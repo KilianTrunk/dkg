@@ -804,7 +804,7 @@ describe('OpenClaw bridge behavioral tests', () => {
       });
       expect(hermes?.chatReady).toBe(false);
       expect(hermes?.bridgeOnline).toBe(false);
-      expect(hermes?.defaultSessionId).toContain('hermes:dkg-ui:profile-dkg-smoke:transport-');
+      expect(hermes?.defaultSessionId).toBe('hermes:dkg-ui:profile-dkg-smoke');
       expect(hermes?.defaultSessionId).not.toBe('hermes:dkg-ui');
       expect(hermes?.detail).toContain('profile dkg-smoke');
       expect(hermes?.detail).toContain('memory provider conflict');
@@ -862,7 +862,7 @@ describe('OpenClaw bridge behavioral tests', () => {
     }
   });
 
-  it('fetchLocalAgentIntegrations separates Hermes default sessions by profile and transport', async () => {
+  it('fetchLocalAgentIntegrations separates Hermes default sessions by profile and home', async () => {
     const { fetch } = createTrackingFetch([
       {
         ok: true,
@@ -903,7 +903,7 @@ describe('OpenClaw bridge behavioral tests', () => {
       const { fetchLocalAgentIntegrations } = await import('../src/ui/api.js');
       const result = await fetchLocalAgentIntegrations();
       const hermes = result.integrations.find((item) => item.id === 'hermes');
-      expect(hermes?.defaultSessionId).toMatch(/^hermes:dkg-ui:profile-dkg-smoke:home-[a-z0-9]+:transport-[a-z0-9]+$/);
+      expect(hermes?.defaultSessionId).toMatch(/^hermes:dkg-ui:profile-dkg-smoke:home-[a-z0-9]+$/);
     } finally {
       globalThis.fetch = original;
     }

@@ -74,3 +74,5 @@ export {
 } from './random-sampling-bind.js';
 export { monotonicTransition, versionedWrite, type MonotonicStages } from './workspace-consistency.js';
 export { StaleWriteError, type CASCondition } from '@origintrail-official/dkg-publisher';
+export * from './source-worker.js';
+export * from './source-registry.js';

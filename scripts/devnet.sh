@@ -709,14 +709,19 @@ cmd_start() {
       const stakingNFT = new ethers.Contract(
         c('DKGStakingConvictionNFT'),
         // lockTier is uint40 in V10 (L3 — widened from uint8 to support tier ids > 255).
-        // balanceOf(address) is the ERC-721 standard read used by the
-        // duplicate-stake guard below — without it, the probe throws
-        // immediately and the guard falls through to a double-stake.
-        // Codex round 5 on PR #368.
-        [
-          'function createConviction(uint72,uint96,uint40)',
-          'function balanceOf(address) view returns (uint256)',
-        ],
+        ['function createConviction(uint72,uint96,uint40)'],
+        provider
+      );
+      // Identity-scoped read used by the duplicate-stake guard below.
+      // ERC-721 balanceOf(opWallet) would also signal "this wallet
+      // owns at least one position", but that's not what the guard
+      // needs to know — an op wallet can hold positions for OTHER
+      // identities, which would skip a needed createConviction for
+      // THIS identity. getNodeStakeV10(idId) reads the per-identity
+      // stake total directly. Codex round 7 on PR #368.
+      const css = new ethers.Contract(
+        c('ConvictionStakingStorage'),
+        ['function getNodeStakeV10(uint72) view returns (uint256)'],
         provider
       );
       const stakingV10Addr = c('StakingV10');
@@ -878,9 +883,8 @@ cmd_start() {
         // the time this script reaches the staking loop the daemon has
         // (usually) already staked. Running createConviction again would
         // open a SECOND 50k position per core node and silently double the
-        // devnet stake. We detect this by reading the conviction NFT
-        // balance on the operational wallet — if the daemon's stake
-        // succeeded the balance is >0 and we skip.
+        // devnet stake. We detect this by reading the per-identity V10
+        // stake total — if the daemon's stake succeeded it's >0 and we skip.
         //
         // Codex round 5 on PR #368: do NOT fall through to "not staked"
         // on probe failure (transient RPC, decode error). That would
@@ -890,21 +894,27 @@ cmd_start() {
         // decides — rather than silently doubling the stake.
         // updateAsk is INDEPENDENT of stake state, so we still attempt
         // it below regardless of the probe outcome.
+        //
+        // Codex round 7 on PR #368: probe `getNodeStakeV10(idId)` instead
+        // of NFT `balanceOf(opSigner.address)`. The op wallet could hold
+        // positions for OTHER identities (not in our devnet today, but
+        // a wallet-scoped probe is the wrong semantic check); we want
+        // to know whether THIS identity is staked.
         let probeOk = false;
         let shouldStake = false;
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
-            const balance = await stakingNFT.balanceOf(opSigner.address);
+            const nodeStake = await css.getNodeStakeV10(idId);
             probeOk = true;
-            if (balance > 0n) {
+            if (nodeStake > 0n) {
               staked++;
-              console.log('Node ' + (i+1) + ' (core): daemon already staked (NFT balance=' + balance + '), skipping createConviction');
+              console.log('Node ' + (i+1) + ' (core): daemon already staked (nodeStakeV10=' + nodeStake + '), skipping createConviction');
             } else {
               shouldStake = true;
             }
             break;
           } catch (e) {
-            console.log('Node ' + (i+1) + ' (core): NFT balance probe failed (attempt ' + (attempt + 1) + '/2): ' + e.message);
+            console.log('Node ' + (i+1) + ' (core): nodeStakeV10 probe failed (attempt ' + (attempt + 1) + '/2): ' + e.message);
             if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
           }
         }

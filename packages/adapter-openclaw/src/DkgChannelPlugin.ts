@@ -2516,7 +2516,18 @@ function resolveDirectAdapterConfigFallback(api: OpenClawPluginApi): Record<stri
       ? mergeAdapterPluginConfigs(source, ...overlays.slice().reverse())
       : source;
   }
-  return overlays[0];
+  // T364 — When every discovered source is a partial overlay (no full
+  // config exists), merge ALL collected overlays in priority order.
+  // Pre-fix this path returned `overlays[0]` and dropped the rest, so a
+  // metadata-only api.cfg + partial pluginConfig + partial runtime.* still
+  // produced an incomplete cfg even when the missing daemon/channel/memory
+  // fields were available on lower-priority overlays. Reverse so the
+  // highest-priority overlay is applied last and wins on conflicts; module
+  // deep-merge preserves lower-priority defaults for fields the higher
+  // overlay omits.
+  return overlays.length > 0
+    ? mergeAdapterPluginConfigs(...overlays.slice().reverse())
+    : undefined;
 }
 
 function resolveChannelDispatchConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {

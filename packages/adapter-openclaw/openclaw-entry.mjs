@@ -203,10 +203,22 @@ function resolveEntryConfig(api, options = {}) {
     );
   const currentWorkspaceMatchesConfiguredStateDir =
     stateDirMatchesWorkspaceDefault(config.stateDir, currentWorkspaceDir);
+  // T364 — Gate the stale-route fallback on setup-owned stateDir values.
+  // Pre-fix this check also fired for operator-owned stateDir paths
+  // (custom `config.stateDir` pointing outside the workspace default).
+  // For those, `stateDirMatchesWorkspaceDefault` is always false, so a
+  // live `agents.defaults.workspace` would be discarded and `workspaceDir`
+  // / SKILL sync would fall back to `installedWorkspace` or older runtime
+  // metadata — even when the live workspace was correct. Only treat the
+  // current workspace as stale when the stateDir IS a setup-owned default
+  // (i.e., stateDirSource === 'setup-default'); otherwise the operator
+  // owns the stateDir path and the workspace stale check shouldn't fire.
+  const stateDirSourceIsSetupDefault = config.stateDirSource === 'setup-default';
   const currentRouteWorkspaceIsStale =
     (currentDirectConfigMatchesInstalledWorkspace || currentEntryConfigMatchesInstalledWorkspace) &&
     !!installedWorkspaceDir &&
     !!currentWorkspaceDir &&
+    stateDirSourceIsSetupDefault &&
     !currentWorkspaceMatchesConfiguredStateDir;
   const configWorkspaceDir = currentRouteWorkspaceIsStale
     ? fallbackWorkspaceDir

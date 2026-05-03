@@ -342,6 +342,65 @@ describe('DkgChannelPlugin', () => {
     });
   });
 
+  it('T364 — merges all overlays in priority order when no full direct config exists', async () => {
+    // T364 follow-up regression: when EVERY discovered direct-config
+    // source is a partial overlay (no full adapter config anywhere on
+    // api.cfg/config/pluginConfig or runtime.*), the function previously
+    // returned `overlays[0]` and dropped the rest — losing daemonUrl /
+    // memory / channel fields that were available on lower-priority
+    // overlays. Post-fix, all overlays are merged in priority order so
+    // the highest priority wins on conflicts and lower priorities fill
+    // in fields the higher overlays omit.
+    const { runtime } = makeMockRuntime({
+      dispatchImpl: async (params) => {
+        await params.dispatcherOptions.deliver({ text: 'All-overlays merge reply' });
+      },
+    });
+    // Highest-priority overlay: state metadata only (no daemonUrl/channel).
+    const metadataOnlyOverlay = {
+      stateDir: '/workspace/.dkg-adapter',
+      stateDirSource: 'setup-default',
+      installedWorkspace: '/workspace',
+    };
+    // Mid-priority overlay: partial channel (overrides channel.port).
+    const partialChannelOverlay = {
+      channel: { port: 9802 },
+    };
+    // Lowest-priority overlay: partial config carrying daemonUrl + a
+    // baseline channel.host (no `enabled` so it's still partial).
+    const partialDaemonOverlay = {
+      daemonUrl: 'http://localhost:9555',
+      channel: { host: '127.0.0.1' },
+    };
+    const api = makeApi({
+      cfg: metadataOnlyOverlay,
+      pluginConfig: partialChannelOverlay,
+      runtime: {
+        ...runtime,
+        pluginConfig: partialDaemonOverlay,
+      },
+    } as any);
+    vi.spyOn(client, 'storeChatTurn').mockResolvedValue(undefined);
+
+    plugin.register(api);
+    const reply = await plugin.processInbound('Hello', 'corr-all-overlays', 'owner');
+
+    expect(reply.text).toBe('All-overlays merge reply');
+    const dispatchCfg = (runtime as any).channel.routing.resolveAgentRoute.calls[0][0].cfg;
+    // Top-level keys: highest-priority metadataOnly (stateDir/Source/installedWorkspace)
+    // wins, daemonUrl from runtime.pluginConfig fills the gap.
+    expect(dispatchCfg).toMatchObject({
+      stateDir: '/workspace/.dkg-adapter',
+      stateDirSource: 'setup-default',
+      installedWorkspace: '/workspace',
+      daemonUrl: 'http://localhost:9555',
+      // channel deep-merge: port from pluginConfig (mid-priority) overrides
+      // host from runtime.pluginConfig (lowest); both fields are present
+      // because module deep-merge preserves lower-priority defaults.
+      channel: { port: 9802, host: '127.0.0.1' },
+    });
+  });
+
   it('keeps current api.pluginConfig ahead of runtime direct config fallback', async () => {
     const { runtime } = makeMockRuntime({
       dispatchImpl: async (params) => {

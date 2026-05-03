@@ -1,5 +1,25 @@
 export { DkgNodePlugin } from './DkgNodePlugin.js';
 export { DkgDaemonClient, type DkgClientOptions } from './dkg-client.js';
+export {
+  DkgPublisherFacade,
+  DkgPublisherFacade as GenericDkgPublisher,
+  DkgPublisherFacade as DkgPublisherAbstraction,
+  createDkgPublisher,
+  escapeDkgRdfLiteral,
+  isDkgRdfTerm,
+  normalizeDkgPublisherObject,
+  normalizeDkgPublisherQuads,
+  type DkgPublisherClient,
+  type DkgPublisherQuad,
+  type DkgPublisherQuadInput,
+  type LocalWorkspaceCreateRequest,
+  type LocalWorkspaceDiscardRequest,
+  type LocalWorkspacePromoteRequest,
+  type LocalWorkspaceWriteRequest,
+  type SharedMemoryPublishRequest,
+  type SharedMemoryWriteRequest,
+  type VerifiedMemoryPublishRequest,
+} from './publisher.js';
 export { DkgChannelPlugin, CHANNEL_NAME } from './DkgChannelPlugin.js';
 export {
   mergeOpenClawConfig,

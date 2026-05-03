@@ -29,6 +29,7 @@ import {
 import { DkgChannelPlugin } from './DkgChannelPlugin.js';
 import { HookSurface } from './HookSurface.js';
 import { ChatTurnWriter } from './ChatTurnWriter.js';
+import { createDkgPublisher, type DkgPublisherFacade } from './publisher.js';
 import {
   DkgMemoryPlugin,
   DkgMemorySearchManager,
@@ -155,6 +156,7 @@ export class DkgNodePlugin {
   // HTTP client to daemon — used by all tools and integration modules
   private client!: DkgDaemonClient;
   private daemonClientGeneration = 0;
+  private publisher!: DkgPublisherFacade;
 
   // Integration modules
   private channelPlugin: DkgChannelPlugin | null = null;
@@ -448,6 +450,7 @@ export class DkgNodePlugin {
     this.resetDaemonScopedCachesForClientChange();
     this.dkgHome = next.dkgHome;
     this.client = new DkgDaemonClient({ baseUrl: next.daemonUrl, dkgHome: next.dkgHome });
+    this.publisher = createDkgPublisher(this.client);
     this.chatTurnWriter?.setClient(this.client);
     this.channelPlugin?.setClient(this.client);
     this.memoryPlugin?.setClient(this.client, { reRegister: this.config.memory?.enabled === true });
@@ -623,6 +626,7 @@ export class DkgNodePlugin {
     // (the very bug T70 set out to fix). Threading `dkgHome` through
     // `DkgClientOptions` plugs that hole.
     this.client = new DkgDaemonClient({ baseUrl: daemonUrl, dkgHome: this.dkgHome });
+    this.publisher = createDkgPublisher(this.client);
     this.initialized = true;
     // R17.2 — Defer `ChatTurnWriter` construction to runtime-enabled
     // modes. The constructor calls `mkdirSync` + reads the watermark
@@ -3246,21 +3250,8 @@ export class DkgNodePlugin {
         return this.error('"quads" must be a non-empty array of {subject, predicate, object} objects.');
       }
 
-      // Convert agent-friendly quads to daemon format:
-      // - subject/predicate: plain URI strings (passed as-is)
-      // - object: auto-detect URI vs literal — URIs passed as-is, literals wrapped in ""
-      const quads = rawQuads.map((q: any) => {
-        const objVal = String(q.object ?? '');
-        return {
-          subject: String(q.subject ?? ''),
-          predicate: String(q.predicate ?? ''),
-          object: isUri(objVal) ? objVal : `"${escapeRdfLiteral(objVal)}"`,
-          graph: q.graph ? String(q.graph) : '',
-        };
-      });
-
-      const result = await this.client.publish(contextGraphId, quads);
-      return this.json({ kcId: result.kcId, kaCount: result.kas?.length ?? 0, quadsPublished: quads.length });
+      const result = await this.publisher.publishVerifiedMemory({ contextGraphId, quads: rawQuads });
+      return this.json({ kcId: result.kcId, kaCount: result.kas?.length ?? 0, quadsPublished: rawQuads.length });
     } catch (err: any) {
       return this.daemonError(err);
     }
@@ -3765,7 +3756,11 @@ export class DkgNodePlugin {
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!name) return this.error('"name" is required.');
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      const result = await this.client.createAssertion(contextGraphId, name, { subGraphName });
+      const result = await this.publisher.createLocalWorkspace({
+        contextGraphId,
+        assertionName: name,
+        subGraphName,
+      });
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3783,18 +3778,13 @@ export class DkgNodePlugin {
         return this.error('"quads" must be a non-empty array of {subject, predicate, object} objects.');
       }
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      // Mirror dkg_publish: auto-detect URI vs literal for the object so agents can pass
-      // raw values without manually wrapping string literals in quotes.
-      const quads = rawQuads.map((q: any) => {
-        const objVal = String(q.object ?? '');
-        return {
-          subject: String(q.subject ?? ''),
-          predicate: String(q.predicate ?? ''),
-          object: isUri(objVal) ? objVal : `"${escapeRdfLiteral(objVal)}"`,
-          graph: q.graph ? String(q.graph) : '',
-        };
+      const result = await this.publisher.writeLocalWorkspace({
+        contextGraphId,
+        assertionName: name,
+        quads: rawQuads,
+        subGraphName,
+        createIfMissing: false,
       });
-      const result = await this.client.writeAssertion(contextGraphId, name, quads, { subGraphName });
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3821,7 +3811,12 @@ export class DkgNodePlugin {
       } else {
         return this.error('"entities" must be omitted or a non-empty array of root entity URIs.');
       }
-      const result = await this.client.promoteAssertion(contextGraphId, name, { entities, subGraphName });
+      const result = await this.publisher.promoteLocalWorkspace({
+        contextGraphId,
+        assertionName: name,
+        rootEntities: entities,
+        subGraphName,
+      });
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3835,7 +3830,11 @@ export class DkgNodePlugin {
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!name) return this.error('"name" is required.');
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      const result = await this.client.discardAssertion(contextGraphId, name, { subGraphName });
+      const result = await this.publisher.discardLocalWorkspace({
+        contextGraphId,
+        assertionName: name,
+        subGraphName,
+      });
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3979,7 +3978,7 @@ export class DkgNodePlugin {
           }
         }
       }
-      const result = await this.client.publishSharedMemory(contextGraphId, { rootEntities, subGraphName });
+      const result = await this.publisher.publishSharedMemory({ contextGraphId, rootEntities, subGraphName });
       return this.json(registration ? { ...result, registration } : result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3993,11 +3992,6 @@ function slugify(name: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')  // replace non-alphanumeric runs with a single hyphen
     .replace(/^-+|-+$/g, '');      // strip leading/trailing hyphens
-}
-
-/** Check if a value looks like a URI (starts with a known scheme). */
-function isUri(value: string): boolean {
-  return /^(?:https?:\/\/|urn:|did:)/i.test(value);
 }
 
 function pickShareableMultiaddr(addrs: string[]): string | null {
@@ -4116,27 +4110,6 @@ function formatRecalledMemoryBlock(
     '</recalled-memory>',
   ];
   return lines.join('\n');
-}
-
-/**
- * Escape a plain-text string for use as an RDF/N-Triples literal body.
- * Covers every ECHAR escape the N-Triples spec defines (\\, ", \n, \r, \t,
- * \b, \f); returns only the escaped body (caller wraps in `"..."`).
- * Without these, agents writing strings that happen to contain a raw
- * form-feed, backspace, or tab would produce malformed RDF literals that
- * strict triple-store parsers reject.
- * Backslash MUST be replaced first so the later inserted escape sequences
- * don't get re-escaped on subsequent passes.
- */
-function escapeRdfLiteral(value: string): string {
-  return value
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t')
-    .replace(/\f/g, '\\f')
-    .replace(/\x08/g, '\\b');
 }
 
 /**

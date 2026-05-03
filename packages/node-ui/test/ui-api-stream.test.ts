@@ -263,7 +263,7 @@ describe('ui local-agent stream api', () => {
     }
   });
 
-  it('forwards session metadata through the Hermes local-agent chat transport', async () => {
+  it('forwards durable turn metadata through the Hermes local-agent chat transport', async () => {
     const fetchCalls: [string | URL | Request, RequestInit | undefined][] = [];
     const savedFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -274,16 +274,41 @@ describe('ui local-agent stream api', () => {
       );
     }) as typeof globalThis.fetch;
 
+    const attachments = [{
+      id: 'att-1',
+      fileName: 'notes.md',
+      contextGraphId: 'project-1',
+      assertionName: 'assert-1',
+      assertionUri: 'urn:dkg:assertion:1',
+      fileHash: 'abc123',
+      detectedContentType: 'text/markdown',
+      extractionStatus: 'completed' as const,
+      tripleCount: 12,
+    }];
+    const contextEntries = [{
+      key: 'project',
+      label: 'Project',
+      value: 'project-1',
+    }];
+
     try {
       const result = await streamLocalAgentChat('hermes', 'hello', {
+        correlationId: 'corr-1',
         sessionId: 'hermes:dkg-ui',
+        profile: 'dkg-smoke',
+        attachments,
+        contextEntries,
         contextGraphId: 'project-1',
       });
 
       expect(result.text).toBe('Hermes response');
       expect(String(fetchCalls[0]?.[0])).toBe('/api/hermes-channel/stream');
       const payload = JSON.parse(String(fetchCalls[0]?.[1]?.body));
+      expect(payload.correlationId).toBe('corr-1');
       expect(payload.sessionId).toBe('hermes:dkg-ui');
+      expect(payload.profile).toBe('dkg-smoke');
+      expect(payload.attachmentRefs).toEqual(attachments);
+      expect(payload.contextEntries).toEqual(contextEntries);
       expect(payload.contextGraphId).toBe('project-1');
       expect(payload.text).toBe('hello');
     } finally {

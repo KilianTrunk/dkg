@@ -721,12 +721,9 @@ interface LocalAgentChatRequestOptions {
   attachments?: LocalAgentChatAttachmentRef[];
   contextEntries?: LocalAgentChatContextEntry[];
   /**
-   * UI-selected project context graph for this turn. Forwarded to the
-   * adapter's channel bridge as `uiContextGraphId` on the envelope so the
-   * adapter's DKG memory slot can scope slot-backed recall to the user's
-   * current project. `DkgMemorySearchManager.search` reads it via the
-   * per-session resolver; `dkg_memory_import` uses it as the fallback CG
-   * when the agent does not supply one explicitly.
+   * UI-selected project context graph for this turn. Forwarded unchanged as
+   * `contextGraphId`; the local agent may use it as contextual signal, while
+   * explicit DKG write tools still choose their own target graph.
    */
   contextGraphId?: string;
 }

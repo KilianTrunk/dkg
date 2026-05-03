@@ -45,7 +45,7 @@ def register_cli(cli_group):
         click.echo("DKG Status: CONNECTED")
         click.echo(f"  Daemon URL: {config.get('daemon_url')}")
         click.echo(f"  Peer ID: {status.get('peerId', 'unknown')}")
-        click.echo(f"  Context Graph: {config.get('context_graph', 'hermes-memory')}")
+        click.echo(f"  Context Graph: {config.get('context_graph', 'agent-context')}")
         if isinstance(cg_list, list):
             click.echo(f"  Subscribed CGs: {len(cg_list)}")
             for cg in cg_list[:5]:
@@ -99,7 +99,7 @@ def register_cli(cli_group):
             return
 
         click.echo(f"Syncing {len(queued)} queued writes...")
-        context_graph = config.get("context_graph", "hermes-memory")
+        context_graph = config.get("context_graph", "agent-context")
         assertion_name = agent_name or "hermes"
         synced = 0
         failed = []

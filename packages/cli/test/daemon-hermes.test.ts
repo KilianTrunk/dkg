@@ -1125,6 +1125,40 @@ describe('Hermes daemon routes', () => {
     expect(importMemories).toHaveBeenCalledWith('hi', `hermes-session:hermes:default:turn:${body.turnId}`);
   });
 
+  it('deduplicates Hermes persist-turn retries by correlation id when turn id is omitted', async () => {
+    let stored = false;
+    const storeChatExchange = vi.fn(async () => {
+      stored = true;
+    });
+    const importMemories = vi.fn(async () => {});
+    const memoryManager = {
+      hasChatTurn: vi.fn(async () => stored),
+      storeChatExchange,
+    };
+    const payload = {
+      sessionId: 'hermes:default',
+      userMessage: 'hello',
+      assistantReply: 'hi',
+      correlationId: 'corr-1',
+    };
+    const first = makeHermesRouteContext(payload, memoryManager);
+    const second = makeHermesRouteContext(payload, memoryManager);
+    first.ctx.agent.importMemories = importMemories;
+    second.ctx.agent.importMemories = importMemories;
+
+    await handleHermesRoutes(first.ctx);
+    await handleHermesRoutes(second.ctx);
+
+    const expectedTurnId = buildStableHermesTurnId({
+      sessionId: 'hermes:default',
+      correlationId: 'corr-1',
+    });
+    expect(storeChatExchange).toHaveBeenCalledTimes(1);
+    expect(importMemories).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(first.res.body)).toEqual({ ok: true, turnId: expectedTurnId });
+    expect(JSON.parse(second.res.body)).toEqual({ ok: true, duplicate: true, turnId: expectedTurnId });
+  });
+
   it('does not import Hermes assistant replies until the turn is durably stored', async () => {
     const storeChatExchange = vi.fn(async () => {});
     const importMemories = vi.fn(async () => {});

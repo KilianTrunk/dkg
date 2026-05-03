@@ -9,7 +9,7 @@ When the daemon is unreachable, falls back to a local cache file
 
 Config via $HERMES_HOME/dkg.json:
   daemon_url     — DKG daemon URL (default: http://127.0.0.1:9200)
-  context_graph  — Context Graph name (default: hermes-memory)
+  context_graph  — Context Graph name (default: agent-context)
   agent_name     — Agent identity (default: from hermes config)
 """
 
@@ -44,7 +44,7 @@ def _load_config() -> dict:
 
     config = {
         "daemon_url": "http://127.0.0.1:9200",
-        "context_graph": "hermes-memory",
+        "context_graph": "agent-context",
         "agent_name": "",
         "publish_tool": "request-only",
         "allow_direct_publish": False,
@@ -787,7 +787,7 @@ class DKGMemoryProvider(MemoryProvider):
             or "hermes"
         )
         self._cache = _load_cache(self._agent_name)
-        self._context_graph = self._config.get("context_graph", "hermes-memory")
+        self._context_graph = self._config.get("context_graph", "agent-context")
 
         # Create HTTP client
         from .client import DKGClient
@@ -1107,7 +1107,7 @@ class DKGMemoryProvider(MemoryProvider):
                 "key": "context_graph",
                 "label": "Context Graph",
                 "type": "string",
-                "default": "hermes-memory",
+                "default": "agent-context",
                 "help": "Name of the Context Graph for agent memory.",
             },
             {

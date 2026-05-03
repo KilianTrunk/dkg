@@ -114,7 +114,7 @@ export function planHermesSetup(options: HermesSetupOptions = {}): HermesSetupPl
     status: warnings.length ? 'degraded' : 'configured',
     profile,
     daemonUrl,
-    contextGraph: options.contextGraph ?? 'hermes-memory',
+    contextGraph: options.contextGraph ?? 'agent-context',
     agentName: options.agentName,
     ...(bridge ? { bridge } : {}),
     publishGuard,

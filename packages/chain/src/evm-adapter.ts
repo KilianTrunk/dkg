@@ -63,6 +63,20 @@ const DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS = 5 * 60 * 1000;
 const DURATION_PROBE_TIMEOUT_MS = 2000;
 
 /**
+ * Upper bound on the in-flight duration probe slot age. The single-flight
+ * guard reuses a pending probe to bound RPC cardinality at 1, but if the
+ * underlying `eth_call` never settles (hung provider, dropped websocket)
+ * the slot would otherwise stay populated forever and suppress every
+ * fresh probe. After this many ms we abandon the slot regardless and
+ * let the next call start a new probe — capping leaked-handle growth
+ * to one per `MAX_PROBE_AGE_MS` window instead of one per tick. Set
+ * generously above `DURATION_PROBE_TIMEOUT_MS` so honest slow paths
+ * (high RPC latency, congested chain) still benefit from single-flight.
+ * Codex round 8 on PR #369.
+ */
+const MAX_PROBE_AGE_MS = 30_000;
+
+/**
  * Substrings we treat as "the Hub no longer recognises this contract
  * as a registered participant" — i.e. the cached address is stale and
  * the next call should re-resolve from the Hub. Conservative match on
@@ -276,11 +290,28 @@ export class EVMChainAdapter implements ChainAdapter {
    * naively issuing one new probe per tick would accumulate one
    * stuck request per tick on a hung provider. Instead we reuse the
    * same in-flight promise across overlapping calls — at most one
-   * probe is ever pending against the provider at a time. The slot
-   * clears in `.finally`, so a probe that eventually settles unblocks
-   * the next call to issue a fresh one.
+   * probe is ever pending against the provider at a time.
+   *
+   * Codex round 8 on PR #369: also track the RS pair-cache generation
+   * the probe was started against AND a wall-clock creation timestamp.
+   *   - Generation guard: a TTL refresh of `randomSamplingPairCache`
+   *     re-resolves `rs` to a possibly-new contract WITHOUT calling
+   *     `invalidateRandomSamplingPair()`. We must NOT pair a fresh
+   *     `getActiveProofPeriodStatus()` from the new contract with a
+   *     duration probe started against the old contract, so we drop
+   *     the slot whenever the cache generation has moved.
+   *   - Max-age guard: `Promise.race` returns `undefined` to the
+   *     caller on timeout, but the underlying `eth_call` may
+   *     never settle (truly hung provider). Without an upper
+   *     bound on slot age, a single hung probe would suppress
+   *     every fresh probe forever. After `MAX_PROBE_AGE_MS` we
+   *     abandon the slot regardless; the orphan promise still has
+   *     its `.finally` attached but the slot identity check inside
+   *     it correctly does nothing.
    */
   private inflightDurationProbe: Promise<bigint | undefined> | undefined;
+  private inflightDurationProbeGeneration = -1;
+  private inflightDurationProbeStartedAt = 0;
 
   constructor(config: EVMAdapterConfig) {
     this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
@@ -2551,6 +2582,8 @@ export class EVMChainAdapter implements ChainAdapter {
     this.contracts.randomSampling = undefined;
     this.contracts.randomSamplingStorage = undefined;
     this.inflightDurationProbe = undefined;
+    this.inflightDurationProbeGeneration = -1;
+    this.inflightDurationProbeStartedAt = 0;
   }
 
   /**
@@ -2784,14 +2817,29 @@ export class EVMChainAdapter implements ChainAdapter {
       ]);
     };
     // Single-flight: if a previous tick's probe is still pending,
-    // reuse it instead of issuing a fresh `eth_call`. This bounds
-    // outstanding-probe cardinality to 1 even when the provider
-    // hangs every request, preventing socket / handle accumulation
-    // on long-lived nodes.
+    // reuse it instead of issuing a fresh `eth_call`. Codex round 8:
+    // first invalidate the slot if (a) the RS pair-cache generation
+    // has moved (TTL-refresh path doesn't call invalidateRandomSamplingPair
+    // but DOES re-resolve the contract → probe was started against the
+    // old contract and must not be paired with the new contract's
+    // status), or (b) the slot is older than MAX_PROBE_AGE_MS (a
+    // truly hung probe must not suppress retries forever).
+    const currentGen = this.randomSamplingPairCache.currentGeneration();
+    const probeAgeMs = this.inflightDurationProbe
+      ? Date.now() - this.inflightDurationProbeStartedAt
+      : 0;
+    if (this.inflightDurationProbe && (
+      this.inflightDurationProbeGeneration !== currentGen ||
+      probeAgeMs > MAX_PROBE_AGE_MS
+    )) {
+      this.inflightDurationProbe = undefined;
+    }
     let probe = this.inflightDurationProbe;
     if (!probe) {
       const fresh = readDurationBestEffort();
       this.inflightDurationProbe = fresh;
+      this.inflightDurationProbeGeneration = currentGen;
+      this.inflightDurationProbeStartedAt = Date.now();
       // `.finally` covers both resolve and reject paths without
       // altering the value the caller observes.
       void fresh.finally(() => {

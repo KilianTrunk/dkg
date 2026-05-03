@@ -434,6 +434,83 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     }
   });
 
+  it('drops the duration probe slot when RS pair-cache generation moves (TTL refresh, Codex round 8)', async () => {
+    // The TTL-refresh path of HubResolutionCache re-resolves the
+    // contract WITHOUT calling invalidateRandomSamplingPair(). A
+    // probe started against the old contract must NOT be paired
+    // with the new contract's status. We bump the generation
+    // manually and verify the next call issues a fresh probe.
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      const probeCalls = vi.fn();
+      const fakeRs = {
+        getActiveProofPeriodStatus: async () => ({
+          activeProofPeriodStartBlock: 1n,
+          isValid: true,
+        }),
+        getActiveProofingPeriodDurationInBlocks: () => {
+          probeCalls();
+          return new Promise(() => {/* hang */});
+        },
+      };
+      (a as any).init = async () => undefined;
+      (a as any).getRandomSampling = async () => ({ rs: fakeRs, rss: {} });
+      const first = a.getActiveProofPeriodStatus();
+      await vi.advanceTimersByTimeAsync(2001);
+      await first;
+      expect(probeCalls).toHaveBeenCalledTimes(1);
+      // Bump the cache generation as if a TTL refresh happened.
+      (a as any).randomSamplingPairCache.invalidate();
+      const second = a.getActiveProofPeriodStatus();
+      await vi.advanceTimersByTimeAsync(2001);
+      await second;
+      // Generation moved, so the slot was dropped and a fresh
+      // probe was started against the (now-current) contract.
+      expect(probeCalls).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops the duration probe slot when it exceeds MAX_PROBE_AGE_MS (Codex round 8)', async () => {
+    // A truly hung probe (underlying eth_call never settles) must
+    // not suppress every fresh probe forever. The age guard kicks
+    // in after 30s and abandons the slot so the next call can
+    // issue a new one — capping leaked-handle growth to one per
+    // 30s window instead of one per tick.
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      const probeCalls = vi.fn();
+      const fakeRs = {
+        getActiveProofPeriodStatus: async () => ({
+          activeProofPeriodStartBlock: 1n,
+          isValid: true,
+        }),
+        getActiveProofingPeriodDurationInBlocks: () => {
+          probeCalls();
+          return new Promise(() => {/* hang */});
+        },
+      };
+      (a as any).init = async () => undefined;
+      (a as any).getRandomSampling = async () => ({ rs: fakeRs, rss: {} });
+      const first = a.getActiveProofPeriodStatus();
+      await vi.advanceTimersByTimeAsync(2001);
+      await first;
+      expect(probeCalls).toHaveBeenCalledTimes(1);
+      // Fast-forward past MAX_PROBE_AGE_MS (30s).
+      await vi.advanceTimersByTimeAsync(30_001);
+      const second = a.getActiveProofPeriodStatus();
+      await vi.advanceTimersByTimeAsync(2001);
+      await second;
+      // Slot was abandoned by the age guard, fresh probe was started.
+      expect(probeCalls).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('invalidateRandomSamplingPair drops the in-flight duration probe so a Hub rotation forces a fresh one (Codex round 7)', async () => {
     // If a probe was started against the OLD RandomSampling contract
     // and Hub rotates before it settles:

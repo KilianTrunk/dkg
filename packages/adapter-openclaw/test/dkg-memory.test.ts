@@ -340,6 +340,65 @@ describe('DkgMemoryPlugin.register', () => {
     expect(api.registerMemoryCapability).toHaveBeenCalledTimes(1);
   });
 
+  it('T364 round 7 — mixed { workspaceDir, memory: { enabled: false } } payload contributes its memory decision to disable()', async () => {
+    // Regression: pre-fix `directPluginConfigMemoryEnabledFromCandidates`
+    // gated on the strict `looksLikeAdapterPluginConfig`, which rejected
+    // any candidate carrying route-metadata keys (`workspaceDir`,
+    // `agents`, `session`, `workspace`). A mixed gateway payload like
+    // `{ workspaceDir, memory: { enabled: false } }` therefore lost
+    // its explicit `memory.enabled: false` signal — stale runtime/
+    // pluginConfig values won out and `disable()` could fail to clear
+    // the slot. The channel/entry sites were updated in round 6 to
+    // route through `extractAdapterPluginConfigOverlay()`; round 7
+    // mirrors the same fix on the memory-ownership path.
+    const initialApi = makeApi();
+    expect(plugin.register(initialApi)).toBe(true);
+    expect(initialApi.registerMemoryCapability).toHaveBeenCalledTimes(1);
+
+    // Mixed payload: workspaceDir (route metadata) + memory.enabled:false
+    // (adapter overlay). Pre-fix this would not surface the disable
+    // decision to memorySlotOwnershipForApi.
+    const mixedDisableApi = makeApi();
+    mixedDisableApi.config = {
+      workspaceDir: '/legacy-workspace',
+      memory: { enabled: false },
+    } as any;
+
+    expect(plugin.disable(mixedDisableApi)).toBe(true);
+    expect(mixedDisableApi.registerMemoryCapability).toHaveBeenCalledTimes(1);
+    const disabledCapability =
+      mixedDisableApi.registerMemoryCapability.mock.calls[0][0] as MemoryPluginCapability;
+    const result = await disabledCapability.runtime!.getMemorySearchManager(
+      {} as MemoryRuntimeRequest,
+    );
+    expect(result.manager).toBeNull();
+    expect(result.error).toContain('disabled');
+  });
+
+  it('T364 round 7 — mixed { workspaceDir, memory: { enabled: true } } payload contributes its memory decision to register()', async () => {
+    // Symmetric positive-decision case for round 7: a mixed payload
+    // that ENABLES memory must also surface its decision via the
+    // extractAdapterPluginConfigOverlay path, not be dropped on the
+    // floor by the strict looksLikeAdapterPluginConfig gate.
+    // Without this, a workspace whose `api.config` happened to carry
+    // both `workspaceDir` and `memory.enabled: true` would never bring
+    // DKG memory up.
+    const api = {
+      config: {
+        workspaceDir: '/legacy-workspace',
+        memory: { enabled: true },
+      },
+      registerTool: vi.fn(),
+      registerHook: vi.fn(),
+      on: vi.fn(),
+      logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+      registerMemoryCapability: vi.fn(),
+    } as unknown as MockApi;
+
+    expect(plugin.register(api)).toBe(true);
+    expect(api.registerMemoryCapability).toHaveBeenCalledTimes(1);
+  });
+
   it('warns about direct memory disable without setup guidance', () => {
     const api = makeApi();
     api.config = {

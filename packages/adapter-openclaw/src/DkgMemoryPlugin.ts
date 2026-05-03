@@ -48,9 +48,9 @@ import type {
   OpenClawPluginApi,
 } from './types.js';
 import {
+  extractAdapterPluginConfigOverlay,
   isObjectRecord,
   isStateMetadataOnlyAdapterConfig,
-  looksLikeAdapterPluginConfig,
   resolveOpenClawMergedConfig,
 } from './openclaw-config.js';
 
@@ -967,8 +967,16 @@ function directPluginConfigMemoryEnabledFromCandidates(
   candidates: unknown[],
 ): boolean | undefined {
   for (const candidate of candidates) {
-    if (!looksLikeAdapterPluginConfig(candidate)) continue;
-    const memory = (candidate as Record<string, unknown>).memory;
+    // T364 round 7 — normalize through extractAdapterPluginConfigOverlay
+    // so mixed gateway payloads (e.g. `{ workspaceDir, memory: { enabled: false } }`)
+    // contribute their explicit memory decision. Pre-fix the strict
+    // `looksLikeAdapterPluginConfig` reject dropped these payloads on
+    // the floor — stale runtime/pluginConfig values then masked the
+    // operator's intent and could keep DKG registered (or prevent
+    // disable() from clearing the slot).
+    const overlay = extractAdapterPluginConfigOverlay(candidate);
+    if (!overlay) continue;
+    const memory = overlay.memory;
     if (isObjectRecord(memory) && Object.prototype.hasOwnProperty.call(memory, 'enabled')) {
       return memory.enabled === true;
     }
@@ -986,13 +994,21 @@ function hasCurrentDirectOverlayWithoutMemoryDecision(api: OpenClawPluginApi): b
 }
 
 function isDirectConfigWithoutMemoryDecision(candidate: unknown): boolean {
-  if (!looksLikeAdapterPluginConfig(candidate)) return false;
-  const config = candidate as Record<string, unknown>;
-  const memory = config.memory;
+  // T364 round 7 — same normalization as `directPluginConfigMemoryEnabledFromCandidates`.
+  // A mixed payload like `{ workspaceDir, memory: { enabled: false } }`
+  // pre-fix returned false here (strict looksLike rejected it), so the
+  // explicit memory decision was treated as "no decision" and stale
+  // runtime values won out. Routing through the extraction helper
+  // surfaces the decision when present — and reports "no decision"
+  // (returns true) only when the overlay actually carries adapter keys
+  // but no `memory.enabled`.
+  const overlay = extractAdapterPluginConfigOverlay(candidate);
+  if (!overlay) return false;
+  const memory = overlay.memory;
   if (isObjectRecord(memory) && Object.prototype.hasOwnProperty.call(memory, 'enabled')) {
     return false;
   }
-  return Object.keys(config).length > 0;
+  return Object.keys(overlay).length > 0;
 }
 
 

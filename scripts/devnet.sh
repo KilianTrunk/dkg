@@ -771,10 +771,16 @@ cmd_start() {
         // The daemon's publisher shares this op wallet (registered as the
         // StorageACK signer + first op wallet). It may have submitted txs
         // already (addKey, addOperationalWallets) by the time we reach here,
-        // so we MUST query the latest nonce explicitly and pass it to each
-        // tx — relying on ethers' default nonce manager would race the daemon
+        // so we MUST query the nonce explicitly and pass it to each tx —
+        // relying on ethers' default nonce manager would race the daemon
         // and yield 'nonce has already been used'.
-        let nonce = await provider.getTransactionCount(opSigner.address, 'latest');
+        //
+        // Codex round 1 on PR #368: use 'pending' (NOT 'latest') so the
+        // count includes daemon-submitted txs already in the mempool but
+        // not yet mined. 'latest' would still collide with an in-flight
+        // addKey/addOperationalWallets and produce the very nonce error
+        // this code path exists to prevent.
+        let nonce = await provider.getTransactionCount(opSigner.address, 'pending');
         try {
           const deployer = await provider.getSigner(0);
           await (await token.connect(deployer).mint(opSigner.address, stakeAmount)).wait();

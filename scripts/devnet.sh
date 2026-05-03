@@ -865,18 +865,41 @@ cmd_start() {
           const tx = await txFactory(freshNonce);
           return tx.wait();
         };
+        // Codex round 4 on PR #368: skip createConviction if the daemon
+        // already opened a position. PR 366 wired `EVMChainAdapter.ensureProfile()`
+        // to open a default 50k V10 conviction during agent startup, so by
+        // the time this script reaches the staking loop the daemon has
+        // (usually) already staked. Running createConviction again would
+        // open a SECOND 50k position per core node and silently double the
+        // devnet stake. We detect this by reading the conviction NFT
+        // balance on the operational wallet — if the daemon's stake
+        // succeeded the balance is >0 and we skip. If the daemon's stake
+        // failed (e.g. transient RPC), balance is 0 and we still do the
+        // bootstrap stake as a fallback.
+        let alreadyStaked = false;
         try {
-          const deployer = await provider.getSigner(0);
-          await (await token.connect(deployer).mint(opSigner.address, stakeAmount)).wait();
-          // StakingV10.stake pulls TRAC via transferFrom(staker, address(CSS), amount)
-          // gated by allowance to StakingV10. Approve StakingV10 here, NOT the NFT —
-          // the NFT is only the entry point and never custodies TRAC.
-          await sendWithFreshNonce((freshNonce) =>
-            token.connect(opSigner).approve(stakingV10Addr, stakeAmount, { nonce: freshNonce }));
-          await sendWithFreshNonce((freshNonce) =>
-            stakingNFT.connect(opSigner).createConviction(idId, stakeAmount, lockTier, { nonce: freshNonce }));
-          staked++;
-        } catch (e) { console.log('Stake failed for node ' + (i+1) + ': ' + e.message); }
+          const balance = await stakingNFT.balanceOf(opSigner.address);
+          if (balance > 0n) {
+            alreadyStaked = true;
+            staked++;
+            console.log('Node ' + (i+1) + ' (core): daemon already staked (NFT balance=' + balance + '), skipping createConviction');
+          }
+        } catch (e) { console.log('Node ' + (i+1) + ' (core): NFT balance probe failed (treating as not staked): ' + e.message); }
+
+        if (!alreadyStaked) {
+          try {
+            const deployer = await provider.getSigner(0);
+            await (await token.connect(deployer).mint(opSigner.address, stakeAmount)).wait();
+            // StakingV10.stake pulls TRAC via transferFrom(staker, address(CSS), amount)
+            // gated by allowance to StakingV10. Approve StakingV10 here, NOT the NFT —
+            // the NFT is only the entry point and never custodies TRAC.
+            await sendWithFreshNonce((freshNonce) =>
+              token.connect(opSigner).approve(stakingV10Addr, stakeAmount, { nonce: freshNonce }));
+            await sendWithFreshNonce((freshNonce) =>
+              stakingNFT.connect(opSigner).createConviction(idId, stakeAmount, lockTier, { nonce: freshNonce }));
+            staked++;
+          } catch (e) { console.log('Stake failed for node ' + (i+1) + ': ' + e.message); }
+        }
 
         // Set ask price (independent try block — a failed stake must not
         // skip ask setup; sendWithFreshNonce re-reads 'pending' so it

@@ -709,7 +709,14 @@ cmd_start() {
       const stakingNFT = new ethers.Contract(
         c('DKGStakingConvictionNFT'),
         // lockTier is uint40 in V10 (L3 — widened from uint8 to support tier ids > 255).
-        ['function createConviction(uint72,uint96,uint40)'],
+        // balanceOf(address) is the ERC-721 standard read used by the
+        // duplicate-stake guard below — without it, the probe throws
+        // immediately and the guard falls through to a double-stake.
+        // Codex round 5 on PR #368.
+        [
+          'function createConviction(uint72,uint96,uint40)',
+          'function balanceOf(address) view returns (uint256)',
+        ],
         provider
       );
       const stakingV10Addr = c('StakingV10');
@@ -873,20 +880,37 @@ cmd_start() {
         // open a SECOND 50k position per core node and silently double the
         // devnet stake. We detect this by reading the conviction NFT
         // balance on the operational wallet — if the daemon's stake
-        // succeeded the balance is >0 and we skip. If the daemon's stake
-        // failed (e.g. transient RPC), balance is 0 and we still do the
-        // bootstrap stake as a fallback.
-        let alreadyStaked = false;
-        try {
-          const balance = await stakingNFT.balanceOf(opSigner.address);
-          if (balance > 0n) {
-            alreadyStaked = true;
-            staked++;
-            console.log('Node ' + (i+1) + ' (core): daemon already staked (NFT balance=' + balance + '), skipping createConviction');
+        // succeeded the balance is >0 and we skip.
+        //
+        // Codex round 5 on PR #368: do NOT fall through to "not staked"
+        // on probe failure (transient RPC, decode error). That would
+        // re-introduce the double-stake bug this guard exists to prevent.
+        // Retry once with backoff; if the probe still fails, refuse to
+        // run createConviction so the operator sees the symptom and
+        // decides — rather than silently doubling the stake.
+        // updateAsk is INDEPENDENT of stake state, so we still attempt
+        // it below regardless of the probe outcome.
+        let probeOk = false;
+        let shouldStake = false;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const balance = await stakingNFT.balanceOf(opSigner.address);
+            probeOk = true;
+            if (balance > 0n) {
+              staked++;
+              console.log('Node ' + (i+1) + ' (core): daemon already staked (NFT balance=' + balance + '), skipping createConviction');
+            } else {
+              shouldStake = true;
+            }
+            break;
+          } catch (e) {
+            console.log('Node ' + (i+1) + ' (core): NFT balance probe failed (attempt ' + (attempt + 1) + '/2): ' + e.message);
+            if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
           }
-        } catch (e) { console.log('Node ' + (i+1) + ' (core): NFT balance probe failed (treating as not staked): ' + e.message); }
-
-        if (!alreadyStaked) {
+        }
+        if (!probeOk) {
+          console.log('Node ' + (i+1) + ' (core): cannot verify existing conviction after retry; skipping bootstrap stake to avoid double-stake');
+        } else if (shouldStake) {
           try {
             const deployer = await provider.getSigner(0);
             await (await token.connect(deployer).mint(opSigner.address, stakeAmount)).wait();

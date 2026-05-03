@@ -8,6 +8,7 @@ import {
   isStateMetadataOnlyAdapterConfig,
   looksLikeAdapterPluginConfig,
   mergeAdapterPluginConfigs,
+  sameResolvedPath,
 } from './dist/index.js';
 
 /** Module-level singleton - prevents duplicate registration during gateway multi-phase init. */
@@ -263,10 +264,18 @@ function workspaceDirFromConfig(config) {
 
 function stateDirMatchesWorkspaceDefault(stateDir, workspaceDir) {
   if (typeof stateDir !== 'string' || typeof workspaceDir !== 'string') return false;
-  const normalized = normalizePath(stateDir);
+  // T364 follow-up: use canonical-path comparison so symlinked
+  // workspaces and macOS realpath aliases compare equal. Pre-fix the
+  // raw `normalizePath` only handled separators / trailing slashes,
+  // so the same workspace exposed via a symlink would fail the match
+  // and the live route workspace would be treated as stale —
+  // pushing SKILL sync / watermark state back to `installedWorkspace`
+  // even when the live workspace was correct. `sameResolvedPath`
+  // (re-exported from state-dir-path.ts) wraps `realpathSync` with
+  // missing-parts tolerance and platform-aware case normalization.
   return (
-    normalized === normalizePath(join(workspaceDir, '.dkg-adapter')) ||
-    normalized === normalizePath(join(workspaceDir, '.openclaw'))
+    sameResolvedPath(stateDir, join(workspaceDir, '.dkg-adapter')) ||
+    sameResolvedPath(stateDir, join(workspaceDir, '.openclaw'))
   );
 }
 
@@ -313,7 +322,18 @@ function directApiConfigFrom(config) {
     isObjectRecord(config.plugins) ||
     isObjectRecord(config.agents) ||
     isObjectRecord(config.session) ||
-    typeof config.workspace === 'string'
+    typeof config.workspace === 'string' ||
+    // T364 follow-up: `workspaceDir` is route metadata, not a direct
+    // adapter config field. Companion fix to the `looksLikeAdapterPluginConfig`
+    // exclusion in openclaw-config.ts. Pre-fix
+    // `{ workspaceDir, channel: { port: 9801 } }` flipped `configIsPartial`
+    // to false here and bootstrap stopped merging the fallback full
+    // config — recreating the stale daemon/channel settings on first
+    // runtime pass. (`looksLikeAdapterPluginConfig` already excludes
+    // `workspaceDir` after the shared-helper fix; this entry-side
+    // mirror keeps the early-return path's exclusion list aligned so
+    // the rules cannot drift.)
+    typeof config.workspaceDir === 'string'
   ) {
     return undefined;
   }

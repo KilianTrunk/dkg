@@ -63,8 +63,20 @@ describe('openclaw-entry', () => {
         '}',
         'export function looksLikeAdapterPluginConfig(value) {',
         '  if (!isObjectRecord(value)) return false;',
-        "  if (isObjectRecord(value.plugins) || isObjectRecord(value.agents) || isObjectRecord(value.session) || typeof value.workspace === 'string') return false;",
+        "  if (isObjectRecord(value.plugins) || isObjectRecord(value.agents) || isObjectRecord(value.session) || typeof value.workspace === 'string' || typeof value.workspaceDir === 'string') return false;",
         '  return ADAPTER_PLUGIN_CONFIG_KEYS.some((key) => Object.prototype.hasOwnProperty.call(value, key));',
+        '}',
+        // T364 follow-up: sameResolvedPath polyfill for the test fake.
+        // Real `state-dir-path.ts` walks up to existing parent then
+        // realpathSync; the test fake operates on hypothetical paths
+        // (mkdtemp dirs, fictional workspaces) so a string-equality
+        // fallback after resolve() suffices for the test surface.
+        "import { resolve as resolvePath } from 'node:path';",
+        'export function sameResolvedPath(a, b) {',
+        '  if (typeof a !== "string" || typeof b !== "string") return false;',
+        '  const an = resolvePath(a).replace(/\\\\/g, "/").replace(/\\/+$/, "");',
+        '  const bn = resolvePath(b).replace(/\\\\/g, "/").replace(/\\/+$/, "");',
+        "  return process.platform === 'win32' ? an.toLowerCase() === bn.toLowerCase() : an === bn;",
         '}',
         'export function isStateMetadataOnlyAdapterConfig(value) {',
         '  if (!looksLikeAdapterPluginConfig(value)) return false;',

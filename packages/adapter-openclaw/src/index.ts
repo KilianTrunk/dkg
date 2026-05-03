@@ -45,6 +45,10 @@ export {
   resolveOpenClawMergedConfig,
   resolveOpenClawRouteMetadataConfig,
 } from './openclaw-config.js';
+export {
+  canonicalPathForCompare,
+  sameResolvedPath,
+} from './state-dir-path.js';
 export type {
   DkgMemorySession,
   DkgMemorySessionResolver,

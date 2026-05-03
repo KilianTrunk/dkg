@@ -39,7 +39,16 @@ export function looksLikeAdapterPluginConfig(value: unknown): boolean {
     isObjectRecord(value.plugins) ||
     isObjectRecord(value.agents) ||
     isObjectRecord(value.session) ||
-    typeof value.workspace === 'string'
+    typeof value.workspace === 'string' ||
+    // T364 follow-up: `workspaceDir` is route metadata (per
+    // `hasRouteMetadataConfigSignal` and the setup.ts:166-190 fallback
+    // chain). Pre-fix `{ workspaceDir, channel: { port: 9801 } }` or
+    // `{ workspaceDir, stateDir: ... }` was misclassified as a direct
+    // adapter config, so the dispatch resolver stopped layering in
+    // lower-priority full configs and could drop daemonUrl /
+    // memory.enabled. Excluding `workspaceDir` here aligns the
+    // classifier with route-metadata recognition.
+    typeof value.workspaceDir === 'string'
   ) {
     return false;
   }

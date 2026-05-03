@@ -725,7 +725,11 @@ cmd_start() {
       // identity in the eyes of the staking + profile contracts).
       const n = $NUM_NODES;
       const opSigners = new Array(n).fill(null);
-      const nodeRoles = new Array(n).fill('core');
+      // Codex round 3 on PR #368: default unknown role to 'edge' (safest
+      // failure mode). 'core' would auto-provision an on-chain identity
+      // and stake for a node whose role we cannot confirm, violating the
+      // documented 'edge stays off-chain' invariant.
+      const nodeRoles = new Array(n).fill('edge');
       // Codex round 2 on PR #368: parse each node's wallets.json + config.json
       // independently. A malformed file (truncated mid-write, missing
       // wallets[0], unparseable JSON) MUST NOT throw and abort staking
@@ -749,10 +753,31 @@ cmd_start() {
         }
         try {
           const cfg = JSON.parse(fs.readFileSync(cPath, 'utf8'));
-          nodeRoles[i - 1] = cfg.nodeRole || 'core';
+          // Trust the explicit role; fall back to 'edge' (NOT 'core') if
+          // the field is missing — see comment above on safest default.
+          nodeRoles[i - 1] = cfg.nodeRole || 'edge';
         } catch (e) {
-          console.log('Node ' + i + ': failed to parse config.json (defaulting nodeRole=core): ' + (e && e.message || e));
+          console.log('Node ' + i + ': failed to parse config.json (defaulting nodeRole=edge): ' + (e && e.message || e));
         }
+      }
+
+      // Codex round 3 on PR #368: fail-fast if a node we INTEND to be
+      // a core (its config.json said so) lost its wallets.json. The
+      // earlier silent-skip here would let cmd_start succeed with a
+      // half-staked devnet, then publish/ACK smoke tests would fail
+      // later with much less obvious symptoms. We treat any node that
+      // BOTH (a) has nodeRole=core AND (b) failed wallet parse as a
+      // hard failure — print diagnostics and exit non-zero so the
+      // operator fixes the wallet file before retrying.
+      const lostCores = [];
+      for (let i = 0; i < n; i++) {
+        if (nodeRoles[i] === 'core' && opSigners[i] === null) lostCores.push(i + 1);
+      }
+      if (lostCores.length > 0) {
+        console.error('FATAL: ' + lostCores.length + ' core node(s) have invalid wallets.json: '
+          + lostCores.map(String).join(', '));
+        console.error('Refusing to bootstrap a partially-provisioned devnet. Fix the wallet files and re-run.');
+        process.exit(1);
       }
 
       // Wait up to 60s for all CORE nodes to have identities. Edge nodes

@@ -2533,11 +2533,24 @@ export class EVMChainAdapter implements ChainAdapter {
    * `isRandomSamplingReady()` probe would keep returning `true` after a Hub
    * rotation (until the next `getRandomSampling()` re-populates the
    * handles), giving the prover a stale all-clear.
+   *
+   * Codex round 6 on PR #369: ALSO drop the in-flight duration probe.
+   * The probe was started against the OLD `RandomSampling` contract;
+   * if Hub rotates while it is pending we MUST NOT pair the new
+   * contract's `getActiveProofPeriodStatus()` with the old contract's
+   * duration in the next call. Worse, if the old probe never settles
+   * (hung provider) it would suppress every fresh probe forever via
+   * the single-flight guard. Clearing the slot here lets the next
+   * call issue a fresh probe against the new contract; the now-orphan
+   * old promise is still handled by its `.finally` hook (the slot
+   * identity check inside .finally won't match, so it correctly does
+   * nothing).
    */
   private invalidateRandomSamplingPair(): void {
     this.randomSamplingPairCache.invalidate();
     this.contracts.randomSampling = undefined;
     this.contracts.randomSamplingStorage = undefined;
+    this.inflightDurationProbe = undefined;
   }
 
   /**

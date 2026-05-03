@@ -434,6 +434,61 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     }
   });
 
+  it('invalidateRandomSamplingPair drops the in-flight duration probe so a Hub rotation forces a fresh one (Codex round 7)', async () => {
+    // If a probe was started against the OLD RandomSampling contract
+    // and Hub rotates before it settles:
+    //   - Without this fix: the next status call would pair the new
+    //     contract's status with the old contract's stale duration,
+    //     OR (if the old probe hangs) suppress every fresh probe
+    //     forever via the single-flight guard.
+    //   - With this fix: invalidate() drops the slot; the next call
+    //     issues a fresh probe against the new contract.
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      const probeCalls = vi.fn();
+      const oldRs = {
+        getActiveProofPeriodStatus: async () => ({
+          activeProofPeriodStartBlock: 1n,
+          isValid: true,
+        }),
+        getActiveProofingPeriodDurationInBlocks: () => {
+          probeCalls();
+          return new Promise(() => {/* old contract probe hangs */});
+        },
+      };
+      const newRs = {
+        getActiveProofPeriodStatus: async () => ({
+          activeProofPeriodStartBlock: 2n,
+          isValid: true,
+        }),
+        getActiveProofingPeriodDurationInBlocks: async () => {
+          probeCalls();
+          return 555n;
+        },
+      };
+      (a as any).init = async () => undefined;
+      (a as any).getRandomSampling = async () => ({ rs: oldRs, rss: {} });
+      const stale = a.getActiveProofPeriodStatus();
+      await vi.advanceTimersByTimeAsync(2001);
+      await stale;
+      expect(probeCalls).toHaveBeenCalledTimes(1);
+      // Simulate Hub rotation: invalidate the RS pair cache.
+      (a as any).invalidateRandomSamplingPair();
+      // Swap in the NEW contract for the next call.
+      (a as any).getRandomSampling = async () => ({ rs: newRs, rss: {} });
+      vi.useRealTimers();
+      const fresh = await a.getActiveProofPeriodStatus();
+      expect(fresh.activeProofPeriodStartBlock).toBe(2n);
+      expect(fresh.proofingPeriodDurationInBlocks).toBe(555n);
+      // Probe must have run against the NEW contract — total
+      // probeCalls is now 2 (old hung + new succeeded).
+      expect(probeCalls).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('getActiveProofPeriodStatus issues a fresh probe after the previous one settles (Codex round 6)', async () => {
     // Once the in-flight probe rejects/resolves, the next call MUST
     // be allowed to issue a new one — otherwise a single transient

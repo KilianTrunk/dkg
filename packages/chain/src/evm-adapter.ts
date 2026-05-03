@@ -267,6 +267,20 @@ export class EVMChainAdapter implements ChainAdapter {
    */
   private readonly randomSamplingPairCache: HubResolutionCache<{ rs: Contract; rss: Contract }>;
   private hubRotationListenerStarted = false;
+  /**
+   * Single-flight guard for the best-effort
+   * `getActiveProofingPeriodDurationInBlocks()` probe inside
+   * `getActiveProofPeriodStatus()`. Codex round 5 on PR #369: the
+   * 2s `Promise.race` timeout returns `undefined` to the caller but
+   * the underlying `eth_call` is NOT cancellable in ethers v6, so
+   * naively issuing one new probe per tick would accumulate one
+   * stuck request per tick on a hung provider. Instead we reuse the
+   * same in-flight promise across overlapping calls — at most one
+   * probe is ever pending against the provider at a time. The slot
+   * clears in `.finally`, so a probe that eventually settles unblocks
+   * the next call to issue a fresh one.
+   */
+  private inflightDurationProbe: Promise<bigint | undefined> | undefined;
 
   constructor(config: EVMAdapterConfig) {
     this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
@@ -2756,9 +2770,27 @@ export class EVMChainAdapter implements ChainAdapter {
         timeout,
       ]);
     };
+    // Single-flight: if a previous tick's probe is still pending,
+    // reuse it instead of issuing a fresh `eth_call`. This bounds
+    // outstanding-probe cardinality to 1 even when the provider
+    // hangs every request, preventing socket / handle accumulation
+    // on long-lived nodes.
+    let probe = this.inflightDurationProbe;
+    if (!probe) {
+      const fresh = readDurationBestEffort();
+      this.inflightDurationProbe = fresh;
+      // `.finally` covers both resolve and reject paths without
+      // altering the value the caller observes.
+      void fresh.finally(() => {
+        if (this.inflightDurationProbe === fresh) {
+          this.inflightDurationProbe = undefined;
+        }
+      });
+      probe = fresh;
+    }
     const [raw, proofingPeriodDurationInBlocks] = await Promise.all([
       rs.getActiveProofPeriodStatus(),
-      withTimeout(readDurationBestEffort(), DURATION_PROBE_TIMEOUT_MS, undefined),
+      withTimeout(probe, DURATION_PROBE_TIMEOUT_MS, undefined),
     ]);
     return {
       activeProofPeriodStartBlock: BigInt(raw.activeProofPeriodStartBlock ?? raw[0]),

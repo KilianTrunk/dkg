@@ -2,7 +2,7 @@
  * Unit tests for evm-adapter pure helpers and constructor-only surface (07 EVM_MODULE —
  * revert decoding used across chain operations). No live RPC / Hardhat.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Interface, ethers } from 'ethers';
 import { decodeEvmError, enrichEvmError, EVMChainAdapter, type EVMAdapterConfig } from '../src/evm-adapter.js';
 
@@ -353,34 +353,115 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(status.proofingPeriodDurationInBlocks).toBe(50n);
   });
 
-  it('getActiveProofPeriodStatus does not stall when the duration probe hangs (Codex round 5)', async () => {
+  it('getActiveProofPeriodStatus does not stall when the duration probe hangs (Codex round 5, fake-timers)', async () => {
     // A provider that accepts the request but never resolves — e.g.
     // RPC slow path, half-broken websocket — would otherwise pin
     // every status read until the underlying timeout (often >30s)
     // and silently freeze the prover loop. The 2s race must kick
     // in long before the primary status leg comes back, returning
     // `undefined` so the prover falls back to the cached duration.
+    //
+    // Codex round 6 on PR #369: drive setTimeout via fake timers
+    // instead of waiting on real wall clock. Real-time assertions
+    // are flaky under loaded CI / long GC pauses.
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      const fakeRs = {
+        getActiveProofPeriodStatus: async () => ({
+          activeProofPeriodStartBlock: 1234n,
+          isValid: true,
+        }),
+        getActiveProofingPeriodDurationInBlocks: () =>
+          new Promise(() => {/* never resolves */}),
+      };
+      (a as any).init = async () => undefined;
+      (a as any).getRandomSampling = async () => ({ rs: fakeRs, rss: {} });
+      const inflight = a.getActiveProofPeriodStatus();
+      // Advance past DURATION_PROBE_TIMEOUT_MS (2000) to fire the
+      // fallback resolve and let the awaited Promise.all settle.
+      await vi.advanceTimersByTimeAsync(2001);
+      const status = await inflight;
+      expect(status.activeProofPeriodStartBlock).toBe(1234n);
+      expect(status.isValid).toBe(true);
+      expect(status.proofingPeriodDurationInBlocks).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('getActiveProofPeriodStatus single-flights the duration probe (Codex round 6)', async () => {
+    // A hung probe must NOT cause one stuck `eth_call` per tick —
+    // the adapter has to reuse the in-flight promise across
+    // overlapping calls so cardinality stays at 1. Without this
+    // guard, a long-lived node in a hung-RPC state would leak one
+    // stuck request per tick and eventually exhaust handles.
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      const probeCalls = vi.fn();
+      const fakeRs = {
+        getActiveProofPeriodStatus: async () => ({
+          activeProofPeriodStartBlock: 7n,
+          isValid: false,
+        }),
+        getActiveProofingPeriodDurationInBlocks: () => {
+          probeCalls();
+          return new Promise(() => {/* never resolves */});
+        },
+      };
+      (a as any).init = async () => undefined;
+      (a as any).getRandomSampling = async () => ({ rs: fakeRs, rss: {} });
+      // Three back-to-back tick calls; each times out at 2s with
+      // fallback `undefined`. The duration probe MUST be issued
+      // exactly once across all three because the in-flight
+      // promise from tick #1 is still pending.
+      const calls = [
+        a.getActiveProofPeriodStatus(),
+        a.getActiveProofPeriodStatus(),
+        a.getActiveProofPeriodStatus(),
+      ];
+      await vi.advanceTimersByTimeAsync(2001);
+      const results = await Promise.all(calls);
+      for (const r of results) {
+        expect(r.activeProofPeriodStartBlock).toBe(7n);
+        expect(r.isValid).toBe(false);
+        expect(r.proofingPeriodDurationInBlocks).toBeUndefined();
+      }
+      expect(probeCalls).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('getActiveProofPeriodStatus issues a fresh probe after the previous one settles (Codex round 6)', async () => {
+    // Once the in-flight probe rejects/resolves, the next call MUST
+    // be allowed to issue a new one — otherwise a single transient
+    // failure would permanently disable the live duration read.
     const a = new EVMChainAdapter(minimalConfig());
+    const probeCalls = vi.fn();
+    let attempt = 0;
     const fakeRs = {
       getActiveProofPeriodStatus: async () => ({
-        activeProofPeriodStartBlock: 1234n,
+        activeProofPeriodStartBlock: 99n,
         isValid: true,
       }),
-      getActiveProofingPeriodDurationInBlocks: () =>
-        new Promise(() => {/* never resolves */}),
+      getActiveProofingPeriodDurationInBlocks: async () => {
+        probeCalls();
+        attempt += 1;
+        if (attempt === 1) throw new Error('first attempt fails');
+        return 77n;
+      },
     };
     (a as any).init = async () => undefined;
     (a as any).getRandomSampling = async () => ({ rs: fakeRs, rss: {} });
-    const t0 = Date.now();
-    const status = await a.getActiveProofPeriodStatus();
-    const elapsed = Date.now() - t0;
-    expect(status.activeProofPeriodStartBlock).toBe(1234n);
-    expect(status.isValid).toBe(true);
-    expect(status.proofingPeriodDurationInBlocks).toBeUndefined();
-    // Timeout is 2000ms; pad generously for slow CI but still
-    // well below any realistic provider timeout.
-    expect(elapsed).toBeGreaterThanOrEqual(1900);
-    expect(elapsed).toBeLessThan(4000);
+    const first = await a.getActiveProofPeriodStatus();
+    expect(first.proofingPeriodDurationInBlocks).toBeUndefined();
+    // Wait a microtask so the .finally that clears the slot runs.
+    await Promise.resolve();
+    const second = await a.getActiveProofPeriodStatus();
+    expect(second.proofingPeriodDurationInBlocks).toBe(77n);
+    expect(probeCalls).toHaveBeenCalledTimes(2);
   });
 
   it('coerces randomSamplingHubRefreshMs<=0 to the default TTL (no "disable refresh" mode)', () => {

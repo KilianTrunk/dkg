@@ -760,9 +760,26 @@ describe("ChatTurnWriter", () => {
 
     const restarted = new ChatTurnWriter({ client: mockClient, logger: mockLogger, stateDir });
     mockClient.storeChatTurn.mockClear();
+    // T362 — Seed the restarted writer past cold-start; the clamp would
+    // otherwise discard both historical pairs of identical content
+    // before the marker check runs. This test specifically verifies
+    // that markers distinguish two same-content pairs by messageId
+    // (in-session marker behavior, not cold-start replay).
+    restarted.onAgentEnd({
+      sessionId: "seed",
+      messages: [
+        { role: "user", content: "__seed__" },
+        { role: "assistant", content: "__seed__reply__" },
+      ],
+    }, { channelId: "telegram", accountId: "bot", conversationId: "chat-repeat-marker", sessionKey: "agent:main:real" });
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
     restarted.onAgentEnd({
       sessionId: "test",
       messages: [
+        { role: "user", content: "__seed__" },              // saved
+        { role: "assistant", content: "__seed__reply__" },
         { role: "user", content: "repeat marker q", metadata: { messageId: "repeat-older-in" } },
         { role: "assistant", content: "repeat marker a" },
         { role: "user", content: "repeat marker q", metadata: { messageId: "repeat-target-in" } },
@@ -776,18 +793,18 @@ describe("ChatTurnWriter", () => {
       strongSessionId,
       "repeat marker q",
       "repeat marker a",
-      0,
+      1,
     );
     const targetTurnId = (restarted as any).deterministicTurnId(
       strongSessionId,
       "repeat marker q",
       "repeat marker a",
-      1,
+      2,
     );
     expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(1);
     expect(mockClient.storeChatTurn.mock.calls[0][3]?.turnId).toBe(olderTurnId);
     expect(mockClient.storeChatTurn.mock.calls[0][3]?.turnId).not.toBe(targetTurnId);
-    expect((restarted as any).cachedWatermarks.get(strongSessionId)).toBe(1);
+    expect((restarted as any).cachedWatermarks.get(strongSessionId)).toBe(2);
     restarted.flushSync();
   });
 
@@ -2341,12 +2358,28 @@ describe("ChatTurnWriter", () => {
 
     const restarted = new ChatTurnWriter({ client: mockClient, logger: mockLogger, stateDir });
     mockClient.storeChatTurn.mockClear();
+    // T362 — Seed past cold-start so the in-session marker check runs
+    // for both same-content pairs (cold-start clamp would otherwise
+    // discard the first pair entirely, defeating this test's
+    // verification that markers are correlation-bound, not content-only).
+    restarted.onAgentEnd({
+      sessionId: "seed",
+      messages: [
+        { role: "user", content: "__seed__" },
+        { role: "assistant", content: "__seed__reply__" },
+      ],
+    }, { channelId: "telegram", sessionKey: "agent:main:main" });
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
     restarted.onAgentEnd({
       sessionId: "test",
       messages: [
-        { role: "user", content: "same question" },
+        { role: "user", content: "__seed__" },              // saved
+        { role: "assistant", content: "__seed__reply__" },
+        { role: "user", content: "same question" },                                                   // pairIndex 1 — emit
         { role: "assistant", content: "same answer" },
-        { role: "user", content: "same question", context: { Provider: "dkg-ui", DkgTurnId: "node-ui-corr-2" } },
+        { role: "user", content: "same question", context: { Provider: "dkg-ui", DkgTurnId: "node-ui-corr-2" } },  // pairIndex 2 — marker hit, skip
         { role: "assistant", content: "same answer" },
       ],
     }, { channelId: "telegram", sessionKey: "agent:main:main" });
@@ -2358,13 +2391,13 @@ describe("ChatTurnWriter", () => {
       (restarted as any).deriveSessionId({ channelId: "telegram", sessionKey: "agent:main:main" }),
       "same question",
       "same answer",
-      0,
+      1,
     );
     const skippedSecondPairTurnId = (restarted as any).deterministicTurnId(
       (restarted as any).deriveSessionId({ channelId: "telegram", sessionKey: "agent:main:main" }),
       "same question",
       "same answer",
-      1,
+      2,
     );
     expect(mockClient.storeChatTurn.mock.calls[0][3]).toEqual({ turnId: expectedFirstPairTurnId });
     expect(mockClient.storeChatTurn.mock.calls[0][3]).not.toEqual({ turnId: skippedSecondPairTurnId });
@@ -2380,12 +2413,28 @@ describe("ChatTurnWriter", () => {
     });
     const restarted = new ChatTurnWriter({ client: mockClient, logger: mockLogger, stateDir });
     mockClient.storeChatTurn.mockClear();
+    // T362 — Seed past cold-start; the clamp would otherwise discard
+    // the historical UI pair and only emit the latest Telegram pair,
+    // defeating this test's verification that BOTH pairs persist
+    // when the external marker doesn't match an exact ID.
+    restarted.onAgentEnd({
+      sessionId: "seed",
+      messages: [
+        { role: "user", content: "__seed__" },
+        { role: "assistant", content: "__seed__reply__" },
+      ],
+    }, { channelId: "telegram", sessionKey: "agent:main:main" });
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
     restarted.onAgentEnd({
       sessionId: "test",
       messages: [
-        { role: "user", content: "unique ui question", context: { Provider: "dkg-ui" } },
+        { role: "user", content: "__seed__" },              // saved
+        { role: "assistant", content: "__seed__reply__" },
+        { role: "user", content: "unique ui question", context: { Provider: "dkg-ui" } },  // emit
         { role: "assistant", content: "unique ui answer" },
-        { role: "user", content: "telegram question" },
+        { role: "user", content: "telegram question" },                                     // emit
         { role: "assistant", content: "telegram answer" },
       ],
     }, { channelId: "telegram", sessionKey: "agent:main:main" });
@@ -2455,9 +2504,25 @@ describe("ChatTurnWriter", () => {
     });
     const restarted = new ChatTurnWriter({ client: mockClient, logger: mockLogger, stateDir });
     mockClient.storeChatTurn.mockClear();
+    // T362 — Seed past cold-start; the clamp would otherwise discard
+    // the first ambiguous pair and only emit the latest, defeating
+    // this test's verification that BOTH ambiguous pairs persist when
+    // the marker can't bind to an exact ID.
+    restarted.onAgentEnd({
+      sessionId: "seed",
+      messages: [
+        { role: "user", content: "__seed__" },
+        { role: "assistant", content: "__seed__reply__" },
+      ],
+    }, { channelId: "telegram", sessionKey: "agent:main:main" });
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
     restarted.onAgentEnd({
       sessionId: "test",
       messages: [
+        { role: "user", content: "__seed__" },              // saved
+        { role: "assistant", content: "__seed__reply__" },
         { role: "user", content: "ambiguous direct text", context: { Provider: "dkg-ui", DkgTurnId: "node-ui-corr-new-id" } },
         { role: "assistant", content: "ambiguous direct answer" },
         { role: "user", content: "ambiguous direct text", context: { Provider: "dkg-ui" } },
@@ -3012,7 +3077,13 @@ describe("ChatTurnWriter", () => {
     expect(call[2]).toBe("OriginTrail is a decentralized knowledge graph project.");
   });
 
-  it("T359 - delayed W4a flushing still preserves ordinary multi-pair backfill", async () => {
+  it("T362 — delayed W4a flushing on cold start clamps to the latest pair (revised T359)", async () => {
+    // Pre-T362, this test exercised the same cold-start replay assumption
+    // as the R2.4 backfill test — feed 2 pairs to a fresh writer and
+    // expect both to persist. With the cold-start clamp in place
+    // (savedUpTo === -1 → discard historical pairs, emit only the
+    // latest), only the most-recent pair lands. Steady-state in-session
+    // backfill is exercised separately by the T362 in-session test.
     const event: AgentEndContext = {
       sessionId: "test",
       messages: [
@@ -3025,11 +3096,10 @@ describe("ChatTurnWriter", () => {
     writer.onAgentEnd(event, { channelId: "telegram", sessionKey: "sk" });
     await flushMicrotasks();
 
-    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(2);
-    expect(mockClient.storeChatTurn.mock.calls.map((call) => [call[1], call[2]])).toEqual([
-      ["q1", "a1"],
-      ["q2", "a2"],
-    ]);
+    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(1);
+    const call = mockClient.storeChatTurn.mock.calls[0];
+    expect(call[1]).toBe("q2");
+    expect(call[2]).toBe("a2");
   });
 
   it("T5 — cross-path stamps live on a SHORTER TTL than the in-flight turnIds (<=10s)", () => {
@@ -3283,17 +3353,34 @@ describe("ChatTurnWriter", () => {
   });
 
   it("backfill of identical content STILL persists both pairs even after symmetric dedup (R12.6 + R10.4)", async () => {
-    // Backfill scenario: agent_end fires with messages array containing
-    // two same-content pairs. Pre-fix collision in dedup would drop
-    // the second. The W4b-origin check is gated to LAST pair only, so
-    // the earlier (backfill) pair persists via its own pair-indexed
-    // turnId without false dedup.
+    // Backfill scenario: in-session agent_end fires with messages array
+    // containing two same-content pairs. Pre-fix collision in dedup
+    // would drop the second. The W4b-origin check is gated to LAST
+    // pair only, so the earlier (backfill) pair persists via its own
+    // pair-indexed turnId without false dedup.
+    //
+    // T362 — Seed the writer past cold-start first; the cold-start
+    // clamp would otherwise discard historical pairs and emit only
+    // the latest. This test specifically exercises in-session
+    // backfill (the post-cold-start regime), so we seed and clear.
+    writer.onAgentEnd(
+      { sessionId: "t", messages: [
+        { role: "user", content: "__seed__" },
+        { role: "assistant", content: "__seed__reply__" },
+      ]},
+      { channelId: "ch", sessionKey: "sk" },
+    );
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
     const event: AgentEndContext = {
       sessionId: "t",
       messages: [
-        { role: "user", content: "thanks" },
+        { role: "user", content: "__seed__" },              // pairIndex 0 — savedUpTo
+        { role: "assistant", content: "__seed__reply__" },
+        { role: "user", content: "thanks" },                // pairIndex 1 — emit
         { role: "assistant", content: "you're welcome" },
-        { role: "user", content: "thanks" },
+        { role: "user", content: "thanks" },                // pairIndex 2 — emit
         { role: "assistant", content: "you're welcome" },
       ],
     };
@@ -3373,19 +3460,36 @@ describe("ChatTurnWriter", () => {
   });
 
   it("backfill: W4a persists pair 5 then pair 7 — watermark is 7, not incrementing arithmetic (R11.2)", async () => {
-    // 4 unsaved pairs: indices 0..3 in messages. Set watermark to -1 (fresh).
-    // After all persist, watermark should be at the last persisted pair's
-    // index (3), not whatever cumulative count of persists.
+    // 4 unsaved in-session pairs (indices 1..4). After all persist,
+    // watermark should be at the last persisted pair's index (4), not
+    // cumulative count of persists.
+    //
+    // T362 — Seed past cold-start first; the clamp engages on
+    // savedUpTo === -1 and would otherwise discard the historical
+    // pairs. This test specifically asserts the absolute-pairIndex
+    // watermark advance, which is in-session backfill behavior.
+    writer.onAgentEnd(
+      { sessionId: "t", messages: [
+        { role: "user", content: "__seed__" },
+        { role: "assistant", content: "__seed__reply__" },
+      ]},
+      { channelId: "ch", sessionKey: "sk" },
+    );
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
     const event: AgentEndContext = {
       sessionId: "t",
       messages: [
-        { role: "user", content: "u0" },
+        { role: "user", content: "__seed__" },              // pairIndex 0 — saved
+        { role: "assistant", content: "__seed__reply__" },
+        { role: "user", content: "u0" },                    // pairIndex 1 — emit
         { role: "assistant", content: "a0" },
-        { role: "user", content: "u1" },
+        { role: "user", content: "u1" },                    // pairIndex 2 — emit
         { role: "assistant", content: "a1" },
-        { role: "user", content: "u2" },
+        { role: "user", content: "u2" },                    // pairIndex 3 — emit
         { role: "assistant", content: "a2" },
-        { role: "user", content: "u3" },
+        { role: "user", content: "u3" },                    // pairIndex 4 — emit
         { role: "assistant", content: "a3" },
       ],
     };
@@ -3394,7 +3498,7 @@ describe("ChatTurnWriter", () => {
     await new Promise((r) => setTimeout(r, 70));
     expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(4);
     const watermarks = (writer as any).cachedWatermarks as Map<string, number>;
-    expect(watermarks.get("openclaw:ch:::sk")).toBe(3); // last pairIndex
+    expect(watermarks.get("openclaw:ch:::sk")).toBe(4); // last pairIndex
   });
 
   it("collapses tool-using turn into one (user, final-reply) pair (R10.3)", async () => {
@@ -3422,12 +3526,29 @@ describe("ChatTurnWriter", () => {
     // Pre-fix: same-content pairs collided on the dedup key and only the
     // first persisted. With pairIndex baked into the W4a turnId, both
     // backfill pairs get distinct turnIds and both write.
+    //
+    // T362 — In-session backfill regime; seed first to bypass the
+    // cold-start clamp (which would discard historical pairs and emit
+    // only the latest, defeating this test's purpose of verifying that
+    // two unsaved same-content pairs both persist).
+    writer.onAgentEnd(
+      { sessionId: "t", messages: [
+        { role: "user", content: "__seed__" },
+        { role: "assistant", content: "__seed__reply__" },
+      ]},
+      { channelId: "ch", sessionKey: "sk" },
+    );
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
     const event: AgentEndContext = {
       sessionId: "t",
       messages: [
-        { role: "user", content: "thanks" },
+        { role: "user", content: "__seed__" },              // saved
+        { role: "assistant", content: "__seed__reply__" },
+        { role: "user", content: "thanks" },                // emit (pairIndex 1)
         { role: "assistant", content: "you're welcome" },
-        { role: "user", content: "thanks" },
+        { role: "user", content: "thanks" },                // emit (pairIndex 2)
         { role: "assistant", content: "you're welcome" },
       ],
     };
@@ -4079,7 +4200,23 @@ describe("ChatTurnWriter", () => {
     expect(mockLogger.warn).toHaveBeenCalled();
   });
 
-  it("persists every unsaved pair when computeDelta sees multiple (R2.4 backfill)", async () => {
+  it("T362 — cold-start clamp: only the latest pair persists when watermark is missing (R2.4-revised)", async () => {
+    // Pre-T362, this test asserted that all unsaved pairs persist when
+    // computeDelta sees multiple. Live smoke (PR #362) showed that
+    // semantic turned every cold start into a full transcript replay:
+    // OpenClaw retains the channel transcript (Telegram, etc.) across
+    // sessions, while DKG state can be wiped independently. On the first
+    // agent_end after a fresh DKG home, `messages[]` carries the entire
+    // historical transcript; walking those pairs replays each one
+    // (the daemon does not idempotently dedupe — every storeChatExchange
+    // mints fresh userMsg/assistantMsg UUIDs even when turnId matches),
+    // bloating chat-turns by ~20 triples per replayed pair.
+    //
+    // The cold-start clamp inside `runAgentEndPersist` discards
+    // historical pairs when savedUpTo === -1 and emits only the latest.
+    // Subsequent agent_end calls see a non-negative savedUpTo, the
+    // clamp does NOT engage, and within-session backfill works as
+    // before (covered by the next test).
     const event: AgentEndContext = {
       sessionId: "test",
       messages: [
@@ -4091,14 +4228,63 @@ describe("ChatTurnWriter", () => {
     };
     writer.onAgentEnd(event, { channelId: "ch", sessionKey: "sk" });
     await flushMicrotasks();
-    // Both pairs must be written — not just the last one.
-    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(2);
-    const firstCall = mockClient.storeChatTurn.mock.calls[0];
-    const secondCall = mockClient.storeChatTurn.mock.calls[1];
-    expect(firstCall[1]).toBe("u1");
-    expect(firstCall[2]).toBe("a1");
-    expect(secondCall[1]).toBe("u2");
-    expect(secondCall[2]).toBe("a2");
+    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(1);
+    const call = mockClient.storeChatTurn.mock.calls[0];
+    expect(call[1]).toBe("u2");
+    expect(call[2]).toBe("a2");
+    // Watermark must advance to the latest pairIndex (1), implicitly
+    // claiming index 0 as done. Without this advance, the next
+    // agent_end would re-find the historical pair as unsaved.
+    // loadWatermark consults the pending debounce, so no 50ms wait needed.
+    expect((writer as any).loadWatermark("openclaw:ch:::sk")).toBe(1);
+  });
+
+  it("T362 — post-cold-start in-session backfill still emits each unsaved pair", async () => {
+    // Once the cold-start clamp has run and advanced the watermark, a
+    // subsequent agent_end with N new unsaved pairs MUST emit all N.
+    // Within-session backfill is still desirable: e.g., a typed-hook
+    // outage between turn 1 and turn 5 means turns 2..4 sit unsaved
+    // in `messages[]` and need to land on the next agent_end fire.
+    // The clamp only suppresses cold start (savedUpTo === -1), not
+    // legitimate mid-session backfill (savedUpTo >= 0).
+    const seedEvent: AgentEndContext = {
+      sessionId: "test",
+      messages: [
+        { role: "user", content: "u1" },
+        { role: "assistant", content: "a1" },
+      ],
+    };
+    writer.onAgentEnd(seedEvent, { channelId: "ch", sessionKey: "sk" });
+    await flushMicrotasks();
+    // Cold start emitted exactly 1 (only pair). Watermark now at 0.
+    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(1);
+    mockClient.storeChatTurn.mockClear();
+
+    // Subsequent agent_end with 3 new pairs (u2..u4). savedUpTo = 0,
+    // so pair index 0 is skipped and indices 1, 2, 3 all emit.
+    const backfillEvent: AgentEndContext = {
+      sessionId: "test",
+      messages: [
+        { role: "user", content: "u1" },     // pairIndex 0 — saved
+        { role: "assistant", content: "a1" },
+        { role: "user", content: "u2" },     // pairIndex 1 — emit
+        { role: "assistant", content: "a2" },
+        { role: "user", content: "u3" },     // pairIndex 2 — emit
+        { role: "assistant", content: "a3" },
+        { role: "user", content: "u4" },     // pairIndex 3 — emit
+        { role: "assistant", content: "a4" },
+      ],
+    };
+    writer.onAgentEnd(backfillEvent, { channelId: "ch", sessionKey: "sk" });
+    await flushMicrotasks();
+
+    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(3);
+    const persisted = mockClient.storeChatTurn.mock.calls.map((call) => [call[1], call[2]]);
+    expect(persisted).toEqual([
+      ["u2", "a2"],
+      ["u3", "a3"],
+      ["u4", "a4"],
+    ]);
   });
 
   it("pending queue collapses into one user-side per outbound (R2.3 / T15)", async () => {
@@ -4243,32 +4429,53 @@ describe("ChatTurnWriter", () => {
   }, 10_000);
 
   it("onBeforeCompaction clears the watermark so post-compaction turns persist (R5.2)", async () => {
-    // First: persist 3 turns so watermark advances to 2.
+    // Pre-compaction setup: seed past cold-start (1 persist), then
+    // an in-session backfill of 2 pairs (post-clamp, in-session
+    // backfill emits all unsaved pairs). Watermark advances to 2.
+    writer.onAgentEnd(
+      { sessionId: "t", messages: [
+        { role: "user", content: "__seed__" },
+        { role: "assistant", content: "__seed__reply__" },
+      ]},
+      { channelId: "ch", sessionKey: "sk" },
+    );
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
     const preEvent: AgentEndContext = {
       sessionId: "t",
       messages: [
-        { role: "user", content: "u1" },
+        { role: "user", content: "__seed__" },              // saved
+        { role: "assistant", content: "__seed__reply__" },
+        { role: "user", content: "u1" },                    // emit
         { role: "assistant", content: "a1" },
-        { role: "user", content: "u2" },
+        { role: "user", content: "u2" },                    // emit
         { role: "assistant", content: "a2" },
-        { role: "user", content: "u3" },
-        { role: "assistant", content: "a3" },
       ],
     };
     writer.onAgentEnd(preEvent, { channelId: "ch", sessionKey: "sk" });
     await flushMicrotasks();
     await new Promise((r) => setTimeout(r, 70)); // let the 50ms debounce commit
-    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(3);
+    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(2);
 
     mockClient.storeChatTurn.mockClear();
     // Session-scoped reset — must pass the same ctx so the correct
-    // session's watermark is cleared.
+    // session's watermark is cleared. After this, savedUpTo returns
+    // to -1; the next agent_end is again "cold start" for this
+    // session.
     writer.onBeforeCompaction({}, { channelId: "ch", sessionKey: "sk" });
 
-    // After compaction a shorter messages array arrives (representative of
-    // gateway summarization: old turns folded to a single summary pair).
-    // Without the watermark reset, the pair-count cursor at 2 would skip
-    // the first 3 pairs of this new array entirely.
+    // After compaction a shorter messages array arrives (representative
+    // of gateway summarization: old turns folded to a single summary
+    // pair). Without the watermark reset, the pair-count cursor at 2
+    // would skip the first pairs of this new array.
+    // T362 — Post-compaction the cold-start clamp re-engages: only the
+    // latest pair persists, matching the "fresh start" mental model.
+    // Pre-T362 this test asserted 2 post-compaction persists; with the
+    // clamp, the assertion is 1 (the latest pair). Compaction's job
+    // here is verified: the watermark was cleared and a NEW pair lands
+    // (it would NOT land if the watermark had not been cleared, since
+    // the new content's pairIndex 0 would be ≤ the old watermark of 2).
     // Also wait past the 3s dedup TTL so identical-text turns aren't
     // blocked by the cross-path dedup map.
     await new Promise((r) => setTimeout(r, 3100));
@@ -4283,9 +4490,9 @@ describe("ChatTurnWriter", () => {
     };
     writer.onAgentEnd(postEvent, { channelId: "ch", sessionKey: "sk" });
     await flushMicrotasks();
-    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(2);
-    expect(mockClient.storeChatTurn.mock.calls[0][1]).toBe("summary");
-    expect(mockClient.storeChatTurn.mock.calls[1][1]).toBe("follow-up");
+    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(1);
+    expect(mockClient.storeChatTurn.mock.calls[0][1]).toBe("follow-up");
+    expect(mockClient.storeChatTurn.mock.calls[0][2]).toBe("reply");
   }, 10_000);
 
   it("onBeforeCompaction resets only the affected session's watermark (R6.1)", async () => {
@@ -4785,17 +4992,34 @@ describe("ChatTurnWriter", () => {
     // reservation gate already in place. Spy on the stamp method to
     // count calls — pre-fix would be 3 (one per persisted pair),
     // post-fix is 1 (only the last).
+    //
+    // T362 — Seed past cold-start so the in-session backfill loop
+    // actually walks 3 pairs (cold-start clamp would otherwise discard
+    // historical pairs and emit only the latest, defeating this test's
+    // purpose of asserting the per-pair stamp gating).
+    writer.onAgentEnd(
+      { sessionId: "test", messages: [
+        { role: "user", content: "__seed__" },
+        { role: "assistant", content: "__seed__reply__" },
+      ]},
+      { channelId: "tg", sessionKey: "sk" },
+    );
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
     const dkw = writer as any;
     const stampSpy = vi.spyOn(dkw, "markCrossPathStamp");
     const event: AgentEndContext = {
       sessionId: "test",
       messages: [
+        { role: "user", content: "__seed__" },              // saved
+        { role: "assistant", content: "__seed__reply__" },
         { role: "user", content: "u0" },
-        { role: "assistant", content: "a0" },  // pair[0]
+        { role: "assistant", content: "a0" },  // pair[1]
         { role: "user", content: "u1" },
-        { role: "assistant", content: "a1" },  // pair[1]
+        { role: "assistant", content: "a1" },  // pair[2]
         { role: "user", content: "u2" },
-        { role: "assistant", content: "a2" },  // pair[2] (last, live pair)
+        { role: "assistant", content: "a2" },  // pair[3] (last, live pair)
       ],
     };
     writer.onAgentEnd(event, { channelId: "tg", sessionKey: "sk" });
@@ -4806,7 +5030,7 @@ describe("ChatTurnWriter", () => {
     // count how many times the backfill loop stamped, which is
     // exactly the count of calls.
     expect(stampSpy).toHaveBeenCalledTimes(1);
-    // Verify it was the LAST pair that got stamped, not pair[0] or pair[1].
+    // Verify it was the LAST pair that got stamped, not pair[1] or pair[2].
     const lastKey = dkw.w4aOriginKey("u2", "a2");
     expect(stampSpy.mock.calls.some((c: any[]) => c[1] === lastKey)).toBe(true);
     stampSpy.mockRestore();

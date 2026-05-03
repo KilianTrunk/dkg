@@ -584,6 +584,28 @@ export class ChatTurnWriter {
       const savedUpTo = Math.max(w4aWatermark, w4bCount - 1);
       const pairs = this.computeDelta(event.messages, savedUpTo);
       if (pairs.length === 0) return;
+      // T362 — Cold-start clamp. When no prior watermark exists for this
+      // session (savedUpTo === -1) AND `messages[]` carries more than one
+      // valid pair, the older pairs come from a conversation the adapter
+      // never observed: OpenClaw retains the channel transcript across
+      // sessions while DKG state can be wiped independently. Walking those
+      // historical pairs replays them; the daemon does not idempotently
+      // dedupe (each storeChatExchange mints fresh userMsg/assistantMsg
+      // UUIDs even when turnId matches), so each replayed pair bloats the
+      // chat-turns assertion by ~20 triples. Persist only the latest pair;
+      // bumpWatermark advances to its index and MAX semantics implicitly
+      // claim earlier indices as done. Historical pairs remain in the
+      // OpenClaw transcript for context-window recall — they just do not
+      // retroactively flood DKG. See #359 / PR #362 live-smoke evidence.
+      if (savedUpTo < 0 && pairs.length > 1) {
+        const dropped = pairs.length - 1;
+        this.logger.info?.(
+          `[ChatTurnWriter.onAgentEnd] cold-start clamp: ` +
+          `discarded ${dropped} historical pair(s), ` +
+          `persisting only the latest (sessionId=${sessionId})`
+        );
+        pairs.splice(0, dropped);
+      }
       // Persist sequentially so a transient failure on pair N leaves the
       // watermark at N-1 and the next agent_end call retries from the same
       // point. Without sequencing, a failed middle pair could be skipped
@@ -3075,6 +3097,15 @@ export class ChatTurnWriter {
   }
 
   private loadWatermark(sessionId: string): number {
+    // Prefer the pending debounce value if a saveWatermark is in flight.
+    // saveWatermark schedules a 50ms debounce before committing to
+    // `cachedWatermarks`; without this, two rapid `agent_end` fires
+    // within that window both see -1 from `cachedWatermarks` and would
+    // re-clamp under the cold-start guard (T362). bumpWatermark already
+    // uses this pattern at its own call site; centralizing here keeps
+    // the runAgentEndPersist `savedUpTo` derivation consistent.
+    const pending = this.debounceTimers.get(sessionId);
+    if (pending) return pending.pendingIndex;
     return this.cachedWatermarks.get(sessionId) ?? -1;
   }
 

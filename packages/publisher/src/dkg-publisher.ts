@@ -244,11 +244,17 @@ export class DKGPublisher implements Publisher {
       this.publisherWallet = new ethers.Wallet(config.publisherPrivateKey);
       this.publisherAddress = this.publisherWallet.address;
     } else {
+      // No private key supplied → no signing capability. Every on-chain code
+      // path in this class is gated on `if (this.publisherWallet)` and
+      // gracefully no-ops when absent (see `executeOnChainPublish` and the
+      // self-sign / authorship-proof blocks). The previous behaviour
+      // generated an ephemeral `Wallet.createRandom()` here whenever chain
+      // was enabled, which produced unverifiable signatures attributed to a
+      // throw-away address — actively misleading callers that supplied
+      // `publisherAddress` separately. See PR fixing this for the
+      // testnet-blocking incident chain (`ensureProfile` had the same
+      // anti-pattern, fixed in PR #366).
       this.publisherAddress = config.publisherAddress ?? '0x' + '0'.repeat(40);
-      if (config.chain.chainId !== 'none') {
-        const random = ethers.Wallet.createRandom();
-        this.publisherWallet = new ethers.Wallet(random.privateKey);
-      }
     }
 
     for (const key of config.additionalSignerKeys ?? []) {

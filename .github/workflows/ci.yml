@@ -91,6 +91,14 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
 
+      # Cheap (~300 ms) audit that bans `Wallet.createRandom()` outside a
+      # small allowlist of intentional call sites. See
+      # `scripts/audit-create-random.mjs` for the incident this prevents
+      # from regressing — pre-PR-#366 `ensureProfile` used the anti-pattern
+      # to destroy nine testnet admin keys at registration time.
+      - name: Audit Wallet.createRandom usage
+        run: node scripts/audit-create-random.mjs
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

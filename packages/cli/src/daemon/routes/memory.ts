@@ -432,6 +432,52 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
+  // POST /api/profile/query-catalog/read { contextGraphId }
+  if (req.method === "POST" && path === "/api/profile/query-catalog/read") {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+
+    const contextGraphId = parsed.contextGraphId ?? parsed.paranetId;
+    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+
+    const graph = `did:dkg:context-graph:${contextGraphId}/meta/query-catalog`;
+    const query = `PREFIX prof: <http://dkg.io/ontology/profile/>
+PREFIX schema: <http://schema.org/>
+SELECT ?q ?subGraph ?catalog ?name ?description ?sparql ?rank ?catalogName ?catalogDescription ?catalogRank
+WHERE {
+  GRAPH <${graph}> {
+    ?q a prof:SavedQuery ;
+       prof:forSubGraph ?subGraph ;
+       prof:sparqlQuery ?sparql .
+    OPTIONAL { ?q prof:inCatalog ?catalog }
+    OPTIONAL { ?q prof:displayName ?name }
+    OPTIONAL { ?q schema:description ?description }
+    OPTIONAL { ?q prof:rank ?rank }
+    OPTIONAL { ?catalog prof:displayName ?catalogName }
+    OPTIONAL { ?catalog schema:description ?catalogDescription }
+    OPTIONAL { ?catalog prof:rank ?catalogRank }
+  }
+}`;
+
+    try {
+      const result = await agent.store.query(query);
+      const bindings = result.type === "bindings" ? result.bindings : [];
+      return jsonResponse(res, 200, {
+        contextGraphId,
+        graph,
+        result: {
+          type: "bindings",
+          bindings,
+        },
+      });
+    } catch (err: any) {
+      return jsonResponse(res, 400, {
+        error: err?.message ?? "Query catalog read failed",
+      });
+    }
+  }
+
   // POST /api/shared-memory/write (V10) or /api/workspace/write (legacy)
   if (
     req.method === "POST" &&

@@ -644,10 +644,25 @@ export class DkgMemoryPlugin {
     // skipped the disable when the original registration came from
     // merged-workspace-config — leaving the stale DKG memory capability active
     // in the gateway slot even though the user had explicitly disabled it.
+    //
+    // Codex follow-up: but DON'T overwrite another provider's slot. When the
+    // merged config now carries `plugins.slots.memory = 'other-plugin'` (a
+    // different memory provider has been elected), `currentOwnership` is
+    // `{ owned: false, source: 'merged-config' }`. Pre-this-refinement, an
+    // explicit direct `memory.enabled: false` would still have stamped the
+    // disabled capability and clobbered the new owner's runtime. Gate the
+    // direct-config disable on either DKG still owning the slot OR direct
+    // plugin config being the active ownership signal (i.e., no merged-config
+    // ownership decision has been made for this api).
     const directConfigDisableForRegisteredApi =
       hadRegisteredCapability &&
       currentApi !== null &&
-      directPluginConfigMemoryEnabledForApi(currentApi) === false;
+      directPluginConfigMemoryEnabledForApi(currentApi) === false &&
+      (
+        !currentOwnership ||
+        currentOwnership.owned === true ||
+        currentOwnership.source === 'direct-plugin-config'
+      );
     const targetApi =
       currentOwnership?.owned === true || directConfigDisableForRegisteredApi
         ? currentApi

@@ -166,6 +166,27 @@ describe('openclaw-config helpers', () => {
     expect(resolveOpenClawRouteMetadataConfig(api)).toEqual(routeConfig);
   });
 
+  it('T364 follow-up — recognizes legacy `workspaceDir`-only route config as route metadata', () => {
+    // Codex follow-up regression: pre-fix `hasRouteMetadataConfigSignal`
+    // checked only `agents`/`session`/`workspace`. A runtime cfg
+    // carrying just `workspaceDir` (the third entry in setup.ts's
+    // recognized fallback chain `agents.defaults.workspace -> workspace
+    // -> workspaceDir`) was dropped from route metadata, so
+    // `resolveChannelDispatchConfig` lost the workspace path entirely
+    // on those layouts. Including `workspaceDir` in the signal check
+    // keeps setup-time and runtime recognition aligned.
+    const routeConfig = {
+      workspaceDir: '/legacy-workspace',
+    };
+    const api = {
+      config: {},
+      cfg: routeConfig,
+    } as any;
+
+    expect(resolveOpenClawMergedConfig(api)).toBeUndefined();
+    expect(resolveOpenClawRouteMetadataConfig(api)).toEqual(routeConfig);
+  });
+
   it('keeps session-only route metadata separate from merged plugin config', () => {
     const routeConfig = {
       session: {

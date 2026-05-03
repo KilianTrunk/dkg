@@ -108,7 +108,19 @@ function hasMergedPluginConfigSignal(value: Record<string, unknown>): boolean {
 }
 
 function hasRouteMetadataConfigSignal(value: Record<string, unknown>): boolean {
-  return isObjectRecord(value.agents) || isObjectRecord(value.session) || typeof value.workspace === 'string';
+  // T364 — `workspaceDir` is a recognized cfg shape (`setup.ts:166-190` reads
+  // the fallback chain `agents.defaults.workspace → workspace → workspaceDir`
+  // when discovering the workspace path). Pre-fix `hasRouteMetadataConfigSignal`
+  // omitted it, so a runtime cfg carrying ONLY `workspaceDir` was dropped from
+  // dispatch route metadata and `resolveChannelDispatchConfig` lost the
+  // workspace path entirely. Including it keeps setup-time and runtime
+  // recognition aligned across the same openclaw.json layouts.
+  return (
+    isObjectRecord(value.agents) ||
+    isObjectRecord(value.session) ||
+    typeof value.workspace === 'string' ||
+    typeof value.workspaceDir === 'string'
+  );
 }
 
 export function resolveOpenClawMergedConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {

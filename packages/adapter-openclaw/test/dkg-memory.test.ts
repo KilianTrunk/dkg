@@ -261,6 +261,48 @@ describe('DkgMemoryPlugin.register', () => {
     expect(result.error).toContain('disabled');
   });
 
+  it('T364 follow-up — direct-config disable does NOT stamp when another plugin now owns the slot', async () => {
+    // Codex follow-up regression: my earlier T364 fix removed the
+    // `registeredOwnershipSource === 'direct-plugin-config'` gate too
+    // broadly. With it removed, an explicit direct-config
+    // `memory.enabled: false` would fire `disable()` even when the
+    // merged config now carried `plugins.slots.memory = 'other-plugin'`
+    // (a different memory provider has been elected) — clobbering the
+    // new owner's runtime in the gateway slot.
+    //
+    // Post-refinement, the direct-config disable path is gated on either
+    // (a) DKG still owning the slot, OR (b) direct plugin config being
+    // the active ownership signal (no merged-config decision). When
+    // `slots.memory = 'other-plugin'` AND direct says
+    // `memory.enabled: false`, ownership resolves to
+    // `{ owned: false, source: 'merged-config' }` and the direct-config
+    // disable does NOT fire — the new owner's slot is preserved.
+
+    // Step 1: register DKG via merged-config (`slots.memory = 'adapter-openclaw'`).
+    const initialApi = makeApi();
+    expect(plugin.register(initialApi)).toBe(true);
+    expect(initialApi.registerMemoryCapability).toHaveBeenCalledTimes(1);
+
+    // Step 2: a later runtime pass arrives where the merged config has
+    // re-elected another memory provider AND the direct config carries
+    // `memory.enabled: false`. The direct-config disable MUST NOT
+    // stamp the disabled capability because we no longer own the slot.
+    const otherOwnerApi = makeApi();
+    (otherOwnerApi.config as any).plugins.slots.memory = 'some-other-memory-plugin';
+    (otherOwnerApi as any).pluginConfig = {
+      memory: { enabled: false },
+    };
+
+    expect(plugin.disable(otherOwnerApi)).toBe(false);
+
+    // The `otherOwnerApi.registerMemoryCapability` MUST NOT be called —
+    // we don't own the slot anymore, so we can't stamp anything on it.
+    expect(otherOwnerApi.registerMemoryCapability).not.toHaveBeenCalled();
+    // Local registration is invalidated regardless (we know we're no
+    // longer the slot owner).
+    expect(plugin.isRegistered()).toBe(false);
+  });
+
   it('warns about direct memory disable without setup guidance', () => {
     const api = makeApi();
     api.config = {

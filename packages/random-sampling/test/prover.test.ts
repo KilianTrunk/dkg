@@ -566,6 +566,72 @@ describe('RandomSamplingProver — short-circuits', () => {
     await prover.close();
   });
 
+  it('falls back to existing.proofingPeriodDurationInBlocks when legacy adapter omits status.proofingPeriodDurationInBlocks (Codex round 5)', async () => {
+    // ProofPeriodStatus.proofingPeriodDurationInBlocks is intentionally
+    // optional — older EVM adapters (and any third-party ChainAdapter
+    // implementations) MAY omit it. The prover's `live ?? cached`
+    // fallback guarantees the wall-clock staleness check still works
+    // in that case. Without explicit coverage, a regression that
+    // makes `isCachedChallengeStale` *require* the live field would
+    // re-deadlock against legacy adapters with no test failure.
+    //
+    // Setup: live duration is omitted from status; cached challenge
+    // duration is short enough to be wall-clock-stale at CURRENT_BLOCK.
+    // The prover MUST consult the cached duration, see the staleness,
+    // and force createChallenge instead of reusing the unsolved cache.
+    const fixture: KCFixture = {
+      cgId: 12n, kcId: 8n, ual: 'did:dkg:hardhat:31337/0xpub/8',
+      rootEntities: ['urn:e:1'],
+      publicTriples: [{ subject: 'urn:e:1', predicate: 'urn:p:k', object: '"a"' }],
+    };
+    const { root, leafCount } = await seedKC(store, fixture);
+
+    const FROZEN_PERIOD = 1000n;
+    const CACHED_DURATION = 50n;
+    const CURRENT_BLOCK = 5000;
+    const ROTATED_PERIOD = 5000n;
+
+    const submitProof = vi.fn(async () => ({ hash: '0xnext', blockNumber: CURRENT_BLOCK, success: true }));
+    const createChallenge = vi.fn(async () => ({
+      challenge: makeChallenge({
+        knowledgeCollectionId: fixture.kcId,
+        chunkId: 0n,
+        epoch: 21n,
+        activeProofPeriodStartBlock: ROTATED_PERIOD,
+        proofingPeriodDurationInBlocks: CACHED_DURATION,
+        solved: false,
+      }),
+      contextGraphId: fixture.cgId,
+      hash: '0x', blockNumber: CURRENT_BLOCK, success: true,
+    }));
+    const chain = makeChain({
+      status: {
+        activeProofPeriodStartBlock: FROZEN_PERIOD,
+        isValid: false,
+        // proofingPeriodDurationInBlocks intentionally omitted —
+        // simulating a legacy adapter that hasn't been updated yet.
+      },
+      challengeForNode: makeChallenge({
+        knowledgeCollectionId: fixture.kcId,
+        activeProofPeriodStartBlock: FROZEN_PERIOD,
+        proofingPeriodDurationInBlocks: CACHED_DURATION,
+        solved: false,
+      }),
+      blockNumber: CURRENT_BLOCK,
+      createChallenge,
+      expectedRoot: root,
+      expectedLeafCount: leafCount,
+      cgIdForKc: fixture.cgId,
+      submitProof: submitProof as never,
+    });
+    const prover = new RandomSamplingProver({ chain, store, identityId: IDENTITY_ID });
+    const outcome = await prover.tick();
+    expect(outcome.kind).toBe('submitted');
+    expect(createChallenge).toHaveBeenCalledTimes(1);
+    expect(submitProof).toHaveBeenCalledTimes(1);
+    await prover.close();
+  });
+
   it('returns cg-not-found when getKCContextGraphId returns 0', async () => {
     const chain = makeChain({
       status: { activeProofPeriodStartBlock: 1000n, isValid: true },

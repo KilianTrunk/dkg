@@ -353,6 +353,36 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(status.proofingPeriodDurationInBlocks).toBe(50n);
   });
 
+  it('getActiveProofPeriodStatus does not stall when the duration probe hangs (Codex round 5)', async () => {
+    // A provider that accepts the request but never resolves — e.g.
+    // RPC slow path, half-broken websocket — would otherwise pin
+    // every status read until the underlying timeout (often >30s)
+    // and silently freeze the prover loop. The 2s race must kick
+    // in long before the primary status leg comes back, returning
+    // `undefined` so the prover falls back to the cached duration.
+    const a = new EVMChainAdapter(minimalConfig());
+    const fakeRs = {
+      getActiveProofPeriodStatus: async () => ({
+        activeProofPeriodStartBlock: 1234n,
+        isValid: true,
+      }),
+      getActiveProofingPeriodDurationInBlocks: () =>
+        new Promise(() => {/* never resolves */}),
+    };
+    (a as any).init = async () => undefined;
+    (a as any).getRandomSampling = async () => ({ rs: fakeRs, rss: {} });
+    const t0 = Date.now();
+    const status = await a.getActiveProofPeriodStatus();
+    const elapsed = Date.now() - t0;
+    expect(status.activeProofPeriodStartBlock).toBe(1234n);
+    expect(status.isValid).toBe(true);
+    expect(status.proofingPeriodDurationInBlocks).toBeUndefined();
+    // Timeout is 2000ms; pad generously for slow CI but still
+    // well below any realistic provider timeout.
+    expect(elapsed).toBeGreaterThanOrEqual(1900);
+    expect(elapsed).toBeLessThan(4000);
+  });
+
   it('coerces randomSamplingHubRefreshMs<=0 to the default TTL (no "disable refresh" mode)', () => {
     // The "disable refresh entirely" mode is intentionally not
     // supported — without a TTL backstop, a missed Hub event on a

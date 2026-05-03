@@ -52,6 +52,17 @@ import { HubResolutionCache } from './hub-resolution-cache.js';
 const DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS = 5 * 60 * 1000;
 
 /**
+ * Hard ceiling for the best-effort live `getActiveProofingPeriodDurationInBlocks()`
+ * read inside `getActiveProofPeriodStatus()`. The status read itself is one
+ * `eth_call`; the duration probe is a sibling `eth_call` on the same provider
+ * and should typically resolve in <100ms. If it hasn't returned in 2s the
+ * provider is slow or hanging — fall back to `undefined` and let the prover
+ * use the cached `existing.proofingPeriodDurationInBlocks` rather than
+ * stalling the whole tick. Codex round 5 on PR #369.
+ */
+const DURATION_PROBE_TIMEOUT_MS = 2000;
+
+/**
  * Substrings we treat as "the Hub no longer recognises this contract
  * as a registered participant" — i.e. the cached address is stale and
  * the next call should re-resolve from the Hub. Conservative match on
@@ -2706,16 +2717,24 @@ export class EVMChainAdapter implements ChainAdapter {
     // duration alongside the status read so the prover can compare
     // wall-clock against the same value the contract uses for rollover.
     //
-    // Codex round 3 + 4 — keep the live-duration read STRICTLY best-effort:
+    // Codex round 3 + 4 + 5 — keep the live-duration read STRICTLY best-effort:
     // a transient RPC blip, partial rollout, or an older RS deployment
     // that omits the method from its ABI must NOT make the whole
-    // `getActiveProofPeriodStatus()` reject. Naive `Promise.allSettled`
-    // is NOT enough — `rs.getActiveProofingPeriodDurationInBlocks()`
-    // would throw synchronously (`TypeError: ... is not a function`)
-    // before `allSettled` can wrap it when the method is missing
-    // entirely. Wrap the lookup + call in a never-rejecting helper
-    // that resolves to `undefined` for any failure mode (missing fn,
-    // sync throw, async revert, RPC outage, decode error).
+    // `getActiveProofPeriodStatus()` reject OR stall.
+    //
+    // Naive `Promise.allSettled` is NOT enough —
+    // `rs.getActiveProofingPeriodDurationInBlocks()` would throw
+    // synchronously (`TypeError: ... is not a function`) before
+    // `allSettled` can wrap it when the method is missing entirely.
+    //
+    // Plain `try/catch` is also NOT enough — a hung RPC (provider
+    // accepts the request but never responds) keeps the await pending
+    // forever, blocking the entire status probe even though the
+    // primary `getActiveProofPeriodStatus()` already returned. The
+    // prover can safely continue with the cached challenge duration,
+    // so race the duration read against a short timeout and prefer
+    // `undefined` on slow paths. The prover treats `undefined` as
+    // "fall back to existing.proofingPeriodDurationInBlocks".
     const readDurationBestEffort = async (): Promise<bigint | undefined> => {
       try {
         const fn = (rs as unknown as { getActiveProofingPeriodDurationInBlocks?: () => Promise<unknown> })
@@ -2727,9 +2746,19 @@ export class EVMChainAdapter implements ChainAdapter {
         return undefined;
       }
     };
+    const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+      });
+      return Promise.race([
+        p.then((v) => { if (timer) clearTimeout(timer); return v; }),
+        timeout,
+      ]);
+    };
     const [raw, proofingPeriodDurationInBlocks] = await Promise.all([
       rs.getActiveProofPeriodStatus(),
-      readDurationBestEffort(),
+      withTimeout(readDurationBestEffort(), DURATION_PROBE_TIMEOUT_MS, undefined),
     ]);
     return {
       activeProofPeriodStartBlock: BigInt(raw.activeProofPeriodStartBlock ?? raw[0]),

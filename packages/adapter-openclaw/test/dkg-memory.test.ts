@@ -214,6 +214,53 @@ describe('DkgMemoryPlugin.register', () => {
     expect(result.error).toContain('disabled');
   });
 
+  it('T364 — direct-config disable stamps disabled capability even when prior registration came from merged-config', async () => {
+    // Regression for the Codex bug flagged on PR #364:
+    // pre-fix the disable path required `registeredOwnershipSource ===
+    // 'direct-plugin-config'`, which silently skipped the disable when the
+    // adapter had originally been registered via merged-workspace-config
+    // (`plugins.slots.memory: 'adapter-openclaw'`). Result: a user who
+    // edited `memory.enabled: false` into their direct plugin config saw
+    // local bookkeeping cleared but the gateway's slot kept pointing at
+    // the stale DKG memory capability — recall/prompt-building stayed
+    // wired through DKG even though the user explicitly disabled it.
+    //
+    // Post-fix the gate is `hadRegisteredCapability && currentApi !== null
+    // && directPluginConfigMemoryEnabledForApi(currentApi) === false` —
+    // the source of the prior registration no longer matters.
+
+    // Step 1: register via merged-workspace-config. makeApi()'s default
+    // config carries `plugins.slots.memory: 'adapter-openclaw'`, which
+    // makes `memorySlotOwnershipForApi` resolve `source: 'merged-config'`.
+    const mergedConfigApi = makeApi();
+    expect(plugin.register(mergedConfigApi)).toBe(true);
+    expect(mergedConfigApi.registerMemoryCapability).toHaveBeenCalledTimes(1);
+
+    // Sanity: confirm the registered ownership source.
+    expect((plugin as any).registeredOwnershipSource).toBe('merged-config');
+
+    // Step 2: a later runtime pass arrives with direct-plugin-config-only
+    // carrying `memory.enabled: false` — no `plugins.slots.memory` field,
+    // so this api would resolve as direct-plugin-config ownership.
+    const directDisableApi = makeApi();
+    directDisableApi.config = {
+      memory: { enabled: false },
+    } as any;
+
+    expect(plugin.disable(directDisableApi)).toBe(true);
+
+    // The disabled capability MUST be stamped on the current API so the
+    // gateway slot stops routing memory through DKG.
+    expect(directDisableApi.registerMemoryCapability).toHaveBeenCalledTimes(1);
+    const disabledCapability =
+      directDisableApi.registerMemoryCapability.mock.calls[0][0] as MemoryPluginCapability;
+    const result = await disabledCapability.runtime!.getMemorySearchManager(
+      {} as MemoryRuntimeRequest,
+    );
+    expect(result.manager).toBeNull();
+    expect(result.error).toContain('disabled');
+  });
+
   it('warns about direct memory disable without setup guidance', () => {
     const api = makeApi();
     api.config = {
@@ -541,6 +588,14 @@ describe('DkgMemoryPlugin.register', () => {
   });
 
   it('clears the previous registry without stamping through a stale registered api', () => {
+    // T364 — Pre-fix this test asserted that disable() returned false and
+    // did NOT stamp the disabled capability when the prior registration
+    // was merged-config and the current api carried direct-plugin-config
+    // `memory: { enabled: false }`. That behavior was the bug Codex flagged:
+    // the user explicitly disabling memory in direct config but the stale
+    // DKG capability staying live in the gateway slot. Post-fix, disable()
+    // stamps the disabled capability on `currentApi` (NOT on the stale
+    // `initialApi`) so the gateway slot stops routing memory through DKG.
     const initialApi = makeApi();
     plugin.register(initialApi);
     const currentApi = {
@@ -554,12 +609,17 @@ describe('DkgMemoryPlugin.register', () => {
       registerMemoryCapability: vi.fn(),
     } as unknown as MockApi;
 
-    expect(plugin.disable(currentApi)).toBe(false);
+    expect(plugin.disable(currentApi)).toBe(true);
 
-    expect(currentApi.registerMemoryCapability).not.toHaveBeenCalled();
+    // Disabled capability lands on the CURRENT api, not the stale initial
+    // one — that's the "without stamping through a stale registered api"
+    // half of the test name. The initialApi only saw the original
+    // enabled-capability registration.
+    expect(currentApi.registerMemoryCapability).toHaveBeenCalledTimes(1);
     expect(initialApi.registerMemoryCapability).toHaveBeenCalledTimes(1);
     expect(plugin.isRegistered()).toBe(false);
     plugin.reAssertCapability();
+    expect(currentApi.registerMemoryCapability).toHaveBeenCalledTimes(1);
     expect(initialApi.registerMemoryCapability).toHaveBeenCalledTimes(1);
   });
 

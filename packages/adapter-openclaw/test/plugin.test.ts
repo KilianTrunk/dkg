@@ -520,12 +520,20 @@ describe('DkgNodePlugin', () => {
     });
     (plugin as any).registerIntegrationModules(currentDirectApi, { enableFullRuntime: true });
 
-    expect(currentRegisterMemoryCapability).not.toHaveBeenCalled();
+    // T364 — Pre-fix this test asserted `currentRegisterMemoryCapability`
+    // NOT to be called when the prior registration was merged-config. That
+    // was the bug Codex flagged: the user explicitly disabling memory in
+    // direct config saw local bookkeeping cleared but the gateway slot
+    // kept the stale DKG capability live. Post-fix, the disabled capability
+    // is stamped on the CURRENT api (`currentDirectApi`, NOT the stale
+    // `initialApi`) so the gateway slot stops routing memory through DKG.
+    expect(currentRegisterMemoryCapability).toHaveBeenCalledTimes(1);
     expect(initialRegisterMemoryCapability).toHaveBeenCalledTimes(1);
     expect((plugin as any).memoryPlugin).toBeNull();
     expect((plugin as any).memoryResolverApi).toBeNull();
     oldMemoryPlugin.reAssertCapability();
     expect(initialRegisterMemoryCapability).toHaveBeenCalledTimes(1);
+    expect(currentRegisterMemoryCapability).toHaveBeenCalledTimes(1);
     expect(oldMemoryPlugin.isRegistered()).toBe(false);
   });
 

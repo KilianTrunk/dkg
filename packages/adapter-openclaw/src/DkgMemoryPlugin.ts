@@ -637,9 +637,15 @@ export class DkgMemoryPlugin {
       ? api
       : null;
     const currentOwnership = currentApi ? memorySlotOwnershipForApi(currentApi) : undefined;
+    // T364 — When the user explicitly disables memory via direct plugin config
+    // (`memory.enabled: false`), stamp the disabled capability regardless of how
+    // the prior registration was sourced. Pre-fix this gate also required
+    // `registeredOwnershipSource === 'direct-plugin-config'`, which silently
+    // skipped the disable when the original registration came from
+    // merged-workspace-config — leaving the stale DKG memory capability active
+    // in the gateway slot even though the user had explicitly disabled it.
     const directConfigDisableForRegisteredApi =
       hadRegisteredCapability &&
-      this.registeredOwnershipSource === 'direct-plugin-config' &&
       currentApi !== null &&
       directPluginConfigMemoryEnabledForApi(currentApi) === false;
     const targetApi =

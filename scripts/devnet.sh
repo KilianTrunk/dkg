@@ -724,13 +724,35 @@ cmd_start() {
       // also need to be signed by the op wallet (the address that owns the
       // identity in the eyes of the staking + profile contracts).
       const n = $NUM_NODES;
-      const opSigners = [];
-      const nodeRoles = [];
+      const opSigners = new Array(n).fill(null);
+      const nodeRoles = new Array(n).fill('core');
+      // Codex round 2 on PR #368: parse each node's wallets.json + config.json
+      // independently. A malformed file (truncated mid-write, missing
+      // wallets[0], unparseable JSON) MUST NOT throw and abort staking
+      // for every node — log + skip the bad one and let the rest boot.
+      // Downstream loops gate on \`opSigners[i] != null\` so skipped
+      // entries never reach createConviction/updateAsk.
       for (let i = 1; i <= n; i++) {
-        const w = JSON.parse(fs.readFileSync('$DEVNET_DIR/node' + i + '/wallets.json', 'utf8'));
-        opSigners.push(new ethers.Wallet(w.wallets[0].privateKey, provider));
-        const cfg = JSON.parse(fs.readFileSync('$DEVNET_DIR/node' + i + '/config.json', 'utf8'));
-        nodeRoles.push(cfg.nodeRole || 'core');
+        const wPath = '$DEVNET_DIR/node' + i + '/wallets.json';
+        const cPath = '$DEVNET_DIR/node' + i + '/config.json';
+        try {
+          const w = JSON.parse(fs.readFileSync(wPath, 'utf8'));
+          if (!w || !Array.isArray(w.wallets) || w.wallets.length === 0
+              || !w.wallets[0] || !w.wallets[0].privateKey) {
+            console.log('Node ' + i + ': wallets.json missing wallets[0].privateKey, skipping (' + wPath + ')');
+            continue;
+          }
+          opSigners[i - 1] = new ethers.Wallet(w.wallets[0].privateKey, provider);
+        } catch (e) {
+          console.log('Node ' + i + ': failed to parse wallets.json: ' + (e && e.message || e));
+          continue;
+        }
+        try {
+          const cfg = JSON.parse(fs.readFileSync(cPath, 'utf8'));
+          nodeRoles[i - 1] = cfg.nodeRole || 'core';
+        } catch (e) {
+          console.log('Node ' + i + ': failed to parse config.json (defaulting nodeRole=core): ' + (e && e.message || e));
+        }
       }
 
       // Wait up to 60s for all CORE nodes to have identities. Edge nodes
@@ -738,7 +760,10 @@ cmd_start() {
       // ensureProfile for effectiveRole='edge'), so we don't wait on them.
       // The daemon creates identities eagerly in agent.connect() (dkg-agent.ts
       // ensureProfile path), typically within ~5s of node start.
-      const coreIdxs = nodeRoles.map((r, i) => r === 'core' ? i : -1).filter(i => i >= 0);
+      // Skip nodes whose wallets.json failed to parse (opSigners[i] === null).
+      const coreIdxs = nodeRoles
+        .map((r, i) => r === 'core' && opSigners[i] !== null ? i : -1)
+        .filter(i => i >= 0);
       const nodeIds = new Array(n).fill(0n);
       for (let attempt = 0; attempt < 30; attempt++) {
         let allReady = true;
@@ -759,6 +784,7 @@ cmd_start() {
       for (let i = 0; i < n; i++) {
         if (nodeRoles[i] !== 'core') continue;
         const opSigner = opSigners[i];
+        if (!opSigner) { console.log('Node ' + (i+1) + ' (core): wallets.json invalid, skipping'); continue; }
         const idId = nodeIds[i] || await identity.getIdentityId(opSigner.address);
         if (idId === 0n) { console.log('Node ' + (i+1) + ' (core): no identity after 60s, skipping'); continue; }
 
@@ -780,21 +806,39 @@ cmd_start() {
         // not yet mined. 'latest' would still collide with an in-flight
         // addKey/addOperationalWallets and produce the very nonce error
         // this code path exists to prevent.
-        let nonce = await provider.getTransactionCount(opSigner.address, 'pending');
+        //
+        // Codex round 2 on PR #368: re-read 'pending' before EVERY tx
+        // (not once per node loop). The previous code did `nonce++` at
+        // call site so a failed approve advanced the local counter even
+        // though the chain nonce did not, leaving createConviction +
+        // updateAsk to send with an inflated nonce that would either
+        // queue forever or skip a slot. Re-reading 'pending' between
+        // awaits costs one extra eth_call per tx, which is negligible
+        // for a 6-node devnet bootstrap.
+        const sendWithFreshNonce = async (txFactory) => {
+          const freshNonce = await provider.getTransactionCount(opSigner.address, 'pending');
+          const tx = await txFactory(freshNonce);
+          return tx.wait();
+        };
         try {
           const deployer = await provider.getSigner(0);
           await (await token.connect(deployer).mint(opSigner.address, stakeAmount)).wait();
           // StakingV10.stake pulls TRAC via transferFrom(staker, address(CSS), amount)
           // gated by allowance to StakingV10. Approve StakingV10 here, NOT the NFT —
           // the NFT is only the entry point and never custodies TRAC.
-          await (await token.connect(opSigner).approve(stakingV10Addr, stakeAmount, { nonce: nonce++ })).wait();
-          await (await stakingNFT.connect(opSigner).createConviction(idId, stakeAmount, lockTier, { nonce: nonce++ })).wait();
+          await sendWithFreshNonce((freshNonce) =>
+            token.connect(opSigner).approve(stakingV10Addr, stakeAmount, { nonce: freshNonce }));
+          await sendWithFreshNonce((freshNonce) =>
+            stakingNFT.connect(opSigner).createConviction(idId, stakeAmount, lockTier, { nonce: freshNonce }));
           staked++;
         } catch (e) { console.log('Stake failed for node ' + (i+1) + ': ' + e.message); }
 
-        // Set ask price
+        // Set ask price (independent try block — a failed stake must not
+        // skip ask setup; sendWithFreshNonce re-reads 'pending' so it
+        // tolerates the chain nonce having advanced or not).
         try {
-          await (await profile.connect(opSigner).updateAsk(idId, askAmount, { nonce: nonce++ })).wait();
+          await sendWithFreshNonce((freshNonce) =>
+            profile.connect(opSigner).updateAsk(idId, askAmount, { nonce: freshNonce }));
           asked++;
         } catch (e) { console.log('Ask failed for node ' + (i+1) + ': ' + e.message); }
       }

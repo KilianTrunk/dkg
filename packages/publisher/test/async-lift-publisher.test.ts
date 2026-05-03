@@ -336,7 +336,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(released.bindings).toHaveLength(0);
   });
 
-  it('does not delete a newer wallet lock when an older job releases late', async () => {
+  it('rejects a stale release without deleting a newer wallet lock', async () => {
     const publisher = createPublisher();
     const jobA = await publisher.lift(request());
     const jobB = await publisher.lift({ ...request(), shareOperationId: 'op-2' });
@@ -370,14 +370,16 @@ describe('TripleStoreAsyncLiftPublisher', () => {
       ),
     );
 
-    await publisher.update(jobA, 'failed', {
-      failure: createLiftJobFailureMetadata({
-        failedFromState: 'validated',
-        code: 'authority_unavailable',
-        message: 'late failure',
-        errorPayloadRef: 'urn:error:late-failure',
-      }) as any,
-    });
+    await expect(
+      publisher.update(jobA, 'failed', {
+        failure: createLiftJobFailureMetadata({
+          failedFromState: 'validated',
+          code: 'authority_unavailable',
+          message: 'late failure',
+          errorPayloadRef: 'urn:error:late-failure',
+        }) as any,
+      }),
+    ).rejects.toThrow(/stale|lock|claim/i);
 
     const lock = await store.query(`SELECT ?job WHERE {
       GRAPH <${DEFAULT_WALLET_LOCK_GRAPH_URI}> {

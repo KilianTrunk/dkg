@@ -143,7 +143,7 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
   async update(jobId: string, status: LiftJobState, data: Partial<LiftJob> = {}): Promise<void> {
     await this.ensureGraph();
     const current = await this.getRequiredJob(jobId);
-    await this.assertActiveClaimFence(current);
+    await this.assertActiveClaimLock(current);
     const next = this.refreshActiveLease(this.mergeJob(current, status, data));
     this.assertJobMatchesStatus(next);
     await this.writeJob(next);
@@ -283,6 +283,7 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
     if (!current.claim || !current.validation) {
       throw new Error(`LiftJob ${jobId} must be claimed and validated before recording publish results`);
     }
+    await this.assertActiveClaimLock(current);
 
     const mapped = mapPublishResultToLiftJobSuccess({
       publishResult,
@@ -333,6 +334,7 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
   async recordPublishFailure(jobId: string, failure: AsyncLiftPublishFailureInput): Promise<LiftJob> {
     await this.ensureGraph();
     const current = await this.getRequiredJob(jobId);
+    await this.assertActiveClaimLock(current);
     const next = this.mergeJob(current, 'failed', {
       failure: mapPublishExceptionToLiftJobFailure(failure) as any,
     });
@@ -595,9 +597,8 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
     const currentLock = await this.readWalletLock(walletId);
 
     if (job.status === 'claimed' || job.status === 'validated' || job.status === 'broadcast' || job.status === 'included') {
-      if (currentLock && !this.lockMatchesJob(currentLock, job)) {
-        return;
-      }
+      if (!currentLock) throw this.createStaleClaimError(job, `missing active wallet lock for ${walletId}`);
+      if (!this.isUsableActiveLock(currentLock, job)) throw this.createStaleClaimError(job, `wallet lock mismatch for ${walletId}`);
       const acquiredAt = job.timestamps.claimedAt ?? this.now();
       const refreshedExpiry = job.claim?.claimLeaseExpiresAt ?? acquiredAt + this.lockLeaseMs;
       await this.writeWalletLock({
@@ -625,6 +626,7 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
 
   private async recordExecutionFailure(jobId: string, failedFromState: LiftJobState, error: unknown): Promise<LiftJob> {
     const current = await this.getRequiredJob(jobId);
+    await this.assertActiveClaimLock(current);
 
     if (failedFromState === 'claimed' || failedFromState === 'validated') {
       const message = error instanceof Error ? error.message : String(error);
@@ -731,28 +733,38 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
     job: LiftJob,
   ): boolean {
     if (lock.jobId !== job.jobId) return false;
-    if (job.claim?.claimToken && lock.claimToken) {
-      return lock.claimToken === job.claim.claimToken;
-    }
-    return true;
+    if (job.claim?.claimToken) return lock.claimToken === job.claim.claimToken;
+    return !lock.claimToken;
   }
 
-  private async assertActiveClaimFence(job: LiftJob): Promise<void> {
+  private async assertActiveClaimLock(job: LiftJob): Promise<void> {
+    if (!this.requiresActiveClaimLock(job)) return;
+
     const walletId = job.claim?.walletId;
-    if (!walletId) return;
+    if (!walletId) throw this.createStaleClaimError(job, 'missing claim wallet');
+
     const currentLock = await this.readWalletLock(walletId);
-    if (!currentLock) {
-      throw new Error(`stale_claim: wallet lock missing for ${walletId}`);
+    if (!currentLock) throw this.createStaleClaimError(job, `missing active wallet lock for ${walletId}`);
+    if (!this.isUsableActiveLock(currentLock, job)) {
+      throw this.createStaleClaimError(job, `wallet lock mismatch for ${walletId}`);
     }
-    if (!this.lockMatchesJob(currentLock, job)) {
-      throw new Error(`fence_token_mismatch: wallet lock for ${walletId} no longer matches job ${job.jobId}`);
-    }
-    if (currentLock.status !== 'active') {
-      throw new Error(`stale_claim: wallet lock for ${walletId} is not active`);
-    }
-    if (typeof currentLock.expiresAt === 'number' && currentLock.expiresAt <= this.now()) {
-      throw new Error(`stale_claim: wallet lock for ${walletId} expired`);
-    }
+  }
+
+  private requiresActiveClaimLock(job: LiftJob): boolean {
+    return job.status === 'claimed' || job.status === 'validated' || job.status === 'broadcast' || job.status === 'included';
+  }
+
+  private isUsableActiveLock(
+    lock: { jobId: string; claimToken?: string; status?: string; expiresAt?: number },
+    job: LiftJob,
+  ): boolean {
+    if (lock.status !== 'active') return false;
+    if (lock.expiresAt !== undefined && lock.expiresAt <= this.now()) return false;
+    return this.lockMatchesJob(lock, job);
+  }
+
+  private createStaleClaimError(job: LiftJob, reason: string): Error {
+    return new Error(`Stale LiftJob claim for ${job.jobId}: ${reason}`);
   }
 
   private async withClaimLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -895,6 +907,7 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
 
   private async finalizeNoopPublish(jobId: string): Promise<LiftJob> {
     const current = await this.getRequiredJob(jobId);
+    await this.assertActiveClaimLock(current);
     const finalized = this.mergeJob(current, 'finalized', {
       finalization: {
         mode: 'noop',

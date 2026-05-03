@@ -288,6 +288,60 @@ describe('DkgChannelPlugin', () => {
     });
   });
 
+  it.each(['cfg', 'config'] as const)('T364 — merges partial-channel api.%s overlay with current api.pluginConfig instead of masking it', async (sourceKey) => {
+    // T364 regression for the Codex bug flagged on the merge of main into PR
+    // #364: pre-fix `resolveDirectAdapterConfigFallback` only captured
+    // state-metadata-only overlays and returned the first non-metadata
+    // source verbatim. A higher-priority partial overlay like
+    // `{ channel: { port: 9801 } }` (no `enabled` field) would mask the
+    // lower-priority full adapter config in `api.pluginConfig` /
+    // `runtime.*` — the channel ended up dispatching with an incomplete
+    // `cfg` (no `daemonUrl`, no `memory.enabled`, etc.) which broke route
+    // resolution on gateways that emit incremental direct config updates.
+    //
+    // Post-fix `isPartialAdapterConfigOverlay` is checked alongside the
+    // state-metadata-only check; partial overlays are captured in
+    // priority order and merged over the next full direct config.
+    const { runtime } = makeMockRuntime({
+      dispatchImpl: async (params) => {
+        await params.dispatcherOptions.deliver({ text: 'Partial overlay reply' });
+      },
+    });
+    // Higher-priority partial overlay: just a partial channel block, no
+    // `enabled` key (so isPartialAdapterConfigOverlay matches it).
+    const partialChannelOverlay = {
+      channel: { port: 9801 },
+    };
+    // Lower-priority full adapter config carrying the daemonUrl, memory,
+    // and a baseline channel configuration that the overlay should layer
+    // over rather than mask.
+    const currentPluginConfig = {
+      daemonUrl: 'http://localhost:9350',
+      memory: { enabled: true },
+      channel: { enabled: true, port: 9200 },
+    };
+    const api = makeApi({
+      [sourceKey]: partialChannelOverlay,
+      pluginConfig: currentPluginConfig,
+      runtime,
+    } as any);
+    vi.spyOn(client, 'storeChatTurn').mockResolvedValue(undefined);
+
+    plugin.register(api);
+    const reply = await plugin.processInbound('Hello', 'corr-partial-overlay', 'owner');
+
+    expect(reply.text).toBe('Partial overlay reply');
+    const dispatchCfg = (runtime as any).channel.routing.resolveAgentRoute.calls[0][0].cfg;
+    // The dispatch cfg must carry the FULL config's daemonUrl + memory,
+    // and the overlay's channel.port must win over the full config's
+    // channel.port (deep-merge with later-wins semantic on module keys).
+    expect(dispatchCfg).toMatchObject({
+      daemonUrl: 'http://localhost:9350',
+      memory: { enabled: true },
+      channel: { enabled: true, port: 9801 },
+    });
+  });
+
   it('keeps current api.pluginConfig ahead of runtime direct config fallback', async () => {
     const { runtime } = makeMockRuntime({
       dispatchImpl: async (params) => {

@@ -33,7 +33,7 @@ import type {
 import type { DkgDaemonClient, OpenClawAttachmentRef } from './dkg-client.js';
 import type { ChatTurnWriter } from './ChatTurnWriter.js';
 import {
-  isStateMetadataOnlyAdapterConfig,
+  isPartialAdapterConfigOverlay,
   isObjectRecord,
   looksLikeAdapterPluginConfig,
   mergeAdapterPluginConfigs,
@@ -2490,17 +2490,33 @@ function resolveDirectAdapterConfigFallback(api: OpenClawPluginApi): Record<stri
     directAdapterConfigFrom(runtime?.config),
     directAdapterConfigFrom(runtime?.pluginConfig),
   ].filter(isObjectRecord);
-  let metadataOverlay: Record<string, unknown> | undefined;
+  // T364 — Capture all partial overlays (state-metadata-only AND module
+  // partials like `{ channel: { port: 9801 } }`) in priority order so a
+  // higher-priority partial doesn't mask a lower-priority full adapter
+  // config it should layer over. Pre-fix the loop only captured
+  // state-metadata-only overlays and returned the first non-metadata
+  // source verbatim, so a partial channel overlay at api.cfg blocked
+  // the full config in runtime.config from contributing
+  // daemonUrl/memory/etc to the dispatch — breaking route resolution
+  // on gateways that emit incremental direct config updates.
+  // `isPartialAdapterConfigOverlay` is a superset of
+  // `isStateMetadataOnlyAdapterConfig`, so a single check covers both.
+  const overlays: Record<string, unknown>[] = [];
   for (const source of sources) {
-    if (isStateMetadataOnlyAdapterConfig(source)) {
-      metadataOverlay ??= source;
+    if (isPartialAdapterConfigOverlay(source)) {
+      overlays.push(source);
       continue;
     }
-    return metadataOverlay
-      ? mergeAdapterPluginConfigs(source, metadataOverlay)
+    // Found a full config. Merge captured overlays over it. `overlays`
+    // is in highest-first priority order; reverse so the highest
+    // priority is applied last (and wins via mergeAdapterPluginConfigs's
+    // later-arg-wins semantic for top-level keys plus deep-merge for
+    // memory/channel modules).
+    return overlays.length > 0
+      ? mergeAdapterPluginConfigs(source, ...overlays.slice().reverse())
       : source;
   }
-  return metadataOverlay;
+  return overlays[0];
 }
 
 function resolveChannelDispatchConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {

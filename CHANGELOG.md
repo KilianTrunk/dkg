@@ -4,14 +4,33 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+---
+
+## [10.0.0-rc.3] - 2026-05-03
+
+Operator hardening on top of `v10.0.0-rc.2`. No contract redeploy — `chainResetMarker` unchanged, no per-node state wipe is triggered. Ships the admin / operational wallet key split, RandomSampling Hub-rotation self-refresh, prover stale-period detection, and devnet bootstrap fail-fast guards.
+
 ### Added
-- (Changes go here for the next release.)
+- **Persisted profile admin wallet** (#366): `wallets.json` now contains a distinct admin wallet alongside operational wallets so newly-created profiles do not lose their admin key.
+- **Operational wallet self-healing for ACK signing** (#366): core nodes now auto-register configured operational ACK signer wallets on-chain for their profile identity during startup.
+- **`Profile.addOperationalWallets(uint72,address[])` facade** (#366): profile admins can add operational-only keys without using the lower-level generic key-management surface.
+- **End-to-end ACK signer registration coverage** (#366): a real Hardhat/libp2p test now verifies startup registration, StorageACK signing by the confirmed key, and refusal to sign after the key is removed on-chain.
+- **RandomSampling Hub-rotation self-refresh** (#367): `EVMChainAdapter` re-resolves `RandomSampling` + `RandomSamplingStorage` addresses through `HubResolutionCache` on every prover tick instead of caching them at boot, so a Hub rotation no longer strands the prover on dead addresses.
+- **`[rs.tick.forcing-rotation]` log + behaviour** (#369): the prover now compares the cached challenge's period against the on-chain block height every tick and forces a fresh `createChallenge` when the cached "unsolved" challenge is past its wall-clock period boundary, instead of stranding on a stale challenge after a Hub rotation.
+- **Devnet stake-probe via `getNodeStakeV10`** (#368): `scripts/devnet.sh` checks for an existing identity-scoped V10 stake before issuing `createConviction`, preventing duplicate stakes when re-running `start` on an already-bootstrapped devnet.
+- **Devnet hosting-node discovery fail-fast** (#370): `scripts/devnet-test-publish.sh` now distinguishes file-level `wallets.json` failures (refuses to run a partial smoke) from intentional edge-node skips.
 
 ### Changed
-- (Optional.)
+- **Admin-only operational wallet registration** (#366): `Profile.addOperationalWallets` requires a profile admin key; operational keys can no longer add more operational keys.
+- **New profile creation uses the persisted admin wallet** (#366): `EVMChainAdapter.ensureProfile` now uses `chainConfig.adminPrivateKey` for the profile admin address instead of creating an unrecoverable random admin wallet.
+- **StorageACK signing is gated by on-chain confirmation** (#366): core nodes only register/sign with ACK keys confirmed as `OPERATIONAL_KEY` for the node identity.
+- **Devnet bootstrap fail-fast** (#370): `scripts/devnet.sh` now exits non-zero when `staked < coreCount`, refusing to declare devnet ready when only some cores ended up staked.
+- **Single-flight RPC duration probe** (#369): `EVMChainAdapter` uses Contract-instance identity (rather than `HubResolutionCache.generation`) to scope the duration probe slot, so a TTL refresh that mints a new Contract handle correctly invalidates an in-flight probe without breaking `resolveAndAssignRandomSamplingPair`'s concurrent-invalidation detection.
 
 ### Fixed
-- (Optional.)
+- **Invalid ACKs from unregistered wallets** (#366): ACK handlers no longer produce signatures from local keys that are not confirmed operational wallets on-chain.
+- **`HubResolutionCache` invalidate-vs-await race** (#367): a `generation` counter bumped only on `invalidate()` ensures an in-flight resolve started under generation N cannot write back its value if `invalidate()` was called while it was suspended.
+- **Devnet single-wallet `wallets.json` file shape** (#368): `scripts/devnet.sh` now writes the `{ adminWallet, wallets }` shape expected by post-#366 daemons (graceful fallback for legacy single-wallet files retained for testnet operators).
 
 ---
 
@@ -40,7 +59,8 @@ V10 RandomSampling + V8/V10 staking consolidation. Testnet reset required (Base 
 - **`ensureProfile` profile-without-stake on partial failure**: profile creation and staking are now in separate `try/catch` blocks so a failed stake leaves the on-chain identity intact for retry instead of leaving the operator without either.
 - **ABI pinning test drift** for V10 publish/update functions after `merkleLeafCount` was added (`abi-pinning.test.ts`): pin digests refreshed.
 
-[Unreleased]: https://github.com/OriginTrail/dkg/compare/v10.0.0-rc.2...HEAD
+[Unreleased]: https://github.com/OriginTrail/dkg/compare/v10.0.0-rc.3...HEAD
+[10.0.0-rc.3]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.3
 [10.0.0-rc.2]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.2
 [9.0.0]: https://github.com/OriginTrail/dkg-v9/releases/tag/v9.0.0
 

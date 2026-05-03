@@ -30,6 +30,7 @@ import type {
   NodeChallenge,
   ProofPeriodStatus,
   CreateChallengeResult,
+  OperationalWalletRegistrationResult,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -37,6 +38,56 @@ import {
   MerkleRootMismatchError,
   ChallengeNoLongerActiveError,
 } from './chain-adapter.js';
+import { HubResolutionCache } from './hub-resolution-cache.js';
+
+/**
+ * Default TTL for re-resolving `RandomSampling` / `RandomSamplingStorage`
+ * from the Hub. Matches the daemon auto-update poll cadence — small
+ * enough that a missed `Hub.ContractChanged` event still self-heals
+ * within ~5 min, large enough that the steady-state RPC overhead is
+ * effectively zero (one extra `eth_call` every 5 min for the two
+ * names, vs. the prover's per-tick reads). Override per-adapter via
+ * `EVMAdapterConfig.randomSamplingHubRefreshMs`.
+ */
+const DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS = 5 * 60 * 1000;
+
+/**
+ * Hard ceiling for the best-effort live `getActiveProofingPeriodDurationInBlocks()`
+ * read inside `getActiveProofPeriodStatus()`. The status read itself is one
+ * `eth_call`; the duration probe is a sibling `eth_call` on the same provider
+ * and should typically resolve in <100ms. If it hasn't returned in 2s the
+ * provider is slow or hanging — fall back to `undefined` and let the prover
+ * use the cached `existing.proofingPeriodDurationInBlocks` rather than
+ * stalling the whole tick. Codex round 5 on PR #369.
+ */
+const DURATION_PROBE_TIMEOUT_MS = 2000;
+
+/**
+ * Upper bound on the in-flight duration probe slot age. The single-flight
+ * guard reuses a pending probe to bound RPC cardinality at 1, but if the
+ * underlying `eth_call` never settles (hung provider, dropped websocket)
+ * the slot would otherwise stay populated forever and suppress every
+ * fresh probe. After this many ms we abandon the slot regardless and
+ * let the next call start a new probe — capping leaked-handle growth
+ * to one per `MAX_PROBE_AGE_MS` window instead of one per tick. Set
+ * generously above `DURATION_PROBE_TIMEOUT_MS` so honest slow paths
+ * (high RPC latency, congested chain) still benefit from single-flight.
+ * Codex round 8 on PR #369.
+ */
+const MAX_PROBE_AGE_MS = 30_000;
+
+/**
+ * Substrings we treat as "the Hub no longer recognises this contract
+ * as a registered participant" — i.e. the cached address is stale and
+ * the next call should re-resolve from the Hub. Conservative match on
+ * the canonical revert wording from `ContractStatus.onlyContracts` /
+ * `UnauthorizedAccess(Only Contracts in Hub)` so we don't accidentally
+ * drop the cache on an unrelated authorization failure.
+ */
+const HUB_STALE_ERROR_MARKERS = [
+  'Only Contracts in Hub',
+  'UnauthorizedAccess(Only Contracts in Hub)',
+];
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -62,6 +113,9 @@ const ERROR_ABI_CONTRACTS = [
   'PublishingConvictionAccount',
   'RandomSampling', 'RandomSamplingStorage',
 ];
+
+const ADMIN_KEY_PURPOSE = 1;
+const OPERATIONAL_KEY_PURPOSE = 2;
 
 let _errorInterface: Interface | null = null;
 
@@ -126,7 +180,7 @@ export function enrichEvmError(err: unknown): string | null {
   return decoded.name;
 }
 
-export interface EVMAdapterConfig {
+interface EVMAdapterBaseConfig {
   rpcUrl: string;
   /** Primary operational wallet key (used for identity registration, staking, etc.) */
   privateKey: string;
@@ -134,6 +188,32 @@ export interface EVMAdapterConfig {
   additionalKeys?: string[];
   hubAddress: string;
   chainId?: string;
+  /**
+   * TTL (ms) for re-resolving `RandomSampling` / `RandomSamplingStorage`
+   * addresses from the Hub. Defaults to 5 minutes. Values `<= 0` are
+   * treated as "use default" and intentionally NOT supported as a
+   * "disable periodic refresh" mode: even with the Hub event listener
+   * and the `Only Contracts in Hub` retry wrapper, a missed event on
+   * a read-only path (e.g. `getActiveProofPeriodStatus`,
+   * `getNodeChallenge`) would leave the adapter pinned to a stale
+   * address until restart, exactly the failure mode this cache exists
+   * to prevent. The TTL is a backstop, not the primary refresh
+   * mechanism — keep it short enough that a missed rotation
+   * self-heals within minutes and the steady-state RPC overhead is
+   * still effectively zero.
+   */
+  randomSamplingHubRefreshMs?: number;
+}
+
+export interface EVMAdapterConfig extends EVMAdapterBaseConfig {
+  /** Admin wallet key used for profile/key-management transactions. */
+  adminPrivateKey?: string;
+  /**
+   * Documents that this adapter is intentionally running without admin
+   * authority. Missing admin keys are still accepted for backwards-compatible
+   * publish/read-only usage; admin-only operations fail when invoked.
+   */
+  allowNoAdminSigner?: boolean;
 }
 
 interface ContractCache {
@@ -170,10 +250,73 @@ export class EVMChainAdapter implements ChainAdapter {
   private readonly signer: Wallet;
   /** All operational signers (includes primary). Used round-robin for publish TXs. */
   private readonly signerPool: Wallet[];
+  /** Admin signer — used only for profile/key-management operations. */
+  private readonly adminSigner?: Wallet;
   private signerIndex = 0;
   private readonly hubAddress: string;
   private contracts: ContractCache;
   private initialized = false;
+  /**
+   * Single self-refreshing cache for the `RandomSampling` /
+   * `RandomSamplingStorage` pair. RS is the highest-value Hub-resolved
+   * surface (it gates per-period proof rewards), so it gets stricter
+   * freshness guarantees than the one-shot resolution every other
+   * contract uses.
+   *
+   * The two addresses are deliberately treated as a **coupled unit**
+   * because `RandomSampling.initialize()` snapshots its
+   * `RandomSamplingStorage` address once at deploy time. If the
+   * adapter ever held a mixed pair (e.g. new RS + old RSS, or the
+   * inverse) `createChallenge()` would write through one contract
+   * and `getNodeChallenge()` would read from the other — producing
+   * the empty-struct / state-mismatch failures the prover already
+   * has a defensive guard against. Resolving both names atomically
+   * inside one cache eliminates that race.
+   *
+   * See `HubResolutionCache` for the semantics; the listener
+   * installed in `init()` invalidates this cache on
+   * `Hub.ContractChanged` / `Hub.NewContract` for **either** name,
+   * and `withHubStaleRetry()` invalidates it when a write surfaces
+   * `UnauthorizedAccess(Only Contracts in Hub)`.
+   */
+  private readonly randomSamplingPairCache: HubResolutionCache<{ rs: Contract; rss: Contract }>;
+  private hubRotationListenerStarted = false;
+  /**
+   * Single-flight guard for the best-effort
+   * `getActiveProofingPeriodDurationInBlocks()` probe inside
+   * `getActiveProofPeriodStatus()`. Codex round 5 on PR #369: the
+   * 2s `Promise.race` timeout returns `undefined` to the caller but
+   * the underlying `eth_call` is NOT cancellable in ethers v6, so
+   * naively issuing one new probe per tick would accumulate one
+   * stuck request per tick on a hung provider. Instead we reuse the
+   * same in-flight promise across overlapping calls — at most one
+   * probe is ever pending against the provider at a time.
+   *
+   * Codex round 8 on PR #369: also track the `RandomSampling`
+   * Contract instance the probe was started against AND a wall-clock
+   * creation timestamp.
+   *   - Contract-identity guard: a TTL refresh of
+   *     `randomSamplingPairCache` re-resolves `rs` to a freshly
+   *     constructed `Contract` instance WITHOUT calling
+   *     `invalidateRandomSamplingPair()`. The HubResolutionCache
+   *     generation counter is invalidate-only (it is also used by
+   *     `resolveAndAssignRandomSamplingPair()` to detect concurrent
+   *     invalidations, so it must NOT bump on normal refreshes), so
+   *     it can't signal a TTL refresh. Comparing the resolved
+   *     Contract instance by reference is the canonical check: a
+   *     refresh always hands back a new instance.
+   *   - Max-age guard: `Promise.race` returns `undefined` to the
+   *     caller on timeout, but the underlying `eth_call` may
+   *     never settle (truly hung provider). Without an upper
+   *     bound on slot age, a single hung probe would suppress
+   *     every fresh probe forever. After `MAX_PROBE_AGE_MS` we
+   *     abandon the slot regardless; the orphan promise still has
+   *     its `.finally` attached but the slot identity check inside
+   *     it correctly does nothing.
+   */
+  private inflightDurationProbe: Promise<bigint | undefined> | undefined;
+  private inflightDurationProbeContract: Contract | undefined;
+  private inflightDurationProbeStartedAt = 0;
 
   constructor(config: EVMAdapterConfig) {
     this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
@@ -182,12 +325,40 @@ export class EVMChainAdapter implements ChainAdapter {
     for (const key of config.additionalKeys ?? []) {
       this.signerPool.push(new Wallet(key, this.provider));
     }
+    if (config.adminPrivateKey) {
+      this.adminSigner = new Wallet(config.adminPrivateKey, this.provider);
+      const adminAddress = this.adminSigner.address.toLowerCase();
+      if (this.signerPool.some((signer) => signer.address.toLowerCase() === adminAddress)) {
+        throw new Error('EVM adminPrivateKey must be distinct from operational keys');
+      }
+    }
     this.hubAddress = config.hubAddress;
     this.chainId = config.chainId ?? 'evm:31337';
 
     this.contracts = {
       hub: new Contract(config.hubAddress, loadAbi('Hub'), this.signer),
     };
+
+    // Coerce `<=0` to the default. The "disable refresh entirely" mode
+    // is intentionally unsupported (see `randomSamplingHubRefreshMs`
+    // doc above) — without a TTL backstop, a missed Hub event on a
+    // read-only path (`getActiveProofPeriodStatus`, `getNodeChallenge`)
+    // would silently pin the adapter to a stale address until restart.
+    const rawRsRefreshMs = config.randomSamplingHubRefreshMs ?? DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS;
+    const rsRefreshMs = rawRsRefreshMs > 0 ? rawRsRefreshMs : DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS;
+    this.randomSamplingPairCache = new HubResolutionCache(
+      async () => {
+        // Resolve both names in a single round (Promise.all) so that
+        // the cache only ever holds a coherent pair: when this
+        // resolves, both addresses came from the same Hub view.
+        const [rs, rss] = await Promise.all([
+          this.resolveContract('RandomSampling'),
+          this.resolveContract('RandomSamplingStorage'),
+        ]);
+        return { rs, rss };
+      },
+      { ttlMs: rsRefreshMs },
+    );
   }
 
   /** Pick the next signer from the pool (round-robin). */
@@ -234,8 +405,117 @@ export class EVMChainAdapter implements ChainAdapter {
     return this.signer.privateKey;
   }
 
+  private walletKeyHash(address: string): string {
+    return ethers.keccak256(ethers.solidityPacked(['address'], [ethers.getAddress(address)]));
+  }
+
+  private async hasAdminPurpose(
+    identityStorage: Contract,
+    identityId: bigint,
+    address: string,
+  ): Promise<boolean> {
+    return identityStorage.keyHasPurpose(
+      identityId,
+      this.walletKeyHash(address),
+      ADMIN_KEY_PURPOSE,
+    );
+  }
+
+  private async hasOperationalPurpose(
+    identityStorage: Contract,
+    identityId: bigint,
+    address: string,
+  ): Promise<boolean> {
+    return identityStorage.keyHasPurpose(
+      identityId,
+      this.walletKeyHash(address),
+      OPERATIONAL_KEY_PURPOSE,
+    );
+  }
+
+  async isOperationalWalletRegistered(identityId: bigint, address: string): Promise<boolean> {
+    await this.init();
+    const identityStorage = await this.resolveContract('IdentityStorage');
+    return this.hasOperationalPurpose(identityStorage, identityId, address);
+  }
+
+  async ensureOperationalWalletsRegistered(options?: {
+    identityId?: bigint;
+    additionalAddresses?: string[];
+  }): Promise<OperationalWalletRegistrationResult> {
+    await this.init();
+
+    const identityId = options?.identityId ?? (await this.getIdentityId());
+    const result: OperationalWalletRegistrationResult = {
+      identityId,
+      registered: [],
+      alreadyRegistered: [],
+      taken: [],
+    };
+    if (identityId === 0n) return result;
+
+    const identityStorage = await this.resolveContract('IdentityStorage');
+    const candidates = [
+      ...this.signerPool.map((s) => s.address),
+      ...(options?.additionalAddresses ?? []),
+    ];
+    const seen = new Set<string>();
+    const missing: string[] = [];
+
+    for (const candidate of candidates) {
+      const address = ethers.getAddress(candidate);
+      const key = address.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const existingIdentityId = BigInt(await identityStorage.getIdentityId(address));
+      if (existingIdentityId === identityId) {
+        result.alreadyRegistered.push(address);
+      } else if (existingIdentityId === 0n) {
+        missing.push(address);
+      } else {
+        result.taken.push({ address, identityId: existingIdentityId });
+      }
+    }
+
+    if (missing.length === 0) return result;
+
+    if (!this.adminSigner) {
+      throw new Error(
+        `Cannot register operational wallets for identity ${identityId}: ` +
+        'adminPrivateKey is not configured.',
+      );
+    }
+    if (!(await this.hasAdminPurpose(identityStorage, identityId, this.adminSigner.address))) {
+      throw new Error(
+        `Cannot register operational wallets for identity ${identityId}: configured admin wallet ` +
+        `${this.adminSigner.address} is not registered on-chain as an admin key for this identity.`,
+      );
+    }
+
+    const profile = this.contracts.profile!.connect(this.adminSigner) as Contract;
+    const tx = await profile.addOperationalWallets(identityId, missing);
+    await tx.wait();
+
+    for (const address of missing) {
+      if (await this.hasOperationalPurpose(identityStorage, identityId, address)) {
+        result.registered.push(address);
+      }
+    }
+
+    return result;
+  }
+
   private async resolveContract(name: string, abiName?: string): Promise<Contract> {
-    const address: string = await this.contracts.hub.getContractAddress(name);
+    let address: string;
+    try {
+      address = await this.contracts.hub.getContractAddress(name);
+    } catch (err) {
+      if (this.isContractMissingRevert(err)) {
+        throw new Error(`Contract "${name}" not found in Hub at ${this.hubAddress}`, { cause: err });
+      }
+      throw err;
+    }
     if (address === ethers.ZeroAddress) {
       throw new Error(`Contract "${name}" not found in Hub at ${this.hubAddress}`);
     }
@@ -243,11 +523,34 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   private async resolveAssetStorage(name: string, abiName?: string): Promise<Contract> {
-    const address: string = await this.contracts.hub.getAssetStorageAddress(name);
+    let address: string;
+    try {
+      address = await this.contracts.hub.getAssetStorageAddress(name);
+    } catch (err) {
+      if (this.isContractMissingRevert(err)) {
+        throw new Error(`Asset storage "${name}" not found in Hub at ${this.hubAddress}`, { cause: err });
+      }
+      throw err;
+    }
     if (address === ethers.ZeroAddress) {
       throw new Error(`Asset storage "${name}" not found in Hub at ${this.hubAddress}`);
     }
     return new Contract(address, loadAbi(abiName ?? name), this.signer);
+  }
+
+  /**
+   * The current Hub implementation reverts with `ContractDoesNotExist(name)`
+   * (custom error from `UnorderedNamedContractDynamicSet.get`) when a name
+   * is missing, instead of returning `address(0)`. We normalise both
+   * shapes onto the legacy `Contract "X" not found in Hub at <addr>` marker
+   * so downstream code (`getRandomSampling()`'s catch block) only needs
+   * to recognise one wording.
+   */
+  private isContractMissingRevert(err: unknown): boolean {
+    if (!(err instanceof Error)) return false;
+    enrichEvmError(err);
+    return err.message.includes('ContractDoesNotExist')
+      || err.message.includes('AddressDoesNotExist');
   }
 
   private async init(): Promise<void> {
@@ -297,11 +600,12 @@ export class EVMChainAdapter implements ChainAdapter {
     }
 
     try {
-      this.contracts.randomSampling = await this.resolveContract('RandomSampling');
-      this.contracts.randomSamplingStorage = await this.resolveContract('RandomSamplingStorage');
+      await this.resolveAndAssignRandomSamplingPair();
     } catch {
       // RandomSampling not deployed — proof submission unavailable
     }
+
+    await this.startHubRotationListener();
 
     const tokenAddress: string = await this.contracts.hub.getContractAddress('Token');
     if (tokenAddress !== ethers.ZeroAddress) {
@@ -352,11 +656,15 @@ export class EVMChainAdapter implements ChainAdapter {
     // Step 1: Create profile if none exists
     if (identityId === 0n) {
       const nodeName = options?.nodeName ?? `node-${Date.now()}`;
-      const adminWallet = ethers.Wallet.createRandom();
+      if (!this.adminSigner) {
+        throw new Error(
+          'Cannot create profile: adminPrivateKey is required so the profile admin key is not lost.',
+        );
+      }
       const nodeId = ethers.hexlify(ethers.randomBytes(32));
 
       const tx = await this.contracts.profile!.createProfile(
-        adminWallet.address,
+        this.adminSigner.address,
         [],
         nodeName,
         nodeId,
@@ -426,12 +734,19 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async registerIdentity(proof: IdentityProof): Promise<bigint> {
     await this.init();
+    if (!this.adminSigner) {
+      throw new Error(
+        'Cannot register identity: adminPrivateKey is required so the profile admin key is not lost.',
+      );
+    }
+    const nodeName = `node-${ethers.hexlify(ethers.randomBytes(4)).slice(2)}`;
+    const nodeId = proof.publicKey.length > 0 ? proof.publicKey : ethers.randomBytes(32);
 
     const tx = await this.contracts.profile!.createProfile(
-      this.signer.address,
-      [this.signer.address],
-      '',
-      proof.publicKey,
+      this.adminSigner.address,
+      [],
+      nodeName,
+      nodeId,
       0,
     );
     const receipt = await tx.wait();
@@ -1995,9 +2310,12 @@ export class EVMChainAdapter implements ChainAdapter {
     if (!identityStorage) return false;
 
     // Match on-chain verification: keyHasPurpose(identityId, keccak256(signer), OPERATIONAL_KEY)
-    const OPERATIONAL_KEY = 2;
     const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
-    const hasPurpose: boolean = await identityStorage.keyHasPurpose(claimedIdentityId, keyHash, OPERATIONAL_KEY);
+    const hasPurpose: boolean = await identityStorage.keyHasPurpose(
+      claimedIdentityId,
+      keyHash,
+      OPERATIONAL_KEY_PURPOSE,
+    );
     if (!hasPurpose) return false;
 
     // Verify the identity is a staked core node (spec §9.0: "Core nodes MUST be staked").
@@ -2037,13 +2355,18 @@ export class EVMChainAdapter implements ChainAdapter {
     const identityStorage = await this.resolveContract('IdentityStorage');
     if (!identityStorage) return false;
 
-    const OPERATIONAL_KEY = 2;
     const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
-    return identityStorage.keyHasPurpose(claimedIdentityId, keyHash, OPERATIONAL_KEY);
+    return identityStorage.keyHasPurpose(claimedIdentityId, keyHash, OPERATIONAL_KEY_PURPOSE);
   }
 
   async signACKDigest(digest: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array } | undefined> {
     try {
+      const identityId = await this.getIdentityId();
+      if (identityId === 0n) return undefined;
+      if (!(await this.isOperationalWalletRegistered(identityId, this.signer.address))) {
+        return undefined;
+      }
+
       const sig = ethers.Signature.from(await this.signer.signMessage(digest));
       return {
         r: ethers.getBytes(sig.r),
@@ -2163,16 +2486,149 @@ export class EVMChainAdapter implements ChainAdapter {
   // Random Sampling (V10 RandomSampling.sol)
   // =====================================================================
 
-  private requireRandomSampling(): { rs: Contract; rss: Contract } {
-    const rs = this.contracts.randomSampling;
-    const rss = this.contracts.randomSamplingStorage;
-    if (!rs || !rss) {
-      throw new Error(
-        'RandomSampling / RandomSamplingStorage not deployed in this Hub. ' +
-        'The deployer is responsible for shipping these alongside V10 publish.',
-      );
+  /**
+   * Resolve `RandomSampling` and `RandomSamplingStorage` through the
+   * Hub-backed cache. Each call may trigger a re-resolve when the
+   * cached value is missing or has expired (TTL or invalidation),
+   * which is exactly the property that makes node operators no longer
+   * need a daemon restart after a Hub-side contract rotation.
+   *
+   * Failure-mode handling: only the documented "name not registered
+   * in the Hub" case (which `resolveContract` throws as
+   * `Contract "X" not found in Hub at <addr>`) is rewritten to a
+   * deployment-oriented hint. Every other failure (transient RPC,
+   * ABI mismatch, provider error, etc.) propagates with its original
+   * message preserved so the prover loop's error log points
+   * operators at the actual cause instead of misdirecting them
+   * toward a redeploy.
+   */
+  private async getRandomSampling(): Promise<{ rs: Contract; rss: Contract }> {
+    try {
+      return await this.resolveAndAssignRandomSamplingPair();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('not found in Hub at')) {
+        throw new Error(
+          'RandomSampling / RandomSamplingStorage not deployed in this Hub. ' +
+          'The deployer is responsible for shipping these alongside V10 publish.',
+          { cause: err },
+        );
+      }
+      throw err;
     }
-    return { rs, rss };
+  }
+
+  /**
+   * Resolve the RS+RSS pair from the cache and write the handles into
+   * `this.contracts.randomSampling[Storage]` ONLY if no `invalidate()`
+   * happened during the await. Without the generation guard, an
+   * in-flight resolve started before a Hub rotation would leak the
+   * pre-rotation pair back into the side-channel handles, undoing the
+   * invalidation's clearing of those handles and leaving
+   * `isRandomSamplingReady()` reporting `true` against stale addresses.
+   * Returning the (possibly stale) pair to the immediate caller is
+   * still safe — `withHubStaleRetry` catches the inevitable on-chain
+   * `UnauthorizedAccess` and re-tries against the freshly resolved
+   * pair.
+   */
+  private async resolveAndAssignRandomSamplingPair(): Promise<{ rs: Contract; rss: Contract }> {
+    const generationBefore = this.randomSamplingPairCache.currentGeneration();
+    const pair = await this.randomSamplingPairCache.get();
+    if (this.randomSamplingPairCache.currentGeneration() === generationBefore) {
+      this.contracts.randomSampling = pair.rs;
+      this.contracts.randomSamplingStorage = pair.rss;
+    }
+    return pair;
+  }
+
+  /**
+   * Run `fn` and, if it fails with the unique "this caller is no
+   * longer registered as a Hub contract" revert, drop the cached RS
+   * pair and retry exactly once. This is the safety net for the
+   * rare case where (a) the daemon missed the `Hub.ContractChanged`
+   * event (RPC reconnect, dropped subscription, etc.) AND (b) the TTL
+   * hasn't expired yet. After the retry, the cache holds the freshly
+   * resolved pair for subsequent ticks.
+   */
+  private async withHubStaleRetry<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      if (HUB_STALE_ERROR_MARKERS.some((m) => msg.includes(m))) {
+        this.invalidateRandomSamplingPair();
+        return await fn();
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Invalidate both the cache AND the side-channel contract handles. Without
+   * dropping `this.contracts.randomSampling[Storage]`, the public
+   * `isRandomSamplingReady()` probe would keep returning `true` after a Hub
+   * rotation (until the next `getRandomSampling()` re-populates the
+   * handles), giving the prover a stale all-clear.
+   *
+   * Codex round 6 on PR #369: ALSO drop the in-flight duration probe.
+   * The probe was started against the OLD `RandomSampling` contract;
+   * if Hub rotates while it is pending we MUST NOT pair the new
+   * contract's `getActiveProofPeriodStatus()` with the old contract's
+   * duration in the next call. Worse, if the old probe never settles
+   * (hung provider) it would suppress every fresh probe forever via
+   * the single-flight guard. Clearing the slot here lets the next
+   * call issue a fresh probe against the new contract; the now-orphan
+   * old promise is still handled by its `.finally` hook (the slot
+   * identity check inside .finally won't match, so it correctly does
+   * nothing).
+   */
+  private invalidateRandomSamplingPair(): void {
+    this.randomSamplingPairCache.invalidate();
+    this.contracts.randomSampling = undefined;
+    this.contracts.randomSamplingStorage = undefined;
+    this.inflightDurationProbe = undefined;
+    this.inflightDurationProbeContract = undefined;
+    this.inflightDurationProbeStartedAt = 0;
+  }
+
+  /**
+   * Subscribe to Hub `ContractChanged` / `NewContract` events and
+   * invalidate the RS pair cache whenever **either** RS-side name is
+   * rotated. The pair is treated as a single coupled unit (see the
+   * `randomSamplingPairCache` field comment) — invalidating on either
+   * name forces an atomic re-resolve of both.
+   *
+   * `Hub._setContractAddress` is double-tap-emitting (`Hub-extra.test.ts`
+   * E-7): on the new-contract path it emits `NewContract` twice, and
+   * on the update path it emits both `ContractChanged` AND
+   * `NewContract`. We listen to BOTH events so the cache invalidates
+   * regardless of which Hub variant the deployment ships, and the
+   * invalidation is idempotent so duplicate notifications are
+   * harmless.
+   *
+   * `Contract.on(...)` is async in ethers v6: a sync `try/catch` would
+   * miss provider rejections (e.g. HTTP-only endpoints that can't
+   * install filter subscriptions) and leave us with an unhandled
+   * rejection. We `await` both subscriptions and only set
+   * `hubRotationListenerStarted` after both succeed, so a failed
+   * provider can be retried by a future call site if we ever need to
+   * — and meanwhile the TTL refresh path still keeps the pair fresh.
+   */
+  private async startHubRotationListener(): Promise<void> {
+    if (this.hubRotationListenerStarted) return;
+    const onChange = (name: unknown): void => {
+      if (typeof name !== 'string') return;
+      if (name === 'RandomSampling' || name === 'RandomSamplingStorage') {
+        this.invalidateRandomSamplingPair();
+      }
+    };
+    try {
+      await this.contracts.hub.on('ContractChanged', onChange);
+      await this.contracts.hub.on('NewContract', onChange);
+      this.hubRotationListenerStarted = true;
+    } catch {
+      /* provider doesn't support filter subscriptions — TTL refresh is the fallback */
+    }
   }
 
   /**
@@ -2223,67 +2679,69 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async createChallenge(): Promise<CreateChallengeResult> {
     await this.init();
-    const { rs, rss } = this.requireRandomSampling();
 
     const identityStorage = await this.resolveContract('IdentityStorage');
     const identityId: bigint = await identityStorage.getIdentityId(this.signer.address);
 
-    let receipt: ethers.TransactionReceipt;
-    try {
-      const tx = await rs.createChallenge();
-      receipt = await tx.wait();
-    } catch (err) {
-      this.translateRandomSamplingError(err);
-    }
+    return this.withHubStaleRetry(async () => {
+      const { rs, rss } = await this.getRandomSampling();
 
-    // Decode `ChallengeGenerated(identityId, contextGraphId, kcId, chunkId, epoch, startBlock)`
-    // from the receipt. cgId is indexed (topic[2]); the rest are in data
-    // but we only need cgId here — the proof builder reads kcId/chunkId
-    // off the Challenge struct fetched below, so everything stays
-    // consistent if the storage layout shifts.
-    let contextGraphId = 0n;
-    const rsIface = rs.interface;
-    for (const log of receipt.logs) {
+      let receipt: ethers.TransactionReceipt;
       try {
-        const parsed = rsIface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed?.name === 'ChallengeGenerated') {
-          contextGraphId = BigInt(parsed.args.contextGraphId);
-          break;
-        }
-      } catch { /* not this contract */ }
-    }
-    if (contextGraphId === 0n) {
-      // The picker only emits the event when it actually lands on a CG,
-      // so a missing event is a bug — fail loud rather than fall back
-      // to "lookup by KC" which V10 doesn't support natively.
-      throw new Error(
-        'createChallenge succeeded on-chain but no ChallengeGenerated event was found in the receipt; ' +
-        'cannot route proof builder without contextGraphId.',
-      );
-    }
+        const tx = await rs.createChallenge();
+        receipt = await tx.wait();
+      } catch (err) {
+        this.translateRandomSamplingError(err);
+      }
 
-    const challengeRaw = await rss.getNodeChallenge(identityId);
-    const challenge = this.toNodeChallenge(challengeRaw);
-    if (!challenge) {
-      throw new Error(
-        `createChallenge succeeded but RandomSamplingStorage.getNodeChallenge(${identityId}) ` +
-        'returned an empty struct. This indicates a state inconsistency between ' +
-        'RandomSampling and RandomSamplingStorage.',
-      );
-    }
+      // Decode `ChallengeGenerated(identityId, contextGraphId, kcId, chunkId, epoch, startBlock)`
+      // from the receipt. cgId is indexed (topic[2]); the rest are in data
+      // but we only need cgId here — the proof builder reads kcId/chunkId
+      // off the Challenge struct fetched below, so everything stays
+      // consistent if the storage layout shifts.
+      let contextGraphId = 0n;
+      const rsIface = rs.interface;
+      for (const log of receipt.logs) {
+        try {
+          const parsed = rsIface.parseLog({ topics: [...log.topics], data: log.data });
+          if (parsed?.name === 'ChallengeGenerated') {
+            contextGraphId = BigInt(parsed.args.contextGraphId);
+            break;
+          }
+        } catch { /* not this contract */ }
+      }
+      if (contextGraphId === 0n) {
+        // The picker only emits the event when it actually lands on a CG,
+        // so a missing event is a bug — fail loud rather than fall back
+        // to "lookup by KC" which V10 doesn't support natively.
+        throw new Error(
+          'createChallenge succeeded on-chain but no ChallengeGenerated event was found in the receipt; ' +
+          'cannot route proof builder without contextGraphId.',
+        );
+      }
 
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: true,
-      challenge,
-      contextGraphId,
-    };
+      const challengeRaw = await rss.getNodeChallenge(identityId);
+      const challenge = this.toNodeChallenge(challengeRaw);
+      if (!challenge) {
+        throw new Error(
+          `createChallenge succeeded but RandomSamplingStorage.getNodeChallenge(${identityId}) ` +
+          'returned an empty struct. This indicates a state inconsistency between ' +
+          'RandomSampling and RandomSamplingStorage.',
+        );
+      }
+
+      return {
+        hash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        success: true,
+        challenge,
+        contextGraphId,
+      };
+    });
   }
 
   async submitProof(leaf: Uint8Array | `0x${string}`, merkleProof: Uint8Array[]): Promise<TxResult> {
     await this.init();
-    const { rs } = this.requireRandomSampling();
 
     const leafHex = typeof leaf === 'string' ? leaf : ethers.hexlify(leaf);
     if (!ethers.isHexString(leafHex, 32)) {
@@ -2291,35 +2749,126 @@ export class EVMChainAdapter implements ChainAdapter {
     }
     const proofHex = merkleProof.map((p) => ethers.hexlify(p));
 
-    let receipt: ethers.TransactionReceipt;
-    try {
-      const tx = await rs.submitProof(leafHex, proofHex);
-      receipt = await tx.wait();
-    } catch (err) {
-      this.translateRandomSamplingError(err);
-    }
+    return this.withHubStaleRetry(async () => {
+      const { rs } = await this.getRandomSampling();
 
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: true,
-    };
+      let receipt: ethers.TransactionReceipt;
+      try {
+        const tx = await rs.submitProof(leafHex, proofHex);
+        receipt = await tx.wait();
+      } catch (err) {
+        this.translateRandomSamplingError(err);
+      }
+
+      return {
+        hash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        success: true,
+      };
+    });
   }
 
   async getActiveProofPeriodStatus(): Promise<ProofPeriodStatus> {
     await this.init();
-    const { rs } = this.requireRandomSampling();
+    const { rs } = await this.getRandomSampling();
 
-    const raw = await rs.getActiveProofPeriodStatus();
+    // Codex round 2 on PR #369: the cached `NodeChallenge.proofingPeriodDurationInBlocks`
+    // is whatever the contract used at challenge-creation time. The chain's
+    // `updateAndGetActiveProofPeriodStartBlock()` rolls forward using the
+    // CURRENT epoch's duration via `getActiveProofingPeriodDurationInBlocks()`.
+    // If a governance change shortens the duration mid-flight, off-chain
+    // staleness checks against the cached duration would underestimate
+    // expiry and re-deadlock at the rollover boundary. Pull the live
+    // duration alongside the status read so the prover can compare
+    // wall-clock against the same value the contract uses for rollover.
+    //
+    // Codex round 3 + 4 + 5 — keep the live-duration read STRICTLY best-effort:
+    // a transient RPC blip, partial rollout, or an older RS deployment
+    // that omits the method from its ABI must NOT make the whole
+    // `getActiveProofPeriodStatus()` reject OR stall.
+    //
+    // Naive `Promise.allSettled` is NOT enough —
+    // `rs.getActiveProofingPeriodDurationInBlocks()` would throw
+    // synchronously (`TypeError: ... is not a function`) before
+    // `allSettled` can wrap it when the method is missing entirely.
+    //
+    // Plain `try/catch` is also NOT enough — a hung RPC (provider
+    // accepts the request but never responds) keeps the await pending
+    // forever, blocking the entire status probe even though the
+    // primary `getActiveProofPeriodStatus()` already returned. The
+    // prover can safely continue with the cached challenge duration,
+    // so race the duration read against a short timeout and prefer
+    // `undefined` on slow paths. The prover treats `undefined` as
+    // "fall back to existing.proofingPeriodDurationInBlocks".
+    const readDurationBestEffort = async (): Promise<bigint | undefined> => {
+      try {
+        const fn = (rs as unknown as { getActiveProofingPeriodDurationInBlocks?: () => Promise<unknown> })
+          .getActiveProofingPeriodDurationInBlocks;
+        if (typeof fn !== 'function') return undefined;
+        const v = await fn.call(rs);
+        return BigInt(v as never);
+      } catch {
+        return undefined;
+      }
+    };
+    const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+      });
+      return Promise.race([
+        p.then((v) => { if (timer) clearTimeout(timer); return v; }),
+        timeout,
+      ]);
+    };
+    // Single-flight: if a previous tick's probe is still pending,
+    // reuse it instead of issuing a fresh `eth_call`. Codex round 8:
+    // first invalidate the slot if (a) the resolved RS Contract
+    // instance has changed since the probe was started (TTL-refresh
+    // path constructs a fresh Contract WITHOUT calling
+    // invalidateRandomSamplingPair → the probe was started against
+    // the old contract and must not be paired with the new
+    // contract's status), or (b) the slot is older than
+    // MAX_PROBE_AGE_MS (a truly hung probe must not suppress retries
+    // forever).
+    const probeAgeMs = this.inflightDurationProbe
+      ? Date.now() - this.inflightDurationProbeStartedAt
+      : 0;
+    if (this.inflightDurationProbe && (
+      this.inflightDurationProbeContract !== rs ||
+      probeAgeMs > MAX_PROBE_AGE_MS
+    )) {
+      this.inflightDurationProbe = undefined;
+    }
+    let probe = this.inflightDurationProbe;
+    if (!probe) {
+      const fresh = readDurationBestEffort();
+      this.inflightDurationProbe = fresh;
+      this.inflightDurationProbeContract = rs;
+      this.inflightDurationProbeStartedAt = Date.now();
+      // `.finally` covers both resolve and reject paths without
+      // altering the value the caller observes.
+      void fresh.finally(() => {
+        if (this.inflightDurationProbe === fresh) {
+          this.inflightDurationProbe = undefined;
+        }
+      });
+      probe = fresh;
+    }
+    const [raw, proofingPeriodDurationInBlocks] = await Promise.all([
+      rs.getActiveProofPeriodStatus(),
+      withTimeout(probe, DURATION_PROBE_TIMEOUT_MS, undefined),
+    ]);
     return {
       activeProofPeriodStartBlock: BigInt(raw.activeProofPeriodStartBlock ?? raw[0]),
       isValid: Boolean(raw.isValid ?? raw[1]),
+      proofingPeriodDurationInBlocks,
     };
   }
 
   async getNodeChallenge(identityId: bigint): Promise<NodeChallenge | null> {
     await this.init();
-    const { rss } = this.requireRandomSampling();
+    const { rss } = await this.getRandomSampling();
     const raw = await rss.getNodeChallenge(identityId);
     return this.toNodeChallenge(raw);
   }
@@ -2330,7 +2879,7 @@ export class EVMChainAdapter implements ChainAdapter {
     periodStartBlock: bigint,
   ): Promise<bigint> {
     await this.init();
-    const { rss } = this.requireRandomSampling();
+    const { rss } = await this.getRandomSampling();
     const score: bigint = await rss.getNodeEpochProofPeriodScore(identityId, epoch, periodStartBlock);
     return BigInt(score);
   }

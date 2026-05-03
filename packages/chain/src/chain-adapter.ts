@@ -302,6 +302,27 @@ export interface ProofPeriodStatus {
    * treat `false` as "skip this tick, retry on the next block".
    */
   isValid: boolean;
+  /**
+   * Currently-active proofing period duration in blocks, as the contract
+   * computes it for the current epoch (read via
+   * `RandomSampling.getActiveProofingPeriodDurationInBlocks()` →
+   * `RandomSamplingStorage.getEpochProofingPeriodDurationInBlocks(currentEpoch)`).
+   *
+   * The chain's `updateAndGetActiveProofPeriodStartBlock()` rolls the
+   * cursor forward using THIS value, not the duration baked into a
+   * cached `NodeChallenge`. Off-chain wall-clock staleness checks must
+   * therefore consult this live value (Codex round 2 on PR #369): if a
+   * governance action changes the proofing duration mid-flight, the
+   * cached `existing.proofingPeriodDurationInBlocks` no longer reflects
+   * the on-chain expiry boundary, and rotating off `existing.duration`
+   * alone would re-introduce the same `kc-not-synced` deadlock that
+   * the unsolved-stale check exists to prevent.
+   *
+   * Optional only because legacy adapters that pre-date this field may
+   * not populate it; consumers MUST treat `undefined` as "skip the
+   * live-duration staleness path and fall back to the cached duration".
+   */
+  proofingPeriodDurationInBlocks?: bigint;
 }
 
 /**
@@ -382,6 +403,13 @@ export interface UpdateKCParams {
   kcId: bigint;
   newMerkleRoot: Uint8Array;
   signatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
+}
+
+export interface OperationalWalletRegistrationResult {
+  identityId: bigint;
+  registered: string[];
+  alreadyRegistered: string[];
+  taken: Array<{ address: string; identityId: bigint }>;
 }
 
 /**
@@ -522,6 +550,20 @@ export interface ChainAdapter {
 
   /** Verify that a recovered signer address is a registered operational key for the given identity. */
   verifyACKIdentity?(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean>;
+
+  /** Idempotently register local operational wallets for an existing identity. */
+  ensureOperationalWalletsRegistered?(options?: {
+    identityId?: bigint;
+    additionalAddresses?: string[];
+  }): Promise<OperationalWalletRegistrationResult>;
+
+  /**
+   * Confirm that an address is registered as an OPERATIONAL_KEY for an identity.
+   * V10 ACK signing refuses to proceed when this capability is missing, but the
+   * method stays optional to preserve the public ChainAdapter interface for
+   * adapters that never advertise StorageACK support.
+   */
+  isOperationalWalletRegistered?(identityId: bigint, address: string): Promise<boolean>;
 
   /**
    * Verify that a recovered signer address owns the claimed identity without

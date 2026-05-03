@@ -84,6 +84,9 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // ChainAdapter contract. They must remain EVM-only.
   'nextSigner',
   'nextAuthorizedSigner',
+  'walletKeyHash',
+  'hasAdminPurpose',
+  'hasOperationalPurpose',
   'resolveContract',
   'resolveAssetStorage',
   'init',
@@ -96,9 +99,17 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // submitProof, getActiveProofPeriodStatus, getNodeChallenge,
   // getNodeEpochProofPeriodScore) ARE mirrored on MockChainAdapter; only
   // these internal helpers stay EVM-only.
-  'requireRandomSampling',
+  'getRandomSampling',
   'translateRandomSamplingError',
   'toNodeChallenge',
+  // Hub-rotation handling — adapter-internal plumbing that backs the
+  // self-refreshing RS resolution. The mock has no Hub, so no live
+  // rotation surface to mirror.
+  'withHubStaleRetry',
+  'startHubRotationListener',
+  'invalidateRandomSamplingPair',
+  'resolveAndAssignRandomSamplingPair',
+  'isContractMissingRevert',
   // KC views (Phase 1) — TS-private helpers; the four public methods
   // (getLatestMerkleRoot, getMerkleLeafCount, getLatestMerkleRootPublisher,
   // getKCContextGraphId) ARE mirrored on MockChainAdapter.
@@ -131,6 +142,8 @@ const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([
   'getMinimumRequiredSignatures',
   'verifyACKIdentity',
   'verifySyncIdentity',
+  'ensureOperationalWalletsRegistered',
+  'isOperationalWalletRegistered',
   'updateKnowledgeCollectionV10',
   'stakeWithLock',
   'getDelegatorConvictionMultiplier',
@@ -189,6 +202,7 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       rpcUrl: 'http://127.0.0.1:1',
       hubAddress: '0x0000000000000000000000000000000000000001',
       privateKey: '0x' + '1'.repeat(64),
+      allowNoAdminSigner: true,
     });
     expect(mock.chainType).toBe(evm.chainType);
   });

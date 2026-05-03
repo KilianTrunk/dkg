@@ -434,17 +434,21 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     }
   });
 
-  it('drops the duration probe slot when RS pair-cache generation moves (TTL refresh, Codex round 8)', async () => {
+  it('drops the duration probe slot when the resolved RS Contract instance changes (TTL refresh, Codex round 8)', async () => {
     // The TTL-refresh path of HubResolutionCache re-resolves the
-    // contract WITHOUT calling invalidateRandomSamplingPair(). A
-    // probe started against the old contract must NOT be paired
-    // with the new contract's status. We bump the generation
-    // manually and verify the next call issues a fresh probe.
+    // contract to a freshly constructed Contract instance WITHOUT
+    // calling invalidateRandomSamplingPair() and WITHOUT bumping
+    // the (invalidate-only) generation counter. A probe started
+    // against the old contract must NOT be paired with the new
+    // contract's status. The guard compares the resolved Contract
+    // by reference identity — a refresh always hands back a new
+    // instance, so this fires on both same-address and changed-
+    // address refreshes.
     vi.useFakeTimers();
     try {
       const a = new EVMChainAdapter(minimalConfig());
       const probeCalls = vi.fn();
-      const fakeRs = {
+      const oldRs = {
         getActiveProofPeriodStatus: async () => ({
           activeProofPeriodStartBlock: 1n,
           isValid: true,
@@ -454,19 +458,22 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
           return new Promise(() => {/* hang */});
         },
       };
+      // Distinct Contract instance with the same shape — simulates
+      // the post-refresh Contract a TTL re-resolve would produce
+      // even when the underlying address is unchanged.
+      const refreshedRs = { ...oldRs };
       (a as any).init = async () => undefined;
-      (a as any).getRandomSampling = async () => ({ rs: fakeRs, rss: {} });
+      (a as any).getRandomSampling = async () => ({ rs: oldRs, rss: {} });
       const first = a.getActiveProofPeriodStatus();
       await vi.advanceTimersByTimeAsync(2001);
       await first;
       expect(probeCalls).toHaveBeenCalledTimes(1);
-      // Bump the cache generation as if a TTL refresh happened.
-      (a as any).randomSamplingPairCache.invalidate();
+      // TTL refresh: re-resolve hands back a fresh Contract instance.
+      (a as any).getRandomSampling = async () => ({ rs: refreshedRs, rss: {} });
       const second = a.getActiveProofPeriodStatus();
       await vi.advanceTimersByTimeAsync(2001);
       await second;
-      // Generation moved, so the slot was dropped and a fresh
-      // probe was started against the (now-current) contract.
+      // Contract identity changed → slot was dropped → fresh probe issued.
       expect(probeCalls).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();

@@ -292,14 +292,19 @@ export class EVMChainAdapter implements ChainAdapter {
    * same in-flight promise across overlapping calls — at most one
    * probe is ever pending against the provider at a time.
    *
-   * Codex round 8 on PR #369: also track the RS pair-cache generation
-   * the probe was started against AND a wall-clock creation timestamp.
-   *   - Generation guard: a TTL refresh of `randomSamplingPairCache`
-   *     re-resolves `rs` to a possibly-new contract WITHOUT calling
-   *     `invalidateRandomSamplingPair()`. We must NOT pair a fresh
-   *     `getActiveProofPeriodStatus()` from the new contract with a
-   *     duration probe started against the old contract, so we drop
-   *     the slot whenever the cache generation has moved.
+   * Codex round 8 on PR #369: also track the `RandomSampling`
+   * Contract instance the probe was started against AND a wall-clock
+   * creation timestamp.
+   *   - Contract-identity guard: a TTL refresh of
+   *     `randomSamplingPairCache` re-resolves `rs` to a freshly
+   *     constructed `Contract` instance WITHOUT calling
+   *     `invalidateRandomSamplingPair()`. The HubResolutionCache
+   *     generation counter is invalidate-only (it is also used by
+   *     `resolveAndAssignRandomSamplingPair()` to detect concurrent
+   *     invalidations, so it must NOT bump on normal refreshes), so
+   *     it can't signal a TTL refresh. Comparing the resolved
+   *     Contract instance by reference is the canonical check: a
+   *     refresh always hands back a new instance.
    *   - Max-age guard: `Promise.race` returns `undefined` to the
    *     caller on timeout, but the underlying `eth_call` may
    *     never settle (truly hung provider). Without an upper
@@ -310,7 +315,7 @@ export class EVMChainAdapter implements ChainAdapter {
    *     it correctly does nothing.
    */
   private inflightDurationProbe: Promise<bigint | undefined> | undefined;
-  private inflightDurationProbeGeneration = -1;
+  private inflightDurationProbeContract: Contract | undefined;
   private inflightDurationProbeStartedAt = 0;
 
   constructor(config: EVMAdapterConfig) {
@@ -2582,7 +2587,7 @@ export class EVMChainAdapter implements ChainAdapter {
     this.contracts.randomSampling = undefined;
     this.contracts.randomSamplingStorage = undefined;
     this.inflightDurationProbe = undefined;
-    this.inflightDurationProbeGeneration = -1;
+    this.inflightDurationProbeContract = undefined;
     this.inflightDurationProbeStartedAt = 0;
   }
 
@@ -2818,18 +2823,19 @@ export class EVMChainAdapter implements ChainAdapter {
     };
     // Single-flight: if a previous tick's probe is still pending,
     // reuse it instead of issuing a fresh `eth_call`. Codex round 8:
-    // first invalidate the slot if (a) the RS pair-cache generation
-    // has moved (TTL-refresh path doesn't call invalidateRandomSamplingPair
-    // but DOES re-resolve the contract → probe was started against the
-    // old contract and must not be paired with the new contract's
-    // status), or (b) the slot is older than MAX_PROBE_AGE_MS (a
-    // truly hung probe must not suppress retries forever).
-    const currentGen = this.randomSamplingPairCache.currentGeneration();
+    // first invalidate the slot if (a) the resolved RS Contract
+    // instance has changed since the probe was started (TTL-refresh
+    // path constructs a fresh Contract WITHOUT calling
+    // invalidateRandomSamplingPair → the probe was started against
+    // the old contract and must not be paired with the new
+    // contract's status), or (b) the slot is older than
+    // MAX_PROBE_AGE_MS (a truly hung probe must not suppress retries
+    // forever).
     const probeAgeMs = this.inflightDurationProbe
       ? Date.now() - this.inflightDurationProbeStartedAt
       : 0;
     if (this.inflightDurationProbe && (
-      this.inflightDurationProbeGeneration !== currentGen ||
+      this.inflightDurationProbeContract !== rs ||
       probeAgeMs > MAX_PROBE_AGE_MS
     )) {
       this.inflightDurationProbe = undefined;
@@ -2838,7 +2844,7 @@ export class EVMChainAdapter implements ChainAdapter {
     if (!probe) {
       const fresh = readDurationBestEffort();
       this.inflightDurationProbe = fresh;
-      this.inflightDurationProbeGeneration = currentGen;
+      this.inflightDurationProbeContract = rs;
       this.inflightDurationProbeStartedAt = Date.now();
       // `.finally` covers both resolve and reject paths without
       // altering the value the caller observes.

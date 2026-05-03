@@ -49,6 +49,7 @@ import type {
 } from './types.js';
 import {
   isObjectRecord,
+  isStateMetadataOnlyAdapterConfig,
   looksLikeAdapterPluginConfig,
   resolveOpenClawMergedConfig,
 } from './openclaw-config.js';
@@ -853,7 +854,7 @@ function memorySlotOwnershipForApi(
     if (slots && Object.prototype.hasOwnProperty.call(slots, 'memory')) {
       return { owned: slots.memory === 'adapter-openclaw', source: 'merged-config' };
     }
-    const directMemoryEnabled = directPluginConfigMemoryEnabledForApi(api);
+    const directMemoryEnabled = directPluginConfigMemoryEnabledForApi(api, options);
     if (directMemoryEnabled !== undefined) {
       return { owned: directMemoryEnabled, source: 'direct-plugin-config' };
     }
@@ -862,7 +863,7 @@ function memorySlotOwnershipForApi(
     }
     return { owned: false, source: 'merged-config' };
   }
-  const directMemoryEnabled = directPluginConfigMemoryEnabledForApi(api);
+  const directMemoryEnabled = directPluginConfigMemoryEnabledForApi(api, options);
   if (directMemoryEnabled === undefined) {
     if (options.preserveDirectOverlayWithoutMemoryDecision && hasCurrentDirectOverlayWithoutMemoryDecision(api)) {
       return { owned: true, source: 'direct-plugin-config' };
@@ -882,7 +883,10 @@ function memoryRegistrationSkipMessage(ownership: MemorySlotOwnership | undefine
     'memory provider. Rerun `dkg setup` to elect adapter-openclaw into the memory slot if that was the intent.';
 }
 
-function directPluginConfigMemoryEnabledForApi(api: OpenClawPluginApi | null): boolean | undefined {
+function directPluginConfigMemoryEnabledForApi(
+  api: OpenClawPluginApi | null,
+  options: { preserveDirectOverlayWithoutMemoryDecision?: boolean } = {},
+): boolean | undefined {
   if (!api) return undefined;
   const anyApi = api as any;
   const runtime = anyApi?.runtime;
@@ -906,7 +910,32 @@ function directPluginConfigMemoryEnabledForApi(api: OpenClawPluginApi | null): b
     [anyApi?.cfg, anyApi?.config].map(adapterEntryConfigFromMergedConfig),
   );
   if (currentMergedEntryMemoryEnabled !== undefined) return currentMergedEntryMemoryEnabled;
-  if (currentCandidates.some(isDirectConfigWithoutMemoryDecision)) {
+  // T364 follow-up: when the caller is re-registering and the current API
+  // exposes only state-metadata-only configs (`{ stateDir, stateDirSource,
+  // installedWorkspace }`), don't fall through to runtime — the existing
+  // direct-source ownership is preserved by the caller's downstream
+  // `hasCurrentDirectOverlayWithoutMemoryDecision` branch. Falling through
+  // to a stale runtime memory.enabled here would override that
+  // preservation. The flag is only set by `memorySlotOwnershipForApi` when
+  // `registeredOwnershipSource === 'direct-plugin-config'`, so first
+  // registrations (where runtime is the only memory signal) still see the
+  // runtime fallback fire. Codex's reported case (first registration with
+  // state-metadata + runtime.pluginConfig.memory.enabled: true) succeeds.
+  if (
+    options.preserveDirectOverlayWithoutMemoryDecision &&
+    currentCandidates.some(isStateMetadataOnlyAdapterConfig)
+  ) {
+    return undefined;
+  }
+  // Block runtime fallback when current carries a "real" without-decision
+  // overlay (channel/daemonUrl with no memory key). State-metadata-only
+  // configs are orthogonal to memory and don't fall here unless the
+  // re-registration preserve flag above also matched.
+  const blocksRuntimeFallback = currentCandidates.some((candidate) =>
+    isDirectConfigWithoutMemoryDecision(candidate) &&
+    !isStateMetadataOnlyAdapterConfig(candidate),
+  );
+  if (blocksRuntimeFallback) {
     return undefined;
   }
 

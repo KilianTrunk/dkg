@@ -303,6 +303,43 @@ describe('DkgMemoryPlugin.register', () => {
     expect(plugin.isRegistered()).toBe(false);
   });
 
+  it('T364 follow-up — state-metadata-only api.config still falls through to runtime.pluginConfig for memory.enabled', async () => {
+    // Codex follow-up regression: pre-fix a first registration where
+    // `api.config = { stateDir, stateDirSource, installedWorkspace }`
+    // (state metadata only) and the real `memory.enabled: true` only
+    // available on `runtime.pluginConfig` was rejected by
+    // `directPluginConfigMemoryEnabledForApi`'s early return —
+    // `isDirectConfigWithoutMemoryDecision` matched the state-metadata
+    // overlay, suppressing the runtime fallback. Result: ownership
+    // resolved to undefined, registration skipped, DKG memory never
+    // came up on that gateway shape.
+    //
+    // Post-fix `isDirectConfigWithoutMemoryDecision` excludes
+    // state-metadata-only configs (they're orthogonal to memory and
+    // don't carry a memory signal at all), so the runtime fallback
+    // resolves the real `memory.enabled` and registration succeeds.
+    const api = {
+      config: {
+        stateDir: '/workspace/.dkg-adapter',
+        stateDirSource: 'setup-default',
+        installedWorkspace: '/workspace',
+      },
+      runtime: {
+        pluginConfig: {
+          memory: { enabled: true },
+        },
+      },
+      registerTool: vi.fn(),
+      registerHook: vi.fn(),
+      on: vi.fn(),
+      logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+      registerMemoryCapability: vi.fn(),
+    } as unknown as MockApi;
+
+    expect(plugin.register(api)).toBe(true);
+    expect(api.registerMemoryCapability).toHaveBeenCalledTimes(1);
+  });
+
   it('warns about direct memory disable without setup guidance', () => {
     const api = makeApi();
     api.config = {

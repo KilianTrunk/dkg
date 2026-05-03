@@ -241,14 +241,24 @@ function apiWorkspaceDirFrom(api) {
 }
 
 function hasWorkspaceConfig(config) {
+  // T364 follow-up: include `workspaceDir` (the third entry in setup.ts's
+  // recognized fallback chain `agents.defaults.workspace -> workspace ->
+  // workspaceDir` at setup.ts:166-190). Pre-fix `hasWorkspaceConfig` and
+  // `workspaceDirFromConfig` ignored `workspaceDir`, so cfg shapes that
+  // exposed only that field never populated `api.workspaceDir` and
+  // `ensureChatTurnWriter` / SKILL sync fell back to `installedWorkspace`
+  // or `~/.openclaw`, writing adapter state into the wrong workspace.
+  // Companion fix to the same recognition added in `openclaw-config.ts`'s
+  // `hasRouteMetadataConfigSignal`.
   return (
     typeof config?.agents?.defaults?.workspace === 'string' ||
-    typeof config?.workspace === 'string'
+    typeof config?.workspace === 'string' ||
+    typeof config?.workspaceDir === 'string'
   );
 }
 
 function workspaceDirFromConfig(config) {
-  return config?.agents?.defaults?.workspace ?? config?.workspace;
+  return config?.agents?.defaults?.workspace ?? config?.workspace ?? config?.workspaceDir;
 }
 
 function stateDirMatchesWorkspaceDefault(stateDir, workspaceDir) {

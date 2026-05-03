@@ -725,12 +725,31 @@ cmd_start() {
       // identity in the eyes of the staking + profile contracts).
       const n = $NUM_NODES;
       const opSigners = new Array(n).fill(null);
-      // Codex round 3 on PR #368: default unknown role to 'edge' (safest
-      // failure mode). 'core' would auto-provision an on-chain identity
-      // and stake for a node whose role we cannot confirm, violating the
-      // documented 'edge stays off-chain' invariant.
       const nodeRoles = new Array(n).fill('edge');
-      // Codex round 2 on PR #368: parse each node's wallets.json + config.json
+      // Codex round 4 on PR #368: read config.json FIRST and INDEPENDENTLY
+      // of wallets.json. The previous loop did wallets first and `continue`d
+      // on parse failure BEFORE reading config, so an intended core whose
+      // wallets.json was malformed silently kept the 'edge' default,
+      // dropped out of coreIdxs, and the lostCores guard never fired.
+      // Reading config first decouples the two failures: now lostCores
+      // correctly catches "I was supposed to be a core but my wallets
+      // are broken".
+      const configErrors = [];
+      for (let i = 1; i <= n; i++) {
+        const cPath = '$DEVNET_DIR/node' + i + '/config.json';
+        try {
+          const cfg = JSON.parse(fs.readFileSync(cPath, 'utf8'));
+          // Trust the explicit role; fall back to 'edge' (NOT 'core') if
+          // the field is missing — defaulting unknowns to 'core' would
+          // auto-provision an on-chain identity for a node whose role we
+          // cannot confirm.
+          nodeRoles[i - 1] = cfg.nodeRole || 'edge';
+        } catch (e) {
+          configErrors.push(i);
+          console.log('Node ' + i + ': failed to parse config.json (treating as edge): ' + (e && e.message || e));
+        }
+      }
+      // Codex round 2 on PR #368: parse each node's wallets.json
       // independently. A malformed file (truncated mid-write, missing
       // wallets[0], unparseable JSON) MUST NOT throw and abort staking
       // for every node — log + skip the bad one and let the rest boot.
@@ -738,7 +757,6 @@ cmd_start() {
       // entries never reach createConviction/updateAsk.
       for (let i = 1; i <= n; i++) {
         const wPath = '$DEVNET_DIR/node' + i + '/wallets.json';
-        const cPath = '$DEVNET_DIR/node' + i + '/config.json';
         try {
           const w = JSON.parse(fs.readFileSync(wPath, 'utf8'));
           if (!w || !Array.isArray(w.wallets) || w.wallets.length === 0
@@ -749,15 +767,6 @@ cmd_start() {
           opSigners[i - 1] = new ethers.Wallet(w.wallets[0].privateKey, provider);
         } catch (e) {
           console.log('Node ' + i + ': failed to parse wallets.json: ' + (e && e.message || e));
-          continue;
-        }
-        try {
-          const cfg = JSON.parse(fs.readFileSync(cPath, 'utf8'));
-          // Trust the explicit role; fall back to 'edge' (NOT 'core') if
-          // the field is missing — see comment above on safest default.
-          nodeRoles[i - 1] = cfg.nodeRole || 'edge';
-        } catch (e) {
-          console.log('Node ' + i + ': failed to parse config.json (defaulting nodeRole=edge): ' + (e && e.message || e));
         }
       }
 
@@ -778,6 +787,17 @@ cmd_start() {
           + lostCores.map(String).join(', '));
         console.error('Refusing to bootstrap a partially-provisioned devnet. Fix the wallet files and re-run.');
         process.exit(1);
+      }
+      // Codex round 4 on PR #368: a node whose config.json was unreadable
+      // is now treated as 'edge' and silently skipped from staking. This
+      // is the correct safe default IF the operator intended that node to
+      // be edge — but if they intended it to be core, the lostCores
+      // guard above won't catch it because nodeRoles[i] !== 'core'.
+      // Surface the ambiguity loudly so the operator can confirm intent.
+      if (configErrors.length > 0) {
+        console.error('WARNING: ' + configErrors.length + ' node(s) have unreadable config.json: '
+          + configErrors.map(String).join(', '));
+        console.error('These nodes are being treated as edge (no on-chain stake). Fix config.json if any were intended to be core.');
       }
 
       // Wait up to 60s for all CORE nodes to have identities. Edge nodes

@@ -45,6 +45,7 @@ export {
   mergeAdapterPluginConfigs,
   resolveOpenClawMergedConfig,
   resolveOpenClawRouteMetadataConfig,
+  scrubStaleWorkspaceAliases,
 } from './openclaw-config.js';
 export {
   canonicalPathForCompare,

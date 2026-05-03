@@ -298,6 +298,120 @@ describe('DkgChannelPlugin', () => {
     });
   });
 
+  it('T364 round 8 — dispatch merge scrubs stale agents.defaults.workspace when newer route asserts workspaceDir only', async () => {
+    // Pre-fix `mergeRouteMetadataWithMergedConfig` (DkgChannelPlugin.ts)
+    // kept any older `workspace` / `agents.defaults.workspace` from the
+    // merged snapshot when the routeConfig only carried a newer
+    // `workspaceDir`. The setup-side resolver's fallback chain
+    // (`agents.defaults.workspace -> workspace -> workspaceDir`) then
+    // returned the stale alias and the channel dispatched against the
+    // wrong workspace. Post-fix `scrubStaleWorkspaceAliases` is shared
+    // with `openclaw-config.ts` and runs on the dispatch-side merge
+    // too, so the newest workspace signal wins consistently.
+    const { runtime } = makeMockRuntime({
+      dispatchImpl: async (params) => {
+        await params.dispatcherOptions.deliver({ text: 'New workspace reply' });
+      },
+    });
+    // mergedConfig (older snapshot) carries plugins + a stale
+    // agents.defaults.workspace.
+    const staleMergedConfig = {
+      agents: { defaults: { workspace: '/stale-workspace', model: 'gpt-4' } },
+      plugins: {
+        slots: { memory: 'adapter-openclaw' },
+        entries: {
+          'adapter-openclaw': {
+            config: {
+              daemonUrl: 'http://localhost:9350',
+              memory: { enabled: true },
+              channel: { enabled: true, port: 0 },
+            },
+          },
+        },
+      },
+    };
+    // Newer route metadata asserts workspaceDir but no agents.defaults.workspace.
+    const freshRouteConfig = {
+      workspaceDir: '/fresh-workspace',
+    };
+    const api = makeApi({
+      cfg: freshRouteConfig,
+      runtime: {
+        ...runtime,
+        config: staleMergedConfig,
+      },
+    } as any);
+    vi.spyOn(client, 'storeChatTurn').mockResolvedValue(undefined);
+
+    plugin.register(api);
+    const reply = await plugin.processInbound('Hello', 'corr-route-scrub', 'owner');
+
+    expect(reply.text).toBe('New workspace reply');
+    const dispatchCfg = (runtime as any).channel.routing.resolveAgentRoute.calls[0][0].cfg;
+    // Newer workspaceDir wins.
+    expect(dispatchCfg.workspaceDir).toBe('/fresh-workspace');
+    // Stale `agents.defaults.workspace` MUST be scrubbed so the resolver
+    // chain doesn't pick the old value.
+    expect(dispatchCfg.agents?.defaults?.workspace).toBeUndefined();
+    // Other agents.defaults fields preserved.
+    expect(dispatchCfg.agents?.defaults?.model).toBe('gpt-4');
+  });
+
+  it('T364 round 8 — dispatch merge does NOT mutate caller-owned mergedConfig.agents.defaults', async () => {
+    // QA-flagged side-effect concern: pre-fix `mergeRouteMetadataWithMergedConfig`
+    // created `result` via `{...mergedConfig, ...routeConfig}` (shallow
+    // spread), so when routeConfig has no `agents` key, `result.agents`
+    // and `result.agents.defaults` are still pointers into the caller's
+    // runtime config. The scrub then mutated `mergedConfig.agents.defaults.workspace`
+    // — visible to subsequent dispatches/observers as a delete-on-input
+    // side-effect. Post-fix `scrubStaleAgentsDefaultsWorkspace` clones
+    // the agents/defaults path before deleting, so caller-owned input
+    // is preserved verbatim.
+    const { runtime } = makeMockRuntime({
+      dispatchImpl: async (params) => {
+        await params.dispatcherOptions.deliver({ text: 'No-mutation reply' });
+      },
+    });
+    const liveMergedConfig = {
+      agents: { defaults: { workspace: '/should-not-be-mutated', model: 'gpt-4' } },
+      plugins: {
+        slots: { memory: 'adapter-openclaw' },
+        entries: {
+          'adapter-openclaw': {
+            config: {
+              daemonUrl: 'http://localhost:9350',
+              memory: { enabled: true },
+              channel: { enabled: true, port: 0 },
+            },
+          },
+        },
+      },
+    };
+    const before = JSON.stringify(liveMergedConfig);
+    const freshRouteConfig = { workspaceDir: '/fresh-from-route' };
+    const api = makeApi({
+      cfg: freshRouteConfig,
+      runtime: {
+        ...runtime,
+        config: liveMergedConfig,
+      },
+    } as any);
+    vi.spyOn(client, 'storeChatTurn').mockResolvedValue(undefined);
+
+    plugin.register(api);
+    await plugin.processInbound('Hello', 'corr-no-mutation', 'owner');
+
+    // Caller-owned mergedConfig MUST be unchanged after dispatch.
+    expect(JSON.stringify(liveMergedConfig)).toBe(before);
+    expect(liveMergedConfig.agents.defaults.workspace).toBe('/should-not-be-mutated');
+    // Returned dispatch cfg DOES carry the scrubbed view (newer
+    // workspaceDir wins, stale agents.defaults.workspace removed).
+    const dispatchCfg = (runtime as any).channel.routing.resolveAgentRoute.calls[0][0].cfg;
+    expect(dispatchCfg.workspaceDir).toBe('/fresh-from-route');
+    expect((dispatchCfg.agents as any)?.defaults?.workspace).toBeUndefined();
+    expect((dispatchCfg.agents as any)?.defaults?.model).toBe('gpt-4');
+  });
+
   it('keeps direct api.cfg ahead of stale api.pluginConfig for dispatch cfg fallback', async () => {
     const { runtime } = makeMockRuntime({
       dispatchImpl: async (params) => {

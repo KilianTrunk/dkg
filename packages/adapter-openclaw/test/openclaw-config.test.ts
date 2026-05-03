@@ -200,6 +200,58 @@ describe('openclaw-config helpers', () => {
     expect(extractAdapterPluginConfigOverlay({})).toBeUndefined();
   });
 
+  it('T364 round 8 — newer workspaceDir-only route config supersedes older agents.defaults.workspace alias', () => {
+    // Pre-fix `mergeRouteMetadataConfigs` did `Object.assign(merged, config)`
+    // verbatim, so an older `agents.defaults.workspace = '/old'` survived
+    // alongside a newer `workspaceDir = '/new'`. Consumers following the
+    // documented `agents.defaults.workspace -> workspace -> workspaceDir`
+    // fallback chain (setup.ts:166-190) then resolved the STALE `/old`
+    // because it sits first in the chain — silently ignoring the newer
+    // route's intent.
+    const oldRoute = { agents: { defaults: { workspace: '/old', model: 'gpt-4' } } };
+    const newRoute = { workspaceDir: '/new' };
+    const api = {
+      runtime: { config: oldRoute },
+      cfg: newRoute,
+    } as any;
+    const result = resolveOpenClawRouteMetadataConfig(api);
+    expect(result).toBeDefined();
+    // workspaceDir from newer config wins.
+    expect(result?.workspaceDir).toBe('/new');
+    // older `agents.defaults.workspace` MUST be scrubbed so the resolver
+    // chain doesn't pick the stale value.
+    expect((result?.agents as any)?.defaults?.workspace).toBeUndefined();
+    // Other agents.defaults fields (e.g. model) preserved across the merge.
+    expect((result?.agents as any)?.defaults?.model).toBe('gpt-4');
+  });
+
+  it('T364 round 8 — newer workspace-only route config supersedes older workspaceDir alias', () => {
+    // Symmetric case: newer config asserts `workspace`, older has only
+    // `workspaceDir`. The newer signal must win, so the older
+    // `workspaceDir` is scrubbed.
+    const api = {
+      runtime: { config: { workspaceDir: '/old' } },
+      cfg: { workspace: '/new' },
+    } as any;
+    const result = resolveOpenClawRouteMetadataConfig(api);
+    expect(result).toBeDefined();
+    expect(result?.workspace).toBe('/new');
+    expect(result?.workspaceDir).toBeUndefined();
+  });
+
+  it('T364 round 8 — preserves older workspace alias when newer config asserts none', () => {
+    // Anti-test: if the newer config carries no workspace signal at all,
+    // the older alias must survive (no spurious scrubs).
+    const api = {
+      runtime: { config: { workspaceDir: '/persistent' } },
+      cfg: { session: { dmScope: 'main' } },
+    } as any;
+    const result = resolveOpenClawRouteMetadataConfig(api);
+    expect(result).toBeDefined();
+    expect(result?.workspaceDir).toBe('/persistent');
+    expect((result?.session as any)?.dmScope).toBe('main');
+  });
+
   it('T364 follow-up — recognizes legacy `workspaceDir`-only route config as route metadata', () => {
     // Codex follow-up regression: pre-fix `hasRouteMetadataConfigSignal`
     // checked only `agents`/`session`/`workspace`. A runtime cfg

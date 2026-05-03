@@ -243,6 +243,16 @@ function mergeRouteMetadataConfigs(
     const priorSession = isObjectRecord(merged.session) ? merged.session : undefined;
     const nextAgents = isObjectRecord(config.agents) ? config.agents : undefined;
     const nextSession = isObjectRecord(config.session) ? config.session : undefined;
+    // T364 round 8 — when this newer config asserts ANY workspace
+    // signal (across the documented `agents.defaults.workspace ->
+    // workspace -> workspaceDir` fallback chain), scrub older aliases
+    // from the merged snapshot first. Pre-fix `Object.assign` kept
+    // every older alias in place, so an older
+    // `agents.defaults.workspace` / `workspace` would survive
+    // alongside a newer-only `workspaceDir` and the resolver chain
+    // (which prefers `agents.defaults.workspace`) would pick the
+    // stale value — silently ignoring the newer route's intent.
+    scrubStaleWorkspaceAliases(merged, config);
     Object.assign(merged, config);
     if (priorAgents || nextAgents) {
       merged.agents = { ...(priorAgents ?? {}), ...(nextAgents ?? {}) };
@@ -254,10 +264,79 @@ function mergeRouteMetadataConfigs(
           ...(nextDefaults ?? {}),
         };
       }
+      // The agents.defaults assignment above re-introduces any prior
+      // `agents.defaults.workspace` that was scrubbed before
+      // `Object.assign`. Re-scrub after the deep-merge so the rule
+      // (newer workspace signal wins consistently) holds for the
+      // nested alias too.
+      scrubStaleAgentsDefaultsWorkspace(merged, config);
     }
     if (priorSession || nextSession) {
       merged.session = { ...(priorSession ?? {}), ...(nextSession ?? {}) };
     }
   }
   return merged;
+}
+
+/**
+ * The documented setup-side resolver picks the first alias to define
+ * a workspace from `agents.defaults.workspace -> workspace ->
+ * workspaceDir`. When merging route-metadata snapshots the resolver
+ * must see a single coherent answer, so any newer config that asserts
+ * a workspace signal (in any of those three slots) supersedes the
+ * older aliases entirely — otherwise an older alias survives and the
+ * resolver picks it ahead of the newer value.
+ *
+ * T364 round 8 — exported for `mergeRouteMetadataWithMergedConfig` in
+ * `DkgChannelPlugin.ts` so dispatch-side and resolve-side route merges
+ * share one normalization rule.
+ */
+export function scrubStaleWorkspaceAliases(
+  merged: Record<string, unknown>,
+  next: Record<string, unknown>,
+): void {
+  const supplied = workspaceAliasesSuppliedBy(next);
+  if (supplied.size === 0) return;
+  if (!supplied.has('workspace') && Object.prototype.hasOwnProperty.call(merged, 'workspace')) {
+    delete merged.workspace;
+  }
+  if (!supplied.has('workspaceDir') && Object.prototype.hasOwnProperty.call(merged, 'workspaceDir')) {
+    delete merged.workspaceDir;
+  }
+  scrubStaleAgentsDefaultsWorkspace(merged, next);
+}
+
+function scrubStaleAgentsDefaultsWorkspace(
+  merged: Record<string, unknown>,
+  next: Record<string, unknown>,
+): void {
+  const supplied = workspaceAliasesSuppliedBy(next);
+  if (supplied.size === 0) return;
+  if (supplied.has('agents.defaults.workspace')) return;
+  const mergedAgents = isObjectRecord(merged.agents) ? merged.agents : undefined;
+  if (!mergedAgents) return;
+  const mergedDefaults = isObjectRecord(mergedAgents.defaults) ? mergedAgents.defaults : undefined;
+  if (!mergedDefaults) return;
+  if (!Object.prototype.hasOwnProperty.call(mergedDefaults, 'workspace')) return;
+  // T364 round 8 — clone the agents → defaults path before deleting so
+  // we never mutate a caller-owned shared reference. `merged` in
+  // `mergeRouteMetadataWithMergedConfig` may be a shallow spread whose
+  // nested `agents`/`defaults` are still pointers into live runtime
+  // state (`runtime.config`). Mutating those would surface to other
+  // dispatches/observers as a delete-on-input side-effect.
+  const clonedDefaults: Record<string, unknown> = { ...mergedDefaults };
+  delete clonedDefaults.workspace;
+  merged.agents = { ...mergedAgents, defaults: clonedDefaults };
+}
+
+function workspaceAliasesSuppliedBy(config: Record<string, unknown>): Set<string> {
+  const supplied = new Set<string>();
+  if (typeof config.workspace === 'string') supplied.add('workspace');
+  if (typeof config.workspaceDir === 'string') supplied.add('workspaceDir');
+  const agents = isObjectRecord(config.agents) ? config.agents : undefined;
+  const defaults = isObjectRecord(agents?.defaults) ? agents.defaults : undefined;
+  if (defaults && typeof (defaults as Record<string, unknown>).workspace === 'string') {
+    supplied.add('agents.defaults.workspace');
+  }
+  return supplied;
 }

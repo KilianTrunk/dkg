@@ -39,6 +39,7 @@ import {
   mergeAdapterPluginConfigs,
   resolveOpenClawMergedConfig,
   resolveOpenClawRouteMetadataConfig,
+  scrubStaleWorkspaceAliases,
 } from './openclaw-config.js';
 
 export const CHANNEL_NAME = 'dkg-ui';
@@ -2602,6 +2603,17 @@ function mergeRouteMetadataWithMergedConfig(
     ...routeConfig,
     plugins: mergedConfig.plugins,
   };
+  // T364 round 8 — drop stale workspace aliases that the merged
+  // snapshot inherited from older route metadata when the current
+  // routeConfig asserts a newer workspace signal. Pre-fix the
+  // `...mergedConfig, ...routeConfig` spread kept any older
+  // `workspace` / `agents.defaults.workspace` from the merged
+  // snapshot alongside the newer-only `workspaceDir`, and the
+  // documented `agents.defaults.workspace -> workspace -> workspaceDir`
+  // resolver chain would pick the stale alias. Scrubbing here
+  // keeps the dispatch-side and resolve-side merges consistent
+  // with `mergeRouteMetadataConfigs` in `openclaw-config.ts`.
+  scrubStaleWorkspaceAliases(result, routeConfig);
   if (priorAgents || nextAgents) {
     result.agents = { ...(priorAgents ?? {}), ...(nextAgents ?? {}) };
     const priorDefaults = isObjectRecord(priorAgents?.defaults) ? priorAgents.defaults : undefined;
@@ -2612,6 +2624,11 @@ function mergeRouteMetadataWithMergedConfig(
         ...(nextDefaults ?? {}),
       };
     }
+    // The agents.defaults assignment above re-introduces the prior
+    // `agents.defaults.workspace` that was scrubbed by
+    // `scrubStaleWorkspaceAliases`. Re-scrub so the rule (newer
+    // workspace signal wins consistently) holds for the nested alias.
+    scrubStaleWorkspaceAliases(result, routeConfig);
   }
   if (priorSession || nextSession) {
     result.session = { ...(priorSession ?? {}), ...(nextSession ?? {}) };

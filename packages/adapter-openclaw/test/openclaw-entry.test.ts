@@ -670,7 +670,18 @@ describe('openclaw-entry', () => {
     expect(instance.config.dkgHome).toBeUndefined();
   });
 
-  it('keeps current entry config ahead of stale api.pluginConfig', async () => {
+  it('layers fresher api.pluginConfig over stale merged entry config', async () => {
+    // T364 — Pre-fix this test asserted that the entry config in
+    // `cfg.plugins.entries['adapter-openclaw'].config` won over a fresher
+    // `api.pluginConfig` direct config. That encoded the bug Codex
+    // flagged: a stale merged-snapshot entry would beat the fresher
+    // direct config that the operator had just supplied, so the
+    // singleton kept the old daemonUrl / memory / channel until a
+    // later pass rebuilt the merged snapshot. Post-fix
+    // `currentDirectConfigs` always layers `api.pluginConfig` on top of
+    // current entry configs, so the operator's fresher pluginConfig
+    // wins on conflicts (with module deep-merge preserving entry-only
+    // fields like `channel.port` that the direct config didn't override).
     const entry = await loadEntryWithFakeRuntime();
     const firstApi = makeApi('http://127.0.0.1:9200');
     const secondApi = makeDirectPluginConfigApi({
@@ -698,9 +709,13 @@ describe('openclaw-entry', () => {
 
     const instance = globalThis.__openclawEntryTestInstances![0];
     expect(instance.config).toMatchObject({
-      daemonUrl: 'http://127.0.0.1:9735',
-      memory: { enabled: false },
-      channel: { enabled: true, port: 9736 },
+      // Fresher pluginConfig wins on top-level + module-key conflicts.
+      daemonUrl: 'http://127.0.0.1:9620',
+      memory: { enabled: true },
+      // channel.enabled from pluginConfig wins; channel.port preserved
+      // from entry config via module deep-merge (pluginConfig didn't
+      // override that field).
+      channel: { enabled: false, port: 9736 },
     });
     expect(instance.updateConfigCalls[0].options).toEqual({ partial: false });
   });

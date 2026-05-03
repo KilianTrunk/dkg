@@ -2533,18 +2533,60 @@ function resolveDirectAdapterConfigFallback(api: OpenClawPluginApi): Record<stri
 function resolveChannelDispatchConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {
   const mergedConfig = resolveOpenClawMergedConfig(api);
   const routeConfig = resolveOpenClawRouteMetadataConfig(api);
+  const directConfig = resolveDirectAdapterConfigFallback(api);
   if (mergedConfig) {
-    return routeConfig
-      ? mergeRouteMetadataWithMergedConfig(mergedConfig, routeConfig)
+    // T364 — Layer the fresher direct adapter config over the merged
+    // workspace config's nested `plugins.entries['adapter-openclaw'].config`.
+    // Pre-fix this branch returned the merged config as-is even when
+    // `api.pluginConfig` carried newer daemonUrl / channel / memory
+    // updates, so the channel dispatched against stale settings on
+    // multi-phase gateways that update direct config before the merged
+    // snapshot catches up.
+    const mergedWithDirect = directConfig
+      ? mergeDirectAdapterConfigIntoMergedConfig(mergedConfig, directConfig)
       : mergedConfig;
+    return routeConfig
+      ? mergeRouteMetadataWithMergedConfig(mergedWithDirect, routeConfig)
+      : mergedWithDirect;
   }
 
-  const directConfig = resolveDirectAdapterConfigFallback(api);
   if (routeConfig && directConfig) {
     return mergeRouteConfigWithAdapterConfig(routeConfig, directConfig);
   }
 
   return directConfig ?? routeConfig;
+}
+
+function mergeDirectAdapterConfigIntoMergedConfig(
+  mergedConfig: Record<string, unknown>,
+  directConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  const plugins = isObjectRecord(mergedConfig.plugins)
+    ? (mergedConfig.plugins as Record<string, unknown>)
+    : {};
+  const entries = isObjectRecord(plugins.entries)
+    ? (plugins.entries as Record<string, unknown>)
+    : {};
+  const adapterEntry = isObjectRecord(entries['adapter-openclaw'])
+    ? (entries['adapter-openclaw'] as Record<string, unknown>)
+    : {};
+  const adapterEntryConfig = isObjectRecord(adapterEntry.config)
+    ? (adapterEntry.config as Record<string, unknown>)
+    : {};
+  const mergedAdapterConfig = mergeAdapterPluginConfigs(adapterEntryConfig, directConfig);
+  return {
+    ...mergedConfig,
+    plugins: {
+      ...plugins,
+      entries: {
+        ...entries,
+        'adapter-openclaw': {
+          ...adapterEntry,
+          config: mergedAdapterConfig,
+        },
+      },
+    },
+  };
 }
 
 function mergeRouteMetadataWithMergedConfig(

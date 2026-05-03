@@ -878,15 +878,45 @@ function directPluginConfigMemoryEnabledForApi(api: OpenClawPluginApi | null): b
   ];
   const currentMemoryEnabled = directPluginConfigMemoryEnabledFromCandidates(currentCandidates);
   if (currentMemoryEnabled !== undefined) return currentMemoryEnabled;
+  // T364 — Also read the nested merged-config entry path
+  // (`plugins.entries['adapter-openclaw'].config`) for `memory.enabled`.
+  // Pre-fix this helper only looked at top-level direct configs; when a
+  // runtime exposed the adapter config only through merged-shape
+  // `api.cfg`/`api.config` (with `plugins.entries.adapter-openclaw.config`)
+  // and omitted `plugins.slots.memory`, `disable()` never observed the
+  // explicit `memory.enabled: false` and cleared local state without
+  // stamping the inactive capability into the gateway — leaving the
+  // stale DKG memory runtime active.
+  const currentMergedEntryMemoryEnabled = directPluginConfigMemoryEnabledFromCandidates(
+    [anyApi?.cfg, anyApi?.config].map(adapterEntryConfigFromMergedConfig),
+  );
+  if (currentMergedEntryMemoryEnabled !== undefined) return currentMergedEntryMemoryEnabled;
   if (currentCandidates.some(isDirectConfigWithoutMemoryDecision)) {
     return undefined;
   }
 
-  return directPluginConfigMemoryEnabledFromCandidates([
+  const runtimeMemoryEnabled = directPluginConfigMemoryEnabledFromCandidates([
     runtime?.cfg,
     runtime?.config,
     runtime?.pluginConfig,
   ]);
+  if (runtimeMemoryEnabled !== undefined) return runtimeMemoryEnabled;
+
+  return directPluginConfigMemoryEnabledFromCandidates(
+    [runtime?.cfg, runtime?.config].map(adapterEntryConfigFromMergedConfig),
+  );
+}
+
+function adapterEntryConfigFromMergedConfig(value: unknown): unknown {
+  if (!isObjectRecord(value)) return undefined;
+  const plugins = (value as Record<string, unknown>).plugins;
+  if (!isObjectRecord(plugins)) return undefined;
+  const entries = (plugins as Record<string, unknown>).entries;
+  if (!isObjectRecord(entries)) return undefined;
+  const adapter = (entries as Record<string, unknown>)['adapter-openclaw'];
+  if (!isObjectRecord(adapter)) return undefined;
+  const config = (adapter as Record<string, unknown>).config;
+  return isObjectRecord(config) ? config : undefined;
 }
 
 function directPluginConfigMemoryEnabledFromCandidates(

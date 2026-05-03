@@ -127,11 +127,18 @@ function resolveEntryConfig(api, options = {}) {
     strongestCurrentEntryConfigIsMetadataOnly
       ? stripStateMetadataFromAdapterConfig(currentPluginConfig)
       : currentPluginConfig;
+  // T364 — Always layer api.pluginConfig over current entry configs, not
+  // only when the entry config is metadata-only. Pre-fix the third
+  // ternary returned `[]` when the current entry config was a full
+  // adapter config, so a fresher api.pluginConfig with updated
+  // daemonUrl / memory / channel was dropped on the floor — the
+  // singleton kept the stale entry-config values until a later pass
+  // rebuilt the merged snapshot. `currentPluginConfigForMetadataEntry`
+  // already strips state metadata in the metadata-only-entry case
+  // (line 126-129), so the merge is safe in both branches.
   const currentDirectConfigs = hasCurrentDirectApiConfig
     ? currentDirectApiConfigSources
-    : currentEntryConfigs.length === 0 || strongestCurrentEntryConfigIsMetadataOnly
-      ? [currentPluginConfigForMetadataEntry].filter(isObjectRecord)
-      : [];
+    : [currentPluginConfigForMetadataEntry].filter(isObjectRecord);
   const currentDirectConfigsArePartialOverlays =
     currentDirectConfigs.length > 0 &&
     currentDirectConfigs.every(isPartialAdapterConfigOverlay);

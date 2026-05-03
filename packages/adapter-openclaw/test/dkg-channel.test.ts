@@ -118,7 +118,15 @@ describe('DkgChannelPlugin', () => {
     expect(CHANNEL_NAME).toBe('dkg-ui');
   });
 
-  it('captures full runtime config when api.config is adapter plugin config', () => {
+  it('layers direct adapter config from api.config into merged runtime config', () => {
+    // T364 — Pre-fix this test asserted `(plugin as any).cfg).toBe(fullConfig)`
+    // (object identity), encoding the buggy behavior where the merged
+    // runtime config was returned verbatim and the fresher direct adapter
+    // config from `api.config` was dropped. Post-fix the direct adapter
+    // config is layered into the merged config's nested
+    // `plugins.entries['adapter-openclaw'].config`, so dispatch sees the
+    // updated daemonUrl / channel / memory while still inheriting
+    // `agents.defaults.workspace` from the merged runtime config.
     const { runtime } = makeMockRuntime();
     const fullConfig = {
       plugins: {
@@ -149,7 +157,18 @@ describe('DkgChannelPlugin', () => {
 
     plugin.register(api);
 
-    expect((plugin as any).cfg).toBe(fullConfig);
+    // Workspace metadata from the merged runtime config is preserved.
+    expect((plugin as any).cfg).toMatchObject({
+      agents: { defaults: { workspace: '/runtime-workspace' } },
+    });
+    // Direct adapter config from api.config is layered into the nested
+    // adapter-openclaw entry, with channel deep-merged over the entry's
+    // baseline (entry had `channel: { enabled: true, port: 0 }`, direct
+    // had `channel: { enabled: true, port: 0 }` — same shape, merge-clean).
+    expect((plugin as any).cfg.plugins.entries['adapter-openclaw'].config).toMatchObject({
+      daemonUrl: 'http://localhost:9200',
+      channel: { enabled: true, port: 0 },
+    });
   });
 
   it('overlays current route metadata onto fallback merged runtime config', async () => {

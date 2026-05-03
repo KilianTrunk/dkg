@@ -47,12 +47,56 @@ export function looksLikeAdapterPluginConfig(value: unknown): boolean {
     // adapter config, so the dispatch resolver stopped layering in
     // lower-priority full configs and could drop daemonUrl /
     // memory.enabled. Excluding `workspaceDir` here aligns the
-    // classifier with route-metadata recognition.
+    // classifier with route-metadata recognition; consumers that need
+    // to extract adapter-config keys from a mixed payload (workspaceDir
+    // + memory/channel/...) call `extractAdapterPluginConfigOverlay`
+    // instead, which splits route-metadata keys from adapter-config
+    // keys rather than rejecting the whole object.
     typeof value.workspaceDir === 'string'
   ) {
     return false;
   }
   return ADAPTER_PLUGIN_CONFIG_KEYS.some((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+/**
+ * Extract an adapter-config overlay from a candidate that may be a
+ * mixed payload (route metadata + adapter config). Returns just the
+ * adapter-config keys (`memory`, `channel`, `daemonUrl`, …) or
+ * `undefined` if the candidate carries none. Returns `undefined` for
+ * merged-config-shaped objects (presence of `plugins`) — those are
+ * full snapshots, not overlays.
+ *
+ * T364 round 6 — pre-fix the dispatch resolver and entry classifier
+ * blanket-rejected any object carrying route-metadata keys
+ * (`workspaceDir`, `agents`, `session`, `workspace`). For a gateway
+ * payload like `{ workspaceDir, channel: { port: 9801 } }` that
+ * dropped the legitimate channel override on the floor, leaving
+ * bootstrap/dispatch on the previous channel/memory settings. This
+ * helper lets callers split mixed payloads into the route-metadata
+ * portion (handled by `resolveOpenClawRouteMetadataConfig`) and the
+ * adapter-config portion (the overlay returned here).
+ */
+export function extractAdapterPluginConfigOverlay(value: unknown): Record<string, unknown> | undefined {
+  if (!isObjectRecord(value)) return undefined;
+  if (isObjectRecord(value.plugins)) return undefined;
+  const valueKeys = Object.keys(value);
+  if (valueKeys.length === 0) return undefined;
+  // Pure adapter config (no route-metadata keys mixed in) — return the
+  // original reference so consumers that compare by identity (and test
+  // suites that assert `toBe(candidate)`) keep working. The helper
+  // only allocates a fresh overlay when the input is a mixed payload
+  // that needs splitting.
+  if (looksLikeAdapterPluginConfig(value)) {
+    return value as Record<string, unknown>;
+  }
+  const overlay: Record<string, unknown> = {};
+  for (const key of ADAPTER_PLUGIN_CONFIG_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      overlay[key] = (value as Record<string, unknown>)[key];
+    }
+  }
+  return Object.keys(overlay).length > 0 ? overlay : undefined;
 }
 
 export function isStateMetadataOnlyAdapterConfig(value: unknown): boolean {
@@ -161,10 +205,33 @@ export function resolveOpenClawRouteMetadataConfig(api: OpenClawPluginApi): Reco
     !looksLikeAdapterPluginConfig(candidate) &&
     !hasMergedPluginConfigSignal(candidate) &&
     hasRouteMetadataConfigSignal(candidate)
-  );
+  ) as Record<string, unknown>[];
+  // T364 round 6 — extract just the route-metadata keys from each
+  // candidate before merging. A mixed gateway payload like
+  // `{ workspaceDir, channel: { port: 9801 } }` has both route metadata
+  // (workspaceDir) AND adapter overlay (channel); the adapter portion
+  // is handled by `extractAdapterPluginConfigOverlay` separately, so
+  // route-metadata extraction must drop adapter keys here to avoid
+  // leaking them into the route layer (and overriding the merged
+  // adapter config that gets nested under `plugins.entries`).
+  // Pre-fix `mergeRouteMetadataConfigs` did `Object.assign(merged, config)`
+  // verbatim, so `channel: { port: 9801 }` would leak into the route
+  // metadata top level when the mixed payload was the only candidate.
   return candidates.length > 0
-    ? mergeRouteMetadataConfigs(...candidates)
+    ? mergeRouteMetadataConfigs(...candidates.map(extractRouteMetadataKeys))
     : undefined;
+}
+
+const ROUTE_METADATA_KEYS = ['workspace', 'workspaceDir', 'agents', 'session'] as const;
+
+function extractRouteMetadataKeys(value: Record<string, unknown>): Record<string, unknown> {
+  const extracted: Record<string, unknown> = {};
+  for (const key of ROUTE_METADATA_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      extracted[key] = value[key];
+    }
+  }
+  return extracted;
 }
 
 function mergeRouteMetadataConfigs(

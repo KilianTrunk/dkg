@@ -1876,6 +1876,112 @@ describe('DkgNodePlugin', () => {
     }
   });
 
+  it('T364 round 6 — aborts in-flight local-agent sync when channel.enabled flips to false mid-await', async () => {
+    // Regression: pre-fix syncLocalAgentIntegrationState only checked
+    // daemonClientGeneration at each yield. A config flip from
+    // channel.enabled=true→false does NOT bump that generation, so
+    // a sync that was already awaiting getLocalAgentIntegration() or
+    // channelPlugin.start() could still call
+    // connectLocalAgentIntegration({ enabled: true }) AFTER the disable
+    // path had cleared the OpenClaw record — silently re-enabling it.
+    let resolveLoad: ((value: null) => void) | undefined;
+    const client = {
+      getLocalAgentIntegration: vi.fn(() => new Promise<null>((resolve) => { resolveLoad = resolve; })),
+      connectLocalAgentIntegration: vi.fn(),
+    };
+    const plugin = new DkgNodePlugin({
+      daemonUrl: 'http://localhost:9200',
+      channel: { enabled: true, port: 0 },
+      memory: { enabled: false },
+    } as any);
+    const api: OpenClawPluginApi = {
+      config: {},
+      registrationMode: 'full',
+      registerTool: () => {},
+      registerHook: () => {},
+      on: () => {},
+      logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+    } as unknown as OpenClawPluginApi;
+
+    (plugin as any).client = client;
+    (plugin as any).channelPlugin = {
+      isUsingGatewayRoute: false,
+      isListening: true,
+      bridgePort: 0,
+      start: vi.fn(async () => {}),
+      setClient: vi.fn(),
+    };
+
+    const sync = (plugin as any).syncLocalAgentIntegrationState(api, 'full');
+    expect(client.getLocalAgentIntegration).toHaveBeenCalledWith('openclaw');
+
+    // Flip channel.enabled to false WITHOUT bumping daemonClientGeneration —
+    // simulates the operator/config path disabling channel mid-sync.
+    (plugin as any).config = {
+      ...(plugin as any).config,
+      channel: { enabled: false, port: 0 },
+    };
+
+    resolveLoad?.(null);
+    await sync;
+
+    expect(client.connectLocalAgentIntegration).not.toHaveBeenCalled();
+  });
+
+  it('T364 round 6 — aborts in-flight local-agent sync when channel.enabled flips during channelPlugin.start() await', async () => {
+    // Companion to the get-load-await test: covers the SECOND yield
+    // window in syncLocalAgentIntegrationState. After the load
+    // resolves, `await channelPlugin.start()` is the next yield;
+    // a config flip during that window must also abort before
+    // `connectLocalAgentIntegration({ enabled: true })` fires.
+    let resolveStart: (() => void) | undefined;
+    const client = {
+      getLocalAgentIntegration: vi.fn(async () => null),
+      connectLocalAgentIntegration: vi.fn(),
+    };
+    const plugin = new DkgNodePlugin({
+      daemonUrl: 'http://localhost:9200',
+      channel: { enabled: true, port: 0 },
+      memory: { enabled: false },
+    } as any);
+    const api: OpenClawPluginApi = {
+      config: {},
+      registrationMode: 'full',
+      registerTool: () => {},
+      registerHook: () => {},
+      on: () => {},
+      logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+    } as unknown as OpenClawPluginApi;
+
+    (plugin as any).client = client;
+    (plugin as any).channelPlugin = {
+      isUsingGatewayRoute: false,
+      isListening: true,
+      bridgePort: 0,
+      start: vi.fn(() => new Promise<void>((resolve) => { resolveStart = resolve; })),
+      setClient: vi.fn(),
+    };
+
+    const sync = (plugin as any).syncLocalAgentIntegrationState(api, 'full');
+    // Let the microtask chain drain past `getLocalAgentIntegration` and
+    // into `channelPlugin.start()` so we are blocked on `resolveStart`.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Flip channel.enabled to false WITHOUT bumping daemonClientGeneration —
+    // simulates a config update arriving while channelPlugin.start() is
+    // still pending.
+    (plugin as any).config = {
+      ...(plugin as any).config,
+      channel: { enabled: false, port: 0 },
+    };
+
+    resolveStart?.();
+    await sync;
+
+    expect(client.connectLocalAgentIntegration).not.toHaveBeenCalled();
+  });
+
   it('drops stale local-agent sync work after daemon client refresh', async () => {
     vi.useFakeTimers();
     let resolveLoad: ((value: null) => void) | undefined;

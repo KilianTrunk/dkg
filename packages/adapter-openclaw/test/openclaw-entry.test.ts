@@ -66,6 +66,23 @@ describe('openclaw-entry', () => {
         "  if (isObjectRecord(value.plugins) || isObjectRecord(value.agents) || isObjectRecord(value.session) || typeof value.workspace === 'string' || typeof value.workspaceDir === 'string') return false;",
         '  return ADAPTER_PLUGIN_CONFIG_KEYS.some((key) => Object.prototype.hasOwnProperty.call(value, key));',
         '}',
+        // T364 round 6 — mirror production extractAdapterPluginConfigOverlay.
+        // Splits mixed gateway payloads (route metadata + adapter overlay)
+        // by returning only the adapter-config keys, or undefined if none.
+        // Rejects merged-config-shaped objects (presence of `plugins`).
+        // Returns the original reference for pure adapter configs (no
+        // mixed route-metadata keys) so identity-based equality holds.
+        'export function extractAdapterPluginConfigOverlay(value) {',
+        '  if (!isObjectRecord(value)) return undefined;',
+        '  if (isObjectRecord(value.plugins)) return undefined;',
+        '  if (Object.keys(value).length === 0) return undefined;',
+        '  if (looksLikeAdapterPluginConfig(value)) return value;',
+        '  const overlay = {};',
+        '  for (const key of ADAPTER_PLUGIN_CONFIG_KEYS) {',
+        '    if (Object.prototype.hasOwnProperty.call(value, key)) overlay[key] = value[key];',
+        '  }',
+        '  return Object.keys(overlay).length > 0 ? overlay : undefined;',
+        '}',
         // T364 follow-up: sameResolvedPath polyfill for the test fake.
         // Real `state-dir-path.ts` walks up to existing parent then
         // realpathSync; the test fake operates on hypothetical paths

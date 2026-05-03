@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  extractAdapterPluginConfigOverlay,
   isPartialAdapterConfigOverlay,
   isStateMetadataOnlyAdapterConfig,
   looksLikeAdapterPluginConfig,
@@ -164,6 +165,39 @@ describe('openclaw-config helpers', () => {
 
     expect(resolveOpenClawMergedConfig(api)).toBeUndefined();
     expect(resolveOpenClawRouteMetadataConfig(api)).toEqual(routeConfig);
+  });
+
+  it('T364 round 6 — extractAdapterPluginConfigOverlay splits mixed gateway payloads into adapter overlay', () => {
+    // Pre-fix `looksLikeAdapterPluginConfig` blanket-rejected any
+    // object carrying `workspaceDir` (or any route-metadata key), so
+    // a legitimate gateway payload like `{ workspaceDir, channel: {...} }`
+    // dropped its channel/memory overrides on the floor and bootstrap
+    // kept stale settings. The new helper splits the route-metadata
+    // portion (handled separately by route-metadata recognition) from
+    // the adapter-config portion and returns just the latter.
+    expect(extractAdapterPluginConfigOverlay({
+      workspaceDir: '/legacy-workspace',
+      channel: { port: 9801 },
+    })).toEqual({ channel: { port: 9801 } });
+    expect(extractAdapterPluginConfigOverlay({
+      workspaceDir: '/legacy-workspace',
+      memory: { enabled: false },
+    })).toEqual({ memory: { enabled: false } });
+    // Pure adapter config — return original reference (identity preserved)
+    // so consumers comparing by `toBe(candidate)` keep working.
+    const pure = { daemonUrl: 'http://127.0.0.1:9200', channel: { enabled: true, port: 0 } };
+    expect(extractAdapterPluginConfigOverlay(pure)).toBe(pure);
+    // Pure route metadata (no adapter keys) → undefined.
+    expect(extractAdapterPluginConfigOverlay({ workspaceDir: '/just-metadata' })).toBeUndefined();
+    expect(extractAdapterPluginConfigOverlay({ agents: { defaults: { workspace: '/x' } } })).toBeUndefined();
+    // Merged-config-shaped input (has `plugins`) → undefined; that's
+    // a full snapshot, not a direct overlay.
+    expect(extractAdapterPluginConfigOverlay({
+      plugins: { entries: { 'adapter-openclaw': { config: { channel: { port: 9801 } } } } },
+    })).toBeUndefined();
+    expect(extractAdapterPluginConfigOverlay(undefined)).toBeUndefined();
+    expect(extractAdapterPluginConfigOverlay(null)).toBeUndefined();
+    expect(extractAdapterPluginConfigOverlay({})).toBeUndefined();
   });
 
   it('T364 follow-up — recognizes legacy `workspaceDir`-only route config as route metadata', () => {

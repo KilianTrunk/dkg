@@ -244,6 +244,60 @@ describe('DkgChannelPlugin', () => {
     expect((runtime as any).channel.routing.resolveAgentRoute.calls[0][0].cfg).toBe(directConfig);
   });
 
+  it('T364 round 6 — extracts adapter overlay from mixed { workspaceDir, channel } gateway payload', async () => {
+    // Pre-fix `directAdapterConfigFrom` rejected any object carrying
+    // route-metadata keys (workspaceDir, agents, session, workspace),
+    // so a gateway payload like `{ workspaceDir, channel: { port: 9801 } }`
+    // dropped its channel override on the floor and the dispatch
+    // resolver kept stale daemon/channel settings from lower-priority
+    // sources. Post-fix the helper splits the route-metadata portion
+    // (handled separately by `resolveOpenClawRouteMetadataConfig`) from
+    // the adapter-config portion and returns just the latter, so the
+    // overlay layers correctly over the lower-priority full config.
+    const { runtime } = makeMockRuntime({
+      dispatchImpl: async (params) => {
+        await params.dispatcherOptions.deliver({ text: 'Mixed payload reply' });
+      },
+    });
+    const mixedConfig = {
+      workspaceDir: '/legacy-workspace',
+      channel: { port: 9801 },
+    };
+    const fullPluginConfig = {
+      daemonUrl: 'http://localhost:9350',
+      memory: { enabled: true },
+      channel: { enabled: true, port: 0 },
+    };
+    const api = makeApi({
+      config: mixedConfig,
+      pluginConfig: fullPluginConfig,
+      runtime,
+    } as any);
+    vi.spyOn(client, 'storeChatTurn').mockResolvedValue(undefined);
+
+    plugin.register(api);
+    const reply = await plugin.processInbound('Hello', 'corr-mixed-payload', 'owner');
+
+    expect(reply.text).toBe('Mixed payload reply');
+    const dispatchCfg = (runtime as any).channel.routing.resolveAgentRoute.calls[0][0].cfg;
+    // Adapter overlay (channel.port: 9801) MUST be preserved on top of
+    // the lower-priority full plugin config; route metadata (workspaceDir)
+    // is recognized by the route-metadata path separately. Adapter
+    // fields land nested under `plugins.entries['adapter-openclaw'].config`
+    // because mergeRouteConfigWithAdapterConfig groups them there when
+    // a route-metadata layer is present (matches the no-merged-config
+    // route+direct path used elsewhere in this file).
+    expect(dispatchCfg.workspaceDir).toBe('/legacy-workspace');
+    // Route layer must NOT leak the adapter `channel` key (T364 round 6
+    // route-metadata-extraction fix).
+    expect(dispatchCfg).not.toHaveProperty('channel');
+    expect(dispatchCfg.plugins.entries['adapter-openclaw'].config).toMatchObject({
+      daemonUrl: 'http://localhost:9350',
+      memory: { enabled: true },
+      channel: { enabled: true, port: 9801 },
+    });
+  });
+
   it('keeps direct api.cfg ahead of stale api.pluginConfig for dispatch cfg fallback', async () => {
     const { runtime } = makeMockRuntime({
       dispatchImpl: async (params) => {

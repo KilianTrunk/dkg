@@ -33,9 +33,9 @@ import type {
 import type { DkgDaemonClient, OpenClawAttachmentRef } from './dkg-client.js';
 import type { ChatTurnWriter } from './ChatTurnWriter.js';
 import {
+  extractAdapterPluginConfigOverlay,
   isPartialAdapterConfigOverlay,
   isObjectRecord,
-  looksLikeAdapterPluginConfig,
   mergeAdapterPluginConfigs,
   resolveOpenClawMergedConfig,
   resolveOpenClawRouteMetadataConfig,
@@ -2620,9 +2620,15 @@ function mergeRouteMetadataWithMergedConfig(
 }
 
 function directAdapterConfigFrom(candidate: unknown): Record<string, unknown> | undefined {
-  return isObjectRecord(candidate) && looksLikeAdapterPluginConfig(candidate)
-    ? candidate
-    : undefined;
+  // T364 round 6 — extract just the adapter-config keys from
+  // candidates that may be mixed gateway payloads (route metadata +
+  // adapter overlay), e.g. `{ workspaceDir, channel: { port: 9801 } }`.
+  // Pre-fix `looksLikeAdapterPluginConfig` returned false for such
+  // payloads, so the legitimate channel/memory overlay was dropped on
+  // the floor and bootstrap/dispatch kept stale settings. The
+  // extraction helper splits route-metadata keys (handled separately
+  // by `resolveOpenClawRouteMetadataConfig`) from adapter-config keys.
+  return extractAdapterPluginConfigOverlay(candidate);
 }
 
 function mergeRouteConfigWithAdapterConfig(

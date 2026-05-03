@@ -3,10 +3,10 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DkgNodePlugin,
+  extractAdapterPluginConfigOverlay,
   isObjectRecord,
   isPartialAdapterConfigOverlay,
   isStateMetadataOnlyAdapterConfig,
-  looksLikeAdapterPluginConfig,
   mergeAdapterPluginConfigs,
   sameResolvedPath,
 } from './dist/index.js';
@@ -345,30 +345,19 @@ function clearEntryAssignedWorkspaceDir(api) {
 }
 
 function directApiConfigFrom(config) {
-  if (!isObjectRecord(config)) return undefined;
-  if (
-    isObjectRecord(config.plugins) ||
-    isObjectRecord(config.agents) ||
-    isObjectRecord(config.session) ||
-    typeof config.workspace === 'string' ||
-    // T364 follow-up: `workspaceDir` is route metadata, not a direct
-    // adapter config field. Companion fix to the `looksLikeAdapterPluginConfig`
-    // exclusion in openclaw-config.ts. Pre-fix
-    // `{ workspaceDir, channel: { port: 9801 } }` flipped `configIsPartial`
-    // to false here and bootstrap stopped merging the fallback full
-    // config — recreating the stale daemon/channel settings on first
-    // runtime pass. (`looksLikeAdapterPluginConfig` already excludes
-    // `workspaceDir` after the shared-helper fix; this entry-side
-    // mirror keeps the early-return path's exclusion list aligned so
-    // the rules cannot drift.)
-    typeof config.workspaceDir === 'string'
-  ) {
-    return undefined;
-  }
-  if (looksLikeAdapterPluginConfig(config)) {
-    return config;
-  }
-  return undefined;
+  // T364 round 6 — extract just the adapter-config keys (memory,
+  // channel, daemonUrl, ...) from a candidate that may be a mixed
+  // gateway payload (route metadata + adapter overlay). Pre-fix this
+  // helper rejected the whole object whenever any route-metadata key
+  // (`workspaceDir`, `agents`, `session`, `workspace`) was present, so
+  // a payload like `{ workspaceDir, channel: { port: 9801 } }` lost
+  // the legitimate channel override on the floor and bootstrap kept
+  // stale daemon/channel/memory settings on the first runtime pass.
+  // The shared `extractAdapterPluginConfigOverlay` helper splits the
+  // overlay from the route metadata (which is handled separately by
+  // route-metadata recognition) and returns just the adapter-config
+  // keys, or `undefined` if the candidate carries none.
+  return extractAdapterPluginConfigOverlay(config);
 }
 
 function registrationModeEnablesRuntime(api) {
@@ -377,11 +366,12 @@ function registrationModeEnablesRuntime(api) {
 }
 
 function directPluginConfigFrom(config) {
-  if (!isObjectRecord(config)) return undefined;
-  if (looksLikeAdapterPluginConfig(config)) {
-    return config;
-  }
-  return undefined;
+  // T364 round 6 — same mixed-payload semantics as `directApiConfigFrom`.
+  // `api.pluginConfig` is typically a pure adapter config, but this
+  // helper is also fed `runtime.pluginConfig` and other less-strict
+  // sources. Extract just the adapter-config keys so a mixed gateway
+  // payload contributes its overlay rather than being rejected wholesale.
+  return extractAdapterPluginConfigOverlay(config);
 }
 
 function adapterConfigSourcesFromFullConfig(config) {

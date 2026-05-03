@@ -37,6 +37,7 @@ export {
   PROJECT_MEMORY_ASSERTION,
 } from './DkgMemoryPlugin.js';
 export {
+  extractAdapterPluginConfigOverlay,
   isObjectRecord,
   isPartialAdapterConfigOverlay,
   isStateMetadataOnlyAdapterConfig,

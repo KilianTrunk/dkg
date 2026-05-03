@@ -1682,6 +1682,17 @@ export class DkgNodePlugin {
     generation = this.daemonClientGeneration,
   ): Promise<void> {
     if (generation !== this.daemonClientGeneration) return;
+    // T364 round 6 — re-check `channel.enabled` at every yield, not
+    // only `daemonClientGeneration`. A config flip from
+    // `channel.enabled=true→false` does NOT bump the daemon-client
+    // generation, so an in-flight sync that started while the channel
+    // was enabled and is now awaiting `getLocalAgentIntegration()` or
+    // `channelPlugin.start()` could otherwise continue to call
+    // `connectLocalAgentIntegration({ enabled: true })` AFTER the
+    // disable path (`clearLocalAgentChannelIntegration`) has already
+    // cleared the OpenClaw record — silently re-enabling it. Mirror
+    // the `channelEnabled()` guards in the disable path here.
+    if (this.config.channel?.enabled !== true) return;
     const client = this.client;
     // Skip the retry loop entirely when the adapter has no runtime
     // integrations to sync. The stored-integration fetch is a no-op for
@@ -1695,6 +1706,7 @@ export class DkgNodePlugin {
 
     const existing = await this.loadStoredOpenClawIntegration(api, generation, client);
     if (generation !== this.daemonClientGeneration) return;
+    if (this.config.channel?.enabled !== true) return;
     if (existing === undefined) {
       // Log dedup: emit exactly one `warn` per distinct failure reason,
       // then downgrade repeats of the same reason to `debug` (silent at
@@ -1755,6 +1767,10 @@ export class DkgNodePlugin {
       }
     }
     if (generation !== this.daemonClientGeneration) return;
+    // Final guard immediately before sending the enabled payload. A
+    // disable that happened during channelPlugin.start() above must not
+    // be undone by this in-flight sync.
+    if (this.config.channel?.enabled !== true) return;
 
     const bridgeReady = this.channelPlugin?.isListening === true && !startError;
     // T30 — Derive memory-related capability flags from actual

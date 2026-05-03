@@ -40,6 +40,13 @@ export class HubResolutionCache<T> {
    * previous tick's resolve is awaiting the RPC reply would re-cache
    * the **pre-rotation** address — exactly the stale-entry bug this
    * cache was added to fix.
+   *
+   * NOTE: This counter is INVALIDATE-ONLY. It does NOT bump on a
+   * successful TTL-driven re-resolve. Callers that need to detect a
+   * silent contract swap (e.g. via TTL refresh on a stale Hub view)
+   * should compare the resolved value/identity itself rather than
+   * relying solely on this counter — see
+   * `EVMChainAdapter.inflightDurationProbeContract`.
    */
   private generation = 0;
 

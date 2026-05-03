@@ -52,6 +52,31 @@ import { HubResolutionCache } from './hub-resolution-cache.js';
 const DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS = 5 * 60 * 1000;
 
 /**
+ * Hard ceiling for the best-effort live `getActiveProofingPeriodDurationInBlocks()`
+ * read inside `getActiveProofPeriodStatus()`. The status read itself is one
+ * `eth_call`; the duration probe is a sibling `eth_call` on the same provider
+ * and should typically resolve in <100ms. If it hasn't returned in 2s the
+ * provider is slow or hanging — fall back to `undefined` and let the prover
+ * use the cached `existing.proofingPeriodDurationInBlocks` rather than
+ * stalling the whole tick. Codex round 5 on PR #369.
+ */
+const DURATION_PROBE_TIMEOUT_MS = 2000;
+
+/**
+ * Upper bound on the in-flight duration probe slot age. The single-flight
+ * guard reuses a pending probe to bound RPC cardinality at 1, but if the
+ * underlying `eth_call` never settles (hung provider, dropped websocket)
+ * the slot would otherwise stay populated forever and suppress every
+ * fresh probe. After this many ms we abandon the slot regardless and
+ * let the next call start a new probe — capping leaked-handle growth
+ * to one per `MAX_PROBE_AGE_MS` window instead of one per tick. Set
+ * generously above `DURATION_PROBE_TIMEOUT_MS` so honest slow paths
+ * (high RPC latency, congested chain) still benefit from single-flight.
+ * Codex round 8 on PR #369.
+ */
+const MAX_PROBE_AGE_MS = 30_000;
+
+/**
  * Substrings we treat as "the Hub no longer recognises this contract
  * as a registered participant" — i.e. the cached address is stale and
  * the next call should re-resolve from the Hub. Conservative match on
@@ -256,6 +281,42 @@ export class EVMChainAdapter implements ChainAdapter {
    */
   private readonly randomSamplingPairCache: HubResolutionCache<{ rs: Contract; rss: Contract }>;
   private hubRotationListenerStarted = false;
+  /**
+   * Single-flight guard for the best-effort
+   * `getActiveProofingPeriodDurationInBlocks()` probe inside
+   * `getActiveProofPeriodStatus()`. Codex round 5 on PR #369: the
+   * 2s `Promise.race` timeout returns `undefined` to the caller but
+   * the underlying `eth_call` is NOT cancellable in ethers v6, so
+   * naively issuing one new probe per tick would accumulate one
+   * stuck request per tick on a hung provider. Instead we reuse the
+   * same in-flight promise across overlapping calls — at most one
+   * probe is ever pending against the provider at a time.
+   *
+   * Codex round 8 on PR #369: also track the `RandomSampling`
+   * Contract instance the probe was started against AND a wall-clock
+   * creation timestamp.
+   *   - Contract-identity guard: a TTL refresh of
+   *     `randomSamplingPairCache` re-resolves `rs` to a freshly
+   *     constructed `Contract` instance WITHOUT calling
+   *     `invalidateRandomSamplingPair()`. The HubResolutionCache
+   *     generation counter is invalidate-only (it is also used by
+   *     `resolveAndAssignRandomSamplingPair()` to detect concurrent
+   *     invalidations, so it must NOT bump on normal refreshes), so
+   *     it can't signal a TTL refresh. Comparing the resolved
+   *     Contract instance by reference is the canonical check: a
+   *     refresh always hands back a new instance.
+   *   - Max-age guard: `Promise.race` returns `undefined` to the
+   *     caller on timeout, but the underlying `eth_call` may
+   *     never settle (truly hung provider). Without an upper
+   *     bound on slot age, a single hung probe would suppress
+   *     every fresh probe forever. After `MAX_PROBE_AGE_MS` we
+   *     abandon the slot regardless; the orphan promise still has
+   *     its `.finally` attached but the slot identity check inside
+   *     it correctly does nothing.
+   */
+  private inflightDurationProbe: Promise<bigint | undefined> | undefined;
+  private inflightDurationProbeContract: Contract | undefined;
+  private inflightDurationProbeStartedAt = 0;
 
   constructor(config: EVMAdapterConfig) {
     this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
@@ -2508,11 +2569,26 @@ export class EVMChainAdapter implements ChainAdapter {
    * `isRandomSamplingReady()` probe would keep returning `true` after a Hub
    * rotation (until the next `getRandomSampling()` re-populates the
    * handles), giving the prover a stale all-clear.
+   *
+   * Codex round 6 on PR #369: ALSO drop the in-flight duration probe.
+   * The probe was started against the OLD `RandomSampling` contract;
+   * if Hub rotates while it is pending we MUST NOT pair the new
+   * contract's `getActiveProofPeriodStatus()` with the old contract's
+   * duration in the next call. Worse, if the old probe never settles
+   * (hung provider) it would suppress every fresh probe forever via
+   * the single-flight guard. Clearing the slot here lets the next
+   * call issue a fresh probe against the new contract; the now-orphan
+   * old promise is still handled by its `.finally` hook (the slot
+   * identity check inside .finally won't match, so it correctly does
+   * nothing).
    */
   private invalidateRandomSamplingPair(): void {
     this.randomSamplingPairCache.invalidate();
     this.contracts.randomSampling = undefined;
     this.contracts.randomSamplingStorage = undefined;
+    this.inflightDurationProbe = undefined;
+    this.inflightDurationProbeContract = undefined;
+    this.inflightDurationProbeStartedAt = 0;
   }
 
   /**
@@ -2696,10 +2772,97 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     const { rs } = await this.getRandomSampling();
 
-    const raw = await rs.getActiveProofPeriodStatus();
+    // Codex round 2 on PR #369: the cached `NodeChallenge.proofingPeriodDurationInBlocks`
+    // is whatever the contract used at challenge-creation time. The chain's
+    // `updateAndGetActiveProofPeriodStartBlock()` rolls forward using the
+    // CURRENT epoch's duration via `getActiveProofingPeriodDurationInBlocks()`.
+    // If a governance change shortens the duration mid-flight, off-chain
+    // staleness checks against the cached duration would underestimate
+    // expiry and re-deadlock at the rollover boundary. Pull the live
+    // duration alongside the status read so the prover can compare
+    // wall-clock against the same value the contract uses for rollover.
+    //
+    // Codex round 3 + 4 + 5 — keep the live-duration read STRICTLY best-effort:
+    // a transient RPC blip, partial rollout, or an older RS deployment
+    // that omits the method from its ABI must NOT make the whole
+    // `getActiveProofPeriodStatus()` reject OR stall.
+    //
+    // Naive `Promise.allSettled` is NOT enough —
+    // `rs.getActiveProofingPeriodDurationInBlocks()` would throw
+    // synchronously (`TypeError: ... is not a function`) before
+    // `allSettled` can wrap it when the method is missing entirely.
+    //
+    // Plain `try/catch` is also NOT enough — a hung RPC (provider
+    // accepts the request but never responds) keeps the await pending
+    // forever, blocking the entire status probe even though the
+    // primary `getActiveProofPeriodStatus()` already returned. The
+    // prover can safely continue with the cached challenge duration,
+    // so race the duration read against a short timeout and prefer
+    // `undefined` on slow paths. The prover treats `undefined` as
+    // "fall back to existing.proofingPeriodDurationInBlocks".
+    const readDurationBestEffort = async (): Promise<bigint | undefined> => {
+      try {
+        const fn = (rs as unknown as { getActiveProofingPeriodDurationInBlocks?: () => Promise<unknown> })
+          .getActiveProofingPeriodDurationInBlocks;
+        if (typeof fn !== 'function') return undefined;
+        const v = await fn.call(rs);
+        return BigInt(v as never);
+      } catch {
+        return undefined;
+      }
+    };
+    const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+      });
+      return Promise.race([
+        p.then((v) => { if (timer) clearTimeout(timer); return v; }),
+        timeout,
+      ]);
+    };
+    // Single-flight: if a previous tick's probe is still pending,
+    // reuse it instead of issuing a fresh `eth_call`. Codex round 8:
+    // first invalidate the slot if (a) the resolved RS Contract
+    // instance has changed since the probe was started (TTL-refresh
+    // path constructs a fresh Contract WITHOUT calling
+    // invalidateRandomSamplingPair → the probe was started against
+    // the old contract and must not be paired with the new
+    // contract's status), or (b) the slot is older than
+    // MAX_PROBE_AGE_MS (a truly hung probe must not suppress retries
+    // forever).
+    const probeAgeMs = this.inflightDurationProbe
+      ? Date.now() - this.inflightDurationProbeStartedAt
+      : 0;
+    if (this.inflightDurationProbe && (
+      this.inflightDurationProbeContract !== rs ||
+      probeAgeMs > MAX_PROBE_AGE_MS
+    )) {
+      this.inflightDurationProbe = undefined;
+    }
+    let probe = this.inflightDurationProbe;
+    if (!probe) {
+      const fresh = readDurationBestEffort();
+      this.inflightDurationProbe = fresh;
+      this.inflightDurationProbeContract = rs;
+      this.inflightDurationProbeStartedAt = Date.now();
+      // `.finally` covers both resolve and reject paths without
+      // altering the value the caller observes.
+      void fresh.finally(() => {
+        if (this.inflightDurationProbe === fresh) {
+          this.inflightDurationProbe = undefined;
+        }
+      });
+      probe = fresh;
+    }
+    const [raw, proofingPeriodDurationInBlocks] = await Promise.all([
+      rs.getActiveProofPeriodStatus(),
+      withTimeout(probe, DURATION_PROBE_TIMEOUT_MS, undefined),
+    ]);
     return {
       activeProofPeriodStartBlock: BigInt(raw.activeProofPeriodStartBlock ?? raw[0]),
       isValid: Boolean(raw.isValid ?? raw[1]),
+      proofingPeriodDurationInBlocks,
     };
   }
 

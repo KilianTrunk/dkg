@@ -174,20 +174,48 @@ function resolveEntryConfig(api, options = {}) {
   const daemonUrlFromCurrentConfig = currentConfigSources.some((candidate) =>
     Object.prototype.hasOwnProperty.call(candidate, 'daemonUrl')
   );
-  const dkgHomeFromCurrentConfig = currentConfigSources.some((candidate) =>
-    Object.prototype.hasOwnProperty.call(candidate, 'dkgHome')
-  );
-
   const daemonUrlFromEnv = !!process.env.DKG_DAEMON_URL;
+  // T364 follow-up — pair `dkgHome` with the source that supplied the
+  // winning `daemonUrl`. Pre-fix `dkgHomeFromCurrentConfig` was true
+  // whenever ANY current source had `dkgHome`, even when a higher-
+  // priority overlay changed only `daemonUrl` (or `DKG_DAEMON_URL`
+  // overrode it). The stale lower-priority `dkgHome` then survived
+  // through `mergeAdapterPluginConfigs`, leaving the client pointed
+  // at the new daemon URL while still reading auth from the old home.
+  // Treat `dkgHome` as "current" only when the winning daemonUrl
+  // source also supplied it: env (which never supplies dkgHome) wins
+  // → false; otherwise check the highest-priority current source that
+  // has `daemonUrl`.
+  const winningCurrentDaemonUrlSource = (() => {
+    for (let i = currentConfigSources.length - 1; i >= 0; i--) {
+      if (Object.prototype.hasOwnProperty.call(currentConfigSources[i], 'daemonUrl')) {
+        return currentConfigSources[i];
+      }
+    }
+    return undefined;
+  })();
+  const dkgHomeFromCurrentConfig =
+    !daemonUrlFromEnv &&
+    !!winningCurrentDaemonUrlSource &&
+    Object.prototype.hasOwnProperty.call(winningCurrentDaemonUrlSource, 'dkgHome');
+
   if (process.env.DKG_DAEMON_URL) {
     config.daemonUrl = process.env.DKG_DAEMON_URL;
   }
   const fallbackConfig = mergeAdapterPluginConfigs(...fallbackConfigSources);
-  if (configIsPartial && (daemonUrlFromEnv || daemonUrlFromCurrentConfig) && !dkgHomeFromCurrentConfig) {
+  // Reset gate fires whenever a winning `daemonUrl` is not paired with
+  // a `dkgHome` from the same source. Drop the `configIsPartial`
+  // precondition: a full lower-priority current entry can still carry
+  // a stale `dkgHome` when a higher-priority direct overlay changes
+  // only `daemonUrl`, and clamping that requires the same reset path.
+  if ((daemonUrlFromEnv || daemonUrlFromCurrentConfig) && !dkgHomeFromCurrentConfig) {
     delete fallbackConfig.dkgHome;
-    if (!Object.prototype.hasOwnProperty.call(config, 'dkgHome')) {
-      config.dkgHome = undefined;
-    }
+    // Drop any lower-priority current `dkgHome` that survived the
+    // current-source merge — the winning daemonUrl source did not
+    // supply it, so pairing the stale value with the new daemonUrl
+    // through `bootstrapConfig` would mismatch auth and daemon.
+    delete config.dkgHome;
+    config.dkgHome = undefined;
   }
   const bootstrapConfig = configIsPartial
     ? mergeAdapterPluginConfigs(fallbackConfig, config)

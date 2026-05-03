@@ -83,12 +83,21 @@ describe('openclaw-entry', () => {
         '  const keys = Object.keys(value);',
         '  return keys.length > 0 && keys.every((key) => STATE_METADATA_CONFIG_KEYS.includes(key));',
         '}',
+        // T364 round 5 — mirror production isPartialAdapterConfigOverlay
+        // (src/openclaw-config.ts): the fast-path returns true when ALL
+        // keys are module keys (memory/channel), regardless of whether
+        // those modules have `enabled`. Pre-fix this stub used the old
+        // `!enabled`-only rule, so module-only configs with `enabled`
+        // set were misclassified relative to production and the entry
+        // tests could exercise a different merge path than runtime.
         'export function isPartialAdapterConfigOverlay(value) {',
         '  if (!looksLikeAdapterPluginConfig(value)) return false;',
         '  const partialOverlayKeys = new Set([\'daemonUrl\', \'dkgHome\', \'stateDir\', \'stateDirSource\', \'installedWorkspace\']);',
         '  const partialModuleKeys = new Set([\'memory\', \'channel\']);',
         '  const keys = Object.keys(value);',
-        '  return keys.length > 0 && keys.every((key) => partialOverlayKeys.has(key) || (partialModuleKeys.has(key) && isObjectRecord(value[key]) && !Object.prototype.hasOwnProperty.call(value[key], \'enabled\')));',
+        '  if (keys.length === 0) return false;',
+        '  if (keys.every((key) => partialModuleKeys.has(key))) return true;',
+        '  return keys.every((key) => partialOverlayKeys.has(key) || (partialModuleKeys.has(key) && isObjectRecord(value[key]) && !Object.prototype.hasOwnProperty.call(value[key], \'enabled\')));',
         '}',
         'export function mergeAdapterPluginConfigs(...configs) {',
         '  const merged = {};',
@@ -1466,6 +1475,45 @@ describe('openclaw-entry', () => {
       if (prevDaemonUrl === undefined) delete process.env.DKG_DAEMON_URL;
       else process.env.DKG_DAEMON_URL = prevDaemonUrl;
     }
+  });
+
+  it('T364 round 5 — drops stale lower-priority dkgHome when higher-priority overlay changes only daemonUrl', async () => {
+    // Regression: pre-fix `dkgHomeFromCurrentConfig` was true if ANY
+    // current source supplied `dkgHome`, so a stale lower-priority
+    // entry-config dkgHome (e.g. from yesterday's daemon) survived
+    // through the merge while a higher-priority direct overlay
+    // changed only `daemonUrl`. The result: client points at the new
+    // daemon URL while reading auth from the old home. Fix pairs
+    // `dkgHome` with the source that supplied the winning daemonUrl —
+    // here the direct overlay wins and does not supply dkgHome, so
+    // the stale lower-priority value is cleared.
+    const entry = await loadEntryWithFakeRuntime();
+    const api = makeDirectPluginConfigApi({
+      daemonUrl: 'http://127.0.0.1:9999',
+    }, {
+      config: {
+        plugins: {
+          entries: {
+            'adapter-openclaw': {
+              config: {
+                daemonUrl: 'http://127.0.0.1:9200',
+                dkgHome: '/stale-entry-dkg-home',
+                memory: { enabled: true },
+                channel: { enabled: false },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    entry(api);
+
+    const instance = globalThis.__openclawEntryTestInstances![0];
+    expect(instance.config.daemonUrl).toBe('http://127.0.0.1:9999');
+    expect(instance.config.dkgHome).toBeUndefined();
+    expect(instance.config.memory).toEqual({ enabled: true });
+    expect(instance.config.channel).toEqual({ enabled: false });
   });
 
   it('resolves workspace from runtime.config even when it only carries workspace metadata', async () => {

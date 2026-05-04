@@ -509,6 +509,27 @@ export class DkgClient {
   }
 
   /**
+   * Create a named sub-graph inside a context graph. Strict create — the
+   * daemon returns a 409 if the sub-graph already exists, which this
+   * method propagates as a `DkgHttpError`. The `dkg_sub_graph_create`
+   * tool is the public consumer; SKILL.md is silent on idempotency,
+   * the daemon is strict, the OpenClaw adapter is strict — three
+   * independent signals all point to strict. For the internal
+   * "create-or-ignore" sugaring the wave-1 sugared writes used,
+   * `ensureSubGraph` exists separately above; do NOT use it as the
+   * tool surface.
+   */
+  async createSubGraph(args: {
+    contextGraphId: string;
+    subGraphName: string;
+  }): Promise<{ created: string; contextGraphId: string }> {
+    return this.request('POST', '/api/sub-graph/create', {
+      contextGraphId: args.contextGraphId,
+      subGraphName: args.subGraphName,
+    });
+  }
+
+  /**
    * Final canonical-flow step: publish the current contents of a context
    * graph's Shared Working Memory to Verified Memory (on-chain) and
    * (by default) clear SWM. The daemon route accepts `selection` as

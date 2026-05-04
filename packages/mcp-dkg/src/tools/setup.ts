@@ -152,13 +152,17 @@ export function registerSetupTools(
   );
 
   // ── dkg_sub_graph_create ────────────────────────────────────────
-  // Idempotent semantics per audit v1.1 schema-source-of-truth lock:
-  // routes through `client.ensureSubGraph` which swallows the
-  // daemon's "already exists" error so a duplicate-name call is a
-  // no-op rather than a 409. Matches the wave-1 `createAssertion`
-  // pattern (idempotent on duplicate name) and the audit's
-  // recommendation that agents shouldn't hit a confusing failure on
-  // re-run.
+  // Strict create per parity-analyst's audit v1.1 self-correction
+  // (2026-05-04). Three independent signals all point to strict:
+  //   - SKILL.md is silent on idempotency
+  //   - the daemon route 409s on duplicate sub-graph name
+  //   - the OpenClaw adapter exposes the strict path
+  // mcp-dkg's `client.ensureSubGraph` is a CLIENT-side wrapper that
+  // catches the 409 for internal use only (the now-dropped sugared
+  // writes were its sole consumer). It does NOT belong on the public
+  // tool surface — agents should reach for either "create-strict"
+  // (let me know if it's there) or "list-then-decide", not silent-
+  // success-or-409. Strict is the honest contract.
   server.registerTool(
     'dkg_sub_graph_create',
     {
@@ -166,8 +170,8 @@ export function registerSetupTools(
       description:
         'Create a named sub-graph inside a context graph (an optional ' +
         'partition for scoped assertions, e.g. "code", "tasks", "meta"). ' +
-        'Idempotent — a pre-existing sub-graph with the same name is ' +
-        'silently reused, no error. Names must be lowercase letters, ' +
+        'Strict create — the daemon returns an error if a sub-graph with ' +
+        'this name already exists. Names must be lowercase letters, ' +
         'digits, and hyphens, and must not start with `_`.',
       inputSchema: {
         contextGraphId: z.string().min(1).describe('Parent context graph id'),
@@ -183,8 +187,11 @@ export function registerSetupTools(
       if (!cgId) return errResult('"contextGraphId" is required.');
       if (!sgName) return errResult('"subGraphName" is required.');
       try {
-        await client.ensureSubGraph(cgId, sgName);
-        return ok(`Sub-graph '${sgName}' ready in '${cgId}'.`);
+        const result = await client.createSubGraph({
+          contextGraphId: cgId,
+          subGraphName: sgName,
+        });
+        return ok(`Created sub-graph '${result.created}' in '${result.contextGraphId}'.`);
       } catch (e) {
         return errResult(`Failed to create sub-graph: ${formatError(e)}`);
       }

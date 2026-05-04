@@ -261,6 +261,73 @@ describe('publish tools — write+publish helper + canonical SWM finalizer', () 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/Failed to register context graph: rpc unreachable/);
   });
+
+  // F3+F13 (qa-review-round-1 F3 + qa-review-round-2 F13): chain
+  // provenance echoed on publish responses so callers can verify
+  // post-hoc which chain the publish landed on. User explicit:
+  // option (a) WITHOUT loud-warning prose. accessPolicy is also
+  // echoed when registerIfNeeded ran so the caller can verify what
+  // the daemon committed without a separate read-back.
+  it('F3+F13: dkg_publish success summary echoes the configured chainId', async () => {
+    // FakeClient.walletBalances ships chainId='base-sepolia' by default.
+    const result = await server.call('dkg_publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s:1', predicate: 'urn:p:type', object: 'urn:Note' }],
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toMatch(/Chain: base-sepolia/);
+  });
+
+  it('F3+F13: dkg_shared_memory_publish success summary echoes the configured chainId', async () => {
+    const result = await server.call('dkg_shared_memory_publish', { contextGraphId: 'cg' });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toMatch(/Chain: base-sepolia/);
+  });
+
+  it('F3+F13: chainId is omitted gracefully when the wallet-balances probe fails', async () => {
+    // The probe failure must NOT fail the publish — the publish
+    // succeeded, the chain echo is best-effort.
+    const localClient = new FakeClient({
+      getWalletBalances: async () => {
+        throw new Error('rpc unreachable');
+      },
+    });
+    const localServer = new FakeServer();
+    registerPublishTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
+
+    const result = await localServer.call('dkg_publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s:1', predicate: 'urn:p:type', object: 'urn:Note' }],
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).not.toMatch(/Chain:/);
+  });
+
+  it('F3+F13: dkg_shared_memory_publish echoes accessPolicy when registerIfNeeded ran', async () => {
+    const result = await server.call('dkg_shared_memory_publish', {
+      contextGraphId: 'cg',
+      registerIfNeeded: true,
+      accessPolicy: 1,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toMatch(/Registered on-chain:.*accessPolicy=1/);
+  });
+
+  it('F3+F13: response carries no warning prose (user explicit)', async () => {
+    // The user explicitly opted for echo-only — no "WARNING: this
+    // spends gas" / "Verify chainId before publishing" / similar
+    // copy. Future-proofs against well-meaning re-additions.
+    const r1 = await server.call('dkg_publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s:1', predicate: 'urn:p:type', object: 'urn:Note' }],
+    });
+    const r2 = await server.call('dkg_shared_memory_publish', { contextGraphId: 'cg' });
+    for (const r of [r1, r2]) {
+      expect(r.content[0].text).not.toMatch(/warning/i);
+      expect(r.content[0].text).not.toMatch(/spends gas/i);
+      expect(r.content[0].text).not.toMatch(/verify.*chain/i);
+    }
+  });
 });
 
 describe('health tools — status + wallet balances', () => {

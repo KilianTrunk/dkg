@@ -40,6 +40,30 @@ const formatError = (e: unknown): string =>
   e instanceof Error ? e.message : String(e);
 
 /**
+ * F3+F13: resolve the daemon's configured chainId for the success
+ * summary. The daemon's `/api/shared-memory/publish` response does
+ * not include `chainId` in the JSON body (it's threaded through the
+ * tracker only — see `packages/cli/src/daemon/routes/memory.ts:483-488`),
+ * so we read it from `/api/wallets/balances` which already exposes it
+ * as a first-class field. Returns `null` when the wallet-balances
+ * probe fails — non-fatal, the publish itself already succeeded.
+ *
+ * Why expose chainId at all: lets the caller verify which chain the
+ * publish landed on without a separate roundtrip. F3 was originally
+ * "warn loudly before publish to mainnet"; the user explicitly opted
+ * for echo-only (no warning prose) so callers self-verify post-hoc
+ * instead.
+ */
+async function resolveChainId(client: DkgClient): Promise<string | null> {
+  try {
+    const balances = await client.getWalletBalances();
+    return balances.chainId ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * URI auto-detection for object terms — matches the adapter's `isUri`
  * at `DkgNodePlugin.ts:3468-3470`. Anything starting with http://,
  * https://, urn:, or did: is treated as a URI; anything else gets
@@ -136,11 +160,18 @@ export function registerPublishTools(
           | Array<{ tokenId: string; rootEntity: string }>
           | undefined;
         const txHash = (result as Record<string, unknown>).txHash as string | undefined;
+        // F3+F13: echo the configured chainId so callers can verify
+        // which chain the publish landed on without a separate
+        // wallet-balances roundtrip. Fetched after the publish
+        // succeeds; if the wallet-balances probe itself fails the
+        // publish stands and we just omit the chain line.
+        const chainId = await resolveChainId(client);
         const summary = [
           `Published ${wireQuads.length} quad(s) to '${cgId}'.`,
           kcId ? `KC: ${kcId}` : null,
           kas?.length ? `KAs: ${kas.length}` : null,
           txHash ? `Tx: ${txHash}` : null,
+          chainId ? `Chain: ${chainId}` : null,
         ]
           .filter((line): line is string => line !== null)
           .join('\n');
@@ -254,13 +285,20 @@ export function registerPublishTools(
         const kcId = result.kcId as string | undefined;
         const kas = result.kas as Array<{ tokenId: string; rootEntity: string }> | undefined;
         const txHash = result.txHash as string | undefined;
+        // F3+F13: see `resolveChainId` JSDoc — chainId is echoed for
+        // post-hoc caller verification. accessPolicy is also echoed
+        // when the registration step ran (registerIfNeeded path) so
+        // the caller can verify the daemon committed the value they
+        // requested. Both are read-only echoes; no warning prose.
+        const chainId = await resolveChainId(client);
         const summary = [
           `Published ${cgId}'s SWM to Verified Memory.`,
           roots ? `Roots: ${roots.length}` : 'Selection: all',
           kcId ? `KC: ${kcId}` : null,
           kas?.length ? `KAs: ${kas.length}` : null,
           txHash ? `Tx: ${txHash}` : null,
-          registration ? `Registered on-chain: ${registration.onChainId ?? '(unknown)'}` : null,
+          chainId ? `Chain: ${chainId}` : null,
+          registration ? `Registered on-chain: ${registration.onChainId ?? '(unknown)'}${accessPolicy != null ? ` (accessPolicy=${accessPolicy})` : ''}` : null,
         ]
           .filter((line): line is string => line !== null)
           .join('\n');

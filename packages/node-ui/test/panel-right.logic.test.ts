@@ -7,6 +7,7 @@ let adoptLocalAgentTurnId: any;
 let getLocalAgentConversationStateKey: any;
 let markLocalAgentIntegrationDisconnected: any;
 let networkPeerCardStatusClass: any;
+let normalizeMessageContent: any;
 let resolveConnectedAgentsTabState: any;
 let resolveLocalAgentSelectionState: any;
 let shouldPreserveSelectedLocalAgentTab: any;
@@ -41,6 +42,7 @@ beforeAll(async () => {
   getLocalAgentConversationStateKey = panelRight.getLocalAgentConversationStateKey;
   markLocalAgentIntegrationDisconnected = panelRight.markLocalAgentIntegrationDisconnected;
   networkPeerCardStatusClass = panelRight.networkPeerCardStatusClass;
+  normalizeMessageContent = panelRight.normalizeMessageContent;
   resolveConnectedAgentsTabState = panelRight.resolveConnectedAgentsTabState;
   resolveLocalAgentSelectionState = panelRight.resolveLocalAgentSelectionState;
   shouldPreserveSelectedLocalAgentTab = panelRight.shouldPreserveSelectedLocalAgentTab;
@@ -124,6 +126,14 @@ describe('PanelRight logic helpers', () => {
 
     expect(updated.map((message: any) => message.turnId)).toEqual(['stable-1', 'stable-1', 'stable-0']);
     expect(adoptLocalAgentTurnId(messages, 'corr-1')).toBe(messages);
+  });
+
+  it('normalizes local-agent message content without leading empty bubble space', () => {
+    expect(normalizeMessageContent('\\n\\nDone.')).toBe('Done.');
+    expect(normalizeMessageContent('\n\nMatched entry in agent-context / memory:\n\n- fact')).toBe(
+      'Matched entry in agent-context / memory:\n\n- fact',
+    );
+    expect(normalizeMessageContent('Line one\\n\\nLine two\\n')).toBe('Line one\n\nLine two');
   });
 
   it('resolves conversation state keys and session preservation correctly', () => {

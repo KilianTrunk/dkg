@@ -225,8 +225,11 @@ export function adoptLocalAgentTurnId(
     message.turnId === correlationId ? { ...message, turnId: stableTurnId } : message);
 }
 
-function normalizeMessageContent(content: string): string {
-  return content.replace(/\\n/g, '\n');
+export function normalizeMessageContent(content: string): string {
+  const normalized = content.replace(/\\n/g, '\n').replace(/\r\n/g, '\n');
+  return normalized
+    .replace(/^(?:[ \t]*\n)+/, '')
+    .replace(/(?:\n[ \t]*)+$/, '');
 }
 
 function renderInlineMarkdown(text: string): React.ReactNode[] {

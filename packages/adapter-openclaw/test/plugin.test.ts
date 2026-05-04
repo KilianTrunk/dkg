@@ -4485,6 +4485,69 @@ describe('DkgNodePlugin', () => {
     await plugin.stop();
   });
 
+  it('T29 — runtime.state.resolveStateDir() returning the gateway homedir root is rejected; resolver falls through to workspace-derived branches', async () => {
+    // Regression for an OpenClaw 2026.4.15 misbehavior observed in
+    // production: the gateway's `runtime.state.resolveStateDir()`
+    // returns the gateway's own `~/.openclaw` config root, which is
+    // NOT workspace-scoped. Pre-fix the resolver trusted that value
+    // (highest-priority branch) and wrote per-workspace chat-turn
+    // watermarks into the shared homedir, conflating workspaces. The
+    // T29 filter rejects values canonicalizing to the gateway homedir
+    // and falls through to workspace-derived branches.
+    const prevEnv = process.env.OPENCLAW_STATE_DIR;
+    delete process.env.OPENCLAW_STATE_DIR;
+    const tmpRoot = require('os').tmpdir();
+    const workspaceDir = path.join(tmpRoot, `dkg-t29-workspace-${Date.now()}`);
+    const homeDir = path.join(require('os').homedir(), '.openclaw');
+    try {
+      const plugin = new DkgNodePlugin({
+        daemonUrl: 'http://localhost:9200',
+        channel: { enabled: false },
+        memory: { enabled: false },
+        // Setup-default path pointing at the legacy `<workspace>/.openclaw`
+        // location — exercises the redirect-to-`.dkg-adapter` branch
+        // so we can verify the workspace-derived path wins after
+        // T29 ignores the gateway's homedir runtime stateDir.
+        stateDir: path.join(workspaceDir, '.openclaw'),
+        stateDirSource: 'setup-default',
+        installedWorkspace: workspaceDir,
+      } as any);
+      const api: OpenClawPluginApi = {
+        config: {},
+        registrationMode: 'full',
+        workspaceDir,
+        runtime: {
+          state: {
+            // Gateway homedir — must NOT be honored as the chat-turn
+            // state dir even though it's the highest-priority branch.
+            resolveStateDir: () => homeDir,
+          },
+        },
+        registerTool: () => {},
+        registerHook: () => {},
+        on: () => {},
+        logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+      } as unknown as OpenClawPluginApi;
+      plugin.register(api);
+      // Resolver must NOT pick the homedir; it should fall through to
+      // the workspace branch (api.workspaceDir + .dkg-adapter).
+      const resolved = (plugin as any).chatTurnWriterStateDir as string;
+      expect(resolved.replace(/\\/g, '/')).toBe(
+        path.join(workspaceDir, '.dkg-adapter').replace(/\\/g, '/'),
+      );
+      expect((plugin as any).chatTurnWriterStateDirSource).toBe('workspace');
+      // No homedir-fallback warning emitted (the resolver picked a
+      // proper workspace-scoped branch).
+      const homedirWarnCall = (api.logger.warn as any).mock.calls.find((args: any[]) =>
+        typeof args[0] === 'string' && args[0].includes('Could not resolve a workspace-scoped state dir'),
+      );
+      expect(homedirWarnCall).toBeUndefined();
+    } finally {
+      if (prevEnv === undefined) delete process.env.OPENCLAW_STATE_DIR;
+      else process.env.OPENCLAW_STATE_DIR = prevEnv;
+    }
+  });
+
   it('T24 — chatTurnWriterStateDir is updated ONLY on successful migration; failure leaves state at fallback so future register() retries', async () => {
     // Regression for T24: pre-fix, `chatTurnWriterStateDir = stateDir`
     // was set BEFORE the async migration completed. If `setStateDir`

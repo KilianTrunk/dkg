@@ -718,7 +718,29 @@ export class DkgNodePlugin {
         (!setupWorkspaceDir && !!configuredDefaultWorkspaceDir)
       );
     const workspaceStateDir = trimmedWorkspaceDir ? defaultStateDirForWorkspace(trimmedWorkspaceDir) : undefined;
-    const runtimeStateDir = trimmedNonEmpty((api as any)?.runtime?.state?.resolveStateDir?.());
+    const runtimeStateDirRaw = trimmedNonEmpty((api as any)?.runtime?.state?.resolveStateDir?.());
+    // T29 — Some OpenClaw gateway versions (observed on 2026.4.15)
+    // expose the gateway's own `~/.openclaw` config root via
+    // `runtime.state.resolveStateDir()`. That value is NOT workspace-
+    // scoped despite the API contract — trusting it would write
+    // per-workspace adapter state into the shared gateway home and
+    // conflate every workspace's chat-turn watermarks. Reject the
+    // value when it canonicalizes to the gateway homedir root and
+    // fall through to the workspace-derived branches that ARE
+    // workspace-scoped. Operators can still pin a custom state dir
+    // explicitly via `OPENCLAW_STATE_DIR` (envStateDir) or
+    // `config.stateDir` — those branches are not filtered.
+    const runtimeStateDir = (runtimeStateDirRaw &&
+      canonicalPathForCompare(runtimeStateDirRaw) !== canonicalPathForCompare(homeDir))
+      ? runtimeStateDirRaw
+      : undefined;
+    if (runtimeStateDirRaw && !runtimeStateDir) {
+      api.logger.debug?.(
+        `[dkg] Ignoring runtime.state.resolveStateDir()='${runtimeStateDirRaw}' — ` +
+        `it is the gateway homedir root, not a workspace-scoped state dir. ` +
+        `Falling through to workspace / setup-default resolution.`,
+      );
+    }
     const runtimeWorkspaceDir = runtimeStateDir ? workspaceDirForDefaultStateDir(runtimeStateDir) : undefined;
     const envStateDir = trimmedNonEmpty(process.env.OPENCLAW_STATE_DIR);
     const envWorkspaceDir = envStateDir ? workspaceDirForDefaultStateDir(envStateDir) : undefined;

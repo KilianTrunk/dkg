@@ -27,15 +27,21 @@ export async function subtractFinalizedExactQuads(params: {
     };
   }
 
-  const confirmedRoots = await loadConfirmedRoots(params.store, params.graphManager, params.request.contextGraphId, params.validation.canonicalRoots);
+  const confirmedRoots = await loadConfirmedRoots(
+    params.store,
+    params.graphManager,
+    params.request.contextGraphId,
+    params.validation.canonicalRoots,
+    params.request.subGraphName,
+  );
   const authoritativePublic = await loadAuthoritativeQuadKeys(
     params.store,
-    params.graphManager.dataGraphUri(params.request.contextGraphId),
+    publicGraphUri(params.graphManager, params.request.contextGraphId, params.request.subGraphName),
     confirmedRoots,
   );
   const authoritativePrivate = await loadAuthoritativeQuadKeys(
     params.store,
-    params.graphManager.privateGraphUri(params.request.contextGraphId),
+    privateGraphUri(params.graphManager, params.request.contextGraphId, params.request.subGraphName),
     confirmedRoots,
   );
 
@@ -58,16 +64,21 @@ async function loadConfirmedRoots(
   graphManager: GraphManager,
   contextGraphId: string,
   roots: readonly string[],
+  subGraphName?: string,
 ): Promise<Set<string>> {
   if (roots.length === 0) return new Set();
   const metaGraph = graphManager.metaGraphUri(contextGraphId);
   const values = roots.map((root) => safeStringLiteral(root)).join(' ');
+  const subGraphConstraint = subGraphName
+    ? `?kc <${DKG}subGraphName> ${safeStringLiteral(subGraphName)} .`
+    : `FILTER NOT EXISTS { ?kc <${DKG}subGraphName> ?subGraphName }`;
   const result = await store.query(
     `SELECT DISTINCT ?root WHERE {
       GRAPH <${metaGraph}> {
         VALUES ?rootValue { ${values} }
         ?ka <${DKG}rootEntity> ?root ; <${DKG}partOf> ?kc .
         ?kc <${DKG}status> "confirmed" .
+        ${subGraphConstraint}
         FILTER(STR(?root) = ?rootValue)
       }
     }`,
@@ -78,6 +89,18 @@ async function loadConfirmedRoots(
   }
 
   return new Set(result.bindings.map((row) => stripTerm(row['root'])).filter(isPresent));
+}
+
+function publicGraphUri(graphManager: GraphManager, contextGraphId: string, subGraphName?: string): string {
+  return subGraphName
+    ? graphManager.subGraphUri(contextGraphId, subGraphName)
+    : graphManager.dataGraphUri(contextGraphId);
+}
+
+function privateGraphUri(graphManager: GraphManager, contextGraphId: string, subGraphName?: string): string {
+  return subGraphName
+    ? graphManager.subGraphPrivateUri(contextGraphId, subGraphName)
+    : graphManager.privateGraphUri(contextGraphId);
 }
 
 function subtractGraphExactMatches(

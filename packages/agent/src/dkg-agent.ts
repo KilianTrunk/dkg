@@ -2932,6 +2932,7 @@ export class DKGAgent {
       scope: opts?.scope ?? 'context-graph',
       transitionType: opts?.transitionType ?? 'CREATE',
       authority: opts?.authority ?? { type: 'owner', proofRef: `urn:dkg:publish-async:${shareOperationId}` },
+      subGraphName: opts?.subGraphName,
       accessPolicy: opts?.accessPolicy,
       allowedPeers: opts?.allowedPeers,
     });

@@ -30,6 +30,7 @@ import {
   CONTROL_ROOT,
   CONTROL_SCOPE,
   CONTROL_SHARE_OPERATION_ID,
+  CONTROL_SUB_GRAPH_NAME,
   CONTROL_STATUS,
   CONTROL_SWM_ID,
   DEFAULT_CONTROL_GRAPH_URI,
@@ -156,7 +157,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
 
   it('stores explicit LiftJob and LiftRequest control-plane triples', async () => {
     const publisher = createPublisher();
-    const jobId = await publisher.lift(request());
+    const jobId = await publisher.lift({ ...request(), subGraphName: 'research' });
 
     const result = await store.query(`SELECT ?p ?o WHERE {
       GRAPH <${DEFAULT_CONTROL_GRAPH_URI}> {
@@ -193,6 +194,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(requestTriples).toContainEqual([CONTROL_SWM_ID, '"swm-1"']);
     expect(requestTriples).toContainEqual([CONTROL_SHARE_OPERATION_ID, '"op-1"']);
     expect(requestTriples).toContainEqual([CONTROL_SCOPE, '"person-profile"']);
+    expect(requestTriples).toContainEqual([CONTROL_SUB_GRAPH_NAME, '"research"']);
     expect(requestTriples).toContainEqual([CONTROL_AUTHORITY_PROOF_REF, '"proof:owner:1"']);
     expect(requestTriples).toContainEqual([CONTROL_ROOT, '"urn:local:/rihana"']);
   });

@@ -28,6 +28,7 @@ export interface LiftRequest {
   readonly transitionType: LiftTransitionType;
   readonly authority: LiftAuthorityProof;
   readonly priorVersion?: string;
+  readonly subGraphName?: string;
   readonly accessPolicy?: LiftAccessPolicy;
   readonly allowedPeers?: readonly string[];
 }
@@ -42,6 +43,7 @@ export const LIFT_REQUEST_IMMUTABLE_FIELDS = [
   'transitionType',
   'authority',
   'priorVersion',
+  'subGraphName',
   'accessPolicy',
   'allowedPeers',
 ] as const;

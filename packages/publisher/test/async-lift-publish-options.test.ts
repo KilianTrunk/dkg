@@ -52,6 +52,22 @@ describe('mapLiftRequestToPublishOptions', () => {
     expect(options.targetMetaGraphUri).toBe('did:dkg:paranet:music-social/_meta');
   });
 
+  it('forwards the request subGraphName into canonical publish options', () => {
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      request: {
+        ...baseInput().request,
+        subGraphName: 'research',
+      },
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: '12D3KooWPublisher',
+      },
+    });
+
+    expect(options.subGraphName).toBe('research');
+  });
+
   it('defaults to ownerOnly when private quads are present', () => {
     const options = mapLiftRequestToPublishOptions({
       ...baseInput(),

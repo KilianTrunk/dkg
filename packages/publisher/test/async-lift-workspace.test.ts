@@ -3,7 +3,7 @@ import { GraphManager, OxigraphStore, PrivateContentStore } from '@origintrail-o
 import { EVMChainAdapter } from '@origintrail-official/dkg-chain';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
 import { ethers } from 'ethers';
-import { DKGPublisher } from '../src/index.js';
+import { DKGPublisher, generateSubGraphRegistration } from '../src/index.js';
 import { resolveLiftWorkspaceSlice, resolveWorkspaceSelection } from '../src/workspace-resolution.js';
 import { createEVMAdapter, getSharedContext, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 
@@ -93,6 +93,61 @@ describe('async lift workspace resolution', () => {
     expect(resolved.quads).toHaveLength(2);
     expect(resolved.quads.map((quad) => quad.subject).sort()).toEqual([ENTITY, skolem].sort());
     expect(resolved.publisherPeerId).toBe('peer1');
+  });
+
+  it('resolves async lift payloads from the requested sub-graph partition', async () => {
+    const subGraphName = 'research';
+    const privateStore = new PrivateContentStore(store, graphManager);
+    await graphManager.ensureSubGraph(PARANET, subGraphName);
+    await store.insert(generateSubGraphRegistration({
+      contextGraphId: PARANET,
+      subGraphName,
+      createdBy: 'peer1',
+      timestamp: new Date('2026-01-01T00:00:00.000Z'),
+    }));
+
+    await publisher.share(PARANET, [
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Default"', graph: '' },
+    ], { publisherPeerId: 'peer1' });
+    const write = await publisher.share(PARANET, [
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Research"', graph: '' },
+    ], { publisherPeerId: 'peer1', subGraphName });
+    await privateStore.storePrivateTriplesForOperation(PARANET, write.shareOperationId, ENTITY, [
+      { subject: ENTITY, predicate: 'http://schema.org/secret', object: '"subgraph-secret"', graph: '' },
+    ], subGraphName);
+
+    const resolved = await resolveLiftWorkspaceSlice({
+      store,
+      graphManager,
+      request: {
+        swmId: 'swm-main',
+        shareOperationId: write.shareOperationId,
+        roots: [ENTITY],
+        contextGraphId: PARANET,
+        namespace: 'aloha',
+        scope: 'person-profile',
+        transitionType: 'CREATE',
+        authority: { type: 'owner', proofRef: 'proof:owner:1' },
+        subGraphName,
+      },
+    });
+
+    expect(resolved.quads).toEqual([
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Research"', graph: '' },
+    ]);
+    expect(resolved.privateQuads).toEqual([
+      { subject: ENTITY, predicate: 'http://schema.org/secret', object: '"subgraph-secret"', graph: '' },
+    ]);
+
+    const defaultQuads = await resolveWorkspaceSelection({
+      store,
+      graphManager,
+      contextGraphId: PARANET,
+      selection: { rootEntities: [ENTITY] },
+    });
+    expect(defaultQuads).toEqual([
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Default"', graph: '' },
+    ]);
   });
 
   it('resolves public and private async lift payloads by shareOperationId instead of combining root history', async () => {

@@ -1,6 +1,6 @@
 import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
-import { assertSafeIri, isSafeIri } from '@origintrail-official/dkg-core';
+import { assertSafeIri, isSafeIri, validateSubGraphName } from '@origintrail-official/dkg-core';
 import type { LiftRequest } from './lift-job.js';
 import type { LiftResolvedPublishSlice } from './async-lift-publish-options.js';
 
@@ -98,8 +98,10 @@ export async function resolveWorkspaceOperation(params: {
   graphManager: GraphManager;
   contextGraphId: string;
   shareOperationId: string;
+  subGraphName?: string;
 }): Promise<ResolvedWorkspaceOperation> {
-  const workspaceMetaGraph = params.graphManager.workspaceMetaGraphUri(params.contextGraphId);
+  const subGraphName = normalizeOptionalSubGraphName(params.subGraphName);
+  const workspaceMetaGraph = params.graphManager.sharedMemoryMetaUri(params.contextGraphId, subGraphName);
   const subject = workspaceOperationSubject(params.contextGraphId, params.shareOperationId);
   const result = await params.store.query(
     `SELECT ?root ?publisherPeerId WHERE {
@@ -139,6 +141,7 @@ export async function resolveLiftWorkspaceSlice(params: {
 }): Promise<LiftResolvedPublishSlice> {
   const request = params.request;
   const shareOperationId = request.shareOperationId;
+  const subGraphName = normalizeOptionalSubGraphName(request.subGraphName);
   const requestedRoots = normalizeRoots(request.roots);
   if (requestedRoots.length === 0) {
     throw new Error(`No valid Lift shared-memory roots provided for context graph ${request.contextGraphId}`);
@@ -151,6 +154,7 @@ export async function resolveLiftWorkspaceSlice(params: {
       graphManager: params.graphManager,
       contextGraphId: request.contextGraphId,
       shareOperationId,
+      subGraphName,
     });
   } catch (err) {
     if (!isMissingWorkspaceOperationError(err)) {
@@ -173,12 +177,13 @@ export async function resolveLiftWorkspaceSlice(params: {
     contextGraphId: request.contextGraphId,
     shareOperationId,
     roots: requestedRoots,
+    subGraphName,
   });
   const privateStore = new PrivateContentStore(params.store, params.graphManager);
   const privateQuads = (
     await Promise.all(
       requestedRoots.map((root) =>
-        privateStore.getPrivateTriplesForOperation(request.contextGraphId, shareOperationId, root),
+        privateStore.getPrivateTriplesForOperation(request.contextGraphId, shareOperationId, root, subGraphName),
       ),
     )
   ).flat();
@@ -311,6 +316,17 @@ function selectQuadsForRoots(quads: readonly Quad[], roots: readonly string[]): 
 
 function normalizeRoots(roots: readonly string[]): string[] {
   return [...new Set(roots.map((root) => String(root).trim()).filter((root) => isSafeIri(root)))];
+}
+
+function normalizeOptionalSubGraphName(subGraphName: string | undefined): string | undefined {
+  const normalized = subGraphName?.trim();
+  if (!normalized) return undefined;
+
+  const validation = validateSubGraphName(normalized);
+  if (!validation.valid) {
+    throw new Error(`Lift shared-memory resolution rejected invalid subGraphName "${subGraphName}": ${validation.reason}`);
+  }
+  return normalized;
 }
 
 function workspaceOperationSubject(contextGraphId: string, shareOperationId: string): string {

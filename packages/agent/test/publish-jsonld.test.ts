@@ -240,4 +240,49 @@ describe('publishJsonLd', () => {
     expect(privatePayload.type).toBe('boolean');
     if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(true);
   }, 15000);
+
+  it('async publish records and resolves subGraphName for staged public and private data', async () => {
+    const { agent, store } = await createAgent('AsyncSubGraphBot');
+    await agent.createContextGraph({ id: 'async-subgraph', name: 'AsyncSubGraph', description: '' });
+    await agent.createSubGraph('async-subgraph', 'research');
+    const root = 'http://example.org/AsyncSubGraphSecret';
+
+    const { captureID } = await agent.publishAsync(
+      'async-subgraph',
+      {
+        private: {
+          '@context': 'http://schema.org/',
+          '@id': root,
+          '@type': 'Thing',
+          'name': 'Private Subgraph Async',
+        },
+      },
+      { localOnly: true, accessPolicy: 'ownerOnly', subGraphName: 'research' },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.subGraphName).toBe('research');
+
+    const prepared = await asyncPublisher.inspectPreparedPayload(captureID);
+    expect(prepared?.publishOptions.subGraphName).toBe('research');
+
+    const publicAnchor = await store.query(
+      `ASK { GRAPH <did:dkg:context-graph:async-subgraph/research/_shared_memory> { <${root}> <http://dkg.io/ontology/privateDataAnchor> "true" } }`,
+    );
+    expect(publicAnchor.type).toBe('boolean');
+    if (publicAnchor.type === 'boolean') expect(publicAnchor.value).toBe(true);
+
+    const defaultAnchor = await store.query(
+      `ASK { GRAPH <did:dkg:context-graph:async-subgraph/_shared_memory> { <${root}> <http://dkg.io/ontology/privateDataAnchor> "true" } }`,
+    );
+    expect(defaultAnchor.type).toBe('boolean');
+    if (defaultAnchor.type === 'boolean') expect(defaultAnchor.value).toBe(false);
+
+    const privatePayload = await store.query(
+      `ASK { GRAPH <did:dkg:context-graph:async-subgraph/research/_private> { <${root}> <http://schema.org/name> "Private Subgraph Async" } }`,
+    );
+    expect(privatePayload.type).toBe('boolean');
+    if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(true);
+  }, 15000);
 });

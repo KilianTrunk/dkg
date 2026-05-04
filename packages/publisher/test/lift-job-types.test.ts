@@ -33,6 +33,7 @@ describe('LiftJob request and record types', () => {
       'transitionType',
       'authority',
       'priorVersion',
+      'subGraphName',
       'accessPolicy',
       'allowedPeers',
     ]);

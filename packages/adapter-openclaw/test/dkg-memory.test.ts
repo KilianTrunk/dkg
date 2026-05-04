@@ -399,6 +399,42 @@ describe('DkgMemoryPlugin.register', () => {
     expect(api.registerMemoryCapability).toHaveBeenCalledTimes(1);
   });
 
+  it('T364 round 11 — mixed { workspaceDir, stateDir, stateDirSource, installedWorkspace } payload still falls through to runtime memory.enabled on first registration', async () => {
+    // Pre-fix `directPluginConfigMemoryEnabledForApi` ran the candidate
+    // through `isStateMetadataOnlyAdapterConfig` directly. That helper
+    // gates on the strict `looksLikeAdapterPluginConfig`, which rejects
+    // any object carrying `workspaceDir`. So a mixed gateway payload
+    // like `{ workspaceDir, stateDir, stateDirSource, installedWorkspace }`
+    // returned false — `blocksRuntimeFallback` flipped to true — and
+    // we never read `runtime.pluginConfig.memory.enabled` on first
+    // registration. DKG memory setup was skipped even when the
+    // runtime explicitly enabled it. Post-fix the candidates are
+    // normalized through `extractAdapterPluginConfigOverlay` first,
+    // so the underlying state-metadata shape becomes visible to the
+    // classifier and the runtime fallback fires correctly.
+    const api = {
+      config: {
+        workspaceDir: '/legacy-workspace',
+        stateDir: '/workspace/.dkg-adapter',
+        stateDirSource: 'setup-default',
+        installedWorkspace: '/workspace',
+      },
+      runtime: {
+        pluginConfig: {
+          memory: { enabled: true },
+        },
+      },
+      registerTool: vi.fn(),
+      registerHook: vi.fn(),
+      on: vi.fn(),
+      logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+      registerMemoryCapability: vi.fn(),
+    } as unknown as MockApi;
+
+    expect(plugin.register(api)).toBe(true);
+    expect(api.registerMemoryCapability).toHaveBeenCalledTimes(1);
+  });
+
   it('warns about direct memory disable without setup guidance', () => {
     const api = makeApi();
     api.config = {

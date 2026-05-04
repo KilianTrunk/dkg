@@ -921,9 +921,24 @@ function directPluginConfigMemoryEnabledForApi(
   // registrations (where runtime is the only memory signal) still see the
   // runtime fallback fire. Codex's reported case (first registration with
   // state-metadata + runtime.pluginConfig.memory.enabled: true) succeeds.
+  // T364 round 11 — normalize candidates through
+  // `extractAdapterPluginConfigOverlay` before the state-metadata
+  // classification. Pre-fix a mixed gateway payload like
+  // `{ workspaceDir, stateDir, stateDirSource, installedWorkspace }`
+  // was rejected by `isStateMetadataOnlyAdapterConfig` (its
+  // `looksLikeAdapterPluginConfig` gate excludes anything carrying
+  // `workspaceDir`), so `blocksRuntimeFallback` became true and we
+  // never read `runtime.pluginConfig.memory.enabled` on first
+  // registration — DKG memory setup was skipped even when the
+  // runtime explicitly enabled it. Extracting the adapter overlay
+  // first drops the `workspaceDir` route portion and lets the
+  // state-metadata classifier see the underlying shape.
+  const currentAdapterOverlays = currentCandidates
+    .map(extractAdapterPluginConfigOverlay)
+    .filter(isObjectRecord);
   if (
     options.preserveDirectOverlayWithoutMemoryDecision &&
-    currentCandidates.some(isStateMetadataOnlyAdapterConfig)
+    currentAdapterOverlays.some(isStateMetadataOnlyAdapterConfig)
   ) {
     return undefined;
   }
@@ -931,9 +946,9 @@ function directPluginConfigMemoryEnabledForApi(
   // overlay (channel/daemonUrl with no memory key). State-metadata-only
   // configs are orthogonal to memory and don't fall here unless the
   // re-registration preserve flag above also matched.
-  const blocksRuntimeFallback = currentCandidates.some((candidate) =>
-    isDirectConfigWithoutMemoryDecision(candidate) &&
-    !isStateMetadataOnlyAdapterConfig(candidate),
+  const blocksRuntimeFallback = currentAdapterOverlays.some((overlay) =>
+    isDirectConfigWithoutMemoryDecision(overlay) &&
+    !isStateMetadataOnlyAdapterConfig(overlay),
   );
   if (blocksRuntimeFallback) {
     return undefined;

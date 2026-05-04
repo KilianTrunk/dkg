@@ -231,6 +231,24 @@ function resolveEntryConfig(api, options = {}) {
     delete config.dkgHome;
     config.dkgHome = undefined;
   }
+  // T364 round 11 — carry forward setup metadata from fallback when
+  // current doesn't supply it. Pre-fix a "full" current adapter config
+  // like `{ daemonUrl, memory, channel }` was classified as
+  // `configIsPartial = false`, so `bootstrapConfig = config` ended up
+  // with no `stateDir` / `stateDirSource` / `installedWorkspace` even
+  // when the fallback runtime entry had them — and
+  // `DkgNodePlugin.ensureChatTurnWriter()` fell back to `~/.openclaw`
+  // and persisted watermarks in the wrong place. Setup metadata is
+  // orthogonal to the daemon/memory/channel adapter decisions; carry
+  // it forward independent of the partial/full classification so it's
+  // present on both `config` (passed to subsequent `updateConfig`) and
+  // `bootstrapConfig` (passed to `new DkgNodePlugin`).
+  for (const key of ['stateDir', 'stateDirSource', 'installedWorkspace']) {
+    if (Object.prototype.hasOwnProperty.call(fallbackConfig, key) &&
+        !Object.prototype.hasOwnProperty.call(config, key)) {
+      config[key] = fallbackConfig[key];
+    }
+  }
   const bootstrapConfig = configIsPartial
     ? mergeAdapterPluginConfigs(fallbackConfig, config)
     : config;

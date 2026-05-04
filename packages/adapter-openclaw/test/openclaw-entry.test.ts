@@ -1881,6 +1881,56 @@ describe('openclaw-entry', () => {
     expect(instance.workspaceDirsAtRegister[0]).toBe('/real-fallback');
   });
 
+  it('T364 round 11 — full current adapter config carries fallback setup metadata into bootstrapConfig', async () => {
+    // Pre-fix a "full" current adapter config like `{ daemonUrl,
+    // memory, channel }` was classified as `configIsPartial = false`,
+    // so `bootstrapConfig = config` ended up with no `stateDir` /
+    // `stateDirSource` / `installedWorkspace` even when fallback
+    // runtime config supplied them. `DkgNodePlugin.ensureChatTurnWriter()`
+    // then fell back to `~/.openclaw` and persisted watermarks in the
+    // wrong place. Post-fix the setup metadata is carried forward
+    // from fallback into `config` (and `bootstrapConfig`) regardless
+    // of the partial/full classification — setup metadata is
+    // orthogonal to the daemon/memory/channel adapter decisions.
+    const entry = await loadEntryWithFakeRuntime();
+    const api = makeDirectPluginConfigApi({
+      // Full current adapter config — has memory/channel with `enabled`,
+      // so isPartialAdapterConfigOverlay returns false (full snapshot).
+      daemonUrl: 'http://127.0.0.1:9200',
+      memory: { enabled: true },
+      channel: { enabled: true, port: 0 },
+    }, {
+      runtime: {
+        config: {
+          plugins: {
+            entries: {
+              'adapter-openclaw': {
+                config: {
+                  stateDir: '/installed/.dkg-adapter',
+                  stateDirSource: 'setup-default',
+                  installedWorkspace: '/installed',
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    entry(api);
+
+    const instance = globalThis.__openclawEntryTestInstances![0];
+    expect(instance.config.daemonUrl).toBe('http://127.0.0.1:9200');
+    expect(instance.config.memory).toEqual({ enabled: true });
+    expect(instance.config.channel).toEqual({ enabled: true, port: 0 });
+    // The setup metadata MUST be present on the bootstrap config so
+    // ensureChatTurnWriter() can resolve the right state directory
+    // instead of falling back to ~/.openclaw.
+    expect(instance.config.stateDir).toBe('/installed/.dkg-adapter');
+    expect(instance.config.stateDirSource).toBe('setup-default');
+    expect(instance.config.installedWorkspace).toBe('/installed');
+  });
+
   it('T364 round 9 — partial pluginConfig overlay inherits fallback installedWorkspace for stale-route check', async () => {
     // Pre-fix the stale-route check read `installedWorkspace` and
     // `stateDirSource` from raw `config` (just current sources). For a

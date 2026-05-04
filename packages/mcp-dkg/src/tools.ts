@@ -63,21 +63,22 @@ export function registerReadTools(
   client: DkgClient,
   config: DkgConfig,
 ): void {
-  // ── dkg_list_projects ───────────────────────────────────────────
+  // ── dkg_list_context_graphs ─────────────────────────────────────
   server.registerTool(
-    'dkg_list_projects',
+    'dkg_list_context_graphs',
     {
-      title: 'List DKG Projects',
+      title: 'List Context Graphs',
       description:
-        'List every context graph (project) this DKG node knows about. ' +
-        'Returns id, display name, role (curator / participant), and layer. ' +
-        'The first call most agents make when joining a workspace.',
+        "List every context graph this DKG node knows about (also called " +
+        "'projects' in the DKG node UI). Returns id, display name, role " +
+        '(curator / participant), and layer. The first call most agents ' +
+        'make when joining a workspace.',
       inputSchema: {},
     },
     async (): Promise<ToolResult> => {
       try {
         const rows = await client.listProjects();
-        if (!rows.length) return ok('No projects found on this DKG node.');
+        if (!rows.length) return ok('No context graphs found on this DKG node.');
         const pinned = config.defaultProject;
         const table = rows
           .map((r) => {
@@ -90,24 +91,25 @@ export function registerReadTools(
           })
           .join('\n');
         const hint = pinned
-          ? `\n\n★ pinned in .dkg/config.yaml — other tools default to this project.`
+          ? `\n\n★ pinned in .dkg/config.yaml — other tools default to this context graph.`
           : '';
-        return ok(`Found ${rows.length} project(s):\n\n${table}${hint}`);
+        return ok(`Found ${rows.length} context graph(s):\n\n${table}${hint}`);
       } catch (e) {
-        return err(`Failed to list projects: ${formatError(e)}`);
+        return err(`Failed to list context graphs: ${formatError(e)}`);
       }
     },
   );
 
-  // ── dkg_list_subgraphs ──────────────────────────────────────────
+  // ── dkg_sub_graph_list ──────────────────────────────────────────
   server.registerTool(
-    'dkg_list_subgraphs',
+    'dkg_sub_graph_list',
     {
       title: 'List Sub-graphs',
       description:
-        'List the sub-graphs inside a DKG project (e.g. code, github, ' +
-        'decisions, tasks, meta, chat) with entity counts. Use to figure ' +
-        'out what kind of knowledge the project exposes before querying.',
+        'List the sub-graphs inside a DKG context graph (e.g. code, ' +
+        'github, decisions, tasks, meta, chat) with entity counts. Use ' +
+        'to figure out what kind of knowledge the context graph exposes ' +
+        'before querying.',
       inputSchema: {
         projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
       },
@@ -117,7 +119,7 @@ export function registerReadTools(
       if (!pid) return projectErr();
       try {
         const rows = await client.listSubGraphs(pid);
-        if (!rows.length) return ok(`Project '${pid}' has no sub-graphs yet.`);
+        if (!rows.length) return ok(`Context graph '${pid}' has no sub-graphs yet.`);
         const lines = rows.map(
           (r) =>
             `- **${r.name}**${r.entityCount != null ? ` · ${r.entityCount} entities` : ''}${
@@ -131,45 +133,61 @@ export function registerReadTools(
     },
   );
 
-  // ── dkg_sparql ──────────────────────────────────────────────────
+  // ── dkg_query ───────────────────────────────────────────────────
+  // Replaces the legacy `dkg_sparql` registration. SKILL.md + the
+  // OpenClaw adapter both use `dkg_query` against `POST /api/query`.
+  // The two-axis schema migration (audit §7 item 5):
+  //   - Old single `layer: 'wm' | 'swm' | 'union' | 'vm'` enum
+  //   - New separate axes:
+  //       view: 'working-memory' | 'shared-working-memory' | 'verified-memory'
+  //       includeSharedMemory?: boolean   (orthogonal — combines with view)
+  //   - The legacy `'union'` mode (`view: 'working-memory'` ∪ SWM)
+  //     was an enum-conflation of two orthogonal axes; callers
+  //     wanting that semantics now pass
+  //     `view: 'working-memory' + includeSharedMemory: true`.
+  // The daemon-side wire shape already matches this two-axis form
+  // (`DkgClient.query` accepts both as separate fields per
+  // `client.ts:133-183`); this is a public-tool-surface alignment
+  // only, no daemon change needed.
   server.registerTool(
-    'dkg_sparql',
+    'dkg_query',
     {
       title: 'Run SPARQL Query',
       description:
         'Execute an arbitrary SPARQL SELECT / ASK / CONSTRUCT against a ' +
-        'DKG project. Known prefixes are auto-prepended so you can just ' +
-        'write `SELECT ?d WHERE { ?d a decisions:Decision }`. Scope with ' +
-        '`layer` — "wm" (default), "swm", "union" (wm+swm), or "vm".',
+        'DKG context graph. Known prefixes are auto-prepended so you can ' +
+        'just write `SELECT ?d WHERE { ?d a decisions:Decision }`. Scope ' +
+        'with `view` — "working-memory" (default, private), ' +
+        '"shared-working-memory" (team), or "verified-memory" (on-chain). ' +
+        'Set `includeSharedMemory: true` alongside `view: "working-memory"` ' +
+        'to get the WM∪SWM union the legacy `dkg_sparql` exposed as ' +
+        '`layer: "union"`.',
       inputSchema: {
         sparql: z.string().describe('SPARQL query body. Prefixes are auto-injected.'),
         projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
         subGraphName: z.string().optional().describe('Limit the query to a single sub-graph'),
-        layer: z
-          .enum(['wm', 'swm', 'union', 'vm'])
+        view: z
+          .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
           .optional()
-          .describe('Memory layer scope: wm (default, private), swm (team), union (wm+swm), vm (on-chain verified)'),
+          .describe('Memory tier: working-memory (default, private), shared-working-memory (team), verified-memory (on-chain).'),
+        includeSharedMemory: z
+          .boolean()
+          .optional()
+          .describe('When set with view: "working-memory", include SWM in the result set (the legacy `layer: "union"` semantics).'),
         limit: z.number().optional().describe('Row cap when rendering to markdown; does NOT modify the query'),
       },
     },
-    async ({ sparql, projectId, subGraphName, layer, limit }): Promise<ToolResult> => {
+    async ({ sparql, projectId, subGraphName, view, includeSharedMemory, limit }): Promise<ToolResult> => {
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       const fullSparql = sparql.startsWith('PREFIX') ? sparql : `${PREFIXES}\n${sparql}`;
-      const scope =
-        layer === 'swm'
-          ? { graphSuffix: '_shared_memory' as const }
-          : layer === 'union'
-          ? { includeSharedMemory: true }
-          : layer === 'vm'
-          ? { view: 'verified-memory' as const }
-          : {};
       try {
         const result = await client.query({
           sparql: fullSparql,
           contextGraphId: pid,
           subGraphName,
-          ...scope,
+          view,
+          includeSharedMemory,
         });
         const all = result.bindings ?? [];
         const capped = typeof limit === 'number' ? all.slice(0, limit) : all;

@@ -247,8 +247,8 @@ export function registerAssertionTools(
       title: 'Dump Assertion Quads',
       description:
         'Return every quad in a Working Memory assertion. Not a SPARQL ' +
-        'endpoint — for ad-hoc filtering use `dkg_sparql` with ' +
-        '`layer: "wm"`. The canonical introspection step for the ' +
+        'endpoint — for ad-hoc filtering use `dkg_query` with ' +
+        '`view: "working-memory"`. The canonical introspection step for the ' +
         '`assertion_create + assertion_write + assertion_promote` round-trip.',
       inputSchema: {
         name: z.string().describe('Existing assertion name'),

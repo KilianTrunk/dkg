@@ -328,6 +328,57 @@ describe('publish tools — write+publish helper + canonical SWM finalizer', () 
       expect(r.content[0].text).not.toMatch(/verify.*chain/i);
     }
   });
+
+  // F11 (qa-review-round-2 / matrix v0.8 §4.10): the canonical
+  // wire form for `accessPolicy` is the numeric `0|1` per the
+  // daemon's `/api/context-graph/{create,register}` handlers
+  // (`packages/cli/src/daemon/routes/context-graph.ts:455` /
+  // `:509-510` — both reject anything other than literal 0/1).
+  // Matrix v0.8 §4.10 line 291 had drifted to `z.enum(['open',
+  // 'private'])`; this test pins the implementation against the
+  // daemon canonical so a future re-alignment can't regress
+  // silently to the string form.
+  it('F11: dkg_shared_memory_publish accepts numeric accessPolicy 0 (open)', async () => {
+    const result = await server.call('dkg_shared_memory_publish', {
+      contextGraphId: 'cg',
+      registerIfNeeded: true,
+      accessPolicy: 0,
+    });
+    expect(result.isError).toBeFalsy();
+  });
+
+  it('F11: dkg_shared_memory_publish accepts numeric accessPolicy 1 (private)', async () => {
+    const result = await server.call('dkg_shared_memory_publish', {
+      contextGraphId: 'cg',
+      registerIfNeeded: true,
+      accessPolicy: 1,
+    });
+    expect(result.isError).toBeFalsy();
+  });
+
+  it('F11: dkg_shared_memory_publish rejects the legacy string `"open"` form at the schema layer', async () => {
+    await expect(
+      server.call('dkg_shared_memory_publish', {
+        contextGraphId: 'cg',
+        registerIfNeeded: true,
+        accessPolicy: 'open',
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('F11: dkg_shared_memory_publish rejects out-of-range numeric accessPolicy', async () => {
+    // Matches the daemon's strict `accessPolicy !== 0 && accessPolicy !== 1`
+    // guard at routes/context-graph.ts:509 — the schema layer must
+    // reject the same shape (literal 0 / literal 1 only) before
+    // the wire boundary.
+    await expect(
+      server.call('dkg_shared_memory_publish', {
+        contextGraphId: 'cg',
+        registerIfNeeded: true,
+        accessPolicy: 2,
+      }),
+    ).rejects.toThrow();
+  });
 });
 
 describe('health tools — status + wallet balances', () => {

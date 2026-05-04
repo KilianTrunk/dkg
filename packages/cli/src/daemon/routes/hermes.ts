@@ -13,6 +13,7 @@ import { hasConfiguredLocalAgentChat } from '../local-agents.js';
 import type { OpenClawAttachmentRef } from '../openclaw.js';
 import {
   HERMES_CHANNEL_RESPONSE_TIMEOUT_MS,
+  buildStableHermesTurnId,
   buildHermesChannelHeaders,
   ensureHermesBridgeAvailable,
   getPersistedHermesTurnState,
@@ -32,6 +33,8 @@ type HermesPersistRouteResult = {
   statusCode: number;
   body: Record<string, unknown>;
 };
+
+type NormalizedHermesPersistTurnPayload = Exclude<ReturnType<typeof normalizeHermesPersistTurnPayload>, { error: string }>;
 
 const hermesPersistTurnInflight = new Map<string, Promise<HermesPersistRouteResult>>();
 
@@ -109,9 +112,23 @@ export async function handleHermesRoutes(ctx: RequestContext): Promise<void> {
             details,
           });
         }
-        const reply = target.protocol === 'hermes-openai'
-          ? await readHermesOpenAiReply(forwardRes, payload)
-          : await forwardRes.json();
+        if (target.protocol === 'hermes-openai') {
+          const reply = await readHermesOpenAiReply(forwardRes, payload);
+          const persisted = await persistHermesOpenAiUiTurn(
+            ctx,
+            payload,
+            attachmentRefs,
+            reply.text,
+            reply.sessionId,
+          );
+          return jsonResponse(res, 200, {
+            ...reply,
+            sessionId: persisted.sessionId,
+            turnId: persisted.turnId,
+          });
+        }
+
+        const reply = await forwardRes.json();
         return jsonResponse(res, 200, reply);
       } catch (err: any) {
         if (err.name === 'TimeoutError') {
@@ -206,7 +223,28 @@ export async function handleHermesRoutes(ctx: RequestContext): Promise<void> {
           });
           try {
             if (target.protocol === 'hermes-openai') {
-              await pipeHermesOpenAiStream(res, (transportRes.body as any).getReader(), payload, transportRes);
+              const streamed = await pipeHermesOpenAiStream(
+                res,
+                (transportRes.body as any).getReader(),
+                payload,
+                transportRes,
+              );
+              const persisted = await persistHermesOpenAiUiTurn(
+                ctx,
+                payload,
+                attachmentRefs,
+                streamed.text,
+                streamed.sessionId,
+              );
+              if (!res.writableEnded) {
+                res.write(`data: ${JSON.stringify({
+                  type: 'final',
+                  text: streamed.text,
+                  correlationId: payload.correlationId,
+                  sessionId: persisted.sessionId,
+                  turnId: persisted.turnId,
+                })}\n\n`);
+              }
             } else {
               await pipeHermesStream(req, res, (transportRes.body as any).getReader());
             }
@@ -222,6 +260,9 @@ export async function handleHermesRoutes(ctx: RequestContext): Promise<void> {
         const reply = target.protocol === 'hermes-openai'
           ? await readHermesOpenAiReply(transportRes, payload)
           : await transportRes.json();
+        const persisted = target.protocol === 'hermes-openai'
+          ? await persistHermesOpenAiUiTurn(ctx, payload, attachmentRefs, reply.text ?? '', reply.sessionId)
+          : null;
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache',
@@ -232,8 +273,10 @@ export async function handleHermesRoutes(ctx: RequestContext): Promise<void> {
           type: 'final',
           text: reply.text ?? '',
           correlationId: reply.correlationId ?? payload.correlationId,
-          ...(typeof reply.sessionId === 'string' && reply.sessionId ? { sessionId: reply.sessionId } : {}),
-          ...(typeof reply.turnId === 'string' && reply.turnId ? { turnId: reply.turnId } : {}),
+          ...(persisted
+            ? { sessionId: persisted.sessionId, turnId: persisted.turnId }
+            : typeof reply.sessionId === 'string' && reply.sessionId ? { sessionId: reply.sessionId } : {}),
+          ...(!persisted && typeof reply.turnId === 'string' && reply.turnId ? { turnId: reply.turnId } : {}),
         })}\n\n`);
         res.end();
         return;
@@ -378,7 +421,7 @@ function buildHermesNodeUiSystemPrompt(
 async function readHermesOpenAiReply(
   response: Response,
   payload: HermesChatPayload,
-): Promise<Record<string, unknown>> {
+): Promise<{ text: string; correlationId: string; sessionId?: string }> {
   const body = await response.json().catch(() => ({})) as Record<string, unknown>;
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const firstChoice = choices[0];
@@ -397,16 +440,57 @@ async function readHermesOpenAiReply(
   };
 }
 
+async function persistHermesOpenAiUiTurn(
+  ctx: RequestContext,
+  payload: HermesChatPayload,
+  verifiedAttachmentRefs: OpenClawAttachmentRef[] | undefined,
+  assistantReply: string,
+  responseSessionId?: string,
+): Promise<{ sessionId: string; turnId: string }> {
+  const sessionId = payload.sessionId ?? responseSessionId ?? 'hermes:dkg-ui';
+  const turnId = buildStableHermesTurnId({
+    sessionId,
+    correlationId: payload.correlationId,
+    profile: payload.profile,
+    contextGraphId: payload.contextGraphId,
+  });
+  const persistPayload = normalizeHermesPersistTurnPayload({
+    sessionId,
+    userMessage: payload.text,
+    assistantReply,
+    turnId,
+    correlationId: payload.correlationId,
+    attachmentRefs: verifiedAttachmentRefs,
+    persistenceState: 'stored',
+    contextGraphId: payload.contextGraphId,
+    profile: payload.profile,
+    metadata: { source: 'node-ui-openai' },
+  });
+  if ('error' in persistPayload) {
+    throw new Error(`Invalid Hermes UI persistence payload: ${persistPayload.error}`);
+  }
+
+  const result = await persistHermesTurnWithDuplicateLock(
+    ctx,
+    persistPayload,
+    verifiedAttachmentRefs,
+  );
+  if (result.statusCode !== 200) {
+    const error = typeof result.body.error === 'string' ? result.body.error : 'unknown error';
+    throw new Error(`Hermes UI chat persistence failed: ${error}`);
+  }
+  return { sessionId, turnId };
+}
+
 async function pipeHermesOpenAiStream(
   res: RequestContext['res'],
   reader: { read: () => Promise<{ done?: boolean; value?: Uint8Array }> },
   payload: HermesChatPayload,
   response: Response,
-): Promise<void> {
+): Promise<{ text: string; sessionId?: string }> {
   const decoder = new TextDecoder();
   let buffer = '';
   let finalText = '';
-  let finalEmitted = false;
   const sessionId = response.headers.get('x-hermes-session-id') ?? undefined;
 
   const emit = (event: Record<string, unknown>) => {
@@ -424,13 +508,6 @@ async function pipeHermesOpenAiStream(
       .filter(Boolean);
     for (const data of dataLines) {
       if (data === '[DONE]') {
-        emit({
-          type: 'final',
-          text: finalText,
-          correlationId: payload.correlationId,
-          ...(sessionId ? { sessionId } : {}),
-        });
-        finalEmitted = true;
         continue;
       }
       try {
@@ -469,14 +546,7 @@ async function pipeHermesOpenAiStream(
   }
   buffer += decoder.decode();
   if (buffer.trim()) processFrame(buffer);
-  if (!res.writableEnded && finalText && !finalEmitted) {
-    emit({
-      type: 'final',
-      text: finalText,
-      correlationId: payload.correlationId,
-      ...(sessionId ? { sessionId } : {}),
-    });
-  }
+  return { text: finalText, sessionId };
 }
 
 function findHermesOpenAiSseBoundary(buffer: string): { index: number; length: number } {
@@ -491,7 +561,7 @@ function findHermesOpenAiSseBoundary(buffer: string): { index: number; length: n
 
 async function persistHermesTurnWithDuplicateLock(
   ctx: RequestContext,
-  payload: Exclude<ReturnType<typeof normalizeHermesPersistTurnPayload>, { error: string }>,
+  payload: NormalizedHermesPersistTurnPayload,
   verifiedAttachmentRefs: OpenClawAttachmentRef[] | undefined,
 ): Promise<HermesPersistRouteResult> {
   const key = hermesPersistTurnKey(payload.sessionId, payload.turnId);
@@ -529,7 +599,7 @@ async function persistHermesTurnWithDuplicateLock(
 
 async function persistHermesTurnUnlocked(
   ctx: RequestContext,
-  payload: Exclude<ReturnType<typeof normalizeHermesPersistTurnPayload>, { error: string }>,
+  payload: NormalizedHermesPersistTurnPayload,
   verifiedAttachmentRefs: OpenClawAttachmentRef[] | undefined,
 ): Promise<HermesPersistRouteResult> {
   const { agent, memoryManager } = ctx;
@@ -616,7 +686,7 @@ function persistenceStateRank(state: HermesTurnPersistenceState): number {
 
 async function recordHermesTurnPersistenceTransition(
   memoryManager: RequestContext['memoryManager'],
-  payload: Exclude<ReturnType<typeof normalizeHermesPersistTurnPayload>, { error: string }>,
+  payload: NormalizedHermesPersistTurnPayload,
   verifiedAttachmentRefs: OpenClawAttachmentRef[] | undefined,
 ): Promise<boolean> {
   const recorder = (memoryManager as unknown as {

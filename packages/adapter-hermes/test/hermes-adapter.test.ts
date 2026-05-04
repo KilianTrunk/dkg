@@ -2534,8 +2534,35 @@ assert len(provider._client.writes) == 1, provider._client.writes
 assert provider._client.writes[0][2] == [{
     "subject": "urn:hermes:agent:memory",
     "predicate": "urn:hermes:content",
-    "object": "[memory]\ncached fact",
+    "object": module._quote_literal("[memory]\ncached fact"),
 }], provider._client.writes
+
+provider._cache = {"memory": [], "queued_writes": []}
+result = json.loads(provider._handle_memory({"action": "add", "target": "memory", "content": "live fact"}))
+assert result["store"] == "dkg", result
+assert result["queued"] is False, result
+assert provider._client.writes[-1][2] == [{
+    "subject": "urn:hermes:agent:memory",
+    "predicate": "urn:hermes:content",
+    "object": module._quote_literal("[memory]\nlive fact"),
+}], provider._client.writes
+
+class FailingClient:
+    def write_assertion(self, assertion_name, context_graph_id, quads):
+        return {"success": False, "error": "bad literal"}
+
+provider._client = FailingClient()
+provider._cache = {"memory": [], "queued_writes": []}
+result = json.loads(provider._handle_memory({"action": "add", "target": "memory", "content": "queued fact"}))
+assert result["store"] == "local_cache", result
+assert result["queued"] is True, result
+assert provider._cache["queued_writes"] == [{
+    "type": "memory",
+    "action": "add",
+    "target": "memory",
+    "content": "queued fact",
+    "old_text": "",
+}], provider._cache
 
 provider._assertion_id = ""
 provider._cache["queued_writes"] = [{"type": "memory", "action": "replace", "target": "memory", "content": "new fact", "old_text": "cached"}]

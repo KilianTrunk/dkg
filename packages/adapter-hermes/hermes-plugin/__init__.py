@@ -1177,7 +1177,7 @@ class DKGMemoryProvider(MemoryProvider):
             "action": action,
             "target": target,
             "entries": count,
-            "store": "dkg" if not self._offline else "local_cache",
+            "store": "dkg" if not self._offline and not write_queued else "local_cache",
             "queued": write_queued,
         })
 
@@ -1864,11 +1864,12 @@ class DKGMemoryProvider(MemoryProvider):
 
         entries = list(self._cache.get(target, []))
         quads = []
+        subject = f"urn:hermes:{_uri_segment(self._agent_name, 'agent')}:{_uri_segment(target, 'memory')}"
         for e in entries:
             quads.append({
-                "subject": f"urn:hermes:{self._agent_name}:{target}",
+                "subject": subject,
                 "predicate": "urn:hermes:content",
-                "object": f"[{e.get('target', target)}]\n{e['content']}",
+                "object": _quote_literal(f"[{e.get('target', target)}]\n{e['content']}"),
             })
         try:
             result = self._client.write_assertion(
@@ -2009,6 +2010,11 @@ def _required_cg_and_name(args: Dict[str, Any]) -> tuple[str, str]:
 
 def _quote_literal(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
+
+
+def _uri_segment(value: Any, fallback: str) -> str:
+    segment = re.sub(r"[^A-Za-z0-9._:-]+", "-", str(value or "").strip()).strip("-")
+    return segment or fallback
 
 
 def _normalize_quads(raw_quads: Any) -> List[Dict[str, str]]:

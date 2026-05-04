@@ -976,6 +976,14 @@ describe('Hermes daemon routes', () => {
 
   it('adapts Node UI send requests to the Hermes OpenAI-compatible API server', async () => {
     const calls: Array<{ url: string; body: any }> = [];
+    const storeChatExchange = vi.fn(async () => {});
+    const uiSessionId = 'hermes:dkg-ui:profile-default';
+    const expectedTurnId = buildStableHermesTurnId({
+      sessionId: uiSessionId,
+      correlationId: 'corr-openai',
+      profile: 'default',
+      contextGraphId: 'project-1',
+    });
     vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
       return new Response(JSON.stringify({
@@ -988,11 +996,12 @@ describe('Hermes daemon routes', () => {
     const { ctx, res } = makeHermesRouteContext({
       text: 'hello',
       correlationId: 'corr-openai',
+      sessionId: uiSessionId,
       contextGraphId: 'project-1',
       profile: 'default',
     }, {
       hasChatTurn: vi.fn(async () => false),
-      storeChatExchange: vi.fn(async () => {}),
+      storeChatExchange,
     }, {
       localAgentIntegrations: {
         hermes: {
@@ -1011,8 +1020,19 @@ describe('Hermes daemon routes', () => {
     expect(JSON.parse(res.body)).toMatchObject({
       text: 'Hermes API reply',
       correlationId: 'corr-openai',
-      sessionId: 'api-session-1',
+      sessionId: uiSessionId,
+      turnId: expectedTurnId,
     });
+    expect(storeChatExchange).toHaveBeenCalledWith(
+      uiSessionId,
+      'hello',
+      'Hermes API reply',
+      undefined,
+      expect.objectContaining({
+        turnId: expectedTurnId,
+        persistenceState: 'stored',
+      }),
+    );
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe('http://127.0.0.1:8642/v1/chat/completions');
     expect(calls[0].body).toMatchObject({
@@ -1030,6 +1050,13 @@ describe('Hermes daemon routes', () => {
 
   it('converts Hermes OpenAI-compatible SSE chunks for Node UI streaming', async () => {
     const encoder = new TextEncoder();
+    const storeChatExchange = vi.fn(async () => {});
+    const uiSessionId = 'hermes:dkg-ui:profile-default';
+    const expectedTurnId = buildStableHermesTurnId({
+      sessionId: uiSessionId,
+      correlationId: 'corr-stream',
+      contextGraphId: 'project-1',
+    });
     vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(String(url)).toBe('http://127.0.0.1:8642/v1/chat/completions');
       expect(JSON.parse(String(init?.body))).toMatchObject({ stream: true });
@@ -1049,10 +1076,11 @@ describe('Hermes daemon routes', () => {
     const { ctx, res } = makeHermesRouteContext({
       text: 'hello',
       correlationId: 'corr-stream',
+      sessionId: uiSessionId,
       contextGraphId: 'project-1',
     }, {
       hasChatTurn: vi.fn(async () => false),
-      storeChatExchange: vi.fn(async () => {}),
+      storeChatExchange,
     }, {
       localAgentIntegrations: {
         hermes: {
@@ -1072,7 +1100,18 @@ describe('Hermes daemon routes', () => {
     expect(res.body).toContain('"type":"delta","text":"Hel"');
     expect(res.body).toContain('"type":"delta","text":"lo"');
     expect(res.body).toContain('"type":"final","text":"Hello"');
-    expect(res.body).toContain('"sessionId":"api-session-2"');
+    expect(res.body).toContain(`"sessionId":"${uiSessionId}"`);
+    expect(res.body).toContain(`"turnId":"${expectedTurnId}"`);
+    expect(storeChatExchange).toHaveBeenCalledWith(
+      uiSessionId,
+      'hello',
+      'Hello',
+      undefined,
+      expect.objectContaining({
+        turnId: expectedTurnId,
+        persistenceState: 'stored',
+      }),
+    );
   });
 
   it('falls back to the gateway when bridge send returns retryable 5xx', async () => {

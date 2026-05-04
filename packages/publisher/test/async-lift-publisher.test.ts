@@ -654,6 +654,48 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(processed?.failure?.code).toBe('tx_submit_timeout');
   });
 
+  it('does not invent chain metadata for tentative publish results without on-chain details', async () => {
+    const publisher = createPublisher({
+      config: {
+        publishExecutor: async () => ({
+          kcId: 0n,
+          ual: 'did:dkg:mock:31337/0xabc/tentative',
+          merkleRoot: new Uint8Array([0xab, 0xcd]),
+          kaManifest: [],
+          status: 'tentative',
+        }),
+      },
+    });
+
+    const dkgPublisher = new DKGPublisher({
+      store,
+      chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      eventBus: new TypedEventBus(),
+      keypair: await generateEd25519Keypair(),
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    const write = await dkgPublisher.share('music-social', [
+      { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
+    ], { publisherPeerId: 'peer-1' });
+
+    await publisher.lift({
+      ...request(),
+      shareOperationId: write.shareOperationId,
+    });
+
+    const processed = await publisher.processNext('wallet-1');
+
+    expect(processed?.status).toBe('failed');
+    expect(processed?.broadcast).toBeUndefined();
+    expect(processed?.inclusion).toBeUndefined();
+    expect(processed?.failure?.failedFromState).toBe('broadcast');
+    expect(processed?.failure?.code).toBe('rpc_unavailable');
+    expect(processed?.failure?.retryable).toBe(true);
+    expect(processed?.failure?.resolution).toBe('reset_to_accepted');
+    expect(processed?.failure?.message).toContain('without onChainResult');
+  });
+
   it('persists unknown included-phase failures as terminal failed jobs', async () => {
     const publisher = createPublisher();
     const jobId = await publisher.lift(request());

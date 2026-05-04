@@ -88,6 +88,34 @@ describe('mapLiftRequestToPublishOptions', () => {
     expect(options.allowedPeers).toEqual(['peer-a', 'peer-b']);
   });
 
+  it('preserves private quads with explicit allowList handoff options', () => {
+    const input = {
+      ...baseInput(),
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: ' 12D3KooWPublisher ',
+        privateQuads: [
+          {
+            subject: 'did:dkg:music-social:rihana',
+            predicate: 'http://schema.org/secret',
+            object: '"top-secret"',
+            graph: 'did:dkg:paranet:music-social/_private',
+          },
+        ],
+        accessPolicy: 'allowList',
+        allowedPeers: [' peer-a ', 'peer-b', 'peer-a'],
+      },
+    } satisfies LiftPublishMappingInput;
+
+    const prepared = prepareAsyncPublishPayload(input);
+
+    expect(prepared.privateQuads).toEqual(input.resolved.privateQuads);
+    expect(prepared.publishOptions.privateQuads).toEqual(input.resolved.privateQuads);
+    expect(prepared.publishOptions.publisherPeerId).toBe('12D3KooWPublisher');
+    expect(prepared.publishOptions.accessPolicy).toBe('allowList');
+    expect(prepared.publishOptions.allowedPeers).toEqual(['peer-a', 'peer-b']);
+  });
+
   it('requires publisherPeerId for non-public access', () => {
     expect(() =>
       mapLiftRequestToPublishOptions({

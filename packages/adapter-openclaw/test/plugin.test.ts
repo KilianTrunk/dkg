@@ -1219,6 +1219,7 @@ describe('DkgNodePlugin', () => {
       expect(retryShaped.rootEntity).toBe(rootEntity);
 
       (plugin as any).nodePeerId = '12D3KooWShareWriterTwo';
+      (plugin as any).shareWriterIdentity = undefined;
       const otherWriter = await byName.get('dkg_share')!.execute('tc-other-writer', {
         context_graph_id: 'ctx',
         content: '  Alpha\nBeta  ',
@@ -1229,6 +1230,32 @@ describe('DkgNodePlugin', () => {
       const otherWriterShaped = JSON.parse(otherWriter.content[0].text);
       expect(otherWriterBody.quads[0].subject).not.toBe(rootEntity);
       expect(otherWriterShaped.rootEntity).toBe(otherWriterBody.quads[0].subject);
+
+      (plugin as any).nodePeerId = undefined;
+      (plugin as any).shareWriterIdentity = undefined;
+      (plugin as any).shareWriterFallbackId = 'fallback-writer';
+      (plugin as any).ensureNodePeerId = vi.fn().mockResolvedValue(undefined);
+      const startup = await byName.get('dkg_share')!.execute('tc-startup', {
+        context_graph_id: 'ctx',
+        content: '  Alpha\nBeta  ',
+        sub_graph_name: 'protocols',
+      });
+      const [, startupInit] = fetchMock.mock.calls[3] as [string, RequestInit];
+      const startupBody = JSON.parse(startupInit.body as string);
+      const startupShaped = JSON.parse(startup.content[0].text);
+      expect(startupShaped.rootEntity).toBe(startupBody.quads[0].subject);
+
+      (plugin as any).nodePeerId = '12D3KooWShareWriterLate';
+      const startupRetry = await byName.get('dkg_share')!.execute('tc-startup-retry', {
+        context_graph_id: 'ctx',
+        content: '  Alpha\nBeta  ',
+        sub_graph_name: 'protocols',
+      });
+      const [, startupRetryInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+      const startupRetryBody = JSON.parse(startupRetryInit.body as string);
+      const startupRetryShaped = JSON.parse(startupRetry.content[0].text);
+      expect(startupRetryBody.quads[0].subject).toBe(startupBody.quads[0].subject);
+      expect(startupRetryShaped.rootEntity).toBe(startupShaped.rootEntity);
     });
 
     it('dkg_share validates required inputs and rejects legacy aliases locally', async () => {

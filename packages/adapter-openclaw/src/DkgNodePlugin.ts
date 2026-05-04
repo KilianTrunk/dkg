@@ -44,7 +44,7 @@ import type {
 } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   canonicalPathForCompare,
   defaultStateDirForWorkspace,
@@ -290,6 +290,8 @@ export class DkgNodePlugin {
    * stampede `/api/status`. Null when no probe is running. Codex Bug B9.
    */
   private peerIdProbeInFlight: Promise<void> | null = null;
+  private shareWriterFallbackId = randomUUID();
+  private shareWriterIdentity: string | undefined;
   /**
    * Node agent address returned by `/api/agent/identity`. The daemon resolves
    * the adapter's node-level Bearer token to its default agent address, which
@@ -457,6 +459,8 @@ export class DkgNodePlugin {
   private resetDaemonScopedCachesForClientChange(): void {
     this.nodePeerId = undefined;
     this.peerIdProbeInFlight = null;
+    this.shareWriterFallbackId = randomUUID();
+    this.shareWriterIdentity = undefined;
     this.nodeAgentAddress = undefined;
     this.agentAddressProbeInFlight = null;
     this.availableContextGraphCache = [];
@@ -3297,17 +3301,14 @@ export class DkgNodePlugin {
       if (!content.trim()) return this.error('"content" is required.');
 
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      if (this.nodePeerId === undefined) {
-        await this.ensureNodePeerId().catch(() => {});
-      }
-      const writerIdentity = this.nodePeerId;
-      if (!writerIdentity) {
-        return this.error(
-          '"dkg_share" requires a node peer ID. Retry once the daemon status probe is available.',
-        );
+      if (!this.shareWriterIdentity) {
+        if (this.nodePeerId === undefined) {
+          await this.ensureNodePeerId().catch(() => {});
+        }
+        this.shareWriterIdentity = this.nodePeerId ?? `local:${this.shareWriterFallbackId}`;
       }
       const rootEntityHash = createHash('sha256')
-        .update(writerIdentity)
+        .update(this.shareWriterIdentity)
         .update('\0')
         .update(contextGraphId)
         .update('\0')

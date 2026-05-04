@@ -168,12 +168,23 @@ function hasRouteMetadataConfigSignal(value: Record<string, unknown>): boolean {
   // dispatch route metadata and `resolveChannelDispatchConfig` lost the
   // workspace path entirely. Including it keeps setup-time and runtime
   // recognition aligned across the same openclaw.json layouts.
+  //
+  // T364 round 10 — require workspace aliases to be non-empty after
+  // trimming. Pre-fix an empty-string `workspaceDir`/`workspace` would
+  // count as a route-metadata signal and suppress the fallback chain,
+  // so the resolver could land on an empty workspace and
+  // `syncSkillToWorkspace` would write to `./skills/...` under the
+  // process CWD instead of an actual workspace.
   return (
     isObjectRecord(value.agents) ||
     isObjectRecord(value.session) ||
-    typeof value.workspace === 'string' ||
-    typeof value.workspaceDir === 'string'
+    isNonEmptyString(value.workspace) ||
+    isNonEmptyString(value.workspaceDir)
   );
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 export function resolveOpenClawMergedConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {
@@ -330,12 +341,16 @@ function scrubStaleAgentsDefaultsWorkspace(
 }
 
 function workspaceAliasesSuppliedBy(config: Record<string, unknown>): Set<string> {
+  // T364 round 10 — count an alias as "supplied" only when it carries
+  // a non-empty trimmed string. An empty / whitespace-only value is
+  // not a real workspace and must not suppress fallbacks (or trigger
+  // a stale-alias scrub) on its own.
   const supplied = new Set<string>();
-  if (typeof config.workspace === 'string') supplied.add('workspace');
-  if (typeof config.workspaceDir === 'string') supplied.add('workspaceDir');
+  if (isNonEmptyString(config.workspace)) supplied.add('workspace');
+  if (isNonEmptyString(config.workspaceDir)) supplied.add('workspaceDir');
   const agents = isObjectRecord(config.agents) ? config.agents : undefined;
   const defaults = isObjectRecord(agents?.defaults) ? agents.defaults : undefined;
-  if (defaults && typeof (defaults as Record<string, unknown>).workspace === 'string') {
+  if (defaults && isNonEmptyString((defaults as Record<string, unknown>).workspace)) {
     supplied.add('agents.defaults.workspace');
   }
   return supplied;

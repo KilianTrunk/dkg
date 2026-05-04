@@ -200,6 +200,39 @@ describe('openclaw-config helpers', () => {
     expect(extractAdapterPluginConfigOverlay({})).toBeUndefined();
   });
 
+  it('T364 round 10 — empty-string workspace aliases do not count as route-metadata signal', () => {
+    // Pre-fix `hasRouteMetadataConfigSignal` accepted any string for
+    // `workspace`/`workspaceDir`, so an empty string (or whitespace-
+    // only value) counted as a workspace signal. That suppressed the
+    // fallback chain, the resolver could land on an empty workspace,
+    // and `syncSkillToWorkspace` would write to `./skills/...` under
+    // the process CWD instead of an actual workspace. Post-fix the
+    // signal requires a non-empty trimmed value across all three
+    // alias slots — empty-only candidates fall through to the next
+    // priority source.
+    const api = {
+      cfg: { workspaceDir: '   ' },  // whitespace-only — should NOT trigger
+      runtime: { config: { workspace: '/real-fallback' } },
+    } as any;
+    const result = resolveOpenClawRouteMetadataConfig(api);
+    // Empty-only `cfg` should not crowd out the real fallback workspace.
+    expect(result?.workspace).toBe('/real-fallback');
+  });
+
+  it('T364 round 10 — newer config with empty-string workspace alias does not scrub older real alias', () => {
+    // Anti-test for the alias scrubber: a "newer" config supplying
+    // an empty workspace alias must NOT be treated as asserting a
+    // workspace signal; otherwise it would scrub the older REAL
+    // alias and leave the resolver with no workspace at all.
+    const api = {
+      runtime: { config: { agents: { defaults: { workspace: '/old-real' } } } },
+      cfg: { workspaceDir: '' },  // empty string — no real signal
+    } as any;
+    const result = resolveOpenClawRouteMetadataConfig(api);
+    expect(result).toBeDefined();
+    expect((result?.agents as any)?.defaults?.workspace).toBe('/old-real');
+  });
+
   it('T364 round 8 — newer workspaceDir-only route config supersedes older agents.defaults.workspace alias', () => {
     // Pre-fix `mergeRouteMetadataConfigs` did `Object.assign(merged, config)`
     // verbatim, so an older `agents.defaults.workspace = '/old'` survived

@@ -321,15 +321,34 @@ function hasWorkspaceConfig(config) {
   // or `~/.openclaw`, writing adapter state into the wrong workspace.
   // Companion fix to the same recognition added in `openclaw-config.ts`'s
   // `hasRouteMetadataConfigSignal`.
+  //
+  // T364 round 10 — require non-empty trimmed values. Pre-fix an empty
+  // string `workspaceDir`/`workspace` (or whitespace-only) counted as a
+  // workspace signal and suppressed the fallback chain, leaving
+  // `workspaceDir` empty and `syncSkillToWorkspace` writing to
+  // `./skills/...` under the process CWD.
   return (
-    typeof config?.agents?.defaults?.workspace === 'string' ||
-    typeof config?.workspace === 'string' ||
-    typeof config?.workspaceDir === 'string'
+    isNonEmptyString(config?.agents?.defaults?.workspace) ||
+    isNonEmptyString(config?.workspace) ||
+    isNonEmptyString(config?.workspaceDir)
   );
 }
 
 function workspaceDirFromConfig(config) {
-  return config?.agents?.defaults?.workspace ?? config?.workspace ?? config?.workspaceDir;
+  // T364 round 10 — only return a non-empty trimmed string per alias.
+  // Empty / whitespace-only values fall through to the next alias so the
+  // resolver chain `agents.defaults.workspace -> workspace -> workspaceDir`
+  // never lands on an empty workspace.
+  if (isNonEmptyString(config?.agents?.defaults?.workspace)) {
+    return config.agents.defaults.workspace;
+  }
+  if (isNonEmptyString(config?.workspace)) return config.workspace;
+  if (isNonEmptyString(config?.workspaceDir)) return config.workspaceDir;
+  return undefined;
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function stateDirMatchesWorkspaceDefault(stateDir, workspaceDir) {

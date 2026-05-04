@@ -1850,6 +1850,37 @@ describe('openclaw-entry', () => {
     expect(existsSync(join(staleWorkspace, 'skills', 'dkg-node', 'SKILL.md'))).toBe(false);
   });
 
+  it('T364 round 10 — empty-string workspaceDir alias falls through to the next config source', async () => {
+    // Pre-fix `workspaceDirFromConfig` returned the first non-undefined
+    // alias even if it was an empty string, so a stray
+    // `cfg.workspaceDir = ''` (or whitespace-only) suppressed the
+    // fallback chain — `workspaceDir` ended up empty and
+    // `syncSkillToWorkspace()` would write to `./skills/...` under
+    // the process CWD. Post-fix `isNonEmptyString` is required for
+    // an alias to count, so empty/whitespace-only values fall through
+    // to the next priority source.
+    const entry = await loadEntryWithFakeRuntime();
+    const api = makeDirectPluginConfigApi({
+      stateDir: '/dir/.dkg-adapter',
+      stateDirSource: 'setup-default',
+      installedWorkspace: '/dir',
+    }, {
+      cfg: {
+        workspaceDir: '   ',  // whitespace-only — should NOT block fallback
+      },
+      runtime: {
+        config: {
+          workspace: '/real-fallback',
+        },
+      },
+    });
+
+    entry(api);
+
+    const instance = globalThis.__openclawEntryTestInstances![0];
+    expect(instance.workspaceDirsAtRegister[0]).toBe('/real-fallback');
+  });
+
   it('T364 round 9 — partial pluginConfig overlay inherits fallback installedWorkspace for stale-route check', async () => {
     // Pre-fix the stale-route check read `installedWorkspace` and
     // `stateDirSource` from raw `config` (just current sources). For a

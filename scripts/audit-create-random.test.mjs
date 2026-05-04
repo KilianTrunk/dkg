@@ -82,6 +82,40 @@ describe('stripCommentsPreservingPositions', () => {
     const out = stripCommentsPreservingPositions(text);
     assert.match(out, /Wallet\.createRandom\(\)/);
   });
+
+  it('REGRESSION (PR #371 round 2): a `}` inside a string inside a ${...} substitution does NOT close the substitution', () => {
+    // Codex caught this exact bypass on the round-1 fix: the flat
+    // `state + braceDepth` machine treated the `}` inside `"}"` as the
+    // substitution's closing brace, popped back to template-string mode,
+    // and blanked the real `Wallet.createRandom()` after it. The
+    // stack-based machine pushes dq-string on top of tpl-substitution,
+    // so the brace inside the string is just blanked-content.
+    const text = 'const t = `${"}" + Wallet.createRandom()}`;';
+    const out = stripCommentsPreservingPositions(text);
+    assert.match(out, /Wallet\.createRandom\(\)/);
+  });
+
+  it('REGRESSION: a `{` inside a string inside a ${...} substitution does NOT inflate the brace counter', () => {
+    // Symmetric inverse: `{` inside the inner string must not be counted
+    // either, otherwise the substitution would never close and we'd
+    // blank everything to EOF (also a bypass — anything after the
+    // template would be treated as still-inside-a-template).
+    const text = 'const t = `${"{" + Wallet.createRandom()}`; const z = 1;';
+    const out = stripCommentsPreservingPositions(text);
+    assert.match(out, /Wallet\.createRandom\(\)/);
+    assert.match(out, /const z = 1;/);
+  });
+
+  it('REGRESSION: nested template literal inside a substitution is properly re-lexed', () => {
+    // `\`outer ${\`inner ${Wallet.createRandom()}\`}\``
+    // Inner template is pushed onto the stack on top of the outer
+    // substitution; its own ${} pushes another substitution. Real
+    // Wallet.createRandom() lives in the inner-inner substitution and
+    // must be detected.
+    const text = 'const t = `outer ${`inner ${Wallet.createRandom()}`}`;';
+    const out = stripCommentsPreservingPositions(text);
+    assert.match(out, /Wallet\.createRandom\(\)/);
+  });
 });
 
 describe('findHits', () => {

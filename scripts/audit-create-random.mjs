@@ -61,11 +61,11 @@
  *   - Per-hit allowlist (not per-file): an extra `createRandom()` call
  *     added to an already-exempt file fails CI and must be justified.
  *   - Template-literal substitutions (`${ … }`) ARE scanned as code, so a
- *     `\`${Wallet.createRandom()}\`` would be flagged. Strings nested
- *     inside such substitutions are not recursively re-lexed; an exotic
- *     `\`${"Wallet.createRandom("}\`` would false-positive (acceptable —
- *     false-positive is much safer than false-negative for a security
- *     audit, and that pattern is trivially obvious in review).
+ *     `\`${Wallet.createRandom()}\`` would be flagged. Nested strings
+ *     and templates inside substitutions are properly re-lexed via the
+ *     state stack — so braces inside a string inside a substitution
+ *     (e.g. `\`${"}" + Wallet.createRandom()}\``) cannot prematurely
+ *     close the substitution and hide a real call after it.
  */
 
 import { readFile, readdir } from 'node:fs/promises';
@@ -146,24 +146,36 @@ const PATTERN = /\bWallet\s*\.\s*createRandom\s*\(/g;
  * has the same byte length as the input and match indexes still resolve
  * to the original line numbers.
  *
- * State machine (small, intentionally not a full TS parser):
+ * Stack-based state machine (small, intentionally not a full TS parser).
+ * Each context on the stack is one of:
  *
  *   normal              → code we want to scan
- *   line-comment        // … \n          (entered only from normal)
- *   block-comment       /​* … *​/          (entered only from normal)
- *   sq-string           ' … '            (entered only from normal; \-escapes consumed)
- *   dq-string           " … "            (entered only from normal; \-escapes consumed)
- *   tpl-string          ` … `            (entered only from normal; \-escapes consumed)
- *   tpl-substitution    ${ … }           (entered from tpl-string; brace-balanced; treated as normal code)
+ *   line-comment        // … \n          (only above normal/substitution)
+ *   block-comment       /​* … *​/          (only above normal/substitution)
+ *   sq-string           ' … '            (\-escapes consumed)
+ *   dq-string           " … "            (\-escapes consumed)
+ *   tpl-string          ` … `            (\-escapes; ${ pushes a substitution)
+ *   tpl-substitution    { braceDepth }   ends when braceDepth → 0 on a `}`
  *
- * Why the explicit string state? The previous comment-only stripper
- * treated `//` and `/​*` as comment-start unconditionally — so the line
- * `const url = "http://"; Wallet.createRandom();` blanked everything
- * after `//`, swallowing the real `createRandom()` call after the string.
- * That is a false-NEGATIVE bypass for a security audit, the worst case.
- * The fixed stripper enters `dq-string` at the opening `"`, blanks the
- * string contents, exits at the closing `"`, then resumes normal scanning
- * which sees `Wallet.createRandom(` intact.
+ * Why a stack? We need string contexts to be re-entered RECURSIVELY when
+ * we're inside a template substitution, so braces inside such strings
+ * can't prematurely close the substitution. A flat `state` + `braceDepth`
+ * (the previous attempt) misses this case. Concretely:
+ *
+ *   `${"}" + Wallet.createRandom()}`
+ *
+ *   Without the stack, the `}` inside `"}"` decremented the substitution's
+ *   braceDepth to 0 and popped us back to template-string mode, blanking
+ *   the rest including the real `Wallet.createRandom()`. With the stack,
+ *   the `"` pushes dq-string on top of tpl-substitution, the `}` is just
+ *   string content (blanked, brace counter untouched), the closing `"`
+ *   pops back to tpl-substitution which still has braceDepth=1, and the
+ *   real `Wallet.createRandom()` is detected.
+ *
+ * Bypass-history regression cases that this stripper now correctly
+ * blocks:
+ *   - `// or /* inside a string literal` (PR #371 codex round 1)
+ *   - `} inside a string inside a ${ ... } substitution` (round 2)
  *
  * Strings are blanked rather than passed through verbatim so that a
  * literal `"Wallet.createRandom("` inside a string can't false-positive
@@ -178,108 +190,102 @@ export function stripCommentsPreservingPositions(text) {
   const len = text.length;
   let out = '';
   let i = 0;
-  let state = 'normal';
-  let stringQuote = ''; // " | ' | ` for sq/dq/tpl
-  let braceDepth = 0;   // tracked inside tpl-substitution
 
+  // Stack of contexts. Top of the stack is the active state.
+  const stack = [{ kind: 'normal' }];
+  const top = () => stack[stack.length - 1];
   const blank = (c) => (c === '\n' ? '\n' : ' ');
 
   while (i < len) {
+    const cur = top();
     const c = text[i];
     const next = i + 1 < len ? text[i + 1] : '';
 
-    if (state === 'normal') {
+    if (cur.kind === 'normal' || cur.kind === 'tpl-substitution') {
+      // tpl-substitution behaves exactly like normal code, EXCEPT that
+      // top-level `{` / `}` adjust the substitution's brace counter and
+      // the closing `}` pops back to the enclosing tpl-string.
+      if (cur.kind === 'tpl-substitution') {
+        if (c === '{') {
+          cur.braceDepth += 1;
+          out += c; i += 1;
+          continue;
+        }
+        if (c === '}') {
+          cur.braceDepth -= 1;
+          if (cur.braceDepth === 0) {
+            stack.pop();
+            out += ' '; i += 1;
+            continue;
+          }
+          out += c; i += 1;
+          continue;
+        }
+      }
       if (c === '/' && next === '/') {
         out += '  '; i += 2;
-        state = 'line-comment';
+        stack.push({ kind: 'line-comment' });
       } else if (c === '/' && next === '*') {
         out += '  '; i += 2;
-        state = 'block-comment';
+        stack.push({ kind: 'block-comment' });
       } else if (c === '"' || c === "'") {
         out += ' '; i += 1;
-        state = c === '"' ? 'dq-string' : 'sq-string';
-        stringQuote = c;
+        stack.push({ kind: c === '"' ? 'dq-string' : 'sq-string' });
       } else if (c === '`') {
         out += ' '; i += 1;
-        state = 'tpl-string';
-        stringQuote = '`';
+        stack.push({ kind: 'tpl-string' });
       } else {
         out += c; i += 1;
       }
       continue;
     }
 
-    if (state === 'line-comment') {
+    if (cur.kind === 'line-comment') {
       if (c === '\n') {
         out += '\n'; i += 1;
-        state = 'normal';
+        stack.pop();
       } else {
         out += ' '; i += 1;
       }
       continue;
     }
 
-    if (state === 'block-comment') {
+    if (cur.kind === 'block-comment') {
       if (c === '*' && next === '/') {
         out += '  '; i += 2;
-        state = 'normal';
+        stack.pop();
       } else {
         out += blank(c); i += 1;
       }
       continue;
     }
 
-    if (state === 'sq-string' || state === 'dq-string') {
+    if (cur.kind === 'sq-string' || cur.kind === 'dq-string') {
+      const quote = cur.kind === 'sq-string' ? "'" : '"';
       if (c === '\\' && i + 1 < len) {
-        // Consume escape sequence (e.g. \", \\, \n) — blank both bytes.
         out += blank(c) + blank(text[i + 1]);
         i += 2;
-      } else if (c === stringQuote) {
+      } else if (c === quote) {
         out += ' '; i += 1;
-        state = 'normal';
-        stringQuote = '';
+        stack.pop();
       } else {
         out += blank(c); i += 1;
       }
       continue;
     }
 
-    if (state === 'tpl-string') {
+    if (cur.kind === 'tpl-string') {
       if (c === '\\' && i + 1 < len) {
         out += blank(c) + blank(text[i + 1]);
         i += 2;
       } else if (c === '`') {
         out += ' '; i += 1;
-        state = 'normal';
-        stringQuote = '';
+        stack.pop();
       } else if (c === '$' && next === '{') {
-        // Enter a substitution: subsequent code is scanned as normal.
-        // We DO NOT recursively re-lex strings inside the substitution —
-        // see the docstring's bypass-resistance notes for the trade-off.
         out += '  '; i += 2;
-        state = 'tpl-substitution';
-        braceDepth = 1;
+        stack.push({ kind: 'tpl-substitution', braceDepth: 1 });
       } else {
         out += blank(c); i += 1;
-      }
-      continue;
-    }
-
-    if (state === 'tpl-substitution') {
-      if (c === '{') {
-        braceDepth += 1;
-        out += c; i += 1;
-      } else if (c === '}') {
-        braceDepth -= 1;
-        if (braceDepth === 0) {
-          out += ' '; i += 1;
-          state = 'tpl-string';
-        } else {
-          out += c; i += 1;
-        }
-      } else {
-        // Pass through so regex catches Wallet.createRandom() inside ${...}
-        out += c; i += 1;
       }
       continue;
     }

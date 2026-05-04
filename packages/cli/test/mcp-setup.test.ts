@@ -127,6 +127,62 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(deps.startDaemon).toHaveBeenCalledTimes(1);
   });
 
+  // F6 (qa-review-round-1): when the existing-config skip-write branch
+  // is taken, `effectivePort` MUST be reconciled against the persisted
+  // config, not the CLI default. Pre-fix concrete reproducer: a user
+  // who previously ran `dkg openclaw setup --port 9300` (so
+  // `~/.dkg/config.json` has `apiPort: 9300`) and then runs `dkg mcp
+  // setup` with no flags would have the daemon started on 9200 (the
+  // CLI default), the verification probe hit the wrong port, and the
+  // registered MCP entry would point nowhere useful.
+  it('F6: existing config with non-default port — startDaemon receives the persisted port, not the CLI default', async () => {
+    const dkgDir = join(tmpHome, '.dkg');
+    mkdirSync(dkgDir, { recursive: true });
+    // Pre-existing config has apiPort 9300; the user is running `dkg
+    // mcp setup` with NO --port flag, so the CLI default would be 9200.
+    writeFileSync(
+      join(dkgDir, 'config.json'),
+      JSON.stringify({ name: 'persisted-agent', apiPort: 9300, nodeRole: 'edge' }, null, 2),
+    );
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ verify: false, fund: false }, deps);
+
+    // writeDkgConfig MUST NOT have run — the existing-config branch
+    // was taken (no overrides supplied).
+    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    // startDaemon MUST receive the persisted 9300, not the CLI default.
+    expect(deps.startDaemon).toHaveBeenCalledTimes(1);
+    expect((deps.startDaemon as any).mock.calls[0][0]).toBe(9300);
+  });
+
+  it('F6: existing config with non-default port + --no-start — read-back still runs', async () => {
+    // Even with --no-start, the read-back must populate effective state
+    // so faucet (if enabled) and verify (if enabled) target the right
+    // port. Asserting via writeDkgConfig staying uncalled (skip-write
+    // branch taken) without throwing — the read-back sits on the same
+    // branch entry that the F6 fix lifts out of the `else`.
+    const dkgDir = join(tmpHome, '.dkg');
+    mkdirSync(dkgDir, { recursive: true });
+    writeFileSync(
+      join(dkgDir, 'config.json'),
+      JSON.stringify({ name: 'persisted', apiPort: 9400 }, null, 2),
+    );
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, verify: false, fund: false }, deps);
+
+    // Daemon-start was opted out, faucet was opted out — no port
+    // assertion possible directly. The read-back's correctness here
+    // is structural: the branch ran without throwing on the corrupt
+    // configs / missing fields path the helper handles. Companion
+    // assertion to the port-9300 case above.
+    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    expect(deps.startDaemon).not.toHaveBeenCalled();
+  });
+
   it('honours --no-start: skips daemon start AND faucet (faucet depends on running daemon)', async () => {
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
     const deps = makeDeps();

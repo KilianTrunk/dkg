@@ -283,8 +283,39 @@ export async function mcpSetupAction(
   let effectivePort = apiPort;
   let effectiveAgentName = opts.name?.trim() || readPersistedAgentName(dkgDirPath) || mintFallbackAgentName();
 
+  /**
+   * F6 fix: read-back must run on BOTH branches (skip-write AND
+   * write-then-read), not just inside the `else`. The pre-F6 layout
+   * only reconciled `effectivePort` after `writeDkgConfig` ran,
+   * leaving the skip-write branch with the CLI default 9200 even when
+   * the persisted config had a different port. Concrete reproducer:
+   * a user previously ran `dkg openclaw setup --port 9300`; running
+   * `dkg mcp setup` with no flags would start the daemon on 9200 and
+   * the verification probe + registered MCP entry would point at the
+   * wrong port.
+   *
+   * Pulling the read-back into a helper that runs unconditionally
+   * after the (optional) write keeps the daemon-start, faucet, and
+   * verify steps all aligned with the persisted config — which is
+   * the source of truth for an existing install.
+   */
+  const reconcileFromPersistedConfig = (): void => {
+    if (!existsSync(jsonPath)) return;
+    try {
+      const merged = JSON.parse(readFileSync(jsonPath, 'utf-8'));
+      const mergedPort = Number(merged.apiPort);
+      if (Number.isInteger(mergedPort) && mergedPort >= 1 && mergedPort <= 65535) {
+        effectivePort = mergedPort;
+      }
+      if (typeof merged.name === 'string' && merged.name.trim()) {
+        effectiveAgentName = merged.name.trim();
+      }
+    } catch { /* corrupt config; downstream uses pre-merge values */ }
+  };
+
   if (configExists && opts.name == null && opts.port == null) {
     console.log(`[setup] Node config exists (${tildify(existsSync(yamlPath) ? yamlPath : jsonPath)}); leaving untouched.`);
+    reconcileFromPersistedConfig();
   } else if (dryRun) {
     console.log(`[setup] [dry-run] Would write ~/.dkg/config.json (port ${apiPort}, name "${effectiveAgentName}")`);
   } else {
@@ -297,16 +328,7 @@ export async function mcpSetupAction(
       // Read back the effective port + name from the merged config so
       // downstream steps use the persisted values when an existing
       // config preserved a different port/name.
-      try {
-        const merged = JSON.parse(readFileSync(jsonPath, 'utf-8'));
-        const mergedPort = Number(merged.apiPort);
-        if (Number.isInteger(mergedPort) && mergedPort >= 1 && mergedPort <= 65535) {
-          effectivePort = mergedPort;
-        }
-        if (typeof merged.name === 'string' && merged.name.trim()) {
-          effectiveAgentName = merged.name.trim();
-        }
-      } catch { /* use pre-merge values */ }
+      reconcileFromPersistedConfig();
     } catch (err: any) {
       console.error(`[setup] Failed to load network config: ${err?.message ?? err}`);
       throw err;

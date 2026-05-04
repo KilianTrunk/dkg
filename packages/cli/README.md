@@ -88,6 +88,27 @@ dkg query my-project -q "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10"
 
 Run `dkg <command> --help` for per-command options.
 
+## Source Workers
+
+`dkg source-worker run --config <path>` runs a generic polling worker from a
+JSON config file. Treat that config as sensitive operator material, equivalent
+to the daemon's `auth.token`: it contains `daemonToken` and names a
+`handlerModule` that the CLI dynamically imports and executes in the worker
+process. Store it with the same access controls as `auth.token`, and do not
+commit it to a repository.
+
+Handler modules export `createSourceWorkerDeps(context)`, returning
+`getFingerprint` and `processSource`. `getFingerprint(source)` is the content
+identity contract for the worker: source content changes that affect emitted
+triples/assets must produce a different fingerprint, while unchanged source
+content must keep the same fingerprint across runs. Do not include wall-clock
+time, random values, transient job status, or other polling noise in the
+fingerprint.
+
+The worker state file is updated with a same-directory temp-file write, file
+fsync, atomic rename, and parent-directory fsync where supported so a crash does
+not truncate the previous state file.
+
 ## HTTP API
 
 When the daemon is running, it exposes a local HTTP API (default: `http://localhost:9200`). Key endpoint groups:

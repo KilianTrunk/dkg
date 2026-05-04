@@ -21,8 +21,13 @@ export interface SourceWorkerHandlerContext<TSource extends SourceWorkerSource =
 }
 
 export interface SourceWorkerHandlerModule<TSource extends SourceWorkerSource = SourceWorkerSource> {
+  /**
+   * Build the source-specific worker hooks. getFingerprint must be stable for
+   * unchanged source content and must change when source content that affects
+   * emitted triples/assets changes.
+   */
   createSourceWorkerDeps(context: SourceWorkerHandlerContext<TSource>): Promise<
-  Pick<SourceWorkerDeps<TSource>, 'getFingerprint' | 'processSource'>
+    Pick<SourceWorkerDeps<TSource>, 'getFingerprint' | 'processSource'>
   > | Pick<SourceWorkerDeps<TSource>, 'getFingerprint' | 'processSource'>;
 }
 

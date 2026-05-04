@@ -1,6 +1,11 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
+/**
+ * Source-worker configs are sensitive operator material, equivalent to
+ * auth.token: they contain daemonToken and select handlerModule code that
+ * this process dynamically imports and executes.
+ */
 export interface SourceWorkerConfig<TSource = unknown> {
   pollIntervalMs: number;
   stateFile: string;

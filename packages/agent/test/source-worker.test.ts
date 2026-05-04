@@ -1,8 +1,8 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { runSourceWorkerOnce } from '../src/source-worker.js';
+import { runSourceWorkerOnce, saveSourceWorkerState } from '../src/source-worker.js';
 
 const cleanup: string[] = [];
 afterEach(async () => {
@@ -33,5 +33,37 @@ describe('source worker runtime', () => {
 
     expect(deps.processSource).toHaveBeenCalledTimes(1);
     expect(second.sources['src-1']?.lastStatus).toBe('finalized');
+  });
+
+  it('saves state without leaving temp files behind', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'source-worker-'));
+    cleanup.push(dir);
+    const statePath = join(dir, 'state.json');
+
+    await saveSourceWorkerState(statePath, {
+      sources: {
+        'src-1': {
+          fingerprint: 'fp-1',
+          lastStatus: 'queued',
+        },
+      },
+    });
+
+    await expect(readdir(dir)).resolves.toEqual(['state.json']);
+    await expect(runSourceWorkerOnce([], statePath, {
+      now: () => '2026-04-28T00:00:00.000Z',
+      getFingerprint: vi.fn(async () => ''),
+      getJobStatus: vi.fn(async () => ''),
+      processSource: vi.fn(async () => {
+        throw new Error('unexpected source processing');
+      }),
+    })).resolves.toMatchObject({
+      sources: {
+        'src-1': {
+          fingerprint: 'fp-1',
+          lastStatus: 'queued',
+        },
+      },
+    });
   });
 });

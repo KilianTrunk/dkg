@@ -1,5 +1,6 @@
-import { writeFile, readFile, mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { open, readFile, mkdir, rename, rm, type FileHandle } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 
 export interface SourceWorkerJobState {
   fingerprint?: string;
@@ -29,6 +30,11 @@ export interface SourcePreparationResult<TAsset = unknown> {
 }
 
 export interface SourceKindHandler<TSource = SourceWorkerSource, TAsset = unknown> {
+  /**
+   * Return a stable fingerprint for source content that affects emitted assets.
+   * Changed content must produce a different fingerprint; unchanged content
+   * must keep the same fingerprint across runs.
+   */
   computeFingerprint(source: TSource): Promise<string>;
   prepare(source: TSource): Promise<SourcePreparationResult<TAsset>>;
 }
@@ -45,6 +51,13 @@ export interface SourceWorkerResult {
 
 export interface SourceWorkerDeps<TSource extends SourceWorkerSource> {
   now(): string;
+  /**
+   * Return a stable fingerprint for source content that affects emitted
+   * triples/assets. Changed content must produce a different fingerprint;
+   * unchanged content must keep the same fingerprint across runs. Do not
+   * include wall-clock time, random values, transient job status, or polling
+   * noise.
+   */
   getFingerprint(source: TSource): Promise<string>;
   processSource(source: TSource, fingerprint: string, state: SourceWorkerJobState | undefined): Promise<SourceWorkerResult>;
   getJobStatus(jobId: string): Promise<string>;
@@ -62,8 +75,27 @@ export async function loadSourceWorkerState(path: string): Promise<SourceWorkerS
 }
 
 export async function saveSourceWorkerState(path: string, state: SourceWorkerState): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(state, null, 2) + '\n', 'utf8');
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
+  const tempPath = join(dir, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+  let tempFile: FileHandle | undefined;
+
+  try {
+    tempFile = await open(tempPath, 'wx');
+    await tempFile.writeFile(JSON.stringify(state, null, 2) + '\n', 'utf8');
+    await tempFile.sync();
+    await tempFile.close();
+    tempFile = undefined;
+
+    await rename(tempPath, path);
+    await syncDirectory(dir);
+  } catch (error) {
+    if (tempFile) {
+      await tempFile.close().catch(() => undefined);
+    }
+    await rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
@@ -162,4 +194,20 @@ function isSuccessStatus(status: string | undefined): boolean {
 
 function isActiveStatus(status: string | undefined): boolean {
   return status === 'accepted' || status === 'claimed' || status === 'validated' || status === 'broadcast' || status === 'included' || status === 'queued' || status === 'in-flight';
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  let dir: FileHandle | undefined;
+  try {
+    dir = await open(path, 'r');
+    await dir.sync();
+  } catch (error: any) {
+    if (!['EINVAL', 'ENOTSUP', 'EPERM', 'EISDIR'].includes(error?.code)) {
+      throw error;
+    }
+  } finally {
+    if (dir) {
+      await dir.close().catch(() => undefined);
+    }
+  }
 }

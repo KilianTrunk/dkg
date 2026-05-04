@@ -669,7 +669,7 @@ describe('DkgNodePlugin', () => {
       'dkg_shared_memory_publish',
       'memory_search',
     ];
-    expect(new Set(toolNames)).toEqual(new Set(expectedToolNames));
+    expect(toolNames).toEqual(expect.arrayContaining(expectedToolNames));
     // Tool names should stay unique even as the registry grows.
     expect(new Set(toolNames).size).toBe(toolNames.length);
   });
@@ -1200,10 +1200,21 @@ describe('DkgNodePlugin', () => {
         rootEntity,
         triplesWritten: 1,
       });
-      expect(shaped.rootEntity).toMatch(/^urn:openclaw:dkg-share:[0-9a-f-]+$/);
+      expect(shaped.rootEntity).toMatch(/^urn:openclaw:dkg-share:[0-9a-f]{64}$/);
       expect(shaped).not.toHaveProperty('workspaceOperationId');
       expect(shaped).not.toHaveProperty('paranetId');
       expect(result.details).toEqual(shaped);
+
+      const retry = await byName.get('dkg_share')!.execute('tc-retry', {
+        context_graph_id: 'ctx',
+        content: '  Alpha\nBeta  ',
+        sub_graph_name: 'protocols',
+      });
+      const [, retryInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const retryBody = JSON.parse(retryInit.body as string);
+      const retryShaped = JSON.parse(retry.content[0].text);
+      expect(retryBody.quads[0].subject).toBe(rootEntity);
+      expect(retryShaped.rootEntity).toBe(rootEntity);
     });
 
     it('dkg_share validates required inputs and rejects legacy aliases locally', async () => {

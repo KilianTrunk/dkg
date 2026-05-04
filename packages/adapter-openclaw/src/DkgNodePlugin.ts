@@ -44,7 +44,7 @@ import type {
 } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import {
   canonicalPathForCompare,
   defaultStateDirForWorkspace,
@@ -3296,13 +3296,20 @@ export class DkgNodePlugin {
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!content.trim()) return this.error('"content" is required.');
 
-      const rootEntity = `urn:openclaw:dkg-share:${randomUUID()}`;
+      const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
+      const rootEntityHash = createHash('sha256')
+        .update(contextGraphId)
+        .update('\0')
+        .update(subGraphName ?? '')
+        .update('\0')
+        .update(content)
+        .digest('hex');
+      const rootEntity = `urn:openclaw:dkg-share:${rootEntityHash}`;
       const quads = [{
         subject: rootEntity,
         predicate: 'http://schema.org/text',
         object: `"${escapeRdfLiteral(content)}"`,
       }];
-      const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
       const result = await this.client.share(contextGraphId, quads, {
         localOnly: false,
         subGraphName,

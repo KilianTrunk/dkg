@@ -1858,6 +1858,11 @@ for (const [commandName, candidates, description] of [
   command.action(async (opts) => {
     const action = await loadHermesAdapterAction(commandName, candidates);
     try {
+      if (commandName === 'reconnect') {
+        const { loadBundledDkgNodeSkill } = await import('./hermes-setup.js');
+        await action({ ...opts, nodeSkillContent: loadBundledDkgNodeSkill() });
+        return;
+      }
       await action(opts);
     } catch (err: any) {
       console.error(`\n[hermes ${commandName}] ERROR: ${err?.message ?? err}\n`);

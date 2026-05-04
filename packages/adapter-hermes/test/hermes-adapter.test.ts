@@ -436,6 +436,7 @@ assert provider._config["context_graph"] == "agent-context", provider._config
     expect(config.allow_direct_publish).toBe(true);
     expect(config.require_explicit_approval).toBe(false);
     expect(config.require_wallet_check).toBe(false);
+    expect(config.allow_context_graph_admin_tools).toBe(true);
   });
 
   it('defaults publish tools to direct exposure for skill parity', () => {
@@ -452,6 +453,7 @@ assert provider._config["context_graph"] == "agent-context", provider._config
     });
     expect(config.publish_tool).toBe('direct');
     expect(config.allow_direct_publish).toBe(true);
+    expect(config.allow_context_graph_admin_tools).toBe(true);
   });
 
   it('loads provider guard aliases from dkg.json', () => {
@@ -507,9 +509,9 @@ config = module._load_config()
 assert config["publish_tool"] == "direct", config
 assert config["allow_direct_publish"] is True, config
 assert config["allow_context_graph_admin_tools"] is True, config
-(home / "dkg.json").write_text(json.dumps({"allow_context_graph_admin_tools": True}), encoding="utf-8")
+(home / "dkg.json").write_text(json.dumps({"allow_context_graph_admin_tools": False}), encoding="utf-8")
 config = module._load_config()
-assert config["allow_context_graph_admin_tools"] is True, config
+assert config["allow_context_graph_admin_tools"] is False, config
 `;
     const result = spawnSync('python', ['-B', '-c', script], {
       cwd: process.cwd(),
@@ -1496,11 +1498,16 @@ expected_default = [
     "dkg_assertion_query",
     "dkg_assertion_write",
     "dkg_context_graph_create",
+    "dkg_context_graph_invite",
     "dkg_find_agents",
     "dkg_invoke_skill",
+    "dkg_join_request_approve",
     "dkg_join_request_list",
+    "dkg_join_request_reject",
     "dkg_list_context_graphs",
+    "dkg_participant_add",
     "dkg_participant_list",
+    "dkg_participant_remove",
     "dkg_publish",
     "dkg_query",
     "dkg_read_messages",
@@ -1526,10 +1533,15 @@ share_schema = next(schema for schema in provider.get_tool_schemas() if schema["
 assert "context_graph_id" in share_schema["parameters"]["properties"], share_schema
 assert "context_graph" not in share_schema["parameters"]["properties"], share_schema
 
-provider._config = {"publish_tool": "disabled", "allow_direct_publish": False}
+provider._config = {
+    "publish_tool": "disabled",
+    "allow_direct_publish": False,
+    "allow_context_graph_admin_tools": False,
+}
 disabled_names = sorted(schema["name"] for schema in provider.get_tool_schemas())
 assert "dkg_publish" not in disabled_names, disabled_names
 assert "dkg_shared_memory_publish" not in disabled_names, disabled_names
+assert "dkg_context_graph_invite" not in disabled_names, disabled_names
 guarded = provider.handle_tool_call("dkg_shared_memory_publish", {"context_graph_id": "cg:test"})
 assert "disabled by the adapter publish guard" in guarded, guarded
 admin_guarded = provider.handle_tool_call("dkg_participant_add", {"context_graph_id": "cg:test", "agent_address": "0xabc"})

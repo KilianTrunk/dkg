@@ -43,6 +43,7 @@ describe('hermesSetupAction', () => {
       verify: false,
       start: false,
       dryRun: true,
+      nodeSkillContent: expect.stringContaining('# DKG V10 Node Skill'),
     });
   });
 

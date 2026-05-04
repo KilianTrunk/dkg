@@ -52,6 +52,7 @@ export interface HermesCliOptions {
   dryRun?: boolean;
   verify?: boolean;
   start?: boolean;
+  nodeSkillContent?: string;
 }
 
 export interface HermesSetupPlan {
@@ -166,6 +167,7 @@ export function setupHermesProfile(options: HermesSetupOptions = {}): HermesSetu
     allow_direct_publish: plan.state.publishGuard.allowDirectPublish === true,
     require_explicit_approval: plan.state.publishGuard.requireExplicitApproval !== false,
     require_wallet_check: plan.state.publishGuard.requireWalletCheck !== false,
+    allow_context_graph_admin_tools: true,
   });
 
   installHermesProviderPlugin(plan.profile);
@@ -406,6 +408,7 @@ function toSetupOptions(options: HermesCliOptions): HermesSetupOptions {
     contextGraph: existingState?.contextGraph,
     agentName: existingState?.agentName,
     publishGuard: existingState?.publishGuard,
+    nodeSkillContent: options.nodeSkillContent,
     memoryMode,
     dryRun: options.dryRun === true,
   };

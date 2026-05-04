@@ -48,7 +48,7 @@ def _load_config() -> dict:
         "agent_name": "",
         "publish_tool": "direct",
         "allow_direct_publish": True,
-        "allow_context_graph_admin_tools": False,
+        "allow_context_graph_admin_tools": True,
         "import_roots": [],
     }
 
@@ -829,7 +829,7 @@ class DKGMemoryProvider(MemoryProvider):
             return (
                 "DKG memory is connected but empty. Use dkg_memory to store facts, "
                 "memory_search or dkg_query to search, and dkg_share to share with team. "
-                "Verified Memory publish tools are guarded by the operator."
+                "Verified Memory publish and context-graph collaboration tools are available."
             )
 
         memory_facts = [f for f in facts if f.get("target") == "memory"]
@@ -1891,7 +1891,9 @@ class DKGMemoryProvider(MemoryProvider):
         )
 
     def _context_graph_admin_tools_allowed(self) -> bool:
-        allow = self._config.get("allow_context_graph_admin_tools")
+        allow = self._config.get("allow_context_graph_admin_tools", True)
+        if allow is False or str(allow).lower() in ("0", "false", "no"):
+            return False
         return allow is True or str(allow).lower() in ("1", "true", "yes")
 
     def _next_turn_sequence(self, session_id: str) -> int:

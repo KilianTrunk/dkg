@@ -1,4 +1,5 @@
 import type { Command } from 'commander';
+import { readFileSync } from 'node:fs';
 
 export type HermesMemoryMode = 'primary' | 'tools-only';
 
@@ -26,6 +27,7 @@ export interface NormalizedHermesSetupOptions {
   verify: boolean;
   start: boolean;
   dryRun: boolean;
+  nodeSkillContent?: string;
 }
 
 export interface HermesSetupActionDeps {
@@ -43,6 +45,10 @@ function normalizePort(value: string | number | undefined): number | undefined {
     throw new Error(`Invalid Hermes daemon port: ${String(value)}`);
   }
   return port;
+}
+
+export function loadBundledDkgNodeSkill(): string {
+  return readFileSync(new URL('../skills/dkg-node/SKILL.md', import.meta.url), 'utf-8');
 }
 
 export function normalizeHermesSetupOptions(opts: HermesSetupCliOptions): NormalizedHermesSetupOptions {
@@ -74,5 +80,8 @@ export async function hermesSetupAction(
   _command: Pick<Command, 'getOptionValueSource'>,
   deps: HermesSetupActionDeps,
 ): Promise<void> {
-  await deps.runSetup(normalizeHermesSetupOptions(opts));
+  await deps.runSetup({
+    ...normalizeHermesSetupOptions(opts),
+    nodeSkillContent: loadBundledDkgNodeSkill(),
+  });
 }

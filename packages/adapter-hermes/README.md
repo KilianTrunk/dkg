@@ -90,6 +90,10 @@ adapter disconnected. `uninstall` removes ownership-marked adapter artifacts.
 It does not delete Hermes sessions, logs, `.env`, non-DKG skills, or unrelated
 profile data.
 
+`pnpm dkg hermes setup` and `pnpm dkg hermes reconnect` install the bundled DKG
+node skill to `$HERMES_HOME/skills/dkg-node/SKILL.md` so Hermes can discover
+the same node instructions that the daemon serves from `/.well-known/skill.md`.
+
 ## Provider Mode vs Tools-Only Mode
 
 Hermes allows one external memory provider at a time. In provider mode, setup
@@ -135,8 +139,9 @@ same model-callable DKG tool surface as the node skill. Operators can hide
 "disabled"` / `allow_direct_publish: false` in `dkg.json`, or by exporting
 `DKG_ALLOW_DIRECT_PUBLISH=false`. Context-graph admin mutation tools such as
 `dkg_context_graph_invite`, `dkg_participant_add`, `dkg_participant_remove`,
-`dkg_join_request_approve`, and `dkg_join_request_reject` are also hidden by
-default unless `DKG_ALLOW_CONTEXT_GRAPH_ADMIN_TOOLS=true`.
+`dkg_join_request_approve`, and `dkg_join_request_reject` are also exposed by
+default. Operators can hide them with `allow_context_graph_admin_tools: false`
+in `dkg.json` or `DKG_ALLOW_CONTEXT_GRAPH_ADMIN_TOOLS=false`.
 
 `dkg_assertion_import_file` requires an operator-approved import root. Configure
 `DKG_HERMES_IMPORT_ROOTS`, `HERMES_DKG_IMPORT_ROOTS`, `DKG_IMPORT_ROOTS`, or the
@@ -185,7 +190,8 @@ provenance before forwarding them to Hermes.
   explicit trust decision and require normal network hardening.
 - Verified Memory publishing is permanent and may cost TRAC; operators can
   disable direct publish exposure with `DKG_ALLOW_DIRECT_PUBLISH=false`.
-  Context-graph admin mutation tools are disabled by default.
+- Context-graph admin mutation tools are enabled by default for collaboration;
+  operators can hide them with `DKG_ALLOW_CONTEXT_GRAPH_ADMIN_TOOLS=false`.
 - Assertion file import is model-callable only inside configured safe roots;
   use `DKG_HERMES_IMPORT_ROOTS` or adapter `import_roots` to approve document
   locations explicitly.

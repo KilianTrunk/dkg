@@ -152,17 +152,21 @@ export function registerSetupTools(
   );
 
   // ── dkg_sub_graph_create ────────────────────────────────────────
-  // Strict create per parity-analyst's audit v1.1 self-correction
-  // (2026-05-04). Three independent signals all point to strict:
-  //   - SKILL.md is silent on idempotency
-  //   - the daemon route 409s on duplicate sub-graph name
-  //   - the OpenClaw adapter exposes the strict path
-  // mcp-dkg's `client.ensureSubGraph` is a CLIENT-side wrapper that
-  // catches the 409 for internal use only (the now-dropped sugared
-  // writes were its sole consumer). It does NOT belong on the public
-  // tool surface — agents should reach for either "create-strict"
-  // (let me know if it's there) or "list-then-decide", not silent-
-  // success-or-409. Strict is the honest contract.
+  // Idempotent semantics — final lock per parity-analyst matrix v0.8
+  // §4.18 (2026-05-04). Routes through `client.ensureSubGraph` which
+  // catches the daemon's 409 on duplicate-name and returns silent
+  // success.
+  //
+  // Rationale (the create-family-wide view): the three `*_create`
+  // tools have asymmetric daemon-side idempotency:
+  //   - dkg_assertion_create   → daemon-idempotent (`alreadyExists: true`)
+  //   - dkg_context_graph_create → daemon-idempotent (returns existing CG)
+  //   - dkg_sub_graph_create   → daemon-strict (409 on duplicate)
+  //
+  // Wrapping the strict one at the client level via `ensureSubGraph`
+  // gives agents a uniform "all *_create tools are safe to retry"
+  // mental model. Adapter parity loses to UX consistency on this one;
+  // matrix v0.8 §4.18 documents the divergence as deliberate.
   server.registerTool(
     'dkg_sub_graph_create',
     {
@@ -170,8 +174,8 @@ export function registerSetupTools(
       description:
         'Create a named sub-graph inside a context graph (an optional ' +
         'partition for scoped assertions, e.g. "code", "tasks", "meta"). ' +
-        'Strict create — the daemon returns an error if a sub-graph with ' +
-        'this name already exists. Names must be lowercase letters, ' +
+        'Idempotent — a pre-existing sub-graph with the same name is ' +
+        'silently reused, no error. Names must be lowercase letters, ' +
         'digits, and hyphens, and must not start with `_`.',
       inputSchema: {
         contextGraphId: z.string().min(1).describe('Parent context graph id'),
@@ -187,11 +191,8 @@ export function registerSetupTools(
       if (!cgId) return errResult('"contextGraphId" is required.');
       if (!sgName) return errResult('"subGraphName" is required.');
       try {
-        const result = await client.createSubGraph({
-          contextGraphId: cgId,
-          subGraphName: sgName,
-        });
-        return ok(`Created sub-graph '${result.created}' in '${result.contextGraphId}'.`);
+        await client.ensureSubGraph(cgId, sgName);
+        return ok(`Sub-graph '${sgName}' ready in '${cgId}'.`);
       } catch (e) {
         return errResult(`Failed to create sub-graph: ${formatError(e)}`);
       }

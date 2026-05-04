@@ -674,6 +674,47 @@ assert config["allow_context_graph_admin_tools"] is True, config
     expect(config).toContain('  retrieval_k: 8');
   });
 
+  it('replaces an empty Hermes provider placeholder instead of shadowing the managed DKG provider', () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    writeFileSync(join(hermesHome, 'config.yaml'), [
+      'model: gpt-5',
+      'memory:',
+      '  memory_enabled: true',
+      "  provider: ''",
+      '  nudge_interval: 10',
+      '',
+    ].join('\n'));
+
+    setupHermesProfile({ hermesHome, memoryMode: 'provider' });
+
+    const config = readFileSync(join(hermesHome, 'config.yaml'), 'utf-8');
+    const providerLines = config.split(/\r?\n/).filter((line) => /^\s+provider\s*:/.test(line));
+    const verify = verifyHermesProfile({ hermesHome, memoryMode: 'provider' });
+    expect(verify.ok).toBe(true);
+    expect(providerLines).toEqual(['  provider: dkg']);
+    expect(config).toContain('  memory_enabled: true');
+    expect(config).toContain('  nudge_interval: 10');
+    expect(config).not.toContain("provider: ''");
+  });
+
+  it('reports config drift when a later provider line overrides the managed DKG provider', () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    setupHermesProfile({ hermesHome, memoryMode: 'provider' });
+    writeFileSync(join(hermesHome, 'config.yaml'), [
+      'memory:',
+      '  # BEGIN DKG ADAPTER HERMES MANAGED',
+      '  provider: dkg',
+      '  # END DKG ADAPTER HERMES MANAGED',
+      "  provider: ''",
+      '',
+    ].join('\n'));
+
+    const verify = verifyHermesProfile({ hermesHome, memoryMode: 'provider' });
+
+    expect(verify.ok).toBe(false);
+    expect(verify.errors.some((error) => error.includes('effective memory.provider: dkg'))).toBe(true);
+  });
+
   it('marks an existing dkg provider line so verify and disconnect own it', () => {
     const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
     writeFileSync(join(hermesHome, 'config.yaml'), 'model: gpt-5\nmemory:\n  provider: dkg\n  retrieval_k: 8\n');

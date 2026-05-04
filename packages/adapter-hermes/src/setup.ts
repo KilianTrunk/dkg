@@ -22,6 +22,7 @@ const PLUGIN_OWNER_FILE = '.dkg-adapter-hermes-owner.json';
 const TOP_LEVEL_MEMORY_BLOCK_RE = /^memory\s*:\s*(?:#.*)?$/;
 const TOP_LEVEL_MEMORY_PROVIDER_RE = /^memory\.provider\s*:\s*["']?([^"'\s#]+)["']?/;
 const INDENTED_PROVIDER_RE = /^(\s+)provider\s*:\s*["']?([^"'\s#]+)["']?/;
+const INDENTED_PROVIDER_LINE_RE = /^(\s+)provider\s*:\s*(?:(["'])(.*?)\2|([^#\s]+))?\s*(?:#.*)?$/;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export interface HermesSetupOptions {
@@ -221,8 +222,13 @@ export function verifyHermesProfile(options: HermesSetupOptions = {}): HermesVer
   if (effectiveMemoryMode === 'provider' && !disconnected) {
     if (!existsSync(profile.configPath)) {
       errors.push(`Hermes provider mode requires config.yaml with managed memory.provider: dkg at ${profile.configPath}`);
-    } else if (!hasManagedDkgProvider(readFileSync(profile.configPath, 'utf-8'))) {
-      errors.push(`Hermes provider mode requires an adapter-managed memory.provider: dkg block in ${profile.configPath}`);
+    } else {
+      const rawConfig = readFileSync(profile.configPath, 'utf-8');
+      if (!hasManagedDkgProvider(rawConfig)) {
+        errors.push(`Hermes provider mode requires an adapter-managed memory.provider: dkg block in ${profile.configPath}`);
+      } else if (findConfiguredMemoryProvider(rawConfig) !== 'dkg') {
+        errors.push(`Hermes provider mode requires effective memory.provider: dkg in ${profile.configPath}`);
+      }
     }
   } else if (effectiveMemoryMode === 'provider' && disconnected) {
     warnings.push('Hermes profile is disconnected; managed memory.provider: dkg is not expected until reconnect.');
@@ -627,6 +633,7 @@ function detectProviderConflict(profile: HermesProfileMetadata, memoryMode: Herm
 function findConfiguredMemoryProvider(raw: string): string | null {
   const lines = raw.split(/\r?\n/);
   let inMemory = false;
+  let provider: string | null = null;
   for (const line of lines) {
     if (TOP_LEVEL_MEMORY_BLOCK_RE.test(line)) {
       inMemory = true;
@@ -636,13 +643,13 @@ function findConfiguredMemoryProvider(raw: string): string | null {
       inMemory = false;
     }
     if (inMemory) {
-      const match = line.match(INDENTED_PROVIDER_RE);
-      if (match) return match[2];
+      const match = readIndentedProviderLine(line);
+      if (match) provider = match.value;
     }
     const inline = line.match(TOP_LEVEL_MEMORY_PROVIDER_RE);
-    if (inline) return inline[1];
+    if (inline) provider = inline[1];
   }
-  return null;
+  return provider;
 }
 
 function hasManagedDkgProvider(raw: string): boolean {
@@ -744,18 +751,65 @@ function appendManagedMemoryBlock(raw: string): string {
 function insertManagedProviderIntoMemoryBlock(raw: string): string {
   const lines = raw.split(/\r?\n/);
   const next: string[] = [];
+  const replaceExistingProvider = hasMemoryProviderLine(raw);
   let inserted = false;
+  let inMemory = false;
   for (const line of lines) {
-    next.push(line);
-    if (!inserted && TOP_LEVEL_MEMORY_BLOCK_RE.test(line)) {
-      const indent = line.match(/^(\s*)/)?.[1] ?? '';
-      next.push(`${indent}  ${CONFIG_BEGIN}`);
-      next.push(`${indent}  provider: dkg`);
-      next.push(`${indent}  ${CONFIG_END}`);
-      inserted = true;
+    if (TOP_LEVEL_MEMORY_BLOCK_RE.test(line)) {
+      inMemory = true;
+      next.push(line);
+      if (!replaceExistingProvider) {
+        const indent = line.match(/^(\s*)/)?.[1] ?? '';
+        next.push(`${indent}  ${CONFIG_BEGIN}`);
+        next.push(`${indent}  provider: dkg`);
+        next.push(`${indent}  ${CONFIG_END}`);
+        inserted = true;
+      }
+      continue;
     }
+    if (inMemory && /^\S/.test(line)) {
+      inMemory = false;
+    }
+    if (replaceExistingProvider && inMemory) {
+      const provider = readIndentedProviderLine(line);
+      if (provider) {
+        if (!inserted) {
+          next.push(`${provider.indent}${CONFIG_BEGIN}`);
+          next.push(`${provider.indent}provider: dkg`);
+          next.push(`${provider.indent}${CONFIG_END}`);
+          inserted = true;
+        }
+        continue;
+      }
+    }
+    next.push(line);
   }
   return next.join('\n');
+}
+
+function hasMemoryProviderLine(raw: string): boolean {
+  const lines = raw.split(/\r?\n/);
+  let inMemory = false;
+  for (const line of lines) {
+    if (TOP_LEVEL_MEMORY_BLOCK_RE.test(line)) {
+      inMemory = true;
+      continue;
+    }
+    if (inMemory && /^\S/.test(line)) {
+      inMemory = false;
+    }
+    if (inMemory && readIndentedProviderLine(line)) return true;
+  }
+  return false;
+}
+
+function readIndentedProviderLine(line: string): { indent: string; value: string } | null {
+  const match = line.match(INDENTED_PROVIDER_LINE_RE);
+  if (!match) return null;
+  return {
+    indent: match[1],
+    value: (match[3] ?? match[4] ?? '').trim(),
+  };
 }
 
 function hasTopLevelMemoryBlock(raw: string): boolean {

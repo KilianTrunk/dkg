@@ -119,19 +119,35 @@ function resolveEntryConfig(api, options = {}) {
   const strongestCurrentDirectApiConfig = currentDirectApiConfigs[currentDirectApiConfigs.length - 1];
   const strongestCurrentDirectApiConfigIsMetadataOnly =
     isStateMetadataOnlyAdapterConfig(strongestCurrentDirectApiConfig);
-  const currentPluginConfigForMetadataDirect =
-    strongestCurrentDirectApiConfigIsMetadataOnly
-      ? stripStateMetadataFromAdapterConfig(currentPluginConfig)
-      : undefined;
+  // T364 round 12 — layer `api.pluginConfig` underneath ANY partial
+  // current direct config, not only the metadata-only case. Pre-fix
+  // `currentPluginConfigForMetadataDirect` was set only when the
+  // strongest direct was state-metadata-only. For a mixed gateway
+  // payload that extracts to a partial overlay (e.g.
+  // `{ workspaceDir, channel: { port: 9801 } }` → `{ channel: { port: 9801 } }`),
+  // the helper returned undefined and `currentDirectApiConfigSources`
+  // collapsed to just the overlay — `api.pluginConfig`'s
+  // `daemonUrl` / `memory.enabled` / `channel.enabled` were dropped on
+  // the floor. Strip state metadata from `pluginConfig` only in the
+  // metadata-only case (so the strongest direct's state metadata
+  // wins via merge order); otherwise pass `pluginConfig` through
+  // verbatim so its base values flow under the partial overlay.
+  const strongestCurrentDirectApiConfigIsPartial =
+    isPartialAdapterConfigOverlay(strongestCurrentDirectApiConfig);
+  const currentPluginConfigForDirectLayering = strongestCurrentDirectApiConfigIsPartial
+    ? (strongestCurrentDirectApiConfigIsMetadataOnly
+        ? stripStateMetadataFromAdapterConfig(currentPluginConfig)
+        : currentPluginConfig)
+    : undefined;
   const currentDirectApiConfigSources =
     hasCurrentDirectApiConfig &&
-    strongestCurrentDirectApiConfigIsMetadataOnly &&
-    isObjectRecord(currentPluginConfigForMetadataDirect)
+    strongestCurrentDirectApiConfigIsPartial &&
+    isObjectRecord(currentPluginConfigForDirectLayering)
       ? [
-          ...(isPartialAdapterConfigOverlay(currentPluginConfigForMetadataDirect)
+          ...(isPartialAdapterConfigOverlay(currentPluginConfigForDirectLayering)
             ? currentDirectApiConfigs.slice(0, -1)
             : currentDirectApiConfigs.slice(0, -1).filter(isStateMetadataOnlyAdapterConfig)),
-          currentPluginConfigForMetadataDirect,
+          currentPluginConfigForDirectLayering,
           strongestCurrentDirectApiConfig,
         ].filter(isObjectRecord)
       : currentDirectApiConfigs;

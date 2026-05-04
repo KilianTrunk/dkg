@@ -1881,6 +1881,47 @@ describe('openclaw-entry', () => {
     expect(instance.workspaceDirsAtRegister[0]).toBe('/real-fallback');
   });
 
+  it('T364 round 12 — partial direct overlay from api.config layers api.pluginConfig underneath instead of dropping it', async () => {
+    // Pre-fix `currentDirectApiConfigSources` only layered
+    // `api.pluginConfig` underneath the strongest direct config when
+    // that direct was strictly state-metadata-only. For a mixed
+    // gateway payload like `{ workspaceDir, channel: { port: 9801 } }`
+    // (extracted to `{ channel: { port: 9801 } }` — partial but NOT
+    // metadata-only), the helper returned `undefined` and the
+    // bootstrap collapsed to just the overlay. `daemonUrl` /
+    // `memory.enabled` / `channel.enabled` from `api.pluginConfig`
+    // were dropped on the floor on first load and re-register.
+    // Post-fix the layering extends to all partial overlays — the
+    // partial direct rides on top of `pluginConfig` via merge order,
+    // and the resulting bootstrap carries all four fields.
+    const entry = await loadEntryWithFakeRuntime();
+    const api = makeDirectPluginConfigApi({
+      // Full pluginConfig — the rest of the adapter config.
+      daemonUrl: 'http://127.0.0.1:9201',
+      memory: { enabled: true },
+      channel: { enabled: true, port: 0 },
+    }, {
+      // Mixed partial overlay (workspaceDir is route metadata; channel
+      // partial is the adapter overlay). After round-6 extraction,
+      // currentDirectApiConfigs contains just `{ channel: { port: 9801 } }`.
+      config: {
+        workspaceDir: '/legacy-workspace',
+        channel: { port: 9801 },
+      },
+    });
+
+    entry(api);
+
+    const instance = globalThis.__openclawEntryTestInstances![0];
+    // Base values from pluginConfig flow through.
+    expect(instance.config.daemonUrl).toBe('http://127.0.0.1:9201');
+    expect(instance.config.memory).toEqual({ enabled: true });
+    // Partial direct overlay layers on top — channel.enabled stays
+    // (from pluginConfig, deep-merged) and channel.port is overridden
+    // (from the partial direct).
+    expect(instance.config.channel).toEqual({ enabled: true, port: 9801 });
+  });
+
   it('T364 round 11 — full current adapter config carries fallback setup metadata into bootstrapConfig', async () => {
     // Pre-fix a "full" current adapter config like `{ daemonUrl,
     // memory, channel }` was classified as `configIsPartial = false`,

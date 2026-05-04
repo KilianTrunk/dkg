@@ -180,8 +180,7 @@ export function registerMemorySearchTool(
         'trust-weighted ranking. Higher-trust layers (VM > SWM > WM) ' +
         'collapse lower-trust hits for the same entity URI. Use this for ' +
         '"ask my memory anything" recall — for ad-hoc SPARQL prefer ' +
-        '`dkg_query`; for keyword search across labels/body in a single ' +
-        'project prefer `dkg_search`.',
+        '`dkg_query`.',
       inputSchema: {
         query: z
           .string()

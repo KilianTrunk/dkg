@@ -120,10 +120,8 @@ for Cursor and Claude Code — only the event wiring differs.
 {
   "version": 1,
   "hooks": {
-    "sessionStart":       [{ "command": "DKG_WORKSPACE=/path/to/repo node /path/to/packages/mcp-dkg/hooks/capture-chat.mjs sessionStart",       "failClosed": false }],
     "beforeSubmitPrompt": [{ "command": "DKG_WORKSPACE=/path/to/repo node /path/to/packages/mcp-dkg/hooks/capture-chat.mjs beforeSubmitPrompt", "failClosed": false }],
-    "afterAgentResponse": [{ "command": "DKG_WORKSPACE=/path/to/repo node /path/to/packages/mcp-dkg/hooks/capture-chat.mjs afterAgentResponse", "failClosed": false }],
-    "sessionEnd":         [{ "command": "DKG_WORKSPACE=/path/to/repo node /path/to/packages/mcp-dkg/hooks/capture-chat.mjs sessionEnd",         "failClosed": false }]
+    "afterAgentResponse": [{ "command": "DKG_WORKSPACE=/path/to/repo node /path/to/packages/mcp-dkg/hooks/capture-chat.mjs afterAgentResponse", "failClosed": false }]
   }
 }
 ```
@@ -139,22 +137,17 @@ user's conversation. Any error is logged to `/tmp/dkg-capture.log`
 
 Merge the following `hooks` block into your existing `~/.claude/settings.json`
 (the capture-chat script handles the native Claude Code event names
-`SessionStart` / `UserPromptSubmit` / `Stop` / `SessionEnd` as aliases):
+`UserPromptSubmit` / `Stop` as aliases for `beforeSubmitPrompt` /
+`afterAgentResponse`):
 
 ```json
 {
   "hooks": {
-    "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "DKG_WORKSPACE=/path/to/repo DKG_CAPTURE_TOOL=claude-code DKG_AGENT_URI=urn:dkg:agent:claude-code-<op> node /path/to/packages/mcp-dkg/hooks/capture-chat.mjs SessionStart" }] }
-    ],
     "UserPromptSubmit": [
       { "hooks": [{ "type": "command", "command": "DKG_WORKSPACE=/path/to/repo DKG_CAPTURE_TOOL=claude-code DKG_AGENT_URI=urn:dkg:agent:claude-code-<op> node /path/to/packages/mcp-dkg/hooks/capture-chat.mjs UserPromptSubmit" }] }
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "DKG_WORKSPACE=/path/to/repo DKG_CAPTURE_TOOL=claude-code DKG_AGENT_URI=urn:dkg:agent:claude-code-<op> node /path/to/packages/mcp-dkg/hooks/capture-chat.mjs Stop" }] }
-    ],
-    "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "DKG_WORKSPACE=/path/to/repo DKG_CAPTURE_TOOL=claude-code DKG_AGENT_URI=urn:dkg:agent:claude-code-<op> node /path/to/packages/mcp-dkg/hooks/capture-chat.mjs SessionEnd" }] }
     ]
   }
 }

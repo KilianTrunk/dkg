@@ -509,21 +509,6 @@ export class DkgClient {
   }
 
   /**
-   * Create a named sub-graph inside a context graph. Strict create — the
-   * daemon returns an error if the sub-graph already exists. Use
-   * `ensureSubGraph` for idempotent semantics.
-   */
-  async createSubGraph(args: {
-    contextGraphId: string;
-    subGraphName: string;
-  }): Promise<{ created: string; contextGraphId: string }> {
-    return this.request('POST', '/api/sub-graph/create', {
-      contextGraphId: args.contextGraphId,
-      subGraphName: args.subGraphName,
-    });
-  }
-
-  /**
    * Final canonical-flow step: publish the current contents of a context
    * graph's Shared Working Memory to Verified Memory (on-chain) and
    * (by default) clear SWM. The daemon route accepts `selection` as

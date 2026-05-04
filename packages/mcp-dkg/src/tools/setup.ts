@@ -121,15 +121,16 @@ export function registerSetupTools(
       description:
         'Subscribe to a context graph so its data syncs locally from ' +
         'peers. Call once before querying or publishing a remotely-' +
-        'authored CG. By default also syncs Shared Working Memory; pass ' +
-        '`includeSharedMemory: false` to skip SWM sync (saves bandwidth ' +
-        'when you only need on-chain data).',
+        'authored CG. Defaults to also syncing Shared Working Memory; ' +
+        'pass `includeSharedMemory: false` to skip SWM sync (saves ' +
+        'bandwidth when you only need on-chain data).',
       inputSchema: {
         contextGraphId: z.string().min(1).describe('Context graph id (e.g. "my-research")'),
         includeSharedMemory: z
           .boolean()
           .optional()
-          .describe('Also sync SWM. Daemon default is true.'),
+          .default(true)
+          .describe('Also sync SWM. Default true.'),
       },
     },
     async ({ contextGraphId, includeSharedMemory }): Promise<ToolResult> => {
@@ -151,12 +152,13 @@ export function registerSetupTools(
   );
 
   // ── dkg_sub_graph_create ────────────────────────────────────────
-  // Strict create (mirrors the adapter's `dkg_sub_graph_create` at
-  // `DkgNodePlugin.ts:2358-2371`). For idempotent "ensure exists"
-  // semantics during sugared writes, mcp-dkg's `client.ensureSubGraph`
-  // handles the duplicate-name 409 internally; this tool exposes the
-  // strict path so agents can pre-stage structure with a clear failure
-  // mode.
+  // Idempotent semantics per audit v1.1 schema-source-of-truth lock:
+  // routes through `client.ensureSubGraph` which swallows the
+  // daemon's "already exists" error so a duplicate-name call is a
+  // no-op rather than a 409. Matches the wave-1 `createAssertion`
+  // pattern (idempotent on duplicate name) and the audit's
+  // recommendation that agents shouldn't hit a confusing failure on
+  // re-run.
   server.registerTool(
     'dkg_sub_graph_create',
     {
@@ -164,9 +166,9 @@ export function registerSetupTools(
       description:
         'Create a named sub-graph inside a context graph (an optional ' +
         'partition for scoped assertions, e.g. "code", "tasks", "meta"). ' +
-        'Strict create — the daemon errors if a sub-graph with this ' +
-        'name already exists. Names must be lowercase letters, digits, ' +
-        'and hyphens, and must not start with `_`.',
+        'Idempotent — a pre-existing sub-graph with the same name is ' +
+        'silently reused, no error. Names must be lowercase letters, ' +
+        'digits, and hyphens, and must not start with `_`.',
       inputSchema: {
         contextGraphId: z.string().min(1).describe('Parent context graph id'),
         subGraphName: z
@@ -181,11 +183,8 @@ export function registerSetupTools(
       if (!cgId) return errResult('"contextGraphId" is required.');
       if (!sgName) return errResult('"subGraphName" is required.');
       try {
-        const result = await client.createSubGraph({
-          contextGraphId: cgId,
-          subGraphName: sgName,
-        });
-        return ok(`Created sub-graph '${result.created}' in '${result.contextGraphId}'.`);
+        await client.ensureSubGraph(cgId, sgName);
+        return ok(`Sub-graph '${sgName}' ready in '${cgId}'.`);
       } catch (e) {
         return errResult(`Failed to create sub-graph: ${formatError(e)}`);
       }

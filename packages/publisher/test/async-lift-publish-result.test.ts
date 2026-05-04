@@ -67,19 +67,22 @@ describe('async lift publish result mapping', () => {
     expect(mapped.finalization?.publisherAddress).toBe('0x1111111111111111111111111111111111111111');
   });
 
-  it('rejects publish results that never reached canonical on-chain submission', () => {
-    expect(() =>
-      mapPublishResultToLiftJobSuccess({
-        walletId: 'wallet-1',
-        publishResult: {
-          kcId: 1n,
-          ual: 'did:dkg:mock:31337/0xabc/1',
-          merkleRoot: new Uint8Array([0xab, 0xcd]),
-          kaManifest: [],
-          status: 'tentative',
-        },
-      }),
-    ).toThrow('Canonical publish returned status tentative without onChainResult');
+  it('maps tentative canonical publish without chain details into included LiftJob state', () => {
+    const mapped = mapPublishResultToLiftJobSuccess({
+      walletId: 'wallet-1',
+      publishResult: {
+        kcId: 0n,
+        ual: 'did:dkg:mock:31337/0xabc/t1',
+        merkleRoot: new Uint8Array([0xab, 0xcd]),
+        kaManifest: [],
+        status: 'tentative',
+      },
+    });
+
+    expect(mapped.status).toBe('included');
+    expect(mapped.broadcast.txHash).toBe('0xabcd');
+    expect(mapped.inclusion.txHash).toBe('0xabcd');
+    expect(mapped.inclusion.blockNumber).toBe(0);
   });
 
   it('rejects failed canonical publish results in the success mapper', () => {

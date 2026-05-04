@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { DKGAgent } from '../src/index.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
+import { TripleStoreAsyncLiftPublisher } from '@origintrail-official/dkg-publisher';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
@@ -194,5 +195,48 @@ describe('publishJsonLd', () => {
       { subject: 'did:dkg:test:X', predicate: 'http://schema.org/name', object: '"X"', graph: '' },
     ]);
     expect(result.status).toBe('confirmed');
+  }, 15000);
+
+  it('async private-only JSON-LD anchors the real private root and enqueues a Lift job', async () => {
+    const { agent, store } = await createAgent('AsyncPrivateOnlyBot');
+    await agent.createContextGraph({ id: 'async-priv-only', name: 'AsyncPrivateOnly', description: '' });
+    const root = 'http://example.org/AsyncSecret';
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-priv-only',
+      {
+        private: {
+          '@context': 'http://schema.org/',
+          '@id': root,
+          '@type': 'Thing',
+          'name': 'Private Async',
+        },
+      },
+      { localOnly: true, accessPolicy: 'allowList', allowedPeers: ['peer-a'] },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.roots).toEqual([root]);
+    expect(job?.request.accessPolicy).toBe('allowList');
+    expect(job?.request.allowedPeers).toEqual(['peer-a']);
+
+    const publicAnchor = await store.query(
+      `ASK { GRAPH <did:dkg:context-graph:async-priv-only/_shared_memory> { <${root}> <http://dkg.io/ontology/privateDataAnchor> "true" } }`,
+    );
+    expect(publicAnchor.type).toBe('boolean');
+    if (publicAnchor.type === 'boolean') expect(publicAnchor.value).toBe(true);
+
+    const publicPayload = await store.query(
+      `ASK { GRAPH <did:dkg:context-graph:async-priv-only/_shared_memory> { <${root}> <http://schema.org/name> "Private Async" } }`,
+    );
+    expect(publicPayload.type).toBe('boolean');
+    if (publicPayload.type === 'boolean') expect(publicPayload.value).toBe(false);
+
+    const privatePayload = await store.query(
+      `ASK { GRAPH <did:dkg:context-graph:async-priv-only/_private> { <${root}> <http://schema.org/name> "Private Async" } }`,
+    );
+    expect(privatePayload.type).toBe('boolean');
+    if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(true);
   }, 15000);
 });

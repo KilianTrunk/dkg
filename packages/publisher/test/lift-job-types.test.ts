@@ -33,6 +33,8 @@ describe('LiftJob request and record types', () => {
       'transitionType',
       'authority',
       'priorVersion',
+      'accessPolicy',
+      'allowedPeers',
     ]);
     expect(LIFT_JOB_IMMUTABLE_FIELDS).toEqual([
       'jobId',

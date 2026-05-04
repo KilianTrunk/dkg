@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { OxigraphStore } from '@origintrail-official/dkg-storage';
-import { GraphManager } from '@origintrail-official/dkg-storage';
+import { GraphManager, OxigraphStore, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter } from '@origintrail-official/dkg-chain';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
 import { ethers } from 'ethers';
@@ -94,6 +93,69 @@ describe('async lift workspace resolution', () => {
     expect(resolved.quads).toHaveLength(2);
     expect(resolved.quads.map((quad) => quad.subject).sort()).toEqual([ENTITY, skolem].sort());
     expect(resolved.publisherPeerId).toBe('peer1');
+  });
+
+  it('resolves private async lift payload by shareOperationId instead of combining root history', async () => {
+    const privateStore = new PrivateContentStore(store, graphManager);
+    const secretPredicate = 'http://schema.org/secret';
+    const write1 = await publisher.share(PARANET, [
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"One"', graph: '' },
+    ], { publisherPeerId: 'peer1' });
+    await privateStore.storePrivateTriplesForOperation(PARANET, write1.shareOperationId, ENTITY, [
+      { subject: ENTITY, predicate: secretPredicate, object: '"first"', graph: '' },
+    ]);
+
+    const write2 = await publisher.share(PARANET, [
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Two"', graph: '' },
+    ], { publisherPeerId: 'peer1' });
+    await privateStore.storePrivateTriplesForOperation(PARANET, write2.shareOperationId, ENTITY, [
+      { subject: ENTITY, predicate: secretPredicate, object: '"second"', graph: '' },
+    ]);
+
+    const resolved = await resolveLiftWorkspaceSlice({
+      store,
+      graphManager,
+      request: {
+        swmId: 'swm-main',
+        shareOperationId: write2.shareOperationId,
+        roots: [ENTITY],
+        contextGraphId: PARANET,
+        namespace: 'aloha',
+        scope: 'person-profile',
+        transitionType: 'CREATE',
+        authority: { type: 'owner', proofRef: 'proof:owner:1' },
+      },
+    });
+
+    expect(resolved.privateQuads).toEqual([
+      { subject: ENTITY, predicate: secretPredicate, object: '"second"', graph: '' },
+    ]);
+  });
+
+  it('carries Lift request access policy into resolved publish options', async () => {
+    const write = await publisher.share(PARANET, [
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"One"', graph: '' },
+    ], { publisherPeerId: 'peer1' });
+
+    const resolved = await resolveLiftWorkspaceSlice({
+      store,
+      graphManager,
+      request: {
+        swmId: 'swm-main',
+        shareOperationId: write.shareOperationId,
+        roots: [ENTITY],
+        contextGraphId: PARANET,
+        namespace: 'aloha',
+        scope: 'person-profile',
+        transitionType: 'CREATE',
+        authority: { type: 'owner', proofRef: 'proof:owner:1' },
+        accessPolicy: 'allowList',
+        allowedPeers: ['peer-a', 'peer-b'],
+      },
+    });
+
+    expect(resolved.accessPolicy).toBe('allowList');
+    expect(resolved.allowedPeers).toEqual(['peer-a', 'peer-b']);
   });
 
   it('resolves a LiftRequest slice with the renamed fields', async () => {

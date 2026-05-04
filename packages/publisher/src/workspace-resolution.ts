@@ -1,5 +1,5 @@
 import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
-import { GraphManager } from '@origintrail-official/dkg-storage';
+import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { assertSafeIri, isSafeIri } from '@origintrail-official/dkg-core';
 import type { LiftRequest } from './lift-job.js';
 import type { LiftResolvedPublishSlice } from './async-lift-publish-options.js';
@@ -108,6 +108,14 @@ export async function resolveLiftWorkspaceSlice(params: {
     contextGraphId: request.contextGraphId,
     selection: { rootEntities: requestedRoots },
   });
+  const privateStore = new PrivateContentStore(params.store, params.graphManager);
+  const privateQuads = (
+    await Promise.all(
+      requestedRoots.map((root) =>
+        privateStore.getPrivateTriplesForOperation(request.contextGraphId, shareOperationId, root),
+      ),
+    )
+  ).flat();
 
   const publishContextGraphId = await resolveOnChainContextGraphId({
     store: params.store,
@@ -116,7 +124,10 @@ export async function resolveLiftWorkspaceSlice(params: {
 
   return {
     quads,
+    privateQuads: privateQuads.length > 0 ? privateQuads : undefined,
     publisherPeerId: operation.publisherPeerId,
+    accessPolicy: request.accessPolicy,
+    allowedPeers: request.allowedPeers ? [...request.allowedPeers] : undefined,
     publishContextGraphId,
   };
 }

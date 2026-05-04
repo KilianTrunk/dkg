@@ -30,8 +30,12 @@
     "sim": "pnpm --filter @origintrail-official/dkg-network-sim dev",
     "sim:testnet": "SIM_TARGET=testnet pnpm --filter @origintrail-official/dkg-network-sim dev",
     "sim:build": "pnpm --filter @origintrail-official/dkg-network-sim build",
+<<<<<<< HEAD
     "mcp": "node packages/mcp-server/dist/index.js",
     "check:npm-metadata": "node scripts/check-npm-metadata.mjs",
+=======
+    "mcp": "node packages/cli/dist/cli.js mcp serve",
+>>>>>>> abc1a35a (chore(v10-mcp): align CI + CLAUDE.md + package metadata for mcp-server deletion)
     "index": "node packages/cli/dist/cli.js index",
     "test:evm-integration": "./scripts/test-evm-integration.sh",
     "test:evm": "./scripts/test-evm-integration.sh all",

@@ -276,4 +276,165 @@ export function registerAssertionTools(
       }
     },
   );
+
+  // ── dkg_assertion_import_file ───────────────────────────────────
+  // Wave-2 P1 add (audit §7 item 4). Wraps
+  // `POST /api/assertion/{name}/import-file` (multipart/form-data) —
+  // the daemon's extraction pipeline turns markdown / PDF / DOCX /
+  // etc. into RDF triples and writes them into the assertion's graph.
+  server.registerTool(
+    'dkg_assertion_import_file',
+    {
+      title: 'Import File into Assertion',
+      description:
+        'Import a local document (markdown, PDF, DOCX, etc.) into a ' +
+        'Working Memory assertion: the daemon runs its extraction ' +
+        'pipeline and writes the resulting triples. text/markdown is ' +
+        'native; other types need a registered converter (extraction ' +
+        'returns `status: "skipped"` if none). Useful for seeding a ' +
+        'context graph from existing documents in a single step.',
+      inputSchema: {
+        name: z.string().describe('Target assertion name'),
+        filePath: z.string().describe('Absolute local path to the file to import'),
+        projectId: z.string().optional(),
+        contentType: z
+          .string()
+          .optional()
+          .describe(
+            'MIME override (e.g. "text/markdown", "application/pdf"). Inferred from extension when omitted.',
+          ),
+        ontologyRef: z
+          .string()
+          .optional()
+          .describe('Optional ontology URI to guide extraction'),
+        subGraphName: z.string().optional(),
+      },
+    },
+    async ({
+      name,
+      filePath,
+      projectId,
+      contentType,
+      ontologyRef,
+      subGraphName,
+    }): Promise<ToolResult> => {
+      const pid = resolveProject(projectId, config);
+      if (!pid) return projectErr();
+      const trimmedPath = filePath.trim();
+      if (!trimmedPath) return errResult('"filePath" is required.');
+
+      // Load the file lazily — `node:fs/promises` is import-on-demand
+      // so the bare stdio MCP server doesn't pay the disk-I/O cost
+      // unless this tool actually fires.
+      let fileBuffer: Buffer;
+      let fileName: string;
+      try {
+        const { readFile } = await import('node:fs/promises');
+        const { basename } = await import('node:path');
+        fileBuffer = await readFile(trimmedPath);
+        fileName = basename(trimmedPath);
+      } catch (e) {
+        return errResult(
+          `Failed to read file at "${trimmedPath}": ${formatError(e)}`,
+        );
+      }
+
+      // Extension-based MIME inference. Mirrors the adapter's
+      // `inferContentTypeFromExtension` (`DkgNodePlugin.ts:3544+`)
+      // for cross-surface parity. Unmatched extensions fall through
+      // to the daemon's `application/octet-stream` default; callers
+      // can still override via `contentType`.
+      let effectiveContentType = contentType;
+      if (!effectiveContentType) {
+        const ext = fileName.split('.').pop()?.toLowerCase();
+        const inferred = ext
+          ? {
+              md: 'text/markdown',
+              markdown: 'text/markdown',
+              pdf: 'application/pdf',
+              docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              html: 'text/html',
+              htm: 'text/html',
+              txt: 'text/plain',
+              csv: 'text/csv',
+            }[ext]
+          : undefined;
+        if (inferred) effectiveContentType = inferred;
+      }
+
+      try {
+        const result = await client.importAssertionFile({
+          contextGraphId: pid,
+          assertionName: name,
+          fileBuffer,
+          fileName,
+          contentType: effectiveContentType,
+          ontologyRef,
+          subGraphName,
+        });
+        const extraction = (result as Record<string, unknown>).extraction as
+          | Record<string, unknown>
+          | undefined;
+        const status = extraction?.status ?? '(unknown)';
+        const tripleCount = extraction?.tripleCount;
+        const lines = [
+          `Imported '${fileName}' into assertion '${name}' (project '${pid}').`,
+          `Extraction status: ${status}` +
+            (typeof tripleCount === 'number' ? ` · ${tripleCount} triple(s)` : ''),
+          effectiveContentType ? `Content type: ${effectiveContentType}` : null,
+        ]
+          .filter((line): line is string => line !== null)
+          .join('\n');
+        return ok(lines);
+      } catch (e) {
+        return errResult(`Failed to import file: ${formatError(e)}`);
+      }
+    },
+  );
+
+  // ── dkg_assertion_history ───────────────────────────────────────
+  // Wave-2 P3 add (audit §7 item 12). Wraps
+  // `GET /api/assertion/{name}/history` — lifecycle introspection.
+  server.registerTool(
+    'dkg_assertion_history',
+    {
+      title: 'Assertion History',
+      description:
+        "Fetch an assertion's lifecycle descriptor: author, " +
+        'extraction status, promotion state, timestamps. Returns a ' +
+        '404 (surfaced as a tool error) if no record exists for the ' +
+        '(contextGraphId, name, agentAddress) tuple. Useful for ' +
+        'debug/audit; not required for the canonical write flow.',
+      inputSchema: {
+        name: z.string().describe('Assertion name'),
+        projectId: z.string().optional(),
+        agentAddress: z
+          .string()
+          .optional()
+          .describe("Optional author — defaults to this node's agent address"),
+        subGraphName: z.string().optional(),
+      },
+    },
+    async ({ name, projectId, agentAddress, subGraphName }): Promise<ToolResult> => {
+      const pid = resolveProject(projectId, config);
+      if (!pid) return projectErr();
+      try {
+        const result = await client.getAssertionHistory({
+          contextGraphId: pid,
+          assertionName: name,
+          agentAddress,
+          subGraphName,
+        });
+        return ok(
+          `History for assertion '${name}' (project '${pid}'):\n\n\`\`\`json\n${JSON.stringify(
+            result,
+            null,
+            2,
+          )}\n\`\`\``,
+        );
+      } catch (e) {
+        return errResult(`Failed to fetch assertion history: ${formatError(e)}`);
+      }
+    },
+  );
 }

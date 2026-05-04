@@ -373,6 +373,227 @@ export class DkgClient {
       body,
     );
   }
+
+  /**
+   * Lifecycle descriptor for an assertion: author, extraction status,
+   * promotion state, timestamps. Returns 404 (`DkgHttpError`) when no
+   * record exists for the (contextGraphId, name, agentAddress) tuple.
+   */
+  async getAssertionHistory(args: {
+    contextGraphId: string;
+    assertionName: string;
+    agentAddress?: string;
+    subGraphName?: string;
+  }): Promise<Record<string, unknown>> {
+    const params = new URLSearchParams({ contextGraphId: args.contextGraphId });
+    if (args.agentAddress) params.set('agentAddress', args.agentAddress);
+    if (args.subGraphName) params.set('subGraphName', args.subGraphName);
+    return this.request(
+      'GET',
+      `/api/assertion/${encodeURIComponent(args.assertionName)}/history?${params.toString()}`,
+    );
+  }
+
+  /**
+   * Import a local document (markdown, PDF, etc.) into a WM assertion via
+   * multipart/form-data. The daemon runs its extraction pipeline and writes
+   * the resulting triples into the assertion's graph. text/markdown is
+   * native; other types need a registered converter (extraction returns
+   * `status: "skipped"` if none).
+   *
+   * Bypasses the JSON `request()` helper because multipart bodies need
+   * `FormData` rather than `JSON.stringify`. The auth header and base URL
+   * shape match `request()` so behaviour stays consistent.
+   */
+  async importAssertionFile(args: {
+    contextGraphId: string;
+    assertionName: string;
+    fileBuffer: Buffer | Uint8Array;
+    fileName: string;
+    contentType?: string;
+    ontologyRef?: string;
+    subGraphName?: string;
+  }): Promise<Record<string, unknown>> {
+    const form = new FormData();
+    // Copy into a fresh Uint8Array to satisfy TS's BlobPart union across
+    // Node Buffer / SharedArrayBuffer.
+    const bytes = new Uint8Array(args.fileBuffer.byteLength);
+    bytes.set(args.fileBuffer);
+    const blob = new Blob([bytes], {
+      type: args.contentType ?? 'application/octet-stream',
+    });
+    form.append('file', blob, args.fileName);
+    form.append('contextGraphId', args.contextGraphId);
+    if (args.contentType) form.append('contentType', args.contentType);
+    if (args.ontologyRef) form.append('ontologyRef', args.ontologyRef);
+    if (args.subGraphName) form.append('subGraphName', args.subGraphName);
+
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (this.token) headers.Authorization = `Bearer ${this.token}`;
+    const res = await this.fetcher(
+      `${this.api}/api/assertion/${encodeURIComponent(args.assertionName)}/import-file`,
+      {
+        method: 'POST',
+        headers,
+        body: form,
+      },
+    );
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      let parsed: unknown = text;
+      try { parsed = JSON.parse(text); } catch { /* leave as raw text */ }
+      throw new DkgHttpError(
+        res.status,
+        parsed,
+        `POST /api/assertion/${args.assertionName}/import-file → ${res.status}: ${text}`,
+      );
+    }
+    return res.json() as Promise<Record<string, unknown>>;
+  }
+
+  /**
+   * Node status: peer ID, connected peers, multiaddrs, wallet addresses.
+   * Wraps `GET /api/status` (the same endpoint the OpenClaw adapter calls
+   * at `getFullStatus`).
+   */
+  async getStatus(): Promise<Record<string, unknown>> {
+    return this.request('GET', '/api/status');
+  }
+
+  /**
+   * Per-wallet TRAC + ETH balances + chain context. Wraps
+   * `GET /api/wallets/balances` — pre-publish "do I have funds" check.
+   */
+  async getWalletBalances(): Promise<{
+    wallets: string[];
+    balances: Array<{ address: string; eth: string; trac: string; symbol: string }>;
+    chainId: string | null;
+    rpcUrl: string | null;
+    error?: string;
+  }> {
+    return this.request('GET', '/api/wallets/balances');
+  }
+
+  /**
+   * Subscribe to a context graph so its data syncs locally. Required
+   * before querying or publishing into a remotely-authored CG.
+   */
+  async subscribe(args: {
+    contextGraphId: string;
+    includeSharedMemory?: boolean;
+  }): Promise<{
+    subscribed: string;
+    catchup?: { jobId: string; status: string; includeSharedMemory: boolean };
+  }> {
+    return this.request('POST', '/api/subscribe', {
+      contextGraphId: args.contextGraphId,
+      includeSharedMemory: args.includeSharedMemory,
+    });
+  }
+
+  /**
+   * Create a new context graph on the DKG node. The `id` is the slug; if
+   * omitted at the tool layer it should be derived from `name` before
+   * being passed through. Wraps `POST /api/context-graph/create`.
+   */
+  async createContextGraph(args: {
+    id: string;
+    name: string;
+    description?: string;
+  }): Promise<{ created: string; uri: string }> {
+    return this.request('POST', '/api/context-graph/create', {
+      id: args.id,
+      name: args.name,
+      description: args.description,
+    });
+  }
+
+  /**
+   * Create a named sub-graph inside a context graph. Strict create — the
+   * daemon returns an error if the sub-graph already exists. Use
+   * `ensureSubGraph` for idempotent semantics.
+   */
+  async createSubGraph(args: {
+    contextGraphId: string;
+    subGraphName: string;
+  }): Promise<{ created: string; contextGraphId: string }> {
+    return this.request('POST', '/api/sub-graph/create', {
+      contextGraphId: args.contextGraphId,
+      subGraphName: args.subGraphName,
+    });
+  }
+
+  /**
+   * Final canonical-flow step: publish the current contents of a context
+   * graph's Shared Working Memory to Verified Memory (on-chain) and
+   * (by default) clear SWM. The daemon route accepts `selection` as
+   * either the literal `"all"` or an array of root entity URIs — this
+   * wrapper exposes the latter as `rootEntities` and translates the
+   * omit-case to `"all"` server-side.
+   *
+   * Default `clearAfter` is `false` for subset publishes (so unpublished
+   * roots aren't dropped from SWM) and `true` for full publishes.
+   * Mirrors `packages/adapter-openclaw/src/dkg-client.ts:664-680`.
+   */
+  async publishSharedMemory(args: {
+    contextGraphId: string;
+    rootEntities?: string[];
+    subGraphName?: string;
+    clearAfter?: boolean;
+  }): Promise<Record<string, unknown>> {
+    const hasSubset = Array.isArray(args.rootEntities) && args.rootEntities.length > 0;
+    const clearAfter = args.clearAfter ?? !hasSubset;
+    return this.request('POST', '/api/shared-memory/publish', {
+      contextGraphId: args.contextGraphId,
+      selection: args.rootEntities ?? 'all',
+      clearAfter,
+      subGraphName: args.subGraphName,
+    });
+  }
+
+  /**
+   * Two-call publish helper: write quads into Shared Working Memory, then
+   * publish the entire SWM and clear it. Use for the "I have fresh quads,
+   * publish them now" case. For the canonical step-wise flow
+   * (`assertion_create + write + promote` then `shared_memory_publish`),
+   * use those tools directly.
+   *
+   * Mirrors `packages/adapter-openclaw/src/dkg-client.ts:635-652`.
+   */
+  async publishQuads(args: {
+    contextGraphId: string;
+    quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>;
+  }): Promise<Record<string, unknown>> {
+    await this.request('POST', '/api/shared-memory/write', {
+      contextGraphId: args.contextGraphId,
+      quads: args.quads,
+    });
+    return this.request('POST', '/api/shared-memory/publish', {
+      contextGraphId: args.contextGraphId,
+      selection: 'all',
+      clearAfter: true,
+    });
+  }
+
+  /**
+   * Register a context graph on-chain. Used in conjunction with
+   * `publishSharedMemory({ ... })` when `register_if_needed: true`.
+   * The CG must exist locally first (via `createContextGraph`).
+   */
+  async registerContextGraph(args: {
+    id: string;
+    accessPolicy?: number;
+  }): Promise<{
+    registered: string;
+    onChainId: string;
+    txHash?: string;
+    hint?: string;
+  }> {
+    return this.request('POST', '/api/context-graph/register', {
+      id: args.id,
+      accessPolicy: args.accessPolicy,
+    });
+  }
 }
 
 /**

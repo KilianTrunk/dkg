@@ -1,0 +1,256 @@
+/**
+ * Publish tools — Shared Working Memory writes / on-chain finalization.
+ *
+ * Wave-2 P1 adds (audit §7 items 2 + 3). Two distinct surfaces, both
+ * documented in SKILL.md §4a:
+ *
+ *   - `dkg_publish` — "I have fresh quads, publish them now" one-shot.
+ *     Two-call helper: writes the quads to SWM, then publishes the
+ *     entire SWM to Verified Memory and clears SWM.
+ *
+ *   - `dkg_shared_memory_publish` — canonical Step 5 finalizer for the
+ *     stepwise flow (`assertion_create + write + promote` then this).
+ *     UNGATED per matrix v0.6 / user lock 2026-04-30 — no
+ *     `agent.canPublishToVm` flag; matches the OpenClaw adapter shape
+ *     exactly.
+ *
+ * Both call the same daemon endpoints
+ * (`POST /api/shared-memory/{write,publish}`); the difference is in
+ * the input shape — `dkg_publish` accepts fresh quads, while
+ * `dkg_shared_memory_publish` consumes existing SWM (filterable by
+ * `rootEntities`) and clears as a side-effect.
+ */
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { z } from 'zod';
+import type { DkgClient } from '../client.js';
+import type { DkgConfig } from '../config.js';
+
+type ToolResult = {
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+};
+
+const ok = (text: string): ToolResult => ({ content: [{ type: 'text', text }] });
+const errResult = (text: string): ToolResult => ({
+  content: [{ type: 'text', text }],
+  isError: true,
+});
+
+const formatError = (e: unknown): string =>
+  e instanceof Error ? e.message : String(e);
+
+/**
+ * URI auto-detection for object terms — matches the adapter's `isUri`
+ * at `DkgNodePlugin.ts:3468-3470`. Anything starting with http://,
+ * https://, urn:, or did: is treated as a URI; anything else gets
+ * wrapped as a literal at the wire boundary.
+ */
+function isUri(value: string): boolean {
+  return /^(?:https?:\/\/|urn:|did:)/i.test(value);
+}
+
+/**
+ * Escape literal-text inside an RDF object term. Mirrors the adapter's
+ * literal-handling in `handlePublish` so SWM writes from either surface
+ * produce identical triples.
+ */
+function escapeRdfLiteral(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
+}
+
+const QuadSchema = z.object({
+  subject: z.string().min(1).describe('Subject URI'),
+  predicate: z.string().min(1).describe('Predicate URI'),
+  object: z
+    .string()
+    .describe(
+      'Object — URI or literal. Auto-detected: values starting with http://, https://, urn:, or did: pass as URIs; anything else becomes a literal.',
+    ),
+  graph: z.string().optional().describe('Optional named graph URI'),
+});
+
+export function registerPublishTools(
+  server: McpServer,
+  client: DkgClient,
+  _config: DkgConfig,
+): void {
+  // ── dkg_publish ─────────────────────────────────────────────────
+  server.registerTool(
+    'dkg_publish',
+    {
+      title: 'Publish Fresh Quads',
+      description:
+        'One-shot write + publish helper: writes the supplied quads to ' +
+        'Shared Working Memory, then publishes the entire SWM in the CG ' +
+        'to Verified Memory (on-chain) and clears SWM. For the canonical ' +
+        'step-wise flow (write → promote → publish) use ' +
+        '`dkg_assertion_create / write / promote` followed by ' +
+        '`dkg_shared_memory_publish` — that path keeps WM as a draft ' +
+        'staging area before SWM. Use `dkg_publish` only when you have ' +
+        'fresh quads to anchor immediately.',
+      inputSchema: {
+        contextGraphId: z.string().min(1).describe('Target context graph id'),
+        quads: z
+          .array(QuadSchema)
+          .min(1)
+          .describe(
+            'Non-empty array of quads to publish. Object values are auto-typed (URI vs literal).',
+          ),
+      },
+    },
+    async ({ contextGraphId, quads }): Promise<ToolResult> => {
+      const cgId = contextGraphId.trim();
+      if (!cgId) return errResult('"contextGraphId" is required.');
+      if (!quads.length) {
+        return errResult('"quads" must be a non-empty array.');
+      }
+      // Auto-type the object: URI vs literal. Mirrors the adapter's
+      // handlePublish at `DkgNodePlugin.ts:2721-2729` byte-for-byte so
+      // a memory written via either surface lands as identical triples.
+      const wireQuads = quads.map((q) => {
+        const objVal = String(q.object ?? '');
+        return {
+          subject: String(q.subject ?? ''),
+          predicate: String(q.predicate ?? ''),
+          object: isUri(objVal) ? objVal : `"${escapeRdfLiteral(objVal)}"`,
+          graph: q.graph ? String(q.graph) : '',
+        };
+      });
+      try {
+        const result = await client.publishQuads({
+          contextGraphId: cgId,
+          quads: wireQuads,
+        });
+        const kcId = (result as Record<string, unknown>).kcId as string | undefined;
+        const kas = (result as Record<string, unknown>).kas as
+          | Array<{ tokenId: string; rootEntity: string }>
+          | undefined;
+        const txHash = (result as Record<string, unknown>).txHash as string | undefined;
+        const summary = [
+          `Published ${wireQuads.length} quad(s) to '${cgId}'.`,
+          kcId ? `KC: ${kcId}` : null,
+          kas?.length ? `KAs: ${kas.length}` : null,
+          txHash ? `Tx: ${txHash}` : null,
+        ]
+          .filter((line): line is string => line !== null)
+          .join('\n');
+        return ok(summary);
+      } catch (e) {
+        return errResult(`Publish failed: ${formatError(e)}`);
+      }
+    },
+  );
+
+  // ── dkg_shared_memory_publish ───────────────────────────────────
+  server.registerTool(
+    'dkg_shared_memory_publish',
+    {
+      title: 'Publish Shared Working Memory',
+      description:
+        'Final step of the canonical write flow. Publish all Shared ' +
+        'Working Memory in a context graph to Verified Memory (on-chain) ' +
+        'and clear SWM. Use after `dkg_assertion_promote` to finalize ' +
+        'promoted data. Pass `rootEntities` to publish only specific ' +
+        'roots (subset publishes default to NOT clearing SWM, so other ' +
+        'unpublished roots are not dropped). Set `registerIfNeeded: ' +
+        'true` to upgrade a local-only CG to on-chain registration before ' +
+        'publishing — note this MAY spend gas/TRAC; opt-in only.',
+      inputSchema: {
+        contextGraphId: z.string().min(1).describe('Target context graph id'),
+        rootEntities: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'Optional filter — publish only these root entity URIs. Omit to publish all SWM in the CG.',
+          ),
+        subGraphName: z
+          .string()
+          .optional()
+          .describe(
+            'Optional sub-graph scope. Must match the sub-graph used during create/write/promote.',
+          ),
+        registerIfNeeded: z
+          .boolean()
+          .optional()
+          .describe(
+            'When true, register the CG on-chain before publishing if needed. May spend gas/TRAC; opt-in only.',
+          ),
+        accessPolicy: z
+          .union([z.literal(0), z.literal(1)])
+          .optional()
+          .describe(
+            'Used only when `registerIfNeeded: true`. 0 = open, 1 = private.',
+          ),
+      },
+    },
+    async ({
+      contextGraphId,
+      rootEntities,
+      subGraphName,
+      registerIfNeeded,
+      accessPolicy,
+    }): Promise<ToolResult> => {
+      const cgId = contextGraphId.trim();
+      if (!cgId) return errResult('"contextGraphId" is required.');
+      // Mirror handleAssertionPromote's `entities` validation: omit →
+      // daemon-side default (selection="all"); non-empty array of
+      // strings only — no other shapes silently 400 at the daemon.
+      let roots: string[] | undefined;
+      if (rootEntities !== undefined) {
+        if (!Array.isArray(rootEntities) || rootEntities.length === 0) {
+          return errResult(
+            '"rootEntities" must be omitted or a non-empty array of root entity URIs.',
+          );
+        }
+        roots = rootEntities;
+      }
+
+      // Optional on-chain registration before publish. Tolerates the
+      // "already registered" case (just publishes); other failures
+      // propagate as tool errors.
+      let registration: Record<string, unknown> | undefined;
+      if (registerIfNeeded === true) {
+        try {
+          registration = await client.registerContextGraph({
+            id: cgId,
+            accessPolicy,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (!message.includes('already registered')) {
+            return errResult(`Failed to register context graph: ${message}`);
+          }
+        }
+      }
+
+      try {
+        const result = await client.publishSharedMemory({
+          contextGraphId: cgId,
+          rootEntities: roots,
+          subGraphName,
+        });
+        const kcId = result.kcId as string | undefined;
+        const kas = result.kas as Array<{ tokenId: string; rootEntity: string }> | undefined;
+        const txHash = result.txHash as string | undefined;
+        const summary = [
+          `Published ${cgId}'s SWM to Verified Memory.`,
+          roots ? `Roots: ${roots.length}` : 'Selection: all',
+          kcId ? `KC: ${kcId}` : null,
+          kas?.length ? `KAs: ${kas.length}` : null,
+          txHash ? `Tx: ${txHash}` : null,
+          registration ? `Registered on-chain: ${registration.onChainId ?? '(unknown)'}` : null,
+        ]
+          .filter((line): line is string => line !== null)
+          .join('\n');
+        return ok(summary);
+      } catch (e) {
+        return errResult(`Publish failed: ${formatError(e)}`);
+      }
+    },
+  );
+}

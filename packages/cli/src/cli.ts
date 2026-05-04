@@ -2610,7 +2610,7 @@ program
       const chainResolved = resolveChainConfig(config, network);
       const rpcUrl = chainResolved?.rpcUrl;
       const hubAddress = chainResolved?.hubAddress;
-      const tokenAddress = config.chain?.tokenAddress ?? network?.chain?.tokenAddress;
+      const tokenAddress = chainResolved?.tokenAddress;
       const chainId = chainResolved?.chainId ?? '(unknown)';
 
       let provider: ethers.JsonRpcProvider | null = null;

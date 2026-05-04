@@ -620,7 +620,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     }
     try {
       const provider = new ethers.JsonRpcProvider(rpcUrl);
-      const tokenAddr = config.chain?.tokenAddress
+      const tokenAddr = chain?.tokenAddress
         ?? (await new ethers.Contract(
           hubAddress,
           ["function getContractAddress(string) view returns (address)"],

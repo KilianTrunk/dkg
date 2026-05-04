@@ -532,6 +532,8 @@ export function resolveChainConfig(
   if (rpcUrl !== undefined) merged.rpcUrl = rpcUrl;
   const hubAddress = cfg?.hubAddress ?? net?.hubAddress;
   if (hubAddress !== undefined) merged.hubAddress = hubAddress;
+  const tokenAddress = cfg?.tokenAddress ?? net?.tokenAddress;
+  if (tokenAddress !== undefined) merged.tokenAddress = tokenAddress;
   const chainId = cfg?.chainId ?? net?.chainId;
   if (chainId !== undefined) merged.chainId = chainId;
   if (cfg?.mockIdentityId !== undefined) merged.mockIdentityId = cfg.mockIdentityId;

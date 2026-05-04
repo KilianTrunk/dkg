@@ -95,7 +95,7 @@ describe('async lift workspace resolution', () => {
     expect(resolved.publisherPeerId).toBe('peer1');
   });
 
-  it('resolves private async lift payload by shareOperationId instead of combining root history', async () => {
+  it('resolves public and private async lift payloads by shareOperationId instead of combining root history', async () => {
     const privateStore = new PrivateContentStore(store, graphManager);
     const secretPredicate = 'http://schema.org/secret';
     const write1 = await publisher.share(PARANET, [
@@ -117,7 +117,7 @@ describe('async lift workspace resolution', () => {
       graphManager,
       request: {
         swmId: 'swm-main',
-        shareOperationId: write2.shareOperationId,
+        shareOperationId: write1.shareOperationId,
         roots: [ENTITY],
         contextGraphId: PARANET,
         namespace: 'aloha',
@@ -127,8 +127,22 @@ describe('async lift workspace resolution', () => {
       },
     });
 
+    expect(resolved.quads).toEqual([
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"One"', graph: '' },
+    ]);
     expect(resolved.privateQuads).toEqual([
-      { subject: ENTITY, predicate: secretPredicate, object: '"second"', graph: '' },
+      { subject: ENTITY, predicate: secretPredicate, object: '"first"', graph: '' },
+    ]);
+    expect(resolved.publisherPeerId).toBe('peer1');
+
+    const liveQuads = await resolveWorkspaceSelection({
+      store,
+      graphManager,
+      contextGraphId: PARANET,
+      selection: { rootEntities: [ENTITY] },
+    });
+    expect(liveQuads).toEqual([
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Two"', graph: '' },
     ]);
   });
 

@@ -244,22 +244,27 @@ export class DKGPublisher implements Publisher {
       this.publisherWallet = new ethers.Wallet(config.publisherPrivateKey);
       this.publisherAddress = this.publisherWallet.address;
     } else {
-      // No private key supplied → no in-process signing capability. The
-      // publish-time paths that need a `publisherWallet` to produce a
-      // signature (V10 self-sign ACK at L1237, the on-chain `publishDirect`
-      // signature at L1276, and the per-KA authorship proofs at L1444)
-      // are explicitly gated on `if (this.publisherWallet)` and degrade
-      // safely when absent. Other on-chain entry points (`update()`,
-      // `chain.updateKnowledgeCollectionV10` / `updateKnowledgeAssets`)
-      // delegate signing to the chain adapter's own signer pool and
-      // therefore do not require this wallet at all.
+      // No private key supplied → no in-process signing capability. Three
+      // call sites inside `publishFromSharedMemory` need `publisherWallet`
+      // to produce a signature:
+      //   1. the V10 self-signed ACK fallback (when no peer ACKs were
+      //      collected for the publish),
+      //   2. the on-chain `publishDirect` publisher signature, and
+      //   3. the per-KA authorship-proof loop (spec §9.0.6).
+      // All three are guarded by `if (this.publisherWallet)` and degrade
+      // safely when absent. Other on-chain entry points — `update()` and
+      // its `chain.updateKnowledgeCollectionV10` / `updateKnowledgeAssets`
+      // descendants — delegate signing to the chain adapter's own signer
+      // pool and never touch this field, so they're unaffected.
       //
       // The previous behaviour generated an ephemeral `Wallet.createRandom()`
       // here whenever chain was enabled, which produced unverifiable
       // signatures attributed to a throw-away address — actively misleading
       // callers that supplied `publisherAddress` separately. See PR #371 for
       // the testnet-blocking incident chain (`ensureProfile` had the same
-      // anti-pattern, fixed in PR #366).
+      // anti-pattern, fixed in PR #366). A future enhancement could fall
+      // back to `chain.signMessage` for the publish-time paths so adapter-
+      // owned signers can still confirm publishes; tracked in #373.
       this.publisherAddress = config.publisherAddress ?? '0x' + '0'.repeat(40);
     }
 

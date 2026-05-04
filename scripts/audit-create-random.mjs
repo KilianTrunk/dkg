@@ -23,10 +23,12 @@
  *
  * What it does
  * ------------
- * Walks every `.ts` / `.js` source file under `packages/*\/src/**` and fails
- * if it finds `Wallet.createRandom(` outside the explicitly allowlisted
- * call sites below. Each allowlist entry has a one-line justification —
- * if you need to add a new one, justify it in code review.
+ * Walks every `.ts` / `.tsx` / `.mts` / `.cts` / `.js` / `.jsx` / `.mjs` /
+ * `.cjs` source file under `packages/*\/{src,utils}/**` and fails if it
+ * finds `Wallet.createRandom(` outside the explicitly allowlisted call
+ * sites below. Each allowlist entry pins ONE expected hit with a one-line
+ * justification — adding a second `createRandom()` to the same file does
+ * NOT inherit the existing exemption and must be reviewed on its own.
  *
  * What's allowed
  * --------------
@@ -41,6 +43,19 @@
  *
  * Tests are excluded — they routinely use random keys for fixtures and
  * never run against real chains.
+ *
+ * Bypass-resistance notes
+ * -----------------------
+ *   - Whole-file scan after stripping `//` line comments and `/* … *​/`
+ *     block comments, so split invocations like `Wallet\n.createRandom()`
+ *     or `Wallet /* … *​/.createRandom()` cannot bypass the regex by
+ *     formatting.
+ *   - Per-hit allowlist (not per-file): an extra `createRandom()` call
+ *     added to an already-exempt file fails CI and must be justified.
+ *   - String literals containing `//` or `/​*` are treated as comments.
+ *     Acceptable false-negative scope: a string containing
+ *     `"Wallet.createRandom("` would slip past, but that pattern is
+ *     trivially obvious in code review.
  */
 
 import { readFile, readdir } from 'node:fs/promises';
@@ -49,9 +64,6 @@ import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..');
 
-// Plain recursive walk — keeps this script dependency-free so it can run
-// in any CI step before `pnpm install`. Only descends into directories we
-// actually care about (skips node_modules, dist, .git, test dirs).
 const SKIP_DIRS = new Set([
   'node_modules', 'dist', 'dist-ui', '.git', '.turbo', 'coverage',
   'test', 'tests', '__tests__', 'cache', 'artifacts', 'typechain',
@@ -85,43 +97,94 @@ async function* walkSourceFiles(dir) {
   }
 }
 
-// Each allowlist entry must have a justification. Reviewers should not
-// extend this list without understanding why — see file header.
+// Each entry pins ONE expected hit. `expectedHits` is the number of
+// `Wallet.createRandom(` invocations that must appear in this file; a
+// future PR adding a second call will fail CI even though one is justified.
 const ALLOWLIST = new Map([
   [
     'packages/agent/src/op-wallets.ts',
-    'first-run admin+op wallet generation, persisted to wallets.json (chmod 0600)',
+    {
+      expectedHits: 1,
+      justification: 'first-run admin+op wallet generation, persisted to wallets.json (chmod 0600)',
+    },
   ],
   [
     'packages/agent/src/agent-keystore.ts',
-    'custodial chat-agent keypair, returned to caller and persisted in keystore',
+    {
+      expectedHits: 1,
+      justification: 'custodial chat-agent keypair, returned to caller and persisted in keystore',
+    },
   ],
   [
     'packages/evm-module/utils/helpers.ts',
-    'hardhat deploy-script utility, key returned to operator (`generateEvmWallet`)',
+    {
+      expectedHits: 1,
+      justification: 'hardhat deploy-script utility, key returned to operator (`generateEvmWallet`)',
+    },
   ],
 ]);
 
-// Match `Wallet.createRandom(` (with the dot, so `createRandom` standalone
-// or as a method on something else still passes). Trailing `(` is required
-// to avoid matching identifiers in narrative prose.
-const PATTERN = /\bWallet\.createRandom\s*\(/;
+// Match `Wallet . createRandom (` allowing arbitrary whitespace (including
+// newlines) between the tokens. This is intentionally a single regex over
+// the comment-stripped file, NOT a per-line scan — that previously let
+// `Wallet\n  .createRandom()` bypass the audit by formatting alone.
+const PATTERN = /\bWallet\s*\.\s*createRandom\s*\(/g;
 
-// Skip single-line `//` comments and JSDoc-style block-comment lines
-// starting with `*`. This isn't a full comment parser — multi-line
-// `/* … */` regions on a single line still get scanned, which is fine
-// for this audit (they're rare and obvious in review).
-function isCommentLine(line) {
-  const trimmed = line.trimStart();
-  return trimmed.startsWith('//') || trimmed.startsWith('*');
+/**
+ * Strip `//` line comments and `/​* … *​/` block comments from `text`,
+ * replacing them with whitespace of the same byte length so that match
+ * indexes computed against the returned string still map back to the
+ * original line numbers.
+ *
+ * Non-goals: this is not a full lexer. String literals containing comment
+ * tokens (`const s = "// ...";`) are treated as comments, which is fine
+ * for an audit that only cares about real `Wallet.createRandom(` calls —
+ * such calls cannot live inside string literals.
+ */
+function stripCommentsPreservingPositions(text) {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    const next = i + 1 < text.length ? text[i + 1] : '';
+    if (c === '/' && next === '/') {
+      while (i < text.length && text[i] !== '\n') {
+        out += ' ';
+        i += 1;
+      }
+    } else if (c === '/' && next === '*') {
+      out += '  ';
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) {
+        out += text[i] === '\n' ? '\n' : ' ';
+        i += 1;
+      }
+      if (i < text.length) {
+        out += '  ';
+        i += 2;
+      }
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out;
 }
 
-function fileHasOffense(text) {
-  for (const line of text.split('\n')) {
-    if (isCommentLine(line)) continue;
-    if (PATTERN.test(line)) return true;
+function findHits(originalText) {
+  const stripped = stripCommentsPreservingPositions(originalText);
+  const hits = [];
+  for (const m of stripped.matchAll(PATTERN)) {
+    const upToMatch = stripped.slice(0, m.index);
+    const line = upToMatch.split('\n').length;
+    const lineStart = upToMatch.lastIndexOf('\n') + 1;
+    const lineEnd = stripped.indexOf('\n', m.index);
+    const snippet = originalText
+      .slice(lineStart, lineEnd === -1 ? originalText.length : lineEnd)
+      .trim();
+    hits.push({ line, snippet });
   }
-  return false;
+  return hits;
 }
 
 async function main() {
@@ -133,41 +196,73 @@ async function main() {
     console.error(`audit-create-random: cannot read ${packagesDir}: ${err.message}`);
     return 2;
   }
-  const offenders = [];
+  const violations = [];
+  const seenAllowlistPaths = new Set();
   for (const pkg of pkgs) {
     if (!pkg.isDirectory() || pkg.name.startsWith('.')) continue;
-    // Scan src/ and utils/ — utils/ catches packages/evm-module/utils/
     for (const subdir of ['src', 'utils']) {
       const root = join(packagesDir, pkg.name, subdir);
       for await (const absPath of walkSourceFiles(root)) {
         const text = await readFile(absPath, 'utf8');
-        if (!fileHasOffense(text)) continue;
+        const hits = findHits(text);
+        if (hits.length === 0) continue;
         const relPath = relative(REPO_ROOT, absPath).split('\\').join('/');
-        if (ALLOWLIST.has(relPath)) continue;
-        const lines = text.split('\n');
-        const hits = [];
-        for (let i = 0; i < lines.length; i++) {
-          if (isCommentLine(lines[i])) continue;
-          if (PATTERN.test(lines[i])) hits.push({ line: i + 1, text: lines[i].trim() });
+        const exemption = ALLOWLIST.get(relPath);
+        if (!exemption) {
+          violations.push({
+            path: relPath,
+            kind: 'no-exemption',
+            hits,
+            expectedHits: 0,
+          });
+          continue;
         }
-        if (hits.length > 0) offenders.push({ path: relPath, hits });
+        seenAllowlistPaths.add(relPath);
+        if (hits.length !== exemption.expectedHits) {
+          violations.push({
+            path: relPath,
+            kind: 'hit-count-mismatch',
+            hits,
+            expectedHits: exemption.expectedHits,
+            justification: exemption.justification,
+          });
+        }
       }
     }
   }
 
-  if (offenders.length === 0) {
+  // A stale allowlist entry is itself a violation — we don't want exemptions
+  // to silently outlive the file/call site they were granted for.
+  const staleAllowlist = [];
+  for (const [path] of ALLOWLIST) {
+    if (!seenAllowlistPaths.has(path)) staleAllowlist.push(path);
+  }
+
+  if (violations.length === 0 && staleAllowlist.length === 0) {
     console.log('audit-create-random: OK — no undisciplined Wallet.createRandom() in production code.');
     if (ALLOWLIST.size > 0) {
       console.log(`Allowlisted (${ALLOWLIST.size}):`);
-      for (const [p, why] of ALLOWLIST) console.log(`  - ${p}: ${why}`);
+      for (const [p, { expectedHits, justification }] of ALLOWLIST) {
+        console.log(`  - ${p} (${expectedHits} hit${expectedHits === 1 ? '' : 's'}): ${justification}`);
+      }
     }
     return 0;
   }
 
-  console.error('audit-create-random: FAIL — Wallet.createRandom() found outside the audited allowlist:');
-  for (const o of offenders) {
-    console.error(`\n  ${o.path}`);
-    for (const h of o.hits) console.error(`    L${h.line}: ${h.text}`);
+  console.error('audit-create-random: FAIL');
+  for (const v of violations) {
+    console.error(`\n  ${v.path}`);
+    if (v.kind === 'no-exemption') {
+      console.error(`    No allowlist entry. Found ${v.hits.length} hit${v.hits.length === 1 ? '' : 's'}:`);
+    } else {
+      console.error(`    Allowlisted for ${v.expectedHits} hit${v.expectedHits === 1 ? '' : 's'} (${v.justification}), but found ${v.hits.length}:`);
+    }
+    for (const h of v.hits) console.error(`    L${h.line}: ${h.snippet}`);
+  }
+  for (const p of staleAllowlist) {
+    console.error(`\n  ${p}`);
+    console.error('    Allowlist entry is stale (no Wallet.createRandom() found in the file).');
+    console.error('    Remove the entry from ALLOWLIST in scripts/audit-create-random.mjs.');
   }
   console.error(`
 Why this matters: random keys generated in-process and then discarded

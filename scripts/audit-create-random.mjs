@@ -46,21 +46,31 @@
  *
  * Bypass-resistance notes
  * -----------------------
- *   - Whole-file scan after stripping `//` line comments and `/* … *​/`
- *     block comments, so split invocations like `Wallet\n.createRandom()`
- *     or `Wallet /* … *​/.createRandom()` cannot bypass the regex by
- *     formatting.
+ *   - Whole-file scan after a small lexer blanks comments AND string /
+ *     template-literal contents (preserving byte length and newlines so
+ *     line numbers in error output stay accurate). This means:
+ *       * Split invocations like `Wallet\n.createRandom()` or
+ *         `Wallet /* … *​/.createRandom()` cannot bypass via formatting.
+ *       * `//` or `/​*` inside a string literal does NOT trigger comment
+ *         mode (so `const url = "http://"; Wallet.createRandom();` is
+ *         correctly flagged — previously the `//` inside the string
+ *         silently blanked the real call after it).
+ *       * A string literal containing the literal text `Wallet.createRandom(`
+ *         is blanked along with the rest of the string, so the regex
+ *         can't false-positive on it either.
  *   - Per-hit allowlist (not per-file): an extra `createRandom()` call
  *     added to an already-exempt file fails CI and must be justified.
- *   - String literals containing `//` or `/​*` are treated as comments.
- *     Acceptable false-negative scope: a string containing
- *     `"Wallet.createRandom("` would slip past, but that pattern is
- *     trivially obvious in code review.
+ *   - Template-literal substitutions (`${ … }`) ARE scanned as code, so a
+ *     `\`${Wallet.createRandom()}\`` would be flagged. Strings nested
+ *     inside such substitutions are not recursively re-lexed; an exotic
+ *     `\`${"Wallet.createRandom("}\`` would false-positive (acceptable —
+ *     false-positive is much safer than false-negative for a security
+ *     audit, and that pattern is trivially obvious in review).
  */
 
 import { readFile, readdir } from 'node:fs/promises';
 import { resolve, relative, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..');
 
@@ -131,47 +141,153 @@ const ALLOWLIST = new Map([
 const PATTERN = /\bWallet\s*\.\s*createRandom\s*\(/g;
 
 /**
- * Strip `//` line comments and `/​* … *​/` block comments from `text`,
- * replacing them with whitespace of the same byte length so that match
- * indexes computed against the returned string still map back to the
- * original line numbers.
+ * Blank out comments AND string / template-literal contents from `text`,
+ * replacing them with spaces (newlines preserved) so the returned string
+ * has the same byte length as the input and match indexes still resolve
+ * to the original line numbers.
  *
- * Non-goals: this is not a full lexer. String literals containing comment
- * tokens (`const s = "// ...";`) are treated as comments, which is fine
- * for an audit that only cares about real `Wallet.createRandom(` calls —
- * such calls cannot live inside string literals.
+ * State machine (small, intentionally not a full TS parser):
+ *
+ *   normal              → code we want to scan
+ *   line-comment        // … \n          (entered only from normal)
+ *   block-comment       /​* … *​/          (entered only from normal)
+ *   sq-string           ' … '            (entered only from normal; \-escapes consumed)
+ *   dq-string           " … "            (entered only from normal; \-escapes consumed)
+ *   tpl-string          ` … `            (entered only from normal; \-escapes consumed)
+ *   tpl-substitution    ${ … }           (entered from tpl-string; brace-balanced; treated as normal code)
+ *
+ * Why the explicit string state? The previous comment-only stripper
+ * treated `//` and `/​*` as comment-start unconditionally — so the line
+ * `const url = "http://"; Wallet.createRandom();` blanked everything
+ * after `//`, swallowing the real `createRandom()` call after the string.
+ * That is a false-NEGATIVE bypass for a security audit, the worst case.
+ * The fixed stripper enters `dq-string` at the opening `"`, blanks the
+ * string contents, exits at the closing `"`, then resumes normal scanning
+ * which sees `Wallet.createRandom(` intact.
+ *
+ * Strings are blanked rather than passed through verbatim so that a
+ * literal `"Wallet.createRandom("` inside a string can't false-positive
+ * the regex either.
+ *
+ * Regex literals (`/foo/g`) are NOT explicitly handled — we'd need full
+ * JS expression context to disambiguate `/` from division. In practice
+ * the only pattern that could bypass is a regex literal whose body
+ * contains an unescaped `/​/` or `/​*`, which is exotic enough to ignore.
  */
-function stripCommentsPreservingPositions(text) {
+export function stripCommentsPreservingPositions(text) {
+  const len = text.length;
   let out = '';
   let i = 0;
-  while (i < text.length) {
+  let state = 'normal';
+  let stringQuote = ''; // " | ' | ` for sq/dq/tpl
+  let braceDepth = 0;   // tracked inside tpl-substitution
+
+  const blank = (c) => (c === '\n' ? '\n' : ' ');
+
+  while (i < len) {
     const c = text[i];
-    const next = i + 1 < text.length ? text[i + 1] : '';
-    if (c === '/' && next === '/') {
-      while (i < text.length && text[i] !== '\n') {
-        out += ' ';
-        i += 1;
+    const next = i + 1 < len ? text[i + 1] : '';
+
+    if (state === 'normal') {
+      if (c === '/' && next === '/') {
+        out += '  '; i += 2;
+        state = 'line-comment';
+      } else if (c === '/' && next === '*') {
+        out += '  '; i += 2;
+        state = 'block-comment';
+      } else if (c === '"' || c === "'") {
+        out += ' '; i += 1;
+        state = c === '"' ? 'dq-string' : 'sq-string';
+        stringQuote = c;
+      } else if (c === '`') {
+        out += ' '; i += 1;
+        state = 'tpl-string';
+        stringQuote = '`';
+      } else {
+        out += c; i += 1;
       }
-    } else if (c === '/' && next === '*') {
-      out += '  ';
-      i += 2;
-      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) {
-        out += text[i] === '\n' ? '\n' : ' ';
-        i += 1;
+      continue;
+    }
+
+    if (state === 'line-comment') {
+      if (c === '\n') {
+        out += '\n'; i += 1;
+        state = 'normal';
+      } else {
+        out += ' '; i += 1;
       }
-      if (i < text.length) {
-        out += '  ';
+      continue;
+    }
+
+    if (state === 'block-comment') {
+      if (c === '*' && next === '/') {
+        out += '  '; i += 2;
+        state = 'normal';
+      } else {
+        out += blank(c); i += 1;
+      }
+      continue;
+    }
+
+    if (state === 'sq-string' || state === 'dq-string') {
+      if (c === '\\' && i + 1 < len) {
+        // Consume escape sequence (e.g. \", \\, \n) — blank both bytes.
+        out += blank(c) + blank(text[i + 1]);
         i += 2;
+      } else if (c === stringQuote) {
+        out += ' '; i += 1;
+        state = 'normal';
+        stringQuote = '';
+      } else {
+        out += blank(c); i += 1;
       }
-    } else {
-      out += c;
-      i += 1;
+      continue;
+    }
+
+    if (state === 'tpl-string') {
+      if (c === '\\' && i + 1 < len) {
+        out += blank(c) + blank(text[i + 1]);
+        i += 2;
+      } else if (c === '`') {
+        out += ' '; i += 1;
+        state = 'normal';
+        stringQuote = '';
+      } else if (c === '$' && next === '{') {
+        // Enter a substitution: subsequent code is scanned as normal.
+        // We DO NOT recursively re-lex strings inside the substitution —
+        // see the docstring's bypass-resistance notes for the trade-off.
+        out += '  '; i += 2;
+        state = 'tpl-substitution';
+        braceDepth = 1;
+      } else {
+        out += blank(c); i += 1;
+      }
+      continue;
+    }
+
+    if (state === 'tpl-substitution') {
+      if (c === '{') {
+        braceDepth += 1;
+        out += c; i += 1;
+      } else if (c === '}') {
+        braceDepth -= 1;
+        if (braceDepth === 0) {
+          out += ' '; i += 1;
+          state = 'tpl-string';
+        } else {
+          out += c; i += 1;
+        }
+      } else {
+        // Pass through so regex catches Wallet.createRandom() inside ${...}
+        out += c; i += 1;
+      }
+      continue;
     }
   }
   return out;
 }
 
-function findHits(originalText) {
+export function findHits(originalText) {
   const stripped = stripCommentsPreservingPositions(originalText);
   const hits = [];
   for (const m of stripped.matchAll(PATTERN)) {
@@ -277,5 +393,11 @@ with a one-line justification. Otherwise: take a key from the caller.
   return 1;
 }
 
-const exitCode = await main();
-process.exit(exitCode);
+// Run only when invoked directly (so the test file can import the lexer
+// + findHits without triggering a full repository scan + process.exit).
+const invokedDirectly =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  const exitCode = await main();
+  process.exit(exitCode);
+}

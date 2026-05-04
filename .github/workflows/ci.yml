@@ -99,6 +99,13 @@ jobs:
       - name: Audit Wallet.createRandom usage
         run: node scripts/audit-create-random.mjs
 
+      # Unit tests for the audit lexer itself (string/template-literal
+      # awareness, comment stripping, etc.). Catches regressions in the
+      # bypass-resistance the audit relies on — e.g. the PR #371 fix where
+      # `//` inside a string literal silently blanked real code after it.
+      - name: Test audit-create-random lexer
+        run: node --test scripts/audit-create-random.test.mjs
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

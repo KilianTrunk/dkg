@@ -33,9 +33,9 @@ dkg hermes setup --profile research
 
 targets `~/.hermes/profiles/research`.
 
-## Provider Mode Setup
+## DKG Memory Provider Setup
 
-Use provider mode when DKG should be Hermes' active external memory provider.
+Use setup when DKG should be Hermes' active external memory provider.
 
 ```bash
 dkg start
@@ -59,30 +59,9 @@ Provider facts are written to the `memory` assertion in `agent-context` by
 default. The fact subjects still carry the Hermes profile/agent identity.
 
 The adapter refuses to overwrite an existing non-DKG memory provider. If the
-profile already uses Honcho, Mem0, Supermemory, or another provider, choose
-tools-only mode or switch providers explicitly.
-
-## Tools-Only Setup
-
-Use tools-only mode when Hermes should keep its current memory provider but
-still have DKG profile state and local-agent registration metadata.
-
-```bash
-dkg hermes setup --profile research --memory-mode tools-only
-```
-
-Tools-only mode preserves `memory.provider` in `config.yaml`. It still writes
-adapter state and installs the provider package files so `status`, `doctor`,
-`disconnect`, `reconnect`, and `uninstall` can inspect and repair the
-DKG/Hermes profile relationship. Hermes-provider DKG tools such as
-`dkg_memory`, `memory_search`, `dkg_query`, `dkg_share`,
-assertion/sub-graph helpers, and status/wallet/network helpers require
-provider mode in this release. The `<recalled-memory>` auto-recall block
-documented in the node `SKILL.md` remains an OpenClaw runtime surface, not the
-Hermes tools-only surface.
-
-`--memory-mode ask` is reserved for a future interactive setup flow and is not
-supported in this release.
+profile already uses Honcho, Mem0, Supermemory, or another provider, edit the
+Hermes profile config intentionally or use a fresh Hermes profile, then rerun
+setup so DKG can become the active memory provider.
 
 ## CLI Helpers
 
@@ -182,13 +161,9 @@ but the UI should show a degraded/offline bridge state.
 
 ### Provider conflict
 
-If setup reports an existing `memory.provider`, either keep that provider with:
-
-```bash
-dkg hermes setup --profile research --memory-mode tools-only
-```
-
-or edit the Hermes profile config intentionally before rerunning provider mode.
+If setup reports an existing `memory.provider`, edit the Hermes profile config
+intentionally or use a fresh Hermes profile, then rerun setup so DKG can become
+the active memory provider.
 
 ### Hermes chat offline
 
@@ -236,8 +211,7 @@ dkg hermes uninstall --profile research
 
 For release validation, record evidence for:
 
-- provider-mode setup and verify
-- tools-only setup with an existing memory provider
+- DKG memory provider setup and verify
 - duplicate setup idempotency
 - provider conflict refusal
 - Node UI connect, stream, refresh, and persisted history

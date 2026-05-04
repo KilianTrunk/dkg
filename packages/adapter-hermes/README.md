@@ -22,7 +22,7 @@ This package contains:
 ## What It Does
 
 - installs the DKG memory provider plugin into a selected Hermes profile
-- elects DKG as Hermes' external memory provider in provider mode
+- elects DKG as Hermes' external memory provider
 - exposes the DKG tool surface listed in `packages/cli/skills/dkg-node/SKILL.md`
   plus Hermes-native helpers such as `dkg_memory` and `dkg_share`
 - stores provider memory facts in the `memory` assertion of the `agent-context`
@@ -42,8 +42,7 @@ This package contains:
   `dkg init` and `dkg start` before running Hermes setup
 - it does not start Hermes for you; run the Hermes gateway separately
 - it does not copy DKG API tokens into Hermes config files
-- it does not overwrite an existing non-DKG Hermes memory provider in provider
-  mode
+- it does not overwrite an existing non-DKG Hermes memory provider
 - it does not expose standalone HTTP route stubs from the adapter package;
   Hermes channel routes are served by the DKG CLI daemon
 
@@ -90,7 +89,6 @@ is set, setup uses that exact profile home.
 | `--bridge-url <url>` | unset | Custom same-host Hermes bridge URL. Loopback only; use `--gateway-url` for WSL2 or remote transports. |
 | `--bridge-health-url <url>` | derived from transport | Optional health URL override. It must belong to the configured bridge/gateway base. |
 | `--port <port>` | `9200` | Shortcut for `--daemon-url http://127.0.0.1:<port>`. |
-| `--memory-mode <mode>` | `primary` | `primary` elects DKG as the Hermes memory provider; `tools-only` preserves another provider. |
 | `--no-start` | off | Configure files without best-effort local-agent registration against the daemon. It does not start or stop the daemon in this release. |
 | `--no-verify` | off | Skip the post-setup verification pass. |
 | `--dry-run` | off | Preview planned file changes without writing anything. |
@@ -142,28 +140,17 @@ with ownership metadata and refuses to overwrite a non-managed file.
 Environment token override order is `DKG_API_TOKEN`, `DKG_AUTH_TOKEN`, the
 setup-resolved `dkg_home`, `DKG_HOME`, then `~/.dkg`.
 
-## Provider Mode vs Tools-Only Mode
+## Hermes Memory Provider
 
-Hermes allows one external memory provider at a time. In provider mode, setup
-elects DKG by writing a managed `memory.provider: dkg` block. If `config.yaml`
-already names another provider, for example Honcho, Mem0, or Supermemory,
-setup refuses to replace it.
+Hermes allows one external memory provider at a time. Setup elects DKG by
+writing a managed `memory.provider: dkg` block. If `config.yaml` already names
+another provider, for example Honcho, Mem0, or Supermemory, setup refuses to
+replace it automatically.
 
-Use tools-only mode when you want local-agent registration and DKG profile
-state without changing Hermes' active memory provider:
-
-```bash
-dkg hermes setup --profile research --memory-mode tools-only
-```
-
-Tools-only mode preserves the existing provider and still writes DKG adapter
-state (`dkg.json`, plugin files, setup-state metadata, and the skill file) so
-status, doctor, reconnect, and uninstall can reason about the profile. In this
-release, Hermes-provider DKG tools such as `dkg_memory`, `memory_search`,
-`dkg_query`, `dkg_share`, assertion/sub-graph helpers, and
-status/wallet/network helpers are available when Hermes activates the DKG
-memory provider; a separate general Hermes tool plugin for tools-only mode is
-future work.
+To use this adapter, switch the Hermes profile to DKG memory intentionally and
+rerun setup. Once DKG is the active provider, Hermes receives DKG-backed memory
+recall, `dkg_memory`, `memory_search`, `dkg_query`, `dkg_share`,
+assertion/sub-graph helpers, and status/wallet/network helpers.
 
 ## Node UI Connect, Refresh, And Disconnect
 
@@ -232,13 +219,9 @@ provenance before forwarding them to Hermes.
 
 ### Provider conflict
 
-If setup reports an existing `memory.provider`, either keep that provider with:
-
-```bash
-dkg hermes setup --profile research --memory-mode tools-only
-```
-
-or edit the Hermes profile config intentionally before rerunning provider mode.
+If setup reports an existing `memory.provider`, edit the Hermes profile config
+intentionally or use a fresh Hermes profile, then rerun setup so DKG can become
+the active memory provider.
 
 ### Hermes chat offline
 

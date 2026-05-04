@@ -637,6 +637,39 @@ describe('DkgNodePlugin', () => {
     expect(toolNames).not.toContain('dkg_paranet_create');
     // memory_search added by this feature branch (W2 — agent-callable recall button).
     expect(toolNames).toContain('memory_search');
+    const expectedToolNames = [
+      'dkg_status',
+      'dkg_wallet_balances',
+      'dkg_list_context_graphs',
+      'dkg_context_graph_create',
+      'dkg_context_graph_invite',
+      'dkg_participant_add',
+      'dkg_participant_remove',
+      'dkg_participant_list',
+      'dkg_join_request_list',
+      'dkg_join_request_approve',
+      'dkg_join_request_reject',
+      'dkg_subscribe',
+      'dkg_publish',
+      'dkg_share',
+      'dkg_query',
+      'dkg_find_agents',
+      'dkg_send_message',
+      'dkg_read_messages',
+      'dkg_invoke_skill',
+      'dkg_assertion_create',
+      'dkg_assertion_write',
+      'dkg_assertion_promote',
+      'dkg_assertion_discard',
+      'dkg_assertion_import_file',
+      'dkg_assertion_query',
+      'dkg_assertion_history',
+      'dkg_sub_graph_create',
+      'dkg_sub_graph_list',
+      'dkg_shared_memory_publish',
+      'memory_search',
+    ];
+    expect(new Set(toolNames)).toEqual(new Set(expectedToolNames));
     // Tool names should stay unique even as the registry grows.
     expect(new Set(toolNames).size).toBe(toolNames.length);
   });

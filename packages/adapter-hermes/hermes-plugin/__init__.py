@@ -1365,8 +1365,8 @@ class DKGMemoryProvider(MemoryProvider):
         roots = _quad_root_entities(quads)
         result = self._client.publish(
             cg,
-            selection=roots,
-            clear_after=False,
+            selection="all",
+            clear_after=True,
             sub_graph_name=_first_text(args, "sub_graph_name"),
         )
         result["quadsPublished"] = len(quads)

@@ -329,6 +329,79 @@ describe('Hermes profile setup helpers', () => {
     expect(readFileSync(join(hermesHome, 'plugins', 'dkg', '.dkg-adapter-hermes-owner.json'), 'utf-8')).toContain('@origintrail-official/dkg-adapter-hermes');
   });
 
+  it('loads the installed provider from Hermes user plugin discovery path', () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    setupHermesProfile({
+      hermesHome,
+      profileName: 'dev',
+      nodeSkillContent: '# DKG Node\n',
+    });
+
+    const script = String.raw`
+import importlib.util
+import json
+import sys
+import types
+from pathlib import Path
+
+home = Path(r"${hermesHome.replace(/\\/g, '\\\\')}")
+provider_dir = home / "plugins" / "dkg"
+
+agent_pkg = types.ModuleType("agent")
+memory_provider = types.ModuleType("agent.memory_provider")
+class MemoryProvider:
+    def is_available(self):
+        return True
+memory_provider.MemoryProvider = MemoryProvider
+sys.modules["agent"] = agent_pkg
+sys.modules["agent.memory_provider"] = memory_provider
+
+tools_pkg = types.ModuleType("tools")
+registry = types.ModuleType("tools.registry")
+registry.tool_error = lambda message: json.dumps({"error": message})
+sys.modules["tools"] = tools_pkg
+sys.modules["tools.registry"] = registry
+
+constants = types.ModuleType("hermes_constants")
+constants.get_hermes_home = lambda: home
+sys.modules["hermes_constants"] = constants
+
+module_name = "_hermes_user_memory.dkg"
+parent = types.ModuleType("_hermes_user_memory")
+parent.__path__ = [str(home / "plugins")]
+sys.modules["_hermes_user_memory"] = parent
+spec = importlib.util.spec_from_file_location(
+    module_name,
+    provider_dir / "__init__.py",
+    submodule_search_locations=[str(provider_dir)],
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules[module_name] = module
+spec.loader.exec_module(module)
+
+class Collector:
+    def __init__(self):
+        self.provider = None
+    def register_memory_provider(self, provider):
+        self.provider = provider
+
+collector = Collector()
+module.register(collector)
+provider = collector.provider
+assert provider is not None, "provider was not registered"
+provider.initialize({"session_id": "loader-smoke"})
+assert provider.name == "dkg", provider.name
+assert any(schema["name"] == "memory_search" for schema in provider.get_tool_schemas())
+assert provider._config["context_graph"] == "agent-context", provider._config
+`;
+    const result = spawnSync('python', ['-B', '-c', script], {
+      cwd: process.cwd(),
+      encoding: 'utf-8',
+    });
+
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('writes provider-readable publish guard keys into dkg.json', () => {
     const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
 
@@ -1768,7 +1841,7 @@ assert result["success"] is True, result
 assert result["rootEntities"] == ["urn:root:1", "urn:root:2"], result
 assert provider._client.published == (
     "cg:test",
-    {"selection": ["urn:root:1", "urn:root:2"], "clear_after": False, "sub_graph_name": ""},
+    {"selection": "all", "clear_after": True, "sub_graph_name": ""},
 ), provider._client.published
 `;
     const result = spawnSync('python', ['-B', '-c', script], {

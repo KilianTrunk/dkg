@@ -36,15 +36,16 @@ This package contains:
 - registers Hermes as a DKG local-agent integration for status, connect,
   refresh, and disconnect flows
 
-## What It Does Not Do Anymore
+## Scope Boundaries
 
-- it does not restore legacy Hermes routes or compatibility stubs
+- it does not run its own DKG node; configure and start the node with
+  `dkg init` and `dkg start` before running Hermes setup
+- it does not start Hermes for you; run the Hermes gateway separately
 - it does not copy DKG API tokens into Hermes config files
 - it does not overwrite an existing non-DKG Hermes memory provider in provider
   mode
-- it does not start Hermes for you; run the Hermes gateway separately
-- it does not currently replace `dkg init` / `dkg start`; configure and start
-  the DKG node before running Hermes setup
+- it does not expose standalone HTTP route stubs from the adapter package;
+  Hermes channel routes are served by the DKG CLI daemon
 
 ## Quick Start
 

@@ -175,7 +175,12 @@ function classify(target: ClientTarget): ClientState {
   const body = readJson(target.configPath);
   const servers = (body.mcpServers as Record<string, unknown> | undefined) ?? {};
   const current = servers.dkg as Record<string, unknown> | undefined;
-  if (current === undefined) {
+  // Treat both `undefined` (key absent) and `null` (key present but
+  // explicitly nulled) as "not-registered". Pre-F7 a `{ dkg: null }`
+  // entry classified as `stale`, which made the operator-facing
+  // log line claim there was a current value to refresh — there
+  // wasn't. Same registration outcome under `--force`; clearer log.
+  if (current === undefined || current === null) {
     return { target, state: 'not-registered', current: null };
   }
   const matches =
@@ -313,11 +318,21 @@ export async function mcpSetupAction(
     } catch { /* corrupt config; downstream uses pre-merge values */ }
   };
 
+  // F25: reconcile BEFORE the branch decision so dry-run preview
+  // and skip-write log lines see the persisted-port value. Pre-F25
+  // the dry-run branch printed the CLI-default `apiPort` (9200)
+  // even when `~/.dkg/config.json` had `apiPort: 9300`. Lifting
+  // the call here also collapses the two duplicate calls (one in
+  // the skip-write branch, one in the write-then-read branch)
+  // into a single up-front read.
+  if (configExists) {
+    reconcileFromPersistedConfig();
+  }
+
   if (configExists && opts.name == null && opts.port == null) {
     console.log(`[setup] Node config exists (${tildify(existsSync(yamlPath) ? yamlPath : jsonPath)}); leaving untouched.`);
-    reconcileFromPersistedConfig();
   } else if (dryRun) {
-    console.log(`[setup] [dry-run] Would write ~/.dkg/config.json (port ${apiPort}, name "${effectiveAgentName}")`);
+    console.log(`[setup] [dry-run] Would write ~/.dkg/config.json (port ${effectivePort}, name "${effectiveAgentName}")`);
   } else {
     try {
       const network = deps.loadNetworkConfig();
@@ -325,9 +340,9 @@ export async function mcpSetupAction(
         nameExplicit: opts.name != null,
         portExplicit: opts.port != null,
       });
-      // Read back the effective port + name from the merged config so
-      // downstream steps use the persisted values when an existing
-      // config preserved a different port/name.
+      // Re-read after writeDkgConfig in case the daemon's config-
+      // merge changed `apiPort` / `name` (first-wins semantics on
+      // existing fields, explicit overrides on new).
       reconcileFromPersistedConfig();
     } catch (err: any) {
       console.error(`[setup] Failed to load network config: ${err?.message ?? err}`);
@@ -375,9 +390,17 @@ export async function mcpSetupAction(
   } else {
     let daemonReachable = false;
     try {
-      const probe = await fetch(`http://127.0.0.1:${effectivePort}/api/status`);
+      // F26: bound the probe with AbortSignal.timeout(2000) so a
+      // partially-up daemon (port bound but unresponsive — half-stuck
+      // process or deadlocked startup) doesn't hang setup. The probe
+      // is best-effort; treating timeout as "not reachable" is the
+      // correct fallback because we move on to log the explicit
+      // skip-with-reason message anyway.
+      const probe = await fetch(`http://127.0.0.1:${effectivePort}/api/status`, {
+        signal: AbortSignal.timeout(2000),
+      });
       daemonReachable = probe.ok;
-    } catch { /* not reachable */ }
+    } catch { /* not reachable (or timed out) */ }
 
     if (!daemonReachable) {
       console.log(
@@ -475,7 +498,11 @@ export async function mcpSetupAction(
   // are out of scope for setup.
   if (shouldVerify && !dryRun && shouldStart) {
     try {
-      const res = await fetch(`http://127.0.0.1:${effectivePort}/api/status`);
+      // F26: same hang-bound as the funding-step reachability probe.
+      // A partially-up daemon must not block setup completion.
+      const res = await fetch(`http://127.0.0.1:${effectivePort}/api/status`, {
+        signal: AbortSignal.timeout(2000),
+      });
       if (res.ok) {
         console.log(`\n[setup] Daemon healthy at http://127.0.0.1:${effectivePort}.`);
       } else {

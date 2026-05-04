@@ -164,8 +164,7 @@ export function registerReadTools(
         'with `view` — "working-memory" (default, private), ' +
         '"shared-working-memory" (team), or "verified-memory" (on-chain). ' +
         'Set `includeSharedMemory: true` alongside `view: "working-memory"` ' +
-        'to get the WM∪SWM union the legacy `dkg_sparql` exposed as ' +
-        '`layer: "union"`.',
+        'to query WM ∪ SWM in one call.',
       inputSchema: {
         sparql: z.string().describe('SPARQL query body. Prefixes are auto-injected.'),
         projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
@@ -219,11 +218,17 @@ export function registerReadTools(
         view: z
           .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
           .optional()
-          .describe('Memory tier: working-memory (default, private), shared-working-memory (team), verified-memory (on-chain).'),
+          .describe(
+            'Memory tier (explicit selection is STRICT — pick one tier only): ' +
+              '"working-memory" (private WM only — pair with includeSharedMemory: true to add SWM), ' +
+              '"shared-working-memory" (team SWM only), ' +
+              '"verified-memory" (on-chain VM only). ' +
+              'Omit `view` to get the WM ∪ SWM default (the V9-era `layer: "union"` shape).',
+          ),
         includeSharedMemory: z
           .boolean()
           .optional()
-          .describe('When set with view: "working-memory", include SWM in the result set (the WM∪SWM combined view; default true here for backwards-compat with the prior `layer: "union"` default).'),
+          .describe('When set with view: "working-memory", include SWM in the result set (the WM∪SWM combined view).'),
       },
     },
     async ({ uri, projectId, view, includeSharedMemory }): Promise<ToolResult> => {
@@ -320,11 +325,17 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
         view: z
           .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
           .optional()
-          .describe('Memory tier: working-memory (private), shared-working-memory (team), verified-memory (on-chain).'),
+          .describe(
+            'Memory tier (explicit selection is STRICT — pick one tier only): ' +
+              '"working-memory" (private WM only — pair with includeSharedMemory: true to add SWM), ' +
+              '"shared-working-memory" (team SWM only), ' +
+              '"verified-memory" (on-chain VM only). ' +
+              'Omit `view` to get the WM ∪ SWM default (the V9-era `layer: "union"` shape).',
+          ),
         includeSharedMemory: z
           .boolean()
           .optional()
-          .describe('When set with view: "working-memory", include SWM in the result set (the WM∪SWM combined view; default true here for backwards-compat with the prior `layer: "union"` default).'),
+          .describe('When set with view: "working-memory", include SWM in the result set (the WM∪SWM combined view).'),
         limit: z.number().optional().default(25),
       },
     },

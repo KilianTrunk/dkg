@@ -193,9 +193,12 @@ export function registerAssertionTools(
           contextGraphId: pid,
           assertionName: name,
           subGraphName,
-          // mcp-dkg's existing `promoteAssertion` requires an `entities`
-          // array; pass an empty array when omitting so the daemon receives
-          // its default-promotion sentinel (matches adapter behaviour).
+          // The tool blocks empty-array from callers (validated above)
+          // because the schema's intent is unambiguous: omit means
+          // promote-all. The empty-array IS the daemon's "promote all"
+          // sentinel internally — `promoteAssertion` requires an array
+          // shape — but we hide that wire detail from the public surface
+          // so the API has one canonical "promote all" form (omit).
           entities: entities ?? [],
         });
         const scope = entities && entities.length > 0

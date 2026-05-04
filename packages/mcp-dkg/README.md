@@ -153,7 +153,7 @@ Both ship ungated — no `agent.canPublishToVm` flag — to mirror the OpenClaw 
 | Tool | What it does |
 |---|---|
 | `dkg_memory_search` | Trust-weighted free-text recall across WM/SWM/VM in the agent-context graph (and an optional project graph). Higher-trust layers (VM > SWM > WM) collapse lower-trust hits for the same entity URI. Each hit surfaces `contextGraphId`, `layer`, and `trustWeight`. Use this for "ask my memory anything" recall. |
-| `dkg_query` | Execute SPARQL SELECT / ASK / CONSTRUCT against a context graph. Known prefixes are auto-prepended. Scope with `view`: `"working-memory"` (default), `"shared-working-memory"`, or `"verified-memory"`. Set `includeSharedMemory: true` alongside `view: "working-memory"` to get the WM∪SWM union the legacy `dkg_sparql` exposed as `layer: "union"`. |
+| `dkg_query` | Execute SPARQL SELECT / ASK / CONSTRUCT against a context graph. Known prefixes are auto-prepended. Scope with `view`: `"working-memory"` (default), `"shared-working-memory"`, or `"verified-memory"`. Set `includeSharedMemory: true` alongside `view: "working-memory"` to query WM ∪ SWM in one call. |
 
 ## The canonical round-trip
 

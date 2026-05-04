@@ -73,7 +73,7 @@ Pick the on-ramp that matches how you're already working:
 
 | You want… | Recipe | More |
 |---|---|---|
-| **DKG V10 as memory for Cursor / Claude Code / Continue / Cline** | [MCP setup](#dkg-v10-as-agent-memory-mcp) | three commands |
+| **DKG V10 as memory for Cursor / Claude Code / Continue / Cline** | [MCP setup](#dkg-v10-as-agent-memory-mcp) | two commands |
 | **DKG V10 wired into an OpenClaw agent** | [OpenClaw setup](#openclaw-adapter) | two commands |
 | **DKG V10 inside an ElizaOS agent** | [ElizaOS adapter](packages/adapter-elizaos/README.md) | adapter README |
 | **DKG V10 inside a Hermes agent** | [Hermes adapter](packages/adapter-hermes/README.md) | adapter README |
@@ -91,29 +91,36 @@ Every on-ramp installs the same `@origintrail-official/dkg` umbrella package, ru
 
 ### DKG V10 as agent memory (MCP)
 
-Three commands give Cursor, Claude Code, Continue, or Cline a verifiable shared memory layer:
+Two commands give Cursor, Claude Code, Continue, or Cline a verifiable shared memory layer:
 
 ```bash
 npm install -g @origintrail-official/dkg     # installs CLI + bundled MCP server
-dkg init                                     # one-time: node name, EVM key, auto-fund testnet wallets
-dkg start                                    # background daemon on http://127.0.0.1:9200
-dkg mcp setup                                # register MCP with every detected client
+dkg mcp setup                                # one-shot: init + start + fund + register + verify
 ```
 
-`dkg mcp setup` is idempotent and safe to re-run. It detects each MCP-aware client by its config file (`~/.cursor/mcp.json`, `~/.claude.json`) and writes a single canonical entry:
+That's it. The first command installs the `dkg` umbrella CLI; the second runs a one-shot bundled flow that:
 
-```json
-{
-  "mcpServers": {
-    "dkg": {
-      "command": "dkg",
-      "args": ["mcp", "serve"]
-    }
-  }
-}
-```
+1. Initializes `~/.dkg/config.json` if it doesn't exist (skipped silently when present)
+2. Starts the DKG daemon as a background process (skipped if already running)
+3. Funds the node's wallets via the testnet faucet (skip with `--no-fund` for CI)
+4. Registers the MCP server with each detected client (Cursor, Claude Code) by writing a single canonical entry under `mcpServers.dkg`:
+
+   ```json
+   {
+     "mcpServers": {
+       "dkg": {
+         "command": "dkg",
+         "args": ["mcp", "serve"]
+       }
+     }
+   }
+   ```
+
+5. Verifies the daemon is healthy
 
 No tokens or URLs in the JSON — those live in `~/.dkg/config.yaml` and the daemon-written `~/.dkg/auth.token`. If no client config is detected, run `dkg mcp setup --print-only` to emit the JSON for manual paste.
+
+**Each step is idempotent and skippable.** Re-running `dkg mcp setup` on an already-set-up box is safe — every step short-circuits when its work is already done. Step-skip flags: `--no-start` (configure only, don't start the daemon), `--no-fund` (skip faucet — CI-friendly), `--no-verify` (skip the post-setup probe), `--dry-run` (preview what would happen), `--force` (refresh every detected client config regardless of state). First-init overrides: `--port <n>`, `--name <s>`.
 
 **First-run verification.** Restart your client so it discovers the MCP, then ask it: *"What tools does dkg expose?"* The `tools/list` response must include at least `dkg_assertion_create`, `dkg_assertion_write`, and `dkg_memory_search`. Then trigger the [round-trip](#round-trip-write-then-recall) below to prove the wiring works end to end.
 
@@ -122,15 +129,14 @@ No tokens or URLs in the JSON — those live in `~/.dkg/config.yaml` and the dae
 The validated path agents follow when "remember this" actually has to mean *cryptographically anchored, queryable, survives the session*:
 
 1. **Install** — `npm install -g @origintrail-official/dkg`
-2. **Initialize** — `dkg init` (auto-funds Base Sepolia wallets via the testnet faucet if reachable)
-3. **Start the daemon** — `dkg start`
-4. **Confirm reachable** — `dkg status` returns a PeerId; `curl -s http://127.0.0.1:9200/health` is `200`
-5. **Wire the MCP** — `dkg mcp setup`, then restart your client
-6. **(no manual CG creation)** — `agent-context` is auto-created on first write by the storage layer; the round-trip below assumes it
-7. **Write** — agent calls `dkg_assertion_create` with `name: "session-2026-05-04"`, then `dkg_assertion_write` with one or more quads. Both tools are idempotent / additive — re-runs are safe.
-8. **Recall** — agent calls `dkg_memory_search` with a keyword from the write. The result includes `contextGraphId`, `layer` (`working-memory`, `shared-working-memory`, or `verified-memory`), and a `trustWeight` per hit; higher-trust layers collapse lower-trust hits for the same entity. The just-written triple comes back from the WM layer.
-9. **(Optional) Promote to SWM** — `dkg_assertion_promote` advances the assertion's lifecycle and gossips it to peers subscribed to the same context graph.
-10. **(Optional) Publish to VM** — `dkg_shared_memory_publish` finalizes Shared Working Memory on-chain (costs TRAC + gas, clears SWM). For a one-shot fresh-quads-to-VM helper, use `dkg_publish` instead — it writes to SWM and publishes in a single call but skips the WM staging area.
+2. **Set up** — `dkg mcp setup` (the bundled flow: initializes config, starts the daemon, funds wallets via testnet faucet, registers the MCP with detected clients, verifies daemon health)
+3. **Confirm reachable** — `dkg status` returns a PeerId; `curl -s http://127.0.0.1:9200/health` is `200`
+4. **Restart your client** — Cursor / Claude Code / Continue / Cline picks up the new MCP entry on next launch
+5. **(no manual CG creation)** — `agent-context` is auto-created on first write by the storage layer; the round-trip below assumes it
+6. **Write** — agent calls `dkg_assertion_create` with `name: "session-2026-05-04"`, then `dkg_assertion_write` with one or more quads. Both tools are idempotent / additive — re-runs are safe.
+7. **Recall** — agent calls `dkg_memory_search` with a keyword from the write. The result includes `contextGraphId`, `layer` (`working-memory`, `shared-working-memory`, or `verified-memory`), and a `trustWeight` per hit; higher-trust layers collapse lower-trust hits for the same entity. The just-written triple comes back from the WM layer.
+8. **(Optional) Promote to SWM** — `dkg_assertion_promote` advances the assertion's lifecycle and gossips it to peers subscribed to the same context graph.
+9. **(Optional) Publish to VM** — `dkg_shared_memory_publish` finalizes Shared Working Memory on-chain (costs TRAC + gas, clears SWM). For a one-shot fresh-quads-to-VM helper, use `dkg_publish` instead — it writes to SWM and publishes in a single call but skips the WM staging area.
 
 That round-trip — write → search → optionally promote → optionally finalize — is the canonical pattern across every framework on this page. The MCP tools, OpenClaw adapter, and ElizaOS provider all hit the same daemon endpoints behind the scenes, so memories cross frameworks freely.
 

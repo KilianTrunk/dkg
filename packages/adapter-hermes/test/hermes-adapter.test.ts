@@ -1326,6 +1326,8 @@ assert "include_shared_memory" in subscribe_schema["parameters"]["properties"], 
 search_schema = next(schema for schema in provider.get_tool_schemas() if schema["name"] == "memory_search")
 assert "context_graph_id" in search_schema["parameters"]["properties"], search_schema
 assert "context_graph" not in search_schema["parameters"]["properties"], search_schema
+query_schema = next(schema for schema in provider.get_tool_schemas() if schema["name"] == "dkg_query")
+assert "sub_graph_name" not in query_schema["parameters"]["properties"], query_schema
 share_schema = next(schema for schema in provider.get_tool_schemas() if schema["name"] == "dkg_share")
 assert "context_graph_id" in share_schema["parameters"]["properties"], share_schema
 assert "context_graph" not in share_schema["parameters"]["properties"], share_schema
@@ -1623,6 +1625,7 @@ for args, needle in [
     ({"sparql": "ASK {}", "context_graph": "old"}, "context_graph"),
     ({"sparql": "ASK {}", "context_graph_id": "cg:test", "view": "bad"}, "view"),
     ({"sparql": "ASK {}", "view": "working-memory"}, "context_graph_id"),
+    ({"sparql": "ASK {}", "context_graph_id": "cg:test", "view": "shared-working-memory", "sub_graph_name": "scratch"}, "sub_graph_name"),
     ({"sparql": "ASK {}", "context_graph_id": "cg:test", "view": "working-memory", "agent_address": "   "}, "agent_address"),
 ]:
     result = json.loads(provider.handle_tool_call("dkg_query", args))
@@ -1765,7 +1768,7 @@ assert result["success"] is True, result
 assert result["rootEntities"] == ["urn:root:1", "urn:root:2"], result
 assert provider._client.published == (
     "cg:test",
-    {"selection": ["urn:root:1", "urn:root:2"], "clear_after": True, "sub_graph_name": ""},
+    {"selection": ["urn:root:1", "urn:root:2"], "clear_after": False, "sub_graph_name": ""},
 ), provider._client.published
 `;
     const result = spawnSync('python', ['-B', '-c', script], {

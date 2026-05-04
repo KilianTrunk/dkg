@@ -242,10 +242,6 @@ DKG_QUERY_SCHEMA = {
                 "type": "string",
                 "description": "Optional assertion name scope.",
             },
-            "sub_graph_name": {
-                "type": "string",
-                "description": "Optional sub-graph scope.",
-            },
         },
         "required": ["sparql"],
     },
@@ -1200,6 +1196,8 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error('"view" must be one of: working-memory, shared-working-memory, verified-memory.')
         if view and not _first_text(args, "context_graph_id"):
             return tool_error(f'"view: {view}" requires "context_graph_id".')
+        if view and _first_text(args, "sub_graph_name"):
+            return tool_error('"sub_graph_name" cannot be combined with view-based dkg_query routing.')
         if args.get("agent_address") is not None and not isinstance(args.get("agent_address"), str):
             return tool_error('"agent_address" must be a string.')
         if isinstance(args.get("agent_address"), str) and not args.get("agent_address", "").strip():
@@ -1368,7 +1366,7 @@ class DKGMemoryProvider(MemoryProvider):
         result = self._client.publish(
             cg,
             selection=roots,
-            clear_after=True,
+            clear_after=False,
             sub_graph_name=_first_text(args, "sub_graph_name"),
         )
         result["quadsPublished"] = len(quads)

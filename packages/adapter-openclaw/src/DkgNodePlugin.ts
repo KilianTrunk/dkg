@@ -3297,7 +3297,18 @@ export class DkgNodePlugin {
       if (!content.trim()) return this.error('"content" is required.');
 
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
+      if (this.nodePeerId === undefined) {
+        await this.ensureNodePeerId().catch(() => {});
+      }
+      const writerIdentity = this.nodePeerId;
+      if (!writerIdentity) {
+        return this.error(
+          '"dkg_share" requires a node peer ID. Retry once the daemon status probe is available.',
+        );
+      }
       const rootEntityHash = createHash('sha256')
+        .update(writerIdentity)
+        .update('\0')
         .update(contextGraphId)
         .update('\0')
         .update(subGraphName ?? '')

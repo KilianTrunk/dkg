@@ -812,6 +812,7 @@ describe('DkgNodePlugin', () => {
         on: () => {},
         logger: {},
       });
+      (plugin as any).nodePeerId = '12D3KooWShareWriterOne';
       const byName = new Map(tools.map((t) => [t.name, t] as const));
       return { fetchMock, plugin, byName };
     };
@@ -1157,7 +1158,7 @@ describe('DkgNodePlugin', () => {
     });
 
     it('dkg_share writes content to team-visible SWM and returns V10-shaped JSON', async () => {
-      const { fetchMock, byName } = setupPluginWithFetch({
+      const { fetchMock, plugin, byName } = setupPluginWithFetch({
         shareOperationId: 'op-1',
         workspaceOperationId: 'legacy-op-1',
         contextGraphId: 'ctx',
@@ -1205,6 +1206,7 @@ describe('DkgNodePlugin', () => {
       expect(shaped).not.toHaveProperty('paranetId');
       expect(result.details).toEqual(shaped);
 
+      (plugin as any).nodeAgentAddress = '0x0000000000000000000000000000000000000001';
       const retry = await byName.get('dkg_share')!.execute('tc-retry', {
         context_graph_id: 'ctx',
         content: '  Alpha\nBeta  ',
@@ -1215,6 +1217,18 @@ describe('DkgNodePlugin', () => {
       const retryShaped = JSON.parse(retry.content[0].text);
       expect(retryBody.quads[0].subject).toBe(rootEntity);
       expect(retryShaped.rootEntity).toBe(rootEntity);
+
+      (plugin as any).nodePeerId = '12D3KooWShareWriterTwo';
+      const otherWriter = await byName.get('dkg_share')!.execute('tc-other-writer', {
+        context_graph_id: 'ctx',
+        content: '  Alpha\nBeta  ',
+        sub_graph_name: 'protocols',
+      });
+      const [, otherWriterInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+      const otherWriterBody = JSON.parse(otherWriterInit.body as string);
+      const otherWriterShaped = JSON.parse(otherWriter.content[0].text);
+      expect(otherWriterBody.quads[0].subject).not.toBe(rootEntity);
+      expect(otherWriterShaped.rootEntity).toBe(otherWriterBody.quads[0].subject);
     });
 
     it('dkg_share validates required inputs and rejects legacy aliases locally', async () => {
@@ -1268,6 +1282,7 @@ describe('DkgNodePlugin', () => {
         on: () => {},
         logger: {},
       });
+      (plugin as any).nodePeerId = '12D3KooWShareWriterOne';
       const byName = new Map(tools.map((t) => [t.name, t] as const));
 
       const result = await byName.get('dkg_share')!.execute('tc', {

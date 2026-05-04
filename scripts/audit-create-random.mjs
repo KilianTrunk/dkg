@@ -56,8 +56,11 @@ const SKIP_DIRS = new Set([
   'node_modules', 'dist', 'dist-ui', '.git', '.turbo', 'coverage',
   'test', 'tests', '__tests__', 'cache', 'artifacts', 'typechain',
 ]);
-const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
-const TEST_SUFFIXES = ['.test.ts', '.test.tsx', '.test.js', '.test.jsx', '.spec.ts', '.spec.tsx', '.spec.js', '.spec.jsx'];
+const SOURCE_EXTS = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs']);
+const TEST_SUFFIXES = [
+  '.test.ts', '.test.tsx', '.test.mts', '.test.cts', '.test.js', '.test.jsx', '.test.mjs', '.test.cjs',
+  '.spec.ts', '.spec.tsx', '.spec.mts', '.spec.cts', '.spec.js', '.spec.jsx', '.spec.mjs', '.spec.cjs',
+];
 
 async function* walkSourceFiles(dir) {
   let entries;

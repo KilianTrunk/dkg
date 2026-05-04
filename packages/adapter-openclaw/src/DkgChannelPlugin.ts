@@ -32,6 +32,15 @@ import type {
 } from './types.js';
 import type { DkgDaemonClient, OpenClawAttachmentRef } from './dkg-client.js';
 import type { ChatTurnWriter } from './ChatTurnWriter.js';
+import {
+  extractAdapterPluginConfigOverlay,
+  isPartialAdapterConfigOverlay,
+  isObjectRecord,
+  mergeAdapterPluginConfigs,
+  resolveOpenClawMergedConfig,
+  resolveOpenClawRouteMetadataConfig,
+  scrubStaleWorkspaceAliases,
+} from './openclaw-config.js';
 
 export const CHANNEL_NAME = 'dkg-ui';
 const DEFAULT_CHANNEL_ACCOUNT_ID = 'default';
@@ -399,6 +408,7 @@ export class DkgChannelPlugin {
   private readonly stopWaiters: Array<() => void> = [];
   private stopDrainDeadlineAt: number | null = null;
   private serverStop: Promise<void> | null = null;
+  private serverStopShouldUpdateGatewayStatus = false;
   private gatewayLifecycleStop: (() => void) | null = null;
   private gatewayLifecycleOwner: object | null = null;
   private gatewayLifecyclePendingOwner: object | null = null;
@@ -422,9 +432,13 @@ export class DkgChannelPlugin {
 
   constructor(
     private readonly config: NonNullable<DkgOpenClawConfig['channel']>,
-    private readonly client: DkgDaemonClient,
+    private client: DkgDaemonClient,
   ) {
     this.port = config.port ?? 9201;
+  }
+
+  setClient(client: DkgDaemonClient): void {
+    this.client = client;
   }
 
   /** Wire the memory-slot re-assert callback. Called by `DkgNodePlugin`. */
@@ -497,7 +511,7 @@ export class DkgChannelPlugin {
     // Capture the runtime and config from the plugin API.
     // These are not part of the typed API surface but are available at runtime.
     this.runtime = (api as any).runtime;
-    this.cfg = (api as any).cfg ?? (api as any).config ?? this.runtime?.cfg ?? this.runtime?.config;
+    this.cfg = resolveChannelDispatchConfig(api);
 
     // Log what we found for diagnostics
     if (this.runtime?.channel) {
@@ -633,8 +647,12 @@ export class DkgChannelPlugin {
   }
 
   async stop(options: { updateGatewayStatus?: boolean } = {}): Promise<void> {
-    if (this.serverStop) return this.serverStop;
     const updateGatewayStatus = options.updateGatewayStatus !== false;
+    if (this.serverStop) {
+      if (updateGatewayStatus) this.serverStopShouldUpdateGatewayStatus = true;
+      return this.serverStop;
+    }
+    this.serverStopShouldUpdateGatewayStatus = updateGatewayStatus;
     const stopWork = Promise.resolve().then(async () => {
       this.stopping = true;
       this.stopDrainDeadlineAt = Date.now() + STOP_DRAIN_TIMEOUT_MS;
@@ -680,7 +698,7 @@ export class DkgChannelPlugin {
         this.clearPendingMarkerPersistence();
       }
       this.stopDrainDeadlineAt = null;
-      if (updateGatewayStatus) {
+      if (this.serverStopShouldUpdateGatewayStatus) {
         this.reportGatewayLifecycleStopped(this.gatewayLifecycleStatusContext, this.gatewayLifecycleStatusOwner);
       }
       this.gatewayLifecycleStop?.();
@@ -693,6 +711,7 @@ export class DkgChannelPlugin {
     } finally {
       if (this.serverStop === stopWork) {
         this.serverStop = null;
+        this.serverStopShouldUpdateGatewayStatus = false;
       }
     }
   }
@@ -2459,4 +2478,200 @@ function getErrorMessage(err: unknown): string {
     return err.message;
   }
   return String(err);
+}
+
+function resolveDirectAdapterConfigFallback(api: OpenClawPluginApi): Record<string, unknown> | undefined {
+  const anyApi = api as any;
+  const runtime = anyApi?.runtime;
+  const sources = [
+    directAdapterConfigFrom(anyApi?.cfg),
+    directAdapterConfigFrom(anyApi?.config),
+    directAdapterConfigFrom(anyApi?.pluginConfig),
+    directAdapterConfigFrom(runtime?.cfg),
+    directAdapterConfigFrom(runtime?.config),
+    directAdapterConfigFrom(runtime?.pluginConfig),
+  ].filter(isObjectRecord);
+  // T364 — Capture all partial overlays (state-metadata-only AND module
+  // partials like `{ channel: { port: 9801 } }`) in priority order so a
+  // higher-priority partial doesn't mask a lower-priority full adapter
+  // config it should layer over. Pre-fix the loop only captured
+  // state-metadata-only overlays and returned the first non-metadata
+  // source verbatim, so a partial channel overlay at api.cfg blocked
+  // the full config in runtime.config from contributing
+  // daemonUrl/memory/etc to the dispatch — breaking route resolution
+  // on gateways that emit incremental direct config updates.
+  // `isPartialAdapterConfigOverlay` is a superset of
+  // `isStateMetadataOnlyAdapterConfig`, so a single check covers both.
+  const overlays: Record<string, unknown>[] = [];
+  for (const source of sources) {
+    if (isPartialAdapterConfigOverlay(source)) {
+      overlays.push(source);
+      continue;
+    }
+    // Found a full config. Merge captured overlays over it. `overlays`
+    // is in highest-first priority order; reverse so the highest
+    // priority is applied last (and wins via mergeAdapterPluginConfigs's
+    // later-arg-wins semantic for top-level keys plus deep-merge for
+    // memory/channel modules).
+    return overlays.length > 0
+      ? mergeAdapterPluginConfigs(source, ...overlays.slice().reverse())
+      : source;
+  }
+  // T364 — When every discovered source is a partial overlay (no full
+  // config exists), merge ALL collected overlays in priority order.
+  // Pre-fix this path returned `overlays[0]` and dropped the rest, so a
+  // metadata-only api.cfg + partial pluginConfig + partial runtime.* still
+  // produced an incomplete cfg even when the missing daemon/channel/memory
+  // fields were available on lower-priority overlays. Reverse so the
+  // highest-priority overlay is applied last and wins on conflicts; module
+  // deep-merge preserves lower-priority defaults for fields the higher
+  // overlay omits.
+  return overlays.length > 0
+    ? mergeAdapterPluginConfigs(...overlays.slice().reverse())
+    : undefined;
+}
+
+function resolveChannelDispatchConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {
+  const mergedConfig = resolveOpenClawMergedConfig(api);
+  const routeConfig = resolveOpenClawRouteMetadataConfig(api);
+  const directConfig = resolveDirectAdapterConfigFallback(api);
+  if (mergedConfig) {
+    // T364 — Layer the fresher direct adapter config over the merged
+    // workspace config's nested `plugins.entries['adapter-openclaw'].config`.
+    // Pre-fix this branch returned the merged config as-is even when
+    // `api.pluginConfig` carried newer daemonUrl / channel / memory
+    // updates, so the channel dispatched against stale settings on
+    // multi-phase gateways that update direct config before the merged
+    // snapshot catches up.
+    const mergedWithDirect = directConfig
+      ? mergeDirectAdapterConfigIntoMergedConfig(mergedConfig, directConfig)
+      : mergedConfig;
+    return routeConfig
+      ? mergeRouteMetadataWithMergedConfig(mergedWithDirect, routeConfig)
+      : mergedWithDirect;
+  }
+
+  if (routeConfig && directConfig) {
+    return mergeRouteConfigWithAdapterConfig(routeConfig, directConfig);
+  }
+
+  return directConfig ?? routeConfig;
+}
+
+function mergeDirectAdapterConfigIntoMergedConfig(
+  mergedConfig: Record<string, unknown>,
+  directConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  const plugins = isObjectRecord(mergedConfig.plugins)
+    ? (mergedConfig.plugins as Record<string, unknown>)
+    : {};
+  const entries = isObjectRecord(plugins.entries)
+    ? (plugins.entries as Record<string, unknown>)
+    : {};
+  const adapterEntry = isObjectRecord(entries['adapter-openclaw'])
+    ? (entries['adapter-openclaw'] as Record<string, unknown>)
+    : {};
+  const adapterEntryConfig = isObjectRecord(adapterEntry.config)
+    ? (adapterEntry.config as Record<string, unknown>)
+    : {};
+  const mergedAdapterConfig = mergeAdapterPluginConfigs(adapterEntryConfig, directConfig);
+  return {
+    ...mergedConfig,
+    plugins: {
+      ...plugins,
+      entries: {
+        ...entries,
+        'adapter-openclaw': {
+          ...adapterEntry,
+          config: mergedAdapterConfig,
+        },
+      },
+    },
+  };
+}
+
+function mergeRouteMetadataWithMergedConfig(
+  mergedConfig: Record<string, unknown>,
+  routeConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  const priorAgents = isObjectRecord(mergedConfig.agents) ? mergedConfig.agents : undefined;
+  const nextAgents = isObjectRecord(routeConfig.agents) ? routeConfig.agents : undefined;
+  const priorSession = isObjectRecord(mergedConfig.session) ? mergedConfig.session : undefined;
+  const nextSession = isObjectRecord(routeConfig.session) ? routeConfig.session : undefined;
+  const result: Record<string, unknown> = {
+    ...mergedConfig,
+    ...routeConfig,
+    plugins: mergedConfig.plugins,
+  };
+  // T364 round 8 — drop stale workspace aliases that the merged
+  // snapshot inherited from older route metadata when the current
+  // routeConfig asserts a newer workspace signal. Pre-fix the
+  // `...mergedConfig, ...routeConfig` spread kept any older
+  // `workspace` / `agents.defaults.workspace` from the merged
+  // snapshot alongside the newer-only `workspaceDir`, and the
+  // documented `agents.defaults.workspace -> workspace -> workspaceDir`
+  // resolver chain would pick the stale alias. Scrubbing here
+  // keeps the dispatch-side and resolve-side merges consistent
+  // with `mergeRouteMetadataConfigs` in `openclaw-config.ts`.
+  scrubStaleWorkspaceAliases(result, routeConfig);
+  if (priorAgents || nextAgents) {
+    result.agents = { ...(priorAgents ?? {}), ...(nextAgents ?? {}) };
+    const priorDefaults = isObjectRecord(priorAgents?.defaults) ? priorAgents.defaults : undefined;
+    const nextDefaults = isObjectRecord(nextAgents?.defaults) ? nextAgents.defaults : undefined;
+    if (priorDefaults || nextDefaults) {
+      (result.agents as Record<string, unknown>).defaults = {
+        ...(priorDefaults ?? {}),
+        ...(nextDefaults ?? {}),
+      };
+    }
+    // The agents.defaults assignment above re-introduces the prior
+    // `agents.defaults.workspace` that was scrubbed by
+    // `scrubStaleWorkspaceAliases`. Re-scrub so the rule (newer
+    // workspace signal wins consistently) holds for the nested alias.
+    scrubStaleWorkspaceAliases(result, routeConfig);
+  }
+  if (priorSession || nextSession) {
+    result.session = { ...(priorSession ?? {}), ...(nextSession ?? {}) };
+  }
+  return result;
+}
+
+function directAdapterConfigFrom(candidate: unknown): Record<string, unknown> | undefined {
+  // T364 round 6 — extract just the adapter-config keys from
+  // candidates that may be mixed gateway payloads (route metadata +
+  // adapter overlay), e.g. `{ workspaceDir, channel: { port: 9801 } }`.
+  // Pre-fix `looksLikeAdapterPluginConfig` returned false for such
+  // payloads, so the legitimate channel/memory overlay was dropped on
+  // the floor and bootstrap/dispatch kept stale settings. The
+  // extraction helper splits route-metadata keys (handled separately
+  // by `resolveOpenClawRouteMetadataConfig`) from adapter-config keys.
+  return extractAdapterPluginConfigOverlay(candidate);
+}
+
+function mergeRouteConfigWithAdapterConfig(
+  routeConfig: Record<string, unknown>,
+  adapterConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  const plugins = isObjectRecord(routeConfig.plugins) ? routeConfig.plugins : undefined;
+  const entries = isObjectRecord(plugins?.entries) ? plugins.entries : undefined;
+  const existingEntry = isObjectRecord(entries?.['adapter-openclaw'])
+    ? entries['adapter-openclaw'] as Record<string, unknown>
+    : undefined;
+  const existingAdapterConfig = isObjectRecord(existingEntry?.config)
+    ? existingEntry.config as Record<string, unknown>
+    : undefined;
+
+  return {
+    ...routeConfig,
+    plugins: {
+      ...(plugins ?? {}),
+      entries: {
+        ...(entries ?? {}),
+        'adapter-openclaw': {
+          ...(existingEntry ?? {}),
+          config: mergeAdapterPluginConfigs(existingAdapterConfig, adapterConfig),
+        },
+      },
+    },
+  };
 }

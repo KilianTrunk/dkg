@@ -1928,6 +1928,93 @@ describe('DkgNodePlugin', () => {
     expect(client.connectLocalAgentIntegration).not.toHaveBeenCalled();
   });
 
+  it('T364 round 13 — disable HTTP write resolves AFTER an enable HTTP write, but the daemon ends up disabled because the disable runs serialized AFTER the enable and re-checks channel state', async () => {
+    // Round 6 closed the channel-disable race for the await yields BEFORE
+    // the HTTP write. Round 13 closes the second-order race: the HTTP
+    // writes themselves were independent. An older
+    // `connectLocalAgentIntegration({ enabled: true })` in flight at the
+    // time of disable could resolve AFTER the disable's HTTP write,
+    // leaving the daemon record at `enabled: true` even though the
+    // channel was already off. Post-fix the writes are serialized onto
+    // a single chain and each step re-checks channel state, so the
+    // latest config wins regardless of network ordering.
+    let resolveConnect: (() => void) | undefined;
+    let resolveDisable: (() => void) | undefined;
+    const connectCalls: any[] = [];
+    const disableCalls: any[] = [];
+    const client = {
+      getLocalAgentIntegration: vi.fn(async () => ({ enabled: true, transport: { kind: 'openclaw-channel' } })),
+      connectLocalAgentIntegration: vi.fn((payload: any) => new Promise<void>((resolve) => {
+        connectCalls.push(payload);
+        resolveConnect = resolve;
+      })),
+      updateLocalAgentIntegration: vi.fn((id: string, payload: any) => new Promise<void>((resolve) => {
+        disableCalls.push({ id, payload });
+        resolveDisable = resolve;
+      })),
+    };
+    const plugin = new DkgNodePlugin({
+      daemonUrl: 'http://localhost:9200',
+      channel: { enabled: true, port: 0 },
+      memory: { enabled: false },
+    } as any);
+    const api: OpenClawPluginApi = {
+      config: {},
+      registrationMode: 'full',
+      registerTool: () => {},
+      registerHook: () => {},
+      on: () => {},
+      logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+    } as unknown as OpenClawPluginApi;
+
+    (plugin as any).client = client;
+    (plugin as any).channelPlugin = {
+      isUsingGatewayRoute: false,
+      isListening: true,
+      bridgePort: 0,
+      start: vi.fn(async () => {}),
+      setClient: vi.fn(),
+    };
+
+    // Step 1: kick off an enable sync. It will reach the
+    // connectLocalAgentIntegration HTTP write (serialized) and pause
+    // because we don't resolveConnect() yet.
+    const syncPromise = (plugin as any).syncLocalAgentIntegrationState(api, 'full');
+    // Drain microtasks so the serialized work can reach the HTTP call.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(client.connectLocalAgentIntegration).toHaveBeenCalledTimes(1);
+
+    // Step 2: flip channel.enabled to false and fire the disable
+    // path. Without serialization, this would race the in-flight
+    // connect. With serialization, it queues behind the connect.
+    (plugin as any).config = {
+      ...(plugin as any).config,
+      channel: { enabled: false, port: 0 },
+    };
+    (plugin as any).clearLocalAgentChannelIntegration(api, 'full');
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    // Disable HTTP write must NOT have fired yet — it's queued
+    // behind the in-flight connect.
+    expect(client.updateLocalAgentIntegration).not.toHaveBeenCalled();
+
+    // Step 3: resolve the in-flight connect. The serialized chain
+    // now picks up the disable, which re-checks channel state
+    // (false) and proceeds with the disable HTTP write.
+    resolveConnect?.();
+    await syncPromise;
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    // The disable load probe should have fired (loadStoredOpenClawIntegration).
+    expect(client.getLocalAgentIntegration).toHaveBeenCalled();
+    // After the load resolves, the disable HTTP write fires.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(client.updateLocalAgentIntegration).toHaveBeenCalledTimes(1);
+    expect(disableCalls[0].payload.enabled).toBe(false);
+
+    resolveDisable?.();
+    await Promise.resolve();
+  });
+
   it('T364 round 6 — aborts in-flight local-agent sync when channel.enabled flips during channelPlugin.start() await', async () => {
     // Companion to the get-load-await test: covers the SECOND yield
     // window in syncLocalAgentIntegrationState. After the load

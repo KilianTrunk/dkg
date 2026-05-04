@@ -266,6 +266,22 @@ export class DkgNodePlugin {
    * failure or after a successful load.
    */
   private lastLocalAgentIntegrationLoadError: string | null = null;
+  /**
+   * Serial promise chain for local-agent integration HTTP mutations.
+   * T364 round 13 — pre-fix `clearLocalAgentChannelIntegration` and
+   * `syncLocalAgentIntegrationState` both guarded `channel.enabled` /
+   * `daemonClientGeneration` only BEFORE their HTTP write, so a config
+   * flip while either request was awaiting the daemon could leave the
+   * daemon record in the wrong state: an older
+   * `connectLocalAgentIntegration({ enabled: true })` resolving AFTER
+   * a newer disable write would re-enable the integration even though
+   * the channel was already off. Serializing every integration write
+   * onto a single chain ensures only one HTTP mutation is in flight
+   * at a time, and each operation re-checks generation + channel state
+   * inside the serialized step (so the latest config wins regardless
+   * of write ordering on the wire).
+   */
+  private localAgentIntegrationWriteChain: Promise<void> = Promise.resolve();
   private nodePeerId: string | undefined;
   /**
    * In-flight handle for the node peer ID probe, used to debounce
@@ -453,6 +469,31 @@ export class DkgNodePlugin {
     this.localAgentIntegrationRetryAttempt = 0;
     this.lastLocalAgentIntegrationWarnReason = null;
     this.lastLocalAgentIntegrationLoadError = null;
+    // T364 round 13 — reset the serial integration write chain so a
+    // brand-new client generation isn't artificially blocked behind
+    // an orphaned in-flight write from the previous client. Orphaned
+    // writes themselves are no-ops (each serialized step re-checks
+    // generation), but freeing the chain lets the next operation run
+    // immediately instead of waiting for the prior fetch to settle.
+    this.localAgentIntegrationWriteChain = Promise.resolve();
+  }
+
+  /**
+   * T364 round 13 — chain `work` onto the serial integration write
+   * pipeline. Each operation runs after the previous one settles
+   * (success or failure) and re-checks generation + channel state
+   * inside its own body, so an older enable that was queued before a
+   * disable cannot resolve after the disable's HTTP write and re-flip
+   * the daemon record.
+   */
+  private serializeLocalAgentIntegrationWrite(work: () => Promise<void>): Promise<void> {
+    const next = this.localAgentIntegrationWriteChain
+      // Don't propagate a prior write's rejection to the next op;
+      // each work() handles its own errors.
+      .catch(() => undefined)
+      .then(() => work());
+    this.localAgentIntegrationWriteChain = next;
+    return next;
   }
 
   /** Whether the base runtime (daemon client, lifecycle hooks) has been initialized. */
@@ -1608,23 +1649,32 @@ export class DkgNodePlugin {
         api.logger.info?.('[dkg] Stored OpenClaw integration was explicitly disconnected by the user; skipping disabled-channel status update');
         return;
       }
-      await client.updateLocalAgentIntegration('openclaw', {
-        enabled: false,
-        description: 'Connect a local OpenClaw agent through the DKG node.',
-        transport: { kind: 'openclaw-channel' },
-        capabilities: disabledChannelCapabilities(),
-        manifest: OPENCLAW_LOCAL_AGENT_MANIFEST,
-        setupEntry: OPENCLAW_LOCAL_AGENT_MANIFEST.setupEntry,
-        metadata: {
-          channelId: 'dkg-ui',
-          registrationMode,
-          transportMode: 'disabled',
-        },
-        runtime: {
-          status: 'configured',
-          ready: false,
-          lastError: 'DKG UI channel disabled by adapter config',
-        },
+      // T364 round 13 — serialize the disable HTTP write so it can't
+      // resolve out of order with an in-flight enable from
+      // syncLocalAgentIntegrationState. Re-check inside the serialized
+      // step too: if the channel got re-enabled while we were queued,
+      // skip the disable entirely.
+      await this.serializeLocalAgentIntegrationWrite(async () => {
+        if (generation !== this.daemonClientGeneration) return;
+        if (channelEnabled()) return;
+        await client.updateLocalAgentIntegration('openclaw', {
+          enabled: false,
+          description: 'Connect a local OpenClaw agent through the DKG node.',
+          transport: { kind: 'openclaw-channel' },
+          capabilities: disabledChannelCapabilities(),
+          manifest: OPENCLAW_LOCAL_AGENT_MANIFEST,
+          setupEntry: OPENCLAW_LOCAL_AGENT_MANIFEST.setupEntry,
+          metadata: {
+            channelId: 'dkg-ui',
+            registrationMode,
+            transportMode: 'disabled',
+          },
+          runtime: {
+            status: 'configured',
+            ready: false,
+            lastError: 'DKG UI channel disabled by adapter config',
+          },
+        });
       });
     }).catch((err: any) => {
       api.logger.warn?.(`[dkg] Local agent channel disable status update failed: ${err?.message ?? err}`);
@@ -1801,13 +1851,25 @@ export class DkgNodePlugin {
     };
 
     try {
-      await client.connectLocalAgentIntegration({
-        ...basePayload,
-        runtime: {
-          status: startError ? 'error' : bridgeReady ? 'ready' : 'connecting',
-          ready: bridgeReady,
-          lastError: startError ? startError.message : null,
-        },
+      // T364 round 13 — serialize the enable HTTP write so it can't
+      // resolve out of order with an in-flight disable from
+      // clearLocalAgentChannelIntegration. Re-check inside the
+      // serialized step too: a disable that fired while this op was
+      // queued must not be undone by a stale enable resolving after
+      // it. The pre-write rechecks earlier in this function close
+      // the await-yield window; this final check inside the
+      // serialized step closes the in-flight-HTTP window.
+      await this.serializeLocalAgentIntegrationWrite(async () => {
+        if (generation !== this.daemonClientGeneration) return;
+        if (this.config.channel?.enabled !== true) return;
+        await client.connectLocalAgentIntegration({
+          ...basePayload,
+          runtime: {
+            status: startError ? 'error' : bridgeReady ? 'ready' : 'connecting',
+            ready: bridgeReady,
+            lastError: startError ? startError.message : null,
+          },
+        });
       });
     } catch (err: any) {
       api.logger.warn?.(`[dkg] Local agent registration failed (will retry on next gateway start): ${err.message}`);

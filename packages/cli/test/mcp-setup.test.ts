@@ -72,6 +72,10 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const readWalletsWithRetry = vi.fn(async () => ['0xtest1', '0xtest2', '0xtest3']);
     const requestFaucetFunding = vi.fn(async () => ({ success: true }) as any);
     const logManualFundingInstructions = vi.fn(() => {});
+    // Phase-2: detectContext defaults to "installed" by returning null
+    // from findDkgMonorepoRoot. Tests that exercise the monorepo path
+    // override this dep to return a mock repo root.
+    const findDkgMonorepoRoot = vi.fn((_startDir?: string) => null as string | null);
     return {
       loadNetworkConfig,
       writeDkgConfig,
@@ -79,6 +83,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       readWalletsWithRetry,
       requestFaucetFunding,
       logManualFundingInstructions,
+      findDkgMonorepoRoot,
       ...overrides,
     };
   }
@@ -343,6 +348,125 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(deps.logManualFundingInstructions).toHaveBeenCalledTimes(1);
     // Registration still proceeds.
     expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(true);
+
+    fetchSpy.mockRestore();
+  });
+
+  // ── Phase-2: monorepo context detection + --installed/--monorepo flags ──
+
+  // Helper: extract the JSON object emitted by --print-only. Vitest's
+  // own progress reporter occasionally interleaves a non-JSON write
+  // ahead of production stdout, so we slice from the first `{` to
+  // the matching last `}`. The production code emits exactly one
+  // JSON object via `process.stdout.write`, so first-`{` to last-`}`
+  // is a tight bracket.
+  const parseStdoutJson = (
+    spy: ReturnType<typeof vi.spyOn>,
+  ): Record<string, any> => {
+    const all = (spy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    const start = all.indexOf('{');
+    const end = all.lastIndexOf('}');
+    if (start < 0 || end < 0 || end <= start) {
+      throw new Error(`No JSON object in stdout: ${JSON.stringify(all)}`);
+    }
+    return JSON.parse(all.slice(start, end + 1));
+  };
+
+  it('phase-2: --print-only with monorepo auto-detect emits the local-CLI-dist absolute-path form', async () => {
+    const fakeRepoRoot = join('/fake', 'dkg-v9');
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+    });
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await mcpSetupAction({ printOnly: true }, deps);
+
+    const parsed = parseStdoutJson(stdoutSpy);
+    // Monorepo form: command is `node`, args[0] is the absolute
+    // path to the contributor's local CLI dist as produced by
+    // path.join — platform-native separators.
+    expect(parsed.mcpServers.dkg.command).toBe('node');
+    expect(parsed.mcpServers.dkg.args[0]).toBe(
+      join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
+    );
+    expect(parsed.mcpServers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
+    stdoutSpy.mockRestore();
+  });
+
+  it('phase-2: --print-only with no monorepo detected emits the standard `dkg` installed form', async () => {
+    const deps = makeDeps(); // findDkgMonorepoRoot defaults to returning null
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await mcpSetupAction({ printOnly: true }, deps);
+
+    const parsed = parseStdoutJson(stdoutSpy);
+    expect(parsed.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    stdoutSpy.mockRestore();
+  });
+
+  it('phase-2: --installed forces the standard form even from inside a monorepo', async () => {
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => join('/fake', 'dkg-v9')),
+    });
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await mcpSetupAction({ printOnly: true, installed: true }, deps);
+
+    const parsed = parseStdoutJson(stdoutSpy);
+    expect(parsed.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    stdoutSpy.mockRestore();
+  });
+
+  it('phase-2: --monorepo from outside any monorepo throws the canonical error', async () => {
+    const deps = makeDeps(); // findDkgMonorepoRoot returns null
+    await expect(
+      mcpSetupAction({ printOnly: true, monorepo: true }, deps),
+    ).rejects.toThrow(/--monorepo flag passed but no DKG monorepo root/);
+  });
+
+  it('phase-2: --installed and --monorepo together throw the mutual-exclusion error', async () => {
+    const deps = makeDeps();
+    await expect(
+      mcpSetupAction({ printOnly: true, installed: true, monorepo: true }, deps),
+    ).rejects.toThrow(/mutually exclusive/);
+  });
+
+  it('phase-2: a stored installed-form entry classifies as `stale` when run in monorepo mode', async () => {
+    // Stale-across-context: a config with the `dkg` (installed) form
+    // is correct when the user is on the global install but stale
+    // when they switch to a dev-checkout invocation. Asserts the
+    // staleness detection compares against the context-aware
+    // canonical entry, not a hardcoded form.
+    const fakeRepoRoot = join('/fake', 'dkg-v9');
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    // Pre-populate Cursor with the installed-form entry.
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify(
+        { mcpServers: { dkg: { command: 'dkg', args: ['mcp', 'serve'] } } },
+        null,
+        2,
+      ),
+    );
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new Error('connection refused');
+    });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // Post-write, the config now carries the monorepo-form entry —
+    // platform-native paths from `path.join`.
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    expect(after.mcpServers.dkg.command).toBe('node');
+    expect(after.mcpServers.dkg.args[0]).toBe(
+      join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
+    );
+    expect(after.mcpServers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
 
     fetchSpy.mockRestore();
   });

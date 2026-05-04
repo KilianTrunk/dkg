@@ -1807,6 +1807,8 @@ mcpCmd
   .option('--force', 'Refresh every detected client regardless of current registration state')
   .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
   .option('--yes', 'Auto-confirm all registrations (default; reserved for future interactive prompts)')
+  .option('--installed', 'Force the installed-mode command form ({ command: "dkg", args: ["mcp", "serve"] }) even when invoked from inside a monorepo dev checkout. Mutually exclusive with --monorepo.')
+  .option('--monorepo', 'Force the monorepo-mode command form (absolute path to local CLI dist) — errors if no DKG monorepo root can be located. Mutually exclusive with --installed.')
   .action(async (opts) => {
     // Dynamic-import the openclaw-setup primitives for the bundled
     // init + daemon-start. Same import surface (and same package
@@ -1840,6 +1842,7 @@ mcpCmd
         readWalletsWithRetry: openclawSetupExports.readWalletsWithRetry,
         logManualFundingInstructions: openclawSetupExports.logManualFundingInstructions,
         requestFaucetFunding: coreExports.requestFaucetFunding,
+        findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
       });
     } catch (err: any) {
       console.error(`\n[dkg mcp setup] ERROR: ${err?.message ?? err}\n`);

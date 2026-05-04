@@ -60,7 +60,31 @@ export interface McpSetupCliOptions {
   verify?: boolean;
   /** Preview without writing or starting anything. Mirrors openclaw-setup. */
   dryRun?: boolean;
+  /**
+   * Force installed-mode command form even when invoked from inside
+   * a monorepo dev checkout. Escape hatch for contributors who want
+   * to test the published-CLI shape from a dev cwd. Mutually
+   * exclusive with `--monorepo`.
+   */
+  installed?: boolean;
+  /**
+   * Force monorepo-mode command form (writes the absolute path to
+   * the local CLI dist). Errors if no monorepo root can be located.
+   * Mutually exclusive with `--installed`.
+   */
+  monorepo?: boolean;
 }
+
+/**
+ * Setup context — drives `canonicalEntry`'s output shape. `'installed'`
+ * is the default for npm-installed CLIs (writes
+ * `{ command: "dkg", args: ["mcp", "serve"] }`); `'monorepo'` is the
+ * contributor-from-dev-checkout case (writes
+ * `{ command: "node", args: ["<repo>/packages/cli/dist/cli.js",
+ * "mcp", "serve"] }` so the contributor's local-build runs, not a
+ * stale globally-installed version).
+ */
+export type SetupContext = 'installed' | 'monorepo';
 
 /**
  * Dependency surface for `mcpSetupAction`. All bundled-flow primitives
@@ -77,18 +101,67 @@ export interface McpSetupActionDeps {
   logManualFundingInstructions: typeof import('@origintrail-official/dkg-adapter-openclaw').logManualFundingInstructions;
   /** Faucet primitive from `@origintrail-official/dkg-core`. */
   requestFaucetFunding: typeof import('@origintrail-official/dkg-core').requestFaucetFunding;
+  /**
+   * Walks ancestors looking for a DKG monorepo root. Defaulted to the
+   * dkg-core implementation in production; injectable so tests can
+   * stub it without touching the real filesystem.
+   */
+  findDkgMonorepoRoot: typeof import('@origintrail-official/dkg-core').findDkgMonorepoRoot;
 }
 
 /**
- * The canonical MCP-server entry written into client config files. Single
- * source of truth — every detected client gets the same block under
- * `mcpServers.dkg`.
+ * The canonical MCP-server entry written into client config files.
+ * Context-aware: `'installed'` uses the global `dkg` bin (the npm-
+ * installed shape); `'monorepo'` uses an absolute path to the local
+ * CLI dist so a contributor's dev build runs even when a stale
+ * `dkg` from a prior global install is still on PATH.
  */
-function canonicalEntry(): Record<string, unknown> {
-  return {
-    command: 'dkg',
-    args: ['mcp', 'serve'],
-  };
+function canonicalEntry(
+  context: SetupContext,
+  monorepoRoot: string | null,
+): Record<string, unknown> {
+  if (context === 'monorepo' && monorepoRoot) {
+    return {
+      command: 'node',
+      args: [join(monorepoRoot, 'packages', 'cli', 'dist', 'cli.js'), 'mcp', 'serve'],
+    };
+  }
+  return { command: 'dkg', args: ['mcp', 'serve'] };
+}
+
+/**
+ * Detect the setup context. With `force` set to a literal value, that
+ * value wins (with `--monorepo` requiring a discoverable monorepo
+ * root). Without `force`, walk ancestors of the CLI's compiled
+ * location: a hit means we're invoked from a monorepo dev checkout,
+ * so write the local-cli-dist absolute path; a miss means we're
+ * globally installed and the standard `dkg` shape is correct.
+ *
+ * `--installed` and `--monorepo` are mutually exclusive — the caller
+ * is expected to have validated that before calling. We accept the
+ * narrow union here so the action can pass through whichever flag
+ * commander produced without re-validating.
+ */
+function detectContext(
+  findRoot: typeof import('@origintrail-official/dkg-core').findDkgMonorepoRoot,
+  opts: { force?: SetupContext } = {},
+): { context: SetupContext; monorepoRoot: string | null } {
+  if (opts.force === 'installed') {
+    return { context: 'installed', monorepoRoot: null };
+  }
+  if (opts.force === 'monorepo') {
+    const root = findRoot();
+    if (!root) {
+      throw new Error(
+        '--monorepo flag passed but no DKG monorepo root could be located from this CLI invocation.',
+      );
+    }
+    return { context: 'monorepo', monorepoRoot: root };
+  }
+  const root = findRoot();
+  return root
+    ? { context: 'monorepo', monorepoRoot: root }
+    : { context: 'installed', monorepoRoot: null };
 }
 
 interface ClientTarget {
@@ -310,8 +383,10 @@ function writeConfigBody(target: ClientTarget, body: Record<string, unknown>): v
   }
 }
 
-function classify(target: ClientTarget): ClientState {
-  const expected = canonicalEntry();
+function classify(
+  target: ClientTarget,
+  expected: Record<string, unknown>,
+): ClientState {
   const body = readConfigBody(target);
   const current = readEntryAt(body, target.entryPath) as
     | Record<string, unknown>
@@ -339,11 +414,14 @@ function classify(target: ClientTarget): ClientState {
   };
 }
 
-function writeRegistration(target: ClientTarget): void {
+function writeRegistration(
+  target: ClientTarget,
+  entry: Record<string, unknown>,
+): void {
   const body = readConfigBody(target);
   const { head, leaf } = splitEntryPath(target.entryPath);
   const container = ensurePathContainer(body, head);
-  container[leaf] = canonicalEntry();
+  container[leaf] = entry;
   writeConfigBody(target, body);
 }
 
@@ -399,10 +477,31 @@ export async function mcpSetupAction(
     throw new Error(`Invalid port "${opts.port}" — must be an integer between 1 and 65535`);
   }
 
+  // Phase-2: detect setup context (installed vs monorepo dev). Drives
+  // `canonicalEntry`'s output shape so a contributor's local CLI dist
+  // is the one Cursor / Claude Code etc. invoke, not a stale globally-
+  // installed version. `--installed` / `--monorepo` are mutually
+  // exclusive overrides; flag them at the boundary so a misuse
+  // surfaces with a clear error rather than silent precedence.
+  if (opts.installed === true && opts.monorepo === true) {
+    throw new Error(
+      '--installed and --monorepo are mutually exclusive; pass at most one.',
+    );
+  }
+  const forcedContext: SetupContext | undefined = opts.installed
+    ? 'installed'
+    : opts.monorepo
+      ? 'monorepo'
+      : undefined;
+  const { context, monorepoRoot } = detectContext(deps.findDkgMonorepoRoot, {
+    force: forcedContext,
+  });
+  const expectedEntry = canonicalEntry(context, monorepoRoot);
+
   if (printOnly) {
     const block = {
       mcpServers: {
-        dkg: canonicalEntry(),
+        dkg: expectedEntry,
       },
     };
     process.stdout.write(JSON.stringify(block, null, 2) + '\n');
@@ -587,7 +686,7 @@ export async function mcpSetupAction(
     return;
   }
 
-  const states = clients.map(classify);
+  const states = clients.map((c) => classify(c, expectedEntry));
   type Action = 'register' | 'refresh' | 'skip';
   const planned: Array<{ s: ClientState; action: Action }> = states.map((s) => {
     if (force) return { s, action: 'refresh' };
@@ -621,7 +720,7 @@ export async function mcpSetupAction(
     console.log('');
     for (const { s, action } of writes) {
       try {
-        writeRegistration(s.target);
+        writeRegistration(s.target, expectedEntry);
         console.log(`  ${action === 'register' ? 'Registered' : 'Refreshed'} ${s.target.name} → ${s.target.displayPath}`);
       } catch (err: any) {
         console.error(`  Failed to write ${s.target.displayPath}: ${err?.message ?? err}`);

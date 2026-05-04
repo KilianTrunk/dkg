@@ -125,7 +125,9 @@ When active as `memory.provider: dkg`, the Python provider:
 
 - loads DKG settings from `$HERMES_HOME/dkg.json`, with environment overrides
   such as `DKG_DAEMON_URL`, `DKG_CONTEXT_GRAPH`, and `DKG_AGENT_NAME`
-- reads the DKG bearer token from `$DKG_HOME/auth.token` or `~/.dkg/auth.token`
+- reads the DKG bearer token from `DKG_API_TOKEN` / `DKG_AUTH_TOKEN`, the
+  setup-resolved `dkg_home` in `$HERMES_HOME/dkg.json`, `$DKG_HOME/auth.token`,
+  or `~/.dkg/auth.token`
 - redacts bearer tokens from client errors
 - stores persistent facts in a DKG assertion for the configured context graph
 - syncs completed turns in a background thread with stable turn IDs and
@@ -174,8 +176,9 @@ provenance before forwarding them to Hermes.
 ## Auth And Security
 
 - Non-public DKG daemon routes use the existing bearer token auth.
-- The Python client reads the DKG token from `DKG_HOME`/`~/.dkg`; it does not
-  require copying the token into Hermes config.
+- The Python client reads the DKG token from token environment variables first,
+  then the setup-resolved `dkg_home` written to `$HERMES_HOME/dkg.json`, then
+  `DKG_HOME`/`~/.dkg`; it does not copy the token into Hermes config.
 - Setup registration uses the same bearer source: explicit token environment
   variables first, then `$DKG_HOME/auth.token` or `~/.dkg/auth.token`.
 - Standalone loopback Hermes bridge calls use a route-scoped

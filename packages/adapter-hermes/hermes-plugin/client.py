@@ -144,17 +144,22 @@ def _slugify_context_graph_id(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
-def _resolve_dkg_home() -> Path:
-    """Resolve the DKG data directory: $DKG_HOME > ~/.dkg."""
+def _resolve_dkg_home(dkg_home: Optional[str] = None) -> Path:
+    """Resolve the DKG data directory: explicit config > $DKG_HOME > ~/.dkg."""
+    if dkg_home:
+        return Path(dkg_home).expanduser()
     env = os.environ.get("DKG_HOME")
     if env:
-        return Path(env)
+        return Path(env).expanduser()
     return Path.home() / ".dkg"
 
 
-def _load_auth_token() -> Optional[str]:
-    """Try to load auth token from $DKG_HOME/auth.token (or ~/.dkg/auth.token)."""
-    token_path = _resolve_dkg_home() / "auth.token"
+def _load_auth_token(dkg_home: Optional[str] = None) -> Optional[str]:
+    """Try to load auth token from explicit DKG home, $DKG_HOME, or ~/.dkg."""
+    env_token = (os.environ.get("DKG_API_TOKEN") or os.environ.get("DKG_AUTH_TOKEN") or "").strip()
+    if env_token:
+        return env_token
+    token_path = _resolve_dkg_home(dkg_home) / "auth.token"
     if not token_path.exists():
         return None
     try:
@@ -169,10 +174,12 @@ class DKGClient:
     """HTTP client for DKG V10 daemon."""
 
     def __init__(self, base_url: str = _DEFAULT_URL, timeout: int = _TIMEOUT,
-                 import_roots: Optional[List[str]] = None):
+                 import_roots: Optional[List[str]] = None,
+                 dkg_home: Optional[str] = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self._token = _load_auth_token()
+        self._dkg_home = dkg_home
+        self._token = _load_auth_token(dkg_home)
         self._session = None  # lazy
         self._agent_address: Optional[str] = None
         self._peer_id: Optional[str] = None

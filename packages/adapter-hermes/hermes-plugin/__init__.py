@@ -793,6 +793,7 @@ class DKGMemoryProvider(MemoryProvider):
         self._client = DKGClient(
             base_url=self._config.get("daemon_url", "http://127.0.0.1:9200"),
             import_roots=self._config.get("import_roots") or None,
+            dkg_home=self._config.get("dkg_home") or None,
         )
 
         # Check daemon health

@@ -28,7 +28,10 @@ def register_cli(cli_group):
 
         config = _load_config()
         agent_name = config.get("agent_name", "")
-        client = DKGClient(base_url=config.get("daemon_url", "http://127.0.0.1:9200"))
+        client = DKGClient(
+            base_url=config.get("daemon_url", "http://127.0.0.1:9200"),
+            dkg_home=config.get("dkg_home") or None,
+        )
 
         if not client.health_check():
             cache = _load_cache(agent_name)
@@ -61,7 +64,10 @@ def register_cli(cli_group):
         from . import _load_config
 
         config = _load_config()
-        client = DKGClient(base_url=config.get("daemon_url", "http://127.0.0.1:9200"))
+        client = DKGClient(
+            base_url=config.get("daemon_url", "http://127.0.0.1:9200"),
+            dkg_home=config.get("dkg_home") or None,
+        )
 
         if not client.health_check():
             click.echo("Error: DKG daemon is not reachable.", err=True)
@@ -85,7 +91,10 @@ def register_cli(cli_group):
 
         config = _load_config()
         agent_name = config.get("agent_name", "")
-        client = DKGClient(base_url=config.get("daemon_url", "http://127.0.0.1:9200"))
+        client = DKGClient(
+            base_url=config.get("daemon_url", "http://127.0.0.1:9200"),
+            dkg_home=config.get("dkg_home") or None,
+        )
 
         if not client.health_check():
             click.echo("Error: DKG daemon is not reachable.", err=True)

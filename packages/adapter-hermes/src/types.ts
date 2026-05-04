@@ -43,6 +43,7 @@ export interface HermesSetupState {
   status: HermesRuntimeStatus;
   profile: HermesProfileMetadata;
   daemonUrl: string;
+  dkgHome: string;
   contextGraph: string;
   agentName?: string;
   bridge?: {

@@ -49,6 +49,11 @@ Setup writes only adapter-owned artifacts inside the selected Hermes profile:
 - `plugins/dkg`
 - `.dkg-adapter-hermes/setup-state.json`
 - a managed `memory.provider: dkg` block in `config.yaml`
+- the bundled DKG node skill at `skills/dkg-node/SKILL.md`
+
+`dkg.json` records the DKG home directory that matches the target daemon, so
+Hermes uses the same `auth.token` as `pnpm dkg` in monorepo `.dkg-dev` and
+packaged `.dkg` installs.
 
 The adapter refuses to overwrite an existing non-DKG memory provider. If the
 profile already uses Honcho, Mem0, Supermemory, or another provider, choose

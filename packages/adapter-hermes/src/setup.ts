@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
-import { resolveDkgConfigHome } from '@origintrail-official/dkg-core';
+import { resolveDkgConfigHome, resolveDkgHome } from '@origintrail-official/dkg-core';
 import {
   type HermesMemoryMode,
   type HermesProfileMetadata,
@@ -95,6 +95,7 @@ export function planHermesSetup(options: HermesSetupOptions = {}): HermesSetupPl
   const profile = resolveHermesProfile(options);
   const warnings = detectProviderConflict(profile, options.memoryMode ?? 'provider');
   const daemonUrl = stripTrailingSlashes(options.daemonUrl ?? 'http://127.0.0.1:9200');
+  const dkgHome = resolveDkgHome({ daemonUrl });
   const bridge = normalizeBridgeConfig(options);
   const publishGuard = normalizePublishGuard(options.publishGuard);
   const managedFiles = [
@@ -118,6 +119,7 @@ export function planHermesSetup(options: HermesSetupOptions = {}): HermesSetupPl
     status: warnings.length ? 'degraded' : 'configured',
     profile,
     daemonUrl,
+    dkgHome,
     contextGraph: options.contextGraph ?? 'agent-context',
     agentName: options.agentName,
     ...(bridge ? { bridge } : {}),
@@ -157,6 +159,7 @@ export function setupHermesProfile(options: HermesSetupOptions = {}): HermesSetu
   writeOwnedJson(dkgConfigPath, {
     managedBy: MANAGED_BY,
     daemon_url: plan.state.daemonUrl,
+    dkg_home: plan.state.dkgHome,
     ...(plan.state.bridge ? { bridge: plan.state.bridge } : {}),
     context_graph: plan.state.contextGraph,
     agent_name: plan.state.agentName ?? '',
@@ -447,7 +450,7 @@ function normalizePort(value: string | number | undefined): number | undefined {
 }
 
 async function connectDaemonBestEffort(plan: HermesSetupPlan, daemonUrl: string | undefined): Promise<void> {
-  const apiToken = loadDkgAuthToken();
+  const apiToken = loadDkgAuthToken(daemonUrl);
   const transport: { kind: 'hermes-channel'; bridgeUrl?: string; gatewayUrl?: string; healthUrl?: string } = {
     kind: 'hermes-channel',
   };
@@ -493,7 +496,7 @@ async function disconnectDaemonBestEffort(
   daemonUrl: string | undefined,
   setupState: HermesSetupState,
 ): Promise<void> {
-  const apiToken = loadDkgAuthToken();
+  const apiToken = loadDkgAuthToken(daemonUrl);
   const client = new HermesDkgClient({
     baseUrl: daemonUrl,
     apiToken,
@@ -582,11 +585,11 @@ function isLoopbackUrl(value: string): boolean {
   }
 }
 
-function loadDkgAuthToken(): string | undefined {
+function loadDkgAuthToken(daemonUrl?: string): string | undefined {
   const envToken = trimmed(process.env.DKG_API_TOKEN) ?? trimmed(process.env.DKG_AUTH_TOKEN);
   if (envToken) return envToken;
 
-  const dkgHome = resolve(expandHome(trimmed(process.env.DKG_HOME) ?? dkgDir()));
+  const dkgHome = resolve(expandHome(trimmed(process.env.DKG_HOME) ?? dkgDir(daemonUrl)));
   try {
     const rawTokenFile = readFileSync(join(dkgHome, 'auth.token'), 'utf-8');
     for (const line of rawTokenFile.split('\n')) {
@@ -599,8 +602,8 @@ function loadDkgAuthToken(): string | undefined {
   }
 }
 
-function dkgDir(): string {
-  return resolveDkgConfigHome({ startDir: __dirname });
+function dkgDir(daemonUrl?: string): string {
+  return resolveDkgHome({ daemonUrl }) ?? resolveDkgConfigHome({ startDir: __dirname });
 }
 
 function printPlan(label: string, plan: HermesSetupPlan): void {

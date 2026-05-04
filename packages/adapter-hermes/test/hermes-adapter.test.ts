@@ -10,9 +10,10 @@ vi.mock('@origintrail-official/dkg-core', async () => {
   return {
     ...actual,
     resolveDkgConfigHome: vi.fn((opts) => actual.resolveDkgConfigHome(opts)),
+    resolveDkgHome: vi.fn((opts) => actual.resolveDkgHome(opts)),
   };
 });
-import { resolveDkgConfigHome } from '@origintrail-official/dkg-core';
+import { resolveDkgHome } from '@origintrail-official/dkg-core';
 import { HermesAdapterPlugin } from '../src/HermesAdapterPlugin.js';
 import { registerHermesRoutes } from '../src/hermes-routes.js';
 import type { DaemonPluginApi } from '../src/types.js';
@@ -1050,7 +1051,7 @@ assert config["allow_context_graph_admin_tools"] is False, config
     delete process.env.DKG_AUTH_TOKEN;
     process.env.HOME = homeRoot;
     process.env.USERPROFILE = homeRoot;
-    const resolver = vi.mocked(resolveDkgConfigHome);
+    const resolver = vi.mocked(resolveDkgHome);
     resolver.mockClear();
 
     try {
@@ -1069,10 +1070,12 @@ assert config["allow_context_graph_admin_tools"] is False, config
     }
 
     expect((calls[0].init.headers as Record<string, string>).Authorization).toBe('Bearer live-dev-token');
+    const config = JSON.parse(readFileSync(join(hermesHome, 'dkg.json'), 'utf-8'));
+    const state = JSON.parse(readFileSync(join(hermesHome, '.dkg-adapter-hermes', 'setup-state.json'), 'utf-8'));
+    expect(config.dkg_home).toBe(dkgDevHome);
+    expect(state.dkgHome).toBe(dkgDevHome);
     expect(resolver.mock.calls.some(([opts]) => {
-      const startDir = (opts as any)?.startDir;
-      return typeof startDir === 'string'
-        && startDir.replace(/\\/g, '/').includes('/packages/adapter-hermes/src');
+      return (opts as any)?.daemonUrl === 'http://127.0.0.1:9200';
     })).toBe(true);
   });
 
@@ -1265,7 +1268,7 @@ sys.modules["plugins.memory.dkg"] = pkg
 store_calls = []
 client_mod = types.ModuleType("plugins.memory.dkg.client")
 class DKGClient:
-    def __init__(self, base_url):
+    def __init__(self, base_url, **kwargs):
         self.base_url = base_url
     def health_check(self):
         return True
@@ -2292,6 +2295,54 @@ assert online == {"query": "alpha", "count": 0, "scope": "project-cg", "hits": [
 provider._offline = True
 offline = json.loads(provider.handle_tool_call("memory_search", {"query": "alpha", "limit": 5}))
 assert offline["offline"] is True and offline["count"] == 1, offline
+`;
+    const result = spawnSync('python', ['-B', '-c', script], {
+      cwd: process.cwd(),
+      encoding: 'utf-8',
+    });
+
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('loads Hermes Python client auth from setup-resolved DKG home', () => {
+    const script = String.raw`
+import importlib.util
+import os
+import tempfile
+from pathlib import Path
+
+root = Path(tempfile.mkdtemp(prefix="hermes-dkg-home-"))
+default_home = root / "user-home"
+default_dkg_home = default_home / ".dkg"
+resolved_dkg_home = root / ".dkg-dev"
+default_dkg_home.mkdir(parents=True)
+resolved_dkg_home.mkdir(parents=True)
+(default_dkg_home / "auth.token").write_text("stale-token\n", encoding="utf-8")
+(resolved_dkg_home / "auth.token").write_text("# comment\nlive-token\n", encoding="utf-8")
+
+os.environ["HOME"] = str(default_home)
+os.environ["USERPROFILE"] = str(default_home)
+os.environ.pop("DKG_HOME", None)
+
+plugin_dir = Path(r"${process.cwd().replace(/\\/g, '\\\\')}") / "hermes-plugin"
+spec = importlib.util.spec_from_file_location("dkg_client", plugin_dir / "client.py")
+client_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(client_module)
+
+client = client_module.DKGClient("http://127.0.0.1:9200", dkg_home=str(resolved_dkg_home))
+assert client._token == "live-token", client._token
+
+os.environ["DKG_AUTH_TOKEN"] = "env-override-token"
+env_override_client = client_module.DKGClient("http://127.0.0.1:9200", dkg_home=str(resolved_dkg_home))
+assert env_override_client._token == "env-override-token", env_override_client._token
+os.environ.pop("DKG_AUTH_TOKEN", None)
+
+env_dkg_home = root / "env-dkg"
+env_dkg_home.mkdir()
+(env_dkg_home / "auth.token").write_text("env-token\n", encoding="utf-8")
+os.environ["DKG_HOME"] = str(env_dkg_home)
+env_client = client_module.DKGClient("http://127.0.0.1:9200")
+assert env_client._token == "env-token", env_client._token
 `;
     const result = spawnSync('python', ['-B', '-c', script], {
       cwd: process.cwd(),

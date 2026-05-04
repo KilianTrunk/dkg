@@ -2,9 +2,9 @@ import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
 /**
- * Source-worker configs are sensitive operator material, equivalent to
- * auth.token: they contain daemonToken and select handlerModule code that
- * this process dynamically imports and executes.
+ * Source-worker configs are sensitive operator material, equivalent to the
+ * daemon auth.token. They contain daemonToken and select handlerModule code
+ * that this process dynamically imports and executes.
  */
 export interface SourceWorkerConfig<TSource = unknown> {
   pollIntervalMs: number;
@@ -12,6 +12,7 @@ export interface SourceWorkerConfig<TSource = unknown> {
   daemonUrl: string;
   daemonToken: string;
   handlerModule: string;
+  /** Optional named export to load from handlerModule instead of default/sourceWorker. */
   handlerExport?: string;
   sources: TSource[];
 }

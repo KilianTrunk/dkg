@@ -88,6 +88,7 @@ export async function runConfiguredSourceWorker(configPath: string, options: { o
 async function loadHandlerModule<TSource extends SourceWorkerSource>(
   config: SourceWorkerConfig<TSource>,
 ): Promise<SourceWorkerHandlerModule<TSource>> {
+  // handlerModule is trusted operator code selected by the sensitive worker config.
   const namespace = await import(pathToFileURL(config.handlerModule).href);
   const candidate = config.handlerExport
     ? namespace[config.handlerExport]

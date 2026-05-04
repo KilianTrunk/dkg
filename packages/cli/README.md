@@ -105,6 +105,54 @@ content must keep the same fingerprint across runs. Do not include wall-clock
 time, random values, transient job status, or other polling noise in the
 fingerprint.
 
+Minimal config shape:
+
+```json
+{
+  "pollIntervalMs": 60000,
+  "stateFile": "./state/source-worker.json",
+  "daemonUrl": "http://127.0.0.1:9200",
+  "daemonToken": "<contents of auth.token>",
+  "handlerModule": "./handlers/source-worker.mjs",
+  "handlerExport": "sourceWorker",
+  "sources": [{ "id": "source-1" }]
+}
+```
+
+The handler module is loaded from the config file's directory:
+
+```js
+export const sourceWorker = {
+  createSourceWorkerDeps({ sharedMemory, asyncLift }) {
+    return {
+      async getFingerprint(source) {
+        return source.contentHash;
+      },
+      async processSource(source, fingerprint) {
+        const share = await sharedMemory.share(source.contextGraphId, source.quads);
+        const jobId = await asyncLift.lift({
+          ...source.liftRequest,
+          shareOperationId: share.shareOperationId
+        });
+        return {
+          sourceId: source.id,
+          skipped: false,
+          jobIds: [jobId],
+          jobStatuses: { [jobId]: "queued" },
+          status: "queued",
+          nextState: {
+            fingerprint,
+            lastStatus: "queued",
+            lastJobIds: [jobId],
+            lastJobStatuses: { [jobId]: "queued" }
+          }
+        };
+      },
+    };
+  },
+};
+```
+
 The worker state file is updated with a same-directory temp-file write, file
 fsync, atomic rename, and parent-directory fsync where supported so a crash does
 not truncate the previous state file.

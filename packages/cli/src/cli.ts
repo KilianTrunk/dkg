@@ -2176,7 +2176,7 @@ const sourceWorkerCmd = program
 sourceWorkerCmd
   .command('run')
   .description('Run a source worker from a JSON config file')
-  .requiredOption('--config <path>', 'Worker config JSON file')
+  .requiredOption('--config <path>', 'Sensitive worker config JSON file')
   .option('--once', 'Run a single iteration and exit')
   .action(async (opts: ActionOpts) => {
     try {

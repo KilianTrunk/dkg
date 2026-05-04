@@ -17,6 +17,7 @@ class SourceWorkerConfig {
   +daemonUrl
   +daemonToken
   +handlerModule
+  +handlerExport
   +stateFile
   +sources
 }
@@ -85,10 +86,11 @@ daemon bearer token and selects a handler module that the CLI dynamically import
 and executes in the worker process, so it must be protected like the daemon
 `auth.token` and must not be committed to source control.
 
-The handler module exports `createSourceWorkerDeps(context)`. The CLI passes the
-resolved config plus daemon clients for Shared Working Memory writes and async
-publisher lift jobs. The handler returns the source-specific `getFingerprint`
-and `processSource` hooks.
+The handler module exposes `createSourceWorkerDeps(context)` either through the
+named `handlerExport` selected by config, `default`, `sourceWorker`, or the
+module namespace itself. The CLI passes the resolved config plus daemon clients
+for Shared Working Memory writes and async publisher lift jobs. The selected
+handler returns the source-specific `getFingerprint` and `processSource` hooks.
 
 `getFingerprint(source)` is the content identity contract. Source content that
 affects emitted triples or assets must produce a different fingerprint, and
@@ -113,9 +115,9 @@ participant Publisher as AsyncPublisher API
 
 Operator->>CLI: dkg source-worker run --config worker.json
 CLI->>Config: load and resolve config-relative paths
-Config-->>CLI: daemonUrl, daemonToken, handlerModule, stateFile, sources
+Config-->>CLI: daemonUrl, daemonToken, handlerModule, handlerExport, stateFile, sources
 CLI->>Runner: runConfiguredSourceWorker(configPath)
-Runner->>Handler: dynamic import handlerModule
+Runner->>Handler: dynamic import handlerModule and select handler export
 Handler-->>Runner: createSourceWorkerDeps(context)
 Runner->>State: loadSourceWorkerState(stateFile)
 loop each configured source

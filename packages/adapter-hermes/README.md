@@ -24,10 +24,11 @@ provider conflict handling, and client contracts for the daemon-owned
 Supported Hermes channel routes are registered by the DKG CLI daemon, not by
 this adapter package as standalone HTTP stubs.
 
-The Hermes local bridge process that answers chat requests must expose
-`/health`, `/send`, and `/stream` on its configured bridge URL, or equivalent
-gateway routes under `/api/hermes-channel/*`. Until that bridge is running,
-the node can register Hermes but chat stays degraded/offline.
+Node UI chat uses Hermes' OpenAI-compatible API server by default:
+`http://127.0.0.1:8642/health` and
+`http://127.0.0.1:8642/v1/chat/completions`. Start Hermes with
+`API_SERVER_ENABLED=true`; until that API server is running, the node can
+register Hermes but chat stays degraded/offline.
 
 ## Architecture
 
@@ -67,8 +68,8 @@ Common setup flags:
 | --- | --- |
 | `--profile <name>` | Target `~/.hermes/profiles/<name>` instead of the default profile. |
 | `--daemon-url <url>` | DKG daemon URL. Defaults to `http://127.0.0.1:9200`. |
-| `--bridge-url <url>` | Same-host Hermes bridge URL for local chat. Use loopback addresses only. |
-| `--gateway-url <url>` | Gateway URL for WSL2 or remote Hermes chat. |
+| `--bridge-url <url>` | Custom same-host Hermes bridge URL for local chat. Use loopback addresses only. |
+| `--gateway-url <url>` | Hermes OpenAI-compatible API server URL. Defaults to `http://127.0.0.1:8642`. |
 | `--bridge-health-url <url>` | Optional health URL override for the configured bridge/gateway. Must belong to the configured `--bridge-url` or `--gateway-url` base. |
 | `--port <port>` | Shortcut for `http://127.0.0.1:<port>`. |
 | `--memory-mode <mode>` | `primary` maps to provider-election mode and is the default path; use `tools-only` to preserve an existing Hermes memory provider. |
@@ -124,12 +125,14 @@ surface in this release.
 When active as `memory.provider: dkg`, the Python provider:
 
 - loads DKG settings from `$HERMES_HOME/dkg.json`, with environment overrides
-  such as `DKG_DAEMON_URL`, `DKG_CONTEXT_GRAPH`, and `DKG_AGENT_NAME`
+  such as `DKG_DAEMON_URL`, `DKG_CONTEXT_GRAPH`, `DKG_MEMORY_ASSERTION`, and
+  `DKG_AGENT_NAME`
 - reads the DKG bearer token from `DKG_API_TOKEN` / `DKG_AUTH_TOKEN`, the
   setup-resolved `dkg_home` in `$HERMES_HOME/dkg.json`, `$DKG_HOME/auth.token`,
   or `~/.dkg/auth.token`
 - redacts bearer tokens from client errors
-- stores persistent facts in a DKG assertion for the configured context graph
+- stores persistent facts in the configured DKG assertion, `memory` by default,
+  for the configured context graph
 - syncs completed turns in a background thread with stable turn IDs and
   idempotency keys
 - queues local writes in `$HERMES_HOME/dkg_cache*.json` when the daemon is
@@ -164,11 +167,12 @@ client, and payload contracts that call into them.
 | `POST /api/hermes-channel/stream` | Forward a streaming Node UI message and proxy SSE frames back to the UI. |
 | `POST /api/hermes-channel/persist-turn` | Persist a completed Hermes turn through DKG chat memory with duplicate-turn protection. |
 
-The daemon forwards Node UI chat to a standalone bridge at
-`http://127.0.0.1:9202` by default. Setup does not persist that fallback as an
-explicit transport. Use `dkg hermes setup --gateway-url <url>` when Hermes is
-reachable through a WSL2 or remote gateway; the daemon then uses
-`<gateway>/api/hermes-channel/{health,send,stream}` instead.
+The daemon forwards Node UI chat to Hermes' OpenAI-compatible API server at
+`http://127.0.0.1:8642` by default. Set `API_SERVER_ENABLED=true` in the active
+Hermes profile `.env`, then restart `hermes gateway run --replace -v`.
+Use `dkg hermes setup --gateway-url <url>` when the Hermes API server is
+reachable through WSL2 or a remote gateway. `--bridge-url` is reserved for a
+custom loopback bridge that implements `/health`, `/send`, and `/stream`.
 
 Attachment references are node-owned assertion refs. The daemon verifies their
 provenance before forwarding them to Hermes.
@@ -189,7 +193,7 @@ provenance before forwarding them to Hermes.
   not enabled in the DKG local-agent registry. `persist-turn` remains
   daemon-authenticated so the active Hermes provider can persist completed
   turns even when UI chat registration is unavailable.
-- The default bridge host is loopback. Treat non-loopback gateway URLs as an
+- The default Hermes API server host is loopback. Treat non-loopback gateway URLs as an
   explicit trust decision and require normal network hardening.
 - Verified Memory publishing is permanent and may cost TRAC; operators can
   disable direct publish exposure with `DKG_ALLOW_DIRECT_PUBLISH=false`.

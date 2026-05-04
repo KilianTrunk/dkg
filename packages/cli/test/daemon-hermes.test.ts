@@ -133,13 +133,14 @@ afterEach(() => {
 });
 
 describe('Hermes channel helpers', () => {
-  it('defaults to the local Hermes bridge when no transport is configured', () => {
+  it('defaults to the local Hermes OpenAI-compatible API server when no transport is configured', () => {
     expect(getHermesChannelTargets(makeConfig())).toEqual([
       {
-        name: 'bridge',
-        inboundUrl: 'http://127.0.0.1:9202/send',
-        streamUrl: 'http://127.0.0.1:9202/stream',
-        healthUrl: 'http://127.0.0.1:9202/health',
+        name: 'gateway',
+        protocol: 'hermes-openai',
+        inboundUrl: 'http://127.0.0.1:8642/v1/chat/completions',
+        streamUrl: 'http://127.0.0.1:8642/v1/chat/completions',
+        healthUrl: 'http://127.0.0.1:8642/health',
       },
     ]);
   });
@@ -166,6 +167,7 @@ describe('Hermes channel helpers', () => {
     }))).toEqual([
       {
         name: 'gateway',
+        protocol: 'hermes-channel',
         inboundUrl: 'http://gateway.local:9300/api/hermes-channel/send',
         streamUrl: 'http://gateway.local:9300/api/hermes-channel/stream',
         healthUrl: 'http://gateway.local:9300/api/hermes-channel/health',
@@ -195,6 +197,28 @@ describe('Hermes channel helpers', () => {
     ]);
   });
 
+  it('uses Hermes OpenAI-compatible API server routes when configured', () => {
+    expect(getHermesChannelTargets(makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: {
+            kind: 'hermes-openai',
+            gatewayUrl: 'http://127.0.0.1:8642',
+          },
+        },
+      },
+    }))).toEqual([
+      {
+        name: 'gateway',
+        protocol: 'hermes-openai',
+        inboundUrl: 'http://127.0.0.1:8642/v1/chat/completions',
+        streamUrl: 'http://127.0.0.1:8642/v1/chat/completions',
+        healthUrl: 'http://127.0.0.1:8642/health',
+      },
+    ]);
+  });
+
   it('rejects gateway healthUrl overrides outside the Hermes gateway API base', () => {
     expect(getHermesChannelTargets(makeConfig({
       localAgentIntegrations: {
@@ -209,6 +233,7 @@ describe('Hermes channel helpers', () => {
       },
     }))).toEqual([{
       name: 'gateway',
+      protocol: 'hermes-channel',
       inboundUrl: 'https://hermes.example.com/api/hermes-channel/send',
       streamUrl: 'https://hermes.example.com/api/hermes-channel/stream',
       healthUrl: 'https://hermes.example.com/api/hermes-channel/health',
@@ -252,6 +277,7 @@ describe('Hermes channel helpers', () => {
       },
       {
         name: 'gateway',
+        protocol: 'hermes-channel',
         inboundUrl: 'https://hermes.example.com/api/hermes-channel/send',
         streamUrl: 'https://hermes.example.com/api/hermes-channel/stream',
         healthUrl: 'https://hermes.example.com/api/hermes-channel/custom-health',
@@ -320,6 +346,7 @@ describe('Hermes channel helpers', () => {
     }))).toEqual([
       {
         name: 'gateway',
+        protocol: 'hermes-channel',
         inboundUrl: 'https://hermes.example.com/api/hermes-channel/send',
         streamUrl: 'https://hermes.example.com/api/hermes-channel/stream',
         healthUrl: 'https://hermes.example.com/api/hermes-channel/health',
@@ -339,6 +366,7 @@ describe('Hermes channel helpers', () => {
     }))).toEqual([
       {
         name: 'gateway',
+        protocol: 'hermes-channel',
         inboundUrl: 'https://hermes.example.com/api/hermes-channel/send',
         streamUrl: 'https://hermes.example.com/api/hermes-channel/stream',
         healthUrl: 'https://hermes.example.com/api/hermes-channel/health',
@@ -498,14 +526,14 @@ describe('Hermes local-agent registry lifecycle', () => {
       { id: 'hermes', metadata: { source: 'node-ui' } },
       'bridge-token',
       {
-        probeHermesHealth: async () => ({ ok: true, target: 'bridge' }),
+        probeHermesHealth: async () => ({ ok: true, target: 'gateway' }),
       },
     );
 
     expect(result.integration.id).toBe('hermes');
     expect(result.integration.runtime.status).toBe('ready');
     expect(result.integration.runtime.ready).toBe(true);
-    expect(result.integration.transport.kind).toBe('hermes-channel');
+    expect(result.integration.transport.kind).toBe('hermes-openai');
     expect(result.integration.capabilities.localChat).toBe(true);
     expect(result.integration.capabilities.chatAttachments).toBe(true);
     expect(result.integration.metadata.hermesHome).toBe('C:\\Hermes\\default');
@@ -526,7 +554,7 @@ describe('Hermes local-agent registry lifecycle', () => {
       },
       'bridge-token',
       {
-        probeHermesHealth: async () => ({ ok: true, target: 'bridge' }),
+        probeHermesHealth: async () => ({ ok: true, target: 'gateway' }),
       },
     );
 
@@ -840,7 +868,7 @@ describe('Hermes local-agent registry lifecycle', () => {
 
   it('Hermes definition includes manifest, transport, and local chat capabilities', () => {
     const integration = getLocalAgentIntegration(makeConfig(), 'hermes');
-    expect(integration?.transport.kind).toBe('hermes-channel');
+    expect(integration?.transport.kind).toBe('hermes-openai');
     expect(integration?.manifest?.packageName).toBe('@origintrail-official/dkg-adapter-hermes');
     expect(integration?.manifest?.setupEntry).toBe('./setup-entry.mjs');
     expect(integration?.capabilities.localChat).toBe(true);
@@ -944,6 +972,107 @@ describe('Hermes daemon routes', () => {
     expect(forwardedBodies[0]).toMatchObject({
       contextGraphId: 'project-1',
     });
+  });
+
+  it('adapts Node UI send requests to the Hermes OpenAI-compatible API server', async () => {
+    const calls: Array<{ url: string; body: any }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'Hermes API reply' } }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'x-hermes-session-id': 'api-session-1' },
+      });
+    }));
+    const { ctx, res } = makeHermesRouteContext({
+      text: 'hello',
+      correlationId: 'corr-openai',
+      contextGraphId: 'project-1',
+      profile: 'default',
+    }, {
+      hasChatTurn: vi.fn(async () => false),
+      storeChatExchange: vi.fn(async () => {}),
+    }, {
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: {
+            kind: 'hermes-openai',
+            gatewayUrl: 'http://127.0.0.1:8642',
+          },
+        },
+      },
+    }, '/api/hermes-channel/send');
+
+    await handleHermesRoutes(ctx);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({
+      text: 'Hermes API reply',
+      correlationId: 'corr-openai',
+      sessionId: 'api-session-1',
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('http://127.0.0.1:8642/v1/chat/completions');
+    expect(calls[0].body).toMatchObject({
+      model: 'hermes-agent',
+      stream: false,
+      messages: [
+        expect.objectContaining({
+          role: 'system',
+          content: expect.stringContaining('Current DKG context graph id: project-1'),
+        }),
+        { role: 'user', content: 'hello' },
+      ],
+    });
+  });
+
+  it('converts Hermes OpenAI-compatible SSE chunks for Node UI streaming', async () => {
+    const encoder = new TextEncoder();
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(String(url)).toBe('http://127.0.0.1:8642/v1/chat/completions');
+      expect(JSON.parse(String(init?.body))).toMatchObject({ stream: true });
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Hel"}}]}\r\n\r\n'));
+          controller.enqueue(encoder.encode('event: hermes.tool.progress\r\ndata: {"name":"dkg_status"}\r\n\r\n'));
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream', 'x-hermes-session-id': 'api-session-2' },
+      });
+    }));
+    const { ctx, res } = makeHermesRouteContext({
+      text: 'hello',
+      correlationId: 'corr-stream',
+      contextGraphId: 'project-1',
+    }, {
+      hasChatTurn: vi.fn(async () => false),
+      storeChatExchange: vi.fn(async () => {}),
+    }, {
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: {
+            kind: 'hermes-openai',
+            gatewayUrl: 'http://127.0.0.1:8642',
+          },
+        },
+      },
+    }, '/api/hermes-channel/stream');
+
+    await handleHermesRoutes(ctx);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['Content-Type']).toContain('text/event-stream');
+    expect(res.body).toContain('"type":"delta","text":"Hel"');
+    expect(res.body).toContain('"type":"delta","text":"lo"');
+    expect(res.body).toContain('"type":"final","text":"Hello"');
+    expect(res.body).toContain('"sessionId":"api-session-2"');
   });
 
   it('falls back to the gateway when bridge send returns retryable 5xx', async () => {
@@ -1580,7 +1709,14 @@ describe('Hermes daemon routes', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const report = await probeHermesChannelHealth(makeConfig(), 'bridge-token');
+    const report = await probeHermesChannelHealth(makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-channel', bridgeUrl: 'http://127.0.0.1:9202' },
+        },
+      },
+    }), 'bridge-token');
 
     expect(report.ok).toBe(true);
     expect(report.target).toBe('bridge');
@@ -1590,13 +1726,47 @@ describe('Hermes daemon routes', () => {
     );
   });
 
+  it('probes Hermes OpenAI-compatible API server health without bridge auth', async () => {
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      expect(init.headers).not.toMatchObject({ 'x-dkg-bridge-token': 'bridge-token' });
+      return new Response(JSON.stringify({ status: 'ok', platform: 'hermes-agent' }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const report = await probeHermesChannelHealth(makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: {
+            kind: 'hermes-openai',
+            gatewayUrl: 'http://127.0.0.1:8642',
+          },
+        },
+      },
+    }), 'bridge-token');
+
+    expect(report.ok).toBe(true);
+    expect(report.target).toBe('gateway');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:8642/health',
+      expect.objectContaining({ headers: expect.objectContaining({ Accept: 'application/json' }) }),
+    );
+  });
+
   it('does not mark Hermes ready when health JSON reports ok false', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       ok: false,
       error: 'warming up',
     }), { status: 200 })));
 
-    const report = await probeHermesChannelHealth(makeConfig(), 'bridge-token');
+    const report = await probeHermesChannelHealth(makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-channel', bridgeUrl: 'http://127.0.0.1:9202' },
+        },
+      },
+    }), 'bridge-token');
 
     expect(report.ok).toBe(false);
     expect(report.bridge?.ok).toBe(false);

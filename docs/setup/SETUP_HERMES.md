@@ -55,6 +55,9 @@ Setup writes only adapter-owned artifacts inside the selected Hermes profile:
 Hermes uses the same `auth.token` as `pnpm dkg` in monorepo `.dkg-dev` and
 packaged `.dkg` installs.
 
+Provider facts are written to the `memory` assertion in `agent-context` by
+default. The fact subjects still carry the Hermes profile/agent identity.
+
 The adapter refuses to overwrite an existing non-DKG memory provider. If the
 profile already uses Honcho, Mem0, Supermemory, or another provider, choose
 tools-only mode or switch providers explicitly.
@@ -116,24 +119,28 @@ POST /api/hermes-channel/stream
 POST /api/hermes-channel/persist-turn
 ```
 
-The daemon defaults to a standalone Hermes bridge at:
+The daemon routes Node UI chat to Hermes' OpenAI-compatible API server when
+`dkg hermes setup` registers the default transport:
 
 ```text
-http://127.0.0.1:9202/{health,send,stream}
+http://127.0.0.1:8642/health
+http://127.0.0.1:8642/v1/chat/completions
 ```
 
-If the local-agent registry has a Hermes gateway URL, the daemon forwards to:
+Enable the Hermes API server before starting the gateway:
 
-```text
-<gateway-url>/api/hermes-channel/{health,send,stream}
+```bash
+echo 'API_SERVER_ENABLED=true' >> ~/.hermes/.env
+hermes gateway run --replace -v
 ```
 
-`dkg hermes setup` registers only the Hermes channel kind by default. Use
-`--bridge-url` for a same-host loopback bridge or `--gateway-url` for WSL2 and
-remote Hermes deployments. Do not use a non-loopback `bridgeUrl`; remote
-targets should be registered as gateways. If `--bridge-health-url` is supplied,
-it must belong to the same configured bridge or gateway base so readiness
-checks cannot pass against one endpoint while chat is routed to another.
+Use `--gateway-url <url>` when the Hermes API server is reachable somewhere
+other than `http://127.0.0.1:8642`. Use `--bridge-url` only for a custom
+same-host loopback bridge that implements `/health`, `/send`, and `/stream`.
+Do not use a non-loopback `bridgeUrl`; remote targets should be registered as
+gateways. If `--bridge-health-url` is supplied, it must belong to the same
+configured bridge or gateway base so readiness checks cannot pass against one
+endpoint while chat is routed to another.
 
 Node UI chat is considered ready only when the bridge or gateway health route
 responds successfully. When it is unavailable, Hermes may still be registered,
@@ -143,7 +150,7 @@ but the UI should show a degraded/offline bridge state.
 
 - DKG daemon API calls use bearer auth from the node.
 - The Python Hermes provider reads the DKG token from `$DKG_HOME/auth.token` or
-  `~/.dkg/auth.token`.
+  the setup-resolved DKG home in `$HERMES_HOME/dkg.json`, then `~/.dkg/auth.token`.
 - Setup registration uses an explicit token environment variable when present,
   then falls back to `$DKG_HOME/auth.token` or `~/.dkg/auth.token`.
 - Standalone loopback bridge calls use `x-dkg-bridge-token`. Non-loopback
@@ -183,20 +190,22 @@ dkg hermes setup --profile research --memory-mode tools-only
 
 or edit the Hermes profile config intentionally before rerunning provider mode.
 
-### Bridge offline
+### Hermes chat offline
 
 If Node UI says Hermes is degraded or offline:
 
 1. Confirm Hermes is running for the same profile.
-2. Confirm the bridge is listening on `127.0.0.1:9202`, or configure the DKG
+2. Confirm `API_SERVER_ENABLED=true` is present in the active
+   `$HERMES_HOME/.env`.
+3. Confirm `http://127.0.0.1:8642/health` responds, or configure the DKG
    local-agent integration with the correct gateway URL.
-3. Run:
+4. Run:
 
 ```bash
 dkg hermes doctor --profile research
 ```
 
-4. Refresh the Hermes connected-agent panel in the Node UI.
+5. Refresh the Hermes connected-agent panel in the Node UI.
 
 ### Windows and WSL2
 

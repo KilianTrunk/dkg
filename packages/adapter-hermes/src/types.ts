@@ -45,8 +45,10 @@ export interface HermesSetupState {
   daemonUrl: string;
   dkgHome: string;
   contextGraph: string;
+  memoryAssertion: string;
   agentName?: string;
   bridge?: {
+    protocol?: 'hermes-channel' | 'hermes-openai';
     url?: string;
     gatewayUrl?: string;
     healthUrl?: string;
@@ -142,7 +144,7 @@ export interface HermesLocalAgentIntegrationPayload {
   description?: string;
   enabled?: boolean;
   transport?: {
-    kind?: 'hermes-channel';
+    kind?: 'hermes-channel' | 'hermes-openai';
     bridgeUrl?: string;
     gatewayUrl?: string;
     healthUrl?: string;

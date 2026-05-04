@@ -24,6 +24,7 @@ import {
   probeHermesChannelHealth,
   shouldTryNextHermesTarget,
   verifyHermesAttachmentRefsProvenance,
+  type HermesChatPayload,
   type HermesTurnPersistenceState,
 } from '../hermes.js';
 
@@ -81,24 +82,15 @@ export async function handleHermesRoutes(ctx: RequestContext): Promise<void> {
       }
 
       try {
+        const forwardBody = target.protocol === 'hermes-openai'
+          ? buildHermesOpenAiChatBody(payload, attachmentRefs, requestAgentAddress, false)
+          : buildHermesChannelBody(payload, attachmentRefs, requestAgentAddress);
         const forwardRes = await fetch(target.inboundUrl, {
           method: 'POST',
           headers: buildHermesChannelHeaders(target, bridgeAuthToken, {
             'Content-Type': 'application/json',
           }),
-          body: JSON.stringify({
-            text: payload.text,
-            correlationId: payload.correlationId,
-            identity: payload.identity ?? 'owner',
-            ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
-            ...(payload.profile ? { profile: payload.profile } : {}),
-            ...(attachmentRefs ? { attachmentRefs } : {}),
-            ...(payload.contextEntries ? { contextEntries: payload.contextEntries } : {}),
-            ...(payload.contextGraphId ? { contextGraphId: payload.contextGraphId } : {}),
-            ...(payload.currentAgentAddress ?? requestAgentAddress
-              ? { currentAgentAddress: payload.currentAgentAddress ?? requestAgentAddress }
-              : {}),
-          }),
+          body: JSON.stringify(forwardBody),
           signal: AbortSignal.timeout(HERMES_CHANNEL_RESPONSE_TIMEOUT_MS),
         });
         if (!forwardRes.ok) {
@@ -117,7 +109,9 @@ export async function handleHermesRoutes(ctx: RequestContext): Promise<void> {
             details,
           });
         }
-        const reply = await forwardRes.json();
+        const reply = target.protocol === 'hermes-openai'
+          ? await readHermesOpenAiReply(forwardRes, payload)
+          : await forwardRes.json();
         return jsonResponse(res, 200, reply);
       } catch (err: any) {
         if (err.name === 'TimeoutError') {
@@ -172,25 +166,16 @@ export async function handleHermesRoutes(ctx: RequestContext): Promise<void> {
       }
 
       try {
+        const forwardBody = target.protocol === 'hermes-openai'
+          ? buildHermesOpenAiChatBody(payload, attachmentRefs, requestAgentAddress, true)
+          : buildHermesChannelBody(payload, attachmentRefs, requestAgentAddress);
         const transportRes = await fetch(target.streamUrl ?? target.inboundUrl, {
           method: 'POST',
           headers: buildHermesChannelHeaders(target, bridgeAuthToken, {
             'Content-Type': 'application/json',
             Accept: 'text/event-stream',
           }),
-          body: JSON.stringify({
-            text: payload.text,
-            correlationId: payload.correlationId,
-            identity: payload.identity ?? 'owner',
-            ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
-            ...(payload.profile ? { profile: payload.profile } : {}),
-            ...(attachmentRefs ? { attachmentRefs } : {}),
-            ...(payload.contextEntries ? { contextEntries: payload.contextEntries } : {}),
-            ...(payload.contextGraphId ? { contextGraphId: payload.contextGraphId } : {}),
-            ...(payload.currentAgentAddress ?? requestAgentAddress
-              ? { currentAgentAddress: payload.currentAgentAddress ?? requestAgentAddress }
-              : {}),
-          }),
+          body: JSON.stringify(forwardBody),
           signal: AbortSignal.timeout(HERMES_CHANNEL_RESPONSE_TIMEOUT_MS),
         });
 
@@ -220,7 +205,11 @@ export async function handleHermesRoutes(ctx: RequestContext): Promise<void> {
             ...corsHeaders(resolveCorsOrigin(req, daemonState.moduleCorsAllowed)),
           });
           try {
-            await pipeHermesStream(req, res, (transportRes.body as any).getReader());
+            if (target.protocol === 'hermes-openai') {
+              await pipeHermesOpenAiStream(res, (transportRes.body as any).getReader(), payload, transportRes);
+            } else {
+              await pipeHermesStream(req, res, (transportRes.body as any).getReader());
+            }
           } catch (err: any) {
             if (!res.writableEnded) {
               res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
@@ -230,7 +219,9 @@ export async function handleHermesRoutes(ctx: RequestContext): Promise<void> {
           return;
         }
 
-        const reply = await transportRes.json();
+        const reply = target.protocol === 'hermes-openai'
+          ? await readHermesOpenAiReply(transportRes, payload)
+          : await transportRes.json();
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache',
@@ -306,6 +297,196 @@ function ensureHermesIntegrationEnabled(config: RequestContext['config'], res: R
     code: 'INTEGRATION_DISABLED',
   });
   return false;
+}
+
+function buildHermesChannelBody(
+  payload: HermesChatPayload,
+  attachmentRefs: OpenClawAttachmentRef[] | undefined,
+  requestAgentAddress: string | undefined,
+): Record<string, unknown> {
+  return {
+    text: payload.text,
+    correlationId: payload.correlationId,
+    identity: payload.identity ?? 'owner',
+    ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+    ...(payload.profile ? { profile: payload.profile } : {}),
+    ...(attachmentRefs ? { attachmentRefs } : {}),
+    ...(payload.contextEntries ? { contextEntries: payload.contextEntries } : {}),
+    ...(payload.contextGraphId ? { contextGraphId: payload.contextGraphId } : {}),
+    ...(payload.currentAgentAddress ?? requestAgentAddress
+      ? { currentAgentAddress: payload.currentAgentAddress ?? requestAgentAddress }
+      : {}),
+  };
+}
+
+function buildHermesOpenAiChatBody(
+  payload: HermesChatPayload,
+  attachmentRefs: OpenClawAttachmentRef[] | undefined,
+  requestAgentAddress: string | undefined,
+  stream: boolean,
+): Record<string, unknown> {
+  return {
+    model: 'hermes-agent',
+    stream,
+    messages: [
+      {
+        role: 'system',
+        content: buildHermesNodeUiSystemPrompt(payload, attachmentRefs, requestAgentAddress),
+      },
+      {
+        role: 'user',
+        content: payload.text,
+      },
+    ],
+  };
+}
+
+function buildHermesNodeUiSystemPrompt(
+  payload: HermesChatPayload,
+  attachmentRefs: OpenClawAttachmentRef[] | undefined,
+  requestAgentAddress: string | undefined,
+): string {
+  const lines = [
+    'This conversation is coming from the DKG Node UI Hermes integration.',
+    'Use the DKG tools normally. When a current context graph is provided, prefer it for project-scoped DKG operations unless the user asks for a different project/context graph.',
+  ];
+  if (payload.contextGraphId) {
+    lines.push(`Current DKG context graph id: ${payload.contextGraphId}`);
+  }
+  const agentAddress = payload.currentAgentAddress ?? requestAgentAddress;
+  if (agentAddress) {
+    lines.push(`Current DKG agent address: ${agentAddress}`);
+  }
+  if (payload.profile) {
+    lines.push(`Hermes profile: ${payload.profile}`);
+  }
+  if (payload.contextEntries?.length) {
+    lines.push('Node UI context entries:');
+    for (const entry of payload.contextEntries) {
+      lines.push(`- ${entry.label || entry.key}: ${entry.value}`);
+    }
+  }
+  if (attachmentRefs?.length) {
+    lines.push('Node UI attachment assertion refs:');
+    for (const attachment of attachmentRefs) {
+      lines.push(`- ${attachment.fileName}: ${attachment.assertionUri} (${attachment.contextGraphId})`);
+    }
+  }
+  return lines.join('\n');
+}
+
+async function readHermesOpenAiReply(
+  response: Response,
+  payload: HermesChatPayload,
+): Promise<Record<string, unknown>> {
+  const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const firstChoice = choices[0];
+  const message = firstChoice && typeof firstChoice === 'object' && !Array.isArray(firstChoice)
+    ? (firstChoice as Record<string, unknown>).message
+    : undefined;
+  const text = message && typeof message === 'object' && !Array.isArray(message)
+    ? (message as Record<string, unknown>).content
+    : undefined;
+  return {
+    text: typeof text === 'string' ? text : '',
+    correlationId: payload.correlationId,
+    ...(response.headers.get('x-hermes-session-id')
+      ? { sessionId: response.headers.get('x-hermes-session-id') ?? undefined }
+      : {}),
+  };
+}
+
+async function pipeHermesOpenAiStream(
+  res: RequestContext['res'],
+  reader: { read: () => Promise<{ done?: boolean; value?: Uint8Array }> },
+  payload: HermesChatPayload,
+  response: Response,
+): Promise<void> {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalText = '';
+  let finalEmitted = false;
+  const sessionId = response.headers.get('x-hermes-session-id') ?? undefined;
+
+  const emit = (event: Record<string, unknown>) => {
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    }
+  };
+
+  const processFrame = (frame: string) => {
+    const dataLines = frame
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trim())
+      .filter(Boolean);
+    for (const data of dataLines) {
+      if (data === '[DONE]') {
+        emit({
+          type: 'final',
+          text: finalText,
+          correlationId: payload.correlationId,
+          ...(sessionId ? { sessionId } : {}),
+        });
+        finalEmitted = true;
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(data) as Record<string, unknown>;
+        const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+        const firstChoice = choices[0];
+        const delta = firstChoice && typeof firstChoice === 'object' && !Array.isArray(firstChoice)
+          ? (firstChoice as Record<string, unknown>).delta
+          : undefined;
+        const content = delta && typeof delta === 'object' && !Array.isArray(delta)
+          ? (delta as Record<string, unknown>).content
+          : undefined;
+        if (typeof content === 'string' && content) {
+          finalText += content;
+          emit({ type: 'delta', text: content, correlationId: payload.correlationId });
+        }
+      } catch {
+        // Ignore non-chat SSE frames such as Hermes tool progress metadata.
+      }
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = findHermesOpenAiSseBoundary(buffer);
+      while (boundary.index !== -1) {
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary.length);
+        processFrame(frame);
+        boundary = findHermesOpenAiSseBoundary(buffer);
+      }
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) processFrame(buffer);
+  if (!res.writableEnded && finalText && !finalEmitted) {
+    emit({
+      type: 'final',
+      text: finalText,
+      correlationId: payload.correlationId,
+      ...(sessionId ? { sessionId } : {}),
+    });
+  }
+}
+
+function findHermesOpenAiSseBoundary(buffer: string): { index: number; length: number } {
+  const lf = buffer.indexOf('\n\n');
+  const crlf = buffer.indexOf('\r\n\r\n');
+  if (lf === -1) return { index: crlf, length: crlf === -1 ? 0 : 4 };
+  if (crlf === -1) return { index: lf, length: 2 };
+  return crlf < lf
+    ? { index: crlf, length: 4 }
+    : { index: lf, length: 2 };
 }
 
 async function persistHermesTurnWithDuplicateLock(

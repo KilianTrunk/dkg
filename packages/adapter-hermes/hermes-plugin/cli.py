@@ -109,7 +109,8 @@ def register_cli(cli_group):
 
         click.echo(f"Syncing {len(queued)} queued writes...")
         context_graph = config.get("context_graph", "agent-context")
-        assertion_name = agent_name or "hermes"
+        assertion_name = config.get("memory_assertion") or "memory"
+        subject_agent = agent_name or "hermes"
         synced = 0
         failed = []
         dirty_targets: set = set()
@@ -148,7 +149,7 @@ def register_cli(cli_group):
                 failed_targets.add(target)
                 continue
             quads = [{
-                "subject": f"urn:hermes:{assertion_name}:{target}",
+                "subject": f"urn:hermes:{subject_agent}:{target}",
                 "predicate": "urn:hermes:content",
                 "object": f"[{e.get('target', target)}]\n{e['content']}",
             } for e in entries]

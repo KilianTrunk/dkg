@@ -438,6 +438,7 @@ assert provider._config["context_graph"] == "agent-context", provider._config
     expect(config.require_explicit_approval).toBe(false);
     expect(config.require_wallet_check).toBe(false);
     expect(config.allow_context_graph_admin_tools).toBe(true);
+    expect(config.memory_assertion).toBe('memory');
   });
 
   it('defaults publish tools to direct exposure for skill parity', () => {
@@ -455,6 +456,7 @@ assert provider._config["context_graph"] == "agent-context", provider._config
     expect(config.publish_tool).toBe('direct');
     expect(config.allow_direct_publish).toBe(true);
     expect(config.allow_context_graph_admin_tools).toBe(true);
+    expect(config.memory_assertion).toBe('memory');
   });
 
   it('loads provider guard aliases from dkg.json', () => {
@@ -915,6 +917,7 @@ assert config["allow_context_graph_admin_tools"] is False, config
     const state = JSON.parse(readFileSync(join(hermesHome, '.dkg-adapter-hermes', 'setup-state.json'), 'utf-8'));
     expect(config.daemon_url).toBe('https://dkg.example.com');
     expect(config.bridge).toEqual({
+      protocol: 'hermes-openai',
       gatewayUrl: 'https://hermes.example.com',
       healthUrl: 'https://hermes.example.com/api/hermes-channel/health',
     });
@@ -947,6 +950,7 @@ assert config["allow_context_graph_admin_tools"] is False, config
     const state = JSON.parse(readFileSync(join(hermesHome, '.dkg-adapter-hermes', 'setup-state.json'), 'utf-8'));
     expect(config.daemon_url).toBe('https://fresh-dkg.example.com');
     expect(config.bridge).toEqual({
+      protocol: 'hermes-openai',
       gatewayUrl: 'https://fresh-hermes.example.com',
       healthUrl: 'https://fresh-hermes.example.com/api/hermes-channel/health',
     });
@@ -1018,7 +1022,10 @@ assert config["allow_context_graph_admin_tools"] is False, config
     expect(calls[0].url).toBe('http://127.0.0.1:9200/api/local-agent-integrations/connect');
     expect((calls[0].init.headers as Record<string, string>).Authorization).toBe('Bearer file-token');
     const body = JSON.parse(String(calls[0].init.body));
-    expect(body.transport).toEqual({ kind: 'hermes-channel' });
+    expect(body.transport).toEqual({
+      kind: 'hermes-openai',
+      gatewayUrl: 'http://127.0.0.1:8642',
+    });
     expect(body.transport.bridgeUrl).toBeUndefined();
   });
 
@@ -1099,12 +1106,13 @@ assert config["allow_context_graph_admin_tools"] is False, config
 
     const body = JSON.parse(String(calls[0].init.body));
     expect(body.transport).toEqual({
-      kind: 'hermes-channel',
+      kind: 'hermes-openai',
       gatewayUrl: 'https://hermes.example.com',
       healthUrl: 'https://hermes.example.com/api/hermes-channel/health',
     });
     const state = JSON.parse(readFileSync(join(hermesHome, '.dkg-adapter-hermes', 'setup-state.json'), 'utf-8'));
     expect(state.bridge).toEqual({
+      protocol: 'hermes-openai',
       gatewayUrl: 'https://hermes.example.com',
       healthUrl: 'https://hermes.example.com/api/hermes-channel/health',
     });
@@ -1153,9 +1161,10 @@ assert config["allow_context_graph_admin_tools"] is False, config
     await expect(runSetup({
       hermesHome,
       verify: false,
+      start: false,
       gatewayUrl: 'https://hermes.example.com',
       bridgeHealthUrl: 'https://hermes.example.com/health',
-    })).rejects.toThrow('must belong to the configured');
+    })).resolves.toBeUndefined();
   });
 });
 
@@ -1794,6 +1803,8 @@ client_http._session = FakeSession()
 exists_http = client_http.create_assertion("cg:test", "Hermes")
 assert exists_http["success"] is True and exists_http["alreadyExists"] is True, exists_http
 
+created_assertions = []
+
 class ExistingAssertionClient:
     def __init__(self, base_url, **kwargs):
         self.base_url = base_url
@@ -1802,6 +1813,7 @@ class ExistingAssertionClient:
         return True
 
     def create_assertion(self, context_graph_id, name):
+        created_assertions.append((context_graph_id, name))
         return {"success": True, "alreadyExists": True}
 
 provider_existing = module.DKGMemoryProvider()
@@ -1814,7 +1826,8 @@ module._load_cache = lambda agent_name: {"memory": [], "user": [], "queued_write
 client_module.DKGClient = ExistingAssertionClient
 provider_existing._backlog_import_if_needed = lambda hermes_home: None
 provider_existing.initialize("session-1")
-assert provider_existing._assertion_id == "HermesAgent", provider_existing._assertion_id
+assert provider_existing._assertion_id == "memory", provider_existing._assertion_id
+assert created_assertions == [("cg:test", "memory")], created_assertions
 
 class QueryClient:
     def __init__(self):

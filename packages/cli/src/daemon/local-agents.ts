@@ -54,6 +54,7 @@ import {
   localOpenclawConfigPath,
 } from './openclaw.js';
 import {
+  DEFAULT_HERMES_API_SERVER_URL,
   type HermesChannelHealthReport,
   probeHermesChannelHealth,
   transportPatchFromHermesTarget,
@@ -105,7 +106,7 @@ export const LOCAL_AGENT_INTEGRATION_DEFINITIONS: Record<string, LocalAgentInteg
     id: 'hermes',
     name: 'Hermes',
     description: 'Connect a local Hermes agent through the DKG node.',
-    transportKind: 'hermes-channel',
+    transportKind: 'hermes-openai',
     capabilities: {
       localChat: true,
       chatAttachments: true,
@@ -505,8 +506,12 @@ export async function connectLocalAgentIntegrationFromUi(
     const probeHermesHealth = deps.probeHermesHealth ?? probeHermesChannelHealth;
     const health = await probeHermesHealth(config, bridgeAuthToken, { timeoutMs: 3_000 });
     if (health.ok) {
+      const transport = transportPatchFromHermesTarget(config, health.target)
+        ?? (health.target === 'gateway'
+          ? { kind: 'hermes-openai', gatewayUrl: DEFAULT_HERMES_API_SERVER_URL }
+          : undefined);
       const integration = updateLocalAgentIntegration(config, requested.id, {
-        transport: transportPatchFromHermesTarget(config, health.target),
+        transport,
         runtime: {
           status: 'ready',
           ready: true,
@@ -811,8 +816,12 @@ export async function refreshLocalAgentIntegrationFromUi(
       });
 
       if (health.ok) {
+        const transport = transportPatchFromHermesTarget(config, health.target)
+          ?? (health.target === 'gateway'
+            ? { kind: 'hermes-openai', gatewayUrl: DEFAULT_HERMES_API_SERVER_URL }
+            : undefined);
         return updateLocalAgentIntegration(config, normalizedId, {
-          transport: transportPatchFromHermesTarget(config, health.target),
+          transport,
           runtime: {
             status: 'ready',
             ready: true,

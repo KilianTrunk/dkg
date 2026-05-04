@@ -27,9 +27,13 @@ import {
 
 export const HERMES_CHANNEL_RESPONSE_TIMEOUT_MS = 180_000;
 export const DEFAULT_HERMES_BRIDGE_URL = 'http://127.0.0.1:9202';
+export const DEFAULT_HERMES_API_SERVER_URL = 'http://127.0.0.1:8642';
+
+export type HermesChannelProtocol = 'hermes-channel' | 'hermes-openai';
 
 export interface HermesChannelTarget {
   name: 'bridge' | 'gateway';
+  protocol?: HermesChannelProtocol;
   inboundUrl: string;
   streamUrl?: string;
   healthUrl?: string;
@@ -137,6 +141,7 @@ export function getHermesChannelTargets(config: DkgConfig): HermesChannelTarget[
   if (storedHermesIntegration?.enabled === false) return [];
 
   const hermesIntegration = getLocalAgentIntegration(config, 'hermes');
+  const transportKind = hermesIntegration?.transport.kind;
   const explicitBridgeBase = hermesIntegration?.transport.bridgeUrl
     ? trimTrailingSlashes(hermesIntegration.transport.bridgeUrl)
     : undefined;
@@ -149,24 +154,29 @@ export function getHermesChannelTargets(config: DkgConfig): HermesChannelTarget[
   const bridgeLooksLikeGateway =
     explicitBridgeBase?.endsWith('/api/hermes-channel') ?? false;
   const explicitBridgeIsLoopback = isHermesLoopbackUrl(explicitBridgeBase);
+  const openAiGatewayBase = transportKind === 'hermes-openai'
+    ? explicitGatewayBase ?? DEFAULT_HERMES_API_SERVER_URL
+    : undefined;
   const standaloneBridgeUsesExplicitBase = !!explicitBridgeBase
     && explicitBridgeIsLoopback
     && !bridgeLooksLikeGateway;
   const standaloneBridgeBase = standaloneBridgeUsesExplicitBase && explicitBridgeBase
     ? explicitBridgeBase
-    : !explicitBridgeBase && !explicitGatewayBase && !bridgeLooksLikeGateway
+    : !explicitBridgeBase && !explicitGatewayBase && !bridgeLooksLikeGateway && !openAiGatewayBase
       ? DEFAULT_HERMES_BRIDGE_URL
       : undefined;
-  const gatewayBase =
-    explicitGatewayBase ??
-    (bridgeLooksLikeGateway ? explicitBridgeBase : undefined);
+  const gatewayBase = transportKind === 'hermes-openai'
+    ? undefined
+    : explicitGatewayBase ?? (bridgeLooksLikeGateway ? explicitBridgeBase : undefined);
   const normalizedGatewayBase = gatewayBase
     ? buildHermesGatewayBase(gatewayBase)
     : undefined;
   const explicitHealthIsGateway =
     !!explicitHealthUrl
-    && !!normalizedGatewayBase
-    && urlBelongsToBase(explicitHealthUrl, normalizedGatewayBase);
+    && (
+      (!!normalizedGatewayBase && urlBelongsToBase(explicitHealthUrl, normalizedGatewayBase))
+      || (!!openAiGatewayBase && urlBelongsToBase(explicitHealthUrl, openAiGatewayBase))
+    );
   const targets: HermesChannelTarget[] = [];
   const seenInboundUrls = new Set<string>();
 
@@ -192,11 +202,24 @@ export function getHermesChannelTargets(config: DkgConfig): HermesChannelTarget[
   if (normalizedGatewayBase) {
     pushTarget({
       name: 'gateway',
+      protocol: 'hermes-channel',
       inboundUrl: `${normalizedGatewayBase}/send`,
       streamUrl: `${normalizedGatewayBase}/stream`,
       healthUrl: explicitHealthUrl && explicitHealthIsGateway
         ? explicitHealthUrl
         : `${normalizedGatewayBase}/health`,
+    });
+  }
+
+  if (openAiGatewayBase) {
+    pushTarget({
+      name: 'gateway',
+      protocol: 'hermes-openai',
+      inboundUrl: `${openAiGatewayBase}/v1/chat/completions`,
+      streamUrl: `${openAiGatewayBase}/v1/chat/completions`,
+      healthUrl: explicitHealthUrl && explicitHealthIsGateway
+        ? explicitHealthUrl
+        : `${openAiGatewayBase}/health`,
     });
   }
 
@@ -242,6 +265,18 @@ export function transportPatchFromHermesTarget(
       kind: 'hermes-channel',
       bridgeUrl: bridgeBase,
       ...(existingTransport.gatewayUrl ? { gatewayUrl: existingTransport.gatewayUrl } : {}),
+      ...explicitHealth,
+    };
+  }
+
+  if (target.protocol === 'hermes-openai') {
+    const gatewayUrl = target.inboundUrl.endsWith('/v1/chat/completions')
+      ? target.inboundUrl.slice(0, -'/v1/chat/completions'.length)
+      : target.inboundUrl;
+    return {
+      kind: 'hermes-openai',
+      ...(existingTransport.bridgeUrl ? { bridgeUrl: existingTransport.bridgeUrl } : {}),
+      gatewayUrl,
       ...explicitHealth,
     };
   }
@@ -296,7 +331,7 @@ export async function probeHermesChannelHealth(
       const result: HermesHealthState = { ok: healthRes.ok, ...parsed };
       if (target.name === 'bridge') bridge = result;
       else gateway = result;
-      if (healthRes.ok && result.ok === true) {
+      if (healthRes.ok && (result.ok === true || result.status === 'ok')) {
         return { ok: true, target: target.name, bridge, gateway };
       }
       lastError = typeof result.error === 'string'

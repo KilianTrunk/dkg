@@ -45,6 +45,7 @@ def _load_config() -> dict:
     config = {
         "daemon_url": "http://127.0.0.1:9200",
         "context_graph": "agent-context",
+        "memory_assertion": "memory",
         "agent_name": "",
         "publish_tool": "direct",
         "allow_direct_publish": True,
@@ -77,6 +78,7 @@ def _load_config() -> dict:
     for env_name, config_key in (
         ("DKG_DAEMON_URL", "daemon_url"),
         ("DKG_CONTEXT_GRAPH", "context_graph"),
+        ("DKG_MEMORY_ASSERTION", "memory_assertion"),
         ("DKG_AGENT_NAME", "agent_name"),
         ("DKG_PUBLISH_TOOL", "publish_tool"),
     ):
@@ -787,6 +789,7 @@ class DKGMemoryProvider(MemoryProvider):
         )
         self._cache = _load_cache(self._agent_name)
         self._context_graph = self._config.get("context_graph", "agent-context")
+        memory_assertion = self._config.get("memory_assertion") or "memory"
 
         # Create HTTP client
         from .client import DKGClient
@@ -804,11 +807,11 @@ class DKGMemoryProvider(MemoryProvider):
 
         # Create or resolve assertion for this agent's Working Memory
         result = self._client.create_assertion(
-            self._context_graph, self._agent_name,
+            self._context_graph, memory_assertion,
         )
         assertion_uri = result.get("assertionUri")
         if assertion_uri or result.get("alreadyExists") is True:
-            self._assertion_id = self._agent_name
+            self._assertion_id = memory_assertion
             if assertion_uri:
                 logger.info(f"[dkg] Assertion ready: {assertion_uri}")
             else:

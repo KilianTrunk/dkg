@@ -19,6 +19,7 @@ const STATE_VERSION = 1;
 const CONFIG_BEGIN = '# BEGIN DKG ADAPTER HERMES MANAGED';
 const CONFIG_END = '# END DKG ADAPTER HERMES MANAGED';
 const PLUGIN_OWNER_FILE = '.dkg-adapter-hermes-owner.json';
+const DEFAULT_HERMES_API_SERVER_URL = 'http://127.0.0.1:8642';
 const TOP_LEVEL_MEMORY_BLOCK_RE = /^memory\s*:\s*(?:#.*)?$/;
 const TOP_LEVEL_MEMORY_PROVIDER_RE = /^memory\.provider\s*:\s*["']?([^"'\s#]+)["']?/;
 const INDENTED_PROVIDER_RE = /^(\s+)provider\s*:\s*["']?([^"'\s#]+)["']?/;
@@ -121,6 +122,7 @@ export function planHermesSetup(options: HermesSetupOptions = {}): HermesSetupPl
     daemonUrl,
     dkgHome,
     contextGraph: options.contextGraph ?? 'agent-context',
+    memoryAssertion: 'memory',
     agentName: options.agentName,
     ...(bridge ? { bridge } : {}),
     publishGuard,
@@ -162,6 +164,7 @@ export function setupHermesProfile(options: HermesSetupOptions = {}): HermesSetu
     dkg_home: plan.state.dkgHome,
     ...(plan.state.bridge ? { bridge: plan.state.bridge } : {}),
     context_graph: plan.state.contextGraph,
+    memory_assertion: plan.state.memoryAssertion,
     agent_name: plan.state.agentName ?? '',
     profile_name: plan.profile.profileName ?? '',
     memory_mode: plan.profile.memoryMode,
@@ -451,8 +454,8 @@ function normalizePort(value: string | number | undefined): number | undefined {
 
 async function connectDaemonBestEffort(plan: HermesSetupPlan, daemonUrl: string | undefined): Promise<void> {
   const apiToken = loadDkgAuthToken(daemonUrl);
-  const transport: { kind: 'hermes-channel'; bridgeUrl?: string; gatewayUrl?: string; healthUrl?: string } = {
-    kind: 'hermes-channel',
+  const transport: { kind: 'hermes-channel' | 'hermes-openai'; bridgeUrl?: string; gatewayUrl?: string; healthUrl?: string } = {
+    kind: plan.state.bridge?.protocol === 'hermes-openai' ? 'hermes-openai' : 'hermes-channel',
   };
   if (plan.state.bridge?.url) {
     transport.bridgeUrl = plan.state.bridge.url;
@@ -527,9 +530,12 @@ function normalizeBridgeConfig(
   options: Pick<HermesSetupOptions, 'bridgeUrl' | 'gatewayUrl' | 'bridgeHealthUrl'>,
 ): HermesSetupState['bridge'] | undefined {
   const url = stripTrailingSlashes(trimmed(options.bridgeUrl) ?? '');
-  const gatewayUrl = stripTrailingSlashes(trimmed(options.gatewayUrl) ?? '');
+  const explicitGatewayUrl = stripTrailingSlashes(trimmed(options.gatewayUrl) ?? '');
   const healthUrl = stripTrailingSlashes(trimmed(options.bridgeHealthUrl) ?? '');
-  if (!url && !gatewayUrl && !healthUrl) return undefined;
+  const gatewayUrl = explicitGatewayUrl || (!url && !healthUrl ? DEFAULT_HERMES_API_SERVER_URL : '');
+  const protocol = gatewayUrl && !gatewayUrl.endsWith('/api/hermes-channel')
+    ? 'hermes-openai'
+    : 'hermes-channel';
   if (url && !isLoopbackUrl(url)) {
     throw new Error('Hermes bridge URL must be a loopback URL; use --gateway-url for WSL2 or remote Hermes gateways.');
   }
@@ -539,13 +545,14 @@ function normalizeBridgeConfig(
     }
     const allowedBases = [
       ...(url ? [url] : []),
-      ...(gatewayUrl ? [buildHermesGatewayBase(gatewayUrl)] : []),
+      ...(gatewayUrl ? [protocol === 'hermes-openai' ? gatewayUrl : buildHermesGatewayBase(gatewayUrl)] : []),
     ];
     if (!allowedBases.some((base) => urlBelongsToBase(healthUrl, base))) {
       throw new Error('Hermes bridge health URL must belong to the configured --bridge-url or --gateway-url transport.');
     }
   }
   return {
+    ...(gatewayUrl ? { protocol } : {}),
     ...(url ? { url } : {}),
     ...(gatewayUrl ? { gatewayUrl } : {}),
     ...(healthUrl ? { healthUrl } : {}),

@@ -58,10 +58,13 @@ packaged `.dkg` installs.
 Provider facts are written to the `memory` assertion in `agent-context` by
 default. The fact subjects still carry the Hermes profile/agent identity.
 
-The adapter refuses to overwrite an existing non-DKG memory provider. If the
-profile already uses Honcho, Mem0, Supermemory, or another provider, edit the
-Hermes profile config intentionally or use a fresh Hermes profile, then rerun
-setup so DKG can become the active memory provider.
+DKG is the intended memory provider for this adapter. Setup installs and selects
+DKG by writing a managed `memory.provider: dkg` block. If the target profile
+already has another provider configured, this release stops before changing it
+so setup never silently replaces an existing memory backend. To switch that
+profile to DKG, remove or change the existing `memory.provider` entry in
+`config.yaml`, then rerun `dkg hermes setup`. For a clean start, use a fresh
+Hermes profile.
 
 ## CLI Helpers
 
@@ -161,9 +164,10 @@ but the UI should show a degraded/offline bridge state.
 
 ### Provider conflict
 
-If setup reports an existing `memory.provider`, edit the Hermes profile config
-intentionally or use a fresh Hermes profile, then rerun setup so DKG can become
-the active memory provider.
+If setup reports an existing `memory.provider`, the target profile is already
+using another memory backend. To switch it to DKG in this release, remove or
+change that provider entry in the profile `config.yaml`, then rerun
+`dkg hermes setup`. For a clean start, use a fresh Hermes profile.
 
 ### Hermes chat offline
 

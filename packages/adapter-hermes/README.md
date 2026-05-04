@@ -121,7 +121,7 @@ A healthy setup should satisfy all of the following:
 ## Adapter Config
 
 These keys live in `$HERMES_HOME/dkg.json`. `dkg hermes setup` writes the file
-with ownership metadata and refuses to overwrite a non-managed file.
+with ownership metadata and leaves a non-managed file untouched.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
@@ -142,14 +142,15 @@ setup-resolved `dkg_home`, `DKG_HOME`, then `~/.dkg`.
 
 ## Hermes Memory Provider
 
-Hermes allows one external memory provider at a time. Setup elects DKG by
-writing a managed `memory.provider: dkg` block. If `config.yaml` already names
-another provider, for example Honcho, Mem0, or Supermemory, setup refuses to
-replace it automatically.
+Hermes uses DKG as its memory provider. Setup installs and selects DKG by
+writing a managed `memory.provider: dkg` block. If the target profile already
+has another provider configured, this release stops before changing it so setup
+never silently replaces an existing memory backend. To switch that profile to
+DKG, remove or change the existing `memory.provider` entry in `config.yaml`,
+then rerun `dkg hermes setup`. For a clean start, use a fresh Hermes profile.
 
-To use this adapter, switch the Hermes profile to DKG memory intentionally and
-rerun setup. Once DKG is the active provider, Hermes receives DKG-backed memory
-recall, `dkg_memory`, `memory_search`, `dkg_query`, `dkg_share`,
+Once DKG is the active provider, Hermes receives DKG-backed memory recall,
+`dkg_memory`, `memory_search`, `dkg_query`, `dkg_share`,
 assertion/sub-graph helpers, and status/wallet/network helpers.
 
 ## Node UI Connect, Refresh, And Disconnect
@@ -219,9 +220,10 @@ provenance before forwarding them to Hermes.
 
 ### Provider conflict
 
-If setup reports an existing `memory.provider`, edit the Hermes profile config
-intentionally or use a fresh Hermes profile, then rerun setup so DKG can become
-the active memory provider.
+If setup reports an existing `memory.provider`, the target profile is already
+using another memory backend. To switch it to DKG in this release, remove or
+change that provider entry in the profile `config.yaml`, then rerun
+`dkg hermes setup`. For a clean start, use a fresh Hermes profile.
 
 ### Hermes chat offline
 

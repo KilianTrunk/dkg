@@ -576,4 +576,97 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // dkg added.
     expect(written.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
   });
+
+  // ── Phase-4: VSCode + Copilot Chat (servers.dkg shape) ────────────
+
+  /**
+   * Helper: resolve VSCode + Copilot Chat's per-platform user-mcp
+   * config path under a fake home root. Mirrors the production
+   * `vscodeMcpPaths` resolver so the test pins exactly what the
+   * production code does on this platform.
+   */
+  function vscodeMcpPathUnder(fakeHome: string): string {
+    const p = platform();
+    if (p === 'darwin') {
+      return join(fakeHome, 'Library', 'Application Support', 'Code', 'User', 'mcp.json');
+    }
+    if (p === 'win32') {
+      const appData = process.env.APPDATA ?? join(fakeHome, 'AppData', 'Roaming');
+      return join(appData, 'Code', 'User', 'mcp.json');
+    }
+    return join(fakeHome, '.config', 'Code', 'User', 'mcp.json');
+  }
+
+  it('phase-4: VSCode + Copilot Chat is detected and writes under `servers.dkg` (not `mcpServers.dkg`)', async () => {
+    const vscodePath = vscodeMcpPathUnder(tmpHome);
+    mkdirSync(join(vscodePath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(vscodePath)).toBe(true);
+    const written = JSON.parse(readFileSync(vscodePath, 'utf-8'));
+    // VSCode + Copilot Chat keys under `servers`, NOT `mcpServers`.
+    // Pins the entryPath dispatch wired in phase 1.
+    expect(written.servers?.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    // The canonical `mcpServers.dkg` shape MUST NOT be present in
+    // VSCode's file — that would be the wrong key for Copilot Chat.
+    expect(written.mcpServers).toBeUndefined();
+  });
+
+  it('phase-4: pre-existing VSCode `servers.<other>` siblings are preserved on merge', async () => {
+    const vscodePath = vscodeMcpPathUnder(tmpHome);
+    mkdirSync(join(vscodePath, '..'), { recursive: true });
+    writeFileSync(
+      vscodePath,
+      JSON.stringify(
+        { servers: { 'other-mcp': { command: 'baz' } } },
+        null,
+        2,
+      ),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const written = JSON.parse(readFileSync(vscodePath, 'utf-8'));
+    expect(written.servers['other-mcp']).toEqual({ command: 'baz' });
+    expect(written.servers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+  });
+
+  it('phase-4: VSCode staleness — pre-existing dkg entry under `servers.dkg` reclassifies on context flip to monorepo', async () => {
+    // Cross-shape staleness: a Cursor-shaped entry written into
+    // VSCode's `servers.dkg` wouldn't classify as `registered` if
+    // the canonical entry's command/args differ. Here we pin the
+    // installed→monorepo flip works for VSCode the same as for
+    // Cursor (phase-2 covered the Cursor case).
+    const fakeRepoRoot = join('/fake', 'dkg-v9');
+    const vscodePath = vscodeMcpPathUnder(tmpHome);
+    mkdirSync(join(vscodePath, '..'), { recursive: true });
+    writeFileSync(
+      vscodePath,
+      JSON.stringify(
+        { servers: { dkg: { command: 'dkg', args: ['mcp', 'serve'] } } },
+        null,
+        2,
+      ),
+    );
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new Error('connection refused');
+    });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const written = JSON.parse(readFileSync(vscodePath, 'utf-8'));
+    expect(written.servers.dkg.command).toBe('node');
+    expect(written.servers.dkg.args[0]).toBe(
+      join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
+    );
+
+    fetchSpy.mockRestore();
+  });
 });

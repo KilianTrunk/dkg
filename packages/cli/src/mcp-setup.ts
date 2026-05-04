@@ -292,6 +292,34 @@ function claudeDesktopPaths(home: string): { configPath: string; displayPath: st
 }
 
 /**
+ * Resolve VSCode + Copilot Chat's per-platform user-settings MCP
+ * config path. VSCode keeps user-scoped settings under
+ * `<userDataDir>/User/`; on Mac this is
+ * `~/Library/Application Support/Code/User/mcp.json`; on Windows
+ * it's `%APPDATA%\Code\User\mcp.json`; on Linux it's
+ * `~/.config/Code/User/mcp.json`. Note this is the user-scoped
+ * (cross-workspace) config, not the per-workspace `.vscode/mcp.json`.
+ *
+ * Diverges from the canonical `mcpServers.dkg` shape: Copilot Chat's
+ * MCP wiring uses `servers.dkg` instead. The phase-1 entryPath
+ * dispatch handles that without per-client write logic.
+ */
+function vscodeMcpPaths(home: string): { configPath: string; displayPath: string } {
+  const p = platform();
+  if (p === 'darwin') {
+    const configPath = join(home, 'Library', 'Application Support', 'Code', 'User', 'mcp.json');
+    return { configPath, displayPath: '~/Library/Application Support/Code/User/mcp.json' };
+  }
+  if (p === 'win32') {
+    const appData = process.env.APPDATA ?? join(home, 'AppData', 'Roaming');
+    const configPath = join(appData, 'Code', 'User', 'mcp.json');
+    return { configPath, displayPath: configPath.replace(home, '~') };
+  }
+  const configPath = join(home, '.config', 'Code', 'User', 'mcp.json');
+  return { configPath, displayPath: '~/.config/Code/User/mcp.json' };
+}
+
+/**
  * Discover MCP-aware clients on the machine. We look at the standard
  * config-file locations rather than probing for installed binaries — a
  * config file is the artifact `dkg mcp setup` actually writes into, and
@@ -314,6 +342,7 @@ function claudeDesktopPaths(home: string): { configPath: string; displayPath: st
 function detectClients(): ClientTarget[] {
   const home = homedir();
   const claudeDesktop = claudeDesktopPaths(home);
+  const vscodeMcp = vscodeMcpPaths(home);
   const candidates: ClientTarget[] = [
     {
       name: 'Cursor',
@@ -334,6 +363,15 @@ function detectClients(): ClientTarget[] {
       name: 'Windsurf',
       configPath: join(home, '.codeium', 'windsurf', 'mcp_config.json'),
       displayPath: '~/.codeium/windsurf/mcp_config.json',
+    },
+    {
+      name: 'VSCode',
+      configPath: vscodeMcp.configPath,
+      displayPath: vscodeMcp.displayPath,
+      // Copilot Chat's MCP wiring keys under `servers`, not the
+      // canonical `mcpServers`. Phase-1 entryPath dispatch handles
+      // it without per-client write logic.
+      entryPath: 'servers.dkg',
     },
   ];
   return candidates.filter((c) => {

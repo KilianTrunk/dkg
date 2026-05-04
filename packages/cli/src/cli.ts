@@ -1797,14 +1797,50 @@ mcpCmd
 
 mcpCmd
   .command('setup')
-  .description('Register the DKG MCP server with detected MCP-aware clients (idempotent, safe to re-run)')
+  .description('Bundled init + daemon-start + MCP-client registration (idempotent, safe to re-run)')
+  .option('--port <port>', 'Override daemon API port (default: 9200)')
+  .option('--name <name>', 'Override agent name (used only on first init)')
+  .option('--no-start', 'Skip daemon start (configure only)')
+  .option('--no-fund', 'Skip wallet funding via testnet faucet')
+  .option('--no-verify', 'Skip post-setup verification probe')
+  .option('--dry-run', 'Preview steps without writing or starting anything')
   .option('--force', 'Refresh every detected client regardless of current registration state')
-  .option('--print-only', 'Print the canonical JSON to stdout; skip client detection and writes')
+  .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
   .option('--yes', 'Auto-confirm all registrations (default; reserved for future interactive prompts)')
   .action(async (opts) => {
+    // Dynamic-import the openclaw-setup primitives for the bundled
+    // init + daemon-start. Same import surface (and same package
+    // resolution failure mode) as `dkg openclaw setup` so a missing
+    // adapter build emits a parallel error message.
+    let openclawSetupExports: typeof import('@origintrail-official/dkg-adapter-openclaw');
+    try {
+      openclawSetupExports = await import('@origintrail-official/dkg-adapter-openclaw');
+    } catch (err: any) {
+      console.error('\n[dkg mcp setup] Setup primitives are not available.');
+      console.error(`  Reason: ${err?.message ?? err}`);
+      console.error('  • In a monorepo dev checkout: run `pnpm build` at the repo root to build all workspaces.');
+      console.error('  • With a global install: reinstall with `npm install -g @origintrail-official/dkg`.\n');
+      process.exit(1);
+    }
+    let coreExports: typeof import('@origintrail-official/dkg-core');
+    try {
+      coreExports = await import('@origintrail-official/dkg-core');
+    } catch (err: any) {
+      console.error('\n[dkg mcp setup] Core faucet primitive is not available.');
+      console.error(`  Reason: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+
     const { mcpSetupAction } = await import('./mcp-setup.js');
     try {
-      await mcpSetupAction(opts);
+      await mcpSetupAction(opts, {
+        loadNetworkConfig: openclawSetupExports.loadNetworkConfig,
+        writeDkgConfig: openclawSetupExports.writeDkgConfig,
+        startDaemon: openclawSetupExports.startDaemon,
+        readWalletsWithRetry: openclawSetupExports.readWalletsWithRetry,
+        logManualFundingInstructions: openclawSetupExports.logManualFundingInstructions,
+        requestFaucetFunding: coreExports.requestFaucetFunding,
+      });
     } catch (err: any) {
       console.error(`\n[dkg mcp setup] ERROR: ${err?.message ?? err}\n`);
       process.exit(1);

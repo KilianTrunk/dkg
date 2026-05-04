@@ -1850,6 +1850,86 @@ describe('openclaw-entry', () => {
     expect(existsSync(join(staleWorkspace, 'skills', 'dkg-node', 'SKILL.md'))).toBe(false);
   });
 
+  it('T364 round 9 — partial pluginConfig overlay inherits fallback installedWorkspace for stale-route check', async () => {
+    // Pre-fix the stale-route check read `installedWorkspace` and
+    // `stateDirSource` from raw `config` (just current sources). For a
+    // partial overlay update (e.g. `api.pluginConfig = { channel: { port: 9801 } }`),
+    // those keys aren't in current at all — they live only in fallback
+    // runtime config. So `currentRouteWorkspaceIsStale` stayed false and
+    // we kept stamping/syncing against the stale `api.cfg.workspace` even
+    // though the fallback metadata had grounds to reject it.
+    // Post-fix the stale check reads from `bootstrapConfig` (which merges
+    // fallback under partial current), so the fallback installedWorkspace
+    // / stateDirSource correctly engage the rejection path.
+    const installedWorkspace = mkdtempSync(join(tmpdir(), 'openclaw-installed-r9-'));
+    tempRoots.push(installedWorkspace);
+    const entry = await loadEntryWithFakeRuntime();
+    const api = makeDirectPluginConfigApi({
+      // Partial overlay — no installedWorkspace / stateDirSource here.
+      channel: { port: 9801 },
+    }, {
+      cfg: {
+        // Stale route workspace pointed at the installedWorkspace
+        // (matches the setup-default detection trigger).
+        agents: { defaults: { workspace: installedWorkspace } },
+      },
+      runtime: {
+        // Fallback carries the setup metadata that should engage the
+        // stale-route rejection path.
+        pluginConfig: {
+          stateDir: join(installedWorkspace, '.dkg-adapter'),
+          stateDirSource: 'setup-default',
+          installedWorkspace,
+        },
+      },
+    });
+
+    entry(api);
+
+    const instance = globalThis.__openclawEntryTestInstances![0];
+    // Bootstrap should resolve the installedWorkspace (the fallback
+    // metadata kicked in via the stale-route rejection path), not the
+    // stale `api.cfg.agents.defaults.workspace` value.
+    expect(instance.workspaceDirsAtRegister[0]).toBe(installedWorkspace);
+  });
+
+  it('T364 round 9 — gracefully tolerates a non-configurable api.workspaceDir property', async () => {
+    // Pre-fix `setEntryAssignedWorkspaceDir` used a hard
+    // `Object.defineProperty` that throws on plugin load if a future
+    // OpenClaw API exposed `workspaceDir` as a non-configurable own
+    // property. Post-fix the install is wrapped in a try/catch that
+    // falls back to plain assignment + value tracking, so the plugin
+    // loads cleanly and the resolver still yields the computed workspace.
+    const entry = await loadEntryWithFakeRuntime();
+    const api = makeDirectPluginConfigApi({
+      stateDir: '/dir/.dkg-adapter',
+      stateDirSource: 'setup-default',
+      installedWorkspace: '/dir',
+    }, {
+      runtime: {
+        config: {
+          workspace: '/from-runtime',
+        },
+      },
+    });
+    // Pre-pin api.workspaceDir as non-configurable, simulating a future
+    // gateway that locks the property.
+    Object.defineProperty(api, 'workspaceDir', {
+      configurable: false,
+      enumerable: true,
+      writable: true,
+      value: undefined,
+    });
+
+    expect(() => entry(api)).not.toThrow();
+
+    const instance = globalThis.__openclawEntryTestInstances![0];
+    // The fallback path writes through plain assignment, so the
+    // gateway sees the value via api.workspaceDir.
+    expect((api as any).workspaceDir).toBe('/from-runtime');
+    expect(instance.workspaceDirsAtRegister).toEqual(['/from-runtime']);
+  });
+
   it('does not reuse a workspaceDir written by an earlier same-api registration', async () => {
     const entry = await loadEntryWithFakeRuntime();
     const api = makeDirectPluginConfigApi({

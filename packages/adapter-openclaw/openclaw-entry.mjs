@@ -14,7 +14,21 @@ import {
 /** Module-level singleton - prevents duplicate registration during gateway multi-phase init. */
 let instance = null;
 const lifecycleServiceApis = new WeakMap();
+// Tracks api → marker so apiWorkspaceDirFrom can distinguish values
+// we wrote from values the gateway/third party set. The defineProperty
+// setter clears the marker on ANY third-party write (even one that
+// matches the entry-assigned value), so subsequent reads correctly
+// fall through to auto-detection.
 const entryAssignedWorkspaceDirMarkers = new WeakMap();
+// T364 round 9 — fallback value tracking for the rare future gateway
+// version where api.workspaceDir is non-configurable (defineProperty
+// throws). The catch branch in setEntryAssignedWorkspaceDir registers
+// here instead of via the marker; apiWorkspaceDirFrom then compares
+// values to detect third-party writes that change the value. Codex
+// flagged that a hard defineProperty assumed the property was always
+// configurable plain data — graceful degradation here means a future
+// OpenClaw API that locks the property doesn't throw plugin load.
+const entryAssignedWorkspaceDirValues = new WeakMap();
 let lifecycleOwnerToken = null;
 
 export default function (api) {
@@ -222,8 +236,18 @@ function resolveEntryConfig(api, options = {}) {
     : config;
 
   const apiWorkspaceDir = apiWorkspaceDirFrom(anyApi);
-  const installedWorkspaceDir = typeof config.installedWorkspace === 'string'
-    ? config.installedWorkspace
+  // T364 round 9 — read setup metadata from `bootstrapConfig`, not raw
+  // `config`. `config` only carries the merged CURRENT sources, so a
+  // partial overlay update (e.g. `api.pluginConfig = { channel: { port: 9801 } }`)
+  // has neither `installedWorkspace` nor `stateDirSource`/`stateDir`.
+  // Pre-fix `currentRouteWorkspaceIsStale` then stayed false for
+  // partial-overlay updates and we kept stamping/syncing against a
+  // stale `api.cfg.workspace` even when fallback runtime config
+  // already had the setup metadata to reject it. `bootstrapConfig`
+  // merges fallback under current when partial, so partial overlays
+  // inherit the fallback metadata for this stale-workspace check.
+  const installedWorkspaceDir = typeof bootstrapConfig.installedWorkspace === 'string'
+    ? bootstrapConfig.installedWorkspace
     : undefined;
   const currentWorkspaceDir = workspaceDirFromConfig(currentWorkspaceConfig);
   const fallbackWorkspaceDir = workspaceDirFromConfig(fallbackWorkspaceConfig);
@@ -238,7 +262,7 @@ function resolveEntryConfig(api, options = {}) {
       setupDefaultStateMetadataMatchesWorkspace(candidate, installedWorkspaceDir)
     );
   const currentWorkspaceMatchesConfiguredStateDir =
-    stateDirMatchesWorkspaceDefault(config.stateDir, currentWorkspaceDir);
+    stateDirMatchesWorkspaceDefault(bootstrapConfig.stateDir, currentWorkspaceDir);
   // T364 — Gate the stale-route fallback on setup-owned stateDir values.
   // Pre-fix this check also fired for operator-owned stateDir paths
   // (custom `config.stateDir` pointing outside the workspace default).
@@ -249,7 +273,7 @@ function resolveEntryConfig(api, options = {}) {
   // current workspace as stale when the stateDir IS a setup-owned default
   // (i.e., stateDirSource === 'setup-default'); otherwise the operator
   // owns the stateDir path and the workspace stale check shouldn't fire.
-  const stateDirSourceIsSetupDefault = config.stateDirSource === 'setup-default';
+  const stateDirSourceIsSetupDefault = bootstrapConfig.stateDirSource === 'setup-default';
   const currentRouteWorkspaceIsStale =
     (currentDirectConfigMatchesInstalledWorkspace || currentEntryConfigMatchesInstalledWorkspace) &&
     !!installedWorkspaceDir &&
@@ -266,7 +290,25 @@ function resolveEntryConfig(api, options = {}) {
 
 function apiWorkspaceDirFrom(api) {
   if (typeof api?.workspaceDir !== 'string') return undefined;
-  return entryAssignedWorkspaceDirMarkers.has(api) ? undefined : api.workspaceDir;
+  // Primary path: marker present means we hold the defineProperty
+  // accessor and no third-party write has cleared the marker. Any
+  // third-party write — even one that assigns the same value — fires
+  // the setter and removes the marker, so subsequent reads correctly
+  // fall through to auto-detection.
+  if (entryAssignedWorkspaceDirMarkers.has(api)) return undefined;
+  // Fallback path: marker missing but value tracking present means the
+  // defineProperty install failed (non-configurable property on a
+  // future gateway) and we're tracking by value. Treat as
+  // entry-assigned only if the value still matches; a third-party
+  // write that changes the value clears this match. (Same-value
+  // third-party writes are indistinguishable from no-op in this path,
+  // which is acceptable — the marker path handles that case for the
+  // common gateway shape.)
+  const entryAssigned = entryAssignedWorkspaceDirValues.get(api);
+  if (entryAssigned !== undefined && entryAssigned === api.workspaceDir) {
+    return undefined;
+  }
+  return api.workspaceDir;
 }
 
 function hasWorkspaceConfig(config) {
@@ -320,28 +362,65 @@ function normalizePath(value) {
 }
 
 function setEntryAssignedWorkspaceDir(api, workspaceDir) {
+  // T364 round 9 — try `Object.defineProperty` first (preserves the
+  // pre-existing same-value third-party write detection via the
+  // setter callback) and fall back to plain assignment + value
+  // tracking when the property is non-configurable on a future
+  // gateway. Codex flagged that a hard defineProperty assumed the
+  // property was always a configurable plain data property; the
+  // try/catch here makes the install graceful so plugin load doesn't
+  // throw if a future OpenClaw API exposes `workspaceDir` via a
+  // non-configurable own property or its own accessor.
   const marker = {};
   let currentValue = workspaceDir;
   entryAssignedWorkspaceDirMarkers.set(api, marker);
-  Object.defineProperty(api, 'workspaceDir', {
-    configurable: true,
-    enumerable: true,
-    get() {
-      return currentValue;
-    },
-    set(value) {
-      currentValue = value;
-      if (entryAssignedWorkspaceDirMarkers.get(api) === marker) {
-        entryAssignedWorkspaceDirMarkers.delete(api);
-      }
-    },
-  });
+  try {
+    Object.defineProperty(api, 'workspaceDir', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return currentValue;
+      },
+      set(value) {
+        currentValue = value;
+        if (entryAssignedWorkspaceDirMarkers.get(api) === marker) {
+          entryAssignedWorkspaceDirMarkers.delete(api);
+        }
+      },
+    });
+    // Marker path is in effect; clear any stale value-track entry from
+    // a previous fallback round so apiWorkspaceDirFrom doesn't double-count.
+    entryAssignedWorkspaceDirValues.delete(api);
+  } catch {
+    // Property is non-configurable (or has its own non-overridable
+    // accessor) on this gateway. Drop the marker — the setter we
+    // tried to install isn't there to clear it — and switch to value
+    // tracking. If the plain assignment also throws (read-only),
+    // accept the existing api.workspaceDir as the resolver answer.
+    entryAssignedWorkspaceDirMarkers.delete(api);
+    try {
+      api.workspaceDir = workspaceDir;
+    } catch { /* read-only — accept existing value */ }
+    entryAssignedWorkspaceDirValues.set(api, workspaceDir);
+  }
 }
 
 function clearEntryAssignedWorkspaceDir(api) {
-  if (!entryAssignedWorkspaceDirMarkers.has(api)) return;
+  const hadMarker = entryAssignedWorkspaceDirMarkers.has(api);
+  const hadValue = entryAssignedWorkspaceDirValues.has(api);
+  if (!hadMarker && !hadValue) return;
   entryAssignedWorkspaceDirMarkers.delete(api);
-  delete api.workspaceDir;
+  const trackedValue = entryAssignedWorkspaceDirValues.get(api);
+  entryAssignedWorkspaceDirValues.delete(api);
+  // Marker path: defineProperty installed; safely delete the
+  // descriptor we own. Value-track path: only delete if the property
+  // still holds the value we wrote — a third-party write to a
+  // different value would otherwise be silently dropped.
+  if (hadMarker || trackedValue === undefined || api.workspaceDir === trackedValue) {
+    try {
+      delete api.workspaceDir;
+    } catch { /* non-configurable — best-effort */ }
+  }
 }
 
 function directApiConfigFrom(config) {

@@ -59,13 +59,23 @@ export class FakeServer {
   /**
    * Validate input against the tool's declared zod inputSchema, then invoke
    * the handler exactly the way the real MCP SDK does (positional input
-   * object, no extras). Throws on validation failure so tests can `expect`
-   * the rejection.
+   * object, no extras). Throws on declared-field validation failure so
+   * tests can `expect` the rejection.
+   *
+   * Mirrors production MCP SDK schema posture: unknown keys are silently
+   * dropped at parse, NOT rejected. The pre-F27 `.strict()` mode here
+   * gave three tests false confidence — they asserted that legacy
+   * `{ layer: 'union' }` was *rejected* on `dkg_get_entity` /
+   * `dkg_list_activity` / `dkg_query` post-W2-#17. Against the real
+   * MCP SDK those calls would parse cleanly (`layer` silently dropped)
+   * and run the handler with the default scope. The harness now matches
+   * that posture so the tests describe the real surface, not a
+   * harness artefact. Strict-mode tests must use a different harness.
    */
   async call(name: string, input: Record<string, unknown> = {}): Promise<ToolResult> {
     const tool = this.get(name);
     const shape = tool.config.inputSchema ?? {};
-    const objectSchema = z.object(shape as Record<string, ZodTypeAny>).strict();
+    const objectSchema = z.object(shape as Record<string, ZodTypeAny>);
     const parsed = objectSchema.parse(input);
     return tool.handler(parsed);
   }

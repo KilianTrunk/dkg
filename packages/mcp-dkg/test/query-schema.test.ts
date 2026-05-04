@@ -53,18 +53,32 @@ describe('dkg_query — two-axis schema migration (post-#17 rename + split)', ()
     },
   );
 
-  it('rejects the legacy single-axis shape `layer: "wm" | "swm" | "union" | "vm"`', async () => {
-    // The post-#17 schema replaces the old `layer` enum with the
-    // two-axis (view, includeSharedMemory) shape. Passing the legacy
-    // shape must be rejected by zod's strict object check, not silently
-    // ignored.
+  it('post-#17 + F27: legacy `layer` key is silently dropped at parse, call runs with V10 default scope', async () => {
+    // Post-W2 #17 the schema migrated to the two-axis (view,
+    // includeSharedMemory) shape. The legacy `layer` field is no
+    // longer declared. Production MCP SDK silently drops undeclared
+    // keys at parse — it does NOT reject them. Pre-F27 the harness
+    // ran `.strict()` and asserted these calls *throw*; that
+    // assertion was a harness artefact (production would never have
+    // thrown). The honest production-equivalent test: every legacy
+    // `layer` value parses cleanly and the handler runs with the
+    // default scope (no `view`, no `includeSharedMemory` — i.e.
+    // dkg_query's default WM-only routing).
     for (const layer of ['wm', 'swm', 'union', 'vm']) {
-      await expect(
-        server.call('dkg_query', {
-          sparql: 'SELECT ?s WHERE { ?s ?p ?o }',
-          layer,
-        }),
-      ).rejects.toThrow();
+      const before = client.queryCalls.length;
+      const result = await server.call('dkg_query', {
+        sparql: 'SELECT ?s WHERE { ?s ?p ?o }',
+        layer,
+      });
+      expect(result.isError).toBeFalsy();
+      const lastCall = client.queryCalls[before];
+      // Default scope: no view, no includeSharedMemory — `layer`
+      // was silently dropped, NOT mapped to anything.
+      expect(lastCall.view).toBeUndefined();
+      expect(lastCall.includeSharedMemory).toBeUndefined();
+      // And the legacy `layer` key itself must not have leaked
+      // through to the wire (the parsed input doesn't carry it).
+      expect((lastCall as Record<string, unknown>).layer).toBeUndefined();
     }
   });
 
@@ -152,13 +166,29 @@ describe('F1 schema-migration sweep — no public tool exposes legacy `layer` fi
     expect(lastCall.view).toBe('verified-memory');
   });
 
-  it('dkg_get_entity rejects the legacy `layer: "union"` shape', async () => {
+  it('F27: dkg_get_entity silently drops legacy `layer: "union"`, falls back to V9-era default WM∪SWM scope', async () => {
+    // Post-F1 the legacy `layer` field is no longer on the schema
+    // (replaced by `view + includeSharedMemory`). Production MCP SDK
+    // drops undeclared keys at parse — pre-F27 the harness's strict
+    // mode falsely asserted that `layer: 'union'` throws here.
+    // Honest assertion: the legacy key drops, the handler falls
+    // through to the no-view default which preserves the V9-era
+    // `layer: 'union'` semantics on the wire (`includeSharedMemory: true`).
     const server = new FakeServer();
     const client = new FakeClient();
     registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
-    await expect(
-      server.call('dkg_get_entity', { uri: 'urn:test:entity', layer: 'union' }),
-    ).rejects.toThrow();
+    const result = await server.call('dkg_get_entity', {
+      uri: 'urn:test:entity',
+      layer: 'union',
+    });
+    expect(result.isError).toBeFalsy();
+    // Two query calls fire (outgoing + incoming neighbourhood);
+    // both must use the no-view default scope.
+    expect(client.queryCalls.length).toBeGreaterThanOrEqual(1);
+    for (const call of client.queryCalls) {
+      expect(call.view).toBeUndefined();
+      expect(call.includeSharedMemory).toBe(true);
+    }
   });
 
   it('dkg_list_activity accepts `view: "shared-working-memory"` post-F1', async () => {
@@ -173,13 +203,21 @@ describe('F1 schema-migration sweep — no public tool exposes legacy `layer` fi
     expect(lastCall.graphSuffix).toBe('_shared_memory');
   });
 
-  it('dkg_list_activity rejects the legacy `layer: "wm"` shape', async () => {
+  it('F27: dkg_list_activity silently drops legacy `layer: "wm"`, falls back to V9-era default WM∪SWM scope', async () => {
+    // F27-bug-class twin to the dkg_get_entity case above. Production
+    // MCP SDK drops the legacy `layer` key at parse; the handler
+    // falls through to the no-view default. The `layer: 'wm'` value
+    // does NOT route to a WM-only query — it gets dropped entirely,
+    // leaving the call to use the V9-era WM∪SWM default.
     const server = new FakeServer();
     const client = new FakeClient();
     registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
-    await expect(
-      server.call('dkg_list_activity', { layer: 'wm' }),
-    ).rejects.toThrow();
+    const result = await server.call('dkg_list_activity', { layer: 'wm' });
+    expect(result.isError).toBeFalsy();
+    const lastCall = client.queryCalls.at(-1)!;
+    expect(lastCall.view).toBeUndefined();
+    expect(lastCall.includeSharedMemory).toBe(true);
+    expect(lastCall.graphSuffix).toBeUndefined();
   });
 
   it('dkg_get_entity default (no view) preserves V9-era WM∪SWM behaviour', async () => {

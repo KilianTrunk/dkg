@@ -6,16 +6,24 @@ The package ships transitively as part of `@origintrail-official/dkg`. You don't
 
 ## Install
 
-Three commands, same shape as every other DKG V10 on-ramp:
+Two commands, same shape as `dkg openclaw setup`:
 
 ```bash
 npm install -g @origintrail-official/dkg     # umbrella CLI bundles this MCP server
-dkg init                                     # one-time: node name, EVM key, auto-fund testnet wallets
-dkg start                                    # background daemon on http://127.0.0.1:9200
-dkg mcp setup                                # register MCP with every detected client
+dkg mcp setup                                # one-shot: init + start + fund + register + verify
 ```
 
-`dkg mcp setup` is idempotent and safe to re-run. It detects each MCP-aware client by its config file (`~/.cursor/mcp.json`, `~/.claude.json`) and writes a single canonical entry under `mcpServers.dkg`:
+`dkg mcp setup` runs a bundled, idempotent flow. In order, it:
+
+1. Initializes `~/.dkg/config.json` if absent (skipped silently when present)
+2. Starts the DKG daemon as a background process (skipped if already running)
+3. Funds the node's wallets via the testnet faucet (skip with `--no-fund`)
+4. Detects each MCP-aware client by its config file (`~/.cursor/mcp.json`, `~/.claude.json`) and writes the canonical entry under `mcpServers.dkg`
+5. Verifies the daemon is healthy
+
+Every step short-circuits when its work is already done, so re-running on a set-up box is safe. Step-skip flags: `--no-start`, `--no-fund`, `--no-verify`, `--dry-run` (preview only), `--force` (refresh every detected client config regardless of state). First-init overrides: `--port <n>`, `--name <s>`. The bundled flow re-uses the same primitives `dkg openclaw setup` does, so the two verbs stay byte-aligned on network defaults, daemon-readiness probes, faucet retry/back-off, and manual-curl fallback.
+
+The canonical entry written into each client's config:
 
 ```json
 {

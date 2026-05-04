@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
-import { tmpdir, homedir } from 'node:os';
+import { tmpdir, homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { mcpSetupAction, type McpSetupActionDeps } from '../src/mcp-setup.js';
 
@@ -19,6 +19,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
   let tmpHome: string;
   let originalHome: string | undefined;
   let originalUserprofile: string | undefined;
+  let originalAppdata: string | undefined;
   let logSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
@@ -27,9 +28,15 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     tmpHome = mkdtempSync(join(tmpdir(), 'mcp-setup-test-'));
     originalHome = process.env.HOME;
     originalUserprofile = process.env.USERPROFILE;
+    originalAppdata = process.env.APPDATA;
     process.env.HOME = tmpHome;
     // node:os homedir() reads USERPROFILE on win32, HOME elsewhere; set both.
     process.env.USERPROFILE = tmpHome;
+    // Phase-3: Claude Desktop's Windows path resolves under
+    // %APPDATA%; redirect that into tmpHome too so the per-platform
+    // path resolver lands inside the test sandbox on Win32. macOS
+    // and Linux ignore APPDATA.
+    process.env.APPDATA = join(tmpHome, 'AppData', 'Roaming');
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -40,6 +47,8 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     else delete process.env.HOME;
     if (originalUserprofile !== undefined) process.env.USERPROFILE = originalUserprofile;
     else delete process.env.USERPROFILE;
+    if (originalAppdata !== undefined) process.env.APPDATA = originalAppdata;
+    else delete process.env.APPDATA;
     logSpy.mockRestore();
     warnSpy.mockRestore();
     errorSpy.mockRestore();
@@ -469,5 +478,102 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(after.mcpServers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
 
     fetchSpy.mockRestore();
+  });
+
+  // ── Phase-3: Claude Desktop + Windsurf detection + write ──────────
+
+  /**
+   * Helper: resolve the per-platform Claude Desktop config path under
+   * a fake home root. Mirrors the production `claudeDesktopPaths`
+   * resolver byte-for-byte so the test pins what the production
+   * code does on whatever platform is running this test.
+   */
+  function claudeDesktopPathUnder(fakeHome: string): string {
+    const p = platform();
+    if (p === 'darwin') {
+      return join(fakeHome, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
+    }
+    if (p === 'win32') {
+      const appData = process.env.APPDATA ?? join(fakeHome, 'AppData', 'Roaming');
+      return join(appData, 'Claude', 'claude_desktop_config.json');
+    }
+    return join(fakeHome, '.config', 'Claude', 'claude_desktop_config.json');
+  }
+
+  it('phase-3: Claude Desktop is detected when its config dir exists; gets canonical entry written', async () => {
+    // Pre-create the per-platform config directory so detection
+    // fires even though the file doesn't exist yet (parent-dir
+    // existence is a sufficient detection signal).
+    const claudePath = claudeDesktopPathUnder(tmpHome);
+    mkdirSync(join(claudePath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(claudePath)).toBe(true);
+    const written = JSON.parse(readFileSync(claudePath, 'utf-8'));
+    expect(written.mcpServers.dkg).toEqual({
+      command: 'dkg',
+      args: ['mcp', 'serve'],
+    });
+  });
+
+  it('phase-3: Windsurf is detected at ~/.codeium/windsurf/; gets canonical entry written', async () => {
+    const windsurfPath = join(tmpHome, '.codeium', 'windsurf', 'mcp_config.json');
+    mkdirSync(join(windsurfPath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(windsurfPath)).toBe(true);
+    const written = JSON.parse(readFileSync(windsurfPath, 'utf-8'));
+    expect(written.mcpServers.dkg).toEqual({
+      command: 'dkg',
+      args: ['mcp', 'serve'],
+    });
+  });
+
+  it('phase-3: clients with no config dir are not detected — silent and absent', async () => {
+    // Cursor's parent dir exists (we'll pre-create it), but Claude
+    // Desktop's and Windsurf's do NOT — so only Cursor should be
+    // touched. Pins the "permissive but only when the parent
+    // directory exists" detection contract.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(true);
+    expect(existsSync(claudeDesktopPathUnder(tmpHome))).toBe(false);
+    expect(existsSync(join(tmpHome, '.codeium', 'windsurf', 'mcp_config.json'))).toBe(false);
+  });
+
+  it('phase-3: pre-existing Claude Desktop entry on a sibling key is preserved', async () => {
+    // Common real-world shape: a Claude Desktop user already has
+    // other MCP servers registered. The setup must merge — write
+    // `dkg` alongside without clobbering siblings.
+    const claudePath = claudeDesktopPathUnder(tmpHome);
+    mkdirSync(join(claudePath, '..'), { recursive: true });
+    writeFileSync(
+      claudePath,
+      JSON.stringify(
+        {
+          mcpServers: {
+            'some-other-server': { command: 'foo', args: ['bar'] },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const written = JSON.parse(readFileSync(claudePath, 'utf-8'));
+    // Sibling preserved.
+    expect(written.mcpServers['some-other-server']).toEqual({ command: 'foo', args: ['bar'] });
+    // dkg added.
+    expect(written.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
   });
 });

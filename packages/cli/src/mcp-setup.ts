@@ -39,7 +39,7 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, platform } from 'node:os';
 
 export interface McpSetupCliOptions {
   /** Refresh every detected client regardless of current registration state. */
@@ -268,15 +268,42 @@ function tildify(p: string): string {
 }
 
 /**
+ * Resolve Claude Desktop's per-platform config path. The macOS path
+ * uses `~/Library/Application Support/Claude/`; Windows uses
+ * `%APPDATA%\Claude\`; Linux follows XDG-ish convention at
+ * `~/.config/Claude/`. The display path tildifies the home prefix
+ * so the operator-facing log reads consistently across platforms.
+ */
+function claudeDesktopPaths(home: string): { configPath: string; displayPath: string } {
+  const p = platform();
+  if (p === 'darwin') {
+    const configPath = join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
+    return { configPath, displayPath: '~/Library/Application Support/Claude/claude_desktop_config.json' };
+  }
+  if (p === 'win32') {
+    const appData = process.env.APPDATA ?? join(home, 'AppData', 'Roaming');
+    const configPath = join(appData, 'Claude', 'claude_desktop_config.json');
+    return { configPath, displayPath: configPath.replace(home, '~') };
+  }
+  // Linux + everything else: XDG-style. Per Claude's docs the active
+  // config under Linux is `~/.config/Claude/claude_desktop_config.json`.
+  const configPath = join(home, '.config', 'Claude', 'claude_desktop_config.json');
+  return { configPath, displayPath: '~/.config/Claude/claude_desktop_config.json' };
+}
+
+/**
  * Discover MCP-aware clients on the machine. We look at the standard
  * config-file locations rather than probing for installed binaries — a
  * config file is the artifact `dkg mcp setup` actually writes into, and
  * its existence (or non-existence) is the signal that matters.
  *
- * Cursor reads `~/.cursor/mcp.json`. Claude Code reads `~/.claude.json`
- * (and on some platforms `~/.claude/mcp_servers.json`); we target
- * `~/.claude.json` because that's the user-scoped path the MCP-server
- * wiring already uses across the rest of the codebase.
+ * Per-client docs source-of-truth (verify on next-cycle if anything
+ * drifts):
+ *   - Cursor:        `~/.cursor/mcp.json` — global per-user MCP config
+ *   - Claude Code:   `~/.claude.json` — user-scoped path the MCP-server
+ *     wiring already uses across the rest of the codebase
+ *   - Claude Desktop: per-platform (see `claudeDesktopPaths`)
+ *   - Windsurf (Codeium): `~/.codeium/windsurf/mcp_config.json`
  *
  * Detection is deliberately permissive: any client whose config file is
  * already present OR whose config directory is already present counts as
@@ -286,6 +313,7 @@ function tildify(p: string): string {
  */
 function detectClients(): ClientTarget[] {
   const home = homedir();
+  const claudeDesktop = claudeDesktopPaths(home);
   const candidates: ClientTarget[] = [
     {
       name: 'Cursor',
@@ -296,6 +324,16 @@ function detectClients(): ClientTarget[] {
       name: 'Claude Code',
       configPath: join(home, '.claude.json'),
       displayPath: '~/.claude.json',
+    },
+    {
+      name: 'Claude Desktop',
+      configPath: claudeDesktop.configPath,
+      displayPath: claudeDesktop.displayPath,
+    },
+    {
+      name: 'Windsurf',
+      configPath: join(home, '.codeium', 'windsurf', 'mcp_config.json'),
+      displayPath: '~/.codeium/windsurf/mcp_config.json',
     },
   ];
   return candidates.filter((c) => {

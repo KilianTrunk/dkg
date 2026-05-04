@@ -254,8 +254,15 @@ export class FakeClient {
   // ── Setup ───────────────────────────────────────────────────────
   async createContextGraph(args: { id: string; name: string }) {
     if (this.overrides.createContextGraph) return this.overrides.createContextGraph.call(this, args);
+    // Mirror the real client's idempotency contract (post-F2): duplicate
+    // ids return `alreadyExists: true` rather than throwing.
+    const alreadyExists = this.contextGraphs.has(args.id);
     this.contextGraphs.add(args.id);
-    return { created: args.id, uri: `urn:dkg:cg:${args.id}` };
+    return {
+      created: args.id,
+      uri: `urn:dkg:cg:${args.id}`,
+      alreadyExists,
+    };
   }
 
   async ensureSubGraph(cgId: string, name: string) {

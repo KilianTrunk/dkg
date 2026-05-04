@@ -57,6 +57,37 @@ describe('setup tools — context graph + sub-graph + subscribe', () => {
     expect(client.contextGraphs.size).toBe(0);
   });
 
+  // F2: surface the daemon's already-exists signal so callers can
+  // distinguish "newly created" from "already existed" without doing
+  // an extra dkg_list_context_graphs round-trip. Mirrors
+  // dkg_assertion_create's idempotency surfacing.
+  it('first create reports "Created"; second create with same id reports "already exists"', async () => {
+    const r1 = await server.call('dkg_context_graph_create', { name: 'My Project' });
+    expect(r1.isError).toBeFalsy();
+    expect(r1.content[0].text).toMatch(/^Created context graph 'my-project'/);
+
+    // Re-create with the same auto-derived id — daemon-side 409 is
+    // caught by `client.createContextGraph`, surfaced as
+    // `alreadyExists: true` to the tool, which renders the
+    // distinct "already exists" message.
+    const r2 = await server.call('dkg_context_graph_create', { name: 'My Project' });
+    expect(r2.isError).toBeFalsy();
+    expect(r2.content[0].text).toMatch(/^Context graph 'my-project' already exists/);
+    expect(r2.content[0].text).not.toMatch(/^Created/);
+  });
+
+  it('description no longer recommends the dkg_list_context_graphs workaround', () => {
+    // The pre-F2 description told callers to "Call dkg_list_context_graphs
+    // first to see if one with this name already exists." That workaround
+    // was forced because the create call dropped the idempotency signal.
+    // Post-F2 the create surfaces the signal directly, so the workaround
+    // text must be gone.
+    const desc = server.get('dkg_context_graph_create').config.description!;
+    expect(desc).not.toMatch(/Call `dkg_list_context_graphs` first/);
+    // ...replaced with an explicit idempotency contract.
+    expect(desc).toMatch(/Idempotent/);
+  });
+
   it('dkg_sub_graph_create is wrapper-idempotent: ensureSubGraph swallows the daemon-side 409', async () => {
     const r1 = await server.call('dkg_sub_graph_create', {
       contextGraphId: 'cg',

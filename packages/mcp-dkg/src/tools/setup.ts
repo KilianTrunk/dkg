@@ -63,10 +63,11 @@ export function registerSetupTools(
       title: 'Create Context Graph',
       description:
         "Create a context graph (called 'projects' in the DKG node UI). " +
-        "Returns the new CG's id, name, and on-chain registration status. " +
-        'Call `dkg_list_context_graphs` first to see if one with this name ' +
-        'already exists. The `id` slug is auto-derived from `name` when ' +
-        'omitted (e.g. "My Research" → "my-research"); slugs must match ' +
+        'Idempotent — re-creating an existing CG with the same id is a ' +
+        "no-op and surfaces `already exists` in the response. Returns the " +
+        "CG's id, URI, and whether it was newly created or already existed. " +
+        'The `id` slug is auto-derived from `name` when omitted (e.g. ' +
+        '"My Research" → "my-research"); slugs must match ' +
         '/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.',
       inputSchema: {
         name: z.string().min(1).describe('Human-readable name (e.g. "My Research Context Graph")'),
@@ -101,6 +102,16 @@ export function registerSetupTools(
           name: trimmedName,
           description: description?.trim() || undefined,
         });
+        // Mirror dkg_assertion_create's idempotency surfacing: distinct
+        // success messages for "newly created" vs "already existed" so
+        // callers don't have to do an extra `dkg_list_context_graphs`
+        // round-trip to figure out which path the daemon took.
+        if (result.alreadyExists) {
+          return ok(
+            `Context graph '${cgId}' already exists.\n` +
+              `URI: ${result.uri}`,
+          );
+        }
         return ok(
           `Created context graph '${cgId}'.\n` +
             `URI: ${result.uri}\n` +

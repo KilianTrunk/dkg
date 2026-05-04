@@ -495,17 +495,48 @@ export class DkgClient {
    * Create a new context graph on the DKG node. The `id` is the slug; if
    * omitted at the tool layer it should be derived from `name` before
    * being passed through. Wraps `POST /api/context-graph/create`.
+   *
+   * Idempotent on duplicate `id`: the daemon route returns HTTP 409 with
+   * an `already exists` / `duplicate` / `conflict` body when a CG with
+   * the same id already exists; this wrapper catches that 409 and returns
+   * `{ alreadyExists: true, created, uri }` so callers (e.g.
+   * `dkg_context_graph_create`) can surface "already existed" vs
+   * "newly created" without parsing error strings. Mirrors the
+   * `createAssertion` shape — same convention, same idempotency contract.
    */
   async createContextGraph(args: {
     id: string;
     name: string;
     description?: string;
-  }): Promise<{ created: string; uri: string }> {
-    return this.request('POST', '/api/context-graph/create', {
-      id: args.id,
-      name: args.name,
-      description: args.description,
-    });
+  }): Promise<{ created: string; uri: string; alreadyExists: boolean }> {
+    try {
+      const response = await this.request<{ created: string; uri: string }>(
+        'POST',
+        '/api/context-graph/create',
+        {
+          id: args.id,
+          name: args.name,
+          description: args.description,
+        },
+      );
+      return { ...response, alreadyExists: false };
+    } catch (err) {
+      // Daemon returns 409 with "already exists" / "duplicate" / "conflict"
+      // in the body when the id is taken; treat any of those as the
+      // idempotent already-exists case rather than a hard failure.
+      if (
+        err instanceof DkgHttpError &&
+        err.status === 409 &&
+        /already exists|duplicate|conflict/i.test(String(err.message))
+      ) {
+        return {
+          created: args.id,
+          uri: `did:dkg:context-graph:${args.id}`,
+          alreadyExists: true,
+        };
+      }
+      throw err;
+    }
   }
 
   /**

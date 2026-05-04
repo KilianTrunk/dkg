@@ -3296,8 +3296,9 @@ export class DkgNodePlugin {
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!content.trim()) return this.error('"content" is required.');
 
+      const rootEntity = `urn:openclaw:dkg-share:${randomUUID()}`;
       const quads = [{
-        subject: `urn:openclaw:dkg-share:${randomUUID()}`,
+        subject: rootEntity,
         predicate: 'urn:openclaw:dkg-share:content',
         object: `"${escapeRdfLiteral(content)}"`,
       }];
@@ -3310,6 +3311,7 @@ export class DkgNodePlugin {
         shareOperationId: result.shareOperationId,
         contextGraphId: result.contextGraphId ?? contextGraphId,
         graph: result.graph,
+        rootEntity,
         triplesWritten: result.triplesWritten ?? quads.length,
       });
     } catch (err: any) {

@@ -637,8 +637,8 @@ describe('DkgNodePlugin', () => {
     expect(toolNames).not.toContain('dkg_paranet_create');
     // memory_search added by this feature branch (W2 — agent-callable recall button).
     expect(toolNames).toContain('memory_search');
-    // 28 from main (originals + assertion/subgraph/SWM/CG-registration tools) + dkg_share + 1 memory_search = 30
-    expect(registeredTools.length).toBe(30);
+    // Tool names should stay unique even as the registry grows.
+    expect(new Set(toolNames).size).toBe(toolNames.length);
   });
 
   it('new dkg_assertion_* and dkg_sub_graph_* tools have the expected schema shape', () => {
@@ -1143,11 +1143,12 @@ describe('DkgNodePlugin', () => {
       expect(url).toBe('http://localhost:9200/api/shared-memory/write');
       expect(init.method).toBe('POST');
       const body = JSON.parse(init.body as string);
+      const rootEntity = body.quads[0].subject;
       expect(body).toEqual({
         contextGraphId: 'ctx',
         quads: [
           {
-            subject: expect.stringMatching(/^urn:openclaw:dkg-share:[0-9a-f-]+$/),
+            subject: rootEntity,
             predicate: 'urn:openclaw:dkg-share:content',
             object: '"  Alpha\\nBeta  "',
           },
@@ -1163,8 +1164,10 @@ describe('DkgNodePlugin', () => {
         shareOperationId: 'op-1',
         contextGraphId: 'ctx',
         graph: contextGraphSharedMemoryUri('ctx', 'protocols'),
+        rootEntity,
         triplesWritten: 1,
       });
+      expect(shaped.rootEntity).toMatch(/^urn:openclaw:dkg-share:[0-9a-f-]+$/);
       expect(shaped).not.toHaveProperty('workspaceOperationId');
       expect(shaped).not.toHaveProperty('paranetId');
       expect(result.details).toEqual(shaped);

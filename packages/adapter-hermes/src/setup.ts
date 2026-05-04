@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
+import { resolveDkgConfigHome } from '@origintrail-official/dkg-core';
 import {
   type HermesMemoryMode,
   type HermesProfileMetadata,
@@ -21,6 +22,7 @@ const PLUGIN_OWNER_FILE = '.dkg-adapter-hermes-owner.json';
 const TOP_LEVEL_MEMORY_BLOCK_RE = /^memory\s*:\s*(?:#.*)?$/;
 const TOP_LEVEL_MEMORY_PROVIDER_RE = /^memory\.provider\s*:\s*["']?([^"'\s#]+)["']?/;
 const INDENTED_PROVIDER_RE = /^(\s+)provider\s*:\s*["']?([^"'\s#]+)["']?/;
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export interface HermesSetupOptions {
   profileName?: string;
@@ -575,7 +577,7 @@ function loadDkgAuthToken(): string | undefined {
   const envToken = trimmed(process.env.DKG_API_TOKEN) ?? trimmed(process.env.DKG_AUTH_TOKEN);
   if (envToken) return envToken;
 
-  const dkgHome = resolve(expandHome(trimmed(process.env.DKG_HOME) ?? join(homedir(), '.dkg')));
+  const dkgHome = resolve(expandHome(trimmed(process.env.DKG_HOME) ?? dkgDir()));
   try {
     const rawTokenFile = readFileSync(join(dkgHome, 'auth.token'), 'utf-8');
     for (const line of rawTokenFile.split('\n')) {
@@ -586,6 +588,10 @@ function loadDkgAuthToken(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function dkgDir(): string {
+  return resolveDkgConfigHome({ startDir: __dirname });
 }
 
 function printPlan(label: string, plan: HermesSetupPlan): void {
@@ -842,7 +848,7 @@ function installHermesProviderPlugin(profile: HermesProfileMetadata): void {
 }
 
 function resolveBundledHermesPluginDir(): string {
-  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const moduleDir = __dirname;
   const candidates = [
     resolve(moduleDir, '..', 'hermes-plugin'),
     resolve(moduleDir, '..', '..', 'hermes-plugin'),

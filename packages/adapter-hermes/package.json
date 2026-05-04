@@ -25,6 +25,9 @@
     "test:coverage": "vitest run --coverage",
     "clean": "node -e \"const fs=require('fs'); for (const p of ['dist','tsconfig.tsbuildinfo']) fs.rmSync(p,{recursive:true,force:true});\""
   },
+  "dependencies": {
+    "@origintrail-official/dkg-core": "workspace:*"
+  },
   "devDependencies": {
     "@vitest/coverage-v8": "^4.0.18",
     "vitest": "^4.0.18"

@@ -1,8 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+vi.mock('@origintrail-official/dkg-core', async () => {
+  const actual = await vi.importActual<typeof import('@origintrail-official/dkg-core')>(
+    '@origintrail-official/dkg-core',
+  );
+  return {
+    ...actual,
+    resolveDkgConfigHome: vi.fn((opts) => actual.resolveDkgConfigHome(opts)),
+  };
+});
+import { resolveDkgConfigHome } from '@origintrail-official/dkg-core';
 import { HermesAdapterPlugin } from '../src/HermesAdapterPlugin.js';
 import { registerHermesRoutes } from '../src/hermes-routes.js';
 import type { DaemonPluginApi } from '../src/types.js';
@@ -950,6 +960,61 @@ assert config["allow_context_graph_admin_tools"] is True, config
     const body = JSON.parse(String(calls[0].init.body));
     expect(body.transport).toEqual({ kind: 'hermes-channel' });
     expect(body.transport.bridgeUrl).toBeUndefined();
+  });
+
+  it('uses the shared monorepo DKG home when DKG_HOME is unset for setup daemon registration', async () => {
+    const homeRoot = mkdtempSync(join(tmpdir(), 'hermes-dkg-home-'));
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    const dkgHome = join(homeRoot, '.dkg');
+    const dkgDevHome = join(homeRoot, '.dkg-dev');
+    mkdirSync(dkgHome, { recursive: true });
+    mkdirSync(dkgDevHome, { recursive: true });
+    writeFileSync(join(dkgHome, 'auth.token'), 'stale-npm-token\n');
+    writeFileSync(join(dkgDevHome, 'auth.token'), '# DKG node API token\nlive-dev-token\n');
+
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    vi.stubGlobal('fetch', async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    const oldDkgHome = process.env.DKG_HOME;
+    const oldApiToken = process.env.DKG_API_TOKEN;
+    const oldAuthToken = process.env.DKG_AUTH_TOKEN;
+    const oldHome = process.env.HOME;
+    const oldUserProfile = process.env.USERPROFILE;
+    delete process.env.DKG_HOME;
+    delete process.env.DKG_API_TOKEN;
+    delete process.env.DKG_AUTH_TOKEN;
+    process.env.HOME = homeRoot;
+    process.env.USERPROFILE = homeRoot;
+    const resolver = vi.mocked(resolveDkgConfigHome);
+    resolver.mockClear();
+
+    try {
+      await runSetup({ hermesHome, verify: false });
+    } finally {
+      if (oldDkgHome === undefined) delete process.env.DKG_HOME;
+      else process.env.DKG_HOME = oldDkgHome;
+      if (oldApiToken === undefined) delete process.env.DKG_API_TOKEN;
+      else process.env.DKG_API_TOKEN = oldApiToken;
+      if (oldAuthToken === undefined) delete process.env.DKG_AUTH_TOKEN;
+      else process.env.DKG_AUTH_TOKEN = oldAuthToken;
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+      if (oldUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = oldUserProfile;
+    }
+
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe('Bearer live-dev-token');
+    expect(resolver.mock.calls.some(([opts]) => {
+      const startDir = (opts as any)?.startDir;
+      return typeof startDir === 'string'
+        && startDir.replace(/\\/g, '/').includes('/packages/adapter-hermes/src');
+    })).toBe(true);
   });
 
   it('preserves explicit gateway transport inputs during setup registration', async () => {

@@ -35,8 +35,10 @@ export class ApiClient {
   private baseUrl: string;
   private token?: string;
 
-  constructor(port: number, token?: string) {
-    this.baseUrl = `http://127.0.0.1:${port}`;
+  constructor(portOrBaseUrl: number | string, token?: string) {
+    this.baseUrl = typeof portOrBaseUrl === 'number'
+      ? `http://127.0.0.1:${portOrBaseUrl}`
+      : portOrBaseUrl.replace(/\/+$/, '');
     this.token = token;
   }
 

@@ -3299,7 +3299,7 @@ export class DkgNodePlugin {
       const rootEntity = `urn:openclaw:dkg-share:${randomUUID()}`;
       const quads = [{
         subject: rootEntity,
-        predicate: 'urn:openclaw:dkg-share:content',
+        predicate: 'http://schema.org/text',
         object: `"${escapeRdfLiteral(content)}"`,
       }];
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;

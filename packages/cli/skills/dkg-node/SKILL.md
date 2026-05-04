@@ -129,7 +129,7 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 | `dkg_assertion_history` | `GET /api/assertion/{name}/history` | Read an assertion's lifecycle descriptor |
 | `dkg_publish` | `POST /api/shared-memory/write` + `POST /api/shared-memory/publish` | **Two-call helper**: first writes supplied quads to SWM via `/write`, then publishes all SWM → VM (TRAC). Calling only the `/publish` route skips the write — if dropping to raw HTTP, use both calls in order |
 | `dkg_shared_memory_publish` | `POST /api/shared-memory/publish` | **Canonical finalizer** after `dkg_assertion_promote`: publish SWM → VM, no fresh quads |
-| `dkg_share` | `POST /api/shared-memory/write` | OpenClaw/Hermes direct helper for writing concise team-visible knowledge to SWM without staging a WM assertion. OpenClaw returns `rootEntity` for targeted follow-up query or publish. Prefer the WM assertion → promote flow for durable/canonical work |
+| `dkg_share` | `POST /api/shared-memory/write` | OpenClaw/Hermes direct helper for writing concise team-visible knowledge to SWM without staging a WM assertion. OpenClaw returns `rootEntity` for targeted follow-up queries; targeted publish by `root_entities` leaves the SWM copy in place. Prefer the WM assertion → promote flow for durable/canonical work |
 | `dkg_sub_graph_create` | `POST /api/sub-graph/create` | Register a sub-graph inside a CG |
 | `dkg_sub_graph_list` | `GET /api/sub-graph/list` | List sub-graphs in a CG |
 | `dkg_query` | `POST /api/query` | Read-only SPARQL across assertions in a CG. Pass `view` (`working-memory` / `shared-working-memory` / `verified-memory`) to pick the layer — when `view` is set, `context_graph_id` is required; for WM reads, optional `agent_address` targets another agent's WM (defaults to this node). Omit `view` for a legacy cross-graph data-path query. |
@@ -138,7 +138,7 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 | `dkg_read_messages` | `GET /api/messages` | Read inbound messages |
 | `dkg_invoke_skill` | `POST /api/invoke-skill` | Call another agent's skill (best-effort P2P) |
 
-P2P tools fail gracefully when the peer is offline. `dkg_publish` (fresh quads + write + publish, two HTTP calls) and `dkg_shared_memory_publish` (publish existing SWM, one HTTP call) differ in intent: use the two-call helper for "I have quads, publish now"; use the canonical finalizer as step 4 of the stepwise write → promote → publish flow. `dkg_share` is a direct SWM convenience helper for quick team-visible notes, not a replacement for assertion lifecycle tracking; on OpenClaw, keep the returned `rootEntity` when you need a targeted follow-up query or `dkg_shared_memory_publish({ root_entities: [...] })`.
+P2P tools fail gracefully when the peer is offline. `dkg_publish` (fresh quads + write + publish, two HTTP calls) and `dkg_shared_memory_publish` (publish existing SWM, one HTTP call) differ in intent: use the two-call helper for "I have quads, publish now"; use the canonical finalizer as step 4 of the stepwise write → promote → publish flow. `dkg_share` is a direct SWM convenience helper for quick team-visible notes, not a replacement for assertion lifecycle tracking; on OpenClaw, keep the returned `rootEntity` when you need a targeted follow-up query. If you pass it to `dkg_shared_memory_publish({ root_entities: [...] })`, that selected publish does not clear the SWM copy, so a later full publish can include the note again.
 
 ### HTTP-only operations (no tool wrapper)
 

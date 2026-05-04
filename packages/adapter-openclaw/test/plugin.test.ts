@@ -1182,7 +1182,7 @@ describe('DkgNodePlugin', () => {
         quads: [
           {
             subject: rootEntity,
-            predicate: 'urn:openclaw:dkg-share:content',
+            predicate: 'http://schema.org/text',
             object: '"  Alpha\\nBeta  "',
           },
         ],

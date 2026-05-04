@@ -2882,7 +2882,7 @@ export class DKGAgent {
         privateQuads = assertQuadArray(content.privateQuads, 'privateQuads');
       } else {
         const parsed = await jsonLdToQuads(content as JsonLdContent, {
-          defaultVisibility: 'public',
+          defaultVisibility: 'private',
           syntheticPrivateAnchor: false,
         });
         publicQuads = parsed.publicQuads;

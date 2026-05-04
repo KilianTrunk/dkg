@@ -241,6 +241,46 @@ describe('publishJsonLd', () => {
     if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(true);
   }, 15000);
 
+  it('async bare JSON-LD defaults to private quads and only exposes an anchor', async () => {
+    const { agent, store } = await createAgent('AsyncBarePrivateBot');
+    await agent.createContextGraph({ id: 'async-bare-private', name: 'AsyncBarePrivate', description: '' });
+    const root = 'http://example.org/AsyncBareSecret';
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-bare-private',
+      {
+        '@context': 'http://schema.org/',
+        '@id': root,
+        '@type': 'Thing',
+        'name': 'Bare Async Private',
+      },
+      { localOnly: true, accessPolicy: 'ownerOnly' },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.roots).toEqual([root]);
+    expect(job?.request.accessPolicy).toBe('ownerOnly');
+
+    const publicAnchor = await store.query(
+      `ASK { GRAPH <did:dkg:context-graph:async-bare-private/_shared_memory> { <${root}> <http://dkg.io/ontology/privateDataAnchor> "true" } }`,
+    );
+    expect(publicAnchor.type).toBe('boolean');
+    if (publicAnchor.type === 'boolean') expect(publicAnchor.value).toBe(true);
+
+    const publicPayload = await store.query(
+      `ASK { GRAPH <did:dkg:context-graph:async-bare-private/_shared_memory> { <${root}> <http://schema.org/name> "Bare Async Private" } }`,
+    );
+    expect(publicPayload.type).toBe('boolean');
+    if (publicPayload.type === 'boolean') expect(publicPayload.value).toBe(false);
+
+    const privatePayload = await store.query(
+      `ASK { GRAPH <did:dkg:context-graph:async-bare-private/_private> { <${root}> <http://schema.org/name> "Bare Async Private" } }`,
+    );
+    expect(privatePayload.type).toBe('boolean');
+    if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(true);
+  }, 15000);
+
   it('async publish records and resolves subGraphName for staged public and private data', async () => {
     const { agent, store } = await createAgent('AsyncSubGraphBot');
     await agent.createContextGraph({ id: 'async-subgraph', name: 'AsyncSubGraph', description: '' });

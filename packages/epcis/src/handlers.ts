@@ -219,7 +219,7 @@ export async function handleCaptureAsync(
   request: CaptureRequest,
   config: AsyncCaptureConfig,
 ): Promise<CaptureAcceptedResult> {
-  const { document, content } = resolveCaptureContent(request.epcisDocument);
+  const { document, content, isEnvelope } = resolveCaptureContent(request.epcisDocument);
   const validation = validator.validate(document);
 
   if (!validation.valid) {
@@ -230,7 +230,8 @@ export async function handleCaptureAsync(
     ? { accessPolicy: request.publishOptions.accessPolicy, allowedPeers: request.publishOptions.allowedPeers }
     : undefined;
 
-  const result = await config.publisher.publishAsync(config.contextGraphId, content, opts);
+  const publishContent = isEnvelope ? content : { public: content };
+  const result = await config.publisher.publishAsync(config.contextGraphId, publishContent, opts);
 
   return {
     captureID: result.captureID,
@@ -240,15 +241,15 @@ export async function handleCaptureAsync(
   };
 }
 
-function resolveCaptureContent(epcisDocument: unknown): { document: unknown; content: unknown } {
+function resolveCaptureContent(epcisDocument: unknown): { document: unknown; content: unknown; isEnvelope: boolean } {
   if (!epcisDocument || typeof epcisDocument !== 'object' || Array.isArray(epcisDocument)) {
-    return { document: epcisDocument, content: epcisDocument };
+    return { document: epcisDocument, content: epcisDocument, isEnvelope: false };
   }
 
   const obj = epcisDocument as Record<string, unknown>;
   const isEnvelope = obj.type !== 'EPCISDocument' && ('public' in obj || 'private' in obj);
   if (!isEnvelope) {
-    return { document: epcisDocument, content: epcisDocument };
+    return { document: epcisDocument, content: epcisDocument, isEnvelope: false };
   }
 
   if (!obj.public) {
@@ -261,5 +262,6 @@ function resolveCaptureContent(epcisDocument: unknown): { document: unknown; con
       public: obj.public,
       private: obj.private,
     },
+    isEnvelope: true,
   };
 }

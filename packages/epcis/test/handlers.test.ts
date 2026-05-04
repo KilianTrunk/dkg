@@ -84,6 +84,17 @@ describe('handleCapture', () => {
     expect(publisher.calls[0]?.options?.accessPolicy).toBe('ownerOnly');
   });
 
+  it('wraps bare async EPCIS documents as explicit public content', async () => {
+    const publisher = trackingAsyncPublisher();
+    await handleCaptureAsync(
+      { epcisDocument: VALID_OBJECT_EVENT_DOC },
+      { contextGraphId: CONTEXT_GRAPH_ID, publisher },
+    );
+
+    expect(publisher.calls).toHaveLength(1);
+    expect(publisher.calls[0]?.doc).toEqual({ public: VALID_OBJECT_EVENT_DOC });
+  });
+
   it('accepts async privacy envelope capture and returns captureID', async () => {
     const publisher = trackingAsyncPublisher();
     const result = await handleCaptureAsync(

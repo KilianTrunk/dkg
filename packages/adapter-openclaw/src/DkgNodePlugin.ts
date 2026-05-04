@@ -20,8 +20,6 @@ import {
   type GetView,
   createDkgPublisherExtension,
   type DkgPublisherExtension,
-  loadAgentAuthTokenSync,
-  MultipleAgentsError,
   resolveDkgHome,
   toEip55Checksum,
 } from '@origintrail-official/dkg-core';

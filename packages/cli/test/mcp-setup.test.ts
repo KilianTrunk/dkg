@@ -328,11 +328,22 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
         throw new Error('faucet 503');
       }),
     });
+    // F14 + F26: the funding step now probes daemon reachability via
+    // `/api/status` before attempting the faucet call. Stub fetch to
+    // mark the daemon reachable so the throwing-faucet mock is
+    // actually reached. Without this stub the funding step would
+    // short-circuit on the unreachable-path log line and the
+    // throwing-faucet mock would never run.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      return new Response('{}', { status: 200 }) as any;
+    });
 
     await mcpSetupAction({ verify: false }, deps);
 
     expect(deps.logManualFundingInstructions).toHaveBeenCalledTimes(1);
     // Registration still proceeds.
     expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(true);
+
+    fetchSpy.mockRestore();
   });
 });

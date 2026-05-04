@@ -96,6 +96,92 @@ interface ClientTarget {
   configPath: string;
   /** Pretty path for display, with `~` substituted back in. */
   displayPath: string;
+  /**
+   * Per-client config-file format. Defaults to `'json'` so the existing
+   * Cursor + Claude Code targets stay byte-identical post-refactor.
+   * Future clients with non-JSON config (Codex CLI = TOML, Continue
+   * may be YAML) declare the format here so `writeRegistration` and
+   * `classify` dispatch to the right serializer.
+   */
+  format?: 'json' | 'toml' | 'yaml';
+  /**
+   * Dotted path to the per-server entry inside the parsed config.
+   * Defaults to `'mcpServers.dkg'` — the shape Cursor / Claude Code /
+   * Claude Desktop / Windsurf / Cline all use. Clients diverging from
+   * that shape (VSCode + Copilot Chat uses `servers.dkg`; Codex CLI
+   * uses `mcp_servers.dkg` under TOML) declare the alternate path
+   * here so a single registration helper covers all surfaces without
+   * per-client write functions.
+   */
+  entryPath?: string;
+}
+
+const DEFAULT_FORMAT: NonNullable<ClientTarget['format']> = 'json';
+const DEFAULT_ENTRY_PATH = 'mcpServers.dkg';
+
+/**
+ * Resolve a dotted entry-path (`'mcpServers.dkg'`, `'servers.dkg'`,
+ * `'mcp_servers.dkg'`) into its head segments + final key. Used by
+ * both classify (read) and writeRegistration (write) to navigate the
+ * parsed config object identically.
+ */
+function splitEntryPath(entryPath: string | undefined): { head: string[]; leaf: string } {
+  const path = entryPath ?? DEFAULT_ENTRY_PATH;
+  const parts = path.split('.').filter(Boolean);
+  if (parts.length === 0) {
+    throw new Error(`Invalid entryPath "${entryPath}": must be a non-empty dotted path`);
+  }
+  return { head: parts.slice(0, -1), leaf: parts[parts.length - 1] };
+}
+
+/**
+ * Walk a parsed config object down a list of head segments, lazily
+ * creating intermediate `Record<string, unknown>` containers for any
+ * missing levels. Returns the parent container of the leaf key.
+ *
+ * Used at write time only. At read time we tolerate missing
+ * intermediates (the entry just classifies as `not-registered`).
+ */
+function ensurePathContainer(
+  body: Record<string, unknown>,
+  head: string[],
+): Record<string, unknown> {
+  let cursor: Record<string, unknown> = body;
+  for (const segment of head) {
+    const next = cursor[segment];
+    if (next === undefined || next === null || typeof next !== 'object') {
+      const fresh: Record<string, unknown> = {};
+      cursor[segment] = fresh;
+      cursor = fresh;
+    } else {
+      cursor = next as Record<string, unknown>;
+    }
+  }
+  return cursor;
+}
+
+/**
+ * Read the leaf value at a dotted entry-path; returns `undefined` if
+ * any intermediate is missing or non-object. Used by `classify` so
+ * staleness detection works regardless of how deep the entry is
+ * nested.
+ */
+function readEntryAt(
+  body: Record<string, unknown>,
+  entryPath: string | undefined,
+): unknown {
+  const { head, leaf } = splitEntryPath(entryPath);
+  let cursor: unknown = body;
+  for (const segment of head) {
+    if (cursor === undefined || cursor === null || typeof cursor !== 'object') {
+      return undefined;
+    }
+    cursor = (cursor as Record<string, unknown>)[segment];
+  }
+  if (cursor === undefined || cursor === null || typeof cursor !== 'object') {
+    return undefined;
+  }
+  return (cursor as Record<string, unknown>)[leaf];
 }
 
 function expandHome(p: string): string {
@@ -170,11 +256,67 @@ function readJson(path: string): Record<string, unknown> {
   }
 }
 
+/**
+ * Read the parsed body of a per-client config, dispatching on
+ * `target.format`. JSON is the default + only format wired today;
+ * TOML / YAML branches throw `NotImplementedError`-style errors so
+ * targets that declare them but ship pre-phase-5 trip cleanly at
+ * registration time rather than silently writing garbage. Phase 5
+ * (Codex CLI) wires the TOML branch; Continue (phase 4) wires YAML
+ * if Continue's config-file detection lands on `.yaml`.
+ */
+function readConfigBody(target: ClientTarget): Record<string, unknown> {
+  const format = target.format ?? DEFAULT_FORMAT;
+  switch (format) {
+    case 'json':
+      return readJson(target.configPath);
+    case 'toml':
+      throw new Error(
+        `TOML config format not yet implemented (target: ${target.name}). Land phase 5 first.`,
+      );
+    case 'yaml':
+      throw new Error(
+        `YAML config format not yet implemented (target: ${target.name}). Land phase 4 first.`,
+      );
+    default:
+      throw new Error(`Unknown client config format: ${String(format)}`);
+  }
+}
+
+/**
+ * Serialize a parsed body to disk, dispatching on `target.format`.
+ * Mirrors `readConfigBody`'s dispatch shape so phase 4/5 wiring is a
+ * symmetric extension. JSON output keeps the pre-refactor formatting
+ * (2-space indent, trailing newline) byte-for-byte.
+ */
+function writeConfigBody(target: ClientTarget, body: Record<string, unknown>): void {
+  const format = target.format ?? DEFAULT_FORMAT;
+  const dir = dirname(target.configPath);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  switch (format) {
+    case 'json':
+      writeFileSync(target.configPath, JSON.stringify(body, null, 2) + '\n');
+      return;
+    case 'toml':
+      throw new Error(
+        `TOML config format not yet implemented (target: ${target.name}). Land phase 5 first.`,
+      );
+    case 'yaml':
+      throw new Error(
+        `YAML config format not yet implemented (target: ${target.name}). Land phase 4 first.`,
+      );
+    default:
+      throw new Error(`Unknown client config format: ${String(format)}`);
+  }
+}
+
 function classify(target: ClientTarget): ClientState {
   const expected = canonicalEntry();
-  const body = readJson(target.configPath);
-  const servers = (body.mcpServers as Record<string, unknown> | undefined) ?? {};
-  const current = servers.dkg as Record<string, unknown> | undefined;
+  const body = readConfigBody(target);
+  const current = readEntryAt(body, target.entryPath) as
+    | Record<string, unknown>
+    | null
+    | undefined;
   // Treat both `undefined` (key absent) and `null` (key present but
   // explicitly nulled) as "not-registered". Pre-F7 a `{ dkg: null }`
   // entry classified as `stale`, which made the operator-facing
@@ -198,14 +340,11 @@ function classify(target: ClientTarget): ClientState {
 }
 
 function writeRegistration(target: ClientTarget): void {
-  const body = readJson(target.configPath);
-  const servers =
-    (body.mcpServers as Record<string, unknown> | undefined) ?? {};
-  servers.dkg = canonicalEntry();
-  body.mcpServers = servers;
-  const dir = dirname(target.configPath);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(target.configPath, JSON.stringify(body, null, 2) + '\n');
+  const body = readConfigBody(target);
+  const { head, leaf } = splitEntryPath(target.entryPath);
+  const container = ensurePathContainer(body, head);
+  container[leaf] = canonicalEntry();
+  writeConfigBody(target, body);
 }
 
 /**

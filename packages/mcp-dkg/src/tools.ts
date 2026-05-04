@@ -216,24 +216,34 @@ export function registerReadTools(
       inputSchema: {
         uri: z.string().describe('Entity URI (e.g. urn:dkg:decision:shacl-on-vm-promotion)'),
         projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
-        layer: z
-          .enum(['wm', 'swm', 'union', 'vm'])
+        view: z
+          .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
           .optional()
-          .default('union')
-          .describe('Memory layer scope; default "union" (wm+swm)'),
+          .describe('Memory tier: working-memory (default, private), shared-working-memory (team), verified-memory (on-chain).'),
+        includeSharedMemory: z
+          .boolean()
+          .optional()
+          .describe('When set with view: "working-memory", include SWM in the result set (the WM∪SWM combined view; default true here for backwards-compat with the prior `layer: "union"` default).'),
       },
     },
-    async ({ uri, projectId, layer }): Promise<ToolResult> => {
+    async ({ uri, projectId, view, includeSharedMemory }): Promise<ToolResult> => {
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
+      // Default behaviour mirrors the historical `layer: 'union'` default:
+      // when neither `view` nor `includeSharedMemory` is set, return WM∪SWM
+      // (the shape callers learned via the V9 surface). Explicit
+      // `view: 'verified-memory'` routes to VM; explicit
+      // `view: 'shared-working-memory'` routes to SWM only;
+      // `view: 'working-memory'` (without `includeSharedMemory: true`)
+      // returns WM only.
       const scope =
-        layer === 'swm'
-          ? { graphSuffix: '_shared_memory' as const }
-          : layer === 'wm'
-          ? {}
-          : layer === 'vm'
+        view === 'verified-memory'
           ? { view: 'verified-memory' as const }
-          : { includeSharedMemory: true };
+          : view === 'shared-working-memory'
+          ? { graphSuffix: '_shared_memory' as const }
+          : view === 'working-memory'
+          ? (includeSharedMemory === true ? { includeSharedMemory: true } : {})
+          : { includeSharedMemory: includeSharedMemory ?? true };
       try {
         // NOTE: no explicit `GRAPH ?g { … }` wrapper here — the query
         // engine injects one that scopes to the requested CG. Adding our
@@ -257,7 +267,13 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
         const out = outgoing.bindings ?? [];
         const inc = incoming.bindings ?? [];
         if (!out.length && !inc.length) {
-          return ok(`No triples found for <${uri}> in '${pid}' (layer=${layer ?? 'union'}).`);
+          const scopeLabel =
+            view === 'verified-memory' ? 'verified-memory' :
+            view === 'shared-working-memory' ? 'shared-working-memory' :
+            view === 'working-memory'
+              ? (includeSharedMemory === true ? 'working-memory∪swm' : 'working-memory')
+              : 'working-memory∪swm';
+          return ok(`No triples found for <${uri}> in '${pid}' (view=${scopeLabel}).`);
         }
         const parts: string[] = [`# ${prettyTerm(uri)}`, `<${uri}>`, ''];
         if (out.length) {
@@ -301,21 +317,31 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
         subGraph: z.string().optional().describe('Narrow to one sub-graph (e.g. "decisions", "chat")'),
         agentUri: z.string().optional().describe('Only items attributed to this agent'),
         sinceIso: z.string().optional().describe('Earliest timestamp, ISO-8601'),
-        layer: z.enum(['wm', 'swm', 'union', 'vm']).optional().default('union'),
+        view: z
+          .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
+          .optional()
+          .describe('Memory tier: working-memory (private), shared-working-memory (team), verified-memory (on-chain).'),
+        includeSharedMemory: z
+          .boolean()
+          .optional()
+          .describe('When set with view: "working-memory", include SWM in the result set (the WM∪SWM combined view; default true here for backwards-compat with the prior `layer: "union"` default).'),
         limit: z.number().optional().default(25),
       },
     },
-    async ({ projectId, subGraph, agentUri, sinceIso, layer, limit }): Promise<ToolResult> => {
+    async ({ projectId, subGraph, agentUri, sinceIso, view, includeSharedMemory, limit }): Promise<ToolResult> => {
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
+      // Default mirrors historical `layer: 'union'`: WM∪SWM when neither
+      // `view` nor `includeSharedMemory` is supplied. Explicit values
+      // route to the requested tier (see dkg_get_entity for the parallel).
       const scope =
-        layer === 'swm'
-          ? { graphSuffix: '_shared_memory' as const }
-          : layer === 'wm'
-          ? {}
-          : layer === 'vm'
+        view === 'verified-memory'
           ? { view: 'verified-memory' as const }
-          : { includeSharedMemory: true };
+          : view === 'shared-working-memory'
+          ? { graphSuffix: '_shared_memory' as const }
+          : view === 'working-memory'
+          ? (includeSharedMemory === true ? { includeSharedMemory: true } : {})
+          : { includeSharedMemory: includeSharedMemory ?? true };
 
       const typeFilterBySubgraph: Record<string, string> = {
         decisions: `?s a <${NS.decisions}Decision> .`,

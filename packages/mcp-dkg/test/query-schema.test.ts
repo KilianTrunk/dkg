@@ -111,6 +111,90 @@ describe('dkg_query — two-axis schema migration (post-#17 rename + split)', ()
   });
 });
 
+// ── F1 sweep: schema-migration uniformity guard ──────────────────────
+// Per qa-review-round-1.md F1: the W2 #17 schema migration replaced
+// the `layer: 'wm'|'swm'|'union'|'vm'` enum with `view + includeSharedMemory`,
+// but the migration was originally applied to `dkg_query` only. F1
+// flipped `dkg_get_entity` and `dkg_list_activity` to the canonical
+// shape. This sweep asserts that NO public-facing tool surface still
+// exposes the legacy `layer` field — same bug-class guard as the
+// drop-sweep block in `drop-sweep.test.ts`.
+describe('F1 schema-migration sweep — no public tool exposes legacy `layer` field', () => {
+  it('asserts every registered tool uses `view + includeSharedMemory` (or no scope field at all)', () => {
+    const server = new FakeServer();
+    const client = new FakeClient();
+    const config = makeConfig();
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), config);
+
+    for (const [name, tool] of server.tools.entries()) {
+      const shape = tool.config.inputSchema ?? {};
+      // The legacy single-axis `layer` field MUST NOT appear on any
+      // public-facing tool's inputSchema. Tools that don't take a
+      // memory-tier scope at all (e.g. `dkg_get_agent`, listings) are
+      // free to omit both — that's also valid.
+      expect(
+        Object.keys(shape),
+        `Tool '${name}' must not expose the legacy 'layer' field; use 'view' + 'includeSharedMemory' per W2 #17 schema migration.`,
+      ).not.toContain('layer');
+    }
+  });
+
+  it('dkg_get_entity accepts `view: "verified-memory"` post-F1', async () => {
+    const server = new FakeServer();
+    const client = new FakeClient();
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    const result = await server.call('dkg_get_entity', {
+      uri: 'urn:test:entity',
+      view: 'verified-memory',
+    });
+    expect(result.isError).toBeFalsy();
+    const lastCall = client.queryCalls.at(-1)!;
+    expect(lastCall.view).toBe('verified-memory');
+  });
+
+  it('dkg_get_entity rejects the legacy `layer: "union"` shape', async () => {
+    const server = new FakeServer();
+    const client = new FakeClient();
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    await expect(
+      server.call('dkg_get_entity', { uri: 'urn:test:entity', layer: 'union' }),
+    ).rejects.toThrow();
+  });
+
+  it('dkg_list_activity accepts `view: "shared-working-memory"` post-F1', async () => {
+    const server = new FakeServer();
+    const client = new FakeClient();
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    const result = await server.call('dkg_list_activity', {
+      view: 'shared-working-memory',
+    });
+    expect(result.isError).toBeFalsy();
+    const lastCall = client.queryCalls.at(-1)!;
+    expect(lastCall.graphSuffix).toBe('_shared_memory');
+  });
+
+  it('dkg_list_activity rejects the legacy `layer: "wm"` shape', async () => {
+    const server = new FakeServer();
+    const client = new FakeClient();
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    await expect(
+      server.call('dkg_list_activity', { layer: 'wm' }),
+    ).rejects.toThrow();
+  });
+
+  it('dkg_get_entity default (no view) preserves V9-era WM∪SWM behaviour', async () => {
+    const server = new FakeServer();
+    const client = new FakeClient();
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    await server.call('dkg_get_entity', { uri: 'urn:test:entity' });
+    // Default scope must produce WM∪SWM — the historical `layer: 'union'`
+    // default. Encoded as `includeSharedMemory: true` on the wire.
+    const lastCall = client.queryCalls.at(-1)!;
+    expect(lastCall.includeSharedMemory).toBe(true);
+    expect(lastCall.view).toBeUndefined();
+  });
+});
+
 describe('dkg_list_context_graphs — rename + UX-note pair', () => {
   let server: FakeServer;
   let client: FakeClient;

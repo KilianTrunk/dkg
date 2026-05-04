@@ -74,7 +74,14 @@ All on-chain publishing goes through SWM first — the chain transaction is a fi
 
 > **ElizaOS agents:** Use the [`@origintrail-official/dkg-adapter-elizaos`](packages/adapter-elizaos/README.md) adapter. See the [ElizaOS setup guide](docs/setup/SETUP_ELIZAOS.md).
 
-> **Hermes agents:** Use the [`@origintrail-official/dkg-adapter-hermes`](packages/adapter-hermes/README.md) adapter — it ships DKG setup/client support and a Python memory provider for Hermes.
+> **Hermes agents:** Install the DKG CLI, start a node, and run Hermes setup - this wires the selected Hermes profile to DKG memory, tools, and Node UI chat:
+> ```bash
+> npm install -g @origintrail-official/dkg
+> dkg init
+> dkg start
+> dkg hermes setup
+> ```
+> Then start Hermes with its API server enabled. See the [adapter guide](packages/adapter-hermes/README.md) for details.
 
 > **Cursor / Claude Code / other MCP clients:** Install the [`@origintrail-official/dkg-mcp`](packages/mcp-dkg/README.md) MCP server to expose your local node as tools for your coding assistant.
 
@@ -175,6 +182,7 @@ dkg auth status                          # show whether auth is enabled
 
 # Framework adapters
 dkg openclaw setup                       # install & configure the OpenClaw adapter
+dkg hermes setup                         # install & configure the Hermes adapter
 
 # Community integrations (registry: OriginTrail/dkg-integrations)
 dkg integration list [--tier community]  # default tier filter is `verified`+
@@ -216,6 +224,7 @@ Use adapters for OpenClaw, ElizaOS, Hermes, or your own Node.js / TypeScript pro
 |---|---|
 | [Join the Testnet](docs/setup/JOIN_TESTNET.md) | You want a full node setup and first publish/query flow |
 | [OpenClaw Setup](docs/setup/SETUP_OPENCLAW.md) | You want OpenClaw to use DKG as memory/tools |
+| [Hermes Setup](docs/setup/SETUP_HERMES.md) | You want Hermes Agent to use DKG as memory/tools |
 | [ElizaOS Setup](docs/setup/SETUP_ELIZAOS.md) | You want ElizaOS integration |
 | [Custom agent Setup](docs/setup/SETUP_CUSTOM.md) | You are wiring an agent framework not covered above |
 | [Testnet Faucet](docs/setup/TESTNET_FAUCET.md) | You need Base Sepolia ETH and TRAC |

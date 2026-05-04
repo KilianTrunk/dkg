@@ -1,11 +1,15 @@
-# DKG Adapter for Hermes Agent
+# DKG V10 Hermes Adapter
 
 `@origintrail-official/dkg-adapter-hermes` connects a local
 [Hermes Agent](https://github.com/nousresearch/hermes-agent) profile to a DKG
-V10 node. The DKG daemon stays the owner of graph state, auth, wallets,
-context graphs, local-agent registry state, and Node UI chat persistence.
-Hermes stays the owner of its profile directory, `config.yaml`, `.env`,
-session state, plugins, tools, and runtime logs.
+V10 node.
+
+The adapter is a thin bridge into the DKG node. It does not run its own DKG
+node or own Hermes runtime state. The DKG daemon owns graph state, wallets,
+auth, context graphs, `/.well-known/skill.md`, the local-agent registry, Node
+UI chat routing, and DKG-backed chat persistence. Hermes owns its profile
+directory, `config.yaml`, `.env`, session state, tools, plugins, and runtime
+logs.
 
 This package contains:
 
@@ -13,94 +17,136 @@ This package contains:
   payload/client contracts.
 - `hermes-plugin/` - Python Hermes memory provider plugin and DKG daemon
   client.
+- `setup-entry.mjs` - setup-safe package entry used by the DKG CLI and daemon.
 
-## Current Status
+## What It Does
 
-The adapter now provides the DKG-side setup and local-agent contracts for
-Hermes. It includes profile-aware setup helpers, configurable publish behavior,
-provider conflict handling, and client contracts for the daemon-owned
-`/api/hermes-channel/*` routes.
+- installs the DKG memory provider plugin into a selected Hermes profile
+- elects DKG as Hermes' external memory provider in provider mode
+- exposes the DKG tool surface listed in `packages/cli/skills/dkg-node/SKILL.md`
+  plus Hermes-native helpers such as `dkg_memory` and `dkg_share`
+- stores provider memory facts in the `memory` assertion of the `agent-context`
+  context graph by default
+- syncs completed Hermes turns into DKG Working Memory with stable turn IDs and
+  duplicate-turn protection
+- bridges the DKG Node UI right-panel chat to Hermes' OpenAI-compatible API
+  server
+- keeps connected-agent chat history persisted in DKG memory so Node UI reloads
+  do not lose the conversation
+- registers Hermes as a DKG local-agent integration for status, connect,
+  refresh, and disconnect flows
 
-Supported Hermes channel routes are registered by the DKG CLI daemon, not by
-this adapter package as standalone HTTP stubs.
+## What It Does Not Do Anymore
 
-Node UI chat uses Hermes' OpenAI-compatible API server by default:
-`http://127.0.0.1:8642/health` and
-`http://127.0.0.1:8642/v1/chat/completions`. Start Hermes with
-`API_SERVER_ENABLED=true`; until that API server is running, the node can
-register Hermes but chat stays degraded/offline.
+- it does not restore legacy Hermes routes or compatibility stubs
+- it does not copy DKG API tokens into Hermes config files
+- it does not overwrite an existing non-DKG Hermes memory provider in provider
+  mode
+- it does not start Hermes for you; run the Hermes gateway separately
+- it does not currently replace `dkg init` / `dkg start`; configure and start
+  the DKG node before running Hermes setup
 
-## Architecture
+## Quick Start
 
-```text
-Hermes profile                         DKG daemon
--------------------------------        ---------------------------------
-$HERMES_HOME/config.yaml               ~/.dkg/config.json
-$HERMES_HOME/dkg.json                  localAgentIntegrations.hermes
-$HERMES_HOME/.dkg-adapter-hermes/      /api/hermes-channel/*
-$HERMES_HOME/plugins/dkg/             ChatMemoryManager persistence
-
-DKGMemoryProvider  -> bearer HTTP ->   DKG V10 routes and graph storage
-Node UI chat       -> daemon route ->  Hermes bridge/gateway -> Hermes
-```
-
-The default profile home is `~/.hermes`. A named profile resolves to
-`~/.hermes/profiles/<profile>`. If `HERMES_HOME` is set, the setup helpers use
-that path directly. This matches Hermes' own `get_hermes_home()` behavior.
-
-## CLI Helpers
-
-The DKG CLI exposes:
+Install the DKG CLI, create/start a DKG node, and set up the default Hermes
+profile:
 
 ```bash
+npm install -g @origintrail-official/dkg
+dkg init
+dkg start
 dkg hermes setup
-dkg hermes status
-dkg hermes verify
-dkg hermes doctor
-dkg hermes disconnect
-dkg hermes reconnect
-dkg hermes uninstall
 ```
 
-Common setup flags:
+Enable Hermes' API server and start the gateway:
 
-| Flag | Purpose |
-| --- | --- |
-| `--profile <name>` | Target `~/.hermes/profiles/<name>` instead of the default profile. |
-| `--daemon-url <url>` | DKG daemon URL. Defaults to `http://127.0.0.1:9200`. |
-| `--bridge-url <url>` | Custom same-host Hermes bridge URL for local chat. Use loopback addresses only. |
-| `--gateway-url <url>` | Hermes OpenAI-compatible API server URL. Defaults to `http://127.0.0.1:8642`. |
-| `--bridge-health-url <url>` | Optional health URL override for the configured bridge/gateway. Must belong to the configured `--bridge-url` or `--gateway-url` base. |
-| `--port <port>` | Shortcut for `http://127.0.0.1:<port>`. |
-| `--memory-mode <mode>` | `primary` maps to provider-election mode and is the default path; use `tools-only` to preserve an existing Hermes memory provider. |
-| `--dry-run` | Print planned file changes without writing them. |
-| `--no-verify` | Skip the post-setup verification pass. |
-| `--no-start` | Configure files without best-effort daemon registration. |
+```bash
+echo 'API_SERVER_ENABLED=true' >> ~/.hermes/.env
+hermes gateway run --replace -v
+```
 
-`setup` is non-interactive and idempotent. It writes ownership-marked adapter
-state only under the resolved Hermes profile:
+Then open the DKG Node UI at `http://127.0.0.1:9200/ui`, choose **Agents** in
+the right panel, and connect Hermes. A healthy setup lets Hermes run
+`dkg_status`, search memory, write DKG memory, and use the DKG tool table from
+the node skill file.
 
-- `$HERMES_HOME/dkg.json`
-- `$HERMES_HOME/plugins/dkg`
-- `$HERMES_HOME/.dkg-adapter-hermes/setup-state.json`
-- a managed `memory.provider: dkg` block in `$HERMES_HOME/config.yaml` when
-  provider mode is selected
+For a named Hermes profile:
 
-`disconnect` removes only the managed provider election block and marks the
-adapter disconnected. `uninstall` removes ownership-marked adapter artifacts.
-It does not delete Hermes sessions, logs, `.env`, non-DKG skills, or unrelated
-profile data.
+```bash
+dkg hermes setup --profile research
+```
 
-`pnpm dkg hermes setup` and `pnpm dkg hermes reconnect` install the bundled DKG
-node skill to `$HERMES_HOME/skills/dkg-node/SKILL.md` so Hermes can discover
-the same node instructions that the daemon serves from `/.well-known/skill.md`.
+The named profile resolves to `~/.hermes/profiles/research`. If `HERMES_HOME`
+is set, setup uses that exact profile home.
+
+### Flags
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--profile <name>` | default profile | Target `~/.hermes/profiles/<name>` instead of `~/.hermes`. |
+| `--daemon-url <url>` | `http://127.0.0.1:9200` | DKG daemon URL. |
+| `--gateway-url <url>` | `http://127.0.0.1:8642` | Hermes OpenAI-compatible API server URL for Node UI chat. |
+| `--bridge-url <url>` | unset | Custom same-host Hermes bridge URL. Loopback only; use `--gateway-url` for WSL2 or remote transports. |
+| `--bridge-health-url <url>` | derived from transport | Optional health URL override. It must belong to the configured bridge/gateway base. |
+| `--port <port>` | `9200` | Shortcut for `--daemon-url http://127.0.0.1:<port>`. |
+| `--memory-mode <mode>` | `primary` | `primary` elects DKG as the Hermes memory provider; `tools-only` preserves another provider. |
+| `--no-start` | off | Configure files without best-effort local-agent registration against the daemon. It does not start or stop the daemon in this release. |
+| `--no-verify` | off | Skip the post-setup verification pass. |
+| `--dry-run` | off | Preview planned file changes without writing anything. |
+
+## Verification
+
+A healthy setup should satisfy all of the following:
+
+- `dkg hermes verify` reports the selected profile as configured
+- Hermes gateway logs show `Memory provider 'dkg' registered`
+- `dkg_status` works from Hermes
+- the DKG Node UI loads at `http://127.0.0.1:9200/ui`
+- the right-side chat surface can connect to Hermes and send a message
+- the conversation survives Node UI reload because turns are persisted in DKG
+  memory
+- `dkg_memory` writes can be read from the `memory` assertion in
+  `agent-context`
+
+## Config Files
+
+| File | Owner | Purpose |
+| --- | --- | --- |
+| `~/.dkg/config.json` | DKG node | node config: networking, chain, auth, API |
+| `$HERMES_HOME/config.yaml` | Hermes | active Hermes provider selection; setup writes only an ownership-marked DKG memory provider block |
+| `$HERMES_HOME/dkg.json` | DKG adapter | daemon URL, resolved DKG home, memory assertion, tool guards, and transport config |
+| `$HERMES_HOME/plugins/dkg/` | DKG adapter | installed Hermes memory provider plugin |
+| `$HERMES_HOME/skills/dkg-node/SKILL.md` | DKG adapter | Hermes profile copy of the node skill file |
+| `$HERMES_HOME/.dkg-adapter-hermes/` | DKG adapter | setup state and ownership metadata |
+
+## Adapter Config
+
+These keys live in `$HERMES_HOME/dkg.json`. `dkg hermes setup` writes the file
+with ownership metadata and refuses to overwrite a non-managed file.
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `daemon_url` | `http://127.0.0.1:9200` | DKG daemon HTTP URL. Env `DKG_DAEMON_URL` overrides at runtime. |
+| `dkg_home` | resolved from the target daemon | DKG config home used to read `auth.token`; supports monorepo `.dkg-dev` and packaged `.dkg` installs. |
+| `bridge.gatewayUrl` | `http://127.0.0.1:8642` | Hermes OpenAI-compatible API server base used by Node UI chat. |
+| `bridge.url` | unset | Optional custom loopback `/health`, `/send`, `/stream` bridge. |
+| `bridge.healthUrl` | derived | Optional health check URL tied to the configured transport base. |
+| `context_graph` | `agent-context` | Default context graph for provider memory facts. Env `DKG_CONTEXT_GRAPH` overrides at runtime. |
+| `memory_assertion` | `memory` | Working Memory assertion used by `dkg_memory`. Env `DKG_MEMORY_ASSERTION` overrides at runtime. |
+| `memory_mode` | `provider` | Stored setup mode for status/reconnect/uninstall. |
+| `publish_tool` / `allow_direct_publish` | direct / `true` | Controls exposure of direct publish tools. Env `DKG_ALLOW_DIRECT_PUBLISH=false` hides them. |
+| `allow_context_graph_admin_tools` | `true` | Controls mutating project-admin tools. Env `DKG_ALLOW_CONTEXT_GRAPH_ADMIN_TOOLS=false` hides them. |
+| `import_roots` | `[]` | Optional safe roots for `dkg_assertion_import_file`; env import-root settings also apply. |
+
+Environment token override order is `DKG_API_TOKEN`, `DKG_AUTH_TOKEN`, the
+setup-resolved `dkg_home`, `DKG_HOME`, then `~/.dkg`.
 
 ## Provider Mode vs Tools-Only Mode
 
 Hermes allows one external memory provider at a time. In provider mode, setup
-elects DKG as the active Hermes memory provider by writing a managed
-`memory.provider: dkg` block. If `config.yaml` already names another provider,
-for example Honcho, Mem0, or Supermemory, setup refuses to replace it.
+elects DKG by writing a managed `memory.provider: dkg` block. If `config.yaml`
+already names another provider, for example Honcho, Mem0, or Supermemory,
+setup refuses to replace it.
 
 Use tools-only mode when you want local-agent registration and DKG profile
 state without changing Hermes' active memory provider:
@@ -110,49 +156,29 @@ dkg hermes setup --profile research --memory-mode tools-only
 ```
 
 Tools-only mode preserves the existing provider and still writes DKG adapter
-state (`dkg.json`, the provider plugin files, and setup-state metadata) so
+state (`dkg.json`, plugin files, setup-state metadata, and the skill file) so
 status, doctor, reconnect, and uninstall can reason about the profile. In this
 release, Hermes-provider DKG tools such as `dkg_memory`, `memory_search`,
 `dkg_query`, `dkg_share`, assertion/sub-graph helpers, and
 status/wallet/network helpers are available when Hermes activates the DKG
 memory provider; a separate general Hermes tool plugin for tools-only mode is
-future work. The `<recalled-memory>` auto-recall block documented in the node
-`SKILL.md` remains an OpenClaw runtime surface, not a Hermes tools-only
-surface in this release.
+future work.
 
-## Hermes Memory Provider
+## Node UI Connect, Refresh, And Disconnect
 
-When active as `memory.provider: dkg`, the Python provider:
+The Node UI **Connect Hermes** button registers Hermes in the local-agent
+registry and probes the configured Hermes API server/bridge. If Hermes is
+online, the panel becomes chat-ready. If Hermes is offline, the panel records a
+degraded state and tells the user to run `dkg hermes setup` or refresh after
+Hermes starts.
 
-- loads DKG settings from `$HERMES_HOME/dkg.json`, with environment overrides
-  such as `DKG_DAEMON_URL`, `DKG_CONTEXT_GRAPH`, `DKG_MEMORY_ASSERTION`, and
-  `DKG_AGENT_NAME`
-- reads the DKG bearer token from `DKG_API_TOKEN` / `DKG_AUTH_TOKEN`, the
-  setup-resolved `dkg_home` in `$HERMES_HOME/dkg.json`, `$DKG_HOME/auth.token`,
-  or `~/.dkg/auth.token`
-- redacts bearer tokens from client errors
-- stores persistent facts in the configured DKG assertion, `memory` by default,
-  for the configured context graph
-- syncs completed turns in a background thread with stable turn IDs and
-  idempotency keys
-- queues local writes in `$HERMES_HOME/dkg_cache*.json` when the daemon is
-  unavailable
+**Refresh** re-probes Hermes health and updates ready/degraded state. It does
+not reinstall the adapter.
 
-Verified Memory publishing tools are exposed by default so Hermes receives the
-same model-callable DKG tool surface as the node skill. Operators can hide
-`dkg_publish` and `dkg_shared_memory_publish` by setting `publish_tool:
-"disabled"` / `allow_direct_publish: false` in `dkg.json`, or by exporting
-`DKG_ALLOW_DIRECT_PUBLISH=false`. Context-graph admin mutation tools such as
-`dkg_context_graph_invite`, `dkg_participant_add`, `dkg_participant_remove`,
-`dkg_join_request_approve`, and `dkg_join_request_reject` are also exposed by
-default. Operators can hide them with `allow_context_graph_admin_tools: false`
-in `dkg.json` or `DKG_ALLOW_CONTEXT_GRAPH_ADMIN_TOOLS=false`.
-
-`dkg_assertion_import_file` requires an operator-approved import root. Configure
-`DKG_HERMES_IMPORT_ROOTS`, `HERMES_DKG_IMPORT_ROOTS`, `DKG_IMPORT_ROOTS`, or the
-adapter `import_roots` setting before exposing file import to agents. Imports
-outside those roots, symlink escapes, oversized files, and obvious
-credential/wallet/DKG private-state paths are rejected.
+**Disconnect** runs Hermes reverse setup for the stored profile metadata, then
+disables the local-agent integration. It removes only adapter-owned provider
+election/artifacts and preserves Hermes sessions, logs, `.env`, and unrelated
+profile data.
 
 ## Local-Agent Routes
 
@@ -163,16 +189,16 @@ client, and payload contracts that call into them.
 | Route | Purpose |
 | --- | --- |
 | `GET /api/hermes-channel/health` | Probe configured Hermes bridge/gateway health and update local-agent readiness. |
-| `POST /api/hermes-channel/send` | Forward a non-streaming Node UI message to the Hermes bridge. |
+| `POST /api/hermes-channel/send` | Forward a non-streaming Node UI message to Hermes. |
 | `POST /api/hermes-channel/stream` | Forward a streaming Node UI message and proxy SSE frames back to the UI. |
 | `POST /api/hermes-channel/persist-turn` | Persist a completed Hermes turn through DKG chat memory with duplicate-turn protection. |
 
 The daemon forwards Node UI chat to Hermes' OpenAI-compatible API server at
 `http://127.0.0.1:8642` by default. Set `API_SERVER_ENABLED=true` in the active
-Hermes profile `.env`, then restart `hermes gateway run --replace -v`.
-Use `dkg hermes setup --gateway-url <url>` when the Hermes API server is
-reachable through WSL2 or a remote gateway. `--bridge-url` is reserved for a
-custom loopback bridge that implements `/health`, `/send`, and `/stream`.
+Hermes profile `.env`, then restart `hermes gateway run --replace -v`. Use
+`dkg hermes setup --gateway-url <url>` when the Hermes API server is reachable
+through WSL2 or a remote gateway. `--bridge-url` is reserved for a custom
+loopback bridge that implements `/health`, `/send`, and `/stream`.
 
 Attachment references are node-owned assertion refs. The daemon verifies their
 provenance before forwarding them to Hermes.
@@ -183,50 +209,71 @@ provenance before forwarding them to Hermes.
 - The Python client reads the DKG token from token environment variables first,
   then the setup-resolved `dkg_home` written to `$HERMES_HOME/dkg.json`, then
   `DKG_HOME`/`~/.dkg`; it does not copy the token into Hermes config.
-- Setup registration uses the same bearer source: explicit token environment
-  variables first, then `$DKG_HOME/auth.token` or `~/.dkg/auth.token`.
+- Setup registration uses the same bearer source.
 - Standalone loopback Hermes bridge calls use a route-scoped
-  `x-dkg-bridge-token` header. Non-loopback `bridgeUrl` values are ignored;
+  `x-dkg-bridge-token` header. Non-loopback `bridgeUrl` values are rejected;
   use `gatewayUrl` for remote transports. Gateway targets do not receive that
   bridge token.
 - Hermes `send` and `stream` routes fail closed when the Hermes integration is
   not enabled in the DKG local-agent registry. `persist-turn` remains
   daemon-authenticated so the active Hermes provider can persist completed
   turns even when UI chat registration is unavailable.
-- The default Hermes API server host is loopback. Treat non-loopback gateway URLs as an
-  explicit trust decision and require normal network hardening.
-- Verified Memory publishing is permanent and may cost TRAC; operators can
-  disable direct publish exposure with `DKG_ALLOW_DIRECT_PUBLISH=false`.
+- Direct publish tools are model-callable by default to match the node skill
+  surface. Publishing Verified Memory is permanent and may cost TRAC; operators
+  can hide direct publish exposure with `DKG_ALLOW_DIRECT_PUBLISH=false`.
 - Context-graph admin mutation tools are enabled by default for collaboration;
   operators can hide them with `DKG_ALLOW_CONTEXT_GRAPH_ADMIN_TOOLS=false`.
-- Assertion file import is model-callable only inside configured safe roots;
-  use `DKG_HERMES_IMPORT_ROOTS` or adapter `import_roots` to approve document
-  locations explicitly.
+- `dkg_assertion_import_file` requires an operator-approved import root. Use
+  `DKG_HERMES_IMPORT_ROOTS`, `HERMES_DKG_IMPORT_ROOTS`, `DKG_IMPORT_ROOTS`, or
+  adapter `import_roots` to approve document locations explicitly.
 
-## Verification Status
+## Troubleshooting
 
-Automated coverage in this branch includes:
+### Provider conflict
+
+If setup reports an existing `memory.provider`, either keep that provider with:
 
 ```bash
-pnpm --filter @origintrail-official/dkg-adapter-hermes run build
-pnpm --filter @origintrail-official/dkg-adapter-hermes test
-pnpm --filter @origintrail-official/dkg exec vitest run test/daemon-hermes.test.ts test/hermes-setup-cli-args.test.ts
-pnpm --filter @origintrail-official/dkg-node-ui exec vitest run test/openclaw-bridge.test.ts test/ui-api-stream.test.ts
-pnpm build:runtime
+dkg hermes setup --profile research --memory-mode tools-only
 ```
 
-Manual smoke still needs to be recorded before release readiness:
+or edit the Hermes profile config intentionally before rerunning provider mode.
 
-1. Start a DKG daemon.
-2. Run `dkg hermes setup --profile dkg-smoke --dry-run`.
-3. Run `dkg hermes setup --profile dkg-smoke`.
-4. Run `dkg hermes verify --profile dkg-smoke`.
-5. Start Hermes with that profile.
-6. Connect Hermes from the DKG Node UI.
-7. Verify streamed chat, persisted history, refresh/degraded recovery, and
-   disconnect/reconnect/uninstall behavior.
-8. Repeat the path where Hermes runs in WSL2 and the DKG daemon runs on
-   Windows, using an explicit daemon URL reachable from WSL.
+### Hermes chat offline
+
+If Node UI says Hermes is degraded or offline:
+
+1. Confirm Hermes is running for the same profile.
+2. Confirm `API_SERVER_ENABLED=true` is present in the active
+   `$HERMES_HOME/.env`.
+3. Confirm `http://127.0.0.1:8642/health` responds, or configure the DKG
+   local-agent integration with the correct gateway URL.
+4. Run `dkg hermes doctor --profile <name>`.
+5. Refresh the Hermes connected-agent panel in the Node UI.
+
+### Windows and WSL2
+
+Hermes does not support native Windows. Run Hermes inside WSL2. If the DKG
+daemon runs on Windows, use a daemon URL reachable from WSL:
+
+```bash
+dkg hermes setup --profile research --daemon-url http://<windows-host-ip>:9200
+```
+
+### Uninstall and reconnect
+
+`disconnect` is reversible:
+
+```bash
+dkg hermes disconnect --profile research
+dkg hermes reconnect --profile research
+```
+
+Use `uninstall` when you want to remove adapter-owned files:
+
+```bash
+dkg hermes uninstall --profile research
+```
 
 ## Development
 

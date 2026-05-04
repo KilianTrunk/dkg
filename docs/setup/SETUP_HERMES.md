@@ -7,8 +7,8 @@ memory provider, and DKG daemon-owned local-agent routes under
 
 ## Prerequisites
 
-- Node.js 22+ and pnpm for this DKG monorepo.
-- A DKG node configured with `dkg init`.
+- Node.js 22+ and npm for packaged installs, or pnpm for this DKG monorepo.
+- A DKG node configured with `dkg init` and running with `dkg start`.
 - Hermes Agent installed on Linux, macOS, WSL2, or Termux.
 
 Hermes does not support native Windows. On Windows, run Hermes inside WSL2. A
@@ -234,7 +234,7 @@ dkg hermes uninstall --profile research
 
 ## Release Smoke Checklist
 
-Before release, record evidence for:
+For release validation, record evidence for:
 
 - provider-mode setup and verify
 - tools-only setup with an existing memory provider
@@ -248,5 +248,4 @@ Before release, record evidence for:
 
 Automated tests cover the TypeScript adapter, CLI option normalization, daemon
 Hermes routes, duplicate persist behavior, local-agent readiness transitions,
-and Node UI Hermes transport helpers. Manual smoke evidence is still required
-for release sign-off.
+and Node UI Hermes transport helpers.

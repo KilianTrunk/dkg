@@ -28,6 +28,13 @@ export interface DkgClientOptions {
   timeoutMs?: number;
 }
 
+export interface SharedMemoryWriteResult {
+  shareOperationId: string;
+  contextGraphId?: string;
+  graph?: string;
+  triplesWritten?: number;
+}
+
 export interface OpenClawAttachmentRef {
   assertionUri: string;
   fileHash: string;
@@ -237,7 +244,7 @@ export class DkgDaemonClient {
     contextGraphId: string,
     quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
     opts?: { localOnly?: boolean; subGraphName?: string },
-  ): Promise<{ shareOperationId: string }> {
+  ): Promise<SharedMemoryWriteResult> {
     return this.post('/api/shared-memory/write', {
       contextGraphId,
       quads,

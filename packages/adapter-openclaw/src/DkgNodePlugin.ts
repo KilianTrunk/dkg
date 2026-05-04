@@ -3292,9 +3292,9 @@ export class DkgNodePlugin {
         return this.error('"paranet_id" is not a supported parameter on dkg_share. Use "context_graph_id".');
       }
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
-      const content = typeof args.content === 'string' ? args.content.trim() : '';
+      const content = typeof args.content === 'string' ? args.content : '';
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
-      if (!content) return this.error('"content" is required.');
+      if (!content.trim()) return this.error('"content" is required.');
 
       const quads = [{
         subject: `urn:openclaw:dkg-share:${randomUUID()}`,
@@ -3306,12 +3306,11 @@ export class DkgNodePlugin {
         localOnly: false,
         subGraphName,
       });
-      const shared = result as Record<string, unknown>;
       return this.json({
-        shareOperationId: shared.shareOperationId,
-        contextGraphId: shared.contextGraphId ?? contextGraphId,
-        graph: shared.graph,
-        triplesWritten: shared.triplesWritten ?? quads.length,
+        shareOperationId: result.shareOperationId,
+        contextGraphId: result.contextGraphId ?? contextGraphId,
+        graph: result.graph,
+        triplesWritten: result.triplesWritten ?? quads.length,
       });
     } catch (err: any) {
       return this.daemonError(err);

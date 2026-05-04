@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { homedir, tmpdir } from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
-import { toEip55Checksum } from '@origintrail-official/dkg-core';
+import { contextGraphSharedMemoryUri, toEip55Checksum } from '@origintrail-official/dkg-core';
 import { DkgNodePlugin } from '../src/DkgNodePlugin.js';
 import { DkgChannelPlugin } from '../src/DkgChannelPlugin.js';
 import { ChatTurnWriter } from '../src/ChatTurnWriter.js';
@@ -1129,13 +1129,13 @@ describe('DkgNodePlugin', () => {
         workspaceOperationId: 'legacy-op-1',
         contextGraphId: 'ctx',
         paranetId: 'ctx',
-        graph: 'did:dkg:context-graph:ctx/shared-memory/sub/protocols',
+        graph: contextGraphSharedMemoryUri('ctx', 'protocols'),
         triplesWritten: 1,
       });
 
       const result = await byName.get('dkg_share')!.execute('tc', {
         context_graph_id: 'ctx',
-        content: 'Alpha\nBeta',
+        content: '  Alpha\nBeta  ',
         sub_graph_name: 'protocols',
       });
 
@@ -1149,7 +1149,7 @@ describe('DkgNodePlugin', () => {
           {
             subject: expect.stringMatching(/^urn:openclaw:dkg-share:[0-9a-f-]+$/),
             predicate: 'urn:openclaw:dkg-share:content',
-            object: '"Alpha\\nBeta"',
+            object: '"  Alpha\\nBeta  "',
           },
         ],
         localOnly: false,
@@ -1162,7 +1162,7 @@ describe('DkgNodePlugin', () => {
       expect(shaped).toEqual({
         shareOperationId: 'op-1',
         contextGraphId: 'ctx',
-        graph: 'did:dkg:context-graph:ctx/shared-memory/sub/protocols',
+        graph: contextGraphSharedMemoryUri('ctx', 'protocols'),
         triplesWritten: 1,
       });
       expect(shaped).not.toHaveProperty('workspaceOperationId');

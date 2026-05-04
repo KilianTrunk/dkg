@@ -56,7 +56,8 @@ const SKIP_DIRS = new Set([
   'node_modules', 'dist', 'dist-ui', '.git', '.turbo', 'coverage',
   'test', 'tests', '__tests__', 'cache', 'artifacts', 'typechain',
 ]);
-const SOURCE_EXTS = new Set(['.ts', '.js', '.mjs', '.cjs']);
+const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
+const TEST_SUFFIXES = ['.test.ts', '.test.tsx', '.test.js', '.test.jsx', '.spec.ts', '.spec.tsx', '.spec.js', '.spec.jsx'];
 
 async function* walkSourceFiles(dir) {
   let entries;
@@ -73,8 +74,7 @@ async function* walkSourceFiles(dir) {
       if (SKIP_DIRS.has(e.name)) continue;
       yield* walkSourceFiles(full);
     } else if (e.isFile()) {
-      if (e.name.endsWith('.test.ts') || e.name.endsWith('.test.js')) continue;
-      if (e.name.endsWith('.spec.ts') || e.name.endsWith('.spec.js')) continue;
+      if (TEST_SUFFIXES.some((s) => e.name.endsWith(s))) continue;
       const dot = e.name.lastIndexOf('.');
       if (dot === -1 || !SOURCE_EXTS.has(e.name.slice(dot))) continue;
       yield full;

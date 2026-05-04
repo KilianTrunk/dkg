@@ -244,15 +244,21 @@ export class DKGPublisher implements Publisher {
       this.publisherWallet = new ethers.Wallet(config.publisherPrivateKey);
       this.publisherAddress = this.publisherWallet.address;
     } else {
-      // No private key supplied → no signing capability. Every on-chain code
-      // path in this class is gated on `if (this.publisherWallet)` and
-      // gracefully no-ops when absent (see `executeOnChainPublish` and the
-      // self-sign / authorship-proof blocks). The previous behaviour
-      // generated an ephemeral `Wallet.createRandom()` here whenever chain
-      // was enabled, which produced unverifiable signatures attributed to a
-      // throw-away address — actively misleading callers that supplied
-      // `publisherAddress` separately. See PR fixing this for the
-      // testnet-blocking incident chain (`ensureProfile` had the same
+      // No private key supplied → no in-process signing capability. The
+      // publish-time paths that need a `publisherWallet` to produce a
+      // signature (V10 self-sign ACK at L1237, the on-chain `publishDirect`
+      // signature at L1276, and the per-KA authorship proofs at L1444)
+      // are explicitly gated on `if (this.publisherWallet)` and degrade
+      // safely when absent. Other on-chain entry points (`update()`,
+      // `chain.updateKnowledgeCollectionV10` / `updateKnowledgeAssets`)
+      // delegate signing to the chain adapter's own signer pool and
+      // therefore do not require this wallet at all.
+      //
+      // The previous behaviour generated an ephemeral `Wallet.createRandom()`
+      // here whenever chain was enabled, which produced unverifiable
+      // signatures attributed to a throw-away address — actively misleading
+      // callers that supplied `publisherAddress` separately. See PR #371 for
+      // the testnet-blocking incident chain (`ensureProfile` had the same
       // anti-pattern, fixed in PR #366).
       this.publisherAddress = config.publisherAddress ?? '0x' + '0'.repeat(40);
     }

@@ -80,19 +80,24 @@ export function registerPublishTools(
   _config: DkgConfig,
 ): void {
   // ── dkg_publish ─────────────────────────────────────────────────
+  // Description quotes SKILL.md §4a line 182's `dkg_publish` vs
+  // `dkg_shared_memory_publish` disambiguation verbatim per audit
+  // v1.1 lock — agents need to pick the right tool without re-
+  // reading SKILL.md.
   server.registerTool(
     'dkg_publish',
     {
       title: 'Publish Fresh Quads',
       description:
-        'One-shot write + publish helper: writes the supplied quads to ' +
-        'Shared Working Memory, then publishes the entire SWM in the CG ' +
-        'to Verified Memory (on-chain) and clears SWM. For the canonical ' +
-        'step-wise flow (write → promote → publish) use ' +
-        '`dkg_assertion_create / write / promote` followed by ' +
-        '`dkg_shared_memory_publish` — that path keeps WM as a draft ' +
-        'staging area before SWM. Use `dkg_publish` only when you have ' +
-        'fresh quads to anchor immediately.',
+        '"I have fresh quads, write+publish now." Two-call helper: ' +
+        'writes the supplied quads to Shared Working Memory, then ' +
+        'publishes the entire SWM in the CG to Verified Memory ' +
+        '(on-chain) and clears SWM. For the canonical step-wise flow ' +
+        '(write → promote → publish) use `dkg_assertion_create / write ' +
+        '/ promote` followed by `dkg_shared_memory_publish` — that ' +
+        'path keeps WM as a draft staging area before SWM. Use ' +
+        '`dkg_publish` only when you have fresh quads to anchor ' +
+        'immediately.',
       inputSchema: {
         contextGraphId: z.string().min(1).describe('Target context graph id'),
         quads: z
@@ -147,19 +152,23 @@ export function registerPublishTools(
   );
 
   // ── dkg_shared_memory_publish ───────────────────────────────────
+  // Description quotes SKILL.md §4a line 182's `dkg_publish` vs
+  // `dkg_shared_memory_publish` disambiguation verbatim per audit
+  // v1.1 lock.
   server.registerTool(
     'dkg_shared_memory_publish',
     {
       title: 'Publish Shared Working Memory',
       description:
-        'Final step of the canonical write flow. Publish all Shared ' +
-        'Working Memory in a context graph to Verified Memory (on-chain) ' +
-        'and clear SWM. Use after `dkg_assertion_promote` to finalize ' +
-        'promoted data. Pass `rootEntities` to publish only specific ' +
-        'roots (subset publishes default to NOT clearing SWM, so other ' +
-        'unpublished roots are not dropped). Set `registerIfNeeded: ' +
-        'true` to upgrade a local-only CG to on-chain registration before ' +
-        'publishing — note this MAY spend gas/TRAC; opt-in only.',
+        'Canonical step-4 finalizer for "publish existing SWM" (one HTTP ' +
+        'call). Publishes all Shared Working Memory in a context graph to ' +
+        'Verified Memory (on-chain) and clears SWM. Use after ' +
+        '`dkg_assertion_promote` to finalize promoted data. Pass ' +
+        '`rootEntities` to publish only specific roots (subset publishes ' +
+        'default to NOT clearing SWM, so other unpublished roots are not ' +
+        'dropped). Set `registerIfNeeded: true` to upgrade a local-only CG ' +
+        'to on-chain registration before publishing — note this MAY spend ' +
+        'gas/TRAC; opt-in only.',
       inputSchema: {
         contextGraphId: z.string().min(1).describe('Target context graph id'),
         rootEntities: z

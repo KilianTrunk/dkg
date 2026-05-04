@@ -68,11 +68,15 @@ export function registerReadTools(
     'dkg_list_context_graphs',
     {
       title: 'List Context Graphs',
+      // Description opens with the audit v1.1 verbatim-locked
+      // reconciliation note (SKILL.md §6 user-vs-internal
+      // terminology); the follow-up sentence is the existing
+      // mcp-dkg per-row payload notes.
       description:
-        "List every context graph this DKG node knows about (also called " +
-        "'projects' in the DKG node UI). Returns id, display name, role " +
-        '(curator / participant), and layer. The first call most agents ' +
-        'make when joining a workspace.',
+        "List all context graphs the node knows about (called 'projects' " +
+        'in the DKG node UI). Returns id, display name, role (curator / ' +
+        'participant), and layer. The first call most agents make when ' +
+        'joining a workspace.',
       inputSchema: {},
     },
     async (): Promise<ToolResult> => {

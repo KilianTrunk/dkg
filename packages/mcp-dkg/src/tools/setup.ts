@@ -53,19 +53,21 @@ export function registerSetupTools(
   _config: DkgConfig,
 ): void {
   // ── dkg_context_graph_create ────────────────────────────────────
+  // Description string opens with the audit v1.1 verbatim-locked
+  // reconciliation note (SKILL.md §6 line 297 user-vs-internal
+  // terminology). The follow-up sentence about slug derivation is
+  // mcp-dkg-specific UX ergonomics.
   server.registerTool(
     'dkg_context_graph_create',
     {
       title: 'Create Context Graph',
       description:
-        'Create a new context graph on the DKG node (also called a ' +
-        '"project" in the DKG node UI). A context graph is a scoped ' +
-        'knowledge domain that organises published assertions. Call ' +
-        '`dkg_list_context_graphs` first to see if one with this name ' +
-        'already exists. The `id` slug is auto-derived from `name` if ' +
-        'omitted (e.g. "My Research" → "my-research"); slugs must be ' +
-        'lowercase letters, digits, and hyphens, and start and end with ' +
-        'a letter or digit.',
+        "Create a context graph (called 'projects' in the DKG node UI). " +
+        "Returns the new CG's id, name, and on-chain registration status. " +
+        'Call `dkg_list_context_graphs` first to see if one with this name ' +
+        'already exists. The `id` slug is auto-derived from `name` when ' +
+        'omitted (e.g. "My Research" → "my-research"); slugs must match ' +
+        '/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.',
       inputSchema: {
         name: z.string().min(1).describe('Human-readable name (e.g. "My Research Context Graph")'),
         description: z.string().optional().describe('Optional description of the CG\'s purpose'),

@@ -112,13 +112,13 @@ Acceptance criteria per route module:
 - Same wire format and status codes (snapshot the full `daemon.ts` behaviour with a CDC test before splitting; the existing playwright + node-ui tests should keep passing).
 - Auth resolution (`requestAgentAddress`) is performed by `http/auth.ts`, not the route module.
 - Phase events (`tracker.start/startPhase/completePhase/complete`) stay at the route boundary so the journal contract doesn't change.
-- **Every existing legacy path stays wired.** The refactor is a pure file move, not an API break. Before merging any route split, grep the monorepo for the route string and confirm in-repo clients (`packages/mcp-server`, `packages/mcp-dkg`, `packages/node-ui`) resolve against the new location. The known legacy aliases that must survive the move (verified against `packages/cli/src/daemon.ts` at the time of writing) are:
+- **Every existing legacy path stays wired.** The refactor is a pure file move, not an API break. Before merging any route split, grep the monorepo for the route string and confirm in-repo clients (`packages/mcp-dkg`, `packages/node-ui`) resolve against the new location. (The historical `mcp-server` package was a third in-repo client at plan-authoring time; it was removed in the V10 keeper consolidation 2026-05-04 — see the `pre-v10-tool-drop` tag.) The known legacy aliases that must survive the move (verified against `packages/cli/src/daemon.ts` at the time of writing) are:
   - `/api/subscribe` → V10 `/api/context-graph/subscribe`
   - `/api/paranet/create | list | rename | exists` → V10 `/api/context-graph/*` (see the paranet caveat below; `paranet/create` is a narrower legacy shim, not a pure alias)
   - `/api/workspace/write` → V10 `/api/shared-memory/write` (dual-wired at `daemon.ts:4646-4650`)
   - `/api/workspace/enshrine` → V10 `/api/shared-memory/publish` (dual-wired at `daemon.ts:4706-4710`)
 
-  A route split that omits any of these aliases silently breaks older CLI builds, older `mcp-server` releases, and any user automation that hit the V9 surface.
+  A route split that omits any of these aliases silently breaks older CLI builds, the historical legacy MCP package (now removed; see `pre-v10-tool-drop` tag), and any user automation that hit the V9 surface.
 
 Recommended PR ordering (smallest → largest, each is independently mergeable):
 
@@ -219,8 +219,7 @@ End state: `dkg-agent.ts` ≤ 1.5 kLOC; no sub‑module > 1.2 kLOC. The implemen
   - `packages/publisher` (phase-sequences + publish/update regression)
   - `packages/cli` (daemon HTTP behaviour + CLI integration)
   - `packages/node-ui` (chat-memory, operations view)
-  - `packages/mcp-server` (MCP tool schema + integration — the MCP server is an in-repo client of `/api/query`, `/api/shared-memory/write`, `/api/shared-memory/publish`, `/api/context-graph/list`, and `/api/context-graph/create` as wired in `packages/mcp-server/src/connection.ts`; a route move that breaks any of those calls would otherwise slip through the daemon-only tests. The list must be re‑grepped before any PR that touches routes — if this file falls out of sync with `connection.ts`, the verification checklist stops catching MCP‑publish regressions)
-  - `packages/mcp-dkg` (the DKG-flavoured MCP bundle; same rationale)
+  - `packages/mcp-dkg` (MCP tool schema + integration — the MCP server is an in-repo client of `/api/query`, `/api/shared-memory/write`, `/api/shared-memory/publish`, `/api/context-graph/list`, and `/api/context-graph/create` as wired in its `client.ts`; a route move that breaks any of those calls would otherwise slip through the daemon-only tests. The list must be re‑grepped before any PR that touches routes — if this file falls out of sync with `client.ts`, the verification checklist stops catching MCP‑publish regressions. The historical legacy MCP package was a separate fourth client at plan-authoring time and has since been removed in the V10 keeper consolidation 2026-05-04; see `pre-v10-tool-drop` tag for its original wiring.)
 
   A repo‑wide `typecheck` script per package is itself a Phase‑2 follow‑up, not a prerequisite.
 

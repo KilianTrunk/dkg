@@ -1757,6 +1757,60 @@ openclawCmd
     }
   });
 
+// ─── dkg mcp ────────────────────────────────────────────────────────
+
+const mcpCmd = program
+  .command('mcp')
+  .description('DKG MCP server for AI coding assistants (Cursor, Claude Code, …)');
+
+mcpCmd
+  .command('serve')
+  .description('Run the DKG MCP server over stdio (invoked by the MCP-aware client)')
+  .allowUnknownOption(true)
+  .allowExcessArguments(true)
+  .action(async (_opts, command) => {
+    // Pass any positional/extra args from the umbrella CLI through to the
+    // MCP server's `main()` so its internal CLI subcommand dispatcher
+    // (`join`, `status`, `help`) keeps working from the umbrella wrapper.
+    const passthrough = command.args ?? [];
+    let main: typeof import('@origintrail-official/dkg-mcp').main;
+    try {
+      ({ main } = await import('@origintrail-official/dkg-mcp'));
+    } catch (err: any) {
+      console.error('\n[dkg mcp serve] MCP server is not available.');
+      console.error(`  Reason: ${err?.message ?? err}`);
+      console.error('  • In a monorepo dev checkout: run `pnpm build` at the repo root to build all workspaces.');
+      console.error('  • With a global install: reinstall with `npm install -g @origintrail-official/dkg`.\n');
+      process.exit(1);
+    }
+    try {
+      // Synthesise an argv whose `[2]` slot aligns with the MCP server's
+      // own subcommand dispatcher. Without this, `dkg mcp serve join …`
+      // would land `argv[2] === 'mcp'` inside the MCP server and the
+      // `join` would never be seen.
+      await main(['node', 'dkg-mcp', ...passthrough]);
+    } catch (err: any) {
+      console.error(`\n[dkg mcp serve] ERROR: ${err?.message ?? err}\n`);
+      process.exit(1);
+    }
+  });
+
+mcpCmd
+  .command('setup')
+  .description('Register the DKG MCP server with detected MCP-aware clients (idempotent, safe to re-run)')
+  .option('--force', 'Refresh every detected client regardless of current registration state')
+  .option('--print-only', 'Print the canonical JSON to stdout; skip client detection and writes')
+  .option('--yes', 'Auto-confirm all registrations (default; reserved for future interactive prompts)')
+  .action(async (opts) => {
+    const { mcpSetupAction } = await import('./mcp-setup.js');
+    try {
+      await mcpSetupAction(opts);
+    } catch (err: any) {
+      console.error(`\n[dkg mcp setup] ERROR: ${err?.message ?? err}\n`);
+      process.exit(1);
+    }
+  });
+
 // ─── dkg ccl ────────────────────────────────────────────────────────
 
 type HermesAdapterModule = Record<string, unknown>;

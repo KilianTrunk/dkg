@@ -3,10 +3,14 @@
  * Stdio MCP server exposing the local DKG daemon to any MCP-aware client
  * (Cursor, Claude Code, Continue, …). See README.md for installation.
  *
- * Launched either directly via `dkg-mcp` (installed binary) or via
- * `npx @origintrail-official/dkg-mcp`. Picks up `.dkg/config.yaml` from
- * the workspace or falls back to environment variables.
+ * Launched either directly via `dkg-mcp` (installed binary), via
+ * `npx @origintrail-official/dkg-mcp`, or by the umbrella CLI's
+ * `dkg mcp serve` wrapper which imports `main()` and invokes it with
+ * a synthesised argv. `main()` reads its argv from the parameter (not
+ * `process.argv`) so the umbrella wrapper can pass through subcommands
+ * (`join`, `status`, etc.) cleanly.
  */
+import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { loadConfig, describeConfig } from './config.js';
@@ -15,7 +19,10 @@ import { registerReadTools } from './tools.js';
 import { registerWriteTools } from './tools/writes.js';
 import { registerAnnotationTools } from './tools/annotations.js';
 import { registerReviewTools } from './tools/review.js';
+import { registerAssertionTools } from './tools/assertions.js';
+import { registerMemorySearchTool } from './tools/memory-search.js';
 import { runCli, isKnownCliSubcommand } from './cli/index.js';
+import { loadAdapters } from './adapters.js';
 
 const VERSION = '0.1.0';
 
@@ -26,11 +33,17 @@ const VERSION = '0.1.0';
  * delegate to the CLI dispatcher. This keeps the operator-facing
  * binary single (`dkg-mcp`) while still letting MCP clients spawn
  * the same process with no args.
+ *
+ * `argv` defaults to `process.argv` so direct-bin invocation
+ * (`dkg-mcp join <invite>`) keeps working. The umbrella CLI's
+ * `dkg mcp serve` wrapper passes a synthesised argv:
+ * `['node', 'dkg-mcp', ...userArgs]` so `argv[2]` lines up with the
+ * MCP-internal subcommand instead of the umbrella's `mcp` verb.
  */
-async function main(): Promise<void> {
-  const sub = process.argv[2];
+export async function main(argv: string[] = process.argv): Promise<void> {
+  const sub = argv[2];
   if (sub && isKnownCliSubcommand(sub)) {
-    process.exit(await runCli(process.argv.slice(2)));
+    process.exit(await runCli(argv.slice(2)));
   }
 
   const config = loadConfig();
@@ -43,14 +56,34 @@ async function main(): Promise<void> {
   registerWriteTools(server, client, config);
   registerAnnotationTools(server, client, config);
   registerReviewTools(server, client, config);
+  registerAssertionTools(server, client, config);
+  registerMemorySearchTool(server, client, config);
+
+  await loadAdapters(server, client, config);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
 
-main().catch((err: unknown) => {
-  process.stderr.write(
-    `[dkg-mcp] fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`,
-  );
-  process.exit(1);
-});
+// Self-execute only when invoked as the entrypoint script. When the
+// umbrella `dkg mcp serve` wrapper imports this module to call `main()`
+// directly, the module-load side effect must NOT boot a second MCP
+// server — `process.argv[1]` is the umbrella `dkg` binary in that case,
+// not this file.
+const isDirectEntrypoint = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return fileURLToPath(import.meta.url) === process.argv[1];
+  } catch {
+    return false;
+  }
+})();
+
+if (isDirectEntrypoint) {
+  main().catch((err: unknown) => {
+    process.stderr.write(
+      `[dkg-mcp] fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`,
+    );
+    process.exit(1);
+  });
+}

@@ -156,6 +156,14 @@ export class DkgClient {
     verifiedGraph?: string;
     assertionName?: string;
     /**
+     * Required for `view: "working-memory"` reads. The daemon scopes WM
+     * assertion-graph URIs to the agent's raw peer ID — DID-form values
+     * route to a non-existent namespace and silently return empty
+     * results. Pass the bare peer ID (strip any `did:dkg:agent:` prefix
+     * at the boundary; see `dkg_memory_search` for an example).
+     */
+    agentAddress?: string;
+    /**
      * P-13: minimum trust level to admit into results. Only meaningful for
      * `view: "verified-memory"`; silently ignored on WM/SWM views.
      *
@@ -176,10 +184,31 @@ export class DkgClient {
     if (args.view != null) body.view = args.view;
     if (args.verifiedGraph != null) body.verifiedGraph = args.verifiedGraph;
     if (args.assertionName) body.assertionName = args.assertionName;
+    if (args.agentAddress) body.agentAddress = args.agentAddress;
     if (args.minTrust != null) body.minTrust = args.minTrust;
 
     const r = await this.request<QueryResponse>('POST', '/api/query', body);
     return r.result ?? { bindings: [] };
+  }
+
+  /**
+   * Fetch the daemon's default agent identity. Used by `dkg_memory_search`
+   * to resolve the agent address required for WM view routing — the
+   * daemon scopes WM assertion-graph URIs to the raw peer ID, so a
+   * memory-search call without it would silently route into a
+   * non-existent namespace and return zero hits.
+   *
+   * Returns `agentAddress` (DID-form, e.g. `did:dkg:agent:<peerId>`) and
+   * `peerId` (raw form). For WM view routing pass `peerId`; for
+   * provenance triples (e.g. `prov:wasAttributedTo`) pass `agentAddress`.
+   */
+  async getAgentIdentity(): Promise<{
+    agentAddress?: string;
+    agentDid?: string;
+    peerId?: string;
+    [key: string]: unknown;
+  }> {
+    return this.request('GET', '/api/agent/identity');
   }
 
   /** List registered agents (human + AI) + their live connection health. */
@@ -289,6 +318,58 @@ export class DkgClient {
     await this.request(
       'POST',
       `/api/assertion/${encodeURIComponent(args.assertionName)}/promote`,
+      body,
+    );
+  }
+
+  /**
+   * Create an empty Working Memory assertion graph (idempotent — duplicate
+   * names land as `alreadyExists: true` rather than throwing). The
+   * canonical write flow is `createAssertion` → `writeAssertion` →
+   * `promoteAssertion` (or `discardAssertion` to roll back).
+   */
+  async createAssertion(args: {
+    contextGraphId: string;
+    assertionName: string;
+    subGraphName?: string;
+  }): Promise<{ assertionUri: string | null; alreadyExists: boolean }> {
+    const body: Record<string, unknown> = {
+      contextGraphId: args.contextGraphId,
+      name: args.assertionName,
+    };
+    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    try {
+      const response = await this.request<{ assertionUri: string }>(
+        'POST',
+        '/api/assertion/create',
+        body,
+      );
+      return { assertionUri: response.assertionUri, alreadyExists: false };
+    } catch (err) {
+      if (err instanceof DkgHttpError && /already exists/.test(String(err.message))) {
+        return { assertionUri: null, alreadyExists: true };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Dump every quad in a Working Memory assertion. Returns `{ quads, count }`.
+   * Not a SPARQL endpoint — for ad-hoc filtering use `query()` with
+   * `view: 'working-memory'` plus the assertion's named graph.
+   */
+  async queryAssertion(args: {
+    contextGraphId: string;
+    assertionName: string;
+    subGraphName?: string;
+  }): Promise<{ quads: unknown[]; count: number }> {
+    const body: Record<string, unknown> = {
+      contextGraphId: args.contextGraphId,
+    };
+    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    return this.request(
+      'POST',
+      `/api/assertion/${encodeURIComponent(args.assertionName)}/query`,
       body,
     );
   }

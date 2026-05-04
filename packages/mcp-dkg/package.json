@@ -46,6 +46,9 @@
     "zod": "^3.25",
     "yaml": "^2.6.0"
   },
+  "optionalDependencies": {
+    "@origintrail-official/dkg-adapter-autoresearch": "workspace:*"
+  },
   "devDependencies": {
     "vitest": "^4.0.18"
   },

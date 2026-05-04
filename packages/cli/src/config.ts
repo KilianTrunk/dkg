@@ -85,6 +85,7 @@ export interface NetworkConfig {
     type: 'evm';
     rpcUrl: string;
     hubAddress: string;
+    tokenAddress?: string;
     chainId: string;
   };
   faucet?: {
@@ -117,6 +118,8 @@ export interface ChainConfig {
   rpcUrl: string;
   /** Hub contract address */
   hubAddress: string;
+  /** Optional token contract address override. When omitted, resolve from Hub.Token. */
+  tokenAddress?: string;
   /** Chain identifier (e.g., 'base:84532') */
   chainId?: string;
   /**
@@ -529,6 +532,8 @@ export function resolveChainConfig(
   if (rpcUrl !== undefined) merged.rpcUrl = rpcUrl;
   const hubAddress = cfg?.hubAddress ?? net?.hubAddress;
   if (hubAddress !== undefined) merged.hubAddress = hubAddress;
+  const tokenAddress = cfg?.tokenAddress ?? net?.tokenAddress;
+  if (tokenAddress !== undefined) merged.tokenAddress = tokenAddress;
   const chainId = cfg?.chainId ?? net?.chainId;
   if (chainId !== undefined) merged.chainId = chainId;
   if (cfg?.mockIdentityId !== undefined) merged.mockIdentityId = cfg.mockIdentityId;

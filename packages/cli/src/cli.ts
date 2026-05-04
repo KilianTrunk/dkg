@@ -22,6 +22,7 @@ import {
 } from './config.js';
 import { ApiClient } from './api-client.js';
 import { parsePositiveMsOption } from './publisher-runner.js';
+import { runConfiguredSourceWorker } from './source-worker-runner.js';
 
 function isDaemonUnreachable(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -2279,6 +2280,26 @@ sharedMemoryCmd
     }
   });
 
+// ─── dkg source-worker ────────────────────────────────────────────────
+
+const sourceWorkerCmd = program
+  .command('source-worker')
+  .description('Run generic source workers against the DKG daemon');
+
+sourceWorkerCmd
+  .command('run')
+  .description('Run a source worker from a JSON config file')
+  .requiredOption('--config <path>', 'Sensitive worker config JSON file')
+  .option('--once', 'Run a single iteration and exit')
+  .action(async (opts: ActionOpts) => {
+    try {
+      await runConfiguredSourceWorker(String(opts.config), { once: opts.once === true });
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
 // ─── dkg publisher ────────────────────────────────────────────────────
 
 const publisherCmd = program
@@ -2702,6 +2723,7 @@ program
       const chainResolved = resolveChainConfig(config, network);
       const rpcUrl = chainResolved?.rpcUrl;
       const hubAddress = chainResolved?.hubAddress;
+      const tokenAddress = chainResolved?.tokenAddress;
       const chainId = chainResolved?.chainId ?? '(unknown)';
 
       let provider: ethers.JsonRpcProvider | null = null;
@@ -2711,7 +2733,10 @@ program
       if (rpcUrl) {
         try {
           provider = new ethers.JsonRpcProvider(rpcUrl);
-          if (hubAddress) {
+          if (tokenAddress && tokenAddress !== ethers.ZeroAddress) {
+            token = new ethers.Contract(tokenAddress, ['function balanceOf(address) view returns (uint256)', 'function symbol() view returns (string)'], provider);
+            tokenSymbol = await token.symbol().catch(() => 'TRAC');
+          } else if (hubAddress) {
             const hub = new ethers.Contract(hubAddress, ['function getContractAddress(string) view returns (address)'], provider);
             const tokenAddr = await hub.getContractAddress('Token');
             if (tokenAddr !== ethers.ZeroAddress) {
@@ -2944,14 +2969,66 @@ function formatPublisherJobValue(value: unknown, key?: string): unknown {
 }
 
 function stripQuotes(s: string): string {
-  if (s.startsWith('"') && s.endsWith('"')) return s.slice(1, -1);
-  const match = s.match(/^"(.*)"(\^\^.*|@.*)?$/);
-  if (match) return match[1];
+  const decodeLiteral = (literal: string): string => {
+    try {
+      return JSON.parse(literal);
+    } catch {
+      return literal.slice(1, -1);
+    }
+  };
+  if (s.startsWith('"') && s.endsWith('"')) return decodeLiteral(s);
+  const match = s.match(/^(".*")(\^\^.*|@.*)?$/);
+  if (match) return decodeLiteral(match[1]);
   return s;
 }
 
 function formatQuadObject(object: string): string {
   return /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)/.test(object) ? `<${object}>` : object;
+}
+
+type QueryCatalogItem = {
+  slug: string;
+  name: string;
+  description?: string;
+  sparql: string;
+  rank: number;
+  catalogSlug: string;
+  catalogName: string;
+  catalogDescription?: string;
+  catalogRank: number;
+  subGraph: string;
+};
+
+async function loadSavedQueriesForCatalog(contextGraphId: string): Promise<QueryCatalogItem[]> {
+  const client = await ApiClient.connect();
+  const result = await client.readQueryCatalog(contextGraphId);
+  const bindings = result.result.type === 'bindings' ? result.result.bindings : [];
+  return bindings
+    .map((row) => {
+      const qIri = stripQuotes(String(row.q ?? ''));
+      const catalogIri = stripQuotes(String(row.catalog ?? ''));
+      const slug = qIri.split(':query:').pop() ?? qIri;
+      const catalogSlug = catalogIri ? (catalogIri.split(':catalog:').pop() ?? catalogIri) : 'ui-saved-queries';
+      return {
+        slug,
+        name: stripQuotes(String(row.name ?? slug)),
+        description: row.description ? stripQuotes(String(row.description)) : undefined,
+        sparql: stripQuotes(String(row.sparql ?? '')),
+        rank: Number.parseInt(stripQuotes(String(row.rank ?? '99')), 10) || 99,
+        catalogSlug,
+        catalogName: stripQuotes(String(row.catalogName ?? 'Queries')),
+        catalogDescription: row.catalogDescription ? stripQuotes(String(row.catalogDescription)) : undefined,
+        catalogRank: Number.parseInt(stripQuotes(String(row.catalogRank ?? '999')), 10) || 999,
+        subGraph: stripQuotes(String(row.subGraph ?? '')),
+      };
+    })
+    .filter((item) => item.sparql.length > 0)
+    .sort((a, b) => a.subGraph.localeCompare(b.subGraph) || a.catalogRank - b.catalogRank || a.rank - b.rank || a.name.localeCompare(b.name));
+}
+
+function findSavedQuery(items: QueryCatalogItem[], selector: string): QueryCatalogItem | undefined {
+  return items.find((item) => item.slug === selector)
+    ?? items.find((item) => item.name === selector);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -2975,6 +3052,59 @@ async function stopDaemonIfRunning(): Promise<boolean> {
 }
 
 // ─── dkg update ──────────────────────────────────────────────────────
+
+// ─── dkg query-catalog ───────────────────────────────────────────────
+
+const queryCatalogCmd = program
+  .command('query-catalog')
+  .description('List and run saved SPARQL queries from the profile catalog');
+
+queryCatalogCmd
+  .command('list <context-graph>')
+  .description('List saved queries in the profile query catalog')
+  .action(async (contextGraphId: string) => {
+    try {
+      const items = await loadSavedQueriesForCatalog(contextGraphId);
+      if (items.length === 0) {
+        console.log(`No saved queries found for ${contextGraphId}.`);
+        return;
+      }
+      console.log(`Saved queries for ${contextGraphId}:\n`);
+      for (const item of items) {
+        console.log(`${item.slug}`);
+        console.log(`  Name:        ${item.name}`);
+        console.log(`  Catalog:     ${item.catalogName} (${item.catalogSlug})`);
+        console.log(`  Sub-graph:   ${item.subGraph}`);
+        if (item.description) console.log(`  Description: ${item.description}`);
+        console.log('');
+      }
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
+queryCatalogCmd
+  .command('run <context-graph> <query>')
+  .description('Run a saved query by slug or exact name')
+  .action(async (contextGraphId: string, selector: string) => {
+    try {
+      const items = await loadSavedQueriesForCatalog(contextGraphId);
+      const match = findSavedQuery(items, selector);
+      if (!match) {
+        console.error(`Saved query not found: ${selector}`);
+        process.exit(1);
+      }
+      const client = await ApiClient.connect();
+      const result = await client.query(match.sparql, contextGraphId);
+      console.log(`Running saved query: ${match.name}`);
+      console.log(`Slug: ${match.slug}\n`);
+      console.log(JSON.stringify(result.result, null, 2));
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
 
 program
   .command('update [versionOrRef]')

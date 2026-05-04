@@ -305,6 +305,10 @@ export class ApiClient {
     });
   }
 
+  async readQueryCatalog(contextGraphId: string): Promise<{ result: QueryResult }> {
+    return this.post('/api/profile/query-catalog/read', { contextGraphId });
+  }
+
   async queryRemote(peerId: string, request: {
     lookupType: string;
     contextGraphId?: string;

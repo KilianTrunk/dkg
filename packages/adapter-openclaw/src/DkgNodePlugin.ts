@@ -18,6 +18,10 @@
 import {
   GET_VIEWS,
   type GetView,
+  createDkgPublisherExtension,
+  type DkgPublisherExtension,
+  loadAgentAuthTokenSync,
+  MultipleAgentsError,
   resolveDkgHome,
   toEip55Checksum,
 } from '@origintrail-official/dkg-core';
@@ -29,7 +33,6 @@ import {
 import { DkgChannelPlugin } from './DkgChannelPlugin.js';
 import { HookSurface } from './HookSurface.js';
 import { ChatTurnWriter } from './ChatTurnWriter.js';
-import { createDkgPublisher, type DkgPublisherFacade } from './publisher.js';
 import {
   DkgMemoryPlugin,
   DkgMemorySearchManager,
@@ -156,7 +159,7 @@ export class DkgNodePlugin {
   // HTTP client to daemon — used by all tools and integration modules
   private client!: DkgDaemonClient;
   private daemonClientGeneration = 0;
-  private publisher!: DkgPublisherFacade;
+  private publisher!: DkgPublisherExtension;
 
   // Integration modules
   private channelPlugin: DkgChannelPlugin | null = null;
@@ -450,7 +453,7 @@ export class DkgNodePlugin {
     this.resetDaemonScopedCachesForClientChange();
     this.dkgHome = next.dkgHome;
     this.client = new DkgDaemonClient({ baseUrl: next.daemonUrl, dkgHome: next.dkgHome });
-    this.publisher = createDkgPublisher(this.client);
+    this.publisher = createDkgPublisherExtension(this.client);
     this.chatTurnWriter?.setClient(this.client);
     this.channelPlugin?.setClient(this.client);
     this.memoryPlugin?.setClient(this.client, { reRegister: this.config.memory?.enabled === true });
@@ -626,7 +629,7 @@ export class DkgNodePlugin {
     // (the very bug T70 set out to fix). Threading `dkgHome` through
     // `DkgClientOptions` plugs that hole.
     this.client = new DkgDaemonClient({ baseUrl: daemonUrl, dkgHome: this.dkgHome });
-    this.publisher = createDkgPublisher(this.client);
+    this.publisher = createDkgPublisherExtension(this.client);
     this.initialized = true;
     // R17.2 — Defer `ChatTurnWriter` construction to runtime-enabled
     // modes. The constructor calls `mkdirSync` + reads the watermark

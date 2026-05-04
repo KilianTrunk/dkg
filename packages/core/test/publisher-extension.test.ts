@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
-  createDkgPublisher,
+  createDkgPublisherExtension,
   escapeDkgRdfLiteral,
   isDkgRdfTerm,
   normalizeDkgPublisherObject,
   normalizeDkgPublisherQuads,
-  type DkgPublisherClient,
-} from '../src/publisher.js';
+  type DkgPublisherExtensionTransport,
+} from '../src/publisher-extension.js';
 
-function createClient(): DkgPublisherClient & { calls: Array<[string, unknown[]]> } {
+function createTransport(): DkgPublisherExtensionTransport & { calls: Array<[string, unknown[]]> } {
   const calls: Array<[string, unknown[]]> = [];
   return {
     calls,
@@ -43,8 +43,8 @@ function createClient(): DkgPublisherClient & { calls: Array<[string, unknown[]]
   };
 }
 
-describe('DkgPublisherFacade', () => {
-  it('normalizes agent-friendly object values into RDF terms', () => {
+describe('DkgPublisherExtension', () => {
+  it('normalizes plugin-friendly object values into RDF terms', () => {
     expect(isDkgRdfTerm('https://example.org/entity')).toBe(true);
     expect(isDkgRdfTerm('urn:dkg:entity:1')).toBe(true);
     expect(isDkgRdfTerm('did:dkg:agent:abc')).toBe(true);
@@ -73,8 +73,8 @@ describe('DkgPublisherFacade', () => {
   });
 
   it('covers the local workspace create and write flow', async () => {
-    const client = createClient();
-    const publisher = createDkgPublisher(client);
+    const transport = createTransport();
+    const publisher = createDkgPublisherExtension(transport);
 
     await publisher.createLocalWorkspace({
       contextGraphId: 'cg',
@@ -88,7 +88,7 @@ describe('DkgPublisherFacade', () => {
       quads: [{ subject: 'did:dkg:e:1', predicate: 'http://schema.org/name', object: 'Alpha' }],
     });
 
-    expect(client.calls).toEqual([
+    expect(transport.calls).toEqual([
       ['createAssertion', ['cg', 'scratch', { subGraphName: 'research' }]],
       ['createAssertion', ['cg', 'memory', { subGraphName: 'research' }]],
       ['writeAssertion', [
@@ -101,8 +101,8 @@ describe('DkgPublisherFacade', () => {
   });
 
   it('can write to shared memory without creating a workspace assertion', async () => {
-    const client = createClient();
-    const publisher = createDkgPublisher(client);
+    const transport = createTransport();
+    const publisher = createDkgPublisherExtension(transport);
 
     await publisher.writeSharedMemory({
       contextGraphId: 'cg',
@@ -110,7 +110,7 @@ describe('DkgPublisherFacade', () => {
       quads: [{ subject: 'did:dkg:e:1', predicate: 'http://schema.org/url', object: 'https://example.org/a' }],
     });
 
-    expect(client.calls).toEqual([
+    expect(transport.calls).toEqual([
       ['share', [
         'cg',
         [{ subject: 'did:dkg:e:1', predicate: 'http://schema.org/url', object: 'https://example.org/a', graph: '' }],
@@ -120,8 +120,8 @@ describe('DkgPublisherFacade', () => {
   });
 
   it('publishes fresh quads and existing shared memory into verified memory', async () => {
-    const client = createClient();
-    const publisher = createDkgPublisher(client);
+    const transport = createTransport();
+    const publisher = createDkgPublisherExtension(transport);
 
     await publisher.publishVerifiedMemory({
       contextGraphId: 'cg',
@@ -134,7 +134,7 @@ describe('DkgPublisherFacade', () => {
       subGraphName: 'research',
     });
 
-    expect(client.calls).toEqual([
+    expect(transport.calls).toEqual([
       ['publish', [
         'cg',
         [{ subject: 'did:dkg:e:1', predicate: 'http://schema.org/name', object: '"Alpha"', graph: '' }],

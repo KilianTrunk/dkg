@@ -1,25 +1,29 @@
 export { DkgNodePlugin } from './DkgNodePlugin.js';
 export { DkgDaemonClient, type DkgClientOptions } from './dkg-client.js';
 export {
-  DkgPublisherFacade,
-  DkgPublisherFacade as GenericDkgPublisher,
-  DkgPublisherFacade as DkgPublisherAbstraction,
-  createDkgPublisher,
+  DkgPublisherExtension,
+  DkgPublisherExtension as DkgPublisherFacade,
+  DkgPublisherExtension as GenericDkgPublisher,
+  DkgPublisherExtension as DkgPublisherAbstraction,
+  createDkgPublisherExtension,
+  createDkgPublisherExtension as createDkgPublisher,
   escapeDkgRdfLiteral,
   isDkgRdfTerm,
   normalizeDkgPublisherObject,
   normalizeDkgPublisherQuads,
-  type DkgPublisherClient,
-  type DkgPublisherQuad,
-  type DkgPublisherQuadInput,
-  type LocalWorkspaceCreateRequest,
-  type LocalWorkspaceDiscardRequest,
-  type LocalWorkspacePromoteRequest,
-  type LocalWorkspaceWriteRequest,
-  type SharedMemoryPublishRequest,
-  type SharedMemoryWriteRequest,
-  type VerifiedMemoryPublishRequest,
-} from './publisher.js';
+} from '@origintrail-official/dkg-core';
+export type {
+  DkgPublisherClient,
+  DkgPublisherQuad,
+  DkgPublisherQuadInput,
+  LocalWorkspaceCreateRequest,
+  LocalWorkspaceDiscardRequest,
+  LocalWorkspacePromoteRequest,
+  LocalWorkspaceWriteRequest,
+  SharedMemoryPublishRequest,
+  SharedMemoryWriteRequest,
+  VerifiedMemoryPublishRequest,
+} from '@origintrail-official/dkg-core';
 export { DkgChannelPlugin, CHANNEL_NAME } from './DkgChannelPlugin.js';
 export {
   mergeOpenClawConfig,

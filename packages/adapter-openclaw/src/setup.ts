@@ -19,16 +19,29 @@
  * Every step is idempotent — re-running is safe.
  */
 
-import { execSync, spawnSync, type SpawnSyncOptions } from 'node:child_process';
+import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
 import { accessSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, readFileSync, realpathSync, writeFileSync, mkdirSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { blueGreenSlotReady, findPackageRepoDir, requestFaucetFunding, resolveDkgConfigHome } from '@origintrail-official/dkg-core';
+import {
+  blueGreenSlotReady,
+  findPackageRepoDir,
+  requestFaucetFunding,
+  resolveCliPackageDir,
+  resolveDkgConfigHome,
+} from '@origintrail-official/dkg-core';
 import type { DkgOpenClawConfig } from './types.js';
 import { resolveDkgCli } from './resolve-dkg-cli.js';
+
+// Re-export `resolveCliPackageDir` so the existing public surface
+// (`@origintrail-official/dkg-adapter-openclaw` consumers, including 9 in-tree
+// test files that `vi.mock('../src/setup.js')`) keeps working unchanged.
+// The implementation moved to `@origintrail-official/dkg-core/resolve-dkg-cli.ts`
+// in S1 of issue #386 because adapter-hermes also needs it (helper-reuse-rec
+// §43-46) and the dep direction is `cli → adapters → core`.
+export { resolveCliPackageDir };
 import {
   defaultStateDirForWorkspace,
   legacyStateDirForWorkspace,
@@ -292,53 +305,8 @@ function readPersistedAgentName(): string | undefined {
 // Step 3: Write DKG config
 // ---------------------------------------------------------------------------
 
-/**
- * Locate the `@origintrail-official/dkg` CLI package root. Probes three
- * layouts in the order they're likeliest to succeed during setup:
- *   (1) Monorepo dev checkout — `packages/cli` sibling of this adapter.
- *   (2) Local install — `./node_modules/@origintrail-official/dkg`, found
- *       via `createRequire(import.meta.url).resolve('.../package.json')`.
- *   (3) Global install — `npm prefix -g` + `[lib/]node_modules/...`.
- *
- * Returns `null` when the CLI isn't reachable; callers are responsible for
- * emitting the error message that's appropriate for the specific file they
- * were looking for (SKILL.md, testnet.json, etc.).
- */
-export function resolveCliPackageDir(): string | null {
-  // (1) Monorepo dev checkout — sibling `packages/cli`.
-  const monorepoCandidate = resolve(adapterRoot(), '..', 'cli');
-  if (existsSync(join(monorepoCandidate, 'package.json'))) {
-    return monorepoCandidate;
-  }
-
-  // (2) Local install — `./node_modules/@origintrail-official/dkg/...`.
-  // This path is invisible to `npm prefix -g` since the CLI lives inside the
-  // calling project rather than the global prefix.
-  try {
-    const req = createRequire(import.meta.url);
-    const cliPkgJson = req.resolve('@origintrail-official/dkg/package.json');
-    const localInstallCandidate = dirname(cliPkgJson);
-    if (existsSync(join(localInstallCandidate, 'package.json'))) {
-      return localInstallCandidate;
-    }
-  } catch { /* fall through to npm prefix -g */ }
-
-  // (3) Global install — `npm install -g @origintrail-official/dkg`.
-  try {
-    const npmPrefix = execSync('npm prefix -g', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-    const candidates = [
-      join(npmPrefix, 'lib', 'node_modules', '@origintrail-official', 'dkg'),
-      join(npmPrefix, 'node_modules', '@origintrail-official', 'dkg'),
-    ];
-    for (const candidate of candidates) {
-      if (existsSync(join(candidate, 'package.json'))) {
-        return candidate;
-      }
-    }
-  } catch { /* fall through */ }
-
-  return null;
-}
+// `resolveCliPackageDir` was extracted to `@origintrail-official/dkg-core` in
+// S1 of issue #386. See the import + re-export at the top of this file.
 
 export function loadNetworkConfig(): NetworkConfig {
   const cliDir = resolveCliPackageDir();

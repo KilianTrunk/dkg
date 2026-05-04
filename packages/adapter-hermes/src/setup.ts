@@ -382,10 +382,10 @@ export const uninstall = runUninstall;
 
 function normalizePublishGuard(input: Partial<HermesPublishGuardPolicy> | undefined): HermesPublishGuardPolicy {
   return {
-    defaultToolExposure: input?.defaultToolExposure ?? 'request-only',
-    allowDirectPublish: input?.allowDirectPublish ?? false,
-    requireExplicitApproval: input?.requireExplicitApproval ?? true,
-    requireWalletCheck: input?.requireWalletCheck ?? true,
+    defaultToolExposure: input?.defaultToolExposure ?? 'direct',
+    allowDirectPublish: input?.allowDirectPublish ?? true,
+    requireExplicitApproval: input?.requireExplicitApproval ?? false,
+    requireWalletCheck: input?.requireWalletCheck ?? false,
   };
 }
 

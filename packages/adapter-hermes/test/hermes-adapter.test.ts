@@ -438,6 +438,22 @@ assert provider._config["context_graph"] == "agent-context", provider._config
     expect(config.require_wallet_check).toBe(false);
   });
 
+  it('defaults publish tools to direct exposure for skill parity', () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-default-publish-'));
+
+    setupHermesProfile({ hermesHome });
+
+    const config = JSON.parse(readFileSync(join(hermesHome, 'dkg.json'), 'utf-8'));
+    expect(config.publish_guard).toEqual({
+      defaultToolExposure: 'direct',
+      allowDirectPublish: true,
+      requireExplicitApproval: false,
+      requireWalletCheck: false,
+    });
+    expect(config.publish_tool).toBe('direct');
+    expect(config.allow_direct_publish).toBe(true);
+  });
+
   it('loads provider guard aliases from dkg.json', () => {
     const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-provider-config-'));
     writeFileSync(join(hermesHome, 'dkg.json'), JSON.stringify({
@@ -1470,7 +1486,6 @@ sys.modules["plugins.memory.dkg"] = module
 spec.loader.exec_module(module)
 
 provider = module.DKGMemoryProvider()
-provider._config = {"publish_tool": "request-only", "allow_direct_publish": False}
 names = sorted(schema["name"] for schema in provider.get_tool_schemas())
 expected_default = [
     "dkg_assertion_create",
@@ -1486,9 +1501,11 @@ expected_default = [
     "dkg_join_request_list",
     "dkg_list_context_graphs",
     "dkg_participant_list",
+    "dkg_publish",
     "dkg_query",
     "dkg_read_messages",
     "dkg_send_message",
+    "dkg_shared_memory_publish",
     "dkg_status",
     "dkg_sub_graph_create",
     "dkg_sub_graph_list",
@@ -1498,8 +1515,6 @@ expected_default = [
 ]
 missing = [name for name in expected_default if name not in names]
 assert missing == [], missing
-assert "dkg_publish" not in names, names
-assert "dkg_shared_memory_publish" not in names, names
 subscribe_schema = next(schema for schema in provider.get_tool_schemas() if schema["name"] == "dkg_subscribe")
 assert "include_shared_memory" in subscribe_schema["parameters"]["properties"], subscribe_schema
 search_schema = next(schema for schema in provider.get_tool_schemas() if schema["name"] == "memory_search")
@@ -1511,6 +1526,10 @@ share_schema = next(schema for schema in provider.get_tool_schemas() if schema["
 assert "context_graph_id" in share_schema["parameters"]["properties"], share_schema
 assert "context_graph" not in share_schema["parameters"]["properties"], share_schema
 
+provider._config = {"publish_tool": "disabled", "allow_direct_publish": False}
+disabled_names = sorted(schema["name"] for schema in provider.get_tool_schemas())
+assert "dkg_publish" not in disabled_names, disabled_names
+assert "dkg_shared_memory_publish" not in disabled_names, disabled_names
 guarded = provider.handle_tool_call("dkg_shared_memory_publish", {"context_graph_id": "cg:test"})
 assert "disabled by the adapter publish guard" in guarded, guarded
 admin_guarded = provider.handle_tool_call("dkg_participant_add", {"context_graph_id": "cg:test", "agent_address": "0xabc"})

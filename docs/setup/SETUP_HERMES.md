@@ -148,8 +148,10 @@ but the UI should show a degraded/offline bridge state.
   `persist-turn` remains bearer-authenticated for provider persistence even
   when UI chat registration is unavailable.
 - Adapter setup stores non-secret settings in `dkg.json`.
-- Direct `dkg_publish` and `dkg_shared_memory_publish` are guarded by default
-  and should remain operator-reviewed unless explicitly enabled.
+- Direct `dkg_publish` and `dkg_shared_memory_publish` are exposed by default
+  so Hermes matches the node skill tool surface. Operators can hide them with
+  `publish_tool: "disabled"` / `allow_direct_publish: false` in `dkg.json`, or
+  `DKG_ALLOW_DIRECT_PUBLISH=false`.
 - Context-graph admin mutation tools such as `dkg_context_graph_invite`,
   `dkg_participant_add`, `dkg_participant_remove`,
   `dkg_join_request_approve`, and `dkg_join_request_reject` are hidden by

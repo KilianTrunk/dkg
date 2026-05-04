@@ -46,8 +46,8 @@ def _load_config() -> dict:
         "daemon_url": "http://127.0.0.1:9200",
         "context_graph": "agent-context",
         "agent_name": "",
-        "publish_tool": "request-only",
-        "allow_direct_publish": False,
+        "publish_tool": "direct",
+        "allow_direct_publish": True,
         "allow_context_graph_admin_tools": False,
         "import_roots": [],
     }
@@ -595,7 +595,10 @@ DKG_ASSERTION_HISTORY_SCHEMA = {
 
 DKG_SHARED_MEMORY_PUBLISH_SCHEMA = {
     "name": "dkg_shared_memory_publish",
-    "description": "Publish existing Shared Working Memory to Verified Memory. Guarded by operator policy.",
+    "description": (
+        "Publish existing Shared Working Memory to Verified Memory. "
+        "Use after dkg_assertion_promote in the canonical write → promote → publish flow."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -851,9 +854,9 @@ class DKGMemoryProvider(MemoryProvider):
             )
 
         publish_guidance = (
-            "  dkg_shared_memory_publish / dkg_publish — Guarded Verified Memory publish flows\n"
+            "  dkg_shared_memory_publish / dkg_publish — Verified Memory publish flows\n"
             if self._direct_publish_allowed()
-            else "  Verified Memory publish tools are disabled by default; ask the operator before chain publish\n"
+            else "  Verified Memory publish tools are disabled by operator policy; ask before chain publish\n"
         )
         admin_guidance = (
             "  dkg_context_graph_invite / dkg_participant_* / dkg_join_request_* — Manage project access\n"
@@ -1877,11 +1880,14 @@ class DKGMemoryProvider(MemoryProvider):
             return False
 
     def _direct_publish_allowed(self) -> bool:
-        allow = self._config.get("allow_direct_publish")
+        exposure = str(self._config.get("publish_tool", "direct")).lower()
+        allow = self._config.get("allow_direct_publish", True)
+        if exposure == "disabled" or allow is False or str(allow).lower() in ("0", "false", "no"):
+            return False
         return (
             allow is True
             or str(allow).lower() in ("1", "true", "yes")
-            or str(self._config.get("publish_tool", "")).lower() == "direct"
+            or exposure == "direct"
         )
 
     def _context_graph_admin_tools_allowed(self) -> bool:

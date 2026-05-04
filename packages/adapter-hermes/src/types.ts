@@ -25,8 +25,8 @@ export interface HermesProfileMetadata {
 export interface HermesPublishGuardPolicy {
   /**
    * Default exposure for model-callable publish behavior. The adapter defaults
-   * to `request-only`, which means direct VM publish is not exposed as a normal
-   * tool unless a user explicitly opts in.
+   * to `direct` so Hermes receives the same publish tools as the node skill;
+   * operators can set this to `disabled` when they want publish hidden.
    */
   defaultToolExposure: 'disabled' | 'request-only' | 'direct';
   /** Allow direct `/api/shared-memory/publish` calls from the provider. */

@@ -17,7 +17,7 @@ This package contains:
 ## Current Status
 
 The adapter now provides the DKG-side setup and local-agent contracts for
-Hermes. It includes profile-aware setup helpers, guarded publish behavior,
+Hermes. It includes profile-aware setup helpers, configurable publish behavior,
 provider conflict handling, and client contracts for the daemon-owned
 `/api/hermes-channel/*` routes.
 
@@ -129,14 +129,14 @@ When active as `memory.provider: dkg`, the Python provider:
 - queues local writes in `$HERMES_HOME/dkg_cache*.json` when the daemon is
   unavailable
 
-Direct Verified Memory publishing is guarded by default. The `dkg_publish`
-and `dkg_shared_memory_publish` tools are not exposed unless direct publish is
-explicitly enabled through the adapter publish guard or
-`DKG_ALLOW_DIRECT_PUBLISH=true`. Context-graph admin mutation tools such as
+Verified Memory publishing tools are exposed by default so Hermes receives the
+same model-callable DKG tool surface as the node skill. Operators can hide
+`dkg_publish` and `dkg_shared_memory_publish` by setting `publish_tool:
+"disabled"` / `allow_direct_publish: false` in `dkg.json`, or by exporting
+`DKG_ALLOW_DIRECT_PUBLISH=false`. Context-graph admin mutation tools such as
 `dkg_context_graph_invite`, `dkg_participant_add`, `dkg_participant_remove`,
 `dkg_join_request_approve`, and `dkg_join_request_reject` are also hidden by
-default unless `DKG_ALLOW_CONTEXT_GRAPH_ADMIN_TOOLS=true`. By default, publish
-and admin flows should remain operator-reviewed.
+default unless `DKG_ALLOW_CONTEXT_GRAPH_ADMIN_TOOLS=true`.
 
 `dkg_assertion_import_file` requires an operator-approved import root. Configure
 `DKG_HERMES_IMPORT_ROOTS`, `HERMES_DKG_IMPORT_ROOTS`, `DKG_IMPORT_ROOTS`, or the
@@ -183,8 +183,9 @@ provenance before forwarding them to Hermes.
   turns even when UI chat registration is unavailable.
 - The default bridge host is loopback. Treat non-loopback gateway URLs as an
   explicit trust decision and require normal network hardening.
-- Verified Memory publishing is permanent and may cost TRAC; direct publish and
-  context-graph admin mutation tools are disabled by default.
+- Verified Memory publishing is permanent and may cost TRAC; operators can
+  disable direct publish exposure with `DKG_ALLOW_DIRECT_PUBLISH=false`.
+  Context-graph admin mutation tools are disabled by default.
 - Assertion file import is model-callable only inside configured safe roots;
   use `DKG_HERMES_IMPORT_ROOTS` or adapter `import_roots` to approve document
   locations explicitly.

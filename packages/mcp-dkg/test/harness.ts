@@ -309,6 +309,11 @@ export class FakeClient {
 
   async registerContextGraph(args: { id: string }) {
     if (this.overrides.registerContextGraph) return this.overrides.registerContextGraph.call(this, args);
-    return { registered: args.id, onChainId: `chain:${args.id}`, txHash: '0xreg' };
+    return {
+      registered: args.id,
+      onChainId: `chain:${args.id}`,
+      txHash: '0xreg',
+      alreadyRegistered: false,
+    };
   }
 }

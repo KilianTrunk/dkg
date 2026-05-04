@@ -595,20 +595,47 @@ export class DkgClient {
    * Register a context graph on-chain. Used in conjunction with
    * `publishSharedMemory({ ... })` when `register_if_needed: true`.
    * The CG must exist locally first (via `createContextGraph`).
+   *
+   * Idempotent on already-registered: the daemon route returns HTTP 409
+   * when the CG is already on-chain; this wrapper catches that 409 and
+   * returns `{ alreadyRegistered: true }` so callers can branch on a
+   * typed signal rather than parsing error message text. Mirrors the
+   * `createAssertion` / `createContextGraph` shape — same convention,
+   * same idempotency contract.
    */
   async registerContextGraph(args: {
     id: string;
     accessPolicy?: number;
   }): Promise<{
     registered: string;
-    onChainId: string;
+    onChainId?: string;
     txHash?: string;
     hint?: string;
+    alreadyRegistered: boolean;
   }> {
-    return this.request('POST', '/api/context-graph/register', {
-      id: args.id,
-      accessPolicy: args.accessPolicy,
-    });
+    try {
+      const response = await this.request<{
+        registered: string;
+        onChainId: string;
+        txHash?: string;
+        hint?: string;
+      }>('POST', '/api/context-graph/register', {
+        id: args.id,
+        accessPolicy: args.accessPolicy,
+      });
+      return { ...response, alreadyRegistered: false };
+    } catch (err) {
+      // Daemon returns 409 with "already registered" body when the CG
+      // is already on-chain. Surface as a typed flag so the tool layer
+      // can branch on it without the locale-fragile substring match.
+      if (err instanceof DkgHttpError && err.status === 409) {
+        return {
+          registered: args.id,
+          alreadyRegistered: true,
+        };
+      }
+      throw err;
+    }
   }
 }
 

@@ -196,7 +196,12 @@ describe('publish tools — write+publish helper + canonical SWM finalizer', () 
     let registered = false;
     localClient.registerContextGraph = (async () => {
       registered = true;
-      return { registered: 'cg', onChainId: 'chain:cg', txHash: '0xreg' };
+      return {
+        registered: 'cg',
+        onChainId: 'chain:cg',
+        txHash: '0xreg',
+        alreadyRegistered: false,
+      };
     }) as never;
     const localServer = new FakeServer();
     registerPublishTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
@@ -208,6 +213,53 @@ describe('publish tools — write+publish helper + canonical SWM finalizer', () 
     expect(result.isError).toBeFalsy();
     expect(registered).toBe(true);
     expect(result.content[0].text).toMatch(/Registered on-chain/);
+  });
+
+  // F12 (qa-review-round-2): the registerIfNeeded already-registered
+  // tolerance was implemented as a `message.includes('already registered')`
+  // substring match — locale-fragile + breaks on any daemon wording
+  // change. Post-F12 the client surfaces a typed `alreadyRegistered:
+  // true` flag from the daemon's HTTP 409, and the tool branches on
+  // the typed flag.
+  it('F12: registerIfNeeded tolerates already-registered via the typed flag (no substring match)', async () => {
+    const localClient = new FakeClient({
+      registerContextGraph: async () => ({
+        registered: 'cg',
+        alreadyRegistered: true,
+      }) as any,
+    });
+    const localServer = new FakeServer();
+    registerPublishTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
+
+    const result = await localServer.call('dkg_shared_memory_publish', {
+      contextGraphId: 'cg',
+      registerIfNeeded: true,
+    });
+    // The publish must succeed even though the CG was already registered.
+    expect(result.isError).toBeFalsy();
+    // Success summary MUST NOT claim we just registered something.
+    expect(result.content[0].text).not.toMatch(/Registered on-chain/);
+  });
+
+  it('F12: registerIfNeeded propagates non-409 register failures (no silent swallow)', async () => {
+    // A truly-failing register call (network error, unrelated body
+    // shape) MUST propagate as a tool error; the pre-F12 substring
+    // match would have swallowed any error whose message happened to
+    // contain "already registered" verbatim.
+    const localClient = new FakeClient({
+      registerContextGraph: async () => {
+        throw new Error('rpc unreachable');
+      },
+    });
+    const localServer = new FakeServer();
+    registerPublishTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
+
+    const result = await localServer.call('dkg_shared_memory_publish', {
+      contextGraphId: 'cg',
+      registerIfNeeded: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/Failed to register context graph: rpc unreachable/);
   });
 });
 

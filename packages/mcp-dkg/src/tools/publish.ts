@@ -220,20 +220,28 @@ export function registerPublishTools(
       }
 
       // Optional on-chain registration before publish. Tolerates the
-      // "already registered" case (just publishes); other failures
-      // propagate as tool errors.
+      // already-registered case (just publishes); other failures
+      // propagate as tool errors. F12: branch on the typed
+      // `alreadyRegistered: true` flag the client now surfaces from
+      // the daemon's 409 — replaces the locale-fragile
+      // `message.includes('already registered')` substring match.
       let registration: Record<string, unknown> | undefined;
       if (registerIfNeeded === true) {
         try {
-          registration = await client.registerContextGraph({
+          const result = await client.registerContextGraph({
             id: cgId,
             accessPolicy,
           });
+          // Capture the registration record (and on-chain id when
+          // newly-registered) for the success summary; if it was
+          // already registered, leave `registration` undefined so
+          // the summary doesn't claim we just registered something.
+          if (!result.alreadyRegistered) {
+            registration = result;
+          }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          if (!message.includes('already registered')) {
-            return errResult(`Failed to register context graph: ${message}`);
-          }
+          return errResult(`Failed to register context graph: ${message}`);
         }
       }
 

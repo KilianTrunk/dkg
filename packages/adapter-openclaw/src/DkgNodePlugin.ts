@@ -3296,7 +3296,13 @@ export class DkgNodePlugin {
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!content.trim()) return this.error('"content" is required.');
 
-      const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
+      let subGraphName: string | undefined;
+      if (args.sub_graph_name !== undefined) {
+        if (typeof args.sub_graph_name !== 'string' || !args.sub_graph_name.trim()) {
+          return this.error('"sub_graph_name" must be a non-empty string when provided.');
+        }
+        subGraphName = args.sub_graph_name.trim();
+      }
       const trimmedToolCallId = typeof toolCallId === 'string' ? toolCallId.trim() : '';
       const toolCallSeed = trimmedToolCallId || `generated:${randomUUID()}`;
       const rootEntityHash = createHash('sha256')

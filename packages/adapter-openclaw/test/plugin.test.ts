@@ -1254,6 +1254,38 @@ describe('DkgNodePlugin', () => {
       expect((plugin as any).ensureNodePeerId).not.toHaveBeenCalled();
     });
 
+    it('dkg_share omits absent sub_graph_name and trims valid sub_graph_name', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({
+        shareOperationId: 'op-1',
+        contextGraphId: 'ctx',
+        triplesWritten: 1,
+      });
+
+      await byName.get('dkg_share')!.execute('tc-omit-subgraph', {
+        context_graph_id: 'ctx',
+        content: 'alpha',
+      });
+      const omittedBody = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+      expect(omittedBody).not.toHaveProperty('subGraphName');
+
+      await byName.get('dkg_share')!.execute('tc-trim-subgraph', {
+        context_graph_id: 'ctx',
+        content: 'alpha',
+        sub_graph_name: '  protocols  ',
+      });
+      const trimmedBody = JSON.parse(fetchMock.mock.calls[1][1]?.body as string);
+      expect(trimmedBody.subGraphName).toBe('protocols');
+
+      await byName.get('dkg_share')!.execute('tc-trim-subgraph', {
+        context_graph_id: 'ctx',
+        content: 'alpha',
+        sub_graph_name: 'protocols',
+      });
+      const canonicalBody = JSON.parse(fetchMock.mock.calls[2][1]?.body as string);
+      expect(canonicalBody.subGraphName).toBe('protocols');
+      expect(canonicalBody.quads[0].subject).toBe(trimmedBody.quads[0].subject);
+    });
+
     it('dkg_share validates required inputs and rejects legacy aliases locally', async () => {
       const { fetchMock, byName } = setupPluginWithFetch({});
 
@@ -1267,6 +1299,22 @@ describe('DkgNodePlugin', () => {
         content: '   ',
       });
       expect(missingContent.content[0].text).toContain('content');
+
+      const blankSubGraph = await byName.get('dkg_share')!.execute('tc', {
+        context_graph_id: 'ctx',
+        content: 'alpha',
+        sub_graph_name: '   ',
+      });
+      expect(blankSubGraph.content[0].text).toContain('sub_graph_name');
+      expect(blankSubGraph.content[0].text).toMatch(/non-empty|string/);
+
+      const nonStringSubGraph = await byName.get('dkg_share')!.execute('tc', {
+        context_graph_id: 'ctx',
+        content: 'alpha',
+        sub_graph_name: 123,
+      });
+      expect(nonStringSubGraph.content[0].text).toContain('sub_graph_name');
+      expect(nonStringSubGraph.content[0].text).toContain('string');
 
       const legacyContext = await byName.get('dkg_share')!.execute('tc', {
         context_graph_id: 'ctx',

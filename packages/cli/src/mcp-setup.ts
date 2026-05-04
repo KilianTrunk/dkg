@@ -17,10 +17,28 @@
  *      probe, stale-PID handling, etc.).
  *   3. Optionally fund the node's wallets via testnet faucet (mirrors
  *      openclaw-setup's --no-fund posture).
- *   4. Detect MCP-aware clients and register the canonical
- *      `{ command: "dkg", args: ["mcp", "serve"] }` block. State-aware
- *      (`registered`/`stale`/`not registered`) and fast-exits on no-op
- *      re-runs.
+ *   4. Detect MCP-aware clients (`detectClients()`) and register the
+ *      context-aware canonical entry. Detected clients today: Cursor,
+ *      Claude Code, Claude Desktop, Windsurf, VSCode + Copilot Chat,
+ *      and Cline. (Continue + Codex CLI deferred to a follow-up; see
+ *      the phase-4 / phase-5 commit bodies for the defer rationale.)
+ *      State-aware (`registered` / `stale` / `not registered`) per
+ *      client and fast-exits on no-op re-runs.
+ *
+ * Context-awareness (phase 2): when invoked from inside a dkg-v9
+ * monorepo dev checkout (detected via
+ * `findDkgMonorepoRoot()` from `@origintrail-official/dkg-core`),
+ * the canonical entry writes the absolute path to the local CLI
+ * dist instead of the global `dkg` bin — so a contributor's local
+ * build runs even when a stale globally-installed `dkg` is on PATH.
+ * `--installed` / `--monorepo` are mutually-exclusive overrides.
+ *
+ * Per-client format / entry-shape dispatch (phase 1): Cursor, Claude
+ * Code, Claude Desktop, Windsurf, and Cline all use canonical
+ * `mcpServers.dkg` JSON. VSCode + Copilot Chat keys under
+ * `servers.dkg` instead. The `format` + `entryPath` fields on
+ * `ClientTarget` describe each client's contract; `writeRegistration`
+ * and `classify` dispatch on those without per-client write logic.
  *
  * Flags (parity with `dkg openclaw setup` where applicable):
  *   --port <n>     Override daemon API port (default 9200).
@@ -32,6 +50,11 @@
  *   --force        Refresh every detected client regardless of state.
  *   --print-only   Emit canonical JSON only; skip every other step.
  *   --yes          Auto-confirm (default; reserved for future prompts).
+ *   --installed    Force installed-mode command form even from a
+ *                  monorepo cwd (mutually exclusive with --monorepo).
+ *   --monorepo     Force monorepo-mode command form (errors if no
+ *                  DKG monorepo root locatable; mutually exclusive
+ *                  with --installed).
  *
  * Tokens and URLs are NOT in the emitted client-config block — the MCP
  * server reads them from `~/.dkg/config.yaml` + the daemon-written

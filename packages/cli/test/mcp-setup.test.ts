@@ -634,6 +634,68 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(written.servers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
   });
 
+  // ── Phase-5: Cline (deep-nested VSCode globalStorage path) ────────
+
+  /**
+   * Helper: resolve Cline's per-platform globalStorage settings
+   * path under a fake home root. Mirrors the production
+   * `clineMcpPaths` resolver byte-for-byte.
+   */
+  function clineMcpPathUnder(fakeHome: string): string {
+    const suffix = join(
+      'globalStorage',
+      'saoudrizwan.claude-dev',
+      'settings',
+      'cline_mcp_settings.json',
+    );
+    const p = platform();
+    if (p === 'darwin') {
+      return join(fakeHome, 'Library', 'Application Support', 'Code', 'User', suffix);
+    }
+    if (p === 'win32') {
+      const appData = process.env.APPDATA ?? join(fakeHome, 'AppData', 'Roaming');
+      return join(appData, 'Code', 'User', suffix);
+    }
+    return join(fakeHome, '.config', 'Code', 'User', suffix);
+  }
+
+  it('phase-5: Cline is detected at VSCode globalStorage and writes canonical `mcpServers.dkg`', async () => {
+    const clinePath = clineMcpPathUnder(tmpHome);
+    // Pre-create the parent dir (the deep-nested
+    // globalStorage/saoudrizwan.claude-dev/settings/ chain) so
+    // detection fires.
+    mkdirSync(join(clinePath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(clinePath)).toBe(true);
+    const written = JSON.parse(readFileSync(clinePath, 'utf-8'));
+    // Cline keys under canonical `mcpServers.dkg` (unlike VSCode's
+    // `servers.dkg`), so no entryPath override on the candidate.
+    expect(written.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+  });
+
+  it('phase-5: Cline siblings preserved — pre-existing entries don\'t get clobbered', async () => {
+    const clinePath = clineMcpPathUnder(tmpHome);
+    mkdirSync(join(clinePath, '..'), { recursive: true });
+    writeFileSync(
+      clinePath,
+      JSON.stringify(
+        { mcpServers: { 'github': { command: 'gh-mcp' } } },
+        null,
+        2,
+      ),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const written = JSON.parse(readFileSync(clinePath, 'utf-8'));
+    expect(written.mcpServers['github']).toEqual({ command: 'gh-mcp' });
+    expect(written.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+  });
+
   it('phase-4: VSCode staleness — pre-existing dkg entry under `servers.dkg` reclassifies on context flip to monorepo', async () => {
     // Cross-shape staleness: a Cursor-shaped entry written into
     // VSCode's `servers.dkg` wouldn't classify as `registered` if

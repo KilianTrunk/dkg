@@ -320,6 +320,41 @@ function vscodeMcpPaths(home: string): { configPath: string; displayPath: string
 }
 
 /**
+ * Resolve Cline (VSCode extension) per-platform config path. Cline
+ * stores its MCP wiring inside VSCode's per-extension globalStorage
+ * directory under the extension publisher.id namespace
+ * (`saoudrizwan.claude-dev`). Same `mcpServers.dkg` JSON shape as
+ * Cursor / Claude Code; what's hard is just the deeply-nested path.
+ *
+ * macOS: `~/Library/Application Support/Code/User/globalStorage/...`
+ * Windows: `%APPDATA%\Code\User\globalStorage\...`
+ * Linux:  `~/.config/Code/User/globalStorage/...`
+ *
+ * Mirrors `vscodeMcpPaths` for the per-platform Code-user-data root,
+ * with the per-extension globalStorage suffix appended.
+ */
+function clineMcpPaths(home: string): { configPath: string; displayPath: string } {
+  const suffix = join(
+    'globalStorage',
+    'saoudrizwan.claude-dev',
+    'settings',
+    'cline_mcp_settings.json',
+  );
+  const p = platform();
+  if (p === 'darwin') {
+    const configPath = join(home, 'Library', 'Application Support', 'Code', 'User', suffix);
+    return { configPath, displayPath: `~/Library/Application Support/Code/User/${suffix.replace(/\\/g, '/')}` };
+  }
+  if (p === 'win32') {
+    const appData = process.env.APPDATA ?? join(home, 'AppData', 'Roaming');
+    const configPath = join(appData, 'Code', 'User', suffix);
+    return { configPath, displayPath: configPath.replace(home, '~') };
+  }
+  const configPath = join(home, '.config', 'Code', 'User', suffix);
+  return { configPath, displayPath: `~/.config/Code/User/${suffix.replace(/\\/g, '/')}` };
+}
+
+/**
  * Discover MCP-aware clients on the machine. We look at the standard
  * config-file locations rather than probing for installed binaries — a
  * config file is the artifact `dkg mcp setup` actually writes into, and
@@ -373,6 +408,18 @@ function detectClients(): ClientTarget[] {
       // it without per-client write logic.
       entryPath: 'servers.dkg',
     },
+    (() => {
+      const cline = clineMcpPaths(home);
+      return {
+        name: 'Cline',
+        configPath: cline.configPath,
+        displayPath: cline.displayPath,
+        // Cline uses the canonical `mcpServers.dkg` shape; only the
+        // path is unusual (deep-nested under VSCode's per-extension
+        // globalStorage). entryPath defaults to `mcpServers.dkg`
+        // so no override needed.
+      };
+    })(),
   ];
   return candidates.filter((c) => {
     if (existsSync(c.configPath)) return true;

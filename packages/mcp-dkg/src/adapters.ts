@@ -15,11 +15,9 @@
  * contributes. Failure to load any single adapter is logged to stderr and
  * does not abort startup — adapters are opt-in and optional.
  *
- * Compared to the legacy `mcp-server` loader (`packages/mcp-server/src/index.ts`):
- * the lazy `getClient: () => Promise<DkgClient>` getter is replaced by a
- * concrete `DkgClient`, and adapters now also receive the resolved
- * `DkgConfig` so they can honour the workspace's pinned project, agent URI,
- * and capture defaults without re-reading `.dkg/config.yaml`.
+ * Adapters receive a concrete `DkgClient` plus the resolved `DkgConfig` so
+ * they can honour the workspace's pinned project, agent URI, and capture
+ * defaults without re-reading `.dkg/config.yaml`.
  */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { DkgClient } from './client.js';

@@ -368,7 +368,6 @@ This is a pnpm + Turborepo monorepo.
 @origintrail-official/dkg-attested-assets    Attested Knowledge Asset protocol components
 @origintrail-official/dkg-epcis              EPCIS → RDF supply-chain adapter
 @origintrail-official/dkg-mcp                MCP server for Cursor / Claude Code / coding agents
-@origintrail-official/dkg-mcp-server         Code-graph MCP tools (dev-coordination)
 ```
 
 ### Adapters and apps

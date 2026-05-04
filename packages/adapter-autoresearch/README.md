@@ -64,7 +64,7 @@ Results propagate via GossipSub to all paranet subscribers. Every agent sees eve
 ### Prerequisites
 
 - A running DKG V10 node (`dkg start`)
-- The DKG MCP server built (`pnpm --filter @origintrail-official/dkg-mcp-server build`)
+- The DKG MCP server built (`pnpm --filter @origintrail-official/dkg-mcp build`)
 - The adapter built (`pnpm --filter @origintrail-official/dkg-adapter-autoresearch build`)
 - A clone of [autoresearch](https://github.com/karpathy/autoresearch/) (or a Mac fork — see [Hardware](#hardware))
 
@@ -76,8 +76,8 @@ Set `DKG_ADAPTERS=autoresearch` when running the MCP server. In your Cursor/IDE 
 {
   "mcpServers": {
     "dkg": {
-      "command": "node",
-      "args": ["/path/to/dkg/packages/mcp-server/dist/index.js"],
+      "command": "dkg",
+      "args": ["mcp", "serve"],
       "env": {
         "DKG_ADAPTERS": "autoresearch"
       }
@@ -89,7 +89,7 @@ Set `DKG_ADAPTERS=autoresearch` when running the MCP server. In your Cursor/IDE 
 Or from the command line:
 
 ```bash
-DKG_ADAPTERS=autoresearch node packages/mcp-server/dist/index.js
+DKG_ADAPTERS=autoresearch dkg mcp serve
 ```
 
 This registers 6 additional MCP tools alongside the core DKG tools.
@@ -398,4 +398,4 @@ The DKG adapter is hardware-agnostic — the ontology and tools work with any fo
 - `@modelcontextprotocol/sdk` — MCP tool registration
 - `zod` — input schema validation
 
-Loaded as an optional dependency by `@origintrail-official/dkg-mcp-server`.
+Loaded as an optional dependency by `@origintrail-official/dkg-mcp`.

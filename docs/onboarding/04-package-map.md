@@ -47,7 +47,7 @@ graph TD
     subgraph "Adapters & Integrations"
         elizaos["@origintrail-official/dkg-adapter-elizaos"]
         openclaw["@origintrail-official/dkg-adapter-openclaw"]
-        mcp["@origintrail-official/dkg-mcp-server"]
+        mcp["@origintrail-official/dkg-mcp"]
     end
 
     subgraph "Tooling & UI"
@@ -179,12 +179,12 @@ An adapter for the AutoResearch framework that integrates DKG capabilities into 
 
 **Depends on**: `core`, `agent`.
 
-### @origintrail-official/dkg-mcp-server
-`packages/mcp-server/`
+### @origintrail-official/dkg-mcp
+`packages/mcp-dkg/`
 
-A Model Context Protocol (MCP) server that exposes the DKG code graph to AI coding assistants (Claude Code, Cursor, etc.). Provides tools for finding modules, functions, classes, and packages by keyword, getting file summaries without reading source, and running raw SPARQL queries. Connects to a running DKG node's API.
+A Model Context Protocol (MCP) server that exposes the DKG to AI coding assistants (Claude Code, Cursor, etc.) through the canonical V10 tool surface (assertion CRUD lifecycle, SPARQL queries, trust-weighted memory search, publish to Verified Memory). Reachable via `dkg mcp serve` (umbrella CLI subcommand) once `@origintrail-official/dkg` is installed. Connects to a running DKG node's HTTP API.
 
-**Depends on**: `@modelcontextprotocol/sdk`, `zod` (no workspace deps).
+**Depends on**: `@modelcontextprotocol/sdk`, `zod`, `yaml` (no workspace deps).
 
 ---
 
@@ -241,7 +241,7 @@ Attested Knowledge Assets (AKA) protocol implementation. Provides session manage
 | Swap the triple store backend                   | `packages/storage/src/adapters/` |
 | Build an ElizaOS agent with DKG                 | `packages/adapter-elizaos/`      |
 | Build an OpenClaw agent with DKG                | `packages/adapter-openclaw/`     |
-| Expose DKG to an AI coding assistant            | `packages/mcp-server/`           |
+| Expose DKG to an AI coding assistant            | `packages/mcp-dkg/`              |
 | Add a metric to the node dashboard              | `packages/node-ui/`              |
 | Customize knowledge graph rendering             | `packages/graph-viz/`            |
 | Understand network behavior visually            | `packages/network-sim/`          |
@@ -264,7 +264,7 @@ Attested Knowledge Assets (AKA) protocol implementation. Provides session manage
 | `@origintrail-official/dkg-agent`         | `core`, `storage`, `chain`, `publisher`, `query`     |
 | `@origintrail-official/dkg-adapter-elizaos` | `core`, `storage`, `agent`                         |
 | `@origintrail-official/dkg-adapter-openclaw` | `core`, `storage`, `agent`                        |
-| `@origintrail-official/dkg-mcp-server`    | (none -- connects via HTTP API)                      |
+| `@origintrail-official/dkg-mcp`           | (none -- connects via HTTP API)                      |
 | `@origintrail-official/dkg-graph-viz`     | (none -- standalone)                                 |
 | `@origintrail-official/dkg-network-sim`   | (none -- standalone)                                 |
 | `@origintrail-official/dkg-node-ui`       | `core`, `graph-viz`                                  |

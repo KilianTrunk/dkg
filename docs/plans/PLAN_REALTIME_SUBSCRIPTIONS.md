@@ -297,7 +297,7 @@ useEffect(() => {
 
 ### 3.2 MCP Server — event subscription tool
 
-**File:** `packages/mcp-server/src/index.ts`
+**File:** `packages/mcp-dkg/src/index.ts` (was the now-removed legacy mcp-server package at plan-authoring time; see `pre-v10-tool-drop` tag for the original wiring)
 
 Add an MCP tool `subscribe_events` that opens an SSE connection and delivers events to the LLM:
 

@@ -812,7 +812,6 @@ describe('DkgNodePlugin', () => {
         on: () => {},
         logger: {},
       });
-      (plugin as any).nodePeerId = '12D3KooWShareWriterOne';
       const byName = new Map(tools.map((t) => [t.name, t] as const));
       return { fetchMock, plugin, byName };
     };
@@ -1207,7 +1206,9 @@ describe('DkgNodePlugin', () => {
       expect(result.details).toEqual(shaped);
 
       (plugin as any).nodeAgentAddress = '0x0000000000000000000000000000000000000001';
-      const retry = await byName.get('dkg_share')!.execute('tc-retry', {
+      (plugin as any).nodePeerId = '12D3KooWShareWriterTwo';
+      (plugin as any).ensureNodePeerId = vi.fn().mockResolvedValue(undefined);
+      const retry = await byName.get('dkg_share')!.execute('tc', {
         context_graph_id: 'ctx',
         content: '  Alpha\nBeta  ',
         sub_graph_name: 'protocols',
@@ -1217,45 +1218,40 @@ describe('DkgNodePlugin', () => {
       const retryShaped = JSON.parse(retry.content[0].text);
       expect(retryBody.quads[0].subject).toBe(rootEntity);
       expect(retryShaped.rootEntity).toBe(rootEntity);
+      expect((plugin as any).ensureNodePeerId).not.toHaveBeenCalled();
 
-      (plugin as any).nodePeerId = '12D3KooWShareWriterTwo';
-      (plugin as any).shareWriterIdentity = undefined;
-      const otherWriter = await byName.get('dkg_share')!.execute('tc-other-writer', {
+      const otherShare = await byName.get('dkg_share')!.execute('tc-other-share', {
         context_graph_id: 'ctx',
         content: '  Alpha\nBeta  ',
         sub_graph_name: 'protocols',
       });
-      const [, otherWriterInit] = fetchMock.mock.calls[2] as [string, RequestInit];
-      const otherWriterBody = JSON.parse(otherWriterInit.body as string);
-      const otherWriterShaped = JSON.parse(otherWriter.content[0].text);
-      expect(otherWriterBody.quads[0].subject).not.toBe(rootEntity);
-      expect(otherWriterShaped.rootEntity).toBe(otherWriterBody.quads[0].subject);
+      const [, otherShareInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+      const otherShareBody = JSON.parse(otherShareInit.body as string);
+      const otherShareShaped = JSON.parse(otherShare.content[0].text);
+      expect(otherShareBody.quads[0].subject).not.toBe(rootEntity);
+      expect(otherShareShaped.rootEntity).toBe(otherShareBody.quads[0].subject);
+      expect((plugin as any).ensureNodePeerId).not.toHaveBeenCalled();
 
-      (plugin as any).nodePeerId = undefined;
-      (plugin as any).shareWriterIdentity = undefined;
-      (plugin as any).shareWriterFallbackId = 'fallback-writer';
-      (plugin as any).ensureNodePeerId = vi.fn().mockResolvedValue(undefined);
-      const startup = await byName.get('dkg_share')!.execute('tc-startup', {
+      const missingToolCallId = await byName.get('dkg_share')!.execute('', {
         context_graph_id: 'ctx',
         content: '  Alpha\nBeta  ',
         sub_graph_name: 'protocols',
       });
-      const [, startupInit] = fetchMock.mock.calls[3] as [string, RequestInit];
-      const startupBody = JSON.parse(startupInit.body as string);
-      const startupShaped = JSON.parse(startup.content[0].text);
-      expect(startupShaped.rootEntity).toBe(startupBody.quads[0].subject);
+      const [, missingToolCallIdInit] = fetchMock.mock.calls[3] as [string, RequestInit];
+      const missingToolCallIdBody = JSON.parse(missingToolCallIdInit.body as string);
+      const missingToolCallIdShaped = JSON.parse(missingToolCallId.content[0].text);
+      expect(missingToolCallIdBody.quads[0].subject).toMatch(/^urn:openclaw:dkg-share:[0-9a-f]{64}$/);
+      expect(missingToolCallIdShaped.rootEntity).toBe(missingToolCallIdBody.quads[0].subject);
 
-      (plugin as any).nodePeerId = '12D3KooWShareWriterLate';
-      const startupRetry = await byName.get('dkg_share')!.execute('tc-startup-retry', {
+      const secondMissingToolCallId = await byName.get('dkg_share')!.execute('', {
         context_graph_id: 'ctx',
         content: '  Alpha\nBeta  ',
         sub_graph_name: 'protocols',
       });
-      const [, startupRetryInit] = fetchMock.mock.calls[4] as [string, RequestInit];
-      const startupRetryBody = JSON.parse(startupRetryInit.body as string);
-      const startupRetryShaped = JSON.parse(startupRetry.content[0].text);
-      expect(startupRetryBody.quads[0].subject).toBe(startupBody.quads[0].subject);
-      expect(startupRetryShaped.rootEntity).toBe(startupShaped.rootEntity);
+      const [, secondMissingToolCallIdInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+      const secondMissingToolCallIdBody = JSON.parse(secondMissingToolCallIdInit.body as string);
+      expect(secondMissingToolCallIdBody.quads[0].subject).not.toBe(missingToolCallIdBody.quads[0].subject);
+      expect((plugin as any).ensureNodePeerId).not.toHaveBeenCalled();
     });
 
     it('dkg_share validates required inputs and rejects legacy aliases locally', async () => {
@@ -1309,7 +1305,6 @@ describe('DkgNodePlugin', () => {
         on: () => {},
         logger: {},
       });
-      (plugin as any).nodePeerId = '12D3KooWShareWriterOne';
       const byName = new Map(tools.map((t) => [t.name, t] as const));
 
       const result = await byName.get('dkg_share')!.execute('tc', {

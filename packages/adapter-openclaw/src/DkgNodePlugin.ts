@@ -290,8 +290,6 @@ export class DkgNodePlugin {
    * stampede `/api/status`. Null when no probe is running. Codex Bug B9.
    */
   private peerIdProbeInFlight: Promise<void> | null = null;
-  private shareWriterFallbackId = randomUUID();
-  private shareWriterIdentity: string | undefined;
   /**
    * Node agent address returned by `/api/agent/identity`. The daemon resolves
    * the adapter's node-level Bearer token to its default agent address, which
@@ -459,8 +457,6 @@ export class DkgNodePlugin {
   private resetDaemonScopedCachesForClientChange(): void {
     this.nodePeerId = undefined;
     this.peerIdProbeInFlight = null;
-    this.shareWriterFallbackId = randomUUID();
-    this.shareWriterIdentity = undefined;
     this.nodeAgentAddress = undefined;
     this.agentAddressProbeInFlight = null;
     this.availableContextGraphCache = [];
@@ -2649,7 +2645,7 @@ export class DkgNodePlugin {
           },
           required: ['context_graph_id', 'content'],
         },
-        execute: async (_toolCallId, args) => this.handleShare(args),
+        execute: async (toolCallId, args) => this.handleShare(toolCallId, args),
       },
       {
         name: 'dkg_query',
@@ -3287,7 +3283,7 @@ export class DkgNodePlugin {
     }
   }
 
-  private async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleShare(toolCallId: string, args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       if (args.context_graph !== undefined) {
         return this.error('"context_graph" is not a supported parameter on dkg_share. Use "context_graph_id".');
@@ -3301,14 +3297,10 @@ export class DkgNodePlugin {
       if (!content.trim()) return this.error('"content" is required.');
 
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      if (!this.shareWriterIdentity) {
-        if (this.nodePeerId === undefined) {
-          await this.ensureNodePeerId().catch(() => {});
-        }
-        this.shareWriterIdentity = this.nodePeerId ?? `local:${this.shareWriterFallbackId}`;
-      }
+      const trimmedToolCallId = typeof toolCallId === 'string' ? toolCallId.trim() : '';
+      const toolCallSeed = trimmedToolCallId || `generated:${randomUUID()}`;
       const rootEntityHash = createHash('sha256')
-        .update(this.shareWriterIdentity)
+        .update(toolCallSeed)
         .update('\0')
         .update(contextGraphId)
         .update('\0')

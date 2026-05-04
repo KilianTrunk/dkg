@@ -101,12 +101,41 @@ interface LayerPlan {
   view: 'working-memory' | 'shared-working-memory' | 'verified-memory';
 }
 
+/**
+ * Per-hit shape preserves SKILL.md §6.3's combined-string `layer`
+ * contract (`agent-context-wm | … | project-vm`) so consumers reading
+ * hits from this MCP, the OpenClaw adapter, or the daemon directly see
+ * the same agent-facing identifier. `contextGraphId` and `trustWeight`
+ * are surfaced as first-class fields alongside it — the prefix
+ * redundancy is intentional, the combined string is the SKILL contract
+ * and the split fields are agent ergonomics.
+ *
+ * Synthetic `path` mirrors the adapter shape `dkg://{cg}/{layer}/{hash}`
+ * (`packages/adapter-openclaw/src/DkgMemoryPlugin.ts:410`) so tooling
+ * consuming hits from either surface can dedup or jump-to-source on
+ * the same identifier.
+ */
 interface Hit {
-  snippet: string;
+  contextGraphId: string;
   layer: MemoryLayer;
+  trustWeight: number;
   score: number;
   entityUri: string;
-  contextGraphId: string;
+  snippet: string;
+  path: string;
+}
+
+/**
+ * Decompose the SKILL.md combined `layer` string into human-readable
+ * CG-and-tier halves for the text-mode renderer. Pure rendering
+ * helper — does NOT mutate the contract on `Hit.layer` (which stays
+ * the SKILL-canonical combined form). Returns `{ tier: 'WM' | 'SWM'
+ * | 'VM' }`; the CG half is the explicit `Hit.contextGraphId`.
+ */
+function tierFromCombinedLayer(layer: MemoryLayer): 'WM' | 'SWM' | 'VM' {
+  if (layer.endsWith('-vm')) return 'VM';
+  if (layer.endsWith('-swm')) return 'SWM';
+  return 'WM';
 }
 
 function computeKeywordOverlap(text: string, keywords: string[]): number {
@@ -281,14 +310,22 @@ LIMIT ${cap}`;
           if (!text) continue;
           const rawScore = computeKeywordOverlap(text, keywords);
           if (rawScore <= 0) continue;
-          const weighted = rawScore * TRUST_WEIGHT[plan.layer];
+          const weight = TRUST_WEIGHT[plan.layer];
+          const weighted = rawScore * weight;
           const key = `${plan.contextGraphId}::${uri || hashString(text)}`;
+          // Synthetic `path` mirrors the adapter shape
+          // `dkg://${cg}/${layer}/${hash}` (`DkgMemoryPlugin.ts:410`)
+          // so tooling that consumes either surface can dedup or
+          // jump-to-source on the same identifier.
+          const path = `dkg://${plan.contextGraphId}/${plan.layer}/${hashString(uri || text)}`;
           const candidate: RankedHit = {
-            snippet: truncate(text, 500),
+            contextGraphId: plan.contextGraphId,
             layer: plan.layer,
+            trustWeight: weight,
             score: rawScore,
             entityUri: uri,
-            contextGraphId: plan.contextGraphId,
+            snippet: truncate(text, 500),
+            path,
             rank: weighted,
           };
           const existing = best.get(key);
@@ -308,7 +345,7 @@ LIMIT ${cap}`;
       }
 
       const ranked = Array.from(best.values()).sort((a, b) => b.rank - a.rank);
-      const top = ranked.slice(0, cap);
+      const top: Hit[] = ranked.slice(0, cap).map(({ rank: _rank, ...rest }) => rest);
 
       const totalRaw = settled.reduce((n, s) => n + s.bindings.length, 0);
       const breakdown = settled.map((s) => `${s.plan.layer}:${s.bindings.length}`).join(', ');
@@ -332,9 +369,19 @@ LIMIT ${cap}`;
 
       if (top.length === 0) return ok(header);
 
+      // Per-hit text rendering surfaces provenance up-front:
+      //   [agent-context · VM · weight=1.30 · score=0.87] <snippet>
+      // The combined `Hit.layer` (SKILL §6.3 contract) decomposes into
+      // the explicit `Hit.contextGraphId` (rendered as-is, lower-case
+      // canonical) plus the trust tier (rendered upper-case via
+      // `tierFromCombinedLayer`). Numeric weight + score show two
+      // decimal places — enough precision to spot the trust-tiering
+      // effect without flooding the line.
       const lines = top.map((h, i) => {
-        const uriPart = h.entityUri ? ` \`${h.entityUri}\`` : '';
-        return `### ${i + 1}. [${h.layer}] score=${h.score.toFixed(2)}${uriPart}\n${h.snippet}`;
+        const tier = tierFromCombinedLayer(h.layer);
+        const provenance = `${h.contextGraphId} · ${tier} · weight=${h.trustWeight.toFixed(2)} · score=${h.score.toFixed(2)}`;
+        const uriLine = h.entityUri ? `\`${h.entityUri}\`\n` : '';
+        return `### ${i + 1}. [${provenance}]\n${uriLine}${h.snippet}`;
       });
       return ok(`${header}\n\n${lines.join('\n\n')}`);
     },

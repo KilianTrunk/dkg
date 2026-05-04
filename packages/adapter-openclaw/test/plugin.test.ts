@@ -615,6 +615,7 @@ describe('DkgNodePlugin', () => {
     expect(toolNames).toContain('dkg_join_request_reject');
     expect(toolNames).toContain('dkg_subscribe');
     expect(toolNames).toContain('dkg_publish');
+    expect(toolNames).toContain('dkg_share');
     expect(toolNames).toContain('dkg_query');
     expect(toolNames).toContain('dkg_find_agents');
     expect(toolNames).toContain('dkg_send_message');
@@ -636,8 +637,8 @@ describe('DkgNodePlugin', () => {
     expect(toolNames).not.toContain('dkg_paranet_create');
     // memory_search added by this feature branch (W2 — agent-callable recall button).
     expect(toolNames).toContain('memory_search');
-    // 28 from main (originals + assertion/subgraph/SWM/CG-registration tools) + 1 memory_search = 29
-    expect(registeredTools.length).toBe(29);
+    // 28 from main (originals + assertion/subgraph/SWM/CG-registration tools) + dkg_share + 1 memory_search = 30
+    expect(registeredTools.length).toBe(30);
   });
 
   it('new dkg_assertion_* and dkg_sub_graph_* tools have the expected schema shape', () => {
@@ -683,6 +684,13 @@ describe('DkgNodePlugin', () => {
     expectRequired('dkg_sub_graph_create', ['context_graph_id', 'sub_graph_name']);
     expectRequired('dkg_sub_graph_list', ['context_graph_id']);
     expectRequired('dkg_shared_memory_publish', ['context_graph_id']);
+    expectRequired('dkg_share', ['context_graph_id', 'content']);
+
+    const shareProps = byName.get('dkg_share')!.parameters.properties;
+    expect(shareProps).toHaveProperty('sub_graph_name');
+    expect(shareProps.sub_graph_name.type).toBe('string');
+    expect(shareProps).not.toHaveProperty('context_graph');
+    expect(shareProps).not.toHaveProperty('paranet_id');
 
     // dkg_shared_memory_publish must declare `sub_graph_name` so agents that
     // create/write/promote into a sub-graph can publish the promoted data
@@ -1113,6 +1121,116 @@ describe('DkgNodePlugin', () => {
       expect(parsed.pathname).toBe('/api/sub-graph/list');
       expect(parsed.searchParams.get('contextGraphId')).toBe('ctx');
       expect(init.body).toBeUndefined();
+    });
+
+    it('dkg_share writes content to team-visible SWM and returns V10-shaped JSON', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({
+        shareOperationId: 'op-1',
+        workspaceOperationId: 'legacy-op-1',
+        contextGraphId: 'ctx',
+        paranetId: 'ctx',
+        graph: 'did:dkg:context-graph:ctx/shared-memory/sub/protocols',
+        triplesWritten: 1,
+      });
+
+      const result = await byName.get('dkg_share')!.execute('tc', {
+        context_graph_id: 'ctx',
+        content: 'Alpha\nBeta',
+        sub_graph_name: 'protocols',
+      });
+
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe('http://localhost:9200/api/shared-memory/write');
+      expect(init.method).toBe('POST');
+      const body = JSON.parse(init.body as string);
+      expect(body).toEqual({
+        contextGraphId: 'ctx',
+        quads: [
+          {
+            subject: expect.stringMatching(/^urn:openclaw:dkg-share:[0-9a-f-]+$/),
+            predicate: 'urn:openclaw:dkg-share:content',
+            object: '"Alpha\\nBeta"',
+          },
+        ],
+        localOnly: false,
+        subGraphName: 'protocols',
+      });
+      expect(body).not.toHaveProperty('context_graph');
+      expect(body).not.toHaveProperty('paranetId');
+
+      const shaped = JSON.parse(result.content[0].text);
+      expect(shaped).toEqual({
+        shareOperationId: 'op-1',
+        contextGraphId: 'ctx',
+        graph: 'did:dkg:context-graph:ctx/shared-memory/sub/protocols',
+        triplesWritten: 1,
+      });
+      expect(shaped).not.toHaveProperty('workspaceOperationId');
+      expect(shaped).not.toHaveProperty('paranetId');
+      expect(result.details).toEqual(shaped);
+    });
+
+    it('dkg_share validates required inputs and rejects legacy aliases locally', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({});
+
+      const missingContext = await byName.get('dkg_share')!.execute('tc', {
+        content: 'alpha',
+      });
+      expect(missingContext.content[0].text).toContain('context_graph_id');
+
+      const missingContent = await byName.get('dkg_share')!.execute('tc', {
+        context_graph_id: 'ctx',
+        content: '   ',
+      });
+      expect(missingContent.content[0].text).toContain('content');
+
+      const legacyContext = await byName.get('dkg_share')!.execute('tc', {
+        context_graph_id: 'ctx',
+        context_graph: 'legacy',
+        content: 'alpha',
+      });
+      expect(legacyContext.content[0].text).toContain('context_graph');
+      expect(legacyContext.content[0].text).toContain('context_graph_id');
+
+      const legacyParanet = await byName.get('dkg_share')!.execute('tc', {
+        context_graph_id: 'ctx',
+        paranet_id: 'legacy',
+        content: 'alpha',
+      });
+      expect(legacyParanet.content[0].text).toContain('paranet_id');
+      expect(legacyParanet.content[0].text).toContain('context_graph_id');
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('dkg_share shapes daemon errors instead of throwing', async () => {
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify({ error: 'share failed' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const plugin = new DkgNodePlugin({ daemonUrl: 'http://localhost:9200' });
+      const tools: OpenClawTool[] = [];
+      plugin.register({
+        config: {},
+        registerTool: (t) => tools.push(t),
+        registerHook: () => {},
+        on: () => {},
+        logger: {},
+      });
+      const byName = new Map(tools.map((t) => [t.name, t] as const));
+
+      const result = await byName.get('dkg_share')!.execute('tc', {
+        context_graph_id: 'ctx',
+        content: 'alpha',
+      });
+      const shaped = JSON.parse(result.content[0].text);
+      expect(shaped.error).toContain('/api/shared-memory/write');
+      expect(shaped.error).toContain('share failed');
+      expect(result.details).toEqual(shaped);
     });
 
     it('dkg_shared_memory_publish forwards snake_case → camelCase body with selection="all" when omitted', async () => {
@@ -1671,7 +1789,7 @@ describe('DkgNodePlugin', () => {
   // needs it.
   // ---------------------------------------------------------------------------
 
-  it('dkg_subscribe / dkg_publish / dkg_query do not advertise or honor the v9 paranet_id alias', () => {
+  it('dkg_subscribe / dkg_publish / dkg_share / dkg_query do not advertise or honor the v9 paranet_id alias', () => {
     const plugin = new DkgNodePlugin();
     const tools: OpenClawTool[] = [];
     plugin.register({
@@ -1682,7 +1800,7 @@ describe('DkgNodePlugin', () => {
       logger: {},
     });
     const byName = new Map(tools.map((t) => [t.name, t] as const));
-    for (const name of ['dkg_subscribe', 'dkg_publish', 'dkg_query'] as const) {
+    for (const name of ['dkg_subscribe', 'dkg_publish', 'dkg_share', 'dkg_query'] as const) {
       const props = byName.get(name)!.parameters.properties;
       expect(props).not.toHaveProperty('paranet_id');
     }

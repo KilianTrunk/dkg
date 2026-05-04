@@ -44,6 +44,7 @@ import type {
 } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import {
   canonicalPathForCompare,
   defaultStateDirForWorkspace,
@@ -2631,6 +2632,22 @@ export class DkgNodePlugin {
         execute: async (_toolCallId, args) => this.handlePublish(args),
       },
       {
+        name: 'dkg_share',
+        description:
+          'Direct Shared Working Memory helper: write a concise team-visible note to SWM without staging a ' +
+          'Working Memory assertion. Use the assertion create/write/promote flow for durable or canonical work.',
+        parameters: {
+          type: 'object',
+          properties: {
+            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            content: { type: 'string', description: 'Concise knowledge to share with the team.' },
+            sub_graph_name: { type: 'string', description: 'Optional sub-graph scope for the SWM write.' },
+          },
+          required: ['context_graph_id', 'content'],
+        },
+        execute: async (_toolCallId, args) => this.handleShare(args),
+      },
+      {
         name: 'dkg_query',
         description:
           'Read-only SPARQL query against the local triple store. Pass `view` to pick which memory ' +
@@ -3261,6 +3278,41 @@ export class DkgNodePlugin {
 
       const result = await this.client.publish(contextGraphId, quads);
       return this.json({ kcId: result.kcId, kaCount: result.kas?.length ?? 0, quadsPublished: quads.length });
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      if (args.context_graph !== undefined) {
+        return this.error('"context_graph" is not a supported parameter on dkg_share. Use "context_graph_id".');
+      }
+      if (args.paranet_id !== undefined || args.paranetId !== undefined) {
+        return this.error('"paranet_id" is not a supported parameter on dkg_share. Use "context_graph_id".');
+      }
+      const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
+      const content = typeof args.content === 'string' ? args.content.trim() : '';
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      if (!content) return this.error('"content" is required.');
+
+      const quads = [{
+        subject: `urn:openclaw:dkg-share:${randomUUID()}`,
+        predicate: 'urn:openclaw:dkg-share:content',
+        object: `"${escapeRdfLiteral(content)}"`,
+      }];
+      const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
+      const result = await this.client.share(contextGraphId, quads, {
+        localOnly: false,
+        subGraphName,
+      });
+      const shared = result as Record<string, unknown>;
+      return this.json({
+        shareOperationId: shared.shareOperationId,
+        contextGraphId: shared.contextGraphId ?? contextGraphId,
+        graph: shared.graph,
+        triplesWritten: shared.triplesWritten ?? quads.length,
+      });
     } catch (err: any) {
       return this.daemonError(err);
     }

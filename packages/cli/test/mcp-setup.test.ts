@@ -183,16 +183,79 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(deps.startDaemon).not.toHaveBeenCalled();
   });
 
-  it('honours --no-start: skips daemon start AND faucet (faucet depends on running daemon)', async () => {
+  it('honours --no-start: skips daemon start; faucet path is gated on daemon reachability (F14)', async () => {
+    // Pre-F14, --no-start was conflated with "skip funding" via the
+    // outer `shouldFund && shouldStart` guard. Post-F14 the funding
+    // decision is decoupled: if the daemon is reachable on
+    // effectivePort, funding proceeds regardless of which invocation
+    // started the daemon. This test pins the daemon-not-reachable
+    // path: --no-start with no running daemon → faucet skipped via
+    // the new explicit "daemon not reachable on port X" log line
+    // (NOT the silent omission that pre-F14 produced).
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
     const deps = makeDeps();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new Error('connection refused');
+    });
 
     await mcpSetupAction({ start: false, verify: false }, deps);
 
     expect(deps.startDaemon).not.toHaveBeenCalled();
     expect(deps.requestFaucetFunding).not.toHaveBeenCalled();
-    // But registration still proceeds.
+    // Registration still proceeds — orthogonal axis.
     expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(true);
+    // And the new explicit log line fired (replacing the pre-F14
+    // silent omission).
+    const logged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    expect(logged).toMatch(/Skipping wallet funding \(daemon not reachable on port 9200\)/);
+
+    fetchSpy.mockRestore();
+  });
+
+  // F14 (qa-review-round-2): the canonical decoupled-flow test.
+  // --no-start with a daemon already running (e.g. user re-runs to
+  // retry funding after the faucet was down on first run) MUST
+  // proceed with funding — pre-F14 it was silently skipped because
+  // the outer guard required `shouldStart === true`.
+  it('F14: --no-start with daemon already reachable → funding proceeds', async () => {
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      // Daemon is up and healthy; probe returns ok.
+      return new Response('{}', { status: 200 }) as any;
+    });
+
+    await mcpSetupAction({ start: false, verify: false }, deps);
+
+    expect(deps.startDaemon).not.toHaveBeenCalled();
+    // Funding MUST proceed — daemon is reachable, --no-fund was not
+    // supplied. This is the bug F14 fixes.
+    expect(deps.requestFaucetFunding).toHaveBeenCalledTimes(1);
+
+    fetchSpy.mockRestore();
+  });
+
+  it('F14: --no-fund + --no-start → explicit-skip log (not the unreachable log)', async () => {
+    // The --no-fund explicit-skip path takes precedence over the
+    // daemon-reachability probe — no probe should fire when funding
+    // is explicitly opted out, and the existing
+    // "Skipping wallet funding (--no-fund)" log line stays intact.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new Error('should not be called when --no-fund is set');
+    });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(deps.requestFaucetFunding).not.toHaveBeenCalled();
+    const logged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    expect(logged).toMatch(/Skipping wallet funding \(--no-fund\)/);
+    // The unreachable-path log line MUST NOT fire when --no-fund
+    // short-circuits the funding step.
+    expect(logged).not.toMatch(/daemon not reachable/);
+
+    fetchSpy.mockRestore();
   });
 
   it('honours --no-fund: skips the faucet step but starts daemon + registers', async () => {

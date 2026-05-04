@@ -353,37 +353,66 @@ export async function mcpSetupAction(
   // daemon) with the same 5×1s retry openclaw-setup uses. Faucet
   // failures log a manual `curl` block and continue — funding is
   // non-fatal for setup.
-  if (shouldFund && !dryRun && shouldStart) {
+  //
+  // F14: the funding decision is decoupled from `shouldStart`. The
+  // pre-fix outer guard `if (shouldFund && !dryRun && shouldStart)`
+  // silently skipped funding whenever `--no-start` was supplied,
+  // even when the daemon was already running from a prior invocation
+  // and a re-run-to-retry-funding was the user's actual goal.
+  // Post-fix flow:
+  //   1. Honour `--no-fund` (explicit opt-out, unchanged).
+  //   2. Honour `--dry-run` (no network calls).
+  //   3. Probe daemon reachability at `/api/status` on
+  //      `effectivePort`. If unreachable, log explicit
+  //      "skipping wallet funding (daemon not reachable on port X)"
+  //      with the reason — replaces the silent omission. If
+  //      reachable, proceed with funding regardless of which
+  //      invocation started the daemon.
+  if (!shouldFund) {
+    console.log('[setup] Skipping wallet funding (--no-fund)');
+  } else if (dryRun) {
+    console.log('[setup] [dry-run] Would attempt wallet funding');
+  } else {
+    let daemonReachable = false;
     try {
-      const network = deps.loadNetworkConfig();
-      const faucetUrl = network.faucet?.url;
-      const faucetMode = network.faucet?.mode ?? 'testnet';
-      if (!faucetUrl) {
-        console.log('[setup] No faucet URL configured for this network; skipping wallet funding.');
-      } else {
-        const wallets = await deps.readWalletsWithRetry();
-        if (wallets.length === 0) {
-          console.log('[setup] No wallets to fund yet (daemon may not have flushed wallets.json).');
+      const probe = await fetch(`http://127.0.0.1:${effectivePort}/api/status`);
+      daemonReachable = probe.ok;
+    } catch { /* not reachable */ }
+
+    if (!daemonReachable) {
+      console.log(
+        `[setup] Skipping wallet funding (daemon not reachable on port ${effectivePort})`,
+      );
+    } else {
+      try {
+        const network = deps.loadNetworkConfig();
+        const faucetUrl = network.faucet?.url;
+        const faucetMode = network.faucet?.mode ?? 'testnet';
+        if (!faucetUrl) {
+          console.log('[setup] No faucet URL configured for this network; skipping wallet funding.');
         } else {
-          try {
-            const result = await deps.requestFaucetFunding(faucetUrl, faucetMode, wallets, effectiveAgentName);
-            if (result?.success === false) {
-              console.warn('[setup] Faucet returned failure; emitting manual instructions.');
+          const wallets = await deps.readWalletsWithRetry();
+          if (wallets.length === 0) {
+            console.log('[setup] No wallets to fund yet (daemon may not have flushed wallets.json).');
+          } else {
+            try {
+              const result = await deps.requestFaucetFunding(faucetUrl, faucetMode, wallets, effectiveAgentName);
+              if (result?.success === false) {
+                console.warn('[setup] Faucet returned failure; emitting manual instructions.');
+                deps.logManualFundingInstructions(wallets, faucetUrl, faucetMode);
+              } else {
+                console.log(`[setup] Funded ${wallets.length} wallet(s) via testnet faucet.`);
+              }
+            } catch (err: any) {
+              console.warn(`[setup] Faucet call failed (${err?.message ?? err}); emitting manual instructions.`);
               deps.logManualFundingInstructions(wallets, faucetUrl, faucetMode);
-            } else {
-              console.log(`[setup] Funded ${wallets.length} wallet(s) via testnet faucet.`);
             }
-          } catch (err: any) {
-            console.warn(`[setup] Faucet call failed (${err?.message ?? err}); emitting manual instructions.`);
-            deps.logManualFundingInstructions(wallets, faucetUrl, faucetMode);
           }
         }
+      } catch (err: any) {
+        console.warn(`[setup] Faucet step skipped: ${err?.message ?? err}`);
       }
-    } catch (err: any) {
-      console.warn(`[setup] Faucet step skipped: ${err?.message ?? err}`);
     }
-  } else if (!shouldFund) {
-    console.log('[setup] Skipping wallet funding (--no-fund)');
   }
 
   // ── Step 4: client detection + classification ─────────────────────

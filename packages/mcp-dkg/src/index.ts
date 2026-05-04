@@ -16,9 +16,6 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { loadConfig, describeConfig } from './config.js';
 import { DkgClient } from './client.js';
 import { registerReadTools } from './tools.js';
-import { registerWriteTools } from './tools/writes.js';
-import { registerAnnotationTools } from './tools/annotations.js';
-import { registerReviewTools } from './tools/review.js';
 import { registerAssertionTools } from './tools/assertions.js';
 import { registerMemorySearchTool } from './tools/memory-search.js';
 import { runCli, isKnownCliSubcommand } from './cli/index.js';
@@ -53,9 +50,6 @@ export async function main(argv: string[] = process.argv): Promise<void> {
   const server = new McpServer({ name: 'dkg', version: VERSION });
 
   registerReadTools(server, client, config);
-  registerWriteTools(server, client, config);
-  registerAnnotationTools(server, client, config);
-  registerReviewTools(server, client, config);
   registerAssertionTools(server, client, config);
   registerMemorySearchTool(server, client, config);
 

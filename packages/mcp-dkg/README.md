@@ -6,12 +6,13 @@ any other MCP-aware coding assistant.
 
 Once installed, an agent can do things like:
 
-- `dkg_list_projects` — see every context graph this node participates in
-- `dkg_list_activity` — catch up on the last 25 decisions / tasks / PRs, who authored each
-- `dkg_search "tree-sitter"` — full-text search across labels + body text
-- `dkg_get_entity urn:dkg:decision:…` — pull a decision's full provenance + 1-hop neighbours
-- `dkg_get_chat --keyword "hook"` — ask "what was my teammate's assistant discussing about hooks?"
-- `dkg_sparql "SELECT ?d WHERE { ?d a decisions:Decision }"` — drop down to raw SPARQL when the canned tools aren't enough
+- `dkg_list_context_graphs` — see every context graph (called "projects" in the DKG node UI) this node participates in
+- `dkg_list_activity` — catch up on the last 25 entities authored across the graph, with attribution
+- `dkg_assertion_create` + `dkg_assertion_write` — open a Working Memory assertion and append RDF quads to it
+- `dkg_assertion_promote` — promote a Working Memory assertion to Shared Working Memory so teammates see it
+- `dkg_memory_search "tree-sitter"` — trust-weighted free-text recall across WM/SWM/VM in the agent-context graph (and an optional project graph)
+- `dkg_get_entity urn:dkg:…` — pull an entity's full triples + 1-hop neighbours
+- `dkg_query "SELECT ?d WHERE { ?d a decisions:Decision }"` — drop down to raw SPARQL when the canned tools aren't enough
 
 ## Install
 
@@ -102,7 +103,7 @@ Inside a Claude Code session you can then do:
 
 ```
 /mcp dkg_list_activity
-/mcp dkg_search "branarakic tree-sitter"
+/mcp dkg_memory_search "branarakic tree-sitter"
 ```
 
 ## Capture hook
@@ -172,35 +173,35 @@ delete at any time.
 
 ## Tools at a glance
 
-| Tool                 | What it does                                                             |
-| -------------------- | ------------------------------------------------------------------------ |
-| `dkg_list_projects`  | List every context graph this node knows about                           |
-| `dkg_list_subgraphs` | List the sub-graphs in one project with entity counts                    |
-| `dkg_sparql`         | Execute any SPARQL (prefixes auto-injected) scoped by layer (wm/swm/vm)  |
-| `dkg_get_entity`     | Entity detail: all outgoing triples + inbound 1-hop neighbours           |
-| `dkg_search`         | Keyword search across labels + body predicates                           |
-| `dkg_list_activity`  | Recent activity feed, newest first, with agent attribution               |
-| `dkg_get_agent`      | Agent profile card + per-type authored counts                            |
-| `dkg_get_chat`       | Captured chat turns, filterable by session / agent / keyword / time      |
+| Tool                       | What it does                                                                       |
+| -------------------------- | ---------------------------------------------------------------------------------- |
+| `dkg_list_context_graphs`  | List every context graph (called "projects" in the DKG node UI) this node knows   |
+| `dkg_sub_graph_list`       | List the sub-graphs in one context graph with entity counts                        |
+| `dkg_query`                | Execute any SPARQL (prefixes auto-injected) scoped by `view` (WM/SWM/VM) ± SWM     |
+| `dkg_get_entity`           | Entity detail: all outgoing triples + inbound 1-hop neighbours                     |
+| `dkg_list_activity`        | Recent activity feed, newest first, with agent attribution                         |
+| `dkg_get_agent`            | Agent profile card + per-type authored counts                                      |
+| `dkg_assertion_create`     | Step 1 of the canonical write flow: create an empty WM assertion (idempotent)      |
+| `dkg_assertion_write`      | Step 2: append RDF quads into an existing WM assertion                             |
+| `dkg_assertion_promote`    | Step 3: promote a WM assertion (or specific roots) into Shared Working Memory      |
+| `dkg_assertion_discard`    | Discard a WM assertion without promoting (rollback / replace-then-write pattern)   |
+| `dkg_assertion_query`      | Dump every quad in a WM assertion — closed-loop introspection for the round-trip  |
+| `dkg_memory_search`        | Trust-weighted free-text recall across WM/SWM/VM, agent-context + optional project |
 
-All read-only. Write tools (propose decision, add task, comment, etc.)
-will arrive in a follow-up release that coincides with the R/W
-attribution PR landing.
+## View semantics
 
-## Layer semantics
+The `view` argument (where supported) scopes the query to one of the
+three DKG memory tiers:
 
-The `layer` argument (where supported) scopes the query to one of the
-three DKG memory layers:
+- `working-memory` — private to this node's agents (default)
+- `shared-working-memory` — gossiped to every participant on the CG
+- `verified-memory` — on-chain anchored; responses include UAL +
+  publisher info
 
-- `wm` — working memory (local, private to this node's agents)
-- `swm` — shared working memory (gossiped to every participant on the CG)
-- `union` — wm + swm combined (default for most tools; matches the
-  Node UI's default reader)
-- `vm` — verified / on-chain memory (hits `view: "verified-memory"`
-  on the daemon, whose responses include UAL + publisher info)
-
-Chat tools default to `union` so you see everything your own agent
-wrote plus everything your teammates shared.
+A separate `includeSharedMemory: boolean` axis (where supported) layers
+SWM on top of the requested view; `view: "working-memory" +
+includeSharedMemory: true` matches what the Node UI's default reader
+shows.
 
 ## Troubleshooting
 

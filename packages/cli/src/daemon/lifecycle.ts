@@ -1624,6 +1624,7 @@ export async function runDaemonInner(
         res,
         agent,
         publisherControl,
+        publisherRuntime,
         config,
         startedAt,
         dashDb,

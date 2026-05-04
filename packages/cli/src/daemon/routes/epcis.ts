@@ -335,6 +335,7 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
     res,
     agent,
     publisherControl,
+    publisherRuntime,
     config,
     startedAt,
     dashDb,
@@ -433,6 +434,12 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 503, {
         error: "PublisherDisabled",
         message: "Async EPCIS capture requires publisher.enabled=true",
+      });
+    }
+    if (!publisherRuntime || publisherRuntime.walletIds.length === 0) {
+      return jsonResponse(res, 503, {
+        error: "PublisherUnavailable",
+        message: "Async EPCIS capture requires the publisher runtime to be running with at least one configured publisher wallet",
       });
     }
     const body = await readBody(req);

@@ -25,8 +25,14 @@ import { handleHermesRoutes } from '../src/daemon/routes/hermes.js';
 import { handleLocalAgentsRoutes } from '../src/daemon/routes/local-agents.js';
 
 const disconnectHermesProfileMock = vi.hoisted(() => vi.fn());
+const resolveHermesProfileMock = vi.hoisted(() => vi.fn(() => ({
+  profileName: undefined,
+  hermesHome: 'C:\\Hermes\\default',
+  memoryMode: 'provider',
+})));
 vi.mock('@origintrail-official/dkg-adapter-hermes', () => ({
   disconnectHermesProfile: disconnectHermesProfileMock,
+  resolveHermesProfile: resolveHermesProfileMock,
 }));
 
 function makeConfig(overrides: Partial<DkgConfig> = {}): DkgConfig {
@@ -118,6 +124,12 @@ function makeHermesRouteContext(
 afterEach(() => {
   vi.unstubAllGlobals();
   disconnectHermesProfileMock.mockReset();
+  resolveHermesProfileMock.mockReset();
+  resolveHermesProfileMock.mockReturnValue({
+    profileName: undefined,
+    hermesHome: 'C:\\Hermes\\default',
+    memoryMode: 'provider',
+  });
 });
 
 describe('Hermes channel helpers', () => {
@@ -161,7 +173,7 @@ describe('Hermes channel helpers', () => {
     ]);
   });
 
-  it('prefers a stored Hermes transport healthUrl over derived health endpoints', () => {
+  it('prefers a stored bridge healthUrl over derived bridge health endpoints', () => {
     expect(getHermesChannelTargets(makeConfig({
       localAgentIntegrations: {
         hermes: {
@@ -181,6 +193,26 @@ describe('Hermes channel helpers', () => {
         healthUrl: 'http://127.0.0.1:9300/custom-health',
       },
     ]);
+  });
+
+  it('rejects gateway healthUrl overrides outside the Hermes gateway API base', () => {
+    expect(getHermesChannelTargets(makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: {
+            kind: 'hermes-channel',
+            gatewayUrl: 'https://hermes.example.com',
+            healthUrl: 'https://hermes.example.com/healthz',
+          },
+        },
+      },
+    }))).toEqual([{
+      name: 'gateway',
+      inboundUrl: 'https://hermes.example.com/api/hermes-channel/send',
+      streamUrl: 'https://hermes.example.com/api/hermes-channel/stream',
+      healthUrl: 'https://hermes.example.com/api/hermes-channel/health',
+    }]);
 
     expect(getHermesChannelTargets(makeConfig({
       localAgentIntegrations: {
@@ -189,11 +221,11 @@ describe('Hermes channel helpers', () => {
           transport: {
             kind: 'hermes-channel',
             gatewayUrl: 'https://hermes.example.com',
-            healthUrl: 'https://hermes.example.com/custom-health',
+            healthUrl: 'https://hermes.example.com/api/hermes-channel/custom-health',
           },
         },
       },
-    }))[0]?.healthUrl).toBe('https://hermes.example.com/custom-health');
+    }))[0]?.healthUrl).toBe('https://hermes.example.com/api/hermes-channel/custom-health');
   });
 
   it('does not apply a gateway healthUrl override to the bridge target', async () => {
@@ -205,7 +237,7 @@ describe('Hermes channel helpers', () => {
             kind: 'hermes-channel',
             bridgeUrl: 'http://127.0.0.1:9444',
             gatewayUrl: 'https://hermes.example.com',
-            healthUrl: 'https://hermes.example.com/custom-health',
+            healthUrl: 'https://hermes.example.com/api/hermes-channel/custom-health',
           },
         },
       },
@@ -222,7 +254,7 @@ describe('Hermes channel helpers', () => {
         name: 'gateway',
         inboundUrl: 'https://hermes.example.com/api/hermes-channel/send',
         streamUrl: 'https://hermes.example.com/api/hermes-channel/stream',
-        healthUrl: 'https://hermes.example.com/custom-health',
+        healthUrl: 'https://hermes.example.com/api/hermes-channel/custom-health',
       },
     ]);
 
@@ -241,7 +273,7 @@ describe('Hermes channel helpers', () => {
     expect(report).toMatchObject({ ok: true, target: 'gateway' });
     expect(urls).toEqual([
       'http://127.0.0.1:9444/health',
-      'https://hermes.example.com/custom-health',
+      'https://hermes.example.com/api/hermes-channel/custom-health',
     ]);
   });
 
@@ -476,6 +508,34 @@ describe('Hermes local-agent registry lifecycle', () => {
     expect(result.integration.transport.kind).toBe('hermes-channel');
     expect(result.integration.capabilities.localChat).toBe(true);
     expect(result.integration.capabilities.chatAttachments).toBe(true);
+    expect(result.integration.metadata.hermesHome).toBe('C:\\Hermes\\default');
+    expect(result.integration.metadata.memoryMode).toBe('provider');
+  });
+
+  it('preserves explicit Hermes profile metadata from UI connect requests', async () => {
+    const config = makeConfig();
+    const result = await connectLocalAgentIntegrationFromUi(
+      config,
+      {
+        id: 'hermes',
+        metadata: {
+          source: 'node-ui',
+          profileName: 'research',
+          hermesHome: 'C:\\Hermes\\research',
+        },
+      },
+      'bridge-token',
+      {
+        probeHermesHealth: async () => ({ ok: true, target: 'bridge' }),
+      },
+    );
+
+    expect(resolveHermesProfileMock).not.toHaveBeenCalled();
+    expect(result.integration.metadata).toMatchObject({
+      source: 'node-ui',
+      profileName: 'research',
+      hermesHome: 'C:\\Hermes\\research',
+    });
   });
 
   it('marks Hermes degraded when UI connect cannot reach bridge health', async () => {
@@ -539,6 +599,34 @@ describe('Hermes local-agent registry lifecycle', () => {
 
     expect(integration.runtime.status).toBe('ready');
     expect(integration.transport.bridgeUrl).toBe('http://127.0.0.1:9444');
+    expect(integration.transport.gatewayUrl).toBe('https://hermes.example.com');
+    expect(integration.transport.healthUrl).toBeUndefined();
+  });
+
+  it('refresh drops same-origin gateway healthUrl values outside the Hermes gateway API base', async () => {
+    const urls: string[] = [];
+    const config = makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: {
+            kind: 'hermes-channel',
+            gatewayUrl: 'https://hermes.example.com',
+            healthUrl: 'https://hermes.example.com/healthz',
+          },
+          runtime: { status: 'degraded', ready: false },
+        },
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }));
+
+    const integration = await refreshLocalAgentIntegrationFromUi(config, 'hermes', 'bridge-token');
+
+    expect(urls).toEqual(['https://hermes.example.com/api/hermes-channel/health']);
+    expect(integration.runtime.status).toBe('ready');
     expect(integration.transport.gatewayUrl).toBe('https://hermes.example.com');
     expect(integration.transport.healthUrl).toBeUndefined();
   });
@@ -656,7 +744,7 @@ describe('Hermes local-agent registry lifecycle', () => {
     expect(config.localAgentIntegrations?.hermes?.enabled).toBe(false);
   });
 
-  it('disables Hermes chat and records an error when UI reverse setup fails', async () => {
+  it('keeps Hermes chat attached and records an error when UI reverse setup fails', async () => {
     const previousDkgHome = process.env.DKG_HOME;
     const dkgHome = mkdtempSync(join(tmpdir(), 'dkg-home-'));
     process.env.DKG_HOME = dkgHome;
@@ -696,16 +784,16 @@ describe('Hermes local-agent registry lifecycle', () => {
 
     const body = JSON.parse(res.body);
     expect(res.statusCode).toBe(200);
-    expect(body.integration.enabled).toBe(false);
+    expect(body.integration.enabled).toBe(true);
     expect(body.integration.runtime.status).toBe('error');
     expect(body.integration.runtime.ready).toBe(false);
     expect(body.integration.runtime.lastError).toContain('Hermes disconnect failed: profile locked');
-    expect(body.integration.metadata.userDisabled).toBe(true);
-    expect(config.localAgentIntegrations?.hermes?.enabled).toBe(false);
-    expect(getHermesChannelTargets(config)).toEqual([]);
+    expect(body.integration.metadata.userDisabled).toBeUndefined();
+    expect(config.localAgentIntegrations?.hermes?.enabled).toBe(true);
+    expect(getHermesChannelTargets(config)).not.toEqual([]);
   });
 
-  it('disables Hermes chat when UI reverse setup cannot infer a profile', async () => {
+  it('keeps Hermes chat attached when UI reverse setup cannot infer a profile', async () => {
     const previousDkgHome = process.env.DKG_HOME;
     const dkgHome = mkdtempSync(join(tmpdir(), 'dkg-home-'));
     process.env.DKG_HOME = dkgHome;
@@ -741,13 +829,13 @@ describe('Hermes local-agent registry lifecycle', () => {
     const body = JSON.parse(res.body);
     expect(res.statusCode).toBe(200);
     expect(disconnectHermesProfileMock).not.toHaveBeenCalled();
-    expect(body.integration.enabled).toBe(false);
+    expect(body.integration.enabled).toBe(true);
     expect(body.integration.runtime.status).toBe('error');
     expect(body.integration.runtime.ready).toBe(false);
     expect(body.integration.runtime.lastError).toContain('Hermes profile metadata is missing');
-    expect(body.integration.metadata.userDisabled).toBe(true);
-    expect(config.localAgentIntegrations?.hermes?.enabled).toBe(false);
-    expect(getHermesChannelTargets(config)).toEqual([]);
+    expect(body.integration.metadata.userDisabled).toBeUndefined();
+    expect(config.localAgentIntegrations?.hermes?.enabled).toBe(true);
+    expect(getHermesChannelTargets(config)).not.toEqual([]);
   });
 
   it('Hermes definition includes manifest, transport, and local chat capabilities', () => {

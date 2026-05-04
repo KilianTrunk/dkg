@@ -165,11 +165,8 @@ export function getHermesChannelTargets(config: DkgConfig): HermesChannelTarget[
     : undefined;
   const explicitHealthIsGateway =
     !!explicitHealthUrl
-    && !!gatewayBase
-    && (
-      urlBelongsToBase(explicitHealthUrl, gatewayBase)
-      || (!!normalizedGatewayBase && urlBelongsToBase(explicitHealthUrl, normalizedGatewayBase))
-    );
+    && !!normalizedGatewayBase
+    && urlBelongsToBase(explicitHealthUrl, normalizedGatewayBase);
   const targets: HermesChannelTarget[] = [];
   const seenInboundUrls = new Set<string>();
 
@@ -197,7 +194,7 @@ export function getHermesChannelTargets(config: DkgConfig): HermesChannelTarget[
       name: 'gateway',
       inboundUrl: `${normalizedGatewayBase}/send`,
       streamUrl: `${normalizedGatewayBase}/stream`,
-      healthUrl: explicitHealthUrl && (explicitHealthIsGateway || !standaloneBridgeBase)
+      healthUrl: explicitHealthUrl && explicitHealthIsGateway
         ? explicitHealthUrl
         : `${normalizedGatewayBase}/health`,
     });
@@ -229,11 +226,13 @@ export function transportPatchFromHermesTarget(
   if (!targetName) return undefined;
   const hermesIntegration = getLocalAgentIntegration(config, 'hermes');
   const existingTransport = hermesIntegration?.transport ?? {};
-  const explicitHealth = existingTransport.healthUrl
-    ? { healthUrl: existingTransport.healthUrl }
-    : {};
   const target = getHermesChannelTargets(config).find((item) => item.name === targetName);
   if (!target) return undefined;
+  const explicitHealth = existingTransport.healthUrl && target.healthUrl === trimTrailingSlashes(existingTransport.healthUrl)
+    ? { healthUrl: existingTransport.healthUrl }
+    : existingTransport.healthUrl
+      ? { healthUrl: undefined }
+      : {};
 
   if (target.name === 'bridge') {
     const bridgeBase = target.inboundUrl.endsWith('/send')

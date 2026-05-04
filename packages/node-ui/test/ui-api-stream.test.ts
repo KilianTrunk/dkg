@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import {
   fetchMemorySessionGraphDelta,
+  sendHermesLocalChat,
   streamHermesLocalChat,
   streamLocalAgentChat,
   streamOpenClawLocalChat,
@@ -143,6 +144,27 @@ describe('ui local-agent stream api', () => {
     expect(res.correlationId).toBe('h1');
     expect(events).toEqual(['text_delta', 'text_delta', 'final']);
     expect(requestLog.some(r => r.url.includes('/api/hermes-channel/stream'))).toBe(true);
+  });
+
+  it('includes Hermes daemon details in send and stream errors', async () => {
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const requestUrl = String(url);
+      const details = requestUrl.includes('/stream')
+        ? 'gateway health does not match /api/hermes-channel'
+        : 'bridge returned 502';
+      return new Response(
+        JSON.stringify({ error: 'Hermes bridge error', details }),
+        { status: 502, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof globalThis.fetch;
+
+    try {
+      await expect(sendHermesLocalChat('hi')).rejects.toThrow('Hermes bridge error: bridge returned 502');
+      await expect(streamHermesLocalChat('hi')).rejects.toThrow('Hermes bridge error: gateway health does not match /api/hermes-channel');
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
   });
 
   it('forwards Hermes profile through the generic local-agent chat transport', async () => {

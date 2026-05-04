@@ -137,7 +137,11 @@ export function normalizeLocalAgentTransport(input: unknown): LocalAgentIntegrat
   if (typeof input.kind === 'string' && input.kind.trim()) transport.kind = input.kind.trim();
   if (typeof input.bridgeUrl === 'string' && input.bridgeUrl.trim()) transport.bridgeUrl = trimTrailingSlashes(input.bridgeUrl.trim());
   if (typeof input.gatewayUrl === 'string' && input.gatewayUrl.trim()) transport.gatewayUrl = trimTrailingSlashes(input.gatewayUrl.trim());
-  if (typeof input.healthUrl === 'string' && input.healthUrl.trim()) transport.healthUrl = trimTrailingSlashes(input.healthUrl.trim());
+  if (Object.prototype.hasOwnProperty.call(input, 'healthUrl')) {
+    transport.healthUrl = typeof input.healthUrl === 'string' && input.healthUrl.trim()
+      ? trimTrailingSlashes(input.healthUrl.trim())
+      : undefined;
+  }
   return Object.keys(transport).length > 0 ? transport : undefined;
 }
 
@@ -415,7 +419,61 @@ export type LocalAgentUiAttachDeps = OpenClawUiAttachDeps & {
     bridgeAuthToken: string | undefined,
     opts?: { timeoutMs?: number },
   ) => Promise<HermesChannelHealthReport>;
+  resolveHermesProfile?: (options?: { profileName?: string; hermesHome?: string }) => {
+    profileName?: string;
+    hermesHome: string;
+    memoryMode?: string;
+  };
 };
+
+async function addHermesProfileMetadataForUiConnect(
+  config: DkgConfig,
+  body: Record<string, unknown>,
+  deps: LocalAgentUiAttachDeps,
+): Promise<Record<string, unknown>> {
+  const metadata = isPlainRecord(body.metadata) ? { ...body.metadata } : {};
+  const topLevelProfileName = typeof body.profileName === 'string' && body.profileName.trim()
+    ? body.profileName.trim()
+    : undefined;
+  const topLevelHermesHome = typeof body.hermesHome === 'string' && body.hermesHome.trim()
+    ? body.hermesHome.trim()
+    : undefined;
+  const existing = getStoredLocalAgentIntegrations(config).hermes;
+  const existingMetadata = isPlainRecord(existing?.metadata) ? existing.metadata : {};
+  const profileName =
+    topLevelProfileName
+    ?? stringMetadataValue(metadata, 'profileName')
+    ?? stringMetadataValue(existingMetadata, 'profileName');
+  const hermesHome =
+    topLevelHermesHome
+    ?? stringMetadataValue(metadata, 'hermesHome')
+    ?? stringMetadataValue(existingMetadata, 'hermesHome');
+
+  if (profileName || hermesHome) {
+    return {
+      ...body,
+      metadata: {
+        ...metadata,
+        ...(profileName ? { profileName } : {}),
+        ...(hermesHome ? { hermesHome } : {}),
+      },
+    };
+  }
+
+  const adapter = deps.resolveHermesProfile
+    ? { resolveHermesProfile: deps.resolveHermesProfile }
+    : await import('@origintrail-official/dkg-adapter-hermes');
+  const profile = adapter.resolveHermesProfile({});
+  return {
+    ...body,
+    metadata: {
+      ...metadata,
+      ...(profile.profileName ? { profileName: profile.profileName } : {}),
+      hermesHome: profile.hermesHome,
+      ...(profile.memoryMode ? { memoryMode: profile.memoryMode } : {}),
+    },
+  };
+}
 
 /**
  * CONTRACT (issue #198): This handler MUST leave ~/.openclaw/openclaw.json in a state
@@ -432,8 +490,11 @@ export async function connectLocalAgentIntegrationFromUi(
   const requestedId = typeof body.id === 'string' ? normalizeIntegrationId(body.id) : '';
   const existingBeforeConnect = requestedId ? getLocalAgentIntegration(config, requestedId) : null;
   const hadStoredTransportBeforeConnect = hasStoredLocalAgentTransportConfig(existingBeforeConnect);
+  const connectBody = requestedId === 'hermes'
+    ? await addHermesProfileMetadataForUiConnect(config, body, deps)
+    : body;
   const requested = connectLocalAgentIntegration(config, {
-    ...body,
+    ...connectBody,
     runtime: {
       status: 'connecting',
       ready: false,

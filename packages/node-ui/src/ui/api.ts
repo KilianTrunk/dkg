@@ -919,7 +919,7 @@ export async function sendHermesLocalChat(
   });
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
-    throw new Error((errBody as { error?: string })?.error ?? `Request failed (${res.status})`);
+    throw new Error(formatLocalAgentError(errBody, `Request failed (${res.status})`));
   }
   return res.json();
 }
@@ -943,7 +943,7 @@ export async function streamHermesLocalChat(
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
-    throw new Error((errBody as { error?: string })?.error ?? `Request failed (${res.status})`);
+    throw new Error(formatLocalAgentError(errBody, `Request failed (${res.status})`));
   }
 
   const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
@@ -1022,6 +1022,20 @@ export async function streamHermesLocalChat(
 
 export const fetchHermesLocalHealth = () =>
   get<LocalAgentHealthResponse>('/api/hermes-channel/health');
+
+function formatLocalAgentError(body: unknown, fallback: string): string {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return fallback;
+  const record = body as Record<string, unknown>;
+  const error = typeof record.error === 'string' && record.error.trim()
+    ? record.error.trim()
+    : fallback;
+  if (record.details === undefined || record.details === null) return error;
+  const details = typeof record.details === 'string'
+    ? record.details.trim()
+    : JSON.stringify(record.details);
+  if (!details || details === error) return error;
+  return `${error}: ${details}`;
+}
 
 interface LocalAgentIntegrationRecord {
   id: string;

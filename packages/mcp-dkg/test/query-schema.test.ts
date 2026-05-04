@@ -157,3 +157,49 @@ describe('dkg_sub_graph_list — wave-2 rename guard', () => {
     expect(server.tools.has('dkg_list_subgraphs')).toBe(false);
   });
 });
+
+// ── Wave-2 #18 drop-sweep ────────────────────────────────────────────
+// Per qa-engineer's verification-plan §0.8 fixture 4: assert that none
+// of the 10 dropped tool names is registered by any tool-bundle. Today
+// nothing admits a regression (the registrations were cleanly removed
+// in #18); this guards against future accidental re-registration during
+// refactors. Exercised against the full surface (read + assertion + memory
+// + setup + health + publish) so a tool re-introduced via *any* bundle
+// trips the assertion.
+describe('Wave-2 #18 drop-sweep — none of the 10 dropped tools is registered', () => {
+  it('asserts every dropped tool is absent across the full registered surface', async () => {
+    // Lazy-import the other tool registrars so this file's top-level
+    // dependency graph stays tight.
+    const { registerAssertionTools } = await import('../src/tools/assertions.js');
+    const { registerMemorySearchTool } = await import('../src/tools/memory-search.js');
+    const { registerSetupTools } = await import('../src/tools/setup.js');
+    const { registerHealthTools } = await import('../src/tools/health.js');
+    const { registerPublishTools } = await import('../src/tools/publish.js');
+
+    const server = new FakeServer();
+    const client = new FakeClient();
+    const config = makeConfig();
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), config);
+    registerAssertionTools(server.asMcpServer(), client.asDkgClient(), config);
+    registerMemorySearchTool(server.asMcpServer(), client.asDkgClient(), config);
+    registerSetupTools(server.asMcpServer(), client.asDkgClient(), config);
+    registerHealthTools(server.asMcpServer(), client.asDkgClient(), config);
+    registerPublishTools(server.asMcpServer(), client.asDkgClient(), config);
+
+    const DROPPED_TOOLS = [
+      'dkg_review_manifest',
+      'dkg_annotate_turn',
+      'dkg_get_ontology',
+      'dkg_get_chat',
+      'dkg_set_session_privacy',
+      'dkg_request_vm_publish',
+      'dkg_search',
+      'dkg_propose_decision',
+      'dkg_add_task',
+      'dkg_comment',
+    ];
+    for (const name of DROPPED_TOOLS) {
+      expect(server.tools.has(name)).toBe(false);
+    }
+  });
+});

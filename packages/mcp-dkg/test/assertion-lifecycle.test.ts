@@ -84,6 +84,33 @@ describe('assertion CRUD quintet — round-trip with @en literal preservation', 
     ).rejects.toThrow();
   });
 
+  // v0.5 §4.16 alignment guard: only `dkg_assertion_create` enforces
+  // /^[a-z0-9-]+$/ — the four read-side tools (`write`, `promote`,
+  // `discard`, `query`) MUST NOT inherit the regex because they need
+  // to operate on assertion names created by other agents whose names
+  // don't conform to the slug shape. Bug-class-most-likely: implementer
+  // copies the regex to all five tools because they look symmetric.
+  it('read-side tools accept non-slug names (regex-scope guard per v0.5 §4.16)', async () => {
+    const richName = 'Bad Name With Spaces';
+    // Each of the four read-side tools must accept the rich name —
+    // schema-layer rejection here is the regression.
+    await expect(
+      server.call('dkg_assertion_write', {
+        name: richName,
+        quads: [{ subject: 'urn:s', predicate: 'urn:p', object: '"v"' }],
+      }),
+    ).resolves.toBeDefined();
+    await expect(
+      server.call('dkg_assertion_promote', { name: richName, entities: ['urn:s'] }),
+    ).resolves.toBeDefined();
+    await expect(
+      server.call('dkg_assertion_discard', { name: richName }),
+    ).resolves.toBeDefined();
+    await expect(
+      server.call('dkg_assertion_query', { name: richName }),
+    ).resolves.toBeDefined();
+  });
+
   it('write requires a non-empty quads array', async () => {
     await server.call('dkg_assertion_create', { name: 'empty' });
     await expect(

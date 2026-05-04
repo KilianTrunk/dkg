@@ -67,18 +67,20 @@ the writer, but do not encrypt GossipSub payload bytes.
 
 ## Quick Start
 
-**Prerequisites:** Node.js 22+, npm 10+
+**Prerequisites:** Node.js 22+, npm 10+. macOS, Linux, and Windows (PowerShell 5.1+ or WSL2) all supported.
 
-### For AI agents
+Pick the on-ramp that matches how you're already working:
 
-> **OpenClaw agents:** Install the DKG CLI and run setup — this installs the node AND wires up the adapter with memory, tools, and Agent Hub:
-> ```bash
-> npm install -g @origintrail-official/dkg
-> dkg openclaw setup
-> ```
-> Then restart the OpenClaw gateway. See the [adapter guide](packages/adapter-openclaw/README.md) for details.
+| You want… | Recipe | More |
+|---|---|---|
+| **DKG V10 as memory for Cursor / Claude Code / Continue / Cline** | [MCP setup](#dkg-v10-as-agent-memory-mcp) | three commands |
+| **DKG V10 wired into an OpenClaw agent** | [OpenClaw setup](#openclaw-adapter) | two commands |
+| **DKG V10 inside an ElizaOS agent** | [ElizaOS adapter](packages/adapter-elizaos/README.md) | adapter README |
+| **DKG V10 inside a Hermes agent** | [Hermes adapter](packages/adapter-hermes/README.md) | adapter README |
+| **A standalone node** to query and publish from the CLI | [Standalone node](#standalone-node) | manual install |
+| **A custom Node.js / TypeScript integration** | [Custom-agent setup](docs/setup/SETUP_CUSTOM.md) | docs |
 
-> **ElizaOS agents:** Use the [`@origintrail-official/dkg-adapter-elizaos`](packages/adapter-elizaos/README.md) adapter. See the [ElizaOS setup guide](docs/setup/SETUP_ELIZAOS.md).
+Every on-ramp installs the same `@origintrail-official/dkg` umbrella package, runs the same daemon (`dkg start`), and exposes the same data via HTTP, SPARQL, and MCP. The recipes below diverge only in what they wire up on top.
 
 > **Hermes agents:** Install the DKG CLI and run Hermes setup, then start the Hermes gateway:
 > ```bash
@@ -87,21 +89,112 @@ the writer, but do not encrypt GossipSub payload bytes.
 > ```
 > `dkg hermes setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and wires the Hermes profile with replace-by-default provider election (use `--preserve-provider` to opt out, `--no-start` / `--no-fund` for advanced flows). See the [adapter guide](packages/adapter-hermes/README.md) for details.
 
-> **Cursor / Claude Code / other MCP clients:** Install the [`@origintrail-official/dkg-mcp`](packages/mcp-dkg/README.md) MCP server to expose your local node as tools for your coding assistant.
+### DKG V10 as agent memory (MCP)
 
-**Other frameworks:** Any agent that can speak HTTP or run shell commands can participate in the DKG — install the node manually (below) and point your agent at the local API.
+Three commands give Cursor, Claude Code, Continue, or Cline a verifiable shared memory layer:
 
-### Manual install (standalone node)
+```bash
+npm install -g @origintrail-official/dkg     # installs CLI + bundled MCP server
+dkg init                                     # one-time: node name, EVM key, auto-fund testnet wallets
+dkg start                                    # background daemon on http://127.0.0.1:9200
+dkg mcp setup                                # register MCP with every detected client
+```
 
-Install the CLI globally and spin up a node:
+`dkg mcp setup` is idempotent and safe to re-run. It detects each MCP-aware client by its config file (`~/.cursor/mcp.json`, `~/.claude.json`) and writes a single canonical entry:
+
+```json
+{
+  "mcpServers": {
+    "dkg": {
+      "command": "dkg",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+```
+
+No tokens or URLs in the JSON — those live in `~/.dkg/config.yaml` and the daemon-written `~/.dkg/auth.token`. If no client config is detected, run `dkg mcp setup --print-only` to emit the JSON for manual paste.
+
+**First-run verification.** Restart your client so it discovers the MCP, then ask it: *"What tools does dkg expose?"* The `tools/list` response must include at least `dkg_assertion_create`, `dkg_assertion_write`, and `dkg_memory_search`. Then trigger the [round-trip](#round-trip-write-then-recall) below to prove the wiring works end to end.
+
+#### Round-trip: write, then recall
+
+The validated path agents follow when "remember this" actually has to mean *cryptographically anchored, queryable, survives the session*:
+
+1. **Install** — `npm install -g @origintrail-official/dkg`
+2. **Initialize** — `dkg init` (auto-funds Base Sepolia wallets via the testnet faucet if reachable)
+3. **Start the daemon** — `dkg start`
+4. **Confirm reachable** — `dkg status` returns a PeerId; `curl -s http://127.0.0.1:9200/health` is `200`
+5. **Wire the MCP** — `dkg mcp setup`, then restart your client
+6. **(no manual CG creation)** — `agent-context` is auto-created on first write by the storage layer; the round-trip below assumes it
+7. **Write** — agent calls `dkg_assertion_create` with `name: "session-2026-05-04"`, then `dkg_assertion_write` with one or more quads. Both tools are idempotent / additive — re-runs are safe.
+8. **Recall** — agent calls `dkg_memory_search` with a keyword from the write. The result includes `contextGraphId`, `layer` (`working-memory`, `shared-working-memory`, or `verified-memory`), and a `trustWeight` per hit; higher-trust layers collapse lower-trust hits for the same entity. The just-written triple comes back from the WM layer.
+9. **(Optional) Promote to SWM** — `dkg_assertion_promote` advances the assertion's lifecycle and gossips it to peers subscribed to the same context graph.
+10. **(Optional) Publish to VM** — `dkg_shared_memory_publish` finalizes Shared Working Memory on-chain (costs TRAC + gas, clears SWM). For a one-shot fresh-quads-to-VM helper, use `dkg_publish` instead — it writes to SWM and publishes in a single call but skips the WM staging area.
+
+That round-trip — write → search → optionally promote → optionally finalize — is the canonical pattern across every framework on this page. The MCP tools, OpenClaw adapter, and ElizaOS provider all hit the same daemon endpoints behind the scenes, so memories cross frameworks freely.
+
+#### Troubleshooting (MCP)
+
+- **`dkg mcp setup` says "no MCP-aware clients detected"** → install Cursor, Claude Code, Continue, or Cline (or run with `--print-only` to copy the JSON yourself).
+- **`dkg mcp` says command not found** → the umbrella CLI isn't on PATH; verify with `which dkg`. `npm i -g @origintrail-official/dkg` does NOT propagate transitive bins, so `dkg-mcp` directly is also unavailable — always go through `dkg mcp serve`.
+- **MCP not visible in client** → restart the client; on Cursor verify `~/.cursor/mcp.json` is syntactically valid; on Claude Code run `claude mcp list`.
+- **HTTP 401 from MCP tools** → token mismatch. `dkg auth show` returns the expected value; confirm it matches `~/.dkg/auth.token`. On CI / containers / proxied environments where `dkg init` can't run, set the env-var fallbacks documented at `packages/mcp-dkg/src/config.ts`: `DKG_API` (daemon URL), `DKG_TOKEN` (bearer), `DKG_PROJECT` (default context graph), `DKG_AGENT_URI`. A stale exported `DKG_PROJECT` from a prior session can silently mis-route writes — unset it if you switch projects.
+- **Daemon unreachable** → `dkg status`; if it errors, `dkg logs` and `cat ~/.dkg/daemon.log`. Stale pid → `cat ~/.dkg/daemon.pid` and kill it, then `dkg start` again.
+- **Port 9200 already in use** → another node is running. `dkg stop` once, or override via `dkg init` and pick a different API port.
+- **WSL2: daemon dies when the terminal closes** → wrap in `tmux` or install as a systemd user service. See the [WSL2 section in JOIN_TESTNET.md](docs/setup/JOIN_TESTNET.md) for the systemd unit file.
+
+### OpenClaw adapter
+
+Two commands:
+
+```bash
+npm install -g @origintrail-official/dkg     # installs CLI + bundled adapter
+dkg openclaw setup                           # configures + starts the daemon, registers the plugin
+```
+
+`dkg openclaw setup` is non-interactive and idempotent. It writes `~/.dkg/config.json`, merges the adapter into `~/.openclaw/openclaw.json` (under `plugins.entries.adapter-openclaw.config` — `daemonUrl`, `memory.enabled`, `channel.enabled`), syncs the canonical DKG node skill into the OpenClaw workspace at `skills/dkg-node/SKILL.md`, and verifies the install. The right-panel "Connect OpenClaw" button in the node UI runs the same in-process flow.
+
+Restart the OpenClaw gateway if it does not auto-reload:
+
+```bash
+openclaw gateway restart
+```
+
+**First-run verification.** A healthy setup satisfies all four:
+
+- `dkg_status` works from the OpenClaw agent
+- The DKG node UI loads at `http://127.0.0.1:9200/ui`
+- The right-side chat surface connects to OpenClaw and a sent message round-trips
+- The conversation survives a UI reload (proves DKG-backed chat persistence)
+
+**Flags.** `--no-fund` (skip faucet), `--no-start` (configure only), `--no-verify` (skip verification), `--dry-run` (preview without writing). Faucet funding is best-effort: a failed call logs a ready-to-paste `curl` block and setup continues. See the [Testnet Funding](#testnet-funding) section below for the full request/response shape.
+
+The full adapter reference — daemon URL config, channel-port overrides, disconnect/reconnect semantics — lives in [`packages/adapter-openclaw/README.md`](packages/adapter-openclaw/README.md).
+
+#### Troubleshooting (OpenClaw)
+
+- **Adapter not visible to gateway** → check `~/.openclaw/openclaw.json` has `plugins.entries.adapter-openclaw` populated; re-run `dkg openclaw setup`.
+- **Faucet failure** → setup logs a `curl` block for manual funding; the node still works for non-on-chain flows (P2P, queries, WM/SWM writes).
+- **Disconnect / Reconnect cycle wiped my custom config** → re-run `dkg openclaw setup --port <N>` after Reconnect. Default-port users see no visible difference across the cycle.
+- **Channel port `9201` already in use** → set `channel.port` manually under `plugins.entries.adapter-openclaw.config` in `~/.openclaw/openclaw.json`.
+
+### Standalone node
+
+Skip the framework wiring — run the daemon directly and use the CLI or HTTP API:
 
 ```bash
 npm install -g @origintrail-official/dkg
-dkg init      # creates ~/.dkg with default config
-dkg start     # starts the node daemon
+dkg init      # creates ~/.dkg/config.yaml (auto-funds wallets on testnet if faucet reachable)
+dkg start     # starts the node daemon on http://127.0.0.1:9200
 ```
 
-Once running, open the dashboard at [http://127.0.0.1:9200/ui](http://127.0.0.1:9200/ui).
+Once running, open the dashboard at [http://127.0.0.1:9200/ui](http://127.0.0.1:9200/ui), or query directly:
+
+```bash
+TOKEN=$(dkg auth show)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9200/api/agents
+```
 
 ---
 
@@ -184,9 +277,11 @@ dkg auth show                            # show the current API auth token
 dkg auth rotate                          # generate a new auth token
 dkg auth status                          # show whether auth is enabled
 
-# Framework adapters
+# Framework adapters & MCP wiring
 dkg openclaw setup                       # install & configure the OpenClaw adapter
 dkg hermes setup                         # install & configure the Hermes adapter
+dkg mcp setup                            # register the MCP server with Cursor / Claude Code / Continue / Cline
+dkg mcp serve                            # run the MCP server on stdio (invoked by the client; not run manually)
 
 # Community integrations (registry: OriginTrail/dkg-integrations)
 dkg integration list [--tier community]  # default tier filter is `verified`+
@@ -226,6 +321,8 @@ Use adapters for OpenClaw, ElizaOS, Hermes, or your own Node.js / TypeScript pro
 
 | Guide | Use it when |
 |---|---|
+| [DKG V10 as agent memory (MCP)](#dkg-v10-as-agent-memory-mcp) | You want Cursor / Claude Code / Continue / Cline to use DKG as memory |
+| [`packages/mcp-dkg/README.md`](packages/mcp-dkg/README.md) | You want the full MCP tool surface and config reference |
 | [Join the Testnet](docs/setup/JOIN_TESTNET.md) | You want a full node setup and first publish/query flow |
 | [OpenClaw Setup](docs/setup/SETUP_OPENCLAW.md) | You want OpenClaw to use DKG as memory/tools |
 | [Hermes Setup](docs/setup/SETUP_HERMES.md) | You want Hermes Agent to use DKG as memory/tools |

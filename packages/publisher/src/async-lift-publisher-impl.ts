@@ -59,6 +59,7 @@ import {
 export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
   private static readonly claimQueues = new Map<string, Promise<void>>();
   private static readonly DEFAULT_RECOVERY_LOOKUP_TIMEOUT_MS = 15 * 60 * 1000;
+  private static readonly DEFAULT_MAX_RETRIES = 10;
 
   private readonly graphUri: string;
   private readonly walletLockGraphUri: string;
@@ -80,7 +81,7 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
   ) {
     this.graphUri = config.graphUri ?? DEFAULT_GRAPH_URI;
     this.walletLockGraphUri = DEFAULT_WALLET_LOCK_GRAPH_URI;
-    this.maxRetries = config.maxRetries ?? 3;
+    this.maxRetries = config.maxRetries ?? TripleStoreAsyncLiftPublisher.DEFAULT_MAX_RETRIES;
     this.recoveryLookupTimeoutMs = config.recoveryLookupTimeoutMs ?? TripleStoreAsyncLiftPublisher.DEFAULT_RECOVERY_LOOKUP_TIMEOUT_MS;
     this.lockLeaseMs = 5 * 60 * 1000;
     this.now = config.now ?? (() => Date.now());

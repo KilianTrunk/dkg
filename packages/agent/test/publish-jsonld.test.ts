@@ -220,6 +220,7 @@ describe('publishJsonLd', () => {
     expect(job?.request.roots).toEqual([root]);
     expect(job?.request.accessPolicy).toBe('allowList');
     expect(job?.request.allowedPeers).toEqual(['peer-a']);
+    expect(job?.retries.maxRetries).toBe(10);
 
     const publicAnchor = await store.query(
       `ASK { GRAPH <did:dkg:context-graph:async-priv-only/_shared_memory> { <${root}> <http://dkg.io/ontology/privateDataAnchor> "true" } }`,

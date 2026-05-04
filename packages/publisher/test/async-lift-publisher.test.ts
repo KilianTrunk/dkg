@@ -22,6 +22,7 @@ import {
   CONTROL_LOCKED_JOB,
   CONTROL_LOCK_EXPIRES_AT,
   CONTROL_LOCK_STATUS,
+  CONTROL_MAX_RETRIES,
   CONTROL_WALLET_ID,
   CONTROL_CONTEXT_GRAPH_ID,
   CONTROL_PAYLOAD,
@@ -133,6 +134,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(job?.request.contextGraphId).toBe('music-social');
     expect(job?.request.swmId).toBe('swm-1');
     expect(job?.request.shareOperationId).toBe('op-1');
+    expect(job?.retries.maxRetries).toBe(10);
   });
 
   it('exposes the renamed shared-memory publisher contract', async () => {
@@ -170,6 +172,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(triples.get(CONTROL_JOB_SLUG)).toBe('"music-social/person-profile/create/op-1/rihana"');
     expect(triples.get(CONTROL_HAS_REQUEST)).toBe(requestSubject(jobId));
     expect(triples.get(CONTROL_ACCEPTED_AT)).toBe('"1001"^^<http://www.w3.org/2001/XMLSchema#integer>');
+    expect(triples.get(CONTROL_MAX_RETRIES)).toBe('"10"^^<http://www.w3.org/2001/XMLSchema#integer>');
     expect(triples.get(CONTROL_PAYLOAD)).toBeDefined();
 
     const requestResult = await store.query(`SELECT ?p ?o WHERE {

@@ -136,43 +136,38 @@ contract Identity is INamed, IVersioned, ContractStatus, IInitializable {
     }
 
     function addOperationalWallets(uint72 identityId, address[] calldata operationalWallets) external onlyContracts {
-        // The loop body is delegated to a private helper so each iteration
-        // runs in its own scope. This keeps the simultaneous local count low
-        // enough for viaIR + solidity-coverage instrumentation to fit within
-        // the EVM stack budget on the same compiler settings used in
-        // production (Solidity 0.8.20 / viaIR / optimizer runs=200).
         IdentityStorage ids = identityStorage;
-        uint256 len = operationalWallets.length;
-        for (uint256 i; i < len; ) {
-            _addOperationalWallet(ids, identityId, operationalWallets[i]);
+
+        bytes32 operationalKey;
+        bytes32 attachedKey;
+
+        for (uint256 i; i < operationalWallets.length; ) {
+            if (operationalWallets[i] == address(0)) {
+                revert IdentityLib.OperationalAddressZero();
+            }
+
+            operationalKey = keccak256(abi.encodePacked(operationalWallets[i]));
+
+            if (operationalKey == bytes32(0)) {
+                revert IdentityLib.KeyIsEmpty();
+            }
+            if (ids.identityIds(operationalKey) != 0) {
+                revert IdentityLib.OperationalKeyTaken(operationalKey);
+            }
+
+            ids.setOperationalKeyIdentityId(operationalKey, identityId);
+
+            (, , attachedKey) = ids.getKey(identityId, operationalKey);
+            if (attachedKey == operationalKey) {
+                revert IdentityLib.KeyAlreadyAttached(operationalKey);
+            }
+
+            ids.addKey(identityId, operationalKey, IdentityLib.OPERATIONAL_KEY, IdentityLib.ECDSA);
+
             unchecked {
                 i++;
             }
         }
-    }
-
-    function _addOperationalWallet(IdentityStorage ids, uint72 identityId, address wallet) private {
-        if (wallet == address(0)) {
-            revert IdentityLib.OperationalAddressZero();
-        }
-
-        bytes32 operationalKey = keccak256(abi.encodePacked(wallet));
-
-        if (operationalKey == bytes32(0)) {
-            revert IdentityLib.KeyIsEmpty();
-        }
-        if (ids.identityIds(operationalKey) != 0) {
-            revert IdentityLib.OperationalKeyTaken(operationalKey);
-        }
-
-        ids.setOperationalKeyIdentityId(operationalKey, identityId);
-
-        (, , bytes32 attachedKey) = ids.getKey(identityId, operationalKey);
-        if (attachedKey == operationalKey) {
-            revert IdentityLib.KeyAlreadyAttached(operationalKey);
-        }
-
-        ids.addKey(identityId, operationalKey, IdentityLib.OPERATIONAL_KEY, IdentityLib.ECDSA);
     }
 
     function _checkAdmin(uint72 identityId) internal view virtual {

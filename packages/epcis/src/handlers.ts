@@ -1,12 +1,7 @@
 import { createValidator } from './validation.js';
 import { buildEpcisQuery } from './query-builder.js';
 import { parseQueryParams, hasValidDateRange, encodePageToken } from './utils.js';
-import type { Publisher, AsyncPublisher, CaptureResult, CaptureAcceptedResult, CaptureOptions, QueryEngine, EPCISQueryDocumentResponse } from './types.js';
-
-export interface CaptureConfig {
-  contextGraphId: string;
-  publisher: Publisher;
-}
+import type { AsyncPublisher, CaptureAcceptedResult, CaptureOptions, QueryEngine, EPCISQueryDocumentResponse } from './types.js';
 
 export interface AsyncCaptureConfig {
   contextGraphId: string;
@@ -183,10 +178,10 @@ export async function handleEventsQuery(
 
 const validator = createValidator();
 
-export async function handleCapture(
+export async function handleCaptureAsync(
   request: CaptureRequest,
-  config: CaptureConfig,
-): Promise<CaptureResult> {
+  config: AsyncCaptureConfig,
+): Promise<CaptureAcceptedResult> {
   const { document, content } = resolveCaptureContent(request.epcisDocument);
   const validation = validator.validate(document);
 
@@ -194,44 +189,11 @@ export async function handleCapture(
     throw new EpcisValidationError(validation.errors!);
   }
 
-  // REVISIT: eventID (EPCIS 2.0 §7.4.1) maps to @id in JSON-LD, giving each event a
-  // named URI as its RDF subject. Without it, blank nodes are auto-assigned uuid: URIs
-  // (like dkg.js v8), so publishing works either way. However, user-provided eventIDs
-  // are preferred because they're deterministic and meaningful for provenance queries.
-  // Consider making eventID mandatory once the EPCIS plugin is stable.
-
   const opts = request.publishOptions
     ? { accessPolicy: request.publishOptions.accessPolicy, allowedPeers: request.publishOptions.allowedPeers }
     : undefined;
 
-  const result = await config.publisher.publish(config.contextGraphId, content, opts);
-
-  return {
-    ual: result.ual,
-    kcId: result.kcId,
-    receivedAt: new Date().toISOString(),
-    eventCount: validation.eventCount!,
-    status: result.status,
-  };
-}
-
-export async function handleCaptureAsync(
-  request: CaptureRequest,
-  config: AsyncCaptureConfig,
-): Promise<CaptureAcceptedResult> {
-  const { document, content, isEnvelope } = resolveCaptureContent(request.epcisDocument);
-  const validation = validator.validate(document);
-
-  if (!validation.valid) {
-    throw new EpcisValidationError(validation.errors!);
-  }
-
-  const opts = request.publishOptions
-    ? { accessPolicy: request.publishOptions.accessPolicy, allowedPeers: request.publishOptions.allowedPeers }
-    : undefined;
-
-  const publishContent = isEnvelope ? content : { public: content };
-  const result = await config.publisher.publishAsync(config.contextGraphId, publishContent, opts);
+  const result = await config.publisher.publishAsync(config.contextGraphId, content, opts);
 
   return {
     captureID: result.captureID,
@@ -241,27 +203,38 @@ export async function handleCaptureAsync(
   };
 }
 
-function resolveCaptureContent(epcisDocument: unknown): { document: unknown; content: unknown; isEnvelope: boolean } {
+function resolveCaptureContent(epcisDocument: unknown): { document: unknown; content: unknown } {
   if (!epcisDocument || typeof epcisDocument !== 'object' || Array.isArray(epcisDocument)) {
-    return { document: epcisDocument, content: epcisDocument, isEnvelope: false };
+    return { document: epcisDocument, content: { private: epcisDocument } };
   }
 
   const obj = epcisDocument as Record<string, unknown>;
-  const isEnvelope = obj.type !== 'EPCISDocument' && ('public' in obj || 'private' in obj);
-  if (!isEnvelope) {
-    return { document: epcisDocument, content: epcisDocument, isEnvelope: false };
+  if (obj.type === 'EPCISDocument') {
+    return { document: epcisDocument, content: { private: epcisDocument } };
   }
 
-  if (!obj.public) {
-    throw new EpcisValidationError(['Privacy envelope requires a public EPCIS document']);
+  const hasPublic = Object.prototype.hasOwnProperty.call(obj, 'public');
+  const hasPrivate = Object.prototype.hasOwnProperty.call(obj, 'private');
+  if (!hasPublic && !hasPrivate) {
+    throw new EpcisValidationError(['Privacy envelope requires a public or private EPCIS document']);
+  }
+
+  const publicDoc = obj.public;
+  const privateDoc = obj.private;
+  if (publicDoc === undefined && privateDoc === undefined) {
+    throw new EpcisValidationError(['Privacy envelope requires a public or private EPCIS document']);
+  }
+
+  const content: Record<string, unknown> = {};
+  if (hasPublic) {
+    content.public = publicDoc;
+  }
+  if (hasPrivate) {
+    content.private = privateDoc;
   }
 
   return {
-    document: obj.public,
-    content: {
-      public: obj.public,
-      private: obj.private,
-    },
-    isEnvelope: true,
+    document: hasPublic ? publicDoc : privateDoc,
+    content,
   };
 }

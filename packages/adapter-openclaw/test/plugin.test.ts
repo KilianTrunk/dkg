@@ -1330,15 +1330,29 @@ describe('DkgNodePlugin', () => {
     it('dkg_share escapes the full N-Triples control-char set when building the literal', async () => {
       const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-escape' });
       // Cover \\, ", \n, \r, \t, \f, \b — the canonical escaper from
-      // @origintrail-official/dkg-core handles all seven; partial coverage
-      // would let tab/backspace/form-feed through and produce an invalid
-      // RDF literal at the storage layer.
+      // @origintrail-official/dkg-core handles all seven.
       await byName.get('dkg_share')!.execute('tc', {
         content: 'a\nb\rc\td\fe\bf "q" \\ end',
         context_graph_id: 'ctx',
       });
       const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
       expect(body.quads[0].object).toBe('"a\\nb\\rc\\td\\fe\\bf \\"q\\" \\\\ end"');
+    });
+
+    it('dkg_share UCHAR-encodes non-ECHAR control bytes (NUL, VT, DEL) the canonical escaper leaves raw', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-uchar' });
+      // escapeDkgRdfLiteral covers \b, \t, \n, \f, \r — but leaves NUL (0x00),
+      // VT (0x0B), DEL (0x7F), etc. untouched. Those would produce invalid
+      // N-Triples at the storage layer. Defensive post-pass UCHAR-encodes them.
+      const NUL = String.fromCharCode(0x00);
+      const VT = String.fromCharCode(0x0B);
+      const DEL = String.fromCharCode(0x7F);
+      await byName.get('dkg_share')!.execute('tc', {
+        content: `a${NUL}b${VT}c${DEL}d`,
+        context_graph_id: 'ctx',
+      });
+      const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+      expect(body.quads[0].object).toBe('"a\\u0000b\\u000Bc\\u007Fd"');
     });
 
     it('dkg_share plumbs sub_graph_name through to subGraphName for sub-graph-scoped writes', async () => {

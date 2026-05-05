@@ -4280,12 +4280,24 @@ export class DkgNodePlugin {
       // replace prior shares from the same agent.
       const shareId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
       const subject = `urn:openclaw:${addr}:shared:${shareId}`;
-      // Serialize content as an N-Triples literal so the storage layer's
-      // formatTerm (oxigraph.ts:233-244) doesn't wrap unquoted text in
-      // angle brackets and treat it as an invalid IRI. Reuses the canonical
-      // escaper from @origintrail-official/dkg-core to cover the full set
-      // of N-Triples control-char escapes (\\, ", \n, \r, \t, \f, \b).
-      const literal = `"${escapeDkgRdfLiteral(content)}"`;
+      // Serialize content as an N-Triples literal. The canonical
+      // escapeDkgRdfLiteral from @origintrail-official/dkg-core handles
+      // the ECHAR set (\\, ", \n, \r, \t, \f, \b), but leaves other ASCII
+      // control bytes (0x00-0x07, 0x0B, 0x0E-0x1F, 0x7F) raw — those
+      // would still produce an invalid N-Triples literal. Defensive
+      // post-pass UCHAR-encodes the remaining bytes. (A canonical fix
+      // belongs in the core helper itself; tracked separately.)
+      const escaped = escapeDkgRdfLiteral(content).replace(
+        new RegExp(
+          '[' +
+            String.fromCharCode(0x00) + '-' + String.fromCharCode(0x1F) +
+            String.fromCharCode(0x7F) +
+          ']',
+          'g',
+        ),
+        (ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0').toUpperCase(),
+      );
+      const literal = `"${escaped}"`;
       const quads = [{
         subject,
         predicate: 'urn:openclaw:sharedContent',

@@ -386,7 +386,9 @@ class AgentKeyStore {
   +selectDefaultOrFallbackSigner()
   +selectAllowedSigner(contextGraphId)
 }
-class AgentGateMetadata {
+class ContextGraphAccessMetadata {
+  +DKG_ACCESS_POLICY
+  +DKG_ALLOWED_PEER
   +DKG_ALLOWED_AGENT
   +DKG_PARTICIPANT_AGENT
 }
@@ -402,6 +404,8 @@ class GossipEnvelope {
 class SharedMemoryHandler {
   +handle(data, from)
   +verifyAgentEnvelope()
+  +contextGraphHasPrivateAccessPolicy()
+  +getContextGraphAllowedPeers()
 }
 class AsyncPublisher {
   +enqueue()
@@ -426,10 +430,10 @@ DaemonHTTPAPI --> AsyncPublisher : delegates lift jobs
 DKGAgent --> WorkingMemory : owns
 DKGAgent --> SharedWorkingMemory : gossips
 DKGAgent --> AgentKeyStore : selects local signing agent
-DKGAgent --> AgentGateMetadata : reads agent gates
+DKGAgent --> ContextGraphAccessMetadata : reads agent gates
 DKGAgent --> GossipEnvelope : wraps signed SWM gossip
 GossipEnvelope --> SharedMemoryHandler : delivered on SWM topic
-SharedMemoryHandler --> AgentGateMetadata : authorizes gated writers
+SharedMemoryHandler --> ContextGraphAccessMetadata : reads access policy and gates
 SharedMemoryHandler --> SharedWorkingMemory : stores accepted writes
 AsyncPublisher --> SharedWorkingMemory : reads source data
 AsyncPublisher --> VerifiedMemory : publishes
@@ -450,6 +454,18 @@ agent-gated. For gated graphs, `SharedMemoryHandler` requires a current signed
 `GossipEnvelope`, verifies the claimed agent address against the recovered
 signature, checks that the envelope context graph matches the payload, and
 rejects writers outside the allowed or participant agent set.
+
+Receiver-side access checks also treat explicit `DKG_ACCESS_POLICY = "private"`
+metadata in either the context graph `_meta` graph or the ontology graph as
+private context graph metadata. If such a graph has no `DKG_ALLOWED_PEER`,
+`DKG_ALLOWED_AGENT`, or `DKG_PARTICIPANT_AGENT` gate, `SharedMemoryHandler`
+fails closed and rejects received SWM gossip rather than accepting it as open.
+`DKG_ALLOWED_PEER` remains a libp2p peer-id allowlist, while the agent gates
+remain signed-envelope checks.
+
+`GossipEnvelope` signing authenticates the SWM writer and binds the payload to
+the claimed context graph, but it does not encrypt GossipSub payload bytes.
+Operators should treat SWM gossip contents as visible to subscribed peers.
 
 ```mermaid
 sequenceDiagram
@@ -481,11 +497,18 @@ else context graph is not agent-gated
   end
 end
 Gossip->>Handler: deliver SWM topic message
-Handler->>Meta: read accepted agent writers
-alt receiver graph is agent-gated
-  Handler->>Handler: require envelope and verify signature, timestamp, and writer
+Handler->>Meta: read DKG_ACCESS_POLICY, DKG_ALLOWED_PEER, and agent gates
+alt private access policy has no gossip allowlist
+  Handler->>Handler: reject write fail closed
+else gossip allowlist exists
+  opt agent writer gate exists
+    Handler->>Handler: require envelope and verify signature, timestamp, and writer
+  end
+  opt peer allowlist exists
+    Handler->>Handler: require sender peer id in DKG_ALLOWED_PEER
+  end
   Handler->>SWM: store accepted write
-else receiver graph is not agent-gated
+else receiver graph is open
   Handler->>Handler: decode envelope or legacy raw payload
   Handler->>SWM: store accepted write
 end

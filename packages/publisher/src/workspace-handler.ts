@@ -1,7 +1,7 @@
 import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { EventBus } from '@origintrail-official/dkg-core';
-import { Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, DKG_ONTOLOGY } from '@origintrail-official/dkg-core';
+import { Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, DKG_ONTOLOGY, SYSTEM_PARANETS } from '@origintrail-official/dkg-core';
 import type { PhaseCallback } from './publisher.js';
 import {
   decodeGossipEnvelope,
@@ -161,13 +161,20 @@ export class SharedMemoryHandler {
       }
 
       const agentGateAddresses = await this.getContextGraphAgentGateAddresses(contextGraphId);
+      const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
+      const hasPrivateAccessPolicy = await this.contextGraphHasPrivateAccessPolicy(contextGraphId);
+
+      if (hasPrivateAccessPolicy && agentGateAddresses === null && allowedPeers === null) {
+        this.log.warn(ctx, `SWM write rejected: private context graph "${contextGraphId}" has no gossip allowlist`);
+        return;
+      }
+
       if (agentGateAddresses !== null) {
         const verified = await this.verifyAgentEnvelope(envelope, payload, contextGraphId, agentGateAddresses, ctx);
         if (!verified) return;
       }
 
       // Enforce peer allowlist for curated CGs
-      const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
       if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
         this.log.warn(ctx, `SWM write rejected: peer "${fromPeerId}" not in allowlist for context graph "${contextGraphId}"`);
         return;
@@ -444,11 +451,10 @@ export class SharedMemoryHandler {
    * is set (open CG — all peers allowed).
    */
   private async getContextGraphAllowedPeers(contextGraphId: string): Promise<string[] | null> {
-    const DKG_ALLOWED_PEER = 'https://dkg.network/ontology#allowedPeer';
     const cgMeta = contextGraphMetaUri(contextGraphId);
     const cgData = contextGraphDataUri(contextGraphId);
     const result = await this.store.query(
-      `SELECT ?peer WHERE { GRAPH <${cgMeta}> { <${cgData}> <${DKG_ALLOWED_PEER}> ?peer } }`,
+      `SELECT ?peer WHERE { GRAPH <${cgMeta}> { <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?peer } }`,
     );
     if (result.type !== 'bindings' || result.bindings.length === 0) {
       return null;
@@ -484,6 +490,36 @@ export class SharedMemoryHandler {
       .filter((v) => ethers.isAddress(v))
       .map((v) => ethers.getAddress(v));
     return [...new Set(agents)];
+  }
+
+  private async contextGraphHasPrivateAccessPolicy(contextGraphId: string): Promise<boolean> {
+    if ((Object.values(SYSTEM_PARANETS) as string[]).includes(contextGraphId)) {
+      return false;
+    }
+
+    const ontologyGraph = contextGraphDataUri(SYSTEM_PARANETS.ONTOLOGY);
+    const cgMeta = contextGraphMetaUri(contextGraphId);
+    const cgData = contextGraphDataUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?policy WHERE {
+        {
+          GRAPH <${ontologyGraph}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy
+          }
+        } UNION {
+          GRAPH <${cgMeta}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy
+          }
+        }
+      }`,
+    );
+    if (result.type !== 'bindings') {
+      return false;
+    }
+    return result.bindings.some((row) => {
+      const policy = row['policy'];
+      return typeof policy === 'string' && stripRdfLiteral(policy) === 'private';
+    });
   }
 
   /**

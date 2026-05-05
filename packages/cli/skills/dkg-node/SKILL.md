@@ -133,6 +133,8 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 | `dkg_sub_graph_create` | `POST /api/sub-graph/create` | Register a sub-graph inside a CG |
 | `dkg_sub_graph_list` | `GET /api/sub-graph/list` | List sub-graphs in a CG |
 | `dkg_query` | `POST /api/query` | Read-only SPARQL across assertions in a CG. Pass `view` (`working-memory` / `shared-working-memory` / `verified-memory`) to pick the layer — when `view` is set, `context_graph_id` is required; for WM reads, optional `agent_address` targets another agent's WM (defaults to this node). Omit `view` for a legacy cross-graph data-path query. |
+| `dkg_query_catalog_list` | `POST /api/profile/query-catalog/read` | List saved SPARQL queries declared in the project profile query catalog |
+| `dkg_query_catalog_run` | `POST /api/profile/query-catalog/read` + `POST /api/query` | Run a saved catalog query by slug or exact display name |
 | `dkg_find_agents` | `GET /api/agents` | Discover other agents (best-effort P2P) |
 | `dkg_send_message` | `POST /api/chat` | Send a direct message (best-effort P2P) |
 | `dkg_read_messages` | `GET /api/messages` | Read inbound messages |
@@ -145,6 +147,7 @@ P2P tools fail gracefully when the peer is offline. `dkg_publish` (fresh quads +
 - **Participant self-service join/sign flow** — see §6.
 - **Conditional writes** (`POST /api/shared-memory/conditional-write`) — see §5 SWM.
 - **Async publisher job queue** (`/api/publisher/*`) — see §8.
+- **Query catalog writes** (`POST /api/profile/query-catalog/write`) — see §5 "Saved Query Catalog".
 - **Raw file retrieval** (`GET /api/file/{fileHash}`) — see §7.
 - **Endorse / verify / update** (`POST /api/endorse`, `/verify`, `/update`) — see §5 VM.
 - **SSE event stream** (`GET /api/events`) — see §8.
@@ -227,6 +230,101 @@ The `memory_search` tool is the recommended entry point for free-text memory rec
   - `includeSharedMemory` / `includeWorkspace` — merge SWM into the result set
   - `verifiedGraph` — target a specific VM (on-chain) named graph
 - `POST /api/query-remote` — query a remote peer via P2P. Body: `{ peerId, lookupType, contextGraphId, ual?, entityUri?, rdfType?, sparql?, limit?, timeout? }`. `lookupType` picks the strategy (e.g. `sparql`, `entity`, `rdf-type`). Remote peer ACL is enforced.
+
+### Saved Query Catalog
+
+The query catalog is project profile metadata: saved SPARQL queries attached to
+a context graph and grouped by sub-graph/catalog. In the Node UI it appears in
+the Project view as **Query catalog** above the context-graph query surface and
+inside sub-graph detail views; it is not the Graph Overview.
+
+Use this decision order:
+
+1. When a turn has a clear selected project/context graph
+   (`target_context_graph` or an explicit user-provided context graph) and the
+   user asks a substantive question about that project's data, call
+   `dkg_query_catalog_list` before inventing ad-hoc SPARQL or using broad
+   free-text recall. Skip this first-check only for operational/admin requests
+   such as daemon status, publishing, setup, connectivity, permissions, or
+   explicit writes.
+2. Inspect the returned saved-query candidates (`slug`, `name`, `description`,
+   `catalogName`, and `subGraph`) and choose the query that best matches the
+   user's wording. If exactly one candidate clearly matches, run it with
+   `dkg_query_catalog_run` and answer from the result. Mention the saved query
+   used in one short phrase when useful.
+3. If several candidates plausibly match and the answer depends on which one
+   is used, list the candidate names/slugs and ask the user to choose. If one
+   is clearly the best default, run it and note that other catalog options
+   exist only if the result is incomplete.
+4. If the catalog is empty or no saved query matches the request, continue with
+   the normal lookup path (`memory_search` for broad recall or `dkg_query` for
+   precise SPARQL). Do not pretend a catalog query was used.
+5. If the user asks which saved queries exist, call `dkg_query_catalog_list`
+   with the selected `context_graph_id` and present the useful candidates.
+6. If the user explicitly asks to run a saved query, call
+   `dkg_query_catalog_run` with the selected `context_graph_id` and the saved
+   query slug or exact display name. If the name is ambiguous, list first and
+   ask/choose by slug.
+7. If no query catalog tool is available, use `dkg_query` against the profile
+   graph (`did:dkg:context-graph:<id>/meta/query-catalog`) to read saved
+   queries, then run the selected `prof:sparqlQuery` with `dkg_query`.
+8. Only write or change query catalog entries when the user explicitly asks to
+   save/update catalog queries.
+
+OpenClaw tool path:
+
+- `dkg_query_catalog_list` input: `{ "context_graph_id": "<contextGraphId>" }`
+- `dkg_query_catalog_run` input:
+  `{ "context_graph_id": "<contextGraphId>", "query": "<slug-or-exact-name>" }`
+
+CLI fallback:
+
+```bash
+dkg query-catalog list <context-graph>
+dkg query-catalog run <context-graph> <query-slug-or-exact-name>
+```
+
+HTTP fallback:
+
+- `POST /api/profile/query-catalog/read`
+  Body: `{ "contextGraphId": "<contextGraphId>" }`
+  Returns bindings with `q`, `subGraph`, `catalog`, `name`, `description`,
+  `sparql`, `rank`, `catalogName`, `catalogDescription`, and `catalogRank`.
+- `POST /api/profile/query-catalog/write`
+  Body: `{ "contextGraphId": "<contextGraphId>", "quads": [...] }`
+  The daemon stores these triples in
+  `did:dkg:context-graph:<contextGraphId>/meta/query-catalog` regardless of
+  the incoming quad `graph` field. This route appends profile triples; prefer
+  a new saved-query URI for new saved queries and avoid overwriting unrelated
+  catalog/profile metadata.
+
+Profile RDF shape for writes:
+
+```turtle
+@prefix prof: <http://dkg.io/ontology/profile/> .
+@prefix schema: <http://schema.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:dkg:profile:PROJECT:catalog:CATALOG> rdf:type prof:QueryCatalog ;
+  prof:forSubGraph "SUBGRAPH" ;
+  prof:displayName "Catalog name" ;
+  schema:description "Catalog description" ;
+  prof:rank "50"^^xsd:integer .
+
+<urn:dkg:profile:PROJECT:query:QUERY> rdf:type prof:SavedQuery ;
+  prof:forSubGraph "SUBGRAPH" ;
+  prof:inCatalog <urn:dkg:profile:PROJECT:catalog:CATALOG> ;
+  prof:displayName "Saved query name" ;
+  schema:description "What this query returns" ;
+  prof:sparqlQuery "SELECT ?uri WHERE { ?uri ?p ?o } LIMIT 50" ;
+  prof:resultColumn "uri" ;
+  prof:rank "100"^^xsd:integer .
+```
+
+When composing saved SPARQL, keep it read-only (`SELECT`, `ASK`, `CONSTRUCT`,
+or `DESCRIBE`). Prefer returning a stable `?uri` column when the result should
+feed entity-list UI surfaces.
 
 ### Operational constraints
 

@@ -484,18 +484,37 @@ class DKGClient:
         """GET /api/context-graph/list — list subscribed context graphs."""
         return self._get("/api/context-graph/list")
 
-    def create_context_graph(self, name: str, description: str = "", cg_id: Optional[str] = None) -> Dict[str, Any]:
+    def create_context_graph(
+        self,
+        name: str,
+        description: str = "",
+        cg_id: Optional[str] = None,
+        *,
+        access_policy: Optional[int] = None,
+        allowed_agents: Optional[list] = None,
+    ) -> Dict[str, Any]:
         """POST /api/context-graph/create — create a new context graph.
-        Daemon requires both `id` and `name`; auto-generates id from name if not given."""
+        Daemon requires both `id` and `name`; auto-generates id from name if not given.
+
+        `access_policy` and `allowed_agents` are forwarded to the daemon when
+        provided. Pass `access_policy=1` for a curated/private CG; `None` lets
+        the daemon resolve to its default (open). `allowed_agents` populates
+        the allowlist atomically with creation.
+        """
         if not cg_id:
             cg_id = _slugify_context_graph_id(name)
         if not _CG_ID_RE.match(cg_id):
             return {"success": False, "error": "Context graph id must be a lowercase slug using letters, numbers, and hyphens."}
-        return self._post("/api/context-graph/create", {
+        body: Dict[str, Any] = {
             "id": cg_id,
             "name": name,
             "description": description,
-        })
+        }
+        if isinstance(access_policy, int):
+            body["accessPolicy"] = access_policy
+        if isinstance(allowed_agents, list) and allowed_agents:
+            body["allowedAgents"] = allowed_agents
+        return self._post("/api/context-graph/create", body)
 
     def register_context_graph(self, context_graph_id: str, access_policy: Optional[int] = None) -> Dict[str, Any]:
         """POST /api/context-graph/register — register a local CG on-chain."""

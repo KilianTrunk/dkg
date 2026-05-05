@@ -1642,6 +1642,10 @@ client._get = lambda path: calls.append(("GET", path, {})) or {"ok": True}
 bad_cg = client.create_context_graph("Bad", cg_id="Bad:Id")
 assert bad_cg["success"] is False, bad_cg
 client.create_context_graph("My Project", "desc")
+# T-PRIVACY: client passes accessPolicy + allowedAgents through to the daemon
+# verbatim when supplied, and omits them when not.
+client.create_context_graph("Curated", "private cg", access_policy=1)
+client.create_context_graph("Team", "shared", access_policy=1, allowed_agents=["0xAlice", "0xBob"])
 client.subscribe("cg:test", include_shared_memory=True)
 client.write_assertion("a b", "cg:test", [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "sub")
 client.discard_assertion("a b", "cg:test")
@@ -1655,6 +1659,8 @@ client.publish("cg:test", selection=["urn:root"], clear_after=False, sub_graph_n
 
 assert calls == [
     ("POST", "/api/context-graph/create", {"id": "my-project", "name": "My Project", "description": "desc"}),
+    ("POST", "/api/context-graph/create", {"id": "curated", "name": "Curated", "description": "private cg", "accessPolicy": 1}),
+    ("POST", "/api/context-graph/create", {"id": "team", "name": "Team", "description": "shared", "accessPolicy": 1, "allowedAgents": ["0xAlice", "0xBob"]}),
     ("POST", "/api/context-graph/subscribe", {"contextGraphId": "cg:test", "includeSharedMemory": True}),
     ("POST", "/api/assertion/a%20b/write", {"contextGraphId": "cg:test", "quads": [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "subGraphName": "sub"}),
     ("POST", "/api/assertion/a%20b/discard", {"contextGraphId": "cg:test"}),
@@ -2568,6 +2574,117 @@ provider._assertion_id = ""
 provider._cache["queued_writes"] = [{"type": "memory", "action": "replace", "target": "memory", "content": "new fact", "old_text": "cached"}]
 provider._flush_queued_writes()
 assert provider._cache["queued_writes"] == [{"type": "memory", "action": "replace", "target": "memory", "content": "new fact", "old_text": "cached"}], provider._cache
+`;
+    const result = spawnSync('python', ['-B', '-c', script], {
+      cwd: process.cwd(),
+      encoding: 'utf-8',
+    });
+
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('dkg_context_graph_create handler defaults to curated and forwards public + allowed_agents', () => {
+    // Privacy-by-default flip in Hermes parity:
+    //
+    // - No `public` and no `allowed_agents` → handler sends accessPolicy: 1
+    //   (curated). The agent's createContextGraph flow auto-includes the
+    //   creator in DKG_ALLOWED_AGENT (see packages/agent/src/dkg-agent.ts:3962),
+    //   so the creator can immediately read/write without a self-invite.
+    // - `public: true` → handler drops accessPolicy (daemon resolves to open)
+    //   AND drops allowed_agents even if supplied (meaningless on a public CG).
+    // - `allowed_agents: [...]` (no `public`) → handler sends accessPolicy: 1
+    //   AND allowedAgents.
+    // - Whitespace-only / empty / non-string entries in allowed_agents are
+    //   filtered out before forwarding.
+    const script = String.raw`
+import importlib.util
+import json
+import sys
+import tempfile
+import types
+from pathlib import Path
+
+home = Path(tempfile.mkdtemp(prefix="hermes-dkg-create-cg-defaults-"))
+
+agent_pkg = types.ModuleType("agent")
+memory_provider = types.ModuleType("agent.memory_provider")
+class MemoryProvider:
+    pass
+memory_provider.MemoryProvider = MemoryProvider
+sys.modules["agent"] = agent_pkg
+sys.modules["agent.memory_provider"] = memory_provider
+
+tools_pkg = types.ModuleType("tools")
+registry = types.ModuleType("tools.registry")
+def tool_error(message):
+    return json.dumps({"error": message})
+registry.tool_error = tool_error
+sys.modules["tools"] = tools_pkg
+sys.modules["tools.registry"] = registry
+
+constants = types.ModuleType("hermes_constants")
+constants.get_hermes_home = lambda: home
+sys.modules["hermes_constants"] = constants
+
+sys.modules["plugins"] = types.ModuleType("plugins")
+sys.modules["plugins.memory"] = types.ModuleType("plugins.memory")
+sys.modules["plugins.memory.dkg"] = types.ModuleType("plugins.memory.dkg")
+
+plugin_dir = Path(r"${process.cwd().replace(/\\/g, '\\\\')}") / "hermes-plugin"
+
+spec = importlib.util.spec_from_file_location(
+    "plugins.memory.dkg",
+    plugin_dir / "__init__.py",
+    submodule_search_locations=[str(plugin_dir)],
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules["plugins.memory.dkg"] = module
+spec.loader.exec_module(module)
+
+provider = module.DKGMemoryProvider()
+provider._offline = False
+
+class FakeClient:
+    def __init__(self):
+        self.calls = []
+    def create_context_graph(self, name, description="", cg_id=None, *, access_policy=None, allowed_agents=None):
+        self.calls.append({
+            "name": name,
+            "description": description,
+            "cg_id": cg_id,
+            "access_policy": access_policy,
+            "allowed_agents": allowed_agents,
+        })
+        return {"created": cg_id or name, "uri": f"did:dkg:context-graph:{cg_id or name}"}
+
+client = FakeClient()
+provider._client = client
+
+# Default - no public, no allowed_agents -> curated.
+provider._handle_create_cg({"name": "Default", "id": "default"})
+# Explicit public - accessPolicy dropped, allowed_agents ignored.
+provider._handle_create_cg({"name": "Open", "id": "open", "public": True, "allowed_agents": ["0xIgnored"]})
+# Curated with explicit allowlist.
+provider._handle_create_cg({"name": "Team", "id": "team", "allowed_agents": ["0xAlice", "0xBob"]})
+# Curated with allowlist that includes empty / whitespace / non-string entries.
+provider._handle_create_cg({"name": "Trim", "id": "trim", "allowed_agents": ["  0xAlice  ", "", "   ", 42, "0xBob"]})
+
+assert client.calls[0] == {
+    "name": "Default", "description": "", "cg_id": "default",
+    "access_policy": 1, "allowed_agents": None,
+}, client.calls[0]
+assert client.calls[1] == {
+    "name": "Open", "description": "", "cg_id": "open",
+    "access_policy": None, "allowed_agents": None,
+}, client.calls[1]
+assert client.calls[2] == {
+    "name": "Team", "description": "", "cg_id": "team",
+    "access_policy": 1, "allowed_agents": ["0xAlice", "0xBob"],
+}, client.calls[2]
+assert client.calls[3] == {
+    "name": "Trim", "description": "", "cg_id": "trim",
+    "access_policy": 1, "allowed_agents": ["0xAlice", "0xBob"],
+}, client.calls[3]
 `;
     const result = spawnSync('python', ['-B', '-c', script], {
       cwd: process.cwd(),

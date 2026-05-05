@@ -173,8 +173,9 @@ async function startDaemon(opts: {
     daemon.signal = signal;
   });
 
-  // Wait for /api/status to respond (up to 30s)
-  for (let i = 0; i < 60; i++) {
+  // Wait for /api/status to respond (up to 60s). CI startup can be noisy when
+  // workflow fan-out is high, and 30s proved flaky despite healthy behavior.
+  for (let i = 0; i < 120; i++) {
     if (child.exitCode !== null) {
       throw new Error(`Daemon exited early with code ${child.exitCode}`);
     }
@@ -185,7 +186,7 @@ async function startDaemon(opts: {
       /* not ready yet */
     }
     await sleep(500);
-    if (i === 59) throw new Error('Daemon did not become ready within 30s');
+    if (i === 119) throw new Error('Daemon did not become ready within 60s');
   }
 
   if (opts.authEnabled) {

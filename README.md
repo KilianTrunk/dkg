@@ -60,7 +60,8 @@ All on-chain publishing goes through SWM first — the chain transaction is a fi
 SWM gossip is signed when the node has a local agent private key. Context graphs
 that declare `DKG_ALLOWED_AGENT` or `DKG_PARTICIPANT_AGENT` require a signed
 `GossipEnvelope` from one of those agent addresses; unsigned legacy SWM payloads
-are accepted only for context graphs without agent gates.
+are accepted only for context graphs without agent gates. Signatures authenticate
+the writer, but do not encrypt GossipSub payload bytes.
 
 ---
 

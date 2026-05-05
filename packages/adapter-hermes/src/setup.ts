@@ -85,6 +85,17 @@ export interface HermesCliOptions {
    * the flag through so the orchestrator sees it.
    */
   preserveProvider?: boolean;
+  /**
+   * Restore the prior `memory.provider` after a disconnect (CLI only).
+   * Defaults to `false` — `dkg hermes disconnect` is disconnect-only by
+   * default, matching today's behavior. `--restore-provider` flips to
+   * `true` and invokes `restoreHermesProfile` after
+   * `disconnectHermesProfile`. UI Disconnect always restores via the
+   * daemon route (per setup-entrypoint-contract.md §6) and ignores
+   * this field. `dkg hermes uninstall` always restores, also ignoring
+   * this field (per H-AC-39).
+   */
+  restoreProvider?: boolean;
   /** UI-driven cancel; CLI handlers ignore. Mirrors `runOpenClawUiSetup`. */
   signal?: AbortSignal;
   /** Optional log/telemetry hint; non-functional. */
@@ -771,6 +782,20 @@ export async function runDisconnect(options: HermesCliOptions = {}): Promise<voi
   if (!plan.dryRun && plan.actions.some((action) => action.type !== 'skip')) {
     await disconnectDaemonBestEffort(setupOptions.daemonUrl, plan.state);
   }
+  if (options.restoreProvider) {
+    if (plan.dryRun) {
+      console.log('[dry-run] Would restore prior memory.provider via restoreHermesProfile');
+      return;
+    }
+    const result = restoreHermesProfile({
+      profile: setupOptions.profile,
+      hermesHome: setupOptions.hermesHome,
+    });
+    printRestore('Hermes restore', result);
+    if (!result.ok) {
+      console.warn(`[hermes disconnect] restore-provider failed: ${result.restoreError ?? 'unknown error'}`);
+    }
+  }
 }
 
 export async function runReconnect(options: HermesCliOptions = {}): Promise<void> {
@@ -780,6 +805,24 @@ export async function runReconnect(options: HermesCliOptions = {}): Promise<void
 export async function runUninstall(options: HermesCliOptions = {}): Promise<void> {
   const setupOptions = toSetupOptions(options);
   const uninstallState = readSetupState(resolveHermesProfile(setupOptions));
+  // Restore prior memory.provider BEFORE uninstall removes setup-state.json
+  // (which holds the priorMemoryProvider snapshot). Per H-AC-39: uninstall
+  // always restores. Dry-run prints what would happen and skips the actual
+  // restore.
+  if (uninstallState?.priorMemoryProvider) {
+    if (options.dryRun) {
+      console.log('[dry-run] Would restore prior memory.provider via restoreHermesProfile');
+    } else {
+      const result = restoreHermesProfile({
+        profile: setupOptions.profile,
+        hermesHome: setupOptions.hermesHome,
+      });
+      printRestore('Hermes uninstall: restore', result);
+      if (!result.ok) {
+        console.warn(`[hermes uninstall] restore-provider failed: ${result.restoreError ?? 'unknown error'}`);
+      }
+    }
+  }
   const plan = uninstallHermesProfile(setupOptions);
   printPlan('Hermes uninstall', plan);
   if (!plan.dryRun && uninstallState) {
@@ -1038,6 +1081,19 @@ function printVerify(label: string, result: HermesVerifyResult): void {
   }
   for (const error of result.errors) {
     console.error(`error: ${error}`);
+  }
+}
+
+function printRestore(label: string, result: HermesRestoreResult): void {
+  console.log(`${label}: path=${result.path}`);
+  if (result.path === 'surgical' && result.restoredProvider) {
+    console.log(`  restored memory.provider: ${result.restoredProvider}`);
+  }
+  if (result.path === 'backup-file' && result.restoredFrom) {
+    console.log(`  restored from backup: ${result.restoredFrom}`);
+  }
+  if (result.restoreError) {
+    console.warn(`  restore error: ${result.restoreError}`);
   }
 }
 

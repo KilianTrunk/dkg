@@ -1877,6 +1877,12 @@ for (const [commandName, candidates, description] of [
       .option('--no-verify', 'Skip post-reconnect verification')
       .option('--no-start', 'Skip daemon start (configure only)');
   }
+  if (commandName === 'disconnect') {
+    command.option(
+      '--restore-provider',
+      'After disconnect, restore the prior memory.provider captured during setup (default: disconnect-only)',
+    );
+  }
   command.action(async (opts) => {
     const action = await loadHermesAdapterAction(commandName, candidates);
     try {

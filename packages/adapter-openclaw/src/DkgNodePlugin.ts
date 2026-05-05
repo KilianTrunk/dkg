@@ -3491,32 +3491,65 @@ export class DkgNodePlugin {
       // flow auto-includes the creator's address in the allowlist (see
       // `packages/agent/src/dkg-agent.ts:3962-3973`), so the creator can
       // immediately read/write the curated CG without a self-invite step.
-      const isPublic = args.public === true;
-      const allowedAgents = Array.isArray(args.allowed_agents)
-        ? args.allowed_agents
-            .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
-            .filter((entry): entry is string => entry.length > 0)
-        : undefined;
-      // Validate Ethereum address format up-front so a malformed input
-      // surfaces as a tool-level error instead of bubbling up as a 500
-      // from the daemon. Mirrors the agent layer's check at
-      // `packages/agent/src/dkg-agent.ts:3918-3922`.
-      if (!isPublic && allowedAgents && allowedAgents.length > 0) {
+      // Round 2 — strict type validation on `public`. Non-boolean values
+      // (e.g. `"yes"`, `1`, `null`) silently became `false` previously,
+      // producing curated CGs when the LLM intended public — the opposite
+      // of the agent's intent. Reject explicitly so the agent gets a
+      // clear correction instead of silent miscategorization.
+      const rawPublic = args.public;
+      if (rawPublic !== undefined && typeof rawPublic !== 'boolean') {
+        return this.error(
+          `"public" must be a boolean (true or false). Got: ${typeof rawPublic}.`,
+        );
+      }
+      const isPublic = rawPublic === true;
+      // Round 2 — strict allowed_agents validation. Previously we
+      // silently dropped non-string / blank entries, which hides
+      // LLM-generated mistakes (e.g. `["0x1234...", 42]` would create a
+      // curated graph WITHOUT 42's intended owner ever knowing they
+      // were excluded). Fail fast on every malformed entry with a
+      // precise index-scoped error so the agent can correct.
+      let allowedAgents: string[] | undefined;
+      if (!isPublic && args.allowed_agents !== undefined) {
+        if (!Array.isArray(args.allowed_agents)) {
+          return this.error(
+            `"allowed_agents" must be an array of strings. Got: ${typeof args.allowed_agents}.`,
+          );
+        }
         const ethAddrRe = /^0x[0-9a-fA-F]{40}$/;
-        for (const addr of allowedAgents) {
-          if (!ethAddrRe.test(addr)) {
+        const cleaned: string[] = [];
+        for (let i = 0; i < args.allowed_agents.length; i++) {
+          const entry = args.allowed_agents[i];
+          if (typeof entry !== 'string') {
             return this.error(
-              `Invalid Ethereum address in "allowed_agents": "${addr}". ` +
-              'Each entry must be a 0x-prefixed 40-hex-char string (e.g. "0x1234567890abcdef1234567890abcdef12345678").',
+              `"allowed_agents[${i}]" must be a string. Got: ${entry === null ? 'null' : typeof entry}.`,
             );
           }
+          const trimmed = entry.trim();
+          if (!trimmed) {
+            return this.error(
+              `"allowed_agents[${i}]" is empty or whitespace-only. ` +
+              'Each entry must be a 0x-prefixed 40-hex-char Ethereum address.',
+            );
+          }
+          if (!ethAddrRe.test(trimmed)) {
+            return this.error(
+              `Invalid Ethereum address in "allowed_agents[${i}]": "${entry}". ` +
+              'Each entry must be a 0x-prefixed 40-hex-char string ' +
+              '(e.g. "0x1234567890abcdef1234567890abcdef12345678").',
+            );
+          }
+          cleaned.push(trimmed);
+        }
+        if (cleaned.length > 0) {
+          allowedAgents = cleaned;
         }
       }
       const opts: { accessPolicy?: number; allowedAgents?: string[] } = {};
       if (!isPublic) {
         opts.accessPolicy = 1;
       }
-      if (!isPublic && allowedAgents && allowedAgents.length > 0) {
+      if (allowedAgents && allowedAgents.length > 0) {
         opts.allowedAgents = allowedAgents;
       }
       const result = await this.client.createContextGraph(id, name, description, opts);

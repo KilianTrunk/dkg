@@ -531,9 +531,12 @@ describe('dkg_context_graph_create tool', () => {
     expect(body.allowedAgents).toBeUndefined();
   });
 
-  it('trims and filters allowed_agents entries before validation', async () => {
-    // Whitespace and non-string entries are dropped before format validation,
-    // so trim-then-validate is the correct order.
+  it('trims whitespace-padded valid allowed_agents entries', async () => {
+    // Whitespace padding around an otherwise valid address is trimmed
+    // before validation. Empty, whitespace-only, and non-string entries
+    // are NOT silently dropped — they fail validation (see fail-fast
+    // tests below). LLM-generated bad args should produce a clear tool
+    // error so the agent can correct, not silently lose collaborators.
     ft.addResponses(
       new Response(JSON.stringify({ created: 'trimmed', uri: 'did:dkg:context-graph:trimmed' }), { status: 200 }),
     );
@@ -544,7 +547,7 @@ describe('dkg_context_graph_create tool', () => {
     await tool.execute('call-trim', {
       id: 'trimmed',
       name: 'Trim',
-      allowed_agents: [`  ${validAddr1}  `, '', '   ', validAddr2, 42 as unknown as string],
+      allowed_agents: [`  ${validAddr1}  `, validAddr2],
     });
 
     const body = JSON.parse(ft.calls[0][1]?.body as string);
@@ -564,8 +567,8 @@ describe('dkg_context_graph_create tool', () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.error).toContain('Invalid Ethereum address');
+    expect(parsed.error).toContain('allowed_agents[1]');
     expect(parsed.error).toContain('not-an-address');
-    // Should not have hit the daemon — pre-flight validation.
     expect(ft.calls).toHaveLength(0);
   });
 
@@ -579,6 +582,93 @@ describe('dkg_context_graph_create tool', () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.error).toContain('Invalid Ethereum address');
+    expect(ft.calls).toHaveLength(0);
+  });
+
+  it('round 2: fails fast when allowed_agents contains a non-string entry', async () => {
+    // LLMs sometimes emit numbers / nulls / dicts in tool args; if we
+    // silently drop them, the agent thinks the participant was added
+    // when it wasn't. Fail with a precise index-scoped error.
+    const tool = findTool('dkg_context_graph_create');
+    const result = await tool.execute('call-non-string', {
+      id: 'non-string',
+      name: 'NonString',
+      allowed_agents: ['0x' + 'a'.repeat(40), 42 as unknown as string, '0x' + 'b'.repeat(40)],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toContain('allowed_agents[1]');
+    expect(parsed.error).toContain('must be a string');
+    expect(ft.calls).toHaveLength(0);
+  });
+
+  it('round 2: fails fast when allowed_agents contains an empty / whitespace-only entry', async () => {
+    const tool = findTool('dkg_context_graph_create');
+    const result = await tool.execute('call-empty-entry', {
+      id: 'empty-entry',
+      name: 'EmptyEntry',
+      allowed_agents: ['0x' + 'a'.repeat(40), '   '],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toContain('allowed_agents[1]');
+    expect(parsed.error).toMatch(/empty|whitespace/i);
+    expect(ft.calls).toHaveLength(0);
+  });
+
+  it('round 2: fails fast when allowed_agents contains null', async () => {
+    const tool = findTool('dkg_context_graph_create');
+    const result = await tool.execute('call-null', {
+      id: 'null-entry',
+      name: 'Null',
+      allowed_agents: ['0x' + 'a'.repeat(40), null as unknown as string],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toContain('allowed_agents[1]');
+    expect(ft.calls).toHaveLength(0);
+  });
+
+  it('round 2: fails fast when allowed_agents is not an array', async () => {
+    const tool = findTool('dkg_context_graph_create');
+    const result = await tool.execute('call-not-array', {
+      id: 'not-array',
+      name: 'NotArray',
+      allowed_agents: '0x1234' as unknown as string[],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toContain('"allowed_agents"');
+    expect(parsed.error).toContain('array');
+    expect(ft.calls).toHaveLength(0);
+  });
+
+  it('round 2: fails fast when public is a non-boolean value', async () => {
+    // An LLM emitting `public: "yes"` or `public: 1` should NOT
+    // silently produce a curated CG (which is the opposite of intent).
+    const tool = findTool('dkg_context_graph_create');
+    const result = await tool.execute('call-public-string', {
+      id: 'public-string',
+      name: 'PublicString',
+      public: 'yes' as unknown as boolean,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toContain('"public"');
+    expect(parsed.error).toContain('boolean');
+    expect(ft.calls).toHaveLength(0);
+  });
+
+  it('round 2: fails fast when public is a number', async () => {
+    const tool = findTool('dkg_context_graph_create');
+    const result = await tool.execute('call-public-number', {
+      id: 'public-number',
+      name: 'PublicNumber',
+      public: 1 as unknown as boolean,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toContain('"public"');
     expect(ft.calls).toHaveLength(0);
   });
 

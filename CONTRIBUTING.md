@@ -46,7 +46,8 @@ Thank you for your interest in contributing to the OriginTrail Decentralized Kno
 This is a pnpm + Turborepo monorepo. Key commands:
 
 ```bash
-pnpm build                          # Build all packages
+pnpm build                          # Build all packages and the Node UI bundle
+pnpm run build:packages             # Build package outputs only
 pnpm test                           # Test all packages
 pnpm --filter @origintrail-official/dkg-core test   # Test a specific package
 ```

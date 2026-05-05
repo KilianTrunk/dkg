@@ -1,6 +1,6 @@
 # `@origintrail-official/dkg-mcp`
 
-[Model Context Protocol](https://modelcontextprotocol.io) server that exposes your local DKG V10 daemon to **Cursor**, **Claude Code**, **Continue**, **Cline**, and any other MCP-aware coding assistant. It is the canonical V10 surface for "DKG as agent memory."
+[Model Context Protocol](https://modelcontextprotocol.io) server that exposes your local DKG V10 daemon to **Cursor**, **Claude Code**, **Claude Desktop**, **Windsurf**, **VSCode + GitHub Copilot Chat**, **Cline**, and any other MCP-aware coding assistant. It is the canonical V10 surface for "DKG as agent memory."
 
 The package ships transitively as part of `@origintrail-official/dkg`. You don't run the bin directly — the umbrella CLI's `dkg mcp serve` invokes it on the client's behalf.
 
@@ -18,7 +18,7 @@ dkg mcp setup                                # one-shot: init + start + fund + r
 1. Initializes `~/.dkg/config.json` if absent (skipped silently when present)
 2. Starts the DKG daemon as a background process (skipped if already running)
 3. Funds the node's wallets via the testnet faucet (skip with `--no-fund`)
-4. Detects each MCP-aware client by its config file (`~/.cursor/mcp.json`, `~/.claude.json`) and writes the canonical entry under `mcpServers.dkg`
+4. Detects each MCP-aware client by its config file and writes the canonical entry. The detection set is six clients: **Cursor** (`~/.cursor/mcp.json`), **Claude Code** (`~/.claude.json`), **Claude Desktop** (per-platform — `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows, `~/.config/Claude/claude_desktop_config.json` on Linux), **Windsurf** (`~/.codeium/windsurf/mcp_config.json`), **VSCode + GitHub Copilot Chat** (per-platform Code user-settings dir + `mcp.json` — note this client uses the `servers.dkg` shape, not `mcpServers.dkg`), and **Cline** (deep-nested under VSCode's per-extension globalStorage at `Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`). The five `mcpServers.dkg` clients receive the same JSON block
 5. Verifies the daemon is healthy
 
 Every step short-circuits when its work is already done, so re-running on a set-up box is safe. Step-skip flags: `--no-start`, `--no-fund`, `--no-verify`, `--dry-run` (preview only), `--force` (refresh every detected client config regardless of state). First-init overrides: `--port <n>`, `--name <s>`. The bundled flow re-uses the same primitives `dkg openclaw setup` does, so the two verbs stay byte-aligned on network defaults, daemon-readiness probes, faucet retry/back-off, and manual-curl fallback.
@@ -44,23 +44,44 @@ After `dkg mcp setup` runs, restart your client so it discovers the MCP. Verify 
 
 For environments where `dkg mcp setup` can't run (CI, locked-down configs, custom paths), drop the same block in by hand:
 
-- **Cursor** — `~/.cursor/mcp.json` (or workspace `.cursor/mcp.json`)
-- **Claude Code** — `~/.claude.json`, or run `claude mcp add dkg dkg mcp serve`
-- **Continue / Cline / generic MCP client** — the project's MCP config file, same JSON shape
+- **Cursor** — `~/.cursor/mcp.json` (or workspace `.cursor/mcp.json`); `mcpServers.dkg`
+- **Claude Code** — `~/.claude.json`, or run `claude mcp add dkg dkg mcp serve`; `mcpServers.dkg`
+- **Claude Desktop** — per-platform path (see step 4 above); `mcpServers.dkg`
+- **Windsurf (Codeium)** — `~/.codeium/windsurf/mcp_config.json`; `mcpServers.dkg`
+- **VSCode + GitHub Copilot Chat** — per-platform Code user-settings dir + `mcp.json`; **`servers.dkg`** (Copilot Chat uses `servers`, not `mcpServers` — copy the inner block, not the outer wrapper)
+- **Cline** — `Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` under your VSCode user dir; `mcpServers.dkg`
+- **Continue / Codex CLI / generic MCP client** — Continue uses YAML and Codex CLI uses TOML; not auto-detected today (deferred to a follow-up). Run `dkg mcp setup --print-only` to emit the canonical JSON block, then translate into the client's native format
 
-For monorepo contributors working from source without a global install, the workspace-relative form (matches the repo's own `.cursor/mcp.json`):
+### Contributor (monorepo dev) workflow
+
+If you run `dkg mcp setup` from inside a `dkg-v9` monorepo checkout, the CLI auto-detects the workspace via `findDkgMonorepoRoot()` and writes a different entry that points at your local build instead of the globally-installed `dkg`:
 
 ```json
 {
   "mcpServers": {
     "dkg": {
-      "command": "pnpm",
-      "args": ["exec", "tsx", "packages/mcp-dkg/src/index.ts"],
-      "cwd": "${workspaceFolder}"
+      "command": "node",
+      "args": ["/absolute/path/to/dkg-v9/packages/cli/dist/cli.js", "mcp", "serve"]
     }
   }
 }
 ```
+
+This lets the registered MCP run your in-progress changes the next time the client spawns it. **Required prereq: rebuild before re-running setup.**
+
+```bash
+pnpm --filter @origintrail-official/dkg build      # rebuild the CLI dist
+dkg mcp setup                                      # re-register against the freshly-built dist
+```
+
+Skip the rebuild and the registered entry points at a stale `dist/cli.js` — your edits won't show up.
+
+**Mode overrides** (mutually exclusive — pass at most one):
+
+- `--installed` forces installed-mode even from a monorepo cwd. Use this to test the published CLI from inside the monorepo (e.g. dogfooding a release candidate).
+- `--monorepo` forces monorepo-mode and errors if no DKG monorepo root is locatable. Use this to fail loudly if your CI expects a monorepo path but the workspace lookup goes sideways.
+
+**Moved checkout caveat.** The written `args` carry an absolute path. If you rename or move your checkout, every registered client still points at the old path. Re-run `dkg mcp setup --force` from the new location to refresh every detected client's entry.
 
 ### Configuration sources
 
@@ -218,7 +239,7 @@ Per-turn state is kept in `~/.cache/dkg-mcp/sessions/*.json`; safe to delete at 
 
 ## Troubleshooting
 
-- **`dkg mcp setup` says "no MCP-aware clients detected"** → install Cursor, Claude Code, Continue, or Cline (or run with `--print-only` to copy the JSON yourself).
+- **`dkg mcp setup` says "no MCP-aware clients detected"** → install one of Cursor, Claude Code, Claude Desktop, Windsurf, VSCode + GitHub Copilot Chat, or Cline. Continue and Codex CLI are NOT auto-detected today (Continue's YAML-config shape and Codex CLI's TOML format ship in a follow-up); users with those clients should run `dkg mcp setup --print-only` and paste the JSON manually.
 - **`dkg mcp` says command not found** → the umbrella CLI isn't on PATH. Verify with `which dkg`. Note: `npm i -g @origintrail-official/dkg` does NOT propagate transitive bins to global PATH, so the `dkg-mcp` bin is only reachable through `dkg mcp serve` or via a direct `npx -p @origintrail-official/dkg-mcp dkg-mcp`.
 - **MCP not visible in client** → restart the client. On Cursor, verify `~/.cursor/mcp.json` is syntactically valid JSON. On Claude Code, run `claude mcp list`.
 - **"No project specified"** → set `contextGraph: <id>` in `.dkg/config.yaml`, or pass `projectId` on each tool call, or export `DKG_PROJECT`.

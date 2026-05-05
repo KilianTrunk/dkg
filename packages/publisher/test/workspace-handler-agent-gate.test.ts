@@ -41,7 +41,11 @@ function workspaceMessage(name: string, operationId: string): Uint8Array {
   });
 }
 
-async function signWorkspaceMessage(wallet: ethers.Wallet, payload: Uint8Array): Promise<Uint8Array> {
+async function signWorkspaceMessage(
+  wallet: ethers.Wallet,
+  payload: Uint8Array,
+  claimedAgentAddress = wallet.address,
+): Promise<Uint8Array> {
   const timestamp = new Date().toISOString();
   const signingPayload = computeGossipSigningPayload(
     GOSSIP_TYPE_WORKSPACE_PUBLISH,
@@ -54,7 +58,7 @@ async function signWorkspaceMessage(wallet: ethers.Wallet, payload: Uint8Array):
     version: GOSSIP_ENVELOPE_VERSION,
     type: GOSSIP_TYPE_WORKSPACE_PUBLISH,
     contextGraphId: CONTEXT_GRAPH_ID,
-    agentAddress: wallet.address,
+    agentAddress: claimedAgentAddress,
     timestamp,
     signature: ethers.getBytes(signature),
     payload,
@@ -66,6 +70,15 @@ async function insertAgentGate(predicate: string, agentAddress: string): Promise
     subject: DATA_GRAPH,
     predicate,
     object: `"${agentAddress}"`,
+    graph: META_GRAPH,
+  }]);
+}
+
+async function insertPeerGate(peerId: string): Promise<void> {
+  await store.insert([{
+    subject: DATA_GRAPH,
+    predicate: DKG_ONTOLOGY.DKG_ALLOWED_PEER,
+    object: `"${peerId}"`,
     graph: META_GRAPH,
   }]);
 }
@@ -197,5 +210,55 @@ describe('SharedMemoryHandler agent-gated gossip', () => {
     await handler.handle(await signWorkspaceMessage(denied, raw), PEER_ID);
 
     await expectWorkspaceEmpty();
+  });
+
+  it.each([
+    ['DKG_ALLOWED_AGENT', DKG_ONTOLOGY.DKG_ALLOWED_AGENT],
+    ['DKG_PARTICIPANT_AGENT', DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT],
+  ])('rejects legacy raw SWM gossip when DKG_ALLOWED_PEER is combined with %s', async (_label, predicate) => {
+    const allowed = ethers.Wallet.createRandom();
+    await insertPeerGate(PEER_ID);
+    await insertAgentGate(predicate, allowed.address);
+
+    await handler.handle(workspaceMessage('Mixed Raw', `ws-agent-gate-mixed-raw-${_label}`), PEER_ID);
+
+    await expectWorkspaceEmpty();
+  });
+
+  it.each([
+    ['DKG_ALLOWED_AGENT', DKG_ONTOLOGY.DKG_ALLOWED_AGENT],
+    ['DKG_PARTICIPANT_AGENT', DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT],
+  ])('rejects signed SWM gossip with a forged %s envelope claim even when DKG_ALLOWED_PEER passes', async (_label, predicate) => {
+    const allowed = ethers.Wallet.createRandom();
+    const denied = ethers.Wallet.createRandom();
+    handler = new SharedMemoryHandler(store, new TypedEventBus(), {
+      sharedMemoryOwnedEntities: workspaceOwned,
+      localAgentAddresses: () => [allowed.address],
+    });
+    await insertPeerGate(PEER_ID);
+    await insertAgentGate(predicate, allowed.address);
+
+    const raw = workspaceMessage('Mixed Forged', `ws-agent-gate-mixed-forged-${_label}`);
+    await handler.handle(await signWorkspaceMessage(denied, raw, allowed.address), PEER_ID);
+
+    await expectWorkspaceEmpty();
+  });
+
+  it.each([
+    ['DKG_ALLOWED_AGENT', DKG_ONTOLOGY.DKG_ALLOWED_AGENT],
+    ['DKG_PARTICIPANT_AGENT', DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT],
+  ])('accepts signed SWM gossip only when DKG_ALLOWED_PEER and %s both pass', async (label, predicate) => {
+    const allowed = ethers.Wallet.createRandom();
+    handler = new SharedMemoryHandler(store, new TypedEventBus(), {
+      sharedMemoryOwnedEntities: workspaceOwned,
+      localAgentAddresses: () => [allowed.address],
+    });
+    await insertPeerGate(PEER_ID);
+    await insertAgentGate(predicate, allowed.address);
+
+    const raw = workspaceMessage(`${label} Mixed Signed`, `ws-agent-gate-mixed-signed-${label}`);
+    await handler.handle(await signWorkspaceMessage(allowed, raw), PEER_ID);
+
+    await expectStoredName(`${label} Mixed Signed`);
   });
 });

@@ -6726,6 +6726,10 @@ export class DKGAgent {
     name: string;
     description?: string;
     creator?: string;
+    /** Wallet-scoped curator DID (from _meta / ontology), if present. */
+    curator?: string;
+    /** Declared access policy literal, e.g. public / private. */
+    accessPolicy?: string;
     createdAt?: string;
     isSystem: boolean;
     subscribed: boolean;
@@ -6735,13 +6739,15 @@ export class DKGAgent {
     const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
     const agentsGraph = paranetDataGraphUri(SYSTEM_PARANETS.AGENTS);
     const result = await this.store.query(`
-      SELECT ?ctxGraph ?name ?desc ?creator ?created ?isSystem WHERE {
+      SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access ?isSystem WHERE {
         {
           GRAPH <${ontologyGraph}> {
             ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}> .
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CREATOR}> ?creator }
+            OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator }
+            OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?access }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CREATED_AT}> ?created }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_SYSTEM_PARANET}> . BIND(true AS ?isSystem) }
           }
@@ -6751,6 +6757,8 @@ export class DKGAgent {
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CREATOR}> ?creator }
+            OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator }
+            OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?access }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CREATED_AT}> ?created }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_SYSTEM_PARANET}> . BIND(true AS ?isSystem) }
           }
@@ -6761,7 +6769,7 @@ export class DKGAgent {
     const prefix = 'did:dkg:context-graph:';
     const seen = new Map<string, {
       id: string; uri: string; name: string; description?: string;
-      creator?: string; createdAt?: string; isSystem: boolean;
+      creator?: string; curator?: string; accessPolicy?: string; createdAt?: string; isSystem: boolean;
       subscribed: boolean; synced: boolean; onChainId?: string;
     }>();
 
@@ -6778,6 +6786,8 @@ export class DKGAgent {
           name: stripLiteral(row['name'] ?? id),
           description: row['desc'] ? stripLiteral(row['desc']) : undefined,
           creator: row['creator'],
+          ...(row['curator'] ? { curator: row['curator'] } : {}),
+          ...(row['access'] ? { accessPolicy: stripLiteral(row['access']) } : {}),
           createdAt: row['created'] ? stripLiteral(row['created']) : undefined,
           isSystem: !!row['isSystem'],
           subscribed: sub?.subscribed ?? false,
@@ -6797,12 +6807,14 @@ export class DKGAgent {
       const metaGraph = paranetMetaGraphUri(id);
       const pUri = paranetDataGraphUri(id);
       const metaResult = await this.store.query(`
-        SELECT ?name ?desc ?creator ?created WHERE {
+        SELECT ?name ?desc ?creator ?created ?curator ?access WHERE {
           GRAPH <${metaGraph}> {
             <${pUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}> .
             OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name }
             OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc }
             OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?creator }
+            OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator }
+            OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?access }
             OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.DKG_CREATED_AT}> ?created }
           }
         } LIMIT 1
@@ -6817,6 +6829,8 @@ export class DKGAgent {
           name: stripLiteral(row['name'] ?? sub.name ?? id),
           description: row['desc'] ? stripLiteral(row['desc']) : undefined,
           creator: row['creator'],
+          ...(row['curator'] ? { curator: row['curator'] } : {}),
+          ...(row['access'] ? { accessPolicy: stripLiteral(row['access']) } : {}),
           createdAt: row['created'] ? stripLiteral(row['created']) : undefined,
           isSystem: false,
           subscribed: sub.subscribed,

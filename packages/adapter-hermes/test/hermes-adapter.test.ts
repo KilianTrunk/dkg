@@ -1654,6 +1654,25 @@ client.create_context_graph(
     access_policy=1,
     allowed_agents=["0x" + "a" * 40, "0x" + "B" * 40],
 )
+
+# Round 3 — access_policy=True (Python bool, which is a subclass of int)
+# would have silently sent JSON true to the daemon under the previous
+# isinstance(access_policy, int) check; the daemon's typeof check would
+# then drop the field and resolve to default-public, the opposite of a
+# programmatic caller's intent. Now rejected at the client layer with a
+# clear error before any daemon contact.
+bool_true_result = client.create_context_graph("BoolTrue", "x", access_policy=True)
+assert bool_true_result["success"] is False, bool_true_result
+assert "access_policy" in bool_true_result["error"], bool_true_result
+bool_false_result = client.create_context_graph("BoolFalse", "x", access_policy=False)
+assert bool_false_result["success"] is False, bool_false_result
+# Round 3 — only meaningful values {0, 1} accepted; other ints rejected.
+out_of_range = client.create_context_graph("Two", "x", access_policy=2)
+assert out_of_range["success"] is False, out_of_range
+assert "0" in out_of_range["error"] and "1" in out_of_range["error"], out_of_range
+# access_policy=0 is the open/discoverable value — accepted.
+client.create_context_graph("OpenExplicit", "x", access_policy=0)
+
 client.subscribe("cg:test", include_shared_memory=True)
 client.write_assertion("a b", "cg:test", [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "sub")
 client.discard_assertion("a b", "cg:test")
@@ -1672,6 +1691,7 @@ assert calls == [
     ("POST", "/api/context-graph/create", {"id": "my-project", "name": "My Project", "description": "desc"}),
     ("POST", "/api/context-graph/create", {"id": "curated", "name": "Curated", "description": "private cg", "accessPolicy": 1}),
     ("POST", "/api/context-graph/create", {"id": "team", "name": "Team", "description": "shared", "accessPolicy": 1, "allowedAgents": [_VALID_ADDR_A, _VALID_ADDR_B]}),
+    ("POST", "/api/context-graph/create", {"id": "openexplicit", "name": "OpenExplicit", "description": "x", "accessPolicy": 0}),
     ("POST", "/api/context-graph/subscribe", {"contextGraphId": "cg:test", "includeSharedMemory": True}),
     ("POST", "/api/assertion/a%20b/write", {"contextGraphId": "cg:test", "quads": [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "subGraphName": "sub"}),
     ("POST", "/api/assertion/a%20b/discard", {"contextGraphId": "cg:test"}),

@@ -505,12 +505,32 @@ class DKGClient:
             cg_id = _slugify_context_graph_id(name)
         if not _CG_ID_RE.match(cg_id):
             return {"success": False, "error": "Context graph id must be a lowercase slug using letters, numbers, and hyphens."}
+        # Round 3 — `bool` is a subclass of `int` in Python, so plain
+        # `isinstance(access_policy, int)` accepts `True` / `False` and the
+        # body would carry JSON `true` / `false`. The daemon route at
+        # `packages/cli/src/daemon/routes/context-graph.ts:455` checks
+        # `typeof accessPolicy === 'number'`, which excludes JSON booleans —
+        # the field would be silently dropped and the CG would resolve to
+        # the daemon's default (public), the opposite of a programmatic
+        # caller's intent. Use `type(... ) is int` to exclude bool, and
+        # additionally restrict to the meaningful values {0, 1} since
+        # other ints would be rejected by the agent layer anyway
+        # (`LOCAL_ACCESS_OPEN = 0` / `LOCAL_ACCESS_CURATED = 1`).
+        if access_policy is not None:
+            if type(access_policy) is not int or access_policy not in (0, 1):
+                return {
+                    "success": False,
+                    "error": (
+                        "access_policy must be 0 (open) or 1 (curated). "
+                        f"Got: {type(access_policy).__name__}={access_policy!r}."
+                    ),
+                }
         body: Dict[str, Any] = {
             "id": cg_id,
             "name": name,
             "description": description,
         }
-        if isinstance(access_policy, int):
+        if access_policy is not None:
             body["accessPolicy"] = access_policy
         if isinstance(allowed_agents, list) and allowed_agents:
             body["allowedAgents"] = allowed_agents

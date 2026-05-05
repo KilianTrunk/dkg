@@ -3083,6 +3083,33 @@ export class DkgNodePlugin {
         execute: async (_toolCallId, args) => this.handleSharedMemoryPublish(args),
       },
       {
+        name: 'dkg_share',
+        description:
+          'Direct Shared Working Memory write — gossip-replicate a concise free-text fact ' +
+          'to the team. Lightweight alternative to the canonical dkg_assertion_create → ' +
+          'dkg_assertion_write → dkg_assertion_promote flow; use the canonical flow when the ' +
+          'data needs to be staged, retracted, or promoted to Verified Memory.',
+        parameters: {
+          type: 'object',
+          properties: {
+            content: {
+              type: 'string',
+              description: 'Free-text knowledge to share with the team.',
+            },
+            context_graph_id: {
+              type: 'string',
+              description: 'Target context graph ID.',
+            },
+            sub_graph_name: {
+              type: 'string',
+              description: 'Optional sub-graph scope.',
+            },
+          },
+          required: ['content', 'context_graph_id'],
+        },
+        execute: async (_toolCallId, args) => this.handleShare(args),
+      },
+      {
         name: 'memory_search',
         description:
           'Search your DKG-backed memory across all trust tiers (Working Memory drafts, ' +
@@ -4229,6 +4256,31 @@ export class DkgNodePlugin {
       }
       const result = await this.publisher.publishSharedMemory({ contextGraphId, rootEntities, subGraphName });
       return this.json(registration ? { ...result, registration } : result);
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      const content = String(args.content ?? '').trim();
+      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      if (!content) return this.error('"content" is required.');
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      const rawSub = args.sub_graph_name;
+      const subGraphName = rawSub === undefined || rawSub === null
+        ? undefined
+        : (String(rawSub).trim() || undefined);
+
+      await this.ensureNodeAgentAddress();
+      const addr = this.resolveDefaultAgentAddress() ?? 'unknown';
+      const quads = [{
+        subject: `urn:openclaw:${addr}:shared`,
+        predicate: 'urn:openclaw:sharedContent',
+        object: content,
+      }];
+      const result = await this.client.share(contextGraphId, quads, { subGraphName });
+      return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
     }

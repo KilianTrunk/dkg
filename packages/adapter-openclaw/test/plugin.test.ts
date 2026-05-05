@@ -631,6 +631,8 @@ describe('DkgNodePlugin', () => {
     expect(toolNames).toContain('dkg_sub_graph_create');
     expect(toolNames).toContain('dkg_sub_graph_list');
     expect(toolNames).toContain('dkg_shared_memory_publish');
+    // dkg_share — direct SWM convenience helper, parity with Hermes (#382, #408).
+    expect(toolNames).toContain('dkg_share');
     // Legacy V9 paranet aliases are removed as of v10-rc.
     expect(toolNames).not.toContain('dkg_list_paranets');
     expect(toolNames).not.toContain('dkg_paranet_create');
@@ -1259,6 +1261,86 @@ describe('DkgNodePlugin', () => {
       expect(fetchMock).not.toHaveBeenCalled();
       expect(bad.content[0].text).toContain('root_entities');
       expect(bad.content[0].text).toContain('non-empty array');
+    });
+
+    it('dkg_share is registered with required content and context_graph_id', () => {
+      const { byName } = setupPluginWithFetch({});
+      const tool = byName.get('dkg_share');
+      expect(tool).toBeDefined();
+      expect(tool!.parameters.required).toEqual(['content', 'context_graph_id']);
+      const props = tool!.parameters.properties;
+      expect(props.content?.type).toBe('string');
+      expect(props.context_graph_id?.type).toBe('string');
+      expect(props.sub_graph_name?.type).toBe('string');
+    });
+
+    it('dkg_share rejects missing/empty content without making a daemon call', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-1' });
+      const result = await byName.get('dkg_share')!.execute('tc', { context_graph_id: 'ctx' });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain('content');
+
+      const blank = await byName.get('dkg_share')!.execute('tc', { content: '   ', context_graph_id: 'ctx' });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(blank.content[0].text).toContain('content');
+    });
+
+    it('dkg_share rejects missing/empty context_graph_id without making a daemon call', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-2' });
+      const result = await byName.get('dkg_share')!.execute('tc', { content: 'fact' });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain('context_graph_id');
+    });
+
+    it('dkg_share forwards content as a canned quad to /api/shared-memory/write with localOnly=false', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-3' });
+      await byName.get('dkg_share')!.execute('tc', {
+        content: 'hello',
+        context_graph_id: 'ctx',
+      });
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe('http://localhost:9200/api/shared-memory/write');
+      expect(init.method).toBe('POST');
+      const body = JSON.parse(init.body as string);
+      expect(body.contextGraphId).toBe('ctx');
+      expect(body.localOnly).toBe(false);
+      expect(body.subGraphName).toBeUndefined();
+      expect(body.quads).toHaveLength(1);
+      const [quad] = body.quads;
+      expect(quad.subject).toMatch(/^urn:openclaw:.+:shared$/);
+      expect(quad.predicate).toBe('urn:openclaw:sharedContent');
+      expect(quad.object).toBe('hello');
+    });
+
+    it('dkg_share plumbs sub_graph_name through to subGraphName for sub-graph-scoped writes', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-4' });
+      await byName.get('dkg_share')!.execute('tc', {
+        content: 'hello',
+        context_graph_id: 'ctx',
+        sub_graph_name: 'protocols',
+      });
+      const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+      expect(body.subGraphName).toBe('protocols');
+    });
+
+    it('dkg_share surfaces daemon-offline failures via the standard daemonError helper', async () => {
+      const fetchMock = vi.fn(async () => { throw new Error('fetch failed: ECONNREFUSED'); });
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+      const plugin = new DkgNodePlugin({ daemonUrl: 'http://localhost:9200' });
+      const tools: OpenClawTool[] = [];
+      plugin.register({
+        config: {},
+        registerTool: (t) => tools.push(t),
+        registerHook: () => {},
+        on: () => {},
+        logger: {},
+      });
+      const byName = new Map(tools.map((t) => [t.name, t] as const));
+      const result = await byName.get('dkg_share')!.execute('tc', {
+        content: 'hello',
+        context_graph_id: 'ctx',
+      });
+      expect(result.content[0].text).toContain('DKG daemon is not reachable');
     });
 
     it('dkg_query explicitly rejects the v9 paranet_id field with a clear error', async () => {

@@ -420,16 +420,8 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
     });
   }
 
-  // POST /api/epcis/capture  { epcisDocument: {...} | { public, private }, publishOptions?: { accessPolicy? } }
+  // POST /api/epcis/capture  { contextGraphId?, subGraphName?, epcisDocument, publishOptions? }
   if (req.method === "POST" && path === "/api/epcis/capture") {
-    const captureContextGraphId =
-      config.epcis?.contextGraphId ?? config.epcis?.paranetId;
-    if (!captureContextGraphId) {
-      return jsonResponse(res, 503, {
-        error:
-          "EPCIS plugin is not configured (missing epcis.contextGraphId in config)",
-      });
-    }
     if (!config.publisher?.enabled) {
       return jsonResponse(res, 503, {
         error: "PublisherDisabled",
@@ -452,13 +444,63 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
         message: "Invalid JSON in request body",
       });
     }
-    const { epcisDocument, publishOptions } = parsed;
+    const { epcisDocument, publishOptions, contextGraphId: bodyContextGraphId, subGraphName: bodySubGraphName } = parsed;
     if (!epcisDocument) {
       return jsonResponse(res, 400, {
         error: "InvalidContent",
         message: 'Missing "epcisDocument" in request body',
       });
     }
+
+    // Resolve target context graph: per-request body field, otherwise
+    // fall back to epcis.contextGraphId, otherwise legacy paranetId.
+    let captureContextGraphId: string;
+    if (bodyContextGraphId !== undefined && bodyContextGraphId !== null) {
+      if (typeof bodyContextGraphId !== "string") {
+        return jsonResponse(res, 400, {
+          error: "InvalidContent",
+          message: '"contextGraphId" must be a string',
+        });
+      }
+      const cgValidation = validateContextGraphId(bodyContextGraphId);
+      if (!cgValidation.valid) {
+        return jsonResponse(res, 400, {
+          error: "InvalidContent",
+          message: `Invalid "contextGraphId": ${cgValidation.reason}`,
+        });
+      }
+      captureContextGraphId = bodyContextGraphId;
+    } else {
+      const fallback = config.epcis?.contextGraphId ?? config.epcis?.paranetId;
+      if (!fallback) {
+        return jsonResponse(res, 400, {
+          error: "InvalidContent",
+          message:
+            'Missing "contextGraphId": provide it in the request body or configure epcis.contextGraphId (or legacy epcis.paranetId)',
+        });
+      }
+      captureContextGraphId = fallback;
+    }
+
+    // Sub-graph is per-payload only — no fallback. Validate when present.
+    let captureSubGraphName: string | undefined;
+    if (bodySubGraphName !== undefined && bodySubGraphName !== null) {
+      if (typeof bodySubGraphName !== "string" || bodySubGraphName === "") {
+        return jsonResponse(res, 400, {
+          error: "InvalidContent",
+          message: 'subGraphName must be a non-empty string (omit the field for root graph)',
+        });
+      }
+      const sgValidation = validateSubGraphName(bodySubGraphName);
+      if (!sgValidation.valid) {
+        return jsonResponse(res, 400, {
+          error: "InvalidContent",
+          message: `Invalid "subGraphName": ${sgValidation.reason}`,
+        });
+      }
+      captureSubGraphName = bodySubGraphName;
+    }
+
     const epcisPublisher: EpcisAsyncPublisher = {
       async publishAsync(contextGraphId, content, opts) {
         return agent.publishAsync(
@@ -470,7 +512,12 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
     };
     try {
       const result = await handleCaptureAsync(
-        { epcisDocument, publishOptions },
+        {
+          epcisDocument,
+          publishOptions,
+          contextGraphId: captureContextGraphId,
+          subGraphName: captureSubGraphName,
+        },
         { contextGraphId: captureContextGraphId, publisher: epcisPublisher },
       );
       return jsonResponse(res, 202, result);

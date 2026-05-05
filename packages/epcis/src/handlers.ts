@@ -1,7 +1,7 @@
 import { createValidator } from './validation.js';
 import { buildEpcisQuery } from './query-builder.js';
 import { parseQueryParams, hasValidDateRange, encodePageToken } from './utils.js';
-import type { AsyncPublisher, CaptureAcceptedResult, CaptureOptions, QueryEngine, EPCISQueryDocumentResponse } from './types.js';
+import type { AsyncPublisher, CaptureAcceptedResult, CaptureOptions, PublisherCaptureOpts, QueryEngine, EPCISQueryDocumentResponse } from './types.js';
 
 export interface AsyncCaptureConfig {
   contextGraphId: string;
@@ -11,6 +11,18 @@ export interface AsyncCaptureConfig {
 export interface CaptureRequest {
   epcisDocument: unknown;
   publishOptions?: CaptureOptions;
+  /**
+   * Optional per-request override for the target context graph. When
+   * present takes precedence over `AsyncCaptureConfig.contextGraphId`,
+   * which acts as the daemon-level fallback.
+   */
+  contextGraphId?: string;
+  /**
+   * Optional sub-graph name within the target context graph. Threaded
+   * straight into the publisher's opts — no fallback, sub-graphs are
+   * inherently per-payload.
+   */
+  subGraphName?: string;
 }
 
 export class EpcisValidationError extends Error {
@@ -189,11 +201,17 @@ export async function handleCaptureAsync(
     throw new EpcisValidationError(validation.errors!);
   }
 
-  const opts = request.publishOptions
-    ? { accessPolicy: request.publishOptions.accessPolicy, allowedPeers: request.publishOptions.allowedPeers }
+  const effectiveContextGraphId = request.contextGraphId ?? config.contextGraphId;
+
+  const opts: PublisherCaptureOpts | undefined = (request.publishOptions || request.subGraphName)
+    ? {
+        ...(request.publishOptions?.accessPolicy !== undefined && { accessPolicy: request.publishOptions.accessPolicy }),
+        ...(request.publishOptions?.allowedPeers !== undefined && { allowedPeers: request.publishOptions.allowedPeers }),
+        ...(request.subGraphName !== undefined && { subGraphName: request.subGraphName }),
+      }
     : undefined;
 
-  const result = await config.publisher.publishAsync(config.contextGraphId, content, opts);
+  const result = await config.publisher.publishAsync(effectiveContextGraphId, content, opts);
 
   return {
     captureID: result.captureID,

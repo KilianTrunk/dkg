@@ -144,4 +144,56 @@ describe('handleCaptureAsync', () => {
 
     expect(publisher.calls).toHaveLength(0);
   });
+
+  it('uses config.contextGraphId when request omits one (back-compat)', async () => {
+    const publisher = trackingAsyncPublisher();
+    await handleCaptureAsync(
+      { epcisDocument: VALID_OBJECT_EVENT_DOC },
+      { contextGraphId: CONTEXT_GRAPH_ID, publisher },
+    );
+
+    expect(publisher.calls).toHaveLength(1);
+    expect(publisher.calls[0]?.contextGraphId).toBe(CONTEXT_GRAPH_ID);
+  });
+
+  it('per-request contextGraphId overrides the config fallback', async () => {
+    const publisher = trackingAsyncPublisher();
+    await handleCaptureAsync(
+      { epcisDocument: VALID_OBJECT_EVENT_DOC, contextGraphId: 'override-cg' },
+      { contextGraphId: CONTEXT_GRAPH_ID, publisher },
+    );
+
+    expect(publisher.calls).toHaveLength(1);
+    expect(publisher.calls[0]?.contextGraphId).toBe('override-cg');
+  });
+
+  it('threads subGraphName into the publisher opts', async () => {
+    const publisher = trackingAsyncPublisher();
+    await handleCaptureAsync(
+      { epcisDocument: VALID_OBJECT_EVENT_DOC, subGraphName: 'research' },
+      { contextGraphId: CONTEXT_GRAPH_ID, publisher },
+    );
+
+    expect(publisher.calls).toHaveLength(1);
+    expect(publisher.calls[0]?.options).toEqual({ subGraphName: 'research' });
+  });
+
+  it('threads subGraphName alongside publishOptions', async () => {
+    const publisher = trackingAsyncPublisher();
+    await handleCaptureAsync(
+      {
+        epcisDocument: VALID_OBJECT_EVENT_DOC,
+        subGraphName: 'research',
+        publishOptions: { accessPolicy: 'allowList', allowedPeers: ['peer-a'] },
+      },
+      { contextGraphId: CONTEXT_GRAPH_ID, publisher },
+    );
+
+    expect(publisher.calls).toHaveLength(1);
+    expect(publisher.calls[0]?.options).toEqual({
+      accessPolicy: 'allowList',
+      allowedPeers: ['peer-a'],
+      subGraphName: 'research',
+    });
+  });
 });

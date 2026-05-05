@@ -45,11 +45,20 @@ export interface CaptureOptions {
   allowedPeers?: string[];
 }
 
+/**
+ * Options the EPCIS handler hands to the async publisher. Wire-level
+ * `publishOptions` (CaptureOptions) plus a per-payload `subGraphName`
+ * lifted from the top of the capture body.
+ */
+export interface PublisherCaptureOpts extends CaptureOptions {
+  subGraphName?: string;
+}
+
 export interface AsyncPublisher {
   publishAsync(
     contextGraphId: string,
     content: unknown,
-    opts?: CaptureOptions,
+    opts?: PublisherCaptureOpts,
   ): Promise<{ captureID: string }>;
 }
 

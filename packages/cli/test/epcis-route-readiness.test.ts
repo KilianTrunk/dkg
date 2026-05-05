@@ -178,4 +178,135 @@ describe('EPCIS async capture publisher readiness', () => {
       },
     ]);
   });
+
+  it('uses per-request contextGraphId and threads subGraphName into publisher opts', async () => {
+    const published: Array<{ contextGraphId: string; content: unknown; opts: unknown }> = [];
+    const ctx = createContext({
+      req: createRequest({
+        contextGraphId: 'per-request-cg',
+        subGraphName: 'research',
+        epcisDocument: VALID_OBJECT_EVENT_DOC,
+      }),
+      agent: {
+        publishAsync: async (contextGraphId: string, content: unknown, opts: unknown) => {
+          published.push({ contextGraphId, content, opts });
+          return { captureID: 'capture-route-2' };
+        },
+      } as unknown as RequestContext['agent'],
+      publisherRuntime: {
+        walletIds: ['0xpublisher'],
+        runner: {},
+        publisher: {},
+        stop: async () => {},
+      } as unknown as RequestContext['publisherRuntime'],
+    });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(202);
+    expect(published).toEqual([
+      {
+        contextGraphId: 'per-request-cg',
+        content: { private: VALID_OBJECT_EVENT_DOC },
+        opts: { subGraphName: 'research' },
+      },
+    ]);
+  });
+
+  it('falls back to legacy epcis.paranetId when neither body nor epcis.contextGraphId is set', async () => {
+    const published: Array<{ contextGraphId: string }> = [];
+    const ctx = createContext({
+      req: createRequest({ epcisDocument: VALID_OBJECT_EVENT_DOC }),
+      config: {
+        epcis: { paranetId: 'legacy-paranet' },
+        publisher: { enabled: true },
+      } as RequestContext['config'],
+      agent: {
+        publishAsync: async (contextGraphId: string) => {
+          published.push({ contextGraphId });
+          return { captureID: 'capture-route-3' };
+        },
+      } as unknown as RequestContext['agent'],
+      publisherRuntime: {
+        walletIds: ['0xpublisher'],
+        runner: {},
+        publisher: {},
+        stop: async () => {},
+      } as unknown as RequestContext['publisherRuntime'],
+    });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(202);
+    expect(published).toEqual([{ contextGraphId: 'legacy-paranet' }]);
+  });
+
+  it('returns 400 InvalidContent when neither body nor config supplies a contextGraphId', async () => {
+    const ctx = createContext({
+      req: createRequest({ epcisDocument: VALID_OBJECT_EVENT_DOC }),
+      config: {
+        epcis: {},
+        publisher: { enabled: true },
+      } as RequestContext['config'],
+      publisherRuntime: {
+        walletIds: ['0xpublisher'],
+        runner: {},
+        publisher: {},
+        stop: async () => {},
+      } as unknown as RequestContext['publisherRuntime'],
+    });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(400);
+    const body = responseBody(ctx);
+    expect(body.error).toBe('InvalidContent');
+    expect(body.message).toMatch(/contextGraphId/);
+    expect(body.message).toMatch(/epcis\.contextGraphId/);
+  });
+
+  it('returns 400 InvalidContent for an invalid per-request contextGraphId', async () => {
+    const ctx = createContext({
+      req: createRequest({
+        contextGraphId: 'bad cg with spaces',
+        epcisDocument: VALID_OBJECT_EVENT_DOC,
+      }),
+      publisherRuntime: {
+        walletIds: ['0xpublisher'],
+        runner: {},
+        publisher: {},
+        stop: async () => {},
+      } as unknown as RequestContext['publisherRuntime'],
+    });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(400);
+    const body = responseBody(ctx);
+    expect(body.error).toBe('InvalidContent');
+    expect(body.message).toMatch(/contextGraphId/);
+  });
+
+  it('returns 400 InvalidContent for an invalid subGraphName', async () => {
+    const ctx = createContext({
+      req: createRequest({
+        subGraphName: '_reserved',
+        epcisDocument: VALID_OBJECT_EVENT_DOC,
+      }),
+      publisherRuntime: {
+        walletIds: ['0xpublisher'],
+        runner: {},
+        publisher: {},
+        stop: async () => {},
+      } as unknown as RequestContext['publisherRuntime'],
+    });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(400);
+    const body = responseBody(ctx);
+    expect(body.error).toBe('InvalidContent');
+    expect(body.message).toMatch(/subGraphName/);
+    expect(body.message).toMatch(/reserved/);
+  });
 });

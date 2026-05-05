@@ -2915,17 +2915,30 @@ assert "error" in err_sub and "sub_graph_name" in err_sub["error"], err_sub
 assert client.calls == [], client.calls
 
 # Round 2 — daemon failures must pass through untouched. The Python client
-# returns {success: False, error: ...} on errors (it doesn't throw), so a
-# write that 4xx'd at the daemon would otherwise have synthetic subject /
-# root_entities attached, masking the failure for chained publish calls.
+# returns failure shapes ({success: False}, {ok: False}, or bare {error: ...})
+# on errors (it doesn't throw), so a write that 4xx'd at the daemon would
+# otherwise have synthetic subject / root_entities attached, masking the
+# failure for chained publish calls. _handle_share routes through
+# _client_result_failed() so all three shapes are caught the same way as
+# elsewhere in the module.
 class FailingClient:
+    def __init__(self, failure):
+        self.failure = failure
     def share(self, *args, **kwargs):
-        return {"success": False, "error": "context graph not registered"}
-provider._client = FailingClient()
-fail_result = json.loads(provider.handle_tool_call("dkg_share", {"content": "x", "context_graph_id": "cg:test"}))
-assert fail_result.get("success") is False, fail_result
-assert "subject" not in fail_result, fail_result
-assert "root_entities" not in fail_result, fail_result
+        return self.failure
+
+for failure_shape in [
+    {"success": False, "error": "context graph not registered"},
+    {"ok": False, "error": "auth required"},
+    {"error": "stream closed"},
+]:
+    provider._client = FailingClient(failure_shape)
+    fail_result = json.loads(provider.handle_tool_call("dkg_share", {"content": "x", "context_graph_id": "cg:test"}))
+    assert "subject" not in fail_result, (failure_shape, fail_result)
+    assert "root_entities" not in fail_result, (failure_shape, fail_result)
+    # Failure result must pass through untouched.
+    for key, expected in failure_shape.items():
+        assert fail_result.get(key) == expected, (failure_shape, fail_result)
 provider._client = client
 `;
     const result = spawnSync('python', ['-B', '-c', script], {

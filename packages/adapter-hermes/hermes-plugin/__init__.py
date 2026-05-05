@@ -1415,12 +1415,14 @@ class DKGMemoryProvider(MemoryProvider):
         }]
         result = self._client.share(cg, quads, sub_graph_name=_first_text(args, "sub_graph_name"))
         # Only surface the minted subject on a successful write. Hermes'
-        # Python client returns `{success: False, error: ...}` on failures
-        # (it doesn't throw). Attaching subject/root_entities to those
-        # would mask the failure and let chained dkg_shared_memory_publish
-        # calls publish a root entity that was never written. Pass the
-        # raw failure result through untouched.
-        if isinstance(result, dict) and result.get("success") is False:
+        # Python client returns failure shapes (`{success: False, error: ...}`,
+        # `{ok: False}`, or bare `{error: ...}`) without throwing — see
+        # client.py:213 and the canonical detector at _client_result_failed
+        # below. Attaching subject/root_entities to a failure would mask it
+        # and let chained dkg_shared_memory_publish calls publish a root
+        # entity that was never written. Use the canonical helper so this
+        # path stays aligned with every other failure check in the module.
+        if _client_result_failed(result):
             return json.dumps(result)
         # Surface the minted subject so callers can target THIS share in a
         # follow-up `dkg_shared_memory_publish({ root_entities: [...] })`.

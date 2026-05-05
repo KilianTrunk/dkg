@@ -545,11 +545,17 @@ assert config["allow_context_graph_admin_tools"] is False, config
     expect(plan.state.bridge).toEqual({ url: 'http://127.0.0.1:9202' });
   });
 
-  it('detects provider conflicts and preserves user config on disconnect/uninstall', async () => {
+  it('detects provider conflicts (with --preserve-provider) and preserves user config on disconnect/uninstall', async () => {
     const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
     writeFileSync(join(hermesHome, 'config.yaml'), 'memory:\n  provider: mem0\n');
 
-    expect(() => setupHermesProfile({ hermesHome, memoryMode: 'provider' })).toThrow('memory.provider: mem0');
+    // S4 step 2 (issue #386): the throw-on-conflict assertion now lives
+    // behind `preserveProvider: true` (formerly the default). Default
+    // behavior (without the flag) replaces with backup; the rest of this
+    // test exercises the `--preserve-provider` opt-out path so the
+    // historical assertions stay relevant.
+    expect(() => setupHermesProfile({ hermesHome, memoryMode: 'provider', preserveProvider: true }))
+      .toThrow('memory.provider: mem0');
 
     const plan = setupHermesProfile({ hermesHome, memoryMode: 'tools-only' });
     const verify = verifyHermesProfile({ hermesHome });
@@ -594,11 +600,16 @@ assert config["allow_context_graph_admin_tools"] is False, config
     await expect(runDoctor({ hermesHome, memoryMode: 'provider' })).resolves.toBeUndefined();
   });
 
-  it('detects provider conflicts when the top-level memory block has an inline comment', () => {
+  it('detects provider conflicts (with --preserve-provider) when the top-level memory block has an inline comment', () => {
     const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
     writeFileSync(join(hermesHome, 'config.yaml'), 'memory: # existing provider\n  provider: mem0\n');
 
-    expect(() => setupHermesProfile({ hermesHome, memoryMode: 'provider' })).toThrow('memory.provider: mem0');
+    // S4 step 2 (issue #386): inline-comment detection still works
+    // under `preserveProvider: true` — proves the YAML parser correctly
+    // skips comments when finding the configured provider, even on the
+    // throw path.
+    expect(() => setupHermesProfile({ hermesHome, memoryMode: 'provider', preserveProvider: true }))
+      .toThrow('memory.provider: mem0');
   });
 
   it('ignores nested memory provider blocks when managing Hermes provider config', () => {
@@ -1286,6 +1297,219 @@ assert config["allow_context_graph_admin_tools"] is False, config
     expect(result.state?.daemonUrl).toBe('http://127.0.0.1:9200');
 
     warnSpy.mockRestore();
+  });
+
+  // ---------------------------------------------------------------------------
+  // S4 step 2 — replace-by-default + backup + prior-provider capture
+  // (issue #386, contract §4 + parity-matrix.md Layer 4 + H-AC-27..31).
+  // ---------------------------------------------------------------------------
+
+  // H-AC-27: default `runHermesSetup` replaces an existing non-DKG
+  // memory.provider with the managed DKG block.
+  it('H-AC-27: replaces existing non-DKG memory.provider with managed DKG block by default', async () => {
+    const { runHermesSetup, setupHermesProfile } = await import('../src/setup.js');
+    void runHermesSetup; // silence unused-import in case orchestrator path is not exercised here
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-replace-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    writeFileSync(configPath, 'memory:\n  provider: redis\n  url: redis://localhost\n');
+
+    setupHermesProfile({ hermesHome });
+
+    const after = readFileSync(configPath, 'utf-8');
+    expect(after).toContain('# BEGIN DKG ADAPTER HERMES MANAGED');
+    expect(after).toContain('# END DKG ADAPTER HERMES MANAGED');
+    expect(after).toContain('provider: dkg');
+  });
+
+  // H-AC-28: replacement writes a timestamped backup at
+  // `<hermesHome>/config.yaml.bak.<unix-ts-ms>`. Bytes equal pre-seeded
+  // config.yaml (whole-file backup, not partial).
+  it('H-AC-28: replacement writes timestamped backup with verbatim original bytes', async () => {
+    const { setupHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-backup-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    const original = 'memory:\n  provider: claude-memory\n  api_key: sk-fake\n';
+    writeFileSync(configPath, original);
+
+    setupHermesProfile({ hermesHome });
+
+    const entries = readdirSync(hermesHome);
+    const backups = entries.filter((e) => /^config\.yaml\.bak\.\d+$/.test(e));
+    expect(backups.length).toBe(1);
+    expect(readFileSync(join(hermesHome, backups[0]), 'utf-8')).toBe(original);
+  });
+
+  // H-AC-29: replacement captures prior provider in adapter state.
+  // `setup-state.json.priorMemoryProvider` is `{ provider, configBackupPath, capturedAt }`.
+  it('H-AC-29: replacement captures priorMemoryProvider in setup-state.json', async () => {
+    const { setupHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-capture-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    writeFileSync(configPath, 'memory:\n  provider: openai-memory\n');
+
+    setupHermesProfile({ hermesHome });
+
+    const stateRaw = readFileSync(join(hermesHome, '.dkg-adapter-hermes', 'setup-state.json'), 'utf-8');
+    const state = JSON.parse(stateRaw);
+    expect(state.priorMemoryProvider).toBeDefined();
+    expect(state.priorMemoryProvider.provider).toBe('openai-memory');
+    expect(state.priorMemoryProvider.configBackupPath).toMatch(/config\.yaml\.bak\.\d+$/);
+    expect(state.priorMemoryProvider.capturedAt).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/,
+    );
+  });
+
+  // H-AC-29 negative: fresh install (no prior provider) does NOT
+  // populate priorMemoryProvider.
+  it('H-AC-29 (negative): fresh install does not populate priorMemoryProvider', async () => {
+    const { setupHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-fresh-'));
+    // No pre-existing config.yaml.
+
+    setupHermesProfile({ hermesHome });
+
+    const stateRaw = readFileSync(join(hermesHome, '.dkg-adapter-hermes', 'setup-state.json'), 'utf-8');
+    const state = JSON.parse(stateRaw);
+    expect(state.priorMemoryProvider).toBeUndefined();
+    // No backup file either.
+    const entries = readdirSync(hermesHome);
+    expect(entries.filter((e) => /\.bak\./.test(e))).toEqual([]);
+  });
+
+  // H-AC-30 (adapter half): `--preserve-provider` (preserveProvider:true)
+  // refuses replacement and throws with the verbatim string from the
+  // pre-#386 code so external grep / log scrapers stay stable.
+  it('H-AC-30 (adapter): preserveProvider:true throws with verbatim message', async () => {
+    const { setupHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-preserve-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    writeFileSync(configPath, 'memory:\n  provider: redis\n');
+
+    expect(() => setupHermesProfile({ hermesHome, preserveProvider: true })).toThrow(
+      'Refusing to replace existing Hermes memory.provider: redis',
+    );
+    // No backup written when we throw.
+    const entries = readdirSync(hermesHome);
+    expect(entries.filter((e) => /\.bak\./.test(e))).toEqual([]);
+  });
+
+  // H-AC-31: re-run after a replacement does NOT take a second backup.
+  // First-wins on capture (priorMemoryProvider unchanged across re-runs).
+  it('H-AC-31: re-run after replacement does not take a second backup (first-wins capture)', async () => {
+    const { setupHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-rerun-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    writeFileSync(configPath, 'memory:\n  provider: redis\n');
+
+    setupHermesProfile({ hermesHome });
+
+    const firstRunBackups = readdirSync(hermesHome).filter((e) => /\.bak\./.test(e));
+    expect(firstRunBackups.length).toBe(1);
+    const firstStateRaw = readFileSync(join(hermesHome, '.dkg-adapter-hermes', 'setup-state.json'), 'utf-8');
+    const firstState = JSON.parse(firstStateRaw);
+    expect(firstState.priorMemoryProvider.provider).toBe('redis');
+
+    // Second run on the now-DKG-selected profile.
+    setupHermesProfile({ hermesHome });
+
+    const secondRunBackups = readdirSync(hermesHome).filter((e) => /\.bak\./.test(e));
+    expect(secondRunBackups).toEqual(firstRunBackups);
+    const secondStateRaw = readFileSync(join(hermesHome, '.dkg-adapter-hermes', 'setup-state.json'), 'utf-8');
+    const secondState = JSON.parse(secondStateRaw);
+    // First-wins: same provider, same backup path, same capturedAt.
+    expect(secondState.priorMemoryProvider).toEqual(firstState.priorMemoryProvider);
+  });
+
+  // ---------------------------------------------------------------------------
+  // S4 step 3 — restoreHermesProfile primitive
+  // (issue #386, contract §6 + QA addendum §10C #1 + H-AC-34..36).
+  // ---------------------------------------------------------------------------
+
+  // H-AC-34: restore after replacement puts back the prior provider via
+  // the surgical line-rewrite path. Verifies the path discriminator is
+  // 'surgical' and the post-restore config has the captured provider.
+  it('H-AC-34: restoreHermesProfile via surgical path after replacement', async () => {
+    const { setupHermesProfile, restoreHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-restore-surgical-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    writeFileSync(configPath, 'memory:\n  provider: redis\n  url: redis://x\n');
+
+    setupHermesProfile({ hermesHome });
+    const result = restoreHermesProfile({ hermesHome });
+
+    expect(result.ok).toBe(true);
+    expect(result.path).toBe('surgical');
+    expect(result.restoredProvider).toBe('redis');
+    const post = readFileSync(configPath, 'utf-8');
+    expect(post).toContain('provider: redis');
+    expect(post).not.toContain('# BEGIN DKG ADAPTER HERMES MANAGED');
+  });
+
+  // H-AC-35: restore falls back to backup-file when the surgical path
+  // cannot find an active provider line (e.g. user manually deleted
+  // the memory: block from config.yaml between setup and restore).
+  it('H-AC-35: restoreHermesProfile falls back to backup-file when surgical path fails', async () => {
+    const { setupHermesProfile, restoreHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-restore-backup-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    const original = 'memory:\n  provider: openai-memory\n  api_key: sk-fake\n';
+    writeFileSync(configPath, original);
+
+    setupHermesProfile({ hermesHome });
+    // Simulate user deleting the entire memory: block after setup.
+    // The managed block remains (since DKG was selected), but no
+    // surgical-rewriteable provider line will exist after we strip it.
+    writeFileSync(configPath, '# BEGIN DKG ADAPTER HERMES MANAGED\nmemory:\n  provider: dkg\n# END DKG ADAPTER HERMES MANAGED\n');
+
+    const result = restoreHermesProfile({ hermesHome });
+
+    expect(result.ok).toBe(true);
+    expect(result.path).toBe('backup-file');
+    expect(result.restoredFrom).toMatch(/config\.yaml\.bak\.\d+$/);
+    // Whole-file restore: post-restore config matches the original bytes.
+    const post = readFileSync(configPath, 'utf-8');
+    expect(post).toBe(original);
+  });
+
+  // H-AC-36: restore reports `path: 'failed'` when both surgical AND
+  // backup-file paths fail (e.g. operator deleted the backup file
+  // AND the active config doesn't have an active provider line).
+  it('H-AC-36: restoreHermesProfile returns failed when both paths fail', async () => {
+    const { setupHermesProfile, restoreHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-restore-failed-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    writeFileSync(configPath, 'memory:\n  provider: claude-memory\n');
+
+    setupHermesProfile({ hermesHome });
+    // Delete the backup file (operator cleanup) AND strip the memory
+    // block from config.yaml (so surgical also fails).
+    const backups = readdirSync(hermesHome).filter((e) => /\.bak\./.test(e));
+    expect(backups.length).toBe(1);
+    rmSync(join(hermesHome, backups[0]));
+    writeFileSync(configPath, '# unrelated config\nlogger:\n  level: info\n');
+
+    const result = restoreHermesProfile({ hermesHome });
+
+    expect(result.ok).toBe(false);
+    expect(result.path).toBe('failed');
+    expect(result.restoreError).toContain('surgical');
+    expect(result.restoreError).toContain('backup-file');
+  });
+
+  // restoreHermesProfile noop: nothing to restore when no
+  // priorMemoryProvider was captured (fresh install).
+  it('restoreHermesProfile noop on fresh install', async () => {
+    const { setupHermesProfile, restoreHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-restore-noop-'));
+    // No pre-existing config.yaml; setup writes a fresh DKG-only one.
+    setupHermesProfile({ hermesHome });
+
+    const result = restoreHermesProfile({ hermesHome });
+
+    expect(result.ok).toBe(true);
+    expect(result.path).toBe('noop');
+    expect(result.restoredProvider).toBeUndefined();
+    expect(result.restoredFrom).toBeUndefined();
   });
 });
 

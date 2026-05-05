@@ -1,4 +1,4 @@
-import { cpSync, existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync, rmdirSync } from 'node:fs';
+import { cpSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync, mkdirSync, statSync, rmdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -15,6 +15,8 @@ import {
   type HermesMemoryMode,
   type HermesProfileMetadata,
   type HermesPublishGuardPolicy,
+  type HermesRestoreRequest,
+  type HermesRestoreResult,
   type HermesRuntimeStatus,
   type HermesSetupRequest,
   type HermesSetupResult,
@@ -45,6 +47,14 @@ export interface HermesSetupOptions {
   agentName?: string;
   memoryMode?: HermesMemoryMode;
   dryRun?: boolean;
+  /**
+   * Refuse to replace an existing non-DKG `memory.provider` in the
+   * Hermes profile config. Defaults to `false` (replace-by-default per
+   * setup-entrypoint-contract.md §2). `true` restores the pre-#386
+   * throw-on-conflict behavior. Threaded from `HermesCliOptions.preserveProvider`
+   * via `toSetupOptions`.
+   */
+  preserveProvider?: boolean;
   publishGuard?: Partial<HermesPublishGuardPolicy>;
   nodeSkillContent?: string;
 }
@@ -120,7 +130,14 @@ export function resolveHermesProfile(options: Pick<HermesSetupOptions, 'profileN
 
 export function planHermesSetup(options: HermesSetupOptions = {}): HermesSetupPlan {
   const profile = resolveHermesProfile(options);
-  const warnings = detectProviderConflict(profile, options.memoryMode ?? 'provider');
+  // S4 step 2 (issue #386): provider conflict is now handled inside
+  // `ensureManagedProviderBlock` per `preserveProvider`. Default
+  // behavior replaces with backup; `preserveProvider: true` throws the
+  // canonical "Refusing to replace existing Hermes memory.provider"
+  // message from `ensureManagedProviderBlock`. The plan-level throw at
+  // `setupHermesProfile:185` is bypassed (we no longer pre-emit warnings
+  // for non-DKG providers — that decision lives downstream now).
+  const warnings: string[] = [];
   const daemonUrl = stripTrailingSlashes(options.daemonUrl ?? 'http://127.0.0.1:9200');
   const dkgHome = resolveDkgHome({ daemonUrl });
   const bridge = normalizeBridgeConfig(options);
@@ -204,8 +221,12 @@ export function setupHermesProfile(options: HermesSetupOptions = {}): HermesSetu
 
   installHermesProviderPlugin(plan.profile);
 
+  let providerSwap: EnsureManagedProviderBlockResult['swap'] = null;
   if (plan.profile.memoryMode === 'provider') {
-    ensureManagedProviderBlock(plan.profile.configPath);
+    const result = ensureManagedProviderBlock(plan.profile.configPath, {
+      preserveProvider: options.preserveProvider === true,
+    });
+    providerSwap = result.swap;
   } else {
     removeManagedProviderBlock(plan.profile.configPath);
   }
@@ -216,10 +237,17 @@ export function setupHermesProfile(options: HermesSetupOptions = {}): HermesSetu
   }
 
   const existingState = readSetupState(plan.profile);
+  // First-wins on `priorMemoryProvider`: if a prior install already
+  // captured a snapshot, the second install's swap is ignored. Matches
+  // the OpenClaw `previousMemorySlotOwner` first-wins semantics
+  // (parity-matrix.md Layer 4 row "Idempotency on re-run").
+  const priorMemoryProvider = existingState?.priorMemoryProvider
+    ?? (providerSwap ? providerSwap : undefined);
   const state = {
     ...plan.state,
     installedAt: existingState?.installedAt ?? plan.state.installedAt,
     updatedAt: new Date().toISOString(),
+    ...(priorMemoryProvider ? { priorMemoryProvider } : {}),
   };
   writeOwnedJson(join(plan.profile.stateDir, 'setup-state.json'), state);
   plan.state = state;
@@ -334,6 +362,180 @@ export function uninstallHermesProfile(options: HermesSetupOptions = {}): Hermes
   }
   removeEmptyDir(profile.stateDir);
   return plan;
+}
+
+/**
+ * `restoreHermesProfile` — S4 step 3 of execution-plan.md §3.S4
+ * (issue #386). Reads `state.priorMemoryProvider` (captured by S4.2's
+ * replace-by-default branch) and attempts to put
+ * `<hermesHome>/config.yaml` back to its pre-replacement state.
+ *
+ * Behavior per setup-entrypoint-contract.md §6 + QA addendum §10C #1:
+ *
+ *   1. Absent `priorMemoryProvider` → `path: 'noop'`, `ok: true`.
+ *      Nothing to restore (fresh install or already-DKG before setup).
+ *   2. Surgical first: remove the managed block, then rewrite the
+ *      remaining active `provider:` line (or the `memory.provider:`
+ *      inline form) to the captured provider name. Preserves any user
+ *      edits made to `config.yaml` after setup. Verify post-restore
+ *      via `findConfiguredMemoryProvider(post) === captured.provider`
+ *      before reporting success — mismatch falls through to backup-file.
+ *   3. Backup-file fallback: atomic rename of `state.priorMemoryProvider.configBackupPath`
+ *      over `config.yaml`. Loses any post-setup user edits but is the
+ *      whole-file safety net. Same post-restore verification.
+ *   4. If both surgical AND backup-file fail (or both produce a
+ *      verification mismatch), `path: 'failed'`, `ok: false`,
+ *      populated `restoreError`.
+ *
+ * Restore is independent of `disconnectHermesProfile`: the daemon's
+ * `reverseHermesSetupForUi` (S3) calls disconnect first, then restore;
+ * a restore failure does NOT roll back the disconnect (per contract §6
+ * — the integration stays disconnected and the restore failure
+ * surfaces as a `runtime.lastError` warning, not an error status).
+ *
+ * Idempotent: safe to call when there's nothing to restore (returns
+ * `path: 'noop'`).
+ */
+export function restoreHermesProfile(req: HermesRestoreRequest = {}): HermesRestoreResult {
+  if (req.signal?.aborted) {
+    return { ok: false, path: 'failed', restoreError: 'restore cancelled before start' };
+  }
+  const profile = resolveHermesProfile({
+    profileName: req.profile,
+    hermesHome: req.hermesHome,
+  });
+  const state = readSetupState(profile);
+  const captured = state?.priorMemoryProvider;
+  if (!captured) {
+    return { ok: true, path: 'noop' };
+  }
+
+  // Path 1: surgical line-rewrite. Remove the managed block first so
+  // we don't accidentally rewrite the DKG provider line; then look
+  // for a remaining active provider line and rewrite it to the
+  // captured value. If no remaining line is found (e.g. user manually
+  // deleted the memory: block since setup), surgical fails and we
+  // fall through to backup-file.
+  let surgicalError: string | undefined;
+  if (existsSync(profile.configPath)) {
+    try {
+      const original = readFileSync(profile.configPath, 'utf-8');
+      const cleaned = removeManagedBlock(original);
+      const rewritten = rewriteActiveProviderLine(cleaned, captured.provider);
+      if (rewritten === null) {
+        surgicalError = 'no active memory.provider line found after removing managed block';
+      } else {
+        writeFileSync(profile.configPath, rewritten);
+        const post = findConfiguredMemoryProvider(rewritten);
+        if (post === captured.provider) {
+          return {
+            ok: true,
+            path: 'surgical',
+            restoredProvider: captured.provider,
+          };
+        }
+        surgicalError = `surgical post-restore verification mismatch (got ${post ?? 'null'}, expected ${captured.provider})`;
+      }
+    } catch (err: any) {
+      surgicalError = `surgical write failed: ${err?.message ?? String(err)}`;
+    }
+  } else {
+    surgicalError = 'config.yaml does not exist; cannot rewrite in place';
+  }
+
+  // Path 2: backup-file fallback. Atomic rename of the captured
+  // backup over config.yaml. Fails when the backup file is missing
+  // (deleted by user) or unreadable.
+  let backupError: string | undefined;
+  if (existsSync(captured.configBackupPath)) {
+    try {
+      renameSync(captured.configBackupPath, profile.configPath);
+      const post = findConfiguredMemoryProvider(
+        readFileSync(profile.configPath, 'utf-8'),
+      );
+      if (post === captured.provider) {
+        return {
+          ok: true,
+          path: 'backup-file',
+          restoredFrom: captured.configBackupPath,
+        };
+      }
+      backupError = `backup-file post-restore verification mismatch (got ${post ?? 'null'}, expected ${captured.provider})`;
+    } catch (err: any) {
+      backupError = `backup-file rename failed: ${err?.message ?? String(err)}`;
+    }
+  } else {
+    backupError = `backup file missing at ${captured.configBackupPath}`;
+  }
+
+  return {
+    ok: false,
+    path: 'failed',
+    restoreError: `restore failed via both paths. surgical: ${surgicalError ?? 'n/a'}. backup-file: ${backupError ?? 'n/a'}.`,
+  };
+}
+
+/**
+ * Internal helper for `restoreHermesProfile` surgical path. Walks the
+ * config.yaml lines (already cleaned of the managed block) and either:
+ *
+ *   1. Rewrites the first active provider line found (top-level
+ *      `memory:` block + indented `provider: <x>` line, OR inline
+ *      `memory.provider: <x>`), OR
+ *   2. If a top-level `memory:` block exists but has no `provider:`
+ *      line inside it (typical post-replacement state, since
+ *      `insertManagedProviderIntoMemoryBlock` consumed the original
+ *      provider line), INSERTS a `provider: <captured>` line as the
+ *      first child of the `memory:` block.
+ *
+ * Returns the rewritten string, or `null` when no `memory:` block
+ * exists at all (caller falls through to the backup-file path).
+ */
+function rewriteActiveProviderLine(raw: string, newProvider: string): string | null {
+  const lines = raw.split(/\r?\n/);
+  let inMemory = false;
+  let memoryHeaderIndex = -1;
+  let memoryHeaderIndent = '';
+  let rewroteAny = false;
+  const next: string[] = [];
+  for (const line of lines) {
+    if (TOP_LEVEL_MEMORY_BLOCK_RE.test(line)) {
+      inMemory = true;
+      memoryHeaderIndex = next.length;
+      memoryHeaderIndent = line.match(/^(\s*)/)?.[1] ?? '';
+      next.push(line);
+      continue;
+    }
+    if (inMemory && /^\S/.test(line)) {
+      inMemory = false;
+    }
+    if (!rewroteAny) {
+      const inline = line.match(TOP_LEVEL_MEMORY_PROVIDER_RE);
+      if (inline) {
+        next.push(`memory.provider: ${newProvider}`);
+        rewroteAny = true;
+        continue;
+      }
+      if (inMemory) {
+        const indented = readIndentedProviderLine(line);
+        if (indented) {
+          next.push(`${indented.indent}provider: ${newProvider}`);
+          rewroteAny = true;
+          continue;
+        }
+      }
+    }
+    next.push(line);
+  }
+  if (rewroteAny) return next.join('\n');
+  // Insertion fallback: a `memory:` block existed but had no
+  // `provider:` child (typical post-replace state). Insert a
+  // `provider: <captured>` line as the first child of the block.
+  if (memoryHeaderIndex >= 0) {
+    next.splice(memoryHeaderIndex + 1, 0, `${memoryHeaderIndent}  provider: ${newProvider}`);
+    return next.join('\n');
+  }
+  return null;
 }
 
 /**
@@ -621,6 +823,7 @@ function toSetupOptions(options: HermesCliOptions): HermesSetupOptions {
     publishGuard: existingState?.publishGuard,
     nodeSkillContent: options.nodeSkillContent,
     memoryMode,
+    preserveProvider: options.preserveProvider === true,
     dryRun: options.dryRun === true,
   };
 }
@@ -892,15 +1095,62 @@ function hasManagedDkgProvider(raw: string): boolean {
   return false;
 }
 
-function ensureManagedProviderBlock(configPath: string): void {
+/**
+ * Result of `ensureManagedProviderBlock`. When the call replaced an
+ * existing non-DKG provider, `swap` describes the prior provider and
+ * the path of the timestamped backup file we wrote BEFORE the
+ * replacement. When the call was a no-op (already-DKG, fresh install,
+ * or `preserveProvider: true` on a fresh install), `swap` is `null`
+ * and the function did not touch `<hermesHome>/config.yaml.bak.*`.
+ *
+ * Caller is responsible for first-wins persistence into
+ * `state.priorMemoryProvider`: if a prior install already captured a
+ * snapshot, the second install must NOT overwrite it.
+ */
+interface EnsureManagedProviderBlockResult {
+  swap: {
+    provider: string;
+    configBackupPath: string;
+    capturedAt: string;
+  } | null;
+}
+
+function ensureManagedProviderBlock(
+  configPath: string,
+  options: { preserveProvider?: boolean } = {},
+): EnsureManagedProviderBlockResult {
   const existing = existsSync(configPath) ? readFileSync(configPath, 'utf-8') : '';
   const configuredProvider = findConfiguredMemoryProvider(existing);
   if (!existing.includes(CONFIG_BEGIN) && configuredProvider === 'dkg') {
     writeOwnedText(configPath, markExistingDkgProvider(existing), false);
-    return;
+    return { swap: null };
   }
   if (configuredProvider && configuredProvider !== 'dkg') {
-    throw new Error(`Refusing to replace existing Hermes memory.provider: ${configuredProvider}`);
+    // S4 step 2 (issue #386): replace-by-default with backup + capture.
+    // Pre-#386 behavior is preserved verbatim behind `--preserve-provider`
+    // for operators who want the throw (H-AC-30 adapter-half asserts the
+    // exact message stays grep-stable).
+    if (options.preserveProvider === true) {
+      throw new Error(`Refusing to replace existing Hermes memory.provider: ${configuredProvider}`);
+    }
+    // Replace-by-default: write a timestamped backup of the current
+    // config.yaml bytes BEFORE the managed-block rewrite. The backup
+    // is what `restoreHermesProfile` (S4 step 3) consumes for the
+    // backup-file fallback path; the line-rewrite path uses the
+    // captured `provider` name instead.
+    const backupPath = `${configPath}.bak.${Date.now()}`;
+    writeFileSync(backupPath, existing);
+    const swap = {
+      provider: configuredProvider,
+      configBackupPath: backupPath,
+      capturedAt: new Date().toISOString(),
+    };
+    const unmanaged = removeManagedBlock(existing);
+    const next = hasTopLevelMemoryBlock(unmanaged)
+      ? insertManagedProviderIntoMemoryBlock(unmanaged)
+      : appendManagedMemoryBlock(unmanaged);
+    writeOwnedText(configPath, next, false);
+    return { swap };
   }
 
   const unmanaged = removeManagedBlock(existing);
@@ -908,6 +1158,7 @@ function ensureManagedProviderBlock(configPath: string): void {
     ? insertManagedProviderIntoMemoryBlock(unmanaged)
     : appendManagedMemoryBlock(unmanaged);
   writeOwnedText(configPath, next, false);
+  return { swap: null };
 }
 
 function markExistingDkgProvider(raw: string): string {

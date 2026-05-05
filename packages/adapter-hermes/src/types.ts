@@ -115,6 +115,52 @@ export interface HermesSetupRequest {
 }
 
 /**
+ * `HermesRestoreRequest` — input shape for `restoreHermesProfile`.
+ * Per setup-entrypoint-contract.md §6. Restore reads the captured
+ * `priorMemoryProvider` snapshot from setup-state.json and attempts to
+ * put `<hermesHome>/config.yaml` back to its pre-replacement state.
+ */
+export interface HermesRestoreRequest {
+  profile?: string;
+  hermesHome?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * `HermesRestoreResult` — output shape `restoreHermesProfile` returns.
+ * Per setup-entrypoint-contract.md §6 + QA addendum §10C #1
+ * (post-restore verification).
+ *
+ * `path` discriminator:
+ *   - `'surgical'`: the active `memory.provider` line was rewritten in
+ *     place to the captured provider name. Preserves any user edits to
+ *     `config.yaml` made after setup.
+ *   - `'backup-file'`: surgical rewrite failed (parse error, missing
+ *     top-level `memory:` block, etc.); the captured backup file was
+ *     atomically renamed over `config.yaml`. Loses any post-setup
+ *     user edits.
+ *   - `'noop'`: nothing to restore (no `priorMemoryProvider` snapshot
+ *     in setup-state, or fresh install).
+ *   - `'failed'`: both surgical AND backup-file paths failed (e.g.
+ *     backup file deleted by user, config corrupted, post-restore
+ *     verification mismatch).
+ *
+ * Per QA addendum §10C #1: after both surgical AND backup-file paths,
+ * verify `findConfiguredMemoryProvider(post) === captured.provider`
+ * before reporting success. Mismatch ⇒ `path: 'failed'`.
+ */
+export interface HermesRestoreResult {
+  ok: boolean;
+  path: 'surgical' | 'backup-file' | 'noop' | 'failed';
+  /** Backup path consumed when `path === 'backup-file'`. */
+  restoredFrom?: string;
+  /** Captured prior provider name when `path === 'surgical'`. */
+  restoredProvider?: string;
+  /** Populated when `path === 'failed'`. */
+  restoreError?: string;
+}
+
+/**
  * `HermesSetupResult` — the output shape `runHermesSetup` returns. The
  * daemon UI Connect handler maps `status` → `runtime.status` per
  * `setup-entrypoint-contract.md` §3 table:

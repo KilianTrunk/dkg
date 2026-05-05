@@ -2775,4 +2775,134 @@ assert len(client.calls) == 4, client.calls
 
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
+
+  it('dkg_share mints unique subjects per call, N-Triples-quotes content, and surfaces snake_case root_entities', () => {
+    // Closes OriginTrail/dkg#414 — the same three SWM-write bugs PR #413
+    // fixed for OpenClaw, applied to Hermes:
+    //   1. Constant subject → publisher upserts and overwrites prior shares.
+    //   2. Raw content → storage parser coerces to invalid IRI.
+    //   3. Partial _quote_literal escaping → control bytes leak through.
+    const script = String.raw`
+import importlib.util
+import json
+import re
+import sys
+import tempfile
+import types
+from pathlib import Path
+
+home = Path(tempfile.mkdtemp(prefix="hermes-dkg-share-hardening-"))
+
+agent_pkg = types.ModuleType("agent")
+memory_provider = types.ModuleType("agent.memory_provider")
+class MemoryProvider:
+    pass
+memory_provider.MemoryProvider = MemoryProvider
+sys.modules["agent"] = agent_pkg
+sys.modules["agent.memory_provider"] = memory_provider
+
+tools_pkg = types.ModuleType("tools")
+registry = types.ModuleType("tools.registry")
+def tool_error(message):
+    return json.dumps({"error": message})
+registry.tool_error = tool_error
+sys.modules["tools"] = tools_pkg
+sys.modules["tools.registry"] = registry
+
+constants = types.ModuleType("hermes_constants")
+constants.get_hermes_home = lambda: home
+sys.modules["hermes_constants"] = constants
+
+sys.modules["plugins"] = types.ModuleType("plugins")
+sys.modules["plugins.memory"] = types.ModuleType("plugins.memory")
+sys.modules["plugins.memory.dkg"] = types.ModuleType("plugins.memory.dkg")
+
+plugin_dir = Path(r"${process.cwd().replace(/\\/g, '\\\\')}") / "hermes-plugin"
+
+spec = importlib.util.spec_from_file_location(
+    "plugins.memory.dkg",
+    plugin_dir / "__init__.py",
+    submodule_search_locations=[str(plugin_dir)],
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules["plugins.memory.dkg"] = module
+spec.loader.exec_module(module)
+
+provider = module.DKGMemoryProvider()
+provider._offline = False
+provider._agent_name = "tester"
+
+class CapturingClient:
+    def __init__(self):
+        self.calls = []
+    def share(self, context_graph_id, quads, sub_graph_name=None):
+        self.calls.append({
+            "context_graph_id": context_graph_id,
+            "quads": quads,
+            "sub_graph_name": sub_graph_name,
+        })
+        return {"shareOperationId": f"swm-{len(self.calls)}", "triplesWritten": len(quads)}
+
+client = CapturingClient()
+provider._client = client
+
+# Bug 1 fix — successive shares mint distinct subjects so the publisher
+# does not upsert and overwrite prior facts.
+r1 = json.loads(provider.handle_tool_call("dkg_share", {"content": "first fact", "context_graph_id": "cg:test"}))
+r2 = json.loads(provider.handle_tool_call("dkg_share", {"content": "second fact", "context_graph_id": "cg:test"}))
+subject1 = client.calls[0]["quads"][0]["subject"]
+subject2 = client.calls[1]["quads"][0]["subject"]
+assert subject1 != subject2, (subject1, subject2)
+assert re.match(r"^urn:hermes:tester:shared:\d+-[0-9a-f]+$", subject1), subject1
+assert re.match(r"^urn:hermes:tester:shared:\d+-[0-9a-f]+$", subject2), subject2
+
+# Response shape parity with OpenClaw: subject + snake_case root_entities.
+assert r1["subject"] == subject1, r1
+assert r1["root_entities"] == [subject1], r1
+assert r1.get("rootEntities") is None, r1
+assert "shareOperationId" in r1, r1
+
+# Bug 2 fix — content is wrapped as an N-Triples literal (quoted) before
+# being handed to the daemon, not as a bare string the storage layer would
+# coerce to an IRI.
+obj1 = client.calls[0]["quads"][0]["object"]
+assert obj1.startswith('"') and obj1.endswith('"'), obj1
+assert obj1 == '"first fact"', obj1
+
+# Bug 3 fix — _quote_literal escapes the full ECHAR set (\\, ", \\b, \\t,
+# \\n, \\f, \\r) and UCHAR-encodes any other ASCII control bytes (NUL, VT,
+# DEL, etc.) so a payload with mixed control characters round-trips cleanly.
+r3 = json.loads(provider.handle_tool_call("dkg_share", {
+    "content": "a\nb\rc\td\fe\bf \"q\" \\ end",
+    "context_graph_id": "cg:test",
+}))
+obj_echar = client.calls[2]["quads"][0]["object"]
+assert obj_echar == '"a\\nb\\rc\\td\\fe\\bf \\"q\\" \\\\ end"', obj_echar
+
+NUL = chr(0x00)
+VT = chr(0x0B)
+DEL = chr(0x7F)
+r4 = json.loads(provider.handle_tool_call("dkg_share", {
+    "content": f"x{NUL}y{VT}z{DEL}",
+    "context_graph_id": "cg:test",
+}))
+obj_uchar = client.calls[3]["quads"][0]["object"]
+assert obj_uchar == '"x\\u0000y\\u000Bz\\u007F"', obj_uchar
+
+# sub_graph_name still plumbs through, schema unchanged on that axis.
+provider.handle_tool_call("dkg_share", {"content": "scoped", "context_graph_id": "cg:test", "sub_graph_name": "protocols"})
+assert client.calls[4]["sub_graph_name"] == "protocols", client.calls[4]
+
+# Schema parity with OpenClaw — content + context_graph_id required, sub_graph_name optional.
+share_schema = next(s for s in provider.get_tool_schemas() if s["name"] == "dkg_share")
+assert share_schema["parameters"]["required"] == ["content", "context_graph_id"], share_schema
+assert "sub_graph_name" in share_schema["parameters"]["properties"], share_schema
+`;
+    const result = spawnSync('python', ['-B', '-c', script], {
+      cwd: process.cwd(),
+      encoding: 'utf-8',
+    });
+
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
 });

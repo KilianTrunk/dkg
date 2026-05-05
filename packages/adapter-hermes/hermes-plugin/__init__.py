@@ -20,7 +20,9 @@ import logging
 import os
 import hashlib
 import re
+import secrets
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
@@ -1385,13 +1387,31 @@ class DKGMemoryProvider(MemoryProvider):
         cg = _first_text(args, "context_graph_id")
         if not cg:
             return tool_error("context_graph_id is required.")
+        # Mint a unique root entity per share. The publisher upserts SWM by
+        # root entity (packages/publisher/src/dkg-publisher.ts:422-429), so
+        # a stable subject would mean each share replaces the previous one
+        # rather than appending a new fact.
+        share_id = f"{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+        subject = f"urn:hermes:{self._agent_name}:shared:{share_id}"
+        # Wrap content as an N-Triples literal. The storage layer's
+        # formatTerm (packages/storage/src/adapters/oxigraph.ts:233-244)
+        # treats any object value not starting with `"` as an IRI, so raw
+        # text like `hello` would be coerced to `<hello>` — invalid IRI.
         quads = [{
-            "subject": f"urn:hermes:{self._agent_name}:shared",
+            "subject": subject,
             "predicate": "urn:hermes:sharedContent",
-            "object": content,
+            "object": _quote_literal(content),
         }]
         result = self._client.share(cg, quads, sub_graph_name=_first_text(args, "sub_graph_name"))
-        return json.dumps(result)
+        # Surface the minted subject so callers can target THIS share in a
+        # follow-up `dkg_shared_memory_publish({ root_entities: [...] })`.
+        # Field name is snake_case to match the consuming tool's argument
+        # shape (matches OpenClaw's response, PR #413).
+        if isinstance(result, dict):
+            response = {**result, "subject": subject, "root_entities": [subject]}
+        else:
+            response = {"raw": result, "subject": subject, "root_entities": [subject]}
+        return json.dumps(response)
 
     def _handle_publish(self, args: Dict[str, Any]) -> str:
         if not self._direct_publish_allowed():
@@ -2108,8 +2128,42 @@ def _required_cg_and_name(args: Dict[str, Any]) -> tuple[str, str]:
     return _first_text(args, "context_graph_id"), _first_text(args, "name")
 
 
+_ECHAR_REPLACEMENTS = {
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
 def _quote_literal(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
+    """
+    Wrap a free-text string as an N-Triples literal.
+
+    Escapes the full set the daemon's storage parser requires:
+    * the two structural ECHARs (`\\` and `"`) first, so subsequent
+      escape introducers don't get themselves doubled;
+    * the five common ECHAR control bytes (`\\b`, `\\t`, `\\n`, `\\f`, `\\r`);
+    * every remaining ASCII control byte (0x00-0x1F and 0x7F) as a
+      `\\uXXXX` UCHAR escape — without this, inputs containing NUL,
+      VT, DEL, etc. produce an invalid literal that the parser rejects.
+
+    Mirrors the OpenClaw side of the parity hardening (PR #413, defensive
+    post-pass over `escapeDkgRdfLiteral`). The TypeScript canonical helper
+    has the same gap upstream — see issue #416.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    out: List[str] = []
+    for ch in escaped:
+        code = ord(ch)
+        if ch in _ECHAR_REPLACEMENTS:
+            out.append(_ECHAR_REPLACEMENTS[ch])
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\u{code:04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def _uri_segment(value: Any, fallback: str) -> str:

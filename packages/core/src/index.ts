@@ -26,6 +26,14 @@ export {
   blueGreenSlotReady,
 } from './blue-green.js';
 export { requestFaucetFunding, type FaucetResult } from './faucet.js';
+export {
+  fundWalletsBestEffort,
+  logManualFundingInstructions,
+  readWallets,
+  readWalletsWithRetry,
+  type FundWalletsBestEffortOptions,
+  type FundWalletsNetworkConfig,
+} from './faucet-orchestration.js';
 export { resolveCliPackageDir } from './resolve-cli-package-dir.js';
 export { resolveDkgCli, type ResolvedDkgCli } from './resolve-dkg-cli.js';
 export { startDaemon } from './daemon-lifecycle.js';

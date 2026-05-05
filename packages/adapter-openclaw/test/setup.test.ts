@@ -10,6 +10,19 @@ import { fileURLToPath } from 'node:url';
 // regardless of where this line appears. Other `@origintrail-official/dkg-core`
 // exports are passed through unchanged via `importActual` so existing tests
 // that rely on core semantics (transitive imports) stay intact.
+//
+// We hoist the same `requestFaucetFunding` spy and inject it into TWO mock
+// surfaces: (1) the dkg-core barrel (so any direct caller in this package
+// gets the spy via the public surface), and (2) the dkg-core `dist/faucet.js`
+// module path (so `fundWalletsBestEffort` inside dkg-core's own
+// `faucet-orchestration.ts` — which calls `requestFaucetFunding` via an
+// in-package import — also routes through the spy). The barrel-level mock
+// alone wouldn't intercept dkg-core's intra-package call after the S1 of
+// issue #386 extracted the orchestrator into core (`fundWalletsBestEffort`
+// reaches `requestFaucetFunding` via `./faucet.js`, not via the barrel).
+const requestFaucetFundingSpy = vi.hoisted(() =>
+  vi.fn(async () => ({ success: true, funded: ['0.01 ETH', '1000 TRAC'] })),
+);
 vi.mock('@origintrail-official/dkg-core', async () => {
   const actual = await vi.importActual<typeof import('@origintrail-official/dkg-core')>(
     '@origintrail-official/dkg-core',

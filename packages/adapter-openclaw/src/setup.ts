@@ -25,21 +25,29 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import {
-  requestFaucetFunding,
+  fundWalletsBestEffort,
+  logManualFundingInstructions,
+  readWallets,
+  readWalletsWithRetry,
   resolveCliPackageDir,
   resolveDkgConfigHome,
   startDaemon,
 } from '@origintrail-official/dkg-core';
 import type { DkgOpenClawConfig } from './types.js';
 
-// Re-export `resolveCliPackageDir` and `startDaemon` so the existing
-// public surface (`@origintrail-official/dkg-adapter-openclaw` consumers,
-// including in-tree tests that `vi.mock('../src/setup.js')`) keeps
-// working unchanged. The implementations moved to
-// `@origintrail-official/dkg-core` in S1 of issue #386 because
-// adapter-hermes also needs them and the dep direction is
-// `cli → adapters → core`.
-export { resolveCliPackageDir, startDaemon };
+// Re-export shared lifecycle helpers so the existing public surface
+// (`@origintrail-official/dkg-adapter-openclaw` consumers, including in-tree
+// tests that import them from `'../src/setup.js'`) keeps working unchanged.
+// The implementations moved to `@origintrail-official/dkg-core` in S1 of
+// issue #386 because adapter-hermes also needs them and the dep direction
+// is `cli → adapters → core`.
+export {
+  logManualFundingInstructions,
+  readWallets,
+  readWalletsWithRetry,
+  resolveCliPackageDir,
+  startDaemon,
+};
 import {
   defaultStateDirForWorkspace,
   legacyStateDirForWorkspace,
@@ -536,128 +544,13 @@ export function writeDkgConfig(
 // `startDaemon` was extracted to `@origintrail-official/dkg-core` in S1
 // of issue #386. See the import + re-export at the top of this file.
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 // ---------------------------------------------------------------------------
 // Step 6: Read wallets and fund via testnet faucet
 // ---------------------------------------------------------------------------
-
-/**
- * Read the wallet addresses the daemon has written to `~/.dkg/wallets.json`.
- *
- * Returns an empty list (with a warning) when the file is missing or
- * malformed. `runSetup` retries a few times after daemon start because the
- * daemon writes `wallets.json` asynchronously and may not have flushed it
- * by the time the health check passes.
- */
-export function readWallets(): string[] {
-  const walletsPath = join(dkgDir(), 'wallets.json');
-  if (!existsSync(walletsPath)) {
-    warn('wallets.json not found — daemon may not have started yet');
-    return [];
-  }
-
-  let raw: any;
-  try {
-    raw = JSON.parse(readFileSync(walletsPath, 'utf-8'));
-  } catch {
-    warn('wallets.json is malformed or still being written — skipping');
-    return [];
-  }
-  // The daemon writes { adminWallet, wallets: [{ address, privateKey }] }.
-  // Include admin first so profile/key-management transactions have gas, then
-  // fall back to the legacy operational-only array shapes.
-  const walletList: any[] = Array.isArray(raw?.wallets) ? raw.wallets
-    : Array.isArray(raw) ? raw
-    : [];
-  const operationalAddresses: string[] = [];
-  const operationalSeen = new Set<string>();
-  for (const w of walletList) {
-    const address = w?.address;
-    if (typeof address !== 'string' || address.length === 0) continue;
-    const key = address.toLowerCase();
-    if (operationalSeen.has(key)) continue;
-    operationalSeen.add(key);
-    operationalAddresses.push(address);
-  }
-  if (operationalAddresses.length === 0) {
-    warn('wallets.json has no operational wallets — skipping faucet funding');
-    return [];
-  }
-
-  const addresses: string[] = [];
-  const seen = new Set<string>();
-  const addAddress = (address: unknown) => {
-    if (typeof address !== 'string' || address.length === 0) return;
-    const key = address.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    addresses.push(address);
-  };
-  addAddress(raw?.adminWallet?.address);
-  for (const address of operationalAddresses) {
-    addAddress(address);
-  }
-
-  if (addresses.length) {
-    log(`Wallets: ${addresses.join(', ')}`);
-  }
-  return addresses;
-}
-
-/**
- * Print a ready-to-paste `curl` block for manual faucet funding. Called
- * only on faucet failure; the caller is expected to continue (funding is
- * best-effort / non-fatal).
- *
- * Addresses are split into batches of 3 to match the faucet's per-request
- * cap. Including more wallets in one body would be rejected by the faucet.
- */
-export function logManualFundingInstructions(addresses: string[], faucetUrl: string, mode: string): void {
-  const batches: string[][] = [];
-  for (let i = 0; i < addresses.length; i += 3) {
-    batches.push(addresses.slice(i, i + 3));
-  }
-  console.log('\nTo fund wallets manually, run:');
-  batches.forEach((batch, index) => {
-    if (batches.length > 1) {
-      console.log(`  # batch ${index + 1}/${batches.length}`);
-    }
-    console.log(`  curl -X POST "${faucetUrl}" \\`);
-    console.log(`    -H "Content-Type: application/json" \\`);
-    console.log(`    -H "Idempotency-Key: $(date +%s)-${index + 1}" \\`);
-    console.log(`    --data-raw '{"mode":"${mode}","wallets":${JSON.stringify(batch)}}'`);
-  });
-  if (batches.length > 1) {
-    console.log(`\nNote: faucet supports up to 3 wallets per call; run each batch above.`);
-  }
-  console.log('');
-}
-
-/**
- * Read wallet addresses, retrying up to 5 times with a 1s delay between
- * attempts. The daemon writes `~/.dkg/wallets.json` asynchronously after
- * its health check passes, so the file is often missing on the first read
- * immediately after `startDaemon` returns.
- *
- * Exported (internal to this package — not re-exported from `index.ts`) so
- * the retry accounting can be unit-tested without spawning a real daemon.
- * Defaults preserve production behavior: `sleep` for the real `setTimeout`
- * delay, `readWallets` for the real filesystem read.
- */
-export async function readWalletsWithRetry(
-  sleepFn: (ms: number) => Promise<void> = sleep,
-  readFn: () => string[] = readWallets,
-): Promise<string[]> {
-  let walletAddresses = readFn();
-  for (let i = 0; i < 5 && !walletAddresses.length; i++) {
-    await sleepFn(1_000);
-    walletAddresses = readFn();
-  }
-  return walletAddresses;
-}
+// `readWallets`, `readWalletsWithRetry`, `logManualFundingInstructions`,
+// and the `fundWalletsBestEffort` orchestrator were extracted to
+// `@origintrail-official/dkg-core/faucet-orchestration.ts` in S1 of
+// issue #386. See the import + re-export at the top of this file.
 
 // ---------------------------------------------------------------------------
 // Step 4 (preflight) + Step 8: Merge adapter into openclaw.json
@@ -1789,57 +1682,25 @@ export async function runSetup(options: SetupOptions): Promise<void> {
   }
 
   // Step 6: Read wallets and fund via testnet faucet.
-  // Delegates to the shared `requestFaucetFunding` in `@origintrail-official/dkg-core`,
-  // which is the same implementation the `dkg init` CLI path uses. The
-  // faucet URL and mode come from `network.faucet.*`; a missing
-  // `network.faucet.url` logs and skips (matches the CLI parity decision).
-  // Faucet failures (HTTP error, thrown exception, `success === false`) log
-  // a manual `curl` block and continue — setup is non-fatal on funding.
-  // Wallet read retries 5×1s because the daemon writes `wallets.json`
-  // asynchronously after the health check passes.
+  // Delegates to the shared `fundWalletsBestEffort` orchestrator in
+  // `@origintrail-official/dkg-core`, which wraps the faucet URL check,
+  // wallet-read retry-after-daemon-start, the `requestFaucetFunding`
+  // call, and the manual-curl fallback. Faucet failures stay non-fatal
+  // — the orchestrator never throws. Wallet read retries 5×1s when
+  // `didStartDaemon` is true because the daemon writes `wallets.json`
+  // asynchronously after `/api/status` responds OK.
   throwIfAborted();
   const shouldFund = options.fund !== false;
-  if (!dryRun && shouldFund) {
-    const faucetUrl = network?.faucet?.url;
-    const faucetMode = network?.faucet?.mode;
-    if (!faucetUrl || !faucetMode) {
-      log('Skipping wallet funding (no faucet configured in network config)');
-    } else {
-      // Retry only makes sense if we actually started the daemon this run —
-      // with `--no-start`, the wallet file either exists already or never
-      // will. `readWalletsWithRetry` is extracted to keep the loop bound
-      // covered by unit tests (see test/setup.test.ts retry-accounting).
-      const walletAddresses = shouldStart
-        ? await readWalletsWithRetry()
-        : readWallets();
-      if (walletAddresses.length > 0) {
-        log('Funding wallets via testnet faucet...');
-        try {
-          const result = await requestFaucetFunding(faucetUrl, faucetMode, walletAddresses, effectiveAgentName);
-          if (result.success) {
-            log(`Funded: ${result.funded.join(', ')}`);
-            if (result.error) {
-              warn(`Faucet partially completed: ${result.error}`);
-              logManualFundingInstructions(
-                result.failedWallets?.length ? result.failedWallets : walletAddresses,
-                faucetUrl,
-                faucetMode,
-              );
-            }
-          } else {
-            warn(`Faucet request did not fund any wallets${result.error ? ` (${result.error})` : ''}`);
-            logManualFundingInstructions(walletAddresses, faucetUrl, faucetMode);
-          }
-        } catch (err: any) {
-          warn(`Faucet call failed: ${err?.message ?? String(err)}`);
-          logManualFundingInstructions(walletAddresses, faucetUrl, faucetMode);
-        }
-      } else {
-        warn('No wallet addresses available to fund (daemon did not produce wallets.json)');
-      }
-    }
+  if (!dryRun && shouldFund && network) {
+    await fundWalletsBestEffort({
+      network,
+      callerId: effectiveAgentName,
+      didStartDaemon: shouldStart,
+    });
   } else if (!dryRun && !shouldFund) {
     log('Skipping wallet funding (--no-fund)');
+  } else if (!dryRun && !network) {
+    log('Skipping wallet funding (network config unavailable)');
   } else {
     log('[dry-run] Would read wallets and fund via faucet');
   }

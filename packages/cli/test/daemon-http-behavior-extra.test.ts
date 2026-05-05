@@ -173,9 +173,20 @@ async function startDaemon(opts: {
     daemon.signal = signal;
   });
 
-  // Wait for /api/status to respond (up to 60s). CI startup can be noisy when
-  // workflow fan-out is high, and 30s proved flaky despite healthy behavior.
-  for (let i = 0; i < 120; i++) {
+  // Wait for /api/status to respond (up to 45s). The readiness ceiling MUST
+  // sit comfortably below the per-test vitest timeout used by callers
+  // (currently 120s for CLI-13/14, 60s elsewhere) so that a slow startup
+  // surfaces as a readable `"Daemon did not become ready within 45s"`
+  // assertion error from inside startDaemon — *not* as the opaque
+  // `"Test timed out"` framework error you get when both budgets collide
+  // at the same wall-clock instant. 45s of startup headroom is generous:
+  // healthy fresh-daemon boot on CI is ~1.5s, and the previous 60s ceiling
+  // was the exact wall vitest's framework timer was hitting on overloaded
+  // runners (see the May-5 main branch flake on `Bura: cli` →
+  // `SIGINT → exits with code 130 within 10s` failing at 60_007ms — that
+  // 7ms-over-budget signature is vitest cutting in before this loop's
+  // own throw could fire).
+  for (let i = 0; i < 90; i++) {
     if (child.exitCode !== null) {
       throw new Error(`Daemon exited early with code ${child.exitCode}`);
     }
@@ -186,7 +197,7 @@ async function startDaemon(opts: {
       /* not ready yet */
     }
     await sleep(500);
-    if (i === 119) throw new Error('Daemon did not become ready within 60s');
+    if (i === 89) throw new Error('Daemon did not become ready within 45s');
   }
 
   if (opts.authEnabled) {
@@ -1312,6 +1323,15 @@ describe('A-1 follow-up: auth-disabled /api/query fails closed on foreign WM', (
 // dedicated daemon. They must run AFTER the shared-fixture tests so the
 // module-level daemon isn't affected.
 //
+// Per-test budget = 120s. Composition:
+//   ~45s — startDaemon readiness ceiling (see the loop above)
+//   ~10s — stopDaemon's signal-to-exit window (the actual assertion)
+//   ~65s — slack for runner I/O / fork-load spikes during fresh daemon
+//          spawn under heavy CI fan-out
+// The tests still strictly assert "exit within 10s of signal" — the
+// expanded budget only buys headroom for the daemon to come up; once it
+// is up, the SIGTERM/SIGINT validation window is unchanged.
+//
 
 describe('CLI-13 / CLI-14 — shutdown signal exit codes & timer cleanup', () => {
   it('SIGTERM → exits with code 0 within 10s (pruneTimer cleaned up)', async () => {
@@ -1326,7 +1346,7 @@ describe('CLI-13 / CLI-14 — shutdown signal exit codes & timer cleanup', () =>
     } else {
       expect(signal).toBe('SIGTERM');
     }
-  }, 60_000);
+  }, 120_000);
 
   it('SIGINT → exits with code 130 (POSIX: 128+SIGINT) within 10s', async () => {
     const d = await startDaemon({ authEnabled: false });
@@ -1342,7 +1362,7 @@ describe('CLI-13 / CLI-14 — shutdown signal exit codes & timer cleanup', () =>
     } else {
       expect(signal).toBe('SIGINT');
     }
-  }, 60_000);
+  }, 120_000);
 
   it('no open-handle hang after SIGTERM (daemon exits within 5s, not 10s cap)', async () => {
     const d = await startDaemon({ authEnabled: false });
@@ -1354,5 +1374,5 @@ describe('CLI-13 / CLI-14 — shutdown signal exit codes & timer cleanup', () =>
     // They ARE unref'd in current code — this is a guard test so any
     // future "remove .unref()" regression fires here. 5s is generous.
     expect(dt).toBeLessThan(8_000);
-  }, 60_000);
+  }, 120_000);
 });

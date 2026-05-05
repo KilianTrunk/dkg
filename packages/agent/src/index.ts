@@ -53,8 +53,14 @@ export {
 } from './ccl-policy.js';
 export {
   DKGAgent,
+  ContextGraphNotFoundError,
+  InvalidContentError,
   type DKGAgentConfig,
   type ContextGraphSub,
+  type PublishOpts,
+  type PublishAsyncContent,
+  type PublishAsyncOpts,
+  type PublishAsyncQuadEnvelope,
   type ContextGraphMemberPrincipalType,
   type ContextGraphMemberStatus,
   type ContextGraphMembershipRecord,

@@ -1544,6 +1544,14 @@ assert "sub_graph_name" not in query_schema["parameters"]["properties"], query_s
 share_schema = next(schema for schema in provider.get_tool_schemas() if schema["name"] == "dkg_share")
 assert "context_graph_id" in share_schema["parameters"]["properties"], share_schema
 assert "context_graph" not in share_schema["parameters"]["properties"], share_schema
+# sub_graph_name is in the schema so MCP clients can pass it portably
+# (#413 — _handle_share already forwards it; the schema exposure was missing).
+assert "sub_graph_name" in share_schema["parameters"]["properties"], share_schema
+# context_graph_id is required on Hermes too, matching OpenClaw's contract
+# (#413 unification — no implicit current-project fallback).
+assert share_schema["parameters"]["required"] == ["content", "context_graph_id"], share_schema
+missing_cg = provider.handle_tool_call("dkg_share", {"content": "alpha"})
+assert "context_graph_id is required" in missing_cg, missing_cg
 
 provider._config = {
     "publish_tool": "disabled",
@@ -1642,6 +1650,37 @@ client._get = lambda path: calls.append(("GET", path, {})) or {"ok": True}
 bad_cg = client.create_context_graph("Bad", cg_id="Bad:Id")
 assert bad_cg["success"] is False, bad_cg
 client.create_context_graph("My Project", "desc")
+# T-PRIVACY: client passes accessPolicy + allowedAgents through to the daemon
+# verbatim when supplied, and omits them when not. The CLIENT layer does NOT
+# validate address format; that's the tool handler's job — the client just
+# forwards bytes to the daemon for the cases where a programmatic caller has
+# already validated upstream.
+client.create_context_graph("Curated", "private cg", access_policy=1)
+client.create_context_graph(
+    "Team",
+    "shared",
+    access_policy=1,
+    allowed_agents=["0x" + "a" * 40, "0x" + "B" * 40],
+)
+
+# Round 3 — access_policy=True (Python bool, which is a subclass of int)
+# would have silently sent JSON true to the daemon under the previous
+# isinstance(access_policy, int) check; the daemon's typeof check would
+# then drop the field and resolve to default-public, the opposite of a
+# programmatic caller's intent. Now rejected at the client layer with a
+# clear error before any daemon contact.
+bool_true_result = client.create_context_graph("BoolTrue", "x", access_policy=True)
+assert bool_true_result["success"] is False, bool_true_result
+assert "access_policy" in bool_true_result["error"], bool_true_result
+bool_false_result = client.create_context_graph("BoolFalse", "x", access_policy=False)
+assert bool_false_result["success"] is False, bool_false_result
+# Round 3 — only meaningful values {0, 1} accepted; other ints rejected.
+out_of_range = client.create_context_graph("Two", "x", access_policy=2)
+assert out_of_range["success"] is False, out_of_range
+assert "0" in out_of_range["error"] and "1" in out_of_range["error"], out_of_range
+# access_policy=0 is the open/discoverable value — accepted.
+client.create_context_graph("OpenExplicit", "x", access_policy=0)
+
 client.subscribe("cg:test", include_shared_memory=True)
 client.write_assertion("a b", "cg:test", [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "sub")
 client.discard_assertion("a b", "cg:test")
@@ -1653,8 +1692,14 @@ client.add_participant("cg:test", "agent")
 client.list_join_requests("cg:test")
 client.publish("cg:test", selection=["urn:root"], clear_after=False, sub_graph_name="sub")
 
+_VALID_ADDR_A = "0x" + "a" * 40
+_VALID_ADDR_B = "0x" + "B" * 40
+
 assert calls == [
     ("POST", "/api/context-graph/create", {"id": "my-project", "name": "My Project", "description": "desc"}),
+    ("POST", "/api/context-graph/create", {"id": "curated", "name": "Curated", "description": "private cg", "accessPolicy": 1}),
+    ("POST", "/api/context-graph/create", {"id": "team", "name": "Team", "description": "shared", "accessPolicy": 1, "allowedAgents": [_VALID_ADDR_A, _VALID_ADDR_B]}),
+    ("POST", "/api/context-graph/create", {"id": "openexplicit", "name": "OpenExplicit", "description": "x", "accessPolicy": 0}),
     ("POST", "/api/context-graph/subscribe", {"contextGraphId": "cg:test", "includeSharedMemory": True}),
     ("POST", "/api/assertion/a%20b/write", {"contextGraphId": "cg:test", "quads": [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "subGraphName": "sub"}),
     ("POST", "/api/assertion/a%20b/discard", {"contextGraphId": "cg:test"}),
@@ -2568,6 +2613,160 @@ provider._assertion_id = ""
 provider._cache["queued_writes"] = [{"type": "memory", "action": "replace", "target": "memory", "content": "new fact", "old_text": "cached"}]
 provider._flush_queued_writes()
 assert provider._cache["queued_writes"] == [{"type": "memory", "action": "replace", "target": "memory", "content": "new fact", "old_text": "cached"}], provider._cache
+`;
+    const result = spawnSync('python', ['-B', '-c', script], {
+      cwd: process.cwd(),
+      encoding: 'utf-8',
+    });
+
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('dkg_context_graph_create handler defaults to curated and forwards public + allowed_agents', () => {
+    // Privacy-by-default flip in Hermes parity:
+    //
+    // - No `public` and no `allowed_agents` → handler sends accessPolicy: 1
+    //   (curated). The agent's createContextGraph flow auto-includes the
+    //   creator in DKG_ALLOWED_AGENT (see packages/agent/src/dkg-agent.ts:3962),
+    //   so the creator can immediately read/write without a self-invite.
+    // - `public: true` → handler drops accessPolicy (daemon resolves to open)
+    //   AND drops allowed_agents even if supplied (meaningless on a public CG).
+    // - `allowed_agents: [...]` (no `public`) → handler sends accessPolicy: 1
+    //   AND allowedAgents.
+    // - Whitespace-only / empty / non-string entries in allowed_agents are
+    //   filtered out before forwarding.
+    const script = String.raw`
+import importlib.util
+import json
+import sys
+import tempfile
+import types
+from pathlib import Path
+
+home = Path(tempfile.mkdtemp(prefix="hermes-dkg-create-cg-defaults-"))
+
+agent_pkg = types.ModuleType("agent")
+memory_provider = types.ModuleType("agent.memory_provider")
+class MemoryProvider:
+    pass
+memory_provider.MemoryProvider = MemoryProvider
+sys.modules["agent"] = agent_pkg
+sys.modules["agent.memory_provider"] = memory_provider
+
+tools_pkg = types.ModuleType("tools")
+registry = types.ModuleType("tools.registry")
+def tool_error(message):
+    return json.dumps({"error": message})
+registry.tool_error = tool_error
+sys.modules["tools"] = tools_pkg
+sys.modules["tools.registry"] = registry
+
+constants = types.ModuleType("hermes_constants")
+constants.get_hermes_home = lambda: home
+sys.modules["hermes_constants"] = constants
+
+sys.modules["plugins"] = types.ModuleType("plugins")
+sys.modules["plugins.memory"] = types.ModuleType("plugins.memory")
+sys.modules["plugins.memory.dkg"] = types.ModuleType("plugins.memory.dkg")
+
+plugin_dir = Path(r"${process.cwd().replace(/\\/g, '\\\\')}") / "hermes-plugin"
+
+spec = importlib.util.spec_from_file_location(
+    "plugins.memory.dkg",
+    plugin_dir / "__init__.py",
+    submodule_search_locations=[str(plugin_dir)],
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules["plugins.memory.dkg"] = module
+spec.loader.exec_module(module)
+
+provider = module.DKGMemoryProvider()
+provider._offline = False
+
+class FakeClient:
+    def __init__(self):
+        self.calls = []
+    def create_context_graph(self, name, description="", cg_id=None, *, access_policy=None, allowed_agents=None):
+        self.calls.append({
+            "name": name,
+            "description": description,
+            "cg_id": cg_id,
+            "access_policy": access_policy,
+            "allowed_agents": allowed_agents,
+        })
+        return {"created": cg_id or name, "uri": f"did:dkg:context-graph:{cg_id or name}"}
+
+client = FakeClient()
+provider._client = client
+
+VALID_A = "0x" + "a" * 40
+VALID_B = "0x" + "B" * 40
+
+# Default - no public, no allowed_agents -> curated.
+provider._handle_create_cg({"name": "Default", "id": "default"})
+# Explicit public - accessPolicy dropped, allowed_agents ignored even if
+# malformed (validation only runs when public is false, so public CGs never
+# raise on bad allowlist content).
+provider._handle_create_cg({"name": "Open", "id": "open", "public": True, "allowed_agents": ["not-an-address"]})
+# Curated with explicit allowlist (valid 40-hex addresses).
+provider._handle_create_cg({"name": "Team", "id": "team", "allowed_agents": [VALID_A, VALID_B]})
+# Curated with whitespace-padded valid entries — trimmed but kept.
+provider._handle_create_cg({"name": "Trim", "id": "trim", "allowed_agents": [f"  {VALID_A}  ", VALID_B]})
+# Round 1 — invalid address must surface as a tool error and NOT call client.
+err = json.loads(provider._handle_create_cg({"name": "Bad", "id": "bad", "allowed_agents": [VALID_A, "not-an-address"]}))
+assert "error" in err and "Invalid Ethereum address" in err["error"], err
+assert "not-an-address" in err["error"], err
+# Round 1 — too-short hex value also rejected.
+err2 = json.loads(provider._handle_create_cg({"name": "Short", "id": "short", "allowed_agents": ["0xabc"]}))
+assert "error" in err2 and "Invalid Ethereum address" in err2["error"], err2
+
+# Round 2 — fail-fast on non-string entries instead of silently dropping
+# them. LLMs occasionally emit numbers / dicts / nulls in tool args; if we
+# silently drop them, the agent thinks the participant was added when it
+# wasn't. Fail with a precise index-scoped error so the agent can correct.
+err3 = json.loads(provider._handle_create_cg({"name": "Mixed", "id": "mixed", "allowed_agents": [VALID_A, 42, VALID_B]}))
+assert "error" in err3 and "allowed_agents[1]" in err3["error"] and "must be a string" in err3["error"], err3
+
+# Round 2 — fail-fast on empty / whitespace-only entries.
+err4 = json.loads(provider._handle_create_cg({"name": "Empty", "id": "empty", "allowed_agents": [VALID_A, "   "]}))
+assert "error" in err4 and "allowed_agents[1]" in err4["error"] and ("empty" in err4["error"] or "whitespace" in err4["error"]), err4
+
+# Round 2 — fail-fast on null entries.
+err5 = json.loads(provider._handle_create_cg({"name": "Null", "id": "null", "allowed_agents": [VALID_A, None]}))
+assert "error" in err5 and "allowed_agents[1]" in err5["error"], err5
+
+# Round 2 — non-list allowed_agents (e.g. dict, string) rejected.
+err6 = json.loads(provider._handle_create_cg({"name": "NotList", "id": "notlist", "allowed_agents": "0x1234"}))
+assert "error" in err6 and "must be an array" in err6["error"], err6
+
+# Round 2 — non-boolean public rejected (string "yes" should NOT silently
+# fall back to curated; the agent gets a clear error).
+err7 = json.loads(provider._handle_create_cg({"name": "Yes", "id": "yes", "public": "yes"}))
+assert "error" in err7 and "public" in err7["error"] and "boolean" in err7["error"], err7
+
+# Round 2 — non-boolean public rejected (number 1 should NOT be coerced).
+err8 = json.loads(provider._handle_create_cg({"name": "One", "id": "one", "public": 1}))
+assert "error" in err8 and "public" in err8["error"], err8
+
+assert client.calls[0] == {
+    "name": "Default", "description": "", "cg_id": "default",
+    "access_policy": 1, "allowed_agents": None,
+}, client.calls[0]
+assert client.calls[1] == {
+    "name": "Open", "description": "", "cg_id": "open",
+    "access_policy": None, "allowed_agents": None,
+}, client.calls[1]
+assert client.calls[2] == {
+    "name": "Team", "description": "", "cg_id": "team",
+    "access_policy": 1, "allowed_agents": [VALID_A, VALID_B],
+}, client.calls[2]
+assert client.calls[3] == {
+    "name": "Trim", "description": "", "cg_id": "trim",
+    "access_policy": 1, "allowed_agents": [VALID_A, VALID_B],
+}, client.calls[3]
+# All round-1 + round-2 failure paths must NOT have hit the client —
+# pre-flight validation.
+assert len(client.calls) == 4, client.calls
 `;
     const result = spawnSync('python', ['-B', '-c', script], {
       cwd: process.cwd(),

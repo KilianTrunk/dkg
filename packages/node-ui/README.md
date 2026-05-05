@@ -38,7 +38,10 @@ pnpm dev:ui
 # Build the production UI bundle
 pnpm build:ui
 
-# Build the full package (server + UI)
+# Build the full package from this workspace (server + UI)
+pnpm build:full
+
+# Build all packages and the Node UI bundle from the repo root
 pnpm build
 ```
 

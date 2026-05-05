@@ -264,10 +264,14 @@ DKG_SHARE_SCHEMA = {
             },
             "context_graph_id": {
                 "type": "string",
-                "description": "Target Context Graph (default: current project).",
+                "description": "Target Context Graph ID.",
+            },
+            "sub_graph_name": {
+                "type": "string",
+                "description": "Optional sub-graph scope.",
             },
         },
-        "required": ["content"],
+        "required": ["content", "context_graph_id"],
     },
 }
 
@@ -452,7 +456,12 @@ DKG_CREATE_CONTEXT_GRAPH_SCHEMA = {
         "Create a new Context Graph — a bounded knowledge space for a project "
         "or team. Context Graphs organize knowledge into Working Memory, "
         "Shared Memory, and Verified Memory layers. Use dkg_status first to "
-        "check if the Context Graph already exists."
+        "check if the Context Graph already exists. "
+        "Defaults to a curated/private context graph — the creator is "
+        "auto-included in the allowlist and can immediately write to working "
+        "and shared memory. Pass `public: true` for an open/discoverable "
+        "context graph, or `allowed_agents` to invite collaborators "
+        "atomically with creation."
     ),
     "parameters": {
         "type": "object",
@@ -468,6 +477,24 @@ DKG_CREATE_CONTEXT_GRAPH_SCHEMA = {
             "id": {
                 "type": "string",
                 "description": "Optional context graph ID. Auto-generated from name when omitted.",
+            },
+            "public": {
+                "type": "boolean",
+                "description": (
+                    "If true, creates an open/discoverable context graph "
+                    "(anyone can subscribe and read). Default is false — the "
+                    "context graph is curated/private and restricted to "
+                    "allowed_agents (the creator is always auto-included)."
+                ),
+            },
+            "allowed_agents": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional agent addresses (0x...) to add to the curation "
+                    "allowlist at creation time. The creator's own address is "
+                    "auto-added regardless. Ignored when public is true."
+                ),
             },
         },
         "required": ["name"],
@@ -899,7 +926,16 @@ class DKGMemoryProvider(MemoryProvider):
             "TRUST FLOW: Working Memory (local, free) → SHARE → Shared Memory "
             "(team, free) → PUBLISH → Verified Memory (chain, TRAC cost, permanent).\n"
             "Knowledge gains trust as it moves through layers. Only publish when "
-            "findings are verified and ready for permanent record."
+            "findings are verified and ready for permanent record.\n"
+            "\n"
+            "PRIVACY MODEL: Context graphs created via dkg_context_graph_create "
+            "default to curated/private — only listed agents receive Shared "
+            "Memory gossip. The creator is auto-included; invite collaborators "
+            "with dkg_participant_add or pass allowed_agents at creation. Use "
+            "public:true to opt into a discoverable/open context graph. Working "
+            "Memory is per-agent regardless of visibility. Verified Memory "
+            "anchors are public on-chain; the underlying private quads stay "
+            "local on the publishing node."
         )
 
         return "\n\n".join(blocks)
@@ -1343,7 +1379,12 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error("Content is required.")
         if "context_graph" in args:
             return tool_error('"context_graph" is not a supported parameter on dkg_share. Use "context_graph_id".')
-        cg = _first_text(args, "context_graph_id") or self._context_graph
+        # Aligned with OpenClaw: context_graph_id is required (no implicit
+        # current-project fallback). Keeps both adapter contracts identical
+        # so portable agent code works unchanged across either surface.
+        cg = _first_text(args, "context_graph_id")
+        if not cg:
+            return tool_error("context_graph_id is required.")
         quads = [{
             "subject": f"urn:hermes:{self._agent_name}:shared",
             "predicate": "urn:hermes:sharedContent",
@@ -1533,7 +1574,66 @@ class DKGMemoryProvider(MemoryProvider):
         if not name:
             return tool_error("name is required.")
         description = args.get("description", "")
-        result = self._client.create_context_graph(name, description, cg_id=_first_text(args, "id"))
+        # Privacy-by-default: when `public` is omitted or false, the context
+        # graph is curated (`accessPolicy: 1`). The agent's createContextGraph
+        # flow auto-includes the creator's address in the allowlist (see
+        # `packages/agent/src/dkg-agent.ts:3962-3973`), so the creator can
+        # immediately read/write the curated CG without a self-invite step.
+        #
+        # Round 2 — strict type validation: an LLM that emits
+        # `public: "yes"` (string) or any non-boolean value should get a
+        # clear tool error rather than silently defaulting to false (which
+        # would produce the opposite of the agent's intent). Only `True`,
+        # `False`, or omitted are accepted.
+        raw_public = args.get("public")
+        if raw_public is not None and not isinstance(raw_public, bool):
+            return tool_error(
+                f"\"public\" must be a boolean (true or false). Got: {type(raw_public).__name__}."
+            )
+        is_public = raw_public is True
+        access_policy: Optional[int] = None if is_public else 1
+        raw_allowed = args.get("allowed_agents")
+        allowed_agents: Optional[list] = None
+        if not is_public and raw_allowed is not None:
+            # Round 2 — strict validation: every entry must be a non-empty
+            # trimmed string that matches the Ethereum address regex.
+            # Previously we silently dropped non-string/blank entries,
+            # which hides LLM-generated mistakes (e.g. `["0xAlice...", 42]`
+            # would create a curated graph without entry 42's owner ever
+            # knowing they were excluded). Fail fast instead.
+            if not isinstance(raw_allowed, list):
+                return tool_error(
+                    f"\"allowed_agents\" must be an array of strings. Got: {type(raw_allowed).__name__}."
+                )
+            eth_addr_re = re.compile(r"^0x[0-9a-fA-F]{40}$")
+            cleaned: list = []
+            for index, entry in enumerate(raw_allowed):
+                if not isinstance(entry, str):
+                    return tool_error(
+                        f"\"allowed_agents[{index}]\" must be a string. Got: {type(entry).__name__}."
+                    )
+                trimmed = entry.strip()
+                if not trimmed:
+                    return tool_error(
+                        f"\"allowed_agents[{index}]\" is empty or whitespace-only. "
+                        "Each entry must be a 0x-prefixed 40-hex-char Ethereum address."
+                    )
+                if not eth_addr_re.match(trimmed):
+                    return tool_error(
+                        f"Invalid Ethereum address in \"allowed_agents[{index}]\": \"{entry}\". "
+                        "Each entry must be a 0x-prefixed 40-hex-char string "
+                        "(e.g. \"0x1234567890abcdef1234567890abcdef12345678\")."
+                    )
+                cleaned.append(trimmed)
+            if cleaned:
+                allowed_agents = cleaned
+        result = self._client.create_context_graph(
+            name,
+            description,
+            cg_id=_first_text(args, "id"),
+            access_policy=access_policy,
+            allowed_agents=allowed_agents,
+        )
         return json.dumps(result)
 
     def _handle_context_graph_invite(self, args: Dict[str, Any]) -> str:

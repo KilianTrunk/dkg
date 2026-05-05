@@ -169,12 +169,10 @@ export const fetchNodeLog = (params: { lines?: number; q?: string } = {}) => {
   return get<{ lines: string[]; totalSize: number }>(`/api/node-log${q ? '?' + q : ''}`);
 };
 
-// --- Context Graphs ---
-// Use /api/paranet/* which works on both the installed release and dev builds.
-// The V10 aliases (/api/context-graph/*) are only available on the latest dev daemon.
+// --- Context graphs (V10) — legacy daemon paths keep working server-side redirects.
 export async function fetchContextGraphs(): Promise<{ contextGraphs: any[] }> {
-  const data = await get<{ paranets?: any[]; contextGraphs?: any[] }>('/api/paranet/list');
-  const list = data.contextGraphs ?? data.paranets ?? [];
+  const data = await get<{ contextGraphs?: any[] }>('/api/context-graph/list');
+  const list = data.contextGraphs ?? [];
   return { contextGraphs: list.filter((p: any) => !p.isSystem) };
 }
 
@@ -199,7 +197,7 @@ export async function createContextGraph(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
-    const res = await fetch(`${BASE}/api/paranet/create`, {
+    const res = await fetch(`${BASE}/api/context-graph/create`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
@@ -1516,6 +1514,34 @@ async function mapLocalAgentIntegrationRecord(record: LocalAgentIntegrationRecor
     target: health?.target,
     source: configured || surface ? 'live' : 'planned',
   } satisfies LocalAgentIntegration;
+}
+
+export type RegistryTrustTier = 'community' | 'verified' | 'featured';
+export type RegistryMemoryLayer = 'WM' | 'SWM' | 'VM';
+export type RegistryInstallKind = 'cli' | 'mcp' | 'service' | 'agent-plugin' | 'manual';
+
+export interface RegistryIntegrationSummary {
+  slug: string;
+  name: string;
+  description: string;
+  trustTier: RegistryTrustTier;
+  memoryLayers: RegistryMemoryLayer[];
+  installKind: RegistryInstallKind;
+  repo: string;
+  maintainer: string;
+  targetAgents: string[];
+}
+
+export interface RegistryListResult {
+  entries: RegistryIntegrationSummary[];
+  failures: Array<{ slug: string; error: string }>;
+  fetchedAt: number;
+  tier: RegistryTrustTier;
+}
+
+export async function fetchRegistryIntegrations(opts: { tier?: RegistryTrustTier } = {}): Promise<RegistryListResult> {
+  const search = opts.tier ? `?tier=${encodeURIComponent(opts.tier)}` : '';
+  return get<RegistryListResult>(`/api/integrations/registry${search}`);
 }
 
 export async function fetchLocalAgentIntegrations(): Promise<{ integrations: LocalAgentIntegration[] }> {

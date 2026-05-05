@@ -122,8 +122,8 @@ describe('httpAuthGuard', () => {
   let baseUrl: string;
 
   beforeEach(async () => {
-    server = createServer((req: IncomingMessage, res: ServerResponse) => {
-      if (!httpAuthGuard(req, res, true, validTokens)) return;
+    server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      if (!(await httpAuthGuard(req, res, true, validTokens))) return;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
     });
@@ -204,8 +204,8 @@ describe('httpAuthGuard (auth disabled)', () => {
   let baseUrl: string;
 
   beforeEach(async () => {
-    server = createServer((req: IncomingMessage, res: ServerResponse) => {
-      if (!httpAuthGuard(req, res, false, new Set())) return;
+    server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      if (!(await httpAuthGuard(req, res, false, new Set()))) return;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
     });

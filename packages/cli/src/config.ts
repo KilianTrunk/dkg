@@ -248,6 +248,7 @@ export interface DkgConfig {
     enabled?: boolean;
     pollIntervalMs?: number;
     errorBackoffMs?: number;
+    maxRetries?: number;
   };
   /** Allowed CORS origins. Defaults to '*' when apiHost is '127.0.0.1', otherwise restrictive. */
   corsOrigins?: string | string[];

@@ -316,7 +316,7 @@ export class DKGPublisher implements Publisher {
     return this.publisherAddress;
   }
 
-  private requirePublisherSigner(operation: string): PublisherSigner {
+  private getPublisherSigner(): PublisherSigner | undefined {
     if (this.publisherWallet && this.publisherAddress) {
       const wallet = this.publisherWallet;
       return {
@@ -349,7 +349,13 @@ export class DKGPublisher implements Publisher {
       };
     }
 
-    throw new PublisherWalletRequiredError(operation);
+    return undefined;
+  }
+
+  private requirePublisherSigner(operation: string): PublisherSigner {
+    const signer = this.getPublisherSigner();
+    if (!signer) throw new PublisherWalletRequiredError(operation);
+    return signer;
   }
 
   private async withWriteLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
@@ -1074,8 +1080,7 @@ export class DKGPublisher implements Publisher {
     const effectiveAccessPolicy = accessPolicy ?? (privateQuads.length > 0 ? 'ownerOnly' : 'public');
     const normalizedAllowedPeers = [...new Set((allowedPeers ?? []).map((p) => p.trim()).filter(Boolean))];
     const normalizedPublisherPeerId = publisherPeerId.trim();
-    const publisherSigner = this.requirePublisherSigner('publish');
-    const publisherAddress = publisherSigner.address;
+    const publisherAddress = this.requirePublisherAddress('publish');
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {
       throw new Error(
@@ -1335,28 +1340,33 @@ export class DKGPublisher implements Publisher {
       v10ChainId !== undefined &&
       v10KavAddress !== undefined
     ) {
-      const reason = !options.v10ACKProvider ? 'no v10ACKProvider (single-node mode)' : 'ACK collection failed/skipped';
-      this.log.info(ctx, `Self-signing ACK — ${reason}`);
-      const ackDigest = computePublishACKDigest(
-        v10ChainId,
-        v10KavAddress,
-        v10CgId,
-        kcMerkleRoot,
-        BigInt(kaCount),
-        publicByteSize,
-        BigInt(publishEpochs),
-        precomputedTokenAmount,
-        BigInt(kcMerkleLeafCount),
-      );
-      const ackSig = ethers.Signature.from(
-        await publisherSigner.signMessage(ackDigest),
-      );
-      v10ACKs = [{
-        peerId: 'self',
-        signatureR: ethers.getBytes(ackSig.r),
-        signatureVS: ethers.getBytes(ackSig.yParityAndS),
-        nodeIdentityId: this.publisherNodeIdentityId,
-      }];
+      const publisherSigner = this.getPublisherSigner();
+      if (publisherSigner) {
+        const reason = !options.v10ACKProvider ? 'no v10ACKProvider (single-node mode)' : 'ACK collection failed/skipped';
+        this.log.info(ctx, `Self-signing ACK — ${reason}`);
+        const ackDigest = computePublishACKDigest(
+          v10ChainId,
+          v10KavAddress,
+          v10CgId,
+          kcMerkleRoot,
+          BigInt(kaCount),
+          publicByteSize,
+          BigInt(publishEpochs),
+          precomputedTokenAmount,
+          BigInt(kcMerkleLeafCount),
+        );
+        const ackSig = ethers.Signature.from(
+          await publisherSigner.signMessage(ackDigest),
+        );
+        v10ACKs = [{
+          peerId: 'self',
+          signatureR: ethers.getBytes(ackSig.r),
+          signatureVS: ethers.getBytes(ackSig.yParityAndS),
+          nodeIdentityId: this.publisherNodeIdentityId,
+        }];
+      } else {
+        this.log.warn(ctx, 'Self-sign ACK skipped: publisher signing key is unavailable');
+      }
     }
 
     onPhase?.('chain', 'start');
@@ -1372,19 +1382,25 @@ export class DKGPublisher implements Publisher {
     if (identityId === 0n) {
       this.log.warn(ctx, `Identity not set (0) — skipping on-chain publish`);
     } else {
-      onPhase?.('chain:sign', 'start');
-      this.log.info(
-        ctx,
-        `Signing on-chain publish (identityId=${identityId}, signer=${publisherSigner.address}, source=${publisherSigner.source})`,
-      );
-
       const tokenAmount = precomputedTokenAmount;
       usedV10Path = true;
-
-      onPhase?.('chain:sign', 'end');
-      onPhase?.('chain:submit', 'start');
-      this.log.info(ctx, `Submitting V10 on-chain publish tx (${kaCount} KAs, publicByteSize=${publicByteSize}, tokenAmount=${tokenAmount})`);
+      let signStarted = false;
+      let submitStarted = false;
       try {
+        onPhase?.('chain:sign', 'start');
+        signStarted = true;
+        const publisherSigner = this.requirePublisherSigner('publish');
+        this.log.info(
+          ctx,
+          `Signing on-chain publish (identityId=${identityId}, signer=${publisherSigner.address}, source=${publisherSigner.source})`,
+        );
+
+        onPhase?.('chain:sign', 'end');
+        signStarted = false;
+        onPhase?.('chain:submit', 'start');
+        submitStarted = true;
+        this.log.info(ctx, `Submitting V10 on-chain publish tx (${kaCount} KAs, publicByteSize=${publicByteSize}, tokenAmount=${tokenAmount})`);
+
         if (!v10ACKs || v10ACKs.length === 0) {
           throw new Error('V10 ACKs required for on-chain publish — no ACKs collected');
         }
@@ -1564,10 +1580,12 @@ export class DKGPublisher implements Publisher {
 
         status = 'confirmed';
         onPhase?.('chain:submit', 'end');
+        submitStarted = false;
         onPhase?.('chain:metadata', 'start');
         this.log.info(ctx, `On-chain confirmed: UAL=${ual} batchId=${onChainResult.batchId} tx=${onChainResult.txHash}`);
       } catch (err) {
-        onPhase?.('chain:submit', 'end');
+        if (signStarted) onPhase?.('chain:sign', 'end');
+        if (submitStarted) onPhase?.('chain:submit', 'end');
         this.log.warn(ctx, `On-chain tx failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }

@@ -157,6 +157,46 @@ describe('findHits', () => {
     assert.equal(hits.length, 1);
   });
 
+  it('REGRESSION (PR #371 round 4): finds Wallet import aliases', () => {
+    const text = 'import { Wallet as EthersWallet } from "ethers";\nconst w = EthersWallet.createRandom();';
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 2);
+    assert.equal(hits[0].identifier, 'EthersWallet');
+  });
+
+  it('REGRESSION (PR #371 round 4): follows local Wallet aliases', () => {
+    const text = 'const W = Wallet;\nconst w = W.createRandom();';
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 2);
+    assert.equal(hits[0].identifier, 'W');
+  });
+
+  it('REGRESSION (PR #371 round 4): follows transitive Wallet aliases', () => {
+    const text = 'const W = Wallet;\nconst W2 = W;\nconst w = W2.createRandom();';
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 3);
+    assert.equal(hits[0].identifier, 'W2');
+  });
+
+  it('REGRESSION (PR #371 round 4): finds aliases assigned from ethers.Wallet', () => {
+    const text = 'const W = ethers.Wallet;\nconst w = W.createRandom();';
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 2);
+    assert.equal(hits[0].identifier, 'W');
+  });
+
+  it('REGRESSION (PR #371 round 4): finds destructured ethers Wallet aliases', () => {
+    const text = 'const { Wallet: EthersWallet } = ethers;\nconst w = EthersWallet.createRandom();';
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 2);
+    assert.equal(hits[0].identifier, 'EthersWallet');
+  });
+
   it('does NOT report calls inside string literals', () => {
     const hits = findHits('const s = "Wallet.createRandom()";');
     assert.equal(hits.length, 0);

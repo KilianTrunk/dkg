@@ -25,8 +25,9 @@
  * ------------
  * Walks every `.ts` / `.tsx` / `.mts` / `.cts` / `.js` / `.jsx` / `.mjs` /
  * `.cjs` source file under `packages/*\/{src,utils}/**` and fails if it
- * finds `Wallet.createRandom(` outside the explicitly allowlisted call
- * sites below. Each allowlist entry pins ONE expected hit with a one-line
+ * finds `Wallet.createRandom(` (including obvious `Wallet` aliases) outside
+ * the explicitly allowlisted call sites below. Each allowlist entry pins ONE
+ * expected hit with a one-line
  * justification — adding a second `createRandom()` to the same file does
  * NOT inherit the existing exemption and must be reviewed on its own.
  *
@@ -51,6 +52,8 @@
  *     line numbers in error output stay accurate). This means:
  *       * Split invocations like `Wallet\n.createRandom()` or
  *         `Wallet /* … *​/.createRandom()` cannot bypass via formatting.
+ *       * Import/local aliases such as `import { Wallet as EthersWallet }`
+ *         and `const W = Wallet; W.createRandom()` are scanned too.
  *       * `//` or `/​*` inside a string literal does NOT trigger comment
  *         mode (so `const url = "http://"; Wallet.createRandom();` is
  *         correctly flagged — previously the `//` inside the string
@@ -134,11 +137,8 @@ const ALLOWLIST = new Map([
   ],
 ]);
 
-// Match `Wallet . createRandom (` allowing arbitrary whitespace (including
-// newlines) between the tokens. This is intentionally a single regex over
-// the comment-stripped file, NOT a per-line scan — that previously let
-// `Wallet\n  .createRandom()` bypass the audit by formatting alone.
-const PATTERN = /\bWallet\s*\.\s*createRandom\s*\(/g;
+const IDENT = String.raw`[A-Za-z_$][\w$]*`;
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
  * Blank out comments AND string / template-literal contents from `text`,
@@ -335,18 +335,88 @@ export function stripCommentsPreservingPositions(text) {
 
 export function findHits(originalText) {
   const stripped = stripCommentsPreservingPositions(originalText);
+  const walletAliases = collectWalletAliases(stripped);
   const hits = [];
-  for (const m of stripped.matchAll(PATTERN)) {
-    const upToMatch = stripped.slice(0, m.index);
-    const line = upToMatch.split('\n').length;
-    const lineStart = upToMatch.lastIndexOf('\n') + 1;
-    const lineEnd = stripped.indexOf('\n', m.index);
-    const snippet = originalText
-      .slice(lineStart, lineEnd === -1 ? originalText.length : lineEnd)
-      .trim();
-    hits.push({ line, snippet });
+  const seen = new Set();
+
+  for (const alias of walletAliases) {
+    const pattern = new RegExp(String.raw`\b${escapeRegExp(alias)}\s*\.\s*createRandom\s*\(`, 'g');
+    for (const m of stripped.matchAll(pattern)) {
+      if (seen.has(m.index)) continue;
+      seen.add(m.index);
+      hits.push(hitFromIndex(originalText, stripped, m.index, alias));
+    }
   }
-  return hits;
+
+  hits.sort((a, b) => a.index - b.index);
+  return hits.map(({ index: _index, ...hit }) => hit);
+}
+
+function hitFromIndex(originalText, stripped, index, identifier) {
+  const upToMatch = stripped.slice(0, index);
+  const line = upToMatch.split('\n').length;
+  const lineStart = upToMatch.lastIndexOf('\n') + 1;
+  const lineEnd = stripped.indexOf('\n', index);
+  const snippet = originalText
+    .slice(lineStart, lineEnd === -1 ? originalText.length : lineEnd)
+    .trim();
+  return { index, line, snippet, identifier };
+}
+
+function collectWalletAliases(stripped) {
+  const aliases = new Set(['Wallet']);
+
+  // Named imports, including aliases: import { Wallet as EthersWallet } from ...
+  // String contents are blanked by the lexer, so this intentionally keys on the
+  // imported binding shape rather than the module specifier. The audit is a
+  // fail-safe for high-impact key loss, so a conservative false positive is
+  // preferable to an alias bypass.
+  const importPattern = new RegExp(String.raw`\bimport\s*\{([^}]*)\}\s*from\b`, 'g');
+  for (const m of stripped.matchAll(importPattern)) {
+    for (const rawSpecifier of m[1].split(',')) {
+      const specifier = rawSpecifier.trim();
+      const aliasMatch = specifier.match(new RegExp(String.raw`^Wallet\s+as\s+(${IDENT})$`));
+      if (aliasMatch) aliases.add(aliasMatch[1]);
+      if (specifier === 'Wallet') aliases.add('Wallet');
+    }
+  }
+
+  // Destructuring aliases from ethers: const { Wallet: W } = ethers;
+  const destructurePattern = new RegExp(
+    String.raw`\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*ethers\b`,
+    'g',
+  );
+  for (const m of stripped.matchAll(destructurePattern)) {
+    for (const rawSpecifier of m[1].split(',')) {
+      const specifier = rawSpecifier.trim();
+      const aliasMatch = specifier.match(new RegExp(String.raw`^Wallet\s*:\s*(${IDENT})$`));
+      if (aliasMatch) aliases.add(aliasMatch[1]);
+      if (specifier === 'Wallet') aliases.add('Wallet');
+    }
+  }
+
+  // Follow simple assignment aliases transitively:
+  //   const W = Wallet;
+  //   const W = ethers.Wallet;
+  //   const W2 = W;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const alias of [...aliases]) {
+      const aliasPattern = new RegExp(
+        String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*(?:ethers\s*\.\s*)?${escapeRegExp(alias)}\b`,
+        'g',
+      );
+      for (const m of stripped.matchAll(aliasPattern)) {
+        if (!aliases.has(m[1])) {
+          aliases.add(m[1]);
+          changed = true;
+        }
+      }
+    }
+  }
+
+  return aliases;
 }
 
 async function main() {

@@ -18,7 +18,9 @@
  * test both land in the same PR. The constructor now leaves
  * `publisherWallet` undefined; publish now requires either an explicit local
  * signing key or a configured adapter signer bound to a non-zero publisher
- * address.
+ * address before it can create ACKs, publisher signatures, or authorship
+ * proofs. Local tentative/no-chain publishes may proceed only when the caller
+ * supplied an explicit non-zero publisher address.
  */
 import { describe, it, expect } from 'vitest';
 import { DKGPublisher } from '../src/dkg-publisher.js';
@@ -68,28 +70,53 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect((publisher as any).publisherAddress).toBeUndefined();
   });
 
-  it('rejects publish without a publisherPrivateKey or adapter signer before producing a UAL', async () => {
+  it('rejects publish without any publisher address before producing a UAL', async () => {
     const keypair = await generateEd25519Keypair();
     const publisher = new DKGPublisher({
       store: new OxigraphStore(),
       chain: makeStubChain('test-evm-chain'),
       eventBus: new TypedEventBus(),
       keypair,
-      publisherAddress: '0x000000000000000000000000000000000000dEaD',
     });
 
-    expect((publisher as any).publisherWallet).toBeUndefined();
     await expect(
       publisher.publish({
         contextGraphId: '1',
         quads: [{
-          subject: 'urn:test:no-key',
+          subject: 'urn:test:no-address',
           predicate: 'http://schema.org/name',
-          object: '"NoKey"',
+          object: '"NoAddress"',
           graph: 'did:dkg:context-graph:1',
         }],
       }),
     ).rejects.toThrow(/publisherPrivateKey/i);
+  });
+
+  it('publishes tentatively with an explicit non-zero publisherAddress when no on-chain signer is needed', async () => {
+    const keypair = await generateEd25519Keypair();
+    const publisherAddress = '0x000000000000000000000000000000000000dEaD';
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain: makeStubChain('test-evm-chain'),
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherAddress,
+    });
+
+    expect((publisher as any).publisherWallet).toBeUndefined();
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:no-key',
+        predicate: 'http://schema.org/name',
+        object: '"NoKey"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+    expect(result.ual.toLowerCase()).toContain(publisherAddress.toLowerCase());
   });
 
   it('rejects a zero publisherAddress instead of treating it as a sentinel', async () => {

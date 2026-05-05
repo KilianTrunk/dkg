@@ -1,101 +1,112 @@
 import { defineSuite } from 'esbench';
-import { createPayload } from '../packages/cli/src/benchmark/publish-get/payload.ts';
-import { formatResult, summarizeOperations } from '../packages/cli/src/benchmark/publish-get/stats.ts';
-import {
-  OPERATIONS,
-  type BenchmarkOperation,
-  type BenchmarkResult,
-  type OperationTiming,
-} from '../packages/cli/src/benchmark/publish-get/types.ts';
-
-const config = {
-  contextGraphId: 'bench-cg',
-  repeat: 30,
-  warmups: 3,
-  timeoutMs: 120_000,
-  payloadSizeBytes: 1024,
-  fixture: 'generated' as const,
-  outputFormat: 'json' as const,
-  namespace: 'benchmark',
-  scope: 'publish-async-get',
-  authorityProofRef: 'proof:benchmark-local',
-  pollIntervalMs: 1000,
-  asyncSuccessStatuses: ['finalized'],
-  getView: 'verified-memory' as const,
-};
+import { createPayload, getSparql, validateQueryContainsMarker } from '../packages/cli/src/benchmark/publish-get/payload.ts';
+import { runPublishAsyncGetBenchmark } from '../packages/cli/src/benchmark/publish-get/runner.ts';
+import type { BenchmarkConfig } from '../packages/cli/src/benchmark/publish-get/types.ts';
+import { LayeredDkgBenchmarkClient } from './support/layered-dkg-client.ts';
 
 export default defineSuite({
   params: {
-    iterations: [30, 300],
+    payloadSizeBytes: [128, 1024],
   },
   baseline: {
     type: 'Name',
-    value: 'summarizeOperations',
+    value: 'syncPublish SWM to VM',
   },
   timing: {
     evaluateOverhead: false,
-    iterations: 64,
+    iterations: 16,
     samples: 5,
+    unrollFactor: 1,
     warmup: 1,
   },
-  setup(scene) {
-    const operations = createOperationTimings(scene.params.iterations);
-    const result = createBenchmarkResult(operations);
+  async setup(scene) {
+    const config = createConfig(scene.params.payloadSizeBytes);
+    const getClient = new LayeredDkgBenchmarkClient();
+    const getPayload = createPayload(config, 'esbench-get', 1, 'sync', false);
+    await getClient.sharedMemoryWrite(config.contextGraphId, getPayload.quads);
+    await getClient.publishFromSharedMemory(config.contextGraphId, { rootEntities: [getPayload.rootEntity] }, false);
 
-    scene.bench('summarizeOperations', () => {
-      summarizeOperations(operations);
+    let sequence = 0;
+
+    scene.benchAsync('syncPublish SWM to VM', async () => {
+      const client = new LayeredDkgBenchmarkClient();
+      const payload = createPayload(config, `esbench-sync-${sequence++}`, 1, 'sync', false);
+      await client.sharedMemoryWrite(config.contextGraphId, payload.quads);
+      const result = await client.publishFromSharedMemory(
+        config.contextGraphId,
+        { rootEntities: [payload.rootEntity] },
+        false,
+      );
+      if (!result.kcId) throw new Error('sync publish did not finalize a knowledge collection');
     });
 
-    scene.bench('formatResultJson', () => {
-      formatResult(result, 'json');
-    });
+    scene.benchAsync('asyncPublish enqueue runtime SWM to VM', async () => {
+      const client = new LayeredDkgBenchmarkClient();
+      const payload = createPayload(config, `esbench-async-${sequence++}`, 1, 'async', false);
+      const prepared = await client.sharedMemoryWrite(config.contextGraphId, payload.quads);
+      const shareOperationId = prepared.shareOperationId ?? prepared.workspaceOperationId;
+      if (!shareOperationId) throw new Error('shared-memory write did not return a share operation id');
 
-    scene.bench('formatResultNdjson', () => {
-      formatResult(result, 'ndjson');
-    });
+      const queued = await client.publisherEnqueue({
+        contextGraphId: config.contextGraphId,
+        shareOperationId,
+        roots: [payload.rootEntity],
+        namespace: config.namespace,
+        scope: config.scope,
+        authorityProofRef: config.authorityProofRef,
+        swmId: 'swm-main',
+        transitionType: 'CREATE',
+        authorityType: 'owner',
+      });
+      if (!queued.jobId) throw new Error('async publisher did not return a job id');
 
-    scene.bench('createPayload', () => {
-      for (let i = 0; i < scene.params.iterations; i += 1) {
-        createPayload(config, 'esbench', i + 1, i % 2 === 0 ? 'sync' : 'async', false);
+      const completed = await client.publisherJob(queued.jobId);
+      if (completed.job?.status !== 'finalized') {
+        throw new Error(`async publisher did not finalize: ${completed.job?.status ?? 'missing job'}`);
       }
+    });
+
+    scene.benchAsync('get VM marker validation', async () => {
+      const response = await getClient.query(
+        getSparql(getPayload.rootEntity),
+        config.contextGraphId,
+        { view: 'verified-memory' },
+      );
+      validateQueryContainsMarker(response.result, getPayload.marker);
+    });
+
+    scene.benchAsync('runner publish async get', async () => {
+      await runPublishAsyncGetBenchmark(
+        { ...config, repeat: 1, warmups: 0, timeoutMs: 1000, pollIntervalMs: 1 },
+        new LayeredDkgBenchmarkClient(),
+        monotonicClock(),
+      );
     });
   },
 });
 
-function createOperationTimings(iterations: number): OperationTiming[] {
-  const timings: OperationTiming[] = [];
-  for (let iteration = 1; iteration <= iterations; iteration += 1) {
-    for (const operation of OPERATIONS) {
-      timings.push(createTiming(operation, iteration));
-    }
-  }
-  return timings;
-}
-
-function createTiming(operation: BenchmarkOperation, iteration: number): OperationTiming {
-  const operationIndex = OPERATIONS.indexOf(operation) + 1;
+function createConfig(payloadSizeBytes: number): BenchmarkConfig {
   return {
-    operation,
-    iteration,
-    warmup: false,
-    success: true,
-    durationMs: operationIndex * 10 + iteration * 0.01,
-    context: {
-      contextGraphId: config.contextGraphId,
-      rootEntity: `urn:dkg:benchmark:esbench:${operation}:${iteration}`,
-      reproduction: `pnpm benchmark:publish-async-get -- --context-graph-id ${config.contextGraphId}`,
-    },
+    contextGraphId: 'bench-cg',
+    repeat: 30,
+    warmups: 3,
+    timeoutMs: 120_000,
+    payloadSizeBytes,
+    fixture: 'generated',
+    outputFormat: 'json',
+    namespace: 'benchmark',
+    scope: 'publish-async-get',
+    authorityProofRef: 'proof:benchmark-local',
+    pollIntervalMs: 1000,
+    asyncSuccessStatuses: ['finalized'],
+    getView: 'verified-memory',
   };
 }
 
-function createBenchmarkResult(operations: OperationTiming[]): BenchmarkResult {
-  return {
-    benchmark: 'publish-async-get',
-    startedAt: '2026-01-01T00:00:00.000Z',
-    finishedAt: '2026-01-01T00:00:01.000Z',
-    config,
-    operations,
-    summaries: summarizeOperations(operations),
-    failures: [],
+function monotonicClock(): () => number {
+  let value = 0;
+  return () => {
+    value += 1;
+    return value;
   };
 }

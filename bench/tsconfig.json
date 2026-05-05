@@ -9,6 +9,7 @@
   },
   "include": [
     "./**/*.ts",
-    "../packages/cli/src/benchmark/**/*.ts"
+    "../packages/cli/src/benchmark/**/*.ts",
+    "../packages/cli/src/api-client.ts"
   ]
 }

@@ -5,7 +5,20 @@ This repository uses two separate tools for two separate jobs:
 - Vitest is for unit and correctness tests.
 - ESBench is for repeatable local benchmarks, HTML reports, and baseline comparisons.
 
-The initial ESBench suite lives in `bench/publish-async-get.bench.ts`. It uses real benchmark helper code from `packages/cli/src/benchmark/publish-get/` and is intentionally small. Add new suites under `bench/**/*.bench.ts` as performance-sensitive paths become obvious.
+The initial ESBench suite lives in `bench/publish-async-get.bench.ts`. It uses
+the same publish/get runner contract as the CLI benchmark and a deterministic
+in-memory DKG client from `bench/support/layered-dkg-client.ts`. That client
+models the important layers explicitly:
+
+- working memory, where benchmark triples are first written
+- shared working memory, where payloads are staged for publishing
+- verified memory, where sync or async publish finalizes readable content
+- publisher jobs, where async enqueue is separated from runtime finalization
+
+The ESBench suite measures `syncPublish SWM to VM`,
+`asyncPublish enqueue runtime SWM to VM`, `get VM marker validation`, and the
+full `runPublishAsyncGetBenchmark` runner path. Add new suites under
+`bench/**/*.bench.ts` as performance-sensitive paths become obvious.
 
 ## Local Usage
 

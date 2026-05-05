@@ -66,6 +66,16 @@ function createRequest(body?: unknown): RequestContext['req'] {
   return request as RequestContext['req'];
 }
 
+function createGetRequest(url: string): RequestContext['req'] {
+  const request = new Readable({ read() { this.push(null); } });
+  Object.assign(request, {
+    method: 'GET',
+    url,
+    headers: { host: '127.0.0.1' },
+  });
+  return request as RequestContext['req'];
+}
+
 function createContext(overrides: Partial<RequestContext> = {}): RequestContext {
   const url = new URL('http://127.0.0.1/api/epcis/capture');
   return {
@@ -308,5 +318,163 @@ describe('EPCIS async capture publisher readiness', () => {
     expect(body.error).toBe('InvalidContent');
     expect(body.message).toMatch(/subGraphName/);
     expect(body.message).toMatch(/reserved/);
+  });
+});
+
+describe('EPCIS events query route — per-request CG + sub-graph', () => {
+  function createGetContext(rawUrl: string, overrides: Partial<RequestContext> = {}): RequestContext {
+    const url = new URL(rawUrl, 'http://127.0.0.1');
+    const queryCalls: Array<{ sparql: string; opts: unknown }> = [];
+    const baseAgent = {
+      query: async (sparql: string, opts: unknown) => {
+        queryCalls.push({ sparql, opts });
+        return { bindings: [] };
+      },
+    } as unknown as RequestContext['agent'];
+
+    return createContext({
+      req: createGetRequest(`${url.pathname}${url.search}`),
+      url,
+      path: url.pathname,
+      agent: baseAgent,
+      ...overrides,
+    });
+  }
+
+  // Capture agent.query SPARQL for assertions. The route plumbs the
+  // resolved CG + sub-graph through to the SPARQL builder, so this is
+  // the cleanest end-to-end observation point.
+  function captureSparql(): { agent: RequestContext['agent']; calls: Array<{ sparql: string; opts: unknown }> } {
+    const calls: Array<{ sparql: string; opts: unknown }> = [];
+    const agent = {
+      query: async (sparql: string, opts: unknown) => {
+        calls.push({ sparql, opts });
+        return { bindings: [] };
+      },
+    } as unknown as RequestContext['agent'];
+    return { agent, calls };
+  }
+
+  it('keeps existing config-only callers working (back-compat: no contextGraphId in query string)', async () => {
+    const { agent, calls } = captureSparql();
+    const ctx = createGetContext('/api/epcis/events', { agent });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:epcis-test>');
+    expect(calls[0].opts).toEqual({ contextGraphId: 'epcis-test' });
+  });
+
+  it('per-request contextGraphId overrides config and reaches the SPARQL builder', async () => {
+    const { agent, calls } = captureSparql();
+    const ctx = createGetContext('/api/epcis/events?contextGraphId=per-request-cg', { agent });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:epcis-test>');
+    expect(calls[0].opts).toEqual({ contextGraphId: 'per-request-cg' });
+  });
+
+  it('per-request subGraphName reaches the SPARQL builder for both public and private graphs', async () => {
+    const { agent, calls } = captureSparql();
+    const ctx = createGetContext(
+      '/api/epcis/events?contextGraphId=per-request-cg&subGraphName=research',
+      { agent },
+    );
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research/_private>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:per-request-cg>'); // root not used when sub set
+  });
+
+  it('per-request subGraphName picks SWM partition when finalized=false', async () => {
+    const { agent, calls } = captureSparql();
+    const ctx = createGetContext(
+      '/api/epcis/events?contextGraphId=per-request-cg&subGraphName=research&finalized=false',
+      { agent },
+    );
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(200);
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research/_shared_memory>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research/_private>');
+  });
+
+  it('falls back to legacy epcis.paranetId when neither query string nor epcis.contextGraphId is set', async () => {
+    const { agent, calls } = captureSparql();
+    const ctx = createGetContext('/api/epcis/events', {
+      agent,
+      config: {
+        epcis: { paranetId: 'legacy-paranet' },
+        publisher: { enabled: true },
+      } as RequestContext['config'],
+    });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(200);
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:legacy-paranet>');
+  });
+
+  it('returns 400 InvalidContent when neither query nor config supplies a contextGraphId', async () => {
+    const ctx = createGetContext('/api/epcis/events', {
+      config: {
+        epcis: {},
+        publisher: { enabled: true },
+      } as RequestContext['config'],
+    });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(400);
+    const body = responseBody(ctx);
+    expect(body.error).toBe('InvalidContent');
+    expect(body.message).toMatch(/contextGraphId/);
+    expect(body.message).toMatch(/epcis\.contextGraphId/);
+  });
+
+  it('returns 400 InvalidContent for an invalid per-request contextGraphId', async () => {
+    const ctx = createGetContext('/api/epcis/events?contextGraphId=bad%20cg%20with%20spaces');
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(400);
+    const body = responseBody(ctx);
+    expect(body.error).toBe('InvalidContent');
+    expect(body.message).toMatch(/contextGraphId/);
+  });
+
+  it('returns 400 InvalidContent for an invalid subGraphName (reserved underscore prefix)', async () => {
+    const ctx = createGetContext(
+      '/api/epcis/events?contextGraphId=per-request-cg&subGraphName=_reserved',
+    );
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(400);
+    const body = responseBody(ctx);
+    expect(body.error).toBe('InvalidContent');
+    expect(body.message).toMatch(/subGraphName/);
+    expect(body.message).toMatch(/reserved/);
+  });
+
+  it('does not call agent.query when validation fails (CG)', async () => {
+    const { agent, calls } = captureSparql();
+    const ctx = createGetContext('/api/epcis/events?contextGraphId=bad%20cg', { agent });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(400);
+    expect(calls).toHaveLength(0);
   });
 });

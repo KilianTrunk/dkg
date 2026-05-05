@@ -244,7 +244,7 @@ describe('buildEpcisQuery', () => {
     expect(sparql).toContain('dkg:privateDataAnchor "true"');
     expect(sparql).toMatch(
       new RegExp(
-        String.raw`GRAPH <${DATA_GRAPH}> \{[\s\S]*\?root dkg:privateDataAnchor "true"[\s\S]*\}[\s\S]*GRAPH <${PRIVATE_GRAPH}> \{[\s\S]*\?event a \?eventType`,
+        String.raw`GRAPH <${DATA_GRAPH}> \{[\s\S]*\?event dkg:privateDataAnchor "true"[\s\S]*\}[\s\S]*GRAPH <${PRIVATE_GRAPH}> \{[\s\S]*\?event a \?eventType`,
       ),
     );
   });

@@ -226,11 +226,10 @@ WHERE {
   union
   {
     GRAPH <${publicGraph}> {
-      ?root dkg:privateDataAnchor "true" .
+      ?event dkg:privateDataAnchor "true" .
     }
     GRAPH <${privateGraph}> {
       ?event a ?eventType .
-      FILTER(?event = ?root)
       ${wherePatterns.slice(1).join('\n      ')}
       ${optionalClauses.join('\n      ')}
     }

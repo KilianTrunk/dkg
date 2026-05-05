@@ -363,25 +363,59 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
   } = ctx;
 
 
-  // GET /api/epcis/events?epc=...&bizStep=...&from=...&to=...&limit=100&offset=0
+  // GET /api/epcis/events?contextGraphId=...&subGraphName=...&epc=...&bizStep=...&from=...&to=...&limit=100&offset=0
   if (req.method === "GET" && path === "/api/epcis/events") {
-    const epcisContextGraphId =
-      config.epcis?.contextGraphId ?? config.epcis?.paranetId;
-    if (!epcisContextGraphId) {
-      return jsonResponse(res, 503, {
-        error:
-          "EPCIS plugin is not configured (missing epcis.contextGraphId in config)",
-      });
-    }
     const searchParams = new URL(req.url!, `http://${req.headers.host}`)
       .searchParams;
+
+    // Resolve target context graph: per-request query string field,
+    // otherwise fall back to epcis.contextGraphId, otherwise legacy
+    // paranetId. Validation symmetry with the capture route.
+    const queryContextGraphId = searchParams.get("contextGraphId");
+    let resolvedContextGraphId: string;
+    if (queryContextGraphId !== null && queryContextGraphId !== "") {
+      const cgValidation = validateContextGraphId(queryContextGraphId);
+      if (!cgValidation.valid) {
+        return jsonResponse(res, 400, {
+          error: "InvalidContent",
+          message: `Invalid "contextGraphId": ${cgValidation.reason}`,
+        });
+      }
+      resolvedContextGraphId = queryContextGraphId;
+    } else {
+      const fallback = config.epcis?.contextGraphId ?? config.epcis?.paranetId;
+      if (!fallback) {
+        return jsonResponse(res, 400, {
+          error: "InvalidContent",
+          message:
+            'Missing "contextGraphId": provide it in the query string or configure epcis.contextGraphId (or legacy epcis.paranetId)',
+        });
+      }
+      resolvedContextGraphId = fallback;
+    }
+
+    // Sub-graph is per-request only — no fallback. Validate when present.
+    const querySubGraphName = searchParams.get("subGraphName");
+    let resolvedSubGraphName: string | undefined;
+    if (querySubGraphName !== null && querySubGraphName !== "") {
+      const sgValidation = validateSubGraphName(querySubGraphName);
+      if (!sgValidation.valid) {
+        return jsonResponse(res, 400, {
+          error: "InvalidContent",
+          message: `Invalid "subGraphName": ${sgValidation.reason}`,
+        });
+      }
+      resolvedSubGraphName = querySubGraphName;
+    }
+
     const epcisQueryEngine = {
       query: (sparql: string, opts?: { contextGraphId?: string }) =>
         agent.query(sparql, opts),
     };
     try {
       const result = await handleEventsQuery(searchParams, {
-        contextGraphId: epcisContextGraphId,
+        contextGraphId: resolvedContextGraphId,
+        subGraphName: resolvedSubGraphName,
         queryEngine: epcisQueryEngine,
         basePath: "/api/epcis/events",
       });

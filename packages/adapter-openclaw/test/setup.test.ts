@@ -544,6 +544,81 @@ describe('writeDkgConfig', () => {
       process.env.DKG_HOME = original;
     }
   });
+
+  // S1 step 4 ordering-invariant regression guard (issue #386 / execution-plan.md
+  // §3.S1 step 4). After the agent-agnostic field-level merge moved to
+  // dkg-core's `ensureDkgNodeConfig`, OpenClaw's `writeDkgConfig` MUST keep
+  // running `migrateLegacyOpenClawTransport` + the `openclawAdapter`/
+  // `openclawChannel` deletes + `pruneNetworkPinnedDefaults` BEFORE delegating
+  // to `ensureDkgNodeConfig`. If a future refactor flipped the order:
+  //   - Migration after merge: the `...existing` spread inside
+  //     `ensureDkgNodeConfig` would already have copied `openclawChannel`
+  //     into the output; the post-merge migration would then have to mutate
+  //     the *output* of `ensureDkgNodeConfig`, but the helper writes the
+  //     file synchronously, so the on-disk JSON would still contain
+  //     `openclawChannel` — and `localAgentIntegrations.openclaw.transport`
+  //     would be missing the migrated bridgeUrl/gatewayUrl.
+  //   - Delete after merge: same shape — `openclawChannel` would survive
+  //     to disk.
+  // This test asserts the union of both: bridge/gateway hints land under
+  // `localAgentIntegrations.openclaw.transport` AND the legacy key is gone
+  // AND the post-migration `name`/`apiPort` field-level merge respects the
+  // overrides — three signals from one fixture so a future refactor that
+  // breaks any one is caught with a precise stack trace.
+  it('ordering invariant: legacy migration + prune run before ensureDkgNodeConfig field merge', () => {
+    const dkgHome = join(testDir, '.dkg-ordering-invariant');
+    mkdirSync(dkgHome, { recursive: true });
+    writeFileSync(join(dkgHome, 'config.json'), JSON.stringify({
+      // Fields the migration must consume + delete:
+      openclawChannel: {
+        bridgeUrl: 'http://127.0.0.1:9999',
+        gatewayUrl: 'http://127.0.0.1:8888',
+      },
+      openclawAdapter: { stale: true },
+      // Field the prune must strip (matches network default below):
+      autoUpdate: { enabled: true, repo: 'OriginTrail/dkg', branch: 'main', checkIntervalMinutes: 30 },
+      // Pre-existing localAgentIntegrations the migration extends in-place
+      // (proves the migration ran on `existing` BEFORE field-level merge —
+      // if the order flipped, `localAgentIntegrations` would still be the
+      // pre-migration shape and bridgeUrl/gatewayUrl would be missing):
+      localAgentIntegrations: { openclaw: { enabled: true, transport: { kind: 'openclaw-channel' } } },
+      // Field the merge must preserve over the explicit override (proves
+      // ensureDkgNodeConfig saw post-migration existing with name intact):
+      name: 'preserved-from-existing',
+      apiPort: 9400,
+    }));
+
+    const original = process.env.DKG_HOME;
+    process.env.DKG_HOME = dkgHome;
+    try {
+      writeDkgConfig('discovered-name', {
+        ...fakeNetwork,
+        autoUpdate: { enabled: true, repo: 'OriginTrail/dkg', branch: 'main', checkIntervalMinutes: 30 },
+      }, 9200);
+
+      const config = JSON.parse(readFileSync(join(dkgHome, 'config.json'), 'utf-8'));
+
+      // (1) Migration ran: bridge/gateway hints ended up under
+      // localAgentIntegrations.openclaw.transport.
+      expect(config.localAgentIntegrations.openclaw.transport).toMatchObject({
+        kind: 'openclaw-channel',
+        bridgeUrl: 'http://127.0.0.1:9999',
+        gatewayUrl: 'http://127.0.0.1:8888',
+      });
+      // (2) Delete ran: legacy keys gone from on-disk config.
+      expect(config.openclawChannel).toBeUndefined();
+      expect(config.openclawAdapter).toBeUndefined();
+      // (3) Prune ran: stale auto-pinned autoUpdate fields stripped, only
+      // `enabled` mirrored back via ensureDkgNodeConfig.
+      expect(config.autoUpdate).toEqual({ enabled: true });
+      // (4) Field-level merge respected post-migration existing: name/apiPort
+      // preserved (no explicit overrides, so first-wins on `existing`).
+      expect(config.name).toBe('preserved-from-existing');
+      expect(config.apiPort).toBe(9400);
+    } finally {
+      process.env.DKG_HOME = original;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

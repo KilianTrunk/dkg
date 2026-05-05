@@ -25,6 +25,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import {
+  ensureDkgNodeConfig,
   fundWalletsBestEffort,
   logManualFundingInstructions,
   readWallets,
@@ -456,12 +457,17 @@ export function writeDkgConfig(
   apiPort: number,
   overrides?: DkgConfigOverrides,
 ): void {
-  const dir = dkgDir();
-  const configPath = join(dir, 'config.json');
+  const configPath = join(dkgDir(), 'config.json');
 
-  mkdirSync(dir, { recursive: true });
-
-  // Load existing config if present — merge, don't overwrite
+  // Load existing config if present — merge, don't overwrite. The
+  // OpenClaw-specific migrations + prune below MUST run on the loaded
+  // `existing` BEFORE we delegate to the agent-agnostic
+  // `ensureDkgNodeConfig` helper in dkg-core. The order is load-bearing:
+  // the helper reads `existing.localAgentIntegrations` (post-migration
+  // shape) and a future refactor that flipped the order would silently
+  // drop legacy openclawChannel hints from the merged config. See
+  // execution-plan.md §3.S1 step 4 ordering invariant + the regression
+  // test in setup.test.ts that pre-seeds an `openclawChannel` legacy key.
   let existing: Record<string, any> = {};
   if (existsSync(configPath)) {
     try {
@@ -487,55 +493,9 @@ export function writeDkgConfig(
   // status/telemetry consumers below depend on it being present.
   pruneNetworkPinnedDefaults(existing, network);
 
-  // Explicit CLI overrides (--name, --port) take precedence over existing config.
-  // Auto-detected values only fill in when no existing value is present.
-  //
-  // We intentionally do NOT persist `chain` or `autoUpdate` from
-  // `network/<env>.json` into the user's config when they're absent —
-  // the daemon already does field-level merging at runtime via
-  // `resolveChainConfig` (cli/src/config.ts) and `resolveAutoUpdateConfig`
-  // (same file, see docstring at "dkg init intentionally omits repo/branch").
-  // Pinning the network defaults here would cement them and break future
-  // hub rotations / branch rotations / RPC swaps in `network/<env>.json`,
-  // which is exactly the failure mode we just had to fight through on the
-  // testnet relay nodes after the hub address was rotated. The `...existing`
-  // spread above still preserves any chain/autoUpdate the operator added
-  // manually (e.g. private RPC override).
-  const config: Record<string, any> = {
-    ...existing,
-    name: overrides?.nameExplicit ? agentName : (existing.name ?? agentName),
-    apiPort: overrides?.portExplicit ? apiPort : (existing.apiPort ?? apiPort),
-    nodeRole: existing.nodeRole ?? (network.defaultNodeRole as 'edge' | 'core'),
-    contextGraphs: existing.contextGraphs
-      ?? existing.paranets
-      ?? network.defaultContextGraphs
-      ?? network.defaultParanets,
-    auth: existing.auth ?? { enabled: true },
-  };
-
-  // Preserve an existing relay override but never pin a new one — the daemon
-  // reads the full relay list from network config (testnet.json) automatically,
-  // which is better than hard-coding a single relay into the user's config.
-  if (existing.relay) {
-    config.relay = existing.relay;
-  }
-
-  // Persist only the `enabled` flag mirrored from the network default.
-  // `repo`/`branch`/`checkIntervalMinutes`/etc. are intentionally omitted
-  // (see big comment above on the resolver contract), but the `enabled`
-  // flag has to stay because several consumers — `/api/status`,
-  // `/api/info`, the telemetry log pusher in `lifecycle.ts`, and
-  // `resolveAutoUpdateEnabled` itself — read `config.autoUpdate?.enabled`
-  // directly without falling back to `network.autoUpdate.enabled`.
-  // Dropping the whole block would make those report auto-update as
-  // disabled on fresh testnet OpenClaw installs even though the updater
-  // is in fact running.
-  if (!existing.autoUpdate && network.autoUpdate?.enabled !== undefined) {
-    config.autoUpdate = { enabled: network.autoUpdate.enabled };
-  }
-
-  writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
-  log(`Wrote ${configPath} (${network.networkName}, ${config.nodeRole}, port ${config.apiPort})`);
+  // Delegate the agent-agnostic field-level merge + write to dkg-core.
+  // adapter-hermes will use the same helper in S2 (issue #386).
+  ensureDkgNodeConfig({ agentName, network, apiPort, existing, overrides });
 }
 
 // ---------------------------------------------------------------------------

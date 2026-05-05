@@ -34,6 +34,12 @@ export {
   type FundWalletsBestEffortOptions,
   type FundWalletsNetworkConfig,
 } from './faucet-orchestration.js';
+export {
+  ensureDkgNodeConfig,
+  type DkgNodeConfigOverrides,
+  type DkgNodeNetworkConfig,
+  type EnsureDkgNodeConfigOptions,
+} from './ensure-dkg-node-config.js';
 export { resolveCliPackageDir } from './resolve-cli-package-dir.js';
 export { resolveDkgCli, type ResolvedDkgCli } from './resolve-dkg-cli.js';
 export { startDaemon } from './daemon-lifecycle.js';

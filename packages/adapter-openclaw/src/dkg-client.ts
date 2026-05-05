@@ -223,6 +223,21 @@ export class DkgDaemonClient {
   }
 
   // ---------------------------------------------------------------------------
+  // Query catalog
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Read saved profile query catalog entries for a context graph.
+   *
+   * The daemon stores these as local profile metadata in
+   * `did:dkg:context-graph:<id>/meta/query-catalog`; callers usually run the
+   * returned `prof:sparqlQuery` text through `query()`.
+   */
+  async readQueryCatalog(contextGraphId: string): Promise<Record<string, unknown>> {
+    return this.post('/api/profile/query-catalog/read', { contextGraphId });
+  }
+
+  // ---------------------------------------------------------------------------
   // Shared memory write (SWM layer — NOT used by v1 chat-turn / memory paths)
   // ---------------------------------------------------------------------------
 

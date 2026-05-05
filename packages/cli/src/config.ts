@@ -22,7 +22,13 @@ export interface AutoUpdateBuildTimeouts {
   install?: number;
   /** `pnpm build:runtime` / `pnpm build` (default 180_000). */
   build?: number;
-  /** `pnpm --filter dkg-evm-module build` (default 300_000; bump to 900_000 on ARM64). */
+  /**
+   * @deprecated Ignored since the auto-updater stopped invoking `hardhat
+   * compile` on node hosts. Committed `packages/evm-module/abi/*.json` are
+   * now the runtime contract surface, and CI enforces freshness (see
+   * `abi-freshness` job in `.github/workflows/ci.yml`). The field is
+   * retained on the type so existing user configs don't fail to parse.
+   */
   contracts?: number;
   /** MarkItDown bundling step (default 900_000). */
   markitdown?: number;

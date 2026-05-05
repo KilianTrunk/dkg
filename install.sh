@@ -77,7 +77,13 @@ else
     info "Installing dependencies in slot a ..."
     (cd "$SLOT_A" && pnpm install --frozen-lockfile)
     info "Building slot a ..."
-    (cd "$SLOT_A" && pnpm build)
+    # Runtime build only — skips evm-module's hardhat compile. The committed
+    # `packages/evm-module/abi/*.json` files are the runtime contract surface
+    # consumed by `packages/chain`; CI enforces they stay in sync with the
+    # Solidity sources, so nodes never need to invoke `hardhat compile`.
+    # Mirrors what the auto-updater does (see node-ui-static.ts:
+    # runtimeBuildCommandFromPackageJson).
+    (cd "$SLOT_A" && pnpm build:runtime)
   fi
   stage_markitdown "$SLOT_A" "a"
 
@@ -90,7 +96,7 @@ else
     info "Installing dependencies in slot b ..."
     (cd "$SLOT_B" && pnpm install --frozen-lockfile)
     info "Building slot b ..."
-    (cd "$SLOT_B" && pnpm build)
+    (cd "$SLOT_B" && pnpm build:runtime)
   fi
   stage_markitdown "$SLOT_B" "b"
 

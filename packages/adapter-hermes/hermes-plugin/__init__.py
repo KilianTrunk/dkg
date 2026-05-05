@@ -1570,29 +1570,53 @@ class DKGMemoryProvider(MemoryProvider):
         # flow auto-includes the creator's address in the allowlist (see
         # `packages/agent/src/dkg-agent.ts:3962-3973`), so the creator can
         # immediately read/write the curated CG without a self-invite step.
-        is_public = bool(args.get("public") is True)
+        #
+        # Round 2 — strict type validation: an LLM that emits
+        # `public: "yes"` (string) or any non-boolean value should get a
+        # clear tool error rather than silently defaulting to false (which
+        # would produce the opposite of the agent's intent). Only `True`,
+        # `False`, or omitted are accepted.
+        raw_public = args.get("public")
+        if raw_public is not None and not isinstance(raw_public, bool):
+            return tool_error(
+                f"\"public\" must be a boolean (true or false). Got: {type(raw_public).__name__}."
+            )
+        is_public = raw_public is True
         access_policy: Optional[int] = None if is_public else 1
         raw_allowed = args.get("allowed_agents")
         allowed_agents: Optional[list] = None
-        if not is_public and isinstance(raw_allowed, list):
-            cleaned = [
-                entry.strip()
-                for entry in raw_allowed
-                if isinstance(entry, str) and entry.strip()
-            ]
+        if not is_public and raw_allowed is not None:
+            # Round 2 — strict validation: every entry must be a non-empty
+            # trimmed string that matches the Ethereum address regex.
+            # Previously we silently dropped non-string/blank entries,
+            # which hides LLM-generated mistakes (e.g. `["0xAlice...", 42]`
+            # would create a curated graph without entry 42's owner ever
+            # knowing they were excluded). Fail fast instead.
+            if not isinstance(raw_allowed, list):
+                return tool_error(
+                    f"\"allowed_agents\" must be an array of strings. Got: {type(raw_allowed).__name__}."
+                )
+            eth_addr_re = re.compile(r"^0x[0-9a-fA-F]{40}$")
+            cleaned: list = []
+            for index, entry in enumerate(raw_allowed):
+                if not isinstance(entry, str):
+                    return tool_error(
+                        f"\"allowed_agents[{index}]\" must be a string. Got: {type(entry).__name__}."
+                    )
+                trimmed = entry.strip()
+                if not trimmed:
+                    return tool_error(
+                        f"\"allowed_agents[{index}]\" is empty or whitespace-only. "
+                        "Each entry must be a 0x-prefixed 40-hex-char Ethereum address."
+                    )
+                if not eth_addr_re.match(trimmed):
+                    return tool_error(
+                        f"Invalid Ethereum address in \"allowed_agents[{index}]\": \"{entry}\". "
+                        "Each entry must be a 0x-prefixed 40-hex-char string "
+                        "(e.g. \"0x1234567890abcdef1234567890abcdef12345678\")."
+                    )
+                cleaned.append(trimmed)
             if cleaned:
-                # Validate Ethereum address format up-front so a malformed
-                # input surfaces as a tool-level error rather than bubbling
-                # up as a 500 from the daemon. Mirrors the agent layer's
-                # check at `packages/agent/src/dkg-agent.ts:3918-3922`.
-                eth_addr_re = re.compile(r"^0x[0-9a-fA-F]{40}$")
-                for addr in cleaned:
-                    if not eth_addr_re.match(addr):
-                        return tool_error(
-                            f"Invalid Ethereum address in \"allowed_agents\": \"{addr}\". "
-                            "Each entry must be a 0x-prefixed 40-hex-char string "
-                            "(e.g. \"0x1234567890abcdef1234567890abcdef12345678\")."
-                        )
                 allowed_agents = cleaned
         result = self._client.create_context_graph(
             name,

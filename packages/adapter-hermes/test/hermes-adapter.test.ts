@@ -2682,8 +2682,8 @@ provider._handle_create_cg({"name": "Default", "id": "default"})
 provider._handle_create_cg({"name": "Open", "id": "open", "public": True, "allowed_agents": ["not-an-address"]})
 # Curated with explicit allowlist (valid 40-hex addresses).
 provider._handle_create_cg({"name": "Team", "id": "team", "allowed_agents": [VALID_A, VALID_B]})
-# Curated with allowlist that includes empty / whitespace / non-string entries.
-provider._handle_create_cg({"name": "Trim", "id": "trim", "allowed_agents": [f"  {VALID_A}  ", "", "   ", 42, VALID_B]})
+# Curated with whitespace-padded valid entries — trimmed but kept.
+provider._handle_create_cg({"name": "Trim", "id": "trim", "allowed_agents": [f"  {VALID_A}  ", VALID_B]})
 # Round 1 — invalid address must surface as a tool error and NOT call client.
 err = json.loads(provider._handle_create_cg({"name": "Bad", "id": "bad", "allowed_agents": [VALID_A, "not-an-address"]}))
 assert "error" in err and "Invalid Ethereum address" in err["error"], err
@@ -2691,6 +2691,34 @@ assert "not-an-address" in err["error"], err
 # Round 1 — too-short hex value also rejected.
 err2 = json.loads(provider._handle_create_cg({"name": "Short", "id": "short", "allowed_agents": ["0xabc"]}))
 assert "error" in err2 and "Invalid Ethereum address" in err2["error"], err2
+
+# Round 2 — fail-fast on non-string entries instead of silently dropping
+# them. LLMs occasionally emit numbers / dicts / nulls in tool args; if we
+# silently drop them, the agent thinks the participant was added when it
+# wasn't. Fail with a precise index-scoped error so the agent can correct.
+err3 = json.loads(provider._handle_create_cg({"name": "Mixed", "id": "mixed", "allowed_agents": [VALID_A, 42, VALID_B]}))
+assert "error" in err3 and "allowed_agents[1]" in err3["error"] and "must be a string" in err3["error"], err3
+
+# Round 2 — fail-fast on empty / whitespace-only entries.
+err4 = json.loads(provider._handle_create_cg({"name": "Empty", "id": "empty", "allowed_agents": [VALID_A, "   "]}))
+assert "error" in err4 and "allowed_agents[1]" in err4["error"] and ("empty" in err4["error"] or "whitespace" in err4["error"]), err4
+
+# Round 2 — fail-fast on null entries.
+err5 = json.loads(provider._handle_create_cg({"name": "Null", "id": "null", "allowed_agents": [VALID_A, None]}))
+assert "error" in err5 and "allowed_agents[1]" in err5["error"], err5
+
+# Round 2 — non-list allowed_agents (e.g. dict, string) rejected.
+err6 = json.loads(provider._handle_create_cg({"name": "NotList", "id": "notlist", "allowed_agents": "0x1234"}))
+assert "error" in err6 and "must be an array" in err6["error"], err6
+
+# Round 2 — non-boolean public rejected (string "yes" should NOT silently
+# fall back to curated; the agent gets a clear error).
+err7 = json.loads(provider._handle_create_cg({"name": "Yes", "id": "yes", "public": "yes"}))
+assert "error" in err7 and "public" in err7["error"] and "boolean" in err7["error"], err7
+
+# Round 2 — non-boolean public rejected (number 1 should NOT be coerced).
+err8 = json.loads(provider._handle_create_cg({"name": "One", "id": "one", "public": 1}))
+assert "error" in err8 and "public" in err8["error"], err8
 
 assert client.calls[0] == {
     "name": "Default", "description": "", "cg_id": "default",
@@ -2708,7 +2736,8 @@ assert client.calls[3] == {
     "name": "Trim", "description": "", "cg_id": "trim",
     "access_policy": 1, "allowed_agents": [VALID_A, VALID_B],
 }, client.calls[3]
-# Bad / short calls must NOT have hit the client — pre-flight validation.
+# All round-1 + round-2 failure paths must NOT have hit the client —
+# pre-flight validation.
 assert len(client.calls) == 4, client.calls
 `;
     const result = spawnSync('python', ['-B', '-c', script], {

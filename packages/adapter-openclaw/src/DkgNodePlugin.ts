@@ -20,6 +20,7 @@ import {
   type GetView,
   createDkgPublisherExtension,
   type DkgPublisherExtension,
+  escapeDkgRdfLiteral,
   resolveDkgHome,
   toEip55Checksum,
 } from '@origintrail-official/dkg-core';
@@ -4281,14 +4282,10 @@ export class DkgNodePlugin {
       const subject = `urn:openclaw:${addr}:shared:${shareId}`;
       // Serialize content as an N-Triples literal so the storage layer's
       // formatTerm (oxigraph.ts:233-244) doesn't wrap unquoted text in
-      // angle brackets and treat it as an invalid IRI.
-      const literal = '"' +
-        content
-          .replace(/\\/g, '\\\\')
-          .replace(/"/g, '\\"')
-          .replace(/\n/g, '\\n')
-          .replace(/\r/g, '\\r') +
-        '"';
+      // angle brackets and treat it as an invalid IRI. Reuses the canonical
+      // escaper from @origintrail-official/dkg-core to cover the full set
+      // of N-Triples control-char escapes (\\, ", \n, \r, \t, \f, \b).
+      const literal = `"${escapeDkgRdfLiteral(content)}"`;
       const quads = [{
         subject,
         predicate: 'urn:openclaw:sharedContent',

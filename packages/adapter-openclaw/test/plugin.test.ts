@@ -1327,14 +1327,18 @@ describe('DkgNodePlugin', () => {
       expect(subjB).toMatch(/^urn:openclaw:.+:shared:\d+-[a-z0-9]+$/);
     });
 
-    it('dkg_share escapes quotes, backslashes, and newlines when building the literal', async () => {
+    it('dkg_share escapes the full N-Triples control-char set when building the literal', async () => {
       const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-escape' });
+      // Cover \\, ", \n, \r, \t, \f, \b — the canonical escaper from
+      // @origintrail-official/dkg-core handles all seven; partial coverage
+      // would let tab/backspace/form-feed through and produce an invalid
+      // RDF literal at the storage layer.
       await byName.get('dkg_share')!.execute('tc', {
-        content: 'line1\nline2 "quoted" with \\ slash',
+        content: 'a\nb\rc\td\fe\bf "q" \\ end',
         context_graph_id: 'ctx',
       });
       const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
-      expect(body.quads[0].object).toBe('"line1\\nline2 \\"quoted\\" with \\\\ slash"');
+      expect(body.quads[0].object).toBe('"a\\nb\\rc\\td\\fe\\bf \\"q\\" \\\\ end"');
     });
 
     it('dkg_share plumbs sub_graph_name through to subGraphName for sub-graph-scoped writes', async () => {

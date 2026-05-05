@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 vi.mock('@origintrail-official/dkg-core', async () => {
@@ -1193,6 +1193,99 @@ assert config["allow_context_graph_admin_tools"] is False, config
       gatewayUrl: 'https://hermes.example.com',
       bridgeHealthUrl: 'https://hermes.example.com/health',
     })).resolves.toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------------------
+  // S2 step 4 — dry-run hardening (issue #386 contract §5 + H-AC-21/25/26).
+  // ---------------------------------------------------------------------------
+
+  // H-AC-21: `--dry-run` does not write any file (no `dkg.json`, no
+  // plugin dir, no skill, no `setup-state.json`, no `config.yaml.bak.*`,
+  // no mutation of existing `config.yaml`). Brief explicitly calls out
+  // "no backup file" — assert no `config.yaml.bak.*` exists.
+  it('H-AC-21: --dry-run does not write any file under hermesHome', async () => {
+    const { runHermesSetup } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-dryrun-'));
+    // Pre-snapshot the empty hermesHome contents.
+    const before = readdirSync(hermesHome);
+    expect(before).toEqual([]);
+
+    const result = await runHermesSetup({
+      hermesHome,
+      dryRun: true,
+      // start/fund/verify default to true but dryRun must short-circuit
+      // them per contract §5. We deliberately leave them at defaults to
+      // exercise the dryRun-overrides-everything guarantee.
+    });
+
+    // Post-snapshot: no files anywhere under hermesHome.
+    const after = readdirSync(hermesHome);
+    expect(after).toEqual([]);
+    // Defense-in-depth: glob-style assertion that no `config.yaml.bak.*`
+    // landed (the brief explicitly calls this out).
+    const allEntries = [...after];
+    for (const entry of allEntries) {
+      expect(entry).not.toMatch(/config\.yaml\.bak\./);
+    }
+    // Result still populated for caller inspection.
+    expect(result.daemonStarted).toBe(false);
+    expect(result.fundedWallets).toEqual([]);
+    expect(result.transport.kind).toMatch(/^hermes-/);
+  });
+
+  // H-AC-25: `--dry-run` returns a `HermesSetupResult` where `state` is
+  // populated from the in-memory plan (so callers can inspect what
+  // would be written), but no actual filesystem writes occurred.
+  it('H-AC-25: --dry-run returns a populated state without writing files', async () => {
+    const { runHermesSetup } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-dryrun-state-'));
+
+    const result = await runHermesSetup({
+      hermesHome,
+      dryRun: true,
+    });
+
+    // The plan-state IS populated so the caller can preview what would
+    // be written (contract §5: "plan describes the planned actions
+    // without executing any").
+    expect(result.state).toBeDefined();
+    expect(result.state?.profile.hermesHome).toBe(resolve(hermesHome));
+    expect(result.state?.managedFiles.length).toBeGreaterThan(0);
+    // But none of those managed files actually exist on disk.
+    for (const path of result.state?.managedFiles ?? []) {
+      expect(existsSync(path)).toBe(false);
+    }
+  });
+
+  // H-AC-58: when both `--port` and `--daemon-url` are passed and the
+  // URL host:port disagrees with `--port`, `daemonUrl` wins (first-wins)
+  // AND a `console.warn` line is emitted with the verbatim format
+  // documented in setup-entrypoint-contract.md §2.
+  it('H-AC-58: --port + --daemon-url conflict warns; daemonUrl wins', async () => {
+    const { runHermesSetup } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-port-conflict-'));
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await runHermesSetup({
+      hermesHome,
+      daemonUrl: 'http://127.0.0.1:9200',
+      port: 9300,
+      // Skip new orchestrator steps — we're testing the warn, not the
+      // full lifecycle.
+      start: false,
+      fund: false,
+      verify: false,
+    });
+
+    // Warn fired with the verbatim format.
+    const warnedLines = warnSpy.mock.calls.map((args) => String(args[0]));
+    expect(warnedLines).toContain(
+      'daemon URL host:port (127.0.0.1:9200) does not match --port (9300); using URL',
+    );
+    // First-wins: result.state.daemonUrl is the URL, not the port-derived URL.
+    expect(result.state?.daemonUrl).toBe('http://127.0.0.1:9200');
+
+    warnSpy.mockRestore();
   });
 });
 

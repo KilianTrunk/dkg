@@ -16,19 +16,39 @@
  * This is the same anti-pattern that destroyed nine testnet admin keys via
  * `ensureProfile` (see `scripts/audit-create-random.mjs` header). Fix and
  * test both land in the same PR. The constructor now leaves
- * `publisherWallet` undefined; publish/update now fail before emitting
- * publisher-attributed output unless an explicit signing key exists.
+ * `publisherWallet` undefined; publish now requires either an explicit local
+ * signing key or a configured adapter signer bound to a non-zero publisher
+ * address.
  */
 import { describe, it, expect } from 'vitest';
 import { DKGPublisher } from '../src/dkg-publisher.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
-import type { ChainAdapter } from '@origintrail-official/dkg-chain';
+import { MockChainAdapter, type ChainAdapter } from '@origintrail-official/dkg-chain';
+import { ethers } from 'ethers';
+
+const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 
 // Minimal stub — DKGPublisher's constructor only reads `chain.chainId`.
 // All other ChainAdapter methods are unused in this test.
 function makeStubChain(chainId: string): ChainAdapter {
   return { chainId } as unknown as ChainAdapter;
+}
+
+class AdapterSigningChain extends MockChainAdapter {
+  constructor(private readonly wallet: ethers.Wallet) {
+    super('mock:31337', wallet.address);
+    this.seedIdentity(wallet.address, 1n);
+    this.minimumRequiredSignatures = 1;
+  }
+
+  override async signMessage(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const sig = ethers.Signature.from(await this.wallet.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
 }
 
 describe('DKGPublisher: no random publisher wallet without explicit key', () => {
@@ -48,7 +68,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect((publisher as any).publisherAddress).toBeUndefined();
   });
 
-  it('rejects publish without a publisherPrivateKey before producing a UAL', async () => {
+  it('rejects publish without a publisherPrivateKey or adapter signer before producing a UAL', async () => {
     const keypair = await generateEd25519Keypair();
     const publisher = new DKGPublisher({
       store: new OxigraphStore(),
@@ -85,8 +105,6 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
   it('still constructs publisherWallet when an explicit key is supplied', async () => {
     const keypair = await generateEd25519Keypair();
-    // Deterministic test-only key (not used elsewhere in the suite).
-    const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
     const publisher = new DKGPublisher({
       store: new OxigraphStore(),
       chain: makeStubChain('test-evm-chain'),
@@ -102,7 +120,6 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
   it('rejects publisherAddress values that do not match the supplied private key', async () => {
     const keypair = await generateEd25519Keypair();
-    const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 
     expect(() => new DKGPublisher({
       store: new OxigraphStore(),
@@ -112,5 +129,70 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       publisherPrivateKey: TEST_KEY,
       publisherAddress: '0x000000000000000000000000000000000000dEaD',
     })).toThrow(/does not match publisherPrivateKey signer/i);
+  });
+
+  it('publishes with an adapter-backed signer when a non-zero publisherAddress is configured', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new AdapterSigningChain(wallet);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherAddress: wallet.address,
+      publisherNodeIdentityId: 1n,
+    });
+
+    expect((publisher as any).publisherWallet).toBeUndefined();
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-signer',
+        predicate: 'http://schema.org/name',
+        object: '"AdapterSigner"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
+  it('updates with an adapter-backed signer and configured publisherAddress', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new AdapterSigningChain(wallet);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherAddress: wallet.address,
+      publisherNodeIdentityId: 1n,
+    });
+
+    const created = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-update',
+        predicate: 'http://schema.org/name',
+        object: '"Before"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    const updated = await publisher.update(created.kcId, {
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-update',
+        predicate: 'http://schema.org/name',
+        object: '"After"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(updated.status).toBe('confirmed');
+    expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 });

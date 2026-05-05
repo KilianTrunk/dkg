@@ -60,8 +60,9 @@ export interface DKGPublisherConfig {
 export class PublisherWalletRequiredError extends Error {
   constructor(operation: string) {
     super(
-      `${operation} requires "publisherPrivateKey". ` +
-      'Publishing without a signing key would produce unattributable or unverifiable publisher output.',
+      `${operation} requires "publisherPrivateKey" or a non-zero "publisherAddress" ` +
+      'backed by ChainAdapter.signMessage(). Publishing without a publisher signing key ' +
+      'would produce unattributable or unverifiable publisher output.',
     );
     this.name = 'PublisherWalletRequiredError';
   }
@@ -200,6 +201,12 @@ type InternalPublishOptions = PublishOptions & {
   [INTERNAL_ORIGIN_TOKEN]?: true;
 };
 
+interface PublisherSigner {
+  address: string;
+  source: 'publisherPrivateKey' | 'chainAdapter';
+  signMessage(message: Uint8Array): Promise<string>;
+}
+
 function isInternalOrigin(options: PublishOptions): boolean {
   return (options as InternalPublishOptions)[INTERNAL_ORIGIN_TOKEN] === true;
 }
@@ -278,8 +285,10 @@ export class DKGPublisher implements Publisher {
     } else {
       // No private key supplied means no in-process publisher signing
       // capability. Keep an optional, validated address only for callers
-      // that need to inspect configuration; publish/update fail before
-      // emitting publisher-attributed data unless a real signing key exists.
+      // that route signing through their ChainAdapter (e.g. adapter-backed
+      // or hardware-signer deployments). Publish still fails unless that
+      // address is backed by ChainAdapter.signMessage(); update can let the
+      // adapter select its signer from the configured signer pool.
       //
       // The previous behaviour generated an ephemeral `Wallet.createRandom()`
       // here whenever chain was enabled, which produced unverifiable
@@ -287,9 +296,7 @@ export class DKGPublisher implements Publisher {
       // `0x000...000` as a sentinel: it looks like an on-chain publisher and
       // can leak into UALs/metadata. See PR #371 for
       // the testnet-blocking incident chain (`ensureProfile` had the same
-      // anti-pattern, fixed in PR #366). A future enhancement could fall
-      // back to `chain.signMessage` for the publish-time paths so adapter-
-      // owned signers can still confirm publishes; tracked in #373.
+      // anti-pattern, fixed in PR #366).
       this.publisherAddress = configuredPublisherAddress;
     }
 
@@ -304,11 +311,45 @@ export class DKGPublisher implements Publisher {
     this.writeLocks = config.writeLocks ?? new Map();
   }
 
-  private requirePublisherWallet(operation: string): { wallet: ethers.Wallet; address: string } {
-    if (!this.publisherWallet || !this.publisherAddress) {
-      throw new PublisherWalletRequiredError(operation);
+  private requirePublisherAddress(operation: string): string {
+    if (!this.publisherAddress) throw new PublisherWalletRequiredError(operation);
+    return this.publisherAddress;
+  }
+
+  private requirePublisherSigner(operation: string): PublisherSigner {
+    if (this.publisherWallet && this.publisherAddress) {
+      const wallet = this.publisherWallet;
+      return {
+        address: this.publisherAddress,
+        source: 'publisherPrivateKey',
+        signMessage: (message: Uint8Array) => wallet.signMessage(message),
+      };
     }
-    return { wallet: this.publisherWallet, address: this.publisherAddress };
+
+    if (this.publisherAddress && typeof this.chain.signMessage === 'function') {
+      const expectedAddress = this.publisherAddress;
+      return {
+        address: expectedAddress,
+        source: 'chainAdapter',
+        signMessage: async (message: Uint8Array) => {
+          const compact = await this.chain.signMessage!(message);
+          const signature = ethers.Signature.from({
+            r: ethers.hexlify(compact.r),
+            yParityAndS: ethers.hexlify(compact.vs),
+          }).serialized;
+          const recovered = ethers.verifyMessage(message, signature);
+          if (recovered.toLowerCase() !== expectedAddress.toLowerCase()) {
+            throw new Error(
+              `publisherAddress (${expectedAddress}) does not match ChainAdapter.signMessage signer ` +
+              `(${recovered})`,
+            );
+          }
+          return signature;
+        },
+      };
+    }
+
+    throw new PublisherWalletRequiredError(operation);
   }
 
   private async withWriteLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
@@ -1033,7 +1074,8 @@ export class DKGPublisher implements Publisher {
     const effectiveAccessPolicy = accessPolicy ?? (privateQuads.length > 0 ? 'ownerOnly' : 'public');
     const normalizedAllowedPeers = [...new Set((allowedPeers ?? []).map((p) => p.trim()).filter(Boolean))];
     const normalizedPublisherPeerId = publisherPeerId.trim();
-    const { wallet: publisherWallet, address: publisherAddress } = this.requirePublisherWallet('publish');
+    const publisherSigner = this.requirePublisherSigner('publish');
+    const publisherAddress = publisherSigner.address;
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {
       throw new Error(
@@ -1307,7 +1349,7 @@ export class DKGPublisher implements Publisher {
         BigInt(kcMerkleLeafCount),
       );
       const ackSig = ethers.Signature.from(
-        await publisherWallet.signMessage(ackDigest),
+        await publisherSigner.signMessage(ackDigest),
       );
       v10ACKs = [{
         peerId: 'self',
@@ -1331,7 +1373,10 @@ export class DKGPublisher implements Publisher {
       this.log.warn(ctx, `Identity not set (0) — skipping on-chain publish`);
     } else {
       onPhase?.('chain:sign', 'start');
-      this.log.info(ctx, `Signing on-chain publish (identityId=${identityId}, signer=${publisherWallet.address})`);
+      this.log.info(
+        ctx,
+        `Signing on-chain publish (identityId=${identityId}, signer=${publisherSigner.address}, source=${publisherSigner.source})`,
+      );
 
       const tokenAmount = precomputedTokenAmount;
       usedV10Path = true;
@@ -1369,7 +1414,7 @@ export class DKGPublisher implements Publisher {
           kcMerkleRoot,
         );
         const pubSig = ethers.Signature.from(
-          await publisherWallet.signMessage(pubMsgHash),
+          await publisherSigner.signMessage(pubMsgHash),
         );
         // P-1 review (iter-2): `chain:writeahead:start` now fires
         // *from inside* the adapter via the `onBroadcast` callback,
@@ -1495,11 +1540,11 @@ export class DKGPublisher implements Publisher {
         // Agent authorship proof (spec §9.0.6): sign keccak256(merkleRoot) and store in _meta
         try {
           const merkleHashBytes = ethers.keccak256(kcMerkleRoot);
-          const sig = await publisherWallet.signMessage(ethers.getBytes(merkleHashBytes));
+          const sig = await publisherSigner.signMessage(ethers.getBytes(merkleHashBytes));
           const proofQuads = generateAuthorshipProof({
             kcUal: ual,
             contextGraphId,
-            agentAddress: publisherWallet.address,
+            agentAddress: publisherSigner.address,
             signature: sig,
             signedHash: merkleHashBytes,
           });
@@ -1512,7 +1557,7 @@ export class DKGPublisher implements Publisher {
           } else {
             await this.store.insert(proofQuads);
           }
-          this.log.info(ctx, `Authorship proof stored for agent ${publisherWallet.address}`);
+          this.log.info(ctx, `Authorship proof stored for agent ${publisherSigner.address}`);
         } catch (proofErr) {
           this.log.warn(ctx, `Failed to generate authorship proof: ${proofErr instanceof Error ? proofErr.message : String(proofErr)}`);
         }
@@ -1609,7 +1654,7 @@ export class DKGPublisher implements Publisher {
       if (privateQuads.length > 0) rejectReservedSubjectPrefixes(privateQuads);
     }
     const ctx: OperationContext = operationCtx ?? createOperationContext('publish');
-    const { address: publisherAddress } = this.requirePublisherWallet('update');
+    const publisherAddress = this.requirePublisherAddress('update');
     this.log.info(ctx, `Updating kcId=${kcId} with ${quads.length} triples`);
     const dataGraph = this.graphManager.dataGraphUri(contextGraphId);
 

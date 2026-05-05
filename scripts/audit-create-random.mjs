@@ -156,6 +156,7 @@ const PATTERN = /\bWallet\s*\.\s*createRandom\s*\(/g;
  *   dq-string           " … "            (\-escapes consumed)
  *   tpl-string          ` … `            (\-escapes; ${ pushes a substitution)
  *   tpl-substitution    { braceDepth }   ends when braceDepth → 0 on a `}`
+ *   regex-literal       / … /flags       (\-escapes + character classes)
  *
  * Why a stack? We need string contexts to be re-entered RECURSIVELY when
  * we're inside a template substitution, so braces inside such strings
@@ -181,10 +182,11 @@ const PATTERN = /\bWallet\s*\.\s*createRandom\s*\(/g;
  * literal `"Wallet.createRandom("` inside a string can't false-positive
  * the regex either.
  *
- * Regex literals (`/foo/g`) are NOT explicitly handled — we'd need full
- * JS expression context to disambiguate `/` from division. In practice
- * the only pattern that could bypass is a regex literal whose body
- * contains an unescaped `/​/` or `/​*`, which is exotic enough to ignore.
+ * Regex literals are handled conservatively when `/` appears in an
+ * expression-start position (`=`, `(`, `[`, `{`, `,`, `;`, etc.). This is
+ * still not a full JS parser, but it closes the dangerous false-negative
+ * class where `//` or `/*` inside a regex body was previously treated as
+ * a real comment and blanked a following `Wallet.createRandom()` call.
  */
 export function stripCommentsPreservingPositions(text) {
   const len = text.length;
@@ -195,6 +197,16 @@ export function stripCommentsPreservingPositions(text) {
   const stack = [{ kind: 'normal' }];
   const top = () => stack[stack.length - 1];
   const blank = (c) => (c === '\n' ? '\n' : ' ');
+  const previousSignificantChar = () => {
+    for (let j = out.length - 1; j >= 0; j -= 1) {
+      if (!/\s/.test(out[j])) return out[j];
+    }
+    return '';
+  };
+  const canStartRegexLiteral = () => {
+    const prev = previousSignificantChar();
+    return prev === '' || '([{=,:;!&|?+-*~^<>'.includes(prev);
+  };
 
   while (i < len) {
     const cur = top();
@@ -228,6 +240,9 @@ export function stripCommentsPreservingPositions(text) {
       } else if (c === '/' && next === '*') {
         out += '  '; i += 2;
         stack.push({ kind: 'block-comment' });
+      } else if (c === '/' && canStartRegexLiteral()) {
+        out += ' '; i += 1;
+        stack.push({ kind: 'regex-literal', inClass: false });
       } else if (c === '"' || c === "'") {
         out += ' '; i += 1;
         stack.push({ kind: c === '"' ? 'dq-string' : 'sq-string' });
@@ -253,6 +268,31 @@ export function stripCommentsPreservingPositions(text) {
     if (cur.kind === 'block-comment') {
       if (c === '*' && next === '/') {
         out += '  '; i += 2;
+        stack.pop();
+      } else {
+        out += blank(c); i += 1;
+      }
+      continue;
+    }
+
+    if (cur.kind === 'regex-literal') {
+      if (c === '\n') {
+        out += '\n'; i += 1;
+        stack.pop();
+      } else if (c === '\\' && i + 1 < len) {
+        out += blank(c) + blank(text[i + 1]);
+        i += 2;
+      } else if (c === '[') {
+        cur.inClass = true;
+        out += ' '; i += 1;
+      } else if (c === ']' && cur.inClass) {
+        cur.inClass = false;
+        out += ' '; i += 1;
+      } else if (c === '/' && !cur.inClass) {
+        out += ' '; i += 1;
+        while (i < len && /[A-Za-z]/.test(text[i])) {
+          out += ' '; i += 1;
+        }
         stack.pop();
       } else {
         out += blank(c); i += 1;

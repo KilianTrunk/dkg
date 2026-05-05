@@ -116,6 +116,27 @@ describe('stripCommentsPreservingPositions', () => {
     const out = stripCommentsPreservingPositions(text);
     assert.match(out, /Wallet\.createRandom\(\)/);
   });
+
+  it('REGRESSION: // inside a regex literal does NOT start a line comment', () => {
+    const text = 'const r = /\\/\\//; Wallet.createRandom();';
+    const out = stripCommentsPreservingPositions(text);
+    assert.match(out, /Wallet\.createRandom\(\);/);
+    assert.equal(out.length, text.length);
+  });
+
+  it('REGRESSION: /* inside a regex literal does NOT start a block comment', () => {
+    const text = 'const r = /\\/\\*/; Wallet.createRandom();';
+    const out = stripCommentsPreservingPositions(text);
+    assert.match(out, /Wallet\.createRandom\(\);/);
+    assert.equal(out.length, text.length);
+  });
+
+  it('blanks Wallet.createRandom( inside a regex literal (no false positive)', () => {
+    const text = 'const r = /Wallet\\.createRandom\\(/; const z = 1;';
+    const out = stripCommentsPreservingPositions(text);
+    assert.doesNotMatch(out, /Wallet\.createRandom\(/);
+    assert.match(out, /const z = 1;/);
+  });
 });
 
 describe('findHits', () => {
@@ -175,5 +196,11 @@ describe('findHits', () => {
     const hits = findHits(text);
     assert.equal(hits.length, 1);
     assert.match(hits[0].snippet, /const url = "http:\/\/"; Wallet\.createRandom\(\);/);
+  });
+
+  it('REGRESSION (PR #371): finds calls after a regex containing //', () => {
+    const hits = findHits('const r = /\\/\\//; Wallet.createRandom();');
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 1);
   });
 });

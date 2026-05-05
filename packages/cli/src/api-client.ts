@@ -264,6 +264,103 @@ export class ApiClient {
     return this.post('/api/publisher/clear', { status });
   }
 
+  // ───────────────────────── EPCIS ─────────────────────────────────────
+  // The EPCIS daemon route is described in `packages/cli/src/daemon/routes/epcis.ts`.
+  // CLI-side wrappers below mirror its three endpoints and surface 202/200 bodies
+  // to the CLI command actions, which decide on exit-code mapping.
+
+  async captureEpcis(request: {
+    epcisDocument: unknown;
+    contextGraphId?: string;
+    subGraphName?: string;
+    publishOptions?: {
+      accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
+      allowedPeers?: string[];
+    };
+  }): Promise<{
+    captureID: string;
+    receivedAt: string;
+    eventCount: number;
+    status: 'accepted';
+  }> {
+    return this.post('/api/epcis/capture', request);
+  }
+
+  async getEpcisCapture(captureID: string): Promise<{
+    captureID: string;
+    state: 'accepted' | 'claimed' | 'validated' | 'broadcast' | 'included' | 'finalized' | 'failed';
+    receivedAt: string;
+    finalizedAt: string | null;
+    error: string | null;
+  }> {
+    return this.get(`/api/epcis/capture/${encodeURIComponent(captureID)}`);
+  }
+
+  /**
+   * GET /api/epcis/events. Returns the full EPCIS query document plus
+   * the parsed `nextPageUrl` derived from the response's `Link: rel="next"`
+   * header so callers can implement `--all` pagination without re-parsing
+   * the header themselves. `nextPageUrl` is a path+query string ready to
+   * be appended to the daemon's `baseUrl` (e.g. `/api/epcis/events?...`).
+   */
+  async queryEpcisEvents(params: {
+    contextGraphId?: string;
+    subGraphName?: string;
+    finalized?: boolean;
+    epc?: string;
+    bizStep?: string;
+    bizLocation?: string;
+    from?: string;
+    to?: string;
+    eventID?: string;
+    eventType?: string;
+    action?: string;
+    disposition?: string;
+    readPoint?: string;
+    parentID?: string;
+    childEPC?: string;
+    inputEPC?: string;
+    outputEPC?: string;
+    anyEPC?: string;
+    perPage?: number;
+    nextPageToken?: string;
+  } = {}): Promise<{
+    body: unknown;
+    nextPageUrl: string | null;
+  }> {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value === undefined || value === null) continue;
+      search.set(key, String(value));
+    }
+    const qs = search.toString();
+    return this.queryEpcisEventsByPath(`/api/epcis/events${qs ? `?${qs}` : ''}`);
+  }
+
+  /**
+   * Lower-level EPCIS query helper. Used by `--all` follow-up requests
+   * after the initial query, where the daemon already serialised the
+   * next-page URL into the Link header and we just want to re-issue it.
+   * The path/query is taken verbatim — we never reconstruct it from the
+   * parsed Link header to avoid re-encoding bugs.
+   */
+  async queryEpcisEventsByPath(path: string): Promise<{
+    body: unknown;
+    nextPageUrl: string | null;
+  }> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: res.statusText }));
+      throw ApiClient.httpError(res.status, ApiClient.errorMessageFromBody(body, res.statusText), body);
+    }
+    const body = (await res.json()) as unknown;
+    const linkHeader = res.headers.get('Link') ?? res.headers.get('link');
+    const nextPageUrl = parseNextLink(linkHeader);
+    return { body, nextPageUrl };
+  }
+
   /**
    * Run SPARQL via the daemon. `opts` covers the full /api/query surface —
    * memory-layer routing (`view`, `graphSuffix`, `verifiedGraph`,
@@ -926,6 +1023,35 @@ export class ApiClient {
     }
     return fallback;
   }
+}
+
+/**
+ * Parse the path+query of the first `rel="next"` link in an RFC 5988
+ * Link header. We accept absolute URLs (in case a daemon ever emits one)
+ * and relative paths (the current daemon shape from
+ * `handlers.ts: handleEventsQuery`). Returns `null` if no next link is
+ * present or the header is malformed in a way that doesn't yield a
+ * usable path.
+ */
+function parseNextLink(linkHeader: string | null): string | null {
+  if (!linkHeader) return null;
+  const segments = linkHeader.split(',');
+  for (const segment of segments) {
+    const match = segment.match(/<([^>]+)>\s*;\s*rel\s*=\s*"?next"?/i);
+    if (!match) continue;
+    const target = match[1];
+    if (!target) continue;
+    if (target.startsWith('http://') || target.startsWith('https://')) {
+      try {
+        const url = new URL(target);
+        return `${url.pathname}${url.search}`;
+      } catch {
+        return null;
+      }
+    }
+    return target;
+  }
+  return null;
 }
 
 // NOTE: mirrored in `packages/adapter-openclaw/src/DkgNodePlugin.ts`

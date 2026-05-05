@@ -513,7 +513,10 @@ jobs:
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: github.event_name != 'pull_request'
+    # TEMPORARY: also run on this PR's branch so we can validate the
+    # solidity-coverage stack-depth fix in CI before merging. Once green,
+    # this `||` clause must be removed so the job reverts to push-only.
+    if: github.event_name != 'pull_request' || github.head_ref == 'v10-backend-tests'
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

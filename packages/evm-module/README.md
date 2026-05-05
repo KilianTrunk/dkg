@@ -45,14 +45,19 @@ slot swap).
 
 That contract is enforced by the `abi-freshness` job in
 `.github/workflows/ci.yml`: every PR that touches `contracts/`, `hardhat.*`,
-or `package.json` runs `pnpm --filter @origintrail-official/dkg-evm-module build`
-and then `git diff --exit-code -- packages/evm-module/abi/`. Any drift fails
-the PR with an explicit remediation message.
+or `package.json` runs `npx hardhat compile` (default config — picks up
+`hardhat-abi-exporter`) and then `git diff --exit-code -- packages/evm-module/abi/`.
+Any drift fails the PR with an explicit remediation message.
+
+> Note: the package's `pnpm build` script intentionally runs Hardhat with
+> `--config hardhat.node.config.ts`, which does **not** load
+> `hardhat-abi-exporter`. Use `npx hardhat compile` (no `--config`) when you
+> need to regenerate `abi/*.json`.
 
 If you change a `.sol` file, regenerate and commit ABIs in the same change:
 
 ```bash
-pnpm --filter @origintrail-official/dkg-evm-module build
+cd packages/evm-module && npx hardhat compile && cd -
 git add packages/evm-module/abi/
 ```
 

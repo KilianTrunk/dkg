@@ -1207,11 +1207,13 @@ async function _performUpdateInner(
     // NOTE: the auto-updater intentionally never invokes `hardhat compile` on
     // node hosts. The committed `packages/evm-module/abi/*.json` files are the
     // runtime contract surface (consumed by `packages/chain` via require()),
-    // and a CI gate (`abi-freshness` job in ci.yml) blocks any PR that changes
-    // `.sol` sources without committing the regenerated ABIs. This removes the
-    // single most failure-prone step from the update flow — hardhat compile
-    // routinely OOMs / times out on resource-constrained nodes (cold solc on
-    // ARM64, in particular) and any failure here would abort the slot swap.
+    // and a CI gate (`abi-freshness` job in ci.yml) runs `npx hardhat compile`
+    // (default config, the one that loads `hardhat-abi-exporter`) on every
+    // contract-touching PR and blocks merge if the regenerated `abi/` differs
+    // from what was committed. This removes the single most failure-prone
+    // step from the update flow — hardhat compile routinely OOMs / times out
+    // on resource-constrained nodes (cold solc on ARM64, in particular) and
+    // any failure here would abort the slot swap.
 
     let nodeUiPackageNames = NODE_UI_PACKAGE_NAME_FALLBACKS;
     try {

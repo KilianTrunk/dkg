@@ -448,11 +448,23 @@ jobs:
             packages/evm-module/artifacts
             packages/evm-module/cache
             packages/evm-module/typechain
-          key: hardhat-${{ runner.os }}-${{ hashFiles('packages/evm-module/contracts/**/*.sol', 'packages/evm-module/hardhat.node.config.ts') }}
+          # Hash both configs because abi/ regen depends on hardhat.config.ts
+          # (which is what loads hardhat-abi-exporter; see the next step).
+          key: hardhat-${{ runner.os }}-abi-${{ hashFiles('packages/evm-module/contracts/**/*.sol', 'packages/evm-module/hardhat.config.ts', 'packages/evm-module/hardhat.node.config.ts') }}
           restore-keys: |
+            hardhat-${{ runner.os }}-abi-
             hardhat-${{ runner.os }}-
-      - name: Compile contracts (regenerates abi/*.json)
-        run: pnpm --filter @origintrail-official/dkg-evm-module build
+      - name: Compile contracts with the default config (regenerates abi/*.json)
+        # Subtle: `pnpm --filter dkg-evm-module build` ultimately calls
+        # `hardhat compile --config hardhat.node.config.ts`, which does NOT
+        # have `hardhat-abi-exporter` wired in. Only the default
+        # `hardhat.config.ts` imports the plugin and sets `abiExporter:
+        # { runOnCompile: true, ... }`. Running `npx hardhat compile`
+        # without a `--config` flag (so it picks up the default config)
+        # is what actually regenerates `abi/*.json`. Without this, the
+        # diff check below would always pass even with stale ABIs.
+        run: npx hardhat compile
+        working-directory: packages/evm-module
       - name: Verify committed abi/ matches regenerated abi/
         # `git diff --exit-code` returns 1 if anything under abi/ changed
         # after compile. If so, the contributor forgot to commit the
@@ -461,13 +473,13 @@ jobs:
         run: |
           set -euo pipefail
           if ! git diff --exit-code -- packages/evm-module/abi/; then
-            echo "::error title=ABI drift::Committed packages/evm-module/abi/*.json does not match the output of \`pnpm --filter @origintrail-official/dkg-evm-module build\`."
+            echo "::error title=ABI drift::Committed packages/evm-module/abi/*.json does not match the output of \`hardhat compile\` (default config)."
             echo ""
             echo "The auto-updater no longer runs hardhat compile on node hosts (see comment in packages/cli/src/daemon/auto-update.ts), so committed ABIs ARE the runtime contract surface. Drift here would silently activate stale ABIs against new contracts on every node."
             echo ""
             echo "To fix: regenerate and commit the ABIs locally:"
             echo ""
-            echo "  pnpm --filter @origintrail-official/dkg-evm-module build"
+            echo "  cd packages/evm-module && npx hardhat compile && cd -"
             echo "  git add packages/evm-module/abi/"
             echo "  git commit --amend --no-edit   # or a fresh commit, your call"
             echo "  git push --force-with-lease"

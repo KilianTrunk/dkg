@@ -40,6 +40,34 @@ slot_ready() {
   [ -d "$slot_path/.git" ] && [ -f "$entry_path" ]
 }
 
+# Mirror packages/cli/src/node-ui-static.ts:runtimeBuildCommandFromPackageJson.
+# Honour `dkgBuild.releaseRuntimeBuildScript` first, then fall back through
+# `build:runtime` and `build:runtime:packages`, finally `build`. This keeps
+# the install path compatible with arbitrary $DKG_BRANCH / $DKG_REPO targets
+# (e.g. older tags that predate the runtime-build split).
+runtime_build_script() {
+  slot_path="$1"
+  node -e "
+    try {
+      const fs = require('fs');
+      const pkg = JSON.parse(fs.readFileSync('$slot_path/package.json', 'utf-8'));
+      const isSafe = (s) => typeof s === 'string' && /^[A-Za-z0-9:_-]+\$/.test(s);
+      const rrbs = pkg.dkgBuild && pkg.dkgBuild.releaseRuntimeBuildScript;
+      if (isSafe(rrbs) && pkg.scripts && typeof pkg.scripts[rrbs] === 'string') {
+        process.stdout.write(rrbs);
+      } else if (pkg.scripts && typeof pkg.scripts['build:runtime'] === 'string') {
+        process.stdout.write('build:runtime');
+      } else if (pkg.scripts && typeof pkg.scripts['build:runtime:packages'] === 'string') {
+        process.stdout.write('build:runtime:packages');
+      } else {
+        process.stdout.write('build');
+      }
+    } catch (e) {
+      process.stdout.write('build');
+    }
+  "
+}
+
 stage_markitdown() {
   slot_path="$1"
   slot_name="$2"
@@ -76,14 +104,15 @@ else
     git clone --branch "$BRANCH" "$REPO_URL" "$SLOT_A"
     info "Installing dependencies in slot a ..."
     (cd "$SLOT_A" && pnpm install --frozen-lockfile)
-    info "Building slot a ..."
-    # Runtime build only — skips evm-module's hardhat compile. The committed
-    # `packages/evm-module/abi/*.json` files are the runtime contract surface
-    # consumed by `packages/chain`; CI enforces they stay in sync with the
-    # Solidity sources, so nodes never need to invoke `hardhat compile`.
-    # Mirrors what the auto-updater does (see node-ui-static.ts:
-    # runtimeBuildCommandFromPackageJson).
-    (cd "$SLOT_A" && pnpm build:runtime)
+    # Runtime build — picks the best available script in the target ref
+    # (mirrors the auto-updater's fallback so older tags still install
+    # correctly). On current main this resolves to `build:runtime:packages`
+    # via `dkgBuild.releaseRuntimeBuildScript`, which skips evm-module's
+    # hardhat compile. The committed `packages/evm-module/abi/*.json` files
+    # are the runtime contract surface; CI enforces they stay in sync.
+    SLOT_A_BUILD_SCRIPT=$(runtime_build_script "$SLOT_A")
+    info "Building slot a (pnpm run $SLOT_A_BUILD_SCRIPT) ..."
+    (cd "$SLOT_A" && pnpm run "$SLOT_A_BUILD_SCRIPT")
   fi
   stage_markitdown "$SLOT_A" "a"
 
@@ -95,8 +124,9 @@ else
     git clone --reference "$SLOT_A" --dissociate --branch "$BRANCH" "$REPO_URL" "$SLOT_B"
     info "Installing dependencies in slot b ..."
     (cd "$SLOT_B" && pnpm install --frozen-lockfile)
-    info "Building slot b ..."
-    (cd "$SLOT_B" && pnpm build:runtime)
+    SLOT_B_BUILD_SCRIPT=$(runtime_build_script "$SLOT_B")
+    info "Building slot b (pnpm run $SLOT_B_BUILD_SCRIPT) ..."
+    (cd "$SLOT_B" && pnpm run "$SLOT_B_BUILD_SCRIPT")
   fi
   stage_markitdown "$SLOT_B" "b"
 

@@ -342,10 +342,16 @@ describe('handleEventsQuery', () => {
       { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
     );
 
+    // Orphan exclusion: the private event subject must equal the public
+    // anchor subject. We express the join by reusing `?event` across both
+    // graphs (SPARQL native bind-by-name) instead of `FILTER(?event = ?root)`,
+    // because some triplestores fail to bridge URI bindings across graph
+    // contexts via FILTER and the anchored payload otherwise stays empty
+    // on live data.
     expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_shared_memory>');
-    expect(calls[0].sparql).toContain('?root dkg:privateDataAnchor "true" .');
+    expect(calls[0].sparql).toContain('?event dkg:privateDataAnchor "true" .');
     expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
-    expect(calls[0].sparql).toContain('FILTER(?event = ?root)');
+    expect(calls[0].sparql).not.toContain('FILTER(?event = ?root)');
   });
 
   it('keeps finalized=false on pagination Link headers', async () => {
@@ -487,5 +493,61 @@ describe('handleEventsQuery — validation', () => {
     ).rejects.toThrow(/date|range|from|to|invalid|validation|before|after|order/i);
 
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('handleEventsQuery — per-request sub-graph', () => {
+  it('threads subGraphName from config into the SPARQL graph URIs (finalized=true canonical partition)', async () => {
+    const { engine, calls } = createTrackingQueryEngine([makeBindings()]);
+
+    await handleEventsQuery(
+      new URLSearchParams('eventType=ObjectEvent'),
+      {
+        contextGraphId: CONTEXT_GRAPH_ID,
+        subGraphName: 'research',
+        queryEngine: engine,
+        basePath: BASE_PATH,
+      },
+    );
+
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/research>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/research/_private>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-paranet>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+  });
+
+  it('threads subGraphName into SPARQL graph URIs (finalized=false SWM partition)', async () => {
+    const { engine, calls } = createTrackingQueryEngine([makeBindings()]);
+
+    await handleEventsQuery(
+      new URLSearchParams('finalized=false&eventType=ObjectEvent'),
+      {
+        contextGraphId: CONTEXT_GRAPH_ID,
+        subGraphName: 'research',
+        queryEngine: engine,
+        basePath: BASE_PATH,
+      },
+    );
+
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/research/_shared_memory>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/research/_private>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-paranet/_shared_memory>');
+  });
+
+  it('falls back to root partition when subGraphName is omitted', async () => {
+    const { engine, calls } = createTrackingQueryEngine([makeBindings()]);
+
+    await handleEventsQuery(
+      new URLSearchParams('eventType=ObjectEvent'),
+      {
+        contextGraphId: CONTEXT_GRAPH_ID,
+        queryEngine: engine,
+        basePath: BASE_PATH,
+      },
+    );
+
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+    expect(calls[0].sparql).not.toContain('test-paranet/research');
   });
 });

@@ -44,6 +44,13 @@ export class EpcisQueryError extends Error {
 
 export interface EventsQueryConfig {
   contextGraphId: string;
+  /**
+   * Optional sub-graph name within the context graph. When set, the
+   * query reads from the `<cg>/<sub>/_shared_memory` (or canonical
+   * `<cg>/<sub>` for finalized) partition and joins from
+   * `<cg>/<sub>/_private`.
+   */
+  subGraphName?: string;
   queryEngine: QueryEngine;
   basePath: string;
 }
@@ -145,8 +152,14 @@ export async function handleEventsQuery(
   const perPage = Math.min(Math.max(params.perPage ?? DEFAULT_PER_PAGE, 1), MAX_PER_PAGE);
   const offset = Math.max(params.offset ?? 0, 0);
 
-  // Request one extra row to detect if more pages exist
-  const sparql = buildEpcisQuery({ ...params, limit: perPage + 1, offset }, config.contextGraphId);
+  // Request one extra row to detect if more pages exist. Sub-graph
+  // selection is per-request (route-level), not derivable from the
+  // SPARQL query string, so it lives on the config rather than in
+  // `params`.
+  const sparql = buildEpcisQuery(
+    { ...params, subGraphName: config.subGraphName, limit: perPage + 1, offset },
+    config.contextGraphId,
+  );
   const result = await config.queryEngine.query(sparql, { contextGraphId: config.contextGraphId });
 
   const hasMore = result.bindings.length > perPage;

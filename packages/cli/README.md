@@ -180,6 +180,62 @@ All endpoints (except public paths like `/api/status`, `/api/chain/rpc-health`, 
 
 The full API surface — including request bodies, response shapes, and error codes — is documented in [`skills/dkg-node/SKILL.md`](./skills/dkg-node/SKILL.md).
 
+## Local Benchmarks
+
+The live publish/get benchmark measures four operation timings against a running
+DKG daemon: synchronous publish end-to-end latency, async publisher enqueue
+latency, async job completion/finalization latency, and SPARQL get latency for
+the published benchmark content.
+
+Prerequisites:
+
+- Start a node with `dkg start`.
+- Use a context graph that is safe for benchmark writes and publish costs.
+- Ensure the async publisher is enabled when measuring async completion:
+  `dkg publisher enable`.
+- For local daemon targets, use normal discovery or `DKG_API_PORT`; the command
+  loads the local auth token from `DKG_HOME`. For non-loopback `--api-url`
+  targets, pass `--auth-token` or `DKG_AUTH_TOKEN` explicitly.
+
+Run from the repository after building the CLI package:
+
+```bash
+pnpm --filter @origintrail-official/dkg build
+```
+
+```bash
+pnpm --filter @origintrail-official/dkg benchmark:publish-async-get -- \
+  --context-graph-id my-project \
+  --repeat 30 \
+  --warmups 3 \
+  --payload-size 1024 \
+  --output-format json
+```
+
+Useful environment variables mirror the flags: `DKG_BENCH_CONTEXT_GRAPH_ID`,
+`DKG_BENCH_REPEAT`, `DKG_BENCH_WARMUPS`, `DKG_BENCH_TIMEOUT_MS`,
+`DKG_BENCH_PAYLOAD_SIZE`, `DKG_BENCH_FIXTURE`, `DKG_BENCH_OUTPUT_FORMAT`,
+`DKG_BENCH_POLL_INTERVAL_MS`, `DKG_API_PORT`, `DKG_API_URL`, and
+`DKG_AUTH_TOKEN`.
+
+The output includes per-operation timing records and summary rows for
+`syncPublish`, `asyncEnqueue`, `asyncCompletion`, and `get`. Each summary reports
+count, success count, failure count, min, max, mean, median/p50, and p95. Failure
+records include operation, iteration, error message, root entity, marker, context
+graph, and a reproduction command. Warmups are excluded from summaries.
+
+The repository-level ESBench workflow for this same benchmark feature is
+documented in `BENCHMARKING.md`. It uses a deterministic layered DKG client, not
+a live daemon, so the generated reports avoid auth tokens and local node paths.
+`pnpm bench:html` writes the combined ESBench report plus one focused HTML page
+for each benchmark flow:
+
+- get/read retrieval
+- synchronous publish with finalization
+- asynchronous publish enqueue and finalization
+- upload payload to local working memory
+- lift local working memory to shared working memory
+
 ## Extending the Node
 
 The V9 "installable apps" framework (iframe-hosted third-party UIs loaded from

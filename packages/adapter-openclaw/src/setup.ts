@@ -19,29 +19,27 @@
  * Every step is idempotent — re-running is safe.
  */
 
-import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
-import { accessSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, readFileSync, realpathSync, writeFileSync, mkdirSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
+import { accessSync, constants as fsConstants, copyFileSync, existsSync, readFileSync, realpathSync, writeFileSync, mkdirSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import {
-  blueGreenSlotReady,
-  findPackageRepoDir,
   requestFaucetFunding,
   resolveCliPackageDir,
   resolveDkgConfigHome,
+  startDaemon,
 } from '@origintrail-official/dkg-core';
 import type { DkgOpenClawConfig } from './types.js';
-import { resolveDkgCli } from './resolve-dkg-cli.js';
 
-// Re-export `resolveCliPackageDir` so the existing public surface
-// (`@origintrail-official/dkg-adapter-openclaw` consumers, including 9 in-tree
-// test files that `vi.mock('../src/setup.js')`) keeps working unchanged.
-// The implementation moved to `@origintrail-official/dkg-core/resolve-dkg-cli.ts`
-// in S1 of issue #386 because adapter-hermes also needs it (helper-reuse-rec
-// §43-46) and the dep direction is `cli → adapters → core`.
-export { resolveCliPackageDir };
+// Re-export `resolveCliPackageDir` and `startDaemon` so the existing
+// public surface (`@origintrail-official/dkg-adapter-openclaw` consumers,
+// including in-tree tests that `vi.mock('../src/setup.js')`) keeps
+// working unchanged. The implementations moved to
+// `@origintrail-official/dkg-core` in S1 of issue #386 because
+// adapter-hermes also needs them and the dep direction is
+// `cli → adapters → core`.
+export { resolveCliPackageDir, startDaemon };
 import {
   defaultStateDirForWorkspace,
   legacyStateDirForWorkspace,
@@ -535,117 +533,11 @@ export function writeDkgConfig(
 // ---------------------------------------------------------------------------
 // Step 5: Start DKG daemon
 // ---------------------------------------------------------------------------
-
-const DKG_START_TIMEOUT_MS = 30_000;
-const DKG_START_MIGRATION_TIMEOUT_MS = 60 * 60_000;
-
-function hasLocalRepoForCli(cliPath: string): boolean {
-  let physicalCliPath = cliPath;
-  try {
-    physicalCliPath = realpathSync(cliPath);
-  } catch {
-    // `resolveDkgCli` surfaces missing CLI paths later; keep timeout detection conservative here.
-  }
-  const repo = findPackageRepoDir(dirname(physicalCliPath));
-  return Boolean(repo && existsSync(join(repo, '.git')));
-}
-
-function blueGreenMigrationMayRunDuringStart(cliPath: string): boolean {
-  if (process.env.DKG_NO_BLUE_GREEN) return false;
-  if (!hasLocalRepoForCli(cliPath)) return false;
-
-  const releasesPath = join(dkgDir(), 'releases');
-  const currentLink = join(releasesPath, 'current');
-
-  try {
-    if (!lstatSync(currentLink).isSymbolicLink()) return true;
-  } catch {
-    return true;
-  }
-
-  return !blueGreenSlotReady(join(releasesPath, 'a'))
-    || !blueGreenSlotReady(join(releasesPath, 'b'));
-}
-
-function daemonStartSpawnOptions(cliPath: string): SpawnSyncOptions {
-  const options: SpawnSyncOptions = { stdio: 'inherit' };
-  options.timeout = blueGreenMigrationMayRunDuringStart(cliPath)
-    ? DKG_START_MIGRATION_TIMEOUT_MS
-    : DKG_START_TIMEOUT_MS;
-  return options;
-}
-
-export async function startDaemon(apiPort: number): Promise<void> {
-  // Check if already running
-  const pidPath = join(dkgDir(), 'daemon.pid');
-  if (existsSync(pidPath)) {
-    try {
-      const pid = parseInt(readFileSync(pidPath, 'utf-8').trim(), 10);
-      if (pid && isProcessRunning(pid)) {
-        // Verify the running daemon is reachable on the expected port
-        try {
-          const res = await fetch(`http://127.0.0.1:${apiPort}/api/status`);
-          if (res.ok) {
-            log(`DKG daemon already running (PID ${pid}, port ${apiPort})`);
-            return;
-          }
-        } catch { /* not reachable on expected port */ }
-        // PID is alive but not reachable — could be a stale PID, PID reuse,
-        // or a port mismatch. Warn and fall through to attempt dkg start,
-        // which will either succeed (if the PID wasn't actually DKG) or
-        // fail with a clear error (if port is genuinely in use).
-        warn(
-          `PID ${pid} is alive but daemon not reachable on port ${apiPort}. ` +
-          'Attempting to start — if this fails, run "dkg stop" first.',
-        );
-      }
-    } catch { /* stale pid file */ }
-  }
-
-  log('Starting DKG daemon...');
-  try {
-    // Resolve the CLI entrypoint as an absolute path and spawn via
-    // process.execPath so we don't depend on `dkg` being on PATH — which
-    // `pnpm dkg openclaw setup` does not guarantee in a cloned monorepo.
-    const { node, cliPath } = resolveDkgCli();
-    const result = spawnSync(node, [cliPath, 'start'], daemonStartSpawnOptions(cliPath));
-    if (result.error) throw result.error;
-    if (result.status !== 0) {
-      throw new Error(
-        `dkg start exited with ${result.status ?? `signal ${result.signal}`}`,
-      );
-    }
-  } catch (err: any) {
-    throw new Error(`Failed to start DKG daemon: ${err.message}`);
-  }
-
-  // Poll for readiness
-  const maxAttempts = 30;
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${apiPort}/api/status`);
-      if (res.ok) {
-        log('DKG daemon is ready');
-        return;
-      }
-    } catch { /* not ready yet */ }
-    await sleep(1_000);
-  }
-
-  warn('Daemon started but health check timed out — it may still be initializing');
-}
+// `startDaemon` was extracted to `@origintrail-official/dkg-core` in S1
+// of issue #386. See the import + re-export at the top of this file.
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function isProcessRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 // ---------------------------------------------------------------------------

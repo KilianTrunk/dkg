@@ -20,6 +20,7 @@ import {
   type GetView,
   createDkgPublisherExtension,
   type DkgPublisherExtension,
+  escapeDkgRdfLiteral,
   resolveDkgHome,
   toEip55Checksum,
 } from '@origintrail-official/dkg-core';
@@ -3083,6 +3084,33 @@ export class DkgNodePlugin {
         execute: async (_toolCallId, args) => this.handleSharedMemoryPublish(args),
       },
       {
+        name: 'dkg_share',
+        description:
+          'Direct Shared Working Memory write — gossip-replicate a concise free-text fact ' +
+          'to the team. Lightweight alternative to the canonical dkg_assertion_create → ' +
+          'dkg_assertion_write → dkg_assertion_promote flow; use the canonical flow when the ' +
+          'data needs to be staged, retracted, or promoted to Verified Memory.',
+        parameters: {
+          type: 'object',
+          properties: {
+            content: {
+              type: 'string',
+              description: 'Free-text knowledge to share with the team.',
+            },
+            context_graph_id: {
+              type: 'string',
+              description: 'Target context graph ID.',
+            },
+            sub_graph_name: {
+              type: 'string',
+              description: 'Optional sub-graph scope.',
+            },
+          },
+          required: ['content', 'context_graph_id'],
+        },
+        execute: async (_toolCallId, args) => this.handleShare(args),
+      },
+      {
         name: 'memory_search',
         description:
           'Search your DKG-backed memory across all trust tiers (Working Memory drafts, ' +
@@ -4229,6 +4257,100 @@ export class DkgNodePlugin {
       }
       const result = await this.publisher.publishSharedMemory({ contextGraphId, rootEntities, subGraphName });
       return this.json(registration ? { ...result, registration } : result);
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      // Type-validate at the runtime boundary. Without this, a malformed MCP
+      // call passing `content: {}` or `false` would coerce via String(...) to
+      // `"[object Object]"` / `"false"` and pollute SWM with garbage. Reject
+      // up front instead.
+      if (args.content !== undefined && typeof args.content !== 'string') {
+        return this.error('"content" must be a string.');
+      }
+      if (args.context_graph_id !== undefined && typeof args.context_graph_id !== 'string') {
+        return this.error('"context_graph_id" must be a string.');
+      }
+      if (
+        args.sub_graph_name !== undefined &&
+        args.sub_graph_name !== null &&
+        typeof args.sub_graph_name !== 'string'
+      ) {
+        return this.error('"sub_graph_name" must be a string.');
+      }
+      // Use the raw content for serialization so leading/trailing whitespace
+      // and terminal newlines are preserved verbatim — agents sharing code
+      // snippets or exact transcripts depend on this. Validate against the
+      // trimmed form so a whitespace-only payload still rejects as "empty".
+      const content = (args.content as string | undefined) ?? '';
+      const contextGraphId = ((args.context_graph_id as string | undefined) ?? '').trim();
+      if (!content.trim()) return this.error('"content" is required.');
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      const rawSub = args.sub_graph_name as string | undefined | null;
+      const subGraphName = rawSub === undefined || rawSub === null
+        ? undefined
+        : (rawSub.trim() || undefined);
+
+      // Best-effort node-identity attribution. Try the gated probes first
+      // (these warm the cache when the memory resolver API is attached),
+      // then fall back to a direct /api/agent/identity probe so dkg_share
+      // works in `memory.enabled: false` configurations too. If neither
+      // path resolves, we still mint a unique-per-call subject under an
+      // `anon` namespace — the share itself doesn't require identity
+      // (the daemon's /api/shared-memory/write doesn't), so refusing to
+      // write would over-couple the tool to a startup race.
+      await Promise.all([this.ensureNodeAgentAddress(), this.ensureNodePeerId()]);
+      let addr = this.resolveDefaultAgentAddress();
+      if (!addr) {
+        const probe = await this.client.getAgentIdentity().catch(() => null);
+        if (probe?.ok && probe.identity) {
+          if (probe.identity.agentAddress) this.nodeAgentAddress = probe.identity.agentAddress;
+          if (probe.identity.peerId) this.nodePeerId = probe.identity.peerId;
+          addr = this.resolveDefaultAgentAddress();
+        }
+      }
+      // Unique per call — the publisher's delete-then-insert upsert
+      // (dkg-publisher.ts:422-429) keys off the root entity, so a stable
+      // subject would replace the prior share. Random shareId guarantees
+      // a fresh root every time, regardless of attribution.
+      const shareId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const subject = addr
+        ? `urn:openclaw:${addr}:shared:${shareId}`
+        : `urn:openclaw:anon:shared:${shareId}`;
+      // Serialize content as an N-Triples literal. The canonical
+      // escapeDkgRdfLiteral from @origintrail-official/dkg-core handles
+      // the ECHAR set (\\, ", \n, \r, \t, \f, \b), but leaves other ASCII
+      // control bytes (0x00-0x07, 0x0B, 0x0E-0x1F, 0x7F) raw — those
+      // would still produce an invalid N-Triples literal. Defensive
+      // post-pass UCHAR-encodes the remaining bytes. (A canonical fix
+      // belongs in the core helper itself; tracked separately.)
+      const escaped = escapeDkgRdfLiteral(content).replace(
+        new RegExp(
+          '[' +
+            String.fromCharCode(0x00) + '-' + String.fromCharCode(0x1F) +
+            String.fromCharCode(0x7F) +
+          ']',
+          'g',
+        ),
+        (ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0').toUpperCase(),
+      );
+      const literal = `"${escaped}"`;
+      const quads = [{
+        subject,
+        predicate: 'urn:openclaw:sharedContent',
+        object: literal,
+      }];
+      const result = await this.client.share(contextGraphId, quads, { subGraphName });
+      // Surface the minted subject so callers can target THIS share in a
+      // follow-up `dkg_shared_memory_publish({ root_entities: [...] })` or
+      // inspect it precisely. Field name is snake_case to match the
+      // consuming tool's argument shape — agents chaining `dkg_share` →
+      // `dkg_shared_memory_publish` can pass the value through without
+      // case translation.
+      return this.json({ ...result, subject, root_entities: [subject] });
     } catch (err: any) {
       return this.daemonError(err);
     }

@@ -4,14 +4,20 @@ import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   createBenchmarkClient,
+  formatResult,
   isLoopbackApiUrl,
   parseBenchmarkArgs,
   resolveTokenForApiUrl,
   runPublishAsyncGetBenchmark,
   summarizeOperations,
-  type BenchmarkClient,
-  type BenchmarkConfig,
 } from '../src/benchmark/publish-get/index.js';
+import {
+  baseConfig,
+  MockBenchmarkClient,
+  monotonicClock,
+  timing,
+  trackingFetch,
+} from './helpers/publish-async-get-benchmark.js';
 
 const originalFetch = globalThis.fetch;
 const originalDkgHome = process.env.DKG_HOME;
@@ -54,6 +60,23 @@ describe('publish async get benchmark', () => {
       outputFormat: 'ndjson',
       apiUrl: 'http://127.0.0.1:9200',
       authToken: 'token-a',
+    });
+  });
+
+  it('uses the default repeat count and environment configuration', () => {
+    const config = parseBenchmarkArgs([], {
+      DKG_BENCH_CONTEXT_GRAPH_ID: 'env-cg',
+      DKG_BENCH_WARMUPS: '4',
+      DKG_BENCH_OUTPUT_FORMAT: 'json',
+      DKG_BENCH_PAYLOAD_SIZE: '512',
+    });
+
+    expect(config).toMatchObject({
+      contextGraphId: 'env-cg',
+      repeat: 30,
+      warmups: 4,
+      payloadSizeBytes: 512,
+      outputFormat: 'json',
     });
   });
 
@@ -115,6 +138,57 @@ describe('publish async get benchmark', () => {
     });
   });
 
+  it('reports get validation failures when returned content does not include the marker', async () => {
+    const client = new MockBenchmarkClient({ queryMarkerOverride: '"wrong-marker"' });
+    const result = await runPublishAsyncGetBenchmark({ ...baseConfig(), repeat: 1, warmups: 0 }, client, monotonicClock());
+
+    expect(result.summaries.get).toMatchObject({ count: 1, successCount: 0, failureCount: 1 });
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]).toMatchObject({
+      operation: 'get',
+      iteration: 1,
+      error: expect.stringContaining('Get query did not return benchmark marker'),
+    });
+    expect(result.failures[0].context).toMatchObject({
+      contextGraphId: 'bench-cg',
+      flow: 'get',
+    });
+  });
+
+  it('reports async enqueue failures and skipped completion context', async () => {
+    const client = new MockBenchmarkClient({ enqueueError: 'publisher queue disabled' });
+    const result = await runPublishAsyncGetBenchmark({ ...baseConfig(), repeat: 1, warmups: 0 }, client, monotonicClock());
+
+    expect(result.failures.map((failure) => failure.operation)).toEqual(['asyncEnqueue', 'asyncCompletion']);
+    expect(result.failures[0]).toMatchObject({
+      iteration: 1,
+      error: expect.stringContaining('publisher queue disabled'),
+    });
+    expect(result.failures[0].context).toMatchObject({
+      contextGraphId: 'bench-cg',
+      flow: 'async',
+      shareOperationId: 'share-2',
+    });
+    expect(result.failures[1].context).toMatchObject({
+      skippedAfter: 'asyncEnqueue',
+      shareOperationId: 'share-2',
+    });
+  });
+
+  it('formats ndjson output with operation rows, a summary row, and sanitized config', async () => {
+    const config = baseConfig({ authToken: 'secret-token', outputFormat: 'ndjson' });
+    const result = await runPublishAsyncGetBenchmark(config, new MockBenchmarkClient(), monotonicClock());
+    const rows = formatResult(result, 'ndjson').split('\n').map((line) => JSON.parse(line));
+
+    expect(rows).toHaveLength(result.operations.length + 1);
+    expect(rows.slice(0, -1).every((row) => row.type === 'operation')).toBe(true);
+    expect(rows.at(-1)).toMatchObject({
+      type: 'summary',
+      summaries: { syncPublish: { count: 1, successCount: 1, failureCount: 0 } },
+    });
+    expect(JSON.stringify(rows)).not.toContain('secret-token');
+  });
+
   it('auto-loads local tokens for DKG_API_PORT targets', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'dkg-bench-auth-'));
     process.env.DKG_HOME = tempDir;
@@ -132,6 +206,23 @@ describe('publish async get benchmark', () => {
     }
   });
 
+  it('auto-loads local tokens for loopback DKG_API_URL targets', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'dkg-bench-auth-'));
+    process.env.DKG_HOME = tempDir;
+    await writeFile(join(tempDir, 'auth.token'), 'local-url-token\n', 'utf8');
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = trackingFetch(calls, { name: 'dkg', peerId: 'p', uptimeMs: 1, connectedPeers: 0, relayConnected: false, multiaddrs: [] });
+
+    try {
+      const client = await createBenchmarkClient({ ...baseConfig(), apiUrl: 'http://localhost:9301', authToken: undefined });
+      await client.status();
+      expect(calls[0].url).toBe('http://localhost:9301/api/status');
+      expect((calls[0].init?.headers as Record<string, string>).Authorization).toBe('Bearer local-url-token');
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not auto-load local auth tokens for non-loopback API URLs', async () => {
     await expect(resolveTokenForApiUrl('https://node.example.test:9200')).rejects.toThrow(/non-loopback API URL/);
     await expect(resolveTokenForApiUrl('https://node.example.test:9200', 'explicit-token')).resolves.toBe('explicit-token');
@@ -140,97 +231,3 @@ describe('publish async get benchmark', () => {
     expect(isLoopbackApiUrl('http://192.168.1.50:9200')).toBe(false);
   });
 });
-
-function baseConfig(): BenchmarkConfig {
-  return {
-    contextGraphId: 'bench-cg',
-    repeat: 1,
-    warmups: 0,
-    timeoutMs: 1000,
-    payloadSizeBytes: 128,
-    fixture: 'minimal',
-    outputFormat: 'json',
-    namespace: 'benchmark',
-    scope: 'publish-async-get',
-    authorityProofRef: 'proof:benchmark-local',
-    pollIntervalMs: 1,
-    asyncSuccessStatuses: ['finalized'],
-    getView: 'verified-memory',
-  };
-}
-
-function timing(
-  operation: 'syncPublish' | 'asyncEnqueue' | 'asyncCompletion' | 'get',
-  iteration: number,
-  warmup: boolean,
-  success: boolean,
-  durationMs: number,
-  error?: string,
-) {
-  return { operation, iteration, warmup, success, durationMs, error, context: {} };
-}
-
-function monotonicClock(): () => number {
-  let value = 0;
-  return () => {
-    value += 10;
-    return value;
-  };
-}
-
-function trackingFetch(calls: Array<{ url: string; init?: RequestInit }>, body: unknown): typeof globalThis.fetch {
-  return (async (url: string | URL | Request, init?: RequestInit) => {
-    calls.push({ url: String(url), init });
-    return {
-      ok: true,
-      status: 200,
-      statusText: 'OK',
-      headers: new Headers(),
-      json: () => Promise.resolve(body),
-      text: () => Promise.resolve(JSON.stringify(body)),
-    } as unknown as Response;
-  }) as typeof globalThis.fetch;
-}
-
-class MockBenchmarkClient implements BenchmarkClient {
-  readonly publishCalls: Array<{ roots: string[]; clearAfter?: boolean }> = [];
-  readonly enqueueCalls: Array<{ roots: string[] }> = [];
-  private readonly markersByRoot = new Map<string, string>();
-
-  constructor(private readonly opts: { jobStatus?: string; jobError?: string } = {}) {}
-
-  async status(): Promise<unknown> {
-    return { ok: true };
-  }
-
-  async sharedMemoryWrite(_contextGraphId: string, quads: Array<{ subject: string; predicate: string; object: string }>) {
-    const markerQuad = quads.find((quad) => quad.predicate === 'http://schema.org/identifier');
-    if (markerQuad) this.markersByRoot.set(markerQuad.subject, markerQuad.object);
-    return { workspaceOperationId: `share-${this.markersByRoot.size}` };
-  }
-
-  async publishFromSharedMemory(
-    _contextGraphId: string,
-    selection: 'all' | { rootEntities: string[] },
-    clearAfter?: boolean,
-  ) {
-    const roots = selection === 'all' ? ['all'] : selection.rootEntities;
-    this.publishCalls.push({ roots, clearAfter });
-    return { kcId: `kc-${this.publishCalls.length}`, kas: roots.map((rootEntity) => ({ tokenId: '1', rootEntity })) };
-  }
-
-  async publisherEnqueue(request: { roots: string[] }) {
-    this.enqueueCalls.push({ roots: request.roots });
-    return { jobId: `job-${this.enqueueCalls.length}` };
-  }
-
-  async publisherJob(_jobId: string) {
-    return { job: { status: this.opts.jobStatus ?? 'finalized', error: this.opts.jobError } };
-  }
-
-  async query(sparql: string) {
-    const root = sparql.match(/<([^>]+)>/)?.[1] ?? '';
-    const value = this.markersByRoot.get(root) ?? '"missing"';
-    return { result: { type: 'bindings' as const, bindings: [{ value }] } };
-  }
-}

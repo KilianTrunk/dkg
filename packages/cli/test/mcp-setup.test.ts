@@ -85,6 +85,11 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // from findDkgMonorepoRoot. Tests that exercise the monorepo path
     // override this dep to return a mock repo root.
     const findDkgMonorepoRoot = vi.fn((_startDir?: string) => null as string | null);
+    // F30: resolveDkgBin defaults to returning null (bin not found),
+    // which keeps the canonical entry as the bare-`"dkg"` form.
+    // Tests that exercise the absolute-path resolution override this
+    // dep with a path-returning stub.
+    const resolveDkgBin = vi.fn((): string | null => null);
     return {
       loadNetworkConfig,
       writeDkgConfig,
@@ -93,6 +98,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       requestFaucetFunding,
       logManualFundingInstructions,
       findDkgMonorepoRoot,
+      resolveDkgBin,
       ...overrides,
     };
   }
@@ -694,6 +700,154 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const written = JSON.parse(readFileSync(clinePath, 'utf-8'));
     expect(written.mcpServers['github']).toEqual({ command: 'gh-mcp' });
     expect(written.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+  });
+
+  // ── F30: resolve absolute `dkg` bin path on installed-mode setup ──
+
+  it('F30: installed mode with resolved bin → canonical entry uses absolute path, not bare "dkg"', async () => {
+    // Real-world signal: GUI MCP clients (Claude Desktop, etc.)
+    // don't inherit shell PATH, so the bare-`"dkg"` form fails with
+    // `spawn dkg ENOENT`. Resolved absolute path makes the entry
+    // robust against PATH inheritance gaps.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps({
+      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
+    });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursorConfig.mcpServers.dkg).toEqual({
+      command: '/usr/local/bin/dkg',
+      args: ['mcp', 'serve'],
+    });
+    // resolveDkgBin was called exactly once (cached at action top).
+    expect(deps.resolveDkgBin).toHaveBeenCalledTimes(1);
+  });
+
+  it('F30: resolveDkgBin returning null falls back to bare "dkg"', async () => {
+    // The default `makeDeps` already returns null. This test is
+    // explicit to pin the fallback contract — `null` MUST NOT
+    // crash setup; it MUST emit the bare-`"dkg"` form so a user
+    // running on a machine where `dkg` somehow isn't on PATH at
+    // setup time still gets a workable (if not-GUI-friendly)
+    // entry written.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps(); // resolveDkgBin defaults to null
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursorConfig.mcpServers.dkg).toEqual({
+      command: 'dkg',
+      args: ['mcp', 'serve'],
+    });
+  });
+
+  it('F30: monorepo mode does NOT call resolveDkgBin (already absolute)', async () => {
+    // Monorepo mode hard-codes the local CLI dist absolute path
+    // and has no need for the resolver. Asserting the resolver is
+    // a no-op in that branch keeps the IO surface minimal — no
+    // spurious child-process spawn during a monorepo setup.
+    const fakeRepoRoot = join('/fake', 'dkg-v9');
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
+    });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(deps.resolveDkgBin).not.toHaveBeenCalled();
+    const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursorConfig.mcpServers.dkg.command).toBe('node');
+    expect(cursorConfig.mcpServers.dkg.args[0]).toBe(
+      join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
+    );
+  });
+
+  it('F30: pre-existing bare-"dkg" entry classifies as `registered` against resolved-path canonical', async () => {
+    // Re-run resilience: a user previously ran `dkg mcp setup`
+    // pre-F30 (bare-`"dkg"` written), then upgraded to a setup
+    // version that writes the resolved-path form. The re-run MUST
+    // NOT classify the pre-existing entry as `stale` and trigger
+    // a refresh — the bare command and the resolved path invoke
+    // the SAME bin on PATH today. Avoids spurious `--force`
+    // prompts and unnecessary file rewrites.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify(
+        { mcpServers: { dkg: { command: 'dkg', args: ['mcp', 'serve'] } } },
+        null,
+        2,
+      ),
+    );
+    const beforeMtime = (await import('node:fs')).statSync(join(cursorDir, 'mcp.json')).mtimeMs;
+
+    const deps = makeDeps({
+      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
+    });
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // File MUST NOT have been rewritten — pre-existing bare-"dkg"
+    // entry is registered-equivalent to the resolved-path canonical.
+    const afterMtime = (await import('node:fs')).statSync(join(cursorDir, 'mcp.json')).mtimeMs;
+    expect(afterMtime).toBe(beforeMtime);
+    // And the entry is unchanged on disk.
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    expect(after.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+  });
+
+  it('F30: pre-existing different absolute path classifies as `stale` (real divergence)', async () => {
+    // The bare-vs-resolved equivalence is asymmetric: a pre-
+    // existing entry pointing at `/old/path/dkg` while the
+    // currently-resolved bin lives at `/usr/local/bin/dkg` IS
+    // real divergence — those invoke different binaries.
+    // Classify as `stale`, refresh on the canonical path.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify(
+        { mcpServers: { dkg: { command: '/old/path/dkg', args: ['mcp', 'serve'] } } },
+        null,
+        2,
+      ),
+    );
+
+    const deps = makeDeps({
+      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
+    });
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // Stale → refresh: file rewritten with the new resolved path.
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    expect(after.mcpServers.dkg).toEqual({
+      command: '/usr/local/bin/dkg',
+      args: ['mcp', 'serve'],
+    });
+  });
+
+  it('F30: --print-only with resolved bin emits the absolute path', async () => {
+    // The print-only short-circuit must use the same context-aware
+    // canonical entry as the write path — a documented JSON snippet
+    // that diverges from what setup actually writes would be a
+    // foot-gun for users following the README's manual-paste path.
+    const deps = makeDeps({
+      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
+    });
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await mcpSetupAction({ printOnly: true }, deps);
+
+    const parsed = parseStdoutJson(stdoutSpy);
+    expect(parsed.mcpServers.dkg).toEqual({
+      command: '/usr/local/bin/dkg',
+      args: ['mcp', 'serve'],
+    });
+    stdoutSpy.mockRestore();
   });
 
   it('phase-4: VSCode staleness — pre-existing dkg entry under `servers.dkg` reclassifies on context flip to monorepo', async () => {

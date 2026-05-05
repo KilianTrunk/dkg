@@ -1833,7 +1833,7 @@ mcpCmd
       process.exit(1);
     }
 
-    const { mcpSetupAction } = await import('./mcp-setup.js');
+    const { mcpSetupAction, resolveDkgBin } = await import('./mcp-setup.js');
     try {
       await mcpSetupAction(opts, {
         loadNetworkConfig: openclawSetupExports.loadNetworkConfig,
@@ -1843,6 +1843,7 @@ mcpCmd
         logManualFundingInstructions: openclawSetupExports.logManualFundingInstructions,
         requestFaucetFunding: coreExports.requestFaucetFunding,
         findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
+        resolveDkgBin,
       });
     } catch (err: any) {
       console.error(`\n[dkg mcp setup] ERROR: ${err?.message ?? err}\n`);

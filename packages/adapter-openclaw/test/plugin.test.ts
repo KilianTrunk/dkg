@@ -1307,9 +1307,34 @@ describe('DkgNodePlugin', () => {
       expect(body.subGraphName).toBeUndefined();
       expect(body.quads).toHaveLength(1);
       const [quad] = body.quads;
-      expect(quad.subject).toMatch(/^urn:openclaw:.+:shared$/);
+      // Subject ends with a unique shareId suffix so the publisher's
+      // delete-then-insert upsert doesn't replace prior shares.
+      expect(quad.subject).toMatch(/^urn:openclaw:.+:shared:\d+-[a-z0-9]+$/);
       expect(quad.predicate).toBe('urn:openclaw:sharedContent');
-      expect(quad.object).toBe('hello');
+      // Object is N-Triples-quoted so the storage formatTerm doesn't
+      // IRI-encode the unquoted text.
+      expect(quad.object).toBe('"hello"');
+    });
+
+    it('dkg_share mints a unique subject per call so successive shares do not upsert', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-multi' });
+      await byName.get('dkg_share')!.execute('tc', { content: 'one', context_graph_id: 'ctx' });
+      await byName.get('dkg_share')!.execute('tc', { content: 'two', context_graph_id: 'ctx' });
+      const subjA = JSON.parse(fetchMock.mock.calls[0][1]?.body as string).quads[0].subject;
+      const subjB = JSON.parse(fetchMock.mock.calls[1][1]?.body as string).quads[0].subject;
+      expect(subjA).not.toBe(subjB);
+      expect(subjA).toMatch(/^urn:openclaw:.+:shared:\d+-[a-z0-9]+$/);
+      expect(subjB).toMatch(/^urn:openclaw:.+:shared:\d+-[a-z0-9]+$/);
+    });
+
+    it('dkg_share escapes quotes, backslashes, and newlines when building the literal', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-escape' });
+      await byName.get('dkg_share')!.execute('tc', {
+        content: 'line1\nline2 "quoted" with \\ slash',
+        context_graph_id: 'ctx',
+      });
+      const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+      expect(body.quads[0].object).toBe('"line1\\nline2 \\"quoted\\" with \\\\ slash"');
     });
 
     it('dkg_share plumbs sub_graph_name through to subGraphName for sub-graph-scoped writes', async () => {

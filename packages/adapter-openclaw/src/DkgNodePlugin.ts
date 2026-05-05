@@ -4274,10 +4274,25 @@ export class DkgNodePlugin {
 
       await this.ensureNodeAgentAddress();
       const addr = this.resolveDefaultAgentAddress() ?? 'unknown';
+      // Mint a unique root entity per share so the publisher's
+      // delete-then-insert upsert (dkg-publisher.ts:422-429) doesn't
+      // replace prior shares from the same agent.
+      const shareId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const subject = `urn:openclaw:${addr}:shared:${shareId}`;
+      // Serialize content as an N-Triples literal so the storage layer's
+      // formatTerm (oxigraph.ts:233-244) doesn't wrap unquoted text in
+      // angle brackets and treat it as an invalid IRI.
+      const literal = '"' +
+        content
+          .replace(/\\/g, '\\\\')
+          .replace(/"/g, '\\"')
+          .replace(/\n/g, '\\n')
+          .replace(/\r/g, '\\r') +
+        '"';
       const quads = [{
-        subject: `urn:openclaw:${addr}:shared`,
+        subject,
         predicate: 'urn:openclaw:sharedContent',
-        object: content,
+        object: literal,
       }];
       const result = await this.client.share(contextGraphId, quads, { subGraphName });
       return this.json(result);

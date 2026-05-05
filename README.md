@@ -418,7 +418,7 @@ Clone the repo and use pnpm (v10+) with Node.js 22+ to work across all workspace
 
 ```bash
 pnpm install                                     # install all workspace deps
-pnpm build                                       # compile every package (Turborepo)
+pnpm build                                       # compile packages and the Node UI bundle
 pnpm test                                        # run the full test suite
 pnpm test:coverage                               # tests + tier-based coverage gates (all packages)
 pnpm --filter @origintrail-official/dkg test     # run tests for a single package

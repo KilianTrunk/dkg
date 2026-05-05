@@ -57,8 +57,15 @@ import {
   DEFAULT_HERMES_API_SERVER_URL,
   type HermesChannelHealthReport,
   probeHermesChannelHealth,
+  runHermesUiSetup,
   transportPatchFromHermesTarget,
 } from './hermes.js';
+import {
+  type PendingAttachJob,
+  scheduleAttachJob,
+  isCancelled as isAttachJobCancelled,
+} from './local-agent-attach-jobs.js';
+import type { HermesSetupResult } from '@origintrail-official/dkg-adapter-hermes';
 
 const daemonRequire = createRequire(import.meta.url);
 
@@ -425,6 +432,8 @@ export type LocalAgentUiAttachDeps = OpenClawUiAttachDeps & {
     hermesHome: string;
     memoryMode?: string;
   };
+  /** Test injection: stub the Hermes UI setup entrypoint. */
+  runHermesSetup?: (signal?: AbortSignal) => Promise<HermesSetupResult>;
 };
 
 async function addHermesProfileMetadataForUiConnect(
@@ -504,8 +513,11 @@ export async function connectLocalAgentIntegrationFromUi(
   });
   if (requested.id === 'hermes') {
     const probeHermesHealth = deps.probeHermesHealth ?? probeHermesChannelHealth;
+    const runSetup = deps.runHermesSetup ?? runHermesUiSetup;
+    const saveConfigState = deps.saveConfig;
+
     const health = await probeHermesHealth(config, bridgeAuthToken, { timeoutMs: 3_000 });
-    if (health.ok) {
+    if (health.ok && hadStoredTransportBeforeConnect) {
       const transport = transportPatchFromHermesTarget(config, health.target)
         ?? (health.target === 'gateway'
           ? { kind: 'hermes-openai', gatewayUrl: DEFAULT_HERMES_API_SERVER_URL }
@@ -524,16 +536,97 @@ export async function connectLocalAgentIntegrationFromUi(
       };
     }
 
+    const persistHermesIntegrationState = async (patch: Record<string, unknown>): Promise<LocalAgentIntegrationRecord | null> => {
+      const current = getLocalAgentIntegration(config, requested.id);
+      if (current?.enabled === false && patch.enabled !== false) {
+        return null;
+      }
+      const integration = updateLocalAgentIntegration(config, requested.id, patch);
+      if (saveConfigState) {
+        await saveConfigState(config);
+      }
+      return integration;
+    };
+
+    const { started } = scheduleAttachJob(requested.id, async (attachJob: PendingAttachJob) => {
+      try {
+        const result = await runSetup(attachJob.controller.signal);
+        if (isAttachJobCancelled(attachJob)) return;
+
+        // setup-entrypoint-contract.md §3: result.transport is non-optional and
+        // already matches the LocalAgentIntegrationTransport patch shape, so we
+        // lift it straight rather than calling transportPatchFromHermesTarget.
+        // Provider-swap audit (§3) goes onto record.metadata so disconnect/restore
+        // and the UI's hermesDetail formatter can both reach it.
+        const metadataPatch = result.providerSwap
+          ? {
+              priorProvider: result.providerSwap.previousProvider,
+              backupPath: result.providerSwap.backupPath,
+            }
+          : undefined;
+
+        if (!result.ok || result.status === 'error') {
+          await persistHermesIntegrationState({
+            ...(metadataPatch ? { metadata: metadataPatch } : {}),
+            runtime: {
+              status: 'error',
+              ready: false,
+              lastError: result.errors[0] ?? 'Hermes setup failed',
+            },
+          });
+          return;
+        }
+
+        if (result.status === 'degraded') {
+          await persistHermesIntegrationState({
+            transport: result.transport,
+            ...(metadataPatch ? { metadata: metadataPatch } : {}),
+            runtime: {
+              status: 'degraded',
+              ready: false,
+              lastError: result.warnings[0] ?? null,
+            },
+          });
+          return;
+        }
+
+        await persistHermesIntegrationState({
+          transport: result.transport,
+          ...(metadataPatch ? { metadata: metadataPatch } : {}),
+          runtime: {
+            status: 'ready',
+            ready: true,
+            lastError: null,
+          },
+        });
+      } catch (err: any) {
+        if (isAttachJobCancelled(attachJob)) return;
+        await persistHermesIntegrationState({
+          enabled: hadStoredTransportBeforeConnect ? true : false,
+          ...(hadStoredTransportBeforeConnect && existingBeforeConnect?.transport
+            ? { transport: existingBeforeConnect.transport }
+            : {}),
+          runtime: {
+            status: 'error',
+            ready: false,
+            lastError: err?.message ?? 'Hermes attach failed',
+          },
+        });
+      }
+    }, deps.onAttachScheduled);
+
     const integration = updateLocalAgentIntegration(config, requested.id, {
       runtime: {
-        status: 'degraded',
+        status: 'connecting',
         ready: false,
-        lastError: health.error ?? 'Hermes bridge offline',
+        lastError: null,
       },
     });
     return {
       integration,
-      notice: 'Hermes was registered, but its local chat bridge is not responding yet. Run `dkg hermes setup` or refresh after Hermes starts.',
+      notice: started
+        ? 'Hermes setup started. This chat tab will come online automatically once Hermes finishes setting up.'
+        : 'Hermes setup is already in progress. This chat tab will come online automatically once Hermes finishes setting up.',
     };
   }
 

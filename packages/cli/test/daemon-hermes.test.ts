@@ -519,8 +519,20 @@ describe('Hermes channel helpers', () => {
 });
 
 describe('Hermes local-agent registry lifecycle', () => {
-  it('marks Hermes ready when UI connect can reach bridge health', async () => {
-    const config = makeConfig();
+  it('short-circuits to ready when UI connect reaches bridge health and transport is already stored', async () => {
+    // Re-running Connect on an already-attached Hermes integration: the stored
+    // transport from the prior install lets us trust the bridge probe directly
+    // and skip re-running setup entirely. New behavior post-#386 — see
+    // setup-entrypoint-contract.md §9 + connectLocalAgentIntegrationFromUi.
+    const config = makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+          runtime: { status: 'ready', ready: true },
+        },
+      },
+    });
     const result = await connectLocalAgentIntegrationFromUi(
       config,
       { id: 'hermes', metadata: { source: 'node-ui' } },
@@ -566,20 +578,36 @@ describe('Hermes local-agent registry lifecycle', () => {
     });
   });
 
-  it('marks Hermes degraded when UI connect cannot reach bridge health', async () => {
+  it('schedules setup and returns connecting when UI connect cannot reach bridge health', async () => {
+    // New behavior post-#386: a fresh Connect on an unconfigured profile no
+    // longer settles to "degraded" on a failed health probe — instead it
+    // schedules the new runHermesSetup attach job and returns runtime: connecting
+    // synchronously. The UI's polling loop transitions to ready/error once the
+    // attach job settles. Setup is awaited via runHermesSetup test stub here.
     const config = makeConfig();
+    const runHermesSetupStub = vi.fn(async () => ({
+      ok: true,
+      status: 'configured' as const,
+      profile: { hermesHome: 'C:\\Hermes\\default', configPath: '', memoryMode: 'provider' },
+      daemonStarted: false,
+      fundedWallets: [],
+      transport: { kind: 'hermes-openai' as const, gatewayUrl: 'http://127.0.0.1:8642' },
+      warnings: [],
+      errors: [],
+    }));
     const result = await connectLocalAgentIntegrationFromUi(
       config,
       { id: 'hermes', metadata: { source: 'node-ui' } },
       'bridge-token',
       {
         probeHermesHealth: async () => ({ ok: false, error: 'offline' }),
+        runHermesSetup: runHermesSetupStub,
       },
     );
 
-    expect(result.integration.runtime.status).toBe('degraded');
+    expect(result.integration.runtime.status).toBe('connecting');
     expect(result.integration.runtime.ready).toBe(false);
-    expect(result.integration.runtime.lastError).toBe('offline');
+    expect(result.notice).toContain('Hermes setup started');
   });
 
   it('refresh probes Hermes health and promotes an existing integration to ready', async () => {

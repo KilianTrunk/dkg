@@ -4264,18 +4264,35 @@ export class DkgNodePlugin {
 
   private async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
+      // Type-validate at the runtime boundary. Without this, a malformed MCP
+      // call passing `content: {}` or `false` would coerce via String(...) to
+      // `"[object Object]"` / `"false"` and pollute SWM with garbage. Reject
+      // up front instead.
+      if (args.content !== undefined && typeof args.content !== 'string') {
+        return this.error('"content" must be a string.');
+      }
+      if (args.context_graph_id !== undefined && typeof args.context_graph_id !== 'string') {
+        return this.error('"context_graph_id" must be a string.');
+      }
+      if (
+        args.sub_graph_name !== undefined &&
+        args.sub_graph_name !== null &&
+        typeof args.sub_graph_name !== 'string'
+      ) {
+        return this.error('"sub_graph_name" must be a string.');
+      }
       // Use the raw content for serialization so leading/trailing whitespace
       // and terminal newlines are preserved verbatim — agents sharing code
       // snippets or exact transcripts depend on this. Validate against the
       // trimmed form so a whitespace-only payload still rejects as "empty".
-      const content = String(args.content ?? '');
-      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const content = (args.content as string | undefined) ?? '';
+      const contextGraphId = ((args.context_graph_id as string | undefined) ?? '').trim();
       if (!content.trim()) return this.error('"content" is required.');
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
-      const rawSub = args.sub_graph_name;
+      const rawSub = args.sub_graph_name as string | undefined | null;
       const subGraphName = rawSub === undefined || rawSub === null
         ? undefined
-        : (String(rawSub).trim() || undefined);
+        : (rawSub.trim() || undefined);
 
       await this.ensureNodeAgentAddress();
       const addr = this.resolveDefaultAgentAddress() ?? 'unknown';

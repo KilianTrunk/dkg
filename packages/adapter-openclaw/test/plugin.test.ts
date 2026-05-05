@@ -1274,6 +1274,30 @@ describe('DkgNodePlugin', () => {
       expect(props.sub_graph_name?.type).toBe('string');
     });
 
+    it('dkg_share rejects non-string content/context_graph_id/sub_graph_name without coercing', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-types' });
+      // Without explicit type checks, `String(args.content ?? '')` would coerce
+      // {} → "[object Object]" and false → "false" — silently polluting SWM
+      // with garbage. Validate at the runtime boundary instead.
+      const objContent = await byName.get('dkg_share')!.execute('tc', { content: {}, context_graph_id: 'ctx' });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(objContent.content[0].text).toContain('content');
+
+      const boolContent = await byName.get('dkg_share')!.execute('tc', { content: false, context_graph_id: 'ctx' });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(boolContent.content[0].text).toContain('content');
+
+      const objCg = await byName.get('dkg_share')!.execute('tc', { content: 'x', context_graph_id: { id: 'ctx' } });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(objCg.content[0].text).toContain('context_graph_id');
+
+      const numSub = await byName.get('dkg_share')!.execute('tc', {
+        content: 'x', context_graph_id: 'ctx', sub_graph_name: 42,
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(numSub.content[0].text).toContain('sub_graph_name');
+    });
+
     it('dkg_share rejects missing/empty content without making a daemon call', async () => {
       const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-1' });
       const result = await byName.get('dkg_share')!.execute('tc', { context_graph_id: 'ctx' });

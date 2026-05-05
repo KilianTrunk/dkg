@@ -264,10 +264,14 @@ DKG_SHARE_SCHEMA = {
             },
             "context_graph_id": {
                 "type": "string",
-                "description": "Target Context Graph (default: current project).",
+                "description": "Target Context Graph ID.",
+            },
+            "sub_graph_name": {
+                "type": "string",
+                "description": "Optional sub-graph scope.",
             },
         },
-        "required": ["content"],
+        "required": ["content", "context_graph_id"],
     },
 }
 
@@ -1375,7 +1379,12 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error("Content is required.")
         if "context_graph" in args:
             return tool_error('"context_graph" is not a supported parameter on dkg_share. Use "context_graph_id".')
-        cg = _first_text(args, "context_graph_id") or self._context_graph
+        # Aligned with OpenClaw: context_graph_id is required (no implicit
+        # current-project fallback). Keeps both adapter contracts identical
+        # so portable agent code works unchanged across either surface.
+        cg = _first_text(args, "context_graph_id")
+        if not cg:
+            return tool_error("context_graph_id is required.")
         quads = [{
             "subject": f"urn:hermes:{self._agent_name}:shared",
             "predicate": "urn:hermes:sharedContent",

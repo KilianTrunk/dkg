@@ -44,8 +44,8 @@ function startGuardedServer(
   validTokens: Set<string>,
 ): Promise<{ server: Server; baseUrl: string }> {
   return new Promise((resolve) => {
-    const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-      if (!httpAuthGuard(req, res, true, validTokens)) return;
+    const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      if (!(await httpAuthGuard(req, res, true, validTokens))) return;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, url: req.url }));
     });

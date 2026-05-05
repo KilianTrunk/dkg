@@ -14,8 +14,8 @@ describe('httpAuthGuard — /.well-known/skill.md', () => {
   let baseUrl: string;
 
   beforeEach(async () => {
-    server = createServer((req: IncomingMessage, res: ServerResponse) => {
-      if (!httpAuthGuard(req, res, true, validTokens)) return;
+    server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      if (!(await httpAuthGuard(req, res, true, validTokens))) return;
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('ok');
     });

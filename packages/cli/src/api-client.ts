@@ -307,6 +307,10 @@ export class ApiClient {
     });
   }
 
+  async readQueryCatalog(contextGraphId: string): Promise<{ result: QueryResult }> {
+    return this.post('/api/profile/query-catalog/read', { contextGraphId });
+  }
+
   async queryRemote(peerId: string, request: {
     lookupType: string;
     contextGraphId?: string;
@@ -624,6 +628,11 @@ export class ApiClient {
       creator?: string;
       createdAt?: string;
       isSystem: boolean;
+      subscribed?: boolean;
+      synced?: boolean;
+      curator?: string;
+      accessPolicy?: string;
+      callerInvolved?: boolean;
     }>;
   }> {
     return this.get('/api/context-graph/list');

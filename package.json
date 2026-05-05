@@ -1,5 +1,5 @@
 {
-  "name": "dkg-v9",
+  "name": "dkg-v10",
   "version": "10.0.0-rc.4",
   "private": true,
   "packageManager": "pnpm@10.28.1",
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "turbo build",
-    "build:runtime:packages": "pnpm -r --filter @origintrail-official/dkg-core --filter @origintrail-official/dkg-storage --filter @origintrail-official/dkg-query --filter @origintrail-official/dkg-publisher --filter @origintrail-official/dkg-chain --filter @origintrail-official/dkg-epcis --filter @origintrail-official/dkg-random-sampling --filter @origintrail-official/dkg-agent --filter @origintrail-official/dkg-graph-viz --filter @origintrail-official/dkg-node-ui --filter @origintrail-official/dkg-adapter-openclaw --filter @origintrail-official/dkg run build",
+    "build:runtime:packages": "pnpm -r --filter @origintrail-official/dkg-core --filter @origintrail-official/dkg-storage --filter @origintrail-official/dkg-query --filter @origintrail-official/dkg-publisher --filter @origintrail-official/dkg-chain --filter @origintrail-official/dkg-epcis --filter @origintrail-official/dkg-random-sampling --filter @origintrail-official/dkg-agent --filter @origintrail-official/dkg-graph-viz --filter @origintrail-official/dkg-node-ui --filter @origintrail-official/dkg-adapter-openclaw --filter @origintrail-official/dkg-adapter-hermes --filter @origintrail-official/dkg run build",
     "build:runtime": "pnpm run build:runtime:packages && pnpm --filter @origintrail-official/dkg-node-ui run build:ui",
     "test": "turbo test",
     "test:watch": "vitest --config vitest.config.ts",
@@ -30,6 +30,7 @@
     "sim:testnet": "SIM_TARGET=testnet pnpm --filter @origintrail-official/dkg-network-sim dev",
     "sim:build": "pnpm --filter @origintrail-official/dkg-network-sim build",
     "mcp": "node packages/mcp-server/dist/index.js",
+    "check:npm-metadata": "node scripts/check-npm-metadata.mjs",
     "index": "node packages/cli/dist/cli.js index",
     "test:evm-integration": "./scripts/test-evm-integration.sh",
     "test:evm": "./scripts/test-evm-integration.sh all",

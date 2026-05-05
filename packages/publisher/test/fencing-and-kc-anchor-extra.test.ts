@@ -38,9 +38,8 @@
  *                     does NOT insert a confirmed-status quad when the
  *                     on-chain root does not match.
  *
- * Per QA policy: production code is not modified. Where a failing
- * assertion encodes a spec violation, it IS the bug evidence and is
- * tagged `PROD-BUG:` in-line.
+ * These tests started as red bug evidence. They now pin the fixed
+ * fail-closed behavior for stale worker claims.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
@@ -136,9 +135,7 @@ describe('P-2 (CRITICAL): fencing token — stale worker after health-check rese
   });
 
   it(
-    'PROD-BUG: after the wallet lock is cleared, a stale worker can still ' +
-      'flip `claimed → validated` on its own job — update() has no fence on ' +
-      'the caller claim token. See BUGS_FOUND.md P-2.',
+    'rejects claimed -> validated after the wallet lock is cleared',
     async () => {
       const publisher = createPublisher();
       const jobId = await publisher.lift(request());
@@ -154,9 +151,7 @@ describe('P-2 (CRITICAL): fencing token — stale worker after health-check rese
 
       // Stale worker-A still holds the jobId in-memory and tries to
       // push the FSM forward. Per spec this must be rejected with a
-      // fence / stale-lease error. Currently update() has no claim-
-      // token argument and does not re-read the lock before writing,
-      // so this call silently succeeds → documented PROD-BUG.
+      // fence / stale-lease error.
       let caught: unknown = null;
       try {
         await publisher.update(jobId, 'validated', {
@@ -175,8 +170,7 @@ describe('P-2 (CRITICAL): fencing token — stale worker after health-check rese
       // Expected (spec): update from stale worker is rejected.
       expect(
         caught,
-        'PROD-BUG: stale update after lock reset should throw a fencing error ' +
-          '(e.g. "stale_claim", "fence_token_mismatch"). Currently succeeds.',
+        'stale update after lock reset should throw a fencing error',
       ).toBeInstanceOf(Error);
       if (caught instanceof Error) {
         expect(caught.message).toMatch(/fenc|stale|lock|claim/i);
@@ -184,7 +178,7 @@ describe('P-2 (CRITICAL): fencing token — stale worker after health-check rese
     },
   );
 
-  it('PROD-BUG: update() accepts an in-memory LiftJob even when the on-disk claim token has been overwritten by a different worker', async () => {
+  it('rejects update() when the on-disk claim token or wallet lock no longer matches the in-memory job claim', async () => {
     const publisher = createPublisher();
     const jobId = await publisher.lift(request());
     const claimedByA = await publisher.claimNext('wallet-A');
@@ -192,23 +186,9 @@ describe('P-2 (CRITICAL): fencing token — stale worker after health-check rese
     const originalTokenA = claimedByA?.claim?.claimToken;
     expect(originalTokenA).toBeTruthy();
 
-    // Simulate health-check sweep + takeover: wipe wallet-A's lock,
-    // then put the job back into `accepted` so a different wallet can
-    // legitimately re-claim it.
+    // Simulate health-check sweep: wipe wallet-A's lock so the job's
+    // persisted claim no longer has an active control-plane lease.
     await deleteWalletLockOutOfBand('wallet-A');
-    // Force the FSM back to `accepted` by manually overwriting the
-    // status quad via the claimed snapshot. We do this through the
-    // supported `update()` path only for the PURPOSE of resetting —
-    // in a real node this would happen through an async-lift recovery.
-    // We intentionally do NOT use recover() here because that would
-    // release wallet-A's lease via the happy path.
-    // ---
-    // Instead, we re-drive the job directly with the API: it does not
-    // expose a "reset" so the realistic simulation is "wallet-B claims
-    // a fresh job" in the same store, sharing the control plane. For
-    // the fencing-token scope we only need to verify that stale wallet-
-    // A's update is unconditionally accepted — the presence of a second
-    // worker is not required for the assertion below to be meaningful.
     // The claim token persisted on the job is still wallet-A's; the
     // lock however is gone. Per spec this is already "stale".
     let caughtStale: unknown = null;
@@ -225,24 +205,19 @@ describe('P-2 (CRITICAL): fencing token — stale worker after health-check rese
     } catch (err) {
       caughtStale = err;
     }
-    // PROD-BUG: update() signs off on this mutation with no fence check,
-    // and the publisher even rewrites the wallet lock for wallet-A
-    // (re-acquiring a lease that the control plane had explicitly
-    // invalidated). Observe: lock came back.
-    expect(caughtStale).toBeNull();
-    expect(await walletLockRowCount('wallet-A')).toBeGreaterThan(0);
+    expect(caughtStale).toBeInstanceOf(Error);
+    if (caughtStale instanceof Error) {
+      expect(caughtStale.message).toMatch(/fenc|stale|lock|claim/i);
+    }
+    expect(await walletLockRowCount('wallet-A')).toBe(0);
 
-    // Make the spec expectation explicit: under a correct fencing
-    // implementation, either the update or the lock recreation would
-    // fail. The two assertions below codify "at least one of these
-    // must be false".
+    // Make the spec expectation explicit: the stale write must not be
+    // accepted and the invalidated wallet lock must not be recreated.
     const staleWriteAccepted = caughtStale === null;
     const lockSilentlyRecreated = (await walletLockRowCount('wallet-A')) > 0;
-    // PROD-BUG evidence: BOTH are currently true.
     expect(
       staleWriteAccepted && lockSilentlyRecreated,
-      'PROD-BUG: stale worker was allowed to write AND silently regained ' +
-        'a wallet lock the control plane had invalidated. See BUGS_FOUND.md P-2.',
+      'stale worker must not write and regain an invalidated wallet lock',
     ).toBe(false);
   });
 });

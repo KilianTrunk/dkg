@@ -18,6 +18,8 @@
 import {
   GET_VIEWS,
   type GetView,
+  createDkgPublisherExtension,
+  type DkgPublisherExtension,
   resolveDkgHome,
   toEip55Checksum,
 } from '@origintrail-official/dkg-core';
@@ -59,6 +61,79 @@ import { mergeAdapterPluginConfigs } from './openclaw-config.js';
 const ETH_ADDR_RE_LC = /^0x[0-9a-f]{40}$/;
 function isValidEthAddressString(value: string | undefined): boolean {
   return typeof value === 'string' && ETH_ADDR_RE_LC.test(value.trim().toLowerCase());
+}
+
+type QueryCatalogToolItem = {
+  slug: string;
+  name: string;
+  description?: string;
+  sparql: string;
+  rank: number;
+  catalogSlug: string;
+  catalogName: string;
+  catalogDescription?: string;
+  catalogRank: number;
+  subGraph: string;
+};
+
+function stripRdfTerm(value: unknown): string {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const maybeValue = (value as Record<string, unknown>).value;
+    if (typeof maybeValue === 'string') return maybeValue;
+  }
+  const raw = String(value ?? '');
+  const decodeLiteral = (literal: string): string => {
+    try {
+      return JSON.parse(literal);
+    } catch {
+      return literal.slice(1, -1);
+    }
+  };
+  const literalMatch = raw.match(/^("[\s\S]*")(\^\^.*|@.*)?$/);
+  if (literalMatch) return decodeLiteral(literalMatch[1]);
+  return raw;
+}
+
+function queryCatalogSlugFromIri(iri: string, marker: string, fallback: string): string {
+  if (!iri) return fallback;
+  return iri.split(marker).pop() ?? iri;
+}
+
+function normalizeQueryCatalogItems(response: Record<string, unknown>): QueryCatalogToolItem[] {
+  const result = response.result as { type?: string; bindings?: unknown[] } | undefined;
+  const bindings = result?.type === 'bindings' && Array.isArray(result.bindings)
+    ? result.bindings
+    : [];
+  return bindings
+    .map((row): QueryCatalogToolItem | null => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+      const r = row as Record<string, unknown>;
+      const qIri = stripRdfTerm(r.q);
+      const catalogIri = stripRdfTerm(r.catalog);
+      const slug = queryCatalogSlugFromIri(qIri, ':query:', qIri);
+      const catalogSlug = queryCatalogSlugFromIri(catalogIri, ':catalog:', 'ui-saved-queries');
+      const sparql = stripRdfTerm(r.sparql);
+      if (!sparql) return null;
+      return {
+        slug,
+        name: stripRdfTerm(r.name) || slug,
+        description: r.description !== undefined ? stripRdfTerm(r.description) : undefined,
+        sparql,
+        rank: Number.parseInt(stripRdfTerm(r.rank) || '99', 10) || 99,
+        catalogSlug,
+        catalogName: stripRdfTerm(r.catalogName) || 'Queries',
+        catalogDescription: r.catalogDescription !== undefined ? stripRdfTerm(r.catalogDescription) : undefined,
+        catalogRank: Number.parseInt(stripRdfTerm(r.catalogRank) || '999', 10) || 999,
+        subGraph: stripRdfTerm(r.subGraph),
+      };
+    })
+    .filter((item): item is QueryCatalogToolItem => item !== null)
+    .sort((a, b) =>
+      a.subGraph.localeCompare(b.subGraph)
+      || a.catalogRank - b.catalogRank
+      || a.rank - b.rank
+      || a.name.localeCompare(b.name),
+    );
 }
 
 const OPENCLAW_LOCAL_AGENT_CAPABILITIES = {
@@ -155,6 +230,7 @@ export class DkgNodePlugin {
   // HTTP client to daemon — used by all tools and integration modules
   private client!: DkgDaemonClient;
   private daemonClientGeneration = 0;
+  private publisher!: DkgPublisherExtension;
 
   // Integration modules
   private channelPlugin: DkgChannelPlugin | null = null;
@@ -448,6 +524,7 @@ export class DkgNodePlugin {
     this.resetDaemonScopedCachesForClientChange();
     this.dkgHome = next.dkgHome;
     this.client = new DkgDaemonClient({ baseUrl: next.daemonUrl, dkgHome: next.dkgHome });
+    this.publisher = createDkgPublisherExtension(this.client);
     this.chatTurnWriter?.setClient(this.client);
     this.channelPlugin?.setClient(this.client);
     this.memoryPlugin?.setClient(this.client, { reRegister: this.config.memory?.enabled === true });
@@ -623,6 +700,7 @@ export class DkgNodePlugin {
     // (the very bug T70 set out to fix). Threading `dkgHome` through
     // `DkgClientOptions` plugs that hole.
     this.client = new DkgDaemonClient({ baseUrl: daemonUrl, dkgHome: this.dkgHome });
+    this.publisher = createDkgPublisherExtension(this.client);
     this.initialized = true;
     // R17.2 — Defer `ChatTurnWriter` construction to runtime-enabled
     // modes. The constructor calls `mkdirSync` + reads the watermark
@@ -2681,6 +2759,46 @@ export class DkgNodePlugin {
         execute: async (_toolCallId, args) => this.handleQuery(args),
       },
       {
+        name: 'dkg_query_catalog_list',
+        description:
+          'List saved SPARQL queries from a context graph profile query catalog. Use this when the user asks ' +
+          'what saved/catalog queries are available for a project or before running a saved query by name. ' +
+          'Returns sorted items with slug, display name, catalog, sub-graph, description, and SPARQL text.',
+        parameters: {
+          type: 'object',
+          properties: {
+            context_graph_id: {
+              type: 'string',
+              description: 'Context graph/project ID whose profile query catalog should be read.',
+            },
+          },
+          required: ['context_graph_id'],
+        },
+        execute: async (_toolCallId, args) => this.handleQueryCatalogList(args),
+      },
+      {
+        name: 'dkg_query_catalog_run',
+        description:
+          'Run a saved SPARQL query from a context graph profile query catalog by slug or exact display name. ' +
+          'Call dkg_query_catalog_list first if the selector is ambiguous. Executes the saved SPARQL against ' +
+          'the same context graph using the standard DKG query route.',
+        parameters: {
+          type: 'object',
+          properties: {
+            context_graph_id: {
+              type: 'string',
+              description: 'Context graph/project ID whose saved query should be used.',
+            },
+            query: {
+              type: 'string',
+              description: 'Saved query slug or exact display name.',
+            },
+          },
+          required: ['context_graph_id', 'query'],
+        },
+        execute: async (_toolCallId, args) => this.handleQueryCatalogRun(args),
+      },
+      {
         name: 'dkg_find_agents',
         description:
           'List DKG agents known to this node — combines the local registry (this node + cached peers from the ' +
@@ -3246,21 +3364,8 @@ export class DkgNodePlugin {
         return this.error('"quads" must be a non-empty array of {subject, predicate, object} objects.');
       }
 
-      // Convert agent-friendly quads to daemon format:
-      // - subject/predicate: plain URI strings (passed as-is)
-      // - object: auto-detect URI vs literal — URIs passed as-is, literals wrapped in ""
-      const quads = rawQuads.map((q: any) => {
-        const objVal = String(q.object ?? '');
-        return {
-          subject: String(q.subject ?? ''),
-          predicate: String(q.predicate ?? ''),
-          object: isUri(objVal) ? objVal : `"${escapeRdfLiteral(objVal)}"`,
-          graph: q.graph ? String(q.graph) : '',
-        };
-      });
-
-      const result = await this.client.publish(contextGraphId, quads);
-      return this.json({ kcId: result.kcId, kaCount: result.kas?.length ?? 0, quadsPublished: quads.length });
+      const result = await this.publisher.publishVerifiedMemory({ contextGraphId, quads: rawQuads });
+      return this.json({ kcId: result.kcId, kaCount: result.kas?.length ?? 0, quadsPublished: rawQuads.length });
     } catch (err: any) {
       return this.daemonError(err);
     }
@@ -3406,6 +3511,63 @@ export class DkgNodePlugin {
         agentAddress,
       });
       return this.json(result);
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleQueryCatalogList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      const response = await this.client.readQueryCatalog(contextGraphId);
+      const items = normalizeQueryCatalogItems(response);
+      return this.json({
+        contextGraphId,
+        count: items.length,
+        items,
+      });
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleQueryCatalogRun(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const selector = String(args.query ?? '').trim();
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      if (!selector) return this.error('"query" is required.');
+
+      const response = await this.client.readQueryCatalog(contextGraphId);
+      const items = normalizeQueryCatalogItems(response);
+      const slugMatches = items.filter((item) => item.slug === selector);
+      const nameMatches = slugMatches.length > 0
+        ? []
+        : items.filter((item) => item.name === selector);
+      const matches = slugMatches.length > 0 ? slugMatches : nameMatches;
+      if (matches.length === 0) {
+        return this.error(
+          `Saved query not found: ${selector}. Available queries: ${
+            items.map((item) => `${item.slug} (${item.name})`).join(', ') || 'none'
+          }`,
+        );
+      }
+      if (matches.length > 1) {
+        return this.error(
+          `Saved query selector is ambiguous: ${selector}. Matching slugs: ${
+            matches.map((item) => item.slug).join(', ')
+          }`,
+        );
+      }
+
+      const savedQuery = matches[0];
+      const result = await this.client.query(savedQuery.sparql, { contextGraphId });
+      return this.json({
+        contextGraphId,
+        savedQuery,
+        result,
+      });
     } catch (err: any) {
       return this.daemonError(err);
     }
@@ -3765,7 +3927,11 @@ export class DkgNodePlugin {
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!name) return this.error('"name" is required.');
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      const result = await this.client.createAssertion(contextGraphId, name, { subGraphName });
+      const result = await this.publisher.createLocalWorkspace({
+        contextGraphId,
+        assertionName: name,
+        subGraphName,
+      });
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3783,18 +3949,13 @@ export class DkgNodePlugin {
         return this.error('"quads" must be a non-empty array of {subject, predicate, object} objects.');
       }
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      // Mirror dkg_publish: auto-detect URI vs literal for the object so agents can pass
-      // raw values without manually wrapping string literals in quotes.
-      const quads = rawQuads.map((q: any) => {
-        const objVal = String(q.object ?? '');
-        return {
-          subject: String(q.subject ?? ''),
-          predicate: String(q.predicate ?? ''),
-          object: isUri(objVal) ? objVal : `"${escapeRdfLiteral(objVal)}"`,
-          graph: q.graph ? String(q.graph) : '',
-        };
+      const result = await this.publisher.writeLocalWorkspace({
+        contextGraphId,
+        assertionName: name,
+        quads: rawQuads,
+        subGraphName,
+        createIfMissing: false,
       });
-      const result = await this.client.writeAssertion(contextGraphId, name, quads, { subGraphName });
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3821,7 +3982,12 @@ export class DkgNodePlugin {
       } else {
         return this.error('"entities" must be omitted or a non-empty array of root entity URIs.');
       }
-      const result = await this.client.promoteAssertion(contextGraphId, name, { entities, subGraphName });
+      const result = await this.publisher.promoteLocalWorkspace({
+        contextGraphId,
+        assertionName: name,
+        rootEntities: entities,
+        subGraphName,
+      });
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3835,7 +4001,11 @@ export class DkgNodePlugin {
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!name) return this.error('"name" is required.');
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      const result = await this.client.discardAssertion(contextGraphId, name, { subGraphName });
+      const result = await this.publisher.discardLocalWorkspace({
+        contextGraphId,
+        assertionName: name,
+        subGraphName,
+      });
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3979,7 +4149,7 @@ export class DkgNodePlugin {
           }
         }
       }
-      const result = await this.client.publishSharedMemory(contextGraphId, { rootEntities, subGraphName });
+      const result = await this.publisher.publishSharedMemory({ contextGraphId, rootEntities, subGraphName });
       return this.json(registration ? { ...result, registration } : result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3993,11 +4163,6 @@ function slugify(name: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')  // replace non-alphanumeric runs with a single hyphen
     .replace(/^-+|-+$/g, '');      // strip leading/trailing hyphens
-}
-
-/** Check if a value looks like a URI (starts with a known scheme). */
-function isUri(value: string): boolean {
-  return /^(?:https?:\/\/|urn:|did:)/i.test(value);
 }
 
 function pickShareableMultiaddr(addrs: string[]): string | null {
@@ -4116,27 +4281,6 @@ function formatRecalledMemoryBlock(
     '</recalled-memory>',
   ];
   return lines.join('\n');
-}
-
-/**
- * Escape a plain-text string for use as an RDF/N-Triples literal body.
- * Covers every ECHAR escape the N-Triples spec defines (\\, ", \n, \r, \t,
- * \b, \f); returns only the escaped body (caller wraps in `"..."`).
- * Without these, agents writing strings that happen to contain a raw
- * form-feed, backspace, or tab would produce malformed RDF literals that
- * strict triple-store parsers reject.
- * Backslash MUST be replaced first so the later inserted escape sequences
- * don't get re-escaped on subsequent passes.
- */
-function escapeRdfLiteral(value: string): string {
-  return value
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t')
-    .replace(/\f/g, '\\f')
-    .replace(/\x08/g, '\\b');
 }
 
 /**

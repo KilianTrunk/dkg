@@ -2535,7 +2535,10 @@ export class DkgNodePlugin {
           'Create a new context graph on the DKG node. A context graph is a scoped knowledge domain ' +
           'that organizes published knowledge. Use dkg_list_context_graphs first to check if the ' +
           'context graph already exists. Returns the context graph ID and URI (did:dkg:context-graph:<id>). ' +
-          'The ID is auto-generated from the name if not provided.',
+          'The ID is auto-generated from the name if not provided. ' +
+          'Defaults to a curated/private context graph — the creator is auto-included in the allowlist ' +
+          'and can immediately write to working/shared memory. Pass `public: true` for an open/discoverable ' +
+          'context graph, or `allowed_agents` to invite collaborators atomically with creation.',
         parameters: {
           type: 'object',
           properties: {
@@ -2550,6 +2553,15 @@ export class DkgNodePlugin {
             id: {
               type: 'string',
               description: 'Optional custom context graph ID slug. Auto-generated from name if omitted (e.g. "My Research" → "my-research").',
+            },
+            public: {
+              type: 'boolean',
+              description: 'If true, creates an open/discoverable context graph (anyone can subscribe and read). Default is false — the context graph is curated/private and restricted to allowed_agents (the creator is always auto-included).',
+            },
+            allowed_agents: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Optional agent addresses (0x...) to add to the curation allowlist at creation time. The creator\'s own address is auto-added regardless. Ignored when public is true.',
             },
           },
           required: ['name'],
@@ -3644,7 +3656,73 @@ export class DkgNodePlugin {
         );
       }
       const description = args.description ? String(args.description).trim() : undefined;
-      const result = await this.client.createContextGraph(id, name, description);
+      // Privacy-by-default: when `public` is omitted or false, the context
+      // graph is curated (`accessPolicy: 1`). The agent's createContextGraph
+      // flow auto-includes the creator's address in the allowlist (see
+      // `packages/agent/src/dkg-agent.ts:3962-3973`), so the creator can
+      // immediately read/write the curated CG without a self-invite step.
+      // Round 2 — strict type validation on `public`. Non-boolean values
+      // (e.g. `"yes"`, `1`, `null`) silently became `false` previously,
+      // producing curated CGs when the LLM intended public — the opposite
+      // of the agent's intent. Reject explicitly so the agent gets a
+      // clear correction instead of silent miscategorization.
+      const rawPublic = args.public;
+      if (rawPublic !== undefined && typeof rawPublic !== 'boolean') {
+        return this.error(
+          `"public" must be a boolean (true or false). Got: ${typeof rawPublic}.`,
+        );
+      }
+      const isPublic = rawPublic === true;
+      // Round 2 — strict allowed_agents validation. Previously we
+      // silently dropped non-string / blank entries, which hides
+      // LLM-generated mistakes (e.g. `["0x1234...", 42]` would create a
+      // curated graph WITHOUT 42's intended owner ever knowing they
+      // were excluded). Fail fast on every malformed entry with a
+      // precise index-scoped error so the agent can correct.
+      let allowedAgents: string[] | undefined;
+      if (!isPublic && args.allowed_agents !== undefined) {
+        if (!Array.isArray(args.allowed_agents)) {
+          return this.error(
+            `"allowed_agents" must be an array of strings. Got: ${typeof args.allowed_agents}.`,
+          );
+        }
+        const ethAddrRe = /^0x[0-9a-fA-F]{40}$/;
+        const cleaned: string[] = [];
+        for (let i = 0; i < args.allowed_agents.length; i++) {
+          const entry = args.allowed_agents[i];
+          if (typeof entry !== 'string') {
+            return this.error(
+              `"allowed_agents[${i}]" must be a string. Got: ${entry === null ? 'null' : typeof entry}.`,
+            );
+          }
+          const trimmed = entry.trim();
+          if (!trimmed) {
+            return this.error(
+              `"allowed_agents[${i}]" is empty or whitespace-only. ` +
+              'Each entry must be a 0x-prefixed 40-hex-char Ethereum address.',
+            );
+          }
+          if (!ethAddrRe.test(trimmed)) {
+            return this.error(
+              `Invalid Ethereum address in "allowed_agents[${i}]": "${entry}". ` +
+              'Each entry must be a 0x-prefixed 40-hex-char string ' +
+              '(e.g. "0x1234567890abcdef1234567890abcdef12345678").',
+            );
+          }
+          cleaned.push(trimmed);
+        }
+        if (cleaned.length > 0) {
+          allowedAgents = cleaned;
+        }
+      }
+      const opts: { accessPolicy?: number; allowedAgents?: string[] } = {};
+      if (!isPublic) {
+        opts.accessPolicy = 1;
+      }
+      if (allowedAgents && allowedAgents.length > 0) {
+        opts.allowedAgents = allowedAgents;
+      }
+      const result = await this.client.createContextGraph(id, name, description, opts);
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);

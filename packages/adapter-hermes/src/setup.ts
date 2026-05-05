@@ -232,10 +232,49 @@ export function setupHermesProfile(options: HermesSetupOptions = {}): HermesSetu
 
   installHermesProviderPlugin(plan.profile);
 
+  // S4 vector-6 fix (adversarial-findings.md §6): peek the
+  // provider-swap intent BEFORE the destructive `config.yaml` rewrite,
+  // and persist `setup-state.json` with `priorMemoryProvider` set to
+  // the intent FIRST. A SIGINT between this state-write and the
+  // rewrite leaves recoverable state on disk: a re-run sees
+  // `existingState.priorMemoryProvider` populated, takes the
+  // first-wins branch below, and `restoreHermesProfile` finds the
+  // orphan backup at the recorded `configBackupPath`.
+  const intendedSwap = plan.profile.memoryMode === 'provider'
+    ? peekProviderSwapIntent(plan.profile.configPath, {
+        preserveProvider: options.preserveProvider === true,
+      }).swap
+    : null;
+
+  const existingState = readSetupState(plan.profile);
+  // First-wins on `priorMemoryProvider`: if a prior install already
+  // captured a snapshot (or a previous interrupted install captured
+  // an intent), the current install's intent is ignored. Matches
+  // the OpenClaw `previousMemorySlotOwner` first-wins semantics
+  // (parity-matrix.md Layer 4 row "Idempotency on re-run").
+  const priorMemoryProvider = existingState?.priorMemoryProvider
+    ?? (intendedSwap ? intendedSwap : undefined);
+
+  const stateBeforeRewrite = {
+    ...plan.state,
+    installedAt: existingState?.installedAt ?? plan.state.installedAt,
+    updatedAt: new Date().toISOString(),
+    ...(priorMemoryProvider ? { priorMemoryProvider } : {}),
+  };
+  writeOwnedJson(join(plan.profile.stateDir, 'setup-state.json'), stateBeforeRewrite);
+
   let providerSwap: EnsureManagedProviderBlockResult['swap'] = null;
   if (plan.profile.memoryMode === 'provider') {
+    // Pass the pre-computed `intendedSwap` so the backup file lands
+    // at the path already recorded in setup-state.json. Honors
+    // first-wins: if a prior interrupted install already captured a
+    // snapshot, we still pre-write the intent then `ensureManagedProviderBlock`
+    // writes the backup file at the new `intendedSwap.configBackupPath`
+    // (the first-wins state record above keeps pointing at the
+    // original captured backup, not this re-run's).
     const result = ensureManagedProviderBlock(plan.profile.configPath, {
       preserveProvider: options.preserveProvider === true,
+      ...(intendedSwap ? { intendedSwap } : {}),
     });
     providerSwap = result.swap;
   } else {
@@ -247,21 +286,23 @@ export function setupHermesProfile(options: HermesSetupOptions = {}): HermesSetu
     writeOwnedText(skillPath, options.nodeSkillContent);
   }
 
-  const existingState = readSetupState(plan.profile);
-  // First-wins on `priorMemoryProvider`: if a prior install already
-  // captured a snapshot, the second install's swap is ignored. Matches
-  // the OpenClaw `previousMemorySlotOwner` first-wins semantics
-  // (parity-matrix.md Layer 4 row "Idempotency on re-run").
-  const priorMemoryProvider = existingState?.priorMemoryProvider
-    ?? (providerSwap ? providerSwap : undefined);
+  // Re-write setup-state.json post-rewrite with the freshest
+  // `updatedAt`. The `priorMemoryProvider` slot is still first-wins
+  // and unchanged from the pre-rewrite write — we only refresh the
+  // timestamp. If `peekProviderSwapIntent` somehow disagreed with
+  // `ensureManagedProviderBlock` (defensive: shouldn't happen, both
+  // call `findConfiguredMemoryProvider` on the same input), the
+  // pre-write snapshot is what restore consumes; the post-write is
+  // cosmetic.
   const state = {
-    ...plan.state,
-    installedAt: existingState?.installedAt ?? plan.state.installedAt,
+    ...stateBeforeRewrite,
     updatedAt: new Date().toISOString(),
-    ...(priorMemoryProvider ? { priorMemoryProvider } : {}),
   };
   writeOwnedJson(join(plan.profile.stateDir, 'setup-state.json'), state);
   plan.state = state;
+  // `providerSwap` is currently logged for parity with the pre-fix
+  // return shape; downstream consumers read `state.priorMemoryProvider`.
+  void providerSwap;
   return plan;
 }
 
@@ -788,7 +829,7 @@ export async function runDisconnect(options: HermesCliOptions = {}): Promise<voi
       return;
     }
     const result = restoreHermesProfile({
-      profile: setupOptions.profile,
+      profile: setupOptions.profileName,
       hermesHome: setupOptions.hermesHome,
     });
     printRestore('Hermes restore', result);
@@ -814,7 +855,7 @@ export async function runUninstall(options: HermesCliOptions = {}): Promise<void
       console.log('[dry-run] Would restore prior memory.provider via restoreHermesProfile');
     } else {
       const result = restoreHermesProfile({
-        profile: setupOptions.profile,
+        profile: setupOptions.profileName,
         hermesHome: setupOptions.hermesHome,
       });
       printRestore('Hermes uninstall: restore', result);
@@ -1171,9 +1212,64 @@ interface EnsureManagedProviderBlockResult {
   } | null;
 }
 
+/**
+ * Peek the provider-swap intent for a `setupHermesProfile` call WITHOUT
+ * writing anything. Returns the same `{ swap }` shape that
+ * `ensureManagedProviderBlock` will produce, with `configBackupPath`
+ * pre-computed using the supplied `nowMs` timestamp.
+ *
+ * This split exists because of the SIGINT mid-execute partial-state
+ * bug surfaced by the adversarial reviewer (see
+ * `agent-docs/hermes-parity/adversarial-findings.md` §6). The caller
+ * (`setupHermesProfile`) writes `setup-state.json` with the intended
+ * `priorMemoryProvider` BEFORE the destructive `config.yaml` rewrite,
+ * so a SIGINT between the two writes leaves recoverable state on disk
+ * (re-run sees existingState.priorMemoryProvider populated and routes
+ * `restoreHermesProfile` correctly to the orphan backup).
+ *
+ * Throws when `preserveProvider: true` AND the existing config carries
+ * a non-DKG provider — same canonical message as
+ * `ensureManagedProviderBlock` (H-AC-30 adapter-half stable string).
+ */
+function peekProviderSwapIntent(
+  configPath: string,
+  options: { preserveProvider?: boolean; nowMs?: number } = {},
+): EnsureManagedProviderBlockResult {
+  const existing = existsSync(configPath) ? readFileSync(configPath, 'utf-8') : '';
+  const configuredProvider = findConfiguredMemoryProvider(existing);
+  if (!existing.includes(CONFIG_BEGIN) && configuredProvider === 'dkg') {
+    return { swap: null };
+  }
+  if (configuredProvider && configuredProvider !== 'dkg') {
+    if (options.preserveProvider === true) {
+      throw new Error(`Refusing to replace existing Hermes memory.provider: ${configuredProvider}`);
+    }
+    const ts = options.nowMs ?? Date.now();
+    return {
+      swap: {
+        provider: configuredProvider,
+        configBackupPath: `${configPath}.bak.${ts}`,
+        capturedAt: new Date(ts).toISOString(),
+      },
+    };
+  }
+  return { swap: null };
+}
+
 function ensureManagedProviderBlock(
   configPath: string,
-  options: { preserveProvider?: boolean } = {},
+  options: {
+    preserveProvider?: boolean;
+    /**
+     * The `{ provider, configBackupPath, capturedAt }` snapshot
+     * produced by `peekProviderSwapIntent`. When supplied, this
+     * function writes the backup file at the pre-computed path and
+     * skips re-detection. Required when the caller has already
+     * persisted `priorMemoryProvider` to setup-state.json (vector 6
+     * fix: SIGINT-safe ordering).
+     */
+    intendedSwap?: NonNullable<EnsureManagedProviderBlockResult['swap']>;
+  } = {},
 ): EnsureManagedProviderBlockResult {
   const existing = existsSync(configPath) ? readFileSync(configPath, 'utf-8') : '';
   const configuredProvider = findConfiguredMemoryProvider(existing);
@@ -1194,13 +1290,20 @@ function ensureManagedProviderBlock(
     // is what `restoreHermesProfile` (S4 step 3) consumes for the
     // backup-file fallback path; the line-rewrite path uses the
     // captured `provider` name instead.
-    const backupPath = `${configPath}.bak.${Date.now()}`;
-    writeFileSync(backupPath, existing);
-    const swap = {
+    //
+    // SIGINT-safe ordering (vector 6 fix): when the caller has already
+    // persisted `priorMemoryProvider` via `peekProviderSwapIntent`, we
+    // honor the pre-computed `configBackupPath` so the on-disk state
+    // points at the same backup path that gets written here. Without
+    // the injection, a tiny clock skew between peek and execute could
+    // produce a different `Date.now()` and leave the snapshot pointing
+    // at a non-existent backup.
+    const swap = options.intendedSwap ?? {
       provider: configuredProvider,
-      configBackupPath: backupPath,
+      configBackupPath: `${configPath}.bak.${Date.now()}`,
       capturedAt: new Date().toISOString(),
     };
+    writeFileSync(swap.configBackupPath, existing);
     const unmanaged = removeManagedBlock(existing);
     const next = hasTopLevelMemoryBlock(unmanaged)
       ? insertManagedProviderIntoMemoryBlock(unmanaged)

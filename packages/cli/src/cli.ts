@@ -21,7 +21,7 @@ import {
   type AutoUpdateConfig,
 } from './config.js';
 import { ApiClient } from './api-client.js';
-import { parsePositiveMsOption } from './publisher-runner.js';
+import { parsePositiveIntegerOption, parsePositiveMsOption } from './publisher-runner.js';
 import { runConfiguredSourceWorker } from './source-worker-runner.js';
 
 function isDaemonUnreachable(err: unknown): boolean {
@@ -2369,6 +2369,7 @@ publisherCmd
   .description('Enable async publisher runtime')
   .option('--poll-interval <ms>', 'Poll interval in milliseconds', '12000')
   .option('--error-backoff <ms>', 'Error backoff in milliseconds', '5000')
+  .option('--max-retries <count>', 'Maximum async Lift retries per job', '10')
   .action(async (opts: ActionOpts) => {
     try {
       const config = await loadConfig();
@@ -2376,6 +2377,7 @@ publisherCmd
         enabled: true,
         pollIntervalMs: parsePositiveMsOption(String(opts.pollInterval ?? '12000'), '--poll-interval'),
         errorBackoffMs: parsePositiveMsOption(String(opts.errorBackoff ?? '5000'), '--error-backoff'),
+        maxRetries: parsePositiveIntegerOption(String(opts.maxRetries ?? '10'), '--max-retries'),
       };
       await saveConfig(config);
       console.log('Async publisher enabled');

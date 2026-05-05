@@ -30,6 +30,7 @@ import {
   updateMetaMerkleRoot,
   type KAMetadata,
 } from './metadata.js';
+import { storeWorkspaceOperationPublicQuads } from './workspace-resolution.js';
 import { ethers } from 'ethers';
 
 export { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
@@ -442,6 +443,16 @@ export class DKGPublisher implements Publisher {
       swmMetaGraph,
     );
     await this.store.insert(metaQuads);
+    await storeWorkspaceOperationPublicQuads({
+      store: this.store,
+      graphManager: this.graphManager,
+      contextGraphId,
+      shareOperationId,
+      rootEntities,
+      quads: normalized,
+      publisherPeerId: options.publisherPeerId,
+      subGraphName: options.subGraphName,
+    });
 
     if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {
       this.sharedMemoryOwnedEntities.set(ownershipKey, new Map());
@@ -2303,6 +2314,16 @@ export class DKGPublisher implements Publisher {
         swmMetaGraph,
       );
       await this.store.insert(metaQuads);
+      await storeWorkspaceOperationPublicQuads({
+        store: this.store,
+        graphManager: this.graphManager,
+        contextGraphId,
+        shareOperationId: operationId,
+        rootEntities: effectiveRoots,
+        quads: swmQuads,
+        publisherPeerId: opts.publisherPeerId,
+        subGraphName: opts.subGraphName,
+      });
 
       if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {
         this.sharedMemoryOwnedEntities.set(ownershipKey, new Map());

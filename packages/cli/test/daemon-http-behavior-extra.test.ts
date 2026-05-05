@@ -1,7 +1,7 @@
 /**
  * Daemon HTTP behavior tests.
  *
- * Covers audit findings from `.test-audit/BUGS_FOUND.md` → `packages/cli (BURA)`:
+ * Covers audit findings from `.test-audit/` → `packages/cli (BURA)`:
  *   - CLI-2  (dup #76) — CORS policy for JSON API: foreign-origin preflight must
  *                       not be echoed; whitelist must hold.
  *   - CLI-4  (dup #78) — Malformed JSON body → 400 with clear error message.
@@ -173,8 +173,9 @@ async function startDaemon(opts: {
     daemon.signal = signal;
   });
 
-  // Wait for /api/status to respond (up to 30s)
-  for (let i = 0; i < 60; i++) {
+  // Wait for /api/status to respond (up to 60s). CI startup can be noisy when
+  // workflow fan-out is high, and 30s proved flaky despite healthy behavior.
+  for (let i = 0; i < 120; i++) {
     if (child.exitCode !== null) {
       throw new Error(`Daemon exited early with code ${child.exitCode}`);
     }
@@ -185,7 +186,7 @@ async function startDaemon(opts: {
       /* not ready yet */
     }
     await sleep(500);
-    if (i === 59) throw new Error('Daemon did not become ready within 30s');
+    if (i === 119) throw new Error('Daemon did not become ready within 60s');
   }
 
   if (opts.authEnabled) {

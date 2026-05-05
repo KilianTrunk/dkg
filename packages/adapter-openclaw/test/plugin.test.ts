@@ -1350,10 +1350,10 @@ describe('DkgNodePlugin', () => {
       expect(quad.object).toBe('"hello"');
     });
 
-    it('dkg_share returns the minted subject and rootEntities in the tool response', async () => {
-      // Without the subject in the response, callers have only the opaque
-      // shareOperationId to identify the share — that can't be used as a
-      // root_entities selector for a later dkg_shared_memory_publish call.
+    it('dkg_share returns the minted subject and snake_case root_entities in the tool response', async () => {
+      // Field name is snake_case to match the consuming tool's argument
+      // shape — agents chaining dkg_share → dkg_shared_memory_publish
+      // ({ root_entities: ... }) can pass the value through unchanged.
       const { byName } = setupPluginWithFetch({ shareOperationId: 'op-resp' });
       const result = await byName.get('dkg_share')!.execute('tc', {
         content: 'targetable',
@@ -1362,7 +1362,8 @@ describe('DkgNodePlugin', () => {
       const body = JSON.parse(result.content[0].text);
       expect(body.shareOperationId).toBe('op-resp');
       expect(body.subject).toMatch(/^urn:openclaw:.+:shared:\d+-[a-z0-9]+$/);
-      expect(body.rootEntities).toEqual([body.subject]);
+      expect(body.root_entities).toEqual([body.subject]);
+      expect(body.rootEntities).toBeUndefined();
     });
 
     it('dkg_share mints a unique subject per call so successive shares do not upsert', async () => {
@@ -1452,14 +1453,14 @@ describe('DkgNodePlugin', () => {
       expect(identityCalls.length).toBe(1);
     });
 
-    it('dkg_share errors when node identity is unresolved (no agent address, no peer ID)', async () => {
+    it('dkg_share falls back to an anonymous unique subject when node identity is unresolved', async () => {
       // Without an injected nodePeerId, ensureNodeAgentAddress/ensureNodePeerId
-      // both no-op (no memoryResolverApi). The handler still tries the direct
-      // /api/agent/identity probe — but in this test the default fetch mock
-      // returns a payload without `agentAddress` or `peerId`, so the fallback
-      // probe doesn't yield a usable identifier either. Handler should refuse
-      // to share rather than fall back to a placeholder identifier and pollute
-      // SWM with `urn:openclaw:unknown:...` subjects.
+      // both no-op (no memoryResolverApi). The direct /api/agent/identity
+      // probe returns the default mock payload which lacks agentAddress and
+      // peerId. The handler must NOT refuse the share — /api/shared-memory/write
+      // doesn't require identity preflight. Mint a unique-per-call anonymous
+      // subject so the upsert problem is still avoided and authorship just
+      // degrades to anon attribution.
       const { fetchMock, byName } = setupPluginWithFetch(
         { shareOperationId: 'op-noid' },
         { skipNodeIdInjection: true },
@@ -1468,11 +1469,13 @@ describe('DkgNodePlugin', () => {
         content: 'hello',
         context_graph_id: 'ctx',
       });
-      // The fallback probe to /api/agent/identity is allowed; what must NOT
-      // happen is the actual share write (POST to /api/shared-memory/write).
+      const body = JSON.parse(result.content[0].text);
+      expect(body.shareOperationId).toBe('op-noid');
+      expect(body.subject).toMatch(/^urn:openclaw:anon:shared:\d+-[a-z0-9]+$/);
+      expect(body.root_entities).toEqual([body.subject]);
+      // The actual share write must have happened.
       const shareCalls = fetchMock.mock.calls.filter(c => String(c[0]).includes('/api/shared-memory/write'));
-      expect(shareCalls.length).toBe(0);
-      expect(result.content[0].text).toContain('node agent address and peer ID');
+      expect(shareCalls.length).toBe(1);
     });
 
     it('dkg_share UCHAR-encodes non-ECHAR control bytes (NUL, VT, DEL) the canonical escaper leaves raw', async () => {

@@ -4294,18 +4294,16 @@ export class DkgNodePlugin {
         ? undefined
         : (rawSub.trim() || undefined);
 
-      // Probe both the agent ETH address and the libp2p peer ID before
-      // resolving — at startup either probe may not have fired yet, and a
-      // bare `?? 'unknown'` fallback would pollute SWM with shares under
-      // `urn:openclaw:unknown:...` for every node still booting.
+      // Best-effort node-identity attribution. Try the gated probes first
+      // (these warm the cache when the memory resolver API is attached),
+      // then fall back to a direct /api/agent/identity probe so dkg_share
+      // works in `memory.enabled: false` configurations too. If neither
+      // path resolves, we still mint a unique-per-call subject under an
+      // `anon` namespace — the share itself doesn't require identity
+      // (the daemon's /api/shared-memory/write doesn't), so refusing to
+      // write would over-couple the tool to a startup race.
       await Promise.all([this.ensureNodeAgentAddress(), this.ensureNodePeerId()]);
       let addr = this.resolveDefaultAgentAddress();
-      // The gated probes above no-op when the memory resolver API is not
-      // attached (e.g. `memory.enabled: false`). dkg_share writes directly
-      // to /api/shared-memory/write and shouldn't go dark just because the
-      // memory module is off. Fall back to a direct daemon probe — the
-      // /api/agent/identity endpoint returns both agentAddress and peerId
-      // and is available regardless of the memory module's state.
       if (!addr) {
         const probe = await this.client.getAgentIdentity().catch(() => null);
         if (probe?.ok && probe.identity) {
@@ -4314,17 +4312,14 @@ export class DkgNodePlugin {
           addr = this.resolveDefaultAgentAddress();
         }
       }
-      if (!addr) {
-        return this.error(
-          'Cannot share: node agent address and peer ID are both unresolved. ' +
-          'The daemon may still be starting up — retry once node identity is available.',
-        );
-      }
-      // Mint a unique root entity per share so the publisher's
-      // delete-then-insert upsert (dkg-publisher.ts:422-429) doesn't
-      // replace prior shares from the same agent.
+      // Unique per call — the publisher's delete-then-insert upsert
+      // (dkg-publisher.ts:422-429) keys off the root entity, so a stable
+      // subject would replace the prior share. Random shareId guarantees
+      // a fresh root every time, regardless of attribution.
       const shareId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-      const subject = `urn:openclaw:${addr}:shared:${shareId}`;
+      const subject = addr
+        ? `urn:openclaw:${addr}:shared:${shareId}`
+        : `urn:openclaw:anon:shared:${shareId}`;
       // Serialize content as an N-Triples literal. The canonical
       // escapeDkgRdfLiteral from @origintrail-official/dkg-core handles
       // the ECHAR set (\\, ", \n, \r, \t, \f, \b), but leaves other ASCII
@@ -4351,10 +4346,11 @@ export class DkgNodePlugin {
       const result = await this.client.share(contextGraphId, quads, { subGraphName });
       // Surface the minted subject so callers can target THIS share in a
       // follow-up `dkg_shared_memory_publish({ root_entities: [...] })` or
-      // inspect it precisely. Without this the daemon's opaque
-      // shareOperationId is the only handle, which can't be used as a
-      // root-entity selector.
-      return this.json({ ...result, subject, rootEntities: [subject] });
+      // inspect it precisely. Field name is snake_case to match the
+      // consuming tool's argument shape — agents chaining `dkg_share` →
+      // `dkg_shared_memory_publish` can pass the value through without
+      // case translation.
+      return this.json({ ...result, subject, root_entities: [subject] });
     } catch (err: any) {
       return this.daemonError(err);
     }

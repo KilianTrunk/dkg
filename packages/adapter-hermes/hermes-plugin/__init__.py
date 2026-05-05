@@ -1581,6 +1581,18 @@ class DKGMemoryProvider(MemoryProvider):
                 if isinstance(entry, str) and entry.strip()
             ]
             if cleaned:
+                # Validate Ethereum address format up-front so a malformed
+                # input surfaces as a tool-level error rather than bubbling
+                # up as a 500 from the daemon. Mirrors the agent layer's
+                # check at `packages/agent/src/dkg-agent.ts:3918-3922`.
+                eth_addr_re = re.compile(r"^0x[0-9a-fA-F]{40}$")
+                for addr in cleaned:
+                    if not eth_addr_re.match(addr):
+                        return tool_error(
+                            f"Invalid Ethereum address in \"allowed_agents\": \"{addr}\". "
+                            "Each entry must be a 0x-prefixed 40-hex-char string "
+                            "(e.g. \"0x1234567890abcdef1234567890abcdef12345678\")."
+                        )
                 allowed_agents = cleaned
         result = self._client.create_context_graph(
             name,

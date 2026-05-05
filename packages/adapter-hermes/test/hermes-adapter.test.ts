@@ -1643,9 +1643,17 @@ bad_cg = client.create_context_graph("Bad", cg_id="Bad:Id")
 assert bad_cg["success"] is False, bad_cg
 client.create_context_graph("My Project", "desc")
 # T-PRIVACY: client passes accessPolicy + allowedAgents through to the daemon
-# verbatim when supplied, and omits them when not.
+# verbatim when supplied, and omits them when not. The CLIENT layer does NOT
+# validate address format; that's the tool handler's job — the client just
+# forwards bytes to the daemon for the cases where a programmatic caller has
+# already validated upstream.
 client.create_context_graph("Curated", "private cg", access_policy=1)
-client.create_context_graph("Team", "shared", access_policy=1, allowed_agents=["0xAlice", "0xBob"])
+client.create_context_graph(
+    "Team",
+    "shared",
+    access_policy=1,
+    allowed_agents=["0x" + "a" * 40, "0x" + "B" * 40],
+)
 client.subscribe("cg:test", include_shared_memory=True)
 client.write_assertion("a b", "cg:test", [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "sub")
 client.discard_assertion("a b", "cg:test")
@@ -1657,10 +1665,13 @@ client.add_participant("cg:test", "agent")
 client.list_join_requests("cg:test")
 client.publish("cg:test", selection=["urn:root"], clear_after=False, sub_graph_name="sub")
 
+_VALID_ADDR_A = "0x" + "a" * 40
+_VALID_ADDR_B = "0x" + "B" * 40
+
 assert calls == [
     ("POST", "/api/context-graph/create", {"id": "my-project", "name": "My Project", "description": "desc"}),
     ("POST", "/api/context-graph/create", {"id": "curated", "name": "Curated", "description": "private cg", "accessPolicy": 1}),
-    ("POST", "/api/context-graph/create", {"id": "team", "name": "Team", "description": "shared", "accessPolicy": 1, "allowedAgents": ["0xAlice", "0xBob"]}),
+    ("POST", "/api/context-graph/create", {"id": "team", "name": "Team", "description": "shared", "accessPolicy": 1, "allowedAgents": [_VALID_ADDR_A, _VALID_ADDR_B]}),
     ("POST", "/api/context-graph/subscribe", {"contextGraphId": "cg:test", "includeSharedMemory": True}),
     ("POST", "/api/assertion/a%20b/write", {"contextGraphId": "cg:test", "quads": [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "subGraphName": "sub"}),
     ("POST", "/api/assertion/a%20b/discard", {"contextGraphId": "cg:test"}),
@@ -2660,14 +2671,26 @@ class FakeClient:
 client = FakeClient()
 provider._client = client
 
+VALID_A = "0x" + "a" * 40
+VALID_B = "0x" + "B" * 40
+
 # Default - no public, no allowed_agents -> curated.
 provider._handle_create_cg({"name": "Default", "id": "default"})
-# Explicit public - accessPolicy dropped, allowed_agents ignored.
-provider._handle_create_cg({"name": "Open", "id": "open", "public": True, "allowed_agents": ["0xIgnored"]})
-# Curated with explicit allowlist.
-provider._handle_create_cg({"name": "Team", "id": "team", "allowed_agents": ["0xAlice", "0xBob"]})
+# Explicit public - accessPolicy dropped, allowed_agents ignored even if
+# malformed (validation only runs when public is false, so public CGs never
+# raise on bad allowlist content).
+provider._handle_create_cg({"name": "Open", "id": "open", "public": True, "allowed_agents": ["not-an-address"]})
+# Curated with explicit allowlist (valid 40-hex addresses).
+provider._handle_create_cg({"name": "Team", "id": "team", "allowed_agents": [VALID_A, VALID_B]})
 # Curated with allowlist that includes empty / whitespace / non-string entries.
-provider._handle_create_cg({"name": "Trim", "id": "trim", "allowed_agents": ["  0xAlice  ", "", "   ", 42, "0xBob"]})
+provider._handle_create_cg({"name": "Trim", "id": "trim", "allowed_agents": [f"  {VALID_A}  ", "", "   ", 42, VALID_B]})
+# Round 1 — invalid address must surface as a tool error and NOT call client.
+err = json.loads(provider._handle_create_cg({"name": "Bad", "id": "bad", "allowed_agents": [VALID_A, "not-an-address"]}))
+assert "error" in err and "Invalid Ethereum address" in err["error"], err
+assert "not-an-address" in err["error"], err
+# Round 1 — too-short hex value also rejected.
+err2 = json.loads(provider._handle_create_cg({"name": "Short", "id": "short", "allowed_agents": ["0xabc"]}))
+assert "error" in err2 and "Invalid Ethereum address" in err2["error"], err2
 
 assert client.calls[0] == {
     "name": "Default", "description": "", "cg_id": "default",
@@ -2679,12 +2702,14 @@ assert client.calls[1] == {
 }, client.calls[1]
 assert client.calls[2] == {
     "name": "Team", "description": "", "cg_id": "team",
-    "access_policy": 1, "allowed_agents": ["0xAlice", "0xBob"],
+    "access_policy": 1, "allowed_agents": [VALID_A, VALID_B],
 }, client.calls[2]
 assert client.calls[3] == {
     "name": "Trim", "description": "", "cg_id": "trim",
-    "access_policy": 1, "allowed_agents": ["0xAlice", "0xBob"],
+    "access_policy": 1, "allowed_agents": [VALID_A, VALID_B],
 }, client.calls[3]
+# Bad / short calls must NOT have hit the client — pre-flight validation.
+assert len(client.calls) == 4, client.calls
 `;
     const result = spawnSync('python', ['-B', '-c', script], {
       cwd: process.cwd(),

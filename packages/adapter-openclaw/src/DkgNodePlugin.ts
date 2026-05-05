@@ -3497,6 +3497,21 @@ export class DkgNodePlugin {
             .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
             .filter((entry): entry is string => entry.length > 0)
         : undefined;
+      // Validate Ethereum address format up-front so a malformed input
+      // surfaces as a tool-level error instead of bubbling up as a 500
+      // from the daemon. Mirrors the agent layer's check at
+      // `packages/agent/src/dkg-agent.ts:3918-3922`.
+      if (!isPublic && allowedAgents && allowedAgents.length > 0) {
+        const ethAddrRe = /^0x[0-9a-fA-F]{40}$/;
+        for (const addr of allowedAgents) {
+          if (!ethAddrRe.test(addr)) {
+            return this.error(
+              `Invalid Ethereum address in "allowed_agents": "${addr}". ` +
+              'Each entry must be a 0x-prefixed 40-hex-char string (e.g. "0x1234567890abcdef1234567890abcdef12345678").',
+            );
+          }
+        }
+      }
       const opts: { accessPolicy?: number; allowedAgents?: string[] } = {};
       if (!isPublic) {
         opts.accessPolicy = 1;

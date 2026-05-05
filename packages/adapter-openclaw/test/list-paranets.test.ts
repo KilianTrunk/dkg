@@ -496,16 +496,18 @@ describe('dkg_context_graph_create tool', () => {
       new Response(JSON.stringify({ created: 'team', uri: 'did:dkg:context-graph:team' }), { status: 200 }),
     );
 
+    const validAddr1 = '0x' + 'a'.repeat(40);
+    const validAddr2 = '0x' + 'B'.repeat(40);
     const tool = findTool('dkg_context_graph_create');
     await tool.execute('call-allowed', {
       id: 'team',
       name: 'Team CG',
-      allowed_agents: ['0xAlice', '0xBob'],
+      allowed_agents: [validAddr1, validAddr2],
     });
 
     const body = JSON.parse(ft.calls[0][1]?.body as string);
     expect(body.accessPolicy).toBe(1);
-    expect(body.allowedAgents).toEqual(['0xAlice', '0xBob']);
+    expect(body.allowedAgents).toEqual([validAddr1, validAddr2]);
   });
 
   it('ignores allowed_agents when public:true is passed', async () => {
@@ -515,12 +517,13 @@ describe('dkg_context_graph_create tool', () => {
       new Response(JSON.stringify({ created: 'open-2', uri: 'did:dkg:context-graph:open-2' }), { status: 200 }),
     );
 
+    const validAddr = '0x' + 'a'.repeat(40);
     const tool = findTool('dkg_context_graph_create');
     await tool.execute('call-public-with-allowed', {
       id: 'open-2',
       name: 'Open',
       public: true,
-      allowed_agents: ['0xAlice'],
+      allowed_agents: [validAddr],
     });
 
     const body = JSON.parse(ft.calls[0][1]?.body as string);
@@ -528,20 +531,76 @@ describe('dkg_context_graph_create tool', () => {
     expect(body.allowedAgents).toBeUndefined();
   });
 
-  it('trims and filters allowed_agents entries', async () => {
+  it('trims and filters allowed_agents entries before validation', async () => {
+    // Whitespace and non-string entries are dropped before format validation,
+    // so trim-then-validate is the correct order.
     ft.addResponses(
       new Response(JSON.stringify({ created: 'trimmed', uri: 'did:dkg:context-graph:trimmed' }), { status: 200 }),
     );
 
+    const validAddr1 = '0x' + 'a'.repeat(40);
+    const validAddr2 = '0x' + 'B'.repeat(40);
     const tool = findTool('dkg_context_graph_create');
     await tool.execute('call-trim', {
       id: 'trimmed',
       name: 'Trim',
-      allowed_agents: ['  0xAlice  ', '', '   ', '0xBob', 42 as unknown as string],
+      allowed_agents: [`  ${validAddr1}  `, '', '   ', validAddr2, 42 as unknown as string],
     });
 
     const body = JSON.parse(ft.calls[0][1]?.body as string);
-    expect(body.allowedAgents).toEqual(['0xAlice', '0xBob']);
+    expect(body.allowedAgents).toEqual([validAddr1, validAddr2]);
+  });
+
+  it('returns a tool error when allowed_agents contains a malformed address', async () => {
+    // Validation is at the tool layer so a malformed input surfaces as a
+    // user-correctable tool error rather than bubbling up as a daemon 500.
+    // Mirrors the agent-layer regex at `packages/agent/src/dkg-agent.ts:3918`.
+    const tool = findTool('dkg_context_graph_create');
+    const result = await tool.execute('call-bad-addr', {
+      id: 'bad-addr',
+      name: 'Bad',
+      allowed_agents: ['0x' + 'a'.repeat(40), 'not-an-address'],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toContain('Invalid Ethereum address');
+    expect(parsed.error).toContain('not-an-address');
+    // Should not have hit the daemon — pre-flight validation.
+    expect(ft.calls).toHaveLength(0);
+  });
+
+  it('returns a tool error when allowed_agents has a too-short hex value', async () => {
+    const tool = findTool('dkg_context_graph_create');
+    const result = await tool.execute('call-short-addr', {
+      id: 'short-addr',
+      name: 'Short',
+      allowed_agents: ['0xabc'],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toContain('Invalid Ethereum address');
+    expect(ft.calls).toHaveLength(0);
+  });
+
+  it('skips allowed_agents validation entirely when public:true is passed', async () => {
+    // Curation parameters are dropped on public CGs, so even malformed
+    // entries do not produce an error — they're simply ignored.
+    ft.addResponses(
+      new Response(JSON.stringify({ created: 'open-skip', uri: 'did:dkg:context-graph:open-skip' }), { status: 200 }),
+    );
+
+    const tool = findTool('dkg_context_graph_create');
+    const result = await tool.execute('call-public-malformed', {
+      id: 'open-skip',
+      name: 'Open Skip',
+      public: true,
+      allowed_agents: ['not-an-address'],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toBeUndefined();
+    const body = JSON.parse(ft.calls[0][1]?.body as string);
+    expect(body.allowedAgents).toBeUndefined();
   });
 });
 

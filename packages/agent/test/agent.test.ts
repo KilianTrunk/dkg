@@ -313,7 +313,13 @@ describe('ProfileManager', () => {
     const { TypedEventBus, generateEd25519Keypair } = await import('@origintrail-official/dkg-core');
     const eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({ store, chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP), eventBus, keypair });
+    const publisher = new DKGPublisher({
+      store,
+      chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      eventBus,
+      keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+    });
 
     const manager = new ProfileManager(publisher, store);
     const result = await manager.publishProfile({
@@ -347,7 +353,13 @@ describe('ProfileManager', () => {
       const { TypedEventBus, generateEd25519Keypair } = await import('@origintrail-official/dkg-core');
       const eventBus = new TypedEventBus();
       const keypair = await generateEd25519Keypair();
-      const publisher = new DKGPublisher({ store, chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP), eventBus, keypair });
+      const publisher = new DKGPublisher({
+        store,
+        chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        eventBus,
+        keypair,
+        publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      });
       const manager = new ProfileManager(publisher, store);
 
       const peerId = 'QmLegacyUpgrade';
@@ -432,7 +444,13 @@ describe('ProfileManager', () => {
       const walletB = '0x' + 'bb'.repeat(20);
 
       // Publish under wallet A.
-      const publisher1 = new DKGPublisher({ store, chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP), eventBus, keypair });
+      const publisher1 = new DKGPublisher({
+        store,
+        chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        eventBus,
+        keypair,
+        publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      });
       const managerA = new ProfileManager(publisher1, store);
       await managerA.publishProfile({
         peerId,
@@ -457,7 +475,13 @@ describe('ProfileManager', () => {
       // Simulate a daemon restart + wallet rotation — brand new
       // ProfileManager with NO lastRootEntity memory, but the same
       // store + peerId + a NEW wallet.
-      const publisher2 = new DKGPublisher({ store, chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP), eventBus, keypair });
+      const publisher2 = new DKGPublisher({
+        store,
+        chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        eventBus,
+        keypair,
+        publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      });
       const managerB = new ProfileManager(publisher2, store);
       await managerB.publishProfile({
         peerId,
@@ -523,7 +547,13 @@ describe('ProfileManager', () => {
     const { TypedEventBus, generateEd25519Keypair } = await import('@origintrail-official/dkg-core');
     const eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({ store, chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP), eventBus, keypair });
+    const publisher = new DKGPublisher({
+      store,
+      chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      eventBus,
+      keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+    });
 
     const manager = new ProfileManager(publisher, store);
 

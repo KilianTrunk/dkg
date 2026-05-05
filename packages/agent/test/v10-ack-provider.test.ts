@@ -19,7 +19,7 @@ afterAll(async () => {
   await revertSnapshot(_fileSnapshot);
 });
 
-async function createAgent(chainAdapter: ChainAdapter) {
+async function createAgent(chainAdapter: ChainAdapter, operationalKeys?: string[]) {
   const store = new OxigraphStore();
   const agent = await DKGAgent.create({
     name: 'AckProviderTestAgent',
@@ -27,6 +27,13 @@ async function createAgent(chainAdapter: ChainAdapter) {
     listenHost: '127.0.0.1',
     store,
     chainAdapter,
+    chainConfig: operationalKeys
+      ? {
+          rpcUrl: 'http://127.0.0.1:8545',
+          hubAddress: ethers.ZeroAddress,
+          operationalKeys,
+        }
+      : undefined,
     nodeRole: 'core',
   });
   await agent.start();
@@ -60,8 +67,8 @@ describe('v10 ACK provider wiring', () => {
     expect(typeof result.onChainResult!.batchId).toBe('bigint');
   });
 
-  it('publishes tentatively when chain does not support V10 (NoChainAdapter)', async () => {
-    ({ agent } = await createAgent(new NoChainAdapter()));
+  it('publishes tentatively when chain does not support V10 but a publisher key is configured', async () => {
+    ({ agent } = await createAgent(new NoChainAdapter(), [HARDHAT_KEYS.CORE_OP]));
 
     const result = await agent.publish(SYSTEM_PARANETS.ONTOLOGY, [
       { subject: 'urn:test:no-ack-provider', predicate: 'http://schema.org/name', object: '"No ACK"', graph: '' },
@@ -69,5 +76,15 @@ describe('v10 ACK provider wiring', () => {
 
     expect(result.status).toBe('tentative');
     expect(result.onChainResult).toBeUndefined();
+  });
+
+  it('fails clearly when publishing without a publisher key', async () => {
+    ({ agent } = await createAgent(new NoChainAdapter()));
+
+    await expect(
+      agent.publish(SYSTEM_PARANETS.ONTOLOGY, [
+        { subject: 'urn:test:no-publisher-key', predicate: 'http://schema.org/name', object: '"No key"', graph: '' },
+      ]),
+    ).rejects.toThrow(/publisherPrivateKey/i);
   });
 });

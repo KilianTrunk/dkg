@@ -141,7 +141,7 @@ describe('Phase-sequence contracts', () => {
       chain,
       eventBus: new TypedEventBus(),
       keypair,
-      // No publisherPrivateKey → tentative only
+      // No publisherPrivateKey → fail closed before any publish phases
     });
 
     const quads = [q(ENTITY, 'http://schema.org/name', '"Tentative"')];

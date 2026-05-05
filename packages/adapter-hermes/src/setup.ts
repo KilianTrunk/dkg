@@ -4,12 +4,20 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
-import { resolveDkgConfigHome, resolveDkgHome } from '@origintrail-official/dkg-core';
+import {
+  fundWalletsBestEffort,
+  resolveDkgConfigHome,
+  resolveDkgHome,
+  startDaemon,
+  type FundWalletsNetworkConfig,
+} from '@origintrail-official/dkg-core';
 import {
   type HermesMemoryMode,
   type HermesProfileMetadata,
   type HermesPublishGuardPolicy,
   type HermesRuntimeStatus,
+  type HermesSetupRequest,
+  type HermesSetupResult,
   type HermesSetupState,
 } from './types.js';
 import { HermesDkgClient, redact } from './dkg-client.js';
@@ -53,6 +61,24 @@ export interface HermesCliOptions {
   dryRun?: boolean;
   verify?: boolean;
   start?: boolean;
+  /**
+   * Fund the first node wallets via the testnet faucet on first setup.
+   * Defaults to `true`; `--no-fund` flips to `false`. Mirrors OpenClaw
+   * `OpenClawSetupCliOptions.fund` (issue #386 acceptance).
+   */
+  fund?: boolean;
+  /**
+   * Refuse to replace an existing non-DKG `memory.provider` in the Hermes
+   * profile. Defaults to `false` (replace-by-default per
+   * setup-entrypoint-contract.md §2). `--preserve-provider` flips to true.
+   * S4 implements the actual replace-by-default + restore logic; S2 wires
+   * the flag through so the orchestrator sees it.
+   */
+  preserveProvider?: boolean;
+  /** UI-driven cancel; CLI handlers ignore. Mirrors `runOpenClawUiSetup`. */
+  signal?: AbortSignal;
+  /** Optional log/telemetry hint; non-functional. */
+  invokedBy?: 'cli' | 'ui';
   nodeSkillContent?: string;
 }
 
@@ -310,9 +336,188 @@ export function uninstallHermesProfile(options: HermesSetupOptions = {}): Hermes
   return plan;
 }
 
+/**
+ * `runHermesSetup` — the canonical entrypoint for Hermes setup that
+ * both `dkg hermes setup` (CLI) and the daemon-side UI Connect handler
+ * (S3) call. Returns a `HermesSetupResult` rather than throwing on
+ * non-fatal conditions; the daemon route maps `result.status` into
+ * `LocalAgentIntegrationRecord.runtime.status` per
+ * `setup-entrypoint-contract.md` §3.
+ *
+ * Behavior, in order:
+ *   1. Resolve profile via `resolveHermesProfile` (mirrors `toSetupOptions`).
+ *   2. Bootstrap `~/.dkg/config.json` via `ensureDkgNodeConfig` (S1.4)
+ *      when the file is missing AND we're not in dry-run. (S2 step 3
+ *      MVP: ensure the node config exists. Currently the bootstrap
+ *      reads `network/<env>.json` via the small `loadNetworkConfig`
+ *      probe below; full network discovery parity with OpenClaw lands
+ *      alongside the rest of the issue #386 fresh-user flow.)
+ *   3. Start the DKG daemon via `startDaemon` (S1.2) when
+ *      `start !== false` AND `dryRun !== true`.
+ *   4. Best-effort fund wallets via `fundWalletsBestEffort` (S1.3) when
+ *      `fund !== false` AND `dryRun !== true`. Faucet failures are
+ *      non-fatal — they surface as warnings, not errors.
+ *   5. Run the existing `setupHermesProfile` body (preserves the
+ *      dryRun short-circuit). For dryRun, this returns the plan
+ *      without touching the filesystem (S2 step 4 / contract §5
+ *      hardens the no-write guarantee).
+ *   6. Best-effort daemon registration via `connectDaemonBestEffort`
+ *      when not dry-run AND `start !== false`. Daemon registration
+ *      probe is gated on `start !== false` to keep it decoupled from
+ *      the new daemon-start step (issue #386 acceptance: `--no-start`
+ *      truly skips both daemon start AND registration probe).
+ *   7. Verify via `verifyHermesProfile` when `verify !== false`.
+ *   8. Compute `HermesSetupResult` with full `transport` always
+ *      populated (per contract §3).
+ *
+ * `providerSwap` is intentionally not populated here — that's S4's
+ * replace-by-default work. The `HermesSetupResult.providerSwap` field
+ * is defined in the result shape so the daemon route consumer
+ * (`setup-entrypoint-contract.md` §9 sketch) doesn't change between
+ * S2 → S3 → S4.
+ */
+export async function runHermesSetup(req: HermesSetupRequest): Promise<HermesSetupResult> {
+  const cliOptions = setupRequestToCliOptions(req);
+  const setupOptions = toSetupOptions(cliOptions);
+  const profile = resolveHermesProfile(setupOptions);
+  const dryRun = req.dryRun === true;
+  const shouldStart = req.start !== false && !dryRun;
+  const shouldFund = req.fund !== false && !dryRun;
+  const shouldVerify = req.verify !== false;
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  let daemonStarted = false;
+  let fundedWallets: string[] = [];
+  let plan: HermesSetupPlan | undefined;
+
+  // Step 1 (port-conflict warn): lifted out of `runHermesSetup` body
+  // for clarity. Fires when both `--port` and `--daemon-url` are passed
+  // and disagree on host:port. First-wins on `daemonUrl`. Per
+  // setup-entrypoint-contract.md §2 Open Question 1 + H-AC-58.
+  warnPortConflict(req, warnings);
+
+  // Step 2: bootstrap `~/.dkg/config.json` when missing.
+  if (!dryRun && !existsSync(join(resolveDkgConfigHome({ startDir: __dirname }), 'config.json'))) {
+    try {
+      await bootstrapDkgNodeConfig(profile, setupOptions, warnings);
+    } catch (err: any) {
+      // Non-fatal — operator can run `dkg init` and re-run setup. We
+      // surface a warning so the result.status flips to 'degraded'.
+      warnings.push(`Could not bootstrap ~/.dkg/config.json: ${err?.message ?? String(err)}`);
+    }
+  } else if (dryRun) {
+    console.log('[hermes-setup] [dry-run] Would bootstrap ~/.dkg/config.json if missing');
+  }
+
+  // Step 3: start daemon.
+  if (shouldStart) {
+    try {
+      const apiPort = setupOptions.daemonUrl
+        ? new URL(setupOptions.daemonUrl).port
+          ? Number(new URL(setupOptions.daemonUrl).port)
+          : 9200
+        : 9200;
+      await startDaemon(apiPort);
+      daemonStarted = true;
+    } catch (err: any) {
+      errors.push(`Failed to start DKG daemon: ${err?.message ?? String(err)}`);
+    }
+  } else if (dryRun) {
+    console.log('[hermes-setup] [dry-run] Would start DKG daemon');
+  } else {
+    console.log('[hermes-setup] Skipping daemon start (--no-start)');
+  }
+
+  // Step 4: fund wallets best-effort. Only meaningful when we have a
+  // network config to read `faucet.url` / `faucet.mode` from. Mirrors
+  // OpenClaw's "skip when no faucet configured" path.
+  if (shouldFund) {
+    const network = loadHermesNetworkConfig(warnings);
+    if (network) {
+      try {
+        await fundWalletsBestEffort({
+          network,
+          callerId: setupOptions.agentName ?? profile.profileName ?? 'hermes-setup',
+          didStartDaemon: shouldStart,
+        });
+        // fundWalletsBestEffort never throws and never returns funded list;
+        // we report `[]` (parity with OpenClaw — funded addresses are
+        // logged but not surfaced through the orchestrator return value).
+        fundedWallets = [];
+      } catch (err: any) {
+        // Defensive — fundWalletsBestEffort is documented as non-throwing,
+        // but log any future regression as a warning rather than an error.
+        warnings.push(`Faucet orchestrator threw unexpectedly: ${err?.message ?? String(err)}`);
+      }
+    }
+  } else if (dryRun) {
+    console.log('[hermes-setup] [dry-run] Would read wallets and fund via faucet');
+  } else if (req.fund === false) {
+    console.log('[hermes-setup] Skipping wallet funding (--no-fund)');
+  }
+
+  // Step 5: existing Hermes profile setup (writes dkg.json, plugin dir,
+  // managed provider block, skill, setup-state.json). Honors dryRun.
+  try {
+    plan = setupHermesProfile(setupOptions);
+    printPlan('Hermes setup', plan);
+  } catch (err: any) {
+    errors.push(err?.message ?? String(err));
+  }
+
+  // Step 6: daemon registration probe. Decoupled from `--no-start` per
+  // issue #386 brief ("decouple registration from shouldStart" — applies
+  // symmetrically with the same fix that landed for mcp-setup). Even
+  // with `--no-start` the operator presumably has a daemon already
+  // running and wants Hermes registered against it; the probe is
+  // best-effort and fail-quiet via `connectDaemonBestEffort`.
+  if (!dryRun && plan) {
+    await connectDaemonBestEffort(plan, setupOptions.daemonUrl);
+  }
+  let verifyState: HermesSetupState | undefined = plan?.state;
+  if (!dryRun && shouldVerify) {
+    const verifyResult = verifyHermesProfile(setupOptions);
+    printVerify('Hermes verify', verifyResult);
+    verifyState = verifyResult.state ?? verifyState;
+    if (!verifyResult.ok) {
+      errors.push(...verifyResult.errors);
+    }
+    warnings.push(...verifyResult.warnings);
+  }
+
+  // Step 8: compute result shape. `transport` always populated (contract §3).
+  const transport = computeTransportFromState(verifyState ?? plan?.state, profile);
+  const status: HermesSetupResult['status'] = errors.length
+    ? 'error'
+    : warnings.length
+      ? 'degraded'
+      : 'configured';
+
+  return {
+    ok: errors.length === 0,
+    status,
+    profile,
+    daemonStarted,
+    fundedWallets,
+    transport,
+    warnings,
+    errors,
+    state: verifyState ?? plan?.state,
+  };
+}
+
+/**
+ * Backwards-compat wrapper preserving the pre-S2 throw-on-error
+ * contract. Existing callers (CLI `dkg hermes setup` action handler,
+ * setup-entry.mjs lazy export) keep their `await runSetup(opts)` shape
+ * unchanged; on `result.ok === false` we throw so existing tests that
+ * `await expect(runSetup(...)).rejects.toThrow(...)` still pass.
+ */
 export async function runSetup(options: HermesCliOptions = {}): Promise<void> {
-  const setupOptions = toSetupOptions(options);
-  await executeSetup(options, setupOptions);
+  const result = await runHermesSetup(cliOptionsToSetupRequest(options));
+  if (!result.ok) {
+    throw new Error(result.errors.join('\n'));
+  }
 }
 
 async function executeSetup(
@@ -963,4 +1168,191 @@ function escapeRegExp(value: string): string {
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+// ---------------------------------------------------------------------------
+// S2 step 3 — `runHermesSetup` orchestrator helpers (issue #386).
+// ---------------------------------------------------------------------------
+
+/**
+ * Translate a `HermesSetupRequest` (the canonical entrypoint shape) into
+ * the legacy `HermesCliOptions` shape that `toSetupOptions` already knows
+ * how to consume. Mirrors `cliOptionsToSetupRequest` for the CLI bridge.
+ */
+function setupRequestToCliOptions(req: HermesSetupRequest): HermesCliOptions {
+  return {
+    profile: req.profile,
+    hermesHome: req.hermesHome,
+    daemonUrl: req.daemonUrl,
+    bridgeUrl: req.bridgeUrl,
+    gatewayUrl: req.gatewayUrl,
+    bridgeHealthUrl: req.bridgeHealthUrl,
+    port: req.port,
+    memoryMode: req.memoryMode,
+    dryRun: req.dryRun,
+    verify: req.verify,
+    start: req.start,
+    fund: req.fund,
+    preserveProvider: req.preserveProvider,
+    signal: req.signal,
+    invokedBy: req.invokedBy,
+    nodeSkillContent: req.nodeSkillContent,
+  };
+}
+
+/**
+ * Inverse of `setupRequestToCliOptions` — used by the backwards-compat
+ * `runSetup` wrapper to bridge legacy `HermesCliOptions` callers into
+ * the new `HermesSetupRequest` shape `runHermesSetup` consumes.
+ */
+function cliOptionsToSetupRequest(options: HermesCliOptions): HermesSetupRequest {
+  return {
+    profile: options.profile,
+    hermesHome: options.hermesHome,
+    daemonUrl: options.daemonUrl,
+    bridgeUrl: options.bridgeUrl,
+    gatewayUrl: options.gatewayUrl,
+    bridgeHealthUrl: options.bridgeHealthUrl,
+    port: options.port,
+    memoryMode: options.memoryMode,
+    dryRun: options.dryRun,
+    verify: options.verify,
+    start: options.start,
+    fund: options.fund,
+    preserveProvider: options.preserveProvider,
+    signal: options.signal,
+    invokedBy: options.invokedBy,
+    nodeSkillContent: options.nodeSkillContent,
+  };
+}
+
+/**
+ * Bootstrap `~/.dkg/config.json` via `ensureDkgNodeConfig` (S1.4) when
+ * the file is missing. The agent name comes from the resolved profile
+ * (Hermes uses `profileName` as identity, unlike OpenClaw's IDENTITY.md
+ * lookup); the daemon API port comes from the resolved daemon URL.
+ *
+ * Network config loading is deferred to `loadHermesNetworkConfig` —
+ * absent network config means we can't bootstrap and the caller logs a
+ * warning. This matches the OpenClaw "skip when no faucet configured"
+ * shape: bootstrap is best-effort during fresh setup, not a hard requirement.
+ */
+async function bootstrapDkgNodeConfig(
+  profile: HermesProfileMetadata,
+  setupOptions: HermesSetupOptions,
+  warnings: string[],
+): Promise<void> {
+  const network = loadHermesNetworkConfig(warnings);
+  if (!network) return;
+  const apiPort = setupOptions.daemonUrl
+    ? new URL(setupOptions.daemonUrl).port
+      ? Number(new URL(setupOptions.daemonUrl).port)
+      : 9200
+    : 9200;
+  const agentName = profile.profileName ?? 'hermes-default';
+  // Late-bind the import so test suites that mock `dkg-core` don't have to
+  // declare `ensureDkgNodeConfig` in the mock returns up front.
+  const { ensureDkgNodeConfig } = await import('@origintrail-official/dkg-core');
+  ensureDkgNodeConfig({
+    agentName,
+    network,
+    apiPort,
+    existing: {},
+  });
+}
+
+/**
+ * Probe `network/<env>.json` from the bundled CLI package. Mirrors
+ * OpenClaw's `loadNetworkConfig` shape but inlined here per
+ * `helper-reuse-recommendation.md` §43-46 (Hermes-only copy-shape; the
+ * CLI lookup itself uses the shared `resolveCliPackageDir` from S1.1).
+ *
+ * Returns `null` (with a warning) when the network config can't be
+ * located; absent network config is non-fatal — bootstrap and faucet
+ * steps simply skip.
+ */
+function loadHermesNetworkConfig(warnings: string[]): FundWalletsNetworkConfig & {
+  networkName: string;
+  defaultNodeRole: string;
+  defaultContextGraphs?: string[];
+  autoUpdate?: { enabled: boolean };
+} | null {
+  // Defer import — keeps adapter-hermes startup light when the orchestrator
+  // is not invoked, and lets test suites mock `dkg-core` without declaring
+  // `resolveCliPackageDir`.
+  let cliDir: string | null = null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const core = require('@origintrail-official/dkg-core') as typeof import('@origintrail-official/dkg-core');
+    cliDir = core.resolveCliPackageDir();
+  } catch {
+    cliDir = null;
+  }
+  // testnet.json is the default network — operators with a custom env can
+  // pre-write `~/.dkg/config.json` and `runHermesSetup` will skip bootstrap.
+  const candidates: string[] = [];
+  if (cliDir) candidates.push(join(cliDir, 'network', 'testnet.json'));
+  candidates.push(resolve(__dirname, '..', '..', '..', 'network', 'testnet.json'));
+  candidates.push(resolve(__dirname, '..', '..', '..', '..', 'network', 'testnet.json'));
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      try {
+        return JSON.parse(readFileSync(candidate, 'utf-8'));
+      } catch (err: any) {
+        warnings.push(`Could not parse ${candidate}: ${err?.message ?? String(err)}`);
+        return null;
+      }
+    }
+  }
+  warnings.push('Could not locate network/testnet.json (network bootstrap + faucet steps skipped)');
+  return null;
+}
+
+/**
+ * Fire a `console.warn` when both `--port` and `--daemon-url` are passed
+ * and the URL host:port disagrees with `--port`. First-wins on
+ * `daemonUrl` per `setup-entrypoint-contract.md` §2 Open Question 1.
+ * The exact warn string is asserted by H-AC-58 (added in S2 step 6).
+ */
+function warnPortConflict(req: HermesSetupRequest, warnings: string[]): void {
+  if (req.port == null || !req.daemonUrl) return;
+  const portNum = typeof req.port === 'number' ? req.port : Number(req.port);
+  if (!Number.isFinite(portNum)) return;
+  let urlPort: number | null = null;
+  let urlHost = '';
+  try {
+    const u = new URL(req.daemonUrl);
+    urlHost = u.hostname;
+    urlPort = u.port ? Number(u.port) : null;
+  } catch {
+    return;
+  }
+  if (urlPort == null || urlPort === portNum) return;
+  const line = `daemon URL host:port (${urlHost}:${urlPort}) does not match --port (${portNum}); using URL`;
+  console.warn(line);
+  warnings.push(line);
+}
+
+/**
+ * Lift the resolved bridge config from `HermesSetupState` (or the
+ * profile metadata when state is absent) into the canonical
+ * `HermesSetupResult.transport` shape. Falls back to the legacy
+ * `{ kind: 'hermes-openai', gatewayUrl: DEFAULT_HERMES_API_SERVER_URL }`
+ * shape that the daemon route already uses (`local-agents.ts:509-512`)
+ * when nothing is configured.
+ */
+function computeTransportFromState(
+  state: HermesSetupState | undefined,
+  _profile: HermesProfileMetadata,
+): HermesSetupResult['transport'] {
+  const bridge = state?.bridge;
+  if (bridge) {
+    return {
+      kind: bridge.protocol ?? 'hermes-channel',
+      ...(bridge.url ? { bridgeUrl: bridge.url } : {}),
+      ...(bridge.gatewayUrl ? { gatewayUrl: bridge.gatewayUrl } : {}),
+      ...(bridge.healthUrl ? { healthUrl: bridge.healthUrl } : {}),
+    };
+  }
+  return { kind: 'hermes-openai', gatewayUrl: DEFAULT_HERMES_API_SERVER_URL };
 }

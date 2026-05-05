@@ -57,6 +57,123 @@ export interface HermesSetupState {
   installedAt: string;
   updatedAt: string;
   managedFiles: string[];
+  /**
+   * Captured at the first install that replaced a non-DKG memory.provider
+   * in `<hermesHome>/config.yaml`. First-wins: re-runs do NOT overwrite
+   * this snapshot. `restoreHermesProfile` consumes it to put the user
+   * back where they started. Absent when the install never replaced a
+   * provider (fresh profile, or DKG was already selected).
+   *
+   * Defined in S2 with the optional shape so the schema is stable across
+   * S2 → S4. Populated by S4's replace-by-default logic per
+   * `setup-entrypoint-contract.md` §4.
+   */
+  priorMemoryProvider?: {
+    provider: string;
+    configBackupPath: string;
+    capturedAt: string;
+  };
+}
+
+/**
+ * `HermesSetupRequest` — the input shape for `runHermesSetup`. Both the
+ * CLI (`dkg hermes setup`) and the daemon-side UI Connect handler call
+ * the same entrypoint with this shape. See `setup-entrypoint-contract.md`
+ * §2 for the full source-of-truth table mapping each field to its CLI /
+ * UI source.
+ */
+export interface HermesSetupRequest {
+  // Profile selection
+  profile?: string;
+  hermesHome?: string;
+
+  // Daemon target
+  daemonUrl?: string;
+  port?: string | number;
+
+  // Bridge / gateway transport (loopback validation per pr-315-baseline §9)
+  bridgeUrl?: string;
+  gatewayUrl?: string;
+  bridgeHealthUrl?: string;
+
+  // Memory mode
+  memoryMode?: HermesMemoryMode | 'primary';
+
+  // Skill content resolved by caller (CLI passes loadBundledDkgNodeSkill())
+  nodeSkillContent?: string;
+
+  // Parity flags (issue #386 acceptance)
+  start?: boolean;
+  fund?: boolean;
+  preserveProvider?: boolean;
+  dryRun?: boolean;
+  verify?: boolean;
+
+  // UI / host-only knobs
+  signal?: AbortSignal;
+  invokedBy?: 'cli' | 'ui';
+}
+
+/**
+ * `HermesSetupResult` — the output shape `runHermesSetup` returns. The
+ * daemon UI Connect handler maps `status` → `runtime.status` per
+ * `setup-entrypoint-contract.md` §3 table:
+ *   - `'configured'` → `runtime.status: 'ready'`
+ *   - `'degraded'`   → `runtime.status: 'degraded'`
+ *   - `'error'`      → `runtime.status: 'error'`
+ */
+export interface HermesSetupResult {
+  ok: boolean;
+  status: 'configured' | 'degraded' | 'error';
+
+  /** Resolved profile (always populated, even on error). */
+  profile: HermesProfileMetadata;
+
+  /**
+   * `true` ⇒ daemon was started (or confirmed already-running on the
+   * resolved port). `false` when `start: false` was passed or daemon
+   * start was attempted and failed.
+   */
+  daemonStarted: boolean;
+
+  /**
+   * Wallet addresses funded via the testnet faucet on this run. Empty
+   * when `fund: false`, no faucet configured, dryRun, or the faucet
+   * returned no funded wallets (the latter is best-effort, not an error).
+   */
+  fundedWallets: string[];
+
+  /**
+   * Convenience transport descriptor lifted from the resolved bridge
+   * config. Daemon route consumers patch this straight into
+   * `LocalAgentIntegrationRecord` (see `setup-entrypoint-contract.md` §3).
+   */
+  transport: {
+    kind: 'hermes-channel' | 'hermes-openai';
+    bridgeUrl?: string;
+    gatewayUrl?: string;
+    healthUrl?: string;
+  };
+
+  /**
+   * Provider-replacement audit. Present only when this run actually
+   * swapped `memory.provider`. Populated by S4's replace-by-default
+   * implementation; defined here so the result shape is stable.
+   */
+  providerSwap?: {
+    previousProvider: string | null;
+    backupPath: string;
+  };
+
+  warnings: string[];
+  /** Populated only on `ok: false`. */
+  errors: string[];
+
+  /**
+   * Full setup-state.json snapshot for callers (UI persists for
+   * inspection / restore).
+   */
+  state?: HermesSetupState;
 }
 
 export interface HermesChannelHealthResponse {

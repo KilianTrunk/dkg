@@ -1009,7 +1009,13 @@ assert config["allow_context_graph_admin_tools"] is False, config
     delete process.env.DKG_API_TOKEN;
     delete process.env.DKG_AUTH_TOKEN;
     try {
-      await runSetup({ hermesHome, verify: false });
+      // S2.3 (issue #386): `runSetup` now flows through the new
+      // `runHermesSetup` orchestrator which spawns the DKG daemon when
+      // `start !== false` and funds wallets via the faucet when
+      // `fund !== false`. This test exercises the daemon-registration
+      // probe against an already-running daemon, so we pass
+      // `start: false` + `fund: false` to skip both new steps.
+      await runSetup({ hermesHome, verify: false, start: false, fund: false });
     } finally {
       if (oldDkgHome === undefined) delete process.env.DKG_HOME;
       else process.env.DKG_HOME = oldDkgHome;
@@ -1062,7 +1068,11 @@ assert config["allow_context_graph_admin_tools"] is False, config
     resolver.mockClear();
 
     try {
-      await runSetup({ hermesHome, verify: false });
+      // S2.3: pass `start: false` + `fund: false` to skip both new
+      // orchestrator steps; this test exercises the registration-probe
+      // path against an already-running daemon (registration is decoupled
+      // from --no-start per issue #386 brief, so the probe still fires).
+      await runSetup({ hermesHome, verify: false, start: false, fund: false });
     } finally {
       if (oldDkgHome === undefined) delete process.env.DKG_HOME;
       else process.env.DKG_HOME = oldDkgHome;
@@ -1100,6 +1110,11 @@ assert config["allow_context_graph_admin_tools"] is False, config
     await runSetup({
       hermesHome,
       verify: false,
+      // S2.3: skip new orchestrator steps not under test
+      // (test exercises bridge transport persistence, not daemon
+      // spawn or faucet funding).
+      start: false,
+      fund: false,
       gatewayUrl: 'https://hermes.example.com/',
       bridgeHealthUrl: 'https://hermes.example.com/api/hermes-channel/health/',
     });
@@ -1132,6 +1147,11 @@ assert config["allow_context_graph_admin_tools"] is False, config
     await runSetup({
       hermesHome,
       verify: false,
+      // S2.3: skip new orchestrator steps not under test
+      // (this test exercises tools-only memory-mode capabilities, not
+      // daemon spawn or faucet funding).
+      start: false,
+      fund: false,
       memoryMode: 'tools-only',
     });
 
@@ -1145,15 +1165,22 @@ assert config["allow_context_graph_admin_tools"] is False, config
   it('rejects bridge health URLs without a matching transport base', async () => {
     const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
 
+    // S2.3: skip new orchestrator steps not under test on each
+    // invocation. These three cases test bridge-URL validation inside
+    // `setupHermesProfile`, not the daemon-start or faucet flows.
     await expect(runSetup({
       hermesHome,
       verify: false,
+      start: false,
+      fund: false,
       bridgeHealthUrl: 'https://hermes.example.com/health',
     })).rejects.toThrow('requires --bridge-url or --gateway-url');
 
     await expect(runSetup({
       hermesHome,
       verify: false,
+      start: false,
+      fund: false,
       gatewayUrl: 'https://hermes.example.com',
       bridgeHealthUrl: 'https://other-hermes.example.com/api/hermes-channel/health',
     })).rejects.toThrow('must belong to the configured');
@@ -1162,6 +1189,7 @@ assert config["allow_context_graph_admin_tools"] is False, config
       hermesHome,
       verify: false,
       start: false,
+      fund: false,
       gatewayUrl: 'https://hermes.example.com',
       bridgeHealthUrl: 'https://hermes.example.com/health',
     })).resolves.toBeUndefined();

@@ -17,6 +17,7 @@ export {
   resolveHermesProfile,
   runDisconnect,
   runDoctor,
+  runHermesSetup,
   runReconnect,
   runSetup,
   runStatus,
@@ -41,6 +42,8 @@ export type {
   HermesLocalAgentIntegrationPayload,
   HermesProfileMetadata,
   HermesPublishGuardPolicy,
+  HermesSetupRequest,
+  HermesSetupResult,
   HermesSetupState,
 } from './types.js';
 export type { HermesDkgClientOptions } from './dkg-client.js';

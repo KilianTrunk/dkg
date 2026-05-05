@@ -756,7 +756,10 @@ describe('DkgNodePlugin', () => {
   // ---------------------------------------------------------------------------
 
   describe('handler-level drift guards: snake_case args → camelCase daemon body', () => {
-    const setupPluginWithFetch = (response: unknown = {}) => {
+    const setupPluginWithFetch = (
+      response: unknown = {},
+      opts: { skipNodeIdInjection?: boolean } = {},
+    ) => {
       const fetchMock = vi.fn(async () =>
         new Response(JSON.stringify(response), {
           status: 200,
@@ -774,6 +777,13 @@ describe('DkgNodePlugin', () => {
         on: () => {},
         logger: {},
       });
+      // Most handler tests assume the node identity has resolved (e.g. dkg_share
+      // builds canned-quad subjects from it). Inject a placeholder address so
+      // tests don't have to mock the daemon /api/status probe end-to-end. Pass
+      // `skipNodeIdInjection: true` to exercise the unresolved-identity branch.
+      if (!opts.skipNodeIdInjection) {
+        (plugin as any).nodePeerId = '12D3KooTestPeerId';
+      }
       const byName = new Map(tools.map((t) => [t.name, t] as const));
       return { fetchMock, plugin, byName };
     };
@@ -1384,6 +1394,24 @@ describe('DkgNodePlugin', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
+    it('dkg_share errors when node identity is unresolved (no agent address, no peer ID)', async () => {
+      // Without an injected nodePeerId, ensureNodeAgentAddress/ensureNodePeerId
+      // both no-op (no memoryResolverApi to probe against), and both
+      // nodeAgentAddress and nodePeerId stay undefined. The handler should
+      // refuse to share rather than fall back to a placeholder identifier
+      // and pollute SWM with `urn:openclaw:unknown:...` subjects.
+      const { fetchMock, byName } = setupPluginWithFetch(
+        { shareOperationId: 'op-noid' },
+        { skipNodeIdInjection: true },
+      );
+      const result = await byName.get('dkg_share')!.execute('tc', {
+        content: 'hello',
+        context_graph_id: 'ctx',
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain('node agent address and peer ID');
+    });
+
     it('dkg_share UCHAR-encodes non-ECHAR control bytes (NUL, VT, DEL) the canonical escaper leaves raw', async () => {
       const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-uchar' });
       // escapeDkgRdfLiteral covers \b, \t, \n, \f, \r — but leaves NUL (0x00),
@@ -1423,6 +1451,9 @@ describe('DkgNodePlugin', () => {
         on: () => {},
         logger: {},
       });
+      // Mirror setupPluginWithFetch's identity injection so the handler
+      // gets past the unresolved-identity guard and reaches the fetch.
+      (plugin as any).nodePeerId = '12D3KooTestPeerId';
       const byName = new Map(tools.map((t) => [t.name, t] as const));
       const result = await byName.get('dkg_share')!.execute('tc', {
         content: 'hello',

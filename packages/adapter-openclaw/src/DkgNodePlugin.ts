@@ -4294,8 +4294,19 @@ export class DkgNodePlugin {
         ? undefined
         : (rawSub.trim() || undefined);
 
-      await this.ensureNodeAgentAddress();
-      const addr = this.resolveDefaultAgentAddress() ?? 'unknown';
+      // Probe both the agent ETH address and the libp2p peer ID before
+      // resolving — at startup either probe may not have fired yet, and a
+      // bare `?? 'unknown'` fallback would pollute SWM with shares under
+      // `urn:openclaw:unknown:...` for every node still booting. If neither
+      // identifier resolves, surface the error instead of writing garbage.
+      await Promise.all([this.ensureNodeAgentAddress(), this.ensureNodePeerId()]);
+      const addr = this.resolveDefaultAgentAddress();
+      if (!addr) {
+        return this.error(
+          'Cannot share: node agent address and peer ID are both unresolved. ' +
+          'The daemon may still be starting up — retry once node identity is available.',
+        );
+      }
       // Mint a unique root entity per share so the publisher's
       // delete-then-insert upsert (dkg-publisher.ts:422-429) doesn't
       // replace prior shares from the same agent.

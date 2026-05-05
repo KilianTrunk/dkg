@@ -185,6 +185,12 @@ before promoting it to SWM (team) or through to VM (chain-anchored).
 
 SWM is for knowledge you've promoted from WM and want peers to see. Data arrives here via `POST /api/assertion/{name}/promote` (from WM) or via direct SWM writes (escape hatch for team-visible data that doesn't need a WM staging step).
 
+> **Visibility.** SWM gossips to peers in the context graph's allowlist.
+> For a **curated** CG (the default — see §6), only listed agents/peers
+> receive the gossip. For an **explicitly public** CG (`public: true` at
+> creation), every peer subscribed to the CG receives the gossip.
+> Working Memory is per-agent regardless of CG visibility.
+
 - `POST /api/shared-memory/write` — write triples directly to SWM (gossip-replicated). Body: `{ contextGraphId, quads, subGraphName? }`. Use the WM → promote path for most workflows; direct SWM writes are for bulk team data that skips the private draft stage.
 - `POST /api/shared-memory/conditional-write` — compare-and-swap write. Body: `{ contextGraphId, quads, conditions: [...], subGraphName? }`. Each condition is `{ subject: IRI, predicate: IRI, expectedValue: string | null }`; `null` means "must not exist", a string must match the current object after N-Triples serialization. Any mismatch throws `StaleWriteError` and leaves SWM unchanged. `conditions` must be non-empty — use `/api/shared-memory/write` for unconditional writes.
 - `POST /api/shared-memory/publish` — promote SWM triples to Verified Memory (costs TRAC)
@@ -255,6 +261,19 @@ The `<recalled-memory>` block is stripped from outgoing assistant text before tu
 
 Context Graphs are scoped knowledge domains with configurable access and governance. In the node UI, context graphs are called **projects** — when a user says "my project" or selects a project in the right-panel dropdown, they mean a context graph.
 
+> **Default privacy model.** Context graphs created via the
+> `dkg_context_graph_create` tool are **curated/private by default** —
+> only agents in the allowlist can read SWM gossip or subscribe to
+> the CG. The creator is auto-included in the allowlist on creation,
+> so they can immediately read and write without an explicit
+> self-invite. Pass `public: true` to create an open/discoverable
+> context graph instead. Pass `allowed_agents: ["0x..."]` to invite
+> collaborators atomically with creation, or use
+> `dkg_participant_add` to invite them later. Working Memory is
+> per-agent regardless of CG visibility. Verified Memory anchors
+> are public on-chain — but the underlying private quads stay local
+> on the publishing node and are gated to allowed peers.
+
 ### Routing: Turn Context Override
 
 When the chat turn includes injected context with `target_context_graph`, treat that value as BOTH:
@@ -315,8 +334,16 @@ Implications:
   - **Mock chain adapter** (`chainId` starts with `mock`): the create-time auto-register path is deliberately skipped to avoid polluting test runs. The CG stays local on create; explicit `register: true` or `/api/context-graph/register` may succeed depending on what the mock implements.
   - **Real chain adapter WITH on-chain identity**: `createContextGraph()` auto-registers on-chain as a best-effort side-effect. Failures are logged as warnings (not surfaced on the create response) and the CG remains local. Passing `register: true` in this regime usually duplicates the auto-register work and returns `200` with `registered: false` + `registerError` + `hint` because the CG is already registered — looks like a failure but isn't one. Use `register: true` here only as an explicit retry hook when the auto-register path failed.
   - **Real chain adapter WITHOUT on-chain identity**: no auto-register on create; CG stays local until `/api/context-graph/register` or `register: true` promotes it.
-  - **Simple CG** (default): pass `{ id, name }`. Creator alone publishes to VM. Add `accessPolicy: 1` + `allowedAgents` for a curated CG.
+  - **Curated CG** (default for the `dkg_context_graph_create` tool): the tool sends `accessPolicy: 1` automatically. The creator is auto-included in `DKG_ALLOWED_AGENT` so they can immediately read/write. Add collaborators with `dkg_participant_add` (or pass `allowed_agents: ["0x..."]` at creation to do it atomically).
+  - **Public CG**: pass `public: true` on the tool (or `accessPolicy: 0` / omit on the raw HTTP route). Anyone can subscribe and read SWM gossip.
   - **Multi-sig CG**: pass `participantIdentityIds: [...]` + `requiredSignatures: M`. Use `register: true` so the participant set and threshold are anchored on-chain. `requiredSignatures` is optional when `private: true`.
+
+  > **Direct HTTP vs tool.** When you call the `dkg_context_graph_create`
+  > tool, it defaults to curated/private (sends `accessPolicy: 1`). When
+  > you call `POST /api/context-graph/create` directly without
+  > `accessPolicy`, the daemon resolves to public/discoverable. The tool
+  > is the recommended surface for agent workflows; raw HTTP is for
+  > programmatic clients that want explicit control.
 - `POST /api/context-graph/register` — register a previously-created local CG on-chain (two-phase creation). Body: `{ id, accessPolicy? }`. Use this to promote a free CG to an on-chain identity before publishing to Verified Memory. `revealOnChain` is deprecated and ignored on the V10 ContextGraphs path.
 - `POST /api/context-graph/rename` — rename a CG (human-readable name only; the ID is immutable). Body: `{ contextGraphId, name }`.
 - `POST /api/context-graph/subscribe` — subscribe to a context graph
@@ -438,6 +465,21 @@ Use the job queue for bulk or long-running publishes, publishes that must surviv
 3. Write triples to Working Memory (`POST /api/assertion/{name}/write`)
 4. When ready to share with peers: promote to SWM (`POST /api/assertion/{name}/promote`)
 5. When ready to publish permanently: publish to VM (`POST /api/shared-memory/publish`)
+
+**Private project for me alone (the default):**
+
+1. `dkg_context_graph_create({ name: "My Notes" })` — curated by default; creator is the only allowed agent.
+2. Write WM and promote to SWM — gossip is gated to the creator's allowlist (just yourself).
+
+**Shared project with a teammate:**
+
+1. `dkg_context_graph_create({ name: "Team X", allowed_agents: ["0xAlice"] })` — curated CG with Alice (and the creator) on the allowlist atomically with creation.
+2. Or, if Alice's address comes later: `dkg_context_graph_create({ name: "Team X" })` followed by `dkg_participant_add({ context_graph_id: "team-x", agent_address: "0xAlice" })`.
+3. Write and promote — SWM gossip is delivered only to the listed peers.
+
+**Open/discoverable project:**
+
+1. `dkg_context_graph_create({ name: "Public Research", public: true })` — explicitly opts out of curation; anyone subscribed receives SWM gossip.
 
 **Import a file into a project:**
 

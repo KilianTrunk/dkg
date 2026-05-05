@@ -459,6 +459,90 @@ describe('dkg_context_graph_create tool', () => {
 
     expect(parsed.error).toContain('daemon is not reachable');
   });
+
+  it('defaults to curated/private (accessPolicy: 1) when public is not specified', async () => {
+    // Privacy-by-default: omitting `public` produces a curated CG.
+    // The agent's createContextGraph flow auto-includes the creator
+    // in DKG_ALLOWED_AGENT (see packages/agent/src/dkg-agent.ts:3962),
+    // so the creator can immediately read/write without a self-invite.
+    ft.addResponses(
+      new Response(JSON.stringify({ created: 'private', uri: 'did:dkg:context-graph:private' }), { status: 200 }),
+    );
+
+    const tool = findTool('dkg_context_graph_create');
+    await tool.execute('call-default-private', { id: 'private', name: 'Private CG' });
+
+    const body = JSON.parse(ft.calls[0][1]?.body as string);
+    expect(body.accessPolicy).toBe(1);
+    expect(body.allowedAgents).toBeUndefined();
+  });
+
+  it('creates an open/discoverable CG when public:true is passed', async () => {
+    ft.addResponses(
+      new Response(JSON.stringify({ created: 'open', uri: 'did:dkg:context-graph:open' }), { status: 200 }),
+    );
+
+    const tool = findTool('dkg_context_graph_create');
+    await tool.execute('call-public', { id: 'open', name: 'Open CG', public: true });
+
+    const body = JSON.parse(ft.calls[0][1]?.body as string);
+    // public:true → no accessPolicy sent → daemon's "open" default takes over.
+    expect(body.accessPolicy).toBeUndefined();
+    expect(body.allowedAgents).toBeUndefined();
+  });
+
+  it('passes allowed_agents to the daemon when provided alongside curated default', async () => {
+    ft.addResponses(
+      new Response(JSON.stringify({ created: 'team', uri: 'did:dkg:context-graph:team' }), { status: 200 }),
+    );
+
+    const tool = findTool('dkg_context_graph_create');
+    await tool.execute('call-allowed', {
+      id: 'team',
+      name: 'Team CG',
+      allowed_agents: ['0xAlice', '0xBob'],
+    });
+
+    const body = JSON.parse(ft.calls[0][1]?.body as string);
+    expect(body.accessPolicy).toBe(1);
+    expect(body.allowedAgents).toEqual(['0xAlice', '0xBob']);
+  });
+
+  it('ignores allowed_agents when public:true is passed', async () => {
+    // Curation parameters are meaningless on a public CG; the handler
+    // drops them rather than sending a contradictory mix to the daemon.
+    ft.addResponses(
+      new Response(JSON.stringify({ created: 'open-2', uri: 'did:dkg:context-graph:open-2' }), { status: 200 }),
+    );
+
+    const tool = findTool('dkg_context_graph_create');
+    await tool.execute('call-public-with-allowed', {
+      id: 'open-2',
+      name: 'Open',
+      public: true,
+      allowed_agents: ['0xAlice'],
+    });
+
+    const body = JSON.parse(ft.calls[0][1]?.body as string);
+    expect(body.accessPolicy).toBeUndefined();
+    expect(body.allowedAgents).toBeUndefined();
+  });
+
+  it('trims and filters allowed_agents entries', async () => {
+    ft.addResponses(
+      new Response(JSON.stringify({ created: 'trimmed', uri: 'did:dkg:context-graph:trimmed' }), { status: 200 }),
+    );
+
+    const tool = findTool('dkg_context_graph_create');
+    await tool.execute('call-trim', {
+      id: 'trimmed',
+      name: 'Trim',
+      allowed_agents: ['  0xAlice  ', '', '   ', '0xBob', 42 as unknown as string],
+    });
+
+    const body = JSON.parse(ft.calls[0][1]?.body as string);
+    expect(body.allowedAgents).toEqual(['0xAlice', '0xBob']);
+  });
 });
 
 describe('dkg_subscribe tool', () => {

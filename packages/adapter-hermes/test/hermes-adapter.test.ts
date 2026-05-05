@@ -1544,6 +1544,9 @@ assert "sub_graph_name" not in query_schema["parameters"]["properties"], query_s
 share_schema = next(schema for schema in provider.get_tool_schemas() if schema["name"] == "dkg_share")
 assert "context_graph_id" in share_schema["parameters"]["properties"], share_schema
 assert "context_graph" not in share_schema["parameters"]["properties"], share_schema
+# sub_graph_name is in the schema so MCP clients can pass it portably
+# (#413 — _handle_share already forwards it; the schema exposure was missing).
+assert "sub_graph_name" in share_schema["parameters"]["properties"], share_schema
 # context_graph_id is required on Hermes too, matching OpenClaw's contract
 # (#413 unification — no implicit current-project fallback).
 assert share_schema["parameters"]["required"] == ["content", "context_graph_id"], share_schema

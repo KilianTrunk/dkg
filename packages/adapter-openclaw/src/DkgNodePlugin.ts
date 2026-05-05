@@ -4264,9 +4264,13 @@ export class DkgNodePlugin {
 
   private async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
-      const content = String(args.content ?? '').trim();
+      // Use the raw content for serialization so leading/trailing whitespace
+      // and terminal newlines are preserved verbatim — agents sharing code
+      // snippets or exact transcripts depend on this. Validate against the
+      // trimmed form so a whitespace-only payload still rejects as "empty".
+      const content = String(args.content ?? '');
       const contextGraphId = String(args.context_graph_id ?? '').trim();
-      if (!content) return this.error('"content" is required.');
+      if (!content.trim()) return this.error('"content" is required.');
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       const rawSub = args.sub_graph_name;
       const subGraphName = rawSub === undefined || rawSub === null

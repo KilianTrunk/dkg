@@ -1339,6 +1339,27 @@ describe('DkgNodePlugin', () => {
       expect(body.quads[0].object).toBe('"a\\nb\\rc\\td\\fe\\bf \\"q\\" \\\\ end"');
     });
 
+    it('dkg_share preserves leading/trailing whitespace in content (no silent trim)', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-ws' });
+      // Agents sharing code snippets or exact transcripts must get byte-for-byte
+      // round-tripping. Trimming for serialization would silently drop terminal
+      // newlines and indentation. Validation still rejects whitespace-only.
+      await byName.get('dkg_share')!.execute('tc', {
+        content: '  function f() {\n  return 1;\n}\n',
+        context_graph_id: 'ctx',
+      });
+      const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+      // Quoted, with the leading two spaces, embedded newlines, and trailing newline preserved.
+      expect(body.quads[0].object).toBe('"  function f() {\\n  return 1;\\n}\\n"');
+
+      const blank = await byName.get('dkg_share')!.execute('tc', {
+        content: '   \n   ',
+        context_graph_id: 'ctx',
+      });
+      expect(blank.content[0].text).toContain('content');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
     it('dkg_share UCHAR-encodes non-ECHAR control bytes (NUL, VT, DEL) the canonical escaper leaves raw', async () => {
       const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-uchar' });
       // escapeDkgRdfLiteral covers \b, \t, \n, \f, \r — but leaves NUL (0x00),

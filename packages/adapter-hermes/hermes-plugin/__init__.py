@@ -266,6 +266,10 @@ DKG_SHARE_SCHEMA = {
                 "type": "string",
                 "description": "Target Context Graph ID.",
             },
+            "sub_graph_name": {
+                "type": "string",
+                "description": "Optional sub-graph scope.",
+            },
         },
         "required": ["content", "context_graph_id"],
     },

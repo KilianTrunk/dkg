@@ -4297,10 +4297,23 @@ export class DkgNodePlugin {
       // Probe both the agent ETH address and the libp2p peer ID before
       // resolving — at startup either probe may not have fired yet, and a
       // bare `?? 'unknown'` fallback would pollute SWM with shares under
-      // `urn:openclaw:unknown:...` for every node still booting. If neither
-      // identifier resolves, surface the error instead of writing garbage.
+      // `urn:openclaw:unknown:...` for every node still booting.
       await Promise.all([this.ensureNodeAgentAddress(), this.ensureNodePeerId()]);
-      const addr = this.resolveDefaultAgentAddress();
+      let addr = this.resolveDefaultAgentAddress();
+      // The gated probes above no-op when the memory resolver API is not
+      // attached (e.g. `memory.enabled: false`). dkg_share writes directly
+      // to /api/shared-memory/write and shouldn't go dark just because the
+      // memory module is off. Fall back to a direct daemon probe — the
+      // /api/agent/identity endpoint returns both agentAddress and peerId
+      // and is available regardless of the memory module's state.
+      if (!addr) {
+        const probe = await this.client.getAgentIdentity().catch(() => null);
+        if (probe?.ok && probe.identity) {
+          if (probe.identity.agentAddress) this.nodeAgentAddress = probe.identity.agentAddress;
+          if (probe.identity.peerId) this.nodePeerId = probe.identity.peerId;
+          addr = this.resolveDefaultAgentAddress();
+        }
+      }
       if (!addr) {
         return this.error(
           'Cannot share: node agent address and peer ID are both unresolved. ' +

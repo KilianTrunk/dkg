@@ -1409,12 +1409,57 @@ describe('DkgNodePlugin', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
+    it('dkg_share falls back to direct /api/agent/identity probe when the memory resolver is disabled', async () => {
+      // With `memory.enabled: false` the memory resolver API never registers,
+      // so ensureNodeAgentAddress/ensureNodePeerId both no-op (memoryResolverApi
+      // stays null). dkg_share writes to /api/shared-memory/write directly and
+      // must not go dark in that config — fall through to a direct daemon
+      // /api/agent/identity probe.
+      const fetchMock = vi.fn(async (url: string) => {
+        if (url === 'http://localhost:9200/api/agent/identity') {
+          return new Response(JSON.stringify({
+            agentAddress: '0xprobed',
+            peerId: '12D3KooProbed',
+            agentDid: 'did:dkg:agent:probed',
+            name: 'probed',
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({ shareOperationId: 'op-mem-off' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      });
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+      const plugin = new DkgNodePlugin({ daemonUrl: 'http://localhost:9200' });
+      const tools: OpenClawTool[] = [];
+      plugin.register({
+        config: {},
+        registerTool: (t) => tools.push(t),
+        registerHook: () => {},
+        on: () => {},
+        logger: {},
+      });
+      // Deliberately do NOT inject nodePeerId — memory module disabled scenario.
+      const byName = new Map(tools.map((t) => [t.name, t] as const));
+      const result = await byName.get('dkg_share')!.execute('tc', {
+        content: 'works without memory module',
+        context_graph_id: 'ctx',
+      });
+      const body = JSON.parse(result.content[0].text);
+      expect(body.shareOperationId).toBe('op-mem-off');
+      // Subject should incorporate the address surfaced by the direct probe.
+      expect(body.subject).toMatch(/^urn:openclaw:0xprobed:shared:\d+-[a-z0-9]+$/);
+      const identityCalls = fetchMock.mock.calls.filter(c => c[0] === 'http://localhost:9200/api/agent/identity');
+      expect(identityCalls.length).toBe(1);
+    });
+
     it('dkg_share errors when node identity is unresolved (no agent address, no peer ID)', async () => {
       // Without an injected nodePeerId, ensureNodeAgentAddress/ensureNodePeerId
-      // both no-op (no memoryResolverApi to probe against), and both
-      // nodeAgentAddress and nodePeerId stay undefined. The handler should
-      // refuse to share rather than fall back to a placeholder identifier
-      // and pollute SWM with `urn:openclaw:unknown:...` subjects.
+      // both no-op (no memoryResolverApi). The handler still tries the direct
+      // /api/agent/identity probe — but in this test the default fetch mock
+      // returns a payload without `agentAddress` or `peerId`, so the fallback
+      // probe doesn't yield a usable identifier either. Handler should refuse
+      // to share rather than fall back to a placeholder identifier and pollute
+      // SWM with `urn:openclaw:unknown:...` subjects.
       const { fetchMock, byName } = setupPluginWithFetch(
         { shareOperationId: 'op-noid' },
         { skipNodeIdInjection: true },
@@ -1423,7 +1468,10 @@ describe('DkgNodePlugin', () => {
         content: 'hello',
         context_graph_id: 'ctx',
       });
-      expect(fetchMock).not.toHaveBeenCalled();
+      // The fallback probe to /api/agent/identity is allowed; what must NOT
+      // happen is the actual share write (POST to /api/shared-memory/write).
+      const shareCalls = fetchMock.mock.calls.filter(c => String(c[0]).includes('/api/shared-memory/write'));
+      expect(shareCalls.length).toBe(0);
       expect(result.content[0].text).toContain('node agent address and peer ID');
     });
 

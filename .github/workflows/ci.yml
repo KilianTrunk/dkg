@@ -60,17 +60,16 @@ jobs:
   #    output — see the `Build all Node packages` step below for the
   #    full analysis.
   #
-  # 2. `build:packages` is TSC-ONLY for every remaining package. The Vite UI
-  #    bundle (`@dkg-node-ui`) was split out into a separate `build:ui`
-  #    task (see `turbo.json` and the `build` / `build:ui` / `build:full`
-  #    scripts in that package). No test in CI reads `dist-ui/` at
-  #    runtime — API tests never hit the static dashboard routes, the
-  #    daemon gracefully 404s when the dir is absent, and the node-ui
-  #    vitest suite fabricates its own temp staticDir.
+  # 2. `build:packages` runs the existing package build graph while skipping
+  #    the Node UI `dist-ui/` bundle. Some packages still use Vite for their
+  #    own package output, but no test in CI reads the Node UI static bundle
+  #    at runtime — API tests never hit the static dashboard routes, the
+  #    daemon gracefully 404s when the dir is absent, and the node-ui vitest
+  #    suite fabricates its own temp staticDir.
   #
   # The default repo-root `pnpm build` remains the full developer/release
   # build and includes the Node UI Vite bundle. CI uses `build:packages`
-  # here to keep this shared test artifact on the fast package-only path.
+  # here to keep this shared test artifact on the Node-UI-bundle-free path.
   #
   # Turbo remote cache is opt-in: if TURBO_TOKEN / TURBO_TEAM secrets
   # are set the build step will pull previously-cached outputs; with no

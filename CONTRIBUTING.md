@@ -47,7 +47,8 @@ This is a pnpm + Turborepo monorepo. Key commands:
 
 ```bash
 pnpm build                          # Build all packages and the Node UI bundle
-pnpm run build:packages             # Build package outputs only
+pnpm run build:packages             # Build workspace package outputs only; skips the Node UI bundle
+pnpm run build -- --filter <pkg>    # Pass Turbo args through without the full Node UI bundle
 pnpm test                           # Test all packages
 pnpm --filter @origintrail-official/dkg-core test   # Test a specific package
 ```

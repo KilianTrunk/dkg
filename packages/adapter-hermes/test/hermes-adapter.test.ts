@@ -2897,6 +2897,36 @@ assert client.calls[4]["sub_graph_name"] == "protocols", client.calls[4]
 share_schema = next(s for s in provider.get_tool_schemas() if s["name"] == "dkg_share")
 assert share_schema["parameters"]["required"] == ["content", "context_graph_id"], share_schema
 assert "sub_graph_name" in share_schema["parameters"]["properties"], share_schema
+
+# Round 1 — type validation at the runtime boundary. Malformed MCP payloads
+# must surface a structured tool_error rather than crashing inside
+# _quote_literal with AttributeError on .replace.
+client.calls.clear()
+err_obj = json.loads(provider.handle_tool_call("dkg_share", {"content": {}, "context_graph_id": "cg:test"}))
+assert "error" in err_obj and "must be a string" in err_obj["error"], err_obj
+err_bool = json.loads(provider.handle_tool_call("dkg_share", {"content": False, "context_graph_id": "cg:test"}))
+# False also trips the "Content is required" check before the type check;
+# either is acceptable as long as it's a structured error and no daemon call fired.
+assert "error" in err_bool, err_bool
+err_cg = json.loads(provider.handle_tool_call("dkg_share", {"content": "hello", "context_graph_id": ["cg:test"]}))
+assert "error" in err_cg and ("context_graph_id" in err_cg["error"]), err_cg
+err_sub = json.loads(provider.handle_tool_call("dkg_share", {"content": "hello", "context_graph_id": "cg:test", "sub_graph_name": 42}))
+assert "error" in err_sub and "sub_graph_name" in err_sub["error"], err_sub
+assert client.calls == [], client.calls
+
+# Round 2 — daemon failures must pass through untouched. The Python client
+# returns {success: False, error: ...} on errors (it doesn't throw), so a
+# write that 4xx'd at the daemon would otherwise have synthetic subject /
+# root_entities attached, masking the failure for chained publish calls.
+class FailingClient:
+    def share(self, *args, **kwargs):
+        return {"success": False, "error": "context graph not registered"}
+provider._client = FailingClient()
+fail_result = json.loads(provider.handle_tool_call("dkg_share", {"content": "x", "context_graph_id": "cg:test"}))
+assert fail_result.get("success") is False, fail_result
+assert "subject" not in fail_result, fail_result
+assert "root_entities" not in fail_result, fail_result
+provider._client = client
 `;
     const result = spawnSync('python', ['-B', '-c', script], {
       cwd: process.cwd(),

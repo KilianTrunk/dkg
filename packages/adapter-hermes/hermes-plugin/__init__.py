@@ -1376,11 +1376,22 @@ class DKGMemoryProvider(MemoryProvider):
     def _handle_share(self, args: Dict[str, Any]) -> str:
         if self._offline:
             return tool_error("DKG daemon is offline. Cannot share to team.")
-        content = args.get("content", "")
-        if not content:
+        # Type-validate at the runtime boundary. Without this, a malformed MCP
+        # call passing `content: {}` or `False` would crash inside _quote_literal
+        # with AttributeError on .replace, instead of returning a structured
+        # tool_error. Mirrors the OpenClaw boundary checks (PR #413 round 7).
+        if "content" not in args or args["content"] is None or args["content"] == "":
             return tool_error("Content is required.")
+        if not isinstance(args["content"], str):
+            return tool_error('"content" must be a string.')
         if "context_graph" in args:
             return tool_error('"context_graph" is not a supported parameter on dkg_share. Use "context_graph_id".')
+        if "context_graph_id" in args and args["context_graph_id"] is not None and not isinstance(args["context_graph_id"], str):
+            return tool_error('"context_graph_id" must be a string.')
+        sub_graph_name_raw = args.get("sub_graph_name")
+        if sub_graph_name_raw is not None and not isinstance(sub_graph_name_raw, str):
+            return tool_error('"sub_graph_name" must be a string.')
+        content = args["content"]
         # Aligned with OpenClaw: context_graph_id is required (no implicit
         # current-project fallback). Keeps both adapter contracts identical
         # so portable agent code works unchanged across either surface.
@@ -1403,6 +1414,14 @@ class DKGMemoryProvider(MemoryProvider):
             "object": _quote_literal(content),
         }]
         result = self._client.share(cg, quads, sub_graph_name=_first_text(args, "sub_graph_name"))
+        # Only surface the minted subject on a successful write. Hermes'
+        # Python client returns `{success: False, error: ...}` on failures
+        # (it doesn't throw). Attaching subject/root_entities to those
+        # would mask the failure and let chained dkg_shared_memory_publish
+        # calls publish a root entity that was never written. Pass the
+        # raw failure result through untouched.
+        if isinstance(result, dict) and result.get("success") is False:
+            return json.dumps(result)
         # Surface the minted subject so callers can target THIS share in a
         # follow-up `dkg_shared_memory_publish({ root_entities: [...] })`.
         # Field name is snake_case to match the consuming tool's argument

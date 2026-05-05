@@ -11,6 +11,7 @@ interface MemoryRecord {
   rootEntity: string;
   marker: string;
   quads: Quad[];
+  workspaceOperationId?: string;
   shareOperationId?: string;
   kcId?: string;
 }
@@ -30,6 +31,7 @@ export class LayeredDkgBenchmarkClient implements BenchmarkClient {
   readonly publisherJobs = new Map<string, PublisherJob>();
 
   private shareSequence = 0;
+  private workspaceSequence = 0;
   private kcSequence = 0;
   private jobSequence = 0;
 
@@ -46,13 +48,34 @@ export class LayeredDkgBenchmarkClient implements BenchmarkClient {
   }
 
   async sharedMemoryWrite(contextGraphId: string, quads: Quad[]) {
-    const shareOperationId = `share-${++this.shareSequence}`;
+    const working = await this.writeWorkingMemory(contextGraphId, quads);
+    const shared = await this.liftWorkingMemoryToSharedMemory(contextGraphId, uniqueSubjects(quads));
+    return {
+      workspaceOperationId: working.workspaceOperationId,
+      shareOperationId: shared.shareOperationId,
+    };
+  }
+
+  async writeWorkingMemory(contextGraphId: string, quads: Quad[]) {
+    const workspaceOperationId = `workspace-${++this.workspaceSequence}`;
     for (const rootEntity of uniqueSubjects(quads)) {
-      const record = createMemoryRecord(contextGraphId, rootEntity, quads, shareOperationId);
+      const record = createMemoryRecord(contextGraphId, rootEntity, quads, { workspaceOperationId });
       this.workingMemory.set(rootEntity, record);
-      this.sharedWorkingMemory.set(rootEntity, { ...record });
     }
-    return { workspaceOperationId: shareOperationId, shareOperationId };
+    return { workspaceOperationId };
+  }
+
+  async liftWorkingMemoryToSharedMemory(contextGraphId: string, rootEntities: string[]) {
+    const shareOperationId = `share-${++this.shareSequence}`;
+    for (const rootEntity of rootEntities) {
+      const record = this.workingMemory.get(rootEntity);
+      if (!record) throw new Error(`Root ${rootEntity} is missing from working memory`);
+      if (record.contextGraphId !== contextGraphId) {
+        throw new Error(`Root ${rootEntity} belongs to ${record.contextGraphId}, not ${contextGraphId}`);
+      }
+      this.sharedWorkingMemory.set(rootEntity, { ...record, shareOperationId });
+    }
+    return { shareOperationId };
   }
 
   async publishFromSharedMemory(
@@ -147,7 +170,7 @@ function createMemoryRecord(
   contextGraphId: string,
   rootEntity: string,
   quads: Quad[],
-  shareOperationId: string,
+  ids: Pick<MemoryRecord, 'workspaceOperationId' | 'shareOperationId'>,
 ): MemoryRecord {
   const rootQuads = quads.filter((quad) => quad.subject === rootEntity);
   return {
@@ -155,7 +178,7 @@ function createMemoryRecord(
     rootEntity,
     marker: markerFromQuads(rootQuads),
     quads: rootQuads,
-    shareOperationId,
+    ...ids,
   };
 }
 

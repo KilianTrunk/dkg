@@ -14,7 +14,7 @@
     "test:watch": "vitest --config vitest.config.ts",
     "test:coverage": "turbo test:coverage",
     "bench": "esbench --config esbench.config.mjs",
-    "bench:html": "ESBENCH_HTML=1 esbench --config esbench.config.mjs",
+    "bench:html": "ESBENCH_HTML=1 ESBENCH_PUBLISH_ASYNC_GET_HTML=1 esbench --config esbench.config.mjs",
     "bench:baseline": "ESBENCH_RESULT=bench/results/baseline.json ESBENCH_HTML=1 ESBENCH_HTML_FILE=bench/results/baseline.html esbench --config esbench.config.mjs",
     "bench:compare": "ESBENCH_DIFF=bench/results/baseline.json ESBENCH_RESULT=bench/results/compare.json ESBENCH_HTML=1 ESBENCH_HTML_FILE=bench/results/compare.html esbench --config esbench.config.mjs",
     "lint": "turbo lint",

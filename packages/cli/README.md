@@ -155,6 +155,11 @@ count, success count, failure count, min, max, mean, median/p50, and p95. Failur
 records include operation, iteration, error message, root entity, marker, context
 graph, and a reproduction command. Warmups are excluded from summaries.
 
+The repository-level ESBench workflow for this same benchmark feature is
+documented in `BENCHMARKING.md`. `pnpm bench:html` writes the combined ESBench
+report plus focused HTML pages for get/read retrieval, synchronous publish,
+asynchronous publish, working-memory upload, and working-to-shared-memory lift.
+
 ## Extending the Node
 
 The V9 "installable apps" framework (iframe-hosted third-party UIs loaded from

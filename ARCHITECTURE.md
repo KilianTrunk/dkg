@@ -8,7 +8,10 @@ The local publish/async/get benchmark lives inside the CLI package. It is a
 developer/operator workflow, not a daemon subsystem: the benchmark runner connects
 to an already running DKG daemon, writes unique benchmark payloads to shared
 memory, exercises synchronous and asynchronous publish paths, queries the
-published marker, and reports timings plus failures.
+published marker, and reports timings plus failures. The repository ESBench
+workflow for the same feature stays local to benchmark tooling: it uses a
+deterministic layered DKG client to measure focused WM, SWM, VM, publish, and
+read flows, then renders both the combined report and per-flow HTML pages.
 
 ## Top-Level Components
 
@@ -29,6 +32,31 @@ classDiagram
     +createBenchmarkClient()
     +runPublishAsyncGetBenchmark()
     +formatResult()
+  }
+
+  class EsbenchBenchmarkSuite {
+    <<tooling>>
+    +publish_async_get_suite()
+    +benchAsyncWithHooks()
+    +publishAsyncGetHtmlReporter()
+  }
+
+  class LayeredBenchmarkClient {
+    <<test double>>
+    +writeWorkingMemory()
+    +liftWorkingMemoryToSharedMemory()
+    +sharedMemoryWrite()
+    +publishFromSharedMemory()
+    +publisherEnqueue()
+    +publisherJob()
+    +query()
+  }
+
+  class BenchmarkReports {
+    <<artifact>>
+    +latest_json()
+    +latest_html()
+    +per_flow_html_pages()
   }
 
   class DkgDaemonApi {
@@ -78,9 +106,14 @@ classDiagram
 
   CliPackage --> DkgDaemonApi : starts and exposes
   CliPackage --> PublishGetBenchmark : provides script
+  CliPackage --> EsbenchBenchmarkSuite : owns benchmark suite
   PublishGetBenchmark --> DkgDaemonApi : measures via ApiClient
+  EsbenchBenchmarkSuite --> LayeredBenchmarkClient : measures deterministic flows
+  EsbenchBenchmarkSuite --> BenchmarkReports : renders combined and focused HTML
   DkgDaemonApi --> DkgAgentRuntime : delegates memory and query work
   DkgDaemonApi --> PublisherRuntime : delegates publish work
+  LayeredBenchmarkClient ..> DkgAgentRuntime : mirrors WM and SWM behavior
+  LayeredBenchmarkClient ..> PublisherRuntime : mirrors enqueue and finalization
   DkgAgentRuntime --> StorageAdapters : reads and writes triples
   PublisherRuntime --> StorageAdapters : reads SWM staging data
   PublisherRuntime --> ChainAdapters : anchors VM commitments
@@ -176,6 +209,84 @@ sequenceDiagram
 
   Script->>Script: aggregate min max mean median p50 p95
   Script-->>Operator: JSON or NDJSON benchmark result
+```
+
+## ESBench Focused Report Flow
+
+The repository-level ESBench suite in `bench/publish-async-get.bench.ts` keeps the
+benchmark feature split into named cases. The normal `pnpm bench` workflow writes
+the raw ESBench result. `pnpm bench:html` enables the standard combined HTML
+report and a publish/async/get reporter that filters the same result into one
+HTML page per DKG memory, publish, or read flow.
+
+The ESBench path does not call a live daemon. Instead,
+`LayeredDkgBenchmarkClient` models the memory layers explicitly: payloads are
+written to working memory, lifted to shared working memory, promoted to verified
+memory by sync or async publish, and queried from a selected view. This keeps
+benchmark report generation deterministic and avoids secrets or
+machine-specific daemon paths in the generated pages.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Operator
+  participant Esbench as ESBench Runner
+  participant Suite as Publish Async Get Suite
+  participant Hooks as Case Hooks
+  participant Client as Layered DKG Client
+  participant WM as Working Memory
+  participant SWM as Shared Working Memory
+  participant VM as Verified Memory
+  participant Jobs as Publisher Jobs
+  participant Reports as HTML Reporters
+
+  Operator->>Esbench: pnpm bench or pnpm bench:html
+  Esbench->>Suite: load publish-async-get cases
+  Suite->>Hooks: register before-iteration setup per case
+
+  loop payload sizes and measured iterations
+    Hooks->>Client: prepare unique benchmark payload
+
+    alt get/read retrieval
+      Client->>WM: write payload
+      Client->>SWM: lift payload
+      Client->>VM: finalize sync publish
+      Suite->>Client: query verified-memory marker
+      Client-->>Suite: binding with marker
+    else synchronous publish with finalization
+      Client->>WM: write payload
+      Client->>SWM: lift payload
+      Suite->>Client: publishFromSharedMemory(root)
+      Client->>VM: promote root with kc id
+      Client-->>Suite: finalized publish result
+    else asynchronous publish enqueue and finalization
+      Client->>WM: write payload
+      Client->>SWM: lift payload
+      Suite->>Client: publisherEnqueue(share operation)
+      Client->>Jobs: create queued job
+      Suite->>Client: publisherJob(job id)
+      Client->>VM: promote queued roots
+      Client-->>Suite: finalized job status
+    else upload payload to local working memory
+      Suite->>Client: writeWorkingMemory(quads)
+      Client->>WM: store workspace operation
+      Client-->>Suite: workspace operation id
+    else lift local working memory to shared working memory
+      Client->>WM: write payload
+      Suite->>Client: liftWorkingMemoryToSharedMemory(root)
+      Client->>SWM: store share operation
+      Client-->>Suite: share operation id
+    end
+  end
+
+  Esbench->>Reports: rawReporter latest.json
+  opt ESBENCH_HTML
+    Esbench->>Reports: combined latest.html
+  end
+  opt ESBENCH_PUBLISH_ASYNC_GET_HTML
+    Reports->>Reports: filter result by case name
+    Reports-->>Operator: five focused publish-async-get HTML pages
+  end
 ```
 
 ## Codex Architecture Documentation Workflow

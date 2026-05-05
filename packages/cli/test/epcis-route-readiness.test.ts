@@ -1,7 +1,38 @@
 import { describe, expect, it } from 'vitest';
 import type { ServerResponse } from 'node:http';
+import { Readable } from 'node:stream';
 import { handleEpcisRoutes } from '../src/daemon/routes/epcis.js';
 import type { RequestContext } from '../src/daemon/routes/context.js';
+
+const VALID_OBJECT_EVENT_DOC = {
+  '@context': {
+    '@vocab': 'https://gs1.github.io/EPCIS/',
+    epcis: 'https://gs1.github.io/EPCIS/',
+    cbv: 'https://ref.gs1.org/cbv/',
+    type: '@type',
+    id: '@id',
+    eventID: '@id',
+  },
+  type: 'EPCISDocument',
+  schemaVersion: '2.0',
+  creationDate: '2024-03-01T08:00:00Z',
+  epcisBody: {
+    eventList: [
+      {
+        eventID: 'urn:uuid:fixture-obj-1',
+        type: 'ObjectEvent',
+        eventTime: '2024-03-01T08:00:00.000Z',
+        eventTimeZoneOffset: '+00:00',
+        epcList: ['urn:epc:id:sgtin:4012345.011111.1001'],
+        action: 'ADD',
+        bizStep: 'https://ref.gs1.org/cbv/BizStep-receiving',
+        disposition: 'https://ref.gs1.org/cbv/Disp-in_progress',
+        readPoint: { id: 'urn:epc:id:sgln:4012345.00001.0' },
+        bizLocation: { id: 'urn:epc:id:sgln:4012345.00001.0' },
+      },
+    ],
+  },
+};
 
 function createResponse() {
   const response = {
@@ -23,14 +54,22 @@ function createResponse() {
   return response;
 }
 
-function createContext(overrides: Partial<RequestContext> = {}): RequestContext {
-  const request = {
+function createRequest(body?: unknown): RequestContext['req'] {
+  const request = body === undefined
+    ? new Readable({ read() { this.push(null); } })
+    : Readable.from([Buffer.from(JSON.stringify(body))]);
+  Object.assign(request, {
     method: 'POST',
     url: '/api/epcis/capture',
-  };
+    headers: {},
+  });
+  return request as RequestContext['req'];
+}
+
+function createContext(overrides: Partial<RequestContext> = {}): RequestContext {
   const url = new URL('http://127.0.0.1/api/epcis/capture');
   return {
-    req: request as RequestContext['req'],
+    req: createRequest(),
     res: createResponse() as unknown as ServerResponse,
     agent: {
       publishAsync: async () => {
@@ -100,5 +139,43 @@ describe('EPCIS async capture publisher readiness', () => {
     expect(responseBody(ctx)).toMatchObject({
       error: 'PublisherDisabled',
     });
+  });
+
+  it('accepts capture and publishes bare documents as private content without route public wrapping', async () => {
+    const published: Array<{ contextGraphId: string; content: unknown; opts: unknown }> = [];
+    const ctx = createContext({
+      req: createRequest({
+        epcisDocument: VALID_OBJECT_EVENT_DOC,
+        publishOptions: { accessPolicy: 'allowList', allowedPeers: ['peer-a'] },
+      }),
+      agent: {
+        publishAsync: async (contextGraphId: string, content: unknown, opts: unknown) => {
+          published.push({ contextGraphId, content, opts });
+          return { captureID: 'capture-route-1' };
+        },
+      } as unknown as RequestContext['agent'],
+      publisherRuntime: {
+        walletIds: ['0xpublisher'],
+        runner: {},
+        publisher: {},
+        stop: async () => {},
+      } as unknown as RequestContext['publisherRuntime'],
+    });
+
+    await handleEpcisRoutes(ctx);
+
+    expect(ctx.res.statusCode).toBe(202);
+    expect(responseBody(ctx)).toMatchObject({
+      captureID: 'capture-route-1',
+      status: 'accepted',
+      eventCount: 1,
+    });
+    expect(published).toEqual([
+      {
+        contextGraphId: 'epcis-test',
+        content: { private: VALID_OBJECT_EVENT_DOC },
+        opts: { accessPolicy: 'allowList', allowedPeers: ['peer-a'] },
+      },
+    ]);
   });
 });

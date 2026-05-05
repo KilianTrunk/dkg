@@ -33,14 +33,6 @@ export interface ValidationResult {
   eventCount?: number;
 }
 
-export interface CaptureResult {
-  ual: string;
-  kcId: string;
-  receivedAt: string;
-  eventCount: number;
-  status: string;
-}
-
 export interface CaptureAcceptedResult {
   captureID: string;
   receivedAt: string;
@@ -51,15 +43,6 @@ export interface CaptureAcceptedResult {
 export interface CaptureOptions {
   accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
   allowedPeers?: string[];
-}
-
-/** Dependency-inversion boundary: the EPCIS package needs something that can publish JSON-LD. */
-export interface Publisher {
-  publish(
-    contextGraphId: string,
-    content: unknown,
-    opts?: CaptureOptions,
-  ): Promise<{ ual: string; kcId: string; status: string }>;
 }
 
 export interface AsyncPublisher {

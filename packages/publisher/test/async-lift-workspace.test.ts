@@ -115,6 +115,7 @@ describe('async lift workspace resolution', () => {
     await privateStore.storePrivateTriplesForOperation(PARANET, write.shareOperationId, ENTITY, [
       { subject: ENTITY, predicate: 'http://schema.org/secret', object: '"subgraph-secret"', graph: '' },
     ], subGraphName);
+    expect(await privateStore.getPrivateTriples(PARANET, ENTITY, subGraphName)).toEqual([]);
 
     const resolved = await resolveLiftWorkspaceSlice({
       store,
@@ -166,6 +167,7 @@ describe('async lift workspace resolution', () => {
     await privateStore.storePrivateTriplesForOperation(PARANET, write2.shareOperationId, ENTITY, [
       { subject: ENTITY, predicate: secretPredicate, object: '"second"', graph: '' },
     ]);
+    expect(await privateStore.getPrivateTriples(PARANET, ENTITY)).toEqual([]);
 
     const resolved = await resolveLiftWorkspaceSlice({
       store,

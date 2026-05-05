@@ -33,6 +33,12 @@ export class PrivateContentStore {
     return subGraphName ? `${contextGraphId}\0${subGraphName}` : contextGraphId;
   }
 
+  private privateStagingGraph(contextGraphId: string, shareOperationId: string, subGraphName?: string): string {
+    const parts = [contextGraphId, subGraphName ?? '_', shareOperationId]
+      .map((part) => encodeURIComponent(part));
+    return assertSafeIri(`urn:dkg:private-stage-graph:${parts.join(':')}`);
+  }
+
   async storePrivateTriples(
     contextGraphId: string,
     rootEntity: string,
@@ -71,9 +77,9 @@ export class PrivateContentStore {
     quads: Quad[],
     subGraphName?: string,
   ): Promise<void> {
-    await this.storePrivateTriples(contextGraphId, rootEntity, quads, subGraphName);
+    assertSafeIri(rootEntity);
 
-    const graphUri = this.privateGraph(contextGraphId, subGraphName);
+    const graphUri = this.privateStagingGraph(contextGraphId, shareOperationId, subGraphName);
     const subject = privateStageSubject(contextGraphId, shareOperationId, rootEntity, subGraphName);
     await this.store.deleteByPattern({ graph: graphUri, subject });
     await this.store.insert([{
@@ -90,7 +96,9 @@ export class PrivateContentStore {
     rootEntity: string,
     subGraphName?: string,
   ): Promise<Quad[]> {
-    const graphUri = this.privateGraph(contextGraphId, subGraphName);
+    assertSafeIri(rootEntity);
+
+    const graphUri = this.privateStagingGraph(contextGraphId, shareOperationId, subGraphName);
     const subject = privateStageSubject(contextGraphId, shareOperationId, rootEntity, subGraphName);
     const result = await this.store.query(
       `SELECT ?payload WHERE {
@@ -104,6 +112,19 @@ export class PrivateContentStore {
     if (typeof payload !== 'string') return [];
     const parsed = JSON.parse(payload) as Quad[];
     return parsed.map((q) => ({ ...q, graph: '' }));
+  }
+
+  async deletePrivateTriplesForOperation(
+    contextGraphId: string,
+    shareOperationId: string,
+    rootEntity: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    assertSafeIri(rootEntity);
+
+    const graphUri = this.privateStagingGraph(contextGraphId, shareOperationId, subGraphName);
+    const subject = privateStageSubject(contextGraphId, shareOperationId, rootEntity, subGraphName);
+    await this.store.deleteByPattern({ graph: graphUri, subject });
   }
 
   async getPrivateTriples(

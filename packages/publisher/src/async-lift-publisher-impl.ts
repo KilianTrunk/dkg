@@ -1,5 +1,5 @@
-import type { TripleStore } from '@origintrail-official/dkg-storage';
-import { GraphManager } from '@origintrail-official/dkg-storage';
+import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
+import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import type { PublishResult } from './publisher.js';
 import {
   LIFT_JOB_STATES,
@@ -147,6 +147,9 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
     await this.assertActiveClaimLock(current);
     const next = this.refreshActiveLease(this.mergeJob(current, status, data));
     this.assertJobMatchesStatus(next);
+    if (next.status === 'finalized') {
+      await this.promoteFinalizedPrivateStaging(next);
+    }
     await this.writeJob(next);
     await this.syncWalletLockForJob(next);
   }
@@ -327,6 +330,7 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
       finalization: mapped.finalization,
     });
     this.assertJobMatchesStatus(next);
+    await this.promoteFinalizedPrivateStaging(next);
     await this.writeJob(next);
     await this.syncWalletLockForJob(next);
     return next;
@@ -366,7 +370,9 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
         const resolved = await this.chainRecoveryResolver(job);
         if (resolved) {
           await this.releaseWalletLockForJob(job);
-          await this.writeJob(this.finalizeRecoveredJob(job, resolved.inclusion, resolved.finalization));
+          const finalized = this.finalizeRecoveredJob(job, resolved.inclusion, resolved.finalization);
+          await this.promoteFinalizedPrivateStaging(finalized);
+          await this.writeJob(finalized);
           recovered += 1;
           continue;
         }
@@ -401,7 +407,9 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
           const restoredStatus = job.failure.failedFromState === 'included' ? 'included' : 'broadcast';
           const { failure: _staleFailure, ...jobWithoutFailure } = job as unknown as Record<string, unknown>;
           const recoverable = { ...jobWithoutFailure, status: restoredStatus } as unknown as LiftJobBroadcast;
-          await this.writeJob(this.finalizeRecoveredJob(recoverable, resolved.inclusion, resolved.finalization));
+          const finalized = this.finalizeRecoveredJob(recoverable, resolved.inclusion, resolved.finalization);
+          await this.promoteFinalizedPrivateStaging(finalized);
+          await this.writeJob(finalized);
           recovered += 1;
         }
         // If still inconclusive, leave in failed state — next recover() will retry again.
@@ -915,9 +923,40 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
       },
     });
     this.assertJobMatchesStatus(finalized);
+    await this.promoteFinalizedPrivateStaging(finalized);
     await this.writeJob(finalized);
     await this.syncWalletLockForJob(finalized);
     return finalized;
+  }
+
+  private async promoteFinalizedPrivateStaging(job: LiftJob): Promise<void> {
+    if (job.status !== 'finalized' || !job.validation) return;
+
+    const privateStore = new PrivateContentStore(this.store, this.graphManager);
+    for (const sourceRoot of job.request.roots) {
+      const staged = await privateStore.getPrivateTriplesForOperation(
+        job.request.contextGraphId,
+        job.request.shareOperationId,
+        sourceRoot,
+        job.request.subGraphName,
+      );
+      if (staged.length === 0) continue;
+
+      const canonicalRoot = job.validation.canonicalRootMap[sourceRoot] ?? sourceRoot;
+      const canonicalQuads = canonicalizePrivateStagedQuads(staged, job.validation.canonicalRootMap);
+      await privateStore.storePrivateTriples(
+        job.request.contextGraphId,
+        canonicalRoot,
+        canonicalQuads,
+        job.request.subGraphName,
+      );
+      await privateStore.deletePrivateTriplesForOperation(
+        job.request.contextGraphId,
+        job.request.shareOperationId,
+        sourceRoot,
+        job.request.subGraphName,
+      );
+    }
   }
 
   private computePublicByteSize(quads: readonly { subject: string; predicate: string; object: string; graph: string }[]): number {
@@ -958,4 +997,29 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
         throw new Error(`Unsupported LiftJob status: ${(job as LiftJob).status}`);
     }
   }
+}
+
+function canonicalizePrivateStagedQuads(
+  quads: readonly Quad[],
+  canonicalRootMap: Readonly<Record<string, string>>,
+): Quad[] {
+  return quads.map((quad) => ({
+    ...quad,
+    subject: canonicalizeTerm(quad.subject, canonicalRootMap),
+    object: quad.object.startsWith('"') ? quad.object : canonicalizeTerm(quad.object, canonicalRootMap),
+    graph: '',
+  }));
+}
+
+function canonicalizeTerm(term: string, canonicalRootMap: Readonly<Record<string, string>>): string {
+  for (const [sourceRoot, canonicalRoot] of Object.entries(canonicalRootMap)) {
+    if (term === sourceRoot) {
+      return canonicalRoot;
+    }
+    const skolemPrefix = `${sourceRoot}/.well-known/genid/`;
+    if (term.startsWith(skolemPrefix)) {
+      return `${canonicalRoot}${term.slice(sourceRoot.length)}`;
+    }
+  }
+  return term;
 }

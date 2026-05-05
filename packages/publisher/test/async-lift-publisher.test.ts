@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, afterAll, describe, expect, it } from 'vitest';
-import { GraphManager, OxigraphStore } from '@origintrail-official/dkg-storage';
+import { GraphManager, OxigraphStore, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter } from '@origintrail-official/dkg-chain';
 import { TypedEventBus, generateEd25519Keypair, sha256 } from '@origintrail-official/dkg-core';
 import { ethers } from 'ethers';
@@ -579,6 +579,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
           expect(walletId).toBe('wallet-1');
           expect(publishOptions.contextGraphId).toBe('music-social');
           expect(publishOptions.quads[0]?.subject).toContain('dkg:music-social:aloha:person-profile/rihana-');
+          expect(publishOptions.privateQuads?.[0]?.subject).toContain('dkg:music-social:aloha:person-profile/rihana-');
           return {
             kcId: 1n,
             ual: 'did:dkg:mock:31337/0xabc/1',
@@ -598,6 +599,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
         },
       },
     });
+    const privateStore = new PrivateContentStore(store, new GraphManager(store));
 
     const dkgPublisher = new DKGPublisher({
       store,
@@ -610,6 +612,10 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     const write = await dkgPublisher.share('music-social', [
       { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
     ], { publisherPeerId: 'peer-1' });
+    await privateStore.storePrivateTriplesForOperation('music-social', write.shareOperationId, 'urn:local:/rihana', [
+      { subject: 'urn:local:/rihana', predicate: 'http://schema.org/secret', object: '"stage-secret"', graph: '' },
+    ]);
+    expect(await privateStore.getPrivateTriples('music-social', 'urn:local:/rihana')).toEqual([]);
 
     const jobId = await publisher.lift({
       ...request(),
@@ -622,6 +628,10 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(processed?.status).toBe('finalized');
     expect(processed?.validation?.authorityProofRef).toBe('proof:owner:1');
     expect(processed?.finalization?.ual).toBe('did:dkg:mock:31337/0xabc/1');
+    const canonicalRoot = processed?.validation?.canonicalRootMap['urn:local:/rihana'];
+    expect(canonicalRoot).toBeDefined();
+    expect((await privateStore.getPrivateTriples('music-social', canonicalRoot!)).map((quad) => quad.object)).toEqual(['"stage-secret"']);
+    expect(await privateStore.getPrivateTriplesForOperation('music-social', write.shareOperationId, 'urn:local:/rihana')).toEqual([]);
   });
 
   it('records validation/publish execution failures during processNext', async () => {
@@ -1004,6 +1014,10 @@ describe('TripleStoreAsyncLiftPublisher', () => {
 
     const claimedId = await publisher.lift(request());
     const broadcastId = await publisher.lift({ ...request(), shareOperationId: 'op-2' });
+    const privateStore = new PrivateContentStore(store, new GraphManager(store));
+    await privateStore.storePrivateTriplesForOperation('music-social', 'op-2', 'urn:local:/rihana', [
+      { subject: 'urn:local:/rihana', predicate: 'http://schema.org/secret', object: '"recover-secret"', graph: '' },
+    ]);
 
     await publisher.claimNext('wallet-1');
     await publisher.claimNext('wallet-2');
@@ -1029,6 +1043,8 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(claimed?.status).toBe('accepted');
     expect(broadcast?.status).toBe('finalized');
     expect(broadcast?.recovery?.action).toBe('finalized_from_chain');
+    expect((await privateStore.getPrivateTriples('music-social', 'dkg:music-social:aloha:person/rihana')).map((quad) => quad.object)).toEqual(['"recover-secret"']);
+    expect(await privateStore.getPrivateTriplesForOperation('music-social', 'op-2', 'urn:local:/rihana')).toEqual([]);
   });
 
   it('keeps broadcast jobs in place while inconclusive recovery is still within the timeout window', async () => {

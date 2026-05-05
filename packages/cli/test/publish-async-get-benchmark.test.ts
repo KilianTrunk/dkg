@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -290,5 +290,16 @@ describe('publish async get benchmark', () => {
     expect(record.scenes).toHaveLength(2);
     expect(record.scenes[0]).toEqual({});
     expect(record.scenes[1]).toEqual({ [caseName]: { time: [3] } });
+  });
+
+  it('keeps focused ESBench HTML pages wired into the documented benchmark script', async () => {
+    const packageJson = JSON.parse(await readFile(new URL('../../../package.json', import.meta.url), 'utf8')) as {
+      scripts?: Record<string, string>;
+    };
+    const benchHtml = packageJson.scripts?.['bench:html'];
+
+    expect(benchHtml).toContain('ESBENCH_HTML=1');
+    expect(benchHtml).toContain('ESBENCH_PUBLISH_ASYNC_GET_HTML=1');
+    expect(benchHtml).toContain('esbench --config esbench.config.mjs');
   });
 });

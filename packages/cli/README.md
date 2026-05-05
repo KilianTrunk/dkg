@@ -113,10 +113,10 @@ The full API surface — including request bodies, response shapes, and error co
 
 ## Local Benchmarks
 
-The publish/get benchmark measures four paths against a running DKG daemon:
-synchronous publish end-to-end latency, async publisher enqueue latency, async
-job completion/finalization latency, and SPARQL get latency for the published
-benchmark content.
+The live publish/get benchmark measures four operation timings against a running
+DKG daemon: synchronous publish end-to-end latency, async publisher enqueue
+latency, async job completion/finalization latency, and SPARQL get latency for
+the published benchmark content.
 
 Prerequisites:
 
@@ -156,9 +156,16 @@ records include operation, iteration, error message, root entity, marker, contex
 graph, and a reproduction command. Warmups are excluded from summaries.
 
 The repository-level ESBench workflow for this same benchmark feature is
-documented in `BENCHMARKING.md`. `pnpm bench:html` writes the combined ESBench
-report plus focused HTML pages for get/read retrieval, synchronous publish,
-asynchronous publish, working-memory upload, and working-to-shared-memory lift.
+documented in `BENCHMARKING.md`. It uses a deterministic layered DKG client, not
+a live daemon, so the generated reports avoid auth tokens and local node paths.
+`pnpm bench:html` writes the combined ESBench report plus one focused HTML page
+for each benchmark flow:
+
+- get/read retrieval
+- synchronous publish with finalization
+- asynchronous publish enqueue and finalization
+- upload payload to local working memory
+- lift local working memory to shared working memory
 
 ## Extending the Node
 

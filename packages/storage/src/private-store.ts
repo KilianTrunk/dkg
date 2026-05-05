@@ -775,6 +775,12 @@ export class PrivateContentStore {
     return subGraphName ? `${contextGraphId}\0${subGraphName}` : contextGraphId;
   }
 
+  private privateStagingGraph(contextGraphId: string, shareOperationId: string, subGraphName?: string): string {
+    const parts = [contextGraphId, subGraphName ?? '_', shareOperationId]
+      .map((part) => encodeURIComponent(part));
+    return assertSafeIri(`urn:dkg:private-stage-graph:${parts.join(':')}`);
+  }
+
   async storePrivateTriples(
     contextGraphId: string,
     rootEntity: string,
@@ -848,6 +854,63 @@ export class PrivateContentStore {
     entities.add(rootEntity);
   }
 
+  async storePrivateTriplesForOperation(
+    contextGraphId: string,
+    shareOperationId: string,
+    rootEntity: string,
+    quads: Quad[],
+    subGraphName?: string,
+  ): Promise<void> {
+    assertSafeIri(rootEntity);
+
+    const graphUri = this.privateStagingGraph(contextGraphId, shareOperationId, subGraphName);
+    const subject = privateStageSubject(contextGraphId, shareOperationId, rootEntity, subGraphName);
+    await this.store.deleteByPattern({ graph: graphUri, subject });
+    await this.store.insert([{
+      subject,
+      predicate: 'http://dkg.io/ontology/privateStagedQuads',
+      object: JSON.stringify(JSON.stringify(quads.map((q) => ({ ...q, graph: '' })))),
+      graph: graphUri,
+    }]);
+  }
+
+  async getPrivateTriplesForOperation(
+    contextGraphId: string,
+    shareOperationId: string,
+    rootEntity: string,
+    subGraphName?: string,
+  ): Promise<Quad[]> {
+    assertSafeIri(rootEntity);
+
+    const graphUri = this.privateStagingGraph(contextGraphId, shareOperationId, subGraphName);
+    const subject = privateStageSubject(contextGraphId, shareOperationId, rootEntity, subGraphName);
+    const result = await this.store.query(
+      `SELECT ?payload WHERE {
+        GRAPH <${assertSafeIri(graphUri)}> {
+          <${assertSafeIri(subject)}> <http://dkg.io/ontology/privateStagedQuads> ?payload .
+        }
+      } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return [];
+    const payload = parseLiteral(result.bindings[0]?.['payload']);
+    if (typeof payload !== 'string') return [];
+    const parsed = JSON.parse(payload) as Quad[];
+    return parsed.map((q) => ({ ...q, graph: '' }));
+  }
+
+  async deletePrivateTriplesForOperation(
+    contextGraphId: string,
+    shareOperationId: string,
+    rootEntity: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    assertSafeIri(rootEntity);
+
+    const graphUri = this.privateStagingGraph(contextGraphId, shareOperationId, subGraphName);
+    const subject = privateStageSubject(contextGraphId, shareOperationId, rootEntity, subGraphName);
+    await this.store.deleteByPattern({ graph: graphUri, subject });
+  }
+
   async getPrivateTriples(
     contextGraphId: string,
     rootEntity: string,
@@ -912,5 +975,27 @@ export class PrivateContentStore {
     const key = this.privateKey(contextGraphId, subGraphName);
     const entities = this.privateEntities.get(key);
     if (entities) entities.delete(rootEntity);
+  }
+}
+
+function privateStageSubject(
+  contextGraphId: string,
+  shareOperationId: string,
+  rootEntity: string,
+  subGraphName?: string,
+): string {
+  const parts = [contextGraphId, subGraphName ?? '_', shareOperationId, rootEntity]
+    .map((part) => encodeURIComponent(part));
+  const subject = `urn:dkg:private-stage:${parts.join(':')}`;
+  assertSafeIri(subject);
+  return subject;
+}
+
+function parseLiteral(value: string | undefined): unknown {
+  if (!value) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
   }
 }

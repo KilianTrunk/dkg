@@ -16,7 +16,7 @@ import {
   TrustLevel,
   type DKGNodeConfig, type OperationContext, type GetView, type AssertionDescriptor, type AssertionEvent, type AssertionState,
 } from '@origintrail-official/dkg-core';
-import { GraphManager, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad } from '@origintrail-official/dkg-storage';
+import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
@@ -24,8 +24,9 @@ import {
   ACKCollector, StorageACKHandler,
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
   computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
+  TripleStoreAsyncLiftPublisher,
   type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
-  type CollectedACK,
+  type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
 import {
@@ -92,13 +93,115 @@ export interface CclPublishedEvaluationRecord {
   results: CclPublishedResultEntry[];
 }
 
-interface PublishOpts {
+export interface PublishOpts {
   onPhase?: PhaseCallback;
   operationCtx?: OperationContext;
   accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
   allowedPeers?: string[];
   /** Target sub-graph within the context graph (e.g. "code", "decisions"). */
   subGraphName?: string;
+}
+
+export interface PublishAsyncOpts extends PublishOpts {
+  namespace?: string;
+  scope?: string;
+  transitionType?: LiftTransitionType;
+  authority?: LiftAuthorityProof;
+  localOnly?: boolean;
+}
+
+export interface PublishAsyncQuadEnvelope {
+  publicQuads?: Quad[];
+  privateQuads?: Quad[];
+}
+
+export type PublishAsyncContent = JsonLdContent | PublishAsyncQuadEnvelope;
+
+export class ContextGraphNotFoundError extends Error {
+  readonly code = 'ContextGraphNotFound';
+
+  constructor(contextGraphId: string) {
+    super(`Context graph "${contextGraphId}" does not exist or is not subscribed locally`);
+    this.name = 'ContextGraphNotFound';
+  }
+}
+
+export class InvalidContentError extends Error {
+  readonly code = 'InvalidContent';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidContent';
+  }
+}
+
+const PRIVATE_DATA_ANCHOR = 'http://dkg.io/ontology/privateDataAnchor';
+
+function normalizePublishContextGraphId(input: string): string {
+  const value = String(input).trim().replace(/^<(.+)>$/, '$1');
+  const prefix = 'did:dkg:context-graph:';
+  if (!value.startsWith(prefix)) return value;
+  const rest = value.slice(prefix.length);
+  const slash = rest.indexOf('/');
+  return slash >= 0 ? rest.slice(0, slash) : rest;
+}
+
+function isPublishAsyncQuadEnvelope(input: unknown): input is PublishAsyncQuadEnvelope {
+  return !!input
+    && typeof input === 'object'
+    && !Array.isArray(input)
+    && ('publicQuads' in input || 'privateQuads' in input);
+}
+
+function assertQuadArray(value: unknown, fieldName: string): Quad[] {
+  if (value == null) return [];
+  if (!Array.isArray(value)) {
+    throw new InvalidContentError(`${fieldName} must be an array of RDF quads`);
+  }
+  for (const quad of value) {
+    if (
+      !quad
+      || typeof quad.subject !== 'string'
+      || typeof quad.predicate !== 'string'
+      || typeof quad.object !== 'string'
+    ) {
+      throw new InvalidContentError(`${fieldName} must contain RDF quads with subject, predicate, and object strings`);
+    }
+  }
+  return value.map((quad) => ({ ...quad, graph: quad.graph ?? '' })) as Quad[];
+}
+
+function partitionPublishAsyncQuads(publicQuads: Quad[], privateQuads: Quad[]): {
+  publicQuads: Quad[];
+  privateQuadsByRoot: Map<string, Quad[]>;
+  roots: string[];
+} {
+  const privateByRoot = autoPartition(privateQuads);
+  let stagedPublicQuads = [...publicQuads];
+  let publicByRoot = autoPartition(stagedPublicQuads);
+
+  for (const rootEntity of privateByRoot.keys()) {
+    if (!publicByRoot.has(rootEntity)) {
+      stagedPublicQuads.push({
+        subject: rootEntity,
+        predicate: PRIVATE_DATA_ANCHOR,
+        object: '"true"',
+        graph: '',
+      });
+    }
+  }
+
+  publicByRoot = autoPartition(stagedPublicQuads);
+  const roots = [...publicByRoot.keys()];
+  if (roots.length === 0) {
+    throw new InvalidContentError('Content produced no publishable root entities');
+  }
+
+  return {
+    publicQuads: stagedPublicQuads,
+    privateQuadsByRoot: privateByRoot,
+    roots,
+  };
 }
 
 const SYNC_PAGE_SIZE = 500;
@@ -2756,6 +2859,94 @@ export class DKGAgent {
       return this._publish(contextGraphId, input as Quad[], thirdArg, fourthArg);
     }
     return this._publish(contextGraphId, input as Quad[], undefined, thirdArg ?? fourthArg);
+  }
+
+  async publishAsync(
+    contextGraphIdOrUal: string,
+    content: PublishAsyncContent,
+    opts?: PublishAsyncOpts,
+  ): Promise<{ captureID: string }> {
+    const contextGraphId = normalizePublishContextGraphId(contextGraphIdOrUal);
+    const ctx = opts?.operationCtx ?? createOperationContext('publish');
+
+    const exists = await this.contextGraphExists(contextGraphId);
+    if (!exists) {
+      throw new ContextGraphNotFoundError(contextGraphId);
+    }
+
+    let publicQuads: Quad[];
+    let privateQuads: Quad[];
+    try {
+      if (isPublishAsyncQuadEnvelope(content)) {
+        publicQuads = assertQuadArray(content.publicQuads, 'publicQuads');
+        privateQuads = assertQuadArray(content.privateQuads, 'privateQuads');
+      } else {
+        const parsed = await jsonLdToQuads(content as JsonLdContent, {
+          defaultVisibility: 'private',
+          syntheticPrivateAnchor: false,
+        });
+        publicQuads = parsed.publicQuads;
+        privateQuads = parsed.privateQuads;
+      }
+    } catch (err) {
+      if (err instanceof InvalidContentError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new InvalidContentError(`Invalid JSON-LD content: ${message}`);
+    }
+
+    if (publicQuads.length === 0 && privateQuads.length === 0) {
+      throw new InvalidContentError('Content must include at least one public or private payload');
+    }
+
+    const partitioned = partitionPublishAsyncQuads(publicQuads, privateQuads);
+    const { shareOperationId, message } = await this.publisher.writeToWorkspace(
+      contextGraphId,
+      partitioned.publicQuads,
+      {
+        publisherPeerId: this.peerId,
+        operationCtx: ctx,
+        subGraphName: opts?.subGraphName,
+      },
+    );
+
+    if (partitioned.privateQuadsByRoot.size > 0) {
+      const privateStore = new PrivateContentStore(this.store, new GraphManager(this.store));
+      for (const [rootEntity, rootPrivateQuads] of partitioned.privateQuadsByRoot) {
+        await privateStore.storePrivateTriplesForOperation(
+          contextGraphId,
+          shareOperationId,
+          rootEntity,
+          rootPrivateQuads,
+          opts?.subGraphName,
+        );
+      }
+    }
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
+    const captureID = await asyncPublisher.lift({
+      swmId: shareOperationId,
+      shareOperationId,
+      roots: partitioned.roots,
+      contextGraphId,
+      namespace: opts?.namespace ?? 'async-publish',
+      scope: opts?.scope ?? 'context-graph',
+      transitionType: opts?.transitionType ?? 'CREATE',
+      authority: opts?.authority ?? { type: 'owner', proofRef: `urn:dkg:publish-async:${shareOperationId}` },
+      subGraphName: opts?.subGraphName,
+      accessPolicy: opts?.accessPolicy,
+      allowedPeers: opts?.allowedPeers,
+    });
+
+    if (!opts?.localOnly) {
+      const topic = paranetWorkspaceTopic(contextGraphId);
+      try {
+        await this.gossip.publish(topic, message);
+      } catch {
+        this.log.warn(ctx, `No peers subscribed to ${topic} yet`);
+      }
+    }
+
+    return { captureID };
   }
 
   private async _publish(

@@ -3,8 +3,8 @@ import { defineConfig, htmlReporter, rawReporter, textReporter } from 'esbench/h
 const resultFile = process.env.ESBENCH_RESULT ?? 'bench/results/latest.json';
 const htmlFile = process.env.ESBENCH_HTML_FILE ?? 'bench/results/latest.html';
 const diffFile = process.env.ESBENCH_DIFF ?? null;
-const publishAsyncGetSuite = 'bench/publish-async-get.bench.ts';
-const publishAsyncGetPages = [
+export const publishAsyncGetSuite = 'bench/publish-async-get.bench.ts';
+export const publishAsyncGetPages = [
   ['get/read retrieval', 'bench/results/publish-async-get/get-read-retrieval.html'],
   ['synchronous publish with finalization', 'bench/results/publish-async-get/sync-publish-finalization.html'],
   ['asynchronous publish enqueue and finalization', 'bench/results/publish-async-get/async-publish-finalization.html'],
@@ -68,7 +68,7 @@ function publishAsyncGetHtmlReporter() {
   };
 }
 
-function filterResultByCase(result, caseName) {
+export function filterResultByCase(result, caseName) {
   const records = result[publishAsyncGetSuite] ?? [];
   const filteredRecords = records
     .map((record) => ({

@@ -39,6 +39,8 @@ classDiagram
     +publish_async_get_suite()
     +benchAsyncWithHooks()
     +publishAsyncGetHtmlReporter()
+    +publishAsyncGetPages
+    +filterResultByCase()
   }
 
   class LayeredBenchmarkClient {
@@ -219,6 +221,11 @@ the raw ESBench result. `pnpm bench:html` enables the standard combined HTML
 report and a publish/async/get reporter that filters the same result into one
 HTML page per DKG memory, publish, or read flow.
 
+The focused reporter boundary is the benchmark config: it exports the suite id,
+the five case-to-file page mapping, and `filterResultByCase()`. That filter keeps
+the payload-size parameter records stable while removing measurements for other
+cases from each focused page.
+
 The ESBench path does not call a live daemon. Instead,
 `LayeredDkgBenchmarkClient` models the memory layers explicitly: payloads are
 written to working memory, lifted to shared working memory, promoted to verified
@@ -284,7 +291,7 @@ sequenceDiagram
     Esbench->>Reports: combined latest.html
   end
   opt ESBENCH_PUBLISH_ASYNC_GET_HTML
-    Reports->>Reports: filter result by case name
+    Reports->>Reports: filter result by case name and keep payload-size params
     Reports-->>Operator: five focused publish-async-get HTML pages
   end
 ```

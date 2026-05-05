@@ -22,6 +22,22 @@ import {
 const originalFetch = globalThis.fetch;
 const originalDkgHome = process.env.DKG_HOME;
 
+type FocusedBenchmarkRecord = {
+  baseline: unknown;
+  notes: unknown;
+  paramDef: unknown;
+  scenes: Array<Record<string, unknown>>;
+};
+
+type EsbenchConfigForTest = {
+  filterResultByCase: (
+    result: Record<string, unknown>,
+    caseName: string,
+  ) => Record<string, FocusedBenchmarkRecord[]>;
+  publishAsyncGetPages: Array<[string, string]>;
+  publishAsyncGetSuite: string;
+};
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
   if (originalDkgHome === undefined) delete process.env.DKG_HOME;
@@ -229,5 +245,50 @@ describe('publish async get benchmark', () => {
     expect(isLoopbackApiUrl('http://localhost:9200')).toBe(true);
     expect(isLoopbackApiUrl('http://127.12.0.1:9200')).toBe(true);
     expect(isLoopbackApiUrl('http://192.168.1.50:9200')).toBe(false);
+  });
+
+  it('keeps ESBench focused HTML scenes aligned with payload-size params', async () => {
+    const {
+      filterResultByCase,
+      publishAsyncGetPages,
+      publishAsyncGetSuite,
+    } = await import('../../../esbench.config.mjs') as EsbenchConfigForTest;
+    const caseName = 'asynchronous publish enqueue and finalization';
+    const result = {
+      [publishAsyncGetSuite]: [
+        {
+          notes: ['not copied'],
+          baseline: { type: 'Name', value: 'synchronous publish with finalization' },
+          paramDef: [['payloadSizeBytes', ['128', '1024']]],
+          scenes: [
+            {
+              'get/read retrieval': { time: [1] },
+              'synchronous publish with finalization': { time: [2] },
+            },
+            {
+              [caseName]: { time: [3] },
+              'synchronous publish with finalization': { time: [4] },
+            },
+          ],
+        },
+      ],
+    };
+
+    const filtered = filterResultByCase(result, caseName);
+    const record = filtered[publishAsyncGetSuite][0];
+
+    expect(publishAsyncGetPages).toEqual([
+      ['get/read retrieval', 'bench/results/publish-async-get/get-read-retrieval.html'],
+      ['synchronous publish with finalization', 'bench/results/publish-async-get/sync-publish-finalization.html'],
+      ['asynchronous publish enqueue and finalization', 'bench/results/publish-async-get/async-publish-finalization.html'],
+      ['upload payload to local working memory', 'bench/results/publish-async-get/working-memory-upload.html'],
+      ['lift local working memory to shared working memory', 'bench/results/publish-async-get/working-to-shared-memory.html'],
+    ]);
+    expect(record.paramDef).toEqual([['payloadSizeBytes', ['128', '1024']]]);
+    expect(record.baseline).toEqual({ type: 'Name', value: caseName });
+    expect(record.notes).toEqual([]);
+    expect(record.scenes).toHaveLength(2);
+    expect(record.scenes[0]).toEqual({});
+    expect(record.scenes[1]).toEqual({ [caseName]: { time: [3] } });
   });
 });

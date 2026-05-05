@@ -129,9 +129,9 @@ describe('Phase-sequence contracts', () => {
     ]);
   });
 
-  // -- Publish (no wallet — tentative path) -----------------------------
+  // -- Publish (no wallet — fail closed) --------------------------------
 
-  it('publish: tentative path omits sign/submit sub-phases', async () => {
+  it('publish: missing publisher wallet rejects before phase emission', async () => {
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
@@ -146,28 +146,12 @@ describe('Phase-sequence contracts', () => {
 
     const quads = [q(ENTITY, 'http://schema.org/name', '"Tentative"')];
     const { calls, fn } = recorder();
-    await publisher.publish({ contextGraphId: PARANET, quads, onPhase: fn });
+    await expect(
+      publisher.publish({ contextGraphId: PARANET, quads, onPhase: fn }),
+    ).rejects.toThrow(/publisherPrivateKey/i);
 
     const phases = calls.map(([p, s]) => `${p}:${s}`);
-
-    expect(phases).toEqual([
-      'prepare:start',
-      'prepare:ensureContextGraph:start',
-      'prepare:ensureContextGraph:end',
-      'prepare:partition:start',
-      'prepare:partition:end',
-      'prepare:manifest:start',
-      'prepare:manifest:end',
-      'prepare:validate:start',
-      'prepare:validate:end',
-      'prepare:merkle:start',
-      'prepare:merkle:end',
-      'prepare:end',
-      'store:start',
-      'store:end',
-      'chain:start',
-      'chain:end',
-    ]);
+    expect(phases).toEqual([]);
   });
 
   // -- Update (happy path) -----------------------------------------------

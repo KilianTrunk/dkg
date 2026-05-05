@@ -1,6 +1,7 @@
 /**
  * Regression test: DKGPublisher must NOT auto-mint a random publisher wallet
- * when no `publisherPrivateKey` is supplied.
+ * when no `publisherPrivateKey` is supplied, and must not use the zero
+ * address as a placeholder publisher.
  *
  * Background
  * ----------
@@ -15,8 +16,8 @@
  * This is the same anti-pattern that destroyed nine testnet admin keys via
  * `ensureProfile` (see `scripts/audit-create-random.mjs` header). Fix and
  * test both land in the same PR. The constructor now leaves
- * `publisherWallet` undefined; every signing call site is already guarded
- * by `if (this.publisherWallet)` and skips gracefully.
+ * `publisherWallet` undefined; publish/update now fail before emitting
+ * publisher-attributed output unless an explicit signing key exists.
  */
 import { describe, it, expect } from 'vitest';
 import { DKGPublisher } from '../src/dkg-publisher.js';
@@ -31,7 +32,23 @@ function makeStubChain(chainId: string): ChainAdapter {
 }
 
 describe('DKGPublisher: no random publisher wallet without explicit key', () => {
-  it('leaves publisherWallet undefined when chain is enabled but no key supplied', async () => {
+  it('leaves publisherWallet and publisherAddress undefined when no key or address is supplied', async () => {
+    const keypair = await generateEd25519Keypair();
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain: makeStubChain('test-evm-chain'),
+      eventBus: new TypedEventBus(),
+      keypair,
+    });
+
+    // Cast to any so we can assert on the private field — the regression we
+    // are guarding against is exactly that this field used to be a freshly
+    // generated random wallet, which is observable here.
+    expect((publisher as any).publisherWallet).toBeUndefined();
+    expect((publisher as any).publisherAddress).toBeUndefined();
+  });
+
+  it('rejects publish without a publisherPrivateKey before producing a UAL', async () => {
     const keypair = await generateEd25519Keypair();
     const publisher = new DKGPublisher({
       store: new OxigraphStore(),
@@ -41,23 +58,29 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       publisherAddress: '0x000000000000000000000000000000000000dEaD',
     });
 
-    // Cast to any so we can assert on the private field — the regression we
-    // are guarding against is exactly that this field used to be a freshly
-    // generated random wallet, which is observable here.
     expect((publisher as any).publisherWallet).toBeUndefined();
-    expect((publisher as any).publisherAddress).toBe('0x000000000000000000000000000000000000dEaD');
+    await expect(
+      publisher.publish({
+        contextGraphId: '1',
+        quads: [{
+          subject: 'urn:test:no-key',
+          predicate: 'http://schema.org/name',
+          object: '"NoKey"',
+          graph: 'did:dkg:context-graph:1',
+        }],
+      }),
+    ).rejects.toThrow(/publisherPrivateKey/i);
   });
 
-  it('leaves publisherWallet undefined when chain is disabled and no key supplied', async () => {
+  it('rejects a zero publisherAddress instead of treating it as a sentinel', async () => {
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({
+    expect(() => new DKGPublisher({
       store: new OxigraphStore(),
-      chain: makeStubChain('none'),
+      chain: makeStubChain('test-evm-chain'),
       eventBus: new TypedEventBus(),
       keypair,
-    });
-
-    expect((publisher as any).publisherWallet).toBeUndefined();
+      publisherAddress: '0x0000000000000000000000000000000000000000',
+    })).toThrow(/zero address/i);
   });
 
   it('still constructs publisherWallet when an explicit key is supplied', async () => {
@@ -75,5 +98,19 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(wallet).toBeDefined();
     expect(wallet.address.toLowerCase()).toBe('0x70997970c51812dc3a010c7d01b50e0d17dc79c8');
     expect((publisher as any).publisherAddress.toLowerCase()).toBe('0x70997970c51812dc3a010c7d01b50e0d17dc79c8');
+  });
+
+  it('rejects publisherAddress values that do not match the supplied private key', async () => {
+    const keypair = await generateEd25519Keypair();
+    const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
+
+    expect(() => new DKGPublisher({
+      store: new OxigraphStore(),
+      chain: makeStubChain('test-evm-chain'),
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherPrivateKey: TEST_KEY,
+      publisherAddress: '0x000000000000000000000000000000000000dEaD',
+    })).toThrow(/does not match publisherPrivateKey signer/i);
   });
 });

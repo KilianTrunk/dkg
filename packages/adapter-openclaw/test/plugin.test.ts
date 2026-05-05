@@ -1350,6 +1350,21 @@ describe('DkgNodePlugin', () => {
       expect(quad.object).toBe('"hello"');
     });
 
+    it('dkg_share returns the minted subject and rootEntities in the tool response', async () => {
+      // Without the subject in the response, callers have only the opaque
+      // shareOperationId to identify the share — that can't be used as a
+      // root_entities selector for a later dkg_shared_memory_publish call.
+      const { byName } = setupPluginWithFetch({ shareOperationId: 'op-resp' });
+      const result = await byName.get('dkg_share')!.execute('tc', {
+        content: 'targetable',
+        context_graph_id: 'ctx',
+      });
+      const body = JSON.parse(result.content[0].text);
+      expect(body.shareOperationId).toBe('op-resp');
+      expect(body.subject).toMatch(/^urn:openclaw:.+:shared:\d+-[a-z0-9]+$/);
+      expect(body.rootEntities).toEqual([body.subject]);
+    });
+
     it('dkg_share mints a unique subject per call so successive shares do not upsert', async () => {
       const { fetchMock, byName } = setupPluginWithFetch({ shareOperationId: 'op-multi' });
       await byName.get('dkg_share')!.execute('tc', { content: 'one', context_graph_id: 'ctx' });

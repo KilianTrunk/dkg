@@ -4336,7 +4336,12 @@ export class DkgNodePlugin {
         object: literal,
       }];
       const result = await this.client.share(contextGraphId, quads, { subGraphName });
-      return this.json(result);
+      // Surface the minted subject so callers can target THIS share in a
+      // follow-up `dkg_shared_memory_publish({ root_entities: [...] })` or
+      // inspect it precisely. Without this the daemon's opaque
+      // shareOperationId is the only handle, which can't be used as a
+      // root-entity selector.
+      return this.json({ ...result, subject, rootEntities: [subject] });
     } catch (err: any) {
       return this.daemonError(err);
     }

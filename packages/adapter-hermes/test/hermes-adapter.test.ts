@@ -1420,6 +1420,102 @@ assert config["allow_context_graph_admin_tools"] is False, config
     expect(secondState.priorMemoryProvider).toEqual(firstState.priorMemoryProvider);
   });
 
+  // H-AC-32: replacement is byte-equivalent across re-runs (idempotency
+  // on top of replace-by-default). First run replaces; second run on
+  // the now-DKG-selected profile must produce byte-identical config.yaml.
+  it('H-AC-32: replacement is byte-equivalent across re-runs', async () => {
+    const { setupHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-byteq-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    writeFileSync(configPath, 'memory:\n  provider: redis\n');
+
+    setupHermesProfile({ hermesHome });
+    const after1 = readFileSync(configPath);
+
+    setupHermesProfile({ hermesHome });
+    const after2 = readFileSync(configPath);
+
+    expect(after2.equals(after1)).toBe(true);
+  });
+
+  // H-AC-33: replacement on a YAML config that already has DKG marked-
+  // non-managed: setup adopts the existing line into the managed block
+  // without writing a new provider value AND without taking a backup
+  // (no actual provider switch occurred — already-DKG users are
+  // upgraded in-place by `markExistingDkgProvider`, not "replaced").
+  it('H-AC-33: already-DKG (non-managed) is adopted into the managed block without backup', async () => {
+    const { setupHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-already-dkg-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    writeFileSync(configPath, 'memory:\n  provider: dkg\n');
+
+    setupHermesProfile({ hermesHome });
+
+    const after = readFileSync(configPath, 'utf-8');
+    expect(after).toContain('# BEGIN DKG ADAPTER HERMES MANAGED');
+    expect(after).toContain('# END DKG ADAPTER HERMES MANAGED');
+    expect(after).toContain('provider: dkg');
+    // No backup taken — the adoption path doesn't trigger replacement
+    // semantics (no prior non-DKG provider was overwritten).
+    const backups = readdirSync(hermesHome).filter((e) => /\.bak\./.test(e));
+    expect(backups).toEqual([]);
+    // No priorMemoryProvider captured either (nothing was actually
+    // swapped — same provider before and after).
+    const stateRaw = readFileSync(
+      join(hermesHome, '.dkg-adapter-hermes', 'setup-state.json'),
+      'utf-8',
+    );
+    expect(JSON.parse(stateRaw).priorMemoryProvider).toBeUndefined();
+  });
+
+  // H-AC-38: disconnect on a profile with no captured priorMemoryProvider
+  // — restore is a noop, disconnect succeeds normally.
+  it('H-AC-38: disconnect on profile with no priorMemoryProvider — restore is noop', async () => {
+    const { setupHermesProfile, disconnectHermesProfile, restoreHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-disconnect-noop-'));
+    // No pre-existing config.yaml; fresh install means no prior provider captured.
+    setupHermesProfile({ hermesHome });
+
+    const disconnectPlan = disconnectHermesProfile({ hermesHome });
+    expect(disconnectPlan.state.status).toBe('disconnected');
+
+    const restoreResult = restoreHermesProfile({ hermesHome });
+    expect(restoreResult.ok).toBe(true);
+    expect(restoreResult.path).toBe('noop');
+  });
+
+  // H-AC-39: `dkg hermes uninstall` after a replacement restores prior
+  // provider AND removes adapter-owned files. Verifies the post-uninstall
+  // config.yaml has the captured provider AND the adapter-owned artifacts
+  // (dkg.json, plugin dir, setup-state.json) are gone.
+  it('H-AC-39: uninstall after replacement restores prior provider and removes adapter files', async () => {
+    const { setupHermesProfile, restoreHermesProfile, uninstallHermesProfile } = await import('../src/setup.js');
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-uninstall-'));
+    const configPath = join(hermesHome, 'config.yaml');
+    writeFileSync(configPath, 'memory:\n  provider: openai-memory\n');
+
+    setupHermesProfile({ hermesHome });
+
+    // Mirror the CLI `runUninstall` order: restore BEFORE uninstall
+    // so the captured backup is consumed while it still exists. After
+    // uninstall, the adapter state dir is removed AND the prior
+    // provider line is back in config.yaml.
+    const restoreResult = restoreHermesProfile({ hermesHome });
+    expect(restoreResult.ok).toBe(true);
+    expect(['surgical', 'backup-file']).toContain(restoreResult.path);
+
+    uninstallHermesProfile({ hermesHome });
+
+    // Adapter artifacts gone.
+    expect(existsSync(join(hermesHome, 'dkg.json'))).toBe(false);
+    expect(existsSync(join(hermesHome, 'plugins', 'dkg'))).toBe(false);
+    expect(existsSync(join(hermesHome, '.dkg-adapter-hermes'))).toBe(false);
+    // Prior provider restored in config.yaml.
+    const post = readFileSync(configPath, 'utf-8');
+    expect(post).toContain('provider: openai-memory');
+    expect(post).not.toContain('# BEGIN DKG ADAPTER HERMES MANAGED');
+  });
+
   // ---------------------------------------------------------------------------
   // S4 step 3 — restoreHermesProfile primitive
   // (issue #386, contract §6 + QA addendum §10C #1 + H-AC-34..36).

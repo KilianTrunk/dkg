@@ -6966,10 +6966,10 @@ export class DKGAgent {
 
     const annotated = await Promise.all(rows.map(async (r) => {
       const curatorMatch = this.curatorDidMatchesChecksumAgent(r.curator, checksum);
-      const creatorIsSelf = this.creatorDidMatchesSelfPeer(r.creator);
-      const involved = curatorMatch
-        || creatorIsSelf
-        || (await this.callerIsAllowlistedAgentParticipant(r.id, checksum));
+      const allowlisted = await this.callerIsAllowlistedAgentParticipant(r.id, checksum);
+      // `callerInvolved` must reflect ONLY the provided caller wallet.
+      // Using local node identity (`creatorIsSelf`) leaks curated rows to unrelated callers.
+      const involved = curatorMatch || allowlisted;
       return { ...r, callerInvolved: involved };
     }));
 

@@ -278,6 +278,91 @@ describe('handleEventsQuery', () => {
     expect(calls[0].sparql).toContain('OFFSET 0');
   });
 
+  it('queries finalized canonical partition by default', async () => {
+    const { engine, calls } = createTrackingQueryEngine([makeBindings()]);
+
+    await handleEventsQuery(
+      new URLSearchParams('eventType=ObjectEvent'),
+      { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
+    );
+
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-paranet/_shared_memory>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+  });
+
+  it('queries shared memory partition when finalized=false', async () => {
+    const { engine, calls } = createTrackingQueryEngine([makeBindings()]);
+
+    await handleEventsQuery(
+      new URLSearchParams('finalized=false&eventType=ObjectEvent'),
+      { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
+    );
+
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_shared_memory>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+    expect(calls[0].sparql).toContain('dkg:privateDataAnchor "true"');
+  });
+
+  it('returns full EPCIS fields from anchored private payload bindings when finalized=false', async () => {
+    const { engine, calls } = createTrackingQueryEngine([
+      makeBindings({
+        event: 'urn:uuid:private-event',
+        eventType: 'https://gs1.github.io/EPCIS/ObjectEvent',
+        eventTime: '2024-04-01T08:00:00.000Z',
+        action: 'OBSERVE',
+        epcList: 'urn:epc:id:sgtin:4012345.011111.9999',
+        bizStep: 'https://ref.gs1.org/cbv/BizStep-shipping',
+        ual: '',
+      }),
+    ]);
+
+    const { body } = await handleEventsQuery(
+      new URLSearchParams('finalized=false&epc=urn:epc:id:sgtin:4012345.011111.9999'),
+      { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
+    );
+
+    expect(calls[0].sparql).toContain('dkg:privateDataAnchor "true"');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+    expect(body.epcisBody.queryResults.resultsBody.eventList).toEqual([
+      expect.objectContaining({
+        type: 'ObjectEvent',
+        action: 'OBSERVE',
+        bizStep: 'https://ref.gs1.org/cbv/BizStep-shipping',
+        epcList: ['urn:epc:id:sgtin:4012345.011111.9999'],
+      }),
+    ]);
+  });
+
+  it('constructs finalized=false private branch so orphan private payloads cannot match', async () => {
+    const { engine, calls } = createTrackingQueryEngine([]);
+
+    await handleEventsQuery(
+      new URLSearchParams('finalized=false'),
+      { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
+    );
+
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_shared_memory>');
+    expect(calls[0].sparql).toContain('?root dkg:privateDataAnchor "true" .');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+    expect(calls[0].sparql).toContain('FILTER(?event = ?root)');
+  });
+
+  it('keeps finalized=false on pagination Link headers', async () => {
+    const bindings = Array.from({ length: 6 }, (_, i) =>
+      makeBindings({ event: `urn:uuid:event-${i}` }),
+    );
+    const { engine } = createTrackingQueryEngine(bindings);
+
+    const { headers } = await handleEventsQuery(
+      new URLSearchParams('finalized=false&perPage=5'),
+      { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
+    );
+
+    expect(headers?.link).toContain('finalized=false');
+    expect(headers?.link).toContain('nextPageToken=');
+  });
+
   it('omits Link header on last page (fewer than perPage+1 rows)', async () => {
     const bindings = Array.from({ length: 5 }, (_, i) =>
       makeBindings({ event: `urn:uuid:event-${i}` }),

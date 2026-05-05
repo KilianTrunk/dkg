@@ -4,6 +4,8 @@ import { buildEpcisQuery, escapeSparql, normalizeBizStep, normalizeGs1Vocabulary
 const CONTEXT_GRAPH_ID = 'test-paranet';
 const DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH_ID}`;
 const META_GRAPH = `${DATA_GRAPH}/_meta`;
+const SHARED_MEMORY_GRAPH = `${DATA_GRAPH}/_shared_memory`;
+const PRIVATE_GRAPH = `${DATA_GRAPH}/_private`;
 
 describe('buildEpcisQuery', () => {
   it('generates SPARQL with explicit GRAPH for a single EPC filter', () => {
@@ -114,9 +116,10 @@ describe('buildEpcisQuery', () => {
     expect(sparql).toContain('epcis:parentID "urn:epc:id:sgtin:4012345.011111.1001"');
     expect(sparql).toContain('epcis:inputEPCList "urn:epc:id:sgtin:4012345.011111.1001"');
     expect(sparql).toContain('epcis:outputEPCList "urn:epc:id:sgtin:4012345.011111.1001"');
-    // Count UNION keywords — 5 branches = 4 UNIONs
+    // Count UNION keywords — 5 anyEPC branches = 4 UNIONs, repeated once
+    // per public/private payload branch.
     const unions = sparql.match(/UNION/g);
-    expect(unions).toHaveLength(4);
+    expect(unions).toHaveLength(8);
   });
 
   it('combines multiple filters', () => {
@@ -230,6 +233,63 @@ describe('buildEpcisQuery', () => {
     const sparql = buildEpcisQuery({ epc: 'urn:test' }, CONTEXT_GRAPH_ID);
 
     expect(sparql).toContain('ORDER BY DESC(?eventTime) ?event');
+  });
+
+  it('uses finalized public partition by default and unions anchored private payloads', () => {
+    const sparql = buildEpcisQuery({ epc: 'urn:test' }, CONTEXT_GRAPH_ID);
+
+    expect(sparql).toContain(`GRAPH <${DATA_GRAPH}>`);
+    expect(sparql).not.toContain(`GRAPH <${SHARED_MEMORY_GRAPH}>`);
+    expect(sparql).toContain(`GRAPH <${PRIVATE_GRAPH}>`);
+    expect(sparql).toContain('dkg:privateDataAnchor "true"');
+    expect(sparql).toMatch(
+      new RegExp(
+        String.raw`GRAPH <${DATA_GRAPH}> \{[\s\S]*\?root dkg:privateDataAnchor "true"[\s\S]*\}[\s\S]*GRAPH <${PRIVATE_GRAPH}> \{[\s\S]*\?event a \?eventType`,
+      ),
+    );
+  });
+
+  it('uses shared memory public partition when finalized=false', () => {
+    const sparql = buildEpcisQuery({ finalized: false, eventType: 'ObjectEvent' }, CONTEXT_GRAPH_ID);
+
+    expect(sparql).toContain(`GRAPH <${SHARED_MEMORY_GRAPH}>`);
+    expect(sparql).not.toContain(`GRAPH <${DATA_GRAPH}> {\n    ?event a ?eventType`);
+    expect(sparql).toContain(`GRAPH <${PRIVATE_GRAPH}>`);
+    expect(sparql).toContain('FILTER(?eventType = <https://gs1.github.io/EPCIS/ObjectEvent>)');
+  });
+
+  it('uses sub-graph variants for finalized public, shared memory, meta, and private graphs', () => {
+    const finalizedSparql = buildEpcisQuery({ subGraphName: 'supply-chain' }, CONTEXT_GRAPH_ID);
+    const swmSparql = buildEpcisQuery({ finalized: false, subGraphName: 'supply-chain' }, CONTEXT_GRAPH_ID);
+
+    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain>`);
+    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_private>`);
+    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_meta>`);
+    expect(swmSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_shared_memory>`);
+    expect(swmSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_private>`);
+  });
+
+  it('applies representative filters outside the public/private source union', () => {
+    const sparql = buildEpcisQuery(
+      {
+        finalized: false,
+        epc: 'urn:epc:id:sgtin:4012345.011111.1001',
+        bizStep: 'shipping',
+        from: '2024-01-01T00:00:00Z',
+        to: '2024-02-01T00:00:00Z',
+        eventType: 'ObjectEvent',
+      },
+      CONTEXT_GRAPH_ID,
+    );
+
+    expect(sparql).toContain(`GRAPH <${SHARED_MEMORY_GRAPH}>`);
+    expect(sparql).toContain(`GRAPH <${PRIVATE_GRAPH}>`);
+    expect(sparql).toContain('epcis:epcList "urn:epc:id:sgtin:4012345.011111.1001"');
+    expect(sparql).toContain('epcis:childEPCs "urn:epc:id:sgtin:4012345.011111.1001"');
+    expect(sparql).toContain('https://ref.gs1.org/cbv/BizStep-shipping');
+    expect(sparql).toContain('xsd:dateTime("2024-01-01T00:00:00Z")');
+    expect(sparql).toContain('xsd:dateTime("2024-02-01T00:00:00Z")');
+    expect(sparql).toContain('FILTER(?eventType = <https://gs1.github.io/EPCIS/ObjectEvent>)');
   });
 });
 

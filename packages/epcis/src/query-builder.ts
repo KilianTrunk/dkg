@@ -36,6 +36,27 @@ export function normalizeBizStep(value: string): string {
   return normalizeGs1Vocabulary('BizStep', value);
 }
 
+function contextGraphBaseUri(contextGraphId: string, subGraphName?: string): string {
+  const root = `did:dkg:context-graph:${contextGraphId}`;
+  return subGraphName ? `${root}/${subGraphName}` : root;
+}
+
+function contextGraphSharedMemoryUri(contextGraphId: string, subGraphName?: string): string {
+  return `${contextGraphBaseUri(contextGraphId, subGraphName)}/_shared_memory`;
+}
+
+function contextGraphMetaUri(contextGraphId: string, subGraphName?: string): string {
+  return `${contextGraphBaseUri(contextGraphId, subGraphName)}/_meta`;
+}
+
+function contextGraphSharedMemoryMetaUri(contextGraphId: string, subGraphName?: string): string {
+  return `${contextGraphBaseUri(contextGraphId, subGraphName)}/_shared_memory_meta`;
+}
+
+function contextGraphPrivateUri(contextGraphId: string, subGraphName?: string): string {
+  return `${contextGraphBaseUri(contextGraphId, subGraphName)}/_private`;
+}
+
 /**
  * Build a composite SPARQL query for EPCIS events.
  *
@@ -45,8 +66,16 @@ export function normalizeBizStep(value: string): string {
  * - Groups by ?event (the event URI) instead of ?ual (the graph URI)
  */
 export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string): string {
-  const dataGraph = `did:dkg:context-graph:${contextGraphId}`;
-  const metaGraph = `${dataGraph}/_meta`;
+  const partition = params.finalized === false ? 'swm' : 'finalized';
+  const publicGraph =
+    partition === 'swm'
+      ? contextGraphSharedMemoryUri(contextGraphId, params.subGraphName)
+      : contextGraphBaseUri(contextGraphId, params.subGraphName);
+  const metaGraph =
+    partition === 'swm'
+      ? contextGraphSharedMemoryMetaUri(contextGraphId, params.subGraphName)
+      : contextGraphMetaUri(contextGraphId, params.subGraphName);
+  const privateGraph = contextGraphPrivateUri(contextGraphId, params.subGraphName);
 
   const wherePatterns: string[] = [];
   const filterClauses: string[] = [];
@@ -177,6 +206,10 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   // Pagination
   const limit = Math.min(Math.max(params.limit ?? 100, 1), 1000);
   const offset = Math.max(params.offset ?? 0, 0);
+  const graphBody = [
+    ...wherePatterns,
+    ...optionalClauses,
+  ].join('\n      ');
 
   return `${PREFIXES}
 SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?ual
@@ -185,9 +218,22 @@ SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoin
   (GROUP_CONCAT(DISTINCT ?inputEPCList; SEPARATOR=", ") AS ?inputEPCs)
   (GROUP_CONCAT(DISTINCT ?outputEPCList; SEPARATOR=", ") AS ?outputEPCs)
 WHERE {
-  GRAPH <${dataGraph}> {
-    ${wherePatterns.join('\n    ')}
-    ${optionalClauses.join('\n    ')}
+  {
+    GRAPH <${publicGraph}> {
+      ${graphBody}
+    }
+  }
+  union
+  {
+    GRAPH <${publicGraph}> {
+      ?root dkg:privateDataAnchor "true" .
+    }
+    GRAPH <${privateGraph}> {
+      ?event a ?eventType .
+      FILTER(?event = ?root)
+      ${wherePatterns.slice(1).join('\n      ')}
+      ${optionalClauses.join('\n      ')}
+    }
   }
   ${filterClauses.join('\n  ')}
   OPTIONAL {

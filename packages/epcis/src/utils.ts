@@ -50,7 +50,7 @@ function resolveParam(sp: URLSearchParams, canonical: string): string | undefine
 
 /** Parse URLSearchParams into typed EpcisQueryParams. */
 export function parseQueryParams(sp: URLSearchParams): EpcisQueryParams {
-  const params: EpcisQueryParams = {};
+  const params: EpcisQueryParams = { finalized: true };
 
   for (const key of FILTER_KEYS) {
     const val = resolveParam(sp, key);
@@ -97,6 +97,13 @@ export function parseQueryParams(sp: URLSearchParams): EpcisQueryParams {
     if (offset != null && /^\d+$/.test(offset)) {
       params.offset = Number.parseInt(offset, 10);
     }
+  }
+
+  const finalized = sp.get('finalized');
+  if (finalized === 'false') {
+    params.finalized = false;
+  } else {
+    params.finalized = true;
   }
 
   return params;

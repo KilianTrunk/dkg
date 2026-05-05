@@ -80,6 +80,8 @@ export interface EpcisQueryParams {
   action?: string;
   disposition?: string;
   readPoint?: string;
+  finalized?: boolean;
+  subGraphName?: string;
   perPage?: number;
   limit?: number;
   offset?: number;

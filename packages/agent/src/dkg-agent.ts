@@ -538,6 +538,19 @@ async function inferAdapterPublisherAddress(
   );
   if (signerAddress) return signerAddress;
 
+  const operationalKeyGetter = (chain as unknown as { getOperationalPrivateKey?: () => unknown })
+    .getOperationalPrivateKey;
+  if (typeof operationalKeyGetter === 'function') {
+    try {
+      const privateKey = operationalKeyGetter.call(chain);
+      if (typeof privateKey === 'string' && privateKey.length > 0) {
+        return normalizeAdapterPublisherAddress(new ethers.Wallet(privateKey).address);
+      }
+    } catch {
+      // Last-resort compatibility probe; fall through to adapter signatures.
+    }
+  }
+
   if (chain.chainId === 'none' || typeof chain.signMessage !== 'function') return undefined;
 
   try {

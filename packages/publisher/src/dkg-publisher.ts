@@ -336,7 +336,8 @@ export class DKGPublisher implements Publisher {
   private async resolvePublisherAddress(contextGraphId?: bigint): Promise<string | undefined> {
     if (this.publisherAddress) return this.publisherAddress;
     if (this.publisherAddressResolver) {
-      return normalizePublisherAddress(await this.publisherAddressResolver(contextGraphId));
+      const resolved = normalizePublisherAddress(await this.publisherAddressResolver(contextGraphId));
+      if (resolved) return resolved;
     }
     return this.inferAdapterPublisherAddress(contextGraphId);
   }
@@ -381,12 +382,30 @@ export class DKGPublisher implements Publisher {
     );
     if (signerAddress) return signerAddress;
 
+    const operationalWallet = this.getAdapterOperationalWallet();
+    if (operationalWallet) return operationalWallet.address;
+
     if (this.chain.chainId === 'none' || typeof this.chain.signMessage !== 'function') return undefined;
 
     try {
       const challenge = ethers.getBytes(ethers.id('dkg-publisher:publisher-address-probe'));
       const compact = await this.chain.signMessage(challenge);
       return coercePublisherAddress(recoverCompactMessageSigner(challenge, compact));
+    } catch {
+      return undefined;
+    }
+  }
+
+  private getAdapterOperationalWallet(): ethers.Wallet | undefined {
+    const operationalKeyGetter = (this.chain as unknown as { getOperationalPrivateKey?: () => unknown })
+      .getOperationalPrivateKey;
+    if (typeof operationalKeyGetter !== 'function') return undefined;
+
+    try {
+      const privateKey = operationalKeyGetter.call(this.chain);
+      return typeof privateKey === 'string' && privateKey.length > 0
+        ? new ethers.Wallet(privateKey)
+        : undefined;
     } catch {
       return undefined;
     }
@@ -464,6 +483,19 @@ export class DKGPublisher implements Publisher {
           }
           return signature;
         },
+      };
+    }
+
+    const operationalWallet = this.getAdapterOperationalWallet();
+    if (
+      address &&
+      operationalWallet &&
+      operationalWallet.address.toLowerCase() === address.toLowerCase()
+    ) {
+      return {
+        address: operationalWallet.address,
+        source: 'chainAdapter',
+        signMessage: (message: Uint8Array) => operationalWallet.signMessage(message),
       };
     }
 

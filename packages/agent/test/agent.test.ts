@@ -18,7 +18,15 @@ import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
 import { getGenesisQuads, computeNetworkId, PROTOCOL_SYNC, PROTOCOL_STORAGE_ACK, SYSTEM_PARANETS, DKG_ONTOLOGY, paranetDataGraphUri, paranetWorkspaceGraphUri, contextGraphMetaUri, sparqlString } from '@origintrail-official/dkg-core';
 import { DKGQueryEngine } from '@origintrail-official/dkg-query';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { EVMChainAdapter, MockChainAdapter, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult } from '@origintrail-official/dkg-chain';
+import {
+  EVMChainAdapter,
+  MockChainAdapter,
+  type ChainAdapter,
+  type CreateOnChainContextGraphParams,
+  type CreateOnChainContextGraphResult,
+  type OnChainPublishResult,
+  type V10PublishDirectParams,
+} from '@origintrail-official/dkg-chain';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
@@ -117,6 +125,45 @@ class ContextAuthorizedPublisherChainAdapter extends MockChainAdapter {
       throw new Error('agent pinned publish to the primary operational key');
     }
     return super.createKnowledgeAssetsV10(params);
+  }
+}
+
+class OperationalKeyOnlyPublishChainAdapter implements ChainAdapter {
+  readonly chainId = 'mock:31337';
+  capturedPublisherAddress?: string;
+
+  constructor(private readonly wallet: ethers.Wallet) {}
+
+  getOperationalPrivateKey(): string {
+    return this.wallet.privateKey;
+  }
+
+  isV10Ready(): boolean {
+    return true;
+  }
+
+  async getEvmChainId(): Promise<bigint> {
+    return 31337n;
+  }
+
+  async getKnowledgeAssetsV10Address(): Promise<string> {
+    return '0x00000000000000000000000000000000000000A1';
+  }
+
+  async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+    this.capturedPublisherAddress = params.publisherAddress;
+    if (params.publisherAddress.toLowerCase() !== this.wallet.address.toLowerCase()) {
+      throw new Error('publisher did not use the adapter operational key fallback');
+    }
+    return {
+      batchId: 1n,
+      startKAId: 101n,
+      endKAId: 101n,
+      txHash: `0x${'34'.repeat(32)}`,
+      blockNumber: 1,
+      blockTimestamp: Math.floor(Date.now() / 1000),
+      publisherAddress: this.wallet.address,
+    };
   }
 }
 
@@ -1042,6 +1089,37 @@ describe('DKGAgent ACK signer gating', () => {
       expect(result.status).toBe('confirmed');
       expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(authorized.address.toLowerCase());
       expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(authorized.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('keeps getOperationalPrivateKey as a legacy adapter-backed publish fallback', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const chain = new OperationalKeyOnlyPublishChainAdapter(wallet);
+
+    const agent = await DKGAgent.create({
+      name: 'LegacyOperationalKeyPublisher',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+    });
+
+    try {
+      agent.publisher.setIdentityId(1n);
+      const result = await agent.publisher.publish({
+        contextGraphId: '42',
+        quads: [{
+          subject: 'urn:test:agent-operational-key-fallback',
+          predicate: 'http://schema.org/name',
+          object: '"OperationalKeyFallback"',
+          graph: 'did:dkg:context-graph:42',
+        }],
+      });
+
+      expect(result.status).toBe('confirmed');
+      expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+      expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
     } finally {
       await agent.stop().catch(() => {});
     }

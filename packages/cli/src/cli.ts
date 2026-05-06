@@ -1313,6 +1313,7 @@ contextGraphCmd
     [] as string[],
   )
   .option('--required-signatures <n>', 'Required signatures threshold for participant-based context graphs')
+  .option('--pca-account-id <id>', 'Publishing Conviction Account id for PCA-curated on-chain registration')
   .option('--subscribe', 'Also subscribe to the context graph after creation', true)
   .option('--save', 'Persist subscription to config')
   .action(async (id: string, opts: ActionOpts) => {
@@ -1327,7 +1328,14 @@ contextGraphCmd
 
       const participantIdentityIds = (opts.participantIdentityId as string[] | undefined) ?? [];
       const allowedAgents = (opts.allowedAgent as string[] | undefined) ?? [];
-      const accessPolicy = allowedAgents.length > 0 ? 1 : (opts.accessPolicy as number | undefined);
+      const pcaAccountId = opts.pcaAccountId as string | undefined;
+      if (pcaAccountId && !/^[1-9]\d*$/.test(pcaAccountId)) {
+        throw new Error('--pca-account-id must be a positive decimal integer');
+      }
+      if (pcaAccountId && opts.accessPolicy === 0 && !opts.private) {
+        throw new Error('--pca-account-id can only be used with curated/private context graphs');
+      }
+      const accessPolicy = allowedAgents.length > 0 || pcaAccountId ? 1 : (opts.accessPolicy as number | undefined);
 
       const result = await client.createContextGraph(id, opts.name ?? id, opts.description, {
         private: !!opts.private,
@@ -1335,6 +1343,7 @@ contextGraphCmd
         allowedAgents: allowedAgents.length > 0 ? allowedAgents : undefined,
         participantIdentityIds,
         requiredSignatures: opts.requiredSignatures != null ? Number(opts.requiredSignatures) : undefined,
+        pcaAccountId,
       }, opts.invite as string[] | undefined);
       console.log(`Context graph created:`);
       console.log(`  ID:   ${result.created}`);
@@ -1351,6 +1360,9 @@ contextGraphCmd
       }
       if (opts.requiredSignatures != null) {
         console.log(`  Required signatures: ${opts.requiredSignatures}`);
+      }
+      if (pcaAccountId) {
+        console.log(`  PCA account id: ${pcaAccountId}`);
       }
       console.log(`  Run 'dkg context-graph register ${id}' to register on-chain (unlocks Verified Memory).`);
 
@@ -1385,19 +1397,28 @@ contextGraphCmd
   .option('--reveal', 'Deprecated: V10 ContextGraphs registration does not reveal cleartext metadata on-chain')
   .option('--access-policy <n>', 'Access policy: 0 = public/discoverable, 1 = private/curated', parseInt)
   .option('--publish-policy <n>', 'Publish policy: 0 = curated, 1 = open', parseInt)
+  .option('--pca-account-id <id>', 'Publishing Conviction Account id for PCA-curated registration')
   .action(async (id: string, opts: ActionOpts) => {
     try {
       const client = await ApiClient.connect();
       if (opts.reveal) {
         console.warn('--reveal is deprecated and ignored for V10 ContextGraphs registration.');
       }
+      const pcaAccountId = opts.pcaAccountId as string | undefined;
+      if (pcaAccountId && !/^[1-9]\d*$/.test(pcaAccountId)) {
+        throw new Error('--pca-account-id must be a positive decimal integer');
+      }
       const result = await client.registerContextGraph(id, {
         accessPolicy: opts.accessPolicy != null ? Number(opts.accessPolicy) : undefined,
         publishPolicy: opts.publishPolicy != null ? Number(opts.publishPolicy) : undefined,
+        pcaAccountId,
       });
       console.log(`Context graph registered on-chain:`);
       console.log(`  ID:         ${id}`);
       console.log(`  On-chain:   ${result.onChainId}`);
+      if (pcaAccountId) {
+        console.log(`  PCA account id: ${pcaAccountId}`);
+      }
       console.log(`  ${result.hint ?? 'You can now publish SWM to Verified Memory.'}`);
     } catch (err) {
       console.error(toErrorMessage(err));

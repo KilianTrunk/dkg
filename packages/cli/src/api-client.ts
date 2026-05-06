@@ -896,6 +896,7 @@ export class ApiClient {
     participantAgents?: string[];
     participantIdentityIds?: Array<string | number | bigint>;
     requiredSignatures?: number;
+    pcaAccountId?: string | number | bigint;
   }, allowedPeers?: string[]): Promise<{
     created: string;
     uri: string;
@@ -913,6 +914,7 @@ export class ApiClient {
         ? { participantIdentityIds: options.participantIdentityIds.map((id) => id.toString()) }
         : {}),
       ...(options?.requiredSignatures != null ? { requiredSignatures: options.requiredSignatures } : {}),
+      ...(options?.pcaAccountId != null ? { pcaAccountId: options.pcaAccountId.toString() } : {}),
     });
   }
 
@@ -928,6 +930,7 @@ export class ApiClient {
     revealOnChain?: boolean;
     accessPolicy?: number;
     publishPolicy?: number;
+    pcaAccountId?: string | number | bigint;
   }): Promise<{
     registered: string;
     onChainId: string;
@@ -937,6 +940,7 @@ export class ApiClient {
       id,
       ...(opts?.accessPolicy != null ? { accessPolicy: opts.accessPolicy } : {}),
       ...(opts?.publishPolicy != null ? { publishPolicy: opts.publishPolicy } : {}),
+      ...(opts?.pcaAccountId != null ? { pcaAccountId: opts.pcaAccountId.toString() } : {}),
     });
   }
 

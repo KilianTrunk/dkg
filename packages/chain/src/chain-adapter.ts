@@ -582,6 +582,13 @@ export interface ChainAdapter {
   getConvictionDiscount?(accountId: bigint): Promise<{ discountBps: number; conviction: bigint }>;
   getConvictionAccountInfo?(accountId: bigint): Promise<ConvictionAccountInfo | null>;
   /**
+   * Live owner lookup for a PCA NFT — wraps `DKGPublishingConvictionNFT.ownerOf(accountId)`.
+   * Used by the daemon's curated-CG registration preflight to enforce
+   * `local curator == ownerOf(pcaAccountId)` so an agent wallet cannot
+   * impersonate ownership when tying a CG to a PCA.
+   */
+  getPublishingConvictionAccountOwner?(accountId: bigint): Promise<string>;
+  /**
    * Authorize an EOA to draw down on the PCA's discounted publishing
    * allowance. Wraps `PublishingConvictionAccount.addAuthorizedKey(accountId, key)`,
    * which the contract gates on `msg.sender == account.admin` — i.e. the

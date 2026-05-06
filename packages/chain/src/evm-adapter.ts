@@ -2570,6 +2570,13 @@ export class EVMChainAdapter implements ChainAdapter {
     }
   }
 
+  async getPublishingConvictionAccountOwner(accountId: bigint): Promise<string> {
+    await this.init();
+    const nft = await this.resolveContract('DKGPublishingConvictionNFT');
+    const owner = await nft.ownerOf(accountId);
+    return ethers.getAddress(owner);
+  }
+
   async getConvictionDiscount(accountId: bigint): Promise<{ discountBps: number; conviction: bigint }> {
     await this.init();
     if (!this.contracts.publishingConvictionAccount) {

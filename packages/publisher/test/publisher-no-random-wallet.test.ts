@@ -307,6 +307,32 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 
+  it('infers adapter-backed signer address for direct DKGPublisher consumers', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new AdapterSigningChain(wallet);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 1n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-inferred-signer',
+        predicate: 'http://schema.org/name',
+        object: '"AdapterInferredSigner"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
   it('binds context-graph-aware adapter signer resolution to the V10 tx publisher address', async () => {
     const keypair = await generateEd25519Keypair();
     const primaryWallet = new ethers.Wallet(TEST_KEY);

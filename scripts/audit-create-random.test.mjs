@@ -197,6 +197,21 @@ describe('findHits', () => {
     assert.equal(hits[0].identifier, 'EthersWallet');
   });
 
+  it('REGRESSION (PR #371 round 5): finds optional chaining calls', () => {
+    const hits = findHits('const w = Wallet?.createRandom();');
+    assert.equal(hits.length, 1);
+  });
+
+  it('REGRESSION (PR #371 round 5): finds bracket-property calls', () => {
+    const hits = findHits('const w = Wallet["createRandom"]();');
+    assert.equal(hits.length, 1);
+  });
+
+  it('REGRESSION (PR #371 round 5): finds optional bracket-property calls', () => {
+    const hits = findHits("const w = Wallet?.['createRandom']?.();");
+    assert.equal(hits.length, 1);
+  });
+
   it('does NOT report calls inside string literals', () => {
     const hits = findHits('const s = "Wallet.createRandom()";');
     assert.equal(hits.length, 0);

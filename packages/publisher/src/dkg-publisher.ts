@@ -82,6 +82,12 @@ function normalizePublisherAddress(address: string | undefined): string | undefi
   return normalized;
 }
 
+function coercePublisherAddress(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !ethers.isAddress(value)) return undefined;
+  const normalized = ethers.getAddress(value);
+  return normalized === ethers.ZeroAddress ? undefined : normalized;
+}
+
 export interface ShareOptions {
   publisherPeerId: string;
   operationCtx?: OperationContext;
@@ -257,7 +263,6 @@ export class DKGPublisher implements Publisher {
   private publisherNodeIdentityId: bigint;
   private publisherAddress?: string;
   private readonly publisherAddressResolver?: (contextGraphId?: bigint) => Promise<string | undefined>;
-  private readonly dynamicallyResolvePublisherAddress: boolean;
   private readonly publisherWallet?: ethers.Wallet;
   /** Additional wallets that can provide receiver signatures. */
   private readonly additionalSignerWallets: ethers.Wallet[] = [];
@@ -275,9 +280,6 @@ export class DKGPublisher implements Publisher {
     this.publisherAddressResolver = config.publisherAddressResolver;
 
     const configuredPublisherAddress = normalizePublisherAddress(config.publisherAddress);
-    this.dynamicallyResolvePublisherAddress = !config.publisherPrivateKey &&
-      !configuredPublisherAddress &&
-      typeof config.publisherAddressResolver === 'function';
     if (config.publisherPrivateKey) {
       this.publisherWallet = new ethers.Wallet(config.publisherPrivateKey);
       this.publisherAddress = this.publisherWallet.address;
@@ -320,17 +322,71 @@ export class DKGPublisher implements Publisher {
     this.writeLocks = config.writeLocks ?? new Map();
   }
 
-  private requirePublisherAddress(operation: string): string {
-    if (!this.publisherAddress) throw new PublisherWalletRequiredError(operation);
-    return this.publisherAddress;
+  private requirePublisherAddress(operation: string, address = this.publisherAddress): string {
+    if (!address) throw new PublisherWalletRequiredError(operation);
+    return address;
   }
 
-  private async resolvePublisherAddress(contextGraphId?: bigint): Promise<void> {
-    if (!this.publisherAddressResolver) return;
-    if (this.publisherAddress && !this.dynamicallyResolvePublisherAddress) return;
-    const resolved = normalizePublisherAddress(await this.publisherAddressResolver(contextGraphId));
-    if (resolved || this.dynamicallyResolvePublisherAddress) {
-      this.publisherAddress = resolved;
+  private async resolvePublisherAddress(contextGraphId?: bigint): Promise<string | undefined> {
+    if (this.publisherAddress) return this.publisherAddress;
+    if (this.publisherAddressResolver) {
+      return normalizePublisherAddress(await this.publisherAddressResolver(contextGraphId));
+    }
+    return this.inferAdapterPublisherAddress(contextGraphId);
+  }
+
+  private async inferAdapterPublisherAddress(contextGraphId?: bigint): Promise<string | undefined> {
+    if (contextGraphId !== undefined && typeof this.chain.getAuthorizedPublisherAddress === 'function') {
+      try {
+        const address = coercePublisherAddress(await this.chain.getAuthorizedPublisherAddress(contextGraphId));
+        if (address) return address;
+      } catch {
+        // Best-effort inference; the publish path will fail clearly if no signer resolves.
+      }
+    }
+
+    const signerAddressGetter = (this.chain as unknown as { getSignerAddress?: () => unknown }).getSignerAddress;
+    if (typeof signerAddressGetter === 'function') {
+      try {
+        const address = coercePublisherAddress(signerAddressGetter.call(this.chain));
+        if (address) return address;
+      } catch {
+        // Fall through to other common adapter surfaces.
+      }
+    }
+
+    const signerAddressesGetter = (this.chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
+    if (typeof signerAddressesGetter === 'function') {
+      try {
+        const advertised = signerAddressesGetter.call(this.chain);
+        if (Array.isArray(advertised)) {
+          for (const value of advertised) {
+            const address = coercePublisherAddress(value);
+            if (address) return address;
+          }
+        }
+      } catch {
+        // Fall through to legacy adapter surfaces.
+      }
+    }
+
+    const signerAddress = coercePublisherAddress(
+      (this.chain as unknown as { signerAddress?: unknown }).signerAddress,
+    );
+    if (signerAddress) return signerAddress;
+
+    if (this.chain.chainId === 'none' || typeof this.chain.signMessage !== 'function') return undefined;
+
+    try {
+      const challenge = ethers.getBytes(ethers.id('dkg-publisher:publisher-address-probe'));
+      const compact = await this.chain.signMessage(challenge);
+      const signature = ethers.Signature.from({
+        r: ethers.hexlify(compact.r),
+        yParityAndS: ethers.hexlify(compact.vs),
+      }).serialized;
+      return coercePublisherAddress(ethers.verifyMessage(challenge, signature));
+    } catch {
+      return undefined;
     }
   }
 
@@ -342,7 +398,7 @@ export class DKGPublisher implements Publisher {
     return address === ethers.ZeroAddress ? '0x0000000000000000000000000000000000000001' : address;
   }
 
-  private getPublisherSigner(): PublisherSigner | undefined {
+  private getPublisherSigner(address = this.publisherAddress): PublisherSigner | undefined {
     if (this.publisherWallet && this.publisherAddress) {
       const wallet = this.publisherWallet;
       return {
@@ -353,10 +409,10 @@ export class DKGPublisher implements Publisher {
     }
 
     if (
-      this.publisherAddress &&
+      address &&
       (typeof this.chain.signMessageAs === 'function' || typeof this.chain.signMessage === 'function')
     ) {
-      const expectedAddress = this.publisherAddress;
+      const expectedAddress = address;
       return {
         address: expectedAddress,
         source: 'chainAdapter',
@@ -381,12 +437,6 @@ export class DKGPublisher implements Publisher {
     }
 
     return undefined;
-  }
-
-  private requirePublisherSigner(operation: string): PublisherSigner {
-    const signer = this.getPublisherSigner();
-    if (!signer) throw new PublisherWalletRequiredError(operation);
-    return signer;
   }
 
   private async withWriteLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
@@ -1118,9 +1168,9 @@ export class DKGPublisher implements Publisher {
     } catch {
       // Descriptive SWM graph names stay on the existing tentative/mock path.
     }
-    await this.resolvePublisherAddress(publisherContextGraphId);
-    const publisherSigner = this.getPublisherSigner();
-    const publisherAddress = this.publisherAddress ?? this.localTentativePublisherAddress();
+    const resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
+    const publisherSigner = this.getPublisherSigner(resolvedPublisherAddress);
+    const publisherAddress = resolvedPublisherAddress ?? this.localTentativePublisherAddress();
     const canAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherSigner !== undefined;
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {
@@ -1393,7 +1443,6 @@ export class DKGPublisher implements Publisher {
       v10ChainId !== undefined &&
       v10KavAddress !== undefined
     ) {
-      const publisherSigner = this.getPublisherSigner();
       if (publisherSigner) {
         const reason = !options.v10ACKProvider ? 'no v10ACKProvider (single-node mode)' : 'ACK collection failed/skipped';
         this.log.info(ctx, `Self-signing ACK — ${reason}`);
@@ -1442,7 +1491,7 @@ export class DKGPublisher implements Publisher {
       try {
         onPhase?.('chain:sign', 'start');
         signStarted = true;
-        const publisherSigner = this.requirePublisherSigner('publish');
+        if (!publisherSigner) throw new PublisherWalletRequiredError('publish');
         this.log.info(
           ctx,
           `Signing on-chain publish (identityId=${identityId}, signer=${publisherSigner.address}, source=${publisherSigner.source})`,
@@ -1733,10 +1782,10 @@ export class DKGPublisher implements Publisher {
     } catch {
       // Descriptive SWM graph names are valid local/mock update scopes.
     }
-    await this.resolvePublisherAddress(publisherContextGraphId);
+    const resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
     const localOnlyUpdate = this.chain.chainId === 'none';
-    const publisherAddress = this.publisherAddress ?? (
-      localOnlyUpdate ? this.localTentativePublisherAddress() : this.requirePublisherAddress('update')
+    const publisherAddress = resolvedPublisherAddress ?? (
+      localOnlyUpdate ? this.localTentativePublisherAddress() : this.requirePublisherAddress('update', resolvedPublisherAddress)
     );
     this.log.info(ctx, `Updating kcId=${kcId} with ${quads.length} triples`);
     const dataGraph = this.graphManager.dataGraphUri(contextGraphId);

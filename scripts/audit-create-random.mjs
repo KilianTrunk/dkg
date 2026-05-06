@@ -24,11 +24,11 @@
  * What it does
  * ------------
  * Walks every `.ts` / `.tsx` / `.mts` / `.cts` / `.js` / `.jsx` / `.mjs` /
- * `.cjs` source file under root `scripts/**` and
- * `packages/*\/{src,utils,scripts}/**`, then fails if it finds
- * `Wallet.createRandom(` (including obvious `Wallet` aliases) outside the
- * explicitly allowlisted call sites below. Each allowlist entry pins ONE
- * expected hit with a one-line
+ * `.cjs` source file under root `scripts/**` and every non-test package
+ * source under `packages/**`, then fails if it finds `Wallet.createRandom(`
+ * (including obvious `Wallet` aliases and equivalent optional/bracket access
+ * forms) outside the explicitly allowlisted call sites below. Each allowlist
+ * entry pins ONE expected hit with a one-line
  * justification — adding a second `createRandom()` to the same file does
  * NOT inherit the existing exemption and must be reviewed on its own.
  *
@@ -341,8 +341,9 @@ export function findHits(originalText) {
   const seen = new Set();
 
   for (const alias of walletAliases) {
-    const pattern = new RegExp(String.raw`\b${escapeRegExp(alias)}\s*\.\s*createRandom\s*\(`, 'g');
+    const pattern = new RegExp(String.raw`\b${escapeRegExp(alias)}\b`, 'g');
     for (const m of stripped.matchAll(pattern)) {
+      if (!matchesCreateRandomCall(originalText, stripped, m.index + alias.length)) continue;
       if (seen.has(m.index)) continue;
       seen.add(m.index);
       hits.push(hitFromIndex(originalText, stripped, m.index, alias));
@@ -351,6 +352,73 @@ export function findHits(originalText) {
 
   hits.sort((a, b) => a.index - b.index);
   return hits.map(({ index: _index, ...hit }) => hit);
+}
+
+function skipWhitespace(text, index) {
+  let i = index;
+  while (i < text.length && /\s/.test(text[i])) i += 1;
+  return i;
+}
+
+function readQuotedProperty(originalText, index) {
+  const quote = originalText[index];
+  if (quote !== '"' && quote !== "'") return null;
+  let value = '';
+  let i = index + 1;
+  while (i < originalText.length) {
+    const c = originalText[i];
+    if (c === '\\' && i + 1 < originalText.length) {
+      value += originalText[i + 1];
+      i += 2;
+      continue;
+    }
+    if (c === quote) return { value, end: i + 1 };
+    value += c;
+    i += 1;
+  }
+  return null;
+}
+
+function matchesCreateRandomCall(originalText, stripped, indexAfterAlias) {
+  let i = skipWhitespace(stripped, indexAfterAlias);
+
+  if (stripped.startsWith('?.[', i)) {
+    i += 3;
+    const property = readQuotedProperty(originalText, skipWhitespace(originalText, i));
+    if (!property || property.value !== 'createRandom') return false;
+    i = skipWhitespace(originalText, property.end);
+    if (stripped[i] !== ']') return false;
+    i = skipWhitespace(stripped, i + 1);
+    if (stripped.startsWith('?.', i)) i = skipWhitespace(stripped, i + 2);
+    return stripped[i] === '(';
+  }
+
+  if (stripped[i] === '[') {
+    i += 1;
+    const property = readQuotedProperty(originalText, skipWhitespace(originalText, i));
+    if (!property || property.value !== 'createRandom') return false;
+    i = skipWhitespace(originalText, property.end);
+    if (stripped[i] !== ']') return false;
+    i = skipWhitespace(stripped, i + 1);
+    if (stripped.startsWith('?.', i)) i = skipWhitespace(stripped, i + 2);
+    return stripped[i] === '(';
+  }
+
+  if (stripped.startsWith('?.', i)) {
+    i += 2;
+  } else if (stripped[i] === '.') {
+    i += 1;
+  } else {
+    return false;
+  }
+
+  i = skipWhitespace(stripped, i);
+  if (!stripped.startsWith('createRandom', i)) return false;
+  const afterName = i + 'createRandom'.length;
+  if (/[\w$]/.test(stripped[afterName] ?? '')) return false;
+  i = skipWhitespace(stripped, afterName);
+  if (stripped.startsWith('?.', i)) i = skipWhitespace(stripped, i + 2);
+  return stripped[i] === '(';
 }
 
 function hitFromIndex(originalText, stripped, index, identifier) {
@@ -422,13 +490,6 @@ function collectWalletAliases(stripped) {
 
 async function main() {
   const packagesDir = join(REPO_ROOT, 'packages');
-  let pkgs;
-  try {
-    pkgs = await readdir(packagesDir, { withFileTypes: true });
-  } catch (err) {
-    console.error(`audit-create-random: cannot read ${packagesDir}: ${err.message}`);
-    return 2;
-  }
   const violations = [];
   const seenAllowlistPaths = new Set();
 
@@ -462,13 +523,7 @@ async function main() {
   };
 
   await scanRoot(join(REPO_ROOT, 'scripts'));
-
-  for (const pkg of pkgs) {
-    if (!pkg.isDirectory() || pkg.name.startsWith('.')) continue;
-    for (const subdir of ['src', 'utils', 'scripts']) {
-      await scanRoot(join(packagesDir, pkg.name, subdir));
-    }
-  }
+  await scanRoot(packagesDir);
 
   // A stale allowlist entry is itself a violation — we don't want exemptions
   // to silently outlive the file/call site they were granted for.

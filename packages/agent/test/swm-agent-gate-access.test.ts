@@ -17,7 +17,11 @@ interface DKGAgentInternals {
   localAgents: Map<string, AgentKeyRecord>;
   defaultAgentAddress?: string;
   canReadContextGraph(contextGraphId: string): Promise<boolean>;
-  canUseSharedMemoryForContextGraph(contextGraphId: string): Promise<boolean>;
+  canUseSharedMemoryForContextGraph(
+    contextGraphId: string,
+    opts?: { callerAgentAddress?: string },
+  ): Promise<boolean>;
+  reconcileSharedMemoryGossipSubscription(contextGraphId: string): Promise<void>;
 }
 
 class FakeGossip {
@@ -119,10 +123,15 @@ async function insertSharedMemorySecret(agent: DKGAgent, contextGraphId: string,
   return subject;
 }
 
-async function querySharedMemoryName(agent: DKGAgent, contextGraphId: string, subject: string) {
+async function querySharedMemoryName(
+  agent: DKGAgent,
+  contextGraphId: string,
+  subject: string,
+  opts: { callerAgentAddress?: string } = {},
+) {
   return agent.query(
     `SELECT ?name WHERE { <${subject}> <https://schema.org/name> ?name }`,
-    { contextGraphId, view: 'shared-working-memory' },
+    { contextGraphId, view: 'shared-working-memory', ...opts },
   );
 }
 
@@ -135,6 +144,24 @@ describe('DKGAgent SWM agent-gate access', () => {
     await flushAsync();
 
     expect(gossip.subscribed.has(paranetWorkspaceTopic(contextGraphId))).toBe(false);
+  });
+
+  it('does not subscribe to SWM for explicit private context graphs without an enforceable allowlist', async () => {
+    const { agent, internals, gossip } = await createAgent();
+    const contextGraphId = 'swm-private-no-allowlist';
+    await insertAccessMeta(agent, contextGraphId, {
+      accessPolicy: 'private',
+    });
+    const subject = await insertSharedMemorySecret(agent, contextGraphId, 'NoAllowlistSecret');
+
+    agent.subscribeToContextGraph(contextGraphId);
+    await flushAsync();
+
+    expect(await internals.canReadContextGraph(contextGraphId)).toBe(true);
+    expect(await internals.canUseSharedMemoryForContextGraph(contextGraphId)).toBe(false);
+    expect(gossip.subscribed.has(paranetWorkspaceTopic(contextGraphId))).toBe(false);
+    const result = await querySharedMemoryName(agent, contextGraphId, subject);
+    expect(result.bindings).toHaveLength(0);
   });
 
   it('subscribes to SWM for ontology-confirmed open context graphs without local _meta', async () => {
@@ -167,6 +194,69 @@ describe('DKGAgent SWM agent-gate access', () => {
     const result = await querySharedMemoryName(agent, contextGraphId, subject);
     expect(result.bindings).toHaveLength(1);
     expect(result.bindings[0]?.['name']).toBe('"PeerInviteSecret"');
+  });
+
+  it('scopes SWM queries to the authenticated caller agent on multi-agent nodes', async () => {
+    const { agent, internals, gossip } = await createAgent();
+    const contextGraphId = 'swm-agent-caller-scope';
+    const allowedWallet = ethers.Wallet.createRandom();
+    const deniedWallet = ethers.Wallet.createRandom();
+    const allowedRecord = agentFromPrivateKey(allowedWallet.privateKey, 'allowed');
+    const deniedRecord = agentFromPrivateKey(deniedWallet.privateKey, 'denied');
+    internals.localAgents.set(allowedRecord.agentAddress, allowedRecord);
+    internals.localAgents.set(deniedRecord.agentAddress, deniedRecord);
+    internals.defaultAgentAddress = allowedRecord.agentAddress;
+    await insertAccessMeta(agent, contextGraphId, {
+      agentGatePredicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
+      agentAddress: allowedRecord.agentAddress,
+    });
+    const subject = await insertSharedMemorySecret(agent, contextGraphId, 'CallerScopeSecret');
+
+    agent.subscribeToContextGraph(contextGraphId);
+    await flushAsync();
+
+    expect(gossip.subscribed.has(paranetWorkspaceTopic(contextGraphId))).toBe(true);
+    expect(await internals.canUseSharedMemoryForContextGraph(contextGraphId, {
+      callerAgentAddress: deniedRecord.agentAddress,
+    })).toBe(false);
+    const deniedResult = await querySharedMemoryName(agent, contextGraphId, subject, {
+      callerAgentAddress: deniedRecord.agentAddress,
+    });
+    expect(deniedResult.bindings).toHaveLength(0);
+    const allowedResult = await querySharedMemoryName(agent, contextGraphId, subject, {
+      callerAgentAddress: allowedRecord.agentAddress,
+    });
+    expect(allowedResult.bindings).toHaveLength(1);
+    expect(allowedResult.bindings[0]?.['name']).toBe('"CallerScopeSecret"');
+  });
+
+  it('unsubscribes from SWM when the local agent loses its allowlist entry', async () => {
+    const { agent, internals, gossip } = await createAgent();
+    const contextGraphId = 'swm-agent-revoked';
+    const allowedWallet = ethers.Wallet.createRandom();
+    const allowedRecord = agentFromPrivateKey(allowedWallet.privateKey, 'allowed');
+    internals.localAgents.set(allowedRecord.agentAddress, allowedRecord);
+    internals.defaultAgentAddress = allowedRecord.agentAddress;
+    await insertAccessMeta(agent, contextGraphId, {
+      agentGatePredicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
+      agentAddress: allowedRecord.agentAddress,
+    });
+
+    agent.subscribeToContextGraph(contextGraphId);
+    await flushAsync();
+
+    expect(gossip.subscribed.has(paranetWorkspaceTopic(contextGraphId))).toBe(true);
+
+    await agent.store.deleteByPattern({
+      graph: contextGraphMetaUri(contextGraphId),
+      subject: contextGraphDataUri(contextGraphId),
+      predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
+      object: `"${allowedRecord.agentAddress}"`,
+    });
+    await internals.reconcileSharedMemoryGossipSubscription(contextGraphId);
+
+    expect(await internals.canUseSharedMemoryForContextGraph(contextGraphId)).toBe(false);
+    expect(gossip.subscribed.has(paranetWorkspaceTopic(contextGraphId))).toBe(false);
   });
 
   it.each([

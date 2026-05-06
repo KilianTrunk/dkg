@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { validateLiftPublishPayload, type LiftValidationInput } from '../src/index.js';
+import { sha256 } from '@origintrail-official/dkg-core';
 
 describe('validateLiftPublishPayload', () => {
   function baseInput(): LiftValidationInput {
@@ -48,13 +49,23 @@ describe('validateLiftPublishPayload', () => {
     };
   }
 
-  it('validates resolved lift payloads and preserves source root IRIs', () => {
+  function canonicalRoot(root: string): string {
+    const digest = sha256(new TextEncoder().encode(root));
+    const suffix = Array.from(digest)
+      .slice(0, 6)
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+    return `dkg:music-social:aloha:person-profile/rihana-${suffix}`;
+  }
+
+  it('validates and canonicalizes resolved lift payloads', () => {
     const validated = validateLiftPublishPayload(baseInput());
+    const expectedCanonicalRoot = canonicalRoot('urn:local:/rihana');
 
     expect(validated.validation).toEqual({
-      canonicalRoots: ['urn:local:/rihana'],
+      canonicalRoots: [expectedCanonicalRoot],
       canonicalRootMap: {
-        'urn:local:/rihana': 'urn:local:/rihana',
+        'urn:local:/rihana': expectedCanonicalRoot,
       },
       swmQuadCount: 4,
       authorityProofRef: 'proof:owner:1',
@@ -63,12 +74,12 @@ describe('validateLiftPublishPayload', () => {
     });
 
     expect(validated.resolved.quads.map((quad) => quad.subject)).toEqual([
-      'urn:local:/rihana',
-      'urn:local:/rihana/.well-known/genid/child-1',
-      'urn:local:/rihana',
+      expectedCanonicalRoot,
+      `${expectedCanonicalRoot}/.well-known/genid/child-1`,
+      expectedCanonicalRoot,
     ]);
-    expect(validated.resolved.quads[2]?.object).toBe('urn:local:/rihana');
-    expect(validated.resolved.privateQuads?.[0]?.subject).toBe('urn:local:/rihana');
+    expect(validated.resolved.quads[2]?.object).toBe(expectedCanonicalRoot);
+    expect(validated.resolved.privateQuads?.[0]?.subject).toBe(expectedCanonicalRoot);
   });
 
   it('rejects missing authority proof refs', () => {

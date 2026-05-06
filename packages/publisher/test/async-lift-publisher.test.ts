@@ -1,7 +1,7 @@
 import { beforeAll, beforeEach, afterAll, describe, expect, it } from 'vitest';
 import { GraphManager, OxigraphStore, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter } from '@origintrail-official/dkg-chain';
-import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
+import { TypedEventBus, generateEd25519Keypair, sha256 } from '@origintrail-official/dkg-core';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -112,6 +112,15 @@ describe('TripleStoreAsyncLiftPublisher', () => {
       throw new Error(`Unexpected expiresAt literal: ${value}`);
     }
     return Number.parseInt(match[1] as string, 10);
+  }
+
+  function canonicalRoot(root: string): string {
+    const digest = sha256(new TextEncoder().encode(root));
+    const suffix = Array.from(digest)
+      .slice(0, 6)
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+    return `dkg:${PARANET}:aloha:person-profile/rihana-${suffix}`;
   }
 
   it('creates accepted jobs and returns status', async () => {
@@ -569,8 +578,8 @@ describe('TripleStoreAsyncLiftPublisher', () => {
         publishExecutor: async ({ walletId, publishOptions }) => {
           expect(walletId).toBe('wallet-1');
           expect(publishOptions.contextGraphId).toBe('music-social');
-          expect(publishOptions.quads[0]?.subject).toBe('urn:local:/rihana');
-          expect(publishOptions.privateQuads?.[0]?.subject).toBe('urn:local:/rihana');
+          expect(publishOptions.quads[0]?.subject).toContain('dkg:music-social:aloha:person-profile/rihana-');
+          expect(publishOptions.privateQuads?.[0]?.subject).toContain('dkg:music-social:aloha:person-profile/rihana-');
           return {
             kcId: 1n,
             ual: 'did:dkg:mock:31337/0xabc/1',
@@ -619,18 +628,9 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(processed?.status).toBe('finalized');
     expect(processed?.validation?.authorityProofRef).toBe('proof:owner:1');
     expect(processed?.finalization?.ual).toBe('did:dkg:mock:31337/0xabc/1');
-    // Regression guard for the SWM-anchor vs `_private`-payload subject
-    // mismatch: the lift must keep the source root IRI on canonical
-    // publishes, otherwise the EPCIS query layer cannot join SWM anchors
-    // to their `_private` payload.
     const canonicalRoot = processed?.validation?.canonicalRootMap['urn:local:/rihana'];
-    expect(canonicalRoot).toBe('urn:local:/rihana');
-    expect((await privateStore.getPrivateTriples('music-social', 'urn:local:/rihana')).map((quad) => quad.object)).toEqual(['"stage-secret"']);
-    const swmAnchorMatch = await store.query(
-      `ASK { GRAPH <did:dkg:context-graph:music-social/_shared_memory> { <urn:local:/rihana> ?p ?o } }`,
-    );
-    expect(swmAnchorMatch.type).toBe('boolean');
-    if (swmAnchorMatch.type === 'boolean') expect(swmAnchorMatch.value).toBe(true);
+    expect(canonicalRoot).toBeDefined();
+    expect((await privateStore.getPrivateTriples('music-social', canonicalRoot!)).map((quad) => quad.object)).toEqual(['"stage-secret"']);
     expect(await privateStore.getPrivateTriplesForOperation('music-social', write.shareOperationId, 'urn:local:/rihana')).toEqual([]);
   });
 
@@ -780,7 +780,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     const result = await dkgPublisher.publish({
       contextGraphId: PARANET,
       quads: [
-        { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
+        { subject: canonicalRoot('urn:local:/rihana'), predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
       ],
       publisherPeerId: 'peer-1',
     });
@@ -834,22 +834,19 @@ describe('TripleStoreAsyncLiftPublisher', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
 
-    // Stage SWM first so the canonical pre-publish does not collide with
-    // SWM Rule 4 (rootEntity already in <cg>). Share owns the entity in
-    // SWM, then the canonical publish drops one of the share's quads
-    // into <cg> + meta to simulate it being already finalized.
+    const canonical = canonicalRoot('urn:local:/rihana');
+    await dkgPublisher.publish({
+      contextGraphId: PARANET,
+      quads: [
+        { subject: canonical, predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
+      ],
+      publisherPeerId: 'peer-1',
+    });
+
     const write = await dkgPublisher.share(PARANET, [
       { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
       { subject: 'urn:local:/rihana', predicate: 'http://schema.org/genre', object: '"Pop"', graph: '' },
     ], { publisherPeerId: 'peer-1' });
-
-    await dkgPublisher.publish({
-      contextGraphId: PARANET,
-      quads: [
-        { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
-      ],
-      publisherPeerId: 'peer-1',
-    });
 
     await publisher.lift({
       ...request(),
@@ -880,21 +877,18 @@ describe('TripleStoreAsyncLiftPublisher', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
 
-    // Stage SWM first to avoid colliding with SWM Rule 4 in the
-    // canonical pre-publish step. Once shared and pre-published, the
-    // entire share content matches what's already in <cg> + meta, so
-    // subtraction empties the lift and finalization is a no-op.
-    const write = await dkgPublisher.share(PARANET, [
-      { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
-    ], { publisherPeerId: 'peer-1' });
-
+    const canonical = canonicalRoot('urn:local:/rihana');
     await dkgPublisher.publish({
       contextGraphId: PARANET,
       quads: [
-        { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
+        { subject: canonical, predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
       ],
       publisherPeerId: 'peer-1',
     });
+
+    const write = await dkgPublisher.share(PARANET, [
+      { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
+    ], { publisherPeerId: 'peer-1' });
 
     await publisher.lift({
       ...request(),

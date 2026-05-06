@@ -1,4 +1,5 @@
 import type { Quad } from '@origintrail-official/dkg-storage';
+import { sha256 } from '@origintrail-official/dkg-core';
 import type { LiftResolvedPublishSlice } from './async-lift-publish-options.js';
 import type { LiftJobValidationMetadata, LiftRequest } from './lift-job.js';
 
@@ -97,19 +98,31 @@ function canonicalizeTerm(term: string, canonicalRootMap: Record<string, string>
   return term;
 }
 
-// Canonical root IRI is the source root, unchanged. Earlier revisions
-// remapped roots to `dkg:<cg>:<ns>:<scope>/<tail>-<hash>`, but that broke
-// joins between SWM-partition reads (anchor under source IRI) and
-// finalized-partition reads (payload under remapped IRI). Keeping a
-// single IRI for the same logical event across SWM, canonical CG data,
-// and `_private` is the only way the EPCIS query layer can join anchor
-// and payload across those partitions.
-function canonicalRootIri(_request: LiftRequest, root: string): string {
-  return root;
+export function canonicalRootIri(request: LiftRequest, root: string): string {
+  const rootName = slugPart(rootTail(root));
+  const rootHash = shortRootHash(root);
+  return `dkg:${slugPart(request.contextGraphId)}:${slugPart(request.namespace)}:${slugPart(request.scope)}/${rootName}-${rootHash}`;
 }
 
 function normalizeRoots(roots: readonly string[]): string[] {
   return [...new Set(roots.map((root) => root.trim()).filter(Boolean))];
+}
+
+function rootTail(root: string): string {
+  const trimmed = root.trim();
+  const slashIndex = trimmed.lastIndexOf('/');
+  const colonIndex = trimmed.lastIndexOf(':');
+  const cutIndex = Math.max(slashIndex, colonIndex);
+  return cutIndex >= 0 ? trimmed.slice(cutIndex + 1) : trimmed;
+}
+
+function slugPart(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || 'unknown';
 }
 
 function normalizePriorVersion(priorVersion: string | undefined): string | undefined {
@@ -141,4 +154,12 @@ function assertNoCanonicalRootCollisions(canonicalRootMap: Record<string, string
     }
     reverse.set(canonicalRoot, sourceRoot);
   }
+}
+
+function shortRootHash(root: string): string {
+  const digest = sha256(new TextEncoder().encode(root));
+  return Array.from(digest)
+    .slice(0, 6)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
 }

@@ -253,6 +253,7 @@ export class EVMChainAdapter implements ChainAdapter {
   /** Admin signer — used only for profile/key-management operations. */
   private readonly adminSigner?: Wallet;
   private signerIndex = 0;
+  private signerSelectionQueue: Promise<void> = Promise.resolve();
   private readonly hubAddress: string;
   private contracts: ContractCache;
   private initialized = false;
@@ -368,11 +369,21 @@ export class EVMChainAdapter implements ChainAdapter {
     return s;
   }
 
-  private findSignerByAddress(address: string): { signer: Wallet; index: number } | undefined {
+  private findSignerByAddress(address: string): Wallet | undefined {
     const normalized = ethers.getAddress(address).toLowerCase();
-    const index = this.signerPool.findIndex((signer) => signer.address.toLowerCase() === normalized);
-    if (index === -1) return undefined;
-    return { signer: this.signerPool[index], index };
+    return this.signerPool.find((signer) => signer.address.toLowerCase() === normalized);
+  }
+
+  private async withSignerSelectionLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.signerSelectionQueue;
+    let release!: () => void;
+    this.signerSelectionQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
   }
 
   /**
@@ -381,51 +392,38 @@ export class EVMChainAdapter implements ChainAdapter {
    * when the auth surface is unavailable.
    */
   private async nextAuthorizedSigner(contextGraphId: bigint): Promise<Wallet> {
-    if (!this.contracts.contextGraphs) {
-      return this.nextSigner();
-    }
-
-    const start = this.signerIndex % this.signerPool.length;
-    for (let i = 0; i < this.signerPool.length; i += 1) {
-      const idx = (start + i) % this.signerPool.length;
-      const signer = this.signerPool[idx];
-      const authorized = await this.contracts.contextGraphs.isAuthorizedPublisher(contextGraphId, signer.address);
-      if (authorized) {
-        this.signerIndex = idx + 1;
-        return signer;
+    return this.withSignerSelectionLock(async () => {
+      if (!this.contracts.contextGraphs) {
+        return this.nextSigner();
       }
-    }
 
-    throw new Error(
-      `No authorized publisher wallet found in signer pool for context graph ${contextGraphId.toString()}. ` +
-      'Ensure at least one configured wallet is permitted by on-chain publish authority.',
-    );
+      const start = this.signerIndex % this.signerPool.length;
+      for (let i = 0; i < this.signerPool.length; i += 1) {
+        const idx = (start + i) % this.signerPool.length;
+        const signer = this.signerPool[idx];
+        const authorized = await this.contracts.contextGraphs.isAuthorizedPublisher(contextGraphId, signer.address);
+        if (authorized) {
+          this.signerIndex = idx + 1;
+          return signer;
+        }
+      }
+
+      throw new Error(
+        `No authorized publisher wallet found in signer pool for context graph ${contextGraphId.toString()}. ` +
+        'Ensure at least one configured wallet is permitted by on-chain publish authority.',
+      );
+    });
   }
 
   /**
-   * Inspect the same authorized-signer order as `nextAuthorizedSigner`, but do
-   * not advance the round-robin cursor. The publisher uses this to bind
-   * off-chain signatures to the tx signer before `publishDirect` is submitted.
+   * Reserve the next authorized signer and return its address. The publisher
+   * uses this to bind off-chain signatures to the tx signer before
+   * `publishDirect` is submitted.
    */
   async getAuthorizedPublisherAddress(contextGraphId: bigint): Promise<string> {
     await this.init();
 
-    if (!this.contracts.contextGraphs) {
-      return this.signerPool[this.signerIndex % this.signerPool.length].address;
-    }
-
-    const start = this.signerIndex % this.signerPool.length;
-    for (let i = 0; i < this.signerPool.length; i += 1) {
-      const idx = (start + i) % this.signerPool.length;
-      const signer = this.signerPool[idx];
-      const authorized = await this.contracts.contextGraphs.isAuthorizedPublisher(contextGraphId, signer.address);
-      if (authorized) return signer.address;
-    }
-
-    throw new Error(
-      `No authorized publisher wallet found in signer pool for context graph ${contextGraphId.toString()}. ` +
-      'Ensure at least one configured wallet is permitted by on-chain publish authority.',
-    );
+    return (await this.nextAuthorizedSigner(contextGraphId)).address;
   }
 
   /** All operational wallet addresses (for display / funding). */
@@ -1674,17 +1672,16 @@ export class EVMChainAdapter implements ChainAdapter {
       if (this.contracts.contextGraphs) {
         const authorized = await this.contracts.contextGraphs.isAuthorizedPublisher(
           params.contextGraphId,
-          selected.signer.address,
+          selected.address,
         );
         if (!authorized) {
           throw new Error(
-            `Configured publisherAddress ${selected.signer.address} is not authorized to publish ` +
+            `Configured publisherAddress ${selected.address} is not authorized to publish ` +
             `to context graph ${params.contextGraphId.toString()}.`,
           );
         }
       }
-      txSigner = selected.signer;
-      this.signerIndex = selected.index + 1;
+      txSigner = selected;
     } else {
       txSigner = await this.nextAuthorizedSigner(params.contextGraphId);
     }
@@ -2464,7 +2461,7 @@ export class EVMChainAdapter implements ChainAdapter {
       throw new Error(`Cannot sign with ${address}: address is not present in the EVM signer pool.`);
     }
     const sig = ethers.Signature.from(
-      await selected.signer.signMessage(messageHash),
+      await selected.signMessage(messageHash),
     );
     return {
       r: ethers.getBytes(sig.r),

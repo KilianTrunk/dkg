@@ -2097,18 +2097,17 @@ export class DKGPublisher implements Publisher {
         );
       } catch {
         // Some legacy adapters can submit updates but cannot report the
-        // effective publisher. Fall back below so we do not throw after a
-        // successful broadcast and leave local state stale.
+        // effective publisher. Refuse confirmed metadata below rather than
+        // inventing a publisher address that did not come from chain state.
       }
     }
     onPhase?.('chain:submit', 'end');
     onPhase?.('chain', 'end');
     if (!effectivePublisherAddress) {
-      effectivePublisherAddress = this.localTentativePublisherAddress();
-      this.log.warn(
-        ctx,
-        'Chain adapter returned a successful update without publisherAddress; using deterministic local attribution address. ' +
-        'Upgrade the adapter to return TxResult.publisherAddress for exact on-chain attribution.',
+      throw new Error(
+        'Chain adapter returned a successful update without publisherAddress, and ' +
+        'getLatestMerkleRootPublisher() did not resolve a real publisher. Refusing to write ' +
+        'confirmed metadata with synthetic publisher attribution.',
       );
     }
 

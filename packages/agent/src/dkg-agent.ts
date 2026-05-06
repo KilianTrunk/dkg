@@ -4498,7 +4498,7 @@ export class DKGAgent {
       );
     }
     const publishAuthority = publishPolicy === EVM_PUBLISH_CURATED
-      ? this.getChainPublishAuthorityAddress()
+      ? await this.getChainPublishAuthorityAddress()
       : undefined;
     if (
       publishPolicy === EVM_PUBLISH_CURATED
@@ -7225,12 +7225,14 @@ export class DKGAgent {
       && ownerAddress.toLowerCase() === this.defaultAgentAddress.toLowerCase();
   }
 
-  private getChainPublishAuthorityAddress(): string | undefined {
+  private async getChainPublishAuthorityAddress(): Promise<string | undefined> {
     const chainWithSigner = this.chain as unknown as {
-      getSignerAddress?: () => string;
+      getSignerAddress?: () => unknown;
       signerAddress?: string;
     };
-    const rawAddress = chainWithSigner.getSignerAddress?.() ?? chainWithSigner.signerAddress;
+    const rawAddress = chainWithSigner.getSignerAddress
+      ? await Promise.resolve(chainWithSigner.getSignerAddress())
+      : chainWithSigner.signerAddress;
     if (rawAddress && ethers.isAddress(rawAddress)) {
       return ethers.getAddress(rawAddress);
     }

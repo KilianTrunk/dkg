@@ -275,6 +275,8 @@ export class DKGPublisher implements Publisher {
   private readonly publisherAddress?: string;
   private readonly publisherAddressResolver?: (contextGraphId?: bigint) => Promise<string | undefined>;
   private readonly publisherWallet?: ethers.Wallet;
+  private adapterSignMessagePublisherAddress?: string;
+  private readonly adapterSignMessageProbeCache = new Map<string, boolean>();
   /** Additional wallets that can provide receiver signatures. */
   private readonly additionalSignerWallets: ethers.Wallet[] = [];
   private readonly log = new Logger('DKGPublisher');
@@ -387,12 +389,18 @@ export class DKGPublisher implements Publisher {
     const operationalWallet = this.getAdapterOperationalWallet();
     if (operationalWallet) return operationalWallet.address;
 
+    if (this.adapterSignMessagePublisherAddress) return this.adapterSignMessagePublisherAddress;
     if (this.chain.chainId === 'none' || typeof this.chain.signMessage !== 'function') return undefined;
 
     try {
       const challenge = ethers.getBytes(ethers.id('dkg-publisher:publisher-address-probe'));
       const compact = await this.chain.signMessage(challenge);
-      return coercePublisherAddress(recoverCompactMessageSigner(challenge, compact));
+      const address = coercePublisherAddress(recoverCompactMessageSigner(challenge, compact));
+      if (address) {
+        this.adapterSignMessagePublisherAddress = address;
+        this.adapterSignMessageProbeCache.set(address.toLowerCase(), true);
+      }
+      return address;
     } catch {
       return undefined;
     }
@@ -419,6 +427,27 @@ export class DKGPublisher implements Publisher {
     const digest = ethers.keccak256(this.keypair.publicKey);
     const address = ethers.getAddress(ethers.dataSlice(digest, 12));
     return address === ethers.ZeroAddress ? '0x0000000000000000000000000000000000000001' : address;
+  }
+
+  private async adapterSignMessageMatchesAddress(expectedAddress: string): Promise<boolean> {
+    if (typeof this.chain.signMessage !== 'function') return false;
+
+    const cacheKey = expectedAddress.toLowerCase();
+    const cached = this.adapterSignMessageProbeCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const challenge = ethers.getBytes(ethers.id(`dkg-publisher:chain-signer-probe:${cacheKey}`));
+    try {
+      const compact = await this.chain.signMessage(challenge);
+      const recovered = recoverCompactMessageSigner(challenge, compact);
+      const matches = recovered.toLowerCase() === cacheKey;
+      this.adapterSignMessageProbeCache.set(cacheKey, matches);
+      if (matches) this.adapterSignMessagePublisherAddress = expectedAddress;
+      return matches;
+    } catch {
+      this.adapterSignMessageProbeCache.set(cacheKey, false);
+      return false;
+    }
   }
 
   private async getPublisherSigner(address = this.publisherAddress): Promise<PublisherSigner | undefined> {
@@ -456,37 +485,27 @@ export class DKGPublisher implements Publisher {
 
     if (address && typeof this.chain.signMessage === 'function') {
       const expectedAddress = address;
-      const challenge = ethers.getBytes(ethers.id(`dkg-publisher:chain-signer-probe:${expectedAddress.toLowerCase()}`));
-      let signMessageMatches = false;
-      try {
-        const compact = await this.chain.signMessage(challenge);
-        const recovered = recoverCompactMessageSigner(challenge, compact);
-        signMessageMatches = recovered.toLowerCase() === expectedAddress.toLowerCase();
-      } catch {
-        signMessageMatches = false;
-      }
-
-      if (signMessageMatches) {
-        return {
-          address: expectedAddress,
-          source: 'chainAdapter',
-          signMessage: async (message: Uint8Array) => {
-            const compact = await this.chain.signMessage!(message);
-            const signature = ethers.Signature.from({
-              r: ethers.hexlify(compact.r),
-              yParityAndS: ethers.hexlify(compact.vs),
-            }).serialized;
-            const recovered = ethers.verifyMessage(message, signature);
-            if (recovered.toLowerCase() !== expectedAddress.toLowerCase()) {
-              throw new Error(
-                `publisherAddress (${expectedAddress}) does not match ChainAdapter.signMessage signer ` +
-                `(${recovered})`,
-              );
-            }
-            return signature;
-          },
-        };
-      }
+      if (!(await this.adapterSignMessageMatchesAddress(expectedAddress))) return undefined;
+      return {
+        address: expectedAddress,
+        source: 'chainAdapter',
+        signMessage: async (message: Uint8Array) => {
+          const compact = await this.chain.signMessage!(message);
+          const signature = ethers.Signature.from({
+            r: ethers.hexlify(compact.r),
+            yParityAndS: ethers.hexlify(compact.vs),
+          }).serialized;
+          const recovered = ethers.verifyMessage(message, signature);
+          if (recovered.toLowerCase() !== expectedAddress.toLowerCase()) {
+            this.adapterSignMessageProbeCache.set(expectedAddress.toLowerCase(), false);
+            throw new Error(
+              `publisherAddress (${expectedAddress}) does not match ChainAdapter.signMessage signer ` +
+              `(${recovered})`,
+            );
+          }
+          return signature;
+        },
+      };
     }
 
     const operationalWallet = this.getAdapterOperationalWallet();
@@ -2077,8 +2096,17 @@ export class DKGPublisher implements Publisher {
     }
 
     if (!txResult.success) {
-      const failedPublisherAddress = coercePublisherAddress(txResult.publisherAddress) ??
+      let failedPublisherAddress = coercePublisherAddress(txResult.publisherAddress) ??
         publisherAddress;
+      if (!failedPublisherAddress && typeof this.chain.getLatestMerkleRootPublisher === 'function') {
+        try {
+          failedPublisherAddress = coercePublisherAddress(
+            await this.chain.getLatestMerkleRootPublisher(kcId),
+          );
+        } catch {
+          // Fall through to the clear fail-loud path below.
+        }
+      }
       if (!failedPublisherAddress) throw new PublisherWalletRequiredError('update');
       onPhase?.('chain:submit', 'end');
       onPhase?.('chain', 'end');

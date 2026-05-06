@@ -53,6 +53,12 @@ class CapturingContextGraphChainAdapter extends MockChainAdapter {
   }
 }
 
+class AsyncSignerAddressContextGraphChainAdapter extends CapturingContextGraphChainAdapter {
+  async getSignerAddress(): Promise<string> {
+    return this.signerAddress;
+  }
+}
+
 class NonRegisteringACKChainAdapter extends MockChainAdapter {
   async ensureOperationalWalletsRegistered(options?: {
     identityId?: bigint;
@@ -1902,7 +1908,7 @@ decisions: []
   });
 
   it('maps local access policy to EVM publish policy and forwards participant agents on registration', async () => {
-    const chain = new CapturingContextGraphChainAdapter();
+    const chain = new AsyncSignerAddressContextGraphChainAdapter();
     const agent = await DKGAgent.create({
       name: 'RegistrationPolicyBot',
       store: new OxigraphStore(),

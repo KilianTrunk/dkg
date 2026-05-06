@@ -133,6 +133,24 @@ class LazyReadySigningChain extends AsyncAddressSigningChain {
   }
 }
 
+class InitGatedSigningChain extends AsyncAddressSigningChain {
+  private ready = false;
+
+  override isV10Ready(): boolean {
+    return this.ready;
+  }
+
+  override async getEvmChainId(): Promise<bigint> {
+    this.ready = true;
+    return super.getEvmChainId();
+  }
+
+  override async getSignerAddress(): Promise<string> {
+    if (!this.ready) throw new Error('signer unavailable before V10 init');
+    return super.getSignerAddress();
+  }
+}
+
 class RejectingAdapterSignerChain extends AsyncAddressSigningChain {
   async signMessageAs(): Promise<{ r: Uint8Array; vs: Uint8Array }> {
     throw new Error('remote signer unavailable');
@@ -629,6 +647,32 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(chain.capturedTokenAmount).toBe(123n);
   });
 
+  it('initializes V10 readiness before resolving adapter-backed signer addresses', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new InitGatedSigningChain(wallet);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 1n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:init-before-signer-resolution',
+        predicate: 'http://schema.org/name',
+        object: '"InitBeforeSignerResolution"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
   it('continues tentatively when adapter signer fails during self-ACK', async () => {
     const keypair = await generateEd25519Keypair();
     const store = new OxigraphStore();
@@ -867,7 +911,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 
-  it('rejects adapter-managed updates when publisher attribution is unavailable', async () => {
+  it('keeps adapter-managed updates tentative when publisher attribution is unavailable', async () => {
     const keypair = await generateEd25519Keypair();
     const store = new OxigraphStore();
     const chain = new AdapterManagedUpdateChain();
@@ -878,7 +922,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       keypair,
     });
 
-    await expect(publisher.update(12n, {
+    const updated = await publisher.update(12n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-managed-update-without-address',
@@ -886,9 +930,12 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
         object: '"After"',
         graph: 'did:dkg:context-graph:1',
       }],
-    })).rejects.toThrow(/without publisherAddress.*local KC metadata.*synthetic publisher attribution/i);
+    });
 
     expect(chain.capturedPublisherAddress).toBeUndefined();
+    expect(updated.status).toBe('tentative');
+    expect(updated.onChainResult).toBeUndefined();
+    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/12$/);
 
     const stored = await store.query(`
       SELECT ?p ?o WHERE {
@@ -898,6 +945,6 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       }
     `);
     expect(stored.type).toBe('bindings');
-    expect(stored.bindings).toHaveLength(0);
+    expect(stored.bindings.length).toBeGreaterThan(0);
   });
 });

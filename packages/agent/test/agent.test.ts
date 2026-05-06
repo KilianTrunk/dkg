@@ -59,6 +59,16 @@ class AsyncSignerAddressContextGraphChainAdapter extends CapturingContextGraphCh
   }
 }
 
+class SignerListContextGraphChainAdapter extends CapturingContextGraphChainAdapter {
+  async getSignerAddress(): Promise<string> {
+    throw new Error('signer address unavailable until publish');
+  }
+
+  async getSignerAddresses(): Promise<string[]> {
+    return [this.signerAddress];
+  }
+}
+
 class NonRegisteringACKChainAdapter extends MockChainAdapter {
   async ensureOperationalWalletsRegistered(options?: {
     identityId?: bigint;
@@ -1991,7 +2001,30 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
-  it('requires address-scoped curator authority for on-chain registration', async () => {
+  it('uses best-effort adapter publisher-address inference for curated CG registration', async () => {
+    const chain = new SignerListContextGraphChainAdapter();
+    const agent = await DKGAgent.create({
+      name: 'RegistrationSignerListBot',
+      store: new OxigraphStore(),
+      chainAdapter: chain,
+      nodeRole: 'core',
+    });
+    await agent.start();
+
+    const ownerAgent = ethers.getAddress(chain.signerAddress);
+    await agent.createContextGraph({
+      id: 'register-curated-signer-list-policy',
+      name: 'Curated Signer List Policy',
+      accessPolicy: 1,
+      callerAgentAddress: ownerAgent,
+    });
+    await agent.registerContextGraph('register-curated-signer-list-policy', { callerAgentAddress: ownerAgent });
+
+    expect(chain.createOnChainContextGraphCalls[0]?.publishAuthority).toBe(ownerAgent);
+    await agent.stop().catch(() => {});
+  });
+
+	  it('requires address-scoped curator authority for on-chain registration', async () => {
     const store = new OxigraphStore();
     const chain = new CapturingContextGraphChainAdapter();
     const agent = await DKGAgent.create({

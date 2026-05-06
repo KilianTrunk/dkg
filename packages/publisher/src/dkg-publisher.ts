@@ -1295,11 +1295,11 @@ export class DKGPublisher implements Publisher {
     } catch {
       // Descriptive SWM graph names stay on the existing tentative/mock path.
     }
+    const willAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherContextGraphId !== undefined;
+    const chainV10Ready = await this.refreshChainV10Readiness();
     const resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
     const publisherSigner = await this.getPublisherSigner(resolvedPublisherAddress);
     const publisherAddress = resolvedPublisherAddress ?? this.localTentativePublisherAddress();
-    const willAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherContextGraphId !== undefined;
-    const chainV10Ready = await this.refreshChainV10Readiness();
     const canAttemptOnChainPublish = willAttemptOnChainPublish &&
       chainV10Ready &&
       publisherSigner !== undefined;
@@ -2181,11 +2181,24 @@ export class DKGPublisher implements Publisher {
     onPhase?.('chain:submit', 'end');
     onPhase?.('chain', 'end');
     if (!effectivePublisherAddress) {
-      throw new Error(
-        'Chain adapter returned a successful update without publisherAddress, and ' +
-        'neither getLatestMerkleRootPublisher() nor local KC metadata resolved a real publisher. ' +
-        'Refusing to write confirmed metadata with synthetic publisher attribution.',
+      const tentativePublisherAddress = this.localTentativePublisherAddress();
+      this.log.warn(
+        ctx,
+        'Chain adapter returned a successful update without publisherAddress, and neither ' +
+        'getLatestMerkleRootPublisher() nor local KC metadata resolved a real publisher. ' +
+        'Applying local data update as tentative instead of writing synthetic confirmed attribution.',
       );
+      await storeUpdatedQuads();
+      const result: PublishResult = {
+        kcId,
+        ual: `did:dkg:${this.chain.chainId}/${tentativePublisherAddress}/${kcId}`,
+        merkleRoot: kcMerkleRoot,
+        kaManifest: manifestEntries,
+        status: 'tentative',
+        publicQuads: allSkolemizedQuads,
+      };
+      this.eventBus.emit(DKGEvent.KA_UPDATED, result);
+      return result;
     }
 
     await storeUpdatedQuads();

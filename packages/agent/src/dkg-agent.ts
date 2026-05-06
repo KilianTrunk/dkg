@@ -4498,7 +4498,7 @@ export class DKGAgent {
       );
     }
     const publishAuthority = publishPolicy === EVM_PUBLISH_CURATED
-      ? await this.getChainPublishAuthorityAddress()
+      ? await this.getChainPublishAuthorityAddress(id)
       : undefined;
     if (
       publishPolicy === EVM_PUBLISH_CURATED
@@ -7225,18 +7225,15 @@ export class DKGAgent {
       && ownerAddress.toLowerCase() === this.defaultAgentAddress.toLowerCase();
   }
 
-  private async getChainPublishAuthorityAddress(): Promise<string | undefined> {
-    const chainWithSigner = this.chain as unknown as {
-      getSignerAddress?: () => unknown;
-      signerAddress?: string;
-    };
-    const rawAddress = chainWithSigner.getSignerAddress
-      ? await Promise.resolve(chainWithSigner.getSignerAddress())
-      : chainWithSigner.signerAddress;
-    if (rawAddress && ethers.isAddress(rawAddress)) {
-      return ethers.getAddress(rawAddress);
+  private async getChainPublishAuthorityAddress(contextGraphId?: string): Promise<string | undefined> {
+    let publisherContextGraphId: bigint | undefined;
+    try {
+      const parsed = BigInt(contextGraphId ?? '');
+      if (parsed > 0n) publisherContextGraphId = parsed;
+    } catch {
+      // Local descriptive CG ids cannot be used as adapter context hints.
     }
-    return undefined;
+    return inferAdapterPublisherAddress(this.chain, publisherContextGraphId);
   }
 
   /**

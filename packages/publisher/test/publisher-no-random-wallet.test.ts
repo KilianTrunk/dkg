@@ -109,6 +109,29 @@ class AsyncAddressSigningChain implements ChainAdapter {
   }
 }
 
+class LazyReadySigningChain extends AsyncAddressSigningChain {
+  private ready = false;
+  capturedTokenAmount?: bigint;
+
+  override isV10Ready(): boolean {
+    return this.ready;
+  }
+
+  override async getEvmChainId(): Promise<bigint> {
+    this.ready = true;
+    return super.getEvmChainId();
+  }
+
+  async getRequiredPublishTokenAmount(): Promise<bigint> {
+    return 123n;
+  }
+
+  override async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+    this.capturedTokenAmount = params.tokenAmount;
+    return super.createKnowledgeAssetsV10(params);
+  }
+}
+
 class RejectingAdapterSignerChain extends AsyncAddressSigningChain {
   async signMessageAs(): Promise<{ r: Uint8Array; vs: Uint8Array }> {
     throw new Error('remote signer unavailable');
@@ -543,6 +566,32 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(result.status).toBe('confirmed');
     expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
     expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
+  it('precomputes token amount for adapters that become V10-ready during initialization', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new LazyReadySigningChain(wallet);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 1n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:lazy-v10-ready',
+        predicate: 'http://schema.org/name',
+        object: '"LazyV10Ready"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(chain.capturedTokenAmount).toBe(123n);
   });
 
   it('continues tentatively when adapter signer fails during self-ACK', async () => {

@@ -453,6 +453,11 @@ export interface DKGAgentConfig {
   /** Private key for the V10 ACK signer. When omitted, falls back to chainConfig.operationalKeys[0]. */
   ackSignerKey?: string;
   /**
+   * Publisher EVM address used when publish signing is delegated to the
+   * ChainAdapter instead of an in-process publisherPrivateKey.
+   */
+  publisherAddress?: string;
+  /**
    * EVM chain configuration. If omitted, publishing won't have on-chain finality.
    * `adminPrivateKey` is the private key for the profile admin wallet used
    * only for profile/key-management transactions. Nodes may omit it when they
@@ -480,6 +485,44 @@ export interface DKGAgentConfig {
   contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;
   /** Durable local cache for nodes/agents known to be members of a context graph. */
   contextGraphMembershipStore?: ContextGraphMembershipStore;
+}
+
+function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !ethers.isAddress(value)) return undefined;
+  const address = ethers.getAddress(value);
+  return address === ethers.ZeroAddress ? undefined : address;
+}
+
+async function inferAdapterPublisherAddress(chain: ChainAdapter): Promise<string | undefined> {
+  const signerAddresses = (chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
+  if (typeof signerAddresses === 'function') {
+    const advertised = signerAddresses.call(chain);
+    if (Array.isArray(advertised)) {
+      for (const value of advertised) {
+        const address = normalizeAdapterPublisherAddress(value);
+        if (address) return address;
+      }
+    }
+  }
+
+  const signerAddress = normalizeAdapterPublisherAddress(
+    (chain as unknown as { signerAddress?: unknown }).signerAddress,
+  );
+  if (signerAddress) return signerAddress;
+
+  if (chain.chainId === 'none' || typeof chain.signMessage !== 'function') return undefined;
+
+  try {
+    const challenge = ethers.getBytes(ethers.id('dkg-agent:publisher-address-probe'));
+    const compact = await chain.signMessage(challenge);
+    const signature = ethers.Signature.from({
+      r: ethers.hexlify(compact.r),
+      yParityAndS: ethers.hexlify(compact.vs),
+    }).serialized;
+    return normalizeAdapterPublisherAddress(ethers.verifyMessage(challenge, signature));
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -680,12 +723,16 @@ export class DKGAgent {
     const node = new DKGNode(nodeConfig);
     const workspaceOwnedEntities = new Map<string, Map<string, string>>();
     const writeLocks = new Map<string, Promise<void>>();
+    const publisherAddress = config.publisherAddress ?? (
+      opKeys?.[0] ? undefined : await inferAdapterPublisherAddress(chain)
+    );
     const publisher = new DKGPublisher({
       store,
       chain,
       eventBus,
       keypair,
       publisherPrivateKey: opKeys?.[0],
+      publisherAddress,
       sharedMemoryOwnedEntities: workspaceOwnedEntities,
       writeLocks,
     });

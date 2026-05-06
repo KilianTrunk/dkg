@@ -40,6 +40,16 @@ async function createAgent(chainAdapter: ChainAdapter, operationalKeys?: string[
   return { agent, store, chain: chainAdapter };
 }
 
+function hideOperationalPrivateKey(chain: ChainAdapter): ChainAdapter {
+  return new Proxy(chain, {
+    get(target, prop, receiver) {
+      if (prop === 'getOperationalPrivateKey') return undefined;
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as ChainAdapter;
+}
+
 describe('v10 ACK provider wiring', () => {
   let agent: DKGAgent | undefined;
 
@@ -65,6 +75,23 @@ describe('v10 ACK provider wiring', () => {
     expect(result.status).toBe('confirmed');
     expect(result.onChainResult).toBeDefined();
     expect(typeof result.onChainResult!.batchId).toBe('bigint');
+  });
+
+  it('uses adapter-backed publisher signing when chainAdapter does not expose a private key', async () => {
+    const chain = hideOperationalPrivateKey(createEVMAdapter(HARDHAT_KEYS.CORE_OP));
+    ({ agent } = await createAgent(chain));
+
+    const cgId = 'adapter-backed-publisher-cg';
+    const expectedAddress = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
+    await agent.createContextGraph({ id: cgId, name: 'Adapter-backed Publisher CG' });
+    await agent.registerContextGraph(cgId, { callerAgentAddress: expectedAddress });
+
+    const result = await agent.publish(cgId, [
+      { subject: 'urn:test:adapter-backed-agent', predicate: 'http://schema.org/name', object: '"Adapter backed"', graph: '' },
+    ]);
+
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(expectedAddress.toLowerCase());
   });
 
   it('publishes tentatively when chain does not support V10 but a publisher key is configured', async () => {

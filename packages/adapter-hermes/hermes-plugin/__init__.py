@@ -20,7 +20,9 @@ import logging
 import os
 import hashlib
 import re
+import secrets
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
@@ -1374,24 +1376,63 @@ class DKGMemoryProvider(MemoryProvider):
     def _handle_share(self, args: Dict[str, Any]) -> str:
         if self._offline:
             return tool_error("DKG daemon is offline. Cannot share to team.")
-        content = args.get("content", "")
-        if not content:
+        # Type-validate at the runtime boundary. Without this, a malformed MCP
+        # call passing `content: {}` or `False` would crash inside _quote_literal
+        # with AttributeError on .replace, instead of returning a structured
+        # tool_error. Mirrors the OpenClaw boundary checks (PR #413 round 7).
+        if "content" not in args or args["content"] is None or args["content"] == "":
             return tool_error("Content is required.")
+        if not isinstance(args["content"], str):
+            return tool_error('"content" must be a string.')
         if "context_graph" in args:
             return tool_error('"context_graph" is not a supported parameter on dkg_share. Use "context_graph_id".')
+        if "context_graph_id" in args and args["context_graph_id"] is not None and not isinstance(args["context_graph_id"], str):
+            return tool_error('"context_graph_id" must be a string.')
+        sub_graph_name_raw = args.get("sub_graph_name")
+        if sub_graph_name_raw is not None and not isinstance(sub_graph_name_raw, str):
+            return tool_error('"sub_graph_name" must be a string.')
+        content = args["content"]
         # Aligned with OpenClaw: context_graph_id is required (no implicit
         # current-project fallback). Keeps both adapter contracts identical
         # so portable agent code works unchanged across either surface.
         cg = _first_text(args, "context_graph_id")
         if not cg:
             return tool_error("context_graph_id is required.")
+        # Mint a unique root entity per share. The publisher upserts SWM by
+        # root entity (packages/publisher/src/dkg-publisher.ts:422-429), so
+        # a stable subject would mean each share replaces the previous one
+        # rather than appending a new fact.
+        share_id = f"{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+        subject = f"urn:hermes:{self._agent_name}:shared:{share_id}"
+        # Wrap content as an N-Triples literal. The storage layer's
+        # formatTerm (packages/storage/src/adapters/oxigraph.ts:233-244)
+        # treats any object value not starting with `"` as an IRI, so raw
+        # text like `hello` would be coerced to `<hello>` — invalid IRI.
         quads = [{
-            "subject": f"urn:hermes:{self._agent_name}:shared",
+            "subject": subject,
             "predicate": "urn:hermes:sharedContent",
-            "object": content,
+            "object": _quote_literal(content),
         }]
         result = self._client.share(cg, quads, sub_graph_name=_first_text(args, "sub_graph_name"))
-        return json.dumps(result)
+        # Only surface the minted subject on a successful write. Hermes'
+        # Python client returns failure shapes (`{success: False, error: ...}`,
+        # `{ok: False}`, or bare `{error: ...}`) without throwing — see
+        # client.py:213 and the canonical detector at _client_result_failed
+        # below. Attaching subject/root_entities to a failure would mask it
+        # and let chained dkg_shared_memory_publish calls publish a root
+        # entity that was never written. Use the canonical helper so this
+        # path stays aligned with every other failure check in the module.
+        if _client_result_failed(result):
+            return json.dumps(result)
+        # Surface the minted subject so callers can target THIS share in a
+        # follow-up `dkg_shared_memory_publish({ root_entities: [...] })`.
+        # Field name is snake_case to match the consuming tool's argument
+        # shape (matches OpenClaw's response, PR #413).
+        if isinstance(result, dict):
+            response = {**result, "subject": subject, "root_entities": [subject]}
+        else:
+            response = {"raw": result, "subject": subject, "root_entities": [subject]}
+        return json.dumps(response)
 
     def _handle_publish(self, args: Dict[str, Any]) -> str:
         if not self._direct_publish_allowed():
@@ -2108,8 +2149,42 @@ def _required_cg_and_name(args: Dict[str, Any]) -> tuple[str, str]:
     return _first_text(args, "context_graph_id"), _first_text(args, "name")
 
 
+_ECHAR_REPLACEMENTS = {
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
 def _quote_literal(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
+    """
+    Wrap a free-text string as an N-Triples literal.
+
+    Escapes the full set the daemon's storage parser requires:
+    * the two structural ECHARs (`\\` and `"`) first, so subsequent
+      escape introducers don't get themselves doubled;
+    * the five common ECHAR control bytes (`\\b`, `\\t`, `\\n`, `\\f`, `\\r`);
+    * every remaining ASCII control byte (0x00-0x1F and 0x7F) as a
+      `\\uXXXX` UCHAR escape — without this, inputs containing NUL,
+      VT, DEL, etc. produce an invalid literal that the parser rejects.
+
+    Mirrors the OpenClaw side of the parity hardening (PR #413, defensive
+    post-pass over `escapeDkgRdfLiteral`). The TypeScript canonical helper
+    has the same gap upstream — see issue #416.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    out: List[str] = []
+    for ch in escaped:
+        code = ord(ch)
+        if ch in _ECHAR_REPLACEMENTS:
+            out.append(_ECHAR_REPLACEMENTS[ch])
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\u{code:04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def _uri_segment(value: Any, fallback: str) -> str:

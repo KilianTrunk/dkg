@@ -9,9 +9,12 @@ routes under `/api/hermes-channel/*`.
 ## Prerequisites
 
 - Node.js 22+ and npm for packaged installs, or pnpm for this DKG monorepo.
-- A DKG node configured with `dkg init`. `dkg hermes setup` starts the daemon
-  for you by default; pass `--no-start` to keep an externally managed daemon.
 - Hermes Agent installed on Linux, macOS, WSL2, or Termux.
+
+`dkg hermes setup` bootstraps the DKG node config when missing (no separate
+`dkg init` is needed) and starts the daemon for you by default; pass
+`--no-start` to keep an externally managed daemon, or `--preserve-provider` to
+keep an existing non-DKG `memory.provider` instead of replacing it.
 
 Hermes does not support native Windows. On Windows, run Hermes inside WSL2. A
 DKG daemon may still run on Windows, but the Hermes profile must use a daemon
@@ -39,26 +42,25 @@ targets `~/.hermes/profiles/research`.
 
 ```bash
 npm install -g @origintrail-official/dkg
-dkg init
 dkg hermes setup
 ```
 
-`dkg init` writes the DKG node config; `dkg hermes setup` starts the daemon
-(unless `--no-start` is passed), funds the node's first wallets through the
-testnet faucet (unless `--no-fund` is passed), installs the DKG Hermes plugin,
-elects DKG as the active `memory.provider`, and registers the Hermes
-integration with the daemon. After setup, enable Hermes' API server and start
-the gateway:
+`dkg hermes setup` bootstraps `~/.dkg/config.json` when missing, starts the
+DKG daemon (unless `--no-start` is passed), funds the node's first wallets
+through the testnet faucet (unless `--no-fund` is passed), installs the DKG
+Hermes plugin, elects DKG as the active `memory.provider` (replacing any
+prior provider with a timestamped backup; `--preserve-provider` opts out),
+and registers the Hermes integration with the daemon. After setup, enable
+Hermes' API server and start the gateway:
 
 ```bash
 echo 'API_SERVER_ENABLED=true' >> ~/.hermes/.env
 hermes gateway run --replace -v
 ```
 
-Existing-user equivalent: if `dkg init` and `dkg start` have already run,
-open the Node UI at `http://127.0.0.1:9200/ui`, choose **Agents** in the right
-panel, and click **Connect Hermes** — the daemon invokes the same setup the
-CLI does.
+Existing-user equivalent: if a DKG daemon is already running, open the Node
+UI at `http://127.0.0.1:9200/ui`, choose **Agents** in the right panel, and
+click **Connect Hermes** — the daemon invokes the same setup the CLI does.
 
 ## DKG Memory Provider Setup
 

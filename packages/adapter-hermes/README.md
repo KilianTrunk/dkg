@@ -38,8 +38,9 @@ This package contains:
 
 ## Scope Boundaries
 
-- it does not run its own DKG node; `dkg init` is still required first.
-  `dkg hermes setup` starts the daemon by default (`--no-start` opts out)
+- it does not run its own DKG node; `dkg hermes setup` bootstraps the DKG
+  config when missing (no separate `dkg init` needed) and starts the daemon
+  by default (`--no-start` opts out)
 - it does not start Hermes for you; run the Hermes gateway separately
 - it does not copy DKG API tokens into Hermes config files
 - it does not expose standalone HTTP route stubs from the adapter package;
@@ -47,13 +48,10 @@ This package contains:
 
 ## Quick Start
 
-Install the DKG CLI, create/start a DKG node, and set up the default Hermes
-profile:
+Install the DKG CLI and set up the default Hermes profile:
 
 ```bash
 npm install -g @origintrail-official/dkg
-dkg init
-dkg start
 dkg hermes setup
 ```
 

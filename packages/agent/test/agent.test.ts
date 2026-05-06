@@ -202,6 +202,12 @@ class ExternalOperationalKeyPublishChainAdapter implements ChainAdapter {
   }
 }
 
+class AddressOnlyExternalOperationalKeyPublishChainAdapter extends ExternalOperationalKeyPublishChainAdapter {
+  getSignerAddress(): string {
+    return ethers.Wallet.createRandom().address;
+  }
+}
+
 let _fileSnapshot: string;
 beforeAll(async () => {
   _fileSnapshot = await takeSnapshot();
@@ -1184,6 +1190,42 @@ describe('DKGAgent ACK signer gating', () => {
           subject: 'urn:test:agent-chain-config-operational-key-fallback',
           predicate: 'http://schema.org/name',
           object: '"ChainConfigOperationalKeyFallback"',
+          graph: 'did:dkg:context-graph:42',
+        }],
+      });
+
+      expect(result.status).toBe('confirmed');
+      expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+      expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('keeps chainConfig.operationalKeys fallback when a custom adapter only exposes signer addresses', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const chain = new AddressOnlyExternalOperationalKeyPublishChainAdapter(wallet.address);
+
+    const agent = await DKGAgent.create({
+      name: 'AddressOnlyExternalOperationalKeyPublisher',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+      chainConfig: {
+        rpcUrl: 'http://127.0.0.1:0',
+        hubAddress: '0x00000000000000000000000000000000000000A1',
+        operationalKeys: [wallet.privateKey],
+      },
+    });
+
+    try {
+      agent.publisher.setIdentityId(1n);
+      const result = await agent.publisher.publish({
+        contextGraphId: '42',
+        quads: [{
+          subject: 'urn:test:agent-address-only-operational-key-fallback',
+          predicate: 'http://schema.org/name',
+          object: '"AddressOnlyOperationalKeyFallback"',
           graph: 'did:dkg:context-graph:42',
         }],
       });

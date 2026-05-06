@@ -1235,7 +1235,8 @@ export class DKGPublisher implements Publisher {
     const resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
     const publisherSigner = await this.getPublisherSigner(resolvedPublisherAddress);
     const publisherAddress = resolvedPublisherAddress ?? this.localTentativePublisherAddress();
-    const canAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherSigner !== undefined;
+    const willAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherContextGraphId !== undefined;
+    const canAttemptOnChainPublish = willAttemptOnChainPublish && publisherSigner !== undefined;
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {
       throw new Error(
@@ -1250,7 +1251,7 @@ export class DKGPublisher implements Publisher {
       throw new Error('Publish rejected: "allowedPeers" is only valid when accessPolicy is "allowList"');
     }
 
-    if (this.chain.chainId !== 'none' && !publisherSigner) {
+    if (willAttemptOnChainPublish && !publisherSigner) {
       throw new PublisherWalletRequiredError('publish');
     }
 
@@ -1547,6 +1548,8 @@ export class DKGPublisher implements Publisher {
 
     if (identityId === 0n) {
       this.log.warn(ctx, `Identity not set (0) — skipping on-chain publish`);
+    } else if (publisherContextGraphId === undefined) {
+      this.log.warn(ctx, `No positive on-chain context graph id resolved from "${v10CgDomain}" — skipping on-chain publish`);
     } else {
       const tokenAmount = precomputedTokenAmount;
       usedV10Path = true;

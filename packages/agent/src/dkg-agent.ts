@@ -494,13 +494,10 @@ function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
 }
 
 function adapterAdvertisesPublisherSigner(chain: ChainAdapter): boolean {
-  if (typeof chain.getAuthorizedPublisherAddress === 'function') return true;
   if (typeof chain.signMessageAs === 'function') return true;
   if (typeof chain.signMessage === 'function') return true;
-  if (typeof (chain as unknown as { getSignerAddress?: unknown }).getSignerAddress === 'function') return true;
-  if (typeof (chain as unknown as { getSignerAddresses?: unknown }).getSignerAddresses === 'function') return true;
   if (typeof (chain as unknown as { getOperationalPrivateKey?: unknown }).getOperationalPrivateKey === 'function') return true;
-  return normalizeAdapterPublisherAddress((chain as unknown as { signerAddress?: unknown }).signerAddress) !== undefined;
+  return false;
 }
 
 async function inferAdapterPublisherAddress(

@@ -237,13 +237,65 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(result.ual.toLowerCase()).toContain(publisherAddress.toLowerCase());
   });
 
-  it('rejects chain-backed publish without a publisher signer before local storage', async () => {
+  it('keeps chain-backed identity-less publishes tentative without a publisher signer', async () => {
     const keypair = await generateEd25519Keypair();
     const publisher = new DKGPublisher({
       store: new OxigraphStore(),
       chain: makeStubChain('evm:31337'),
       eventBus: new TypedEventBus(),
       keypair,
+      publisherNodeIdentityId: 0n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:evm-no-identity-no-signer',
+        predicate: 'http://schema.org/name',
+        object: '"EvmNoIdentityNoSigner"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+    expect(result.ual).toMatch(/^did:dkg:evm:31337\/0x[0-9a-fA-F]{40}\/t/);
+  });
+
+  it('keeps descriptive-CG chain-backed publishes tentative without a publisher signer', async () => {
+    const keypair = await generateEd25519Keypair();
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain: makeStubChain('evm:31337'),
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 1n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: 'draft-cg',
+      quads: [{
+        subject: 'urn:test:evm-descriptive-cg-no-signer',
+        predicate: 'http://schema.org/name',
+        object: '"EvmDescriptiveCgNoSigner"',
+        graph: 'did:dkg:context-graph:draft-cg',
+      }],
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+    expect(result.ual).toMatch(/^did:dkg:evm:31337\/0x[0-9a-fA-F]{40}\/t/);
+  });
+
+  it('rejects chain-backed on-chain publish without a publisher signer before local storage', async () => {
+    const keypair = await generateEd25519Keypair();
+    const store = new OxigraphStore();
+    const publisher = new DKGPublisher({
+      store,
+      chain: makeStubChain('evm:31337'),
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 1n,
     });
 
     await expect(publisher.publish({
@@ -255,6 +307,16 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
         graph: 'did:dkg:context-graph:1',
       }],
     })).rejects.toThrow(/publisherPrivateKey/);
+
+    const stored = await store.query(`
+      SELECT ?p ?o WHERE {
+        GRAPH <did:dkg:context-graph:1> {
+          <urn:test:evm-no-signer> ?p ?o .
+        }
+      }
+    `);
+    expect(stored.type).toBe('bindings');
+    expect(stored.bindings).toHaveLength(0);
   });
 
   it('rejects unrecoverable mock signMessage adapters before local storage', async () => {

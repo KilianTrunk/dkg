@@ -129,9 +129,9 @@ describe('Phase-sequence contracts', () => {
     ]);
   });
 
-  // -- Publish (no wallet — fail closed before local storage) -------------
+  // -- Publish (adapter-backed signer, no identity — tentative) -----------
 
-  it('publish: missing publisher wallet rejects before phase emission', async () => {
+  it('publish: adapter-backed signer without node identity returns tentative after local phases', async () => {
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
@@ -146,9 +146,32 @@ describe('Phase-sequence contracts', () => {
 
     const quads = [q(ENTITY, 'http://schema.org/name', '"Tentative"')];
     const { calls, fn } = recorder();
-    await expect(publisher.publish({ contextGraphId: PARANET, quads, onPhase: fn }))
-      .rejects.toThrow(/publisherPrivateKey/);
-    expect(calls).toEqual([]);
+    const result = await publisher.publish({ contextGraphId: PARANET, quads, onPhase: fn });
+    const adapterAddress = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
+
+    expect(result.status).toBe('tentative');
+    expect(result.ual).toContain(`/${adapterAddress}/`);
+    expect(result.ual).not.toContain(`/${ethers.ZeroAddress}/`);
+
+    const phases = stripTxSigned(calls).map(([p, s]) => `${p}:${s}`);
+    expect(phases).toEqual([
+      'prepare:start',
+      'prepare:ensureContextGraph:start',
+      'prepare:ensureContextGraph:end',
+      'prepare:partition:start',
+      'prepare:partition:end',
+      'prepare:manifest:start',
+      'prepare:manifest:end',
+      'prepare:validate:start',
+      'prepare:validate:end',
+      'prepare:merkle:start',
+      'prepare:merkle:end',
+      'prepare:end',
+      'store:start',
+      'store:end',
+      'chain:start',
+      'chain:end',
+    ]);
   });
 
   // -- Update (happy path) -----------------------------------------------

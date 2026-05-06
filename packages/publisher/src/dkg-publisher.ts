@@ -2078,11 +2078,29 @@ export class DKGPublisher implements Publisher {
         publicQuads: allSkolemizedQuads,
       };
     }
-    const effectivePublisherAddress = coercePublisherAddress(txResult.publisherAddress) ??
+    let effectivePublisherAddress = coercePublisherAddress(txResult.publisherAddress) ??
       publisherAddress;
+    if (!effectivePublisherAddress && typeof this.chain.getLatestMerkleRootPublisher === 'function') {
+      try {
+        effectivePublisherAddress = coercePublisherAddress(
+          await this.chain.getLatestMerkleRootPublisher(kcId),
+        );
+      } catch {
+        // Some legacy adapters can submit updates but cannot report the
+        // effective publisher. Fall back below so we do not throw after a
+        // successful broadcast and leave local state stale.
+      }
+    }
     onPhase?.('chain:submit', 'end');
     onPhase?.('chain', 'end');
-    if (!effectivePublisherAddress) throw new PublisherWalletRequiredError('update');
+    if (!effectivePublisherAddress) {
+      effectivePublisherAddress = this.localTentativePublisherAddress();
+      this.log.warn(
+        ctx,
+        'Chain adapter returned a successful update without publisherAddress; using deterministic local attribution address. ' +
+        'Upgrade the adapter to return TxResult.publisherAddress for exact on-chain attribution.',
+      );
+    }
 
     await storeUpdatedQuads();
 

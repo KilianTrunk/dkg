@@ -105,7 +105,10 @@ class AdapterManagedUpdateChain implements ChainAdapter {
   readonly chainId = 'mock:31337';
   capturedPublisherAddress?: string;
 
-  constructor(private readonly publisherAddress?: string) {}
+  constructor(
+    private readonly publisherAddress?: string,
+    private readonly latestPublisherAddress?: string,
+  ) {}
 
   async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
     this.capturedPublisherAddress = params.publisherAddress;
@@ -115,6 +118,11 @@ class AdapterManagedUpdateChain implements ChainAdapter {
       blockNumber: 1,
       ...(this.publisherAddress ? { publisherAddress: this.publisherAddress } : {}),
     };
+  }
+
+  async getLatestMerkleRootPublisher(): Promise<string> {
+    if (!this.latestPublisherAddress) throw new Error('publisher unavailable');
+    return this.latestPublisherAddress;
   }
 }
 
@@ -540,7 +548,34 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 
-  it('rejects unattributable adapter-managed updates before local storage', async () => {
+  it('resolves adapter-managed update attribution from chain state when tx result omits publisherAddress', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new AdapterManagedUpdateChain(undefined, wallet.address);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+    });
+
+    const updated = await publisher.update(11n, {
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-managed-update-chain-attribution',
+        predicate: 'http://schema.org/name',
+        object: '"After"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(chain.capturedPublisherAddress).toBeUndefined();
+    expect(updated.status).toBe('confirmed');
+    expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
+    expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
+  it('persists successful adapter-managed updates when legacy adapters omit publisherAddress', async () => {
     const keypair = await generateEd25519Keypair();
     const store = new OxigraphStore();
     const chain = new AdapterManagedUpdateChain();
@@ -551,7 +586,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       keypair,
     });
 
-    await expect(publisher.update(12n, {
+    const updated = await publisher.update(12n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-managed-update-without-address',
@@ -559,7 +594,13 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
         object: '"After"',
         graph: 'did:dkg:context-graph:1',
       }],
-    })).rejects.toThrow(/publisherPrivateKey/);
+    });
+
+    expect(chain.capturedPublisherAddress).toBeUndefined();
+    expect(updated.status).toBe('confirmed');
+    expect(updated.onChainResult?.publisherAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+    expect(updated.onChainResult?.publisherAddress).not.toBe(ethers.ZeroAddress);
+    expect(updated.ual).toContain(updated.onChainResult!.publisherAddress);
 
     const stored = await store.query(`
       SELECT ?p ?o WHERE {
@@ -569,6 +610,6 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       }
     `);
     expect(stored.type).toBe('bindings');
-    expect(stored.bindings).toHaveLength(0);
+    expect(stored.bindings).toHaveLength(1);
   });
 });

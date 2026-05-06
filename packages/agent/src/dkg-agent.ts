@@ -500,6 +500,15 @@ function adapterAdvertisesPublisherSigner(chain: ChainAdapter): boolean {
   return false;
 }
 
+function privateKeyAddress(privateKey: string | undefined): string | undefined {
+  if (!privateKey) return undefined;
+  try {
+    return normalizeAdapterPublisherAddress(new ethers.Wallet(privateKey).address);
+  } catch {
+    return undefined;
+  }
+}
+
 async function inferAdapterPublisherAddress(
   chain: ChainAdapter,
   contextGraphId?: bigint,
@@ -771,18 +780,26 @@ export class DKGAgent {
     const node = new DKGNode(nodeConfig);
     const workspaceOwnedEntities = new Map<string, Map<string, string>>();
     const writeLocks = new Map<string, Promise<void>>();
+    const legacyAdapterOperationalKey = opKeys?.[0];
+    const legacyAdapterOperationalAddress = privateKeyAddress(legacyAdapterOperationalKey);
+    const configuredPublisherAddress = normalizeAdapterPublisherAddress(config.publisherAddress);
+    const publisherAddressMatchesLegacyKey = Boolean(
+      configuredPublisherAddress &&
+      legacyAdapterOperationalAddress &&
+      configuredPublisherAddress.toLowerCase() === legacyAdapterOperationalAddress.toLowerCase(),
+    );
     const useLegacyAdapterOperationalKeyFallback = Boolean(
       config.chainAdapter &&
-      !config.publisherAddress &&
-      opKeys?.[0] &&
-      !adapterAdvertisesPublisherSigner(chain),
+      legacyAdapterOperationalKey &&
+      !adapterAdvertisesPublisherSigner(chain) &&
+      (!configuredPublisherAddress || publisherAddressMatchesLegacyKey),
     );
     const publisher = new DKGPublisher({
       store,
       chain,
       eventBus,
       keypair,
-      publisherPrivateKey: useLegacyAdapterOperationalKeyFallback ? opKeys?.[0] : undefined,
+      publisherPrivateKey: useLegacyAdapterOperationalKeyFallback ? legacyAdapterOperationalKey : undefined,
       publisherAddress: config.publisherAddress,
       publisherAddressResolver: config.publisherAddress || useLegacyAdapterOperationalKeyFallback
         ? undefined

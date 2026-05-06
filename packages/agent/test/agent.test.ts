@@ -167,6 +167,41 @@ class OperationalKeyOnlyPublishChainAdapter implements ChainAdapter {
   }
 }
 
+class ExternalOperationalKeyPublishChainAdapter implements ChainAdapter {
+  readonly chainId = 'mock:31337';
+  capturedPublisherAddress?: string;
+
+  constructor(private readonly expectedPublisherAddress: string) {}
+
+  isV10Ready(): boolean {
+    return true;
+  }
+
+  async getEvmChainId(): Promise<bigint> {
+    return 31337n;
+  }
+
+  async getKnowledgeAssetsV10Address(): Promise<string> {
+    return '0x00000000000000000000000000000000000000A1';
+  }
+
+  async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+    this.capturedPublisherAddress = params.publisherAddress;
+    if (params.publisherAddress.toLowerCase() !== this.expectedPublisherAddress.toLowerCase()) {
+      throw new Error('publisher did not use chainConfig.operationalKeys fallback');
+    }
+    return {
+      batchId: 1n,
+      startKAId: 101n,
+      endKAId: 101n,
+      txHash: `0x${'56'.repeat(32)}`,
+      blockNumber: 1,
+      blockTimestamp: Math.floor(Date.now() / 1000),
+      publisherAddress: this.expectedPublisherAddress,
+    };
+  }
+}
+
 let _fileSnapshot: string;
 beforeAll(async () => {
   _fileSnapshot = await takeSnapshot();
@@ -1113,6 +1148,42 @@ describe('DKGAgent ACK signer gating', () => {
           subject: 'urn:test:agent-operational-key-fallback',
           predicate: 'http://schema.org/name',
           object: '"OperationalKeyFallback"',
+          graph: 'did:dkg:context-graph:42',
+        }],
+      });
+
+      expect(result.status).toBe('confirmed');
+      expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+      expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('keeps chainConfig.operationalKeys fallback when a custom adapter has no signer probes', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const chain = new ExternalOperationalKeyPublishChainAdapter(wallet.address);
+
+    const agent = await DKGAgent.create({
+      name: 'ExternalOperationalKeyPublisher',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+      chainConfig: {
+        rpcUrl: 'http://127.0.0.1:0',
+        hubAddress: '0x00000000000000000000000000000000000000A1',
+        operationalKeys: [wallet.privateKey],
+      },
+    });
+
+    try {
+      agent.publisher.setIdentityId(1n);
+      const result = await agent.publisher.publish({
+        contextGraphId: '42',
+        quads: [{
+          subject: 'urn:test:agent-chain-config-operational-key-fallback',
+          predicate: 'http://schema.org/name',
+          object: '"ChainConfigOperationalKeyFallback"',
           graph: 'did:dkg:context-graph:42',
         }],
       });

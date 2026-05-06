@@ -455,35 +455,36 @@ export class DKGPublisher implements Publisher {
     if (address && typeof this.chain.signMessage === 'function') {
       const expectedAddress = address;
       const challenge = ethers.getBytes(ethers.id(`dkg-publisher:chain-signer-probe:${expectedAddress.toLowerCase()}`));
+      let signMessageMatches = false;
       try {
         const compact = await this.chain.signMessage(challenge);
         const recovered = recoverCompactMessageSigner(challenge, compact);
-        if (recovered.toLowerCase() !== expectedAddress.toLowerCase()) {
-          return undefined;
-        }
+        signMessageMatches = recovered.toLowerCase() === expectedAddress.toLowerCase();
       } catch {
-        return undefined;
+        signMessageMatches = false;
       }
 
-      return {
-        address: expectedAddress,
-        source: 'chainAdapter',
-        signMessage: async (message: Uint8Array) => {
-          const compact = await this.chain.signMessage!(message);
-          const signature = ethers.Signature.from({
-            r: ethers.hexlify(compact.r),
-            yParityAndS: ethers.hexlify(compact.vs),
-          }).serialized;
-          const recovered = ethers.verifyMessage(message, signature);
-          if (recovered.toLowerCase() !== expectedAddress.toLowerCase()) {
-            throw new Error(
-              `publisherAddress (${expectedAddress}) does not match ChainAdapter.signMessage signer ` +
-              `(${recovered})`,
-            );
-          }
-          return signature;
-        },
-      };
+      if (signMessageMatches) {
+        return {
+          address: expectedAddress,
+          source: 'chainAdapter',
+          signMessage: async (message: Uint8Array) => {
+            const compact = await this.chain.signMessage!(message);
+            const signature = ethers.Signature.from({
+              r: ethers.hexlify(compact.r),
+              yParityAndS: ethers.hexlify(compact.vs),
+            }).serialized;
+            const recovered = ethers.verifyMessage(message, signature);
+            if (recovered.toLowerCase() !== expectedAddress.toLowerCase()) {
+              throw new Error(
+                `publisherAddress (${expectedAddress}) does not match ChainAdapter.signMessage signer ` +
+                `(${recovered})`,
+              );
+            }
+            return signature;
+          },
+        };
+      }
     }
 
     const operationalWallet = this.getAdapterOperationalWallet();

@@ -493,6 +493,16 @@ function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
   return address === ethers.ZeroAddress ? undefined : address;
 }
 
+function adapterAdvertisesPublisherSigner(chain: ChainAdapter): boolean {
+  if (typeof chain.getAuthorizedPublisherAddress === 'function') return true;
+  if (typeof chain.signMessageAs === 'function') return true;
+  if (typeof chain.signMessage === 'function') return true;
+  if (typeof (chain as unknown as { getSignerAddress?: unknown }).getSignerAddress === 'function') return true;
+  if (typeof (chain as unknown as { getSignerAddresses?: unknown }).getSignerAddresses === 'function') return true;
+  if (typeof (chain as unknown as { getOperationalPrivateKey?: unknown }).getOperationalPrivateKey === 'function') return true;
+  return normalizeAdapterPublisherAddress((chain as unknown as { signerAddress?: unknown }).signerAddress) !== undefined;
+}
+
 async function inferAdapterPublisherAddress(
   chain: ChainAdapter,
   contextGraphId?: bigint,
@@ -764,13 +774,20 @@ export class DKGAgent {
     const node = new DKGNode(nodeConfig);
     const workspaceOwnedEntities = new Map<string, Map<string, string>>();
     const writeLocks = new Map<string, Promise<void>>();
+    const useLegacyAdapterOperationalKeyFallback = Boolean(
+      config.chainAdapter &&
+      !config.publisherAddress &&
+      opKeys?.[0] &&
+      !adapterAdvertisesPublisherSigner(chain),
+    );
     const publisher = new DKGPublisher({
       store,
       chain,
       eventBus,
       keypair,
+      publisherPrivateKey: useLegacyAdapterOperationalKeyFallback ? opKeys?.[0] : undefined,
       publisherAddress: config.publisherAddress,
-      publisherAddressResolver: config.publisherAddress
+      publisherAddressResolver: config.publisherAddress || useLegacyAdapterOperationalKeyFallback
         ? undefined
         : (contextGraphId?: bigint) => inferAdapterPublisherAddress(chain, contextGraphId),
       sharedMemoryOwnedEntities: workspaceOwnedEntities,

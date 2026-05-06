@@ -355,7 +355,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(result.ual).toMatch(/^did:dkg:evm:31337\/0x[0-9a-fA-F]{40}\/t/);
   });
 
-  it('rejects chain-backed on-chain publish without a publisher signer before local storage', async () => {
+  it('keeps non-V10 chain-backed publishes tentative without a publisher signer', async () => {
     const keypair = await generateEd25519Keypair();
     const store = new OxigraphStore();
     const publisher = new DKGPublisher({
@@ -366,7 +366,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       publisherNodeIdentityId: 1n,
     });
 
-    await expect(publisher.publish({
+    const result = await publisher.publish({
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:evm-no-signer',
@@ -374,7 +374,11 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
         object: '"EvmNoSigner"',
         graph: 'did:dkg:context-graph:1',
       }],
-    })).rejects.toThrow(/publisherPrivateKey/);
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+    expect(result.ual).toMatch(/^did:dkg:evm:31337\/0x[0-9a-fA-F]{40}\/t/);
 
     const stored = await store.query(`
       SELECT ?p ?o WHERE {
@@ -384,7 +388,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       }
     `);
     expect(stored.type).toBe('bindings');
-    expect(stored.bindings).toHaveLength(0);
+    expect(stored.bindings.length).toBeGreaterThan(0);
   });
 
   it('rejects unrecoverable mock signMessage adapters before local storage', async () => {

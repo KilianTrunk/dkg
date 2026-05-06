@@ -1238,7 +1238,13 @@ export class DKGPublisher implements Publisher {
     const publisherSigner = await this.getPublisherSigner(resolvedPublisherAddress);
     const publisherAddress = resolvedPublisherAddress ?? this.localTentativePublisherAddress();
     const willAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherContextGraphId !== undefined;
-    const canAttemptOnChainPublish = willAttemptOnChainPublish && publisherSigner !== undefined;
+    const chainAdvertisesV10Publish = this.chain.chainId !== 'none' &&
+      typeof this.chain.isV10Ready === 'function' &&
+      this.chain.isV10Ready() &&
+      typeof this.chain.createKnowledgeAssetsV10 === 'function';
+    const canAttemptOnChainPublish = willAttemptOnChainPublish &&
+      chainAdvertisesV10Publish &&
+      publisherSigner !== undefined;
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {
       throw new Error(
@@ -1253,7 +1259,7 @@ export class DKGPublisher implements Publisher {
       throw new Error('Publish rejected: "allowedPeers" is only valid when accessPolicy is "allowList"');
     }
 
-    if (willAttemptOnChainPublish && !publisherSigner) {
+    if (willAttemptOnChainPublish && chainAdvertisesV10Publish && !publisherSigner) {
       throw new PublisherWalletRequiredError('publish');
     }
 

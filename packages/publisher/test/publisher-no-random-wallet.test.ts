@@ -27,7 +27,7 @@ import { describe, it, expect } from 'vitest';
 import { DKGPublisher } from '../src/dkg-publisher.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
-import { MockChainAdapter, type ChainAdapter } from '@origintrail-official/dkg-chain';
+import { MockChainAdapter, type ChainAdapter, type TxResult, type V10UpdateKCParams } from '@origintrail-official/dkg-chain';
 import { ethers } from 'ethers';
 
 const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
@@ -98,6 +98,23 @@ class ContextAwareAdapterSigningChain extends MockChainAdapter {
       throw new Error('publish tx signer did not match resolved publisher address');
     }
     return super.createKnowledgeAssetsV10(params);
+  }
+}
+
+class AdapterManagedUpdateChain implements ChainAdapter {
+  readonly chainId = 'mock:31337';
+  capturedPublisherAddress?: string;
+
+  constructor(private readonly publisherAddress?: string) {}
+
+  async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
+    this.capturedPublisherAddress = params.publisherAddress;
+    return {
+      success: true,
+      hash: `0x${'12'.repeat(32)}`,
+      blockNumber: 1,
+      ...(this.publisherAddress ? { publisherAddress: this.publisherAddress } : {}),
+    };
   }
 }
 
@@ -238,6 +255,40 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
         graph: 'did:dkg:context-graph:1',
       }],
     })).rejects.toThrow(/publisherPrivateKey/);
+  });
+
+  it('rejects unrecoverable mock signMessage adapters before local storage', async () => {
+    const keypair = await generateEd25519Keypair();
+    const store = new OxigraphStore();
+    const chain = new MockChainAdapter('mock:31337', '0x0000000000000000000000000000000000001111');
+    chain.seedIdentity('0x0000000000000000000000000000000000001111', 1n);
+    const publisher = new DKGPublisher({
+      store,
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 1n,
+    });
+
+    await expect(publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:mock-unrecoverable-signer',
+        predicate: 'http://schema.org/name',
+        object: '"MockUnrecoverableSigner"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    })).rejects.toThrow(/publisherPrivateKey/);
+
+    const stored = await store.query(`
+      SELECT ?p ?o WHERE {
+        GRAPH <did:dkg:context-graph:1> {
+          <urn:test:mock-unrecoverable-signer> ?p ?o .
+        }
+      }
+    `);
+    expect(stored.type).toBe('bindings');
+    expect(stored.bindings).toHaveLength(0);
   });
 
   it('rejects a zero publisherAddress instead of treating it as a sentinel', async () => {
@@ -398,5 +449,64 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
     expect(updated.status).toBe('confirmed');
     expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
+  it('lets adapter-managed updates select their signer without local address discovery', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new AdapterManagedUpdateChain(wallet.address);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+    });
+
+    const updated = await publisher.update(11n, {
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-managed-update',
+        predicate: 'http://schema.org/name',
+        object: '"After"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(chain.capturedPublisherAddress).toBeUndefined();
+    expect(updated.status).toBe('confirmed');
+    expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
+    expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
+  it('rejects unattributable adapter-managed updates before local storage', async () => {
+    const keypair = await generateEd25519Keypair();
+    const store = new OxigraphStore();
+    const chain = new AdapterManagedUpdateChain();
+    const publisher = new DKGPublisher({
+      store,
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+    });
+
+    await expect(publisher.update(12n, {
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-managed-update-without-address',
+        predicate: 'http://schema.org/name',
+        object: '"After"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    })).rejects.toThrow(/publisherPrivateKey/);
+
+    const stored = await store.query(`
+      SELECT ?p ?o WHERE {
+        GRAPH <did:dkg:context-graph:1> {
+          <urn:test:adapter-managed-update-without-address> ?p ?o .
+        }
+      }
+    `);
+    expect(stored.type).toBe('bindings');
+    expect(stored.bindings).toHaveLength(0);
   });
 });

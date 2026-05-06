@@ -88,6 +88,17 @@ function coercePublisherAddress(value: unknown): string | undefined {
   return normalized === ethers.ZeroAddress ? undefined : normalized;
 }
 
+function recoverCompactMessageSigner(
+  message: Uint8Array,
+  signature: { r: Uint8Array; vs: Uint8Array },
+): string {
+  const serialized = ethers.Signature.from({
+    r: ethers.hexlify(signature.r),
+    yParityAndS: ethers.hexlify(signature.vs),
+  }).serialized;
+  return ethers.verifyMessage(message, serialized);
+}
+
 export interface ShareOptions {
   publisherPeerId: string;
   operationCtx?: OperationContext;
@@ -322,11 +333,6 @@ export class DKGPublisher implements Publisher {
     this.writeLocks = config.writeLocks ?? new Map();
   }
 
-  private requirePublisherAddress(operation: string, address = this.publisherAddress): string {
-    if (!address) throw new PublisherWalletRequiredError(operation);
-    return address;
-  }
-
   private async resolvePublisherAddress(contextGraphId?: bigint): Promise<string | undefined> {
     if (this.publisherAddress) return this.publisherAddress;
     if (this.publisherAddressResolver) {
@@ -380,11 +386,7 @@ export class DKGPublisher implements Publisher {
     try {
       const challenge = ethers.getBytes(ethers.id('dkg-publisher:publisher-address-probe'));
       const compact = await this.chain.signMessage(challenge);
-      const signature = ethers.Signature.from({
-        r: ethers.hexlify(compact.r),
-        yParityAndS: ethers.hexlify(compact.vs),
-      }).serialized;
-      return coercePublisherAddress(ethers.verifyMessage(challenge, signature));
+      return coercePublisherAddress(recoverCompactMessageSigner(challenge, compact));
     } catch {
       return undefined;
     }
@@ -398,7 +400,7 @@ export class DKGPublisher implements Publisher {
     return address === ethers.ZeroAddress ? '0x0000000000000000000000000000000000000001' : address;
   }
 
-  private getPublisherSigner(address = this.publisherAddress): PublisherSigner | undefined {
+  private async getPublisherSigner(address = this.publisherAddress): Promise<PublisherSigner | undefined> {
     if (this.publisherWallet && this.publisherAddress) {
       const wallet = this.publisherWallet;
       return {
@@ -408,18 +410,47 @@ export class DKGPublisher implements Publisher {
       };
     }
 
-    if (
-      address &&
-      (typeof this.chain.signMessageAs === 'function' || typeof this.chain.signMessage === 'function')
-    ) {
+    if (address && typeof this.chain.signMessageAs === 'function') {
       const expectedAddress = address;
       return {
         address: expectedAddress,
         source: 'chainAdapter',
         signMessage: async (message: Uint8Array) => {
-          const compact = typeof this.chain.signMessageAs === 'function'
-            ? await this.chain.signMessageAs(expectedAddress, message)
-            : await this.chain.signMessage!(message);
+          const compact = await this.chain.signMessageAs!(expectedAddress, message);
+          const signature = ethers.Signature.from({
+            r: ethers.hexlify(compact.r),
+            yParityAndS: ethers.hexlify(compact.vs),
+          }).serialized;
+          const recovered = ethers.verifyMessage(message, signature);
+          if (recovered.toLowerCase() !== expectedAddress.toLowerCase()) {
+            throw new Error(
+              `publisherAddress (${expectedAddress}) does not match ChainAdapter.signMessage signer ` +
+              `(${recovered})`,
+            );
+          }
+          return signature;
+        },
+      };
+    }
+
+    if (address && typeof this.chain.signMessage === 'function') {
+      const expectedAddress = address;
+      const challenge = ethers.getBytes(ethers.id(`dkg-publisher:chain-signer-probe:${expectedAddress.toLowerCase()}`));
+      try {
+        const compact = await this.chain.signMessage(challenge);
+        const recovered = recoverCompactMessageSigner(challenge, compact);
+        if (recovered.toLowerCase() !== expectedAddress.toLowerCase()) {
+          return undefined;
+        }
+      } catch {
+        return undefined;
+      }
+
+      return {
+        address: expectedAddress,
+        source: 'chainAdapter',
+        signMessage: async (message: Uint8Array) => {
+          const compact = await this.chain.signMessage!(message);
           const signature = ethers.Signature.from({
             r: ethers.hexlify(compact.r),
             yParityAndS: ethers.hexlify(compact.vs),
@@ -1169,7 +1200,7 @@ export class DKGPublisher implements Publisher {
       // Descriptive SWM graph names stay on the existing tentative/mock path.
     }
     const resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
-    const publisherSigner = this.getPublisherSigner(resolvedPublisherAddress);
+    const publisherSigner = await this.getPublisherSigner(resolvedPublisherAddress);
     const publisherAddress = resolvedPublisherAddress ?? this.localTentativePublisherAddress();
     const canAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherSigner !== undefined;
 
@@ -1785,7 +1816,7 @@ export class DKGPublisher implements Publisher {
     const resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
     const localOnlyUpdate = this.chain.chainId === 'none';
     const publisherAddress = resolvedPublisherAddress ?? (
-      localOnlyUpdate ? this.localTentativePublisherAddress() : this.requirePublisherAddress('update', resolvedPublisherAddress)
+      localOnlyUpdate ? this.localTentativePublisherAddress() : undefined
     );
     this.log.info(ctx, `Updating kcId=${kcId} with ${quads.length} triples`);
     const dataGraph = this.graphManager.dataGraphUri(contextGraphId);
@@ -1896,7 +1927,7 @@ export class DKGPublisher implements Publisher {
     // the hook — it retains the coarse phase boundary that brackets
     // the whole adapter call. See the equivalent marker in the
     // publish path above for the full rationale.
-    let txResult: { success: boolean; hash: string; blockNumber?: number };
+    let txResult: { success: boolean; hash: string; blockNumber?: number; publisherAddress?: string };
     let earlyReturn: PublishResult | undefined;
     let wroteAhead = false;
     const emitWriteAheadStart = (info?: { txHash?: string }) => {
@@ -1934,6 +1965,7 @@ export class DKGPublisher implements Publisher {
           ];
           if (errorName && V10_DEFINITIVE_ERRORS.includes(errorName)) {
             this.log.warn(ctx, `V10 update rejected (${errorName}): ${v10Err instanceof Error ? v10Err.message : String(v10Err)}`);
+            if (!publisherAddress) throw v10Err;
             earlyReturn = {
               kcId,
               ual: `did:dkg:${this.chain.chainId}/${publisherAddress}/${kcId}`,
@@ -1996,25 +2028,31 @@ export class DKGPublisher implements Publisher {
     }
 
     if (!txResult.success) {
+      const failedPublisherAddress = coercePublisherAddress(txResult.publisherAddress) ??
+        publisherAddress;
+      if (!failedPublisherAddress) throw new PublisherWalletRequiredError('update');
       onPhase?.('chain:submit', 'end');
       onPhase?.('chain', 'end');
       return {
         kcId,
-        ual: `did:dkg:${this.chain.chainId}/${publisherAddress}/${kcId}`,
+        ual: `did:dkg:${this.chain.chainId}/${failedPublisherAddress}/${kcId}`,
         merkleRoot: kcMerkleRoot,
         kaManifest: manifestEntries,
         status: 'failed',
         publicQuads: allSkolemizedQuads,
       };
     }
+    const effectivePublisherAddress = coercePublisherAddress(txResult.publisherAddress) ??
+      publisherAddress;
     onPhase?.('chain:submit', 'end');
     onPhase?.('chain', 'end');
+    if (!effectivePublisherAddress) throw new PublisherWalletRequiredError('update');
 
     await storeUpdatedQuads();
 
     const result: PublishResult = {
       kcId,
-      ual: `did:dkg:${this.chain.chainId}/${publisherAddress}/${kcId}`,
+      ual: `did:dkg:${this.chain.chainId}/${effectivePublisherAddress}/${kcId}`,
       merkleRoot: kcMerkleRoot,
       kaManifest: manifestEntries,
       status: 'confirmed',
@@ -2024,7 +2062,7 @@ export class DKGPublisher implements Publisher {
         txHash: txResult.hash,
         blockNumber: txResult.blockNumber ?? 0,
         blockTimestamp: Math.floor(Date.now() / 1000),
-        publisherAddress,
+        publisherAddress: effectivePublisherAddress,
       },
     };
 

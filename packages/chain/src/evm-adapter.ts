@@ -1035,6 +1035,7 @@ export class EVMChainAdapter implements ChainAdapter {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
       success: receipt.status === 1,
+      publisherAddress: signer.address,
     };
   }
 
@@ -2123,6 +2124,7 @@ export class EVMChainAdapter implements ChainAdapter {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
       success: receipt.status === 1,
+      publisherAddress: signer.address,
     };
   }
 

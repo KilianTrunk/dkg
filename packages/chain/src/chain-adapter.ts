@@ -68,6 +68,8 @@ export interface TxResult {
   hash: string;
   blockNumber: number;
   success: boolean;
+  /** Effective publisher/signing address used by update-style txs when known. */
+  publisherAddress?: string;
   /** Set by createContextGraph when V9 registry is used (on-chain contextGraphId as hex). */
   contextGraphId?: string;
 }

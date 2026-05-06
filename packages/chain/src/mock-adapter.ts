@@ -319,7 +319,10 @@ export class MockChainAdapter implements ChainAdapter {
       txIndex,
     });
 
-    return this.txResult(true);
+    return {
+      ...this.txResult(true),
+      publisherAddress: this.signerAddress,
+    };
   }
 
   async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
@@ -362,7 +365,10 @@ export class MockChainAdapter implements ChainAdapter {
       txIndex,
     });
 
-    return this.txResult(true);
+    return {
+      ...this.txResult(true),
+      publisherAddress: this.signerAddress,
+    };
   }
 
   async verifyKAUpdate(txHash: string, batchId: bigint, publisherAddress: string): Promise<KAUpdateVerification> {

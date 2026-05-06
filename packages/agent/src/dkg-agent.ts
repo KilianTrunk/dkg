@@ -756,9 +756,8 @@ export class DKGAgent {
       chain,
       eventBus,
       keypair,
-      publisherPrivateKey: opKeys?.[0],
       publisherAddress: config.publisherAddress,
-      publisherAddressResolver: opKeys?.[0] || config.publisherAddress
+      publisherAddressResolver: config.publisherAddress
         ? undefined
         : (contextGraphId?: bigint) => inferAdapterPublisherAddress(chain, contextGraphId),
       sharedMemoryOwnedEntities: workspaceOwnedEntities,

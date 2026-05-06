@@ -78,6 +78,48 @@ class FlakyRegistrationACKChainAdapter extends MockChainAdapter {
   }
 }
 
+class ContextAuthorizedPublisherChainAdapter extends MockChainAdapter {
+  capturedPublisherAddress?: string;
+
+  constructor(
+    private readonly primaryWallet: ethers.Wallet,
+    private readonly authorizedWallet: ethers.Wallet,
+  ) {
+    super('mock:31337', primaryWallet.address);
+    this.seedIdentity(authorizedWallet.address, 77n);
+    this.minimumRequiredSignatures = 1;
+  }
+
+  getOperationalPrivateKey(): string {
+    return this.primaryWallet.privateKey;
+  }
+
+  async getAuthorizedPublisherAddress(contextGraphId: bigint): Promise<string> {
+    expect(contextGraphId).toBe(42n);
+    return this.authorizedWallet.address;
+  }
+
+  async signMessageAs(address: string, messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const normalized = ethers.getAddress(address);
+    if (normalized.toLowerCase() !== this.authorizedWallet.address.toLowerCase()) {
+      throw new Error(`unexpected publisher signer ${address}`);
+    }
+    const sig = ethers.Signature.from(await this.authorizedWallet.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+
+  override async createKnowledgeAssetsV10(params: Parameters<MockChainAdapter['createKnowledgeAssetsV10']>[0]) {
+    this.capturedPublisherAddress = params.publisherAddress;
+    if (params.publisherAddress?.toLowerCase() !== this.authorizedWallet.address.toLowerCase()) {
+      throw new Error('agent pinned publish to the primary operational key');
+    }
+    return super.createKnowledgeAssetsV10(params);
+  }
+}
+
 let _fileSnapshot: string;
 beforeAll(async () => {
   _fileSnapshot = await takeSnapshot();
@@ -968,6 +1010,38 @@ describe('DKGAgent ACK signer gating', () => {
 
       expect(await chain.isOperationalWalletRegistered(44n, staleChainConfigSigner.address)).toBe(false);
       expect(agent.node.libp2p.getProtocols()).not.toContain(PROTOCOL_STORAGE_ACK);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('resolves publish signer from the adapter instead of pinning operationalKeys[0]', async () => {
+    const primary = ethers.Wallet.createRandom();
+    const authorized = ethers.Wallet.createRandom();
+    const chain = new ContextAuthorizedPublisherChainAdapter(primary, authorized);
+
+    const agent = await DKGAgent.create({
+      name: 'AdapterAuthorizedPublisher',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+    });
+
+    try {
+      agent.publisher.setIdentityId(77n);
+      const result = await agent.publisher.publish({
+        contextGraphId: '42',
+        quads: [{
+          subject: 'urn:test:agent-adapter-authorized-publisher',
+          predicate: 'http://schema.org/name',
+          object: '"AdapterAuthorizedPublisher"',
+          graph: 'did:dkg:context-graph:42',
+        }],
+      });
+
+      expect(result.status).toBe('confirmed');
+      expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(authorized.address.toLowerCase());
+      expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(authorized.address.toLowerCase());
     } finally {
       await agent.stop().catch(() => {});
     }

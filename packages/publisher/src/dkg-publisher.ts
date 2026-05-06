@@ -27,6 +27,7 @@ import {
   generateAssertionPublishedMetadata,
   generateAssertionDiscardedMetadata,
   toHex,
+  resolveUalByBatchId,
   updateMetaMerkleRoot,
   type KAMetadata,
 } from './metadata.js';
@@ -86,6 +87,13 @@ function coercePublisherAddress(value: unknown): string | undefined {
   if (typeof value !== 'string' || !ethers.isAddress(value)) return undefined;
   const normalized = ethers.getAddress(value);
   return normalized === ethers.ZeroAddress ? undefined : normalized;
+}
+
+function publisherAddressFromUal(ual: string | undefined): string | undefined {
+  const prefix = 'did:dkg:';
+  if (!ual?.startsWith(prefix)) return undefined;
+  const segments = ual.slice(prefix.length).split('/');
+  return coercePublisherAddress(segments[1]);
 }
 
 function recoverCompactMessageSigner(
@@ -427,6 +435,40 @@ export class DKGPublisher implements Publisher {
     const digest = ethers.keccak256(this.keypair.publicKey);
     const address = ethers.getAddress(ethers.dataSlice(digest, 12));
     return address === ethers.ZeroAddress ? '0x0000000000000000000000000000000000000001' : address;
+  }
+
+  private isChainV10Ready(): boolean {
+    return this.chain.chainId !== 'none' &&
+      typeof this.chain.isV10Ready === 'function' &&
+      this.chain.isV10Ready();
+  }
+
+  private async refreshChainV10Readiness(): Promise<boolean> {
+    if (this.isChainV10Ready()) return true;
+    if (this.chain.chainId === 'none') return false;
+    try {
+      const chainIdGetter = (this.chain as unknown as { getEvmChainId?: () => Promise<bigint> }).getEvmChainId;
+      const kavAddressGetter = (this.chain as unknown as { getKnowledgeAssetsV10Address?: () => Promise<string> })
+        .getKnowledgeAssetsV10Address;
+      if (typeof chainIdGetter === 'function') await chainIdGetter.call(this.chain);
+      if (typeof kavAddressGetter === 'function') await kavAddressGetter.call(this.chain);
+    } catch {
+      // V9-only or incompletely configured adapters stay off the V10 path.
+    }
+    return this.isChainV10Ready();
+  }
+
+  private async resolveKnownBatchPublisherAddress(contextGraphId: string, kcId: bigint): Promise<string | undefined> {
+    try {
+      const ual = await resolveUalByBatchId(
+        this.store,
+        this.graphManager.metaGraphUri(contextGraphId),
+        kcId,
+      );
+      return publisherAddressFromUal(ual);
+    } catch {
+      return undefined;
+    }
   }
 
   private async adapterSignMessageMatchesAddress(expectedAddress: string): Promise<boolean> {
@@ -1257,9 +1299,9 @@ export class DKGPublisher implements Publisher {
     const publisherSigner = await this.getPublisherSigner(resolvedPublisherAddress);
     const publisherAddress = resolvedPublisherAddress ?? this.localTentativePublisherAddress();
     const willAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherContextGraphId !== undefined;
-    const chainAdvertisesV10Publish = this.chain.chainId !== 'none' &&
-      typeof this.chain.createKnowledgeAssetsV10 === 'function';
+    const chainV10Ready = await this.refreshChainV10Readiness();
     const canAttemptOnChainPublish = willAttemptOnChainPublish &&
+      chainV10Ready &&
       publisherSigner !== undefined;
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {
@@ -1275,7 +1317,7 @@ export class DKGPublisher implements Publisher {
       throw new Error('Publish rejected: "allowedPeers" is only valid when accessPolicy is "allowList"');
     }
 
-    if (willAttemptOnChainPublish && chainAdvertisesV10Publish && !publisherSigner) {
+    if (willAttemptOnChainPublish && chainV10Ready && !publisherSigner) {
       throw new PublisherWalletRequiredError('publish');
     }
 
@@ -1582,6 +1624,8 @@ export class DKGPublisher implements Publisher {
       this.log.warn(ctx, `Identity not set (0) — skipping on-chain publish`);
     } else if (publisherContextGraphId === undefined) {
       this.log.warn(ctx, `No positive on-chain context graph id resolved from "${v10CgDomain}" — skipping on-chain publish`);
+    } else if (!chainV10Ready) {
+      this.log.warn(ctx, 'Chain adapter is not V10-ready — skipping on-chain publish');
     } else {
       const tokenAmount = precomputedTokenAmount;
       usedV10Path = true;
@@ -2107,6 +2151,7 @@ export class DKGPublisher implements Publisher {
           // Fall through to the clear fail-loud path below.
         }
       }
+      failedPublisherAddress ??= await this.resolveKnownBatchPublisherAddress(contextGraphId, kcId);
       if (!failedPublisherAddress) throw new PublisherWalletRequiredError('update');
       onPhase?.('chain:submit', 'end');
       onPhase?.('chain', 'end');
@@ -2132,13 +2177,14 @@ export class DKGPublisher implements Publisher {
         // inventing a publisher address that did not come from chain state.
       }
     }
+    effectivePublisherAddress ??= await this.resolveKnownBatchPublisherAddress(contextGraphId, kcId);
     onPhase?.('chain:submit', 'end');
     onPhase?.('chain', 'end');
     if (!effectivePublisherAddress) {
       throw new Error(
         'Chain adapter returned a successful update without publisherAddress, and ' +
-        'getLatestMerkleRootPublisher() did not resolve a real publisher. Refusing to write ' +
-        'confirmed metadata with synthetic publisher attribution.',
+        'neither getLatestMerkleRootPublisher() nor local KC metadata resolved a real publisher. ' +
+        'Refusing to write confirmed metadata with synthetic publisher attribution.',
       );
     }
 

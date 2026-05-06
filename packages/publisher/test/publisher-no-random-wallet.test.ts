@@ -25,6 +25,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { DKGPublisher } from '../src/dkg-publisher.js';
+import { generateConfirmedFullMetadata } from '../src/metadata.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
 import {
@@ -415,6 +416,39 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(stored.bindings.length).toBeGreaterThan(0);
   });
 
+  it('keeps method-present but non-ready V10 adapters tentative without a publisher signer', async () => {
+    const keypair = await generateEd25519Keypair();
+    const store = new OxigraphStore();
+    const chain = {
+      chainId: 'evm:31337',
+      isV10Ready: () => false,
+      createKnowledgeAssetsV10: async () => {
+        throw new Error('non-ready V10 adapter should not be called');
+      },
+    } as unknown as ChainAdapter;
+    const publisher = new DKGPublisher({
+      store,
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 1n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:evm-method-present-not-ready-no-signer',
+        predicate: 'http://schema.org/name',
+        object: '"EvmMethodPresentNotReadyNoSigner"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+    expect(result.ual).toMatch(/^did:dkg:evm:31337\/0x[0-9a-fA-F]{40}\/t/);
+  });
+
   it('rejects unrecoverable mock signMessage adapters before local storage', async () => {
     const keypair = await generateEd25519Keypair();
     const store = new OxigraphStore();
@@ -779,6 +813,60 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
   });
 
+  it('resolves adapter-managed update attribution from local confirmed metadata', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const store = new OxigraphStore();
+    const chain = new AdapterManagedUpdateChain();
+    const publisher = new DKGPublisher({
+      store,
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+    });
+    const ual = `did:dkg:mock:31337/${wallet.address}/13`;
+    await store.insert(generateConfirmedFullMetadata(
+      {
+        ual,
+        contextGraphId: '1',
+        merkleRoot: new Uint8Array(32),
+        kaCount: 1,
+        publisherPeerId: 'peer',
+        timestamp: new Date(0),
+      },
+      [{
+        rootEntity: 'urn:test:adapter-managed-update-local-attribution',
+        kcUal: ual,
+        tokenId: 1n,
+        publicTripleCount: 1,
+        privateTripleCount: 0,
+      }],
+      {
+        txHash: `0x${'34'.repeat(32)}`,
+        blockNumber: 1,
+        blockTimestamp: 1,
+        publisherAddress: wallet.address,
+        batchId: 13n,
+        chainId: 'mock:31337',
+      },
+    ));
+
+    const updated = await publisher.update(13n, {
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-managed-update-local-attribution',
+        predicate: 'http://schema.org/name',
+        object: '"After"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(chain.capturedPublisherAddress).toBeUndefined();
+    expect(updated.status).toBe('confirmed');
+    expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
+    expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
   it('rejects adapter-managed updates when publisher attribution is unavailable', async () => {
     const keypair = await generateEd25519Keypair();
     const store = new OxigraphStore();
@@ -798,7 +886,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
         object: '"After"',
         graph: 'did:dkg:context-graph:1',
       }],
-    })).rejects.toThrow(/successful update without publisherAddress.*synthetic publisher attribution/i);
+    })).rejects.toThrow(/without publisherAddress.*local KC metadata.*synthetic publisher attribution/i);
 
     expect(chain.capturedPublisherAddress).toBeUndefined();
 

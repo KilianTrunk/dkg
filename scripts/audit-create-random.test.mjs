@@ -221,6 +221,11 @@ describe('findHits', () => {
     assert.equal(hits.length, 1);
   });
 
+  it('REGRESSION (PR #371 round 10): finds template-literal bracket-property calls', () => {
+    const hits = findHits('const w = Wallet[`createRandom`]();');
+    assert.equal(hits.length, 1);
+  });
+
   it('REGRESSION (PR #371 round 7): finds bracket-property calls with comments before the key', () => {
     const hits = findHits("const w = Wallet[/* gap */'createRandom']();");
     assert.equal(hits.length, 1);
@@ -228,6 +233,11 @@ describe('findHits', () => {
 
   it('REGRESSION (PR #371 round 5): finds optional bracket-property calls', () => {
     const hits = findHits("const w = Wallet?.['createRandom']?.();");
+    assert.equal(hits.length, 1);
+  });
+
+  it('REGRESSION (PR #371 round 10): finds optional template-literal bracket-property calls', () => {
+    const hits = findHits('const w = Wallet?.[`createRandom`]?.();');
     assert.equal(hits.length, 1);
   });
 
@@ -257,6 +267,41 @@ describe('findHits', () => {
     const hits = findHits(text);
     assert.equal(hits.length, 1);
     assert.equal(hits[0].line, 3);
+    assert.equal(hits[0].identifier, 'W');
+  });
+
+  it('REGRESSION (PR #371 round 10): finds Wallet aliases from named ethers namespace imports', () => {
+    const text = [
+      'import { ethers as E } from "ethers";',
+      'const W = E.Wallet;',
+      'const w = W.createRandom();',
+    ].join('\n');
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 3);
+    assert.equal(hits[0].identifier, 'W');
+  });
+
+  it('REGRESSION (PR #371 round 10): finds Wallet aliases from CommonJS ethers namespace requires', () => {
+    const text = [
+      'const E = require("ethers");',
+      'const W = E.Wallet;',
+      'const w = W.createRandom();',
+    ].join('\n');
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 3);
+    assert.equal(hits[0].identifier, 'W');
+  });
+
+  it('REGRESSION (PR #371 round 10): finds destructured Wallet aliases from CommonJS requires', () => {
+    const text = [
+      'const { Wallet: W } = require("ethers");',
+      'const w = W.createRandom();',
+    ].join('\n');
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 2);
     assert.equal(hits[0].identifier, 'W');
   });
 

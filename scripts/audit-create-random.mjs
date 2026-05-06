@@ -374,7 +374,7 @@ function skipWhitespace(text, index) {
 function skipToQuotedProperty(originalText, stripped, index) {
   let i = index;
   while (i < originalText.length) {
-    if (originalText[i] === '"' || originalText[i] === "'") return i;
+    if (originalText[i] === '"' || originalText[i] === "'" || originalText[i] === '`') return i;
     if (/\s/.test(originalText[i]) || /\s/.test(stripped[i] ?? '')) {
       i += 1;
       continue;
@@ -386,7 +386,7 @@ function skipToQuotedProperty(originalText, stripped, index) {
 
 function readQuotedProperty(originalText, index) {
   const quote = originalText[index];
-  if (quote !== '"' && quote !== "'") return null;
+  if (quote !== '"' && quote !== "'" && quote !== '`') return null;
   let value = '';
   let i = index + 1;
   while (i < originalText.length) {
@@ -396,6 +396,7 @@ function readQuotedProperty(originalText, index) {
       i += 2;
       continue;
     }
+    if (quote === '`' && c === '$' && originalText[i + 1] === '{') return null;
     if (c === quote) return { value, end: i + 1 };
     value += c;
     i += 1;
@@ -459,6 +460,7 @@ function hitFromIndex(originalText, stripped, index, identifier) {
 function collectWalletAliases(stripped) {
   const aliases = new Set(['Wallet']);
   const namespaceAliases = new Set(['ethers']);
+  const importPattern = new RegExp(String.raw`\bimport\s*\{([^}]*)\}\s*from\b`, 'g');
 
   // Namespace imports, including aliases: import * as E from ...
   // As with named imports below, the module specifier string has been
@@ -467,6 +469,42 @@ function collectWalletAliases(stripped) {
   const namespaceImportPattern = new RegExp(String.raw`\bimport\s+\*\s+as\s+(${IDENT})\s+from\b`, 'g');
   for (const m of stripped.matchAll(namespaceImportPattern)) {
     namespaceAliases.add(m[1]);
+  }
+
+  // Named namespace imports, including aliases: import { ethers as E } from ...
+  // The source string is blanked, so treat the binding shape conservatively.
+  for (const m of stripped.matchAll(importPattern)) {
+    for (const rawSpecifier of m[1].split(',')) {
+      const specifier = rawSpecifier.trim();
+      const aliasMatch = specifier.match(new RegExp(String.raw`^ethers\s+as\s+(${IDENT})$`));
+      if (aliasMatch) namespaceAliases.add(aliasMatch[1]);
+      if (specifier === 'ethers') namespaceAliases.add('ethers');
+    }
+  }
+
+  // CommonJS namespace aliases: const E = require('ethers')
+  // String contents are blanked, so any require namespace alias is treated as
+  // potentially ethers. This may false-positive, but avoids a CI gate bypass in
+  // JS/CJS files.
+  const requireNamespacePattern = new RegExp(
+    String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*require\s*\(`,
+    'g',
+  );
+  for (const m of stripped.matchAll(requireNamespacePattern)) {
+    namespaceAliases.add(m[1]);
+  }
+
+  const requireDestructurePattern = new RegExp(
+    String.raw`\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\s*\(`,
+    'g',
+  );
+  for (const m of stripped.matchAll(requireDestructurePattern)) {
+    for (const rawSpecifier of m[1].split(',')) {
+      const specifier = rawSpecifier.trim();
+      const aliasMatch = specifier.match(new RegExp(String.raw`^ethers\s*:\s*(${IDENT})$`));
+      if (aliasMatch) namespaceAliases.add(aliasMatch[1]);
+      if (specifier === 'ethers') namespaceAliases.add('ethers');
+    }
   }
 
   let namespaceChanged = true;
@@ -492,7 +530,6 @@ function collectWalletAliases(stripped) {
   // imported binding shape rather than the module specifier. The audit is a
   // fail-safe for high-impact key loss, so a conservative false positive is
   // preferable to an alias bypass.
-  const importPattern = new RegExp(String.raw`\bimport\s*\{([^}]*)\}\s*from\b`, 'g');
   for (const m of stripped.matchAll(importPattern)) {
     for (const rawSpecifier of m[1].split(',')) {
       const specifier = rawSpecifier.trim();
@@ -502,18 +539,27 @@ function collectWalletAliases(stripped) {
     }
   }
 
+  const addWalletDestructureAliases = (bindingList) => {
+    for (const rawSpecifier of bindingList.split(',')) {
+      const specifier = rawSpecifier.trim();
+      const aliasMatch = specifier.match(new RegExp(String.raw`^Wallet\s*:\s*(${IDENT})$`));
+      if (aliasMatch) aliases.add(aliasMatch[1]);
+      if (specifier === 'Wallet') aliases.add('Wallet');
+    }
+  };
+
   // Destructuring aliases from ethers: const { Wallet: W } = ethers;
   const destructurePattern = new RegExp(
     String.raw`\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:${namespacePattern})\b`,
     'g',
   );
   for (const m of stripped.matchAll(destructurePattern)) {
-    for (const rawSpecifier of m[1].split(',')) {
-      const specifier = rawSpecifier.trim();
-      const aliasMatch = specifier.match(new RegExp(String.raw`^Wallet\s*:\s*(${IDENT})$`));
-      if (aliasMatch) aliases.add(aliasMatch[1]);
-      if (specifier === 'Wallet') aliases.add('Wallet');
-    }
+    addWalletDestructureAliases(m[1]);
+  }
+
+  // Direct CommonJS destructuring: const { Wallet: W } = require('ethers');
+  for (const m of stripped.matchAll(requireDestructurePattern)) {
+    addWalletDestructureAliases(m[1]);
   }
 
   // Follow simple assignment aliases transitively:

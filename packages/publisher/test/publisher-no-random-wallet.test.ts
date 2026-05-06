@@ -27,7 +27,14 @@ import { describe, it, expect } from 'vitest';
 import { DKGPublisher } from '../src/dkg-publisher.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
-import { MockChainAdapter, type ChainAdapter, type TxResult, type V10UpdateKCParams } from '@origintrail-official/dkg-chain';
+import {
+  MockChainAdapter,
+  type ChainAdapter,
+  type OnChainPublishResult,
+  type TxResult,
+  type V10PublishDirectParams,
+  type V10UpdateKCParams,
+} from '@origintrail-official/dkg-chain';
 import { ethers } from 'ethers';
 
 const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
@@ -52,6 +59,59 @@ class AdapterSigningChain extends MockChainAdapter {
       r: ethers.getBytes(sig.r),
       vs: ethers.getBytes(sig.yParityAndS),
     };
+  }
+}
+
+class AsyncAddressSigningChain implements ChainAdapter {
+  readonly chainId = 'mock:31337';
+  capturedPublisherAddress?: string;
+
+  constructor(private readonly wallet: ethers.Wallet) {}
+
+  isV10Ready(): boolean {
+    return true;
+  }
+
+  async getEvmChainId(): Promise<bigint> {
+    return 31337n;
+  }
+
+  async getKnowledgeAssetsV10Address(): Promise<string> {
+    return '0x00000000000000000000000000000000000000A1';
+  }
+
+  async getSignerAddress(): Promise<string> {
+    return this.wallet.address;
+  }
+
+  async signMessage(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const sig = ethers.Signature.from(await this.wallet.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+
+  async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+    this.capturedPublisherAddress = params.publisherAddress;
+    if (params.publisherAddress?.toLowerCase() !== this.wallet.address.toLowerCase()) {
+      throw new Error('publisher did not await async signer address');
+    }
+    return {
+      batchId: 1n,
+      startKAId: 101n,
+      endKAId: 101n,
+      txHash: `0x${'78'.repeat(32)}`,
+      blockNumber: 1,
+      blockTimestamp: Math.floor(Date.now() / 1000),
+      publisherAddress: this.wallet.address,
+    };
+  }
+}
+
+class RejectingAdapterSignerChain extends AsyncAddressSigningChain {
+  async signMessageAs(): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    throw new Error('remote signer unavailable');
   }
 }
 
@@ -452,6 +512,70 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
     expect(result.status).toBe('confirmed');
     expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
+  it('awaits async adapter signer address probes', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new AsyncAddressSigningChain(wallet);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 1n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-async-address',
+        predicate: 'http://schema.org/name',
+        object: '"AdapterAsyncAddress"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+    expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
+  it('continues tentatively when adapter signer fails during self-ACK', async () => {
+    const keypair = await generateEd25519Keypair();
+    const store = new OxigraphStore();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new RejectingAdapterSignerChain(wallet);
+    const publisher = new DKGPublisher({
+      store,
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 1n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-self-ack-failure',
+        predicate: 'http://schema.org/name',
+        object: '"AdapterSelfAckFailure"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(chain.capturedPublisherAddress).toBeUndefined();
+
+    const stored = await store.query(`
+      SELECT ?p ?o WHERE {
+        GRAPH <did:dkg:context-graph:1> {
+          <urn:test:adapter-self-ack-failure> ?p ?o .
+        }
+      }
+    `);
+    expect(stored.type).toBe('bindings');
+    expect(stored.bindings).toHaveLength(1);
   });
 
   it('binds context-graph-aware adapter signer resolution to the V10 tx publisher address', async () => {

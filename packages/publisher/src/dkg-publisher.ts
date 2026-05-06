@@ -355,7 +355,9 @@ export class DKGPublisher implements Publisher {
     const signerAddressGetter = (this.chain as unknown as { getSignerAddress?: () => unknown }).getSignerAddress;
     if (typeof signerAddressGetter === 'function') {
       try {
-        const address = coercePublisherAddress(signerAddressGetter.call(this.chain));
+        const address = coercePublisherAddress(
+          await Promise.resolve(signerAddressGetter.call(this.chain)),
+        );
         if (address) return address;
       } catch {
         // Fall through to other common adapter surfaces.
@@ -365,7 +367,7 @@ export class DKGPublisher implements Publisher {
     const signerAddressesGetter = (this.chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
     if (typeof signerAddressesGetter === 'function') {
       try {
-        const advertised = signerAddressesGetter.call(this.chain);
+        const advertised = await Promise.resolve(signerAddressesGetter.call(this.chain));
         if (Array.isArray(advertised)) {
           for (const value of advertised) {
             const address = coercePublisherAddress(value);
@@ -1522,15 +1524,23 @@ export class DKGPublisher implements Publisher {
           precomputedTokenAmount,
           BigInt(kcMerkleLeafCount),
         );
-        const ackSig = ethers.Signature.from(
-          await publisherSigner.signMessage(ackDigest),
-        );
-        v10ACKs = [{
-          peerId: 'self',
-          signatureR: ethers.getBytes(ackSig.r),
-          signatureVS: ethers.getBytes(ackSig.yParityAndS),
-          nodeIdentityId: this.publisherNodeIdentityId,
-        }];
+        try {
+          const ackSig = ethers.Signature.from(
+            await publisherSigner.signMessage(ackDigest),
+          );
+          v10ACKs = [{
+            peerId: 'self',
+            signatureR: ethers.getBytes(ackSig.r),
+            signatureVS: ethers.getBytes(ackSig.yParityAndS),
+            nodeIdentityId: this.publisherNodeIdentityId,
+          }];
+        } catch (err) {
+          this.log.warn(
+            ctx,
+            `Self-sign ACK skipped: publisher signer failed (${err instanceof Error ? err.message : String(err)})`,
+          );
+          v10ACKs = [];
+        }
       } else {
         this.log.warn(ctx, 'Self-sign ACK skipped: publisher signing key is unavailable');
       }

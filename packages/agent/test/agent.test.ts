@@ -208,6 +208,44 @@ class AddressOnlyExternalOperationalKeyPublishChainAdapter extends ExternalOpera
   }
 }
 
+class AsyncAddressSignMessageAsPublishChainAdapter extends ExternalOperationalKeyPublishChainAdapter {
+  constructor(private readonly wallet: ethers.Wallet) {
+    super(wallet.address);
+  }
+
+  async getSignerAddress(): Promise<string> {
+    return this.wallet.address;
+  }
+
+  async signMessageAs(address: string, messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    if (address.toLowerCase() !== this.wallet.address.toLowerCase()) {
+      throw new Error(`unexpected signer ${address}`);
+    }
+    const sig = ethers.Signature.from(await this.wallet.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+}
+
+class GenericSignMessageExternalOperationalKeyPublishChainAdapter extends ExternalOperationalKeyPublishChainAdapter {
+  constructor(
+    expectedPublisherAddress: string,
+    private readonly genericSigner: ethers.Wallet,
+  ) {
+    super(expectedPublisherAddress);
+  }
+
+  async signMessage(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const sig = ethers.Signature.from(await this.genericSigner.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+}
+
 let _fileSnapshot: string;
 beforeAll(async () => {
   _fileSnapshot = await takeSnapshot();
@@ -1135,6 +1173,37 @@ describe('DKGAgent ACK signer gating', () => {
     }
   });
 
+  it('awaits async adapter signer address probes', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const chain = new AsyncAddressSignMessageAsPublishChainAdapter(wallet);
+
+    const agent = await DKGAgent.create({
+      name: 'AsyncAdapterAddressPublisher',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+    });
+
+    try {
+      agent.publisher.setIdentityId(1n);
+      const result = await agent.publisher.publish({
+        contextGraphId: '42',
+        quads: [{
+          subject: 'urn:test:agent-async-adapter-address',
+          predicate: 'http://schema.org/name',
+          object: '"AsyncAdapterAddress"',
+          graph: 'did:dkg:context-graph:42',
+        }],
+      });
+
+      expect(result.status).toBe('confirmed');
+      expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+      expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
   it('keeps getOperationalPrivateKey as a legacy adapter-backed publish fallback', async () => {
     const wallet = ethers.Wallet.createRandom();
     const chain = new OperationalKeyOnlyPublishChainAdapter(wallet);
@@ -1226,6 +1295,46 @@ describe('DKGAgent ACK signer gating', () => {
           subject: 'urn:test:agent-address-only-operational-key-fallback',
           predicate: 'http://schema.org/name',
           object: '"AddressOnlyOperationalKeyFallback"',
+          graph: 'did:dkg:context-graph:42',
+        }],
+      });
+
+      expect(result.status).toBe('confirmed');
+      expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+      expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('keeps chainConfig.operationalKeys fallback when custom adapter only exposes generic signMessage', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const unrelatedSigner = ethers.Wallet.createRandom();
+    const chain = new GenericSignMessageExternalOperationalKeyPublishChainAdapter(
+      wallet.address,
+      unrelatedSigner,
+    );
+
+    const agent = await DKGAgent.create({
+      name: 'GenericSignMessageOperationalKeyPublisher',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+      chainConfig: {
+        rpcUrl: 'http://127.0.0.1:0',
+        hubAddress: '0x00000000000000000000000000000000000000A1',
+        operationalKeys: [wallet.privateKey],
+      },
+    });
+
+    try {
+      agent.publisher.setIdentityId(1n);
+      const result = await agent.publisher.publish({
+        contextGraphId: '42',
+        quads: [{
+          subject: 'urn:test:agent-generic-sign-message-operational-key-fallback',
+          predicate: 'http://schema.org/name',
+          object: '"GenericSignMessageOperationalKeyFallback"',
           graph: 'did:dkg:context-graph:42',
         }],
       });

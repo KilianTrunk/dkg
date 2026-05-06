@@ -495,7 +495,6 @@ function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
 
 function adapterAdvertisesPublisherSigner(chain: ChainAdapter): boolean {
   if (typeof chain.signMessageAs === 'function') return true;
-  if (typeof chain.signMessage === 'function') return true;
   if (typeof (chain as unknown as { getOperationalPrivateKey?: unknown }).getOperationalPrivateKey === 'function') return true;
   return false;
 }
@@ -527,7 +526,9 @@ async function inferAdapterPublisherAddress(
   const signerAddressGetter = (chain as unknown as { getSignerAddress?: () => unknown }).getSignerAddress;
   if (typeof signerAddressGetter === 'function') {
     try {
-      const address = normalizeAdapterPublisherAddress(signerAddressGetter.call(chain));
+      const address = normalizeAdapterPublisherAddress(
+        await Promise.resolve(signerAddressGetter.call(chain)),
+      );
       if (address) return address;
     } catch {
       // Best-effort probe; fall through to broader adapter surfaces.
@@ -537,7 +538,7 @@ async function inferAdapterPublisherAddress(
   const signerAddresses = (chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
   if (typeof signerAddresses === 'function') {
     try {
-      const advertised = signerAddresses.call(chain);
+      const advertised = await Promise.resolve(signerAddresses.call(chain));
       if (Array.isArray(advertised)) {
         for (const value of advertised) {
           const address = normalizeAdapterPublisherAddress(value);

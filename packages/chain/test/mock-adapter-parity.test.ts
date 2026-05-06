@@ -307,9 +307,9 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       ackSignatures: [],
     };
 
-    await expect(mock.createKnowledgeAssetsV10(params)).rejects.toThrow(/not registered/);
+    await expect(mock.createKnowledgeAssetsV10(params)).rejects.toThrow(/not allowed/);
 
-    mock.seedIdentity(otherPublisher, 7n);
+    mock.allowPublisherAddress(otherPublisher);
     await expect(mock.createKnowledgeAssetsV10(params)).resolves.toMatchObject({
       publisherAddress: otherPublisher,
     });
@@ -319,7 +319,7 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     const mock = new MockChainAdapter('mock:31337', '0x1111111111111111111111111111111111111111');
     mock.minimumRequiredSignatures = 0;
     const delegatedPublisher = '0x2222222222222222222222222222222222222222';
-    mock.seedIdentity(delegatedPublisher, 7n);
+    mock.allowPublisherAddress(delegatedPublisher);
 
     const created = await mock.createKnowledgeAssetsV10({
       publishOperationId: 'mock-v10-delegated-update',
@@ -355,7 +355,7 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     const mock = new MockChainAdapter('mock:31337', '0x1111111111111111111111111111111111111111');
     const delegatedPublisher = '0x2222222222222222222222222222222222222222';
     mock.minimumRequiredSignatures = 0;
-    mock.seedIdentity(delegatedPublisher, 7n);
+    mock.allowPublisherAddress(delegatedPublisher);
 
     const created = await mock.createKnowledgeAssetsV10({
       publishOperationId: 'mock-v9-fallback-delegated-update',

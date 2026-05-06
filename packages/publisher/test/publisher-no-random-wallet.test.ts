@@ -110,6 +110,21 @@ class AsyncAddressSigningChain implements ChainAdapter {
   }
 }
 
+class ReservingPublishChain extends AsyncAddressSigningChain {
+  reservations = 0;
+  private readonly authorizedAddress: string;
+
+  constructor(wallet: ethers.Wallet) {
+    super(wallet);
+    this.authorizedAddress = wallet.address;
+  }
+
+  async getAuthorizedPublisherAddress(): Promise<string> {
+    this.reservations += 1;
+    return this.authorizedAddress;
+  }
+}
+
 class LazyReadySigningChain extends AsyncAddressSigningChain {
   private ready = false;
   capturedTokenAmount?: bigint;
@@ -380,6 +395,33 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(result.status).toBe('tentative');
     expect(result.onChainResult).toBeUndefined();
     expect(result.ual).toMatch(/^did:dkg:evm:31337\/0x[0-9a-fA-F]{40}\/t/);
+  });
+
+  it('does not reserve adapter publisher signers for identity-less tentative publishes', async () => {
+    const keypair = await generateEd25519Keypair();
+    const chain = new ReservingPublishChain(new ethers.Wallet(TEST_KEY));
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherNodeIdentityId: 0n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:evm-identityless-no-reserve',
+        predicate: 'http://schema.org/name',
+        object: '"EvmIdentitylessNoReserve"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+    expect(chain.reservations).toBe(0);
+    expect(chain.capturedPublisherAddress).toBeUndefined();
   });
 
   it('keeps descriptive-CG chain-backed publishes tentative without a publisher signer', async () => {
@@ -890,6 +932,31 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
     expect(updated.status).toBe('failed');
     expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
+  });
+
+  it('preserves failed adapter-managed updates when publisher attribution is unavailable', async () => {
+    const keypair = await generateEd25519Keypair();
+    const chain = new AdapterManagedUpdateChain(undefined, undefined, false);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+    });
+
+    const updated = await publisher.update(12n, {
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:adapter-managed-failed-update-without-address',
+        predicate: 'http://schema.org/name',
+        object: '"After"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(chain.capturedPublisherAddress).toBeUndefined();
+    expect(updated.status).toBe('failed');
+    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/12$/);
   });
 
   it('does not confirm adapter-managed updates from local metadata alone', async () => {

@@ -60,6 +60,11 @@ export interface DKGPublisherConfig {
   writeLocks?: Map<string, Promise<void>>;
 }
 
+interface PublisherAddressResolutionOptions {
+  includeReservingPublisherProbe?: boolean;
+  includeGenericSignMessageProbe?: boolean;
+}
+
 export class PublisherWalletRequiredError extends Error {
   constructor(operation: string) {
     super(
@@ -343,17 +348,27 @@ export class DKGPublisher implements Publisher {
     this.writeLocks = config.writeLocks ?? new Map();
   }
 
-  private async resolvePublisherAddress(contextGraphId?: bigint): Promise<string | undefined> {
+  private async resolvePublisherAddress(
+    contextGraphId?: bigint,
+    options: PublisherAddressResolutionOptions = {},
+  ): Promise<string | undefined> {
     if (this.publisherAddress) return this.publisherAddress;
     if (this.publisherAddressResolver) {
       const resolved = normalizePublisherAddress(await this.publisherAddressResolver(contextGraphId));
       if (resolved) return resolved;
     }
-    return this.inferAdapterPublisherAddress(contextGraphId);
+    return this.inferAdapterPublisherAddress(contextGraphId, options);
   }
 
-  private async inferAdapterPublisherAddress(contextGraphId?: bigint): Promise<string | undefined> {
-    if (contextGraphId !== undefined && typeof this.chain.getAuthorizedPublisherAddress === 'function') {
+  private async inferAdapterPublisherAddress(
+    contextGraphId?: bigint,
+    options: PublisherAddressResolutionOptions = {},
+  ): Promise<string | undefined> {
+    if (
+      options.includeReservingPublisherProbe !== false &&
+      contextGraphId !== undefined &&
+      typeof this.chain.getAuthorizedPublisherAddress === 'function'
+    ) {
       try {
         const address = coercePublisherAddress(await this.chain.getAuthorizedPublisherAddress(contextGraphId));
         if (address) return address;
@@ -398,6 +413,7 @@ export class DKGPublisher implements Publisher {
     if (operationalWallet) return operationalWallet.address;
 
     if (this.adapterSignMessagePublisherAddress) return this.adapterSignMessagePublisherAddress;
+    if (options.includeGenericSignMessageProbe === false) return undefined;
     if (this.chain.chainId === 'none' || typeof this.chain.signMessage !== 'function') return undefined;
 
     try {
@@ -458,11 +474,15 @@ export class DKGPublisher implements Publisher {
     return this.isChainV10Ready();
   }
 
-  private async resolveKnownBatchPublisherAddress(contextGraphId: string, kcId: bigint): Promise<string | undefined> {
+  private async resolveKnownBatchPublisherAddress(
+    contextGraphId: string,
+    kcId: bigint,
+    metaGraphUri = this.graphManager.metaGraphUri(contextGraphId),
+  ): Promise<string | undefined> {
     try {
       const ual = await resolveUalByBatchId(
         this.store,
-        this.graphManager.metaGraphUri(contextGraphId),
+        metaGraphUri,
         kcId,
       );
       return publisherAddressFromUal(ual);
@@ -487,7 +507,6 @@ export class DKGPublisher implements Publisher {
       if (matches) this.adapterSignMessagePublisherAddress = expectedAddress;
       return matches;
     } catch {
-      this.adapterSignMessageProbeCache.set(cacheKey, false);
       return false;
     }
   }
@@ -1297,8 +1316,16 @@ export class DKGPublisher implements Publisher {
     }
     const willAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherContextGraphId !== undefined;
     const chainV10Ready = await this.refreshChainV10Readiness();
-    const resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
-    const publisherSigner = await this.getPublisherSigner(resolvedPublisherAddress);
+    const canResolveOnChainPublisher = willAttemptOnChainPublish && chainV10Ready;
+    const resolvedPublisherAddress = canResolveOnChainPublisher
+      ? await this.resolvePublisherAddress(publisherContextGraphId)
+      : await this.resolvePublisherAddress(undefined, {
+        includeReservingPublisherProbe: false,
+        includeGenericSignMessageProbe: false,
+      });
+    const publisherSigner = canResolveOnChainPublisher
+      ? await this.getPublisherSigner(resolvedPublisherAddress)
+      : undefined;
     const publisherAddress = resolvedPublisherAddress ?? this.localTentativePublisherAddress();
     const canAttemptOnChainPublish = willAttemptOnChainPublish &&
       chainV10Ready &&
@@ -1928,7 +1955,7 @@ export class DKGPublisher implements Publisher {
     const localOnlyUpdate = this.chain.chainId === 'none';
     let resolvedPublisherAddress: string | undefined;
     if (localOnlyUpdate) {
-      resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
+      resolvedPublisherAddress = this.publisherAddress;
     } else if (typeof this.chain.getLatestMerkleRootPublisher === 'function') {
       try {
         resolvedPublisherAddress = coercePublisherAddress(
@@ -1940,7 +1967,11 @@ export class DKGPublisher implements Publisher {
       }
     }
     if (!resolvedPublisherAddress && !localOnlyUpdate) {
-      resolvedPublisherAddress = await this.resolveKnownBatchPublisherAddress(contextGraphId, kcId);
+      resolvedPublisherAddress = await this.resolveKnownBatchPublisherAddress(
+        contextGraphId,
+        kcId,
+        options.targetMetaGraphUri,
+      );
     }
     const publisherAddress = resolvedPublisherAddress ?? (
       localOnlyUpdate ? this.localTentativePublisherAddress() : undefined
@@ -2167,8 +2198,20 @@ export class DKGPublisher implements Publisher {
           // Fall through to the clear fail-loud path below.
         }
       }
-      failedPublisherAddress ??= await this.resolveKnownBatchPublisherAddress(contextGraphId, kcId);
-      if (!failedPublisherAddress) throw new PublisherWalletRequiredError('update');
+      failedPublisherAddress ??= await this.resolveKnownBatchPublisherAddress(
+        contextGraphId,
+        kcId,
+        options.targetMetaGraphUri,
+      );
+      if (!failedPublisherAddress) {
+        failedPublisherAddress = this.localTentativePublisherAddress();
+        this.log.warn(
+          ctx,
+          'Chain adapter returned a failed update without publisherAddress, and neither ' +
+          'chain state nor local metadata resolved the publisher. Returning the failed ' +
+          'update status with a local tentative UAL placeholder.',
+        );
+      }
       onPhase?.('chain:submit', 'end');
       onPhase?.('chain', 'end');
       return {

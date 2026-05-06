@@ -118,11 +118,19 @@ export class MockChainAdapter implements ChainAdapter {
   seedIdentity(address: string, identityId: bigint): void {
     this.identities.set(address, identityId);
     if (ethers.isAddress(address)) {
-      this.allowedPublisherAddresses.add(ethers.getAddress(address).toLowerCase());
+      this.allowPublisherAddress(address);
     }
     if (identityId >= this.nextIdentityId) {
       this.nextIdentityId = identityId + 1n;
     }
+  }
+
+  /**
+   * Test helper: allow delegated V10 publishes to be attributed to an address
+   * without also pretending that address owns a node identity.
+   */
+  allowPublisherAddress(address: string): void {
+    this.allowedPublisherAddresses.add(ethers.getAddress(address).toLowerCase());
   }
 
   // --- V9 UAL-based methods ---
@@ -958,8 +966,8 @@ export class MockChainAdapter implements ChainAdapter {
       : ethers.getAddress(this.signerAddress);
     if (!this.allowedPublisherAddresses.has(publisherAddress.toLowerCase())) {
       throw new Error(
-        `Mock publisherAddress ${publisherAddress} is not registered with this adapter. ` +
-        'Seed the address first to model explicit mock support for address-specific publishing.',
+        `Mock publisherAddress ${publisherAddress} is not allowed with this adapter. ` +
+        'Allow the address first to model explicit mock support for address-specific publishing.',
       );
     }
     const kcId = this.nextBatchId++;

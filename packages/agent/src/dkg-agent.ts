@@ -518,7 +518,10 @@ function privateKeyAddress(privateKey: string | undefined): string | undefined {
 async function inferAdapterPublisherAddress(
   chain: ChainAdapter,
   contextGraphId?: bigint,
-  options?: { includeReservingPublisherProbe?: boolean },
+  options?: {
+    includeReservingPublisherProbe?: boolean;
+    includeGenericSignMessageProbe?: boolean;
+  },
 ): Promise<string | undefined> {
   if (
     options?.includeReservingPublisherProbe !== false &&
@@ -580,6 +583,7 @@ async function inferAdapterPublisherAddress(
     }
   }
 
+  if (options?.includeGenericSignMessageProbe === false) return undefined;
   if (chain.chainId === 'none' || typeof chain.signMessage !== 'function') return undefined;
 
   try {
@@ -7257,6 +7261,7 @@ export class DKGAgent {
     }
     return inferAdapterPublisherAddress(this.chain, publisherContextGraphId, {
       includeReservingPublisherProbe: false,
+      includeGenericSignMessageProbe: false,
     });
   }
 

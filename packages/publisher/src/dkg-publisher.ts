@@ -272,7 +272,7 @@ export class DKGPublisher implements Publisher {
   private readonly sharedMemoryOwnedEntities: Map<string, Map<string, string>>;
   readonly knownBatchContextGraphs: Map<string, string>;
   private publisherNodeIdentityId: bigint;
-  private publisherAddress?: string;
+  private readonly publisherAddress?: string;
   private readonly publisherAddressResolver?: (contextGraphId?: bigint) => Promise<string | undefined>;
   private readonly publisherWallet?: ethers.Wallet;
   /** Additional wallets that can provide receiver signatures. */

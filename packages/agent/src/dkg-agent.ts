@@ -494,9 +494,12 @@ function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
 }
 
 function adapterAdvertisesPublisherSigner(chain: ChainAdapter): boolean {
-  if (typeof chain.signMessageAs === 'function') return true;
-  if (typeof (chain as unknown as { getOperationalPrivateKey?: unknown }).getOperationalPrivateKey === 'function') return true;
-  return false;
+  const hasAddressProbe = typeof chain.getAuthorizedPublisherAddress === 'function' ||
+    typeof (chain as unknown as { getSignerAddress?: unknown }).getSignerAddress === 'function' ||
+    typeof (chain as unknown as { getSignerAddresses?: unknown }).getSignerAddresses === 'function' ||
+    Boolean(normalizeAdapterPublisherAddress((chain as unknown as { signerAddress?: unknown }).signerAddress));
+
+  return hasAddressProbe && typeof chain.signMessageAs === 'function';
 }
 
 function privateKeyAddress(privateKey: string | undefined): string | undefined {

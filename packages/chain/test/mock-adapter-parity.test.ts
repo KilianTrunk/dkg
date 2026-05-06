@@ -284,6 +284,35 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       publishPolicy: 0,
     })).resolves.toMatchObject({ contextGraphId: 1n });
   });
+
+  it('requires explicit mock support for address-specific V10 publishing', async () => {
+    const mock = new MockChainAdapter('mock:31337', '0x1111111111111111111111111111111111111111');
+    mock.minimumRequiredSignatures = 0;
+    const otherPublisher = '0x2222222222222222222222222222222222222222';
+    const params = {
+      publishOperationId: 'mock-v10-publisher-address',
+      contextGraphId: 1n,
+      publisherAddress: otherPublisher,
+      merkleRoot: new Uint8Array(32),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1n,
+      epochs: 1,
+      tokenAmount: 1n,
+      isImmutable: false,
+      merkleLeafCount: 1,
+      paymaster: '0x0000000000000000000000000000000000000000',
+      publisherNodeIdentityId: 1n,
+      publisherSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      ackSignatures: [],
+    };
+
+    await expect(mock.createKnowledgeAssetsV10(params)).rejects.toThrow(/not registered/);
+
+    mock.seedIdentity(otherPublisher, 7n);
+    await expect(mock.createKnowledgeAssetsV10(params)).resolves.toMatchObject({
+      publisherAddress: otherPublisher,
+    });
+  });
 });
 
 describe('NoChainAdapter completeness [CH-9]', () => {

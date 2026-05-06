@@ -69,6 +69,8 @@ export class MockChainAdapter implements ChainAdapter {
   private events: ChainEvent[] = [];
   /** Reserved UAL ranges per publisher address for verifyPublisherOwnsRange */
   private reservedRangesByPublisher = new Map<string, Array<{ startId: bigint; endId: bigint }>>();
+  /** Publisher addresses this mock is explicitly allowed to attribute V10 publishes to. */
+  private allowedPublisherAddresses: Set<string>;
 
   /** Configurable minimum receiver signatures. When > 0, publishKnowledgeAssets will check the count. Default: 1. */
   minimumRequiredSignatures = 1;
@@ -76,6 +78,7 @@ export class MockChainAdapter implements ChainAdapter {
   constructor(chainId = 'mock:31337', signerAddress = MOCK_DEFAULT_SIGNER) {
     this.chainId = chainId;
     this.signerAddress = signerAddress;
+    this.allowedPublisherAddresses = new Set([ethers.getAddress(signerAddress).toLowerCase()]);
   }
 
   async getIdentityId(): Promise<bigint> {
@@ -108,6 +111,9 @@ export class MockChainAdapter implements ChainAdapter {
    */
   seedIdentity(address: string, identityId: bigint): void {
     this.identities.set(address, identityId);
+    if (ethers.isAddress(address)) {
+      this.allowedPublisherAddresses.add(ethers.getAddress(address).toLowerCase());
+    }
     if (identityId >= this.nextIdentityId) {
       this.nextIdentityId = identityId + 1n;
     }
@@ -923,8 +929,16 @@ export class MockChainAdapter implements ChainAdapter {
       );
     }
 
+    const publisherAddress = params.publisherAddress
+      ? ethers.getAddress(params.publisherAddress)
+      : ethers.getAddress(this.signerAddress);
+    if (!this.allowedPublisherAddresses.has(publisherAddress.toLowerCase())) {
+      throw new Error(
+        `Mock publisherAddress ${publisherAddress} is not registered with this adapter. ` +
+        'Seed the address first to model explicit mock support for address-specific publishing.',
+      );
+    }
     const kcId = this.nextBatchId++;
-    const publisherAddress = params.publisherAddress ?? this.signerAddress;
     this.collections.set(kcId, {
       merkleRoot: params.merkleRoot,
       kaCount: params.knowledgeAssetsAmount,

@@ -46,6 +46,8 @@ function delayedAdapterPublisherAddress(chain: ChainAdapter, address: string): {
     chain: new Proxy(chain, {
     get(target, prop, receiver) {
       if (prop === 'getOperationalPrivateKey') return undefined;
+      if (prop === 'getAuthorizedPublisherAddress') return undefined;
+      if (prop === 'getSignerAddress') return undefined;
       if (prop === 'getSignerAddresses') {
         return () => {
           if (!unlocked) throw new Error('signer address unavailable during startup');

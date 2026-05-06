@@ -95,6 +95,21 @@ export {
 } from './gossip-envelope.js';
 
 export {
+  type EncryptedWorkspacePayloadMsg,
+  type EncryptedWorkspaceRecipientKeySlotMsg,
+  type EncryptedWorkspaceAADFields,
+  ENCRYPTED_WORKSPACE_ENVELOPE_VERSION,
+  ENCRYPTED_WORKSPACE_ENVELOPE_TYPE,
+  ENCRYPTED_WORKSPACE_CIPHER_ALGORITHM,
+  ENCRYPTED_WORKSPACE_KEY_WRAP_ALGORITHM,
+  ENCRYPTED_WORKSPACE_AAD_DOMAIN,
+  encodeEncryptedWorkspacePayload,
+  decodeEncryptedWorkspacePayload,
+  computeEncryptedWorkspaceAAD,
+  timestampForAAD,
+} from './encrypted-workspace.js';
+
+export {
   type PublishIntentMsg,
   encodePublishIntent,
   decodePublishIntent,

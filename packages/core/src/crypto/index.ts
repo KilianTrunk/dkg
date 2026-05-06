@@ -43,4 +43,17 @@ export {
   uint256ToBytes,
 } from './ack.js';
 
+export {
+  WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+  WORKSPACE_ENCRYPTION_KEY_BYTES,
+  WORKSPACE_ENCRYPTION_NONCE_BYTES,
+  generateWorkspaceRecipientEncryptionKey,
+  encryptWorkspacePayload,
+  decryptWorkspacePayload,
+  assertSupportedEncryptedWorkspaceEnvelope,
+  type WorkspaceRecipientEncryptionKey,
+  type EncryptWorkspacePayloadInput,
+  type DecryptedWorkspacePayload,
+} from './workspace-encryption.js';
+
 export { resolveRootEntities, type Quad as RootEntityQuad } from './root-entity.js';

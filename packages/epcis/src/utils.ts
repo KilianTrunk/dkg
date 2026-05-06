@@ -99,11 +99,8 @@ export function parseQueryParams(sp: URLSearchParams): EpcisQueryParams {
     }
   }
 
-  const finalized = sp.get('finalized');
-  if (finalized === 'false') {
+  if (sp.get('finalized') === 'false') {
     params.finalized = false;
-  } else {
-    params.finalized = true;
   }
 
   return params;

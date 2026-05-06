@@ -2695,16 +2695,6 @@ const EPCIS_EXIT_CODES = {
   NOT_FOUND: 4,
 } as const;
 
-/**
- * Map an HTTP status from the daemon's epcis routes to the CLI's
- * documented exit codes (see slice 05 spec, "Exit codes" table).
- *
- * - 2xx → 0 (caller treats as success)
- * - 503 → 3 (publisher disabled / unavailable / enqueue failed)
- * - 404 → 4 (capture or context graph not found)
- * - 4xx → 2 (validation, missing CG, etc.)
- * - everything else (incl. 5xx other than 503) → 1
- */
 function exitCodeForEpcisHttpStatus(status: number | undefined): number {
   if (status === undefined) return EPCIS_EXIT_CODES.UNEXPECTED;
   if (status >= 200 && status < 300) return EPCIS_EXIT_CODES.SUCCESS;
@@ -2714,14 +2704,6 @@ function exitCodeForEpcisHttpStatus(status: number | undefined): number {
   return EPCIS_EXIT_CODES.UNEXPECTED;
 }
 
-/**
- * Print error message + exit with the right code for an EPCIS subcommand.
- * - HTTP responses (errors thrown by `ApiClient`) carry an `httpStatus`;
- *   we use it to pick exit code 2/3/4 per the spec table.
- * - Network failures / unexpected errors fall through to exit code 1.
- * - The full response body (when present) is printed as JSON so callers
- *   can pipe it; the human-readable message goes to stderr.
- */
 function reportEpcisError(err: unknown): never {
   const httpStatus = (err as { httpStatus?: number })?.httpStatus;
   const responseBody = (err as { responseBody?: unknown })?.responseBody;
@@ -2730,7 +2712,7 @@ function reportEpcisError(err: unknown): never {
     try {
       console.log(JSON.stringify(responseBody, null, 2));
     } catch {
-      // Body wasn't serialisable — drop it; the message below is enough.
+      // not serialisable
     }
   }
   console.error(toErrorMessage(err));
@@ -2752,11 +2734,8 @@ epcisCmd
   .option('--allowed-peer <peerId>', 'Peer allowed to read the captured event (repeatable, requires --access-policy allowList)', (value: string, prev: string[] = []) => [...prev, value])
   .action(async (documentPath: string, opts: ActionOpts) => {
     try {
-      // The document file may be either a raw EPCIS 2.0 JSON-LD document
-      // (top-level `type: "EPCISDocument"`) or an envelope of the daemon's
-      // capture body shape `{ epcisDocument, publishOptions, contextGraphId,
-      // subGraphName }`. We normalise both into the daemon's body, with
-      // CLI flags overriding fields supplied by the file when both exist.
+      // Document file may be a bare EPCIS 2.0 doc or a `{ epcisDocument, ... }`
+      // envelope; CLI flags override fields read from the file.
       const { readFile } = await import('node:fs/promises');
       let raw: string;
       try {
@@ -2907,9 +2886,6 @@ epcisCmd
         return;
       }
 
-      // --all: walk Link: rel="next" pages until exhausted and stitch
-      // every page's `eventList` into the first page's response. Cap the
-      // walk so a runaway/buggy daemon can't loop forever.
       const merged = JSON.parse(JSON.stringify(initial.body)) as any;
       const eventList = merged?.epcisBody?.queryResults?.resultsBody?.eventList;
       if (!Array.isArray(eventList)) {

@@ -265,9 +265,6 @@ export class ApiClient {
   }
 
   // ───────────────────────── EPCIS ─────────────────────────────────────
-  // The EPCIS daemon route is described in `packages/cli/src/daemon/routes/epcis.ts`.
-  // CLI-side wrappers below mirror its three endpoints and surface 202/200 bodies
-  // to the CLI command actions, which decide on exit-code mapping.
 
   async captureEpcis(request: {
     epcisDocument: unknown;
@@ -296,13 +293,6 @@ export class ApiClient {
     return this.get(`/api/epcis/capture/${encodeURIComponent(captureID)}`);
   }
 
-  /**
-   * GET /api/epcis/events. Returns the full EPCIS query document plus
-   * the parsed `nextPageUrl` derived from the response's `Link: rel="next"`
-   * header so callers can implement `--all` pagination without re-parsing
-   * the header themselves. `nextPageUrl` is a path+query string ready to
-   * be appended to the daemon's `baseUrl` (e.g. `/api/epcis/events?...`).
-   */
   async queryEpcisEvents(params: {
     contextGraphId?: string;
     subGraphName?: string;
@@ -337,13 +327,6 @@ export class ApiClient {
     return this.queryEpcisEventsByPath(`/api/epcis/events${qs ? `?${qs}` : ''}`);
   }
 
-  /**
-   * Lower-level EPCIS query helper. Used by `--all` follow-up requests
-   * after the initial query, where the daemon already serialised the
-   * next-page URL into the Link header and we just want to re-issue it.
-   * The path/query is taken verbatim — we never reconstruct it from the
-   * parsed Link header to avoid re-encoding bugs.
-   */
   async queryEpcisEventsByPath(path: string): Promise<{
     body: unknown;
     nextPageUrl: string | null;
@@ -1025,14 +1008,6 @@ export class ApiClient {
   }
 }
 
-/**
- * Parse the path+query of the first `rel="next"` link in an RFC 5988
- * Link header. We accept absolute URLs (in case a daemon ever emits one)
- * and relative paths (the current daemon shape from
- * `handlers.ts: handleEventsQuery`). Returns `null` if no next link is
- * present or the header is malformed in a way that doesn't yield a
- * usable path.
- */
 function parseNextLink(linkHeader: string | null): string | null {
   if (!linkHeader) return null;
   const segments = linkHeader.split(',');

@@ -258,15 +258,15 @@ describe('buildEpcisQuery', () => {
     expect(sparql).toContain('FILTER(?eventType = <https://gs1.github.io/EPCIS/ObjectEvent>)');
   });
 
-  it('uses sub-graph variants for finalized public, shared memory, meta, and private graphs', () => {
+  it('uses core URI helpers for sub-graph public, shared memory, meta, and private graphs', () => {
     const finalizedSparql = buildEpcisQuery({ subGraphName: 'supply-chain' }, CONTEXT_GRAPH_ID);
     const swmSparql = buildEpcisQuery({ finalized: false, subGraphName: 'supply-chain' }, CONTEXT_GRAPH_ID);
 
-    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain>`);
-    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_private>`);
-    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_meta>`);
+    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain>`);
+    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain/_meta>`);
+    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/_private>`);
     expect(swmSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_shared_memory>`);
-    expect(swmSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_private>`);
+    expect(swmSparql).toContain(`GRAPH <${DATA_GRAPH}/_private>`);
   });
 
   it('applies representative filters outside the public/private source union', () => {

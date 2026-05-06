@@ -510,10 +510,9 @@ describe('handleEventsQuery — per-request sub-graph', () => {
       },
     );
 
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research>');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research/_private>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/context/research>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');
     expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg>');
-    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');
   });
 
   it('threads subGraphName into SPARQL graph URIs (finalized=false SWM partition)', async () => {
@@ -530,7 +529,7 @@ describe('handleEventsQuery — per-request sub-graph', () => {
     );
 
     expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research/_shared_memory>');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research/_private>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');
     expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg/_shared_memory>');
   });
 

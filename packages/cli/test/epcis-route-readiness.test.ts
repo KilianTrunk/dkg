@@ -363,9 +363,8 @@ describe('EPCIS events query route — per-request CG + sub-graph', () => {
 
     expect(ctx.res.statusCode).toBe(200);
     expect(calls).toHaveLength(1);
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research>');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research/_private>');
-    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:per-request-cg>'); // root not used when sub set
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/context/research>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/_private>');
   });
 
   it('per-request subGraphName picks SWM partition when finalized=false', async () => {
@@ -379,7 +378,7 @@ describe('EPCIS events query route — per-request CG + sub-graph', () => {
 
     expect(ctx.res.statusCode).toBe(200);
     expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research/_shared_memory>');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research/_private>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/_private>');
   });
 
   it('returns 400 InvalidContent when neither query nor config supplies a contextGraphId', async () => {

@@ -1,3 +1,10 @@
+import {
+  contextGraphDataUri,
+  contextGraphMetaUri,
+  contextGraphPrivateUri,
+  contextGraphSharedMemoryUri,
+  contextGraphSharedMemoryMetaUri,
+} from '@origintrail-official/dkg-core';
 import type { EpcisQueryParams } from './types.js';
 
 const PREFIXES = `
@@ -36,27 +43,6 @@ export function normalizeBizStep(value: string): string {
   return normalizeGs1Vocabulary('BizStep', value);
 }
 
-function contextGraphBaseUri(contextGraphId: string, subGraphName?: string): string {
-  const root = `did:dkg:context-graph:${contextGraphId}`;
-  return subGraphName ? `${root}/${subGraphName}` : root;
-}
-
-function contextGraphSharedMemoryUri(contextGraphId: string, subGraphName?: string): string {
-  return `${contextGraphBaseUri(contextGraphId, subGraphName)}/_shared_memory`;
-}
-
-function contextGraphMetaUri(contextGraphId: string, subGraphName?: string): string {
-  return `${contextGraphBaseUri(contextGraphId, subGraphName)}/_meta`;
-}
-
-function contextGraphSharedMemoryMetaUri(contextGraphId: string, subGraphName?: string): string {
-  return `${contextGraphBaseUri(contextGraphId, subGraphName)}/_shared_memory_meta`;
-}
-
-function contextGraphPrivateUri(contextGraphId: string, subGraphName?: string): string {
-  return `${contextGraphBaseUri(contextGraphId, subGraphName)}/_private`;
-}
-
 /**
  * Build a composite SPARQL query for EPCIS events.
  *
@@ -70,12 +56,12 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   const publicGraph =
     partition === 'swm'
       ? contextGraphSharedMemoryUri(contextGraphId, params.subGraphName)
-      : contextGraphBaseUri(contextGraphId, params.subGraphName);
+      : contextGraphDataUri(contextGraphId, params.subGraphName);
   const metaGraph =
     partition === 'swm'
       ? contextGraphSharedMemoryMetaUri(contextGraphId, params.subGraphName)
       : contextGraphMetaUri(contextGraphId, params.subGraphName);
-  const privateGraph = contextGraphPrivateUri(contextGraphId, params.subGraphName);
+  const privateGraph = contextGraphPrivateUri(contextGraphId);
 
   const wherePatterns: string[] = [];
   const filterClauses: string[] = [];

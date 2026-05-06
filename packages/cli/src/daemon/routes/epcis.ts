@@ -328,6 +328,51 @@ import {
 
 import type { RequestContext } from './context.js';
 
+type ResolveOk<T> = { ok: true; value: T };
+type ResolveErr = { ok: false; status: number; body: object };
+type ResolveResult<T> = ResolveOk<T> | ResolveErr;
+
+function resolveCgId(
+  input: unknown,
+  source: 'query string' | 'request body',
+  fallback?: string,
+): ResolveResult<string> {
+  if (input !== undefined && input !== null && input !== '') {
+    if (typeof input !== 'string') {
+      return { ok: false, status: 400, body: { error: 'InvalidContent', message: '"contextGraphId" must be a string' } };
+    }
+    const v = validateContextGraphId(input);
+    if (!v.valid) {
+      return { ok: false, status: 400, body: { error: 'InvalidContent', message: `Invalid "contextGraphId": ${v.reason}` } };
+    }
+    return { ok: true, value: input };
+  }
+  if (!fallback) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'InvalidContent',
+        message: `Missing "contextGraphId": provide it in the ${source} or configure epcis.contextGraphId`,
+      },
+    };
+  }
+  return { ok: true, value: fallback };
+}
+
+function resolveSubGraphName(input: unknown): ResolveResult<string | undefined> {
+  if (input === undefined || input === null || input === '') {
+    return { ok: true, value: undefined };
+  }
+  if (typeof input !== 'string') {
+    return { ok: false, status: 400, body: { error: 'InvalidContent', message: 'subGraphName must be a string' } };
+  }
+  const v = validateSubGraphName(input);
+  if (!v.valid) {
+    return { ok: false, status: 400, body: { error: 'InvalidContent', message: `Invalid "subGraphName": ${v.reason}` } };
+  }
+  return { ok: true, value: input };
+}
 
 export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
   const {
@@ -368,45 +413,10 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
     const searchParams = new URL(req.url!, `http://${req.headers.host}`)
       .searchParams;
 
-    // Resolve target context graph: per-request query string field,
-    // otherwise fall back to epcis.contextGraphId. Validation
-    // symmetry with the capture route.
-    const queryContextGraphId = searchParams.get("contextGraphId");
-    let resolvedContextGraphId: string;
-    if (queryContextGraphId !== null && queryContextGraphId !== "") {
-      const cgValidation = validateContextGraphId(queryContextGraphId);
-      if (!cgValidation.valid) {
-        return jsonResponse(res, 400, {
-          error: "InvalidContent",
-          message: `Invalid "contextGraphId": ${cgValidation.reason}`,
-        });
-      }
-      resolvedContextGraphId = queryContextGraphId;
-    } else {
-      const fallback = config.epcis?.contextGraphId;
-      if (!fallback) {
-        return jsonResponse(res, 400, {
-          error: "InvalidContent",
-          message:
-            'Missing "contextGraphId": provide it in the query string or configure epcis.contextGraphId',
-        });
-      }
-      resolvedContextGraphId = fallback;
-    }
-
-    // Sub-graph is per-request only — no fallback. Validate when present.
-    const querySubGraphName = searchParams.get("subGraphName");
-    let resolvedSubGraphName: string | undefined;
-    if (querySubGraphName !== null && querySubGraphName !== "") {
-      const sgValidation = validateSubGraphName(querySubGraphName);
-      if (!sgValidation.valid) {
-        return jsonResponse(res, 400, {
-          error: "InvalidContent",
-          message: `Invalid "subGraphName": ${sgValidation.reason}`,
-        });
-      }
-      resolvedSubGraphName = querySubGraphName;
-    }
+    const cg = resolveCgId(searchParams.get('contextGraphId'), 'query string', config.epcis?.contextGraphId);
+    if (!cg.ok) return jsonResponse(res, cg.status, cg.body);
+    const sg = resolveSubGraphName(searchParams.get('subGraphName'));
+    if (!sg.ok) return jsonResponse(res, sg.status, sg.body);
 
     const epcisQueryEngine = {
       query: (sparql: string, opts?: { contextGraphId?: string }) =>
@@ -414,8 +424,8 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
     };
     try {
       const result = await handleEventsQuery(searchParams, {
-        contextGraphId: resolvedContextGraphId,
-        subGraphName: resolvedSubGraphName,
+        contextGraphId: cg.value,
+        subGraphName: sg.value,
         queryEngine: epcisQueryEngine,
         basePath: "/api/epcis/events",
       });
@@ -486,54 +496,10 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
       });
     }
 
-    // Resolve target context graph: per-request body field, otherwise
-    // fall back to epcis.contextGraphId.
-    let captureContextGraphId: string;
-    if (bodyContextGraphId !== undefined && bodyContextGraphId !== null) {
-      if (typeof bodyContextGraphId !== "string") {
-        return jsonResponse(res, 400, {
-          error: "InvalidContent",
-          message: '"contextGraphId" must be a string',
-        });
-      }
-      const cgValidation = validateContextGraphId(bodyContextGraphId);
-      if (!cgValidation.valid) {
-        return jsonResponse(res, 400, {
-          error: "InvalidContent",
-          message: `Invalid "contextGraphId": ${cgValidation.reason}`,
-        });
-      }
-      captureContextGraphId = bodyContextGraphId;
-    } else {
-      const fallback = config.epcis?.contextGraphId;
-      if (!fallback) {
-        return jsonResponse(res, 400, {
-          error: "InvalidContent",
-          message:
-            'Missing "contextGraphId": provide it in the request body or configure epcis.contextGraphId',
-        });
-      }
-      captureContextGraphId = fallback;
-    }
-
-    // Sub-graph is per-payload only — no fallback. Validate when present.
-    let captureSubGraphName: string | undefined;
-    if (bodySubGraphName !== undefined && bodySubGraphName !== null) {
-      if (typeof bodySubGraphName !== "string" || bodySubGraphName === "") {
-        return jsonResponse(res, 400, {
-          error: "InvalidContent",
-          message: 'subGraphName must be a non-empty string (omit the field for root graph)',
-        });
-      }
-      const sgValidation = validateSubGraphName(bodySubGraphName);
-      if (!sgValidation.valid) {
-        return jsonResponse(res, 400, {
-          error: "InvalidContent",
-          message: `Invalid "subGraphName": ${sgValidation.reason}`,
-        });
-      }
-      captureSubGraphName = bodySubGraphName;
-    }
+    const cg = resolveCgId(bodyContextGraphId, 'request body', config.epcis?.contextGraphId);
+    if (!cg.ok) return jsonResponse(res, cg.status, cg.body);
+    const sg = resolveSubGraphName(bodySubGraphName);
+    if (!sg.ok) return jsonResponse(res, sg.status, sg.body);
 
     const epcisPublisher: EpcisAsyncPublisher = {
       async publishAsync(contextGraphId, content, opts) {
@@ -549,10 +515,10 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
         {
           epcisDocument,
           publishOptions,
-          contextGraphId: captureContextGraphId,
-          subGraphName: captureSubGraphName,
+          contextGraphId: cg.value,
+          subGraphName: sg.value,
         },
-        { contextGraphId: captureContextGraphId, publisher: epcisPublisher },
+        { contextGraphId: cg.value, publisher: epcisPublisher },
       );
       return jsonResponse(res, 202, result);
     } catch (err) {

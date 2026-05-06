@@ -1514,16 +1514,14 @@ export async function runDaemonInner(
       }
 
       // Auth guard — rejects with 401 if token is invalid/missing
-      if (
-        !httpAuthGuard(
-          req,
-          res,
-          authEnabled,
-          validTokens,
-          resolveCorsOrigin(req, corsAllowed),
-        )
-      )
-        return;
+      const authAllowed = await httpAuthGuard(
+        req,
+        res,
+        authEnabled,
+        validTokens,
+        resolveCorsOrigin(req, corsAllowed),
+      );
+      if (!authAllowed) return;
 
       // Retired installable apps framework (V9): respond with 410 Gone so upgraded
       // nodes give a clear migration hint for both the JSON API and any bookmarked

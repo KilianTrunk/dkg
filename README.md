@@ -57,6 +57,12 @@ create assertion ──► write triples ──► promote ──► publish ─
 
 All on-chain publishing goes through SWM first — the chain transaction is a finality signal that seals data peers already hold via gossip. Assertions themselves carry a durable lifecycle record (`created → promoted → published → finalized`, or `discarded`) in the context graph's `_meta` graph, so their history is auditable independently of the data.
 
+SWM gossip is signed when the node has a local agent private key. Context graphs
+that declare `DKG_ALLOWED_AGENT` or `DKG_PARTICIPANT_AGENT` require a signed
+`GossipEnvelope` from one of those agent addresses; unsigned legacy SWM payloads
+are accepted only for context graphs without agent gates. Signatures authenticate
+the writer, but do not encrypt GossipSub payload bytes.
+
 ---
 
 ## Quick Start
@@ -74,14 +80,12 @@ All on-chain publishing goes through SWM first — the chain transaction is a fi
 
 > **ElizaOS agents:** Use the [`@origintrail-official/dkg-adapter-elizaos`](packages/adapter-elizaos/README.md) adapter. See the [ElizaOS setup guide](docs/setup/SETUP_ELIZAOS.md).
 
-> **Hermes agents:** Install the DKG CLI, start a node, and run Hermes setup - this wires the selected Hermes profile to DKG memory, tools, and Node UI chat:
+> **Hermes agents:** Install the DKG CLI and run Hermes setup, then start the Hermes gateway:
 > ```bash
 > npm install -g @origintrail-official/dkg
-> dkg init
-> dkg start
 > dkg hermes setup
 > ```
-> Then start Hermes with its API server enabled. See the [adapter guide](packages/adapter-hermes/README.md) for details.
+> `dkg hermes setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and wires the Hermes profile with replace-by-default provider election (use `--preserve-provider` to opt out, `--no-start` / `--no-fund` for advanced flows). See the [adapter guide](packages/adapter-hermes/README.md) for details.
 
 > **Cursor / Claude Code / other MCP clients:** Install the [`@origintrail-official/dkg-mcp`](packages/mcp-dkg/README.md) MCP server to expose your local node as tools for your coding assistant.
 
@@ -418,7 +422,7 @@ Clone the repo and use pnpm (v10+) with Node.js 22+ to work across all workspace
 
 ```bash
 pnpm install                                     # install all workspace deps
-pnpm build                                       # compile every package (Turborepo)
+pnpm build                                       # compile packages and the Node UI bundle
 pnpm test                                        # run the full test suite
 pnpm test:coverage                               # tests + tier-based coverage gates (all packages)
 pnpm --filter @origintrail-official/dkg test     # run tests for a single package

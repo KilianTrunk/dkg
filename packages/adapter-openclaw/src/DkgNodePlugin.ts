@@ -20,6 +20,7 @@ import {
   type GetView,
   createDkgPublisherExtension,
   type DkgPublisherExtension,
+  escapeDkgRdfLiteral,
   resolveDkgHome,
   toEip55Checksum,
 } from '@origintrail-official/dkg-core';
@@ -61,6 +62,79 @@ import { mergeAdapterPluginConfigs } from './openclaw-config.js';
 const ETH_ADDR_RE_LC = /^0x[0-9a-f]{40}$/;
 function isValidEthAddressString(value: string | undefined): boolean {
   return typeof value === 'string' && ETH_ADDR_RE_LC.test(value.trim().toLowerCase());
+}
+
+type QueryCatalogToolItem = {
+  slug: string;
+  name: string;
+  description?: string;
+  sparql: string;
+  rank: number;
+  catalogSlug: string;
+  catalogName: string;
+  catalogDescription?: string;
+  catalogRank: number;
+  subGraph: string;
+};
+
+function stripRdfTerm(value: unknown): string {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const maybeValue = (value as Record<string, unknown>).value;
+    if (typeof maybeValue === 'string') return maybeValue;
+  }
+  const raw = String(value ?? '');
+  const decodeLiteral = (literal: string): string => {
+    try {
+      return JSON.parse(literal);
+    } catch {
+      return literal.slice(1, -1);
+    }
+  };
+  const literalMatch = raw.match(/^("[\s\S]*")(\^\^.*|@.*)?$/);
+  if (literalMatch) return decodeLiteral(literalMatch[1]);
+  return raw;
+}
+
+function queryCatalogSlugFromIri(iri: string, marker: string, fallback: string): string {
+  if (!iri) return fallback;
+  return iri.split(marker).pop() ?? iri;
+}
+
+function normalizeQueryCatalogItems(response: Record<string, unknown>): QueryCatalogToolItem[] {
+  const result = response.result as { type?: string; bindings?: unknown[] } | undefined;
+  const bindings = result?.type === 'bindings' && Array.isArray(result.bindings)
+    ? result.bindings
+    : [];
+  return bindings
+    .map((row): QueryCatalogToolItem | null => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+      const r = row as Record<string, unknown>;
+      const qIri = stripRdfTerm(r.q);
+      const catalogIri = stripRdfTerm(r.catalog);
+      const slug = queryCatalogSlugFromIri(qIri, ':query:', qIri);
+      const catalogSlug = queryCatalogSlugFromIri(catalogIri, ':catalog:', 'ui-saved-queries');
+      const sparql = stripRdfTerm(r.sparql);
+      if (!sparql) return null;
+      return {
+        slug,
+        name: stripRdfTerm(r.name) || slug,
+        description: r.description !== undefined ? stripRdfTerm(r.description) : undefined,
+        sparql,
+        rank: Number.parseInt(stripRdfTerm(r.rank) || '99', 10) || 99,
+        catalogSlug,
+        catalogName: stripRdfTerm(r.catalogName) || 'Queries',
+        catalogDescription: r.catalogDescription !== undefined ? stripRdfTerm(r.catalogDescription) : undefined,
+        catalogRank: Number.parseInt(stripRdfTerm(r.catalogRank) || '999', 10) || 999,
+        subGraph: stripRdfTerm(r.subGraph),
+      };
+    })
+    .filter((item): item is QueryCatalogToolItem => item !== null)
+    .sort((a, b) =>
+      a.subGraph.localeCompare(b.subGraph)
+      || a.catalogRank - b.catalogRank
+      || a.rank - b.rank
+      || a.name.localeCompare(b.name),
+    );
 }
 
 const OPENCLAW_LOCAL_AGENT_CAPABILITIES = {
@@ -2462,7 +2536,10 @@ export class DkgNodePlugin {
           'Create a new context graph on the DKG node. A context graph is a scoped knowledge domain ' +
           'that organizes published knowledge. Use dkg_list_context_graphs first to check if the ' +
           'context graph already exists. Returns the context graph ID and URI (did:dkg:context-graph:<id>). ' +
-          'The ID is auto-generated from the name if not provided.',
+          'The ID is auto-generated from the name if not provided. ' +
+          'Defaults to a curated/private context graph — the creator is auto-included in the allowlist ' +
+          'and can immediately write to working/shared memory. Pass `public: true` for an open/discoverable ' +
+          'context graph, or `allowed_agents` to invite collaborators atomically with creation.',
         parameters: {
           type: 'object',
           properties: {
@@ -2477,6 +2554,15 @@ export class DkgNodePlugin {
             id: {
               type: 'string',
               description: 'Optional custom context graph ID slug. Auto-generated from name if omitted (e.g. "My Research" → "my-research").',
+            },
+            public: {
+              type: 'boolean',
+              description: 'If true, creates an open/discoverable context graph (anyone can subscribe and read). Default is false — the context graph is curated/private and restricted to allowed_agents (the creator is always auto-included).',
+            },
+            allowed_agents: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Optional agent addresses (0x...) to add to the curation allowlist at creation time. The creator\'s own address is auto-added regardless. Ignored when public is true.',
             },
           },
           required: ['name'],
@@ -2684,6 +2770,46 @@ export class DkgNodePlugin {
           required: ['sparql'],
         },
         execute: async (_toolCallId, args) => this.handleQuery(args),
+      },
+      {
+        name: 'dkg_query_catalog_list',
+        description:
+          'List saved SPARQL queries from a context graph profile query catalog. Use this when the user asks ' +
+          'what saved/catalog queries are available for a project or before running a saved query by name. ' +
+          'Returns sorted items with slug, display name, catalog, sub-graph, description, and SPARQL text.',
+        parameters: {
+          type: 'object',
+          properties: {
+            context_graph_id: {
+              type: 'string',
+              description: 'Context graph/project ID whose profile query catalog should be read.',
+            },
+          },
+          required: ['context_graph_id'],
+        },
+        execute: async (_toolCallId, args) => this.handleQueryCatalogList(args),
+      },
+      {
+        name: 'dkg_query_catalog_run',
+        description:
+          'Run a saved SPARQL query from a context graph profile query catalog by slug or exact display name. ' +
+          'Call dkg_query_catalog_list first if the selector is ambiguous. Executes the saved SPARQL against ' +
+          'the same context graph using the standard DKG query route.',
+        parameters: {
+          type: 'object',
+          properties: {
+            context_graph_id: {
+              type: 'string',
+              description: 'Context graph/project ID whose saved query should be used.',
+            },
+            query: {
+              type: 'string',
+              description: 'Saved query slug or exact display name.',
+            },
+          },
+          required: ['context_graph_id', 'query'],
+        },
+        execute: async (_toolCallId, args) => this.handleQueryCatalogRun(args),
       },
       {
         name: 'dkg_find_agents',
@@ -2956,6 +3082,33 @@ export class DkgNodePlugin {
           required: ['context_graph_id'],
         },
         execute: async (_toolCallId, args) => this.handleSharedMemoryPublish(args),
+      },
+      {
+        name: 'dkg_share',
+        description:
+          'Direct Shared Working Memory write — gossip-replicate a concise free-text fact ' +
+          'to the team. Lightweight alternative to the canonical dkg_assertion_create → ' +
+          'dkg_assertion_write → dkg_assertion_promote flow; use the canonical flow when the ' +
+          'data needs to be staged, retracted, or promoted to Verified Memory.',
+        parameters: {
+          type: 'object',
+          properties: {
+            content: {
+              type: 'string',
+              description: 'Free-text knowledge to share with the team.',
+            },
+            context_graph_id: {
+              type: 'string',
+              description: 'Target context graph ID.',
+            },
+            sub_graph_name: {
+              type: 'string',
+              description: 'Optional sub-graph scope.',
+            },
+          },
+          required: ['content', 'context_graph_id'],
+        },
+        execute: async (_toolCallId, args) => this.handleShare(args),
       },
       {
         name: 'memory_search',
@@ -3403,6 +3556,63 @@ export class DkgNodePlugin {
     }
   }
 
+  private async handleQueryCatalogList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      const response = await this.client.readQueryCatalog(contextGraphId);
+      const items = normalizeQueryCatalogItems(response);
+      return this.json({
+        contextGraphId,
+        count: items.length,
+        items,
+      });
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleQueryCatalogRun(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const selector = String(args.query ?? '').trim();
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      if (!selector) return this.error('"query" is required.');
+
+      const response = await this.client.readQueryCatalog(contextGraphId);
+      const items = normalizeQueryCatalogItems(response);
+      const slugMatches = items.filter((item) => item.slug === selector);
+      const nameMatches = slugMatches.length > 0
+        ? []
+        : items.filter((item) => item.name === selector);
+      const matches = slugMatches.length > 0 ? slugMatches : nameMatches;
+      if (matches.length === 0) {
+        return this.error(
+          `Saved query not found: ${selector}. Available queries: ${
+            items.map((item) => `${item.slug} (${item.name})`).join(', ') || 'none'
+          }`,
+        );
+      }
+      if (matches.length > 1) {
+        return this.error(
+          `Saved query selector is ambiguous: ${selector}. Matching slugs: ${
+            matches.map((item) => item.slug).join(', ')
+          }`,
+        );
+      }
+
+      const savedQuery = matches[0];
+      const result = await this.client.query(savedQuery.sparql, { contextGraphId });
+      return this.json({
+        contextGraphId,
+        savedQuery,
+        result,
+      });
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
   private async handleFindAgents(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const filter: { framework?: string; skill_type?: string } = {};
@@ -3474,7 +3684,73 @@ export class DkgNodePlugin {
         );
       }
       const description = args.description ? String(args.description).trim() : undefined;
-      const result = await this.client.createContextGraph(id, name, description);
+      // Privacy-by-default: when `public` is omitted or false, the context
+      // graph is curated (`accessPolicy: 1`). The agent's createContextGraph
+      // flow auto-includes the creator's address in the allowlist (see
+      // `packages/agent/src/dkg-agent.ts:3962-3973`), so the creator can
+      // immediately read/write the curated CG without a self-invite step.
+      // Round 2 — strict type validation on `public`. Non-boolean values
+      // (e.g. `"yes"`, `1`, `null`) silently became `false` previously,
+      // producing curated CGs when the LLM intended public — the opposite
+      // of the agent's intent. Reject explicitly so the agent gets a
+      // clear correction instead of silent miscategorization.
+      const rawPublic = args.public;
+      if (rawPublic !== undefined && typeof rawPublic !== 'boolean') {
+        return this.error(
+          `"public" must be a boolean (true or false). Got: ${typeof rawPublic}.`,
+        );
+      }
+      const isPublic = rawPublic === true;
+      // Round 2 — strict allowed_agents validation. Previously we
+      // silently dropped non-string / blank entries, which hides
+      // LLM-generated mistakes (e.g. `["0x1234...", 42]` would create a
+      // curated graph WITHOUT 42's intended owner ever knowing they
+      // were excluded). Fail fast on every malformed entry with a
+      // precise index-scoped error so the agent can correct.
+      let allowedAgents: string[] | undefined;
+      if (!isPublic && args.allowed_agents !== undefined) {
+        if (!Array.isArray(args.allowed_agents)) {
+          return this.error(
+            `"allowed_agents" must be an array of strings. Got: ${typeof args.allowed_agents}.`,
+          );
+        }
+        const ethAddrRe = /^0x[0-9a-fA-F]{40}$/;
+        const cleaned: string[] = [];
+        for (let i = 0; i < args.allowed_agents.length; i++) {
+          const entry = args.allowed_agents[i];
+          if (typeof entry !== 'string') {
+            return this.error(
+              `"allowed_agents[${i}]" must be a string. Got: ${entry === null ? 'null' : typeof entry}.`,
+            );
+          }
+          const trimmed = entry.trim();
+          if (!trimmed) {
+            return this.error(
+              `"allowed_agents[${i}]" is empty or whitespace-only. ` +
+              'Each entry must be a 0x-prefixed 40-hex-char Ethereum address.',
+            );
+          }
+          if (!ethAddrRe.test(trimmed)) {
+            return this.error(
+              `Invalid Ethereum address in "allowed_agents[${i}]": "${entry}". ` +
+              'Each entry must be a 0x-prefixed 40-hex-char string ' +
+              '(e.g. "0x1234567890abcdef1234567890abcdef12345678").',
+            );
+          }
+          cleaned.push(trimmed);
+        }
+        if (cleaned.length > 0) {
+          allowedAgents = cleaned;
+        }
+      }
+      const opts: { accessPolicy?: number; allowedAgents?: string[] } = {};
+      if (!isPublic) {
+        opts.accessPolicy = 1;
+      }
+      if (allowedAgents && allowedAgents.length > 0) {
+        opts.allowedAgents = allowedAgents;
+      }
+      const result = await this.client.createContextGraph(id, name, description, opts);
       return this.json(result);
     } catch (err: any) {
       return this.daemonError(err);
@@ -3981,6 +4257,100 @@ export class DkgNodePlugin {
       }
       const result = await this.publisher.publishSharedMemory({ contextGraphId, rootEntities, subGraphName });
       return this.json(registration ? { ...result, registration } : result);
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      // Type-validate at the runtime boundary. Without this, a malformed MCP
+      // call passing `content: {}` or `false` would coerce via String(...) to
+      // `"[object Object]"` / `"false"` and pollute SWM with garbage. Reject
+      // up front instead.
+      if (args.content !== undefined && typeof args.content !== 'string') {
+        return this.error('"content" must be a string.');
+      }
+      if (args.context_graph_id !== undefined && typeof args.context_graph_id !== 'string') {
+        return this.error('"context_graph_id" must be a string.');
+      }
+      if (
+        args.sub_graph_name !== undefined &&
+        args.sub_graph_name !== null &&
+        typeof args.sub_graph_name !== 'string'
+      ) {
+        return this.error('"sub_graph_name" must be a string.');
+      }
+      // Use the raw content for serialization so leading/trailing whitespace
+      // and terminal newlines are preserved verbatim — agents sharing code
+      // snippets or exact transcripts depend on this. Validate against the
+      // trimmed form so a whitespace-only payload still rejects as "empty".
+      const content = (args.content as string | undefined) ?? '';
+      const contextGraphId = ((args.context_graph_id as string | undefined) ?? '').trim();
+      if (!content.trim()) return this.error('"content" is required.');
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      const rawSub = args.sub_graph_name as string | undefined | null;
+      const subGraphName = rawSub === undefined || rawSub === null
+        ? undefined
+        : (rawSub.trim() || undefined);
+
+      // Best-effort node-identity attribution. Try the gated probes first
+      // (these warm the cache when the memory resolver API is attached),
+      // then fall back to a direct /api/agent/identity probe so dkg_share
+      // works in `memory.enabled: false` configurations too. If neither
+      // path resolves, we still mint a unique-per-call subject under an
+      // `anon` namespace — the share itself doesn't require identity
+      // (the daemon's /api/shared-memory/write doesn't), so refusing to
+      // write would over-couple the tool to a startup race.
+      await Promise.all([this.ensureNodeAgentAddress(), this.ensureNodePeerId()]);
+      let addr = this.resolveDefaultAgentAddress();
+      if (!addr) {
+        const probe = await this.client.getAgentIdentity().catch(() => null);
+        if (probe?.ok && probe.identity) {
+          if (probe.identity.agentAddress) this.nodeAgentAddress = probe.identity.agentAddress;
+          if (probe.identity.peerId) this.nodePeerId = probe.identity.peerId;
+          addr = this.resolveDefaultAgentAddress();
+        }
+      }
+      // Unique per call — the publisher's delete-then-insert upsert
+      // (dkg-publisher.ts:422-429) keys off the root entity, so a stable
+      // subject would replace the prior share. Random shareId guarantees
+      // a fresh root every time, regardless of attribution.
+      const shareId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const subject = addr
+        ? `urn:openclaw:${addr}:shared:${shareId}`
+        : `urn:openclaw:anon:shared:${shareId}`;
+      // Serialize content as an N-Triples literal. The canonical
+      // escapeDkgRdfLiteral from @origintrail-official/dkg-core handles
+      // the ECHAR set (\\, ", \n, \r, \t, \f, \b), but leaves other ASCII
+      // control bytes (0x00-0x07, 0x0B, 0x0E-0x1F, 0x7F) raw — those
+      // would still produce an invalid N-Triples literal. Defensive
+      // post-pass UCHAR-encodes the remaining bytes. (A canonical fix
+      // belongs in the core helper itself; tracked separately.)
+      const escaped = escapeDkgRdfLiteral(content).replace(
+        new RegExp(
+          '[' +
+            String.fromCharCode(0x00) + '-' + String.fromCharCode(0x1F) +
+            String.fromCharCode(0x7F) +
+          ']',
+          'g',
+        ),
+        (ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0').toUpperCase(),
+      );
+      const literal = `"${escaped}"`;
+      const quads = [{
+        subject,
+        predicate: 'urn:openclaw:sharedContent',
+        object: literal,
+      }];
+      const result = await this.client.share(contextGraphId, quads, { subGraphName });
+      // Surface the minted subject so callers can target THIS share in a
+      // follow-up `dkg_shared_memory_publish({ root_entities: [...] })` or
+      // inspect it precisely. Field name is snake_case to match the
+      // consuming tool's argument shape — agents chaining `dkg_share` →
+      // `dkg_shared_memory_publish` can pass the value through without
+      // case translation.
+      return this.json({ ...result, subject, root_entities: [subject] });
     } catch (err: any) {
       return this.daemonError(err);
     }

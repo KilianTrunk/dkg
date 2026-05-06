@@ -1350,7 +1350,9 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     req.method === "GET" &&
     (path === "/api/context-graph/list" || path === "/api/paranet/list")
   ) {
-    const contextGraphs = await agent.listContextGraphs();
+    const contextGraphs = await agent.listContextGraphs({
+      callerAgentAddress: requestAgentAddress ?? null,
+    });
     return jsonResponse(res, 200, {
       contextGraphs,
       paranets: contextGraphs, // backward compat

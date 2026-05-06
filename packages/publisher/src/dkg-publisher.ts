@@ -1081,6 +1081,7 @@ export class DKGPublisher implements Publisher {
     const normalizedAllowedPeers = [...new Set((allowedPeers ?? []).map((p) => p.trim()).filter(Boolean))];
     const normalizedPublisherPeerId = publisherPeerId.trim();
     const publisherAddress = this.requirePublisherAddress('publish');
+    const canAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && this.getPublisherSigner() !== undefined;
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {
       throw new Error(
@@ -1214,11 +1215,19 @@ export class DKGPublisher implements Publisher {
     // `KnowledgeAssetsV10._executePublishCore`.
     const publishEpochs = 1;
     let precomputedTokenAmount = 0n;
-    if (typeof this.chain.getRequiredPublishTokenAmount === 'function') {
-      precomputedTokenAmount = await this.chain.getRequiredPublishTokenAmount(publicByteSize, publishEpochs);
-      if (precomputedTokenAmount <= 0n) {
-        this.log.warn(ctx, `getRequiredPublishTokenAmount returned ${precomputedTokenAmount} for byteSize=${publicByteSize} — using 1n as minimum`);
-        precomputedTokenAmount = 1n;
+    if (canAttemptOnChainPublish && typeof this.chain.getRequiredPublishTokenAmount === 'function') {
+      try {
+        precomputedTokenAmount = await this.chain.getRequiredPublishTokenAmount(publicByteSize, publishEpochs);
+        if (precomputedTokenAmount <= 0n) {
+          this.log.warn(ctx, `getRequiredPublishTokenAmount returned ${precomputedTokenAmount} for byteSize=${publicByteSize} — using 1n as minimum`);
+          precomputedTokenAmount = 1n;
+        }
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `getRequiredPublishTokenAmount failed — publish will fall back to tentative if on-chain submit cannot proceed: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
 

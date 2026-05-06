@@ -95,9 +95,15 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
   it('publishes tentatively with an explicit non-zero publisherAddress when no on-chain signer is needed', async () => {
     const keypair = await generateEd25519Keypair();
     const publisherAddress = '0x000000000000000000000000000000000000dEaD';
+    const chain = {
+      ...makeStubChain('test-evm-chain'),
+      getRequiredPublishTokenAmount: async () => {
+        throw new Error('RPC unavailable');
+      },
+    } as ChainAdapter;
     const publisher = new DKGPublisher({
       store: new OxigraphStore(),
-      chain: makeStubChain('test-evm-chain'),
+      chain,
       eventBus: new TypedEventBus(),
       keypair,
       publisherAddress,

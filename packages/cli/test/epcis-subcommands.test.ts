@@ -287,6 +287,33 @@ describe.sequential('dkg epcis subcommands', { timeout: 240_000 }, () => {
       expect(result.stderr).toContain('--allowed-peer requires --access-policy allowList');
     });
 
+    it('rejects CLI --access-policy ownerOnly when envelope file carries allowedPeers (exit 1)', async () => {
+      const envelope = {
+        epcisDocument: { type: 'EPCISDocument' },
+        publishOptions: { accessPolicy: 'allowList', allowedPeers: ['peerA'] },
+      };
+      const docPath = join(dkgHome, 'cap-stale-peers.json');
+      await writeFile(docPath, JSON.stringify(envelope));
+      const result = await runCli(
+        ['epcis', 'capture', docPath, '--access-policy', 'ownerOnly'],
+        env(),
+      );
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('publishOptions.allowedPeers requires accessPolicy "allowList"');
+    });
+
+    it('rejects envelope file with invalid publishOptions.accessPolicy (exit 1)', async () => {
+      const envelope = {
+        epcisDocument: { type: 'EPCISDocument' },
+        publishOptions: { accessPolicy: 'bogus' },
+      };
+      const docPath = join(dkgHome, 'cap-bad-policy.json');
+      await writeFile(docPath, JSON.stringify(envelope));
+      const result = await runCli(['epcis', 'capture', docPath], env());
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('Invalid publishOptions.accessPolicy');
+    });
+
     it('maps 503 PublisherDisabled to exit code 3', async () => {
       clearCalls();
       stub.setHandler(() => ({

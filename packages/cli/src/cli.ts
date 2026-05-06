@@ -2809,6 +2809,16 @@ epcisCmd
         }
         return Object.keys(merged).length > 0 ? merged : undefined;
       })();
+      if (publishOptions) {
+        if (publishOptions.accessPolicy !== undefined && !ALLOWED_ACCESS_POLICIES.has(publishOptions.accessPolicy)) {
+          console.error(`Invalid publishOptions.accessPolicy "${publishOptions.accessPolicy}". Use one of: public, ownerOnly, allowList.`);
+          process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+        }
+        if (publishOptions.allowedPeers && publishOptions.allowedPeers.length > 0 && publishOptions.accessPolicy !== 'allowList') {
+          console.error('publishOptions.allowedPeers requires accessPolicy "allowList".');
+          process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+        }
+      }
 
       const request = {
         epcisDocument,

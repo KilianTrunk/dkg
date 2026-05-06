@@ -129,9 +129,9 @@ describe('Phase-sequence contracts', () => {
     ]);
   });
 
-  // -- Publish (no wallet — fail closed) --------------------------------
+  // -- Publish (no wallet — local tentative) -----------------------------
 
-  it('publish: missing publisher wallet rejects before phase emission', async () => {
+  it('publish: missing publisher wallet stores tentative data without sign/submit phases', async () => {
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
@@ -141,17 +141,38 @@ describe('Phase-sequence contracts', () => {
       chain,
       eventBus: new TypedEventBus(),
       keypair,
-      // No publisherPrivateKey → fail closed before any publish phases
+      // No publisherPrivateKey and no identity -> local tentative publish.
     });
 
     const quads = [q(ENTITY, 'http://schema.org/name', '"Tentative"')];
     const { calls, fn } = recorder();
-    await expect(
-      publisher.publish({ contextGraphId: PARANET, quads, onPhase: fn }),
-    ).rejects.toThrow(/publisherPrivateKey/i);
+    const result = await publisher.publish({ contextGraphId: PARANET, quads, onPhase: fn });
+    const match = result.ual.match(/^did:dkg:evm:31337\/(0x[0-9a-fA-F]{40})\/t/);
+
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+    expect(match?.[1]).toBeDefined();
+    expect(match![1]).not.toBe(ethers.ZeroAddress);
 
     const phases = calls.map(([p, s]) => `${p}:${s}`);
-    expect(phases).toEqual([]);
+    expect(phases).toEqual([
+      'prepare:start',
+      'prepare:ensureContextGraph:start',
+      'prepare:ensureContextGraph:end',
+      'prepare:partition:start',
+      'prepare:partition:end',
+      'prepare:manifest:start',
+      'prepare:manifest:end',
+      'prepare:validate:start',
+      'prepare:validate:end',
+      'prepare:merkle:start',
+      'prepare:merkle:end',
+      'prepare:end',
+      'store:start',
+      'store:end',
+      'chain:start',
+      'chain:end',
+    ]);
   });
 
   // -- Update (happy path) -----------------------------------------------

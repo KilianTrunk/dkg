@@ -19,8 +19,9 @@
  * `publisherWallet` undefined; publish now requires either an explicit local
  * signing key or a configured adapter signer bound to a non-zero publisher
  * address before it can create ACKs, publisher signatures, or authorship
- * proofs. Local tentative/no-chain publishes may proceed only when the caller
- * supplied an explicit non-zero publisher address.
+ * proofs. Local tentative/no-chain publishes never use the zero address; when
+ * no EVM publisher address exists, they use a deterministic non-zero address
+ * derived from the agent keypair solely for tentative metadata/UAL scoping.
  */
 import { describe, it, expect } from 'vitest';
 import { DKGPublisher } from '../src/dkg-publisher.js';
@@ -70,26 +71,36 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect((publisher as any).publisherAddress).toBeUndefined();
   });
 
-  it('rejects publish without any publisher address before producing a UAL', async () => {
+  it('publishes tentatively with a deterministic non-zero local address when no publisher address is configured', async () => {
     const keypair = await generateEd25519Keypair();
+    const chain = {
+      ...makeStubChain('test-evm-chain'),
+      getRequiredPublishTokenAmount: async () => {
+        throw new Error('RPC unavailable');
+      },
+    } as ChainAdapter;
     const publisher = new DKGPublisher({
       store: new OxigraphStore(),
-      chain: makeStubChain('test-evm-chain'),
+      chain,
       eventBus: new TypedEventBus(),
       keypair,
     });
 
-    await expect(
-      publisher.publish({
-        contextGraphId: '1',
-        quads: [{
-          subject: 'urn:test:no-address',
-          predicate: 'http://schema.org/name',
-          object: '"NoAddress"',
-          graph: 'did:dkg:context-graph:1',
-        }],
-      }),
-    ).rejects.toThrow(/publisherPrivateKey/i);
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:no-address',
+        predicate: 'http://schema.org/name',
+        object: '"NoAddress"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    const match = result.ual.match(/^did:dkg:test-evm-chain\/(0x[0-9a-fA-F]{40})\/t/);
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+    expect(match?.[1]).toBeDefined();
+    expect(match![1]).not.toBe(ethers.ZeroAddress);
   });
 
   it('publishes tentatively with an explicit non-zero publisherAddress when no on-chain signer is needed', async () => {

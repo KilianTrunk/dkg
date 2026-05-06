@@ -316,6 +316,14 @@ export class DKGPublisher implements Publisher {
     return this.publisherAddress;
   }
 
+  // Local-only tentative publishes need a stable, non-zero UAL component even
+  // when no EVM publisher key exists. This is not used for signatures.
+  private localTentativePublisherAddress(): string {
+    const digest = ethers.keccak256(this.keypair.publicKey);
+    const address = ethers.getAddress(ethers.dataSlice(digest, 12));
+    return address === ethers.ZeroAddress ? '0x0000000000000000000000000000000000000001' : address;
+  }
+
   private getPublisherSigner(): PublisherSigner | undefined {
     if (this.publisherWallet && this.publisherAddress) {
       const wallet = this.publisherWallet;
@@ -1080,7 +1088,7 @@ export class DKGPublisher implements Publisher {
     const effectiveAccessPolicy = accessPolicy ?? (privateQuads.length > 0 ? 'ownerOnly' : 'public');
     const normalizedAllowedPeers = [...new Set((allowedPeers ?? []).map((p) => p.trim()).filter(Boolean))];
     const normalizedPublisherPeerId = publisherPeerId.trim();
-    const publisherAddress = this.requirePublisherAddress('publish');
+    const publisherAddress = this.publisherAddress ?? this.localTentativePublisherAddress();
     const canAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && this.getPublisherSigner() !== undefined;
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {

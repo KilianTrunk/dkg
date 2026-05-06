@@ -78,13 +78,17 @@ describe('v10 ACK provider wiring', () => {
     expect(result.onChainResult).toBeUndefined();
   });
 
-  it('fails clearly when publishing without a publisher key', async () => {
+  it('publishes tentatively without chain config using a non-zero local publisher address', async () => {
     ({ agent } = await createAgent(new NoChainAdapter()));
 
-    await expect(
-      agent.publish(SYSTEM_PARANETS.ONTOLOGY, [
-        { subject: 'urn:test:no-publisher-key', predicate: 'http://schema.org/name', object: '"No key"', graph: '' },
-      ]),
-    ).rejects.toThrow(/publisherPrivateKey/i);
+    const result = await agent.publish(SYSTEM_PARANETS.ONTOLOGY, [
+      { subject: 'urn:test:no-publisher-key', predicate: 'http://schema.org/name', object: '"No key"', graph: '' },
+    ]);
+
+    const match = result.ual.match(/^did:dkg:none\/(0x[0-9a-fA-F]{40})\/t/);
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+    expect(match?.[1]).toBeDefined();
+    expect(match![1]).not.toBe(ethers.ZeroAddress);
   });
 });

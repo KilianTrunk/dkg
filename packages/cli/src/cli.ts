@@ -2939,9 +2939,11 @@ epcisCmd
         }
         const next = await client.queryEpcisEventsByPath(nextUrl);
         const nextEventList = (next.body as any)?.epcisBody?.queryResults?.resultsBody?.eventList;
-        if (Array.isArray(nextEventList)) {
-          eventList.push(...nextEventList);
+        if (!Array.isArray(nextEventList)) {
+          console.error(`Cannot follow Link: rel="next" — page ${pages + 1} response shape unexpected.`);
+          process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
         }
+        eventList.push(...nextEventList);
         nextUrl = next.nextPageUrl;
         pages += 1;
       }

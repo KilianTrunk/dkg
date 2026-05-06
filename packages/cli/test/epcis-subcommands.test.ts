@@ -558,6 +558,38 @@ describe.sequential('dkg epcis subcommands', { timeout: 240_000 }, () => {
       ]);
     });
 
+    it('with --all: fails fast on a malformed follow-up page instead of silently dropping it', async () => {
+      clearCalls();
+      let pageIdx = 0;
+      stub.setHandler(() => {
+        pageIdx += 1;
+        if (pageIdx === 1) {
+          return {
+            status: 200,
+            body: {
+              '@context': [],
+              type: 'EPCISQueryDocument',
+              schemaVersion: '2.0',
+              epcisBody: {
+                queryResults: { queryName: 'SimpleEventQuery', resultsBody: { eventList: [{ id: 1 }] } },
+              },
+            },
+            headers: { Link: '</api/epcis/events?cursor=2>; rel="next"' },
+          };
+        }
+        return {
+          status: 200,
+          body: { type: 'EPCISQueryDocument', epcisBody: { queryResults: { resultsBody: {} } } },
+        };
+      });
+      const result = await runCli(
+        ['epcis', 'query', '--context-graph-id', 'cg-1', '--all'],
+        env(),
+      );
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('page 2 response shape unexpected');
+    });
+
     it('maps 400 InvalidContent to exit code 2', async () => {
       clearCalls();
       stub.setHandler(() => ({ status: 400, body: { error: 'Bad bizStep' } }));

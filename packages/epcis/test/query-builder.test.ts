@@ -263,7 +263,8 @@ describe('buildEpcisQuery', () => {
     const swmSparql = buildEpcisQuery({ finalized: false, subGraphName: 'supply-chain' }, CONTEXT_GRAPH_ID);
 
     expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain>`);
-    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain/_meta>`);
+    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/_meta>`);
+    expect(finalizedSparql).not.toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain/_meta>`);
     expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_private>`);
     expect(finalizedSparql).not.toContain(`GRAPH <${DATA_GRAPH}/_private>`);
     expect(swmSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_shared_memory>`);

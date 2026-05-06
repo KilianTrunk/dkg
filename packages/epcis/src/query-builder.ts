@@ -61,7 +61,7 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   const metaGraph =
     partition === 'swm'
       ? contextGraphSharedMemoryMetaUri(contextGraphId, params.subGraphName)
-      : contextGraphMetaUri(contextGraphId, params.subGraphName);
+      : contextGraphMetaUri(contextGraphId);
   const privateGraph = params.subGraphName
     ? contextGraphSubGraphPrivateUri(contextGraphId, params.subGraphName)
     : contextGraphPrivateUri(contextGraphId);

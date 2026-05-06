@@ -124,6 +124,20 @@ describe('stripCommentsPreservingPositions', () => {
     assert.equal(out.length, text.length);
   });
 
+  it('REGRESSION: // inside a regex literal after return does NOT start a line comment', () => {
+    const text = 'function f() { return /\\/\\//; Wallet.createRandom(); }';
+    const out = stripCommentsPreservingPositions(text);
+    assert.match(out, /Wallet\.createRandom\(\);/);
+    assert.equal(out.length, text.length);
+  });
+
+  it('REGRESSION: // inside a regex literal after throw does NOT start a line comment', () => {
+    const text = 'function f() { throw /\\/\\//; Wallet.createRandom(); }';
+    const out = stripCommentsPreservingPositions(text);
+    assert.match(out, /Wallet\.createRandom\(\);/);
+    assert.equal(out.length, text.length);
+  });
+
   it('REGRESSION: /* inside a regex literal does NOT start a block comment', () => {
     const text = 'const r = /\\/\\*/; Wallet.createRandom();';
     const out = stripCommentsPreservingPositions(text);
@@ -207,9 +221,43 @@ describe('findHits', () => {
     assert.equal(hits.length, 1);
   });
 
+  it('REGRESSION (PR #371 round 7): finds bracket-property calls with comments before the key', () => {
+    const hits = findHits("const w = Wallet[/* gap */'createRandom']();");
+    assert.equal(hits.length, 1);
+  });
+
   it('REGRESSION (PR #371 round 5): finds optional bracket-property calls', () => {
     const hits = findHits("const w = Wallet?.['createRandom']?.();");
     assert.equal(hits.length, 1);
+  });
+
+  it('REGRESSION (PR #371 round 7): finds optional bracket-property calls with comments before the key', () => {
+    const hits = findHits("const w = Wallet?.[/* gap */'createRandom']?.();");
+    assert.equal(hits.length, 1);
+  });
+
+  it('REGRESSION (PR #371 round 7): finds destructured Wallet aliases from ethers namespace import aliases', () => {
+    const text = [
+      'import * as E from "ethers";',
+      'const { Wallet: W } = E;',
+      'const w = W.createRandom();',
+    ].join('\n');
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 3);
+    assert.equal(hits[0].identifier, 'W');
+  });
+
+  it('REGRESSION (PR #371 round 7): finds Wallet aliases assigned from ethers namespace import aliases', () => {
+    const text = [
+      'import * as E from "ethers";',
+      'const W = E.Wallet;',
+      'const w = W.createRandom();',
+    ].join('\n');
+    const hits = findHits(text);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 3);
+    assert.equal(hits[0].identifier, 'W');
   });
 
   it('does NOT report calls inside string literals', () => {
@@ -255,6 +303,12 @@ describe('findHits', () => {
 
   it('REGRESSION (PR #371): finds calls after a regex containing //', () => {
     const hits = findHits('const r = /\\/\\//; Wallet.createRandom();');
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].line, 1);
+  });
+
+  it('REGRESSION (PR #371 round 7): finds calls after a keyword-prefixed regex containing //', () => {
+    const hits = findHits('function f() { return /\\/\\//; Wallet.createRandom(); }');
     assert.equal(hits.length, 1);
     assert.equal(hits[0].line, 1);
   });

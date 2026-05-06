@@ -198,15 +198,26 @@ export function stripCommentsPreservingPositions(text) {
   const stack = [{ kind: 'normal' }];
   const top = () => stack[stack.length - 1];
   const blank = (c) => (c === '\n' ? '\n' : ' ');
-  const previousSignificantChar = () => {
+  const previousSignificantToken = () => {
     for (let j = out.length - 1; j >= 0; j -= 1) {
-      if (!/\s/.test(out[j])) return out[j];
+      if (/\s/.test(out[j])) continue;
+      if (/[A-Za-z_$]/.test(out[j])) {
+        let start = j;
+        while (start > 0 && /[\w$]/.test(out[start - 1])) start -= 1;
+        return { kind: 'word', value: out.slice(start, j + 1) };
+      }
+      return { kind: 'char', value: out[j] };
     }
-    return '';
+    return { kind: 'start', value: '' };
   };
   const canStartRegexLiteral = () => {
-    const prev = previousSignificantChar();
-    return prev === '' || '([{=,:;!&|?+-*~^<>'.includes(prev);
+    const prev = previousSignificantToken();
+    if (prev.kind === 'start') return true;
+    if (prev.kind === 'char') return '([{=,:;!&|?+-*~^<>%'.includes(prev.value);
+    return new Set([
+      'return', 'throw', 'case', 'delete', 'void', 'typeof', 'yield',
+      'await', 'new', 'else', 'do', 'in', 'of', 'instanceof',
+    ]).has(prev.value);
   };
 
   while (i < len) {
@@ -360,6 +371,19 @@ function skipWhitespace(text, index) {
   return i;
 }
 
+function skipToQuotedProperty(originalText, stripped, index) {
+  let i = index;
+  while (i < originalText.length) {
+    if (originalText[i] === '"' || originalText[i] === "'") return i;
+    if (/\s/.test(originalText[i]) || /\s/.test(stripped[i] ?? '')) {
+      i += 1;
+      continue;
+    }
+    return i;
+  }
+  return i;
+}
+
 function readQuotedProperty(originalText, index) {
   const quote = originalText[index];
   if (quote !== '"' && quote !== "'") return null;
@@ -384,9 +408,9 @@ function matchesCreateRandomCall(originalText, stripped, indexAfterAlias) {
 
   if (stripped.startsWith('?.[', i)) {
     i += 3;
-    const property = readQuotedProperty(originalText, skipWhitespace(originalText, i));
+    const property = readQuotedProperty(originalText, skipToQuotedProperty(originalText, stripped, i));
     if (!property || property.value !== 'createRandom') return false;
-    i = skipWhitespace(originalText, property.end);
+    i = skipWhitespace(stripped, property.end);
     if (stripped[i] !== ']') return false;
     i = skipWhitespace(stripped, i + 1);
     if (stripped.startsWith('?.', i)) i = skipWhitespace(stripped, i + 2);
@@ -395,9 +419,9 @@ function matchesCreateRandomCall(originalText, stripped, indexAfterAlias) {
 
   if (stripped[i] === '[') {
     i += 1;
-    const property = readQuotedProperty(originalText, skipWhitespace(originalText, i));
+    const property = readQuotedProperty(originalText, skipToQuotedProperty(originalText, stripped, i));
     if (!property || property.value !== 'createRandom') return false;
-    i = skipWhitespace(originalText, property.end);
+    i = skipWhitespace(stripped, property.end);
     if (stripped[i] !== ']') return false;
     i = skipWhitespace(stripped, i + 1);
     if (stripped.startsWith('?.', i)) i = skipWhitespace(stripped, i + 2);
@@ -434,6 +458,34 @@ function hitFromIndex(originalText, stripped, index, identifier) {
 
 function collectWalletAliases(stripped) {
   const aliases = new Set(['Wallet']);
+  const namespaceAliases = new Set(['ethers']);
+
+  // Namespace imports, including aliases: import * as E from ...
+  // As with named imports below, the module specifier string has been
+  // blanked by the lexer, so this intentionally treats namespace imports
+  // conservatively rather than allowing `ethers` aliases to bypass the gate.
+  const namespaceImportPattern = new RegExp(String.raw`\bimport\s+\*\s+as\s+(${IDENT})\s+from\b`, 'g');
+  for (const m of stripped.matchAll(namespaceImportPattern)) {
+    namespaceAliases.add(m[1]);
+  }
+
+  let namespaceChanged = true;
+  while (namespaceChanged) {
+    namespaceChanged = false;
+    const namespacePattern = [...namespaceAliases].map(escapeRegExp).join('|');
+    const namespaceAliasPattern = new RegExp(
+      String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*(?:${namespacePattern})\b`,
+      'g',
+    );
+    for (const m of stripped.matchAll(namespaceAliasPattern)) {
+      if (!namespaceAliases.has(m[1])) {
+        namespaceAliases.add(m[1]);
+        namespaceChanged = true;
+      }
+    }
+  }
+
+  const namespacePattern = [...namespaceAliases].map(escapeRegExp).join('|');
 
   // Named imports, including aliases: import { Wallet as EthersWallet } from ...
   // String contents are blanked by the lexer, so this intentionally keys on the
@@ -452,7 +504,7 @@ function collectWalletAliases(stripped) {
 
   // Destructuring aliases from ethers: const { Wallet: W } = ethers;
   const destructurePattern = new RegExp(
-    String.raw`\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*ethers\b`,
+    String.raw`\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:${namespacePattern})\b`,
     'g',
   );
   for (const m of stripped.matchAll(destructurePattern)) {
@@ -467,13 +519,14 @@ function collectWalletAliases(stripped) {
   // Follow simple assignment aliases transitively:
   //   const W = Wallet;
   //   const W = ethers.Wallet;
+  //   const W = E.Wallet;     (where E is an ethers namespace import)
   //   const W2 = W;
   let changed = true;
   while (changed) {
     changed = false;
     for (const alias of [...aliases]) {
       const aliasPattern = new RegExp(
-        String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*(?:ethers\s*\.\s*)?${escapeRegExp(alias)}\b`,
+        String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*${escapeRegExp(alias)}\b`,
         'g',
       );
       for (const m of stripped.matchAll(aliasPattern)) {
@@ -481,6 +534,16 @@ function collectWalletAliases(stripped) {
           aliases.add(m[1]);
           changed = true;
         }
+      }
+    }
+    const namespaceWalletPattern = new RegExp(
+      String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*(?:${namespacePattern})\s*\.\s*Wallet\b`,
+      'g',
+    );
+    for (const m of stripped.matchAll(namespaceWalletPattern)) {
+      if (!aliases.has(m[1])) {
+        aliases.add(m[1]);
+        changed = true;
       }
     }
   }

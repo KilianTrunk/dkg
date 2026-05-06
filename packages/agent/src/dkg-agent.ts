@@ -530,6 +530,7 @@ export class DKGAgent {
   private started = false;
   private readonly subscribedContextGraphs = new Map<string, ContextGraphSub>();
   private readonly gossipRegistered = new Set<string>();
+  private readonly sharedMemoryGossipRegistered = new Set<string>();
   private readonly seenOnChainIds = new Set<string>();
   private readonly peerHealth = new Map<string, PeerHealth>();
   private readonly knownCorePeerIds = new Set<string>();
@@ -1729,10 +1730,33 @@ export class DKGAgent {
     contextGraphIds: string[],
   ): Promise<SharedMemorySyncResult> {
     const ctx = createOperationContext('sync');
+    const allowedContextGraphIds: string[] = [];
+    for (const contextGraphId of contextGraphIds) {
+      if (await this.canUseSharedMemoryForContextGraph(contextGraphId)) {
+        allowedContextGraphIds.push(contextGraphId);
+      } else {
+        this.log.warn(ctx, `Skipping SWM sync for unauthorized or unconfirmed context graph "${contextGraphId}"`);
+      }
+    }
+    if (allowedContextGraphIds.length === 0) {
+      return {
+        insertedTriples: 0,
+        fetchedMetaTriples: 0,
+        fetchedDataTriples: 0,
+        insertedMetaTriples: 0,
+        insertedDataTriples: 0,
+        bytesReceived: 0,
+        resumedPhases: 0,
+        emptyResponses: 0,
+        droppedDataTriples: 0,
+        failedPeers: 0,
+        deniedPhases: 0,
+      };
+    }
     return runSharedMemorySync({
       ctx,
       remotePeerId,
-      contextGraphIds,
+      contextGraphIds: allowedContextGraphIds,
       createContextGraphSyncDeadline: this.createContextGraphSyncDeadline.bind(this),
       fetchSyncPages: this.fetchSyncPages.bind(this),
       processSharedMemoryBatch: (wsDataQuads, wsMetaQuads) => this.getOrCreateSyncVerifyWorker().processSharedMemoryBatch(wsDataQuads, wsMetaQuads),
@@ -2036,6 +2060,7 @@ export class DKGAgent {
       if (await this.hasConfirmedMetaState(contextGraphId)) {
         sub.metaSynced = true;
         this.persistContextGraphSubscription(contextGraphId);
+        this.queueSharedMemoryGossipSubscription(contextGraphId);
       }
     }
   }
@@ -2229,6 +2254,17 @@ export class DKGAgent {
       }`,
     );
     return ontologyResult.type === 'boolean' && ontologyResult.value === true;
+  }
+
+  private async hasConfirmedSharedMemoryMetaState(contextGraphId: string): Promise<boolean> {
+    return this.hasConfirmedMetaState(contextGraphId);
+  }
+
+  private async canUseSharedMemoryForContextGraph(contextGraphId: string): Promise<boolean> {
+    if (!(await this.hasConfirmedSharedMemoryMetaState(contextGraphId))) {
+      return false;
+    }
+    return this.canReadContextGraph(contextGraphId);
   }
 
   private async verifySyncedDataInWorker(
@@ -2922,6 +2958,16 @@ export class DKGAgent {
     return sawAgentGate ? agents : null;
   }
 
+  private hasLocalAgentInGate(agentGateAddresses: readonly string[]): boolean {
+    const allowedSet = new Set(agentGateAddresses.map((agent) => agent.toLowerCase()));
+    for (const record of this.localAgents.values()) {
+      if (allowedSet.has(record.agentAddress.toLowerCase())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private async resolveWorkspaceGossipSigningAgent(
     contextGraphId: string,
   ): Promise<(AgentKeyRecord & { privateKey: string }) | null> {
@@ -3460,6 +3506,19 @@ export class DKGAgent {
       throw new Error(`SPARQL rejected: ${readOnlyGuard.reason}`);
     }
 
+    const targetsSharedMemory =
+      opts.graphSuffix === '_shared_memory'
+      || opts.includeSharedMemory === true
+      || opts.view === 'shared-working-memory';
+    if (
+      opts.contextGraphId
+      && targetsSharedMemory
+      && !(await this.canUseSharedMemoryForContextGraph(opts.contextGraphId))
+    ) {
+      this.log.info(ctx, `Shared memory query denied for unauthorized or unconfirmed context graph "${opts.contextGraphId}"`);
+      return emptyQueryResultForKind(sparql);
+    }
+
     if (opts.contextGraphId && !(await this.canReadContextGraph(opts.contextGraphId))) {
       this.log.info(ctx, `Query denied for private context graph "${opts.contextGraphId}"`);
       // A-1 follow-up review: synthetic deny must match the SPARQL form
@@ -3614,9 +3673,26 @@ export class DKGAgent {
       return true;
     }
 
+    const agentGateAddresses = await this.getContextGraphAgentGateAddresses(contextGraphId);
+    const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
+
+    // Mixed legacy peer-id and V10 agent gates are conjunctive: a node must
+    // be invited by peer id and also hold a local allowed agent identity.
+    if (agentGateAddresses !== null && allowedPeers !== null) {
+      return allowedPeers.includes(this.peerId) && this.hasLocalAgentInGate(agentGateAddresses);
+    }
+
+    if (agentGateAddresses !== null && this.hasLocalAgentInGate(agentGateAddresses)) {
+      return true;
+    }
+
     const participants = await this.getPrivateContextGraphParticipants(contextGraphId);
 
-    // No participant list at all → allow creator / locally-subscribed nodes
+    if ((!participants || participants.length === 0) && allowedPeers !== null) {
+      return allowedPeers.includes(this.peerId);
+    }
+
+    // No participant or peer list at all → allow creator / locally-subscribed nodes
     if (!participants || participants.length === 0) {
       return this.subscribedContextGraphs.has(contextGraphId)
         || (this.config.syncContextGraphs ?? []).includes(contextGraphId);
@@ -3640,7 +3716,6 @@ export class DKGAgent {
     // Legacy peer-ID allowlist: `inviteToContextGraph` writes `DKG_ALLOWED_PEER`
     // quads. Honor them for local reads so a peer-ID-invited node can query
     // the data it just synced.
-    const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
     if (allowedPeers?.includes(this.peerId)) {
       return true;
     }
@@ -3778,6 +3853,7 @@ export class DKGAgent {
 
     // Idempotent: skip if gossip handlers already installed for this context graph.
     if (this.gossipRegistered.has(contextGraphId)) {
+      this.queueSharedMemoryGossipSubscription(contextGraphId);
       const existing = this.subscribedContextGraphs.get(contextGraphId);
       if (!existing?.subscribed) {
         this.setContextGraphSubscription(
@@ -3791,11 +3867,9 @@ export class DKGAgent {
     this.gossipRegistered.add(contextGraphId);
 
     const publishTopic = paranetPublishTopic(contextGraphId);
-    const swmTopic = paranetWorkspaceTopic(contextGraphId);
     const appTopic = paranetAppTopic(contextGraphId);
 
     this.gossip.subscribe(publishTopic);
-    this.gossip.subscribe(swmTopic);
     this.gossip.subscribe(appTopic);
 
     const existing = this.subscribedContextGraphs.get(contextGraphId);
@@ -3810,10 +3884,7 @@ export class DKGAgent {
       await gph.handlePublishMessage(data, contextGraphId, undefined, from);
     });
 
-    this.gossip.onMessage(swmTopic, async (_topic, data, from) => {
-      const wh = this.getOrCreateSharedMemoryHandler();
-      await wh.handle(data, from);
-    });
+    this.queueSharedMemoryGossipSubscription(contextGraphId);
 
     const updateTopic = paranetUpdateTopic(contextGraphId);
     this.gossip.subscribe(updateTopic);
@@ -3827,6 +3898,32 @@ export class DKGAgent {
     this.gossip.onMessage(finalizationTopic, async (_topic, data) => {
       const fh = this.getOrCreateFinalizationHandler();
       await fh.handleFinalizationMessage(data, contextGraphId);
+    });
+  }
+
+  private queueSharedMemoryGossipSubscription(contextGraphId: string): void {
+    void this.ensureSharedMemoryGossipSubscription(contextGraphId).catch((err) => {
+      this.log.warn(
+        createOperationContext('system'),
+        `SWM gossip subscription check failed for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+
+  private async ensureSharedMemoryGossipSubscription(contextGraphId: string): Promise<void> {
+    if (this.sharedMemoryGossipRegistered.has(contextGraphId)) return;
+    const ctx = createOperationContext('system');
+    if (!(await this.canUseSharedMemoryForContextGraph(contextGraphId))) {
+      this.log.warn(ctx, `SWM gossip subscription denied for "${contextGraphId}": local node is not authorized`);
+      return;
+    }
+
+    const swmTopic = paranetWorkspaceTopic(contextGraphId);
+    this.sharedMemoryGossipRegistered.add(contextGraphId);
+    this.gossip.subscribe(swmTopic);
+    this.gossip.onMessage(swmTopic, async (_topic, data, from) => {
+      const wh = this.getOrCreateSharedMemoryHandler();
+      await wh.handle(data, from);
     });
   }
 
@@ -6549,6 +6646,7 @@ export class DKGAgent {
       verifyIdentity: typeof verifyIdentity === 'function' ? verifyIdentity.bind(this.chain) : undefined,
       getParticipants: (contextGraphId) => this.getPrivateContextGraphParticipants(contextGraphId),
       getAllowedPeers: (contextGraphId) => this.getContextGraphAllowedPeers(contextGraphId),
+      getAgentGateAddresses: (contextGraphId) => this.getContextGraphAgentGateAddresses(contextGraphId),
       refreshMetaFromCurator: (contextGraphId) => this.refreshMetaFromCurator(contextGraphId),
       logWarn: (ctx, message) => this.log.warn(ctx, message),
       logInfo: (ctx, message) => this.log.info(ctx, message),

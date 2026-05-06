@@ -31,6 +31,11 @@ type FocusedBenchmarkRecord = {
 };
 
 type EsbenchConfigForTest = {
+  addLinkedReportNavigation: (
+    html: string,
+    currentFile: string,
+    targets: Array<[string, string]>,
+  ) => string;
   filterResultByCase: (
     result: Record<string, unknown>,
     caseName: string,
@@ -46,6 +51,10 @@ type EsbenchSuiteForTest = {
     };
   };
   GENERATED_PAYLOAD_SIZES: Array<{ label: string; bytes: number }>;
+};
+
+type CpuProfileReportForTest = {
+  renderCpuProfileFlamegraphHtml: (profile: unknown, options?: Record<string, unknown>) => string;
 };
 
 afterEach(() => {
@@ -324,14 +333,89 @@ describe('publish async get benchmark', () => {
     expect(record.scenes[1]).toEqual({ [caseName]: { time: [3] } });
   });
 
+  it('links the combined ESBench report and focused HTML pages together', async () => {
+    const {
+      addLinkedReportNavigation,
+      publishAsyncGetPages,
+    } = await import('../../../esbench.config.mjs') as EsbenchConfigForTest;
+    const targets: Array<[string, string]> = [
+      ['Combined report', 'bench/results/latest.html'],
+      ...publishAsyncGetPages,
+    ];
+
+    const html = addLinkedReportNavigation(
+      '<!doctype html><html><head><title>Benchmark</title></head><body><main></main></body></html>',
+      'bench/results/publish-async-get/get-read-retrieval.html',
+      targets,
+    );
+    const repeated = addLinkedReportNavigation(
+      html,
+      'bench/results/publish-async-get/get-read-retrieval.html',
+      targets,
+    );
+
+    expect(html).toContain('dkg-benchmark-report-nav');
+    expect(html).toContain('../latest.html');
+    expect(html).toContain('sync-publish-finalization.html');
+    expect(html).toContain('asynchronous publish enqueue and finalization');
+    expect(html).toContain('aria-current=\\"page\\"');
+    expect(html).toContain('DOMContentLoaded');
+    expect(repeated.match(/dkg-benchmark-report-nav:start/g)).toHaveLength(1);
+  });
+
+  it('renders a CPU profile flamegraph HTML report for benchmark analysis', async () => {
+    const { renderCpuProfileFlamegraphHtml } = await import('../../../bench/support/cpu-profile-report.mjs') as CpuProfileReportForTest;
+    const html = renderCpuProfileFlamegraphHtml({
+      nodes: [
+        {
+          id: 1,
+          callFrame: { functionName: '(root)', url: '', lineNumber: 0, columnNumber: 0 },
+          children: [2],
+        },
+        {
+          id: 2,
+          callFrame: {
+            functionName: 'publishFromSharedMemory',
+            url: 'file:///repo/packages/publisher/src/index.ts',
+            lineNumber: 41,
+            columnNumber: 1,
+          },
+          children: [3],
+        },
+        {
+          id: 3,
+          callFrame: {
+            functionName: 'finalizePublish',
+            url: 'file:///repo/packages/agent/src/publisher.ts',
+            lineNumber: 8,
+            columnNumber: 1,
+          },
+        },
+      ],
+      samples: [2, 3, 3],
+      timeDeltas: [1000, 2000, 3000],
+    }, {
+      profileName: 'publish-async-get-test.cpuprofile',
+      generatedAt: '2026-05-06T00:00:00.000Z',
+    });
+
+    expect(html).toContain('<svg');
+    expect(html).toContain('publishFromSharedMemory');
+    expect(html).toContain('finalizePublish');
+    expect(html).toContain('6.00 ms');
+    expect(html).toContain('Raw .cpuprofile');
+  });
+
   it('keeps focused ESBench HTML pages wired into the documented benchmark script', async () => {
     const packageJson = JSON.parse(await readFile(new URL('../../../package.json', import.meta.url), 'utf8')) as {
       scripts?: Record<string, string>;
     };
     const benchHtml = packageJson.scripts?.['bench:html'];
+    const benchProfile = packageJson.scripts?.['bench:profile'];
 
     expect(benchHtml).toContain('ESBENCH_HTML=1');
     expect(benchHtml).toContain('ESBENCH_PUBLISH_ASYNC_GET_HTML=1');
     expect(benchHtml).toContain('esbench --config esbench.config.mjs');
+    expect(benchProfile).toBe('node bench/profile-publish-async-get.mjs');
   });
 });

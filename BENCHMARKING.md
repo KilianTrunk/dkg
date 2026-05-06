@@ -82,7 +82,42 @@ Open the combined HTML file for the full table, or one of the per-flow pages
 when you only need a single DKG memory/publish/read path. The per-flow pages are
 generated from the same result object through
 `ESBENCH_PUBLISH_ASYNC_GET_HTML=1`; they contain benchmark results only and do
-not embed local auth tokens or daemon paths.
+not embed local auth tokens or daemon paths. The combined report and per-flow
+pages include a fixed report navigation bar so the generated HTML files can be
+opened directly from disk without losing the link between the pages.
+
+## CPU Profiles And Flame Graphs
+
+Generate the ESBench reports plus a V8 CPU profile and generated flame graph:
+
+```bash
+pnpm bench:profile
+```
+
+Profile a single large generated payload when investigating the heavy path:
+
+```bash
+DKG_ESBENCH_PAYLOAD_SIZES=200mb pnpm bench:profile
+```
+
+This writes:
+
+- `bench/results/profiles/publish-async-get-<timestamp>.esbench.json`
+- `bench/results/profiles/publish-async-get-<timestamp>.esbench.html`
+- `bench/results/profiles/publish-async-get-<timestamp>.cpuprofile`
+- `bench/results/profiles/publish-async-get-<timestamp>.flamegraph.html`
+- `bench/results/profiles/index.html`
+
+The generated flame graph is a local HTML view built from V8 sampled CPU stacks.
+Width represents aggregated sampled CPU time. Use it to find where CPU time is
+going inside publish, async publish, get, and memory-layer benchmark runs.
+When `bench/results/latest.html` and the focused per-flow pages already exist,
+`pnpm bench:profile` updates their navigation bars with a `CPU profiles` link.
+
+The raw `.cpuprofile` can also be opened in Chrome or Edge DevTools Performance,
+or uploaded locally to Speedscope. CPU profiling adds overhead, so use normal
+`pnpm bench` or `pnpm bench:html` output as the timing baseline and use
+`pnpm bench:profile` for deeper attribution.
 
 ## Baseline Workflow
 

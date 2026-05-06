@@ -1925,8 +1925,23 @@ export class DKGPublisher implements Publisher {
     } catch {
       // Descriptive SWM graph names are valid local/mock update scopes.
     }
-    const resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
     const localOnlyUpdate = this.chain.chainId === 'none';
+    let resolvedPublisherAddress: string | undefined;
+    if (localOnlyUpdate) {
+      resolvedPublisherAddress = await this.resolvePublisherAddress(publisherContextGraphId);
+    } else if (typeof this.chain.getLatestMerkleRootPublisher === 'function') {
+      try {
+        resolvedPublisherAddress = coercePublisherAddress(
+          await this.chain.getLatestMerkleRootPublisher(kcId),
+        );
+      } catch {
+        // Adapter-managed updates can still let the adapter resolve the
+        // original publisher while submitting the transaction.
+      }
+    }
+    if (!resolvedPublisherAddress && !localOnlyUpdate) {
+      resolvedPublisherAddress = await this.resolveKnownBatchPublisherAddress(contextGraphId, kcId);
+    }
     const publisherAddress = resolvedPublisherAddress ?? (
       localOnlyUpdate ? this.localTentativePublisherAddress() : undefined
     );

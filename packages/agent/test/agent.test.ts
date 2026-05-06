@@ -262,6 +262,28 @@ class GenericSignMessageExternalOperationalKeyPublishChainAdapter extends Extern
   }
 }
 
+class MultiSignerGenericSignMessagePublishChainAdapter extends ExternalOperationalKeyPublishChainAdapter {
+  constructor(
+    expectedPublisherAddress: string,
+    private readonly genericSigner: ethers.Wallet,
+    private readonly advertisedSigner: ethers.Wallet,
+  ) {
+    super(expectedPublisherAddress);
+  }
+
+  async getSignerAddresses(): Promise<string[]> {
+    return [this.advertisedSigner.address];
+  }
+
+  async signMessage(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const sig = ethers.Signature.from(await this.genericSigner.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+}
+
 class SingleSignerAdapterPublishChainAdapter extends ExternalOperationalKeyPublishChainAdapter {
   constructor(private readonly adapterWallet: ethers.Wallet) {
     super(adapterWallet.address);
@@ -273,6 +295,34 @@ class SingleSignerAdapterPublishChainAdapter extends ExternalOperationalKeyPubli
 
   async signMessage(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
     const sig = ethers.Signature.from(await this.adapterWallet.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+}
+
+class ReservingAuthorityContextGraphChainAdapter extends ExternalOperationalKeyPublishChainAdapter {
+  reservations = 0;
+
+  constructor(private readonly wallet: ethers.Wallet) {
+    super(wallet.address);
+  }
+
+  async getAuthorizedPublisherAddress(): Promise<string> {
+    this.reservations += 1;
+    return ethers.Wallet.createRandom().address;
+  }
+
+  getSignerAddress(): string {
+    return this.wallet.address;
+  }
+
+  async signMessageAs(address: string, messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    if (address.toLowerCase() !== this.wallet.address.toLowerCase()) {
+      throw new Error(`unexpected signer ${address}`);
+    }
+    const sig = ethers.Signature.from(await this.wallet.signMessage(messageHash));
     return {
       r: ethers.getBytes(sig.r),
       vs: ethers.getBytes(sig.yParityAndS),
@@ -1408,6 +1458,73 @@ describe('DKGAgent ACK signer gating', () => {
 
       expect(authority?.toLowerCase()).toBe(wallet.address.toLowerCase());
       expect(authority?.toLowerCase()).not.toBe(unrelatedSigner.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('keeps chainConfig.operationalKeys fallback when multi-signer adapter lacks signMessageAs', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const genericSigner = ethers.Wallet.createRandom();
+    const advertisedSigner = ethers.Wallet.createRandom();
+    const chain = new MultiSignerGenericSignMessagePublishChainAdapter(
+      wallet.address,
+      genericSigner,
+      advertisedSigner,
+    );
+
+    const agent = await DKGAgent.create({
+      name: 'MultiSignerGenericSignMessageOperationalKeyPublisher',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+      chainConfig: {
+        rpcUrl: 'http://127.0.0.1:0',
+        hubAddress: '0x00000000000000000000000000000000000000A1',
+        operationalKeys: [wallet.privateKey],
+      },
+    });
+
+    try {
+      agent.publisher.setIdentityId(1n);
+      const result = await agent.publisher.publish({
+        contextGraphId: '42',
+        quads: [{
+          subject: 'urn:test:agent-multi-signer-generic-sign-message-operational-key-fallback',
+          predicate: 'http://schema.org/name',
+          object: '"MultiSignerGenericSignMessageOperationalKeyFallback"',
+          graph: 'did:dkg:context-graph:42',
+        }],
+      });
+
+      expect(result.status).toBe('confirmed');
+      expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+      expect(chain.capturedPublisherAddress?.toLowerCase()).not.toBe(genericSigner.address.toLowerCase());
+      expect(chain.capturedPublisherAddress?.toLowerCase()).not.toBe(advertisedSigner.address.toLowerCase());
+      expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('does not reserve a publish signer while resolving curated registration authority', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const chain = new ReservingAuthorityContextGraphChainAdapter(wallet);
+
+    const agent = await DKGAgent.create({
+      name: 'NonReservingRegistrationAuthority',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+    });
+
+    try {
+      const authority = await (agent as unknown as {
+        getChainPublishAuthorityAddress(contextGraphId?: string): Promise<string | undefined>;
+      }).getChainPublishAuthorityAddress('42');
+
+      expect(authority?.toLowerCase()).toBe(wallet.address.toLowerCase());
+      expect(chain.reservations).toBe(0);
     } finally {
       await agent.stop().catch(() => {});
     }

@@ -494,14 +494,16 @@ function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
 }
 
 function adapterAdvertisesPublisherSigner(chain: ChainAdapter): boolean {
-  const hasAddressProbe = typeof chain.getAuthorizedPublisherAddress === 'function' ||
-    typeof (chain as unknown as { getSignerAddress?: unknown }).getSignerAddress === 'function' ||
-    typeof (chain as unknown as { getSignerAddresses?: unknown }).getSignerAddresses === 'function' ||
+  const hasReservingOrMultiAddressProbe = typeof chain.getAuthorizedPublisherAddress === 'function' ||
+    typeof (chain as unknown as { getSignerAddresses?: unknown }).getSignerAddresses === 'function';
+  const hasSingleAddressProbe = typeof (chain as unknown as { getSignerAddress?: unknown }).getSignerAddress === 'function' ||
     Boolean(normalizeAdapterPublisherAddress((chain as unknown as { signerAddress?: unknown }).signerAddress));
-  const hasSigningProbe = typeof chain.signMessageAs === 'function' ||
-    typeof chain.signMessage === 'function';
+  const hasAnyAddressProbe = hasReservingOrMultiAddressProbe || hasSingleAddressProbe;
 
-  return hasAddressProbe && hasSigningProbe;
+  if (typeof chain.signMessageAs === 'function') return hasAnyAddressProbe;
+  return !hasReservingOrMultiAddressProbe &&
+    hasSingleAddressProbe &&
+    typeof chain.signMessage === 'function';
 }
 
 function privateKeyAddress(privateKey: string | undefined): string | undefined {
@@ -516,8 +518,13 @@ function privateKeyAddress(privateKey: string | undefined): string | undefined {
 async function inferAdapterPublisherAddress(
   chain: ChainAdapter,
   contextGraphId?: bigint,
+  options?: { includeReservingPublisherProbe?: boolean },
 ): Promise<string | undefined> {
-  if (contextGraphId !== undefined && typeof chain.getAuthorizedPublisherAddress === 'function') {
+  if (
+    options?.includeReservingPublisherProbe !== false &&
+    contextGraphId !== undefined &&
+    typeof chain.getAuthorizedPublisherAddress === 'function'
+  ) {
     try {
       const address = normalizeAdapterPublisherAddress(
         await chain.getAuthorizedPublisherAddress(contextGraphId),
@@ -7248,7 +7255,9 @@ export class DKGAgent {
     } catch {
       // Local descriptive CG ids cannot be used as adapter context hints.
     }
-    return inferAdapterPublisherAddress(this.chain, publisherContextGraphId);
+    return inferAdapterPublisherAddress(this.chain, publisherContextGraphId, {
+      includeReservingPublisherProbe: false,
+    });
   }
 
   /**

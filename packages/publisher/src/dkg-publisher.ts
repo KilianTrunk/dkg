@@ -43,7 +43,7 @@ export interface DKGPublisherConfig {
   publisherNodeIdentityId?: bigint;
   publisherAddress?: string;
   /** Retryable publisher address resolver for adapter-backed signing. */
-  publisherAddressResolver?: () => Promise<string | undefined>;
+  publisherAddressResolver?: (contextGraphId?: bigint) => Promise<string | undefined>;
   /** EVM private key for signing publish requests (hex string with 0x prefix) */
   publisherPrivateKey?: string;
   /**
@@ -63,7 +63,7 @@ export class PublisherWalletRequiredError extends Error {
   constructor(operation: string) {
     super(
       `${operation} requires "publisherPrivateKey" or a non-zero "publisherAddress" ` +
-      'backed by ChainAdapter.signMessage(). Publishing without a publisher signing key ' +
+      'backed by ChainAdapter.signMessageAs()/signMessage(). Publishing without a publisher signing key ' +
       'would produce unattributable or unverifiable publisher output.',
     );
     this.name = 'PublisherWalletRequiredError';
@@ -256,7 +256,8 @@ export class DKGPublisher implements Publisher {
   readonly knownBatchContextGraphs: Map<string, string>;
   private publisherNodeIdentityId: bigint;
   private publisherAddress?: string;
-  private readonly publisherAddressResolver?: () => Promise<string | undefined>;
+  private readonly publisherAddressResolver?: (contextGraphId?: bigint) => Promise<string | undefined>;
+  private readonly dynamicallyResolvePublisherAddress: boolean;
   private readonly publisherWallet?: ethers.Wallet;
   /** Additional wallets that can provide receiver signatures. */
   private readonly additionalSignerWallets: ethers.Wallet[] = [];
@@ -274,6 +275,9 @@ export class DKGPublisher implements Publisher {
     this.publisherAddressResolver = config.publisherAddressResolver;
 
     const configuredPublisherAddress = normalizePublisherAddress(config.publisherAddress);
+    this.dynamicallyResolvePublisherAddress = !config.publisherPrivateKey &&
+      !configuredPublisherAddress &&
+      typeof config.publisherAddressResolver === 'function';
     if (config.publisherPrivateKey) {
       this.publisherWallet = new ethers.Wallet(config.publisherPrivateKey);
       this.publisherAddress = this.publisherWallet.address;
@@ -291,8 +295,9 @@ export class DKGPublisher implements Publisher {
       // capability. Keep an optional, validated address only for callers
       // that route signing through their ChainAdapter (e.g. adapter-backed
       // or hardware-signer deployments). Chain-backed publish still fails
-      // unless that address is backed by ChainAdapter.signMessage(); update
-      // can let the adapter select its signer from the configured signer pool.
+      // unless that address is backed by ChainAdapter.signMessageAs() or
+      // signMessage(); update can let the adapter select its signer from the
+      // configured signer pool.
       //
       // The previous behaviour generated an ephemeral `Wallet.createRandom()`
       // here whenever chain was enabled, which produced unverifiable
@@ -320,10 +325,13 @@ export class DKGPublisher implements Publisher {
     return this.publisherAddress;
   }
 
-  private async resolvePublisherAddress(): Promise<void> {
-    if (this.publisherAddress || !this.publisherAddressResolver) return;
-    const resolved = normalizePublisherAddress(await this.publisherAddressResolver());
-    if (resolved) this.publisherAddress = resolved;
+  private async resolvePublisherAddress(contextGraphId?: bigint): Promise<void> {
+    if (!this.publisherAddressResolver) return;
+    if (this.publisherAddress && !this.dynamicallyResolvePublisherAddress) return;
+    const resolved = normalizePublisherAddress(await this.publisherAddressResolver(contextGraphId));
+    if (resolved || this.dynamicallyResolvePublisherAddress) {
+      this.publisherAddress = resolved;
+    }
   }
 
   // Local-only tentative publishes need a stable, non-zero UAL component even
@@ -344,13 +352,18 @@ export class DKGPublisher implements Publisher {
       };
     }
 
-    if (this.publisherAddress && typeof this.chain.signMessage === 'function') {
+    if (
+      this.publisherAddress &&
+      (typeof this.chain.signMessageAs === 'function' || typeof this.chain.signMessage === 'function')
+    ) {
       const expectedAddress = this.publisherAddress;
       return {
         address: expectedAddress,
         source: 'chainAdapter',
         signMessage: async (message: Uint8Array) => {
-          const compact = await this.chain.signMessage!(message);
+          const compact = typeof this.chain.signMessageAs === 'function'
+            ? await this.chain.signMessageAs(expectedAddress, message)
+            : await this.chain.signMessage!(message);
           const signature = ethers.Signature.from({
             r: ethers.hexlify(compact.r),
             yParityAndS: ethers.hexlify(compact.vs),
@@ -1098,7 +1111,14 @@ export class DKGPublisher implements Publisher {
     const effectiveAccessPolicy = accessPolicy ?? (privateQuads.length > 0 ? 'ownerOnly' : 'public');
     const normalizedAllowedPeers = [...new Set((allowedPeers ?? []).map((p) => p.trim()).filter(Boolean))];
     const normalizedPublisherPeerId = publisherPeerId.trim();
-    await this.resolvePublisherAddress();
+    let publisherContextGraphId: bigint | undefined;
+    try {
+      const parsed = BigInt(options.publishContextGraphId ?? contextGraphId);
+      if (parsed > 0n) publisherContextGraphId = parsed;
+    } catch {
+      // Descriptive SWM graph names stay on the existing tentative/mock path.
+    }
+    await this.resolvePublisherAddress(publisherContextGraphId);
     const publisherSigner = this.getPublisherSigner();
     const publisherAddress = this.publisherAddress ?? this.localTentativePublisherAddress();
     const canAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherSigner !== undefined;
@@ -1524,6 +1544,7 @@ export class DKGPublisher implements Publisher {
           onChainResult = await this.chain.createKnowledgeAssetsV10!({
             publishOperationId: `${this.sessionId}-${tentativeSeq}`,
             contextGraphId: v10CgId,
+            publisherAddress: publisherSigner.address,
             merkleRoot: kcMerkleRoot,
             knowledgeAssetsAmount: kaCount,
             byteSize: publicByteSize,
@@ -1705,7 +1726,14 @@ export class DKGPublisher implements Publisher {
       if (privateQuads.length > 0) rejectReservedSubjectPrefixes(privateQuads);
     }
     const ctx: OperationContext = operationCtx ?? createOperationContext('publish');
-    await this.resolvePublisherAddress();
+    let publisherContextGraphId: bigint | undefined;
+    try {
+      const parsed = BigInt(options.publishContextGraphId ?? contextGraphId);
+      if (parsed > 0n) publisherContextGraphId = parsed;
+    } catch {
+      // Descriptive SWM graph names are valid local/mock update scopes.
+    }
+    await this.resolvePublisherAddress(publisherContextGraphId);
     const localOnlyUpdate = this.chain.chainId === 'none';
     const publisherAddress = this.publisherAddress ?? (
       localOnlyUpdate ? this.localTentativePublisherAddress() : this.requirePublisherAddress('update')

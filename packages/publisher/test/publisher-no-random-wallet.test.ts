@@ -31,6 +31,7 @@ import { MockChainAdapter, type ChainAdapter } from '@origintrail-official/dkg-c
 import { ethers } from 'ethers';
 
 const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
+const TEST_KEY_ALT = '0x5de4111a56f4c24611d9ed4d5318a7e03f9b9a9d73f3a5f3f6324a2a0e6fbb36';
 
 // Minimal stub — DKGPublisher's constructor only reads `chain.chainId`.
 // All other ChainAdapter methods are unused in this test.
@@ -51,6 +52,52 @@ class AdapterSigningChain extends MockChainAdapter {
       r: ethers.getBytes(sig.r),
       vs: ethers.getBytes(sig.yParityAndS),
     };
+  }
+}
+
+class ContextAwareAdapterSigningChain extends MockChainAdapter {
+  capturedPublisherAddress?: string;
+
+  constructor(
+    private readonly primaryWallet: ethers.Wallet,
+    private readonly authorizedWallet: ethers.Wallet,
+  ) {
+    super('mock:31337', primaryWallet.address);
+    this.seedIdentity(authorizedWallet.address, 7n);
+    this.minimumRequiredSignatures = 1;
+  }
+
+  async getAuthorizedPublisherAddress(contextGraphId: bigint): Promise<string> {
+    expect(contextGraphId).toBe(42n);
+    return this.authorizedWallet.address;
+  }
+
+  override async signMessage(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const sig = ethers.Signature.from(await this.primaryWallet.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+
+  async signMessageAs(address: string, messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const normalized = ethers.getAddress(address);
+    if (normalized.toLowerCase() !== this.authorizedWallet.address.toLowerCase()) {
+      throw new Error(`unexpected signer ${address}`);
+    }
+    const sig = ethers.Signature.from(await this.authorizedWallet.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+
+  override async createKnowledgeAssetsV10(params: Parameters<MockChainAdapter['createKnowledgeAssetsV10']>[0]) {
+    this.capturedPublisherAddress = params.publisherAddress;
+    if (params.publisherAddress?.toLowerCase() !== this.authorizedWallet.address.toLowerCase()) {
+      throw new Error('publish tx signer did not match resolved publisher address');
+    }
+    return super.createKnowledgeAssetsV10(params);
   }
 }
 
@@ -258,6 +305,36 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
     expect(result.status).toBe('confirmed');
     expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
+  it('binds context-graph-aware adapter signer resolution to the V10 tx publisher address', async () => {
+    const keypair = await generateEd25519Keypair();
+    const primaryWallet = new ethers.Wallet(TEST_KEY);
+    const authorizedWallet = new ethers.Wallet(TEST_KEY_ALT);
+    const chain = new ContextAwareAdapterSigningChain(primaryWallet, authorizedWallet);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherAddressResolver: (contextGraphId?: bigint) =>
+        contextGraphId === undefined ? Promise.resolve(undefined) : chain.getAuthorizedPublisherAddress(contextGraphId),
+      publisherNodeIdentityId: 7n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: '42',
+      quads: [{
+        subject: 'urn:test:adapter-context-aware-signer',
+        predicate: 'http://schema.org/name',
+        object: '"AdapterContextAwareSigner"',
+        graph: 'did:dkg:context-graph:42',
+      }],
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(authorizedWallet.address.toLowerCase());
+    expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(authorizedWallet.address.toLowerCase());
   });
 
   it('updates with an adapter-backed signer and configured publisherAddress', async () => {

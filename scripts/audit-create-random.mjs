@@ -24,9 +24,10 @@
  * What it does
  * ------------
  * Walks every `.ts` / `.tsx` / `.mts` / `.cts` / `.js` / `.jsx` / `.mjs` /
- * `.cjs` source file under `packages/*\/{src,utils}/**` and fails if it
- * finds `Wallet.createRandom(` (including obvious `Wallet` aliases) outside
- * the explicitly allowlisted call sites below. Each allowlist entry pins ONE
+ * `.cjs` source file under root `scripts/**` and
+ * `packages/*\/{src,utils,scripts}/**`, then fails if it finds
+ * `Wallet.createRandom(` (including obvious `Wallet` aliases) outside the
+ * explicitly allowlisted call sites below. Each allowlist entry pins ONE
  * expected hit with a one-line
  * justification — adding a second `createRandom()` to the same file does
  * NOT inherit the existing exemption and must be reviewed on its own.
@@ -430,36 +431,42 @@ async function main() {
   }
   const violations = [];
   const seenAllowlistPaths = new Set();
+
+  const scanRoot = async (root) => {
+    for await (const absPath of walkSourceFiles(root)) {
+      const text = await readFile(absPath, 'utf8');
+      const hits = findHits(text);
+      if (hits.length === 0) continue;
+      const relPath = relative(REPO_ROOT, absPath).split('\\').join('/');
+      const exemption = ALLOWLIST.get(relPath);
+      if (!exemption) {
+        violations.push({
+          path: relPath,
+          kind: 'no-exemption',
+          hits,
+          expectedHits: 0,
+        });
+        continue;
+      }
+      seenAllowlistPaths.add(relPath);
+      if (hits.length !== exemption.expectedHits) {
+        violations.push({
+          path: relPath,
+          kind: 'hit-count-mismatch',
+          hits,
+          expectedHits: exemption.expectedHits,
+          justification: exemption.justification,
+        });
+      }
+    }
+  };
+
+  await scanRoot(join(REPO_ROOT, 'scripts'));
+
   for (const pkg of pkgs) {
     if (!pkg.isDirectory() || pkg.name.startsWith('.')) continue;
-    for (const subdir of ['src', 'utils']) {
-      const root = join(packagesDir, pkg.name, subdir);
-      for await (const absPath of walkSourceFiles(root)) {
-        const text = await readFile(absPath, 'utf8');
-        const hits = findHits(text);
-        if (hits.length === 0) continue;
-        const relPath = relative(REPO_ROOT, absPath).split('\\').join('/');
-        const exemption = ALLOWLIST.get(relPath);
-        if (!exemption) {
-          violations.push({
-            path: relPath,
-            kind: 'no-exemption',
-            hits,
-            expectedHits: 0,
-          });
-          continue;
-        }
-        seenAllowlistPaths.add(relPath);
-        if (hits.length !== exemption.expectedHits) {
-          violations.push({
-            path: relPath,
-            kind: 'hit-count-mismatch',
-            hits,
-            expectedHits: exemption.expectedHits,
-            justification: exemption.justification,
-          });
-        }
-      }
+    for (const subdir of ['src', 'utils', 'scripts']) {
+      await scanRoot(join(packagesDir, pkg.name, subdir));
     }
   }
 

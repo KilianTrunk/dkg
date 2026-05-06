@@ -918,11 +918,12 @@ export class MockChainAdapter implements ChainAdapter {
     }
 
     const kcId = this.nextBatchId++;
+    const publisherAddress = params.publisherAddress ?? this.signerAddress;
     this.collections.set(kcId, {
       merkleRoot: params.merkleRoot,
       kaCount: params.knowledgeAssetsAmount,
       merkleLeafCount: params.merkleLeafCount,
-      publisherAddress: this.signerAddress,
+      publisherAddress,
       cgId: params.contextGraphId,
     });
     // Also store in batches so verify() can find this publish
@@ -941,7 +942,7 @@ export class MockChainAdapter implements ChainAdapter {
       merkleRoot: toHex(params.merkleRoot),
       byteSize: params.byteSize.toString(),
       txHash,
-      publisherAddress: this.signerAddress,
+      publisherAddress,
       startKAId: startKAId.toString(),
       endKAId: endKAId.toString(),
       isImmutable: params.isImmutable,
@@ -957,7 +958,7 @@ export class MockChainAdapter implements ChainAdapter {
       txHash: result.hash,
       blockNumber: result.blockNumber,
       blockTimestamp: Math.floor(Date.now() / 1000),
-      publisherAddress: this.signerAddress,
+      publisherAddress,
       tokenAmount: params.tokenAmount,
     };
   }

@@ -192,6 +192,14 @@ export interface ConvictionAccountInfo {
 export interface V10PublishDirectParams {
   publishOperationId: string;
   contextGraphId: bigint;
+  /**
+   * Optional signer hint selected by the caller for the publish. Adapters
+   * with signer pools MUST use this address for the concrete tx when present
+   * (or throw clearly if unavailable/unauthorized), so the off-chain
+   * publisher/ACK/authorship signatures and on-chain attribution stay bound
+   * to the same key.
+   */
+  publisherAddress?: string;
   merkleRoot: Uint8Array;
   knowledgeAssetsAmount: number;
   byteSize: bigint;
@@ -528,6 +536,20 @@ export interface ChainAdapter {
    * Used for self-signing as receiver or context graph participant.
    */
   signMessage?(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }>;
+
+  /**
+   * Return the adapter signer that would be used for a publish to the given
+   * context graph without advancing any round-robin cursor. Used by publishers
+   * that need the off-chain signature address to match the eventual tx signer.
+   */
+  getAuthorizedPublisherAddress?(contextGraphId: bigint): Promise<string>;
+
+  /**
+   * Sign with a specific adapter-held address. Adapters with signer pools
+   * should implement this so callers can bind a context-graph-selected
+   * publisher address to the digest signatures generated before tx submit.
+   */
+  signMessageAs?(address: string, messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }>;
 
   // On-Chain Context Graphs (ContextGraphs contract)
   createOnChainContextGraph?(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult>;

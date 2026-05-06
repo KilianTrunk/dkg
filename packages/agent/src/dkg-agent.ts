@@ -493,7 +493,31 @@ function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
   return address === ethers.ZeroAddress ? undefined : address;
 }
 
-async function inferAdapterPublisherAddress(chain: ChainAdapter): Promise<string | undefined> {
+async function inferAdapterPublisherAddress(
+  chain: ChainAdapter,
+  contextGraphId?: bigint,
+): Promise<string | undefined> {
+  if (contextGraphId !== undefined && typeof chain.getAuthorizedPublisherAddress === 'function') {
+    try {
+      const address = normalizeAdapterPublisherAddress(
+        await chain.getAuthorizedPublisherAddress(contextGraphId),
+      );
+      if (address) return address;
+    } catch {
+      // Best-effort probe; the publisher resolver retries on later publish/update attempts.
+    }
+  }
+
+  const signerAddressGetter = (chain as unknown as { getSignerAddress?: () => unknown }).getSignerAddress;
+  if (typeof signerAddressGetter === 'function') {
+    try {
+      const address = normalizeAdapterPublisherAddress(signerAddressGetter.call(chain));
+      if (address) return address;
+    } catch {
+      // Best-effort probe; fall through to broader adapter surfaces.
+    }
+  }
+
   const signerAddresses = (chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
   if (typeof signerAddresses === 'function') {
     try {
@@ -736,7 +760,7 @@ export class DKGAgent {
       publisherAddress: config.publisherAddress,
       publisherAddressResolver: opKeys?.[0] || config.publisherAddress
         ? undefined
-        : () => inferAdapterPublisherAddress(chain),
+        : (contextGraphId?: bigint) => inferAdapterPublisherAddress(chain, contextGraphId),
       sharedMemoryOwnedEntities: workspaceOwnedEntities,
       writeLocks,
     });

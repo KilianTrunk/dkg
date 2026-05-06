@@ -498,8 +498,10 @@ function adapterAdvertisesPublisherSigner(chain: ChainAdapter): boolean {
     typeof (chain as unknown as { getSignerAddress?: unknown }).getSignerAddress === 'function' ||
     typeof (chain as unknown as { getSignerAddresses?: unknown }).getSignerAddresses === 'function' ||
     Boolean(normalizeAdapterPublisherAddress((chain as unknown as { signerAddress?: unknown }).signerAddress));
+  const hasSigningProbe = typeof chain.signMessageAs === 'function' ||
+    typeof chain.signMessage === 'function';
 
-  return hasAddressProbe && typeof chain.signMessageAs === 'function';
+  return hasAddressProbe && hasSigningProbe;
 }
 
 function privateKeyAddress(privateKey: string | undefined): string | undefined {

@@ -262,6 +262,24 @@ class GenericSignMessageExternalOperationalKeyPublishChainAdapter extends Extern
   }
 }
 
+class SingleSignerAdapterPublishChainAdapter extends ExternalOperationalKeyPublishChainAdapter {
+  constructor(private readonly adapterWallet: ethers.Wallet) {
+    super(adapterWallet.address);
+  }
+
+  getSignerAddress(): string {
+    return this.adapterWallet.address;
+  }
+
+  async signMessage(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const sig = ethers.Signature.from(await this.adapterWallet.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+}
+
 let _fileSnapshot: string;
 beforeAll(async () => {
   _fileSnapshot = await takeSnapshot();
@@ -1358,6 +1376,44 @@ describe('DKGAgent ACK signer gating', () => {
       expect(result.status).toBe('confirmed');
       expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
       expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('uses a single-signer adapter instead of chainConfig.operationalKeys fallback', async () => {
+    const adapterWallet = ethers.Wallet.createRandom();
+    const staleChainConfigSigner = ethers.Wallet.createRandom();
+    const chain = new SingleSignerAdapterPublishChainAdapter(adapterWallet);
+
+    const agent = await DKGAgent.create({
+      name: 'SingleSignerAdapterPublisher',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+      chainConfig: {
+        rpcUrl: 'http://127.0.0.1:0',
+        hubAddress: '0x00000000000000000000000000000000000000A1',
+        operationalKeys: [staleChainConfigSigner.privateKey],
+      },
+    });
+
+    try {
+      agent.publisher.setIdentityId(1n);
+      const result = await agent.publisher.publish({
+        contextGraphId: '42',
+        quads: [{
+          subject: 'urn:test:agent-single-signer-adapter',
+          predicate: 'http://schema.org/name',
+          object: '"SingleSignerAdapter"',
+          graph: 'did:dkg:context-graph:42',
+        }],
+      });
+
+      expect(result.status).toBe('confirmed');
+      expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(adapterWallet.address.toLowerCase());
+      expect(chain.capturedPublisherAddress?.toLowerCase()).not.toBe(staleChainConfigSigner.address.toLowerCase());
+      expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(adapterWallet.address.toLowerCase());
     } finally {
       await agent.stop().catch(() => {});
     }

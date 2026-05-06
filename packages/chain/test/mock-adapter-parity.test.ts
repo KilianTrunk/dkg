@@ -45,6 +45,7 @@ import { describe, it, expect } from 'vitest';
 import { EVMChainAdapter } from '../src/evm-adapter.js';
 import { MockChainAdapter } from '../src/mock-adapter.js';
 import { NoChainAdapter } from '../src/no-chain-adapter.js';
+import { ethers } from 'ethers';
 
 /** Collect all own method names across the whole prototype chain, minus `constructor`. */
 function collectMethodNames(ctor: Function): Set<string> {
@@ -312,6 +313,74 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     await expect(mock.createKnowledgeAssetsV10(params)).resolves.toMatchObject({
       publisherAddress: otherPublisher,
     });
+  });
+
+  it('preserves delegated V10 publisher attribution across mock updates', async () => {
+    const mock = new MockChainAdapter('mock:31337', '0x1111111111111111111111111111111111111111');
+    mock.minimumRequiredSignatures = 0;
+    const delegatedPublisher = '0x2222222222222222222222222222222222222222';
+    mock.seedIdentity(delegatedPublisher, 7n);
+
+    const created = await mock.createKnowledgeAssetsV10({
+      publishOperationId: 'mock-v10-delegated-update',
+      contextGraphId: 1n,
+      publisherAddress: delegatedPublisher,
+      merkleRoot: new Uint8Array(32),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1n,
+      epochs: 1,
+      tokenAmount: 1n,
+      isImmutable: false,
+      merkleLeafCount: 1,
+      paymaster: ethers.ZeroAddress,
+      publisherNodeIdentityId: 1n,
+      publisherSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      ackSignatures: [],
+    });
+
+    const newMerkleRoot = ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes('mock-v10-update')));
+    const update = await mock.updateKnowledgeCollectionV10({
+      kcId: created.batchId,
+      newMerkleRoot,
+      newByteSize: 2n,
+      newMerkleLeafCount: 1,
+    });
+
+    expect(update.publisherAddress?.toLowerCase()).toBe(delegatedPublisher.toLowerCase());
+    await expect(mock.getLatestMerkleRootPublisher(created.batchId)).resolves.toBe(delegatedPublisher);
+    await expect(mock.getLatestMerkleRoot(created.batchId)).resolves.toEqual(newMerkleRoot);
+  });
+
+  it('uses stored publisher attribution on the V9 mock update path', async () => {
+    const mock = new MockChainAdapter('mock:31337', '0x1111111111111111111111111111111111111111');
+    const delegatedPublisher = '0x2222222222222222222222222222222222222222';
+    mock.minimumRequiredSignatures = 0;
+    mock.seedIdentity(delegatedPublisher, 7n);
+
+    const created = await mock.createKnowledgeAssetsV10({
+      publishOperationId: 'mock-v9-fallback-delegated-update',
+      contextGraphId: 1n,
+      publisherAddress: delegatedPublisher,
+      merkleRoot: new Uint8Array(32),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1n,
+      epochs: 1,
+      tokenAmount: 1n,
+      isImmutable: false,
+      merkleLeafCount: 1,
+      paymaster: ethers.ZeroAddress,
+      publisherNodeIdentityId: 1n,
+      publisherSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      ackSignatures: [],
+    });
+
+    const update = await mock.updateKnowledgeAssets({
+      batchId: created.batchId,
+      newMerkleRoot: ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes('mock-v9-update'))),
+      newPublicByteSize: 2n,
+    });
+
+    expect(update.publisherAddress?.toLowerCase()).toBe(delegatedPublisher.toLowerCase());
   });
 });
 

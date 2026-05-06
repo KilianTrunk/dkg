@@ -103,6 +103,43 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(match![1]).not.toBe(ethers.ZeroAddress);
   });
 
+  it('updates no-chain tentative publishes with the same deterministic local address', async () => {
+    const keypair = await generateEd25519Keypair();
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain: makeStubChain('none'),
+      eventBus: new TypedEventBus(),
+      keypair,
+    });
+
+    const created = await publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:no-chain-update',
+        predicate: 'http://schema.org/name',
+        object: '"Before"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+    const createdAddress = created.ual.match(/^did:dkg:none\/(0x[0-9a-fA-F]{40})\/t/)?.[1];
+
+    const updated = await publisher.update(created.kcId, {
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:no-chain-update',
+        predicate: 'http://schema.org/name',
+        object: '"After"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(updated.status).toBe('tentative');
+    expect(updated.onChainResult).toBeUndefined();
+    expect(createdAddress).toBeDefined();
+    expect(updated.ual.toLowerCase()).toContain(createdAddress!.toLowerCase());
+    expect(updated.publicQuads[0]?.object).toBe('"After"');
+  });
+
   it('publishes tentatively with an explicit non-zero publisherAddress on no-chain publishes', async () => {
     const keypair = await generateEd25519Keypair();
     const publisherAddress = '0x000000000000000000000000000000000000dEaD';

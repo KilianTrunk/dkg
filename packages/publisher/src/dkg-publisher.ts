@@ -42,6 +42,8 @@ export interface DKGPublisherConfig {
   keypair: Ed25519Keypair;
   publisherNodeIdentityId?: bigint;
   publisherAddress?: string;
+  /** Retryable publisher address resolver for adapter-backed signing. */
+  publisherAddressResolver?: () => Promise<string | undefined>;
   /** EVM private key for signing publish requests (hex string with 0x prefix) */
   publisherPrivateKey?: string;
   /**
@@ -253,7 +255,8 @@ export class DKGPublisher implements Publisher {
   private readonly sharedMemoryOwnedEntities: Map<string, Map<string, string>>;
   readonly knownBatchContextGraphs: Map<string, string>;
   private publisherNodeIdentityId: bigint;
-  private readonly publisherAddress?: string;
+  private publisherAddress?: string;
+  private readonly publisherAddressResolver?: () => Promise<string | undefined>;
   private readonly publisherWallet?: ethers.Wallet;
   /** Additional wallets that can provide receiver signatures. */
   private readonly additionalSignerWallets: ethers.Wallet[] = [];
@@ -268,6 +271,7 @@ export class DKGPublisher implements Publisher {
     this.eventBus = config.eventBus;
     this.keypair = config.keypair;
     this.publisherNodeIdentityId = config.publisherNodeIdentityId ?? 0n;
+    this.publisherAddressResolver = config.publisherAddressResolver;
 
     const configuredPublisherAddress = normalizePublisherAddress(config.publisherAddress);
     if (config.publisherPrivateKey) {
@@ -314,6 +318,12 @@ export class DKGPublisher implements Publisher {
   private requirePublisherAddress(operation: string): string {
     if (!this.publisherAddress) throw new PublisherWalletRequiredError(operation);
     return this.publisherAddress;
+  }
+
+  private async resolvePublisherAddress(): Promise<void> {
+    if (this.publisherAddress || !this.publisherAddressResolver) return;
+    const resolved = normalizePublisherAddress(await this.publisherAddressResolver());
+    if (resolved) this.publisherAddress = resolved;
   }
 
   // Local-only tentative publishes need a stable, non-zero UAL component even
@@ -1088,6 +1098,7 @@ export class DKGPublisher implements Publisher {
     const effectiveAccessPolicy = accessPolicy ?? (privateQuads.length > 0 ? 'ownerOnly' : 'public');
     const normalizedAllowedPeers = [...new Set((allowedPeers ?? []).map((p) => p.trim()).filter(Boolean))];
     const normalizedPublisherPeerId = publisherPeerId.trim();
+    await this.resolvePublisherAddress();
     const publisherSigner = this.getPublisherSigner();
     const publisherAddress = this.publisherAddress ?? this.localTentativePublisherAddress();
     const canAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherSigner !== undefined;
@@ -1694,7 +1705,11 @@ export class DKGPublisher implements Publisher {
       if (privateQuads.length > 0) rejectReservedSubjectPrefixes(privateQuads);
     }
     const ctx: OperationContext = operationCtx ?? createOperationContext('publish');
-    const publisherAddress = this.requirePublisherAddress('update');
+    await this.resolvePublisherAddress();
+    const localOnlyUpdate = this.chain.chainId === 'none';
+    const publisherAddress = this.publisherAddress ?? (
+      localOnlyUpdate ? this.localTentativePublisherAddress() : this.requirePublisherAddress('update')
+    );
     this.log.info(ctx, `Updating kcId=${kcId} with ${quads.length} triples`);
     const dataGraph = this.graphManager.dataGraphUri(contextGraphId);
 
@@ -1736,6 +1751,48 @@ export class DKGPublisher implements Publisher {
     }
     onPhase?.('prepare:merkle', 'end');
     onPhase?.('prepare', 'end');
+
+    const storeUpdatedQuads = async (): Promise<void> => {
+      onPhase?.('store', 'start');
+      for (const [rootEntity, publicQuads] of kaMap) {
+        await this.store.deleteByPattern({ graph: dataGraph, subject: rootEntity });
+        await this.store.deleteBySubjectPrefix(dataGraph, rootEntity + '/.well-known/genid/');
+        await this.privateStore.deletePrivateTriples(contextGraphId, rootEntity, options.subGraphName);
+
+        const normalized = publicQuads.map((q) => ({ ...q, graph: dataGraph }));
+        await this.store.insert(normalized);
+
+        const entityPrivateQuads = entityPrivateMap.get(rootEntity) ?? [];
+        if (entityPrivateQuads.length > 0) {
+          await this.privateStore.storePrivateTriples(contextGraphId, rootEntity, entityPrivateQuads, options.subGraphName);
+        }
+      }
+
+      try {
+        await updateMetaMerkleRoot(this.store, this.graphManager, contextGraphId, kcId, kcMerkleRoot);
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `Failed to sync _meta merkleRoot for kcId=${kcId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      onPhase?.('store', 'end');
+    };
+
+    if (localOnlyUpdate) {
+      this.log.warn(ctx, 'No chain configured — applying update locally and returning tentative result');
+      await storeUpdatedQuads();
+      const result: PublishResult = {
+        kcId,
+        ual: `did:dkg:${this.chain.chainId}/${publisherAddress}/${kcId}`,
+        merkleRoot: kcMerkleRoot,
+        kaManifest: manifestEntries,
+        status: 'tentative',
+        publicQuads: allSkolemizedQuads,
+      };
+      this.eventBus.emit(DKGEvent.KA_UPDATED, result);
+      return result;
+    }
 
     onPhase?.('chain', 'start');
     onPhase?.('chain:submit', 'start');
@@ -1876,30 +1933,7 @@ export class DKGPublisher implements Publisher {
     onPhase?.('chain:submit', 'end');
     onPhase?.('chain', 'end');
 
-    onPhase?.('store', 'start');
-    for (const [rootEntity, publicQuads] of kaMap) {
-      await this.store.deleteByPattern({ graph: dataGraph, subject: rootEntity });
-      await this.store.deleteBySubjectPrefix(dataGraph, rootEntity + '/.well-known/genid/');
-      await this.privateStore.deletePrivateTriples(contextGraphId, rootEntity, options.subGraphName);
-
-      const normalized = publicQuads.map((q) => ({ ...q, graph: dataGraph }));
-      await this.store.insert(normalized);
-
-      const entityPrivateQuads = entityPrivateMap.get(rootEntity) ?? [];
-      if (entityPrivateQuads.length > 0) {
-        await this.privateStore.storePrivateTriples(contextGraphId, rootEntity, entityPrivateQuads, options.subGraphName);
-      }
-    }
-
-    try {
-      await updateMetaMerkleRoot(this.store, this.graphManager, contextGraphId, kcId, kcMerkleRoot);
-    } catch (err) {
-      this.log.warn(
-        ctx,
-        `Failed to sync _meta merkleRoot for kcId=${kcId}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    onPhase?.('store', 'end');
+    await storeUpdatedQuads();
 
     const result: PublishResult = {
       kcId,

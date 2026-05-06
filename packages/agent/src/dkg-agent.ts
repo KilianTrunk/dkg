@@ -496,12 +496,16 @@ function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
 async function inferAdapterPublisherAddress(chain: ChainAdapter): Promise<string | undefined> {
   const signerAddresses = (chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
   if (typeof signerAddresses === 'function') {
-    const advertised = signerAddresses.call(chain);
-    if (Array.isArray(advertised)) {
-      for (const value of advertised) {
-        const address = normalizeAdapterPublisherAddress(value);
-        if (address) return address;
+    try {
+      const advertised = signerAddresses.call(chain);
+      if (Array.isArray(advertised)) {
+        for (const value of advertised) {
+          const address = normalizeAdapterPublisherAddress(value);
+          if (address) return address;
+        }
       }
+    } catch {
+      // Best-effort probe; the publisher resolver retries on later publish/update attempts.
     }
   }
 
@@ -723,16 +727,16 @@ export class DKGAgent {
     const node = new DKGNode(nodeConfig);
     const workspaceOwnedEntities = new Map<string, Map<string, string>>();
     const writeLocks = new Map<string, Promise<void>>();
-    const publisherAddress = config.publisherAddress ?? (
-      opKeys?.[0] ? undefined : await inferAdapterPublisherAddress(chain)
-    );
     const publisher = new DKGPublisher({
       store,
       chain,
       eventBus,
       keypair,
       publisherPrivateKey: opKeys?.[0],
-      publisherAddress,
+      publisherAddress: config.publisherAddress,
+      publisherAddressResolver: opKeys?.[0] || config.publisherAddress
+        ? undefined
+        : () => inferAdapterPublisherAddress(chain),
       sharedMemoryOwnedEntities: workspaceOwnedEntities,
       writeLocks,
     });

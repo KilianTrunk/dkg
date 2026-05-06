@@ -40,14 +40,31 @@ async function createAgent(chainAdapter: ChainAdapter, operationalKeys?: string[
   return { agent, store, chain: chainAdapter };
 }
 
-function hideOperationalPrivateKey(chain: ChainAdapter): ChainAdapter {
-  return new Proxy(chain, {
+function delayedAdapterPublisherAddress(chain: ChainAdapter, address: string): { chain: ChainAdapter; unlock: () => void } {
+  let unlocked = false;
+  return {
+    chain: new Proxy(chain, {
     get(target, prop, receiver) {
       if (prop === 'getOperationalPrivateKey') return undefined;
+      if (prop === 'getSignerAddresses') {
+        return () => {
+          if (!unlocked) throw new Error('signer address unavailable during startup');
+          return [address];
+        };
+      }
+      if (prop === 'signMessage') {
+        const sign = Reflect.get(target, prop, receiver) as (...args: unknown[]) => Promise<unknown>;
+        return async (...args: unknown[]) => {
+          if (!unlocked) throw new Error('signer locked during startup');
+          return sign.apply(target, args);
+        };
+      }
       const value = Reflect.get(target, prop, receiver);
       return typeof value === 'function' ? value.bind(target) : value;
     },
-  }) as ChainAdapter;
+    }) as ChainAdapter,
+    unlock: () => { unlocked = true; },
+  };
 }
 
 describe('v10 ACK provider wiring', () => {
@@ -78,13 +95,15 @@ describe('v10 ACK provider wiring', () => {
   });
 
   it('uses adapter-backed publisher signing when chainAdapter does not expose a private key', async () => {
-    const chain = hideOperationalPrivateKey(createEVMAdapter(HARDHAT_KEYS.CORE_OP));
+    const expectedAddress = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
+    const delayed = delayedAdapterPublisherAddress(createEVMAdapter(HARDHAT_KEYS.CORE_OP), expectedAddress);
+    const chain = delayed.chain;
     ({ agent } = await createAgent(chain));
 
     const cgId = 'adapter-backed-publisher-cg';
-    const expectedAddress = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
     await agent.createContextGraph({ id: cgId, name: 'Adapter-backed Publisher CG' });
     await agent.registerContextGraph(cgId, { callerAgentAddress: expectedAddress });
+    delayed.unlock();
 
     const result = await agent.publish(cgId, [
       { subject: 'urn:test:adapter-backed-agent', predicate: 'http://schema.org/name', object: '"Adapter backed"', graph: '' },

@@ -2092,10 +2092,11 @@ export class DKGPublisher implements Publisher {
           ];
           if (errorName && V10_DEFINITIVE_ERRORS.includes(errorName)) {
             this.log.warn(ctx, `V10 update rejected (${errorName}): ${v10Err instanceof Error ? v10Err.message : String(v10Err)}`);
-            if (!publisherAddress) throw v10Err;
+            const rejectedPublisherAddress = publisherAddress ?? this.publisherAddress;
+            if (!rejectedPublisherAddress) throw v10Err;
             earlyReturn = {
               kcId,
-              ual: `did:dkg:${this.chain.chainId}/${publisherAddress}/${kcId}`,
+              ual: `did:dkg:${this.chain.chainId}/${rejectedPublisherAddress}/${kcId}`,
               merkleRoot: kcMerkleRoot,
               kaManifest: manifestEntries,
               status: 'failed',

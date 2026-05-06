@@ -4,6 +4,7 @@ import {
   contextGraphPrivateUri,
   contextGraphSharedMemoryUri,
   contextGraphSharedMemoryMetaUri,
+  contextGraphSubGraphPrivateUri,
 } from '@origintrail-official/dkg-core';
 import type { EpcisQueryParams } from './types.js';
 
@@ -61,7 +62,9 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
     partition === 'swm'
       ? contextGraphSharedMemoryMetaUri(contextGraphId, params.subGraphName)
       : contextGraphMetaUri(contextGraphId, params.subGraphName);
-  const privateGraph = contextGraphPrivateUri(contextGraphId);
+  const privateGraph = params.subGraphName
+    ? contextGraphSubGraphPrivateUri(contextGraphId, params.subGraphName)
+    : contextGraphPrivateUri(contextGraphId);
 
   const wherePatterns: string[] = [];
   const filterClauses: string[] = [];

@@ -264,9 +264,11 @@ describe('buildEpcisQuery', () => {
 
     expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain>`);
     expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain/_meta>`);
-    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/_private>`);
+    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_private>`);
+    expect(finalizedSparql).not.toContain(`GRAPH <${DATA_GRAPH}/_private>`);
     expect(swmSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_shared_memory>`);
-    expect(swmSparql).toContain(`GRAPH <${DATA_GRAPH}/_private>`);
+    expect(swmSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_private>`);
+    expect(swmSparql).not.toContain(`GRAPH <${DATA_GRAPH}/_private>`);
   });
 
   it('applies representative filters outside the public/private source union', () => {

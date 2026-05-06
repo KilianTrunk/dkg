@@ -374,25 +374,17 @@ export class EVMChainAdapter implements ChainAdapter {
     return this.signerPool.find((signer) => signer.address.toLowerCase() === normalized);
   }
 
-  private async withSignerSelectionLock<T>(fn: () => Promise<T>): Promise<T> {
-    const previous = this.signerSelectionQueue;
-    let release!: () => void;
-    this.signerSelectionQueue = new Promise<void>((resolve) => { release = resolve; });
-    await previous;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
-  }
-
   /**
    * Pick the next signer in the pool that the on-chain ContextGraphs contract
    * authorizes for the target context graph. Falls back to round-robin only
    * when the auth surface is unavailable.
    */
   private async nextAuthorizedSigner(contextGraphId: bigint): Promise<Wallet> {
-    return this.withSignerSelectionLock(async () => {
+    const previousSelection = this.signerSelectionQueue;
+    let releaseSelection!: () => void;
+    this.signerSelectionQueue = new Promise<void>((resolve) => { releaseSelection = resolve; });
+    await previousSelection;
+    try {
       if (!this.contracts.contextGraphs) {
         return this.nextSigner();
       }
@@ -412,7 +404,9 @@ export class EVMChainAdapter implements ChainAdapter {
         `No authorized publisher wallet found in signer pool for context graph ${contextGraphId.toString()}. ` +
         'Ensure at least one configured wallet is permitted by on-chain publish authority.',
       );
-    });
+    } finally {
+      releaseSelection();
+    }
   }
 
   /**

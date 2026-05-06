@@ -501,16 +501,22 @@ function recoverCompactSigner(message: Uint8Array, compact: { r: Uint8Array; vs:
   return ethers.verifyMessage(message, signature);
 }
 
-function adapterHasOperationalPrivateKey(chain: ChainAdapter): boolean {
+function adapterOperationalPrivateKeyAddress(chain: ChainAdapter): string | undefined {
   const operationalKeyGetter = (chain as unknown as { getOperationalPrivateKey?: () => unknown })
     .getOperationalPrivateKey;
-  if (typeof operationalKeyGetter !== 'function') return false;
+  if (typeof operationalKeyGetter !== 'function') return undefined;
   try {
     const privateKey = operationalKeyGetter.call(chain);
-    return typeof privateKey === 'string' && privateKey.length > 0 && privateKeyAddress(privateKey) !== undefined;
+    return typeof privateKey === 'string' && privateKey.length > 0
+      ? privateKeyAddress(privateKey)
+      : undefined;
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+function adapterHasOperationalPrivateKey(chain: ChainAdapter): boolean {
+  return adapterOperationalPrivateKeyAddress(chain) !== undefined;
 }
 
 async function adapterGenericSignMessageMatchesAddress(
@@ -614,18 +620,8 @@ async function inferAdapterPublisherAddress(
   );
   if (signerAddress) return signerAddress;
 
-  const operationalKeyGetter = (chain as unknown as { getOperationalPrivateKey?: () => unknown })
-    .getOperationalPrivateKey;
-  if (typeof operationalKeyGetter === 'function') {
-    try {
-      const privateKey = operationalKeyGetter.call(chain);
-      if (typeof privateKey === 'string' && privateKey.length > 0) {
-        return normalizeAdapterPublisherAddress(new ethers.Wallet(privateKey).address);
-      }
-    } catch {
-      // Last-resort compatibility probe; fall through to adapter signatures.
-    }
-  }
+  const adapterOperationalAddress = adapterOperationalPrivateKeyAddress(chain);
+  if (adapterOperationalAddress) return adapterOperationalAddress;
 
   if (options?.includeGenericSignMessageProbe === false) return undefined;
   if (chain.chainId === 'none' || typeof chain.signMessage !== 'function') return undefined;
@@ -7300,6 +7296,8 @@ export class DKGAgent {
     } catch {
       // Local descriptive CG ids cannot be used as adapter context hints.
     }
+    // This mirrors the publisher resolver, including the adapter-only
+    // `getOperationalPrivateKey()` fallback used by custom ChainAdapters.
     return inferAdapterPublisherAddress(this.chain, publisherContextGraphId, {
       includeReservingPublisherProbe: false,
       includeGenericSignMessageProbe: false,

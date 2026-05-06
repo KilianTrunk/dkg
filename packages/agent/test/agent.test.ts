@@ -1341,6 +1341,28 @@ describe('DKGAgent ACK signer gating', () => {
     }
   });
 
+  it('uses getOperationalPrivateKey as curated registration authority for adapter-only publishers', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const chain = new OperationalKeyOnlyPublishChainAdapter(wallet);
+
+    const agent = await DKGAgent.create({
+      name: 'LegacyOperationalKeyRegistrationAuthority',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+    });
+
+    try {
+      const authority = await (agent as unknown as {
+        getChainPublishAuthorityAddress(contextGraphId?: string): Promise<string | undefined>;
+      }).getChainPublishAuthorityAddress('42');
+
+      expect(authority?.toLowerCase()).toBe(wallet.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
   it('keeps chainConfig.operationalKeys fallback when a custom adapter has no signer probes', async () => {
     const wallet = ethers.Wallet.createRandom();
     const chain = new ExternalOperationalKeyPublishChainAdapter(wallet.address);

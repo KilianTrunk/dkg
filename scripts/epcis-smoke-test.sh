@@ -815,7 +815,7 @@ except: print("")' 2>/dev/null)"
   if [ "$q8" = "yes" ]; then
     scenario_pass 8 "full allow-list payload visible on N2 (auto-pull triggered)"
   else
-    scenario_info 8 "allow-list payload not visible on N2 within ${N2_SYNC_TIMEOUT}s — receiver-side auto-pull from publisher is unimplemented in the integration branch (slice-04 caveat #3)"
+    scenario_info 8 "allow-list payload not visible on N2 within ${N2_SYNC_TIMEOUT}s — receiver-side auto-pull from publisher is not implemented yet"
   fi
 
   # ----- Scenario 9: SPARQL <cg>/_private on N3 (post allow-list) -----

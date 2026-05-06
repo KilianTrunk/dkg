@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { handleEventsQuery, EpcisQueryError, toEpcisEvent } from '../src/handlers.js';
 import type { QueryEngine } from '../src/types.js';
 
-const CONTEXT_GRAPH_ID = 'test-paranet';
+const CONTEXT_GRAPH_ID = 'test-cg';
 const BASE_PATH = '/api/epcis/events';
 
 interface QueryCall {
@@ -68,7 +68,7 @@ describe('handleEventsQuery', () => {
     expect(event.bizLocation).toEqual({ id: 'urn:epc:id:sgln:4012345.00001.0' });
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg>');
     expect(calls[0].opts).toEqual({ contextGraphId: CONTEXT_GRAPH_ID });
   });
 
@@ -286,9 +286,9 @@ describe('handleEventsQuery', () => {
       { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
     );
 
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet>');
-    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-paranet/_shared_memory>');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg/_shared_memory>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');
   });
 
   it('queries shared memory partition when finalized=false', async () => {
@@ -299,8 +299,8 @@ describe('handleEventsQuery', () => {
       { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
     );
 
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_shared_memory>');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/_shared_memory>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');
     expect(calls[0].sparql).toContain('dkg:privateDataAnchor "true"');
   });
 
@@ -323,7 +323,7 @@ describe('handleEventsQuery', () => {
     );
 
     expect(calls[0].sparql).toContain('dkg:privateDataAnchor "true"');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');
     expect(body.epcisBody.queryResults.resultsBody.eventList).toEqual([
       expect.objectContaining({
         type: 'ObjectEvent',
@@ -348,9 +348,9 @@ describe('handleEventsQuery', () => {
     // because some triplestores fail to bridge URI bindings across graph
     // contexts via FILTER and the anchored payload otherwise stays empty
     // on live data.
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_shared_memory>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/_shared_memory>');
     expect(calls[0].sparql).toContain('?event dkg:privateDataAnchor "true" .');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');
     expect(calls[0].sparql).not.toContain('FILTER(?event = ?root)');
   });
 
@@ -510,10 +510,10 @@ describe('handleEventsQuery — per-request sub-graph', () => {
       },
     );
 
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/research>');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/research/_private>');
-    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-paranet>');
-    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research/_private>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');
   });
 
   it('threads subGraphName into SPARQL graph URIs (finalized=false SWM partition)', async () => {
@@ -529,9 +529,9 @@ describe('handleEventsQuery — per-request sub-graph', () => {
       },
     );
 
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/research/_shared_memory>');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/research/_private>');
-    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-paranet/_shared_memory>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research/_shared_memory>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research/_private>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg/_shared_memory>');
   });
 
   it('falls back to root partition when subGraphName is omitted', async () => {
@@ -546,8 +546,8 @@ describe('handleEventsQuery — per-request sub-graph', () => {
       },
     );
 
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet>');
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet/_private>');
-    expect(calls[0].sparql).not.toContain('test-paranet/research');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');
+    expect(calls[0].sparql).not.toContain('test-cg/research');
   });
 });

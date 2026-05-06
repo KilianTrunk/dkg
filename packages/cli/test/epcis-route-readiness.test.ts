@@ -223,34 +223,6 @@ describe('EPCIS async capture publisher readiness', () => {
     ]);
   });
 
-  it('falls back to legacy epcis.paranetId when neither body nor epcis.contextGraphId is set', async () => {
-    const published: Array<{ contextGraphId: string }> = [];
-    const ctx = createContext({
-      req: createRequest({ epcisDocument: VALID_OBJECT_EVENT_DOC }),
-      config: {
-        epcis: { paranetId: 'legacy-paranet' },
-        publisher: { enabled: true },
-      } as RequestContext['config'],
-      agent: {
-        publishAsync: async (contextGraphId: string) => {
-          published.push({ contextGraphId });
-          return { captureID: 'capture-route-3' };
-        },
-      } as unknown as RequestContext['agent'],
-      publisherRuntime: {
-        walletIds: ['0xpublisher'],
-        runner: {},
-        publisher: {},
-        stop: async () => {},
-      } as unknown as RequestContext['publisherRuntime'],
-    });
-
-    await handleEpcisRoutes(ctx);
-
-    expect(ctx.res.statusCode).toBe(202);
-    expect(published).toEqual([{ contextGraphId: 'legacy-paranet' }]);
-  });
-
   it('returns 400 InvalidContent when neither body nor config supplies a contextGraphId', async () => {
     const ctx = createContext({
       req: createRequest({ epcisDocument: VALID_OBJECT_EVENT_DOC }),
@@ -408,22 +380,6 @@ describe('EPCIS events query route — per-request CG + sub-graph', () => {
     expect(ctx.res.statusCode).toBe(200);
     expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research/_shared_memory>');
     expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research/_private>');
-  });
-
-  it('falls back to legacy epcis.paranetId when neither query string nor epcis.contextGraphId is set', async () => {
-    const { agent, calls } = captureSparql();
-    const ctx = createGetContext('/api/epcis/events', {
-      agent,
-      config: {
-        epcis: { paranetId: 'legacy-paranet' },
-        publisher: { enabled: true },
-      } as RequestContext['config'],
-    });
-
-    await handleEpcisRoutes(ctx);
-
-    expect(ctx.res.statusCode).toBe(200);
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:legacy-paranet>');
   });
 
   it('returns 400 InvalidContent when neither query nor config supplies a contextGraphId', async () => {

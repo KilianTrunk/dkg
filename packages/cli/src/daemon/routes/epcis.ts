@@ -369,8 +369,8 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
       .searchParams;
 
     // Resolve target context graph: per-request query string field,
-    // otherwise fall back to epcis.contextGraphId, otherwise legacy
-    // paranetId. Validation symmetry with the capture route.
+    // otherwise fall back to epcis.contextGraphId. Validation
+    // symmetry with the capture route.
     const queryContextGraphId = searchParams.get("contextGraphId");
     let resolvedContextGraphId: string;
     if (queryContextGraphId !== null && queryContextGraphId !== "") {
@@ -383,12 +383,12 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
       }
       resolvedContextGraphId = queryContextGraphId;
     } else {
-      const fallback = config.epcis?.contextGraphId ?? config.epcis?.paranetId;
+      const fallback = config.epcis?.contextGraphId;
       if (!fallback) {
         return jsonResponse(res, 400, {
           error: "InvalidContent",
           message:
-            'Missing "contextGraphId": provide it in the query string or configure epcis.contextGraphId (or legacy epcis.paranetId)',
+            'Missing "contextGraphId": provide it in the query string or configure epcis.contextGraphId',
         });
       }
       resolvedContextGraphId = fallback;
@@ -487,7 +487,7 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
     }
 
     // Resolve target context graph: per-request body field, otherwise
-    // fall back to epcis.contextGraphId, otherwise legacy paranetId.
+    // fall back to epcis.contextGraphId.
     let captureContextGraphId: string;
     if (bodyContextGraphId !== undefined && bodyContextGraphId !== null) {
       if (typeof bodyContextGraphId !== "string") {
@@ -505,12 +505,12 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
       }
       captureContextGraphId = bodyContextGraphId;
     } else {
-      const fallback = config.epcis?.contextGraphId ?? config.epcis?.paranetId;
+      const fallback = config.epcis?.contextGraphId;
       if (!fallback) {
         return jsonResponse(res, 400, {
           error: "InvalidContent",
           message:
-            'Missing "contextGraphId": provide it in the request body or configure epcis.contextGraphId (or legacy epcis.paranetId)',
+            'Missing "contextGraphId": provide it in the request body or configure epcis.contextGraphId',
         });
       }
       captureContextGraphId = fallback;

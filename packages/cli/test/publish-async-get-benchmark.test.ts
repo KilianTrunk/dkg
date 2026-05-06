@@ -21,6 +21,7 @@ import {
 
 const originalFetch = globalThis.fetch;
 const originalDkgHome = process.env.DKG_HOME;
+const originalEsbenchPayloadSizes = process.env.DKG_ESBENCH_PAYLOAD_SIZES;
 
 type FocusedBenchmarkRecord = {
   baseline: unknown;
@@ -38,10 +39,21 @@ type EsbenchConfigForTest = {
   publishAsyncGetSuite: string;
 };
 
+type EsbenchSuiteForTest = {
+  default: {
+    params?: {
+      payloadSize?: string[];
+    };
+  };
+  GENERATED_PAYLOAD_SIZES: Array<{ label: string; bytes: number }>;
+};
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
   if (originalDkgHome === undefined) delete process.env.DKG_HOME;
   else process.env.DKG_HOME = originalDkgHome;
+  if (originalEsbenchPayloadSizes === undefined) delete process.env.DKG_ESBENCH_PAYLOAD_SIZES;
+  else process.env.DKG_ESBENCH_PAYLOAD_SIZES = originalEsbenchPayloadSizes;
 });
 
 describe('publish async get benchmark', () => {
@@ -55,7 +67,7 @@ describe('publish async get benchmark', () => {
       '--timeout-ms',
       '5000',
       '--payload-size',
-      '256',
+      '10kb',
       '--fixture',
       'minimal',
       '--output-format',
@@ -71,7 +83,7 @@ describe('publish async get benchmark', () => {
       repeat: 7,
       warmups: 2,
       timeoutMs: 5000,
-      payloadSizeBytes: 256,
+      payloadSizeBytes: 10 * 1024,
       fixture: 'minimal',
       outputFormat: 'ndjson',
       apiUrl: 'http://127.0.0.1:9200',
@@ -84,16 +96,23 @@ describe('publish async get benchmark', () => {
       DKG_BENCH_CONTEXT_GRAPH_ID: 'env-cg',
       DKG_BENCH_WARMUPS: '4',
       DKG_BENCH_OUTPUT_FORMAT: 'json',
-      DKG_BENCH_PAYLOAD_SIZE: '512',
+      DKG_BENCH_PAYLOAD_SIZE: '100kb',
     });
 
     expect(config).toMatchObject({
       contextGraphId: 'env-cg',
       repeat: 30,
       warmups: 4,
-      payloadSizeBytes: 512,
+      payloadSizeBytes: 100 * 1024,
       outputFormat: 'json',
     });
+  });
+
+  it('parses generated payload sizes with mb units', () => {
+    expect(parseBenchmarkArgs(['--context-graph-id', 'bench-cg', '--payload-size', '2mb'], {}).payloadSizeBytes)
+      .toBe(2 * 1024 * 1024);
+    expect(parseBenchmarkArgs(['--context-graph-id', 'bench-cg', '--payload-size', '200mb'], {}).payloadSizeBytes)
+      .toBe(200 * 1024 * 1024);
   });
 
   it('aggregates measured timings while excluding warmups', () => {
@@ -247,6 +266,19 @@ describe('publish async get benchmark', () => {
     expect(isLoopbackApiUrl('http://192.168.1.50:9200')).toBe(false);
   });
 
+  it('runs the ESBench suite across the generated payload-size matrix', async () => {
+    delete process.env.DKG_ESBENCH_PAYLOAD_SIZES;
+    const suite = await import('../../../bench/publish-async-get.bench.ts') as EsbenchSuiteForTest;
+
+    expect(suite.GENERATED_PAYLOAD_SIZES).toEqual([
+      { label: '10kb', bytes: 10 * 1024 },
+      { label: '100kb', bytes: 100 * 1024 },
+      { label: '2mb', bytes: 2 * 1024 * 1024 },
+      { label: '200mb', bytes: 200 * 1024 * 1024 },
+    ]);
+    expect(suite.default.params?.payloadSize).toEqual(['10kb', '100kb', '2mb', '200mb']);
+  });
+
   it('keeps ESBench focused HTML scenes aligned with payload-size params', async () => {
     const {
       filterResultByCase,
@@ -259,7 +291,7 @@ describe('publish async get benchmark', () => {
         {
           notes: ['not copied'],
           baseline: { type: 'Name', value: 'synchronous publish with finalization' },
-          paramDef: [['payloadSizeBytes', ['128', '1024']]],
+          paramDef: [['payloadSize', ['10kb', '100kb', '2mb', '200mb']]],
           scenes: [
             {
               'get/read retrieval': { time: [1] },
@@ -284,7 +316,7 @@ describe('publish async get benchmark', () => {
       ['upload payload to local working memory', 'bench/results/publish-async-get/working-memory-upload.html'],
       ['lift local working memory to shared working memory', 'bench/results/publish-async-get/working-to-shared-memory.html'],
     ]);
-    expect(record.paramDef).toEqual([['payloadSizeBytes', ['128', '1024']]]);
+    expect(record.paramDef).toEqual([['payloadSize', ['10kb', '100kb', '2mb', '200mb']]]);
     expect(record.baseline).toEqual({ type: 'Name', value: caseName });
     expect(record.notes).toEqual([]);
     expect(record.scenes).toHaveLength(2);

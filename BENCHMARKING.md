@@ -23,6 +23,10 @@ The ESBench suite measures focused memory-layer flows:
 - `upload payload to local working memory`
 - `lift local working memory to shared working memory`
 
+Each flow runs against generated payload sizes of `10kb`, `100kb`, `2mb`, and
+`200mb`. The labels use binary units: `1kb = 1024` bytes and `1mb = 1024 * 1024`
+bytes.
+
 Add new suites under `bench/**/*.bench.ts` as performance-sensitive paths become
 obvious.
 
@@ -40,6 +44,12 @@ Run benchmarks and write the raw result to `bench/results/latest.json`:
 pnpm bench
 ```
 
+Run a quick subset while iterating on benchmark wiring:
+
+```bash
+DKG_ESBENCH_PAYLOAD_SIZES=10kb pnpm bench
+```
+
 The root ESBench config is `esbench.config.mjs`. It was verified against ESBench `0.8.1`, whose CLI runs suites with `esbench --config <file>` and generates reports from saved result files with `esbench report <patterns...> --config <file>`.
 
 ## HTML Reports
@@ -49,6 +59,10 @@ Generate a benchmark run plus an interactive HTML report:
 ```bash
 pnpm bench:html
 ```
+
+The default run includes the `200mb` generated payload scene and is intentionally
+heavy. Use `DKG_ESBENCH_PAYLOAD_SIZES=10kb,100kb` for a faster local smoke run,
+or pass one of `10kb`, `100kb`, `2mb`, `200mb` to isolate a single size.
 
 The `bench:html` script sets both `ESBENCH_HTML=1` and
 `ESBENCH_PUBLISH_ASYNC_GET_HTML=1`, so the combined report and the focused

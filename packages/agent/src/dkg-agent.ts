@@ -7228,6 +7228,19 @@ export class DKGAgent {
   }
 
   private async getChainPublishAuthorityAddress(contextGraphId?: string): Promise<string | undefined> {
+    const configuredPublisherAddress = normalizeAdapterPublisherAddress(this.config.publisherAddress);
+    if (configuredPublisherAddress) return configuredPublisherAddress;
+
+    const legacyAdapterOperationalKey = this.config.chainConfig?.operationalKeys?.[0];
+    const legacyAdapterOperationalAddress = privateKeyAddress(legacyAdapterOperationalKey);
+    if (
+      this.config.chainAdapter &&
+      legacyAdapterOperationalAddress &&
+      !adapterAdvertisesPublisherSigner(this.chain)
+    ) {
+      return legacyAdapterOperationalAddress;
+    }
+
     let publisherContextGraphId: bigint | undefined;
     try {
       const parsed = BigInt(contextGraphId ?? '');

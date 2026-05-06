@@ -857,7 +857,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
   });
 
-  it('resolves adapter-managed update attribution from local confirmed metadata', async () => {
+  it('does not confirm adapter-managed updates from local metadata alone', async () => {
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);
     const store = new OxigraphStore();
@@ -906,9 +906,19 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     });
 
     expect(chain.capturedPublisherAddress).toBeUndefined();
-    expect(updated.status).toBe('confirmed');
-    expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
-    expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+    expect(updated.status).toBe('tentative');
+    expect(updated.onChainResult).toBeUndefined();
+    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/13$/);
+
+    const stored = await store.query(`
+      SELECT ?p ?o WHERE {
+        GRAPH <did:dkg:context-graph:1> {
+          <urn:test:adapter-managed-update-local-attribution> ?p ?o .
+        }
+      }
+    `);
+    expect(stored.type).toBe('bindings');
+    expect(stored.bindings.length).toBeGreaterThan(0);
   });
 
   it('keeps adapter-managed updates tentative when publisher attribution is unavailable', async () => {

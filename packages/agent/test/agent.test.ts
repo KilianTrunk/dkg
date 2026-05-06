@@ -1381,6 +1381,38 @@ describe('DKGAgent ACK signer gating', () => {
     }
   });
 
+  it('uses chainConfig fallback authority when generic signMessage is not the publish signer', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const unrelatedSigner = ethers.Wallet.createRandom();
+    const chain = new GenericSignMessageExternalOperationalKeyPublishChainAdapter(
+      wallet.address,
+      unrelatedSigner,
+    );
+
+    const agent = await DKGAgent.create({
+      name: 'GenericSignMessageRegistrationAuthority',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+      chainConfig: {
+        rpcUrl: 'http://127.0.0.1:0',
+        hubAddress: '0x00000000000000000000000000000000000000A1',
+        operationalKeys: [wallet.privateKey],
+      },
+    });
+
+    try {
+      const authority = await (agent as unknown as {
+        getChainPublishAuthorityAddress(contextGraphId?: string): Promise<string | undefined>;
+      }).getChainPublishAuthorityAddress('42');
+
+      expect(authority?.toLowerCase()).toBe(wallet.address.toLowerCase());
+      expect(authority?.toLowerCase()).not.toBe(unrelatedSigner.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
   it('uses a single-signer adapter instead of chainConfig.operationalKeys fallback', async () => {
     const adapterWallet = ethers.Wallet.createRandom();
     const staleChainConfigSigner = ethers.Wallet.createRandom();

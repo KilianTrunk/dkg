@@ -2164,8 +2164,7 @@ export class DKGPublisher implements Publisher {
         publicQuads: allSkolemizedQuads,
       };
     }
-    let effectivePublisherAddress = coercePublisherAddress(txResult.publisherAddress) ??
-      publisherAddress;
+    let effectivePublisherAddress = coercePublisherAddress(txResult.publisherAddress);
     if (!effectivePublisherAddress && typeof this.chain.getLatestMerkleRootPublisher === 'function') {
       try {
         effectivePublisherAddress = coercePublisherAddress(
@@ -2174,19 +2173,18 @@ export class DKGPublisher implements Publisher {
       } catch {
         // Some legacy adapters can submit updates but cannot report the
         // effective publisher. Refuse confirmed metadata below rather than
-        // inventing a publisher address that did not come from chain state.
+          // inventing a publisher address that did not come from chain state.
       }
     }
-    effectivePublisherAddress ??= await this.resolveKnownBatchPublisherAddress(contextGraphId, kcId);
     onPhase?.('chain:submit', 'end');
     onPhase?.('chain', 'end');
     if (!effectivePublisherAddress) {
-      const tentativePublisherAddress = this.localTentativePublisherAddress();
+      const tentativePublisherAddress = publisherAddress ?? this.localTentativePublisherAddress();
       this.log.warn(
         ctx,
         'Chain adapter returned a successful update without publisherAddress, and neither ' +
-        'getLatestMerkleRootPublisher() nor local KC metadata resolved a real publisher. ' +
-        'Applying local data update as tentative instead of writing synthetic confirmed attribution.',
+        'getLatestMerkleRootPublisher() nor the tx result resolved a chain publisher. ' +
+        'Applying local data update as tentative instead of confirming unproven attribution.',
       );
       await storeUpdatedQuads();
       const result: PublishResult = {

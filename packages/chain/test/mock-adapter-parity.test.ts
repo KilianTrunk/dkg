@@ -77,6 +77,8 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'getProvider',            // returns a JsonRpcProvider; mock has none
   'getSignerAddress',       // mock exposes `signerAddress` as a field
   'getSignerAddresses',     // pool not applicable to mock
+  'getAuthorizedPublisherAddress', // pool-specific signer selection; mock has one signerAddress
+  'signMessageAs',          // pool-specific wallet-key signing; mock has no adapter-held private keys
   'getOperationalPrivateKey', // mock has no wallet keys
   'getRequiredPublishTokenAmount', // TODO: missing on mock, cross-check below
   // TypeScript `private` is erased at runtime; these are adapter-internal
@@ -84,6 +86,7 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // ChainAdapter contract. They must remain EVM-only.
   'nextSigner',
   'nextAuthorizedSigner',
+  'findSignerByAddress',
   'walletKeyHash',
   'hasAdminPurpose',
   'hasOperationalPurpose',

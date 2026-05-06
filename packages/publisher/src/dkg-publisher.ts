@@ -286,9 +286,9 @@ export class DKGPublisher implements Publisher {
       // No private key supplied means no in-process publisher signing
       // capability. Keep an optional, validated address only for callers
       // that route signing through their ChainAdapter (e.g. adapter-backed
-      // or hardware-signer deployments). Publish still fails unless that
-      // address is backed by ChainAdapter.signMessage(); update can let the
-      // adapter select its signer from the configured signer pool.
+      // or hardware-signer deployments). Chain-backed publish still fails
+      // unless that address is backed by ChainAdapter.signMessage(); update
+      // can let the adapter select its signer from the configured signer pool.
       //
       // The previous behaviour generated an ephemeral `Wallet.createRandom()`
       // here whenever chain was enabled, which produced unverifiable
@@ -1088,8 +1088,9 @@ export class DKGPublisher implements Publisher {
     const effectiveAccessPolicy = accessPolicy ?? (privateQuads.length > 0 ? 'ownerOnly' : 'public');
     const normalizedAllowedPeers = [...new Set((allowedPeers ?? []).map((p) => p.trim()).filter(Boolean))];
     const normalizedPublisherPeerId = publisherPeerId.trim();
+    const publisherSigner = this.getPublisherSigner();
     const publisherAddress = this.publisherAddress ?? this.localTentativePublisherAddress();
-    const canAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && this.getPublisherSigner() !== undefined;
+    const canAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherSigner !== undefined;
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {
       throw new Error(
@@ -1102,6 +1103,10 @@ export class DKGPublisher implements Publisher {
     }
     if (effectiveAccessPolicy !== 'allowList' && normalizedAllowedPeers.length > 0) {
       throw new Error('Publish rejected: "allowedPeers" is only valid when accessPolicy is "allowList"');
+    }
+
+    if (this.chain.chainId !== 'none' && !publisherSigner) {
+      throw new PublisherWalletRequiredError('publish');
     }
 
     onPhase?.('prepare', 'start');

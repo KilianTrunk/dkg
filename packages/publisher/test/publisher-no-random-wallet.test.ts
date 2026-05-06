@@ -71,10 +71,10 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect((publisher as any).publisherAddress).toBeUndefined();
   });
 
-  it('publishes tentatively with a deterministic non-zero local address when no publisher address is configured', async () => {
+  it('publishes tentatively with a deterministic non-zero local address on no-chain publishes', async () => {
     const keypair = await generateEd25519Keypair();
     const chain = {
-      ...makeStubChain('test-evm-chain'),
+      ...makeStubChain('none'),
       getRequiredPublishTokenAmount: async () => {
         throw new Error('RPC unavailable');
       },
@@ -96,18 +96,18 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       }],
     });
 
-    const match = result.ual.match(/^did:dkg:test-evm-chain\/(0x[0-9a-fA-F]{40})\/t/);
+    const match = result.ual.match(/^did:dkg:none\/(0x[0-9a-fA-F]{40})\/t/);
     expect(result.status).toBe('tentative');
     expect(result.onChainResult).toBeUndefined();
     expect(match?.[1]).toBeDefined();
     expect(match![1]).not.toBe(ethers.ZeroAddress);
   });
 
-  it('publishes tentatively with an explicit non-zero publisherAddress when no on-chain signer is needed', async () => {
+  it('publishes tentatively with an explicit non-zero publisherAddress on no-chain publishes', async () => {
     const keypair = await generateEd25519Keypair();
     const publisherAddress = '0x000000000000000000000000000000000000dEaD';
     const chain = {
-      ...makeStubChain('test-evm-chain'),
+      ...makeStubChain('none'),
       getRequiredPublishTokenAmount: async () => {
         throw new Error('RPC unavailable');
       },
@@ -134,6 +134,26 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(result.status).toBe('tentative');
     expect(result.onChainResult).toBeUndefined();
     expect(result.ual.toLowerCase()).toContain(publisherAddress.toLowerCase());
+  });
+
+  it('rejects chain-backed publish without a publisher signer before local storage', async () => {
+    const keypair = await generateEd25519Keypair();
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain: makeStubChain('evm:31337'),
+      eventBus: new TypedEventBus(),
+      keypair,
+    });
+
+    await expect(publisher.publish({
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:evm-no-signer',
+        predicate: 'http://schema.org/name',
+        object: '"EvmNoSigner"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    })).rejects.toThrow(/publisherPrivateKey/);
   });
 
   it('rejects a zero publisherAddress instead of treating it as a sentinel', async () => {

@@ -453,6 +453,11 @@ export interface DKGAgentConfig {
   /** Private key for the V10 ACK signer. When omitted, falls back to chainConfig.operationalKeys[0]. */
   ackSignerKey?: string;
   /**
+   * Publisher EVM address used when publish signing is delegated to the
+   * ChainAdapter instead of an in-process publisherPrivateKey.
+   */
+  publisherAddress?: string;
+  /**
    * EVM chain configuration. If omitted, publishing won't have on-chain finality.
    * `adminPrivateKey` is the private key for the profile admin wallet used
    * only for profile/key-management transactions. Nodes may omit it when they
@@ -480,6 +485,154 @@ export interface DKGAgentConfig {
   contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;
   /** Durable local cache for nodes/agents known to be members of a context graph. */
   contextGraphMembershipStore?: ContextGraphMembershipStore;
+}
+
+function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !ethers.isAddress(value)) return undefined;
+  const address = ethers.getAddress(value);
+  return address === ethers.ZeroAddress ? undefined : address;
+}
+
+function recoverCompactSigner(message: Uint8Array, compact: { r: Uint8Array; vs: Uint8Array }): string {
+  const signature = ethers.Signature.from({
+    r: ethers.hexlify(compact.r),
+    yParityAndS: ethers.hexlify(compact.vs),
+  }).serialized;
+  return ethers.verifyMessage(message, signature);
+}
+
+function adapterOperationalPrivateKeyAddress(chain: ChainAdapter): string | undefined {
+  const operationalKeyGetter = (chain as unknown as { getOperationalPrivateKey?: () => unknown })
+    .getOperationalPrivateKey;
+  if (typeof operationalKeyGetter !== 'function') return undefined;
+  try {
+    const privateKey = operationalKeyGetter.call(chain);
+    return typeof privateKey === 'string' && privateKey.length > 0
+      ? privateKeyAddress(privateKey)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function adapterHasOperationalPrivateKey(chain: ChainAdapter): boolean {
+  return adapterOperationalPrivateKeyAddress(chain) !== undefined;
+}
+
+async function adapterGenericSignMessageMatchesAddress(
+  chain: ChainAdapter,
+  expectedAddress: string,
+): Promise<boolean> {
+  if (chain.chainId === 'none' || typeof chain.signMessage !== 'function') return false;
+  const normalized = normalizeAdapterPublisherAddress(expectedAddress);
+  if (!normalized) return false;
+
+  try {
+    const challenge = ethers.getBytes(ethers.id(`dkg-agent:chain-signer-probe:${normalized.toLowerCase()}`));
+    const compact = await chain.signMessage(challenge);
+    const recovered = normalizeAdapterPublisherAddress(recoverCompactSigner(challenge, compact));
+    return recovered?.toLowerCase() === normalized.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+async function adapterAdvertisesPublisherSigner(chain: ChainAdapter): Promise<boolean> {
+  const hasReservingOrMultiAddressProbe = typeof chain.getAuthorizedPublisherAddress === 'function' ||
+    typeof (chain as unknown as { getSignerAddresses?: unknown }).getSignerAddresses === 'function';
+  const hasSingleAddressProbe = typeof (chain as unknown as { getSignerAddress?: unknown }).getSignerAddress === 'function' ||
+    Boolean(normalizeAdapterPublisherAddress((chain as unknown as { signerAddress?: unknown }).signerAddress));
+  const hasAnyAddressProbe = hasReservingOrMultiAddressProbe || hasSingleAddressProbe;
+
+  if (typeof chain.signMessageAs === 'function') return hasAnyAddressProbe;
+  if (adapterHasOperationalPrivateKey(chain)) return true;
+  if (typeof chain.signMessage !== 'function') return false;
+
+  const advertisedAddress = await inferAdapterPublisherAddress(chain, undefined, {
+    includeReservingPublisherProbe: false,
+    includeGenericSignMessageProbe: false,
+  });
+  if (!advertisedAddress) return false;
+  return adapterGenericSignMessageMatchesAddress(chain, advertisedAddress);
+}
+
+function privateKeyAddress(privateKey: string | undefined): string | undefined {
+  if (!privateKey) return undefined;
+  try {
+    return normalizeAdapterPublisherAddress(new ethers.Wallet(privateKey).address);
+  } catch {
+    return undefined;
+  }
+}
+
+async function inferAdapterPublisherAddress(
+  chain: ChainAdapter,
+  contextGraphId?: bigint,
+  options?: {
+    includeReservingPublisherProbe?: boolean;
+    includeGenericSignMessageProbe?: boolean;
+  },
+): Promise<string | undefined> {
+  if (
+    options?.includeReservingPublisherProbe !== false &&
+    contextGraphId !== undefined &&
+    typeof chain.getAuthorizedPublisherAddress === 'function'
+  ) {
+    try {
+      const address = normalizeAdapterPublisherAddress(
+        await chain.getAuthorizedPublisherAddress(contextGraphId),
+      );
+      if (address) return address;
+    } catch {
+      // Best-effort probe; the publisher resolver retries on later publish/update attempts.
+    }
+  }
+
+  const signerAddressGetter = (chain as unknown as { getSignerAddress?: () => unknown }).getSignerAddress;
+  if (typeof signerAddressGetter === 'function') {
+    try {
+      const address = normalizeAdapterPublisherAddress(
+        await Promise.resolve(signerAddressGetter.call(chain)),
+      );
+      if (address) return address;
+    } catch {
+      // Best-effort probe; fall through to broader adapter surfaces.
+    }
+  }
+
+  const signerAddresses = (chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
+  if (typeof signerAddresses === 'function') {
+    try {
+      const advertised = await Promise.resolve(signerAddresses.call(chain));
+      if (Array.isArray(advertised)) {
+        for (const value of advertised) {
+          const address = normalizeAdapterPublisherAddress(value);
+          if (address) return address;
+        }
+      }
+    } catch {
+      // Best-effort probe; the publisher resolver retries on later publish/update attempts.
+    }
+  }
+
+  const signerAddress = normalizeAdapterPublisherAddress(
+    (chain as unknown as { signerAddress?: unknown }).signerAddress,
+  );
+  if (signerAddress) return signerAddress;
+
+  const adapterOperationalAddress = adapterOperationalPrivateKeyAddress(chain);
+  if (adapterOperationalAddress) return adapterOperationalAddress;
+
+  if (options?.includeGenericSignMessageProbe === false) return undefined;
+  if (chain.chainId === 'none' || typeof chain.signMessage !== 'function') return undefined;
+
+  try {
+    const challenge = ethers.getBytes(ethers.id('dkg-agent:publisher-address-probe'));
+    const compact = await chain.signMessage(challenge);
+    return normalizeAdapterPublisherAddress(recoverCompactSigner(challenge, compact));
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -680,12 +833,31 @@ export class DKGAgent {
     const node = new DKGNode(nodeConfig);
     const workspaceOwnedEntities = new Map<string, Map<string, string>>();
     const writeLocks = new Map<string, Promise<void>>();
+    const legacyAdapterOperationalKey = opKeys?.[0];
+    const legacyAdapterOperationalAddress = privateKeyAddress(legacyAdapterOperationalKey);
+    const configuredPublisherAddress = normalizeAdapterPublisherAddress(config.publisherAddress);
+    const publisherAddressMatchesLegacyKey = Boolean(
+      configuredPublisherAddress &&
+      legacyAdapterOperationalAddress &&
+      configuredPublisherAddress.toLowerCase() === legacyAdapterOperationalAddress.toLowerCase(),
+    );
+    const adapterCanPublishFromAdvertisedSigner = await adapterAdvertisesPublisherSigner(chain);
+    const useLegacyAdapterOperationalKeyFallback = Boolean(
+      config.chainAdapter &&
+      legacyAdapterOperationalKey &&
+      !adapterCanPublishFromAdvertisedSigner &&
+      (!configuredPublisherAddress || publisherAddressMatchesLegacyKey),
+    );
     const publisher = new DKGPublisher({
       store,
       chain,
       eventBus,
       keypair,
-      publisherPrivateKey: opKeys?.[0],
+      publisherPrivateKey: useLegacyAdapterOperationalKeyFallback ? legacyAdapterOperationalKey : undefined,
+      publisherAddress: config.publisherAddress,
+      publisherAddressResolver: config.publisherAddress || useLegacyAdapterOperationalKeyFallback
+        ? undefined
+        : (contextGraphId?: bigint) => inferAdapterPublisherAddress(chain, contextGraphId),
       sharedMemoryOwnedEntities: workspaceOwnedEntities,
       writeLocks,
     });
@@ -4376,7 +4548,7 @@ export class DKGAgent {
       );
     }
     const publishAuthority = publishPolicy === EVM_PUBLISH_CURATED
-      ? this.getChainPublishAuthorityAddress()
+      ? await this.getChainPublishAuthorityAddress(id)
       : undefined;
     if (
       publishPolicy === EVM_PUBLISH_CURATED
@@ -7103,16 +7275,33 @@ export class DKGAgent {
       && ownerAddress.toLowerCase() === this.defaultAgentAddress.toLowerCase();
   }
 
-  private getChainPublishAuthorityAddress(): string | undefined {
-    const chainWithSigner = this.chain as unknown as {
-      getSignerAddress?: () => string;
-      signerAddress?: string;
-    };
-    const rawAddress = chainWithSigner.getSignerAddress?.() ?? chainWithSigner.signerAddress;
-    if (rawAddress && ethers.isAddress(rawAddress)) {
-      return ethers.getAddress(rawAddress);
+  private async getChainPublishAuthorityAddress(contextGraphId?: string): Promise<string | undefined> {
+    const configuredPublisherAddress = normalizeAdapterPublisherAddress(this.config.publisherAddress);
+    if (configuredPublisherAddress) return configuredPublisherAddress;
+
+    const legacyAdapterOperationalKey = this.config.chainConfig?.operationalKeys?.[0];
+    const legacyAdapterOperationalAddress = privateKeyAddress(legacyAdapterOperationalKey);
+    if (
+      this.config.chainAdapter &&
+      legacyAdapterOperationalAddress &&
+      !(await adapterAdvertisesPublisherSigner(this.chain))
+    ) {
+      return legacyAdapterOperationalAddress;
     }
-    return undefined;
+
+    let publisherContextGraphId: bigint | undefined;
+    try {
+      const parsed = BigInt(contextGraphId ?? '');
+      if (parsed > 0n) publisherContextGraphId = parsed;
+    } catch {
+      // Local descriptive CG ids cannot be used as adapter context hints.
+    }
+    // This mirrors the publisher resolver, including the adapter-only
+    // `getOperationalPrivateKey()` fallback used by custom ChainAdapters.
+    return inferAdapterPublisherAddress(this.chain, publisherContextGraphId, {
+      includeReservingPublisherProbe: false,
+      includeGenericSignMessageProbe: false,
+    });
   }
 
   /**

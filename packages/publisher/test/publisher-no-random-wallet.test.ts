@@ -828,6 +828,33 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 
+  it('uses configured publisherAddress as update fallback when chain state and metadata miss', async () => {
+    const keypair = await generateEd25519Keypair();
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new AdapterManagedUpdateChain(wallet.address);
+    const publisher = new DKGPublisher({
+      store: new OxigraphStore(),
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherAddress: wallet.address,
+    });
+
+    const updated = await publisher.update(99n, {
+      contextGraphId: '1',
+      quads: [{
+        subject: 'urn:test:update-configured-publisher-fallback',
+        predicate: 'http://schema.org/name',
+        object: '"ConfiguredPublisherFallback"',
+        graph: 'did:dkg:context-graph:1',
+      }],
+    });
+
+    expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+    expect(updated.status).toBe('confirmed');
+    expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
   it('lets adapter-managed updates select their signer without local address discovery', async () => {
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);

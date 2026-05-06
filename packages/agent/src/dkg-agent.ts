@@ -493,7 +493,45 @@ function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
   return address === ethers.ZeroAddress ? undefined : address;
 }
 
-function adapterAdvertisesPublisherSigner(chain: ChainAdapter): boolean {
+function recoverCompactSigner(message: Uint8Array, compact: { r: Uint8Array; vs: Uint8Array }): string {
+  const signature = ethers.Signature.from({
+    r: ethers.hexlify(compact.r),
+    yParityAndS: ethers.hexlify(compact.vs),
+  }).serialized;
+  return ethers.verifyMessage(message, signature);
+}
+
+function adapterHasOperationalPrivateKey(chain: ChainAdapter): boolean {
+  const operationalKeyGetter = (chain as unknown as { getOperationalPrivateKey?: () => unknown })
+    .getOperationalPrivateKey;
+  if (typeof operationalKeyGetter !== 'function') return false;
+  try {
+    const privateKey = operationalKeyGetter.call(chain);
+    return typeof privateKey === 'string' && privateKey.length > 0 && privateKeyAddress(privateKey) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+async function adapterGenericSignMessageMatchesAddress(
+  chain: ChainAdapter,
+  expectedAddress: string,
+): Promise<boolean> {
+  if (chain.chainId === 'none' || typeof chain.signMessage !== 'function') return false;
+  const normalized = normalizeAdapterPublisherAddress(expectedAddress);
+  if (!normalized) return false;
+
+  try {
+    const challenge = ethers.getBytes(ethers.id(`dkg-agent:chain-signer-probe:${normalized.toLowerCase()}`));
+    const compact = await chain.signMessage(challenge);
+    const recovered = normalizeAdapterPublisherAddress(recoverCompactSigner(challenge, compact));
+    return recovered?.toLowerCase() === normalized.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+async function adapterAdvertisesPublisherSigner(chain: ChainAdapter): Promise<boolean> {
   const hasReservingOrMultiAddressProbe = typeof chain.getAuthorizedPublisherAddress === 'function' ||
     typeof (chain as unknown as { getSignerAddresses?: unknown }).getSignerAddresses === 'function';
   const hasSingleAddressProbe = typeof (chain as unknown as { getSignerAddress?: unknown }).getSignerAddress === 'function' ||
@@ -501,9 +539,15 @@ function adapterAdvertisesPublisherSigner(chain: ChainAdapter): boolean {
   const hasAnyAddressProbe = hasReservingOrMultiAddressProbe || hasSingleAddressProbe;
 
   if (typeof chain.signMessageAs === 'function') return hasAnyAddressProbe;
-  return !hasReservingOrMultiAddressProbe &&
-    hasSingleAddressProbe &&
-    typeof chain.signMessage === 'function';
+  if (adapterHasOperationalPrivateKey(chain)) return true;
+  if (typeof chain.signMessage !== 'function') return false;
+
+  const advertisedAddress = await inferAdapterPublisherAddress(chain, undefined, {
+    includeReservingPublisherProbe: false,
+    includeGenericSignMessageProbe: false,
+  });
+  if (!advertisedAddress) return false;
+  return adapterGenericSignMessageMatchesAddress(chain, advertisedAddress);
 }
 
 function privateKeyAddress(privateKey: string | undefined): string | undefined {
@@ -589,11 +633,7 @@ async function inferAdapterPublisherAddress(
   try {
     const challenge = ethers.getBytes(ethers.id('dkg-agent:publisher-address-probe'));
     const compact = await chain.signMessage(challenge);
-    const signature = ethers.Signature.from({
-      r: ethers.hexlify(compact.r),
-      yParityAndS: ethers.hexlify(compact.vs),
-    }).serialized;
-    return normalizeAdapterPublisherAddress(ethers.verifyMessage(challenge, signature));
+    return normalizeAdapterPublisherAddress(recoverCompactSigner(challenge, compact));
   } catch {
     return undefined;
   }
@@ -805,10 +845,11 @@ export class DKGAgent {
       legacyAdapterOperationalAddress &&
       configuredPublisherAddress.toLowerCase() === legacyAdapterOperationalAddress.toLowerCase(),
     );
+    const adapterCanPublishFromAdvertisedSigner = await adapterAdvertisesPublisherSigner(chain);
     const useLegacyAdapterOperationalKeyFallback = Boolean(
       config.chainAdapter &&
       legacyAdapterOperationalKey &&
-      !adapterAdvertisesPublisherSigner(chain) &&
+      !adapterCanPublishFromAdvertisedSigner &&
       (!configuredPublisherAddress || publisherAddressMatchesLegacyKey),
     );
     const publisher = new DKGPublisher({
@@ -7247,7 +7288,7 @@ export class DKGAgent {
     if (
       this.config.chainAdapter &&
       legacyAdapterOperationalAddress &&
-      !adapterAdvertisesPublisherSigner(this.chain)
+      !(await adapterAdvertisesPublisherSigner(this.chain))
     ) {
       return legacyAdapterOperationalAddress;
     }

@@ -284,6 +284,28 @@ class MultiSignerGenericSignMessagePublishChainAdapter extends ExternalOperation
   }
 }
 
+class SingleAddressMismatchedGenericSignMessagePublishChainAdapter extends ExternalOperationalKeyPublishChainAdapter {
+  constructor(
+    expectedPublisherAddress: string,
+    private readonly advertisedSigner: ethers.Wallet,
+    private readonly genericSigner: ethers.Wallet,
+  ) {
+    super(expectedPublisherAddress);
+  }
+
+  getSignerAddress(): string {
+    return this.advertisedSigner.address;
+  }
+
+  async signMessage(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const sig = ethers.Signature.from(await this.genericSigner.signMessage(messageHash));
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+}
+
 class SingleSignerAdapterPublishChainAdapter extends ExternalOperationalKeyPublishChainAdapter {
   constructor(private readonly adapterWallet: ethers.Wallet) {
     super(adapterWallet.address);
@@ -1501,6 +1523,50 @@ describe('DKGAgent ACK signer gating', () => {
       expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
       expect(chain.capturedPublisherAddress?.toLowerCase()).not.toBe(genericSigner.address.toLowerCase());
       expect(chain.capturedPublisherAddress?.toLowerCase()).not.toBe(advertisedSigner.address.toLowerCase());
+      expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('keeps chainConfig.operationalKeys fallback when single-address adapter signMessage uses another key', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const advertisedSigner = ethers.Wallet.createRandom();
+    const genericSigner = ethers.Wallet.createRandom();
+    const chain = new SingleAddressMismatchedGenericSignMessagePublishChainAdapter(
+      wallet.address,
+      advertisedSigner,
+      genericSigner,
+    );
+
+    const agent = await DKGAgent.create({
+      name: 'SingleAddressMismatchedGenericSignMessagePublisher',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      chainAdapter: chain,
+      chainConfig: {
+        rpcUrl: 'http://127.0.0.1:0',
+        hubAddress: '0x00000000000000000000000000000000000000A1',
+        operationalKeys: [wallet.privateKey],
+      },
+    });
+
+    try {
+      agent.publisher.setIdentityId(1n);
+      const result = await agent.publisher.publish({
+        contextGraphId: '42',
+        quads: [{
+          subject: 'urn:test:agent-single-address-mismatched-generic-sign-message',
+          predicate: 'http://schema.org/name',
+          object: '"SingleAddressMismatchedGenericSignMessage"',
+          graph: 'did:dkg:context-graph:42',
+        }],
+      });
+
+      expect(result.status).toBe('confirmed');
+      expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
+      expect(chain.capturedPublisherAddress?.toLowerCase()).not.toBe(advertisedSigner.address.toLowerCase());
+      expect(chain.capturedPublisherAddress?.toLowerCase()).not.toBe(genericSigner.address.toLowerCase());
       expect(result.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
     } finally {
       await agent.stop().catch(() => {});

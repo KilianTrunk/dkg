@@ -1973,6 +1973,12 @@ export class DKGPublisher implements Publisher {
         options.targetMetaGraphUri,
       );
     }
+    if (!resolvedPublisherAddress && !localOnlyUpdate) {
+      resolvedPublisherAddress = await this.resolvePublisherAddress(undefined, {
+        includeReservingPublisherProbe: false,
+        includeGenericSignMessageProbe: false,
+      });
+    }
     const publisherAddress = resolvedPublisherAddress ?? (
       localOnlyUpdate ? this.localTentativePublisherAddress() : undefined
     );

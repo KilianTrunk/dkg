@@ -591,6 +591,13 @@ export class ApiClient {
     });
   }
 
+  async createSubGraph(contextGraphId: string, subGraphName: string): Promise<{
+    created: string;
+    contextGraphId: string;
+  }> {
+    return this.post('/api/sub-graph/create', { contextGraphId, subGraphName });
+  }
+
   async registerContextGraph(id: string, opts?: {
     /** @deprecated V10 ContextGraphs registration ignores metadata reveal. */
     revealOnChain?: boolean;

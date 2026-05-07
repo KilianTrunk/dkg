@@ -912,15 +912,23 @@ export async function mcpSetupAction(
   // GUI clients' lookup chain.
   const expectedEntry = canonicalEntry(context, monorepoRoot);
 
-  // Codex Round-7 Fix 11: surface the exact command + args that
-  // will be persisted into client configs. The `--installed` /
-  // `--monorepo` flags only govern the bootstrap home — the
-  // registered binary is always whichever CLI is currently
-  // running. Logging it here lets operators verify before any
-  // client write happens; if the path doesn't match expectation,
-  // re-invoke with the intended CLI binary.
+  // Codex Round-7 Fix 11 + Round-8 Fix 13: surface the exact
+  // command + args that will be persisted into client configs.
+  // The `--installed` / `--monorepo` flags only govern the
+  // bootstrap home — the registered binary is always whichever
+  // CLI is currently running. Logging it here lets operators
+  // verify before any client write happens.
+  //
+  // Routed to STDERR (not console.log → stdout) because this
+  // line runs BEFORE the `--print-only` early return, and
+  // `dkg mcp setup --print-only` MUST emit a single canonical
+  // JSON document on stdout for `… | jq …` and redirect-into-
+  // config workflows to work. Same convention as the VSCode
+  // disambiguation note (Round-2 Bug B): operator advisories on
+  // stderr; data on stdout. Round-7 originally used console.log
+  // and broke --print-only stdout purity for the second time.
   const entryArgs = (expectedEntry.args as string[]).join(' ');
-  console.log(`[setup] Registering CLI: ${expectedEntry.command} ${entryArgs}`);
+  process.stderr.write(`[setup] Registering CLI: ${expectedEntry.command} ${entryArgs}\n`);
 
   if (printOnly) {
     const block = {
@@ -970,31 +978,35 @@ export async function mcpSetupAction(
   // duration of this action overrides the package-path-based auto-
   // detection inside adapter-openclaw's `dkgDir()` and dkg-core's
   // daemon-lifecycle, keeping all four flows aligned.
-  // Codex Round-5 Fix 6: when `--monorepo` was explicitly forced AND
-  // a monorepo root was located, isolate to `~/.dkg-dev`
-  // unconditionally — bypass `resolveDkgConfigHome`'s configExists
-  // short-circuit. The flag's contract is "isolate dev state from
-  // installed state"; pre-fix, a user with an existing
-  // `~/.dkg/config.{json,yaml}` who passed `--monorepo` would still
-  // bootstrap against the installed home (since the helper falls
-  // back to `~/.dkg` when a config exists), mixing dev and installed
-  // state — exactly the contract `--monorepo` is meant to break.
-  // Auto-detect mode (no flag) keeps the existing configExists
-  // semantics so users with a global install aren't accidentally
-  // redirected.
-  const dkgDirPath = forcedContext === 'monorepo' && monorepoRoot
-    ? join(homedir(), '.dkg-dev')
-    : deps.resolveDkgConfigHome({ isDkgMonorepo: context === 'monorepo' });
-  // Codex Round-3 Fix 3: save+restore `DKG_HOME` around the rest of
-  // the action body. Pre-fix the env mutation was a permanent global
-  // side effect — a long-lived process invoking `mcpSetupAction`
-  // (e.g. an embedding test runner; a script that calls setup more
-  // than once with different contexts; the action throwing midway)
-  // would leak the override into unrelated downstream code that
-  // also reads `DKG_HOME`. Wrap in try/finally so the env var is
-  // restored on both throw AND normal exit, and so two sequential
-  // calls don't bleed state.
+  // Codex Round-3 Fix 3 + Round-8 Fix 14: capture the operator's
+  // pre-existing `DKG_HOME` BEFORE our own mutation — both for
+  // try/finally restore (Round-3 Fix 3) AND for env-precedence
+  // priority (Round-8 Fix 14). DKG_HOME is the highest-precedence
+  // operator override; it MUST win over the `--monorepo` bypass and
+  // over the auto-detect fallback. Pre-Fix-14 the `--monorepo`
+  // branch ignored env entirely, so an operator with `DKG_HOME` set
+  // who passed `--monorepo` would have setup state land in
+  // `~/.dkg-dev` while the rest of the CLI (every other downstream
+  // call into `resolveDkgConfigHome` / `dkgDir()`) honoured the
+  // env override — splitting state across two homes.
   const previousDkgHome = process.env.DKG_HOME;
+
+  // dkgDirPath cascade (highest priority first):
+  //   1. `previousDkgHome` (operator-set DKG_HOME) — wins always.
+  //   2. `--monorepo` bypass (Round-5 Fix 6) — explicit dev-isolation
+  //      contract; bypasses configExists short-circuit but defers
+  //      to env override above.
+  //   3. `resolveDkgConfigHome` auto-detect — respects configExists
+  //      so global-install users on incidental monorepo cwd aren't
+  //      silently redirected.
+  let dkgDirPath: string;
+  if (previousDkgHome) {
+    dkgDirPath = previousDkgHome;
+  } else if (forcedContext === 'monorepo' && monorepoRoot) {
+    dkgDirPath = join(homedir(), '.dkg-dev');
+  } else {
+    dkgDirPath = deps.resolveDkgConfigHome({ isDkgMonorepo: context === 'monorepo' });
+  }
   process.env.DKG_HOME = dkgDirPath;
   try {
   const yamlPath = join(dkgDirPath, 'config.yaml');
@@ -1171,8 +1183,34 @@ export async function mcpSetupAction(
     return;
   }
 
-  const states = clients.map((c) => classify(c, expectedEntry));
+  // Codex Round-8 Fix 15: per-client classify error isolation.
+  // Pre-fix, a malformed config in any one detected client (e.g. a
+  // truncated VSCode `Code/User/mcp.json`, a broken Cline
+  // `cline_mcp_settings.json`) would throw out of `classify(...)`
+  // and abort the entire setup before other clients were even
+  // touched. This is especially load-bearing for VSCode/Cline,
+  // whose dirname-heuristic detection is broad enough to flag any
+  // `Code/User/` directory as a candidate even when Copilot Chat
+  // / Cline isn't actually installed.
+  //
+  // Fixed: track classify failures alongside states. On failure,
+  // emit a stderr warning, mark the target as failed, and force
+  // the planner below to `skip` it so no write is attempted on a
+  // client we couldn't read. Other clients continue unaffected.
+  const classifyFailed = new Set<string>();
+  const states: ClientState[] = clients.map((c) => {
+    try {
+      return classify(c, expectedEntry);
+    } catch (err: any) {
+      process.stderr.write(
+        `[setup] WARNING: ${c.name} classify failed (${err?.message ?? err}); skipping this client.\n`,
+      );
+      classifyFailed.add(c.name);
+      return { target: c, state: 'not-registered', current: null };
+    }
+  });
   const planned: PlannedItem[] = states.map((s) => {
+    if (classifyFailed.has(s.target.name)) return { s, action: 'skip' };
     if (force) return { s, action: 'refresh' };
     if (s.state === 'not-registered') return { s, action: 'register' };
     if (s.state === 'stale') return { s, action: 'refresh' };
@@ -1231,8 +1269,21 @@ export async function mcpSetupAction(
         writeRegistration(s.target, expectedEntry);
         console.log(`  ${action === 'register' ? 'Registered' : 'Refreshed'} ${s.target.name} → ${s.target.displayPath}`);
       } catch (err: any) {
-        console.error(`  Failed to write ${s.target.displayPath}: ${err?.message ?? err}`);
-        throw err;
+        // Codex Round-8 Fix 15: per-client write error isolation.
+        // Pre-fix this `throw err` aborted the entire setup on the
+        // first per-client write failure — every subsequent client
+        // (and step 5's verification probe) was skipped. Operators
+        // hitting a permissions issue on one client config (e.g.
+        // VSCode's `Code/User/mcp.json` owned by root after a
+        // previous sudo run) would have to fix that one file by
+        // hand before any other registration could be written.
+        // Fixed: emit a stderr warning and continue with the rest
+        // of the writes loop. The other clients still get
+        // registered; the operator sees the failed-client warning
+        // and can address it separately.
+        process.stderr.write(
+          `[setup] WARNING: ${s.target.name} write failed (${err?.message ?? err}); other clients still attempted.\n`,
+        );
       }
     }
   }

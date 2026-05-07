@@ -40,6 +40,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
   let logSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
+  let stderrSilencer: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     tmpHome = mkdtempSync(join(tmpdir(), 'mcp-setup-test-'));
@@ -69,6 +70,13 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Codex Round-8 Fix 13: the "Registering CLI:" log + Round-2
+    // Bug B's VSCode advisory + Round-8 Fix 15's per-client
+    // failure warnings all go to stderr now. Silence them by
+    // default so the test reporter stays readable. Tests that
+    // need to assert on stderr re-spy after entering the test body
+    // (the overlap is harmless — vi resolves the most-recent spy).
+    stderrSilencer = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
   });
 
   afterEach(() => {
@@ -85,6 +93,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     logSpy.mockRestore();
     warnSpy.mockRestore();
     errorSpy.mockRestore();
+    stderrSilencer.mockRestore();
     rmSync(tmpHome, { recursive: true, force: true });
   });
 
@@ -1869,22 +1878,32 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     );
   });
 
-  it('Codex Round-7 Fix 11: emits a "Registering CLI:" log line with the full command + args', async () => {
+  it('Codex Round-7 Fix 11 + Round-8 Fix 13: "Registering CLI:" log goes to STDERR (preserves --print-only stdout purity)', async () => {
     // Operators should see exactly which binary will be persisted
-    // into client configs BEFORE any client write happens, so they
-    // can verify the resolved binary path matches their expectation.
+    // into client configs BEFORE any client write happens. Round-8
+    // Fix 13 routed this log to stderr (not stdout) so it doesn't
+    // contaminate `dkg mcp setup --print-only | jq …` workflows —
+    // stdout stays a single canonical JSON document.
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
     const deps = makeDeps();
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
-    const logged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
     // Log line includes the literal "Registering CLI:" prefix.
-    expect(logged).toMatch(/Registering CLI:/);
+    expect(stderrText).toMatch(/Registering CLI:/);
     // And the absolute Node binary path.
-    expect(logged).toContain(process.execPath);
+    expect(stderrText).toContain(process.execPath);
     // And the resolved cli.js path.
-    expect(logged).toContain('mcp serve');
+    expect(stderrText).toContain('mcp serve');
+    // Belt-and-braces: the line did NOT go to stdout (logSpy
+    // captures console.log calls, which would be the pre-Round-8
+    // path).
+    const stdoutLogged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    expect(stdoutLogged).not.toMatch(/Registering CLI:/);
+
+    stderrSpy.mockRestore();
   });
 
   // ── Codex Round-7 Fix 12: complete yaml fast-path read ───────────
@@ -1960,5 +1979,252 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     // JSON's port (9100) wins.
     expect((deps.startDaemon as any).mock.calls[0][0]).toBe(9100);
+  });
+
+  // ── Codex Round-8 Fix 13: --print-only stdout-purity regression ──
+
+  it('Codex Round-8 Fix 13: --print-only stdout is parseable JSON (no Registering CLI prefix)', async () => {
+    // Round-7 broke the --print-only stdout-purity contract for the
+    // SECOND time (Round-2 Bug B was the first). Round-8 Fix 13
+    // routes the "Registering CLI:" log to stderr. This test pins
+    // the stdout-purity invariant: `JSON.parse(stdout)` succeeds
+    // and the parsed object has the canonical mcpServers.dkg shape.
+    const deps = makeDeps();
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await mcpSetupAction({ printOnly: true }, deps);
+
+    const stdoutText = (stdoutSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    // No "Registering CLI:" prefix on stdout. Pre-fix this string
+    // contaminated stdout.
+    expect(stdoutText).not.toMatch(/Registering CLI:/);
+    // No "VSCode" advisory on stdout (Round-2 Fix B regression
+    // guard rebaselined for Round-8).
+    expect(stdoutText).not.toMatch(/VSCode/i);
+    // Strict JSON-parses cleanly.
+    const parsed = JSON.parse(stdoutText.trim());
+    expect(parsed.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+
+    // STDERR carries BOTH the "Registering CLI:" log AND the
+    // VSCode-shape disambiguation note.
+    const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    expect(stderrText).toMatch(/Registering CLI:/);
+    expect(stderrText).toMatch(/VSCode/i);
+
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
+  });
+
+  // ── Codex Round-8 Fix 14: DKG_HOME env precedence over --monorepo ──
+
+  it('Codex Round-8 Fix 14: DKG_HOME set + --monorepo → uses DKG_HOME (env wins over flag bypass)', async () => {
+    // Pre-fix: Round-5 Fix 6's --monorepo bypass of
+    // resolveDkgConfigHome ALSO bypassed the DKG_HOME env-var
+    // precedence. Operators with `DKG_HOME=/custom/path` who passed
+    // `--monorepo` would have setup state land in `~/.dkg-dev`
+    // while the rest of the CLI honoured the custom path —
+    // splitting state across two homes.
+    //
+    // Post-fix: DKG_HOME wins always, regardless of mode flags.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    const customDkgHome = join(tmpHome, 'custom-dkg-home');
+    mkdirSync(customDkgHome, { recursive: true });
+    process.env.DKG_HOME = customDkgHome;
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    let dkgHomeAtStartDaemon: string | undefined;
+    const startDaemonSpy = vi.fn(async (_port: number) => {
+      dkgHomeAtStartDaemon = process.env.DKG_HOME;
+    });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      startDaemon: startDaemonSpy,
+    });
+
+    await mcpSetupAction({ monorepo: true, fund: false, verify: false }, deps);
+
+    // DKG_HOME wins — neither the --monorepo bypass to ~/.dkg-dev
+    // nor any other branch overrode it.
+    expect(dkgHomeAtStartDaemon).toBe(customDkgHome);
+    // ~/.dkg-dev was NOT created (the bypass branch was skipped).
+    expect(existsSync(join(tmpHome, '.dkg-dev'))).toBe(false);
+
+    // Restore env (try/finally restore should have already done this).
+    expect(process.env.DKG_HOME).toBe(customDkgHome);
+  });
+
+  it('Codex Round-8 Fix 14: DKG_HOME set + auto-detect (no flag) on monorepo cwd → uses DKG_HOME', async () => {
+    // Auto-detect path (no --monorepo flag) ALSO defers to DKG_HOME
+    // when set. Pre-Round-8 the auto-detect path called
+    // resolveDkgConfigHome which already respects DKG_HOME, so this
+    // case worked already; Fix 14 makes the precedence explicit and
+    // unconditional in the cli's own cascade.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    const customDkgHome = join(tmpHome, 'custom-dkg-home');
+    mkdirSync(customDkgHome, { recursive: true });
+    process.env.DKG_HOME = customDkgHome;
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    let dkgHomeAtStartDaemon: string | undefined;
+    const startDaemonSpy = vi.fn(async (_port: number) => {
+      dkgHomeAtStartDaemon = process.env.DKG_HOME;
+    });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      startDaemon: startDaemonSpy,
+    });
+
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    expect(dkgHomeAtStartDaemon).toBe(customDkgHome);
+  });
+
+  it('Codex Round-8 Fix 14: no DKG_HOME + --monorepo → ~/.dkg-dev (existing FIX 6 behaviour preserved)', async () => {
+    // Counterpart to the DKG_HOME-set case: when DKG_HOME is unset,
+    // the --monorepo bypass still kicks in (Round-5 Fix 6
+    // contract). Pin that the env-precedence addition didn't
+    // accidentally regress the bypass.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    delete process.env.DKG_HOME;
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    let dkgHomeAtStartDaemon: string | undefined;
+    const startDaemonSpy = vi.fn(async (_port: number) => {
+      dkgHomeAtStartDaemon = process.env.DKG_HOME;
+    });
+
+    const resolveDkgConfigHomeSpy = vi.fn(() => join(tmpHome, '.dkg'));
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      resolveDkgConfigHome: resolveDkgConfigHomeSpy,
+      startDaemon: startDaemonSpy,
+    });
+
+    await mcpSetupAction({ monorepo: true, fund: false, verify: false }, deps);
+
+    expect(dkgHomeAtStartDaemon).toBe(join(tmpHome, '.dkg-dev'));
+    // resolveDkgConfigHome was NOT called (--monorepo bypass took
+    // over, since DKG_HOME wasn't set).
+    expect(resolveDkgConfigHomeSpy).not.toHaveBeenCalled();
+  });
+
+  it('Codex Round-8 Fix 14: DKG_HOME restored to its pre-action value after exit (Fix 3 invariant preserved)', async () => {
+    // Round-3 Fix 3 added try/finally save+restore of DKG_HOME
+    // around the action body. Round-8 Fix 14 captures
+    // previousDkgHome BEFORE the cascade; the try/finally restore
+    // MUST still use that captured value. This test pins the
+    // invariant for both the env-set and env-unset cases.
+    const PRIOR = '/some/external/dkg-home';
+    process.env.DKG_HOME = PRIOR;
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    // After exit, DKG_HOME is back to PRIOR. (And during the
+    // action, since previousDkgHome === PRIOR was non-empty,
+    // dkgDirPath itself was PRIOR per Fix 14's cascade.)
+    expect(process.env.DKG_HOME).toBe(PRIOR);
+  });
+
+  // ── Codex Round-8 Fix 15: per-client failure isolation ───────────
+
+  it('Codex Round-8 Fix 15: classify error on one client → other clients still classified + written; failing client skipped', async () => {
+    // Pre-fix: a malformed config in any one detected client
+    // (e.g. truncated VSCode mcp.json) would throw out of
+    // classify(...) and abort the entire setup before other
+    // clients were touched. Post-fix: per-client classify errors
+    // are caught, logged to stderr, and the failing client is
+    // marked skip; other clients continue.
+    //
+    // Setup: two detected clients (Cursor + Claude Code via
+    // ~/.claude.json's parent always-existing). Cursor's config
+    // is intentionally malformed (truncated JSON) so classify
+    // throws on the JSON.parse call inside readConfigBody. Claude
+    // Code is unconfigured (no file yet).
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(join(cursorDir, 'mcp.json'), '{"truncated":');
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const deps = makeDeps();
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    // Stderr warning for the failing classify.
+    expect(stderrText).toMatch(/WARNING: Cursor classify failed/);
+    // Cursor's malformed file is NOT overwritten (failed-client
+    // skip semantics).
+    expect(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8')).toBe('{"truncated":');
+    // Other client (Claude Code) was still registered — its
+    // ~/.claude.json file exists post-action.
+    expect(existsSync(join(tmpHome, '.claude.json'))).toBe(true);
+    const claudeWritten = JSON.parse(readFileSync(join(tmpHome, '.claude.json'), 'utf-8'));
+    expect(claudeWritten.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+
+    stderrSpy.mockRestore();
+  });
+
+  it('Codex Round-8 Fix 15: write error on one client → other clients still attempted; failing client logs stderr warning', async () => {
+    // Per-client write isolation: pre-fix, the inner try/catch
+    // around writeRegistration re-threw on error, aborting the
+    // whole setup. Post-fix the catch logs a stderr warning and
+    // continues with the rest of the writes loop.
+    //
+    // Force a write failure: pre-create the Cursor config dir as a
+    // FILE (not a directory) so writeFileSync at the entry path
+    // throws ENOTDIR. Claude Code's parent (tmpHome) still works.
+    const cursorDir = join(tmpHome, '.cursor');
+    // Create as file to make the mcp.json write fail.
+    writeFileSync(cursorDir, 'this is a file, not a directory');
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const deps = makeDeps();
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    // Stderr warning for the failing client.
+    expect(stderrText).toMatch(/WARNING: Cursor (classify|write) failed/);
+    // Other client (Claude Code) was still written.
+    expect(existsSync(join(tmpHome, '.claude.json'))).toBe(true);
+
+    stderrSpy.mockRestore();
+  });
+
+  it('Codex Round-8 Fix 15: ALL clients failing → setup completes (returns) with stderr warnings; does not throw', async () => {
+    // Regression test for the "one malformed config kills setup"
+    // failure mode — even when EVERY detected client fails,
+    // mcpSetupAction MUST return cleanly (not throw). The
+    // operator sees per-client warnings and can address each.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(join(cursorDir, 'mcp.json'), '{"corrupt":');
+    // Claude Code (~/.claude.json) — also corrupt.
+    writeFileSync(join(tmpHome, '.claude.json'), '{"also-corrupt":');
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const deps = makeDeps();
+
+    // No throw — just completes.
+    await expect(
+      mcpSetupAction({ start: false, fund: false, verify: false }, deps),
+    ).resolves.not.toThrow();
+
+    const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    // Both clients' classify failures logged.
+    expect(stderrText).toMatch(/WARNING: Cursor classify failed/);
+    expect(stderrText).toMatch(/WARNING: Claude Code classify failed/);
+
+    // Neither malformed file was overwritten.
+    expect(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8')).toBe('{"corrupt":');
+    expect(readFileSync(join(tmpHome, '.claude.json'), 'utf-8')).toBe('{"also-corrupt":');
+
+    stderrSpy.mockRestore();
   });
 });

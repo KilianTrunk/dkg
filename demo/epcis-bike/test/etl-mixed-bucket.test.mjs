@@ -23,27 +23,34 @@ import { runEtl } from '../lib/etl.mjs';
 
 const TRACE = '11111111-2222-4333-8444-555555555555';
 
+// Run the ETL on a temp source file, then either:
+//   - run the optional `fn` callback with `{ result, dir, source }`
+//     BEFORE cleanup (so it can inspect the emitted JSON files on
+//     disk), OR
+//   - just return the in-memory result for tests that only assert on
+//     manifest metadata.
+// `dir` is removed in `finally` regardless, so callers must do all
+// disk-touching assertions inside `fn`. Manifest-only assertions can
+// use the returned `result.traceManifest` after the call returns
+// (it's in-memory and survives the cleanup).
 async function withSource(records, fn) {
   const dir = await mkdtemp(join(tmpdir(), 'epcis-bike-etl-test-'));
   const source = join(dir, 'source.json');
   await writeFile(source, JSON.stringify(records, null, 2), 'utf8');
   try {
     const result = await runEtl({ source, traceId: TRACE, outDir: dir });
+    if (typeof fn === 'function') {
+      await fn({ result, dir, source });
+    }
     return { dir, result, source };
   } finally {
-    // Clean up — the runEtl call wrote the source AND derived files into
-    // `dir`. Leaving them around would leak /tmp space across many runs.
+    // Clean up — the runEtl call wrote the source AND derived files
+    // into `dir`. Leaving them around would leak /tmp space across
+    // many runs. The `dir` field in the returned object is therefore
+    // stale after this point; callers that need disk access must use
+    // the `fn` callback above.
     await rm(dir, { recursive: true, force: true });
   }
-}
-
-async function readEvents(dir, files) {
-  const docs = [];
-  for (const f of files) {
-    const doc = JSON.parse(await readFile(join(dir, f), 'utf8'));
-    docs.push({ file: f, event: doc.epcisBody.eventList[0] });
-  }
-  return docs;
 }
 
 test('uniform-status single-item-per-record produces stable eventIDs and no splits', async () => {

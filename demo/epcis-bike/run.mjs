@@ -358,13 +358,38 @@ async function fetchCaptureStatus(captureID) {
   return { status: res.status, body: text, parsed };
 }
 
+// Resolve just the node2 base URL (`http://127.0.0.1:<port>`) without
+// requiring a usable token. Used for unauthenticated probes like
+// `/api/status` (public). Returns null only if the port file is
+// missing/malformed. NOT cached — the underlying file read is cheap
+// and a freshly-started node2 needs to be rediscovered between phases.
+async function resolveNode2BaseUrl() {
+  try {
+    const port = Number.parseInt(
+      (await readFile(join(NODE2_DKG_HOME, 'api.port'), 'utf-8')).trim(),
+      10,
+    );
+    if (!Number.isFinite(port)) return null;
+    return `http://127.0.0.1:${port}`;
+  } catch {
+    return null;
+  }
+}
+
 // Resolve the second devnet node's auth (port + token + baseUrl). Used by
 // Phase 7 to verify cross-node visibility from a non-owner perspective.
 // Returns null when node2 is not reachable so Phase 7 can degrade
 // gracefully rather than fail the demo.
+//
+// Cache only SUCCESS — null results are not cached so a node2 that's
+// still booting at Phase 0 gets retried at Phase 6 / 7 instead of
+// permanently locking the demo into the synthetic-peer fallback.
+// Every call probes when the cache is empty; a successful resolution
+// stops further probes (the value can't change between Phase 0 and
+// Phase 7 in any sane operational scenario).
 let _node2Auth;
 async function getNode2Auth() {
-  if (_node2Auth !== undefined) return _node2Auth;
+  if (_node2Auth) return _node2Auth;
   try {
     const port = Number.parseInt(
       (await readFile(join(NODE2_DKG_HOME, 'api.port'), 'utf-8')).trim(),
@@ -376,35 +401,42 @@ async function getNode2Auth() {
     // the node's own config requires auth.
     const { token, authEnabled } = await resolveAuthToken(NODE2_DKG_HOME);
     if (!Number.isFinite(port)) {
-      _node2Auth = null;
+      // Don't cache null — the next probe re-tries (node2 still booting).
       return null;
     }
     if (authEnabled && !token) {
-      _node2Auth = null;
+      // Don't cache null — token may become readable on a later probe.
       return null;
     }
     _node2Auth = { baseUrl: `http://127.0.0.1:${port}`, token };
     return _node2Auth;
   } catch {
-    _node2Auth = null;
+    // Don't cache null — the next probe re-tries.
     return null;
   }
 }
 
-// Probe node2's identity. Returns null if unreachable. Used both to verify
-// Phase 7 has a second node available AND to thread node2's libp2p peerId
-// into the Phase 6 allow-list grant so it corresponds to a real peer.
+// Probe node2's identity. Returns null if unreachable. Used both to
+// verify Phase 7 has a second node available AND to thread node2's
+// libp2p peerId into the Phase 6 allow-list grant so it corresponds to
+// a real peer.
+//
+// `/api/status` is a public endpoint (no auth required). Probe it
+// without going through `getNode2Auth` — that gate would mark node2
+// as "unavailable" whenever its token isn't locally readable, even
+// when the daemon itself is reachable. Falling back on
+// `getNode2Auth` for the *bearer header* (when present) preserves the
+// auth-aware path on daemons that DO require it for /api/status.
 async function fetchNode2Identity() {
+  const baseUrl = await resolveNode2BaseUrl();
+  if (!baseUrl) return null;
+  // Best-effort token: if we have one, send it; if not, send without.
+  // Public daemons accept either; auth-required daemons would only
+  // accept the authenticated path. Keep the auth attempt non-fatal.
   const auth = await getNode2Auth();
-  if (!auth) return null;
-  // Same conditional-header pattern as fetchCaptureStatus / node2Sparql:
-  // emit Authorization only when node2 has a real token. An
-  // `auth.enabled=false` node2 sandbox would otherwise reject the
-  // explicit `Bearer undefined` we'd send if we built the header
-  // unconditionally.
-  const headers = auth.token ? { Authorization: `Bearer ${auth.token}` } : {};
+  const headers = auth?.token ? { Authorization: `Bearer ${auth.token}` } : {};
   try {
-    const res = await fetch(`${auth.baseUrl}/api/status`, { headers });
+    const res = await fetch(`${baseUrl}/api/status`, { headers });
     if (!res.ok) return null;
     const body = await res.json();
     return { peerId: body.peerId, name: body.name };
@@ -1256,7 +1288,7 @@ async function phase4() {
   await pauseAfter();
 }
 
-async function phase5() {
+async function phase5(trace) {
   await startPhase(PHASE_INTROS[5]);
 
   // Filters target the in-flight partition (--finalized=false). On a healthy
@@ -1269,7 +1301,22 @@ async function phase5() {
     '--sub-graph-name', SUB,
     '--finalized', 'false',
   ];
-  const item = 'urn:acme:bike:item:BIKE-2026-W18-0001';
+  // Derive the sample EPC + time window from the loaded trace, not
+  // from hardcoded fixture-specific values. After a `BIKE_SOURCE` /
+  // `--trace-id` regen the committed `BIKE-2026-W18-0001` and
+  // `2026-05-12T09:30..10:00` window become stale and the filters
+  // return empty/misleading results. Pulling them from `trace.events`
+  // / `trace.time_range` keeps Phase 5 meaningful for any source.
+  const sampleItemId = trace?.events?.[0]?.item_ids?.[0];
+  // `safeUrnSegment` (encodeURIComponent) is what `epc-mapping.mjs:itemEpc`
+  // uses internally — preserve the same encoding here so the filter
+  // matches the actual EPC URN written into the partition.
+  const item = sampleItemId
+    ? `urn:acme:bike:item:${encodeURIComponent(sampleItemId)}`
+    : 'urn:acme:bike:item:UNKNOWN';
+  const [traceFrom, traceTo] = Array.isArray(trace?.time_range) && trace.time_range.length === 2
+    ? trace.time_range
+    : ['1970-01-01T00:00:00Z', '2999-12-31T23:59:59Z'];
 
   const r1 = runCli([...baseArgs, '--epc', item]);
   emit('phase-5-by-epc', 'Filter 1/5 — by EPC (one item\'s lifecycle)', r1, {
@@ -1287,11 +1334,11 @@ async function phase5() {
   });
   await pauseAfter();
 
-  const r3 = runCli([...baseArgs, '--from', '2026-05-12T09:30:00Z', '--to', '2026-05-12T10:00:00Z']);
+  const r3 = runCli([...baseArgs, '--from', traceFrom, '--to', traceTo]);
   emit('phase-5-by-time', 'Filter 3/5 — by time window', r3, {
-    preamble: 'Filter by an `eventTime` range. Useful for incident windows ("what happened between 09:30:00 and 10:00:00 UTC?").',
+    preamble: `Filter by an \`eventTime\` range. Useful for incident windows — here the window is the trace's full span (${traceFrom} → ${traceTo}), so this returns every event captured this run.`,
     kind: 'epcis-query',
-    interpretation: 'Use case: narrow scan around a known incident timestamp.',
+    interpretation: 'Use case: narrow scan around a known incident timestamp; here, full-trace.',
   });
   await pauseAfter();
 
@@ -2034,7 +2081,7 @@ async function main() {
   if (captureIds.length > 0) await phase2(captureIds);
   await phase3();
   await phase4();
-  await phase5();
+  await phase5(trace);
   await phase6();
   await phase7(trace);
   showClosing();

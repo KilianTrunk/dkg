@@ -63,6 +63,7 @@ await writeFile(flamegraphPath, renderCpuProfileFlamegraphHtml(profile, {
   rawProfileHref: `./${profileName}`,
 }), 'utf8');
 
+await runMethodAnalysis(env);
 await writeProfileIndex();
 await linkExistingBenchmarkReports();
 
@@ -121,6 +122,13 @@ async function writeProfileIndex() {
   }), 'utf8');
 }
 
+async function runMethodAnalysis(env) {
+  const exitCode = await runCommand(process.execPath, ['--experimental-strip-types', 'bench/analyze-publish-async-get.ts'], env);
+  if (exitCode !== 0) {
+    throw new Error(`Method analysis failed with exit code ${exitCode}`);
+  }
+}
+
 async function readProfilePayloadSizes(reportJsonFile) {
   try {
     const report = JSON.parse(await readFile(reportJsonFile, 'utf8'));
@@ -151,8 +159,13 @@ async function linkExistingBenchmarkReports() {
   const targets = [
     ['Combined report', 'bench/results/latest.html'],
     ...publishAsyncGetPages,
-    ['CPU profiles', 'bench/results/profiles/index.html'],
   ];
+  if (existsSync(resolve(rootDir, 'bench/results/profiles/index.html'))) {
+    targets.push(['CPU profiles', 'bench/results/profiles/index.html']);
+  }
+  if (existsSync(resolve(rootDir, 'bench/results/profiles/method-analysis.latest.html'))) {
+    targets.push(['Method analysis', 'bench/results/profiles/method-analysis.latest.html']);
+  }
 
   for (const file of reportFiles) {
     const reportPath = resolve(rootDir, file);
@@ -160,6 +173,28 @@ async function linkExistingBenchmarkReports() {
     const html = await readFile(reportPath, 'utf8');
     await writeFile(reportPath, addLinkedReportNavigation(html, file, targets), 'utf8');
   }
+}
+
+function runCommand(command, args, env) {
+  return new Promise((resolveExitCode) => {
+    const child = spawn(command, args, {
+      cwd: rootDir,
+      env,
+      stdio: 'inherit',
+    });
+    child.on('error', (error) => {
+      console.error(error);
+      resolveExitCode(1);
+    });
+    child.on('exit', (code, signal) => {
+      if (signal) {
+        console.error(`[bench:profile] command exited from signal ${signal}`);
+        resolveExitCode(1);
+        return;
+      }
+      resolveExitCode(code ?? 1);
+    });
+  });
 }
 
 function relativeFromRoot(path) {

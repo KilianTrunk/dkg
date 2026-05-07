@@ -57,6 +57,31 @@ type CpuProfileReportForTest = {
   renderCpuProfileFlamegraphHtml: (profile: unknown, options?: Record<string, unknown>) => string;
 };
 
+type MethodAnalysisForTest = {
+  renderMethodAnalysisHtml: (report: {
+    benchmark: 'publish-async-get-method-analysis';
+    generatedAt: string;
+    payloadSizes: string[];
+    flows: Array<{
+      flow: string;
+      payloadSize: string;
+      totalMs: number;
+      measuredMs: number;
+      traces: Array<{
+        flow: string;
+        payloadSize: string;
+        phase: string;
+        method: string;
+        invokes: string[];
+        detail: string;
+        durationMs: number;
+        success: boolean;
+        context: Record<string, unknown>;
+      }>;
+    }>;
+  }) => string;
+};
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
   if (originalDkgHome === undefined) delete process.env.DKG_HOME;
@@ -406,16 +431,67 @@ describe('publish async get benchmark', () => {
     expect(html).toContain('Raw .cpuprofile');
   });
 
+  it('renders method analysis with invoked methods and per-step timing', async () => {
+    const { renderMethodAnalysisHtml } = await import('../../../bench/analyze-publish-async-get.ts') as MethodAnalysisForTest;
+    const html = renderMethodAnalysisHtml({
+      benchmark: 'publish-async-get-method-analysis',
+      generatedAt: '2026-05-06T00:00:00.000Z',
+      payloadSizes: ['200mb'],
+      flows: [
+        {
+          flow: 'asynchronous publish enqueue and finalization',
+          payloadSize: '200mb',
+          totalMs: 12,
+          measuredMs: 7,
+          traces: [
+            {
+              flow: 'asynchronous publish enqueue and finalization',
+              payloadSize: '200mb',
+              phase: 'measured',
+              method: 'publisherEnqueue',
+              invokes: ['publisherJobs.set'],
+              detail: 'Enqueue the publish request through the publisher runtime path.',
+              durationMs: 2,
+              success: true,
+              context: { rootEntity: 'urn:test:root', quadCount: 1 },
+            },
+            {
+              flow: 'asynchronous publish enqueue and finalization',
+              payloadSize: '200mb',
+              phase: 'measured',
+              method: 'publisherJob',
+              invokes: ['promoteSharedRoot'],
+              detail: 'Poll the publisher job and finalize queued content.',
+              durationMs: 5,
+              success: true,
+              context: { jobId: 'job-1' },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(html).toContain('DKG Benchmark Method Analysis');
+    expect(html).toContain('asynchronous publish enqueue and finalization');
+    expect(html).toContain('publisherEnqueue');
+    expect(html).toContain('publisherJob');
+    expect(html).toContain('promoteSharedRoot');
+    expect(html).toContain('2.000 ms');
+    expect(html).toContain('5.000 ms');
+  });
+
   it('keeps focused ESBench HTML pages wired into the documented benchmark script', async () => {
     const packageJson = JSON.parse(await readFile(new URL('../../../package.json', import.meta.url), 'utf8')) as {
       scripts?: Record<string, string>;
     };
     const benchHtml = packageJson.scripts?.['bench:html'];
+    const benchAnalysis = packageJson.scripts?.['bench:analysis'];
     const benchProfile = packageJson.scripts?.['bench:profile'];
 
     expect(benchHtml).toContain('ESBENCH_HTML=1');
     expect(benchHtml).toContain('ESBENCH_PUBLISH_ASYNC_GET_HTML=1');
     expect(benchHtml).toContain('esbench --config esbench.config.mjs');
+    expect(benchAnalysis).toBe('node --experimental-strip-types bench/analyze-publish-async-get.ts');
     expect(benchProfile).toBe('node bench/profile-publish-async-get.mjs');
   });
 });

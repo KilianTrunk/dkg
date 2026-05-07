@@ -90,6 +90,7 @@ export function renderCpuProfileFlamegraphHtml(profile, options = {}) {
       <a href="${escapeHtml(benchmarkReportHref)}">ESBench report</a>
       <a href="${escapeHtml(rawProfileHref)}">Raw .cpuprofile</a>
       <a href="./index.html">Profile index</a>
+      <a href="./method-analysis.latest.html">Method analysis</a>
     </nav>
   </header>
   <main>
@@ -148,6 +149,7 @@ export function renderProfileIndexHtml(entries, options = {}) {
   <header>
     <h1>${escapeHtml(title)}</h1>
     <div><a href="${escapeHtml(benchmarkReportHref)}">Open latest ESBench report</a></div>
+    <div><a href="./method-analysis.latest.html">Open latest method analysis</a></div>
   </header>
   <main>
     <section class="panel">

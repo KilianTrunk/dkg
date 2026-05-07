@@ -6,6 +6,7 @@ const resultFile = process.env.ESBENCH_RESULT ?? 'bench/results/latest.json';
 const htmlFile = process.env.ESBENCH_HTML_FILE ?? 'bench/results/latest.html';
 const diffFile = process.env.ESBENCH_DIFF ?? null;
 const profileIndexFile = 'bench/results/profiles/index.html';
+const methodAnalysisFile = 'bench/results/profiles/method-analysis.latest.html';
 export const publishAsyncGetSuite = 'bench/publish-async-get.bench.ts';
 export const publishAsyncGetPages = [
   ['get/read retrieval', 'bench/results/publish-async-get/get-read-retrieval.html'],
@@ -97,6 +98,9 @@ async function writeLinkedReportNavigation(files) {
   ];
   if (await fileExists(profileIndexFile)) {
     targets.push(['CPU profiles', profileIndexFile]);
+  }
+  if (await fileExists(methodAnalysisFile)) {
+    targets.push(['Method analysis', methodAnalysisFile]);
   }
 
   await Promise.all(uniqueFiles.map(async (file) => {

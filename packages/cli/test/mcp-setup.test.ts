@@ -310,9 +310,10 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     expect(deps.writeDkgConfig).not.toHaveBeenCalled();
     expect(deps.startDaemon).not.toHaveBeenCalled();
-    // Asserted JSON shape on stdout.
-    const allWrites = (stdoutSpy.mock.calls as any[]).map((c) => c[0]).join('');
-    const parsed = JSON.parse(allWrites);
+    // Codex Issue 5: --print-only now emits TWO JSON blocks (the
+    // canonical mcpServers.dkg shape PLUS a VSCode-shape note).
+    // Use parseStdoutJson which walks the first balanced object.
+    const parsed = parseStdoutJson(stdoutSpy);
     expect(parsed.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
     stdoutSpy.mockRestore();
   });
@@ -369,26 +370,95 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
   // ── Phase-2: monorepo context detection + --installed/--monorepo flags ──
 
-  // Helper: extract the JSON object emitted by --print-only. Vitest's
-  // own progress reporter occasionally interleaves a non-JSON write
-  // ahead of production stdout, so we slice from the first `{` to
-  // the matching last `}`. The production code emits exactly one
-  // JSON object via `process.stdout.write`, so first-`{` to last-`}`
-  // is a tight bracket.
+  // Helper: extract the FIRST balanced JSON object from spied stdout.
+  // Pre-Codex-Issue-5 the production --print-only path emitted exactly
+  // one JSON block; first-`{` to last-`}` was a tight bracket. After
+  // Issue 5 we ALSO emit a VSCode-shape note + a second JSON block,
+  // so first-`{` to last-`}` spans both. Walk balanced braces (with
+  // string-literal awareness) to grab just the first object's bytes.
   const parseStdoutJson = (
     spy: ReturnType<typeof vi.spyOn>,
   ): Record<string, any> => {
     const all = (spy.mock.calls as any[]).map((c) => String(c[0])).join('');
     const start = all.indexOf('{');
-    const end = all.lastIndexOf('}');
-    if (start < 0 || end < 0 || end <= start) {
-      throw new Error(`No JSON object in stdout: ${JSON.stringify(all)}`);
+    if (start < 0) throw new Error(`No JSON object in stdout: ${JSON.stringify(all)}`);
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < all.length; i++) {
+      const ch = all[i];
+      if (escaped) { escaped = false; continue; }
+      if (ch === '\\') { escaped = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          return JSON.parse(all.slice(start, i + 1));
+        }
+      }
     }
-    return JSON.parse(all.slice(start, end + 1));
+    throw new Error(`Unbalanced JSON object in stdout: ${JSON.stringify(all)}`);
   };
 
+  // Helper: parse the SECOND JSON block from --print-only output.
+  // Codex Issue 5 appends a `{ servers: { dkg: ... } }` block after
+  // the canonical `mcpServers.dkg` block as a manual-paste hint for
+  // VSCode + Copilot Chat. Tests for the note assert against this
+  // second block.
+  const parseStdoutJsonSecond = (
+    spy: ReturnType<typeof vi.spyOn>,
+  ): Record<string, any> | null => {
+    const all = (spy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    let cursor = 0;
+    let count = 0;
+    while (cursor < all.length) {
+      const start = all.indexOf('{', cursor);
+      if (start < 0) return null;
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let i = start; i < all.length; i++) {
+        const ch = all[i];
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) {
+            count++;
+            if (count === 2) {
+              return JSON.parse(all.slice(start, i + 1));
+            }
+            cursor = i + 1;
+            break;
+          }
+        }
+      }
+      if (depth !== 0) return null;
+    }
+    return null;
+  };
+
+  // Codex Bug 3: tests that pass a fake monorepoRoot via the
+  // findDkgMonorepoRoot stub MUST also pre-create
+  // `<root>/packages/cli/dist/cli.js` because canonicalEntry now
+  // existsSync-checks the path before returning the monorepo entry.
+  // This helper does both: builds a fake root under tmpHome, creates
+  // the dist file as an empty placeholder, returns the root path.
+  function makeFakeMonorepoRoot(): string {
+    const root = join(tmpHome, 'fake-monorepo');
+    const distDir = join(root, 'packages', 'cli', 'dist');
+    mkdirSync(distDir, { recursive: true });
+    writeFileSync(join(distDir, 'cli.js'), '// fake CLI dist for tests\n');
+    return root;
+  }
+
   it('phase-2: --print-only with monorepo auto-detect emits the local-CLI-dist absolute-path form', async () => {
-    const fakeRepoRoot = join('/fake', 'dkg-v9');
+    const fakeRepoRoot = makeFakeMonorepoRoot();
     const deps = makeDeps({
       findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
     });
@@ -397,10 +467,11 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     await mcpSetupAction({ printOnly: true }, deps);
 
     const parsed = parseStdoutJson(stdoutSpy);
-    // Monorepo form: command is `node`, args[0] is the absolute
-    // path to the contributor's local CLI dist as produced by
-    // path.join — platform-native separators.
-    expect(parsed.mcpServers.dkg.command).toBe('node');
+    // Codex Bug 2: command is `process.execPath` (absolute path to
+    // the running Node binary), not bare `'node'`. args[0] is the
+    // absolute path to the contributor's local CLI dist as produced
+    // by path.join — platform-native separators.
+    expect(parsed.mcpServers.dkg.command).toBe(process.execPath);
     expect(parsed.mcpServers.dkg.args[0]).toBe(
       join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
     );
@@ -421,7 +492,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
   it('phase-2: --installed forces the standard form even from inside a monorepo', async () => {
     const deps = makeDeps({
-      findDkgMonorepoRoot: vi.fn(() => join('/fake', 'dkg-v9')),
+      findDkgMonorepoRoot: vi.fn(() => makeFakeMonorepoRoot()),
     });
     const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
@@ -452,7 +523,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // when they switch to a dev-checkout invocation. Asserts the
     // staleness detection compares against the context-aware
     // canonical entry, not a hardcoded form.
-    const fakeRepoRoot = join('/fake', 'dkg-v9');
+    const fakeRepoRoot = makeFakeMonorepoRoot();
     const cursorDir = join(tmpHome, '.cursor');
     mkdirSync(cursorDir, { recursive: true });
     // Pre-populate Cursor with the installed-form entry.
@@ -475,9 +546,10 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
     // Post-write, the config now carries the monorepo-form entry —
-    // platform-native paths from `path.join`.
+    // command is `process.execPath` (Codex Bug 2), args[0] is the
+    // absolute CLI dist path.
     const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
-    expect(after.mcpServers.dkg.command).toBe('node');
+    expect(after.mcpServers.dkg.command).toBe(process.execPath);
     expect(after.mcpServers.dkg.args[0]).toBe(
       join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
     );
@@ -749,7 +821,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // and has no need for the resolver. Asserting the resolver is
     // a no-op in that branch keeps the IO surface minimal — no
     // spurious child-process spawn during a monorepo setup.
-    const fakeRepoRoot = join('/fake', 'dkg-v9');
+    const fakeRepoRoot = makeFakeMonorepoRoot();
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
     const deps = makeDeps({
       findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
@@ -760,7 +832,8 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     expect(deps.resolveDkgBin).not.toHaveBeenCalled();
     const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
-    expect(cursorConfig.mcpServers.dkg.command).toBe('node');
+    // Codex Bug 2: command is process.execPath, not bare 'node'.
+    expect(cursorConfig.mcpServers.dkg.command).toBe(process.execPath);
     expect(cursorConfig.mcpServers.dkg.args[0]).toBe(
       join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
     );
@@ -968,13 +1041,120 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(result.map((p) => p.action)).toEqual(['register', 'refresh']);
   });
 
+  // ── PR #394 Codex review round 1 ────────────────────────────────
+
+  it('Codex Bug 1: detectContext passes process.cwd() to findDkgMonorepoRoot', async () => {
+    // Pre-fix: findDkgMonorepoRoot() was called with no argument,
+    // defaulting to the dirname of @origintrail-official/dkg-core's
+    // installed location. For a globally-installed CLI run from
+    // inside a user's monorepo cwd, that walks node_modules/...
+    // not the user's cwd → monorepo auto-detect never fires.
+    // Post-fix: cwd is passed explicitly.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const findStub = vi.fn((startDir?: string) => {
+      // Mimic the production semantic: only return monorepo root
+      // when startDir is something inside the monorepo. Without the
+      // Bug 1 fix, startDir would be undefined here (default arg).
+      return startDir ? fakeRepoRoot : null;
+    });
+    const deps = makeDeps({ findDkgMonorepoRoot: findStub });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // The stub was called with a defined startDir argument (the
+    // production code now passes process.cwd() explicitly).
+    expect(findStub).toHaveBeenCalled();
+    const callArg = findStub.mock.calls[0][0];
+    expect(callArg).toBeDefined();
+    expect(typeof callArg).toBe('string');
+    // Monorepo mode fired: the entry uses execPath + cli.js, not the
+    // bare-`"dkg"` installed form.
+    const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursorConfig.mcpServers.dkg.command).toBe(process.execPath);
+  });
+
+  it('Codex Bug 2: monorepo entry uses process.execPath, not bare "node"', async () => {
+    // Pre-fix: command was hard-coded to 'node'. Same PATH-
+    // inheritance failure as bare-`"dkg"` for GUI MCP clients.
+    // Post-fix: process.execPath (absolute path to running Node).
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+    });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    // process.execPath is always an absolute path; assert that
+    // shape rather than hardcoding the runtime-specific value.
+    expect(cursorConfig.mcpServers.dkg.command).toBe(process.execPath);
+    expect(cursorConfig.mcpServers.dkg.command).not.toBe('node');
+    // Sanity: it's actually absolute on this platform.
+    expect(cursorConfig.mcpServers.dkg.command.length).toBeGreaterThan(4);
+  });
+
+  it('Codex Bug 3: monorepo mode errors clearly when local cli.dist/cli.js is missing', async () => {
+    // Fresh checkout / pnpm clean / source-only edits all leave
+    // dist absent. Pre-fix: setup wrote a broken entry that points
+    // at a non-existent file, overwriting a previously-working
+    // installed registration. Post-fix: throws an actionable error
+    // and writes nothing.
+    const fakeRepoRoot = join(tmpHome, 'fake-monorepo-no-dist');
+    // Deliberately do NOT create packages/cli/dist/cli.js — root exists
+    // (so findDkgMonorepoRoot's stub returning it is plausible) but
+    // the dist file is absent.
+    mkdirSync(fakeRepoRoot, { recursive: true });
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+    });
+
+    await expect(
+      mcpSetupAction({ start: false, fund: false, verify: false }, deps),
+    ).rejects.toThrow(/Local CLI dist not found at .*Run `pnpm.*build` first/);
+
+    // No client config was written; the previously-empty Cursor
+    // dir stays empty (no file touched).
+    expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(false);
+  });
+
+  it('Codex Issue 5: --print-only emits a VSCode-shape note alongside the canonical block', async () => {
+    // Pre-fix: --print-only emitted only mcpServers.dkg. Users
+    // following the manual-paste path for VSCode + Copilot Chat
+    // got a wrong-shape snippet. Post-fix: a second block under
+    // `servers.dkg` is appended below the canonical block as a
+    // manual-paste hint for VSCode.
+    const deps = makeDeps();
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await mcpSetupAction({ printOnly: true }, deps);
+
+    // First block is the canonical mcpServers.dkg shape.
+    const first = parseStdoutJson(stdoutSpy);
+    expect(first.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    // Second block is the VSCode `servers.dkg` shape with the
+    // SAME entry contents — pinning that the note isn't drift.
+    const second = parseStdoutJsonSecond(stdoutSpy);
+    expect(second).not.toBeNull();
+    expect(second!.servers?.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    // The explanatory text mentioning VSCode + servers.dkg appears
+    // between the two blocks.
+    const allText = (stdoutSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    expect(allText).toMatch(/VSCode/i);
+    expect(allText).toMatch(/servers\.dkg/);
+    stdoutSpy.mockRestore();
+  });
+
   it('phase-4: VSCode staleness — pre-existing dkg entry under `servers.dkg` reclassifies on context flip to monorepo', async () => {
     // Cross-shape staleness: a Cursor-shaped entry written into
     // VSCode's `servers.dkg` wouldn't classify as `registered` if
     // the canonical entry's command/args differ. Here we pin the
     // installed→monorepo flip works for VSCode the same as for
     // Cursor (phase-2 covered the Cursor case).
-    const fakeRepoRoot = join('/fake', 'dkg-v9');
+    const fakeRepoRoot = makeFakeMonorepoRoot();
     const vscodePath = vscodeMcpPathUnder(tmpHome);
     mkdirSync(join(vscodePath, '..'), { recursive: true });
     writeFileSync(
@@ -996,7 +1176,8 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
     const written = JSON.parse(readFileSync(vscodePath, 'utf-8'));
-    expect(written.servers.dkg.command).toBe('node');
+    // Codex Bug 2: command is process.execPath, not bare 'node'.
+    expect(written.servers.dkg.command).toBe(process.execPath);
     expect(written.servers.dkg.args[0]).toBe(
       join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
     );

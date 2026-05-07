@@ -195,9 +195,27 @@ function canonicalEntry(
   resolvedBin: string | null,
 ): Record<string, unknown> {
   if (context === 'monorepo' && monorepoRoot) {
+    const cliJsPath = join(monorepoRoot, 'packages', 'cli', 'dist', 'cli.js');
+    // Codex Bug 3: validate the local CLI dist exists before
+    // pointing client configs at it. Fresh checkout, `pnpm clean`,
+    // or source-only edits leave dist absent or stale; without
+    // this check we'd overwrite a previously-working installed
+    // registration with a broken monorepo entry.
+    if (!existsSync(cliJsPath)) {
+      throw new Error(
+        `Local CLI dist not found at ${cliJsPath}. Run \`pnpm --filter @origintrail-official/dkg build\` first, then re-run \`dkg mcp setup\`.`,
+      );
+    }
     return {
-      command: 'node',
-      args: [join(monorepoRoot, 'packages', 'cli', 'dist', 'cli.js'), 'mcp', 'serve'],
+      // Codex Bug 2: use `process.execPath` (absolute path to the
+      // currently-running Node binary) instead of bare `"node"`.
+      // Same bug class as F30 fixed for installed mode — GUI MCP
+      // clients (Claude Desktop, Windsurf, VSCode + Copilot) often
+      // launch without the shell PATH that includes Node, so the
+      // bare-`"node"` form would `spawn node ENOENT` for the
+      // contributors most likely to be testing GUI clients.
+      command: process.execPath,
+      args: [cliJsPath, 'mcp', 'serve'],
     };
   }
   // F30: in installed mode, prefer the absolute-path resolution so
@@ -319,8 +337,17 @@ function detectContext(
   if (opts.force === 'installed') {
     return { context: 'installed', monorepoRoot: null };
   }
+  // Codex Bug 1: pass `process.cwd()` explicitly so the walk
+  // starts from the operator's working directory (the user's
+  // intent: "am I running this from inside a dkg-v9 checkout?").
+  // Default-start would walk from `@origintrail-official/dkg-core`'s
+  // installed location, which on a globally-installed CLI is in
+  // `node_modules/` and never sees the user's monorepo cwd —
+  // monorepo auto-detect would never fire for the most common
+  // contributor invocation.
+  const cwd = process.cwd();
   if (opts.force === 'monorepo') {
-    const root = findRoot();
+    const root = findRoot(cwd);
     if (!root) {
       throw new Error(
         '--monorepo flag passed but no DKG monorepo root could be located from this CLI invocation.',
@@ -328,7 +355,7 @@ function detectContext(
     }
     return { context: 'monorepo', monorepoRoot: root };
   }
-  const root = findRoot();
+  const root = findRoot(cwd);
   return root
     ? { context: 'monorepo', monorepoRoot: root }
     : { context: 'installed', monorepoRoot: null };
@@ -830,6 +857,19 @@ export async function mcpSetupAction(
       },
     };
     process.stdout.write(JSON.stringify(block, null, 2) + '\n');
+    // Codex Issue 5: VSCode + Copilot Chat keys MCP servers under
+    // `servers`, not the canonical `mcpServers`. Users following the
+    // `--print-only` manual-paste path for VSCode would silently
+    // get the wrong shape. Append a one-paragraph note BELOW the
+    // JSON so existing copy-paste workflows for the 5 canonical-
+    // shape clients aren't broken; the note disambiguates VSCode.
+    process.stdout.write(
+      '\n' +
+        'Note: VSCode + GitHub Copilot Chat uses a different shape — ' +
+        '`servers.dkg` instead of `mcpServers.dkg`. For VSCode, paste:\n' +
+        JSON.stringify({ servers: { dkg: expectedEntry } }, null, 2) +
+        '\n',
+    );
     return;
   }
 

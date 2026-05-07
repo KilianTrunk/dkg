@@ -1807,8 +1807,8 @@ mcpCmd
   .option('--force', 'Refresh every detected client regardless of current registration state')
   .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
   .option('--yes', 'Auto-confirm per-client registrations (default false: prompt interactively in TTY mode; non-TTY auto-confirms — pass `--yes` in scripts for the safer scripted-environment posture)')
-  .option('--installed', 'Force the installed-mode command form ({ command: "dkg", args: ["mcp", "serve"] }) even when invoked from inside a monorepo dev checkout. Mutually exclusive with --monorepo.')
-  .option('--monorepo', 'Force the monorepo-mode command form (absolute path to local CLI dist) — errors if no DKG monorepo root can be located. Mutually exclusive with --installed.')
+  .option('--installed', 'Force installed-mode command form. Writes an absolute path to the resolved `dkg` bin (via `which dkg` / `where.exe dkg`); falls back to bare `"dkg"` only if PATH resolution fails. Mutually exclusive with --monorepo.')
+  .option('--monorepo', 'Force monorepo-mode command form. Writes `process.execPath` plus an absolute path to the local CLI dist (`<repo>/packages/cli/dist/cli.js`). Errors if no DKG monorepo root is locatable from cwd ancestors. Mutually exclusive with --installed.')
   .action(async (opts) => {
     // Dynamic-import the openclaw-setup primitives for the bundled
     // init + daemon-start. Same import surface (and same package

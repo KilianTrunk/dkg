@@ -5,18 +5,23 @@ import { join } from 'node:path';
 import { mcpSetupAction, type McpSetupActionDeps } from '../src/mcp-setup.js';
 
 /**
- * Codex Round-4: canonical entry shape that production now writes
- * for INSTALLED context. Both modes emit `{ command:
- * process.execPath, args: [<cli script path>, 'mcp', 'serve'] }`;
- * installed-mode resolves the script path from `process.argv[1]`
- * via `realpathSync` (canonicalises symlinks). Tests that assert
- * the exact installed-mode entry contents call this helper so they
- * stay byte-aligned with production without hardcoding the
- * test-runner-specific argv[1].
+ * Codex Round-4 + Round-9: canonical entry shape that production
+ * now writes for INSTALLED context. Both modes emit `{ command:
+ * process.execPath, args: [<cli script path>, 'mcp', 'serve'],
+ * env: { DKG_HOME: <resolved-home> } }`; installed-mode resolves
+ * the script path from `process.argv[1]` via `realpathSync`
+ * (canonicalises symlinks).
+ *
+ * The optional `dkgHome` arg lets tests pin the DKG_HOME env value
+ * for the entry (default: `<HOME>/.dkg`, i.e. the tmpHome's
+ * installed-mode home). Tests that exercise alternate homes
+ * (`--monorepo`, custom `DKG_HOME`) pass the expected path
+ * explicitly.
  */
-const EXPECTED_INSTALLED_ENTRY = () => ({
+const EXPECTED_INSTALLED_ENTRY = (dkgHome?: string) => ({
   command: process.execPath,
   args: [realpathSync(process.argv[1]), 'mcp', 'serve'],
+  env: { DKG_HOME: dkgHome ?? join(process.env.HOME ?? process.env.USERPROFILE ?? '', '.dkg') },
 });
 
 /**
@@ -2133,19 +2138,18 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
   // ── Codex Round-8 Fix 15: per-client failure isolation ───────────
 
-  it('Codex Round-8 Fix 15: classify error on one client → other clients still classified + written; failing client skipped', async () => {
-    // Pre-fix: a malformed config in any one detected client
-    // (e.g. truncated VSCode mcp.json) would throw out of
-    // classify(...) and abort the entire setup before other
-    // clients were touched. Post-fix: per-client classify errors
-    // are caught, logged to stderr, and the failing client is
-    // marked skip; other clients continue.
+  it('Codex Round-8 Fix 15 + Round-9 Fix 17: classify error on one client → others still attempted, failing client skipped, action throws partial-failure', async () => {
+    // Round-8 Fix 15 isolates per-client classify errors so other
+    // clients still get attempted. Round-9 Fix 17 layered an
+    // aggregate-failure throw on top so CI / scripted invocations
+    // see a non-zero exit signal even when SOME clients
+    // succeeded — the partial-success state is still a failure
+    // for "did setup complete its registration step?" purposes.
     //
-    // Setup: two detected clients (Cursor + Claude Code via
-    // ~/.claude.json's parent always-existing). Cursor's config
-    // is intentionally malformed (truncated JSON) so classify
-    // throws on the JSON.parse call inside readConfigBody. Claude
-    // Code is unconfigured (no file yet).
+    // Setup: Cursor's config is malformed (truncated JSON) →
+    // classify throws → marked skipped. Claude Code is
+    // unconfigured → registers cleanly. The action throws
+    // "1 client(s) failed to register; 1 succeeded" at the end.
     const cursorDir = join(tmpHome, '.cursor');
     mkdirSync(cursorDir, { recursive: true });
     writeFileSync(join(cursorDir, 'mcp.json'), '{"truncated":');
@@ -2153,16 +2157,18 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const deps = makeDeps();
 
-    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+    await expect(
+      mcpSetupAction({ start: false, fund: false, verify: false }, deps),
+    ).rejects.toThrow(/1 client\(s\) failed to register; 1 succeeded/);
 
     const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
     // Stderr warning for the failing classify.
     expect(stderrText).toMatch(/WARNING: Cursor classify failed/);
     // Cursor's malformed file is NOT overwritten (failed-client
-    // skip semantics).
+    // skip semantics from Fix 15).
     expect(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8')).toBe('{"truncated":');
-    // Other client (Claude Code) was still registered — its
-    // ~/.claude.json file exists post-action.
+    // Other client (Claude Code) was still registered before the
+    // throw — its ~/.claude.json file exists post-action.
     expect(existsSync(join(tmpHome, '.claude.json'))).toBe(true);
     const claudeWritten = JSON.parse(readFileSync(join(tmpHome, '.claude.json'), 'utf-8'));
     expect(claudeWritten.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
@@ -2170,23 +2176,22 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     stderrSpy.mockRestore();
   });
 
-  it('Codex Round-8 Fix 15: write error on one client → other clients still attempted; failing client logs stderr warning', async () => {
-    // Per-client write isolation: pre-fix, the inner try/catch
-    // around writeRegistration re-threw on error, aborting the
-    // whole setup. Post-fix the catch logs a stderr warning and
-    // continues with the rest of the writes loop.
-    //
-    // Force a write failure: pre-create the Cursor config dir as a
-    // FILE (not a directory) so writeFileSync at the entry path
-    // throws ENOTDIR. Claude Code's parent (tmpHome) still works.
+  it('Codex Round-8 Fix 15 + Round-9 Fix 17: write error on one client → others still attempted, action throws partial-failure', async () => {
+    // Per-client write isolation (Fix 15) + non-zero exit on
+    // partial failure (Fix 17). Force a write failure by pre-
+    // creating the Cursor config dir as a regular FILE (so the
+    // mcp.json create-or-write throws). Claude Code's parent
+    // (tmpHome) still works. Action throws partial-failure at
+    // the end; Claude Code IS still registered before the throw.
     const cursorDir = join(tmpHome, '.cursor');
-    // Create as file to make the mcp.json write fail.
     writeFileSync(cursorDir, 'this is a file, not a directory');
 
     const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const deps = makeDeps();
 
-    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+    await expect(
+      mcpSetupAction({ start: false, fund: false, verify: false }, deps),
+    ).rejects.toThrow(/1 client\(s\) failed/);
 
     const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
     // Stderr warning for the failing client.
@@ -2197,33 +2202,176 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     stderrSpy.mockRestore();
   });
 
-  it('Codex Round-8 Fix 15: ALL clients failing → setup completes (returns) with stderr warnings; does not throw', async () => {
-    // Regression test for the "one malformed config kills setup"
-    // failure mode — even when EVERY detected client fails,
-    // mcpSetupAction MUST return cleanly (not throw). The
-    // operator sees per-client warnings and can address each.
+  it('Codex Round-8 Fix 15 + Round-9 Fix 17: ALL clients failing → action throws "No client configs updated" (zero successes)', async () => {
+    // When EVERY detected client fails, mcpSetupAction MUST throw
+    // a structured "No client configs updated" error so CI sees
+    // a non-zero exit. Round-8 Fix 15 (continue past per-client
+    // failures) is preserved — every client still gets tried —
+    // but Round-9 Fix 17 ensures the aggregate exit signal
+    // reflects the actual outcome.
     const cursorDir = join(tmpHome, '.cursor');
     mkdirSync(cursorDir, { recursive: true });
     writeFileSync(join(cursorDir, 'mcp.json'), '{"corrupt":');
-    // Claude Code (~/.claude.json) — also corrupt.
     writeFileSync(join(tmpHome, '.claude.json'), '{"also-corrupt":');
 
     const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const deps = makeDeps();
 
-    // No throw — just completes.
     await expect(
       mcpSetupAction({ start: false, fund: false, verify: false }, deps),
-    ).resolves.not.toThrow();
+    ).rejects.toThrow(/No client configs updated\. 2 client\(s\) failed/);
 
     const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
-    // Both clients' classify failures logged.
+    // Both clients' classify failures logged before the throw.
     expect(stderrText).toMatch(/WARNING: Cursor classify failed/);
     expect(stderrText).toMatch(/WARNING: Claude Code classify failed/);
 
     // Neither malformed file was overwritten.
     expect(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8')).toBe('{"corrupt":');
     expect(readFileSync(join(tmpHome, '.claude.json'), 'utf-8')).toBe('{"also-corrupt":');
+
+    stderrSpy.mockRestore();
+  });
+
+  // ── Codex Round-9 Fix 16: env DKG_HOME propagation in entry ──────
+
+  it('Codex Round-9 Fix 16: default install → entry has env: { DKG_HOME: ~/.dkg }', async () => {
+    // The MCP entry's env field carries the resolved bootstrap
+    // home so spawned MCP servers (in GUI clients that don't
+    // inherit shell env) read the same config / auth.token setup
+    // just bootstrapped.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps();
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const cursor = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursor.mcpServers.dkg.env).toEqual({ DKG_HOME: join(tmpHome, '.dkg') });
+  });
+
+  it('Codex Round-9 Fix 16: operator DKG_HOME=/custom → entry has env: { DKG_HOME: /custom }', async () => {
+    const customHome = join(tmpHome, 'custom-dkg-home');
+    mkdirSync(customHome, { recursive: true });
+    process.env.DKG_HOME = customHome;
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const cursor = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursor.mcpServers.dkg.env).toEqual({ DKG_HOME: customHome });
+  });
+
+  it('Codex Round-9 Fix 16: --monorepo → entry has env: { DKG_HOME: ~/.dkg-dev }', async () => {
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+    });
+    await mcpSetupAction({ monorepo: true, start: false, fund: false, verify: false }, deps);
+
+    const cursor = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursor.mcpServers.dkg.env).toEqual({ DKG_HOME: join(tmpHome, '.dkg-dev') });
+  });
+
+  it('Codex Round-9 Fix 16: classifier compares env.DKG_HOME — DKG_HOME drift classifies as stale and refreshes', async () => {
+    // Pre-existing entry has env: { DKG_HOME: '/old/path' }; a
+    // re-run with DKG_HOME unset (or pointing somewhere new)
+    // computes a different env and classifies as stale, refreshing
+    // to the new value.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    // Pre-existing entry with stale DKG_HOME.
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          dkg: {
+            command: process.execPath,
+            args: [realpathSync(process.argv[1]), 'mcp', 'serve'],
+            env: { DKG_HOME: '/old/abandoned/path' },
+          },
+        },
+      }, null, 2),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // Refreshed: the new env carries the current home.
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    expect(after.mcpServers.dkg.env).toEqual({ DKG_HOME: join(tmpHome, '.dkg') });
+    // Classifier saw the env drift, didn't treat the entry as
+    // already-registered.
+    expect(after.mcpServers.dkg.env.DKG_HOME).not.toBe('/old/abandoned/path');
+  });
+
+  it('Codex Round-9 Fix 16: pre-Fix-16 entries (no env field) classify as stale and migrate forward', async () => {
+    // Legacy entries from any setup version pre-Fix-16 lack the
+    // env field. The classifier's JSON.stringify(env) comparison
+    // sees `undefined` vs `{ DKG_HOME }` and marks stale → the
+    // refresh path adds the env field automatically. This is the
+    // auto-migration story for users upgrading.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          dkg: {
+            command: process.execPath,
+            args: [realpathSync(process.argv[1]), 'mcp', 'serve'],
+            // Note: no env field at all — pre-Fix-16 shape.
+          },
+        },
+      }, null, 2),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    expect(after.mcpServers.dkg.env).toEqual({ DKG_HOME: join(tmpHome, '.dkg') });
+  });
+
+  // ── Codex Round-9 Fix 17: aggregate failure throw cases ──────────
+
+  it('Codex Round-9 Fix 17: all clients succeed → no throw; "Next steps" hint emitted', async () => {
+    // Counterpart to the all-fail / partial-fail tests above:
+    // the happy path. Every detected client registers cleanly,
+    // mcpSetupAction returns (does not throw), and the
+    // operator-facing "Next steps" hint appears in stdout.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps();
+
+    await expect(
+      mcpSetupAction({ start: false, fund: false, verify: false }, deps),
+    ).resolves.not.toThrow();
+
+    const logged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    expect(logged).toMatch(/Next steps:/);
+  });
+
+  it('Codex Round-9 Fix 17: dry-run does NOT throw on classify failures (preview-only path)', async () => {
+    // Dry-run is preview-only. Even with classify failures in
+    // detected clients, dry-run MUST return cleanly — no writes
+    // attempted, no aggregate-failure throw. Operators use it to
+    // see what setup WOULD do without committing.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(join(cursorDir, 'mcp.json'), '{"corrupt":');
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const deps = makeDeps();
+
+    await expect(
+      mcpSetupAction({ dryRun: true, start: false, fund: false, verify: false }, deps),
+    ).resolves.not.toThrow();
+
+    // Stderr warning still fires (operator sees the issue).
+    const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    expect(stderrText).toMatch(/WARNING: Cursor classify failed/);
 
     stderrSpy.mockRestore();
   });

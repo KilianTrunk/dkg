@@ -34,13 +34,16 @@ The canonical entry written into each client's config (paths shown POSIX-style; 
         "/usr/local/lib/node_modules/@origintrail-official/dkg/dist/cli.js",
         "mcp",
         "serve"
-      ]
+      ],
+      "env": {
+        "DKG_HOME": "/Users/you/.dkg"
+      }
     }
   }
 }
 ```
 
-The `command` is the absolute path to the Node binary running this CLI (`process.execPath` at setup time); the first arg is the absolute path to the installed CLI's `cli.js` (resolved from `process.argv[1]` via `realpathSync`, which canonicalises symlinks across `npm relink` / version-manager rotations). GUI MCP clients (Claude Desktop, Windsurf, VSCode + Copilot) often don't inherit the shell PATH that includes `node` or the `dkg` shim, so writing the resolved absolute paths makes the registration robust against that gap. `dkg mcp setup` resolves and writes both automatically — you only need this manual shape when configuring by hand. For VSCode + Copilot Chat, swap the outer `mcpServers` key for `servers` while keeping the same inner block.
+The `command` is the absolute path to the Node binary running this CLI (`process.execPath` at setup time); the first arg is the absolute path to the installed CLI's `cli.js` (resolved from `process.argv[1]` via `realpathSync`, which canonicalises symlinks across `npm relink` / version-manager rotations). GUI MCP clients (Claude Desktop, Windsurf, VSCode + Copilot) often don't inherit the shell PATH that includes `node` or the `dkg` shim, so writing the resolved absolute paths makes the registration robust against that gap. The `env.DKG_HOME` field propagates the resolved bootstrap home so spawned MCP servers (which don't inherit shell env in GUI clients) read the same `config.yaml` / `auth.token` that setup just bootstrapped — important under `DKG_HOME=/custom` or `--monorepo` where the home is `~/.dkg-dev`. `dkg mcp setup` resolves and writes all three automatically — you only need this manual shape when configuring by hand. For VSCode + Copilot Chat, swap the outer `mcpServers` key for `servers` while keeping the same inner block.
 
 No tokens or URLs in the JSON — those live in `~/.dkg/config.yaml` and the daemon-written `~/.dkg/auth.token`. If no client is detected, run `dkg mcp setup --print-only` to emit the JSON for manual paste.
 

@@ -215,36 +215,55 @@ export interface McpSetupActionDeps {
 function canonicalEntry(
   context: SetupContext,
   monorepoRoot: string | null,
+  dkgHome: string,
 ): Record<string, unknown> {
+  let cliJsPath: string;
   if (context === 'monorepo' && monorepoRoot) {
-    const cliJsPath = join(monorepoRoot, 'packages', 'cli', 'dist', 'cli.js');
+    cliJsPath = join(monorepoRoot, 'packages', 'cli', 'dist', 'cli.js');
     if (!existsSync(cliJsPath)) {
       throw new Error(
         `Local CLI dist not found at ${cliJsPath}. Run \`pnpm --filter @origintrail-official/dkg build\` first, then re-run \`dkg mcp setup\`.`,
       );
     }
-    return { command: process.execPath, args: [cliJsPath, 'mcp', 'serve'] };
+  } else {
+    // Installed mode: resolve the CLI script Node is currently
+    // executing. `process.argv[1]` points at the npm bin-shim's
+    // target (the actual cli.js file); `realpathSync` follows
+    // symlinks for stability across npm relink / version-manager
+    // rotations.
+    const installedCliPath = realpathSync(process.argv[1]);
+    // Codex Round-6 Fix 8: detect ephemeral package-manager cache
+    // paths (npx / pnpm dlx / yarn dlx / bunx). Persisting one of
+    // those into a client config means the registration silently
+    // breaks on the next cache cleanup. Throw an actionable error
+    // so the operator installs globally instead.
+    const ephemeralReason = detectEphemeralInstallPath(installedCliPath);
+    if (ephemeralReason) {
+      throw new Error(
+        `Detected ephemeral install path (${ephemeralReason}): ${installedCliPath}\n` +
+        `MCP client registrations must persist across runs. Install dkg globally first:\n` +
+        `  npm install -g @origintrail-official/dkg && dkg mcp setup`,
+      );
+    }
+    cliJsPath = installedCliPath;
   }
-  // Installed mode: resolve the CLI script Node is currently
-  // executing. `process.argv[1]` points at the npm bin-shim's
-  // target (the actual cli.js file); `realpathSync` follows
-  // symlinks for stability across npm relink / version-manager
-  // rotations.
-  const installedCliPath = realpathSync(process.argv[1]);
-  // Codex Round-6 Fix 8: detect ephemeral package-manager cache
-  // paths (npx / pnpm dlx / yarn dlx / bunx). Persisting one of
-  // those into a client config means the registration silently
-  // breaks on the next cache cleanup. Throw an actionable error
-  // so the operator installs globally instead.
-  const ephemeralReason = detectEphemeralInstallPath(installedCliPath);
-  if (ephemeralReason) {
-    throw new Error(
-      `Detected ephemeral install path (${ephemeralReason}): ${installedCliPath}\n` +
-      `MCP client registrations must persist across runs. Install dkg globally first:\n` +
-      `  npm install -g @origintrail-official/dkg && dkg mcp setup`,
-    );
-  }
-  return { command: process.execPath, args: [installedCliPath, 'mcp', 'serve'] };
+  // Codex Round-9 Fix 16: propagate the resolved bootstrap home
+  // via the standard `env: { DKG_HOME: <path> }` field on the MCP
+  // server entry. GUI clients (Claude Desktop, Cursor, VSCode +
+  // Copilot, Windsurf) all support this shape and DON'T inherit
+  // shell env when spawning the registered command — so without
+  // this propagation, an operator who set `DKG_HOME=/custom`
+  // would have setup write config / auth.token to `/custom` while
+  // the spawned MCP server fell back to `~/.dkg` and missed both.
+  // Always emitted (even for the default `~/.dkg`) so the
+  // registered entry is fully self-contained: operators can move
+  // / copy it between machines and it resolves identically without
+  // depending on shell state.
+  return {
+    command: process.execPath,
+    args: [cliJsPath, 'mcp', 'serve'],
+    env: { DKG_HOME: dkgHome },
+  };
 }
 
 /**
@@ -777,11 +796,22 @@ function classify(
     Array.isArray((current as Record<string, unknown>).args) &&
     JSON.stringify((current as Record<string, unknown>).args) ===
       JSON.stringify(expected.args);
+  // Codex Round-9 Fix 16: also compare the `env: { DKG_HOME }`
+  // field. A registered entry with a different DKG_HOME (e.g.
+  // operator changed `DKG_HOME` between runs, or moved their
+  // bootstrap state) is genuine drift — refresh on the new value.
+  // Pre-Fix-16 entries that lack `env` entirely classify as
+  // `stale` and migrate forward automatically (deep-equal of
+  // `undefined` vs `{ DKG_HOME }` is false).
+  const envMatch =
+    JSON.stringify((current as Record<string, unknown>).env) ===
+      JSON.stringify(expected.env);
   const matches =
     typeof current === 'object' &&
     current !== null &&
     commandMatches &&
-    argsMatch;
+    argsMatch &&
+    envMatch;
   return {
     target,
     state: matches ? 'registered' : 'stale',
@@ -905,12 +935,53 @@ export async function mcpSetupAction(
   const { context, monorepoRoot } = detectContext(deps.findDkgMonorepoRoot, {
     force: forcedContext,
   });
+
+  // Codex Round-9 Fix 16: dkgDirPath has to be resolved BEFORE
+  // `canonicalEntry()` so we can propagate it via the entry's `env:
+  // { DKG_HOME }` field. Round-3/Round-5/Round-8 layered the cascade
+  // — see comment block on `previousDkgHome` capture below for the
+  // full rationale chain.
+  //
+  // Codex Round-3 Fix 3 + Round-8 Fix 14: capture the operator's
+  // pre-existing `DKG_HOME` BEFORE our own mutation — both for
+  // try/finally restore (Round-3 Fix 3) AND for env-precedence
+  // priority (Round-8 Fix 14). DKG_HOME is the highest-precedence
+  // operator override; it MUST win over the `--monorepo` bypass and
+  // over the auto-detect fallback. Pre-Fix-14 the `--monorepo`
+  // branch ignored env entirely, so an operator with `DKG_HOME` set
+  // who passed `--monorepo` would have setup state land in
+  // `~/.dkg-dev` while the rest of the CLI (every other downstream
+  // call into `resolveDkgConfigHome` / `dkgDir()`) honoured the
+  // env override — splitting state across two homes.
+  const previousDkgHome = process.env.DKG_HOME;
+
+  // dkgDirPath cascade (highest priority first):
+  //   1. `previousDkgHome` (operator-set DKG_HOME) — wins always.
+  //   2. `--monorepo` bypass (Round-5 Fix 6) — explicit dev-isolation
+  //      contract; bypasses configExists short-circuit but defers
+  //      to env override above.
+  //   3. `resolveDkgConfigHome` auto-detect — respects configExists
+  //      so global-install users on incidental monorepo cwd aren't
+  //      silently redirected.
+  let dkgDirPath: string;
+  if (previousDkgHome) {
+    dkgDirPath = previousDkgHome;
+  } else if (forcedContext === 'monorepo' && monorepoRoot) {
+    dkgDirPath = join(homedir(), '.dkg-dev');
+  } else {
+    dkgDirPath = deps.resolveDkgConfigHome({ isDkgMonorepo: context === 'monorepo' });
+  }
+
   // Codex Round-4: both modes register `process.execPath` + the
   // absolute CLI script path. No more `which dkg` resolution — the
   // shape is uniform and PATH-free, eliminating both the `dkg` bin
   // shim AND the `node` binary the shim would have invoked from
   // GUI clients' lookup chain.
-  const expectedEntry = canonicalEntry(context, monorepoRoot);
+  // Codex Round-9 Fix 16: third arg propagates dkgDirPath into the
+  // entry's `env: { DKG_HOME }` field so spawned MCP servers read
+  // the same home setup just bootstrapped (GUI clients don't
+  // inherit shell env).
+  const expectedEntry = canonicalEntry(context, monorepoRoot, dkgDirPath);
 
   // Codex Round-7 Fix 11 + Round-8 Fix 13: surface the exact
   // command + args that will be persisted into client configs.
@@ -969,44 +1040,12 @@ export async function mcpSetupAction(
   // Codex Round-2 Bug A: thread the monorepo signal into DKG-home
   // resolution so the bootstrap state (config, daemon pid, faucet
   // wallets, auth.token) lands in the SAME directory the registered
-  // local CLI dist will read at MCP-client startup. Without this,
-  // monorepo-context setup writes the local-CLI MCP entry but
-  // bootstraps state under `~/.dkg`, while the daemon spawned by
-  // that local CLI on next launch reads `~/.dkg-dev` (because
-  // `resolveDkgConfigHome` from inside the monorepo source detects
-  // monorepo and prefers the dev home). Setting `DKG_HOME` for the
-  // duration of this action overrides the package-path-based auto-
-  // detection inside adapter-openclaw's `dkgDir()` and dkg-core's
-  // daemon-lifecycle, keeping all four flows aligned.
-  // Codex Round-3 Fix 3 + Round-8 Fix 14: capture the operator's
-  // pre-existing `DKG_HOME` BEFORE our own mutation — both for
-  // try/finally restore (Round-3 Fix 3) AND for env-precedence
-  // priority (Round-8 Fix 14). DKG_HOME is the highest-precedence
-  // operator override; it MUST win over the `--monorepo` bypass and
-  // over the auto-detect fallback. Pre-Fix-14 the `--monorepo`
-  // branch ignored env entirely, so an operator with `DKG_HOME` set
-  // who passed `--monorepo` would have setup state land in
-  // `~/.dkg-dev` while the rest of the CLI (every other downstream
-  // call into `resolveDkgConfigHome` / `dkgDir()`) honoured the
-  // env override — splitting state across two homes.
-  const previousDkgHome = process.env.DKG_HOME;
-
-  // dkgDirPath cascade (highest priority first):
-  //   1. `previousDkgHome` (operator-set DKG_HOME) — wins always.
-  //   2. `--monorepo` bypass (Round-5 Fix 6) — explicit dev-isolation
-  //      contract; bypasses configExists short-circuit but defers
-  //      to env override above.
-  //   3. `resolveDkgConfigHome` auto-detect — respects configExists
-  //      so global-install users on incidental monorepo cwd aren't
-  //      silently redirected.
-  let dkgDirPath: string;
-  if (previousDkgHome) {
-    dkgDirPath = previousDkgHome;
-  } else if (forcedContext === 'monorepo' && monorepoRoot) {
-    dkgDirPath = join(homedir(), '.dkg-dev');
-  } else {
-    dkgDirPath = deps.resolveDkgConfigHome({ isDkgMonorepo: context === 'monorepo' });
-  }
+  // local CLI dist will read at MCP-client startup. Setting
+  // `DKG_HOME` for the duration of this action overrides the
+  // package-path-based auto-detection inside adapter-openclaw's
+  // `dkgDir()` and dkg-core's daemon-lifecycle, keeping all four
+  // flows aligned. (`dkgDirPath` itself was computed up-front for
+  // Round-9 Fix 16 — we just install the env mutation here.)
   process.env.DKG_HOME = dkgDirPath;
   try {
   const yamlPath = join(dkgDirPath, 'config.yaml');
@@ -1262,7 +1301,18 @@ export async function mcpSetupAction(
     }
   } else if (dryRun) {
     console.log('\n[setup] [dry-run] Would write to the clients listed above.');
-  } else {
+  }
+  // Codex Round-9 Fix 17: collect per-client write failures so we
+  // can throw a structured aggregate error after the loop. Round-8
+  // Fix 15 (continue past per-client failures) is the right intent
+  // — but it accidentally exited setup with code 0 even when zero
+  // clients were actually updated, giving CI / scripted runs a
+  // false-success signal. Fix 17 keeps the continue-and-attempt
+  // behaviour AND restores the non-zero exit by throwing once the
+  // loop finishes, citing every failed client (classify-failed +
+  // write-failed).
+  const writeFailures: { name: string; error: string }[] = [];
+  if (!dryRun && writes.length > 0) {
     console.log('');
     for (const { s, action } of writes) {
       try {
@@ -1278,13 +1328,49 @@ export async function mcpSetupAction(
         // previous sudo run) would have to fix that one file by
         // hand before any other registration could be written.
         // Fixed: emit a stderr warning and continue with the rest
-        // of the writes loop. The other clients still get
-        // registered; the operator sees the failed-client warning
-        // and can address it separately.
+        // of the writes loop. Round-9 Fix 17 collects the failure
+        // for the post-loop aggregate throw.
+        const msg = err?.message ?? String(err);
         process.stderr.write(
-          `[setup] WARNING: ${s.target.name} write failed (${err?.message ?? err}); other clients still attempted.\n`,
+          `[setup] WARNING: ${s.target.name} write failed (${msg}); other clients still attempted.\n`,
+        );
+        writeFailures.push({ name: s.target.name, error: msg });
+      }
+    }
+  }
+
+  // Codex Round-9 Fix 17: aggregate every classify-failed (Fix 15)
+  // and write-failed client into a single structured error. Three
+  // cases:
+  //   - zero clients failed → fall through to step 5 verification
+  //     and the existing "Next steps" hint.
+  //   - all attempted clients failed → throw "No client configs
+  //     updated" (hardest case; the registration step did nothing).
+  //   - mixed (some succeeded, some failed) → throw "N failed; M
+  //     succeeded" (partial; CI still sees non-zero so the
+  //     pipeline can re-run after the operator addresses the
+  //     per-client warnings emitted above).
+  //
+  // Skipped under dry-run (no writes attempted) and on the
+  // pure-decline path (planned has writes but operator declined
+  // every prompt — that's a deliberate operator action, not a
+  // failure).
+  if (!dryRun) {
+    const allFailures: { name: string; error: string }[] = [
+      ...Array.from(classifyFailed).map((name) => ({ name, error: 'classify failed' })),
+      ...writeFailures,
+    ];
+    if (allFailures.length > 0) {
+      const successfulWrites = writes.length - writeFailures.length;
+      const lines = allFailures.map((f) => `  - ${f.name}: ${f.error}`).join('\n');
+      if (successfulWrites === 0) {
+        throw new Error(
+          `No client configs updated. ${allFailures.length} client(s) failed:\n${lines}`,
         );
       }
+      throw new Error(
+        `${allFailures.length} client(s) failed to register; ${successfulWrites} succeeded:\n${lines}\nReview the warnings above and re-run \`dkg mcp setup\` after resolving the issues.`,
+      );
     }
   }
 

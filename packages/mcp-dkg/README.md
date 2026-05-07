@@ -84,8 +84,10 @@ Skip the rebuild and the registered entry points at a stale `dist/cli.js` — yo
 
 **Mode overrides** (mutually exclusive — pass at most one):
 
-- `--installed` forces installed-mode even from a monorepo cwd. Use this to test the published CLI from inside the monorepo (e.g. dogfooding a release candidate).
-- `--monorepo` forces monorepo-mode and errors if no DKG monorepo root is locatable. Use this to fail loudly if your CI expects a monorepo path but the workspace lookup goes sideways.
+- `--installed` forces installed-mode bootstrap home (`~/.dkg`) even from a monorepo cwd. **It does NOT change which CLI binary is registered with MCP clients** — the registered binary is always the CLI you ran. To register a different binary, invoke that binary directly.
+- `--monorepo` forces monorepo-mode bootstrap home (`~/.dkg-dev`) and errors if no DKG monorepo root is locatable from cwd ancestors. Use this to fail loudly if your CI expects a monorepo path but the workspace lookup goes sideways. **Same binary-selection caveat as `--installed`** — the registered binary is always the CLI you ran.
+
+The `[setup] Registering CLI: …` log line emitted at registration time prints the exact `command` and `args` that will be persisted into client configs, so you can verify the resolved binary path before any write happens.
 
 **Moved checkout caveat.** The written `args` carry an absolute path. If you rename or move your checkout, every registered client still points at the old path. Re-run `dkg mcp setup --force` from the new location to refresh every detected client's entry.
 

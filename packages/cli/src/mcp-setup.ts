@@ -67,6 +67,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir, platform } from 'node:os';
+import yaml from 'js-yaml';
 
 export interface McpSetupCliOptions {
   /** Refresh every detected client regardless of current registration state. */
@@ -813,20 +814,54 @@ function mintFallbackAgentName(): string {
 }
 
 /**
- * Read the persisted agent name from `~/.dkg/config.json`. Returns
- * `undefined` for missing/corrupt files. Used so a second `dkg mcp
- * setup` run on a config whose `name` was set by a prior init doesn't
- * regenerate a fresh random fallback.
+ * Codex Round-7 Fix 12: read the persisted DKG node config from
+ * either `config.json` (preferred) or `config.yaml` (fallback).
+ * Round-3's yaml support in `resolveDkgConfigHome()`'s configExists
+ * short-circuit treated yaml-only homes as established, but the
+ * step-1 reconcile path stayed JSON-only. The asymmetry meant
+ * yaml-only users hit the configExists fast path and then silently
+ * fell back to defaults for `name` / `apiPort` — daemon start /
+ * funding / verification all targeted the wrong values.
+ *
+ * Precedence: JSON wins over YAML when both exist. Deterministic
+ * for users who hand-edit one file while the daemon writes to the
+ * other; matches the existing `resolveDkgConfigHome` order.
+ *
+ * Returns `undefined` on missing or corrupt files (both formats
+ * tolerate parse failure — downstream uses pre-merge defaults
+ * silently rather than crashing setup).
+ */
+function readPersistedConfig(dkgDirPath: string): Record<string, unknown> | undefined {
+  const jsonPath = join(dkgDirPath, 'config.json');
+  if (existsSync(jsonPath)) {
+    try {
+      const raw = JSON.parse(readFileSync(jsonPath, 'utf-8'));
+      if (raw && typeof raw === 'object') return raw as Record<string, unknown>;
+    } catch { /* corrupt JSON; fall through to YAML attempt */ }
+  }
+  const yamlPath = join(dkgDirPath, 'config.yaml');
+  if (existsSync(yamlPath)) {
+    try {
+      const raw = yaml.load(readFileSync(yamlPath, 'utf-8'));
+      if (raw && typeof raw === 'object') return raw as Record<string, unknown>;
+    } catch { /* corrupt YAML; let writeDkgConfig handle */ }
+  }
+  return undefined;
+}
+
+/**
+ * Read the persisted agent name from the DKG node config (JSON or
+ * YAML). Returns `undefined` for missing/corrupt files. Used so a
+ * second `dkg mcp setup` run on a config whose `name` was set by a
+ * prior init doesn't regenerate a fresh random fallback.
+ *
+ * Codex Round-7 Fix 12: now accepts YAML configs in addition to
+ * JSON via the shared `readPersistedConfig()` helper.
  */
 function readPersistedAgentName(dkgDirPath: string): string | undefined {
-  const configPath = join(dkgDirPath, 'config.json');
-  if (!existsSync(configPath)) return undefined;
-  try {
-    const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
-    if (typeof raw?.name === 'string' && raw.name.trim()) {
-      return raw.name.trim();
-    }
-  } catch { /* corrupt config; let writeDkgConfig handle */ }
+  const persisted = readPersistedConfig(dkgDirPath);
+  const name = persisted?.name;
+  if (typeof name === 'string' && name.trim()) return name.trim();
   return undefined;
 }
 
@@ -876,6 +911,16 @@ export async function mcpSetupAction(
   // shim AND the `node` binary the shim would have invoked from
   // GUI clients' lookup chain.
   const expectedEntry = canonicalEntry(context, monorepoRoot);
+
+  // Codex Round-7 Fix 11: surface the exact command + args that
+  // will be persisted into client configs. The `--installed` /
+  // `--monorepo` flags only govern the bootstrap home — the
+  // registered binary is always whichever CLI is currently
+  // running. Logging it here lets operators verify before any
+  // client write happens; if the path doesn't match expectation,
+  // re-invoke with the intended CLI binary.
+  const entryArgs = (expectedEntry.args as string[]).join(' ');
+  console.log(`[setup] Registering CLI: ${expectedEntry.command} ${entryArgs}`);
 
   if (printOnly) {
     const block = {
@@ -976,17 +1021,24 @@ export async function mcpSetupAction(
    * the source of truth for an existing install.
    */
   const reconcileFromPersistedConfig = (): void => {
-    if (!existsSync(jsonPath)) return;
-    try {
-      const merged = JSON.parse(readFileSync(jsonPath, 'utf-8'));
-      const mergedPort = Number(merged.apiPort);
-      if (Number.isInteger(mergedPort) && mergedPort >= 1 && mergedPort <= 65535) {
-        effectivePort = mergedPort;
-      }
-      if (typeof merged.name === 'string' && merged.name.trim()) {
-        effectiveAgentName = merged.name.trim();
-      }
-    } catch { /* corrupt config; downstream uses pre-merge values */ }
+    // Codex Round-7 Fix 12: read JSON-or-YAML via the shared
+    // `readPersistedConfig()` helper. Pre-fix this branch only
+    // tried `config.json`, so a yaml-only install would silently
+    // fall through with the CLI defaults (port 9200, random name)
+    // and the daemon / funding / verify steps would target the
+    // wrong values. Round-3's configExists short-circuit had
+    // already established yaml-only homes; this completes the
+    // contract.
+    const merged = readPersistedConfig(dkgDirPath);
+    if (!merged) return;
+    const mergedPort = Number((merged as { apiPort?: unknown }).apiPort);
+    if (Number.isInteger(mergedPort) && mergedPort >= 1 && mergedPort <= 65535) {
+      effectivePort = mergedPort;
+    }
+    const mergedName = (merged as { name?: unknown }).name;
+    if (typeof mergedName === 'string' && mergedName.trim()) {
+      effectiveAgentName = mergedName.trim();
+    }
   };
 
   // F25: reconcile BEFORE the branch decision so dry-run preview

@@ -1827,4 +1827,138 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const written = JSON.parse(readFileSync(clinePath, 'utf-8'));
     expect(written.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
+
+  // ── Codex Round-7 Fix 11: narrow --installed flag + log line ─────
+
+  it('Codex Round-7 Fix 11: --installed from monorepo cwd registers the running CLI (NOT a hypothetical installed binary)', async () => {
+    // Pre-fix the `--installed` flag implied it would force the
+    // published CLI binary. Post-fix it controls bootstrap home
+    // only — the registered CLI is always the one currently
+    // running. Pin both behaviours together: bootstrap home goes
+    // to ~/.dkg (forced), but registered command is `process.argv[1]`
+    // (the test runner's own argv[1]), NOT some hypothetical installed
+    // path.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    let dkgHomeAtStartDaemon: string | undefined;
+    const startDaemonSpy = vi.fn(async (_port: number) => {
+      dkgHomeAtStartDaemon = process.env.DKG_HOME;
+    });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      startDaemon: startDaemonSpy,
+    });
+
+    await mcpSetupAction({ installed: true, fund: false, verify: false }, deps);
+
+    // (1) Bootstrap home is the installed-mode home, not dev.
+    expect(dkgHomeAtStartDaemon).toBe(join(tmpHome, '.dkg'));
+    expect(existsSync(join(tmpHome, '.dkg-dev'))).toBe(false);
+
+    // (2) Registered command is the CURRENTLY-RUNNING CLI, NOT
+    // the monorepo cli.dist (even though monorepoRoot is detected
+    // and the user explicitly opted out of monorepo mode).
+    const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursorConfig.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    // Belt-and-braces: the registered cli.js is NOT the fake repo
+    // root's dist path — `--installed` does NOT swap binaries.
+    expect(cursorConfig.mcpServers.dkg.args[0]).not.toBe(
+      join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
+    );
+  });
+
+  it('Codex Round-7 Fix 11: emits a "Registering CLI:" log line with the full command + args', async () => {
+    // Operators should see exactly which binary will be persisted
+    // into client configs BEFORE any client write happens, so they
+    // can verify the resolved binary path matches their expectation.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps();
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const logged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    // Log line includes the literal "Registering CLI:" prefix.
+    expect(logged).toMatch(/Registering CLI:/);
+    // And the absolute Node binary path.
+    expect(logged).toContain(process.execPath);
+    // And the resolved cli.js path.
+    expect(logged).toContain('mcp serve');
+  });
+
+  // ── Codex Round-7 Fix 12: complete yaml fast-path read ───────────
+
+  it('Codex Round-7 Fix 12: yaml-only ~/.dkg/config.yaml — readPersistedAgentName + reconcile use the YAML values', async () => {
+    // Pre-fix: yaml-only home would hit the configExists short-
+    // circuit (Round-3 Fix 2) but step 1's reconcile path only
+    // read config.json, so name/port silently fell back to
+    // defaults — daemon start, funding, verification all targeted
+    // the wrong values. Post-fix: readPersistedConfig() helper
+    // tries JSON then YAML.
+    const dkgDir = join(tmpHome, '.dkg');
+    mkdirSync(dkgDir, { recursive: true });
+    writeFileSync(
+      join(dkgDir, 'config.yaml'),
+      'name: my-yaml-agent\napiPort: 9001\nnodeRole: edge\n',
+    );
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    // (1) writeDkgConfig was NOT called — yaml-only configExists
+    // fast path keeps the existing file untouched.
+    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    // (2) startDaemon got the YAML port (9001), NOT the CLI
+    // default 9200. This is the load-bearing assertion: pre-fix
+    // this would have been 9200.
+    expect(deps.startDaemon).toHaveBeenCalledTimes(1);
+    expect((deps.startDaemon as any).mock.calls[0][0]).toBe(9001);
+  });
+
+  it('Codex Round-7 Fix 12: yaml-only with no fields → falls back to defaults gracefully (no crash)', async () => {
+    // Empty YAML object: readPersistedConfig returns the empty
+    // object, but `name`/`apiPort` reads come back undefined →
+    // pre-merge defaults are used. No crash; no agent-name
+    // regeneration loop on re-runs (since configExists short-
+    // circuits writeDkgConfig).
+    const dkgDir = join(tmpHome, '.dkg');
+    mkdirSync(dkgDir, { recursive: true });
+    writeFileSync(join(dkgDir, 'config.yaml'), '{}\n');
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps();
+    await expect(
+      mcpSetupAction({ fund: false, verify: false }, deps),
+    ).resolves.not.toThrow();
+
+    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    // Default port 9200 used since YAML had no apiPort field.
+    expect((deps.startDaemon as any).mock.calls[0][0]).toBe(9200);
+  });
+
+  it('Codex Round-7 Fix 12: both config.json AND config.yaml exist → JSON wins (deterministic precedence)', async () => {
+    // When both files exist, the helper prefers JSON. Mirrors
+    // resolveDkgConfigHome's order of checks and gives a
+    // deterministic answer for users who hand-edit one file
+    // while the daemon writes the other.
+    const dkgDir = join(tmpHome, '.dkg');
+    mkdirSync(dkgDir, { recursive: true });
+    writeFileSync(
+      join(dkgDir, 'config.json'),
+      JSON.stringify({ name: 'json-wins', apiPort: 9100, nodeRole: 'edge' }, null, 2),
+    );
+    writeFileSync(
+      join(dkgDir, 'config.yaml'),
+      'name: yaml-loses\napiPort: 9200\n',
+    );
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    // JSON's port (9100) wins.
+    expect((deps.startDaemon as any).mock.calls[0][0]).toBe(9100);
+  });
 });

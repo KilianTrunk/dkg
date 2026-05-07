@@ -156,6 +156,30 @@ test('mixed status AND mixed action together produce up to 4 sibling docs with u
   ]);
 });
 
+test('repeated unit_id across stations does not collide on eventID', async () => {
+  // Real BIKE_SOURCE exports often use per-station cycle counters where
+  // each station's `unit_id` restarts at 1. Without `process_name` in
+  // the eventID seed, `(trace, unit_id, ended)` would hash to the same
+  // UUID across stations and trip the publisher's duplicate-root
+  // rejection on the second sibling. This test pins the regression:
+  // two records share unit_id (and even ended, by 1ms), differ only
+  // in process_name → must produce distinct eventIDs.
+  const records = [
+    { trace_id: TRACE, unit_id: 'cycle-001', unit_name: 'WC1', process_name: 'StationA', ended: '2026-05-12T08:00:00.000Z', product_id: 'P', items: { X: { status: 'Passed' } } },
+    { trace_id: TRACE, unit_id: 'cycle-001', unit_name: 'WC2', process_name: 'StationB', ended: '2026-05-12T08:00:00.000Z', product_id: 'P', items: { X: { status: 'Passed' } } },
+  ];
+  const { result } = await withSource(records);
+  const evts = result.traceManifest.events;
+  assert.equal(evts.length, 2);
+  // Distinct eventIDs even though trace_id, unit_id, and ended are
+  // byte-identical between the two records.
+  assert.notEqual(evts[0].eventID, evts[1].eventID);
+  // Filenames carry the process_name, not the unit_id, so they're
+  // distinct on disk too.
+  const files = evts.map((e) => e.file).sort();
+  assert.deepEqual(files, ['event-01-StationA.json', 'event-02-StationB.json']);
+});
+
 test('eventID determinism: re-running the ETL on the same source yields identical eventIDs', async () => {
   const records = [
     { trace_id: TRACE, unit_id: 'c1', unit_name: 'WC1', process_name: 'StationA', ended: '2026-05-12T08:00:00.000Z', product_id: 'P', items: { A: { status: 'Passed' } } },

@@ -13,7 +13,7 @@
   "epcisBody": {
     "eventList": [
       {
-        "eventID": "urn:uuid:f4655466-6a01-5329-8508-2cb1771a5d25",
+        "eventID": "urn:uuid:4a779c36-24bd-5095-b6f5-3e977b150a85",
         "type": "ObjectEvent",
         "eventTime": "2026-05-12T09:05:00.000Z",
         "eventTimeZoneOffset": "+00:00",

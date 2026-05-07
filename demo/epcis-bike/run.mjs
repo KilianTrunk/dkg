@@ -246,8 +246,21 @@ async function resolveAuthToken(dkgHome) {
 function isSuccessState(state) {
   return state === 'finalized' || state === 'completed';
 }
+// `failed` is the publisher's real error terminal — it means the lift
+// committed a final negative outcome and won't change. Distinct from
+// `http-error`, which is purely transport-side (synthesized by
+// fetchCaptureStatus on non-2xx or fetch reject) and CAN recover on the
+// next poll iteration if the daemon comes back up. The pollers below
+// break only on real terminals (success or `failed`); `http-error` is
+// observed and remembered as the last transport error so the post-loop
+// branch can surface it if polling never recovers, but it does NOT
+// stop polling — a transient daemon restart shouldn't permanently mark
+// an in-flight capture as failed.
+function isFinalTerminal(state) {
+  return isSuccessState(state) || state === 'failed';
+}
 function isTerminalState(state) {
-  return isSuccessState(state) || state === 'failed' || state === 'http-error';
+  return isFinalTerminal(state) || state === 'http-error';
 }
 
 // Read the daemon's port + bearer token from DKG_HOME (or ~/.dkg). Cached
@@ -1025,6 +1038,11 @@ async function phase2(captureIds) {
 
   const start = Date.now();
   const final = new Map();
+  // Per-captureId last transport error. Populated as we observe
+  // `http-error` states and consulted only if polling times out without
+  // a real terminal — surfacing the most recent network/auth/5xx cause
+  // instead of just "didn't finalize within Ns".
+  const lastTransportError = new Map();
   let sampleShown = false;
   let sampleResult = null; // captured for the post-loop emit
   let lastTickReported = 0;
@@ -1043,13 +1061,20 @@ async function phase2(captureIds) {
       const r = results[i];
       const state = r.parsed?.state;
       // Publisher lift lifecycle: accepted → claimed → validated → broadcast
-      // → included → finalized (success). `failed` is the error terminal,
-      // `http-error` a synthetic terminal injected by fetchCaptureStatus
-      // on non-2xx so the loop breaks promptly with the HTTP cause
-      // attributed correctly. `completed` is recognized as a success
-      // alias too via isSuccessState — older RC daemons emit it instead
-      // of `finalized` for the same outcome.
-      const isTerminal = isTerminalState(state);
+      // → included → finalized (success). `failed` is the real error
+      // terminal. `completed` is a backward-compat alias for `finalized`
+      // — both classified by `isSuccessState`. `http-error` is a
+      // synthetic transport-level state and is NOT terminal: a transient
+      // daemon restart / 5xx / auth hiccup shouldn't permanently mark a
+      // capture as failed. The loop tracks the last http-error per
+      // capture and surfaces it in the timeout-summary if polling never
+      // recovered, but keeps retrying until POLL_TIMEOUT_MS otherwise.
+      const isTerminal = isFinalTerminal(state);
+      if (state === 'http-error') {
+        // Remember the latest transport error for the timeout summary;
+        // do NOT mark this capture finalized. Continue polling.
+        lastTransportError.set(id, r.parsed?.error ?? `HTTP ${r.status}`);
+      }
       if (isTerminal) {
         final.set(id, { state, response: r.parsed });
         newlyFinalized += 1;
@@ -1104,19 +1129,26 @@ async function phase2(captureIds) {
 
   const finalized = [...final.values()].filter((v) => isSuccessState(v.state)).length;
   const failed = [...final.values()].filter((v) => v.state === 'failed').length;
-  // Count `http-error` separately from `failed` so the diagnostic in the
-  // aggregate line distinguishes "publisher lifted and the lift failed"
-  // (`failed`) from "the daemon never gave us a usable status response"
-  // (`http-error`). Both are terminal in the polling loop, but they point
-  // at different root causes.
-  const httpErrored = [...final.values()].filter((v) => v.state === 'http-error').length;
-  const stuck = captureIds.length - finalized - failed - httpErrored;
+  const stuck = captureIds.length - finalized - failed;
+  // `lastTransportError` holds the most recent http-error message per
+  // captureId that hit a transport-level issue at any point during
+  // polling. Now that http-error is non-terminal, captures that only
+  // ever saw http-error are simply "still pending" at timeout — but we
+  // can still surface the last error so the operator knows WHY they
+  // didn't finalize. Pick the first stuck capture's last transport
+  // error as a representative sample for the aggregate line.
+  const stuckWithTransport = captureIds.filter(
+    (id) => !final.has(id) && lastTransportError.has(id),
+  );
+  const httpErrored = stuckWithTransport.length;
+  const httpErrorSample = httpErrored > 0
+    ? { state: 'http-error', error: lastTransportError.get(stuckWithTransport[0]) }
+    : null;
   const chainStuck = [...final.values()].some((v) =>
     /tentative without onChainResult|cannot mark chain inclusion/i.test(
       v.response?.error ?? '',
     ),
   );
-  const httpErrorSample = [...final.values()].find((v) => v.state === 'http-error');
 
   if (!JSON_MODE) {
     console.log('');
@@ -1134,8 +1166,8 @@ async function phase2(captureIds) {
       );
     } else if (httpErrored > 0) {
       fmt.warn(
-        `Daemon returned a non-2xx response for ${httpErrored} capture(s) during status polling. ` +
-          `Sample error: ${httpErrorSample?.response?.error ?? '(no body)'}`,
+        `Polling timed out and ${httpErrored} pending capture(s) had transient transport errors during the run. ` +
+          `Sample last error: ${httpErrorSample?.error ?? '(no body)'}`,
       );
     } else if (stuck > 0) {
       fmt.warn('Some captures did not finalize within the timeout.');
@@ -1487,33 +1519,36 @@ async function phase6() {
   }
   let phase6FinalState = null;
   let phase6FinalBody = null;
+  let phase6LastTransportError = null;
   {
     const pollStartedAt = Date.now();
     while (Date.now() - pollStartedAt < POLL_TIMEOUT_MS) {
       const status = await fetchCaptureStatus(phase6CaptureId);
       const state = status.parsed?.state;
-      // Same terminal semantics as Phase 2's poller — see isTerminalState
-      // for the full set: `finalized`/`completed` (success aliases),
-      // `failed` (error terminal), `http-error` (synthesized non-2xx).
-      // Without `completed` here an older RC daemon's successful Phase 6
-      // grant capture spins until POLL_TIMEOUT_MS, the post-loop branch
-      // declares the lift never reached the meta graph, and Phase 6
-      // reports a false negative.
-      if (isTerminalState(state)) {
+      // Same terminal semantics as Phase 2's poller — break on real
+      // terminals (`finalized`/`completed`/`failed`) only. `http-error`
+      // is a transient transport state; remember the last one for the
+      // post-loop summary but keep polling — a daemon restart
+      // mid-Phase-6 shouldn't permanently mark the lift as failed.
+      if (isFinalTerminal(state)) {
         phase6FinalState = state;
         phase6FinalBody = status.parsed;
         break;
+      }
+      if (state === 'http-error') {
+        phase6LastTransportError = status.parsed?.error ?? `HTTP ${status.status}`;
       }
       await sleep(POLL_INTERVAL_MS);
     }
   }
   if (phase6FinalState !== null && !isSuccessState(phase6FinalState)) {
-    const cause = phase6FinalState === 'http-error'
-      ? `Phase 6 status polling hit a daemon error: `
-      : `Phase 6 lift failed before any grant could be written: `;
+    // Reaching here means `phase6FinalState === 'failed'` — the
+    // publisher emitted a real failure terminal. (http-error is no
+    // longer a possible terminal value here; it's handled in the
+    // timeout branch below as a "polling never recovered" signal.)
     emitFail(
       'phase-6-lift-fail',
-      `${cause}${phase6FinalBody?.error ?? '(no error message)'}`,
+      `Phase 6 lift failed before any grant could be written: ${phase6FinalBody?.error ?? '(no error message)'}`,
       {
         note: 'Skipping post-count verify — the lift never reached the meta graph.',
         state: phase6FinalState,
@@ -1532,12 +1567,18 @@ async function phase6() {
   if (phase6FinalState === null) {
     // `phase6CaptureId` is guaranteed truthy here — the missing-id branch
     // above hard-fails out — so this condition is purely "polling
-    // timed out without a terminal state".
+    // timed out without a real terminal state". Surface the last
+    // transport error if any was observed during polling — that's the
+    // most useful signal when the daemon was down/flaky for the whole
+    // window.
+    const cause = phase6LastTransportError
+      ? `last transport error during polling was: ${phase6LastTransportError}`
+      : 'no transport errors observed; the publisher may simply be slow';
     emitWarn(
       'phase-6-lift-timeout',
-      `Phase 6 lift didn't reach a terminal state within ${POLL_TIMEOUT_MS / 1000}s. ` +
+      `Phase 6 lift didn't reach a terminal state within ${POLL_TIMEOUT_MS / 1000}s — ${cause}. ` +
         'Running the verify anyway, but the grant may not be written yet.',
-      { timeoutMs: POLL_TIMEOUT_MS },
+      { timeoutMs: POLL_TIMEOUT_MS, lastTransportError: phase6LastTransportError },
     );
   }
 
@@ -1665,25 +1706,36 @@ async function phase7(trace) {
     const querySucceeded = (res) =>
       res.status === 200 && Array.isArray(res.bindings);
 
-    let anchorRes = await node2Sparql(anchorSparql(finalizedGraphUri));
-    let anchorCount = querySucceeded(anchorRes) ? parseCount(anchorRes) : 0;
-    let queriedPartition = 'finalized';
-    let anchorQueryOk = querySucceeded(anchorRes);
-    let baselineForPartition = phase7AnchorBaseline.finalized.ok ? phase7AnchorBaseline.finalized.count : 0;
-    let baselineForPartitionOk = phase7AnchorBaseline.finalized.ok;
-    // The "did anchors gossip THIS run" claim is `current - baseline > 0`.
-    // The fallback to SWM applies when the post-baseline finalized delta
-    // is zero (subscribers don't materialize finalized; SWM is the
-    // expected target). Falling back on absolute count instead of delta
-    // would mis-route on a reused CG that has stale finalized anchors.
-    if (anchorQueryOk && anchorCount - baselineForPartition === 0) {
-      anchorRes = await node2Sparql(anchorSparql(swmGraphUri));
-      anchorQueryOk = querySucceeded(anchorRes);
-      anchorCount = anchorQueryOk ? parseCount(anchorRes) : 0;
-      queriedPartition = 'swm-fallback';
-      baselineForPartition = phase7AnchorBaseline.swm.ok ? phase7AnchorBaseline.swm.count : 0;
-      baselineForPartitionOk = phase7AnchorBaseline.swm.ok;
-    }
+    // Always probe BOTH partitions and sum: anchors can sit in either
+    // `<cg>/<sub>` (finalized) or `<cg>/<sub>/_shared_memory` (SWM)
+    // depending on whether the publisher's lift has moved them. On a
+    // partial-finalization run, some anchors are in finalized while
+    // others are still in SWM — earlier code only fell back to SWM
+    // when finalized delta was exactly 0, so the in-flight ones in SWM
+    // were never counted alongside the already-finalized ones in
+    // finalized, and Phase 7A would falsely report the run as failed.
+    // Summing both partitions is unconditionally correct: a unique
+    // anchor lives in exactly one of the two at any moment, so the
+    // sum is the true "anchors visible on node2" count.
+    const finalizedRes = await node2Sparql(anchorSparql(finalizedGraphUri));
+    const swmRes = await node2Sparql(anchorSparql(swmGraphUri));
+    const finalizedCount = querySucceeded(finalizedRes) ? parseCount(finalizedRes) : 0;
+    const swmCount = querySucceeded(swmRes) ? parseCount(swmRes) : 0;
+    const anchorCount = finalizedCount + swmCount;
+    // For diagnostics keep both raw counts plus a label describing
+    // where the anchors landed for THIS run (handy on partial-
+    // finalization runs).
+    const anchorRes = swmCount > 0 && finalizedCount === 0 ? swmRes : finalizedRes;
+    const anchorQueryOk = querySucceeded(finalizedRes) && querySucceeded(swmRes);
+    const queriedPartition =
+      finalizedCount > 0 && swmCount > 0 ? 'finalized+swm'
+        : finalizedCount > 0 ? 'finalized'
+          : swmCount > 0 ? 'swm-fallback'
+            : 'finalized'; // both empty — surface as finalized for the diagnostic
+    const finalizedBaseline = phase7AnchorBaseline.finalized.ok ? phase7AnchorBaseline.finalized.count : 0;
+    const swmBaseline = phase7AnchorBaseline.swm.ok ? phase7AnchorBaseline.swm.count : 0;
+    const baselineForPartition = finalizedBaseline + swmBaseline;
+    const baselineForPartitionOk = phase7AnchorBaseline.finalized.ok && phase7AnchorBaseline.swm.ok;
     const anchorDelta = anchorCount - baselineForPartition;
     // The expected count must include Phase 6's anchor when its capture
     // finalized — Phase 6 writes one synthetic "batch summary" KC after

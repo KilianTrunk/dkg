@@ -73,19 +73,25 @@ export function dispositionFor(status) {
   return STATUS_TO_DISPOSITION[status] ?? `${CBV_DISP_BASE}unknown`;
 }
 
-// Deterministic UUIDv5 from (trace_id, unit_id, ended[, groupKey]). Same inputs
-// → same output. `groupKey` is included in the seed only when one source
-// record is split into multiple sibling EPCIS docs (e.g. items with mixed
-// statuses), so that the sibling docs get distinct eventIDs. When the source
-// record produces a single doc, groupKey is omitted and the seed is identical
-// to the original two-arg form — committed fixtures regenerate unchanged.
-export function eventId(traceId, unitId, ended, groupKey) {
-  if (!traceId || !unitId || !ended) {
-    throw new Error('eventId: traceId, unitId, ended all required');
+// Deterministic UUIDv5 from (trace_id, unit_id, process_name, ended
+// [, groupKey]). Same inputs → same output. `processName` is part of the
+// seed because real `BIKE_SOURCE` exports often use per-station cycle
+// counters where two records can share `unit_id` and `ended` but differ
+// in station — without `processName` in the seed those records would
+// hash to the same eventID and trip the publisher's duplicate-root
+// rejection on the second one. The synthesized fixture's `unit_id` is
+// already station-unique (`cycle-W18-001`..`cycle-W18-007`), so adding
+// `processName` doesn't change its eventIDs in practice — the seed
+// gains a new component but every record's component is unique anyway.
+// `groupKey` is included only when one source record splits into
+// multiple sibling EPCIS docs (mixed statuses, mixed first-seen actions).
+export function eventId(traceId, unitId, processName, ended, groupKey) {
+  if (!traceId || !unitId || !processName || !ended) {
+    throw new Error('eventId: traceId, unitId, processName, ended all required');
   }
   const seed = groupKey
-    ? `acme-bike|${traceId}|${unitId}|${ended}|${groupKey}`
-    : `acme-bike|${traceId}|${unitId}|${ended}`;
+    ? `acme-bike|${traceId}|${unitId}|${processName}|${ended}|${groupKey}`
+    : `acme-bike|${traceId}|${unitId}|${processName}|${ended}`;
   return `urn:uuid:${uuidv5(seed, UUID_DNS_NAMESPACE)}`;
 }
 
@@ -136,7 +142,7 @@ export function buildEpcisDocument({
   creationDate,
 }) {
   const event = {
-    eventID: eventId(traceId, unitId, ended, groupKey),
+    eventID: eventId(traceId, unitId, processName, ended, groupKey),
     type: 'ObjectEvent',
     eventTime: ended,
     eventTimeZoneOffset: extractTzOffset(ended),

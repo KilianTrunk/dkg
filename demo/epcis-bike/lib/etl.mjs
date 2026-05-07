@@ -100,11 +100,36 @@ export async function runEtl({
 
   await mkdir(outDir, { recursive: true });
 
-  // Clean any prior event-*.json so re-runs don't leave stale files.
-  for (const entry of await readdir(outDir)) {
-    if (/^event-\d+-.*\.json$/.test(entry)) {
-      await unlink(join(outDir, entry));
+  // Clean prior fixture files — but ONLY the ones we wrote in a previous
+  // run, never arbitrary `event-*.json` matches in `--out`. The earlier
+  // glob-delete (`/^event-\d+-.*\.json$/.test`) silently destroyed
+  // unrelated files when an operator pointed `--out` at a shared
+  // directory. Restrict deletion to files recorded in the previous
+  // manifest; if no manifest is present, skip cleanup entirely so a
+  // misdirected `--out` can't lose data.
+  const existingEntries = await readdir(outDir).catch(() => []);
+  const previousManifests = existingEntries.filter((f) =>
+    /^trace-[0-9a-f]{8}-bike-line\.json$/.test(f),
+  );
+  const filesToRemove = new Set();
+  for (const m of previousManifests) {
+    try {
+      const prev = JSON.parse(await readFile(join(outDir, m), 'utf-8'));
+      if (Array.isArray(prev?.events)) {
+        for (const ev of prev.events) {
+          if (typeof ev?.file === 'string') filesToRemove.add(ev.file);
+        }
+      }
+      // Also remove the prior manifest itself so a regen with a new
+      // trace-id doesn't leave the old one lingering as a sibling.
+      filesToRemove.add(m);
+    } catch {
+      // Malformed prior manifest — skip; we'd rather leak a stale file
+      // than risk deleting unlisted user data based on a partial parse.
     }
+  }
+  for (const entry of filesToRemove) {
+    await unlink(join(outDir, entry)).catch(() => {});
   }
 
   // Use the latest source-record timestamp as the document's

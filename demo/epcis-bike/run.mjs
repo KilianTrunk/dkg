@@ -436,6 +436,49 @@ async function node2Sparql(sparql) {
   };
 }
 
+// Resolve the trace manifest path for the current fixture set. The ETL
+// writes its manifest as `trace-<traceId.slice(0,8)>-bike-line.json`,
+// keyed by whatever `--trace-id` was passed (default
+// `7c4f8d2a-9e3b-4a6d-b517-8f9e0a1b2c3d`). After a regeneration with a
+// custom `--trace-id` / `BIKE_SOURCE`, the manifest's filename prefix
+// changes — so Phase 0 must look it up dynamically rather than hardcode
+// the synthesized-source default. Resolution order:
+//   1. `source-snapshot.json:trace_id` (the ETL writes both alongside
+//      each other) → exact path `trace-<8>-bike-line.json`.
+//   2. Glob fallback for setups missing the snapshot — exactly one
+//      candidate is required, multi-match throws to force the operator
+//      to disambiguate (e.g. by pinning EPCIS_DEMO_CG fresh and
+//      regenerating).
+async function loadTraceManifest() {
+  const snapshotPath = join(FIXTURES, 'source-snapshot.json');
+  let traceId;
+  try {
+    const snap = JSON.parse(await readFile(snapshotPath, 'utf-8'));
+    traceId = snap?.trace_id;
+  } catch {
+    // Snapshot missing or malformed — fall through to glob below.
+  }
+  if (typeof traceId === 'string' && traceId.length >= 8) {
+    const path = join(FIXTURES, `trace-${traceId.slice(0, 8)}-bike-line.json`);
+    return JSON.parse(await readFile(path, 'utf-8'));
+  }
+  const candidates = (await readdir(FIXTURES))
+    .filter((f) => /^trace-[0-9a-f]{8}-bike-line\.json$/.test(f));
+  if (candidates.length === 0) {
+    throw new Error(
+      `No trace-<id>-bike-line.json manifest found in ${FIXTURES}. ` +
+        'Run `node demo/epcis-bike/lib/etl.mjs` first to generate fixtures.',
+    );
+  }
+  if (candidates.length > 1) {
+    throw new Error(
+      `Multiple trace manifests in ${FIXTURES} (${candidates.join(', ')}). ` +
+        'Set source-snapshot.json:trace_id, or remove the stale manifests, to disambiguate.',
+    );
+  }
+  return JSON.parse(await readFile(join(FIXTURES, candidates[0]), 'utf-8'));
+}
+
 // emit a single step. opts: { preamble, kind, interpretation, quiet }.
 //   preamble: 1-2 sentence prose shown BEFORE the command — what we're about
 //             to do and why. The user sees this before output, not after.
@@ -761,8 +804,14 @@ async function phase0() {
     }
   }
 
-  const traceManifestPath = join(FIXTURES, 'trace-7c4f8d2a-bike-line.json');
-  const trace = JSON.parse(await readFile(traceManifestPath, 'utf-8'));
+  // Resolve the manifest path from `source-snapshot.json` instead of
+  // hardcoding `trace-7c4f8d2a-bike-line.json`. The ETL writes its
+  // manifest as `trace-<traceId.slice(0,8)>-bike-line.json` and accepts
+  // `--trace-id` / `BIKE_SOURCE` overrides — after a regeneration with
+  // a different trace-id the hardcoded path would either fail outright
+  // or read a stale manifest that no longer matches the current
+  // event-NN-*.json files. Snapshot fallback to a glob when absent.
+  const trace = await loadTraceManifest();
   if (JSON_MODE) {
     process.stdout.write(
       `${JSON.stringify({ step: 'phase-0-fixture', fixture: { event_count: trace.event_count, stations: trace.stations.length, time_range: trace.time_range, trace_id: trace.trace_id } })}\n`,
@@ -785,6 +834,21 @@ async function phase1() {
   const eventFiles = (await readdir(FIXTURES))
     .filter((f) => /^event-\d+-.*\.json$/.test(f))
     .sort();
+
+  // Hard-fail when no fixtures match. Falling through to the empty
+  // captureIds branch would let Phase 2 trivially "complete" and the
+  // read-side phases (3-7) run against zero captures, producing a
+  // green-looking demo run that proves nothing. The most likely cause
+  // is a missing/incomplete ETL run; surface that explicitly here so
+  // the operator gets a useful pointer instead of a silent no-op walk.
+  if (eventFiles.length === 0) {
+    emitFail(
+      'phase-1-no-fixtures',
+      `No event-NN-*.json fixture files in ${FIXTURES}. Run \`node demo/epcis-bike/lib/etl.mjs\` to regenerate from the committed source, or check BIKE_SOURCE if you pointed the ETL at an external source.`,
+      { fixturesDir: FIXTURES },
+    );
+    throw new Error(`Phase 1 cannot proceed: no fixture files in ${FIXTURES}`);
+  }
 
   const captureIds = [];
   for (let i = 0; i < eventFiles.length; i += 1) {

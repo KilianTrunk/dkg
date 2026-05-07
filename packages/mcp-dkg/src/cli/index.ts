@@ -163,17 +163,35 @@ function parseJoinArgs(args: string[]): JoinOptions {
 
 interface ParsedInvite {
   contextGraphId: string;
+  /** Legacy V9: full multiaddr embedded in the invite. */
   multiaddr: string | null;
+  /** V10: bare libp2p peer id; resolved via DHT at dial time. */
+  curatorPeerId: string | null;
 }
+
+const PEER_ID_RE = /^(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|12D3Koo[1-9A-HJ-NP-Za-km-z]{45,53})$/;
 
 function parseInviteCode(raw: string): ParsedInvite {
   const trimmed = raw.trim();
-  // Two formats accepted:
-  //   "<cgId>"
-  //   "<cgId> @ <multiaddr>"
-  const m = trimmed.match(/^(.+?)\s*@\s*(\/.+)$/);
-  if (m) return { contextGraphId: m[1].trim(), multiaddr: m[2].trim() };
-  return { contextGraphId: trimmed, multiaddr: null };
+  // V9 single-line `<cgId> @ <multiaddr>`.
+  const atForm = trimmed.match(/^(.+?)\s*@\s*(\/.+)$/);
+  if (atForm) {
+    return { contextGraphId: atForm[1].trim(), multiaddr: atForm[2].trim(), curatorPeerId: null };
+  }
+
+  // Multi-line forms. Line 1 = cgId; line 2 = multiaddr (legacy) or peer id (V10).
+  const lines = trimmed.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length >= 2) {
+    const second = lines.slice(1).join('').replace(/\s+/g, '');
+    if (second.startsWith('/')) {
+      return { contextGraphId: lines[0], multiaddr: second, curatorPeerId: null };
+    }
+    if (PEER_ID_RE.test(lines[1])) {
+      return { contextGraphId: lines[0], multiaddr: null, curatorPeerId: lines[1] };
+    }
+  }
+
+  return { contextGraphId: trimmed, multiaddr: null, curatorPeerId: null };
 }
 
 async function prompt(question: string, defaultValue?: string): Promise<string> {
@@ -198,7 +216,8 @@ async function cmdJoin(args: string[]): Promise<number> {
 
   const invite = parseInviteCode(opts.inviteCode);
   console.log(`[join] context graph: ${invite.contextGraphId}`);
-  if (invite.multiaddr) console.log(`[join] curator multiaddr: ${invite.multiaddr}`);
+  if (invite.curatorPeerId) console.log(`[join] curator peer id: ${invite.curatorPeerId} (will resolve via DHT)`);
+  if (invite.multiaddr) console.log(`[join] curator multiaddr: ${invite.multiaddr} (legacy form, ask curator to regenerate via Share Project)`);
 
   // ── 1. Sanity-check the daemon ──
   console.log(`[join] checking local daemon at ${opts.daemonUrl}...`);

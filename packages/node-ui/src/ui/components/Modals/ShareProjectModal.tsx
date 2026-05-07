@@ -25,44 +25,15 @@ function truncAddr(addr: string): string {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
 }
 
-// Pick the most shareable multiaddr for an invite. Circuit-relay addresses are
-// preferred because they route through a public V10 relay and work from any
-// network (NAT, different LAN, remote). A public IPv4 is next best, then LAN,
-// then loopback (which is never useful to share).
-function pickShareableMultiaddr(addrs: string[]): string | null {
-  if (addrs.length === 0) return null;
-  const ranked = [...addrs].sort((a, b) => scoreMultiaddr(b) - scoreMultiaddr(a));
-  return ranked[0] ?? null;
-}
-
-function scoreMultiaddr(addr: string): number {
-  if (addr.includes('/p2p-circuit/')) return 100;
-  const ipv4 = addr.match(/\/ip4\/([^/]+)/)?.[1];
-  if (!ipv4) return 50;
-  if (isLoopbackIPv4(ipv4)) return 0;
-  if (isPrivateIPv4(ipv4)) return 10;
-  return 80;
-}
-
-function isLoopbackIPv4(ip: string): boolean {
-  return ip.startsWith('127.');
-}
-
-function isPrivateIPv4(ip: string): boolean {
-  if (ip.startsWith('10.')) return true;
-  if (ip.startsWith('192.168.')) return true;
-  if (ip.startsWith('169.254.')) return true;
-  const m = ip.match(/^172\.(\d+)\./);
-  if (m) {
-    const second = Number.parseInt(m[1]!, 10);
-    if (second >= 16 && second <= 31) return true;
-  }
-  return false;
-}
-
 export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphName }: ShareProjectModalProps) {
   const [copied, setCopied] = useState<string | null>(null);
-  const [peerMultiaddr, setPeerMultiaddr] = useState<string | null>(null);
+  // V10 invites carry the curator's libp2p peer id, not a hand-picked
+  // multiaddr. The joiner's daemon resolves the peer's current addresses
+  // via Kademlia DHT (`libp2p.peerRouting.findPeer`) at dial time, so the
+  // invite stays valid across relay rotations, NAT changes, and public-IP
+  // moves. The previous multiaddr-in-invite design broke whenever the
+  // chosen relay rotated under the curator.
+  const [peerId, setPeerId] = useState<string | null>(null);
   const [allowedAgents, setAllowedAgents] = useState<string[]>([]);
   const [newAgent, setNewAgent] = useState('');
   const [addingAgent, setAddingAgent] = useState(false);
@@ -77,8 +48,9 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
     fetch('/api/status', { headers: authHeaders() })
       .then(r => r.json())
       .then((data: any) => {
-        const addrs: string[] = data.multiaddrs ?? [];
-        setPeerMultiaddr(pickShareableMultiaddr(addrs));
+        if (typeof data?.peerId === 'string' && data.peerId.length > 0) {
+          setPeerId(data.peerId);
+        }
       })
       .catch(() => {});
 
@@ -102,8 +74,8 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
 
   if (!open) return null;
 
-  const invitePayload = peerMultiaddr
-    ? `${contextGraphId}\n${peerMultiaddr}`
+  const invitePayload = peerId
+    ? `${contextGraphId}\n${peerId}`
     : contextGraphId;
 
   const copyToClipboard = (text: string, label: string) => {
@@ -361,6 +333,8 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
                 </div>
                 <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginTop: 4 }}>
                   Share this with collaborators. They paste it into <strong>Join Project</strong> on their node.
+                  Their daemon dials your node by peer id over the libp2p DHT, so the invite stays
+                  valid even if your relay or public IP changes.
                   {allowedAgents.length > 0 ? (
                     <> The invitee must have their agent address on the allowlist, or they can submit a signed join request for your approval.</>
                   ) : (

@@ -599,16 +599,33 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     return jsonResponse(res, 200, { messages: msgs });
   }
 
-  // POST /api/connect  { multiaddr: "..." }
+  // POST /api/connect — accepts either:
+  //   { multiaddr: "/ip4/.../p2p/<id>" }    legacy direct dial
+  //   { peerId:   "12D3KooW..." }           V10 DHT lookup + dial
+  // The peerId form is preferred for invites: the daemon resolves the
+  // peer's current multiaddrs via libp2p Kademlia (`peerRouting.findPeer`)
+  // and dials them, so the invite survives the curator's relay rotations
+  // / public-IP changes.
   if (req.method === "POST" && path === "/api/connect") {
     const body = await readBody(req, SMALL_BODY_BYTES);
-    const { multiaddr: addr } = JSON.parse(body);
-    if (!addr) return jsonResponse(res, 400, { error: 'Missing "multiaddr"' });
+    const parsed = JSON.parse(body);
+    const { multiaddr: addr, peerId } = parsed;
+    if (!addr && !peerId) return jsonResponse(res, 400, { error: 'Missing "multiaddr" or "peerId"' });
     try {
-      await agent.connectTo(addr);
+      if (peerId) {
+        await agent.connectToPeerId(peerId);
+      } else {
+        await agent.connectTo(addr);
+      }
     } catch (err: any) {
-      return jsonResponse(res, 400, {
+      const code = err?.code as string | undefined;
+      const status = code === 'PEER_NOT_FOUND' ? 404
+        : code === 'INVALID_PEER_ID' || code === 'SELF_DIAL' ? 400
+        : code === 'DIAL_FAILED' ? 502
+        : 400;
+      return jsonResponse(res, status, {
         error: err.message ?? "Failed to connect",
+        ...(code ? { code } : {}),
       });
     }
     return jsonResponse(res, 200, { connected: true });

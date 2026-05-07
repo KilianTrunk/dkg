@@ -721,6 +721,42 @@ program
     }
   });
 
+// ─── dkg connect ─────────────────────────────────────────────────────
+// Direct dial helper, mostly useful for ad-hoc P2P troubleshooting and
+// validating an invite before pasting it into the UI. Two modes:
+//   dkg connect <multiaddr>          legacy direct dial
+//   dkg connect --peer-id <peerId>   V10 DHT-resolved dial
+// The peer-id form is preferred — it asks the daemon to walk the libp2p
+// Kademlia table and pick up the peer's *current* multiaddrs, which is
+// exactly how invite redemption now resolves curators.
+program
+  .command('connect [multiaddr]')
+  .description('Dial a peer by multiaddr or peer id (DHT-resolved)')
+  .option('--peer-id <id>', 'Resolve via libp2p DHT (peerRouting.findPeer) and dial')
+  .action(async (multiaddrArg: string | undefined, opts: { peerId?: string }) => {
+    if (!multiaddrArg && !opts.peerId) {
+      console.error('Provide either a multiaddr or --peer-id <id>');
+      process.exit(1);
+    }
+    if (multiaddrArg && opts.peerId) {
+      console.error('Pass either a multiaddr or --peer-id, not both');
+      process.exit(1);
+    }
+    try {
+      const client = await ApiClient.connect();
+      if (opts.peerId) {
+        await client.connectByPeerId(opts.peerId);
+        console.log(`Connected to ${opts.peerId} (resolved via DHT)`);
+      } else {
+        await client.connect(multiaddrArg!);
+        console.log(`Connected to ${multiaddrArg}`);
+      }
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
 // ─── dkg send <name> <message> ───────────────────────────────────────
 
 program
@@ -1193,7 +1229,7 @@ async function runCatchupStatusCommand(contextGraph: string, opts: CatchupStatus
   const client = await ApiClient.connect();
   const watch = !!opts.watch;
   const intervalSeconds = Math.max(1, Number(opts.interval ?? 2));
-  const terminalStates = new Set(['done', 'failed', 'denied']);
+  const terminalStates = new Set(['done', 'failed', 'denied', 'unreachable']);
 
   do {
     const status = await client.catchupStatus(contextGraph);

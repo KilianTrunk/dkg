@@ -1969,6 +1969,16 @@ export class DKGAgent {
     connectedPeers: number;
     syncCapablePeers: number;
     peersTried: number;
+    /**
+     * Subset of `peersTried` whose sync round finished without a transport
+     * failure AND without an explicit ACL denial. Used by the daemon
+     * subscribe job to distinguish a real "curator unreachable" outcome
+     * (`peersTried > 0 && peersSucceeded === 0 && !denied`) from a slow
+     * public CG (some peers responded with empty / meta-only) — the UI
+     * surfaces a dedicated `unreachable` terminal status with a "send
+     * signed join request" CTA instead of the generic timeout copy.
+     */
+    peersSucceeded: number;
     dataSynced: number;
     sharedMemorySynced: number;
     /**
@@ -2014,6 +2024,7 @@ export class DKGAgent {
     connectedPeers: number;
     syncCapablePeers: number;
     peersTried: number;
+    peersSucceeded: number;
     dataSynced: number;
     sharedMemorySynced: number;
     denied: boolean;
@@ -2131,7 +2142,22 @@ export class DKGAgent {
       return { durable, shared };
     }));
     let accessDeniedPeers = 0;
+    let peersSucceeded = 0;
     for (const r of results) {
+      // A peer "succeeded" when its sync round finished without a
+      // transport failure AND without an explicit denial. We treat the
+      // emergency `failedPeers: 1` produced by `emptyDurable()` /
+      // `emptyShared()` (set when `syncFromPeerDetailed` rejected) as
+      // the failure marker — anything else (data, meta-only, empty
+      // response) counts as a legitimate response from a host that
+      // happens to hold no/incomplete data for this CG.
+      const durableFailed = r.durable.failedPeers > 0;
+      const sharedFailed = r.shared ? r.shared.failedPeers > 0 : false;
+      const peerDeniedRound = r.durable.deniedPhases > 0
+        || (r.shared ? r.shared.deniedPhases > 0 : false);
+      if (!durableFailed && !sharedFailed && !peerDeniedRound) {
+        peersSucceeded++;
+      }
       dataSynced += r.durable.insertedTriples;
       diagnostics.durable.fetchedMetaTriples += r.durable.fetchedMetaTriples;
       diagnostics.durable.fetchedDataTriples += r.durable.fetchedDataTriples;
@@ -2181,6 +2207,7 @@ export class DKGAgent {
       connectedPeers: peers.length,
       syncCapablePeers,
       peersTried,
+      peersSucceeded,
       dataSynced,
       sharedMemorySynced,
       denied: accessDeniedPeers > 0,
@@ -2602,6 +2629,20 @@ export class DKGAgent {
     const pubKeyBase64 = Buffer.from(this.wallet.keypair.publicKey).toString('base64');
     const relayAddrs = this.config.relayPeers;
 
+    // Populate `contextGraphsServed` so peers can discover which CGs this
+    // node hosts via the public agent profile, but ONLY include CGs whose
+    // accessPolicy is open. `isPrivateContextGraph` is the same predicate
+    // the responder consults to gate sync requests, so the discovery layer
+    // and the data-plane access control stay consistent. System CGs
+    // (`agents`, `ontology`) are excluded — they are universal and don't
+    // need to be re-advertised in every profile.
+    const publicServed: string[] = [];
+    for (const id of this.subscribedContextGraphs.keys()) {
+      if (id === SYSTEM_PARANETS.AGENTS || id === SYSTEM_PARANETS.ONTOLOGY) continue;
+      if (await this.isPrivateContextGraph(id)) continue;
+      publicServed.push(id);
+    }
+
     const profileConfig: AgentProfileConfig = {
       peerId: this.node.peerId,
       name: this.config.name,
@@ -2617,6 +2658,7 @@ export class DKGAgent {
         currency: s.currency ?? 'TRAC',
         pricingModel: s.pricePerCall ? 'PerInvocation' as const : 'Free' as const,
       })),
+      ...(publicServed.length > 0 ? { contextGraphsServed: publicServed } : {}),
     };
 
     const profileCtx = createOperationContext('publish');
@@ -3028,6 +3070,92 @@ export class DKGAgent {
       multiaddress,
       (message) => this.log.info(ctx, message),
     );
+  }
+
+  /**
+   * Resolve a peer's current multiaddrs via the libp2p Kademlia DHT and
+   * dial them. Used by the V10 invite flow where invites carry only a peer
+   * id — the daemon discovers up-to-date addresses at join time so the
+   * invite stays valid across relay rotations and IP changes (which broke
+   * the legacy multiaddr-in-invite design).
+   *
+   * Errors:
+   *   - `PEER_NOT_FOUND` — DHT walked but produced no providers for the id.
+   *   - `DIAL_FAILED` — DHT returned multiaddrs but every dial attempt failed.
+   * The HTTP layer surfaces these as 404 / 502 with a stable `error` code so
+   * the UI can render targeted copy ("curator is offline" vs "wrong peer id").
+   */
+  async connectToPeerId(peerIdStr: string, options?: { timeoutMs?: number }): Promise<void> {
+    const ctx = createOperationContext('connect');
+    const timeoutMs = options?.timeoutMs ?? 15_000;
+    const { peerIdFromString } = await import('@libp2p/peer-id');
+
+    let peerId;
+    try {
+      peerId = peerIdFromString(peerIdStr);
+    } catch (err: any) {
+      const error = new Error(`Invalid peer id: ${err?.message ?? String(err)}`);
+      (error as any).code = 'INVALID_PEER_ID';
+      throw error;
+    }
+
+    if (peerId.toString() === this.node.peerId) {
+      const error = new Error('Cannot dial self');
+      (error as any).code = 'SELF_DIAL';
+      throw error;
+    }
+
+    // Fast-path: already connected (e.g. via gossipsub mesh / mDNS / a
+    // prior invite). Skip the DHT walk in that case to keep retried
+    // joins snappy.
+    const existing = this.node.libp2p.getConnections(peerId);
+    if (existing.length > 0) {
+      this.log.info(ctx, `Already connected to ${peerIdStr}`);
+      return;
+    }
+
+    const peerRouting = (this.node.libp2p as any).peerRouting;
+    if (!peerRouting || typeof peerRouting.findPeer !== 'function') {
+      const error = new Error('libp2p peerRouting unavailable (DHT not configured)');
+      (error as any).code = 'PEER_ROUTING_UNAVAILABLE';
+      throw error;
+    }
+
+    this.log.info(ctx, `Resolving ${peerIdStr} via DHT...`);
+    let info: { multiaddrs?: any[] };
+    try {
+      info = await peerRouting.findPeer(peerId, {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err: any) {
+      const error = new Error(`PEER_NOT_FOUND: ${err?.message ?? String(err)}`);
+      (error as any).code = 'PEER_NOT_FOUND';
+      throw error;
+    }
+
+    const addrs = (info?.multiaddrs ?? []).map((m: any) => m?.toString?.() ?? String(m)).filter(Boolean);
+    if (addrs.length === 0) {
+      const error = new Error('PEER_NOT_FOUND: DHT returned no addresses');
+      (error as any).code = 'PEER_NOT_FOUND';
+      throw error;
+    }
+    this.log.info(ctx, `DHT resolved ${peerIdStr} → ${addrs.length} addr(s); dialling...`);
+
+    try {
+      await this.node.libp2p.peerStore.merge(peerId, { multiaddrs: info.multiaddrs ?? [] });
+    } catch {
+      // peerStore merge is best-effort; libp2p.dial(peerId) will still
+      // attempt a fresh DHT lookup if the merge didn't take.
+    }
+
+    try {
+      await this.node.libp2p.dial(peerId, { signal: AbortSignal.timeout(timeoutMs) });
+      this.log.info(ctx, `Connected to ${peerIdStr}`);
+    } catch (err: any) {
+      const error = new Error(`DIAL_FAILED: ${err?.message ?? String(err)}`);
+      (error as any).code = 'DIAL_FAILED';
+      throw error;
+    }
   }
 
   /**

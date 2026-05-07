@@ -1843,6 +1843,7 @@ mcpCmd
         logManualFundingInstructions: openclawSetupExports.logManualFundingInstructions,
         requestFaucetFunding: coreExports.requestFaucetFunding,
         findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
+        resolveDkgConfigHome: coreExports.resolveDkgConfigHome,
         resolveDkgBin,
       });
     } catch (err: any) {

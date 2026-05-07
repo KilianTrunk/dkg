@@ -155,6 +155,16 @@ export interface McpSetupActionDeps {
    */
   findDkgMonorepoRoot: typeof import('@origintrail-official/dkg-core').findDkgMonorepoRoot;
   /**
+   * Codex Round-2 Bug A: resolve the DKG home directory used by the
+   * config / daemon / faucet steps below. Defaults to the dkg-core
+   * implementation in production; injectable so tests can pin a
+   * deterministic home without depending on `homedir()` or env. When
+   * mcp-setup detects monorepo context it forwards the signal here
+   * so the bootstrap state lands in the same `~/.dkg-dev` that the
+   * registered local CLI dist will read at MCP-client startup time.
+   */
+  resolveDkgConfigHome: typeof import('@origintrail-official/dkg-core').resolveDkgConfigHome;
+  /**
    * F30: resolve the absolute path of the `dkg` bin (fallback to
    * `null` if not on PATH). Required because GUI MCP clients
    * (Claude Desktop, Windsurf, etc.) don't inherit the shell PATH
@@ -228,6 +238,33 @@ function canonicalEntry(
     return { command: resolvedBin, args: ['mcp', 'serve'] };
   }
   return { command: 'dkg', args: ['mcp', 'serve'] };
+}
+
+/**
+ * Codex Round-2 helper. Returns `true` if `cmd` looks like an
+ * absolute-path entry pointing at a `dkg` bin: an absolute path
+ * (POSIX `/...` or Windows-drive `X:\...`) whose final segment is
+ * `dkg`, `dkg.exe`, `dkg.cmd`, or `dkg.bat`. Used by `classify` to
+ * recognise pre-existing F30-style absolute entries when the current
+ * `resolveDkgBin()` call returns `null` (e.g. PATH state changed
+ * between setup runs); preserving these prevents a regression from
+ * the previously-written GUI-friendly absolute path back to bare
+ * `'dkg'`.
+ */
+function isAbsoluteDkgBinPath(cmd: unknown): boolean {
+  if (typeof cmd !== 'string' || cmd.length === 0) return false;
+  const isPosixAbsolute = cmd.startsWith('/');
+  const isWindowsAbsolute = /^[A-Za-z]:[\\/]/.test(cmd);
+  if (!isPosixAbsolute && !isWindowsAbsolute) return false;
+  const lastSep = Math.max(cmd.lastIndexOf('/'), cmd.lastIndexOf('\\'));
+  const basename = lastSep >= 0 ? cmd.slice(lastSep + 1) : cmd;
+  const lowered = basename.toLowerCase();
+  return (
+    lowered === 'dkg' ||
+    lowered === 'dkg.exe' ||
+    lowered === 'dkg.cmd' ||
+    lowered === 'dkg.bat'
+  );
 }
 
 /**
@@ -741,11 +778,19 @@ function classify(
   const commandMatches =
     currentCommand === expectedCommand ||
     // Bare `"dkg"` is equivalent to ANY resolved-path expected
-    // command — both invoke the currently-installed bin. The
-    // reverse is NOT symmetric: a resolved-path current is only
-    // equivalent if it matches the resolved-path expected exactly
-    // (handled by the strict `===` above).
-    (currentCommand === 'dkg' && typeof expectedCommand === 'string');
+    // command — both invoke the currently-installed bin.
+    (currentCommand === 'dkg' && typeof expectedCommand === 'string') ||
+    // Codex Round-2: the reverse case for the resolution-failed
+    // path. When `resolveDkgBin()` returns `null`, `canonicalEntry`
+    // falls back to bare `'dkg'` for `expectedCommand`. If the
+    // client config already has a working absolute-path entry from
+    // a prior successful resolution, classifying it as `stale` here
+    // would let the planner refresh it back to bare `'dkg'` — a
+    // regression of the F30 fix. Treat any absolute-path current
+    // whose basename is `dkg` / `dkg.exe` / `dkg.cmd` / `dkg.bat`
+    // as equivalent to expected bare-`'dkg'`, preserving the
+    // existing GUI-friendly entry.
+    (expectedCommand === 'dkg' && isAbsoluteDkgBinPath(currentCommand));
   const argsMatch =
     Array.isArray((current as Record<string, unknown>).args) &&
     JSON.stringify((current as Record<string, unknown>).args) ===
@@ -857,13 +902,15 @@ export async function mcpSetupAction(
       },
     };
     process.stdout.write(JSON.stringify(block, null, 2) + '\n');
-    // Codex Issue 5: VSCode + Copilot Chat keys MCP servers under
-    // `servers`, not the canonical `mcpServers`. Users following the
-    // `--print-only` manual-paste path for VSCode would silently
-    // get the wrong shape. Append a one-paragraph note BELOW the
-    // JSON so existing copy-paste workflows for the 5 canonical-
-    // shape clients aren't broken; the note disambiguates VSCode.
-    process.stdout.write(
+    // Codex Round-2: VSCode + Copilot Chat keys MCP servers under
+    // `servers`, not the canonical `mcpServers`. Round-1 of this
+    // fix appended the note + a second JSON object to stdout, but
+    // that breaks `dkg mcp setup --print-only | jq …` and any
+    // redirect-based workflow — the flag contract is "stdout is the
+    // canonical JSON document". Keep stdout a single JSON document
+    // and emit the disambiguation to stderr instead, matching the
+    // standard CLI convention (data on stdout, advisories on stderr).
+    process.stderr.write(
       '\n' +
         'Note: VSCode + GitHub Copilot Chat uses a different shape — ' +
         '`servers.dkg` instead of `mcpServers.dkg`. For VSCode, paste:\n' +
@@ -879,11 +926,27 @@ export async function mcpSetupAction(
     console.log('[setup] DRY RUN — no files will be modified, no daemon will start\n');
   }
 
-  // ── Step 1: ensure ~/.dkg/config.json ─────────────────────────────
+  // ── Step 1: ensure <dkg-home>/config.json ─────────────────────────
   // Mirrors `dkg openclaw setup` step 3 byte-for-byte. If the file
   // already exists, `writeDkgConfig` merges (first-wins on `name` /
   // `apiPort` unless explicit overrides are passed).
-  const dkgDirPath = join(homedir(), '.dkg');
+  //
+  // Codex Round-2 Bug A: thread the monorepo signal into DKG-home
+  // resolution so the bootstrap state (config, daemon pid, faucet
+  // wallets, auth.token) lands in the SAME directory the registered
+  // local CLI dist will read at MCP-client startup. Without this,
+  // monorepo-context setup writes the local-CLI MCP entry but
+  // bootstraps state under `~/.dkg`, while the daemon spawned by
+  // that local CLI on next launch reads `~/.dkg-dev` (because
+  // `resolveDkgConfigHome` from inside the monorepo source detects
+  // monorepo and prefers the dev home). Setting `DKG_HOME` for the
+  // duration of this action overrides the package-path-based auto-
+  // detection inside adapter-openclaw's `dkgDir()` and dkg-core's
+  // daemon-lifecycle, keeping all four flows aligned.
+  const dkgDirPath = deps.resolveDkgConfigHome({
+    isDkgMonorepo: context === 'monorepo',
+  });
+  process.env.DKG_HOME = dkgDirPath;
   const yamlPath = join(dkgDirPath, 'config.yaml');
   const jsonPath = join(dkgDirPath, 'config.json');
   const configExists = existsSync(yamlPath) || existsSync(jsonPath);

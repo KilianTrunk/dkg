@@ -20,6 +20,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
   let originalHome: string | undefined;
   let originalUserprofile: string | undefined;
   let originalAppdata: string | undefined;
+  let originalDkgHome: string | undefined;
   let logSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
@@ -29,6 +30,12 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     originalHome = process.env.HOME;
     originalUserprofile = process.env.USERPROFILE;
     originalAppdata = process.env.APPDATA;
+    // Codex Round-2 Bug A: mcpSetupAction now sets DKG_HOME for the
+    // duration of the action so adapter-openclaw / dkg-core flows
+    // pick up the resolved home. Save+restore it like HOME/APPDATA
+    // so the env mutation is bounded to each test.
+    originalDkgHome = process.env.DKG_HOME;
+    delete process.env.DKG_HOME;
     process.env.HOME = tmpHome;
     // node:os homedir() reads USERPROFILE on win32, HOME elsewhere; set both.
     process.env.USERPROFILE = tmpHome;
@@ -49,6 +56,8 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     else delete process.env.USERPROFILE;
     if (originalAppdata !== undefined) process.env.APPDATA = originalAppdata;
     else delete process.env.APPDATA;
+    if (originalDkgHome !== undefined) process.env.DKG_HOME = originalDkgHome;
+    else delete process.env.DKG_HOME;
     logSpy.mockRestore();
     warnSpy.mockRestore();
     errorSpy.mockRestore();
@@ -64,7 +73,12 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
   function makeDeps(overrides: Partial<McpSetupActionDeps> = {}): McpSetupActionDeps {
     const startDaemon = vi.fn(async (_port: number) => {});
     const writeDkgConfig = vi.fn((agentName: string, _network: any, apiPort: number) => {
-      const dkgDir = join(tmpHome, '.dkg');
+      // Codex Round-2 Bug A: production `writeDkgConfig` uses
+      // adapter-openclaw's `dkgDir()` which delegates to
+      // `resolveDkgConfigHome()` and respects `DKG_HOME`. Mirror that
+      // posture in the stub so monorepo-mode tests that flip
+      // `isDkgMonorepo` see the side effects in the dev-home dir.
+      const dkgDir = process.env.DKG_HOME ?? join(tmpHome, '.dkg');
       mkdirSync(dkgDir, { recursive: true });
       writeFileSync(
         join(dkgDir, 'config.json'),
@@ -90,6 +104,25 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // Tests that exercise the absolute-path resolution override this
     // dep with a path-returning stub.
     const resolveDkgBin = vi.fn((): string | null => null);
+    // Codex Round-2 Bug A: resolveDkgConfigHome defaults to mirroring
+    // the production dkg-core posture against the test's tmpHome.
+    // `isDkgMonorepo: true` ⇒ `<tmpHome>/.dkg-dev`; otherwise ⇒
+    // `<tmpHome>/.dkg`. Existing tests that don't exercise the
+    // monorepo path keep landing in `<tmpHome>/.dkg` byte-aligned
+    // with the pre-Bug-A behaviour.
+    const resolveDkgConfigHome = vi.fn(
+      (opts: { isDkgMonorepo?: boolean } = {}): string => {
+        if (opts.isDkgMonorepo) {
+          const devDir = join(tmpHome, '.dkg-dev');
+          // Tests that hit the monorepo branch expect writeDkgConfig
+          // to land in this directory; create it eagerly so existsSync
+          // probes downstream don't trip over a missing parent.
+          mkdirSync(devDir, { recursive: true });
+          return devDir;
+        }
+        return join(tmpHome, '.dkg');
+      },
+    );
     return {
       loadNetworkConfig,
       writeDkgConfig,
@@ -98,6 +131,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       requestFaucetFunding,
       logManualFundingInstructions,
       findDkgMonorepoRoot,
+      resolveDkgConfigHome,
       resolveDkgBin,
       ...overrides,
     };
@@ -370,12 +404,12 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
   // ── Phase-2: monorepo context detection + --installed/--monorepo flags ──
 
-  // Helper: extract the FIRST balanced JSON object from spied stdout.
-  // Pre-Codex-Issue-5 the production --print-only path emitted exactly
-  // one JSON block; first-`{` to last-`}` was a tight bracket. After
-  // Issue 5 we ALSO emit a VSCode-shape note + a second JSON block,
-  // so first-`{` to last-`}` spans both. Walk balanced braces (with
-  // string-literal awareness) to grab just the first object's bytes.
+  // Helper: parse the single canonical JSON object from spied stdout.
+  // Codex Round-2 Bug B: --print-only stdout is now contractually a
+  // single JSON document (the VSCode-shape note + secondary block
+  // moved to stderr). `JSON.parse(all)` would also work, but we
+  // keep the brace-walking shape so leading/trailing whitespace
+  // around the JSON body never trips the parser.
   const parseStdoutJson = (
     spy: ReturnType<typeof vi.spyOn>,
   ): Record<string, any> => {
@@ -400,47 +434,6 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       }
     }
     throw new Error(`Unbalanced JSON object in stdout: ${JSON.stringify(all)}`);
-  };
-
-  // Helper: parse the SECOND JSON block from --print-only output.
-  // Codex Issue 5 appends a `{ servers: { dkg: ... } }` block after
-  // the canonical `mcpServers.dkg` block as a manual-paste hint for
-  // VSCode + Copilot Chat. Tests for the note assert against this
-  // second block.
-  const parseStdoutJsonSecond = (
-    spy: ReturnType<typeof vi.spyOn>,
-  ): Record<string, any> | null => {
-    const all = (spy.mock.calls as any[]).map((c) => String(c[0])).join('');
-    let cursor = 0;
-    let count = 0;
-    while (cursor < all.length) {
-      const start = all.indexOf('{', cursor);
-      if (start < 0) return null;
-      let depth = 0;
-      let inString = false;
-      let escaped = false;
-      for (let i = start; i < all.length; i++) {
-        const ch = all[i];
-        if (escaped) { escaped = false; continue; }
-        if (ch === '\\') { escaped = true; continue; }
-        if (ch === '"') { inString = !inString; continue; }
-        if (inString) continue;
-        if (ch === '{') depth++;
-        else if (ch === '}') {
-          depth--;
-          if (depth === 0) {
-            count++;
-            if (count === 2) {
-              return JSON.parse(all.slice(start, i + 1));
-            }
-            cursor = i + 1;
-            break;
-          }
-        }
-      }
-      if (depth !== 0) return null;
-    }
-    return null;
   };
 
   // Codex Bug 3: tests that pass a fake monorepoRoot via the
@@ -1121,31 +1114,48 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(false);
   });
 
-  it('Codex Issue 5: --print-only emits a VSCode-shape note alongside the canonical block', async () => {
-    // Pre-fix: --print-only emitted only mcpServers.dkg. Users
-    // following the manual-paste path for VSCode + Copilot Chat
-    // got a wrong-shape snippet. Post-fix: a second block under
-    // `servers.dkg` is appended below the canonical block as a
-    // manual-paste hint for VSCode.
+  it('Codex Issue 5 + Round-2 Bug B: --print-only stdout stays pure canonical JSON; VSCode note goes to stderr', async () => {
+    // Round-1 of Issue 5: --print-only appended a second JSON block
+    // + prose to stdout to disambiguate VSCode's `servers.dkg`
+    // shape. Round-2 Codex feedback: that broke the
+    // `dkg mcp setup --print-only | jq …` flag contract — stdout
+    // must be a single canonical JSON document. Final shape: stdout
+    // stays the canonical `mcpServers.dkg` block (single JSON
+    // document, parses cleanly with `jq`), and the VSCode-shape
+    // note is emitted on stderr instead.
     const deps = makeDeps();
     const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
     await mcpSetupAction({ printOnly: true }, deps);
 
-    // First block is the canonical mcpServers.dkg shape.
-    const first = parseStdoutJson(stdoutSpy);
-    expect(first.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
-    // Second block is the VSCode `servers.dkg` shape with the
-    // SAME entry contents — pinning that the note isn't drift.
-    const second = parseStdoutJsonSecond(stdoutSpy);
-    expect(second).not.toBeNull();
-    expect(second!.servers?.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
-    // The explanatory text mentioning VSCode + servers.dkg appears
-    // between the two blocks.
-    const allText = (stdoutSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
-    expect(allText).toMatch(/VSCode/i);
-    expect(allText).toMatch(/servers\.dkg/);
+    // STDOUT: a single JSON document, parseable as-is — no prose,
+    // no second object. This is the `dkg mcp setup --print-only |
+    // jq …` flag contract.
+    const stdoutText = (stdoutSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    const stdoutParsed = JSON.parse(stdoutText);
+    expect(stdoutParsed.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    // No `servers.dkg` (the VSCode shape) on stdout — keeps it
+    // machine-readable.
+    expect(stdoutParsed.servers).toBeUndefined();
+
+    // STDERR: the VSCode-shape disambiguation note + a second JSON
+    // block under `servers.dkg`. Same entry contents as the canonical
+    // block — pinning that the note isn't drift.
+    const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    expect(stderrText).toMatch(/VSCode/i);
+    expect(stderrText).toMatch(/servers\.dkg/);
+    // The stderr note contains a parseable `{ servers: { dkg: ... } }`
+    // block; extract the JSON portion (between the first `{` and the
+    // matching closing `}`) and parse it.
+    const stderrJsonStart = stderrText.indexOf('{');
+    expect(stderrJsonStart).toBeGreaterThanOrEqual(0);
+    const stderrJsonText = stderrText.slice(stderrJsonStart).trim();
+    const stderrParsed = JSON.parse(stderrJsonText);
+    expect(stderrParsed.servers?.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+
     stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
   });
 
   it('phase-4: VSCode staleness — pre-existing dkg entry under `servers.dkg` reclassifies on context flip to monorepo', async () => {
@@ -1183,5 +1193,210 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     );
 
     fetchSpy.mockRestore();
+  });
+
+  // ── Codex Round-2 review fixes ────────────────────────────────────
+
+  it('Codex Round-2 Bug A: monorepo context routes DKG home to dev dir + sets DKG_HOME', async () => {
+    // Pre-fix: mcpSetupAction hard-coded `~/.dkg` regardless of
+    // monorepo detection. The registered local CLI dist (whose
+    // own dkgDir() resolves to `~/.dkg-dev` from inside the
+    // monorepo) would read a different home than mcp-setup just
+    // bootstrapped — config / daemon / faucet split across two
+    // dirs. Post-fix: thread the monorepo signal into
+    // `resolveDkgConfigHome({ isDkgMonorepo: true })` and set
+    // `DKG_HOME` so adapter-openclaw's dkgDir() and dkg-core's
+    // daemon-lifecycle agree on the dev home.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    let isDkgMonorepoArg: boolean | undefined;
+    let dkgHomeAtWriteCall: string | undefined;
+    let dkgHomeAtStartDaemonCall: string | undefined;
+
+    const resolveDkgConfigHomeSpy = vi.fn((opts: { isDkgMonorepo?: boolean } = {}) => {
+      isDkgMonorepoArg = opts.isDkgMonorepo;
+      const dir = opts.isDkgMonorepo ? join(tmpHome, '.dkg-dev') : join(tmpHome, '.dkg');
+      mkdirSync(dir, { recursive: true });
+      return dir;
+    });
+
+    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
+      // Capture the env at the moment writeDkgConfig is invoked so
+      // we can assert that DKG_HOME was set BEFORE step 1's write.
+      dkgHomeAtWriteCall = process.env.DKG_HOME;
+      const dir = process.env.DKG_HOME ?? join(tmpHome, '.dkg');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'config.json'),
+        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+      );
+    });
+
+    const startDaemonSpy = vi.fn(async (_port: number) => {
+      dkgHomeAtStartDaemonCall = process.env.DKG_HOME;
+    });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      resolveDkgConfigHome: resolveDkgConfigHomeSpy,
+      writeDkgConfig: writeDkgConfigSpy,
+      startDaemon: startDaemonSpy,
+    });
+
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    // (1) resolveDkgConfigHome was called with isDkgMonorepo: true —
+    // the monorepo signal threaded through.
+    expect(isDkgMonorepoArg).toBe(true);
+
+    // (2) DKG_HOME was set BEFORE step 1's writeDkgConfig and was
+    // still set BEFORE step 2's startDaemon. Both downstream
+    // primitives delegate to dkgDir() which respects this env var,
+    // so all four flows (mcp-setup, openclaw, core daemon-lifecycle,
+    // and the registered local CLI) land in the SAME home.
+    expect(dkgHomeAtWriteCall).toBe(join(tmpHome, '.dkg-dev'));
+    expect(dkgHomeAtStartDaemonCall).toBe(join(tmpHome, '.dkg-dev'));
+
+    // (3) The bootstrapped config landed in the dev home, not ~/.dkg.
+    expect(existsSync(join(tmpHome, '.dkg-dev', 'config.json'))).toBe(true);
+    expect(existsSync(join(tmpHome, '.dkg', 'config.json'))).toBe(false);
+  });
+
+  it('Codex Round-2 Bug A: installed context keeps DKG home at ~/.dkg (no dev-dir leak)', async () => {
+    // Counterpart to the monorepo case: when no monorepo is
+    // detected, DKG home stays at the canonical `~/.dkg`. Pre-fix
+    // and post-fix behaviour byte-aligned for installed-mode users.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    let isDkgMonorepoArg: boolean | undefined;
+    const resolveDkgConfigHomeSpy = vi.fn((opts: { isDkgMonorepo?: boolean } = {}) => {
+      isDkgMonorepoArg = opts.isDkgMonorepo;
+      return join(tmpHome, '.dkg');
+    });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => null),
+      resolveDkgConfigHome: resolveDkgConfigHomeSpy,
+    });
+
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    expect(isDkgMonorepoArg).toBe(false);
+    expect(process.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    expect(existsSync(join(tmpHome, '.dkg', 'config.json'))).toBe(true);
+    // No accidental .dkg-dev creation on the installed path.
+    expect(existsSync(join(tmpHome, '.dkg-dev'))).toBe(false);
+  });
+
+  it('Codex Round-2 Bug B: --print-only stdout is a single parseable JSON document (jq-compatible)', async () => {
+    // Round-1 of Issue 5 emitted the canonical JSON + prose + a
+    // second JSON object on stdout, breaking
+    // `dkg mcp setup --print-only | jq …`. Round-2 fix: stdout
+    // stays a single JSON document. This test asserts the strict
+    // contract: `JSON.parse(allStdout)` succeeds, with no leftover
+    // bytes after the canonical block.
+    const deps = makeDeps();
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await mcpSetupAction({ printOnly: true }, deps);
+
+    const stdoutText = (stdoutSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    // jq-style strict parse: the entire stdout (after trimming
+    // trailing newline) must round-trip through JSON.parse with
+    // nothing left over.
+    const trimmed = stdoutText.trim();
+    expect(() => JSON.parse(trimmed)).not.toThrow();
+    const parsed = JSON.parse(trimmed);
+    // Exactly one top-level key: `mcpServers`. No `servers` (VSCode
+    // shape) on stdout.
+    expect(Object.keys(parsed)).toEqual(['mcpServers']);
+    // No prose contamination on stdout.
+    expect(stdoutText).not.toMatch(/Note/);
+    expect(stdoutText).not.toMatch(/VSCode/i);
+
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
+  });
+
+  it('Codex Round-2 Bug C: existing absolute-path entry is preserved when resolveDkgBin returns null on rerun', async () => {
+    // Concrete scenario: a prior `dkg mcp setup` ran when `dkg`
+    // was on PATH and wrote an absolute-path entry. A later rerun
+    // happens in an environment where `which dkg` fails (e.g. the
+    // user's shell PATH state changed; or fnm/nvm switched and
+    // the resolver missed). Pre-fix: canonicalEntry falls back
+    // to bare `'dkg'` AND classify marks the existing absolute
+    // entry as `stale`, triggering a refresh that downgrades the
+    // GUI-friendly absolute path back to bare — regressing the F30
+    // fix this PR exists to provide.
+    //
+    // Post-fix: classify treats any absolute-path entry whose
+    // basename is `dkg` / `dkg.exe` / `dkg.cmd` / `dkg.bat` as
+    // equivalent to expected bare-`'dkg'`, preserving the existing
+    // entry verbatim.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    // Pre-existing absolute-path entry, as if a prior successful
+    // `which dkg` resolution wrote it.
+    const existingAbsPath = platform() === 'win32'
+      ? 'C:\\Users\\test\\AppData\\Local\\fnm\\dkg.exe'
+      : '/usr/local/bin/dkg';
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: { dkg: { command: existingAbsPath, args: ['mcp', 'serve'] } },
+      }, null, 2),
+    );
+
+    const deps = makeDeps({
+      // resolveDkgBin returns null this run — simulating the
+      // rerun-after-PATH-state-change scenario.
+      resolveDkgBin: vi.fn(() => null),
+    });
+
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    // The pre-existing absolute-path entry was PRESERVED — not
+    // refreshed back to bare `'dkg'`. This is the regression
+    // protection.
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    expect(after.mcpServers.dkg.command).toBe(existingAbsPath);
+    expect(after.mcpServers.dkg.command).not.toBe('dkg');
+  });
+
+  it('Codex Round-2 Bug C: bogus non-dkg absolute-path entry IS classified stale (only dkg basenames are preserved)', async () => {
+    // Counterpart guard: the `isAbsoluteDkgBinPath` heuristic
+    // accepts ONLY paths whose basename is dkg / dkg.exe /
+    // dkg.cmd / dkg.bat. An absolute path pointing somewhere
+    // else (operator typo; manual mis-edit; some other tool
+    // squatting on the entry) MUST classify as stale and get
+    // refreshed — otherwise broken entries would survive setup
+    // forever. The test pre-seeds a `/totally/wrong/path` and
+    // asserts the refresh fired.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    const bogusAbsPath = platform() === 'win32'
+      ? 'C:\\Users\\test\\some-other-tool.exe'
+      : '/totally/wrong/path/some-other-tool';
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: { dkg: { command: bogusAbsPath, args: ['mcp', 'serve'] } },
+      }, null, 2),
+    );
+
+    const deps = makeDeps({
+      // Force --force so we know any refresh is from staleness
+      // detection, not from the F31 confirm prompt loop bypass.
+      resolveDkgBin: vi.fn(() => null),
+    });
+
+    await mcpSetupAction({ force: true, fund: false, verify: false }, deps);
+
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    // Refreshed to bare-`'dkg'` (since resolveDkgBin returned
+    // null and the existing entry is not a dkg-basename absolute).
+    expect(after.mcpServers.dkg.command).toBe('dkg');
   });
 });

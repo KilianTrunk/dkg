@@ -223,7 +223,31 @@ export async function runEtl({
 
   for (let i = 0; i < traceRecords.length; i += 1) {
     const rec = traceRecords[i];
-    const itemIds = Object.keys(rec.items ?? {});
+    // Validate `items` is a plain object whose values are item objects.
+    // `BIKE_SOURCE` is external input, so accept-anything-truthy +
+    // `Object.keys(rec.items ?? {})` would silently turn arrays into
+    // synthetic numeric EPC IDs (`"0"`, `"1"`...) and strings into
+    // per-character ones. The downstream EPCIS document is malformed
+    // either way; failing here points at the actual cause (a malformed
+    // source record) instead of leaving a stack trace at the publisher.
+    if (rec.items === undefined || rec.items === null) continue;
+    if (typeof rec.items !== 'object' || Array.isArray(rec.items)) {
+      throw new Error(
+        `Source record has malformed \`items\`: expected a plain object, ` +
+          `got ${Array.isArray(rec.items) ? 'array' : typeof rec.items} ` +
+          `(trace_id=${rec.trace_id} unit_id=${rec.unit_id} ended=${JSON.stringify(rec.ended)})`,
+      );
+    }
+    for (const [itemId, itemVal] of Object.entries(rec.items)) {
+      if (itemVal === null || typeof itemVal !== 'object' || Array.isArray(itemVal)) {
+        throw new Error(
+          `Source record has malformed \`items.${itemId}\`: expected a plain object ` +
+            `(with at least an optional \`status\` field), got ${Array.isArray(itemVal) ? 'array' : typeof itemVal} ` +
+            `(trace_id=${rec.trace_id} unit_id=${rec.unit_id} ended=${JSON.stringify(rec.ended)})`,
+        );
+      }
+    }
+    const itemIds = Object.keys(rec.items);
     if (itemIds.length === 0) continue;
 
     // If items have heterogeneous statuses, group them so each EPCIS event

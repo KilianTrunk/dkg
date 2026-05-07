@@ -180,6 +180,81 @@ test('repeated unit_id across stations does not collide on eventID', async () =>
   assert.deepEqual(files, ['event-01-StationA.json', 'event-02-StationB.json']);
 });
 
+test('malformed `items` shapes are rejected with precise errors instead of producing invalid EPCIS', async () => {
+  // BIKE_SOURCE is external input. Without explicit shape-validation
+  // the ETL would silently turn arrays into synthetic numeric EPC IDs
+  // (`Object.keys(["A","B"])` → `["0","1"]`) and strings into per-
+  // character IDs. Both produce malformed EPCIS documents the publisher
+  // would later reject with confusing errors. The validator should
+  // fail loud at ETL time instead.
+  const cases = [
+    { label: 'items = array', items: ['A', 'B'] },
+    { label: 'items = string', items: 'A' },
+    { label: 'items = number', items: 42 },
+    { label: 'items.A = array', items: { A: ['Passed'] } },
+    { label: 'items.A = string', items: { A: 'Passed' } },
+    { label: 'items.A = null', items: { A: null } },
+  ];
+  for (const c of cases) {
+    const records = [{
+      trace_id: TRACE,
+      unit_id: 'c1',
+      unit_name: 'WC',
+      process_name: 'S',
+      ended: '2026-05-12T08:00:00Z',
+      product_id: 'P',
+      items: c.items,
+    }];
+    let threw = false;
+    try {
+      await withSource(records);
+    } catch (err) {
+      threw = true;
+      assert.match(err.message, /malformed `items/, `expected validation error for case "${c.label}", got: ${err.message}`);
+    }
+    assert.equal(threw, true, `expected ETL to throw on case "${c.label}"`);
+  }
+});
+
+test('shared outDir cleanup preserves sibling traces', async () => {
+  // Regression for cycle 9 → 16 oscillation: the cleanup path used to
+  // either glob-delete every `event-*.json` (cross-trace data loss) or
+  // aggregate files across ALL `trace-*.json` manifests in the dir
+  // (also cross-trace data loss). Cycle 9 fixed it to use the current
+  // traceId's manifest only. This test pins that behavior: regenerating
+  // trace B into a dir holding trace A leaves trace A's files intact.
+  const dir = await mkdtemp(join(tmpdir(), 'epcis-bike-shared-'));
+  try {
+    const TRACE_A = 'aaaa1111-2222-4333-8444-555555555555';
+    const TRACE_B = 'bbbb2222-3333-4444-8555-666666666666';
+    const recA = [{
+      trace_id: TRACE_A, unit_id: 'a1', unit_name: 'WC', process_name: 'StationA',
+      ended: '2026-05-12T08:00:00Z', product_id: 'P', items: { X: { status: 'Passed' } },
+    }];
+    const recB = [{
+      trace_id: TRACE_B, unit_id: 'b1', unit_name: 'WC', process_name: 'StationB',
+      ended: '2026-05-12T09:00:00Z', product_id: 'P', items: { Y: { status: 'Passed' } },
+    }];
+    const srcA = join(dir, 'src-A.json');
+    const srcB = join(dir, 'src-B.json');
+    await writeFile(srcA, JSON.stringify(recA), 'utf8');
+    await writeFile(srcB, JSON.stringify(recB), 'utf8');
+    // ETL trace A into shared dir.
+    const { runEtl } = await import('../lib/etl.mjs');
+    await runEtl({ source: srcA, traceId: TRACE_A, outDir: dir });
+    // ETL trace B into the SAME dir.
+    await runEtl({ source: srcB, traceId: TRACE_B, outDir: dir });
+    const filenames = (await readdir(dir)).sort();
+    // Both trace manifests + both events must be present.
+    assert.ok(filenames.includes(`trace-${TRACE_A}-bike-line.json`), 'trace A manifest preserved');
+    assert.ok(filenames.includes(`trace-${TRACE_B}-bike-line.json`), 'trace B manifest preserved');
+    assert.ok(filenames.includes('event-01-StationA.json'), 'trace A event preserved');
+    assert.ok(filenames.includes('event-01-StationB.json'), 'trace B event preserved');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('eventID determinism: re-running the ETL on the same source yields identical eventIDs', async () => {
   const records = [
     { trace_id: TRACE, unit_id: 'c1', unit_name: 'WC1', process_name: 'StationA', ended: '2026-05-12T08:00:00.000Z', product_id: 'P', items: { A: { status: 'Passed' } } },

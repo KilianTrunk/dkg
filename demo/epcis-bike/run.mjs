@@ -86,7 +86,31 @@ let phase6GrantOk = false;
 // publisher's anchor-write target depends on lift state. Stays at 0 when
 // node2 is unavailable — Phase 7 short-circuits with `node2Ident=null` in
 // that case so the baseline isn't consulted.
-let phase7AnchorBaseline = { finalized: 0, swm: 0, private: 0, captured: false };
+// Per-partition baseline validity: a partition is `ok=true` only when
+// its Phase-0 baseline probe returned 200 + a parseable count. A failed
+// probe leaves `ok=false` and the consumer (Phase 7A/B) falls back to
+// absolute count for that partition only. Earlier we tracked a single
+// `captured` flag for all three partitions; that masked partial probe
+// failures — a non-200 on the SWM probe with a successful finalized
+// probe still set `captured=true`, and Phase 7A's SWM-fallback path
+// would then subtract a stale 0 from a real anchor count and falsely
+// report "anchors visible from this run" against pure leftover stale
+// data from earlier runs.
+let phase7AnchorBaseline = {
+  finalized: { ok: false, count: 0 },
+  swm: { ok: false, count: 0 },
+  private: { ok: false, count: 0 },
+};
+
+// Set to 1 when Phase 6's allow-list capture reaches a success terminal
+// (finalized/completed), 0 otherwise. Phase 7A's expected-anchor bound
+// must include this so it doesn't mask a missing Phase 1 anchor with
+// the Phase 6 anchor: if Phase 1 emitted N events and Phase 6 ran, the
+// publisher writes N + 1 `privateDataAnchor` triples to <cg>/<sub>'s
+// public partition; Phase 7A's `delta >= N` check (without Phase 6's
+// contribution) would let `delta == N` pass when only N-1 of N Phase 1
+// anchors gossipped + Phase 6's anchor masked the gap.
+let phase6AnchoredCount = 0;
 
 // `--skip-cg-create` bypasses the canonical-ID resolution path in Phase 0.
 // If `EPCIS_DEMO_CG` is a bare name (no `/`), `CG_ID` stays as-is and every
@@ -830,38 +854,53 @@ async function phase0() {
       `}`;
     const privateBaselineSparql = (uri) =>
       `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${uri}> { ?s ?p ?o } }`;
-    let baselineFinalized = 0;
-    let baselineSwm = 0;
-    let baselinePrivate = 0;
-    try {
-      const fr = await node2Sparql(anchorBaselineSparql(finalizedGraphUriBaseline));
-      if (fr.status === 200 && Array.isArray(fr.bindings)) {
-        baselineFinalized = parseCountBinding(fr.bindings[0]?.c);
+    // Probe each partition independently — a transient failure on one
+    // partition shouldn't poison the others' baselines. `ok` flips to
+    // true only when the probe returned 200 + parseable bindings;
+    // otherwise the partition keeps `ok=false` and Phase 7's downstream
+    // check falls back to absolute count for that partition only.
+    const probeBaseline = async (sparql) => {
+      try {
+        const r = await node2Sparql(sparql);
+        if (r.status === 200 && Array.isArray(r.bindings)) {
+          return { ok: true, count: parseCountBinding(r.bindings[0]?.c) };
+        }
+      } catch {
+        // fall through to ok=false below
       }
-      const sr = await node2Sparql(anchorBaselineSparql(swmGraphUriBaseline));
-      if (sr.status === 200 && Array.isArray(sr.bindings)) {
-        baselineSwm = parseCountBinding(sr.bindings[0]?.c);
+      return { ok: false, count: 0 };
+    };
+    const finalizedBaseline = await probeBaseline(anchorBaselineSparql(finalizedGraphUriBaseline));
+    const swmBaseline = await probeBaseline(anchorBaselineSparql(swmGraphUriBaseline));
+    const privateBaseline = await probeBaseline(privateBaselineSparql(privGraphUriBaseline));
+    phase7AnchorBaseline = {
+      finalized: finalizedBaseline,
+      swm: swmBaseline,
+      private: privateBaseline,
+    };
+    if (!JSON_MODE) {
+      const failedPartitions = [
+        finalizedBaseline.ok ? null : 'finalized',
+        swmBaseline.ok ? null : 'SWM',
+        privateBaseline.ok ? null : 'private',
+      ].filter(Boolean);
+      if (failedPartitions.length > 0) {
+        fmt.warn(
+          `  Phase 7 baseline probe failed on partition(s): ${failedPartitions.join(', ')}. ` +
+            'Phase 7A/B will fall back to absolute counts for those partitions; ' +
+            'a reused CG with stale data may produce false positives.',
+        );
       }
-      const pr = await node2Sparql(privateBaselineSparql(privGraphUriBaseline));
-      if (pr.status === 200 && Array.isArray(pr.bindings)) {
-        baselinePrivate = parseCountBinding(pr.bindings[0]?.c);
+      const totalKnownBaseline =
+        (finalizedBaseline.ok ? finalizedBaseline.count : 0) +
+        (swmBaseline.ok ? swmBaseline.count : 0) +
+        (privateBaseline.ok ? privateBaseline.count : 0);
+      if (totalKnownBaseline > 0) {
+        fmt.note(
+          `  Phase 7 baselines on node2: ${finalizedBaseline.count} finalized + ${swmBaseline.count} SWM anchors, ` +
+            `${privateBaseline.count} private triples already present — Phase 7A/B will check the delta.`,
+        );
       }
-      phase7AnchorBaseline = {
-        finalized: baselineFinalized,
-        swm: baselineSwm,
-        private: baselinePrivate,
-        captured: true,
-      };
-    } catch {
-      // Leave baseline at default {0, 0, 0, captured:false}; Phase 7A/B
-      // still run but their deltas degrade to absolute counts. Better
-      // than aborting Phase 0 over a transient query.
-    }
-    if (!JSON_MODE && (baselineFinalized + baselineSwm + baselinePrivate) > 0) {
-      fmt.note(
-        `  Phase 7 baselines on node2: ${baselineFinalized} finalized + ${baselineSwm} SWM anchors, ` +
-          `${baselinePrivate} private triples already present — Phase 7A/B will check the delta.`,
-      );
     }
   }
 
@@ -1483,6 +1522,13 @@ async function phase6() {
     phase6GrantOk = false;
     return;
   }
+  // Record that Phase 6 added one privateDataAnchor triple to the
+  // public partition, so Phase 7A's expected count includes it. Stays 0
+  // when Phase 6 timed out or failed (handled above), so the fallback
+  // doesn't over-count.
+  if (phase6FinalState !== null && isSuccessState(phase6FinalState)) {
+    phase6AnchoredCount = 1;
+  }
   if (phase6FinalState === null) {
     // `phase6CaptureId` is guaranteed truthy here — the missing-id branch
     // above hard-fails out — so this condition is purely "polling
@@ -1623,7 +1669,8 @@ async function phase7(trace) {
     let anchorCount = querySucceeded(anchorRes) ? parseCount(anchorRes) : 0;
     let queriedPartition = 'finalized';
     let anchorQueryOk = querySucceeded(anchorRes);
-    let baselineForPartition = phase7AnchorBaseline.captured ? phase7AnchorBaseline.finalized : 0;
+    let baselineForPartition = phase7AnchorBaseline.finalized.ok ? phase7AnchorBaseline.finalized.count : 0;
+    let baselineForPartitionOk = phase7AnchorBaseline.finalized.ok;
     // The "did anchors gossip THIS run" claim is `current - baseline > 0`.
     // The fallback to SWM applies when the post-baseline finalized delta
     // is zero (subscribers don't materialize finalized; SWM is the
@@ -1634,20 +1681,20 @@ async function phase7(trace) {
       anchorQueryOk = querySucceeded(anchorRes);
       anchorCount = anchorQueryOk ? parseCount(anchorRes) : 0;
       queriedPartition = 'swm-fallback';
-      baselineForPartition = phase7AnchorBaseline.captured ? phase7AnchorBaseline.swm : 0;
+      baselineForPartition = phase7AnchorBaseline.swm.ok ? phase7AnchorBaseline.swm.count : 0;
+      baselineForPartitionOk = phase7AnchorBaseline.swm.ok;
     }
     const anchorDelta = anchorCount - baselineForPartition;
-    // Scope the assertion to THIS run AND require ALL of this run's
-    // captures to have gossiped — `delta > 0` is too lax: it lets the
-    // green success line + verified table cell trigger as soon as a
-    // single capture's anchor reaches node2, even when 6 of 7 stayed
-    // stuck. `delta >= expectedAnchorCount` (where the expected count
-    // is `trace.event_count`, the number of EPCIS docs Phase 1 sent)
-    // requires the full run's gossip to land. When no baseline was
-    // captured (node2 unreachable at Phase 0), baselineForPartition
-    // stays 0 and the comparison degrades to `anchorCount >=
-    // expectedAnchorCount` — still a tighter bound than `> 0`.
-    const expectedAnchorCount = Array.isArray(trace?.events) ? trace.events.length : 0;
+    // The expected count must include Phase 6's anchor when its capture
+    // finalized — Phase 6 writes one synthetic "batch summary" KC after
+    // Phase 1, so the publisher emits `<event_count> + 1` privateData-
+    // Anchor triples on the public partition for a fully-successful run.
+    // Without including phase6AnchoredCount, a missing Phase 1 anchor
+    // can be silently masked by Phase 6's anchor (e.g. 6 of 7 fixture
+    // anchors gossip + 1 Phase 6 anchor == 7 == `expected`, the gap
+    // never surfaces).
+    const expectedAnchorCount =
+      (Array.isArray(trace?.events) ? trace.events.length : 0) + phase6AnchoredCount;
     anchorOk = anchorQueryOk && expectedAnchorCount > 0 && anchorDelta >= expectedAnchorCount;
     if (!JSON_MODE) {
       fmt.step('phase-7a-public-anchor-on-node2', 'Anyone — public anchor visible on a second node');
@@ -1667,7 +1714,7 @@ async function phase7(trace) {
       }
       await pauseAfter();
     } else {
-      process.stdout.write(`${JSON.stringify({ step: 'phase-7a-public-anchor-on-node2', anchorCount, anchorDelta, expected: expectedAnchorCount, baseline: baselineForPartition, partition: queriedPartition, queryOk: anchorQueryOk, ok: anchorOk })}\n`);
+      process.stdout.write(`${JSON.stringify({ step: 'phase-7a-public-anchor-on-node2', anchorCount, anchorDelta, expected: expectedAnchorCount, baseline: baselineForPartition, baselineOk: baselineForPartitionOk, partition: queriedPartition, queryOk: anchorQueryOk, ok: anchorOk })}\n`);
     }
 
     // 7.B — Private payload absent on node2 until access-protocol fetch.
@@ -1695,7 +1742,7 @@ async function phase7(trace) {
     // absolute zero. When no baseline was captured (node2 unreachable
     // at Phase 0), privBaseline stays 0 and delta degrades to absolute
     // count.
-    const privBaseline = phase7AnchorBaseline.captured ? phase7AnchorBaseline.private : 0;
+    const privBaseline = phase7AnchorBaseline.private.ok ? phase7AnchorBaseline.private.count : 0;
     const privDelta = privCount - privBaseline;
     privateInvisible = privQueryOk && privDelta === 0;
     if (!JSON_MODE) {

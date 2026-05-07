@@ -1837,7 +1837,7 @@ mcpCmd
     try {
       await mcpSetupAction(opts, {
         loadNetworkConfig: openclawSetupExports.loadNetworkConfig,
-        writeDkgConfig: openclawSetupExports.writeDkgConfig,
+        ensureDkgNodeConfig: coreExports.ensureDkgNodeConfig,
         startDaemon: openclawSetupExports.startDaemon,
         readWalletsWithRetry: openclawSetupExports.readWalletsWithRetry,
         logManualFundingInstructions: openclawSetupExports.logManualFundingInstructions,

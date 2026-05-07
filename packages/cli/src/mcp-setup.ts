@@ -143,7 +143,21 @@ export interface PlannedItem {
  */
 export interface McpSetupActionDeps {
   loadNetworkConfig: typeof import('@origintrail-official/dkg-adapter-openclaw').loadNetworkConfig;
-  writeDkgConfig: typeof import('@origintrail-official/dkg-adapter-openclaw').writeDkgConfig;
+  /**
+   * Codex Round-23 Fix 30: agent-agnostic config-write helper from
+   * `dkg-core`. Pre-fix this dep was `adapter-openclaw`'s
+   * `writeDkgConfig` wrapper, which ran 3 OpenClaw-specific
+   * mutations (`migrateLegacyOpenClawTransport`, plus
+   * `delete existing.openclawAdapter` / `delete existing.openclawChannel`)
+   * before delegating to this same `ensureDkgNodeConfig`. Those
+   * mutations are no-ops on MCP-only configs but the dependency
+   * was architecturally wrong — MCP setup shouldn't reach into
+   * the OpenClaw adapter for config writes. Calling the agent-
+   * agnostic helper directly drops the dead OpenClaw baggage from
+   * the MCP-only setup path. The OpenClaw migrations stay scoped
+   * to `dkg openclaw setup`'s own `writeDkgConfig` call site.
+   */
+  ensureDkgNodeConfig: typeof import('@origintrail-official/dkg-core').ensureDkgNodeConfig;
   startDaemon: typeof import('@origintrail-official/dkg-adapter-openclaw').startDaemon;
   readWalletsWithRetry: typeof import('@origintrail-official/dkg-adapter-openclaw').readWalletsWithRetry;
   logManualFundingInstructions: typeof import('@origintrail-official/dkg-adapter-openclaw').logManualFundingInstructions;
@@ -1324,17 +1338,31 @@ export async function mcpSetupAction(
   if (configExists && opts.name == null && opts.port == null) {
     console.log(`[setup] Node config exists (${tildify(existsSync(yamlPath) ? yamlPath : jsonPath)}); leaving untouched.`);
   } else if (dryRun) {
-    console.log(`[setup] [dry-run] Would write ~/.dkg/config.json (port ${effectivePort}, name "${effectiveAgentName}")`);
+    console.log(`[setup] [dry-run] Would write ${tildify(jsonPath)} (port ${effectivePort}, name "${effectiveAgentName}")`);
   } else {
     try {
       const network = deps.loadNetworkConfig();
-      deps.writeDkgConfig(effectiveAgentName, network, apiPort, {
-        nameExplicit: opts.name != null,
-        portExplicit: opts.port != null,
+      // Codex Round-23 Fix 30: call the agent-agnostic
+      // ensureDkgNodeConfig directly. The caller-loads-existing
+      // contract means we pre-read the persisted config (yaml or
+      // json) here and pass it through; the helper merges with
+      // network defaults + overrides. No OpenClaw migration step
+      // — MCP-only configs never have the legacy openclawAdapter
+      // / openclawChannel keys this setup never wrote.
+      const existing = readPersistedConfig(dkgDirPath) ?? {};
+      deps.ensureDkgNodeConfig({
+        agentName: effectiveAgentName,
+        network,
+        apiPort,
+        existing,
+        overrides: {
+          nameExplicit: opts.name != null,
+          portExplicit: opts.port != null,
+        },
       });
-      // Re-read after writeDkgConfig in case the daemon's config-
-      // merge changed `apiPort` / `name` (first-wins semantics on
-      // existing fields, explicit overrides on new).
+      // Re-read after ensureDkgNodeConfig in case the helper's
+      // field-level merge changed `apiPort` / `name` (first-wins
+      // semantics on existing fields, explicit overrides on new).
       reconcileFromPersistedConfig();
     } catch (err: any) {
       console.error(`[setup] Failed to load network config: ${err?.message ?? err}`);

@@ -103,24 +103,41 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
   });
 
   /**
-   * Build a fresh stubbed deps surface. `writeDkgConfig` writes a real
-   * file into the temp HOME so the post-merge readback in mcpSetupAction
-   * sees a valid config — that's the byte-aligned behaviour with the
-   * production primitive without spawning a real daemon.
+   * Build a fresh stubbed deps surface. `ensureDkgNodeConfig` writes a
+   * real file into the temp HOME so the post-merge readback in
+   * mcpSetupAction sees a valid config — byte-aligned with the
+   * production helper's contract without spawning a real daemon.
+   *
+   * Codex Round-23 Fix 30: signature is the object-shape one
+   * (`{ agentName, network, apiPort, existing, overrides }`) used
+   * by `dkg-core`'s helper. Round-2 Bug A's DKG_HOME-honouring
+   * posture is preserved — the stub reads `process.env.DKG_HOME`
+   * (set by the action) for the write target.
    */
   function makeDeps(overrides: Partial<McpSetupActionDeps> = {}): McpSetupActionDeps {
     const startDaemon = vi.fn(async (_port: number) => {});
-    const writeDkgConfig = vi.fn((agentName: string, _network: any, apiPort: number) => {
-      // Codex Round-2 Bug A: production `writeDkgConfig` uses
-      // adapter-openclaw's `dkgDir()` which delegates to
-      // `resolveDkgConfigHome()` and respects `DKG_HOME`. Mirror that
-      // posture in the stub so monorepo-mode tests that flip
-      // `isDkgMonorepo` see the side effects in the dev-home dir.
+    const ensureDkgNodeConfig = vi.fn((opts: {
+      agentName: string;
+      network: any;
+      apiPort: number;
+      existing: Record<string, any>;
+      overrides?: { nameExplicit?: boolean; portExplicit?: boolean };
+    }) => {
       const dkgDir = process.env.DKG_HOME ?? join(tmpHome, '.dkg');
       mkdirSync(dkgDir, { recursive: true });
+      // Mirror the production helper's first-wins / explicit-override
+      // semantics minimally — most tests just check that the call
+      // happened with these args, but a few re-read the file so we
+      // emit something realistic.
+      const merged = {
+        ...opts.existing,
+        name: opts.overrides?.nameExplicit ? opts.agentName : (opts.existing?.name ?? opts.agentName),
+        apiPort: opts.overrides?.portExplicit ? opts.apiPort : (opts.existing?.apiPort ?? opts.apiPort),
+        nodeRole: opts.existing?.nodeRole ?? 'edge',
+      };
       writeFileSync(
         join(dkgDir, 'config.json'),
-        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+        JSON.stringify(merged, null, 2),
       );
     });
     const loadNetworkConfig = vi.fn(() => ({
@@ -162,7 +179,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     );
     return {
       loadNetworkConfig,
-      writeDkgConfig,
+      ensureDkgNodeConfig,
       startDaemon,
       readWalletsWithRetry,
       requestFaucetFunding,
@@ -182,12 +199,12 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // Avoid the verify step's real-network probe.
     await mcpSetupAction({ verify: false, fund: false }, deps);
 
-    // (a) writeDkgConfig was called with port 9200 (default) + a fallback agent name.
-    expect(deps.writeDkgConfig).toHaveBeenCalledTimes(1);
-    const writeArgs = (deps.writeDkgConfig as any).mock.calls[0];
-    expect(writeArgs[2]).toBe(9200);
-    expect(typeof writeArgs[0]).toBe('string');
-    expect(writeArgs[0]).toMatch(/^mcp-agent-/);
+    // (a) ensureDkgNodeConfig was called with port 9200 (default) + a fallback agent name.
+    expect(deps.ensureDkgNodeConfig).toHaveBeenCalledTimes(1);
+    const writeArgs = (deps.ensureDkgNodeConfig as any).mock.calls[0][0];
+    expect(writeArgs.apiPort).toBe(9200);
+    expect(typeof writeArgs.agentName).toBe('string');
+    expect(writeArgs.agentName).toMatch(/^mcp-agent-/);
     expect(existsSync(join(tmpHome, '.dkg', 'config.json'))).toBe(true);
 
     // (b) startDaemon was called once with the effective port.
@@ -209,7 +226,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const deps = makeDeps();
     await mcpSetupAction({ verify: false, fund: false }, deps);
 
-    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    expect(deps.ensureDkgNodeConfig).not.toHaveBeenCalled();
     // Daemon start still runs unless --no-start was passed.
     expect(deps.startDaemon).toHaveBeenCalledTimes(1);
   });
@@ -238,7 +255,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     // writeDkgConfig MUST NOT have run — the existing-config branch
     // was taken (no overrides supplied).
-    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    expect(deps.ensureDkgNodeConfig).not.toHaveBeenCalled();
     // startDaemon MUST receive the persisted 9300, not the CLI default.
     expect(deps.startDaemon).toHaveBeenCalledTimes(1);
     expect((deps.startDaemon as any).mock.calls[0][0]).toBe(9300);
@@ -266,7 +283,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // is structural: the branch ran without throwing on the corrupt
     // configs / missing fields path the helper handles. Companion
     // assertion to the port-9300 case above.
-    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    expect(deps.ensureDkgNodeConfig).not.toHaveBeenCalled();
     expect(deps.startDaemon).not.toHaveBeenCalled();
   });
 
@@ -362,7 +379,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     await mcpSetupAction({ dryRun: true }, deps);
 
-    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    expect(deps.ensureDkgNodeConfig).not.toHaveBeenCalled();
     expect(deps.startDaemon).not.toHaveBeenCalled();
     expect(deps.requestFaucetFunding).not.toHaveBeenCalled();
     expect(existsSync(join(tmpHome, '.dkg', 'config.json'))).toBe(false);
@@ -375,7 +392,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     await mcpSetupAction({ printOnly: true }, deps);
 
-    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    expect(deps.ensureDkgNodeConfig).not.toHaveBeenCalled();
     expect(deps.startDaemon).not.toHaveBeenCalled();
     // Codex Issue 5: --print-only now emits TWO JSON blocks (the
     // canonical mcpServers.dkg shape PLUS a VSCode-shape note).
@@ -395,16 +412,16 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     ).rejects.toThrow(/Invalid port/);
   });
 
-  it('--port and --name overrides flow through to writeDkgConfig', async () => {
+  it('--port and --name overrides flow through to ensureDkgNodeConfig', async () => {
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
     const deps = makeDeps();
 
     await mcpSetupAction({ port: '9300', name: 'override-agent', verify: false, fund: false }, deps);
 
-    const writeArgs = (deps.writeDkgConfig as any).mock.calls[0];
-    expect(writeArgs[0]).toBe('override-agent');
-    expect(writeArgs[2]).toBe(9300);
-    expect(writeArgs[3]).toEqual({ nameExplicit: true, portExplicit: true });
+    const writeArgs = (deps.ensureDkgNodeConfig as any).mock.calls[0][0];
+    expect(writeArgs.agentName).toBe('override-agent');
+    expect(writeArgs.apiPort).toBe(9300);
+    expect(writeArgs.overrides).toEqual({ nameExplicit: true, portExplicit: true });
     // Daemon start uses the override port.
     expect((deps.startDaemon as any).mock.calls[0][0]).toBe(9300);
   });
@@ -1270,15 +1287,15 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       return dir;
     });
 
-    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
-      // Capture the env at the moment writeDkgConfig is invoked so
-      // we can assert that DKG_HOME was set BEFORE step 1's write.
+    const ensureDkgNodeConfigSpy = vi.fn((opts: any) => {
+      // Capture the env at the moment ensureDkgNodeConfig is invoked
+      // so we can assert that DKG_HOME was set BEFORE step 1's write.
       dkgHomeAtWriteCall = process.env.DKG_HOME;
       const dir = process.env.DKG_HOME ?? join(tmpHome, '.dkg');
       mkdirSync(dir, { recursive: true });
       writeFileSync(
         join(dir, 'config.json'),
-        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+        JSON.stringify({ name: opts.agentName, apiPort: opts.apiPort, nodeRole: 'edge' }, null, 2),
       );
     });
 
@@ -1289,7 +1306,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const deps = makeDeps({
       findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
       resolveDkgConfigHome: resolveDkgConfigHomeSpy,
-      writeDkgConfig: writeDkgConfigSpy,
+      ensureDkgNodeConfig: ensureDkgNodeConfigSpy,
       startDaemon: startDaemonSpy,
     });
 
@@ -1335,16 +1352,16 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // action returns, so reading it post-`await` no longer reflects
     // the in-action value.
     let dkgHomeAtWriteCall: string | undefined;
-    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
+    const ensureDkgNodeConfigSpy = vi.fn((opts: any) => {
       dkgHomeAtWriteCall = process.env.DKG_HOME;
       const dir = process.env.DKG_HOME ?? join(tmpHome, '.dkg');
       mkdirSync(dir, { recursive: true });
       writeFileSync(
         join(dir, 'config.json'),
-        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+        JSON.stringify({ name: opts.agentName, apiPort: opts.apiPort, nodeRole: 'edge' }, null, 2),
       );
     });
-    (deps as any).writeDkgConfig = writeDkgConfigSpy;
+    (deps as any).ensureDkgNodeConfig = ensureDkgNodeConfigSpy;
 
     await mcpSetupAction({ fund: false, verify: false }, deps);
 
@@ -1396,20 +1413,20 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     });
 
     let dkgHomeAtWriteCall: string | undefined;
-    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
+    const ensureDkgNodeConfigSpy = vi.fn((opts: any) => {
       dkgHomeAtWriteCall = process.env.DKG_HOME;
       const dir = process.env.DKG_HOME ?? installedDkg;
       mkdirSync(dir, { recursive: true });
       writeFileSync(
         join(dir, 'config.json'),
-        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+        JSON.stringify({ name: opts.agentName, apiPort: opts.apiPort, nodeRole: 'edge' }, null, 2),
       );
     });
 
     const deps = makeDeps({
       findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
       resolveDkgConfigHome: resolveDkgConfigHomeSpy,
-      writeDkgConfig: writeDkgConfigSpy,
+      ensureDkgNodeConfig: ensureDkgNodeConfigSpy,
     });
 
     await mcpSetupAction({ monorepo: true, fund: false, verify: false }, deps);
@@ -1440,20 +1457,20 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     const resolveDkgConfigHomeSpy = vi.fn(() => installedDkg);
     let dkgHomeAtWriteCall: string | undefined;
-    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
+    const ensureDkgNodeConfigSpy = vi.fn((opts: any) => {
       dkgHomeAtWriteCall = process.env.DKG_HOME;
       const dir = process.env.DKG_HOME ?? installedDkg;
       mkdirSync(dir, { recursive: true });
       writeFileSync(
         join(dir, 'config.json'),
-        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+        JSON.stringify({ name: opts.agentName, apiPort: opts.apiPort, nodeRole: 'edge' }, null, 2),
       );
     });
 
     const deps = makeDeps({
       findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
       resolveDkgConfigHome: resolveDkgConfigHomeSpy,
-      writeDkgConfig: writeDkgConfigSpy,
+      ensureDkgNodeConfig: ensureDkgNodeConfigSpy,
     });
 
     await mcpSetupAction({ monorepo: true, fund: false, verify: false }, deps);
@@ -1625,13 +1642,13 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const fakeRepoRoot = makeFakeMonorepoRoot();
     const observedHomesAtWriteCall: string[] = [];
 
-    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
+    const ensureDkgNodeConfigSpy = vi.fn((opts: any) => {
       observedHomesAtWriteCall.push(process.env.DKG_HOME ?? '<unset>');
       const dir = process.env.DKG_HOME ?? join(tmpHome, '.dkg');
       mkdirSync(dir, { recursive: true });
       writeFileSync(
         join(dir, 'config.json'),
-        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+        JSON.stringify({ name: opts.agentName, apiPort: opts.apiPort, nodeRole: 'edge' }, null, 2),
       );
     });
 
@@ -1639,7 +1656,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // the fake repo root; `resolveDkgConfigHome` returns dev dir.
     const depsMono = makeDeps({
       findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
-      writeDkgConfig: writeDkgConfigSpy,
+      ensureDkgNodeConfig: ensureDkgNodeConfigSpy,
     });
     await mcpSetupAction({ monorepo: true, fund: false, verify: false }, depsMono);
     // After call 1: DKG_HOME restored to unset.
@@ -1648,7 +1665,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // Call 2: force installed. Default `resolveDkgConfigHome` stub
     // returns `<tmpHome>/.dkg`.
     const depsInstalled = makeDeps({
-      writeDkgConfig: writeDkgConfigSpy,
+      ensureDkgNodeConfig: ensureDkgNodeConfigSpy,
     });
     await mcpSetupAction({ installed: true, fund: false, verify: false }, depsInstalled);
     // After call 2: DKG_HOME restored to unset.
@@ -1933,7 +1950,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     // (1) writeDkgConfig was NOT called — yaml-only configExists
     // fast path keeps the existing file untouched.
-    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    expect(deps.ensureDkgNodeConfig).not.toHaveBeenCalled();
     // (2) startDaemon got the YAML port (9001), NOT the CLI
     // default 9200. This is the load-bearing assertion: pre-fix
     // this would have been 9200.
@@ -1957,7 +1974,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       mcpSetupAction({ fund: false, verify: false }, deps),
     ).resolves.not.toThrow();
 
-    expect(deps.writeDkgConfig).not.toHaveBeenCalled();
+    expect(deps.ensureDkgNodeConfig).not.toHaveBeenCalled();
     // Default port 9200 used since YAML had no apiPort field.
     expect((deps.startDaemon as any).mock.calls[0][0]).toBe(9200);
   });
@@ -2936,5 +2953,38 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // top-level keys from a non-existent prior.
     expect(Object.keys(cursor.mcpServers.dkg).sort()).toEqual(['args', 'command', 'env']);
     expect(cursor.mcpServers.dkg.env).toEqual({ DKG_HOME: join(tmpHome, '.dkg') });
+  });
+
+  // ── Codex Round-23 Fix 29: dry-run log honesty ─────────────────────
+
+  it('Codex Round-23 Fix 29: --dry-run log line cites the RESOLVED dkgDirPath, not literal ~/.dkg', async () => {
+    // Pre-fix the dry-run log hardcoded `~/.dkg/config.json` regardless
+    // of where the resolved bootstrap home actually pointed (e.g.
+    // `~/.dkg-dev` under monorepo mode, or a custom DKG_HOME). The
+    // operator was reading the wrong path in the preview. Post-fix
+    // the log uses `tildify(jsonPath)` so it reflects the actual
+    // write target.
+    //
+    // Force monorepo mode so the resolved home is `<tmpHome>/.dkg-dev`
+    // — different enough from `~/.dkg` that we can assert the log
+    // doesn't contain the literal old string.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+    });
+
+    await mcpSetupAction(
+      { monorepo: true, dryRun: true, fund: false, verify: false },
+      deps,
+    );
+
+    const logged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    // The dry-run line cites the resolved home path.
+    expect(logged).toMatch(/\[dry-run\] Would write/);
+    expect(logged).toContain('.dkg-dev');
+    // And does NOT cite the bare-literal `~/.dkg/config.json` (the
+    // pre-fix string).
+    expect(logged).not.toMatch(/Would write ~\/\.dkg\/config\.json/);
   });
 });

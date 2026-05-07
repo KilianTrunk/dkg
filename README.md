@@ -210,6 +210,38 @@ Use adapters for OpenClaw, ElizaOS, Hermes, or your own Node.js / TypeScript pro
 
 ---
 
+## Benchmarking
+
+Benchmarking docs live in [`BENCHMARKING.md`](BENCHMARKING.md). The current
+suite covers DKG publish/get and memory-layer flows:
+
+- get/read retrieval
+- synchronous publish with finalization
+- asynchronous publish enqueue and finalization
+- upload payload to local working memory
+- lift local working memory to shared working memory
+
+Run the main local benchmark workflow:
+
+```bash
+pnpm bench
+pnpm bench:html
+pnpm bench:analysis
+pnpm bench:profile
+```
+
+The benchmark matrix uses generated payload sizes of `10kb`, `100kb`, `2mb`,
+and `200mb`. Use `DKG_ESBENCH_PAYLOAD_SIZES=10kb` or
+`DKG_ESBENCH_PAYLOAD_SIZES=200mb` to run a focused subset.
+
+Generated reports are written under `bench/results/`. The combined ESBench HTML
+report is `bench/results/latest.html`; per-flow HTML pages are under
+`bench/results/publish-async-get/`. CPU profiles, flame graphs, and per-method
+analysis reports are under `bench/results/profiles/`, including
+`method-analysis.latest.html` for the invoked-method timing breakdown.
+
+---
+
 ## Setup guides
 
 | Guide | Use it when |

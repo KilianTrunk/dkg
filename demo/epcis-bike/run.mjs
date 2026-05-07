@@ -189,6 +189,22 @@ async function resolveAuthToken(dkgHome) {
   }
 }
 
+// Publisher's success terminal is `finalized` (V10). Older RC daemons
+// emit `completed` for the same logical outcome — the `dkg epcis status`
+// CLI accepts both, and so do the Phase 2/6 narrative strings. The
+// direct-HTTP pollers below must agree, otherwise on an older daemon a
+// successful capture sits in the pending set until POLL_TIMEOUT_MS
+// elapses, the loop reports timeout, and the demo declares failure on
+// what was actually a successful lift. `http-error` is a synthetic
+// terminal injected by fetchCaptureStatus on non-2xx so loops break
+// promptly with the HTTP cause attributed correctly.
+function isSuccessState(state) {
+  return state === 'finalized' || state === 'completed';
+}
+function isTerminalState(state) {
+  return isSuccessState(state) || state === 'failed' || state === 'http-error';
+}
+
 // Read the daemon's port + bearer token from DKG_HOME (or ~/.dkg). Cached
 // after first read because Phase 2 polls in tight loops and re-reading the
 // auth file every poll round adds avoidable latency.
@@ -196,10 +212,20 @@ let _daemonAuth;
 async function getDaemonAuth() {
   if (_daemonAuth) return _daemonAuth;
   const dkgHome = process.env.DKG_HOME ?? join(homedir(), '.dkg');
-  const port = Number.parseInt(
-    (await readFile(join(dkgHome, 'api.port'), 'utf-8')).trim(),
-    10,
-  );
+  // Resolve port the same way the CLI's `ApiClient.connect()` does:
+  // `DKG_API_PORT` env var wins over the file-backed `<DKG_HOME>/api.port`.
+  // Without this, a user who points `dkg` at a non-default port via the
+  // env var would hit one daemon for Phase 1 captures (CLI honors the env)
+  // and a different daemon for Phase 2 polling and Phase 6/7 verification
+  // (this script falls back to api.port), surfacing as false POLL_TIMEOUT
+  // expirations and "missing grant" errors against captures that
+  // actually succeeded on the right daemon.
+  const port = process.env.DKG_API_PORT
+    ? Number.parseInt(process.env.DKG_API_PORT, 10)
+    : Number.parseInt(
+        (await readFile(join(dkgHome, 'api.port'), 'utf-8')).trim(),
+        10,
+      );
   const token = await resolveAuthToken(dkgHome);
   if (!Number.isFinite(port) || !token) {
     throw new Error(`Cannot read daemon auth from ${dkgHome}`);
@@ -757,17 +783,13 @@ async function phase2(captureIds) {
       const r = results[i];
       const state = r.parsed?.state;
       // Publisher lift lifecycle: accepted → claimed → validated → broadcast
-      // → included → finalized (success). `failed` is the error terminal.
-      // Earlier "completed" was a misnomer — the EPCIS route passes through
-      // the publisher's status verbatim, so the success terminal really is
-      // "finalized". Anything else is still in progress.
-      //
-      // `http-error` is a synthetic terminal state injected by
-      // fetchCaptureStatus when the daemon returned a non-2xx response —
-      // treat it like `failed` so the loop breaks promptly with the HTTP
-      // cause attributed correctly instead of timing out as "still pending".
-      const isTerminal =
-        state === 'finalized' || state === 'failed' || state === 'http-error';
+      // → included → finalized (success). `failed` is the error terminal,
+      // `http-error` a synthetic terminal injected by fetchCaptureStatus
+      // on non-2xx so the loop breaks promptly with the HTTP cause
+      // attributed correctly. `completed` is recognized as a success
+      // alias too via isSuccessState — older RC daemons emit it instead
+      // of `finalized` for the same outcome.
+      const isTerminal = isTerminalState(state);
       if (isTerminal) {
         final.set(id, { state, response: r.parsed });
         newlyFinalized += 1;
@@ -777,7 +799,7 @@ async function phase2(captureIds) {
           // strip path (paint() only paints the surrounding text inside
           // fmt.note, not embedded escapes), surfacing as raw bytes in
           // CI logs and other non-TTY consumers.
-          const stateColored = state === 'finalized' ? fmt.green(state) : fmt.red(state);
+          const stateColored = isSuccessState(state) ? fmt.green(state) : fmt.red(state);
           fmt.note(`  · ${id.slice(0, 12)}… → ${stateColored}`);
         }
         if (!sampleShown) {
@@ -814,13 +836,13 @@ async function phase2(captureIds) {
     emit('phase-2-status', 'Sample status (first finalized capture)', sampleResult, {
       kind: 'status',
       interpretation:
-        sampleResult.parsed?.state === 'finalized'
+        isSuccessState(sampleResult.parsed?.state)
           ? 'This capture made it on-chain. Its UAL is the durable identifier.'
           : 'This capture did not finalize. The error field explains why.',
     });
   }
 
-  const finalized = [...final.values()].filter((v) => v.state === 'finalized').length;
+  const finalized = [...final.values()].filter((v) => isSuccessState(v.state)).length;
   const failed = [...final.values()].filter((v) => v.state === 'failed').length;
   // Count `http-error` separately from `failed` so the diagnostic in the
   // aggregate line distinguishes "publisher lifted and the lift failed"
@@ -1194,11 +1216,14 @@ async function phase6() {
     while (Date.now() - pollStartedAt < POLL_TIMEOUT_MS) {
       const status = await fetchCaptureStatus(phase6CaptureId);
       const state = status.parsed?.state;
-      // Treat `http-error` (synthesized on non-2xx by fetchCaptureStatus)
-      // as a terminal state so we don't spin until POLL_TIMEOUT_MS waiting
-      // for `finalized` to materialize from a daemon that's returning
-      // 401 / 404 / 500. The post-loop branch surfaces the HTTP error.
-      if (state === 'finalized' || state === 'failed' || state === 'http-error') {
+      // Same terminal semantics as Phase 2's poller — see isTerminalState
+      // for the full set: `finalized`/`completed` (success aliases),
+      // `failed` (error terminal), `http-error` (synthesized non-2xx).
+      // Without `completed` here an older RC daemon's successful Phase 6
+      // grant capture spins until POLL_TIMEOUT_MS, the post-loop branch
+      // declares the lift never reached the meta graph, and Phase 6
+      // reports a false negative.
+      if (isTerminalState(state)) {
         phase6FinalState = state;
         phase6FinalBody = status.parsed;
         break;
@@ -1206,7 +1231,7 @@ async function phase6() {
       await sleep(POLL_INTERVAL_MS);
     }
   }
-  if (phase6FinalState === 'failed' || phase6FinalState === 'http-error') {
+  if (phase6FinalState !== null && !isSuccessState(phase6FinalState)) {
     const cause = phase6FinalState === 'http-error'
       ? `Phase 6 status polling hit a daemon error: `
       : `Phase 6 lift failed before any grant could be written: `;

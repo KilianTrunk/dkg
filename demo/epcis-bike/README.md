@@ -12,7 +12,7 @@ The privacy story is the central beat: by default, EPCIS captures publish a **pu
 
 ## Prerequisites
 
-- Node ≥ 20 (built-in `fetch`).
+- Node.js 22+ — matches the repo-level requirement (`README.md:70`). The demo also uses built-in `fetch`, which is stable from Node 18 onward; the 22 lower bound here is set by the repo, not the demo itself, and is enforced when you run `pnpm -C packages/cli build` from the next bullet.
 - Local DKG daemon running and reachable on `~/.dkg/api.port`. Start it with `dkg start`.
 - Either a recent `dkg` on your `$PATH` *with* the `epcis` subcommand, **or** the local CLI build (`pnpm -C packages/cli build` from repo root). `run.mjs` prefers the local build automatically.
 - The local devnet must be in a **healthy** state — chain adapter responding, contracts deployed and in sync. If the devnet has been running across contract redeploys, captures will finalize with `Async lift cannot mark chain inclusion`. Stopping and restarting the daemon (`dkg stop && dkg start`) typically resolves this; see commit `27490f2b fix(devnet): redeploy contracts when artifacts outpace running chain` for the underlying fix.

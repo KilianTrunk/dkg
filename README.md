@@ -161,7 +161,23 @@ That round-trip — write → search → optionally promote → optionally final
 
 #### Contributor (monorepo dev) workflow
 
-If you run `dkg mcp setup` from inside a `dkg-v9` monorepo checkout, the CLI auto-detects the workspace via `findDkgMonorepoRoot()` and writes the local CLI dist as the first arg instead of the installed CLI's path. The shape stays uniform — only `args[0]` differs:
+To register the local monorepo CLI dist with your MCP clients (so the registered server runs your in-progress changes), use **either** of these two entry-points. Auto-detect keys off the *running CLI's* on-disk location, **not** your shell `cwd` — so just `cd`-ing into the checkout and calling the global `dkg` is NOT enough.
+
+**Option A (preferred): invoke the repo-built CLI directly.** Auto-detect sees the running CLI lives inside the monorepo and switches to monorepo mode automatically:
+
+```bash
+pnpm --filter @origintrail-official/dkg build         # rebuild the CLI dist
+node packages/cli/dist/cli.js mcp setup               # invoke the local build directly
+```
+
+**Option B: pass `--monorepo` with the global bin.** When you have `npm i -g @origintrail-official/dkg` already and want to override auto-detect from the global install, pass `--monorepo` from inside the checkout. The flag's contract is "use the monorepo from this `cwd`", so the global `dkg` invocation resolves the local checkout via cwd:
+
+```bash
+pnpm --filter @origintrail-official/dkg build         # rebuild the CLI dist
+dkg mcp setup --monorepo                              # global `dkg` + explicit monorepo override
+```
+
+Either way, the resolved registration looks like this — the shape stays uniform across modes; only `args[0]` differs:
 
 ```json
 {
@@ -174,14 +190,9 @@ If you run `dkg mcp setup` from inside a `dkg-v9` monorepo checkout, the CLI aut
 }
 ```
 
-This lets the registered MCP run your in-progress changes the next time the client spawns it. **Required prereq: rebuild before re-running setup.**
+**What does NOT work**: `cd dkg-v9 && dkg mcp setup` (without `--monorepo`). With a globally-installed `dkg`, the running CLI lives at the npm global path — auto-detect sees that location is outside any monorepo and stays in installed mode, registering the global build. Your local edits won't be picked up. Either invoke the local dist directly (Option A) or pass `--monorepo` (Option B).
 
-```bash
-pnpm --filter @origintrail-official/dkg build      # rebuild the CLI dist
-dkg mcp setup                                      # re-register against the freshly-built dist
-```
-
-Skip the rebuild and the registered entry points at a stale `dist/cli.js` — your edits won't show up.
+**Always rebuild before re-running setup** — skip the rebuild and the registered entry points at a stale `dist/cli.js`, so your edits won't show up.
 
 **Mode overrides** (mutually exclusive — pass at most one):
 

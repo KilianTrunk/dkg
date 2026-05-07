@@ -836,6 +836,18 @@ export function detectClients(): ClientTarget[] {
         configPath: windsurfWinPath,
         displayPath: windsurfWinPath,
       });
+      // Codex Round-17 Fix 23: Cursor on Windows — same shape as
+      // Linux Cursor (~/.cursor/mcp.json + canonical mcpServers.dkg
+      // entry), just resolved through %USERPROFILE%. Round-13 FIX 20
+      // skipped this; "Windows Cursor + WSL shell" is a common dev
+      // setup that was silently unregistered until now even though
+      // Cursor's been in the detection set since round 1.
+      const cursorWinPath = join(winUserProfile, '.cursor', 'mcp.json');
+      candidates.push({
+        name: 'Cursor (Windows-side via WSL)',
+        configPath: cursorWinPath,
+        displayPath: cursorWinPath,
+      });
     }
   }
 

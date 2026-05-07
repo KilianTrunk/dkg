@@ -36,6 +36,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
   let originalUserprofile: string | undefined;
   let originalAppdata: string | undefined;
   let originalDkgHome: string | undefined;
+  let originalXdgConfigHome: string | undefined;
   let logSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
@@ -51,6 +52,12 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // so the env mutation is bounded to each test.
     originalDkgHome = process.env.DKG_HOME;
     delete process.env.DKG_HOME;
+    // Codex Round-6 Fix 9: linuxConfigDir() reads XDG_CONFIG_HOME at
+    // call time. Save+restore so tests that set it don't leak into
+    // sibling tests and so the existing Linux fallback tests run with
+    // it unset (mirrors the typical operator environment).
+    originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+    delete process.env.XDG_CONFIG_HOME;
     process.env.HOME = tmpHome;
     // node:os homedir() reads USERPROFILE on win32, HOME elsewhere; set both.
     process.env.USERPROFILE = tmpHome;
@@ -73,6 +80,8 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     else delete process.env.APPDATA;
     if (originalDkgHome !== undefined) process.env.DKG_HOME = originalDkgHome;
     else delete process.env.DKG_HOME;
+    if (originalXdgConfigHome !== undefined) process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+    else delete process.env.XDG_CONFIG_HOME;
     logSpy.mockRestore();
     warnSpy.mockRestore();
     errorSpy.mockRestore();
@@ -578,7 +587,9 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       const appData = process.env.APPDATA ?? join(fakeHome, 'AppData', 'Roaming');
       return join(appData, 'Claude', 'claude_desktop_config.json');
     }
-    return join(fakeHome, '.config', 'Claude', 'claude_desktop_config.json');
+    // Codex Round-6 Fix 9: Linux honours XDG_CONFIG_HOME when set.
+    const configBase = process.env.XDG_CONFIG_HOME ?? join(fakeHome, '.config');
+    return join(configBase, 'Claude', 'claude_desktop_config.json');
   }
 
   it('phase-3: Claude Desktop is detected when its config dir exists; gets canonical entry written', async () => {
@@ -669,7 +680,9 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       const appData = process.env.APPDATA ?? join(fakeHome, 'AppData', 'Roaming');
       return join(appData, 'Code', 'User', 'mcp.json');
     }
-    return join(fakeHome, '.config', 'Code', 'User', 'mcp.json');
+    // Codex Round-6 Fix 9: Linux honours XDG_CONFIG_HOME when set.
+    const configBase = process.env.XDG_CONFIG_HOME ?? join(fakeHome, '.config');
+    return join(configBase, 'Code', 'User', 'mcp.json');
   }
 
   it('phase-4: VSCode + Copilot Chat is detected and writes under `servers.dkg` (not `mcpServers.dkg`)', async () => {
@@ -731,7 +744,9 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       const appData = process.env.APPDATA ?? join(fakeHome, 'AppData', 'Roaming');
       return join(appData, 'Code', 'User', suffix);
     }
-    return join(fakeHome, '.config', 'Code', 'User', suffix);
+    // Codex Round-6 Fix 9: Linux honours XDG_CONFIG_HOME when set.
+    const configBase = process.env.XDG_CONFIG_HOME ?? join(fakeHome, '.config');
+    return join(configBase, 'Code', 'User', suffix);
   }
 
   it('phase-5: Cline is detected at VSCode globalStorage and writes canonical `mcpServers.dkg`', async () => {
@@ -1632,5 +1647,184 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       join(tmpHome, '.dkg-dev'),
       join(tmpHome, '.dkg'),
     ]);
+  });
+
+  // ── Codex Round-6 Fix 8: detect ephemeral install paths ──────────
+
+  /**
+   * Helper: temporarily override `process.argv[1]` to a fake CLI
+   * script path, ensuring the file exists so `realpathSync` doesn't
+   * throw before `detectEphemeralInstallPath` gets to run. Returns
+   * a restore function the caller MUST run in `finally`.
+   */
+  function withFakeArgv1(fakeAbsPath: string): () => void {
+    mkdirSync(join(fakeAbsPath, '..'), { recursive: true });
+    writeFileSync(fakeAbsPath, '// fake cli.js for argv[1] override');
+    const original = process.argv[1];
+    process.argv[1] = fakeAbsPath;
+    return () => {
+      process.argv[1] = original;
+    };
+  }
+
+  it('Codex Round-6 Fix 8: npx-style ephemeral install path → throws "install globally first"', async () => {
+    // npx caches packages under `~/.npm/_npx/<hash>/...`. A user who
+    // invokes `npx @origintrail-official/dkg mcp setup` would have
+    // `process.argv[1]` resolved to a path inside that cache; writing
+    // it into client configs means the registration silently breaks
+    // on the next `npm cache clean --force` or after the npx cache
+    // TTL expires.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const ephemeralPath = join(tmpHome, '.npm', '_npx', 'abc123', 'node_modules', '@origintrail-official', 'dkg', 'dist', 'cli.js');
+    const restore = withFakeArgv1(ephemeralPath);
+    try {
+      const deps = makeDeps();
+      await expect(
+        mcpSetupAction({ start: false, fund: false, verify: false }, deps),
+      ).rejects.toThrow(/Detected ephemeral install path \(npx cache\)/);
+
+      // No client config was written on the throw path.
+      expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+
+  it('Codex Round-6 Fix 8: pnpm-dlx-style ephemeral install path → throws "install globally first"', async () => {
+    // pnpm dlx stores packages under
+    // `~/.local/share/pnpm/dlx-<hash>/...` (or similar dlx- prefix
+    // paths). Same persistence problem as npx.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const ephemeralPath = join(tmpHome, '.local', 'share', 'pnpm', 'dlx-abc123', 'node_modules', '@origintrail-official', 'dkg', 'dist', 'cli.js');
+    const restore = withFakeArgv1(ephemeralPath);
+    try {
+      const deps = makeDeps();
+      await expect(
+        mcpSetupAction({ start: false, fund: false, verify: false }, deps),
+      ).rejects.toThrow(/Detected ephemeral install path \(pnpm dlx cache\)/);
+      expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+
+  it('Codex Round-6 Fix 8: persistent global install path → no throw, normal canonical entry', async () => {
+    // Counterpart guard: a "real" global install path (not in any
+    // package-manager cache) MUST NOT be flagged as ephemeral. This
+    // pins the heuristic isn't over-broad — false positives would
+    // break normal global installs by throwing for everyone.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    // A path that looks like a normal npm global install. NOTE: we
+    // can't override realpathSync, so we just place the fake cli.js
+    // somewhere on disk that isn't matched by any of the cache
+    // patterns.
+    const persistentPath = join(tmpHome, 'usr-local-lib', 'node_modules', '@origintrail-official', 'dkg', 'dist', 'cli.js');
+    const restore = withFakeArgv1(persistentPath);
+    try {
+      const deps = makeDeps();
+      await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+      // No throw; the Cursor entry was written with the persistent
+      // path as args[0].
+      const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+      expect(cursorConfig.mcpServers.dkg.command).toBe(process.execPath);
+      expect(cursorConfig.mcpServers.dkg.args[0]).toBe(persistentPath);
+      expect(cursorConfig.mcpServers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
+    } finally {
+      restore();
+    }
+  });
+
+  // ── Codex Round-6 Fix 9: respect XDG_CONFIG_HOME on Linux paths ──
+
+  it('Codex Round-6 Fix 9: Linux Claude Desktop with XDG_CONFIG_HOME → detected at custom location', async () => {
+    // The detection on Linux MUST defer to XDG_CONFIG_HOME when the
+    // operator has set it (common in dotfile-managed setups). Pre-fix
+    // the path was hardcoded to `~/.config/Claude/...` regardless,
+    // so users with a relocated config dir were invisible.
+    if (platform() === 'win32') {
+      // Windows uses %APPDATA%, not XDG; this test is Linux/macOS
+      // only. Skip on Windows so the suite stays cross-platform
+      // green. (macOS uses Library/, but the production code's
+      // linuxConfigDir branch is also taken on any non-darwin/non-
+      // win32 platform; the test below for the helper covers macOS
+      // by directing through the Linux branch when not on Windows.)
+      return;
+    }
+    const xdgConfig = join(tmpHome, 'custom-xdg', 'config');
+    process.env.XDG_CONFIG_HOME = xdgConfig;
+    const claudePath = claudeDesktopPathUnder(tmpHome);
+    // Sanity check on the helper: when XDG is set, the path
+    // resolves under it on Linux, not `~/.config/`.
+    if (platform() !== 'darwin') {
+      expect(claudePath).toContain(xdgConfig);
+      expect(claudePath).not.toContain(join(tmpHome, '.config'));
+    }
+    mkdirSync(join(claudePath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // Detected at the XDG-relocated path; entry written.
+    expect(existsSync(claudePath)).toBe(true);
+    const written = JSON.parse(readFileSync(claudePath, 'utf-8'));
+    expect(written.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
+  it('Codex Round-6 Fix 9: Linux Claude Desktop without XDG_CONFIG_HOME → detected at ~/.config/Claude/ (fallback)', async () => {
+    // Counterpart: the existing `~/.config/Claude/...` behaviour is
+    // preserved when XDG_CONFIG_HOME is unset (the default for most
+    // users). Pre-fix tests were already exercising this path; the
+    // explicit test here pins the fallback contract so a future
+    // refactor doesn't accidentally break it.
+    if (platform() === 'win32') return; // %APPDATA% path on Windows.
+    expect(process.env.XDG_CONFIG_HOME).toBeUndefined();
+    const claudePath = claudeDesktopPathUnder(tmpHome);
+    if (platform() !== 'darwin') {
+      expect(claudePath).toContain(join(tmpHome, '.config', 'Claude'));
+    }
+    mkdirSync(join(claudePath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(claudePath)).toBe(true);
+  });
+
+  it('Codex Round-6 Fix 9: Linux VSCode + Copilot Chat with XDG_CONFIG_HOME → detected at custom location', async () => {
+    if (platform() === 'win32') return;
+    const xdgConfig = join(tmpHome, 'custom-xdg', 'config');
+    process.env.XDG_CONFIG_HOME = xdgConfig;
+    const vscodePath = vscodeMcpPathUnder(tmpHome);
+    if (platform() !== 'darwin') {
+      expect(vscodePath).toContain(xdgConfig);
+    }
+    mkdirSync(join(vscodePath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(vscodePath)).toBe(true);
+    const written = JSON.parse(readFileSync(vscodePath, 'utf-8'));
+    // VSCode uses `servers.dkg` shape (not `mcpServers.dkg`).
+    expect(written.servers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
+  it('Codex Round-6 Fix 9: Linux Cline with XDG_CONFIG_HOME → detected at custom location', async () => {
+    if (platform() === 'win32') return;
+    const xdgConfig = join(tmpHome, 'custom-xdg', 'config');
+    process.env.XDG_CONFIG_HOME = xdgConfig;
+    const clinePath = clineMcpPathUnder(tmpHome);
+    if (platform() !== 'darwin') {
+      expect(clinePath).toContain(xdgConfig);
+    }
+    mkdirSync(join(clinePath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(clinePath)).toBe(true);
+    const written = JSON.parse(readFileSync(clinePath, 'utf-8'));
+    expect(written.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 });

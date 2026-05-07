@@ -18,23 +18,29 @@ dkg mcp setup                                # one-shot: init + start + fund + r
 1. Initializes `~/.dkg/config.json` if absent (skipped silently when present)
 2. Starts the DKG daemon as a background process (skipped if already running)
 3. Funds the node's wallets via the testnet faucet (skip with `--no-fund`)
-4. Detects each MCP-aware client by its config file and writes the canonical entry. **You confirm per detected client interactively** (`Register DKG MCP with <client>? [Y/n]`) unless `--yes` is passed; non-TTY invocations (CI, piped stdin) auto-confirm so scripts don't hang. The detection set is six clients: **Cursor** (`~/.cursor/mcp.json`), **Claude Code** (`~/.claude.json`), **Claude Desktop** (per-platform — `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows, `~/.config/Claude/claude_desktop_config.json` on Linux), **Windsurf** (`~/.codeium/windsurf/mcp_config.json`), **VSCode + GitHub Copilot Chat** (per-platform Code user-settings dir + `mcp.json` — note this client uses the `servers.dkg` shape, not `mcpServers.dkg`), and **Cline** (deep-nested under VSCode's per-extension globalStorage at `Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`). The five `mcpServers.dkg` clients receive the same JSON block
+4. Detects each MCP-aware client by its config file and writes the canonical entry. **You confirm per detected client interactively** (`Register DKG MCP with <client>? [Y/n]`) unless `--yes` is passed; non-TTY invocations (CI, piped stdin) auto-confirm so scripts don't hang. The detection set is six clients: **Cursor** (`~/.cursor/mcp.json`), **Claude Code** (`~/.claude.json`), **Claude Desktop** (per-platform — `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows, `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (or `~/.config/Claude/...` when XDG_CONFIG_HOME is unset) on Linux), **Windsurf** (`~/.codeium/windsurf/mcp_config.json`), **VSCode + GitHub Copilot Chat** (per-platform Code user-settings dir + `mcp.json` — note this client uses the `servers.dkg` shape, not `mcpServers.dkg`), and **Cline** (deep-nested under VSCode's per-extension globalStorage at `Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`). The five `mcpServers.dkg` clients receive the same JSON block
 5. Verifies the daemon is healthy
 
 Every step short-circuits when its work is already done, so re-running on a set-up box is safe. Step-skip flags: `--no-start`, `--no-fund`, `--no-verify`, `--dry-run` (preview only), `--force` (refresh every detected client config regardless of state), `--yes` (auto-confirm per-client registrations; default false — TTY mode prompts interactively, non-TTY auto-confirms; pass `--yes` in scripts for the safer scripted-environment posture). First-init overrides: `--port <n>`, `--name <s>`. The bundled flow re-uses the same primitives `dkg openclaw setup` does, so the two verbs stay byte-aligned on network defaults, daemon-readiness probes, faucet retry/back-off, and manual-curl fallback.
 
-The canonical entry written into each client's config:
+The canonical entry written into each client's config (paths shown POSIX-style; Windows users see equivalent Windows-absolute paths):
 
 ```json
 {
   "mcpServers": {
     "dkg": {
-      "command": "dkg",
-      "args": ["mcp", "serve"]
+      "command": "/usr/local/bin/node",
+      "args": [
+        "/usr/local/lib/node_modules/@origintrail-official/dkg/dist/cli.js",
+        "mcp",
+        "serve"
+      ]
     }
   }
 }
 ```
+
+The `command` is the absolute path to the Node binary running this CLI (`process.execPath` at setup time); the first arg is the absolute path to the installed CLI's `cli.js` (resolved from `process.argv[1]` via `realpathSync`, which canonicalises symlinks across `npm relink` / version-manager rotations). GUI MCP clients (Claude Desktop, Windsurf, VSCode + Copilot) often don't inherit the shell PATH that includes `node` or the `dkg` shim, so writing the resolved absolute paths makes the registration robust against that gap. `dkg mcp setup` resolves and writes both automatically — you only need this manual shape when configuring by hand. For VSCode + Copilot Chat, swap the outer `mcpServers` key for `servers` while keeping the same inner block.
 
 No tokens or URLs in the JSON — those live in `~/.dkg/config.yaml` and the daemon-written `~/.dkg/auth.token`. If no client is detected, run `dkg mcp setup --print-only` to emit the JSON for manual paste.
 
@@ -54,13 +60,13 @@ For environments where `dkg mcp setup` can't run (CI, locked-down configs, custo
 
 ### Contributor (monorepo dev) workflow
 
-If you run `dkg mcp setup` from inside a `dkg-v9` monorepo checkout, the CLI auto-detects the workspace via `findDkgMonorepoRoot()` and writes a different entry that points at your local build instead of the globally-installed `dkg`:
+If you run `dkg mcp setup` from inside a `dkg-v9` monorepo checkout, the CLI auto-detects the workspace via `findDkgMonorepoRoot()` and writes the local CLI dist as the first arg instead of the installed CLI's path. The shape stays uniform — only the `args[0]` differs:
 
 ```json
 {
   "mcpServers": {
     "dkg": {
-      "command": "node",
+      "command": "/usr/local/bin/node",
       "args": ["/absolute/path/to/dkg-v9/packages/cli/dist/cli.js", "mcp", "serve"]
     }
   }

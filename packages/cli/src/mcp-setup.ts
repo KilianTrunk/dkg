@@ -230,7 +230,49 @@ function canonicalEntry(
   // symlinks for stability across npm relink / version-manager
   // rotations.
   const installedCliPath = realpathSync(process.argv[1]);
+  // Codex Round-6 Fix 8: detect ephemeral package-manager cache
+  // paths (npx / pnpm dlx / yarn dlx / bunx). Persisting one of
+  // those into a client config means the registration silently
+  // breaks on the next cache cleanup. Throw an actionable error
+  // so the operator installs globally instead.
+  const ephemeralReason = detectEphemeralInstallPath(installedCliPath);
+  if (ephemeralReason) {
+    throw new Error(
+      `Detected ephemeral install path (${ephemeralReason}): ${installedCliPath}\n` +
+      `MCP client registrations must persist across runs. Install dkg globally first:\n` +
+      `  npm install -g @origintrail-official/dkg && dkg mcp setup`,
+    );
+  }
   return { command: process.execPath, args: [installedCliPath, 'mcp', 'serve'] };
+}
+
+/**
+ * Codex Round-6 Fix 8: detect ephemeral package-manager cache paths
+ * that would yield non-persistent MCP registrations. Returns a
+ * short label of the matched cache pattern, or `null` if the path
+ * looks persistent.
+ *
+ * Patterns matched (path is normalized to forward-slashes +
+ * lower-case before matching, so Windows backslashes and casing
+ * don't escape the heuristic):
+ *   - npm  : `/_npx/`                                 (npx CLI cache)
+ *   - pnpm : `/.pnpm/dlx-`, `/dlx-`                   (pnpm dlx cache)
+ *   - yarn : `/.yarn/cache/`, `/.yarn/berry/cache/`   (yarn berry dlx)
+ *   - bun  : `/.bun/install/cache/`                   (bunx cache)
+ *
+ * Heuristic posture: positive-allow-list-against-cache, not
+ * negative-allow-list-of-globals. Globally installed bins always
+ * live outside these cache paths, so any false-negative still
+ * yields a working install. A false-positive throws and the
+ * operator gets a clear hint to install globally — recoverable.
+ */
+function detectEphemeralInstallPath(absPath: string): string | null {
+  const norm = absPath.replace(/\\/g, '/').toLowerCase();
+  if (norm.includes('/_npx/')) return 'npx cache';
+  if (norm.includes('/.pnpm/dlx-') || norm.includes('/dlx-')) return 'pnpm dlx cache';
+  if (norm.includes('/.yarn/cache/') || norm.includes('/.yarn/berry/cache/')) return 'yarn cache';
+  if (norm.includes('/.bun/install/cache/')) return 'bun cache';
+  return null;
 }
 
 /**
@@ -449,6 +491,20 @@ function tildify(p: string): string {
 }
 
 /**
+ * Codex Round-6 Fix 9: resolve the Linux config base directory,
+ * honouring `XDG_CONFIG_HOME` when set. Per the XDG Base Directory
+ * spec, applications that store config under `~/.config` should
+ * defer to `$XDG_CONFIG_HOME` first — users who relocate app
+ * configs (common on multi-user systems and dotfile-managed
+ * setups) were previously invisible to `dkg mcp setup`'s detection
+ * sweep. Used by the Claude Desktop / VSCode + Copilot Chat /
+ * Cline Linux path resolvers below.
+ */
+function linuxConfigDir(home: string): string {
+  return process.env.XDG_CONFIG_HOME ?? join(home, '.config');
+}
+
+/**
  * Resolve Claude Desktop's per-platform config path. The macOS path
  * uses `~/Library/Application Support/Claude/`; Windows uses
  * `%APPDATA%\Claude\`; Linux follows XDG-ish convention at
@@ -467,9 +523,10 @@ function claudeDesktopPaths(home: string): { configPath: string; displayPath: st
     return { configPath, displayPath: configPath.replace(home, '~') };
   }
   // Linux + everything else: XDG-style. Per Claude's docs the active
-  // config under Linux is `~/.config/Claude/claude_desktop_config.json`.
-  const configPath = join(home, '.config', 'Claude', 'claude_desktop_config.json');
-  return { configPath, displayPath: '~/.config/Claude/claude_desktop_config.json' };
+  // config under Linux is `<XDG_CONFIG_HOME>/Claude/claude_desktop_config.json`,
+  // falling back to `~/.config/Claude/...` when XDG_CONFIG_HOME is unset.
+  const configPath = join(linuxConfigDir(home), 'Claude', 'claude_desktop_config.json');
+  return { configPath, displayPath: tildify(configPath) };
 }
 
 /**
@@ -496,8 +553,8 @@ function vscodeMcpPaths(home: string): { configPath: string; displayPath: string
     const configPath = join(appData, 'Code', 'User', 'mcp.json');
     return { configPath, displayPath: configPath.replace(home, '~') };
   }
-  const configPath = join(home, '.config', 'Code', 'User', 'mcp.json');
-  return { configPath, displayPath: '~/.config/Code/User/mcp.json' };
+  const configPath = join(linuxConfigDir(home), 'Code', 'User', 'mcp.json');
+  return { configPath, displayPath: tildify(configPath) };
 }
 
 /**
@@ -531,8 +588,8 @@ function clineMcpPaths(home: string): { configPath: string; displayPath: string 
     const configPath = join(appData, 'Code', 'User', suffix);
     return { configPath, displayPath: configPath.replace(home, '~') };
   }
-  const configPath = join(home, '.config', 'Code', 'User', suffix);
-  return { configPath, displayPath: `~/.config/Code/User/${suffix.replace(/\\/g, '/')}` };
+  const configPath = join(linuxConfigDir(home), 'Code', 'User', suffix);
+  return { configPath, displayPath: tildify(configPath) };
 }
 
 /**

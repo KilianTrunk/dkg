@@ -268,8 +268,7 @@ Use adapters for OpenClaw, ElizaOS, Hermes, or your own Node.js / TypeScript pro
 
 | Guide | Use it when |
 |---|---|
-| [Model Context Protocol (MCP)](#model-context-protocol-mcp) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline to use DKG as memory |
-| [`packages/mcp-dkg/README.md`](packages/mcp-dkg/README.md) | You want the full MCP tool surface and config reference |
+| [MCP Setup](docs/setup/SETUP_MCP.md) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline to use DKG as memory |
 | [Join the Testnet](docs/setup/JOIN_TESTNET.md) | You want a full node setup and first publish/query flow |
 | [OpenClaw Setup](docs/setup/SETUP_OPENCLAW.md) | You want OpenClaw to use DKG as memory/tools |
 | [Hermes Setup](docs/setup/SETUP_HERMES.md) | You want Hermes Agent to use DKG as memory/tools |

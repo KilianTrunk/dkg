@@ -183,6 +183,25 @@ describe('ApiClient', () => {
       });
     });
 
+    it('createSubGraph() posts context graph id and sub-graph name', async () => {
+      const { fetch, calls } = createTrackingFetch({
+        ok: true,
+        status: 200,
+        body: { created: 'lab', contextGraphId: 'research' },
+      });
+      globalThis.fetch = fetch;
+
+      const result = await client.createSubGraph('research', 'lab');
+
+      expect(result).toEqual({ created: 'lab', contextGraphId: 'research' });
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/sub-graph/create`);
+      expect(calls[0].opts.method).toBe('POST');
+      expect(JSON.parse(calls[0].opts.body as string)).toEqual({
+        contextGraphId: 'research',
+        subGraphName: 'lab',
+      });
+    });
+
     it('publishCclPolicy() posts policy payload', async () => {
       const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: { policyUri: 'urn:policy', hash: 'sha256:abc', status: 'proposed' } });
       globalThis.fetch = fetch;

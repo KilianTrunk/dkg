@@ -8,22 +8,34 @@
  * by environment variables so npx-style installs that live outside a
  * workspace can still point at something:
  *
- *   DKG_HOME         — DKG state directory. When set, config is read
- *                      from `<DKG_HOME>/config.json` first (what
- *                      `dkg mcp setup`'s writeDkgConfig actually
- *                      writes), then `<DKG_HOME>/config.yaml` as
- *                      fallback (the spec-canonical workspace
- *                      format). Both are valid bootstrap states per
- *                      Round-3 Fix 2's `resolveDkgConfigHome`
- *                      semantics. The cwd-walk is skipped entirely.
- *                      Propagated by `dkg mcp setup` via the MCP
- *                      entry's `env: { DKG_HOME }` field (Round-9
- *                      Fix 16) so GUI clients spawning the
+ *   DKG_HOME         — DKG state directory. When set, config is
+ *                      resolved from one of two sources at the
+ *                      home:
+ *                        1. `<DKG_HOME>/config.json` — the daemon
+ *                           config that `dkg mcp setup`'s
+ *                           writeDkgConfig writes (apiPort /
+ *                           contextGraphs / auth shape). Translated
+ *                           to DkgConfig via loadConfigFromDkgHome:
+ *                           `api ← http://localhost:<apiPort>`,
+ *                           `token ← <DKG_HOME>/auth.token`'s first
+ *                           non-comment line, `defaultProject ←
+ *                           contextGraphs[0]`.
+ *                        2. `<DKG_HOME>/config.yaml` — workspace-
+ *                           shape, parsed via the regular yaml flow.
+ *                           Used when an operator hand-writes a
+ *                           workspace config at the home directly.
+ *                      The cwd-walk is skipped entirely under
+ *                      DKG_HOME. Propagated by `dkg mcp setup` via
+ *                      the MCP entry's `env: { DKG_HOME }` field
+ *                      (Round-9 Fix 16) so GUI clients spawning the
  *                      registered command read the same home setup
  *                      just bootstrapped — they don't inherit shell
  *                      env. Operators can also export it from their
  *                      shell. (Round-11 Fix 18 added DKG_HOME-as-
- *                      yaml; Round-19 Fix 25 added json precedence.)
+ *                      yaml; Round-19 Fix 25 added json precedence
+ *                      via the wrong parser; Round-21 Fix 27
+ *                      replaced that with a real daemon-config
+ *                      translator.)
  *   DKG_API          — daemon base URL    (default http://localhost:9200)
  *   DKG_TOKEN        — bearer token       (no default; read-only tools
  *                                          still need it in most setups)
@@ -92,40 +104,27 @@ function readIfExists(filePath: string): string | null {
 }
 
 /**
- * Locate the daemon's config file.
+ * Locate a workspace-shape `.dkg/config.yaml`. When `DKG_HOME` is
+ * set, this checks `<DKG_HOME>/config.yaml` directly and returns
+ * `null` if it doesn't exist (the cwd-walk is suppressed). When
+ * `DKG_HOME` is unset, walks upwards from `start` looking for the
+ * spec-canonical `.dkg/config.yaml`.
  *
- * Codex Round-11 Fix 18 + Round-19 Fix 25: `DKG_HOME` takes priority.
- * When set (propagated by `dkg mcp setup` via the MCP entry's
- * `env: { DKG_HOME }` field, or exported by the operator's shell),
- * config is read from `<DKG_HOME>/config.json` FIRST, then
- * `<DKG_HOME>/config.yaml` as fallback. JSON precedence matches
- * what `dkg mcp setup`'s `writeDkgConfig` actually writes after
- * a fresh setup — pre-Round-19 we only checked yaml, so the post-
- * setup path silently fell through to env defaults (empty token,
- * null project) and every write 401'd. The cwd-walk is skipped
- * entirely when DKG_HOME is set; falling back to the walk would
- * mask a missing-config issue and re-introduce the cwd-dependence
- * FIX 16's env propagation was meant to eliminate.
- *
- * Without `DKG_HOME` set, walk upwards from `start` looking for
- * `.dkg/config.yaml` — the spec-canonical workspace layout (see
- * dkgv10-spec 22_AGENT_ONBOARDING §2.1).
+ * Codex Round-21 Fix 27: this helper now ONLY handles the
+ * workspace-shape yaml. The setup-home daemon-config path (where
+ * `dkg mcp setup` writes `<DKG_HOME>/config.json` with apiPort /
+ * contextGraphs / auth, NOT the node.api/node.token/project shape
+ * loadConfig parses) is handled by `loadConfigFromDkgHome` in a
+ * dedicated translator. Round-19 Fix 25 incorrectly tried to
+ * parse the daemon-config JSON with the workspace-yaml extractor
+ * — every field name mismatched, so the translation extracted
+ * nothing and the post-setup path 401'd.
  */
 function findConfigFile(start: string): string | null {
-  // Inline asString-equivalent: asString is defined later in this
-  // file, so we trim+null-coerce manually here rather than hoist.
   const dkgHome = process.env.DKG_HOME?.trim() || null;
   if (dkgHome) {
-    // Codex Round-19 Fix 25: try `config.json` first (what
-    // `dkg mcp setup`'s `writeDkgConfig` writes), then
-    // `config.yaml` as fallback (the spec-canonical workspace
-    // format and the format honoured by Round-3 Fix 2's
-    // `resolveDkgConfigHome` configExists check).
-    const jsonCandidate = path.join(dkgHome, 'config.json');
-    if (fs.existsSync(jsonCandidate)) return jsonCandidate;
-    const yamlCandidate = path.join(dkgHome, 'config.yaml');
-    if (fs.existsSync(yamlCandidate)) return yamlCandidate;
-    return null;
+    const candidate = path.join(dkgHome, 'config.yaml');
+    return fs.existsSync(candidate) ? candidate : null;
   }
   let dir = path.resolve(start);
   const root = path.parse(dir).root;
@@ -137,6 +136,113 @@ function findConfigFile(start: string): string | null {
     if (parent === dir) return null;
     dir = parent;
   }
+}
+
+/**
+ * Codex Round-21 Fix 27: translate a setup-home daemon config into
+ * the `DkgConfig` shape that `loadConfig` returns.
+ *
+ * `dkg mcp setup`'s `writeDkgConfig` writes a daemon config to
+ * `<DKG_HOME>/config.json` with a different shape than the
+ * workspace agent config that `loadConfig` traditionally parses:
+ *
+ *   daemon config (config.json):
+ *     { apiPort, nodeRole, contextGraphs, auth: { enabled }, … }
+ *
+ *   workspace agent config (config.yaml):
+ *     { node: { api, token, tokenFile }, project, agent: { uri }, … }
+ *
+ * Round-19 Fix 25 tried to read config.json with the yaml-shape
+ * extractor — every field name was wrong, so cfg ended up with
+ * empty token + localhost:9200 + null project, and every write
+ * 401'd despite the FIX 16 → FIX 18 → FIX 25 chain that was
+ * meant to make the round-trip work.
+ *
+ * This translator does the actual mapping:
+ *   - `api` ← `http://localhost:<apiPort>` (default 9200)
+ *   - `token` ← first non-comment line of `<DKG_HOME>/auth.token`
+ *   - `defaultProject` ← `contextGraphs[0]`
+ *
+ * Returns `null` when `<DKG_HOME>/config.json` doesn't exist (so
+ * loadConfig can fall through to the path-B yaml branch).
+ *
+ * Env vars (DKG_API / DKG_TOKEN / DKG_PROJECT / DKG_AGENT_URI)
+ * still override the file values per the operator-precedence
+ * contract — operators with custom shell exports get the same
+ * behaviour they did before.
+ */
+function loadConfigFromDkgHome(dkgHome: string): DkgConfig | null {
+  const jsonPath = path.join(dkgHome, 'config.json');
+  if (!fs.existsSync(jsonPath)) return null;
+
+  let daemonConfig: Record<string, unknown> = {};
+  try {
+    const raw = fs.readFileSync(jsonPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      daemonConfig = parsed as Record<string, unknown>;
+    }
+  } catch (err) {
+    // Malformed JSON is non-fatal; fall through to env-only defaults
+    // below with sourcePath still set so diagnostics can show the
+    // operator which file failed to parse.
+    process.stderr.write(
+      `[mcp-dkg] warning: could not parse ${jsonPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    );
+  }
+
+  const apiPort = typeof daemonConfig.apiPort === 'number' ? daemonConfig.apiPort : 9200;
+  const fileApi = `http://localhost:${apiPort}`;
+  const contextGraphs = Array.isArray(daemonConfig.contextGraphs)
+    ? daemonConfig.contextGraphs
+    : [];
+  const fileDefaultProject =
+    contextGraphs.length > 0 && typeof contextGraphs[0] === 'string'
+      ? (contextGraphs[0] as string)
+      : null;
+
+  // Auth token from the dedicated `<DKG_HOME>/auth.token` file
+  // (one non-comment line, same format as the existing
+  // resolveTokenFromFile helper handles).
+  const tokenPath = path.join(dkgHome, 'auth.token');
+  let fileToken = '';
+  if (fs.existsSync(tokenPath)) {
+    const tokenContent = readIfExists(tokenPath);
+    if (tokenContent) {
+      const line = tokenContent
+        .split('\n')
+        .find((l) => l.trim() && !l.startsWith('#'));
+      if (line) fileToken = line.trim();
+    }
+  }
+
+  // Operator env-var overrides win over file values (matches the
+  // existing loadConfig precedence semantics for operator-set
+  // overrides — env wins for things the file doesn't pin or that
+  // the operator explicitly wants to redirect).
+  const envApi = asString(process.env.DKG_API) ?? asString(process.env.DEVNET_API);
+  const envToken =
+    asString(process.env.DKG_TOKEN) ??
+    asString(process.env.DEVNET_TOKEN) ??
+    asString(process.env.DKG_AUTH);
+  const envProject = asString(process.env.DKG_PROJECT);
+  const envAgent = asString(process.env.DKG_AGENT_URI);
+
+  return {
+    api: envApi ?? fileApi,
+    token: envToken ?? fileToken,
+    defaultProject: envProject ?? fileDefaultProject,
+    agentUri: envAgent ?? null,
+    capture: {
+      autoShare: true,
+      defaultPrivacy: 'team',
+      subGraph: 'chat',
+      assertion: 'chat-log',
+    },
+    sourcePath: jsonPath,
+  };
 }
 
 function resolveTokenFromFile(filePath: string): string | null {
@@ -169,6 +275,24 @@ function asPrivacy(v: unknown): 'private' | 'team' | 'public' {
  * + defaults, which is fine for tools that don't need auth.
  */
 export function loadConfig(cwd: string = process.cwd()): DkgConfig {
+  // Codex Round-21 Fix 27: when DKG_HOME is set AND points at a
+  // setup-home (config.json present), translate the daemon config
+  // shape into DkgConfig. Round-19 Fix 25 incorrectly tried to
+  // parse the daemon JSON with the workspace-yaml extractor —
+  // every field name mismatched and the post-setup path 401'd.
+  // The dedicated translator handles api / token / defaultProject
+  // derivation correctly. Returns null when no config.json exists,
+  // which lets us fall through to the path-B yaml branch below.
+  const dkgHome = process.env.DKG_HOME?.trim() || null;
+  if (dkgHome) {
+    const fromDkgHome = loadConfigFromDkgHome(dkgHome);
+    if (fromDkgHome) return fromDkgHome;
+    // Else fall through: DKG_HOME is set but config.json doesn't
+    // exist there — operator may have hand-written a workspace
+    // shape config.yaml at that path. The findConfigFile()
+    // DKG_HOME branch above will pick that up.
+  }
+
   const envApi = asString(process.env.DKG_API) ?? asString(process.env.DEVNET_API);
   const envToken = asString(process.env.DKG_TOKEN) ?? asString(process.env.DEVNET_TOKEN) ?? asString(process.env.DKG_AUTH);
   const envProject = asString(process.env.DKG_PROJECT);
@@ -182,26 +306,20 @@ export function loadConfig(cwd: string = process.cwd()): DkgConfig {
     const raw = readIfExists(configPath);
     if (raw) {
       try {
-        // Codex Round-19 Fix 25: format-aware parser dispatch.
-        // findConfigFile may return either a `config.json`
-        // (`dkg mcp setup`'s writeDkgConfig output) or a
-        // `config.yaml` (workspace-canonical) depending on what's
-        // present at DKG_HOME. JSON.parse handles JSON; parseYaml
-        // handles YAML (note: parseYaml ALSO accepts well-formed
-        // JSON since YAML is a superset, so the dispatch isn't
-        // strictly required for correctness — but using the
-        // dedicated parser keeps error messages format-specific).
-        const parsed = configPath.endsWith('.json')
-          ? JSON.parse(raw)
-          : parseYaml(raw);
+        // Workspace-canonical yaml format. Round-21 Fix 27 reverted
+        // the Round-19 Fix 25 format-aware dispatch — the daemon
+        // config.json path is handled upstream by
+        // loadConfigFromDkgHome, so by the time we get here, the
+        // file is always yaml-shape (either a workspace
+        // .dkg/config.yaml or a hand-written DKG_HOME/config.yaml).
+        const parsed = parseYaml(raw);
         if (parsed && typeof parsed === 'object') {
           fromFile = parsed as Record<string, unknown>;
         }
       } catch (err) {
-        // Malformed config is not fatal — we just ignore it and log to
+        // Malformed YAML is not fatal — we just ignore it and log to
         // stderr so the user sees the problem without blocking the
-        // server startup. Format name in the warning matches the
-        // file extension for clarity.
+        // server startup.
         process.stderr.write(
           `[mcp-dkg] warning: could not parse ${configPath}: ${
             err instanceof Error ? err.message : String(err)

@@ -1807,8 +1807,8 @@ mcpCmd
   .option('--force', 'Refresh every detected client regardless of current registration state')
   .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
   .option('--yes', 'Auto-confirm per-client registrations (default false: prompt interactively in TTY mode; non-TTY auto-confirms — pass `--yes` in scripts for the safer scripted-environment posture)')
-  .option('--installed', 'Force installed-mode bootstrap home (`~/.dkg`) even when invoked from a monorepo dev checkout. Does NOT change which CLI binary is registered with MCP clients — that is always the CLI you ran. To register a different binary, invoke that binary directly. Mutually exclusive with --monorepo.')
-  .option('--monorepo', 'Force monorepo-mode bootstrap home (`~/.dkg-dev`); errors if no DKG monorepo root is detected from cwd ancestors. Does NOT change which CLI binary is registered with MCP clients — that is always the CLI you ran. Mutually exclusive with --installed.')
+  .option('--installed', 'Force installed-mode setup. Bootstrap home: `~/.dkg`. Registered binary: the running CLI (whichever invoked this command — typically the global `dkg`). Use this from a monorepo cwd when you want the global install instead of the local dist. Mutually exclusive with --monorepo.')
+  .option('--monorepo', 'Force monorepo-mode setup. Bootstrap home: `~/.dkg-dev`. Registered binary: the local `<repo>/packages/cli/dist/cli.js` script (located via cwd-first walk; falls back to the running CLI dir). Errors if no DKG monorepo root is detected. Switches BOTH bootstrap home AND the registered binary, unlike --installed which only switches the home. Mutually exclusive with --installed.')
   .action(async (opts) => {
     // Dynamic-import the openclaw-setup primitives for the bundled
     // init + daemon-start. Same import surface (and same package

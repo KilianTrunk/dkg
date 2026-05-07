@@ -98,8 +98,8 @@ Either way, the resolved registration looks like this — the shape stays unifor
 
 **Mode overrides** (mutually exclusive — pass at most one):
 
-- `--installed` forces installed-mode bootstrap home (`~/.dkg`) even from a monorepo cwd. **It does NOT change which CLI binary is registered with MCP clients** — the registered binary is always the CLI you ran. To register a different binary, invoke that binary directly.
-- `--monorepo` forces monorepo-mode bootstrap home (`~/.dkg-dev`) and errors if no DKG monorepo root is locatable from cwd ancestors. Use this to fail loudly if your CI expects a monorepo path but the workspace lookup goes sideways. **Same binary-selection caveat as `--installed`** — the registered binary is always the CLI you ran.
+- `--installed` forces installed-mode setup. **Bootstrap home**: `~/.dkg`. **Registered binary**: the running CLI (whichever invoked the command — typically the global `dkg`). Use this from a monorepo cwd when you want the global install registered instead of the local dist. Only the bootstrap home changes — the registered binary is always the CLI you ran.
+- `--monorepo` forces monorepo-mode setup. **Bootstrap home**: `~/.dkg-dev`. **Registered binary**: the local `<repo>/packages/cli/dist/cli.js` script (located via cwd-first walk; falls back to the running CLI dir). Errors if no DKG monorepo root is detected. Unlike `--installed`, this switches **both** the bootstrap home **and** the registered binary — so re-running setup in a fresh checkout with `--monorepo` swaps the persisted MCP entry to the local build.
 
 The `[setup] Registering CLI: …` log line emitted at registration time prints the exact `command` and `args` that will be persisted into client configs, so you can verify the resolved binary path before any write happens.
 

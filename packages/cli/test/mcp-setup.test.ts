@@ -1,8 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { mcpSetupAction, type McpSetupActionDeps } from '../src/mcp-setup.js';
+
+/**
+ * Codex Round-4: canonical entry shape that production now writes
+ * for INSTALLED context. Both modes emit `{ command:
+ * process.execPath, args: [<cli script path>, 'mcp', 'serve'] }`;
+ * installed-mode resolves the script path from `process.argv[1]`
+ * via `realpathSync` (canonicalises symlinks). Tests that assert
+ * the exact installed-mode entry contents call this helper so they
+ * stay byte-aligned with production without hardcoding the
+ * test-runner-specific argv[1].
+ */
+const EXPECTED_INSTALLED_ENTRY = () => ({
+  command: process.execPath,
+  args: [realpathSync(process.argv[1]), 'mcp', 'serve'],
+});
 
 /**
  * Bundled-flow fixture for `dkg mcp setup`. Per W6-pre task brief, asserts
@@ -99,11 +114,10 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // from findDkgMonorepoRoot. Tests that exercise the monorepo path
     // override this dep to return a mock repo root.
     const findDkgMonorepoRoot = vi.fn((_startDir?: string) => null as string | null);
-    // F30: resolveDkgBin defaults to returning null (bin not found),
-    // which keeps the canonical entry as the bare-`"dkg"` form.
-    // Tests that exercise the absolute-path resolution override this
-    // dep with a path-returning stub.
-    const resolveDkgBin = vi.fn((): string | null => null);
+    // Codex Round-4: `resolveDkgBin` was removed from the deps
+    // surface — both modes now register `process.execPath +
+    // <cli.js path>`, so the `which dkg` resolution it provided is
+    // obsolete.
     // Codex Round-2 Bug A: resolveDkgConfigHome defaults to mirroring
     // the production dkg-core posture against the test's tmpHome.
     // `isDkgMonorepo: true` ⇒ `<tmpHome>/.dkg-dev`; otherwise ⇒
@@ -132,7 +146,6 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       logManualFundingInstructions,
       findDkgMonorepoRoot,
       resolveDkgConfigHome,
-      resolveDkgBin,
       ...overrides,
     };
   }
@@ -160,10 +173,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     // (c) Cursor client config was written with the canonical entry.
     const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
-    expect(cursorConfig.mcpServers.dkg).toEqual({
-      command: 'dkg',
-      args: ['mcp', 'serve'],
-    });
+    expect(cursorConfig.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
   it('skips writeDkgConfig when ~/.dkg/config.yaml already exists and no overrides given', async () => {
@@ -348,7 +358,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // canonical mcpServers.dkg shape PLUS a VSCode-shape note).
     // Use parseStdoutJson which walks the first balanced object.
     const parsed = parseStdoutJson(stdoutSpy);
-    expect(parsed.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(parsed.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
     stdoutSpy.mockRestore();
   });
 
@@ -479,7 +489,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     await mcpSetupAction({ printOnly: true }, deps);
 
     const parsed = parseStdoutJson(stdoutSpy);
-    expect(parsed.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(parsed.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
     stdoutSpy.mockRestore();
   });
 
@@ -492,7 +502,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     await mcpSetupAction({ printOnly: true, installed: true }, deps);
 
     const parsed = parseStdoutJson(stdoutSpy);
-    expect(parsed.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(parsed.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
     stdoutSpy.mockRestore();
   });
 
@@ -583,10 +593,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     expect(existsSync(claudePath)).toBe(true);
     const written = JSON.parse(readFileSync(claudePath, 'utf-8'));
-    expect(written.mcpServers.dkg).toEqual({
-      command: 'dkg',
-      args: ['mcp', 'serve'],
-    });
+    expect(written.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
   it('phase-3: Windsurf is detected at ~/.codeium/windsurf/; gets canonical entry written', async () => {
@@ -598,10 +605,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     expect(existsSync(windsurfPath)).toBe(true);
     const written = JSON.parse(readFileSync(windsurfPath, 'utf-8'));
-    expect(written.mcpServers.dkg).toEqual({
-      command: 'dkg',
-      args: ['mcp', 'serve'],
-    });
+    expect(written.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
   it('phase-3: clients with no config dir are not detected — silent and absent', async () => {
@@ -645,7 +649,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // Sibling preserved.
     expect(written.mcpServers['some-other-server']).toEqual({ command: 'foo', args: ['bar'] });
     // dkg added.
-    expect(written.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(written.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
   // ── Phase-4: VSCode + Copilot Chat (servers.dkg shape) ────────────
@@ -679,7 +683,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const written = JSON.parse(readFileSync(vscodePath, 'utf-8'));
     // VSCode + Copilot Chat keys under `servers`, NOT `mcpServers`.
     // Pins the entryPath dispatch wired in phase 1.
-    expect(written.servers?.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(written.servers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
     // The canonical `mcpServers.dkg` shape MUST NOT be present in
     // VSCode's file — that would be the wrong key for Copilot Chat.
     expect(written.mcpServers).toBeUndefined();
@@ -702,7 +706,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     const written = JSON.parse(readFileSync(vscodePath, 'utf-8'));
     expect(written.servers['other-mcp']).toEqual({ command: 'baz' });
-    expect(written.servers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(written.servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
   // ── Phase-5: Cline (deep-nested VSCode globalStorage path) ────────
@@ -744,7 +748,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const written = JSON.parse(readFileSync(clinePath, 'utf-8'));
     // Cline keys under canonical `mcpServers.dkg` (unlike VSCode's
     // `servers.dkg`), so no entryPath override on the candidate.
-    expect(written.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(written.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
   it('phase-5: Cline siblings preserved — pre-existing entries don\'t get clobbered', async () => {
@@ -764,90 +768,67 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     const written = JSON.parse(readFileSync(clinePath, 'utf-8'));
     expect(written.mcpServers['github']).toEqual({ command: 'gh-mcp' });
-    expect(written.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(written.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
   // ── F30: resolve absolute `dkg` bin path on installed-mode setup ──
 
-  it('F30: installed mode with resolved bin → canonical entry uses absolute path, not bare "dkg"', async () => {
-    // Real-world signal: GUI MCP clients (Claude Desktop, etc.)
-    // don't inherit shell PATH, so the bare-`"dkg"` form fails with
-    // `spawn dkg ENOENT`. Resolved absolute path makes the entry
-    // robust against PATH inheritance gaps.
+  // ── Codex Round-4: process.execPath unification ──────────────────
+
+  it('Codex Round-4: installed mode writes process.execPath + cli.js path (no `dkg` bin shim)', async () => {
+    // Round-4 unified the canonical entry shape across both modes.
+    // Installed mode: `{ command: process.execPath, args: [<cli.js>,
+    // 'mcp', 'serve'] }` — Node binary directly + the cli.js script
+    // Node is currently executing. No more `which dkg` step; no
+    // dependency on `dkg` shim or `node` binary being on the GUI
+    // client's PATH.
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
-    const deps = makeDeps({
-      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
-    });
+    const deps = makeDeps();
 
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
     const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
-    expect(cursorConfig.mcpServers.dkg).toEqual({
-      command: '/usr/local/bin/dkg',
-      args: ['mcp', 'serve'],
-    });
-    // resolveDkgBin was called exactly once (cached at action top).
-    expect(deps.resolveDkgBin).toHaveBeenCalledTimes(1);
+    expect(cursorConfig.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    // Specific shape pins:
+    expect(cursorConfig.mcpServers.dkg.command).toBe(process.execPath);
+    expect(typeof cursorConfig.mcpServers.dkg.args[0]).toBe('string');
+    expect(cursorConfig.mcpServers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
+    // Belt-and-braces: the registered command MUST NOT be the bare
+    // `dkg` shim form anymore — that's the F30 PATH-dependency we
+    // removed by switching to direct-Node invocation.
+    expect(cursorConfig.mcpServers.dkg.command).not.toBe('dkg');
   });
 
-  it('F30: resolveDkgBin returning null falls back to bare "dkg"', async () => {
-    // The default `makeDeps` already returns null. This test is
-    // explicit to pin the fallback contract — `null` MUST NOT
-    // crash setup; it MUST emit the bare-`"dkg"` form so a user
-    // running on a machine where `dkg` somehow isn't on PATH at
-    // setup time still gets a workable (if not-GUI-friendly)
-    // entry written.
-    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
-    const deps = makeDeps(); // resolveDkgBin defaults to null
-
-    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
-
-    const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
-    expect(cursorConfig.mcpServers.dkg).toEqual({
-      command: 'dkg',
-      args: ['mcp', 'serve'],
-    });
-  });
-
-  it('F30: monorepo mode does NOT call resolveDkgBin (already absolute)', async () => {
-    // Monorepo mode hard-codes the local CLI dist absolute path
-    // and has no need for the resolver. Asserting the resolver is
-    // a no-op in that branch keeps the IO surface minimal — no
-    // spurious child-process spawn during a monorepo setup.
+  it('Codex Round-4: monorepo mode writes process.execPath + local cli.dist path', async () => {
+    // Monorepo mode is byte-aligned with installed mode on the
+    // command field (process.execPath) and differs only on args[0]
+    // (local cli.dist absolute path vs the installed cli.js path
+    // realpathSync resolves to). Asserts the unification.
     const fakeRepoRoot = makeFakeMonorepoRoot();
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
     const deps = makeDeps({
       findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
-      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
     });
 
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
-    expect(deps.resolveDkgBin).not.toHaveBeenCalled();
     const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
-    // Codex Bug 2: command is process.execPath, not bare 'node'.
     expect(cursorConfig.mcpServers.dkg.command).toBe(process.execPath);
     expect(cursorConfig.mcpServers.dkg.args[0]).toBe(
       join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
     );
+    expect(cursorConfig.mcpServers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
   });
 
-  it('F30 + Codex Round-3: pre-existing bare-"dkg" entry classifies as `stale` and migrates to resolved-path form', async () => {
-    // Codex round-3 reversed the round-2 bare↔absolute equivalence
-    // direction. Round-2 treated bare-`"dkg"` as `registered`
-    // against a resolved-path canonical, but that meant a stock
-    // `dkg mcp setup` re-run NEVER migrated legacy entries to the
-    // GUI-safe absolute-path form. Existing Claude Desktop /
-    // Windsurf / VSCode installs stayed broken in the no-PATH
-    // scenario F30 exists to fix unless the operator passed
-    // `--force` — defeating the auto-migration intent of the
-    // re-run.
+  it('Codex Round-4: legacy bare-"dkg" entries auto-migrate to process.execPath form on stock re-run', async () => {
+    // Pre-Round-4 setup runs (or pre-F30 hand-edited configs) wrote
+    // `{ command: "dkg", args: ["mcp", "serve"] }`. Round-4's pure
+    // string equality classifier sees that as `stale` against the
+    // new `process.execPath + cli.js` expected entry, and refreshes
+    // to the new shape on a stock re-run — no `--force` needed.
     //
-    // New contract: bare current vs absolute expected ⇒ `stale` ⇒
-    // refresh to absolute on stock re-run. The reverse case
-    // (absolute current vs bare expected from resolveDkgBin
-    // failure) stays `registered` so working absolute entries
-    // aren't downgraded — see the Codex Round-2 Bug C tests below.
+    // This is the migration story for users upgrading from any
+    // earlier version of the setup tool.
     const cursorDir = join(tmpHome, '.cursor');
     mkdirSync(cursorDir, { recursive: true });
     writeFileSync(
@@ -859,69 +840,40 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       ),
     );
 
-    const deps = makeDeps({
-      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
-    });
+    const deps = makeDeps();
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
-    // Stale → refresh: file now has the GUI-safe absolute-path
-    // form. This is the auto-migration legacy users get on a
-    // stock re-run, no `--force` needed.
     const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
-    expect(after.mcpServers.dkg).toEqual({
-      command: '/usr/local/bin/dkg',
-      args: ['mcp', 'serve'],
-    });
+    expect(after.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    expect(after.mcpServers.dkg.command).toBe(process.execPath);
   });
 
-  it('F30: pre-existing different absolute path classifies as `stale` (real divergence)', async () => {
-    // The bare-vs-resolved equivalence is asymmetric: a pre-
-    // existing entry pointing at `/old/path/dkg` while the
-    // currently-resolved bin lives at `/usr/local/bin/dkg` IS
-    // real divergence — those invoke different binaries.
-    // Classify as `stale`, refresh on the canonical path.
+  it('Codex Round-4: pre-existing F30-style absolute `dkg` bin entry ALSO migrates (uniform classifier)', async () => {
+    // The interim Round-1 F30 form was `{ command: "/usr/local/bin/
+    // dkg", args: ["mcp", "serve"] }`. Round-4's process.execPath
+    // form supersedes it (skips the bin shim entirely). Pure
+    // string equality classifies the old absolute-bin entry as
+    // `stale` and migrates it forward — no special-casing needed.
     const cursorDir = join(tmpHome, '.cursor');
     mkdirSync(cursorDir, { recursive: true });
+    const legacyAbsBin = platform() === 'win32'
+      ? 'C:\\Users\\test\\AppData\\Local\\fnm\\dkg.exe'
+      : '/usr/local/bin/dkg';
     writeFileSync(
       join(cursorDir, 'mcp.json'),
       JSON.stringify(
-        { mcpServers: { dkg: { command: '/old/path/dkg', args: ['mcp', 'serve'] } } },
+        { mcpServers: { dkg: { command: legacyAbsBin, args: ['mcp', 'serve'] } } },
         null,
         2,
       ),
     );
 
-    const deps = makeDeps({
-      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
-    });
+    const deps = makeDeps();
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
-    // Stale → refresh: file rewritten with the new resolved path.
     const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
-    expect(after.mcpServers.dkg).toEqual({
-      command: '/usr/local/bin/dkg',
-      args: ['mcp', 'serve'],
-    });
-  });
-
-  it('F30: --print-only with resolved bin emits the absolute path', async () => {
-    // The print-only short-circuit must use the same context-aware
-    // canonical entry as the write path — a documented JSON snippet
-    // that diverges from what setup actually writes would be a
-    // foot-gun for users following the README's manual-paste path.
-    const deps = makeDeps({
-      resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
-    });
-    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-
-    await mcpSetupAction({ printOnly: true }, deps);
-
-    const parsed = parseStdoutJson(stdoutSpy);
-    expect(parsed.mcpServers.dkg).toEqual({
-      command: '/usr/local/bin/dkg',
-      args: ['mcp', 'serve'],
-    });
-    stdoutSpy.mockRestore();
+    expect(after.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    expect(after.mcpServers.dkg.command).not.toBe(legacyAbsBin);
   });
 
   // ── F31: per-client interactive confirm prompts ───────────────────
@@ -982,12 +934,13 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
   it('F31: all-skip plan (everything already registered) → confirmPlan still called but produces zero writes', async () => {
     // Pre-populate every detected-by-default client with the
-    // canonical bare-`"dkg"` entry so they all classify as
-    // `registered`. Plan ends up all-skip; confirmPlan still
-    // called (the action doesn't pre-filter) but no writes follow.
+    // Round-4 canonical entry (process.execPath + cli.js path) so
+    // they all classify as `registered`. Plan ends up all-skip;
+    // confirmPlan still called (the action doesn't pre-filter) but
+    // no writes follow.
     const cursorDir = join(tmpHome, '.cursor');
     mkdirSync(cursorDir, { recursive: true });
-    const canonical = { mcpServers: { dkg: { command: 'dkg', args: ['mcp', 'serve'] } } };
+    const canonical = { mcpServers: { dkg: EXPECTED_INSTALLED_ENTRY() } };
     writeFileSync(join(cursorDir, 'mcp.json'), JSON.stringify(canonical, null, 2));
     // ~/.claude.json's parent IS tmpHome → always detected. Pre-register.
     writeFileSync(join(tmpHome, '.claude.json'), JSON.stringify(canonical, null, 2));
@@ -1040,6 +993,57 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const result = await prodConfirmPlan(fakePlan, { yes: false });
     expect(result).toHaveLength(2);
     expect(result.map((p) => p.action)).toEqual(['register', 'refresh']);
+  });
+
+  it('Codex Round-4 Fix 5: confirmPlan auto-confirms when stdout.isTTY is false even if stdin.isTTY is true', async () => {
+    // Pre-fix: the auto-confirm guard only checked
+    // `process.stdin.isTTY`. If stdout was redirected/captured but
+    // stdin still happened to be a TTY (e.g. `dkg mcp setup > log.txt`
+    // from an interactive shell), the helper opened a readline
+    // prompt that emitted to a non-visible stdout — the user saw
+    // nothing while their terminal blocked.
+    //
+    // Post-fix: BOTH stdin AND stdout must be TTY before prompting.
+    // Either non-TTY end ⇒ auto-confirm.
+    const { confirmPlan: prodConfirmPlan } = await import('../src/mcp-setup.js');
+    const fakePlan = [
+      { s: { target: { name: 'Cursor', displayPath: '~/.cursor/mcp.json' } } as any, action: 'register' as const },
+    ];
+
+    const originalStdinIsTTY = process.stdin.isTTY;
+    const originalStdoutIsTTY = process.stdout.isTTY;
+    try {
+      // Force stdin TTY=true (the scenario the pre-fix missed),
+      // stdout TTY=false (redirected). The post-fix guard MUST
+      // auto-confirm and not block on readline.
+      Object.defineProperty(process.stdin, 'isTTY', {
+        value: true,
+        configurable: true,
+      });
+      Object.defineProperty(process.stdout, 'isTTY', {
+        value: false,
+        configurable: true,
+      });
+
+      // No timeout / hang protection needed — if the guard regresses
+      // and the helper actually prompts, vitest's per-test timeout
+      // catches it. Under the post-fix guard, this resolves
+      // synchronously with the plan unchanged.
+      const result = await prodConfirmPlan(fakePlan, { yes: false });
+      expect(result).toHaveLength(1);
+      expect(result[0].action).toBe('register');
+    } finally {
+      // Restore the original TTY flags so subsequent tests aren't
+      // affected by the override.
+      Object.defineProperty(process.stdin, 'isTTY', {
+        value: originalStdinIsTTY,
+        configurable: true,
+      });
+      Object.defineProperty(process.stdout, 'isTTY', {
+        value: originalStdoutIsTTY,
+        configurable: true,
+      });
+    }
   });
 
   // ── PR #394 Codex review round 1 ────────────────────────────────
@@ -1142,7 +1146,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // jq …` flag contract.
     const stdoutText = (stdoutSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
     const stdoutParsed = JSON.parse(stdoutText);
-    expect(stdoutParsed.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(stdoutParsed.mcpServers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
     // No `servers.dkg` (the VSCode shape) on stdout — keeps it
     // machine-readable.
     expect(stdoutParsed.servers).toBeUndefined();
@@ -1160,7 +1164,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(stderrJsonStart).toBeGreaterThanOrEqual(0);
     const stderrJsonText = stderrText.slice(stderrJsonStart).trim();
     const stderrParsed = JSON.parse(stderrJsonText);
-    expect(stderrParsed.servers?.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(stderrParsed.servers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
 
     stdoutSpy.mockRestore();
     stderrSpy.mockRestore();
@@ -1346,85 +1350,15 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     stderrSpy.mockRestore();
   });
 
-  it('Codex Round-2 Bug C: existing absolute-path entry is preserved when resolveDkgBin returns null on rerun', async () => {
-    // Concrete scenario: a prior `dkg mcp setup` ran when `dkg`
-    // was on PATH and wrote an absolute-path entry. A later rerun
-    // happens in an environment where `which dkg` fails (e.g. the
-    // user's shell PATH state changed; or fnm/nvm switched and
-    // the resolver missed). Pre-fix: canonicalEntry falls back
-    // to bare `'dkg'` AND classify marks the existing absolute
-    // entry as `stale`, triggering a refresh that downgrades the
-    // GUI-friendly absolute path back to bare — regressing the F30
-    // fix this PR exists to provide.
-    //
-    // Post-fix: classify treats any absolute-path entry whose
-    // basename is `dkg` / `dkg.exe` / `dkg.cmd` / `dkg.bat` as
-    // equivalent to expected bare-`'dkg'`, preserving the existing
-    // entry verbatim.
-    const cursorDir = join(tmpHome, '.cursor');
-    mkdirSync(cursorDir, { recursive: true });
-    // Pre-existing absolute-path entry, as if a prior successful
-    // `which dkg` resolution wrote it.
-    const existingAbsPath = platform() === 'win32'
-      ? 'C:\\Users\\test\\AppData\\Local\\fnm\\dkg.exe'
-      : '/usr/local/bin/dkg';
-    writeFileSync(
-      join(cursorDir, 'mcp.json'),
-      JSON.stringify({
-        mcpServers: { dkg: { command: existingAbsPath, args: ['mcp', 'serve'] } },
-      }, null, 2),
-    );
-
-    const deps = makeDeps({
-      // resolveDkgBin returns null this run — simulating the
-      // rerun-after-PATH-state-change scenario.
-      resolveDkgBin: vi.fn(() => null),
-    });
-
-    await mcpSetupAction({ fund: false, verify: false }, deps);
-
-    // The pre-existing absolute-path entry was PRESERVED — not
-    // refreshed back to bare `'dkg'`. This is the regression
-    // protection.
-    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
-    expect(after.mcpServers.dkg.command).toBe(existingAbsPath);
-    expect(after.mcpServers.dkg.command).not.toBe('dkg');
-  });
-
-  it('Codex Round-2 Bug C: bogus non-dkg absolute-path entry IS classified stale (only dkg basenames are preserved)', async () => {
-    // Counterpart guard: the `isAbsoluteDkgBinPath` heuristic
-    // accepts ONLY paths whose basename is dkg / dkg.exe /
-    // dkg.cmd / dkg.bat. An absolute path pointing somewhere
-    // else (operator typo; manual mis-edit; some other tool
-    // squatting on the entry) MUST classify as stale and get
-    // refreshed — otherwise broken entries would survive setup
-    // forever. The test pre-seeds a `/totally/wrong/path` and
-    // asserts the refresh fired.
-    const cursorDir = join(tmpHome, '.cursor');
-    mkdirSync(cursorDir, { recursive: true });
-    const bogusAbsPath = platform() === 'win32'
-      ? 'C:\\Users\\test\\some-other-tool.exe'
-      : '/totally/wrong/path/some-other-tool';
-    writeFileSync(
-      join(cursorDir, 'mcp.json'),
-      JSON.stringify({
-        mcpServers: { dkg: { command: bogusAbsPath, args: ['mcp', 'serve'] } },
-      }, null, 2),
-    );
-
-    const deps = makeDeps({
-      // Force --force so we know any refresh is from staleness
-      // detection, not from the F31 confirm prompt loop bypass.
-      resolveDkgBin: vi.fn(() => null),
-    });
-
-    await mcpSetupAction({ force: true, fund: false, verify: false }, deps);
-
-    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
-    // Refreshed to bare-`'dkg'` (since resolveDkgBin returned
-    // null and the existing entry is not a dkg-basename absolute).
-    expect(after.mcpServers.dkg.command).toBe('dkg');
-  });
+  // Codex Round-2 Bug C tests retired: Round-4's process.execPath
+  // unification eliminated the `isAbsoluteDkgBinPath` equivalence
+  // those tests pinned. Both modes now write the same absolute
+  // process.execPath form, so any divergent entry — bare `"dkg"`,
+  // an old absolute-bin path, a moved-checkout cli.js path —
+  // classifies as `stale` via pure string equality and refreshes
+  // forward. The auto-migration story is exercised by the
+  // "legacy bare-`dkg` migrates" and "F30-style absolute migrates"
+  // Round-4 tests above.
 
   // ── Codex Round-3 Fix 3: try/finally DKG_HOME env mutation ────────
 

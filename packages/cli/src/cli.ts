@@ -1807,8 +1807,8 @@ mcpCmd
   .option('--force', 'Refresh every detected client regardless of current registration state')
   .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
   .option('--yes', 'Auto-confirm per-client registrations (default false: prompt interactively in TTY mode; non-TTY auto-confirms — pass `--yes` in scripts for the safer scripted-environment posture)')
-  .option('--installed', 'Force installed-mode command form. Writes an absolute path to the resolved `dkg` bin (via `which dkg` / `where.exe dkg`); falls back to bare `"dkg"` only if PATH resolution fails. Mutually exclusive with --monorepo.')
-  .option('--monorepo', 'Force monorepo-mode command form. Writes `process.execPath` plus an absolute path to the local CLI dist (`<repo>/packages/cli/dist/cli.js`). Errors if no DKG monorepo root is locatable from cwd ancestors. Mutually exclusive with --installed.')
+  .option('--installed', 'Force installed-mode bootstrap home (~/.dkg). The registered MCP entry is the unified `process.execPath + <installed cli.js>` shape regardless of mode. Mutually exclusive with --monorepo.')
+  .option('--monorepo', 'Force monorepo-mode bootstrap home (~/.dkg-dev) and register the local CLI dist (`<repo>/packages/cli/dist/cli.js`). Errors if no DKG monorepo root is locatable from cwd ancestors. Mutually exclusive with --installed.')
   .action(async (opts) => {
     // Dynamic-import the openclaw-setup primitives for the bundled
     // init + daemon-start. Same import surface (and same package
@@ -1833,7 +1833,7 @@ mcpCmd
       process.exit(1);
     }
 
-    const { mcpSetupAction, resolveDkgBin } = await import('./mcp-setup.js');
+    const { mcpSetupAction } = await import('./mcp-setup.js');
     try {
       await mcpSetupAction(opts, {
         loadNetworkConfig: openclawSetupExports.loadNetworkConfig,
@@ -1844,7 +1844,6 @@ mcpCmd
         requestFaucetFunding: coreExports.requestFaucetFunding,
         findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
         resolveDkgConfigHome: coreExports.resolveDkgConfigHome,
-        resolveDkgBin,
       });
     } catch (err: any) {
       console.error(`\n[dkg mcp setup] ERROR: ${err?.message ?? err}\n`);

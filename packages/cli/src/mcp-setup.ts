@@ -64,10 +64,9 @@
  * server reads them from `~/.dkg/config.yaml` + the daemon-written
  * `auth.token` via `loadConfig` (`packages/mcp-dkg/src/config.ts`).
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir, platform } from 'node:os';
-import { execSync } from 'node:child_process';
 
 export interface McpSetupCliOptions {
   /** Refresh every detected client regardless of current registration state. */
@@ -165,16 +164,6 @@ export interface McpSetupActionDeps {
    */
   resolveDkgConfigHome: typeof import('@origintrail-official/dkg-core').resolveDkgConfigHome;
   /**
-   * F30: resolve the absolute path of the `dkg` bin (fallback to
-   * `null` if not on PATH). Required because GUI MCP clients
-   * (Claude Desktop, Windsurf, etc.) don't inherit the shell PATH
-   * where `npm install -g` puts the bin — writing the bare `"dkg"`
-   * command into their config produces `spawn dkg ENOENT` at MCP
-   * client startup. Injectable so tests can stub deterministically
-   * without spawning a child process.
-   */
-  resolveDkgBin: () => string | null;
-  /**
    * F31: per-client interactive confirm hook. Defaulted to the
    * production readline-based implementation. Injectable so tests
    * can stub deterministic answer streams without managing a real
@@ -194,107 +183,54 @@ export interface McpSetupActionDeps {
 
 /**
  * The canonical MCP-server entry written into client config files.
- * Context-aware: `'installed'` uses the global `dkg` bin (the npm-
- * installed shape); `'monorepo'` uses an absolute path to the local
- * CLI dist so a contributor's dev build runs even when a stale
- * `dkg` from a prior global install is still on PATH.
+ *
+ * Codex Round-4 unification: BOTH installed and monorepo modes
+ * register the SAME shape — `process.execPath` (absolute path to
+ * the currently-running Node binary) as `command`, and the absolute
+ * CLI script path as the first arg. This skips the `dkg` bin shim
+ * entirely.
+ *
+ * Why this matters: F30 (round-1 of this PR) wrote the resolved
+ * absolute `dkg` bin path expecting that to free GUI MCP clients
+ * from PATH dependencies. But the `dkg` bin on POSIX is a
+ * `#!/usr/bin/env node` script — `env` then needs `node` on PATH.
+ * On Windows the `.cmd` shim invokes `node.exe` similarly. Both
+ * still ENOENT in the GUI-client environment F30 was trying to
+ * fix. Calling Node directly with the script path eliminates BOTH
+ * PATH lookups (the `dkg` shim AND the `node` binary the shim
+ * would have invoked). GUI clients spawn the registered command
+ * with no PATH lookup at all.
+ *
+ * Installed-mode CLI script path: `realpathSync(process.argv[1])`.
+ * `process.argv[1]` is the script Node is currently executing —
+ * guaranteed valid and on disk. `realpathSync` canonicalises
+ * symlinks (npm's bin-shim is typically a symlink on POSIX)
+ * so the registered path is stable across `npm relink`.
+ *
+ * Monorepo-mode CLI script path: `<root>/packages/cli/dist/cli.js`.
+ * Validated via `existsSync` to fail loudly on a fresh checkout
+ * with no build (Codex Round-1 Bug 3 contract).
  */
 function canonicalEntry(
   context: SetupContext,
   monorepoRoot: string | null,
-  resolvedBin: string | null,
 ): Record<string, unknown> {
   if (context === 'monorepo' && monorepoRoot) {
     const cliJsPath = join(monorepoRoot, 'packages', 'cli', 'dist', 'cli.js');
-    // Codex Bug 3: validate the local CLI dist exists before
-    // pointing client configs at it. Fresh checkout, `pnpm clean`,
-    // or source-only edits leave dist absent or stale; without
-    // this check we'd overwrite a previously-working installed
-    // registration with a broken monorepo entry.
     if (!existsSync(cliJsPath)) {
       throw new Error(
         `Local CLI dist not found at ${cliJsPath}. Run \`pnpm --filter @origintrail-official/dkg build\` first, then re-run \`dkg mcp setup\`.`,
       );
     }
-    return {
-      // Codex Bug 2: use `process.execPath` (absolute path to the
-      // currently-running Node binary) instead of bare `"node"`.
-      // Same bug class as F30 fixed for installed mode — GUI MCP
-      // clients (Claude Desktop, Windsurf, VSCode + Copilot) often
-      // launch without the shell PATH that includes Node, so the
-      // bare-`"node"` form would `spawn node ENOENT` for the
-      // contributors most likely to be testing GUI clients.
-      command: process.execPath,
-      args: [cliJsPath, 'mcp', 'serve'],
-    };
+    return { command: process.execPath, args: [cliJsPath, 'mcp', 'serve'] };
   }
-  // F30: in installed mode, prefer the absolute-path resolution so
-  // GUI MCP clients (Claude Desktop, etc.) that don't inherit the
-  // shell PATH can still spawn the bin. Fall back to bare `"dkg"`
-  // when the resolver can't locate the bin (rare — only happens if
-  // `dkg` isn't on PATH at setup time, in which case `--print-only`
-  // still works as a manual-paste workaround for the operator).
-  if (resolvedBin) {
-    return { command: resolvedBin, args: ['mcp', 'serve'] };
-  }
-  return { command: 'dkg', args: ['mcp', 'serve'] };
-}
-
-/**
- * Codex Round-2 helper. Returns `true` if `cmd` looks like an
- * absolute-path entry pointing at a `dkg` bin: an absolute path
- * (POSIX `/...` or Windows-drive `X:\...`) whose final segment is
- * `dkg`, `dkg.exe`, `dkg.cmd`, or `dkg.bat`. Used by `classify` to
- * recognise pre-existing F30-style absolute entries when the current
- * `resolveDkgBin()` call returns `null` (e.g. PATH state changed
- * between setup runs); preserving these prevents a regression from
- * the previously-written GUI-friendly absolute path back to bare
- * `'dkg'`.
- */
-function isAbsoluteDkgBinPath(cmd: unknown): boolean {
-  if (typeof cmd !== 'string' || cmd.length === 0) return false;
-  const isPosixAbsolute = cmd.startsWith('/');
-  const isWindowsAbsolute = /^[A-Za-z]:[\\/]/.test(cmd);
-  if (!isPosixAbsolute && !isWindowsAbsolute) return false;
-  const lastSep = Math.max(cmd.lastIndexOf('/'), cmd.lastIndexOf('\\'));
-  const basename = lastSep >= 0 ? cmd.slice(lastSep + 1) : cmd;
-  const lowered = basename.toLowerCase();
-  return (
-    lowered === 'dkg' ||
-    lowered === 'dkg.exe' ||
-    lowered === 'dkg.cmd' ||
-    lowered === 'dkg.bat'
-  );
-}
-
-/**
- * F30 production-side resolver. Uses `which` (POSIX) / `where.exe`
- * (Windows) to locate the `dkg` bin's absolute path, returning the
- * first match (Windows `where.exe` can return multiple hits when a
- * bin is shadowed across PATH entries — first wins, which matches
- * shell behaviour). Returns `null` on any failure (`dkg` not on
- * PATH, exec error, empty output) so callers can fall back to the
- * bare-`"dkg"` form without crashing setup.
- *
- * `stdio: ['ignore', 'pipe', 'ignore']` silences `which`'s stderr
- * on the not-found path so the operator-facing setup log stays
- * clean.
- *
- * Exported so `cli.ts` can pass it through to `mcpSetupAction`'s
- * deps surface in production. Tests inject their own stub.
- */
-export function resolveDkgBin(): string | null {
-  try {
-    const cmd = platform() === 'win32' ? 'where.exe dkg' : 'which dkg';
-    const result = execSync(cmd, {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    const firstLine = result.split(/\r?\n/)[0]?.trim();
-    return firstLine || null;
-  } catch {
-    return null;
-  }
+  // Installed mode: resolve the CLI script Node is currently
+  // executing. `process.argv[1]` points at the npm bin-shim's
+  // target (the actual cli.js file); `realpathSync` follows
+  // symlinks for stability across npm relink / version-manager
+  // rotations.
+  const installedCliPath = realpathSync(process.argv[1]);
+  return { command: process.execPath, args: [installedCliPath, 'mcp', 'serve'] };
 }
 
 /**
@@ -305,7 +241,13 @@ export function resolveDkgBin(): string | null {
  *
  * Auto-confirm conditions (skip prompts entirely):
  *   - `opts.yes === true` (operator passed `--yes`).
- *   - `process.stdin.isTTY === false` (CI / scripted / piped input).
+ *   - `process.stdin.isTTY === false` OR `process.stdout.isTTY === false`.
+ *     Codex Round-4 Fix 5 tightened the TTY guard: the pre-fix
+ *     stdin-only check would block on an invisible readline prompt
+ *     when stdout was redirected/captured but stdin still happened
+ *     to be a TTY (e.g. `dkg mcp setup > log.txt` from an
+ *     interactive shell). Both must be a TTY for prompting; any
+ *     non-TTY end auto-confirms.
  *   - Zero non-skip entries in the plan (nothing to confirm).
  *
  * Default empty answer (operator just hits Enter) accepts the
@@ -320,7 +262,12 @@ export async function confirmPlan(
   opts: { yes: boolean },
 ): Promise<PlannedItem[]> {
   const writes = planned.filter((p) => p.action !== 'skip');
-  if (opts.yes || !process.stdin.isTTY || writes.length === 0) {
+  if (
+    opts.yes ||
+    !process.stdin.isTTY ||
+    !process.stdout.isTTY ||
+    writes.length === 0
+  ) {
     return [...planned];
   }
   const { createInterface } = await import('node:readline/promises');
@@ -757,40 +704,17 @@ function classify(
   if (current === undefined || current === null) {
     return { target, state: 'not-registered', current: null };
   }
-  // F30 + Codex Round-3 staleness contract: equivalence is now
-  // ASYMMETRIC. Round-2 treated bare-`"dkg"` and the resolved
-  // absolute path as fully equivalent (both directions), but
-  // Codex round-3 pointed out that letting an OLD bare-`"dkg"`
-  // entry classify as `registered` against a resolved-path expected
-  // means a stock re-run of `dkg mcp setup` never migrates legacy
-  // entries to the GUI-safe absolute-path form. That leaves
-  // existing Claude Desktop / Windsurf / VSCode installs broken
-  // in the no-PATH scenario F30 exists to fix unless the operator
-  // happens to pass `--force`. Migration is the whole point of the
-  // re-run — so the legacy direction MUST classify as `stale`.
-  //
-  // Surviving equivalence (one direction only):
-  //   expected = bare `"dkg"` (resolveDkgBin returned null this run)
-  //     ↔ current = absolute path with dkg-family basename
-  //   ⇒ `registered` (preserve the working absolute-path entry).
-  //
-  // This handles the rerun-after-PATH-state-change scenario: a
-  // prior successful run wrote `/usr/local/bin/dkg`, a later run
-  // can't resolve `dkg` (PATH state changed; nvm/fnm rotated) and
-  // falls back to expected = bare `"dkg"`. Without this branch we'd
-  // mark the working absolute entry as stale and refresh it back to
-  // bare — regressing F30 for that user.
-  //
-  // Dropped equivalence (round-3):
-  //   expected = absolute path, current = bare `"dkg"` ⇒ `stale`.
-  // Stale → refresh on stock re-run = legacy entries get migrated
-  // to the GUI-safe form automatically. This is the bug-fix loop
-  // the round-3 reviewer flagged.
+  // Codex Round-4 staleness contract: pure string equality. The
+  // canonical entry is now uniform `process.execPath + cli.js path`
+  // for both installed and monorepo modes (round-4 unified the
+  // shape), so all earlier asymmetric equivalence rules collapse
+  // to a single check. Any divergence — legacy bare-`"dkg"`,
+  // resolved-`/usr/local/bin/dkg`, a stale repo-root path from a
+  // moved checkout, etc. — classifies as `stale` and refreshes to
+  // the new shape on stock re-run. Auto-migration fires for free.
   const expectedCommand = expected.command;
   const currentCommand = (current as Record<string, unknown>).command;
-  const commandMatches =
-    currentCommand === expectedCommand ||
-    (expectedCommand === 'dkg' && isAbsoluteDkgBinPath(currentCommand));
+  const commandMatches = currentCommand === expectedCommand;
   const argsMatch =
     Array.isArray((current as Record<string, unknown>).args) &&
     JSON.stringify((current as Record<string, unknown>).args) ===
@@ -889,11 +813,12 @@ export async function mcpSetupAction(
   const { context, monorepoRoot } = detectContext(deps.findDkgMonorepoRoot, {
     force: forcedContext,
   });
-  // F30: resolve the absolute `dkg` bin path now (installed mode
-  // only — monorepo mode hard-codes the local CLI dist). Resolution
-  // is best-effort; null falls back to bare-`"dkg"` in canonicalEntry.
-  const resolvedBin = context === 'installed' ? deps.resolveDkgBin() : null;
-  const expectedEntry = canonicalEntry(context, monorepoRoot, resolvedBin);
+  // Codex Round-4: both modes register `process.execPath` + the
+  // absolute CLI script path. No more `which dkg` resolution — the
+  // shape is uniform and PATH-free, eliminating both the `dkg` bin
+  // shim AND the `node` binary the shim would have invoked from
+  // GUI clients' lookup chain.
+  const expectedEntry = canonicalEntry(context, monorepoRoot);
 
   if (printOnly) {
     const block = {

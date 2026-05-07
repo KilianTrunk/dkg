@@ -86,13 +86,13 @@ Either way, the resolved registration looks like this — the shape stays unifor
   "mcpServers": {
     "dkg": {
       "command": "/usr/local/bin/node",
-      "args": ["/absolute/path/to/dkg-v9/packages/cli/dist/cli.js", "mcp", "serve"]
+      "args": ["/absolute/path/to/dkg/packages/cli/dist/cli.js", "mcp", "serve"]
     }
   }
 }
 ```
 
-**What does NOT work**: `cd dkg-v9 && dkg mcp setup` (without `--monorepo`). With a globally-installed `dkg`, the running CLI lives at the npm global path — auto-detect sees that location is outside any monorepo and stays in installed mode, registering the global build. Your local edits won't be picked up. Either invoke the local dist directly (Option A) or pass `--monorepo` (Option B).
+**What does NOT work**: `cd dkg && dkg mcp setup` (without `--monorepo`). With a globally-installed `dkg`, the running CLI lives at the npm global path — auto-detect sees that location is outside any monorepo and stays in installed mode, registering the global build. Your local edits won't be picked up. Either invoke the local dist directly (Option A) or pass `--monorepo` (Option B).
 
 **Always rebuild before re-running setup** — skip the rebuild and the registered entry points at a stale `dist/cli.js`, so your edits won't show up.
 

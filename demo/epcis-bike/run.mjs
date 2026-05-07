@@ -538,7 +538,15 @@ async function loadTraceManifest() {
   }
   if (typeof traceId === 'string' && traceId.length > 0) {
     const path = join(FIXTURES, `trace-${traceId}-bike-line.json`);
-    return JSON.parse(await readFile(path, 'utf-8'));
+    try {
+      return JSON.parse(await readFile(path, 'utf-8'));
+    } catch {
+      // Snapshot pointed at a missing or unreadable manifest — could be
+      // a stale source-snapshot.json left over from a regen + manual
+      // rename, or a corrupted file. Fall through to the glob path: if
+      // exactly one valid manifest sits next to the fixture set, use
+      // it; if multiple or none, the glob branch raises a clear error.
+    }
   }
   const uuidShape = /^trace-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-bike-line\.json$/;
   const candidates = (await readdir(FIXTURES)).filter((f) => uuidShape.test(f));
@@ -764,40 +772,50 @@ async function phase0() {
 
     await pauseAfter();
 
-    // The publish path (DKGPublisher.publish → V10 createKnowledgeAssetsV10)
-    // requires a positive on-chain CG id from the ContextGraphs contract.
-    // `context-graph create` only registers the CG over P2P; without
-    // `context-graph register`, the publisher gets cgId=0 and every lift
-    // fails with "V10 publishDirect requires a positive on-chain context
-    // graph id; got 0". The 409 "already registered" path is treated as
-    // success so the demo is idempotent across re-runs.
-    const reg = runCli(['context-graph', 'register', CG_ID]);
-    const regText = `${reg.stdout}\n${reg.stderr}`;
-    const regAlready = /already registered/i.test(regText);
-    const regOk = reg.exit === 0 || regAlready;
-    emit('phase-0-cg-register', 'Register context graph on-chain', {
-      ...reg,
-      // Normalize exit so the summarizer/interpretation reflect the
-      // idempotent-success semantics, not the raw CLI exit.
-      exit: regOk ? 0 : reg.exit,
-    }, {
-      preamble:
-        'On-chain registration is what unlocks Verified Memory: it asks the `ContextGraphs` contract to mint a numeric ID for this CG. The publisher needs that ID for V10 `publishDirect` — without it every lift fails with "got 0". This step costs a small amount of TRAC and produces a tx hash.',
-      interpretation: regAlready
-        ? `CG ${CG_ID} already registered on-chain — reusing.`
-        : regOk
-          ? 'CG is now registered on-chain. The publisher can now lift KCs onto the chain.'
-          : 'On-chain registration failed — subsequent lifts will fail. See stderr.',
-    });
-    if (!regOk) {
-      throw new Error(
-        'Cannot proceed: context graph not registered on-chain. ' +
-          'Common causes on devnet: no TRAC balance, contracts not deployed, ' +
-          'or stale .devnet/hardhat/deployed marker.',
-      );
-    }
     await pauseAfter();
   }
+
+  // The publish path (DKGPublisher.publish → V10 createKnowledgeAssetsV10)
+  // requires a positive on-chain CG id from the ContextGraphs contract.
+  // `context-graph create` only registers the CG over P2P; without
+  // `context-graph register`, the publisher gets cgId=0 and every lift
+  // fails with "V10 publishDirect requires a positive on-chain context
+  // graph id; got 0". The 409 "already registered" path is treated as
+  // success so the demo is idempotent across re-runs.
+  //
+  // Run UNCONDITIONALLY — including in `--skip-cg-create` mode — because
+  // skipping the create step doesn't guarantee the CG is registered;
+  // pointing skip mode at a created-but-unregistered CG would otherwise
+  // fall through to capture-time and surface as a confusing `cgId=0`
+  // error several phases later. The call is idempotent (already-registered
+  // returns success), so re-running it on an already-registered CG is
+  // free.
+  const reg = runCli(['context-graph', 'register', CG_ID]);
+  const regText = `${reg.stdout}\n${reg.stderr}`;
+  const regAlready = /already registered/i.test(regText);
+  const regOk = reg.exit === 0 || regAlready;
+  emit('phase-0-cg-register', 'Register context graph on-chain', {
+    ...reg,
+    // Normalize exit so the summarizer/interpretation reflect the
+    // idempotent-success semantics, not the raw CLI exit.
+    exit: regOk ? 0 : reg.exit,
+  }, {
+    preamble:
+      'On-chain registration is what unlocks Verified Memory: it asks the `ContextGraphs` contract to mint a numeric ID for this CG. The publisher needs that ID for V10 `publishDirect` — without it every lift fails with "got 0". This step costs a small amount of TRAC and produces a tx hash. Runs even in `--skip-cg-create` mode so an unregistered CG fails fast here rather than at capture time.',
+    interpretation: regAlready
+      ? `CG ${CG_ID} already registered on-chain — reusing.`
+      : regOk
+        ? 'CG is now registered on-chain. The publisher can now lift KCs onto the chain.'
+        : 'On-chain registration failed — subsequent lifts will fail. See stderr.',
+  });
+  if (!regOk) {
+    throw new Error(
+      'Cannot proceed: context graph not registered on-chain. ' +
+        'Common causes on devnet: no TRAC balance, contracts not deployed, ' +
+        'or stale .devnet/hardhat/deployed marker.',
+    );
+  }
+  await pauseAfter();
 
   // Sub-graph must be registered before EPCIS captures targeting it can
   // enqueue. The CLI subcommand `context-graph create-sub-graph` lands the
@@ -1717,26 +1735,10 @@ async function phase7(trace) {
     // Summing both partitions is unconditionally correct: a unique
     // anchor lives in exactly one of the two at any moment, so the
     // sum is the true "anchors visible on node2" count.
-    const finalizedRes = await node2Sparql(anchorSparql(finalizedGraphUri));
-    const swmRes = await node2Sparql(anchorSparql(swmGraphUri));
-    const finalizedCount = querySucceeded(finalizedRes) ? parseCount(finalizedRes) : 0;
-    const swmCount = querySucceeded(swmRes) ? parseCount(swmRes) : 0;
-    const anchorCount = finalizedCount + swmCount;
-    // For diagnostics keep both raw counts plus a label describing
-    // where the anchors landed for THIS run (handy on partial-
-    // finalization runs).
-    const anchorRes = swmCount > 0 && finalizedCount === 0 ? swmRes : finalizedRes;
-    const anchorQueryOk = querySucceeded(finalizedRes) && querySucceeded(swmRes);
-    const queriedPartition =
-      finalizedCount > 0 && swmCount > 0 ? 'finalized+swm'
-        : finalizedCount > 0 ? 'finalized'
-          : swmCount > 0 ? 'swm-fallback'
-            : 'finalized'; // both empty — surface as finalized for the diagnostic
     const finalizedBaseline = phase7AnchorBaseline.finalized.ok ? phase7AnchorBaseline.finalized.count : 0;
     const swmBaseline = phase7AnchorBaseline.swm.ok ? phase7AnchorBaseline.swm.count : 0;
     const baselineForPartition = finalizedBaseline + swmBaseline;
     const baselineForPartitionOk = phase7AnchorBaseline.finalized.ok && phase7AnchorBaseline.swm.ok;
-    const anchorDelta = anchorCount - baselineForPartition;
     // The expected count must include Phase 6's anchor when its capture
     // finalized — Phase 6 writes one synthetic "batch summary" KC after
     // Phase 1, so the publisher emits `<event_count> + 1` privateData-
@@ -1747,6 +1749,49 @@ async function phase7(trace) {
     // never surfaces).
     const expectedAnchorCount =
       (Array.isArray(trace?.events) ? trace.events.length : 0) + phase6AnchoredCount;
+
+    // Wrap the node2 anchor probe in a poll loop so a slightly-lagged
+    // gossip arrival doesn't false-negative Phase 7A. Phase 6 finalizes
+    // its capture locally on node1 BEFORE Phase 7 runs, but the
+    // subscriber gossip path to node2 has its own delay. Earlier code
+    // probed node2 once and gave up, so a 1-2-second lag pushed the
+    // green check to red even on otherwise-healthy runs. Now: poll up
+    // to PHASE7A_GOSSIP_WAIT_MS for the delta to reach expected. Bail
+    // early on success; report current numbers (and diagnostics) at
+    // timeout — the table cell still distinguishes "delta < expected,
+    // gossip not yet caught up" from "query failed" via baselineOk.
+    const PHASE7A_GOSSIP_WAIT_MS = 30_000;
+    const phase7aStart = Date.now();
+    let finalizedRes;
+    let swmRes;
+    let finalizedCount = 0;
+    let swmCount = 0;
+    let anchorCount = 0;
+    let anchorQueryOk = false;
+    let anchorDelta = 0;
+    while (true) {
+      finalizedRes = await node2Sparql(anchorSparql(finalizedGraphUri));
+      swmRes = await node2Sparql(anchorSparql(swmGraphUri));
+      finalizedCount = querySucceeded(finalizedRes) ? parseCount(finalizedRes) : 0;
+      swmCount = querySucceeded(swmRes) ? parseCount(swmRes) : 0;
+      anchorCount = finalizedCount + swmCount;
+      anchorQueryOk = querySucceeded(finalizedRes) && querySucceeded(swmRes);
+      anchorDelta = anchorCount - baselineForPartition;
+      if (!anchorQueryOk) break; // surface query failure immediately
+      if (expectedAnchorCount > 0 && anchorDelta >= expectedAnchorCount) break;
+      if (Date.now() - phase7aStart >= PHASE7A_GOSSIP_WAIT_MS) break;
+      await sleep(POLL_INTERVAL_MS);
+    }
+    // Pick a representative response for the cmdString/diagnostic line —
+    // SWM if it has the anchors and finalized doesn't, otherwise the
+    // finalized response (the more authoritative target on a fully-
+    // lifted run).
+    const anchorRes = swmCount > 0 && finalizedCount === 0 ? swmRes : finalizedRes;
+    const queriedPartition =
+      finalizedCount > 0 && swmCount > 0 ? 'finalized+swm'
+        : finalizedCount > 0 ? 'finalized'
+          : swmCount > 0 ? 'swm-fallback'
+            : 'finalized'; // both empty — surface as finalized for the diagnostic
     anchorOk = anchorQueryOk && expectedAnchorCount > 0 && anchorDelta >= expectedAnchorCount;
     if (!JSON_MODE) {
       fmt.step('phase-7a-public-anchor-on-node2', 'Anyone — public anchor visible on a second node');

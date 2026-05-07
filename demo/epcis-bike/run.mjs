@@ -673,12 +673,12 @@ async function phase1() {
         `Capture ${file} (showing first in detail)`,
         r,
         {
-          preamble: 'Each event is sent to the daemon as a complete EPCIS 2.0 ObjectEvent. The plugin returns 202 immediately with a captureID — lifting onto the chain happens asynchronously. We show the first capture in detail; the remaining 16 run silently below.',
+          preamble: `Each event is sent to the daemon as a complete EPCIS 2.0 ObjectEvent. The plugin returns 202 immediately with a captureID — lifting onto the chain happens asynchronously. We show the first capture in detail; the remaining ${eventFiles.length - 1} run silently below.`,
           kind: 'capture',
           interpretation: captureID ? `captureID: ${captureID}` : undefined,
         },
       );
-      if (!JSON_MODE) await pauseAfter('Press Enter to capture the remaining 16 events…');
+      if (!JSON_MODE) await pauseAfter(`Press Enter to capture the remaining ${eventFiles.length - 1} events…`);
     } else if (JSON_MODE) {
       emit(`phase-1-capture-${file.replace('.json', '')}`, `Capture ${file}`, r, { kind: 'capture' });
     } else {
@@ -959,7 +959,7 @@ async function phase5() {
 // reached the daemon / parsed shape unrecognized". A silent coercion to
 // 0 would let auth/daemon errors masquerade as "no new grants" and
 // quietly turn Phase 6 verification into a permanent false negative.
-function countGrantsForPeer(allowedPeer, metaGraph) {
+async function countGrantsForPeer(allowedPeer, metaGraph) {
   const sparql =
     `SELECT (COUNT(?kc) AS ?c) WHERE { ` +
     `  GRAPH <${metaGraph}> { ` +
@@ -967,17 +967,46 @@ function countGrantsForPeer(allowedPeer, metaGraph) {
     `  } ` +
     `  FILTER(STR(?peer) = "${allowedPeer}") ` +
     `}`;
-  const r = runCli(['query', CG_ID, '-q', sparql, '--include-shared-memory']);
-  if (r.exit !== 0) {
-    return { count: null, query: r, error: r.stderr || `query exit ${r.exit}` };
+  // `dkg query` (the CLI front-end) prints a text table for binding results,
+  // not JSON, so `runCli('query', …).parsed` is always undefined and the
+  // pre/post-count delta in Phase 6 silently collapses to "unrecognized
+  // response shape" before allow-list verification can run. Hit the daemon's
+  // /api/query route directly (matches `node2Sparql`'s pattern) so we get
+  // structured `{ result: { bindings } }` back and can read the COUNT cell.
+  const auth = await getDaemonAuth();
+  const cmdString = `POST ${auth.baseUrl}/api/query  ${sparql.length > 80 ? sparql.slice(0, 77) + '...' : sparql}`;
+  let res;
+  let text = '';
+  let parsed;
+  try {
+    res = await fetch(`${auth.baseUrl}/api/query`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${auth.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ sparql, contextGraphId: CG_ID, includeSharedMemory: true }),
+    });
+    text = await res.text();
+    try { parsed = JSON.parse(text); } catch { /* non-JSON body */ }
+  } catch (err) {
+    const message = err?.message ?? String(err);
+    return {
+      count: null,
+      query: { exit: -1, stdout: '', stderr: message, parsed: undefined, cmdString },
+      error: `daemon query fetch failed: ${message}`,
+    };
   }
-  const bindings =
-    r.parsed?.result?.bindings ?? r.parsed?.bindings ?? null;
+  const queryShape = { exit: res.ok ? 0 : res.status, stdout: text, stderr: res.ok ? '' : text, parsed, cmdString };
+  if (!res.ok) {
+    return { count: null, query: queryShape, error: `daemon /api/query HTTP ${res.status}: ${text.slice(0, 200)}` };
+  }
+  const bindings = Array.isArray(parsed?.result?.bindings) ? parsed.result.bindings : null;
   if (bindings === null) {
-    return { count: null, query: r, error: 'unrecognized response shape (no bindings)' };
+    return { count: null, query: queryShape, error: 'unrecognized response shape (no bindings)' };
   }
-  const parsed = parseCountBinding(bindings[0]?.c);
-  return { count: parsed, query: r };
+  const parsedCount = parseCountBinding(bindings[0]?.c);
+  return { count: parsedCount, query: queryShape };
 }
 
 // Pull a numeric COUNT(*) value out of a SPARQL result cell. The DKG
@@ -1046,7 +1075,7 @@ async function phase6() {
   // check needs to find at least one MORE binding to prove THIS run added
   // a grant — a bare existence check would falsely succeed on stale state.
   const metaGraph = `${CG_URI}/_meta`;
-  const beforeResult = countGrantsForPeer(ALLOWED_PEER, metaGraph);
+  const beforeResult = await countGrantsForPeer(ALLOWED_PEER, metaGraph);
   if (beforeResult.count === null) {
     emitFail(
       'phase-6-pre-count-fail',
@@ -1188,7 +1217,7 @@ async function phase6() {
   // THIS specific KC. Instead we count grants for ALLOWED_PEER before
   // and after — if the count went up, this capture's lift wrote a new
   // grant. Older grants from prior runs cannot satisfy the check.
-  const grantsAfterResult = countGrantsForPeer(ALLOWED_PEER, metaGraph);
+  const grantsAfterResult = await countGrantsForPeer(ALLOWED_PEER, metaGraph);
   if (grantsAfterResult.count === null) {
     emitFail(
       'phase-6-post-count-fail',

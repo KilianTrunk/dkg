@@ -1255,12 +1255,32 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
               ...(shouldSyncSharedMemory ? { sharedMemorySynced: true } : {}),
               ...(hasContent ? { metaSynced: true } : {}),
             });
+          } else if (result.peersTried > 0 && result.peersSucceeded === 0) {
+            // No peer answered within the run — curator likely offline
+            // or no node currently holds this CG. Distinct from `denied`
+            // so the UI can render "couldn't reach the curator" copy +
+            // the signed-join-request CTA. The previous behaviour
+            // collapsed this case into a generic `failed` whose message
+            // ("all reachable peers failed") was easy to misread as a
+            // local error. See `JoinProjectModal.tsx` `unreachable`
+            // branch and `CatchupJobState`.
+            job.status = "unreachable";
+            job.error = "No peer could deliver this project's data — the curator may be offline, or no node currently holds the data. You can still send a signed join request; they will receive it next time they come online.";
           } else if (result.peersTried > 0) {
             job.status = "failed";
             job.error = "Sync did not complete — all reachable peers failed (timeouts or transport errors). Retry once the network is healthier.";
           } else if (result.connectedPeers > 0 && result.syncCapablePeers === 0) {
-            job.status = "failed";
-            job.error = "No sync-capable peers found for catch-up";
+            // Connected to peers, but none speak the sync protocol —
+            // i.e. all our connections are non-DKG / mismatched
+            // versions. From the joiner's perspective this is the same
+            // unreachable outcome ("nobody can answer my sync"), so
+            // reuse the dedicated terminal status.
+            job.status = "unreachable";
+            job.error = "No sync-capable peers found for catch-up — the curator may be offline.";
+          } else if (result.connectedPeers === 0) {
+            // No peers connected at all → definitionally unreachable.
+            job.status = "unreachable";
+            job.error = "No peers connected — couldn't reach the curator. They may be offline, or your node hasn't bootstrapped to the network yet.";
           }
 
           if (DEBUG_SYNC_TRACE) {

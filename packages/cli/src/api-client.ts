@@ -435,7 +435,7 @@ export class ApiClient {
     jobId: string;
     contextGraphId: string;
     includeWorkspace: boolean;
-    status: 'queued' | 'running' | 'done' | 'denied' | 'failed';
+    status: 'queued' | 'running' | 'done' | 'denied' | 'failed' | 'unreachable';
     queuedAt: number;
     startedAt?: number;
     finishedAt?: number;
@@ -443,6 +443,7 @@ export class ApiClient {
       connectedPeers: number;
       syncCapablePeers: number;
       peersTried: number;
+      peersSucceeded: number;
       dataSynced: number;
       sharedMemorySynced: number;
       denied: boolean;
@@ -482,6 +483,16 @@ export class ApiClient {
 
   async connect(multiaddr: string): Promise<{ connected: boolean }> {
     return this.post('/api/connect', { multiaddr });
+  }
+
+  /**
+   * V10 DHT-based dial: hand the daemon a peer id, and it resolves the
+   * peer's current multiaddrs via libp2p Kademlia
+   * (`peerRouting.findPeer`) before dialling. Used by invites that carry
+   * only a peer id so they survive relay rotations.
+   */
+  async connectByPeerId(peerId: string): Promise<{ connected: boolean }> {
+    return this.post('/api/connect', { peerId });
   }
 
   async createContextGraph(id: string, name: string, description?: string, options?: {

@@ -1745,6 +1745,55 @@ describe('DKGAgent (integration)', () => {
 
     await agent.stop();
   }, 10000);
+
+  it('publishProfile advertises only public CGs in contextGraphsServed', async () => {
+    // Privacy invariant: the agent profile is published into the public
+    // `agents` system context graph, gossipped to every subscriber. Private
+    // / curated CG IDs MUST NOT leak through `contextGraphsServed`. The
+    // filter in `DKGAgent.publishProfile` consults `isPrivateContextGraph`
+    // — the same predicate the responder uses to gate sync requests — so
+    // discovery and access-control stay aligned.
+    const store = new OxigraphStore();
+    const agent = await DKGAgent.create({
+      name: 'PrivacyHost',
+      framework: 'DKG',
+      listenPort: 0,
+      store,
+      skills: [],
+      chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+    });
+    await agent.start();
+
+    try {
+      await agent.createContextGraph({
+        id: 'public-research',
+        name: 'Public Research',
+      });
+      await agent.createContextGraph({
+        id: 'secret-ops',
+        name: 'Secret Ops',
+        accessPolicy: 1,
+        allowedAgents: ['0x0000000000000000000000000000000000000001'],
+      });
+
+      await agent.publishProfile();
+
+      const agentsGraph = paranetDataGraphUri(SYSTEM_PARANETS.AGENTS);
+      const result = await store.query(
+        `SELECT ?served WHERE { GRAPH <${agentsGraph}> { ?h <https://dkg.origintrail.io/skill#contextGraphsServed> ?served } }`,
+      );
+      expect(result.type).toBe('bindings');
+      const served = result.type === 'bindings'
+        ? (result.bindings.map(b => b['served']).filter(Boolean) as string[])
+        : [];
+      expect(served.length).toBeGreaterThan(0);
+      const joined = served.join(',');
+      expect(joined).toContain('public-research');
+      expect(joined).not.toContain('secret-ops');
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  }, 15000);
 });
 
 describe('Genesis Knowledge', () => {

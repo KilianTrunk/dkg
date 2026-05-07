@@ -363,9 +363,15 @@ describe('EPCIS events query route — per-request CG + sub-graph', () => {
 
     expect(ctx.res.statusCode).toBe(200);
     expect(calls).toHaveLength(1);
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/context/research>');
+    // Finalized sub-graph URI is `<cg>/<sub>` (not `<cg>/context/<sub>`) —
+    // matches `packages/agent/src/finalization-handler.ts:358-362`, which
+    // is where the publisher actually writes finalized sub-graph data.
+    // An earlier expectation against `<cg>/context/<sub>` (contextGraphDataUri's
+    // 2-arg form) read from a graph URI the publisher never populates.
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research>');
     expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:per-request-cg/research/_private>');
     expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:per-request-cg/_private>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:per-request-cg/context/research>');
   });
 
   it('per-request subGraphName picks SWM partition when finalized=false', async () => {

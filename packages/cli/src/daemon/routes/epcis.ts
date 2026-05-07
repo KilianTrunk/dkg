@@ -337,7 +337,20 @@ function resolveCgId(
   source: 'query string' | 'request body',
   fallback?: string,
 ): ResolveResult<string> {
-  if (input !== undefined && input !== null && input !== '') {
+  // Distinguish "absent" (undefined/null) from "explicitly empty" (''):
+  //   - absent → fall back to config.epcis.contextGraphId or 400 if no fallback
+  //   - empty string → 400 InvalidContent (caller asked us to use a CG named
+  //     "", which can't possibly match a real graph; falling back silently
+  //     would route the request to the daemon default CG and could publish
+  //     to the wrong tenant)
+  if (input === '') {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'InvalidContent', message: '"contextGraphId" cannot be an empty string' },
+    };
+  }
+  if (input !== undefined && input !== null) {
     if (typeof input !== 'string') {
       return { ok: false, status: 400, body: { error: 'InvalidContent', message: '"contextGraphId" must be a string' } };
     }
@@ -361,7 +374,18 @@ function resolveCgId(
 }
 
 function resolveSubGraphName(input: unknown): ResolveResult<string | undefined> {
-  if (input === undefined || input === null || input === '') {
+  // Same absent-vs-empty distinction as resolveCgId. Empty subGraphName
+  // can't be coerced to "root partition" silently — that would route a
+  // request the caller flagged with `subGraphName=""` to a different
+  // partition than the one they asked for. Reject explicitly.
+  if (input === '') {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'InvalidContent', message: '"subGraphName" cannot be an empty string' },
+    };
+  }
+  if (input === undefined || input === null) {
     return { ok: true, value: undefined };
   }
   if (typeof input !== 'string') {

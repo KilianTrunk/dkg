@@ -510,7 +510,13 @@ describe('handleEventsQuery — per-request sub-graph', () => {
       },
     );
 
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/context/research>');
+    // Finalized sub-graph URI is `<cg>/<sub>` (no `/context/` segment),
+    // matching `packages/agent/src/finalization-handler.ts:358-362`
+    // (the publisher's actual write target). The earlier expectation
+    // against `<cg>/context/<sub>` read from a graph URI the publisher
+    // never populates — finalized sub-graph queries returned zero rows.
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research>');
+    expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg/context/research>');
     expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg/research/_private>');
     expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg>');
     expect(calls[0].sparql).not.toContain('GRAPH <did:dkg:context-graph:test-cg/_private>');

@@ -5,6 +5,7 @@ import {
   contextGraphSharedMemoryUri,
   contextGraphSharedMemoryMetaUri,
   contextGraphSubGraphPrivateUri,
+  contextGraphSubGraphUri,
 } from '@origintrail-official/dkg-core';
 import type { EpcisQueryParams } from './types.js';
 
@@ -54,10 +55,20 @@ export function normalizeBizStep(value: string): string {
  */
 export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string): string {
   const partition = params.finalized === false ? 'swm' : 'finalized';
+  // Finalized data lands at `<cg>/<sub>` when a sub-graph is targeted —
+  // see `packages/agent/src/finalization-handler.ts:358-362`, which
+  // calls `contextGraphSubGraphUri(contextGraphId, subGraphName)`.
+  // Earlier this branch used `contextGraphDataUri(cg, sub)` which yields
+  // `<cg>/context/<sub>` — a different graph URI than where the publisher
+  // actually writes, so finalized sub-graph queries returned zero events
+  // whenever `subGraphName` was set. The unsub-graph (cg-only) finalized
+  // URI keeps `contextGraphDataUri`'s single-arg fallback (`<cg>`).
   const publicGraph =
     partition === 'swm'
       ? contextGraphSharedMemoryUri(contextGraphId, params.subGraphName)
-      : contextGraphDataUri(contextGraphId, params.subGraphName);
+      : params.subGraphName
+        ? contextGraphSubGraphUri(contextGraphId, params.subGraphName)
+        : contextGraphDataUri(contextGraphId);
   const metaGraph =
     partition === 'swm'
       ? contextGraphSharedMemoryMetaUri(contextGraphId, params.subGraphName)

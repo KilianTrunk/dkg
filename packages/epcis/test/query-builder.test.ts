@@ -262,7 +262,13 @@ describe('buildEpcisQuery', () => {
     const finalizedSparql = buildEpcisQuery({ subGraphName: 'supply-chain' }, CONTEXT_GRAPH_ID);
     const swmSparql = buildEpcisQuery({ finalized: false, subGraphName: 'supply-chain' }, CONTEXT_GRAPH_ID);
 
-    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain>`);
+    // Finalized sub-graph URI is `<cg>/<sub>` (no `/context/` segment) —
+    // matches `packages/agent/src/finalization-handler.ts:358-362`, which
+    // is where the publisher actually writes finalized sub-graph data.
+    // The earlier expectation against `<cg>/context/<sub>` (contextGraphDataUri's
+    // 2-arg form) read from a graph URI the publisher never populates.
+    expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain>`);
+    expect(finalizedSparql).not.toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain>`);
     expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/_meta>`);
     expect(finalizedSparql).not.toContain(`GRAPH <${DATA_GRAPH}/context/supply-chain/_meta>`);
     expect(finalizedSparql).toContain(`GRAPH <${DATA_GRAPH}/supply-chain/_private>`);

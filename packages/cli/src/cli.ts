@@ -2812,10 +2812,13 @@ epcisCmd
         process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
       }
       const allowedPeers = opts.allowedPeer as string[] | undefined;
-      if (allowedPeers && allowedPeers.length > 0 && accessPolicy !== 'allowList') {
-        console.error('--allowed-peer requires --access-policy allowList.');
-        process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
-      }
+      // Validation of `allowedPeers requires accessPolicy === 'allowList'`
+      // runs against the EFFECTIVE merged policy below (post-`merged`
+      // construction). Validating the raw `--access-policy` flag here
+      // would reject `dkg epcis capture envelope.json --allowed-peer X`
+      // when the envelope already supplies `accessPolicy: 'allowList'`,
+      // which is a perfectly valid combination — the flag adds peers,
+      // the envelope sets the policy.
 
       const publishOptions = (() => {
         const merged = { ...(filePublishOptions ?? {}) } as {
@@ -2841,16 +2844,25 @@ epcisCmd
         }
       }
 
+      // Use explicit `!== undefined` checks (not truthiness) so an
+      // envelope file that explicitly sets `"contextGraphId": ""` or
+      // `"subGraphName": ""` round-trips to the server as an empty
+      // string. The server's resolveCgId/resolveSubGraphName then
+      // returns a precise 400 instead of silently falling back to the
+      // daemon default CG / root partition. Truthiness drops empty
+      // strings into the "not provided" bucket, which masks the
+      // misconfiguration as a successful capture against the wrong
+      // partition.
       const request = {
         epcisDocument,
-        ...(opts.contextGraphId
+        ...(opts.contextGraphId !== undefined
           ? { contextGraphId: String(opts.contextGraphId) }
-          : fileContextGraphId
+          : fileContextGraphId !== undefined
             ? { contextGraphId: String(fileContextGraphId) }
             : {}),
-        ...(opts.subGraphName
+        ...(opts.subGraphName !== undefined
           ? { subGraphName: String(opts.subGraphName) }
-          : fileSubGraphName
+          : fileSubGraphName !== undefined
             ? { subGraphName: String(fileSubGraphName) }
             : {}),
         ...(publishOptions ? { publishOptions } : {}),

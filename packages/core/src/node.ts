@@ -73,7 +73,7 @@ export function isPublicLikeAddress(addr: string): boolean {
   const ipv4 = addr.match(/^\/ip4\/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\//);
   if (ipv4) {
     const o = ipv4[1].split('.').map(Number);
-    if (o.some((n) => Number.isNaN(n))) return false;
+    if (o.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
     if (o[0] === 0 || o[0] === 127) return false;
     if (o[0] === 10) return false;
     if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return false;

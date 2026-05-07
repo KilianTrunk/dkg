@@ -38,6 +38,14 @@ describe('isMultiaddrRemotelyDialable', () => {
       expect(isMultiaddrRemotelyDialable('/ip4/169.254.1.5/tcp/9090/p2p/12D3Koo...')).toBe(false);
       expect(isMultiaddrRemotelyDialable('/ip4/100.105.212.110/tcp/57550/p2p/12D3Koo...')).toBe(false);
     });
+    // Mirror of the core test in `packages/core/test/address-classifier.test.ts`.
+    // Codex flagged on PR #434 (round 2) that the core copy was accepting
+    // out-of-range octets while this copy already rejected them — a real drift.
+    it('rejects out-of-range IPv4 octets', () => {
+      expect(isMultiaddrRemotelyDialable('/ip4/999.1.1.1/tcp/9090/p2p/12D3Koo...')).toBe(false);
+      expect(isMultiaddrRemotelyDialable('/ip4/256.0.0.1/tcp/9090/p2p/12D3Koo...')).toBe(false);
+      expect(isMultiaddrRemotelyDialable('/ip4/-1.2.3.4/tcp/9090/p2p/12D3Koo...')).toBe(false);
+    });
     it('rejects loopback + link-local + ULA IPv6', () => {
       expect(isMultiaddrRemotelyDialable('/ip6/::1/tcp/9090/p2p/12D3Koo...')).toBe(false);
       expect(isMultiaddrRemotelyDialable('/ip6/fe80::1/tcp/9090/p2p/12D3Koo...')).toBe(false);

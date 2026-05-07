@@ -1388,6 +1388,27 @@ contextGraphCmd
   });
 
 contextGraphCmd
+  .command('create-sub-graph <contextGraphId> <subGraphName>')
+  .description('Register a sub-graph inside a context graph (required before EPCIS captures or sub-graph-targeted publishes can enqueue).')
+  .action(async (contextGraphId: string, subGraphName: string) => {
+    try {
+      const client = await ApiClient.connect();
+      const result = await client.createSubGraph(contextGraphId, subGraphName);
+      console.log('Sub-graph registered:');
+      console.log(`  Context Graph: ${result.contextGraphId}`);
+      console.log(`  Sub-graph:     ${result.created}`);
+    } catch (err) {
+      const msg = toErrorMessage(err);
+      if (/already exists/i.test(msg)) {
+        console.log(`Sub-graph "${subGraphName}" already exists in context graph "${contextGraphId}" — nothing to do.`);
+        return;
+      }
+      console.error(msg);
+      process.exit(1);
+    }
+  });
+
+contextGraphCmd
   .command('remove-agent <contextGraphId>')
   .description('Remove an agent from a context graph allowlist')
   .requiredOption('--agent <address>', 'Agent Ethereum address (0x...)')

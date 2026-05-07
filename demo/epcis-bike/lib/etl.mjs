@@ -101,35 +101,38 @@ export async function runEtl({
   await mkdir(outDir, { recursive: true });
 
   // Clean prior fixture files — but ONLY the ones we wrote in a previous
-  // run, never arbitrary `event-*.json` matches in `--out`. The earlier
-  // glob-delete (`/^event-\d+-.*\.json$/.test`) silently destroyed
-  // unrelated files when an operator pointed `--out` at a shared
-  // directory. Restrict deletion to files recorded in the previous
-  // manifest; if no manifest is present, skip cleanup entirely so a
-  // misdirected `--out` can't lose data.
+  // run of THIS traceId, never any `event-*.json` matches in `--out` or
+  // any other trace's manifest sharing the same dir. The earlier
+  // implementation aggregated files across every `trace-*-bike-line.json`
+  // it found and deleted them all, which silently destroyed sibling
+  // traces' fixtures whenever an operator regenerated one trace into a
+  // shared dir. Restrict deletion to the events recorded in THIS run's
+  // current manifest (named `trace-<traceId.slice(0,8)>-bike-line.json`);
+  // if it doesn't exist (first run for this traceId), skip cleanup
+  // entirely. Other trace's manifests + their files are left untouched.
   const existingEntries = await readdir(outDir).catch(() => []);
-  const previousManifests = existingEntries.filter((f) =>
-    /^trace-[0-9a-f]{8}-bike-line\.json$/.test(f),
-  );
-  const filesToRemove = new Set();
-  for (const m of previousManifests) {
+  const currentManifestName = `trace-${traceId.slice(0, 8)}-bike-line.json`;
+  if (existingEntries.includes(currentManifestName)) {
+    const filesToRemove = new Set();
     try {
-      const prev = JSON.parse(await readFile(join(outDir, m), 'utf-8'));
+      const prev = JSON.parse(
+        await readFile(join(outDir, currentManifestName), 'utf-8'),
+      );
       if (Array.isArray(prev?.events)) {
         for (const ev of prev.events) {
           if (typeof ev?.file === 'string') filesToRemove.add(ev.file);
         }
       }
-      // Also remove the prior manifest itself so a regen with a new
-      // trace-id doesn't leave the old one lingering as a sibling.
-      filesToRemove.add(m);
+      // Remove THIS trace's prior manifest so a regen leaves only the
+      // freshly-written one.
+      filesToRemove.add(currentManifestName);
     } catch {
-      // Malformed prior manifest — skip; we'd rather leak a stale file
-      // than risk deleting unlisted user data based on a partial parse.
+      // Malformed prior manifest — skip cleanup; we'd rather leak a
+      // stale file than delete files based on a partial parse.
     }
-  }
-  for (const entry of filesToRemove) {
-    await unlink(join(outDir, entry)).catch(() => {});
+    for (const entry of filesToRemove) {
+      await unlink(join(outDir, entry)).catch(() => {});
+    }
   }
 
   // Use the latest source-record timestamp as the document's

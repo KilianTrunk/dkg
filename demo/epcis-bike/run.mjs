@@ -175,29 +175,39 @@ function runCli(args) {
 // file — so demo phases agree with `dkg auth show` on which tokens are
 // valid.
 async function resolveAuthToken(dkgHome) {
+  // Track whether the daemon explicitly disabled auth — when
+  // `config.auth.enabled === false`, the daemon accepts unauthenticated
+  // requests and a missing token is a SUPPORTED configuration, not a
+  // fatal error. Default `true` matches the daemon's own default
+  // (`auth.enabled` defaults to true).
+  let authEnabled = true;
+  let token;
   const configPath = join(dkgHome, 'config.json');
   if (existsSync(configPath)) {
     try {
       const cfg = JSON.parse(await readFile(configPath, 'utf-8'));
+      if (cfg?.auth?.enabled === false) authEnabled = false;
       const cfgTokens = cfg?.auth?.tokens;
       if (Array.isArray(cfgTokens)) {
         const t = cfgTokens.find((s) => typeof s === 'string' && s.length > 0);
-        if (t) return t;
+        if (t) token = t;
       }
     } catch {
-      // Fall through to file-backed token below — a malformed config.json
-      // is an operator problem, not a reason to give up on a daemon that
-      // also has an auth.token file.
+      // Malformed config.json — fall through to file-backed token below;
+      // we'd rather try the file than abort over a broken config.
     }
   }
-  try {
-    return (await readFile(join(dkgHome, 'auth.token'), 'utf-8'))
-      .split('\n')
-      .map((l) => l.trim())
-      .find((l) => l && !l.startsWith('#'));
-  } catch {
-    return undefined;
+  if (!token) {
+    try {
+      token = (await readFile(join(dkgHome, 'auth.token'), 'utf-8'))
+        .split('\n')
+        .map((l) => l.trim())
+        .find((l) => l && !l.startsWith('#'));
+    } catch {
+      // No file token either — leave `token` undefined.
+    }
   }
+  return { token, authEnabled };
 }
 
 // Publisher's success terminal is `finalized` (V10). Older RC daemons
@@ -237,9 +247,22 @@ async function getDaemonAuth() {
         (await readFile(join(dkgHome, 'api.port'), 'utf-8')).trim(),
         10,
       );
-  const token = await resolveAuthToken(dkgHome);
-  if (!Number.isFinite(port) || !token) {
-    throw new Error(`Cannot read daemon auth from ${dkgHome}`);
+  const { token, authEnabled } = await resolveAuthToken(dkgHome);
+  if (!Number.isFinite(port)) {
+    throw new Error(`Cannot read daemon port from ${dkgHome}`);
+  }
+  // A missing token is fatal ONLY when the daemon has auth enabled.
+  // `auth.enabled=false` is a supported deployment (CI, dev sandboxes)
+  // where the daemon accepts unauthenticated requests; aborting Phase 2
+  // here under that config would surface as "Cannot read daemon auth"
+  // even though the API would happily serve the same /api/epcis/capture/<id>
+  // request anonymously. Callers (fetchCaptureStatus, etc.) only emit
+  // an Authorization header when `token` is set.
+  if (authEnabled && !token) {
+    throw new Error(
+      `Daemon at ${dkgHome} has auth.enabled=true but no token reachable ` +
+        '(checked config.json:auth.tokens[] and auth.token file).',
+    );
   }
   _daemonAuth = { baseUrl: `http://127.0.0.1:${port}`, token };
   return _daemonAuth;
@@ -255,6 +278,10 @@ async function fetchCaptureStatus(captureID) {
   let res;
   let text = '';
   let parsed;
+  // Only emit an Authorization header when we actually have a token —
+  // `auth.enabled=false` daemons reject the bearer if it's set to
+  // something invalid (and an empty `Bearer ` is invalid).
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
   // Wrap the network call so daemon restarts / connection resets / any
   // other transport-level rejection synthesizes the same `http-error`
   // terminal shape that non-2xx responses produce below. Without this
@@ -264,7 +291,7 @@ async function fetchCaptureStatus(captureID) {
   // daemon during a transient issue.
   try {
     res = await fetch(`${baseUrl}/api/epcis/capture/${encodeURIComponent(captureID)}`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers,
     });
     text = await res.text();
     try { parsed = JSON.parse(text); } catch { /* non-JSON */ }
@@ -306,12 +333,16 @@ async function getNode2Auth() {
       (await readFile(join(NODE2_DKG_HOME, 'api.port'), 'utf-8')).trim(),
       10,
     );
-    // Same config-aware token resolution as getDaemonAuth — node2 may
-    // also be a config-tokens-only deployment. resolveAuthToken returns
-    // undefined for "no token reachable", which we coerce to graceful
-    // null below (Phase 7 degrades cleanly when node2 is unavailable).
-    const token = await resolveAuthToken(NODE2_DKG_HOME);
-    if (!Number.isFinite(port) || !token) {
+    // Same config-aware token resolution as getDaemonAuth, including
+    // the auth.enabled=false escape hatch. Node2 with auth disabled is
+    // a valid sandbox config; treat missing token as fatal only when
+    // the node's own config requires auth.
+    const { token, authEnabled } = await resolveAuthToken(NODE2_DKG_HOME);
+    if (!Number.isFinite(port)) {
+      _node2Auth = null;
+      return null;
+    }
+    if (authEnabled && !token) {
       _node2Auth = null;
       return null;
     }
@@ -397,13 +428,16 @@ async function node2Sparql(sparql) {
   // querySucceeded() (status===200 && Array.isArray(bindings)) cleanly
   // classifies it as a query failure rather than an unverified result.
   let res;
+  // Only attach Authorization when node2 actually has a token (the
+  // `auth.enabled=false` deployment case — same shape as
+  // fetchCaptureStatus above).
+  const headers = auth.token
+    ? { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' }
+    : { 'Content-Type': 'application/json' };
   try {
     res = await fetch(`${auth.baseUrl}/api/query`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${auth.token}`,
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({ sparql, contextGraphId: CG_ID, includeSharedMemory: true }),
     });
   } catch (err) {
@@ -828,12 +862,21 @@ async function phase0() {
   return trace;
 }
 
-async function phase1() {
+async function phase1(trace) {
   await startPhase(PHASE_INTROS[1]);
 
-  const eventFiles = (await readdir(FIXTURES))
-    .filter((f) => /^event-\d+-.*\.json$/.test(f))
-    .sort();
+  // Drive Phase 1 from `trace.events[].file` rather than a directory
+  // glob + lexicographic sort. The glob-then-sort path silently misordered
+  // any trace whose ETL emitted ≥100 events: `event-100-*.json` sorts
+  // BEFORE `event-99-*.json` lexicographically, so a hypothetical
+  // 100-event source would capture out-of-order in Phase 1 and then
+  // ADD/OBSERVE assignment downstream wouldn't match the manifest the
+  // ETL wrote. Walking `trace.events` is canonical: the ETL produces
+  // events in the same order as the manifest, indices match the
+  // `event-NN-*.json` filename prefix exactly.
+  const eventFiles = (Array.isArray(trace?.events) ? trace.events : [])
+    .map((e) => e?.file)
+    .filter((f) => typeof f === 'string' && /^event-\d+-.*\.json$/.test(f));
 
   // Hard-fail when no fixtures match. Falling through to the empty
   // captureIds branch would let Phase 2 trivially "complete" and the
@@ -1456,7 +1499,7 @@ async function phase6() {
   await pauseAfter();
 }
 
-async function phase7() {
+async function phase7(trace) {
   await startPhase(PHASE_INTROS[7]);
 
   // Verification result tags shown in the final visibility table.
@@ -1537,14 +1580,18 @@ async function phase7() {
       baselineForPartition = phase7AnchorBaseline.captured ? phase7AnchorBaseline.swm : 0;
     }
     const anchorDelta = anchorCount - baselineForPartition;
-    // Scope the assertion to THIS run: require the delta against the
-    // pre-Phase-1 baseline to be > 0. Pure absolute count would falsely
-    // pass against a reused CG whose stale anchors from earlier runs
-    // already exceeded zero. When no baseline was captured (node2 was
-    // unreachable at Phase 0 → phase7AnchorBaseline.captured=false),
-    // baselineForPartition stays 0 and delta == anchorCount, matching
-    // pre-baseline behavior.
-    anchorOk = anchorQueryOk && anchorDelta > 0;
+    // Scope the assertion to THIS run AND require ALL of this run's
+    // captures to have gossiped — `delta > 0` is too lax: it lets the
+    // green success line + verified table cell trigger as soon as a
+    // single capture's anchor reaches node2, even when 6 of 7 stayed
+    // stuck. `delta >= expectedAnchorCount` (where the expected count
+    // is `trace.event_count`, the number of EPCIS docs Phase 1 sent)
+    // requires the full run's gossip to land. When no baseline was
+    // captured (node2 unreachable at Phase 0), baselineForPartition
+    // stays 0 and the comparison degrades to `anchorCount >=
+    // expectedAnchorCount` — still a tighter bound than `> 0`.
+    const expectedAnchorCount = Array.isArray(trace?.events) ? trace.events.length : 0;
+    anchorOk = anchorQueryOk && expectedAnchorCount > 0 && anchorDelta >= expectedAnchorCount;
     if (!JSON_MODE) {
       fmt.step('phase-7a-public-anchor-on-node2', 'Anyone — public anchor visible on a second node');
       fmt.preamble(
@@ -1563,7 +1610,7 @@ async function phase7() {
       }
       await pauseAfter();
     } else {
-      process.stdout.write(`${JSON.stringify({ step: 'phase-7a-public-anchor-on-node2', anchorCount, anchorDelta, baseline: baselineForPartition, partition: queriedPartition, queryOk: anchorQueryOk, ok: anchorOk })}\n`);
+      process.stdout.write(`${JSON.stringify({ step: 'phase-7a-public-anchor-on-node2', anchorCount, anchorDelta, expected: expectedAnchorCount, baseline: baselineForPartition, partition: queriedPartition, queryOk: anchorQueryOk, ok: anchorOk })}\n`);
     }
 
     // 7.B — Private payload absent on node2 until access-protocol fetch.
@@ -1774,14 +1821,14 @@ async function phase7() {
 async function main() {
   CLI = await detectCli();
   await showOpening();
-  await phase0();
-  const captureIds = await phase1();
+  const trace = await phase0();
+  const captureIds = await phase1(trace);
   if (captureIds.length > 0) await phase2(captureIds);
   await phase3();
   await phase4();
   await phase5();
   await phase6();
-  await phase7();
+  await phase7(trace);
   showClosing();
   if (!JSON_MODE) fmt.success('Demo complete.');
 }

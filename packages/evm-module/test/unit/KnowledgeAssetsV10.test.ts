@@ -16,18 +16,21 @@ import {
   Hub,
   KnowledgeAssetsV10,
   KnowledgeCollectionStorage,
+  MockERC1271Wallet,
+  MockERC1271Wallet__factory,
   Profile,
   Staking,
   StakingV10,
   Token,
 } from '../../typechain';
 import {
+  buildAuthorAttestationPayload,
   buildPublishAckDigest,
   buildPublishParams,
-  buildPublisherDigest,
   buildUpdateParams,
   DEFAULT_CHAIN_ID,
-  signPublishDigests,
+  signAckDigest,
+  signAuthorAttestation,
 } from '../helpers/v10-kc-helpers';
 import { createProfile, createProfiles } from '../helpers/profile-helpers';
 import {
@@ -360,10 +363,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode,
           receivingNodes,
           publisherIdentityId,
           receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -434,10 +437,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode,
           receivingNodes,
           publisherIdentityId,
           receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -449,7 +452,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         });
 
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
-        const tx = await KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress);
+        const tx = await KAV10.connect(creator).publish(p);
         const receipt = await tx.wait();
         expect(receipt!.status).to.equal(1);
 
@@ -489,10 +492,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode,
           receivingNodes,
           publisherIdentityId,
           receiverIdentityIds,
+          author: creator,
           contextGraphId: 0n,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -505,7 +508,7 @@ describe('@unit KnowledgeAssetsV10', () => {
 
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
         await expect(
-          KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress),
+          KAV10.connect(creator).publish(p),
         ).to.be.revertedWithCustomError(KAV10, 'ZeroContextGraphId');
       });
 
@@ -532,10 +535,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode,
           receivingNodes,
           publisherIdentityId,
           receiverIdentityIds,
+          author: creator,
           contextGraphId: 0n,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -568,10 +571,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode,
           receivingNodes,
           publisherIdentityId,
           receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -584,184 +587,276 @@ describe('@unit KnowledgeAssetsV10', () => {
 
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
         await expect(
-          KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress),
+          KAV10.connect(creator).publish(p),
         ).to.be.revertedWithCustomError(KAV10, 'ZeroEpochs');
       });
     });
 
     // ----------------------------------------------------------------------
-    // T1.5: N26 publisher field order regression
+    // T1.5: Author attestation (RFC-001) — required-field gates, EOA replay
+    //       guards, and EIP-1271 dispatch.
+    //
+    // RFC-001 replaced the per-publish publisher signature with an EIP-712
+    // `AuthorAttestation` over `(contextGraphId, merkleRoot, authorAddress,
+    // schemeVersion)`. The contract gates the publish path on:
+    //   - `authorAddress != 0`           → AuthorRequired
+    //   - `authorSchemeVersion == 1`     → UnsupportedAuthorScheme
+    //   - EOA: `ECDSA.tryRecover(...) == authorAddress`
+    //                                    → InvalidAuthorSignature
+    //   - SC wallet: `IERC1271.isValidSignature == 0x1626ba7e`
+    //                                    → InvalidAuthorSignature1271
+    //
+    // The happy paths (EOA + EIP-1271) are exercised by every passing publish
+    // test in the suite (T1.1 onwards); this block locks the negative paths
+    // and the smart-wallet positive path explicitly.
     // ----------------------------------------------------------------------
-    describe('T1.5: N26 publisher digest field order regression', () => {
-      it('rejects a publisher signature built with the WRONG field order', async () => {
+    describe('T1.5: author attestation (RFC-001) — required gates + 1271', () => {
+      async function buildBaselinePublishParams() {
         const creator = getDefaultKCCreator(accounts);
-        const { publishingNode, publisherIdentityId, receivingNodes, receiverIdentityIds } =
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
           await setupNodes();
-
         const cgId = await createOpenCG(creator);
         const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.5-root'));
         const tokenAmount = ethers.parseEther('100');
-        const epochs = 2;
-        const knowledgeAssetsAmount = 10;
-        const byteSize = 1000;
 
-        // WRONG field order: (contextGraphId, publisherNodeIdentityId, merkleRoot).
-        // Contract expects: (publisherNodeIdentityId, contextGraphId, merkleRoot).
-        const wrongPublisherDigest = ethers.solidityPackedKeccak256(
-          ['uint256', 'address', 'uint256', 'uint72', 'bytes32'],
-          [chainId, kav10Address, cgId, publisherIdentityId, merkleRoot],
-        );
-
-        // ACK digest uses correct order so the receiver signatures aren't the
-        // failing branch — we want to isolate the publisher sig failure.
-        const merkleLeafCount = 1;
-        const rightAckDigest = buildPublishAckDigest(
+        const p = await buildPublishParams({
           chainId,
           kav10Address,
-          cgId,
-          merkleRoot,
-          knowledgeAssetsAmount,
-          byteSize,
-          epochs,
-          tokenAmount,
-          merkleLeafCount,
-        );
-
-        const sig = await signPublishDigests(
-          publishingNode,
           receivingNodes,
-          wrongPublisherDigest,
-          rightAckDigest,
-        );
-
-        const p = {
-          publishOperationId: 't1.5-op',
+          publisherIdentityId,
+          receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount,
-          byteSize,
-          epochs,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
           tokenAmount,
           isImmutable: false,
-          merkleLeafCount,
-          publisherNodeIdentityId: publisherIdentityId,
-          publisherNodeR: sig.publisherR,
-          publisherNodeVS: sig.publisherVS,
-          identityIds: receiverIdentityIds,
-          r: sig.receiverRs,
-          vs: sig.receiverVSs,
-        };
-
+          publishOperationId: 't1.5-op',
+        });
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
-        // The contract computes the CORRECT publisher digest and recovers a
-        // different (valid but mismatched) signer from the wrong-order
-        // signature, which fails `identityStorage.keyHasPurpose` and reverts
-        // `SignerIsNotNodeOperator`. Pin the specific revert so future
-        // changes to the publisher-sig path can't drift this test into a
-        // silent false-positive.
+        return { creator, cgId, merkleRoot, tokenAmount, p };
+      }
+
+      it('T1.5a: reverts AuthorRequired when authorAddress == address(0)', async () => {
+        const { creator, p } = await buildBaselinePublishParams();
+        const corrupted = { ...p, authorAddress: ethers.ZeroAddress };
         await expect(
-          KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress),
-        ).to.be.revertedWithCustomError(KAV10, 'SignerIsNotNodeOperator');
+          KAV10.connect(creator).publish(corrupted),
+        ).to.be.revertedWithCustomError(KAV10, 'AuthorRequired');
       });
-    });
 
-    // ----------------------------------------------------------------------
-    // T1.5b: ACK digest spec-conformance regression (Codex BLOCKER 1)
-    //
-    // Spec `03_PROTOCOL_CORE.md:2104` + decision #25 Option B
-    // (`V10_CONTRACTS_REDESIGN_v2.md:549`) define the publish ACK digest as:
-    //   (block.chainid, address(this), contextGraphId, merkleRoot,
-    //    knowledgeAssetsAmount, byteSize, epochs, tokenAmount)
-    //
-    // An earlier draft of the contract incorrectly included
-    // `publisherNodeIdentityId` in the ACK digest. This regression locks in
-    // the spec-conformant shape: signing the WRONG (with-identityId) shape
-    // must revert.
-    // ----------------------------------------------------------------------
-    describe('T1.5b: ACK digest spec-conformance regression', () => {
-      it('rejects an ACK signed with the deprecated (publisherNodeIdentityId-included) shape', async () => {
+      it('T1.5b: reverts UnsupportedAuthorScheme when authorSchemeVersion != 1', async () => {
+        const { creator, p } = await buildBaselinePublishParams();
+        const corrupted = { ...p, authorSchemeVersion: 2 };
+        await expect(KAV10.connect(creator).publish(corrupted))
+          .to.be.revertedWithCustomError(KAV10, 'UnsupportedAuthorScheme')
+          .withArgs(2);
+      });
+
+      it('T1.5c: EOA — reverts InvalidAuthorSignature when signer != authorAddress', async () => {
+        // Signature is valid for `stranger` over the right (cgId, merkleRoot,
+        // creator-as-author, scheme=1) payload, but `authorAddress` declares
+        // `creator`. ECDSA recovers `stranger` → mismatch → revert.
         const creator = getDefaultKCCreator(accounts);
-        const { publishingNode, publisherIdentityId, receivingNodes, receiverIdentityIds } =
+        const stranger = accounts[15];
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
           await setupNodes();
-
         const cgId = await createOpenCG(creator);
-        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.5b-root'));
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.5c-root'));
         const tokenAmount = ethers.parseEther('100');
-        const epochs = 2;
-        const knowledgeAssetsAmount = 10;
-        const byteSize = 1000;
 
-        // Correct publisher digest (publisher-side is fine).
-        const publisherDigest = buildPublisherDigest(
-          chainId,
-          kav10Address,
-          publisherIdentityId,
-          cgId,
-          merkleRoot,
-        );
-
-        // WRONG ACK digest: mirrors the deprecated layout that included
-        // publisherNodeIdentityId. The contract computes the correct shape
-        // (without identityId) so recovery yields a different signer.
-        const wrongAckDigest = ethers.solidityPackedKeccak256(
-          [
-            'uint256', // chainId
-            'address', // kav10Address
-            'uint72',  // publisherNodeIdentityId (DEPRECATED — must NOT be in ACK)
-            'uint256', // contextGraphId
-            'bytes32', // merkleRoot
-            'uint256', // knowledgeAssetsAmount
-            'uint256', // byteSize
-            'uint256', // epochs
-            'uint256', // tokenAmount
-          ],
-          [
+        const wrongSig = await signAuthorAttestation(
+          stranger,
+          buildAuthorAttestationPayload({
             chainId,
             kav10Address,
-            publisherIdentityId,
-            cgId,
+            contextGraphId: cgId,
             merkleRoot,
-            knowledgeAssetsAmount,
-            byteSize,
-            epochs,
-            tokenAmount,
-          ],
+            authorAddress: creator.address,
+          }),
         );
 
-        const sig = await signPublishDigests(
-          publishingNode,
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
           receivingNodes,
-          publisherDigest,
-          wrongAckDigest,
-        );
-
-        const p = {
-          publishOperationId: 't1.5b-op',
+          publisherIdentityId,
+          receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount,
-          byteSize,
-          epochs,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
           tokenAmount,
           isImmutable: false,
-          merkleLeafCount: 1,
-          publisherNodeIdentityId: publisherIdentityId,
-          publisherNodeR: sig.publisherR,
-          publisherNodeVS: sig.publisherVS,
-          identityIds: receiverIdentityIds,
-          r: sig.receiverRs,
-          vs: sig.receiverVSs,
-        };
+          publishOperationId: 't1.5c-op',
+          authorSigOverride: wrongSig,
+        });
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await expect(
+          KAV10.connect(creator).publish(p),
+        ).to.be.revertedWithCustomError(KAV10, 'InvalidAuthorSignature');
+      });
+
+      it('T1.5d: EOA — rejects a signature scoped to a different (cgId, merkleRoot)', async () => {
+        // Author signs an attestation for cgId=cgB / merkleRoot=B but the
+        // publish payload is bound to cgA / merkleRoot=A. The EIP-712 digest
+        // domain-binds the struct hash, so recovery yields a non-creator
+        // address (or wrong recovery) and the contract reverts.
+        const creator = getDefaultKCCreator(accounts);
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
+          await setupNodes();
+        const cgIdA = await createOpenCG(creator);
+        const cgIdB = await createOpenCG(creator);
+        const merkleRootA = ethers.keccak256(ethers.toUtf8Bytes('t1.5d-A'));
+        const merkleRootB = ethers.keccak256(ethers.toUtf8Bytes('t1.5d-B'));
+        const tokenAmount = ethers.parseEther('100');
+
+        const wrongPayloadSig = await signAuthorAttestation(
+          creator,
+          buildAuthorAttestationPayload({
+            chainId,
+            kav10Address,
+            contextGraphId: cgIdB,
+            merkleRoot: merkleRootB,
+            authorAddress: creator.address,
+          }),
+        );
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes,
+          publisherIdentityId,
+          receiverIdentityIds,
+          author: creator,
+          contextGraphId: cgIdA,
+          merkleRoot: merkleRootA,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't1.5d-op',
+          authorSigOverride: wrongPayloadSig,
+        });
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await expect(
+          KAV10.connect(creator).publish(p),
+        ).to.be.revertedWithCustomError(KAV10, 'InvalidAuthorSignature');
+      });
+
+      it('T1.5e: EIP-1271 happy path — wallet returns magic value and publish succeeds', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const walletSigner = accounts[15];
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
+          await setupNodes();
+
+        // Deploy mock wallet with `walletSigner` as the configured EOA. The
+        // wallet will recover `walletSigner` from the EIP-1271 signature and
+        // return `0x1626ba7e` only if recovery matches.
+        const wallet: MockERC1271Wallet = await new MockERC1271Wallet__factory(
+          accounts[0],
+        ).deploy(walletSigner.address);
+        const walletAddress = await wallet.getAddress();
+
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.5e-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        // `walletSigner` signs the EIP-712 digest scoped to the wallet as
+        // authorAddress. Contract dispatches to `wallet.isValidSignature` →
+        // wallet recovers `walletSigner` → magic value → success.
+        const sig = await signAuthorAttestation(
+          walletSigner,
+          buildAuthorAttestationPayload({
+            chainId,
+            kav10Address,
+            contextGraphId: cgId,
+            merkleRoot,
+            authorAddress: walletAddress,
+          }),
+        );
+
+        // We need to override `authorAddress` to point at the wallet. The
+        // helper's `args.author.address` defaults to the EOA's address, so we
+        // build via the helper and then mutate the struct.
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes,
+          publisherIdentityId,
+          receiverIdentityIds,
+          author: walletSigner,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't1.5e-op',
+          authorSigOverride: sig,
+        });
+        const corrupted = { ...p, authorAddress: walletAddress };
 
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
-        // Same rationale as T1.5: the wrong ACK field set produces a valid
-        // signature over a different message, the contract recovers a
-        // mismatched signer (publisher sig OR first receiver sig, whichever
-        // the contract checks first), and `keyHasPurpose` rejects it. Pin
-        // the specific error to keep the regression honest.
+        await expect(KAV10.connect(creator).publish(corrupted)).to.not.be.reverted;
+      });
+
+      it('T1.5f: EIP-1271 negative path — wallet returns non-magic value reverts InvalidAuthorSignature1271', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const walletSigner = accounts[15];
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
+          await setupNodes();
+
+        const wallet: MockERC1271Wallet = await new MockERC1271Wallet__factory(
+          accounts[0],
+        ).deploy(walletSigner.address);
+        await wallet.setForceFailure(true);
+        const walletAddress = await wallet.getAddress();
+
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.5f-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        const sig = await signAuthorAttestation(
+          walletSigner,
+          buildAuthorAttestationPayload({
+            chainId,
+            kav10Address,
+            contextGraphId: cgId,
+            merkleRoot,
+            authorAddress: walletAddress,
+          }),
+        );
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes,
+          publisherIdentityId,
+          receiverIdentityIds,
+          author: walletSigner,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't1.5f-op',
+          authorSigOverride: sig,
+        });
+        const corrupted = { ...p, authorAddress: walletAddress };
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
         await expect(
-          KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress),
-        ).to.be.revertedWithCustomError(KAV10, 'SignerIsNotNodeOperator');
+          KAV10.connect(creator).publish(corrupted),
+        ).to.be.revertedWithCustomError(KAV10, 'InvalidAuthorSignature1271');
       });
     });
 
@@ -771,7 +866,7 @@ describe('@unit KnowledgeAssetsV10', () => {
     describe('T1.6: H5 cross-chain replay rejection', () => {
       it('rejects an ACK digest built with a different chain id', async () => {
         const creator = getDefaultKCCreator(accounts);
-        const { publishingNode, publisherIdentityId, receivingNodes, receiverIdentityIds } =
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
           await setupNodes();
 
         const cgId = await createOpenCG(creator);
@@ -784,13 +879,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         // Build a fake "mainnet" ACK digest (chain id 1) — signer attestation
         // is valid for mainnet, but the contract verifies against 31337.
         const mainnetChainId = 1n;
-        const publisherDigest = buildPublisherDigest(
-          mainnetChainId,
-          kav10Address,
-          publisherIdentityId,
-          cgId,
-          merkleRoot,
-        );
         const ackDigest = buildPublishAckDigest(
           mainnetChainId,
           kav10Address,
@@ -802,11 +890,20 @@ describe('@unit KnowledgeAssetsV10', () => {
           tokenAmount,
           1,
         );
-        const sig = await signPublishDigests(
-          publishingNode,
-          receivingNodes,
-          publisherDigest,
-          ackDigest,
+        const sig = await signAckDigest(receivingNodes, ackDigest);
+
+        // Build a valid author attestation for the LOCAL chain so the
+        // author-attestation gate passes — we want to isolate the ACK
+        // cross-chain replay rejection.
+        const authorSig = await signAuthorAttestation(
+          creator,
+          buildAuthorAttestationPayload({
+            chainId,
+            kav10Address,
+            contextGraphId: cgId,
+            merkleRoot,
+            authorAddress: creator.address,
+          }),
         );
 
         const p = {
@@ -820,8 +917,10 @@ describe('@unit KnowledgeAssetsV10', () => {
           isImmutable: false,
           merkleLeafCount: 1,
           publisherNodeIdentityId: publisherIdentityId,
-          publisherNodeR: sig.publisherR,
-          publisherNodeVS: sig.publisherVS,
+          authorAddress: creator.address,
+          authorR: authorSig.authorR,
+          authorVS: authorSig.authorVS,
+          authorSchemeVersion: 1,
           identityIds: receiverIdentityIds,
           r: sig.receiverRs,
           vs: sig.receiverVSs,
@@ -834,7 +933,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         // a future drift to `InvalidSignature` (recovered address zero)
         // makes the test noisy instead of silently passing.
         await expect(
-          KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress),
+          KAV10.connect(creator).publish(p),
         ).to.be.revertedWithCustomError(KAV10, 'SignerIsNotNodeOperator');
       });
     });
@@ -865,10 +964,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode: nodes.publishingNode,
           receivingNodes: nodes.receivingNodes,
           publisherIdentityId: nodes.publisherIdentityId,
           receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -879,7 +978,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           publishOperationId: 't1.7-publish',
         });
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
-        await KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress);
+        await KAV10.connect(creator).publish(p);
 
         return { creator, cgId, ...nodes, kcId: 1n, tokenAmount, byteSize };
       }
@@ -894,7 +993,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -911,7 +1009,7 @@ describe('@unit KnowledgeAssetsV10', () => {
 
         await TokenContract.connect(base.creator).approve(kav10Address, delta);
         await expect(
-          KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up),
         ).to.not.be.reverted;
 
         const meta = await KCS.getKnowledgeCollectionMetadata(base.kcId);
@@ -926,7 +1024,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -942,7 +1039,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         });
 
         await expect(
-          KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up),
         ).to.not.be.reverted;
       });
 
@@ -964,7 +1061,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -985,7 +1081,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         await TokenContract.connect(stranger).approve(kav10Address, delta);
 
         await expect(
-          KAV10.connect(stranger).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(stranger).update(up),
         )
           .to.be.revertedWithCustomError(KAV10, 'UnauthorizedPublisher')
           .withArgs(base.cgId, stranger.address);
@@ -1000,7 +1096,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1015,7 +1110,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           updateOperationId: 't1.7d-update',
         });
 
-        await expect(KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress))
+        await expect(KAV10.connect(base.creator).update(up))
           .to.be.revertedWithCustomError(KAV10, 'CannotShrinkTokenAmount')
           .withArgs(base.tokenAmount, newTokenAmount);
       });
@@ -1038,7 +1133,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up1 = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1053,7 +1147,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           updateOperationId: 't1.7e-first',
         });
         await expect(
-          KAV10.connect(base.creator).updateDirect(up1, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up1),
         ).to.not.be.reverted;
 
         // Chain is now at merkleRoots.length == 2. Replaying up1 must fail —
@@ -1068,7 +1162,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         // catches regressions where replay is silently accepted or the wrong
         // branch (InvalidSignature/TokenAmount) masks the real bug.
         await expect(
-          KAV10.connect(base.creator).updateDirect(up1, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up1),
         ).to.be.revertedWithCustomError(KAV10, 'SignerIsNotNodeOperator');
       });
 
@@ -1096,7 +1190,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1151,7 +1244,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1167,7 +1259,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         });
 
         await expect(
-          KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up),
         ).to.not.be.reverted;
 
         // Merkle root rotated; minted count unchanged.
@@ -1204,7 +1296,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1220,7 +1311,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         });
 
         await expect(
-          KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up),
         ).to.not.be.reverted;
 
         // Caller no longer owns the token.
@@ -1256,7 +1347,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1271,7 +1361,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           updateOperationId: 't1.7i-update',
         });
 
-        await expect(KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress))
+        await expect(KAV10.connect(base.creator).update(up))
           .to.be.revertedWithCustomError(KCS, 'NotPartOfKnowledgeCollection')
           .withArgs(base.kcId, outOfRangeTokenId);
       });
@@ -1313,7 +1403,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1332,7 +1421,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         // KA token from the KC. The revert comes from the open-CG
         // original-publisher pin, NOT from the balanceOf gate.
         await expect(
-          KAV10.connect(stranger).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(stranger).update(up),
         )
           .to.be.revertedWithCustomError(KAV10, 'UnauthorizedPublisher')
           .withArgs(base.cgId, stranger.address);
@@ -1342,7 +1431,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         // update via the original-publisher pin. Locks "original
         // publisher retains rights even after selling a KA token".
         await expect(
-          KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up),
         ).to.not.be.reverted;
       });
     });
@@ -1384,10 +1473,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode: nodes.publishingNode,
           receivingNodes: nodes.receivingNodes,
           publisherIdentityId: nodes.publisherIdentityId,
           receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -1398,7 +1487,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           publishOperationId: 't1.8-publish',
         });
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
-        await KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress);
+        await KAV10.connect(creator).publish(p);
 
         return {
           creator,
@@ -1423,7 +1512,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1439,7 +1527,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         });
 
         await expect(
-          KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up),
         ).to.be.revertedWithCustomError(KAV10, 'InvalidTokenAmount');
       });
 
@@ -1458,7 +1546,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1476,7 +1563,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         const delta = newTokenAmount - base.tokenAmount;
         await TokenContract.connect(base.creator).approve(kav10Address, delta);
         await expect(
-          KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up),
         ).to.not.be.reverted;
 
         const meta = await KCS.getKnowledgeCollectionMetadata(base.kcId);
@@ -1519,7 +1606,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1534,7 +1620,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           updateOperationId: 't1.8c-update',
         });
 
-        await expect(KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress))
+        await expect(KAV10.connect(base.creator).update(up))
           .to.be.revertedWithCustomError(KAV10, 'NoRemainingLifetimeForDelta')
           .withArgs(base.kcId, now, meta[5]);
       });
@@ -1587,7 +1673,6 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: base.publishingNode,
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
@@ -1603,7 +1688,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         });
 
         await expect(
-          KAV10.connect(base.creator).updateDirect(up, ethers.ZeroAddress),
+          KAV10.connect(base.creator).update(up),
         ).to.be.revertedWithCustomError(KAV10, 'InvalidTokenAmount');
       });
     });
@@ -1615,25 +1700,88 @@ describe('@unit KnowledgeAssetsV10', () => {
 
   describe('Tier 2 — should-have coverage', () => {
     // ----------------------------------------------------------------------
-    // T2.1: publish without conviction account reverts NoConvictionAccount
+    // T2.1 (RFC-001): publish without PCA agent registration falls through
+    // to the direct-spend branch.
+    //
+    // RFC-001 unified `publish`/`publishDirect` into a single entrypoint that
+    // auto-detects the cost-coverage branch via
+    // `agentToAccountId[msg.sender]`. A caller with no PCA registration no
+    // longer reverts with `NoConvictionAccount`; instead the entry pulls
+    // TRAC via `transferFrom(msg.sender, CSS, fullCost)` and runs
+    // `_distributeTokens` over the epoch range. This regression locks the
+    // new fall-through behaviour (and asserts the staker pool sees the
+    // expected delta).
     // ----------------------------------------------------------------------
-    describe('T2.1: publish without NFT account reverts NoConvictionAccount', () => {
-      it('reverts when msg.sender is not registered as an agent', async () => {
+    describe('T2.1: publish without PCA agent registration takes the direct-spend branch', () => {
+      it('pulls TRAC from msg.sender and distributes to the staker pool', async () => {
         const creator = getDefaultKCCreator(accounts);
-        const { publishingNode, publisherIdentityId, receivingNodes, receiverIdentityIds } =
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
           await setupNodes();
 
         const cgId = await createOpenCG(creator);
         const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t2.1-root'));
         const tokenAmount = ethers.parseEther('100');
+        const epochs = 2;
+
+        // Sanity: creator is NOT registered as an agent.
+        expect(await NFT.agentToAccountId(creator.address)).to.equal(0n);
+
+        const currentEpoch = await ChronosContract.getCurrentEpoch();
+        const poolsBefore: bigint[] = [];
+        for (let i = 0n; i <= BigInt(epochs); i++) {
+          poolsBefore.push(
+            await EpochStorageContract.getEpochPool(STAKER_SHARD_ID, currentEpoch + i),
+          );
+        }
 
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode,
           receivingNodes,
           publisherIdentityId,
           receiverIdentityIds,
+          author: creator,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't2.1-op',
+        });
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await expect(KAV10.connect(creator).publish(p)).to.not.be.reverted;
+
+        // Sum deltas across the full distribution window == tokenAmount.
+        let totalDelta = 0n;
+        for (let i = 0n; i <= BigInt(epochs); i++) {
+          const after = await EpochStorageContract.getEpochPool(
+            STAKER_SHARD_ID,
+            currentEpoch + i,
+          );
+          totalDelta += after - poolsBefore[Number(i)];
+        }
+        expect(totalDelta).to.equal(tokenAmount);
+      });
+
+      it('reverts TooLowAllowance when caller has no PCA and no TRAC approval', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
+          await setupNodes();
+
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t2.1b-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes,
+          publisherIdentityId,
+          receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -1641,12 +1789,13 @@ describe('@unit KnowledgeAssetsV10', () => {
           epochs: 2,
           tokenAmount,
           isImmutable: false,
-          publishOperationId: 't2.1-op',
+          publishOperationId: 't2.1b-op',
         });
 
+        // Make sure creator hasn't pre-approved TRAC.
+        await TokenContract.connect(creator).approve(kav10Address, 0n);
         await expect(KAV10.connect(creator).publish(p))
-          .to.be.revertedWithCustomError(NFT, 'NoConvictionAccount')
-          .withArgs(creator.address);
+          .to.be.revertedWithCustomError(KAV10, 'TooLowAllowance');
       });
     });
 
@@ -1666,10 +1815,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode,
           receivingNodes,
           publisherIdentityId,
           receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -1682,7 +1831,7 @@ describe('@unit KnowledgeAssetsV10', () => {
 
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
         await expect(
-          KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress),
+          KAV10.connect(creator).publish(p),
         ).to.not.be.reverted;
       });
 
@@ -1695,7 +1844,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           ethers.parseEther('100'),
         );
 
-        const { publishingNode, publisherIdentityId, receivingNodes, receiverIdentityIds } =
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
           await setupNodes();
 
         const cgId = await createCuratedCG(accounts[0], authority.address);
@@ -1705,10 +1854,14 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode,
           receivingNodes,
           publisherIdentityId,
           receiverIdentityIds,
+          // The unauthorized caller signs their own author attestation —
+          // the test isolates the curator-auth gate; the author check must
+          // pass so the revert below is provably from `isAuthorizedPublisher`,
+          // not from `InvalidAuthorSignature`.
+          author: stranger,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -1720,7 +1873,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         });
 
         await TokenContract.connect(stranger).approve(kav10Address, tokenAmount);
-        await expect(KAV10.connect(stranger).publishDirect(p, ethers.ZeroAddress))
+        await expect(KAV10.connect(stranger).publish(p))
           .to.be.revertedWithCustomError(KAV10, 'UnauthorizedPublisher')
           .withArgs(cgId, stranger.address);
       });
@@ -1741,7 +1894,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           agent.address,
         );
 
-        const { publishingNode, publisherIdentityId, receivingNodes, receiverIdentityIds } =
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
           await setupNodes();
 
         // Create a curated CG in PCA mode: publishAuthority = NFT owner
@@ -1767,10 +1920,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode,
           receivingNodes,
           publisherIdentityId,
           receiverIdentityIds,
+          author: agent,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -1789,87 +1942,15 @@ describe('@unit KnowledgeAssetsV10', () => {
     });
 
     // ----------------------------------------------------------------------
-    // T2.4: publishDirect with paymaster path
+    // T2.4 — DELETED in RFC-001.
+    //
+    // Paymaster.sol / PaymasterManager.sol are removed from KAv10's active
+    // path. Sponsorship is now expressed via PCA agent registration: a
+    // sponsoring core calls `DKGPublishingConvictionNFT.registerAgent(its
+    // accountId, sponsoredWallet)`, and that wallet's publishes flow through
+    // the PCA discount branch automatically. The sponsorship semantic is
+    // exercised by T2.3 and T1.1 already.
     // ----------------------------------------------------------------------
-    describe('T2.4: publishDirect via paymaster', () => {
-      it('pulls TRAC from the paymaster contract, not msg.sender', async () => {
-        const creator = getDefaultKCCreator(accounts);
-        const { publishingNode, publisherIdentityId, receivingNodes, receiverIdentityIds } =
-          await setupNodes();
-
-        const cgId = await createOpenCG(creator);
-        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t2.4-root'));
-        const tokenAmount = ethers.parseEther('100');
-
-        // ---- Paymaster wire-up ----
-        //
-        // KAV10's `_addTokens` checks `PaymasterManager.validPaymasters(paymaster)`
-        // before taking the paymaster branch, so we MUST deploy through the
-        // manager (it's the only code path that sets `validPaymasters[p] = true`).
-        //
-        // Paymaster ownership quirk: PaymasterManager calls `new Paymaster(hub)`,
-        // which runs `Ownable(msg.sender)` with `msg.sender = PaymasterManager`.
-        // That makes PaymasterManager the owner — not an EOA. `addAllowedAddress`
-        // is `onlyOwner`, so we impersonate the PaymasterManager contract to
-        // authorize KAV10. `fundPaymaster` is NOT onlyOwner, so any caller with
-        // a matching TRAC allowance can top it up.
-        const pmAddr = await HubContract.getContractAddress('PaymasterManager');
-        const PaymasterManagerContract = await hre.ethers.getContractAt(
-          'PaymasterManager',
-          pmAddr,
-        );
-        await PaymasterManagerContract.connect(accounts[0]).deployPaymaster();
-        const paymasterAddr = await PaymasterManagerContract.deployedPaymasters(
-          accounts[0].address,
-          0,
-        );
-        expect(await PaymasterManagerContract.validPaymasters(paymasterAddr)).to.be.true;
-
-        // Impersonate the PaymasterManager so we can call `addAllowedAddress`
-        // as the Paymaster's owner. `setBalance` gives the impersonated
-        // account enough ETH to pay gas.
-        const hardhatHelpers = await import('@nomicfoundation/hardhat-network-helpers');
-        await hardhatHelpers.impersonateAccount(pmAddr);
-        await hardhatHelpers.setBalance(pmAddr, ethers.parseEther('1'));
-        const pmSigner = await hre.ethers.getSigner(pmAddr);
-        const PaymasterContract = await hre.ethers.getContractAt('Paymaster', paymasterAddr);
-        await PaymasterContract.connect(pmSigner).addAllowedAddress(kav10Address);
-        await hardhatHelpers.stopImpersonatingAccount(pmAddr);
-
-        // Fund the paymaster directly via ERC20 transfer from the deployer —
-        // Paymaster's `_transferTokens` just reads `balanceOf(address(this))`,
-        // so any path that leaves TRAC on the paymaster is equivalent.
-        await TokenContract.connect(accounts[0]).transfer(paymasterAddr, tokenAmount);
-        expect(await TokenContract.balanceOf(paymasterAddr)).to.equal(tokenAmount);
-
-        const creatorBalanceBefore = await TokenContract.balanceOf(creator.address);
-
-        const p = await buildPublishParams({
-          chainId,
-          kav10Address,
-          publishingNode,
-          receivingNodes,
-          publisherIdentityId,
-          receiverIdentityIds,
-          contextGraphId: cgId,
-          merkleRoot,
-          knowledgeAssetsAmount: 10,
-          byteSize: 1000,
-          epochs: 2,
-          tokenAmount,
-          isImmutable: false,
-          publishOperationId: 't2.4-op',
-        });
-
-        await KAV10.connect(creator).publishDirect(p, paymasterAddr);
-
-        // Paymaster TRAC consumed; creator balance untouched.
-        expect(await TokenContract.balanceOf(paymasterAddr)).to.equal(0n);
-        expect(await TokenContract.balanceOf(creator.address)).to.equal(
-          creatorBalanceBefore,
-        );
-      });
-    });
 
     // ----------------------------------------------------------------------
     // T2.5: NoRemainingLifetimeForDelta at KC's final epoch
@@ -1888,10 +1969,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode: nodes.publishingNode,
           receivingNodes: nodes.receivingNodes,
           publisherIdentityId: nodes.publisherIdentityId,
           receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -1902,7 +1983,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           publishOperationId: 't2.5-publish',
         });
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
-        await KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress);
+        await KAV10.connect(creator).publish(p);
 
         // Advance the clock into the KC's final epoch (currentEpoch == endEpoch).
         // With startEpoch == N and epochs == 1, endEpoch == N + 1. We warp so
@@ -1919,10 +2000,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const up = await buildUpdateParams({
           chainId,
           kav10Address,
-          publishingNode: nodes.publishingNode,
           receivingNodes: nodes.receivingNodes,
           publisherIdentityId: nodes.publisherIdentityId,
           receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           id: 1n,
           preUpdateMerkleRootCount: 1n,
@@ -1935,7 +2016,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         });
 
         await TokenContract.connect(creator).approve(kav10Address, delta);
-        await expect(KAV10.connect(creator).updateDirect(up, ethers.ZeroAddress))
+        await expect(KAV10.connect(creator).update(up))
           .to.be.revertedWithCustomError(KAV10, 'NoRemainingLifetimeForDelta')
           .withArgs(1n, now, meta[5]);
       });
@@ -1966,10 +2047,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const p = await buildPublishParams({
           chainId,
           kav10Address,
-          publishingNode: nodes.publishingNode,
           receivingNodes: nodes.receivingNodes,
           publisherIdentityId: nodes.publisherIdentityId,
           receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
           contextGraphId: cgId,
           merkleRoot,
           knowledgeAssetsAmount: 10,
@@ -1981,7 +2062,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         });
         await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
         const kcId = 1n;
-        await KAV10.connect(creator).publishDirect(p, ethers.ZeroAddress);
+        await KAV10.connect(creator).publish(p);
 
         const meta = await KCS.getKnowledgeCollectionMetadata(kcId);
         const originalEndEpoch = meta[5];
@@ -2017,7 +2098,6 @@ describe('@unit KnowledgeAssetsV10', () => {
             kcId,
             extensionEpochs,
             extensionTokenAmount,
-            ethers.ZeroAddress,
           );
 
         // Assert the extension's positive + negative diffs landed exactly at

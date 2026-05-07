@@ -241,12 +241,20 @@ describe('@unit ContextGraphs (facade)', () => {
     });
 
     // --- Validation (storage-level reverts bubble through the facade) ---
-    it('reverts on empty hosting nodes', async () => {
+    it('reverts on empty hosting nodes with requiredSignatures > 0 (RFC-001 edge-CG: must be zero)', async () => {
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
           [], noAgents(), 1, 0, 0, 1, ethers.ZeroAddress, 0,
         ),
       ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
+    });
+
+    it('RFC-001: facade accepts empty hosts when requiredSignatures == 0', async () => {
+      await expect(
+        Facade.connect(accounts[0]).createContextGraph(
+          [], noAgents(), 0, 0, 1, ethers.ZeroAddress, 0,
+        ),
+      ).to.not.be.reverted;
     });
 
     it('reverts on zero hosting node id', async () => {

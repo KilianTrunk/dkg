@@ -164,8 +164,15 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
      * @notice Create a new context graph and mint its governance NFT.
      * @param owner_                       Recipient of the ERC-721 (token holder == manager).
      * @param hostingNodes                 Sorted ascending, no zeros, no duplicates.
+     *                                     MAY be empty for edge-owned CGs that intend
+     *                                     to fan out to hosts via sharding-table membership
+     *                                     at publish time.
      * @param participantAgents            EOA allow-list (no zeros, no duplicates).
-     * @param requiredSignatures           ACK quorum, must be in (0, hostingNodes.length].
+     * @param requiredSignatures           ACK quorum. Must be in (0, hostingNodes.length]
+     *                                     when `hostingNodes` is non-empty. Must be 0
+     *                                     when `hostingNodes` is empty (edge-owned CG
+     *                                     pattern); the publish path then falls back to
+     *                                     `parametersStorage.minimumRequiredSignatures()`.
      * @param metadataBatchId              Batch ID describing the CG metadata (0 if none).
      * @param accessPolicy                 0 = public/discoverable, 1 = private/curated.
      * @param publishPolicy                0 = curated, 1 = open.
@@ -188,17 +195,25 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         if (owner_ == address(0)) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("zero address owner");
         }
-        if (hostingNodes.length == 0) {
-            revert KnowledgeAssetsLib.InvalidContextGraphConfig("empty hosting nodes");
-        }
         if (hostingNodes.length > MAX_HOSTING_NODES) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("hosting nodes cap");
         }
         if (participantAgents.length > MAX_PARTICIPANT_AGENTS) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("agents cap");
         }
-        if (requiredSignatures == 0 || requiredSignatures > hostingNodes.length) {
-            revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid M/N threshold");
+        if (hostingNodes.length == 0) {
+            // Edge-owned CG pattern: no host list, no per-CG quorum override. The
+            // publish path will use `parametersStorage.minimumRequiredSignatures()`
+            // and gate ACK signers on sharding-table membership instead.
+            if (requiredSignatures != 0) {
+                revert KnowledgeAssetsLib.InvalidContextGraphConfig(
+                    "empty hosts requires zero requiredSignatures"
+                );
+            }
+        } else {
+            if (requiredSignatures == 0 || requiredSignatures > hostingNodes.length) {
+                revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid M/N threshold");
+            }
         }
         if (accessPolicy > 1) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid accessPolicy");

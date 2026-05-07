@@ -454,10 +454,10 @@ describe('V10 E2E Conviction System', function () {
       const p = await buildPublishParams({
         chainId: DEFAULT_CHAIN_ID,
         kav10Address,
-        publishingNode,
         receivingNodes,
         publisherIdentityId,
         receiverIdentityIds,
+        author: creator,
         contextGraphId: cgId,
         merkleRoot,
         knowledgeAssetsAmount: 10,

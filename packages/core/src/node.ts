@@ -54,8 +54,22 @@ interface RelayTarget {
  * Circuit-relay addresses are checked separately by callers because the
  * "peer record is dialable" signal merges both classes.
  */
+function isLocalOrInternalHostname(host: string): boolean {
+  if (typeof host !== 'string' || host.length === 0) return true;
+  const h = host.toLowerCase();
+  if (h === 'localhost') return true;
+  if (h.endsWith('.local') || h.endsWith('.localhost')) return true;
+  if (h.endsWith('.test') || h.endsWith('.example')) return true;
+  if (h.endsWith('.invalid') || h.endsWith('.localdomain')) return true;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h)) return true;
+  if (/^\[?[0-9a-f:]+\]?$/.test(h) && h.includes(':')) return true;
+  if (!h.includes('.')) return true;
+  return false;
+}
+
 function isPublicLikeAddress(addr: string): boolean {
-  if (/^\/(?:dns|dns4|dns6|dnsaddr)\//.test(addr)) return true;
+  const dnsMatch = addr.match(/^\/(?:dns|dns4|dns6|dnsaddr)\/([^/]+)\//);
+  if (dnsMatch) return !isLocalOrInternalHostname(dnsMatch[1]);
   const ipv4 = addr.match(/^\/ip4\/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\//);
   if (ipv4) {
     const o = ipv4[1].split('.').map(Number);

@@ -107,11 +107,15 @@ export async function runEtl({
   // it found and deleted them all, which silently destroyed sibling
   // traces' fixtures whenever an operator regenerated one trace into a
   // shared dir. Restrict deletion to the events recorded in THIS run's
-  // current manifest (named `trace-<traceId.slice(0,8)>-bike-line.json`);
-  // if it doesn't exist (first run for this traceId), skip cleanup
+  // current manifest (named `trace-<full-traceId>-bike-line.json`); if
+  // it doesn't exist (first run for this traceId), skip cleanup
   // entirely. Other trace's manifests + their files are left untouched.
+  // The manifest name uses the FULL trace id, not an 8-char prefix —
+  // truncated names would let two traces sharing the first 32 bits of
+  // their UUIDs collide in the same cleanup bucket and overwrite each
+  // other's fixtures in a shared output directory.
   const existingEntries = await readdir(outDir).catch(() => []);
-  const currentManifestName = `trace-${traceId.slice(0, 8)}-bike-line.json`;
+  const currentManifestName = `trace-${traceId}-bike-line.json`;
   if (existingEntries.includes(currentManifestName)) {
     const filesToRemove = new Set();
     try {
@@ -290,7 +294,7 @@ export async function runEtl({
     events,
   };
   await writeFile(
-    join(outDir, `trace-${traceId.slice(0, 8)}-bike-line.json`),
+    join(outDir, `trace-${traceId}-bike-line.json`),
     `${JSON.stringify(traceManifest, null, 2)}\n`,
     'utf-8',
   );
@@ -299,10 +303,17 @@ export async function runEtl({
   // absolute path (e.g. /Users/<name>/...) into committed fixtures. The
   // hash + trace_id are sufficient to identify which source produced these
   // events; the full path is kept in uncommitted local state if needed.
+  // `source_max_event_time` is named honestly: it's the max `ended`
+  // timestamp from the source records, NOT the wall-clock time the ETL
+  // ran. Earlier this field was named `extracted_at`, which implied a
+  // real extraction-time stamp — but the value is deterministically
+  // derived from input data (so committed fixtures regenerate byte-
+  // identically) and consumers that audit/sort on a true ETL-run time
+  // would be misled. Renaming makes the semantics match the value.
   const sourceSnapshot = {
     source_basename: basename(source),
     source_hash: sourceHash,
-    extracted_at: creationDate,
+    source_max_event_time: creationDate,
     trace_id: traceId,
     records_in_trace: traceRecords.length,
     events_emitted: events.length,

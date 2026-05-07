@@ -476,18 +476,20 @@ async function node2Sparql(sparql) {
 }
 
 // Resolve the trace manifest path for the current fixture set. The ETL
-// writes its manifest as `trace-<traceId.slice(0,8)>-bike-line.json`,
-// keyed by whatever `--trace-id` was passed (default
+// writes its manifest as `trace-<full-traceId>-bike-line.json`, keyed
+// by whatever `--trace-id` was passed (default
 // `7c4f8d2a-9e3b-4a6d-b517-8f9e0a1b2c3d`). After a regeneration with a
-// custom `--trace-id` / `BIKE_SOURCE`, the manifest's filename prefix
-// changes — so Phase 0 must look it up dynamically rather than hardcode
-// the synthesized-source default. Resolution order:
+// custom `--trace-id` / `BIKE_SOURCE`, the manifest's filename changes —
+// so Phase 0 must look it up dynamically rather than hardcode the
+// synthesized-source default. Resolution order:
 //   1. `source-snapshot.json:trace_id` (the ETL writes both alongside
-//      each other) → exact path `trace-<8>-bike-line.json`.
+//      each other) → exact path `trace-<full-id>-bike-line.json`.
 //   2. Glob fallback for setups missing the snapshot — exactly one
 //      candidate is required, multi-match throws to force the operator
 //      to disambiguate (e.g. by pinning EPCIS_DEMO_CG fresh and
-//      regenerating).
+//      regenerating). The glob uses the canonical UUID v4 shape so
+//      stray non-trace files matching `trace-*-bike-line.json` aren't
+//      picked up by accident.
 async function loadTraceManifest() {
   const snapshotPath = join(FIXTURES, 'source-snapshot.json');
   let traceId;
@@ -497,12 +499,12 @@ async function loadTraceManifest() {
   } catch {
     // Snapshot missing or malformed — fall through to glob below.
   }
-  if (typeof traceId === 'string' && traceId.length >= 8) {
-    const path = join(FIXTURES, `trace-${traceId.slice(0, 8)}-bike-line.json`);
+  if (typeof traceId === 'string' && traceId.length > 0) {
+    const path = join(FIXTURES, `trace-${traceId}-bike-line.json`);
     return JSON.parse(await readFile(path, 'utf-8'));
   }
-  const candidates = (await readdir(FIXTURES))
-    .filter((f) => /^trace-[0-9a-f]{8}-bike-line\.json$/.test(f));
+  const uuidShape = /^trace-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-bike-line\.json$/;
+  const candidates = (await readdir(FIXTURES)).filter((f) => uuidShape.test(f));
   if (candidates.length === 0) {
     throw new Error(
       `No trace-<id>-bike-line.json manifest found in ${FIXTURES}. ` +
@@ -843,13 +845,10 @@ async function phase0() {
     }
   }
 
-  // Resolve the manifest path from `source-snapshot.json` instead of
-  // hardcoding `trace-7c4f8d2a-bike-line.json`. The ETL writes its
-  // manifest as `trace-<traceId.slice(0,8)>-bike-line.json` and accepts
-  // `--trace-id` / `BIKE_SOURCE` overrides — after a regeneration with
-  // a different trace-id the hardcoded path would either fail outright
-  // or read a stale manifest that no longer matches the current
-  // event-NN-*.json files. Snapshot fallback to a glob when absent.
+  // Resolve the manifest path dynamically (the ETL writes
+  // `trace-<full-traceId>-bike-line.json` and accepts `--trace-id` /
+  // `BIKE_SOURCE` overrides — see loadTraceManifest above). Snapshot
+  // first, glob fallback when absent.
   const trace = await loadTraceManifest();
   if (JSON_MODE) {
     process.stdout.write(

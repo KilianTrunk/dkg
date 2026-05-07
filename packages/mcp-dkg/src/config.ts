@@ -8,6 +8,15 @@
  * by environment variables so npx-style installs that live outside a
  * workspace can still point at something:
  *
+ *   DKG_HOME         — DKG state directory. When set, config is read
+ *                      from `<DKG_HOME>/config.yaml` directly and the
+ *                      cwd-walk is skipped entirely. Propagated by
+ *                      `dkg mcp setup` via the MCP entry's `env: {
+ *                      DKG_HOME }` field (Round-9 Fix 16) so GUI
+ *                      clients spawning the registered command read
+ *                      the same home setup just bootstrapped — they
+ *                      don't inherit shell env. Operators can also
+ *                      export it from their shell. (Round-11 Fix 18)
  *   DKG_API          — daemon base URL    (default http://localhost:9200)
  *   DKG_TOKEN        — bearer token       (no default; read-only tools
  *                                          still need it in most setups)
@@ -75,8 +84,29 @@ function readIfExists(filePath: string): string | null {
   }
 }
 
-/** Walk upwards from `start` looking for `.dkg/config.yaml`. */
+/**
+ * Locate the daemon's `config.yaml`.
+ *
+ * Codex Round-11 Fix 18: `DKG_HOME` takes priority. When set
+ * (propagated by `dkg mcp setup` via the MCP entry's `env: {
+ * DKG_HOME }` field, or exported by the operator's shell), config
+ * is read directly from `<DKG_HOME>/config.yaml`. The cwd-walk
+ * is skipped entirely in that case — falling back to the walk
+ * would mask a missing-config issue and re-introduce the
+ * cwd-dependence FIX 16's env propagation was meant to eliminate.
+ *
+ * Without `DKG_HOME` set, walk upwards from `start` looking for
+ * `.dkg/config.yaml` — the spec-canonical workspace layout (see
+ * dkgv10-spec 22_AGENT_ONBOARDING §2.1).
+ */
 function findConfigFile(start: string): string | null {
+  // Inline asString-equivalent: asString is defined later in this
+  // file, so we trim+null-coerce manually here rather than hoist.
+  const dkgHome = process.env.DKG_HOME?.trim() || null;
+  if (dkgHome) {
+    const candidate = path.join(dkgHome, 'config.yaml');
+    return fs.existsSync(candidate) ? candidate : null;
+  }
   let dir = path.resolve(start);
   const root = path.parse(dir).root;
   while (true) {

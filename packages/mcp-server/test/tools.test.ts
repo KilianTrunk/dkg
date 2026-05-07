@@ -44,8 +44,8 @@ async function createServerAndClient() {
   const statusFn = trackingFn(statusData);
   const queryFn = trackingFn(queryResultData);
   const publishFn = trackingFn(publishResultData);
-  const listParanetsFn = trackingFn();
-  const createParanetFn = trackingFn();
+  const listContextGraphsFn = trackingFn();
+  const createContextGraphFn = trackingFn();
   const agentsFn = trackingFn();
   const subscribeFn = trackingFn();
 
@@ -53,8 +53,8 @@ async function createServerAndClient() {
     status: statusFn.fn,
     query: queryFn.fn,
     publish: publishFn.fn,
-    listParanets: listParanetsFn.fn,
-    createParanet: createParanetFn.fn,
+    listContextGraphs: listContextGraphsFn.fn,
+    createContextGraph: createContextGraphFn.fn,
     agents: agentsFn.fn,
     subscribe: subscribeFn.fn,
   };
@@ -65,7 +65,7 @@ async function createServerAndClient() {
 
   const server = new McpServer({ name: 'dkg-test', version: '9.0.0' });
 
-  const PARANET = 'dev-coordination';
+  const CONTEXT_GRAPH = 'dev-coordination';
   const DG = 'https://ontology.dkg.io/devgraph#';
   const esc = escapeSparqlLiteral;
 
@@ -105,7 +105,7 @@ async function createServerAndClient() {
 
   async function sparql(query: string): Promise<Bindings> {
     const client = await getClient();
-    const result = await client.query(query, PARANET) as { result: unknown };
+    const result = await client.query(query, CONTEXT_GRAPH) as { result: unknown };
     return parseBindings(result.result);
   }
 
@@ -233,7 +233,7 @@ async function createServerAndClient() {
 
   server.registerTool('dkg_publish', {
     title: 'Publish to DKG',
-    description: 'Publish RDF quads to the dev-coordination paranet.',
+    description: 'Publish RDF quads to the dev-coordination contextGraph.',
     inputSchema: {
       quads: z.array(z.object({
         subject: z.string(),
@@ -245,7 +245,7 @@ async function createServerAndClient() {
   }, async ({ quads }) => {
     try {
       const client = await getClient();
-      const result = await client.publish(PARANET, quads) as { kcId: string; status: string };
+      const result = await client.publish(CONTEXT_GRAPH, quads) as { kcId: string; status: string };
       return ok(`Published ${quads.length} quads. KC: ${result.kcId}, status: ${result.status}`);
     } catch (e) { return err(`Publish error: ${formatError(e)}`); }
   });
@@ -301,7 +301,7 @@ describe('DKG MCP Server Tools', () => {
       subject: '<urn:session:1>',
       predicate: '<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>',
       object: '<https://ontology.dkg.io/devgraph#Session>',
-      graph: '<urn:paranet:dev-coordination>',
+      graph: '<urn:contextGraph:dev-coordination>',
     }];
 
     const result = await client.callTool({

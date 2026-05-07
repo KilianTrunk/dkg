@@ -67,9 +67,8 @@ export interface NetworkConfig {
   networkId: string;
   genesisVersion: number;
   relays: string[];
-  /** V10: context graphs (backward-compat alias: defaultParanets) */
+  /** V10: context graphs */
   defaultContextGraphs?: string[];
-  defaultParanets?: string[];
   defaultNodeRole: 'core' | 'edge';
   autoUpdate?: {
     enabled: boolean;
@@ -204,9 +203,8 @@ export interface DkgConfig {
   announceAddresses?: string[];
   /** Bootstrap peer multiaddrs to connect to on startup (for direct peer discovery without relay). */
   bootstrapPeers?: string[];
-  /** V10: context graphs to subscribe. Accepts both `contextGraphs` and legacy `paranets`. */
+  /** V10: context graphs to subscribe. */
   contextGraphs?: string[];
-  paranets?: string[];
   autoUpdate?: AutoUpdateConfig;
   /**
    * Chain config. Field-merged on top of `network/<env>.json#chain` via
@@ -242,7 +240,7 @@ export interface DkgConfig {
   /** @deprecated Legacy alias for sharedMemoryTtlMs */
   workspaceTtlMs?: number;
   /** EPCIS plugin config. When set, POST /api/epcis/capture is enabled. */
-  epcis?: { contextGraphId?: string; /** @deprecated */ paranetId?: string };
+  epcis?: { contextGraphId?: string };
   /** Async publisher runtime options. */
   publisher?: {
     enabled?: boolean;
@@ -308,14 +306,14 @@ const DEFAULT_CONFIG: DkgConfig = {
   nodeRole: 'edge',
 };
 
-/** Resolve context graphs from config, accepting both V10 `contextGraphs` and legacy `paranets` keys. */
+/** Resolve context graphs from config. */
 export function resolveContextGraphs(config: DkgConfig): string[] {
-  return config.contextGraphs ?? config.paranets ?? [];
+  return config.contextGraphs ?? [];
 }
 
-/** Resolve context graphs from network config, accepting both V10 and legacy keys. */
+/** Resolve context graphs from network config. */
 export function resolveNetworkDefaultContextGraphs(network: NetworkConfig | null | undefined): string[] {
-  return network?.defaultContextGraphs ?? network?.defaultParanets ?? [];
+  return network?.defaultContextGraphs ?? [];
 }
 
 /** Resolve shared memory TTL from config, accepting both V10 and legacy keys. */

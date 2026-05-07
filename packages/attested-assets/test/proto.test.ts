@@ -85,7 +85,7 @@ describe('SessionConfig encode/decode', () => {
   it('roundtrips a SessionConfig', () => {
     const config: SessionConfig = {
       sessionId: 'session-1',
-      contextGraphId: 'paranet-1',
+      contextGraphId: 'contextGraph-1',
       appId: 'test-app',
       createdBy: 'peer-1',
       createdAt: '2026-01-01T00:00:00Z',
@@ -107,7 +107,7 @@ describe('SessionConfig encode/decode', () => {
     const decoded = decodeSessionConfig(encoded);
 
     expect(decoded.sessionId).toBe('session-1');
-    expect(decoded.contextGraphId).toBe('paranet-1');
+    expect(decoded.contextGraphId).toBe('contextGraph-1');
     expect(decoded.appId).toBe('test-app');
     expect(decoded.quorumPolicy.numerator).toBe(2);
     expect(decoded.reducer.name).toBe('test-reducer');

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildEpcisQuery, escapeSparql, normalizeBizStep, normalizeGs1Vocabulary } from '../src/query-builder.js';
 
-const CONTEXT_GRAPH_ID = 'test-paranet';
+const CONTEXT_GRAPH_ID = 'test-contextGraph';
 const DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH_ID}`;
 const META_GRAPH = `${DATA_GRAPH}/_meta`;
 

@@ -67,7 +67,7 @@ describe('gossip topic helpers', () => {
   });
 
   it('handles special characters in ids', () => {
-    expect(contextGraphSessionsTopic('my-paranet')).toBe('dkg/context-graph/my-paranet/sessions');
+    expect(contextGraphSessionsTopic('my-contextGraph')).toBe('dkg/context-graph/my-contextGraph/sessions');
     expect(sessionTopic('p1', 's-with-dashes')).toBe('dkg/context-graph/p1/sessions/s-with-dashes');
   });
 });
@@ -82,24 +82,24 @@ describe('AKAGossipHandler', () => {
   });
 
   it('subscribeContextGraph subscribes to the correct topic', () => {
-    handler.subscribeContextGraph('test-paranet');
-    expect(tracking.subscribed.has('dkg/context-graph/test-paranet/sessions')).toBe(true);
+    handler.subscribeContextGraph('test-contextGraph');
+    expect(tracking.subscribed.has('dkg/context-graph/test-contextGraph/sessions')).toBe(true);
     expect(tracking.subscribeCount).toBe(1);
     expect(tracking.onMessageCount).toBe(1);
   });
 
   it('subscribeContextGraph is idempotent — second call does not re-subscribe', () => {
-    handler.subscribeContextGraph('test-paranet');
-    handler.subscribeContextGraph('test-paranet');
+    handler.subscribeContextGraph('test-contextGraph');
+    handler.subscribeContextGraph('test-contextGraph');
     expect(tracking.subscribeCount).toBe(1);
   });
 
   it('unsubscribeContextGraph removes the subscription and handler', () => {
-    handler.subscribeContextGraph('test-paranet');
-    handler.unsubscribeContextGraph('test-paranet');
+    handler.subscribeContextGraph('test-contextGraph');
+    handler.unsubscribeContextGraph('test-contextGraph');
 
     expect(tracking.offMessageCount).toBe(1);
-    expect(tracking.unsubscribeCalls).toContain('dkg/context-graph/test-paranet/sessions');
+    expect(tracking.unsubscribeCalls).toContain('dkg/context-graph/test-contextGraph/sessions');
   });
 
   it('subscribeSession subscribes to session-specific topic', () => {
@@ -173,9 +173,9 @@ describe('AKAGossipHandler — unsubscribeContextGraph then resubscribe', () => 
   });
 
   it('re-subscribing after unsubscribe re-registers the handler', () => {
-    handler.subscribeContextGraph('test-paranet');
-    handler.unsubscribeContextGraph('test-paranet');
-    handler.subscribeContextGraph('test-paranet');
+    handler.subscribeContextGraph('test-contextGraph');
+    handler.unsubscribeContextGraph('test-contextGraph');
+    handler.subscribeContextGraph('test-contextGraph');
 
     expect(tracking.subscribeCount).toBe(2);
     expect(tracking.onMessageCount).toBe(2);

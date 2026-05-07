@@ -20,7 +20,7 @@
 | `dkg_find_packages` | List indexed packages |
 | `dkg_file_summary` | Get a structured summary of a source file |
 | `dkg_query` | Execute a SPARQL query against the knowledge graph |
-| `dkg_publish` | Publish RDF data to a paranet |
+| `dkg_publish` | Publish RDF data to a contextGraph |
 
 ## Setup
 

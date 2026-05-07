@@ -89,7 +89,7 @@ let _fileSnapshot: string;
 beforeAll(async () => {
   _fileSnapshot = await takeSnapshot();
   // Fund CORE_OP with enough TRAC to pay createContextGraph fees, which
-  // the V9 ParanetRegistry charges implicitly via gas. Keeps the adapter
+  // the V9 ContextGraphRegistry charges implicitly via gas. Keeps the adapter
   // transactions from reverting with insufficient funds on long test runs.
   const { hubAddress } = getSharedContext();
   const provider = createProvider();

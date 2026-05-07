@@ -25,7 +25,7 @@ echo "  Results:  $RESULTS_DIR"
 # Pre-index
 echo ""
 echo "--- Indexing OpenClaw into DKG ---"
-node "$DKG_ROOT/packages/cli/dist/cli.js" index "$OPENCLAW_DIR" --paranet dev-coordination
+node "$DKG_ROOT/packages/cli/dist/cli.js" index "$OPENCLAW_DIR" --context-graph dev-coordination
 echo ""
 
 MCP_FILE=$(mktemp /tmp/dkg-mcp-XXXXXX.json)
@@ -41,7 +41,7 @@ cat > "$MCP_FILE" <<MCPEOF
 MCPEOF
 trap "rm -f $MCP_FILE" EXIT
 
-DKG_PREAMBLE="You have access to DKG MCP tools. The OpenClaw codebase is indexed in the dev-coordination paranet. BEFORE exploring files, query the code graph with dkg_query (SPARQL). Other agents are working in parallel — publish decisions via dkg_publish so they can see them. Query recent sessions/decisions before starting."
+DKG_PREAMBLE="You have access to DKG MCP tools. The OpenClaw codebase is indexed in the dev-coordination contextGraph. BEFORE exploring files, query the code graph with dkg_query (SPARQL). Other agents are working in parallel — publish decisions via dkg_publish so they can see them. Query recent sessions/decisions before starting."
 
 # Each agent gets its own worktree
 setup_worktree() {

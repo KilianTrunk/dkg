@@ -3,7 +3,7 @@
  * `scripts/lib/dkg-daemon.mjs` (so error messages / payload shapes stay
  * consistent with our Node scripts) but is TypeScript-typed and aware
  * of the v10 endpoint naming (`/api/context-graph/*` vs legacy
- * `/api/paranet/*`).
+ * `/api/context-graph/*`).
  */
 import type { DkgConfig } from './config.js';
 
@@ -104,24 +104,12 @@ export class DkgClient {
   }
 
   // ── Listing endpoints ──────────────────────────────────────────
-  /** v10 preferred; legacy `/api/paranet/list` retained as fallback. */
   async listProjects(): Promise<ProjectRow[]> {
-    try {
-      const v10 = await this.request<{ contextGraphs?: ProjectRow[]; paranets?: ProjectRow[] }>(
-        'GET',
-        '/api/context-graph/list',
-      );
-      return v10.contextGraphs ?? v10.paranets ?? [];
-    } catch (err) {
-      if (err instanceof DkgHttpError && err.status === 404) {
-        const legacy = await this.request<{ paranets?: ProjectRow[] }>(
-          'GET',
-          '/api/paranet/list',
-        );
-        return legacy.paranets ?? [];
-      }
-      throw err;
-    }
+    const response = await this.request<{ contextGraphs?: ProjectRow[] }>(
+      'GET',
+      '/api/context-graph/list',
+    );
+    return response.contextGraphs ?? [];
   }
 
   async listSubGraphs(contextGraphId: string): Promise<SubGraphRow[]> {

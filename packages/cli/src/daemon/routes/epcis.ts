@@ -366,7 +366,7 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
   // GET /api/epcis/events?epc=...&bizStep=...&from=...&to=...&limit=100&offset=0
   if (req.method === "GET" && path === "/api/epcis/events") {
     const epcisContextGraphId =
-      config.epcis?.contextGraphId ?? config.epcis?.paranetId;
+      config.epcis?.contextGraphId;
     if (!epcisContextGraphId) {
       return jsonResponse(res, 503, {
         error:
@@ -423,7 +423,7 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
   // POST /api/epcis/capture  { epcisDocument: {...} | { public, private }, publishOptions?: { accessPolicy? } }
   if (req.method === "POST" && path === "/api/epcis/capture") {
     const captureContextGraphId =
-      config.epcis?.contextGraphId ?? config.epcis?.paranetId;
+      config.epcis?.contextGraphId;
     if (!captureContextGraphId) {
       return jsonResponse(res, 503, {
         error:

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { handleEventsQuery, EpcisQueryError, toEpcisEvent } from '../src/handlers.js';
 import type { QueryEngine } from '../src/types.js';
 
-const CONTEXT_GRAPH_ID = 'test-paranet';
+const CONTEXT_GRAPH_ID = 'test-contextGraph';
 const BASE_PATH = '/api/epcis/events';
 
 interface QueryCall {
@@ -68,7 +68,7 @@ describe('handleEventsQuery', () => {
     expect(event.bizLocation).toEqual({ id: 'urn:epc:id:sgln:4012345.00001.0' });
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-paranet>');
+    expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-contextGraph>');
     expect(calls[0].opts).toEqual({ contextGraphId: CONTEXT_GRAPH_ID });
   });
 

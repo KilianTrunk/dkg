@@ -31,7 +31,7 @@ describe.sequential('publisher CLI smoke', () => {
         apiPort: Number.parseInt(SMOKE_API_PORT, 10),
         listenPort: 0,
         nodeRole: 'edge',
-        paranets: [],
+        contextGraphs: [],
         auth: { enabled: false },
         store: {
           backend: 'oxigraph-worker',

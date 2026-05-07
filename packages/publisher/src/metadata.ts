@@ -93,7 +93,7 @@ export function generateKCMetadata(
       dateLit(meta.timestamp),
       metaGraph,
     ),
-    mq(meta.ual, `${DKG}paranet`, `did:dkg:context-graph:${meta.contextGraphId}`, metaGraph),
+    mq(meta.ual, `${DKG}contextGraph`, `did:dkg:context-graph:${meta.contextGraphId}`, metaGraph),
   );
 
   if (meta.subGraphName) {

@@ -563,7 +563,7 @@ describe('custom context graph', () => {
   it('uses custom context graph when registerTools is called with one', async () => {
     const mock = createTestDkgClient();
     const server = new McpServer({ name: 'custom-test', version: '0.0.1' });
-    registerTools(server, async () => mock, 'my-custom-paranet');
+    registerTools(server, async () => mock, 'my-custom-contextGraph');
 
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
@@ -573,10 +573,10 @@ describe('custom context graph', () => {
     await mcpClient.callTool({ name: 'autoresearch_setup', arguments: {} });
 
     expect((mock.createContextGraph as TrackingFn<unknown>).calls[0]).toEqual([
-      'my-custom-paranet',
+      'my-custom-contextGraph',
       expect.any(String),
       expect.any(String),
     ]);
-    expect((mock.subscribe as TrackingFn<unknown>).calls[0]).toEqual(['my-custom-paranet']);
+    expect((mock.subscribe as TrackingFn<unknown>).calls[0]).toEqual(['my-custom-contextGraph']);
   });
 });

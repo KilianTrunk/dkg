@@ -15,7 +15,6 @@ export {
   computeNetworkId,
   getGenesisRaw,
   SYSTEM_CONTEXT_GRAPHS,
-  SYSTEM_PARANETS,
   DKG_ONTOLOGY,
   type GenesisQuad,
 } from './genesis.js';

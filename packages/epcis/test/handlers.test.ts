@@ -3,7 +3,7 @@ import { handleCapture, handleCaptureAsync } from '../src/handlers.js';
 import type { AsyncPublisher, Publisher } from '../src/types.js';
 import { VALID_OBJECT_EVENT_DOC, INVALID_DOC, EMPTY_EVENT_LIST_DOC } from './fixtures/bicycle-story.js';
 
-const CONTEXT_GRAPH_ID = 'test-paranet';
+const CONTEXT_GRAPH_ID = 'test-contextGraph';
 
 function trackingPublisher(overrides?: Partial<Publisher>): Publisher & { calls: Array<{ contextGraphId: string; doc: any; options?: any }> } {
   const calls: Array<{ contextGraphId: string; doc: any; options?: any }> = [];

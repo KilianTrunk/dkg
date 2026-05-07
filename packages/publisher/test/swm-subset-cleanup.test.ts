@@ -8,10 +8,10 @@ import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, seedContextGraphRegistration, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 
-let PARANET = 'test-swm-cleanup';
-let WORKSPACE_GRAPH = `did:dkg:context-graph:${PARANET}/_shared_memory`;
-let WORKSPACE_META_GRAPH = `did:dkg:context-graph:${PARANET}/_shared_memory_meta`;
-let DATA_GRAPH = `did:dkg:context-graph:${PARANET}`;
+let CONTEXT_GRAPH = 'test-swm-cleanup';
+let WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
+let WORKSPACE_META_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory_meta`;
+let DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
 
 function q(s: string, p: string, o: string, g = ''): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
@@ -45,10 +45,10 @@ describe('SWM subset publish cleanup', () => {
     const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
     const cgId = await createTestContextGraph();
-    PARANET = String(cgId);
-    WORKSPACE_GRAPH = `did:dkg:context-graph:${PARANET}/_shared_memory`;
-    WORKSPACE_META_GRAPH = `did:dkg:context-graph:${PARANET}/_shared_memory_meta`;
-    DATA_GRAPH = `did:dkg:context-graph:${PARANET}`;
+    CONTEXT_GRAPH = String(cgId);
+    WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
+    WORKSPACE_META_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory_meta`;
+    DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -67,7 +67,7 @@ describe('SWM subset publish cleanup', () => {
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
-    await seedContextGraphRegistration(store, PARANET);
+    await seedContextGraphRegistration(store, CONTEXT_GRAPH);
   });
   afterEach(async () => {
     await revertSnapshot(_testSnapshot);
@@ -76,7 +76,7 @@ describe('SWM subset publish cleanup', () => {
   it('subset publish removes published entities from SWM even when clearSharedMemoryAfter=false', async () => {
     const alice = 'urn:test:alice';
     const bob = 'urn:test:bob';
-    await publisher.share(PARANET, [
+    await publisher.share(CONTEXT_GRAPH, [
       q(alice, 'http://schema.org/name', '"Alice"'),
       q(alice, 'http://schema.org/age', '"30"'),
       q(bob, 'http://schema.org/name', '"Bob"'),
@@ -85,7 +85,7 @@ describe('SWM subset publish cleanup', () => {
 
     expect(await countInGraph(store, WORKSPACE_GRAPH)).toBe(4);
 
-    const result = await publisher.publishFromSharedMemory(PARANET, {
+    const result = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, {
       rootEntities: [alice],
     }, { clearSharedMemoryAfter: false });
 
@@ -105,17 +105,17 @@ describe('SWM subset publish cleanup', () => {
     const bob = 'urn:test:bob';
     const carol = 'urn:test:carol';
 
-    await publisher.share(PARANET, [
+    await publisher.share(CONTEXT_GRAPH, [
       q(alice, 'http://schema.org/name', '"Alice"'),
       q(bob, 'http://schema.org/name', '"Bob"'),
       q(carol, 'http://schema.org/name', '"Carol"'),
     ], { publisherPeerId: 'peer1' });
 
     // Publish Alice only
-    await publisher.publishFromSharedMemory(PARANET, { rootEntities: [alice] }, { clearSharedMemoryAfter: false });
+    await publisher.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [alice] }, { clearSharedMemoryAfter: false });
 
     // Publish remaining (Bob + Carol) — should not fail with "already exists"
-    const result = await publisher.publishFromSharedMemory(PARANET, 'all', { clearSharedMemoryAfter: true });
+    const result = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', { clearSharedMemoryAfter: true });
 
     expect(result.status).toBe('confirmed');
     const roots = result.kaManifest.map((ka) => ka.rootEntity);
@@ -131,24 +131,24 @@ describe('SWM subset publish cleanup', () => {
     const alice = 'urn:test:alice';
     const bob = 'urn:test:bob';
 
-    await publisher.share(PARANET, [
+    await publisher.share(CONTEXT_GRAPH, [
       q(alice, 'http://schema.org/name', '"Alice"'),
       q(bob, 'http://schema.org/name', '"Bob"'),
     ], { publisherPeerId: 'peer1' });
 
     // Publish Alice with clearAfter=true → Bob also gets cleared
-    await publisher.publishFromSharedMemory(PARANET, { rootEntities: [alice] }, { clearSharedMemoryAfter: true });
+    await publisher.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [alice] }, { clearSharedMemoryAfter: true });
 
     expect(await countInGraph(store, WORKSPACE_GRAPH)).toBe(0);
   });
 
   it('published triples appear in data graph', async () => {
     const entity = 'urn:test:entity';
-    await publisher.share(PARANET, [
+    await publisher.share(CONTEXT_GRAPH, [
       q(entity, 'http://schema.org/name', '"Published"'),
     ], { publisherPeerId: 'peer1' });
 
-    await publisher.publishFromSharedMemory(PARANET, 'all');
+    await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all');
 
     const subjects = await subjectsInGraph(store, DATA_GRAPH);
     expect(subjects.has(entity)).toBe(true);
@@ -158,13 +158,13 @@ describe('SWM subset publish cleanup', () => {
     const alice = 'urn:test:alice';
     const bob = 'urn:test:bob';
 
-    await publisher.share(PARANET, [
+    await publisher.share(CONTEXT_GRAPH, [
       q(alice, 'http://schema.org/name', '"Alice"'),
       q(bob, 'http://schema.org/name', '"Bob"'),
     ], { publisherPeerId: 'peer1' });
 
     // Subset publish: alice only, clearAfter=false
-    await publisher.publishFromSharedMemory(PARANET, { rootEntities: [alice] }, { clearSharedMemoryAfter: false });
+    await publisher.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [alice] }, { clearSharedMemoryAfter: false });
 
     // Alice ownership metadata should be removed
     const aliceOwner = await store.query(

@@ -119,11 +119,11 @@ describe('SessionManager', () => {
 
   it('creates a session with correct config', async () => {
     const config = await manager.createSession(
-      'paranet-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
 
     expect(config.sessionId).toHaveLength(64);
-    expect(config.contextGraphId).toBe('paranet-1');
+    expect(config.contextGraphId).toBe('contextGraph-1');
     expect(config.appId).toBe('test-app');
     expect(config.status).toBe('proposed');
     expect(config.membership).toHaveLength(2);
@@ -136,7 +136,7 @@ describe('SessionManager', () => {
     eventBus.on(AKASessionEvent.SESSION_PROPOSED, (ev) => received.push(ev));
 
     const config = await manager.createSession(
-      'paranet-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
 
     expect(received).toHaveLength(1);
@@ -145,30 +145,30 @@ describe('SessionManager', () => {
 
   it('publishes SessionProposed event via gossip', async () => {
     await manager.createSession(
-      'paranet-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
 
     expect(trackingGossip._publishCalls.length).toBeGreaterThan(0);
     const topic = trackingGossip._publishCalls[0].args[0] as string;
-    expect(topic).toContain('paranet-1');
+    expect(topic).toContain('contextGraph-1');
     expect(topic).toContain('sessions');
   });
 
   it('subscribes to session gossip topic on creation', async () => {
     const before = trackingGossip._subscribeCalls.length;
     const config = await manager.createSession(
-      'paranet-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
 
     // Prove the subscription pipeline was actually exercised — a bare
     // `expect(getSession(...)).toBeDefined()` would pass even if the manager
     // silently dropped the subscribe() call (e.g. a bug where a future
-    // refactor drops per-paranet topic subscription).
+    // refactor drops per-contextGraph topic subscription).
     expect(trackingGossip._subscribeCalls.length).toBeGreaterThan(before);
     const subscribedTopic = trackingGossip._subscribeCalls
       .slice(before)
       .map((c) => c.args[0] as string)
-      .find((t) => t.includes('paranet-1') && t.includes('sessions'));
+      .find((t) => t.includes('contextGraph-1') && t.includes('sessions'));
     expect(subscribedTopic, 'subscribe() must fire for the sessions topic').toBeDefined();
     // And the session actually exists, so this is still a positive test of
     // the full creation path.
@@ -177,7 +177,7 @@ describe('SessionManager', () => {
 
   it('getSession retrieves a created session', async () => {
     const config = await manager.createSession(
-      'paranet-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
 
     const session = manager.getSession(config.sessionId);
@@ -188,16 +188,16 @@ describe('SessionManager', () => {
   });
 
   it('listSessions filters by contextGraphId', async () => {
-    await manager.createSession('paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null);
-    await manager.createSession('paranet-2', 'app', membership, quorumPolicy, reducerConfig, 30000, null);
+    await manager.createSession('contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null);
+    await manager.createSession('contextGraph-2', 'app', membership, quorumPolicy, reducerConfig, 30000, null);
 
-    const list = manager.listSessions('paranet-1');
+    const list = manager.listSessions('contextGraph-1');
     expect(list).toHaveLength(1);
-    expect(list[0].contextGraphId).toBe('paranet-1');
+    expect(list[0].contextGraphId).toBe('contextGraph-1');
   });
 
   it('listSessions filters by status', async () => {
-    await manager.createSession('paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null);
+    await manager.createSession('contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null);
 
     expect(manager.listSessions(undefined, 'proposed')).toHaveLength(1);
     expect(manager.listSessions(undefined, 'active')).toHaveLength(0);
@@ -212,7 +212,7 @@ describe('SessionManager', () => {
 
   it('activateSession transitions status to active', async () => {
     const config = await manager.createSession(
-      'paranet-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
 
     const received: any[] = [];
@@ -229,7 +229,7 @@ describe('SessionManager', () => {
 
   it('activateSession rejects when members have not accepted', async () => {
     const config = await manager.createSession(
-      'paranet-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
 
     await expect(manager.activateSession(config.sessionId)).rejects.toThrow('members have not yet accepted');
@@ -244,7 +244,7 @@ describe('SessionManager', () => {
     );
 
     const config = await manager.createSession(
-      'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
 
     await expect(otherManager.activateSession(config.sessionId)).rejects.toThrow('not found');
@@ -253,7 +253,7 @@ describe('SessionManager', () => {
 
   it('startRound publishes RoundStart and transitions to collecting_inputs', async () => {
     const config = await manager.createSession(
-      'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
     acceptAllMembers(config.sessionId);
     await manager.activateSession(config.sessionId);
@@ -280,7 +280,7 @@ describe('SessionManager', () => {
 
   it('startRound rejects if not the proposer', async () => {
     const config = await manager.createSession(
-      'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
     acceptAllMembers(config.sessionId);
     await manager.activateSession(config.sessionId);
@@ -294,7 +294,7 @@ describe('SessionManager', () => {
 
   it('submitInput publishes InputSubmitted via gossip', async () => {
     const config = await manager.createSession(
-      'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
     acceptAllMembers(config.sessionId);
     await manager.activateSession(config.sessionId);
@@ -312,7 +312,7 @@ describe('SessionManager', () => {
 
   it('submitInput rejects when round is not collecting inputs', async () => {
     const config = await manager.createSession(
-      'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
     acceptAllMembers(config.sessionId);
     await manager.activateSession(config.sessionId);
@@ -335,7 +335,7 @@ describe('SessionManager', () => {
     const expectedHash = computeStateHash(expectedGenesis);
 
     const config = await manager.createSession(
-      'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+      'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
     );
 
     expect(config.genesisStateHash).toBe(expectedHash);
@@ -345,7 +345,7 @@ describe('SessionManager', () => {
     function fakeProposalEvent(overrides: Partial<AKAEvent & { config: any }> = {}): AKAEvent {
       const config = overrides.config ?? {
         sessionId: 'fake-session-id-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcde',
-        contextGraphId: 'paranet-1',
+        contextGraphId: 'contextGraph-1',
         appId: 'test-app',
         createdBy: 'peer-1',
         membership,
@@ -378,7 +378,7 @@ describe('SessionManager', () => {
       const event = fakeProposalEvent();
       const config = {
         sessionId: event.sessionId,
-        contextGraphId: 'paranet-1',
+        contextGraphId: 'contextGraph-1',
         appId: 'test-app',
         createdBy: 'peer-1',
         membership,
@@ -454,7 +454,7 @@ describe('SessionManager', () => {
   describe('startRound/submitInput — round mismatch validation', () => {
     it('startRound rejects when requestedRound does not match currentRound', async () => {
       const config = await manager.createSession(
-        'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       acceptAllMembers(config.sessionId);
       await manager.activateSession(config.sessionId);
@@ -476,7 +476,7 @@ describe('SessionManager', () => {
       // changes explicitly. If either side regresses, this test fails
       // at the specific missing state instead of silently passing.
       const config = await manager.createSession(
-        'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       acceptAllMembers(config.sessionId);
       await manager.activateSession(config.sessionId);
@@ -495,7 +495,7 @@ describe('SessionManager', () => {
 
     it('submitInput rejects when requestedRound does not match currentRound', async () => {
       const config = await manager.createSession(
-        'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       acceptAllMembers(config.sessionId);
       await manager.activateSession(config.sessionId);
@@ -519,7 +519,7 @@ describe('SessionManager', () => {
       // assert both that gossip was attempted and that the topic it
       // hit contained the sessionId (the wire-level session ownership).
       const config = await manager.createSession(
-        'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       acceptAllMembers(config.sessionId);
       await manager.activateSession(config.sessionId);
@@ -551,7 +551,7 @@ describe('SessionManager', () => {
   describe('handleIncomingEvent — SessionActivated gate', () => {
     it('rejects SessionActivated when members have not accepted', async () => {
       const config = await manager.createSession(
-        'paranet-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       const sessionId = config.sessionId;
       const payload = new Uint8Array(0);
@@ -559,7 +559,7 @@ describe('SessionManager', () => {
         {
           domain: 'AKA-v1',
           network: 'test-net',
-          contextGraphId: 'paranet-1',
+          contextGraphId: 'contextGraph-1',
           sessionId,
           round: 0,
           type: 'SessionActivated',
@@ -588,7 +588,7 @@ describe('SessionManager', () => {
 
     it('accepts SessionActivated when all members have accepted', async () => {
       const config = await manager.createSession(
-        'paranet-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'test-app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       acceptAllMembers(config.sessionId);
       const sessionId = config.sessionId;
@@ -597,7 +597,7 @@ describe('SessionManager', () => {
         {
           domain: 'AKA-v1',
           network: 'test-net',
-          contextGraphId: 'paranet-1',
+          contextGraphId: 'contextGraph-1',
           sessionId,
           round: 0,
           type: 'SessionActivated',
@@ -628,7 +628,7 @@ describe('SessionManager', () => {
   describe('handleRoundAck — proposal field matching', () => {
     it('rejects RoundAck whose fields don\'t match the proposal', async () => {
       const config = await manager.createSession(
-        'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       acceptAllMembers(config.sessionId);
       await manager.activateSession(config.sessionId);
@@ -665,7 +665,7 @@ describe('SessionManager', () => {
         {
           domain: 'AKA-v1',
           network: 'test-net',
-          contextGraphId: 'paranet-1',
+          contextGraphId: 'contextGraph-1',
           sessionId: config.sessionId,
           round: 2,
           type: 'RoundAck',
@@ -695,7 +695,7 @@ describe('SessionManager', () => {
   describe('handleRoundFinalized — duplicate signerPeerIds', () => {
     it('rejects RoundFinalized with duplicate signerPeerIds', async () => {
       const config = await manager.createSession(
-        'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       acceptAllMembers(config.sessionId);
       await manager.activateSession(config.sessionId);
@@ -724,7 +724,7 @@ describe('SessionManager', () => {
         {
           domain: 'AKA-v1',
           network: 'test-net',
-          contextGraphId: 'paranet-1',
+          contextGraphId: 'contextGraph-1',
           sessionId: config.sessionId,
           round: 2,
           type: 'RoundFinalized',
@@ -754,7 +754,7 @@ describe('SessionManager', () => {
   describe('state bytes — reducer receives actual state, not hash', () => {
     it('latestStateBytes is set from genesis and is not hash text', async () => {
       const config = await manager.createSession(
-        'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       const session = manager.getSession(config.sessionId)!;
 
@@ -768,7 +768,7 @@ describe('SessionManager', () => {
   describe('timeout — remote proposer timer', () => {
     it('after view change to remote proposer, a new timer fires on subsequent timeout', async () => {
       const config = await manager.createSession(
-        'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       acceptAllMembers(config.sessionId);
       await manager.activateSession(config.sessionId);
@@ -792,7 +792,7 @@ describe('SessionManager', () => {
   describe('handleIncomingEvent — validator drops invalid events', () => {
     it('drops event with invalid signature before processing', async () => {
       const config = await manager.createSession(
-        'paranet-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
+        'contextGraph-1', 'app', membership, quorumPolicy, reducerConfig, 30000, null,
       );
       acceptAllMembers(config.sessionId);
       await manager.activateSession(config.sessionId);
@@ -828,7 +828,7 @@ describe('SessionManager', () => {
       ];
 
       await expect(
-        manager.createSession('paranet-1', 'app', duplicateMembership, quorumPolicy, reducerConfig, 30000, null),
+        manager.createSession('contextGraph-1', 'app', duplicateMembership, quorumPolicy, reducerConfig, 30000, null),
       ).rejects.toThrow('duplicate peerId');
     });
 
@@ -839,7 +839,7 @@ describe('SessionManager', () => {
       ];
 
       await expect(
-        manager.createSession('paranet-1', 'app', noLocalMembership, quorumPolicy, reducerConfig, 30000, null),
+        manager.createSession('contextGraph-1', 'app', noLocalMembership, quorumPolicy, reducerConfig, 30000, null),
       ).rejects.toThrow('localPeerId must be included');
     });
   });

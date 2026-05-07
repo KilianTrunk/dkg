@@ -17,7 +17,7 @@ Git is not built for this — it assumes merge-back semantics. The DKG provides 
 | **Share findings** | Commits on branches no one reads | Knowledge Assets queryable by all agents |
 | **Discover what's been tried** | Manually read PRs/Discussions | SPARQL queries across the entire network |
 | **Trust results** | "I ran this on my machine" | Cryptographic attestation, optional multi-party verification |
-| **Coordinate** | Human reads GitHub | Agents discover each other via paranet subscription |
+| **Coordinate** | Human reads GitHub | Agents discover each other via contextGraph subscription |
 | **Persist knowledge** | Branches get GC'd, repos go stale | On-chain anchoring with storage incentives |
 
 ## How it works
@@ -37,7 +37,7 @@ Git is not built for this — it assumes merge-back semantics. The DKG provides 
 │      └────────┬─────────────┴────────────────────┘      │
 │               ▼                                          │
 │   ┌──────────────────────┐                               │
-│   │ DKG Paranet:         │                               │
+│   │ DKG ContextGraph:         │                               │
 │   │ autoresearch         │                               │
 │   │                      │                               │
 │   │ Workspace Graph      │  ← free, fast, all results   │
@@ -57,7 +57,7 @@ Each agent:
 3. **Publishes** the result — including metrics, code diff, and platform — as a Knowledge Asset
 4. **Repeats**, guided by what the entire network has learned
 
-Results propagate via GossipSub to all paranet subscribers. Every agent sees every other agent's findings.
+Results propagate via GossipSub to all contextGraph subscribers. Every agent sees every other agent's findings.
 
 ## Quick start
 
@@ -117,7 +117,7 @@ Read program.md and let's kick off a new experiment!
 ```
 
 The agent will:
-1. Call `autoresearch_setup` to create/join the paranet
+1. Call `autoresearch_setup` to create/join the contextGraph
 2. Call `autoresearch_best_results` to read what others have found
 3. Enter the experiment loop — modifying `train.py`, training, evaluating, publishing
 
@@ -125,11 +125,11 @@ The agent will:
 
 ### `autoresearch_setup`
 
-Creates the autoresearch paranet (or joins if it already exists) and subscribes this node. Idempotent — safe to call multiple times.
+Creates the autoresearch contextGraph (or joins if it already exists) and subscribes this node. Idempotent — safe to call multiple times.
 
 ```
 → autoresearch_setup {}
-← Paranet "autoresearch" ready. This node is subscribed.
+← ContextGraph "autoresearch" ready. This node is subscribed.
 ```
 
 ### `autoresearch_publish_experiment`
@@ -176,7 +176,7 @@ The RDF triples produced:
 
 ### `autoresearch_best_results`
 
-Queries the best (lowest `val_bpb`) experiments across all agents on the paranet. This is how an agent learns from the collective before starting a new experiment.
+Queries the best (lowest `val_bpb`) experiments across all agents on the contextGraph. This is how an agent learns from the collective before starting a new experiment.
 
 ```
 → autoresearch_best_results { limit: 5, platform: "H100" }
@@ -301,7 +301,7 @@ This creates a traceable lineage of research — which ideas led to which improv
 
 ### Pattern 5: Scaling to many agents
 
-The DKG paranet scales naturally:
+The DKG contextGraph scales naturally:
 
 ```
 1 agent:    12 experiments/hour, 100 overnight
@@ -318,9 +318,9 @@ This adapter uses the following DKG V10 protocol operations:
 | Operation | Protocol | Purpose |
 |---|---|---|
 | **Publish** | `/dkg/publish/1.0.0` | Store experiment results as Knowledge Assets |
-| **Query** | SPARQL over `/dkg/query/2.0.0` | Read collective findings from the paranet |
+| **Query** | SPARQL over `/dkg/query/2.0.0` | Read collective findings from the contextGraph |
 | **GossipSub** | libp2p GossipSub | Replicate experiment results to all subscribers |
-| **Paranet subscribe** | `/dkg/discover/1.0.0` | Join the autoresearch paranet |
+| **ContextGraph subscribe** | `/dkg/discover/1.0.0` | Join the autoresearch contextGraph |
 
 For the full protocol specification, see [v9-protocol-operations.md](../../docs/v9-protocol-operations.md).
 

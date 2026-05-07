@@ -15,7 +15,7 @@ import {
   parseCclPolicy,
 } from '../src/index.js';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
-import { getGenesisQuads, computeNetworkId, PROTOCOL_SYNC, PROTOCOL_STORAGE_ACK, SYSTEM_PARANETS, DKG_ONTOLOGY, paranetDataGraphUri, paranetWorkspaceGraphUri, contextGraphMetaUri, sparqlString } from '@origintrail-official/dkg-core';
+import { getGenesisQuads, computeNetworkId, PROTOCOL_SYNC, PROTOCOL_STORAGE_ACK, SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY, contextGraphDataGraphUri, contextGraphWorkspaceGraphUri, contextGraphMetaUri, sparqlString } from '@origintrail-official/dkg-core';
 import { DKGQueryEngine } from '@origintrail-official/dkg-query';
 import { sha256 } from '@noble/hashes/sha2.js';
 import {
@@ -365,19 +365,19 @@ afterAll(async () => {
 });
 
 function buildSnapshotFactQuads(opts: {
-  paranetId: string;
+  contextGraphId: string;
   snapshotId: string;
   view: 'accepted' | 'workspace';
   scopeUal?: string;
   facts: Array<[string, ...unknown[]]>;
 }): Quad[] {
   const graph = opts.view === 'workspace'
-    ? paranetWorkspaceGraphUri(opts.paranetId)
-    : paranetDataGraphUri(opts.paranetId);
+    ? contextGraphWorkspaceGraphUri(opts.contextGraphId)
+    : contextGraphDataGraphUri(opts.contextGraphId);
 
   return opts.facts.flatMap((fact, index) => {
     const [predicate, ...args] = fact;
-    const subject = `did:dkg:ccl-fact:${opts.paranetId}:${opts.snapshotId}:${index}`;
+    const subject = `did:dkg:ccl-fact:${opts.contextGraphId}:${opts.snapshotId}:${index}`;
     const quads: Quad[] = [
       { subject, predicate: DKG_ONTOLOGY.RDF_TYPE, object: `${CCL_FACT_NS}InputFact`, graph },
       { subject, predicate: `${CCL_FACT_NS}predicate`, object: sparqlString(predicate), graph },
@@ -1755,8 +1755,8 @@ describe('Genesis Knowledge', () => {
     const networkDef = quads.filter(q => q.subject === 'did:dkg:network:v9-testnet');
     expect(networkDef.length).toBeGreaterThan(0);
 
-    const agentsParanet = quads.filter(q => q.graph === 'did:dkg:context-graph:agents');
-    expect(agentsParanet.length).toBeGreaterThan(0);
+    const agentsContextGraph = quads.filter(q => q.graph === 'did:dkg:context-graph:agents');
+    expect(agentsContextGraph.length).toBeGreaterThan(0);
 
     const ontology = quads.filter(q => q.graph === 'did:dkg:context-graph:ontology');
     expect(ontology.length).toBeGreaterThan(0);
@@ -1785,10 +1785,10 @@ describe('Genesis Knowledge', () => {
       expect(result.bindings.length).toBe(1);
     }
 
-    const paranets = await store.query(
-      `SELECT ?p WHERE { <did:dkg:context-graph:agents> a <https://dkg.network/ontology#SystemParanet> }`,
+    const contextGraphs = await store.query(
+      `SELECT ?p WHERE { <did:dkg:context-graph:agents> a <https://dkg.network/ontology#SystemContextGraph> }`,
     );
-    expect(paranets.type).toBe('bindings');
+    expect(contextGraphs.type).toBe('bindings');
 
     await agent.stop().catch(() => {});
   });
@@ -1809,7 +1809,7 @@ describe('Genesis Knowledge', () => {
     await agent2.stop().catch(() => {});
   });
 
-  it('publishes, approves, lists, and resolves CCL policies per paranet', async () => {
+  it('publishes, approves, lists, and resolves CCL policies per contextGraph', async () => {
     const store = new OxigraphStore();
     const agent = await DKGAgent.create({
       name: 'PolicyBot',
@@ -1821,7 +1821,7 @@ describe('Genesis Knowledge', () => {
     await agent.createContextGraph({ id: 'ops-policy', name: 'Ops Policy' });
 
     const published = await agent.publishCclPolicy({
-      paranetId: 'ops-policy',
+      contextGraphId: 'ops-policy',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: incident-review
@@ -1834,19 +1834,19 @@ decisions: []
     expect(published.policyUri).toContain('did:dkg:policy:');
     expect(published.hash).toContain('sha256:');
 
-    await agent.approveCclPolicy({ paranetId: 'ops-policy', policyUri: published.policyUri });
+    await agent.approveCclPolicy({ contextGraphId: 'ops-policy', policyUri: published.policyUri });
 
-    const listed = await agent.listCclPolicies({ paranetId: 'ops-policy' });
+    const listed = await agent.listCclPolicies({ contextGraphId: 'ops-policy' });
     expect(listed).toHaveLength(1);
     expect(listed[0].name).toBe('incident-review');
     expect(listed[0].isActiveDefault).toBe(true);
 
-    const resolved = await agent.resolveCclPolicy({ paranetId: 'ops-policy', name: 'incident-review', includeBody: true });
+    const resolved = await agent.resolveCclPolicy({ contextGraphId: 'ops-policy', name: 'incident-review', includeBody: true });
     expect(resolved?.policyUri).toBe(published.policyUri);
     expect(resolved?.body).toContain('rules: []');
 
     const evaluation = await agent.evaluateCclPolicy({
-      paranetId: 'ops-policy',
+      contextGraphId: 'ops-policy',
       name: 'incident-review',
       facts: [['claim', 'c1']],
       snapshotId: 'snap-1',
@@ -1856,7 +1856,7 @@ decisions: []
     expect(evaluation.result.derived).toEqual({});
 
     const publishedEval = await agent.evaluateAndPublishCclPolicy({
-      paranetId: 'ops-policy',
+      contextGraphId: 'ops-policy',
       name: 'incident-review',
       facts: [['claim', 'c1']],
       snapshotId: 'snap-2',
@@ -1873,7 +1873,7 @@ decisions: []
     }
 
     const listedEvals = await agent.listCclEvaluations({
-      paranetId: 'ops-policy',
+      contextGraphId: 'ops-policy',
       snapshotId: 'snap-2',
     });
     expect(listedEvals).toHaveLength(1);
@@ -1895,7 +1895,7 @@ decisions: []
     await agent.createContextGraph({ id: 'ops-context', name: 'Ops Context' });
 
     const base = await agent.publishCclPolicy({
-      paranetId: 'ops-context',
+      contextGraphId: 'ops-context',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: incident-review
@@ -1904,10 +1904,10 @@ rules: []
 decisions: []
 `,
     });
-    await agent.approveCclPolicy({ paranetId: 'ops-context', policyUri: base.policyUri });
+    await agent.approveCclPolicy({ contextGraphId: 'ops-context', policyUri: base.policyUri });
 
     const override = await agent.publishCclPolicy({
-      paranetId: 'ops-context',
+      contextGraphId: 'ops-context',
       name: 'incident-review',
       version: '0.2.0',
       contextType: 'incident_review',
@@ -1917,17 +1917,17 @@ rules: []
 decisions: []
 `,
     });
-    await agent.approveCclPolicy({ paranetId: 'ops-context', policyUri: override.policyUri, contextType: 'incident_review' });
+    await agent.approveCclPolicy({ contextGraphId: 'ops-context', policyUri: override.policyUri, contextType: 'incident_review' });
 
-    const resolvedDefault = await agent.resolveCclPolicy({ paranetId: 'ops-context', name: 'incident-review' });
+    const resolvedDefault = await agent.resolveCclPolicy({ contextGraphId: 'ops-context', name: 'incident-review' });
     expect(resolvedDefault?.policyUri).toBe(base.policyUri);
 
-    const resolvedContext = await agent.resolveCclPolicy({ paranetId: 'ops-context', name: 'incident-review', contextType: 'incident_review' });
+    const resolvedContext = await agent.resolveCclPolicy({ contextGraphId: 'ops-context', name: 'incident-review', contextType: 'incident_review' });
     expect(resolvedContext?.policyUri).toBe(override.policyUri);
     expect(resolvedContext?.activeContexts).toContain('incident_review');
 
     const evaluatedContext = await agent.evaluateCclPolicy({
-      paranetId: 'ops-context',
+      contextGraphId: 'ops-context',
       name: 'incident-review',
       contextType: 'incident_review',
       facts: [['claim', 'c2']],
@@ -1935,14 +1935,14 @@ decisions: []
     expect(evaluatedContext.policy.policyUri).toBe(override.policyUri);
 
     const publishedContextEval = await agent.evaluateAndPublishCclPolicy({
-      paranetId: 'ops-context',
+      contextGraphId: 'ops-context',
       name: 'incident-review',
       contextType: 'incident_review',
       facts: [['claim', 'c2']],
       snapshotId: 'snap-ctx',
     });
     const listedByContext = await agent.listCclEvaluations({
-      paranetId: 'ops-context',
+      contextGraphId: 'ops-context',
       contextType: 'incident_review',
       snapshotId: 'snap-ctx',
     });
@@ -1963,7 +1963,7 @@ decisions: []
     await agent.createContextGraph({ id: 'ops-revoke-default', name: 'Ops Revoke Default' });
 
     const v1 = await agent.publishCclPolicy({
-      paranetId: 'ops-revoke-default',
+      contextGraphId: 'ops-revoke-default',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: incident-review
@@ -1973,7 +1973,7 @@ decisions: []
 `,
     });
     const v2 = await agent.publishCclPolicy({
-      paranetId: 'ops-revoke-default',
+      contextGraphId: 'ops-revoke-default',
       name: 'incident-review',
       version: '0.2.0',
       content: `policy: incident-review
@@ -1983,19 +1983,19 @@ decisions: []
 `,
     });
 
-    await agent.approveCclPolicy({ paranetId: 'ops-revoke-default', policyUri: v1.policyUri });
-    await agent.approveCclPolicy({ paranetId: 'ops-revoke-default', policyUri: v2.policyUri });
+    await agent.approveCclPolicy({ contextGraphId: 'ops-revoke-default', policyUri: v1.policyUri });
+    await agent.approveCclPolicy({ contextGraphId: 'ops-revoke-default', policyUri: v2.policyUri });
 
-    const resolvedLatest = await agent.resolveCclPolicy({ paranetId: 'ops-revoke-default', name: 'incident-review' });
+    const resolvedLatest = await agent.resolveCclPolicy({ contextGraphId: 'ops-revoke-default', name: 'incident-review' });
     expect(resolvedLatest?.policyUri).toBe(v2.policyUri);
 
-    const revoked = await agent.revokeCclPolicy({ paranetId: 'ops-revoke-default', policyUri: v2.policyUri });
+    const revoked = await agent.revokeCclPolicy({ contextGraphId: 'ops-revoke-default', policyUri: v2.policyUri });
     expect(revoked.status).toBe('revoked');
 
-    const resolvedFallback = await agent.resolveCclPolicy({ paranetId: 'ops-revoke-default', name: 'incident-review' });
+    const resolvedFallback = await agent.resolveCclPolicy({ contextGraphId: 'ops-revoke-default', name: 'incident-review' });
     expect(resolvedFallback?.policyUri).toBe(v1.policyUri);
 
-    const listed = await agent.listCclPolicies({ paranetId: 'ops-revoke-default', name: 'incident-review' });
+    const listed = await agent.listCclPolicies({ contextGraphId: 'ops-revoke-default', name: 'incident-review' });
     const revokedRecord = listed.find(policy => policy.policyUri === v2.policyUri);
     const activeRecord = listed.find(policy => policy.policyUri === v1.policyUri);
     expect(revokedRecord?.status).toBe('revoked');
@@ -2017,7 +2017,7 @@ decisions: []
     await agent.createContextGraph({ id: 'ops-revoke-context', name: 'Ops Revoke Context' });
 
     const base = await agent.publishCclPolicy({
-      paranetId: 'ops-revoke-context',
+      contextGraphId: 'ops-revoke-context',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: incident-review
@@ -2027,7 +2027,7 @@ decisions: []
 `,
     });
     const override = await agent.publishCclPolicy({
-      paranetId: 'ops-revoke-context',
+      contextGraphId: 'ops-revoke-context',
       name: 'incident-review',
       version: '0.2.0',
       contextType: 'incident_review',
@@ -2038,27 +2038,27 @@ decisions: []
 `,
     });
 
-    await agent.approveCclPolicy({ paranetId: 'ops-revoke-context', policyUri: base.policyUri });
-    await agent.approveCclPolicy({ paranetId: 'ops-revoke-context', policyUri: override.policyUri, contextType: 'incident_review' });
+    await agent.approveCclPolicy({ contextGraphId: 'ops-revoke-context', policyUri: base.policyUri });
+    await agent.approveCclPolicy({ contextGraphId: 'ops-revoke-context', policyUri: override.policyUri, contextType: 'incident_review' });
 
-    const resolvedOverride = await agent.resolveCclPolicy({ paranetId: 'ops-revoke-context', name: 'incident-review', contextType: 'incident_review' });
+    const resolvedOverride = await agent.resolveCclPolicy({ contextGraphId: 'ops-revoke-context', name: 'incident-review', contextType: 'incident_review' });
     expect(resolvedOverride?.policyUri).toBe(override.policyUri);
 
     const revoked = await agent.revokeCclPolicy({
-      paranetId: 'ops-revoke-context',
+      contextGraphId: 'ops-revoke-context',
       policyUri: override.policyUri,
       contextType: 'incident_review',
     });
     expect(revoked.contextType).toBe('incident_review');
 
-    const resolvedFallback = await agent.resolveCclPolicy({ paranetId: 'ops-revoke-context', name: 'incident-review', contextType: 'incident_review' });
+    const resolvedFallback = await agent.resolveCclPolicy({ contextGraphId: 'ops-revoke-context', name: 'incident-review', contextType: 'incident_review' });
     expect(resolvedFallback?.policyUri).toBe(base.policyUri);
     expect(resolvedFallback?.isActiveDefault).toBe(true);
 
     await agent.stop().catch(() => {});
   });
 
-  it('restricts CCL policy approval to the paranet owner', async () => {
+  it('restricts CCL policy approval to the contextGraph owner', async () => {
     // Shared store simulates two agent processes on the same node so `other`
     // can see the CG metadata. After PR #200, ownership is wallet-scoped via
     // `DKG_CURATOR`, so we pass an explicit `callerAgentAddress` on `other`'s
@@ -2081,7 +2081,7 @@ decisions: []
     await owner.createContextGraph({ id: 'ops-owner', name: 'Ops Owner' });
 
     const published = await owner.publishCclPolicy({
-      paranetId: 'ops-owner',
+      contextGraphId: 'ops-owner',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: incident-review
@@ -2091,17 +2091,17 @@ decisions: []
 `,
     });
 
-    await expect(other.approveCclPolicy({ paranetId: 'ops-owner', policyUri: published.policyUri, callerAgentAddress: otherAddr }))
-      .rejects.toThrow(/Only the paranet owner can manage policies/);
+    await expect(other.approveCclPolicy({ contextGraphId: 'ops-owner', policyUri: published.policyUri, callerAgentAddress: otherAddr }))
+      .rejects.toThrow(/Only the contextGraph owner can manage policies/);
 
-    await expect(owner.approveCclPolicy({ paranetId: 'ops-owner', policyUri: published.policyUri }))
+    await expect(owner.approveCclPolicy({ contextGraphId: 'ops-owner', policyUri: published.policyUri }))
       .resolves.toBeTruthy();
 
     await owner.stop().catch(() => {});
     await other.stop().catch(() => {});
   });
 
-  it('restricts CCL policy revocation to the paranet owner', async () => {
+  it('restricts CCL policy revocation to the contextGraph owner', async () => {
     // See note on policy-approval test above: ownership is wallet-scoped via
     // `DKG_CURATOR` after PR #200; `other` passes an explicit non-owner
     // `callerAgentAddress` to prove the check rejects other wallets.
@@ -2123,7 +2123,7 @@ decisions: []
     await owner.createContextGraph({ id: 'ops-owner-revoke', name: 'Ops Owner Revoke' });
 
     const published = await owner.publishCclPolicy({
-      paranetId: 'ops-owner-revoke',
+      contextGraphId: 'ops-owner-revoke',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: incident-review
@@ -2132,12 +2132,12 @@ rules: []
 decisions: []
 `,
     });
-    await owner.approveCclPolicy({ paranetId: 'ops-owner-revoke', policyUri: published.policyUri });
+    await owner.approveCclPolicy({ contextGraphId: 'ops-owner-revoke', policyUri: published.policyUri });
 
-    await expect(other.revokeCclPolicy({ paranetId: 'ops-owner-revoke', policyUri: published.policyUri, callerAgentAddress: otherAddr }))
-      .rejects.toThrow(/Only the paranet owner can manage policies/);
+    await expect(other.revokeCclPolicy({ contextGraphId: 'ops-owner-revoke', policyUri: published.policyUri, callerAgentAddress: otherAddr }))
+      .rejects.toThrow(/Only the contextGraph owner can manage policies/);
 
-    await expect(owner.revokeCclPolicy({ paranetId: 'ops-owner-revoke', policyUri: published.policyUri }))
+    await expect(owner.revokeCclPolicy({ contextGraphId: 'ops-owner-revoke', policyUri: published.policyUri }))
       .resolves.toMatchObject({ status: 'revoked' });
 
     await owner.stop().catch(() => {});
@@ -2173,7 +2173,7 @@ decisions: []
     });
 
     const published = await node.publishCclPolicy({
-      paranetId: 'ops-multi-agent',
+      contextGraphId: 'ops-multi-agent',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: incident-review
@@ -2184,19 +2184,19 @@ decisions: []
     });
 
     // --- approveCclPolicy ---
-    await expect(node.approveCclPolicy({ paranetId: 'ops-multi-agent', policyUri: published.policyUri }))
-      .rejects.toThrow(/Only the paranet owner can manage policies/);
-    await expect(node.approveCclPolicy({ paranetId: 'ops-multi-agent', policyUri: published.policyUri, callerAgentAddress: siblingAddr }))
-      .rejects.toThrow(/Only the paranet owner can manage policies/);
-    await expect(node.approveCclPolicy({ paranetId: 'ops-multi-agent', policyUri: published.policyUri, callerAgentAddress: nonDefaultAddr }))
+    await expect(node.approveCclPolicy({ contextGraphId: 'ops-multi-agent', policyUri: published.policyUri }))
+      .rejects.toThrow(/Only the contextGraph owner can manage policies/);
+    await expect(node.approveCclPolicy({ contextGraphId: 'ops-multi-agent', policyUri: published.policyUri, callerAgentAddress: siblingAddr }))
+      .rejects.toThrow(/Only the contextGraph owner can manage policies/);
+    await expect(node.approveCclPolicy({ contextGraphId: 'ops-multi-agent', policyUri: published.policyUri, callerAgentAddress: nonDefaultAddr }))
       .resolves.toBeTruthy();
 
     // --- revokeCclPolicy ---
-    await expect(node.revokeCclPolicy({ paranetId: 'ops-multi-agent', policyUri: published.policyUri }))
-      .rejects.toThrow(/Only the paranet owner can manage policies/);
-    await expect(node.revokeCclPolicy({ paranetId: 'ops-multi-agent', policyUri: published.policyUri, callerAgentAddress: siblingAddr }))
-      .rejects.toThrow(/Only the paranet owner can manage policies/);
-    await expect(node.revokeCclPolicy({ paranetId: 'ops-multi-agent', policyUri: published.policyUri, callerAgentAddress: nonDefaultAddr }))
+    await expect(node.revokeCclPolicy({ contextGraphId: 'ops-multi-agent', policyUri: published.policyUri }))
+      .rejects.toThrow(/Only the contextGraph owner can manage policies/);
+    await expect(node.revokeCclPolicy({ contextGraphId: 'ops-multi-agent', policyUri: published.policyUri, callerAgentAddress: siblingAddr }))
+      .rejects.toThrow(/Only the contextGraph owner can manage policies/);
+    await expect(node.revokeCclPolicy({ contextGraphId: 'ops-multi-agent', policyUri: published.policyUri, callerAgentAddress: nonDefaultAddr }))
       .resolves.toMatchObject({ status: 'revoked' });
 
     // --- inviteToContextGraph ---
@@ -2391,7 +2391,7 @@ decisions: []
     await agent.createContextGraph({ id: 'ops-validate', name: 'Ops Validate' });
 
     await expect(agent.publishCclPolicy({
-      paranetId: 'ops-validate',
+      contextGraphId: 'ops-validate',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: wrong-name
@@ -2402,7 +2402,7 @@ decisions: []
     })).rejects.toThrow(/name mismatch/);
 
     await expect(agent.publishCclPolicy({
-      paranetId: 'ops-validate',
+      contextGraphId: 'ops-validate',
       name: 'incident-review',
       version: '0.1.0',
       content: 'rules: []',
@@ -2422,7 +2422,7 @@ decisions: []
     await agent.createContextGraph({ id: 'ops-collision', name: 'Ops Collision' });
 
     await agent.publishCclPolicy({
-      paranetId: 'ops-collision',
+      contextGraphId: 'ops-collision',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: incident-review
@@ -2433,7 +2433,7 @@ decisions: []
     });
 
     await expect(agent.publishCclPolicy({
-      paranetId: 'ops-collision',
+      contextGraphId: 'ops-collision',
       name: 'incident-review',
       version: '0.1.0',
       content: `policy: incident-review
@@ -2461,7 +2461,7 @@ decisions: []
     await agent.createContextGraph({ id: 'ops-snapshot', name: 'Ops Snapshot' });
 
     const published = await agent.publishCclPolicy({
-      paranetId: 'ops-snapshot',
+      contextGraphId: 'ops-snapshot',
       name: 'owner_assertion',
       version: '0.1.0',
       content: `policy: owner_assertion
@@ -2482,10 +2482,10 @@ decisions:
       - atom: { pred: owner_asserted, args: ["$Claim"] }
 `,
     });
-    await agent.approveCclPolicy({ paranetId: 'ops-snapshot', policyUri: published.policyUri });
+    await agent.approveCclPolicy({ contextGraphId: 'ops-snapshot', policyUri: published.policyUri });
 
     await store.insert(buildSnapshotFactQuads({
-      paranetId: 'ops-snapshot',
+      contextGraphId: 'ops-snapshot',
       snapshotId: 'snap-owner-01',
       view: 'accepted',
       scopeUal: 'ual:dkg:example:owner-assertion',
@@ -2497,7 +2497,7 @@ decisions:
     }));
 
     const resolved = await agent.resolveFactsFromSnapshot({
-      paranetId: 'ops-snapshot',
+      contextGraphId: 'ops-snapshot',
       policyName: 'owner_assertion',
       snapshotId: 'snap-owner-01',
       view: 'accepted',
@@ -2513,7 +2513,7 @@ decisions:
     ]);
 
     const evaluation = await agent.evaluateCclPolicy({
-      paranetId: 'ops-snapshot',
+      contextGraphId: 'ops-snapshot',
       name: 'owner_assertion',
       snapshotId: 'snap-owner-01',
       view: 'accepted',
@@ -2535,7 +2535,7 @@ decisions:
       ['owner_of', 'p1', '0xalice'],
     ];
     const quads = buildSnapshotFactQuads({
-      paranetId: 'ops-deterministic',
+      contextGraphId: 'ops-deterministic',
       snapshotId: 'snap-owner-02',
       view: 'accepted',
       scopeUal: 'ual:dkg:example:owner-assertion',
@@ -2551,14 +2551,14 @@ decisions:
     const agentB = await DKGAgent.create({ name: 'DeterministicB', store: storeB, chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP) });
 
     const resolvedA = await agentA.resolveFactsFromSnapshot({
-      paranetId: 'ops-deterministic',
+      contextGraphId: 'ops-deterministic',
       policyName: 'owner_assertion',
       snapshotId: 'snap-owner-02',
       view: 'accepted',
       scopeUal: 'ual:dkg:example:owner-assertion',
     });
     const resolvedB = await agentB.resolveFactsFromSnapshot({
-      paranetId: 'ops-deterministic',
+      contextGraphId: 'ops-deterministic',
       policyName: 'owner_assertion',
       snapshotId: 'snap-owner-02',
       view: 'accepted',
@@ -2667,7 +2667,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
     const agent = await DKGAgent.create({
       name: 'SyncConfigTest',
       chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
-      syncContextGraphs: ['my-custom-paranet', 'another-paranet'],
+      syncContextGraphs: ['my-custom-contextGraph', 'another-contextGraph'],
     });
     expect(agent).toBeDefined();
     await agent.stop().catch(() => {});
@@ -2682,11 +2682,11 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
     try {
       await agent.start();
-      expect((agent as any).config.syncContextGraphs ?? []).not.toContain('runtime-paranet');
+      expect((agent as any).config.syncContextGraphs ?? []).not.toContain('runtime-contextGraph');
 
-      agent.subscribeToContextGraph('runtime-paranet');
+      agent.subscribeToContextGraph('runtime-contextGraph');
 
-      expect((agent as any).config.syncContextGraphs ?? []).toContain('runtime-paranet');
+      expect((agent as any).config.syncContextGraphs ?? []).toContain('runtime-contextGraph');
     } finally {
       await agent.stop().catch(() => {});
     }
@@ -2701,11 +2701,11 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
     try {
       await agent.start();
-      expect((agent as any).config.syncContextGraphs ?? []).not.toContain('discovered-paranet');
+      expect((agent as any).config.syncContextGraphs ?? []).not.toContain('discovered-contextGraph');
 
-      agent.subscribeToContextGraph('discovered-paranet', { trackSyncScope: false });
+      agent.subscribeToContextGraph('discovered-contextGraph', { trackSyncScope: false });
 
-      expect((agent as any).config.syncContextGraphs ?? []).not.toContain('discovered-paranet');
+      expect((agent as any).config.syncContextGraphs ?? []).not.toContain('discovered-contextGraph');
     } finally {
       await agent.stop().catch(() => {});
     }
@@ -2904,8 +2904,8 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
     try {
       await agent.start();
-      agent.subscribeToContextGraph('runtime-paranet');
-      const result = await agent.syncContextGraphFromConnectedPeers('runtime-paranet', {
+      agent.subscribeToContextGraph('runtime-contextGraph');
+      const result = await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph', {
         includeSharedMemory: true,
       });
 
@@ -2936,7 +2936,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
     try {
       await agent.start();
-      agent.subscribeToContextGraph('runtime-paranet');
+      agent.subscribeToContextGraph('runtime-contextGraph');
 
       const remotePeer = agent.node.peerId;
       vi.spyOn(agent.node.libp2p, 'getConnections').mockReturnValue([
@@ -2981,13 +2981,13 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         failedPeers: 0,
       });
 
-      const result = await agent.syncContextGraphFromConnectedPeers('runtime-paranet', {
+      const result = await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph', {
         includeSharedMemory: true,
       });
 
       expect(peerStoreReads).toBe(3);
-      expect(syncFromPeerDetailed).toHaveBeenCalledWith(remotePeer.toString(), ['runtime-paranet']);
-      expect(syncSharedMemoryFromPeerDetailed).toHaveBeenCalledWith(remotePeer.toString(), ['runtime-paranet']);
+      expect(syncFromPeerDetailed).toHaveBeenCalledWith(remotePeer.toString(), ['runtime-contextGraph']);
+      expect(syncSharedMemoryFromPeerDetailed).toHaveBeenCalledWith(remotePeer.toString(), ['runtime-contextGraph']);
       expect(result.connectedPeers).toBe(1);
       expect(result.syncCapablePeers).toBe(1);
       expect(result.peersTried).toBe(1);
@@ -3015,7 +3015,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
       (agent as any).getPeerProtocols = async () => ['/dkg/10.0.0/sync'];
       (agent as any).syncFromPeer = async (_peerId: string, contextGraphIds?: string[]) => {
-        seenCalls.push([...(contextGraphIds ?? [SYSTEM_PARANETS.AGENTS, SYSTEM_PARANETS.ONTOLOGY, ...((agent as any).config.syncContextGraphs ?? [])])]);
+        seenCalls.push([...(contextGraphIds ?? [SYSTEM_CONTEXT_GRAPHS.AGENTS, SYSTEM_CONTEXT_GRAPHS.ONTOLOGY, ...((agent as any).config.syncContextGraphs ?? [])])]);
         return 0;
       };
       (agent as any).refreshMetaSyncedFlags = async () => undefined;
@@ -3043,7 +3043,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
     try {
       await agent.start();
-      agent.subscribeToContextGraph('runtime-paranet');
+      agent.subscribeToContextGraph('runtime-contextGraph');
 
       const remotePeer = agent.node.peerId;
       vi.spyOn(agent.node.libp2p, 'getConnections').mockReturnValue([
@@ -3051,7 +3051,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       ]);
       vi.spyOn(agent.node.libp2p.peerStore, 'get').mockResolvedValue({ protocols: [] } as any);
 
-      const result = await agent.syncContextGraphFromConnectedPeers('runtime-paranet', {
+      const result = await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph', {
         includeSharedMemory: true,
       });
 
@@ -3073,8 +3073,8 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
     try {
       await agent.start();
-      agent.subscribeToContextGraph('runtime-paranet');
-      (agent as any).preferredSyncPeers.set('runtime-paranet', 'peer-preferred');
+      agent.subscribeToContextGraph('runtime-contextGraph');
+      (agent as any).preferredSyncPeers.set('runtime-contextGraph', 'peer-preferred');
 
       const peerOther = { toString: () => 'peer-other' };
       const peerPreferred = { toString: () => 'peer-preferred' };
@@ -3103,7 +3103,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         };
       });
 
-      await agent.syncContextGraphFromConnectedPeers('runtime-paranet');
+      await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph');
 
       expect(triedPeers).toEqual(['peer-preferred', 'peer-other']);
     } finally {
@@ -3125,14 +3125,14 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
     try {
       await agent.start();
-      (agent as any).subscribedContextGraphs.set('runtime-paranet', {
-        name: 'Runtime Paranet',
+      (agent as any).subscribedContextGraphs.set('runtime-contextGraph', {
+        name: 'Runtime ContextGraph',
         subscribed: true,
         synced: false,
         metaSynced: false,
       });
-      agent.subscribeToContextGraph('runtime-paranet');
-      agent.subscribeToContextGraph('runtime-paranet');
+      agent.subscribeToContextGraph('runtime-contextGraph');
+      agent.subscribeToContextGraph('runtime-contextGraph');
 
       const remotePeer = agent.node.peerId;
       vi.spyOn(agent.node.libp2p.peerStore, 'get').mockResolvedValue({
@@ -3144,7 +3144,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
       await (agent as any).trySyncFromPeer(remotePeer.toString());
 
-      expect((agent as any).subscribedContextGraphs.get('runtime-paranet')?.metaSynced).toBe(false);
+      expect((agent as any).subscribedContextGraphs.get('runtime-contextGraph')?.metaSynced).toBe(false);
     } finally {
       await agent.stop().catch(() => {});
     }
@@ -3159,20 +3159,20 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
     try {
       await agent.start();
-      (agent as any).subscribedContextGraphs.set('runtime-paranet', {
-        name: 'Runtime Paranet',
+      (agent as any).subscribedContextGraphs.set('runtime-contextGraph', {
+        name: 'Runtime ContextGraph',
         subscribed: true,
         synced: false,
         metaSynced: false,
       });
-      agent.subscribeToContextGraph('runtime-paranet');
+      agent.subscribeToContextGraph('runtime-contextGraph');
 
       await (agent as any).store.insert([
         {
-          subject: paranetDataGraphUri('runtime-paranet'),
+          subject: contextGraphDataGraphUri('runtime-contextGraph'),
           predicate: DKG_ONTOLOGY.RDF_TYPE,
-          object: DKG_ONTOLOGY.DKG_PARANET,
-          graph: paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY),
+          object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH,
+          graph: contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY),
         },
       ]);
 
@@ -3186,7 +3186,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
 
       await (agent as any).trySyncFromPeer(remotePeer.toString());
 
-      expect((agent as any).subscribedContextGraphs.get('runtime-paranet')?.metaSynced).toBe(true);
+      expect((agent as any).subscribedContextGraphs.get('runtime-contextGraph')?.metaSynced).toBe(true);
     } finally {
       await agent.stop().catch(() => {});
     }

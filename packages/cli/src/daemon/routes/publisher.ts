@@ -375,7 +375,7 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
     const parsed =
       raw.request && typeof raw.request === "object" ? raw.request : raw;
     const { roots, namespace, scope, authorityProofRef, priorVersion } = parsed;
-    const contextGraphId = parsed.contextGraphId ?? parsed.paranetId;
+    const contextGraphId = parsed.contextGraphId;
     const shareOperationId =
       parsed.shareOperationId ?? parsed.workspaceOperationId;
     const swmId = parsed.swmId ?? parsed.workspaceId ?? "swm-main";

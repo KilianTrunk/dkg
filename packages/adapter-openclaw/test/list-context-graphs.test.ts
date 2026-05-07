@@ -3,8 +3,8 @@ import { DkgNodePlugin } from '../src/DkgNodePlugin.js';
 import type { OpenClawPluginApi, OpenClawTool } from '../src/types.js';
 
 const SAMPLE_CONTEXT_GRAPHS = [
-  { id: 'paranet-1', name: 'Research', subscribed: true, synced: true },
-  { id: 'paranet-2', name: 'Testing', subscribed: false, synced: false },
+  { id: 'contextGraph-1', name: 'Research', subscribed: true, synced: true },
+  { id: 'contextGraph-2', name: 'Testing', subscribed: false, synced: false },
 ];
 
 function collectTools(plugin: DkgNodePlugin): OpenClawTool[] {
@@ -366,18 +366,18 @@ describe('dkg_context_graph_create tool', () => {
 
   it('auto-generates id from name when id is omitted', async () => {
     ft.addResponses(
-      new Response(JSON.stringify({ created: 'my-research-paranet', uri: 'did:dkg:context-graph:my-research-paranet' }), { status: 200 }),
+      new Response(JSON.stringify({ created: 'my-research-contextGraph', uri: 'did:dkg:context-graph:my-research-contextGraph' }), { status: 200 }),
     );
 
     const tool = findTool('dkg_context_graph_create');
-    const result = await tool.execute('call-auto', { name: 'My Research Paranet' });
+    const result = await tool.execute('call-auto', { name: 'My Research ContextGraph' });
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(parsed.created).toBe('my-research-paranet');
+    expect(parsed.created).toBe('my-research-contextGraph');
 
     const body = JSON.parse(ft.calls[0][1]?.body as string);
-    expect(body.id).toBe('my-research-paranet');
-    expect(body.name).toBe('My Research Paranet');
+    expect(body.id).toBe('my-research-contextGraph');
+    expect(body.name).toBe('My Research ContextGraph');
   });
 
   it('strips special characters when auto-generating id', async () => {
@@ -424,7 +424,7 @@ describe('dkg_context_graph_create tool', () => {
 
   it('returns error for invalid explicit ID format (uppercase)', async () => {
     const tool = findTool('dkg_context_graph_create');
-    const result = await tool.execute('call-4', { id: 'My-Paranet', name: 'Test' });
+    const result = await tool.execute('call-4', { id: 'My-ContextGraph', name: 'Test' });
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.error).toContain('Invalid context graph ID');
@@ -444,7 +444,7 @@ describe('dkg_context_graph_create tool', () => {
     );
 
     const tool = findTool('dkg_context_graph_create');
-    const result = await tool.execute('call-7', { id: 'x', name: 'X Paranet' });
+    const result = await tool.execute('call-7', { id: 'x', name: 'X ContextGraph' });
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.created).toBe('x');
@@ -711,16 +711,16 @@ describe('dkg_subscribe tool', () => {
   it('subscribes and returns catchup job info', async () => {
     ft.addResponses(
       new Response(JSON.stringify({
-        subscribed: 'my-paranet',
+        subscribed: 'my-contextGraph',
         catchup: { jobId: 'job-1', status: 'queued', includeSharedMemory: true },
       }), { status: 200 }),
     );
 
     const tool = findTool('dkg_subscribe');
-    const result = await tool.execute('call-1', { context_graph_id: 'my-paranet' });
+    const result = await tool.execute('call-1', { context_graph_id: 'my-contextGraph' });
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(parsed.subscribed).toBe('my-paranet');
+    expect(parsed.subscribed).toBe('my-contextGraph');
     expect(parsed.catchup.jobId).toBe('job-1');
   });
 

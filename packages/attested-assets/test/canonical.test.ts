@@ -104,14 +104,14 @@ describe('sha256String', () => {
 
 describe('computeSessionId', () => {
   it('produces a deterministic hex hash', () => {
-    const id = computeSessionId('paranet-1', 'peer-1', '2026-01-01T00:00:00Z', 'nonce-1');
+    const id = computeSessionId('contextGraph-1', 'peer-1', '2026-01-01T00:00:00Z', 'nonce-1');
     expect(id).toHaveLength(64);
-    expect(computeSessionId('paranet-1', 'peer-1', '2026-01-01T00:00:00Z', 'nonce-1')).toBe(id);
+    expect(computeSessionId('contextGraph-1', 'peer-1', '2026-01-01T00:00:00Z', 'nonce-1')).toBe(id);
   });
 
   it('different inputs produce different ids', () => {
-    const a = computeSessionId('paranet-1', 'peer-1', '2026-01-01T00:00:00Z', 'nonce-1');
-    const b = computeSessionId('paranet-2', 'peer-1', '2026-01-01T00:00:00Z', 'nonce-1');
+    const a = computeSessionId('contextGraph-1', 'peer-1', '2026-01-01T00:00:00Z', 'nonce-1');
+    const b = computeSessionId('contextGraph-2', 'peer-1', '2026-01-01T00:00:00Z', 'nonce-1');
     expect(a).not.toBe(b);
   });
 });
@@ -180,7 +180,7 @@ describe('computeTurnCommitment', () => {
 describe('computeConfigHash', () => {
   const baseConfig = {
     sessionId: 'session-1',
-    contextGraphId: 'paranet-1',
+    contextGraphId: 'contextGraph-1',
     appId: 'test-app',
     createdBy: 'peer-1',
     createdAt: '2026-01-01T00:00:00Z',
@@ -213,7 +213,7 @@ describe('signAKAPayload / verifyAKASignature', () => {
   const context: SigningContext = {
     domain: 'AKA-v1',
     network: 'test-net',
-    contextGraphId: 'paranet-1',
+    contextGraphId: 'contextGraph-1',
     sessionId: 'session-1',
     round: 1,
     type: 'RoundAck',

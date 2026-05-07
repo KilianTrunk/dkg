@@ -198,8 +198,8 @@ export class ChainEventPoller {
       if (event.blockNumber > maxEventBlock) maxEventBlock = event.blockNumber;
       if (event.type === 'KnowledgeBatchCreated' || event.type === 'KCCreated') {
         await this.handleBatchCreated(event, ctx);
-      } else if (event.type === 'NameClaimed' || event.type === 'ParanetCreated') {
-        // Accept 'ParanetCreated' for backward compat with adapters that have not renamed the event.
+      } else if (event.type === 'NameClaimed' || event.type === 'ContextGraphCreated') {
+        // Accept 'ContextGraphCreated' for backward compat with adapters that have not renamed the event.
         await this.handleContextGraphCreated(event, ctx);
       } else if (event.type === 'KnowledgeCollectionUpdated') {
         await this.handleCollectionUpdated(event, ctx);
@@ -261,7 +261,7 @@ export class ChainEventPoller {
   private async handleContextGraphCreated(event: ChainEvent, ctx: OperationContext): Promise<void> {
     if (!this.onContextGraphCreated) return;
     const { data } = event;
-    const contextGraphId = String(data['contextGraphId'] ?? data['paranetId'] ?? '');
+    const contextGraphId = String(data['contextGraphId'] ?? data['contextGraphId'] ?? '');
     const creator = String(data['creator'] ?? '');
     const accessPolicy = Number(data['accessPolicy'] ?? 0);
 

@@ -6,7 +6,7 @@ Session-scoped, multi-party consensus protocol for DKG V10. Enables bounded grou
 
 ## What are Attested Knowledge Assets?
 
-Standard Knowledge Assets are published to open paranets — any node can write. Attested Knowledge Assets add a **session** layer on top: a fixed set of members, a deterministic reducer (state machine), and a quorum policy. State transitions only finalize when enough members independently validate and sign off.
+Standard Knowledge Assets are published to open contextGraphs — any node can write. Attested Knowledge Assets add a **session** layer on top: a fixed set of members, a deterministic reducer (state machine), and a quorum policy. State transitions only finalize when enough members independently validate and sign off.
 
 Use cases: multiplayer games, collaborative agent workflows, multi-party computations, supply chain checkpoints.
 
@@ -19,7 +19,7 @@ See the full protocol spec at [`docs/SPEC_ATTESTED_KNOWLEDGE_ASSETS.md`](../../d
 - **Canonical encoding** — RFC 8785 JSON Canonicalization Scheme for deterministic hashing and Ed25519 signing with domain separation (`AKA-v1`)
 - **Quorum engine** — configurable quorum policies (fraction-based, e.g., 2/3 majority) with `isQuorumMet` checks
 - **Session validator** — enforces membership, state linkage, replay protection, timing, proposer authority, signature verification, and equivocation detection
-- **GossipSub integration** — `AKAGossipHandler` for broadcasting and receiving AKA events over paranet and session-specific topics
+- **GossipSub integration** — `AKAGossipHandler` for broadcasting and receiving AKA events over contextGraph and session-specific topics
 - **Protobuf serialization** — efficient encode/decode for all AKA event types
 - **REST API routes** — `createSessionRoutes()` exposes session management and round operations via HTTP
 
@@ -50,7 +50,7 @@ ReducerRegistry.register({
 
 // Create a session
 const session = await sessionManager.createSession({
-  paranetId: 'urn:paranet:my-app',
+  contextGraphId: 'urn:contextGraph:my-app',
   members: [{ peerId: 'peer-1', role: 'validator' }, ...],
   quorum: { numerator: 2, denominator: 3 },
   reducer: { name: 'my-game', version: '1.0.0', hash: '...' },

@@ -210,4 +210,4 @@ wrote plus everything your teammates shared.
   `auth.token` file produced by your daemon's devnet setup, or export
   `DKG_TOKEN`.
 - **HTTP 404 on `/api/context-graph/list`** — you're on an older daemon;
-  the client automatically falls back to `/api/paranet/list`.
+  the client automatically falls back to `/api/context-graph/list`.

@@ -375,7 +375,6 @@ program
       apiPort,
       nodeRole,
       contextGraphs,
-      paranets: contextGraphs,
       autoUpdate: enableAutoUpdate ? autoUpdate : existing.autoUpdate,
       chain: chainSection ?? existing.chain,
       auth: { enabled: enableAuth, tokens: existing.auth?.tokens },
@@ -1005,13 +1004,12 @@ program
   .option('--entity <uri>', 'Get all triples for an entity URI (requires --context-graph)')
   .option('--type <rdfType>', 'Find entities by RDF type (requires --context-graph)')
   .option('-p, --context-graph <id>', 'Target context graph')
-  .option('--paranet <id>', 'Target context graph (legacy alias)')
   .option('-l, --limit <n>', 'Max results', '100')
   .option('--timeout <ms>', 'Query timeout in ms', '5000')
   .action(async (peer: string, opts: ActionOpts) => {
     try {
       const client = await ApiClient.connect();
-      const contextGraphId = opts.contextGraph ?? opts.paranet;
+      const contextGraphId = opts.contextGraph;
 
       let lookupType: string;
       const request: Record<string, any> = { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -1133,7 +1131,7 @@ program
         const cgs = new Set(resolveContextGraphs(config));
         cgs.add(contextGraph);
         config.contextGraphs = [...cgs];
-        config.paranets = [...cgs];
+        config.contextGraphs = [...cgs];
         await saveConfig(config);
         console.log('Saved to config (will auto-subscribe on restart).');
       }
@@ -1223,11 +1221,10 @@ syncCmd
     }
   });
 
-// ─── dkg context-graph (alias: paranet) ─────────────────────────────
+// ─── dkg context-graph ──────────────────────────────────────────────────
 
 const contextGraphCmd = program
   .command('context-graph')
-  .alias('paranet')
   .description('Manage context graphs (knowledge graph partitions)');
 
 contextGraphCmd
@@ -1311,7 +1308,7 @@ contextGraphCmd
         const cgs = new Set(resolveContextGraphs(config));
         cgs.add(id);
         config.contextGraphs = [...cgs];
-        config.paranets = [...cgs];
+        config.contextGraphs = [...cgs];
         await saveConfig(config);
         console.log('  Saved to config (will auto-subscribe on restart).');
       }
@@ -1922,7 +1919,7 @@ for (const [commandName, candidates, description] of [
 
 const cclCmd = program
   .command('ccl')
-  .description('Manage paranet-scoped CCL policies');
+  .description('Manage contextGraph-scoped CCL policies');
 
 const cclPolicyCmd = cclCmd
   .command('policy')
@@ -2004,7 +2001,7 @@ cclPolicyCmd
 cclPolicyCmd
   .command('list')
   .description('List known CCL policies')
-  .option('--paranet <id>', 'Filter by paranet id')
+  .option('--context-graph <id>', 'Filter by contextGraph id')
   .option('--name <name>', 'Filter by policy name')
   .option('--context-type <contextType>', 'Filter by context type')
   .option('--status <status>', 'Filter by status')
@@ -2013,7 +2010,7 @@ cclPolicyCmd
     try {
       const client = await ApiClient.connect();
       const { policies } = await client.listCclPolicies({
-        contextGraphId: opts.paranet,
+        contextGraphId: opts.contextGraph,
         name: opts.name,
         contextType: opts.contextType,
         status: opts.status,
@@ -2025,7 +2022,7 @@ cclPolicyCmd
       }
       for (const policy of policies) {
         console.log(`${policy.name}@${policy.version}  ${policy.policyUri}`);
-      console.log(`  Context Graph: ${policy.contextGraphId ?? policy.paranetId}`);
+      console.log(`  Context Graph: ${policy.contextGraphId}`);
       console.log(`  Status:        ${policy.status}${policy.isActiveDefault ? ' (active default)' : ''}`);
       if (policy.contextType) console.log(`  Context:       ${policy.contextType}`);
         if (policy.activeContexts?.length) console.log(`  Active in contexts: ${policy.activeContexts.join(', ')}`);
@@ -2061,7 +2058,7 @@ cclPolicyCmd
       console.log(`Resolved policy:`);
       console.log(`  URI:     ${policy.policyUri}`);
       console.log(`  Name:    ${policy.name}@${policy.version}`);
-      console.log(`  Context Graph: ${policy.contextGraphId ?? policy.paranetId}`);
+      console.log(`  Context Graph: ${policy.contextGraphId}`);
       console.log(`  Hash:    ${policy.hash}`);
       if (policy.contextType) console.log(`  Context: ${policy.contextType}`);
       if (policy.body) console.log(`  Body:\n${policy.body}`);
@@ -2078,7 +2075,7 @@ cclCmd
   .option('--context-type <contextType>', 'Optional stricter context override scope')
   .option('--case <path>', 'YAML/JSON file with { facts, context? }')
   .option('--facts-file <path>', 'YAML/JSON file containing facts array')
-  .option('--publish-result', 'Publish the evaluation output back into the paranet as typed records')
+  .option('--publish-result', 'Publish the evaluation output back into the contextGraph as typed records')
   .option('--view <view>', 'Declared view, for example accepted')
   .option('--snapshot-id <snapshotId>', 'Snapshot identifier')
   .option('--scope-ual <scopeUal>', 'Scope UAL for evaluation')
@@ -2164,7 +2161,6 @@ program
   .command('index [directory]')
   .description('Index a repository and write to shared memory or publish directly')
   .option('-p, --context-graph <id>', 'Target context graph', 'dev-coordination')
-  .option('--paranet <id>', 'Target context graph (legacy alias)')
   .option('--shared-memory', 'Write indexed quads to shared memory instead of publishing')
   .option('--workspace', 'Write indexed quads to shared memory instead of publishing (legacy alias)')
   .option('--include-content', 'Index docs/content files in addition to source code')
@@ -2175,7 +2171,7 @@ program
     try {
       const { resolve } = await import('node:path');
       const repoRoot = resolve(directory ?? '.');
-      const targetContextGraph = opts.contextGraph ?? opts.paranet ?? 'dev-coordination';
+      const targetContextGraph = opts.contextGraph ?? 'dev-coordination';
       const useSharedMemory = opts.sharedMemory || opts.workspace;
 
       console.log(`Indexing ${repoRoot}...`);

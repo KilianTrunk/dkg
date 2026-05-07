@@ -16,8 +16,8 @@ import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 
-let PARANET = 'test-access';
-let GRAPH = `did:dkg:context-graph:${PARANET}`;
+let CONTEXT_GRAPH = 'test-access';
+let GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
 const ENTITY = 'did:dkg:agent:TestBot';
 
 function q(s: string, p: string, o: string, g = GRAPH): Quad {
@@ -35,8 +35,8 @@ describe('Access Protocol', () => {
     const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
     const cgId = await createTestContextGraph();
-    PARANET = String(cgId);
-    GRAPH = `did:dkg:context-graph:${PARANET}`;
+    CONTEXT_GRAPH = String(cgId);
+    GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -88,7 +88,7 @@ describe('Access Protocol', () => {
     });
 
     const result = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [
         q(ENTITY, 'http://schema.org/name', '"TestBot"'),
         q(ENTITY, 'http://schema.org/description', '"A test agent"'),
@@ -159,7 +159,7 @@ describe('Access Protocol', () => {
 
     const kcUal = result.ual;
     const kaUal = `${result.ual}/1`;
-    const metaGraph = `did:dkg:context-graph:${PARANET}/_meta`;
+    const metaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
     const privateRootHex = Array.from(result.kaManifest[0].privateMerkleRoot!)
       .map((byte) => byte.toString(16).padStart(2, '0'))
       .join('');
@@ -253,7 +253,7 @@ describe('Access Protocol', () => {
 
     const kaUal = `${result.ual}/1`;
     const kcUal = result.ual;
-    const metaGraph = `did:dkg:context-graph:${PARANET}/_meta`;
+    const metaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
 
     await storeA.insert([
       { subject: kcUal, predicate: 'http://dkg.io/ontology/accessPolicy', object: '"ownerOnly"', graph: metaGraph },
@@ -281,7 +281,7 @@ describe('Access Protocol', () => {
     const { result, bus } = await publishWithPrivate(storeA, { publisherPeerId: nodeA.peerId });
 
     const kcUal = result.ual;
-    const metaGraph = `did:dkg:context-graph:${PARANET}/_meta`;
+    const metaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
     await storeA.delete([
       { subject: kcUal, predicate: 'http://dkg.io/ontology/accessPolicy', object: '"ownerOnly"', graph: metaGraph },
       { subject: kcUal, predicate: 'http://dkg.io/ontology/publisherPeerId', object: `"${nodeA.peerId}"`, graph: metaGraph },
@@ -321,7 +321,7 @@ describe('Access Protocol', () => {
     const accessClient = new AccessClient(routerB, keypairB, nodeB.peerId);
 
     const kcUal = result.ual;
-    const metaGraph = `did:dkg:context-graph:${PARANET}/_meta`;
+    const metaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
     await storeA.delete([
       { subject: kcUal, predicate: 'http://dkg.io/ontology/publisherPeerId', object: `"${nodeA.peerId}"`, graph: metaGraph },
       { subject: kcUal, predicate: 'http://www.w3.org/ns/prov#wasAttributedTo', object: `"${nodeA.peerId}"`, graph: metaGraph },
@@ -342,7 +342,7 @@ describe('Access Protocol', () => {
       allowedPeers: [' peer-a ', 'peer-b', 'peer-a'],
     });
 
-    const metaGraph = `did:dkg:context-graph:${PARANET}/_meta`;
+    const metaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
     const metaResult = await storeA.query(`
       SELECT ?policy ?allowedPeer WHERE {
         GRAPH <${metaGraph}> {
@@ -375,7 +375,7 @@ describe('Access Protocol', () => {
 
     await expect(
       publisher.publish({
-        contextGraphId: PARANET,
+        contextGraphId: CONTEXT_GRAPH,
         quads: [q(ENTITY, 'http://schema.org/name', '"TestBot"')],
         privateQuads: [q(ENTITY, 'http://ex.org/apiKey', '"secret-key-123"')],
         publisherPeerId: '12D3KooWTestPublisher',

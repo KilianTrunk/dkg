@@ -449,12 +449,26 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
                 </div>
                 <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginTop: 4 }}>
                   Share this with collaborators. They paste it into <strong>Join Project</strong> on their node.
-                  Their daemon dials your node by peer id over the libp2p DHT, so the invite stays
-                  valid even if your relay or public IP changes.
-                  {allowedAgents.length > 0 ? (
-                    <> The invitee must have their agent address on the allowlist, or they can submit a signed join request for your approval.</>
+                  {inviteReady ? (
+                    <>
+                      {' '}Their daemon dials your node by peer id over the libp2p DHT, so the
+                      invite stays valid even if your relay or public IP changes.
+                      {allowedAgents.length > 0 ? (
+                        <> The invitee must have their agent address on the allowlist, or they can submit a signed join request for your approval.</>
+                      ) : (
+                        <> Since no allowlist is set, anyone with this code can join.</>
+                      )}
+                    </>
                   ) : (
-                    <> Since no allowlist is set, anyone with this code can join.</>
+                    <>
+                      {' '}This is the bare project ID — sufficient for <em>open</em> projects
+                      (joiners discover via gossip without dialing your node).
+                      {allowedAgents.length > 0 ? (
+                        <> Because this project has an allowlist, joiners would also need to dial your node to submit a signed join request — that path won't work until AutoRelay negotiates a circuit-relay reservation. Re-open this modal then to copy the peer-id-enhanced form.</>
+                      ) : (
+                        <> For curated projects, re-open this modal once AutoRelay has negotiated to copy the peer-id-enhanced form.</>
+                      )}
+                    </>
                   )}
                 </div>
               </div>

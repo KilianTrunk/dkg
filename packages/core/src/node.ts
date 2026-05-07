@@ -54,7 +54,7 @@ interface RelayTarget {
  * Circuit-relay addresses are checked separately by callers because the
  * "peer record is dialable" signal merges both classes.
  */
-function isLocalOrInternalHostname(host: string): boolean {
+export function isLocalOrInternalHostname(host: string): boolean {
   if (typeof host !== 'string' || host.length === 0) return true;
   const h = host.toLowerCase();
   if (h === 'localhost') return true;
@@ -67,7 +67,7 @@ function isLocalOrInternalHostname(host: string): boolean {
   return false;
 }
 
-function isPublicLikeAddress(addr: string): boolean {
+export function isPublicLikeAddress(addr: string): boolean {
   const dnsMatch = addr.match(/^\/(?:dns|dns4|dns6|dnsaddr)\/([^/]+)\//);
   if (dnsMatch) return !isLocalOrInternalHostname(dnsMatch[1]);
   const ipv4 = addr.match(/^\/ip4\/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\//);

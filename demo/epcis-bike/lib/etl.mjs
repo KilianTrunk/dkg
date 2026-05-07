@@ -1,0 +1,260 @@
+#!/usr/bin/env node
+// ETL: assembly-line cycle records JSON → EPCIS 2.0 documents (one per station event).
+//
+// Reads a raw `acme-bikes-line-w18.json` array (or any file with the same
+// shape — `[ { trace_id, unit_id, unit_name, process_name, ended, product_id,
+// items: { <id>: { status } } }, ... ]`), filters to a single trace_id,
+// sorts ascending by `ended`, and emits one EPCIS document per cycle record
+// into the fixtures directory.
+//
+// Usage:
+//   node lib/etl.mjs                      # uses committed synthesized source
+//   node lib/etl.mjs \
+//     --source ./fixtures/source-raw/acme-bikes-line-w18.json \
+//     --trace-id 7c4f8d2a-9e3b-4a6d-b517-8f9e0a1b2c3d \
+//     --out ./fixtures
+//
+// Defaults pick the canonical demo trace and write to ../fixtures.
+
+import { createHash } from 'node:crypto';
+import { mkdir, readFile, writeFile, readdir, unlink } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildEpcisDocument } from './epc-mapping.mjs';
+
+const SELF_DIR = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_OUT = resolve(SELF_DIR, '..', 'fixtures');
+const DEFAULT_TRACE_ID = '7c4f8d2a-9e3b-4a6d-b517-8f9e0a1b2c3d';
+// The synthesized source is committed in this repo (it's fully fictional, no
+// partner data). Default the ETL to read from that committed path so
+// `node lib/etl.mjs` works zero-config from a clean clone. Override with
+// `--source <path>` (or `BIKE_SOURCE` env var) to point at an alternate
+// source file with the same shape.
+const DEFAULT_SOURCE =
+  process.env.BIKE_SOURCE
+  ?? resolve(SELF_DIR, '..', 'fixtures', 'source-raw', 'acme-bikes-line-w18.json');
+
+function parseArgs(argv) {
+  const args = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    // Split on the FIRST `=` only — `argv[i].split('=')` truncates
+    // values that themselves contain `=` (e.g. `--source=/tmp/a=b.json`
+    // would lose `=b.json`). indexOf+slice keeps the value lossless.
+    const eqIdx = argv[i].indexOf('=');
+    const [key, val] = eqIdx >= 0
+      ? [argv[i].slice(0, eqIdx), argv[i].slice(eqIdx + 1)]
+      : [argv[i], argv[i + 1]];
+    if (!key.startsWith('--')) continue;
+    args[key.slice(2)] = val;
+    if (eqIdx < 0) i += 1;
+  }
+  return args;
+}
+
+function safeName(processName) {
+  return String(processName ?? 'unknown').replace(/[^A-Za-z0-9_-]/g, '_');
+}
+
+function pad(n, width = 2) {
+  return String(n).padStart(width, '0');
+}
+
+export async function runEtl({
+  source = DEFAULT_SOURCE,
+  traceId = DEFAULT_TRACE_ID,
+  outDir = DEFAULT_OUT,
+} = {}) {
+  const sourceContent = await readFile(source, 'utf-8');
+  const sourceHash = `sha256:${createHash('sha256').update(sourceContent).digest('hex')}`;
+  const allRecords = JSON.parse(sourceContent);
+
+  if (!Array.isArray(allRecords)) {
+    throw new Error(`Source ${source} is not an array of cycle records`);
+  }
+
+  const traceRecords = allRecords
+    .filter((r) => r?.trace_id === traceId)
+    .sort((a, b) => String(a.ended).localeCompare(String(b.ended)));
+
+  if (traceRecords.length === 0) {
+    throw new Error(`No records found for trace_id ${traceId} in ${source}`);
+  }
+
+  await mkdir(outDir, { recursive: true });
+
+  // Clean any prior event-*.json so re-runs don't leave stale files.
+  for (const entry of await readdir(outDir)) {
+    if (/^event-\d+-.*\.json$/.test(entry)) {
+      await unlink(join(outDir, entry));
+    }
+  }
+
+  const creationDate = new Date().toISOString();
+  const events = [];
+  const stations = new Set();
+  const products = new Set();
+  // EPCIS `action: ADD` means "first observation of these EPCs in the
+  // trace". Track first-seen per item rather than per-record-index so
+  // that when a single source record splits into multiple status groups,
+  // EVERY sibling doc whose items haven't appeared yet gets ADD —
+  // not just the first sibling. For the current uniform-status trace
+  // this still produces "doc 1: ADD, docs 2..N: OBSERVE" identically.
+  const seenEpcs = new Set();
+
+  for (let i = 0; i < traceRecords.length; i += 1) {
+    const rec = traceRecords[i];
+    const itemIds = Object.keys(rec.items ?? {});
+    if (itemIds.length === 0) continue;
+
+    // If items have heterogeneous statuses, group them so each EPCIS event
+    // has a single disposition. In practice for this trace they're uniform,
+    // but we don't want to lie about disposition if multiple statuses appear.
+    const byStatus = {};
+    for (const itemId of itemIds) {
+      const status = rec.items[itemId]?.status ?? 'Skipped';
+      (byStatus[status] ??= []).push(itemId);
+    }
+
+    const groupCount = Object.keys(byStatus).length;
+    for (const [status, ids] of Object.entries(byStatus)) {
+      // ADD only when EVERY item in this status group is first-seen.
+      // Earlier `ids.some(unseen)` flagged the whole group as ADD if any
+      // single item was unseen — for a mixed group `[seen, unseen]` the
+      // already-observed item then claimed ADD too, which the EPCIS spec
+      // reserves for a true first observation. Using `every` is
+      // conservative: when a group blends first-seen and previously-seen
+      // EPCs, the action drops to OBSERVE (the strictly correct option
+      // is to split the group, but the demo's uniform-status fixture
+      // never trips that branch — both predicates match identically on
+      // it, so the committed event-*.json files regenerate unchanged).
+      const isFirstInTrace = ids.every((itemId) => !seenEpcs.has(itemId));
+      for (const itemId of ids) seenEpcs.add(itemId);
+
+      const doc = buildEpcisDocument({
+        traceId: rec.trace_id,
+        unitId: rec.unit_id,
+        unitName: rec.unit_name,
+        processName: rec.process_name,
+        ended: rec.ended,
+        itemIds: ids,
+        status,
+        // Disambiguate sibling docs by status when a single source record
+        // splits into multiple groups; otherwise leave undefined so the
+        // eventID matches the back-compat (trace, unit, ended) seed.
+        groupKey: groupCount > 1 ? status : undefined,
+        isFirstInTrace,
+        creationDate,
+      });
+
+      const fileNum = events.length + 1;
+      const suffix = Object.keys(byStatus).length > 1 ? `-${status.toLowerCase()}` : '';
+      const filename = `event-${pad(fileNum)}-${safeName(rec.process_name)}${suffix}.json`;
+      const fullPath = join(outDir, filename);
+      await writeFile(fullPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf-8');
+
+      events.push({
+        file: filename,
+        eventID: doc.epcisBody.eventList[0].eventID,
+        eventTime: rec.ended,
+        process_name: rec.process_name,
+        unit_name: rec.unit_name,
+        unit_id: rec.unit_id,
+        item_ids: ids,
+        status,
+        action: doc.epcisBody.eventList[0].action,
+        bizStep: doc.epcisBody.eventList[0].bizStep,
+        disposition: doc.epcisBody.eventList[0].disposition,
+      });
+
+      stations.add(rec.process_name);
+      products.add(rec.product_id);
+    }
+  }
+
+  // Guard against the all-skipped case before reading events[0]/at(-1).
+  // If every traceRecord has an empty `items` map (or no usable items), we
+  // exit the inner loop with `events` still empty. Indexing `events[0]` then
+  // throws "Cannot read properties of undefined", masking the real cause
+  // (the source dump filtered to nothing). Throw a precise error instead so
+  // the demo's Phase 1 fail message points at the input, not a stack trace.
+  if (events.length === 0) {
+    throw new Error(
+      `No EPCIS events extracted for trace_id ${traceId}: ` +
+        `${traceRecords.length} record(s) matched but none yielded items ` +
+        '(check the `items` map is populated in the source dump).',
+    );
+  }
+
+  const traceManifest = {
+    trace_id: traceId,
+    event_count: events.length,
+    products: Array.from(products),
+    stations: Array.from(stations),
+    time_range: [events[0].eventTime, events.at(-1).eventTime],
+    events,
+  };
+  await writeFile(
+    join(outDir, `trace-${traceId.slice(0, 8)}-bike-line.json`),
+    `${JSON.stringify(traceManifest, null, 2)}\n`,
+    'utf-8',
+  );
+
+  // Persist only the source file's basename to avoid baking a developer's
+  // absolute path (e.g. /Users/<name>/...) into committed fixtures. The
+  // hash + trace_id are sufficient to identify which source produced these
+  // events; the full path is kept in uncommitted local state if needed.
+  const sourceSnapshot = {
+    source_basename: basename(source),
+    source_hash: sourceHash,
+    extracted_at: creationDate,
+    trace_id: traceId,
+    records_in_trace: traceRecords.length,
+    events_emitted: events.length,
+  };
+  await writeFile(
+    join(outDir, 'source-snapshot.json'),
+    `${JSON.stringify(sourceSnapshot, null, 2)}\n`,
+    'utf-8',
+  );
+
+  return { traceManifest, sourceSnapshot, outDir };
+}
+
+// Resolve both sides through `fileURLToPath` + `resolve` rather than the
+// naive string compare `import.meta.url === \`file://${process.argv[1]}\``.
+// Naive concat breaks on URL-encoded paths (spaces, unicode), Windows
+// drive letters (`C:\…` → `file://C:\…` is not a valid URL — the canonical
+// form is `file:///C:/…`), and any path Node normalises (e.g. `./foo.mjs`
+// run from the cwd). Both sides go through the same canonicalisation here
+// so the entry-point check fires when expected on every platform.
+const isMain =
+  process.argv[1] !== undefined
+  && resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1]);
+if (isMain) {
+  const args = parseArgs(process.argv.slice(2));
+  const source = args.source ?? DEFAULT_SOURCE;
+  if (!source) {
+    process.stderr.write(
+      'ETL needs a source: pass `--source <path-to-bike-json>` or set BIKE_SOURCE.\n' +
+        'The committed default points at `fixtures/source-raw/acme-bikes-line-w18.json`,\n' +
+        'which holds the synthesized 7-station trace this demo uses.\n',
+    );
+    process.exit(2);
+  }
+  try {
+    const result = await runEtl({
+      source,
+      traceId: args['trace-id'] ?? DEFAULT_TRACE_ID,
+      outDir: args.out ?? DEFAULT_OUT,
+    });
+    process.stdout.write(
+      `Wrote ${result.traceManifest.event_count} EPCIS documents to ${result.outDir}\n`,
+    );
+    process.stdout.write(
+      `Stations: ${result.traceManifest.stations.join(', ')}\n`,
+    );
+  } catch (err) {
+    process.stderr.write(`ETL failed: ${err.message}\n`);
+    process.exit(1);
+  }
+}

@@ -126,22 +126,34 @@ export async function runEtl({
 
   await mkdir(outDir, { recursive: true });
 
-  // Clean prior fixture files — but ONLY the ones we wrote in a previous
-  // run of THIS traceId, never any `event-*.json` matches in `--out` or
-  // any other trace's manifest sharing the same dir. The earlier
-  // implementation aggregated files across every `trace-*-bike-line.json`
-  // it found and deleted them all, which silently destroyed sibling
-  // traces' fixtures whenever an operator regenerated one trace into a
-  // shared dir. Restrict deletion to the events recorded in THIS run's
-  // current manifest (named `trace-<full-traceId>-bike-line.json`); if
-  // it doesn't exist (first run for this traceId), skip cleanup
-  // entirely. Other trace's manifests + their files are left untouched.
-  // The manifest name uses the FULL trace id, not an 8-char prefix —
-  // truncated names would let two traces sharing the first 32 bits of
-  // their UUIDs collide in the same cleanup bucket and overwrite each
-  // other's fixtures in a shared output directory.
   const existingEntries = await readdir(outDir).catch(() => []);
   const currentManifestName = `trace-${traceId}-bike-line.json`;
+  // Enforce single-trace-per-outDir. Two traces can't coexist safely in
+  // the same dir because the event-NN-*.json filenames are scoped only
+  // by ordinal + station, so a regen of trace B with the same outDir as
+  // trace A would silently overwrite A's `event-01-StationA.json` with
+  // B's `event-01-StationA.json` while leaving A's `trace-<A>-bike-line.json`
+  // pointing at the now-corrupted file. Reject the second trace upfront
+  // with a clear remediation pointer instead of producing a quietly-
+  // broken fixture set.
+  const manifestShape = /^trace-([^/\\]+?)-bike-line\.json$/;
+  const otherManifests = existingEntries.filter(
+    (f) => manifestShape.test(f) && f !== currentManifestName,
+  );
+  if (otherManifests.length > 0) {
+    throw new Error(
+      `outDir ${outDir} already contains a different trace's manifest(s): ${otherManifests.join(', ')}. ` +
+        'The demo enforces single-trace-per-outDir to prevent event-NN-*.json filename collisions ' +
+        'between traces (different traces share the same event-NN-<station>.json shape). ' +
+        `Use a different --out for trace_id=${traceId}, or remove the stale manifest(s) and their listed events first.`,
+    );
+  }
+
+  // Clean prior fixture files for THIS traceId — files listed in the
+  // previous manifest, plus the prior manifest itself. The single-trace-
+  // per-outDir rule above guarantees no sibling traces' files exist
+  // here, so the cleanup is straightforward: remove everything THIS
+  // trace wrote on the previous run, then write the new fixtures.
   if (existingEntries.includes(currentManifestName)) {
     const filesToRemove = new Set();
     try {

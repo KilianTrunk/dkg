@@ -86,7 +86,7 @@ let phase6GrantOk = false;
 // publisher's anchor-write target depends on lift state. Stays at 0 when
 // node2 is unavailable — Phase 7 short-circuits with `node2Ident=null` in
 // that case so the baseline isn't consulted.
-let phase7AnchorBaseline = { finalized: 0, swm: 0, captured: false };
+let phase7AnchorBaseline = { finalized: 0, swm: 0, private: 0, captured: false };
 
 // `--skip-cg-create` bypasses the canonical-ID resolution path in Phase 0.
 // If `EPCIS_DEMO_CG` is a bare name (no `/`), `CG_ID` stays as-is and every
@@ -814,14 +814,25 @@ async function phase0() {
     // alone, indistinguishably from a successful current-run gossip.
     const finalizedGraphUriBaseline = `${CG_URI}/${SUB}`;
     const swmGraphUriBaseline = `${CG_URI}/${SUB}/_shared_memory`;
+    // Phase 7B baseline counterpart: Phase 7B asserts node2 has zero
+    // private triples for this CG/sub-graph. A reused node2 that already
+    // fetched private payloads from an earlier run would have privCount
+    // > 0 even though the CURRENT run leaked nothing — same false-
+    // positive shape as Phase 7A's stale-anchor case. Capture
+    // `<cg>/<sub>/_private` triple count alongside the anchor baselines
+    // so Phase 7B can check the delta instead of the absolute count.
+    const privGraphUriBaseline = `${CG_URI}/${SUB}/_private`;
     const anchorBaselineSparql = (uri) =>
       `SELECT (COUNT(?s) AS ?c) WHERE { ` +
       `  GRAPH <${uri}> { ` +
       `    ?s <http://dkg.io/ontology/privateDataAnchor> ?o ` +
       `  } ` +
       `}`;
+    const privateBaselineSparql = (uri) =>
+      `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${uri}> { ?s ?p ?o } }`;
     let baselineFinalized = 0;
     let baselineSwm = 0;
+    let baselinePrivate = 0;
     try {
       const fr = await node2Sparql(anchorBaselineSparql(finalizedGraphUriBaseline));
       if (fr.status === 200 && Array.isArray(fr.bindings)) {
@@ -831,16 +842,25 @@ async function phase0() {
       if (sr.status === 200 && Array.isArray(sr.bindings)) {
         baselineSwm = parseCountBinding(sr.bindings[0]?.c);
       }
-      phase7AnchorBaseline = { finalized: baselineFinalized, swm: baselineSwm, captured: true };
+      const pr = await node2Sparql(privateBaselineSparql(privGraphUriBaseline));
+      if (pr.status === 200 && Array.isArray(pr.bindings)) {
+        baselinePrivate = parseCountBinding(pr.bindings[0]?.c);
+      }
+      phase7AnchorBaseline = {
+        finalized: baselineFinalized,
+        swm: baselineSwm,
+        private: baselinePrivate,
+        captured: true,
+      };
     } catch {
-      // Leave baseline at default {0, 0, captured:false}; Phase 7A will
-      // still run but its delta degrades to absolute count (current
-      // behavior). Better than aborting Phase 0 over a transient query.
+      // Leave baseline at default {0, 0, 0, captured:false}; Phase 7A/B
+      // still run but their deltas degrade to absolute counts. Better
+      // than aborting Phase 0 over a transient query.
     }
-    if (!JSON_MODE && (baselineFinalized + baselineSwm) > 0) {
+    if (!JSON_MODE && (baselineFinalized + baselineSwm + baselinePrivate) > 0) {
       fmt.note(
-        `  Phase 7A baseline: ${baselineFinalized} finalized + ${baselineSwm} SWM anchors already on node2 ` +
-          'before this run\'s captures — Phase 7A will check the delta.',
+        `  Phase 7 baselines on node2: ${baselineFinalized} finalized + ${baselineSwm} SWM anchors, ` +
+          `${baselinePrivate} private triples already present — Phase 7A/B will check the delta.`,
       );
     }
   }
@@ -1216,12 +1236,23 @@ async function phase5() {
 // reached the daemon / parsed shape unrecognized". A silent coercion to
 // 0 would let auth/daemon errors masquerade as "no new grants" and
 // quietly turn Phase 6 verification into a permanent false negative.
-async function countGrantsForPeer(allowedPeer, metaGraph) {
+async function countGrantsForPeer(allowedPeer, metaGraph, kcRoot) {
+  // When `kcRoot` is provided (the UAL of THIS run's Phase 6 capture),
+  // scope the count to grants that bind the given KC to the given peer.
+  // Without scoping, an older pending allow-list capture for the same
+  // peer that finalizes during this window would inflate the post-count
+  // and produce a false-positive "Phase 6 verified" report. When
+  // `kcRoot` is undefined (the daemon didn't expose the resulting UAL),
+  // fall back to the unscoped count for the delta-of-counts path.
+  const kcScope = kcRoot
+    ? `FILTER(STR(?kc) = "${kcRoot}") `
+    : '';
   const sparql =
     `SELECT (COUNT(?kc) AS ?c) WHERE { ` +
     `  GRAPH <${metaGraph}> { ` +
     `    ?kc <http://dkg.io/ontology/allowedPeer> ?peer . ` +
     `  } ` +
+    `  ${kcScope}` +
     `  FILTER(STR(?peer) = "${allowedPeer}") ` +
     `}`;
   // `dkg query` (the CLI front-end) prints a text table for binding results,
@@ -1477,27 +1508,44 @@ async function phase6() {
   // graph, which is empty in V10 — that was a footgun in earlier
   // versions of this demo.
   //
-  // Verification is delta-based: the EPCIS capture status route does not
-  // currently expose the resulting UAL, so we can't scope the SPARQL to
-  // THIS specific KC. Instead we count grants for ALLOWED_PEER before
-  // and after — if the count went up, this capture's lift wrote a new
-  // grant. Older grants from prior runs cannot satisfy the check.
-  const grantsAfterResult = await countGrantsForPeer(ALLOWED_PEER, metaGraph);
+  // Verification: prefer KC-scoped existence check when the daemon
+  // exposed THIS capture's UAL in the finalized status. That gives us
+  // the tightest possible signal — a triple with `<thisUal>
+  // dkg:allowedPeer "<peer>"` exists in `<cg>/_meta` ⇒ this exact run
+  // wrote the grant. Without UAL scoping, an unrelated allow-list
+  // capture for the same peer that finalizes during this window would
+  // inflate the post-count and produce a false-positive "Phase 6
+  // verified" report. When UAL isn't exposed (older daemons, or non-
+  // finalized status objects), fall back to the unscoped (after -
+  // before) delta-of-counts; both paths use the same countGrantsForPeer
+  // helper, with `kcRoot` either set or undefined.
+  const phase6Ual = phase6FinalBody?.ual;
+  const grantsAfterResult = await countGrantsForPeer(
+    ALLOWED_PEER,
+    metaGraph,
+    phase6Ual,
+  );
   if (grantsAfterResult.count === null) {
     emitFail(
       'phase-6-post-count-fail',
       `Phase 6 post-count query failed: ${grantsAfterResult.error}`,
-      { note: 'Cannot compute (after - before) delta — verification result is unknown for this run.' },
+      { note: 'Cannot compute verification — Phase 6 result is unknown for this run.' },
     );
     phase6GrantOk = false;
     return;
   }
   const grantsAfter = grantsAfterResult.count;
-  const newGrants = grantsAfter - grantsBefore;
-  phase6GrantOk = newGrants > 0;
+  // UAL-scoped path: existence is the verification — `count > 0` means
+  // this exact KC has a grant for the allowed peer. No subtraction
+  // against `grantsBefore` (which was the pre-capture count for the
+  // peer across the whole CG; not directly comparable).
+  // Unscoped fallback: same delta logic as before.
+  const newGrants = phase6Ual ? grantsAfter : grantsAfter - grantsBefore;
+  phase6GrantOk = phase6Ual ? grantsAfter > 0 : newGrants > 0;
   const verify = grantsAfterResult.query;
-  const interpretationFooter =
-    `Verification is delta-based (before=${grantsBefore}, after=${grantsAfter}, new=${newGrants}). The EPCIS capture status route doesn't expose the resulting UAL, so the SPARQL counts grants for this peer before AND after this capture; only a NEW grant proves THIS run wrote the triple, not an older one already in the meta graph.`;
+  const interpretationFooter = phase6Ual
+    ? `Verification is KC-scoped via the finalized capture's UAL <${phase6Ual}>: ${grantsAfter} matching <kc, allowedPeer> binding(s) in <cg>/_meta. Older grants for the same peer can't satisfy this check; only a triple keyed on THIS UAL counts.`
+    : `Verification is delta-based (before=${grantsBefore}, after=${grantsAfter}, new=${newGrants}). The capture status didn't expose this KC's UAL, so we count grants for the peer before AND after this capture; only a NEW grant proves THIS run wrote the triple. NOTE: a concurrent unrelated capture for the same peer that finalizes during this window would inflate \`after\` and report a false positive — daemons that DO expose UAL get the tighter scoped check above.`;
   emit('phase-6-allowlist-verify', 'Verify allowedPeer triple in <cg>/_meta', verify, {
     preamble:
       'Now we verify the grant is durable. After lift completes, the publisher writes `<kc> dkg:allowedPeer "<peer>"` to the meta graph (`metadata.ts:82,103-106`); the access-handler queries those triples at read time (`access-handler.ts:178-185`). The SPARQL targets the `<cg>/_meta` named graph explicitly — bare patterns only see the default graph, which is empty in V10.',
@@ -1639,23 +1687,33 @@ async function phase7(trace) {
     const privRes = await node2Sparql(privSparql);
     const privQueryOk = querySucceeded(privRes);
     const privCount = privQueryOk ? parseCount(privRes) : 0;
-    privateInvisible = privQueryOk && privCount === 0;
+    // Same baseline-delta shape as Phase 7A: a reused node2 that
+    // already fetched private payloads from an earlier run would have
+    // privCount > 0 even though the CURRENT run leaked nothing. Compute
+    // the delta against the pre-Phase-1 baseline; Phase 7B's claim
+    // ("no auto-replication during this run") is `delta === 0`, not
+    // absolute zero. When no baseline was captured (node2 unreachable
+    // at Phase 0), privBaseline stays 0 and delta degrades to absolute
+    // count.
+    const privBaseline = phase7AnchorBaseline.captured ? phase7AnchorBaseline.private : 0;
+    const privDelta = privCount - privBaseline;
+    privateInvisible = privQueryOk && privDelta === 0;
     if (!JSON_MODE) {
       fmt.step('phase-7b-private-empty-on-node2', 'Private payload absent on node2 (no auto-replication)');
       fmt.preamble(
-        'Same node2, different graph: the private partition. The publisher keeps payload on its own local store; allow-list grants authorize an on-demand `PROTOCOL_ACCESS` fetch from grantees, they do NOT push the data. Until that fetch runs (see 7.C), node2\'s local `<cg>/<sub>/_private` is empty regardless of grant. 0 here proves "no auto-leak", not "non-grantee denial".',
+        'Same node2, different graph: the private partition. The publisher keeps payload on its own local store; allow-list grants authorize an on-demand `PROTOCOL_ACCESS` fetch from grantees, they do NOT push the data. Until that fetch runs (see 7.C), node2\'s local `<cg>/<sub>/_private` is empty regardless of grant. 0 delta here proves "no auto-leak", not "non-grantee denial".',
       );
       fmt.command(privRes.cmdString);
       if (!privQueryOk) {
         fmt.warn(`Phase 7B SPARQL failed (HTTP ${privRes.status}) — auto-replication absence unverified.`);
       } else {
-        fmt.note(`  ${privCount} private triples on node2 in <cg>/${SUB}/_private`);
-        if (privateInvisible) fmt.success('Private partition is empty on node2 — no payload was pushed. ✓');
-        else fmt.warn(`Expected zero private triples on node2 but found ${privCount}. The publisher may be replicating private data unintentionally.`);
+        fmt.note(`  ${privCount} private triples on node2 in <cg>/${SUB}/_private (baseline ${privBaseline}, delta ${privDelta})`);
+        if (privateInvisible) fmt.success('Private partition delta is zero on node2 — no payload was pushed by THIS run. ✓');
+        else fmt.warn(`Expected zero new private triples on node2 but delta is ${privDelta}. The publisher may be replicating private data unintentionally.`);
       }
       await pauseAfter();
     } else {
-      process.stdout.write(`${JSON.stringify({ step: 'phase-7b-private-empty-on-node2', privCount, queryOk: privQueryOk, ok: privateInvisible })}\n`);
+      process.stdout.write(`${JSON.stringify({ step: 'phase-7b-private-empty-on-node2', privCount, privBaseline, privDelta, queryOk: privQueryOk, ok: privateInvisible })}\n`);
     }
 
     // 7.C — Document the missing piece. The KIT-positive case ("granted

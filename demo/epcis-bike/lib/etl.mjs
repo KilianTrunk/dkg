@@ -51,8 +51,17 @@ function parseArgs(argv) {
   return args;
 }
 
+// Encode a value for use as a filename segment. Use percent-encoding so
+// distinct source values (`Paint/QA`, `Paint QA`, `Paint_QA`, `Paint-É`)
+// stay distinct in the resulting filename. The earlier lossy
+// `[^A-Za-z0-9_-] → _` substitution silently collapsed all of those to
+// `Paint_QA` and would let a fresh `BIKE_SOURCE` overwrite one event's
+// document with another's mid-ETL. `encodeURIComponent` outputs `%XX`
+// sequences which are valid in filenames on every major filesystem
+// (macOS HFS+/APFS, Linux ext4/btrfs/xfs, Windows NTFS, ZFS) and survives
+// `Object.fromEntries` / round-trip use cases via `decodeURIComponent`.
 function safeName(processName) {
-  return String(processName ?? 'unknown').replace(/[^A-Za-z0-9_-]/g, '_');
+  return encodeURIComponent(String(processName ?? 'unknown'));
 }
 
 function pad(n, width = 2) {

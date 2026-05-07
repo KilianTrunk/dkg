@@ -283,7 +283,45 @@ async function cmdJoin(args: string[]): Promise<number> {
     return 1;
   }
 
-  // ── 2. Subscribe (optional — skip with --no-subscribe if already subscribed) ──
+  // ── 2a. Dial the curator (V10 peerId via DHT, or legacy multiaddr) ──
+  //
+  // The /api/context-graph/subscribe route does NOT consume peer-connection
+  // hints — it only schedules a catchup job over whatever peers happen to
+  // already be connected. So if the joiner has no connection to the curator
+  // when we hit subscribe, the catchup can't reach them. Codex review on
+  // PR #431 flagged that mcp-dkg was parsing peerId invites and then
+  // silently dropping them on the floor here. Wire an explicit /api/connect
+  // call before subscribe so the catchup has a fresh edge to the curator
+  // by the time it runs.
+  //
+  // Soft-fail: if the dial fails (DHT slow, curator offline, transient
+  // transport), keep going. subscribe + catchup may still succeed via
+  // cached / gossipped connections, and the user can re-run join later.
+  if (invite.curatorPeerId) {
+    console.log(`[join] dialing curator via DHT (peer id ${invite.curatorPeerId})...`);
+    try {
+      await (client as any).request('POST', '/api/connect', {
+        peerId: invite.curatorPeerId,
+      });
+      console.log('[join]   connected.');
+    } catch (err) {
+      const msg = (err as Error).message;
+      console.warn(`[join]   could not dial curator (continuing): ${msg.slice(0, 200)}`);
+    }
+  } else if (invite.multiaddr) {
+    console.log(`[join] dialing curator via legacy multiaddr...`);
+    try {
+      await (client as any).request('POST', '/api/connect', {
+        multiaddr: invite.multiaddr,
+      });
+      console.log('[join]   connected.');
+    } catch (err) {
+      const msg = (err as Error).message;
+      console.warn(`[join]   could not dial curator (continuing): ${msg.slice(0, 200)}`);
+    }
+  }
+
+  // ── 2b. Subscribe (optional — skip with --no-subscribe if already subscribed) ──
   if (!opts.noSubscribe) {
     console.log(`[join] subscribing to ${invite.contextGraphId}...`);
     try {
@@ -292,7 +330,6 @@ async function cmdJoin(args: string[]): Promise<number> {
       // since the manifest itself is the source of truth for what to install.
       await (client as any).request('POST', '/api/context-graph/subscribe', {
         contextGraphId: invite.contextGraphId,
-        ...(invite.multiaddr ? { multiaddr: invite.multiaddr } : {}),
       });
       console.log('[join] subscribe call accepted; waiting for catchup...');
       // Short poll for catchup; the manifest may take a few seconds to land.

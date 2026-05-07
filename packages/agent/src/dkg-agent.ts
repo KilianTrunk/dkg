@@ -3080,10 +3080,23 @@ export class DKGAgent {
    * the legacy multiaddr-in-invite design).
    *
    * Errors:
-   *   - `PEER_NOT_FOUND` — DHT walked but produced no providers for the id.
-   *   - `DIAL_FAILED` — DHT returned multiaddrs but every dial attempt failed.
-   * The HTTP layer surfaces these as 404 / 502 with a stable `error` code so
-   * the UI can render targeted copy ("curator is offline" vs "wrong peer id").
+   *   - `INVALID_PEER_ID` — client-side parse failure (HTTP 400).
+   *   - `SELF_DIAL` — caller asked us to dial our own peer id (HTTP 400).
+   *   - `PEER_NOT_FOUND` — DHT walk completed cleanly but no record exists
+   *     for the id (libp2p `NotFoundError` or empty multiaddr set). Genuine
+   *     negative lookup → HTTP 404. Retrying is unlikely to help until the
+   *     remote node republishes.
+   *   - `DHT_TIMEOUT` — `peerRouting.findPeer` aborted before completing
+   *     the Kademlia walk (slow network, sparse routing table). Retriable
+   *     → HTTP 504.
+   *   - `DHT_UNAVAILABLE` — peerRouting threw a non-NotFound error before
+   *     the walk could resolve (transport failure, bootstrap unreachable).
+   *     Retriable → HTTP 503.
+   *   - `DIAL_FAILED` — DHT returned multiaddrs but every dial attempt
+   *     failed. Retriable transport-level → HTTP 502.
+   * Distinguishing PEER_NOT_FOUND from the retriable variants matters for
+   * UI copy: a 404 means "wrong peer id" (don't retry, ask the curator),
+   * a 503/504 means "the network is sick" (retry in a moment).
    */
   async connectToPeerId(peerIdStr: string, options?: { timeoutMs?: number }): Promise<void> {
     const ctx = createOperationContext('connect');
@@ -3128,14 +3141,48 @@ export class DKGAgent {
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err: any) {
-      const error = new Error(`PEER_NOT_FOUND: ${err?.message ?? String(err)}`);
-      (error as any).code = 'PEER_NOT_FOUND';
+      // Distinguish three failure modes so the HTTP layer can map them to
+      // different status codes and the UI can render specific copy:
+      //   - timeout / abort  → DHT_TIMEOUT (504, retriable)
+      //   - genuine NotFound → PEER_NOT_FOUND (404, terminal until republish)
+      //   - anything else    → DHT_UNAVAILABLE (503, retriable transport)
+      // Codex review on PR #431 flagged that collapsing all of these into
+      // PEER_NOT_FOUND made transient DHT issues look like "wrong peer id".
+      const name = err?.name as string | undefined;
+      const errCode = err?.code as string | undefined;
+      const isAbort =
+        name === 'AbortError' ||
+        errCode === 'ABORT_ERR' ||
+        errCode === 'ERR_TIMEOUT' ||
+        /timed?\s*out|aborted/i.test(err?.message ?? '');
+      const isNotFound =
+        name === 'NotFoundError' ||
+        errCode === 'ERR_NOT_FOUND' ||
+        errCode === 'NotFoundError';
+
+      let code: string;
+      let prefix: string;
+      if (isAbort) {
+        code = 'DHT_TIMEOUT';
+        prefix = `DHT_TIMEOUT: peerRouting.findPeer aborted after ${timeoutMs}ms`;
+      } else if (isNotFound) {
+        code = 'PEER_NOT_FOUND';
+        prefix = `PEER_NOT_FOUND: DHT walk completed without locating ${peerIdStr}`;
+      } else {
+        code = 'DHT_UNAVAILABLE';
+        prefix = `DHT_UNAVAILABLE: ${err?.message ?? String(err)}`;
+      }
+      const error = new Error(prefix);
+      (error as any).code = code;
       throw error;
     }
 
     const addrs = (info?.multiaddrs ?? []).map((m: any) => m?.toString?.() ?? String(m)).filter(Boolean);
     if (addrs.length === 0) {
-      const error = new Error('PEER_NOT_FOUND: DHT returned no addresses');
+      // The walk completed and the DHT gave us a record with no usable
+      // multiaddrs. Practically equivalent to NotFound from a dialer's
+      // perspective.
+      const error = new Error(`PEER_NOT_FOUND: DHT returned a record for ${peerIdStr} with no addresses`);
       (error as any).code = 'PEER_NOT_FOUND';
       throw error;
     }

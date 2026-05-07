@@ -24,12 +24,34 @@ describe('JoinProjectModal invite parsing', () => {
       expect(parsed.cgId).toBe('open-project');
       expect(parsed.curatorPeerId).toBeNull();
       expect(parsed.legacyMultiaddr).toBeNull();
+      expect(parsed.hasUnparsedExtra).toBe(false);
       expect(validateInvite(parsed)).toBeNull();
     });
 
     it('validates a peer-id invite as ok', () => {
       const parsed = parseInviteCode('my-project\n12D3KooWQz2bQbQueABKRSjV9koF8VYsXk5TdCsUmPf5zAEZg3q6');
+      expect(parsed.hasUnparsedExtra).toBe(false);
       expect(validateInvite(parsed)).toBeNull();
+    });
+
+    // Regression for Codex review on PR #431 (Issue 3): a typo'd peer id
+    // on the second line used to be silently dropped, so the user fell
+    // into the bare-cgId flow without an immediate input error.
+    it('rejects invite whose second line is neither a peer id nor a multiaddr', () => {
+      const parsed = parseInviteCode('my-project\n12D3KooBAD');
+      expect(parsed.cgId).toBe('my-project');
+      expect(parsed.curatorPeerId).toBeNull();
+      expect(parsed.legacyMultiaddr).toBeNull();
+      expect(parsed.hasUnparsedExtra).toBe(true);
+      const err = validateInvite(parsed);
+      expect(err).not.toBeNull();
+      expect(err).toContain('not a valid peer ID');
+    });
+
+    it('rejects invite with garbage trailing content', () => {
+      const parsed = parseInviteCode('my-project\nthis is just some random text');
+      expect(parsed.hasUnparsedExtra).toBe(true);
+      expect(validateInvite(parsed)).not.toBeNull();
     });
   });
 

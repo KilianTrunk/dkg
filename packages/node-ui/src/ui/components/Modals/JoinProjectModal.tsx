@@ -28,6 +28,15 @@ export interface ParsedInvite {
    * a console.warn deprecation notice fires when the joiner falls back to it.
    */
   legacyMultiaddr: string | null;
+  /**
+   * True when the invite carried content beyond the cgId line that neither
+   * parser (peer id / multiaddr) recognized. `validateInvite` uses this to
+   * reject silent-fallback behaviour where a typo'd peer id like
+   * `12D3KooBAD` would otherwise be discarded and the user dropped into the
+   * bare-cgId flow without an immediate input error. Codex review on
+   * PR #431 flagged this as Issue (yellow).
+   */
+  hasUnparsedExtra: boolean;
 }
 
 const PEER_ID_RE = /^(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|12D3Koo[1-9A-HJ-NP-Za-km-z]{45,53})$/;
@@ -65,11 +74,22 @@ export function parseInviteCode(raw: string): ParsedInvite {
     ? firstLine.replace(inlineMultiaddr, '').trim()
     : firstLine;
 
-  return { cgId, curatorPeerId, legacyMultiaddr };
+  // Detect content past the cgId line that neither parser claimed. The
+  // remainder lines combined yield non-empty text, but no peer-id and no
+  // multiaddr was extracted from it. This is almost certainly a typo'd
+  // invite that we should reject loudly rather than silently truncating.
+  const hadExtraContent = lines.length > 1 || remainder.length > 0;
+  const hasUnparsedExtra =
+    hadExtraContent && curatorPeerId === null && legacyMultiaddr === null;
+
+  return { cgId, curatorPeerId, legacyMultiaddr, hasUnparsedExtra };
 }
 
 export function validateInvite(invite: ParsedInvite): string | null {
   if (!invite.cgId) return 'Missing project ID';
+  if (invite.hasUnparsedExtra) {
+    return 'Invite contains a second line that is not a valid peer ID (12D3Koo…) or multiaddr (/ip4/…). Check for typos.';
+  }
   if (invite.legacyMultiaddr) {
     if (!invite.legacyMultiaddr.startsWith('/')) return 'Invalid curator multiaddr';
     if (!invite.legacyMultiaddr.includes('/p2p/')) return 'Curator multiaddr is missing peer ID';

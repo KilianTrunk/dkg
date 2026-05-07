@@ -619,10 +619,33 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
       }
     } catch (err: any) {
       const code = err?.code as string | undefined;
-      const status = code === 'PEER_NOT_FOUND' ? 404
-        : code === 'INVALID_PEER_ID' || code === 'SELF_DIAL' ? 400
-        : code === 'DIAL_FAILED' ? 502
-        : 400;
+      // Map agent-side error codes to HTTP semantics so the UI can
+      // distinguish "wrong peer id" (don't retry) from "network is sick"
+      // (retry in a moment). Codex review on PR #431 flagged that the
+      // earlier blanket-404 mapping made every transient DHT issue look
+      // like an input error.
+      let status: number;
+      switch (code) {
+        case 'INVALID_PEER_ID':
+        case 'SELF_DIAL':
+          status = 400; // client error, retrying with same input won't help
+          break;
+        case 'PEER_NOT_FOUND':
+          status = 404; // genuine negative lookup
+          break;
+        case 'DHT_TIMEOUT':
+          status = 504; // retriable: walk didn't complete in time
+          break;
+        case 'DHT_UNAVAILABLE':
+        case 'PEER_ROUTING_UNAVAILABLE':
+          status = 503; // retriable: routing layer can't help right now
+          break;
+        case 'DIAL_FAILED':
+          status = 502; // retriable: addrs known but transport failed
+          break;
+        default:
+          status = 400;
+      }
       return jsonResponse(res, status, {
         error: err.message ?? "Failed to connect",
         ...(code ? { code } : {}),

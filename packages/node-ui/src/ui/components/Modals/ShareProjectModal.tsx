@@ -26,10 +26,36 @@ function truncAddr(addr: string): string {
 }
 
 /**
+ * Reject DNS hostnames that no remote peer could resolve to a public
+ * address: `localhost`, mDNS `.local`, RFC 6761 reserved TLDs (`.test`,
+ * `.example`, `.invalid`, `.localhost`), `.localdomain`, IPv4/IPv6
+ * literals embedded in the DNS field, and single-label hostnames
+ * (which usually only resolve via a corporate DNS suffix).
+ *
+ * Codex review on PR #431 (round 3) flagged that the previous heuristic
+ * blanket-accepted every dns multiaddr, so a freshly-started node
+ * announcing /dns/localhost/tcp/9090/p2p/xxx would pass the invite gate
+ * and produce a guaranteed-broken invite.
+ */
+export function isLocalOrInternalHostname(host: string): boolean {
+  if (typeof host !== 'string' || host.length === 0) return true;
+  const h = host.toLowerCase();
+  if (h === 'localhost') return true;
+  if (h.endsWith('.local') || h.endsWith('.localhost')) return true;
+  if (h.endsWith('.test') || h.endsWith('.example')) return true;
+  if (h.endsWith('.invalid') || h.endsWith('.localdomain')) return true;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h)) return true;
+  if (/^\[?[0-9a-f:]+\]?$/.test(h) && h.includes(':')) return true;
+  if (!h.includes('.')) return true;
+  return false;
+}
+
+/**
  * Cheap heuristic: would a remote dialer have ANY chance of reaching us
  * via this multiaddr? A remote-dialable address is one of:
  *   • `/p2p-circuit/...` — relay reservation, dialable through the relay.
- *   • `/dns(4|6|addr)/...` — domain-based, presumed public.
+ *   • `/dns(4|6|addr)/<host>/...` — domain-based, host is a publicly
+ *     resolvable FQDN (NOT `localhost`, `*.local`, `*.test`, etc.).
  *   • `/ip4/<public>/...` — non-RFC1918, non-loopback, non-CGNAT.
  *   • `/ip6/<global-unicast>/...` — not loopback, not link-local, not ULA.
  * Conservative: anything we can't classify counts as NOT dialable, so the
@@ -37,11 +63,16 @@ function truncAddr(addr: string): string {
  * invite. The joiner's DHT walk would surface the same negative answer
  * eventually, but we'd rather fail fast on the curator side than make the
  * joiner sit through a 90s catchup deadline.
+ *
+ * KEEP IN SYNC with `isPublicLikeAddress` in
+ * `packages/core/src/node.ts` — the daemon uses the same predicate to
+ * decide when to log "Node is remotely-dialable".
  */
 export function isMultiaddrRemotelyDialable(addr: string): boolean {
   if (typeof addr !== 'string' || addr.length === 0) return false;
   if (addr.includes('/p2p-circuit/')) return true;
-  if (/^\/(?:dns|dns4|dns6|dnsaddr)\//.test(addr)) return true;
+  const dnsMatch = addr.match(/^\/(?:dns|dns4|dns6|dnsaddr)\/([^/]+)\//);
+  if (dnsMatch) return !isLocalOrInternalHostname(dnsMatch[1]);
 
   const ipv4 = addr.match(/^\/ip4\/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\//);
   if (ipv4) {
@@ -386,11 +417,13 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
                     border: '1px solid rgba(245, 158, 11, 0.3)',
                     color: 'var(--accent-amber, #f59e0b)',
                   }}>
-                    <strong>Invite not ready yet.</strong> Your node has no remotely-dialable
-                    address yet — it hasn't established a circuit-relay reservation or a public
-                    interface. Wait a few seconds for AutoRelay to negotiate, then re-open this
-                    modal. Sharing the invite now would produce a peer record that joiners
-                    cannot reach.
+                    <strong>Peer-id invite not ready yet.</strong> Your node has no
+                    remotely-dialable address yet (no circuit-relay reservation, no public
+                    interface). The invite below is the bare project ID — joiners can subscribe
+                    if the project is <em>open</em>, but for <em>curated</em> projects they need
+                    to dial this node directly to send a join request, which won't work until
+                    AutoRelay negotiates a reservation. Re-open this modal in a few seconds to
+                    pick up the peer-id-enhanced form.
                   </div>
                 )}
                 <div style={{ position: 'relative' }}>
@@ -399,31 +432,43 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
                     borderRadius: 6, padding: '10px 12px', fontSize: 11, lineHeight: 1.6,
                     fontFamily: 'var(--font-mono)', color: 'var(--text-primary)',
                     overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-                    opacity: inviteReady ? 1 : 0.55,
                   }}>
                     {invitePayload}
                   </pre>
                   <button
                     className="v10-modal-btn primary"
                     onClick={() => copyToClipboard(invitePayload, 'invite')}
-                    disabled={!inviteReady}
                     style={{
                       position: 'absolute', top: 6, right: 6, fontSize: 10, padding: '4px 10px', height: 26,
-                      cursor: inviteReady ? 'pointer' : 'not-allowed',
+                      cursor: 'pointer',
                     }}
-                    title={inviteReady ? undefined : 'Waiting for circuit-relay reservation'}
+                    title={inviteReady ? undefined : 'Bare project ID (works for open projects). Wait for AutoRelay to upgrade to a peer-id invite for curated projects.'}
                   >
-                    {copied === 'invite' ? 'Copied' : 'Copy Invite'}
+                    {copied === 'invite' ? 'Copied' : (inviteReady ? 'Copy Invite' : 'Copy Project ID')}
                   </button>
                 </div>
                 <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginTop: 4 }}>
                   Share this with collaborators. They paste it into <strong>Join Project</strong> on their node.
-                  Their daemon dials your node by peer id over the libp2p DHT, so the invite stays
-                  valid even if your relay or public IP changes.
-                  {allowedAgents.length > 0 ? (
-                    <> The invitee must have their agent address on the allowlist, or they can submit a signed join request for your approval.</>
+                  {inviteReady ? (
+                    <>
+                      {' '}Their daemon dials your node by peer id over the libp2p DHT, so the
+                      invite stays valid even if your relay or public IP changes.
+                      {allowedAgents.length > 0 ? (
+                        <> The invitee must have their agent address on the allowlist, or they can submit a signed join request for your approval.</>
+                      ) : (
+                        <> Since no allowlist is set, anyone with this code can join.</>
+                      )}
+                    </>
                   ) : (
-                    <> Since no allowlist is set, anyone with this code can join.</>
+                    <>
+                      {' '}This is the bare project ID — sufficient for <em>open</em> projects
+                      (joiners discover via gossip without dialing your node).
+                      {allowedAgents.length > 0 ? (
+                        <> Because this project has an allowlist, joiners would also need to dial your node to submit a signed join request — that path won't work until AutoRelay negotiates a circuit-relay reservation. Re-open this modal then to copy the peer-id-enhanced form.</>
+                      ) : (
+                        <> For curated projects, re-open this modal once AutoRelay has negotiated to copy the peer-id-enhanced form.</>
+                      )}
+                    </>
                   )}
                 </div>
               </div>

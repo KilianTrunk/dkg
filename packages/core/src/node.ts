@@ -54,12 +54,26 @@ interface RelayTarget {
  * Circuit-relay addresses are checked separately by callers because the
  * "peer record is dialable" signal merges both classes.
  */
-function isPublicLikeAddress(addr: string): boolean {
-  if (/^\/(?:dns|dns4|dns6|dnsaddr)\//.test(addr)) return true;
+export function isLocalOrInternalHostname(host: string): boolean {
+  if (typeof host !== 'string' || host.length === 0) return true;
+  const h = host.toLowerCase();
+  if (h === 'localhost') return true;
+  if (h.endsWith('.local') || h.endsWith('.localhost')) return true;
+  if (h.endsWith('.test') || h.endsWith('.example')) return true;
+  if (h.endsWith('.invalid') || h.endsWith('.localdomain')) return true;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h)) return true;
+  if (/^\[?[0-9a-f:]+\]?$/.test(h) && h.includes(':')) return true;
+  if (!h.includes('.')) return true;
+  return false;
+}
+
+export function isPublicLikeAddress(addr: string): boolean {
+  const dnsMatch = addr.match(/^\/(?:dns|dns4|dns6|dnsaddr)\/([^/]+)\//);
+  if (dnsMatch) return !isLocalOrInternalHostname(dnsMatch[1]);
   const ipv4 = addr.match(/^\/ip4\/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\//);
   if (ipv4) {
     const o = ipv4[1].split('.').map(Number);
-    if (o.some((n) => Number.isNaN(n))) return false;
+    if (o.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
     if (o[0] === 0 || o[0] === 127) return false;
     if (o[0] === 10) return false;
     if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return false;

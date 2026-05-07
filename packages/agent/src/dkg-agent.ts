@@ -2631,14 +2631,29 @@ export class DKGAgent {
 
     // Populate `contextGraphsServed` so peers can discover which CGs this
     // node hosts via the public agent profile, but ONLY include CGs whose
-    // accessPolicy is open. `isPrivateContextGraph` is the same predicate
-    // the responder consults to gate sync requests, so the discovery layer
-    // and the data-plane access control stay consistent. System CGs
-    // (`agents`, `ontology`) are excluded — they are universal and don't
-    // need to be re-advertised in every profile.
+    // accessPolicy is open AND we are actively serving (subscribed=true).
+    //
+    // `isPrivateContextGraph` is the same predicate the responder consults
+    // to gate sync requests, so the discovery layer and the data-plane
+    // access control stay consistent.
+    //
+    // The `subscribed === true` filter is what Codex review on PR #431
+    // (round 3) flagged. `discoverContextGraphsFromStore()` seeds entries
+    // for OPEN CGs we merely learned about with `subscribed: false` (we
+    // don't auto-subscribe public CGs — explicit user opt-in only). Without
+    // this filter, those discovery-only entries would be advertised in
+    // `contextGraphsServed`, so other peers would route join attempts to a
+    // node that doesn't actually host the CG. The curated/private discovery
+    // path immediately calls `subscribeToContextGraph()` (which flips
+    // `subscribed: true`) before adding to the gossip mesh, so this filter
+    // does not regress invited-curated discovery.
+    //
+    // System CGs (`agents`, `ontology`) are excluded — they are universal
+    // and don't need to be re-advertised in every profile.
     const publicServed: string[] = [];
-    for (const id of this.subscribedContextGraphs.keys()) {
+    for (const [id, sub] of this.subscribedContextGraphs) {
       if (id === SYSTEM_PARANETS.AGENTS || id === SYSTEM_PARANETS.ONTOLOGY) continue;
+      if (!sub.subscribed) continue;
       if (await this.isPrivateContextGraph(id)) continue;
       publicServed.push(id);
     }

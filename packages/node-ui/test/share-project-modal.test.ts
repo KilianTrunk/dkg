@@ -15,9 +15,9 @@ describe('isMultiaddrRemotelyDialable', () => {
     it('accepts public IPv4 + tcp', () => {
       expect(isMultiaddrRemotelyDialable('/ip4/178.156.252.147/tcp/9090/p2p/12D3Koo...')).toBe(true);
     });
-    it('accepts dns / dns4 / dnsaddr', () => {
+    it('accepts dns / dns4 / dnsaddr with a public-looking host', () => {
       expect(isMultiaddrRemotelyDialable('/dns4/relay.example.com/tcp/443/p2p/12D3Koo...')).toBe(true);
-      expect(isMultiaddrRemotelyDialable('/dnsaddr/example.com/p2p/12D3Koo...')).toBe(true);
+      expect(isMultiaddrRemotelyDialable('/dnsaddr/relay.origintrail.network/p2p/12D3Koo...')).toBe(true);
     });
     it('accepts global-unicast IPv6', () => {
       expect(isMultiaddrRemotelyDialable('/ip6/2a01:4ff:f4:843b::1/tcp/9090/p2p/12D3Koo...')).toBe(true);
@@ -38,6 +38,14 @@ describe('isMultiaddrRemotelyDialable', () => {
       expect(isMultiaddrRemotelyDialable('/ip4/169.254.1.5/tcp/9090/p2p/12D3Koo...')).toBe(false);
       expect(isMultiaddrRemotelyDialable('/ip4/100.105.212.110/tcp/57550/p2p/12D3Koo...')).toBe(false);
     });
+    // Mirror of the core test in `packages/core/test/address-classifier.test.ts`.
+    // Codex flagged on PR #434 (round 2) that the core copy was accepting
+    // out-of-range octets while this copy already rejected them — a real drift.
+    it('rejects out-of-range IPv4 octets', () => {
+      expect(isMultiaddrRemotelyDialable('/ip4/999.1.1.1/tcp/9090/p2p/12D3Koo...')).toBe(false);
+      expect(isMultiaddrRemotelyDialable('/ip4/256.0.0.1/tcp/9090/p2p/12D3Koo...')).toBe(false);
+      expect(isMultiaddrRemotelyDialable('/ip4/-1.2.3.4/tcp/9090/p2p/12D3Koo...')).toBe(false);
+    });
     it('rejects loopback + link-local + ULA IPv6', () => {
       expect(isMultiaddrRemotelyDialable('/ip6/::1/tcp/9090/p2p/12D3Koo...')).toBe(false);
       expect(isMultiaddrRemotelyDialable('/ip6/fe80::1/tcp/9090/p2p/12D3Koo...')).toBe(false);
@@ -46,6 +54,31 @@ describe('isMultiaddrRemotelyDialable', () => {
     it('rejects garbage / empty', () => {
       expect(isMultiaddrRemotelyDialable('')).toBe(false);
       expect(isMultiaddrRemotelyDialable('not-a-multiaddr')).toBe(false);
+    });
+
+    // Codex review on the post-merge diff of PR #431 (round 3) flagged
+    // that the previous `dns*` path was a blanket-accept. Tighten the gate
+    // so common local/internal hostnames don't slip through.
+    describe('rejects local/internal hostnames behind /dns*/', () => {
+      it('rejects literal localhost', () => {
+        expect(isMultiaddrRemotelyDialable('/dns/localhost/tcp/9090/p2p/12D3Koo...')).toBe(false);
+        expect(isMultiaddrRemotelyDialable('/dns4/localhost/tcp/9090/p2p/12D3Koo...')).toBe(false);
+      });
+      it('rejects mDNS .local', () => {
+        expect(isMultiaddrRemotelyDialable('/dns/raspberrypi.local/tcp/9090/p2p/12D3Koo...')).toBe(false);
+      });
+      it('rejects RFC 6761 reserved TLDs (.test, .example, .invalid, .localhost)', () => {
+        expect(isMultiaddrRemotelyDialable('/dns/foo.test/tcp/9090/p2p/12D3Koo...')).toBe(false);
+        expect(isMultiaddrRemotelyDialable('/dns/host.example/tcp/9090/p2p/12D3Koo...')).toBe(false);
+        expect(isMultiaddrRemotelyDialable('/dns/x.invalid/tcp/9090/p2p/12D3Koo...')).toBe(false);
+        expect(isMultiaddrRemotelyDialable('/dns/y.localhost/tcp/9090/p2p/12D3Koo...')).toBe(false);
+      });
+      it('rejects IP literals embedded in /dns*/', () => {
+        expect(isMultiaddrRemotelyDialable('/dns/127.0.0.1/tcp/9090/p2p/12D3Koo...')).toBe(false);
+      });
+      it('rejects single-label hostnames (no dot)', () => {
+        expect(isMultiaddrRemotelyDialable('/dns/internal-relay/tcp/9090/p2p/12D3Koo...')).toBe(false);
+      });
     });
   });
 });

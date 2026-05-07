@@ -476,7 +476,11 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     // registered later via POST /api/context-graph/register.
     if (register === true) {
       try {
-        const regResult = await agent.registerContextGraph(id, { callerAgentAddress: requestAgentAddress });
+        const regResult = await agent.registerContextGraph(id, {
+          callerAgentAddress: requestAgentAddress,
+          accessPolicy: typeof accessPolicy === 'number' ? accessPolicy : undefined,
+          publishPolicy: typeof publishPolicy === 'number' ? publishPolicy : undefined,
+        });
         return jsonResponse(res, 200, {
           created: id,
           uri: `did:dkg:context-graph:${id}`,
@@ -502,15 +506,18 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
-    const { id, accessPolicy } = parsed;
+    const { id, accessPolicy, publishPolicy } = parsed;
     if (!id) return jsonResponse(res, 400, { error: 'Missing "id"' });
     if (typeof id !== 'string') return jsonResponse(res, 400, { error: '"id" must be a string' });
     if (!isValidContextGraphId(id)) return jsonResponse(res, 400, { error: 'Invalid context graph id' });
     if (accessPolicy !== undefined && (accessPolicy !== 0 && accessPolicy !== 1)) {
       return jsonResponse(res, 400, { error: '"accessPolicy" must be 0 (open) or 1 (private)' });
     }
+    if (publishPolicy !== undefined && (publishPolicy !== 0 && publishPolicy !== 1)) {
+      return jsonResponse(res, 400, { error: '"publishPolicy" must be 0 (curated) or 1 (open)' });
+    }
     try {
-      const result = await agent.registerContextGraph(id, { accessPolicy, callerAgentAddress: requestAgentAddress });
+      const result = await agent.registerContextGraph(id, { accessPolicy, publishPolicy, callerAgentAddress: requestAgentAddress });
       return jsonResponse(res, 200, {
         registered: id,
         onChainId: result.onChainId,

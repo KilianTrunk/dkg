@@ -522,6 +522,7 @@ export class ApiClient {
     /** @deprecated V10 ContextGraphs registration ignores metadata reveal. */
     revealOnChain?: boolean;
     accessPolicy?: number;
+    publishPolicy?: number;
   }): Promise<{
     registered: string;
     onChainId: string;
@@ -530,6 +531,7 @@ export class ApiClient {
     return this.post('/api/context-graph/register', {
       id,
       ...(opts?.accessPolicy != null ? { accessPolicy: opts.accessPolicy } : {}),
+      ...(opts?.publishPolicy != null ? { publishPolicy: opts.publishPolicy } : {}),
     });
   }
 

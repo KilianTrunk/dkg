@@ -2280,16 +2280,32 @@ decisions: []
     await agent.inviteAgentToContextGraph('register-agent-allowlist-policy', allowedAgent, ownerAgent);
     await agent.registerContextGraph('register-agent-allowlist-policy', { callerAgentAddress: ownerAgent });
 
+    await agent.createContextGraph({
+      id: 'register-public-curated-publish-policy',
+      name: 'Public Curated Publish Policy',
+      callerAgentAddress: ownerAgent,
+    });
+    await agent.registerContextGraph('register-public-curated-publish-policy', {
+      callerAgentAddress: ownerAgent,
+      publishPolicy: 0,
+    });
+
     expect(chain.createOnChainContextGraphCalls[0]).toMatchObject({
+      accessPolicy: 0,
       publishPolicy: 1,
       participantAgents: [],
     });
+    expect(chain.createOnChainContextGraphCalls[1]?.accessPolicy).toBe(1);
     expect(chain.createOnChainContextGraphCalls[1]?.publishPolicy).toBe(0);
     expect(chain.createOnChainContextGraphCalls[1]?.publishAuthority).toBe(ethers.getAddress(chain.signerAddress));
     expect(chain.createOnChainContextGraphCalls[1]?.participantAgents).toContain(allowedAgent);
+    expect(chain.createOnChainContextGraphCalls[2]?.accessPolicy).toBe(1);
     expect(chain.createOnChainContextGraphCalls[2]?.publishPolicy).toBe(0);
     expect(chain.createOnChainContextGraphCalls[2]?.publishAuthority).toBe(ethers.getAddress(chain.signerAddress));
     expect(chain.createOnChainContextGraphCalls[2]?.participantAgents).toEqual([]);
+    expect(chain.createOnChainContextGraphCalls[3]?.accessPolicy).toBe(0);
+    expect(chain.createOnChainContextGraphCalls[3]?.publishPolicy).toBe(0);
+    expect(chain.createOnChainContextGraphCalls[3]?.publishAuthority).toBe(ethers.getAddress(chain.signerAddress));
 
     await agent.stop().catch(() => {});
   });

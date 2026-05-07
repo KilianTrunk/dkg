@@ -8,6 +8,7 @@ export type OnContextGraphCreated = (info: {
   contextGraphId: string;
   creator: string;
   accessPolicy: number;
+  publishPolicy?: number;
   blockNumber: number;
 }) => Promise<void>;
 
@@ -264,15 +265,16 @@ export class ChainEventPoller {
     if (!this.onContextGraphCreated) return;
     const { data } = event;
     const contextGraphId = String(data['contextGraphId'] ?? '');
-    const creator = String(data['creator'] ?? data['manager'] ?? '');
+    const creator = String(data['creator'] ?? data['owner'] ?? data['manager'] ?? '');
     const accessPolicy = Number(data['accessPolicy'] ?? 0);
+    const publishPolicy = data['publishPolicy'] == null ? undefined : Number(data['publishPolicy']);
 
     this.log.info(ctx,
       `Chain event: ContextGraphCreated block=${event.blockNumber} id=${contextGraphId.slice(0, 16)}… creator=${creator.slice(0, 10)}…`,
     );
 
     try {
-      await this.onContextGraphCreated({ contextGraphId, creator, accessPolicy, blockNumber: event.blockNumber });
+      await this.onContextGraphCreated({ contextGraphId, creator, accessPolicy, publishPolicy, blockNumber: event.blockNumber });
     } catch (err) {
       this.log.warn(ctx, `onContextGraphCreated callback failed: ${err instanceof Error ? err.message : String(err)}`);
     }

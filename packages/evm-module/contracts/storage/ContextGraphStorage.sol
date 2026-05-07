@@ -96,6 +96,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         address[] participantAgents,
         uint8 requiredSignatures,
         uint256 metadataBatchId,
+        uint8 accessPolicy,
         uint8 publishPolicy,
         address publishAuthority,
         uint256 publishAuthorityAccountId
@@ -166,6 +167,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
      * @param participantAgents            EOA allow-list (no zeros, no duplicates).
      * @param requiredSignatures           ACK quorum, must be in (0, hostingNodes.length].
      * @param metadataBatchId              Batch ID describing the CG metadata (0 if none).
+     * @param accessPolicy                 0 = public/discoverable, 1 = private/curated.
      * @param publishPolicy                0 = curated, 1 = open.
      * @param publishAuthority             Curator address. Required when curated; ignored
      *                                     (and forced to address(0)) when open.
@@ -178,6 +180,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         address[] calldata participantAgents,
         uint8 requiredSignatures,
         uint256 metadataBatchId,
+        uint8 accessPolicy,
         uint8 publishPolicy,
         address publishAuthority,
         uint256 publishAuthorityAccountId
@@ -196,6 +199,9 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         }
         if (requiredSignatures == 0 || requiredSignatures > hostingNodes.length) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid M/N threshold");
+        }
+        if (accessPolicy > 1) {
+            revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid accessPolicy");
         }
         if (publishPolicy > 1) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid publishPolicy");
@@ -233,6 +239,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         cg.metadataBatchId = metadataBatchId;
         cg.active = true;
         cg.createdAt = uint40(block.timestamp);
+        cg.accessPolicy = accessPolicy;
         cg.publishPolicy = publishPolicy;
         cg.publishAuthority = normalizedAuthority;
 
@@ -268,6 +275,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
             participantAgents,
             requiredSignatures,
             metadataBatchId,
+            accessPolicy,
             publishPolicy,
             normalizedAuthority,
             normalizedAccountId
@@ -561,6 +569,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         uint256 metadataBatchId,
         bool active,
         uint256 createdAt,
+        uint8 accessPolicy,
         uint8 publishPolicy,
         address publishAuthority,
         uint256 publishAuthorityAccountId
@@ -575,6 +584,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
             cg.metadataBatchId,
             cg.active,
             cg.createdAt,
+            cg.accessPolicy,
             cg.publishPolicy,
             cg.publishAuthority,
             _publishAuthorityAccountId[contextGraphId]
@@ -638,6 +648,12 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     ) external view returns (uint8 publishPolicy, address publishAuthority) {
         KnowledgeAssetsLib.ContextGraph storage cg = _contextGraphs[contextGraphId];
         return (cg.publishPolicy, cg.publishAuthority);
+    }
+
+    function getAccessPolicy(
+        uint256 contextGraphId
+    ) external view returns (uint8) {
+        return _contextGraphs[contextGraphId].accessPolicy;
     }
 
     function getPublishAuthorityAccountId(

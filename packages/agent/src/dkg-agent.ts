@@ -4606,6 +4606,7 @@ export class DKGAgent {
     /** @deprecated V10 ContextGraphs registration ignores metadata reveal. */
     revealOnChain?: boolean;
     accessPolicy?: number;
+    publishPolicy?: number;
     callerAgentAddress?: string;
   }): Promise<{ onChainId: string; txHash?: string }> {
     const ctx = createOperationContext('system');
@@ -4739,9 +4740,12 @@ export class DKGAgent {
         ? LOCAL_ACCESS_CURATED
         : LOCAL_ACCESS_OPEN;
     }
-    const publishPolicy = resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED
+    if (opts?.publishPolicy !== undefined && opts.publishPolicy !== EVM_PUBLISH_CURATED && opts.publishPolicy !== EVM_PUBLISH_OPEN) {
+      throw new Error('publishPolicy must be 0 (curated) or 1 (open)');
+    }
+    const publishPolicy = opts?.publishPolicy ?? (resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED
       ? EVM_PUBLISH_CURATED
-      : EVM_PUBLISH_OPEN;
+      : EVM_PUBLISH_OPEN);
 
     const participantsResult = await this.store.query(
       `SELECT ?identityId WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId } }`,
@@ -4828,6 +4832,7 @@ export class DKGAgent {
     const result = await this.registerContextGraphOnChain({
       participantIdentityIds: effectiveParticipantIdentityIds,
       requiredSignatures: effectiveRequiredSignatures,
+      accessPolicy: resolvedLocalAccessPolicy,
       publishPolicy,
       ...(publishAuthority ? { publishAuthority } : {}),
       participantAgents,

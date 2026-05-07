@@ -73,7 +73,7 @@ Pick the on-ramp that matches how you're already working:
 
 | You want… | Recipe | More |
 |---|---|---|
-| **DKG V10 as memory for Cursor / Claude Code / Continue / Cline** | [MCP setup](#dkg-v10-as-agent-memory-mcp) | two commands |
+| **DKG V10 as memory for Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline** | [MCP setup](#dkg-v10-as-agent-memory-mcp) | two commands |
 | **DKG V10 wired into an OpenClaw agent** | [OpenClaw setup](#openclaw-adapter) | two commands |
 | **DKG V10 inside an ElizaOS agent** | [ElizaOS adapter](packages/adapter-elizaos/README.md) | adapter README |
 | **DKG V10 inside a Hermes agent** | [Hermes adapter](packages/adapter-hermes/README.md) | adapter README |
@@ -91,64 +91,14 @@ Every on-ramp installs the same `@origintrail-official/dkg` umbrella package, ru
 
 ### DKG V10 as agent memory (MCP)
 
-Two commands give Cursor, Claude Code, Continue, or Cline a verifiable shared memory layer:
+Two commands wire DKG V10 into MCP-aware clients (Cursor, Claude Code, Claude Desktop, Windsurf, VSCode + GitHub Copilot Chat, Cline):
 
 ```bash
-npm install -g @origintrail-official/dkg     # installs CLI + bundled MCP server
-dkg mcp setup                                # one-shot: init + start + fund + register + verify
+npm install -g @origintrail-official/dkg
+dkg mcp setup
 ```
 
-That's it. The first command installs the `dkg` umbrella CLI; the second runs a one-shot bundled flow that:
-
-1. Initializes `~/.dkg/config.json` if it doesn't exist (skipped silently when present)
-2. Starts the DKG daemon as a background process (skipped if already running)
-3. Funds the node's wallets via the testnet faucet (skip with `--no-fund` for CI)
-4. Registers the MCP server with each detected client (Cursor, Claude Code) by writing a single canonical entry under `mcpServers.dkg`:
-
-   ```json
-   {
-     "mcpServers": {
-       "dkg": {
-         "command": "dkg",
-         "args": ["mcp", "serve"]
-       }
-     }
-   }
-   ```
-
-5. Verifies the daemon is healthy
-
-No tokens or URLs in the JSON — those live in `~/.dkg/config.yaml` and the daemon-written `~/.dkg/auth.token`. If no client config is detected, run `dkg mcp setup --print-only` to emit the JSON for manual paste.
-
-**Each step is idempotent and skippable.** Re-running `dkg mcp setup` on an already-set-up box is safe — every step short-circuits when its work is already done. Step-skip flags: `--no-start` (configure only, don't start the daemon), `--no-fund` (skip faucet — CI-friendly), `--no-verify` (skip the post-setup probe), `--dry-run` (preview what would happen), `--force` (refresh every detected client config regardless of state). First-init overrides: `--port <n>`, `--name <s>`.
-
-**First-run verification.** Restart your client so it discovers the MCP, then ask it: *"What tools does dkg expose?"* The `tools/list` response must include at least `dkg_assertion_create`, `dkg_assertion_write`, and `dkg_memory_search`. Then trigger the [round-trip](#round-trip-write-then-recall) below to prove the wiring works end to end.
-
-#### Round-trip: write, then recall
-
-The validated path agents follow when "remember this" actually has to mean *cryptographically anchored, queryable, survives the session*:
-
-1. **Install** — `npm install -g @origintrail-official/dkg`
-2. **Set up** — `dkg mcp setup` (the bundled flow: initializes config, starts the daemon, funds wallets via testnet faucet, registers the MCP with detected clients, verifies daemon health)
-3. **Confirm reachable** — `dkg status` returns a PeerId; `curl -s http://127.0.0.1:9200/health` is `200`
-4. **Restart your client** — Cursor / Claude Code / Continue / Cline picks up the new MCP entry on next launch
-5. **(no manual CG creation)** — `agent-context` is auto-created on first write by the storage layer; the round-trip below assumes it
-6. **Write** — agent calls `dkg_assertion_create` with `name: "session-2026-05-04"`, then `dkg_assertion_write` with one or more quads. Both tools are idempotent / additive — re-runs are safe.
-7. **Recall** — agent calls `dkg_memory_search` with a keyword from the write. The result includes `contextGraphId`, `layer` (`working-memory`, `shared-working-memory`, or `verified-memory`), and a `trustWeight` per hit; higher-trust layers collapse lower-trust hits for the same entity. The just-written triple comes back from the WM layer.
-8. **(Optional) Promote to SWM** — `dkg_assertion_promote` advances the assertion's lifecycle and gossips it to peers subscribed to the same context graph.
-9. **(Optional) Publish to VM** — `dkg_shared_memory_publish` finalizes Shared Working Memory on-chain (costs TRAC + gas, clears SWM). For a one-shot fresh-quads-to-VM helper, use `dkg_publish` instead — it writes to SWM and publishes in a single call but skips the WM staging area.
-
-That round-trip — write → search → optionally promote → optionally finalize — is the canonical pattern across every framework on this page. The MCP tools, OpenClaw adapter, and ElizaOS provider all hit the same daemon endpoints behind the scenes, so memories cross frameworks freely.
-
-#### Troubleshooting (MCP)
-
-- **`dkg mcp setup` says "no MCP-aware clients detected"** → install Cursor, Claude Code, Continue, or Cline (or run with `--print-only` to copy the JSON yourself).
-- **`dkg mcp` says command not found** → the umbrella CLI isn't on PATH; verify with `which dkg`. `npm i -g @origintrail-official/dkg` does NOT propagate transitive bins, so `dkg-mcp` directly is also unavailable — always go through `dkg mcp serve`.
-- **MCP not visible in client** → restart the client; on Cursor verify `~/.cursor/mcp.json` is syntactically valid; on Claude Code run `claude mcp list`.
-- **HTTP 401 from MCP tools** → token mismatch. `dkg auth show` returns the expected value; confirm it matches `~/.dkg/auth.token`. On CI / containers / proxied environments where `dkg init` can't run, set the env-var fallbacks documented at `packages/mcp-dkg/src/config.ts`: `DKG_API` (daemon URL), `DKG_TOKEN` (bearer), `DKG_PROJECT` (default context graph), `DKG_AGENT_URI`. A stale exported `DKG_PROJECT` from a prior session can silently mis-route writes — unset it if you switch projects.
-- **Daemon unreachable** → `dkg status`; if it errors, `dkg logs` and `cat ~/.dkg/daemon.log`. Stale pid → `cat ~/.dkg/daemon.pid` and kill it, then `dkg start` again.
-- **Port 9200 already in use** → another node is running. `dkg stop` once, or override via `dkg init` and pick a different API port.
-- **WSL2: daemon dies when the terminal closes** → wrap in `tmux` or install as a systemd user service. See the [WSL2 section in JOIN_TESTNET.md](docs/setup/JOIN_TESTNET.md) for the systemd unit file.
+`dkg mcp setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and registers MCP entries in each detected client (you confirm per client unless `--yes` is passed). See the [MCP integration guide](packages/mcp-dkg/README.md) for client-by-client paths, mode overrides (`--installed` / `--monorepo`), the manual JSON shape, the contributor monorepo dev workflow, and troubleshooting (including the WSL2 caveat for Windows-side MCP clients).
 
 ### OpenClaw adapter
 
@@ -286,7 +236,7 @@ dkg auth status                          # show whether auth is enabled
 # Framework adapters & MCP wiring
 dkg openclaw setup                       # install & configure the OpenClaw adapter
 dkg hermes setup                         # install & configure the Hermes adapter
-dkg mcp setup                            # register the MCP server with Cursor / Claude Code / Continue / Cline
+dkg mcp setup                            # register the MCP server with Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline
 dkg mcp serve                            # run the MCP server on stdio (invoked by the client; not run manually)
 
 # Community integrations (registry: OriginTrail/dkg-integrations)
@@ -327,7 +277,7 @@ Use adapters for OpenClaw, ElizaOS, Hermes, or your own Node.js / TypeScript pro
 
 | Guide | Use it when |
 |---|---|
-| [DKG V10 as agent memory (MCP)](#dkg-v10-as-agent-memory-mcp) | You want Cursor / Claude Code / Continue / Cline to use DKG as memory |
+| [DKG V10 as agent memory (MCP)](#dkg-v10-as-agent-memory-mcp) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline to use DKG as memory |
 | [`packages/mcp-dkg/README.md`](packages/mcp-dkg/README.md) | You want the full MCP tool surface and config reference |
 | [Join the Testnet](docs/setup/JOIN_TESTNET.md) | You want a full node setup and first publish/query flow |
 | [OpenClaw Setup](docs/setup/SETUP_OPENCLAW.md) | You want OpenClaw to use DKG as memory/tools |

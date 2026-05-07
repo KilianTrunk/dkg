@@ -1814,6 +1814,100 @@ openclawCmd
     }
   });
 
+// ─── dkg mcp ────────────────────────────────────────────────────────
+
+const mcpCmd = program
+  .command('mcp')
+  .description('DKG MCP server for AI coding assistants (Cursor, Claude Code, …)');
+
+mcpCmd
+  .command('serve')
+  .description('Run the DKG MCP server over stdio (invoked by the MCP-aware client)')
+  .allowUnknownOption(true)
+  .allowExcessArguments(true)
+  .action(async (_opts, command) => {
+    // Pass any positional/extra args from the umbrella CLI through to the
+    // MCP server's `main()` so its internal CLI subcommand dispatcher
+    // (`join`, `status`, `help`) keeps working from the umbrella wrapper.
+    const passthrough = command.args ?? [];
+    let main: typeof import('@origintrail-official/dkg-mcp').main;
+    try {
+      ({ main } = await import('@origintrail-official/dkg-mcp'));
+    } catch (err: any) {
+      console.error('\n[dkg mcp serve] MCP server is not available.');
+      console.error(`  Reason: ${err?.message ?? err}`);
+      console.error('  • In a monorepo dev checkout: run `pnpm build` at the repo root to build all workspaces.');
+      console.error('  • With a global install: reinstall with `npm install -g @origintrail-official/dkg`.\n');
+      process.exit(1);
+    }
+    try {
+      // Synthesise an argv whose `[2]` slot aligns with the MCP server's
+      // own subcommand dispatcher. Without this, `dkg mcp serve join …`
+      // would land `argv[2] === 'mcp'` inside the MCP server and the
+      // `join` would never be seen.
+      await main(['node', 'dkg-mcp', ...passthrough]);
+    } catch (err: any) {
+      console.error(`\n[dkg mcp serve] ERROR: ${err?.message ?? err}\n`);
+      process.exit(1);
+    }
+  });
+
+mcpCmd
+  .command('setup')
+  .description('Bundled init + daemon-start + MCP-client registration (idempotent, safe to re-run)')
+  .option('--port <port>', 'Override daemon API port (default: 9200)')
+  .option('--name <name>', 'Override agent name (used only on first init)')
+  .option('--no-start', 'Skip daemon start (configure only)')
+  .option('--no-fund', 'Skip wallet funding via testnet faucet')
+  .option('--no-verify', 'Skip post-setup verification probe')
+  .option('--dry-run', 'Preview steps without writing or starting anything')
+  .option('--force', 'Refresh every detected client regardless of current registration state')
+  .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
+  .option('--yes', 'Auto-confirm per-client registrations (default false: prompt interactively in TTY mode; non-TTY auto-confirms — pass `--yes` in scripts for the safer scripted-environment posture)')
+  .option('--installed', 'Force installed-mode setup. Bootstrap home: `~/.dkg`. Registered binary: the running CLI (whichever invoked this command — typically the global `dkg`). Use this from a monorepo cwd when you want the global install instead of the local dist. Mutually exclusive with --monorepo.')
+  .option('--monorepo', 'Force monorepo-mode setup. Bootstrap home: `~/.dkg-dev`. Registered binary: the local `<repo>/packages/cli/dist/cli.js` script (located via cwd-first walk; falls back to the running CLI dir). Errors if no DKG monorepo root is detected. Switches BOTH bootstrap home AND the registered binary, unlike --installed which only switches the home. Mutually exclusive with --installed.')
+  .action(async (opts) => {
+    // Dynamic-import the openclaw-setup primitives for the bundled
+    // init + daemon-start. Same import surface (and same package
+    // resolution failure mode) as `dkg openclaw setup` so a missing
+    // adapter build emits a parallel error message.
+    let openclawSetupExports: typeof import('@origintrail-official/dkg-adapter-openclaw');
+    try {
+      openclawSetupExports = await import('@origintrail-official/dkg-adapter-openclaw');
+    } catch (err: any) {
+      console.error('\n[dkg mcp setup] Setup primitives are not available.');
+      console.error(`  Reason: ${err?.message ?? err}`);
+      console.error('  • In a monorepo dev checkout: run `pnpm build` at the repo root to build all workspaces.');
+      console.error('  • With a global install: reinstall with `npm install -g @origintrail-official/dkg`.\n');
+      process.exit(1);
+    }
+    let coreExports: typeof import('@origintrail-official/dkg-core');
+    try {
+      coreExports = await import('@origintrail-official/dkg-core');
+    } catch (err: any) {
+      console.error('\n[dkg mcp setup] Core faucet primitive is not available.');
+      console.error(`  Reason: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+
+    const { mcpSetupAction } = await import('./mcp-setup.js');
+    try {
+      await mcpSetupAction(opts, {
+        loadNetworkConfig: openclawSetupExports.loadNetworkConfig,
+        ensureDkgNodeConfig: coreExports.ensureDkgNodeConfig,
+        startDaemon: openclawSetupExports.startDaemon,
+        readWalletsWithRetry: openclawSetupExports.readWalletsWithRetry,
+        logManualFundingInstructions: openclawSetupExports.logManualFundingInstructions,
+        requestFaucetFunding: coreExports.requestFaucetFunding,
+        findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
+        resolveDkgConfigHome: coreExports.resolveDkgConfigHome,
+      });
+    } catch (err: any) {
+      console.error(`\n[dkg mcp setup] ERROR: ${err?.message ?? err}\n`);
+      process.exit(1);
+    }
+  });
+
 // ─── dkg ccl ────────────────────────────────────────────────────────
 
 type HermesAdapterModule = Record<string, unknown>;

@@ -190,7 +190,7 @@ devgraph:Function a rdfs:Class ;
 devgraph:signature a rdf:Property ;
   rdfs:domain devgraph:Function ;
   rdfs:range xsd:string ;
-  rdfs:comment "Full type signature (e.g. '(sparql: string, paranetId?: string) => Promise<Result>')." .
+  rdfs:comment "Full type signature (e.g. '(sparql: string, contextGraphId?: string) => Promise<Result>')." .
 
 devgraph:definedIn a rdf:Property ;
   rdfs:range devgraph:CodeModule ;

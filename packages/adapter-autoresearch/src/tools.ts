@@ -1,13 +1,17 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { NS, RDF_TYPE, XSD, Class, Prop, Status, DEFAULT_CONTEXT_GRAPH } from './ontology.js';
-import type { DkgClientLike, ExperimentRecord } from './types.js';
+import type { DkgClientLike, DkgConfigLike } from './types.js';
 
 type Bindings = Array<Record<string, string>>;
 
 function parseBindings(raw: unknown): Bindings {
-  const obj = raw as { bindings?: Bindings };
-  return obj?.bindings ?? [];
+  // mcp-dkg's DkgClient.query returns the SparqlResult directly (i.e.
+  // `{ bindings, head? }`) rather than the legacy `{ result: { bindings } }`
+  // shape mcp-server's DkgClient used. Accept both for forward / backward
+  // compatibility — `result.bindings` if present, otherwise the top-level.
+  const obj = raw as { bindings?: Bindings; result?: { bindings?: Bindings } };
+  return obj?.result?.bindings ?? obj?.bindings ?? [];
 }
 
 function stripType(v: string): string {
@@ -54,18 +58,102 @@ function toTable(bindings: Bindings, columns?: string[]): string {
 /**
  * Register autoresearch tools on an MCP server.
  *
- * This is the sole integration point — call it from the MCP server's
- * startup to mount autoresearch-specific tools alongside the core tools.
+ * This is the sole integration point — called from the MCP server's
+ * `loadAdapters` shim during startup to mount autoresearch-specific
+ * tools alongside the host's core tools.
+ *
+ * Signature change (2026-04-30 dkg-v10 consolidation, parity-matrix v0.5
+ * §4.21): the legacy `(server, getClient, contextGraphId?)` signature
+ * with a lazy client getter is gone. The new shape passes the resolved
+ * client and config eagerly — mcp-dkg's adapter loader builds both at
+ * server-boot time and hands them to every adapter. Adapters get
+ * structural typing via `DkgClientLike` / `DkgConfigLike`, no hard
+ * dependency on `@origintrail-official/dkg-mcp`'s concrete types.
+ *
+ * `contextGraphId` is no longer a public parameter — every adapter
+ * targets its own canonical graph (autoresearch's is at
+ * `DEFAULT_CONTEXT_GRAPH`). If a future caller needs override semantics,
+ * we'll add it back as an opts bag rather than a positional arg.
  */
 export function registerTools(
   server: McpServer,
-  getClient: () => Promise<DkgClientLike>,
-  contextGraphId: string = DEFAULT_CONTEXT_GRAPH,
+  client: DkgClientLike,
+  config: DkgConfigLike,
 ) {
+  const contextGraphId = DEFAULT_CONTEXT_GRAPH;
+
   async function sparql(query: string): Promise<Bindings> {
-    const client = await getClient();
-    const result = await client.query(query, contextGraphId);
-    return parseBindings(result.result);
+    const result = await client.query({ sparql: query, contextGraphId });
+    return parseBindings(result);
+  }
+
+  // ---------------------------------------------------------------------
+  // Daemon HTTP shim
+  //
+  // mcp-dkg's `DkgClient` is intentionally lean — it exposes the surfaces
+  // mcp-dkg's own tools need (`query`, assertion CRUD, identity probe,
+  // listProjects/listSubGraphs). It does NOT expose the higher-level
+  // helpers the autoresearch adapter inherited from the retired
+  // `mcp-server`'s `DkgClient`: `publish`, `createContextGraph`,
+  // `subscribe`. Rather than bloat mcp-dkg's `DkgClient` for one
+  // consumer, the adapter ships a small private fetch shim that talks
+  // to the same daemon (the URL + bearer token are already resolved on
+  // `config.api` + `config.token`). One file, three routes.
+  // ---------------------------------------------------------------------
+  async function daemonPost<T>(path: string, body: unknown): Promise<T> {
+    const url = `${config.api.replace(/\/$/, '')}${path}`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (config.token) headers.Authorization = `Bearer ${config.token}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    let parsed: unknown = undefined;
+    if (text) {
+      try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+    }
+    if (!res.ok) {
+      const detail =
+        typeof parsed === 'object' && parsed && 'error' in (parsed as Record<string, unknown>)
+          ? (parsed as { error: unknown }).error
+          : parsed;
+      throw new Error(
+        `POST ${path} → ${res.status}: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`,
+      );
+    }
+    return parsed as T;
+  }
+
+  async function daemonCreateContextGraph(
+    id: string,
+    name: string,
+    description?: string,
+  ): Promise<{ created: string; uri: string }> {
+    return daemonPost('/api/context-graph/create', { id, name, description });
+  }
+
+  async function daemonSubscribe(
+    contextGraphId: string,
+  ): Promise<{ subscribed: string }> {
+    return daemonPost('/api/subscribe', { contextGraphId });
+  }
+
+  async function daemonPublish(
+    contextGraphId: string,
+    quads: Array<{ subject: string; predicate: string; object: string; graph: string }>,
+  ): Promise<{ kcId: string; status: string }> {
+    // Two-step canonical publish path — write quads to SWM, then anchor
+    // via /api/shared-memory/publish with `clearAfter: true`. Mirrors
+    // the legacy `mcp-server` `DkgClient.publish` shape so existing
+    // autoresearch SOPs (publish-then-query) continue to work.
+    await daemonPost('/api/shared-memory/write', { contextGraphId, quads });
+    return daemonPost('/api/shared-memory/publish', {
+      contextGraphId,
+      selection: 'all',
+      clearAfter: true,
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -82,9 +170,8 @@ export function registerTools(
     },
     async () => {
       try {
-        const client = await getClient();
         try {
-          await client.createContextGraph(
+          await daemonCreateContextGraph(
             contextGraphId,
             'Autoresearch',
             'Collaborative autonomous ML research — experiment results shared as Knowledge Assets',
@@ -93,7 +180,7 @@ export function registerTools(
           const msg = e instanceof Error ? e.message : String(e);
           if (!(/already exists/i.test(msg) || /duplicate/i.test(msg))) throw e;
         }
-        await client.subscribe(contextGraphId);
+        await daemonSubscribe(contextGraphId);
         return ok(`Context Graph "${contextGraphId}" ready. This node is subscribed.`);
       } catch (e) { return err(`Setup failed: ${fmtError(e)}`); }
     },
@@ -133,7 +220,6 @@ export function registerTools(
     },
     async (params) => {
       try {
-        const client = await getClient();
         const ts = new Date().toISOString();
         const id = `urn:autoresearch:exp:${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const graph = `did:dkg:context-graph:${contextGraphId}`;
@@ -164,7 +250,7 @@ export function registerTools(
         if (params.run_tag) quads.push({ subject: id, predicate: Prop.runTag, object: `"${esc(params.run_tag)}"`, graph });
         if (params.parent_experiment) quads.push({ subject: id, predicate: Prop.parentExperiment, object: params.parent_experiment, graph });
 
-        const result = await client.publish(contextGraphId, quads);
+        const result = await daemonPublish(contextGraphId, quads);
         return ok(
           `Published experiment as Knowledge Asset.\n` +
           `  URI: ${id}\n` +

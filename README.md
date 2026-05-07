@@ -67,41 +67,81 @@ the writer, but do not encrypt GossipSub payload bytes.
 
 ## Quick Start
 
-**Prerequisites:** Node.js 22+, npm 10+
+**Prerequisites:** Node.js 22+, npm 10+. macOS, Linux, and Windows (PowerShell 5.1+ or WSL2) all supported.
 
-### For AI agents
+### Hermes adapter
 
-> **OpenClaw agents:** Install the DKG CLI and run setup — this installs the node AND wires up the adapter with memory, tools, and Agent Hub:
-> ```bash
-> npm install -g @origintrail-official/dkg
-> dkg openclaw setup
-> ```
-> Then restart the OpenClaw gateway. See the [adapter guide](packages/adapter-openclaw/README.md) for details.
-
-> **ElizaOS agents:** Use the [`@origintrail-official/dkg-adapter-elizaos`](packages/adapter-elizaos/README.md) adapter. See the [ElizaOS setup guide](docs/setup/SETUP_ELIZAOS.md).
-
-> **Hermes agents:** Install the DKG CLI and run Hermes setup, then start the Hermes gateway:
-> ```bash
-> npm install -g @origintrail-official/dkg
-> dkg hermes setup
-> ```
-> `dkg hermes setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and wires the Hermes profile with replace-by-default provider election (use `--preserve-provider` to opt out, `--no-start` / `--no-fund` for advanced flows). See the [adapter guide](packages/adapter-hermes/README.md) for details.
-
-> **Cursor / Claude Code / other MCP clients:** Install the [`@origintrail-official/dkg-mcp`](packages/mcp-dkg/README.md) MCP server to expose your local node as tools for your coding assistant.
-
-**Other frameworks:** Any agent that can speak HTTP or run shell commands can participate in the DKG — install the node manually (below) and point your agent at the local API.
-
-### Manual install (standalone node)
-
-Install the CLI globally and spin up a node:
+Two commands:
 
 ```bash
 npm install -g @origintrail-official/dkg
-dkg init      # creates ~/.dkg with default config
-dkg start     # starts the node daemon
+dkg hermes setup
 ```
 
-Once running, open the dashboard at [http://127.0.0.1:9200/ui](http://127.0.0.1:9200/ui).
+`dkg hermes setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and wires the Hermes profile with replace-by-default provider election (use `--preserve-provider` to opt out, `--no-start` / `--no-fund` for advanced flows). See the [adapter guide](packages/adapter-hermes/README.md) for details.
+
+### OpenClaw adapter
+
+Two commands:
+
+```bash
+npm install -g @origintrail-official/dkg     # installs CLI + bundled adapter
+dkg openclaw setup                           # configures + starts the daemon, registers the plugin
+```
+
+`dkg openclaw setup` is non-interactive and idempotent. It writes `~/.dkg/config.json`, merges the adapter into `~/.openclaw/openclaw.json` (under `plugins.entries.adapter-openclaw.config` — `daemonUrl`, `memory.enabled`, `channel.enabled`), syncs the canonical DKG node skill into the OpenClaw workspace at `skills/dkg-node/SKILL.md`, and verifies the install. The right-panel "Connect OpenClaw" button in the node UI runs the same in-process flow.
+
+Restart the OpenClaw gateway if it does not auto-reload:
+
+```bash
+openclaw gateway restart
+```
+
+**First-run verification.** A healthy setup satisfies all four:
+
+- `dkg_status` works from the OpenClaw agent
+- The DKG node UI loads at `http://127.0.0.1:9200/ui`
+- The right-side chat surface connects to OpenClaw and a sent message round-trips
+- The conversation survives a UI reload (proves DKG-backed chat persistence)
+
+**Flags.** `--no-fund` (skip faucet), `--no-start` (configure only), `--no-verify` (skip verification), `--dry-run` (preview without writing). Faucet funding is best-effort: a failed call logs a ready-to-paste `curl` block and setup continues. See the [Testnet Funding](#testnet-funding) section below for the full request/response shape.
+
+The full adapter reference — daemon URL config, channel-port overrides, disconnect/reconnect semantics — lives in [`packages/adapter-openclaw/README.md`](packages/adapter-openclaw/README.md).
+
+#### Troubleshooting (OpenClaw)
+
+- **Adapter not visible to gateway** → check `~/.openclaw/openclaw.json` has `plugins.entries.adapter-openclaw` populated; re-run `dkg openclaw setup`.
+- **Faucet failure** → setup logs a `curl` block for manual funding; the node still works for non-on-chain flows (P2P, queries, WM/SWM writes).
+- **Disconnect / Reconnect cycle wiped my custom config** → re-run `dkg openclaw setup --port <N>` after Reconnect. Default-port users see no visible difference across the cycle.
+- **Channel port `9201` already in use** → set `channel.port` manually under `plugins.entries.adapter-openclaw.config` in `~/.openclaw/openclaw.json`.
+
+### Model Context Protocol (MCP)
+
+Two commands wire DKG V10 into MCP-aware clients (Cursor, Claude Code, Claude Desktop, Windsurf, VSCode + GitHub Copilot Chat, Cline):
+
+```bash
+npm install -g @origintrail-official/dkg
+dkg mcp setup
+```
+
+`dkg mcp setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and registers MCP entries in each detected client (you confirm per client unless `--yes` is passed). See the [MCP integration guide](packages/mcp-dkg/README.md) for client-by-client paths, mode overrides (`--installed` / `--monorepo`), the manual JSON shape, the contributor monorepo dev workflow, and troubleshooting (including the WSL2 caveat for Windows-side MCP clients).
+
+### Standalone node
+
+Skip the framework wiring — run the daemon directly and use the CLI or HTTP API:
+
+```bash
+npm install -g @origintrail-official/dkg
+dkg init      # creates ~/.dkg/config.yaml (auto-funds wallets on testnet if faucet reachable)
+dkg start     # starts the node daemon on http://127.0.0.1:9200
+```
+
+Once running, open the dashboard at [http://127.0.0.1:9200/ui](http://127.0.0.1:9200/ui), or query directly:
+
+```bash
+TOKEN=$(dkg auth show)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9200/api/agents
+```
 
 ---
 
@@ -184,9 +224,11 @@ dkg auth show                            # show the current API auth token
 dkg auth rotate                          # generate a new auth token
 dkg auth status                          # show whether auth is enabled
 
-# Framework adapters
+# Framework adapters & MCP wiring
 dkg openclaw setup                       # install & configure the OpenClaw adapter
 dkg hermes setup                         # install & configure the Hermes adapter
+dkg mcp setup                            # register the MCP server with Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline
+dkg mcp serve                            # run the MCP server on stdio (invoked by the client; not run manually)
 
 # Community integrations (registry: OriginTrail/dkg-integrations)
 dkg integration list [--tier community]  # default tier filter is `verified`+
@@ -258,6 +300,7 @@ analysis reports are under `bench/results/profiles/`, including
 
 | Guide | Use it when |
 |---|---|
+| [MCP Setup](docs/setup/SETUP_MCP.md) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline to use DKG as memory |
 | [Join the Testnet](docs/setup/JOIN_TESTNET.md) | You want a full node setup and first publish/query flow |
 | [OpenClaw Setup](docs/setup/SETUP_OPENCLAW.md) | You want OpenClaw to use DKG as memory/tools |
 | [Hermes Setup](docs/setup/SETUP_HERMES.md) | You want Hermes Agent to use DKG as memory/tools |
@@ -400,7 +443,6 @@ This is a pnpm + Turborepo monorepo.
 @origintrail-official/dkg-attested-assets    Attested Knowledge Asset protocol components
 @origintrail-official/dkg-epcis              EPCIS → RDF supply-chain adapter
 @origintrail-official/dkg-mcp                MCP server for Cursor / Claude Code / coding agents
-@origintrail-official/dkg-mcp-server         Code-graph MCP tools (dev-coordination)
 ```
 
 ### Adapters and apps

@@ -5,20 +5,21 @@
  * dispatcher in `index.ts` routes argv[2] to either CLI subcommand
  * or stdio MCP server.
  *
- * Subcommands (Phase 8 day 2):
+ * Operator-facing subcommands:
  *   join <invite-code> [opts]   Subscribe to a project + install workspace files
  *   status                      Show current install + project membership state
  *   help                        Print usage
  *
- * Subcommands coming in day 3:
+ * Planned for follow-up cycles (not in this PR's scope):
  *   sync                        Diff local install vs project's current manifest
  *   create-project              Curator-side: create CG + publish manifest
  *
- * Distribution:
- *   - Today:  `pnpm exec dkg-mcp join <invite>` (after `pnpm install` + `pnpm build`)
- *   - Or:     `node packages/mcp-dkg/dist/index.js join <invite>`
- *   - Future: `npx @origintrail-official/dkg-mcp join <invite>` once the package
- *             is published to npm.
+ * Distribution: invoked through the umbrella CLI as
+ * `dkg mcp serve <subcommand>` (production path; see
+ * `packages/cli/src/cli.ts:1789-1791` for the argv synthesis). The
+ * `dkg-mcp` bin remains for direct invocation in monorepo dev
+ * checkouts (`pnpm exec dkg-mcp join <invite>`) and for any consumer
+ * that installs `@origintrail-official/dkg-mcp` directly.
  */
 import { parseArgs } from 'node:util';
 import path from 'node:path';

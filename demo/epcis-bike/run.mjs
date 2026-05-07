@@ -360,10 +360,14 @@ async function getNode2Auth() {
 async function fetchNode2Identity() {
   const auth = await getNode2Auth();
   if (!auth) return null;
+  // Same conditional-header pattern as fetchCaptureStatus / node2Sparql:
+  // emit Authorization only when node2 has a real token. An
+  // `auth.enabled=false` node2 sandbox would otherwise reject the
+  // explicit `Bearer undefined` we'd send if we built the header
+  // unconditionally.
+  const headers = auth.token ? { Authorization: `Bearer ${auth.token}` } : {};
   try {
-    const res = await fetch(`${auth.baseUrl}/api/status`, {
-      headers: { Authorization: `Bearer ${auth.token}` },
-    });
+    const res = await fetch(`${auth.baseUrl}/api/status`, { headers });
     if (!res.ok) return null;
     const body = await res.json();
     return { peerId: body.peerId, name: body.name };
@@ -384,13 +388,14 @@ async function fetchNode2Identity() {
 async function subscribeNode2ToCG(contextGraphId) {
   const auth = await getNode2Auth();
   if (!auth) return null;
+  // Optional Authorization — see fetchNode2Identity above.
+  const headers = auth.token
+    ? { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' }
+    : { 'Content-Type': 'application/json' };
   try {
     const res = await fetch(`${auth.baseUrl}/api/context-graph/subscribe`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${auth.token}`,
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({ contextGraphId, includeSharedMemory: true }),
     });
     const text = await res.text();
@@ -1228,16 +1233,21 @@ async function countGrantsForPeer(allowedPeer, metaGraph) {
   // structured `{ result: { bindings } }` back and can read the COUNT cell.
   const auth = await getDaemonAuth();
   const cmdString = `POST ${auth.baseUrl}/api/query  ${sparql.length > 80 ? sparql.slice(0, 77) + '...' : sparql}`;
+  // Conditional Authorization for `auth.enabled=false` daemons — same
+  // pattern as fetchCaptureStatus / node2Sparql / fetchNode2Identity.
+  // Without this, Phase 6's grant-count query would hit auth-disabled
+  // daemons with `Bearer undefined` and the resulting 401/400 would
+  // route into the unrecognized-response-shape branch.
+  const headers = auth.token
+    ? { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' }
+    : { 'Content-Type': 'application/json' };
   let res;
   let text = '';
   let parsed;
   try {
     res = await fetch(`${auth.baseUrl}/api/query`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${auth.token}`,
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({ sparql, contextGraphId: CG_ID, includeSharedMemory: true }),
     });
     text = await res.text();

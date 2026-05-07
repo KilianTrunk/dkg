@@ -94,8 +94,8 @@ A short comparison for agents and humans: when to use workspace (free) vs enshri
 
 ### 4.1 One Extra Named Graph per ContextGraph
 
-- **Existing**: `did:dkg:contextGraph:{id}` (data), `did:dkg:contextGraph:{id}/_meta`, `did:dkg:contextGraph:{id}/_private`.
-- **New**: `did:dkg:contextGraph:{id}/_workspace` (or chosen suffix).
+- **Existing**: `did:dkg:context-graph:{id}` (data), `did:dkg:context-graph:{id}/_meta`, `did:dkg:context-graph:{id}/_private`.
+- **New**: `did:dkg:context-graph:{id}/_workspace` (or chosen suffix).
 
 Same contextGraph scope; workspace is another named graph. No new “contextGraph type” or protocol.
 
@@ -110,7 +110,7 @@ Same contextGraph scope; workspace is another named graph. No new “contextGrap
 | Aspect | Data graph (current publish) | Workspace graph |
 |--------|------------------------------|------------------|
 | **Write** | Prepare → store in data graph → **chain** → broadcast. | Prepare → store in workspace graph + workspace meta → **broadcast** (no chain). |
-| **Replication** | GossipSub on `dkg/contextGraph/{id}/publish`; subscribers receive and store. | **Same**: GossipSub on a workspace topic (see §7); subscribers receive and store in workspace + workspace meta. |
+| **Replication** | GossipSub on `dkg/context-graph/{id}/finalization`; subscribers receive and store. | **Same**: GossipSub on a workspace topic (see §7); subscribers receive and store in workspace + workspace meta. |
 | **Metadata** | Meta graph `/_meta` (UAL, rootEntity, partOf, tentative/confirmed). | **Dedicated workspace metadata graph** `/_workspace_meta` (see §4.4): same *idea* as `_meta` (provenance, rootEntity, operation id), but no UAL until enshrined. |
 | **Entity exclusivity** | Rule 4: one rootEntity per contextGraph (across all publishers). | Policy choice: relax for workspace (see §6) or keep per-workspace-owner. |
 | **Cost** | Chain gas + (future) storage incentives. | **Free** (no chain). |
@@ -118,7 +118,7 @@ Same contextGraph scope; workspace is another named graph. No new “contextGrap
 ### 4.4 Workspace Metadata Graph
 
 - **Do we need a new metadata graph for workspace?** **Yes.** Keep `_meta` for enshrined (data-graph) KAs only; workspace entries never have a UAL, so they shouldn’t live in `_meta`.
-- **New graph**: `did:dkg:contextGraph:{id}/_workspace_meta`.
+- **New graph**: `did:dkg:context-graph:{id}/_workspace_meta`.
 - **Contents** (same *shape* as data-graph metadata where it makes sense):
   - **Workspace operation id** (e.g. UUID or `{publisherPeerId}:{timestamp}`): unique id for this workspace write (no UAL).
   - **rootEntity** (per entity in the write), **partOf** → this operation id (so we can “list entities in this workspace batch”).
@@ -146,7 +146,7 @@ So: **two metadata graphs** — `_meta` for data (enshrined) KAs, `_workspace_me
 
 ### 5.2 Query Workspace (and Optionally Data)
 
-- **Option A**: Query **only** workspace: e.g. `query(sparql, { contextGraphId, graphSuffix: '_workspace' })` so the engine uses `did:dkg:contextGraph:{id}/_workspace`.
+- **Option A**: Query **only** workspace: e.g. `query(sparql, { contextGraphId, graphSuffix: '_workspace' })` so the engine uses `did:dkg:context-graph:{id}/_workspace`.
 - **Option B**: Query **union** of data + workspace: e.g. `query(sparql, { contextGraphId, includeWorkspace: true })` so the default “contextGraph graph” is both data and workspace (e.g. `FROM NAMED` both graphs and query over both). Useful for “show me everything we have so far.”
 - **Option C**: No default change; caller passes explicit `GRAPH <.../_workspace>` in SPARQL.
 
@@ -180,7 +180,7 @@ So workspace is the **source** of triples for one or more “final” publishes;
 
 Workspace replication is **the same model** as for the data graph: GossipSub, all subscribers of the contextGraph receive workspace updates and store them.
 
-- **Topic**: Dedicated topic so protocol and handlers stay clear: `dkg/contextGraph/{id}/workspace` (mirrors `dkg/contextGraph/{id}/publish`). When a node subscribes to a contextGraph, it subscribes to **both** the publish topic (for finality-based publishes) and the workspace topic (for workspace writes).
+- **Topic**: Dedicated topic so protocol and handlers stay clear: `dkg/context-graph/{id}/workspace` (mirrors `dkg/context-graph/{id}/finalization`). When a node subscribes to a contextGraph, it subscribes to **both** the publish topic (for finality-based publishes) and the workspace topic (for workspace writes).
 - **Message format**: A **workspace publish message** that mirrors `PublishRequest` where it makes sense: contextGraphId, nquads (public quads), manifest (rootEntity, optional privateMerkleRoot, privateTripleCount), publisher identity/peer id, **workspace operation id**, timestamp. No UAL, no chainId, no receiver signatures. New protobuf (e.g. `WorkspacePublishRequest`) or extend existing with a `targetGraph: 'data' | 'workspace'` and optional fields.
 - **Receiver**: A **workspace handler** (like PublishHandler): on message, validate, store quads into **workspace graph**, generate and store metadata into **workspace_meta** graph. No chain, no tentative/confirmed lifecycle; just store and optionally ack for reliability.
 - **Result**: Many agents (nodes) working on the same contextGraph all see the same workspace graph and workspace_meta once they’re subscribed; collaboration is natural. When ready, any node can **enshrine** from the workspace content it has.
@@ -193,7 +193,7 @@ Workspace replication is **the same model** as for the data graph: GossipSub, al
 
 **Options to add later** (design only; implement later):
 - **Workspace membership**: ContextGraph (or workspace) config or on-chain registry lists peer IDs or keys that are allowed to subscribe to the workspace topic / receive workspace sync. Non-members do not subscribe to the workspace topic (or subscribe but receive encrypted payloads they cannot decrypt).
-- **Dedicated workspace topic per "room"**: e.g. `dkg/contextGraph/{id}/workspace/{workspaceGroupId}`; membership in `workspaceGroupId` is managed separately (invite-only, or derived from contextGraph membership + extra registration).
+- **Dedicated workspace topic per "room"**: e.g. `dkg/context-graph/{id}/workspace/{workspaceGroupId}`; membership in `workspaceGroupId` is managed separately (invite-only, or derived from contextGraph membership + extra registration).
 - **Encrypted workspace**: Workspace messages encrypted under a key shared only with registered nodes; topic remains public but payload is opaque to non-members.
 
 **Plan**: Document this as a **future** feature. V1 ships with "all contextGraph subscribers see workspace"; add workspace access control in a later phase when we have a clear membership model (e.g. contextGraph join/leave on-chain, or explicit workspace registration API).
@@ -204,7 +204,7 @@ Workspace replication is **the same model** as for the data graph: GossipSub, al
 
 | Component | Change |
 |-----------|--------|
-| **core/constants** | Add `contextGraphWorkspaceGraphUri(contextGraphId)` → `did:dkg:contextGraph:{id}/_workspace`. Add `contextGraphWorkspaceMetaGraphUri(contextGraphId)` → `did:dkg:contextGraph:{id}/_workspace_meta`. Add `contextGraphWorkspaceTopic(contextGraphId)` → `dkg/contextGraph/{id}/workspace`. |
+| **core/constants** | Add `contextGraphWorkspaceGraphUri(contextGraphId)` → `did:dkg:context-graph:{id}/_workspace`. Add `contextGraphWorkspaceMetaGraphUri(contextGraphId)` → `did:dkg:context-graph:{id}/_workspace_meta`. Add `contextGraphWorkspaceTopic(contextGraphId)` → `dkg/context-graph/{id}/workspace`. |
 | **storage/graph-manager** | `ensureContextGraph` creates workspace and workspace_meta graphs; add `workspaceGraphUri(contextGraphId)` and `workspaceMetaGraphUri(contextGraphId)`. `listContextGraphs` / `hasContextGraph` unchanged. |
 | **core/proto** | Define **workspace publish** message (e.g. `WorkspacePublishRequest`: contextGraphId, nquads, manifest, publisherPeerId, workspaceOperationId, timestamp; no UAL/chain fields). Encoder/decoder. |
 | **publisher** | New method `writeToWorkspace(contextGraphId, quads, options?)`: validate, insert into workspace + workspace_meta, **broadcast** on workspace topic. Track workspace-owned entities if Rule 4 applies. |
@@ -243,10 +243,10 @@ Workspace replication is **the same model** as for the data graph: GossipSub, al
 
 ## 11. Naming Summary
 
-- **Data graph**: `did:dkg:contextGraph:{id}` (unchanged).
-- **Workspace graph**: `did:dkg:contextGraph:{id}/_workspace`.
-- **Workspace metadata graph**: `did:dkg:contextGraph:{id}/_workspace_meta` (separate from `_meta`; no UAL until enshrined).
-- **Workspace topic**: `dkg/contextGraph/{id}/workspace`.
+- **Data graph**: `did:dkg:context-graph:{id}` (unchanged).
+- **Workspace graph**: `did:dkg:context-graph:{id}/_workspace`.
+- **Workspace metadata graph**: `did:dkg:context-graph:{id}/_workspace_meta` (separate from `_meta`; no UAL until enshrined).
+- **Workspace topic**: `dkg/context-graph/{id}/workspace`.
 - **Write**: `writeToWorkspace(contextGraphId, quads, options?)` — local store + broadcast on workspace topic.
 - **Promote**: `enshrineFromWorkspace(contextGraphId, selection)`.
 - **Query**: `query(sparql, { contextGraphId, graphSuffix: '_workspace' })` or `includeWorkspace: true`.

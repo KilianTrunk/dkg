@@ -497,7 +497,7 @@ WHERE {
     const contextGraphId = parsed.contextGraphId;
     if (!contextGraphId || !quads?.length) {
       return jsonResponse(res, 400, {
-        error: 'Missing "contextGraphId" (or "contextGraphId") or "quads"',
+        error: 'Missing "contextGraphId" or "quads"',
       });
     }
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
@@ -551,7 +551,7 @@ WHERE {
     const contextGraphId = parsed.contextGraphId;
     if (!contextGraphId)
       return jsonResponse(res, 400, {
-        error: 'Missing "contextGraphId" (or "contextGraphId")',
+        error: 'Missing "contextGraphId"',
       });
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     if (subGraphName && publishContextGraphId) {

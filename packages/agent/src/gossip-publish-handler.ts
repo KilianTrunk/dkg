@@ -481,11 +481,10 @@ export class GossipPublishHandler {
       const approvedBy = bindingQuads.find(q => q.predicate === DKG_ONTOLOGY.DKG_APPROVED_BY)?.object;
       const revokedAt = bindingQuads.find(q => q.predicate === DKG_ONTOLOGY.DKG_REVOKED_AT)?.object;
       const revokedBy = bindingQuads.find(q => q.predicate === DKG_ONTOLOGY.DKG_REVOKED_BY)?.object;
-      const contextGraphId = contextGraphUri?.startsWith('did:dkg:context-graph:')
-        ? contextGraphUri.slice('did:dkg:context-graph:'.length)
-        : contextGraphUri?.startsWith('did:dkg:contextGraph:')
-          ? contextGraphUri.slice('did:dkg:contextGraph:'.length)
-          : null;
+      const contextGraphPrefix = 'did:dkg:context-graph:';
+      const contextGraphId = contextGraphUri?.startsWith(contextGraphPrefix)
+        ? contextGraphUri.slice(contextGraphPrefix.length)
+        : null;
 
       if (!contextGraphId) {
         invalidBindings.add(bindingUri);

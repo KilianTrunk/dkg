@@ -10,7 +10,7 @@ How data gets queried in DKG v9 -- from SPARQL string to result bindings.
 |------|-----------|
 | **SPARQL** | The W3C query language for RDF data. Think SQL, but for graph databases. DKG uses SELECT, CONSTRUCT, ASK, and DESCRIBE forms (all read-only). |
 | **ContextGraph** | A logical partition of knowledge. Every piece of data belongs to exactly one contextGraph. Queries are scoped to a contextGraph unless you explicitly ask for cross-contextGraph results. |
-| **Graph URI** | The named graph identifier that holds a contextGraph's data. Format: `did:dkg:contextGraph:<contextGraphId>`. Each contextGraph has several graphs (data, meta, private, workspace). |
+| **Graph URI** | The named graph identifier that holds a contextGraph's data. Format: `did:dkg:context-graph:<contextGraphId>`. Each contextGraph has several graphs (data, meta, private, workspace). |
 | **Data graph vs meta graph** | The **data graph** holds the actual RDF triples (facts about the world). The **meta graph** holds metadata about knowledge assets -- who published them, which contextGraph they belong to, their root entity URIs. |
 | **Bindings** | The rows returned by a SELECT query. Each binding is a map from variable name to value, like `{ name: "Alice", age: "30" }`. |
 | **Entity resolution** | Looking up a knowledge asset by its UAL to get all its triples. A two-step process: find the entity in the meta graph, then fetch its data from the data graph. |
@@ -35,7 +35,7 @@ The primary query path. You provide a SPARQL string and a contextGraph ID, and t
 
 1. The agent creates an operation context (UUID for log tracing) and calls `DKGQueryEngine.query()`.
 2. The query engine runs the SPARQL through a **read-only guard** (`sparql-guard.ts`) that rejects any mutating keywords (INSERT, DELETE, DROP, etc.). Writes must go through the publish protocol.
-3. If a `contextGraphId` is provided and the query does not already contain a `FROM` clause, the engine **wraps** the WHERE clause inside a `GRAPH <did:dkg:contextGraph:ID> { ... }` block. This is how contextGraph scoping works -- the SPARQL itself is rewritten to target a specific named graph.
+3. If a `contextGraphId` is provided and the query does not already contain a `FROM` clause, the engine **wraps** the WHERE clause inside a `GRAPH <did:dkg:context-graph:ID> { ... }` block. This is how contextGraph scoping works -- the SPARQL itself is rewritten to target a specific named graph.
 4. The wrapped SPARQL is sent to the `TripleStore.query()` interface.
 5. Results are normalized based on the query form:
    - **SELECT** returns bindings (array of variable-to-value maps)
@@ -53,7 +53,7 @@ Runs the same SPARQL against every known contextGraph and combines the results.
 **What happens:**
 
 1. The engine asks `GraphManager.listContextGraphs()` to enumerate all contextGraphs stored locally.
-2. `GraphManager` calls `TripleStore.listGraphs()`, filters for URIs starting with `did:dkg:contextGraph:`, and deduplicates by stripping suffixes like `/_meta`, `/_private`, `/_workspace`, `/_workspace_meta`.
+2. `GraphManager` calls `TripleStore.listGraphs()`, filters for URIs starting with `did:dkg:context-graph:`, and deduplicates by stripping suffixes like `/_meta`, `/_private`, `/_workspace`, `/_workspace_meta`.
 3. For each contextGraph ID, it calls `query(sparql, { contextGraphId })` -- the same path as a contextGraph-scoped query.
 4. All bindings are accumulated into a single array and returned.
 
@@ -100,7 +100,7 @@ sequenceDiagram
     Agent->>Engine: query(sparql, { contextGraphId })
     Engine->>Guard: validateReadOnlySparql(sparql)
     Guard-->>Engine: { safe: true }
-    Engine->>Engine: wrapWithGraph(sparql, "did:dkg:contextGraph:ID")
+    Engine->>Engine: wrapWithGraph(sparql, "did:dkg:context-graph:ID")
     Engine->>Store: store.query(wrappedSparql)
     Store-->>Engine: SelectResult { bindings }
     Engine-->>Agent: { bindings: [...] }
@@ -124,7 +124,7 @@ SELECT ?name WHERE {
 And contextGraph ID `testing`, the engine rewrites it to:
 
 ```sparql
-SELECT ?name WHERE { GRAPH <did:dkg:contextGraph:testing> {
+SELECT ?name WHERE { GRAPH <did:dkg:context-graph:testing> {
   ?s <https://schema.org/name> ?name .
 } }
 ```
@@ -180,11 +180,11 @@ Each contextGraph gets five named graphs, managed by `GraphManager` (`packages/s
 
 | Graph | URI pattern | Purpose |
 |-------|-------------|---------|
-| Data | `did:dkg:contextGraph:<id>` | Published RDF triples |
-| Meta | `did:dkg:contextGraph:<id>/_meta` | KA metadata (root entities, ownership, contextGraph membership) |
-| Private | `did:dkg:contextGraph:<id>/_private` | Encrypted/access-controlled triples |
-| Workspace | `did:dkg:contextGraph:<id>/_workspace` | Draft/unpublished data |
-| Workspace Meta | `did:dkg:contextGraph:<id>/_workspace_meta` | Metadata for workspace items |
+| Data | `did:dkg:context-graph:<id>` | Published RDF triples |
+| Meta | `did:dkg:context-graph:<id>/_meta` | KA metadata (root entities, ownership, contextGraph membership) |
+| Private | `did:dkg:context-graph:<id>/_private` | Encrypted/access-controlled triples |
+| Workspace | `did:dkg:context-graph:<id>/_workspace` | Draft/unpublished data |
+| Workspace Meta | `did:dkg:context-graph:<id>/_workspace_meta` | Metadata for workspace items |
 
 ---
 

@@ -60,7 +60,7 @@ ORDER BY DESC(?score)
 The embedding model is configured **per contextGraph** (not per node), ensuring cross-node score comparability:
 
 ```turtle
-<did:dkg:contextGraph:0xabc>
+<did:dkg:context-graph:0xabc>
     dkgcap:embeddingModel [
         dkgcap:modelType dkgcap:TransE ;
         dkgcap:dimensions "200"^^xsd:integer ;
@@ -142,7 +142,7 @@ Sources → Extract → Transform → Validate → Batch → Publish
 
 ```yaml
 name: climate-monitor
-contextGraph: "did:dkg:contextGraph:0xclimate"
+contextGraph: "did:dkg:context-graph:0xclimate"
 source:
   type: rss
   config: { urls: ["https://climate-news.org/feed"] }

@@ -71,7 +71,7 @@ subject urn:exp-d2a:$RUN_ID:$agent:$feature_id:decision:<n>
 4) publish final handoff:
 subject urn:exp-d2a:$RUN_ID:$agent:$feature_id:handoff
 
-Use graph did:dkg:contextGraph:$CONTEXT_GRAPH_ID and include predicates:
+Use graph did:dkg:context-graph:$CONTEXT_GRAPH_ID and include predicates:
 rdf:type, devgraph:summary, devgraph:kind, devgraph:agent, devgraph:feature.
 
 Feature task:

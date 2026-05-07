@@ -180,7 +180,7 @@ Macaroon {
   identifier: "uuid-v4"
   caveats: [
     { type: "time",     expires: "2026-03-01T00:00:00Z" },
-    { type: "contextGraph",  allowed: ["did:dkg:contextGraph:0xabc"] },
+    { type: "contextGraph",  allowed: ["did:dkg:context-graph:0xabc"] },
     { type: "query",    allowedTypes: ["SELECT"] },
     { type: "rateLimit", maxPerHour: 100 },
     { type: "identity",  boundTo: "did:key:z6Mk..." }
@@ -473,8 +473,8 @@ ContextGraphs are created on-chain and initialized in the triple store.
 ```
 1. Creator → Chain: createContextGraph(id, metadata)
    Chain: register contextGraph, emit ContextGraphCreated event
-2. Nodes observing event: create data graph <did:dkg:contextGraph:{id}>
-                          create meta graph <did:dkg:contextGraph:{id}/_meta>
+2. Nodes observing event: create data graph <did:dkg:context-graph:{id}>
+                          create meta graph <did:dkg:context-graph:{id}/_meta>
 3. Creator publishes initial metadata KA (contextGraph name, description, policies)
 ```
 

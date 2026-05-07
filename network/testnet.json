@@ -1,6 +1,6 @@
 {
   "networkName": "DKG V10 Testnet",
-  "networkId": "dcd82ac91b0d6c67d6766d0d94604a4af9e7435a9c8766f558f00e4fd3a1bb7b",
+  "networkId": "7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b",
   "genesisVersion": 1,
   "relays": [
     "/ip4/178.104.54.178/tcp/9090/p2p/12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M",

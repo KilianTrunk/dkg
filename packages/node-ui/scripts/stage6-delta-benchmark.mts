@@ -44,7 +44,7 @@ type ScenarioResult = {
 };
 
 const MEMORY_CONTEXT_GRAPH = 'agent-memory';
-const DATA_GRAPH = `did:dkg:contextGraph:${MEMORY_CONTEXT_GRAPH}`;
+const DATA_GRAPH = `did:dkg:context-graph:${MEMORY_CONTEXT_GRAPH}`;
 const WORKSPACE_GRAPH = `${DATA_GRAPH}/_workspace`;
 const CHAT_NS = 'urn:dkg:chat:';
 const SCHEMA = 'http://schema.org/';

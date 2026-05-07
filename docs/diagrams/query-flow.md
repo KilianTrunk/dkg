@@ -25,7 +25,7 @@ sequenceDiagram
     Agent ->> QueryEngine: query(sparql, contextGraphId, operationId)
 
     QueryEngine ->> GraphMgr: contextGraphDataGraphUri(contextGraphId)
-    GraphMgr -->> QueryEngine: did:dkg:contextGraph:contextGraphId
+    GraphMgr -->> QueryEngine: did:dkg:context-graph:contextGraphId
 
     QueryEngine ->> QueryEngine: wrapWithGraph(sparql, graphUri)
     Note right of QueryEngine: Wraps the WHERE clause in<br/>a GRAPH block scoped to<br/>the contextGraph data graph.<br/>Skipped if query already<br/>contains GRAPH patterns.
@@ -66,7 +66,7 @@ sequenceDiagram
     QueryEngine ->> GraphMgr: listContextGraphs()
     GraphMgr ->> Store: listGraphs()
     Store -->> GraphMgr: all graph URIs
-    GraphMgr ->> GraphMgr: Filter did:dkg:contextGraph:* URIs
+    GraphMgr ->> GraphMgr: Filter did:dkg:context-graph:* URIs
     Note right of GraphMgr: Deduplicates by stripping<br/>/_meta suffix
     GraphMgr -->> QueryEngine: contextGraphIds array
 

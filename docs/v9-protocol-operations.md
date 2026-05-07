@@ -406,7 +406,7 @@ signatures). If either set of signatures is insufficient, nothing is published.
 **Key concepts:**
 
 - A context graph is **scoped to a contextGraph** via URI convention:
-  `did:dkg:contextGraph:{contextGraphId}/context/{contextGraphId}`
+  `did:dkg:context-graph:{contextGraphId}/context/{contextGraphId}`
 - Participants are registered on-chain at context graph creation with an M-of-N
   threshold. The protocol's `minimumRequiredSignatures` does NOT apply — each
   context graph defines its own requirements.
@@ -520,7 +520,7 @@ sequenceDiagram
     Pub->>Pub: generateConfirmedFullMetadata(ual, kcMerkleRoot, txHash, batchId, ...)
     Pub->>Store: insert(confirmed metadata + chain provenance → context graph meta URI)
     Pub->>Pub: Track ownedEntities + batch→contextGraph binding
-    Note over Store: Data lives at did:dkg:contextGraph:{id}/context/{ctxId}<br/>NOT in the contextGraph data graph
+    Note over Store: Data lives at did:dkg:context-graph:{id}/context/{ctxId}<br/>NOT in the contextGraph data graph
 
     Note over Agent,GS: Phase 8 — Post-broadcast with chain proof
 
@@ -620,7 +620,7 @@ sequenceDiagram
 | **Participant sigs** | Not needed | Not needed | Required (M-of-N, app-defined collection) |
 | **Chain tx** | `publishKnowledgeAssets` | `publishKnowledgeAssets` | `publishToContextGraph` (atomic) |
 | **Failure behavior** | Rollback workspace | Rollback workspace | Strict: fail entirely / Fallback: contextGraph-only |
-| **Data lands in** | `did:dkg:contextGraph:{id}` | `did:dkg:contextGraph:{id}` | `did:dkg:contextGraph:{id}/context/{ctxId}` |
+| **Data lands in** | `did:dkg:context-graph:{id}` | `did:dkg:context-graph:{id}` | `did:dkg:context-graph:{id}/context/{ctxId}` |
 
 ### 2.5 Signature Types
 
@@ -929,38 +929,38 @@ graph TB
     end
 
     subgraph "Per-ContextGraph Topics"
-        PUB["dkg/contextGraph/{id}/publish"]
-        WS["dkg/contextGraph/{id}/workspace"]
-        APP["dkg/contextGraph/{id}/app"]
-        UPD["dkg/contextGraph/{id}/update"]
-        SESS["dkg/contextGraph/{id}/sessions"]
+        PUB["dkg/context-graph/{id}/finalization"]
+        WS["dkg/context-graph/{id}/workspace"]
+        APP["dkg/context-graph/{id}/app"]
+        UPD["dkg/context-graph/{id}/update"]
+        SESS["dkg/context-graph/{id}/sessions"]
     end
 
     subgraph "Per-Session Topics"
-        S1["dkg/contextGraph/{id}/sessions/{sid}"]
+        S1["dkg/context-graph/{id}/sessions/{sid}"]
     end
 
     subgraph "System ContextGraphs"
-        AGENTS["dkg/contextGraph/agents/publish"]
-        ONTO["dkg/contextGraph/ontology/publish"]
+        AGENTS["dkg/context-graph/agents/finalization"]
+        ONTO["dkg/context-graph/ontology/finalization"]
     end
 ```
 
 | Topic | Purpose | Message Types |
 |-------|---------|---------------|
 | `dkg/network/peers` | Peer discovery & health | Peer announce, capabilities |
-| `dkg/contextGraph/{id}/publish` | Publish broadcast (pre- and post-chain) | PublishRequest (pre-chain: data + publisherPeerId; post-chain: + txHash, blockNumber) |
-| `dkg/contextGraph/{id}/workspace` | Workspace writes (deferred publish staging) | WorkspacePublishRequest |
-| `dkg/contextGraph/{id}/app` | Application coordination | JSON app messages (game, etc.) |
-| `dkg/contextGraph/{id}/update` | KA updates | UpdateRequest |
-| `dkg/contextGraph/{id}/sessions` | Multi-party sessions | Session proposals, coordination |
-| `dkg/contextGraph/{id}/sessions/{sid}` | Per-session messages | Round data, commitments |
+| `dkg/context-graph/{id}/finalization` | Publish broadcast (pre- and post-chain) | PublishRequest (pre-chain: data + publisherPeerId; post-chain: + txHash, blockNumber) |
+| `dkg/context-graph/{id}/workspace` | Workspace writes (deferred publish staging) | WorkspacePublishRequest |
+| `dkg/context-graph/{id}/app` | Application coordination | JSON app messages (game, etc.) |
+| `dkg/context-graph/{id}/update` | KA updates | UpdateRequest |
+| `dkg/context-graph/{id}/sessions` | Multi-party sessions | Session proposals, coordination |
+| `dkg/context-graph/{id}/sessions/{sid}` | Per-session messages | Round data, commitments |
 
 > **REVIEW: App topic is untyped.**
 > The `app` topic carries JSON messages with an `app` field for routing (e.g.
 > `"example-app"`). All apps on the same contextGraph share a single topic.
 > **Risk:** A malicious app could flood the topic, affecting all apps. Consider
-> per-app subtopics: `dkg/contextGraph/{id}/app/{appId}`.
+> per-app subtopics: `dkg/context-graph/{id}/app/{appId}`.
 
 ---
 
@@ -970,7 +970,7 @@ graph TB
 graph TB
     subgraph "Triple Store (Oxigraph)"
         subgraph "ContextGraph: example-contextGraph"
-            DATA["Data Graph<br/>did:dkg:contextGraph:example-contextGraph<br/>Published triples"]
+            DATA["Data Graph<br/>did:dkg:context-graph:example-contextGraph<br/>Published triples"]
             META["Meta Graph<br/>.../_meta<br/>KC/KA metadata, merkle roots, status"]
             PRIV["Private Graph<br/>.../_private<br/>Publisher-only triples"]
             WS["Workspace Graph<br/>.../_workspace<br/>Swarms, memberships, votes"]
@@ -978,7 +978,7 @@ graph TB
         end
 
         subgraph "Context Graphs (per swarm)"
-            CTX["did:dkg:contextGraph:.../context/{swarmId}<br/>Turn results (published)"]
+            CTX["did:dkg:context-graph:.../context/{swarmId}<br/>Turn results (published)"]
             CTX_META["...context/{swarmId}/_meta<br/>Turn result metadata"]
         end
     end
@@ -988,13 +988,13 @@ graph TB
 
 | Pattern | Example | Content |
 |---------|---------|---------|
-| `did:dkg:contextGraph:{id}` | `did:dkg:contextGraph:example-contextGraph` | Published data |
-| `did:dkg:contextGraph:{id}/_meta` | `.../_meta` | KC/KA metadata |
-| `did:dkg:contextGraph:{id}/_private` | `.../_private` | Private triples |
-| `did:dkg:contextGraph:{id}/_workspace` | `.../_workspace` | Workspace data |
-| `did:dkg:contextGraph:{id}/_workspace_meta` | `.../_workspace_meta` | Workspace ops |
-| `did:dkg:contextGraph:{id}/context/{ctxId}` | `.../context/swarm-abc123` | Context graph data |
-| `did:dkg:contextGraph:{id}/context/{ctxId}/_meta` | `.../context/swarm-abc123/_meta` | Context graph meta |
+| `did:dkg:context-graph:{id}` | `did:dkg:context-graph:example-contextGraph` | Published data |
+| `did:dkg:context-graph:{id}/_meta` | `.../_meta` | KC/KA metadata |
+| `did:dkg:context-graph:{id}/_private` | `.../_private` | Private triples |
+| `did:dkg:context-graph:{id}/_workspace` | `.../_workspace` | Workspace data |
+| `did:dkg:context-graph:{id}/_workspace_meta` | `.../_workspace_meta` | Workspace ops |
+| `did:dkg:context-graph:{id}/context/{ctxId}` | `.../context/swarm-abc123` | Context graph data |
+| `did:dkg:context-graph:{id}/context/{ctxId}/_meta` | `.../context/swarm-abc123/_meta` | Context graph meta |
 
 `_private` graph behavior:
 
@@ -1185,7 +1185,7 @@ graph LR
 | # | Issue | Severity | Recommendation |
 |---|-------|----------|----------------|
 | G1 | `offMessage` has a bug: returns early when handlers exist | Bug | Fix: `if (!handlers) return;` should be `if (handlers)` |
-| G2 | All apps share single `app` topic per contextGraph | Medium | Add per-app subtopics: `dkg/contextGraph/{id}/app/{appId}` |
+| G2 | All apps share single `app` topic per contextGraph | Medium | Add per-app subtopics: `dkg/context-graph/{id}/app/{appId}` |
 | G3 | No message signing/authentication on gossip level | Medium | GossipSub supports `strictNoSign: false` — enable message signing |
 | G4 | Vote heartbeat creates O(n × 6) messages per turn | Low | Acceptable for 3-8 players; not scalable beyond ~20 |
 
@@ -1258,7 +1258,7 @@ deferred until the update flow is redesigned.
 | OQ-13 | **`/dkg/query/2.0.0` registered but queries are documented as "LOCAL ONLY."** Is remote query a planned future feature, or should the handler be removed from the boot sequence? | Section 1 vs Section 5 |
 | OQ-20 | **Workspace conflict resolution undefined.** Creator-only upsert handles single-owner entities, but what about two publishers writing overlapping (non-identical) entities? Is this prevented by validation rules, or is it a race condition? | Section 2.2, Section 12.2 W1 |
 | OQ-21 | **Who collects participant signatures — the App or the DKG Agent?** The current diagram shows the App/Game Coordinator collecting M-of-N participant signatures and passing them to the Agent. But this means the App must somehow halt/resume the publish flow mid-execution. Alternatives: **(a)** App provides participant signatures upfront in the `publish()` call (requires app to pre-coordinate before calling publish). **(b)** Agent exposes a callback/event that the app subscribes to (agent pauses, app collects, agent resumes). **(c)** Agent collects internally via a protocol (but how does it know the app-specific coordination mechanism?). Each has trade-offs for API design and flow control. | Section 2.3 Phase 5b |
-| OQ-22 | **Should context graph data also live in the contextGraph data graph?** Currently, data published to a context graph lands ONLY at `did:dkg:contextGraph:{id}/context/{ctxId}`, NOT in the contextGraph data graph. This means contextGraph-scoped queries won't find context graph data. Options: **(a)** Context graph only (current) — clean separation, but requires explicit context graph queries. **(b)** Both graphs — data is queryable from either scope, but creates duplication. **(c)** ContextGraph graph with a context graph link — data in contextGraph, metadata links it to the context graph. | Section 2.3 Phase 7 |
+| OQ-22 | **Should context graph data also live in the contextGraph data graph?** Currently, data published to a context graph lands ONLY at `did:dkg:context-graph:{id}/context/{ctxId}`, NOT in the contextGraph data graph. This means contextGraph-scoped queries won't find context graph data. Options: **(a)** Context graph only (current) — clean separation, but requires explicit context graph queries. **(b)** Both graphs — data is queryable from either scope, but creates duplication. **(c)** ContextGraph graph with a context graph link — data in contextGraph, metadata links it to the context graph. | Section 2.3 Phase 7 |
 | OQ-23 | **How are context graph queries scoped?** Section 5 shows queries against the contextGraph data graph and optionally workspace. Context graph data lives at a different URI. Can the app specify a `contextGraphId`? Is there a union query across all context graphs in a contextGraph? | Section 5 vs Section 2.3 |
 | OQ-24 | **Update conflict resolution.** Two publishers updating overlapping entities in the same block — the first tx wins by txIndex but the second publisher gets no notification. What is the conflict resolution strategy? | Section 4, REVIEW note |
 | OQ-25 | **Context graph updates — do they require re-collecting participant signatures?** Section 4 only covers contextGraph data updates. For context graph data, does an update need M-of-N participant governance again? | Section 4 vs Section 2.3 |

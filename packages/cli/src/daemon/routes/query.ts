@@ -873,7 +873,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     if (!contextGraphId && !jobIdParam) {
       return jsonResponse(res, 400, {
         error:
-          'Missing "contextGraphId" (or "contextGraphId") or "jobId" query param',
+          'Missing "contextGraphId" or "jobId" query param',
       });
     }
 

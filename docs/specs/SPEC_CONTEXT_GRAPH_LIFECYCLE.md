@@ -30,8 +30,8 @@ ContextGraphs have a **dual existence**: an on-chain anchor (identity, ownership
 ```
 On-chain (ContextGraph.sol)              Off-chain (Triple Store + GossipSub)
 ┌─────────────────────┐             ┌──────────────────────────────┐
-│ contextGraphId            │             │ data graph: did:dkg:contextGraph:X│
-│ creator (address)    │             │ meta graph: did:dkg:contextGraph:X/_meta
+│ contextGraphId            │             │ data graph: did:dkg:context-graph:X│
+│ creator (address)    │             │ meta graph: did:dkg:context-graph:X/_meta
 │ name, description    │             │ actual RDF triples           │
 │ access policies      │             │ merkle roots (per KC)        │
 │ member list          │             │ replicated via gossipsub     │
@@ -178,7 +178,7 @@ Node                         Chain                    GossipSub
  │   from peers via /dkg/sync   │                        │
  │                              │                        │
  ├── Subscribe to gossipsub ────┼───────────────────────►│
- │   topic: dkg/contextGraph/{id}/   │                        │
+ │   topic: dkg/context-graph/{id}/   │                        │
  │                              │                        │
  │   Now receiving live publishes                        │
 ```

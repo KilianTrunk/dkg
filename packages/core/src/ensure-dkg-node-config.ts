@@ -126,10 +126,7 @@ export function ensureDkgNodeConfig(opts: EnsureDkgNodeConfigOptions): void {
     name: overrides?.nameExplicit ? agentName : (existing.name ?? agentName),
     apiPort: overrides?.portExplicit ? apiPort : (existing.apiPort ?? apiPort),
     nodeRole: existing.nodeRole ?? (network.defaultNodeRole as 'edge' | 'core'),
-    contextGraphs: existing.contextGraphs
-      ?? existing.contextGraphs
-      ?? network.defaultContextGraphs
-      ?? network.defaultContextGraphs,
+    contextGraphs: existing.contextGraphs ?? network.defaultContextGraphs,
     auth: existing.auth ?? { enabled: true },
   };
 

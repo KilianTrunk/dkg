@@ -23,7 +23,7 @@ const CONTEXT_GRAPH = 'agent-skills';
 const TOPIC = contextGraphPublishTopic(CONTEXT_GRAPH);
 const ENTITY = 'did:dkg:agent:QmImageBot';
 const SKOLEM = `${ENTITY}/.well-known/genid/offering1`;
-const GRAPH = `did:dkg:contextGraph:${CONTEXT_GRAPH}`;
+const GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
 
 function q(s, p, o) {
   return { subject: s, predicate: p, object: o, graph: GRAPH };

@@ -8,7 +8,7 @@ describe('batchEntityQuads', () => {
         subject,
         predicate: 'http://schema.org/name',
         object: JSON.stringify(value.repeat(600)),
-        graph: 'did:dkg:contextGraph:test',
+        graph: 'did:dkg:context-graph:test',
       },
     ];
 
@@ -37,7 +37,7 @@ describe('batchEntityQuads', () => {
         subject: 'urn:test:entity:huge',
         predicate: 'http://schema.org/name',
         object: JSON.stringify('x'.repeat(5000)),
-        graph: 'did:dkg:contextGraph:test',
+        graph: 'did:dkg:context-graph:test',
       },
     ];
 
@@ -54,7 +54,7 @@ describe('batchEntityQuads', () => {
       subject: index === 0 ? 'urn:test:entity:huge' : `urn:test:entity:huge/.well-known/genid/${index}`,
       predicate: 'http://schema.org/name',
       object: '"x"',
-      graph: 'did:dkg:contextGraph:test',
+      graph: 'did:dkg:context-graph:test',
     }));
 
     expect(() =>
@@ -68,7 +68,7 @@ describe('batchEntityQuads', () => {
       subject: index === 0 ? 'urn:test:entity:huge' : `urn:test:entity:huge/.well-known/genid/${index}`,
       predicate: 'http://schema.org/name',
       object: `"value-${index}"`,
-      graph: 'did:dkg:contextGraph:test',
+      graph: 'did:dkg:context-graph:test',
     }));
 
     const batches = batchEntityQuads(quads, {
@@ -86,19 +86,19 @@ describe('batchEntityQuads', () => {
         subject: 'urn:test:entity:1',
         predicate: 'http://schema.org/name',
         object: '"Entity"',
-        graph: 'did:dkg:contextGraph:test',
+        graph: 'did:dkg:context-graph:test',
       },
       {
         subject: 'urn:test:entity:1/.well-known/genid/1',
         predicate: 'http://schema.org/name',
         object: '"Blank 1"',
-        graph: 'did:dkg:contextGraph:test',
+        graph: 'did:dkg:context-graph:test',
       },
       {
         subject: 'urn:test:entity:2',
         predicate: 'http://schema.org/name',
         object: '"Other"',
-        graph: 'did:dkg:contextGraph:test',
+        graph: 'did:dkg:context-graph:test',
       },
     ];
 

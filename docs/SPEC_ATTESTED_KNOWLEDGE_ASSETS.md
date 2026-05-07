@@ -471,8 +471,8 @@ Events exceeding these limits are dropped before validation.
 AKA introduces a new gossip topic pattern:
 
 ```
-dkg/contextGraph/<contextGraphId>/sessions             — session lifecycle events
-dkg/contextGraph/<contextGraphId>/sessions/<sessionId> — round events for a specific session
+dkg/context-graph/<contextGraphId>/sessions             — session lifecycle events
+dkg/context-graph/<contextGraphId>/sessions/<sessionId> — round events for a specific session
 ```
 
 This follows the existing topic conventions in `@origintrail-official/dkg-core/constants.ts`.

@@ -104,8 +104,8 @@ Response (UTF-8):
   "<subject> <predicate> <object> <graph> .\n"
 
   Triples from TWO named graphs:
-  - did:dkg:contextGraph:{id}       — data graph (paginated)
-  - did:dkg:contextGraph:{id}/_meta — meta graph (full, first page only)
+  - did:dkg:context-graph:{id}       — data graph (paginated)
+  - did:dkg:context-graph:{id}/_meta — meta graph (full, first page only)
 
   Empty response = no more data (end of pagination).
 ```

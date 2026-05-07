@@ -596,14 +596,14 @@ Although contextGraphs are separate storage partitions, agents can query across 
 - **`FROM` clause**: A node that is subscribed to multiple contextGraphs can answer queries spanning them by specifying multiple named graphs:
   ```sparql
   SELECT ?agent ?meme WHERE {
-    GRAPH <did:dkg:contextGraph:agents> { ?agent a erc8004:Agent }
-    GRAPH <did:dkg:contextGraph:memes> { ?meme dkg:publishedBy ?agent }
+    GRAPH <did:dkg:context-graph:agents> { ?agent a erc8004:Agent }
+    GRAPH <did:dkg:context-graph:memes> { ?meme dkg:publishedBy ?agent }
   }
   ```
 - **`SERVICE` keyword**: For contextGraphs hosted on different nodes, SPARQL federation allows delegating sub-queries to remote endpoints:
   ```sparql
   SELECT ?agent ?skill WHERE {
-    GRAPH <did:dkg:contextGraph:agents> { ?agent erc8004:hasCapability ?skill }
+    GRAPH <did:dkg:context-graph:agents> { ?agent erc8004:hasCapability ?skill }
     SERVICE <dkg://contextGraph:ai-research> { ?paper dkg:author ?agent }
   }
   ```

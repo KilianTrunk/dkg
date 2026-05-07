@@ -102,7 +102,7 @@ sequenceDiagram
 
     Agent ->> Agent: Serialize changed triples to N-Triples
     Agent ->> Gossip: publish(topic, updateMessage)
-    Note right of Gossip: topic = dkg/contextGraph/id/update<br/>Contains kcId + new triples + new merkleRoot
+    Note right of Gossip: topic = dkg/context-graph/id/update<br/>Contains kcId + new triples + new merkleRoot
 
     RcvAgent ->> EVM: Poll KnowledgeAssetsUpdated event
     EVM -->> RcvAgent: Event with matching batchId + newMerkleRoot

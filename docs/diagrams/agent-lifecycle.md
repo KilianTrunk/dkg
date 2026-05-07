@@ -57,7 +57,7 @@ sequenceDiagram
     Note right of Agent: /dkg/publish/1.0.0<br/>/dkg/access/1.0.0<br/>/dkg/query/2.0.0<br/>/dkg/sync/1.0.0
 
     Agent ->> Gossip: Subscribe to contextGraph topics
-    Note right of Gossip: dkg/contextGraph/id/publish<br/>for each configured contextGraph
+    Note right of Gossip: dkg/context-graph/id/finalization<br/>for each configured contextGraph
 
     opt bootstrapPeers configured
         Node ->> Peers: Connect to bootstrap nodes

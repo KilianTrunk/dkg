@@ -246,7 +246,7 @@ Layer 1 (exclusive):  <did:dkg:product:ABC> schema:name "Widget" .
                       Only the owner can set core properties.
 
 Layer 2 (open):       Anyone can add triples in a separate "community" graph
-                      <did:dkg:contextGraph:products/_community>
+                      <did:dkg:context-graph:products/_community>
                       with per-publisher provenance.
 ```
 

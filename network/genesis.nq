@@ -3,7 +3,7 @@
 # This is the deterministic set of RDF quads loaded into every node on first boot.
 # The SHA-256 hash of the canonical (sorted) form of these quads is the networkId:
 #
-#   networkId: dcd82ac91b0d6c67d6766d0d94604a4af9e7435a9c8766f558f00e4fd3a1bb7b
+#   networkId: 7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b
 #
 # Nodes with different genesis cannot peer. Changing anything here changes the
 # networkId and forks the network.
@@ -26,7 +26,7 @@
 <did:dkg:context-graph:agents> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://dkg.network/ontology#SystemContextGraph> <did:dkg:context-graph:agents> .
 <did:dkg:context-graph:agents> <https://schema.org/name> "Agent Registry" <did:dkg:context-graph:agents> .
 <did:dkg:context-graph:agents> <https://schema.org/description> "System contextGraph for agent discovery and profiles" <did:dkg:context-graph:agents> .
-<did:dkg:context-graph:agents> <https://dkg.network/ontology#gossipTopic> "dkg/contextGraph/agents/publish" <did:dkg:context-graph:agents> .
+<did:dkg:context-graph:agents> <https://dkg.network/ontology#gossipTopic> "dkg/context-graph/agents/finalization" <did:dkg:context-graph:agents> .
 <did:dkg:context-graph:agents> <https://dkg.network/ontology#replicationPolicy> "full" <did:dkg:context-graph:agents> .
 
 # ── Ontology system contextGraph (did:dkg:context-graph:ontology graph) ─────────
@@ -35,7 +35,7 @@
 <did:dkg:context-graph:ontology> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://dkg.network/ontology#SystemContextGraph> <did:dkg:context-graph:ontology> .
 <did:dkg:context-graph:ontology> <https://schema.org/name> "Ontology Registry" <did:dkg:context-graph:ontology> .
 <did:dkg:context-graph:ontology> <https://schema.org/description> "System contextGraph for shared ontology and contextGraph definitions" <did:dkg:context-graph:ontology> .
-<did:dkg:context-graph:ontology> <https://dkg.network/ontology#gossipTopic> "dkg/contextGraph/ontology/publish" <did:dkg:context-graph:ontology> .
+<did:dkg:context-graph:ontology> <https://dkg.network/ontology#gossipTopic> "dkg/context-graph/ontology/finalization" <did:dkg:context-graph:ontology> .
 <did:dkg:context-graph:ontology> <https://dkg.network/ontology#replicationPolicy> "full" <did:dkg:context-graph:ontology> .
 
 # ── Ontology: class definitions ──────────────────────────────────────

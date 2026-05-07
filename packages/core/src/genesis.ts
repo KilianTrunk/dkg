@@ -65,7 +65,7 @@ function buildGenesisQuads(): GenesisQuad[] {
   quads.push(q(AG, 'did:dkg:context-graph:agents', `${RDF}type`, `${DKG}SystemContextGraph`));
   quads.push(q(AG, 'did:dkg:context-graph:agents', `${SCHEMA}name`, '"Agent Registry"'));
   quads.push(q(AG, 'did:dkg:context-graph:agents', `${SCHEMA}description`, '"System contextGraph for agent discovery and profiles"'));
-  quads.push(q(AG, 'did:dkg:context-graph:agents', `${DKG}gossipTopic`, '"dkg/contextGraph/agents/publish"'));
+  quads.push(q(AG, 'did:dkg:context-graph:agents', `${DKG}gossipTopic`, '"dkg/context-graph/agents/finalization"'));
   quads.push(q(AG, 'did:dkg:context-graph:agents', `${DKG}replicationPolicy`, '"full"'));
 
   // --- Ontology contextGraph definition ---
@@ -73,7 +73,7 @@ function buildGenesisQuads(): GenesisQuad[] {
   quads.push(q(OG, 'did:dkg:context-graph:ontology', `${RDF}type`, `${DKG}SystemContextGraph`));
   quads.push(q(OG, 'did:dkg:context-graph:ontology', `${SCHEMA}name`, '"Ontology Registry"'));
   quads.push(q(OG, 'did:dkg:context-graph:ontology', `${SCHEMA}description`, '"System contextGraph for shared ontology and contextGraph definitions"'));
-  quads.push(q(OG, 'did:dkg:context-graph:ontology', `${DKG}gossipTopic`, '"dkg/contextGraph/ontology/publish"'));
+  quads.push(q(OG, 'did:dkg:context-graph:ontology', `${DKG}gossipTopic`, '"dkg/context-graph/ontology/finalization"'));
   quads.push(q(OG, 'did:dkg:context-graph:ontology', `${DKG}replicationPolicy`, '"full"'));
 
   // --- Ontology class definitions ---

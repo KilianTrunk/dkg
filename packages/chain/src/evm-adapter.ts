@@ -1295,6 +1295,31 @@ export class EVMChainAdapter implements ChainAdapter {
           }
         }
       }
+
+      if (eventType === 'ContextGraphCreated') {
+        const cgStorage = this.contracts.contextGraphStorage;
+        if (cgStorage) {
+          const eventFilter = cgStorage.filters.ContextGraphCreated();
+          const logs = await cgStorage.queryFilter(eventFilter, filter.fromBlock ?? 0, filter.toBlock);
+          for (const log of logs) {
+            const parsed = cgStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
+            if (parsed) {
+              yield {
+                type: 'ContextGraphCreated',
+                blockNumber: log.blockNumber,
+                data: {
+                  contextGraphId: parsed.args.contextGraphId?.toString() ?? '',
+                  creator: parsed.args.manager?.toString() ?? '',
+                  manager: parsed.args.manager?.toString() ?? '',
+                  requiredSignatures: Number(parsed.args.requiredSignatures ?? 0),
+                  publishPolicy: Number(parsed.args.publishPolicy ?? 0),
+                  txHash: log.transactionHash,
+                },
+              };
+            }
+          }
+        }
+      }
     }
   }
 

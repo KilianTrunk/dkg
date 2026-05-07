@@ -23,7 +23,7 @@ Integrate **Oregon Trail** (multiplayer wagon-train game on the DKG) into the No
 | Concept | DKG / Node UI |
 |--------|----------------|
 | **Oregon Trail** | Multiplayer game: 1 wagon = 1 game = 1 context graph. Turns = rounds; votes = travel/hunt/rest/ford/ferry. Votes live in **workspace**; committed state lives in **context graph**. |
-| **Context Graph** | On-chain M/N signature-gated subgraph in a contextGraph. URI: `did:dkg:contextGraph:{contextGraphId}/context/{contextGraphId}`. One context graph per wagon; participants = wagon members; **floor(2/3 × N)** signatures required to append a new entry (next game state). |
+| **Context Graph** | On-chain M/N signature-gated subgraph in a contextGraph. URI: `did:dkg:context-graph:{contextGraphId}/context/{contextGraphId}`. One context graph per wagon; participants = wagon members; **floor(2/3 × N)** signatures required to append a new entry (next game state). |
 | **Workspace** | DKG workspace on the Oregon Trail contextGraph. Used to publish and sync **votes** so all nodes see each other’s votes before the game master proposes the next context-graph entry. |
 | **Game master** | One of the players (e.g. wagon creator or rotating). Computes next state from votes (e.g. majority), builds the new context-graph entry, and collects signatures from other nodes until ≥ floor(2/3 × N); then commits on-chain. |
 | **Context Oracle** (optional) | Read API that returns triples from a context graph **with Merkle inclusion proofs**. Enables trustless verification of game state in the UI. |
@@ -88,7 +88,7 @@ Integrate **Oregon Trail** (multiplayer wagon-train game on the DKG) into the No
      Join wagon = join the existing context graph (add this node as participant). Publish join event / update membership as required by context graph semantics.
    - **`GET /api/oregon-trail/wagon/:wagonId`**  
      Returns current wagon state (miles, food, party, turn, phase).  
-     Implementation: **read from context graph** `did:dkg:contextGraph:dkg-trail/context/{wagonId}` (or equivalent). No single “local store” of authority; state is the latest attested entry in the CG.
+     Implementation: **read from context graph** `did:dkg:context-graph:dkg-trail/context/{wagonId}` (or equivalent). No single “local store” of authority; state is the latest attested entry in the CG.
    - **`POST /api/oregon-trail/vote`**  
      Body: `{ wagonId, playerId, voteAction, params?, turn? }`.  
      **Publish vote to workspace** (contextGraph). All nodes see votes via workspace sync. No resolution inside this call; resolution is done when the game master proposes a new CG entry.
@@ -167,7 +167,7 @@ Integrate **Oregon Trail** (multiplayer wagon-train game on the DKG) into the No
 ## 5) Data and naming
 
 - **ContextGraph:** e.g. `dkg-trail` (Oregon Trail contextGraph).
-- **Context graph:** One per wagon. URI `did:dkg:contextGraph:dkg-trail/context/{contextGraphId}`. Descriptor in `_meta` graph; participants = wagon members; **M = floor(2/3 × N)** for appending entries.
+- **Context graph:** One per wagon. URI `did:dkg:context-graph:dkg-trail/context/{contextGraphId}`. Descriptor in `_meta` graph; participants = wagon members; **M = floor(2/3 × N)** for appending entries.
 - **Workspace:** Same contextGraph. Votes (wagonId, turn, playerId, action, params) published so all nodes can read them; GM uses votes to compute next state and propose CG entry.
 - **Ontology:** Reuse Oregon Trail RDF types from OregonTrailV9 (e.g. wagon state triples, vote triples). Use existing context graph naming (`contextGraphDataUri`, `contextGraphMetaUri`) where applicable.
 

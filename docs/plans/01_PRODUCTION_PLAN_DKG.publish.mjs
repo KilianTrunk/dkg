@@ -49,7 +49,7 @@ async function main() {
   const contextGraphId = arg('contextGraph', 'dkgv9-production');
   const apiPort = Number(process.env.DKG_API_PORT ?? '9200');
 
-  const graph = `did:dkg:contextGraph:${contextGraphId}`;
+  const graph = `did:dkg:context-graph:${contextGraphId}`;
   const raw = await readFile(planPath, 'utf-8');
   const plan = JSON.parse(raw);
 

@@ -75,8 +75,8 @@ Before going to the network, the publisher stores data locally:
 - Metadata (KC structure, KA manifest, status = "tentative") goes into the **meta graph**.
 
 The `GraphManager` (`packages/storage/src/`) handles graph naming:
-- Data graph: `did:dkg:contextGraph:{contextGraphId}`
-- Meta graph: `did:dkg:contextGraph:{contextGraphId}/_meta`
+- Data graph: `did:dkg:context-graph:{contextGraphId}`
+- Meta graph: `did:dkg:context-graph:{contextGraphId}/_meta`
 
 At this point the data exists only on the publisher node and is marked tentative.
 

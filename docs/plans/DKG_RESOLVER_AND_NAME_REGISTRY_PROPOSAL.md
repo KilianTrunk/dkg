@@ -231,14 +231,14 @@ The following templates define minimum triples for resolver correctness. Predica
   dkg:peerId "12D3..." ;
   schema:name "alice" ;
   dkg:publisherAddress "0xabc..." ;
-  dkg:defaultMemoryContextGraph <did:dkg:contextGraph:agents> ;
+  dkg:defaultMemoryContextGraph <did:dkg:context-graph:agents> ;
   dkg:updatedAt "2026-03-11T00:00:00Z"^^xsd:dateTime .
 ```
 
 ### ContextGraph Registry entry
 
 ```turtle
-<did:dkg:contextGraph:agents> a dkg:ContextGraph ;
+<did:dkg:context-graph:agents> a dkg:ContextGraph ;
   schema:name "agents" ;
   schema:description "Agent registry and profiles" ;
   dkg:ownerAddress "0xabc..." ;
@@ -252,7 +252,7 @@ The following templates define minimum triples for resolver correctness. Predica
 <urn:dkg:name:agents> a dkg:NameClaim ;
   dkg:resolverName "agents" ;
   dkg:targetType "contextGraph" ;
-  dkg:targetId <did:dkg:contextGraph:agents> ;
+  dkg:targetId <did:dkg:context-graph:agents> ;
   dkg:ownerAddress "0xabc..." ;
   dkg:registryStatus "active" ;
   dkg:createdAt "2026-03-11T00:00:00Z"^^xsd:dateTime .

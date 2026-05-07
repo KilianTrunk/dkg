@@ -14,7 +14,7 @@ their tentative data to permanent.
 
 - **Triples, not quads** — the publish message carries `contextGraphId` in the
   envelope, so the graph component (`G` in SPOG) is redundant on the wire.
-  Receiving nodes derive it as `did:dkg:contextGraph:{contextGraphId}`.
+  Receiving nodes derive it as `did:dkg:context-graph:{contextGraphId}`.
 - **Two-level merkle root** — private triples hash into a `privateMerkleRoot`,
   which is anchored as a synthetic public triple. All public triples
   (including the anchor) hash into the `kcMerkleRoot` that goes on-chain.
@@ -143,7 +143,7 @@ sequenceDiagram
     Note right of Agent: operationId / contextGraphId / ntriples<br/>entityProofs flag / kas[]<br/>publisherIdentity / merkleRoot
 
     Agent ->> Gossip: publish(topic, message)
-    Note right of Gossip: topic = dkg/contextGraph/id/publish
+    Note right of Gossip: topic = dkg/context-graph/id/finalization
     Gossip ->> RcvAgent: GossipSub broadcast
 
     Note over RcvAgent,RcvStore: Receiving node validates + stores (same operationId in logs)
@@ -457,7 +457,7 @@ Operational caveat:
 ## How tentative → committed is reflected in the graph
 
 Tentative vs committed is **reflected only in the contextGraph’s meta graph**
-(`did:dkg:contextGraph:{contextGraphId}/_meta`), not in the data graph. The data graph
+(`did:dkg:context-graph:{contextGraphId}/_meta`), not in the data graph. The data graph
 holds the same triples either way; the meta graph records lifecycle and
 on-chain provenance.
 

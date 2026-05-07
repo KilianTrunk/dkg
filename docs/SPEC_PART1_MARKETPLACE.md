@@ -6,7 +6,7 @@
 **Depends on**: Nothing (foundational)
 
 > **Implementation notes (2026-03):**
-> - The agent registry contextGraph is `did:dkg:contextGraph:agents` in code (spec uses `agent-registry`).
+> - The agent registry contextGraph is `did:dkg:context-graph:agents` in code (spec uses `agent-registry`).
 > - Genesis is produced by `getGenesisQuads()` in `packages/core/src/genesis.ts` (N-Quads format, not TriG).
 > - Cross-agent query protocol is `/dkg/query/2.0.0` (spec says `/dkg/query/1.0.0`).
 > - `/dkg/discover/1.0.0` is not implemented; discovery uses SPARQL over the agents contextGraph.
@@ -109,15 +109,15 @@ After step 5, the agent is a live marketplace participant.
 
 ```nquads
 # All triples in the agent-registry contextGraph share one named graph (blank nodes skolemized)
-<did:dkg:agent:QmImageBot> <http://schema.org/name> "ImageBot" <did:dkg:contextGraph:agent-registry> .
-<did:dkg:agent:QmImageBot> <https://dkg.origintrail.io/skill#offersSkill> <did:dkg:agent:QmImageBot/.well-known/genid/offering1> <did:dkg:contextGraph:agent-registry> .
-<did:dkg:agent:QmImageBot/.well-known/genid/offering1> <https://dkg.origintrail.io/skill#skill> <https://dkg.origintrail.io/skill#ImageAnalysis> <did:dkg:contextGraph:agent-registry> .
+<did:dkg:agent:QmImageBot> <http://schema.org/name> "ImageBot" <did:dkg:context-graph:agent-registry> .
+<did:dkg:agent:QmImageBot> <https://dkg.origintrail.io/skill#offersSkill> <did:dkg:agent:QmImageBot/.well-known/genid/offering1> <did:dkg:context-graph:agent-registry> .
+<did:dkg:agent:QmImageBot/.well-known/genid/offering1> <https://dkg.origintrail.io/skill#skill> <https://dkg.origintrail.io/skill#ImageAnalysis> <did:dkg:context-graph:agent-registry> .
 ```
 
 Querying a contextGraph is standard SPARQL:
 
 ```sparql
-SELECT ?s ?p ?o WHERE { GRAPH <did:dkg:contextGraph:agent-registry> { ?s ?p ?o } }
+SELECT ?s ?p ?o WHERE { GRAPH <did:dkg:context-graph:agent-registry> { ?s ?p ?o } }
 ```
 
 ### Knowledge Assets: 1 Entity = 1 KA
@@ -162,8 +162,8 @@ Pre-minted via `reserveKnowledgeCollectionIds()` before publishing.
 
 | Named Graph | URI Pattern | Contents |
 |---|---|---|
-| **Data graph** | `<did:dkg:contextGraph:X>` | All triples from all KCs in this contextGraph (the knowledge) |
-| **Meta graph** | `<did:dkg:contextGraph:X/_meta>` | All KC and KA metadata for this contextGraph (provenance, manifests) |
+| **Data graph** | `<did:dkg:context-graph:X>` | All triples from all KCs in this contextGraph (the knowledge) |
+| **Meta graph** | `<did:dkg:context-graph:X/_meta>` | All KC and KA metadata for this contextGraph (provenance, manifests) |
 
 No side-index. No ownership index. No per-KC named graphs. The KA-to-triple mapping is `dkg:rootEntity` in the meta graph. A contextGraph with 100K KCs still has exactly 2 named graphs.
 
@@ -173,7 +173,7 @@ No side-index. No ownership index. No per-KC named graphs. The KA-to-triple mapp
 
 An agent publishes KC 42 with 2 KAs in the agent-registry contextGraph: its own profile (mixed public/private) and its skill's input schema (fully public).
 
-**ContextGraph data graph** `<did:dkg:contextGraph:agent-registry>` — public triples (on all nodes):
+**ContextGraph data graph** `<did:dkg:context-graph:agent-registry>` — public triples (on all nodes):
 
 ```turtle
 # KA 1: Agent profile — public portion (blank nodes skolemized under rootEntity)
@@ -218,7 +218,7 @@ An agent publishes KC 42 with 2 KAs in the agent-registry contextGraph: its own 
 
 Any agent can see ImageBot's public profile and query its skill offering. The private triples (model version, real costs, traffic volume) are only on ImageBot's node — available for purchase at the listed price.
 
-**Meta graph** `<did:dkg:contextGraph:agent-registry/_meta>` (shared by ALL KCs in this contextGraph):
+**Meta graph** `<did:dkg:context-graph:agent-registry/_meta>` (shared by ALL KCs in this contextGraph):
 
 ```turtle
 # KC 42 metadata (coexists with thousands of other agent KCs in the same meta graph)
@@ -226,7 +226,7 @@ Any agent can see ImageBot's public profile and query its skill offering. The pr
     a dkg:KnowledgeCollection ;
     dkg:merkleRoot          "0xfc92a1..."^^xsd:hexBinary ;
     dkg:knowledgeAssetCount "2"^^xsd:integer ;
-    dkg:inContextGraph           <did:dkg:contextGraph:agent-registry> ;
+    dkg:inContextGraph           <did:dkg:context-graph:agent-registry> ;
     dkg:status              dkg:Confirmed ;
     prov:wasGeneratedBy [
         a dkg:PublishActivity ;
@@ -383,8 +383,8 @@ DHT and GossipSub are complementary: DHT for point lookups against the full netw
 
 | Topic Pattern | Purpose | Example |
 |---|---|---|
-| `dkg/contextGraph/{id}/publish` | New KC published | Nodes update their local store |
-| `dkg/contextGraph/{id}/agents` | Agent joined/left/updated | Skill discovery cache invalidation |
+| `dkg/context-graph/{id}/finalization` | New KC published | Nodes update their local store |
+| `dkg/context-graph/{id}/agents` | Agent joined/left/updated | Skill discovery cache invalidation |
 | `dkg/network/peers` | Global peer announcements | Bootstrap acceleration |
 
 ### Protocol Messages
@@ -479,7 +479,7 @@ Flow: requester sends `AccessRequest` with payment proof → publisher node veri
               Publisher: build PublishRequest with public triples only in nquads,
                          private sub-roots in manifest entries
 
-3. Distribute Publisher broadcasts PublishRequest via GossipSub (`dkg/contextGraph/{id}/publish`)
+3. Distribute Publisher broadcasts PublishRequest via GossipSub (`dkg/context-graph/{id}/finalization`)
               All contextGraph nodes receive: PublishRequest {nquads, manifest, contextGraphId}
               Storage Nodes: validate manifest, canonicalize public triples,
                              compute public sub-roots per KA, combine with
@@ -561,7 +561,7 @@ Tentative triples are queryable (annotated with `dkg:status dkg:Tentative` in me
 
 ### Agent Registry ContextGraph
 
-A well-known contextGraph (`did:dkg:contextGraph:agent-registry`) where agents publish profiles as KAs.
+A well-known contextGraph (`did:dkg:context-graph:agent-registry`) where agents publish profiles as KAs.
 
 ### Agent Profile (RDF)
 
@@ -606,7 +606,7 @@ Find agents offering climate analysis under 100 TRAC:
 PREFIX dkgskill: <https://dkg.origintrail.io/skill#>
 SELECT ?agent ?name ?price ?successRate
 WHERE {
-  GRAPH <did:dkg:contextGraph:agent-registry> {
+  GRAPH <did:dkg:context-graph:agent-registry> {
     ?agent a dkgskill:Agent ; schema:name ?name ;
            dkgskill:offersSkill ?o .
     ?o dkgskill:skill/rdfs:subClassOf* dkgskill:ClimateRiskAssessment ;
@@ -798,20 +798,20 @@ Shipped with every `@origintrail-official/dkg-core` package via `getGenesisQuads
     schema:name "DKG V9 Testnet" ;
     dkg:genesisVersion 1 ;
     dkg:createdAt "2026-02-24T00:00:00Z"^^xsd:dateTime ;
-    dkg:systemContextGraphs <did:dkg:contextGraph:agents>, <did:dkg:contextGraph:ontology> .
+    dkg:systemContextGraphs <did:dkg:context-graph:agents>, <did:dkg:context-graph:ontology> .
 
 # --- System ContextGraph: Agent Registry ---
-GRAPH <did:dkg:contextGraph:agents> {
-    <did:dkg:contextGraph:agents>
+GRAPH <did:dkg:context-graph:agents> {
+    <did:dkg:context-graph:agents>
         a dkg:ContextGraph, dkg:SystemContextGraph ;
         schema:name "Agent Registry" ;
         schema:description "System contextGraph for agent discovery and profiles" ;
-        dkg:gossipTopic "dkg/contextGraph/agents/publish" ;
+        dkg:gossipTopic "dkg/context-graph/agents/finalization" ;
         dkg:replicationPolicy "full" .
 }
 
 # --- System ContextGraph: Ontology ---
-GRAPH <did:dkg:contextGraph:ontology> {
+GRAPH <did:dkg:context-graph:ontology> {
     dkg:Network           a rdfs:Class .
     dkg:ContextGraph           a rdfs:Class .
     dkg:SystemContextGraph     a rdfs:Class ; rdfs:subClassOf dkg:ContextGraph .
@@ -844,7 +844,7 @@ networkId = SHA-256(canonical(getGenesisQuads()))
 
 ### Agent Profile Ontology (ERC-8004 Aligned)
 
-Agent profiles in `did:dkg:contextGraph:agents` use three vocabularies:
+Agent profiles in `did:dkg:context-graph:agents` use three vocabularies:
 
 | Layer | Prefix | Purpose |
 |---|---|---|
@@ -895,7 +895,7 @@ When on-chain identity is available (Phase 2), the profile includes:
 
 2. Every boot:
    ├─ Verify genesis triples present in store (integrity check)
-   ├─ Publish own agent profile as KA into did:dkg:contextGraph:agents
+   ├─ Publish own agent profile as KA into did:dkg:context-graph:agents
    ├─ Subscribe to GossipSub topics from genesis system contextGraphs
    ├─ Connect to relays / bootstrap peers
    └─ Request contextGraph sync from connected peers (catch up)
@@ -923,7 +923,7 @@ The genesis pattern extends to user-created contextGraphs:
 1. Creator publishes a contextGraph definition as a KA (with metadata: name, description, GossipSub topic, replication policy)
 2. The contextGraph definition can live in the agents contextGraph (making it globally discoverable)
 3. Other nodes join by subscribing to the contextGraph's GossipSub topic and syncing existing data
-4. All contextGraphs follow the same 2-graph structure: `<did:dkg:contextGraph:{id}>` (data) + `<did:dkg:contextGraph:{id}/_meta>` (metadata)
+4. All contextGraphs follow the same 2-graph structure: `<did:dkg:context-graph:{id}>` (data) + `<did:dkg:context-graph:{id}/_meta>` (metadata)
 
 ### Network Upgrades
 
@@ -945,7 +945,7 @@ All SPARQL queries execute **locally** against the node's own triple store. Ther
 Standard SPARQL via the storage adapter:
 
 ```sparql
-SELECT ?s ?p ?o WHERE { GRAPH <did:dkg:contextGraph:agent-registry> { ?s ?p ?o } }
+SELECT ?s ?p ?o WHERE { GRAPH <did:dkg:context-graph:agent-registry> { ?s ?p ?o } }
 ```
 
 Since Phase 1 uses full replication (every contextGraph node stores all public triples), local queries are sufficient — the node always has the complete public dataset for its subscribed contextGraphs.
@@ -973,11 +973,11 @@ SELECT ?entity ?contextGraph WHERE {
     ?kc dkg:inContextGraph ?contextGraph .
   }
 }
-# → entity=<did:dkg:agent:QmImageBot>, contextGraph=<did:dkg:contextGraph:agent-registry>
+# → entity=<did:dkg:agent:QmImageBot>, contextGraph=<did:dkg:context-graph:agent-registry>
 
 # Step 2: get all triples about ImageBot from the contextGraph (includes skolemized sub-nodes)
 SELECT ?s ?p ?o WHERE {
-  GRAPH <did:dkg:contextGraph:agent-registry> {
+  GRAPH <did:dkg:context-graph:agent-registry> {
     ?s ?p ?o .
     FILTER(?s = <did:dkg:agent:QmImageBot> || STRSTARTS(STR(?s), "did:dkg:agent:QmImageBot/.well-known/genid/"))
   }
@@ -992,7 +992,7 @@ Optional step 3: verify by recomputing merkle root from returned triples and com
 
 ```sparql
 SELECT ?publisher ?txHash ?when WHERE {
-  GRAPH <did:dkg:contextGraph:agent-registry/_meta> {
+  GRAPH <did:dkg:context-graph:agent-registry/_meta> {
     ?ka  dkg:rootEntity         <did:dkg:agent:QmImageBot> ;
          dkg:partOfCollection   ?kc .
     ?kc  prov:wasGeneratedBy    ?activity .
@@ -1009,7 +1009,7 @@ SELECT ?publisher ?txHash ?when WHERE {
 
 ```sparql
 SELECT ?ka ?entity ?publicCount ?privateCount ?price WHERE {
-  GRAPH <did:dkg:contextGraph:agent-registry/_meta> {
+  GRAPH <did:dkg:context-graph:agent-registry/_meta> {
     ?ka  a dkg:KnowledgeAsset ;
          dkg:rootEntity          ?entity ;
          dkg:publicTripleCount   ?publicCount ;

@@ -6,12 +6,12 @@
   "contextGraphs": [
     {
       "id": "dkgv9-production",
-      "uri": "did:dkg:contextGraph:dkgv9-production",
+      "uri": "did:dkg:context-graph:dkgv9-production",
       "purpose": "Real-time human+agent implementation coordination and delivery state"
     },
     {
       "id": "dkgv9-trust-lab",
-      "uri": "did:dkg:contextGraph:dkgv9-trust-lab",
+      "uri": "did:dkg:context-graph:dkgv9-trust-lab",
       "purpose": "Trust, provenance, and adversarial validation experiments"
     }
   ],

@@ -460,7 +460,7 @@ implementers can quickly see what each point brings.
 
 - **What it brings**: Reframes the issue as a distributed consistency concern across nodes.
 - **Node/graph example**: Node `A` writes `status=traveling` into
-  `did:dkg:contextGraph:example-contextGraph/_workspace`, gossips launch event to `B` and `C`.
+  `did:dkg:context-graph:example-contextGraph/_workspace`, gossips launch event to `B` and `C`.
   Node `B` later queries an older workspace snapshot and sees `status=recruiting`.
   Without consistency semantics, `B` can regress local state from the graph read.
 
@@ -476,7 +476,7 @@ implementers can quickly see what each point brings.
 
 - **What it brings**: Clarifies constraints: no global lock, keep eventual consistency.
 - **Node/graph example**: Node `C` should still accept delayed replication from
-  `did:dkg:contextGraph:example-contextGraph/_workspace`, but never allow that delayed value to
+  `did:dkg:context-graph:example-contextGraph/_workspace`, but never allow that delayed value to
   move a monotonic field backward.
 
 ### 12.4 Proposed improvements (what each adds in practice)

@@ -70,7 +70,7 @@ urn:exp-d2:$RUN_ID:$agent:$stream:decision:<n>
 4) Publish FINAL HANDOFF entity:
 urn:exp-d2:$RUN_ID:$agent:$stream:handoff
 
-Use graph: did:dkg:contextGraph:$CONTEXT_GRAPH_ID
+Use graph: did:dkg:context-graph:$CONTEXT_GRAPH_ID
 Include predicates:
 - rdf:type
 - https://ontology.dkg.io/devgraph#summary

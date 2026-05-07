@@ -18,7 +18,7 @@ function serializeQuadsToNQuads(batch: Array<{ subject: string; predicate: strin
 describe.skipIf(!existsSync(FINDINGS_FILE))('synthetic findings workspace serialization regression', () => {
   it('serializes every staged workspace batch for the synthetic findings file without parser errors', async () => {
     const raw = readFileSync(FINDINGS_FILE, 'utf-8');
-    const quads = await parseRdf(raw, 'ntriples', 'did:dkg:contextGraph:music-social');
+    const quads = await parseRdf(raw, 'ntriples', 'did:dkg:context-graph:music-social');
 
     const batches = batchEntityQuads(quads, {
       maxBatchQuads: 500,

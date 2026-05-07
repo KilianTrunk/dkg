@@ -614,7 +614,7 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     return jsonResponse(res, 200, { connected: true });
   }
 
-  // POST /api/update  { kcId: "...", contextGraphId|contextGraphId: "...", quads: [...], privateQuads?: [...] }
+  // POST /api/update  { kcId: "...", contextGraphId: "...", quads: [...], privateQuads?: [...] }
   if (req.method === "POST" && path === "/api/update") {
     const body = await readBody(req);
     const parsed = JSON.parse(body);
@@ -622,7 +622,7 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     const contextGraphId = parsed.contextGraphId;
     if (!kcId || !contextGraphId || !quads?.length) {
       return jsonResponse(res, 400, {
-        error: 'Missing "kcId", "contextGraphId" (or "contextGraphId"), or "quads"',
+        error: 'Missing "kcId", "contextGraphId", or "quads"',
       });
     }
     let kcIdBigInt: bigint;

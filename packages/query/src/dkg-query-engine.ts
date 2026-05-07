@@ -212,7 +212,7 @@ export class DKGQueryEngine implements QueryEngine {
     if (options?.view) {
       if (!effectiveContextGraphId) {
         throw new Error(
-          `view '${options.view}' requires a contextGraphId or contextGraphId to scope the query`,
+          `view '${options.view}' requires a contextGraphId to scope the query`,
         );
       }
       if (options.subGraphName) {

@@ -1489,7 +1489,7 @@ async function phase7() {
     },
   ]);
   fmt.note('  ✓ verified live · ~ partially verified (grant durable, P2P fetch not yet CLI-exposed) · ? not verified');
-  fmt.note(`  Anyone (no grant) row: ${anyoneNote}`);
+  fmt.note(`  Subscriber (pre-fetch) row: ${subscriberNote}`);
   fmt.note('  Competitor row needs a third ungranted node attempting `PROTOCOL_ACCESS` to verify denial — out of scope for this 2-node setup.');
 }
 

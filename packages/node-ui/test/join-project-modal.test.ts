@@ -77,6 +77,34 @@ describe('JoinProjectModal invite parsing', () => {
       expect(parsed.curatorPeerId).toBeNull();
     });
 
+    // Codex review on PR #431 (round 2): V9 `<cgId> @ <multiaddr>` form
+    // was leaving the `@` glued to the cgId (`"my-project @"`).
+    it('parses V9 single-line `<cgId> @ <multiaddr>` form, stripping the `@` separator', () => {
+      const raw = 'my-project @ /ip4/1.2.3.4/tcp/9090/p2p/12D3KooWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+      const parsed = parseInviteCode(raw);
+      expect(parsed.cgId).toBe('my-project');
+      expect(parsed.legacyMultiaddr).toBe('/ip4/1.2.3.4/tcp/9090/p2p/12D3KooWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+      expect(parsed.hasUnparsedExtra).toBe(false);
+      expect(validateInvite(parsed)).toBeNull();
+    });
+
+    // Codex review on PR #431 (round 2): inline multiaddr regex was missing
+    // /dnsaddr/, so DNS-based legacy invites collapsed into the cgId line.
+    it('recognizes /dnsaddr/ multiaddrs (was dropped by the old regex)', () => {
+      const raw = 'my-project /dnsaddr/relay.example.com/p2p/12D3KooWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+      const parsed = parseInviteCode(raw);
+      expect(parsed.cgId).toBe('my-project');
+      expect(parsed.legacyMultiaddr).toBe('/dnsaddr/relay.example.com/p2p/12D3KooWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+      expect(parsed.hasUnparsedExtra).toBe(false);
+    });
+
+    it('recognizes /dns4/ multiaddrs in two-line form', () => {
+      const raw = 'my-project\n/dns4/relay.example.com/tcp/9090/p2p/12D3KooWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+      const parsed = parseInviteCode(raw);
+      expect(parsed.cgId).toBe('my-project');
+      expect(parsed.legacyMultiaddr).toBe('/dns4/relay.example.com/tcp/9090/p2p/12D3KooWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+    });
+
     it('validates missing peer id in multiaddr', () => {
       const parsed = parseInviteCode('0xabc/project\n/ip4/127.0.0.1/tcp/9090');
       expect(validateInvite(parsed)).toBe('Curator multiaddr is missing peer ID');

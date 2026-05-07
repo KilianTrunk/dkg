@@ -48,7 +48,12 @@ export function parseInviteCode(raw: string): ParsedInvite {
   const remainder = lines.slice(1).join(' ').trim();
 
   // Legacy: any `/ip4|ip6|dns…/.../p2p/<id>` token anywhere in the body.
-  const inlineMultiaddrMatch = normalized.match(/(?:^|\s)(\/(?:ip4|ip6|dns|dns4|dns6)\/\S+)/);
+  // Codex review on PR #431 (round 2) flagged that the old alternation
+  // dropped `dnsaddr`, so a legacy invite of the form
+  // `my-project /dnsaddr/example.com/p2p/...` had its multiaddr ignored
+  // and the whole line collapsed into the cgId. Keep this synchronised
+  // with `isMultiaddrRemotelyDialable` in ShareProjectModal.tsx.
+  const inlineMultiaddrMatch = normalized.match(/(?:^|\s)(\/(?:ip4|ip6|dns|dns4|dns6|dnsaddr)\/\S+)/);
   const inlineMultiaddr = inlineMultiaddrMatch?.[1]?.replace(/\s+/g, '') ?? null;
   const multilineMultiaddr = remainder.replace(/\s+/g, '');
   const legacyMultiaddr = multilineMultiaddr.startsWith('/')
@@ -68,11 +73,17 @@ export function parseInviteCode(raw: string): ParsedInvite {
     }
   }
 
-  // CG id: first line (with the inline multiaddr stripped if it appeared
-  // glued onto the same line — a quirk of the legacy single-line invite).
-  const cgId = inlineMultiaddr && firstLine.includes(inlineMultiaddr)
-    ? firstLine.replace(inlineMultiaddr, '').trim()
-    : firstLine;
+  // CG id: strip the inline multiaddr (if it appeared glued onto the same
+  // line — a quirk of the legacy single-line invite) AND the V9 `@`
+  // separator that sometimes joined them. Codex review on PR #431 (round
+  // 2) flagged that the old code only stripped the multiaddr token, so
+  // `my-project @ /ip4/...` parsed cgId as `"my-project @"`, which would
+  // then be silently subscribed to as a non-existent CG.
+  let cgId = firstLine;
+  if (inlineMultiaddr && cgId.includes(inlineMultiaddr)) {
+    cgId = cgId.replace(inlineMultiaddr, '');
+  }
+  cgId = cgId.replace(/\s*@\s*$/, '').trim();
 
   // Detect content past the cgId line that neither parser claimed. The
   // remainder lines combined yield non-empty text, but no peer-id and no

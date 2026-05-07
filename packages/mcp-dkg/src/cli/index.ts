@@ -161,7 +161,7 @@ function parseJoinArgs(args: string[]): JoinOptions {
   };
 }
 
-interface ParsedInvite {
+export interface ParsedInvite {
   contextGraphId: string;
   /** Legacy V9: full multiaddr embedded in the invite. */
   multiaddr: string | null;
@@ -171,7 +171,7 @@ interface ParsedInvite {
 
 const PEER_ID_RE = /^(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|12D3Koo[1-9A-HJ-NP-Za-km-z]{45,53})$/;
 
-function parseInviteCode(raw: string): ParsedInvite {
+export function parseInviteCode(raw: string): ParsedInvite {
   const trimmed = raw.trim();
   // V9 single-line `<cgId> @ <multiaddr>`.
   const atForm = trimmed.match(/^(.+?)\s*@\s*(\/.+)$/);
@@ -189,6 +189,16 @@ function parseInviteCode(raw: string): ParsedInvite {
     if (PEER_ID_RE.test(lines[1])) {
       return { contextGraphId: lines[0], multiaddr: null, curatorPeerId: lines[1] };
     }
+    // 2+ lines, but neither parser claims line 2 (or beyond). Codex review
+    // on PR #431 (round 2) flagged that the old code silently fell through
+    // to `{ contextGraphId: trimmed }` here, so a typo'd peer id like
+    // `my-project\n12D3KooBAD` turned into a subscribe attempt for the
+    // garbage cgId `"my-project\n12D3KooBAD"`. Fail fast instead — the
+    // UI's parseInviteCode now does the same via `hasUnparsedExtra`.
+    throw new Error(
+      `Invalid invite: line 2 "${lines[1]}" is neither a valid peer ID (12D3Koo…) ` +
+      'nor a multiaddr (/ip4/…). Check for typos.',
+    );
   }
 
   return { contextGraphId: trimmed, multiaddr: null, curatorPeerId: null };
@@ -214,7 +224,13 @@ async function cmdJoin(args: string[]): Promise<number> {
     return 2;
   }
 
-  const invite = parseInviteCode(opts.inviteCode);
+  let invite: ParsedInvite;
+  try {
+    invite = parseInviteCode(opts.inviteCode);
+  } catch (err) {
+    console.error(`[join] ${(err as Error).message}`);
+    return 2;
+  }
   console.log(`[join] context graph: ${invite.contextGraphId}`);
   if (invite.curatorPeerId) console.log(`[join] curator peer id: ${invite.curatorPeerId} (will resolve via DHT)`);
   if (invite.multiaddr) console.log(`[join] curator multiaddr: ${invite.multiaddr} (legacy form, ask curator to regenerate via Share Project)`);

@@ -417,13 +417,21 @@ function detectContext(
     return { context: 'installed', monorepoRoot: null };
   }
   // Round-13 Fix 19: search from the running CLI's directory.
-  // Falls back to cwd ONLY for forced --monorepo (where the
-  // operator's intent overrides auto-detect), and only as a last
-  // resort if argv[1] is unresolvable.
   const cliDir = dirnameOfRunningCli();
   if (opts.force === 'monorepo') {
-    const startDir = cliDir ?? process.cwd();
-    const root = findRoot(startDir);
+    // Codex Round-15 Fix 21: forced --monorepo searches `cwd` FIRST.
+    // The flag's contract is "use the monorepo from THIS checkout"
+    // — the user's explicit cwd-context intent overrides auto-detect
+    // heuristics. Pre-fix (Round-13 FIX 19) we tried `cliDir` first,
+    // which hard-failed when a global `dkg` was invoked from inside
+    // a valid monorepo with `--monorepo` (the global install path
+    // doesn't have a monorepo above it). Falls back to `cliDir`
+    // before throwing for the test pattern that invokes the dist
+    // directly without a matching cwd; auto-detect path below
+    // stays cliDir-first because cwd is incidental for unflagged
+    // invocations.
+    let root = findRoot(process.cwd());
+    if (!root && cliDir) root = findRoot(cliDir);
     if (!root) {
       throw new Error(
         '--monorepo flag passed but no DKG monorepo root could be located from this CLI invocation.',
@@ -948,16 +956,28 @@ function classify(
     Array.isArray((current as Record<string, unknown>).args) &&
     JSON.stringify((current as Record<string, unknown>).args) ===
       JSON.stringify(expected.args);
-  // Codex Round-9 Fix 16: also compare the `env: { DKG_HOME }`
-  // field. A registered entry with a different DKG_HOME (e.g.
-  // operator changed `DKG_HOME` between runs, or moved their
-  // bootstrap state) is genuine drift — refresh on the new value.
-  // Pre-Fix-16 entries that lack `env` entirely classify as
-  // `stale` and migrate forward automatically (deep-equal of
-  // `undefined` vs `{ DKG_HOME }` is false).
-  const envMatch =
-    JSON.stringify((current as Record<string, unknown>).env) ===
-      JSON.stringify(expected.env);
+  // Codex Round-9 Fix 16 + Round-15 Fix 22: compare ONLY the
+  // `env.DKG_HOME` field, not the whole env object. Round-9 used
+  // strict JSON.stringify equality on env, but that turned any
+  // user-added MCP env var (NODE_OPTIONS, HTTPS_PROXY, custom
+  // debug flags) into spurious "stale drift" — and combined with
+  // writeRegistration's full-entry replace, those user vars got
+  // silently wiped on every re-run. Post-fix: only DKG_HOME
+  // matters for staleness; user-added keys are preserved by the
+  // write-time merge in writeRegistration. A pre-Fix-16 entry
+  // lacking `env` entirely classifies as `stale` (currentDkgHome
+  // === undefined !== expectedDkgHome) and migrates forward.
+  const currentEnvObj =
+    (current as Record<string, unknown>).env &&
+    typeof (current as Record<string, unknown>).env === 'object'
+      ? ((current as Record<string, unknown>).env as Record<string, unknown>)
+      : undefined;
+  const currentDkgHome = currentEnvObj?.DKG_HOME;
+  const expectedDkgHome =
+    expected.env && typeof expected.env === 'object'
+      ? (expected.env as Record<string, unknown>).DKG_HOME
+      : undefined;
+  const envMatch = currentDkgHome === expectedDkgHome;
   const matches =
     typeof current === 'object' &&
     current !== null &&
@@ -978,7 +998,33 @@ function writeRegistration(
   const body = readConfigBody(target);
   const { head, leaf } = splitEntryPath(target.entryPath);
   const container = ensurePathContainer(body, head);
-  container[leaf] = entry;
+
+  // Codex Round-15 Fix 22 Part B: when refreshing an existing
+  // entry, MERGE its `env` map with the expected env instead of
+  // replacing the whole entry blindly. User-added MCP env vars
+  // (NODE_OPTIONS, HTTPS_PROXY, custom debug flags, etc.) live
+  // alongside DKG_HOME in the same `env` object — pre-fix the
+  // full-entry replace silently wiped those on every refresh.
+  // Spread order: existing env first, then expected env, so
+  // expected.DKG_HOME overrides any prior DKG_HOME but
+  // user-added keys from the existing entry are preserved.
+  const currentEntry = container[leaf];
+  const currentEnv =
+    currentEntry &&
+    typeof currentEntry === 'object' &&
+    (currentEntry as Record<string, unknown>).env &&
+    typeof (currentEntry as Record<string, unknown>).env === 'object'
+      ? ((currentEntry as Record<string, unknown>).env as Record<string, unknown>)
+      : {};
+  const expectedEnv =
+    entry.env && typeof entry.env === 'object'
+      ? (entry.env as Record<string, unknown>)
+      : {};
+  const mergedEntry: Record<string, unknown> = {
+    ...entry,
+    env: { ...currentEnv, ...expectedEnv },
+  };
+  container[leaf] = mergedEntry;
   writeConfigBody(target, body);
 }
 

@@ -2591,4 +2591,184 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       restoreWslEnv();
     }
   });
+
+  // ── Codex Round-15 Fix 21: --monorepo cwd-first ordering ─────────
+
+  it('Codex Round-15 Fix 21: --monorepo + global CLI invoked from inside a valid monorepo cwd → resolves against cwd', async () => {
+    // Pre-fix (Round-13 FIX 19) the forced-monorepo branch tried
+    // `cliDir` first, which hard-failed when a global `dkg` was
+    // invoked from inside a valid monorepo with `--monorepo`. The
+    // global install path doesn't have a monorepo above it; the
+    // user's intent was clearly cwd. Post-fix: cwd first, cliDir
+    // as a fallback before throwing.
+    //
+    // Test setup: simulate the global-CLI-from-inside-monorepo case.
+    // Stub findRoot so:
+    //   - `<cwd>` returns a fake monorepo root (the user's intent).
+    //   - any other path (cliDir, e.g.) returns null.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    const userCwd = process.cwd();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const findStub = vi.fn((startDir?: string) => {
+      // cwd matches → return the fake repo root.
+      if (startDir === userCwd) return fakeRepoRoot;
+      // Any other start dir (cliDir would be vitest's dist
+      // directory) → no monorepo above it.
+      return null;
+    });
+
+    const deps = makeDeps({ findDkgMonorepoRoot: findStub });
+
+    // Should NOT throw. The cwd-first logic finds the root.
+    await mcpSetupAction({ monorepo: true, start: false, fund: false, verify: false }, deps);
+
+    // The Cursor entry's args[0] points at the fake repo root's
+    // cli.dist (proves the monorepo branch was taken with the
+    // cwd-derived root).
+    const cursor = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursor.mcpServers.dkg.args[0]).toBe(
+      join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
+    );
+    // findStub was called with cwd at least once (cwd-first).
+    const callArgs = findStub.mock.calls.map((c) => c[0]);
+    expect(callArgs).toContain(userCwd);
+  });
+
+  it('Codex Round-15 Fix 21: --monorepo + cwd has no monorepo + cliDir has one → falls back to cliDir', async () => {
+    // The fallback contract: when cwd doesn't have a monorepo above
+    // it but the running CLI's dir does (test runner pattern: the
+    // test invokes mcpSetupAction with --monorepo from a tmpHome
+    // cwd that's outside any monorepo, but the test runner's own
+    // dist might be inside a monorepo for cli-self-test scenarios).
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const findStub = vi.fn((startDir?: string) => {
+      // Anything matching `<cwd>` (test's tmpHome ancestors) → no
+      // monorepo. Anything else (cliDir-derived) → fakeRepoRoot.
+      const cwd = process.cwd();
+      if (startDir && startDir.startsWith(cwd)) return null;
+      return fakeRepoRoot;
+    });
+
+    const deps = makeDeps({ findDkgMonorepoRoot: findStub });
+    // Should resolve via the cliDir fallback.
+    await mcpSetupAction({ monorepo: true, start: false, fund: false, verify: false }, deps);
+
+    const cursor = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursor.mcpServers.dkg.args[0]).toBe(
+      join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
+    );
+    // findStub called at least twice — once with cwd, once with cliDir.
+    expect(findStub.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('Codex Round-15 Fix 21: --monorepo + neither cwd nor cliDir has a monorepo → throws actionable error', async () => {
+    // Existing behavior preserved: when nothing finds a root, the
+    // throw fires with the same actionable message as before.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const findStub = vi.fn(() => null);
+    const deps = makeDeps({ findDkgMonorepoRoot: findStub });
+
+    await expect(
+      mcpSetupAction({ monorepo: true, start: false, fund: false, verify: false }, deps),
+    ).rejects.toThrow(/no DKG monorepo root could be located/);
+
+    // Both cwd and cliDir attempted before throwing.
+    expect(findStub.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // ── Codex Round-15 Fix 22: classify DKG_HOME-only + writeRegistration env merge ──
+
+  it('Codex Round-15 Fix 22: existing entry with user env keys + DKG_HOME drift → stale; refresh preserves user keys, updates DKG_HOME', async () => {
+    // Load-bearing: an operator hand-edited their MCP config to add
+    // NODE_OPTIONS / HTTPS_PROXY for proxy or memory tuning. Pre-fix
+    // a setup re-run with a different DKG_HOME would (a) classify
+    // as stale (correct) AND (b) silently wipe the user's vars on
+    // refresh because writeRegistration replaced the whole entry.
+    //
+    // Post-fix: stale-classification reason narrows to DKG_HOME
+    // drift only; refresh merges existing env keys with the
+    // expected env so DKG_HOME wins but user keys survive.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          dkg: {
+            command: process.execPath,
+            args: [realpathSync(process.argv[1]), 'mcp', 'serve'],
+            env: {
+              DKG_HOME: '/old/abandoned/path',
+              NODE_OPTIONS: '--max-old-space-size=8192',
+              HTTPS_PROXY: 'http://corporate-proxy:8080',
+            },
+          },
+        },
+      }, null, 2),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    // DKG_HOME refreshed to current bootstrap home.
+    expect(after.mcpServers.dkg.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    // User keys PRESERVED — Round-15 Fix 22's load-bearing assertion.
+    expect(after.mcpServers.dkg.env.NODE_OPTIONS).toBe('--max-old-space-size=8192');
+    expect(after.mcpServers.dkg.env.HTTPS_PROXY).toBe('http://corporate-proxy:8080');
+  });
+
+  it('Codex Round-15 Fix 22: existing entry with user env keys + matching DKG_HOME → registered (no spurious stale)', async () => {
+    // Pre-fix: strict-equal env comparison flagged user-added keys
+    // as drift even when DKG_HOME matched, forcing a needless
+    // refresh. Post-fix: only DKG_HOME matters; user keys are
+    // ignored for staleness purposes. Re-run is a no-op.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    const expectedHome = join(tmpHome, '.dkg');
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          dkg: {
+            command: process.execPath,
+            args: [realpathSync(process.argv[1]), 'mcp', 'serve'],
+            env: {
+              DKG_HOME: expectedHome,
+              NODE_OPTIONS: '--max-old-space-size=8192',
+            },
+          },
+        },
+      }, null, 2),
+    );
+    const beforeMtime = (await import('node:fs')).statSync(join(cursorDir, 'mcp.json')).mtimeMs;
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // File NOT rewritten — classifier saw matching DKG_HOME and
+    // ignored the unrelated NODE_OPTIONS.
+    const afterMtime = (await import('node:fs')).statSync(join(cursorDir, 'mcp.json')).mtimeMs;
+    expect(afterMtime).toBe(beforeMtime);
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    expect(after.mcpServers.dkg.env.NODE_OPTIONS).toBe('--max-old-space-size=8192');
+  });
+
+  it('Codex Round-15 Fix 22: fresh client (no existing entry) → entry written with just env: { DKG_HOME }', async () => {
+    // Regression guard: when there's nothing to merge, writeRegistration
+    // emits the expected entry verbatim. No accidental empty `env`
+    // spread artifacts; no leftover keys from a non-existent prior.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps();
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const cursor = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursor.mcpServers.dkg.env).toEqual({ DKG_HOME: join(tmpHome, '.dkg') });
+    // No extra keys leaked into env.
+    expect(Object.keys(cursor.mcpServers.dkg.env)).toEqual(['DKG_HOME']);
+  });
 });

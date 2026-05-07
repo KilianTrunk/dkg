@@ -832,14 +832,22 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     );
   });
 
-  it('F30: pre-existing bare-"dkg" entry classifies as `registered` against resolved-path canonical', async () => {
-    // Re-run resilience: a user previously ran `dkg mcp setup`
-    // pre-F30 (bare-`"dkg"` written), then upgraded to a setup
-    // version that writes the resolved-path form. The re-run MUST
-    // NOT classify the pre-existing entry as `stale` and trigger
-    // a refresh — the bare command and the resolved path invoke
-    // the SAME bin on PATH today. Avoids spurious `--force`
-    // prompts and unnecessary file rewrites.
+  it('F30 + Codex Round-3: pre-existing bare-"dkg" entry classifies as `stale` and migrates to resolved-path form', async () => {
+    // Codex round-3 reversed the round-2 bare↔absolute equivalence
+    // direction. Round-2 treated bare-`"dkg"` as `registered`
+    // against a resolved-path canonical, but that meant a stock
+    // `dkg mcp setup` re-run NEVER migrated legacy entries to the
+    // GUI-safe absolute-path form. Existing Claude Desktop /
+    // Windsurf / VSCode installs stayed broken in the no-PATH
+    // scenario F30 exists to fix unless the operator passed
+    // `--force` — defeating the auto-migration intent of the
+    // re-run.
+    //
+    // New contract: bare current vs absolute expected ⇒ `stale` ⇒
+    // refresh to absolute on stock re-run. The reverse case
+    // (absolute current vs bare expected from resolveDkgBin
+    // failure) stays `registered` so working absolute entries
+    // aren't downgraded — see the Codex Round-2 Bug C tests below.
     const cursorDir = join(tmpHome, '.cursor');
     mkdirSync(cursorDir, { recursive: true });
     writeFileSync(
@@ -850,20 +858,20 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
         2,
       ),
     );
-    const beforeMtime = (await import('node:fs')).statSync(join(cursorDir, 'mcp.json')).mtimeMs;
 
     const deps = makeDeps({
       resolveDkgBin: vi.fn(() => '/usr/local/bin/dkg'),
     });
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
-    // File MUST NOT have been rewritten — pre-existing bare-"dkg"
-    // entry is registered-equivalent to the resolved-path canonical.
-    const afterMtime = (await import('node:fs')).statSync(join(cursorDir, 'mcp.json')).mtimeMs;
-    expect(afterMtime).toBe(beforeMtime);
-    // And the entry is unchanged on disk.
+    // Stale → refresh: file now has the GUI-safe absolute-path
+    // form. This is the auto-migration legacy users get on a
+    // stock re-run, no `--force` needed.
     const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
-    expect(after.mcpServers.dkg).toEqual({ command: 'dkg', args: ['mcp', 'serve'] });
+    expect(after.mcpServers.dkg).toEqual({
+      command: '/usr/local/bin/dkg',
+      args: ['mcp', 'serve'],
+    });
   });
 
   it('F30: pre-existing different absolute path classifies as `stale` (real divergence)', async () => {
@@ -1280,10 +1288,28 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       resolveDkgConfigHome: resolveDkgConfigHomeSpy,
     });
 
+    // Capture DKG_HOME at write time (mid-action) — the only
+    // observable point where the env mutation is visible. Round-3
+    // Fix 3 added a try/finally that restores DKG_HOME after the
+    // action returns, so reading it post-`await` no longer reflects
+    // the in-action value.
+    let dkgHomeAtWriteCall: string | undefined;
+    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
+      dkgHomeAtWriteCall = process.env.DKG_HOME;
+      const dir = process.env.DKG_HOME ?? join(tmpHome, '.dkg');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'config.json'),
+        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+      );
+    });
+    (deps as any).writeDkgConfig = writeDkgConfigSpy;
+
     await mcpSetupAction({ fund: false, verify: false }, deps);
 
     expect(isDkgMonorepoArg).toBe(false);
-    expect(process.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    // During the action, DKG_HOME was the resolved installed home.
+    expect(dkgHomeAtWriteCall).toBe(join(tmpHome, '.dkg'));
     expect(existsSync(join(tmpHome, '.dkg', 'config.json'))).toBe(true);
     // No accidental .dkg-dev creation on the installed path.
     expect(existsSync(join(tmpHome, '.dkg-dev'))).toBe(false);
@@ -1398,5 +1424,106 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // Refreshed to bare-`'dkg'` (since resolveDkgBin returned
     // null and the existing entry is not a dkg-basename absolute).
     expect(after.mcpServers.dkg.command).toBe('dkg');
+  });
+
+  // ── Codex Round-3 Fix 3: try/finally DKG_HOME env mutation ────────
+
+  it('Codex Round-3 Fix 3: action throwing midway restores DKG_HOME', async () => {
+    // Pre-fix: `process.env.DKG_HOME = dkgDirPath` was a permanent
+    // global side effect. If the action threw mid-body (e.g. step 2's
+    // `startDaemon` rejected; step 4's client-config write hit a
+    // permissions error), the override leaked into the rest of the
+    // process and any unrelated downstream code reading DKG_HOME.
+    //
+    // Post-fix: try/finally wraps the action body. The finally
+    // restores the prior `DKG_HOME` value (or unsets it if it wasn't
+    // set going in) on BOTH throw and normal exit.
+    const PRIOR = '/some/external/dkg-home';
+    process.env.DKG_HOME = PRIOR;
+
+    // Force a throw mid-action: stub `startDaemon` to reject. By
+    // then DKG_HOME has been mutated to `<tmpHome>/.dkg`.
+    const deps = makeDeps({
+      startDaemon: vi.fn(async () => {
+        throw new Error('synthetic startDaemon failure for env-restore test');
+      }),
+    });
+
+    await expect(
+      mcpSetupAction({ fund: false, verify: false }, deps),
+    ).rejects.toThrow(/synthetic startDaemon failure/);
+
+    // The finally restored DKG_HOME to its prior value.
+    expect(process.env.DKG_HOME).toBe(PRIOR);
+  });
+
+  it('Codex Round-3 Fix 3: action with previously-unset DKG_HOME deletes the var on exit', async () => {
+    // Counterpart: when DKG_HOME wasn't set going into the action,
+    // the finally must DELETE it (not set to `undefined` or empty
+    // string), so the next caller's `process.env.DKG_HOME` lookup
+    // sees `undefined` and falls through to the auto-detect path.
+    delete process.env.DKG_HOME;
+
+    const deps = makeDeps();
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    expect(process.env.DKG_HOME).toBeUndefined();
+    expect('DKG_HOME' in process.env).toBe(false);
+  });
+
+  it('Codex Round-3 Fix 3: two sequential mcpSetupAction calls don\'t bleed env state', async () => {
+    // Two back-to-back calls with different contexts: the first
+    // forces monorepo (sets DKG_HOME to `<tmpHome>/.dkg-dev`); the
+    // second forces installed (sets DKG_HOME to `<tmpHome>/.dkg`).
+    // Without the try/finally, the second call would observe the
+    // first's leftover override at the top of its body when it
+    // calls `resolveDkgConfigHome()` — which prefers DKG_HOME over
+    // any other signal — and silently inherit the wrong home.
+    //
+    // Post-fix: each call's env mutation is bounded to its own
+    // body, so the second call observes the original (unset)
+    // DKG_HOME at entry and gets to make the correct context-aware
+    // resolution.
+    delete process.env.DKG_HOME;
+
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    const observedHomesAtWriteCall: string[] = [];
+
+    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
+      observedHomesAtWriteCall.push(process.env.DKG_HOME ?? '<unset>');
+      const dir = process.env.DKG_HOME ?? join(tmpHome, '.dkg');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'config.json'),
+        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+      );
+    });
+
+    // Call 1: force monorepo. `findDkgMonorepoRoot` stub returns
+    // the fake repo root; `resolveDkgConfigHome` returns dev dir.
+    const depsMono = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      writeDkgConfig: writeDkgConfigSpy,
+    });
+    await mcpSetupAction({ monorepo: true, fund: false, verify: false }, depsMono);
+    // After call 1: DKG_HOME restored to unset.
+    expect(process.env.DKG_HOME).toBeUndefined();
+
+    // Call 2: force installed. Default `resolveDkgConfigHome` stub
+    // returns `<tmpHome>/.dkg`.
+    const depsInstalled = makeDeps({
+      writeDkgConfig: writeDkgConfigSpy,
+    });
+    await mcpSetupAction({ installed: true, fund: false, verify: false }, depsInstalled);
+    // After call 2: DKG_HOME restored to unset.
+    expect(process.env.DKG_HOME).toBeUndefined();
+
+    // The two writeDkgConfig invocations saw different homes —
+    // dev for call 1, prod-default for call 2 — confirming no
+    // bleed of call 1's override into call 2.
+    expect(observedHomesAtWriteCall).toEqual([
+      join(tmpHome, '.dkg-dev'),
+      join(tmpHome, '.dkg'),
+    ]);
   });
 });

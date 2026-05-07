@@ -757,39 +757,39 @@ function classify(
   if (current === undefined || current === null) {
     return { target, state: 'not-registered', current: null };
   }
-  // F30 staleness contract: the bare `"dkg"` command and the
-  // currently-resolved absolute path are equivalent for the
-  // *currently-installed* `dkg` bin — both spawn the same process
-  // when invoked. Classify both as `registered` against an expected
-  // entry that contains the resolved-path form, AS LONG AS args
-  // match. This avoids spurious "stale → refresh" prompts when a
-  // user re-runs setup after a PATH state change (or after upgrading
-  // to a setup version that started writing the resolved path
-  // instead of the bare command).
+  // F30 + Codex Round-3 staleness contract: equivalence is now
+  // ASYMMETRIC. Round-2 treated bare-`"dkg"` and the resolved
+  // absolute path as fully equivalent (both directions), but
+  // Codex round-3 pointed out that letting an OLD bare-`"dkg"`
+  // entry classify as `registered` against a resolved-path expected
+  // means a stock re-run of `dkg mcp setup` never migrates legacy
+  // entries to the GUI-safe absolute-path form. That leaves
+  // existing Claude Desktop / Windsurf / VSCode installs broken
+  // in the no-PATH scenario F30 exists to fix unless the operator
+  // happens to pass `--force`. Migration is the whole point of the
+  // re-run — so the legacy direction MUST classify as `stale`.
   //
-  // The reverse divergence — pre-existing entry with a DIFFERENT
-  // resolved absolute path (e.g. `/old/path/dkg` while the current
-  // bin lives at `/usr/local/bin/dkg`) — IS real divergence and
-  // classifies as `stale`. The staleness check below treats only
-  // the literal-`"dkg"` ↔ `expected.command` case as equivalent;
-  // any other command-string mismatch falls through to `stale`.
+  // Surviving equivalence (one direction only):
+  //   expected = bare `"dkg"` (resolveDkgBin returned null this run)
+  //     ↔ current = absolute path with dkg-family basename
+  //   ⇒ `registered` (preserve the working absolute-path entry).
+  //
+  // This handles the rerun-after-PATH-state-change scenario: a
+  // prior successful run wrote `/usr/local/bin/dkg`, a later run
+  // can't resolve `dkg` (PATH state changed; nvm/fnm rotated) and
+  // falls back to expected = bare `"dkg"`. Without this branch we'd
+  // mark the working absolute entry as stale and refresh it back to
+  // bare — regressing F30 for that user.
+  //
+  // Dropped equivalence (round-3):
+  //   expected = absolute path, current = bare `"dkg"` ⇒ `stale`.
+  // Stale → refresh on stock re-run = legacy entries get migrated
+  // to the GUI-safe form automatically. This is the bug-fix loop
+  // the round-3 reviewer flagged.
   const expectedCommand = expected.command;
   const currentCommand = (current as Record<string, unknown>).command;
   const commandMatches =
     currentCommand === expectedCommand ||
-    // Bare `"dkg"` is equivalent to ANY resolved-path expected
-    // command — both invoke the currently-installed bin.
-    (currentCommand === 'dkg' && typeof expectedCommand === 'string') ||
-    // Codex Round-2: the reverse case for the resolution-failed
-    // path. When `resolveDkgBin()` returns `null`, `canonicalEntry`
-    // falls back to bare `'dkg'` for `expectedCommand`. If the
-    // client config already has a working absolute-path entry from
-    // a prior successful resolution, classifying it as `stale` here
-    // would let the planner refresh it back to bare `'dkg'` — a
-    // regression of the F30 fix. Treat any absolute-path current
-    // whose basename is `dkg` / `dkg.exe` / `dkg.cmd` / `dkg.bat`
-    // as equivalent to expected bare-`'dkg'`, preserving the
-    // existing GUI-friendly entry.
     (expectedCommand === 'dkg' && isAbsoluteDkgBinPath(currentCommand));
   const argsMatch =
     Array.isArray((current as Record<string, unknown>).args) &&
@@ -946,7 +946,18 @@ export async function mcpSetupAction(
   const dkgDirPath = deps.resolveDkgConfigHome({
     isDkgMonorepo: context === 'monorepo',
   });
+  // Codex Round-3 Fix 3: save+restore `DKG_HOME` around the rest of
+  // the action body. Pre-fix the env mutation was a permanent global
+  // side effect — a long-lived process invoking `mcpSetupAction`
+  // (e.g. an embedding test runner; a script that calls setup more
+  // than once with different contexts; the action throwing midway)
+  // would leak the override into unrelated downstream code that
+  // also reads `DKG_HOME`. Wrap in try/finally so the env var is
+  // restored on both throw AND normal exit, and so two sequential
+  // calls don't bleed state.
+  const previousDkgHome = process.env.DKG_HOME;
   process.env.DKG_HOME = dkgDirPath;
+  try {
   const yamlPath = join(dkgDirPath, 'config.yaml');
   const jsonPath = join(dkgDirPath, 'config.json');
   const configExists = existsSync(yamlPath) || existsSync(jsonPath);
@@ -1203,6 +1214,13 @@ export async function mcpSetupAction(
   console.log('  2. From inside the client, ask "what tools does dkg expose?" — you should see');
   console.log('     dkg_assertion_create, dkg_assertion_write, dkg_assertion_query, and friends.');
   console.log('');
+  } finally {
+    // Codex Round-3 Fix 3: restore the prior `DKG_HOME` (or unset
+    // if it wasn't set going in). Runs on both throw and normal
+    // exit so the env mutation is bounded to the action's body.
+    if (previousDkgHome !== undefined) process.env.DKG_HOME = previousDkgHome;
+    else delete process.env.DKG_HOME;
+  }
 }
 
 export { expandHome };

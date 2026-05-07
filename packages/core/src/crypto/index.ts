@@ -45,15 +45,23 @@ export {
 
 export {
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+  WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+  WORKSPACE_AGENT_ENCRYPTION_KEY_PROOF_DOMAIN,
   WORKSPACE_ENCRYPTION_KEY_BYTES,
+  WORKSPACE_X25519_KEY_BYTES,
   WORKSPACE_ENCRYPTION_NONCE_BYTES,
   generateWorkspaceRecipientEncryptionKey,
   encryptWorkspacePayload,
   decryptWorkspacePayload,
   assertSupportedEncryptedWorkspaceEnvelope,
+  computeWorkspaceAgentEncryptionKeyProofPayload,
+  workspaceAgentEncryptionKeyId,
+  encodeWorkspaceEncryptionKey,
+  decodeWorkspaceEncryptionKey,
   type WorkspaceRecipientEncryptionKey,
   type EncryptWorkspacePayloadInput,
   type DecryptedWorkspacePayload,
+  type WorkspaceAgentEncryptionKeyProofFields,
 } from './workspace-encryption.js';
 
 export { resolveRootEntities, type Quad as RootEntityQuad } from './root-entity.js';

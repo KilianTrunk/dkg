@@ -4,6 +4,7 @@ import {
   ENCRYPTED_WORKSPACE_CIPHER_ALGORITHM,
   ENCRYPTED_WORKSPACE_ENVELOPE_TYPE,
   ENCRYPTED_WORKSPACE_ENVELOPE_VERSION,
+  ENCRYPTED_WORKSPACE_KEY_AGREEMENT_ALGORITHM,
   ENCRYPTED_WORKSPACE_KEY_WRAP_ALGORITHM,
   computeEncryptedWorkspaceAAD,
   decodeEncryptedWorkspacePayload,
@@ -15,6 +16,13 @@ import {
 function bytes(...values: number[]): Uint8Array {
   return new Uint8Array(values);
 }
+
+const EPHEMERAL_PUBLIC_KEY = bytes(
+  0, 1, 2, 3, 4, 5, 6, 7,
+  8, 9, 10, 11, 12, 13, 14, 15,
+  16, 17, 18, 19, 20, 21, 22, 23,
+  24, 25, 26, 27, 28, 29, 30, 31,
+);
 
 describe('EncryptedWorkspacePayload', () => {
   const payload: EncryptedWorkspacePayloadMsg = {
@@ -29,6 +37,8 @@ describe('EncryptedWorkspacePayload', () => {
     cipherAlgorithm: ENCRYPTED_WORKSPACE_CIPHER_ALGORITHM,
     nonce: bytes(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
     ciphertext: bytes(0xaa, 0xbb, 0xcc),
+    keyAgreementAlgorithm: ENCRYPTED_WORKSPACE_KEY_AGREEMENT_ALGORITHM,
+    ephemeralPublicKey: EPHEMERAL_PUBLIC_KEY,
     recipients: [
       {
         recipientId: 'did:dkg:agent:0xabcd',
@@ -52,6 +62,8 @@ describe('EncryptedWorkspacePayload', () => {
     expect(decoded.timestampMs).toBe(payload.timestampMs);
     expect(decoded.subGraphName).toBe(payload.subGraphName);
     expect(decoded.cipherAlgorithm).toBe(ENCRYPTED_WORKSPACE_CIPHER_ALGORITHM);
+    expect(decoded.keyAgreementAlgorithm).toBe(ENCRYPTED_WORKSPACE_KEY_AGREEMENT_ALGORITHM);
+    expect(new Uint8Array(decoded.ephemeralPublicKey)).toEqual(payload.ephemeralPublicKey);
     expect(new Uint8Array(decoded.nonce)).toEqual(payload.nonce);
     expect(new Uint8Array(decoded.ciphertext)).toEqual(payload.ciphertext);
     expect(decoded.recipients).toHaveLength(1);
@@ -99,6 +111,14 @@ describe('computeEncryptedWorkspaceAAD', () => {
     expect(computeEncryptedWorkspaceAAD({ ...fields, workspaceOperationId: 'swm-op-2' })).not.toEqual(base);
     expect(computeEncryptedWorkspaceAAD({ ...fields, timestampMs: fields.timestampMs + 1 })).not.toEqual(base);
     expect(computeEncryptedWorkspaceAAD({ ...fields, subGraphName: 'tasks' })).not.toEqual(base);
+    expect(computeEncryptedWorkspaceAAD({
+      ...fields,
+      keyAgreementAlgorithm: ENCRYPTED_WORKSPACE_KEY_AGREEMENT_ALGORITHM,
+    })).not.toEqual(base);
+    expect(computeEncryptedWorkspaceAAD({
+      ...fields,
+      ephemeralPublicKey: EPHEMERAL_PUBLIC_KEY,
+    })).not.toEqual(base);
   });
 
   it('normalises supported timestamp inputs for AAD', () => {

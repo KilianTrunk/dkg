@@ -14,6 +14,7 @@ const { Type, Field } = protobuf;
 export const ENCRYPTED_WORKSPACE_ENVELOPE_VERSION = '1';
 export const ENCRYPTED_WORKSPACE_ENVELOPE_TYPE = 'dkg.workspace.encrypted';
 export const ENCRYPTED_WORKSPACE_CIPHER_ALGORITHM = 'AES-256-GCM';
+export const ENCRYPTED_WORKSPACE_KEY_AGREEMENT_ALGORITHM = 'X25519-HKDF-SHA256';
 export const ENCRYPTED_WORKSPACE_KEY_WRAP_ALGORITHM = 'AES-256-GCM';
 export const ENCRYPTED_WORKSPACE_AAD_DOMAIN = 'dkg.workspace.encrypted.aad.v1';
 
@@ -37,6 +38,8 @@ export const EncryptedWorkspacePayloadSchema = new Type('EncryptedWorkspacePaylo
   .add(new Field('nonce', 10, 'bytes'))
   .add(new Field('ciphertext', 11, 'bytes'))
   .add(new Field('recipients', 12, 'EncryptedWorkspaceRecipientKeySlot', 'repeated'))
+  .add(new Field('keyAgreementAlgorithm', 13, 'string'))
+  .add(new Field('ephemeralPublicKey', 14, 'bytes'))
   .add(EncryptedWorkspaceRecipientKeySlotSchema);
 
 export interface EncryptedWorkspaceRecipientKeySlotMsg {
@@ -60,6 +63,8 @@ export interface EncryptedWorkspacePayloadMsg {
   nonce: Uint8Array;
   ciphertext: Uint8Array;
   recipients: EncryptedWorkspaceRecipientKeySlotMsg[];
+  keyAgreementAlgorithm: string;
+  ephemeralPublicKey: Uint8Array;
 }
 
 export interface EncryptedWorkspaceAADFields {
@@ -71,6 +76,8 @@ export interface EncryptedWorkspaceAADFields {
   workspaceOperationId: string;
   timestampMs: number | bigint | LongLike;
   subGraphName?: string;
+  keyAgreementAlgorithm?: string;
+  ephemeralPublicKey?: Uint8Array;
 }
 
 export interface LongLike {
@@ -86,6 +93,8 @@ export function encodeEncryptedWorkspacePayload(msg: EncryptedWorkspacePayloadMs
       timestampMs: timestampForProto(msg.timestampMs),
       subGraphName: msg.subGraphName ?? '',
       recipients: msg.recipients ?? [],
+      keyAgreementAlgorithm: msg.keyAgreementAlgorithm,
+      ephemeralPublicKey: msg.ephemeralPublicKey,
     }),
   ).finish();
 }
@@ -116,6 +125,8 @@ export function decodeEncryptedWorkspacePayload(buf: Uint8Array): EncryptedWorks
         };
       })
       : [],
+    keyAgreementAlgorithm: stringField(decoded.keyAgreementAlgorithm),
+    ephemeralPublicKey: bytesField(decoded.ephemeralPublicKey),
   };
 }
 
@@ -147,6 +158,10 @@ export function computeEncryptedWorkspaceAAD(fields: EncryptedWorkspaceAADFields
     framedString(timestampForAAD(fields.timestampMs)),
     framedString('subGraphName'),
     framedString(fields.subGraphName ?? ''),
+    framedString('keyAgreementAlgorithm'),
+    framedString(fields.keyAgreementAlgorithm ?? ''),
+    framedString('ephemeralPublicKey'),
+    framedBytes(fields.ephemeralPublicKey ?? new Uint8Array()),
   ]);
 }
 
@@ -215,6 +230,10 @@ function uint32Be(value: number): Uint8Array {
 function framedString(value: string): Uint8Array {
   const encoded = textEncoder.encode(value);
   return concatBytes([uint32Be(encoded.length), encoded]);
+}
+
+function framedBytes(value: Uint8Array): Uint8Array {
+  return concatBytes([uint32Be(value.length), value]);
 }
 
 function concatBytes(parts: readonly Uint8Array[]): Uint8Array {

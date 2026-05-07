@@ -3,6 +3,7 @@ import {
   ENCRYPTED_WORKSPACE_CIPHER_ALGORITHM,
   ENCRYPTED_WORKSPACE_ENVELOPE_TYPE,
   ENCRYPTED_WORKSPACE_ENVELOPE_VERSION,
+  ENCRYPTED_WORKSPACE_KEY_AGREEMENT_ALGORITHM,
   ENCRYPTED_WORKSPACE_KEY_WRAP_ALGORITHM,
   WORKSPACE_ENCRYPTION_KEY_BYTES,
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
@@ -26,12 +27,11 @@ function recipientKey(
   recipientKeyId: string,
   fill: number,
 ): WorkspaceRecipientEncryptionKey {
-  return {
-    purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+  return generateWorkspaceRecipientEncryptionKey(
     recipientId,
     recipientKeyId,
-    keyBytes: new Uint8Array(WORKSPACE_ENCRYPTION_KEY_BYTES).fill(fill),
-  };
+    (length) => new Uint8Array(length).fill(fill),
+  );
 }
 
 function inputFor(recipients: WorkspaceRecipientEncryptionKey[]): EncryptWorkspacePayloadInput {
@@ -57,6 +57,8 @@ describe('workspace encrypted payload helpers', () => {
     expect(envelope.version).toBe(ENCRYPTED_WORKSPACE_ENVELOPE_VERSION);
     expect(envelope.type).toBe(ENCRYPTED_WORKSPACE_ENVELOPE_TYPE);
     expect(envelope.cipherAlgorithm).toBe(ENCRYPTED_WORKSPACE_CIPHER_ALGORITHM);
+    expect(envelope.keyAgreementAlgorithm).toBe(ENCRYPTED_WORKSPACE_KEY_AGREEMENT_ALGORITHM);
+    expect(envelope.ephemeralPublicKey).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
     expect(envelope.recipients).toHaveLength(2);
     expect(envelope.recipients[0].algorithm).toBe(ENCRYPTED_WORKSPACE_KEY_WRAP_ALGORITHM);
     expect(envelope.ciphertext).not.toEqual(inputFor([alice]).plaintext);
@@ -134,6 +136,7 @@ describe('workspace encrypted payload helpers', () => {
     expect(key.purpose).toBe(WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE);
     expect(key.recipientId).toBe('did:dkg:agent:alice');
     expect(key.recipientKeyId).toBe('alice-key-1');
-    expect(key.keyBytes).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
+    expect(key.publicKeyBytes).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
+    expect(key.privateKeyBytes).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
   });
 });

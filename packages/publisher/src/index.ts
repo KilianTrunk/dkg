@@ -28,6 +28,12 @@ export {
   type CASCondition,
 } from './dkg-publisher.js';
 export {
+  resolveWorkspaceAgentRecipients,
+  type WorkspaceAgentRecipientResolution,
+  type WorkspaceAgentRecipientResolver,
+  type WorkspaceAgentRecipientResolverInput,
+} from './workspace-agent-recipients.js';
+export {
   ACKCollector,
   type ACKCollectorDeps,
   type CollectedACK,

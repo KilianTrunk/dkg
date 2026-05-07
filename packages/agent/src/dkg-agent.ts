@@ -21,7 +21,12 @@ import {
   buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1,
   buildAssertionSealQuads, buildAssertionPublishReceiptQuads,
   parseAssertionSealQuads, type AssertionSeal,
+  WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+  WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+  decodeWorkspaceEncryptionKey,
+  workspaceAgentEncryptionKeyId,
   type DKGNodeConfig, type OperationContext, type GetView, type AssertionDescriptor, type AssertionEvent, type AssertionState,
+  type WorkspaceRecipientEncryptionKey,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult } from '@origintrail-official/dkg-chain';
@@ -30,6 +35,7 @@ import {
   PublishJournal, StaleWriteError,
   ACKCollector, StorageACKHandler,
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
+  resolveWorkspaceAgentRecipients,
   computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
   TripleStoreAsyncLiftPublisher,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
@@ -82,6 +88,7 @@ import { registerSyncHandler } from './sync/responder/sync-handler.js';
 import { runSyncOnConnect } from './sync/on-connect/sync-on-connect.js';
 import {
   generateCustodialAgent, registerSelfSovereignAgent, agentFromPrivateKey,
+  ensureWorkspaceEncryptionKey,
   hashAgentToken,
   type AgentKeyRecord,
 } from './agent-keystore.js';
@@ -825,6 +832,7 @@ export class DKGAgent {
     this.chain = chain;
     this.discovery = new DiscoveryClient(queryEngine);
     this.profileManager = new ProfileManager(publisher, store);
+    this.publisher.setWorkspaceAgentRecipientResolver((input) => resolveWorkspaceAgentRecipients(this.store, input));
   }
 
   static async create(config: DKGAgentConfig): Promise<DKGAgent> {
@@ -2805,6 +2813,7 @@ export class DKGAgent {
   async publishProfile(): Promise<PublishResult> {
     const pubKeyBase64 = Buffer.from(this.wallet.keypair.publicKey).toString('base64');
     const relayAddrs = this.config.relayPeers;
+    const defaultAgent = this.defaultAgentAddress ? this.localAgents.get(this.defaultAgentAddress) : undefined;
 
     // Populate `contextGraphsServed` so peers can discover which CGs this
     // node hosts via the public agent profile, but ONLY include CGs whose
@@ -2844,6 +2853,9 @@ export class DKGAgent {
       publicKey: pubKeyBase64,
       relayAddress: relayAddrs?.[0],
       agentAddress: this.defaultAgentAddress,
+      encryptionKeyAlgorithm: defaultAgent?.encryptionKeyAlgorithm,
+      publicEncryptionKey: defaultAgent?.publicEncryptionKey,
+      encryptionKeyProof: defaultAgent?.encryptionKeyProof,
       skills: (this.config.skills ?? []).map(s => ({
         skillType: s.skillType,
         pricePerCall: s.pricePerCall,
@@ -2886,16 +2898,36 @@ export class DKGAgent {
    */
   async registerAgent(
     name: string,
-    opts?: { publicKey?: string; framework?: string },
+    opts?: {
+      publicKey?: string;
+      framework?: string;
+      encryptionKeyAlgorithm?: typeof WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519;
+      publicEncryptionKey?: string;
+      encryptionKeyProof?: string;
+    },
   ): Promise<AgentKeyRecord> {
     for (const existing of this.localAgents.values()) {
       if (existing.name === name) {
         throw new Error(`Agent name "${name}" already registered on this node`);
       }
     }
+    if (opts?.publicKey && (opts.publicEncryptionKey || opts.encryptionKeyProof) && !(opts.publicEncryptionKey && opts.encryptionKeyProof)) {
+      throw new Error('Self-sovereign agents must provide both publicEncryptionKey and encryptionKeyProof');
+    }
 
     const record = opts?.publicKey
-      ? registerSelfSovereignAgent(name, opts.publicKey, opts.framework)
+      ? registerSelfSovereignAgent(
+        name,
+        opts.publicKey,
+        opts.framework,
+        opts.publicEncryptionKey && opts.encryptionKeyProof
+          ? {
+            encryptionKeyAlgorithm: opts.encryptionKeyAlgorithm ?? WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+            publicEncryptionKey: opts.publicEncryptionKey,
+            encryptionKeyProof: opts.encryptionKeyProof,
+          }
+          : undefined,
+      )
       : generateCustodialAgent(name, opts?.framework);
 
     this.localAgents.set(record.agentAddress, record);
@@ -2992,6 +3024,13 @@ export class DKGAgent {
     if (record.publicKey) {
       quads.push({ subject: agentUri, predicate: `${DKG}publicKey`, object: `"${record.publicKey}"`, graph });
     }
+    if (record.publicEncryptionKey && record.encryptionKeyAlgorithm && record.encryptionKeyProof) {
+      quads.push(
+        { subject: agentUri, predicate: `${DKG}publicEncryptionKey`, object: `"${record.publicEncryptionKey}"`, graph },
+        { subject: agentUri, predicate: `${DKG}encryptionKeyAlgorithm`, object: `"${record.encryptionKeyAlgorithm}"`, graph },
+        { subject: agentUri, predicate: `${DKG}encryptionKeyProof`, object: `"${record.encryptionKeyProof}"`, graph },
+      );
+    }
     if (record.framework) {
       quads.push({ subject: agentUri, predicate: 'https://dkg.origintrail.io/skill#framework', object: `"${record.framework}"`, graph });
     }
@@ -3010,7 +3049,7 @@ export class DKGAgent {
     const keystore = await this.loadKeystore();
 
     const sparql = `
-      SELECT ?agent ?name ?address ?mode ?tokenHash ?legacyToken ?publicKey ?framework ?createdAt ?isDefault WHERE {
+      SELECT ?agent ?name ?address ?mode ?tokenHash ?legacyToken ?publicKey ?publicEncryptionKey ?encryptionKeyAlgorithm ?encryptionKeyProof ?framework ?createdAt ?isDefault WHERE {
         GRAPH <${graph}> {
           ?agent a <${DKG}Agent> ;
                  <https://schema.org/name> ?name ;
@@ -3019,6 +3058,9 @@ export class DKGAgent {
           OPTIONAL { ?agent <${DKG}agentAuthTokenHash> ?tokenHash }
           OPTIONAL { ?agent <${DKG}agentAuthToken> ?legacyToken }
           OPTIONAL { ?agent <${DKG}publicKey> ?publicKey }
+          OPTIONAL { ?agent <${DKG}publicEncryptionKey> ?publicEncryptionKey }
+          OPTIONAL { ?agent <${DKG}encryptionKeyAlgorithm> ?encryptionKeyAlgorithm }
+          OPTIONAL { ?agent <${DKG}encryptionKeyProof> ?encryptionKeyProof }
           OPTIONAL { ?agent <https://dkg.origintrail.io/skill#framework> ?framework }
           OPTIONAL { ?agent <${DKG}createdAt> ?createdAt }
           OPTIONAL { ?agent <${DKG}isDefaultAgent> ?isDefault }
@@ -3042,9 +3084,18 @@ export class DKGAgent {
           authToken = legacyToken;
         }
 
+        const storeHasEncryptionKey = Boolean(
+          strip(row['publicEncryptionKey']) &&
+          strip(row['encryptionKeyAlgorithm']) &&
+          strip(row['encryptionKeyProof']),
+        );
         const record: AgentKeyRecord = {
           agentAddress: addr,
           publicKey: strip(row['publicKey']) || '',
+          publicEncryptionKey: strip(row['publicEncryptionKey']) || ksEntry?.publicEncryptionKey,
+          privateEncryptionKey: ksEntry?.privateEncryptionKey,
+          encryptionKeyAlgorithm: (strip(row['encryptionKeyAlgorithm']) || ksEntry?.encryptionKeyAlgorithm) as typeof WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519 | undefined,
+          encryptionKeyProof: strip(row['encryptionKeyProof']) || ksEntry?.encryptionKeyProof,
           name: strip(row['name']),
           framework: strip(row['framework']) || undefined,
           mode: strip(row['mode']) as 'custodial' | 'self-sovereign',
@@ -3072,6 +3123,18 @@ export class DKGAgent {
           }
         }
 
+        if (record.publicEncryptionKey) {
+          try {
+            record.encryptionKeyId = workspaceAgentEncryptionKeyId(
+              record.agentAddress,
+              decodeWorkspaceEncryptionKey(record.publicEncryptionKey),
+            );
+          } catch {
+            record.encryptionKeyId = undefined;
+          }
+        }
+        const generatedEncryptionKey = ensureWorkspaceEncryptionKey(record);
+
         this.localAgents.set(record.agentAddress, record);
         if (record.authToken) {
           this.agentTokenIndex.set(record.authToken, record.agentAddress);
@@ -3085,6 +3148,17 @@ export class DKGAgent {
         if (legacyToken && !ksEntry?.authToken) {
           needsMigration.push(record);
         }
+        if (
+          generatedEncryptionKey ||
+          (
+            !storeHasEncryptionKey &&
+            record.publicEncryptionKey &&
+            record.encryptionKeyAlgorithm &&
+            record.encryptionKeyProof
+          )
+        ) {
+          needsMigration.push(record);
+        }
       }
       if (markedDefaultAddr) {
         this.defaultAgentAddress = markedDefaultAddr;
@@ -3096,6 +3170,7 @@ export class DKGAgent {
       // Migrate legacy plaintext tokens: save to keystore, replace RDF with hash
       for (const rec of needsMigration) {
         await this.saveToKeystore(rec);
+        await this.persistAgentToStore(rec);
         await this.migrateTokenToHash(rec);
       }
     } catch {
@@ -3142,7 +3217,14 @@ export class DKGAgent {
     return `${this.config.dataDir}/agent-keystore.json`;
   }
 
-  private async loadKeystore(): Promise<Record<string, { authToken?: string; privateKey?: string }>> {
+  private async loadKeystore(): Promise<Record<string, {
+    authToken?: string;
+    privateKey?: string;
+    encryptionKeyAlgorithm?: typeof WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519;
+    publicEncryptionKey?: string;
+    privateEncryptionKey?: string;
+    encryptionKeyProof?: string;
+  }>> {
     const ksPath = this.keystorePath();
     if (!ksPath) return {};
     try {
@@ -3160,7 +3242,14 @@ export class DKGAgent {
     try {
       const { readFile, writeFile, mkdir, chmod } = await import('node:fs/promises');
       const { dirname } = await import('node:path');
-      let existing: Record<string, { authToken?: string; privateKey?: string }> = {};
+      let existing: Record<string, {
+        authToken?: string;
+        privateKey?: string;
+        encryptionKeyAlgorithm?: typeof WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519;
+        publicEncryptionKey?: string;
+        privateEncryptionKey?: string;
+        encryptionKeyProof?: string;
+      }> = {};
       try {
         const raw = await readFile(ksPath, 'utf-8');
         existing = JSON.parse(raw);
@@ -3168,6 +3257,10 @@ export class DKGAgent {
       existing[record.agentAddress.toLowerCase()] = {
         authToken: record.authToken,
         ...(record.privateKey ? { privateKey: record.privateKey } : {}),
+        ...(record.encryptionKeyAlgorithm ? { encryptionKeyAlgorithm: record.encryptionKeyAlgorithm } : {}),
+        ...(record.publicEncryptionKey ? { publicEncryptionKey: record.publicEncryptionKey } : {}),
+        ...(record.privateEncryptionKey ? { privateEncryptionKey: record.privateEncryptionKey } : {}),
+        ...(record.encryptionKeyProof ? { encryptionKeyProof: record.encryptionKeyProof } : {}),
       };
       await mkdir(dirname(ksPath), { recursive: true });
       await writeFile(ksPath, JSON.stringify(existing, null, 2), { mode: 0o600 });
@@ -3635,6 +3728,31 @@ export class DKGAgent {
     return false;
   }
 
+  private getLocalWorkspaceRecipientPrivateKeys(): WorkspaceRecipientEncryptionKey[] {
+    const keys: WorkspaceRecipientEncryptionKey[] = [];
+    for (const record of this.localAgents.values()) {
+      if (
+        record.encryptionKeyAlgorithm !== WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519 ||
+        !record.publicEncryptionKey ||
+        !record.privateEncryptionKey
+      ) {
+        continue;
+      }
+      const publicKeyBytes = decodeWorkspaceEncryptionKey(record.publicEncryptionKey);
+      const privateKeyBytes = decodeWorkspaceEncryptionKey(record.privateEncryptionKey);
+      const recipientId = `did:dkg:agent:${ethers.getAddress(record.agentAddress)}`;
+      keys.push({
+        purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+        recipientId,
+        recipientKeyId: workspaceAgentEncryptionKeyId(record.agentAddress, publicKeyBytes),
+        encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+        publicKeyBytes,
+        privateKeyBytes,
+      });
+    }
+    return keys;
+  }
+
   private async resolveWorkspaceGossipSigningAgent(
     contextGraphId: string,
   ): Promise<(AgentKeyRecord & { privateKey: string }) | null> {
@@ -3653,8 +3771,14 @@ export class DKGAgent {
     throw new Error(`Cannot gossip SWM write for agent-gated context graph "${contextGraphId}": no local allowed signing agent key`);
   }
 
-  private async encodeWorkspaceGossipMessage(contextGraphId: string, message: Uint8Array): Promise<Uint8Array> {
-    const signer = await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
+  private async encodeWorkspaceGossipMessage(
+    contextGraphId: string,
+    message: Uint8Array,
+    resolvedSigner?: (AgentKeyRecord & { privateKey: string }) | null,
+  ): Promise<Uint8Array> {
+    const signer = resolvedSigner === undefined
+      ? await this.resolveWorkspaceGossipSigningAgent(contextGraphId)
+      : resolvedSigner;
     if (!signer) {
       return message;
     }
@@ -3683,9 +3807,10 @@ export class DKGAgent {
     contextGraphId: string,
     message: Uint8Array,
     ctx: OperationContext,
+    resolvedSigner?: (AgentKeyRecord & { privateKey: string }) | null,
   ): Promise<void> {
     const topic = contextGraphWorkspaceTopic(contextGraphId);
-    const wireMessage = await this.encodeWorkspaceGossipMessage(contextGraphId, message);
+    const wireMessage = await this.encodeWorkspaceGossipMessage(contextGraphId, message, resolvedSigner);
     try {
       await this.gossip.publish(topic, wireMessage);
     } catch {
@@ -3731,6 +3856,7 @@ export class DKGAgent {
     }
 
     const partitioned = partitionPublishAsyncQuads(publicQuads, privateQuads);
+    const gossipSigner = opts?.localOnly ? null : await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
     const { shareOperationId, message } = await this.publisher.writeToWorkspace(
       contextGraphId,
       partitioned.publicQuads,
@@ -3738,6 +3864,8 @@ export class DKGAgent {
         publisherPeerId: this.peerId,
         operationCtx: ctx,
         subGraphName: opts?.subGraphName,
+        localOnly: opts?.localOnly,
+        senderAgentAddress: gossipSigner?.agentAddress,
       },
     );
 
@@ -3770,7 +3898,7 @@ export class DKGAgent {
     });
 
     if (!opts?.localOnly) {
-      await this.publishWorkspaceGossip(contextGraphId, message, ctx);
+      await this.publishWorkspaceGossip(contextGraphId, message, ctx, gossipSigner);
     }
 
     return { captureID };
@@ -3927,13 +4055,16 @@ export class DKGAgent {
     const ctx = opts?.operationCtx ?? createOperationContext('share');
     const sgLabel = opts?.subGraphName ? ` (sub-graph: ${opts.subGraphName})` : '';
     this.log.info(ctx, `Sharing ${quads.length} quads to SWM for context graph ${contextGraphId}${sgLabel}${opts?.localOnly ? ' (local-only)' : ''}`);
+    const gossipSigner = opts?.localOnly ? null : await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
     const { shareOperationId, message } = await this.publisher.writeToWorkspace(contextGraphId, quads, {
       publisherPeerId: this.node.peerId.toString(),
       operationCtx: ctx,
       subGraphName: opts?.subGraphName,
+      localOnly: opts?.localOnly,
+      senderAgentAddress: gossipSigner?.agentAddress,
     });
     if (!opts?.localOnly) {
-      await this.publishWorkspaceGossip(contextGraphId, message, ctx);
+      await this.publishWorkspaceGossip(contextGraphId, message, ctx, gossipSigner);
     }
     return { shareOperationId };
   }
@@ -3952,14 +4083,17 @@ export class DKGAgent {
     const ctx = opts?.operationCtx ?? createOperationContext('share');
     const sgLabel = opts?.subGraphName ? ` (sub-graph: ${opts.subGraphName})` : '';
     this.log.info(ctx, `CAS write: ${quads.length} quads, ${conditions.length} conditions for ${contextGraphId}${sgLabel}`);
+    const gossipSigner = opts?.localOnly ? null : await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
     const { shareOperationId, message } = await this.publisher.writeConditionalToWorkspace(contextGraphId, quads, {
       publisherPeerId: this.node.peerId.toString(),
       operationCtx: ctx,
       conditions,
       subGraphName: opts?.subGraphName,
+      localOnly: opts?.localOnly,
+      senderAgentAddress: gossipSigner?.agentAddress,
     });
     if (!opts?.localOnly) {
-      await this.publishWorkspaceGossip(contextGraphId, message, ctx);
+      await this.publishWorkspaceGossip(contextGraphId, message, ctx, gossipSigner);
     }
     return { shareOperationId };
   }
@@ -5601,6 +5735,7 @@ export class DKGAgent {
         sharedMemoryOwnedEntities: this.workspaceOwnedEntities,
         writeLocks: this.writeLocks,
         localAgentAddresses: () => [...this.localAgents.keys()],
+        workspaceRecipientPrivateKeys: () => this.getLocalWorkspaceRecipientPrivateKeys(),
       });
     }
     return this.sharedMemoryHandler;

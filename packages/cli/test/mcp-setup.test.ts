@@ -910,6 +910,14 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(false);
     const logged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
     expect(logged).toMatch(/All pending registrations declined/);
+    // Codex Round-5 Fix 7: the guidance recommends `--yes` (skips
+    // prompts), not `--force` alone (which only refreshes
+    // already-registered clients but still prompts in TTY mode). A
+    // re-run with `--force` would re-prompt the same declined
+    // entries; only `--yes` (or `--force --yes`) escapes the prompt
+    // loop.
+    expect(logged).toMatch(/--yes/);
+    expect(logged).not.toMatch(/Re-run with --force or --yes/);
   });
 
   it('F31: mixed yes/no — declined entries skip; accepted entries register', async () => {
@@ -1316,6 +1324,171 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(dkgHomeAtWriteCall).toBe(join(tmpHome, '.dkg'));
     expect(existsSync(join(tmpHome, '.dkg', 'config.json'))).toBe(true);
     // No accidental .dkg-dev creation on the installed path.
+    expect(existsSync(join(tmpHome, '.dkg-dev'))).toBe(false);
+  });
+
+  // ── Codex Round-5 Fix 6: --monorepo bypasses configExists fallback ─
+
+  it('Codex Round-5 Fix 6: --monorepo with pre-existing ~/.dkg/config.json still isolates to ~/.dkg-dev', async () => {
+    // Pre-fix: `--monorepo` only set `isDkgMonorepo: true` on the
+    // resolveDkgConfigHome call. The helper still respected the
+    // configExists short-circuit (Round-3 Fix 2 made it OR
+    // config.json | config.yaml), so a user with a pre-existing
+    // `~/.dkg/config.json` (typical for anyone who has ever
+    // installed the global CLI) who passed `--monorepo` would
+    // bootstrap their local checkout against the installed node's
+    // state — exactly the dev/installed mixup the flag is meant
+    // to break.
+    //
+    // Post-fix: `--monorepo` (forcedContext === 'monorepo' AND a
+    // monorepo root located) bypasses resolveDkgConfigHome
+    // entirely, computing `~/.dkg-dev` directly via homedir().
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    // Pre-existing `~/.dkg/config.json` — the configExists short-
+    // circuit would normally redirect us back to `~/.dkg`.
+    const installedDkg = join(tmpHome, '.dkg');
+    mkdirSync(installedDkg, { recursive: true });
+    writeFileSync(
+      join(installedDkg, 'config.json'),
+      JSON.stringify({ name: 'persisted', apiPort: 9200, nodeRole: 'edge' }, null, 2),
+    );
+
+    // Real production-shape resolveDkgConfigHome stub: respects
+    // configExists. The Fix 6 bypass means this stub MUST NOT be
+    // called when `--monorepo` is forced.
+    const resolveDkgConfigHomeSpy = vi.fn((opts: { isDkgMonorepo?: boolean; configExists?: boolean } = {}) => {
+      // Mirror production: configExists wins over isDkgMonorepo.
+      if (opts.configExists ?? existsSync(join(installedDkg, 'config.json'))) {
+        return installedDkg;
+      }
+      if (opts.isDkgMonorepo) return join(tmpHome, '.dkg-dev');
+      return installedDkg;
+    });
+
+    let dkgHomeAtWriteCall: string | undefined;
+    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
+      dkgHomeAtWriteCall = process.env.DKG_HOME;
+      const dir = process.env.DKG_HOME ?? installedDkg;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'config.json'),
+        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+      );
+    });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      resolveDkgConfigHome: resolveDkgConfigHomeSpy,
+      writeDkgConfig: writeDkgConfigSpy,
+    });
+
+    await mcpSetupAction({ monorepo: true, fund: false, verify: false }, deps);
+
+    // (1) The bypass kicked in: resolveDkgConfigHome was NOT called
+    // for the dkgDirPath computation under forced --monorepo.
+    expect(resolveDkgConfigHomeSpy).not.toHaveBeenCalled();
+    // (2) DKG_HOME was set to ~/.dkg-dev mid-action — bootstrap
+    // state landed in the dev home, NOT the installed home.
+    expect(dkgHomeAtWriteCall).toBe(join(tmpHome, '.dkg-dev'));
+    // (3) The pre-existing installed config is untouched.
+    const installedConfig = JSON.parse(readFileSync(join(installedDkg, 'config.json'), 'utf-8'));
+    expect(installedConfig.name).toBe('persisted');
+    // (4) The dev-home config was newly written.
+    expect(existsSync(join(tmpHome, '.dkg-dev', 'config.json'))).toBe(true);
+  });
+
+  it('Codex Round-5 Fix 6: --monorepo with pre-existing ~/.dkg/config.yaml still isolates to ~/.dkg-dev', async () => {
+    // Same as above but with YAML instead of JSON. Round-3 Fix 2
+    // extended configExists to OR both file types; Round-5 Fix 6
+    // bypasses the whole short-circuit when --monorepo is forced,
+    // so neither file shape redirects the dev-home isolation.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const installedDkg = join(tmpHome, '.dkg');
+    mkdirSync(installedDkg, { recursive: true });
+    writeFileSync(join(installedDkg, 'config.yaml'), 'name: persisted\napiPort: 9200\n');
+
+    const resolveDkgConfigHomeSpy = vi.fn(() => installedDkg);
+    let dkgHomeAtWriteCall: string | undefined;
+    const writeDkgConfigSpy = vi.fn((agentName: string, _network: any, apiPort: number) => {
+      dkgHomeAtWriteCall = process.env.DKG_HOME;
+      const dir = process.env.DKG_HOME ?? installedDkg;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'config.json'),
+        JSON.stringify({ name: agentName, apiPort, nodeRole: 'edge' }, null, 2),
+      );
+    });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      resolveDkgConfigHome: resolveDkgConfigHomeSpy,
+      writeDkgConfig: writeDkgConfigSpy,
+    });
+
+    await mcpSetupAction({ monorepo: true, fund: false, verify: false }, deps);
+
+    expect(resolveDkgConfigHomeSpy).not.toHaveBeenCalled();
+    expect(dkgHomeAtWriteCall).toBe(join(tmpHome, '.dkg-dev'));
+    // YAML preserved untouched.
+    const yaml = readFileSync(join(installedDkg, 'config.yaml'), 'utf-8');
+    expect(yaml).toContain('name: persisted');
+  });
+
+  it('Codex Round-5 Fix 6: AUTO-detect (no --monorepo flag) + monorepo cwd + existing ~/.dkg/config.json → still respects configExists, returns ~/.dkg', async () => {
+    // Pin the asymmetry between forced and auto. Auto-detect
+    // monorepo (no flag) MUST keep the configExists short-circuit
+    // — users who installed the CLI globally and happen to walk
+    // into a monorepo checkout shouldn't be silently redirected
+    // to a dev home they don't know about.
+    //
+    // Only the explicit --monorepo flag bypasses the fallback;
+    // auto-detect defers to resolveDkgConfigHome's existing
+    // semantics.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const installedDkg = join(tmpHome, '.dkg');
+    mkdirSync(installedDkg, { recursive: true });
+    writeFileSync(
+      join(installedDkg, 'config.json'),
+      JSON.stringify({ name: 'persisted', apiPort: 9200, nodeRole: 'edge' }, null, 2),
+    );
+
+    let resolveCallArgs: { isDkgMonorepo?: boolean } | undefined;
+    const resolveDkgConfigHomeSpy = vi.fn((opts: { isDkgMonorepo?: boolean } = {}) => {
+      resolveCallArgs = opts;
+      // Mirror production semantics: configExists wins → ~/.dkg.
+      return installedDkg;
+    });
+
+    // Use startDaemon as the mid-action observable. With a
+    // pre-existing config, the action skips writeDkgConfig (F25
+    // reconcile path), but startDaemon always runs and DKG_HOME is
+    // already set by the time it does.
+    let dkgHomeAtStartDaemon: string | undefined;
+    const startDaemonSpy = vi.fn(async (_port: number) => {
+      dkgHomeAtStartDaemon = process.env.DKG_HOME;
+    });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+      resolveDkgConfigHome: resolveDkgConfigHomeSpy,
+      startDaemon: startDaemonSpy,
+    });
+
+    // No --monorepo flag — auto-detect path.
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    // (1) resolveDkgConfigHome WAS called (auto-detect doesn't
+    // bypass), and isDkgMonorepo: true was passed to it.
+    expect(resolveDkgConfigHomeSpy).toHaveBeenCalledTimes(1);
+    expect(resolveCallArgs?.isDkgMonorepo).toBe(true);
+    // (2) Despite the monorepo signal, configExists short-circuit
+    // returned ~/.dkg, and DKG_HOME mid-action reflects that.
+    expect(dkgHomeAtStartDaemon).toBe(installedDkg);
+    // (3) No accidental .dkg-dev creation on the auto-detect path
+    // when an installed config already exists.
     expect(existsSync(join(tmpHome, '.dkg-dev'))).toBe(false);
   });
 

@@ -868,9 +868,21 @@ export async function mcpSetupAction(
   // duration of this action overrides the package-path-based auto-
   // detection inside adapter-openclaw's `dkgDir()` and dkg-core's
   // daemon-lifecycle, keeping all four flows aligned.
-  const dkgDirPath = deps.resolveDkgConfigHome({
-    isDkgMonorepo: context === 'monorepo',
-  });
+  // Codex Round-5 Fix 6: when `--monorepo` was explicitly forced AND
+  // a monorepo root was located, isolate to `~/.dkg-dev`
+  // unconditionally — bypass `resolveDkgConfigHome`'s configExists
+  // short-circuit. The flag's contract is "isolate dev state from
+  // installed state"; pre-fix, a user with an existing
+  // `~/.dkg/config.{json,yaml}` who passed `--monorepo` would still
+  // bootstrap against the installed home (since the helper falls
+  // back to `~/.dkg` when a config exists), mixing dev and installed
+  // state — exactly the contract `--monorepo` is meant to break.
+  // Auto-detect mode (no flag) keeps the existing configExists
+  // semantics so users with a global install aren't accidentally
+  // redirected.
+  const dkgDirPath = forcedContext === 'monorepo' && monorepoRoot
+    ? join(homedir(), '.dkg-dev')
+    : deps.resolveDkgConfigHome({ isDkgMonorepo: context === 'monorepo' });
   // Codex Round-3 Fix 3: save+restore `DKG_HOME` around the rest of
   // the action body. Pre-fix the env mutation was a permanent global
   // side effect — a long-lived process invoking `mcpSetupAction`
@@ -1087,11 +1099,17 @@ export async function mcpSetupAction(
   const writes = confirmed.filter((p) => p.action !== 'skip');
   if (writes.length === 0) {
     if (planned.some((p) => p.action !== 'skip')) {
-      // Distinct case from the original "all up-to-date" log: every
-      // pending registration was declined at the prompt. Clarify
-      // that re-running without `--force` won't reprompt unless
-      // the on-disk entry is actually stale.
-      console.log('\nAll pending registrations declined. Re-run with --force or --yes to write without prompts.');
+      // Codex Round-5 Fix 7: clarify the flag guidance. `--force`
+      // refreshes already-registered clients; `--yes` skips
+      // prompts. The flags are orthogonal — a re-run with only
+      // `--force` would re-prompt the same declined entries (since
+      // they're still classified as register/refresh, not skip,
+      // and confirmPlan still prompts in TTY mode regardless of
+      // force). To get past the prompt loop, the operator wants
+      // `--yes` (alone if the entries were unregistered; combined
+      // with `--force` if they want to also refresh
+      // already-registered clients).
+      console.log('\nAll pending registrations declined. Re-run with --yes to skip prompts (or --force --yes to also refresh already-registered clients).');
     } else {
       console.log('\nClients all up-to-date; nothing to write. Re-run with --force to refresh anyway.');
     }

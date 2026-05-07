@@ -111,17 +111,25 @@ function uuidv5(name, namespace) {
 // field, so its offset and `eventTimeZoneOffset` must agree — hard-
 // coding `+00:00` would silently mis-attribute non-UTC source data
 // (e.g. `2026-05-12T08:00:00-05:00` would round-trip as 8 AM UTC,
-// not 8 AM US Eastern). For naive timestamps with no offset suffix
-// we conservatively default to `+00:00`; the synthesized source uses
-// `Z` everywhere so this default never fires for the committed demo
-// fixtures, but it keeps the function total for arbitrary BIKE_SOURCE
-// exports.
+// not 8 AM US Eastern).
+//
+// REJECT naive timestamps (no `Z` and no `±HH:MM`/`±HHMM` suffix)
+// rather than silently rewriting them as `+00:00`. The previous
+// default created a divergence with the ETL's `Date.parse()` sort,
+// which interprets naive timestamps in the host machine's LOCAL
+// timezone — so on a non-UTC host, the source could be ordered as
+// local time but published as UTC, shifting the recorded instant by
+// hours. Failing here makes that ambiguity loud (the ETL's pre-sort
+// validator is the actual gate; this throw is the secondary
+// defensive check should any caller bypass it).
 function extractTzOffset(ended) {
   const s = String(ended);
   if (/Z$/.test(s)) return '+00:00';
   const m = s.match(/([+-])(\d{2}):?(\d{2})$/);
   if (m) return `${m[1]}${m[2]}:${m[3]}`;
-  return '+00:00';
+  throw new Error(
+    `eventTime requires an explicit timezone offset (Z or ±HH:MM); got naive timestamp ${JSON.stringify(s)}`,
+  );
 }
 
 // Build one EPCIS 2.0 Document containing exactly one ObjectEvent.

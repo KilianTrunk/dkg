@@ -91,11 +91,28 @@ export async function runEtl({
   // ETL fails loudly on bad input instead of silently producing
   // wrong-order events, then sort on the parsed instant.
   const filteredRecords = allRecords.filter((r) => r?.trace_id === traceId);
+  // Pre-validate timestamps with TWO checks:
+  //   (a) parseable by Date.parse — catches malformed inputs
+  //   (b) explicit timezone offset — Date.parse interprets naive
+  //       timestamps in the host's LOCAL timezone, so sorting them
+  //       lexicographically next to UTC values mis-orders records on
+  //       non-UTC hosts. EPCIS event documents also require an
+  //       explicit offset (`extractTzOffset` in epc-mapping.mjs
+  //       rejects naive inputs as a secondary defense). Failing here
+  //       makes the ambiguity loud at ETL time rather than at
+  //       publish time.
+  const isoOffsetSuffix = /(?:Z|[+-]\d{2}:?\d{2})$/;
   for (const r of filteredRecords) {
     if (Number.isNaN(Date.parse(r?.ended))) {
       throw new Error(
         `Source contains invalid timestamp: trace_id=${r?.trace_id} ` +
           `unit_id=${r?.unit_id} ended=${JSON.stringify(r?.ended)}`,
+      );
+    }
+    if (typeof r?.ended !== 'string' || !isoOffsetSuffix.test(r.ended)) {
+      throw new Error(
+        `Source timestamp lacks an explicit timezone offset (Z or ±HH:MM): ` +
+          `trace_id=${r?.trace_id} unit_id=${r?.unit_id} ended=${JSON.stringify(r?.ended)}`,
       );
     }
   }
@@ -143,8 +160,26 @@ export async function runEtl({
       // Malformed prior manifest — skip cleanup; we'd rather leak a
       // stale file than delete files based on a partial parse.
     }
+    // Resolve each candidate to an absolute path and verify it stays
+    // INSIDE outDir before deleting. A corrupted or hand-edited
+    // manifest with `../` segments in `events[].file` could otherwise
+    // make a regen unlink files outside the demo's fixtures dir
+    // (worst case: anywhere on the filesystem the user has write
+    // access). The check is path.resolve(outDir+entry) startsWith
+    // path.resolve(outDir) — directory-traversal-safe regardless of
+    // OS-specific separators.
+    const outDirResolved = resolve(outDir);
+    const outDirPrefix = outDirResolved.endsWith('/') || outDirResolved.endsWith('\\')
+      ? outDirResolved
+      : `${outDirResolved}/`;
     for (const entry of filesToRemove) {
-      await unlink(join(outDir, entry)).catch(() => {});
+      const target = resolve(outDir, entry);
+      if (target !== outDirResolved && !target.startsWith(outDirPrefix)) {
+        // Suspect path-traversal — skip silently (we'd rather leak a
+        // stale file than execute a path that escapes outDir).
+        continue;
+      }
+      await unlink(target).catch(() => {});
     }
   }
 

@@ -548,8 +548,15 @@ async function loadTraceManifest() {
       // it; if multiple or none, the glob branch raises a clear error.
     }
   }
-  const uuidShape = /^trace-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-bike-line\.json$/;
-  const candidates = (await readdir(FIXTURES)).filter((f) => uuidShape.test(f));
+  // Match any `trace-<id>-bike-line.json` where `<id>` is non-empty and
+  // contains no path separators or `..` segments. The earlier UUID-only
+  // regex rejected valid manifests for non-UUID `--trace-id` values
+  // (e.g. a custom `BIKE_SOURCE` that uses an external trace key); the
+  // generic shape covers UUIDs and arbitrary identifiers alike while
+  // keeping a path-traversal guard in the regex itself.
+  const manifestShape = /^trace-([^/\\]+?)-bike-line\.json$/;
+  const candidates = (await readdir(FIXTURES))
+    .filter((f) => manifestShape.test(f) && !f.includes('..'));
   if (candidates.length === 0) {
     throw new Error(
       `No trace-<id>-bike-line.json manifest found in ${FIXTURES}. ` +

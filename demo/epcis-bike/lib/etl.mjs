@@ -18,7 +18,7 @@
 
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile, readdir, unlink } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildEpcisDocument } from './epc-mapping.mjs';
 
@@ -165,16 +165,24 @@ export async function runEtl({
     // manifest with `../` segments in `events[].file` could otherwise
     // make a regen unlink files outside the demo's fixtures dir
     // (worst case: anywhere on the filesystem the user has write
-    // access). The check is path.resolve(outDir+entry) startsWith
-    // path.resolve(outDir) — directory-traversal-safe regardless of
-    // OS-specific separators.
+    // access). Use `path.relative(outDir, target)` for the containment
+    // check rather than a hardcoded slash prefix — the previous
+    // `${outDir}/` approach broke on Windows where `path.resolve`
+    // returns `C:\\fixtures\\event.json` and `${outDir}/` is
+    // `C:\\fixtures/`, so `startsWith` always returned false and
+    // cleanup was silently skipped on Windows hosts. `relative()`
+    // returns a string starting with `..` (or absolute on different
+    // drives) when the target escapes the base, which works on every
+    // platform.
     const outDirResolved = resolve(outDir);
-    const outDirPrefix = outDirResolved.endsWith('/') || outDirResolved.endsWith('\\')
-      ? outDirResolved
-      : `${outDirResolved}/`;
     for (const entry of filesToRemove) {
       const target = resolve(outDir, entry);
-      if (target !== outDirResolved && !target.startsWith(outDirPrefix)) {
+      const rel = relative(outDirResolved, target);
+      // Inside outDir: `relative` is empty (target === outDir, never
+      // happens here for files), or a path that does NOT start with
+      // `..` and is NOT absolute (different drive on Windows). Reject
+      // anything else.
+      if (rel.startsWith('..') || resolve(outDirResolved, rel) !== target) {
         // Suspect path-traversal — skip silently (we'd rather leak a
         // stale file than execute a path that escapes outDir).
         continue;

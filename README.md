@@ -69,36 +69,16 @@ the writer, but do not encrypt GossipSub payload bytes.
 
 **Prerequisites:** Node.js 22+, npm 10+. macOS, Linux, and Windows (PowerShell 5.1+ or WSL2) all supported.
 
-Pick the on-ramp that matches how you're already working:
+### Hermes adapter
 
-| You want… | Recipe | More |
-|---|---|---|
-| **DKG V10 as memory for Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline** | [MCP setup](#dkg-v10-as-agent-memory-mcp) | two commands |
-| **DKG V10 wired into an OpenClaw agent** | [OpenClaw setup](#openclaw-adapter) | two commands |
-| **DKG V10 inside an ElizaOS agent** | [ElizaOS adapter](packages/adapter-elizaos/README.md) | adapter README |
-| **DKG V10 inside a Hermes agent** | [Hermes adapter](packages/adapter-hermes/README.md) | adapter README |
-| **A standalone node** to query and publish from the CLI | [Standalone node](#standalone-node) | manual install |
-| **A custom Node.js / TypeScript integration** | [Custom-agent setup](docs/setup/SETUP_CUSTOM.md) | docs |
-
-Every on-ramp installs the same `@origintrail-official/dkg` umbrella package, runs the same daemon (`dkg start`), and exposes the same data via HTTP, SPARQL, and MCP. The recipes below diverge only in what they wire up on top.
-
-> **Hermes agents:** Install the DKG CLI and run Hermes setup, then start the Hermes gateway:
-> ```bash
-> npm install -g @origintrail-official/dkg
-> dkg hermes setup
-> ```
-> `dkg hermes setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and wires the Hermes profile with replace-by-default provider election (use `--preserve-provider` to opt out, `--no-start` / `--no-fund` for advanced flows). See the [adapter guide](packages/adapter-hermes/README.md) for details.
-
-### DKG V10 as agent memory (MCP)
-
-Two commands wire DKG V10 into MCP-aware clients (Cursor, Claude Code, Claude Desktop, Windsurf, VSCode + GitHub Copilot Chat, Cline):
+Two commands:
 
 ```bash
 npm install -g @origintrail-official/dkg
-dkg mcp setup
+dkg hermes setup
 ```
 
-`dkg mcp setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and registers MCP entries in each detected client (you confirm per client unless `--yes` is passed). See the [MCP integration guide](packages/mcp-dkg/README.md) for client-by-client paths, mode overrides (`--installed` / `--monorepo`), the manual JSON shape, the contributor monorepo dev workflow, and troubleshooting (including the WSL2 caveat for Windows-side MCP clients).
+`dkg hermes setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and wires the Hermes profile with replace-by-default provider election (use `--preserve-provider` to opt out, `--no-start` / `--no-fund` for advanced flows). See the [adapter guide](packages/adapter-hermes/README.md) for details.
 
 ### OpenClaw adapter
 
@@ -134,6 +114,17 @@ The full adapter reference — daemon URL config, channel-port overrides, discon
 - **Faucet failure** → setup logs a `curl` block for manual funding; the node still works for non-on-chain flows (P2P, queries, WM/SWM writes).
 - **Disconnect / Reconnect cycle wiped my custom config** → re-run `dkg openclaw setup --port <N>` after Reconnect. Default-port users see no visible difference across the cycle.
 - **Channel port `9201` already in use** → set `channel.port` manually under `plugins.entries.adapter-openclaw.config` in `~/.openclaw/openclaw.json`.
+
+### Model Context Protocol (MCP)
+
+Two commands wire DKG V10 into MCP-aware clients (Cursor, Claude Code, Claude Desktop, Windsurf, VSCode + GitHub Copilot Chat, Cline):
+
+```bash
+npm install -g @origintrail-official/dkg
+dkg mcp setup
+```
+
+`dkg mcp setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and registers MCP entries in each detected client (you confirm per client unless `--yes` is passed). See the [MCP integration guide](packages/mcp-dkg/README.md) for client-by-client paths, mode overrides (`--installed` / `--monorepo`), the manual JSON shape, the contributor monorepo dev workflow, and troubleshooting (including the WSL2 caveat for Windows-side MCP clients).
 
 ### Standalone node
 
@@ -277,7 +268,7 @@ Use adapters for OpenClaw, ElizaOS, Hermes, or your own Node.js / TypeScript pro
 
 | Guide | Use it when |
 |---|---|
-| [DKG V10 as agent memory (MCP)](#dkg-v10-as-agent-memory-mcp) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline to use DKG as memory |
+| [Model Context Protocol (MCP)](#model-context-protocol-mcp) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline to use DKG as memory |
 | [`packages/mcp-dkg/README.md`](packages/mcp-dkg/README.md) | You want the full MCP tool surface and config reference |
 | [Join the Testnet](docs/setup/JOIN_TESTNET.md) | You want a full node setup and first publish/query flow |
 | [OpenClaw Setup](docs/setup/SETUP_OPENCLAW.md) | You want OpenClaw to use DKG as memory/tools |

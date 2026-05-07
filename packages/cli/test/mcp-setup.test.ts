@@ -1591,7 +1591,14 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // Post-fix: try/finally wraps the action body. The finally
     // restores the prior `DKG_HOME` value (or unsets it if it wasn't
     // set going in) on BOTH throw and normal exit.
-    const PRIOR = '/some/external/dkg-home';
+    //
+    // Using a tmpHome-rooted path here, not a hardcoded system path
+    // like `/some/external/dkg-home`: the action mkdirs `dkgDirPath`
+    // before the (stubbed-to-throw) startDaemon, so the path needs
+    // to be writable on the runner. The test invariant (DKG_HOME
+    // pointing somewhere OTHER than the default `~/.dkg`) is the
+    // same regardless of which tmpdir-rooted path we pick.
+    const PRIOR = join(tmpHome, 'external-dkg-home');
     process.env.DKG_HOME = PRIOR;
 
     // Force a throw mid-action: stub `startDaemon` to reject. By
@@ -2140,7 +2147,15 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // previousDkgHome BEFORE the cascade; the try/finally restore
     // MUST still use that captured value. This test pins the
     // invariant for both the env-set and env-unset cases.
-    const PRIOR = '/some/external/dkg-home';
+    //
+    // Using a tmpHome-rooted path here, not a hardcoded system path
+    // like `/some/external/dkg-home`: the action mkdirs `dkgDirPath`
+    // (the writeDkgConfig stub creates it for completeness), so
+    // the path needs to be writable on the runner. The test
+    // invariant (DKG_HOME pointing somewhere OTHER than the default
+    // `~/.dkg`) is the same regardless of which tmpdir-rooted path
+    // we pick.
+    const PRIOR = join(tmpHome, 'external-dkg-home');
     process.env.DKG_HOME = PRIOR;
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
 

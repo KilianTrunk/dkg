@@ -135,61 +135,86 @@ export async function runEtl({
 
     const groupCount = Object.keys(byStatus).length;
     for (const [status, ids] of Object.entries(byStatus)) {
-      // ADD only when EVERY item in this status group is first-seen.
-      // Earlier `ids.some(unseen)` flagged the whole group as ADD if any
-      // single item was unseen — for a mixed group `[seen, unseen]` the
-      // already-observed item then claimed ADD too, which the EPCIS spec
-      // reserves for a true first observation. Using `every` is
-      // conservative: when a group blends first-seen and previously-seen
-      // EPCs, the action drops to OBSERVE (the strictly correct option
-      // is to split the group, but the demo's uniform-status fixture
-      // never trips that branch — both predicates match identically on
-      // it, so the committed event-*.json files regenerate unchanged).
-      const isFirstInTrace = ids.every((itemId) => !seenEpcs.has(itemId));
-      for (const itemId of ids) seenEpcs.add(itemId);
+      // EPCIS `action` is a per-item semantic: ADD = first observation
+      // of these EPCs, OBSERVE = subsequent observation. When a single
+      // status bucket holds BOTH first-seen and already-seen items, no
+      // single action is correct for the bucket as a whole:
+      //   - `some(unseen)` (was) → bucket = ADD → already-seen items
+      //     get re-added, violating spec.
+      //   - `every(unseen)` (was) → bucket = OBSERVE → first-seen items
+      //     lose their first-observation semantic.
+      // Splitting the bucket is the EPCIS-correct option: emit one doc
+      // per (status, action) sub-bucket. For the synthesized uniform-
+      // status fixture only one of the sub-buckets is ever populated
+      // per record, so the committed event-*.json files regenerate
+      // identically (single sub-bucket → no `groupKey` suffix → eventID
+      // seed unchanged from the back-compat shape).
+      const firstSeen = ids.filter((id) => !seenEpcs.has(id));
+      const observed = ids.filter((id) => seenEpcs.has(id));
+      for (const id of ids) seenEpcs.add(id);
 
-      const doc = buildEpcisDocument({
-        traceId: rec.trace_id,
-        unitId: rec.unit_id,
-        unitName: rec.unit_name,
-        processName: rec.process_name,
-        ended: rec.ended,
-        itemIds: ids,
-        status,
-        // Disambiguate sibling docs by status when a single source record
-        // splits into multiple groups; otherwise leave undefined so the
-        // eventID matches the back-compat (trace, unit, ended) seed.
-        groupKey: groupCount > 1 ? status : undefined,
-        isFirstInTrace,
-        creationDate,
-      });
+      const actionSubBuckets = [];
+      if (firstSeen.length > 0) actionSubBuckets.push({ ids: firstSeen, action: 'ADD' });
+      if (observed.length > 0) actionSubBuckets.push({ ids: observed, action: 'OBSERVE' });
 
-      const fileNum = events.length + 1;
-      // Run the status string through `safeName` before interpolating
-      // into the filename — real exports often use multi-word statuses
-      // (`In Progress`, `Hold/Recheck`) that would otherwise create
-      // nested paths or fail `writeFile` outright.
-      const suffix = Object.keys(byStatus).length > 1 ? `-${safeName(status).toLowerCase()}` : '';
-      const filename = `event-${pad(fileNum)}-${safeName(rec.process_name)}${suffix}.json`;
-      const fullPath = join(outDir, filename);
-      await writeFile(fullPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf-8');
+      for (const sub of actionSubBuckets) {
+        // Disambiguate sibling docs from a single source record. When a
+        // record yields multiple status buckets (`groupCount > 1`) OR a
+        // bucket itself splits into ADD/OBSERVE sub-buckets, every
+        // sibling needs a distinct eventID. The publisher's duplicate-
+        // root validator rejects collisions on the second-onward sibling
+        // otherwise. When neither split applies, leave `groupKey`
+        // undefined so the eventID seed matches the back-compat
+        // `(trace, unit, ended)` shape and the committed fixtures
+        // regenerate unchanged.
+        const groupKeyParts = [];
+        if (groupCount > 1) groupKeyParts.push(status);
+        if (actionSubBuckets.length > 1) groupKeyParts.push(sub.action.toLowerCase());
+        const groupKey = groupKeyParts.length > 0 ? groupKeyParts.join('-') : undefined;
+        const isFirstInTrace = sub.action === 'ADD';
 
-      events.push({
-        file: filename,
-        eventID: doc.epcisBody.eventList[0].eventID,
-        eventTime: rec.ended,
-        process_name: rec.process_name,
-        unit_name: rec.unit_name,
-        unit_id: rec.unit_id,
-        item_ids: ids,
-        status,
-        action: doc.epcisBody.eventList[0].action,
-        bizStep: doc.epcisBody.eventList[0].bizStep,
-        disposition: doc.epcisBody.eventList[0].disposition,
-      });
+        const doc = buildEpcisDocument({
+          traceId: rec.trace_id,
+          unitId: rec.unit_id,
+          unitName: rec.unit_name,
+          processName: rec.process_name,
+          ended: rec.ended,
+          itemIds: sub.ids,
+          status,
+          groupKey,
+          isFirstInTrace,
+          creationDate,
+        });
 
-      stations.add(rec.process_name);
-      products.add(rec.product_id);
+        const fileNum = events.length + 1;
+        // Filename suffixes mirror the same two split axes. `safeName`
+        // covers multi-word / slashed / non-ASCII statuses (`In Progress`,
+        // `Hold/Recheck`) that would otherwise create nested paths or
+        // fail `writeFile`. The action suffix appears only when an
+        // ADD/OBSERVE split fires.
+        const statusSuffix = groupCount > 1 ? `-${safeName(status).toLowerCase()}` : '';
+        const actionSuffix = actionSubBuckets.length > 1 ? `-${sub.action.toLowerCase()}` : '';
+        const filename = `event-${pad(fileNum)}-${safeName(rec.process_name)}${statusSuffix}${actionSuffix}.json`;
+        const fullPath = join(outDir, filename);
+        await writeFile(fullPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf-8');
+
+        events.push({
+          file: filename,
+          eventID: doc.epcisBody.eventList[0].eventID,
+          eventTime: rec.ended,
+          process_name: rec.process_name,
+          unit_name: rec.unit_name,
+          unit_id: rec.unit_id,
+          item_ids: sub.ids,
+          status,
+          action: doc.epcisBody.eventList[0].action,
+          bizStep: doc.epcisBody.eventList[0].bizStep,
+          disposition: doc.epcisBody.eventList[0].disposition,
+        });
+
+        stations.add(rec.process_name);
+        products.add(rec.product_id);
+      }
     }
   }
 

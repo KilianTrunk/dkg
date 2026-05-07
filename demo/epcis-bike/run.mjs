@@ -153,6 +153,42 @@ function runCli(args) {
   };
 }
 
+// Resolve a daemon's bearer token from a DKG_HOME the same way
+// `dkg auth show` does — config-pinned tokens (`config.auth.tokens[]`)
+// AND file-backed tokens (`<DKG_HOME>/auth.token`) are both supported
+// deployments. Reading auth.token as the only source breaks config-only
+// setups (operators who disable file-backed auth and pin tokens via
+// config) with a misleading "Cannot read daemon auth" even though the
+// daemon is healthy and would accept a config-token request. Mirrors
+// `packages/cli/src/auth.ts:loadTokens` precedence — config first, then
+// file — so demo phases agree with `dkg auth show` on which tokens are
+// valid.
+async function resolveAuthToken(dkgHome) {
+  const configPath = join(dkgHome, 'config.json');
+  if (existsSync(configPath)) {
+    try {
+      const cfg = JSON.parse(await readFile(configPath, 'utf-8'));
+      const cfgTokens = cfg?.auth?.tokens;
+      if (Array.isArray(cfgTokens)) {
+        const t = cfgTokens.find((s) => typeof s === 'string' && s.length > 0);
+        if (t) return t;
+      }
+    } catch {
+      // Fall through to file-backed token below — a malformed config.json
+      // is an operator problem, not a reason to give up on a daemon that
+      // also has an auth.token file.
+    }
+  }
+  try {
+    return (await readFile(join(dkgHome, 'auth.token'), 'utf-8'))
+      .split('\n')
+      .map((l) => l.trim())
+      .find((l) => l && !l.startsWith('#'));
+  } catch {
+    return undefined;
+  }
+}
+
 // Read the daemon's port + bearer token from DKG_HOME (or ~/.dkg). Cached
 // after first read because Phase 2 polls in tight loops and re-reading the
 // auth file every poll round adds avoidable latency.
@@ -164,10 +200,7 @@ async function getDaemonAuth() {
     (await readFile(join(dkgHome, 'api.port'), 'utf-8')).trim(),
     10,
   );
-  const token = (await readFile(join(dkgHome, 'auth.token'), 'utf-8'))
-    .split('\n')
-    .map((l) => l.trim())
-    .find((l) => l && !l.startsWith('#'));
+  const token = await resolveAuthToken(dkgHome);
   if (!Number.isFinite(port) || !token) {
     throw new Error(`Cannot read daemon auth from ${dkgHome}`);
   }
@@ -218,10 +251,11 @@ async function getNode2Auth() {
       (await readFile(join(NODE2_DKG_HOME, 'api.port'), 'utf-8')).trim(),
       10,
     );
-    const token = (await readFile(join(NODE2_DKG_HOME, 'auth.token'), 'utf-8'))
-      .split('\n')
-      .map((l) => l.trim())
-      .find((l) => l && !l.startsWith('#'));
+    // Same config-aware token resolution as getDaemonAuth — node2 may
+    // also be a config-tokens-only deployment. resolveAuthToken returns
+    // undefined for "no token reachable", which we coerce to graceful
+    // null below (Phase 7 degrades cleanly when node2 is unavailable).
+    const token = await resolveAuthToken(NODE2_DKG_HOME);
     if (!Number.isFinite(port) || !token) {
       _node2Auth = null;
       return null;

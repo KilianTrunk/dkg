@@ -528,32 +528,22 @@ async function node2Sparql(sparql) {
 //      stray non-trace files matching `trace-*-bike-line.json` aren't
 //      picked up by accident.
 async function loadTraceManifest() {
-  const snapshotPath = join(FIXTURES, 'source-snapshot.json');
-  let traceId;
-  try {
-    const snap = JSON.parse(await readFile(snapshotPath, 'utf-8'));
-    traceId = snap?.trace_id;
-  } catch {
-    // Snapshot missing or malformed — fall through to glob below.
-  }
-  if (typeof traceId === 'string' && traceId.length > 0) {
-    const path = join(FIXTURES, `trace-${traceId}-bike-line.json`);
-    try {
-      return JSON.parse(await readFile(path, 'utf-8'));
-    } catch {
-      // Snapshot pointed at a missing or unreadable manifest — could be
-      // a stale source-snapshot.json left over from a regen + manual
-      // rename, or a corrupted file. Fall through to the glob path: if
-      // exactly one valid manifest sits next to the fixture set, use
-      // it; if multiple or none, the glob branch raises a clear error.
-    }
-  }
-  // Match any `trace-<id>-bike-line.json` where `<id>` is non-empty and
-  // contains no path separators or `..` segments. The earlier UUID-only
-  // regex rejected valid manifests for non-UUID `--trace-id` values
-  // (e.g. a custom `BIKE_SOURCE` that uses an external trace key); the
-  // generic shape covers UUIDs and arbitrary identifiers alike while
-  // keeping a path-traversal guard in the regex itself.
+  // Manifest selection is glob-based. The earlier "snapshot-keyed
+  // lookup with glob fallback" path used `source-snapshot.json`'s
+  // `trace_id` to pick which manifest to read, but that file is
+  // global per outDir — after regenerating a different trace into a
+  // shared dir, the snapshot got overwritten with the new trace's
+  // id and the loader silently switched to it, making the original
+  // trace effectively undiscoverable. Glob-only selection requires
+  // the dir to hold exactly one manifest, surfacing multi-trace
+  // ambiguity as an explicit error the operator must resolve (e.g.
+  // by removing stale manifests or running the demo against a fresh
+  // outDir).
+  //
+  // Match any `trace-<id>-bike-line.json` where `<id>` is non-empty
+  // and contains no path separators or `..` segments — covers
+  // UUIDs and arbitrary identifiers alike while keeping a path-
+  // traversal guard in the regex itself.
   const manifestShape = /^trace-([^/\\]+?)-bike-line\.json$/;
   const candidates = (await readdir(FIXTURES))
     .filter((f) => manifestShape.test(f) && !f.includes('..'));
@@ -566,7 +556,7 @@ async function loadTraceManifest() {
   if (candidates.length > 1) {
     throw new Error(
       `Multiple trace manifests in ${FIXTURES} (${candidates.join(', ')}). ` +
-        'Set source-snapshot.json:trace_id, or remove the stale manifests, to disambiguate.',
+        'Remove the stale manifest(s) — the demo loads exactly one per run.',
     );
   }
   return JSON.parse(await readFile(join(FIXTURES, candidates[0]), 'utf-8'));

@@ -253,7 +253,14 @@ export async function runEtl({
     // If items have heterogeneous statuses, group them so each EPCIS event
     // has a single disposition. In practice for this trace they're uniform,
     // but we don't want to lie about disposition if multiple statuses appear.
-    const byStatus = {};
+    // Use Object.create(null) so a status string of `__proto__`,
+    // `constructor`, etc. doesn't walk the prototype chain. With a
+    // plain `{}`, `byStatus['__proto__']` resolves to Object.prototype
+    // and `(byStatus[status] ??= []).push(itemId)` either fails (the
+    // prototype isn't an array) or pollutes the object's prototype
+    // chain. A null-prototype object has no inherited properties so
+    // any string key is safe.
+    const byStatus = Object.create(null);
     for (const itemId of itemIds) {
       const status = rec.items[itemId]?.status ?? 'Skipped';
       (byStatus[status] ??= []).push(itemId);

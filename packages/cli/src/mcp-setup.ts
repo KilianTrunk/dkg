@@ -1011,28 +1011,36 @@ function writeRegistration(
   const { head, leaf } = splitEntryPath(target.entryPath);
   const container = ensurePathContainer(body, head);
 
-  // Codex Round-15 Fix 22 Part B: when refreshing an existing
-  // entry, MERGE its `env` map with the expected env instead of
-  // replacing the whole entry blindly. User-added MCP env vars
-  // (NODE_OPTIONS, HTTPS_PROXY, custom debug flags, etc.) live
-  // alongside DKG_HOME in the same `env` object — pre-fix the
-  // full-entry replace silently wiped those on every refresh.
-  // Spread order: existing env first, then expected env, so
-  // expected.DKG_HOME overrides any prior DKG_HOME but
-  // user-added keys from the existing entry are preserved.
+  // Codex Round-15 Fix 22 + Round-19 Fix 26: when refreshing an
+  // existing entry, MERGE the entire existing entry — not just
+  // env — with the expected entry. Round-15 Fix 22 added env-merge
+  // (NODE_OPTIONS, HTTPS_PROXY, etc. preserved) but the rest of
+  // the entry was still being replaced wholesale, which clobbered
+  // top-level keys clients use to anchor MCP servers (e.g. `cwd`
+  // for workspace-scoped servers, custom keys like `restartPolicy`).
+  //
+  // Spread order: existing entry first, then expected entry, then
+  // explicit env merge. The fields THIS COMMAND owns are
+  // `command`, `args`, and `env.DKG_HOME` — those override
+  // existing values via the second spread + explicit env override.
+  // Everything else passes through from the existing entry
+  // unchanged: arbitrary top-level keys (cwd, restartPolicy, …)
+  // and arbitrary env keys (NODE_OPTIONS, HTTPS_PROXY, …).
   const currentEntry = container[leaf];
+  const currentEntryObj =
+    currentEntry && typeof currentEntry === 'object'
+      ? (currentEntry as Record<string, unknown>)
+      : {};
   const currentEnv =
-    currentEntry &&
-    typeof currentEntry === 'object' &&
-    (currentEntry as Record<string, unknown>).env &&
-    typeof (currentEntry as Record<string, unknown>).env === 'object'
-      ? ((currentEntry as Record<string, unknown>).env as Record<string, unknown>)
+    currentEntryObj.env && typeof currentEntryObj.env === 'object'
+      ? (currentEntryObj.env as Record<string, unknown>)
       : {};
   const expectedEnv =
     entry.env && typeof entry.env === 'object'
       ? (entry.env as Record<string, unknown>)
       : {};
   const mergedEntry: Record<string, unknown> = {
+    ...currentEntryObj,
     ...entry,
     env: { ...currentEnv, ...expectedEnv },
   };

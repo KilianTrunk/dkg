@@ -2837,4 +2837,104 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       restoreWslEnv();
     }
   });
+
+  // ── Codex Round-19 Fix 26: writeRegistration merges full entry ──
+
+  it('Codex Round-19 Fix 26: refresh preserves top-level user keys (cwd) AND env keys; updates command/args/env.DKG_HOME', async () => {
+    // Round-15 Fix 22 added env-merge but the rest of the entry
+    // was still being replaced wholesale, so top-level keys like
+    // `cwd` (workspace-anchoring, common in MCP server configs)
+    // got clobbered on first refresh. Round-19 Fix 26 extends
+    // the merge to the entire entry: spread existing first, then
+    // expected, then explicit env merge. Fields THIS COMMAND owns
+    // (command, args, env.DKG_HOME) override; everything else
+    // passes through unchanged.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          dkg: {
+            command: '/old/legacy/dkg',
+            args: ['legacy-arg'],
+            cwd: '/workspaces/my-project',
+            env: {
+              DKG_HOME: '/old/abandoned/path',
+              NODE_OPTIONS: '--inspect',
+              HTTPS_PROXY: 'http://corp:8080',
+            },
+          },
+        },
+      }, null, 2),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    // Fields this command owns: refreshed.
+    expect(after.mcpServers.dkg.command).toBe(process.execPath);
+    expect(after.mcpServers.dkg.args[0]).toBe(realpathSync(process.argv[1]));
+    expect(after.mcpServers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
+    expect(after.mcpServers.dkg.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    // Top-level user key `cwd`: PRESERVED (load-bearing).
+    expect(after.mcpServers.dkg.cwd).toBe('/workspaces/my-project');
+    // env user keys: PRESERVED (Round-15 Fix 22 contract carries forward).
+    expect(after.mcpServers.dkg.env.NODE_OPTIONS).toBe('--inspect');
+    expect(after.mcpServers.dkg.env.HTTPS_PROXY).toBe('http://corp:8080');
+  });
+
+  it('Codex Round-19 Fix 26: arbitrary unknown top-level keys preserved across refresh', async () => {
+    // Pin the contract: `command`, `args`, `env.DKG_HOME` are
+    // the ONLY fields this command owns. Any other top-level key
+    // — even ones we don't know about today — passes through
+    // unchanged.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(
+      join(cursorDir, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          dkg: {
+            command: '/old/dkg',
+            args: ['old'],
+            env: { DKG_HOME: '/old' },
+            // Hypothetical user-added or future-MCP-spec keys.
+            restartPolicy: 'always',
+            timeout: 30000,
+            tags: ['dev', 'experimental'],
+          },
+        },
+      }, null, 2),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = JSON.parse(readFileSync(join(cursorDir, 'mcp.json'), 'utf-8'));
+    expect(after.mcpServers.dkg.restartPolicy).toBe('always');
+    expect(after.mcpServers.dkg.timeout).toBe(30000);
+    expect(after.mcpServers.dkg.tags).toEqual(['dev', 'experimental']);
+    // And the command-owned fields refreshed correctly.
+    expect(after.mcpServers.dkg.command).toBe(process.execPath);
+    expect(after.mcpServers.dkg.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+  });
+
+  it('Codex Round-19 Fix 26: fresh client (no existing entry) → entry written as-is, no merge artifacts', async () => {
+    // Regression guard: when there's nothing to merge with,
+    // writeRegistration emits the expected entry verbatim. No
+    // accidental empty-spread artifacts; the entry's keys are
+    // exactly what canonicalEntry produced.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps();
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const cursor = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    // Exactly the expected keys: command, args, env. No leftover
+    // top-level keys from a non-existent prior.
+    expect(Object.keys(cursor.mcpServers.dkg).sort()).toEqual(['args', 'command', 'env']);
+    expect(cursor.mcpServers.dkg.env).toEqual({ DKG_HOME: join(tmpHome, '.dkg') });
+  });
 });

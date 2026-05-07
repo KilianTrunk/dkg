@@ -9,14 +9,21 @@
  * workspace can still point at something:
  *
  *   DKG_HOME         — DKG state directory. When set, config is read
- *                      from `<DKG_HOME>/config.yaml` directly and the
- *                      cwd-walk is skipped entirely. Propagated by
- *                      `dkg mcp setup` via the MCP entry's `env: {
- *                      DKG_HOME }` field (Round-9 Fix 16) so GUI
- *                      clients spawning the registered command read
- *                      the same home setup just bootstrapped — they
- *                      don't inherit shell env. Operators can also
- *                      export it from their shell. (Round-11 Fix 18)
+ *                      from `<DKG_HOME>/config.json` first (what
+ *                      `dkg mcp setup`'s writeDkgConfig actually
+ *                      writes), then `<DKG_HOME>/config.yaml` as
+ *                      fallback (the spec-canonical workspace
+ *                      format). Both are valid bootstrap states per
+ *                      Round-3 Fix 2's `resolveDkgConfigHome`
+ *                      semantics. The cwd-walk is skipped entirely.
+ *                      Propagated by `dkg mcp setup` via the MCP
+ *                      entry's `env: { DKG_HOME }` field (Round-9
+ *                      Fix 16) so GUI clients spawning the
+ *                      registered command read the same home setup
+ *                      just bootstrapped — they don't inherit shell
+ *                      env. Operators can also export it from their
+ *                      shell. (Round-11 Fix 18 added DKG_HOME-as-
+ *                      yaml; Round-19 Fix 25 added json precedence.)
  *   DKG_API          — daemon base URL    (default http://localhost:9200)
  *   DKG_TOKEN        — bearer token       (no default; read-only tools
  *                                          still need it in most setups)
@@ -85,15 +92,20 @@ function readIfExists(filePath: string): string | null {
 }
 
 /**
- * Locate the daemon's `config.yaml`.
+ * Locate the daemon's config file.
  *
- * Codex Round-11 Fix 18: `DKG_HOME` takes priority. When set
- * (propagated by `dkg mcp setup` via the MCP entry's `env: {
- * DKG_HOME }` field, or exported by the operator's shell), config
- * is read directly from `<DKG_HOME>/config.yaml`. The cwd-walk
- * is skipped entirely in that case — falling back to the walk
- * would mask a missing-config issue and re-introduce the
- * cwd-dependence FIX 16's env propagation was meant to eliminate.
+ * Codex Round-11 Fix 18 + Round-19 Fix 25: `DKG_HOME` takes priority.
+ * When set (propagated by `dkg mcp setup` via the MCP entry's
+ * `env: { DKG_HOME }` field, or exported by the operator's shell),
+ * config is read from `<DKG_HOME>/config.json` FIRST, then
+ * `<DKG_HOME>/config.yaml` as fallback. JSON precedence matches
+ * what `dkg mcp setup`'s `writeDkgConfig` actually writes after
+ * a fresh setup — pre-Round-19 we only checked yaml, so the post-
+ * setup path silently fell through to env defaults (empty token,
+ * null project) and every write 401'd. The cwd-walk is skipped
+ * entirely when DKG_HOME is set; falling back to the walk would
+ * mask a missing-config issue and re-introduce the cwd-dependence
+ * FIX 16's env propagation was meant to eliminate.
  *
  * Without `DKG_HOME` set, walk upwards from `start` looking for
  * `.dkg/config.yaml` — the spec-canonical workspace layout (see
@@ -104,8 +116,16 @@ function findConfigFile(start: string): string | null {
   // file, so we trim+null-coerce manually here rather than hoist.
   const dkgHome = process.env.DKG_HOME?.trim() || null;
   if (dkgHome) {
-    const candidate = path.join(dkgHome, 'config.yaml');
-    return fs.existsSync(candidate) ? candidate : null;
+    // Codex Round-19 Fix 25: try `config.json` first (what
+    // `dkg mcp setup`'s `writeDkgConfig` writes), then
+    // `config.yaml` as fallback (the spec-canonical workspace
+    // format and the format honoured by Round-3 Fix 2's
+    // `resolveDkgConfigHome` configExists check).
+    const jsonCandidate = path.join(dkgHome, 'config.json');
+    if (fs.existsSync(jsonCandidate)) return jsonCandidate;
+    const yamlCandidate = path.join(dkgHome, 'config.yaml');
+    if (fs.existsSync(yamlCandidate)) return yamlCandidate;
+    return null;
   }
   let dir = path.resolve(start);
   const root = path.parse(dir).root;
@@ -162,13 +182,26 @@ export function loadConfig(cwd: string = process.cwd()): DkgConfig {
     const raw = readIfExists(configPath);
     if (raw) {
       try {
-        const parsed = parseYaml(raw);
+        // Codex Round-19 Fix 25: format-aware parser dispatch.
+        // findConfigFile may return either a `config.json`
+        // (`dkg mcp setup`'s writeDkgConfig output) or a
+        // `config.yaml` (workspace-canonical) depending on what's
+        // present at DKG_HOME. JSON.parse handles JSON; parseYaml
+        // handles YAML (note: parseYaml ALSO accepts well-formed
+        // JSON since YAML is a superset, so the dispatch isn't
+        // strictly required for correctness — but using the
+        // dedicated parser keeps error messages format-specific).
+        const parsed = configPath.endsWith('.json')
+          ? JSON.parse(raw)
+          : parseYaml(raw);
         if (parsed && typeof parsed === 'object') {
           fromFile = parsed as Record<string, unknown>;
         }
       } catch (err) {
-        // Malformed YAML is not fatal — we just ignore it and log to stderr
-        // so the user sees the problem without blocking the server startup.
+        // Malformed config is not fatal — we just ignore it and log to
+        // stderr so the user sees the problem without blocking the
+        // server startup. Format name in the warning matches the
+        // file extension for clarity.
         process.stderr.write(
           `[mcp-dkg] warning: could not parse ${configPath}: ${
             err instanceof Error ? err.message : String(err)

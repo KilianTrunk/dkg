@@ -136,4 +136,89 @@ describe('loadConfig — DKG_HOME precedence (Codex Round-11 Fix 18)', () => {
     expect(cfg.defaultProject).toBe('setup-project');
     expect(cfg.sourcePath).toBe(join(setupHome, 'config.yaml'));
   });
+
+  // ── Codex Round-19 Fix 25: read JSON+YAML from DKG_HOME ──────────
+
+  it('Codex Round-19 Fix 25: DKG_HOME + <DKG_HOME>/config.json exists → loads JSON (matches what `dkg mcp setup` writes)', async () => {
+    // Pre-fix: Round-11 Fix 18 only checked config.yaml under
+    // DKG_HOME. But `dkg mcp setup`'s writeDkgConfig writes
+    // config.json — so after a fresh setup the GUI client's MCP
+    // server hit the DKG_HOME branch, found no yaml, fell through
+    // to env defaults (empty token, null project), and every
+    // write 401'd. Post-fix: JSON-first precedence matches the
+    // bootstrapped state.
+    const home = join(tmpRoot, 'json-dkg-home');
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, 'config.json'),
+      JSON.stringify({
+        node: { token: 'abc', api: 'http://h:9001' },
+        project: 'p',
+      }),
+    );
+    process.env.DKG_HOME = home;
+
+    const cfg = loadConfig();
+    expect(cfg.token).toBe('abc');
+    expect(cfg.api).toBe('http://h:9001');
+    expect(cfg.defaultProject).toBe('p');
+    expect(cfg.sourcePath).toBe(join(home, 'config.json'));
+  });
+
+  it('Codex Round-19 Fix 25: both config.json AND config.yaml exist at DKG_HOME → JSON wins (deterministic precedence)', async () => {
+    // When both files exist, Fix 25's JSON-first precedence
+    // mirrors `dkg mcp setup`'s actual write order. JSON has the
+    // bootstrapped state; YAML may be stale operator hand-edit
+    // from a previous workspace.
+    const home = join(tmpRoot, 'both-formats-home');
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, 'config.json'),
+      JSON.stringify({ node: { api: 'http://json:9100' } }),
+    );
+    writeFileSync(
+      join(home, 'config.yaml'),
+      'node:\n  api: http://yaml:9200\n',
+    );
+    process.env.DKG_HOME = home;
+
+    const cfg = loadConfig();
+    // JSON wins.
+    expect(cfg.api).toBe('http://json:9100');
+    expect(cfg.sourcePath).toBe(join(home, 'config.json'));
+  });
+
+  it('Codex Round-19 Fix 25: DKG_HOME + only config.yaml exists → falls back to YAML', async () => {
+    // YAML fallback: when no JSON is present (e.g. a workspace
+    // where the operator hand-edited config.yaml without going
+    // through `dkg mcp setup`), the YAML loader takes over.
+    // Round-11 Fix 18's contract preserved.
+    const home = join(tmpRoot, 'yaml-only-home');
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, 'config.yaml'),
+      'node:\n  api: http://yaml:9300\n',
+    );
+    process.env.DKG_HOME = home;
+
+    const cfg = loadConfig();
+    expect(cfg.api).toBe('http://yaml:9300');
+    expect(cfg.sourcePath).toBe(join(home, 'config.yaml'));
+  });
+
+  it('Codex Round-19 Fix 25: DKG_HOME + neither file exists → sourcePath null + env defaults preserved', async () => {
+    // Behavior preserved from Round-11 Fix 18: when DKG_HOME
+    // points to a directory with neither config.json nor
+    // config.yaml, the loader returns sourcePath=null and falls
+    // through to env defaults (rather than walking cwd, which
+    // would mask the missing-config issue).
+    const home = join(tmpRoot, 'empty-home');
+    mkdirSync(home, { recursive: true });
+    process.env.DKG_HOME = home;
+
+    const cfg = loadConfig();
+    expect(cfg.sourcePath).toBeNull();
+    // Default api when no config + no env: localhost:9200.
+    expect(cfg.api).toBe('http://localhost:9200');
+  });
 });

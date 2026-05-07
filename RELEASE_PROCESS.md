@@ -36,7 +36,7 @@ Current process keeps these aligned:
 - `package.json`
 - `packages/cli/package.json`
 - `packages/evm-module/package.json`
-- `packages/mcp-dkg/package.json`
+- `packages/mcp-server/package.json`
 
 ## 4) Pre-release tagging workflow
 

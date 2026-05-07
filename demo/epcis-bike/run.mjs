@@ -77,6 +77,17 @@ let phase3bOwnerOk = false;
 let phase4bOwnerOk = false;
 let phase6GrantOk = false;
 
+// Baseline anchor counts captured BEFORE Phase 1 lifts anything to gossip,
+// so Phase 7A can compute a delta and scope the "anchors visible on node2"
+// claim to THIS run's events. Without a baseline, a reused CG with stale
+// anchors from earlier runs would let Phase 7A pass even when the current
+// run's events never gossiped to node2 (the count is non-zero from prior
+// runs alone). Captured into both finalized and SWM partitions because the
+// publisher's anchor-write target depends on lift state. Stays at 0 when
+// node2 is unavailable — Phase 7 short-circuits with `node2Ident=null` in
+// that case so the baseline isn't consulted.
+let phase7AnchorBaseline = { finalized: 0, swm: 0, captured: false };
+
 // `--skip-cg-create` bypasses the canonical-ID resolution path in Phase 0.
 // If `EPCIS_DEMO_CG` is a bare name (no `/`), `CG_ID` stays as-is and every
 // downstream call (`create-sub-graph`, `epcis capture/query`) hits the
@@ -669,6 +680,45 @@ async function phase0() {
       );
     }
     await pauseAfter();
+
+    // Capture node2's pre-Phase-1 anchor counts as a Phase 7A baseline.
+    // Phase 7A will then compute `current - baseline` and require the
+    // delta to be > 0 (or >= eventCount) before claiming "anchors
+    // visible on node2 from THIS run". Without a baseline, a reused CG
+    // with stale anchors from earlier runs would let Phase 7A pass even
+    // when this run's events never gossiped — counting the leftovers
+    // alone, indistinguishably from a successful current-run gossip.
+    const finalizedGraphUriBaseline = `${CG_URI}/${SUB}`;
+    const swmGraphUriBaseline = `${CG_URI}/${SUB}/_shared_memory`;
+    const anchorBaselineSparql = (uri) =>
+      `SELECT (COUNT(?s) AS ?c) WHERE { ` +
+      `  GRAPH <${uri}> { ` +
+      `    ?s <http://dkg.io/ontology/privateDataAnchor> ?o ` +
+      `  } ` +
+      `}`;
+    let baselineFinalized = 0;
+    let baselineSwm = 0;
+    try {
+      const fr = await node2Sparql(anchorBaselineSparql(finalizedGraphUriBaseline));
+      if (fr.status === 200 && Array.isArray(fr.bindings)) {
+        baselineFinalized = parseCountBinding(fr.bindings[0]?.c);
+      }
+      const sr = await node2Sparql(anchorBaselineSparql(swmGraphUriBaseline));
+      if (sr.status === 200 && Array.isArray(sr.bindings)) {
+        baselineSwm = parseCountBinding(sr.bindings[0]?.c);
+      }
+      phase7AnchorBaseline = { finalized: baselineFinalized, swm: baselineSwm, captured: true };
+    } catch {
+      // Leave baseline at default {0, 0, captured:false}; Phase 7A will
+      // still run but its delta degrades to absolute count (current
+      // behavior). Better than aborting Phase 0 over a transient query.
+    }
+    if (!JSON_MODE && (baselineFinalized + baselineSwm) > 0) {
+      fmt.note(
+        `  Phase 7A baseline: ${baselineFinalized} finalized + ${baselineSwm} SWM anchors already on node2 ` +
+          'before this run\'s captures — Phase 7A will check the delta.',
+      );
+    }
   }
 
   const traceManifestPath = join(FIXTURES, 'trace-7c4f8d2a-bike-line.json');
@@ -1369,13 +1419,28 @@ async function phase7() {
     let anchorCount = querySucceeded(anchorRes) ? parseCount(anchorRes) : 0;
     let queriedPartition = 'finalized';
     let anchorQueryOk = querySucceeded(anchorRes);
-    if (anchorQueryOk && anchorCount === 0) {
+    let baselineForPartition = phase7AnchorBaseline.captured ? phase7AnchorBaseline.finalized : 0;
+    // The "did anchors gossip THIS run" claim is `current - baseline > 0`.
+    // The fallback to SWM applies when the post-baseline finalized delta
+    // is zero (subscribers don't materialize finalized; SWM is the
+    // expected target). Falling back on absolute count instead of delta
+    // would mis-route on a reused CG that has stale finalized anchors.
+    if (anchorQueryOk && anchorCount - baselineForPartition === 0) {
       anchorRes = await node2Sparql(anchorSparql(swmGraphUri));
       anchorQueryOk = querySucceeded(anchorRes);
       anchorCount = anchorQueryOk ? parseCount(anchorRes) : 0;
       queriedPartition = 'swm-fallback';
+      baselineForPartition = phase7AnchorBaseline.captured ? phase7AnchorBaseline.swm : 0;
     }
-    anchorOk = anchorQueryOk && anchorCount > 0;
+    const anchorDelta = anchorCount - baselineForPartition;
+    // Scope the assertion to THIS run: require the delta against the
+    // pre-Phase-1 baseline to be > 0. Pure absolute count would falsely
+    // pass against a reused CG whose stale anchors from earlier runs
+    // already exceeded zero. When no baseline was captured (node2 was
+    // unreachable at Phase 0 → phase7AnchorBaseline.captured=false),
+    // baselineForPartition stays 0 and delta == anchorCount, matching
+    // pre-baseline behavior.
+    anchorOk = anchorQueryOk && anchorDelta > 0;
     if (!JSON_MODE) {
       fmt.step('phase-7a-public-anchor-on-node2', 'Anyone — public anchor visible on a second node');
       fmt.preamble(
@@ -1394,7 +1459,7 @@ async function phase7() {
       }
       await pauseAfter();
     } else {
-      process.stdout.write(`${JSON.stringify({ step: 'phase-7a-public-anchor-on-node2', anchorCount, partition: queriedPartition, queryOk: anchorQueryOk, ok: anchorOk })}\n`);
+      process.stdout.write(`${JSON.stringify({ step: 'phase-7a-public-anchor-on-node2', anchorCount, anchorDelta, baseline: baselineForPartition, partition: queriedPartition, queryOk: anchorQueryOk, ok: anchorOk })}\n`);
     }
 
     // 7.B — Private payload absent on node2 until access-protocol fetch.
@@ -1492,22 +1557,62 @@ async function phase7() {
   // call this row "Anyone (no grant)": that label would mis-attribute
   // a passive-subscriber observation as proof of non-grantee denial,
   // which we don't actually exercise here (see Competitor).
-  const subscriberNote =
-    'Probe runs from node2, which IS the grantee in this 2-node setup. ' +
-    'This row reports node2\'s passive-subscriber state — public anchor ' +
-    'visible, private partition empty — BEFORE the access-protocol fetch ' +
-    'is invoked. Strict non-grantee denial (the "no grant" claim) would ' +
-    'need a third, ungranted node calling PROTOCOL_ACCESS — see Competitor.';
+  //
+  // When node2 is unreachable, the row is rendered as "not exercised"
+  // rather than verified=false — false would falsely imply we tested it
+  // and the test failed; what actually happened is we never tested it.
+  const subscriberRow = node2Ident
+    ? {
+        persona: 'Subscriber (pre-fetch)',
+        public_partition: 'anchor only',
+        private_partition: 'nothing (not yet fetched)',
+        verified: anchorOk && privateInvisible,
+        note:
+          'Probe runs from node2, which IS the grantee in this 2-node setup. ' +
+          'This row reports node2\'s passive-subscriber state — public anchor ' +
+          'visible, private partition empty — BEFORE the access-protocol fetch ' +
+          'is invoked. Strict non-grantee denial (the "no grant" claim) would ' +
+          'need a third, ungranted node calling PROTOCOL_ACCESS — see Competitor.',
+      }
+    : {
+        persona: 'Subscriber (pre-fetch)',
+        public_partition: 'not tested',
+        private_partition: 'not tested',
+        verified: 'unavailable',
+        note:
+          'Skipped — no second devnet node reachable. Set NODE2_DKG_HOME or ' +
+          'run `./scripts/devnet.sh start 2` to enable cross-node verification ' +
+          'and exercise this row.',
+      };
+  // Competitor row collapses to "not tested" too when there\'s no node2 to
+  // even host the negative-case probe (the "node2 sees public anchors but
+  // not private payload" observation is the closest proxy we have, and
+  // it can\'t run when node2 doesn\'t exist).
+  const competitorRow = node2Ident
+    ? {
+        persona: 'Competitor',
+        public_partition: 'anchor only',
+        private_partition: 'nothing',
+        verified: anchorOk && competitorPrivateVerified,
+        note: 'active access-handler denial not exercised — would need a third, ungranted node attempting PROTOCOL_ACCESS',
+      }
+    : {
+        persona: 'Competitor',
+        public_partition: 'not tested',
+        private_partition: 'not tested',
+        verified: 'unavailable',
+        note: 'Skipped — no second devnet node reachable; cross-node verification requires NODE2_DKG_HOME.',
+      };
 
   if (JSON_MODE) {
     process.stdout.write(
       `${JSON.stringify({
         step: 'phase-7d-table',
         visibility: [
-          { persona: 'Subscriber (pre-fetch)', public_partition: 'anchor only', private_partition: 'nothing (not yet fetched)', verified: anchorOk && privateInvisible, note: subscriberNote },
+          subscriberRow,
           { persona: 'Acme (owner)', public_partition: 'anchor', private_partition: 'full payload', verified: ownerOk },
           { persona: 'KIT (allowList)', public_partition: 'anchor', private_partition: 'full payload (allowed events)', verified: kitVerified, note: kitNote },
-          { persona: 'Competitor', public_partition: 'anchor only', private_partition: 'nothing', verified: anchorOk && competitorPrivateVerified, note: 'active access-handler denial not exercised — would need a third, ungranted node attempting PROTOCOL_ACCESS' },
+          competitorRow,
         ],
       })}\n`,
     );
@@ -1517,11 +1622,17 @@ async function phase7() {
   console.log('');
   fmt.step('phase-7d-table', 'Visibility summary (with verification status)');
   const tag = (ok, partial = false) => (ok ? '✓' : partial ? '~' : '?');
+  // String tag for the "unavailable" state: distinct from `?` (not
+  // verified) so the human reader can tell "we didn't test this" apart
+  // from "we tested and got an inconclusive result". Hyphen reads as
+  // "no value here", matching the textual `not tested` cells.
+  const subscriberTag = node2Ident ? tag(anchorOk) : '−';
+  const subscriberPrivateTag = node2Ident ? tag(privateInvisible) : '−';
   fmt.table([
     {
       Persona: 'Subscriber (pre-fetch)',
-      'Public partition': `Anchor only ${tag(anchorOk)}`,
-      'Private partition': `Nothing (not yet fetched) ${tag(privateInvisible)}`,
+      'Public partition': node2Ident ? `Anchor only ${subscriberTag}` : 'Not tested −',
+      'Private partition': node2Ident ? `Nothing (not yet fetched) ${subscriberPrivateTag}` : 'Not tested −',
     },
     {
       Persona: 'Acme (owner)',
@@ -1540,16 +1651,20 @@ async function phase7() {
     },
     {
       Persona: 'Competitor',
-      'Public partition': `Anchor only ${tag(anchorOk)}`,
+      'Public partition': node2Ident ? `Anchor only ${tag(anchorOk)}` : 'Not tested −',
       // Drop to ? — see competitorPrivateVerified above. The signal we
       // have ("no auto-replication on node2") doesn't prove active
       // access-handler denial of a non-grantee fetch.
-      'Private partition': 'Nothing ?',
+      'Private partition': node2Ident ? 'Nothing ?' : 'Not tested −',
     },
   ]);
-  fmt.note('  ✓ verified live · ~ partially verified (grant durable, P2P fetch not yet CLI-exposed) · ? not verified');
-  fmt.note(`  Subscriber (pre-fetch) row: ${subscriberNote}`);
-  fmt.note('  Competitor row needs a third ungranted node attempting `PROTOCOL_ACCESS` to verify denial — out of scope for this 2-node setup.');
+  fmt.note('  ✓ verified live · ~ partially verified (grant durable, P2P fetch not yet CLI-exposed) · ? not verified · − not tested (node2 unavailable)');
+  fmt.note(`  Subscriber (pre-fetch) row: ${subscriberRow.note}`);
+  if (node2Ident) {
+    fmt.note('  Competitor row needs a third ungranted node attempting `PROTOCOL_ACCESS` to verify denial — out of scope for this 2-node setup.');
+  } else {
+    fmt.note(`  Competitor row: ${competitorRow.note}`);
+  }
 }
 
 async function main() {

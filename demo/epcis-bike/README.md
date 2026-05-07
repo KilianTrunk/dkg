@@ -49,7 +49,7 @@ Override the context graph ID:
 EPCIS_DEMO_CG=my-test-cg node run.mjs
 ```
 
-By default the demo auto-suffixes its CG name with a per-run timestamp (e.g. `dmaast-bike-demo-mz4hk7n0`) so naive re-runs always create a fresh context graph. The ETL produces deterministic event IDs, so re-capturing the same data into an existing CG would otherwise hit publisher duplicate-root rejection mid-Phase-1. Pin `EPCIS_DEMO_CG=<name>` when you want to iterate Phase 7 verifications against a stable CG across runs.
+By default the demo auto-suffixes its CG name with a per-run timestamp (e.g. `dmaast-bike-demo-mz4hk7n0`) so naive re-runs always create a fresh context graph. The ETL produces deterministic event IDs, so re-capturing the same fixtures into an existing CG hits publisher duplicate-root rejection mid-Phase-1 and never reaches the verification phases — so **pinning `EPCIS_DEMO_CG=<name>` does not, on its own, let you iterate Phase 7**. Phase 1 will hard-fail before Phase 7 runs. To iterate Phase 7 against a stable CG you would need a separate "skip-capture" mode (not provided), so the supported workflow is: let the demo create a fresh CG per run. Pin `EPCIS_DEMO_CG` only when targeting a CG whose `bike-line` sub-graph does not already contain these event IDs.
 
 ## How to navigate
 

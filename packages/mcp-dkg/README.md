@@ -268,10 +268,6 @@ Per-turn state is kept in `~/.cache/dkg-mcp/sessions/*.json`; safe to delete at 
 - **HTTP 401 from MCP tools** → token mismatch. `dkg auth show` returns the expected value; confirm it matches `~/.dkg/auth.token`. On CI / containers / proxied environments where `dkg init` can't run, the env-var fallbacks are `DKG_API` (daemon URL, default `http://localhost:9200`), `DKG_TOKEN` (bearer), `DKG_PROJECT` (default context graph), `DKG_AGENT_URI` (operator agent URI). A stale exported `DKG_PROJECT` from a prior session can silently mis-route writes — unset it if you switch projects.
 - **HTTP 404 on `/api/context-graph/list`** → you're on an older daemon; the client automatically falls back to the legacy endpoint.
 - **`tools/list` is missing tools after `dkg mcp setup`** → the client's MCP config still points at a prior install. Re-run `dkg mcp setup --force` to refresh stale entries.
-- **Daemon unreachable** → `dkg status`; if it errors, `dkg logs` and `cat ~/.dkg/daemon.log`. Stale pid → `cat ~/.dkg/daemon.pid` and kill it, then `dkg start` again.
-- **Port 9200 already in use** → another node is running. `dkg stop` once, or override via `dkg init` and pick a different API port.
-- **WSL2: daemon dies when the terminal closes** → wrap in `tmux` or install as a systemd user service. See the [WSL2 section in JOIN_TESTNET.md](../../docs/setup/JOIN_TESTNET.md) for the systemd unit file.
-- **WSL2: Windows-side MCP clients (Claude Desktop, Cursor, VSCode + Copilot, Cline, Windsurf)** → run `dkg mcp setup` from **PowerShell**, not from inside WSL. Setup invoked from WSL detects the Windows-side configs and writes entries into them, but the registered `command` is the Linux-side `node` binary path; Win32 clients can't spawn Linux executables, so the entries fail at MCP startup. For **Linux-side** clients (Linux Cursor, Linux Claude Code), run setup from inside WSL as normal. End-to-end Windows-side support from a WSL invocation is tracked separately (will use a `wsl.exe`-wrapper command form once shipped).
 
 ## Package layout
 

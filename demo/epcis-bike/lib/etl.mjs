@@ -18,7 +18,7 @@
 
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile, readdir, unlink } from 'node:fs/promises';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildEpcisDocument } from './epc-mapping.mjs';
 
@@ -178,11 +178,20 @@ export async function runEtl({
     for (const entry of filesToRemove) {
       const target = resolve(outDir, entry);
       const rel = relative(outDirResolved, target);
-      // Inside outDir: `relative` is empty (target === outDir, never
-      // happens here for files), or a path that does NOT start with
-      // `..` and is NOT absolute (different drive on Windows). Reject
-      // anything else.
-      if (rel.startsWith('..') || resolve(outDirResolved, rel) !== target) {
+      // Inside outDir: `relative` is a non-empty path that doesn't
+      // start with `..` and isn't absolute. Reject anything else:
+      //   - `..`-prefixed → POSIX/Windows directory traversal up.
+      //   - Absolute → on Windows, `path.relative` returns the
+      //     absolute target when it lives on a different drive
+      //     (`relative('C:\\fixtures', 'D:\\foo\\bar')` = `'D:\\foo\\bar'`).
+      //     Without this guard, `resolve(outDirResolved, rel)` equals
+      //     target (since `resolve` accepts absolute segments) and the
+      //     containment check would falsely pass — letting unlink
+      //     touch an arbitrary file on another drive.
+      //   - The `resolve()` round-trip equality check catches edge
+      //     cases where `relative` would silently normalize away a
+      //     traversal (defense-in-depth).
+      if (rel.startsWith('..') || isAbsolute(rel) || resolve(outDirResolved, rel) !== target) {
         // Suspect path-traversal — skip silently (we'd rather leak a
         // stale file than execute a path that escapes outDir).
         continue;

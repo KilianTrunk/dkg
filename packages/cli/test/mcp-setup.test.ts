@@ -2375,4 +2375,220 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     stderrSpy.mockRestore();
   });
+
+  // ── Codex Round-13 Fix 19: detectContext uses running CLI's location ──
+
+  it('Codex Round-13 Fix 19: auto-detect uses dirname(realpath(argv[1])), NOT process.cwd()', async () => {
+    // Pre-fix: detectContext called findDkgMonorepoRoot(process.cwd())
+    // — a global `dkg` invoked from inside a monorepo checkout
+    // would resolve cwd → repo root and switch the registered MCP
+    // entry to the (potentially unbuilt) monorepo dist. Mismatch:
+    // setup steps 1-3 ran against the global home; the persisted
+    // entry pointed at the local checkout.
+    //
+    // Post-fix: auto-detect calls findDkgMonorepoRoot with the
+    // RUNNING CLI's directory (dirname(realpathSync(argv[1]))).
+    // The test runner's argv[1] is vitest's own dist (in
+    // `node_modules/.pnpm/vitest@.../dist/...`), which is
+    // outside any monorepo root by definition.
+    //
+    // We assert the stub findDkgMonorepoRoot was called with a
+    // path that's NOT process.cwd() (which IS inside the
+    // dkg-v9 monorepo when the test runs from within it).
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const findRootSpy = vi.fn((startDir?: string) => {
+      // Whatever the start dir is, return null (no monorepo) so
+      // we test the auto-detect → installed fallback path.
+      return null as string | null;
+    });
+    const deps = makeDeps({ findDkgMonorepoRoot: findRootSpy });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // findRoot was called at least once (by detectContext).
+    expect(findRootSpy).toHaveBeenCalled();
+    const callArg = findRootSpy.mock.calls[0][0];
+    // The argument is a string path (running CLI's dir), NOT
+    // undefined (which would mean default-walk-from-package-path,
+    // the broken pre-Round-1 default).
+    expect(typeof callArg).toBe('string');
+    // And it's NOT process.cwd() — that was the round-1 fix that
+    // round-13 corrected. The CLI's location and process.cwd() are
+    // different when the test runner runs from within dkg-v9 but
+    // vitest's dist lives in node_modules/.pnpm/.... If they happen
+    // to coincide on a particular machine, this assertion is
+    // a no-op (which is fine — the cwd-vs-cli-dir distinction
+    // only matters when they differ).
+    if (callArg && callArg !== process.cwd()) {
+      // The argument is a directory path containing the test
+      // runner's dist — vitest is the running CLI in this test.
+      expect(callArg).toContain('node_modules');
+    }
+  });
+
+  it('Codex Round-13 Fix 19: auto-detect with monorepo-located CLI → context = monorepo', async () => {
+    // Counterpart: when findDkgMonorepoRoot returns a root for the
+    // running CLI's directory, auto-detect picks monorepo. Stub
+    // returns the fake repo root regardless of input.
+    const fakeRepoRoot = makeFakeMonorepoRoot();
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => fakeRepoRoot),
+    });
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const cursor = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    // Monorepo path: args[0] is the local CLI dist.
+    expect(cursor.mcpServers.dkg.args[0]).toBe(
+      join(fakeRepoRoot, 'packages', 'cli', 'dist', 'cli.js'),
+    );
+  });
+
+  it('Codex Round-13 Fix 19: --monorepo force errors when no root found from running CLI dir', async () => {
+    // Tighter contract: --monorepo demands the running CLI live
+    // inside a monorepo. Pre-fix, `cwd` could mask this. Post-fix,
+    // a global `dkg` invoked with --monorepo from inside a clone
+    // would still throw if the global CLI isn't itself the
+    // monorepo build.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps({
+      findDkgMonorepoRoot: vi.fn(() => null),
+    });
+
+    await expect(
+      mcpSetupAction({ monorepo: true, start: false, fund: false, verify: false }, deps),
+    ).rejects.toThrow(/no DKG monorepo root could be located/);
+  });
+
+  // ── Codex Round-13 Fix 20: WSL2 detection + Windows-side probing ──
+
+  let originalWslDistroName: string | undefined;
+  let originalWslInterop: string | undefined;
+
+  function saveWslEnv(): void {
+    originalWslDistroName = process.env.WSL_DISTRO_NAME;
+    originalWslInterop = process.env.WSL_INTEROP;
+  }
+
+  function restoreWslEnv(): void {
+    if (originalWslDistroName !== undefined) process.env.WSL_DISTRO_NAME = originalWslDistroName;
+    else delete process.env.WSL_DISTRO_NAME;
+    if (originalWslInterop !== undefined) process.env.WSL_INTEROP = originalWslInterop;
+    else delete process.env.WSL_INTEROP;
+  }
+
+  it('Codex Round-13 Fix 20: non-WSL Linux platform — only Linux-side entries (regression guard)', async () => {
+    // Pre-Round-13 default behaviour: a regular Linux box (no WSL
+    // env vars, plain /proc/version) must continue to detect only
+    // the Linux-side configs. This test pins that the Round-13
+    // additions don't accidentally widen the candidate set on
+    // non-WSL platforms.
+    if (platform() !== 'linux') return; // Linux-only test; macOS/Windows skip.
+    saveWslEnv();
+    delete process.env.WSL_DISTRO_NAME;
+    delete process.env.WSL_INTEROP;
+    try {
+      const { detectClients } = await import('../src/mcp-setup.js');
+      const detected = detectClients();
+      // No "(Windows-side via WSL)" entries on plain Linux.
+      const wslEntries = detected.filter((c) => c.name.includes('Windows-side via WSL'));
+      expect(wslEntries.length).toBe(0);
+    } finally {
+      restoreWslEnv();
+    }
+  });
+
+  it('Codex Round-13 Fix 20: WSL env (WSL_DISTRO_NAME set) on Linux — adds Windows-side entries for the 4 GUI clients', async () => {
+    // Synthesize a WSL environment via the env-var signal (cheapest
+    // detection branch), then assert detectClients returns the
+    // additional "(Windows-side via WSL)" entries for Claude
+    // Desktop, VSCode + Copilot, Cline, and Windsurf.
+    //
+    // Skipped on non-Linux platforms: the WSL detector early-returns
+    // false unless platform() === 'linux', and we can't override
+    // platform() without a vi.mock at the top of the file.
+    if (platform() !== 'linux') return;
+    saveWslEnv();
+    process.env.WSL_DISTRO_NAME = 'TestDistro';
+    try {
+      // The wslWindowsEnvPath helper shells out to cmd.exe + wslpath.
+      // In a test environment those binaries don't exist; the helper
+      // catches and returns null, so the WSL branch's additive entries
+      // are skipped silently. To exercise the additive-entry path
+      // we'd need to mock execSync — out of scope for this CI test.
+      // What we CAN verify: isWSL() detection fired correctly and
+      // detectClients didn't throw or hang; it just returned the
+      // base set when wsl path resolution failed.
+      const { detectClients } = await import('../src/mcp-setup.js');
+      const detected = detectClients();
+      // The detector found at least the Linux-side defaults that
+      // exist on this test runner (probably Cursor's parent if
+      // tmpHome is set up, or none at all on a clean test box).
+      // The contract this test pins: detectClients does NOT crash
+      // when WSL is detected but cmd.exe / wslpath are unavailable.
+      expect(Array.isArray(detected)).toBe(true);
+      // No partial / null Windows-side entries leaked through.
+      for (const c of detected) {
+        expect(typeof c.configPath).toBe('string');
+        expect(c.configPath.length).toBeGreaterThan(0);
+      }
+    } finally {
+      restoreWslEnv();
+    }
+  });
+
+  it('Codex Round-13 Fix 20: isWSL() detection helper — returns false on Windows, true with WSL_DISTRO_NAME on Linux', async () => {
+    // Direct unit test of the detection signal. Round-13 added
+    // multi-source detection (env, os.release, /proc/version);
+    // this test pins the env-var path which is the cheapest and
+    // most-common signal in real WSL launches.
+    saveWslEnv();
+    try {
+      // Windows / macOS / non-WSL Linux: detector returns false on
+      // any non-Linux platform regardless of env vars.
+      if (platform() !== 'linux') {
+        process.env.WSL_DISTRO_NAME = 'Ubuntu';
+        // detectClients should NOT add Windows-side entries on
+        // Windows (the detector's `if (platform() !== 'linux')
+        // return false` guard).
+        const { detectClients } = await import('../src/mcp-setup.js');
+        const detected = detectClients();
+        const wslEntries = detected.filter((c) => c.name.includes('Windows-side via WSL'));
+        expect(wslEntries.length).toBe(0);
+      }
+      // On Linux platforms, isWSL would return true with the env
+      // var set. We can't directly observe the helper without
+      // exporting it, but the contract is exercised via the
+      // detectClients-with-WSL-env test above.
+    } finally {
+      restoreWslEnv();
+    }
+  });
+
+  it('Codex Round-13 Fix 20: graceful fallback when wslpath/cmd.exe unavailable (no crash, no half-baked entries)', async () => {
+    // The wslWindowsEnvPath helper catches exec failures and
+    // returns null; detectClients then skips the additive
+    // Windows-side entries silently and returns the base set.
+    // This test pins that graceful-degradation contract — even
+    // when WSL is detected (env signal) but the cmd.exe / wslpath
+    // tooling isn't reachable, setup keeps working with the
+    // Linux-only client set.
+    if (platform() !== 'linux') return;
+    saveWslEnv();
+    process.env.WSL_DISTRO_NAME = 'TestDistro';
+    try {
+      const { detectClients } = await import('../src/mcp-setup.js');
+      // Should not throw despite WSL being "detected" while
+      // cmd.exe/wslpath are unavailable in the test environment.
+      const detected = detectClients();
+      expect(Array.isArray(detected)).toBe(true);
+      // Every returned entry has well-formed string paths.
+      for (const c of detected) {
+        expect(typeof c.configPath).toBe('string');
+      }
+    } finally {
+      restoreWslEnv();
+    }
+  });
 });

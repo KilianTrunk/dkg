@@ -66,7 +66,8 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir, platform } from 'node:os';
+import { homedir, platform, release as osRelease } from 'node:os';
+import { execSync } from 'node:child_process';
 import yaml from 'js-yaml';
 
 export interface McpSetupCliOptions {
@@ -364,12 +365,44 @@ export async function confirmPlan(
 }
 
 /**
+ * Return the absolute directory of the currently-running CLI script,
+ * canonicalised through `realpath` (the npm bin shim is typically a
+ * symlink). Returns `null` if `process.argv[1]` is unset or the
+ * realpath lookup fails — caller falls back to safer defaults.
+ *
+ * Codex Round-13 Fix 19 helper. Used by `detectContext` to locate
+ * the running CLI's actual on-disk position, which is the correct
+ * signal for "is this the monorepo build?" (NOT `process.cwd()`,
+ * which is incidental — a global `dkg` invoked from inside a
+ * monorepo checkout would have `cwd` inside the repo while argv[1]
+ * resolves to the npm global install location).
+ */
+function dirnameOfRunningCli(): string | null {
+  try {
+    if (!process.argv[1]) return null;
+    return dirname(realpathSync(process.argv[1]));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Detect the setup context. With `force` set to a literal value, that
  * value wins (with `--monorepo` requiring a discoverable monorepo
- * root). Without `force`, walk ancestors of the CLI's compiled
- * location: a hit means we're invoked from a monorepo dev checkout,
- * so write the local-cli-dist absolute path; a miss means we're
- * globally installed and the standard `dkg` shape is correct.
+ * root from the running CLI's location). Without `force`, walk
+ * ancestors of the running CLI's actual on-disk location: a hit
+ * means the running CLI is the monorepo dev build; a miss means
+ * we're globally installed.
+ *
+ * Codex Round-13 Fix 19: previously `process.cwd()` was the search
+ * start (Round-1 FIX 1's reaction to the wrong default which walked
+ * from `@origintrail-official/dkg-core`'s installed location). But
+ * cwd is incidental. A global `dkg` invoked from inside a monorepo
+ * checkout would have setup steps 1-3 bootstrap against the global
+ * home while the persisted MCP entry switched to the monorepo dist
+ * (mismatch; hard-fails if dist is unbuilt). The right signal for
+ * "which CLI is this?" is `realpath(process.argv[1])` — the script
+ * Node is currently running.
  *
  * `--installed` and `--monorepo` are mutually exclusive — the caller
  * is expected to have validated that before calling. We accept the
@@ -383,17 +416,14 @@ function detectContext(
   if (opts.force === 'installed') {
     return { context: 'installed', monorepoRoot: null };
   }
-  // Codex Bug 1: pass `process.cwd()` explicitly so the walk
-  // starts from the operator's working directory (the user's
-  // intent: "am I running this from inside a dkg-v9 checkout?").
-  // Default-start would walk from `@origintrail-official/dkg-core`'s
-  // installed location, which on a globally-installed CLI is in
-  // `node_modules/` and never sees the user's monorepo cwd —
-  // monorepo auto-detect would never fire for the most common
-  // contributor invocation.
-  const cwd = process.cwd();
+  // Round-13 Fix 19: search from the running CLI's directory.
+  // Falls back to cwd ONLY for forced --monorepo (where the
+  // operator's intent overrides auto-detect), and only as a last
+  // resort if argv[1] is unresolvable.
+  const cliDir = dirnameOfRunningCli();
   if (opts.force === 'monorepo') {
-    const root = findRoot(cwd);
+    const startDir = cliDir ?? process.cwd();
+    const root = findRoot(startDir);
     if (!root) {
       throw new Error(
         '--monorepo flag passed but no DKG monorepo root could be located from this CLI invocation.',
@@ -401,7 +431,12 @@ function detectContext(
     }
     return { context: 'monorepo', monorepoRoot: root };
   }
-  const root = findRoot(cwd);
+  // Auto-detect: if the running CLI's location is unknown, default
+  // to installed (safer than guessing monorepo from cwd).
+  if (!cliDir) {
+    return { context: 'installed', monorepoRoot: null };
+  }
+  const root = findRoot(cliDir);
   return root
     ? { context: 'monorepo', monorepoRoot: root }
     : { context: 'installed', monorepoRoot: null };
@@ -632,7 +667,73 @@ function clineMcpPaths(home: string): { configPath: string; displayPath: string 
  * client installed still see the fallback "no clients detected; run
  * `dkg mcp setup --print-only`" message.
  */
-function detectClients(): ClientTarget[] {
+/**
+ * Codex Round-13 Fix 20: detect WSL2. Linux platform with `microsoft`
+ * / `WSL` markers in env, kernel release, or `/proc/version`. WSL
+ * users running `dkg mcp setup` from inside their WSL distro need
+ * to register Windows-side GUI clients (Claude Desktop, Windsurf,
+ * VSCode + Copilot, Cline) AS WELL AS any Linux-native clients —
+ * pre-fix they got the Linux-only set and the README's WSL2
+ * promise silently failed for the apps users actually run.
+ *
+ * Multi-signal detection (env first; cheaper than fs reads):
+ *   - `WSL_DISTRO_NAME` / `WSL_INTEROP` set by the WSL launcher.
+ *   - `os.release()` contains `microsoft` or `wsl` (WSL kernels
+ *     identify themselves there).
+ *   - `/proc/version` contains the same markers (slower fallback).
+ */
+function isWSL(): boolean {
+  if (platform() !== 'linux') return false;
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
+  try {
+    const release = osRelease().toLowerCase();
+    if (release.includes('microsoft') || release.includes('wsl')) return true;
+  } catch { /* fall through */ }
+  try {
+    const procVersion = readFileSync('/proc/version', 'utf-8').toLowerCase();
+    if (procVersion.includes('microsoft') || procVersion.includes('wsl')) return true;
+  } catch { /* /proc/version not readable; not WSL */ }
+  return false;
+}
+
+/**
+ * Resolve a Windows-side env var (e.g. `%USERPROFILE%`,
+ * `%APPDATA%`) into a WSL-mounted Linux path (`/mnt/c/...`). Uses
+ * `cmd.exe` to read the env var, then `wslpath` to convert. Returns
+ * `null` on any failure (cmd.exe / wslpath missing, env var
+ * unset, conversion error) so callers fall back to Linux-only
+ * detection.
+ *
+ * Codex Round-13 Fix 20 helper.
+ */
+function wslWindowsEnvPath(envVarName: string): string | null {
+  try {
+    const winPath = execSync(`cmd.exe /c "echo %${envVarName}%"`, {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    // `cmd.exe` echoes `%FOO%` literally when the var is unset.
+    if (!winPath || winPath.startsWith('%')) return null;
+    // Strip Windows CR if present.
+    const cleaned = winPath.replace(/\r/g, '');
+    // wslpath -u takes the Windows path and emits the /mnt/c/...
+    // form. Quote the input to handle spaces in usernames.
+    const linuxPath = execSync(`wslpath -u '${cleaned.replace(/'/g, "'\\''")}'`, {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return linuxPath || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Exported for Codex Round-13 Fix 20 tests — direct unit testing
+ * of WSL2 client-detection branch without going through the full
+ * `mcpSetupAction` body. Production callers go via the action.
+ */
+export function detectClients(): ClientTarget[] {
   const home = homedir();
   const claudeDesktop = claudeDesktopPaths(home);
   const vscodeMcp = vscodeMcpPaths(home);
@@ -679,6 +780,57 @@ function detectClients(): ClientTarget[] {
       };
     })(),
   ];
+
+  // Codex Round-13 Fix 20: when running inside WSL2, ALSO probe the
+  // Windows-side config locations for the four GUI clients users
+  // typically run on Windows even when their dev shell is in WSL.
+  // Linux-side entries above are preserved (some WSL users run
+  // native Linux GUI clients too); the new entries are additive
+  // with disambiguated names so the operator-facing log is clear.
+  if (isWSL()) {
+    const winUserProfile = wslWindowsEnvPath('USERPROFILE');
+    const winAppData = wslWindowsEnvPath('APPDATA');
+    if (winAppData) {
+      // Claude Desktop on Windows: %APPDATA%\Claude\claude_desktop_config.json.
+      const claudeWinPath = join(winAppData, 'Claude', 'claude_desktop_config.json');
+      candidates.push({
+        name: 'Claude Desktop (Windows-side via WSL)',
+        configPath: claudeWinPath,
+        displayPath: claudeWinPath,
+      });
+      // VSCode + Copilot Chat on Windows: %APPDATA%\Code\User\mcp.json.
+      const vscodeWinPath = join(winAppData, 'Code', 'User', 'mcp.json');
+      candidates.push({
+        name: 'VSCode (Windows-side via WSL)',
+        configPath: vscodeWinPath,
+        displayPath: vscodeWinPath,
+        entryPath: 'servers.dkg',
+      });
+      // Cline on Windows: %APPDATA%\Code\User\globalStorage\
+      // saoudrizwan.claude-dev\settings\cline_mcp_settings.json.
+      const clineWinPath = join(
+        winAppData, 'Code', 'User',
+        'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json',
+      );
+      candidates.push({
+        name: 'Cline (Windows-side via WSL)',
+        configPath: clineWinPath,
+        displayPath: clineWinPath,
+      });
+    }
+    if (winUserProfile) {
+      // Windsurf on Windows: %USERPROFILE%\.codeium\windsurf\mcp_config.json
+      // (the `~/.codeium/...` path resolves under USERPROFILE on Windows,
+      // not APPDATA).
+      const windsurfWinPath = join(winUserProfile, '.codeium', 'windsurf', 'mcp_config.json');
+      candidates.push({
+        name: 'Windsurf (Windows-side via WSL)',
+        configPath: windsurfWinPath,
+        displayPath: windsurfWinPath,
+      });
+    }
+  }
+
   return candidates.filter((c) => {
     if (existsSync(c.configPath)) return true;
     if (existsSync(dirname(c.configPath))) return true;

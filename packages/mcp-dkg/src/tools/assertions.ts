@@ -105,18 +105,38 @@ export function registerAssertionTools(
         'Step 2 of the canonical write flow: append RDF quads into an ' +
         'existing Working Memory assertion. Writes are additive (set-merge); ' +
         'callers that want replace semantics should call `dkg_assertion_discard` ' +
-        'first or mint a unique assertion name per snapshot.',
+        'first or mint a unique assertion name per snapshot.\n\n' +
+        'IMPORTANT — quad shape: each quad has subject/predicate/object/graph. ' +
+        'Subjects and predicates are ALWAYS URIs (no spaces). The `object` field ' +
+        'accepts EITHER a URI (no surrounding quotes) OR a literal string ' +
+        'WRAPPED IN DOUBLE QUOTES. Most common mistake: passing free-text ' +
+        'literals without quotes — those get parsed as URIs and fail on the ' +
+        'embedded spaces.',
       inputSchema: {
-        name: z.string().describe('Existing assertion name'),
+        name: z.string().describe('Existing assertion name (e.g. "my-notes-2026-05-07")'),
         quads: z
           .array(
             z.object({
-              subject: z.string().describe('Subject URI'),
-              predicate: z.string().describe('Predicate URI'),
-              object: z
-                .string()
-                .describe('Object URI or literal value (raw, including any quoting)'),
-              graph: z.string().optional().describe('Optional named graph URI'),
+              subject: z.string().describe(
+                'Subject URI. Plain string like "urn:my-thing" or "did:dkg:agent/abc". ' +
+                'Angle brackets are tolerated and stripped (`<urn:foo>` → `urn:foo`). ' +
+                'MUST NOT contain spaces — URIs are space-free by spec.',
+              ),
+              predicate: z.string().describe(
+                'Predicate URI. Same rules as subject. Common predicates: ' +
+                '"rdfs:label", "rdf:type", "schema:name", or any custom URI.',
+              ),
+              object: z.string().describe(
+                'Object value. EITHER a URI (same rules as subject — plain or ' +
+                'angle-bracketed, no spaces) OR a literal string WRAPPED IN ' +
+                'DOUBLE QUOTES.\n' +
+                '  URI example:     "urn:other-thing"  or  "<urn:other-thing>"\n' +
+                '  Literal example: "\\"Hello world with spaces\\""  ← double quotes mandatory for literals\n' +
+                '  Typed literal:   "\\"42\\"^^<http://www.w3.org/2001/XMLSchema#integer>"\n' +
+                '  Lang-tagged:     "\\"hello\\"@en"\n' +
+                'A literal without surrounding quotes will be parsed as a URI and FAIL on spaces.',
+              ),
+              graph: z.string().optional().describe('Optional named graph URI (same rules as subject)'),
             }),
           )
           .min(1)

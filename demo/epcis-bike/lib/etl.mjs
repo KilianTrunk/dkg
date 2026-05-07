@@ -72,9 +72,27 @@ export async function runEtl({
     throw new Error(`Source ${source} is not an array of cycle records`);
   }
 
-  const traceRecords = allRecords
-    .filter((r) => r?.trace_id === traceId)
-    .sort((a, b) => String(a.ended).localeCompare(String(b.ended)));
+  // Lexical (`.localeCompare`) sort on `ended` only produces correct
+  // chronological order when every timestamp shares the same offset
+  // suffix. With arbitrary BIKE_SOURCE inputs that allow mixed offsets
+  // (e.g. `08:00:00-05:00` next to `09:00:00Z`), lexical comparison
+  // mis-orders records — which then changes ADD/OBSERVE assignment
+  // (first-seen tracking depends on iteration order) and the manifest's
+  // `time_range`. Pre-validate every timestamp via `Date.parse` so the
+  // ETL fails loudly on bad input instead of silently producing
+  // wrong-order events, then sort on the parsed instant.
+  const filteredRecords = allRecords.filter((r) => r?.trace_id === traceId);
+  for (const r of filteredRecords) {
+    if (Number.isNaN(Date.parse(r?.ended))) {
+      throw new Error(
+        `Source contains invalid timestamp: trace_id=${r?.trace_id} ` +
+          `unit_id=${r?.unit_id} ended=${JSON.stringify(r?.ended)}`,
+      );
+    }
+  }
+  const traceRecords = filteredRecords.sort(
+    (a, b) => Date.parse(a.ended) - Date.parse(b.ended),
+  );
 
   if (traceRecords.length === 0) {
     throw new Error(`No records found for trace_id ${traceId} in ${source}`);
@@ -147,7 +165,11 @@ export async function runEtl({
       });
 
       const fileNum = events.length + 1;
-      const suffix = Object.keys(byStatus).length > 1 ? `-${status.toLowerCase()}` : '';
+      // Run the status string through `safeName` before interpolating
+      // into the filename — real exports often use multi-word statuses
+      // (`In Progress`, `Hold/Recheck`) that would otherwise create
+      // nested paths or fail `writeFile` outright.
+      const suffix = Object.keys(byStatus).length > 1 ? `-${safeName(status).toLowerCase()}` : '';
       const filename = `event-${pad(fileNum)}-${safeName(rec.process_name)}${suffix}.json`;
       const fullPath = join(outDir, filename);
       await writeFile(fullPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf-8');

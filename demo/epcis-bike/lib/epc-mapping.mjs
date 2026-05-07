@@ -23,16 +23,24 @@ export const EPCIS_CONTEXT = {
   eventID: '@id',
 };
 
-// Replace any character that isn't safe in a URN local segment with `_`.
-// Source data may have spaces, slashes, parentheses, or accented
-// characters in `process_name` / `unit_id`; interpolating those raw into
-// `urn:acme:bike:station:<name>` produces an invalid IRI that the
-// EPCIS plugin and SPARQL stores then reject (or silently mis-parse).
-// Allow ASCII alphanumerics, underscore, and hyphen — the same set
-// `etl.mjs#safeName` accepts for filename construction, so the URN
-// segment and the on-disk filename always agree.
+// Encode a value for use as a URN local segment. We use percent-encoding
+// (`encodeURIComponent`) so the result is BOTH a valid URN segment AND
+// reversible — distinct source identifiers like `BIKE/A` vs `BIKE A`
+// vs `Paint-É` no longer collapse to the same EPC, which a lossy
+// `[^A-Za-z0-9_-] → _` substitution would do (and silently merge two
+// separate items or stations into one graph entity for any non-trivial
+// real-world export). `encodeURIComponent` leaves alphanumerics,
+// `-`, `_`, `.`, `!`, `~`, `*`, `'`, `(`, `)` untouched and percent-
+// encodes everything else (including space, slash, accented chars),
+// which is the standard `pchar` set in RFC 3986 / RFC 8141.
+//
+// Note: this URN segment no longer matches `etl.mjs#safeName` (which
+// stays lossy because filesystem segments can use `_` freely without
+// collision risk for THIS demo's deterministic source). For arbitrary
+// `BIKE_SOURCE` exports the URN remains unique even when the on-disk
+// filename collapses similar-looking process names into one.
 function safeUrnSegment(value) {
-  return String(value).replace(/[^A-Za-z0-9_-]/g, '_');
+  return encodeURIComponent(String(value));
 }
 
 export function itemEpc(itemId) {
@@ -92,6 +100,24 @@ function uuidv5(name, namespace) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
+// Derive `eventTimeZoneOffset` from an ISO 8601 timestamp's trailing
+// offset. `eventTime` is copied verbatim from the source's `ended`
+// field, so its offset and `eventTimeZoneOffset` must agree — hard-
+// coding `+00:00` would silently mis-attribute non-UTC source data
+// (e.g. `2026-05-12T08:00:00-05:00` would round-trip as 8 AM UTC,
+// not 8 AM US Eastern). For naive timestamps with no offset suffix
+// we conservatively default to `+00:00`; the synthesized source uses
+// `Z` everywhere so this default never fires for the committed demo
+// fixtures, but it keeps the function total for arbitrary BIKE_SOURCE
+// exports.
+function extractTzOffset(ended) {
+  const s = String(ended);
+  if (/Z$/.test(s)) return '+00:00';
+  const m = s.match(/([+-])(\d{2}):?(\d{2})$/);
+  if (m) return `${m[1]}${m[2]}:${m[3]}`;
+  return '+00:00';
+}
+
 // Build one EPCIS 2.0 Document containing exactly one ObjectEvent.
 // The plugin expects a JSON-LD-compatible shape; we keep the @context tight.
 // `groupKey` is forwarded to eventId() so sibling docs from a single source
@@ -113,7 +139,7 @@ export function buildEpcisDocument({
     eventID: eventId(traceId, unitId, ended, groupKey),
     type: 'ObjectEvent',
     eventTime: ended,
-    eventTimeZoneOffset: '+00:00',
+    eventTimeZoneOffset: extractTzOffset(ended),
     epcList: itemIds.map(itemEpc),
     action: isFirstInTrace ? 'ADD' : 'OBSERVE',
     bizStep: bizStepFor(processName),

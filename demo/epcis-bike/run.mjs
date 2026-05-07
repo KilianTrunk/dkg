@@ -1422,28 +1422,30 @@ async function phase7() {
   // grantee node (node2) only proves "no auto-replication"; it does NOT
   // prove that the access-handler would deny a non-grantee peer's fetch.
   // To verify denial we'd need a third, ungranted node calling fetch and
-  // being rejected — out of scope for this 2-node setup. Anyone (passive
-  // observer) doesn't make the same claim — "doesn't have private data
-  // locally" is true for any subscriber that hasn't fetched, granted or
-  // not — so that row stays verified.
+  // being rejected — out of scope for this 2-node setup.
   const competitorPrivateVerified = false; // active denial not exercised
 
-  // Note for the Anyone row — explicit so machine consumers don't read
-  // the verified=true as "we proved a non-grantee can't see private
-  // data". The actual proof rests on the architectural invariant that
-  // the publisher never auto-replicates payload to any non-publishing
-  // peer (granted OR not); node2's empty `<cg>/<sub>/_private` reflects
-  // that invariant. Strict non-grantee denial would need a third,
-  // ungranted node calling PROTOCOL_ACCESS — see Competitor.
-  const anyoneNote =
-    'node2 carries the allow-list grant in this setup, but its empty `<cg>/<sub>/_private` reflects the publisher\'s "no auto-replication" invariant — which holds for every non-publishing peer regardless of grant status. The Competitor row covers active denial of a non-grantee fetch (out of scope for this 2-node setup).';
+  // The "Subscriber (pre-fetch)" row covers what we ACTUALLY tested:
+  // the probe runs from node2, which (in this 2-node setup) is also the
+  // grantee. So this row claims only that node2 — in its passive
+  // subscriber role, before invoking the access-protocol fetch — sees
+  // public anchors and zero private triples. We deliberately do NOT
+  // call this row "Anyone (no grant)": that label would mis-attribute
+  // a passive-subscriber observation as proof of non-grantee denial,
+  // which we don't actually exercise here (see Competitor).
+  const subscriberNote =
+    'Probe runs from node2, which IS the grantee in this 2-node setup. ' +
+    'This row reports node2\'s passive-subscriber state — public anchor ' +
+    'visible, private partition empty — BEFORE the access-protocol fetch ' +
+    'is invoked. Strict non-grantee denial (the "no grant" claim) would ' +
+    'need a third, ungranted node calling PROTOCOL_ACCESS — see Competitor.';
 
   if (JSON_MODE) {
     process.stdout.write(
       `${JSON.stringify({
         step: 'phase-7d-table',
         visibility: [
-          { persona: 'Anyone (no grant)', public_partition: 'anchor only', private_partition: 'nothing', verified: anchorOk && privateInvisible, note: anyoneNote },
+          { persona: 'Subscriber (pre-fetch)', public_partition: 'anchor only', private_partition: 'nothing (not yet fetched)', verified: anchorOk && privateInvisible, note: subscriberNote },
           { persona: 'Acme (owner)', public_partition: 'anchor', private_partition: 'full payload', verified: ownerOk },
           { persona: 'KIT (allowList)', public_partition: 'anchor', private_partition: 'full payload (allowed events)', verified: kitVerified, note: kitNote },
           { persona: 'Competitor', public_partition: 'anchor only', private_partition: 'nothing', verified: anchorOk && competitorPrivateVerified, note: 'active access-handler denial not exercised — would need a third, ungranted node attempting PROTOCOL_ACCESS' },
@@ -1458,9 +1460,9 @@ async function phase7() {
   const tag = (ok, partial = false) => (ok ? '✓' : partial ? '~' : '?');
   fmt.table([
     {
-      Persona: 'Anyone (no grant)',
+      Persona: 'Subscriber (pre-fetch)',
       'Public partition': `Anchor only ${tag(anchorOk)}`,
-      'Private partition': `Nothing ${tag(privateInvisible)}`,
+      'Private partition': `Nothing (not yet fetched) ${tag(privateInvisible)}`,
     },
     {
       Persona: 'Acme (owner)',

@@ -366,18 +366,18 @@ describe('dkg_context_graph_create tool', () => {
 
   it('auto-generates id from name when id is omitted', async () => {
     ft.addResponses(
-      new Response(JSON.stringify({ created: 'my-research-contextGraph', uri: 'did:dkg:context-graph:my-research-contextGraph' }), { status: 200 }),
+      new Response(JSON.stringify({ created: 'my-research-context-graph', uri: 'did:dkg:context-graph:my-research-context-graph' }), { status: 200 }),
     );
 
     const tool = findTool('dkg_context_graph_create');
-    const result = await tool.execute('call-auto', { name: 'My Research ContextGraph' });
+    const result = await tool.execute('call-auto', { name: 'My Research Context Graph' });
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(parsed.created).toBe('my-research-contextGraph');
+    expect(parsed.created).toBe('my-research-context-graph');
 
     const body = JSON.parse(ft.calls[0][1]?.body as string);
-    expect(body.id).toBe('my-research-contextGraph');
-    expect(body.name).toBe('My Research ContextGraph');
+    expect(body.id).toBe('my-research-context-graph');
+    expect(body.name).toBe('My Research Context Graph');
   });
 
   it('strips special characters when auto-generating id', async () => {

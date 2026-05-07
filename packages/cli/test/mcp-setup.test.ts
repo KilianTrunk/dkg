@@ -850,6 +850,124 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     stdoutSpy.mockRestore();
   });
 
+  // ── F31: per-client interactive confirm prompts ───────────────────
+
+  it('F31: --yes skips prompts; confirmPlan stub passes plan through unchanged', async () => {
+    // The action MUST call confirmPlan with `yes: true` so the
+    // stub knows the operator opted into auto-confirm. The stub
+    // returns the plan unchanged → all detected clients register.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const confirmPlan = vi.fn(async (planned: any) => [...planned]);
+    const deps = makeDeps({ confirmPlan });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false, yes: true }, deps);
+
+    expect(confirmPlan).toHaveBeenCalledTimes(1);
+    expect(confirmPlan.mock.calls[0][1]).toEqual({ yes: true });
+    expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(true);
+  });
+
+  it('F31: confirmPlan-stub-says-no on a single-client plan → zero writes', async () => {
+    // Operator declined the only pending registration. The action
+    // emits the "All pending registrations declined" log line and
+    // writes nothing. Asserts the decline path is non-fatal and
+    // the file stays absent.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const confirmPlan = vi.fn(async (planned: any) =>
+      planned.map((p: any) => ({ ...p, action: 'skip' })),
+    );
+    const deps = makeDeps({ confirmPlan });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(confirmPlan).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(false);
+    const logged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    expect(logged).toMatch(/All pending registrations declined/);
+  });
+
+  it('F31: mixed yes/no — declined entries skip; accepted entries register', async () => {
+    // Two clients pending. Stub declines Cursor, accepts Claude
+    // Desktop. Post-action: only Claude Desktop's file exists.
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const claudePath = claudeDesktopPathUnder(tmpHome);
+    mkdirSync(join(claudePath, '..'), { recursive: true });
+
+    const confirmPlan = vi.fn(async (planned: any) =>
+      planned.map((p: any) =>
+        p.s.target.name === 'Cursor' ? { ...p, action: 'skip' } : p,
+      ),
+    );
+    const deps = makeDeps({ confirmPlan });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(false);
+    expect(existsSync(claudePath)).toBe(true);
+  });
+
+  it('F31: all-skip plan (everything already registered) → confirmPlan still called but produces zero writes', async () => {
+    // Pre-populate every detected-by-default client with the
+    // canonical bare-`"dkg"` entry so they all classify as
+    // `registered`. Plan ends up all-skip; confirmPlan still
+    // called (the action doesn't pre-filter) but no writes follow.
+    const cursorDir = join(tmpHome, '.cursor');
+    mkdirSync(cursorDir, { recursive: true });
+    const canonical = { mcpServers: { dkg: { command: 'dkg', args: ['mcp', 'serve'] } } };
+    writeFileSync(join(cursorDir, 'mcp.json'), JSON.stringify(canonical, null, 2));
+    // ~/.claude.json's parent IS tmpHome → always detected. Pre-register.
+    writeFileSync(join(tmpHome, '.claude.json'), JSON.stringify(canonical, null, 2));
+    const beforeCursor = (await import('node:fs')).statSync(join(cursorDir, 'mcp.json')).mtimeMs;
+    const beforeClaude = (await import('node:fs')).statSync(join(tmpHome, '.claude.json')).mtimeMs;
+
+    const confirmPlan = vi.fn(async (planned: any) => [...planned]);
+    const deps = makeDeps({ confirmPlan });
+
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // No rewrite of either file — both existing entries' mtimes
+    // are unchanged.
+    const afterCursor = (await import('node:fs')).statSync(join(cursorDir, 'mcp.json')).mtimeMs;
+    const afterClaude = (await import('node:fs')).statSync(join(tmpHome, '.claude.json')).mtimeMs;
+    expect(afterCursor).toBe(beforeCursor);
+    expect(afterClaude).toBe(beforeClaude);
+    // The "all up-to-date" log line fires (the original phrasing,
+    // NOT the F31 declined-prompt phrasing).
+    const logged = (logSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    expect(logged).toMatch(/Clients all up-to-date/);
+    expect(logged).not.toMatch(/All pending registrations declined/);
+  });
+
+  it('F31: dry-run skips confirmPlan entirely (preview-only; no point asking about non-writes)', async () => {
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const confirmPlan = vi.fn(async (planned: any) => [...planned]);
+    const deps = makeDeps({ confirmPlan });
+
+    await mcpSetupAction({ dryRun: true }, deps);
+
+    expect(confirmPlan).not.toHaveBeenCalled();
+    expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(false);
+  });
+
+  it('F31: production confirmPlan auto-confirms when stdin.isTTY is false (CI / piped input)', async () => {
+    // Direct test of the production helper (not the stub) — we
+    // import it from the same module and call it without going
+    // through `mcpSetupAction`. This pins the non-TTY auto-confirm
+    // contract that lets CI runs work without `--yes`.
+    const { confirmPlan: prodConfirmPlan } = await import('../src/mcp-setup.js');
+    const fakePlan = [
+      { s: { target: { name: 'Cursor', displayPath: '~/.cursor/mcp.json' } } as any, action: 'register' as const },
+      { s: { target: { name: 'Claude Code', displayPath: '~/.claude.json' } } as any, action: 'refresh' as const },
+    ];
+
+    // Vitest already runs non-TTY; document the assumption and
+    // assert the no-prompt path returns the plan unchanged.
+    expect(process.stdin.isTTY).toBeFalsy();
+    const result = await prodConfirmPlan(fakePlan, { yes: false });
+    expect(result).toHaveLength(2);
+    expect(result.map((p) => p.action)).toEqual(['register', 'refresh']);
+  });
+
   it('phase-4: VSCode staleness — pre-existing dkg entry under `servers.dkg` reclassifies on context flip to monorepo', async () => {
     // Cross-shape staleness: a Cursor-shaped entry written into
     // VSCode's `servers.dkg` wouldn't classify as `registered` if

@@ -1806,7 +1806,7 @@ mcpCmd
   .option('--dry-run', 'Preview steps without writing or starting anything')
   .option('--force', 'Refresh every detected client regardless of current registration state')
   .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
-  .option('--yes', 'Auto-confirm all registrations (default; reserved for future interactive prompts)')
+  .option('--yes', 'Auto-confirm per-client registrations (default false: prompt interactively in TTY mode; non-TTY auto-confirms — pass `--yes` in scripts for the safer scripted-environment posture)')
   .option('--installed', 'Force the installed-mode command form ({ command: "dkg", args: ["mcp", "serve"] }) even when invoked from inside a monorepo dev checkout. Mutually exclusive with --monorepo.')
   .option('--monorepo', 'Force the monorepo-mode command form (absolute path to local CLI dist) — errors if no DKG monorepo root can be located. Mutually exclusive with --installed.')
   .action(async (opts) => {

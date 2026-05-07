@@ -49,7 +49,11 @@
  *   --dry-run      Preview steps; no filesystem or network writes.
  *   --force        Refresh every detected client regardless of state.
  *   --print-only   Emit canonical JSON only; skip every other step.
- *   --yes          Auto-confirm (default; reserved for future prompts).
+ *   --yes          Auto-confirm registrations (default false: prompt
+ *                  per-client interactively in TTY mode; non-TTY auto-
+ *                  confirms automatically — CI / scripts work without
+ *                  the flag, but passing it explicitly is the safer
+ *                  scripted-environment posture).
  *   --installed    Force installed-mode command form even from a
  *                  monorepo cwd (mutually exclusive with --monorepo).
  *   --monorepo     Force monorepo-mode command form (errors if no
@@ -70,7 +74,14 @@ export interface McpSetupCliOptions {
   force?: boolean;
   /** Emit the canonical JSON block to stdout; do not detect clients or write. */
   printOnly?: boolean;
-  /** Auto-confirm registrations (default true; reserved for future interactive prompts). */
+  /**
+   * Auto-confirm per-client registrations (default false). In TTY
+   * mode without `--yes`, the action prompts per detected client
+   * before writing. In non-TTY mode (CI, piped input, no controlling
+   * terminal) the prompt is skipped — non-interactive environments
+   * auto-confirm so scripts don't hang. Pass `--yes` explicitly in
+   * scripts for the safer posture.
+   */
   yes?: boolean;
   /** Override daemon API port (default 9200). Mirrors openclaw-setup. */
   port?: string;
@@ -111,6 +122,18 @@ export interface McpSetupCliOptions {
 export type SetupContext = 'installed' | 'monorepo';
 
 /**
+ * F31: per-client registration plan item. Lifted to module scope so
+ * the `confirmPlan` helper can take and return arrays of these
+ * without re-declaring the shape inside the action body. `Action`
+ * mirrors the local enum the planning loop produces.
+ */
+export type PlannedAction = 'register' | 'refresh' | 'skip';
+export interface PlannedItem {
+  s: ClientState;
+  action: PlannedAction;
+}
+
+/**
  * Dependency surface for `mcpSetupAction`. All bundled-flow primitives
  * are injected so the action can be unit-tested without touching the
  * real filesystem or spawning the daemon. The CLI wiring in `cli.ts`
@@ -141,6 +164,22 @@ export interface McpSetupActionDeps {
    * without spawning a child process.
    */
   resolveDkgBin: () => string | null;
+  /**
+   * F31: per-client interactive confirm hook. Defaulted to the
+   * production readline-based implementation. Injectable so tests
+   * can stub deterministic answer streams without managing a real
+   * TTY. The helper takes the `planned` array and returns a
+   * possibly-modified copy where declined items are downgraded to
+   * `'skip'`.
+   *
+   * Optional — `mcpSetupAction` falls back to the module-level
+   * `confirmPlan` when not supplied so existing call sites keep
+   * working unchanged.
+   */
+  confirmPlan?: (
+    planned: readonly PlannedItem[],
+    opts: { yes: boolean },
+  ) => Promise<PlannedItem[]>;
 }
 
 /**
@@ -200,6 +239,63 @@ export function resolveDkgBin(): string | null {
     return firstLine || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * F31 production-side per-client confirm prompt. Reads each
+ * to-be-written client name from the planned array and asks the
+ * operator interactively before writing. Skipped entries pass
+ * through unchanged (we don't prompt about no-ops).
+ *
+ * Auto-confirm conditions (skip prompts entirely):
+ *   - `opts.yes === true` (operator passed `--yes`).
+ *   - `process.stdin.isTTY === false` (CI / scripted / piped input).
+ *   - Zero non-skip entries in the plan (nothing to confirm).
+ *
+ * Default empty answer (operator just hits Enter) accepts the
+ * registration — the prompt prefix is `[Y/n]` so the lower-case
+ * default is "yes". Only `n` / `no` (case-insensitive) declines.
+ *
+ * Exported so `cli.ts` can pass it through to `mcpSetupAction`'s
+ * deps surface in production. Tests inject their own stub.
+ */
+export async function confirmPlan(
+  planned: readonly PlannedItem[],
+  opts: { yes: boolean },
+): Promise<PlannedItem[]> {
+  const writes = planned.filter((p) => p.action !== 'skip');
+  if (opts.yes || !process.stdin.isTTY || writes.length === 0) {
+    return [...planned];
+  }
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const result: PlannedItem[] = [];
+    for (const p of planned) {
+      if (p.action === 'skip') {
+        result.push(p);
+        continue;
+      }
+      const verb = p.action === 'register' ? 'Register' : 'Refresh';
+      const ans = (
+        await rl.question(
+          `${verb} DKG MCP with ${p.s.target.name} (${p.s.target.displayPath})? [Y/n] `,
+        )
+      )
+        .trim()
+        .toLowerCase();
+      const declined = ans === 'n' || ans === 'no';
+      if (declined) {
+        console.log(`  → declined; will skip ${p.s.target.name}`);
+        result.push({ ...p, action: 'skip' });
+      } else {
+        result.push(p);
+      }
+    }
+    return result;
+  } finally {
+    rl.close();
   }
 }
 
@@ -916,8 +1012,7 @@ export async function mcpSetupAction(
   }
 
   const states = clients.map((c) => classify(c, expectedEntry));
-  type Action = 'register' | 'refresh' | 'skip';
-  const planned: Array<{ s: ClientState; action: Action }> = states.map((s) => {
+  const planned: PlannedItem[] = states.map((s) => {
     if (force) return { s, action: 'refresh' };
     if (s.state === 'not-registered') return { s, action: 'register' };
     if (s.state === 'stale') return { s, action: 'refresh' };
@@ -940,9 +1035,27 @@ export async function mcpSetupAction(
     console.log(`  ${s.target.name.padEnd(13)} (${s.target.displayPath}) — ${stateLabel}; ${actionLabel}`);
   }
 
-  const writes = planned.filter((p) => p.action !== 'skip');
+  // F31: per-client interactive confirm. Skipped on `--yes`, in
+  // non-TTY environments (CI, piped input), or when nothing's
+  // pending — see `confirmPlan` JSDoc for the auto-confirm matrix.
+  // Skip in dry-run too: dry-run is preview-only, no point asking
+  // the operator about writes that won't happen.
+  const confirm = deps.confirmPlan ?? confirmPlan;
+  const confirmed = dryRun
+    ? planned
+    : await confirm(planned, { yes: opts.yes === true });
+
+  const writes = confirmed.filter((p) => p.action !== 'skip');
   if (writes.length === 0) {
-    console.log('\nClients all up-to-date; nothing to write. Re-run with --force to refresh anyway.');
+    if (planned.some((p) => p.action !== 'skip')) {
+      // Distinct case from the original "all up-to-date" log: every
+      // pending registration was declined at the prompt. Clarify
+      // that re-running without `--force` won't reprompt unless
+      // the on-disk entry is actually stale.
+      console.log('\nAll pending registrations declined. Re-run with --force or --yes to write without prompts.');
+    } else {
+      console.log('\nClients all up-to-date; nothing to write. Re-run with --force to refresh anyway.');
+    }
   } else if (dryRun) {
     console.log('\n[setup] [dry-run] Would write to the clients listed above.');
   } else {

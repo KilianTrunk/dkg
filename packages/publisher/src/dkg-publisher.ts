@@ -2,7 +2,7 @@ import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { ChainAdapter, OnChainPublishResult, AddBatchToContextGraphParams } from '@origintrail-official/dkg-chain';
 import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, contextGraphDataUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, computePublishACKDigest, computePublishPublisherDigest } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, contextGraphDataUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, computePublishACKDigest, buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import type { Publisher, PublishOptions, PublishResult, KAManifestEntry, PhaseCallback } from './publisher.js';
 import { autoPartition } from './auto-partition.js';
@@ -247,6 +247,18 @@ interface PublisherSigner {
   address: string;
   source: 'publisherPrivateKey' | 'chainAdapter';
   signMessage(message: Uint8Array): Promise<string>;
+  /**
+   * Sign EIP-712 typed data. Required for RFC-001 author attestations
+   * which use `\x19\x01` framing rather than the EIP-191 prefix that
+   * `signMessage` applies. Native on `ethers.Wallet`; chain-adapter
+   * fallbacks throw because the adapter's `signMessage` / `signMessageAs`
+   * surface only handles EIP-191 hashes.
+   */
+  signTypedData(
+    domain: ethers.TypedDataDomain,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ): Promise<string>;
 }
 
 function isInternalOrigin(options: PublishOptions): boolean {
@@ -528,6 +540,8 @@ export class DKGPublisher implements Publisher {
         address: this.publisherAddress,
         source: 'publisherPrivateKey',
         signMessage: (message: Uint8Array) => wallet.signMessage(message),
+        signTypedData: (domain, types, value) =>
+          wallet.signTypedData(domain, types, value),
       };
     }
 
@@ -550,6 +564,19 @@ export class DKGPublisher implements Publisher {
             );
           }
           return signature;
+        },
+        signTypedData: async (domain, types, value) => {
+          if (typeof this.chain.signTypedDataAs === 'function') {
+            return this.chain.signTypedDataAs(expectedAddress, domain, types, value);
+          }
+          if (typeof this.chain.signTypedData === 'function') {
+            return this.chain.signTypedData(domain, types, value);
+          }
+          throw new Error(
+            'EIP-712 typed-data signing (RFC-001 author attestation) is not supported ' +
+            'by this chain adapter. Configure publisherPrivateKey or upgrade the adapter ' +
+            'to implement signTypedData / signTypedDataAs.',
+          );
         },
       };
     }
@@ -576,6 +603,19 @@ export class DKGPublisher implements Publisher {
           }
           return signature;
         },
+        signTypedData: async (domain, types, value) => {
+          if (typeof this.chain.signTypedData === 'function') {
+            return this.chain.signTypedData(domain, types, value);
+          }
+          if (typeof this.chain.signTypedDataAs === 'function') {
+            return this.chain.signTypedDataAs(expectedAddress, domain, types, value);
+          }
+          throw new Error(
+            'EIP-712 typed-data signing (RFC-001 author attestation) is not supported ' +
+            'by this chain adapter. Configure publisherPrivateKey or upgrade the adapter ' +
+            'to implement signTypedData / signTypedDataAs.',
+          );
+        },
       };
     }
 
@@ -589,6 +629,8 @@ export class DKGPublisher implements Publisher {
         address: operationalWallet.address,
         source: 'chainAdapter',
         signMessage: (message: Uint8Array) => operationalWallet.signMessage(message),
+        signTypedData: (domain, types, value) =>
+          operationalWallet.signTypedData(domain, types, value),
       };
     }
 
@@ -1688,7 +1730,7 @@ export class DKGPublisher implements Publisher {
         if (typeof this.chain.isV10Ready !== 'function' || !this.chain.isV10Ready()) {
           throw new Error(
             'Chain adapter is not V10-ready (isV10Ready() returned false or is missing). ' +
-            'Publish is routed through KnowledgeAssetsV10.publishDirect, which requires ' +
+            'Publish is routed through KnowledgeAssetsV10.publish, which requires ' +
             'the adapter to expose createKnowledgeAssetsV10, getEvmChainId, and ' +
             'getKnowledgeAssetsV10Address — use an EVM adapter pointed at a chain where ' +
             'KnowledgeAssetsV10 is deployed.',
@@ -1700,18 +1742,25 @@ export class DKGPublisher implements Publisher {
             'getKnowledgeAssetsV10Address(); neither was resolved. The adapter is not V10-capable.',
           );
         }
-        // V10 publisher digest (KnowledgeAssetsV10.sol:327-335):
-        //   keccak256(abi.encodePacked(chainid, kav10Address, uint72 identityId, uint256 cgId, bytes32 merkleRoot))
-        // H5 prefix + N26 field order (identityId BEFORE cgId).
-        const pubMsgHash = computePublishPublisherDigest(
-          v10ChainId,
-          v10KavAddress,
-          identityId,
-          v10CgId,
-          kcMerkleRoot,
-        );
-        const pubSig = ethers.Signature.from(
-          await publisherSigner.signMessage(pubMsgHash),
+        // RFC-001 §3 author attestation. EIP-712 typed-data signature
+        // over (contextGraphId, merkleRoot, authorAddress, schemeVersion)
+        // bound to (KAV10 chainId, KAV10 contract). The publisher signer
+        // is the author of record for this publish — the same EOA that
+        // submits the tx. PCA / EIP-1271 / EIP-7702 indirection is
+        // future work (RFC-001 §9.6); v1 is single-key only.
+        const authorTypedData = buildAuthorAttestationTypedData({
+          chainId: v10ChainId,
+          kav10Address: v10KavAddress,
+          contextGraphId: v10CgId,
+          merkleRoot: kcMerkleRoot,
+          authorAddress: publisherSigner.address,
+        });
+        const authorSig = ethers.Signature.from(
+          await publisherSigner.signTypedData(
+            authorTypedData.domain,
+            authorTypedData.types,
+            authorTypedData.message,
+          ),
         );
         // P-1 review (iter-2): `chain:writeahead:start` now fires
         // *from inside* the adapter via the `onBroadcast` callback,
@@ -1780,11 +1829,14 @@ export class DKGPublisher implements Publisher {
             tokenAmount,
             merkleLeafCount: kcMerkleLeafCount,
             isImmutable: false,
-            paymaster: ethers.ZeroAddress,
             publisherNodeIdentityId: identityId,
-            publisherSignature: {
-              r: ethers.getBytes(pubSig.r),
-              vs: ethers.getBytes(pubSig.yParityAndS),
+            author: {
+              address: publisherSigner.address,
+              signature: {
+                r: ethers.getBytes(authorSig.r),
+                vs: ethers.getBytes(authorSig.yParityAndS),
+              },
+              schemeVersion: AUTHOR_SCHEME_VERSION_V1,
             },
             ackSignatures: v10ACKs.map(ack => ({
               identityId: ack.nodeIdentityId,

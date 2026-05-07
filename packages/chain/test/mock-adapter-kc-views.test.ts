@@ -75,9 +75,12 @@ describe('MockChainAdapter KC views — createKnowledgeAssetsV10 path', () => {
       tokenAmount: 0n,
       isImmutable: false,
       merkleLeafCount: 4,
-      paymaster: ethers.ZeroAddress,
       publisherNodeIdentityId: 1n,
-      publisherSignature: dummySig,
+      author: {
+        address: MOCK_DEFAULT_SIGNER,
+        signature: dummySig,
+        schemeVersion: 1,
+      },
       ackSignatures: [{ identityId: 1n, ...dummySig }],
     });
 

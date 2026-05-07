@@ -21,7 +21,7 @@ import type {
   CreateOnChainContextGraphResult,
   VerifyParams,
   PublishToContextGraphParams,
-  V10PublishDirectParams,
+  V10PublishParams,
   V10UpdateKCParams,
   NodeChallenge,
   ProofPeriodStatus,
@@ -759,6 +759,37 @@ export class MockChainAdapter implements ChainAdapter {
     return { r: new Uint8Array(32), vs: new Uint8Array(32) };
   }
 
+  /**
+   * Mock EIP-712 typed-data signer. If a `mockACKSigner` wallet has been
+   * configured (test setups that exercise the full author-attestation
+   * flow on hardhat-style fixtures), sign with it so the recovered author
+   * matches the wallet address. Otherwise return a deterministic 65-byte
+   * zero signature — sufficient for unit tests that only check publish
+   * plumbing and never round-trip through real KAv10 verification.
+   */
+  async signTypedData(
+    domain: import('ethers').TypedDataDomain,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ): Promise<string> {
+    if (this.mockACKSigner) {
+      return this.mockACKSigner.signTypedData(domain, types, value);
+    }
+    return `0x${'00'.repeat(65)}`;
+  }
+
+  async signTypedDataAs(
+    address: string,
+    domain: import('ethers').TypedDataDomain,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ): Promise<string> {
+    if (this.mockACKSigner && this.mockACKSigner.address.toLowerCase() === address.toLowerCase()) {
+      return this.mockACKSigner.signTypedData(domain, types, value);
+    }
+    throw new Error(`Mock: cannot sign typed data as ${address}: address is not the mock ACK signer.`);
+  }
+
   async getMinimumRequiredSignatures(): Promise<number> {
     return this.minimumRequiredSignatures;
   }
@@ -932,7 +963,7 @@ export class MockChainAdapter implements ChainAdapter {
     return 31337n;
   }
 
-  async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+  async createKnowledgeAssetsV10(params: V10PublishParams): Promise<OnChainPublishResult> {
     // Deliberately tolerant of `contextGraphId === 0n`. The real EVM
     // adapter rejects that at `evm-adapter.ts:createKnowledgeAssetsV10`
     // pre-tx, which is the authoritative fail-loud boundary. The mock is
@@ -1009,7 +1040,8 @@ export class MockChainAdapter implements ChainAdapter {
       endKAId: endKAId.toString(),
       isImmutable: params.isImmutable,
       contextGraphId: params.contextGraphId.toString(),
-      paymaster: params.paymaster,
+      authorAddress: params.author.address,
+      authorSchemeVersion: params.author.schemeVersion,
     });
 
     const result = this.txResult(true);

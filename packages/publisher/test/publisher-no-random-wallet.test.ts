@@ -61,6 +61,14 @@ class AdapterSigningChain extends MockChainAdapter {
       vs: ethers.getBytes(sig.yParityAndS),
     };
   }
+
+  async signTypedData(
+    domain: ethers.TypedDataDomain,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ): Promise<string> {
+    return this.wallet.signTypedData(domain, types, value);
+  }
 }
 
 class AsyncAddressSigningChain implements ChainAdapter {
@@ -91,6 +99,14 @@ class AsyncAddressSigningChain implements ChainAdapter {
       r: ethers.getBytes(sig.r),
       vs: ethers.getBytes(sig.yParityAndS),
     };
+  }
+
+  async signTypedData(
+    domain: ethers.TypedDataDomain,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ): Promise<string> {
+    return this.wallet.signTypedData(domain, types, value);
   }
 
   async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
@@ -207,6 +223,19 @@ class ContextAwareAdapterSigningChain extends MockChainAdapter {
       r: ethers.getBytes(sig.r),
       vs: ethers.getBytes(sig.yParityAndS),
     };
+  }
+
+  async signTypedDataAs(
+    address: string,
+    domain: ethers.TypedDataDomain,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ): Promise<string> {
+    const normalized = ethers.getAddress(address);
+    if (normalized.toLowerCase() !== this.authorizedWallet.address.toLowerCase()) {
+      throw new Error(`unexpected typed-data signer ${address}`);
+    }
+    return this.authorizedWallet.signTypedData(domain, types, value);
   }
 
   override async createKnowledgeAssetsV10(params: Parameters<MockChainAdapter['createKnowledgeAssetsV10']>[0]) {

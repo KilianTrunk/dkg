@@ -11,6 +11,7 @@
     "clean": "rm -rf dist tsconfig.tsbuildinfo"
   },
   "dependencies": {
+    "@origintrail-official/dkg-core": "workspace:*",
     "ethers": "^6"
   },
   "optionalDependencies": {

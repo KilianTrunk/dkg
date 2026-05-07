@@ -101,7 +101,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   //     KnowledgeCollectionUpdated still carry the same ABI shape today;
   //     the digest changed because the function inputs they originate from
   //     changed). Sanity tests below pin the actual event field shapes.
-  KnowledgeAssetsV10:           '8cd026c514ae7390760b3f5c10982af71bba624c8438a8a0f4ba16c4da006fab',
+  KnowledgeAssetsV10:           '785311d19ce39743522bf1db501f41276fb22d715a2cc94cc67d96f8a22e519e',
   KnowledgeCollectionStorage:   '99dd188d290c191a9f7ab5e8bef78db123f9400da0e8fa2c20811db0df15c5da',
   KnowledgeCollection:          'c906207c38ffded8944d7255498f7fc9f2c864098a3f8f3670df19006dbcd395',
   ContextGraphs:                'ee69f0d50b54df966b8bfb3bf457fe6d2865393f51f8770b4185fafd324b9462',

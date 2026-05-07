@@ -281,7 +281,7 @@ export class FinalizationHandler {
 
       if (!batchVerified) return false;
 
-      // V10 publishDirect registers the KC to the context graph internally
+      // V10 publish registers the KC to the context graph internally
       // (no separate addBatchToContextGraph tx / ContextGraphExpanded event).
       // Skip the legacy ContextGraphExpanded check — the batch verification
       // above is sufficient for V10.

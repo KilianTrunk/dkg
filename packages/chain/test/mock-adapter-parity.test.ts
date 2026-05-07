@@ -306,9 +306,12 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       tokenAmount: 1n,
       isImmutable: false,
       merkleLeafCount: 1,
-      paymaster: '0x0000000000000000000000000000000000000000',
       publisherNodeIdentityId: 1n,
-      publisherSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      author: {
+        address: otherPublisher,
+        signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+        schemeVersion: 1,
+      },
       ackSignatures: [],
     };
 
@@ -337,9 +340,12 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       tokenAmount: 1n,
       isImmutable: false,
       merkleLeafCount: 1,
-      paymaster: ethers.ZeroAddress,
       publisherNodeIdentityId: 1n,
-      publisherSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      author: {
+        address: delegatedPublisher,
+        signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+        schemeVersion: 1,
+      },
       ackSignatures: [],
     });
 
@@ -373,9 +379,12 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       tokenAmount: 1n,
       isImmutable: false,
       merkleLeafCount: 1,
-      paymaster: ethers.ZeroAddress,
       publisherNodeIdentityId: 1n,
-      publisherSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      author: {
+        address: delegatedPublisher,
+        signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+        schemeVersion: 1,
+      },
       ackSignatures: [],
     });
 

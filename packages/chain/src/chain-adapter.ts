@@ -1,3 +1,5 @@
+import type { ethers } from 'ethers';
+
 export interface IdentityProof {
   publicKey: Uint8Array;
   signature: Uint8Array;
@@ -204,14 +206,44 @@ export interface ConvictionAccountInfo {
 
 // ----- V10 publish types -----
 
-export interface V10PublishDirectParams {
+/**
+ * Compact `(r, vs)` form of a 65-byte EIP-712 / EIP-191 / EIP-1271
+ * signature. `r` is the standard 32-byte secp256k1 r value; `vs` packs
+ * `s` in the low 255 bits and `(v - 27)` in the top bit, matching
+ * `ECDSA.tryRecover(bytes32, bytes32, bytes32)` in the contract.
+ */
+export interface CompactSignature {
+  r: Uint8Array;
+  vs: Uint8Array;
+}
+
+/**
+ * RFC-001 §3 author attestation. EIP-712 typed-data signature over
+ * `AuthorAttestation(uint256 contextGraphId, bytes32 merkleRoot,
+ * address authorAddress, uint8 schemeVersion)` with domain
+ * `(name="KnowledgeAssetsV10", version="10.1", chainId, verifyingContract)`.
+ *
+ * - `address`: the author identity. EOA → ECDSA recovery branch.
+ *   Smart-contract wallet (incl. EIP-7702-delegated EOAs with
+ *   `code.length > 0`) → IERC1271.isValidSignature dispatch.
+ * - `signature`: compact `(r, vs)` form.
+ * - `schemeVersion`: 1 (only currently-supported scheme; multi-sig /
+ *   threshold / passkey-aggregated will bump this in a future RFC).
+ */
+export interface V10AuthorAttestation {
+  address: string;
+  signature: CompactSignature;
+  schemeVersion: number;
+}
+
+export interface V10PublishParams {
   publishOperationId: string;
   contextGraphId: bigint;
   /**
    * Optional signer hint selected by the caller for the publish. Adapters
    * with signer pools MUST use this address for the concrete tx when present
    * (or throw clearly if unavailable/unauthorized), so the off-chain
-   * publisher/ACK/authorship signatures and on-chain attribution stay bound
+   * authorship/ACK signatures and on-chain attribution stay bound
    * to the same key.
    */
   publisherAddress?: string;
@@ -224,14 +256,14 @@ export interface V10PublishDirectParams {
   /** V10 flat-KC Merkle leaf count (sorted + deduped); stored on-chain for RandomSampling. */
   merkleLeafCount: number;
   /**
-   * Paymaster address. `ethers.ZeroAddress` means the caller pays TRAC
-   * directly. Non-zero means the paymaster covers the cost. The adapter
-   * splits this field out of the struct and passes it as the second
-   * argument to `KnowledgeAssetsV10.publishDirect(PublishParams, paymaster)`.
+   * Self-claimed publishing-factor attribution target. RFC-001 §4 — this
+   * is now informational only on-chain; no per-publish signature is
+   * required from the core node. The contract validates only that the id
+   * is a known sharding-table member.
    */
-  paymaster: string;
   publisherNodeIdentityId: bigint;
-  publisherSignature: { r: Uint8Array; vs: Uint8Array };
+  /** RFC-001 §3 — required EIP-712 author attestation. */
+  author: V10AuthorAttestation;
   ackSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
   /**
    * Write-ahead hook invoked by the adapter *immediately before the
@@ -284,16 +316,22 @@ export interface V10UpdateKCParams {
   publisherAddress?: string;
   updateOperationId?: string;
   publisherNodeIdentityId?: bigint;
-  publisherSignature?: { r: Uint8Array; vs: Uint8Array };
   ackSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
   /**
    * Write-ahead hook fired just before the concrete update tx is
    * broadcast, carrying the signed tx hash. See
-   * {@link V10PublishDirectParams.onBroadcast} for full semantics
+   * {@link V10PublishParams.onBroadcast} for full semantics
    * (fail-closed contract, exactly-once, Promise return, etc.).
    */
   onBroadcast?: (info: { txHash: string }) => Promise<void> | void;
 }
+
+/**
+ * @deprecated Renamed to {@link V10PublishParams} after RFC-001 unified
+ * `publish`/`publishDirect` into a single entrypoint. Existing imports
+ * will compile but new code should use `V10PublishParams`.
+ */
+export type V10PublishDirectParams = V10PublishParams;
 
 // ----- Random Sampling (V10 RandomSampling.sol) -----
 
@@ -557,6 +595,25 @@ export interface ChainAdapter {
   signMessage?(messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }>;
 
   /**
+   * Sign EIP-712 typed data with the adapter's primary signer. Used by
+   * RFC-001 author attestations which use the `\x19\x01` framing rather
+   * than the EIP-191 prefix that {@link signMessage} applies.
+   *
+   * Returns the full 65-byte serialized signature ({@link ethers.Signature}
+   * format). The serialization is `r || s || v` so callers can feed it
+   * straight into `ethers.Signature.from` to extract `(r, vs)`.
+   *
+   * Optional — adapters that hold no signing keys (NoChainAdapter) MUST
+   * NOT implement it. Adapters that implement {@link signMessage} SHOULD
+   * also implement this for the publisher author-signing path.
+   */
+  signTypedData?(
+    domain: ethers.TypedDataDomain,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ): Promise<string>;
+
+  /**
    * Reserve the adapter signer that should be used for a publish to the given
    * context graph and return its address. Signer-pool implementations should
    * advance their cursor atomically here so concurrent publishers do not bind
@@ -573,6 +630,23 @@ export interface ChainAdapter {
    */
   signMessageAs?(address: string, messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }>;
 
+  /**
+   * Sign EIP-712 typed data with a specific adapter-held address. RFC-001
+   * author attestations route through here for adapters with signer
+   * pools so the typed-data signer matches the eventual tx signer.
+   *
+   * Returns the full 65-byte serialized signature; callers feed it into
+   * `ethers.Signature.from` to derive `(r, vs)`. See {@link signTypedData}
+   * for the no-pool variant. Optional for the same reason as
+   * {@link signMessageAs}.
+   */
+  signTypedDataAs?(
+    address: string,
+    domain: ethers.TypedDataDomain,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ): Promise<string>;
+
   // On-Chain Context Graphs (ContextGraphs contract)
   createOnChainContextGraph?(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult>;
   getContextGraphParticipants?(contextGraphId: bigint): Promise<bigint[] | null>;
@@ -586,8 +660,12 @@ export interface ChainAdapter {
    * `getEvmChainId()` below so authors of out-of-tree adapters get a
    * compile-time failure instead of a runtime regression when they
    * implement the tx submission but forget the digest-prefix getters.
+   *
+   * Post-RFC-001 the on-chain entrypoint is the unified `publish` (no
+   * separate `publishDirect`); the adapter auto-selects PCA-discount vs.
+   * direct-spend based on `agentToAccountId(msg.sender)`.
    */
-  createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult>;
+  createKnowledgeAssetsV10(params: V10PublishParams): Promise<OnChainPublishResult>;
 
   /** Read minimumRequiredSignatures from ParametersStorage. Used by ACKCollector. */
   getMinimumRequiredSignatures?(): Promise<number>;
@@ -755,7 +833,7 @@ export interface ChainAdapter {
 
   /**
    * Address that signed the latest merkle root for `kcId` (the EOA that
-   * called `KnowledgeAssetsV10.publishDirect` / update). Mostly observability
+   * called `KnowledgeAssetsV10.publish` / update). Mostly observability
    * — the prover does not gate on this — but useful for trace logs and for
    * future sharding / authorship-based reward heuristics. Publishers also use
    * this as the compatibility path for update adapters whose successful

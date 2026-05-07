@@ -107,7 +107,16 @@ export async function runEtl({
     }
   }
 
-  const creationDate = new Date().toISOString();
+  // Use the latest source-record timestamp as the document's
+  // `creationDate` (and as `source-snapshot.json`'s `extracted_at`)
+  // instead of `new Date().toISOString()`. Wall-clock time would
+  // rewrite every committed `event-NN-*.json` plus `source-snapshot.json`
+  // on every regeneration even when the source file hasn't changed,
+  // contradicting the "regenerate unchanged" guarantee the README
+  // advertises and producing noisy diffs that obscure real changes.
+  // The latest `ended` is a reasonable proxy for "when this trace was
+  // collected" — and it's deterministic for a fixed source.
+  const creationDate = traceRecords.at(-1).ended;
   const events = [];
   const stations = new Set();
   const products = new Set();
@@ -167,10 +176,22 @@ export async function runEtl({
         // undefined so the eventID seed matches the back-compat
         // `(trace, unit, ended)` shape and the committed fixtures
         // regenerate unchanged.
-        const groupKeyParts = [];
-        if (groupCount > 1) groupKeyParts.push(status);
-        if (actionSubBuckets.length > 1) groupKeyParts.push(sub.action.toLowerCase());
-        const groupKey = groupKeyParts.length > 0 ? groupKeyParts.join('-') : undefined;
+        // Encode the (status, action) pair structurally, not as
+        // `<status>-<action>`. A source status that itself contains
+        // a hyphen (e.g. `In-Progress` or worse, a literal `Passed-add`)
+        // would collide with the split key for `(status='Passed',
+        // action='ADD')` under hyphen-join — both seeds become
+        // `Passed-add` and the publisher's duplicate-root validator
+        // rejects the second sibling. JSON.stringify of a fixed-key
+        // object guarantees unique encoding for distinct (status,
+        // action) inputs (status is JSON-string-escaped, key order
+        // is the insertion order JS preserves for non-numeric keys).
+        const groupKeyParts = {};
+        if (groupCount > 1) groupKeyParts.status = status;
+        if (actionSubBuckets.length > 1) groupKeyParts.action = sub.action.toLowerCase();
+        const groupKey = Object.keys(groupKeyParts).length > 0
+          ? JSON.stringify(groupKeyParts)
+          : undefined;
         const isFirstInTrace = sub.action === 'ADD';
 
         const doc = buildEpcisDocument({

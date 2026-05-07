@@ -252,12 +252,30 @@ async function getDaemonAuth() {
 // round to <100ms total.
 async function fetchCaptureStatus(captureID) {
   const { baseUrl, token } = await getDaemonAuth();
-  const res = await fetch(`${baseUrl}/api/epcis/capture/${encodeURIComponent(captureID)}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const text = await res.text();
+  let res;
+  let text = '';
   let parsed;
-  try { parsed = JSON.parse(text); } catch { /* non-JSON */ }
+  // Wrap the network call so daemon restarts / connection resets / any
+  // other transport-level rejection synthesizes the same `http-error`
+  // terminal shape that non-2xx responses produce below. Without this
+  // catch, fetch's rejection bubbles out of `Promise.all` in the Phase
+  // 2 poll round (and out of Phase 6's single-capture poll loop) and
+  // aborts the whole demo even when the operator just restarted the
+  // daemon during a transient issue.
+  try {
+    res = await fetch(`${baseUrl}/api/epcis/capture/${encodeURIComponent(captureID)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    text = await res.text();
+    try { parsed = JSON.parse(text); } catch { /* non-JSON */ }
+  } catch (err) {
+    const message = err?.message ?? String(err);
+    return {
+      status: 0,
+      body: '',
+      parsed: { state: 'http-error', error: `fetch failed: ${message}` },
+    };
+  }
   // Synthesize a terminal `http-error` state on non-2xx so polling callers
   // stop spinning until POLL_TIMEOUT_MS and instead surface the actual
   // cause (auth dropped, capture vanished, daemon 5xx). Without this, a
@@ -369,14 +387,36 @@ async function subscribeNode2ToCG(contextGraphId) {
 async function node2Sparql(sparql) {
   const auth = await getNode2Auth();
   if (!auth) throw new Error('Node2 unreachable');
-  const res = await fetch(`${auth.baseUrl}/api/query`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${auth.token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ sparql, contextGraphId: CG_ID, includeSharedMemory: true }),
-  });
+  const cmdString = `POST ${auth.baseUrl}/api/query  ${sparql.length > 80 ? sparql.slice(0, 77) + '...' : sparql}`;
+  // Catch transport-level fetch failures (daemon restarted, connection
+  // dropped, network unreachable). Phase 7 advertises itself as best-
+  // effort cross-node verification — without this catch, a transient
+  // node2 hiccup throws past the per-call sites and aborts the whole
+  // demo even though the owner-side phases (1-6) already passed.
+  // Return the same {status, body, parsed, bindings} shape so downstream
+  // querySucceeded() (status===200 && Array.isArray(bindings)) cleanly
+  // classifies it as a query failure rather than an unverified result.
+  let res;
+  try {
+    res = await fetch(`${auth.baseUrl}/api/query`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${auth.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ sparql, contextGraphId: CG_ID, includeSharedMemory: true }),
+    });
+  } catch (err) {
+    const message = err?.message ?? String(err);
+    return {
+      status: 0,
+      body: '',
+      parsed: null,
+      bindings: null,
+      cmdString,
+      error: `node2 fetch failed: ${message}`,
+    };
+  }
   const text = await res.text();
   let parsed;
   try { parsed = JSON.parse(text); } catch { /* non-JSON */ }
@@ -392,7 +432,7 @@ async function node2Sparql(sparql) {
     body: text,
     parsed,
     bindings,
-    cmdString: `POST ${auth.baseUrl}/api/query  ${sparql.length > 80 ? sparql.slice(0, 77) + '...' : sparql}`,
+    cmdString,
   };
 }
 

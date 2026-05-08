@@ -363,6 +363,9 @@ importers:
 
   packages/epcis:
     dependencies:
+      '@origintrail-official/dkg-core':
+        specifier: workspace:*
+        version: link:../core
       ajv:
         specifier: ^8
         version: 8.18.0

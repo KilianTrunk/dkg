@@ -3066,6 +3066,73 @@ export class DKGAgent {
     return this.chain.getLatestMerkleRootAuthor(kcId);
   }
 
+  /**
+   * Publishing Conviction Account (PCA) facade for the agent-provenance
+   * runbook surface. These methods are thin wrappers over the chain adapter
+   * — the agent doesn't keep PCA state of its own; the on-chain
+   * `PublishingConvictionAccount` is the source of truth. The wrappers
+   * exist so daemon HTTP routes don't need to reach into the private
+   * `chain` field, mirroring the `getKnowledgeCollectionAuthor` pattern.
+   *
+   * `createPublishingConvictionAccount`: tx is signed by the agent's
+   * configured EOA; that EOA becomes the PCA `admin` and is automatically
+   * added to its own `authorizedKeys` set. Operators driving the runbook
+   * from a core node use this to stand up the PCA before mode (a)/(b).
+   *
+   * `addPCAAuthorizedKey` and `isPCAAuthorizedKey` are admin-gated on chain
+   * (`require(msg.sender == account.admin)`), so the daemon must be running
+   * as the PCA admin EOA for `addPCAAuthorizedKey` to succeed. Read-side
+   * `isPCAAuthorizedKey` is permissionless on chain and works from any node.
+   */
+  async createPublishingConvictionAccount(
+    amount: bigint,
+    lockEpochs: number,
+  ): Promise<{ accountId: bigint; txHash: string; blockNumber: number } | null> {
+    if (typeof this.chain.createConvictionAccount !== 'function') return null;
+    const result = await this.chain.createConvictionAccount(amount, lockEpochs);
+    return {
+      accountId: result.accountId,
+      txHash: result.hash,
+      blockNumber: result.blockNumber,
+    };
+  }
+
+  async addPublishingConvictionAccountFunds(
+    accountId: bigint,
+    amount: bigint,
+  ): Promise<{ txHash: string; blockNumber: number } | null> {
+    if (typeof this.chain.addConvictionFunds !== 'function') return null;
+    const result = await this.chain.addConvictionFunds(accountId, amount);
+    return { txHash: result.hash, blockNumber: result.blockNumber };
+  }
+
+  async addPCAAuthorizedKey(
+    accountId: bigint,
+    key: string,
+  ): Promise<{ txHash: string; blockNumber: number } | null> {
+    if (typeof this.chain.addPCAAuthorizedKey !== 'function') return null;
+    const result = await this.chain.addPCAAuthorizedKey(accountId, key);
+    return { txHash: result.hash, blockNumber: result.blockNumber };
+  }
+
+  async isPCAAuthorizedKey(accountId: bigint, key: string): Promise<boolean | null> {
+    if (typeof this.chain.isPCAAuthorizedKey !== 'function') return null;
+    return this.chain.isPCAAuthorizedKey(accountId, key);
+  }
+
+  async getPublishingConvictionAccountInfo(accountId: bigint): Promise<{
+    accountId: bigint;
+    admin: string;
+    balance: bigint;
+    initialDeposit: bigint;
+    lockEpochs: number;
+    conviction: bigint;
+    discountBps: number;
+  } | null> {
+    if (typeof this.chain.getConvictionAccountInfo !== 'function') return null;
+    return this.chain.getConvictionAccountInfo(accountId);
+  }
+
   // ---------------------------------------------------------------------------
 
   async sendChat(recipientPeerId: string, text: string): Promise<{ delivered: boolean; error?: string }> {
@@ -3663,6 +3730,29 @@ export class DKGAgent {
       contextGraphSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
       /** Target sub-graph within the context graph (e.g. "code", "decisions"). */
       subGraphName?: string;
+      /**
+       * Per-publish override for the `publisherNodeIdentityId` field on
+       * `KnowledgeAssetsV10.PublishParams`. When supplied, takes the
+       * place of the daemon's own identityId for THIS publish only —
+       * the publisher's persistent identity is restored afterwards.
+       *
+       * RFC §4 attribution: lets an edge-mode operator route a publish
+       * through the home-core's `publishFromSharedMemory` while
+       * attributing the publishing-factor credit (and PCA discount, when
+       * the submitter is on the named core's `authorizedKeys`) to a
+       * different core. `0n` is a valid value and means "no
+       * attribution" (RFC §4(d)).
+       *
+       * Concurrency: the override is implemented as a temporary swap of
+       * the publisher's `publisherNodeIdentityId` field. Daemons that
+       * issue concurrent `publishFromSharedMemory` calls with conflicting
+       * overrides will see interleaving — fine for single-operator
+       * runbook + V10.1 single-publisher daemons, but not safe for a
+       * future multi-tenant publisher service. That refactor would push
+       * the override down into a per-call parameter on
+       * `publisher.publishFromSharedMemory`.
+       */
+      publisherNodeIdentityIdOverride?: bigint;
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -3672,16 +3762,29 @@ export class DKGAgent {
     const onChainId = ctxGraphIdStr ?? (await this.getContextGraphOnChainId(contextGraphId)) ?? undefined;
 
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
-    const result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
-      operationCtx: ctx,
-      clearSharedMemoryAfter: options?.clearSharedMemoryAfter,
-      onPhase: options?.onPhase,
-      publishContextGraphId: ctxGraphIdStr,
-      onChainContextGraphId: onChainId,
-      contextGraphSignatures: options?.contextGraphSignatures,
-      v10ACKProvider,
-      subGraphName: options?.subGraphName,
-    });
+
+    const overriding = options?.publisherNodeIdentityIdOverride !== undefined;
+    const originalIdentityId = overriding ? this.publisher.getIdentityId() : 0n;
+    if (overriding) {
+      this.publisher.setIdentityId(options!.publisherNodeIdentityIdOverride!);
+    }
+    let result: PublishResult;
+    try {
+      result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
+        operationCtx: ctx,
+        clearSharedMemoryAfter: options?.clearSharedMemoryAfter,
+        onPhase: options?.onPhase,
+        publishContextGraphId: ctxGraphIdStr,
+        onChainContextGraphId: onChainId,
+        contextGraphSignatures: options?.contextGraphSignatures,
+        v10ACKProvider,
+        subGraphName: options?.subGraphName,
+      });
+    } finally {
+      if (overriding) {
+        this.publisher.setIdentityId(originalIdentityId);
+      }
+    }
 
     if (result.status === 'confirmed' && result.onChainResult) {
       const rootEntities = result.kaManifest.map(ka => ka.rootEntity);

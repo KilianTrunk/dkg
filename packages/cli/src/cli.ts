@@ -857,6 +857,7 @@ program
   .option('-o, --object <value>', 'Object value for simple publish')
   .option('--access-policy <policy>', 'Access policy for private triples (public|ownerOnly|allowList)')
   .option('--allowed-peer <peerId>', 'Peer ID allowed when using allowList policy', (v, prev: string[] = []) => [...prev, v], [])
+  .option('--publisher-node-identity-id <id>', 'Override the publisherNodeIdentityId for THIS publish only (RFC §4 attribution; pass `0` for an unattributed publish)')
   .action(async (contextGraph: string, opts: ActionOpts) => {
     try {
       const client = await ApiClient.connect();
@@ -889,9 +890,19 @@ program
         process.exit(1);
       }
 
+      let publisherNodeIdentityIdOverride: bigint | undefined;
+      if (opts.publisherNodeIdentityId !== undefined) {
+        const raw = String(opts.publisherNodeIdentityId);
+        if (!/^\d+$/.test(raw)) {
+          console.error('--publisher-node-identity-id must be a non-negative integer (use `0` for unattributed)');
+          process.exit(1);
+        }
+        publisherNodeIdentityIdOverride = BigInt(raw);
+      }
       const result = await client.publish(contextGraph, quads, privateQuads, {
         accessPolicy,
         allowedPeers,
+        publisherNodeIdentityIdOverride,
       });
       console.log(`Published to context graph "${contextGraph}":`);
       console.log(`  Status:    ${result.status}`);
@@ -2480,6 +2491,121 @@ sourceWorkerCmd
   });
 
 // ─── dkg publisher ────────────────────────────────────────────────────
+
+// ─── dkg pca — Publishing Conviction Account management ──────────────
+//
+// Operator surface for standing up and inspecting on-chain PCAs. Required
+// fixture for RFC §4 modes (a) and (b) of the agent-provenance runbook.
+// Writes are admin-gated by the on-chain `PublishingConvictionAccount`
+// contract — the daemon's EOA must own the PCA NFT for `pca authorize`
+// and `pca funds` to land. Read-side (`pca info`) is permissionless.
+const pcaCmd = program
+  .command('pca')
+  .description('Publishing Conviction Account: create, authorize keys, top-up, inspect');
+
+pcaCmd
+  .command('create')
+  .description('Create a new PCA. Daemon EOA becomes admin + first authorized key')
+  .requiredOption('--tokens <amount>', 'TRAC commitment (decimal, e.g. 100000)')
+  .requiredOption('--epochs <n>', 'Lock duration in epochs (positive integer)')
+  .action(async (opts: { tokens: string; epochs: string }) => {
+    try {
+      const lockEpochs = parseInt(opts.epochs, 10);
+      if (!Number.isFinite(lockEpochs) || lockEpochs <= 0) {
+        console.error('--epochs must be a positive integer');
+        process.exit(1);
+      }
+      const client = await ApiClient.connect();
+      const result = await client.createPca({ tokens: opts.tokens, lockEpochs });
+      console.log(`PCA created (admin = daemon EOA):`);
+      console.log(`  accountId:        ${result.accountId}`);
+      console.log(`  committedTokens:  ${result.committedTokens} TRAC`);
+      console.log(`  lockEpochs:       ${result.lockEpochs}`);
+      console.log(`  txHash:           ${result.txHash}`);
+      console.log(`  block:            ${result.blockNumber}`);
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
+pcaCmd
+  .command('authorize <accountId> <key>')
+  .description('Add `key` to the PCA\'s authorizedKeys set (admin-only on chain)')
+  .action(async (accountId: string, key: string) => {
+    try {
+      if (!/^\d+$/.test(accountId)) {
+        console.error('accountId must be a non-negative integer');
+        process.exit(1);
+      }
+      const client = await ApiClient.connect();
+      const result = await client.authorizePcaKey(accountId, key);
+      console.log(`Authorized key on PCA ${result.accountId}:`);
+      console.log(`  key:        ${result.key}`);
+      console.log(`  authorized: ${result.authorized} (verified via on-chain read)`);
+      console.log(`  txHash:     ${result.txHash}`);
+      console.log(`  block:      ${result.blockNumber}`);
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
+pcaCmd
+  .command('funds <accountId>')
+  .description('Top up an existing PCA (admin-only). Approves token spend automatically')
+  .requiredOption('--tokens <amount>', 'Additional TRAC to commit (decimal)')
+  .action(async (accountId: string, opts: { tokens: string }) => {
+    try {
+      if (!/^\d+$/.test(accountId)) {
+        console.error('accountId must be a non-negative integer');
+        process.exit(1);
+      }
+      const client = await ApiClient.connect();
+      const result = await client.addPcaFunds(accountId, opts.tokens);
+      console.log(`PCA ${result.accountId} topped up:`);
+      console.log(`  addedTokens: ${result.addedTokens} TRAC`);
+      console.log(`  txHash:      ${result.txHash}`);
+      console.log(`  block:       ${result.blockNumber}`);
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
+pcaCmd
+  .command('info <accountId>')
+  .description('Read-only PCA snapshot (admin, balance, conviction, discount). Optional `--probe-key` checks authorization')
+  .option('--probe-key <addr>', 'Also check whether <addr> is currently on the PCA\'s authorizedKeys set')
+  .action(async (accountId: string, opts: { probeKey?: string }) => {
+    try {
+      if (!/^\d+$/.test(accountId)) {
+        console.error('accountId must be a non-negative integer');
+        process.exit(1);
+      }
+      const client = await ApiClient.connect();
+      const info = await client.getPcaInfo(accountId, opts.probeKey);
+      console.log(`PCA ${info.accountId}:`);
+      console.log(`  admin:           ${info.admin}`);
+      console.log(`  balance:         ${info.balanceTrac} TRAC (${info.balance} wei)`);
+      console.log(`  initialDeposit:  ${info.initialDepositTrac} TRAC`);
+      console.log(`  lockEpochs:      ${info.lockEpochs}`);
+      console.log(`  conviction:      ${info.conviction}`);
+      console.log(`  discountBps:     ${info.discountBps} (${(info.discountBps / 100).toFixed(2)}% off base cost)`);
+      if (info.probedKey) {
+        console.log(`  probedKey:`);
+        console.log(`    key:        ${info.probedKey.key}`);
+        if (info.probedKey.error) {
+          console.log(`    error:      ${info.probedKey.error}`);
+        } else {
+          console.log(`    authorized: ${info.probedKey.authorized}`);
+        }
+      }
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
 
 const publisherCmd = program
   .command('publisher')

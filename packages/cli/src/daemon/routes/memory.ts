@@ -545,7 +545,7 @@ WHERE {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
-    const { selection, clearAfter, publishContextGraphId, subGraphName } =
+    const { selection, clearAfter, publishContextGraphId, subGraphName, publisherNodeIdentityIdOverride } =
       parsed;
     const contextGraphId = parsed.contextGraphId;
     if (!contextGraphId)
@@ -558,6 +558,16 @@ WHERE {
         error:
           '"subGraphName" and "publishContextGraphId" cannot be used together',
       });
+    }
+    let resolvedPublisherIdentityOverride: bigint | undefined;
+    if (publisherNodeIdentityIdOverride !== undefined && publisherNodeIdentityIdOverride !== null) {
+      const raw = String(publisherNodeIdentityIdOverride);
+      if (!/^\d+$/.test(raw)) {
+        return jsonResponse(res, 400, {
+          error: '"publisherNodeIdentityIdOverride" must be a non-negative integer (string or number)',
+        });
+      }
+      resolvedPublisherIdentityOverride = BigInt(raw);
     }
     const ctx = createOperationContext("publishFromSWM");
     tracker.start(ctx, {
@@ -584,6 +594,9 @@ WHERE {
           subGraphName,
           ...(resolvedPublishContextGraphId != null
             ? { contextGraphId: resolvedPublishContextGraphId }
+            : {}),
+          ...(resolvedPublisherIdentityOverride !== undefined
+            ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
             : {}),
         }),
       );

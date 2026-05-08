@@ -140,6 +140,7 @@ export class ApiClient {
   }>, options?: {
     accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
     allowedPeers?: string[];
+    publisherNodeIdentityIdOverride?: bigint;
   }): Promise<{
     kcId: string;
     status: 'tentative' | 'confirmed';
@@ -156,7 +157,9 @@ export class ApiClient {
       );
     }
     await this.sharedMemoryWrite(contextGraphId, quads);
-    return this.publishFromSharedMemory(contextGraphId, 'all', true);
+    return this.publishFromSharedMemory(contextGraphId, 'all', true, {
+      publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
+    });
   }
 
   /** Write quads to shared memory (formerly workspace). */
@@ -190,7 +193,7 @@ export class ApiClient {
     contextGraphId: string,
     selection: 'all' | { rootEntities: string[] } = 'all',
     clearAfter = true,
-    options?: { subGraphName?: string },
+    options?: { subGraphName?: string; publisherNodeIdentityIdOverride?: bigint },
   ): Promise<{
     kcId: string;
     status: 'tentative' | 'confirmed';
@@ -203,7 +206,60 @@ export class ApiClient {
       selection,
       clearAfter,
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+      ...(options?.publisherNodeIdentityIdOverride !== undefined
+        ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride.toString() }
+        : {}),
     });
+  }
+
+  // ─── Publishing Conviction Account (PCA) ────────────────────────────
+
+  async createPca(request: {
+    tokens: string;
+    lockEpochs: number;
+  }): Promise<{
+    accountId: string;
+    txHash: string;
+    blockNumber: number;
+    committedTokens: string;
+    lockEpochs: number;
+  }> {
+    return this.post('/api/pca', request);
+  }
+
+  async addPcaFunds(accountId: string, tokens: string): Promise<{
+    accountId: string;
+    addedTokens: string;
+    txHash: string;
+    blockNumber: number;
+  }> {
+    return this.post(`/api/pca/${encodeURIComponent(accountId)}/funds`, { tokens });
+  }
+
+  async authorizePcaKey(accountId: string, key: string): Promise<{
+    accountId: string;
+    key: string;
+    authorized: boolean;
+    txHash: string;
+    blockNumber: number;
+  }> {
+    return this.post(`/api/pca/${encodeURIComponent(accountId)}/authorize`, { key });
+  }
+
+  async getPcaInfo(accountId: string, probeKey?: string): Promise<{
+    accountId: string;
+    admin: string;
+    balance: string;
+    balanceTrac: string;
+    initialDeposit: string;
+    initialDepositTrac: string;
+    lockEpochs: number;
+    conviction: string;
+    discountBps: number;
+    probedKey?: { key: string; authorized: boolean; adapterSupported?: boolean; error?: string };
+  }> {
+    const qs = probeKey ? `?key=${encodeURIComponent(probeKey)}` : '';
+    return this.get(`/api/pca/${encodeURIComponent(accountId)}${qs}`);
   }
 
   /** @deprecated Use publishFromSharedMemory */

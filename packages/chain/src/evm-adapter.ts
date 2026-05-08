@@ -2353,6 +2353,30 @@ export class EVMChainAdapter implements ChainAdapter {
     };
   }
 
+  async addPCAAuthorizedKey(accountId: bigint, key: string): Promise<TxResult> {
+    await this.init();
+    if (!this.contracts.publishingConvictionAccount) {
+      throw new Error('PublishingConvictionAccount contract not deployed.');
+    }
+    if (!ethers.isAddress(key)) {
+      throw new Error(`addPCAAuthorizedKey: ${key} is not a valid EVM address`);
+    }
+    const tx = await this.contracts.publishingConvictionAccount.addAuthorizedKey(accountId, key);
+    const receipt = await tx.wait();
+    return {
+      hash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      success: receipt.status === 1,
+    };
+  }
+
+  async isPCAAuthorizedKey(accountId: bigint, key: string): Promise<boolean> {
+    await this.init();
+    if (!this.contracts.publishingConvictionAccount) return false;
+    if (!ethers.isAddress(key)) return false;
+    return await this.contracts.publishingConvictionAccount.authorizedKeys(accountId, key);
+  }
+
   async getConvictionAccountInfo(accountId: bigint): Promise<ConvictionAccountInfo | null> {
     await this.init();
     if (!this.contracts.publishingConvictionAccount) return null;

@@ -26,11 +26,36 @@ The repo already ships a Hardhat-based devnet. Re-using it.
 
 ```bash
 # from repo root
+pnpm run build:runtime:packages  # ensure dist/ is current with this branch
 ./scripts/devnet.sh clean        # wipe any prior state
 ./scripts/devnet.sh start 5      # 4 core + 1 edge (the "edge" is just
                                  # node5 with hostingNodes=[] later)
 ./scripts/devnet.sh status       # confirm 5 daemons + hardhat are up
 ```
+
+### Driving CLI commands per node
+
+The `dkg` CLI resolves its target daemon from `$DKG_HOME` (and reads the
+auth token from `<DKG_HOME>/auth.token`) plus `$DKG_API_PORT`. The
+`./scripts/devnet.sh start` command leaves each node's data dir under
+`.devnet/nodeN/` with both files in place, so a one-liner suffices:
+
+```bash
+# alias for "drive the CLI as node N"
+node1() { DKG_NO_BLUE_GREEN=1 DKG_HOME="$PWD/.devnet/node1" DKG_API_PORT=9201 \
+            node packages/cli/dist/cli.js "$@"; }
+node5() { DKG_NO_BLUE_GREEN=1 DKG_HOME="$PWD/.devnet/node5" DKG_API_PORT=9205 \
+            node packages/cli/dist/cli.js "$@"; }
+```
+
+`DKG_NO_BLUE_GREEN=1` bypasses the auto-update / installed-binary
+resolver so the CLI invocation runs against the local source build —
+required while this PR is on a feature branch (the npm-published `dkg`
+binary doesn't ship the new `pca` subcommand yet).
+
+A globally-installed `dkg` (`/Users/...nvm.../bin/dkg` or
+`~/.local/bin/dkg`) WILL work with this branch only after
+`pnpm install -g packages/cli` is rerun on top of `pnpm run build:runtime:packages`.
 
 Note on edge vs core: the daemons are identical binaries; what
 makes a daemon "edge" in the spec sense is having an empty
@@ -66,13 +91,21 @@ the holes from the daemon log + on-chain reads.
 
 ```bash
 # Fixture (one-time)
-NODE_DIR=.devnet/node1 ./scripts/dkg pca create --epochs 12 --tokens 100000
-NODE_DIR=.devnet/node1 ./scripts/dkg pca authorize <edge_publisher_address>
+node1 pca create --tokens 100000 --epochs 12
+# → records accountId (typically 1 on a fresh devnet); save for next step
+
+# Authorize node5's publisher EOA on the PCA. Read it from node5's
+# wallets.json (look for the publisher / submitter wallet, NOT the agent
+# identity — the wallet that calls msg.sender into KAv10):
+NODE5_PUBLISHER=$(jq -r '.adminWallet // .publisher // .wallet' .devnet/node5/wallets.json)
+node1 pca authorize 1 "$NODE5_PUBLISHER"
+node1 pca info 1 --probe-key "$NODE5_PUBLISHER"
+# → expect `probedKey.authorized: true`
 
 # Action
-NODE_DIR=.devnet/node5 ./scripts/dkg publish <cgId> \
+node5 publish <cgId> \
   --file experiments/agent-provenance-devnet/turns/turn-a.nq \
-  --publisher-node-identity-id <core1_id>
+  --publisher-node-identity-id 1     # core1's identityId on this devnet
 ```
 
 **Assertions** (capture into the transcript):
@@ -100,11 +133,18 @@ NODE_DIR=.devnet/node5 ./scripts/dkg publish <cgId> \
 
 ```bash
 # Fixture (one-time)
-NODE_DIR=.devnet/node2 ./scripts/dkg pca create --epochs 12 --tokens 200000
-NODE_DIR=.devnet/node2 ./scripts/dkg pca authorize <core2_publisher_address>
+node2 pca create --tokens 200000 --epochs 12
+NODE2_PUBLISHER=$(jq -r '.adminWallet // .publisher // .wallet' .devnet/node2/wallets.json)
+node2 pca authorize <accountId_from_create> "$NODE2_PUBLISHER"
+node2 pca info <accountId> --probe-key "$NODE2_PUBLISHER"
 
 # Action — end-user agent submits a signed turn to core 2's HTTP API,
 # core 2 forwards as the publisher.
+#
+# Mode (b) is intentionally NOT exposed via `dkg publish` because the
+# attestation has to come from the END USER's signing key, not the
+# core2 daemon. The OpenClaw channel route already accepts a
+# pre-signed `AuthorAttestation` payload.
 curl -s http://127.0.0.1:9202/api/openclaw-channel/persist-turn \
   -H "Authorization: Bearer $(cat .devnet/node2/auth.token)" \
   -H "Content-Type: application/json" \
@@ -125,9 +165,9 @@ and `end-user.agent` for `edge.agent`. Verifies §9.7 #6
 # Fixture: nothing — no PCA needed for this mode.
 
 # Action
-NODE_DIR=.devnet/node5 ./scripts/dkg publish <cgId> \
+node5 publish <cgId> \
   --file experiments/agent-provenance-devnet/turns/turn-c.nq \
-  --publisher-node-identity-id <core3_id>
+  --publisher-node-identity-id 3     # core3's identityId on this devnet
 ```
 
 **Assertions:** §9.7 #7 ("direct-spend with self-claimed
@@ -151,12 +191,35 @@ attribution"):
 # Fixture: none.
 
 # Action
-NODE_DIR=.devnet/node5 ./scripts/dkg publish <cgId> \
+node5 publish <cgId> \
   --file experiments/agent-provenance-devnet/turns/turn-d.nq \
   --publisher-node-identity-id 0
 ```
 
-**Assertions:** §9.7 #8:
+**KNOWN GOTCHA — implementation skips on-chain when identityId=0.**
+The current `DKGPublisher.publish` gates the on-chain step behind
+`this.publisherNodeIdentityId > 0n`, so passing `--publisher-node-identity-id 0`
+produces a *tentative* SWM publish — no `KnowledgeCollectionCreated`
+event is ever emitted. Verified empirically in this PR's smoke test:
+the daemon log emits `Identity not set (0) — skipping on-chain publish [WARN]`
+and `Stored as tentative`, and `client.publish()` returns `Status: tentative`.
+
+This is a **gap between the spec and the publisher** — RFC §4(d) says
+identityId=0 should still produce an on-chain author-attested publish
+("pays full TRAC from its own wallet; no core gets attribution"), but
+the publisher treats identityId=0 as "stay off-chain entirely." Two
+ways to surface mode (d) for the runbook today:
+
+1. **Pick a real `identityId` that doesn't have a PCA configured**
+   (e.g. node5's own identityId once edge identities are supported)
+   — that's mode (c) flavoured but the contract still records
+   non-zero attribution. Closest stand-in for (d).
+2. **Patch the publisher to allow `identityId == 0` on-chain publishes**
+   (small change in `DKGPublisher.publishCore`) — proper RFC-compliant
+   behavior. Track as a follow-up task.
+
+**Assertions** (when the gotcha is fixed; for now only #1 of the
+publisher-skip-tentative path is observable):
 
 - Edge wallet TRAC balance decremented by full fee.
 - No core's publishing-factor counter incremented.
@@ -174,11 +237,15 @@ NODE_DIR=.devnet/node5 ./scripts/dkg publish <cgId> \
 # Fixture: core 1 still has the PCA from mode (a). DON'T add the
 # new edge wallet to core 1's authorizedKeys.
 
-# Action — publish from a fresh edge wallet not on the allowlist.
-NODE_DIR=.devnet/node5 ./scripts/dkg publish <cgId> \
+# Action — publish from a fresh wallet not on the allowlist.
+# Use `dkg publisher wallet add <pk>` on node5 first to enroll a
+# fresh signing wallet, then drive `dkg publish`. Do NOT pass that
+# fresh wallet through `node1 pca authorize` — that would defeat
+# the purpose. Verify with `node1 pca info 1 --probe-key <addr>`
+# that `authorized: false` BEFORE the publish.
+node5 publish <cgId> \
   --file experiments/agent-provenance-devnet/turns/turn-fallthrough.nq \
-  --publisher-node-identity-id <core1_id> \
-  --publisher-key <fresh_edge_key>
+  --publisher-node-identity-id 1     # core1's identityId on this devnet
 ```
 
 **Assertions:**
@@ -187,6 +254,37 @@ NODE_DIR=.devnet/node5 ./scripts/dkg publish <cgId> \
 - Edge wallet TRAC balance decremented by full fee (no discount).
 - Core 1's publishing-factor counter still incremented (attribution
   preserved).
+
+## Quick smoke check (run this first)
+
+Before driving any of the four modes, confirm the new operator surface
+is wired up correctly. This three-step smoke test takes < 30s and
+validates the full pipeline (CLI → daemon → chain → event read-back):
+
+```bash
+# 1. Stand up a PCA on node1
+node1 pca create --tokens 100000 --epochs 12
+# → expect: accountId=1, tx hash, block number
+
+# 2. Authorize a random address and verify it's on chain
+TARGET=$(node -e "console.log(require('ethers').Wallet.createRandom().address)")
+node1 pca authorize 1 "$TARGET"
+node1 pca info 1 --probe-key "$TARGET"
+# → expect: probedKey.authorized: true, discountBps ~1428 (14.28%)
+
+# 3. Publish without attribution to confirm --publisher-node-identity-id
+#    threads through (this exercises the override-and-restore plumbing)
+echo '<urn:test:1> <https://schema.org/name> "smoke" .' > /tmp/smoke.nq
+node1 publish smoke-test --file /tmp/smoke.nq --publisher-node-identity-id 0
+# → expect: Status: tentative (NOT confirmed; daemon log shows "Identity
+#   not set (0) — skipping on-chain publish")
+node1 publish smoke-test --file /tmp/smoke.nq
+# → expect: Status: confirmed, valid kcId, valid txHash
+#   (the publisher's identity was restored after the override)
+```
+
+If steps 1-3 produce the expected output, the operator surface is
+working and you can proceed to the per-mode recipes below.
 
 ## Final §9.7 sweep
 

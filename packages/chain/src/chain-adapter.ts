@@ -568,6 +568,25 @@ export interface ChainAdapter {
   extendConvictionLock?(accountId: bigint, additionalEpochs: number): Promise<TxResult>;
   getConvictionDiscount?(accountId: bigint): Promise<{ discountBps: number; conviction: bigint }>;
   getConvictionAccountInfo?(accountId: bigint): Promise<ConvictionAccountInfo | null>;
+  /**
+   * Authorize an EOA to draw down on the PCA's discounted publishing
+   * allowance. Wraps `PublishingConvictionAccount.addAuthorizedKey(accountId, key)`,
+   * which the contract gates on `msg.sender == account.admin` — i.e. the
+   * caller MUST be the account admin (NFT owner).
+   *
+   * Mirrors the EvmAdapter ↔ MockChainAdapter parity contract: both
+   * implementations expose the same shape; the mock tracks
+   * authorization in-memory so unit tests can drive the
+   * authorized-key check without a live chain.
+   */
+  addPCAAuthorizedKey?(accountId: bigint, key: string): Promise<TxResult>;
+  /**
+   * Read-side mirror of `PublishingConvictionAccount.authorizedKeys[accountId][key]`.
+   * Returns `true` when `key` is currently authorized to draw on the PCA.
+   * Useful for runbook smoke-checks (the operator wants to confirm
+   * `pca authorize` actually landed on chain before driving a publish).
+   */
+  isPCAAuthorizedKey?(accountId: bigint, key: string): Promise<boolean>;
 
   // Permanent Publishing
   publishKnowledgeAssetsPermanent?(params: PermanentPublishParams): Promise<OnChainPublishResult>;

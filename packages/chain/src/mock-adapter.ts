@@ -558,7 +558,7 @@ export class MockChainAdapter implements ChainAdapter {
       initialDeposit: amount,
       lockEpochs,
       conviction,
-      authorizedKeys: new Set([this.signerAddress]),
+      authorizedKeys: new Set([this.signerAddress.toLowerCase()]),
     });
     this.pushEvent('ConvictionAccountCreated', { accountId: accountId.toString(), admin: this.signerAddress });
     return { ...this.txResult(true), accountId };
@@ -577,6 +577,20 @@ export class MockChainAdapter implements ChainAdapter {
     acct.lockEpochs += additionalEpochs;
     acct.conviction = acct.initialDeposit * BigInt(acct.lockEpochs);
     return this.txResult(true);
+  }
+
+  async addPCAAuthorizedKey(accountId: bigint, key: string): Promise<TxResult> {
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct) return this.txResult(false);
+    acct.authorizedKeys.add(key.toLowerCase());
+    this.pushEvent('AuthorizedKeyAdded', { accountId: accountId.toString(), key });
+    return this.txResult(true);
+  }
+
+  async isPCAAuthorizedKey(accountId: bigint, key: string): Promise<boolean> {
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct) return false;
+    return acct.authorizedKeys.has(key.toLowerCase());
   }
 
   async getConvictionDiscount(accountId: bigint): Promise<{ discountBps: number; conviction: bigint }> {

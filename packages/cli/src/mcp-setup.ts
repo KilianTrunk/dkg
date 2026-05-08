@@ -69,6 +69,7 @@ import { dirname, join } from 'node:path';
 import { homedir, platform, release as osRelease } from 'node:os';
 import { execSync } from 'node:child_process';
 import yaml from 'js-yaml';
+import TOML from '@iarna/toml';
 
 export interface McpSetupCliOptions {
   /** Refresh every detected client regardless of current registration state. */
@@ -751,6 +752,39 @@ function wslWindowsEnvPath(envVarName: string): string | null {
 }
 
 /**
+ * Build the Continue candidate, resolving the YAML-vs-JSON config
+ * format at detection time. Continue ships two config schemas:
+ *   - `~/.continue/config.yaml` (canonical from v0.11+; preferred)
+ *   - `~/.continue/config.json` (legacy)
+ *
+ * Resolution rule (matches Continue's own loader): if `.yaml` exists,
+ * use it. Else if `.json` exists, use it. If neither exists but the
+ * `~/.continue` directory does, default to `.yaml` (newer convention)
+ * so a fresh write produces the format Continue prefers going
+ * forward.
+ *
+ * `entryPath` is `mcpServers.dkg` per Continue's MCP block schema
+ * (verified against Continue v0.11+ docs at
+ * https://docs.continue.dev/customize/deep-dives/mcp, accessed
+ * 2026-05-08 via issue #437). Continue accepts the same canonical
+ * `mcpServers.<name>` shape under either YAML or JSON, so the same
+ * `entryPath` works regardless of file format.
+ */
+function continueClient(home: string): ClientTarget {
+  const dir = join(home, '.continue');
+  const yamlPath = join(dir, 'config.yaml');
+  const jsonPath = join(dir, 'config.json');
+  const useYaml = existsSync(yamlPath) || !existsSync(jsonPath);
+  return {
+    name: 'Continue',
+    configPath: useYaml ? yamlPath : jsonPath,
+    displayPath: useYaml ? '~/.continue/config.yaml' : '~/.continue/config.json',
+    format: useYaml ? 'yaml' : 'json',
+    entryPath: 'mcpServers.dkg',
+  };
+}
+
+/**
  * Exported for Codex Round-13 Fix 20 tests — direct unit testing
  * of WSL2 client-detection branch without going through the full
  * `mcpSetupAction` body. Production callers go via the action.
@@ -801,6 +835,20 @@ export function detectClients(): ClientTarget[] {
         // so no override needed.
       };
     })(),
+    {
+      // Codex CLI (OpenAI). Config: `~/.codex/config.toml`. Entry path:
+      // `[mcp_servers.<name>]` table — Codex CLI's canonical naming
+      // (note `mcp_servers`, snake-cased, distinct from the
+      // `mcpServers` JSON convention used by every other client).
+      // Verified against Codex CLI docs at
+      // https://github.com/openai/codex (issue #437, 2026-05-08).
+      name: 'Codex CLI',
+      configPath: join(home, '.codex', 'config.toml'),
+      displayPath: '~/.codex/config.toml',
+      format: 'toml',
+      entryPath: 'mcp_servers.dkg',
+    },
+    continueClient(home),
   ];
 
   // Codex Round-13 Fix 20: when running inside WSL2, ALSO probe the
@@ -862,6 +910,36 @@ export function detectClients(): ClientTarget[] {
         configPath: cursorWinPath,
         displayPath: cursorWinPath,
       });
+      // Issue #437: Codex CLI on Windows — %USERPROFILE%\.codex\config.toml.
+      // Same TOML shape + `mcp_servers.dkg` entryPath as the Linux
+      // candidate; just rooted under the WSL-resolved Windows
+      // userprofile so a WSL shell can register a Win-side Codex CLI
+      // install.
+      const codexWinPath = join(winUserProfile, '.codex', 'config.toml');
+      candidates.push({
+        name: 'Codex CLI (Windows-side via WSL)',
+        configPath: codexWinPath,
+        displayPath: codexWinPath,
+        format: 'toml',
+        entryPath: 'mcp_servers.dkg',
+      });
+      // Issue #437: Continue on Windows — %USERPROFILE%\.continue\config.{yaml,json}.
+      // Mirrors the Linux YAML-vs-JSON detection but rooted under
+      // the WSL-resolved Windows userprofile. We resolve the
+      // candidate fresh against the Win-side filesystem so the same
+      // "yaml-when-yaml-or-no-json, else json" rule applies to a
+      // Windows install accessed from WSL.
+      const continueWinDir = join(winUserProfile, '.continue');
+      const continueWinYaml = join(continueWinDir, 'config.yaml');
+      const continueWinJson = join(continueWinDir, 'config.json');
+      const useWinYaml = existsSync(continueWinYaml) || !existsSync(continueWinJson);
+      candidates.push({
+        name: 'Continue (Windows-side via WSL)',
+        configPath: useWinYaml ? continueWinYaml : continueWinJson,
+        displayPath: useWinYaml ? continueWinYaml : continueWinJson,
+        format: useWinYaml ? 'yaml' : 'json',
+        entryPath: 'mcpServers.dkg',
+      });
     }
   }
 
@@ -898,26 +976,37 @@ function readJson(path: string): Record<string, unknown> {
 
 /**
  * Read the parsed body of a per-client config, dispatching on
- * `target.format`. JSON is the default + only format wired today;
- * TOML / YAML branches throw `NotImplementedError`-style errors so
- * targets that declare them but ship pre-phase-5 trip cleanly at
- * registration time rather than silently writing garbage. Phase 5
- * (Codex CLI) wires the TOML branch; Continue (phase 4) wires YAML
- * if Continue's config-file detection lands on `.yaml`.
+ * `target.format`. JSON is the default + most-common format. TOML
+ * (Codex CLI) and YAML (Continue) branches use `@iarna/toml` and
+ * `js-yaml` respectively. Missing-file is normalised to `{}` for
+ * each format so first-write callers don't have to special-case
+ * detection-via-parent-dir candidates.
  */
 function readConfigBody(target: ClientTarget): Record<string, unknown> {
   const format = target.format ?? DEFAULT_FORMAT;
   switch (format) {
     case 'json':
       return readJson(target.configPath);
-    case 'toml':
-      throw new Error(
-        `TOML config format not yet implemented (target: ${target.name}). Land phase 5 first.`,
-      );
-    case 'yaml':
-      throw new Error(
-        `YAML config format not yet implemented (target: ${target.name}). Land phase 4 first.`,
-      );
+    case 'toml': {
+      if (!existsSync(target.configPath)) return {};
+      const content = readFileSync(target.configPath, 'utf-8');
+      return TOML.parse(content) as Record<string, unknown>;
+    }
+    case 'yaml': {
+      if (!existsSync(target.configPath)) return {};
+      const content = readFileSync(target.configPath, 'utf-8');
+      const parsed = yaml.load(content);
+      // js-yaml returns `null` / `undefined` for an empty doc; classify
+      // those as "no body yet" so the caller's
+      // `entryPath`-resolution still terminates cleanly.
+      if (parsed === null || parsed === undefined) return {};
+      if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(
+          `YAML config at ${target.configPath} parsed to a non-object (${typeof parsed}); expected a mapping`,
+        );
+      }
+      return parsed as Record<string, unknown>;
+    }
     default:
       throw new Error(`Unknown client config format: ${String(format)}`);
   }
@@ -925,9 +1014,24 @@ function readConfigBody(target: ClientTarget): Record<string, unknown> {
 
 /**
  * Serialize a parsed body to disk, dispatching on `target.format`.
- * Mirrors `readConfigBody`'s dispatch shape so phase 4/5 wiring is a
- * symmetric extension. JSON output keeps the pre-refactor formatting
- * (2-space indent, trailing newline) byte-for-byte.
+ * Mirrors `readConfigBody`'s dispatch shape. JSON output keeps the
+ * pre-refactor formatting (2-space indent, trailing newline)
+ * byte-for-byte. TOML uses `@iarna/toml`'s `stringify` (TOML 1.0
+ * canonical output). YAML uses `js-yaml.dump` with
+ * `lineWidth: -1, noRefs: true` to keep long URI/path values
+ * unwrapped and avoid YAML refs / anchors that are confusing for
+ * humans editing the file.
+ *
+ * Comment preservation: best-effort only. Both TOML and YAML
+ * serializers drop user comments on round-trip. Documented in the
+ * setup README — acceptable trade-off for a generated MCP-config
+ * block; users hand-curating sources should source-control them
+ * elsewhere.
+ *
+ * FIX 26 merge: format-agnostic. The merge in `writeRegistration`
+ * operates on the parsed body object before it reaches this writer,
+ * so the per-format spread/stringify path here never sees the merge
+ * logic.
  */
 function writeConfigBody(target: ClientTarget, body: Record<string, unknown>): void {
   const format = target.format ?? DEFAULT_FORMAT;
@@ -937,14 +1041,21 @@ function writeConfigBody(target: ClientTarget, body: Record<string, unknown>): v
     case 'json':
       writeFileSync(target.configPath, JSON.stringify(body, null, 2) + '\n');
       return;
-    case 'toml':
-      throw new Error(
-        `TOML config format not yet implemented (target: ${target.name}). Land phase 5 first.`,
-      );
-    case 'yaml':
-      throw new Error(
-        `YAML config format not yet implemented (target: ${target.name}). Land phase 4 first.`,
-      );
+    case 'toml': {
+      // `@iarna/toml`'s `stringify` accepts any JSON-shaped object
+      // whose values are TOML-representable (string / number / boolean
+      // / Date / array / table). The mcp-server entries we emit only
+      // use string + string-array + nested-string-table, so the cast
+      // through `JsonMap` is safe.
+      const serialised = TOML.stringify(body as TOML.JsonMap);
+      writeFileSync(target.configPath, serialised);
+      return;
+    }
+    case 'yaml': {
+      const serialised = yaml.dump(body, { lineWidth: -1, noRefs: true });
+      writeFileSync(target.configPath, serialised);
+      return;
+    }
     default:
       throw new Error(`Unknown client config format: ${String(format)}`);
   }

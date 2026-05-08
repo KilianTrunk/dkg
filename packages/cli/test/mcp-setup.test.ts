@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir, platform } from 'node:os';
 import { join } from 'node:path';
+import yaml from 'js-yaml';
+import TOML from '@iarna/toml';
 import { mcpSetupAction, type McpSetupActionDeps } from '../src/mcp-setup.js';
 
 /**
@@ -3001,5 +3003,226 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // And does NOT cite the bare-literal `~/.dkg/config.json` (the
     // pre-fix string).
     expect(logged).not.toMatch(/Would write ~\/\.dkg\/config\.json/);
+  });
+
+  // ── Issue #437: Codex CLI (TOML) auto-detect ─────────────────────────
+
+  it('issue #437: Codex CLI is detected at ~/.codex/config.toml; gets canonical entry written under [mcp_servers.dkg]', async () => {
+    // Pre-create the parent dir so detection fires (parent-dir
+    // existence is the universal detection signal).
+    const codexPath = join(tmpHome, '.codex', 'config.toml');
+    mkdirSync(join(codexPath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(codexPath)).toBe(true);
+    const written = TOML.parse(readFileSync(codexPath, 'utf-8'));
+    // Codex CLI's canonical key is `mcp_servers.<name>` (snake-case),
+    // not the JSON-world `mcpServers.<name>`. entryPath dispatch
+    // routes the entry to the right table.
+    expect((written as any).mcp_servers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    // And the canonical JSON-world key MUST NOT appear in TOML output
+    // — that would mean entryPath fell through to default.
+    expect((written as any).mcpServers).toBeUndefined();
+  });
+
+  it('issue #437: Codex CLI FIX 26 — refresh preserves user-added top-level keys (cwd) AND env keys', async () => {
+    // Mirror the Cursor FIX 26 test for the TOML format. Pin the
+    // contract: `command`, `args`, `env.DKG_HOME` are the ONLY
+    // fields this command owns; everything else passes through
+    // unchanged across formats.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    writeFileSync(
+      codexPath,
+      TOML.stringify({
+        mcp_servers: {
+          dkg: {
+            command: '/old/legacy/dkg',
+            args: ['legacy-arg'],
+            cwd: '/workspaces/my-project',
+            env: {
+              DKG_HOME: '/old/abandoned/path',
+              NODE_OPTIONS: '--inspect',
+              HTTPS_PROXY: 'http://corp:8080',
+            },
+          },
+        },
+      } as TOML.JsonMap),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = TOML.parse(readFileSync(codexPath, 'utf-8')) as any;
+    // Fields this command owns: refreshed.
+    expect(after.mcp_servers.dkg.command).toBe(process.execPath);
+    expect(after.mcp_servers.dkg.args[0]).toBe(realpathSync(process.argv[1]));
+    expect(after.mcp_servers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
+    expect(after.mcp_servers.dkg.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    // User-added top-level key + user-added env keys: PRESERVED.
+    expect(after.mcp_servers.dkg.cwd).toBe('/workspaces/my-project');
+    expect(after.mcp_servers.dkg.env.NODE_OPTIONS).toBe('--inspect');
+    expect(after.mcp_servers.dkg.env.HTTPS_PROXY).toBe('http://corp:8080');
+  });
+
+  it('issue #437: Codex CLI sibling [mcp_servers.<other>] tables preserved on merge', async () => {
+    // Real-world Codex CLI users often have other MCP servers
+    // already registered. The setup must merge — write `dkg`
+    // alongside without clobbering siblings, just like the
+    // canonical-JSON-shape clients do.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    writeFileSync(
+      codexPath,
+      TOML.stringify({
+        mcp_servers: {
+          'github-mcp': { command: 'gh-mcp', args: ['serve'] },
+        },
+      } as TOML.JsonMap),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = TOML.parse(readFileSync(codexPath, 'utf-8')) as any;
+    expect(after.mcp_servers['github-mcp']).toEqual({ command: 'gh-mcp', args: ['serve'] });
+    expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
+  // ── Issue #437: Continue (YAML / JSON) auto-detect ─────────────────
+
+  it('issue #437: Continue is detected at ~/.continue/config.yaml when YAML present; entry written under mcpServers.dkg', async () => {
+    const continueDir = join(tmpHome, '.continue');
+    mkdirSync(continueDir, { recursive: true });
+    const yamlPath = join(continueDir, 'config.yaml');
+    // Pre-create an empty-but-existing YAML file so format-detection
+    // picks YAML.
+    writeFileSync(yamlPath, '');
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(yamlPath)).toBe(true);
+    const written = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
+    expect(written.mcpServers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
+  it('issue #437: Continue YAML preferred when both config.yaml and config.json exist', async () => {
+    // Match Continue's own loader resolution: yaml wins.
+    const continueDir = join(tmpHome, '.continue');
+    mkdirSync(continueDir, { recursive: true });
+    const yamlPath = join(continueDir, 'config.yaml');
+    const jsonPath = join(continueDir, 'config.json');
+    writeFileSync(yamlPath, '');
+    writeFileSync(jsonPath, '{}\n');
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // Entry written to YAML, NOT JSON.
+    const writtenYaml = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
+    expect(writtenYaml.mcpServers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    // JSON file untouched (still empty object).
+    const writtenJson = JSON.parse(readFileSync(jsonPath, 'utf-8'));
+    expect(writtenJson.mcpServers).toBeUndefined();
+  });
+
+  it('issue #437: Continue JSON fallback — only config.json present, format detected as json', async () => {
+    const continueDir = join(tmpHome, '.continue');
+    mkdirSync(continueDir, { recursive: true });
+    const jsonPath = join(continueDir, 'config.json');
+    writeFileSync(jsonPath, '{}\n');
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // YAML sibling MUST NOT be created — fallback resolved to JSON.
+    expect(existsSync(join(continueDir, 'config.yaml'))).toBe(false);
+    const written = JSON.parse(readFileSync(jsonPath, 'utf-8'));
+    expect(written.mcpServers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
+  it('issue #437: Continue YAML FIX 26 — refresh preserves user-added top-level keys + env keys', async () => {
+    // Same FIX 26 contract as the Codex CLI / Cursor cases, but
+    // pinned for the YAML serializer path.
+    const continueDir = join(tmpHome, '.continue');
+    mkdirSync(continueDir, { recursive: true });
+    const yamlPath = join(continueDir, 'config.yaml');
+    writeFileSync(
+      yamlPath,
+      yaml.dump(
+        {
+          mcpServers: {
+            dkg: {
+              command: '/old/dkg',
+              args: ['old'],
+              cwd: '/workspaces/x',
+              env: {
+                DKG_HOME: '/old/path',
+                NODE_OPTIONS: '--inspect',
+              },
+              restartPolicy: 'always',
+            },
+          },
+        },
+        { lineWidth: -1, noRefs: true },
+      ),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
+    // Fields this command owns: refreshed.
+    expect(after.mcpServers.dkg.command).toBe(process.execPath);
+    expect(after.mcpServers.dkg.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    // User-added top-level + env keys: PRESERVED.
+    expect(after.mcpServers.dkg.cwd).toBe('/workspaces/x');
+    expect(after.mcpServers.dkg.restartPolicy).toBe('always');
+    expect(after.mcpServers.dkg.env.NODE_OPTIONS).toBe('--inspect');
+  });
+
+  // ── Issue #437: format-dispatch round-trip sanity ────────────────────
+
+  it('issue #437: TOML round-trip — write then read returns deep-equal object', async () => {
+    // Independent of detectClients / mcpSetupAction — pin that the
+    // TOML writer's output is parseable by the same TOML reader and
+    // produces the same shape. Guards against silent format drift
+    // if the lib bumps a major.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+
+    // Trigger a normal write through the action.
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const written = TOML.parse(readFileSync(codexPath, 'utf-8'));
+    // Re-stringify and re-parse — should be deep-equal.
+    const reSerialised = TOML.stringify(written as TOML.JsonMap);
+    const reParsed = TOML.parse(reSerialised);
+    expect(reParsed).toEqual(written);
+  });
+
+  it('issue #437: YAML round-trip — write then read returns deep-equal object', async () => {
+    // Same round-trip sanity as the TOML test, but for the YAML
+    // serializer path.
+    const continueDir = join(tmpHome, '.continue');
+    mkdirSync(continueDir, { recursive: true });
+    const yamlPath = join(continueDir, 'config.yaml');
+    // Touch so format-detection picks YAML.
+    writeFileSync(yamlPath, '');
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const written = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
+    const reSerialised = yaml.dump(written, { lineWidth: -1, noRefs: true });
+    const reParsed = yaml.load(reSerialised);
+    expect(reParsed).toEqual(written);
   });
 });

@@ -114,9 +114,10 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'invalidateRandomSamplingPair',
   'resolveAndAssignRandomSamplingPair',
   'isContractMissingRevert',
-  // KC views (Phase 1) — TS-private helpers; the four public methods
+  // KC views (Phase 1) — TS-private helpers; the five public methods
   // (getLatestMerkleRoot, getMerkleLeafCount, getLatestMerkleRootPublisher,
-  // getKCContextGraphId) ARE mirrored on MockChainAdapter.
+  // getLatestMerkleRootAuthor, getKCContextGraphId) ARE mirrored on
+  // MockChainAdapter.
   'requireKCStorage',
   'requireContextGraphStorage',
 ]);

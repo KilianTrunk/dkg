@@ -1639,4 +1639,55 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     res.end(bytes);
     return;
   }
+
+  // GET /api/kc/:id/author — chain-confirmed author for a knowledge
+  // collection's latest merkle-root entry.
+  //
+  // Delegates to `agent.getKnowledgeCollectionAuthor`, which reads
+  // `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId)` via the
+  // configured chain adapter. The view returns:
+  //   - the EIP-712-recovered (or EIP-1271-verified) author for V10.1+
+  //     publishes, or
+  //   - the zero address for un-attested writes (legacy V8 / V9 publishes
+  //     and the current V10.1 update path).
+  //
+  // We surface the zero-address case explicitly via `attested: false` so
+  // clients don't have to know the convention. Adapters that don't
+  // implement the view (no-chain mode, pre-V10.1 evm-adapter copies)
+  // return 503 — this is "feature requires V10.1 chain adapter," not a
+  // 404 about the kcId.
+  if (req.method === 'GET' && /^\/api\/kc\/[^/]+\/author$/.test(path)) {
+    const idStr = decodeURIComponent(path.split('/')[3] ?? '');
+    if (!/^\d+$/.test(idStr)) {
+      return jsonResponse(res, 400, {
+        error: 'Invalid kcId — must be a non-negative integer',
+      });
+    }
+    const kcId = BigInt(idStr);
+    try {
+      const author = await agent.getKnowledgeCollectionAuthor(kcId);
+      if (author === null) {
+        return jsonResponse(res, 503, {
+          error:
+            'Chain adapter does not expose getLatestMerkleRootAuthor — ' +
+            'V10.1 author attestation is not available on this deployment',
+        });
+      }
+      const ZERO = '0x0000000000000000000000000000000000000000';
+      const attested = author.toLowerCase() !== ZERO;
+      return jsonResponse(res, 200, {
+        kcId: idStr,
+        author: attested ? author : null,
+        attested,
+      });
+    } catch (err: any) {
+      // KCS reverts on unknown kcId; map to 404 so callers can branch
+      // on "not published yet" vs "no attestation."
+      const msg = err?.message ?? String(err);
+      if (/unknown kcId|nonexistent|out-of-bounds/i.test(msg)) {
+        return jsonResponse(res, 404, { error: `Unknown kcId ${idStr}` });
+      }
+      throw err;
+    }
+  }
 }

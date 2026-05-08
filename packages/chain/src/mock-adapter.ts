@@ -68,6 +68,14 @@ export class MockChainAdapter implements ChainAdapter {
     merkleLeafCount: number;
     /** Publisher EOA from `createKnowledgeAssetsV10`; default to mock signer for V8 paths. */
     publisherAddress: string;
+    /**
+     * Verified author identity from the V10.1 author attestation, mirrored
+     * from the EIP-712 EOA-recovered (or EIP-1271-verified) address. Empty
+     * string for legacy V8 / V9 publishes that pre-date author attestation
+     * — `getLatestMerkleRootAuthor` returns the zero address in that case
+     * to match on-chain behaviour for un-attested writes.
+     */
+    authorAddress: string;
     /** On-chain context graph id (0n when the mock V8 path didn't carry one). */
     cgId: bigint;
   }>();
@@ -449,6 +457,8 @@ export class MockChainAdapter implements ChainAdapter {
       kaCount: params.knowledgeAssetsCount,
       merkleLeafCount: 0,
       publisherAddress: this.signerAddress,
+      // Legacy V8 path — no attestation, mirror the on-chain `address(0)`.
+      authorAddress: ethers.ZeroAddress,
       cgId: 0n,
     });
 
@@ -1016,6 +1026,7 @@ export class MockChainAdapter implements ChainAdapter {
       kaCount: params.knowledgeAssetsAmount,
       merkleLeafCount: params.merkleLeafCount,
       publisherAddress,
+      authorAddress: ethers.getAddress(params.author.address),
       cgId: params.contextGraphId,
     });
     // Also store in batches so verify() can find this publish
@@ -1209,6 +1220,10 @@ export class MockChainAdapter implements ChainAdapter {
       kaCount: input.chunks.length,
       merkleLeafCount: input.merkleLeafCount ?? input.chunks.length,
       publisherAddress: input.publisherAddress ?? this.signerAddress,
+      // `__registerKC` is a Random-Sampling test bridge that bypasses the
+      // V10 publish path entirely; no attestation is signed, so mirror
+      // the on-chain `address(0)` semantics for un-attested writes.
+      authorAddress: ethers.ZeroAddress,
       cgId: input.contextGraphId,
     });
   }
@@ -1383,6 +1398,12 @@ export class MockChainAdapter implements ChainAdapter {
     const entry = this.collections.get(kcId);
     if (!entry) throw new Error(`Mock: unknown kcId ${kcId}`);
     return entry.publisherAddress;
+  }
+
+  async getLatestMerkleRootAuthor(kcId: bigint): Promise<string> {
+    const entry = this.collections.get(kcId);
+    if (!entry) throw new Error(`Mock: unknown kcId ${kcId}`);
+    return entry.authorAddress;
   }
 
   async getKCContextGraphId(kcId: bigint): Promise<bigint> {

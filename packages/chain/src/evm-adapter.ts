@@ -3076,6 +3076,13 @@ export class EVMChainAdapter implements ChainAdapter {
     return publisher;
   }
 
+  async getLatestMerkleRootAuthor(kcId: bigint): Promise<string> {
+    await this.init();
+    const kcs = this.requireKCStorage();
+    const author: string = await kcs.getLatestMerkleRootAuthor(kcId);
+    return author;
+  }
+
   async getKCContextGraphId(kcId: bigint): Promise<bigint> {
     await this.init();
     const cgs = this.requireContextGraphStorage();

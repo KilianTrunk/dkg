@@ -3042,6 +3042,30 @@ export class DKGAgent {
     return false;
   }
 
+  /**
+   * Chain-confirmed verified author identity for a knowledge collection's
+   * latest merkle-root entry. Reads
+   * `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId)` via the
+   * configured chain adapter.
+   *
+   * Returns:
+   *   - the address recovered from the EIP-712 author attestation (EOA
+   *     publish path), or
+   *   - the smart-contract author address verified via EIP-1271 for
+   *     contract-based author identities, or
+   *   - `address(0)` for legacy V8 / V9 publishes and current V10.1
+   *     update-path mutations (which don't sign).
+   *
+   * Returns `null` when the chain adapter doesn't expose the view (no-chain
+   * mode or pre-V10.1 evm-adapter copies). Callers that need to distinguish
+   * "no attestation on file" from "feature unavailable" should use this
+   * `null` signal — `address(0)` always means the former.
+   */
+  async getKnowledgeCollectionAuthor(kcId: bigint): Promise<string | null> {
+    if (typeof this.chain.getLatestMerkleRootAuthor !== 'function') return null;
+    return this.chain.getLatestMerkleRootAuthor(kcId);
+  }
+
   // ---------------------------------------------------------------------------
 
   async sendChat(recipientPeerId: string, text: string): Promise<{ delivered: boolean; error?: string }> {

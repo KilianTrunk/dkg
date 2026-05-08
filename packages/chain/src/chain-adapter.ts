@@ -854,6 +854,24 @@ export interface ChainAdapter {
   getLatestMerkleRootPublisher?(kcId: bigint): Promise<string>;
 
   /**
+   * Verified author identity for the latest merkle-root entry of `kcId`.
+   * Sourced from `KnowledgeCollectionStorage.getLatestMerkleRootAuthor`,
+   * which returns:
+   *   - the address recovered from the EIP-712 author attestation (EOA
+   *     publish), or
+   *   - the smart-contract author address verified via EIP-1271
+   *     `isValidSignature`, or
+   *   - `address(0)` when the latest state change was a legacy V8 / V9
+   *     publish or a V10.1 update (current update path doesn't sign).
+   *
+   * Daemon `/api/kc/:id/author` returns the result of this view directly
+   * — chain truth, no SPARQL. Optional so non-V10 / no-chain adapters
+   * can omit the surface; callers MUST treat `address(0)` as
+   * "no attestation on file" rather than as a valid author claim.
+   */
+  getLatestMerkleRootAuthor?(kcId: bigint): Promise<string>;
+
+  /**
    * Context graph id that hosts `kcId`, sourced from
    * `ContextGraphStorage.kcToContextGraph[kcId]`. The on-chain
    * `Challenge` struct intentionally omits cgId (V8 wire compat — see

@@ -49,7 +49,7 @@ const SUB = 'bike-line';
 // with the second devnet node's real libp2p peerId when one is reachable
 // (so the access-handler grant actually corresponds to a real peer and
 // Phase 7's cross-node verification can distinguish grantee vs not).
-const SYNTHETIC_PEER = 'urn:peerId:kit-researcher-demo';
+const SYNTHETIC_PEER = 'urn:peerId:research-lab-demo';
 let ALLOWED_PEER = SYNTHETIC_PEER;
 const peerIsSynthetic = () => ALLOWED_PEER === SYNTHETIC_PEER;
 const POLL_INTERVAL_MS = 1000;
@@ -1522,7 +1522,7 @@ async function phase6() {
     '--allowed-peer', ALLOWED_PEER,
   ]);
   const syntheticWarning = peerIsSynthetic()
-    ? '\n\nNOTE: no second devnet node was detected, so `--allowed-peer` is a placeholder string (`urn:peerId:kit-researcher-demo`) that no real libp2p peer can match. The grant is still written durably so the WRITE side of the model is exercised, but no peer can satisfy the READ side. Run with a second node (e.g. `./scripts/devnet.sh start 2`) to bind the grant to a real peerId.'
+    ? '\n\nNOTE: no second devnet node was detected, so `--allowed-peer` is a placeholder string (`urn:peerId:research-lab-demo`) that no real libp2p peer can match. The grant is still written durably so the WRITE side of the model is exercised, but no peer can satisfy the READ side. Run with a second node (e.g. `./scripts/devnet.sh start 2`) to bind the grant to a real peerId.'
     : '';
   emit('phase-6-allowlist-capture', 'Capture with allowList grant', r, {
     preamble:
@@ -1904,14 +1904,14 @@ async function phase7(trace) {
       process.stdout.write(`${JSON.stringify({ step: 'phase-7b-private-empty-on-node2', privCount, privBaseline, privDelta, queryOk: privQueryOk, ok: privateInvisible })}\n`);
     }
 
-    // 7.C — Document the missing piece. The KIT-positive case ("granted
+    // 7.C — Document the missing piece. The Lab-positive case ("granted
     // peer can read the full payload via the access protocol") would
     // require the libp2p access-protocol fetch (publisher/access-client.ts)
     // which is not yet exposed via CLI. Honest call-out.
     if (!JSON_MODE) {
-      fmt.step('phase-7c-grant-protocol-note', 'KIT (allowList) — grant durability proven; access-protocol fetch not yet CLI-exposed');
+      fmt.step('phase-7c-grant-protocol-note', 'Lab (allowList) — grant durability proven; access-protocol fetch not yet CLI-exposed');
       fmt.preamble(
-        `The Phase 6 grant is durably written to <cg>/_meta with peerId=${ALLOWED_PEER.slice(0, 12)}… (verified via Phase 6.2 SPARQL). At read time, the access-handler (packages/publisher/src/access-handler.ts:98-110) checks fromPeerId against meta.allowedPeers and signs/serves the private payload via libp2p PROTOCOL_ACCESS. The client side is in packages/publisher/src/access-client.ts — but this protocol is not yet wired to a CLI subcommand or HTTP route. Exercising "KIT can read full payload" end-to-end requires either a small CLI hook for AccessClient.requestAccess() or running the access protocol from a test harness.`,
+        `The Phase 6 grant is durably written to <cg>/_meta with peerId=${ALLOWED_PEER.slice(0, 12)}… (verified via Phase 6.2 SPARQL). At read time, the access-handler (packages/publisher/src/access-handler.ts:98-110) checks fromPeerId against meta.allowedPeers and signs/serves the private payload via libp2p PROTOCOL_ACCESS. The client side is in packages/publisher/src/access-client.ts — but this protocol is not yet wired to a CLI subcommand or HTTP route. Exercising "the granted lab can read full payload" end-to-end requires either a small CLI hook for AccessClient.requestAccess() or running the access protocol from a test harness.`,
       );
       fmt.note('  (gap noted — receiver-side fetch not yet CLI-exposed; tracked in #409)');
       await pauseAfter();
@@ -1929,22 +1929,22 @@ async function phase7(trace) {
   const ownerOk = phase3bOwnerOk || phase4bOwnerOk;
   const grantDurable = phase6GrantOk;
 
-  // KIT's verified state mirrors the human-readable table:
+  // Lab's verified state mirrors the human-readable table:
   //   - 'partial'  if the grant triple was observed AND it binds to a real peer
   //                (write side verified, read side not exercised)
   //   - false      if the grant triple was not observed OR the peer is the
   //                synthetic placeholder (no real libp2p peer can satisfy it)
-  let kitVerified;
-  let kitNote;
+  let labVerified;
+  let labNote;
   if (!grantDurable) {
-    kitVerified = false;
-    kitNote = 'grant triple not observed in <cg>/_meta — capture may not have finalized';
+    labVerified = false;
+    labNote = 'grant triple not observed in <cg>/_meta — capture may not have finalized';
   } else if (peerIsSynthetic()) {
-    kitVerified = false;
-    kitNote = 'grant durable but bound to synthetic placeholder peerId — no real peer can satisfy';
+    labVerified = false;
+    labNote = 'grant durable but bound to synthetic placeholder peerId — no real peer can satisfy';
   } else {
-    kitVerified = 'partial';
-    kitNote = 'grant durable; access-protocol fetch not exercised';
+    labVerified = 'partial';
+    labNote = 'grant durable; access-protocol fetch not exercised';
   }
 
   // Competitor is an ACTIVE adversary — they would call PROTOCOL_ACCESS
@@ -2017,7 +2017,7 @@ async function phase7(trace) {
         visibility: [
           subscriberRow,
           { persona: 'Acme (owner)', public_partition: 'anchor', private_partition: 'full payload', verified: ownerOk },
-          { persona: 'KIT (allowList)', public_partition: 'anchor', private_partition: 'full payload (allowed events)', verified: kitVerified, note: kitNote },
+          { persona: 'Lab (allowList)', public_partition: 'anchor', private_partition: 'full payload (allowed events)', verified: labVerified, note: labNote },
           competitorRow,
         ],
       })}\n`,
@@ -2046,7 +2046,7 @@ async function phase7(trace) {
       'Private partition': `Full payload ${tag(ownerOk)}`,
     },
     {
-      Persona: 'KIT (allowList)',
+      Persona: 'Lab (allowList)',
       'Public partition': `Anchor ${tag(anchorOk)}`,
       // The private cell tops out at "~" (grant durable, fetch not
       // exercised) when the grant is bound to a real peer. With the

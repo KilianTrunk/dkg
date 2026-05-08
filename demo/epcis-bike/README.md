@@ -6,7 +6,7 @@ A practical, end-to-end walkthrough of the v10-rc EPCIS plugin against synthesiz
 
 **Acme Bikes** is a fictional bicycle manufacturer used here to keep the demo grounded in something readable while staying free of any partner data. Their **Assembly Line W18** produces road bikes. Each bicycle passes through 7 stations (frame welding, painting, wheel assembly, drivetrain, paint inspection, functional test, packing) before shipping. Every station emits a structured event — which item, where, when, status — that maps directly to the GS1 **EPCIS 2.0** supply-chain standard.
 
-This demo follows **one bicycle** (`trace_id 7c4f8d2a-9e3b-4a6d-b517-8f9e0a1b2c3d`, item `BIKE-2026-W18-0001`) through the line. It captures every station event with the v10-rc EPCIS plugin, queries the data back, and shows what each party (Acme owner, KIT researcher, external auditor, competitor) can see at each step.
+This demo follows **one bicycle** (`trace_id 7c4f8d2a-9e3b-4a6d-b517-8f9e0a1b2c3d`, item `BIKE-2026-W18-0001`) through the line. It captures every station event with the v10-rc EPCIS plugin, queries the data back, and shows what each party (Acme owner, granted research lab, external auditor, competitor) can see at each step.
 
 The privacy story is the central beat: by default, EPCIS captures publish a **public anchor** (proves the event happened) plus a **private payload** (full event body, locally readable, optionally granted to specific peers via allowList). The demo demonstrates this contrast on synthesized data that's safe to commit and replay in any environment.
 

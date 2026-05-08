@@ -7,7 +7,7 @@ export const OPENING = {
   title: 'EPCIS-on-DKG — Acme Bikes Assembly Line W18',
   body: [
     'Acme Bikes (a fictional manufacturer used here for illustration) makes road bikes. On their Assembly Line W18, each bicycle passes through 7 stations — frame welding, painting, wheel assembly, drivetrain installation, paint inspection, functional test, packing — before shipping. Every station emits a structured event (which item, where, when, status). That data is GS1 EPCIS 2.0.',
-    'Acme wants to record those events on shared infrastructure: regulators get proof events happened, partners (e.g. KIT) get controlled access to operational detail, competitors see nothing, Acme keeps the canonical record.',
+    'Acme wants to record those events on shared infrastructure: regulators get proof events happened, partners (e.g. a research lab) get controlled access to operational detail, competitors see nothing, Acme keeps the canonical record.',
     'EPCIS-on-DKG splits each capture into a public anchor (proof of existence) and a private payload (full event body, owner-readable, optionally granted via allowList). This demo follows ONE bicycle through Assembly Line W18 — 7 synthesized events from May-12-2026 — and shows what each party can see at every step.',
   ],
 };
@@ -98,9 +98,9 @@ export const PHASE_INTROS = {
     ],
   },
   6: {
-    title: 'Phase 6 — AllowList grant (KIT researcher)',
+    title: 'Phase 6 — AllowList grant (research lab)',
     body: [
-      'Capture one synthetic "batch summary" event with `--access-policy allowList --allowed-peer <peerId>`. The access handler matches the grant against the caller\'s **bare libp2p peer ID** (e.g. `12D3KooW...`), so production grants must use that form — `run.mjs` looks up node2\'s real peer ID via `/api/identity` at startup and threads it into `ALLOWED_PEER` for that purpose. The `urn:peerId:kit-researcher-demo` value is a synthetic placeholder used ONLY when no second node is reachable (so the demo can exercise the write side without crashing); a real libp2p node would never authorize against it. After lift, the grant is durably stored as `<kc> dkg:allowedPeer "<peerId>"` triples in `<cg>/_meta` (verifiable in `packages/publisher/src/metadata.ts:82-106`). From a second node with the granted peer ID, the EPCIS read path returns the full payload. Cross-node verification needs that second node — out of scope here.',
+      'Capture one synthetic "batch summary" event with `--access-policy allowList --allowed-peer <peerId>`. The access handler matches the grant against the caller\'s **bare libp2p peer ID** (e.g. `12D3KooW...`), so production grants must use that form — `run.mjs` looks up node2\'s real peer ID via `/api/identity` at startup and threads it into `ALLOWED_PEER` for that purpose. The `urn:peerId:research-lab-demo` value is a synthetic placeholder used ONLY when no second node is reachable (so the demo can exercise the write side without crashing); a real libp2p node would never authorize against it. After lift, the grant is durably stored as `<kc> dkg:allowedPeer "<peerId>"` triples in `<cg>/_meta` (verifiable in `packages/publisher/src/metadata.ts:82-106`). From a second node with the granted peer ID, the EPCIS read path returns the full payload. Cross-node verification needs that second node — out of scope here.',
     ],
   },
   7: {

@@ -1,9 +1,9 @@
 /**
- * SHARE / SWM 512 KB gossip-size boundary, exercised from the agent layer.
+ * SHARE / SWM 10 MB gossip-size boundary, exercised from the agent layer.
  *
  * Audit findings covered:
  *   A-2 (CRITICAL) — `DKGPublisher#_shareImpl` rejects encoded SWM messages
- *        larger than `MAX_GOSSIP_MESSAGE_SIZE = 512 * 1024`. The agent's
+ *        larger than the DKG gossip payload cap. The agent's
  *        `DKGAgent#share` is the only user-facing entry point. We pin:
  *          1. Positive: a payload whose encoded size is safely below the
  *             limit succeeds and produces a shareOperationId + SWM quads
@@ -13,7 +13,7 @@
  *             split-into-smaller-share() batches.
  *          3. Boundary: callers that hit the limit see a *clear* error, not
  *             a silent libp2p-level drop. Error message contains both the
- *             observed KB and the 512 KB limit so operators can react.
+ *             observed KB and the 10 MB limit so operators can react.
  *
  * No mocks — real `DKGAgent` + real libp2p + real chain (only used to boot
  * the agent; share() never submits a tx).
@@ -21,6 +21,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ethers } from 'ethers';
 import { DKGAgent } from '../src/index.js';
+import { DKG_GOSSIP_MAX_MESSAGE_BYTES } from '@origintrail-official/dkg-core';
 import {
   HARDHAT_KEYS,
   createEVMAdapter,
@@ -65,12 +66,12 @@ afterAll(async () => {
   await revertSnapshot(_fileSnapshot);
 });
 
-describe('A-2: SHARE 512 KB gossip-size boundary', () => {
-  it('share() with a payload well BELOW 512 KB succeeds and lands in SWM', async () => {
+describe('A-2: SHARE 10 MB gossip-size boundary', () => {
+  it('share() with a payload well below 10 MB succeeds and lands in SWM', async () => {
     const cgId = freshCgId('bnd-lo');
     await nodeA!.createContextGraph({ id: cgId, name: 'Boundary Lo', description: '' });
 
-    // Target ~100 KB of literal payload — well under the 512 KB cap.
+    // Target ~100 KB of literal payload — well under the 10 MB cap.
     // Split across multiple literals to mimic realistic agent output.
     const chunkCount = 10;
     const chunkLen = 10 * 1024; // 10 KB per chunk
@@ -96,13 +97,12 @@ describe('A-2: SHARE 512 KB gossip-size boundary', () => {
     }
   });
 
-  it('share() with a payload WELL ABOVE 512 KB is rejected with the expected error message', async () => {
+  it('share() with a payload well above 10 MB is rejected with the expected error message', async () => {
     const cgId = freshCgId('bnd-hi');
     await nodeA!.createContextGraph({ id: cgId, name: 'Boundary Hi', description: '' });
 
-    // One literal of ~700 KB — guaranteed to push the encoded message
-    // past the 512 KB gossip-size cap even after protobuf framing.
-    const big = 'y'.repeat(700 * 1024);
+    // One literal above the 10 MB cap is guaranteed to trip the pre-mutation guard.
+    const big = 'y'.repeat(DKG_GOSSIP_MAX_MESSAGE_BYTES + 1024 * 1024);
     const quads = [
       {
         subject: 'urn:swm:hi:alice',
@@ -118,10 +118,10 @@ describe('A-2: SHARE 512 KB gossip-size boundary', () => {
     } catch (e) {
       caught = e as Error;
     }
-    expect(caught, 'share() should reject a 700 KB payload with a size-limit error').not.toBeNull();
-    // Spec text from dkg-publisher.ts: "SWM message too large (<KB> KB, limit 512 KB)."
+    expect(caught, 'share() should reject an oversized payload with a size-limit error').not.toBeNull();
+    // Spec text from dkg-publisher.ts: "SWM message too large (<KB> KB, limit 10 MB)."
     expect(caught!.message).toMatch(/SWM message too large/);
-    expect(caught!.message).toMatch(/limit\s+512\s*KB/);
+    expect(caught!.message).toMatch(/limit\s+10\s*MB/);
     // Operator-actionable guidance: split into multiple share() calls.
     expect(caught!.message.toLowerCase()).toMatch(/split|multiple share/);
   });
@@ -130,7 +130,7 @@ describe('A-2: SHARE 512 KB gossip-size boundary', () => {
     const cgId = freshCgId('bnd-atomic');
     await nodeA!.createContextGraph({ id: cgId, name: 'Boundary Atomic', description: '' });
 
-    const big = 'z'.repeat(600 * 1024);
+    const big = 'z'.repeat(DKG_GOSSIP_MAX_MESSAGE_BYTES + 1024 * 1024);
     const quads = [
       {
         subject: 'urn:swm:atomic:bob',

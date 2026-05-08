@@ -16,6 +16,12 @@ export const PROTOCOL_STORAGE_ACK = '/dkg/10.0.0/storage-ack';
 
 export const DHT_PROTOCOL = '/dkg/kad/1.0.0';
 
+/** Maximum application payload size allowed for one DKG GossipSub message (10 MB). */
+export const DKG_GOSSIP_MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
+
+/** Allows GossipSub RPC framing around one max-sized application payload. */
+export const DKG_GOSSIP_MAX_RPC_BYTES = DKG_GOSSIP_MAX_MESSAGE_BYTES + 256 * 1024;
+
 // ── V10 GossipSub Topics ───────────────────────────────────────────────
 
 export function contextGraphSharedMemoryTopic(contextGraphId: string): string {

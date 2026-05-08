@@ -2871,6 +2871,39 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     }
   });
 
+  it('issue #443 local review: WSL Windows-side probing skips Codex until a Windows-compatible command wrapper exists', async () => {
+    // The Windows-side GUI clients can be registered from WSL because
+    // they run Windows apps reading Windows config files, but Codex CLI
+    // would later spawn whatever command we persist. From WSL, the
+    // canonical command/args are Linux paths, so writing them into
+    // %USERPROFILE%\.codex\config.toml would break Windows Codex.
+    if (platform() !== 'linux') return;
+    saveWslEnv();
+    process.env.WSL_DISTRO_NAME = 'TestDistro';
+    try {
+      const winUserProfile = join(tmpHome, 'win-user');
+      const winAppData = join(tmpHome, 'win-appdata', 'Roaming');
+      mkdirSync(join(winUserProfile, '.cursor'), { recursive: true });
+      mkdirSync(join(winUserProfile, '.codex'), { recursive: true });
+
+      const { detectClients } = await import('../src/mcp-setup.js');
+      const detected = detectClients((envVarName) => {
+        if (envVarName === 'USERPROFILE') return winUserProfile;
+        if (envVarName === 'APPDATA') return winAppData;
+        return null;
+      });
+
+      expect(
+        detected.some((c) => c.name === 'Cursor (Windows-side via WSL)'),
+      ).toBe(true);
+      expect(
+        detected.some((c) => c.name === 'Codex CLI (Windows-side via WSL)'),
+      ).toBe(false);
+    } finally {
+      restoreWslEnv();
+    }
+  });
+
   // ── Codex Round-19 Fix 26: writeRegistration merges full entry ──
 
   it('Codex Round-19 Fix 26: refresh preserves top-level user keys (cwd) AND env keys; updates command/args/env.DKG_HOME', async () => {

@@ -761,8 +761,13 @@ function wslWindowsEnvPath(envVarName: string): string | null {
  * Exported for Codex Round-13 Fix 20 tests — direct unit testing
  * of WSL2 client-detection branch without going through the full
  * `mcpSetupAction` body. Production callers go via the action.
+ * The resolver arg is test-only so WSL Windows path discovery can
+ * be exercised without real cmd.exe / wslpath binaries.
  */
-export function detectClients(): ClientTarget[] {
+export function detectClients(
+  resolveWslWindowsEnvPath: (envVarName: string) => string | null =
+    wslWindowsEnvPath,
+): ClientTarget[] {
   const home = homedir();
   const claudeDesktop = claudeDesktopPaths(home);
   const vscodeMcp = vscodeMcpPaths(home);
@@ -830,8 +835,8 @@ export function detectClients(): ClientTarget[] {
   // native Linux GUI clients too); the new entries are additive
   // with disambiguated names so the operator-facing log is clear.
   if (isWSL()) {
-    const winUserProfile = wslWindowsEnvPath('USERPROFILE');
-    const winAppData = wslWindowsEnvPath('APPDATA');
+    const winUserProfile = resolveWslWindowsEnvPath('USERPROFILE');
+    const winAppData = resolveWslWindowsEnvPath('APPDATA');
     if (winAppData) {
       // Claude Desktop on Windows: %APPDATA%\Claude\claude_desktop_config.json.
       const claudeWinPath = join(winAppData, 'Claude', 'claude_desktop_config.json');
@@ -882,19 +887,12 @@ export function detectClients(): ClientTarget[] {
         configPath: cursorWinPath,
         displayPath: cursorWinPath,
       });
-      // Issue #437: Codex CLI on Windows — %USERPROFILE%\.codex\config.toml.
-      // Same TOML shape + `mcp_servers.dkg` entryPath as the Linux
-      // candidate; just rooted under the WSL-resolved Windows
-      // userprofile so a WSL shell can register a Win-side Codex CLI
-      // install.
-      const codexWinPath = join(winUserProfile, '.codex', 'config.toml');
-      candidates.push({
-        name: 'Codex CLI (Windows-side via WSL)',
-        configPath: codexWinPath,
-        displayPath: codexWinPath,
-        format: 'toml',
-        entryPath: 'mcp_servers.dkg',
-      });
+      // PR #443 local review: do not register Windows-side Codex
+      // from a WSL process yet. The canonical entry is computed from
+      // the current Linux/WSL Node + CLI paths; writing that into
+      // %USERPROFILE%\.codex\config.toml would leave Windows Codex
+      // unable to spawn the MCP server. Add this only once we emit a
+      // Windows-compatible wrapper command, e.g. via wsl.exe.
     }
   }
 

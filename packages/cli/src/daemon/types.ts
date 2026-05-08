@@ -7,7 +7,21 @@
 
 import type { CatchupJobResult } from '../catchup-runner.js';
 
-export type CatchupJobState = "queued" | "running" | "done" | "failed" | "denied";
+export type CatchupJobState =
+  | "queued"
+  | "running"
+  | "done"
+  | "failed"
+  | "denied"
+  /**
+   * Catchup completed but no peer could deliver the CG content within
+   * the run — every per-peer sync round either failed or returned
+   * nothing while no responder explicitly denied access. Distinct from
+   * `denied` (curator refused) and `failed` (the worker itself threw)
+   * so the UI can render targeted copy + a "send signed join request"
+   * CTA without misclassifying slow public CGs as denied.
+   */
+  | "unreachable";
 
 export interface CatchupJob {
   jobId: string;

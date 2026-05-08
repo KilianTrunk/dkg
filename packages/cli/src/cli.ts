@@ -61,12 +61,12 @@ import { registerIntegrationCommands } from './integrations/commands.js';
 type ActionOpts = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 
 const STARTUP_BANNER = `
-\x1b[36m██████╗ ██╗  ██╗ ██████╗     ██╗   ██╗ █████╗ 
-██╔══██╗██║ ██╔╝██╔════╝     ██║   ██║██╔══██╗
-██║  ██║█████╔╝ ██║  ███╗    ██║   ██║╚██████║
-██║  ██║██╔═██╗ ██║   ██║    ╚██╗ ██╔╝ ╚═══██║
-██████╔╝██║  ██╗╚██████╔╝     ╚████╔╝  █████╔╝
-╚═════╝ ╚═╝  ╚═╝ ╚═════╝       ╚═══╝   ╚════╝\x1b[0m
+\x1b[36m██████╗ ██╗  ██╗ ██████╗     ██╗   ██╗ ██╗ ██████╗
+██╔══██╗██║ ██╔╝██╔════╝     ██║   ██║███║██╔═████╗
+██║  ██║█████╔╝ ██║  ███╗    ██║   ██║╚██║██║██╔██║
+██║  ██║██╔═██╗ ██║   ██║    ╚██╗ ██╔╝ ██║████╔╝██║
+██████╔╝██║  ██╗╚██████╔╝     ╚████╔╝  ██║╚██████╔╝
+╚═════╝ ╚═╝  ╚═╝ ╚═════╝       ╚═══╝   ╚═╝ ╚═════╝\x1b[0m
 `;
 
 function normalizeVersionTagRef(input: string): string {
@@ -720,6 +720,42 @@ program
     }
   });
 
+// ─── dkg connect ─────────────────────────────────────────────────────
+// Direct dial helper, mostly useful for ad-hoc P2P troubleshooting and
+// validating an invite before pasting it into the UI. Two modes:
+//   dkg connect <multiaddr>          legacy direct dial
+//   dkg connect --peer-id <peerId>   V10 DHT-resolved dial
+// The peer-id form is preferred — it asks the daemon to walk the libp2p
+// Kademlia table and pick up the peer's *current* multiaddrs, which is
+// exactly how invite redemption now resolves curators.
+program
+  .command('connect [multiaddr]')
+  .description('Dial a peer by multiaddr or peer id (DHT-resolved)')
+  .option('--peer-id <id>', 'Resolve via libp2p DHT (peerRouting.findPeer) and dial')
+  .action(async (multiaddrArg: string | undefined, opts: { peerId?: string }) => {
+    if (!multiaddrArg && !opts.peerId) {
+      console.error('Provide either a multiaddr or --peer-id <id>');
+      process.exit(1);
+    }
+    if (multiaddrArg && opts.peerId) {
+      console.error('Pass either a multiaddr or --peer-id, not both');
+      process.exit(1);
+    }
+    try {
+      const client = await ApiClient.connect();
+      if (opts.peerId) {
+        await client.connectByPeerId(opts.peerId);
+        console.log(`Connected to ${opts.peerId} (resolved via DHT)`);
+      } else {
+        await client.connect(multiaddrArg!);
+        console.log(`Connected to ${multiaddrArg}`);
+      }
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
 // ─── dkg send <name> <message> ───────────────────────────────────────
 
 program
@@ -1191,7 +1227,7 @@ async function runCatchupStatusCommand(contextGraph: string, opts: CatchupStatus
   const client = await ApiClient.connect();
   const watch = !!opts.watch;
   const intervalSeconds = Math.max(1, Number(opts.interval ?? 2));
-  const terminalStates = new Set(['done', 'failed', 'denied']);
+  const terminalStates = new Set(['done', 'failed', 'denied', 'unreachable']);
 
   do {
     const status = await client.catchupStatus(contextGraph);
@@ -1776,6 +1812,100 @@ openclawCmd
       await openclawSetupAction(opts, command, { runSetup });
     } catch (err: any) {
       console.error(`\n[setup] ERROR: ${err?.message ?? err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── dkg mcp ────────────────────────────────────────────────────────
+
+const mcpCmd = program
+  .command('mcp')
+  .description('DKG MCP server for AI coding assistants (Cursor, Claude Code, …)');
+
+mcpCmd
+  .command('serve')
+  .description('Run the DKG MCP server over stdio (invoked by the MCP-aware client)')
+  .allowUnknownOption(true)
+  .allowExcessArguments(true)
+  .action(async (_opts, command) => {
+    // Pass any positional/extra args from the umbrella CLI through to the
+    // MCP server's `main()` so its internal CLI subcommand dispatcher
+    // (`join`, `status`, `help`) keeps working from the umbrella wrapper.
+    const passthrough = command.args ?? [];
+    let main: typeof import('@origintrail-official/dkg-mcp').main;
+    try {
+      ({ main } = await import('@origintrail-official/dkg-mcp'));
+    } catch (err: any) {
+      console.error('\n[dkg mcp serve] MCP server is not available.');
+      console.error(`  Reason: ${err?.message ?? err}`);
+      console.error('  • In a monorepo dev checkout: run `pnpm build` at the repo root to build all workspaces.');
+      console.error('  • With a global install: reinstall with `npm install -g @origintrail-official/dkg`.\n');
+      process.exit(1);
+    }
+    try {
+      // Synthesise an argv whose `[2]` slot aligns with the MCP server's
+      // own subcommand dispatcher. Without this, `dkg mcp serve join …`
+      // would land `argv[2] === 'mcp'` inside the MCP server and the
+      // `join` would never be seen.
+      await main(['node', 'dkg-mcp', ...passthrough]);
+    } catch (err: any) {
+      console.error(`\n[dkg mcp serve] ERROR: ${err?.message ?? err}\n`);
+      process.exit(1);
+    }
+  });
+
+mcpCmd
+  .command('setup')
+  .description('Bundled init + daemon-start + MCP-client registration (idempotent, safe to re-run)')
+  .option('--port <port>', 'Override daemon API port (default: 9200)')
+  .option('--name <name>', 'Override agent name (used only on first init)')
+  .option('--no-start', 'Skip daemon start (configure only)')
+  .option('--no-fund', 'Skip wallet funding via testnet faucet')
+  .option('--no-verify', 'Skip post-setup verification probe')
+  .option('--dry-run', 'Preview steps without writing or starting anything')
+  .option('--force', 'Refresh every detected client regardless of current registration state')
+  .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
+  .option('--yes', 'Auto-confirm per-client registrations (default false: prompt interactively in TTY mode; non-TTY auto-confirms — pass `--yes` in scripts for the safer scripted-environment posture)')
+  .option('--installed', 'Force installed-mode setup. Bootstrap home: `~/.dkg`. Registered binary: the running CLI (whichever invoked this command — typically the global `dkg`). Use this from a monorepo cwd when you want the global install instead of the local dist. Mutually exclusive with --monorepo.')
+  .option('--monorepo', 'Force monorepo-mode setup. Bootstrap home: `~/.dkg-dev`. Registered binary: the local `<repo>/packages/cli/dist/cli.js` script (located via cwd-first walk; falls back to the running CLI dir). Errors if no DKG monorepo root is detected. Switches BOTH bootstrap home AND the registered binary, unlike --installed which only switches the home. Mutually exclusive with --installed.')
+  .action(async (opts) => {
+    // Dynamic-import the openclaw-setup primitives for the bundled
+    // init + daemon-start. Same import surface (and same package
+    // resolution failure mode) as `dkg openclaw setup` so a missing
+    // adapter build emits a parallel error message.
+    let openclawSetupExports: typeof import('@origintrail-official/dkg-adapter-openclaw');
+    try {
+      openclawSetupExports = await import('@origintrail-official/dkg-adapter-openclaw');
+    } catch (err: any) {
+      console.error('\n[dkg mcp setup] Setup primitives are not available.');
+      console.error(`  Reason: ${err?.message ?? err}`);
+      console.error('  • In a monorepo dev checkout: run `pnpm build` at the repo root to build all workspaces.');
+      console.error('  • With a global install: reinstall with `npm install -g @origintrail-official/dkg`.\n');
+      process.exit(1);
+    }
+    let coreExports: typeof import('@origintrail-official/dkg-core');
+    try {
+      coreExports = await import('@origintrail-official/dkg-core');
+    } catch (err: any) {
+      console.error('\n[dkg mcp setup] Core faucet primitive is not available.');
+      console.error(`  Reason: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+
+    const { mcpSetupAction } = await import('./mcp-setup.js');
+    try {
+      await mcpSetupAction(opts, {
+        loadNetworkConfig: openclawSetupExports.loadNetworkConfig,
+        ensureDkgNodeConfig: coreExports.ensureDkgNodeConfig,
+        startDaemon: openclawSetupExports.startDaemon,
+        readWalletsWithRetry: openclawSetupExports.readWalletsWithRetry,
+        logManualFundingInstructions: openclawSetupExports.logManualFundingInstructions,
+        requestFaucetFunding: coreExports.requestFaucetFunding,
+        findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
+        resolveDkgConfigHome: coreExports.resolveDkgConfigHome,
+      });
+    } catch (err: any) {
+      console.error(`\n[dkg mcp setup] ERROR: ${err?.message ?? err}\n`);
       process.exit(1);
     }
   });
@@ -2731,6 +2861,259 @@ publisherCmd
     } catch (err) {
       console.error(toErrorMessage(err));
       process.exit(1);
+    }
+  });
+
+// ─── dkg epcis ───────────────────────────────────────────────────────
+
+const EPCIS_EXIT_CODES = {
+  SUCCESS: 0,
+  UNEXPECTED: 1,
+  CLIENT_ERROR: 2,
+  PUBLISHER_UNAVAILABLE: 3,
+  NOT_FOUND: 4,
+} as const;
+
+function exitCodeForEpcisHttpStatus(status: number | undefined): number {
+  if (status === undefined) return EPCIS_EXIT_CODES.UNEXPECTED;
+  if (status >= 200 && status < 300) return EPCIS_EXIT_CODES.SUCCESS;
+  if (status === 503) return EPCIS_EXIT_CODES.PUBLISHER_UNAVAILABLE;
+  if (status === 404) return EPCIS_EXIT_CODES.NOT_FOUND;
+  if (status >= 400 && status < 500) return EPCIS_EXIT_CODES.CLIENT_ERROR;
+  return EPCIS_EXIT_CODES.UNEXPECTED;
+}
+
+function reportEpcisError(err: unknown): never {
+  const httpStatus = (err as { httpStatus?: number })?.httpStatus;
+  const responseBody = (err as { responseBody?: unknown })?.responseBody;
+  const code = exitCodeForEpcisHttpStatus(httpStatus);
+  if (responseBody !== undefined) {
+    try {
+      console.log(JSON.stringify(responseBody, null, 2));
+    } catch {
+      // not serialisable
+    }
+  }
+  console.error(toErrorMessage(err));
+  process.exit(code);
+}
+
+const epcisCmd = program
+  .command('epcis')
+  .description('EPCIS 2.0 capture, status, and event query');
+
+const ALLOWED_ACCESS_POLICIES = new Set(['public', 'ownerOnly', 'allowList']);
+
+epcisCmd
+  .command('capture <document>')
+  .description('Submit an EPCIS 2.0 document for async capture')
+  .option('--context-graph-id <id>', 'Target context graph (overrides config + document envelope)')
+  .option('--sub-graph-name <name>', 'Sub-graph within the context graph')
+  .option('--access-policy <policy>', 'public | ownerOnly | allowList')
+  .option('--allowed-peer <peerId>', 'Peer allowed to read the captured event (repeatable, requires --access-policy allowList)', (value: string, prev: string[] = []) => [...prev, value])
+  .action(async (documentPath: string, opts: ActionOpts) => {
+    try {
+      // Document file may be a bare EPCIS 2.0 doc or a `{ epcisDocument, ... }`
+      // envelope; CLI flags override fields read from the file.
+      const { readFile } = await import('node:fs/promises');
+      let raw: string;
+      try {
+        raw = await readFile(documentPath, 'utf-8');
+      } catch (err) {
+        console.error(`Failed to read ${documentPath}: ${toErrorMessage(err)}`);
+        process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (err) {
+        console.error(`Invalid JSON in ${documentPath}: ${toErrorMessage(err)}`);
+        process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+      }
+
+      const isEnvelope = parsed && typeof parsed === 'object' && 'epcisDocument' in parsed;
+      const epcisDocument = isEnvelope ? parsed.epcisDocument : parsed;
+      const filePublishOptions = isEnvelope ? parsed.publishOptions : undefined;
+      const fileContextGraphId = isEnvelope ? parsed.contextGraphId : undefined;
+      const fileSubGraphName = isEnvelope ? parsed.subGraphName : undefined;
+
+      const accessPolicy = opts.accessPolicy as string | undefined;
+      if (accessPolicy !== undefined && !ALLOWED_ACCESS_POLICIES.has(accessPolicy)) {
+        console.error(`Invalid --access-policy "${accessPolicy}". Use one of: public, ownerOnly, allowList.`);
+        process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+      }
+      const allowedPeers = opts.allowedPeer as string[] | undefined;
+      // Validation of `allowedPeers requires accessPolicy === 'allowList'`
+      // runs against the EFFECTIVE merged policy below (post-`merged`
+      // construction). Validating the raw `--access-policy` flag here
+      // would reject `dkg epcis capture envelope.json --allowed-peer X`
+      // when the envelope already supplies `accessPolicy: 'allowList'`,
+      // which is a perfectly valid combination — the flag adds peers,
+      // the envelope sets the policy.
+
+      const publishOptions = (() => {
+        const merged = { ...(filePublishOptions ?? {}) } as {
+          accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
+          allowedPeers?: string[];
+        };
+        if (accessPolicy !== undefined) {
+          merged.accessPolicy = accessPolicy as 'public' | 'ownerOnly' | 'allowList';
+        }
+        if (allowedPeers && allowedPeers.length > 0) {
+          merged.allowedPeers = allowedPeers;
+        }
+        return Object.keys(merged).length > 0 ? merged : undefined;
+      })();
+      if (publishOptions) {
+        if (publishOptions.accessPolicy !== undefined && !ALLOWED_ACCESS_POLICIES.has(publishOptions.accessPolicy)) {
+          console.error(`Invalid publishOptions.accessPolicy "${publishOptions.accessPolicy}". Use one of: public, ownerOnly, allowList.`);
+          process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+        }
+        if (publishOptions.allowedPeers && publishOptions.allowedPeers.length > 0 && publishOptions.accessPolicy !== 'allowList') {
+          console.error('publishOptions.allowedPeers requires accessPolicy "allowList".');
+          process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+        }
+      }
+
+      // Use explicit `!== undefined` checks (not truthiness) so an
+      // envelope file that explicitly sets `"contextGraphId": ""` or
+      // `"subGraphName": ""` round-trips to the server as an empty
+      // string. The server's resolveCgId/resolveSubGraphName then
+      // returns a precise 400 instead of silently falling back to the
+      // daemon default CG / root partition. Truthiness drops empty
+      // strings into the "not provided" bucket, which masks the
+      // misconfiguration as a successful capture against the wrong
+      // partition.
+      const request = {
+        epcisDocument,
+        ...(opts.contextGraphId !== undefined
+          ? { contextGraphId: String(opts.contextGraphId) }
+          : fileContextGraphId !== undefined
+            ? { contextGraphId: String(fileContextGraphId) }
+            : {}),
+        ...(opts.subGraphName !== undefined
+          ? { subGraphName: String(opts.subGraphName) }
+          : fileSubGraphName !== undefined
+            ? { subGraphName: String(fileSubGraphName) }
+            : {}),
+        ...(publishOptions ? { publishOptions } : {}),
+      };
+
+      const client = await ApiClient.connect();
+      const result = await client.captureEpcis(request);
+      console.log(JSON.stringify(result, null, 2));
+    } catch (err) {
+      reportEpcisError(err);
+    }
+  });
+
+epcisCmd
+  .command('status <captureID>')
+  .description('Get the status of an async EPCIS capture job')
+  .action(async (captureID: string) => {
+    try {
+      const client = await ApiClient.connect();
+      const result = await client.getEpcisCapture(captureID);
+      console.log(JSON.stringify(result, null, 2));
+    } catch (err) {
+      reportEpcisError(err);
+    }
+  });
+
+epcisCmd
+  .command('query')
+  .description('Query EPCIS events from a context graph')
+  .option('--context-graph-id <id>', 'Target context graph (overrides config default)')
+  .option('--sub-graph-name <name>', 'Sub-graph within the context graph')
+  .option('--finalized <bool>', 'true | false (default: server default)')
+  .option('--epc <epc>', 'Filter by EPC')
+  .option('--biz-step <step>', 'Filter by bizStep')
+  .option('--from <ts>', 'Filter by lower bound on eventTime')
+  .option('--to <ts>', 'Filter by upper bound on eventTime')
+  .option('--event-id <id>', 'Filter by eventID')
+  .option('--event-type <type>', 'Filter by eventType (e.g. ObjectEvent)')
+  .option('--action <a>', 'Filter by action (ADD | OBSERVE | DELETE)')
+  .option('--disposition <d>', 'Filter by disposition')
+  .option('--read-point <uri>', 'Filter by readPoint id')
+  .option('--biz-location <uri>', 'Filter by bizLocation id')
+  .option('--per-page <n>', 'Page size')
+  .option('--next-page-token <t>', 'Continuation token from a prior response')
+  .option('--all', 'Follow Link: rel="next" pages and merge eventList in-place')
+  .action(async (opts: ActionOpts) => {
+    try {
+      const finalized = (() => {
+        if (opts.finalized === undefined) return undefined;
+        const lowered = String(opts.finalized).toLowerCase();
+        if (lowered === 'true') return true;
+        if (lowered === 'false') return false;
+        console.error(`Invalid --finalized "${opts.finalized}". Use "true" or "false".`);
+        process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+      })();
+      const perPage = opts.perPage !== undefined
+        ? Number.parseInt(String(opts.perPage), 10)
+        : undefined;
+      if (perPage !== undefined && (!Number.isFinite(perPage) || perPage <= 0)) {
+        console.error(`Invalid --per-page "${opts.perPage}". Use a positive integer.`);
+        process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+      }
+
+      const params = {
+        ...(opts.contextGraphId ? { contextGraphId: String(opts.contextGraphId) } : {}),
+        ...(opts.subGraphName ? { subGraphName: String(opts.subGraphName) } : {}),
+        ...(finalized !== undefined ? { finalized } : {}),
+        ...(opts.epc ? { epc: String(opts.epc) } : {}),
+        ...(opts.bizStep ? { bizStep: String(opts.bizStep) } : {}),
+        ...(opts.from ? { from: String(opts.from) } : {}),
+        ...(opts.to ? { to: String(opts.to) } : {}),
+        ...(opts.eventId ? { eventID: String(opts.eventId) } : {}),
+        ...(opts.eventType ? { eventType: String(opts.eventType) } : {}),
+        ...(opts.action ? { action: String(opts.action) } : {}),
+        ...(opts.disposition ? { disposition: String(opts.disposition) } : {}),
+        ...(opts.readPoint ? { readPoint: String(opts.readPoint) } : {}),
+        ...(opts.bizLocation ? { bizLocation: String(opts.bizLocation) } : {}),
+        ...(perPage !== undefined ? { perPage } : {}),
+        ...(opts.nextPageToken ? { nextPageToken: String(opts.nextPageToken) } : {}),
+      };
+
+      const client = await ApiClient.connect();
+      const initial = await client.queryEpcisEvents(params);
+
+      if (!opts.all) {
+        const out: Record<string, unknown> = { ...((initial.body ?? {}) as Record<string, unknown>) };
+        if (initial.nextPageUrl) {
+          out.nextPageUrl = initial.nextPageUrl;
+        }
+        console.log(JSON.stringify(out, null, 2));
+        return;
+      }
+
+      const merged = JSON.parse(JSON.stringify(initial.body)) as any;
+      const eventList = merged?.epcisBody?.queryResults?.resultsBody?.eventList;
+      if (!Array.isArray(eventList)) {
+        console.error('Cannot follow Link: rel="next" — initial response shape unexpected.');
+        process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+      }
+      let nextUrl = initial.nextPageUrl;
+      const MAX_PAGES = 1000;
+      let pages = 1;
+      while (nextUrl) {
+        if (pages >= MAX_PAGES) {
+          console.error(`Aborting --all after ${MAX_PAGES} pages (suspected loop).`);
+          process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+        }
+        const next = await client.queryEpcisEventsByPath(nextUrl);
+        const nextEventList = (next.body as any)?.epcisBody?.queryResults?.resultsBody?.eventList;
+        if (!Array.isArray(nextEventList)) {
+          console.error(`Cannot follow Link: rel="next" — page ${pages + 1} response shape unexpected.`);
+          process.exit(EPCIS_EXIT_CODES.UNEXPECTED);
+        }
+        eventList.push(...nextEventList);
+        nextUrl = next.nextPageUrl;
+        pages += 1;
+      }
+      console.log(JSON.stringify(merged, null, 2));
+    } catch (err) {
+      reportEpcisError(err);
     }
   });
 

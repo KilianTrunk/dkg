@@ -101,6 +101,23 @@ export const connectToPeerWithTimeout = (multiaddr: string, timeoutMs = 10000) =
     }
     return res.json() as Promise<{ connected?: boolean }>;
   });
+// Resolve a peer's current multiaddrs via the libp2p Kademlia DHT and dial.
+// Used by V10 invites that carry only a peer id, decoupling invite stability
+// from relay/IP rotation. Daemon side: `POST /api/connect { peerId }` →
+// `agent.connectToPeerId` → `peerRouting.findPeer` → `libp2p.dial`.
+export const connectToPeerIdWithTimeout = (peerId: string, timeoutMs = 20000) =>
+  fetchWithTimeout(`${BASE}/api/connect`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ peerId }),
+  }, timeoutMs).then(async (res) => {
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      const msg = (errBody as { error?: string })?.error ?? `HTTP ${res.status}`;
+      throw new Error(msg);
+    }
+    return res.json() as Promise<{ connected?: boolean }>;
+  });
 export const fetchAgents = () => get<any>('/api/agents');
 
 // --- Metrics ---
@@ -268,7 +285,15 @@ export interface CatchupStatusResponse {
   jobId: string;
   contextGraphId: string;
   includeSharedMemory: boolean;
-  status: 'queued' | 'running' | 'done' | 'denied' | 'failed';
+  /**
+   * `unreachable` is the V10 terminal status emitted when the daemon
+   * subscribed and ran the catchup, but no peer could deliver the CG
+   * content (curator offline, no node holds the CG, or transport
+   * failures across the whole peer set). Distinct from `denied`
+   * (responder explicitly refused) so the UI can render targeted
+   * copy + a "send signed join request" CTA.
+   */
+  status: 'queued' | 'running' | 'done' | 'denied' | 'failed' | 'unreachable';
   queuedAt: number;
   startedAt?: number;
   finishedAt?: number;
@@ -276,6 +301,8 @@ export interface CatchupStatusResponse {
     connectedPeers: number;
     syncCapablePeers: number;
     peersTried: number;
+    /** See `unreachable` above; subset of `peersTried` that responded without failure or denial. */
+    peersSucceeded: number;
     dataSynced: number;
     sharedMemorySynced: number;
     denied: boolean;

@@ -1745,6 +1745,111 @@ describe('DKGAgent (integration)', () => {
 
     await agent.stop();
   }, 10000);
+
+  it('publishProfile advertises only public CGs in contextGraphsServed', async () => {
+    // Privacy invariant: the agent profile is published into the public
+    // `agents` system context graph, gossipped to every subscriber. Private
+    // / curated CG IDs MUST NOT leak through `contextGraphsServed`. The
+    // filter in `DKGAgent.publishProfile` consults `isPrivateContextGraph`
+    // — the same predicate the responder uses to gate sync requests — so
+    // discovery and access-control stay aligned.
+    const store = new OxigraphStore();
+    const agent = await DKGAgent.create({
+      name: 'PrivacyHost',
+      framework: 'DKG',
+      listenPort: 0,
+      store,
+      skills: [],
+      chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+    });
+    await agent.start();
+
+    try {
+      await agent.createContextGraph({
+        id: 'public-research',
+        name: 'Public Research',
+      });
+      await agent.createContextGraph({
+        id: 'secret-ops',
+        name: 'Secret Ops',
+        accessPolicy: 1,
+        allowedAgents: ['0x0000000000000000000000000000000000000001'],
+      });
+
+      await agent.publishProfile();
+
+      const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+      const result = await store.query(
+        `SELECT ?served WHERE { GRAPH <${agentsGraph}> { ?h <https://dkg.origintrail.io/skill#contextGraphsServed> ?served } }`,
+      );
+      expect(result.type).toBe('bindings');
+      const served = result.type === 'bindings'
+        ? (result.bindings.map(b => b['served']).filter(Boolean) as string[])
+        : [];
+      expect(served.length).toBeGreaterThan(0);
+      const joined = served.join(',');
+      expect(joined).toContain('public-research');
+      expect(joined).not.toContain('secret-ops');
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  }, 15000);
+
+  it('publishProfile excludes discovery-only entries (subscribed=false)', async () => {
+    // Codex review on PR #434 (round 2) flagged that the
+    // `subscribed === true` filter in publishProfile had no regression
+    // test, so the discovery-only leak could come back unnoticed. This
+    // exercises the actual `discoverContextGraphsFromStore()` path:
+    // we seed the local triple store with ontology triples for an OPEN
+    // CG the agent didn't explicitly subscribe to, run discovery (which
+    // adds the entry with subscribed=false because we don't auto-
+    // subscribe public CGs), then publish the profile and assert the
+    // discovered-only CG was filtered out of contextGraphsServed.
+    const store = new OxigraphStore();
+    const agent = await DKGAgent.create({
+      name: 'DiscoveryFilterHost',
+      framework: 'DKG',
+      listenPort: 0,
+      store,
+      skills: [],
+      chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+    });
+    await agent.start();
+
+    try {
+      await agent.createContextGraph({
+        id: 'normal-public',
+        name: 'Normal Public',
+      });
+
+      const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+      const discoveredUri = 'did:dkg:context-graph:discovered-only';
+      const seedQuads: Quad[] = [
+        { subject: discoveredUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: ontologyGraph },
+        { subject: discoveredUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Discovered Only"', graph: ontologyGraph },
+      ];
+      await store.insert(seedQuads);
+
+      const newlyDiscovered = await agent.discoverContextGraphsFromStore();
+      expect(newlyDiscovered).toBeGreaterThan(0);
+
+      await agent.publishProfile();
+
+      const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+      const result = await store.query(
+        `SELECT ?served WHERE { GRAPH <${agentsGraph}> { ?h <https://dkg.origintrail.io/skill#contextGraphsServed> ?served } }`,
+      );
+      expect(result.type).toBe('bindings');
+      const served = result.type === 'bindings'
+        ? (result.bindings.map(b => b['served']).filter(Boolean) as string[])
+        : [];
+      const joined = served.join(',');
+      expect(joined).toContain('normal-public');
+      expect(joined).not.toContain('discovered-only');
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  }, 15000);
 });
 
 describe('Genesis Knowledge', () => {

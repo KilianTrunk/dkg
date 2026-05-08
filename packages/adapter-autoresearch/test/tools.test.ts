@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { registerTools } from '../src/tools.js';
 import { NS, Class, Prop, Status } from '../src/ontology.js';
-import type { DkgClientLike } from '../src/types.js';
+import type { DkgClientLike, DkgConfigLike } from '../src/types.js';
 
 // ---------------------------------------------------------------------------
 // Tracking function helper
@@ -31,32 +31,111 @@ function trackingAsyncFn<T>(impl: (...args: unknown[]) => T | Promise<T>): Track
 // In-process DkgClient stand-in
 // ---------------------------------------------------------------------------
 //
-// The autoresearch adapter is a thin MCP -> DkgClient translation layer. It
-// is constructed with a `DkgClientLike` factory; everything it does is to
-// take an MCP tool invocation, marshal it into a DkgClient call, and serialize
-// the response back through MCP.
+// Post dkg-v10 consolidation (parity-matrix v0.5 §4.21), the adapter's
+// surface contracts split into two halves:
 //
-// The unit under test is therefore "did the adapter call the client with the
-// right shape?" — not "does the DkgClient produce the right SPARQL?" The
-// DkgClient itself is fully exercised against a real daemon + chain in its
-// own package's e2e tests (`packages/sdk-js/test/*`). Spinning that whole
-// stack up here just to verify MCP wiring would be coverage duplication that
-// hides the actual contract being tested.
+//   1. SPARQL reads — flow through the supplied `DkgClientLike` (mcp-dkg's
+//      `DkgClient.query({sparql, contextGraphId})`). Mocked with a
+//      tracking fn that records the object-arg shape.
 //
-// What we wire up below is therefore the adapter's defined DI seam — the
-// `DkgClientLike` interface is the *production* boundary the adapter is
-// designed against, and providing an in-process implementation that records
-// calls is the correct way to verify the translation. (Renamed away from
-// `createTestDkgClient` so the mock-audit grep no longer flags it.)
+//   2. Daemon writes — flow through a private `fetch`-based shim talking
+//      to `/api/context-graph/create`, `/api/subscribe`,
+//      `/api/shared-memory/{write,publish}`. Mocked with a `globalThis.fetch`
+//      stub that records URL + body per call.
+//
+// Tests therefore assert against EITHER `mock.query.calls` (SPARQL path)
+// OR the fetch stub's recorded HTTP calls (write path). This is the same
+// boundary the production code crosses — verifying both halves keeps the
+// adapter's MCP-↔-daemon translation honest.
+
 function createTestDkgClient(overrides: Partial<DkgClientLike> = {}): DkgClientLike {
   return {
-    query: trackingAsyncFn(async () => ({ result: { bindings: [] } })),
-    publish: trackingAsyncFn(async () => ({ kcId: 'kc-test-001', status: 'confirmed' })),
-    createContextGraph: trackingAsyncFn(async () => ({ created: 'autoresearch', uri: 'urn:context-graph:autoresearch' })),
-    subscribe: trackingAsyncFn(async () => ({ subscribed: 'autoresearch' })),
+    query: trackingAsyncFn(async () => ({ bindings: [] })),
     ...overrides,
   };
 }
+
+const TEST_CONFIG: DkgConfigLike = {
+  api: 'http://test-daemon:9200',
+  token: 'test-token',
+};
+
+// ── Daemon HTTP fetch stub ─────────────────────────────────────────
+//
+// Captures every daemon-route call the adapter's private fetch shim
+// makes. Records URL, method, and parsed body so tests can assert
+// against the wire shape. Per-route response bodies are configured via
+// `setRoute(...)`; an unset route returns the empty default per
+// production daemon shape (used by tests that don't care about the
+// response, only the call).
+
+interface DaemonFetchCall {
+  url: string;
+  method: string;
+  body: unknown;
+}
+
+interface DaemonFetchStub {
+  calls: DaemonFetchCall[];
+  setRoute(path: string, response: unknown): void;
+  setRouteError(path: string, status: number, errorMessage: string): void;
+  reset(): void;
+  install(): void;
+  uninstall(): void;
+}
+
+function createDaemonFetchStub(): DaemonFetchStub {
+  const calls: DaemonFetchCall[] = [];
+  const responses = new Map<string, { status: number; body: unknown }>();
+
+  const fetcher = async (url: string | URL, init?: RequestInit): Promise<Response> => {
+    const u = typeof url === 'string' ? url : url.toString();
+    const path = u.replace('http://test-daemon:9200', '');
+    const method = init?.method ?? 'GET';
+    let body: unknown = undefined;
+    if (init?.body) {
+      try { body = JSON.parse(String(init.body)); } catch { body = init.body; }
+    }
+    calls.push({ url: u, method, body });
+    const configured = responses.get(path);
+    const responseBody = configured?.body ?? defaultResponseFor(path);
+    const status = configured?.status ?? 200;
+    return new Response(JSON.stringify(responseBody), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  let originalFetch: typeof globalThis.fetch | undefined;
+
+  return {
+    calls,
+    setRoute(path, response) { responses.set(path, { status: 200, body: response }); },
+    setRouteError(path, status, errorMessage) {
+      responses.set(path, { status, body: { error: errorMessage } });
+    },
+    reset() { calls.length = 0; responses.clear(); },
+    install() {
+      originalFetch = globalThis.fetch;
+      globalThis.fetch = fetcher as typeof globalThis.fetch;
+    },
+    uninstall() {
+      if (originalFetch) globalThis.fetch = originalFetch;
+    },
+  };
+}
+
+function defaultResponseFor(path: string): unknown {
+  if (path === '/api/context-graph/create') return { created: 'autoresearch', uri: 'urn:context-graph:autoresearch' };
+  if (path === '/api/subscribe') return { subscribed: 'autoresearch' };
+  if (path === '/api/shared-memory/write') return { written: 0 };
+  if (path === '/api/shared-memory/publish') return { kcId: 'kc-test-001', status: 'confirmed' };
+  return {};
+}
+
+// ---------------------------------------------------------------------------
+// Test harness: McpServer + InMemoryTransport + adapter tools
+// ---------------------------------------------------------------------------
 
 type TextContent = Array<{ type: string; text: string }>;
 
@@ -64,14 +143,10 @@ function getText(result: { content: unknown }): string {
   return (result.content as TextContent)[0].text;
 }
 
-// ---------------------------------------------------------------------------
-// Test harness: McpServer + InMemoryTransport + adapter tools
-// ---------------------------------------------------------------------------
-
 async function createTestHarness(injectedClient?: DkgClientLike) {
   const client = injectedClient ?? createTestDkgClient();
   const server = new McpServer({ name: 'autoresearch-test', version: '0.0.1' });
-  registerTools(server, async () => client);
+  registerTools(server, client, TEST_CONFIG);
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -85,6 +160,17 @@ async function createTestHarness(injectedClient?: DkgClientLike) {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+let fetchStub: DaemonFetchStub;
+
+beforeEach(() => {
+  fetchStub = createDaemonFetchStub();
+  fetchStub.install();
+});
+
+afterEach(() => {
+  fetchStub.uninstall();
+});
 
 describe('autoresearch adapter — tool registration', () => {
   let mcpClient: Client;
@@ -122,40 +208,42 @@ describe('autoresearch adapter — tool registration', () => {
 
 describe('autoresearch_setup', () => {
   it('creates context graph and subscribes', async () => {
-    const mock = createTestDkgClient();
-    const { mcpClient } = await createTestHarness(mock);
+    const { mcpClient } = await createTestHarness();
 
     const result = await mcpClient.callTool({ name: 'autoresearch_setup', arguments: {} });
     const text = getText(result);
 
     expect(text).toContain('autoresearch');
     expect(text).toContain('subscribed');
-    expect((mock.createContextGraph as TrackingFn<unknown>).calls[0]).toEqual([
-      'autoresearch',
-      'Autoresearch',
-      expect.any(String),
-    ]);
-    expect((mock.subscribe as TrackingFn<unknown>).calls[0]).toEqual(['autoresearch']);
+
+    const createCall = fetchStub.calls.find(c => c.url.endsWith('/api/context-graph/create'));
+    expect(createCall).toBeDefined();
+    expect(createCall!.method).toBe('POST');
+    expect(createCall!.body).toMatchObject({
+      id: 'autoresearch',
+      name: 'Autoresearch',
+    });
+
+    const subscribeCall = fetchStub.calls.find(c => c.url.endsWith('/api/subscribe'));
+    expect(subscribeCall).toBeDefined();
+    expect(subscribeCall!.body).toMatchObject({ contextGraphId: 'autoresearch' });
   });
 
   it('handles context graph already existing gracefully', async () => {
-    const mock = createTestDkgClient({
-      createContextGraph: trackingAsyncFn(async () => { throw new Error('already exists'); }),
-    });
-    const { mcpClient } = await createTestHarness(mock);
+    fetchStub.setRouteError('/api/context-graph/create', 409, 'already exists');
+    const { mcpClient } = await createTestHarness();
 
     const result = await mcpClient.callTool({ name: 'autoresearch_setup', arguments: {} });
     const text = getText(result);
 
     expect(text).toContain('ready');
-    expect((mock.subscribe as TrackingFn<unknown>).calls.length).toBeGreaterThan(0);
+    const subscribeCall = fetchStub.calls.find(c => c.url.endsWith('/api/subscribe'));
+    expect(subscribeCall).toBeDefined();
   });
 
   it('returns error when subscribe fails', async () => {
-    const mock = createTestDkgClient({
-      subscribe: trackingAsyncFn(async () => { throw new Error('network down'); }),
-    });
-    const { mcpClient } = await createTestHarness(mock);
+    fetchStub.setRouteError('/api/subscribe', 503, 'network down');
+    const { mcpClient } = await createTestHarness();
 
     const result = await mcpClient.callTool({ name: 'autoresearch_setup', arguments: {} });
     expect(result.isError).toBe(true);
@@ -172,8 +260,7 @@ describe('autoresearch_publish_experiment', () => {
   };
 
   it('publishes with required fields and returns URI + KC', async () => {
-    const mock = createTestDkgClient();
-    const { mcpClient } = await createTestHarness(mock);
+    const { mcpClient } = await createTestHarness();
 
     const result = await mcpClient.callTool({
       name: 'autoresearch_publish_experiment',
@@ -188,19 +275,22 @@ describe('autoresearch_publish_experiment', () => {
     expect(text).toContain('increase depth to 12 layers');
   });
 
-  it('sends correct quads to the DKG client', async () => {
-    const mock = createTestDkgClient();
-    const { mcpClient } = await createTestHarness(mock);
+  it('sends correct quads to the DKG daemon', async () => {
+    const { mcpClient } = await createTestHarness();
 
     await mcpClient.callTool({
       name: 'autoresearch_publish_experiment',
       arguments: baseArgs,
     });
 
-    const publishCalls = (mock.publish as TrackingFn<unknown>).calls;
-    expect(publishCalls).toHaveLength(1);
-    const [contextGraphId, quads] = publishCalls[0] as [string, any[]];
-    expect(contextGraphId).toBe('autoresearch');
+    // Two-step publish path: write then publish. We assert on the write
+    // payload — that's where the quads land. The publish call is a thin
+    // anchor that takes only `{contextGraphId, selection, clearAfter}`.
+    const writeCall = fetchStub.calls.find(c => c.url.endsWith('/api/shared-memory/write'));
+    expect(writeCall).toBeDefined();
+    const writeBody = writeCall!.body as { contextGraphId: string; quads: any[] };
+    expect(writeBody.contextGraphId).toBe('autoresearch');
+    const quads = writeBody.quads;
 
     const types = quads.filter((q: any) => q.predicate === 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type');
     expect(types).toHaveLength(1);
@@ -218,11 +308,19 @@ describe('autoresearch_publish_experiment', () => {
     const ts = quads.find((q: any) => q.predicate === Prop.timestamp);
     expect(ts).toBeDefined();
     expect(ts.object).toMatch(/dateTime/);
+
+    // Anchor step also fires.
+    const publishCall = fetchStub.calls.find(c => c.url.endsWith('/api/shared-memory/publish'));
+    expect(publishCall).toBeDefined();
+    expect(publishCall!.body).toMatchObject({
+      contextGraphId: 'autoresearch',
+      selection: 'all',
+      clearAfter: true,
+    });
   });
 
   it('includes optional fields when provided', async () => {
-    const mock = createTestDkgClient();
-    const { mcpClient } = await createTestHarness(mock);
+    const { mcpClient } = await createTestHarness();
 
     await mcpClient.callTool({
       name: 'autoresearch_publish_experiment',
@@ -243,7 +341,8 @@ describe('autoresearch_publish_experiment', () => {
       },
     });
 
-    const [, quads] = (mock.publish as TrackingFn<unknown>).calls[0] as [string, any[]];
+    const writeCall = fetchStub.calls.find(c => c.url.endsWith('/api/shared-memory/write'));
+    const quads = (writeCall!.body as { quads: any[] }).quads;
 
     expect(quads.find((q: any) => q.predicate === Prop.commitHash)).toBeDefined();
     expect(quads.find((q: any) => q.predicate === Prop.platform)).toBeDefined();
@@ -260,15 +359,15 @@ describe('autoresearch_publish_experiment', () => {
   });
 
   it('omits optional fields when not provided', async () => {
-    const mock = createTestDkgClient();
-    const { mcpClient } = await createTestHarness(mock);
+    const { mcpClient } = await createTestHarness();
 
     await mcpClient.callTool({
       name: 'autoresearch_publish_experiment',
       arguments: baseArgs,
     });
 
-    const [, quads] = (mock.publish as TrackingFn<unknown>).calls[0] as [string, any[]];
+    const writeCall = fetchStub.calls.find(c => c.url.endsWith('/api/shared-memory/write'));
+    const quads = (writeCall!.body as { quads: any[] }).quads;
 
     expect(quads.find((q: any) => q.predicate === Prop.commitHash)).toBeUndefined();
     expect(quads.find((q: any) => q.predicate === Prop.platform)).toBeUndefined();
@@ -276,32 +375,30 @@ describe('autoresearch_publish_experiment', () => {
   });
 
   it('maps status values to correct ontology URIs', async () => {
-    const mock = createTestDkgClient();
-    const { mcpClient } = await createTestHarness(mock);
+    const { mcpClient } = await createTestHarness();
 
     for (const [statusStr, expectedUri] of [
       ['keep', Status.Keep],
       ['discard', Status.Discard],
       ['crash', Status.Crash],
     ] as const) {
-      (mock.publish as TrackingFn<unknown>).resetCalls();
+      fetchStub.reset();
 
       await mcpClient.callTool({
         name: 'autoresearch_publish_experiment',
         arguments: { ...baseArgs, status: statusStr },
       });
 
-      const [, quads] = (mock.publish as TrackingFn<unknown>).calls[0] as [string, any[]];
+      const writeCall = fetchStub.calls.find(c => c.url.endsWith('/api/shared-memory/write'));
+      const quads = (writeCall!.body as { quads: any[] }).quads;
       const statusQuad = quads.find((q: any) => q.predicate === Prop.status);
       expect(statusQuad.object).toBe(expectedUri);
     }
   });
 
   it('returns error when publish fails', async () => {
-    const mock = createTestDkgClient({
-      publish: trackingAsyncFn(async () => { throw new Error('DKG daemon not running'); }),
-    });
-    const { mcpClient } = await createTestHarness(mock);
+    fetchStub.setRouteError('/api/shared-memory/publish', 503, 'DKG daemon not running');
+    const { mcpClient } = await createTestHarness();
 
     const result = await mcpClient.callTool({
       name: 'autoresearch_publish_experiment',
@@ -328,19 +425,17 @@ describe('autoresearch_best_results', () => {
   it('formats results when experiments exist', async () => {
     const mock = createTestDkgClient({
       query: trackingAsyncFn(async () => ({
-        result: {
-          bindings: [
-            {
-              exp: 'urn:autoresearch:exp:1',
-              valBpb: '"0.9712"^^<http://www.w3.org/2001/XMLSchema#double>',
-              peakVram: '"44000"^^<http://www.w3.org/2001/XMLSchema#double>',
-              status: `${NS}keep`,
-              desc: '"SwiGLU + depth 16"',
-              ts: '"2026-03-08T12:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>',
-              platform: '"H100"',
-            },
-          ],
-        },
+        bindings: [
+          {
+            exp: 'urn:autoresearch:exp:1',
+            valBpb: '"0.9712"^^<http://www.w3.org/2001/XMLSchema#double>',
+            peakVram: '"44000"^^<http://www.w3.org/2001/XMLSchema#double>',
+            status: `${NS}keep`,
+            desc: '"SwiGLU + depth 16"',
+            ts: '"2026-03-08T12:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>',
+            platform: '"H100"',
+          },
+        ],
       })),
     });
     const { mcpClient } = await createTestHarness(mock);
@@ -368,11 +463,13 @@ describe('autoresearch_best_results', () => {
 
     const queryCalls = (mock.query as TrackingFn<unknown>).calls;
     expect(queryCalls).toHaveLength(1);
-    const [sparql, contextGraphId] = queryCalls[0] as [string, string];
-    expect(contextGraphId).toBe('autoresearch');
-    expect(sparql).toContain(Class.Experiment);
-    expect(sparql).toContain('ORDER BY ASC(?valBpb)');
-    expect(sparql).toContain('LIMIT 5');
+    // Object-arg shape per mcp-dkg's `DkgClient.query`. Replaces the
+    // legacy positional `(sparql, contextGraphId)` form.
+    const [args] = queryCalls[0] as [{ sparql: string; contextGraphId?: string }];
+    expect(args.contextGraphId).toBe('autoresearch');
+    expect(args.sparql).toContain(Class.Experiment);
+    expect(args.sparql).toContain('ORDER BY ASC(?valBpb)');
+    expect(args.sparql).toContain('LIMIT 5');
   });
 });
 
@@ -397,9 +494,9 @@ describe('autoresearch_experiment_history', () => {
       arguments: { run_tag: 'mar8' },
     });
 
-    const [sparql] = (mock.query as TrackingFn<unknown>).calls[0] as [string];
-    expect(sparql).toContain(Prop.runTag);
-    expect(sparql).toContain('mar8');
+    const [args] = (mock.query as TrackingFn<unknown>).calls[0] as [{ sparql: string }];
+    expect(args.sparql).toContain(Prop.runTag);
+    expect(args.sparql).toContain('mar8');
   });
 
   it('includes agent_did filter in SPARQL when provided', async () => {
@@ -411,36 +508,34 @@ describe('autoresearch_experiment_history', () => {
       arguments: { agent_did: 'did:dkg:agent-7' },
     });
 
-    const [sparql] = (mock.query as TrackingFn<unknown>).calls[0] as [string];
-    expect(sparql).toContain(Prop.agentDid);
-    expect(sparql).toContain('did:dkg:agent-7');
+    const [args] = (mock.query as TrackingFn<unknown>).calls[0] as [{ sparql: string }];
+    expect(args.sparql).toContain(Prop.agentDid);
+    expect(args.sparql).toContain('did:dkg:agent-7');
   });
 
   it('returns table-formatted results', async () => {
     const mock = createTestDkgClient({
       query: trackingAsyncFn(async () => ({
-        result: {
-          bindings: [
-            {
-              exp: 'urn:autoresearch:exp:1',
-              valBpb: '"0.9979"',
-              peakVram: '"45060"',
-              status: `${NS}keep`,
-              desc: '"baseline"',
-              ts: '"2026-03-08T08:00:00Z"',
-              commitHash: '"a1b2c3d"',
-            },
-            {
-              exp: 'urn:autoresearch:exp:2',
-              valBpb: '"0.9834"',
-              peakVram: '"44200"',
-              status: `${NS}keep`,
-              desc: '"increase depth"',
-              ts: '"2026-03-08T08:06:00Z"',
-              commitHash: '"b2c3d4e"',
-            },
-          ],
-        },
+        bindings: [
+          {
+            exp: 'urn:autoresearch:exp:1',
+            valBpb: '"0.9979"',
+            peakVram: '"45060"',
+            status: `${NS}keep`,
+            desc: '"baseline"',
+            ts: '"2026-03-08T08:00:00Z"',
+            commitHash: '"a1b2c3d"',
+          },
+          {
+            exp: 'urn:autoresearch:exp:2',
+            valBpb: '"0.9834"',
+            peakVram: '"44200"',
+            status: `${NS}keep`,
+            desc: '"increase depth"',
+            ts: '"2026-03-08T08:06:00Z"',
+            commitHash: '"b2c3d4e"',
+          },
+        ],
       })),
     });
     const { mcpClient } = await createTestHarness(mock);
@@ -479,21 +574,19 @@ describe('autoresearch_insights', () => {
       arguments: { keyword: 'learning rate' },
     });
 
-    const [sparql] = (mock.query as TrackingFn<unknown>).calls[0] as [string];
-    expect(sparql).toContain('FILTER(CONTAINS(LCASE(?desc)');
-    expect(sparql).toContain('learning rate');
+    const [args] = (mock.query as TrackingFn<unknown>).calls[0] as [{ sparql: string }];
+    expect(args.sparql).toContain('FILTER(CONTAINS(LCASE(?desc)');
+    expect(args.sparql).toContain('learning rate');
   });
 
   it('shows summary with keep/discard/crash counts', async () => {
     const mock = createTestDkgClient({
       query: trackingAsyncFn(async () => ({
-        result: {
-          bindings: [
-            { exp: 'urn:1', valBpb: '"0.98"', status: `${NS}keep`, desc: '"LR 0.06"' },
-            { exp: 'urn:2', valBpb: '"1.01"', status: `${NS}discard`, desc: '"LR 0.2"' },
-            { exp: 'urn:3', valBpb: '"0.00"', status: `${NS}crash`, desc: '"LR 1.0 OOM"' },
-          ],
-        },
+        bindings: [
+          { exp: 'urn:1', valBpb: '"0.98"', status: `${NS}keep`, desc: '"LR 0.06"' },
+          { exp: 'urn:2', valBpb: '"1.01"', status: `${NS}discard`, desc: '"LR 0.2"' },
+          { exp: 'urn:3', valBpb: '"0.00"', status: `${NS}crash`, desc: '"LR 1.0 OOM"' },
+        ],
       })),
     });
     const { mcpClient } = await createTestHarness(mock);
@@ -515,9 +608,7 @@ describe('autoresearch_query', () => {
   it('passes raw SPARQL to client', async () => {
     const mock = createTestDkgClient({
       query: trackingAsyncFn(async () => ({
-        result: {
-          bindings: [{ avg: '"0.9856"' }],
-        },
+        bindings: [{ avg: '"0.9856"' }],
       })),
     });
     const { mcpClient } = await createTestHarness(mock);
@@ -528,7 +619,11 @@ describe('autoresearch_query', () => {
       arguments: { sparql },
     });
 
-    expect((mock.query as TrackingFn<unknown>).calls[0]).toEqual([sparql, 'autoresearch']);
+    const queryCalls = (mock.query as TrackingFn<unknown>).calls;
+    expect(queryCalls).toHaveLength(1);
+    const [args] = queryCalls[0] as [{ sparql: string; contextGraphId?: string }];
+    expect(args.sparql).toBe(sparql);
+    expect(args.contextGraphId).toBe('autoresearch');
     expect(getText(result)).toContain('0.9856');
   });
 
@@ -559,24 +654,10 @@ describe('autoresearch_query', () => {
   });
 });
 
-describe('custom context graph', () => {
-  it('uses custom context graph when registerTools is called with one', async () => {
-    const mock = createTestDkgClient();
-    const server = new McpServer({ name: 'custom-test', version: '0.0.1' });
-    registerTools(server, async () => mock, 'my-custom-contextGraph');
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    const mcpClient = new Client({ name: 'test', version: '1.0.0' });
-    await mcpClient.connect(clientTransport);
-
-    await mcpClient.callTool({ name: 'autoresearch_setup', arguments: {} });
-
-    expect((mock.createContextGraph as TrackingFn<unknown>).calls[0]).toEqual([
-      'my-custom-contextGraph',
-      expect.any(String),
-      expect.any(String),
-    ]);
-    expect((mock.subscribe as TrackingFn<unknown>).calls[0]).toEqual(['my-custom-contextGraph']);
-  });
-});
+// Note: the legacy "custom context graph" test (which exercised passing a
+// 3rd `contextGraphId` argument to `registerTools`) is removed in this
+// PR — the parity-matrix v0.5 §4.21 shim signature drops that public
+// parameter. Each adapter now targets its own canonical CG; per-call
+// override semantics will return as an opts-bag if a real consumer needs
+// it. No tests are added in its place because there is no longer a
+// public surface to verify.

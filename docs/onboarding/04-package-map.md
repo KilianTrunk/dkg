@@ -220,13 +220,6 @@ A browser-based network simulator for visualizing DKG node interactions. A React
 
 **Depends on**: `react` (no workspace deps).
 
-### @origintrail-official/dkg-attested-assets
-`packages/attested-assets/`
-
-Attested Knowledge Assets (AKA) protocol implementation. Provides session management, multi-round attestation with M/N signature gating, canonical signing, and domain separation for collaborative knowledge attestation across multiple agents.
-
-**Depends on**: `core`, `agent`.
-
 ## "Where Do I Look?" Quick Reference
 
 | If you want to...                              | Look in                          |

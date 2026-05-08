@@ -34,7 +34,7 @@ cat > "$MCP_FILE" <<MCPEOF
   "mcpServers": {
     "dkg": {
       "command": "node",
-      "args": ["$DKG_ROOT/packages/mcp-server/dist/index.js"]
+      "args": ["$DKG_ROOT/packages/cli/dist/cli.js", "mcp", "serve"]
     }
   }
 }

@@ -1257,6 +1257,14 @@ function writeTomlConfigBody(
     serialisedEntry,
     tomlRawHasEntry(raw, target.entryPath),
   );
+  if (patched === null) {
+    process.stderr.write(
+      `[setup] WARNING: ${target.name} config at ${tildify(target.configPath)} ` +
+        `stores ${ownedPath} without a dedicated [${ownedPath}] table; ` +
+        'rewriting the TOML file to avoid duplicate definitions. ' +
+        'Comments/formatting outside this entry may not be preserved.\n',
+    );
+  }
   writeFileSync(
     target.configPath,
     patched ?? TOML.stringify(body as TOML.JsonMap),

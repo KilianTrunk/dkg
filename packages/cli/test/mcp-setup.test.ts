@@ -3267,6 +3267,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     writeFileSync(
       codexPath,
       [
+        '# unusual user-authored shape; fallback must warn before reserializing',
         'model = "gpt-5"',
         'mcp_servers.dkg = { command = "/old/legacy/dkg", args = [ "legacy-arg" ], cwd = "/workspaces/my-project", env = { DKG_HOME = "/old/abandoned/path", NODE_OPTIONS = "--inspect" } }',
         '',
@@ -3278,6 +3279,12 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     const afterRaw = readFileSync(codexPath, 'utf-8');
     const after = TOML.parse(afterRaw) as any;
+    const stderrText = (stderrSilencer.mock.calls as any[])
+      .map((c) => String(c[0]))
+      .join('');
+    expect(stderrText).toMatch(/WARNING: Codex CLI config/);
+    expect(stderrText).toMatch(/without a dedicated \[mcp_servers\.dkg\] table/);
+    expect(stderrText).toMatch(/Comments\/formatting outside this entry may not be preserved/);
     expect(after.model).toBe('gpt-5');
     expect(after.mcp_servers.dkg.command).toBe(process.execPath);
     expect(after.mcp_servers.dkg.args[0]).toBe(realpathSync(process.argv[1]));

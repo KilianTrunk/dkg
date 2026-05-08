@@ -473,9 +473,9 @@ interface ClientTarget {
   /**
    * Per-client config-file format. Defaults to `'json'` so the existing
    * Cursor + Claude Code targets stay byte-identical post-refactor.
-   * Future clients with non-JSON config (Codex CLI = TOML, Continue
-   * may be YAML) declare the format here so `writeRegistration` and
-   * `classify` dispatch to the right serializer.
+   * Clients with non-JSON config declare the format here (Codex CLI =
+   * TOML; Continue = YAML or JSON) so `readConfigBody` and
+   * `writeConfigBody` dispatch to the right serializer.
    */
   format?: 'json' | 'toml' | 'yaml';
   /**
@@ -485,9 +485,60 @@ interface ClientTarget {
    * that shape (VSCode + Copilot Chat uses `servers.dkg`; Codex CLI
    * uses `mcp_servers.dkg` under TOML) declare the alternate path
    * here so a single registration helper covers all surfaces without
-   * per-client write functions.
+   * per-client write logic.
+   *
+   * Mutually exclusive with `entryWrap` / `entryUnwrap`. When a
+   * client's config file isn't shaped as a map of servers keyed by
+   * name (e.g. Continue's `mcpServers` is a LIST of server objects
+   * with a `name` field), set the wrap/unwrap pair instead.
    */
   entryPath?: string;
+  /**
+   * Issue #437 Codex Review fix: extract the per-server entry from
+   * a parsed config body for staleness comparison. Used when the
+   * file format isn't a simple map keyed by server name. Return
+   * `null` / `undefined` if no entry is currently present.
+   *
+   * Continue uses this: the `mcpServers` block is a LIST of server
+   * objects (`[{ name: 'dkg', command, args, env }, …]`), so
+   * extraction means scanning for the element whose `name` field
+   * matches `'dkg'`.
+   *
+   * If both `entryUnwrap` and `entryPath` are set, `entryUnwrap`
+   * wins; the dotted-path walker is skipped.
+   */
+  entryUnwrap?: (body: Record<string, unknown>) => Record<string, unknown> | null | undefined;
+  /**
+   * Issue #437 Codex Review fix: insert / replace the per-server
+   * entry inside a parsed config body, returning the new body to
+   * serialize. Pairs with `entryUnwrap` for clients whose config
+   * file isn't a simple map keyed by server name.
+   *
+   * Implementations are responsible for:
+   *  1. Preserving sibling entries (other servers in the same file).
+   *  2. Preserving any wrapper / metadata keys the format requires
+   *     (e.g. Continue's `name` / `schema` / `version` top-level
+   *     keys; seed sensible defaults on first write).
+   *  3. Honouring the FIX 26 merge contract — the caller passes
+   *     the already-merged entry, so the wrap function only deals
+   *     with placement, not field-level merge.
+   */
+  entryWrap?: (
+    body: Record<string, unknown>,
+    mergedEntry: Record<string, unknown>,
+  ) => Record<string, unknown>;
+  /**
+   * Optional alternate detection path. The default filter checks
+   * `existsSync(configPath) || existsSync(dirname(configPath))`.
+   * Some clients (Continue) keep their per-server config under a
+   * subdirectory the client itself doesn't pre-create on install
+   * (e.g. `~/.continue/mcpServers/` only exists once a server is
+   * registered). When this field is set, the filter ALSO accepts
+   * the candidate if `detectIfDirExists` exists — letting the
+   * installation root drive detection without forcing the filter
+   * to walk arbitrary numbers of grandparents.
+   */
+  detectIfDirExists?: string;
 }
 
 const DEFAULT_FORMAT: NonNullable<ClientTarget['format']> = 'json';
@@ -752,35 +803,118 @@ function wslWindowsEnvPath(envVarName: string): string | null {
 }
 
 /**
- * Build the Continue candidate, resolving the YAML-vs-JSON config
- * format at detection time. Continue ships two config schemas:
- *   - `~/.continue/config.yaml` (canonical from v0.11+; preferred)
- *   - `~/.continue/config.json` (legacy)
+ * Continue's canonical server name as it appears in the `mcpServers`
+ * list element's `name` field. Distinct from the dotted-map "key"
+ * other clients use; Continue's `mcpServers` is a LIST of objects
+ * each with a `name` field, NOT a map keyed by server name.
+ */
+const CONTINUE_SERVER_NAME = 'dkg';
+
+/**
+ * Issue #437 Codex Review fix: extract the dkg server entry from
+ * a parsed Continue per-server file. The file shape is:
  *
- * Resolution rule (matches Continue's own loader): if `.yaml` exists,
- * use it. Else if `.json` exists, use it. If neither exists but the
- * `~/.continue` directory does, default to `.yaml` (newer convention)
- * so a fresh write produces the format Continue prefers going
- * forward.
+ *   { name, schema, version, mcpServers: [{ name: 'dkg', command, args, env? }, …] }
  *
- * `entryPath` is `mcpServers.dkg` per Continue's MCP block schema
- * (verified against Continue v0.11+ docs at
- * https://docs.continue.dev/customize/deep-dives/mcp, accessed
- * 2026-05-08 via issue #437). Continue accepts the same canonical
- * `mcpServers.<name>` shape under either YAML or JSON, so the same
- * `entryPath` works regardless of file format.
+ * — `mcpServers` is a LIST (NOT a map keyed by name). We scan for
+ * the element whose `name` field matches `'dkg'` and return it; if
+ * absent, return `undefined` so the caller classifies as
+ * `not-registered`.
+ */
+function continueUnwrap(body: Record<string, unknown>): Record<string, unknown> | null | undefined {
+  const list = body.mcpServers;
+  if (!Array.isArray(list)) return undefined;
+  const found = list.find(
+    (e) => e && typeof e === 'object' && (e as Record<string, unknown>).name === CONTINUE_SERVER_NAME,
+  );
+  return (found as Record<string, unknown> | undefined) ?? undefined;
+}
+
+/**
+ * Issue #437 Codex Review fix: insert / replace the dkg server entry
+ * inside a parsed Continue per-server file body. Preserves any other
+ * `mcpServers` siblings (unusual — convention is one server per
+ * file — but supported), seeds Continue's required wrapper keys
+ * (`name` / `schema` / `version`) on first write, and ensures the
+ * merged entry's `name` field stays `'dkg'`.
+ */
+function continueWrap(
+  body: Record<string, unknown>,
+  mergedEntry: Record<string, unknown>,
+): Record<string, unknown> {
+  const existing = (Array.isArray(body.mcpServers) ? body.mcpServers : []) as Record<string, unknown>[];
+  // Force-stamp the `name` field — the FIX 26 spread merge could
+  // theoretically blow it away if a pre-existing entry was missing
+  // it. Continue treats name as the identity key, so it must match
+  // CONTINUE_SERVER_NAME for our entry to be addressable.
+  const dkgEntry: Record<string, unknown> = { ...mergedEntry, name: CONTINUE_SERVER_NAME };
+  const idx = existing.findIndex(
+    (e) => e && typeof e === 'object' && e.name === CONTINUE_SERVER_NAME,
+  );
+  const nextList = existing.slice();
+  if (idx >= 0) nextList[idx] = dkgEntry;
+  else nextList.push(dkgEntry);
+  // Continue requires `name`, `schema`, and `version` top-level keys
+  // in a per-server file. Existing values pass through unchanged;
+  // sensible defaults are seeded on first write. Forward-compat with
+  // future Continue per-server fields: spread `body` first, then
+  // overwrite the four keys we own.
+  const seededName = typeof body.name === 'string' && body.name ? body.name : 'DKG';
+  const seededSchema = typeof body.schema === 'string' && body.schema ? body.schema : 'v1';
+  const seededVersion =
+    typeof body.version === 'string' && body.version ? body.version : '0.0.1';
+  return {
+    ...body,
+    name: seededName,
+    schema: seededSchema,
+    version: seededVersion,
+    mcpServers: nextList,
+  };
+}
+
+/**
+ * Build the Continue candidate, resolving the YAML-vs-JSON file
+ * format at detection time. Continue's MCP block lives in a
+ * dedicated per-server file at `~/.continue/mcpServers/dkg.{yaml,json}`
+ * (one server per file is the canonical Continue convention).
+ *
+ * Issue #437 Codex Review fix: writing to this dedicated path
+ * (instead of inlining into the main `~/.continue/config.{yaml,json}`)
+ * solves two problems at once:
+ *  1. The list-shape format is opaque to the dotted-path walker;
+ *     wrap/unwrap hooks handle the list scan.
+ *  2. The user's main `~/.continue/config.{yaml,json}` is NEVER
+ *     touched, so any user comments / anchors / merge-keys / yaml
+ *     refs there are untouched by `dkg mcp setup`.
+ *
+ * Format detection (yaml-vs-json):
+ *  - If `mcpServers/dkg.yaml` exists → yaml.
+ *  - Else if `mcpServers/dkg.json` exists → json.
+ *  - Else default to yaml (newer convention).
+ *
+ * Verified against https://docs.continue.dev/customize/deep-dives/mcp
+ * accessed 2026-05-08.
  */
 function continueClient(home: string): ClientTarget {
-  const dir = join(home, '.continue');
-  const yamlPath = join(dir, 'config.yaml');
-  const jsonPath = join(dir, 'config.json');
+  const continueDir = join(home, '.continue');
+  const serverDir = join(continueDir, 'mcpServers');
+  const yamlPath = join(serverDir, 'dkg.yaml');
+  const jsonPath = join(serverDir, 'dkg.json');
   const useYaml = existsSync(yamlPath) || !existsSync(jsonPath);
   return {
     name: 'Continue',
     configPath: useYaml ? yamlPath : jsonPath,
-    displayPath: useYaml ? '~/.continue/config.yaml' : '~/.continue/config.json',
+    displayPath: useYaml ? '~/.continue/mcpServers/dkg.yaml' : '~/.continue/mcpServers/dkg.json',
     format: useYaml ? 'yaml' : 'json',
-    entryPath: 'mcpServers.dkg',
+    entryUnwrap: continueUnwrap,
+    entryWrap: continueWrap,
+    // The default detect-by-parent-dir filter checks
+    // `existsSync(dirname(configPath))`, which for Continue means
+    // `mcpServers/`. Continue itself doesn't create that directory
+    // on install — only `~/.continue/` is guaranteed. Without this
+    // override the filter would miss a Continue install that has
+    // never had an MCP server registered through any tool.
+    detectIfDirExists: continueDir,
   };
 }
 
@@ -923,22 +1057,26 @@ export function detectClients(): ClientTarget[] {
         format: 'toml',
         entryPath: 'mcp_servers.dkg',
       });
-      // Issue #437: Continue on Windows — %USERPROFILE%\.continue\config.{yaml,json}.
-      // Mirrors the Linux YAML-vs-JSON detection but rooted under
-      // the WSL-resolved Windows userprofile. We resolve the
-      // candidate fresh against the Win-side filesystem so the same
-      // "yaml-when-yaml-or-no-json, else json" rule applies to a
-      // Windows install accessed from WSL.
+      // Issue #437: Continue on Windows — dedicated per-server file
+      // at %USERPROFILE%\.continue\mcpServers\dkg.{yaml,json}.
+      // Mirrors the Linux YAML-vs-JSON detection (and the same
+      // Codex-Review fix that moved off the inline `config.{yaml,json}`
+      // path), just rooted under the WSL-resolved Windows
+      // userprofile. The wrap/unwrap pair is identical to the Linux
+      // candidate.
       const continueWinDir = join(winUserProfile, '.continue');
-      const continueWinYaml = join(continueWinDir, 'config.yaml');
-      const continueWinJson = join(continueWinDir, 'config.json');
+      const continueWinServerDir = join(continueWinDir, 'mcpServers');
+      const continueWinYaml = join(continueWinServerDir, 'dkg.yaml');
+      const continueWinJson = join(continueWinServerDir, 'dkg.json');
       const useWinYaml = existsSync(continueWinYaml) || !existsSync(continueWinJson);
       candidates.push({
         name: 'Continue (Windows-side via WSL)',
         configPath: useWinYaml ? continueWinYaml : continueWinJson,
         displayPath: useWinYaml ? continueWinYaml : continueWinJson,
         format: useWinYaml ? 'yaml' : 'json',
-        entryPath: 'mcpServers.dkg',
+        entryUnwrap: continueUnwrap,
+        entryWrap: continueWrap,
+        detectIfDirExists: continueWinDir,
       });
     }
   }
@@ -946,6 +1084,7 @@ export function detectClients(): ClientTarget[] {
   return candidates.filter((c) => {
     if (existsSync(c.configPath)) return true;
     if (existsSync(dirname(c.configPath))) return true;
+    if (c.detectIfDirExists && existsSync(c.detectIfDirExists)) return true;
     return false;
   });
 }
@@ -1066,10 +1205,14 @@ function classify(
   expected: Record<string, unknown>,
 ): ClientState {
   const body = readConfigBody(target);
-  const current = readEntryAt(body, target.entryPath) as
-    | Record<string, unknown>
-    | null
-    | undefined;
+  // Issue #437 Codex Review fix: when an `entryUnwrap` is provided
+  // (Continue's list-shape format), use it to extract the entry;
+  // otherwise fall back to the canonical dotted-path walker.
+  const current = (
+    target.entryUnwrap
+      ? target.entryUnwrap(body)
+      : readEntryAt(body, target.entryPath)
+  ) as Record<string, unknown> | null | undefined;
   // Treat both `undefined` (key absent) and `null` (key present but
   // explicitly nulled) as "not-registered". Pre-F7 a `{ dkg: null }`
   // entry classified as `stale`, which made the operator-facing
@@ -1133,25 +1276,30 @@ function writeRegistration(
   entry: Record<string, unknown>,
 ): void {
   const body = readConfigBody(target);
-  const { head, leaf } = splitEntryPath(target.entryPath);
-  const container = ensurePathContainer(body, head);
 
   // Codex Round-15 Fix 22 + Round-19 Fix 26: when refreshing an
   // existing entry, MERGE the entire existing entry — not just
-  // env — with the expected entry. Round-15 Fix 22 added env-merge
-  // (NODE_OPTIONS, HTTPS_PROXY, etc. preserved) but the rest of
-  // the entry was still being replaced wholesale, which clobbered
-  // top-level keys clients use to anchor MCP servers (e.g. `cwd`
-  // for workspace-scoped servers, custom keys like `restartPolicy`).
+  // env — with the expected entry. Spread order: existing entry
+  // first, then expected entry, then explicit env merge. The fields
+  // THIS COMMAND owns are `command`, `args`, and `env.DKG_HOME` —
+  // those override existing values via the second spread + explicit
+  // env override. Everything else passes through from the existing
+  // entry unchanged: arbitrary top-level keys (cwd, restartPolicy,
+  // …) and arbitrary env keys (NODE_OPTIONS, HTTPS_PROXY, …).
   //
-  // Spread order: existing entry first, then expected entry, then
-  // explicit env merge. The fields THIS COMMAND owns are
-  // `command`, `args`, and `env.DKG_HOME` — those override
-  // existing values via the second spread + explicit env override.
-  // Everything else passes through from the existing entry
-  // unchanged: arbitrary top-level keys (cwd, restartPolicy, …)
-  // and arbitrary env keys (NODE_OPTIONS, HTTPS_PROXY, …).
-  const currentEntry = container[leaf];
+  // Issue #437 Codex Review fix: extraction of the existing entry
+  // and re-insertion of the merged entry are dispatched via the
+  // optional `entryUnwrap` / `entryWrap` hooks. Clients whose
+  // config file is shaped as a simple map keyed by server name
+  // (Cursor, Claude Code, Claude Desktop, Windsurf, VSCode + Copilot,
+  // Cline, Codex CLI) leave both hooks unset and the canonical
+  // dotted-path walker handles read + write. Clients with a
+  // wrapper-around-list format (Continue's `mcpServers: [{ name:
+  // 'dkg', … }]`) ship custom unwrap/wrap pairs.
+  const useHooks = !!target.entryUnwrap && !!target.entryWrap;
+  const currentEntry = useHooks
+    ? target.entryUnwrap!(body)
+    : readEntryAt(body, target.entryPath);
   const currentEntryObj =
     currentEntry && typeof currentEntry === 'object'
       ? (currentEntry as Record<string, unknown>)
@@ -1169,6 +1317,14 @@ function writeRegistration(
     ...entry,
     env: { ...currentEnv, ...expectedEnv },
   };
+
+  if (useHooks) {
+    const newBody = target.entryWrap!(body, mergedEntry);
+    writeConfigBody(target, newBody);
+    return;
+  }
+  const { head, leaf } = splitEntryPath(target.entryPath);
+  const container = ensurePathContainer(body, head);
   container[leaf] = mergedEntry;
   writeConfigBody(target, body);
 }

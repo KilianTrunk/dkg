@@ -3093,30 +3093,49 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
-  // ── Issue #437: Continue (YAML / JSON) auto-detect ─────────────────
+  // ── Issue #437 Codex Review fix: Continue dedicated-file + list-shape ──
 
-  it('issue #437: Continue is detected at ~/.continue/config.yaml when YAML present; entry written under mcpServers.dkg', async () => {
+  it('issue #437 (Codex review): Continue writes a DEDICATED ~/.continue/mcpServers/dkg.yaml with list-shape format', async () => {
+    // Codex Review on PR #443 flagged that:
+    //   (1) Continue's `mcpServers` is a LIST of objects with a
+    //       `name` field, NOT a map keyed by server name.
+    //   (2) Inlining into the user's main `~/.continue/config.yaml`
+    //       has unbounded blast-radius (user comments / anchors /
+    //       merge-keys can be lost on YAML round-trip).
+    // Both issues resolved by switching to a dedicated per-server
+    // file at `~/.continue/mcpServers/dkg.yaml`. Continue's docs
+    // explicitly support this convention.
     const continueDir = join(tmpHome, '.continue');
     mkdirSync(continueDir, { recursive: true });
-    const yamlPath = join(continueDir, 'config.yaml');
-    // Pre-create an empty-but-existing YAML file so format-detection
-    // picks YAML.
-    writeFileSync(yamlPath, '');
+    // Continue's installer doesn't pre-create `mcpServers/`; only
+    // `~/.continue/` is guaranteed. Detection must fire from the
+    // grandparent dir (via `detectIfDirExists`).
 
     const deps = makeDeps();
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
+    const yamlPath = join(continueDir, 'mcpServers', 'dkg.yaml');
     expect(existsSync(yamlPath)).toBe(true);
     const written = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
-    expect(written.mcpServers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    // Top-level wrapper keys per Continue's per-server-file schema.
+    expect(written.name).toBe('DKG');
+    expect(written.schema).toBe('v1');
+    expect(written.version).toBe('0.0.1');
+    // mcpServers is a LIST, NOT a map.
+    expect(Array.isArray(written.mcpServers)).toBe(true);
+    expect(written.mcpServers).toHaveLength(1);
+    // The single element is a server object with `name: 'dkg'`
+    // alongside the canonical command/args/env fields.
+    const expected = EXPECTED_INSTALLED_ENTRY();
+    expect(written.mcpServers[0]).toEqual({ name: 'dkg', ...expected });
   });
 
-  it('issue #437: Continue YAML preferred when both config.yaml and config.json exist', async () => {
+  it('issue #437 (Codex review): Continue YAML preferred over JSON when both dkg.{yaml,json} exist', async () => {
     // Match Continue's own loader resolution: yaml wins.
-    const continueDir = join(tmpHome, '.continue');
-    mkdirSync(continueDir, { recursive: true });
-    const yamlPath = join(continueDir, 'config.yaml');
-    const jsonPath = join(continueDir, 'config.json');
+    const serverDir = join(tmpHome, '.continue', 'mcpServers');
+    mkdirSync(serverDir, { recursive: true });
+    const yamlPath = join(serverDir, 'dkg.yaml');
+    const jsonPath = join(serverDir, 'dkg.json');
     writeFileSync(yamlPath, '');
     writeFileSync(jsonPath, '{}\n');
 
@@ -3125,39 +3144,68 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
     // Entry written to YAML, NOT JSON.
     const writtenYaml = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
-    expect(writtenYaml.mcpServers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
-    // JSON file untouched (still empty object).
+    expect(Array.isArray(writtenYaml.mcpServers)).toBe(true);
+    expect(writtenYaml.mcpServers[0].name).toBe('dkg');
+    // JSON file untouched (still the empty object we seeded).
     const writtenJson = JSON.parse(readFileSync(jsonPath, 'utf-8'));
     expect(writtenJson.mcpServers).toBeUndefined();
   });
 
-  it('issue #437: Continue JSON fallback — only config.json present, format detected as json', async () => {
-    const continueDir = join(tmpHome, '.continue');
-    mkdirSync(continueDir, { recursive: true });
-    const jsonPath = join(continueDir, 'config.json');
+  it('issue #437 (Codex review): Continue JSON fallback — only dkg.json present, format detected as json', async () => {
+    const serverDir = join(tmpHome, '.continue', 'mcpServers');
+    mkdirSync(serverDir, { recursive: true });
+    const jsonPath = join(serverDir, 'dkg.json');
     writeFileSync(jsonPath, '{}\n');
 
     const deps = makeDeps();
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
     // YAML sibling MUST NOT be created — fallback resolved to JSON.
-    expect(existsSync(join(continueDir, 'config.yaml'))).toBe(false);
+    expect(existsSync(join(serverDir, 'dkg.yaml'))).toBe(false);
     const written = JSON.parse(readFileSync(jsonPath, 'utf-8'));
-    expect(written.mcpServers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    // Same canonical wrapper + list shape as the YAML path.
+    expect(written.name).toBe('DKG');
+    expect(written.schema).toBe('v1');
+    expect(Array.isArray(written.mcpServers)).toBe(true);
+    expect(written.mcpServers[0].name).toBe('dkg');
   });
 
-  it('issue #437: Continue YAML FIX 26 — refresh preserves user-added top-level keys + env keys', async () => {
-    // Same FIX 26 contract as the Codex CLI / Cursor cases, but
-    // pinned for the YAML serializer path.
-    const continueDir = join(tmpHome, '.continue');
-    mkdirSync(continueDir, { recursive: true });
-    const yamlPath = join(continueDir, 'config.yaml');
+  it('issue #437 (Codex review): Continue detected when only ~/.continue exists (no mcpServers/ subdir yet)', async () => {
+    // Continue's installer creates ~/.continue but NOT
+    // ~/.continue/mcpServers/. The detect-by-parent-dir filter
+    // alone would miss this case; the `detectIfDirExists` field
+    // closes the gap by also accepting the candidate when the
+    // installation root exists.
+    mkdirSync(join(tmpHome, '.continue'), { recursive: true });
+    // No mcpServers/ subdir.
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const yamlPath = join(tmpHome, '.continue', 'mcpServers', 'dkg.yaml');
+    expect(existsSync(yamlPath)).toBe(true);
+    const written = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
+    expect(written.mcpServers[0].name).toBe('dkg');
+  });
+
+  it('issue #437 (Codex review): Continue FIX 26 — refresh preserves user-added top-level entry keys + env keys', async () => {
+    // FIX 26 contract carries forward across the wrap/unwrap
+    // hooks. The merged entry that gets re-inserted into the
+    // mcpServers list element must preserve any user-added keys
+    // (cwd, restartPolicy) and env vars (NODE_OPTIONS, …).
+    const serverDir = join(tmpHome, '.continue', 'mcpServers');
+    mkdirSync(serverDir, { recursive: true });
+    const yamlPath = join(serverDir, 'dkg.yaml');
     writeFileSync(
       yamlPath,
       yaml.dump(
         {
-          mcpServers: {
-            dkg: {
+          name: 'DKG',
+          schema: 'v1',
+          version: '0.0.1',
+          mcpServers: [
+            {
+              name: 'dkg',
               command: '/old/dkg',
               args: ['old'],
               cwd: '/workspaces/x',
@@ -3167,7 +3215,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
               },
               restartPolicy: 'always',
             },
-          },
+          ],
         },
         { lineWidth: -1, noRefs: true },
       ),
@@ -3177,13 +3225,112 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
     const after = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
+    expect(Array.isArray(after.mcpServers)).toBe(true);
+    expect(after.mcpServers).toHaveLength(1);
+    const dkgEl = after.mcpServers[0];
+    // Identity field stable — name MUST stay 'dkg'.
+    expect(dkgEl.name).toBe('dkg');
     // Fields this command owns: refreshed.
-    expect(after.mcpServers.dkg.command).toBe(process.execPath);
-    expect(after.mcpServers.dkg.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    expect(dkgEl.command).toBe(process.execPath);
+    expect(dkgEl.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
     // User-added top-level + env keys: PRESERVED.
-    expect(after.mcpServers.dkg.cwd).toBe('/workspaces/x');
-    expect(after.mcpServers.dkg.restartPolicy).toBe('always');
-    expect(after.mcpServers.dkg.env.NODE_OPTIONS).toBe('--inspect');
+    expect(dkgEl.cwd).toBe('/workspaces/x');
+    expect(dkgEl.restartPolicy).toBe('always');
+    expect(dkgEl.env.NODE_OPTIONS).toBe('--inspect');
+  });
+
+  it("issue #437 (Codex review): Continue's main ~/.continue/config.yaml is NEVER touched", async () => {
+    // Pin the load-bearing blast-radius guarantee: the user's main
+    // `config.yaml` (which may contain comments / anchors / merge
+    // keys / arbitrary settings) is COMPLETELY untouched by
+    // `dkg mcp setup`. We only own files under
+    // `~/.continue/mcpServers/dkg.{yaml,json}`.
+    const continueDir = join(tmpHome, '.continue');
+    mkdirSync(continueDir, { recursive: true });
+    const mainConfigPath = join(continueDir, 'config.yaml');
+    const mainConfigContent =
+      '# User-curated config\n' +
+      'name: my-config\n' +
+      'models:\n' +
+      '  - name: gpt-4\n' +
+      '    provider: openai\n' +
+      '# trailing comment\n';
+    writeFileSync(mainConfigPath, mainConfigContent);
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // Byte-for-byte unchanged.
+    expect(readFileSync(mainConfigPath, 'utf-8')).toBe(mainConfigContent);
+    // And the dedicated file WAS written separately.
+    expect(existsSync(join(continueDir, 'mcpServers', 'dkg.yaml'))).toBe(true);
+  });
+
+  it('issue #437 (Codex review): other files under ~/.continue/mcpServers/ are NEVER touched', async () => {
+    // Same blast-radius guarantee for sibling per-server files: a
+    // user's manually-curated `github.yaml` next to ours stays
+    // byte-identical. We only own `dkg.{yaml,json}` in this dir.
+    const serverDir = join(tmpHome, '.continue', 'mcpServers');
+    mkdirSync(serverDir, { recursive: true });
+    const otherServerPath = join(serverDir, 'github.yaml');
+    const otherServerContent =
+      '# Hand-curated GitHub MCP server\n' +
+      'name: GitHub\n' +
+      'schema: v1\n' +
+      'version: 0.0.1\n' +
+      'mcpServers:\n' +
+      '  - name: github\n' +
+      '    command: gh-mcp\n' +
+      '    args:\n' +
+      '      - serve\n';
+    writeFileSync(otherServerPath, otherServerContent);
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    // Byte-for-byte unchanged.
+    expect(readFileSync(otherServerPath, 'utf-8')).toBe(otherServerContent);
+    // And our dedicated file WAS written separately.
+    expect(existsSync(join(serverDir, 'dkg.yaml'))).toBe(true);
+  });
+
+  it('issue #437 (Codex review): Continue list-shape sibling entries in OUR dkg.yaml preserved on merge', async () => {
+    // Convention is one server per file, but if a user has stuck
+    // an additional server entry into our dkg.yaml file, the merge
+    // must preserve it — the wrap helper finds-by-name and
+    // replaces only the matching element, leaving siblings alone.
+    const serverDir = join(tmpHome, '.continue', 'mcpServers');
+    mkdirSync(serverDir, { recursive: true });
+    const yamlPath = join(serverDir, 'dkg.yaml');
+    writeFileSync(
+      yamlPath,
+      yaml.dump(
+        {
+          name: 'DKG',
+          schema: 'v1',
+          version: '0.0.1',
+          mcpServers: [
+            // User-added sibling FIRST in the list.
+            { name: 'github-sibling', command: 'gh-mcp', args: ['serve'] },
+            { name: 'dkg', command: '/old/dkg', args: ['old'], env: { DKG_HOME: '/old' } },
+          ],
+        },
+        { lineWidth: -1, noRefs: true },
+      ),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
+    expect(after.mcpServers).toHaveLength(2);
+    // Sibling preserved at its original index.
+    const sibling = after.mcpServers.find((e: any) => e.name === 'github-sibling');
+    expect(sibling).toEqual({ name: 'github-sibling', command: 'gh-mcp', args: ['serve'] });
+    // dkg refreshed.
+    const dkgEl = after.mcpServers.find((e: any) => e.name === 'dkg');
+    expect(dkgEl.command).toBe(process.execPath);
+    expect(dkgEl.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
   });
 
   // ── Issue #437: format-dispatch round-trip sanity ────────────────────
@@ -3210,16 +3357,13 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
   it('issue #437: YAML round-trip — write then read returns deep-equal object', async () => {
     // Same round-trip sanity as the TOML test, but for the YAML
-    // serializer path.
-    const continueDir = join(tmpHome, '.continue');
-    mkdirSync(continueDir, { recursive: true });
-    const yamlPath = join(continueDir, 'config.yaml');
-    // Touch so format-detection picks YAML.
-    writeFileSync(yamlPath, '');
+    // serializer path. Uses the dedicated per-server file path.
+    mkdirSync(join(tmpHome, '.continue'), { recursive: true });
 
     const deps = makeDeps();
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
+    const yamlPath = join(tmpHome, '.continue', 'mcpServers', 'dkg.yaml');
     const written = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
     const reSerialised = yaml.dump(written, { lineWidth: -1, noRefs: true });
     const reParsed = yaml.load(reSerialised);

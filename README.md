@@ -450,7 +450,6 @@ This is a pnpm + Turborepo monorepo.
 @origintrail-official/dkg-adapter-openclaw        OpenClaw gateway bridge
 @origintrail-official/dkg-adapter-elizaos         ElizaOS plugin (embedded DKGAgent)
 @origintrail-official/dkg-adapter-hermes          Hermes Agent (Python memory provider + TypeScript setup/client helpers)
-@origintrail-official/dkg-adapter-autoresearch    AutoResearch integration
 ```
 
 ---
@@ -480,7 +479,7 @@ DKG V10 is a **release candidate** on the testnet. Core capabilities are impleme
 - File ingestion pipeline (PDF, DOCX, HTML, Markdown) into WM assertions
 - Agent discovery and encrypted messaging
 - Dashboard UI with chat memory, SPARQL explorer, project management
-- Framework adapters for OpenClaw, ElizaOS, Hermes, AutoResearch
+- Framework adapters for OpenClaw, ElizaOS, Hermes
 - MCP server for Cursor / Claude Code / other coding assistants
 - Community integrations registry (`dkg integration list|info|install`) with install-time provenance verification for CLI-kind installs
 - Blue-green update and rollback flow

@@ -138,13 +138,6 @@ export const kosavaAdapterHermesCoverage: CoverageThresholds = {
   statements: 60,
 };
 
-export const kosavaAdapterAutoresearchCoverage: CoverageThresholds = {
-  lines: 90,
-  functions: 99,
-  branches: 77,
-  statements: 91,
-};
-
 export const kosavaEpcisCoverage: CoverageThresholds = {
   lines: 97,
   functions: 95,

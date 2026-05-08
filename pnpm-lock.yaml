@@ -75,22 +75,6 @@ importers:
         specifier: workspace:*
         version: link:../packages/storage
 
-  packages/adapter-autoresearch:
-    dependencies:
-      '@modelcontextprotocol/sdk':
-        specifier: ^1
-        version: 1.27.1(zod@3.25.76)
-      zod:
-        specifier: ^3.25
-        version: 3.25.76
-    devDependencies:
-      '@vitest/coverage-v8':
-        specifier: ^4.0.18
-        version: 4.0.18(vitest@4.0.18(@types/node@22.19.11)(happy-dom@20.8.3(bufferutil@4.1.0)(utf-8-validate@5.0.10))(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.3))
-      vitest:
-        specifier: ^4.0.18
-        version: 4.0.18(@types/node@22.19.11)(happy-dom@20.8.3(bufferutil@4.1.0)(utf-8-validate@5.0.10))(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.3)
-
   packages/adapter-elizaos:
     dependencies:
       '@origintrail-official/dkg-agent':
@@ -499,10 +483,6 @@ importers:
       vitest:
         specifier: ^4.0.18
         version: 4.0.18(@types/node@22.19.11)(happy-dom@20.8.3(bufferutil@4.1.0)(utf-8-validate@5.0.10))(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.3)
-    optionalDependencies:
-      '@origintrail-official/dkg-adapter-autoresearch':
-        specifier: workspace:*
-        version: link:../adapter-autoresearch
 
   packages/network-sim:
     dependencies:

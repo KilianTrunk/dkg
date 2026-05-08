@@ -172,13 +172,6 @@ An OpenClaw plugin adapter that turns any OpenClaw agent into a DKG v9 node. Fol
 
 **Depends on**: `core`, `storage`, `agent`.
 
-### @origintrail-official/dkg-adapter-autoresearch
-`packages/adapter-autoresearch/`
-
-An adapter for the AutoResearch framework that integrates DKG capabilities into autonomous research pipelines.
-
-**Depends on**: `core`, `agent`.
-
 ### @origintrail-official/dkg-mcp-server
 `packages/mcp-server/`
 

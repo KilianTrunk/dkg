@@ -33,8 +33,20 @@ export type AdapterRegisterFn = (
 ) => void;
 
 /** Short-name → package-id map for first-party adapters. */
-const ADAPTER_MAP: Record<string, string> = {
-  autoresearch: '@origintrail-official/dkg-adapter-autoresearch',
+const ADAPTER_MAP: Record<string, string> = {};
+
+/**
+ * Aliases that previously mapped to a first-party adapter but have been
+ * retired. Loading them throws an explicit deprecation error rather than
+ * falling through to `import(name)`, which would otherwise resolve to
+ * whatever unscoped npm package happens to be installed under that name.
+ */
+const RETIRED_ALIASES: Record<string, string> = {
+  autoresearch:
+    'the "autoresearch" alias has been retired. If you still need it, set ' +
+    'DKG_ADAPTERS to the full package id ' +
+    '(@origintrail-official/dkg-adapter-autoresearch) and ensure the package ' +
+    'is installed.',
 };
 
 function formatError(e: unknown): string {
@@ -59,6 +71,8 @@ export async function loadAdapters(
   for (const name of names) {
     const pkg = ADAPTER_MAP[name] ?? name;
     try {
+      const retired = RETIRED_ALIASES[name];
+      if (retired) throw new Error(retired);
       const mod = (await import(pkg)) as { registerTools?: AdapterRegisterFn };
       if (typeof mod.registerTools === 'function') {
         mod.registerTools(server, client, config);

@@ -19,7 +19,6 @@ export default defineConfig({
       'packages/adapter-openclaw',
       'packages/adapter-elizaos',
       'packages/adapter-hermes',
-      'packages/adapter-autoresearch',
     ],
   },
 });

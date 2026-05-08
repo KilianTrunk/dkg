@@ -25,6 +25,25 @@ export interface KCMetadata {
   allowedPeers?: string[];
   timestamp: Date;
   subGraphName?: string;
+  /**
+   * RFC-001 §3.5 off-chain provenance mirror. When both `authorAddress`
+   * and `publishOperationId` are supplied, `generateKCMetadata` emits a
+   * `dkg:Publication` resource at `urn:dkg:publication:{publishOperationId}`
+   * carrying:
+   *   a dkg:Publication ;
+   *   dkg:publishOperationId "..." ;
+   *   dkg:contextGraphId "..." ;
+   *   dkg:merkleRoot "0x..."^^xsd:hexBinary ;
+   *   dkg:authoredBy "0x..." .
+   * and links each KA via `<kaUri> dkg:publication <publication-uri>`.
+   *
+   * These triples are pure SPARQL-filtering convenience — the on-chain
+   * `KnowledgeBatch.authorAddress` remains canonical (RFC-001 §3.5,
+   * point 1). Implementations that don't need rich provenance queries
+   * can omit these fields and the publication subject is not emitted.
+   */
+  authorAddress?: string;
+  publishOperationId?: string;
 }
 
 export interface KAMetadata {
@@ -146,6 +165,25 @@ export function generateKCMetadata(
     }
   }
 
+  // RFC-001 §3.5 — optional `dkg:Publication` provenance subject. Emitted
+  // only when both `authorAddress` and `publishOperationId` are supplied
+  // so existing callers that don't propagate author identity see no
+  // behavior change.
+  if (meta.authorAddress && meta.publishOperationId) {
+    const publicationUri = `urn:dkg:publication:${meta.publishOperationId}`;
+    quads.push(
+      mq(publicationUri, `${RDF}type`, `${DKG}Publication`, metaGraph),
+      mq(publicationUri, `${DKG}publishOperationId`, lit(meta.publishOperationId), metaGraph),
+      mq(publicationUri, `${DKG}contextGraphId`, lit(meta.contextGraphId), metaGraph),
+      mq(publicationUri, `${DKG}merkleRoot`, hexLit(toHex(meta.merkleRoot)), metaGraph),
+      mq(publicationUri, `${DKG}authoredBy`, lit(meta.authorAddress), metaGraph),
+    );
+    for (const ka of kaEntries) {
+      const kaUri = `${ka.kcUal}/${ka.tokenId}`;
+      quads.push(mq(kaUri, `${DKG}publication`, publicationUri, metaGraph));
+    }
+  }
+
   return quads;
 }
 
@@ -244,6 +282,14 @@ function intLit(val: number | bigint): string {
 
 function dateLit(d: Date): string {
   return `"${d.toISOString()}"^^<${XSD}dateTime>`;
+}
+
+function hexLit(hex: string): string {
+  // RFC-001 §3.5 emits `dkg:merkleRoot "0x{hex}"^^xsd:hexBinary` on the
+  // publication subject. `toHex` returns the bare hex; prepend `0x` and
+  // tag with the canonical xsd:hexBinary datatype.
+  const prefixed = hex.startsWith('0x') ? hex : `0x${hex}`;
+  return `"${prefixed}"^^<${XSD}hexBinary>`;
 }
 
 /**

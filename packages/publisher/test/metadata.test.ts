@@ -123,6 +123,98 @@ describe('generateKCMetadata', () => {
   });
 });
 
+describe('generateKCMetadata — RFC-001 §3.5 publication provenance', () => {
+  // Both fields together unlock the publication subject. Either alone is
+  // a no-op, matching the existing behaviour for callers that don't
+  // propagate the new fields.
+
+  const AUTHOR = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
+  const OP_ID = 'session-abc-7';
+  const PUBLICATION_URI = `urn:dkg:publication:${OP_ID}`;
+
+  it('emits no publication subject when authorAddress and publishOperationId are both omitted', () => {
+    const quads = generateKCMetadata(makeMeta(), [makeKA()]);
+    const pub = quads.find(q => q.subject === PUBLICATION_URI);
+    expect(pub).toBeUndefined();
+    const authoredBy = quads.find(q => q.predicate === `${DKG}authoredBy`);
+    expect(authoredBy).toBeUndefined();
+  });
+
+  it('emits no publication subject when only authorAddress is provided', () => {
+    const quads = generateKCMetadata(makeMeta({ authorAddress: AUTHOR }), [makeKA()]);
+    const pub = quads.find(q => q.predicate === RDF_TYPE && q.object === `${DKG}Publication`);
+    expect(pub).toBeUndefined();
+  });
+
+  it('emits no publication subject when only publishOperationId is provided', () => {
+    const quads = generateKCMetadata(makeMeta({ publishOperationId: OP_ID }), [makeKA()]);
+    const pub = quads.find(q => q.predicate === RDF_TYPE && q.object === `${DKG}Publication`);
+    expect(pub).toBeUndefined();
+  });
+
+  it('emits the dkg:Publication subject with all five RFC-001 §3.5 predicates when both are set', () => {
+    const meta = makeMeta({ authorAddress: AUTHOR, publishOperationId: OP_ID });
+    const quads = generateKCMetadata(meta, [makeKA()]);
+
+    const pubQuads = quads.filter(q => q.subject === PUBLICATION_URI);
+    const preds = new Map(pubQuads.map(q => [q.predicate, q.object]));
+
+    expect(preds.get(RDF_TYPE)).toBe(`${DKG}Publication`);
+    expect(preds.get(`${DKG}publishOperationId`)).toBe(`"${OP_ID}"`);
+    expect(preds.get(`${DKG}contextGraphId`)).toBe(`"${PARANET}"`);
+    expect(preds.get(`${DKG}authoredBy`)).toBe(`"${AUTHOR}"`);
+    // merkleRoot serialised as `"0x..."^^xsd:hexBinary` per RFC-001 §3.5.
+    const root = preds.get(`${DKG}merkleRoot`);
+    expect(root).toBeDefined();
+    expect(root).toMatch(/^"0x[0-9a-f]+"\^\^<http:\/\/www\.w3\.org\/2001\/XMLSchema#hexBinary>$/);
+  });
+
+  it('all publication quads land in the meta graph (not the data graph)', () => {
+    const meta = makeMeta({ authorAddress: AUTHOR, publishOperationId: OP_ID });
+    const quads = generateKCMetadata(meta, [makeKA()]);
+    for (const q of quads.filter(q => q.subject === PUBLICATION_URI)) {
+      expect(q.graph).toBe(META_GRAPH);
+    }
+  });
+
+  it('links each KA to the publication subject via dkg:publication', () => {
+    const meta = makeMeta({ authorAddress: AUTHOR, publishOperationId: OP_ID });
+    const kas = [makeKA({ tokenId: 1n }), makeKA({ tokenId: 2n })];
+    const quads = generateKCMetadata(meta, kas);
+
+    const linkQuads = quads.filter(q => q.predicate === `${DKG}publication`);
+    expect(linkQuads).toHaveLength(2);
+    expect(linkQuads.every(q => q.object === PUBLICATION_URI)).toBe(true);
+    expect(new Set(linkQuads.map(q => q.subject))).toEqual(
+      new Set([`${UAL}/1`, `${UAL}/2`]),
+    );
+  });
+
+  it('publication subject is stable across tentative and confirmed forms (same publishOperationId)', () => {
+    // Confirms RFC-001 §3.5: the publication URI uses the
+    // publishOperationId, not the (unstable) UAL, so a publish that is
+    // first emitted as tentative and later promoted to confirmed
+    // continues to point at the same `dkg:Publication` subject.
+    const tentMeta = makeMeta({
+      ual: 'did:dkg:mock/0xabcd/t-session-abc-7',
+      authorAddress: AUTHOR,
+      publishOperationId: OP_ID,
+    });
+    const confMeta = makeMeta({
+      ual: 'did:dkg:mock/0xabcd/101',
+      authorAddress: AUTHOR,
+      publishOperationId: OP_ID,
+    });
+    const tentQuads = generateKCMetadata(tentMeta, [makeKA({ kcUal: tentMeta.ual })]);
+    const confQuads = generateKCMetadata(confMeta, [makeKA({ kcUal: confMeta.ual })]);
+
+    const tentSubject = tentQuads.find(q => q.predicate === RDF_TYPE && q.object === `${DKG}Publication`)?.subject;
+    const confSubject = confQuads.find(q => q.predicate === RDF_TYPE && q.object === `${DKG}Publication`)?.subject;
+    expect(tentSubject).toBe(PUBLICATION_URI);
+    expect(confSubject).toBe(PUBLICATION_URI);
+  });
+});
+
 describe('generateTentativeMetadata', () => {
   it('adds dkg:status "tentative" quad', () => {
     const quads = generateTentativeMetadata(makeMeta(), [makeKA()]);

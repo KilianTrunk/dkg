@@ -1693,7 +1693,11 @@ export class DKGPublisher implements Publisher {
     let onChainResult: OnChainPublishResult | undefined;
     let status: 'tentative' | 'confirmed' = 'tentative';
     const tentativeSeq = ++this.tentativeCounter;
-    let ual = `did:dkg:${this.chain.chainId}/${publisherAddress}/t${this.sessionId}-${tentativeSeq}`;
+    // RFC-001 §3.5 publication identifier. Stable across tentative and
+    // confirmed states for this publish so the `dkg:Publication` subject
+    // emitted in metadata stays the same after on-chain confirmation.
+    const publishOperationId = `${this.sessionId}-${tentativeSeq}`;
+    let ual = `did:dkg:${this.chain.chainId}/${publisherAddress}/t${publishOperationId}`;
 
     const identityId = this.publisherNodeIdentityId;
     let usedV10Path = false;
@@ -1819,7 +1823,7 @@ export class DKGPublisher implements Publisher {
         };
         try {
           onChainResult = await this.chain.createKnowledgeAssetsV10!({
-            publishOperationId: `${this.sessionId}-${tentativeSeq}`,
+            publishOperationId,
             contextGraphId: v10CgId,
             publisherAddress: publisherSigner.address,
             merkleRoot: kcMerkleRoot,
@@ -1868,6 +1872,8 @@ export class DKGPublisher implements Publisher {
             allowedPeers: normalizedAllowedPeers,
             timestamp: new Date(),
             subGraphName: options.subGraphName,
+            authorAddress: publisherSigner.address,
+            publishOperationId,
           },
           kaMetadata,
           {
@@ -1929,6 +1935,13 @@ export class DKGPublisher implements Publisher {
       for (const km of kaMetadata) {
         km.kcUal = ual;
       }
+      // RFC-001 §3.5: emit `dkg:authoredBy` triple even on tentative
+      // publishes so a publish that never reaches the chain still carries
+      // its self-claimed author identity locally. The on-chain
+      // `KnowledgeBatch.authorAddress` is canonical only once the publish
+      // confirms; until then this is a self-claim. `publisherSigner` may be
+      // undefined (no-chain / no-key path); skip the field in that case so
+      // the publication subject is not emitted with a missing author.
       let tentativeQuads = generateTentativeMetadata(
         {
           ual,
@@ -1940,6 +1953,9 @@ export class DKGPublisher implements Publisher {
           allowedPeers: normalizedAllowedPeers,
           timestamp: new Date(),
           subGraphName: options.subGraphName,
+          ...(publisherSigner
+            ? { authorAddress: publisherSigner.address, publishOperationId }
+            : {}),
         },
         kaMetadata,
       );

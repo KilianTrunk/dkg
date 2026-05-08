@@ -120,7 +120,6 @@ import { type ExtractionStatusRecord, getExtractionStatusRecord, setExtractionSt
 import { FileStore } from '../file-store.js';
 import { VectorStore, OpenAIEmbeddingProvider, type EmbeddingProvider } from '../vector-store.js';
 import { parseBoundary, parseMultipart, MultipartParseError } from '../http/multipart.js';
-import { handleCapture, EpcisValidationError, handleEventsQuery, EpcisQueryError, type Publisher as EpcisPublisher } from '@origintrail-official/dkg-epcis';
 // Phase 8 — project-manifest publish + install (UI-driven onboarding flow).
 // Daemon constructs a self-pointing DkgClient (localhost:listenPort) and
 // reuses the same publish/fetch/plan/write helpers the CLI uses, so wire
@@ -761,7 +760,7 @@ export async function runDaemonInner(
   }
 
   // Ensure configured context graphs + network defaults are subscribed and available.
-  // Uses ensureParanetLocal (idempotent) to avoid duplicate creator claims
+  // Uses ensureContextGraphLocal (idempotent) to avoid duplicate creator claims
   // and to survive "already exists" gracefully.
   const contextGraphsToSubscribe = new Set(syncContextGraphs);
   for (const p of contextGraphsToSubscribe) {
@@ -1127,7 +1126,7 @@ export async function runDaemonInner(
   agent.eventBus.on(DKGEvent.KC_PUBLISHED, (data: any) => {
     const ctx = createOperationContext("publish");
     tracker.start(ctx, {
-      contextGraphId: data.paranetId,
+      contextGraphId: data.contextGraphId,
       details: { kcId: data.kcId, source: "gossipsub" },
     });
     tracker.complete(ctx, { tripleCount: data.tripleCount });
@@ -1136,11 +1135,11 @@ export async function runDaemonInner(
         ts: Date.now(),
         type: "kc_published",
         title: "Knowledge published",
-        message: `Knowledge collection published${data.paranetId ? ` on context graph ${shortId(data.paranetId)}` : ""}`,
+        message: `Knowledge collection published${data.contextGraphId ? ` on context graph ${shortId(data.contextGraphId)}` : ""}`,
         source: "dkg",
         meta: JSON.stringify({
           kcId: data.kcId,
-          contextGraphId: data.paranetId,
+          contextGraphId: data.contextGraphId,
         }),
       });
     } catch {
@@ -1407,7 +1406,7 @@ export async function runDaemonInner(
 
   const catchupTracker: CatchupTracker = {
     jobs: new Map(),
-    latestByParanet: new Map(),
+    latestByContextGraph: new Map(),
   };
 
   // --- Extraction Pipelines ---

@@ -304,8 +304,8 @@ jobs:
 
   # ------------------------------------------------------------------
   # Bura lane — `cli` is the heaviest BURA package (CLI daemon, HTTP API,
-  # auth, keystore, migration, indexer) so it owns a runner. The other
-  # two BURA packages (`query`, `attested-assets`) fit on one runner.
+  # auth, keystore, migration, indexer) so it owns a runner. The
+  # remaining BURA package (`query`) runs on its own runner.
   #
   # Tier: BURA — `dkgv10-spec/CRITICALITY_CATEGORIZATION.md` §1. Packages
   # on the critical path for users/operators; auth & quorum bugs here
@@ -335,7 +335,7 @@ jobs:
         run: pnpm --filter @origintrail-official/dkg test
 
   bura-supporting:
-    name: "Bura: query + attested-assets"
+    name: "Bura: query"
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -354,12 +354,8 @@ jobs:
           path: /tmp
       - name: Restore build outputs
         run: tar -xzf /tmp/build-outputs.tgz
-      - name: "Query + attested-assets tests"
-        run: |
-          pnpm \
-            --filter @origintrail-official/dkg-query \
-            --filter @origintrail-official/dkg-attested-assets \
-            run test
+      - name: "Query tests"
+        run: pnpm --filter @origintrail-official/dkg-query run test
 
   # ------------------------------------------------------------------
   # Kosava lanes — `node-ui` is heavy (React Testing Library, happy-dom)

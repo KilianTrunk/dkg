@@ -28,7 +28,7 @@ import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 
-let PARANET: string;
+let CONTEXT_GRAPH: string;
 let GRAPH: string;
 const ENTITY = 'did:dkg:agent:QmLifecycle';
 const TEST_WALLET = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
@@ -46,8 +46,8 @@ beforeAll(async () => {
   await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
   const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
   const cgId = await createTestContextGraph(chain);
-  PARANET = String(cgId);
-  GRAPH = `did:dkg:context-graph:${PARANET}`;
+  CONTEXT_GRAPH = String(cgId);
+  GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
 });
 afterAll(async () => {
   await revertSnapshot(_topSnapshot);
@@ -84,7 +84,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     ];
 
     const result = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
 
@@ -119,7 +119,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     ];
 
     const result = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
 
@@ -155,7 +155,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     ];
 
     const result = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: fixedQuads,
     });
 
@@ -186,7 +186,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
     const result1 = await publisher1.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: orderA,
     });
 
@@ -201,7 +201,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
     const result2 = await publisher2.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: orderB,
     });
 
@@ -223,7 +223,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     });
 
     const result = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"PrivBot"')],
       privateQuads: [q(ENTITY, 'http://ex.org/secret', '"s3cret"')],
       publisherPeerId: '12D3KooWTestPublisher',
@@ -297,7 +297,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
     ];
 
     const result = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
 
@@ -333,7 +333,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
     ];
 
     const result = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
 
@@ -366,7 +366,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
     ];
 
     const result = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       publisherPeerId: 'test-peer',
       quads: publicTriples,
       privateQuads: privateTriples,
@@ -417,7 +417,7 @@ describe('Tentative data and chain event confirmation', () => {
     const reqBytes = encodePublishRequest({
       ual,
       nquads: new TextEncoder().encode(ntriples),
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       kas: [{ tokenId: 1, rootEntity: 'did:dkg:agent:QmTentative', privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
       publisherIdentity: new Uint8Array(32),
       publisherAddress,
@@ -459,7 +459,7 @@ describe('Tentative data and chain event confirmation', () => {
     const reqBytes = encodePublishRequest({
       ual,
       nquads: new TextEncoder().encode(ntriples),
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       kas: [{ tokenId: 1, rootEntity: 'did:dkg:agent:QmNoRange', privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
       publisherIdentity: new Uint8Array(32),
       publisherAddress,
@@ -496,7 +496,7 @@ describe('Tentative data and chain event confirmation', () => {
     const reqBytes = encodePublishRequest({
       ual,
       nquads: new TextEncoder().encode(ntriples),
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       kas: [{ tokenId: 1, rootEntity: 'did:dkg:agent:QmMisAddr', privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
       publisherIdentity: new Uint8Array(32),
       publisherAddress,
@@ -535,7 +535,7 @@ describe('Tentative data and chain event confirmation', () => {
     const reqBytes = encodePublishRequest({
       ual,
       nquads: new TextEncoder().encode(ntriples),
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       kas: [{ tokenId: 1, rootEntity: 'did:dkg:agent:QmMisRoot', privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
       publisherIdentity: new Uint8Array(32),
       publisherAddress,
@@ -577,7 +577,7 @@ describe('Tentative data and chain event confirmation', () => {
     const reqBytes = encodePublishRequest({
       ual,
       nquads: new TextEncoder().encode(ntriples),
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       kas: [{ tokenId: 1, rootEntity: 'did:dkg:agent:QmByRoot', privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
       publisherIdentity: new Uint8Array(32),
       publisherAddress,
@@ -624,7 +624,7 @@ describe('Tentative data and chain event confirmation', () => {
 
     const triples = [q('did:dkg:agent:QmPolled', 'http://schema.org/name', '"PollBot"')];
     const publishResult = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
 
@@ -643,7 +643,7 @@ describe('Tentative data and chain event confirmation', () => {
     const reqBytes = encodePublishRequest({
       ual,
       nquads: new TextEncoder().encode(ntriples),
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       kas: [{ tokenId: 1, rootEntity: 'did:dkg:agent:QmPolled', privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
       publisherIdentity: new Uint8Array(32),
       publisherAddress: onChain.publisherAddress,
@@ -738,7 +738,7 @@ describe('Update flow', () => {
     ];
 
     const publishResult = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: initialTriples,
     });
 
@@ -759,7 +759,7 @@ describe('Update flow', () => {
     ];
 
     const updateResult = await publisher.update(kcId, {
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: updatedTriples,
     });
 
@@ -793,14 +793,14 @@ describe('Update flow', () => {
     const entity = 'did:dkg:agent:QmPrivUpdate';
 
     const result1 = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"PrivUpdateBot"')],
       privateQuads: [q(entity, 'http://ex.org/secret', '"old-secret"')],
       publisherPeerId: '12D3KooWTestPublisher',
     });
 
     await publisher.update(result1.kcId, {
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"PrivUpdateBot v2"')],
       privateQuads: [q(entity, 'http://ex.org/secret', '"new-secret"')],
     });
@@ -829,14 +829,14 @@ describe('Update flow', () => {
 
     const entity = 'did:dkg:agent:QmChainUpdate';
     const result1 = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"ChainBot v1"')],
     });
 
     const oldMerkleHex = Buffer.from(result1.merkleRoot).toString('hex');
 
     const result2 = await publisher.update(result1.kcId, {
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"ChainBot v2"')],
     });
 
@@ -874,7 +874,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const uals = new Set<string>();
     for (let i = 0; i < 5; i++) {
       const result = await publisher.publish({
-        contextGraphId: PARANET,
+        contextGraphId: CONTEXT_GRAPH,
         quads: [q(`did:dkg:agent:Unique${i}`, 'http://schema.org/name', `"Entity${i}"`)],
       });
 
@@ -900,7 +900,7 @@ describe('Tentative publish UAL uniqueness', () => {
     });
 
     const result = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"ConfirmedUAL"')],
     });
 
@@ -923,7 +923,7 @@ describe('Tentative publish UAL uniqueness', () => {
 
     for (let i = 0; i < 3; i++) {
       await publisher.publish({
-        contextGraphId: PARANET,
+        contextGraphId: CONTEXT_GRAPH,
         quads: [q(`did:dkg:agent:Meta${i}`, 'http://schema.org/name', `"MetaEntity${i}"`)],
       });
     }
@@ -958,7 +958,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const onPhase = (phase: string, status: 'start' | 'end') => phases.push([phase, status]);
 
     await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"PhaseTest"')],
       onPhase,
     });
@@ -987,7 +987,7 @@ describe('Tentative publish UAL uniqueness', () => {
     });
 
     const pub = await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"Original"')],
     });
 
@@ -995,7 +995,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const onPhase = (phase: string, status: 'start' | 'end') => phases.push([phase, status]);
 
     await publisher.update(pub.kcId, {
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"Updated"')],
       onPhase,
     });
@@ -1044,7 +1044,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const onPhase = (phase: string, status: 'start' | 'end') => phases.push([phase, status]);
 
     await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"V10 Staging Test"')],
       v10ACKProvider,
       onPhase,

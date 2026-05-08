@@ -1,8 +1,8 @@
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
-  paranetPublishTopic, paranetWorkspaceTopic, paranetAppTopic, paranetUpdateTopic, paranetFinalizationTopic,
-  paranetDataGraphUri, paranetMetaGraphUri, paranetWorkspaceGraphUri, paranetWorkspaceMetaGraphUri,
+  contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
+  contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
   contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
@@ -15,7 +15,7 @@ import {
   GOSSIP_ENVELOPE_VERSION,
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
   encodeFinalizationMessage, type FinalizationMessageMsg,
-  getGenesisQuads, computeNetworkId, SYSTEM_PARANETS, DKG_ONTOLOGY,
+  getGenesisQuads, computeNetworkId, SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY,
   Logger, createOperationContext, sparqlString, escapeSparqlLiteral,
   TrustLevel,
   type DKGNodeConfig, type OperationContext, type GetView, type AssertionDescriptor, type AssertionEvent, type AssertionState,
@@ -362,9 +362,6 @@ export interface ContextGraphMembershipStore {
   upsert(record: ContextGraphMembershipRecord & { firstSeenAt?: number; updatedAt: number }): Promise<void>;
   delete(contextGraphId: string, principalType: ContextGraphMemberPrincipalType, principalId: string): Promise<void>;
 }
-
-/** @deprecated Use ContextGraphSub */
-export type ParanetSub = ContextGraphSub;
 
 export interface DurableSyncDiagnostics {
   fetchedMetaTriples: number;
@@ -1258,7 +1255,7 @@ export class DKGAgent {
         agentPrivateKey: verifySignerKey,
         agentAddress: verifyWallet.address,
         getBatchMerkleRoot: async (cgId: string, batchId: bigint) => {
-          const metaGraph = paranetMetaGraphUri(cgId);
+          const metaGraph = contextGraphMetaGraphUri(cgId);
           // Try typed literal first, fallback to untyped for backward compat
           for (const literal of [`"${batchId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, `"${batchId}"`]) {
             const result = await this.store.query(
@@ -1477,7 +1474,7 @@ export class DKGAgent {
     });
 
     // Subscribe to both system context graph GossipSub topics
-    for (const systemContextGraph of [SYSTEM_PARANETS.AGENTS, SYSTEM_PARANETS.ONTOLOGY]) {
+    for (const systemContextGraph of [SYSTEM_CONTEXT_GRAPHS.AGENTS, SYSTEM_CONTEXT_GRAPHS.ONTOLOGY]) {
       this.subscribeToContextGraph(systemContextGraph);
     }
 
@@ -1804,7 +1801,7 @@ export class DKGAgent {
    */
   async syncFromPeer(
     remotePeerId: string,
-    contextGraphIds: string[] = [SYSTEM_PARANETS.AGENTS, SYSTEM_PARANETS.ONTOLOGY, ...(this.config.syncContextGraphs ?? [])],
+    contextGraphIds: string[] = [SYSTEM_CONTEXT_GRAPHS.AGENTS, SYSTEM_CONTEXT_GRAPHS.ONTOLOGY, ...(this.config.syncContextGraphs ?? [])],
     onPhase?: PhaseCallback,
     onAccessDenied?: (contextGraphId: string) => void,
   ): Promise<number> {
@@ -1932,9 +1929,9 @@ export class DKGAgent {
       createContextGraphSyncDeadline: this.createContextGraphSyncDeadline.bind(this),
       fetchSyncPages: this.fetchSyncPages.bind(this),
       processSharedMemoryBatch: (wsDataQuads, wsMetaQuads) => this.getOrCreateSyncVerifyWorker().processSharedMemoryBatch(wsDataQuads, wsMetaQuads),
-      ensureParanet: async (contextGraphId) => {
+      ensureContextGraph: async (contextGraphId) => {
         const graphManager = new GraphManager(this.store);
-        await graphManager.ensureParanet(contextGraphId);
+        await graphManager.ensureContextGraph(contextGraphId);
       },
       storeInsert: (quads) => this.store.insert(quads),
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
@@ -2419,11 +2416,11 @@ export class DKGAgent {
   }
 
   private async hasConfirmedMetaState(contextGraphId: string): Promise<boolean> {
-    if ((Object.values(SYSTEM_PARANETS) as string[]).includes(contextGraphId)) {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return true;
     }
 
-    const metaGraph = paranetMetaGraphUri(contextGraphId);
+    const metaGraph = contextGraphMetaGraphUri(contextGraphId);
     const metaResult = await this.store.query(
       `ASK WHERE { GRAPH <${metaGraph}> { ?s ?p ?o } }`,
     );
@@ -2431,13 +2428,13 @@ export class DKGAgent {
       return true;
     }
 
-    // Ontology-only fallback: a CG declared `rdf:type dkg:Paranet` can be
+    // Ontology-only fallback: a CG declared `rdf:type dkg:ContextGraph` can be
     // treated as confirmably-public for the gossip race-opener ONLY when
-    // no local evidence of a restriction exists. Raw paranet declaration
+    // no local evidence of a restriction exists. Raw contextGraph declaration
     // is not enough on its own — `inviteToContextGraph` writes
     // `dkg:allowedPeer` straight to `_meta` without updating ontology, so
     // a CG that was announced publicly and later allowlisted would look
-    // "just a paranet" here even though the curator expects the allowlist
+    // "just a contextGraph" here even though the curator expects the allowlist
     // to gate gossip. Require `isPrivateContextGraph()` (now also reads
     // `DKG_ALLOWED_PEER`) to explicitly return false before honoring the
     // bypass.
@@ -2445,12 +2442,12 @@ export class DKGAgent {
       return false;
     }
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const contextGraphUri = paranetDataGraphUri(contextGraphId);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
     const ontologyResult = await this.store.query(
       `ASK WHERE {
         GRAPH <${ontologyGraph}> {
-          <${contextGraphUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}> .
+          <${contextGraphUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
         }
       }`,
     );
@@ -2547,11 +2544,11 @@ export class DKGAgent {
 
     try {
       const graphManager = new GraphManager(this.store);
-      const contextGraphs = await graphManager.listParanets();
+      const contextGraphs = await graphManager.listContextGraphs();
 
       for (const pid of contextGraphs) {
-        const wsGraph = paranetWorkspaceGraphUri(pid);
-        const wsMetaGraph = paranetWorkspaceMetaGraphUri(pid);
+        const wsGraph = contextGraphWorkspaceGraphUri(pid);
+        const wsMetaGraph = contextGraphWorkspaceMetaGraphUri(pid);
         let graphDeleted = 0;
 
         const expiredOps = await this.store.query(
@@ -2652,7 +2649,7 @@ export class DKGAgent {
     // and don't need to be re-advertised in every profile.
     const publicServed: string[] = [];
     for (const [id, sub] of this.subscribedContextGraphs) {
-      if (id === SYSTEM_PARANETS.AGENTS || id === SYSTEM_PARANETS.ONTOLOGY) continue;
+      if (id === SYSTEM_CONTEXT_GRAPHS.AGENTS || id === SYSTEM_CONTEXT_GRAPHS.ONTOLOGY) continue;
       if (!sub.subscribed) continue;
       if (await this.isPrivateContextGraph(id)) continue;
       publicServed.push(id);
@@ -3304,8 +3301,8 @@ export class DKGAgent {
       add(agentAddress);
     }
 
-    const contextGraphUri = paranetDataGraphUri(contextGraphId);
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const result = await this.store.query(
       `SELECT ?agent WHERE {
         GRAPH <${cgMetaGraph}> {
@@ -3387,7 +3384,7 @@ export class DKGAgent {
     message: Uint8Array,
     ctx: OperationContext,
   ): Promise<void> {
-    const topic = paranetWorkspaceTopic(contextGraphId);
+    const topic = contextGraphWorkspaceTopic(contextGraphId);
     const wireMessage = await this.encodeWorkspaceGossipMessage(contextGraphId, message);
     try {
       await this.gossip.publish(topic, wireMessage);
@@ -3489,7 +3486,7 @@ export class DKGAgent {
     const onPhase = opts?.onPhase;
     this.log.info(ctx, `Starting publish to context graph "${contextGraphId}" with ${quads.length} triples`);
 
-    const isSystem = contextGraphId === SYSTEM_PARANETS.AGENTS || contextGraphId === SYSTEM_PARANETS.ONTOLOGY;
+    const isSystem = contextGraphId === SYSTEM_CONTEXT_GRAPHS.AGENTS || contextGraphId === SYSTEM_CONTEXT_GRAPHS.ONTOLOGY;
     if (!isSystem) {
       const exists = await this.contextGraphExists(contextGraphId);
       if (!exists) {
@@ -3550,7 +3547,7 @@ export class DKGAgent {
           .join('\n');
         const nquadsBytes = new TextEncoder().encode(nquadsStr);
         const message = encodeKAUpdateRequest({
-          paranetId: contextGraphId,
+          contextGraphId: contextGraphId,
           batchId: kcId,
           nquads: nquadsBytes,
           manifest: result.kaManifest.map((m) => ({
@@ -3566,7 +3563,7 @@ export class DKGAgent {
           timestampMs: Date.now(),
           operationId: ctx.operationId,
         });
-        const topic = paranetUpdateTopic(contextGraphId);
+        const topic = contextGraphUpdateTopic(contextGraphId);
         await this.gossip.publish(topic, message);
         this.log.info(ctx, `Broadcast KA update for batchId=${kcId} on ${topic}`);
       } catch (err) {
@@ -3667,7 +3664,7 @@ export class DKGAgent {
 
       const msg: FinalizationMessageMsg = {
         ual: result.ual,
-        paranetId: contextGraphId,
+        contextGraphId: contextGraphId,
         kcMerkleRoot: result.merkleRoot,
         txHash: result.onChainResult.txHash ?? '',
         blockNumber: result.onChainResult.blockNumber ?? 0,
@@ -3678,14 +3675,14 @@ export class DKGAgent {
         rootEntities,
         timestampMs: Date.now(),
         operationId: ctx.operationId,
-        contextGraphId: result.contextGraphError ? undefined : ctxGraphIdStr,
+        targetContextGraphId: result.contextGraphError ? undefined : ctxGraphIdStr,
         subGraphName: options?.subGraphName,
       };
 
-      const topic = paranetFinalizationTopic(contextGraphId);
+      const topic = contextGraphFinalizationTopic(contextGraphId);
       try {
         await this.gossip.publish(topic, encodeFinalizationMessage(msg));
-        this.log.info(ctx, `Broadcast finalization for ${result.ual} to ${topic}${ctxGraphIdStr ? ` (contextGraph=${ctxGraphIdStr})` : ''}${result.contextGraphError ? ' (ctx-graph registration failed, omitting contextGraphId)' : ''}`);
+        this.log.info(ctx, `Broadcast finalization for ${result.ual} to ${topic}${ctxGraphIdStr ? ` (contextGraph=${ctxGraphIdStr})` : ''}${result.contextGraphError ? ' (ctx-graph registration failed, omitting targetContextGraphId)' : ''}`);
       } catch {
         this.log.warn(ctx, `No peers subscribed to ${topic} yet`);
       }
@@ -3800,8 +3797,6 @@ export class DKGAgent {
     sparql: string,
     options?: string | {
       contextGraphId?: string;
-      /** @deprecated Use contextGraphId */
-      paranetId?: string;
       graphSuffix?: '_shared_memory';
       includeSharedMemory?: boolean;
       /** @deprecated Use includeSharedMemory */
@@ -3853,7 +3848,7 @@ export class DKGAgent {
     const rawOpts = typeof options === 'string' ? { contextGraphId: options } : options ?? {};
     const opts = {
       ...rawOpts,
-      contextGraphId: rawOpts.contextGraphId ?? rawOpts.paranetId,
+      contextGraphId: rawOpts.contextGraphId,
       includeSharedMemory: rawOpts.includeSharedMemory ?? rawOpts.includeWorkspace,
     };
     const ctx = opts.operationCtx ?? createOperationContext('query');
@@ -4026,7 +4021,7 @@ export class DKGAgent {
     }
 
     const result = await this.queryEngine.query(sparql, {
-      paranetId: opts.contextGraphId,
+      contextGraphId: opts.contextGraphId,
       excludeGraphPrefixes,
       graphSuffix: opts.graphSuffix,
       includeSharedMemory: opts.includeSharedMemory,
@@ -4142,7 +4137,7 @@ export class DKGAgent {
    * Used to exclude them from unscoped queries.
    */
   private async getDisallowedGraphPrefixes(opts: { callerAgentAddress?: string } = {}): Promise<string[]> {
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const result = await this.store.query(
       `SELECT ?cg WHERE {
         GRAPH <${ontologyGraph}> {
@@ -4215,7 +4210,7 @@ export class DKGAgent {
   ): Promise<QueryResponse> {
     return this.queryRemote(peerId, {
       lookupType: 'ENTITIES_BY_TYPE',
-      paranetId: contextGraphId,
+      contextGraphId: contextGraphId,
       rdfType,
       limit,
     });
@@ -4231,7 +4226,7 @@ export class DKGAgent {
   ): Promise<QueryResponse> {
     return this.queryRemote(peerId, {
       lookupType: 'ENTITY_TRIPLES',
-      paranetId: contextGraphId,
+      contextGraphId: contextGraphId,
       entityUri,
     });
   }
@@ -4248,7 +4243,7 @@ export class DKGAgent {
   ): Promise<QueryResponse> {
     return this.queryRemote(peerId, {
       lookupType: 'SPARQL_QUERY',
-      paranetId: contextGraphId,
+      contextGraphId: contextGraphId,
       sparql,
       limit,
       timeout,
@@ -4275,8 +4270,8 @@ export class DKGAgent {
     }
     this.gossipRegistered.add(contextGraphId);
 
-    const publishTopic = paranetPublishTopic(contextGraphId);
-    const appTopic = paranetAppTopic(contextGraphId);
+    const publishTopic = contextGraphPublishTopic(contextGraphId);
+    const appTopic = contextGraphAppTopic(contextGraphId);
 
     this.gossip.subscribe(publishTopic);
     this.gossip.subscribe(appTopic);
@@ -4295,14 +4290,14 @@ export class DKGAgent {
 
     this.queueSharedMemoryGossipSubscription(contextGraphId);
 
-    const updateTopic = paranetUpdateTopic(contextGraphId);
+    const updateTopic = contextGraphUpdateTopic(contextGraphId);
     this.gossip.subscribe(updateTopic);
     this.gossip.onMessage(updateTopic, async (_topic, data, from) => {
       const uh = this.getOrCreateUpdateHandler();
       await uh.handle(data, from);
     });
 
-    const finalizationTopic = paranetFinalizationTopic(contextGraphId);
+    const finalizationTopic = contextGraphFinalizationTopic(contextGraphId);
     this.gossip.subscribe(finalizationTopic);
     this.gossip.onMessage(finalizationTopic, async (_topic, data) => {
       const fh = this.getOrCreateFinalizationHandler();
@@ -4320,7 +4315,7 @@ export class DKGAgent {
   }
 
   private async reconcileSharedMemoryGossipSubscription(contextGraphId: string): Promise<void> {
-    const swmTopic = paranetWorkspaceTopic(contextGraphId);
+    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
     const isRegistered = this.sharedMemoryGossipRegistered.has(contextGraphId);
     const ctx = createOperationContext('system');
     if (!(await this.canUseSharedMemoryForContextGraph(contextGraphId))) {
@@ -4349,7 +4344,7 @@ export class DKGAgent {
    * System context graphs are already included by default and are skipped here.
    */
   private trackSyncContextGraph(contextGraphId: string): void {
-    const systemContextGraphs = new Set<string>(Object.values(SYSTEM_PARANETS) as string[]);
+    const systemContextGraphs = new Set<string>(Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]);
     if (systemContextGraphs.has(contextGraphId)) return;
 
     const syncSet = new Set<string>(this.config.syncContextGraphs ?? []);
@@ -4367,7 +4362,7 @@ export class DKGAgent {
         {
           contextGraphExists: (id) => this.contextGraphExists(id),
           // Gossip validation compares `approvedBy`/`revokedBy` against the
-          // paranet owner. Those triples are emitted with `dkg:creator` (peer
+          // contextGraph owner. Those triples are emitted with `dkg:creator` (peer
           // DID) so peers validate against the same creator-scoped DID.
           // `dkg:curator` (wallet DID) is for local authorization only.
           getContextGraphOwner: (id) => this.getContextGraphCreator(id),
@@ -4443,9 +4438,9 @@ export class DKGAgent {
   }): Promise<void> {
     const ctx = createOperationContext('system');
     const gm = new GraphManager(this.store);
-    const paranetUri = `did:dkg:context-graph:${opts.id}`;
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const cgMetaGraph = paranetMetaGraphUri(opts.id);
+    const contextGraphUri = `did:dkg:context-graph:${opts.id}`;
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(opts.id);
     const now = new Date().toISOString();
 
     const exists = await this.contextGraphExists(opts.id);
@@ -4495,19 +4490,19 @@ export class DKGAgent {
     const creatorPeerDid = `did:dkg:agent:${this.peerId}`;
     const curatorDid = `did:dkg:agent:${opts.callerAgentAddress ?? this.defaultAgentAddress ?? this.peerId}`;
     const quads: Quad[] = [
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PARANET, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: `"${opts.name}"`, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: creatorPeerDid, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_CREATED_AT, object: `"${now}"`, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_GOSSIP_TOPIC, object: `"${paranetPublishTopic(opts.id)}"`, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_REPLICATION_POLICY, object: `"${opts.replicationPolicy ?? 'full'}"`, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: `"${isCurated || opts.private ? 'private' : 'public'}"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: `"${opts.name}"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: creatorPeerDid, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATED_AT, object: `"${now}"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_GOSSIP_TOPIC, object: `"${contextGraphPublishTopic(opts.id)}"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REPLICATION_POLICY, object: `"${opts.replicationPolicy ?? 'full'}"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: `"${isCurated || opts.private ? 'private' : 'public'}"`, graph: defGraph },
     ];
 
     // Store registration status and curator in _meta
     quads.push(
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"unregistered"`, graph: cgMetaGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: curatorDid, graph: cgMetaGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"unregistered"`, graph: cgMetaGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: curatorDid, graph: cgMetaGraph },
     );
 
     // Store peer allowlist for curated CGs (with validation)
@@ -4518,14 +4513,14 @@ export class DKGAgent {
           throw new Error(`Invalid peer ID in allowedPeers: "${peer}". Expected a libp2p peer ID (e.g. 12D3KooW…).`);
         }
         quads.push({
-          subject: paranetUri,
+          subject: contextGraphUri,
           predicate: DKG_ONTOLOGY.DKG_ALLOWED_PEER,
           object: `"${escapeSparqlLiteral(peer)}"`,
           graph: cgMetaGraph,
         });
       }
       quads.push({
-        subject: paranetUri,
+        subject: contextGraphUri,
         predicate: DKG_ONTOLOGY.DKG_ALLOWED_PEER,
         object: `"${this.peerId}"`,
         graph: cgMetaGraph,
@@ -4540,7 +4535,7 @@ export class DKGAgent {
           throw new Error(`Invalid Ethereum address in allowedAgents: "${addr}".`);
         }
         quads.push({
-          subject: paranetUri,
+          subject: contextGraphUri,
           predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
           object: `"${addr}"`,
           graph: cgMetaGraph,
@@ -4570,7 +4565,7 @@ export class DKGAgent {
         }
         seenParticipantAgents.add(key);
         quads.push({
-          subject: paranetUri,
+          subject: contextGraphUri,
           predicate: DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT,
           object: `"${checksumAddress}"`,
           graph: cgMetaGraph,
@@ -4583,7 +4578,7 @@ export class DKGAgent {
       const creatorAddr = opts.callerAgentAddress ?? this.defaultAgentAddress;
       if (creatorAddr) {
         quads.push({
-          subject: paranetUri,
+          subject: contextGraphUri,
           predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
           object: `"${creatorAddr}"`,
           graph: cgMetaGraph,
@@ -4599,7 +4594,7 @@ export class DKGAgent {
     }
     for (const participantIdentityId of participantIdentityIds) {
       quads.push({
-        subject: paranetUri,
+        subject: contextGraphUri,
         predicate: DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID,
         object: `"${participantIdentityId.toString()}"`,
         graph: cgMetaGraph,
@@ -4614,8 +4609,8 @@ export class DKGAgent {
         throw new Error(`requiredSignatures (${reqSig}) exceeds participant count (${participantIdentityIds.size})`);
       }
       quads.push({
-        subject: paranetUri,
-        predicate: `${DKG_ONTOLOGY.DKG_PARANET}RequiredSignatures`,
+        subject: contextGraphUri,
+        predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}RequiredSignatures`,
         object: `"${reqSig}"`,
         graph: cgMetaGraph,
       });
@@ -4623,7 +4618,7 @@ export class DKGAgent {
 
     if (opts.description) {
       quads.push({
-        subject: paranetUri,
+        subject: contextGraphUri,
         predicate: DKG_ONTOLOGY.SCHEMA_DESCRIPTION,
         object: `"${opts.description}"`,
         graph: defGraph,
@@ -4633,14 +4628,14 @@ export class DKGAgent {
     // Provenance activity
     const activityUri = `did:dkg:activity:create-context-graph:${opts.id}:${Date.now()}`;
     quads.push(
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.PROV_GENERATED_BY, object: activityUri, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.PROV_GENERATED_BY, object: activityUri, graph: defGraph },
       { subject: activityUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.PROV_ACTIVITY, graph: defGraph },
       { subject: activityUri, predicate: DKG_ONTOLOGY.PROV_ASSOCIATED_WITH, object: `did:dkg:agent:${this.peerId}`, graph: defGraph },
       { subject: activityUri, predicate: DKG_ONTOLOGY.PROV_ENDED_AT_TIME, object: `"${now}"`, graph: defGraph },
     );
 
     await this.store.insert(quads);
-    await gm.ensureParanet(opts.id);
+    await gm.ensureContextGraph(opts.id);
 
     // Force the triple-store flush BEFORE the SQLite caches are written.
     // Without this, a daemon crash within 50ms of the insert would lose the
@@ -4762,7 +4757,7 @@ export class DKGAgent {
       // broadcast to the network — only invited nodes will discover it via
       // the explicit subscribe→sync flow.
       if (!isCurated) {
-        const ontologyTopic = paranetPublishTopic(SYSTEM_PARANETS.ONTOLOGY);
+        const ontologyTopic = contextGraphPublishTopic(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
         const broadcastQuads = quads.filter(q => q.graph === ontologyGraph);
         const nquads = broadcastQuads.map(q => {
           const obj = q.object.startsWith('"') ? q.object : `<${q.object}>`;
@@ -4772,7 +4767,7 @@ export class DKGAgent {
         const msg = encodePublishRequest({
           ual: `did:dkg:context-graph:${opts.id}`,
           nquads: new TextEncoder().encode(nquads),
-          paranetId: SYSTEM_PARANETS.ONTOLOGY,
+          contextGraphId: SYSTEM_CONTEXT_GRAPHS.ONTOLOGY,
           kas: [],
           publisherIdentity: this.wallet.keypair.publicKey,
           publisherAddress: '',
@@ -4801,6 +4796,7 @@ export class DKGAgent {
     /** @deprecated V10 ContextGraphs registration ignores metadata reveal. */
     revealOnChain?: boolean;
     accessPolicy?: number;
+    publishPolicy?: number;
     callerAgentAddress?: string;
   }): Promise<{ onChainId: string; txHash?: string }> {
     const ctx = createOperationContext('system');
@@ -4842,13 +4838,13 @@ export class DKGAgent {
       }
 
       const cgMetaGraph = contextGraphMetaUri(id);
-      const ontologyGraph = contextGraphDataUri(SYSTEM_PARANETS.ONTOLOGY);
-      const paranetUri = `did:dkg:context-graph:${id}`;
+      const ontologyGraph = contextGraphDataUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+      const contextGraphUri = `did:dkg:context-graph:${id}`;
       const accessPolicyResult = await this.store.query(
         `SELECT ?ap WHERE {
-          { GRAPH <${ontologyGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
+          { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
           UNION
-          { GRAPH <${cgMetaGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
+          { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
         } LIMIT 1`,
       );
       const apValue = accessPolicyResult.type === 'bindings'
@@ -4861,12 +4857,12 @@ export class DKGAgent {
       // Defensive: replace any stray creator/curator triples (e.g. from
       // a previous build that backfilled per node) so this register call
       // becomes the single source of truth.
-      await this.store.deleteByPattern({ graph: defGraph, subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_CREATOR });
-      await this.store.deleteByPattern({ graph: cgMetaGraph, subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_CREATOR });
-      await this.store.deleteByPattern({ graph: cgMetaGraph, subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_CURATOR });
+      await this.store.deleteByPattern({ graph: defGraph, subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATOR });
+      await this.store.deleteByPattern({ graph: cgMetaGraph, subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATOR });
+      await this.store.deleteByPattern({ graph: cgMetaGraph, subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR });
       await this.store.insert([
-        { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: creatorPeerDid, graph: defGraph },
-        { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: curatorDid, graph: cgMetaGraph },
+        { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: creatorPeerDid, graph: defGraph },
+        { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: curatorDid, graph: cgMetaGraph },
       ]);
       this.log.info(ctx, `Stamped local node as creator contact and address curator for "${id}" (registration-time lazy stamp)`);
       return curatorDid;
@@ -4904,9 +4900,9 @@ export class DKGAgent {
     const ownerAddress = ethers.getAddress(owner.replace(/^did:dkg:agent:/, ''));
     // Check if already registered
     const cgMetaGraph = contextGraphMetaUri(id);
-    const paranetUri = `did:dkg:context-graph:${id}`;
+    const contextGraphUri = `did:dkg:context-graph:${id}`;
     const statusResult = await this.store.query(
-      `SELECT ?status WHERE { GRAPH <${cgMetaGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_REGISTRATION_STATUS}> ?status } } LIMIT 1`,
+      `SELECT ?status WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_REGISTRATION_STATUS}> ?status } } LIMIT 1`,
     );
     if (statusResult.type === 'bindings' && statusResult.bindings[0]?.['status']?.replace(/^"|"$/g, '') === 'registered') {
       const existingOnChainId = this.subscribedContextGraphs.get(id)?.onChainId;
@@ -4915,12 +4911,12 @@ export class DKGAgent {
 
     // Read existing description and access policy. Curated CGs store
     // definition in _meta rather than ONTOLOGY, so check both locations.
-    const ontologyGraph = contextGraphDataUri(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyGraph = contextGraphDataUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const descResult = await this.store.query(
       `SELECT ?desc WHERE {
-        { GRAPH <${ontologyGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc } }
+        { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc } }
         UNION
-        { GRAPH <${cgMetaGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc } }
+        { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc } }
       } LIMIT 1`,
     );
     const description = descResult.type === 'bindings' ? descResult.bindings[0]?.['desc']?.replace(/^"|"$/g, '') : undefined;
@@ -4934,12 +4930,15 @@ export class DKGAgent {
         ? LOCAL_ACCESS_CURATED
         : LOCAL_ACCESS_OPEN;
     }
-    const publishPolicy = resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED
+    if (opts?.publishPolicy !== undefined && opts.publishPolicy !== EVM_PUBLISH_CURATED && opts.publishPolicy !== EVM_PUBLISH_OPEN) {
+      throw new Error('publishPolicy must be 0 (curated) or 1 (open)');
+    }
+    const publishPolicy = opts?.publishPolicy ?? (resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED
       ? EVM_PUBLISH_CURATED
-      : EVM_PUBLISH_OPEN;
+      : EVM_PUBLISH_OPEN);
 
     const participantsResult = await this.store.query(
-      `SELECT ?identityId WHERE { GRAPH <${cgMetaGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId } }`,
+      `SELECT ?identityId WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId } }`,
     );
     const participantIdentityIds = participantsResult.type === 'bindings'
       ? participantsResult.bindings
@@ -4951,7 +4950,7 @@ export class DKGAgent {
       : [];
 
     const requiredSignaturesResult = await this.store.query(
-      `SELECT ?required WHERE { GRAPH <${cgMetaGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_PARANET}RequiredSignatures> ?required } } LIMIT 1`,
+      `SELECT ?required WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}RequiredSignatures> ?required } } LIMIT 1`,
     );
     const storedRequiredSignatures = requiredSignaturesResult.type === 'bindings'
       ? Number(requiredSignaturesResult.bindings[0]?.['required']?.replace(/^"|"$/g, ''))
@@ -4963,11 +4962,11 @@ export class DKGAgent {
       this.log.info(ctx, `Context graph "${id}" already has on-chain ID ${existingOnChainId} — skipping chain call`);
       await this.store.deleteByPattern({
         graph: cgMetaGraph,
-        subject: paranetUri,
+        subject: contextGraphUri,
         predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS,
       });
       await this.store.insert([
-        { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
+        { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
       ]);
       return { onChainId: existingOnChainId, txHash: undefined };
     }
@@ -5023,6 +5022,7 @@ export class DKGAgent {
     const result = await this.registerContextGraphOnChain({
       participantIdentityIds: effectiveParticipantIdentityIds,
       requiredSignatures: effectiveRequiredSignatures,
+      accessPolicy: resolvedLocalAccessPolicy,
       publishPolicy,
       ...(publishAuthority ? { publishAuthority } : {}),
       participantAgents,
@@ -5034,12 +5034,12 @@ export class DKGAgent {
     // Update _meta with registered status and on-chain ID
     await this.store.deleteByPattern({
       graph: cgMetaGraph,
-      subject: paranetUri,
+      subject: contextGraphUri,
       predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS,
     });
     await this.store.insert([
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
-      { subject: paranetUri, predicate: `${DKG_ONTOLOGY.DKG_PARANET}OnChainId`, object: `"${onChainId}"`, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
+      { subject: contextGraphUri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${onChainId}"`, graph: ontologyGraph },
     ]);
 
     // Update in-memory subscription record and ensure we're subscribed
@@ -5058,12 +5058,12 @@ export class DKGAgent {
     // gossip, so that only the authenticated sync path can update it.
     // Broadcast the ontology-graph OnChainId quad so peers see the link.
     try {
-      const onChainNquad = `<${paranetUri}> <${DKG_ONTOLOGY.DKG_PARANET}OnChainId> "${onChainId}" <${ontologyGraph}> .`;
-      const ontologyTopic = paranetPublishTopic(SYSTEM_PARANETS.ONTOLOGY);
+      const onChainNquad = `<${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId> "${onChainId}" <${ontologyGraph}> .`;
+      const ontologyTopic = contextGraphPublishTopic(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
       const regMsg = encodePublishRequest({
         ual: `did:dkg:context-graph:${id}`,
         nquads: new TextEncoder().encode(onChainNquad),
-        paranetId: SYSTEM_PARANETS.ONTOLOGY,
+        contextGraphId: SYSTEM_CONTEXT_GRAPHS.ONTOLOGY,
         kas: [],
         publisherIdentity: this.wallet.keypair.publicKey,
         publisherAddress: '',
@@ -5111,8 +5111,8 @@ export class DKGAgent {
     }
     this.assertCallerIsOwner(owner, callerAgentAddress, 'manage peer invitations');
 
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
-    const paranetUri = `did:dkg:context-graph:${contextGraphId}`;
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     const escapedPeerId = escapeSparqlLiteral(peerId);
 
     const existingAllowlist = await this.getContextGraphAllowedPeers(contextGraphId);
@@ -5123,7 +5123,7 @@ export class DKGAgent {
     if (existingAllowlist === null || existingAllowlist.length === 0) {
       const curatorPeerId = escapeSparqlLiteral(this.peerId);
       quadsToInsert.push({
-        subject: paranetUri,
+        subject: contextGraphUri,
         predicate: DKG_ONTOLOGY.DKG_ALLOWED_PEER,
         object: `"${curatorPeerId}"`,
         graph: cgMetaGraph,
@@ -5145,7 +5145,7 @@ export class DKGAgent {
     }
 
     quadsToInsert.push({
-      subject: paranetUri,
+      subject: contextGraphUri,
       predicate: DKG_ONTOLOGY.DKG_ALLOWED_PEER,
       object: `"${escapedPeerId}"`,
       graph: cgMetaGraph,
@@ -5204,15 +5204,15 @@ export class DKGAgent {
     }
     this.assertCallerIsOwner(owner, callerAgentAddress, 'manage invitations');
 
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
-    const paranetUri = paranetDataGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
     const quadsToInsert: Quad[] = [];
 
     // If first allowlist entry, also add our own agent so the curator doesn't lock themselves out
     const existingParticipants = await this.getPrivateContextGraphParticipants(contextGraphId);
     if ((!existingParticipants || existingParticipants.length === 0) && this.defaultAgentAddress) {
       quadsToInsert.push({
-        subject: paranetUri,
+        subject: contextGraphUri,
         predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
         object: `"${this.defaultAgentAddress}"`,
         graph: cgMetaGraph,
@@ -5228,7 +5228,7 @@ export class DKGAgent {
     }
 
     quadsToInsert.push({
-      subject: paranetUri,
+      subject: contextGraphUri,
       predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
       object: `"${agentAddress}"`,
       graph: cgMetaGraph,
@@ -5271,12 +5271,12 @@ export class DKGAgent {
     }
     this.assertCallerIsOwner(owner, callerAgentAddress, 'manage participants');
 
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
-    const paranetUri = paranetDataGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
 
     await this.store.deleteByPattern({
       graph: cgMetaGraph,
-      subject: paranetUri,
+      subject: contextGraphUri,
       predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
       object: `"${agentAddress}"`,
     });
@@ -5324,26 +5324,26 @@ export class DKGAgent {
     }
     this.assertCallerIsOwner(owner, callerAgentAddress, 'rename context graph');
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
-    const paranetUri = paranetDataGraphUri(contextGraphId);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
     const schemaName = DKG_ONTOLOGY.SCHEMA_NAME;
 
     await this.store.deleteByPattern({
-      subject: paranetUri,
+      subject: contextGraphUri,
       predicate: schemaName,
       graph: ontologyGraph,
     });
     await this.store.deleteByPattern({
-      subject: paranetUri,
+      subject: contextGraphUri,
       predicate: schemaName,
       graph: cgMetaGraph,
     });
 
     const escaped = `"${escapeSparqlLiteral(trimmed)}"`;
     await this.store.insert([
-      { subject: paranetUri, predicate: schemaName, object: escaped, graph: ontologyGraph },
-      { subject: paranetUri, predicate: schemaName, object: escaped, graph: cgMetaGraph },
+      { subject: contextGraphUri, predicate: schemaName, object: escaped, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: schemaName, object: escaped, graph: cgMetaGraph },
     ]);
 
     this.log.info(ctx, `Renamed context graph "${contextGraphId}" to "${trimmed}"`);
@@ -5353,12 +5353,12 @@ export class DKGAgent {
    * List allowed agents for a context graph.
    */
   async getContextGraphAllowedAgents(contextGraphId: string): Promise<string[]> {
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
-    const paranetUri = paranetDataGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
     const result = await this.store.query(
       `SELECT ?agent WHERE {
         GRAPH <${cgMetaGraph}> {
-          <${paranetUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent
+          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent
         }
       }`,
     );
@@ -5436,7 +5436,7 @@ export class DKGAgent {
     timestamp: number,
     agentName?: string,
   ): Promise<void> {
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
     const DKG = 'https://dkg.network/ontology#';
     const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
@@ -5477,7 +5477,7 @@ export class DKGAgent {
   async listPendingJoinRequests(
     contextGraphId: string,
   ): Promise<Array<{ agentAddress: string; name?: string; signature: string; timestamp: number; status: string }>> {
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const DKG = 'https://dkg.network/ontology#';
     const result = await this.store.query(
       `SELECT ?addr ?name ?sig ?ts ?status WHERE {
@@ -5507,7 +5507,7 @@ export class DKGAgent {
    * to the allowlist, and mark the request as approved.
    */
   async approveJoinRequest(contextGraphId: string, agentAddress: string, callerAgentAddress?: string): Promise<void> {
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
     const DKG = 'https://dkg.network/ontology#';
 
@@ -5593,7 +5593,7 @@ export class DKGAgent {
    * Reject a pending join request.
    */
   async rejectJoinRequest(contextGraphId: string, agentAddress: string): Promise<void> {
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
     const DKG = 'https://dkg.network/ontology#';
 
@@ -5822,10 +5822,10 @@ export class DKGAgent {
    * Check whether a context graph has been registered on-chain.
    */
   async isContextGraphRegistered(contextGraphId: string): Promise<boolean> {
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
-    const paranetUri = `did:dkg:context-graph:${contextGraphId}`;
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     const result = await this.store.query(
-      `SELECT ?status WHERE { GRAPH <${cgMetaGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_REGISTRATION_STATUS}> ?status } } LIMIT 1`,
+      `SELECT ?status WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_REGISTRATION_STATUS}> ?status } } LIMIT 1`,
     );
     return result.type === 'bindings' && result.bindings[0]?.['status']?.replace(/^"|"$/g, '') === 'registered';
   }
@@ -5834,10 +5834,10 @@ export class DKGAgent {
     const subscribed = this.subscribedContextGraphs.get(contextGraphId)?.onChainId;
     if (subscribed) return subscribed;
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const paranetUri = `did:dkg:context-graph:${contextGraphId}`;
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     const result = await this.store.query(
-      `SELECT ?id WHERE { GRAPH <${ontologyGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_PARANET}OnChainId> ?id } } LIMIT 1`,
+      `SELECT ?id WHERE { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId> ?id } } LIMIT 1`,
     );
     if (result.type !== 'bindings' || result.bindings.length === 0) return null;
     const value = result.bindings[0]?.['id'];
@@ -5849,10 +5849,10 @@ export class DKGAgent {
    * Returns null if no allowlist is set (open CG).
    */
   async getContextGraphAllowedPeers(contextGraphId: string): Promise<string[] | null> {
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
-    const paranetUri = paranetDataGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
     const result = await this.store.query(
-      `SELECT ?peer WHERE { GRAPH <${cgMetaGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?peer } }`,
+      `SELECT ?peer WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?peer } }`,
     );
     if (result.type !== 'bindings' || result.bindings.length === 0) {
       return null;
@@ -6037,9 +6037,9 @@ export class DKGAgent {
     }
 
     const gm = new GraphManager(this.store);
-    const paranetUri = paranetDataGraphUri(opts.id);
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const cgMetaGraph = paranetMetaGraphUri(opts.id);
+    const contextGraphUri = contextGraphDataGraphUri(opts.id);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(opts.id);
     const now = new Date().toISOString();
 
     // Curated CGs write definition triples to _meta so they stay invisible
@@ -6056,24 +6056,24 @@ export class DKGAgent {
     // where node B mints a second V10 CG before node A's `onChainId`
     // propagates.
     const quads: Quad[] = [
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PARANET, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: `"${opts.name}"`, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_CREATED_AT, object: `"${now}"`, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_GOSSIP_TOPIC, object: `"${paranetPublishTopic(opts.id)}"`, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_REPLICATION_POLICY, object: `"full"`, graph: defGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: `"${opts.curated ? 'private' : 'public'}"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: `"${opts.name}"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATED_AT, object: `"${now}"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_GOSSIP_TOPIC, object: `"${contextGraphPublishTopic(opts.id)}"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REPLICATION_POLICY, object: `"full"`, graph: defGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: `"${opts.curated ? 'private' : 'public'}"`, graph: defGraph },
     ];
 
     // _meta triples: only registration status. `dkg:curator` is written
     // by `registerContextGraph` (or `createContextGraph` for the UI
     // create path) so exactly one node owns the graph locally.
     quads.push(
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"unregistered"`, graph: cgMetaGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"unregistered"`, graph: cgMetaGraph },
     );
 
     if (opts.description) {
       quads.push({
-        subject: paranetUri,
+        subject: contextGraphUri,
         predicate: DKG_ONTOLOGY.SCHEMA_DESCRIPTION,
         object: `"${opts.description}"`,
         graph: defGraph,
@@ -6081,7 +6081,7 @@ export class DKGAgent {
     }
 
     await this.store.insert(quads);
-    await gm.ensureParanet(opts.id);
+    await gm.ensureContextGraph(opts.id);
 
     this.subscribeToContextGraph(opts.id);
     this.setContextGraphSubscription(opts.id, {
@@ -6154,7 +6154,7 @@ export class DKGAgent {
     const ctx = createOperationContext('verify');
 
     // 1. Look up batch merkle root from local metadata (use typed literal for batchId)
-    const metaGraph = paranetMetaGraphUri(opts.contextGraphId);
+    const metaGraph = contextGraphMetaGraphUri(opts.contextGraphId);
     // Try typed literal first, fallback to untyped for backward compat
     let batchBindings: Record<string, string>[] | null = null;
     for (const literal of [`"${opts.batchId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, `"${opts.batchId}"`]) {
@@ -6312,7 +6312,7 @@ export class DKGAgent {
       this.log.warn(createOperationContext('verify'), `No root entities found for batch ${batchId} — skipping VM promotion`);
       return;
     }
-    const dataGraph = paranetDataGraphUri(contextGraphId);
+    const dataGraph = contextGraphDataGraphUri(contextGraphId);
     // Query root entities AND their skolemized children (subjects starting
     // with the root entity URI, e.g. <root>/.well-known/genid/...).
     // We use FILTER with STRSTARTS to capture the full closure instead of
@@ -6352,7 +6352,7 @@ export class DKGAgent {
   }
 
   private async getRootEntities(contextGraphId: string, batchId: bigint): Promise<string[]> {
-    const metaGraph = paranetMetaGraphUri(contextGraphId);
+    const metaGraph = contextGraphMetaGraphUri(contextGraphId);
     // Try typed literal first, fallback to untyped for backward compat
     for (const literal of [`"${batchId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, `"${batchId}"`]) {
       const result = await this.store.query(
@@ -6368,7 +6368,7 @@ export class DKGAgent {
   // ── CCL ──────────────────────────────────────────────────────────────
 
   async publishCclPolicy(opts: {
-    paranetId: string;
+    contextGraphId: string;
     name: string;
     version: string;
     content: string;
@@ -6378,44 +6378,44 @@ export class DKGAgent {
     format?: string;
   }): Promise<{ policyUri: string; hash: string; status: 'proposed' }> {
     const ctx = createOperationContext('system');
-    if (!(await this.contextGraphExists(opts.paranetId))) {
-      throw new Error(`Context Graph "${opts.paranetId}" does not exist. Create it first.`);
+    if (!(await this.contextGraphExists(opts.contextGraphId))) {
+      throw new Error(`Context Graph "${opts.contextGraphId}" does not exist. Create it first.`);
     }
 
     validateCclPolicy(opts.content, { expectedName: opts.name, expectedVersion: opts.version });
 
-    const existing = (await this.listCclPolicies({ paranetId: opts.paranetId, name: opts.name }))
+    const existing = (await this.listCclPolicies({ contextGraphId: opts.contextGraphId, name: opts.name }))
       .find(policy => policy.version === opts.version);
     const existingHash = existing?.hash;
     const nextHash = hashCclPolicy(opts.content);
     if (existingHash && existingHash !== nextHash) {
-      throw new Error(`CCL policy ${opts.paranetId}/${opts.name}@${opts.version} already exists with different content`);
+      throw new Error(`CCL policy ${opts.contextGraphId}/${opts.name}@${opts.version} already exists with different content`);
     }
     if (existing?.policyUri && existingHash === nextHash) {
       return { policyUri: existing.policyUri, hash: existing.hash, status: 'proposed' };
     }
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const now = new Date().toISOString();
     const { policyUri, hash, quads } = buildCclPolicyQuads(opts, `did:dkg:agent:${this.peerId}`, ontologyGraph, now);
     await this.store.insert(quads);
     await this.publishOntologyQuads(policyUri, quads);
-    this.log.info(ctx, `Published CCL policy ${opts.name}@${opts.version} for paranet "${opts.paranetId}"`);
+    this.log.info(ctx, `Published CCL policy ${opts.name}@${opts.version} for contextGraph "${opts.contextGraphId}"`);
     return { policyUri, hash, status: 'proposed' };
   }
 
   async approveCclPolicy(opts: {
-    paranetId: string;
+    contextGraphId: string;
     policyUri: string;
     contextType?: string;
     callerAgentAddress?: string;
   }): Promise<{ policyUri: string; bindingUri: string; contextType?: string; approvedAt: string }> {
     const ctx = createOperationContext('system');
-    await this.assertParanetOwner(opts.paranetId, opts.callerAgentAddress);
+    await this.assertContextGraphPolicyOwner(opts.contextGraphId, opts.callerAgentAddress);
     const record = await this.getCclPolicyByUri(opts.policyUri, { includeBody: true });
     if (!record) throw new Error(`CCL policy not found: ${opts.policyUri}`);
-    if (record.paranetId !== opts.paranetId) {
-      throw new Error(`CCL policy ${opts.policyUri} belongs to paranet "${record.paranetId}", not "${opts.paranetId}"`);
+    if (record.contextGraphId !== opts.contextGraphId) {
+      throw new Error(`CCL policy ${opts.policyUri} belongs to contextGraph "${record.contextGraphId}", not "${opts.contextGraphId}"`);
     }
     if (record.contextType && opts.contextType && record.contextType !== opts.contextType) {
       throw new Error(`CCL policy contextType mismatch: policy=${record.contextType}, requested=${opts.contextType}`);
@@ -6424,7 +6424,7 @@ export class DKGAgent {
     validateCclPolicy(record.body, { expectedName: record.name, expectedVersion: record.version });
 
     // Guard against duplicate approvals for the same policy+scope
-    const existingBindings = await this.listCclPolicyBindings({ paranetId: opts.paranetId, name: record.name });
+    const existingBindings = await this.listCclPolicyBindings({ contextGraphId: opts.contextGraphId, name: record.name });
     const activeForScope = existingBindings.find(
       b => b.policyUri === opts.policyUri && b.status === 'approved' &&
            (b.contextType ?? '') === (opts.contextType ?? record.contextType ?? ''),
@@ -6433,17 +6433,17 @@ export class DKGAgent {
       return { policyUri: opts.policyUri, bindingUri: activeForScope.bindingUri, contextType: activeForScope.contextType, approvedAt: activeForScope.approvedAt };
     }
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const approvedAt = new Date().toISOString();
     const effectiveContextType = opts.contextType ?? record.contextType;
     // Emit the public `dkg:creator` peer DID as the binding owner: it's the
     // handle remote peers resolve via ONTOLOGY gossip, so gossip-publish-handler
     // will accept the approval. `_meta`-only `dkg:curator` (wallet DID) is
-    // used for local authorization via `assertParanetOwner` above.
-    const ownerDid = await this.getContextGraphCreator(opts.paranetId)
+    // used for local authorization via `assertContextGraphOwner` above.
+    const ownerDid = await this.getContextGraphCreator(opts.contextGraphId)
       ?? `did:dkg:agent:${this.peerId}`;
     const { bindingUri, quads } = buildPolicyApprovalQuads({
-      paranetId: opts.paranetId,
+      contextGraphId: opts.contextGraphId,
       policyUri: opts.policyUri,
       policyName: record.name,
       creator: ownerDid,
@@ -6460,68 +6460,68 @@ export class DKGAgent {
 
     await this.store.insert(quads);
     await this.publishOntologyQuads(bindingUri, quads);
-    this.log.info(ctx, `Approved CCL policy ${record.name}@${record.version} for paranet "${opts.paranetId}"${effectiveContextType ? ` (context ${effectiveContextType})` : ''}`);
+    this.log.info(ctx, `Approved CCL policy ${record.name}@${record.version} for contextGraph "${opts.contextGraphId}"${effectiveContextType ? ` (context ${effectiveContextType})` : ''}`);
     return { policyUri: opts.policyUri, bindingUri, contextType: effectiveContextType, approvedAt };
   }
 
   async revokeCclPolicy(opts: {
-    paranetId: string;
+    contextGraphId: string;
     policyUri: string;
     contextType?: string;
     callerAgentAddress?: string;
   }): Promise<{ policyUri: string; bindingUri: string; contextType?: string; revokedAt: string; status: 'revoked' }> {
     const ctx = createOperationContext('system');
-    await this.assertParanetOwner(opts.paranetId, opts.callerAgentAddress);
+    await this.assertContextGraphPolicyOwner(opts.contextGraphId, opts.callerAgentAddress);
 
     const target = await this.getActiveCclPolicyBinding({
-      paranetId: opts.paranetId,
+      contextGraphId: opts.contextGraphId,
       policyUri: opts.policyUri,
       contextType: opts.contextType,
     });
     if (!target) {
-      throw new Error(`No active CCL policy binding found for ${opts.policyUri} in paranet "${opts.paranetId}"${opts.contextType ? ` and context "${opts.contextType}"` : ''}.`);
+      throw new Error(`No active CCL policy binding found for ${opts.policyUri} in contextGraph "${opts.contextGraphId}"${opts.contextType ? ` and context "${opts.contextType}"` : ''}.`);
     }
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const revokedAt = new Date().toISOString();
     // See note in approveCclPolicy — use `dkg:creator` (peer DID) for the
     // public binding metadata so it round-trips through ONTOLOGY gossip.
-    const ownerDid = await this.getContextGraphCreator(opts.paranetId)
+    const ownerDid = await this.getContextGraphCreator(opts.contextGraphId)
       ?? `did:dkg:agent:${this.peerId}`;
     const quads = buildPolicyRevocationQuads({
       bindingUri: target.bindingUri,
       revoker: ownerDid,
       graph: ontologyGraph,
       revokedAt,
-      paranetUri: `did:dkg:context-graph:${opts.paranetId}`,
+      contextGraphUri: `did:dkg:context-graph:${opts.contextGraphId}`,
     });
 
     await this.store.insert(quads);
     await this.publishOntologyQuads(target.bindingUri, quads);
-    this.log.info(ctx, `Revoked CCL policy binding ${target.bindingUri} for paranet "${opts.paranetId}"${target.contextType ? ` (context ${target.contextType})` : ''}`);
+    this.log.info(ctx, `Revoked CCL policy binding ${target.bindingUri} for contextGraph "${opts.contextGraphId}"${target.contextType ? ` (context ${target.contextType})` : ''}`);
     return { policyUri: opts.policyUri, bindingUri: target.bindingUri, contextType: target.contextType, revokedAt, status: 'revoked' };
   }
 
   async listCclPolicies(opts: {
-    paranetId?: string;
+    contextGraphId?: string;
     name?: string;
     contextType?: string;
     status?: string;
     includeBody?: boolean;
   } = {}): Promise<CclPolicyRecord[]> {
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const filters: string[] = [];
-    if (opts.paranetId) filters.push(`?paranet = <did:dkg:context-graph:${opts.paranetId}>`);
+    if (opts.contextGraphId) filters.push(`?contextGraph = <did:dkg:context-graph:${opts.contextGraphId}>`);
     if (opts.name) filters.push(`?name = ${sparqlString(opts.name)}`);
     if (opts.contextType) filters.push(`?contextType = ${sparqlString(opts.contextType)}`);
     const filterBlock = filters.length > 0 ? `FILTER(${filters.join(' && ')})` : '';
     const bodyClause = opts.includeBody ? `OPTIONAL { ?policy <${DKG_ONTOLOGY.DKG_POLICY_BODY}> ?body }` : '';
 
     const result = await this.store.query(`
-      SELECT ?policy ?paranet ?name ?version ?hash ?language ?format ?status ?creator ?created ?approvedBy ?approvedAt ?desc ?contextType ${opts.includeBody ? '?body' : ''} WHERE {
+      SELECT ?policy ?contextGraph ?name ?version ?hash ?language ?format ?status ?creator ?created ?approvedBy ?approvedAt ?desc ?contextType ${opts.includeBody ? '?body' : ''} WHERE {
         GRAPH <${ontologyGraph}> {
           ?policy <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CCL_POLICY}> ;
-                  <${DKG_ONTOLOGY.DKG_POLICY_APPLIES_TO_PARANET}> ?paranet ;
+                  <${DKG_ONTOLOGY.DKG_POLICY_APPLIES_TO_CONTEXT_GRAPH}> ?contextGraph ;
                   <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name ;
                   <${DKG_ONTOLOGY.DKG_POLICY_VERSION}> ?version ;
                   <${DKG_ONTOLOGY.DKG_POLICY_HASH}> ?hash ;
@@ -6541,23 +6541,23 @@ export class DKGAgent {
       ORDER BY ?name ?version
     `);
 
-    const bindings = await this.listCclPolicyBindings({ paranetId: opts.paranetId, name: opts.name });
+    const bindings = await this.listCclPolicyBindings({ contextGraphId: opts.contextGraphId, name: opts.name });
     const latestByScope = this.selectLatestNonRevokedBindings(bindings);
 
     const records = new Map<string, CclPolicyRecord>();
     if (result.type === 'bindings') {
       for (const row of result.bindings as Record<string, string>[]) {
-        const paranetUri = row['paranet'];
-        const paranetId = paranetUri.startsWith('did:dkg:context-graph:') ? paranetUri.slice('did:dkg:context-graph:'.length) : paranetUri;
+        const contextGraphUri = row['contextGraph'];
+        const contextGraphId = contextGraphUri.startsWith('did:dkg:context-graph:') ? contextGraphUri.slice('did:dkg:context-graph:'.length) : contextGraphUri;
         const name = stripLiteral(row['name']);
-        const defaultActive = latestByScope.get(`${paranetId}|${name}|`);
+        const defaultActive = latestByScope.get(`${contextGraphId}|${name}|`);
         const activeContexts = Array.from(latestByScope.values())
-          .filter(binding => binding.paranetId === paranetId && binding.name === name && binding.contextType && binding.policyUri === row['policy'])
+          .filter(binding => binding.contextGraphId === contextGraphId && binding.name === name && binding.contextType && binding.policyUri === row['policy'])
           .map(binding => binding.contextType as string)
           .sort();
         const nextRecord: CclPolicyRecord = {
           policyUri: row['policy'],
-          paranetId,
+          contextGraphId,
           name,
           version: stripLiteral(row['version']),
           hash: stripLiteral(row['hash']),
@@ -6588,14 +6588,14 @@ export class DKGAgent {
   }
 
   async resolveCclPolicy(opts: {
-    paranetId: string;
+    contextGraphId: string;
     name: string;
     contextType?: string;
     includeBody?: boolean;
   }): Promise<CclPolicyRecord | null> {
-    const bindings = await this.listCclPolicyBindings({ paranetId: opts.paranetId, name: opts.name });
+    const bindings = await this.listCclPolicyBindings({ contextGraphId: opts.contextGraphId, name: opts.name });
     const latestByScope = this.selectLatestNonRevokedBindings(bindings);
-    const selected = this.resolveCclPolicyBinding(latestByScope, opts.paranetId, opts.name, opts.contextType);
+    const selected = this.resolveCclPolicyBinding(latestByScope, opts.contextGraphId, opts.name, opts.contextType);
     if (!selected) return null;
     const record = await this.getCclPolicyByUri(selected.policyUri, { includeBody: opts.includeBody });
     if (!record) return null;
@@ -6605,7 +6605,7 @@ export class DKGAgent {
   }
 
   async resolveFactsFromSnapshot(opts: {
-    paranetId: string;
+    contextGraphId: string;
     snapshotId?: string;
     view?: string;
     scopeUal?: string;
@@ -6618,7 +6618,7 @@ export class DKGAgent {
     factResolverVersion: string;
     factResolutionMode: 'snapshot-resolved';
     context: {
-      paranetId: string;
+      contextGraphId: string;
       contextType?: string;
       view?: string;
       snapshotId?: string;
@@ -6629,7 +6629,7 @@ export class DKGAgent {
   }
 
   async evaluateCclPolicy(opts: {
-    paranetId: string;
+    contextGraphId: string;
     name: string;
     facts?: CclFactTuple[];
     contextType?: string;
@@ -6637,9 +6637,9 @@ export class DKGAgent {
     snapshotId?: string;
     scopeUal?: string;
   }): Promise<{
-    policy: Pick<CclPolicyRecord, 'policyUri' | 'paranetId' | 'name' | 'version' | 'hash' | 'language' | 'format' | 'contextType'>;
+    policy: Pick<CclPolicyRecord, 'policyUri' | 'contextGraphId' | 'name' | 'version' | 'hash' | 'language' | 'format' | 'contextType'>;
     context: {
-      paranetId: string;
+      contextGraphId: string;
       contextType?: string;
       view?: string;
       snapshotId?: string;
@@ -6652,20 +6652,20 @@ export class DKGAgent {
     result: CclEvaluationResult;
   }> {
     const policy = await this.resolveCclPolicy({
-      paranetId: opts.paranetId,
+      contextGraphId: opts.contextGraphId,
       name: opts.name,
       contextType: opts.contextType,
       includeBody: true,
     });
     if (!policy?.body) {
-      throw new Error(`No approved policy found for ${opts.paranetId}/${opts.name}${opts.contextType ? `/${opts.contextType}` : ''}`);
+      throw new Error(`No approved policy found for ${opts.contextGraphId}/${opts.name}${opts.contextType ? `/${opts.contextType}` : ''}`);
     }
 
     const parsed = parseCclPolicy(policy.body);
     const factInput = opts.facts
       ? buildManualCclFacts(opts.facts)
       : await this.resolveFactsFromSnapshot({
-          paranetId: opts.paranetId,
+          contextGraphId: opts.contextGraphId,
           snapshotId: opts.snapshotId,
           view: opts.view,
           scopeUal: opts.scopeUal,
@@ -6678,7 +6678,7 @@ export class DKGAgent {
     return {
       policy: {
         policyUri: policy.policyUri,
-        paranetId: policy.paranetId,
+        contextGraphId: policy.contextGraphId,
         name: policy.name,
         version: policy.version,
         hash: policy.hash,
@@ -6687,7 +6687,7 @@ export class DKGAgent {
         contextType: opts.contextType ?? policy.contextType,
       },
       context: {
-        paranetId: opts.paranetId,
+        contextGraphId: opts.contextGraphId,
         contextType: opts.contextType,
         view: opts.view,
         snapshotId: opts.snapshotId,
@@ -6702,7 +6702,7 @@ export class DKGAgent {
   }
 
   async evaluateAndPublishCclPolicy(opts: {
-    paranetId: string;
+    contextGraphId: string;
     name: string;
     facts?: CclFactTuple[];
     contextType?: string;
@@ -6713,9 +6713,9 @@ export class DKGAgent {
     evaluationUri: string;
     publish: PublishResult;
     evaluation: {
-      policy: Pick<CclPolicyRecord, 'policyUri' | 'paranetId' | 'name' | 'version' | 'hash' | 'language' | 'format' | 'contextType'>;
+      policy: Pick<CclPolicyRecord, 'policyUri' | 'contextGraphId' | 'name' | 'version' | 'hash' | 'language' | 'format' | 'contextType'>;
       context: {
-        paranetId: string;
+        contextGraphId: string;
         contextType?: string;
         view?: string;
         snapshotId?: string;
@@ -6729,9 +6729,9 @@ export class DKGAgent {
     };
   }> {
     const evaluation = await this.evaluateCclPolicy(opts);
-    const graph = paranetDataGraphUri(opts.paranetId);
+    const graph = contextGraphDataGraphUri(opts.contextGraphId);
     const { evaluationUri, quads } = buildCclEvaluationQuads({
-      paranetId: opts.paranetId,
+      contextGraphId: opts.contextGraphId,
       policyUri: evaluation.policy.policyUri,
       factSetHash: evaluation.factSetHash,
       factQueryHash: evaluation.factQueryHash,
@@ -6744,12 +6744,12 @@ export class DKGAgent {
       scopeUal: evaluation.context.scopeUal,
       contextType: evaluation.context.contextType,
     }, graph);
-    const publish = await this.publish(opts.paranetId, quads);
+    const publish = await this.publish(opts.contextGraphId, quads);
     return { evaluationUri, publish, evaluation };
   }
 
   async listCclEvaluations(opts: {
-    paranetId: string;
+    contextGraphId: string;
     policyUri?: string;
     snapshotId?: string;
     view?: string;
@@ -6757,7 +6757,7 @@ export class DKGAgent {
     resultKind?: 'derived' | 'decision';
     resultName?: string;
   }): Promise<CclPublishedEvaluationRecord[]> {
-    const graph = paranetDataGraphUri(opts.paranetId);
+    const graph = contextGraphDataGraphUri(opts.contextGraphId);
     const filters: string[] = [];
     if (opts.policyUri) filters.push(`?policy = <${opts.policyUri}>`);
     if (opts.snapshotId) filters.push(`?snapshotId = ${sparqlString(opts.snapshotId)}`);
@@ -6868,7 +6868,7 @@ export class DKGAgent {
     const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     const result = await this.store.query(
       `SELECT ?g WHERE {
-        GRAPH ?g { <${contextGraphUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}> }
+        GRAPH ?g { <${contextGraphUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> }
       } LIMIT 1`,
     );
     if (result.type === 'bindings' && result.bindings.length > 0) {
@@ -6882,9 +6882,9 @@ export class DKGAgent {
 
   /**
    * Check whether the context graph has any actual content locally. A
-   * paranet declaration triple in the ontology graph (from auto-discovery
+   * contextGraph declaration triple in the ontology graph (from auto-discovery
    * via chain registry or ontology sync) does NOT count as content; it
-   * only indicates the paranet was announced, not that we have access to
+   * only indicates the contextGraph was announced, not that we have access to
    * its data. This predicate is used to distinguish "genuinely synced /
    * has access" from "declaration only / probably denied".
    *
@@ -6923,15 +6923,15 @@ export class DKGAgent {
    * optimistic denial inference, not access control decisions).
    */
   async contextGraphIsCurated(contextGraphId: string): Promise<boolean> {
-    const paranetUri = `did:dkg:context-graph:${contextGraphId}`;
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     try {
       const res = await this.store.query(
         `SELECT ?ap WHERE {
-          { GRAPH <${ontologyGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
+          { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
           UNION
-          { GRAPH <${cgMetaGraph}> { <${paranetUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
+          { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
         } LIMIT 1`,
       );
       if (res.type !== 'bindings' || res.bindings.length === 0) return false;
@@ -6976,7 +6976,7 @@ export class DKGAgent {
     const parts = text.split('|');
     const ctxGraphPart = parts[0] || '';
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
-    const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_PARANETS.AGENTS);
+    const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
     return {
       contextGraphId,
       offset: parseInt(parts[1], 10) || 0,
@@ -7072,12 +7072,12 @@ export class DKGAgent {
   }
 
   private async isPrivateContextGraph(contextGraphId: string): Promise<boolean> {
-    if ((Object.values(SYSTEM_PARANETS) as string[]).includes(contextGraphId)) {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return false;
     }
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     const result = await this.store.query(
       `SELECT ?policy WHERE {
@@ -7140,7 +7140,7 @@ export class DKGAgent {
     }
 
     const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
 
     // V10 agent model: local allowedAgent entries plus explicit on-chain
     // participantAgent entries both grant local curated access.
@@ -7193,8 +7193,8 @@ export class DKGAgent {
    * Returns true if meta was refreshed, false if skipped or failed.
    */
   private async resolveCuratorPeerId(contextGraphId: string): Promise<string | undefined> {
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
-    const contextGraphUri = paranetDataGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
 
     const curatorResult = await this.store.query(
       `SELECT ?curator WHERE {
@@ -7225,7 +7225,7 @@ export class DKGAgent {
       // Preferred: look up the creator peer ID from the ontology definition
       // graph or the _meta graph. The dkg:creator triple uses the libp2p
       // peer ID while dkg:curator uses the wallet address.
-      const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+      const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
       const creatorResult = await this.store.query(
         `SELECT ?creator WHERE {
           {
@@ -7279,7 +7279,7 @@ export class DKGAgent {
     }
 
     const ctx = createOperationContext('sync');
-    const cgMetaGraph = paranetMetaGraphUri(contextGraphId);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
     if (!curatorPeerId) {
       return false;
@@ -7377,31 +7377,31 @@ export class DKGAgent {
      */
     callerInvolved?: boolean;
   }>> {
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const agentsGraph = paranetDataGraphUri(SYSTEM_PARANETS.AGENTS);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
     const result = await this.store.query(`
       SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access ?isSystem WHERE {
         {
           GRAPH <${ontologyGraph}> {
-            ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}> .
+            ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CREATOR}> ?creator }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?access }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CREATED_AT}> ?created }
-            OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_SYSTEM_PARANET}> . BIND(true AS ?isSystem) }
+            OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_SYSTEM_CONTEXT_GRAPH}> . BIND(true AS ?isSystem) }
           }
         } UNION {
           GRAPH <${agentsGraph}> {
-            ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}> .
+            ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CREATOR}> ?creator }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?access }
             OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.DKG_CREATED_AT}> ?created }
-            OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_SYSTEM_PARANET}> . BIND(true AS ?isSystem) }
+            OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_SYSTEM_CONTEXT_GRAPH}> . BIND(true AS ?isSystem) }
           }
         }
       }
@@ -7450,14 +7450,14 @@ export class DKGAgent {
     for (const [id, sub] of this.subscribedContextGraphs) {
       const uri = `${prefix}${id}`;
       if (seen.has(uri)) continue;
-      if (id === SYSTEM_PARANETS.AGENTS || id === SYSTEM_PARANETS.ONTOLOGY) continue;
+      if (id === SYSTEM_CONTEXT_GRAPHS.AGENTS || id === SYSTEM_CONTEXT_GRAPHS.ONTOLOGY) continue;
 
-      const metaGraph = paranetMetaGraphUri(id);
-      const pUri = paranetDataGraphUri(id);
+      const metaGraph = contextGraphMetaGraphUri(id);
+      const pUri = contextGraphDataGraphUri(id);
       const metaResult = await this.store.query(`
         SELECT ?name ?desc ?creator ?created ?curator ?access WHERE {
           GRAPH <${metaGraph}> {
-            <${pUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}> .
+            <${pUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
             OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name }
             OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.SCHEMA_DESCRIPTION}> ?desc }
             OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?creator }
@@ -7528,11 +7528,11 @@ export class DKGAgent {
     }
 
     const graphManager = new GraphManager(this.store);
-    const storedContextGraphs = await graphManager.listParanets();
+    const storedContextGraphs = await graphManager.listContextGraphs();
     for (const id of storedContextGraphs) {
       const uri = `${prefix}${id}`;
       if (seen.has(uri)) continue;
-      if (id === SYSTEM_PARANETS.AGENTS || id === SYSTEM_PARANETS.ONTOLOGY) continue;
+      if (id === SYSTEM_CONTEXT_GRAPHS.AGENTS || id === SYSTEM_CONTEXT_GRAPHS.ONTOLOGY) continue;
 
       const sub = this.subscribedContextGraphs.get(id);
       const onChainId = sub?.onChainId ?? (await this.getContextGraphOnChainId(id)) ?? undefined;
@@ -7652,13 +7652,13 @@ export class DKGAgent {
     }
   }
 
-  private async assertParanetOwner(paranetId: string, callerAgentAddress?: string): Promise<void> {
-    const owner = await this.getContextGraphOwner(paranetId);
+  private async assertContextGraphPolicyOwner(contextGraphId: string, callerAgentAddress?: string): Promise<void> {
+    const owner = await this.getContextGraphOwner(contextGraphId);
     if (!owner) {
-      throw new Error(`Paranet "${paranetId}" has no registered owner; cannot manage policies.`);
+      throw new Error(`ContextGraph "${contextGraphId}" has no registered owner; cannot manage policies.`);
     }
     if (!this.isCallerOrNodeOwner(owner, callerAgentAddress)) {
-      throw new Error(`Only the paranet owner can manage policies for "${paranetId}". Owner=${owner}, caller=${`did:dkg:agent:${callerAgentAddress ?? this.defaultAgentAddress ?? this.peerId}`}`);
+      throw new Error(`Only the contextGraph owner can manage policies for "${contextGraphId}". Owner=${owner}, caller=${`did:dkg:agent:${callerAgentAddress ?? this.defaultAgentAddress ?? this.peerId}`}`);
     }
   }
 
@@ -7672,17 +7672,17 @@ export class DKGAgent {
    * 403 response can tell the user exactly what they tried to do
    * ("publish a project manifest", "overwrite onboarding templates", …).
    */
-  async assertContextGraphOwner(paranetId: string, callerAgentAddress: string | undefined, action: string): Promise<void> {
-    const owner = await this.getContextGraphOwner(paranetId);
+  async assertContextGraphOwner(contextGraphId: string, callerAgentAddress: string | undefined, action: string): Promise<void> {
+    const owner = await this.getContextGraphOwner(contextGraphId);
     if (!owner) {
-      throw new Error(`Context graph "${paranetId}" has no registered owner; cannot ${action}.`);
+      throw new Error(`Context graph "${contextGraphId}" has no registered owner; cannot ${action}.`);
     }
     if (!this.isCallerOrNodeOwner(owner, callerAgentAddress)) {
       const caller = callerAgentAddress
         ? `did:dkg:agent:${callerAgentAddress}`
         : `did:dkg:agent:${this.defaultAgentAddress ?? this.peerId}`;
       throw new Error(
-        `Only the context graph curator can ${action} for "${paranetId}". ` +
+        `Only the context graph curator can ${action} for "${contextGraphId}". ` +
         `Owner=${owner}, caller=${caller}.`,
       );
     }
@@ -7793,16 +7793,16 @@ export class DKGAgent {
     return false;
   }
 
-  private async getContextGraphOwner(paranetId: string): Promise<string | null> {
-    const cgMetaGraph = paranetMetaGraphUri(paranetId);
-    const paranetUri = `did:dkg:context-graph:${paranetId}`;
+  private async getContextGraphOwner(contextGraphId: string): Promise<string | null> {
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     // Prefer the curator (wallet-scoped owner) so per-agent authorization
     // works on multi-agent nodes. Fall back to the creator (libp2p peer ID)
     // for legacy CGs created before the curator triple existed.
     const curatorResult = await this.store.query(`
       SELECT ?owner WHERE {
         GRAPH <${cgMetaGraph}> {
-          <${paranetUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?owner .
+          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?owner .
         }
       }
       LIMIT 1
@@ -7811,7 +7811,7 @@ export class DKGAgent {
       const owner = (curatorResult.bindings[0] as Record<string, string>)['owner'];
       if (owner) return owner;
     }
-    return this.getContextGraphCreator(paranetId);
+    return this.getContextGraphCreator(contextGraphId);
   }
 
   private async getContextGraphCurator(contextGraphId: string): Promise<string | null> {
@@ -7918,25 +7918,25 @@ export class DKGAgent {
   }
 
   /**
-   * Read `dkg:creator` (peer-ID DID) for a paranet. This is the publicly
+   * Read `dkg:creator` (peer-ID DID) for a contextGraph. This is the publicly
    * discoverable owner handle used in gossip validation — it propagates
    * through ONTOLOGY sync for open CGs, while `dkg:curator` stays in `_meta`.
    * Emitted approve/revoke binding metadata must use this value so remote
    * peers validating via `gossip-publish-handler` see a matching owner.
    */
-  private async getContextGraphCreator(paranetId: string): Promise<string | null> {
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const cgMetaGraph = paranetMetaGraphUri(paranetId);
-    const paranetUri = `did:dkg:context-graph:${paranetId}`;
+  private async getContextGraphCreator(contextGraphId: string): Promise<string | null> {
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     const result = await this.store.query(`
       SELECT ?owner WHERE {
         {
           GRAPH <${ontologyGraph}> {
-            <${paranetUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?owner .
+            <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?owner .
           }
         } UNION {
           GRAPH <${cgMetaGraph}> {
-            <${paranetUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?owner .
+            <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?owner .
           }
         }
       }
@@ -7947,19 +7947,19 @@ export class DKGAgent {
   }
 
   private async listCclPolicyBindings(opts: {
-    paranetId?: string;
+    contextGraphId?: string;
     name?: string;
   } = {}): Promise<PolicyApprovalBinding[]> {
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const filters: string[] = [];
-    if (opts.paranetId) filters.push(`?paranet = <did:dkg:context-graph:${opts.paranetId}>`);
+    if (opts.contextGraphId) filters.push(`?contextGraph = <did:dkg:context-graph:${opts.contextGraphId}>`);
     if (opts.name) filters.push(`?name = ${sparqlString(opts.name)}`);
     const filterBlock = filters.length > 0 ? `FILTER(${filters.join(' && ')})` : '';
     const result = await this.store.query(`
-      SELECT ?binding ?policy ?paranet ?name ?contextType ?bindingStatus ?approvedAt ?approvedBy ?revokedAt ?revokedBy WHERE {
+      SELECT ?binding ?policy ?contextGraph ?name ?contextType ?bindingStatus ?approvedAt ?approvedBy ?revokedAt ?revokedBy WHERE {
         GRAPH <${ontologyGraph}> {
           ?binding <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_POLICY_BINDING}> ;
-                   <${DKG_ONTOLOGY.DKG_POLICY_APPLIES_TO_PARANET}> ?paranet ;
+                   <${DKG_ONTOLOGY.DKG_POLICY_APPLIES_TO_CONTEXT_GRAPH}> ?contextGraph ;
                    <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name ;
                    <${DKG_ONTOLOGY.DKG_ACTIVE_POLICY}> ?policy ;
                    <${DKG_ONTOLOGY.DKG_APPROVED_AT}> ?approvedAt .
@@ -7982,7 +7982,7 @@ export class DKGAgent {
       const next: PolicyApprovalBinding = {
         bindingUri,
         policyUri: row['policy'],
-        paranetId: row['paranet'].startsWith('did:dkg:context-graph:') ? row['paranet'].slice('did:dkg:context-graph:'.length) : row['paranet'],
+        contextGraphId: row['contextGraph'].startsWith('did:dkg:context-graph:') ? row['contextGraph'].slice('did:dkg:context-graph:'.length) : row['contextGraph'],
         name: stripLiteral(row['name']),
         contextType: row['contextType'] ? stripLiteral(row['contextType']) : undefined,
         status: revokedAt || (row['bindingStatus'] && stripLiteral(row['bindingStatus']) === 'revoked') ? 'revoked' : 'approved',
@@ -8012,7 +8012,7 @@ export class DKGAgent {
     const latestByScope = new Map<string, string>();
     for (const b of allBindings) {
       if (b.status === 'revoked') continue;
-      const key = `${b.paranetId}|${b.name}|${b.contextType ?? ''}`;
+      const key = `${b.contextGraphId}|${b.name}|${b.contextType ?? ''}`;
       if (!latestByScope.has(key)) {
         latestByScope.set(key, b.bindingUri);
       } else if (b.bindingUri !== latestByScope.get(key)) {
@@ -8026,7 +8026,7 @@ export class DKGAgent {
     const latestByScope = new Map<string, PolicyApprovalBinding>();
     for (const binding of bindings) {
       if (binding.status === 'revoked' || binding.status === 'superseded') continue;
-      const key = `${binding.paranetId}|${binding.name}|${binding.contextType ?? ''}`;
+      const key = `${binding.contextGraphId}|${binding.name}|${binding.contextType ?? ''}`;
       const current = latestByScope.get(key);
       if (!current || binding.approvedAt > current.approvedAt) {
         latestByScope.set(key, binding);
@@ -8037,25 +8037,25 @@ export class DKGAgent {
 
   private resolveCclPolicyBinding(
     latestByScope: Map<string, PolicyApprovalBinding>,
-    paranetId: string,
+    contextGraphId: string,
     name: string,
     contextType?: string,
   ): PolicyApprovalBinding | null {
-    return latestByScope.get(`${paranetId}|${name}|${contextType ?? ''}`)
-      ?? latestByScope.get(`${paranetId}|${name}|`)
+    return latestByScope.get(`${contextGraphId}|${name}|${contextType ?? ''}`)
+      ?? latestByScope.get(`${contextGraphId}|${name}|`)
       ?? null;
   }
 
   private async getActiveCclPolicyBinding(opts: {
-    paranetId: string;
+    contextGraphId: string;
     policyUri: string;
     contextType?: string;
   }): Promise<PolicyApprovalBinding | null> {
     const record = await this.getCclPolicyByUri(opts.policyUri);
     if (!record) return null;
-    const bindings = await this.listCclPolicyBindings({ paranetId: opts.paranetId, name: record.name });
+    const bindings = await this.listCclPolicyBindings({ contextGraphId: opts.contextGraphId, name: record.name });
     const latestByScope = this.selectLatestNonRevokedBindings(bindings);
-    const active = this.resolveCclPolicyBinding(latestByScope, opts.paranetId, record.name, opts.contextType);
+    const active = this.resolveCclPolicyBinding(latestByScope, opts.contextGraphId, record.name, opts.contextType);
     if (!active || active.policyUri !== opts.policyUri) return null;
     return active;
   }
@@ -8076,7 +8076,7 @@ export class DKGAgent {
   }
 
   private async publishOntologyQuads(ual: string, quads: Quad[]): Promise<void> {
-    const ontologyTopic = paranetPublishTopic(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyTopic = contextGraphPublishTopic(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const nquads = quads.map(q => {
       const obj = q.object.startsWith('"') ? q.object : `<${q.object}>`;
       return `<${q.subject}> <${q.predicate}> ${obj} <${q.graph}> .`;
@@ -8085,7 +8085,7 @@ export class DKGAgent {
     const msg = encodePublishRequest({
       ual,
       nquads: new TextEncoder().encode(nquads),
-      paranetId: SYSTEM_PARANETS.ONTOLOGY,
+      contextGraphId: SYSTEM_CONTEXT_GRAPHS.ONTOLOGY,
       kas: [],
       publisherIdentity: this.wallet.keypair.publicKey,
       publisherAddress: '',
@@ -8212,7 +8212,7 @@ export class DKGAgent {
    */
   async discoverContextGraphsFromStore(): Promise<number> {
     const ctx = createOperationContext('system');
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const prefix = 'did:dkg:context-graph:';
     let discovered = 0;
 
@@ -8226,7 +8226,7 @@ export class DKGAgent {
         const uri = row['ctxGraph'] ?? '';
         const id = uri.startsWith(prefix) ? uri.slice(prefix.length) : null;
         if (!id) continue;
-        if (id === SYSTEM_PARANETS.AGENTS || id === SYSTEM_PARANETS.ONTOLOGY) continue;
+        if (id === SYSTEM_CONTEXT_GRAPHS.AGENTS || id === SYSTEM_CONTEXT_GRAPHS.ONTOLOGY) continue;
 
         const existing = discoveredEntries.get(id);
         const name = row['name'] ? stripLiteral(row['name']) : existing?.name ?? id;
@@ -8240,7 +8240,7 @@ export class DKGAgent {
     const ontologyResult = await this.store.query(`
       SELECT ?ctxGraph ?name WHERE {
         GRAPH <${ontologyGraph}> {
-          ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}> .
+          ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
           OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name }
         }
       }
@@ -8252,7 +8252,7 @@ export class DKGAgent {
     const metaResult = await this.store.query(`
       SELECT ?ctxGraph ?name WHERE {
         GRAPH ?metaGraph {
-          ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}> .
+          ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
           OPTIONAL { ?ctxGraph <${DKG_ONTOLOGY.SCHEMA_NAME}> ?name }
           FILTER(STRENDS(STR(?metaGraph), "/_meta"))
         }
@@ -8405,11 +8405,11 @@ export class DKGAgent {
       // Persist the on-chain ID to the ontology graph so the publisher's
       // VM registration guard can find it via RDF (it has no access to
       // the in-memory subscribedContextGraphs map).
-      const cgUri = paranetDataGraphUri(p.name);
-      const ontoGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+      const cgUri = contextGraphDataGraphUri(p.name);
+      const ontoGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
       await this.store.insert([{
         subject: cgUri,
-        predicate: `${DKG_ONTOLOGY.DKG_PARANET}OnChainId`,
+        predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`,
         object: `"${p.contextGraphId}"`,
         graph: ontoGraph,
       }]);
@@ -8474,8 +8474,8 @@ export class DKGAgent {
     const gm = new GraphManager(store);
 
     // Ensure system context graphs exist
-    await gm.ensureParanet(SYSTEM_PARANETS.AGENTS);
-    await gm.ensureParanet(SYSTEM_PARANETS.ONTOLOGY);
+    await gm.ensureContextGraph(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    await gm.ensureContextGraph(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
 
     // Check if genesis is already loaded by looking for the network definition
     const result = await store.query(
@@ -8649,7 +8649,7 @@ export class DKGAgent {
     const msg = encodePublishRequest({
       ual: result.ual,
       nquads: new TextEncoder().encode(ntriples),
-      paranetId: contextGraphId,
+      contextGraphId: contextGraphId,
       kas: result.kaManifest.map(ka => ({
         tokenId: Number(ka.tokenId),
         rootEntity: ka.rootEntity,
@@ -8669,7 +8669,7 @@ export class DKGAgent {
       subGraphName: result.subGraphName,
     });
 
-    const topic = paranetPublishTopic(contextGraphId);
+    const topic = contextGraphPublishTopic(contextGraphId);
     this.log.info(ctx, `Broadcasting to topic ${topic}`);
     try {
       await this.gossip.publish(topic, msg);

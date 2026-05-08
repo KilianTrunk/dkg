@@ -21,7 +21,7 @@ The DKG daemon must be running (`dkg start`).
 
 ## Session Start Protocol
 
-Before exploring the codebase, **always** query the dev-coordination paranet first. These queries cost a fraction of the tokens that file exploration does.
+Before exploring the codebase, **always** query the dev-coordination contextGraph first. These queries cost a fraction of the tokens that file exploration does.
 
 ### 1. Check what has been worked on recently
 

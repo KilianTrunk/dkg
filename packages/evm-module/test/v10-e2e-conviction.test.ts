@@ -423,6 +423,7 @@ describe('V10 E2E Conviction System', function () {
         [],                // participant agents
         2,                 // requiredSignatures
         0,                 // metadataBatchId
+        0,                 // accessPolicy = public/discoverable
         1,                 // publishPolicy = open (any non-zero publisher auth'd)
         ethers.ZeroAddress,
         0,                 // publishAuthorityAccountId

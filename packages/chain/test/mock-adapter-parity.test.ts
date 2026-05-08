@@ -259,6 +259,11 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
 
     await expect(mock.createOnChainContextGraph({
       ...base,
+      accessPolicy: 2,
+    })).rejects.toThrow(/invalid accessPolicy/);
+
+    await expect(mock.createOnChainContextGraph({
+      ...base,
       publishPolicy: 2,
     })).rejects.toThrow(/invalid publishPolicy/);
 

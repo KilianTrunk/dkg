@@ -123,7 +123,6 @@ import { type ExtractionStatusRecord, getExtractionStatusRecord, setExtractionSt
 import { FileStore } from '../../file-store.js';
 import { VectorStore, OpenAIEmbeddingProvider, type EmbeddingProvider } from '../../vector-store.js';
 import { parseBoundary, parseMultipart, MultipartParseError } from '../../http/multipart.js';
-import { handleCapture, EpcisValidationError, handleEventsQuery, EpcisQueryError, type Publisher as EpcisPublisher } from '@origintrail-official/dkg-epcis';
 // Phase 8 — project-manifest publish + install (UI-driven onboarding flow).
 // Daemon constructs a self-pointing DkgClient (localhost:listenPort) and
 // reuses the same publish/fetch/plan/write helpers the CLI uses, so wire
@@ -374,7 +373,7 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
 
-    const contextGraphId = parsed.contextGraphId ?? parsed.paranetId;
+    const contextGraphId = parsed.contextGraphId;
     if (!validateRequiredContextGraphId(contextGraphId, res)) return;
 
     const { quads } = parsed;
@@ -438,7 +437,7 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
 
-    const contextGraphId = parsed.contextGraphId ?? parsed.paranetId;
+    const contextGraphId = parsed.contextGraphId;
     if (!validateRequiredContextGraphId(contextGraphId, res)) return;
 
     const graph = `did:dkg:context-graph:${contextGraphId}/meta/query-catalog`;
@@ -494,16 +493,16 @@ WHERE {
     ) {
       return jsonResponse(res, 400, { error: '"localOnly" must be a boolean' });
     }
-    const paranetId = parsed.contextGraphId ?? parsed.paranetId;
-    if (!paranetId || !quads?.length) {
+    const contextGraphId = parsed.contextGraphId;
+    if (!contextGraphId || !quads?.length) {
       return jsonResponse(res, 400, {
-        error: 'Missing "contextGraphId" (or "paranetId") or "quads"',
+        error: 'Missing "contextGraphId" or "quads"',
       });
     }
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     const ctx = createOperationContext("share");
     tracker.start(ctx, {
-      contextGraphId: paranetId,
+      contextGraphId: contextGraphId,
       details: { tripleCount: quads.length, source: "api", subGraphName },
     });
     try {
@@ -511,7 +510,7 @@ WHERE {
         // validation happens inside share
       });
       const result = await tracker.trackPhase(ctx, "store", () =>
-        agent.share(paranetId, quads, {
+        agent.share(contextGraphId, quads, {
           subGraphName,
           localOnly,
           operationCtx: ctx,
@@ -521,9 +520,8 @@ WHERE {
       return jsonResponse(res, 200, {
         shareOperationId: result?.shareOperationId,
         workspaceOperationId: result?.shareOperationId,
-        contextGraphId: paranetId,
-        paranetId,
-        graph: contextGraphSharedMemoryUri(paranetId, subGraphName),
+        contextGraphId,
+        graph: contextGraphSharedMemoryUri(contextGraphId, subGraphName),
         triplesWritten: quads.length,
       });
     } catch (err: any) {
@@ -549,10 +547,10 @@ WHERE {
     if (!parsed) return;
     const { selection, clearAfter, publishContextGraphId, subGraphName } =
       parsed;
-    const paranetId = parsed.contextGraphId ?? parsed.paranetId;
-    if (!paranetId)
+    const contextGraphId = parsed.contextGraphId;
+    if (!contextGraphId)
       return jsonResponse(res, 400, {
-        error: 'Missing "contextGraphId" (or "paranetId")',
+        error: 'Missing "contextGraphId"',
       });
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     if (subGraphName && publishContextGraphId) {
@@ -563,7 +561,7 @@ WHERE {
     }
     const ctx = createOperationContext("publishFromSWM");
     tracker.start(ctx, {
-      contextGraphId: paranetId,
+      contextGraphId: contextGraphId,
       details: { source: "api", publishContextGraphId, subGraphName },
     });
     try {
@@ -574,13 +572,13 @@ WHERE {
       if (publishContextGraphId != null) {
         resolvedPublishContextGraphId = String(publishContextGraphId);
       } else if (!subGraphName) {
-        const onChainId = await agent.getContextGraphOnChainId(paranetId);
+        const onChainId = await agent.getContextGraphOnChainId(contextGraphId);
         if (onChainId && /^\d+$/.test(onChainId)) {
           resolvedPublishContextGraphId = onChainId;
         }
       }
       const result = await tracker.trackPhase(ctx, "read-shared-memory", () =>
-        agent.publishFromSharedMemory(paranetId, sel, {
+        agent.publishFromSharedMemory(contextGraphId, sel, {
           clearSharedMemoryAfter: clearAfter ?? true,
           operationCtx: ctx,
           subGraphName,
@@ -631,20 +629,20 @@ WHERE {
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
     const { quads, conditions, subGraphName } = parsed;
-    const paranetId = parsed.contextGraphId ?? parsed.paranetId;
+    const contextGraphId = parsed.contextGraphId;
     if (!quads?.length)
       return jsonResponse(res, 400, { error: 'Missing "quads"' });
-    if (!validateRequiredContextGraphId(paranetId, res)) return;
+    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
     if (!validateConditions(conditions, res)) return;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     const ctx = createOperationContext("share");
     tracker.start(ctx, {
-      contextGraphId: paranetId,
+      contextGraphId: contextGraphId,
       details: { tripleCount: quads.length, source: "api-cas", subGraphName },
     });
     try {
       const result = await agent.conditionalShare(
-        paranetId,
+        contextGraphId,
         quads,
         conditions,
         { subGraphName, operationCtx: ctx },

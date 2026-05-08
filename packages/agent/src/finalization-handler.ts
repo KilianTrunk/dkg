@@ -1,6 +1,6 @@
 import {
   decodeFinalizationMessage,
-  paranetWorkspaceGraphUri, paranetWorkspaceMetaGraphUri,
+  contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphDataUri, contextGraphMetaUri,
   contextGraphSubGraphUri, validateSubGraphName,
   Logger, createOperationContext,
@@ -37,8 +37,8 @@ export class FinalizationHandler {
         ctx = createOperationContext('gossip', msg.operationId);
       }
 
-      if (msg.paranetId && msg.paranetId !== contextGraphId) {
-        this.log.warn(ctx, `Finalization: contextGraphId "${msg.paranetId}" does not match topic "${contextGraphId}", ignoring`);
+      if (msg.contextGraphId && msg.contextGraphId !== contextGraphId) {
+        this.log.warn(ctx, `Finalization: contextGraphId "${msg.contextGraphId}" does not match topic "${contextGraphId}", ignoring`);
         return;
       }
 
@@ -58,7 +58,7 @@ export class FinalizationHandler {
       const startKAId = protoToBigInt(msg.startKAId);
       const endKAId = protoToBigInt(msg.endKAId);
 
-      const ctxGraphId = msg.contextGraphId || undefined;
+      const ctxGraphId = msg.targetContextGraphId || undefined;
 
       // Validate sub-graph name from gossip — reject invalid names entirely
       let subGraphName: string | undefined;
@@ -149,7 +149,7 @@ export class FinalizationHandler {
     const graphManager = new GraphManager(this.store);
     const sharedMemoryGraph = subGraphName
       ? graphManager.sharedMemoryUri(contextGraphId, subGraphName)
-      : paranetWorkspaceGraphUri(contextGraphId);
+      : contextGraphWorkspaceGraphUri(contextGraphId);
     const safeRoots = rootEntities.filter(isSafeIri);
     if (safeRoots.length === 0) return [];
 
@@ -178,7 +178,7 @@ export class FinalizationHandler {
     const graphManager = new GraphManager(this.store);
     const wsMetaGraph = subGraphName
       ? graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName)
-      : paranetWorkspaceMetaGraphUri(contextGraphId);
+      : contextGraphWorkspaceMetaGraphUri(contextGraphId);
     const safeRoots = rootEntities.filter(isSafeIri);
     if (safeRoots.length === 0) return [];
 
@@ -211,7 +211,7 @@ export class FinalizationHandler {
     const graphManager = new GraphManager(this.store);
     const wsMetaGraph = subGraphName
       ? graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName)
-      : paranetWorkspaceMetaGraphUri(contextGraphId);
+      : contextGraphWorkspaceMetaGraphUri(contextGraphId);
     const safeRoots = rootEntities.filter(isSafeIri);
     if (safeRoots.length === 0) return undefined;
 
@@ -333,7 +333,7 @@ export class FinalizationHandler {
     subGraphName?: string,
   ): Promise<void> {
     const graphManager = new GraphManager(this.store);
-    await graphManager.ensureParanet(contextGraphId);
+    await graphManager.ensureContextGraph(contextGraphId);
     if (subGraphName) {
       await graphManager.ensureSubGraph(contextGraphId, subGraphName);
       const sgUri = contextGraphSubGraphUri(contextGraphId, subGraphName);
@@ -473,10 +473,10 @@ export class FinalizationHandler {
     // Clean up promoted shared memory entries
     const sharedMemoryGraph = subGraphName
       ? graphManager.sharedMemoryUri(contextGraphId, subGraphName)
-      : paranetWorkspaceGraphUri(contextGraphId);
+      : contextGraphWorkspaceGraphUri(contextGraphId);
     const swmMetaGraph = subGraphName
       ? graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName)
-      : paranetWorkspaceMetaGraphUri(contextGraphId);
+      : contextGraphWorkspaceMetaGraphUri(contextGraphId);
     for (const rootEntity of rootEntities) {
       await this.store.deleteByPattern({ graph: sharedMemoryGraph, subject: rootEntity });
       await this.store.deleteBySubjectPrefix(sharedMemoryGraph, rootEntity + '/.well-known/genid/');
@@ -532,4 +532,3 @@ function protoToBigInt(val: number | bigint | { low: number; high: number; unsig
   if (typeof val === 'number') return BigInt(val);
   return (BigInt(val.high >>> 0) << 32n) | BigInt(val.low >>> 0);
 }
-

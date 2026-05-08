@@ -1766,7 +1766,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       // path as args[0].
       const cursorConfig = JSON.parse(readFileSync(join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
       expect(cursorConfig.mcpServers.dkg.command).toBe(process.execPath);
-      expect(cursorConfig.mcpServers.dkg.args[0]).toBe(persistentPath);
+      expect(cursorConfig.mcpServers.dkg.args[0]).toBe(realpathSync(persistentPath));
       expect(cursorConfig.mcpServers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
     } finally {
       restore();

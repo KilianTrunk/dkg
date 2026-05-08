@@ -859,6 +859,7 @@ describe('@unit RandomSampling', () => {
         [], // no participant agents
         2, // requiredSignatures
         0, // metadataBatchId
+        0, // accessPolicy = public/discoverable
         publishPolicy,
         authority,
         0, // publishAuthorityAccountId

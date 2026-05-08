@@ -1,5 +1,5 @@
 import { createOperationContext, DKG_ONTOLOGY, MemoryLayer, type OperationContext } from '@origintrail-official/dkg-core';
-import { paranetDataGraphUri, paranetMetaGraphUri, paranetWorkspaceGraphUri, paranetWorkspaceMetaGraphUri } from '@origintrail-official/dkg-core';
+import { contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri } from '@origintrail-official/dkg-core';
 import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { SyncRequestEnvelope } from '../auth/request-build.js';
 
@@ -53,8 +53,8 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
     }
 
     if (isWorkspace) {
-      const wsGraph = paranetWorkspaceGraphUri(contextGraphId);
-      const wsMetaGraph = paranetWorkspaceMetaGraphUri(contextGraphId);
+      const wsGraph = contextGraphWorkspaceGraphUri(contextGraphId);
+      const wsMetaGraph = contextGraphWorkspaceMetaGraphUri(contextGraphId);
       const cutoff = sharedMemoryTtlMs > 0 ? new Date(Date.now() - sharedMemoryTtlMs).toISOString() : null;
 
       if (phase === 'meta') {
@@ -113,8 +113,8 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
 
       if (nquads.length === 0) return new TextEncoder().encode('');
     } else {
-      const dataGraph = paranetDataGraphUri(contextGraphId);
-      const metaGraph = paranetMetaGraphUri(contextGraphId);
+      const dataGraph = contextGraphDataGraphUri(contextGraphId);
+      const metaGraph = contextGraphMetaGraphUri(contextGraphId);
 
       if (phase === 'meta') {
         const DKG_NS = 'http://dkg.io/ontology/';

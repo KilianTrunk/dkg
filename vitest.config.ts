@@ -15,7 +15,6 @@ export default defineConfig({
       'packages/node-ui',
       'packages/network-sim',
       'packages/graph-viz',
-      'packages/attested-assets',
       'packages/epcis',
       'packages/adapter-openclaw',
       'packages/adapter-elizaos',

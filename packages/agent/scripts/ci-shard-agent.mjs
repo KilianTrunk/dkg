@@ -54,7 +54,7 @@ const WEIGHTS = {
   'test/workspace-ttl.test.ts': 8758,
   'test/e2e-context-graph.test.ts': 8003,
   'test/publish-jsonld.test.ts': 7601,
-  'test/paranet-discovery.test.ts': 5800,
+  'test/contextGraph-discovery.test.ts': 5800,
   'test/e2e-assertion-lifecycle.test.ts': 5318,
   'test/e2e-chain.test.ts': 5000,
   'test/e2e-finalization.test.ts': 5000,

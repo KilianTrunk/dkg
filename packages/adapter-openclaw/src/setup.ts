@@ -87,8 +87,6 @@ interface NetworkConfig {
   networkName: string;
   relays: string[];
   defaultContextGraphs: string[];
-  /** @deprecated Legacy key in older network config files */
-  defaultParanets?: string[];
   defaultNodeRole: string;
   autoUpdate?: {
     enabled: boolean;

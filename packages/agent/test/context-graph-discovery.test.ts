@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
 import { DKGAgent, type ContextGraphSub } from '../src/index.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
-import { SYSTEM_PARANETS, DKG_ONTOLOGY, paranetDataGraphUri, contextGraphSharedMemoryUri, paranetMetaGraphUri } from '@origintrail-official/dkg-core';
+import { SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY, contextGraphDataGraphUri, contextGraphSharedMemoryUri, contextGraphMetaGraphUri } from '@origintrail-official/dkg-core';
 import { type ChainAdapter, type ContextGraphOnChain } from '@origintrail-official/dkg-chain';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -25,7 +25,7 @@ async function createTestAgent(opts?: {
 }) {
   const store = opts?.store ?? new OxigraphStore();
   const agent = await DKGAgent.create({
-    name: 'ParanetTestAgent',
+    name: 'ContextGraphTestAgent',
     listenPort: 0,
     listenHost: '127.0.0.1',
     store,
@@ -41,21 +41,21 @@ describe('ensureContextGraphLocal', () => {
     await agent?.stop().catch(() => {});
   });
 
-  it('creates a paranet if it does not exist', async () => {
+  it('creates a contextGraph if it does not exist', async () => {
     const result = await createTestAgent();
     agent = result.agent;
     await agent.start();
 
-    await agent.ensureContextGraphLocal({ id: 'test-paranet', name: 'Test Paranet' });
+    await agent.ensureContextGraphLocal({ id: 'test-contextGraph', name: 'Test ContextGraph' });
 
-    const exists = await agent.contextGraphExists('test-paranet');
+    const exists = await agent.contextGraphExists('test-contextGraph');
     expect(exists).toBe(true);
 
-    const sub = agent.getSubscribedContextGraphs().get('test-paranet');
+    const sub = agent.getSubscribedContextGraphs().get('test-contextGraph');
     expect(sub).toBeDefined();
     expect(sub!.subscribed).toBe(true);
     expect(sub!.synced).toBe(true);
-    expect(sub!.name).toBe('Test Paranet');
+    expect(sub!.name).toBe('Test ContextGraph');
   }, 15000);
 
   it('is idempotent — calling twice does not throw or duplicate triples', async () => {
@@ -69,11 +69,11 @@ describe('ensureContextGraphLocal', () => {
     const exists = await agent.contextGraphExists('idem-test');
     expect(exists).toBe(true);
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const countResult = await result.store.query(`
       SELECT (COUNT(*) AS ?c) WHERE {
         GRAPH <${ontologyGraph}> {
-          <${paranetDataGraphUri('idem-test')}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_PARANET}>
+          <${contextGraphDataGraphUri('idem-test')}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}>
         }
       }
     `);
@@ -110,15 +110,15 @@ describe('ensureContextGraphLocal', () => {
     await agent.ensureContextGraphLocal({
       id: 'special-chars',
       name: 'Special Chars',
-      description: 'Default paranet: special-chars (test)',
+      description: 'Default contextGraph: special-chars (test)',
     });
 
     const exists = await agent.contextGraphExists('special-chars');
     expect(exists).toBe(true);
 
-    const paranets = await agent.listContextGraphs();
-    const entry = paranets.find(p => p.id === 'special-chars');
-    expect(entry?.description).toBe('Default paranet: special-chars (test)');
+    const contextGraphs = await agent.listContextGraphs();
+    const entry = contextGraphs.find(p => p.id === 'special-chars');
+    expect(entry?.description).toBe('Default contextGraph: special-chars (test)');
     expect(entry?.callerInvolved).toBeUndefined();
   }, 15000);
 
@@ -148,30 +148,30 @@ describe('discoverContextGraphsFromStore', () => {
     await agent?.stop().catch(() => {});
   });
 
-  it('discovers paranets from ONTOLOGY graph without auto-subscribing', async () => {
+  it('discovers contextGraphs from ONTOLOGY graph without auto-subscribing', async () => {
     const store = new OxigraphStore();
     const result = await createTestAgent({ store });
     agent = result.agent;
     await agent.start();
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const paranetUri = paranetDataGraphUri('discovered-paranet');
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const contextGraphUri = contextGraphDataGraphUri('discovered-contextGraph');
     await store.insert([
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PARANET, graph: ontologyGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Discovered Paranet"', graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Discovered ContextGraph"', graph: ontologyGraph },
     ]);
 
     const discovered = await agent.discoverContextGraphsFromStore();
     expect(discovered).toBe(1);
 
-    const sub = agent.getSubscribedContextGraphs().get('discovered-paranet');
+    const sub = agent.getSubscribedContextGraphs().get('discovered-contextGraph');
     expect(sub).toBeDefined();
     expect(sub!.subscribed).toBe(false);
     expect(sub!.synced).toBe(true);
-    expect(sub!.name).toBe('Discovered Paranet');
+    expect(sub!.name).toBe('Discovered ContextGraph');
   }, 15000);
 
-  it('does not re-discover already known paranets', async () => {
+  it('does not re-discover already known contextGraphs', async () => {
     const store = new OxigraphStore();
     const result = await createTestAgent({ store });
     agent = result.agent;
@@ -183,7 +183,7 @@ describe('discoverContextGraphsFromStore', () => {
     expect(discovered).toBe(0);
   }, 15000);
 
-  it('skips system paranets (agents, ontology)', async () => {
+  it('skips system contextGraphs (agents, ontology)', async () => {
     const store = new OxigraphStore();
     const result = await createTestAgent({ store });
     agent = result.agent;
@@ -201,15 +201,15 @@ describe('listContextGraphs merge', () => {
     await agent?.stop().catch(() => {});
   });
 
-  it('returns synced paranets with subscribed=true', async () => {
+  it('returns synced contextGraphs with subscribed=true', async () => {
     const result = await createTestAgent();
     agent = result.agent;
     await agent.start();
 
-    await agent.ensureContextGraphLocal({ id: 'synced-paranet', name: 'Synced' });
+    await agent.ensureContextGraphLocal({ id: 'synced-contextGraph', name: 'Synced' });
 
-    const paranets = await agent.listContextGraphs();
-    const entry = paranets.find(p => p.id === 'synced-paranet');
+    const contextGraphs = await agent.listContextGraphs();
+    const entry = contextGraphs.find(p => p.id === 'synced-contextGraph');
     expect(entry).toBeDefined();
     expect(entry!.subscribed).toBe(true);
     expect(entry!.synced).toBe(true);
@@ -217,7 +217,7 @@ describe('listContextGraphs merge', () => {
     expect(entry!.callerInvolved).toBeUndefined();
   }, 15000);
 
-  it('includes subscribed-but-not-synced paranets from registry', async () => {
+  it('includes subscribed-but-not-synced contextGraphs from registry', async () => {
     const result = await createTestAgent();
     agent = result.agent;
     await agent.start();
@@ -230,8 +230,8 @@ describe('listContextGraphs merge', () => {
       onChainId: '0xabc123',
     });
 
-    const paranets = await agent.listContextGraphs();
-    const entry = paranets.find(p => p.id === 'chain-only');
+    const contextGraphs = await agent.listContextGraphs();
+    const entry = contextGraphs.find(p => p.id === 'chain-only');
     expect(entry).toBeDefined();
     expect(entry!.subscribed).toBe(true);
     expect(entry!.synced).toBe(false);
@@ -239,21 +239,21 @@ describe('listContextGraphs merge', () => {
     expect(entry!.callerInvolved).toBeUndefined();
   }, 15000);
 
-  it('marks SPARQL-only paranets (not in registry) as subscribed=false', async () => {
+  it('marks SPARQL-only contextGraphs (not in registry) as subscribed=false', async () => {
     const store = new OxigraphStore();
     const result = await createTestAgent({ store });
     agent = result.agent;
     await agent.start();
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const paranetUri = paranetDataGraphUri('unsubscribed');
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const contextGraphUri = contextGraphDataGraphUri('unsubscribed');
     await store.insert([
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PARANET, graph: ontologyGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Unsubscribed"', graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Unsubscribed"', graph: ontologyGraph },
     ]);
 
-    const paranets = await agent.listContextGraphs();
-    const entry = paranets.find(p => p.id === 'unsubscribed');
+    const contextGraphs = await agent.listContextGraphs();
+    const entry = contextGraphs.find(p => p.id === 'unsubscribed');
     expect(entry).toBeDefined();
     expect(entry!.subscribed).toBe(false);
     expect(entry!.synced).toBe(true);
@@ -275,8 +275,8 @@ describe('listContextGraphs merge', () => {
       },
     ]);
 
-    const paranets = await agent.listContextGraphs();
-    const entry = paranets.find(p => p.id === 'workspace-only');
+    const contextGraphs = await agent.listContextGraphs();
+    const entry = contextGraphs.find(p => p.id === 'workspace-only');
     expect(entry).toBeDefined();
     expect(entry!.name).toBe('workspace-only');
     expect(entry!.subscribed).toBe(false);
@@ -335,7 +335,7 @@ describe('discoverContextGraphsFromChain', () => {
     await agent?.stop().catch(() => {});
   });
 
-  it('discovers on-chain paranets with cleartext name and auto-subscribes', async () => {
+  it('discovers on-chain contextGraphs with cleartext name and auto-subscribes', async () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     (chain as any).listContextGraphsFromChain = async () => ([
       {
@@ -387,7 +387,7 @@ describe('discoverContextGraphsFromChain', () => {
     expect(subs.get('leaked-curated')).toBeUndefined();
   }, 15000);
 
-  it('skips hash-only on-chain paranets without metadata', async () => {
+  it('skips hash-only on-chain contextGraphs without metadata', async () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     (chain as any).listContextGraphsFromChain = async () => ([
       {
@@ -411,7 +411,7 @@ describe('discoverContextGraphsFromChain', () => {
     expect(ghost).toBeUndefined();
   }, 15000);
 
-  it('skips already known on-chain paranets', async () => {
+  it('skips already known on-chain contextGraphs', async () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     (chain as any).listContextGraphsFromChain = async () => ([
       {
@@ -465,10 +465,10 @@ describe('discoverContextGraphsFromStore', () => {
     await agent.start();
 
     const curatedId = 'curated-meta-only';
-    const paranetUri = paranetDataGraphUri(curatedId);
+    const contextGraphUri = contextGraphDataGraphUri(curatedId);
     await store.insert([
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PARANET, graph: paranetMetaGraphUri(curatedId) },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Curated Meta Only"', graph: paranetMetaGraphUri(curatedId) },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: contextGraphMetaGraphUri(curatedId) },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Curated Meta Only"', graph: contextGraphMetaGraphUri(curatedId) },
     ]);
 
     const discovered = await agent.discoverContextGraphsFromStore();
@@ -526,8 +526,8 @@ describe('hash-vs-name duplication regression', () => {
     await agent?.stop().catch(() => {});
   });
 
-  it('chain discovery then ontology sync produces one merged entry, no ghost 0x paranet', async () => {
-    const localName = 'merged-paranet';
+  it('chain discovery then ontology sync produces one merged entry, no ghost 0x contextGraph', async () => {
+    const localName = 'merged-contextGraph';
     const expectedHash = ethers.keccak256(ethers.toUtf8Bytes(localName));
 
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
@@ -550,24 +550,24 @@ describe('hash-vs-name duplication regression', () => {
     const chainDiscovered = await agent.discoverContextGraphsFromChain();
     expect(chainDiscovered).toBe(1);
 
-    const ontologyGraph = paranetDataGraphUri(SYSTEM_PARANETS.ONTOLOGY);
-    const paranetUri = paranetDataGraphUri(localName);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const contextGraphUri = contextGraphDataGraphUri(localName);
     await store.insert([
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PARANET, graph: ontologyGraph },
-      { subject: paranetUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: `"${localName}"`, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: `"${localName}"`, graph: ontologyGraph },
     ]);
     const storeDiscovered = await agent.discoverContextGraphsFromStore();
     expect(storeDiscovered).toBeLessThanOrEqual(1);
 
-    const paranets = await agent.listContextGraphs();
-    const matches = paranets.filter(p => p.id === localName || p.id === expectedHash);
+    const contextGraphs = await agent.listContextGraphs();
+    const matches = contextGraphs.filter(p => p.id === localName || p.id === expectedHash);
     expect(matches.length).toBe(1);
     expect(matches[0].id).toBe(localName);
     expect(matches[0].subscribed).toBe(true);
     expect(matches[0].synced).toBe(true);
     expect(matches[0].callerInvolved).toBeUndefined();
 
-    const ghosts = paranets.filter(p => p.id.startsWith('0x'));
+    const ghosts = contextGraphs.filter(p => p.id.startsWith('0x'));
     expect(ghosts.length).toBe(0);
   }, 15000);
 });

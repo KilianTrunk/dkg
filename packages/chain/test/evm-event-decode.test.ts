@@ -51,7 +51,7 @@ function canonicalSignature(iface: Interface, eventName: string): string {
 describe('ContextGraphCreated — topic0 and signature pinning [CH-6]', () => {
   const iface = loadInterface('ContextGraphStorage');
   const EXPECTED_SIG =
-    'ContextGraphCreated(uint256,address,uint72[],address[],uint8,uint256,uint8,address,uint256)';
+    'ContextGraphCreated(uint256,address,uint72[],address[],uint8,uint256,uint8,uint8,address,uint256)';
 
   it('canonical signature matches the spec field ordering', () => {
     expect(canonicalSignature(iface, 'ContextGraphCreated')).toBe(EXPECTED_SIG);
@@ -72,8 +72,8 @@ describe('ContextGraphCreated — topic0 and signature pinning [CH-6]', () => {
     const { AbiCoder, zeroPadValue } = require('ethers') as typeof import('ethers');
     const coder = new AbiCoder();
     const nonIndexed = coder.encode(
-      ['uint72[]', 'address[]', 'uint8', 'uint256', 'uint8', 'address', 'uint256'],
-      [[1n, 2n, 3n], [], 2, 0n, 1, '0x0000000000000000000000000000000000000000', 0n],
+      ['uint72[]', 'address[]', 'uint8', 'uint256', 'uint8', 'uint8', 'address', 'uint256'],
+      [[1n, 2n, 3n], [], 2, 0n, 0, 1, '0x0000000000000000000000000000000000000000', 0n],
     );
     const parsed = iface.parseLog({
       topics: [
@@ -87,6 +87,8 @@ describe('ContextGraphCreated — topic0 and signature pinning [CH-6]', () => {
     expect(parsed!.args.contextGraphId).toBe(42n);
     expect(parsed!.args.hostingNodes.map((x: bigint) => x)).toEqual([1n, 2n, 3n]);
     expect(Number(parsed!.args.requiredSignatures)).toBe(2);
+    expect(Number(parsed!.args.accessPolicy)).toBe(0);
+    expect(Number(parsed!.args.publishPolicy)).toBe(1);
   });
 });
 

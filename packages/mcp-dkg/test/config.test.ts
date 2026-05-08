@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
@@ -105,7 +105,7 @@ describe('loadConfig — DKG_HOME precedence (Codex Round-11 Fix 18)', () => {
 
     const cfg = loadConfig();
     expect(cfg.api).toBe('http://workspace:9999');
-    expect(cfg.sourcePath).toBe(join(workspace, '.dkg', 'config.yaml'));
+    expect(realpathSync(cfg.sourcePath!)).toBe(realpathSync(join(workspace, '.dkg', 'config.yaml')));
   });
 
   it('Codex Round-11 Fix 18: round-trip — mcp-setup-style env propagation reads from the bootstrapped home', () => {

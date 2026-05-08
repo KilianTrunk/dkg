@@ -17,7 +17,7 @@ describe('subtractFinalizedExactQuads', () => {
   let publisher: DKGPublisher;
   let _testSnapshot: string;
 
-  let PARANET: string;
+  let CONTEXT_GRAPH: string;
   let _fileSnapshot: string;
   beforeAll(async () => {
     _fileSnapshot = await takeSnapshot();
@@ -26,7 +26,7 @@ describe('subtractFinalizedExactQuads', () => {
     const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
     const cgId = await createTestContextGraph();
-    PARANET = cgId.toString();
+    CONTEXT_GRAPH = cgId.toString();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -57,7 +57,7 @@ describe('subtractFinalizedExactQuads', () => {
         swmId: 'swm-main',
         shareOperationId: 'swm-1',
         roots: ['urn:local:/rihana'],
-        contextGraphId: PARANET,
+        contextGraphId: CONTEXT_GRAPH,
         namespace: 'aloha',
         scope: 'person-profile',
         transitionType: 'CREATE',
@@ -82,7 +82,7 @@ describe('subtractFinalizedExactQuads', () => {
     const authoritativePublic = [publishedNameQuad!];
 
     await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: authoritativePublic,
       publisherPeerId: 'peer-1',
     });
@@ -102,9 +102,9 @@ describe('subtractFinalizedExactQuads', () => {
 
   it('subtracts finalized quads from the requested sub-graph only', async () => {
     const subGraphName = 'research';
-    await graphManager.ensureSubGraph(PARANET, subGraphName);
+    await graphManager.ensureSubGraph(CONTEXT_GRAPH, subGraphName);
     await store.insert(generateSubGraphRegistration({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       subGraphName,
       createdBy: 'peer-1',
       timestamp: new Date('2026-01-01T00:00:00.000Z'),
@@ -121,7 +121,7 @@ describe('subtractFinalizedExactQuads', () => {
     const [publishedNameQuad, genreQuad] = validated.resolved.quads;
 
     await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [publishedNameQuad!],
       publisherPeerId: 'peer-1',
       subGraphName,
@@ -145,7 +145,7 @@ describe('subtractFinalizedExactQuads', () => {
     const authoritativePrivate = validated.resolved.privateQuads;
 
     await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: authoritativePublic,
       privateQuads: authoritativePrivate,
       publisherPeerId: 'peer-1',
@@ -167,7 +167,7 @@ describe('subtractFinalizedExactQuads', () => {
 
   it('does not subtract when the root is not confirmed even if the quad exists locally', async () => {
     const validated = validateLiftPublishPayload(baseInput());
-    const dataGraph = graphManager.dataGraphUri(PARANET);
+    const dataGraph = graphManager.dataGraphUri(CONTEXT_GRAPH);
     await store.insert([
       { ...validated.resolved.quads[0]!, graph: dataGraph },
     ]);
@@ -226,7 +226,7 @@ describe('subtractFinalizedExactQuads', () => {
     const [rihanaQuad, mansonQuad] = validated.resolved.quads;
 
     await publisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [rihanaQuad!],
       publisherPeerId: 'peer-1',
     });

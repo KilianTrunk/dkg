@@ -440,7 +440,6 @@ This is a pnpm + Turborepo monorepo.
 @origintrail-official/dkg-graph-viz          RDF visualization
 @origintrail-official/dkg-evm-module         Solidity contracts and deployment assets
 @origintrail-official/dkg-network-sim        Multi-node simulation tooling
-@origintrail-official/dkg-attested-assets    Attested Knowledge Asset protocol components
 @origintrail-official/dkg-epcis              EPCIS → RDF supply-chain adapter
 @origintrail-official/dkg-mcp                MCP server for Cursor / Claude Code / coding agents
 ```

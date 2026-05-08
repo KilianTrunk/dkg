@@ -2,7 +2,7 @@ import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { ChainAdapter, OnChainPublishResult, AddBatchToContextGraphParams } from '@origintrail-official/dkg-chain';
 import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, contextGraphDataUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, type Ed25519Keypair, computePublishACKDigest, computePublishPublisherDigest } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, contextGraphDataUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, computePublishACKDigest, computePublishPublisherDigest } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import type { Publisher, PublishOptions, PublishResult, KAManifestEntry, PhaseCallback } from './publisher.js';
 import { autoPartition } from './auto-partition.js';
@@ -99,6 +99,16 @@ function publisherAddressFromUal(ual: string | undefined): string | undefined {
   if (!ual?.startsWith(prefix)) return undefined;
   const segments = ual.slice(prefix.length).split('/');
   return coercePublisherAddress(segments[1]);
+}
+
+function formatBytesAsKb(bytes: number): string {
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
+function formatGossipLimit(bytes: number): string {
+  const mb = 1024 * 1024;
+  if (bytes % mb === 0) return `${bytes / mb} MB`;
+  return formatBytesAsKb(bytes);
 }
 
 function recoverCompactMessageSigner(
@@ -734,10 +744,9 @@ export class DKGPublisher implements Publisher {
       subGraphName: options.subGraphName,
     });
 
-    const MAX_GOSSIP_MESSAGE_SIZE = 512 * 1024; // 512 KB
-    if (message.length > MAX_GOSSIP_MESSAGE_SIZE) {
+    if (message.length > DKG_GOSSIP_MAX_MESSAGE_BYTES) {
       throw new Error(
-        `SWM message too large (${(message.length / 1024).toFixed(0)} KB, limit ${MAX_GOSSIP_MESSAGE_SIZE / 1024} KB). ` +
+        `SWM message too large (${formatBytesAsKb(message.length)}, limit ${formatGossipLimit(DKG_GOSSIP_MAX_MESSAGE_BYTES)}). ` +
         `Split large writes into multiple share() calls partitioned by root entity.`,
       );
     }
@@ -2702,10 +2711,9 @@ export class DKGPublisher implements Publisher {
         subGraphName: opts.subGraphName,
       });
 
-      const MAX_GOSSIP_MESSAGE_SIZE = 512 * 1024;
-      if (encoded.length > MAX_GOSSIP_MESSAGE_SIZE) {
+      if (encoded.length > DKG_GOSSIP_MAX_MESSAGE_BYTES) {
         throw new Error(
-          `Promoted assertion too large for gossip (${(encoded.length / 1024).toFixed(0)} KB, limit ${MAX_GOSSIP_MESSAGE_SIZE / 1024} KB). ` +
+          `Promoted assertion too large for gossip (${formatBytesAsKb(encoded.length)}, limit ${formatGossipLimit(DKG_GOSSIP_MAX_MESSAGE_BYTES)}). ` +
           `Promote fewer entities per call.`,
         );
       }

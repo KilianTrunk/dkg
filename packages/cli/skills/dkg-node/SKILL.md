@@ -338,7 +338,7 @@ Respect these when producing writes — they're enforced at the node and produce
 
 - **Reorganizing assertions.** There is no rename-assertion or move-between-sub-graphs endpoint. To reorganize, create a new assertion (with `subGraphName?` for a different partition), copy the triples over via `/write`, then `/discard` the original. A new assertion starts a fresh lifecycle record in `_meta`.
 - **Reserved subject IRIs.** Subjects matching `urn:dkg:file:*` or `urn:dkg:extraction:*` are reserved for internal file/extraction metadata and are rejected at write time. Use a different subject IRI.
-- **SWM gossip size cap (512 KB).** A single promote or SWM write must fit in one 512 KB gossip message. Split large assertions by root entity before promoting — use the `entities` parameter on `/promote` to promote subsets.
+- **SWM gossip size cap (10 MB).** A single promote or SWM write must fit in one 10 MB gossip message. Split larger assertions by root entity before promoting — use the `entities` parameter on `/promote` to promote subsets.
 - **SWM entity ownership (first-writer-wins).** The first peer to write a root entity in SWM becomes its owner; other peers' promotes or writes against that same root entity are rejected with an ownership error. Partition work by agent-owned root entities to avoid conflicts.
 - **Blank nodes are auto-skolemized.** Any `_:b0`-style blank nodes you submit are deterministically rewritten to UUID-backed URIs before storage, so IDs stay stable across sync and on-chain anchoring. Prefer explicit IRIs in production data.
 

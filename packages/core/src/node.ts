@@ -17,7 +17,7 @@ import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { ed25519GetPublicKey } from './crypto/ed25519.js';
 import type { ConnectionTransport, DKGNodeConfig } from './types.js';
-import { DHT_PROTOCOL } from './constants.js';
+import { DHT_PROTOCOL, DKG_GOSSIP_MAX_RPC_BYTES } from './constants.js';
 
 export interface DKGServices extends Record<string, unknown> {
   dht: KadDHT;
@@ -164,6 +164,8 @@ export class DKGNode {
         emitSelf: false,
         allowPublishToZeroTopicPeers: true,
         floodPublish: true,
+        maxInboundDataLength: DKG_GOSSIP_MAX_RPC_BYTES,
+        maxOutboundBufferSize: DKG_GOSSIP_MAX_RPC_BYTES,
         D: 4,
         Dlo: 2,
         Dhi: 8,

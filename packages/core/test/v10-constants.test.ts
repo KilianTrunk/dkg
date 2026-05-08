@@ -18,6 +18,8 @@ import {
   contextGraphSessionsTopic,
   contextGraphSessionTopic,
   networkPeersTopic,
+  DKG_GOSSIP_MAX_MESSAGE_BYTES,
+  DKG_GOSSIP_MAX_RPC_BYTES,
   contextGraphDataUri,
   contextGraphMetaUri,
   contextGraphPrivateUri,
@@ -94,6 +96,11 @@ describe('V10 GossipSub topics', () => {
 
   it('network peers topic', () => {
     expect(networkPeersTopic()).toBe('dkg/network/peers');
+  });
+
+  it('allows one 10 MB DKG gossip application payload', () => {
+    expect(DKG_GOSSIP_MAX_MESSAGE_BYTES).toBe(10 * 1024 * 1024);
+    expect(DKG_GOSSIP_MAX_RPC_BYTES).toBeGreaterThan(DKG_GOSSIP_MAX_MESSAGE_BYTES);
   });
 });
 

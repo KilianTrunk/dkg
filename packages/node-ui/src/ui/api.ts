@@ -345,6 +345,7 @@ export const fetchCatchupStatus = (contextGraphId: string) =>
 export interface ImportFileResult {
   assertionUri: string;
   fileHash: string;
+  rootEntity?: string;
   detectedContentType: string;
   extraction: {
     status: 'completed' | 'skipped' | 'failed';
@@ -352,18 +353,21 @@ export interface ImportFileResult {
     triplesWritten?: number;
     provenance?: any;
     error?: string;
-    pipelineUsed?: string;
+    pipelineUsed?: string | null;
+    mdIntermediateHash?: string;
   };
 }
 
 const EXT_TO_MIME: Record<string, string> = {
-  md: 'text/markdown', txt: 'text/plain', csv: 'text/csv',
+  md: 'text/markdown', markdown: 'text/markdown', txt: 'text/plain', csv: 'text/csv',
   json: 'application/json', xml: 'application/xml',
   yaml: 'text/yaml', yml: 'text/yaml',
   pdf: 'application/pdf',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   doc: 'application/msword',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  epub: 'application/epub+zip',
   ttl: 'text/turtle', rdf: 'application/rdf+xml', owl: 'application/rdf+xml',
   html: 'text/html', htm: 'text/html',
   py: 'text/x-python', ts: 'text/typescript', js: 'text/javascript',
@@ -772,6 +776,22 @@ export interface LocalAgentChatAttachmentRef {
   rootEntity?: string;
 }
 
+export interface LocalAgentChatAttachmentImportResult {
+  id?: string;
+  fileName: string;
+  contextGraphId: string;
+  assertionName?: string;
+  assertionUri: string;
+  fileHash: string;
+  detectedContentType: string;
+  extractionStatus: 'skipped';
+  pipelineUsed?: string | null;
+  tripleCount?: number;
+  rootEntity?: string;
+  mdIntermediateHash?: string;
+  error?: string;
+}
+
 export interface LocalAgentChatContextEntry {
   key: string;
   label: string;
@@ -784,7 +804,9 @@ interface LocalAgentChatRequestOptions {
   identity?: string;
   sessionId?: string;
   profile?: string;
+  persistUserMessage?: string;
   attachments?: LocalAgentChatAttachmentRef[];
+  attachmentImportResults?: LocalAgentChatAttachmentImportResult[];
   contextEntries?: LocalAgentChatContextEntry[];
   /**
    * UI-selected project context graph for this turn. Forwarded unchanged as
@@ -864,7 +886,9 @@ function buildLocalAgentChatBody(
     ...(opts?.identity ? { identity: opts.identity } : {}),
     ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
     ...(opts?.profile ? { profile: opts.profile } : {}),
+    ...(opts?.persistUserMessage ? { persistUserMessage: opts.persistUserMessage } : {}),
     ...(opts?.attachments?.length ? { attachmentRefs: opts.attachments } : {}),
+    ...(opts?.attachmentImportResults?.length ? { attachmentImportResults: opts.attachmentImportResults } : {}),
     ...(opts?.contextEntries?.length ? { contextEntries: opts.contextEntries } : {}),
     ...(opts?.contextGraphId ? { contextGraphId: opts.contextGraphId } : {}),
   };
@@ -1680,16 +1704,8 @@ export async function fetchLocalAgentHistory(
 export async function streamLocalAgentChat(
   id: string,
   text: string,
-  opts: {
-    correlationId?: string;
-    signal?: AbortSignal;
+  opts: LocalAgentChatRequestOptions & {
     onEvent?: (event: LocalAgentStreamEvent) => void;
-    sessionId?: string;
-    profile?: string;
-    attachments?: LocalAgentChatAttachmentRef[];
-    contextEntries?: LocalAgentChatContextEntry[];
-    /** UI-selected project context graph for this turn (memory scope). */
-    contextGraphId?: string;
   } = {},
 ): Promise<LocalAgentChatResponse> {
   const normalizedId = id.trim().toLowerCase();

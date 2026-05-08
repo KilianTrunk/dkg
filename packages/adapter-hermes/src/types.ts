@@ -253,6 +253,20 @@ export interface HermesChannelAttachmentRef {
   rootEntity?: string;
 }
 
+export interface HermesChannelAttachmentImportResult {
+  assertionUri: string;
+  fileHash: string;
+  contextGraphId: string;
+  fileName: string;
+  detectedContentType: string;
+  extractionStatus: 'skipped';
+  pipelineUsed?: string | null;
+  tripleCount?: number;
+  rootEntity?: string;
+  mdIntermediateHash?: string;
+  error?: string;
+}
+
 export interface HermesChannelContextEntry {
   key: string;
   label: string;
@@ -267,8 +281,10 @@ export interface HermesChannelSendPayload {
   contextGraphId?: string;
   currentAgentAddress?: string;
   identity?: string;
+  persistUserMessage?: string;
   contextEntries?: HermesChannelContextEntry[];
   attachmentRefs?: HermesChannelAttachmentRef[];
+  attachmentImportResults?: HermesChannelAttachmentImportResult[];
   metadata?: Record<string, unknown>;
 }
 

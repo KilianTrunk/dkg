@@ -87,6 +87,7 @@ describe('OpenClaw bridge API contract', () => {
     expect(apiSrc).toContain('attachments?: LocalAgentChatAttachmentRef[]');
     expect(apiSrc).toContain('attachmentRefs');
     expect(apiSrc).toContain("extractionStatus?: 'completed';");
+    expect(readUiFile('components/Shell/PanelRight.tsx')).toContain("if (draft.status !== 'completed' || !draft.result) return null;");
     expect(readUiFile('components/Shell/PanelRight.tsx')).toContain("extractionStatus: 'completed'");
   });
 });
@@ -250,7 +251,7 @@ describe('PanelRight UI - connected agent flow', () => {
 
     expect(addAttachmentsBlock).not.toContain('await importFile(');
     expect(sendLocalMessageBlock).toContain('const processedDrafts = await prepareAttachmentDraftsForSend(conversationKey, drafts);');
-    expect(sendLocalMessageBlock).toContain("if (!text && attachments.length === 0) {");
+    expect(sendLocalMessageBlock).toContain('if (!text && attachments.length === 0 && importContext.results.length === 0) {');
     expect(panelRight).not.toContain('selectedCompletedAttachments');
   });
 
@@ -260,15 +261,36 @@ describe('PanelRight UI - connected agent flow', () => {
   });
 
   it('only enables attachment-only sends when at least one draft is sendable', () => {
+    expect(panelRight).toContain("draft.status === 'queued' || draft.status === 'completed' || draft.status === 'skipped'");
     expect(panelRight).toContain('selectedAttachmentDrafts.some(isSendableAttachmentDraft)');
     expect(panelRight).toContain('const hasSendableDrafts = drafts.some(isSendableAttachmentDraft);');
     expect(panelRight).toContain('Choose a target above before attaching files.');
   });
 
+  it('turns skipped document-import results into server-verified sendable import results', () => {
+    expect(panelRight).toContain('function buildAttachmentImportResultRefs');
+    expect(panelRight).toContain('function formatAttachmentImportContextValue');
+    expect(panelRight).toContain('function normalizeAttachmentFileName');
+    expect(panelRight).toContain("if (draft.status !== 'skipped' || !draft.result) return [];");
+    expect(panelRight).toContain('fileName: normalizeAttachmentFileName(draft.file)');
+    expect(panelRight).toContain('rootEntity: draft.result.rootEntity');
+    expect(panelRight).toContain("extractionStatus: 'skipped'");
+    expect(panelRight).toContain('pipelineUsed: extraction.pipelineUsed ?? null');
+    expect(panelRight).toContain('mdIntermediateHash: extraction.mdIntermediateHash');
+    expect(panelRight).toContain('attachmentImportResults: importContext.results');
+    expect(panelRight).toContain('...importContext.deliveredDraftIds');
+  });
+
+  it('normalizes browser filenames before sending completed or skipped chat attachments', () => {
+    expect(panelRight).toContain('fileName: normalizeAttachmentFileName(draft.file)');
+    expect(panelRight).not.toContain('fileName: draft.file.name');
+  });
+
   it('keeps attachment-only summary text UI-only instead of sending it back through the bridge', () => {
     expect(panelRight).toContain('content: message.text || buildAttachmentSummary(message.attachmentRefs ?? [])');
-    expect(panelRight).toContain('const messageText = text || buildAttachmentSummary(attachments);');
-    expect(panelRight).toContain('streamLocalAgentChat(integrationId, text, {');
+    expect(panelRight).toContain('const messageText = text');
+    expect(panelRight).toContain("const outboundText = text ? textWithImportSummary : '';");
+    expect(panelRight).toContain('streamLocalAgentChat(integrationId, outboundText, {');
   });
 
   it('persists verified attachment refs separately from assistant tool calls', () => {
@@ -286,7 +308,7 @@ describe('PanelRight UI - connected agent flow', () => {
   });
 
   it('sends connected-agent chat through the local bridge from PanelRight', () => {
-    expect(panelRight).toContain('streamLocalAgentChat(integrationId, text');
+    expect(panelRight).toContain('streamLocalAgentChat(integrationId, outboundText');
   });
 
   it('does not clear attached agents on a transient integrations refresh failure', () => {

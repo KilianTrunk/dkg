@@ -33,9 +33,7 @@ export type AdapterRegisterFn = (
 ) => void;
 
 /** Short-name → package-id map for first-party adapters. */
-const ADAPTER_MAP: Record<string, string> = {
-  autoresearch: '@origintrail-official/dkg-adapter-autoresearch',
-};
+const ADAPTER_MAP: Record<string, string> = {};
 
 function formatError(e: unknown): string {
   return e instanceof Error ? e.message : String(e);

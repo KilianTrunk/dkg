@@ -420,7 +420,6 @@ jobs:
             --filter @origintrail-official/dkg-mcp \
             --filter @origintrail-official/dkg-network-sim \
             --filter @origintrail-official/dkg-graph-viz \
-            --filter @origintrail-official/dkg-adapter-autoresearch \
             --filter @origintrail-official/dkg-adapter-elizaos \
             --filter @origintrail-official/dkg-adapter-hermes \
             --filter @origintrail-official/dkg-adapter-openclaw \

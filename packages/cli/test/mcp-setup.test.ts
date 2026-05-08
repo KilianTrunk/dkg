@@ -3283,7 +3283,8 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       .map((c) => String(c[0]))
       .join('');
     expect(stderrText).toMatch(/WARNING: Codex CLI config/);
-    expect(stderrText).toMatch(/without a dedicated \[mcp_servers\.dkg\] table/);
+    expect(stderrText).toMatch(/cannot be patched safely for mcp_servers\.dkg/);
+    expect(stderrText).toMatch(/invalid or duplicate definitions/);
     expect(stderrText).toMatch(/Comments\/formatting outside this entry may not be preserved/);
     expect(after.model).toBe('gpt-5');
     expect(after.mcp_servers.dkg.command).toBe(process.execPath);
@@ -3295,6 +3296,43 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(afterRaw).toMatch(/^\[mcp_servers\.dkg\]/m);
     expect(afterRaw).not.toContain('mcp_servers.dkg = {');
     expect(afterRaw).not.toContain('/old/legacy/dkg');
+  });
+
+  it('issue #437 (Codex round-7): Codex CLI rewrites unsupported inline mcp_servers parent before adding dkg', async () => {
+    // Appending [mcp_servers.dkg] under an inline parent table is invalid TOML.
+    // Fall back to a full rewrite so existing sibling servers survive as tables.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    writeFileSync(
+      codexPath,
+      [
+        '# parent inline table cannot accept a child table append',
+        'model = "gpt-5"',
+        'mcp_servers = { "github-mcp" = { command = "gh-mcp", args = [ "serve" ] } }',
+        '',
+      ].join('\n'),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const afterRaw = readFileSync(codexPath, 'utf-8');
+    const after = TOML.parse(afterRaw) as any;
+    const stderrText = (stderrSilencer.mock.calls as any[])
+      .map((c) => String(c[0]))
+      .join('');
+    expect(stderrText).toMatch(/WARNING: Codex CLI config/);
+    expect(stderrText).toMatch(/cannot be patched safely for mcp_servers\.dkg/);
+    expect(after.model).toBe('gpt-5');
+    expect(after.mcp_servers['github-mcp']).toEqual({
+      command: 'gh-mcp',
+      args: ['serve'],
+    });
+    expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    expect(afterRaw).toMatch(/^\[mcp_servers\.github-mcp\]/m);
+    expect(afterRaw).toMatch(/^\[mcp_servers\.dkg\]/m);
+    expect(afterRaw).not.toContain('mcp_servers = {');
   });
 
   it('issue #437 (Codex round-6): Codex CLI ignores table-looking lines inside TOML multiline strings', async () => {

@@ -1073,6 +1073,12 @@ function normaliseTomlOwnedPath(path: string): string {
   return path.split('.').filter(Boolean).join(TOML_PATH_SEPARATOR);
 }
 
+function tomlParentPath(path: string): string | null {
+  const parts = path.split('.').filter(Boolean);
+  if (parts.length <= 1) return null;
+  return parts.slice(0, -1).join('.');
+}
+
 function tomlTableHeaderPath(line: string): string | null {
   const arrayMatch = line.match(/^\s*\[\[\s*(.+?)\s*\]\]\s*(?:#.*)?$/);
   if (arrayMatch) return normaliseTomlHeaderPath(arrayMatch[1]);
@@ -1174,9 +1180,14 @@ function replaceTomlTable(
   ownedPath: string,
   replacement: string,
   parsedRawHasOwnedEntry: boolean,
+  parsedRawHasOwnedParent: boolean,
 ): string | null {
   const newline = raw.includes('\r\n') ? '\r\n' : '\n';
   const ownedPathKey = normaliseTomlOwnedPath(ownedPath);
+  const parentPathKey = tomlParentPath(ownedPath);
+  const normalisedParentPathKey = parentPathKey
+    ? normaliseTomlOwnedPath(parentPathKey)
+    : null;
   const replacementBlock = normaliseNewlines(
     replacement.endsWith('\n') || replacement.endsWith('\r')
       ? replacement
@@ -1187,10 +1198,18 @@ function replaceTomlTable(
   const headerPaths = tomlTableHeaderPaths(lines);
   const ranges: { start: number; end: number }[] = [];
   let hasRootTable = false;
+  let hasParentTableFamily = normalisedParentPathKey === null;
 
   for (let i = 0; i < lines.length; i++) {
     const headerPath = headerPaths[i];
-    if (!headerPath || !ownsTomlTablePath(headerPath, ownedPathKey)) continue;
+    if (!headerPath) continue;
+    if (
+      normalisedParentPathKey &&
+      ownsTomlTablePath(headerPath, normalisedParentPathKey)
+    ) {
+      hasParentTableFamily = true;
+    }
+    if (!ownsTomlTablePath(headerPath, ownedPathKey)) continue;
     if (headerPath === ownedPathKey) hasRootTable = true;
     let end = i + 1;
     while (end < lines.length && headerPaths[end] === null) {
@@ -1205,6 +1224,10 @@ function replaceTomlTable(
   }
 
   if (parsedRawHasOwnedEntry && !hasRootTable) {
+    return null;
+  }
+
+  if (parsedRawHasOwnedParent && !hasParentTableFamily && ranges.length === 0) {
     return null;
   }
 
@@ -1232,11 +1255,33 @@ function replaceTomlTable(
   return out;
 }
 
+function readPathAt(body: Record<string, unknown>, path: string | undefined): unknown {
+  if (!path) return undefined;
+  let cursor: unknown = body;
+  for (const segment of path.split('.').filter(Boolean)) {
+    if (cursor === undefined || cursor === null || typeof cursor !== 'object') {
+      return undefined;
+    }
+    cursor = (cursor as Record<string, unknown>)[segment];
+  }
+  return cursor;
+}
+
 function tomlRawHasEntry(raw: string, entryPath: string | undefined): boolean {
   if (!raw.trim()) return false;
   try {
     const parsed = TOML.parse(raw) as Record<string, unknown>;
     return readEntryAt(parsed, entryPath) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function tomlRawHasPath(raw: string, path: string | undefined): boolean {
+  if (!raw.trim()) return false;
+  try {
+    const parsed = TOML.parse(raw) as Record<string, unknown>;
+    return readPathAt(parsed, path) !== undefined;
   } catch {
     return false;
   }
@@ -1250,18 +1295,20 @@ function writeTomlConfigBody(
     ? readFileSync(target.configPath, 'utf8')
     : '';
   const ownedPath = target.entryPath ?? DEFAULT_ENTRY_PATH;
+  const ownedParentPath = tomlParentPath(ownedPath) ?? undefined;
   const serialisedEntry = serialiseTomlEntryOnly(target, body);
   const patched = replaceTomlTable(
     raw,
     ownedPath,
     serialisedEntry,
     tomlRawHasEntry(raw, target.entryPath),
+    tomlRawHasPath(raw, ownedParentPath),
   );
   if (patched === null) {
     process.stderr.write(
       `[setup] WARNING: ${target.name} config at ${tildify(target.configPath)} ` +
-        `stores ${ownedPath} without a dedicated [${ownedPath}] table; ` +
-        'rewriting the TOML file to avoid duplicate definitions. ' +
+        `uses a TOML shape that cannot be patched safely for ${ownedPath}; ` +
+        'rewriting the TOML file to avoid invalid or duplicate definitions. ' +
         'Comments/formatting outside this entry may not be preserved.\n',
     );
   }

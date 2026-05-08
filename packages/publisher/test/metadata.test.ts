@@ -161,7 +161,7 @@ describe('generateKCMetadata — RFC-001 §3.5 publication provenance', () => {
 
     expect(preds.get(RDF_TYPE)).toBe(`${DKG}Publication`);
     expect(preds.get(`${DKG}publishOperationId`)).toBe(`"${OP_ID}"`);
-    expect(preds.get(`${DKG}contextGraphId`)).toBe(`"${PARANET}"`);
+    expect(preds.get(`${DKG}contextGraphId`)).toBe(`"${CONTEXT_GRAPH}"`);
     expect(preds.get(`${DKG}authoredBy`)).toBe(`"${AUTHOR}"`);
     // merkleRoot serialised as `"0x..."^^xsd:hexBinary` per RFC-001 §3.5.
     const root = preds.get(`${DKG}merkleRoot`);

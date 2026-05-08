@@ -3,10 +3,20 @@
 pragma solidity ^0.8.20;
 
 library KnowledgeCollectionLib {
+    /// @dev `publisher` is `msg.sender` of the publish/update tx (payment of
+    ///      record). `author` is the verified agent identity from the
+    ///      EIP-712 author attestation (V10.1+ publish path) or `address(0)`
+    ///      for legacy KC mutations that predate author attestation. Readers
+    ///      should treat `author == address(0)` as "this state change did
+    ///      not carry an author attestation," never as a valid post-upgrade
+    ///      identity claim. Trust path is on-chain verification at write
+    ///      time; off-chain `dkg:authoredBy` triples mirror this for
+    ///      SPARQL filtering convenience only.
     struct MerkleRoot {
         address publisher;
         bytes32 merkleRoot;
         uint256 timestamp;
+        address author;
     }
 
     struct KnowledgeCollection {

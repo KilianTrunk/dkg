@@ -47,6 +47,18 @@ export interface OnChainPublishResult {
   blockNumber: number;
   blockTimestamp: number;
   publisherAddress: string;
+  /**
+   * Chain-confirmed author identity for this publish. Sourced from the
+   * `KnowledgeCollectionCreated` event's indexed `author` topic, which the
+   * V10.1 contract sets to the address recovered (or wallet address
+   * verified via EIP-1271) from the EIP-712 author attestation. Absent /
+   * `undefined` for legacy V9-ish publishes that go through
+   * `KnowledgeCollection.sol` (no attestation), and for adapter paths
+   * that don't read the event (callers SHOULD then fall back to
+   * `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(batchId)` for
+   * the canonical chain truth).
+   */
+  authorAddress?: string;
   gasUsed?: bigint;
   effectiveGasPrice?: bigint;
   gasCostWei?: bigint;

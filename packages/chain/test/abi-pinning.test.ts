@@ -102,7 +102,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   //     the digest changed because the function inputs they originate from
   //     changed). Sanity tests below pin the actual event field shapes.
   KnowledgeAssetsV10:           '785311d19ce39743522bf1db501f41276fb22d715a2cc94cc67d96f8a22e519e',
-  KnowledgeCollectionStorage:   '99dd188d290c191a9f7ab5e8bef78db123f9400da0e8fa2c20811db0df15c5da',
+  KnowledgeCollectionStorage:   'ae5e991254872a9e935021f6039cf40d7c90183f0bba2f4fe9ee88d2c5b6abe9',
   KnowledgeCollection:          'c906207c38ffded8944d7255498f7fc9f2c864098a3f8f3670df19006dbcd395',
   ContextGraphs:                'ee69f0d50b54df966b8bfb3bf457fe6d2865393f51f8770b4185fafd324b9462',
   ContextGraphStorage:          '4e0ef683d10ead0f167ee08d7d980df4d37a24dcabf2dad3970cf9d7b6d4813b',
@@ -144,10 +144,13 @@ describe('ABI content sanity — required event/error surfaces are present [CH-5
     const ev = abi.find((e) => e.type === 'event' && e.name === 'KnowledgeCollectionCreated');
     expect(ev).toBeDefined();
     const types = (ev!.inputs ?? []).map((i) => i.type);
-    // Spec §06 / §07: id, publishOperationId, merkleRoot, byteSize,
-    // startEpoch, endEpoch, tokenAmount, isImmutable.
+    // V10.1 author-attestation surface: id, author, publishOperationId,
+    // merkleRoot, byteSize, startEpoch, endEpoch, tokenAmount, isImmutable.
+    // `author` is an indexed `address` so off-chain readers can filter
+    // event logs by author identity without a storage call.
     expect(types).toEqual([
       'uint256',
+      'address',
       'string',
       'bytes32',
       'uint88',
@@ -156,6 +159,9 @@ describe('ABI content sanity — required event/error surfaces are present [CH-5
       'uint96',
       'bool',
     ]);
+    const authorInput = ev!.inputs?.[1];
+    expect(authorInput?.name).toBe('author');
+    expect(authorInput?.indexed).toBe(true);
   });
 
   it('KnowledgeCollectionStorage declares KnowledgeAssetsMinted (id, to, startId, endId)', () => {
@@ -196,6 +202,10 @@ describe('ABI content sanity — required event/error surfaces are present [CH-5
     const ev = abi.find((e) => e.type === 'event' && e.name === 'KnowledgeCollectionUpdated');
     expect(ev).toBeDefined();
     const types = (ev!.inputs ?? []).map((i) => i.type);
-    expect(types).toEqual(['uint256', 'string', 'bytes32', 'uint256', 'uint96']);
+    // V10.1 update event mirrors the publish event: the second indexed
+    // arg is `author`. The current V10.1 update path emits
+    // `address(0)` (no attestation yet) but the slot is reserved for
+    // vNext when updates start signing the EIP-712 envelope too.
+    expect(types).toEqual(['uint256', 'address', 'string', 'bytes32', 'uint256', 'uint96']);
   });
 });

@@ -21,8 +21,14 @@ contract KnowledgeCollectionStorage is
 {
     using LibBitmap for LibBitmap.Bitmap;
 
+    /// @dev `author` is the verified agent identity from the V10.1+
+    ///      author-attestation EIP-712 envelope, or `address(0)` for legacy
+    ///      callers (`KnowledgeCollection.sol`) that do not perform author
+    ///      attestation. Indexers SHOULD prefer this `indexed` field over
+    ///      walking storage when filtering KCs by author.
     event KnowledgeCollectionCreated(
         uint256 indexed id,
+        address indexed author,
         string publishOperationId,
         bytes32 merkleRoot,
         uint88 byteSize,
@@ -33,6 +39,7 @@ contract KnowledgeCollectionStorage is
     );
     event KnowledgeCollectionUpdated(
         uint256 indexed id,
+        address indexed author,
         string updateOperationId,
         bytes32 merkleRoot,
         uint256 byteSize,
@@ -89,6 +96,7 @@ contract KnowledgeCollectionStorage is
 
     function createKnowledgeCollection(
         address publisher,
+        address author,
         string calldata publishOperationId,
         bytes32 merkleRoot,
         uint256 knowledgeAssetsAmount,
@@ -103,7 +111,9 @@ contract KnowledgeCollectionStorage is
 
         KnowledgeCollectionLib.KnowledgeCollection storage kc = knowledgeCollections[knowledgeCollectionId];
 
-        kc.merkleRoots.push(KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp));
+        kc.merkleRoots.push(
+            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp, author)
+        );
         kc.byteSize = byteSize;
         kc.startEpoch = startEpoch;
         kc.endEpoch = endEpoch;
@@ -119,6 +129,7 @@ contract KnowledgeCollectionStorage is
 
         emit KnowledgeCollectionCreated(
             knowledgeCollectionId,
+            author,
             publishOperationId,
             merkleRoot,
             byteSize,
@@ -137,8 +148,13 @@ contract KnowledgeCollectionStorage is
         return knowledgeCollections[id];
     }
 
+    /// @dev `author` is the verified author identity for this update or
+    ///      `address(0)` when the update path doesn't carry an attestation
+    ///      (current V10.1 update path emits zero; vNext will sign updates
+    ///      against the same EIP-712 envelope as publish).
     function updateKnowledgeCollection(
         address publisher,
+        address author,
         uint256 id,
         string calldata updateOperationId,
         bytes32 merkleRoot,
@@ -154,7 +170,9 @@ contract KnowledgeCollectionStorage is
             _totalTokenAmount = _totalTokenAmount - kc.tokenAmount + tokenAmount;
         }
 
-        kc.merkleRoots.push(KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp));
+        kc.merkleRoots.push(
+            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp, author)
+        );
         kc.byteSize = byteSize;
         kc.tokenAmount = tokenAmount;
         kc.merkleLeafCount = merkleLeafCount;
@@ -172,7 +190,7 @@ contract KnowledgeCollectionStorage is
             mintKnowledgeAssetsTokens(id, publisher, mintKnowledgeAssetsAmount);
         }
 
-        emit KnowledgeCollectionUpdated(id, updateOperationId, merkleRoot, byteSize, tokenAmount);
+        emit KnowledgeCollectionUpdated(id, author, updateOperationId, merkleRoot, byteSize, tokenAmount);
     }
 
     /// @notice Lightweight update-path metadata — scalar fields only + the
@@ -335,9 +353,23 @@ contract KnowledgeCollectionStorage is
         return _safeGetLatestMerkleRootObject(id).timestamp;
     }
 
+    function getMerkleRootAuthorByIndex(uint256 id, uint256 index) external view returns (address) {
+        return knowledgeCollections[id].merkleRoots[index].author;
+    }
+
+    /// @notice Verified author identity for the latest merkle-root entry
+    /// of `id`. Returns `address(0)` if the latest state change did not
+    /// carry an author attestation (legacy publish path or a pre-vNext
+    /// update). Used by `/api/get` and other off-chain readers as the
+    /// canonical "who authored this KC" lookup — chain wins over any
+    /// off-chain `dkg:authoredBy` triple.
+    function getLatestMerkleRootAuthor(uint256 id) external view returns (address) {
+        return _safeGetLatestMerkleRootObject(id).author;
+    }
+
     function pushMerkleRoot(address publisher, uint256 id, bytes32 merkleRoot) external onlyContracts {
         knowledgeCollections[id].merkleRoots.push(
-            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
+            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp, address(0))
         );
 
         emit KnowledgeCollectionMerkleRootAdded(id, merkleRoot);
@@ -560,7 +592,7 @@ contract KnowledgeCollectionStorage is
     ) internal view returns (KnowledgeCollectionLib.MerkleRoot memory) {
         KnowledgeCollectionLib.KnowledgeCollection memory kc = knowledgeCollections[id];
         if (kc.merkleRoots.length == 0) {
-            return KnowledgeCollectionLib.MerkleRoot(address(0), bytes32(0), 0);
+            return KnowledgeCollectionLib.MerkleRoot(address(0), bytes32(0), 0, address(0));
         }
         return kc.merkleRoots[kc.merkleRoots.length - 1];
     }

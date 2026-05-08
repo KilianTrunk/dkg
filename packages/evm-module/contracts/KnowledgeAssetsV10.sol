@@ -470,8 +470,14 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
         // to). Passing the recovered node signer here would record the
         // node operator wallet as the original publisher and break
         // publish→update coherence for open-CG publishers.
+        // `author` = `p.authorAddress`, the address verified by
+        // `_verifyAuthorAttestation` above. The chain commits the recovered
+        // identity into `merkleRoots[0].author` so off-chain readers
+        // (`/api/get`, indexers) can return the canonical author without
+        // re-deriving from the EIP-712 signature embedded in calldata.
         kcId = kcs.createKnowledgeCollection(
             msg.sender,
+            p.authorAddress,
             p.publishOperationId,
             p.merkleRoot,
             p.knowledgeAssetsAmount,
@@ -1075,8 +1081,15 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
         // `p.updateOperationId` is the off-chain correlation id emitted on
         // `KnowledgeCollectionUpdated`. KCS internally reconciles its
         // `_totalTokenAmount` counter from old → new.
+        // V10.1 update path does not (yet) carry an EIP-712 author
+        // attestation — the new merkle-root entry is annotated with
+        // `author = address(0)` so readers can distinguish "this state
+        // change predates author attestation" from a deliberate
+        // self-anonymisation. vNext will sign the update against the same
+        // EIP-712 envelope as publish and pass `p.authorAddress` here.
         kcs.updateKnowledgeCollection(
             msg.sender,
+            address(0),
             p.id,
             p.updateOperationId,
             p.newMerkleRoot,

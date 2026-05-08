@@ -1835,6 +1835,7 @@ export class EVMChainAdapter implements ChainAdapter {
     let startKAId = 0n;
     let endKAId = 0n;
     let publisherAddress = txSigner.address;
+    let authorAddress: string | undefined;
     const kcs = this.contracts.knowledgeCollectionStorage;
     if (!kcs) {
       throw new Error(
@@ -1850,6 +1851,12 @@ export class EVMChainAdapter implements ChainAdapter {
           const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
           if (parsed?.name === 'KnowledgeCollectionCreated') {
             kcId = BigInt(parsed.args.id);
+            // V10.1: indexed `author` on KnowledgeCollectionCreated is the
+            // chain-confirmed author identity (post EIP-712 verification or
+            // EIP-1271 magic-value check). Carry it back so downstream
+            // metadata writers can pin `dkg:authoredBy` to chain truth
+            // rather than the local signer.
+            authorAddress = String(parsed.args.author);
             foundKCCreated = true;
           }
           if (parsed?.name === 'KnowledgeAssetsMinted') {
@@ -1886,6 +1893,7 @@ export class EVMChainAdapter implements ChainAdapter {
       blockNumber: receipt.blockNumber,
       blockTimestamp,
       publisherAddress,
+      authorAddress,
       gasUsed: receipt.gasUsed ? BigInt(receipt.gasUsed) : undefined,
       effectiveGasPrice: receipt.gasPrice ? BigInt(receipt.gasPrice) : undefined,
       gasCostWei: receipt.gasUsed && receipt.gasPrice ? BigInt(receipt.gasUsed) * BigInt(receipt.gasPrice) : undefined,
@@ -1903,6 +1911,7 @@ export class EVMChainAdapter implements ChainAdapter {
     let startKAId = 0n;
     let endKAId = 0n;
     let publisherAddress = '';
+    let authorAddress: string | undefined;
     let foundKCCreated = false;
     let foundKAMinted = false;
 
@@ -1911,6 +1920,7 @@ export class EVMChainAdapter implements ChainAdapter {
         const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
         if (parsed?.name === 'KnowledgeCollectionCreated') {
           kcId = BigInt(parsed.args.id);
+          authorAddress = String(parsed.args.author);
           foundKCCreated = true;
         }
         if (parsed?.name === 'KnowledgeAssetsMinted') {
@@ -1936,6 +1946,7 @@ export class EVMChainAdapter implements ChainAdapter {
       blockNumber: receipt.blockNumber,
       blockTimestamp,
       publisherAddress,
+      authorAddress,
     };
   }
 

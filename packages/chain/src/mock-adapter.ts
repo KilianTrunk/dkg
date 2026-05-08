@@ -1053,6 +1053,10 @@ export class MockChainAdapter implements ChainAdapter {
       blockNumber: result.blockNumber,
       blockTimestamp: Math.floor(Date.now() / 1000),
       publisherAddress,
+      // Mirror evm-adapter: surface the chain-confirmed author from the
+      // V10.1 publish path so downstream callers (publisher metadata
+      // writers) see the same shape under MockChainAdapter.
+      authorAddress: params.author.address,
       tokenAmount: params.tokenAmount,
     };
   }

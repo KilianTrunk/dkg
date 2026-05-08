@@ -858,6 +858,115 @@ describe('@unit KnowledgeAssetsV10', () => {
           KAV10.connect(creator).publish(corrupted),
         ).to.be.revertedWithCustomError(KAV10, 'InvalidAuthorSignature1271');
       });
+
+      it('T1.5g: EOA — publish persists the recovered author on chain', async () => {
+        // Locks the design's central promise: post-publish, an off-chain
+        // reader can fetch `KnowledgeCollection.merkleRoots[0].author` (and
+        // the `getLatestMerkleRootAuthor` view) and obtain the verified
+        // author identity directly from chain state, with no second-pass
+        // off-chain re-derivation. This is what `/api/get` reads.
+        const creator = getDefaultKCCreator(accounts);
+        const author = accounts[14];
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
+          await setupNodes();
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.5g-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes,
+          publisherIdentityId,
+          receiverIdentityIds,
+          author,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't1.5g-op',
+        });
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await expect(KAV10.connect(creator).publish(p)).to.not.be.reverted;
+
+        // Storage assertion — the recovered author is persisted on the
+        // freshly-minted KC's first merkle-root entry. `creator` (msg.sender)
+        // is the publisher of record; `author` (the EIP-712 signer) is a
+        // different account, so this also confirms the two roles do not
+        // collapse into msg.sender.
+        const latestKcId = await KCS.getLatestKnowledgeCollectionId();
+        const kc = await KCS.getKnowledgeCollection(latestKcId);
+        expect(kc.merkleRoots.length).to.equal(1);
+        expect(kc.merkleRoots[0].author).to.equal(author.address);
+        expect(kc.merkleRoots[0].publisher).to.equal(creator.address);
+        expect(await KCS.getLatestMerkleRootAuthor(latestKcId)).to.equal(
+          author.address,
+        );
+        expect(
+          await KCS.getMerkleRootAuthorByIndex(latestKcId, 0),
+        ).to.equal(author.address);
+      });
+
+      it('T1.5h: EIP-1271 — publish persists the wallet contract address as author', async () => {
+        // Mirror of T1.5g for the smart-contract author path. After a
+        // successful 1271 verification, `merkleRoots[0].author` is the
+        // *wallet contract* address (not the inner EOA signer).
+        const creator = getDefaultKCCreator(accounts);
+        const walletSigner = accounts[16];
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
+          await setupNodes();
+
+        const wallet: MockERC1271Wallet = await new MockERC1271Wallet__factory(
+          accounts[0],
+        ).deploy(walletSigner.address);
+        const walletAddress = await wallet.getAddress();
+
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.5h-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        const sig = await signAuthorAttestation(
+          walletSigner,
+          buildAuthorAttestationPayload({
+            chainId,
+            kav10Address,
+            contextGraphId: cgId,
+            merkleRoot,
+            authorAddress: walletAddress,
+          }),
+        );
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes,
+          publisherIdentityId,
+          receiverIdentityIds,
+          author: walletSigner,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't1.5h-op',
+          authorSigOverride: sig,
+        });
+        const corrupted = { ...p, authorAddress: walletAddress };
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await expect(KAV10.connect(creator).publish(corrupted)).to.not.be.reverted;
+
+        const latestKcId = await KCS.getLatestKnowledgeCollectionId();
+        expect(await KCS.getLatestMerkleRootAuthor(latestKcId)).to.equal(
+          walletAddress,
+        );
+      });
     });
 
     // ----------------------------------------------------------------------

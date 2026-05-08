@@ -530,6 +530,13 @@ describe('V10 E2E Conviction System', function () {
       expect(retrievedKc.merkleRoots.length).to.equal(1);
       expect(retrievedKc.merkleRoots[0].merkleRoot).to.equal(merkleRoot);
       expect(retrievedKc.merkleRoots[0].publisher).to.equal(creator.address);
+      // Verified author identity persisted on chain. In this conviction
+      // E2E the author signer == creator (the test builds `p` via
+      // `buildPublishParams` with the creator as both author and msg.sender).
+      expect(retrievedKc.merkleRoots[0].author).to.equal(creator.address);
+      expect(
+        await KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId),
+      ).to.equal(creator.address);
     });
   });
 

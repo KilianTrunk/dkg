@@ -345,6 +345,12 @@
         "type": "uint256"
       },
       {
+        "indexed": true,
+        "internalType": "address",
+        "name": "author",
+        "type": "address"
+      },
+      {
         "indexed": false,
         "internalType": "string",
         "name": "publishOperationId",
@@ -472,6 +478,11 @@
             "internalType": "uint256",
             "name": "timestamp",
             "type": "uint256"
+          },
+          {
+            "internalType": "address",
+            "name": "author",
+            "type": "address"
           }
         ],
         "indexed": false,
@@ -567,6 +578,12 @@
         "internalType": "uint256",
         "name": "id",
         "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "author",
+        "type": "address"
       },
       {
         "indexed": false,
@@ -905,6 +922,11 @@
         "type": "address"
       },
       {
+        "internalType": "address",
+        "name": "author",
+        "type": "address"
+      },
+      {
         "internalType": "string",
         "name": "publishOperationId",
         "type": "string"
@@ -1126,6 +1148,11 @@
                 "internalType": "uint256",
                 "name": "timestamp",
                 "type": "uint256"
+              },
+              {
+                "internalType": "address",
+                "name": "author",
+                "type": "address"
               }
             ],
             "internalType": "struct KnowledgeCollectionLib.MerkleRoot[]",
@@ -1226,6 +1253,11 @@
             "internalType": "uint256",
             "name": "timestamp",
             "type": "uint256"
+          },
+          {
+            "internalType": "address",
+            "name": "author",
+            "type": "address"
           }
         ],
         "internalType": "struct KnowledgeCollectionLib.MerkleRoot[]",
@@ -1360,6 +1392,25 @@
         "type": "uint256"
       }
     ],
+    "name": "getLatestMerkleRootAuthor",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      }
+    ],
     "name": "getLatestMerkleRootObject",
     "outputs": [
       {
@@ -1378,6 +1429,11 @@
             "internalType": "uint256",
             "name": "timestamp",
             "type": "uint256"
+          },
+          {
+            "internalType": "address",
+            "name": "author",
+            "type": "address"
           }
         ],
         "internalType": "struct KnowledgeCollectionLib.MerkleRoot",
@@ -1458,6 +1514,30 @@
         "type": "uint256"
       }
     ],
+    "name": "getMerkleRootAuthorByIndex",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "index",
+        "type": "uint256"
+      }
+    ],
     "name": "getMerkleRootByIndex",
     "outputs": [
       {
@@ -1500,6 +1580,11 @@
             "internalType": "uint256",
             "name": "timestamp",
             "type": "uint256"
+          },
+          {
+            "internalType": "address",
+            "name": "author",
+            "type": "address"
           }
         ],
         "internalType": "struct KnowledgeCollectionLib.MerkleRoot",
@@ -1584,6 +1669,11 @@
             "internalType": "uint256",
             "name": "timestamp",
             "type": "uint256"
+          },
+          {
+            "internalType": "address",
+            "name": "author",
+            "type": "address"
           }
         ],
         "internalType": "struct KnowledgeCollectionLib.MerkleRoot[]",
@@ -2094,6 +2184,11 @@
             "internalType": "uint256",
             "name": "timestamp",
             "type": "uint256"
+          },
+          {
+            "internalType": "address",
+            "name": "author",
+            "type": "address"
           }
         ],
         "internalType": "struct KnowledgeCollectionLib.MerkleRoot[]",
@@ -2297,6 +2392,11 @@
       {
         "internalType": "address",
         "name": "publisher",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "author",
         "type": "address"
       },
       {

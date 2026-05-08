@@ -3016,7 +3016,8 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
 
     expect(existsSync(codexPath)).toBe(true);
-    const written = TOML.parse(readFileSync(codexPath, 'utf-8'));
+    const rawContent = readFileSync(codexPath, 'utf-8');
+    const written = TOML.parse(rawContent);
     // Codex CLI's canonical key is `mcp_servers.<name>` (snake-case),
     // not the JSON-world `mcpServers.<name>`. entryPath dispatch
     // routes the entry to the right table.
@@ -3024,6 +3025,30 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // And the canonical JSON-world key MUST NOT appear in TOML output
     // — that would mean entryPath fell through to default.
     expect((written as any).mcpServers).toBeUndefined();
+
+    // PR #443 round-4 Codex Review: parsing-and-comparing the
+    // round-tripped object alone passes even if the serializer
+    // emits an inline-table form (e.g. `mcp_servers.dkg = { command
+    // = "...", ... }`) instead of the section-header form Codex
+    // CLI's loader expects (`[mcp_servers.dkg]\ncommand = "..."`).
+    // Pin the on-disk syntax with raw-text assertions so a future
+    // `@iarna/toml` major bump or library swap that changes default
+    // emission style trips this test.
+    //
+    // 1. The section header MUST appear at the start of a line —
+    //    this rules out inline-table form, which would put the key
+    //    inline as `mcp_servers.dkg = { ... }`.
+    expect(rawContent).toMatch(/^\[mcp_servers\.dkg\]/m);
+    // 2. The body fields MUST follow as bare assignments, not as
+    //    inline-table contents. Section-body form: `command = "..."`
+    //    on its own line. The DOTALL flag is intentional — `args`
+    //    may wrap across lines for long arrays.
+    expect(rawContent).toMatch(/^\[mcp_servers\.dkg\][\s\S]*?^command\s*=\s*"/m);
+    expect(rawContent).toMatch(/^\[mcp_servers\.dkg\][\s\S]*?^args\s*=\s*\[/m);
+    // 3. Negative: the inline-table form is explicitly NOT emitted.
+    //    `mcp_servers.dkg = {` would be the smoking gun for a
+    //    serializer regression to inline tables.
+    expect(rawContent).not.toMatch(/^mcp_servers\.dkg\s*=\s*\{/m);
   });
 
   it('issue #437: Codex CLI FIX 26 — refresh preserves user-added top-level keys (cwd) AND env keys', async () => {

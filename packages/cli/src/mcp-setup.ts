@@ -811,6 +811,31 @@ function wslWindowsEnvPath(envVarName: string): string | null {
 const CONTINUE_SERVER_NAME = 'dkg';
 
 /**
+ * Continue's per-server file requires three top-level wrapper keys
+ * (`name` / `schema` / `version`) for its loader to accept the
+ * file. Without them the file is silently rejected by Continue at
+ * load time even if the inner `mcpServers` list is correct.
+ *
+ * `'v1'` is the schema version locked at issue #437 against
+ * https://docs.continue.dev/customize/deep-dives/mcp (accessed
+ * 2026-05-08). Future schema versions: when Continue documents
+ * additional values (e.g. `'v2'`), expand `KNOWN_SCHEMAS` rather
+ * than swap — older files written by older `dkg mcp setup` runs
+ * stay readable and get classified as `registered`, not `stale`.
+ */
+const CONTINUE_KNOWN_SCHEMAS: ReadonlySet<string> = new Set(['v1']);
+
+function isContinueWrapperValid(body: Record<string, unknown>): boolean {
+  const name = body.name;
+  if (typeof name !== 'string' || name.trim() === '') return false;
+  const schema = body.schema;
+  if (typeof schema !== 'string' || !CONTINUE_KNOWN_SCHEMAS.has(schema)) return false;
+  const version = body.version;
+  if (typeof version !== 'string' || version.trim() === '') return false;
+  return true;
+}
+
+/**
  * Issue #437 Codex Review fix: extract the dkg server entry from
  * a parsed Continue per-server file. The file shape is:
  *
@@ -820,10 +845,25 @@ const CONTINUE_SERVER_NAME = 'dkg';
  * the element whose `name` field matches `'dkg'` and return it; if
  * absent, return `undefined` so the caller classifies as
  * `not-registered`.
+ *
+ * Round-2 Codex Review fix (PR #443, comment 3207793946): if the
+ * file's three wrapper keys (`name` / `schema` / `version`) are
+ * missing or malformed, the file won't load in Continue regardless
+ * of how correct the inner `mcpServers` list is. Return `null` in
+ * that case so `classify` treats the file as needing a refresh
+ * (`continueWrap` re-seeds the wrapper on write).
  */
 function continueUnwrap(body: Record<string, unknown>): Record<string, unknown> | null | undefined {
+  // An empty body (no keys yet) is "not-registered", not "stale" —
+  // the canonical shape on a brand-new Continue install. Returning
+  // `null` here would make every fresh install classify as `stale`,
+  // which produces a noisier operator log. Distinguish via the
+  // `mcpServers` key: absent entirely → undefined (no entry yet);
+  // present but wrapper invalid → null (force rewrite).
+  if (!('mcpServers' in body)) return undefined;
+  if (!isContinueWrapperValid(body)) return null;
   const list = body.mcpServers;
-  if (!Array.isArray(list)) return undefined;
+  if (!Array.isArray(list)) return null;
   const found = list.find(
     (e) => e && typeof e === 'object' && (e as Record<string, unknown>).name === CONTINUE_SERVER_NAME,
   );
@@ -855,14 +895,33 @@ function continueWrap(
   if (idx >= 0) nextList[idx] = dkgEntry;
   else nextList.push(dkgEntry);
   // Continue requires `name`, `schema`, and `version` top-level keys
-  // in a per-server file. Existing values pass through unchanged;
-  // sensible defaults are seeded on first write. Forward-compat with
+  // in a per-server file. Existing valid values pass through
+  // unchanged; sensible defaults are seeded on first write OR when
+  // the existing value is missing/malformed. Forward-compat with
   // future Continue per-server fields: spread `body` first, then
   // overwrite the four keys we own.
-  const seededName = typeof body.name === 'string' && body.name ? body.name : 'DKG';
-  const seededSchema = typeof body.schema === 'string' && body.schema ? body.schema : 'v1';
+  //
+  // Round-2 Codex Review fix: validate before re-using. A
+  // pre-existing entry with the right server-list shape but a
+  // missing or malformed wrapper would have been classified as
+  // wrapper-invalid by `continueUnwrap` already, so this branch
+  // fires after we've decided to rewrite the file — we MUST emit
+  // a known-good wrapper, not propagate the malformed values.
+  const existingName = body.name;
+  const seededName =
+    typeof existingName === 'string' && existingName.trim() !== ''
+      ? existingName
+      : 'DKG';
+  const existingSchema = body.schema;
+  const seededSchema =
+    typeof existingSchema === 'string' && CONTINUE_KNOWN_SCHEMAS.has(existingSchema)
+      ? existingSchema
+      : 'v1';
+  const existingVersion = body.version;
   const seededVersion =
-    typeof body.version === 'string' && body.version ? body.version : '0.0.1';
+    typeof existingVersion === 'string' && existingVersion.trim() !== ''
+      ? existingVersion
+      : '0.0.1';
   return {
     ...body,
     name: seededName,

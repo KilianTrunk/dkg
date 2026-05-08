@@ -3093,6 +3093,80 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
+  it('issue #437 (Codex round-2): Codex CLI structural preservation — top-level scalars, sibling tables, array-of-tables ALL preserved across refresh', async () => {
+    // Codex Review round-2 (PR #443, comment 3207793953) flagged
+    // that `TOML.stringify(body)` round-trips the entire user
+    // `~/.codex/config.toml` on every refresh. We documented
+    // comment-loss as a best-effort trade-off; this test pins the
+    // STRUCTURAL preservation contract as a regression guard:
+    //
+    //  1. Top-level scalar keys (`model`, `disable_history`, …) — preserved.
+    //  2. Top-level non-MCP tables (`[history]`, `[notify]`) — preserved.
+    //  3. Top-level array-of-tables (`[[profiles]]`) — preserved.
+    //  4. Sibling MCP servers under `[mcp_servers.<other>]` — preserved
+    //     (already covered by the earlier test; included here for
+    //     full-shape regression).
+    //
+    // If `@iarna/toml` ever introduces a regression that drops or
+    // reorders unrelated content, this catches it. Comment loss is
+    // explicitly NOT pinned — that's documented as a known trade-off.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    writeFileSync(
+      codexPath,
+      TOML.stringify({
+        // Top-level scalars (real Codex CLI config keys).
+        model: 'gpt-5',
+        disable_history: false,
+        approval_policy: 'on-failure',
+        // Top-level non-MCP table.
+        history: {
+          persistence: 'save-all',
+          max_bytes: 1048576,
+        },
+        // Top-level non-MCP table that uses dotted-key shorthand.
+        notify: {
+          on_completion: true,
+          on_error: true,
+        },
+        // Top-level array-of-tables (Codex profile feature).
+        profiles: [
+          { name: 'work', model: 'gpt-5', api_key_env_var: 'OPENAI_API_KEY' },
+          { name: 'personal', model: 'claude-opus-4-7', api_key_env_var: 'ANTHROPIC_API_KEY' },
+        ],
+        // Sibling MCP server.
+        mcp_servers: {
+          'github-mcp': { command: 'gh-mcp', args: ['serve'] },
+        },
+      } as TOML.JsonMap),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = TOML.parse(readFileSync(codexPath, 'utf-8')) as any;
+    // Top-level scalars preserved verbatim.
+    expect(after.model).toBe('gpt-5');
+    expect(after.disable_history).toBe(false);
+    expect(after.approval_policy).toBe('on-failure');
+    // Top-level non-MCP tables preserved verbatim.
+    expect(after.history).toEqual({ persistence: 'save-all', max_bytes: 1048576 });
+    expect(after.notify).toEqual({ on_completion: true, on_error: true });
+    // Top-level array-of-tables preserved verbatim, in original order.
+    expect(after.profiles).toHaveLength(2);
+    expect(after.profiles[0]).toEqual({ name: 'work', model: 'gpt-5', api_key_env_var: 'OPENAI_API_KEY' });
+    expect(after.profiles[1]).toEqual({
+      name: 'personal',
+      model: 'claude-opus-4-7',
+      api_key_env_var: 'ANTHROPIC_API_KEY',
+    });
+    // Sibling MCP server preserved.
+    expect(after.mcp_servers['github-mcp']).toEqual({ command: 'gh-mcp', args: ['serve'] });
+    // And our entry written.
+    expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
   // ── Issue #437 Codex Review fix: Continue dedicated-file + list-shape ──
 
   it('issue #437 (Codex review): Continue writes a DEDICATED ~/.continue/mcpServers/dkg.yaml with list-shape format', async () => {
@@ -3331,6 +3405,92 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     const dkgEl = after.mcpServers.find((e: any) => e.name === 'dkg');
     expect(dkgEl.command).toBe(process.execPath);
     expect(dkgEl.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+  });
+
+  it('issue #437 (Codex round-2): Continue wrapper validation — entry-correct file with missing wrapper keys is reseeded on refresh', async () => {
+    // Codex Review round-2 (PR #443, comment 3207793946) flagged
+    // that staleness was computed only from the unwrapped server
+    // entry, so a `dkg.yaml` with the right `mcpServers: [{ name:
+    // 'dkg', ...correct... }]` but MISSING the wrapper keys
+    // (`name`, `schema`, `version`) would classify as `registered`
+    // and never get repaired — even though Continue's loader would
+    // reject the file at startup.
+    //
+    // Fix: `continueUnwrap` validates the wrapper before extracting.
+    // If wrapper is missing/malformed, returns `null` so `classify`
+    // treats as not-registered → triggers a write that re-seeds
+    // the wrapper via `continueWrap`.
+    const serverDir = join(tmpHome, '.continue', 'mcpServers');
+    mkdirSync(serverDir, { recursive: true });
+    const yamlPath = join(serverDir, 'dkg.yaml');
+    // Pre-existing file with the canonical entry payload but NO
+    // wrapper keys. Pre-fix this would have classified as
+    // `registered` (entry matches expected) and stayed unrepaired.
+    writeFileSync(
+      yamlPath,
+      yaml.dump(
+        {
+          mcpServers: [
+            {
+              name: 'dkg',
+              command: process.execPath,
+              args: [realpathSync(process.argv[1]), 'mcp', 'serve'],
+              env: { DKG_HOME: join(tmpHome, '.dkg') },
+            },
+          ],
+        },
+        { lineWidth: -1, noRefs: true },
+      ),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
+    // Wrapper keys re-seeded with sensible defaults.
+    expect(after.name).toBe('DKG');
+    expect(after.schema).toBe('v1');
+    expect(after.version).toBe('0.0.1');
+    // Server entry intact.
+    expect(after.mcpServers).toHaveLength(1);
+    expect(after.mcpServers[0]).toEqual({ name: 'dkg', ...EXPECTED_INSTALLED_ENTRY() });
+  });
+
+  it('issue #437 (Codex round-2): Continue wrapper validation — partial wrapper (e.g. unknown schema) triggers reseed', async () => {
+    // Pin the contract that any malformed wrapper field — including
+    // an unknown `schema` value — triggers a reseed. Forward-compat
+    // hook: when Continue documents a future schema (`v2`), update
+    // CONTINUE_KNOWN_SCHEMAS rather than swap; older `dkg mcp setup`
+    // runs that wrote `'v1'` stay readable.
+    const serverDir = join(tmpHome, '.continue', 'mcpServers');
+    mkdirSync(serverDir, { recursive: true });
+    const yamlPath = join(serverDir, 'dkg.yaml');
+    writeFileSync(
+      yamlPath,
+      yaml.dump(
+        {
+          name: '', // empty string → invalid
+          schema: 'v99-unknown-future', // not in KNOWN_SCHEMAS → invalid
+          // version key missing entirely → invalid
+          mcpServers: [
+            { name: 'dkg', command: process.execPath, args: ['x'], env: { DKG_HOME: '/x' } },
+          ],
+        },
+        { lineWidth: -1, noRefs: true },
+      ),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = yaml.load(readFileSync(yamlPath, 'utf-8')) as any;
+    // All three wrapper keys normalised to known-good defaults.
+    expect(after.name).toBe('DKG');
+    expect(after.schema).toBe('v1');
+    expect(after.version).toBe('0.0.1');
+    // Entry refreshed too.
+    expect(after.mcpServers[0].command).toBe(process.execPath);
+    expect(after.mcpServers[0].env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
   });
 
   // ── Issue #437: format-dispatch round-trip sanity ────────────────────

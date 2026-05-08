@@ -18,7 +18,7 @@ dkg mcp setup                                # one-shot: init + start + fund + r
 1. Initializes `~/.dkg/config.json` if absent (skipped silently when present)
 2. Starts the DKG daemon as a background process (skipped if already running)
 3. Funds the node's wallets via the testnet faucet (skip with `--no-fund`)
-4. Detects each MCP-aware client by its config file and writes the canonical entry. **You confirm per detected client interactively** (`Register DKG MCP with <client>? [Y/n]`) unless `--yes` is passed; non-TTY invocations (CI, piped stdin) auto-confirm so scripts don't hang. The detection set is eight clients: **Cursor** (`~/.cursor/mcp.json`), **Claude Code** (`~/.claude.json`), **Claude Desktop** (per-platform — `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows, `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (or `~/.config/Claude/...` when XDG_CONFIG_HOME is unset) on Linux), **Windsurf** (`~/.codeium/windsurf/mcp_config.json`), **VSCode + GitHub Copilot Chat** (per-platform Code user-settings dir + `mcp.json` — note this client uses the `servers.dkg` shape, not `mcpServers.dkg`), **Cline** (deep-nested under VSCode's per-extension globalStorage at `Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`), **Codex CLI** (`~/.codex/config.toml` — TOML format, table key `mcp_servers.dkg`), and **Continue** (`~/.continue/config.yaml` — YAML format; legacy `~/.continue/config.json` also accepted). The clients receive the same canonical entry, serialized into each client's native format
+4. Detects each MCP-aware client by its config file and writes the canonical entry. **You confirm per detected client interactively** (`Register DKG MCP with <client>? [Y/n]`) unless `--yes` is passed; non-TTY invocations (CI, piped stdin) auto-confirm so scripts don't hang. The detection set is eight clients: **Cursor** (`~/.cursor/mcp.json`), **Claude Code** (`~/.claude.json`), **Claude Desktop** (per-platform — `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows, `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (or `~/.config/Claude/...` when XDG_CONFIG_HOME is unset) on Linux), **Windsurf** (`~/.codeium/windsurf/mcp_config.json`), **VSCode + GitHub Copilot Chat** (per-platform Code user-settings dir + `mcp.json` — note this client uses the `servers.dkg` shape, not `mcpServers.dkg`), **Cline** (deep-nested under VSCode's per-extension globalStorage at `Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`), **Codex CLI** (`~/.codex/config.toml` — TOML format, table key `mcp_servers.dkg`), and **Continue** (`~/.continue/mcpServers/dkg.yaml` — dedicated per-server file with a list-shape wrapper at `mcpServers: [{ name: 'dkg', ... }]`; legacy `~/.continue/mcpServers/dkg.json` also accepted). The clients receive the same canonical entry, serialized into each client's native format
 5. Verifies the daemon is healthy
 
 Every step short-circuits when its work is already done, so re-running on a set-up box is safe. Step-skip flags: `--no-start`, `--no-fund`, `--no-verify`, `--dry-run` (preview only), `--force` (refresh every detected client config regardless of state), `--yes` (auto-confirm per-client registrations; default false — TTY mode prompts interactively, non-TTY auto-confirms; pass `--yes` in scripts for the safer scripted-environment posture). First-init overrides: `--port <n>`, `--name <s>`. The bundled flow re-uses the same primitives `dkg openclaw setup` does, so the two verbs stay byte-aligned on network defaults, daemon-readiness probes, faucet retry/back-off, and manual-curl fallback.
@@ -60,7 +60,24 @@ For environments where `dkg mcp setup` can't run (CI, locked-down configs, custo
 - **VSCode + GitHub Copilot Chat** — per-platform Code user-settings dir + `mcp.json`; **`servers.dkg`** (Copilot Chat uses `servers`, not `mcpServers` — copy the inner block, not the outer wrapper)
 - **Cline** — `Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` under your VSCode user dir; `mcpServers.dkg`
 - **Codex CLI** — `~/.codex/config.toml`; `mcp_servers.dkg` (TOML table key — Codex CLI uses `mcp_servers`, not `mcpServers`)
-- **Continue** — `~/.continue/config.yaml` (or `~/.continue/config.json` if the legacy form is what you've got); `mcpServers.dkg`
+- **Continue** — `~/.continue/mcpServers/dkg.yaml` (or `~/.continue/mcpServers/dkg.json` if the legacy form is what you've got). Continue uses a **dedicated per-server file** (one server per file) with a list-shape wrapper, NOT a flat `mcpServers.dkg` key under the main `~/.continue/config.{yaml,json}`. Canonical shape:
+
+  ```yaml
+  name: DKG
+  schema: v1
+  version: 0.0.1
+  mcpServers:
+    - name: dkg
+      command: /path/to/node
+      args:
+        - /path/to/cli.js
+        - mcp
+        - serve
+      env:
+        DKG_HOME: /home/you/.dkg
+  ```
+
+  The dedicated-file convention is deliberate — `dkg mcp setup` never touches the main `~/.continue/config.{yaml,json}`, so any user comments / anchors / merge-keys / yaml refs there stay intact.
 - **Any other MCP client** — run `dkg mcp setup --print-only` to emit the canonical JSON block, then translate into the client's native format and paste it under whichever key the client expects
 
 ### Contributor (monorepo dev) workflow

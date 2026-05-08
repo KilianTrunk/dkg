@@ -1063,8 +1063,14 @@ function splitTomlKeyPath(path: string): string[] {
   });
 }
 
+const TOML_PATH_SEPARATOR = '\0';
+
 function normaliseTomlHeaderPath(path: string): string {
-  return splitTomlKeyPath(path).join('.');
+  return splitTomlKeyPath(path).join(TOML_PATH_SEPARATOR);
+}
+
+function normaliseTomlOwnedPath(path: string): string {
+  return path.split('.').filter(Boolean).join(TOML_PATH_SEPARATOR);
 }
 
 function tomlTableHeaderPath(line: string): string | null {
@@ -1076,7 +1082,74 @@ function tomlTableHeaderPath(line: string): string | null {
 }
 
 function ownsTomlTablePath(path: string, ownedPath: string): boolean {
-  return path === ownedPath || path.startsWith(`${ownedPath}.`);
+  return path === ownedPath || path.startsWith(`${ownedPath}${TOML_PATH_SEPARATOR}`);
+}
+
+type TomlMultilineDelimiter = '"""' | "'''";
+
+function advanceTomlMultilineDelimiter(
+  line: string,
+  state: TomlMultilineDelimiter | null,
+): TomlMultilineDelimiter | null {
+  let i = 0;
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  while (i < line.length) {
+    if (state) {
+      const end = line.indexOf(state, i);
+      if (end === -1) return state;
+      i = end + state.length;
+      state = null;
+      continue;
+    }
+
+    const ch = line[i];
+    if (quote === '"') {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        quote = null;
+      }
+      i++;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      i++;
+      continue;
+    }
+    if (ch === '#') break;
+    if (line.startsWith('"""', i)) {
+      state = '"""';
+      i += 3;
+      continue;
+    }
+    if (line.startsWith("'''", i)) {
+      state = "'''";
+      i += 3;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  return state;
+}
+
+function tomlTableHeaderPaths(lines: TomlLine[]): Array<string | null> {
+  let multilineDelimiter: TomlMultilineDelimiter | null = null;
+  return lines.map((line) => {
+    const headerPath = multilineDelimiter ? null : tomlTableHeaderPath(line.text);
+    multilineDelimiter = advanceTomlMultilineDelimiter(line.text, multilineDelimiter);
+    return headerPath;
+  });
 }
 
 function isTomlCommentOrBlank(line: TomlLine): boolean {
@@ -1100,8 +1173,10 @@ function replaceTomlTable(
   raw: string,
   ownedPath: string,
   replacement: string,
-): string {
+  parsedRawHasOwnedEntry: boolean,
+): string | null {
   const newline = raw.includes('\r\n') ? '\r\n' : '\n';
+  const ownedPathKey = normaliseTomlOwnedPath(ownedPath);
   const replacementBlock = normaliseNewlines(
     replacement.endsWith('\n') || replacement.endsWith('\r')
       ? replacement
@@ -1109,13 +1184,16 @@ function replaceTomlTable(
     newline,
   );
   const lines = splitTomlLines(raw);
+  const headerPaths = tomlTableHeaderPaths(lines);
   const ranges: { start: number; end: number }[] = [];
+  let hasRootTable = false;
 
   for (let i = 0; i < lines.length; i++) {
-    const headerPath = tomlTableHeaderPath(lines[i].text);
-    if (!headerPath || !ownsTomlTablePath(headerPath, ownedPath)) continue;
+    const headerPath = headerPaths[i];
+    if (!headerPath || !ownsTomlTablePath(headerPath, ownedPathKey)) continue;
+    if (headerPath === ownedPathKey) hasRootTable = true;
     let end = i + 1;
-    while (end < lines.length && tomlTableHeaderPath(lines[end].text) === null) {
+    while (end < lines.length && headerPaths[end] === null) {
       end++;
     }
     let replaceEnd = end;
@@ -1124,6 +1202,10 @@ function replaceTomlTable(
     }
     ranges.push({ start: i, end: replaceEnd });
     i = end - 1;
+  }
+
+  if (parsedRawHasOwnedEntry && !hasRootTable) {
+    return null;
   }
 
   if (ranges.length === 0) {
@@ -1150,6 +1232,16 @@ function replaceTomlTable(
   return out;
 }
 
+function tomlRawHasEntry(raw: string, entryPath: string | undefined): boolean {
+  if (!raw.trim()) return false;
+  try {
+    const parsed = TOML.parse(raw) as Record<string, unknown>;
+    return readEntryAt(parsed, entryPath) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 function writeTomlConfigBody(
   target: ClientTarget,
   body: Record<string, unknown>,
@@ -1159,7 +1251,16 @@ function writeTomlConfigBody(
     : '';
   const ownedPath = target.entryPath ?? DEFAULT_ENTRY_PATH;
   const serialisedEntry = serialiseTomlEntryOnly(target, body);
-  writeFileSync(target.configPath, replaceTomlTable(raw, ownedPath, serialisedEntry));
+  const patched = replaceTomlTable(
+    raw,
+    ownedPath,
+    serialisedEntry,
+    tomlRawHasEntry(raw, target.entryPath),
+  );
+  writeFileSync(
+    target.configPath,
+    patched ?? TOML.stringify(body as TOML.JsonMap),
+  );
 }
 
 /**

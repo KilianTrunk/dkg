@@ -3256,6 +3256,69 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
   });
 
+  it('issue #437 (Codex round-6): Codex CLI rewrites unsupported inline TOML registration instead of appending a duplicate', async () => {
+    // Valid TOML can encode the same parsed object without an
+    // explicit [mcp_servers.dkg] table. The narrow splice path cannot
+    // safely remove that shape, so it falls back to whole-file
+    // serialization instead of appending a second dkg definition.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    writeFileSync(
+      codexPath,
+      [
+        'model = "gpt-5"',
+        'mcp_servers.dkg = { command = "/old/legacy/dkg", args = [ "legacy-arg" ], cwd = "/workspaces/my-project", env = { DKG_HOME = "/old/abandoned/path", NODE_OPTIONS = "--inspect" } }',
+        '',
+      ].join('\n'),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const afterRaw = readFileSync(codexPath, 'utf-8');
+    const after = TOML.parse(afterRaw) as any;
+    expect(after.model).toBe('gpt-5');
+    expect(after.mcp_servers.dkg.command).toBe(process.execPath);
+    expect(after.mcp_servers.dkg.args[0]).toBe(realpathSync(process.argv[1]));
+    expect(after.mcp_servers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
+    expect(after.mcp_servers.dkg.cwd).toBe('/workspaces/my-project');
+    expect(after.mcp_servers.dkg.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    expect(after.mcp_servers.dkg.env.NODE_OPTIONS).toBe('--inspect');
+    expect(afterRaw).toMatch(/^\[mcp_servers\.dkg\]/m);
+    expect(afterRaw).not.toContain('mcp_servers.dkg = {');
+    expect(afterRaw).not.toContain('/old/legacy/dkg');
+  });
+
+  it('issue #437 (Codex round-6): Codex CLI ignores table-looking lines inside TOML multiline strings', async () => {
+    // The comment-preserving splice scans table headers line-by-line.
+    // Bracket-looking text inside a multiline string must not be
+    // treated as an owned MCP table range.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    const original = [
+      'model = "gpt-5"',
+      'startup_message = """',
+      '[mcp_servers.dkg]',
+      'command = "this is prose, not a table"',
+      '"""',
+      '',
+    ].join('\n');
+    writeFileSync(codexPath, original);
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const afterRaw = readFileSync(codexPath, 'utf-8');
+    const after = TOML.parse(afterRaw) as any;
+    expect(afterRaw.startsWith(original)).toBe(true);
+    expect(afterRaw).toContain('command = "this is prose, not a table"\n"""');
+    expect(afterRaw).toMatch(/"""\n\n\[mcp_servers\.dkg\]\ncommand = "/);
+    expect(after.model).toBe('gpt-5');
+    expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
 
   // ── Issue #437: format-dispatch round-trip sanity ────────────────────
 

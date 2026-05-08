@@ -930,6 +930,34 @@ function readJson(path: string): Record<string, unknown> {
 }
 
 /**
+ * PR #443 round-5 Codex Review: mirror `readJson`'s friendly-recovery
+ * wrapping for the TOML branch. `@iarna/toml`'s parse error includes
+ * line/column info but no path and no suggested next-step; an
+ * operator hitting a malformed `~/.codex/config.toml` would see the
+ * raw library message and abort the entire `dkg mcp setup` flow with
+ * no clear recovery path. Wrap with the same shape JSON uses so the
+ * operator-facing error names the file and the move-it-aside
+ * recovery procedure.
+ */
+function readToml(path: string): Record<string, unknown> {
+  if (!existsSync(path)) return {};
+  const raw = readFileSync(path, 'utf8');
+  // `@iarna/toml`'s parser returns `{}` for an all-whitespace file
+  // already, but normalising empty-string up front mirrors readJson
+  // and skips the parse call for the common parent-dir-only-detected
+  // first-write case.
+  if (!raw.trim()) return {};
+  try {
+    const parsed = TOML.parse(raw);
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new Error(
+      `Existing file is not valid TOML: ${tildify(path)}. Move it aside and re-run.`,
+    );
+  }
+}
+
+/**
  * Read the parsed body of a per-client config, dispatching on
  * `target.format`. JSON is the default + most-common format. TOML
  * (Codex CLI) uses `@iarna/toml`. The YAML branch is a reserved
@@ -943,11 +971,8 @@ function readConfigBody(target: ClientTarget): Record<string, unknown> {
   switch (format) {
     case 'json':
       return readJson(target.configPath);
-    case 'toml': {
-      if (!existsSync(target.configPath)) return {};
-      const content = readFileSync(target.configPath, 'utf-8');
-      return TOML.parse(content) as Record<string, unknown>;
-    }
+    case 'toml':
+      return readToml(target.configPath);
     case 'yaml':
       // YAML branch is reserved for a future client (PR #443
       // attempted Continue here, then reverted because Continue's
@@ -965,17 +990,184 @@ function readConfigBody(target: ClientTarget): Record<string, unknown> {
   }
 }
 
+function serialiseTomlEntryOnly(
+  target: ClientTarget,
+  body: Record<string, unknown>,
+): string {
+  const nested: Record<string, unknown> = {};
+  const { head, leaf } = splitEntryPath(target.entryPath);
+  const container = ensurePathContainer(nested, head);
+  container[leaf] = readEntryAt(body, target.entryPath) ?? {};
+  return TOML.stringify(nested as TOML.JsonMap);
+}
+
+interface TomlLine {
+  text: string;
+  eol: string;
+}
+
+function splitTomlLines(raw: string): TomlLine[] {
+  const lines: TomlLine[] = [];
+  const re = /(.*?)(\r\n|\n|\r|$)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(raw)) !== null) {
+    if (match[0] === '') break;
+    lines.push({ text: match[1], eol: match[2] });
+  }
+  return lines;
+}
+
+function splitTomlKeyPath(path: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const ch of path) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (quote === '"' && ch === '\\') {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      current += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      current += ch;
+      quote = ch;
+      continue;
+    }
+    if (ch === '.') {
+      parts.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  parts.push(current.trim());
+  return parts.map((part) => {
+    if (
+      part.length >= 2 &&
+      ((part.startsWith('"') && part.endsWith('"')) ||
+        (part.startsWith("'") && part.endsWith("'")))
+    ) {
+      return part.slice(1, -1);
+    }
+    return part;
+  });
+}
+
+function normaliseTomlHeaderPath(path: string): string {
+  return splitTomlKeyPath(path).join('.');
+}
+
+function tomlTableHeaderPath(line: string): string | null {
+  const arrayMatch = line.match(/^\s*\[\[\s*(.+?)\s*\]\]\s*(?:#.*)?$/);
+  if (arrayMatch) return normaliseTomlHeaderPath(arrayMatch[1]);
+  const tableMatch = line.match(/^\s*\[\s*(.+?)\s*\]\s*(?:#.*)?$/);
+  if (tableMatch) return normaliseTomlHeaderPath(tableMatch[1]);
+  return null;
+}
+
+function ownsTomlTablePath(path: string, ownedPath: string): boolean {
+  return path === ownedPath || path.startsWith(`${ownedPath}.`);
+}
+
+function isTomlCommentOrBlank(line: TomlLine): boolean {
+  const trimmed = line.text.trim();
+  return trimmed === '' || trimmed.startsWith('#');
+}
+
+function normaliseNewlines(text: string, newline: string): string {
+  return text.replace(/\r\n|\n|\r/g, newline);
+}
+
+function appendTomlTable(raw: string, replacement: string, newline: string): string {
+  if (!raw.trim()) return replacement;
+  let out = raw;
+  if (!out.endsWith('\n') && !out.endsWith('\r')) out += newline;
+  if (!out.endsWith(`${newline}${newline}`)) out += newline;
+  return out + replacement;
+}
+
+function replaceTomlTable(
+  raw: string,
+  ownedPath: string,
+  replacement: string,
+): string {
+  const newline = raw.includes('\r\n') ? '\r\n' : '\n';
+  const replacementBlock = normaliseNewlines(
+    replacement.endsWith('\n') || replacement.endsWith('\r')
+      ? replacement
+      : replacement + newline,
+    newline,
+  );
+  const lines = splitTomlLines(raw);
+  const ranges: { start: number; end: number }[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const headerPath = tomlTableHeaderPath(lines[i].text);
+    if (!headerPath || !ownsTomlTablePath(headerPath, ownedPath)) continue;
+    let end = i + 1;
+    while (end < lines.length && tomlTableHeaderPath(lines[end].text) === null) {
+      end++;
+    }
+    let replaceEnd = end;
+    while (replaceEnd > i + 1 && isTomlCommentOrBlank(lines[replaceEnd - 1])) {
+      replaceEnd--;
+    }
+    ranges.push({ start: i, end: replaceEnd });
+    i = end - 1;
+  }
+
+  if (ranges.length === 0) {
+    return appendTomlTable(raw, replacementBlock, newline);
+  }
+
+  let inserted = false;
+  let rangeIndex = 0;
+  let out = '';
+  for (let i = 0; i < lines.length;) {
+    const range = ranges[rangeIndex];
+    if (range && i === range.start) {
+      if (!inserted) {
+        out += replacementBlock;
+        inserted = true;
+      }
+      i = range.end;
+      rangeIndex++;
+      continue;
+    }
+    out += lines[i].text + lines[i].eol;
+    i++;
+  }
+  return out;
+}
+
+function writeTomlConfigBody(
+  target: ClientTarget,
+  body: Record<string, unknown>,
+): void {
+  const raw = existsSync(target.configPath)
+    ? readFileSync(target.configPath, 'utf8')
+    : '';
+  const ownedPath = target.entryPath ?? DEFAULT_ENTRY_PATH;
+  const serialisedEntry = serialiseTomlEntryOnly(target, body);
+  writeFileSync(target.configPath, replaceTomlTable(raw, ownedPath, serialisedEntry));
+}
+
 /**
  * Serialize a parsed body to disk, dispatching on `target.format`.
  * Mirrors `readConfigBody`'s dispatch shape. JSON output keeps the
  * pre-refactor formatting (2-space indent, trailing newline)
- * byte-for-byte. TOML uses `@iarna/toml`'s `stringify` (TOML 1.0
- * canonical output). YAML is a reserved-stub branch today.
- *
- * Comment preservation: best-effort only. The TOML serializer
- * drops user comments on round-trip. Acceptable trade-off for a
- * generated MCP-config block; users hand-curating sources should
- * source-control them elsewhere.
+ * byte-for-byte. TOML patches only the owned MCP table. YAML is a
+ * reserved-stub branch today.
  *
  * FIX 26 merge: format-agnostic. The merge in `writeRegistration`
  * operates on the parsed body object before it reaches this writer,
@@ -990,16 +1182,9 @@ function writeConfigBody(target: ClientTarget, body: Record<string, unknown>): v
     case 'json':
       writeFileSync(target.configPath, JSON.stringify(body, null, 2) + '\n');
       return;
-    case 'toml': {
-      // `@iarna/toml`'s `stringify` accepts any JSON-shaped object
-      // whose values are TOML-representable (string / number / boolean
-      // / Date / array / table). The mcp-server entries we emit only
-      // use string + string-array + nested-string-table, so the cast
-      // through `JsonMap` is safe.
-      const serialised = TOML.stringify(body as TOML.JsonMap);
-      writeFileSync(target.configPath, serialised);
+    case 'toml':
+      writeTomlConfigBody(target, body);
       return;
-    }
     case 'yaml':
       // Mirror `readConfigBody`'s YAML stub. See the comment there
       // for the rationale (PR #443 Continue revert; YAML branch

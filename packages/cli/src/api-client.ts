@@ -613,6 +613,7 @@ export class ApiClient {
     /** @deprecated V10 ContextGraphs registration ignores metadata reveal. */
     revealOnChain?: boolean;
     accessPolicy?: number;
+    publishPolicy?: number;
   }): Promise<{
     registered: string;
     onChainId: string;
@@ -621,6 +622,7 @@ export class ApiClient {
     return this.post('/api/context-graph/register', {
       id,
       ...(opts?.accessPolicy != null ? { accessPolicy: opts.accessPolicy } : {}),
+      ...(opts?.publishPolicy != null ? { publishPolicy: opts.publishPolicy } : {}),
     });
   }
 
@@ -700,23 +702,6 @@ export class ApiClient {
     return this.get('/api/agent/identity');
   }
 
-  /** @deprecated Use createContextGraph */
-  async createParanet(
-    id: string,
-    name: string,
-    description?: string,
-    options?: {
-      private?: boolean;
-      participantIdentityIds?: Array<string | number | bigint>;
-      requiredSignatures?: number;
-    },
-  ): Promise<{
-    created: string;
-    uri: string;
-  }> {
-    return this.createContextGraph(id, name, description, options);
-  }
-
   async listContextGraphs(): Promise<{
     contextGraphs: Array<{
       id: string;
@@ -736,28 +721,8 @@ export class ApiClient {
     return this.get('/api/context-graph/list');
   }
 
-  /** @deprecated Use listContextGraphs */
-  async listParanets(): Promise<{
-    contextGraphs: Array<{
-      id: string;
-      uri: string;
-      name: string;
-      description?: string;
-      creator?: string;
-      createdAt?: string;
-      isSystem: boolean;
-    }>;
-  }> {
-    return this.listContextGraphs();
-  }
-
   async contextGraphExists(id: string): Promise<{ id: string; exists: boolean }> {
     return this.get(`/api/context-graph/exists?id=${encodeURIComponent(id)}`);
-  }
-
-  /** @deprecated Use contextGraphExists */
-  async paranetExists(id: string): Promise<{ id: string; exists: boolean }> {
-    return this.contextGraphExists(id);
   }
 
   async verify(request: {

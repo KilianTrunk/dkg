@@ -25,7 +25,7 @@ export type CatchupJobState =
 
 export interface CatchupJob {
   jobId: string;
-  paranetId: string;
+  contextGraphId: string;
   includeWorkspace: boolean; // kept for wire compat; semantically "includeSharedMemory"
   status: CatchupJobState;
   queuedAt: number;
@@ -37,13 +37,13 @@ export interface CatchupJob {
 
 export interface CatchupTracker {
   jobs: Map<string, CatchupJob>;
-  latestByParanet: Map<string, string>;
+  latestByContextGraph: Map<string, string>;
 }
 
 export function toCatchupStatusResponse(job: CatchupJob) {
   return {
     ...job,
-    contextGraphId: job.paranetId,
+    contextGraphId: job.contextGraphId,
     includeSharedMemory: job.includeWorkspace,
   };
 }

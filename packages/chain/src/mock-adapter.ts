@@ -650,6 +650,7 @@ export class MockChainAdapter implements ChainAdapter {
     participantAgents: string[];
     requiredSignatures: number;
     metadataBatchId: bigint;
+    accessPolicy: number;
     publishPolicy: number;
     publishAuthority?: string;
     publishAuthorityAccountId: bigint;
@@ -671,6 +672,10 @@ export class MockChainAdapter implements ChainAdapter {
       }
     }
     const publishPolicy = params.publishPolicy ?? 1;
+    const accessPolicy = params.accessPolicy ?? 0;
+    if (accessPolicy !== 0 && accessPolicy !== 1) {
+      throw new Error('Mock: invalid accessPolicy');
+    }
     if (publishPolicy !== 0 && publishPolicy !== 1) {
       throw new Error('Mock: invalid publishPolicy');
     }
@@ -724,6 +729,7 @@ export class MockChainAdapter implements ChainAdapter {
       participantAgents: participantAgents.map((agent) => ethers.getAddress(agent)),
       requiredSignatures: params.requiredSignatures,
       metadataBatchId: params.metadataBatchId ?? 0n,
+      accessPolicy,
       publishPolicy,
       publishAuthority,
       publishAuthorityAccountId,
@@ -733,10 +739,13 @@ export class MockChainAdapter implements ChainAdapter {
 
     this.pushEvent('ContextGraphCreated', {
       contextGraphId: contextGraphId.toString(),
+      creator: this.signerAddress,
+      owner: this.signerAddress,
       manager: this.signerAddress,
       participantIdentityIds: params.participantIdentityIds.map((id) => id.toString()),
       participantAgents: participantAgents.map((agent) => ethers.getAddress(agent)),
       requiredSignatures: params.requiredSignatures,
+      accessPolicy,
       publishPolicy,
     });
 

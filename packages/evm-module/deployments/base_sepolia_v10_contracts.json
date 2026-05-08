@@ -99,7 +99,7 @@
             "deploymentTimestamp": 1777296391540,
             "deployed": true
         },
-        "ParanetsRegistry": {
+        "ContextGraphsRegistry": {
             "evmAddress": "0x05Cf1456fc74587a5FAa360C78a97c749BA4E05C",
             "version": "1.0.1",
             "gitBranch": "main",
@@ -108,7 +108,7 @@
             "deploymentTimestamp": 1772037942928,
             "deployed": true
         },
-        "ParanetServicesRegistry": {
+        "ContextGraphServicesRegistry": {
             "evmAddress": "0x8F68bbb2C4bD5642A3585C305B21341F4D4499A3",
             "version": "1.0.0",
             "gitBranch": "main",
@@ -117,7 +117,7 @@
             "deploymentTimestamp": 1772037948658,
             "deployed": true
         },
-        "ParanetKnowledgeCollectionsRegistry": {
+        "ContextGraphKnowledgeCollectionsRegistry": {
             "evmAddress": "0x364762d19c9b96b75Cfa0A19597E8d0a75186465",
             "version": "1.0.1",
             "gitBranch": "main",
@@ -126,7 +126,7 @@
             "deploymentTimestamp": 1772037951269,
             "deployed": true
         },
-        "ParanetKnowledgeMinersRegistry": {
+        "ContextGraphKnowledgeMinersRegistry": {
             "evmAddress": "0x1b5a8BA4C999e34d231c6B0387A93Fc136e7cB7a",
             "version": "1.0.0",
             "gitBranch": "main",
@@ -234,7 +234,7 @@
             "deploymentTimestamp": 1777296454991,
             "deployed": true
         },
-        "ParanetStagingRegistry": {
+        "ContextGraphStagingRegistry": {
             "evmAddress": "0x3aE7e4dD7c5CB03c3E92f36888281D4478C19bb3",
             "version": "1.0.0",
             "gitBranch": "main",
@@ -243,7 +243,7 @@
             "deploymentTimestamp": 1772037997250,
             "deployed": true
         },
-        "Paranet": {
+        "ContextGraph": {
             "evmAddress": "0x275edeFc18EDD20f32224CfBb1758866274528ED",
             "version": "1.0.0",
             "gitBranch": "main",
@@ -252,7 +252,7 @@
             "deploymentTimestamp": 1772038001158,
             "deployed": true
         },
-        "ParanetIncentivesPoolFactoryHelper": {
+        "ContextGraphIncentivesPoolFactoryHelper": {
             "evmAddress": "0x05F3804c56308C44a304B4ed13118A4f50761BA5",
             "version": "1.0.0",
             "gitBranch": "main",
@@ -261,7 +261,7 @@
             "deploymentTimestamp": 1772038006768,
             "deployed": true
         },
-        "ParanetIncentivesPoolFactory": {
+        "ContextGraphIncentivesPoolFactory": {
             "evmAddress": "0x8C9903Af920C175837DA8B22190d482d70181890",
             "version": "1.0.0",
             "gitBranch": "main",

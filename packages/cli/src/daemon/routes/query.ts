@@ -363,13 +363,13 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
   } = ctx;
 
 
-  // POST /api/query  { sparql: "...", paranetId?: "...", graphSuffix?: "_shared_memory", includeWorkspace?: bool }
+  // POST /api/query  { sparql: "...", contextGraphId?: "...", graphSuffix?: "_shared_memory", includeWorkspace?: bool }
   if (req.method === "POST" && path === "/api/query") {
     const serverT0 = Date.now();
     const body = await readBody(req);
     const parsed = JSON.parse(body);
     const sparql = parsed.sparql;
-    const contextGraphId = parsed.contextGraphId ?? parsed.paranetId;
+    const contextGraphId = parsed.contextGraphId;
     const graphSuffix = parsed.graphSuffix;
     const includeSharedMemory =
       parsed.includeSharedMemory ?? parsed.includeWorkspace;
@@ -794,13 +794,13 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     return;
   }
 
-  // POST /api/query-remote  { peerId, lookupType, paranetId?, ual?, entityUri?, rdfType?, sparql?, limit?, timeout? }
+  // POST /api/query-remote  { peerId, lookupType, contextGraphId?, ual?, entityUri?, rdfType?, sparql?, limit?, timeout? }
   if (req.method === "POST" && path === "/api/query-remote") {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const {
       peerId: rawPeerId,
       lookupType,
-      paranetId,
+      contextGraphId,
       ual,
       entityUri,
       rdfType,
@@ -814,7 +814,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 400, { error: 'Missing "lookupType"' });
     const ctx = createOperationContext("query");
     tracker.start(ctx, {
-      contextGraphId: paranetId,
+      contextGraphId: contextGraphId,
       details: { lookupType, remotePeer: rawPeerId, source: "api-remote" },
     });
     try {
@@ -830,7 +830,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       const response = await tracker.trackPhase(ctx, "execute", () =>
         agent.queryRemote(peerId, {
           lookupType,
-          paranetId,
+          contextGraphId,
           ual,
           entityUri,
           rdfType,
@@ -863,22 +863,22 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
-  // GET /api/sync/catchup-status?contextGraphId=<id> | ?paranetId=<id> | ?jobId=<id>
+  // GET /api/sync/catchup-status?contextGraphId=<id> | ?contextGraphId=<id> | ?jobId=<id>
   if (req.method === "GET" && path === "/api/sync/catchup-status") {
-    const paranetId =
+    const contextGraphId =
       url.searchParams.get("contextGraphId") ??
-      url.searchParams.get("paranetId");
+      url.searchParams.get("contextGraphId");
     const jobIdParam = url.searchParams.get("jobId");
-    if (!paranetId && !jobIdParam) {
+    if (!contextGraphId && !jobIdParam) {
       return jsonResponse(res, 400, {
         error:
-          'Missing "contextGraphId" (or "paranetId") or "jobId" query param',
+          'Missing "contextGraphId" or "jobId" query param',
       });
     }
 
     const jobId =
       jobIdParam ??
-      (paranetId ? catchupTracker.latestByParanet.get(paranetId) : undefined);
+      (contextGraphId ? catchupTracker.latestByContextGraph.get(contextGraphId) : undefined);
     if (!jobId) {
       return jsonResponse(res, 404, { error: "No catch-up job found" });
     }
@@ -1017,7 +1017,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
   if (req.method === "POST" && path === "/api/ccl/policy/publish") {
     const body = await readBody(req, SMALL_BODY_BYTES * 4);
     const {
-      paranetId,
+      contextGraphId,
       name,
       version,
       content,
@@ -1026,13 +1026,13 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       language,
       format,
     } = JSON.parse(body);
-    if (!paranetId || !name || !version || !content) {
+    if (!contextGraphId || !name || !version || !content) {
       return jsonResponse(res, 400, {
-        error: "Missing required fields: paranetId, name, version, content",
+        error: "Missing required fields: contextGraphId, name, version, content",
       });
     }
     const result = await agent.publishCclPolicy({
-      paranetId,
+      contextGraphId,
       name,
       version,
       content,
@@ -1047,15 +1047,15 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
   // POST /api/ccl/policy/approve
   if (req.method === "POST" && path === "/api/ccl/policy/approve") {
     const body = await readBody(req, SMALL_BODY_BYTES);
-    const { paranetId, policyUri, contextType } = JSON.parse(body);
-    if (!paranetId || !policyUri) {
+    const { contextGraphId, policyUri, contextType } = JSON.parse(body);
+    if (!contextGraphId || !policyUri) {
       return jsonResponse(res, 400, {
-        error: "Missing required fields: paranetId, policyUri",
+        error: "Missing required fields: contextGraphId, policyUri",
       });
     }
     try {
       const result = await agent.approveCclPolicy({
-        paranetId,
+        contextGraphId,
         policyUri,
         contextType,
         callerAgentAddress: requestAgentAddress,
@@ -1063,7 +1063,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 200, result);
     } catch (err: any) {
       const msg = err?.message ?? "";
-      if (/Only the paranet owner can manage policies/.test(msg)) {
+      if (/Only the contextGraph owner can manage policies/.test(msg)) {
         return jsonResponse(res, 403, { error: msg });
       }
       throw err;
@@ -1073,15 +1073,15 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
   // POST /api/ccl/policy/revoke
   if (req.method === "POST" && path === "/api/ccl/policy/revoke") {
     const body = await readBody(req, SMALL_BODY_BYTES);
-    const { paranetId, policyUri, contextType } = JSON.parse(body);
-    if (!paranetId || !policyUri) {
+    const { contextGraphId, policyUri, contextType } = JSON.parse(body);
+    if (!contextGraphId || !policyUri) {
       return jsonResponse(res, 400, {
-        error: "Missing required fields: paranetId, policyUri",
+        error: "Missing required fields: contextGraphId, policyUri",
       });
     }
     try {
       const result = await agent.revokeCclPolicy({
-        paranetId,
+        contextGraphId,
         policyUri,
         contextType,
         callerAgentAddress: requestAgentAddress,
@@ -1089,7 +1089,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 200, result);
     } catch (err: any) {
       const msg = err?.message ?? "";
-      if (/Only the paranet owner can manage policies/.test(msg)) {
+      if (/Only the contextGraph owner can manage policies/.test(msg)) {
         return jsonResponse(res, 403, { error: msg });
       }
       throw err;
@@ -1099,7 +1099,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
   // GET /api/ccl/policy/list
   if (req.method === "GET" && path === "/api/ccl/policy/list") {
     const policies = await agent.listCclPolicies({
-      paranetId: url.searchParams.get("paranetId") ?? undefined,
+      contextGraphId: url.searchParams.get("contextGraphId") ?? undefined,
       name: url.searchParams.get("name") ?? undefined,
       contextType: url.searchParams.get("contextType") ?? undefined,
       status: url.searchParams.get("status") ?? undefined,
@@ -1108,17 +1108,17 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     return jsonResponse(res, 200, { policies });
   }
 
-  // GET /api/ccl/policy/resolve?paranetId=&name=&contextType=
+  // GET /api/ccl/policy/resolve?contextGraphId=&name=&contextType=
   if (req.method === "GET" && path === "/api/ccl/policy/resolve") {
-    const paranetId = url.searchParams.get("paranetId");
+    const contextGraphId = url.searchParams.get("contextGraphId");
     const name = url.searchParams.get("name");
-    if (!paranetId || !name) {
+    if (!contextGraphId || !name) {
       return jsonResponse(res, 400, {
-        error: "Missing required query params: paranetId, name",
+        error: "Missing required query params: contextGraphId, name",
       });
     }
     const policy = await agent.resolveCclPolicy({
-      paranetId,
+      contextGraphId,
       name,
       contextType: url.searchParams.get("contextType") ?? undefined,
       includeBody: url.searchParams.get("includeBody") === "true",
@@ -1130,7 +1130,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
   if (req.method === "POST" && path === "/api/ccl/eval") {
     const body = await readBody(req, SMALL_BODY_BYTES * 8);
     const {
-      paranetId,
+      contextGraphId,
       name,
       facts,
       contextType,
@@ -1139,9 +1139,9 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       scopeUal,
       publishResult,
     } = JSON.parse(body);
-    if (!paranetId || !name) {
+    if (!contextGraphId || !name) {
       return jsonResponse(res, 400, {
-        error: "Missing required fields: paranetId, name",
+        error: "Missing required fields: contextGraphId, name",
       });
     }
     if (facts != null && !Array.isArray(facts)) {
@@ -1151,7 +1151,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     }
     const result = publishResult
       ? await agent.evaluateAndPublishCclPolicy({
-          paranetId,
+          contextGraphId,
           name,
           facts,
           contextType,
@@ -1160,7 +1160,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
           scopeUal,
         })
       : await agent.evaluateCclPolicy({
-          paranetId,
+          contextGraphId,
           name,
           facts,
           contextType,
@@ -1171,16 +1171,16 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     return jsonResponse(res, 200, result);
   }
 
-  // GET /api/ccl/results?paranetId=&...
+  // GET /api/ccl/results?contextGraphId=&...
   if (req.method === "GET" && path === "/api/ccl/results") {
-    const paranetId = url.searchParams.get("paranetId");
-    if (!paranetId) {
+    const contextGraphId = url.searchParams.get("contextGraphId");
+    if (!contextGraphId) {
       return jsonResponse(res, 400, {
-        error: "Missing required query param: paranetId",
+        error: "Missing required query param: contextGraphId",
       });
     }
     const evaluations = await agent.listCclEvaluations({
-      paranetId,
+      contextGraphId,
       policyUri: url.searchParams.get("policyUri") ?? undefined,
       snapshotId: url.searchParams.get("snapshotId") ?? undefined,
       view: url.searchParams.get("view") ?? undefined,

@@ -981,8 +981,8 @@ cmd_start() {
 
   # Register context graphs on-chain by going through node 1's public API.
   #
-  # History: this block used to call `ParanetV9Registry.createParanetV9(...)`
-  # directly from the deployer account. That is the legacy V9 paranet
+  # History: this block used to call `ContextGraphV9Registry.createContextGraphV9(...)`
+  # directly from the deployer account. That is the legacy V9 contextGraph
   # registry — V10 publish paths consult `ContextGraphs` + `ContextGraphStorage`
   # and surface the resulting uint256 id as `v10Id` in the API. Registering
   # on the V9 contract left nodes with no V10 record to look up, so every
@@ -1007,7 +1007,7 @@ cmd_start() {
   # Register two context graphs so the devnet preserves the cross-CG isolation
   # smoke path (each CG has its own subgraph + on-chain id; nodes must keep them
   # independent). A single graph would hide regressions that only surface when
-  # traffic fans out across multiple paranets.
+  # traffic fans out across multiple contextGraphs.
   for cg in devnet-test devnet-isolation; do
     local on_chain_id=""
     local attempt
@@ -1068,7 +1068,7 @@ cmd_start() {
     fi
 
     # The on-chain id propagates to other nodes via ONTOLOGY gossip
-    # (`registerContextGraph` writes the `dkg:paranetOnChainId` triple +
+    # (`registerContextGraph` writes the `dkg:contextGraphOnChainId` triple +
     # immediately broadcasts it). Wait until every node's local view
     # surfaces the same id before declaring the devnet ready — without
     # this wait, the next VM publish on node 2+ races the gossip and

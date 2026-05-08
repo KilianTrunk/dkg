@@ -690,7 +690,7 @@ describe('DkgDaemonClient', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Paranets
+  // ContextGraphs
   // ---------------------------------------------------------------------------
 
   it('listContextGraphs should GET /api/context-graph/list', async () => {
@@ -779,20 +779,20 @@ describe('DkgDaemonClient', () => {
   it('subscribe should POST to /api/subscribe', async () => {
     fetchResponses.push(
       new Response(JSON.stringify({
-        subscribed: 'my-paranet',
+        subscribed: 'my-contextGraph',
         catchup: { jobId: 'job-1', status: 'queued', includeSharedMemory: true },
       }), { status: 200 }),
     );
 
-    const result = await client.subscribe('my-paranet');
-    expect(result.subscribed).toBe('my-paranet');
+    const result = await client.subscribe('my-contextGraph');
+    expect(result.subscribed).toBe('my-contextGraph');
     expect(result.catchup.jobId).toBe('job-1');
 
     const [url, opts] = fetchCalls[0];
     expect(url).toBe('http://localhost:9200/api/subscribe');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
-    expect(body.contextGraphId).toBe('my-paranet');
+    expect(body.contextGraphId).toBe('my-contextGraph');
   });
 
   it('subscribe passes includeSharedMemory option', async () => {

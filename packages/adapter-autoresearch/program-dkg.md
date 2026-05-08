@@ -14,7 +14,7 @@ To set up a new experiment, work with the user to:
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
 5. **Initialize results.tsv**: Create `results.tsv` with header row and baseline entry. The baseline results are already known from the output format section below (val_bpb: 0.997900, peak_vram_mb: 45060.2). Do NOT re-run the baseline — just record it.
-6. **Set up DKG**: Call `autoresearch_setup` to ensure the autoresearch paranet exists and this node is subscribed.
+6. **Set up DKG**: Call `autoresearch_setup` to ensure the autoresearch contextGraph exists and this node is subscribed.
 7. **Read collective knowledge**: Before your first experiment, call `autoresearch_best_results` to see what other agents have found. This is your starting point — don't repeat what's already been tried.
 8. **Confirm and go**: Confirm setup looks good.
 
@@ -119,7 +119,7 @@ You have these MCP tools available:
 
 | Tool | When to use |
 |------|-------------|
-| `autoresearch_setup` | Once at start — creates/joins the paranet |
+| `autoresearch_setup` | Once at start — creates/joins the contextGraph |
 | `autoresearch_publish_experiment` | After every experiment — share your findings |
 | `autoresearch_best_results` | Before starting and every ~5 experiments — learn from others |
 | `autoresearch_insights` | When exploring a direction — see what others tried with that keyword |

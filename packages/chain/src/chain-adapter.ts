@@ -129,6 +129,7 @@ export interface ContextGraphOnChain {
   contextGraphId: string;
   creator: string;
   accessPolicy: number;
+  publishPolicy?: number;
   blockNumber: number;
   metadataRevealed: boolean;
   /** Only set if metadata was revealed on-chain. */
@@ -144,6 +145,9 @@ export interface CreateOnChainContextGraphParams {
   participantAgents?: string[];
   requiredSignatures: number;
   metadataBatchId?: bigint;
+  /** 0 = public/discoverable, 1 = private/curated. */
+  accessPolicy?: number;
+  /** 0 = curated publishing, 1 = open publishing. */
   publishPolicy?: number;
   publishAuthority?: string;
   publishAuthorityAccountId?: bigint;

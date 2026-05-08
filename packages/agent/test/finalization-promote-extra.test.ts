@@ -43,7 +43,7 @@ import {
 } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 
-const PARANET = `a4-finalize-${ethers.hexlify(ethers.randomBytes(4)).slice(2)}`;
+const CONTEXT_GRAPH = `a4-finalize-${ethers.hexlify(ethers.randomBytes(4)).slice(2)}`;
 
 let _fileSnapshot: string;
 let nodeA: DKGAgent | undefined;
@@ -77,7 +77,7 @@ describe('A-4: promoteSharedMemoryToCanonical lands data in the CANONICAL data g
     const handler = new FinalizationHandler(store, undefined);
     const entity = 'urn:a4:alice';
     const publisher = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
-    const dataGraph = `did:dkg:context-graph:${PARANET}`;
+    const dataGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
 
     // Seed workspace memory that would be promoted. Not strictly required
     // since the promote method takes quads as an argument, but mirrors
@@ -87,7 +87,7 @@ describe('A-4: promoteSharedMemoryToCanonical lands data in the CANONICAL data g
     ];
 
     await (handler as any).promoteSharedMemoryToCanonical(
-      PARANET,
+      CONTEXT_GRAPH,
       quads,
       'did:dkg:evm:31337/0xA4/1',
       [entity],

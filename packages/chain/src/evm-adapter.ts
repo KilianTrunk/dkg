@@ -1295,6 +1295,32 @@ export class EVMChainAdapter implements ChainAdapter {
           }
         }
       }
+
+      if (eventType === 'ContextGraphCreated') {
+        const cgStorage = this.contracts.contextGraphStorage;
+        if (cgStorage) {
+          const eventFilter = cgStorage.filters.ContextGraphCreated();
+          const logs = await cgStorage.queryFilter(eventFilter, filter.fromBlock ?? 0, filter.toBlock);
+          for (const log of logs) {
+            const parsed = cgStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
+            if (parsed) {
+              yield {
+                type: 'ContextGraphCreated',
+                blockNumber: log.blockNumber,
+                data: {
+                  contextGraphId: parsed.args.contextGraphId?.toString() ?? '',
+                  creator: parsed.args.owner?.toString() ?? '',
+                  owner: parsed.args.owner?.toString() ?? '',
+                  requiredSignatures: Number(parsed.args.requiredSignatures ?? 0),
+                  accessPolicy: Number(parsed.args.accessPolicy ?? 0),
+                  publishPolicy: Number(parsed.args.publishPolicy ?? 0),
+                  txHash: log.transactionHash,
+                },
+              };
+            }
+          }
+        }
+      }
     }
   }
 
@@ -1428,6 +1454,7 @@ export class EVMChainAdapter implements ChainAdapter {
       params.participantAgents ?? [],
       params.requiredSignatures,
       params.metadataBatchId ?? 0n,
+      params.accessPolicy ?? 0,
       params.publishPolicy ?? 1,
       params.publishAuthority ?? ethers.ZeroAddress,
       params.publishAuthorityAccountId ?? 0n,

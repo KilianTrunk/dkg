@@ -263,6 +263,7 @@ describe('@unit KnowledgeAssetsV10', () => {
       [], // participant agents
       2, // requiredSignatures
       0, // metadataBatchId
+      0, // accessPolicy = public/discoverable
       1, // publishPolicy = open
       ethers.ZeroAddress,
       0, // publishAuthorityAccountId
@@ -283,7 +284,8 @@ describe('@unit KnowledgeAssetsV10', () => {
       [],
       2,
       0,
-      0, // curated
+      0, // accessPolicy = public/discoverable
+      0, // publishPolicy = curated
       authority,
       accountId,
     );
@@ -1752,7 +1754,8 @@ describe('@unit KnowledgeAssetsV10', () => {
           [],
           2,
           0,
-          0, // curated
+          0, // accessPolicy = public/discoverable
+          0, // publishPolicy = curated
           nftOwner.address,
           pcaAccountId,
         );

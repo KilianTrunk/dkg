@@ -719,7 +719,7 @@ export class DKGPublisher implements Publisher {
     }));
 
     const message = encodeWorkspacePublishRequest({
-      paranetId: contextGraphId,
+      contextGraphId: contextGraphId,
       nquads: new TextEncoder().encode(nquadsStr),
       manifest: manifestEntries.map((m) => ({
         rootEntity: m.rootEntity,
@@ -931,7 +931,7 @@ export class DKGPublisher implements Publisher {
         // CGs have this but may not have _meta.registrationStatus synced yet.
         const ontologyGraph = contextGraphDataUri('ontology');
         const onChainResult = await this.store.query(
-          `SELECT ?id WHERE { GRAPH <${ontologyGraph}> { <${cgDataUri}> <https://dkg.network/ontology#ParanetOnChainId> ?id } } LIMIT 1`,
+          `SELECT ?id WHERE { GRAPH <${ontologyGraph}> { <${cgDataUri}> <https://dkg.network/ontology#ContextGraphOnChainId> ?id } } LIMIT 1`,
         );
         const hasOnChainId = onChainResult.type === 'bindings' && onChainResult.bindings.length > 0;
 
@@ -1509,7 +1509,7 @@ export class DKGPublisher implements Publisher {
     // digests, or on-chain tx construction, so the caller sees the real
     // error instead of watching it decay through a swallowed ACK warning
     // into a misleading `tentative` status. Descriptive SWM graph names
-    // (e.g. `"devnet-test"`, `"test-paranet"`) MUST still fall through to
+    // (e.g. `"devnet-test"`, `"test-contextGraph"`) MUST still fall through to
     // the soft `v10CgId = 0n` coercion below — mock adapter tests and
     // integration fixtures publish with those names and rely on the
     // data-flow path continuing to exercise. So we only fail loud when
@@ -2692,7 +2692,7 @@ export class DKGPublisher implements Publisher {
         privateTripleCount: 0,
       }));
       const encoded = encodeWorkspacePublishRequest({
-        paranetId: contextGraphId,
+        contextGraphId: contextGraphId,
         nquads: new TextEncoder().encode(nquadsStr),
         manifest: manifestEntries,
         publisherPeerId: opts.publisherPeerId,

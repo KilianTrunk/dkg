@@ -653,15 +653,15 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     return jsonResponse(res, 200, { connected: true });
   }
 
-  // POST /api/update  { kcId: "...", contextGraphId|paranetId: "...", quads: [...], privateQuads?: [...] }
+  // POST /api/update  { kcId: "...", contextGraphId: "...", quads: [...], privateQuads?: [...] }
   if (req.method === "POST" && path === "/api/update") {
     const body = await readBody(req);
     const parsed = JSON.parse(body);
     const { kcId, quads, privateQuads } = parsed;
-    const paranetId = parsed.contextGraphId ?? parsed.paranetId;
-    if (!kcId || !paranetId || !quads?.length) {
+    const contextGraphId = parsed.contextGraphId;
+    if (!kcId || !contextGraphId || !quads?.length) {
       return jsonResponse(res, 400, {
-        error: 'Missing "kcId", "contextGraphId" (or "paranetId"), or "quads"',
+        error: 'Missing "kcId", "contextGraphId", or "quads"',
       });
     }
     let kcIdBigInt: bigint;
@@ -674,13 +674,13 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     }
     const ctx = createOperationContext("update");
     tracker.start(ctx, {
-      contextGraphId: paranetId,
+      contextGraphId: contextGraphId,
       details: { kcId: String(kcId), tripleCount: quads.length, source: "api" },
     });
     try {
       const result = await agent.update(
         kcIdBigInt,
-        paranetId,
+        contextGraphId,
         quads,
         privateQuads,
         {

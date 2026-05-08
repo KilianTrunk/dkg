@@ -1565,7 +1565,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       });
     const contextGraphId =
       url.searchParams.get("contextGraphId") ??
-      url.searchParams.get("paranetId");
+      url.searchParams.get("contextGraphId");
     if (!validateRequiredContextGraphId(contextGraphId, res)) return;
     const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;

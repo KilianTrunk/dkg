@@ -1,4 +1,4 @@
-import { createOperationContext, PROTOCOL_STORAGE_ACK, PROTOCOL_SYNC, SYSTEM_PARANETS, type OperationContext } from '@origintrail-official/dkg-core';
+import { createOperationContext, PROTOCOL_STORAGE_ACK, PROTOCOL_SYNC, SYSTEM_CONTEXT_GRAPHS, type OperationContext } from '@origintrail-official/dkg-core';
 
 interface SyncOnConnectContext {
   remotePeer: string;
@@ -54,8 +54,8 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<v
     logInfo(ctx, `Synced ${synced} data triples from peer ${shortPeer}`);
 
     const syncScope = new Set<string>([
-      SYSTEM_PARANETS.AGENTS,
-      SYSTEM_PARANETS.ONTOLOGY,
+      SYSTEM_CONTEXT_GRAPHS.AGENTS,
+      SYSTEM_CONTEXT_GRAPHS.ONTOLOGY,
       ...(getSyncContextGraphs() ?? []),
     ]);
     await refreshMetaSyncedFlags(syncScope);

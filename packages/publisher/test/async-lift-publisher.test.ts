@@ -45,7 +45,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
   let now = 1_000;
   let ids = 0;
   let store: OxigraphStore;
-  let PARANET: string;
+  let CONTEXT_GRAPH: string;
   let _fileSnapshot: string;
 
   beforeAll(async () => {
@@ -55,7 +55,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
     const cgId = await createTestContextGraph();
-    PARANET = cgId.toString();
+    CONTEXT_GRAPH = cgId.toString();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -120,7 +120,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
       .slice(0, 6)
       .map((byte) => byte.toString(16).padStart(2, '0'))
       .join('');
-    return `dkg:${PARANET}:aloha:person-profile/rihana-${suffix}`;
+    return `dkg:${CONTEXT_GRAPH}:aloha:person-profile/rihana-${suffix}`;
   }
 
   it('creates accepted jobs and returns status', async () => {
@@ -778,7 +778,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     const graphManager = new GraphManager(store);
 
     const result = await dkgPublisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [
         { subject: canonicalRoot('urn:local:/rihana'), predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
       ],
@@ -788,7 +788,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(result.status).toBe('confirmed');
 
     const metadata = await store.query(`SELECT ?p ?o WHERE {
-      GRAPH <${graphManager.metaGraphUri(PARANET)}> {
+      GRAPH <${graphManager.metaGraphUri(CONTEXT_GRAPH)}> {
         <${result.ual}> ?p ?o .
       }
     }`);
@@ -836,21 +836,21 @@ describe('TripleStoreAsyncLiftPublisher', () => {
 
     const canonical = canonicalRoot('urn:local:/rihana');
     await dkgPublisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [
         { subject: canonical, predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
       ],
       publisherPeerId: 'peer-1',
     });
 
-    const write = await dkgPublisher.share(PARANET, [
+    const write = await dkgPublisher.share(CONTEXT_GRAPH, [
       { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
       { subject: 'urn:local:/rihana', predicate: 'http://schema.org/genre', object: '"Pop"', graph: '' },
     ], { publisherPeerId: 'peer-1' });
 
     await publisher.lift({
       ...request(),
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       shareOperationId: write.shareOperationId,
     });
 
@@ -879,20 +879,20 @@ describe('TripleStoreAsyncLiftPublisher', () => {
 
     const canonical = canonicalRoot('urn:local:/rihana');
     await dkgPublisher.publish({
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       quads: [
         { subject: canonical, predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
       ],
       publisherPeerId: 'peer-1',
     });
 
-    const write = await dkgPublisher.share(PARANET, [
+    const write = await dkgPublisher.share(CONTEXT_GRAPH, [
       { subject: 'urn:local:/rihana', predicate: 'http://schema.org/name', object: '"Rihana"', graph: '' },
     ], { publisherPeerId: 'peer-1' });
 
     await publisher.lift({
       ...request(),
-      contextGraphId: PARANET,
+      contextGraphId: CONTEXT_GRAPH,
       shareOperationId: write.shareOperationId,
     });
 

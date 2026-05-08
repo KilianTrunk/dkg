@@ -284,7 +284,14 @@ describe.sequential('dkg epcis subcommands', { timeout: 240_000 }, () => {
         env(),
       );
       expect(result.exitCode).toBe(1);
-      expect(result.stderr).toContain('--allowed-peer requires --access-policy allowList');
+      // CLI flags are merged into publishOptions before validation runs
+      // (cli.ts:2841 unified envelope-validator), so the failure surfaces in
+      // envelope-field terms even when the input came from CLI flags only.
+      // See commit 8e5071dd ("validate merged publishOptions from envelope +
+      // CLI flags") — the dedicated CLI-flag check was consolidated into the
+      // single validator, so both this test and the envelope-file test below
+      // assert the same message but exercise different input shapes.
+      expect(result.stderr).toContain('publishOptions.allowedPeers requires accessPolicy "allowList"');
     });
 
     it('rejects CLI --access-policy ownerOnly when envelope file carries allowedPeers (exit 1)', async () => {

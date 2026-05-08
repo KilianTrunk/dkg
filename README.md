@@ -117,7 +117,7 @@ The full adapter reference — daemon URL config, channel-port overrides, discon
 
 ### Model Context Protocol (MCP)
 
-Two commands wire DKG V10 into MCP-aware clients (Cursor, Claude Code, Claude Desktop, Windsurf, VSCode + GitHub Copilot Chat, Cline):
+Two commands wire DKG V10 into MCP-aware clients (Cursor, Claude Code, Claude Desktop, Windsurf, VSCode + GitHub Copilot Chat, Cline, Codex CLI):
 
 ```bash
 npm install -g @origintrail-official/dkg
@@ -227,7 +227,7 @@ dkg auth status                          # show whether auth is enabled
 # Framework adapters & MCP wiring
 dkg openclaw setup                       # install & configure the OpenClaw adapter
 dkg hermes setup                         # install & configure the Hermes adapter
-dkg mcp setup                            # register the MCP server with Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline
+dkg mcp setup                            # register the MCP server with Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline / Codex CLI
 dkg mcp serve                            # run the MCP server on stdio (invoked by the client; not run manually)
 
 # Community integrations (registry: OriginTrail/dkg-integrations)
@@ -300,7 +300,7 @@ analysis reports are under `bench/results/profiles/`, including
 
 | Guide | Use it when |
 |---|---|
-| [MCP Setup](docs/setup/SETUP_MCP.md) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline to use DKG as memory |
+| [MCP Setup](docs/setup/SETUP_MCP.md) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline / Codex CLI to use DKG as memory |
 | [Join the Testnet](docs/setup/JOIN_TESTNET.md) | You want a full node setup and first publish/query flow |
 | [OpenClaw Setup](docs/setup/SETUP_OPENCLAW.md) | You want OpenClaw to use DKG as memory/tools |
 | [Hermes Setup](docs/setup/SETUP_HERMES.md) | You want Hermes Agent to use DKG as memory/tools |

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir, platform } from 'node:os';
 import { join } from 'node:path';
+import TOML from '@iarna/toml';
 import { mcpSetupAction, type McpSetupActionDeps } from '../src/mcp-setup.js';
 
 /**
@@ -2870,6 +2871,39 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     }
   });
 
+  it('issue #443 local review: WSL Windows-side probing skips Codex until a Windows-compatible command wrapper exists', async () => {
+    // The Windows-side GUI clients can be registered from WSL because
+    // they run Windows apps reading Windows config files, but Codex CLI
+    // would later spawn whatever command we persist. From WSL, the
+    // canonical command/args are Linux paths, so writing them into
+    // %USERPROFILE%\.codex\config.toml would break Windows Codex.
+    if (platform() !== 'linux') return;
+    saveWslEnv();
+    process.env.WSL_DISTRO_NAME = 'TestDistro';
+    try {
+      const winUserProfile = join(tmpHome, 'win-user');
+      const winAppData = join(tmpHome, 'win-appdata', 'Roaming');
+      mkdirSync(join(winUserProfile, '.cursor'), { recursive: true });
+      mkdirSync(join(winUserProfile, '.codex'), { recursive: true });
+
+      const { detectClients } = await import('../src/mcp-setup.js');
+      const detected = detectClients((envVarName) => {
+        if (envVarName === 'USERPROFILE') return winUserProfile;
+        if (envVarName === 'APPDATA') return winAppData;
+        return null;
+      });
+
+      expect(
+        detected.some((c) => c.name === 'Cursor (Windows-side via WSL)'),
+      ).toBe(true);
+      expect(
+        detected.some((c) => c.name === 'Codex CLI (Windows-side via WSL)'),
+      ).toBe(false);
+    } finally {
+      restoreWslEnv();
+    }
+  });
+
   // ── Codex Round-19 Fix 26: writeRegistration merges full entry ──
 
   it('Codex Round-19 Fix 26: refresh preserves top-level user keys (cwd) AND env keys; updates command/args/env.DKG_HOME', async () => {
@@ -3002,4 +3036,388 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // pre-fix string).
     expect(logged).not.toMatch(/Would write ~\/\.dkg\/config\.json/);
   });
+
+  // ── Issue #437: Codex CLI (TOML) auto-detect ─────────────────────────
+
+  it('issue #437: Codex CLI is detected at ~/.codex/config.toml; gets canonical entry written under [mcp_servers.dkg]', async () => {
+    // Pre-create the parent dir so detection fires (parent-dir
+    // existence is the universal detection signal).
+    const codexPath = join(tmpHome, '.codex', 'config.toml');
+    mkdirSync(join(codexPath, '..'), { recursive: true });
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    expect(existsSync(codexPath)).toBe(true);
+    const rawContent = readFileSync(codexPath, 'utf-8');
+    const written = TOML.parse(rawContent);
+    // Codex CLI's canonical key is `mcp_servers.<name>` (snake-case),
+    // not the JSON-world `mcpServers.<name>`. entryPath dispatch
+    // routes the entry to the right table.
+    expect((written as any).mcp_servers?.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    // And the canonical JSON-world key MUST NOT appear in TOML output
+    // — that would mean entryPath fell through to default.
+    expect((written as any).mcpServers).toBeUndefined();
+
+    // PR #443 round-4 Codex Review: parsing-and-comparing the
+    // round-tripped object alone passes even if the serializer
+    // emits an inline-table form (e.g. `mcp_servers.dkg = { command
+    // = "...", ... }`) instead of the section-header form Codex
+    // CLI's loader expects (`[mcp_servers.dkg]\ncommand = "..."`).
+    // Pin the on-disk syntax with raw-text assertions so a future
+    // `@iarna/toml` major bump or library swap that changes default
+    // emission style trips this test.
+    //
+    // 1. The section header MUST appear at the start of a line —
+    //    this rules out inline-table form, which would put the key
+    //    inline as `mcp_servers.dkg = { ... }`.
+    expect(rawContent).toMatch(/^\[mcp_servers\.dkg\]/m);
+    // 2. The body fields MUST follow as bare assignments, not as
+    //    inline-table contents. Section-body form: `command = "..."`
+    //    on its own line. The DOTALL flag is intentional — `args`
+    //    may wrap across lines for long arrays.
+    expect(rawContent).toMatch(/^\[mcp_servers\.dkg\][\s\S]*?^command\s*=\s*"/m);
+    expect(rawContent).toMatch(/^\[mcp_servers\.dkg\][\s\S]*?^args\s*=\s*\[/m);
+    // 3. Negative: the inline-table form is explicitly NOT emitted.
+    //    `mcp_servers.dkg = {` would be the smoking gun for a
+    //    serializer regression to inline tables.
+    expect(rawContent).not.toMatch(/^mcp_servers\.dkg\s*=\s*\{/m);
+  });
+
+  it('issue #437: Codex CLI FIX 26 — refresh preserves user-added top-level keys (cwd) AND env keys', async () => {
+    // Mirror the Cursor FIX 26 test for the TOML format. Pin the
+    // contract: `command`, `args`, `env.DKG_HOME` are the ONLY
+    // fields this command owns; everything else passes through
+    // unchanged across formats.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    writeFileSync(
+      codexPath,
+      [
+        '# user-managed Codex settings stay outside the owned table',
+        '[mcp_servers.dkg]',
+        'command = "/old/legacy/dkg"',
+        'args = [ "legacy-arg" ]',
+        'cwd = "/workspaces/my-project"',
+        '',
+        '[mcp_servers.dkg.env]',
+        'DKG_HOME = "/old/abandoned/path"',
+        'NODE_OPTIONS = "--inspect"',
+        'HTTPS_PROXY = "http://corp:8080"',
+        '',
+        '# sibling server comment must survive the dkg refresh',
+        '[mcp_servers.github-mcp]',
+        'command = "gh-mcp"',
+        'args = [ "serve" ]',
+        '',
+      ].join('\n'),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const afterRaw = readFileSync(codexPath, 'utf-8');
+    const after = TOML.parse(afterRaw) as any;
+    // Fields this command owns: refreshed.
+    expect(after.mcp_servers.dkg.command).toBe(process.execPath);
+    expect(after.mcp_servers.dkg.args[0]).toBe(realpathSync(process.argv[1]));
+    expect(after.mcp_servers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
+    expect(after.mcp_servers.dkg.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    // User-added top-level key + user-added env keys: PRESERVED.
+    expect(after.mcp_servers.dkg.cwd).toBe('/workspaces/my-project');
+    expect(after.mcp_servers.dkg.env.NODE_OPTIONS).toBe('--inspect');
+    expect(after.mcp_servers.dkg.env.HTTPS_PROXY).toBe('http://corp:8080');
+    // Unrelated TOML text outside the owned dkg table is not round-tripped.
+    expect(afterRaw).toContain('# user-managed Codex settings stay outside the owned table');
+    expect(afterRaw).toContain('# sibling server comment must survive the dkg refresh');
+    expect(afterRaw).toContain('[mcp_servers.github-mcp]');
+    expect(after.mcp_servers['github-mcp']).toEqual({ command: 'gh-mcp', args: ['serve'] });
+    expect(afterRaw).not.toContain('/old/legacy/dkg');
+  });
+
+  it('issue #437: Codex CLI sibling [mcp_servers.<other>] tables preserved on merge', async () => {
+    // Real-world Codex CLI users often have other MCP servers
+    // already registered. The setup must merge — write `dkg`
+    // alongside without clobbering siblings, just like the
+    // canonical-JSON-shape clients do.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    writeFileSync(
+      codexPath,
+      TOML.stringify({
+        mcp_servers: {
+          'github-mcp': { command: 'gh-mcp', args: ['serve'] },
+        },
+      } as TOML.JsonMap),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const after = TOML.parse(readFileSync(codexPath, 'utf-8')) as any;
+    expect(after.mcp_servers['github-mcp']).toEqual({ command: 'gh-mcp', args: ['serve'] });
+    expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
+  it('issue #437 (Codex round-5): malformed ~/.codex/config.toml surfaces a friendly path + recovery message, not a raw library parse error', async () => {
+    // Codex Review round-5 (PR #443) flagged that the TOML branch
+    // bubbled `@iarna/toml`'s raw parse error, while the JSON branch
+    // wraps with a friendly "<path> is not valid JSON. Move it aside
+    // and re-run." recovery message. Mirror the JSON wrapping.
+    //
+    // Test mirrors the JSON malformed-file pattern: pre-populate the
+    // file with broken syntax, run setup, assert the per-client
+    // failure stderr warning contains the wrapped error text (path
+    // is named, recovery procedure is stated).
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    // Broken TOML: unbalanced bracket. `@iarna/toml` will reject
+    // this with a raw parse error (line/col info but no path, no
+    // recovery guidance).
+    writeFileSync(codexPath, '[mcp_servers.dkg\ncommand = "broken"');
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const deps = makeDeps();
+
+    // Codex CLI is detectable AND malformed → classify throws →
+    // marked failed. Claude Code's parent dir (tmpHome) is always
+    // present so it auto-detects and registers cleanly. Aggregate-
+    // failure throw fires with a "1 failed; <n> succeeded" body.
+    // The TOML error content is what we're asserting here, not the
+    // aggregate string.
+    await expect(
+      mcpSetupAction({ start: false, fund: false, verify: false }, deps),
+    ).rejects.toThrow(/1 client\(s\) failed to register/);
+
+    const stderrText = (stderrSpy.mock.calls as any[]).map((c) => String(c[0])).join('');
+    // Per-client warning surfaces the wrapped error text.
+    expect(stderrText).toMatch(/WARNING: Codex CLI classify failed/);
+    // The wrapped error names the file (path appears in tildified
+    // form) and states the recovery procedure.
+    expect(stderrText).toMatch(/Existing file is not valid TOML/);
+    expect(stderrText).toMatch(/Move it aside and re-run/);
+    // The file path appears in the stderr output. Tildification may
+    // OR may not fire depending on whether tmpHome lives under the
+    // real homedir (it doesn't in CI), so accept either the literal
+    // path or its tildified form.
+    expect(stderrText).toContain('config.toml');
+
+    // Malformed file MUST NOT be overwritten — failed-client skip
+    // semantics from F15 carry forward across formats.
+    expect(readFileSync(codexPath, 'utf-8')).toBe('[mcp_servers.dkg\ncommand = "broken"');
+
+    stderrSpy.mockRestore();
+  });
+
+  it('issue #437 (Codex round-5): Codex CLI preserves unrelated TOML comments and formatting when adding dkg', async () => {
+    // Codex Review round-5 (PR #443, comment 3207793953) flagged
+    // that whole-file `TOML.stringify(body)` strips comments and
+    // formatting from unrelated user-managed Codex settings. Pin the
+    // narrower edit contract: setup appends/replaces only the owned
+    // `[mcp_servers.dkg]` table and leaves unrelated bytes alone.
+    //
+    // The parsed assertions keep the structural coverage from the
+    // earlier test: scalars, regular tables, array-of-tables, and
+    // sibling MCP server tables all survive.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    const original = [
+      '# Codex user config: this comment must survive',
+      'model = "gpt-5"  # inline model comment must survive',
+      'disable_history = false',
+      'approval_policy = "on-failure"',
+      '',
+      '[history]',
+      '# table comment must survive',
+      'persistence = "save-all"',
+      'max_bytes = 1048576',
+      '',
+      '[notify]',
+      'on_completion = true',
+      'on_error = true',
+      '',
+      '[[profiles]]',
+      'name = "work"',
+      'model = "gpt-5"',
+      'api_key_env_var = "OPENAI_API_KEY"',
+      '',
+      '[[profiles]]',
+      'name = "personal"',
+      'model = "claude-opus-4-7"',
+      'api_key_env_var = "ANTHROPIC_API_KEY"',
+      '',
+      '# sibling MCP server comment must survive',
+      '[mcp_servers.github-mcp]',
+      'command = "gh-mcp"',
+      'args = [ "serve" ]',
+      '',
+    ].join('\n');
+    writeFileSync(codexPath, original);
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const afterRaw = readFileSync(codexPath, 'utf-8');
+    const after = TOML.parse(afterRaw) as any;
+    expect(afterRaw.startsWith(original)).toBe(true);
+    expect(afterRaw).toContain('# Codex user config: this comment must survive');
+    expect(afterRaw).toContain('model = "gpt-5"  # inline model comment must survive');
+    expect(afterRaw).toContain('# table comment must survive');
+    expect(afterRaw).toContain('# sibling MCP server comment must survive');
+    // Top-level scalars preserved verbatim.
+    expect(after.model).toBe('gpt-5');
+    expect(after.disable_history).toBe(false);
+    expect(after.approval_policy).toBe('on-failure');
+    // Top-level non-MCP tables preserved verbatim.
+    expect(after.history).toEqual({ persistence: 'save-all', max_bytes: 1048576 });
+    expect(after.notify).toEqual({ on_completion: true, on_error: true });
+    // Top-level array-of-tables preserved verbatim, in original order.
+    expect(after.profiles).toHaveLength(2);
+    expect(after.profiles[0]).toEqual({ name: 'work', model: 'gpt-5', api_key_env_var: 'OPENAI_API_KEY' });
+    expect(after.profiles[1]).toEqual({
+      name: 'personal',
+      model: 'claude-opus-4-7',
+      api_key_env_var: 'ANTHROPIC_API_KEY',
+    });
+    // Sibling MCP server preserved.
+    expect(after.mcp_servers['github-mcp']).toEqual({ command: 'gh-mcp', args: ['serve'] });
+    // And our entry written.
+    expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
+  it('issue #437 (Codex round-6): Codex CLI rewrites unsupported inline TOML registration instead of appending a duplicate', async () => {
+    // Valid TOML can encode the same parsed object without an
+    // explicit [mcp_servers.dkg] table. The narrow splice path cannot
+    // safely remove that shape, so it falls back to whole-file
+    // serialization instead of appending a second dkg definition.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    writeFileSync(
+      codexPath,
+      [
+        '# unusual user-authored shape; fallback must warn before reserializing',
+        'model = "gpt-5"',
+        'mcp_servers.dkg = { command = "/old/legacy/dkg", args = [ "legacy-arg" ], cwd = "/workspaces/my-project", env = { DKG_HOME = "/old/abandoned/path", NODE_OPTIONS = "--inspect" } }',
+        '',
+      ].join('\n'),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const afterRaw = readFileSync(codexPath, 'utf-8');
+    const after = TOML.parse(afterRaw) as any;
+    const stderrText = (stderrSilencer.mock.calls as any[])
+      .map((c) => String(c[0]))
+      .join('');
+    expect(stderrText).toMatch(/WARNING: Codex CLI config/);
+    expect(stderrText).toMatch(/cannot be patched safely for mcp_servers\.dkg/);
+    expect(stderrText).toMatch(/invalid or duplicate definitions/);
+    expect(stderrText).toMatch(/Comments\/formatting outside this entry may not be preserved/);
+    expect(after.model).toBe('gpt-5');
+    expect(after.mcp_servers.dkg.command).toBe(process.execPath);
+    expect(after.mcp_servers.dkg.args[0]).toBe(realpathSync(process.argv[1]));
+    expect(after.mcp_servers.dkg.args.slice(1)).toEqual(['mcp', 'serve']);
+    expect(after.mcp_servers.dkg.cwd).toBe('/workspaces/my-project');
+    expect(after.mcp_servers.dkg.env.DKG_HOME).toBe(join(tmpHome, '.dkg'));
+    expect(after.mcp_servers.dkg.env.NODE_OPTIONS).toBe('--inspect');
+    expect(afterRaw).toMatch(/^\[mcp_servers\.dkg\]/m);
+    expect(afterRaw).not.toContain('mcp_servers.dkg = {');
+    expect(afterRaw).not.toContain('/old/legacy/dkg');
+  });
+
+  it('issue #437 (Codex round-7): Codex CLI rewrites unsupported inline mcp_servers parent before adding dkg', async () => {
+    // Appending [mcp_servers.dkg] under an inline parent table is invalid TOML.
+    // Fall back to a full rewrite so existing sibling servers survive as tables.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    writeFileSync(
+      codexPath,
+      [
+        '# parent inline table cannot accept a child table append',
+        'model = "gpt-5"',
+        'mcp_servers = { "github-mcp" = { command = "gh-mcp", args = [ "serve" ] } }',
+        '',
+      ].join('\n'),
+    );
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const afterRaw = readFileSync(codexPath, 'utf-8');
+    const after = TOML.parse(afterRaw) as any;
+    const stderrText = (stderrSilencer.mock.calls as any[])
+      .map((c) => String(c[0]))
+      .join('');
+    expect(stderrText).toMatch(/WARNING: Codex CLI config/);
+    expect(stderrText).toMatch(/cannot be patched safely for mcp_servers\.dkg/);
+    expect(after.model).toBe('gpt-5');
+    expect(after.mcp_servers['github-mcp']).toEqual({
+      command: 'gh-mcp',
+      args: ['serve'],
+    });
+    expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+    expect(afterRaw).toMatch(/^\[mcp_servers\.github-mcp\]/m);
+    expect(afterRaw).toMatch(/^\[mcp_servers\.dkg\]/m);
+    expect(afterRaw).not.toContain('mcp_servers = {');
+  });
+
+  it('issue #437 (Codex round-6): Codex CLI ignores table-looking lines inside TOML multiline strings', async () => {
+    // The comment-preserving splice scans table headers line-by-line.
+    // Bracket-looking text inside a multiline string must not be
+    // treated as an owned MCP table range.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+    const original = [
+      'model = "gpt-5"',
+      'startup_message = """',
+      '[mcp_servers.dkg]',
+      'command = "this is prose, not a table"',
+      '"""',
+      '',
+    ].join('\n');
+    writeFileSync(codexPath, original);
+
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const afterRaw = readFileSync(codexPath, 'utf-8');
+    const after = TOML.parse(afterRaw) as any;
+    expect(afterRaw.startsWith(original)).toBe(true);
+    expect(afterRaw).toContain('command = "this is prose, not a table"\n"""');
+    expect(afterRaw).toMatch(/"""\n\n\[mcp_servers\.dkg\]\ncommand = "/);
+    expect(after.model).toBe('gpt-5');
+    expect(after.mcp_servers.dkg).toEqual(EXPECTED_INSTALLED_ENTRY());
+  });
+
+
+  // ── Issue #437: format-dispatch round-trip sanity ────────────────────
+
+  it('issue #437: TOML round-trip — write then read returns deep-equal object', async () => {
+    // Independent of detectClients / mcpSetupAction — pin that the
+    // TOML writer's output is parseable by the same TOML reader and
+    // produces the same shape. Guards against silent format drift
+    // if the lib bumps a major.
+    const codexDir = join(tmpHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    const codexPath = join(codexDir, 'config.toml');
+
+    // Trigger a normal write through the action.
+    const deps = makeDeps();
+    await mcpSetupAction({ start: false, fund: false, verify: false }, deps);
+
+    const written = TOML.parse(readFileSync(codexPath, 'utf-8'));
+    // Re-stringify and re-parse — should be deep-equal.
+    const reSerialised = TOML.stringify(written as TOML.JsonMap);
+    const reParsed = TOML.parse(reSerialised);
+    expect(reParsed).toEqual(written);
+  });
+
 });

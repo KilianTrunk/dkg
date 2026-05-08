@@ -266,6 +266,86 @@ export class ApiClient {
     return this.post('/api/publisher/clear', { status });
   }
 
+  // ───────────────────────── EPCIS ─────────────────────────────────────
+
+  async captureEpcis(request: {
+    epcisDocument: unknown;
+    contextGraphId?: string;
+    subGraphName?: string;
+    publishOptions?: {
+      accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
+      allowedPeers?: string[];
+    };
+  }): Promise<{
+    captureID: string;
+    receivedAt: string;
+    eventCount: number;
+    status: 'accepted';
+  }> {
+    return this.post('/api/epcis/capture', request);
+  }
+
+  async getEpcisCapture(captureID: string): Promise<{
+    captureID: string;
+    state: 'accepted' | 'claimed' | 'validated' | 'broadcast' | 'included' | 'finalized' | 'failed';
+    receivedAt: string;
+    finalizedAt: string | null;
+    error: string | null;
+  }> {
+    return this.get(`/api/epcis/capture/${encodeURIComponent(captureID)}`);
+  }
+
+  async queryEpcisEvents(params: {
+    contextGraphId?: string;
+    subGraphName?: string;
+    finalized?: boolean;
+    epc?: string;
+    bizStep?: string;
+    bizLocation?: string;
+    from?: string;
+    to?: string;
+    eventID?: string;
+    eventType?: string;
+    action?: string;
+    disposition?: string;
+    readPoint?: string;
+    parentID?: string;
+    childEPC?: string;
+    inputEPC?: string;
+    outputEPC?: string;
+    anyEPC?: string;
+    perPage?: number;
+    nextPageToken?: string;
+  } = {}): Promise<{
+    body: unknown;
+    nextPageUrl: string | null;
+  }> {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value === undefined || value === null) continue;
+      search.set(key, String(value));
+    }
+    const qs = search.toString();
+    return this.queryEpcisEventsByPath(`/api/epcis/events${qs ? `?${qs}` : ''}`);
+  }
+
+  async queryEpcisEventsByPath(path: string): Promise<{
+    body: unknown;
+    nextPageUrl: string | null;
+  }> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: res.statusText }));
+      throw ApiClient.httpError(res.status, ApiClient.errorMessageFromBody(body, res.statusText), body);
+    }
+    const body = (await res.json()) as unknown;
+    const linkHeader = res.headers.get('Link') ?? res.headers.get('link');
+    const nextPageUrl = parseNextLink(linkHeader);
+    return { body, nextPageUrl };
+  }
+
   /**
    * Run SPARQL via the daemon. `opts` covers the full /api/query surface —
    * memory-layer routing (`view`, `graphSuffix`, `verifiedGraph`,
@@ -951,6 +1031,27 @@ export class ApiClient {
     }
     return fallback;
   }
+}
+
+function parseNextLink(linkHeader: string | null): string | null {
+  if (!linkHeader) return null;
+  const segments = linkHeader.split(',');
+  for (const segment of segments) {
+    const match = segment.match(/<([^>]+)>\s*;\s*rel\s*=\s*"?next"?/i);
+    if (!match) continue;
+    const target = match[1];
+    if (!target) continue;
+    if (target.startsWith('http://') || target.startsWith('https://')) {
+      try {
+        const url = new URL(target);
+        return `${url.pathname}${url.search}`;
+      } catch {
+        return null;
+      }
+    }
+    return target;
+  }
+  return null;
 }
 
 // NOTE: mirrored in `packages/adapter-openclaw/src/DkgNodePlugin.ts`

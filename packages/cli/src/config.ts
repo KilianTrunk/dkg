@@ -242,7 +242,7 @@ export interface DkgConfig {
   /** @deprecated Legacy alias for sharedMemoryTtlMs */
   workspaceTtlMs?: number;
   /** EPCIS plugin config. When set, POST /api/epcis/capture is enabled. */
-  epcis?: { contextGraphId?: string; /** @deprecated */ paranetId?: string };
+  epcis?: { contextGraphId?: string };
   /** Async publisher runtime options. */
   publisher?: {
     enabled?: boolean;

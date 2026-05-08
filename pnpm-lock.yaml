@@ -217,12 +217,12 @@ importers:
 
   packages/cli:
     dependencies:
-      '@origintrail-official/dkg-adapter-openclaw':
-        specifier: workspace:*
-        version: link:../adapter-openclaw
       '@origintrail-official/dkg-adapter-hermes':
         specifier: workspace:*
         version: link:../adapter-hermes
+      '@origintrail-official/dkg-adapter-openclaw':
+        specifier: workspace:*
+        version: link:../adapter-openclaw
       '@origintrail-official/dkg-agent':
         specifier: workspace:*
         version: link:../agent
@@ -360,6 +360,9 @@ importers:
 
   packages/epcis:
     dependencies:
+      '@origintrail-official/dkg-core':
+        specifier: workspace:*
+        version: link:../core
       ajv:
         specifier: ^8
         version: 8.18.0

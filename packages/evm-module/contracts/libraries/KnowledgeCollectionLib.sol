@@ -4,19 +4,20 @@ pragma solidity ^0.8.20;
 
 library KnowledgeCollectionLib {
     /// @dev `publisher` is `msg.sender` of the publish/update tx (payment of
-    ///      record). `author` is the verified agent identity from the
-    ///      EIP-712 author attestation (V10.1+ publish path) or `address(0)`
-    ///      for legacy KC mutations that predate author attestation. Readers
-    ///      should treat `author == address(0)` as "this state change did
-    ///      not carry an author attestation," never as a valid post-upgrade
-    ///      identity claim. Trust path is on-chain verification at write
-    ///      time; off-chain `dkg:authoredBy` triples mirror this for
-    ///      SPARQL filtering convenience only.
+    ///      record). The verified author identity from the EIP-712
+    ///      attestation (V10.1+ publish path) is NOT stored inline on this
+    ///      struct — it lives on a parallel
+    ///      `mapping(kcId => mapping(rootIndex => address))` on
+    ///      `KnowledgeCollectionStorage` (`merkleRootAuthors`). This keeps
+    ///      the dynamic-array slot stride at 3 slots so already-deployed KCs
+    ///      decode their historical roots correctly after the V10.1 upgrade.
+    ///      Readers should treat the parallel map's `address(0)` as "this
+    ///      state change did not carry an author attestation," never as a
+    ///      valid post-upgrade identity claim.
     struct MerkleRoot {
         address publisher;
         bytes32 merkleRoot;
         uint256 timestamp;
-        address author;
     }
 
     struct KnowledgeCollection {

@@ -122,6 +122,27 @@ export interface PublishOptions {
   fromSharedMemory?: boolean;
   /** When true, the KC was created via V10 and updates should use the V10 path. */
   v10Origin?: boolean;
+  /**
+   * Per-publish override for the on-chain `PublishParams.publisherNodeIdentityId`
+   * attribution field (RFC-001 §4 attribution control).
+   *
+   * Default (`undefined`): use the publisher's persistent
+   * `publisherNodeIdentityId` (the daemon's own identity), preserving the
+   * pre-RFC-001 single-tenant semantics.
+   *
+   * Explicit `bigint` (including `0n`): use this exact value as the
+   * on-chain attribution target. Lets a publisher service route a publish
+   * with attribution credit going to a different core (modes a/b/c) or to
+   * no one at all (mode d, value `0n`). The contract validates that any
+   * non-zero value names a real sharding-table node.
+   *
+   * SCOPE: this controls the on-chain attribution field ONLY. The
+   * publisher's own identity is still used for ACK self-signing (when
+   * applicable) and signer resolution — those are about WHO the daemon
+   * is, not WHO gets attribution credit. Per-call (no global mutation),
+   * so concurrent publishes with conflicting overrides are safe.
+   */
+  publisherNodeIdentityIdOverride?: bigint;
 }
 
 export interface PublishResult {

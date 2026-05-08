@@ -472,9 +472,10 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
         // publish→update coherence for open-CG publishers.
         // `author` = `p.authorAddress`, the address verified by
         // `_verifyAuthorAttestation` above. The chain commits the recovered
-        // identity into `merkleRoots[0].author` so off-chain readers
-        // (`/api/get`, indexers) can return the canonical author without
-        // re-deriving from the EIP-712 signature embedded in calldata.
+        // identity into KCS's parallel `merkleRootAuthors[kcId][0]` map
+        // so off-chain readers (`/api/get`, indexers) can return the
+        // canonical author without re-deriving from the EIP-712
+        // signature embedded in calldata.
         kcId = kcs.createKnowledgeCollection(
             msg.sender,
             p.authorAddress,
@@ -508,7 +509,21 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
         // points — uses BASE `tokenAmount`, NOT any discounted effective
         // spend, so a node's produced-value score reflects the data value
         // the publisher declared.
-        epochStorage.addEpochProducedKnowledgeValue(p.publisherNodeIdentityId, currentEpoch, p.tokenAmount);
+        //
+        // Validation gate: `publisherNodeIdentityId` is a self-claim under
+        // RFC-001 §3.6, but we MUST refuse to credit nonexistent nodes.
+        // Without this check any publisher with a valid ACK quorum could
+        // pump publishing-factor credit into arbitrary identity ids that
+        // the sharding table never minted, distorting RandomSampling node
+        // scores. `0` is the explicit "no attribution" sentinel and is
+        // accepted (skips the EpochStorage write entirely).
+        if (p.publisherNodeIdentityId != 0) {
+            require(
+                shardingTableStorage.nodeExists(p.publisherNodeIdentityId),
+                "publisherNodeIdentityId not in sharding table"
+            );
+            epochStorage.addEpochProducedKnowledgeValue(p.publisherNodeIdentityId, currentEpoch, p.tokenAmount);
+        }
     }
 
     // ========================================================================
@@ -1121,11 +1136,20 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
             // Track per-node produced value for the delta. Uses BASE delta
             // (not discounted effective spend) so the scoring reflects data
             // value added, not publisher economics — identical to publish.
-            epochStorage.addEpochProducedKnowledgeValue(
-                p.publisherNodeIdentityId,
-                currentEpoch,
-                deltaTokenAmount
-            );
+            //
+            // Same validation gate as `_executePublishCore`: refuse to
+            // credit nonexistent identity ids, accept `0` as no-attribution.
+            if (p.publisherNodeIdentityId != 0) {
+                require(
+                    shardingTableStorage.nodeExists(p.publisherNodeIdentityId),
+                    "publisherNodeIdentityId not in sharding table"
+                );
+                epochStorage.addEpochProducedKnowledgeValue(
+                    p.publisherNodeIdentityId,
+                    currentEpoch,
+                    deltaTokenAmount
+                );
+            }
         }
     }
 

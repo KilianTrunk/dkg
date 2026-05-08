@@ -249,10 +249,13 @@ describe('@unit ContextGraphs (facade)', () => {
       ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
     });
 
-    it('RFC-001: facade accepts empty hosts when requiredSignatures == 0', async () => {
+    it('facade accepts empty hosts when requiredSignatures == 0', async () => {
+      // 8-arg signature: hostingNodes, participantAgents, requiredSignatures,
+      // metadataBatchId, accessPolicy, publishPolicy, publishAuthority,
+      // publishAuthorityAccountId.
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          [], noAgents(), 0, 0, 1, ethers.ZeroAddress, 0,
+          [], noAgents(), 0, 0, 0, 1, ethers.ZeroAddress, 0,
         ),
       ).to.not.be.reverted;
     });

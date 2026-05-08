@@ -285,11 +285,14 @@ function dateLit(d: Date): string {
 }
 
 function hexLit(hex: string): string {
-  // RFC-001 §3.5 emits `dkg:merkleRoot "0x{hex}"^^xsd:hexBinary` on the
-  // publication subject. `toHex` returns the bare hex; prepend `0x` and
-  // tag with the canonical xsd:hexBinary datatype.
-  const prefixed = hex.startsWith('0x') ? hex : `0x${hex}`;
-  return `"${prefixed}"^^<${XSD}hexBinary>`;
+  // `xsd:hexBinary` lexical space is hex digits ONLY — no `0x` prefix
+  // (per XML Schema Part 2: Datatypes, §3.2.16). A typed literal
+  // `"0x..."^^xsd:hexBinary` is invalid for RDF value-equality
+  // semantics (SPARQL `=` operator on hexBinary compares decoded
+  // bytes; an invalid lexical form yields no match). Emit the bare
+  // hex digits as the lexical value, no `0x` prefix.
+  const bare = hex.startsWith('0x') ? hex.slice(2) : hex;
+  return `"${bare}"^^<${XSD}hexBinary>`;
 }
 
 /**

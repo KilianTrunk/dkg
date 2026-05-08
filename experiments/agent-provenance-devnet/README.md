@@ -196,35 +196,26 @@ node5 publish <cgId> \
   --publisher-node-identity-id 0
 ```
 
-**KNOWN GOTCHA — implementation skips on-chain when identityId=0.**
-The current `DKGPublisher.publish` gates the on-chain step behind
-`this.publisherNodeIdentityId > 0n`, so passing `--publisher-node-identity-id 0`
-produces a *tentative* SWM publish — no `KnowledgeCollectionCreated`
-event is ever emitted. Verified empirically in this PR's smoke test:
-the daemon log emits `Identity not set (0) — skipping on-chain publish [WARN]`
-and `Stored as tentative`, and `client.publish()` returns `Status: tentative`.
+**Implementation note — `--publisher-node-identity-id 0` is a real on-chain publish.**
+The publisher's gate distinguishes "no override" (use the daemon's own
+identityId, skip on-chain when that's `0`) from "explicit override = `0n`"
+(go on-chain with no attribution; the contract validates and accepts).
+Reviewer feedback: the gate previously skipped on-chain whenever the
+attribution target was `0n` regardless of how it got there, so mode (d)
+silently fell back to a tentative SWM-only publish. Fixed in this PR
+by threading `publisherNodeIdentityIdOverride` as a per-call publisher
+option — explicit `0n` proceeds on-chain.
 
-This is a **gap between the spec and the publisher** — RFC §4(d) says
-identityId=0 should still produce an on-chain author-attested publish
-("pays full TRAC from its own wallet; no core gets attribution"), but
-the publisher treats identityId=0 as "stay off-chain entirely." Two
-ways to surface mode (d) for the runbook today:
-
-1. **Pick a real `identityId` that doesn't have a PCA configured**
-   (e.g. node5's own identityId once edge identities are supported)
-   — that's mode (c) flavoured but the contract still records
-   non-zero attribution. Closest stand-in for (d).
-2. **Patch the publisher to allow `identityId == 0` on-chain publishes**
-   (small change in `DKGPublisher.publishCore`) — proper RFC-compliant
-   behavior. Track as a follow-up task.
-
-**Assertions** (when the gotcha is fixed; for now only #1 of the
-publisher-skip-tentative path is observable):
+**Assertions for mode (d):**
 
 - Edge wallet TRAC balance decremented by full fee.
-- No core's publishing-factor counter incremented.
+- No core's publishing-factor counter incremented:
+  `EpochStorage.getNodeEpochProducedKnowledgeValue(coreId, epoch)` is
+  unchanged across all known core identityIds.
 - `KnowledgeCollectionCreated` event has `author = edge.agent`,
-  `publisherNodeIdentityId = 0` in storage.
+  emitted with `publisherNodeIdentityId = 0` (verifiable via the
+  `merkleRoots` accessor: the on-chain attribution field is `0`).
+- `dkg publish` returns `Status: confirmed` (not `tentative`).
 
 ### Negative case: unauthorized PCA fall-through
 

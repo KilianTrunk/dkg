@@ -74,6 +74,25 @@ contract KnowledgeCollectionStorage is
     mapping(uint256 => KnowledgeCollectionLib.KnowledgeCollection) public knowledgeCollections;
     mapping(uint256 => bool) public isKnowledgeAssetBurned;
 
+    /// @dev Parallel mapping for V10.1+ author attestation.
+    ///
+    /// Why a parallel map and not a struct field on `MerkleRoot`:
+    /// `KnowledgeCollection.merkleRoots` is a dynamic array, so
+    /// extending its element struct from 3 to 4 storage slots would
+    /// shift the slot stride of every prior root entry — already-
+    /// deployed KCs would decode their historical
+    /// `publisher`/`merkleRoot`/`timestamp` from the wrong offsets.
+    /// Layout-preserving fix: keep `MerkleRoot` at 3 slots and store
+    /// the EIP-712-recovered author identity at
+    /// `merkleRootAuthors[kcId][rootIndex]`. `address(0)` means the
+    /// state change at `rootIndex` did not carry an attestation
+    /// (legacy V8/V9 mutations, V10.1 update path until vNext, etc).
+    /// Indexers SHOULD prefer the indexed `author` topic on
+    /// `KnowledgeCollectionCreated` / `KnowledgeCollectionUpdated`
+    /// events; this on-chain mapping is the canonical lookup for
+    /// `/api/kc/:id/author` and SPARQL author-filter queries.
+    mapping(uint256 => mapping(uint256 => address)) public merkleRootAuthors;
+
     constructor(
         address hubAddress,
         uint256 _knowledgeCollectionMaxSize,
@@ -112,8 +131,14 @@ contract KnowledgeCollectionStorage is
         KnowledgeCollectionLib.KnowledgeCollection storage kc = knowledgeCollections[knowledgeCollectionId];
 
         kc.merkleRoots.push(
-            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp, author)
+            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
+        // Store author in the parallel map at the index we just pushed
+        // (length - 1 == 0 here for the create path, but we keep the
+        // arithmetic explicit so the same pattern holds for update).
+        if (author != address(0)) {
+            merkleRootAuthors[knowledgeCollectionId][kc.merkleRoots.length - 1] = author;
+        }
         kc.byteSize = byteSize;
         kc.startEpoch = startEpoch;
         kc.endEpoch = endEpoch;
@@ -171,8 +196,11 @@ contract KnowledgeCollectionStorage is
         }
 
         kc.merkleRoots.push(
-            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp, author)
+            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
+        if (author != address(0)) {
+            merkleRootAuthors[id][kc.merkleRoots.length - 1] = author;
+        }
         kc.byteSize = byteSize;
         kc.tokenAmount = tokenAmount;
         kc.merkleLeafCount = merkleLeafCount;
@@ -354,7 +382,12 @@ contract KnowledgeCollectionStorage is
     }
 
     function getMerkleRootAuthorByIndex(uint256 id, uint256 index) external view returns (address) {
-        return knowledgeCollections[id].merkleRoots[index].author;
+        // Bounds-check via the canonical merkleRoots array so out-of-range
+        // queries revert the same way as the other index-based getters,
+        // rather than silently returning address(0) from the parallel
+        // mapping (which has no concept of "valid index").
+        require(index < knowledgeCollections[id].merkleRoots.length, "Index out of bounds");
+        return merkleRootAuthors[id][index];
     }
 
     /// @notice Verified author identity for the latest merkle-root entry
@@ -364,13 +397,17 @@ contract KnowledgeCollectionStorage is
     /// canonical "who authored this KC" lookup — chain wins over any
     /// off-chain `dkg:authoredBy` triple.
     function getLatestMerkleRootAuthor(uint256 id) external view returns (address) {
-        return _safeGetLatestMerkleRootObject(id).author;
+        uint256 len = knowledgeCollections[id].merkleRoots.length;
+        if (len == 0) return address(0);
+        return merkleRootAuthors[id][len - 1];
     }
 
     function pushMerkleRoot(address publisher, uint256 id, bytes32 merkleRoot) external onlyContracts {
         knowledgeCollections[id].merkleRoots.push(
-            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp, address(0))
+            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
+        // No author for legacy push path — leave the parallel mapping
+        // at its default `address(0)`.
 
         emit KnowledgeCollectionMerkleRootAdded(id, merkleRoot);
     }
@@ -592,7 +629,7 @@ contract KnowledgeCollectionStorage is
     ) internal view returns (KnowledgeCollectionLib.MerkleRoot memory) {
         KnowledgeCollectionLib.KnowledgeCollection memory kc = knowledgeCollections[id];
         if (kc.merkleRoots.length == 0) {
-            return KnowledgeCollectionLib.MerkleRoot(address(0), bytes32(0), 0, address(0));
+            return KnowledgeCollectionLib.MerkleRoot(address(0), bytes32(0), 0);
         }
         return kc.merkleRoots[kc.merkleRoots.length - 1];
     }

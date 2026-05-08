@@ -959,6 +959,12 @@ export class DKGPublisher implements Publisher {
       contextGraphSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
       v10ACKProvider?: PublishOptions['v10ACKProvider'];
       subGraphName?: string;
+      /**
+       * Per-call override for the on-chain attribution target — see
+       * `PublishOptions.publisherNodeIdentityIdOverride` for full semantics.
+       * Threaded into the inner `publish()` call below.
+       */
+      publisherNodeIdentityIdOverride?: bigint;
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -1072,6 +1078,7 @@ export class DKGPublisher implements Publisher {
       publishContextGraphId: chainCgId ?? undefined,
       fromSharedMemory: true,
       subGraphName: options?.subGraphName,
+      publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
       [INTERNAL_ORIGIN_TOKEN]: true,
     };
     const publishResult = await this.publish(internalPublishOptions);
@@ -1699,10 +1706,23 @@ export class DKGPublisher implements Publisher {
     const publishOperationId = `${this.sessionId}-${tentativeSeq}`;
     let ual = `did:dkg:${this.chain.chainId}/${publisherAddress}/t${publishOperationId}`;
 
-    const identityId = this.publisherNodeIdentityId;
+    // Per-publish attribution override (RFC-001 §4): defaults to the
+    // daemon's persistent identity when not set. `0n` is a VALID explicit
+    // value (mode d "no attribution" — contract validates this case) and
+    // must NOT be confused with "override absent". The daemon's own
+    // identity is still used elsewhere (ACK self-signing, signer
+    // resolution) — this only affects the on-chain `PublishParams.publisherNodeIdentityId`.
+    const hasAttributionOverride = options.publisherNodeIdentityIdOverride !== undefined;
+    const attributionIdentityId: bigint = hasAttributionOverride
+      ? options.publisherNodeIdentityIdOverride!
+      : this.publisherNodeIdentityId;
     let usedV10Path = false;
 
-    if (identityId === 0n) {
+    // Gate: skip on-chain only when there's no usable attribution AND no
+    // explicit override. With an explicit override (including `0n`), we
+    // proceed on-chain; the contract validates non-zero values name a
+    // real sharding-table node and accepts `0n` as no-attribution.
+    if (!hasAttributionOverride && this.publisherNodeIdentityId === 0n) {
       this.log.warn(ctx, `Identity not set (0) — skipping on-chain publish`);
     } else if (publisherContextGraphId === undefined) {
       this.log.warn(ctx, `No positive on-chain context graph id resolved from "${v10CgDomain}" — skipping on-chain publish`);
@@ -1719,7 +1739,7 @@ export class DKGPublisher implements Publisher {
         if (!publisherSigner) throw new PublisherWalletRequiredError('publish');
         this.log.info(
           ctx,
-          `Signing on-chain publish (identityId=${identityId}, signer=${publisherSigner.address}, source=${publisherSigner.source})`,
+          `Signing on-chain publish (attributionId=${attributionIdentityId}${hasAttributionOverride ? ' [override]' : ''}, signer=${publisherSigner.address}, source=${publisherSigner.source})`,
         );
 
         onPhase?.('chain:sign', 'end');
@@ -1833,7 +1853,7 @@ export class DKGPublisher implements Publisher {
             tokenAmount,
             merkleLeafCount: kcMerkleLeafCount,
             isImmutable: false,
-            publisherNodeIdentityId: identityId,
+            publisherNodeIdentityId: attributionIdentityId,
             author: {
               address: publisherSigner.address,
               signature: {

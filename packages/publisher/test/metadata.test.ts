@@ -163,10 +163,14 @@ describe('generateKCMetadata — RFC-001 §3.5 publication provenance', () => {
     expect(preds.get(`${DKG}publishOperationId`)).toBe(`"${OP_ID}"`);
     expect(preds.get(`${DKG}contextGraphId`)).toBe(`"${CONTEXT_GRAPH}"`);
     expect(preds.get(`${DKG}authoredBy`)).toBe(`"${AUTHOR}"`);
-    // merkleRoot serialised as `"0x..."^^xsd:hexBinary` per RFC-001 §3.5.
+    // merkleRoot serialised as `"<bare-hex>"^^xsd:hexBinary` (per
+    // XSD 1.1 §3.3.16: `xsd:hexBinary` lexical space is hex digits
+    // ONLY, no `0x` prefix — typed literal must be a valid lexical
+    // form for SPARQL value-equality comparisons to work).
     const root = preds.get(`${DKG}merkleRoot`);
     expect(root).toBeDefined();
-    expect(root).toMatch(/^"0x[0-9a-f]+"\^\^<http:\/\/www\.w3\.org\/2001\/XMLSchema#hexBinary>$/);
+    expect(root).toMatch(/^"[0-9a-f]+"\^\^<http:\/\/www\.w3\.org\/2001\/XMLSchema#hexBinary>$/);
+    expect(root).not.toMatch(/"0x/); // explicit guard: no `0x` prefix in lexical form
   });
 
   it('all publication quads land in the meta graph (not the data graph)', () => {

@@ -861,10 +861,11 @@ describe('@unit KnowledgeAssetsV10', () => {
 
       it('T1.5g: EOA — publish persists the recovered author on chain', async () => {
         // Locks the design's central promise: post-publish, an off-chain
-        // reader can fetch `KnowledgeCollection.merkleRoots[0].author` (and
-        // the `getLatestMerkleRootAuthor` view) and obtain the verified
-        // author identity directly from chain state, with no second-pass
-        // off-chain re-derivation. This is what `/api/get` reads.
+        // reader can fetch the verified author via
+        // `getLatestMerkleRootAuthor` / `getMerkleRootAuthorByIndex`
+        // (parallel `merkleRootAuthors` map — keeps the MerkleRoot
+        // struct at 3 slots so prior KCs decode correctly). This is
+        // what `/api/get` and `/api/kc/:id/author` read.
         const creator = getDefaultKCCreator(accounts);
         const author = accounts[14];
         const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
@@ -901,8 +902,10 @@ describe('@unit KnowledgeAssetsV10', () => {
         const latestKcId = await KCS.getLatestKnowledgeCollectionId();
         const kc = await KCS.getKnowledgeCollection(latestKcId);
         expect(kc.merkleRoots.length).to.equal(1);
-        expect(kc.merkleRoots[0].author).to.equal(author.address);
         expect(kc.merkleRoots[0].publisher).to.equal(creator.address);
+        // Author lives in parallel `merkleRootAuthors` map — read via
+        // the dedicated getters, not as a `MerkleRoot` struct field
+        // (struct preserved at 3 slots; see KnowledgeCollectionLib).
         expect(await KCS.getLatestMerkleRootAuthor(latestKcId)).to.equal(
           author.address,
         );
@@ -913,7 +916,7 @@ describe('@unit KnowledgeAssetsV10', () => {
 
       it('T1.5h: EIP-1271 — publish persists the wallet contract address as author', async () => {
         // Mirror of T1.5g for the smart-contract author path. After a
-        // successful 1271 verification, `merkleRoots[0].author` is the
+        // successful 1271 verification, `getLatestMerkleRootAuthor` is the
         // *wallet contract* address (not the inner EOA signer).
         const creator = getDefaultKCCreator(accounts);
         const walletSigner = accounts[16];
@@ -2225,6 +2228,134 @@ describe('@unit KnowledgeAssetsV10', () => {
         // KCS endEpoch advanced as expected.
         const newMeta = await KCS.getKnowledgeCollectionMetadata(kcId);
         expect(newMeta[5]).to.equal(originalEndEpoch + extensionEpochs);
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-VAL: publisherNodeIdentityId validation gate
+    //
+    // RFC-001 §3.6 makes `publisherNodeIdentityId` a self-claim, but the
+    // contract MUST refuse to credit nonexistent nodes. Without this gate,
+    // any publisher with a valid ACK quorum could pump publishing-factor
+    // credit into arbitrary identity ids that the sharding table never
+    // minted, distorting RandomSampling node scores.
+    //
+    // Spec: `_executePublishCore` requires
+    //   p.publisherNodeIdentityId == 0 || shardingTableStorage.nodeExists(...)
+    // and skips the EpochStorage write entirely when it's 0.
+    // ----------------------------------------------------------------------
+    describe('T-VAL: publisherNodeIdentityId validation', () => {
+      it('reverts when publisherNodeIdentityId names a nonexistent node', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const author = creator;
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t-val-1-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        // Use an obviously-out-of-band identity id that the sharding table
+        // can't have minted (~`uint72` max).
+        const FAKE_ID = 4_722_366_482_869_645_213_695n;
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: FAKE_ID,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't-val-1-op',
+        });
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await expect(KAV10.connect(creator).publish(p)).to.be.revertedWith(
+          'publisherNodeIdentityId not in sharding table',
+        );
+      });
+
+      it('publisherNodeIdentityId=0 publishes successfully and writes NO produced-value credit', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const author = creator;
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t-val-2-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: 0n,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't-val-2-op',
+        });
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        const epochBefore = await ChronosContract.getCurrentEpoch();
+        const globalBefore = await EpochStorageContract.getEpochProducedKnowledgeValue(epochBefore);
+
+        await expect(KAV10.connect(creator).publish(p)).to.not.be.reverted;
+
+        // Global epoch produced-value should be UNCHANGED — id=0 means
+        // "no attribution," skip the EpochStorage write entirely.
+        const globalAfter = await EpochStorageContract.getEpochProducedKnowledgeValue(epochBefore);
+        expect(globalAfter).to.equal(globalBefore);
+      });
+
+      it('publisherNodeIdentityId on a real registered node credits that node', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const author = creator;
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t-val-3-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't-val-3-op',
+        });
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        const epoch = await ChronosContract.getCurrentEpoch();
+        const nodeBefore = await EpochStorageContract.getNodeEpochProducedKnowledgeValue(
+          nodes.publisherIdentityId,
+          epoch,
+        );
+
+        await expect(KAV10.connect(creator).publish(p)).to.not.be.reverted;
+
+        const nodeAfter = await EpochStorageContract.getNodeEpochProducedKnowledgeValue(
+          nodes.publisherIdentityId,
+          epoch,
+        );
+        expect(nodeAfter - nodeBefore).to.equal(tokenAmount);
       });
     });
   });

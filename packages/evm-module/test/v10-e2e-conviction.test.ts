@@ -533,7 +533,12 @@ describe('V10 E2E Conviction System', function () {
       // Verified author identity persisted on chain. In this conviction
       // E2E the author signer == creator (the test builds `p` via
       // `buildPublishParams` with the creator as both author and msg.sender).
-      expect(retrievedKc.merkleRoots[0].author).to.equal(creator.address);
+      // Author lives in the parallel `merkleRootAuthors` map (keeps the
+      // MerkleRoot struct at 3 storage slots so prior KCs decode correctly
+      // post-upgrade — see KnowledgeCollectionLib comments).
+      expect(
+        await KnowledgeCollectionStorage.getMerkleRootAuthorByIndex(kcId, 0),
+      ).to.equal(creator.address);
       expect(
         await KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId),
       ).to.equal(creator.address);

@@ -3731,26 +3731,21 @@ export class DKGAgent {
       /** Target sub-graph within the context graph (e.g. "code", "decisions"). */
       subGraphName?: string;
       /**
-       * Per-publish override for the `publisherNodeIdentityId` field on
-       * `KnowledgeAssetsV10.PublishParams`. When supplied, takes the
-       * place of the daemon's own identityId for THIS publish only —
-       * the publisher's persistent identity is restored afterwards.
+       * Per-publish override for the on-chain
+       * `KnowledgeAssetsV10.PublishParams.publisherNodeIdentityId`
+       * attribution field (RFC-001 §4). Threaded as a per-call option
+       * into `publisher.publishFromSharedMemory` — no global mutation,
+       * so concurrent publishes with conflicting overrides are safe.
        *
-       * RFC §4 attribution: lets an edge-mode operator route a publish
-       * through the home-core's `publishFromSharedMemory` while
-       * attributing the publishing-factor credit (and PCA discount, when
-       * the submitter is on the named core's `authorizedKeys`) to a
-       * different core. `0n` is a valid value and means "no
-       * attribution" (RFC §4(d)).
-       *
-       * Concurrency: the override is implemented as a temporary swap of
-       * the publisher's `publisherNodeIdentityId` field. Daemons that
-       * issue concurrent `publishFromSharedMemory` calls with conflicting
-       * overrides will see interleaving — fine for single-operator
-       * runbook + V10.1 single-publisher daemons, but not safe for a
-       * future multi-tenant publisher service. That refactor would push
-       * the override down into a per-call parameter on
-       * `publisher.publishFromSharedMemory`.
+       * Lets an edge-mode operator route a publish through the
+       * home-core's `publishFromSharedMemory` while attributing the
+       * publishing-factor credit (and PCA discount, when the submitter
+       * is on the named core's `authorizedKeys`) to a different core.
+       * `0n` is a valid explicit value and means "no attribution"
+       * (RFC-001 §4(d)) — the contract validates this case and the
+       * publish proceeds on-chain. The publisher's own
+       * `publisherNodeIdentityId` is unchanged and continues to be
+       * used for ACK self-signing and signer resolution.
        */
       publisherNodeIdentityIdOverride?: bigint;
     },
@@ -3763,28 +3758,17 @@ export class DKGAgent {
 
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
 
-    const overriding = options?.publisherNodeIdentityIdOverride !== undefined;
-    const originalIdentityId = overriding ? this.publisher.getIdentityId() : 0n;
-    if (overriding) {
-      this.publisher.setIdentityId(options!.publisherNodeIdentityIdOverride!);
-    }
-    let result: PublishResult;
-    try {
-      result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
-        operationCtx: ctx,
-        clearSharedMemoryAfter: options?.clearSharedMemoryAfter,
-        onPhase: options?.onPhase,
-        publishContextGraphId: ctxGraphIdStr,
-        onChainContextGraphId: onChainId,
-        contextGraphSignatures: options?.contextGraphSignatures,
-        v10ACKProvider,
-        subGraphName: options?.subGraphName,
-      });
-    } finally {
-      if (overriding) {
-        this.publisher.setIdentityId(originalIdentityId);
-      }
-    }
+    const result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
+      operationCtx: ctx,
+      clearSharedMemoryAfter: options?.clearSharedMemoryAfter,
+      onPhase: options?.onPhase,
+      publishContextGraphId: ctxGraphIdStr,
+      onChainContextGraphId: onChainId,
+      contextGraphSignatures: options?.contextGraphSignatures,
+      v10ACKProvider,
+      subGraphName: options?.subGraphName,
+      publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
+    });
 
     if (result.status === 'confirmed' && result.onChainResult) {
       const rootEntities = result.kaManifest.map(ka => ka.rootEntity);

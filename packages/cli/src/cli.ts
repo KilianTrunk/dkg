@@ -2348,9 +2348,25 @@ program
       }
 
       const client = await ApiClient.connect();
-      const verb = useSharedMemory ? 'Writing to shared memory' : 'Publishing';
+      // RFC-001 §9.x — both branches now go through the assertion
+      // lifecycle. `--shared-memory` stages content into a named WM
+      // assertion (no chain submit); the default branch publishes
+      // directly via the one-shot `publishAssertion` helper.
+      const indexAssertionName = `index-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const verb = useSharedMemory ? 'Staging in WM assertion' : 'Publishing';
       const applyBatch = useSharedMemory
-        ? async (batch: typeof result.quads) => client.sharedMemoryWrite(targetContextGraph, batch)
+        ? async (batch: typeof result.quads) => {
+            // Create-or-append: the daemon's create endpoint is
+            // idempotent on `(cg, name)`, so we lazily create on the
+            // first batch (no quads body) and append on subsequent
+            // batches via `/api/assertion/:name/write`.
+            await client.createAssertion(targetContextGraph, indexAssertionName);
+            return client.appendToAssertion(
+              targetContextGraph,
+              indexAssertionName,
+              batch,
+            );
+          }
         : async (batch: typeof result.quads) => client.publish(targetContextGraph, batch);
 
       await publishEntityBatches(result.quads, applyBatch, (sent) => {
@@ -2364,8 +2380,8 @@ program
       });
 
       if (useSharedMemory) {
-        console.log(`\n\n  Written ${result.quads.length} quads to shared memory for context graph "${targetContextGraph}".`);
-        console.log('  Next: dkg shared-memory publish ' + targetContextGraph);
+        console.log(`\n\n  Staged ${result.quads.length} quads into WM assertion "${indexAssertionName}" for context graph "${targetContextGraph}".`);
+        console.log(`  Next: dkg shared-memory publish ${targetContextGraph} --name ${indexAssertionName}`);
       } else {
         console.log(`\n\n  Published ${result.quads.length} quads to context graph "${targetContextGraph}".`);
       }
@@ -2384,29 +2400,49 @@ const sharedMemoryCmd = program
 
 sharedMemoryCmd
   .command('write [context-graph]')
-  .description('Write triples to shared memory from an RDF file or inline')
+  .description('Stage triples into a named WM assertion (the new home of "shared-memory write")')
   .option('-f, --file <path>', 'RDF file (.nq, .nt, .ttl, .trig, .jsonld, .json)')
   .option('--format <fmt>', 'Explicit RDF format (nquads|ntriples|turtle|trig|json|jsonld)')
   .option('-t, --triples <json>', 'Inline JSON array of {subject, predicate, object} triples')
   .option('-s, --subject <uri>', 'Subject URI for simple write')
   .option('-p, --predicate <uri>', 'Predicate URI for simple write')
   .option('-o, --object <value>', 'Object value for simple write')
+  .option('--name <name>', 'Assertion name (auto-generated if omitted)')
+  .option('--sub-graph-name <name>', 'Optional sub-graph name')
   .action(async (contextGraph: string | undefined, opts: ActionOpts) => {
     try {
       const targetContextGraph = contextGraph ?? 'dev-coordination';
       const client = await ApiClient.connect();
       const defaultGraph = `did:dkg:context-graph:${targetContextGraph}`;
       const quads = await loadQuadsFromInput(opts, defaultGraph);
-      const results: Array<Awaited<ReturnType<typeof client.sharedMemoryWrite>>> = [];
+      const assertionName =
+        typeof opts.name === 'string' && opts.name.length > 0
+          ? (opts.name as string)
+          : `cli-write-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const subGraphOption = (opts.subGraphName as string | undefined) ?? undefined;
+
+      // RFC-001 §9.x — the legacy `shared-memory write` was a
+      // free-form append into SWM. The new lifecycle requires a named
+      // assertion. We create lazily on the first batch (no quads),
+      // then append batches via /api/assertion/:name/write.
+      await client.createAssertion(targetContextGraph, assertionName, {
+        ...(subGraphOption ? { subGraphName: subGraphOption } : {}),
+      });
+      let totalWritten = 0;
       await publishEntityBatches(
         quads,
         async (batch) => {
-          const result = await client.sharedMemoryWrite(targetContextGraph, batch);
-          results.push(result);
+          const result = await client.appendToAssertion(
+            targetContextGraph,
+            assertionName,
+            batch,
+            subGraphOption ? { subGraphName: subGraphOption } : undefined,
+          );
+          totalWritten += result.written;
           return result;
         },
         (sent) => {
-          process.stdout.write(`\r  Writing to shared memory: ${sent}/${quads.length} quads`);
+          process.stdout.write(`\r  Writing to WM assertion: ${sent}/${quads.length} quads`);
         },
         {
           maxBatchBytes: 240 * 1024,
@@ -2414,24 +2450,14 @@ sharedMemoryCmd
           splitOversizedEntities: true,
         },
       );
-      const firstResult = results[0];
-      const lastResult = results[results.length - 1];
       console.log();
-      console.log(`Written to shared memory for "${targetContextGraph}":`);
-      if (results.length === 1) {
-        console.log(`  Share operation: ${firstResult.workspaceOperationId}`);
-      } else {
-        console.log(`  Batches:         ${results.length}`);
-        console.log(`  First share op:  ${firstResult.workspaceOperationId}`);
-        console.log(`  Last share op:   ${lastResult.workspaceOperationId}`);
+      console.log(`Staged WM assertion for "${targetContextGraph}":`);
+      console.log(`  Assertion name:  ${assertionName}`);
+      console.log(`  Triples written: ${totalWritten}`);
+      if (subGraphOption) {
+        console.log(`  Sub-graph:       ${subGraphOption}`);
       }
-      console.log(`  Triples written: ${results.reduce((sum, result) => sum + result.triplesWritten, 0)}`);
-      console.log(`  Graph:           ${firstResult.graph}`);
-      const totalSkolemized = results.reduce((sum, result) => sum + (result.skolemizedBlankNodes ?? 0), 0);
-      if (totalSkolemized > 0) {
-        console.log(`  Skolemized BNs:  ${totalSkolemized}`);
-      }
-      console.log(`  Next:            dkg shared-memory publish ${targetContextGraph}`);
+      console.log(`  Next:            dkg shared-memory publish ${targetContextGraph} --name ${assertionName}`);
     } catch (err) {
       console.error(toErrorMessage(err));
       process.exit(1);
@@ -2440,29 +2466,52 @@ sharedMemoryCmd
 
 sharedMemoryCmd
   .command('publish [context-graph]')
-  .description('Publish from shared memory to a context graph')
-  .option('--keep', 'Keep shared memory triples after publishing')
-  .option('--root <entity...>', 'Publish only specific root entities')
-  .option('--sub-graph-name <name>', 'Publish from a specific shared-memory sub-graph')
+  .description('Finalize, promote, and publish a previously-staged WM assertion')
+  .requiredOption('--name <name>', 'Assertion name (from `dkg shared-memory write --name ...`)')
+  .option('--sub-graph-name <name>', 'Optional sub-graph name')
+  .option('--author-agent-address <address>', 'Override author EOA (must be a registered local agent)')
   .action(async (contextGraph: string | undefined, opts: ActionOpts) => {
     try {
       const targetContextGraph = contextGraph ?? 'dev-coordination';
+      const assertionName = String(opts.name);
+      const subGraphOption = (opts.subGraphName as string | undefined) ?? undefined;
+      const authorAgentAddress = (opts.authorAgentAddress as string | undefined) ?? undefined;
       const client = await ApiClient.connect();
-      const selection = opts.root?.length
-        ? { rootEntities: opts.root as string[] }
-        : 'all';
-      const result = await client.publishFromSharedMemory(targetContextGraph, selection, !opts.keep, {
-        subGraphName: opts.subGraphName,
+
+      // RFC-001 §9.x assertion lifecycle:
+      //   finalize → seal in _meta (idempotent on matching merkleRoot)
+      //   promote  → SWM gossip
+      //   publish  → VM via /api/shared-memory/publish { assertionName }
+      const seal = await client.finalizeAssertion(
+        targetContextGraph,
+        assertionName,
+        {
+          ...(subGraphOption ? { subGraphName: subGraphOption } : {}),
+          ...(authorAgentAddress ? { authorAgentAddress } : {}),
+        },
+      );
+      const promoted = await client.promoteAssertion(assertionName, {
+        contextGraphId: targetContextGraph,
+        ...(subGraphOption ? { subGraphName: subGraphOption } : {}),
       });
-      console.log(`Published from shared memory to "${targetContextGraph}":`);
-      console.log(`  Status: ${result.status}`);
-      console.log(`  KC ID:  ${result.kcId}`);
-      console.log(`  KAs:    ${result.kas.length}`);
-      if (opts.subGraphName) {
-        console.log(`  Sub-graph: ${opts.subGraphName}`);
+      const result = await client.publishFromFinalizedAssertion(
+        targetContextGraph,
+        assertionName,
+        subGraphOption ? { subGraphName: subGraphOption } : undefined,
+      );
+      console.log(`Published WM assertion to "${targetContextGraph}":`);
+      console.log(`  Assertion:    ${seal.assertionUri}`);
+      console.log(`  Author:       ${seal.authorAddress}`);
+      console.log(`  Merkle root:  ${seal.merkleRoot}`);
+      console.log(`  Promoted:     ${promoted.promotedCount ?? promoted.count ?? 0} quads`);
+      console.log(`  Status:       ${result.status}`);
+      console.log(`  KC ID:        ${result.kcId}`);
+      console.log(`  KAs:          ${result.kas.length}`);
+      if (subGraphOption) {
+        console.log(`  Sub-graph:    ${subGraphOption}`);
       }
       if (result.txHash) {
-        console.log(`  TX:     ${result.txHash}`);
+        console.log(`  TX:           ${result.txHash}`);
       }
     } catch (err) {
       console.error(toErrorMessage(err));

@@ -133,6 +133,17 @@ export class ApiClient {
     return this.get(`/api/messages${qs ? '?' + qs : ''}`);
   }
 
+  /**
+   * One-shot legacy publish: routed through the new assertion lifecycle
+   * with an auto-generated assertion name. The seal carries the same
+   * EIP-712 AuthorAttestation that the publisher used to derive at
+   * chain-tx time; from a caller's perspective this is the same method
+   * — only the on-the-wire route changed.
+   *
+   * Use `publishAssertion(contextGraphId, name, quads, opts)` directly
+   * when you want to control the assertion name (for resumability,
+   * audit, dedupe, etc.).
+   */
   async publish(contextGraphId: string, quads: Array<{
     subject: string; predicate: string; object: string; graph: string;
   }>, privateQuads?: Array<{
@@ -152,21 +163,37 @@ export class ApiClient {
   }> {
     if (privateQuads?.length || options?.accessPolicy || options?.allowedPeers?.length) {
       throw new Error(
-        'privateQuads, accessPolicy, and allowedPeers are not supported in the V10 SWM-first publish flow. ' +
-        'Use sharedMemoryWrite() + publishFromSharedMemory() directly.',
+        'privateQuads, accessPolicy, and allowedPeers are not supported in the V10 assertion-lifecycle publish flow. ' +
+        'Re-think the publish: there is no longer a free-form SWM write that can carry private quads — ' +
+        'every published assertion goes through finalize, which signs an EIP-712 attestation over the public quads.',
       );
     }
-    await this.sharedMemoryWrite(contextGraphId, quads);
-    return this.publishFromSharedMemory(contextGraphId, 'all', true, {
-      publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
+    const autoName = `cli-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return this.publishAssertion(contextGraphId, autoName, quads, {
+      ...(options?.publisherNodeIdentityIdOverride !== undefined
+        ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride }
+        : {}),
     });
   }
 
-  /** Write quads to shared memory (formerly workspace). */
+  /**
+   * @deprecated Use `appendToAssertion` (named WM assertion) or
+   * `publishAssertion` (one-shot lifecycle). This shim still routes
+   * through the legacy `/api/shared-memory/write` route to keep
+   * unmigrated callers working; once Phase B-C lands and that route
+   * is removed, this method will throw.
+   *
+   * Phase B migration: every caller of this method must move to a
+   * named-assertion flow. Pre-existing call sites:
+   *   - benchmarks/runner.ts (sync + async publish-get)
+   *   - mcp-dkg, openclaw, network-sim, node-ui (production clients)
+   *   - scripts/{seed,redistribute,drain}.mjs (one-off ops)
+   */
   async sharedMemoryWrite(contextGraphId: string, quads: Array<{
     subject: string; predicate: string; object: string; graph: string;
   }>): Promise<{
     workspaceOperationId: string;
+    shareOperationId?: string;
     contextGraphId: string;
     graph: string;
     triplesWritten: number;
@@ -175,20 +202,12 @@ export class ApiClient {
     return this.post('/api/shared-memory/write', { contextGraphId, quads });
   }
 
-  /** @deprecated Use sharedMemoryWrite */
-  async workspaceWrite(contextGraphId: string, quads: Array<{
-    subject: string; predicate: string; object: string; graph: string;
-  }>): Promise<{
-    workspaceOperationId: string;
-    contextGraphId: string;
-    graph: string;
-    triplesWritten: number;
-    skolemizedBlankNodes?: number;
-  }> {
-    return this.sharedMemoryWrite(contextGraphId, quads);
-  }
-
-  /** Publish from shared memory (formerly enshrine from workspace). */
+  /**
+   * @deprecated Use `publishFromFinalizedAssertion` or
+   * `publishAssertion`. Shim that routes through the legacy
+   * `/api/shared-memory/publish` (without `assertionName`); will be
+   * removed alongside the route in Phase B-C.
+   */
   async publishFromSharedMemory(
     contextGraphId: string,
     selection: 'all' | { rootEntities: string[] } = 'all',
@@ -210,6 +229,241 @@ export class ApiClient {
         ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride.toString() }
         : {}),
     });
+  }
+
+  /**
+   * Create an assertion in WM, optionally writing quads + finalizing +
+   * promoting in the same call. Maps directly to the extended
+   * `POST /api/assertion/create` body.
+   *
+   * RFC-001 §9.x — the assertion lifecycle is the canonical entry
+   * point for staging content for VM publish. Callers that previously
+   * went through the legacy `/api/shared-memory/write` (now removed)
+   * use this method instead.
+   */
+  async createAssertion(
+    contextGraphId: string,
+    name: string,
+    options?: {
+      subGraphName?: string;
+      quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
+      finalize?: boolean;
+      promote?: boolean;
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: {
+        address: string;
+        signature: { r: string; vs: string };
+      };
+      schemeVersion?: number;
+    },
+  ): Promise<{
+    assertionUri: string;
+    written?: number;
+    seal?: {
+      merkleRoot: string;
+      authorAddress: string;
+      schemeVersion: number;
+      chainId: string;
+      kav10Address: string;
+      eip712Digest: string;
+    };
+    promotedCount?: number;
+  }> {
+    return this.post('/api/assertion/create', {
+      contextGraphId,
+      name,
+      ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+      ...(options?.quads ? { quads: options.quads } : {}),
+      ...(options?.finalize !== undefined ? { finalize: options.finalize } : {}),
+      ...(options?.promote !== undefined ? { promote: options.promote } : {}),
+      ...(options?.authorAgentAddress
+        ? { authorAgentAddress: options.authorAgentAddress }
+        : {}),
+      ...(options?.preSignedAuthorAttestation
+        ? { preSignedAuthorAttestation: options.preSignedAuthorAttestation }
+        : {}),
+      ...(options?.schemeVersion !== undefined
+        ? { schemeVersion: options.schemeVersion }
+        : {}),
+    });
+  }
+
+  /**
+   * Append quads to an existing WM assertion. Wraps
+   * `POST /api/assertion/:name/write`. Used by batched ingest paths
+   * (e.g. `dkg index`) that materialize a single named assertion
+   * across many round-trips before finalize.
+   */
+  async appendToAssertion(
+    contextGraphId: string,
+    name: string,
+    quads: Array<{ subject: string; predicate: string; object: string; graph: string }>,
+    options?: { subGraphName?: string },
+  ): Promise<{ written: number }> {
+    return this.post(`/api/assertion/${encodeURIComponent(name)}/write`, {
+      contextGraphId,
+      quads,
+      ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+    });
+  }
+
+  /**
+   * Finalize a previously-created assertion. RFC-001 §9.x — computes
+   * the canonical merkleRoot, builds the EIP-712 AuthorAttestation,
+   * signs (custodial / pre-signed / publisher fallback), and stamps
+   * the seal triples to `_meta`.
+   */
+  async finalizeAssertion(
+    contextGraphId: string,
+    name: string,
+    options?: {
+      subGraphName?: string;
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: {
+        address: string;
+        signature: { r: string; vs: string };
+      };
+      schemeVersion?: number;
+    },
+  ): Promise<{
+    assertionUri: string;
+    merkleRoot: string;
+    authorAddress: string;
+    schemeVersion: number;
+    chainId: string;
+    kav10Address: string;
+    eip712Digest: string;
+  }> {
+    return this.post(
+      `/api/assertion/${encodeURIComponent(name)}/finalize`,
+      {
+        contextGraphId,
+        ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+        ...(options?.authorAgentAddress
+          ? { authorAgentAddress: options.authorAgentAddress }
+          : {}),
+        ...(options?.preSignedAuthorAttestation
+          ? { preSignedAuthorAttestation: options.preSignedAuthorAttestation }
+          : {}),
+        ...(options?.schemeVersion !== undefined
+          ? { schemeVersion: options.schemeVersion }
+          : {}),
+      },
+    );
+  }
+
+  /**
+   * Publish a previously-finalized assertion to the verified-memory
+   * chain. The seal in `_meta` (written by `finalizeAssertion`)
+   * supplies the AuthorAttestation; the publisher forwards it
+   * verbatim and never re-signs.
+   *
+   * Pre-condition: the assertion must be both finalized AND promoted
+   * to SWM. The high-level `publishAssertion` helper handles the
+   * whole sequence in one call.
+   */
+  async publishFromFinalizedAssertion(
+    contextGraphId: string,
+    assertionName: string,
+    options?: {
+      subGraphName?: string;
+      clearAfter?: boolean;
+      publisherNodeIdentityIdOverride?: bigint;
+    },
+  ): Promise<{
+    kcId: string;
+    status: 'tentative' | 'confirmed';
+    assertionUri: string;
+    authorAddress: string;
+    merkleRoot: string;
+    kas: Array<{ tokenId: string; rootEntity: string }>;
+    txHash?: string;
+    blockNumber?: number;
+    contextGraphError?: string;
+  }> {
+    return this.post('/api/shared-memory/publish', {
+      contextGraphId,
+      assertionName,
+      ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+      ...(options?.clearAfter !== undefined ? { clearAfter: options.clearAfter } : {}),
+      ...(options?.publisherNodeIdentityIdOverride !== undefined
+        ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride.toString() }
+        : {}),
+    });
+  }
+
+  /**
+   * High-level convenience: create → write → finalize → promote →
+   * publish, all in two HTTP round-trips. The composite mirrors what
+   * a typical OpenClaw/Hermes client does — stage content, commit it,
+   * push it on-chain. Use this unless you need fine-grained control
+   * over the individual steps.
+   */
+  async publishAssertion(
+    contextGraphId: string,
+    name: string,
+    quads: Array<{ subject: string; predicate: string; object: string; graph: string }>,
+    options?: {
+      subGraphName?: string;
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: {
+        address: string;
+        signature: { r: string; vs: string };
+      };
+      schemeVersion?: number;
+      clearAfter?: boolean;
+      publisherNodeIdentityIdOverride?: bigint;
+    },
+  ): Promise<{
+    assertionUri: string;
+    kcId: string;
+    status: 'tentative' | 'confirmed';
+    authorAddress: string;
+    merkleRoot: string;
+    kas: Array<{ tokenId: string; rootEntity: string }>;
+    txHash?: string;
+    blockNumber?: number;
+  }> {
+    const created = await this.createAssertion(contextGraphId, name, {
+      ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+      quads,
+      finalize: true,
+      promote: true,
+      ...(options?.authorAgentAddress
+        ? { authorAgentAddress: options.authorAgentAddress }
+        : {}),
+      ...(options?.preSignedAuthorAttestation
+        ? { preSignedAuthorAttestation: options.preSignedAuthorAttestation }
+        : {}),
+      ...(options?.schemeVersion !== undefined
+        ? { schemeVersion: options.schemeVersion }
+        : {}),
+    });
+    const published = await this.publishFromFinalizedAssertion(
+      contextGraphId,
+      name,
+      {
+        ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+        ...(options?.clearAfter !== undefined
+          ? { clearAfter: options.clearAfter }
+          : {}),
+        ...(options?.publisherNodeIdentityIdOverride !== undefined
+          ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride }
+          : {}),
+      },
+    );
+    return {
+      assertionUri: created.assertionUri,
+      kcId: published.kcId,
+      status: published.status,
+      authorAddress: published.authorAddress,
+      merkleRoot: published.merkleRoot,
+      kas: published.kas,
+      ...(published.txHash !== undefined ? { txHash: published.txHash } : {}),
+      ...(published.blockNumber !== undefined
+        ? { blockNumber: published.blockNumber }
+        : {}),
+    };
   }
 
   // ─── Publishing Conviction Account (PCA) ────────────────────────────
@@ -262,7 +516,7 @@ export class ApiClient {
     return this.get(`/api/pca/${encodeURIComponent(accountId)}${qs}`);
   }
 
-  /** @deprecated Use publishFromSharedMemory */
+  /** @deprecated Use `publishFromFinalizedAssertion` or `publishAssertion`. */
   async workspaceEnshrine(
     contextGraphId: string,
     selection: 'all' | { rootEntities: string[] } = 'all',

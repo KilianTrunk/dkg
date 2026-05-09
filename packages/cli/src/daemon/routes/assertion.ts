@@ -362,12 +362,39 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
   } = ctx;
 
 
-  // POST /api/assertion/create  { contextGraphId, name, subGraphName? }
+  // POST /api/assertion/create
+  //   Body: {
+  //     contextGraphId, name,
+  //     subGraphName?,
+  //     quads?,                               // one-shot write
+  //     finalize?: boolean,                   // one-shot finalize
+  //     promote?: boolean,                    // one-shot promote-to-SWM
+  //     authorAgentAddress?, preSignedAuthorAttestation?, schemeVersion?,  // forwarded to finalize
+  //   }
+  //
+  // Phase B convenience: a Hermes/OpenClaw client used to need 4 round
+  // trips (create → write → finalize → promote) just to stage an
+  // assertion for VM publish. This endpoint folds the chain into one
+  // call by treating the optional `quads`, `finalize`, and `promote`
+  // flags as opt-in steps. Each is independent — a caller can do
+  // `{ name }` only (legacy create), `{ name, quads }` (create+write),
+  // `{ name, quads, finalize: true, promote: true }` (full lifecycle
+  // up to but not including chain submit).
   if (req.method === "POST" && path === "/api/assertion/create") {
-    const body = await readBody(req, SMALL_BODY_BYTES);
+    const body = await readBody(req);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
-    const { contextGraphId, name, subGraphName } = parsed;
+    const {
+      contextGraphId,
+      name,
+      subGraphName,
+      quads,
+      finalize: shouldFinalize,
+      promote: shouldPromote,
+      authorAgentAddress: bodyAuthorAgentAddress,
+      preSignedAuthorAttestation: bodyPreSignedAttestation,
+      schemeVersion,
+    } = parsed;
     if (!name) return jsonResponse(res, 400, { error: 'Missing "name"' });
     if (!validateRequiredContextGraphId(contextGraphId, res)) return;
     if (typeof name !== "string")
@@ -378,20 +405,135 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         error: `Invalid "name": ${nameVal.reason}`,
       });
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
+    if (quads !== undefined) {
+      if (!Array.isArray(quads) || quads.length === 0) {
+        return jsonResponse(res, 400, {
+          error: '"quads" must be a non-empty array when supplied',
+        });
+      }
+    }
+    if (shouldFinalize === true && quads === undefined) {
+      return jsonResponse(res, 400, {
+        error: '"finalize: true" requires "quads" — cannot finalize an empty assertion',
+      });
+    }
+    if (shouldPromote === true && shouldFinalize !== true) {
+      return jsonResponse(res, 400, {
+        error: '"promote: true" requires "finalize: true" — promote runs after the seal is in place',
+      });
+    }
+    if (
+      bodyAuthorAgentAddress != null &&
+      bodyPreSignedAttestation != null
+    ) {
+      return jsonResponse(res, 400, {
+        error:
+          '"authorAgentAddress" and "preSignedAuthorAttestation" are mutually exclusive',
+      });
+    }
+    let resolvedPreSignedAttestation:
+      | NonNullable<PublishOptions['preSignedAuthorAttestation']>
+      | undefined;
+    if (bodyPreSignedAttestation != null) {
+      const validated = validatePreSignedAuthorAttestation(
+        bodyPreSignedAttestation,
+        res,
+      );
+      if (validated === undefined) return;
+      resolvedPreSignedAttestation = validated;
+    }
+    let resolvedAuthorAgentAddress: string | undefined;
+    if (resolvedPreSignedAttestation == null) {
+      if (
+        typeof bodyAuthorAgentAddress === 'string' &&
+        bodyAuthorAgentAddress.length > 0
+      ) {
+        if (!/^0x[0-9a-fA-F]{40}$/.test(bodyAuthorAgentAddress)) {
+          return jsonResponse(res, 400, {
+            error: '"authorAgentAddress" must be a 0x-prefixed 20-byte EVM address',
+          });
+        }
+        resolvedAuthorAgentAddress = bodyAuthorAgentAddress;
+      } else {
+        const requestToken = extractBearerToken(req.headers.authorization);
+        const tokenAgentAddress = requestToken
+          ? agent.resolveAgentByToken(requestToken)
+          : undefined;
+        if (tokenAgentAddress != null) {
+          resolvedAuthorAgentAddress = tokenAgentAddress;
+        }
+      }
+    }
+    if (
+      schemeVersion != null &&
+      (typeof schemeVersion !== 'number' || !Number.isInteger(schemeVersion) || schemeVersion < 1)
+    ) {
+      return jsonResponse(res, 400, {
+        error: '"schemeVersion" must be a positive integer when supplied',
+      });
+    }
     try {
       const assertionUri = await agent.assertion.create(
         contextGraphId,
         name,
         subGraphName ? { subGraphName } : undefined,
       );
-      return jsonResponse(res, 200, { assertionUri });
+      const response: Record<string, unknown> = { assertionUri };
+      if (Array.isArray(quads) && quads.length > 0) {
+        await agent.assertion.write(
+          contextGraphId,
+          name,
+          quads,
+          subGraphName ? { subGraphName } : undefined,
+        );
+        response.written = quads.length;
+      }
+      if (shouldFinalize === true) {
+        const seal = await agent.assertion.finalize(contextGraphId, name, {
+          ...(subGraphName ? { subGraphName } : {}),
+          ...(resolvedAuthorAgentAddress
+            ? { authorAgentAddress: resolvedAuthorAgentAddress }
+            : {}),
+          ...(resolvedPreSignedAttestation
+            ? { preSignedAuthorAttestation: resolvedPreSignedAttestation }
+            : {}),
+          ...(schemeVersion != null ? { schemeVersion } : {}),
+        });
+        response.seal = {
+          merkleRoot: ethers.hexlify(seal.merkleRoot),
+          authorAddress: seal.authorAddress,
+          schemeVersion: seal.schemeVersion,
+          chainId: seal.chainId.toString(),
+          kav10Address: seal.kav10Address,
+          eip712Digest: seal.eip712Digest,
+        };
+      }
+      if (shouldPromote === true) {
+        const promoteResult = await agent.assertion.promote(
+          contextGraphId,
+          name,
+          subGraphName ? { subGraphName } : undefined,
+        );
+        response.promotedCount = promoteResult.promotedCount;
+      }
+      return jsonResponse(res, 200, response);
     } catch (err: any) {
+      const message = err?.message ?? String(err);
       if (
-        err.message?.includes("already exists") ||
-        err.message?.includes("not found") ||
-        err.message?.includes("Invalid")
+        message.includes("already exists") ||
+        message.includes("not found") ||
+        message.includes("Invalid") ||
+        message.includes('Unsafe') ||
+        message.includes('not registered') ||
+        message.includes('mutually exclusive') ||
+        message.includes('not a registered local agent') ||
+        message.includes('signer mismatch') ||
+        message.includes('has no quads') ||
+        message.includes('different merkleRoot') ||
+        message.includes('reserved namespace') ||
+        err?.name === 'ReservedNamespaceError'
       ) {
-        return jsonResponse(res, 400, { error: err.message });
+        return jsonResponse(res, 400, { error: message });
       }
       throw err;
     }

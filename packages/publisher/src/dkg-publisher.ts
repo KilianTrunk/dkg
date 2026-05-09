@@ -419,6 +419,60 @@ export class DKGPublisher implements Publisher {
     return this.inferAdapterPublisherAddress(contextGraphId, options);
   }
 
+  /**
+   * RFC-001 §9.x — public wrapper around `resolvePublisherAddress` that
+   * `agent.assertionFinalize()` calls when no agent override was
+   * supplied. Mirrors Phase 4 mode (a): the daemon's own publisher
+   * EOA acts as author when the request is admin-scoped.
+   *
+   * Returns `undefined` when no publisher signer is configured
+   * (tentative-only daemon); finalize must then fail because there's
+   * no key to sign with.
+   */
+  async publisherFallbackAuthorAddress(): Promise<string | undefined> {
+    return this.resolvePublisherAddress();
+  }
+
+  /**
+   * RFC-001 §9.x — sign EIP-712 typed data with the publisher's own
+   * wallet (publisherPrivateKey or chain adapter's signer). Used by
+   * `agent.assertionFinalize()` when no agent override is supplied,
+   * so that the seal can still be produced for admin-scoped
+   * finalize requests.
+   *
+   * Returns the compact `(r, vs)` form expected by KAv10's
+   * AuthorAttestation struct.
+   */
+  async signAuthorAttestationAsPublisher(typedData: {
+    domain: { name: string; version: string; chainId: bigint; verifyingContract: string };
+    types: Record<string, Array<{ name: string; type: string }>>;
+    message: Record<string, unknown>;
+  }): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    const address = await this.resolvePublisherAddress();
+    if (!address) {
+      throw new Error(
+        'signAuthorAttestationAsPublisher: no publisher signer is configured. ' +
+          'Configure publisherPrivateKey or use a chain adapter that exposes signTypedData.',
+      );
+    }
+    const signer = await this.getPublisherSigner(address);
+    if (!signer) {
+      throw new Error(
+        `signAuthorAttestationAsPublisher: failed to resolve a signer for ${address}.`,
+      );
+    }
+    const sigHex = await signer.signTypedData(
+      typedData.domain,
+      typedData.types as { [k: string]: Array<{ name: string; type: string }> },
+      typedData.message,
+    );
+    const sig = ethers.Signature.from(sigHex);
+    return {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    };
+  }
+
   private async inferAdapterPublisherAddress(
     contextGraphId?: bigint,
     options: PublisherAddressResolutionOptions = {},
@@ -1015,6 +1069,15 @@ export class DKGPublisher implements Publisher {
        * self-sovereign agents. See `PublishOptions.preSignedAuthorAttestation`.
        */
       preSignedAuthorAttestation?: PublishOptions['preSignedAuthorAttestation'];
+      /**
+       * RFC-001 §9.x Phase 5 — pre-computed attestation captured at
+       * `agent.assertion.finalize()` time. See
+       * `PublishOptions.precomputedAttestation`. Threaded into the inner
+       * `publish()` so the seal flows through unchanged from agent →
+       * publisher → chain. Mutually exclusive with `authorPrivateKey`
+       * and `preSignedAuthorAttestation`.
+       */
+      precomputedAttestation?: PublishOptions['precomputedAttestation'];
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -1131,6 +1194,7 @@ export class DKGPublisher implements Publisher {
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
       authorPrivateKey: options?.authorPrivateKey,
       preSignedAuthorAttestation: options?.preSignedAuthorAttestation,
+      precomputedAttestation: options?.precomputedAttestation,
       [INTERNAL_ORIGIN_TOKEN]: true,
     };
     const publishResult = await this.publish(internalPublishOptions);
@@ -1457,11 +1521,22 @@ export class DKGPublisher implements Publisher {
     // (or a unit test) supplies `authorPrivateKey`, the AuthorAttestation is
     // signed with that key and the on-chain `KC.author` becomes the matching
     // EOA. Pre-signed path (`preSignedAuthorAttestation`) skips local signing
-    // entirely. Both default to undefined → publisher signs as today.
-    if (options.authorPrivateKey != null && options.preSignedAuthorAttestation != null) {
+    // entirely.
+    //
+    // RFC-001 §9.x Phase 5 adds a third lane: `precomputedAttestation`. The
+    // caller (typically `agent.publishFromFinalizedAssertion`) supplies a
+    // full attestation captured at finalize-time; the publisher validates
+    // and forwards verbatim, never signing.
+    //
+    // All three lanes default to undefined → publisher signs as today.
+    const overrideLanes = [
+      options.authorPrivateKey != null ? 'authorPrivateKey' : null,
+      options.preSignedAuthorAttestation != null ? 'preSignedAuthorAttestation' : null,
+      options.precomputedAttestation != null ? 'precomputedAttestation' : null,
+    ].filter((x): x is string => x != null);
+    if (overrideLanes.length > 1) {
       throw new Error(
-        'PublishOptions.authorPrivateKey and PublishOptions.preSignedAuthorAttestation ' +
-        'are mutually exclusive — supply at most one.',
+        `PublishOptions author override lanes are mutually exclusive — got ${overrideLanes.join(' + ')}.`,
       );
     }
     const authorSigner: AuthorSigner | undefined =
@@ -1859,18 +1934,58 @@ export class DKGPublisher implements Publisher {
         // the routing publisher. `preSignedAuthorAttestation` covers the
         // self-sovereign case where the daemon doesn't hold the key.
         const effectiveAuthorAddress =
-          options.preSignedAuthorAttestation?.address
+          options.precomputedAttestation?.authorAddress
+          ?? options.preSignedAuthorAttestation?.address
           ?? authorSigner?.address
           ?? publisherSigner.address;
+        const effectiveSchemeVersion =
+          options.precomputedAttestation?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
         const authorTypedData = buildAuthorAttestationTypedData({
           chainId: v10ChainId,
           kav10Address: v10KavAddress,
           contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
+          schemeVersion: effectiveSchemeVersion,
         });
         let authorSig: ethers.Signature;
-        if (options.preSignedAuthorAttestation) {
+        if (options.precomputedAttestation) {
+          // RFC-001 §9.x Phase 5: the assertion was finalized BEFORE this
+          // publish call, with a merkleRoot signed at that time. Sanity:
+          // the publisher's own re-derivation of `kcMerkleRoot` from the
+          // supplied quads MUST match the seal's expected root, otherwise
+          // either the quads were tampered between finalize and publish,
+          // or the caller and publisher disagree on the canonical merkle
+          // computation. Either way, refuse to publish.
+          const expected = options.precomputedAttestation.expectedMerkleRoot;
+          if (expected.length !== kcMerkleRoot.length || !expected.every((b, i) => b === kcMerkleRoot[i])) {
+            throw new Error(
+              `precomputedAttestation.expectedMerkleRoot mismatch: ` +
+              `seal expects ${ethers.hexlify(expected)} but publish-time recompute yielded ${ethers.hexlify(kcMerkleRoot)}. ` +
+              `Either the assertion's quads were mutated after finalize, or the caller's merkle algorithm differs from the publisher's. Re-finalize the assertion.`,
+            );
+          }
+          authorSig = ethers.Signature.from({
+            r: ethers.hexlify(options.precomputedAttestation.signature.r),
+            yParityAndS: ethers.hexlify(options.precomputedAttestation.signature.vs),
+          });
+          // Verify the sig still recovers to the claimed author against
+          // the typed data we just rebuilt. Cheap defense-in-depth before
+          // the chain rejects it.
+          const digest = ethers.TypedDataEncoder.hash(
+            authorTypedData.domain,
+            authorTypedData.types,
+            authorTypedData.message,
+          );
+          const recovered = ethers.recoverAddress(digest, authorSig);
+          if (recovered.toLowerCase() !== effectiveAuthorAddress.toLowerCase()) {
+            throw new Error(
+              `precomputedAttestation signer mismatch: signature recovers ${recovered} ` +
+              `but address claims ${effectiveAuthorAddress}. The seal's signature does not match its recorded authorAddress; ` +
+              `the assertion's _meta block is corrupt and the assertion must be re-finalized.`,
+            );
+          }
+        } else if (options.preSignedAuthorAttestation) {
           authorSig = ethers.Signature.from({
             r: ethers.hexlify(options.preSignedAuthorAttestation.signature.r),
             yParityAndS: ethers.hexlify(options.preSignedAuthorAttestation.signature.vs),
@@ -1974,7 +2089,7 @@ export class DKGPublisher implements Publisher {
                 r: ethers.getBytes(authorSig.r),
                 vs: ethers.getBytes(authorSig.yParityAndS),
               },
-              schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+              schemeVersion: effectiveSchemeVersion,
             },
             ackSignatures: v10ACKs.map(ack => ({
               identityId: ack.nodeIdentityId,

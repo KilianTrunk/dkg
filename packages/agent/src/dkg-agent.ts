@@ -18,6 +18,9 @@ import {
   getGenesisQuads, computeNetworkId, SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY,
   Logger, createOperationContext, sparqlString, escapeSparqlLiteral,
   TrustLevel,
+  buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1,
+  buildAssertionSealQuads, buildAssertionPublishReceiptQuads,
+  parseAssertionSealQuads, type AssertionSeal,
   type DKGNodeConfig, type OperationContext, type GetView, type AssertionDescriptor, type AssertionEvent, type AssertionState,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad } from '@origintrail-official/dkg-storage';
@@ -3742,6 +3745,419 @@ export class DKGAgent {
   }
 
   /**
+   * RFC-001 §9.x — finalize an assertion: compute merkleRoot, build the
+   * EIP-712 AuthorAttestation typed data, sign (or accept pre-signed),
+   * and write seal triples to the CG `_meta` graph keyed by the
+   * assertion URI.
+   *
+   * Implementation lives on the class (not inside the `assertion` getter
+   * closure) so that the substantial business logic — keystore lookup,
+   * EIP-712 binding, idempotency check, seal write — is independently
+   * testable and visible in stack traces.
+   *
+   * See `assertion.finalize` (the public-facing wrapper) for usage docs.
+   */
+  async assertionFinalize(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    opts?: {
+      subGraphName?: string;
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: PublishOptions['preSignedAuthorAttestation'];
+      schemeVersion?: number;
+    },
+  ): Promise<{
+    assertionUri: string;
+    merkleRoot: Uint8Array;
+    authorAddress: string;
+    schemeVersion: number;
+    chainId: bigint;
+    kav10Address: string;
+    eip712Digest: string;
+  }> {
+    if (
+      opts?.authorAgentAddress != null &&
+      opts?.preSignedAuthorAttestation != null
+    ) {
+      throw new Error(
+        'assertionFinalize: authorAgentAddress and preSignedAuthorAttestation are mutually exclusive',
+      );
+    }
+
+    // 1. Resolve URIs.
+    const assertionUri = contextGraphAssertionUri(
+      contextGraphId,
+      agentAddress,
+      name,
+      opts?.subGraphName,
+    );
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+
+    // 2. Pull the assertion's quads. Refuse to finalize an empty
+    //    assertion — there's nothing to commit.
+    const quads = await this.publisher.assertionQuery(
+      contextGraphId,
+      name,
+      agentAddress,
+      opts?.subGraphName,
+    );
+    if (quads.length === 0) {
+      throw new Error(
+        `Cannot finalize assertion <${assertionUri}>: it has no quads. ` +
+          `Write at least one quad with /api/assertion/${name}/write before finalizing.`,
+      );
+    }
+
+    // 3. Compute merkleRoot using the SAME algorithm the publisher
+    //    uses at publish-time (V10: keccak256-based merkle, sort+dedupe
+    //    leaves). Drift between these two compute paths is the silent
+    //    failure mode this whole architecture is trying to eliminate —
+    //    so we reuse the publisher's exported helpers verbatim.
+    const kaMap = autoPartition(quads);
+    const allSkolemizedQuads = [...kaMap.values()].flat();
+    const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, []);
+
+    // 4. Idempotency: if a seal already exists for this assertion,
+    //    return it as-is when the merkleRoot matches. Mismatch means
+    //    the assertion was mutated since the previous finalize —
+    //    refuse to overwrite silently.
+    const existingMetaResult = await this.store.query(
+      `CONSTRUCT { <${assertionUri}> ?p ?o } WHERE { GRAPH <${metaGraph}> { <${assertionUri}> ?p ?o } }`,
+    );
+    const existingMetaQuads =
+      existingMetaResult.type === 'quads' ? existingMetaResult.quads : [];
+    let existingSeal: AssertionSeal | undefined;
+    try {
+      existingSeal = parseAssertionSealQuads(existingMetaQuads, assertionUri);
+    } catch (err) {
+      // Corrupt seal — surface to the caller. Do NOT silently overwrite
+      // because the original author's signature is still on record and
+      // overwriting would lose the audit trail.
+      throw new Error(
+        `assertionFinalize: existing _meta seal for <${assertionUri}> is corrupt: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
+    if (existingSeal) {
+      if (
+        existingSeal.merkleRoot.length !== merkleRoot.length ||
+        !existingSeal.merkleRoot.every((b, i) => b === merkleRoot[i])
+      ) {
+        throw new Error(
+          `assertionFinalize: assertion <${assertionUri}> is already finalized with a ` +
+            `different merkleRoot (existing=${ethers.hexlify(existingSeal.merkleRoot)}, ` +
+            `current=${ethers.hexlify(merkleRoot)}). Discard and re-create the assertion if ` +
+            `you intended to change its content; in-place mutation of a finalized assertion ` +
+            `breaks the author signature and is rejected.`,
+        );
+      }
+      // Seal exists and matches — return the existing record.
+      const typedData = buildAuthorAttestationTypedData({
+        chainId: existingSeal.chainId,
+        kav10Address: existingSeal.kav10Address,
+        contextGraphId: await this.requireOnChainContextGraphId(contextGraphId),
+        merkleRoot: existingSeal.merkleRoot,
+        authorAddress: existingSeal.authorAddress,
+        schemeVersion: existingSeal.authorSchemeVersion,
+      });
+      return {
+        assertionUri,
+        merkleRoot: existingSeal.merkleRoot,
+        authorAddress: existingSeal.authorAddress,
+        schemeVersion: existingSeal.authorSchemeVersion,
+        chainId: existingSeal.chainId,
+        kav10Address: existingSeal.kav10Address,
+        eip712Digest: ethers.TypedDataEncoder.hash(
+          typedData.domain,
+          typedData.types,
+          typedData.message,
+        ),
+      };
+    }
+
+    // 5. Resolve chain identity. Finalize commits to a specific
+    //    `(chainId, kav10Address)` pair — both must be available.
+    if (
+      typeof this.chain.getEvmChainId !== 'function' ||
+      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+    ) {
+      throw new Error(
+        'assertionFinalize requires a V10-capable chain adapter that exposes ' +
+          'getEvmChainId() and getKnowledgeAssetsV10Address(); the current adapter does not.',
+      );
+    }
+    const chainId = await this.chain.getEvmChainId();
+    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+
+    // 6. Resolve the on-chain CG id — the EIP-712 digest binds to it.
+    const onChainCgId = await this.requireOnChainContextGraphId(contextGraphId);
+
+    // 7. Resolve author. preSigned > custodial agent > publisher fallback.
+    const schemeVersion = opts?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
+    let authorAddress: string;
+    let signerPrivateKey: string | undefined;
+    let preSigned: PublishOptions['preSignedAuthorAttestation'] | undefined;
+    if (opts?.preSignedAuthorAttestation != null) {
+      preSigned = opts.preSignedAuthorAttestation;
+      authorAddress = preSigned.address;
+    } else if (opts?.authorAgentAddress != null) {
+      const mode = this.getLocalAgentMode(opts.authorAgentAddress);
+      if (mode === undefined) {
+        throw new Error(
+          `assertionFinalize: authorAgentAddress ${opts.authorAgentAddress} is not a registered local agent on this node`,
+        );
+      }
+      if (mode === 'self-sovereign') {
+        throw new Error(
+          `assertionFinalize: agent ${opts.authorAgentAddress} is registered as self-sovereign — ` +
+            `this node does not hold its private key. Use preSignedAuthorAttestation instead.`,
+        );
+      }
+      signerPrivateKey = this.getCustodialAgentPrivateKey(opts.authorAgentAddress);
+      if (!signerPrivateKey) {
+        throw new Error(
+          `assertionFinalize: custodial agent ${opts.authorAgentAddress} has no private key on file`,
+        );
+      }
+      authorAddress = opts.authorAgentAddress;
+    } else {
+      // Publisher-wallet fallback: use the daemon's own publisher EOA
+      // as the author. This preserves Phase 4 mode (a) — node admin
+      // signs on its own behalf when no agent attribution is supplied.
+      const fallbackAddress = await this.publisher.publisherFallbackAuthorAddress();
+      if (!fallbackAddress) {
+        throw new Error(
+          'assertionFinalize: no agent override supplied and no publisher signer is available. ' +
+            'Either supply authorAgentAddress / preSignedAuthorAttestation, or configure a publisher private key on the daemon.',
+        );
+      }
+      authorAddress = fallbackAddress;
+    }
+
+    // 8. Build EIP-712 typed data.
+    const typedData = buildAuthorAttestationTypedData({
+      chainId,
+      kav10Address,
+      contextGraphId: onChainCgId,
+      merkleRoot,
+      authorAddress,
+      schemeVersion,
+    });
+    const eip712Digest = ethers.TypedDataEncoder.hash(
+      typedData.domain,
+      typedData.types,
+      typedData.message,
+    );
+
+    // 9. Produce the compact signature (r, vs).
+    let r: Uint8Array;
+    let vs: Uint8Array;
+    if (preSigned) {
+      const sig = ethers.Signature.from({
+        r: ethers.hexlify(preSigned.signature.r),
+        yParityAndS: ethers.hexlify(preSigned.signature.vs),
+      });
+      const recovered = ethers.recoverAddress(eip712Digest, sig);
+      if (recovered.toLowerCase() !== authorAddress.toLowerCase()) {
+        throw new Error(
+          `assertionFinalize: preSignedAuthorAttestation signer mismatch — ` +
+            `signature recovers ${recovered} but address claims ${authorAddress}.`,
+        );
+      }
+      r = preSigned.signature.r;
+      vs = preSigned.signature.vs;
+    } else if (signerPrivateKey) {
+      const wallet = new ethers.Wallet(
+        signerPrivateKey.startsWith('0x') ? signerPrivateKey : '0x' + signerPrivateKey,
+      );
+      const sigHex = await wallet.signTypedData(
+        typedData.domain,
+        typedData.types,
+        typedData.message,
+      );
+      const sig = ethers.Signature.from(sigHex);
+      r = ethers.getBytes(sig.r);
+      vs = ethers.getBytes(sig.yParityAndS);
+    } else {
+      // Publisher fallback: ask the publisher to sign with its own
+      // wallet. Returns the compact (r, vs) form.
+      const compact = await this.publisher.signAuthorAttestationAsPublisher(typedData);
+      r = compact.r;
+      vs = compact.vs;
+    }
+
+    // 10. Persist the seal as `_meta` triples.
+    const finalizedAtIso = new Date().toISOString();
+    const sealQuads = buildAssertionSealQuads({
+      assertionUri,
+      metaGraph,
+      merkleRoot,
+      authorAddress,
+      authorAttestationR: r,
+      authorAttestationVS: vs,
+      authorSchemeVersion: schemeVersion,
+      chainId,
+      kav10Address,
+      finalizedAtIso,
+    });
+    await this.store.insert(sealQuads);
+
+    return {
+      assertionUri,
+      merkleRoot,
+      authorAddress,
+      schemeVersion,
+      chainId,
+      kav10Address,
+      eip712Digest,
+    };
+  }
+
+  /**
+   * Helper: resolve the on-chain context graph id used by the EIP-712
+   * AuthorAttestation domain. Throws when the CG is not yet
+   * registered on-chain — finalize cannot bind a sig to a missing CG.
+   */
+  private async requireOnChainContextGraphId(contextGraphId: string): Promise<bigint> {
+    const onChainId = await this.getContextGraphOnChainId(contextGraphId);
+    if (onChainId == null) {
+      throw new Error(
+        `Context graph "${contextGraphId}" is not registered on-chain. ` +
+          `Run 'dkg context-graph register ${contextGraphId}' before finalizing an assertion ` +
+          `targeted at it; finalize binds the author signature to the on-chain CG id.`,
+      );
+    }
+    try {
+      return BigInt(onChainId);
+    } catch {
+      throw new Error(
+        `Context graph "${contextGraphId}" has a non-numeric on-chain id ("${onChainId}") — ` +
+          `the EIP-712 binding requires a uint256.`,
+      );
+    }
+  }
+
+  /**
+   * RFC-001 §9.x — publish a previously-finalized assertion to the
+   * verified-memory chain.
+   *
+   * Reads the seal from `_meta`, plumbs the seal's
+   * `(merkleRoot, authorAddress, signature, schemeVersion)` into the
+   * publisher as `precomputedAttestation`, and lets
+   * `publishFromSharedMemory` handle everything else (CG registration
+   * check, ACK collection, on-chain submission, post-confirmation
+   * cleanup).
+   *
+   * Pre-condition: the assertion's quads have already been promoted
+   * into SWM via `assertion.promote()`. The publisher pulls quads
+   * from the canonical CG `_shared-memory` graph; if the assertion
+   * hasn't been promoted yet, publish will see an empty/wrong quad
+   * set and the merkleRoot sanity check inside `publish()` will fire.
+   */
+  async publishFromFinalizedAssertion(
+    contextGraphId: string,
+    name: string,
+    opts?: {
+      subGraphName?: string;
+      operationCtx?: OperationContext;
+      onPhase?: PhaseCallback;
+      publisherNodeIdentityIdOverride?: bigint;
+      clearSharedMemoryAfter?: boolean;
+    },
+  ): Promise<PublishResult & { assertionUri: string; seal: AssertionSeal }> {
+    const agentAddress = this.defaultAgentAddress ?? this.peerId;
+    const assertionUri = contextGraphAssertionUri(
+      contextGraphId,
+      agentAddress,
+      name,
+      opts?.subGraphName,
+    );
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+
+    // 1. Read the seal from _meta.
+    const metaResult = await this.store.query(
+      `CONSTRUCT { <${assertionUri}> ?p ?o } WHERE { GRAPH <${metaGraph}> { <${assertionUri}> ?p ?o } }`,
+    );
+    const metaQuads = metaResult.type === 'quads' ? metaResult.quads : [];
+    const seal = parseAssertionSealQuads(metaQuads, assertionUri);
+    if (!seal) {
+      throw new Error(
+        `publishFromFinalizedAssertion: assertion <${assertionUri}> is not finalized. ` +
+          `Call /api/assertion/${name}/finalize before publishing.`,
+      );
+    }
+
+    // 2. Cross-check chain target — refuse to publish a sig signed
+    //    against a different deployment than this daemon currently
+    //    points at. This is the cross-deployment safety the EIP-712
+    //    domain is buying us; surface as an early 4xx-equivalent
+    //    rather than a tx revert.
+    if (
+      typeof this.chain.getEvmChainId === 'function' &&
+      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+    ) {
+      const liveChainId = await this.chain.getEvmChainId();
+      const liveKav10 = await this.chain.getKnowledgeAssetsV10Address();
+      if (liveChainId !== seal.chainId) {
+        throw new Error(
+          `publishFromFinalizedAssertion: seal binds chainId=${seal.chainId.toString()} but daemon ` +
+            `is configured for chainId=${liveChainId.toString()}. The author signature is not valid ` +
+            `against this chain. Re-finalize the assertion against the target chain.`,
+        );
+      }
+      if (liveKav10.toLowerCase() !== seal.kav10Address.toLowerCase()) {
+        throw new Error(
+          `publishFromFinalizedAssertion: seal binds KAv10=${seal.kav10Address} but daemon ` +
+            `is configured for KAv10=${liveKav10}. The signature is not valid against this deployment.`,
+        );
+      }
+    }
+
+    // 3. Run the standard publishFromSharedMemory flow with the
+    //    pre-computed attestation. The publisher will sanity-check
+    //    that its own merkle re-derivation matches the seal.
+    const result = await this.publishFromSharedMemory(contextGraphId, 'all', {
+      operationCtx: opts?.operationCtx,
+      onPhase: opts?.onPhase,
+      subGraphName: opts?.subGraphName,
+      publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
+      clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
+      // Wired through to the inner publisher.publish() via
+      // publishFromSharedMemory's `precomputedAttestation` option.
+      // Skips the publisher's signing entirely.
+      precomputedAttestation: {
+        expectedMerkleRoot: seal.merkleRoot,
+        authorAddress: seal.authorAddress,
+        signature: { r: seal.authorAttestationR, vs: seal.authorAttestationVS },
+        schemeVersion: seal.authorSchemeVersion,
+      },
+    });
+
+    // 4. On confirmed publish, write receipt triples to _meta.
+    if (result.status === 'confirmed' && result.onChainResult) {
+      try {
+        const receiptQuads = buildAssertionPublishReceiptQuads({
+          assertionUri,
+          metaGraph,
+          txHash: result.onChainResult.txHash ?? '',
+          blockNumber: BigInt(result.onChainResult.blockNumber ?? 0),
+          kcId: result.onChainResult.batchId ?? 0n,
+        });
+        await this.store.insert(receiptQuads);
+      } catch (err) {
+        this.log.warn(
+          opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+          `Failed to write publish receipt for <${assertionUri}>: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
+
+    return { ...result, assertionUri, seal };
+  }
+
+  /**
    * Publish shared memory content: read from SWM graph and publish with full finality (data graph + chain).
    * After on-chain confirmation, broadcasts a lightweight FinalizationMessage so peers with matching
    * SWM state can promote it to canonical without re-downloading the full payload.
@@ -3804,6 +4220,14 @@ export class DKGAgent {
        * Pass-through to `PublishOptions.preSignedAuthorAttestation`.
        */
       preSignedAuthorAttestation?: PublishOptions['preSignedAuthorAttestation'];
+      /**
+       * RFC-001 §9.x Phase 5 — pre-computed attestation captured by
+       * `agent.assertion.finalize()`. Threaded through to
+       * `publisher.publishFromSharedMemory` so the seal flows through
+       * unchanged. See `PublishOptions.precomputedAttestation`. Mutually
+       * exclusive with `authorAgentAddress` and `preSignedAuthorAttestation`.
+       */
+      precomputedAttestation?: PublishOptions['precomputedAttestation'];
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -3866,6 +4290,7 @@ export class DKGAgent {
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
       authorPrivateKey: resolvedAuthorPrivateKey,
       preSignedAuthorAttestation: options?.preSignedAuthorAttestation,
+      precomputedAttestation: options?.precomputedAttestation,
     });
 
     if (result.status === 'confirmed' && result.onChainResult) {
@@ -8941,6 +9366,55 @@ export class DKGAgent {
       },
       async discard(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<void> {
         return agent.publisher.assertionDiscard(contextGraphId, name, agentAddress, opts?.subGraphName);
+      },
+
+      /**
+       * RFC-001 §9.x — finalize a Working Memory assertion.
+       *
+       * This is the moment the assertion's content is cryptographically
+       * committed to a chain target: the daemon computes the canonical
+       * merkleRoot from the assertion's quads, builds the EIP-712
+       * AuthorAttestation typed data, signs it (or verifies a pre-signed
+       * payload), and stamps the result as a block of `_meta` triples
+       * keyed by the assertion URI.
+       *
+       * After finalize, the assertion's content is sealed: subsequent
+       * `write` calls would invalidate the seal. The seal travels with
+       * the assertion through SWM gossip (because `_meta` propagates by
+       * default) and is consumed verbatim by the chain publish path —
+       * publish never re-signs or re-hashes.
+       *
+       * Authorship resolution mirrors `publishFromSharedMemory`:
+       *   1. `preSignedAuthorAttestation` wins (self-sovereign agents).
+       *   2. `authorAgentAddress` → custodial agent's private key from
+       *      the local keystore.
+       *   3. Otherwise → throw. The route layer is responsible for
+       *      defaulting to the request token's agent (or to the
+       *      publisher EOA when an admin token is presented).
+       *
+       * Idempotent: re-finalizing an already-sealed assertion with the
+       * same content returns the existing seal without re-signing. A
+       * conflicting re-finalize (different content / author) throws.
+       */
+      async finalize(
+        contextGraphId: string,
+        name: string,
+        opts?: {
+          subGraphName?: string;
+          authorAgentAddress?: string;
+          preSignedAuthorAttestation?: PublishOptions['preSignedAuthorAttestation'];
+          schemeVersion?: number;
+        },
+      ): Promise<{
+        assertionUri: string;
+        merkleRoot: Uint8Array;
+        authorAddress: string;
+        schemeVersion: number;
+        chainId: bigint;
+        kav10Address: string;
+        eip712Digest: string;
+      }> {
+        return agent.assertionFinalize(contextGraphId, name, agentAddress, opts);
       },
 
       async history(contextGraphId: string, name: string, opts?: { agentAddress?: string; subGraphName?: string }): Promise<AssertionDescriptor | null> {

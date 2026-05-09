@@ -342,7 +342,7 @@ import type { RequestContext } from './context.js';
  * recovers the address from the EIP-712 digest computed at publish time and
  * fails closed if the recovered signer doesn't match the claimed address).
  */
-function validatePreSignedAuthorAttestation(
+export function validatePreSignedAuthorAttestation(
   raw: unknown,
   res: ServerResponse,
 ): PublishOptions['preSignedAuthorAttestation'] | undefined {
@@ -610,6 +610,7 @@ WHERE {
       publisherNodeIdentityIdOverride,
       authorAgentAddress: bodyAuthorAgentAddress,
       preSignedAuthorAttestation: bodyPreSignedAttestation,
+      assertionName: bodyAssertionName,
     } = parsed;
     const contextGraphId = parsed.contextGraphId;
     if (!contextGraphId)
@@ -685,6 +686,114 @@ WHERE {
         resolvedAuthorAgentAddress = bodyAuthorAgentAddress;
       } else if (tokenAgentAddress != null) {
         resolvedAuthorAgentAddress = tokenAgentAddress;
+      }
+    }
+
+    // RFC-001 §9.x Phase 5 — finalized-assertion fork.
+    //
+    // When the body carries `assertionName`, the assertion was sealed at
+    // a previous /api/assertion/:name/finalize step and the seal lives
+    // in `_meta`. The agent route reads the seal, validates chain
+    // identity, threads the seal as `precomputedAttestation`, and the
+    // publisher forwards it verbatim — no re-sign, no re-hash. Other
+    // body fields (`authorAgentAddress`, `preSignedAuthorAttestation`)
+    // are illegal in this fork because the seal already encodes the
+    // author. `selection` is forced to `'all'` because the seal is keyed
+    // by the assertion's exact merkleRoot.
+    if (typeof bodyAssertionName === 'string' && bodyAssertionName.length > 0) {
+      const nameVal = validateAssertionName(bodyAssertionName);
+      if (!nameVal.valid) {
+        return jsonResponse(res, 400, {
+          error: `Invalid "assertionName": ${nameVal.reason}`,
+        });
+      }
+      if (
+        bodyAuthorAgentAddress != null ||
+        bodyPreSignedAttestation != null
+      ) {
+        return jsonResponse(res, 400, {
+          error:
+            '"authorAgentAddress" and "preSignedAuthorAttestation" cannot be combined with "assertionName" — the seal already encodes the author. Re-finalize the assertion if you need to change authorship.',
+        });
+      }
+      if (selection !== undefined && selection !== 'all') {
+        return jsonResponse(res, 400, {
+          error:
+            '"selection" must be omitted or "all" when "assertionName" is supplied — the seal commits to the entire assertion content.',
+        });
+      }
+      const ctx2 = createOperationContext('publishFromSWM');
+      tracker.start(ctx2, {
+        contextGraphId,
+        details: {
+          source: 'api',
+          assertionName: bodyAssertionName,
+          subGraphName,
+        },
+      });
+      try {
+        const result = await tracker.trackPhase(
+          ctx2,
+          'read-shared-memory',
+          () =>
+            agent.publishFromFinalizedAssertion(contextGraphId, bodyAssertionName, {
+              ...(subGraphName ? { subGraphName } : {}),
+              operationCtx: ctx2,
+              ...(resolvedPublisherIdentityOverride !== undefined
+                ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
+                : {}),
+              clearSharedMemoryAfter: clearAfter ?? true,
+            }),
+        );
+        const chain = result.onChainResult;
+        if (chain) {
+          tracker.setCost(ctx2, {
+            gasUsed: chain.gasUsed,
+            gasPrice: chain.effectiveGasPrice,
+          });
+          const chainId = resolveChainConfig(config, network)?.chainId;
+          tracker.setTxHash(
+            ctx2,
+            chain.txHash,
+            chainId ? Number(chainId) : undefined,
+          );
+        }
+        tracker.complete(ctx2, { tripleCount: result.kaManifest?.length ?? 0 });
+        const httpStatus = result.contextGraphError ? 207 : 200;
+        return jsonResponse(res, httpStatus, {
+          kcId: String(result.kcId),
+          status: result.status,
+          assertionUri: result.assertionUri,
+          authorAddress: result.seal.authorAddress,
+          merkleRoot:
+            '0x' +
+            Array.from(result.seal.merkleRoot)
+              .map((b) => b.toString(16).padStart(2, '0'))
+              .join(''),
+          kas: result.kaManifest.map((ka: any) => ({
+            tokenId: String(ka.tokenId),
+            rootEntity: ka.rootEntity,
+          })),
+          ...(chain && { txHash: chain.txHash, blockNumber: chain.blockNumber }),
+          ...(result.contextGraphError
+            ? { contextGraphError: result.contextGraphError }
+            : {}),
+        });
+      } catch (err: any) {
+        tracker.fail(ctx2, err);
+        const message = err?.message ?? String(err);
+        if (
+          message.includes('not finalized') ||
+          message.includes('seal binds chainId') ||
+          message.includes('seal binds KAv10') ||
+          message.includes('expectedMerkleRoot mismatch') ||
+          message.includes('precomputedAttestation signer mismatch') ||
+          message.includes('not registered on-chain') ||
+          message.includes('signer mismatch')
+        ) {
+          return jsonResponse(res, 400, { error: message });
+        }
+        throw err;
       }
     }
 

@@ -670,3 +670,155 @@ describe('Diagram 10 — Phase 4 pre-signed AuthorAttestation (self-sovereign pa
     expect(result.onChainResult).toBeUndefined();
   });
 });
+
+// =============================================================================
+// Diagram 11 — Phase 5 sign-at-creation: precomputedAttestation lane
+// =============================================================================
+//
+// RFC-001 §9.x flips the architectural axis on author attestation. Instead
+// of "publish computes merkleRoot then signs at chain-tx time", the agent
+// commits the assertion's content at finalize-time: it computes the
+// canonical merkleRoot, signs the EIP-712 AuthorAttestation typed data,
+// and stamps the seal into `_meta`. The publisher then becomes pure
+// transport — it forwards the pre-computed (merkleRoot, signature,
+// author) to KAv10 verbatim and never signs.
+//
+// At the publisher boundary this is expressed as the
+// `PublishOptions.precomputedAttestation` lane. This file exercises the
+// publisher half of the contract end-to-end on a real Hardhat:
+//
+//   - Happy path: caller signs externally → publisher accepts and
+//     forwards → on-chain `KC.author` matches the externally-signed
+//     identity, byte-for-byte. No re-sign happens.
+//   - Tamper case: caller signs over `expectedMerkleRoot = X`, then asks
+//     to publish quads whose canonical merkle is `Y ≠ X`. Publisher
+//     fails closed before broadcasting (downgraded to tentative — the
+//     publisher catches signing-path errors and falls back, same as the
+//     Diagram 10 mismatched preSigned attestation case).
+//   - Mutual-exclusion: precomputedAttestation + authorPrivateKey is
+//     rejected.
+//
+// The agent-layer wrapper (`agent.assertion.finalize` →
+// `publishFromFinalizedAssertion`) is exercised separately by the
+// daemon-level e2e tests; this file stays at the publisher seam so the
+// invariant being asserted is "publisher honours the seal verbatim",
+// independent of how the seal was produced.
+
+describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () => {
+  it('publish() accepts a pre-computed attestation and forwards it to KAv10', async () => {
+    const { computeFlatKCRootV10, autoPartition } = await import('../src/index.js');
+    const { buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1 } =
+      await import('@origintrail-official/dkg-core');
+
+    const author = ethers.Wallet.createRandom();
+    const publisher = makePublisher();
+    const quads: Quad[] = [
+      q(`${ENTITY}/D11-precomputed`, 'http://schema.org/name', '"Diagram11-Precomputed"'),
+      q(`${ENTITY}/D11-precomputed`, 'http://schema.org/value', '"42"'),
+    ];
+
+    const kaMap = autoPartition(quads);
+    const allQuads = [...kaMap.values()].flat();
+    const merkleRoot = computeFlatKCRootV10(allQuads, []);
+
+    const chainIdNum = await provider.getNetwork().then((n) => n.chainId);
+    const td = buildAuthorAttestationTypedData({
+      chainId: BigInt(chainIdNum),
+      kav10Address,
+      contextGraphId: BigInt(CONTEXT_GRAPH),
+      merkleRoot,
+      authorAddress: author.address,
+      schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    });
+    const sig = ethers.Signature.from(
+      await author.signTypedData(td.domain, td.types, td.message),
+    );
+
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads,
+      precomputedAttestation: {
+        expectedMerkleRoot: merkleRoot,
+        authorAddress: author.address,
+        signature: {
+          r: ethers.getBytes(sig.r),
+          vs: ethers.getBytes(sig.yParityAndS),
+        },
+        schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+      },
+    });
+
+    expect(result.status).toBe('confirmed');
+    const kcId = result.onChainResult!.batchId;
+    const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
+    expect(onChainAuthor.toLowerCase()).toBe(author.address.toLowerCase());
+
+    // The on-chain merkleRoot is what the publisher computed from `quads`
+    // — assert it equals the seal's expected root, proving no
+    // re-derivation drift between sign-time and publish-time.
+    const onChainRootObj = await kcs().getLatestMerkleRootObject(kcId);
+    expect(onChainRootObj.merkleRoot.toLowerCase()).toBe(
+      ethers.hexlify(merkleRoot).toLowerCase(),
+    );
+  });
+
+  it('rejects a precomputed seal whose expectedMerkleRoot disagrees with the actual quads', async () => {
+    const { buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1 } =
+      await import('@origintrail-official/dkg-core');
+    const author = ethers.Wallet.createRandom();
+    const publisher = makePublisher();
+    const quads: Quad[] = [
+      q(`${ENTITY}/D11-tampered`, 'http://schema.org/name', '"Tampered"'),
+    ];
+
+    // Sign over an arbitrary fake root that does NOT match the canonical
+    // root the publisher will derive from `quads`.
+    const fakeRoot = ethers.getBytes('0x' + '22'.repeat(32));
+    const chainIdNum = await provider.getNetwork().then((n) => n.chainId);
+    const td = buildAuthorAttestationTypedData({
+      chainId: BigInt(chainIdNum),
+      kav10Address,
+      contextGraphId: BigInt(CONTEXT_GRAPH),
+      merkleRoot: fakeRoot,
+      authorAddress: author.address,
+      schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    });
+    const sig = ethers.Signature.from(
+      await author.signTypedData(td.domain, td.types, td.message),
+    );
+
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads,
+      precomputedAttestation: {
+        expectedMerkleRoot: fakeRoot,
+        authorAddress: author.address,
+        signature: {
+          r: ethers.getBytes(sig.r),
+          vs: ethers.getBytes(sig.yParityAndS),
+        },
+        schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+      },
+    });
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+  });
+
+  it('rejects precomputedAttestation + authorPrivateKey together', async () => {
+    const author = ethers.Wallet.createRandom();
+    const publisher = makePublisher();
+    await expect(
+      publisher.publish({
+        contextGraphId: CONTEXT_GRAPH,
+        quads: [q(`${ENTITY}/D11-conflict`, 'http://schema.org/name', '"X"')],
+        authorPrivateKey: author.privateKey,
+        precomputedAttestation: {
+          expectedMerkleRoot: new Uint8Array(32),
+          authorAddress: author.address,
+          signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+          schemeVersion: 1,
+        },
+      }),
+    ).rejects.toThrow(/mutually exclusive/);
+  });
+});

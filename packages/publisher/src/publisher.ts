@@ -184,6 +184,39 @@ export interface PublishOptions {
     address: string;
     signature: { r: Uint8Array; vs: Uint8Array };
   };
+  /**
+   * RFC-001 §9.x — pre-computed AuthorAttestation produced at the
+   * `agent.assertion.finalize()` boundary.
+   *
+   * When this is set, the publisher does NOT compute its own
+   * EIP-712 attestation. The caller has already:
+   *   1. Computed `expectedMerkleRoot` over the same quads it is
+   *      now asking the publisher to publish (computed via
+   *      `computeFlatKCRoot` / `autoPartition` semantics).
+   *   2. Signed (or collected a signature for) the typed data
+   *      `buildAuthorAttestationTypedData({ chainId, kav10Address,
+   *      contextGraphId, merkleRoot: expectedMerkleRoot,
+   *      authorAddress })`.
+   *
+   * The publisher independently re-derives `kcMerkleRoot` from the
+   * supplied `quads` and asserts equality with
+   * `expectedMerkleRoot`. Mismatch = throw, because either the
+   * caller's compute path drifted from the publisher's, or the
+   * quads were mutated between finalize and publish.
+   *
+   * The compact `(r, vs)` and `authorAddress` are forwarded to
+   * KAv10 verbatim. Used by `/api/shared-memory/publish` when an
+   * `assertionUri` resolves to a finalized assertion in `_meta`.
+   *
+   * Mutually exclusive with `authorPrivateKey` AND
+   * `preSignedAuthorAttestation`.
+   */
+  precomputedAttestation?: {
+    expectedMerkleRoot: Uint8Array;
+    authorAddress: string;
+    signature: { r: Uint8Array; vs: Uint8Array };
+    schemeVersion: number;
+  };
 }
 
 export interface PublishResult {

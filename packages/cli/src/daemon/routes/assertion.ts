@@ -58,7 +58,8 @@ const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
+import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
+import { validatePreSignedAuthorAttestation } from './memory.js';
 import {
   DashboardDB,
   MetricsCollector,
@@ -521,6 +522,140 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         err.message?.includes("Unsafe")
       ) {
         return jsonResponse(res, 400, { error: err.message });
+      }
+      throw err;
+    }
+  }
+
+  // POST /api/assertion/:name/finalize  { contextGraphId, subGraphName?, authorAgentAddress?, preSignedAuthorAttestation?, schemeVersion? }
+  //
+  // RFC-001 §9.x — seal an assertion's content with an EIP-712
+  // AuthorAttestation signed at this point in the lifecycle (as opposed
+  // to the publish-time path that signs over SWM contents at chain-tx
+  // time). After finalize, the seal lives in `_meta` keyed by the
+  // assertion URI and travels with the assertion through SWM gossip;
+  // publish reads the seal and forwards it verbatim to KAv10.
+  //
+  // Author resolution (mirrors `/api/shared-memory/publish` Phase 4):
+  //   1. body `preSignedAuthorAttestation` (self-sovereign)
+  //   2. body `authorAgentAddress` (admin-asserted custodial)
+  //   3. agent-scoped bearer token → that agent (custodial auto-attribution)
+  //   4. node admin token → publisher EOA fallback
+  if (
+    req.method === "POST" &&
+    path.startsWith("/api/assertion/") &&
+    path.endsWith("/finalize")
+  ) {
+    const assertionName = safeDecodeURIComponent(
+      path.slice("/api/assertion/".length, -"/finalize".length),
+      res,
+    );
+    if (assertionName === null) return;
+    const nameVal = validateAssertionName(assertionName);
+    if (!nameVal.valid)
+      return jsonResponse(res, 400, {
+        error: `Invalid assertion name: ${nameVal.reason}`,
+      });
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    const {
+      contextGraphId,
+      subGraphName,
+      authorAgentAddress: bodyAuthorAgentAddress,
+      preSignedAuthorAttestation: bodyPreSignedAttestation,
+      schemeVersion,
+    } = parsed;
+    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    if (!validateOptionalSubGraphName(subGraphName, res)) return;
+    if (
+      bodyAuthorAgentAddress != null &&
+      bodyPreSignedAttestation != null
+    ) {
+      return jsonResponse(res, 400, {
+        error:
+          '"authorAgentAddress" and "preSignedAuthorAttestation" are mutually exclusive',
+      });
+    }
+    let resolvedPreSignedAttestation:
+      | NonNullable<PublishOptions['preSignedAuthorAttestation']>
+      | undefined;
+    if (bodyPreSignedAttestation != null) {
+      const validated = validatePreSignedAuthorAttestation(
+        bodyPreSignedAttestation,
+        res,
+      );
+      if (validated === undefined) return;
+      resolvedPreSignedAttestation = validated;
+    }
+    let resolvedAuthorAgentAddress: string | undefined;
+    if (resolvedPreSignedAttestation == null) {
+      if (
+        typeof bodyAuthorAgentAddress === 'string' &&
+        bodyAuthorAgentAddress.length > 0
+      ) {
+        if (!/^0x[0-9a-fA-F]{40}$/.test(bodyAuthorAgentAddress)) {
+          return jsonResponse(res, 400, {
+            error: '"authorAgentAddress" must be a 0x-prefixed 20-byte EVM address',
+          });
+        }
+        resolvedAuthorAgentAddress = bodyAuthorAgentAddress;
+      } else {
+        // Auto-attribute when the request was authenticated with an
+        // agent-scoped bearer token. Node admin tokens fall through to
+        // the publisher-wallet fallback inside `assertionFinalize`.
+        const requestToken = extractBearerToken(req.headers.authorization);
+        const tokenAgentAddress = requestToken
+          ? agent.resolveAgentByToken(requestToken)
+          : undefined;
+        if (tokenAgentAddress != null) {
+          resolvedAuthorAgentAddress = tokenAgentAddress;
+        }
+      }
+    }
+    if (
+      schemeVersion != null &&
+      (typeof schemeVersion !== 'number' || !Number.isInteger(schemeVersion) || schemeVersion < 1)
+    ) {
+      return jsonResponse(res, 400, {
+        error: '"schemeVersion" must be a positive integer when supplied',
+      });
+    }
+    try {
+      const seal = await agent.assertion.finalize(contextGraphId, assertionName, {
+        ...(subGraphName ? { subGraphName } : {}),
+        ...(resolvedAuthorAgentAddress
+          ? { authorAgentAddress: resolvedAuthorAgentAddress }
+          : {}),
+        ...(resolvedPreSignedAttestation
+          ? { preSignedAuthorAttestation: resolvedPreSignedAttestation }
+          : {}),
+        ...(schemeVersion != null ? { schemeVersion } : {}),
+      });
+      return jsonResponse(res, 200, {
+        assertionUri: seal.assertionUri,
+        merkleRoot: ethers.hexlify(seal.merkleRoot),
+        authorAddress: seal.authorAddress,
+        schemeVersion: seal.schemeVersion,
+        chainId: seal.chainId.toString(),
+        kav10Address: seal.kav10Address,
+        eip712Digest: seal.eip712Digest,
+      });
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      if (
+        message.includes('not found') ||
+        message.includes('Invalid') ||
+        message.includes('Unsafe') ||
+        message.includes('not registered') ||
+        message.includes('mutually exclusive') ||
+        message.includes('not a registered local agent') ||
+        message.includes('signer mismatch') ||
+        message.includes('has no quads') ||
+        message.includes('different merkleRoot') ||
+        message.includes('not registered on-chain')
+      ) {
+        return jsonResponse(res, 400, { error: message });
       }
       throw err;
     }

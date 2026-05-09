@@ -543,11 +543,20 @@ WHERE {
     }
   }
 
-  // POST /api/shared-memory/write (V10) or /api/workspace/write (legacy)
-  if (
-    req.method === "POST" &&
-    (path === "/api/shared-memory/write" || path === "/api/workspace/write")
-  ) {
+  // POST /api/shared-memory/write
+  //
+  // Direct SWM write entry point. Writes loose triples to shared memory
+  // without minting a named-assertion seal. Triples land in SWM as
+  // ungrouped content; downstream selection-based publishes
+  // (POST /api/shared-memory/publish with `selection`) seal them at
+  // the publish boundary via the agent's selection bridge — see
+  // `agent.publishFromSharedMemory` for the inline-seal logic.
+  //
+  // For seal-from-creation provenance, use the named-assertion
+  // lifecycle instead: POST /api/assertion/create with `quads,
+  // finalize: true, promote: true` followed by
+  // POST /api/shared-memory/publish with `assertionName`.
+  if (req.method === "POST" && path === "/api/shared-memory/write") {
     const body = await readBody(req);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
@@ -602,12 +611,23 @@ WHERE {
     }
   }
 
-  // POST /api/shared-memory/publish (V10) or /api/workspace/enshrine (legacy)
-  if (
-    req.method === "POST" &&
-    (path === "/api/shared-memory/publish" ||
-      path === "/api/workspace/enshrine")
-  ) {
+  // POST /api/shared-memory/publish
+  //
+  // Two operating modes (mutually exclusive):
+  //
+  //   1. `assertionName` body field — finalized-assertion fork. The seal
+  //      lives in `_meta` (written by /api/assertion/:name/finalize).
+  //      The agent reads it, threads it as `precomputedAttestation`,
+  //      and the publisher forwards verbatim. No re-sign, no re-hash.
+  //
+  //   2. `selection` body field (or omitted, defaults to 'all') —
+  //      selection-based fork. The agent loads the selected SWM quads,
+  //      mints a precomputedAttestation inline at the selection
+  //      boundary (RFC-001 §9.x sign-at-creation invariant — the seal
+  //      exists before the publisher gets the payload), then publishes.
+  //      `authorAgentAddress` / `preSignedAuthorAttestation` /
+  //      bearer-token attribution all settle here.
+  if (req.method === "POST" && path === "/api/shared-memory/publish") {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;

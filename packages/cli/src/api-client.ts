@@ -177,17 +177,16 @@ export class ApiClient {
   }
 
   /**
-   * @deprecated Use `appendToAssertion` (named WM assertion) or
-   * `publishAssertion` (one-shot lifecycle). This shim still routes
-   * through the legacy `/api/shared-memory/write` route to keep
-   * unmigrated callers working; once Phase B-C lands and that route
-   * is removed, this method will throw.
+   * Direct SWM write — appends loose triples to shared memory without
+   * creating a named WM assertion. Triples land ungrouped; downstream
+   * selection-based publishes (see `publishFromSharedMemory`) seal
+   * them at the publish boundary via the agent's selection bridge.
    *
-   * Phase B migration: every caller of this method must move to a
-   * named-assertion flow. Pre-existing call sites:
-   *   - benchmarks/runner.ts (sync + async publish-get)
-   *   - mcp-dkg, openclaw, network-sim, node-ui (production clients)
-   *   - scripts/{seed,redistribute,drain}.mjs (one-off ops)
+   * Use this for "write loose content, decide what to publish later"
+   * workflows (e.g. node-ui MemoryLayer, mcp `dkg_share`). For
+   * sealed-from-creation provenance, use `createAssertion` /
+   * `appendToAssertion` / `publishAssertion` instead — the seal then
+   * binds to the named assertion at finalize time.
    */
   async sharedMemoryWrite(contextGraphId: string, quads: Array<{
     subject: string; predicate: string; object: string; graph: string;
@@ -203,10 +202,19 @@ export class ApiClient {
   }
 
   /**
-   * @deprecated Use `publishFromFinalizedAssertion` or
-   * `publishAssertion`. Shim that routes through the legacy
-   * `/api/shared-memory/publish` (without `assertionName`); will be
-   * removed alongside the route in Phase B-C.
+   * Selection-based publish — publishes the selected SWM rootEntities
+   * (or all SWM content) to verified memory. The agent mints the
+   * AuthorAttestation seal inline at the selection boundary using
+   * the calling agent's bearer-token identity / explicit
+   * `authorAgentAddress` / `preSignedAuthorAttestation`, or falls
+   * back to the publisher's wallet. The publisher refuses any
+   * on-chain publish without a seal — sign-at-creation is preserved
+   * at the daemon boundary regardless of which fork the caller used
+   * to put content into SWM.
+   *
+   * For finalized-assertion publishes (seal from creation), use
+   * `publishFromFinalizedAssertion` instead — that path threads the
+   * already-signed seal through verbatim with no re-signing.
    */
   async publishFromSharedMemory(
     contextGraphId: string,
@@ -514,22 +522,6 @@ export class ApiClient {
   }> {
     const qs = probeKey ? `?key=${encodeURIComponent(probeKey)}` : '';
     return this.get(`/api/pca/${encodeURIComponent(accountId)}${qs}`);
-  }
-
-  /** @deprecated Use `publishFromFinalizedAssertion` or `publishAssertion`. */
-  async workspaceEnshrine(
-    contextGraphId: string,
-    selection: 'all' | { rootEntities: string[] } = 'all',
-    clearAfter = true,
-    options?: { subGraphName?: string },
-  ): Promise<{
-    kcId: string;
-    status: 'tentative' | 'confirmed';
-    kas: Array<{ tokenId: string; rootEntity: string }>;
-    txHash?: string;
-    blockNumber?: number;
-  }> {
-    return this.publishFromSharedMemory(contextGraphId, selection, clearAfter, options);
   }
 
   async publisherEnqueue(request: {

@@ -104,8 +104,8 @@ const BLOCKS = [
   [1223, 'openclaw', '/api/openclaw-channel/health'], // GET /api/openclaw-channel/health
   [1228, 'agent-chat', '/api/connect'], // POST /api/connect
   [1243, 'agent-chat', '/api/update'], // POST /api/update
-  [1318, 'memory', '/api/shared-memory/write|/api/workspace/write'], // multi-line if
-  [1378, 'memory', '/api/shared-memory/publish|/api/workspace/enshrine'], // multi-line if
+  [1318, 'memory', '/api/shared-memory/write'], // POST /api/shared-memory/write
+  [1378, 'memory', '/api/shared-memory/publish'], // POST /api/shared-memory/publish
   [1463, 'publisher', '/api/publisher/enqueue'], // POST /api/publisher/enqueue
   [1515, 'publisher', '/api/publisher/jobs'], // GET /api/publisher/jobs
   [1527, 'publisher', '"/api/publisher/job"'], // GET /api/publisher/job (quote-anchored to disambiguate from /jobs and /job-payload)

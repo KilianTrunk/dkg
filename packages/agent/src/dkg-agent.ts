@@ -3641,6 +3641,39 @@ export class DKGAgent {
 
     const onChainId = await this.getContextGraphOnChainId(contextGraphId);
 
+    // RFC-001 §9.x — sign-at-creation. The publisher refuses on-chain
+    // publishes without a `precomputedAttestation`, so the agent
+    // mints one here at the publish boundary using the publisher
+    // fallback signer (legacy `agent.publish(quads)` callers don't
+    // carry author identity hints — mode (a) of Phase 4: daemon signs
+    // as itself). The seal binds (chainId, kav10Address,
+    // contextGraphId, merkleRoot, authorAddress); any drift between
+    // the agent-computed merkleRoot and the publisher's recompute
+    // surfaces as the publisher's `expectedMerkleRoot mismatch`
+    // guard. Skip when the chain isn't V10-capable or the CG isn't
+    // on-chain — the publisher will go tentative anyway.
+    let precomputedAttestation: PublishOptions['precomputedAttestation'];
+    if (
+      onChainId != null &&
+      typeof this.chain.getEvmChainId === 'function' &&
+      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+    ) {
+      try {
+        precomputedAttestation = await this._buildPrecomputedAttestationForSelection(
+          contextGraphId,
+          quads,
+          { targetOnChainCgId: onChainId },
+        );
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `Inline seal mint failed; on-chain publish will fall back to tentative: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+
     const result = await this.publisher.publish({
       contextGraphId,
       quads,
@@ -3653,6 +3686,7 @@ export class DKGAgent {
       onPhase,
       v10ACKProvider,
       publishContextGraphId: onChainId ?? undefined,
+      precomputedAttestation,
     });
 
     onPhase?.('broadcast', 'start');
@@ -4058,6 +4092,216 @@ export class DKGAgent {
   }
 
   /**
+   * RFC-001 §9.x — selection-based publish bridge.
+   *
+   * Mints a `precomputedAttestation` inline for a given quads bag,
+   * without writing seal triples to `_meta`. Used by
+   * `publishFromSharedMemory(selection)` to preserve the
+   * "agent picks rootEntities post-hoc, then publishes" UX while
+   * keeping the sign-at-creation invariant: the seal is computed and
+   * signed at the agent boundary, before the publisher gets the
+   * payload. The publisher then refuses the on-chain publish if the
+   * seal is absent or its merkleRoot doesn't match what it recomputes
+   * from the quads (defence against in-flight tampering between
+   * selection and broadcast).
+   *
+   * Author resolution mirrors `assertionFinalize`:
+   *   1. `preSignedAuthorAttestation` (self-sovereign agent's pre-sig)
+   *   2. `authorAgentAddress` (custodial agent — daemon holds the key)
+   *   3. publisher fallback (the daemon's own publisher EOA signs)
+   *
+   * Unlike `assertionFinalize`, the seal is NOT persisted: it lives
+   * only in the publish call. This is by design — selection-based
+   * publishes are inherently ephemeral curations, not long-lived
+   * named assertions. If you need persistent seal provenance, use the
+   * named-assertion lifecycle (`createAssertion` + `appendToAssertion`
+   * + `finalizeAssertion` + `publishFromFinalizedAssertion`).
+   */
+  private async _buildPrecomputedAttestationForSelection(
+    contextGraphId: string,
+    quads: Quad[],
+    opts?: {
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: PreSignedAuthorAttestation;
+      schemeVersion?: number;
+      /**
+       * On-chain CG id the seal binds to. Defaults to the source
+       * `contextGraphId`'s on-chain id; override for remap-flow
+       * publishes (`publishContextGraphId` / `subContextGraphId` set
+       * on the publish call) where the assertion lives in a different
+       * CG than the SWM source.
+       */
+      targetOnChainCgId?: bigint | string;
+    },
+  ): Promise<PublishOptions['precomputedAttestation']> {
+    if (
+      opts?.authorAgentAddress != null &&
+      opts?.preSignedAuthorAttestation != null
+    ) {
+      throw new Error(
+        '_buildPrecomputedAttestationForSelection: authorAgentAddress and preSignedAuthorAttestation are mutually exclusive',
+      );
+    }
+    if (
+      typeof this.chain.getEvmChainId !== 'function' ||
+      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+    ) {
+      throw new Error(
+        'Selection-based VM publish requires a V10-capable chain adapter that exposes ' +
+          'getEvmChainId() and getKnowledgeAssetsV10Address().',
+      );
+    }
+
+    const kaMap = autoPartition(quads);
+    const allSkolemizedQuads = [...kaMap.values()].flat();
+    const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, []);
+
+    const chainId = await this.chain.getEvmChainId();
+    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const onChainCgId =
+      opts?.targetOnChainCgId !== undefined
+        ? BigInt(opts.targetOnChainCgId)
+        : await this.requireOnChainContextGraphId(contextGraphId);
+
+    const schemeVersion = opts?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
+    let authorAddress: string;
+    let signerPrivateKey: string | undefined;
+    let preSigned: PreSignedAuthorAttestation | undefined;
+    if (opts?.preSignedAuthorAttestation != null) {
+      preSigned = opts.preSignedAuthorAttestation;
+      authorAddress = preSigned.address;
+    } else if (opts?.authorAgentAddress != null) {
+      const mode = this.getLocalAgentMode(opts.authorAgentAddress);
+      if (mode === undefined) {
+        throw new Error(
+          `Selection-based VM publish: authorAgentAddress ${opts.authorAgentAddress} is not a registered local agent on this node`,
+        );
+      }
+      if (mode === 'self-sovereign') {
+        throw new Error(
+          `Selection-based VM publish: agent ${opts.authorAgentAddress} is registered as self-sovereign — ` +
+            `this node does not hold its private key. Use preSignedAuthorAttestation instead.`,
+        );
+      }
+      signerPrivateKey = this.getCustodialAgentPrivateKey(opts.authorAgentAddress);
+      if (!signerPrivateKey) {
+        throw new Error(
+          `Selection-based VM publish: custodial agent ${opts.authorAgentAddress} has no private key on file`,
+        );
+      }
+      authorAddress = opts.authorAgentAddress;
+    } else {
+      const fallbackAddress = await this.publisher.publisherFallbackAuthorAddress();
+      if (!fallbackAddress) {
+        throw new Error(
+          'Selection-based VM publish: no agent override supplied and no publisher signer is available. ' +
+            'Either supply authorAgentAddress / preSignedAuthorAttestation, or configure a publisher private key on the daemon.',
+        );
+      }
+      authorAddress = fallbackAddress;
+    }
+
+    const typedData = buildAuthorAttestationTypedData({
+      chainId,
+      kav10Address,
+      contextGraphId: onChainCgId,
+      merkleRoot,
+      authorAddress,
+      schemeVersion,
+    });
+    const eip712Digest = ethers.TypedDataEncoder.hash(
+      typedData.domain,
+      typedData.types,
+      typedData.message,
+    );
+
+    let r: Uint8Array;
+    let vs: Uint8Array;
+    if (preSigned) {
+      const sig = ethers.Signature.from({
+        r: ethers.hexlify(preSigned.signature.r),
+        yParityAndS: ethers.hexlify(preSigned.signature.vs),
+      });
+      const recovered = ethers.recoverAddress(eip712Digest, sig);
+      if (recovered.toLowerCase() !== authorAddress.toLowerCase()) {
+        throw new Error(
+          `Selection-based VM publish: preSignedAuthorAttestation signer mismatch — ` +
+            `signature recovers ${recovered} but address claims ${authorAddress}.`,
+        );
+      }
+      r = preSigned.signature.r;
+      vs = preSigned.signature.vs;
+    } else if (signerPrivateKey) {
+      const wallet = new ethers.Wallet(
+        signerPrivateKey.startsWith('0x') ? signerPrivateKey : '0x' + signerPrivateKey,
+      );
+      const sigHex = await wallet.signTypedData(
+        typedData.domain,
+        typedData.types,
+        typedData.message,
+      );
+      const sig = ethers.Signature.from(sigHex);
+      r = ethers.getBytes(sig.r);
+      vs = ethers.getBytes(sig.yParityAndS);
+    } else {
+      const compact = await this.publisher.signAuthorAttestationAsPublisher(typedData);
+      r = compact.r;
+      vs = compact.vs;
+    }
+
+    return {
+      expectedMerkleRoot: merkleRoot,
+      authorAddress,
+      signature: { r, vs },
+      schemeVersion,
+    };
+  }
+
+  /**
+   * Load the quads that a selection-based publish would target.
+   * Mirrors the SPARQL CONSTRUCT inside
+   * `publisher.publishFromSharedMemory` so the agent can pre-compute
+   * the assertion seal over the same content the publisher will see
+   * at broadcast time. Any drift (e.g. concurrent SWM mutation
+   * between this load and the publisher's load) surfaces as the
+   * publisher's `expectedMerkleRoot mismatch` error rather than a
+   * silent wrong-content publish.
+   */
+  private async _loadSelectedSWMQuads(
+    contextGraphId: string,
+    selection: 'all' | { rootEntities: string[] },
+    subGraphName?: string,
+  ): Promise<Quad[]> {
+    const swmGraph = contextGraphSharedMemoryUri(contextGraphId, subGraphName);
+    let sparql: string;
+    if (selection === 'all') {
+      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${swmGraph}> { ?s ?p ?o } }`;
+    } else {
+      const roots = [...new Set(
+        selection.rootEntities.map((r) => String(r).trim()),
+      )];
+      if (roots.length === 0) {
+        throw new Error(
+          `_loadSelectedSWMQuads: no rootEntities supplied for context graph ${contextGraphId}`,
+        );
+      }
+      const values = roots.map((r) => `<${r}>`).join(' ');
+      sparql = `CONSTRUCT { ?s ?p ?o } WHERE {
+        GRAPH <${swmGraph}> {
+          VALUES ?root { ${values} }
+          ?s ?p ?o .
+          FILTER(
+            ?s = ?root
+            || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))
+          )
+        }
+      }`;
+    }
+    const result = await this.store.query(sparql);
+    return result.type === 'quads' ? result.quads : [];
+  }
+
+  /**
    * RFC-001 §9.x — publish a previously-finalized assertion to the
    * verified-memory chain.
    *
@@ -4214,17 +4458,36 @@ export class DKGAgent {
       publisherNodeIdentityIdOverride?: bigint;
       /**
        * RFC-001 §9.x — pre-computed attestation captured by
-       * `agent.assertion.finalize()`. Required for on-chain publishes
-       * (publisher refuses to broadcast without it). The seal carries
-       * the merkleRoot, authorAddress, signature, and schemeVersion;
-       * the publisher forwards verbatim and never re-signs.
+       * `agent.assertion.finalize()`. When the caller has already
+       * sealed a named assertion they can plumb the seal here verbatim
+       * and the publisher forwards it unchanged.
        *
-       * The legacy `authorAgentAddress` and `preSignedAuthorAttestation`
-       * options that used to ride this method have been removed in
-       * Phase C — author identity is settled at finalize-time, never
-       * at publish-time.
+       * If omitted AND the publish is going on-chain (V10-capable
+       * adapter + on-chain CG id), the agent mints a seal inline at
+       * the selection boundary using `authorAgentAddress` /
+       * `preSignedAuthorAttestation` / publisher fallback. This is the
+       * "selection-based publish" UX bridge — agents/users keep
+       * picking rootEntities post-hoc, but the seal is still computed
+       * and signed before the publisher sees the payload.
        */
       precomputedAttestation?: PublishOptions['precomputedAttestation'];
+      /**
+       * Agent address to attribute authorship to when minting an
+       * inline seal at this layer. Must be a registered local agent
+       * with custodial keys (the daemon holds the private key). For
+       * self-sovereign agents use `preSignedAuthorAttestation`. Has
+       * no effect when `precomputedAttestation` is also supplied.
+       */
+      authorAgentAddress?: string;
+      /**
+       * Pre-signed AuthorAttestation by a self-sovereign agent whose
+       * private key isn't held by the daemon. Has no effect when
+       * `precomputedAttestation` is also supplied. Mutually exclusive
+       * with `authorAgentAddress`.
+       */
+      preSignedAuthorAttestation?: PreSignedAuthorAttestation;
+      /** Author scheme version override (defaults to AUTHOR_SCHEME_VERSION_V1). */
+      schemeVersion?: number;
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -4234,6 +4497,45 @@ export class DKGAgent {
     const onChainId = ctxGraphIdStr ?? (await this.getContextGraphOnChainId(contextGraphId)) ?? undefined;
 
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
+
+    // RFC-001 §9.x — selection-based publish bridge. If the caller
+    // already sealed the content (named-assertion lifecycle) they
+    // pass `precomputedAttestation` through and we forward verbatim.
+    // Otherwise, when we know we're going on-chain (V10 adapter + CG
+    // has on-chain id), we mint the seal here at the selection
+    // boundary so the publisher's "no on-chain publish without
+    // precomputedAttestation" guard is satisfied.
+    let resolvedSeal = options?.precomputedAttestation;
+    if (
+      !resolvedSeal &&
+      onChainId != null &&
+      typeof this.chain.getEvmChainId === 'function' &&
+      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+    ) {
+      const swmQuads = await this._loadSelectedSWMQuads(
+        contextGraphId,
+        selection,
+        options?.subGraphName,
+      );
+      if (swmQuads.length > 0) {
+        resolvedSeal = await this._buildPrecomputedAttestationForSelection(
+          contextGraphId,
+          swmQuads,
+          {
+            targetOnChainCgId: onChainId,
+            ...(options?.authorAgentAddress != null
+              ? { authorAgentAddress: options.authorAgentAddress }
+              : {}),
+            ...(options?.preSignedAuthorAttestation != null
+              ? { preSignedAuthorAttestation: options.preSignedAuthorAttestation }
+              : {}),
+            ...(options?.schemeVersion !== undefined
+              ? { schemeVersion: options.schemeVersion }
+              : {}),
+          },
+        );
+      }
+    }
 
     const result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
       operationCtx: ctx,
@@ -4245,7 +4547,7 @@ export class DKGAgent {
       v10ACKProvider,
       subGraphName: options?.subGraphName,
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
-      precomputedAttestation: options?.precomputedAttestation,
+      precomputedAttestation: resolvedSeal,
     });
 
     if (result.status === 'confirmed' && result.onChainResult) {

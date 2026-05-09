@@ -543,3 +543,130 @@ describe('Diagram 8 — multi-update author array stays consistent with the cano
       .toBe(ethers.ZeroAddress);
   });
 });
+
+// =============================================================================
+// Diagram 9 — Phase 4: author override (custodial agent's key signs the
+// AuthorAttestation; publisher submits the tx with its own EOA).
+// =============================================================================
+//
+// Reflects the production path /api/shared-memory/publish takes when an
+// agent-scoped bearer token (or a body-asserted `authorAgentAddress`) is
+// passed in: the daemon resolves the AgentKeyRecord, looks up the custodial
+// privateKey, and threads it down as `authorPrivateKey` in PublishOptions.
+// Result on-chain: KC.author == agent.wallet (NOT publisher's wallet),
+// while msg.sender / publisherAddress / publisherNodeIdentityId stay tied
+// to the daemon. RFC-001 §4(b) "publisher-as-a-service" pattern.
+
+describe('Diagram 9 — Phase 4 author override (custodial agent signs AuthorAttestation)', () => {
+  it('authorPrivateKey decouples KC.author from the publisher EOA', async () => {
+    const publisherWallet = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+    const agentWallet = ethers.Wallet.createRandom();
+    expect(agentWallet.address.toLowerCase()).not.toBe(
+      publisherWallet.address.toLowerCase(),
+    );
+
+    const publisher = makePublisher();
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q(`${ENTITY}/D9-custodial`, 'http://schema.org/name', '"Diagram9-AuthorOverride"')],
+      authorPrivateKey: agentWallet.privateKey,
+    });
+
+    expect(result.status).toBe('confirmed');
+    const kcId = result.onChainResult!.batchId;
+
+    const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
+    expect(onChainAuthor.toLowerCase()).toBe(agentWallet.address.toLowerCase());
+
+    // Publisher of record (msg.sender) on the V10 tx is still CORE_OP — the
+    // override only changed who signs the AuthorAttestation.
+    expect(result.onChainResult!.publisherAddress.toLowerCase()).toBe(
+      publisherWallet.address.toLowerCase(),
+    );
+  });
+
+  it('rejects authorPrivateKey + preSignedAuthorAttestation set together', async () => {
+    const publisher = makePublisher();
+    const author = ethers.Wallet.createRandom();
+    await expect(publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q(`${ENTITY}/D9-conflict`, 'http://schema.org/name', '"X"')],
+      authorPrivateKey: author.privateKey,
+      preSignedAuthorAttestation: {
+        address: author.address,
+        signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      },
+    })).rejects.toThrow(/mutually exclusive/);
+  });
+
+  it('rejects an invalid authorPrivateKey with a clear error', async () => {
+    const publisher = makePublisher();
+    await expect(publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q(`${ENTITY}/D9-bad-key`, 'http://schema.org/name', '"X"')],
+      authorPrivateKey: '0xnotahex',
+    })).rejects.toThrow(/authorPrivateKey/);
+  });
+});
+
+// =============================================================================
+// Diagram 10 — Phase 4: pre-signed AuthorAttestation (self-sovereign agents).
+// =============================================================================
+//
+// The self-sovereign path lets a caller whose private key the daemon does
+// NOT hold contribute authorship: the caller computes the EIP-712 digest
+// off-line over the publish-time merkleRoot, signs, and submits the
+// compact (r, vs) along with the publish payload. The publisher recovers
+// the signer from the digest and fails closed if it doesn't match the
+// claimed address.
+//
+// We test the negative branch (signature recovers to a different address)
+// because (a) it exercises the actual verification logic and (b) the
+// positive branch is structurally equivalent to Diagram 9's
+// `authorPrivateKey` path — both call `signTypedData` over the same
+// EIP-712 typed data, the only difference being WHERE the signing
+// happens. The positive happy-path is exercised end-to-end in the
+// devnet automated test suite where the daemon computes the merkle root
+// from the SWM and a self-sovereign client signs it externally.
+
+describe('Diagram 10 — Phase 4 pre-signed AuthorAttestation (self-sovereign path)', () => {
+  it('falls back to tentative when signature recovers to a different address', async () => {
+    const claimed = ethers.Wallet.createRandom();
+    const realSigner = ethers.Wallet.createRandom();
+    const publisher = makePublisher();
+    const quads: Quad[] = [q(`${ENTITY}/D10-bad-recover`, 'http://schema.org/name', '"X"')];
+
+    // Build a digest with an arbitrary fake merkle root, sign with realSigner,
+    // claim it's from `claimed`. The publisher recomputes the digest over the
+    // ACTUAL publish-time merkleRoot, recovers, and rejects on mismatch.
+    // The publisher catches signing errors and downgrades to `tentative`
+    // rather than re-throwing, so we assert on the result status + the
+    // absence of an on-chain confirmation.
+    const fakeRoot = ethers.getBytes('0x' + '11'.repeat(32));
+    const chainIdNum = await provider.getNetwork().then(n => n.chainId);
+    const td = (await import('@origintrail-official/dkg-core')).buildAuthorAttestationTypedData({
+      chainId: BigInt(chainIdNum),
+      kav10Address: kav10Address,
+      contextGraphId: BigInt(CONTEXT_GRAPH),
+      merkleRoot: fakeRoot,
+      authorAddress: claimed.address,
+    });
+    const sigHex = await realSigner.signTypedData(td.domain, td.types, td.message);
+    const sig = ethers.Signature.from(sigHex);
+
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads,
+      preSignedAuthorAttestation: {
+        address: claimed.address,
+        signature: {
+          r: ethers.getBytes(sig.r),
+          vs: ethers.getBytes(sig.yParityAndS),
+        },
+      },
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
+  });
+});

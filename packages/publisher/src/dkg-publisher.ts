@@ -261,6 +261,43 @@ interface PublisherSigner {
   ): Promise<string>;
 }
 
+/**
+ * RFC-001 §4(b) Phase 4 — narrow signer surface used when the AuthorAttestation
+ * is signed by an entity *other* than the publisher (e.g. a registered custodial
+ * agent on the daemon). Strictly typed-data only: ACK signing and the publish
+ * tx itself stay on `publisherSigner`.
+ */
+interface AuthorSigner {
+  address: string;
+  signTypedData(
+    domain: ethers.TypedDataDomain,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ): Promise<string>;
+}
+
+/**
+ * Build an AuthorSigner from a hex-encoded private key. Validates that the
+ * key parses to a wallet; throws with a clear error if it doesn't (saves
+ * an opaque downstream ethers stack trace at signing time).
+ */
+function authorSignerFromPrivateKey(privateKey: string): AuthorSigner {
+  const normalized = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+  let wallet: ethers.Wallet;
+  try {
+    wallet = new ethers.Wallet(normalized);
+  } catch (err) {
+    throw new Error(
+      `PublishOptions.authorPrivateKey is not a valid hex-encoded secp256k1 ` +
+      `private key: ${(err as Error).message}`,
+    );
+  }
+  return {
+    address: wallet.address,
+    signTypedData: (domain, types, value) => wallet.signTypedData(domain, types, value),
+  };
+}
+
 function isInternalOrigin(options: PublishOptions): boolean {
   return (options as InternalPublishOptions)[INTERNAL_ORIGIN_TOKEN] === true;
 }
@@ -965,6 +1002,19 @@ export class DKGPublisher implements Publisher {
        * Threaded into the inner `publish()` call below.
        */
       publisherNodeIdentityIdOverride?: bigint;
+      /**
+       * RFC-001 §4(b) Phase 4 — author signing override. See
+       * `PublishOptions.authorPrivateKey`. Threaded into the inner
+       * `publish()` call so the AuthorAttestation is signed with the
+       * caller-supplied key (e.g. a registered custodial agent) instead
+       * of the publisher's own wallet.
+       */
+      authorPrivateKey?: string;
+      /**
+       * RFC-001 §4(b) Phase 4 — pre-signed AuthorAttestation for
+       * self-sovereign agents. See `PublishOptions.preSignedAuthorAttestation`.
+       */
+      preSignedAuthorAttestation?: PublishOptions['preSignedAuthorAttestation'];
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -1079,6 +1129,8 @@ export class DKGPublisher implements Publisher {
       fromSharedMemory: true,
       subGraphName: options?.subGraphName,
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
+      authorPrivateKey: options?.authorPrivateKey,
+      preSignedAuthorAttestation: options?.preSignedAuthorAttestation,
       [INTERNAL_ORIGIN_TOKEN]: true,
     };
     const publishResult = await this.publish(internalPublishOptions);
@@ -1400,6 +1452,22 @@ export class DKGPublisher implements Publisher {
     const canAttemptOnChainPublish = willAttemptOnChainPublish &&
       chainV10Ready &&
       publisherSigner !== undefined;
+
+    // RFC-001 §4(b) Phase 4 — author signer override. When the daemon route
+    // (or a unit test) supplies `authorPrivateKey`, the AuthorAttestation is
+    // signed with that key and the on-chain `KC.author` becomes the matching
+    // EOA. Pre-signed path (`preSignedAuthorAttestation`) skips local signing
+    // entirely. Both default to undefined → publisher signs as today.
+    if (options.authorPrivateKey != null && options.preSignedAuthorAttestation != null) {
+      throw new Error(
+        'PublishOptions.authorPrivateKey and PublishOptions.preSignedAuthorAttestation ' +
+        'are mutually exclusive — supply at most one.',
+      );
+    }
+    const authorSigner: AuthorSigner | undefined =
+      options.authorPrivateKey != null
+        ? authorSignerFromPrivateKey(options.authorPrivateKey)
+        : undefined;
 
     if (effectiveAccessPolicy !== 'public' && normalizedPublisherPeerId.length === 0) {
       throw new Error(
@@ -1780,24 +1848,58 @@ export class DKGPublisher implements Publisher {
         }
         // RFC-001 §3 author attestation. EIP-712 typed-data signature
         // over (contextGraphId, merkleRoot, authorAddress, schemeVersion)
-        // bound to (KAV10 chainId, KAV10 contract). The publisher signer
-        // is the author of record for this publish — the same EOA that
-        // submits the tx. PCA / EIP-1271 / EIP-7702 indirection is
-        // future work (RFC-001 §9.6); v1 is single-key only.
+        // bound to (KAV10 chainId, KAV10 contract).
+        //
+        // Phase 4: author defaults to the publisher's own EOA (today's
+        // behaviour — `KC.author = msg.sender`). When the caller supplies
+        // an `authorSigner` (e.g. a registered custodial agent's wallet,
+        // resolved from the bearer token by the daemon's publish route),
+        // the AuthorAttestation is signed with that key instead and
+        // `KC.author = authorSigner.address`, decoupling authorship from
+        // the routing publisher. `preSignedAuthorAttestation` covers the
+        // self-sovereign case where the daemon doesn't hold the key.
+        const effectiveAuthorAddress =
+          options.preSignedAuthorAttestation?.address
+          ?? authorSigner?.address
+          ?? publisherSigner.address;
         const authorTypedData = buildAuthorAttestationTypedData({
           chainId: v10ChainId,
           kav10Address: v10KavAddress,
           contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
-          authorAddress: publisherSigner.address,
+          authorAddress: effectiveAuthorAddress,
         });
-        const authorSig = ethers.Signature.from(
-          await publisherSigner.signTypedData(
+        let authorSig: ethers.Signature;
+        if (options.preSignedAuthorAttestation) {
+          authorSig = ethers.Signature.from({
+            r: ethers.hexlify(options.preSignedAuthorAttestation.signature.r),
+            yParityAndS: ethers.hexlify(options.preSignedAuthorAttestation.signature.vs),
+          });
+          const digest = ethers.TypedDataEncoder.hash(
             authorTypedData.domain,
             authorTypedData.types,
             authorTypedData.message,
-          ),
-        );
+          );
+          const recovered = ethers.recoverAddress(digest, authorSig);
+          if (recovered.toLowerCase() !== effectiveAuthorAddress.toLowerCase()) {
+            throw new Error(
+              `preSignedAuthorAttestation signer mismatch: signature recovers ${recovered} ` +
+              `but address claims ${effectiveAuthorAddress}. The signature must be over the ` +
+              `EIP-712 AuthorAttestation built with the publish-time merkleRoot ` +
+              `(${ethers.hexlify(kcMerkleRoot)}), chainId=${v10ChainId.toString()}, ` +
+              `kav10Address=${v10KavAddress}, contextGraphId=${v10CgId.toString()}.`,
+            );
+          }
+        } else {
+          const signer = authorSigner ?? publisherSigner;
+          authorSig = ethers.Signature.from(
+            await signer.signTypedData(
+              authorTypedData.domain,
+              authorTypedData.types,
+              authorTypedData.message,
+            ),
+          );
+        }
         // P-1 review (iter-2): `chain:writeahead:start` now fires
         // *from inside* the adapter via the `onBroadcast` callback,
         // which the adapter invokes immediately before the real
@@ -1867,7 +1969,7 @@ export class DKGPublisher implements Publisher {
             isImmutable: false,
             publisherNodeIdentityId: attributionIdentityId,
             author: {
-              address: publisherSigner.address,
+              address: effectiveAuthorAddress,
               signature: {
                 r: ethers.getBytes(authorSig.r),
                 vs: ethers.getBytes(authorSig.yParityAndS),
@@ -1904,7 +2006,7 @@ export class DKGPublisher implements Publisher {
             allowedPeers: normalizedAllowedPeers,
             timestamp: new Date(),
             subGraphName: options.subGraphName,
-            authorAddress: publisherSigner.address,
+            authorAddress: effectiveAuthorAddress,
             publishOperationId,
           },
           kaMetadata,
@@ -1985,8 +2087,18 @@ export class DKGPublisher implements Publisher {
           allowedPeers: normalizedAllowedPeers,
           timestamp: new Date(),
           subGraphName: options.subGraphName,
-          ...(publisherSigner
-            ? { authorAddress: publisherSigner.address, publishOperationId }
+          // Tentative path runs OUTSIDE the on-chain success branch where
+          // `effectiveAuthorAddress` is computed, so resolve again here.
+          // Order: pre-signed > authorSigner > publisherSigner.
+          ...((options.preSignedAuthorAttestation?.address
+            ?? authorSigner?.address
+            ?? publisherSigner?.address) != null
+            ? {
+                authorAddress: (options.preSignedAuthorAttestation?.address
+                  ?? authorSigner?.address
+                  ?? publisherSigner!.address),
+                publishOperationId,
+              }
             : {}),
         },
         kaMetadata,

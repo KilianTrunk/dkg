@@ -29,7 +29,7 @@ import {
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
   computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
   TripleStoreAsyncLiftPublisher,
-  type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
+  type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
@@ -2745,6 +2745,35 @@ export class DKGAgent {
   }
 
   /**
+   * Look up the custodial private key for a registered agent.
+   *
+   * Returns the hex-encoded private key for `mode === 'custodial'` agents
+   * (the daemon generated and persisted the keypair at registration). Returns
+   * `undefined` if the agent is unknown to this node, is `'self-sovereign'`
+   * (the node never had the key), or does not have a `privateKey` field set
+   * for any reason.
+   *
+   * Used by `publishFromSharedMemory` to resolve a per-publish author signer
+   * without exposing the entire `AgentKeyRecord` (which would leak the auth
+   * token hash and other off-axis material). Phase 4 / RFC-001 §4(b).
+   *
+   * @param address Ethereum address of the registered agent.
+   */
+  getCustodialAgentPrivateKey(address: string): string | undefined {
+    const record = this.localAgents.get(address);
+    if (!record || record.mode !== 'custodial') return undefined;
+    return record.privateKey;
+  }
+
+  /**
+   * Look up the registration mode for a known local agent.
+   * Returns undefined if the agent is unknown to this node.
+   */
+  getLocalAgentMode(address: string): 'custodial' | 'self-sovereign' | undefined {
+    return this.localAgents.get(address)?.mode;
+  }
+
+  /**
    * Get the default agent address for this node.
    * Used when requests come in with a node-level token.
    */
@@ -3748,6 +3777,33 @@ export class DKGAgent {
        * used for ACK self-signing and signer resolution.
        */
       publisherNodeIdentityIdOverride?: bigint;
+      /**
+       * RFC-001 §4(b) Phase 4 — author identity override.
+       *
+       * Address of a registered LOCAL agent on this node whose private
+       * key should sign the on-chain EIP-712 AuthorAttestation. The
+       * daemon's publish route resolves the bearer token to an
+       * `AgentKeyRecord` and supplies that agent's address here; the
+       * agent layer looks up the custodial private key in its keystore
+       * and threads it down to the publisher.
+       *
+       * On-chain effect: `KC.author = <this address>` while
+       * `msg.sender = <daemon publisher EOA>` and
+       * `publisherNodeIdentityId = <override or daemon id>` — i.e.
+       * authorship and routing are decoupled.
+       *
+       * Throws if the address is not registered locally or is registered
+       * but `mode === 'self-sovereign'` (no key on this node — caller
+       * must use `preSignedAuthorAttestation` instead).
+       *
+       * Mutually exclusive with `preSignedAuthorAttestation`.
+       */
+      authorAgentAddress?: string;
+      /**
+       * RFC-001 §4(b) Phase 4 — author identity for self-sovereign agents.
+       * Pass-through to `PublishOptions.preSignedAuthorAttestation`.
+       */
+      preSignedAuthorAttestation?: PublishOptions['preSignedAuthorAttestation'];
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -3757,6 +3813,46 @@ export class DKGAgent {
     const onChainId = ctxGraphIdStr ?? (await this.getContextGraphOnChainId(contextGraphId)) ?? undefined;
 
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
+
+    // RFC-001 §4(b) Phase 4 — resolve the author signing key. Mutually
+    // exclusive with `preSignedAuthorAttestation`. When `authorAgentAddress`
+    // names a local custodial agent we look up its private key in the
+    // keystore and pass it to the publisher; the publisher signs the
+    // EIP-712 AuthorAttestation with that key, and on-chain `KC.author`
+    // becomes the agent's address (decoupled from `msg.sender`).
+    if (
+      options?.authorAgentAddress != null &&
+      options?.preSignedAuthorAttestation != null
+    ) {
+      throw new Error(
+        'publishFromSharedMemory: authorAgentAddress and preSignedAuthorAttestation ' +
+        'are mutually exclusive — supply at most one.',
+      );
+    }
+    let resolvedAuthorPrivateKey: string | undefined;
+    if (options?.authorAgentAddress != null) {
+      const mode = this.getLocalAgentMode(options.authorAgentAddress);
+      if (mode === undefined) {
+        throw new Error(
+          `publishFromSharedMemory: authorAgentAddress ${options.authorAgentAddress} ` +
+          `is not a registered local agent on this node`,
+        );
+      }
+      if (mode === 'self-sovereign') {
+        throw new Error(
+          `publishFromSharedMemory: agent ${options.authorAgentAddress} is registered ` +
+          `as self-sovereign — this node does not hold its private key. Use ` +
+          `preSignedAuthorAttestation instead.`,
+        );
+      }
+      resolvedAuthorPrivateKey = this.getCustodialAgentPrivateKey(options.authorAgentAddress);
+      if (!resolvedAuthorPrivateKey) {
+        throw new Error(
+          `publishFromSharedMemory: custodial agent ${options.authorAgentAddress} ` +
+          `has no private key on file (keystore corruption or partial migration)`,
+        );
+      }
+    }
 
     const result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
       operationCtx: ctx,
@@ -3768,6 +3864,8 @@ export class DKGAgent {
       v10ACKProvider,
       subGraphName: options?.subGraphName,
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
+      authorPrivateKey: resolvedAuthorPrivateKey,
+      preSignedAuthorAttestation: options?.preSignedAuthorAttestation,
     });
 
     if (result.status === 'confirmed' && result.onChainResult) {

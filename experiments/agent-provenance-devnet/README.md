@@ -13,14 +13,18 @@ prefer running them before falling back to the manual recipes below.
 
 | Suite | Scope | Runtime | Command |
 | --- | --- | --- | --- |
-| Hardhat e2e | All 8 sequence diagrams from `RFC-001-implementation-walkthrough.md`, run against an in-process Hardhat EVM. Covers contract correctness + publisher integration in a single process. | ~30s | `pnpm test:e2e:agent-provenance` |
-| 5-node devnet | Modes (a), (c), (d) and the negative-case from §4 + §9.5, run against `./scripts/devnet.sh start 5`. Validates CLI plumbing + multi-node ACK quorum on top. | ~35s after devnet is up | `pnpm test:devnet:agent-provenance` |
+| Hardhat e2e | All 10 sequence diagrams from `RFC-001-implementation-walkthrough.md` (incl. Phase 4 author override + pre-signed AuthorAttestation), run against an in-process Hardhat EVM. Covers contract correctness + publisher integration in a single process. | ~30s | `pnpm test:e2e:agent-provenance` |
+| 5-node devnet | All 4 modes (a/b/c/d) + negative case from §4 + §9.5, run against `./scripts/devnet.sh start 5`. Mode (b) registers a custodial agent on core 2 and validates `KC.author = agent.wallet` while `publisherNodeIdentityId = core2.id`. | ~35s after devnet is up | `pnpm test:devnet:agent-provenance` |
 
-Mode (b) (publisher-as-a-service) is intentionally not in either
-automated suite — it depends on the Phase 4 daemon-side
-`AuthorAttestation` signing path (Hermes / `ChatTurnWriter`) which is
-out of scope for PR #436. The §4(b) recipe below still applies to a
-manual run once Phase 4 lands.
+Phase 4 author override (RFC §4(b)) is now wired end-to-end via the
+agent-keystore: end-user agents register on a daemon (`POST
+/api/agent/register`) and publish through that daemon's
+`/api/shared-memory/publish` route. The route resolves the bearer
+token to an `AgentKeyRecord`, looks up the custodial private key, and
+threads it into the publisher as `authorPrivateKey` so the on-chain
+`AuthorAttestation` is signed by the *agent*, not the daemon. See
+diagrams 9–10 in `RFC-001-implementation-walkthrough.md` for the full
+sequence; see the `(b)` recipe below for the manual equivalent.
 
 The devnet suite expects an already-running devnet (boot once, run
 many times). To opt into auto-boot+teardown for nightly CI, set
@@ -157,23 +161,45 @@ node5 publish <cgId> \
 > core2.publisher`.
 
 ```bash
-# Fixture (one-time)
+# Fixture (one-time) — register a custodial agent on core 2.
+# Returns { agentAddress, authToken, privateKey } the first time.
+AGENT_TOKEN=$(curl -s -X POST \
+  -H "Authorization: Bearer $(cat .devnet/node2/auth.token)" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"mode-b-agent","framework":"phase4-runbook"}' \
+  http://127.0.0.1:9202/api/agent/register | jq -r .authToken)
+
+# Action — end-user agent writes quads + publishes through core 2,
+# authenticating with its OWN bearer token. The daemon resolves the
+# token → agent → custodial privateKey → AuthorAttestation signer.
+curl -s http://127.0.0.1:9202/api/shared-memory/write \
+  -H "Authorization: Bearer $AGENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "contextGraphId": "<cgId>",
+        "quads": [{
+          "subject": "urn:test:mode-b:1",
+          "predicate": "https://schema.org/name",
+          "object": "\"mode-b\"",
+          "graph": "did:dkg:context-graph:<cgId>"
+        }]
+      }'
+
+curl -s http://127.0.0.1:9202/api/shared-memory/publish \
+  -H "Authorization: Bearer $AGENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "contextGraphId": "<cgId>", "selection": "all", "clearAfter": true }'
+```
+
+Optional: register on core 2's PCA so the publish is discounted (this
+mirrors the spec wording where core 2's submitter EOA sits on its own
+PCA `authorizedKeys`). Without the PCA fixture the publish still
+succeeds; core 2's publisher wallet just pays the full TRAC fee.
+
+```bash
 node2 pca create --tokens 200000 --epochs 12
 NODE2_PUBLISHER=$(jq -r '.adminWallet // .publisher // .wallet' .devnet/node2/wallets.json)
 node2 pca authorize <accountId_from_create> "$NODE2_PUBLISHER"
-node2 pca info <accountId> --probe-key "$NODE2_PUBLISHER"
-
-# Action — end-user agent submits a signed turn to core 2's HTTP API,
-# core 2 forwards as the publisher.
-#
-# Mode (b) is intentionally NOT exposed via `dkg publish` because the
-# attestation has to come from the END USER's signing key, not the
-# core2 daemon. The OpenClaw channel route already accepts a
-# pre-signed `AuthorAttestation` payload.
-curl -s http://127.0.0.1:9202/api/openclaw-channel/persist-turn \
-  -H "Authorization: Bearer $(cat .devnet/node2/auth.token)" \
-  -H "Content-Type: application/json" \
-  -d @experiments/agent-provenance-devnet/turns/turn-b.signed.json
 ```
 
 **Assertions:** same shape as (a), substituting core 2 for core 1

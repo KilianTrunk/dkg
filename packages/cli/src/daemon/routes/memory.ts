@@ -58,7 +58,7 @@ const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
+import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
   MetricsCollector,
@@ -328,6 +328,63 @@ import {
 
 import type { RequestContext } from './context.js';
 
+/**
+ * Validate a `preSignedAuthorAttestation` payload from the publish request.
+ *
+ * Shape:
+ *   { address: "0x...", signature: { r: "0x..." | number[], vs: "0x..." | number[] } }
+ *
+ * Returns the normalised value with byte arrays (Uint8Array) ready to forward
+ * into `agent.publishFromSharedMemory`. Returns `undefined` and writes an
+ * appropriate 400 response when the payload is malformed.
+ *
+ * The on-chain signature check happens later inside the publisher (it
+ * recovers the address from the EIP-712 digest computed at publish time and
+ * fails closed if the recovered signer doesn't match the claimed address).
+ */
+function validatePreSignedAuthorAttestation(
+  raw: unknown,
+  res: ServerResponse,
+): PublishOptions['preSignedAuthorAttestation'] | undefined {
+  if (raw == null || typeof raw !== 'object') {
+    jsonResponse(res, 400, {
+      error: '"preSignedAuthorAttestation" must be an object',
+    });
+    return undefined;
+  }
+  const obj = raw as Record<string, unknown>;
+  const address = typeof obj.address === 'string' ? obj.address : undefined;
+  const signature = obj.signature && typeof obj.signature === 'object'
+    ? (obj.signature as Record<string, unknown>)
+    : undefined;
+  if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address) || !signature) {
+    jsonResponse(res, 400, {
+      error: '"preSignedAuthorAttestation" requires { address: 0x..., signature: { r, vs } }',
+    });
+    return undefined;
+  }
+  const decode = (label: string, val: unknown): Uint8Array | undefined => {
+    if (typeof val === 'string') {
+      const stripped = val.startsWith('0x') ? val.slice(2) : val;
+      if (stripped.length !== 64 || !/^[0-9a-fA-F]+$/.test(stripped)) return undefined;
+      return Uint8Array.from(Buffer.from(stripped, 'hex'));
+    }
+    if (Array.isArray(val) && val.length === 32 && val.every((b) => typeof b === 'number' && b >= 0 && b <= 255)) {
+      return Uint8Array.from(val as number[]);
+    }
+    void label;
+    return undefined;
+  };
+  const r = decode('r', signature.r);
+  const vs = decode('vs', signature.vs);
+  if (!r || !vs) {
+    jsonResponse(res, 400, {
+      error: '"preSignedAuthorAttestation.signature.r" and ".vs" must each be 32-byte hex strings or 32-element byte arrays',
+    });
+    return undefined;
+  }
+  return { address, signature: { r, vs } };
+}
 
 export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
   const {
@@ -545,8 +602,15 @@ WHERE {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
-    const { selection, clearAfter, publishContextGraphId, subGraphName, publisherNodeIdentityIdOverride } =
-      parsed;
+    const {
+      selection,
+      clearAfter,
+      publishContextGraphId,
+      subGraphName,
+      publisherNodeIdentityIdOverride,
+      authorAgentAddress: bodyAuthorAgentAddress,
+      preSignedAuthorAttestation: bodyPreSignedAttestation,
+    } = parsed;
     const contextGraphId = parsed.contextGraphId;
     if (!contextGraphId)
       return jsonResponse(res, 400, {
@@ -569,6 +633,61 @@ WHERE {
       }
       resolvedPublisherIdentityOverride = BigInt(raw);
     }
+
+    // RFC-001 §4(b) Phase 4 — author attribution resolution.
+    //
+    // Three precedence-ordered sources, all optional. The publisher signs as
+    // its own wallet (today's behaviour) when none are supplied:
+    //
+    //   1. `preSignedAuthorAttestation` in the request body — used when the
+    //      author is a self-sovereign agent whose private key the daemon
+    //      doesn't hold. Caller pre-signs the EIP-712 typed data.
+    //
+    //   2. `authorAgentAddress` in the request body — admin assertion. The
+    //      node-level admin token can run as any registered local agent
+    //      (matches the existing OpenClaw `agentAddress` pattern at
+    //      packages/cli/src/daemon/routes/query.ts). Resolved to a custodial
+    //      private key by `agent.publishFromSharedMemory`.
+    //
+    //   3. Agent-scoped bearer token — a `dkg_at_*` token registered to a
+    //      specific agent automatically attributes authorship to that agent.
+    //      Node-level admin tokens (resolveAgentByToken returns undefined)
+    //      do NOT attribute by default, preserving today's "publisher signs
+    //      as itself" semantics.
+    const requestToken = extractBearerToken(req.headers.authorization);
+    const tokenAgentAddress = requestToken
+      ? agent.resolveAgentByToken(requestToken)
+      : undefined;
+    if (
+      bodyAuthorAgentAddress != null &&
+      bodyPreSignedAttestation != null
+    ) {
+      return jsonResponse(res, 400, {
+        error:
+          '"authorAgentAddress" and "preSignedAuthorAttestation" are mutually exclusive',
+      });
+    }
+    let resolvedPreSignedAttestation: PublishOptions['preSignedAuthorAttestation'] | undefined;
+    if (bodyPreSignedAttestation != null) {
+      const validated = validatePreSignedAuthorAttestation(bodyPreSignedAttestation, res);
+      if (validated === undefined) return;
+      resolvedPreSignedAttestation = validated;
+    }
+    let resolvedAuthorAgentAddress: string | undefined;
+    if (resolvedPreSignedAttestation == null) {
+      // Pre-signed wins; otherwise body assertion wins; otherwise token.
+      if (typeof bodyAuthorAgentAddress === 'string' && bodyAuthorAgentAddress.length > 0) {
+        if (!/^0x[0-9a-fA-F]{40}$/.test(bodyAuthorAgentAddress)) {
+          return jsonResponse(res, 400, {
+            error: '"authorAgentAddress" must be a 0x-prefixed 20-byte EVM address',
+          });
+        }
+        resolvedAuthorAgentAddress = bodyAuthorAgentAddress;
+      } else if (tokenAgentAddress != null) {
+        resolvedAuthorAgentAddress = tokenAgentAddress;
+      }
+    }
+
     const ctx = createOperationContext("publishFromSWM");
     tracker.start(ctx, {
       contextGraphId: contextGraphId,
@@ -597,6 +716,12 @@ WHERE {
             : {}),
           ...(resolvedPublisherIdentityOverride !== undefined
             ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
+            : {}),
+          ...(resolvedAuthorAgentAddress != null
+            ? { authorAgentAddress: resolvedAuthorAgentAddress }
+            : {}),
+          ...(resolvedPreSignedAttestation != null
+            ? { preSignedAuthorAttestation: resolvedPreSignedAttestation }
             : {}),
         }),
       );

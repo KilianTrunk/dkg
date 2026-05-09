@@ -143,6 +143,47 @@ export interface PublishOptions {
    * so concurrent publishes with conflicting overrides are safe.
    */
   publisherNodeIdentityIdOverride?: bigint;
+  /**
+   * RFC-001 §4(b) Phase 4 — author attribution override.
+   *
+   * Hex-encoded secp256k1 private key (with or without `0x` prefix) that
+   * will sign the on-chain EIP-712 AuthorAttestation INSTEAD of the
+   * publisher's own wallet. The resulting `KC.author` is the address
+   * derived from this key.
+   *
+   * Used by the daemon's `/api/shared-memory/publish` route to attribute
+   * authorship to a registered custodial agent (resolved via bearer-token
+   * lookup → `AgentKeyRecord`) rather than to the routing node's publisher
+   * EOA. Lets a publisher-as-a-service deployment have `author = end-user
+   * agent.wallet`, `msg.sender = service.publisher`, and
+   * `publisherNodeIdentityId = service.id` simultaneously.
+   *
+   * Mutually exclusive with `preSignedAuthorAttestation`. When both are
+   * unset, the publisher falls back to signing the AuthorAttestation
+   * with its own `publisherSigner` (today's behaviour).
+   */
+  authorPrivateKey?: string;
+  /**
+   * RFC-001 §4(b) Phase 4 — author attribution for self-sovereign agents.
+   *
+   * Pre-signed compact ECDSA `(r, vs)` over the EIP-712 typed data
+   * `buildAuthorAttestationTypedData({ chainId, kav10Address,
+   * contextGraphId, merkleRoot, authorAddress: address })`. The publisher
+   * verifies the recovered signer matches `address` before submitting
+   * on-chain.
+   *
+   * Use this for agents whose private key is not held by the daemon
+   * (`mode === 'self-sovereign'`). Caller computes the merkle root via
+   * `compileMerkleRoot(...)` (or by replicating the publisher's
+   * sort-and-keccak), signs the EIP-712 digest off-line, and passes the
+   * compact signature in.
+   *
+   * Mutually exclusive with `authorPrivateKey`.
+   */
+  preSignedAuthorAttestation?: {
+    address: string;
+    signature: { r: Uint8Array; vs: Uint8Array };
+  };
 }
 
 export interface PublishResult {

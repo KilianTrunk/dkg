@@ -685,14 +685,136 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
   }, 120_000);
 
   // =========================================================================
-  // Mode (b) — Publisher-as-a-service via pre-signed AuthorAttestation.
-  // Phase 4 dependency (`ChatTurnWriter` daemon-side signing) — skipped.
+  // Mode (b) — Publisher-as-a-service: end-user agent attribution via
+  // daemon-side AuthorAttestation signing (Phase 4).
+  //
+  // Flow:
+  //   1. Register a fresh custodial agent on core2's daemon. The daemon
+  //      generates a secp256k1 keypair, persists it in agent-keystore.json,
+  //      and returns { agentAddress, authToken, publicKey, privateKey }.
+  //   2. Use the agent's bearer token to call core2's publish endpoint
+  //      directly (POST /api/shared-memory/write + /api/shared-memory/publish).
+  //   3. The daemon's publish route resolves the bearer → agent address →
+  //      AgentKeyRecord → custodial private key, and threads it down to
+  //      DKGPublisher as `authorPrivateKey`. The publisher signs the
+  //      EIP-712 AuthorAttestation with that key.
+  //   4. Assert on-chain: KC.author == agent.address (NOT core2's wallet),
+  //      publisherNodeIdentityId is core2.id (the routing core), and core2's
+  //      Eps grows. The agent never holds TRAC — full fee comes from core2's
+  //      own publisher wallet (no PCA required for this assertion).
   // =========================================================================
-  it.skip('mode (b) — pending Phase 4 daemon-side AuthorAttestation signing (out of scope for PR #436)', () => {
-    // When Phase 4 lands, the test:
-    //   1. Generates an end-user agent EOA + the AuthorAttestation EIP-712 sig.
-    //   2. POSTs to core2's openclaw-channel publish-as-a-service endpoint.
-    //   3. Asserts: author == end-user-agent.address, attribution == core2.id,
-    //      and core2's NFT epochSpent grows.
-  });
+  it('mode (b) — registered agent on core2 publishes; KC.author = agent, attribution = core2', async () => {
+    const s = state.v!;
+    const core2 = s.nodes[2]!;
+    if (core2.identityId === 0n) throw new Error('core2 has no identity');
+
+    // 1. Register a custodial agent on core2.
+    const agentName = `phase4-mode-b-${Date.now()}`;
+    const registerRes = await fetch(
+      `http://127.0.0.1:${core2.apiPort}/api/agent/register`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(core2.authToken ? { Authorization: `Bearer ${core2.authToken}` } : {}),
+        },
+        body: JSON.stringify({ name: agentName, framework: 'phase4-test' }),
+      },
+    );
+    if (!registerRes.ok) {
+      throw new Error(
+        `core2 /api/agent/register failed: ${registerRes.status} ${await registerRes.text()}`,
+      );
+    }
+    const agentRecord = (await registerRes.json()) as {
+      agentAddress: string;
+      authToken: string;
+      mode: 'custodial' | 'self-sovereign';
+    };
+    expect(agentRecord.mode).toBe('custodial');
+    expect(/^0x[0-9a-fA-F]{40}$/.test(agentRecord.agentAddress)).toBe(true);
+
+    const agentHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${agentRecord.authToken}`,
+    };
+
+    // 2. Snapshot pre-publish state.
+    const epoch: bigint = await s.chronos.getCurrentEpoch();
+    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epoch);
+
+    // 3. Write a single triple to SWM via the agent's token, then publish.
+    const ts = Date.now();
+    const subjectIri = `urn:test:mode-b:${ts}`;
+    const writeRes = await fetch(
+      `http://127.0.0.1:${core2.apiPort}/api/shared-memory/write`,
+      {
+        method: 'POST',
+        headers: agentHeaders,
+        body: JSON.stringify({
+          contextGraphId: CONTEXT_GRAPH,
+          quads: [
+            {
+              subject: subjectIri,
+              predicate: 'https://schema.org/name',
+              object: `"mode-b-${ts}"`,
+              graph: `did:dkg:context-graph:${CONTEXT_GRAPH}`,
+            },
+            {
+              subject: subjectIri,
+              predicate: 'https://schema.org/description',
+              object: '"automated devnet mode (b) test"',
+              graph: `did:dkg:context-graph:${CONTEXT_GRAPH}`,
+            },
+          ],
+        }),
+      },
+    );
+    if (!writeRes.ok) {
+      throw new Error(
+        `core2 /api/shared-memory/write failed: ${writeRes.status} ${await writeRes.text()}`,
+      );
+    }
+
+    const publishRes = await fetch(
+      `http://127.0.0.1:${core2.apiPort}/api/shared-memory/publish`,
+      {
+        method: 'POST',
+        headers: agentHeaders,
+        body: JSON.stringify({
+          contextGraphId: CONTEXT_GRAPH,
+          selection: 'all',
+          clearAfter: true,
+        }),
+      },
+    );
+    if (!publishRes.ok) {
+      throw new Error(
+        `core2 /api/shared-memory/publish failed: ${publishRes.status} ${await publishRes.text()}`,
+      );
+    }
+    const publishJson = (await publishRes.json()) as {
+      kcId: string;
+      status: string;
+      txHash?: string;
+    };
+    expect(publishJson.status).toBe('confirmed');
+    expect(publishJson.txHash).toBeTruthy();
+
+    // 4. On-chain assertions.
+    const kcId = BigInt(publishJson.kcId);
+    const onChainAuthor: string = await s.kcs.getLatestMerkleRootAuthor(kcId);
+    expect(onChainAuthor.toLowerCase()).toBe(agentRecord.agentAddress.toLowerCase());
+
+    // Author MUST NOT be any of core2's own op wallets — that would mean we
+    // regressed to mode (a)/(c) behaviour where the publisher signs as itself.
+    const isCoreWallet = core2.opWallets.some(
+      (w) => w.address.toLowerCase() === onChainAuthor.toLowerCase(),
+    );
+    expect(isCoreWallet).toBe(false);
+
+    // Attribution still flows to core2 (the routing node).
+    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epoch);
+    expect(afterEps).toBeGreaterThan(beforeEps);
+  }, 180_000);
 });

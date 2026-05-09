@@ -1145,7 +1145,23 @@ export class DKGPublisher implements Publisher {
     };
     const publishResult = await this.publish(internalPublishOptions);
 
-    if (ctxGraphId && publishResult.status === 'confirmed' && publishResult.onChainResult) {
+    // Per-cgId data promotion: copy quads + KA meta from the default
+    // `<NAME>/data` + `<NAME>/_meta` graphs into `<NAME>/context/<cgId>/data`
+    // + `<NAME>/context/<cgId>/_meta`. The RS prover's `extractV10KCFromStore`
+    // queries the per-cgId meta graph (kc-extractor.ts:154) to resolve a
+    // KC's UAL from `dkg:batchId`, so without this promotion every published
+    // KC stays invisible to random sampling and the prover loops on
+    // `kc-not-synced` indefinitely.
+    //
+    // Pre-Phase B-3 the gate was `if (ctxGraphId && ...)` which fired only on
+    // remap-flow publishes (`subContextGraphId` set). Same-graph publishes
+    // through the selection-bridge (`publishContextGraphId === undefined`,
+    // `onChainContextGraphId === '<resolved>'`) were silently skipped, breaking
+    // RS for all V10 publishes that don't remap. The gate now also fires
+    // when only `chainCgId` is set — the target cgId is always
+    // `ctxGraphId ?? chainCgId`.
+    const targetCgId = ctxGraphId ?? chainCgId;
+    if (targetCgId && publishResult.status === 'confirmed' && publishResult.onChainResult) {
       // V10 publishDirect already registers the KC to the context graph
       // via an internal call to ContextGraphs.registerKnowledgeCollection
       // (Hub-authorized only — EOAs cannot call it directly). The legacy
@@ -1161,7 +1177,7 @@ export class DKGPublisher implements Publisher {
           if (identityId > 0n) {
             const digest = ethers.solidityPackedKeccak256(
               ['uint256', 'bytes32'],
-              [BigInt(ctxGraphId), ethers.hexlify(publishResult.merkleRoot)],
+              [BigInt(targetCgId), ethers.hexlify(publishResult.merkleRoot)],
             );
             const sig = await this.chain.signMessage(ethers.getBytes(digest));
             participantSigs = [{ identityId, ...sig }];
@@ -1174,14 +1190,14 @@ export class DKGPublisher implements Publisher {
 
         try {
           const txResult = await this.chain.verify({
-            contextGraphId: BigInt(ctxGraphId),
+            contextGraphId: BigInt(targetCgId),
             batchId: publishResult.onChainResult.batchId,
             merkleRoot: publishResult.merkleRoot,
             signerSignatures: sortedSigs,
           });
           if (txResult && typeof txResult === 'object' && 'success' in txResult && txResult.success) {
             registered = true;
-            this.log.info(ctx, `Batch ${publishResult.onChainResult.batchId} verified on context graph ${ctxGraphId}`);
+            this.log.info(ctx, `Batch ${publishResult.onChainResult.batchId} verified on context graph ${targetCgId}`);
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -1194,12 +1210,12 @@ export class DKGPublisher implements Publisher {
         }
       } else {
         registered = true;
-        this.log.info(ctx, `No verify function on chain adapter — assuming V10 auto-registration for context graph ${ctxGraphId}`);
+        this.log.info(ctx, `No verify function on chain adapter — assuming V10 auto-registration for context graph ${targetCgId}`);
       }
 
       if (registered) {
-        const ctxDataGraph = contextGraphDataUri(contextGraphId, ctxGraphId);
-        const ctxMetaGraph = contextGraphMetaUri(contextGraphId, ctxGraphId);
+        const ctxDataGraph = contextGraphDataUri(contextGraphId, targetCgId);
+        const ctxMetaGraph = contextGraphMetaUri(contextGraphId, targetCgId);
         const defaultDataGraph = this.graphManager.dataGraphUri(contextGraphId);
         const defaultMetaGraph = `${defaultDataGraph.replace(/\/data$/, '')}/_meta`;
 
@@ -1224,7 +1240,7 @@ export class DKGPublisher implements Publisher {
           await this.store.delete(metaResult.quads.map(q => ({ ...q, graph: defaultMetaGraph })));
         }
 
-        this.log.info(ctx, `Promoted ${publishResult.kaManifest.length} KAs from default graph to context graph ${ctxGraphId}`);
+        this.log.info(ctx, `Promoted ${publishResult.kaManifest.length} KAs from default graph to context graph ${targetCgId}`);
       }
     }
 

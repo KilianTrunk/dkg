@@ -432,7 +432,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       });
     }
     let resolvedPreSignedAttestation:
-      | NonNullable<PublishOptions['preSignedAuthorAttestation']>
+      | { address: string; signature: { r: Uint8Array; vs: Uint8Array } }
       | undefined;
     if (bodyPreSignedAttestation != null) {
       const validated = validatePreSignedAuthorAttestation(
@@ -720,7 +720,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       });
     }
     let resolvedPreSignedAttestation:
-      | NonNullable<PublishOptions['preSignedAuthorAttestation']>
+      | { address: string; signature: { r: Uint8Array; vs: Uint8Array } }
       | undefined;
     if (bodyPreSignedAttestation != null) {
       const validated = validatePreSignedAuthorAttestation(

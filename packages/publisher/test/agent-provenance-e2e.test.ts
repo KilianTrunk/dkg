@@ -176,6 +176,82 @@ function token() {
   );
 }
 
+/**
+ * Build a `precomputedAttestation` payload over `quads` signed by
+ * `author`. RFC-001 §9.x — Phase C — the publisher refuses to
+ * broadcast without a seal, so every on-chain test in this file
+ * builds one here instead of relying on the (now removed) publisher
+ * EOA fallback.
+ *
+ * Mirrors what `agent.assertion.finalize()` does in production: hash
+ * the quads with `computeFlatKCRootV10` over `autoPartition`, build
+ * the EIP-712 typed data, sign with the author wallet, and return
+ * the compact `(r, vs)` shape KAv10 expects.
+ */
+async function buildSeal(
+  quads: Quad[],
+  author: ethers.Wallet,
+  cgId: string = CONTEXT_GRAPH,
+): Promise<{
+  expectedMerkleRoot: Uint8Array;
+  authorAddress: string;
+  signature: { r: Uint8Array; vs: Uint8Array };
+  schemeVersion: number;
+}> {
+  const { computeFlatKCRootV10, autoPartition } = await import('../src/index.js');
+  const { buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1 } =
+    await import('@origintrail-official/dkg-core');
+  const allQuads = [...autoPartition(quads).values()].flat();
+  const merkleRoot = computeFlatKCRootV10(allQuads, []);
+  const chainIdNum = await provider.getNetwork().then((n) => n.chainId);
+  const td = buildAuthorAttestationTypedData({
+    chainId: BigInt(chainIdNum),
+    kav10Address,
+    contextGraphId: BigInt(cgId),
+    merkleRoot,
+    authorAddress: author.address,
+  });
+  const sigHex = await author.signTypedData(td.domain, td.types, td.message);
+  const sig = ethers.Signature.from(sigHex);
+  return {
+    expectedMerkleRoot: merkleRoot,
+    authorAddress: author.address,
+    signature: {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    },
+    schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+  };
+}
+
+/**
+ * Test helper: thin wrapper around `publisher.publish` that builds the
+ * canonical CORE_OP-signed seal automatically. Tests in this file
+ * exercise the publisher's transport behaviour, not the seal-building
+ * itself; folding seal construction into a helper keeps each test
+ * focused on the diagram invariant under test.
+ */
+async function publishSealed(
+  publisher: DKGPublisher,
+  args: {
+    contextGraphId: string;
+    quads: Quad[];
+    publisherNodeIdentityIdOverride?: bigint;
+  },
+  authorKey: string = HARDHAT_KEYS.CORE_OP,
+) {
+  const author = new ethers.Wallet(authorKey);
+  const seal = await buildSeal(args.quads, author, args.contextGraphId);
+  return publisher.publish({
+    contextGraphId: args.contextGraphId,
+    quads: args.quads,
+    ...(args.publisherNodeIdentityIdOverride !== undefined
+      ? { publisherNodeIdentityIdOverride: args.publisherNodeIdentityIdOverride }
+      : {}),
+    precomputedAttestation: seal,
+  });
+}
+
 // =============================================================================
 // Diagram 1 — Publish with author attestation (EOA happy path)
 // =============================================================================
@@ -188,7 +264,7 @@ describe('Diagram 1 — EOA author attestation, end-to-end on real Hardhat', () 
 
     const publisher = makePublisher();
 
-    const result = await publisher.publish({
+    const result = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D1`, 'http://schema.org/name', '"Diagram1-EOA"')],
     });
@@ -256,7 +332,7 @@ describe('Diagram 3 — PCA-discounted vs full-fee cost coverage', () => {
     const before: bigint = await token().balanceOf(author.address);
 
     const publisher = makePublisher();
-    const result = await publisher.publish({
+    const result = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D3-fullfee`, 'http://schema.org/name', '"FullFee"')],
     });
@@ -315,7 +391,7 @@ describe('Diagram 3 — PCA-discounted vs full-fee cost coverage', () => {
     const beforeSpent: bigint = await pca.epochSpent(accountId, epoch);
 
     const publisher = makePublisher();
-    const result = await publisher.publish({
+    const result = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D3-pca`, 'http://schema.org/name', '"PCAdiscount"')],
     });
@@ -341,7 +417,7 @@ describe('Diagram 4 — KC update writes merkleRootAuthors[len-1] unconditionall
     const author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     const publisher = makePublisher();
 
-    const created = await publisher.publish({
+    const created = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D4`, 'http://schema.org/name', '"Original"')],
     });
@@ -379,7 +455,7 @@ describe('Diagram 5 — chain canonical author via DKGAgent.getKnowledgeCollecti
   it('agent facade returns the on-chain author, matching the chain-direct read', async () => {
     const author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     const publisher = makePublisher();
-    const result = await publisher.publish({
+    const result = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D5`, 'http://schema.org/name', '"FacadeRead"')],
     });
@@ -401,7 +477,7 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
     const before: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(coreId, epoch);
 
     const publisher = makePublisher();
-    const result = await publisher.publish({
+    const result = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D6a`, 'http://schema.org/name', '"ModeA"')],
     });
@@ -421,7 +497,7 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
     }
 
     const publisher = makePublisher();
-    const result = await publisher.publish({
+    const result = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D6d`, 'http://schema.org/name', '"ModeD"')],
       publisherNodeIdentityIdOverride: 0n,
@@ -445,7 +521,7 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
     const beforeTarget: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(targetId, epoch);
 
     const publisher = makePublisher();
-    const result = await publisher.publish({
+    const result = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D6e`, 'http://schema.org/name', '"ModeE"')],
       publisherNodeIdentityIdOverride: targetId,
@@ -464,7 +540,7 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
     const fakeId = 999999n; // way beyond any deployed identity counter
 
     const publisher = makePublisher();
-    const result = await publisher.publish({
+    const result = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D6revert`, 'http://schema.org/name', '"FakeId"')],
       publisherNodeIdentityIdOverride: fakeId,
@@ -513,7 +589,7 @@ describe('Diagram 8 — multi-update author array stays consistent with the cano
     const author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     const publisher = makePublisher();
 
-    const created = await publisher.publish({
+    const created = await publishSealed(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D8`, 'http://schema.org/name', '"V0"')],
     });
@@ -545,133 +621,6 @@ describe('Diagram 8 — multi-update author array stays consistent with the cano
 });
 
 // =============================================================================
-// Diagram 9 — Phase 4: author override (custodial agent's key signs the
-// AuthorAttestation; publisher submits the tx with its own EOA).
-// =============================================================================
-//
-// Reflects the production path /api/shared-memory/publish takes when an
-// agent-scoped bearer token (or a body-asserted `authorAgentAddress`) is
-// passed in: the daemon resolves the AgentKeyRecord, looks up the custodial
-// privateKey, and threads it down as `authorPrivateKey` in PublishOptions.
-// Result on-chain: KC.author == agent.wallet (NOT publisher's wallet),
-// while msg.sender / publisherAddress / publisherNodeIdentityId stay tied
-// to the daemon. RFC-001 §4(b) "publisher-as-a-service" pattern.
-
-describe('Diagram 9 — Phase 4 author override (custodial agent signs AuthorAttestation)', () => {
-  it('authorPrivateKey decouples KC.author from the publisher EOA', async () => {
-    const publisherWallet = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
-    const agentWallet = ethers.Wallet.createRandom();
-    expect(agentWallet.address.toLowerCase()).not.toBe(
-      publisherWallet.address.toLowerCase(),
-    );
-
-    const publisher = makePublisher();
-    const result = await publisher.publish({
-      contextGraphId: CONTEXT_GRAPH,
-      quads: [q(`${ENTITY}/D9-custodial`, 'http://schema.org/name', '"Diagram9-AuthorOverride"')],
-      authorPrivateKey: agentWallet.privateKey,
-    });
-
-    expect(result.status).toBe('confirmed');
-    const kcId = result.onChainResult!.batchId;
-
-    const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
-    expect(onChainAuthor.toLowerCase()).toBe(agentWallet.address.toLowerCase());
-
-    // Publisher of record (msg.sender) on the V10 tx is still CORE_OP — the
-    // override only changed who signs the AuthorAttestation.
-    expect(result.onChainResult!.publisherAddress.toLowerCase()).toBe(
-      publisherWallet.address.toLowerCase(),
-    );
-  });
-
-  it('rejects authorPrivateKey + preSignedAuthorAttestation set together', async () => {
-    const publisher = makePublisher();
-    const author = ethers.Wallet.createRandom();
-    await expect(publisher.publish({
-      contextGraphId: CONTEXT_GRAPH,
-      quads: [q(`${ENTITY}/D9-conflict`, 'http://schema.org/name', '"X"')],
-      authorPrivateKey: author.privateKey,
-      preSignedAuthorAttestation: {
-        address: author.address,
-        signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
-      },
-    })).rejects.toThrow(/mutually exclusive/);
-  });
-
-  it('rejects an invalid authorPrivateKey with a clear error', async () => {
-    const publisher = makePublisher();
-    await expect(publisher.publish({
-      contextGraphId: CONTEXT_GRAPH,
-      quads: [q(`${ENTITY}/D9-bad-key`, 'http://schema.org/name', '"X"')],
-      authorPrivateKey: '0xnotahex',
-    })).rejects.toThrow(/authorPrivateKey/);
-  });
-});
-
-// =============================================================================
-// Diagram 10 — Phase 4: pre-signed AuthorAttestation (self-sovereign agents).
-// =============================================================================
-//
-// The self-sovereign path lets a caller whose private key the daemon does
-// NOT hold contribute authorship: the caller computes the EIP-712 digest
-// off-line over the publish-time merkleRoot, signs, and submits the
-// compact (r, vs) along with the publish payload. The publisher recovers
-// the signer from the digest and fails closed if it doesn't match the
-// claimed address.
-//
-// We test the negative branch (signature recovers to a different address)
-// because (a) it exercises the actual verification logic and (b) the
-// positive branch is structurally equivalent to Diagram 9's
-// `authorPrivateKey` path — both call `signTypedData` over the same
-// EIP-712 typed data, the only difference being WHERE the signing
-// happens. The positive happy-path is exercised end-to-end in the
-// devnet automated test suite where the daemon computes the merkle root
-// from the SWM and a self-sovereign client signs it externally.
-
-describe('Diagram 10 — Phase 4 pre-signed AuthorAttestation (self-sovereign path)', () => {
-  it('falls back to tentative when signature recovers to a different address', async () => {
-    const claimed = ethers.Wallet.createRandom();
-    const realSigner = ethers.Wallet.createRandom();
-    const publisher = makePublisher();
-    const quads: Quad[] = [q(`${ENTITY}/D10-bad-recover`, 'http://schema.org/name', '"X"')];
-
-    // Build a digest with an arbitrary fake merkle root, sign with realSigner,
-    // claim it's from `claimed`. The publisher recomputes the digest over the
-    // ACTUAL publish-time merkleRoot, recovers, and rejects on mismatch.
-    // The publisher catches signing errors and downgrades to `tentative`
-    // rather than re-throwing, so we assert on the result status + the
-    // absence of an on-chain confirmation.
-    const fakeRoot = ethers.getBytes('0x' + '11'.repeat(32));
-    const chainIdNum = await provider.getNetwork().then(n => n.chainId);
-    const td = (await import('@origintrail-official/dkg-core')).buildAuthorAttestationTypedData({
-      chainId: BigInt(chainIdNum),
-      kav10Address: kav10Address,
-      contextGraphId: BigInt(CONTEXT_GRAPH),
-      merkleRoot: fakeRoot,
-      authorAddress: claimed.address,
-    });
-    const sigHex = await realSigner.signTypedData(td.domain, td.types, td.message);
-    const sig = ethers.Signature.from(sigHex);
-
-    const result = await publisher.publish({
-      contextGraphId: CONTEXT_GRAPH,
-      quads,
-      preSignedAuthorAttestation: {
-        address: claimed.address,
-        signature: {
-          r: ethers.getBytes(sig.r),
-          vs: ethers.getBytes(sig.yParityAndS),
-        },
-      },
-    });
-
-    expect(result.status).toBe('tentative');
-    expect(result.onChainResult).toBeUndefined();
-  });
-});
-
-// =============================================================================
 // Diagram 11 — Phase 5 sign-at-creation: precomputedAttestation lane
 // =============================================================================
 //
@@ -695,8 +644,9 @@ describe('Diagram 10 — Phase 4 pre-signed AuthorAttestation (self-sovereign pa
 //     fails closed before broadcasting (downgraded to tentative — the
 //     publisher catches signing-path errors and falls back, same as the
 //     Diagram 10 mismatched preSigned attestation case).
-//   - Mutual-exclusion: precomputedAttestation + authorPrivateKey is
-//     rejected.
+//   - Missing seal: a publish() call without precomputedAttestation
+//     falls through to tentative because the publisher refuses to
+//     broadcast without a finalize-time seal (RFC-001 §9.x Phase C).
 //
 // The agent-layer wrapper (`agent.assertion.finalize` →
 // `publishFromFinalizedAssertion`) is exercised separately by the
@@ -804,21 +754,16 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     expect(result.onChainResult).toBeUndefined();
   });
 
-  it('rejects precomputedAttestation + authorPrivateKey together', async () => {
-    const author = ethers.Wallet.createRandom();
+  it('rejects on-chain publish without precomputedAttestation', async () => {
+    // RFC-001 §9.x — Phase C — the publisher refuses to broadcast when
+    // the seal is missing. Falls through to tentative because the
+    // publisher catches signing-path errors instead of re-throwing.
     const publisher = makePublisher();
-    await expect(
-      publisher.publish({
-        contextGraphId: CONTEXT_GRAPH,
-        quads: [q(`${ENTITY}/D11-conflict`, 'http://schema.org/name', '"X"')],
-        authorPrivateKey: author.privateKey,
-        precomputedAttestation: {
-          expectedMerkleRoot: new Uint8Array(32),
-          authorAddress: author.address,
-          signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
-          schemeVersion: 1,
-        },
-      }),
-    ).rejects.toThrow(/mutually exclusive/);
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q(`${ENTITY}/D11-no-seal`, 'http://schema.org/name', '"X"')],
+    });
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
   });
 });

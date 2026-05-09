@@ -43,6 +43,25 @@ import {
   type QueryRequest, type QueryResponse, type QueryAccessConfig, type LookupType,
 } from '@origintrail-official/dkg-query';
 import { DKGAgentWallet, type AgentWallet } from './agent-wallet.js';
+
+/**
+ * Pre-signed AuthorAttestation payload supplied at finalize-time by
+ * self-sovereign agents whose private key isn't held by the daemon.
+ * Compact ECDSA `(r, vs)` over the EIP-712 typed data
+ * `buildAuthorAttestationTypedData({ chainId, kav10Address,
+ * contextGraphId, merkleRoot, authorAddress: address })`. The agent
+ * verifies the recovered signer matches `address` before stamping the
+ * seal.
+ *
+ * Lives at the agent layer (rather than as a publisher
+ * `PublishOptions` field) since RFC-001 §9.x — Phase C — the
+ * publisher only accepts already-sealed `precomputedAttestation`
+ * payloads. Pre-signed signing is a finalize-time concern.
+ */
+type PreSignedAuthorAttestation = {
+  address: string;
+  signature: { r: Uint8Array; vs: Uint8Array };
+};
 import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
 import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler } from './messaging.js';
@@ -3764,7 +3783,7 @@ export class DKGAgent {
     opts?: {
       subGraphName?: string;
       authorAgentAddress?: string;
-      preSignedAuthorAttestation?: PublishOptions['preSignedAuthorAttestation'];
+      preSignedAuthorAttestation?: PreSignedAuthorAttestation;
       schemeVersion?: number;
     },
   ): Promise<{
@@ -3897,7 +3916,7 @@ export class DKGAgent {
     const schemeVersion = opts?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
     let authorAddress: string;
     let signerPrivateKey: string | undefined;
-    let preSigned: PublishOptions['preSignedAuthorAttestation'] | undefined;
+    let preSigned: PreSignedAuthorAttestation | undefined;
     if (opts?.preSignedAuthorAttestation != null) {
       preSigned = opts.preSignedAuthorAttestation;
       authorAddress = preSigned.address;
@@ -4194,38 +4213,16 @@ export class DKGAgent {
        */
       publisherNodeIdentityIdOverride?: bigint;
       /**
-       * RFC-001 §4(b) Phase 4 — author identity override.
+       * RFC-001 §9.x — pre-computed attestation captured by
+       * `agent.assertion.finalize()`. Required for on-chain publishes
+       * (publisher refuses to broadcast without it). The seal carries
+       * the merkleRoot, authorAddress, signature, and schemeVersion;
+       * the publisher forwards verbatim and never re-signs.
        *
-       * Address of a registered LOCAL agent on this node whose private
-       * key should sign the on-chain EIP-712 AuthorAttestation. The
-       * daemon's publish route resolves the bearer token to an
-       * `AgentKeyRecord` and supplies that agent's address here; the
-       * agent layer looks up the custodial private key in its keystore
-       * and threads it down to the publisher.
-       *
-       * On-chain effect: `KC.author = <this address>` while
-       * `msg.sender = <daemon publisher EOA>` and
-       * `publisherNodeIdentityId = <override or daemon id>` — i.e.
-       * authorship and routing are decoupled.
-       *
-       * Throws if the address is not registered locally or is registered
-       * but `mode === 'self-sovereign'` (no key on this node — caller
-       * must use `preSignedAuthorAttestation` instead).
-       *
-       * Mutually exclusive with `preSignedAuthorAttestation`.
-       */
-      authorAgentAddress?: string;
-      /**
-       * RFC-001 §4(b) Phase 4 — author identity for self-sovereign agents.
-       * Pass-through to `PublishOptions.preSignedAuthorAttestation`.
-       */
-      preSignedAuthorAttestation?: PublishOptions['preSignedAuthorAttestation'];
-      /**
-       * RFC-001 §9.x Phase 5 — pre-computed attestation captured by
-       * `agent.assertion.finalize()`. Threaded through to
-       * `publisher.publishFromSharedMemory` so the seal flows through
-       * unchanged. See `PublishOptions.precomputedAttestation`. Mutually
-       * exclusive with `authorAgentAddress` and `preSignedAuthorAttestation`.
+       * The legacy `authorAgentAddress` and `preSignedAuthorAttestation`
+       * options that used to ride this method have been removed in
+       * Phase C — author identity is settled at finalize-time, never
+       * at publish-time.
        */
       precomputedAttestation?: PublishOptions['precomputedAttestation'];
     },
@@ -4238,46 +4235,6 @@ export class DKGAgent {
 
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
 
-    // RFC-001 §4(b) Phase 4 — resolve the author signing key. Mutually
-    // exclusive with `preSignedAuthorAttestation`. When `authorAgentAddress`
-    // names a local custodial agent we look up its private key in the
-    // keystore and pass it to the publisher; the publisher signs the
-    // EIP-712 AuthorAttestation with that key, and on-chain `KC.author`
-    // becomes the agent's address (decoupled from `msg.sender`).
-    if (
-      options?.authorAgentAddress != null &&
-      options?.preSignedAuthorAttestation != null
-    ) {
-      throw new Error(
-        'publishFromSharedMemory: authorAgentAddress and preSignedAuthorAttestation ' +
-        'are mutually exclusive — supply at most one.',
-      );
-    }
-    let resolvedAuthorPrivateKey: string | undefined;
-    if (options?.authorAgentAddress != null) {
-      const mode = this.getLocalAgentMode(options.authorAgentAddress);
-      if (mode === undefined) {
-        throw new Error(
-          `publishFromSharedMemory: authorAgentAddress ${options.authorAgentAddress} ` +
-          `is not a registered local agent on this node`,
-        );
-      }
-      if (mode === 'self-sovereign') {
-        throw new Error(
-          `publishFromSharedMemory: agent ${options.authorAgentAddress} is registered ` +
-          `as self-sovereign — this node does not hold its private key. Use ` +
-          `preSignedAuthorAttestation instead.`,
-        );
-      }
-      resolvedAuthorPrivateKey = this.getCustodialAgentPrivateKey(options.authorAgentAddress);
-      if (!resolvedAuthorPrivateKey) {
-        throw new Error(
-          `publishFromSharedMemory: custodial agent ${options.authorAgentAddress} ` +
-          `has no private key on file (keystore corruption or partial migration)`,
-        );
-      }
-    }
-
     const result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
       operationCtx: ctx,
       clearSharedMemoryAfter: options?.clearSharedMemoryAfter,
@@ -4288,8 +4245,6 @@ export class DKGAgent {
       v10ACKProvider,
       subGraphName: options?.subGraphName,
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
-      authorPrivateKey: resolvedAuthorPrivateKey,
-      preSignedAuthorAttestation: options?.preSignedAuthorAttestation,
       precomputedAttestation: options?.precomputedAttestation,
     });
 
@@ -9402,7 +9357,7 @@ export class DKGAgent {
         opts?: {
           subGraphName?: string;
           authorAgentAddress?: string;
-          preSignedAuthorAttestation?: PublishOptions['preSignedAuthorAttestation'];
+          preSignedAuthorAttestation?: PreSignedAuthorAttestation;
           schemeVersion?: number;
         },
       ): Promise<{

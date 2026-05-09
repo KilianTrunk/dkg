@@ -144,52 +144,12 @@ export interface PublishOptions {
    */
   publisherNodeIdentityIdOverride?: bigint;
   /**
-   * RFC-001 §4(b) Phase 4 — author attribution override.
-   *
-   * Hex-encoded secp256k1 private key (with or without `0x` prefix) that
-   * will sign the on-chain EIP-712 AuthorAttestation INSTEAD of the
-   * publisher's own wallet. The resulting `KC.author` is the address
-   * derived from this key.
-   *
-   * Used by the daemon's `/api/shared-memory/publish` route to attribute
-   * authorship to a registered custodial agent (resolved via bearer-token
-   * lookup → `AgentKeyRecord`) rather than to the routing node's publisher
-   * EOA. Lets a publisher-as-a-service deployment have `author = end-user
-   * agent.wallet`, `msg.sender = service.publisher`, and
-   * `publisherNodeIdentityId = service.id` simultaneously.
-   *
-   * Mutually exclusive with `preSignedAuthorAttestation`. When both are
-   * unset, the publisher falls back to signing the AuthorAttestation
-   * with its own `publisherSigner` (today's behaviour).
-   */
-  authorPrivateKey?: string;
-  /**
-   * RFC-001 §4(b) Phase 4 — author attribution for self-sovereign agents.
-   *
-   * Pre-signed compact ECDSA `(r, vs)` over the EIP-712 typed data
-   * `buildAuthorAttestationTypedData({ chainId, kav10Address,
-   * contextGraphId, merkleRoot, authorAddress: address })`. The publisher
-   * verifies the recovered signer matches `address` before submitting
-   * on-chain.
-   *
-   * Use this for agents whose private key is not held by the daemon
-   * (`mode === 'self-sovereign'`). Caller computes the merkle root via
-   * `compileMerkleRoot(...)` (or by replicating the publisher's
-   * sort-and-keccak), signs the EIP-712 digest off-line, and passes the
-   * compact signature in.
-   *
-   * Mutually exclusive with `authorPrivateKey`.
-   */
-  preSignedAuthorAttestation?: {
-    address: string;
-    signature: { r: Uint8Array; vs: Uint8Array };
-  };
-  /**
    * RFC-001 §9.x — pre-computed AuthorAttestation produced at the
-   * `agent.assertion.finalize()` boundary.
+   * `agent.assertion.finalize()` boundary. This is the canonical
+   * (and, post-Phase-C, the *only*) way to attribute authorship for
+   * an on-chain publish.
    *
-   * When this is set, the publisher does NOT compute its own
-   * EIP-712 attestation. The caller has already:
+   * The caller has already:
    *   1. Computed `expectedMerkleRoot` over the same quads it is
    *      now asking the publisher to publish (computed via
    *      `computeFlatKCRoot` / `autoPartition` semantics).
@@ -205,11 +165,14 @@ export interface PublishOptions {
    * quads were mutated between finalize and publish.
    *
    * The compact `(r, vs)` and `authorAddress` are forwarded to
-   * KAv10 verbatim. Used by `/api/shared-memory/publish` when an
-   * `assertionUri` resolves to a finalized assertion in `_meta`.
+   * KAv10 verbatim. The publisher NEVER signs the AuthorAttestation
+   * itself.
    *
-   * Mutually exclusive with `authorPrivateKey` AND
-   * `preSignedAuthorAttestation`.
+   * For publish flows where no agent is provided, the agent layer
+   * falls back to signing with the publisher's own EOA (via
+   * `signAuthorAttestationAsPublisher`) at finalize-time, so the
+   * publisher EOA still becomes `KC.author` in that case — but the
+   * signature is produced by the agent layer, not by `publish()`.
    */
   precomputedAttestation?: {
     expectedMerkleRoot: Uint8Array;

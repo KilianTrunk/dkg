@@ -329,23 +329,32 @@ import {
 import type { RequestContext } from './context.js';
 
 /**
- * Validate a `preSignedAuthorAttestation` payload from the publish request.
+ * Validate a `preSignedAuthorAttestation` payload from a finalize request.
  *
  * Shape:
  *   { address: "0x...", signature: { r: "0x..." | number[], vs: "0x..." | number[] } }
  *
  * Returns the normalised value with byte arrays (Uint8Array) ready to forward
- * into `agent.publishFromSharedMemory`. Returns `undefined` and writes an
+ * into `agent.assertion.finalize`. Returns `undefined` and writes an
  * appropriate 400 response when the payload is malformed.
  *
- * The on-chain signature check happens later inside the publisher (it
- * recovers the address from the EIP-712 digest computed at publish time and
- * fails closed if the recovered signer doesn't match the claimed address).
+ * The on-chain signature check happens later inside the agent's finalize
+ * path (it recovers the address from the EIP-712 digest and fails closed
+ * if the recovered signer doesn't match the claimed address).
+ *
+ * RFC-001 §9.x — Phase C — pre-signed attestations are a finalize-time
+ * concern. The publish layer no longer accepts them; they're consumed
+ * here and stamped into the seal.
  */
+type PreSignedAuthorAttestation = {
+  address: string;
+  signature: { r: Uint8Array; vs: Uint8Array };
+};
+
 export function validatePreSignedAuthorAttestation(
   raw: unknown,
   res: ServerResponse,
-): PublishOptions['preSignedAuthorAttestation'] | undefined {
+): PreSignedAuthorAttestation | undefined {
   if (raw == null || typeof raw !== 'object') {
     jsonResponse(res, 400, {
       error: '"preSignedAuthorAttestation" must be an object',
@@ -668,7 +677,7 @@ WHERE {
           '"authorAgentAddress" and "preSignedAuthorAttestation" are mutually exclusive',
       });
     }
-    let resolvedPreSignedAttestation: PublishOptions['preSignedAuthorAttestation'] | undefined;
+    let resolvedPreSignedAttestation: PreSignedAuthorAttestation | undefined;
     if (bodyPreSignedAttestation != null) {
       const validated = validatePreSignedAuthorAttestation(bodyPreSignedAttestation, res);
       if (validated === undefined) return;

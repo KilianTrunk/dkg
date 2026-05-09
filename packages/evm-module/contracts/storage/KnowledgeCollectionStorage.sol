@@ -133,12 +133,12 @@ contract KnowledgeCollectionStorage is
         kc.merkleRoots.push(
             KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
-        // Store author in the parallel map at the index we just pushed
-        // (length - 1 == 0 here for the create path, but we keep the
-        // arithmetic explicit so the same pattern holds for update).
-        if (author != address(0)) {
-            merkleRootAuthors[knowledgeCollectionId][kc.merkleRoots.length - 1] = author;
-        }
+        // Unconditional write to overwrite any value at this slot.
+        // For `createKnowledgeCollection` the kcId is freshly minted so
+        // the slot is guaranteed empty; the unconditional shape is kept
+        // for parity with `updateKnowledgeCollection` below, where the
+        // index can have been previously used (post-pop).
+        merkleRootAuthors[knowledgeCollectionId][kc.merkleRoots.length - 1] = author;
         kc.byteSize = byteSize;
         kc.startEpoch = startEpoch;
         kc.endEpoch = endEpoch;
@@ -198,9 +198,13 @@ contract KnowledgeCollectionStorage is
         kc.merkleRoots.push(
             KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
-        if (author != address(0)) {
-            merkleRootAuthors[id][kc.merkleRoots.length - 1] = author;
-        }
+        // Unconditional overwrite — this index may have been written by
+        // a previous create/update and then popped via `popMerkleRoot`,
+        // leaving the stale author in the parallel slot. Always write
+        // the current `author` (which is `address(0)` for the V10.1
+        // update path that doesn't yet sign updates) to make the
+        // canonical mapping monotonic with the merkleRoots array.
+        merkleRootAuthors[id][kc.merkleRoots.length - 1] = author;
         kc.byteSize = byteSize;
         kc.tokenAmount = tokenAmount;
         kc.merkleLeafCount = merkleLeafCount;
@@ -341,6 +345,20 @@ contract KnowledgeCollectionStorage is
         uint256 id,
         KnowledgeCollectionLib.MerkleRoot[] memory _merkleRoots
     ) external onlyContracts {
+        // Wholesale replacement — clear the parallel author mapping for
+        // the union of old and new index ranges so stale authors from
+        // either side cannot leak through. The MerkleRoot struct itself
+        // carries no author field (parallel-mapping design), so callers
+        // of this admin path cannot supply authors here; effective
+        // post-condition is "all entries unauthenticated until a
+        // subsequent create/update writes them". Loop bounded by the
+        // larger of the two lengths.
+        uint256 oldLen = knowledgeCollections[id].merkleRoots.length;
+        uint256 newLen = _merkleRoots.length;
+        uint256 maxLen = oldLen > newLen ? oldLen : newLen;
+        for (uint256 i = 0; i < maxLen; i++) {
+            delete merkleRootAuthors[id][i];
+        }
         knowledgeCollections[id].merkleRoots = _merkleRoots;
 
         emit KnowledgeCollectionMerkleRootsUpdated(id, _merkleRoots);
@@ -406,15 +424,30 @@ contract KnowledgeCollectionStorage is
         knowledgeCollections[id].merkleRoots.push(
             KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
-        // No author for legacy push path — leave the parallel mapping
-        // at its default `address(0)`.
+        // Defensive clear: this index may have been used by a previously
+        // popped author entry (`merkleRoots.length` cycles via push/pop).
+        // Without the explicit `delete`, an unauthenticated push after a
+        // pop would inherit the popped entry's author and `getLatestMerkleRootAuthor`
+        // would lie. Legacy `pushMerkleRoot` carries no author by design —
+        // always zero the parallel slot.
+        delete merkleRootAuthors[id][knowledgeCollections[id].merkleRoots.length - 1];
 
         emit KnowledgeCollectionMerkleRootAdded(id, merkleRoot);
     }
 
     function popMerkleRoot(uint256 id) external onlyContracts {
+        uint256 oldLen = knowledgeCollections[id].merkleRoots.length;
         bytes32 latestMerkleRoot = _safeGetLatestMerkleRootObject(id).merkleRoot;
         knowledgeCollections[id].merkleRoots.pop();
+        // Clear the parallel author slot for the popped index. Without
+        // this, the slot survives and a later push at the same index can
+        // resurrect a stale author. `oldLen > 0` guards the empty-array
+        // case (pop on empty would have reverted on the line above; the
+        // `_safeGetLatestMerkleRootObject` returns a zero-tuple but the
+        // pop itself reverts on length 0 — kept defensive).
+        if (oldLen > 0) {
+            delete merkleRootAuthors[id][oldLen - 1];
+        }
 
         emit KnowledgeCollectionMerkleRootRemoved(id, latestMerkleRoot);
     }

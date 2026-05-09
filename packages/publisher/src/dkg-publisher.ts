@@ -1372,7 +1372,19 @@ export class DKGPublisher implements Publisher {
     } catch {
       // Descriptive SWM graph names stay on the existing tentative/mock path.
     }
-    const willAttemptOnChainPublish = this.publisherNodeIdentityId > 0n && publisherContextGraphId !== undefined;
+    // Per-publish attribution override (RFC-001 §4): see PublishOptions
+    // docstring. `hasAttributionOverride` must influence the EARLY on-chain
+    // attempt gate too — otherwise `publisherSigner` and `tokenAmount`
+    // never resolve when a daemon with persistent identity `0n` carries an
+    // explicit override (including `0n` for mode (d) no-attribution),
+    // and the late gate would then enter the chain branch with
+    // `publisherSigner === undefined` and throw `PublisherWalletRequiredError`.
+    // Self-ACK signing remains tied to `this.publisherNodeIdentityId > 0n`
+    // below — the override controls on-chain attribution, not who signs.
+    const hasAttributionOverride = options.publisherNodeIdentityIdOverride !== undefined;
+    const willAttemptOnChainPublish =
+      (this.publisherNodeIdentityId > 0n || hasAttributionOverride) &&
+      publisherContextGraphId !== undefined;
     const chainV10Ready = await this.refreshChainV10Readiness();
     const canResolveOnChainPublisher = willAttemptOnChainPublish && chainV10Ready;
     const resolvedPublisherAddress = canResolveOnChainPublisher
@@ -1706,13 +1718,13 @@ export class DKGPublisher implements Publisher {
     const publishOperationId = `${this.sessionId}-${tentativeSeq}`;
     let ual = `did:dkg:${this.chain.chainId}/${publisherAddress}/t${publishOperationId}`;
 
-    // Per-publish attribution override (RFC-001 §4): defaults to the
-    // daemon's persistent identity when not set. `0n` is a VALID explicit
-    // value (mode d "no attribution" — contract validates this case) and
-    // must NOT be confused with "override absent". The daemon's own
-    // identity is still used elsewhere (ACK self-signing, signer
-    // resolution) — this only affects the on-chain `PublishParams.publisherNodeIdentityId`.
-    const hasAttributionOverride = options.publisherNodeIdentityIdOverride !== undefined;
+    // Resolve the on-chain attribution target from the per-call override
+    // (computed above) or fall back to the daemon's persistent identity.
+    // `0n` is a VALID explicit override value (mode (d) "no attribution"
+    // — contract validates this case) and must NOT be confused with
+    // "override absent". The daemon's own identity is still used elsewhere
+    // (ACK self-signing, signer resolution); this only affects the
+    // on-chain `PublishParams.publisherNodeIdentityId`.
     const attributionIdentityId: bigint = hasAttributionOverride
       ? options.publisherNodeIdentityIdOverride!
       : this.publisherNodeIdentityId;

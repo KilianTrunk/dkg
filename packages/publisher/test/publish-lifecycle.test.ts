@@ -1059,4 +1059,106 @@ describe('Tentative publish UAL uniqueness', () => {
     const started = phases.filter(([, s]) => s === 'start').map(([p]) => p);
     expect(started).toContain('collect_v10_acks');
   });
+
+  // -------------------------------------------------------------------------
+  // T-OVERRIDE: per-publish `publisherNodeIdentityIdOverride` regression suite
+  //
+  // Round-3 review feedback (PR #436, @branarakic): the override must
+  // influence the EARLY on-chain attempt gate.
+  //
+  //   "This late gate now treats an explicit override as enough to attempt
+  //    the chain path, but the earlier `willAttemptOnChainPublish`
+  //    calculation still requires `this.publisherNodeIdentityId > 0n`
+  //    before resolving `publisherSigner` or precomputing `tokenAmount`.
+  //    A daemon with persistent identity `0n` and `publisherNodeIdentityIdOverride`
+  //    set ... reaches this chain branch with `publisherSigner === undefined`
+  //    and fails with `PublisherWalletRequiredError`."
+  //
+  // The fix hoists `hasAttributionOverride` into the early gate while
+  // intentionally KEEPING self-ACK tied to the daemon identity (per the
+  // reviewer's "while keeping self-ACK tied to the daemon identity"
+  // guidance). Tests 1+2 below pin both halves of that fix.
+  // -------------------------------------------------------------------------
+  it('T-OVERRIDE: mode (d) — daemon has identity, override=0n confirms on-chain with no attribution', async () => {
+    // Primary mode-(d) e2e: a real running daemon (identity=coreProfileId)
+    // explicitly publishes with `override=0n` to mean "no node attribution
+    // for THIS publish". The chain accepts it (T-VAL skips epoch storage),
+    // self-ACK signs as the daemon's real id, status becomes confirmed.
+    const store = new OxigraphStore();
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const bus = new TypedEventBus();
+    const keypair = await generateEd25519Keypair();
+    const realCoreId = BigInt(getSharedContext().coreProfileId);
+
+    const publisher = new DKGPublisher({
+      store, chain, eventBus: bus, keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: realCoreId,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q('did:dkg:agent:OverrideMode-D', 'http://schema.org/name', '"OverrideD"')],
+      publisherNodeIdentityIdOverride: 0n,
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult).toBeDefined();
+    expect(result.onChainResult!.txHash).toBeTruthy();
+  });
+
+  it('T-OVERRIDE: daemon identityId=0 + override does NOT throw PublisherWalletRequiredError', async () => {
+    // Direct regression of the round-3 review thread. Pre-fix path:
+    //   willAttemptOnChainPublish = `this.publisherNodeIdentityId > 0n` = false
+    //   → publisherSigner never resolves
+    //   → late gate (which sees the override) enters the chain branch
+    //   → throws `PublisherWalletRequiredError`.
+    // Post-fix: early gate honors the override, publisherSigner resolves,
+    // chain branch may still fall back to tentative downstream (single-
+    // node mode: self-ACK requires daemon identity, intentionally), but
+    // the publish call MUST resolve cleanly without throwing.
+    const store = new OxigraphStore();
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const bus = new TypedEventBus();
+    const keypair = await generateEd25519Keypair();
+
+    const publisher = new DKGPublisher({
+      store, chain, eventBus: bus, keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: 0n,
+    });
+
+    await expect(
+      publisher.publish({
+        contextGraphId: CONTEXT_GRAPH,
+        quads: [q('did:dkg:agent:OverrideEarlyGate', 'http://schema.org/name', '"OverrideEG"')],
+        publisherNodeIdentityIdOverride: 7n,
+      }),
+    ).resolves.toMatchObject({ status: expect.any(String) });
+  });
+
+  it('T-OVERRIDE: daemon identityId=0 with NO override stays tentative (legacy behavior preserved)', async () => {
+    // Sanity check that the gate change didn't accidentally enable
+    // on-chain publishes for the legacy "daemon has no identity, no
+    // override" path.
+    const store = new OxigraphStore();
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const bus = new TypedEventBus();
+    const keypair = await generateEd25519Keypair();
+
+    const publisher = new DKGPublisher({
+      store, chain, eventBus: bus, keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: 0n,
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q('did:dkg:agent:OverrideNoOverride', 'http://schema.org/name', '"OverrideNone"')],
+      // no publisherNodeIdentityIdOverride
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(result.ual).toContain('/t');
+  });
 });

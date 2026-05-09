@@ -2358,5 +2358,123 @@ describe('@unit KnowledgeAssetsV10', () => {
         expect(nodeAfter - nodeBefore).to.equal(tokenAmount);
       });
     });
+
+    // ----------------------------------------------------------------------
+    // T-AUTHOR: parallel `merkleRootAuthors` mapping invariants
+    //
+    // PR #436 round 3 review feedback (@branarakic): the parallel mapping
+    // can leak stale authors when array indices get reused via
+    // `popMerkleRoot()` + `pushMerkleRoot()` or wholesale-replaced via
+    // `setMerkleRoots()`. These tests pin the post-fix invariant:
+    // `getLatestMerkleRootAuthor` and `getMerkleRootAuthorByIndex` must
+    // never return an author that has been logically removed from the
+    // canonical `merkleRoots[]` history.
+    // ----------------------------------------------------------------------
+    describe('T-AUTHOR: parallel author mapping does not leak stale entries', () => {
+      it('popMerkleRoot clears the parallel author slot — no leak through pop+push', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const author = accounts[14];
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t-author-1-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't-author-1-op',
+        });
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await KAV10.connect(creator).publish(p);
+        const kcId = await KCS.getLatestKnowledgeCollectionId();
+        expect(await KCS.getLatestMerkleRootAuthor(kcId)).to.equal(author.address);
+
+        // Register a test signer as a Hub-authorized contract so it can
+        // call the `onlyContracts` admin-path functions on KCS.
+        const testContract = accounts[19];
+        await HubContract.setContractAddress('TestKCSAdmin', testContract.address);
+
+        // Pop the only root → merkleRoots is empty; PRE-FIX the parallel
+        // slot at index 0 still pointed at `author`.
+        await KCS.connect(testContract).popMerkleRoot(kcId);
+
+        // Push a fresh, unauthenticated root via the legacy path. PRE-FIX
+        // this would have re-used index 0's stale author entry; POST-FIX
+        // both `pop` (clear) and `push` (defensive clear) ensure the
+        // reader sees `address(0)` for the new unauthenticated root.
+        const newRoot = ethers.keccak256(ethers.toUtf8Bytes('t-author-1-newroot'));
+        await KCS.connect(testContract).pushMerkleRoot(creator.address, kcId, newRoot);
+
+        expect(await KCS.getLatestMerkleRootAuthor(kcId)).to.equal(ethers.ZeroAddress);
+        expect(await KCS.getMerkleRootAuthorByIndex(kcId, 0)).to.equal(ethers.ZeroAddress);
+      });
+
+      it('setMerkleRoots clears stale author entries on wholesale replacement', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const author = accounts[14];
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t-author-2-root'));
+        const tokenAmount = ethers.parseEther('100');
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't-author-2-op',
+        });
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await KAV10.connect(creator).publish(p);
+        const kcId = await KCS.getLatestKnowledgeCollectionId();
+        expect(await KCS.getMerkleRootAuthorByIndex(kcId, 0)).to.equal(author.address);
+
+        const testContract = accounts[19];
+        await HubContract.setContractAddress('TestKCSAdmin', testContract.address);
+
+        const replacement = [
+          {
+            publisher: creator.address,
+            merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-author-2-replace-1')),
+            timestamp: 0n,
+          },
+          {
+            publisher: creator.address,
+            merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-author-2-replace-2')),
+            timestamp: 0n,
+          },
+        ];
+        await KCS.connect(testContract).setMerkleRoots(kcId, replacement);
+
+        // Both old (now overwritten) and new indices must read as zero —
+        // wholesale replacement nukes the parallel mapping for the union
+        // of old/new index ranges.
+        expect(await KCS.getMerkleRootAuthorByIndex(kcId, 0)).to.equal(ethers.ZeroAddress);
+        expect(await KCS.getMerkleRootAuthorByIndex(kcId, 1)).to.equal(ethers.ZeroAddress);
+        expect(await KCS.getLatestMerkleRootAuthor(kcId)).to.equal(ethers.ZeroAddress);
+      });
+    });
   });
 });

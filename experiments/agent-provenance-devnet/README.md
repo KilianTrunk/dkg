@@ -6,6 +6,31 @@ through standing up a 5-node devnet (4 core + 1 edge), exercising the
 four operating modes from the spec §4, and capturing the artefacts
 the §9.7 cross-cutting checklist needs as evidence.
 
+## Automated test suites
+
+Two automated suites cover the same surface this runbook describes —
+prefer running them before falling back to the manual recipes below.
+
+| Suite | Scope | Runtime | Command |
+| --- | --- | --- | --- |
+| Hardhat e2e | All 8 sequence diagrams from `RFC-001-implementation-walkthrough.md`, run against an in-process Hardhat EVM. Covers contract correctness + publisher integration in a single process. | ~30s | `pnpm test:e2e:agent-provenance` |
+| 5-node devnet | Modes (a), (c), (d) and the negative-case from §4 + §9.5, run against `./scripts/devnet.sh start 5`. Validates CLI plumbing + multi-node ACK quorum on top. | ~35s after devnet is up | `pnpm test:devnet:agent-provenance` |
+
+Mode (b) (publisher-as-a-service) is intentionally not in either
+automated suite — it depends on the Phase 4 daemon-side
+`AuthorAttestation` signing path (Hermes / `ChatTurnWriter`) which is
+out of scope for PR #436. The §4(b) recipe below still applies to a
+manual run once Phase 4 lands.
+
+The devnet suite expects an already-running devnet (boot once, run
+many times). To opt into auto-boot+teardown for nightly CI, set
+`DKG_DEVNET_AUTO_BOOT=1` before invoking the script — adds ~90s of
+bring-up to the run.
+
+The remainder of this document is the original manual runbook,
+preserved for one-off debugging and as the source of truth on what
+each mode is meant to assert.
+
 The intent is to give a human operator a concrete, copy-paste-able
 sequence per mode, including:
 

@@ -1,7 +1,7 @@
 import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { EventBus } from '@origintrail-official/dkg-core';
-import { Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS } from '@origintrail-official/dkg-core';
 import type { PhaseCallback } from './publisher.js';
 import {
   decodeGossipEnvelope,
@@ -346,6 +346,14 @@ export class SharedMemoryHandler {
       onPhase?.('store', 'end');
       if (applied) {
         this.log.info(ctx, `Stored SWM write ${shareOperationId} (${quads.length} quads)`);
+        this.eventBus.emit(DKGEvent.MEMORY_GRAPH_CHANGED, {
+          contextGraphId,
+          layers: ['swm'],
+          subGraphName,
+          operation: 'shared_memory_gossiped',
+          source: 'gossip',
+          counts: { triples: quads.length },
+        });
       }
     } catch (err) {
       this.log.error(ctx, `SWM handle failed: ${err instanceof Error ? err.message : String(err)}`);

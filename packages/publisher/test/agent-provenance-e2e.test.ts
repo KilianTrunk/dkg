@@ -641,12 +641,15 @@ describe('Diagram 8 — multi-update author array stays consistent with the cano
 //     identity, byte-for-byte. No re-sign happens.
 //   - Tamper case: caller signs over `expectedMerkleRoot = X`, then asks
 //     to publish quads whose canonical merkle is `Y ≠ X`. Publisher
-//     fails closed before broadcasting (downgraded to tentative — the
-//     publisher catches signing-path errors and falls back, same as the
-//     Diagram 10 mismatched preSigned attestation case).
+//     fails closed BEFORE the on-chain try block and rethrows out of
+//     `publish()` (Round 4 review §12 — when a seal IS supplied but
+//     its merkle/signer doesn't match, this is a hard error rather
+//     than a silent downgrade).
 //   - Missing seal: a publish() call without precomputedAttestation
 //     falls through to tentative because the publisher refuses to
 //     broadcast without a finalize-time seal (RFC-001 §9.x Phase C).
+//     This is the no-seal contract — production call sites mint a
+//     seal at the agent layer; tests can opt out by omitting it.
 //
 // The agent-layer wrapper (`agent.assertion.finalize` →
 // `publishFromFinalizedAssertion`) is exercised separately by the
@@ -737,27 +740,38 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
       await author.signTypedData(td.domain, td.types, td.message),
     );
 
-    const result = await publisher.publish({
-      contextGraphId: CONTEXT_GRAPH,
-      quads,
-      precomputedAttestation: {
-        expectedMerkleRoot: fakeRoot,
-        authorAddress: author.address,
-        signature: {
-          r: ethers.getBytes(sig.r),
-          vs: ethers.getBytes(sig.yParityAndS),
+    // Round 4 review §12 — when a seal IS supplied but its
+    // `expectedMerkleRoot` does not match the publisher's recompute,
+    // this is now a hard error (preflight rejects before the on-chain
+    // try/catch). Previously it was silently downgraded to tentative
+    // with an `On-chain tx failed` log line. The hard error gives the
+    // daemon route a 4xx-mappable signal instead of a 200 OK +
+    // `status: tentative, kcId: 0`.
+    await expect(
+      publisher.publish({
+        contextGraphId: CONTEXT_GRAPH,
+        quads,
+        precomputedAttestation: {
+          expectedMerkleRoot: fakeRoot,
+          authorAddress: author.address,
+          signature: {
+            r: ethers.getBytes(sig.r),
+            vs: ethers.getBytes(sig.yParityAndS),
+          },
+          schemeVersion: AUTHOR_SCHEME_VERSION_V1,
         },
-        schemeVersion: AUTHOR_SCHEME_VERSION_V1,
-      },
-    });
-    expect(result.status).toBe('tentative');
-    expect(result.onChainResult).toBeUndefined();
+      }),
+    ).rejects.toThrow(/expectedMerkleRoot mismatch/);
   });
 
   it('rejects on-chain publish without precomputedAttestation', async () => {
     // RFC-001 §9.x — Phase C — the publisher refuses to broadcast when
     // the seal is missing. Falls through to tentative because the
-    // publisher catches signing-path errors instead of re-throwing.
+    // publisher catches signing-path errors instead of re-throwing —
+    // this preserves backward compat for direct `publisher.publish`
+    // unit tests that don't care about author attribution. Production
+    // call sites (agent.publish, /api/shared-memory/publish) always
+    // supply a seal, so they cannot land in this branch.
     const publisher = makePublisher();
     const result = await publisher.publish({
       contextGraphId: CONTEXT_GRAPH,

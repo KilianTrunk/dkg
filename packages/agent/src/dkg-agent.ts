@@ -16,7 +16,7 @@ import {
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
   encodeFinalizationMessage, type FinalizationMessageMsg,
   getGenesisQuads, computeNetworkId, SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY,
-  Logger, createOperationContext, sparqlString, escapeSparqlLiteral,
+  Logger, createOperationContext, sparqlString, escapeSparqlLiteral, isSafeIri,
   TrustLevel,
   buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1,
   buildAssertionSealQuads, buildAssertionPublishReceiptQuads,
@@ -30,7 +30,7 @@ import {
   PublishJournal, StaleWriteError,
   ACKCollector, StorageACKHandler,
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
-  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
+  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
   TripleStoreAsyncLiftPublisher,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
@@ -3662,7 +3662,16 @@ export class DKGAgent {
         precomputedAttestation = await this._buildPrecomputedAttestationForSelection(
           contextGraphId,
           quads,
-          { targetOnChainCgId: onChainId },
+          {
+            targetOnChainCgId: onChainId,
+            // Round 4 review §11 — propagate privateQuads so the
+            // pre-seal merkle includes their per-entity private roots
+            // (the publisher computes `kcMerkleRoot` over public
+            // leaves + privateRoots; without this, every V10 publish
+            // with private content silently downgrades to tentative on
+            // the publisher's `expectedMerkleRoot` guard).
+            privateQuads,
+          },
         );
       } catch (err) {
         this.log.warn(
@@ -3849,16 +3858,35 @@ export class DKGAgent {
 
     // 2. Pull the assertion's quads. Refuse to finalize an empty
     //    assertion — there's nothing to commit.
-    const quads = await this.publisher.assertionQuery(
+    const rawQuads = await this.publisher.assertionQuery(
       contextGraphId,
       name,
       agentAddress,
       opts?.subGraphName,
     );
-    if (quads.length === 0) {
+    if (rawQuads.length === 0) {
       throw new Error(
         `Cannot finalize assertion <${assertionUri}>: it has no quads. ` +
           `Write at least one quad with /api/assertion/${name}/write before finalizing.`,
+      );
+    }
+
+    // 2b. Apply the same `isReservedSubject` filter that
+    //     `assertionPromote` runs at promote time. WM-only bookkeeping
+    //     rows in the `urn:dkg:file:` / `urn:dkg:extraction:` namespaces
+    //     (file descriptors, ExtractionProvenance blocks — see
+    //     `19_MARKDOWN_CONTENT_TYPE.md §10.2`) are stripped before the
+    //     assertion crosses the SWM boundary, so the seal MUST hash
+    //     the post-strip set or it commits to a root the publish path
+    //     can never recompute. (Round 4 review §8 — "assertionFinalize
+    //     hashes WM-only urn:dkg:file: rows".)
+    const quads = rawQuads.filter((q) => !isReservedSubject(q.subject));
+    if (quads.length === 0) {
+      throw new Error(
+        `Cannot finalize assertion <${assertionUri}>: every quad has a ` +
+          `reserved-namespace subject (urn:dkg:file:* / urn:dkg:extraction:*) ` +
+          `which is filtered out before SWM. Add at least one user-authored ` +
+          `quad on a non-reserved subject before finalizing.`,
       );
     }
 
@@ -3870,6 +3898,22 @@ export class DKGAgent {
     const kaMap = autoPartition(quads);
     const allSkolemizedQuads = [...kaMap.values()].flat();
     const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, []);
+    // 3b. Capture rootEntities from the SAME `autoPartition` call that
+    //     drives the merkle leaves. The seal binds these so
+    //     `publishFromFinalizedAssertion` can scope its SWM CONSTRUCT
+    //     instead of bundling everything currently sitting in shared
+    //     memory (Round 4 review §9). Defensive `isSafeIri` filter so
+    //     a malformed root entity is caught here rather than at
+    //     interpolation time.
+    const rootEntities = [...kaMap.keys()].filter((r) => isSafeIri(r));
+    if (rootEntities.length === 0) {
+      throw new Error(
+        `Cannot finalize assertion <${assertionUri}>: autoPartition produced ` +
+          `no IRI-safe root entities. The assertion's quads have only blank-node ` +
+          `subjects or unsafe IRIs — name at least one root entity with a stable ` +
+          `IRI subject before finalizing.`,
+      );
+    }
 
     // 4. Idempotency: if a seal already exists for this assertion,
     //    return it as-is when the merkleRoot matches. Mismatch means
@@ -4053,6 +4097,7 @@ export class DKGAgent {
       chainId,
       kav10Address,
       finalizedAtIso,
+      rootEntities,
     });
     await this.store.insert(sealQuads);
 
@@ -4132,6 +4177,17 @@ export class DKGAgent {
        * CG than the SWM source.
        */
       targetOnChainCgId?: bigint | string;
+      /**
+       * Private quads for the same publish. Round 4 review §11 —
+       * `DKGPublisher.publish` computes `kcMerkleRoot` over the
+       * concatenation of public quads + private roots (see
+       * `dkg-publisher.ts:1567-1575`). The seal must hash the same
+       * leaves or every V10 publish with `privateQuads` falls back to
+       * `tentative` on the publisher's `expectedMerkleRoot mismatch`
+       * guard. Pass them through so the agent's pre-seal merkle
+       * matches what the publisher will recompute.
+       */
+      privateQuads?: Quad[];
     },
   ): Promise<PublishOptions['precomputedAttestation']> {
     if (
@@ -4154,7 +4210,28 @@ export class DKGAgent {
 
     const kaMap = autoPartition(quads);
     const allSkolemizedQuads = [...kaMap.values()].flat();
-    const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, []);
+    // Mirror the publisher's per-rootEntity private partition + root
+    // derivation (see `dkg-publisher.ts:1526-1570`). Each public root
+    // entity gets the private quads whose subjects either equal it or
+    // skolemize beneath its `…/.well-known/genid/` namespace; each
+    // such non-empty bag becomes a `computePrivateRootV10` leaf in the
+    // KC merkle. The order MUST follow the publisher's manifest
+    // iteration over `kaMap`, which is the insertion order — same map
+    // we built two lines up.
+    const privateQuads = opts?.privateQuads ?? [];
+    const privateRoots: Uint8Array[] = [];
+    for (const rootEntity of kaMap.keys()) {
+      if (privateQuads.length === 0) break;
+      const entityPrivateQuads = privateQuads.filter(
+        (q) =>
+          q.subject === rootEntity ||
+          q.subject.startsWith(rootEntity + '/.well-known/genid/'),
+      );
+      if (entityPrivateQuads.length === 0) continue;
+      const root = computePrivateRoot(entityPrivateQuads);
+      if (root) privateRoots.push(root);
+    }
+    const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, privateRoots);
 
     const chainId = await this.chain.getEvmChainId();
     const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
@@ -4277,12 +4354,29 @@ export class DKGAgent {
     if (selection === 'all') {
       sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${swmGraph}> { ?s ?p ?o } }`;
     } else {
+      // Round 4 review §10 — mirror the `isSafeIri` filter that
+      // `DKGPublisher.publishFromSharedMemory` applies before its own
+      // SPARQL CONSTRUCT. Without this guard a caller could craft a
+      // `selection.rootEntities` value containing `>` / SPARQL syntax
+      // that breaks out of the `<…>` IRI literal and rewrites the
+      // pre-seal CONSTRUCT into a wider scope. Both seams must agree
+      // on the IRI shape that survives interpolation; the `_meta`
+      // seal writer (`buildAssertionSealQuads`) applies the same
+      // reject-set when it persists rootEntities so any value that
+      // round-trips through finalize → publish is safe here.
       const roots = [...new Set(
-        selection.rootEntities.map((r) => String(r).trim()),
+        selection.rootEntities
+          .map((r) => String(r).trim())
+          .filter((r) => isSafeIri(r)),
       )];
       if (roots.length === 0) {
+        const hadInput = selection.rootEntities.length > 0;
         throw new Error(
-          `_loadSelectedSWMQuads: no rootEntities supplied for context graph ${contextGraphId}`,
+          hadInput
+            ? `_loadSelectedSWMQuads: no valid rootEntities provided ` +
+                `(all ${selection.rootEntities.length} entries failed IRI validation) ` +
+                `for context graph ${contextGraphId}`
+            : `_loadSelectedSWMQuads: no rootEntities supplied for context graph ${contextGraphId}`,
         );
       }
       const values = roots.map((r) => `<${r}>`).join(' ');
@@ -4380,22 +4474,36 @@ export class DKGAgent {
     // 3. Run the standard publishFromSharedMemory flow with the
     //    pre-computed attestation. The publisher will sanity-check
     //    that its own merkle re-derivation matches the seal.
-    const result = await this.publishFromSharedMemory(contextGraphId, 'all', {
-      operationCtx: opts?.operationCtx,
-      onPhase: opts?.onPhase,
-      subGraphName: opts?.subGraphName,
-      publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
-      clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
-      // Wired through to the inner publisher.publish() via
-      // publishFromSharedMemory's `precomputedAttestation` option.
-      // Skips the publisher's signing entirely.
-      precomputedAttestation: {
-        expectedMerkleRoot: seal.merkleRoot,
-        authorAddress: seal.authorAddress,
-        signature: { r: seal.authorAttestationR, vs: seal.authorAttestationVS },
-        schemeVersion: seal.authorSchemeVersion,
+    //
+    //    Round 4 review §9 — scope the SWM CONSTRUCT to the seal's
+    //    `rootEntities` instead of `'all'`. With `'all'` a named
+    //    publish would bundle every other promoted assertion sitting
+    //    in shared memory into the same KC; the publisher's recompute
+    //    would then disagree with the seal's `expectedMerkleRoot` and
+    //    flip to `tentative kcId: "0"`. The seal's rootEntities were
+    //    captured at finalize time from the same `autoPartition` call
+    //    that drove the merkle leaves, so this selection deterministically
+    //    yields the post-promote SWM slice the seal commits to.
+    const result = await this.publishFromSharedMemory(
+      contextGraphId,
+      { rootEntities: seal.rootEntities },
+      {
+        operationCtx: opts?.operationCtx,
+        onPhase: opts?.onPhase,
+        subGraphName: opts?.subGraphName,
+        publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
+        clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
+        // Wired through to the inner publisher.publish() via
+        // publishFromSharedMemory's `precomputedAttestation` option.
+        // Skips the publisher's signing entirely.
+        precomputedAttestation: {
+          expectedMerkleRoot: seal.merkleRoot,
+          authorAddress: seal.authorAddress,
+          signature: { r: seal.authorAttestationR, vs: seal.authorAttestationVS },
+          schemeVersion: seal.authorSchemeVersion,
+        },
       },
-    });
+    );
 
     // 4. On confirmed publish, write receipt triples to _meta.
     if (result.status === 'confirmed' && result.onChainResult) {

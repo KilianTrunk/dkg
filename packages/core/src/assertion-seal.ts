@@ -44,6 +44,18 @@ export const ASSERTION_SEAL_PREDICATES = {
   ASSERTED_AT_KAV10_ADDRESS: `${ONT}assertedAtKav10Address`,
   /** Daemon-clock dateTime when the seal was written (xsd:dateTime). */
   ASSERTION_FINALIZED_AT: `${ONT}assertionFinalizedAt`,
+  /**
+   * Root entity bound to the seal (multi-valued). Recorded at finalize
+   * time so that `publishFromFinalizedAssertion` can scope the SWM
+   * SPARQL CONSTRUCT to exactly this assertion's quads instead of
+   * bundling everything currently in shared memory. The set is
+   * derived from `autoPartition(filteredQuads).keys()` over the same
+   * reserved-subject-filtered quads `assertionPromote` writes, so the
+   * post-promote SWM lookup produces the same merkle leaves the seal
+   * was signed over. IRI literal — emitted as `<rootEntity>` (object
+   * IRI), not a string literal.
+   */
+  ASSERTION_ROOT_ENTITY: `${ONT}assertionRootEntity`,
 } as const;
 
 /**
@@ -89,6 +101,12 @@ export function buildAssertionSealQuads(args: {
   chainId: bigint;
   kav10Address: string;
   finalizedAtIso: string;
+  /**
+   * Root entities the seal commits to (one per emitted quad). Required
+   * — the SWM-publish path uses these to scope its CONSTRUCT instead
+   * of bundling the entire shared-memory graph (Round 4 review §9).
+   */
+  rootEntities: ReadonlyArray<string>;
 }): Array<{ subject: string; predicate: string; object: string; graph: string }> {
   if (args.merkleRoot.length !== 32) {
     throw new Error(`merkleRoot must be 32 bytes, got ${args.merkleRoot.length}`);
@@ -98,6 +116,9 @@ export function buildAssertionSealQuads(args: {
   }
   if (args.authorAttestationVS.length !== 32) {
     throw new Error(`authorAttestationVS must be 32 bytes, got ${args.authorAttestationVS.length}`);
+  }
+  if (args.rootEntities.length === 0) {
+    throw new Error('rootEntities must be non-empty: the seal must commit to at least one root entity');
   }
   const merkleRootHex = bytesToHexLower(args.merkleRoot);
   const rHex = bytesToHexLower(args.authorAttestationR);
@@ -112,6 +133,18 @@ export function buildAssertionSealQuads(args: {
     predicate,
     object: objectLiteral,
     graph: args.metaGraph,
+  });
+
+  const rootEntityQuads = args.rootEntities.map((root) => {
+    if (UNSAFE_IRI_CHARS.test(root) || root.length === 0) {
+      throw new Error(`Unsafe rootEntity literal: ${root}`);
+    }
+    return {
+      subject: args.assertionUri,
+      predicate: ASSERTION_SEAL_PREDICATES.ASSERTION_ROOT_ENTITY,
+      object: `<${root}>`,
+      graph: args.metaGraph,
+    };
   });
 
   return [
@@ -135,8 +168,15 @@ export function buildAssertionSealQuads(args: {
       ASSERTION_SEAL_PREDICATES.ASSERTION_FINALIZED_AT,
       `"${args.finalizedAtIso}"^^${xsdDateTime}`,
     ),
+    ...rootEntityQuads,
   ];
 }
+
+// Subset of `assertSafeIri`'s reject set, inlined to keep the seal
+// module dependency-free. Mirrors `core/sparql-safe.ts:UNSAFE_IRI_CHARS`
+// so that any rootEntity that passes here is also safe to interpolate
+// into the SPARQL `VALUES` clause inside `_loadSelectedSWMQuads`.
+const UNSAFE_IRI_CHARS = /[<>"{}|\\^`\x00-\x20]/;
 
 /**
  * Build the on-chain receipt quads written after a successful
@@ -186,6 +226,12 @@ export interface AssertionSeal {
   chainId: bigint;
   kav10Address: string;
   finalizedAtIso: string;
+  /**
+   * Root entities the seal commits to. Set at finalize time, used at
+   * publish time to scope the SWM SPARQL CONSTRUCT (so a named publish
+   * does not bundle other content currently sitting in shared memory).
+   */
+  rootEntities: string[];
 }
 
 /**
@@ -199,8 +245,20 @@ export function parseAssertionSealQuads(
   assertionUri: string,
 ): AssertionSeal | undefined {
   const seen = new Map<string, string>();
+  const rootEntities: string[] = [];
   for (const q of quads) {
     if (q.subject !== assertionUri) continue;
+    if (q.predicate === ASSERTION_SEAL_PREDICATES.ASSERTION_ROOT_ENTITY) {
+      const m = q.object.match(/^<([^>]+)>$/);
+      if (!m) {
+        throw new Error(
+          `Invalid assertionRootEntity object literal in seal for <${assertionUri}>: ${q.object} ` +
+            `(expected an IRI in <…> form).`,
+        );
+      }
+      rootEntities.push(m[1]);
+      continue;
+    }
     seen.set(q.predicate, q.object);
   }
   if (!seen.has(ASSERTION_SEAL_PREDICATES.ASSERTION_MERKLE_ROOT)) return undefined;
@@ -222,6 +280,13 @@ export function parseAssertionSealQuads(
           `_meta is corrupt; rebuild from the source assertion.`,
       );
     }
+  }
+  if (rootEntities.length === 0) {
+    throw new Error(
+      `Partial assertion seal for <${assertionUri}>: at least one ` +
+        `<${ASSERTION_SEAL_PREDICATES.ASSERTION_ROOT_ENTITY}> is required ` +
+        `(seal predates the per-assertion-rootEntities binding — re-finalize the assertion).`,
+    );
   }
   return {
     merkleRoot: hexBinaryLiteralToBytes(
@@ -248,6 +313,7 @@ export function parseAssertionSealQuads(
     finalizedAtIso: dateTimeLiteralToValue(
       seen.get(ASSERTION_SEAL_PREDICATES.ASSERTION_FINALIZED_AT)!,
     ),
+    rootEntities,
   };
 }
 

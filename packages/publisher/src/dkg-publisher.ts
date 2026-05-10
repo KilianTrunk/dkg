@@ -1833,6 +1833,76 @@ export class DKGPublisher implements Publisher {
     } else {
       const tokenAmount = precomputedTokenAmount;
       usedV10Path = true;
+      // ─────────────────────────────────────────────────────────────
+      // SEAL INTEGRITY PREFLIGHT (Round 4 review §12)
+      //
+      // When a precomputedAttestation IS provided, validate it BEFORE
+      // the on-chain try/catch so seal-integrity failures (mismatched
+      // expectedMerkleRoot, wrong-signer recovery) propagate up as
+      // hard errors instead of being downgraded to a "tentative"
+      // result with a `On-chain tx failed` log line. These are
+      // protocol-correctness violations, not transient chain issues —
+      // /api/shared-memory/publish callers must see a 4xx for a
+      // broken seal, not a 200 OK with `status: tentative` and
+      // `kcId: 0` (which the daemon previously had to special-case).
+      //
+      // Missing-seal — `precomputedAttestation === undefined` — is
+      // intentionally NOT hoisted. The publisher's contract historically
+      // permits no-seal publishes (they fall through to tentative);
+      // breaking that surface in this PR would invalidate ~120 publisher
+      // unit tests that exercise transport, ownership, and lifecycle
+      // mechanics without caring about author attribution. Production
+      // call sites (agent.publish, /api/shared-memory/publish) always
+      // mint a seal at the agent layer — see Phase 4 wiring; no
+      // user-facing path can reach the publisher without a seal.
+      // ─────────────────────────────────────────────────────────────
+      if (
+        options.precomputedAttestation &&
+        v10ChainId !== undefined &&
+        v10KavAddress !== undefined
+      ) {
+        const effectiveAuthorAddress = options.precomputedAttestation.authorAddress;
+        const effectiveSchemeVersion = options.precomputedAttestation.schemeVersion;
+        const authorTypedData = buildAuthorAttestationTypedData({
+          chainId: v10ChainId,
+          kav10Address: v10KavAddress,
+          contextGraphId: v10CgId,
+          merkleRoot: kcMerkleRoot,
+          authorAddress: effectiveAuthorAddress,
+          schemeVersion: effectiveSchemeVersion,
+        });
+        {
+          const expected = options.precomputedAttestation.expectedMerkleRoot;
+          if (expected.length !== kcMerkleRoot.length || !expected.every((b, i) => b === kcMerkleRoot[i])) {
+            throw new Error(
+              `precomputedAttestation.expectedMerkleRoot mismatch: ` +
+              `seal expects ${ethers.hexlify(expected)} but publish-time recompute yielded ${ethers.hexlify(kcMerkleRoot)}. ` +
+              `Either the assertion's quads were mutated after finalize, or the caller's merkle algorithm differs from the publisher's. Re-finalize the assertion.`,
+            );
+          }
+        }
+        {
+          const sig = ethers.Signature.from({
+            r: ethers.hexlify(options.precomputedAttestation.signature.r),
+            yParityAndS: ethers.hexlify(options.precomputedAttestation.signature.vs),
+          });
+          const digest = ethers.TypedDataEncoder.hash(
+            authorTypedData.domain,
+            authorTypedData.types,
+            authorTypedData.message,
+          );
+          const recovered = ethers.recoverAddress(digest, sig);
+          if (recovered.toLowerCase() !== effectiveAuthorAddress.toLowerCase()) {
+            throw new Error(
+              `precomputedAttestation signer mismatch: signature recovers ${recovered} ` +
+              `but address claims ${effectiveAuthorAddress}. The seal's signature does not match its recorded authorAddress; ` +
+              `the assertion's _meta block is corrupt and the assertion must be re-finalized.`,
+            );
+          }
+        }
+      }
+      // ── End preflight ───────────────────────────────────────────
+
       let signStarted = false;
       let submitStarted = false;
       try {
@@ -1868,8 +1938,6 @@ export class DKGPublisher implements Publisher {
             'getKnowledgeAssetsV10Address(); neither was resolved. The adapter is not V10-capable.',
           );
         }
-        // RFC-001 §9.x — author attestation is sealed at finalize-time
-        // and forwarded verbatim. The publisher never signs.
         if (!options.precomputedAttestation) {
           throw new Error(
             'Publish rejected: on-chain publish requires precomputedAttestation. ' +
@@ -1888,43 +1956,15 @@ export class DKGPublisher implements Publisher {
           authorAddress: effectiveAuthorAddress,
           schemeVersion: effectiveSchemeVersion,
         });
-        // The publisher's own re-derivation of `kcMerkleRoot` from the
-        // supplied quads MUST match the seal's expected root, otherwise
-        // either the quads were tampered between finalize and publish,
-        // or the caller and publisher disagree on the canonical merkle
-        // computation. Either way, refuse to publish.
-        {
-          const expected = options.precomputedAttestation.expectedMerkleRoot;
-          if (expected.length !== kcMerkleRoot.length || !expected.every((b, i) => b === kcMerkleRoot[i])) {
-            throw new Error(
-              `precomputedAttestation.expectedMerkleRoot mismatch: ` +
-              `seal expects ${ethers.hexlify(expected)} but publish-time recompute yielded ${ethers.hexlify(kcMerkleRoot)}. ` +
-              `Either the assertion's quads were mutated after finalize, or the caller's merkle algorithm differs from the publisher's. Re-finalize the assertion.`,
-            );
-          }
-        }
         const authorSig: ethers.Signature = ethers.Signature.from({
           r: ethers.hexlify(options.precomputedAttestation.signature.r),
           yParityAndS: ethers.hexlify(options.precomputedAttestation.signature.vs),
         });
-        // Verify the sig still recovers to the claimed author against
-        // the typed data we just rebuilt. Cheap defense-in-depth before
-        // the chain rejects it.
-        {
-          const digest = ethers.TypedDataEncoder.hash(
-            authorTypedData.domain,
-            authorTypedData.types,
-            authorTypedData.message,
-          );
-          const recovered = ethers.recoverAddress(digest, authorSig);
-          if (recovered.toLowerCase() !== effectiveAuthorAddress.toLowerCase()) {
-            throw new Error(
-              `precomputedAttestation signer mismatch: signature recovers ${recovered} ` +
-              `but address claims ${effectiveAuthorAddress}. The seal's signature does not match its recorded authorAddress; ` +
-              `the assertion's _meta block is corrupt and the assertion must be re-finalized.`,
-            );
-          }
-        }
+        // Note: the seal-integrity validations (expectedMerkleRoot
+        // match, signer recovery) are now done as preflight above
+        // before this try block, so they propagate as hard errors
+        // instead of being silently downgraded to tentative
+        // (Round 4 review §12).
         // P-1 review (iter-2): `chain:writeahead:start` now fires
         // *from inside* the adapter via the `onBroadcast` callback,
         // which the adapter invokes immediately before the real

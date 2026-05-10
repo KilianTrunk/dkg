@@ -1219,23 +1219,25 @@ export class DKGPublisher implements Publisher {
         const defaultDataGraph = this.graphManager.dataGraphUri(contextGraphId);
         const defaultMetaGraph = `${defaultDataGraph.replace(/\/data$/, '')}/_meta`;
 
-        // Data promotion only fires on REMAP-flow publishes
-        // (`publishContextGraphId` set — the caller explicitly asked for the
-        // payload to land at `<NAME>/context/<cgId>/data`). Same-graph
-        // publishes through the selection-bridge keep their data in the
-        // default `<NAME>/data` URI so `agent.query(label)` (which resolves
-        // to `did:dkg:context-graph:<label>` without a `/context/<id>` suffix)
-        // still finds the just-published triples. RS doesn't need data
-        // promotion — only the per-cgId `_meta` graph below — so always
-        // promote `_meta` regardless of the remap flag.
+        // Data promotion: always COPY public quads to the per-cgId data
+        // graph (`<NAME>/context/<cgId>/data`) — RS prover's
+        // `extractV10KCFromStore` reads triples from there
+        // (`kc-extractor.ts` line ~225). On REMAP-flow publishes
+        // (`publishContextGraphId` set), also delete the original copy
+        // from the default data graph; on same-graph publishes, leave
+        // the default copy in place so `agent.query(label)` (which
+        // resolves to `did:dkg:context-graph:<label>` without a
+        // `/context/<id>` suffix) still finds the just-published
+        // triples. Mirrors the `_meta` pattern below.
         if (
-          ctxGraphId &&
           publishResult.publicQuads &&
           publishResult.publicQuads.length > 0
         ) {
           const storedQuads = publishResult.publicQuads.map(q => ({ ...q, graph: defaultDataGraph }));
           await this.store.insert(storedQuads.map(q => ({ ...q, graph: ctxDataGraph })));
-          await this.store.delete(storedQuads);
+          if (ctxGraphId) {
+            await this.store.delete(storedQuads);
+          }
         }
 
         const ual = publishResult.ual;

@@ -249,14 +249,22 @@ export function parseAssertionSealQuads(
   for (const q of quads) {
     if (q.subject !== assertionUri) continue;
     if (q.predicate === ASSERTION_SEAL_PREDICATES.ASSERTION_ROOT_ENTITY) {
-      const m = q.object.match(/^<([^>]+)>$/);
-      if (!m) {
+      // The seal builder writes the root entity in N-Triples `<X>` IRI
+      // syntax (line 145), but stores like oxigraph parse the IRI on
+      // insert and round-trip the bare value back out. Accept both
+      // shapes so the round-trip survives any IRI-aware backend.
+      // `seal.rootEntities` is always exposed to consumers as bare IRIs
+      // (they re-wrap for SPARQL VALUES themselves — see
+      // `_loadSelectedSWMQuads`).
+      const wrapped = q.object.match(/^<([^>]+)>$/);
+      const root = wrapped ? wrapped[1] : q.object;
+      if (root.length === 0 || UNSAFE_IRI_CHARS.test(root)) {
         throw new Error(
-          `Invalid assertionRootEntity object literal in seal for <${assertionUri}>: ${q.object} ` +
-            `(expected an IRI in <…> form).`,
+          `Invalid assertionRootEntity IRI in seal for <${assertionUri}>: ${q.object} ` +
+            `(failed safe-IRI check; expected a bare IRI or N-Triples <IRI> form).`,
         );
       }
-      rootEntities.push(m[1]);
+      rootEntities.push(root);
       continue;
     }
     seen.set(q.predicate, q.object);

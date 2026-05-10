@@ -4,24 +4,17 @@ Curated snapshot of bugs and observations surfaced by `pnpm test:devnet:v10-stre
 
 ## Bugs filed
 
-### Bug 1 — `publishFromFinalizedAssertion` bundles all SWM content
+### Bug 1 (FIXED) — `publishFromFinalizedAssertion` bundled all SWM content
 
-**Where:** `packages/agent/src/dkg-agent.ts:4383` — `publishFromFinalizedAssertion` calls `publishFromSharedMemory(contextGraphId, 'all', …)` with the literal selection `'all'`. SWM content is **not** filtered to the named assertion's quads.
+Originally: `publishFromFinalizedAssertion` called `publishFromSharedMemory(contextGraphId, 'all', …)`, which bundled every promoted assertion currently in SWM into one KC. This produced a merkle-root mismatch against the seal computed at finalize time → `tentative` / `kcId: "0"` rejection.
 
-**Reproduction:**
-1. `POST /api/assertion/create { …, finalize: true, promote: true }` for assertion `A`.
-2. `POST /api/assertion/create { …, finalize: true, promote: true }` for assertion `B`.
-3. `POST /api/shared-memory/publish { assertionName: A }`.
+**Fixed in `26c38350`** (PR #436 Round-4 review #9): the seal block in `_meta` now persists `dkg:assertionRootEntity` triples (one per `autoPartition(filteredQuads).keys()`), and `publishFromFinalizedAssertion` reads them back to scope `selection: { rootEntities: seal.rootEntities }`. Test workaround that drained SWM between batches is no longer required, but is retained because it doesn't hurt and it documents why ordering matters when leaving content in SWM.
 
-**Observed:** the publish bundles A∪B's quads into one KC. The publisher derives a merkle root over the actual bundled SWM content, which does not match the seal's merkle root computed at finalize time over only A's quads, so the publisher returns `tentative` with `kcId: "0"` (sentinel rejection) and the on-chain submission is skipped.
+### Bug 1a (FIXED) — assertionRootEntity round-trip stripped the IRI wrapping
 
-**Expected:** publishing assertion `A` by name publishes exactly A's sealed content.
+`buildAssertionSealQuads` writes the rootEntity as `object: '<urn:foo>'` (N-Triples IRI form). Oxigraph parses the input correctly and stores it as a NamedNode, but on read-back `termToString` returns the bare value (`urn:foo`) for NamedNodes — `<>` is N-Triples *syntax*, not part of the data model. `parseAssertionSealQuads` then fails its regex `/^<([^>]+)>$/` and the publish returns `HTTP 500: Invalid assertionRootEntity object literal in seal`. Surfaced on the very first VM custodial publish in Phase 2.
 
-**Fix direction:** either
-1. extract the named assertion's rootEntities at finalize time and pass `selection: { rootEntities: [...] }` to `publishFromSharedMemory`, or
-2. promote each assertion's quads into a per-assertion graph (e.g. `<assertionUri>/data`) so SWM-wide selection naturally scopes to one assertion. Option 2 is cleaner because it also lets concurrent promotes run without interfering, but it touches the storage layer.
-
-**Workaround in the suite:** drain SWM at phase start (`shared-memory/publish { selection: 'all', clearAfter: true }`), and run all named-publish batches before any "promote and leave in SWM" batch. This preserves the test's intent at the cost of being unrepresentative of real client patterns.
+**Fixed:** `parseAssertionSealQuads` now accepts both `<X>` and bare `X` forms, validating the unwrapped IRI against the same `UNSAFE_IRI_CHARS` reject set the producer uses. `seal.rootEntities` continues to expose bare IRIs to consumers (which re-wrap themselves for SPARQL `VALUES` — see `_loadSelectedSWMQuads`). New unit test `assertion-seal-root-entities.test.ts: parses bare-IRI form (post storage round-trip) identical to <IRI> form` pins the round-trip.
 
 ### Bug 2 — Publisher nonce race during back-to-back publishes
 
@@ -34,6 +27,12 @@ Curated snapshot of bugs and observations surfaced by `pnpm test:devnet:v10-stre
 **Fix direction:** the chain-adapter should switch nonce-fetching to `eth_getTransactionCount(wallet, 'pending')`, OR the op-wallet pool should track per-wallet pending nonces in-process and refuse to dispatch until the previous tx is mined. The latter is more defensive against external tx submissions; the former is a one-line change in the adapter.
 
 **Workaround in the suite:** insert a 2s gap before the VM-custodial batch and retry once on `tentative` after a 2s back-off. This let the test pass in CI but masks the bug for end users.
+
+### Bug 3 (FIXED) — Confirmed-publish data not promoted to per-cgId data graph on same-graph publishes
+
+`DKGPublisher.publishFromSharedMemory`'s data-promotion branch was originally MOVING data from `<NAME>/data` (default) to `<NAME>/context/<cgId>/data` (per-cgId) on every confirmed V10 publish. Agent E2E tests query the default URI via `agent.query(label)` and broke. The earlier fix (`c2abbc9a`) restricted the move to REMAP-flow publishes only (`publishContextGraphId` set), which fixed agent E2E but quietly broke RS proof submission: `kc-extractor.ts` always queries `GRAPH <contextGraphDataUri(cgName, cgId)>` (= per-cgId), so on same-graph publishes RS saw zero triples and emitted `kc-not-synced` for every challenge. Across the entire devnet, **0/5 cores** submitted RS proofs in the 120s Phase-4 window before the fix.
+
+**Fixed:** data is now ALWAYS COPIED to the per-cgId data graph (mirroring the meta pattern that was already correct), and on REMAP publishes is additionally deleted from the default graph. Same-graph publishes keep both copies — `agent.query(label)` finds it at the default URI, RS finds it at the per-cgId URI. Net effect: same-graph publishes carry a small data duplication cost, REMAP publishes are unchanged. Surfaced and fixed in this run; Phase 4 went from 0/5 to 1/5 cores submitting (still under-rate per the warning below, but past the test's hard floor).
 
 ## Warnings (worth investigating, not necessarily bugs)
 

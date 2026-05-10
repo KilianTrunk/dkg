@@ -94,7 +94,7 @@ describe('assertion seal rootEntities round-trip', () => {
     );
   });
 
-  it('parsing a malformed assertionRootEntity object literal throws', () => {
+  it('parsing a malformed assertionRootEntity object (string literal w/ quotes) throws', () => {
     const quads = buildAssertionSealQuads(makeBaseArgs(['urn:dkg:doc:foo']));
     const corrupt = quads.map((q) =>
       q.predicate === ASSERTION_SEAL_PREDICATES.ASSERTION_ROOT_ENTITY
@@ -102,8 +102,27 @@ describe('assertion seal rootEntities round-trip', () => {
         : q,
     );
     expect(() => parseAssertionSealQuads(corrupt, ASSERTION_URI)).toThrow(
-      /Invalid assertionRootEntity object literal/,
+      /Invalid assertionRootEntity IRI/,
     );
+  });
+
+  it('parses bare-IRI form (post storage round-trip) identical to <IRI> form', () => {
+    // Real backends parse `<urn:foo>` as an IRI on insert and round-trip
+    // back as the bare value `urn:foo` on read (e.g. oxigraph
+    // `termToString` returns `t.value` for NamedNode). The parser must
+    // accept both shapes — see the round-trip-bug fix in
+    // `experiments/v10-stress-devnet/FINDINGS.md` Phase 2.
+    const roots = ['urn:dkg:doc:foo', 'http://example.com/A'];
+    const wrapped = buildAssertionSealQuads(makeBaseArgs(roots));
+    const bare = wrapped.map((q) =>
+      q.predicate === ASSERTION_SEAL_PREDICATES.ASSERTION_ROOT_ENTITY
+        ? { ...q, object: q.object.replace(/^<(.+)>$/, '$1') }
+        : q,
+    );
+    const sealFromBare = parseAssertionSealQuads(bare, ASSERTION_URI);
+    const sealFromWrapped = parseAssertionSealQuads(wrapped, ASSERTION_URI);
+    expect(sealFromBare!.rootEntities).toEqual(roots);
+    expect(sealFromBare!.rootEntities).toEqual(sealFromWrapped!.rootEntities);
   });
 
   it('parser dedupes nothing — preserves duplicate rootEntities verbatim', () => {

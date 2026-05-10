@@ -21,8 +21,19 @@ import { ethers } from 'ethers';
 import type { PhaseCallback } from '../src/publisher.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { wrapPublisherForTest } from './_helpers/seal.js';
 
 let CONTEXT_GRAPH: string;
+let _kav10Address: string;
+let _provider: ethers.JsonRpcProvider;
+const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+
+function makeTestPublisher(opts: ConstructorParameters<typeof DKGPublisher>[0]): DKGPublisher {
+  return wrapPublisherForTest(makeTestPublisher(opts), {
+    author: _author,
+    ctx: { provider: _provider, kav10Address: _kav10Address },
+  });
+}
 const ENTITY = 'did:dkg:agent:QmPhaseSeq';
 
 function q(s: string, p: string, o: string, g = `did:dkg:context-graph:${CONTEXT_GRAPH}`): Quad {
@@ -63,6 +74,8 @@ describe('Phase-sequence contracts', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const cgId = await createTestContextGraph(chain);
     CONTEXT_GRAPH = String(cgId);
+    _provider = provider;
+    _kav10Address = await chain.getKnowledgeAssetsV10Address();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -75,7 +88,7 @@ describe('Phase-sequence contracts', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store,
       chain,
       eventBus: new TypedEventBus(),
@@ -136,7 +149,7 @@ describe('Phase-sequence contracts', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store,
       chain,
       eventBus: new TypedEventBus(),
@@ -181,7 +194,7 @@ describe('Phase-sequence contracts', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store,
       chain,
       eventBus: new TypedEventBus(),
@@ -267,7 +280,7 @@ describe('Phase-sequence contracts', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -311,7 +324,7 @@ describe('Phase-sequence contracts', () => {
       const store = new OxigraphStore();
       const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
       const keypair = await generateEd25519Keypair();
-      const publisher = new DKGPublisher({
+      const publisher = makeTestPublisher({
         store, chain, eventBus: new TypedEventBus(), keypair,
         publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
         publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -338,7 +351,7 @@ describe('Phase-sequence contracts', () => {
       const store = new OxigraphStore();
       const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
       const keypair = await generateEd25519Keypair();
-      const publisher = new DKGPublisher({
+      const publisher = makeTestPublisher({
         store, chain, eventBus: new TypedEventBus(), keypair,
         publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
         publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -371,7 +384,7 @@ describe('Phase-sequence contracts', () => {
       const store = new OxigraphStore();
       const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
       const keypair = await generateEd25519Keypair();
-      const publisher = new DKGPublisher({
+      const publisher = makeTestPublisher({
         store, chain, eventBus: new TypedEventBus(), keypair,
         publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
         publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -424,7 +437,7 @@ describe('Phase-sequence contracts', () => {
       const store = new OxigraphStore();
       const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
       const keypair = await generateEd25519Keypair();
-      const publisher = new DKGPublisher({
+      const publisher = makeTestPublisher({
         store, chain, eventBus: new TypedEventBus(), keypair,
         publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
         publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -461,7 +474,7 @@ describe('Phase-sequence contracts', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),

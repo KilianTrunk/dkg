@@ -10,6 +10,7 @@ import { subtractFinalizedExactQuads } from '../src/async-lift-subtraction.js';
 import type { LiftValidationInput } from '../src/async-lift-validation.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { wrapPublisherForTest } from './_helpers/seal.js';
 
 describe('subtractFinalizedExactQuads', () => {
   let store: OxigraphStore;
@@ -19,6 +20,17 @@ describe('subtractFinalizedExactQuads', () => {
 
   let CONTEXT_GRAPH: string;
   let _fileSnapshot: string;
+  let _kav10Address: string;
+  let _provider: ethers.JsonRpcProvider;
+  const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+
+  function makeTestPublisher(opts: ConstructorParameters<typeof DKGPublisher>[0]): DKGPublisher {
+    return wrapPublisherForTest(makeTestPublisher(opts), {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
+    });
+  }
+
   beforeAll(async () => {
     _fileSnapshot = await takeSnapshot();
     const { hubAddress } = getSharedContext();
@@ -27,6 +39,9 @@ describe('subtractFinalizedExactQuads', () => {
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
     const cgId = await createTestContextGraph();
     CONTEXT_GRAPH = cgId.toString();
+    _provider = provider;
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    _kav10Address = await chain.getKnowledgeAssetsV10Address();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -38,7 +53,7 @@ describe('subtractFinalizedExactQuads', () => {
     graphManager = new GraphManager(store);
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
-    publisher = new DKGPublisher({
+    publisher = makeTestPublisher({
       store,
       chain,
       eventBus: new TypedEventBus(),

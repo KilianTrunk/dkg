@@ -240,3 +240,52 @@ export function wrapPublisherForTest(
     },
   });
 }
+
+/**
+ * Convenience for the common pattern in publisher tests: take an
+ * `EVMChainAdapter` (already wired with `provider` + V10 address) and a
+ * private key for the test author, derive the `SealCtx` lazily, and
+ * return a wrapped publisher. Lets test files write a single line:
+ *
+ *   publisher = await wrapPublisherWithChain(new DKGPublisher(...), chain, HARDHAT_KEYS.CORE_OP);
+ *
+ * Re-uses the chain's provider so tests don't have to spin up their
+ * own (avoids extra RPC sockets for hardhat tests that already have
+ * chains available).
+ */
+export async function wrapPublisherWithChain(
+  publisher: DKGPublisher,
+  chain: { getProvider: () => ethers.JsonRpcProvider; getKnowledgeAssetsV10Address: () => Promise<string> },
+  authorKey: string,
+): Promise<DKGPublisher> {
+  return wrapPublisherForTest(publisher, {
+    author: new ethers.Wallet(authorKey),
+    ctx: {
+      provider: chain.getProvider(),
+      kav10Address: await chain.getKnowledgeAssetsV10Address(),
+    },
+  });
+}
+
+/**
+ * Build a `SealCtx` against a fake provider for unit tests that use
+ * `MockChainAdapter`. The provider stub returns `chainId=31337` from
+ * `getNetwork()` — enough to drive `buildAuthorAttestationTypedData`.
+ * The mock chain doesn't validate the seal cryptographically, so any
+ * deterministic chainId works as long as the test asserts behaviour
+ * downstream of `chain.publish()` (status, captured args, etc.) and
+ * not seal authenticity.
+ */
+export function mockSealCtx(opts: {
+  chainId?: bigint;
+  kav10Address?: string;
+} = {}): SealCtx {
+  const chainId = opts.chainId ?? 31337n;
+  const kav10Address = opts.kav10Address ?? '0x0000000000000000000000000000000000000001';
+  return {
+    provider: {
+      getNetwork: async () => ({ chainId }),
+    } as unknown as ethers.JsonRpcProvider,
+    kav10Address,
+  };
+}

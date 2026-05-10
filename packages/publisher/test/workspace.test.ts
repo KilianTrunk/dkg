@@ -21,12 +21,16 @@ import {
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, seedContextGraphRegistration, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { wrapPublisherForTest } from './_helpers/seal.js';
 
 let CONTEXT_GRAPH = 'test-workspace';
 let DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
 let WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
 let WORKSPACE_META_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory_meta`;
 const ENTITY = 'urn:test:entity:1';
+let _kav10Address: string;
+let _provider: ethers.JsonRpcProvider;
+const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 
 function q(s: string, p: string, o: string, g = ''): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
@@ -62,6 +66,9 @@ beforeAll(async () => {
   DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
   WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
   WORKSPACE_META_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory_meta`;
+  _provider = createProvider();
+  const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+  _kav10Address = await chain.getKnowledgeAssetsV10Address();
 });
 
 describe('Workspace: share', () => {
@@ -93,6 +100,10 @@ describe('Workspace: share', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
   });
   afterEach(async () => {
@@ -230,6 +241,10 @@ describe('Workspace: publishFromSharedMemory', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
     await seedContextGraphRegistration(store, CONTEXT_GRAPH);
   });
@@ -407,6 +422,10 @@ describe('Workspace: ownership persistence and reconstruction', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
     await seedContextGraphRegistration(store, CONTEXT_GRAPH);
   });
@@ -1092,6 +1111,10 @@ describe('Workspace: conditionalShare (CAS)', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
   });
 

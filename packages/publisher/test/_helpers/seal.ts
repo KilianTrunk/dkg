@@ -165,3 +165,78 @@ export async function updateSealed(
     (await withSeal(args, author, ctx)) as unknown as Parameters<DKGPublisher['update']>[1],
   );
 }
+
+/**
+ * Wrap a `DKGPublisher` instance so that any `publish()` / `update()`
+ * call without a `precomputedAttestation` automatically gets one
+ * minted by `author` over the call's `quads` (and any `privateQuads`).
+ *
+ * Phase C (`d353d6a5`) made the publisher refuse to self-sign — every
+ * on-chain publish must arrive with a seal. The agent
+ * (`DKGAgent.publishAssertion`) does this in production at
+ * `assertion.finalize()` time. For test files that pre-date Phase C
+ * and still call `publisher.publish(...)` directly with an unsigned
+ * argument bag, this wrapper preserves their existing call sites and
+ * lets them stay focused on the behaviour they assert (lifecycle,
+ * ACK quorum, access control, etc.) rather than seal ceremony.
+ *
+ * Calls that already include `precomputedAttestation` pass through
+ * untouched, so tests that need explicit seal control (e.g.
+ * agent-provenance-e2e.test.ts) keep working.
+ *
+ * Calls without `quads` (e.g. mocked test paths that just verify
+ * argument shape) also pass through untouched, since there's nothing
+ * to seal over.
+ *
+ * `publishFromSharedMemory` is intentionally NOT wrapped here — the
+ * quads it publishes are selected via SPARQL from the SWM store, so
+ * the test must build the seal over the same selection itself
+ * (see `packages/publisher/test/swm-subset-cleanup.test.ts` for
+ * the canonical pattern using `sealForRoots`/`sealForAll`).
+ */
+export interface WrapPublisherOpts {
+  author: ethers.Wallet;
+  ctx: SealCtx;
+}
+
+export function wrapPublisherForTest(
+  publisher: DKGPublisher,
+  opts: WrapPublisherOpts,
+): DKGPublisher {
+  return new Proxy(publisher, {
+    get(target, prop, receiver) {
+      const orig = Reflect.get(target, prop, receiver);
+      if (typeof orig !== 'function') return orig;
+      if (prop !== 'publish' && prop !== 'update') {
+        return orig.bind(target);
+      }
+      return async (...args: unknown[]) => {
+        const argIdx = prop === 'update' ? 1 : 0;
+        const argBag = args[argIdx] as Record<string, unknown> | undefined;
+        if (
+          argBag &&
+          !argBag['precomputedAttestation'] &&
+          Array.isArray(argBag['quads']) &&
+          (argBag['quads'] as Quad[]).length > 0 &&
+          typeof argBag['contextGraphId'] !== 'undefined'
+        ) {
+          try {
+            const seal = await buildSeal({
+              quads: argBag['quads'] as Quad[],
+              privateQuads: argBag['privateQuads'] as Quad[] | undefined,
+              author: opts.author,
+              contextGraphId: argBag['contextGraphId'] as string | bigint,
+              ctx: opts.ctx,
+            });
+            args[argIdx] = { ...argBag, precomputedAttestation: seal };
+          } catch {
+            // No chain configured (mock/none) — leave args unchanged
+            // and let the publisher's own no-chain path handle it
+            // (these tests assert tentative status anyway).
+          }
+        }
+        return (orig as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+}

@@ -142,7 +142,7 @@ describe('@unit ContextGraphStorage', () => {
     it('RFC-001: accepts empty hosting nodes when requiredSignatures == 0 (edge-CG pattern)', async () => {
       await expect(
         StorageContract.connect(opSigner).createContextGraph(
-          accounts[1].address, [], baseAgents(), 0, 0, 1, ethers.ZeroAddress, 0,
+          accounts[1].address, [], baseAgents(), 0, 0, 0, 1, ethers.ZeroAddress, 0,
         ),
       ).to.not.be.reverted;
     });

@@ -50,11 +50,25 @@ const CCL_FACT_NS = 'https://example.org/ccl-fact#';
  *
  * Mutates `agent.publisher` in place — the property is `readonly` in
  * production but the test bypass is intentional and contained.
+ *
+ * The seal context is read from the agent's actual chain adapter:
+ * different test adapters return different kav10 addresses
+ * (`MockChainAdapter` -> `0x...c10a`,
+ * `OperationalKeyOnlyPublishChainAdapter` -> `0x...00A1`, etc.).
+ * Using a fixed `mockSealCtx()` would make the publisher's
+ * seal-integrity preflight rebuild typed-data with the chain's address
+ * (not ours) and reject the seal as a signer mismatch.
  */
-function _wrapAgentPublisherForSeal(agent: DKGAgent): void {
+async function _wrapAgentPublisherForSeal(agent: DKGAgent): Promise<void> {
+  const chain = (agent as unknown as { chain: {
+    getEvmChainId?: () => Promise<bigint>;
+    getKnowledgeAssetsV10Address?: () => Promise<string>;
+  } }).chain;
+  const chainId = (await chain.getEvmChainId?.()) ?? 31337n;
+  const kav10Address = (await chain.getKnowledgeAssetsV10Address?.()) ?? '0x000000000000000000000000000000000000c10a';
   const wrapped = wrapPublisherForTest(agent.publisher, {
     author: ethers.Wallet.createRandom(),
-    ctx: mockSealCtx(),
+    ctx: mockSealCtx({ chainId, kav10Address }),
   });
   Object.defineProperty(agent, 'publisher', { value: wrapped, writable: true, configurable: true });
 }
@@ -1279,7 +1293,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(77n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',
@@ -1311,7 +1325,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(1n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',
@@ -1343,7 +1357,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(1n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',
@@ -1402,7 +1416,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(1n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',
@@ -1439,7 +1453,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(1n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',
@@ -1480,7 +1494,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(1n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',
@@ -1555,7 +1569,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(1n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',
@@ -1600,7 +1614,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(1n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',
@@ -1663,7 +1677,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(1n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',
@@ -1702,7 +1716,7 @@ describe('DKGAgent ACK signer gating', () => {
     });
 
     try {
-      _wrapAgentPublisherForSeal(agent);
+      await _wrapAgentPublisherForSeal(agent);
       agent.publisher.setIdentityId(1n);
       const result = await agent.publisher.publish({
         contextGraphId: '42',

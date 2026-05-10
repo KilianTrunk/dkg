@@ -213,19 +213,29 @@ export function wrapPublisherForTest(
       return async (...args: unknown[]) => {
         const argIdx = prop === 'update' ? 1 : 0;
         const argBag = args[argIdx] as Record<string, unknown> | undefined;
+        // Bind the seal to the on-chain CG id the publisher will sign
+        // against (`publishContextGraphId` for remap publishes;
+        // `contextGraphId` is the local label and may be a non-numeric
+        // string like 'access-roundtrip', which would crash
+        // `BigInt(...)` inside `buildAuthorAttestationTypedData`). Fall
+        // back to the local label when the caller didn't pass an
+        // explicit on-chain id.
+        const sealCgId =
+          (argBag?.['publishContextGraphId'] as string | bigint | undefined) ??
+          (argBag?.['contextGraphId'] as string | bigint | undefined);
         if (
           argBag &&
           !argBag['precomputedAttestation'] &&
           Array.isArray(argBag['quads']) &&
           (argBag['quads'] as Quad[]).length > 0 &&
-          typeof argBag['contextGraphId'] !== 'undefined'
+          typeof sealCgId !== 'undefined'
         ) {
           try {
             const seal = await buildSeal({
               quads: argBag['quads'] as Quad[],
               privateQuads: argBag['privateQuads'] as Quad[] | undefined,
               author: opts.author,
-              contextGraphId: argBag['contextGraphId'] as string | bigint,
+              contextGraphId: sealCgId,
               ctx: opts.ctx,
             });
             args[argIdx] = { ...argBag, precomputedAttestation: seal };

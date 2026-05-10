@@ -176,61 +176,25 @@ function token() {
   );
 }
 
-/**
- * Build a `precomputedAttestation` payload over `quads` signed by
- * `author`. RFC-001 §9.x — Phase C — the publisher refuses to
- * broadcast without a seal, so every on-chain test in this file
- * builds one here instead of relying on the (now removed) publisher
- * EOA fallback.
- *
- * Mirrors what `agent.assertion.finalize()` does in production: hash
- * the quads with `computeFlatKCRootV10` over `autoPartition`, build
- * the EIP-712 typed data, sign with the author wallet, and return
- * the compact `(r, vs)` shape KAv10 expects.
- */
+// Seal helpers extracted to `_helpers/seal.ts` so other test suites can
+// share the ceremony. Local thin wrappers preserve the call shape used
+// throughout this file (CORE_OP author by default; `cgId` defaults to
+// the file-scope `CONTEXT_GRAPH`).
+import { buildSeal as buildSealCore, publishSealed as publishSealedCore } from './_helpers/seal.js';
+
 async function buildSeal(
   quads: Quad[],
   author: ethers.Wallet,
   cgId: string = CONTEXT_GRAPH,
-): Promise<{
-  expectedMerkleRoot: Uint8Array;
-  authorAddress: string;
-  signature: { r: Uint8Array; vs: Uint8Array };
-  schemeVersion: number;
-}> {
-  const { computeFlatKCRootV10, autoPartition } = await import('../src/index.js');
-  const { buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1 } =
-    await import('@origintrail-official/dkg-core');
-  const allQuads = [...autoPartition(quads).values()].flat();
-  const merkleRoot = computeFlatKCRootV10(allQuads, []);
-  const chainIdNum = await provider.getNetwork().then((n) => n.chainId);
-  const td = buildAuthorAttestationTypedData({
-    chainId: BigInt(chainIdNum),
-    kav10Address,
-    contextGraphId: BigInt(cgId),
-    merkleRoot,
-    authorAddress: author.address,
+) {
+  return buildSealCore({
+    quads,
+    author,
+    contextGraphId: cgId,
+    ctx: { provider, kav10Address },
   });
-  const sigHex = await author.signTypedData(td.domain, td.types, td.message);
-  const sig = ethers.Signature.from(sigHex);
-  return {
-    expectedMerkleRoot: merkleRoot,
-    authorAddress: author.address,
-    signature: {
-      r: ethers.getBytes(sig.r),
-      vs: ethers.getBytes(sig.yParityAndS),
-    },
-    schemeVersion: AUTHOR_SCHEME_VERSION_V1,
-  };
 }
 
-/**
- * Test helper: thin wrapper around `publisher.publish` that builds the
- * canonical CORE_OP-signed seal automatically. Tests in this file
- * exercise the publisher's transport behaviour, not the seal-building
- * itself; folding seal construction into a helper keeps each test
- * focused on the diagram invariant under test.
- */
 async function publishSealed(
   publisher: DKGPublisher,
   args: {
@@ -240,16 +204,12 @@ async function publishSealed(
   },
   authorKey: string = HARDHAT_KEYS.CORE_OP,
 ) {
-  const author = new ethers.Wallet(authorKey);
-  const seal = await buildSeal(args.quads, author, args.contextGraphId);
-  return publisher.publish({
-    contextGraphId: args.contextGraphId,
-    quads: args.quads,
-    ...(args.publisherNodeIdentityIdOverride !== undefined
-      ? { publisherNodeIdentityIdOverride: args.publisherNodeIdentityIdOverride }
-      : {}),
-    precomputedAttestation: seal,
-  });
+  return publishSealedCore(
+    publisher,
+    args,
+    new ethers.Wallet(authorKey),
+    { provider, kav10Address },
+  );
 }
 
 // =============================================================================

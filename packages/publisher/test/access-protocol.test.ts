@@ -15,9 +15,13 @@ import { multiaddr } from '@multiformats/multiaddr';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { buildSeal } from './_helpers/seal.js';
 
 let CONTEXT_GRAPH = 'test-access';
 let GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+let _kav10Address: string;
+let _provider: ethers.JsonRpcProvider;
+const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 const ENTITY = 'did:dkg:agent:TestBot';
 
 function q(s: string, p: string, o: string, g = GRAPH): Quad {
@@ -31,12 +35,14 @@ describe('Access Protocol', () => {
   beforeAll(async () => {
     _fileSnapshot = await takeSnapshot();
     const { hubAddress } = getSharedContext();
-    const provider = createProvider();
+    _provider = createProvider();
     const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
-    await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
+    await mintTokens(_provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const cgId = await createTestContextGraph();
     CONTEXT_GRAPH = String(cgId);
     GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    _kav10Address = await chain.getKnowledgeAssetsV10Address();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -87,7 +93,7 @@ describe('Access Protocol', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
 
-    const result = await publisher.publish({
+    const publishArgs = {
       contextGraphId: CONTEXT_GRAPH,
       quads: [
         q(ENTITY, 'http://schema.org/name', '"TestBot"'),
@@ -100,7 +106,15 @@ describe('Access Protocol', () => {
       publisherPeerId: options?.publisherPeerId,
       accessPolicy: options?.accessPolicy,
       allowedPeers: options?.allowedPeers,
+    };
+    const seal = await buildSeal({
+      quads: publishArgs.quads,
+      privateQuads: publishArgs.privateQuads,
+      author: _author,
+      contextGraphId: CONTEXT_GRAPH,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
+    const result = await publisher.publish({ ...publishArgs, precomputedAttestation: seal });
 
     return { result, bus, keypair };
   }

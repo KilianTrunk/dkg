@@ -4,7 +4,7 @@ import { expect } from 'chai';
 import { ethers } from 'ethers';
 import hre from 'hardhat';
 
-import {
+import type {
   AskStorage,
   Chronos,
   ContextGraphs,
@@ -17,7 +17,6 @@ import {
   KnowledgeAssetsV10,
   KnowledgeCollectionStorage,
   MockERC1271Wallet,
-  MockERC1271Wallet__factory,
   Profile,
   Staking,
   StakingV10,
@@ -758,9 +757,13 @@ describe('@unit KnowledgeAssetsV10', () => {
         // Deploy mock wallet with `walletSigner` as the configured EOA. The
         // wallet will recover `walletSigner` from the EIP-1271 signature and
         // return `0x1626ba7e` only if recovery matches.
-        const wallet: MockERC1271Wallet = await new MockERC1271Wallet__factory(
+        const MockERC1271WalletF = await hre.ethers.getContractFactory(
+          'MockERC1271Wallet',
           accounts[0],
-        ).deploy(walletSigner.address);
+        );
+        const wallet = (await MockERC1271WalletF.deploy(
+          walletSigner.address,
+        )) as unknown as MockERC1271Wallet;
         const walletAddress = await wallet.getAddress();
 
         const cgId = await createOpenCG(creator);
@@ -813,9 +816,13 @@ describe('@unit KnowledgeAssetsV10', () => {
         const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
           await setupNodes();
 
-        const wallet: MockERC1271Wallet = await new MockERC1271Wallet__factory(
+        const MockERC1271WalletF = await hre.ethers.getContractFactory(
+          'MockERC1271Wallet',
           accounts[0],
-        ).deploy(walletSigner.address);
+        );
+        const wallet = (await MockERC1271WalletF.deploy(
+          walletSigner.address,
+        )) as unknown as MockERC1271Wallet;
         await wallet.setForceFailure(true);
         const walletAddress = await wallet.getAddress();
 
@@ -923,9 +930,13 @@ describe('@unit KnowledgeAssetsV10', () => {
         const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
           await setupNodes();
 
-        const wallet: MockERC1271Wallet = await new MockERC1271Wallet__factory(
+        const MockERC1271WalletF = await hre.ethers.getContractFactory(
+          'MockERC1271Wallet',
           accounts[0],
-        ).deploy(walletSigner.address);
+        );
+        const wallet = (await MockERC1271WalletF.deploy(
+          walletSigner.address,
+        )) as unknown as MockERC1271Wallet;
         const walletAddress = await wallet.getAddress();
 
         const cgId = await createOpenCG(creator);

@@ -291,6 +291,28 @@ const GOSSIP_DIAL_TIMEOUT_MS = 10_000;
  * (each of which fires its own connection:open).
  */
 const CATCHUP_ON_CONNECT_COOLDOWN_MS = 60_000;
+/**
+ * Period of the sync reconciler tick. The reconciler is the safety net
+ * for the event-driven `peer:update` retry path: if libp2p drops a
+ * `peer:update` event (in-process race, version bug, listener thrown),
+ * or if a peer's protocol list changes via a transport we don't get
+ * notified about, the reconciler eventually re-probes and re-syncs.
+ *
+ * Worst-case sync staleness for a connected peer is ~ this interval.
+ * 5 minutes balances "catch missed events quickly enough that RS
+ * proofs don't drift" against "don't pin the event loop with chatty
+ * sync probes". See the dkg-agent design notes around
+ * `startSyncReconciler` for the trade-off.
+ */
+const SYNC_RECONCILER_INTERVAL_MS = 5 * 60_000;
+/**
+ * A peer is considered "stale" — eligible for a reconciler-driven sync
+ * retry — if no successful sync has completed for it within this window.
+ * Set higher than `SYNC_RECONCILER_INTERVAL_MS` so a single missed
+ * tick doesn't immediately retry every connected peer; that gives
+ * the event-driven path time to win the race in the common case.
+ */
+const SYNC_STALENESS_THRESHOLD_MS = 10 * 60_000;
 const RANDOM_SAMPLING_BIND_RETRY_MS = 30_000;
 const STORAGE_ACK_REGISTRATION_RETRY_MS = 30_000;
 
@@ -738,6 +760,30 @@ export class DKGAgent {
    * direct + relayed connections within a short window.
    */
   private readonly catchupOnConnectAt = new Map<string, number>();
+  /**
+   * Peers whose most recent sync attempt found that their advertised
+   * protocol list did NOT include `PROTOCOL_SYNC` — almost always a
+   * libp2p identify race on the inbound side of `connection:open`,
+   * not a real "this peer doesn't speak sync" answer. The `peer:update`
+   * listener drains entries from this set the moment libp2p reports
+   * an updated protocol list that contains `PROTOCOL_SYNC`, and the
+   * periodic reconciler treats membership as a strong hint to retry.
+   *
+   * Entries are also cleared on `connection:close` (no path to the peer
+   * anyway — the next `connection:open` will re-trigger sync-on-connect)
+   * and after a successful sync (see `lastSuccessfulSyncAt`).
+   */
+  private readonly skippedNoSyncPeers = new Set<string>();
+  /**
+   * Per-peer timestamp of the most recent successful run of sync-on-connect.
+   * Driven by `runSyncOnConnect.onPeerSynced`. Used by the periodic
+   * reconciler to skip peers that have already synced recently — the
+   * staleness threshold is intentionally larger than the reconciler
+   * interval so a single missed tick doesn't immediately retry every
+   * connected peer.
+   */
+  private readonly lastSuccessfulSyncAt = new Map<string, number>();
+  private syncReconcilerTimer: ReturnType<typeof setInterval> | null = null;
   /**
    * v10-rc sync-refactor: per-(peer+CG) checkpoint offsets so the paged
    * sync requester in `sync/requester/page-fetch.ts` can resume where it
@@ -1554,6 +1600,15 @@ export class DKGAgent {
     // fires. `connection:close` fires per connection, so we only forget
     // the timestamp once no live connection to the peer remains. Codex
     // tier-4i finding at packages/agent/src/dkg-agent.ts:1105.
+    //
+    // We also drop the peer from `skippedNoSyncPeers` and forget its
+    // `lastSuccessfulSyncAt` here. The next `connection:open` will
+    // re-trigger sync-on-connect from scratch, so keeping stale entries
+    // would only cause memory leaks across long-lived nodes that see
+    // many transient peers. Note: a brief disconnect+reconnect of the
+    // SAME peer ID still benefits — the new sync-on-connect run will
+    // either succeed (and re-stamp `lastSuccessfulSyncAt`) or get
+    // re-added to `skippedNoSyncPeers` for the event/reconciler retry.
     this.node.libp2p.addEventListener('connection:close', (evt) => {
       const remotePeer = evt.detail.remotePeer.toString();
       if (remotePeer === this.node.libp2p.peerId.toString()) return;
@@ -1562,6 +1617,25 @@ export class DKGAgent {
         .some((p) => p.toString() === remotePeer);
       if (stillConnected) return;
       this.catchupOnConnectAt.delete(remotePeer);
+      this.skippedNoSyncPeers.delete(remotePeer);
+      this.lastSuccessfulSyncAt.delete(remotePeer);
+    });
+
+    // Event-driven sync-retry: libp2p emits `peer:update` whenever a
+    // peer record changes — including (and most importantly) when
+    // identify completes and populates the protocol list for the first
+    // time. The inbound side of `connection:open` reliably loses this
+    // race in practice (the event fires on TCP accept, before identify
+    // has been processed), so without this listener a node that mostly
+    // accepts inbound dials — typically the relay node 1 in our devnet
+    // topology — would never sync from any peer beyond the bootstrap
+    // window. See `handlePeerUpdateForSyncRetry` for the dedup logic.
+    this.node.libp2p.addEventListener('peer:update', (evt) => {
+      const detail = evt.detail as { peer?: { id?: { toString(): string }; protocols?: readonly string[] } };
+      const peerIdObj = detail?.peer?.id;
+      if (!peerIdObj) return;
+      const protocols = detail.peer?.protocols ?? [];
+      this.handlePeerUpdateForSyncRetry(peerIdObj.toString(), protocols);
     });
 
     // Reconnect-on-gossip: when a gossip message arrives from a peer we're
@@ -1600,6 +1674,19 @@ export class DKGAgent {
       }, SWM_CLEANUP_INTERVAL_MS);
       if (this.swmCleanupTimer.unref) this.swmCleanupTimer.unref();
     }
+
+    // Start the periodic sync reconciler — the safety net for the
+    // event-driven `peer:update` retry path. See the constants block at
+    // the top of this file (`SYNC_RECONCILER_INTERVAL_MS`,
+    // `SYNC_STALENESS_THRESHOLD_MS`) and `reconcileSyncFromConnectedPeers`
+    // for the full design rationale.
+    this.syncReconcilerTimer = setInterval(() => {
+      this.reconcileSyncFromConnectedPeers().catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Sync reconciler tick failed: ${message}`);
+      });
+    }, SYNC_RECONCILER_INTERVAL_MS);
+    if (this.syncReconcilerTimer.unref) this.syncReconcilerTimer.unref();
 
     // Wire V10 Random Sampling prover. Edge nodes no-op. Core nodes with
     // transient identity/RPC startup failures retry in the background so
@@ -1740,7 +1827,78 @@ export class DKGAgent {
       discoverContextGraphsFromStore: () => this.discoverContextGraphsFromStore(),
       syncSharedMemoryFromPeer: (peerId, contextGraphIds) => this.syncSharedMemoryFromPeer(peerId, contextGraphIds),
       logInfo: (ctx, message) => this.log.info(ctx, message),
+      onPeerSkippedNoSync: (peerId) => {
+        this.skippedNoSyncPeers.add(peerId);
+      },
+      onPeerSynced: (peerId) => {
+        this.lastSuccessfulSyncAt.set(peerId, Date.now());
+        this.skippedNoSyncPeers.delete(peerId);
+      },
     });
+  }
+
+  /**
+   * Event-driven retry path for the libp2p identify race that otherwise
+   * leaves a peer permanently in `skippedNoSyncPeers`. libp2p emits
+   * `peer:update` whenever a peer record changes — most importantly when
+   * identify completes and the protocol list gets populated for the
+   * first time. If the new list now contains `PROTOCOL_SYNC` and we
+   * previously skipped this peer for that exact reason, fire one
+   * `trySyncFromPeer` immediately.
+   *
+   * Pairs with {@link reconcileSyncFromConnectedPeers}: the listener
+   * handles the common case in <1s (libp2p delivers identify quickly
+   * once it arrives), and the periodic reconciler is the safety net for
+   * delivery failures of this event itself.
+   */
+  private handlePeerUpdateForSyncRetry(peerId: string, protocols: readonly string[]): void {
+    if (peerId === this.node.libp2p.peerId.toString()) return;
+    if (!this.skippedNoSyncPeers.has(peerId)) return;
+    if (!protocols.includes(PROTOCOL_SYNC)) return;
+    this.skippedNoSyncPeers.delete(peerId);
+    const ctx = createOperationContext('sync');
+    const shortPeer = peerId.slice(-8);
+    this.log.info(ctx, `Peer ${shortPeer} now advertises sync protocol — retrying sync-on-connect`);
+    setTimeout(() => {
+      this.trySyncFromPeer(peerId).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Sync retry after peer:update failed for ${shortPeer}: ${message}`);
+      });
+    }, 0);
+  }
+
+  /**
+   * Periodic reconciler for sync-on-connect. Walks every currently
+   * connected peer and retries `trySyncFromPeer` for any that either:
+   *
+   *   - is in {@link skippedNoSyncPeers} and now advertises `PROTOCOL_SYNC`
+   *     (covers the case where the `peer:update` listener missed the
+   *     event for whatever reason), or
+   *   - has no `lastSuccessfulSyncAt` entry, or whose entry is older
+   *     than {@link SYNC_STALENESS_THRESHOLD_MS} (covers slow identify,
+   *     transport-level reconnects that didn't fire connection:open,
+   *     and any future failure mode of the event-driven path).
+   *
+   * Designed to be safe to call concurrently with the event-driven path
+   * — `runSyncOnConnect` itself is idempotent via `syncingPeers`.
+   */
+  private async reconcileSyncFromConnectedPeers(): Promise<void> {
+    if (!this.started) return;
+    const now = Date.now();
+    const ctx = createOperationContext('sync');
+    for (const pid of this.node.libp2p.getPeers()) {
+      const peerId = pid.toString();
+      if (this.syncingPeers.has(peerId)) continue;
+      const lastOk = this.lastSuccessfulSyncAt.get(peerId);
+      const stale = lastOk == null || (now - lastOk) >= SYNC_STALENESS_THRESHOLD_MS;
+      if (!stale) continue;
+      const shortPeer = peerId.slice(-8);
+      this.log.info(ctx, `Sync reconciler retrying ${shortPeer} (last success: ${lastOk == null ? 'never' : `${Math.round((now - lastOk) / 1000)}s ago`})`);
+      this.trySyncFromPeer(peerId).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Sync reconciler retry failed for ${shortPeer}: ${message}`);
+      });
+    }
   }
 
   /**
@@ -9475,6 +9633,10 @@ export class DKGAgent {
     if (this.swmCleanupTimer) {
       clearInterval(this.swmCleanupTimer);
       this.swmCleanupTimer = null;
+    }
+    if (this.syncReconcilerTimer) {
+      clearInterval(this.syncReconcilerTimer);
+      this.syncReconcilerTimer = null;
     }
     this.clearRandomSamplingBindRetry();
     this.clearStorageACKRegistrationRetry();

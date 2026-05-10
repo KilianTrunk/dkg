@@ -3,3 +3,4 @@ packages:
   - "demo"
   - "experiments/agent-provenance-devnet"
   - "experiments/v10-end-to-end-devnet"
+  - "experiments/v10-stress-devnet"

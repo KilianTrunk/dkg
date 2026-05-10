@@ -41,6 +41,7 @@
     "test:e2e:agent-provenance": "pnpm --filter @origintrail-official/dkg-publisher exec vitest run test/agent-provenance-e2e.test.ts",
     "test:devnet:agent-provenance": "vitest run --config experiments/agent-provenance-devnet/vitest.config.ts",
     "test:devnet:v10-e2e": "vitest run --config experiments/v10-end-to-end-devnet/vitest.config.ts",
+    "test:devnet:v10-stress": "vitest run --config experiments/v10-stress-devnet/vitest.config.ts",
     "test:all": "pnpm test && pnpm test:evm"
   },
   "devDependencies": {

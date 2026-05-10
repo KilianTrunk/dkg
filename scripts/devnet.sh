@@ -342,6 +342,12 @@ create_node_config() {
   if [ "$node_num" -le 4 ]; then
     node_role="core"
   fi
+  # `cmd_addnode` overrides the default role/index mapping so we can spawn a
+  # mid-run 7th core (or 8th edge) without the test caring about the indexing
+  # convention used at fresh-boot time.
+  if [ -n "${DEVNET_NODE_ROLE_OVERRIDE:-}" ]; then
+    node_role="$DEVNET_NODE_ROLE_OVERRIDE"
+  fi
 
   # All devnet nodes start with relay="none" to prevent falling back to testnet
   # relays from network/testnet.json. Nodes 2+ get their relay overridden in
@@ -1225,21 +1231,77 @@ cmd_clean() {
   log "Clean."
 }
 
+# Bring up an additional node against an already-running devnet. The node's
+# config + wallets are generated and the daemon is started, but on-chain
+# wiring (createConviction, updateAsk, hostingNodes registration) is left to
+# the caller — the v10-stress-devnet experiment does this from the test
+# itself so it can assert on every step.
+#
+# Usage: devnet.sh addnode <num> [core|edge]
+cmd_addnode() {
+  local node_num="${2:-}"
+  local role="${3:-core}"
+  if [ -z "$node_num" ]; then
+    echo "Usage: $0 addnode <num> [core|edge]"
+    exit 1
+  fi
+  if [ "$node_num" -lt 1 ] || [ "$node_num" -gt 10 ]; then
+    echo "[devnet] node_num must be 1..10 (HARDHAT_KEYS array bound)"
+    exit 1
+  fi
+  if [ -d "$DEVNET_DIR/node${node_num}" ]; then
+    echo "[devnet] node${node_num} already exists at $DEVNET_DIR/node${node_num}"
+    exit 1
+  fi
+  case "$role" in
+    core|edge) ;;
+    *) echo "[devnet] role must be 'core' or 'edge'"; exit 1 ;;
+  esac
+  local hardhat_pid_file="$DEVNET_DIR/hardhat.pid"
+  if [ ! -f "$hardhat_pid_file" ] || ! kill -0 "$(cat "$hardhat_pid_file")" 2>/dev/null; then
+    echo "[devnet] Hardhat is not running. Start the devnet first with: $0 start <N>"
+    exit 1
+  fi
+
+  log "Adding node $node_num (role=$role)..."
+  DEVNET_NODE_ROLE_OVERRIDE="$role" create_node_config "$node_num"
+
+  # Reuse the cluster's shared auth token so the test can talk to the new
+  # node with the same bearer used everywhere else.
+  if [ -f "$DEVNET_DIR/node1/auth.token" ]; then
+    local shared_token
+    shared_token=$(grep -v '^#' "$DEVNET_DIR/node1/auth.token" | head -1)
+    if [ -n "$shared_token" ]; then
+      printf '# DKG devnet shared auth token\n%s\n' "$shared_token" \
+        > "$DEVNET_DIR/node${node_num}/auth.token"
+      chmod 600 "$DEVNET_DIR/node${node_num}/auth.token"
+    fi
+  fi
+
+  cd "$REPO_ROOT" || exit 1
+  start_node "$node_num"
+  log "Node $node_num up. On-chain wiring (createConviction/updateAsk) is the caller's responsibility."
+}
+
 case "${1:-}" in
-  start)  cmd_start ;;
-  stop)   cmd_stop ;;
-  status) cmd_status ;;
-  logs)   cmd_logs "$@" ;;
-  clean)  cmd_clean ;;
-  ui)     cmd_ui "$@" ;;
+  start)   cmd_start ;;
+  addnode) cmd_addnode "$@" ;;
+  stop)    cmd_stop ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs "$@" ;;
+  clean)   cmd_clean ;;
+  ui)      cmd_ui "$@" ;;
   *)
-    echo "Usage: $0 {start|stop|status|logs|clean|ui} [args]"
+    echo "Usage: $0 {start|addnode|stop|status|logs|clean|ui} [args]"
     echo ""
-    echo "  start [N]    Start devnet with N nodes (default 6)"
-    echo "  stop         Stop all devnet processes (incl. UI)"
-    echo "  status       Show running nodes (incl. UI) and their status"
-    echo "  logs [N]     Tail logs for node N (default 1)"
-    echo "  clean        Stop and wipe all devnet data"
+    echo "  start [N]               Start devnet with N nodes (default 6)"
+    echo "  addnode <num> [core|edge]  Spawn one more node against the running"
+    echo "                          devnet (mid-run sync test). Caller drives"
+    echo "                          on-chain identity/stake/ask. (1 <= num <= 10)"
+    echo "  stop                    Stop all devnet processes (incl. UI)"
+    echo "  status                  Show running nodes (incl. UI) and their status"
+    echo "  logs [N]                Tail logs for node N (default 1)"
+    echo "  clean                   Stop and wipe all devnet data"
     echo "  ui {start|stop|restart|status|logs}"
     echo "               Control the node-ui Vite dev server (port \$UI_PORT,"
     echo "               default 5173). Detached via nohup so it survives"

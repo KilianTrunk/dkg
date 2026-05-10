@@ -987,6 +987,18 @@ export class MockChainAdapter implements ChainAdapter {
     return 31337n;
   }
 
+  /**
+   * Mock has no real chain to query; treat every author as an EOA so
+   * the off-chain ECDSA recover-and-compare preflight stays in effect
+   * for unit tests. Production code that needs to test the EIP-1271
+   * branch overrides this to `true` (see the publisher's
+   * `agent-provenance-e2e.test.ts` "skips ECDSA recover for
+   * smart-contract authors" test for the pattern).
+   */
+  async hasContractCode(_address: string): Promise<boolean> {
+    return false;
+  }
+
   async createKnowledgeAssetsV10(params: V10PublishParams): Promise<OnChainPublishResult> {
     // Deliberately tolerant of `contextGraphId === 0n`. The real EVM
     // adapter rejects that at `evm-adapter.ts:createKnowledgeAssetsV10`

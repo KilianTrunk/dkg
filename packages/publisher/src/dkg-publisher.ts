@@ -1915,13 +1915,30 @@ export class DKGPublisher implements Publisher {
             authorTypedData.types,
             authorTypedData.message,
           );
-          const recovered = ethers.recoverAddress(digest, sig);
-          if (recovered.toLowerCase() !== effectiveAuthorAddress.toLowerCase()) {
-            throw new Error(
-              `precomputedAttestation signer mismatch: signature recovers ${recovered} ` +
-              `but address claims ${effectiveAuthorAddress}. The seal's signature does not match its recorded authorAddress; ` +
-              `the assertion's _meta block is corrupt and the assertion must be re-finalized.`,
-            );
+          // Off-chain seal-integrity preflight: ECDSA recover-and-compare
+          // only works for EOA authors. For smart-contract wallets
+          // (incl. EIP-7702-delegated EOAs), the wallet's
+          // `IERC1271.isValidSignature` is the source of truth; signing
+          // typically routes through an owner EOA whose address differs
+          // from the wallet contract, so ECDSA recover would (correctly)
+          // report a mismatch even on a valid 1271 signature. The
+          // on-chain `_verifyAuthorAttestation` already dispatches via
+          // `authorAddress.code.length` — let it be authoritative for
+          // the contract-author branch. EOAs still get the hard-fail
+          // preflight that traps corrupt seals before tx submit.
+          const isContractAuthor =
+            typeof this.chain.hasContractCode === 'function'
+              ? await this.chain.hasContractCode(effectiveAuthorAddress)
+              : false;
+          if (!isContractAuthor) {
+            const recovered = ethers.recoverAddress(digest, sig);
+            if (recovered.toLowerCase() !== effectiveAuthorAddress.toLowerCase()) {
+              throw new Error(
+                `precomputedAttestation signer mismatch: signature recovers ${recovered} ` +
+                `but address claims ${effectiveAuthorAddress}. The seal's signature does not match its recorded authorAddress; ` +
+                `the assertion's _meta block is corrupt and the assertion must be re-finalized.`,
+              );
+            }
           }
         }
       }

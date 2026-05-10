@@ -4055,12 +4055,28 @@ export class DKGAgent {
         r: ethers.hexlify(preSigned.signature.r),
         yParityAndS: ethers.hexlify(preSigned.signature.vs),
       });
-      const recovered = ethers.recoverAddress(eip712Digest, sig);
-      if (recovered.toLowerCase() !== authorAddress.toLowerCase()) {
-        throw new Error(
-          `assertionFinalize: preSignedAuthorAttestation signer mismatch — ` +
-            `signature recovers ${recovered} but address claims ${authorAddress}.`,
-        );
+      // Off-chain seal-integrity preflight: only EOAs can be verified
+      // by ECDSA recover-and-compare. For smart-contract authors
+      // (incl. EIP-7702-delegated EOAs), the on-chain
+      // `_verifyAuthorAttestation` dispatches to
+      // `IERC1271.isValidSignature` and is the authoritative check —
+      // the off-chain ECDSA recover would (correctly) report a
+      // mismatch since 1271 wallets typically sign through an owner
+      // EOA that's distinct from the wallet contract address. Skip the
+      // off-chain check for contract authors so the seal-build pipeline
+      // doesn't reject 1271 publishes that the chain would accept.
+      const isContractAuthor =
+        typeof this.chain.hasContractCode === 'function'
+          ? await this.chain.hasContractCode(authorAddress)
+          : false;
+      if (!isContractAuthor) {
+        const recovered = ethers.recoverAddress(eip712Digest, sig);
+        if (recovered.toLowerCase() !== authorAddress.toLowerCase()) {
+          throw new Error(
+            `assertionFinalize: preSignedAuthorAttestation signer mismatch — ` +
+              `signature recovers ${recovered} but address claims ${authorAddress}.`,
+          );
+        }
       }
       r = preSigned.signature.r;
       vs = preSigned.signature.vs;
@@ -4299,12 +4315,22 @@ export class DKGAgent {
         r: ethers.hexlify(preSigned.signature.r),
         yParityAndS: ethers.hexlify(preSigned.signature.vs),
       });
-      const recovered = ethers.recoverAddress(eip712Digest, sig);
-      if (recovered.toLowerCase() !== authorAddress.toLowerCase()) {
-        throw new Error(
-          `Selection-based VM publish: preSignedAuthorAttestation signer mismatch — ` +
-            `signature recovers ${recovered} but address claims ${authorAddress}.`,
-        );
+      // Same EOA-vs-1271 dispatch as `assertionFinalize` (see comment
+      // there). Skip ECDSA recover for smart-contract / 7702-delegated
+      // authors so the on-chain `IERC1271.isValidSignature` branch can
+      // be the authoritative check.
+      const isContractAuthor =
+        typeof this.chain.hasContractCode === 'function'
+          ? await this.chain.hasContractCode(authorAddress)
+          : false;
+      if (!isContractAuthor) {
+        const recovered = ethers.recoverAddress(eip712Digest, sig);
+        if (recovered.toLowerCase() !== authorAddress.toLowerCase()) {
+          throw new Error(
+            `Selection-based VM publish: preSignedAuthorAttestation signer mismatch — ` +
+              `signature recovers ${recovered} but address claims ${authorAddress}.`,
+          );
+        }
       }
       r = preSigned.signature.r;
       vs = preSigned.signature.vs;

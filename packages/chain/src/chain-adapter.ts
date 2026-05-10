@@ -678,6 +678,25 @@ export interface ChainAdapter {
     value: Record<string, unknown>,
   ): Promise<string>;
 
+  /**
+   * Return `true` iff `address` has deployed bytecode on this chain.
+   *
+   * RFC-001 / V10 author attestations dispatch on `authorAddress.code.length`
+   * inside the on-chain `_verifyAuthorAttestation` (`KnowledgeAssetsV10.sol`):
+   * EOAs route through `ECDSA.tryRecover`, smart-contract wallets through
+   * `IERC1271.isValidSignature`. The off-chain seal-integrity preflights
+   * (in `assertionFinalize`, the selection-based VM publish path, and the
+   * publisher's `precomputedAttestation` recompute) need the same
+   * dispatch — otherwise an EIP-1271 / EIP-7702 signature that the chain
+   * would accept is rejected before it ever reaches the contract. Adapters
+   * skip the off-chain ECDSA recover-and-compare check whenever this
+   * helper returns `true` and let the on-chain verifier be the source of
+   * truth. Optional: adapters without a chain (mock / no-chain) leave this
+   * undefined and the EOA path remains in effect (no regression — those
+   * paths never reach the on-chain contract anyway).
+   */
+  hasContractCode?(address: string): Promise<boolean>;
+
   // On-Chain Context Graphs (ContextGraphs contract)
   createOnChainContextGraph?(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult>;
   getContextGraphParticipants?(contextGraphId: bigint): Promise<bigint[] | null>;

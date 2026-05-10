@@ -1687,6 +1687,25 @@ export class EVMChainAdapter implements ChainAdapter {
     return network.chainId;
   }
 
+  /**
+   * Return `true` iff the address has deployed bytecode on this chain.
+   * Used by the off-chain seal-integrity preflights to dispatch EOA
+   * vs EIP-1271 verification the same way `_verifyAuthorAttestation`
+   * does on-chain (see ChainAdapter.hasContractCode for the full
+   * rationale). Treats a JSON-RPC failure as "unknown" (returns
+   * `false` so the EOA recovery path stays in effect) — safer to
+   * preserve the existing strict check than to silently accept a
+   * potentially-bad signature when the provider is flaky.
+   */
+  async hasContractCode(address: string): Promise<boolean> {
+    try {
+      const code = await this.provider.getCode(address);
+      return code !== undefined && code !== null && code !== '0x' && code.length > 2;
+    } catch {
+      return false;
+    }
+  }
+
   async createKnowledgeAssetsV10(params: V10PublishParams): Promise<OnChainPublishResult> {
     await this.init();
 

@@ -771,7 +771,14 @@ WHERE {
               ...(resolvedPublisherIdentityOverride !== undefined
                 ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
                 : {}),
-              clearSharedMemoryAfter: clearAfter ?? true,
+              // Pass `clearAfter` straight through (incl. `undefined`) so the
+              // publisher's own default — `false` — applies for the named
+              // path. Forcing `?? true` here would silently drain every other
+              // assertion's quads from SWM after publishing the named one,
+              // since the publisher reads `clearSharedMemoryAfter === true`
+              // as "also wipe the unpublished remainder". The named publish
+              // already removes its own roots regardless.
+              ...(clearAfter !== undefined ? { clearSharedMemoryAfter: clearAfter } : {}),
             }),
         );
         const chain = result.onChainResult;

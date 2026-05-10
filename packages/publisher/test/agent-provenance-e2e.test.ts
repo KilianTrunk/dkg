@@ -724,6 +724,86 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     ).rejects.toThrow(/expectedMerkleRoot mismatch/);
   });
 
+  it('skips ECDSA recover for smart-contract authors (delegates to on-chain IERC1271)', async () => {
+    // Round-N review fix — the off-chain seal-integrity preflight in
+    // `DKGPublisher.publish` used to ECDSA-recover-and-compare for
+    // EVERY author, which rejected EIP-1271 / EIP-7702 publishes that
+    // the on-chain `_verifyAuthorAttestation` would happily accept
+    // (smart-contract authors normally sign through an owner EOA whose
+    // address differs from the wallet's). We now branch on
+    // `chain.hasContractCode(authorAddress)` and skip the off-chain
+    // recover for contract authors — the on-chain
+    // `IERC1271.isValidSignature` dispatch is the source of truth, and
+    // is comprehensively covered by `KnowledgeAssetsV10.test.ts`'s
+    // EIP-1271 describe block.
+    //
+    // This test validates the off-chain skip in isolation: with
+    // `hasContractCode === true`, a signature that the EOA path would
+    // reject (signer mismatch) must NOT throw — the publisher proceeds
+    // past preflight and only fails (if at all) in the chain leg.
+    const { buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1 } =
+      await import('@origintrail-official/dkg-core');
+    const author = ethers.Wallet.createRandom();
+    const otherSigner = ethers.Wallet.createRandom(); // mismatching EOA
+    const publisher = makePublisher();
+    // Force the contract-author branch — `author.address` is actually
+    // an EOA on Hardhat, but we just need the off-chain preflight to
+    // believe it has bytecode. The on-chain leg will then fail (because
+    // there's no real 1271 wallet there), so we only assert the
+    // off-chain skip didn't throw "signer mismatch".
+    const chainAny = (publisher as unknown as { chain: { hasContractCode?: (a: string) => Promise<boolean> } }).chain;
+    chainAny.hasContractCode = async () => true;
+
+    const quads: Quad[] = [
+      q(`${ENTITY}/D11-1271-skip`, 'http://schema.org/name', '"Smart-wallet"'),
+    ];
+    // Compute the canonical merkle root the publisher will recompute,
+    // so we don't trip the (still-active) `expectedMerkleRoot` check.
+    const { computeFlatKCRootV10 } = await import('../src/index.js');
+    const expectedRoot = computeFlatKCRootV10(quads, []);
+    const chainIdNum = await provider.getNetwork().then((n) => n.chainId);
+    const td = buildAuthorAttestationTypedData({
+      chainId: BigInt(chainIdNum),
+      kav10Address,
+      contextGraphId: BigInt(CONTEXT_GRAPH),
+      merkleRoot: expectedRoot,
+      authorAddress: author.address,
+      schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    });
+    // Sign with a DIFFERENT EOA — under the EOA branch this would throw
+    // `precomputedAttestation signer mismatch`.
+    const sig = ethers.Signature.from(
+      await otherSigner.signTypedData(td.domain, td.types, td.message),
+    );
+
+    // Should NOT throw "signer mismatch" — the off-chain ECDSA recover
+    // is skipped because `hasContractCode` returned true. Whatever the
+    // on-chain leg does is irrelevant here; the preflight contract is
+    // what we're pinning. We accept any outcome that is NOT the
+    // off-chain seal-integrity error.
+    let threw: unknown = null;
+    try {
+      await publisher.publish({
+        contextGraphId: CONTEXT_GRAPH,
+        quads,
+        precomputedAttestation: {
+          expectedMerkleRoot: expectedRoot,
+          authorAddress: author.address,
+          signature: {
+            r: ethers.getBytes(sig.r),
+            vs: ethers.getBytes(sig.yParityAndS),
+          },
+          schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+        },
+      });
+    } catch (e) {
+      threw = e;
+    }
+    if (threw instanceof Error) {
+      expect(threw.message).not.toMatch(/signer mismatch/);
+    }
+  });
+
   it('rejects on-chain publish without precomputedAttestation', async () => {
     // RFC-001 §9.x — Phase C — the publisher refuses to broadcast when
     // the seal is missing. Falls through to tentative because the

@@ -37,6 +37,17 @@ import {
   type V10UpdateKCParams,
 } from '@origintrail-official/dkg-chain';
 import { ethers } from 'ethers';
+import { wrapPublisherForTest, mockSealCtx } from './_helpers/seal.js';
+
+// Phase C (commit `d353c6a5`) made `DKGPublisher.publish` reject on-chain
+// publishes that arrive without a `precomputedAttestation`. The mock-chain
+// tests in this file pre-date that requirement; wrap each publisher so the
+// proxy mints a seal automatically. The seal is signed by the same wallet
+// that mocks the adapter signer, which lets the publisher's seal-integrity
+// preflight (`recoverAddress` vs `authorAddress`) round-trip cleanly.
+function sealForWallet(publisher: DKGPublisher, wallet: ethers.Wallet): DKGPublisher {
+  return wrapPublisherForTest(publisher, { author: wallet, ctx: mockSealCtx() });
+}
 
 const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 const TEST_KEY_ALT = '0x5de4111a56f4c24611d9ed4d5318a7e03f9b9a9d73f3a5f3f6324a2a0e6fbb36';
@@ -624,7 +635,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);
     const chain = new AdapterSigningChain(wallet);
-    const publisher = new DKGPublisher({
+    const rawPublisher = new DKGPublisher({
       store: new OxigraphStore(),
       chain,
       eventBus: new TypedEventBus(),
@@ -633,7 +644,8 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       publisherNodeIdentityId: 1n,
     });
 
-    expect((publisher as any).publisherWallet).toBeUndefined();
+    expect((rawPublisher as any).publisherWallet).toBeUndefined();
+    const publisher = sealForWallet(rawPublisher, wallet);
     const result = await publisher.publish({
       contextGraphId: '1',
       quads: [{
@@ -652,13 +664,13 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);
     const chain = new AdapterSigningChain(wallet);
-    const publisher = new DKGPublisher({
+    const publisher = sealForWallet(new DKGPublisher({
       store: new OxigraphStore(),
       chain,
       eventBus: new TypedEventBus(),
       keypair,
       publisherNodeIdentityId: 1n,
-    });
+    }), wallet);
 
     const result = await publisher.publish({
       contextGraphId: '1',
@@ -678,13 +690,13 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);
     const chain = new AsyncAddressSigningChain(wallet);
-    const publisher = new DKGPublisher({
+    const publisher = sealForWallet(new DKGPublisher({
       store: new OxigraphStore(),
       chain,
       eventBus: new TypedEventBus(),
       keypair,
       publisherNodeIdentityId: 1n,
-    });
+    }), wallet);
 
     const result = await publisher.publish({
       contextGraphId: '1',
@@ -705,13 +717,13 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);
     const chain = new LazyReadySigningChain(wallet);
-    const publisher = new DKGPublisher({
+    const publisher = sealForWallet(new DKGPublisher({
       store: new OxigraphStore(),
       chain,
       eventBus: new TypedEventBus(),
       keypair,
       publisherNodeIdentityId: 1n,
-    });
+    }), wallet);
 
     const result = await publisher.publish({
       contextGraphId: '1',
@@ -731,13 +743,13 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);
     const chain = new InitGatedSigningChain(wallet);
-    const publisher = new DKGPublisher({
+    const publisher = sealForWallet(new DKGPublisher({
       store: new OxigraphStore(),
       chain,
       eventBus: new TypedEventBus(),
       keypair,
       publisherNodeIdentityId: 1n,
-    });
+    }), wallet);
 
     const result = await publisher.publish({
       contextGraphId: '1',
@@ -795,7 +807,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     const primaryWallet = new ethers.Wallet(TEST_KEY);
     const authorizedWallet = new ethers.Wallet(TEST_KEY_ALT);
     const chain = new ContextAwareAdapterSigningChain(primaryWallet, authorizedWallet);
-    const publisher = new DKGPublisher({
+    const publisher = sealForWallet(new DKGPublisher({
       store: new OxigraphStore(),
       chain,
       eventBus: new TypedEventBus(),
@@ -803,7 +815,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       publisherAddressResolver: (contextGraphId?: bigint) =>
         contextGraphId === undefined ? Promise.resolve(undefined) : chain.getAuthorizedPublisherAddress(contextGraphId),
       publisherNodeIdentityId: 7n,
-    });
+    }), authorizedWallet);
 
     const result = await publisher.publish({
       contextGraphId: '42',
@@ -824,14 +836,14 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);
     const chain = new AdapterSigningChain(wallet);
-    const publisher = new DKGPublisher({
+    const publisher = sealForWallet(new DKGPublisher({
       store: new OxigraphStore(),
       chain,
       eventBus: new TypedEventBus(),
       keypair,
       publisherAddress: wallet.address,
       publisherNodeIdentityId: 1n,
-    });
+    }), wallet);
 
     const created = await publisher.publish({
       contextGraphId: '1',

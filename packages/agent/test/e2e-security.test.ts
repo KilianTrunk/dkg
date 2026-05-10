@@ -27,6 +27,7 @@ import {
 } from '@origintrail-official/dkg-core';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { AccessClient, AccessHandler, DKGPublisher } from '@origintrail-official/dkg-publisher';
+import { wrapPublisherForTest } from '../../publisher/test/_helpers/seal.js';
 import { ethers } from 'ethers';
 
 const agents: DKGAgent[] = [];
@@ -44,6 +45,18 @@ beforeAll(async () => {
 afterAll(async () => {
   await revertSnapshot(_fileSnapshot);
 });
+
+// Phase C requires `precomputedAttestation` for on-chain publishes; wrap each
+// raw `DKGPublisher` in this file so the proxy mints a seal automatically.
+async function wrapPub(p: DKGPublisher, chain: ReturnType<typeof createEVMAdapter>): Promise<DKGPublisher> {
+  return wrapPublisherForTest(p, {
+    author: new ethers.Wallet(HARDHAT_KEYS.CORE_OP),
+    ctx: {
+      provider: createProvider(),
+      kav10Address: await chain.getKnowledgeAssetsV10Address(),
+    },
+  });
+}
 
 afterEach(async () => {
   for (const a of agents) {
@@ -249,14 +262,14 @@ describe('Access protocol denial', () => {
     const busA = new TypedEventBus();
     const keypairA = await generateEd25519Keypair();
 
-    const publisherA = new DKGPublisher({
+    const publisherA = await wrapPub(new DKGPublisher({
       store: storeA,
       chain: chainA,
       eventBus: busA,
       keypair: keypairA,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
-    });
+    }), chainA);
 
     const cgResult = await chainA.createOnChainContextGraph({
       participantIdentityIds: [BigInt(getSharedContext().coreProfileId)],
@@ -383,14 +396,14 @@ describe('Access protocol round-trip', () => {
     const CONTEXT_GRAPH = 'access-roundtrip';
     const ENTITY = 'did:dkg:test:AccessEntity';
 
-    const publisherA = new DKGPublisher({
+    const publisherA = await wrapPub(new DKGPublisher({
       store: storeA,
       chain: chainA,
       eventBus: busA,
       keypair: keypairA,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
-    });
+    }), chainA);
 
     const cgResult = await chainA.createOnChainContextGraph({
       participantIdentityIds: [BigInt(getSharedContext().coreProfileId)],

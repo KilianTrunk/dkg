@@ -281,7 +281,12 @@ export function mockSealCtx(opts: {
   kav10Address?: string;
 } = {}): SealCtx {
   const chainId = opts.chainId ?? 31337n;
-  const kav10Address = opts.kav10Address ?? '0x0000000000000000000000000000000000000001';
+  // Must match `MockChainAdapter.getKnowledgeAssetsV10Address()` exactly,
+  // otherwise the publisher's `recoverAddress` step in the seal-integrity
+  // preflight rebuilds typed data with the chain's address (not ours)
+  // and the recovered signer no longer equals the recorded
+  // `authorAddress` — yielding a "signer mismatch" hard error.
+  const kav10Address = opts.kav10Address ?? '0x000000000000000000000000000000000000c10a';
   return {
     provider: {
       getNetwork: async () => ({ chainId }),

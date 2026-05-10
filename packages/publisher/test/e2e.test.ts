@@ -32,7 +32,7 @@ let _provider: ethers.JsonRpcProvider;
 const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 
 function makeTestPublisher(opts: ConstructorParameters<typeof DKGPublisher>[0]): DKGPublisher {
-  return wrapPublisherForTest(makeTestPublisher(opts), {
+  return wrapPublisherForTest(new DKGPublisher(opts), {
     author: _author,
     ctx: { provider: _provider, kav10Address: _kav10Address },
   });

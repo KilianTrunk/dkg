@@ -1219,7 +1219,20 @@ export class DKGPublisher implements Publisher {
         const defaultDataGraph = this.graphManager.dataGraphUri(contextGraphId);
         const defaultMetaGraph = `${defaultDataGraph.replace(/\/data$/, '')}/_meta`;
 
-        if (publishResult.publicQuads && publishResult.publicQuads.length > 0) {
+        // Data promotion only fires on REMAP-flow publishes
+        // (`publishContextGraphId` set — the caller explicitly asked for the
+        // payload to land at `<NAME>/context/<cgId>/data`). Same-graph
+        // publishes through the selection-bridge keep their data in the
+        // default `<NAME>/data` URI so `agent.query(label)` (which resolves
+        // to `did:dkg:context-graph:<label>` without a `/context/<id>` suffix)
+        // still finds the just-published triples. RS doesn't need data
+        // promotion — only the per-cgId `_meta` graph below — so always
+        // promote `_meta` regardless of the remap flag.
+        if (
+          ctxGraphId &&
+          publishResult.publicQuads &&
+          publishResult.publicQuads.length > 0
+        ) {
           const storedQuads = publishResult.publicQuads.map(q => ({ ...q, graph: defaultDataGraph }));
           await this.store.insert(storedQuads.map(q => ({ ...q, graph: ctxDataGraph })));
           await this.store.delete(storedQuads);
@@ -1236,8 +1249,17 @@ export class DKGPublisher implements Publisher {
         }`;
         const metaResult = await this.store.query(metaQuery);
         if (metaResult.type === 'quads' && metaResult.quads.length > 0) {
+          // Copy meta to the per-cgId graph (RS prover's
+          // `extractV10KCFromStore` resolves UALs from
+          // `dkg:batchId` here). On remap publishes the original
+          // copy at `<NAME>/_meta` is also moved; on same-graph
+          // publishes we leave the default copy in place so
+          // existing meta queries against the label-only URI
+          // continue to resolve.
           await this.store.insert(metaResult.quads.map(q => ({ ...q, graph: ctxMetaGraph })));
-          await this.store.delete(metaResult.quads.map(q => ({ ...q, graph: defaultMetaGraph })));
+          if (ctxGraphId) {
+            await this.store.delete(metaResult.quads.map(q => ({ ...q, graph: defaultMetaGraph })));
+          }
         }
 
         this.log.info(ctx, `Promoted ${publishResult.kaManifest.length} KAs from default graph to context graph ${targetCgId}`);

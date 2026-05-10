@@ -38,6 +38,22 @@ UI_NODE_ID="${UI_NODE_ID:-1}"
 UI_PIDFILE="$DEVNET_DIR/node-ui.pid"
 UI_LOGFILE="$DEVNET_DIR/node-ui.log"
 NUM_OP_WALLETS=3
+# Hardhat block interval (ms). Without interval mining, Hardhat only mines
+# when a tx arrives → block.number / block.timestamp freeze the moment the
+# cluster goes idle, which means time-based on-chain mechanics (RS proof
+# periods, epochs, stake withdrawal delay, ask update delay, …) NEVER tick
+# forward unless somebody is actively publishing. That makes "wait and
+# observe" workflows (RS reconciliation, epoch boundary reward distribution,
+# operator-fee update unlocks) impossible to test without manual `hardhat_mine`
+# RPC calls, and silently masks bugs that only surface across time.
+#
+# 1 sec/block is an aggressive testnet rate (12× faster than Ethereum
+# mainnet's 12s), chosen because the devnet's RS `proofingPeriodDurationInBlocks`
+# is 100 (see evm-module/deployments/parameters.json → development.hardhat) →
+# new RS period every ~100 sec, fast enough for interactive testing without
+# overwhelming the prover loop. Set to 0 to disable (fall back to per-tx
+# mining) for tests that need deterministic block-per-tx semantics.
+HARDHAT_BLOCK_INTERVAL_MS="${HARDHAT_BLOCK_INTERVAL_MS:-1000}"
 BLAZEGRAPH_PORT=9999
 BLAZEGRAPH_CONTAINER="devnet-blazegraph"
 OXIGRAPH_SERVER_PORT_5=7878
@@ -134,6 +150,7 @@ start_hardhat() {
          -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
          > /dev/null 2>&1; then
       log "Hardhat node ready"
+      enable_hardhat_interval_mining
       return 0
     fi
     sleep 1
@@ -141,6 +158,30 @@ start_hardhat() {
 
   log "ERROR: Hardhat node failed to start within 30s"
   return 1
+}
+
+# Switch the running Hardhat node from "mine on tx" into "mine on a wallclock
+# interval" mode. Idempotent and best-effort: failures are logged but never
+# block the rest of the devnet boot (the cluster is still functional in
+# auto-mine-only mode, just without time progression in idle windows).
+#
+# See HARDHAT_BLOCK_INTERVAL_MS at the top of this file for the rationale and
+# the knob to disable it.
+enable_hardhat_interval_mining() {
+  if [ "$HARDHAT_BLOCK_INTERVAL_MS" -le 0 ] 2>/dev/null; then
+    log "Hardhat interval mining disabled (HARDHAT_BLOCK_INTERVAL_MS=$HARDHAT_BLOCK_INTERVAL_MS)"
+    return 0
+  fi
+
+  local response
+  response=$(curl -s "http://127.0.0.1:$HARDHAT_PORT" \
+    -X POST -H "Content-Type: application/json" \
+    -d "{\"jsonrpc\":\"2.0\",\"method\":\"evm_setIntervalMining\",\"params\":[$HARDHAT_BLOCK_INTERVAL_MS],\"id\":1}" 2>&1)
+  if echo "$response" | grep -q '"result"'; then
+    log "Hardhat interval mining enabled (one block every ${HARDHAT_BLOCK_INTERVAL_MS}ms)"
+  else
+    log "WARNING: Failed to enable Hardhat interval mining: $response"
+  fi
 }
 
 deploy_contracts() {

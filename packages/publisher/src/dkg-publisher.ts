@@ -2248,7 +2248,11 @@ export class DKGPublisher implements Publisher {
       subGraphName: options.subGraphName,
     };
 
-    this.eventBus.emit(DKGEvent.KC_PUBLISHED, result);
+    this.eventBus.emit(DKGEvent.KC_PUBLISHED, {
+      ...result,
+      contextGraphId,
+      tripleCount: allSkolemizedQuads.length,
+    });
     return result;
   }
 

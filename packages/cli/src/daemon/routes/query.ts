@@ -360,6 +360,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     path,
     requestToken,
     requestAgentAddress,
+    emitMemoryGraphChanged,
   } = ctx;
 
 
@@ -933,6 +934,12 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
         batchId: parsedBatchId,
         timeoutMs: timeoutMs ? Number(timeoutMs) : undefined,
         requiredSignatures: validatedRequiredSigs,
+      });
+      emitMemoryGraphChanged?.({
+        contextGraphId,
+        layers: ["vm"],
+        operation: "verified_memory_updated",
+        source: "api",
       });
       return jsonResponse(res, 200, { ...result, batchId: String(batchId) });
     } catch (err) {

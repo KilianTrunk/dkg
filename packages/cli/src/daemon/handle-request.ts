@@ -318,7 +318,7 @@ import {
   reverseLocalAgentSetupForUi,
   refreshLocalAgentIntegrationFromUi,
 } from './local-agents.js';
-import type { RequestContext } from './routes/context.js';
+import type { MemoryGraphChangedEvent, RequestContext } from './routes/context.js';
 import { handleStatusRoutes } from './routes/status.js';
 import { handleAgentChatRoutes } from './routes/agent-chat.js';
 import { handleOpenclawRoutes } from './routes/openclaw.js';
@@ -362,6 +362,7 @@ export async function handleRequest(
   // server state instead of request headers (SSRF defence).
   apiHost: string,
   apiPortRef: { value: number },
+  emitMemoryGraphChanged?: (event: MemoryGraphChangedEvent) => void,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
   const path = url.pathname;
@@ -402,6 +403,7 @@ export async function handleRequest(
     path,
     requestToken,
     requestAgentAddress,
+    emitMemoryGraphChanged,
   };
 
   await handleStatusRoutes(ctx);

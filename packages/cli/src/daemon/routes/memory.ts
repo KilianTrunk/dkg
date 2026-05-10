@@ -425,6 +425,7 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
     path,
     requestToken,
     requestAgentAddress,
+    emitMemoryGraphChanged,
   } = ctx;
 
 
@@ -592,6 +593,14 @@ WHERE {
         }),
       );
       tracker.complete(ctx, { tripleCount: quads.length });
+      emitMemoryGraphChanged?.({
+        contextGraphId,
+        layers: ["swm"],
+        subGraphName,
+        operation: "shared_memory_written",
+        source: localOnly ? "api-local" : "api",
+        counts: { triples: quads.length },
+      });
       return jsonResponse(res, 200, {
         shareOperationId: result?.shareOperationId,
         workspaceOperationId: result?.shareOperationId,
@@ -883,7 +892,28 @@ WHERE {
           chainId ? Number(chainId) : undefined,
         );
       }
-      tracker.complete(ctx, { tripleCount: result.kaManifest?.length ?? 0 });
+      const publicTripleCount = Array.isArray(result.publicQuads)
+        ? result.publicQuads.length
+        : undefined;
+      const rootCount = Array.isArray(result.kaManifest)
+        ? result.kaManifest.length
+        : undefined;
+      tracker.complete(ctx, { tripleCount: publicTripleCount ?? rootCount ?? 0 });
+      const clearSharedMemoryAfter = clearAfter ?? true;
+      const publishedSwmCleaned = result.status === "confirmed";
+      emitMemoryGraphChanged?.({
+        contextGraphId,
+        layers: publishedSwmCleaned ? ["swm", "vm"] : ["vm"],
+        subGraphName,
+        operation: "shared_memory_published",
+        source: "api",
+        clearSharedMemoryAfter,
+        status: typeof result.status === "string" ? result.status : undefined,
+        counts: {
+          roots: rootCount,
+          triples: publicTripleCount,
+        },
+      });
       const httpStatus = result.contextGraphError ? 207 : 200;
       return jsonResponse(res, httpStatus, {
         kcId: String(result.kcId),
@@ -931,6 +961,14 @@ WHERE {
         { subGraphName, operationCtx: ctx },
       );
       tracker.complete(ctx, { tripleCount: quads.length });
+      emitMemoryGraphChanged?.({
+        contextGraphId,
+        layers: ["swm"],
+        subGraphName,
+        operation: "shared_memory_conditional_written",
+        source: "api-cas",
+        counts: { triples: quads.length },
+      });
       return jsonResponse(res, 200, {
         ok: true,
         shareOperationId: result?.shareOperationId,
@@ -1112,6 +1150,14 @@ WHERE {
     } catch (err: any) {
       return jsonResponse(res, 500, { error: `Failed to write turn to ${targetLayer}: ${err.message}` });
     }
+    emitMemoryGraphChanged?.({
+      contextGraphId,
+      layers: [targetLayer],
+      subGraphName,
+      operation: "memory_turn_written",
+      source: "memory-turn",
+      counts: { triples: quads.length },
+    });
 
     // 6. Generate embedding (best-effort, non-blocking for response)
     let embeddingId: string | null = null;

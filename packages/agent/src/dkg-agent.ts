@@ -5585,6 +5585,7 @@ export class DKGAgent {
       this.finalizationHandler = new FinalizationHandler(
         this.store,
         this.chain.chainId === 'none' ? undefined : this.chain,
+        this.eventBus,
       );
     }
     return this.finalizationHandler;

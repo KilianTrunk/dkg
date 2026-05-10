@@ -206,9 +206,9 @@ describe('DKGPublisher', () => {
   });
 
   it('emits KC_PUBLISHED event', async () => {
-    let emitted = false;
-    eventBus.on('kc:published', () => {
-      emitted = true;
+    let emitted: any;
+    eventBus.on('kc:published', (event) => {
+      emitted = event;
     });
 
     await publishWS({
@@ -216,7 +216,10 @@ describe('DKGPublisher', () => {
       quads: [q(ENTITY, 'http://schema.org/name', '"Bot"')],
     });
 
-    expect(emitted).toBe(true);
+    expect(emitted).toMatchObject({
+      contextGraphId: CONTEXT_GRAPH,
+      tripleCount: 1,
+    });
   });
 
   it('publishes with confirmed status and onChainResult', async () => {

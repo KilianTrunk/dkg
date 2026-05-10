@@ -334,6 +334,9 @@ export class PublishHandler {
       this.eventBus.emit(DKGEvent.KC_PUBLISHED, {
         ual: request.ual,
         from: fromPeerId,
+        contextGraphId,
+        subGraphName: request.subGraphName || undefined,
+        tripleCount: normalized.length,
       });
 
       const publicByteSize = request.nquads.length;

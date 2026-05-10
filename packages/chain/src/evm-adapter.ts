@@ -1258,6 +1258,12 @@ export class EVMChainAdapter implements ChainAdapter {
             const parsed = kcStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
             if (parsed) {
               const mint = mintByTx.get(log.transactionHash);
+              // V10.1: `author` is the EIP-712-attested author identity recovered
+              // by `_verifyAuthorAttestation` on-chain (or `address(0)` for the
+              // unattributed publish path). Surfacing it here lets replicas
+              // rebuild `dkg:Publication` / `dkg:authoredBy` provenance triples
+              // that match what the originating publisher emitted in
+              // `generateKCMetadata` (Round 5 review §10).
               yield {
                 type: 'KCCreated',
                 blockNumber: log.blockNumber,
@@ -1268,6 +1274,7 @@ export class EVMChainAdapter implements ChainAdapter {
                   byteSize: parsed.args.byteSize.toString(),
                   txHash: log.transactionHash,
                   publisherAddress: mint?.publisherAddress ?? '',
+                  author: typeof parsed.args.author === 'string' ? parsed.args.author : '',
                   startKAId: mint?.startKAId ?? '0',
                   endKAId: mint?.endKAId ?? '0',
                 },

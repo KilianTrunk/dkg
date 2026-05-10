@@ -4053,23 +4053,60 @@ export class DKGAgent {
     //    leaves). Drift between these two compute paths is the silent
     //    failure mode this whole architecture is trying to eliminate —
     //    so we reuse the publisher's exported helpers verbatim.
+    //
+    //    Round 5 review §1 — `kaMap` may contain unsafe-IRI roots
+    //    (e.g. RFC-3987-valid IRIs with `|` `^` etc that fail
+    //    `isSafeIri`'s SPARQL-interpolation rules). Those cannot be
+    //    referenced from the SPARQL CONSTRUCT that
+    //    `publishFromFinalizedAssertion` uses to reload the
+    //    promoted-SWM payload, so they MUST NOT contribute to the
+    //    sealed merkleRoot — otherwise the seal commits to a root
+    //    the publish path can never recompute. Reject finalize
+    //    instead of silently dropping content: silent-drop hides a
+    //    real input error and would let a partial assertion ship
+    //    with a seal that doesn't cover all of its quads.
+    //    Defense-in-depth: the current oxigraph storage adapter
+    //    rejects most unsafe characters at write time, so this guard
+    //    is rarely triggered through `assertion.write`. It still
+    //    matters for non-oxigraph adapters and for code paths that
+    //    seed the WM graph directly (bulk-import / `_meta` fixtures
+    //    / future storage backends). The canonical wire pin lives
+    //    at `core/test/assertion-seal-root-entities.test.ts` —
+    //    `buildAssertionSealQuads` rejects unsafe roots at the seal
+    //    boundary. This guard surfaces the same failure earlier
+    //    with a more actionable message.
     const kaMap = autoPartition(quads);
+    const allRootEntities = [...kaMap.keys()];
+    const unsafeRootEntities = allRootEntities.filter((r) => !isSafeIri(r));
+    if (unsafeRootEntities.length > 0) {
+      const sample = unsafeRootEntities
+        .slice(0, 3)
+        .map((r) => `<${r}>`)
+        .join(', ');
+      const more = unsafeRootEntities.length > 3 ? ` (+${unsafeRootEntities.length - 3} more)` : '';
+      throw new Error(
+        `Cannot finalize assertion <${assertionUri}>: ${unsafeRootEntities.length} root ` +
+          `entit${unsafeRootEntities.length === 1 ? 'y has' : 'ies have'} an unsafe IRI: ${sample}${more}. ` +
+          `The publish path reloads SWM via SPARQL CONSTRUCT scoped to these roots — unsafe IRIs ` +
+          `would be filtered, recomputing a different merkleRoot from the truncated payload, so the ` +
+          `sealed assertion could never be republished. Rename these subjects to safe IRIs ` +
+          `(no blank nodes, control chars, or unbalanced delimiters) before finalizing.`,
+      );
+    }
     const allSkolemizedQuads = [...kaMap.values()].flat();
     const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, []);
     // 3b. Capture rootEntities from the SAME `autoPartition` call that
     //     drives the merkle leaves. The seal binds these so
     //     `publishFromFinalizedAssertion` can scope its SWM CONSTRUCT
     //     instead of bundling everything currently sitting in shared
-    //     memory (Round 4 review §9). Defensive `isSafeIri` filter so
-    //     a malformed root entity is caught here rather than at
-    //     interpolation time.
-    const rootEntities = [...kaMap.keys()].filter((r) => isSafeIri(r));
+    //     memory (Round 4 review §9). Now safe by construction — the
+    //     guard above guarantees every key passes `isSafeIri`.
+    const rootEntities = allRootEntities;
     if (rootEntities.length === 0) {
       throw new Error(
         `Cannot finalize assertion <${assertionUri}>: autoPartition produced ` +
-          `no IRI-safe root entities. The assertion's quads have only blank-node ` +
-          `subjects or unsafe IRIs — name at least one root entity with a stable ` +
-          `IRI subject before finalizing.`,
+          `no root entities. The assertion has no quads; add at least one ` +
+          `user-authored quad on a non-reserved subject before finalizing.`,
       );
     }
 

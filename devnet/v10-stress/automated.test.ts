@@ -807,7 +807,7 @@ describe('V10 chain — stress + scenario validation', () => {
   //
   // Self-sovereign pre-signed (mode C) requires client-side EIP-712 + V10
   // merkle root computation; that path is already covered in
-  // experiments/agent-provenance-devnet/automated.test.ts mode (c) and is
+  // devnet/agent-provenance/automated.test.ts mode (c) and is
   // not duplicated here.
   // =========================================================================
   it('phase 2: 100 publishes mixing 4 lifecycle stages × custodian + third-party publisher modes', async () => {
@@ -1230,7 +1230,7 @@ describe('V10 chain — stress + scenario validation', () => {
         `mode A (third-party / PCA)=${byMode.a}, mode B (custodial)=${byMode.b}. ` +
         `Mode C (self-sovereign pre-signed) intentionally not exercised here — ` +
         `that path requires client-side EIP-712 + V10 merkle root computation ` +
-        `and is covered in experiments/agent-provenance-devnet/automated.test.ts.`,
+        `and is covered in devnet/agent-provenance/automated.test.ts.`,
     );
     if (custodialTentativeRetries > 0) {
       appendFinding(

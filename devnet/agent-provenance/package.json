@@ -1,5 +1,5 @@
 {
-  "name": "@origintrail-official/dkg-experiments-v10-stress-devnet",
+  "name": "@origintrail-official/dkg-devnet-agent-provenance",
   "version": "0.0.0",
   "private": true,
   "type": "module",

@@ -69,7 +69,7 @@ This phase soft-fails (logs the gap, doesn't block the suite) so the test still 
 | pre-signed self-sovereign (mode C) | — | — | 0 *      |
 | unattributed          | —       | —      | 0 *       |
 
-\* mode C and unattributed mode are exercised in `experiments/agent-provenance-devnet/automated.test.ts` instead — those paths require client-side EIP-712 + V10 merkle-root computation, which is the express scope of the agent-provenance suite.
+\* mode C and unattributed mode are exercised in `devnet/agent-provenance/automated.test.ts` instead — those paths require client-side EIP-712 + V10 merkle-root computation, which is the express scope of the agent-provenance suite.
 
 ## Repro
 

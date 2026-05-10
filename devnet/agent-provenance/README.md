@@ -107,7 +107,7 @@ deployment.)
 ## Per-mode recipes
 
 Each mode produces a transcript at
-`experiments/agent-provenance-devnet/<mode>.transcript.md`. The
+`devnet/agent-provenance/<mode>.transcript.md`. The
 transcript template is `transcript.template.md`; copy it, fill in
 the holes from the daemon log + on-chain reads.
 
@@ -133,7 +133,7 @@ node1 pca info 1 --probe-key "$NODE5_PUBLISHER"
 
 # Action
 node5 publish <cgId> \
-  --file experiments/agent-provenance-devnet/turns/turn-a.nq \
+  --file devnet/agent-provenance/turns/turn-a.nq \
   --publisher-node-identity-id 1     # core1's identityId on this devnet
 ```
 
@@ -217,7 +217,7 @@ and `end-user.agent` for `edge.agent`. Verifies §9.7 #6
 
 # Action
 node5 publish <cgId> \
-  --file experiments/agent-provenance-devnet/turns/turn-c.nq \
+  --file devnet/agent-provenance/turns/turn-c.nq \
   --publisher-node-identity-id 3     # core3's identityId on this devnet
 ```
 
@@ -243,7 +243,7 @@ attribution"):
 
 # Action
 node5 publish <cgId> \
-  --file experiments/agent-provenance-devnet/turns/turn-d.nq \
+  --file devnet/agent-provenance/turns/turn-d.nq \
   --publisher-node-identity-id 0
 ```
 
@@ -286,7 +286,7 @@ option — explicit `0n` proceeds on-chain.
 # the purpose. Verify with `node1 pca info 1 --probe-key <addr>`
 # that `authorized: false` BEFORE the publish.
 node5 publish <cgId> \
-  --file experiments/agent-provenance-devnet/turns/turn-fallthrough.nq \
+  --file devnet/agent-provenance/turns/turn-fallthrough.nq \
   --publisher-node-identity-id 1     # core1's identityId on this devnet
 ```
 

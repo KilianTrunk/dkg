@@ -75,7 +75,7 @@ importers:
         specifier: workspace:*
         version: link:../packages/storage
 
-  experiments/agent-provenance-devnet:
+  devnet/agent-provenance:
     dependencies:
       ethers:
         specifier: ^6.16.0
@@ -85,7 +85,7 @@ importers:
         specifier: ^4.0.18
         version: 4.0.18(@types/node@22.19.11)(happy-dom@20.8.3(bufferutil@4.1.0)(utf-8-validate@5.0.10))(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.3)
 
-  experiments/v10-end-to-end-devnet:
+  devnet/v10-end-to-end:
     dependencies:
       ethers:
         specifier: ^6.16.0
@@ -95,7 +95,7 @@ importers:
         specifier: ^4.0.18
         version: 4.0.18(@types/node@22.19.11)(happy-dom@20.8.3(bufferutil@4.1.0)(utf-8-validate@5.0.10))(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.3)
 
-  experiments/v10-stress-devnet:
+  devnet/v10-stress:
     dependencies:
       ethers:
         specifier: ^6.16.0

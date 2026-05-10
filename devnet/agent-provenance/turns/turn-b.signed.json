@@ -1,5 +1,5 @@
 {
-  "_comment_template": "Replace with a real signed payload. The signature is over the EIP-712 author attestation built via @origintrail-official/dkg-core's buildAuthorAttestationTypedData. See `experiments/agent-provenance-devnet/README.md` mode (b) for context.",
+  "_comment_template": "Replace with a real signed payload. The signature is over the EIP-712 author attestation built via @origintrail-official/dkg-core's buildAuthorAttestationTypedData. See `devnet/agent-provenance/README.md` mode (b) for context.",
   "sessionId": "mode-b-session",
   "userMessage": "Edge user request",
   "assistantReply": "Mode (b): publisher-as-a-service via core 2 PCA",

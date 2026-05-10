@@ -5,7 +5,7 @@
  * Each describe block maps 1:1 to a diagram and asserts the diagram's
  * stated invariants against a real Hardhat deployment (single-node;
  * multi-node ACK quorum + P2P gossip is covered separately by the
- * `experiments/agent-provenance-devnet/automated.test.ts` suite).
+ * `devnet/agent-provenance/automated.test.ts` suite).
  *
  * Many of the diagram paths already have dedicated tests elsewhere
  * (`publish-lifecycle.test.ts`, `signature-collection.test.ts`,

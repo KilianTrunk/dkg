@@ -46,7 +46,7 @@
  *   ./scripts/devnet.sh start 6
  *   pnpm test:devnet:v10-e2e
  *
- * Companion to `experiments/agent-provenance-devnet/` (which exercises
+ * Companion to `devnet/agent-provenance/` (which exercises
  * the publish-author attribution modes a/b/c/d). This file's Phase 1
  * is the lightweight equivalent of mode (a) just to confirm the
  * publish+PCA stack still works against current code; Phases 2-4

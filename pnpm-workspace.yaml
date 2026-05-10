@@ -1,6 +1,6 @@
 packages:
   - "packages/*"
   - "demo"
-  - "experiments/agent-provenance-devnet"
-  - "experiments/v10-end-to-end-devnet"
-  - "experiments/v10-stress-devnet"
+  - "devnet/agent-provenance"
+  - "devnet/v10-end-to-end"
+  - "devnet/v10-stress"

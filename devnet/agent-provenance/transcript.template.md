@@ -24,7 +24,7 @@ added, etc.):
 
 ```text
 $ NODE_DIR=.devnet/node5 ./scripts/dkg publish <cgId> \
-    --file experiments/agent-provenance-devnet/turns/turn-<x>.nq \
+    --file devnet/agent-provenance/turns/turn-<x>.nq \
     --publisher-node-identity-id <core_id>
 
 <paste full stdout/stderr — should include the daemon log line:

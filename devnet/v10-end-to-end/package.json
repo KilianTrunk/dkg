@@ -1,5 +1,5 @@
 {
-  "name": "@origintrail-official/dkg-experiments-v10-end-to-end-devnet",
+  "name": "@origintrail-official/dkg-devnet-v10-end-to-end",
   "version": "0.0.0",
   "private": true,
   "type": "module",

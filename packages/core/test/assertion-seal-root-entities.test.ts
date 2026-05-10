@@ -111,7 +111,7 @@ describe('assertion seal rootEntities round-trip', () => {
     // back as the bare value `urn:foo` on read (e.g. oxigraph
     // `termToString` returns `t.value` for NamedNode). The parser must
     // accept both shapes — see the round-trip-bug fix in
-    // `experiments/v10-stress-devnet/FINDINGS.md` Phase 2.
+    // `devnet/v10-stress/FINDINGS.md` Phase 2.
     const roots = ['urn:dkg:doc:foo', 'http://example.com/A'];
     const wrapped = buildAssertionSealQuads(makeBaseArgs(roots));
     const bare = wrapped.map((q) =>

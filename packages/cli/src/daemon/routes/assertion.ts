@@ -827,6 +827,19 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           : {}),
         ...(schemeVersion != null ? { schemeVersion } : {}),
       });
+      // Mirror the chained /create handler: every step in the sign-at-creation
+      // lifecycle emits a memory_graph_changed SSE so a UI watching the graph
+      // (staking-ui, dkg-node-ui) reflects the state machine in real time.
+      // The chained handler emits 4 events (created/written/finalized/promoted);
+      // the standalone routes must each emit their own — otherwise a client
+      // composing the chain by hand would miss the `assertion_finalized` step.
+      emitMemoryGraphChanged?.({
+        contextGraphId,
+        layers: ["wm"],
+        subGraphName,
+        operation: "assertion_finalized",
+        source: "api",
+      });
       return jsonResponse(res, 200, {
         assertionUri: seal.assertionUri,
         merkleRoot: ethers.hexlify(seal.merkleRoot),

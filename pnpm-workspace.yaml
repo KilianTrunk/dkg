@@ -2,5 +2,6 @@ packages:
   - "packages/*"
   - "demo"
   - "devnet/agent-provenance"
+  - "devnet/v10-core-flows"
   - "devnet/v10-end-to-end"
   - "devnet/v10-stress"

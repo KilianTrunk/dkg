@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "vitest run --config vitest.config.ts"
+    "test:devnet": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
     "ethers": "^6.16.0"

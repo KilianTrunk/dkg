@@ -32,11 +32,11 @@ This is correct: edge nodes are app/relay servers, not validators; chain anchori
 
 ### Operator-fee accrual obeys RFC-26 to within rounding
 
-Test 4 sets a 10% operator fee on identityId=1, generates fresh publishes to seed the epoch pool, waits for RS to score the epoch, warps to the next epoch (so the fee becomes "latest" + active), and has a delegator claim. The accrued operator-fee balance equals `(getEpochPool(EPOCH_POOL_INDEX, e) × nodeScore / totalScore) × feeBps / 10_000` to under 100 bps drift. The first claim per (identity, epoch) pair locks the accrual via `isOperatorFeeClaimedForEpoch[id][e] = true`; subsequent delegator claims for the same epoch use the cached `netNodeEpochRewards` and do not re-accrue.
+Test 4 sets a 10% operator fee on identityId=1, reads the pending fee's effective timestamp, generates fresh publishes to seed the epoch pool, waits for RS to score the epoch, warps past that exact effective timestamp, and has a delegator claim. The accrued operator-fee balance equals `(getEpochPool(EPOCH_POOL_INDEX, e) × nodeScore / totalScore) × feeBps / 10_000` to under 100 bps drift. The first claim per (identity, epoch) pair locks the accrual via `isOperatorFeeClaimedForEpoch[id][e] = true`; subsequent delegator claims for the same epoch use the cached `netNodeEpochRewards` and do not re-accrue.
 
 ### `Profile.updateOperatorFee` half-epoch median rule
 
-`updateOperatorFee` calls in the **first half** of the current epoch take effect at the next epoch boundary. Calls in the second half take effect at the boundary *after* next. This prevents an operator from raising the fee mid-epoch to capture rewards earned under the old fee. Test 4 calls in the first half and warps one epoch, so the new fee is active by claim time.
+`updateOperatorFee` calls in the **first half** of the current epoch take effect at the next epoch boundary. Calls in the second half take effect at the boundary *after* next. This prevents an operator from raising the fee mid-epoch to capture rewards earned under the old fee. Test 4 reads the pending effective timestamp and warps past it, so it is deterministic regardless of which half of the epoch the suite starts in.
 
 ## Warnings
 

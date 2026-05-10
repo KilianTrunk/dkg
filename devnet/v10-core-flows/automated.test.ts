@@ -87,7 +87,11 @@ const STAKING_ABI = [
   'function finalizeOperatorFeeWithdrawal(uint72 identityId)',
 ];
 const PROFILE_WRITE_ABI = ['function updateOperatorFee(uint72 identityId, uint16 newOperatorFee)'];
-const PROFILE_STORAGE_ABI = ['function getOperatorFee(uint72) view returns (uint16)'];
+const PROFILE_STORAGE_ABI = [
+  'function getOperatorFee(uint72) view returns (uint16)',
+  'function getOperatorFeesLength(uint72) view returns (uint256)',
+  'function getOperatorFeeEffectiveDateByIndex(uint72,uint256) view returns (uint256)',
+];
 const PARAMS_ABI = ['function stakeWithdrawalDelay() view returns (uint256)'];
 const CHRONOS_ABI = [
   'function getCurrentEpoch() view returns (uint256)',
@@ -386,25 +390,24 @@ describe('2. edge-node publish', () => {
 // ───────────────────────── 3. NFT staking withdraw ───────────────────────
 describe('3. NFT staking withdraw', () => {
   it('tier-0 (no-lock) position withdraws cleanly: TRAC moves, NFT burns, position clears', async () => {
-    // Find a tier-0 delegator who hasn't been touched. Bootstrap creates two
-    // tier-0 positions (wallets 0 and 5).
-    const target = state.delegators.find((d) => d.tier === 0);
-    expect(target, 'no tier-0 delegator found in delegators.json').toBeDefined();
+    // Bootstrap creates two tier-0 positions. Pick one that still has raw
+    // stake so the suite can be re-run after a partial previous pass.
+    let target: Delegator | undefined;
+    let positionSnap: any;
+    for (const candidate of state.delegators.filter((d) => d.tier === 0)) {
+      const position = await state.css.getPosition(BigInt(candidate.tokenId));
+      if (position.raw !== 0n) {
+        target = candidate;
+        positionSnap = position;
+        break;
+      }
+    }
+    expect(target, 'no unwithdrawn tier-0 delegator found — re-bootstrap').toBeDefined();
 
     const wallet = new ethers.Wallet(target!.privateKey, state.provider);
     const nft = new ethers.Contract(state.nft.target, NFT_ABI, wallet);
-    const tokenId = BigInt(target!.tokenId);
-    const positionBefore = await state.css.getPosition(tokenId);
-    if (positionBefore.raw === 0n) {
-      // Already withdrawn (e.g. a prior run); pick the other tier-0
-      const altTarget = state.delegators.find((d) => d.tier === 0 && d.tokenId !== target!.tokenId);
-      expect(altTarget, 'both tier-0 positions already withdrawn — re-bootstrap').toBeDefined();
-      Object.assign(target!, altTarget!);
-    }
-
     const tokenIdRaw = BigInt(target!.tokenId);
-    const positionSnap = await state.css.getPosition(tokenIdRaw);
-    const expectedAmount = positionSnap.raw;
+    const expectedAmount = BigInt(positionSnap.raw);
     const tracBefore = await state.token.balanceOf(target!.address);
 
     const tx = await nft.withdraw(tokenIdRaw);
@@ -463,6 +466,11 @@ describe('4. operator-fee accrual + withdrawal', () => {
     let tx = await profileWrite.updateOperatorFee(identityId, 1000);
     await tx.wait();
 
+    const feeCount: bigint = await state.profileStorage.getOperatorFeesLength(identityId);
+    const feeEffectiveDate: bigint = await state.profileStorage.getOperatorFeeEffectiveDateByIndex(
+      identityId,
+      feeCount - 1n,
+    );
     const startEpoch = await state.chronos.getCurrentEpoch();
 
     // (b) Generate 5 fresh publishes from node1 (core) so the current epoch
@@ -488,16 +496,18 @@ describe('4. operator-fee accrual + withdrawal', () => {
     const grossNode1 = (BigInt(epochPool) * scoreNow) / allScore;
     const expectedFee = (grossNode1 * 1000n) / 10000n; // 10% of gross
 
-    // (d) Warp into the next epoch so the new fee becomes "latest" AND the
-    // claim window for `startEpoch` opens. Add a +120s safety margin past
-    // the boundary because `getActiveOperatorFeePercentage` uses a strict
-    // `>` against `effectiveDate` and the boundary timing is fiddly.
-    const tNext = await state.chronos.timeUntilNextEpoch();
-    const warpSec = Number(tNext) + 120;
-    await state.provider.send('evm_increaseTime', [warpSec]);
+    // (d) Warp until the exact pending fee effective date is safely active
+    // AND the claim window for `startEpoch` has opened. This avoids assuming
+    // whether updateOperatorFee ran before or after the current epoch midpoint.
+    const blockBeforeWarp = await state.provider.getBlock('latest');
+    const targetTimestamp = feeEffectiveDate + 120n;
+    const nowTimestamp = BigInt(blockBeforeWarp!.timestamp);
+    if (nowTimestamp < targetTimestamp) {
+      await state.provider.send('evm_increaseTime', [Number(targetTimestamp - nowTimestamp)]);
+    }
     await state.provider.send('evm_mine', []);
     const newEpoch = await state.chronos.getCurrentEpoch();
-    expect(newEpoch).toBe(startEpoch + 1n);
+    expect(newEpoch).toBeGreaterThan(startEpoch);
 
     const feeBpsLatest = await state.profileStorage.getOperatorFee(identityId);
     expect(feeBpsLatest).toBe(1000);

@@ -462,9 +462,21 @@ describe('4. operator-fee accrual + withdrawal', () => {
     // (a) Set fee to 1000 bps (10%). The new fee is staged as PENDING and
     // becomes "latest" at the next epoch boundary (or the one after, if
     // we're past the half-epoch median — see Profile.updateOperatorFee).
+    //
+    // Idempotent: re-runs on the same devnet skip the update when the fee
+    // is already 1000 bps. `Profile.updateOperatorFee` reverts on a fresh
+    // call when the previous epoch's operator-fee accrual hasn't been
+    // claimed (the contract enforces "settle before re-fee"); a partially-
+    // failed prior run could leave us in that state, and re-calling
+    // `updateOperatorFee` then would mask the real test instead of
+    // recovering. The current value of `getOperatorFee` is the only state
+    // the rest of the test cares about.
     const profileWrite = state.profileWrite.connect(state.adminWallet) as ethers.Contract;
-    let tx = await profileWrite.updateOperatorFee(identityId, 1000);
-    await tx.wait();
+    const existingFee: bigint = await state.profileStorage.getOperatorFee(identityId);
+    if (existingFee !== 1000n) {
+      const tx = await profileWrite.updateOperatorFee(identityId, 1000);
+      await tx.wait();
+    }
 
     const feeCount: bigint = await state.profileStorage.getOperatorFeesLength(identityId);
     const feeEffectiveDate: bigint = await state.profileStorage.getOperatorFeeEffectiveDateByIndex(
@@ -496,12 +508,17 @@ describe('4. operator-fee accrual + withdrawal', () => {
     const grossNode1 = (BigInt(epochPool) * scoreNow) / allScore;
     const expectedFee = (grossNode1 * 1000n) / 10000n; // 10% of gross
 
-    // (d) Warp until the exact pending fee effective date is safely active
-    // AND the claim window for `startEpoch` has opened. This avoids assuming
-    // whether updateOperatorFee ran before or after the current epoch midpoint.
+    // (d) Warp such that BOTH (i) the pending fee effective date has passed
+    // (so `getOperatorFee` returns 1000), and (ii) we've crossed into an
+    // epoch strictly greater than `startEpoch` (so the claim window for
+    // startEpoch's reward pool is open). On a fresh devnet (i) usually
+    // dominates; on a re-run where the fee is already active (i) is in
+    // the past and (ii) becomes the binding constraint.
     const blockBeforeWarp = await state.provider.getBlock('latest');
-    const targetTimestamp = feeEffectiveDate + 120n;
     const nowTimestamp = BigInt(blockBeforeWarp!.timestamp);
+    const tNext = await state.chronos.timeUntilNextEpoch();
+    const nextEpochStart = nowTimestamp + BigInt(tNext);
+    const targetTimestamp = (feeEffectiveDate > nextEpochStart ? feeEffectiveDate : nextEpochStart) + 120n;
     if (nowTimestamp < targetTimestamp) {
       await state.provider.send('evm_increaseTime', [Number(targetTimestamp - nowTimestamp)]);
     }
@@ -510,7 +527,10 @@ describe('4. operator-fee accrual + withdrawal', () => {
     expect(newEpoch).toBeGreaterThan(startEpoch);
 
     const feeBpsLatest = await state.profileStorage.getOperatorFee(identityId);
-    expect(feeBpsLatest).toBe(1000);
+    // ABI returns uint16 → ethers v6 surfaces it as `bigint`. Compare with the
+    // bigint literal so a future ABI bump back to `number` would surface here
+    // as a controlled test update rather than a silent mismatch.
+    expect(feeBpsLatest).toBe(1000n);
 
     // (e) Have a delegator on node1 claim → triggers operator-fee accrual.
     // Pick the highest-stake position on identityId=1 to maximise reward
@@ -524,8 +544,8 @@ describe('4. operator-fee accrual + withdrawal', () => {
     const nft = new ethers.Contract(state.nft.target, NFT_ABI, delegatorWallet);
     const balBefore: bigint = BigInt(await state.css.getOperatorFeeBalance(identityId));
 
-    tx = await nft.claim(BigInt(candidate!.tokenId));
-    const claimReceipt = await tx.wait();
+    const claimTx = await nft.claim(BigInt(candidate!.tokenId));
+    const claimReceipt = await claimTx.wait();
     expect(claimReceipt.status).toBe(1);
 
     const balAfter = BigInt(await state.css.getOperatorFeeBalance(identityId));
@@ -542,8 +562,8 @@ describe('4. operator-fee accrual + withdrawal', () => {
     // (f) Withdrawal cycle: request → assert cooldown → warp → finalize.
     const adminTracBefore = await state.token.balanceOf(state.adminWallet.address);
     const stakingWrite = state.staking.connect(state.adminWallet) as ethers.Contract;
-    tx = await stakingWrite.requestOperatorFeeWithdrawal(identityId, balAfter);
-    await tx.wait();
+    const reqTx = await stakingWrite.requestOperatorFeeWithdrawal(identityId, balAfter);
+    await reqTx.wait();
 
     const queued = await state.css.getOperatorFeeWithdrawalRequest(identityId);
     expect(queued.amount).toBe(balAfter);
@@ -560,8 +580,8 @@ describe('4. operator-fee accrual + withdrawal', () => {
     // Use a fresh nonce — interval mining + the admin wallet being shared
     // with other devnet processes can desync ethers' nonce cache.
     const nonce = await state.provider.getTransactionCount(state.adminWallet.address);
-    tx = await stakingWrite.finalizeOperatorFeeWithdrawal(identityId, { nonce });
-    const finReceipt = await tx.wait();
+    const finTx = await stakingWrite.finalizeOperatorFeeWithdrawal(identityId, { nonce });
+    const finReceipt = await finTx.wait();
     expect(finReceipt.status).toBe(1);
 
     const adminTracAfter = await state.token.balanceOf(state.adminWallet.address);

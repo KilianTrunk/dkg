@@ -7,9 +7,13 @@ import type { Quad } from '@origintrail-official/dkg-storage';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, seedContextGraphRegistration, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { buildSeal } from './_helpers/seal.js';
 
 let CONTEXT_GRAPH: string;
 let GRAPH: string;
+let _kav10Address: string;
+let _provider: ethers.JsonRpcProvider;
+const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 const ENTITY = 'did:dkg:agent:QmImageBot';
 const ENTITY2 = 'did:dkg:agent:QmTextBot';
 const TEST_PUBLISHER_ADDRESS = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
@@ -28,14 +32,41 @@ describe('DKGPublisher', () => {
   beforeAll(async () => {
     _fileSnapshot = await takeSnapshot();
     const { hubAddress } = getSharedContext();
-    const provider = createProvider();
+    _provider = createProvider();
     const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
-    await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
+    await mintTokens(_provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const cgId = await createTestContextGraph(chain);
     CONTEXT_GRAPH = String(cgId);
     GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    _kav10Address = await chain.getKnowledgeAssetsV10Address();
   });
+
+  // Phase C made the publisher a pure transport — every on-chain test
+  // mints a self-signed seal here so the publisher actually broadcasts.
+  // `publisher` is captured by closure (reassigned in beforeEach), so
+  // these wrappers reflect whichever publisher instance the current
+  // test set up.
+  async function publishWS(args: Parameters<DKGPublisher['publish']>[0]) {
+    const seal = await buildSeal({
+      quads: args.quads,
+      privateQuads: args.privateQuads,
+      author: _author,
+      contextGraphId: args.contextGraphId,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
+    });
+    return publisher.publish({ ...args, precomputedAttestation: seal });
+  }
+  async function updateWS(kcId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
+    const seal = await buildSeal({
+      quads: args.quads,
+      privateQuads: args.privateQuads,
+      author: _author,
+      contextGraphId: args.contextGraphId,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
+    });
+    return publisher.update(kcId, { ...args, precomputedAttestation: seal });
+  }
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
   });
@@ -61,7 +92,7 @@ describe('DKGPublisher', () => {
   });
 
   it('publishes a single KA', async () => {
-    const result = await publisher.publish({
+    const result = await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [
         q(ENTITY, 'http://schema.org/name', '"ImageBot"'),
@@ -83,7 +114,7 @@ describe('DKGPublisher', () => {
   });
 
   it('publishes multiple KAs in one KC', async () => {
-    const result = await publisher.publish({
+    const result = await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [
         q(ENTITY, 'http://schema.org/name', '"ImageBot"'),
@@ -99,7 +130,7 @@ describe('DKGPublisher', () => {
   });
 
   it('publishes with blank nodes (auto-skolemized)', async () => {
-    const result = await publisher.publish({
+    const result = await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [
         q(ENTITY, 'http://schema.org/name', '"ImageBot"'),
@@ -124,7 +155,7 @@ describe('DKGPublisher', () => {
   });
 
   it('publishes with private triples', async () => {
-    const result = await publisher.publish({
+    const result = await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"ImageBot"')],
       privateQuads: [q(ENTITY, 'http://ex.org/apiKey', '"secret-key-123"')],
@@ -138,13 +169,13 @@ describe('DKGPublisher', () => {
   });
 
   it('rejects duplicate entity (exclusivity)', async () => {
-    await publisher.publish({
+    await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"ImageBot"')],
     });
 
     await expect(
-      publisher.publish({
+      publishWS({
         contextGraphId: CONTEXT_GRAPH,
         quads: [q(ENTITY, 'http://schema.org/name', '"Duplicate"')],
       }),
@@ -152,12 +183,12 @@ describe('DKGPublisher', () => {
   });
 
   it('updates an existing KC', async () => {
-    const initial = await publisher.publish({
+    const initial = await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"OldName"')],
     });
 
-    const updated = await publisher.update(initial.kcId, {
+    const updated = await updateWS(initial.kcId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"NewName"')],
     });
@@ -180,7 +211,7 @@ describe('DKGPublisher', () => {
       emitted = event;
     });
 
-    await publisher.publish({
+    await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"Bot"')],
     });
@@ -192,7 +223,7 @@ describe('DKGPublisher', () => {
   });
 
   it('publishes with confirmed status and onChainResult', async () => {
-    const result = await publisher.publish({
+    const result = await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"ImageBot"')],
     });
@@ -209,7 +240,7 @@ describe('DKGPublisher', () => {
   });
 
   it('generates address-based UAL format', async () => {
-    const result = await publisher.publish({
+    const result = await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"ImageBot"')],
     });
@@ -230,7 +261,7 @@ describe('DKGPublisher', () => {
   });
 
   it('derives publisherAddress from private key', async () => {
-    const result = await publisher.publish({
+    const result = await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"ImageBot"')],
     });
@@ -241,7 +272,7 @@ describe('DKGPublisher', () => {
   });
 
   it('stores only confirmed status in meta graph on successful publish', async () => {
-    await publisher.publish({
+    await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"ImageBot"')],
     });
@@ -299,7 +330,7 @@ describe('DKGPublisher', () => {
 
     it('rejects a user-authored publish with `urn:dkg:file:keccak256:*` subject in public quads', async () => {
       await expect(
-        publisher.publish({
+        publishWS({
           contextGraphId: CONTEXT_GRAPH,
           quads: [
             q('urn:dkg:file:keccak256:deadbeef', 'http://schema.org/name', '"should be rejected"'),
@@ -310,7 +341,7 @@ describe('DKGPublisher', () => {
 
     it('rejects a user-authored publish with `urn:dkg:extraction:*` subject in privateQuads', async () => {
       await expect(
-        publisher.publish({
+        publishWS({
           contextGraphId: CONTEXT_GRAPH,
           quads: [q(ENTITY, 'http://schema.org/name', '"ok"')],
           privateQuads: [
@@ -340,7 +371,7 @@ describe('DKGPublisher', () => {
       // quad passed to `publish()` with `fromSharedMemory: true` from
       // an external caller is still rejected with a ReservedNamespaceError.
       await expect(
-        publisher.publish({
+        publishWS({
           contextGraphId: CONTEXT_GRAPH,
           quads: [q('urn:dkg:file:keccak256:bypass', 'http://schema.org/name', '"external bypass attempt"')],
           fromSharedMemory: true,
@@ -362,7 +393,7 @@ describe('DKGPublisher', () => {
       // must be one of the valid terminal values, UAL must exist, and
       // at least one KA manifest entry must be present for the single
       // root entity in the input.
-      const result = await publisher.publish({
+      const result = await publishWS({
         contextGraphId: CONTEXT_GRAPH,
         quads: [q(ENTITY, 'http://schema.org/name', '"fromSharedMemory-with-legit-quads"')],
         fromSharedMemory: true,
@@ -429,7 +460,7 @@ describe('DKGPublisher', () => {
       // interaction — so the reserved-namespace rejection surfaces
       // independently of whether the kcId exists.
       await expect(
-        publisher.update(0n, {
+        updateWS(0n, {
           contextGraphId: CONTEXT_GRAPH,
           quads: [q('urn:dkg:file:keccak256:update-leak', 'http://schema.org/name', '"update bypass"')],
         }),
@@ -438,7 +469,7 @@ describe('DKGPublisher', () => {
 
     it('Round 12 Bug 34: update() rejects reserved-prefix privateQuads (parallel to publish)', async () => {
       await expect(
-        publisher.update(0n, {
+        updateWS(0n, {
           contextGraphId: CONTEXT_GRAPH,
           quads: [q(ENTITY, 'http://schema.org/name', '"ok"')],
           privateQuads: [
@@ -452,7 +483,7 @@ describe('DKGPublisher', () => {
       // Same bypass closure as publish — external callers cannot use
       // the public flag to bypass update()'s guard either.
       await expect(
-        publisher.update(0n, {
+        updateWS(0n, {
           contextGraphId: CONTEXT_GRAPH,
           quads: [q('urn:dkg:file:keccak256:upd-bypass', 'http://schema.org/name', '"external bypass"')],
           fromSharedMemory: true,
@@ -551,7 +582,7 @@ describe('DKGPublisher', () => {
     describe('Round 14 Bug 41: case-insensitive URN comparison', () => {
       it('write-time: publish rejects `URN:dkg:file:keccak256:*` (scheme uppercase)', async () => {
         await expect(
-          publisher.publish({
+          publishWS({
             contextGraphId: CONTEXT_GRAPH,
             quads: [q('URN:dkg:file:keccak256:mixedcase', 'http://schema.org/name', '"bypass attempt"')],
           }),
@@ -560,7 +591,7 @@ describe('DKGPublisher', () => {
 
       it('write-time: publish rejects `urn:DKG:file:keccak256:*` (NID uppercase)', async () => {
         await expect(
-          publisher.publish({
+          publishWS({
             contextGraphId: CONTEXT_GRAPH,
             quads: [q('urn:DKG:file:keccak256:nidcase', 'http://schema.org/name', '"bypass attempt"')],
           }),
@@ -569,7 +600,7 @@ describe('DKGPublisher', () => {
 
       it('write-time: publish rejects `Urn:Dkg:File:keccak256:*` (mixed case across scheme+NID+NSS)', async () => {
         await expect(
-          publisher.publish({
+          publishWS({
             contextGraphId: CONTEXT_GRAPH,
             quads: [q('Urn:Dkg:File:keccak256:allcase', 'http://schema.org/name', '"bypass attempt"')],
           }),
@@ -578,7 +609,7 @@ describe('DKGPublisher', () => {
 
       it('write-time: publish rejects `URN:dkg:extraction:*` (parallel for the extraction namespace)', async () => {
         await expect(
-          publisher.publish({
+          publishWS({
             contextGraphId: CONTEXT_GRAPH,
             quads: [q('URN:dkg:extraction:11111111-2222-3333-4444-555555555555', 'http://schema.org/name', '"bypass attempt"')],
           }),
@@ -603,7 +634,7 @@ describe('DKGPublisher', () => {
 
       it('write-time: update rejects mixed-case reserved prefix (Bucket A coverage from Round 12 Bug 34)', async () => {
         await expect(
-          publisher.update(0n, {
+          updateWS(0n, {
             contextGraphId: CONTEXT_GRAPH,
             quads: [q('URN:dkg:extraction:update-bypass', 'http://schema.org/name', '"bypass"')],
           }),
@@ -669,7 +700,7 @@ describe('DKGPublisher', () => {
         //   2. The result shape is a real `PublishResult` with a
         //      non-empty UAL — i.e. the quad was accepted and a KC
         //      was created, not silently dropped.
-        const result = await publisher.publish({
+        const result = await publishWS({
           contextGraphId: CONTEXT_GRAPH,
           quads: [q('urn:dkg:filesystem:foo', 'http://schema.org/name', '"near-miss"')],
         });
@@ -687,7 +718,7 @@ describe('DKGPublisher', () => {
         // above — `toBeDefined()` alone could hide a regression that
         // returns a skeleton failed-result shape while still being
         // "defined".
-        const result = await publisher.publish({
+        const result = await publishWS({
           contextGraphId: CONTEXT_GRAPH,
           quads: [q('http://example.com/bug41-notreserved', 'http://schema.org/name', '"legit"')],
         });
@@ -700,7 +731,7 @@ describe('DKGPublisher', () => {
 
   describe('sub-graph registration validation on share()', () => {
     it('rejects SWM write to unregistered sub-graph', async () => {
-      await publisher.publish({
+      await publishWS({
         contextGraphId: CONTEXT_GRAPH,
         quads: [q(ENTITY, 'http://schema.org/name', '"ImageBot"')],
       });

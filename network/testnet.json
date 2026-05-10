@@ -16,7 +16,7 @@
     "branch": "main",
     "checkIntervalMinutes": 5
   },
-  "chainResetMarker": "v10-rs-staking-consolidation-2026-04-30",
+  "chainResetMarker": "v10-rc6-pca-author-attestation-2026-05-10",
   "chain": {
     "type": "evm",
     "rpcUrl": "https://sepolia.base.org",

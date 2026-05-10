@@ -131,12 +131,20 @@ describe('@unit ContextGraphStorage', () => {
       ).to.be.revertedWithCustomError(StorageContract, 'InvalidContextGraphConfig');
     });
 
-    it('reverts on empty hosting nodes', async () => {
+    it('reverts on empty hosting nodes with requiredSignatures > 0 (RFC-001 edge-CG: must be zero)', async () => {
       await expect(
         StorageContract.connect(opSigner).createContextGraph(
           accounts[1].address, [], baseAgents(), 1, 0, 0, 1, ethers.ZeroAddress, 0,
         ),
       ).to.be.revertedWithCustomError(StorageContract, 'InvalidContextGraphConfig');
+    });
+
+    it('RFC-001: accepts empty hosting nodes when requiredSignatures == 0 (edge-CG pattern)', async () => {
+      await expect(
+        StorageContract.connect(opSigner).createContextGraph(
+          accounts[1].address, [], baseAgents(), 0, 0, 0, 1, ethers.ZeroAddress, 0,
+        ),
+      ).to.not.be.reverted;
     });
 
     it('reverts on unsorted hosting nodes', async () => {

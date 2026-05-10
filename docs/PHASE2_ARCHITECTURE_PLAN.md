@@ -115,8 +115,8 @@ Acceptance criteria per route module:
 - **Canonical paths stay wired.** The refactor is a pure file move, not an API break. Before merging any route split, grep the monorepo for the route string and confirm in-repo clients (`packages/mcp-server`, `packages/mcp-dkg`, `packages/node-ui`) resolve against the new location. The canonical aliases that must survive the move are:
   - `/api/subscribe` → V10 `/api/context-graph/subscribe`
   - `/api/context-graph/create | list | rename | exists`
-  - `/api/workspace/write` → V10 `/api/shared-memory/write` (dual-wired at `daemon.ts:4646-4650`)
-  - `/api/workspace/enshrine` → V10 `/api/shared-memory/publish` (dual-wired at `daemon.ts:4706-4710`)
+
+  Note: the legacy V9 `/api/workspace/write` + `/api/workspace/enshrine` aliases were removed in PR #436 (sign-at-creation assertion lifecycle). Callers must use `/api/shared-memory/write` + `/api/shared-memory/publish` directly.
 
   A route split that omits any of these paths silently breaks CLI builds, MCP releases, and user automation.
 

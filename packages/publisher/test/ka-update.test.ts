@@ -9,8 +9,12 @@ import { parseSimpleNQuads } from '../src/publish-handler.js';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { wrapPublisherForTest } from './_helpers/seal.js';
 
 let CONTEXT_GRAPH: string = 'test-update';
+let _kav10Address: string;
+let _provider: ethers.JsonRpcProvider;
+const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 let DATA_GRAPH: string;
 const ENTITY_A = 'urn:test:entity:a';
 const ENTITY_B = 'urn:test:entity:b';
@@ -133,6 +137,8 @@ describe('UpdateHandler', () => {
     const cgId = await createTestContextGraph(chain);
     CONTEXT_GRAPH = String(cgId);
     DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    _provider = createProvider();
+    _kav10Address = await chain.getKnowledgeAssetsV10Address();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -152,6 +158,10 @@ describe('UpdateHandler', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
     handler = new UpdateHandler(store, chain, eventBus);
   });

@@ -116,6 +116,84 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(emitMemoryGraphChanged.mock.calls[0][0]).not.toHaveProperty('content');
   });
 
+  it('emits an assertion_created refresh on standalone /api/assertion/create', async () => {
+    // Pins the contract that every standalone lifecycle route fires its own
+    // memory_graph_changed SSE. The chained /create handler emits all four
+    // (created/written/finalized/promoted) inside one call, but a client that
+    // composes the chain by hand (e.g. staking-ui, or any external integrator
+    // calling create → write → finalize → promote in four separate POSTs) sees
+    // events ONLY if each standalone route emits independently. A regression
+    // where one of the four routes silently dropped its emit (we caught
+    // exactly this in /finalize during PR #436 devnet validation) would break
+    // any UI watching the graph state machine.
+    const emitMemoryGraphChanged = vi.fn();
+    const create = vi.fn().mockResolvedValue('did:dkg:context-graph:project-a/assertion/0x0/draft');
+    const ctx = createContext('/api/assertion/create', {
+      contextGraphId: 'project-a',
+      name: 'draft',
+      subGraphName: 'notes',
+    }, {
+      agent: { assertion: { create }, resolveAgentByToken: () => undefined } as unknown as RequestContext['agent'],
+      emitMemoryGraphChanged,
+    });
+
+    await handleAssertionRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(responseBody(ctx)).toMatchObject({ assertionUri: expect.stringContaining('draft') });
+    expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
+      contextGraphId: 'project-a',
+      layers: ['wm'],
+      subGraphName: 'notes',
+      operation: 'assertion_created',
+      source: 'api',
+      counts: { triples: 0 },
+    });
+  });
+
+  it('emits an assertion_finalized refresh on standalone /api/assertion/:name/finalize', async () => {
+    // Regression test for the bug found during PR #436 devnet validation:
+    // the chained /create handler emitted memory_graph_changed for the
+    // finalize step, but the standalone /api/assertion/:name/finalize route
+    // returned the EIP-712 seal without emitting. A staking-ui or external
+    // tool composing the lifecycle by hand would silently miss the
+    // 'assertion_finalized' state transition. Fixed by mirroring the chained
+    // handler's emit pattern in the standalone route.
+    const emitMemoryGraphChanged = vi.fn();
+    const finalize = vi.fn().mockResolvedValue({
+      assertionUri: 'did:dkg:context-graph:project-a/assertion/0x0/draft',
+      merkleRoot: new Uint8Array(32),
+      authorAddress: '0x0000000000000000000000000000000000000000',
+      schemeVersion: 1,
+      chainId: 31337n,
+      kav10Address: '0x0000000000000000000000000000000000000001',
+      eip712Digest: '0x0000000000000000000000000000000000000000000000000000000000000000',
+    });
+    const ctx = createContext('/api/assertion/draft/finalize', {
+      contextGraphId: 'project-a',
+      subGraphName: 'notes',
+    }, {
+      agent: { assertion: { finalize }, resolveAgentByToken: () => undefined } as unknown as RequestContext['agent'],
+      emitMemoryGraphChanged,
+    });
+
+    await handleAssertionRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(responseBody(ctx)).toMatchObject({
+      assertionUri: expect.stringContaining('draft'),
+      schemeVersion: 1,
+    });
+    expect(finalize).toHaveBeenCalledWith('project-a', 'draft', { subGraphName: 'notes' });
+    expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
+      contextGraphId: 'project-a',
+      layers: ['wm'],
+      subGraphName: 'notes',
+      operation: 'assertion_finalized',
+      source: 'api',
+    });
+  });
+
   it('emits WM refresh events after assertion writes', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const write = vi.fn().mockResolvedValue(undefined);

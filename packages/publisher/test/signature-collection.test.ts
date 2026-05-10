@@ -15,12 +15,35 @@ import { DKGPublisher } from '../src/index.js';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, seedContextGraphRegistration, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { wrapPublisherForTest, buildSeal } from './_helpers/seal.js';
 
 let CONTEXT_GRAPH: string;
+let _kav10Address: string;
+let _provider: ethers.JsonRpcProvider;
+const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 const ENTITY = 'urn:test:sigcollect:entity:1';
 
 function q(s: string, p: string, o: string, g = ''): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
+}
+
+// `wrapPublisherForTest` intentionally skips `publishFromSharedMemory`
+// (the wrapper can't synthesize the SWM-selection quads from the
+// rootEntities argument alone), so explicit seals are required here.
+// The seal must be bound to the publish's effective on-chain CG id
+// (`publishContextGraphId`), not the local CG label.
+async function sealForPublishFromSWM(
+  rootEntities: string[],
+  triplesByRoot: Quad[],
+  onChainCgId: string | bigint,
+) {
+  const matched = triplesByRoot.filter((quad) => rootEntities.includes(quad.subject));
+  return buildSeal({
+    quads: matched,
+    author: _author,
+    contextGraphId: onChainCgId,
+    ctx: { provider: _provider, kav10Address: _kav10Address },
+  });
 }
 
 /**
@@ -94,6 +117,11 @@ describe('Signature Collection Protocol', () => {
     const { hubAddress } = getSharedContext();
     const provider = createProvider();
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, publisherWallet.address, ethers.parseEther('5000000'));
+    if (!_provider) _provider = provider;
+    if (!_kav10Address) {
+      const c = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+      _kav10Address = await c.getKnowledgeAssetsV10Address();
+    }
   });
 
   afterAll(async () => {
@@ -112,6 +140,10 @@ describe('Signature Collection Protocol', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
   });
 
@@ -257,6 +289,8 @@ describe('Reordered Publish Flow (replicate-then-publish)', () => {
     const cgChain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const cgId = await createTestContextGraph(cgChain);
     CONTEXT_GRAPH = String(cgId);
+    if (!_provider) _provider = provider;
+    if (!_kav10Address) _kav10Address = await cgChain.getKnowledgeAssetsV10Address();
   });
 
   afterAll(async () => {
@@ -275,6 +309,10 @@ describe('Reordered Publish Flow (replicate-then-publish)', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
   });
 
@@ -378,6 +416,11 @@ describe('Context Graph Enshrinement with Signatures', () => {
     const { hubAddress } = getSharedContext();
     const provider = createProvider();
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, publisherWallet.address, ethers.parseEther('5000000'));
+    if (!_provider) _provider = provider;
+    if (!_kav10Address) {
+      const c = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+      _kav10Address = await c.getKnowledgeAssetsV10Address();
+    }
   });
 
   afterAll(async () => {
@@ -397,6 +440,10 @@ describe('Context Graph Enshrinement with Signatures', () => {
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
+    });
 
     const cgResult = await chain.createOnChainContextGraph({
       participantIdentityIds: [1n, 2n],
@@ -407,9 +454,8 @@ describe('Context Graph Enshrinement with Signatures', () => {
   });
 
   it('publishFromSharedMemory registers batch in context graph', async () => {
-    await publisher.share(CONTEXT_GRAPH, [
-      q(ENTITY, 'http://schema.org/name', '"Context Data"'),
-    ], { publisherPeerId: 'test-peer' });
+    const swmQuads = [q(ENTITY, 'http://schema.org/name', '"Context Data"')];
+    await publisher.share(CONTEXT_GRAPH, swmQuads, { publisherPeerId: 'test-peer' });
 
     const participant = new LocalSignerPeer(2n);
 
@@ -423,6 +469,7 @@ describe('Context Graph Enshrinement with Signatures', () => {
           ethers.keccak256(ethers.toUtf8Bytes('placeholder')),
         ),
       ],
+      precomputedAttestation: await sealForPublishFromSWM([ENTITY], swmQuads, '1'),
     });
 
     // Test title claims the batch is REGISTERED in the context graph.
@@ -469,13 +516,17 @@ describe('PublishToContextGraph chain adapter method', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({
+    const _publisherRaw = new DKGPublisher({
       store,
       chain,
       eventBus,
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    const publisher = wrapPublisherForTest(_publisherRaw, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
 
     const { contextGraphId } = await chain.createOnChainContextGraph({
@@ -507,6 +558,11 @@ describe('Regression: sorted and deduplicated participant signatures', () => {
     const { hubAddress } = getSharedContext();
     const provider = createProvider();
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, publisherWallet.address, ethers.parseEther('5000000'));
+    if (!_provider) _provider = provider;
+    if (!_kav10Address) {
+      const c = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+      _kav10Address = await c.getKnowledgeAssetsV10Address();
+    }
   });
 
   afterAll(async () => {
@@ -526,6 +582,10 @@ describe('Regression: sorted and deduplicated participant signatures', () => {
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
+    });
     const cgResult = await chain.createOnChainContextGraph({
       participantIdentityIds: [1n, 3n, 5n],
       requiredSignatures: 1,
@@ -535,9 +595,8 @@ describe('Regression: sorted and deduplicated participant signatures', () => {
   });
 
   it('participant sigs are sorted by identityId before chain call (prevents contract revert)', async () => {
-    await publisher.share(CONTEXT_GRAPH, [
-      q('urn:test:sort:1', 'http://schema.org/name', '"SortTest"'),
-    ], { publisherPeerId: 'test-peer' });
+    const swmQuads = [q('urn:test:sort:1', 'http://schema.org/name', '"SortTest"')];
+    await publisher.share(CONTEXT_GRAPH, swmQuads, { publisherPeerId: 'test-peer' });
 
     const peer5 = new LocalSignerPeer(5n);
     const peer1 = new LocalSignerPeer(1n);
@@ -554,6 +613,7 @@ describe('Regression: sorted and deduplicated participant signatures', () => {
     }, {
       publishContextGraphId: '1',
       contextGraphSignatures: sigs,
+      precomputedAttestation: await sealForPublishFromSWM(['urn:test:sort:1'], swmQuads, '1'),
     });
 
     // Title guarantees "prevents contract revert" — `toBeDefined` was
@@ -569,9 +629,8 @@ describe('Regression: sorted and deduplicated participant signatures', () => {
   });
 
   it('duplicate identityId participant sigs are removed (prevents contract revert)', async () => {
-    await publisher.share(CONTEXT_GRAPH, [
-      q('urn:test:dedup:1', 'http://schema.org/name', '"DedupTest"'),
-    ], { publisherPeerId: 'test-peer' });
+    const swmQuads = [q('urn:test:dedup:1', 'http://schema.org/name', '"DedupTest"')];
+    await publisher.share(CONTEXT_GRAPH, swmQuads, { publisherPeerId: 'test-peer' });
 
     const peer = new LocalSignerPeer(3n);
     const root = ethers.keccak256(ethers.toUtf8Bytes('dedup-test'));
@@ -583,6 +642,7 @@ describe('Regression: sorted and deduplicated participant signatures', () => {
     }, {
       publishContextGraphId: '1',
       contextGraphSignatures: sigs,
+      precomputedAttestation: await sealForPublishFromSWM(['urn:test:dedup:1'], swmQuads, '1'),
     });
 
     // Title guarantees "prevents contract revert". A green
@@ -622,13 +682,17 @@ describe('Regression: complete publish result fields', () => {
     const eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
-    const publisher = new DKGPublisher({
+    const _publisherRaw = new DKGPublisher({
       store,
       chain,
       eventBus,
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    const publisher = wrapPublisherForTest(_publisherRaw, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
 
     const result = await publisher.publish({
@@ -666,13 +730,17 @@ describe('Regression: fail-fast when chain rejects', () => {
     const eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
 
-    const publisher = new DKGPublisher({
+    const _pubExtra1 = new DKGPublisher({
       store,
       chain,
       eventBus,
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.EXTRA1,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    const publisher = wrapPublisherForTest(_pubExtra1, {
+      author: new ethers.Wallet(HARDHAT_KEYS.EXTRA1),
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
 
     const result = await publisher.publish({
@@ -691,13 +759,17 @@ describe('Regression: fail-fast when chain rejects', () => {
     const eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
 
-    const publisher = new DKGPublisher({
+    const _pubExtra2 = new DKGPublisher({
       store,
       chain,
       eventBus,
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.EXTRA2,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    const publisher = wrapPublisherForTest(_pubExtra2, {
+      author: new ethers.Wallet(HARDHAT_KEYS.EXTRA2),
+      ctx: { provider: _provider, kav10Address: _kav10Address },
     });
 
     await publisher.publish({

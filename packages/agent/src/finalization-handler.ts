@@ -94,7 +94,7 @@ export class FinalizationHandler {
 
         if (merkleMatch) {
           const batchId = protoToBigInt(msg.batchId);
-          const verified = await this.verifyOnChain(
+          const { verified, authorAddress } = await this.verifyOnChain(
             msg.txHash, blockNumber, msg.kcMerkleRoot,
             msg.publisherAddress, startKAId, endKAId, ctx, ctxGraphId, batchId,
           );
@@ -104,6 +104,7 @@ export class FinalizationHandler {
               contextGraphId, sharedMemoryQuads, msg.ual, msg.rootEntities,
               msg.publisherAddress, msg.txHash, blockNumber, startKAId, endKAId,
               protoToBigInt(msg.batchId), ctx, ctxGraphId, subGraphName,
+              authorAddress,
             );
             this.markProcessed(dedupeKey);
             this.log.info(ctx, `Finalization: promoted SWM snapshot to ${ctxGraphId ? `context graph ${ctxGraphId}` : 'canonical'} for ${msg.ual} (tx=${msg.txHash.slice(0, 10)}…)`);
@@ -249,9 +250,9 @@ export class FinalizationHandler {
     ctx: OperationContext,
     ctxGraphId?: string,
     expectedBatchId?: bigint,
-  ): Promise<boolean> {
-    if (!this.chain || this.chain.chainId === 'none') return false;
-    if (blockNumber <= 0) return false;
+  ): Promise<{ verified: boolean; authorAddress?: string }> {
+    if (!this.chain || this.chain.chainId === 'none') return { verified: false };
+    if (blockNumber <= 0) return { verified: false };
 
     try {
       // Verify KnowledgeBatchCreated or KCCreated (V10) at the specific block
@@ -262,6 +263,12 @@ export class FinalizationHandler {
       };
 
       let batchVerified = false;
+      // Round 5 review §10 — capture the indexed `author` from the matched
+      // KCCreated event so the caller can populate `dkg:Publication` /
+      // `dkg:authoredBy` provenance on the replica side, mirroring the
+      // originator. `address(0)` here is the unattributed-publish sentinel
+      // (RFC-001 §3.6) and is correctly preserved.
+      let authorAddress: string | undefined;
       for await (const event of this.chain.listenForEvents(batchFilter)) {
         if (event.blockNumber !== blockNumber) continue;
         if (txHash && (!event.data['txHash'] || (event.data['txHash'] as string).toLowerCase() !== txHash.toLowerCase())) {
@@ -279,18 +286,23 @@ export class FinalizationHandler {
         const publisherMatch = eventPublisher.toLowerCase() === expectedPublisher.toLowerCase();
         const rangeMatch = eventStartKAId === expectedStartKAId && eventEndKAId === expectedEndKAId;
 
-        if (merkleMatch && publisherMatch && rangeMatch) { batchVerified = true; break; }
+        if (merkleMatch && publisherMatch && rangeMatch) {
+          batchVerified = true;
+          const eventAuthor = (event.data['author'] as string) ?? '';
+          if (eventAuthor) authorAddress = eventAuthor;
+          break;
+        }
       }
 
-      if (!batchVerified) return false;
+      if (!batchVerified) return { verified: false };
 
-      // V10 publishDirect registers the KC to the context graph internally
+      // V10 publish registers the KC to the context graph internally
       // (no separate addBatchToContextGraph tx / ContextGraphExpanded event).
       // Skip the legacy ContextGraphExpanded check — the batch verification
       // above is sufficient for V10.
       if (ctxGraphId) {
         if (typeof this.chain.isV10Ready === 'function' && this.chain.isV10Ready()) {
-          return true;
+          return { verified: true, authorAddress };
         }
         try {
           const scanWindow = 256;
@@ -305,19 +317,21 @@ export class FinalizationHandler {
           for await (const event of this.chain.listenForEvents(cgFilter)) {
             const eventCGId = String(event.data['contextGraphId'] ?? '');
             const eventBatchId = BigInt(event.data['batchId'] as string ?? '0');
-            if (eventCGId === ctxGraphId && (expectedBatchId === undefined || eventBatchId === expectedBatchId)) return true;
+            if (eventCGId === ctxGraphId && (expectedBatchId === undefined || eventBatchId === expectedBatchId)) {
+              return { verified: true, authorAddress };
+            }
           }
-          return false;
+          return { verified: false };
         } catch {
-          return true;
+          return { verified: true, authorAddress };
         }
       }
 
-      return true;
+      return { verified: true, authorAddress };
     } catch (err) {
       this.log.info(ctx, `Finalization on-chain verification pending (RPC may be lagging): ${err instanceof Error ? err.message : String(err)}`);
     }
-    return false;
+    return { verified: false };
   }
 
   private async promoteSharedMemoryToCanonical(
@@ -334,6 +348,15 @@ export class FinalizationHandler {
     ctx: OperationContext,
     ctxGraphId?: string,
     subGraphName?: string,
+    /**
+     * EIP-712-attested author recovered from `KnowledgeCollectionCreated.author`.
+     * Round 5 review §10 — when set, the replica emits matching
+     * `dkg:Publication` / `dkg:authoredBy` triples so agent-provenance via the
+     * `_meta` triplestore is consistent across the originator and every replica.
+     * `address(0)` and missing/empty values are skipped (preserves the
+     * unattributed-publish path's no-author behaviour from RFC-001 §3.6).
+     */
+    authorAddress?: string,
   ): Promise<void> {
     const graphManager = new GraphManager(this.store);
     await graphManager.ensureContextGraph(contextGraphId);
@@ -425,6 +448,26 @@ export class FinalizationHandler {
     }
 
     const wsPeerId = await this.getPublisherPeerIdFromMeta(contextGraphId, msgRootEntities, subGraphName);
+    // Round 5 review §10 — propagate the on-chain-attested author into the
+    // confirmed `_meta` block so replicas emit `dkg:Publication` /
+    // `dkg:authoredBy` triples matching the originator's. We treat
+    // `address(0)` (the unattributed-publish sentinel) as "no author" by
+    // skipping the field; the dkg:Publication block in
+    // `generateKCMetadata` only fires when both `authorAddress` and
+    // `publishOperationId` are present, so the legacy no-author behaviour
+    // is preserved verbatim.
+    //
+    // `publishOperationId`: replicas don't have access to the originator's
+    // session-scoped publish-operation-id (that's a publisher-internal
+    // identifier). Use the canonical, content-addressable `txHash` instead —
+    // every node observing the chain converges on the same publication URI
+    // (`urn:dkg:publication:<txHash>`), even when the originator's URI
+    // (`urn:dkg:publication:<sessionId>-<seq>`) is different. SPARQL
+    // queries that select on `dkg:authoredBy` work either way; cross-node
+    // URI fragmentation is the documented trade-off.
+    const isUnattributed = !authorAddress
+      || authorAddress === '0x0000000000000000000000000000000000000000'
+      || authorAddress.toLowerCase() === '0x0000000000000000000000000000000000000000';
     const kcMeta: KCMetadata = {
       ual,
       contextGraphId,
@@ -433,6 +476,9 @@ export class FinalizationHandler {
       publisherPeerId: wsPeerId || publisherAddress,
       timestamp: new Date(),
       subGraphName,
+      ...(isUnattributed
+        ? {}
+        : { authorAddress, publishOperationId: txHash }),
     };
 
     let blockTimestamp = Math.floor(Date.now() / 1000);

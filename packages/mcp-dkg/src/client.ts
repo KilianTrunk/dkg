@@ -556,11 +556,17 @@ export class DkgClient {
   }
 
   /**
-   * Two-call publish helper: write quads into Shared Working Memory, then
-   * publish the entire SWM and clear it. Use for the "I have fresh quads,
-   * publish them now" case. For the canonical step-wise flow
-   * (`assertion_create + write + promote` then `shared_memory_publish`),
-   * use those tools directly.
+   * One-shot publish helper: route through the new assertion
+   * lifecycle (RFC-001 §9.x) — create a fresh assertion with an
+   * auto-generated name, write the supplied quads, finalize (which
+   * computes the merkle root and signs the EIP-712 AuthorAttestation
+   * stored in `_meta`), promote into SWM, then publish to the
+   * verified-memory chain. The publisher forwards the seal verbatim
+   * and never re-signs.
+   *
+   * For step-wise control (long-running stage, late finalize, etc.)
+   * use the `assertion_create` / `assertion_finalize` /
+   * `shared_memory_publish` tools directly.
    *
    * Mirrors `packages/adapter-openclaw/src/dkg-client.ts:635-652`.
    */
@@ -568,15 +574,37 @@ export class DkgClient {
     contextGraphId: string;
     quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>;
   }): Promise<Record<string, unknown>> {
-    await this.request('POST', '/api/shared-memory/write', {
-      contextGraphId: args.contextGraphId,
-      quads: args.quads,
-    });
-    return this.request('POST', '/api/shared-memory/publish', {
-      contextGraphId: args.contextGraphId,
-      selection: 'all',
-      clearAfter: true,
-    });
+    const assertionName = `mcp-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const quadsWithGraph = args.quads.map((q) => ({
+      subject: q.subject,
+      predicate: q.predicate,
+      object: q.object,
+      graph: q.graph ?? `did:dkg:context-graph:${args.contextGraphId}`,
+    }));
+    const created = await this.request<{ assertionUri?: string; seal?: Record<string, unknown> }>(
+      'POST',
+      '/api/assertion/create',
+      {
+        contextGraphId: args.contextGraphId,
+        name: assertionName,
+        quads: quadsWithGraph,
+        finalize: true,
+        promote: true,
+      },
+    );
+    const published = await this.request<Record<string, unknown>>(
+      'POST',
+      '/api/shared-memory/publish',
+      {
+        contextGraphId: args.contextGraphId,
+        assertionName,
+      },
+    );
+    return {
+      ...published,
+      ...(created.assertionUri ? { assertionUri: created.assertionUri } : {}),
+      ...(created.seal ? { seal: created.seal } : {}),
+    };
   }
 
   /**

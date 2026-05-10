@@ -880,6 +880,7 @@ describe('@unit RandomSampling', () => {
         opSigner,
       ).createKnowledgeCollection(
         opSigner.address, // publisher
+        ethers.ZeroAddress, // author — Phase 10 fixture predates author attestation
         'phase-10-test-op',
         ethers.keccak256(
           ethers.toUtf8Bytes(

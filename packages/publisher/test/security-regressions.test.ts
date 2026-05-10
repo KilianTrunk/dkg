@@ -19,8 +19,19 @@ import {
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { wrapPublisherForTest } from './_helpers/seal.js';
 
 let CONTEXT_GRAPH: string;
+let _kav10Address: string;
+let _provider: ethers.JsonRpcProvider;
+const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+
+function makeTestPublisher(opts: ConstructorParameters<typeof DKGPublisher>[0]): DKGPublisher {
+  return wrapPublisherForTest(new DKGPublisher(opts), {
+    author: _author,
+    ctx: { provider: _provider, kav10Address: _kav10Address },
+  });
+}
 let DATA_GRAPH: string;
 let WORKSPACE_GRAPH: string;
 let WORKSPACE_META_GRAPH: string;
@@ -62,6 +73,8 @@ beforeAll(async () => {
   DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
   WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
   WORKSPACE_META_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory_meta`;
+  _provider = provider;
+  _kav10Address = await chain.getKnowledgeAssetsV10Address();
 });
 afterAll(async () => {
   await revertSnapshot(_fileSnapshot);
@@ -80,7 +93,7 @@ describe('Prefix deletion safety', () => {
       store = new OxigraphStore();
       const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
       const keypair = await generateEd25519Keypair();
-      publisher = new DKGPublisher({
+      publisher = makeTestPublisher({
         store, chain, eventBus: new TypedEventBus(), keypair,
         publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
         publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -192,7 +205,7 @@ describe('Prefix deletion safety', () => {
       const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
       const keypair = await generateEd25519Keypair();
       const eventBus = new TypedEventBus();
-      publisher = new DKGPublisher({
+      publisher = makeTestPublisher({
         store, chain, eventBus, keypair,
         publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
         publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -254,7 +267,7 @@ describe('Workspace metadata precision', () => {
     store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
-    publisher = new DKGPublisher({
+    publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -429,7 +442,7 @@ describe('EVMChainAdapter.verifyKAUpdate', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const store = new OxigraphStore();
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -464,7 +477,7 @@ describe('EVMChainAdapter.verifyKAUpdate', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const store = new OxigraphStore();
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -490,7 +503,7 @@ describe('EVMChainAdapter.verifyKAUpdate', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const store = new OxigraphStore();
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -530,7 +543,7 @@ describe('Same-block ordering', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
     const eventBus = new TypedEventBus();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -595,7 +608,7 @@ describe('Same-block ordering', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
     const eventBus = new TypedEventBus();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -653,7 +666,7 @@ describe('publisher.update() atomicity', () => {
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -698,7 +711,7 @@ describe('EVMChainAdapter.verifyKAUpdate txIndex', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const store = new OxigraphStore();
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -809,7 +822,7 @@ describe('Cross-contextGraph binding (trusted source)', () => {
     const eventBus = new TypedEventBus();
     const knownBatchContextGraphs = new Map<string, string>();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -873,7 +886,7 @@ describe('Same-block txIndex ordering', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const store = new OxigraphStore();
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -915,7 +928,7 @@ describe('Same-block txIndex ordering', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
     const eventBus = new TypedEventBus();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -994,7 +1007,7 @@ describe('lookupBatchContextGraph typed-literal SPARQL', () => {
     const keypair = await generateEd25519Keypair();
     const eventBus = new TypedEventBus();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1042,7 +1055,7 @@ describe('lookupBatchContextGraph typed-literal SPARQL', () => {
     const keypair = await generateEd25519Keypair();
     const eventBus = new TypedEventBus();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1100,7 +1113,7 @@ describe('EVMChainAdapter address case normalization', () => {
     const keypair = await generateEd25519Keypair();
     const eventBus = new TypedEventBus();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1148,7 +1161,7 @@ describe('Gossip-only batch→contextGraph binding rejected', () => {
     const keypair = await generateEd25519Keypair();
     const eventBus = new TypedEventBus();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1226,7 +1239,7 @@ describe('Update provenance shape', () => {
     const keypair = await generateEd25519Keypair();
     const eventBus = new TypedEventBus();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1260,7 +1273,7 @@ describe('parseCountLiteral robustness', () => {
     const keypair = await generateEd25519Keypair();
     const eventBus = new TypedEventBus();
 
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1318,7 +1331,7 @@ describe('EVMChainAdapter publish event txHash', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const store = new OxigraphStore();
     const keypair = await generateEd25519Keypair();
-    const publisher = new DKGPublisher({
+    const publisher = makeTestPublisher({
       store, chain, eventBus: new TypedEventBus(), keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),

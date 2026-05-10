@@ -24,8 +24,19 @@ import { autoPartition } from '../src/auto-partition.js';
 import { parseSimpleNQuads } from '../src/publish-handler.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { wrapPublisherForTest } from './_helpers/seal.js';
 
 let CONTEXT_GRAPH = 'agent-skills';
+let _kav10Address: string;
+let _provider: ethers.JsonRpcProvider;
+const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+
+function makeTestPublisher(opts: ConstructorParameters<typeof DKGPublisher>[0]): DKGPublisher {
+  return wrapPublisherForTest(new DKGPublisher(opts), {
+    author: _author,
+    ctx: { provider: _provider, kav10Address: _kav10Address },
+  });
+}
 let GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
 const ENTITY = 'did:dkg:agent:QmImageBot';
 const publisherWallet = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
@@ -47,6 +58,9 @@ describe('End-to-end: Publish → Replicate → Query', () => {
     const cgId = await createTestContextGraph();
     CONTEXT_GRAPH = String(cgId);
     GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    _provider = provider;
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    _kav10Address = await chain.getKnowledgeAssetsV10Address();
   });
 
   afterAll(async () => {
@@ -88,7 +102,7 @@ describe('End-to-end: Publish → Replicate → Query', () => {
     const keypairB = await generateEd25519Keypair();
 
     // Publisher on A
-    const publisherA = new DKGPublisher({
+    const publisherA = makeTestPublisher({
       store: storeA,
       chain: chainA,
       eventBus: busA,
@@ -197,7 +211,7 @@ describe('End-to-end: Publish → Replicate → Query', () => {
     const keypairB = await generateEd25519Keypair();
 
     // Publisher on A (holds private triples)
-    const publisherA = new DKGPublisher({
+    const publisherA = makeTestPublisher({
       store: storeA,
       chain: chainA,
       eventBus: busA,

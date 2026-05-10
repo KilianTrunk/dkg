@@ -94,8 +94,10 @@ describe('ContextGraphCreated — topic0 and signature pinning [CH-6]', () => {
 
 describe('KnowledgeCollectionCreated — topic0 and signature pinning [CH-6]', () => {
   const iface = loadInterface('KnowledgeCollectionStorage');
+  // V10.1: indexed `author` (address) joins `id` as a topic so off-chain
+  // log filters can scope by author identity in a single eth_getLogs call.
   const EXPECTED_SIG =
-    'KnowledgeCollectionCreated(uint256,string,bytes32,uint88,uint40,uint40,uint96,bool)';
+    'KnowledgeCollectionCreated(uint256,address,string,bytes32,uint88,uint40,uint40,uint96,bool)';
 
   it('canonical signature matches the spec field ordering', () => {
     expect(canonicalSignature(iface, 'KnowledgeCollectionCreated')).toBe(EXPECTED_SIG);
@@ -106,22 +108,28 @@ describe('KnowledgeCollectionCreated — topic0 and signature pinning [CH-6]', (
     expect(ev!.topicHash.toLowerCase()).toBe(keccak256OfString(EXPECTED_SIG).toLowerCase());
   });
 
-  it('parseLog extracts id (indexed) + merkleRoot (non-indexed) in the right order', () => {
+  it('parseLog extracts id + author (indexed) + body fields in the right order', () => {
     const iface2 = loadInterface('KnowledgeCollectionStorage');
     const ev = iface2.getEvent('KnowledgeCollectionCreated')!;
     const { AbiCoder, zeroPadValue } = require('ethers') as typeof import('ethers');
     const coder = new AbiCoder();
     const merkleRoot = '0x' + 'ab'.repeat(32);
+    const authorAddress = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
     const nonIndexed = coder.encode(
       ['string', 'bytes32', 'uint88', 'uint40', 'uint40', 'uint96', 'bool'],
       ['op-id', merkleRoot, 1024n, 1n, 100n, 10n ** 18n, false],
     );
     const parsed = iface2.parseLog({
-      topics: [ev.topicHash, zeroPadValue('0x07', 32)],
+      topics: [
+        ev.topicHash,
+        zeroPadValue('0x07', 32),
+        zeroPadValue(authorAddress.toLowerCase(), 32),
+      ],
       data: nonIndexed,
     });
     expect(parsed).not.toBeNull();
     expect(parsed!.args.id).toBe(7n);
+    expect(String(parsed!.args.author).toLowerCase()).toBe(authorAddress.toLowerCase());
     expect(parsed!.args.merkleRoot).toBe(merkleRoot);
     expect(parsed!.args.publishOperationId).toBe('op-id');
     expect(parsed!.args.byteSize).toBe(1024n);
@@ -170,8 +178,10 @@ describe('KnowledgeAssetsMinted — topic0 and signature pinning [CH-6]', () => 
 
 describe('KnowledgeCollectionUpdated — topic0 and signature pinning [CH-6]', () => {
   const iface = loadInterface('KnowledgeCollectionStorage');
+  // V10.1: indexed `author` mirrors the publish event. Current update path
+  // emits `address(0)` (no attestation yet) but the slot is reserved.
   const EXPECTED_SIG =
-    'KnowledgeCollectionUpdated(uint256,string,bytes32,uint256,uint96)';
+    'KnowledgeCollectionUpdated(uint256,address,string,bytes32,uint256,uint96)';
 
   it('canonical signature matches the V10 update spec', () => {
     expect(canonicalSignature(iface, 'KnowledgeCollectionUpdated')).toBe(EXPECTED_SIG);

@@ -415,10 +415,30 @@ export const executeQuery = (
 ) =>
   post<{ result: any }>('/api/query', { sparql, contextGraphId, includeSharedMemory, graphSuffix, view });
 
-// --- Publish (SWM-first: write to shared memory, then publish) ---
+// --- Publish (assertion-lifecycle: RFC-001 §9.x sign-at-creation) ---
+//
+// Creates a fresh auto-named assertion, writes the supplied quads,
+// finalizes (computes the merkle root and signs the EIP-712
+// AuthorAttestation stamped into `_meta`), promotes into SWM, and
+// publishes — the publisher forwards the seal verbatim and never
+// re-signs.
 export const publishTriples = async (contextGraphId: string, quads: any[]) => {
-  await post<any>('/api/shared-memory/write', { contextGraphId, quads });
-  return post<any>('/api/shared-memory/publish', { contextGraphId, selection: 'all', clearAfter: true });
+  const assertionName = `ui-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const created = await post<{ assertionUri: string; seal?: Record<string, unknown> }>(
+    '/api/assertion/create',
+    {
+      contextGraphId,
+      name: assertionName,
+      quads,
+      finalize: true,
+      promote: true,
+    },
+  );
+  const published = await post<any>('/api/shared-memory/publish', {
+    contextGraphId,
+    assertionName,
+  });
+  return { ...published, assertionUri: created.assertionUri, ...(created.seal ? { seal: created.seal } : {}) };
 };
 
 export const writeSharedMemory = (

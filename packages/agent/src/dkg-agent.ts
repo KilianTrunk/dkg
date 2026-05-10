@@ -16,8 +16,11 @@ import {
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
   encodeFinalizationMessage, type FinalizationMessageMsg,
   getGenesisQuads, computeNetworkId, SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY,
-  Logger, createOperationContext, sparqlString, escapeSparqlLiteral,
+  Logger, createOperationContext, sparqlString, escapeSparqlLiteral, isSafeIri,
   TrustLevel,
+  buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1,
+  buildAssertionSealQuads, buildAssertionPublishReceiptQuads,
+  parseAssertionSealQuads, type AssertionSeal,
   type DKGNodeConfig, type OperationContext, type GetView, type AssertionDescriptor, type AssertionEvent, type AssertionState,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad } from '@origintrail-official/dkg-storage';
@@ -27,9 +30,9 @@ import {
   PublishJournal, StaleWriteError,
   ACKCollector, StorageACKHandler,
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
-  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
+  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
   TripleStoreAsyncLiftPublisher,
-  type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
+  type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
@@ -40,6 +43,25 @@ import {
   type QueryRequest, type QueryResponse, type QueryAccessConfig, type LookupType,
 } from '@origintrail-official/dkg-query';
 import { DKGAgentWallet, type AgentWallet } from './agent-wallet.js';
+
+/**
+ * Pre-signed AuthorAttestation payload supplied at finalize-time by
+ * self-sovereign agents whose private key isn't held by the daemon.
+ * Compact ECDSA `(r, vs)` over the EIP-712 typed data
+ * `buildAuthorAttestationTypedData({ chainId, kav10Address,
+ * contextGraphId, merkleRoot, authorAddress: address })`. The agent
+ * verifies the recovered signer matches `address` before stamping the
+ * seal.
+ *
+ * Lives at the agent layer (rather than as a publisher
+ * `PublishOptions` field) since RFC-001 §9.x — Phase C — the
+ * publisher only accepts already-sealed `precomputedAttestation`
+ * payloads. Pre-signed signing is a finalize-time concern.
+ */
+type PreSignedAuthorAttestation = {
+  address: string;
+  signature: { r: Uint8Array; vs: Uint8Array };
+};
 import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
 import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler } from './messaging.js';
@@ -269,6 +291,28 @@ const GOSSIP_DIAL_TIMEOUT_MS = 10_000;
  * (each of which fires its own connection:open).
  */
 const CATCHUP_ON_CONNECT_COOLDOWN_MS = 60_000;
+/**
+ * Period of the sync reconciler tick. The reconciler is the safety net
+ * for the event-driven `peer:update` retry path: if libp2p drops a
+ * `peer:update` event (in-process race, version bug, listener thrown),
+ * or if a peer's protocol list changes via a transport we don't get
+ * notified about, the reconciler eventually re-probes and re-syncs.
+ *
+ * Worst-case sync staleness for a connected peer is ~ this interval.
+ * 5 minutes balances "catch missed events quickly enough that RS
+ * proofs don't drift" against "don't pin the event loop with chatty
+ * sync probes". See the dkg-agent design notes around
+ * `startSyncReconciler` for the trade-off.
+ */
+const SYNC_RECONCILER_INTERVAL_MS = 5 * 60_000;
+/**
+ * A peer is considered "stale" — eligible for a reconciler-driven sync
+ * retry — if no successful sync has completed for it within this window.
+ * Set higher than `SYNC_RECONCILER_INTERVAL_MS` so a single missed
+ * tick doesn't immediately retry every connected peer; that gives
+ * the event-driven path time to win the race in the common case.
+ */
+const SYNC_STALENESS_THRESHOLD_MS = 10 * 60_000;
 const RANDOM_SAMPLING_BIND_RETRY_MS = 30_000;
 const STORAGE_ACK_REGISTRATION_RETRY_MS = 30_000;
 
@@ -716,6 +760,30 @@ export class DKGAgent {
    * direct + relayed connections within a short window.
    */
   private readonly catchupOnConnectAt = new Map<string, number>();
+  /**
+   * Peers whose most recent sync attempt found that their advertised
+   * protocol list did NOT include `PROTOCOL_SYNC` — almost always a
+   * libp2p identify race on the inbound side of `connection:open`,
+   * not a real "this peer doesn't speak sync" answer. The `peer:update`
+   * listener drains entries from this set the moment libp2p reports
+   * an updated protocol list that contains `PROTOCOL_SYNC`, and the
+   * periodic reconciler treats membership as a strong hint to retry.
+   *
+   * Entries are also cleared on `connection:close` (no path to the peer
+   * anyway — the next `connection:open` will re-trigger sync-on-connect)
+   * and after a successful sync (see `lastSuccessfulSyncAt`).
+   */
+  private readonly skippedNoSyncPeers = new Set<string>();
+  /**
+   * Per-peer timestamp of the most recent successful run of sync-on-connect.
+   * Driven by `runSyncOnConnect.onPeerSynced`. Used by the periodic
+   * reconciler to skip peers that have already synced recently — the
+   * staleness threshold is intentionally larger than the reconciler
+   * interval so a single missed tick doesn't immediately retry every
+   * connected peer.
+   */
+  private readonly lastSuccessfulSyncAt = new Map<string, number>();
+  private syncReconcilerTimer: ReturnType<typeof setInterval> | null = null;
   /**
    * v10-rc sync-refactor: per-(peer+CG) checkpoint offsets so the paged
    * sync requester in `sync/requester/page-fetch.ts` can resume where it
@@ -1532,6 +1600,15 @@ export class DKGAgent {
     // fires. `connection:close` fires per connection, so we only forget
     // the timestamp once no live connection to the peer remains. Codex
     // tier-4i finding at packages/agent/src/dkg-agent.ts:1105.
+    //
+    // We also drop the peer from `skippedNoSyncPeers` and forget its
+    // `lastSuccessfulSyncAt` here. The next `connection:open` will
+    // re-trigger sync-on-connect from scratch, so keeping stale entries
+    // would only cause memory leaks across long-lived nodes that see
+    // many transient peers. Note: a brief disconnect+reconnect of the
+    // SAME peer ID still benefits — the new sync-on-connect run will
+    // either succeed (and re-stamp `lastSuccessfulSyncAt`) or get
+    // re-added to `skippedNoSyncPeers` for the event/reconciler retry.
     this.node.libp2p.addEventListener('connection:close', (evt) => {
       const remotePeer = evt.detail.remotePeer.toString();
       if (remotePeer === this.node.libp2p.peerId.toString()) return;
@@ -1540,6 +1617,25 @@ export class DKGAgent {
         .some((p) => p.toString() === remotePeer);
       if (stillConnected) return;
       this.catchupOnConnectAt.delete(remotePeer);
+      this.skippedNoSyncPeers.delete(remotePeer);
+      this.lastSuccessfulSyncAt.delete(remotePeer);
+    });
+
+    // Event-driven sync-retry: libp2p emits `peer:update` whenever a
+    // peer record changes — including (and most importantly) when
+    // identify completes and populates the protocol list for the first
+    // time. The inbound side of `connection:open` reliably loses this
+    // race in practice (the event fires on TCP accept, before identify
+    // has been processed), so without this listener a node that mostly
+    // accepts inbound dials — typically the relay node 1 in our devnet
+    // topology — would never sync from any peer beyond the bootstrap
+    // window. See `handlePeerUpdateForSyncRetry` for the dedup logic.
+    this.node.libp2p.addEventListener('peer:update', (evt) => {
+      const detail = evt.detail as { peer?: { id?: { toString(): string }; protocols?: readonly string[] } };
+      const peerIdObj = detail?.peer?.id;
+      if (!peerIdObj) return;
+      const protocols = detail.peer?.protocols ?? [];
+      this.handlePeerUpdateForSyncRetry(peerIdObj.toString(), protocols);
     });
 
     // Reconnect-on-gossip: when a gossip message arrives from a peer we're
@@ -1578,6 +1674,19 @@ export class DKGAgent {
       }, SWM_CLEANUP_INTERVAL_MS);
       if (this.swmCleanupTimer.unref) this.swmCleanupTimer.unref();
     }
+
+    // Start the periodic sync reconciler — the safety net for the
+    // event-driven `peer:update` retry path. See the constants block at
+    // the top of this file (`SYNC_RECONCILER_INTERVAL_MS`,
+    // `SYNC_STALENESS_THRESHOLD_MS`) and `reconcileSyncFromConnectedPeers`
+    // for the full design rationale.
+    this.syncReconcilerTimer = setInterval(() => {
+      this.reconcileSyncFromConnectedPeers().catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Sync reconciler tick failed: ${message}`);
+      });
+    }, SYNC_RECONCILER_INTERVAL_MS);
+    if (this.syncReconcilerTimer.unref) this.syncReconcilerTimer.unref();
 
     // Wire V10 Random Sampling prover. Edge nodes no-op. Core nodes with
     // transient identity/RPC startup failures retry in the background so
@@ -1718,7 +1827,78 @@ export class DKGAgent {
       discoverContextGraphsFromStore: () => this.discoverContextGraphsFromStore(),
       syncSharedMemoryFromPeer: (peerId, contextGraphIds) => this.syncSharedMemoryFromPeer(peerId, contextGraphIds),
       logInfo: (ctx, message) => this.log.info(ctx, message),
+      onPeerSkippedNoSync: (peerId) => {
+        this.skippedNoSyncPeers.add(peerId);
+      },
+      onPeerSynced: (peerId) => {
+        this.lastSuccessfulSyncAt.set(peerId, Date.now());
+        this.skippedNoSyncPeers.delete(peerId);
+      },
     });
+  }
+
+  /**
+   * Event-driven retry path for the libp2p identify race that otherwise
+   * leaves a peer permanently in `skippedNoSyncPeers`. libp2p emits
+   * `peer:update` whenever a peer record changes — most importantly when
+   * identify completes and the protocol list gets populated for the
+   * first time. If the new list now contains `PROTOCOL_SYNC` and we
+   * previously skipped this peer for that exact reason, fire one
+   * `trySyncFromPeer` immediately.
+   *
+   * Pairs with {@link reconcileSyncFromConnectedPeers}: the listener
+   * handles the common case in <1s (libp2p delivers identify quickly
+   * once it arrives), and the periodic reconciler is the safety net for
+   * delivery failures of this event itself.
+   */
+  private handlePeerUpdateForSyncRetry(peerId: string, protocols: readonly string[]): void {
+    if (peerId === this.node.libp2p.peerId.toString()) return;
+    if (!this.skippedNoSyncPeers.has(peerId)) return;
+    if (!protocols.includes(PROTOCOL_SYNC)) return;
+    this.skippedNoSyncPeers.delete(peerId);
+    const ctx = createOperationContext('sync');
+    const shortPeer = peerId.slice(-8);
+    this.log.info(ctx, `Peer ${shortPeer} now advertises sync protocol — retrying sync-on-connect`);
+    setTimeout(() => {
+      this.trySyncFromPeer(peerId).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Sync retry after peer:update failed for ${shortPeer}: ${message}`);
+      });
+    }, 0);
+  }
+
+  /**
+   * Periodic reconciler for sync-on-connect. Walks every currently
+   * connected peer and retries `trySyncFromPeer` for any that either:
+   *
+   *   - is in {@link skippedNoSyncPeers} and now advertises `PROTOCOL_SYNC`
+   *     (covers the case where the `peer:update` listener missed the
+   *     event for whatever reason), or
+   *   - has no `lastSuccessfulSyncAt` entry, or whose entry is older
+   *     than {@link SYNC_STALENESS_THRESHOLD_MS} (covers slow identify,
+   *     transport-level reconnects that didn't fire connection:open,
+   *     and any future failure mode of the event-driven path).
+   *
+   * Designed to be safe to call concurrently with the event-driven path
+   * — `runSyncOnConnect` itself is idempotent via `syncingPeers`.
+   */
+  private async reconcileSyncFromConnectedPeers(): Promise<void> {
+    if (!this.started) return;
+    const now = Date.now();
+    const ctx = createOperationContext('sync');
+    for (const pid of this.node.libp2p.getPeers()) {
+      const peerId = pid.toString();
+      if (this.syncingPeers.has(peerId)) continue;
+      const lastOk = this.lastSuccessfulSyncAt.get(peerId);
+      const stale = lastOk == null || (now - lastOk) >= SYNC_STALENESS_THRESHOLD_MS;
+      if (!stale) continue;
+      const shortPeer = peerId.slice(-8);
+      this.log.info(ctx, `Sync reconciler retrying ${shortPeer} (last success: ${lastOk == null ? 'never' : `${Math.round((now - lastOk) / 1000)}s ago`})`);
+      this.trySyncFromPeer(peerId).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Sync reconciler retry failed for ${shortPeer}: ${message}`);
+      });
+    }
   }
 
   /**
@@ -2745,6 +2925,35 @@ export class DKGAgent {
   }
 
   /**
+   * Look up the custodial private key for a registered agent.
+   *
+   * Returns the hex-encoded private key for `mode === 'custodial'` agents
+   * (the daemon generated and persisted the keypair at registration). Returns
+   * `undefined` if the agent is unknown to this node, is `'self-sovereign'`
+   * (the node never had the key), or does not have a `privateKey` field set
+   * for any reason.
+   *
+   * Used by `publishFromSharedMemory` to resolve a per-publish author signer
+   * without exposing the entire `AgentKeyRecord` (which would leak the auth
+   * token hash and other off-axis material). Phase 4 / RFC-001 §4(b).
+   *
+   * @param address Ethereum address of the registered agent.
+   */
+  getCustodialAgentPrivateKey(address: string): string | undefined {
+    const record = this.localAgents.get(address);
+    if (!record || record.mode !== 'custodial') return undefined;
+    return record.privateKey;
+  }
+
+  /**
+   * Look up the registration mode for a known local agent.
+   * Returns undefined if the agent is unknown to this node.
+   */
+  getLocalAgentMode(address: string): 'custodial' | 'self-sovereign' | undefined {
+    return this.localAgents.get(address)?.mode;
+  }
+
+  /**
    * Get the default agent address for this node.
    * Used when requests come in with a node-level token.
    */
@@ -3040,6 +3249,97 @@ export class DKGAgent {
       if (owner === `did:dkg:agent:${addr}`) return true;
     }
     return false;
+  }
+
+  /**
+   * Chain-confirmed verified author identity for a knowledge collection's
+   * latest merkle-root entry. Reads
+   * `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId)` via the
+   * configured chain adapter.
+   *
+   * Returns:
+   *   - the address recovered from the EIP-712 author attestation (EOA
+   *     publish path), or
+   *   - the smart-contract author address verified via EIP-1271 for
+   *     contract-based author identities, or
+   *   - `address(0)` for legacy V8 / V9 publishes and current V10.1
+   *     update-path mutations (which don't sign).
+   *
+   * Returns `null` when the chain adapter doesn't expose the view (no-chain
+   * mode or pre-V10.1 evm-adapter copies). Callers that need to distinguish
+   * "no attestation on file" from "feature unavailable" should use this
+   * `null` signal — `address(0)` always means the former.
+   */
+  async getKnowledgeCollectionAuthor(kcId: bigint): Promise<string | null> {
+    if (typeof this.chain.getLatestMerkleRootAuthor !== 'function') return null;
+    return this.chain.getLatestMerkleRootAuthor(kcId);
+  }
+
+  /**
+   * Publishing Conviction Account (PCA) facade for the agent-provenance
+   * runbook surface. These methods are thin wrappers over the chain adapter
+   * — the agent doesn't keep PCA state of its own; the on-chain
+   * `PublishingConvictionAccount` is the source of truth. The wrappers
+   * exist so daemon HTTP routes don't need to reach into the private
+   * `chain` field, mirroring the `getKnowledgeCollectionAuthor` pattern.
+   *
+   * `createPublishingConvictionAccount`: tx is signed by the agent's
+   * configured EOA; that EOA becomes the PCA `admin` and is automatically
+   * added to its own `authorizedKeys` set. Operators driving the runbook
+   * from a core node use this to stand up the PCA before mode (a)/(b).
+   *
+   * `addPCAAuthorizedKey` and `isPCAAuthorizedKey` are admin-gated on chain
+   * (`require(msg.sender == account.admin)`), so the daemon must be running
+   * as the PCA admin EOA for `addPCAAuthorizedKey` to succeed. Read-side
+   * `isPCAAuthorizedKey` is permissionless on chain and works from any node.
+   */
+  async createPublishingConvictionAccount(
+    amount: bigint,
+    lockEpochs: number,
+  ): Promise<{ accountId: bigint; txHash: string; blockNumber: number } | null> {
+    if (typeof this.chain.createConvictionAccount !== 'function') return null;
+    const result = await this.chain.createConvictionAccount(amount, lockEpochs);
+    return {
+      accountId: result.accountId,
+      txHash: result.hash,
+      blockNumber: result.blockNumber,
+    };
+  }
+
+  async addPublishingConvictionAccountFunds(
+    accountId: bigint,
+    amount: bigint,
+  ): Promise<{ txHash: string; blockNumber: number } | null> {
+    if (typeof this.chain.addConvictionFunds !== 'function') return null;
+    const result = await this.chain.addConvictionFunds(accountId, amount);
+    return { txHash: result.hash, blockNumber: result.blockNumber };
+  }
+
+  async addPCAAuthorizedKey(
+    accountId: bigint,
+    key: string,
+  ): Promise<{ txHash: string; blockNumber: number } | null> {
+    if (typeof this.chain.addPCAAuthorizedKey !== 'function') return null;
+    const result = await this.chain.addPCAAuthorizedKey(accountId, key);
+    return { txHash: result.hash, blockNumber: result.blockNumber };
+  }
+
+  async isPCAAuthorizedKey(accountId: bigint, key: string): Promise<boolean | null> {
+    if (typeof this.chain.isPCAAuthorizedKey !== 'function') return null;
+    return this.chain.isPCAAuthorizedKey(accountId, key);
+  }
+
+  async getPublishingConvictionAccountInfo(accountId: bigint): Promise<{
+    accountId: bigint;
+    admin: string;
+    balance: bigint;
+    initialDeposit: bigint;
+    lockEpochs: number;
+    conviction: bigint;
+    discountBps: number;
+  } | null> {
+    if (typeof this.chain.getConvictionAccountInfo !== 'function') return null;
+    return this.chain.getConvictionAccountInfo(accountId);
   }
 
   // ---------------------------------------------------------------------------
@@ -3499,6 +3799,48 @@ export class DKGAgent {
 
     const onChainId = await this.getContextGraphOnChainId(contextGraphId);
 
+    // RFC-001 §9.x — sign-at-creation. The publisher refuses on-chain
+    // publishes without a `precomputedAttestation`, so the agent
+    // mints one here at the publish boundary using the publisher
+    // fallback signer (legacy `agent.publish(quads)` callers don't
+    // carry author identity hints — mode (a) of Phase 4: daemon signs
+    // as itself). The seal binds (chainId, kav10Address,
+    // contextGraphId, merkleRoot, authorAddress); any drift between
+    // the agent-computed merkleRoot and the publisher's recompute
+    // surfaces as the publisher's `expectedMerkleRoot mismatch`
+    // guard. Skip when the chain isn't V10-capable or the CG isn't
+    // on-chain — the publisher will go tentative anyway.
+    let precomputedAttestation: PublishOptions['precomputedAttestation'];
+    if (
+      onChainId != null &&
+      typeof this.chain.getEvmChainId === 'function' &&
+      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+    ) {
+      try {
+        precomputedAttestation = await this._buildPrecomputedAttestationForSelection(
+          contextGraphId,
+          quads,
+          {
+            targetOnChainCgId: onChainId,
+            // Round 4 review §11 — propagate privateQuads so the
+            // pre-seal merkle includes their per-entity private roots
+            // (the publisher computes `kcMerkleRoot` over public
+            // leaves + privateRoots; without this, every V10 publish
+            // with private content silently downgrades to tentative on
+            // the publisher's `expectedMerkleRoot` guard).
+            privateQuads,
+          },
+        );
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `Inline seal mint failed; on-chain publish will fall back to tentative: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+
     const result = await this.publisher.publish({
       contextGraphId,
       quads,
@@ -3511,6 +3853,7 @@ export class DKGAgent {
       onPhase,
       v10ACKProvider,
       publishContextGraphId: onChainId ?? undefined,
+      precomputedAttestation,
     });
 
     onPhase?.('broadcast', 'start');
@@ -3622,6 +3965,791 @@ export class DKGAgent {
   }
 
   /**
+   * RFC-001 §9.x — finalize an assertion: compute merkleRoot, build the
+   * EIP-712 AuthorAttestation typed data, sign (or accept pre-signed),
+   * and write seal triples to the CG `_meta` graph keyed by the
+   * assertion URI.
+   *
+   * Implementation lives on the class (not inside the `assertion` getter
+   * closure) so that the substantial business logic — keystore lookup,
+   * EIP-712 binding, idempotency check, seal write — is independently
+   * testable and visible in stack traces.
+   *
+   * See `assertion.finalize` (the public-facing wrapper) for usage docs.
+   */
+  async assertionFinalize(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    opts?: {
+      subGraphName?: string;
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: PreSignedAuthorAttestation;
+      schemeVersion?: number;
+    },
+  ): Promise<{
+    assertionUri: string;
+    merkleRoot: Uint8Array;
+    authorAddress: string;
+    schemeVersion: number;
+    chainId: bigint;
+    kav10Address: string;
+    eip712Digest: string;
+  }> {
+    if (
+      opts?.authorAgentAddress != null &&
+      opts?.preSignedAuthorAttestation != null
+    ) {
+      throw new Error(
+        'assertionFinalize: authorAgentAddress and preSignedAuthorAttestation are mutually exclusive',
+      );
+    }
+
+    // 1. Resolve URIs.
+    const assertionUri = contextGraphAssertionUri(
+      contextGraphId,
+      agentAddress,
+      name,
+      opts?.subGraphName,
+    );
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+
+    // 2. Pull the assertion's quads. Refuse to finalize an empty
+    //    assertion — there's nothing to commit.
+    const rawQuads = await this.publisher.assertionQuery(
+      contextGraphId,
+      name,
+      agentAddress,
+      opts?.subGraphName,
+    );
+    if (rawQuads.length === 0) {
+      throw new Error(
+        `Cannot finalize assertion <${assertionUri}>: it has no quads. ` +
+          `Write at least one quad with /api/assertion/${name}/write before finalizing.`,
+      );
+    }
+
+    // 2b. Apply the same `isReservedSubject` filter that
+    //     `assertionPromote` runs at promote time. WM-only bookkeeping
+    //     rows in the `urn:dkg:file:` / `urn:dkg:extraction:` namespaces
+    //     (file descriptors, ExtractionProvenance blocks — see
+    //     `19_MARKDOWN_CONTENT_TYPE.md §10.2`) are stripped before the
+    //     assertion crosses the SWM boundary, so the seal MUST hash
+    //     the post-strip set or it commits to a root the publish path
+    //     can never recompute. (Round 4 review §8 — "assertionFinalize
+    //     hashes WM-only urn:dkg:file: rows".)
+    const quads = rawQuads.filter((q) => !isReservedSubject(q.subject));
+    if (quads.length === 0) {
+      throw new Error(
+        `Cannot finalize assertion <${assertionUri}>: every quad has a ` +
+          `reserved-namespace subject (urn:dkg:file:* / urn:dkg:extraction:*) ` +
+          `which is filtered out before SWM. Add at least one user-authored ` +
+          `quad on a non-reserved subject before finalizing.`,
+      );
+    }
+
+    // 3. Compute merkleRoot using the SAME algorithm the publisher
+    //    uses at publish-time (V10: keccak256-based merkle, sort+dedupe
+    //    leaves). Drift between these two compute paths is the silent
+    //    failure mode this whole architecture is trying to eliminate —
+    //    so we reuse the publisher's exported helpers verbatim.
+    //
+    //    Round 5 review §1 — `kaMap` may contain unsafe-IRI roots
+    //    (e.g. RFC-3987-valid IRIs with `|` `^` etc that fail
+    //    `isSafeIri`'s SPARQL-interpolation rules). Those cannot be
+    //    referenced from the SPARQL CONSTRUCT that
+    //    `publishFromFinalizedAssertion` uses to reload the
+    //    promoted-SWM payload, so they MUST NOT contribute to the
+    //    sealed merkleRoot — otherwise the seal commits to a root
+    //    the publish path can never recompute. Reject finalize
+    //    instead of silently dropping content: silent-drop hides a
+    //    real input error and would let a partial assertion ship
+    //    with a seal that doesn't cover all of its quads.
+    //    Defense-in-depth: the current oxigraph storage adapter
+    //    rejects most unsafe characters at write time, so this guard
+    //    is rarely triggered through `assertion.write`. It still
+    //    matters for non-oxigraph adapters and for code paths that
+    //    seed the WM graph directly (bulk-import / `_meta` fixtures
+    //    / future storage backends). The canonical wire pin lives
+    //    at `core/test/assertion-seal-root-entities.test.ts` —
+    //    `buildAssertionSealQuads` rejects unsafe roots at the seal
+    //    boundary. This guard surfaces the same failure earlier
+    //    with a more actionable message.
+    const kaMap = autoPartition(quads);
+    const allRootEntities = [...kaMap.keys()];
+    const unsafeRootEntities = allRootEntities.filter((r) => !isSafeIri(r));
+    if (unsafeRootEntities.length > 0) {
+      const sample = unsafeRootEntities
+        .slice(0, 3)
+        .map((r) => `<${r}>`)
+        .join(', ');
+      const more = unsafeRootEntities.length > 3 ? ` (+${unsafeRootEntities.length - 3} more)` : '';
+      throw new Error(
+        `Cannot finalize assertion <${assertionUri}>: ${unsafeRootEntities.length} root ` +
+          `entit${unsafeRootEntities.length === 1 ? 'y has' : 'ies have'} an unsafe IRI: ${sample}${more}. ` +
+          `The publish path reloads SWM via SPARQL CONSTRUCT scoped to these roots — unsafe IRIs ` +
+          `would be filtered, recomputing a different merkleRoot from the truncated payload, so the ` +
+          `sealed assertion could never be republished. Rename these subjects to safe IRIs ` +
+          `(no blank nodes, control chars, or unbalanced delimiters) before finalizing.`,
+      );
+    }
+    const allSkolemizedQuads = [...kaMap.values()].flat();
+    const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, []);
+    // 3b. Capture rootEntities from the SAME `autoPartition` call that
+    //     drives the merkle leaves. The seal binds these so
+    //     `publishFromFinalizedAssertion` can scope its SWM CONSTRUCT
+    //     instead of bundling everything currently sitting in shared
+    //     memory (Round 4 review §9). Now safe by construction — the
+    //     guard above guarantees every key passes `isSafeIri`.
+    const rootEntities = allRootEntities;
+    if (rootEntities.length === 0) {
+      throw new Error(
+        `Cannot finalize assertion <${assertionUri}>: autoPartition produced ` +
+          `no root entities. The assertion has no quads; add at least one ` +
+          `user-authored quad on a non-reserved subject before finalizing.`,
+      );
+    }
+
+    // 4. Idempotency: if a seal already exists for this assertion,
+    //    return it as-is when the merkleRoot matches. Mismatch means
+    //    the assertion was mutated since the previous finalize —
+    //    refuse to overwrite silently.
+    const existingMetaResult = await this.store.query(
+      `CONSTRUCT { <${assertionUri}> ?p ?o } WHERE { GRAPH <${metaGraph}> { <${assertionUri}> ?p ?o } }`,
+    );
+    const existingMetaQuads =
+      existingMetaResult.type === 'quads' ? existingMetaResult.quads : [];
+    let existingSeal: AssertionSeal | undefined;
+    try {
+      existingSeal = parseAssertionSealQuads(existingMetaQuads, assertionUri);
+    } catch (err) {
+      // Corrupt seal — surface to the caller. Do NOT silently overwrite
+      // because the original author's signature is still on record and
+      // overwriting would lose the audit trail.
+      throw new Error(
+        `assertionFinalize: existing _meta seal for <${assertionUri}> is corrupt: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
+    if (existingSeal) {
+      if (
+        existingSeal.merkleRoot.length !== merkleRoot.length ||
+        !existingSeal.merkleRoot.every((b, i) => b === merkleRoot[i])
+      ) {
+        throw new Error(
+          `assertionFinalize: assertion <${assertionUri}> is already finalized with a ` +
+            `different merkleRoot (existing=${ethers.hexlify(existingSeal.merkleRoot)}, ` +
+            `current=${ethers.hexlify(merkleRoot)}). Discard and re-create the assertion if ` +
+            `you intended to change its content; in-place mutation of a finalized assertion ` +
+            `breaks the author signature and is rejected.`,
+        );
+      }
+      // Seal exists and matches — return the existing record.
+      const typedData = buildAuthorAttestationTypedData({
+        chainId: existingSeal.chainId,
+        kav10Address: existingSeal.kav10Address,
+        contextGraphId: await this.requireOnChainContextGraphId(contextGraphId),
+        merkleRoot: existingSeal.merkleRoot,
+        authorAddress: existingSeal.authorAddress,
+        schemeVersion: existingSeal.authorSchemeVersion,
+      });
+      return {
+        assertionUri,
+        merkleRoot: existingSeal.merkleRoot,
+        authorAddress: existingSeal.authorAddress,
+        schemeVersion: existingSeal.authorSchemeVersion,
+        chainId: existingSeal.chainId,
+        kav10Address: existingSeal.kav10Address,
+        eip712Digest: ethers.TypedDataEncoder.hash(
+          typedData.domain,
+          typedData.types,
+          typedData.message,
+        ),
+      };
+    }
+
+    // 5. Resolve chain identity. Finalize commits to a specific
+    //    `(chainId, kav10Address)` pair — both must be available.
+    if (
+      typeof this.chain.getEvmChainId !== 'function' ||
+      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+    ) {
+      throw new Error(
+        'assertionFinalize requires a V10-capable chain adapter that exposes ' +
+          'getEvmChainId() and getKnowledgeAssetsV10Address(); the current adapter does not.',
+      );
+    }
+    const chainId = await this.chain.getEvmChainId();
+    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+
+    // 6. Resolve the on-chain CG id — the EIP-712 digest binds to it.
+    const onChainCgId = await this.requireOnChainContextGraphId(contextGraphId);
+
+    // 7. Resolve author. preSigned > custodial agent > publisher fallback.
+    const schemeVersion = opts?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
+    let authorAddress: string;
+    let signerPrivateKey: string | undefined;
+    let preSigned: PreSignedAuthorAttestation | undefined;
+    if (opts?.preSignedAuthorAttestation != null) {
+      preSigned = opts.preSignedAuthorAttestation;
+      authorAddress = preSigned.address;
+    } else if (opts?.authorAgentAddress != null) {
+      const mode = this.getLocalAgentMode(opts.authorAgentAddress);
+      if (mode === undefined) {
+        throw new Error(
+          `assertionFinalize: authorAgentAddress ${opts.authorAgentAddress} is not a registered local agent on this node`,
+        );
+      }
+      if (mode === 'self-sovereign') {
+        throw new Error(
+          `assertionFinalize: agent ${opts.authorAgentAddress} is registered as self-sovereign — ` +
+            `this node does not hold its private key. Use preSignedAuthorAttestation instead.`,
+        );
+      }
+      signerPrivateKey = this.getCustodialAgentPrivateKey(opts.authorAgentAddress);
+      if (!signerPrivateKey) {
+        throw new Error(
+          `assertionFinalize: custodial agent ${opts.authorAgentAddress} has no private key on file`,
+        );
+      }
+      authorAddress = opts.authorAgentAddress;
+    } else {
+      // Publisher-wallet fallback: use the daemon's own publisher EOA
+      // as the author. This preserves Phase 4 mode (a) — node admin
+      // signs on its own behalf when no agent attribution is supplied.
+      const fallbackAddress = await this.publisher.publisherFallbackAuthorAddress();
+      if (!fallbackAddress) {
+        throw new Error(
+          'assertionFinalize: no agent override supplied and no publisher signer is available. ' +
+            'Either supply authorAgentAddress / preSignedAuthorAttestation, or configure a publisher private key on the daemon.',
+        );
+      }
+      authorAddress = fallbackAddress;
+    }
+
+    // 8. Build EIP-712 typed data.
+    const typedData = buildAuthorAttestationTypedData({
+      chainId,
+      kav10Address,
+      contextGraphId: onChainCgId,
+      merkleRoot,
+      authorAddress,
+      schemeVersion,
+    });
+    const eip712Digest = ethers.TypedDataEncoder.hash(
+      typedData.domain,
+      typedData.types,
+      typedData.message,
+    );
+
+    // 9. Produce the compact signature (r, vs).
+    let r: Uint8Array;
+    let vs: Uint8Array;
+    if (preSigned) {
+      const sig = ethers.Signature.from({
+        r: ethers.hexlify(preSigned.signature.r),
+        yParityAndS: ethers.hexlify(preSigned.signature.vs),
+      });
+      // Off-chain seal-integrity preflight: only EOAs can be verified
+      // by ECDSA recover-and-compare. For smart-contract authors
+      // (incl. EIP-7702-delegated EOAs), the on-chain
+      // `_verifyAuthorAttestation` dispatches to
+      // `IERC1271.isValidSignature` and is the authoritative check —
+      // the off-chain ECDSA recover would (correctly) report a
+      // mismatch since 1271 wallets typically sign through an owner
+      // EOA that's distinct from the wallet contract address. Skip the
+      // off-chain check for contract authors so the seal-build pipeline
+      // doesn't reject 1271 publishes that the chain would accept.
+      const isContractAuthor =
+        typeof this.chain.hasContractCode === 'function'
+          ? await this.chain.hasContractCode(authorAddress)
+          : false;
+      if (!isContractAuthor) {
+        const recovered = ethers.recoverAddress(eip712Digest, sig);
+        if (recovered.toLowerCase() !== authorAddress.toLowerCase()) {
+          throw new Error(
+            `assertionFinalize: preSignedAuthorAttestation signer mismatch — ` +
+              `signature recovers ${recovered} but address claims ${authorAddress}.`,
+          );
+        }
+      }
+      r = preSigned.signature.r;
+      vs = preSigned.signature.vs;
+    } else if (signerPrivateKey) {
+      const wallet = new ethers.Wallet(
+        signerPrivateKey.startsWith('0x') ? signerPrivateKey : '0x' + signerPrivateKey,
+      );
+      const sigHex = await wallet.signTypedData(
+        typedData.domain,
+        typedData.types,
+        typedData.message,
+      );
+      const sig = ethers.Signature.from(sigHex);
+      r = ethers.getBytes(sig.r);
+      vs = ethers.getBytes(sig.yParityAndS);
+    } else {
+      // Publisher fallback: ask the publisher to sign with its own
+      // wallet. Returns the compact (r, vs) form.
+      const compact = await this.publisher.signAuthorAttestationAsPublisher(typedData);
+      r = compact.r;
+      vs = compact.vs;
+    }
+
+    // 10. Persist the seal as `_meta` triples.
+    const finalizedAtIso = new Date().toISOString();
+    const sealQuads = buildAssertionSealQuads({
+      assertionUri,
+      metaGraph,
+      merkleRoot,
+      authorAddress,
+      authorAttestationR: r,
+      authorAttestationVS: vs,
+      authorSchemeVersion: schemeVersion,
+      chainId,
+      kav10Address,
+      finalizedAtIso,
+      rootEntities,
+    });
+    await this.store.insert(sealQuads);
+
+    return {
+      assertionUri,
+      merkleRoot,
+      authorAddress,
+      schemeVersion,
+      chainId,
+      kav10Address,
+      eip712Digest,
+    };
+  }
+
+  /**
+   * Helper: resolve the on-chain context graph id used by the EIP-712
+   * AuthorAttestation domain. Throws when the CG is not yet
+   * registered on-chain — finalize cannot bind a sig to a missing CG.
+   */
+  private async requireOnChainContextGraphId(contextGraphId: string): Promise<bigint> {
+    const onChainId = await this.getContextGraphOnChainId(contextGraphId);
+    if (onChainId == null) {
+      throw new Error(
+        `Context graph "${contextGraphId}" is not registered on-chain. ` +
+          `Run 'dkg context-graph register ${contextGraphId}' before finalizing an assertion ` +
+          `targeted at it; finalize binds the author signature to the on-chain CG id.`,
+      );
+    }
+    try {
+      return BigInt(onChainId);
+    } catch {
+      throw new Error(
+        `Context graph "${contextGraphId}" has a non-numeric on-chain id ("${onChainId}") — ` +
+          `the EIP-712 binding requires a uint256.`,
+      );
+    }
+  }
+
+  /**
+   * RFC-001 §9.x — selection-based publish bridge.
+   *
+   * Mints a `precomputedAttestation` inline for a given quads bag,
+   * without writing seal triples to `_meta`. Used by
+   * `publishFromSharedMemory(selection)` to preserve the
+   * "agent picks rootEntities post-hoc, then publishes" UX while
+   * keeping the sign-at-creation invariant: the seal is computed and
+   * signed at the agent boundary, before the publisher gets the
+   * payload. The publisher then refuses the on-chain publish if the
+   * seal is absent or its merkleRoot doesn't match what it recomputes
+   * from the quads (defence against in-flight tampering between
+   * selection and broadcast).
+   *
+   * Author resolution mirrors `assertionFinalize`:
+   *   1. `preSignedAuthorAttestation` (self-sovereign agent's pre-sig)
+   *   2. `authorAgentAddress` (custodial agent — daemon holds the key)
+   *   3. publisher fallback (the daemon's own publisher EOA signs)
+   *
+   * Unlike `assertionFinalize`, the seal is NOT persisted: it lives
+   * only in the publish call. This is by design — selection-based
+   * publishes are inherently ephemeral curations, not long-lived
+   * named assertions. If you need persistent seal provenance, use the
+   * named-assertion lifecycle (`createAssertion` + `appendToAssertion`
+   * + `finalizeAssertion` + `publishFromFinalizedAssertion`).
+   */
+  private async _buildPrecomputedAttestationForSelection(
+    contextGraphId: string,
+    quads: Quad[],
+    opts?: {
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: PreSignedAuthorAttestation;
+      schemeVersion?: number;
+      /**
+       * On-chain CG id the seal binds to. Defaults to the source
+       * `contextGraphId`'s on-chain id; override for remap-flow
+       * publishes (`publishContextGraphId` / `subContextGraphId` set
+       * on the publish call) where the assertion lives in a different
+       * CG than the SWM source.
+       */
+      targetOnChainCgId?: bigint | string;
+      /**
+       * Private quads for the same publish. Round 4 review §11 —
+       * `DKGPublisher.publish` computes `kcMerkleRoot` over the
+       * concatenation of public quads + private roots (see
+       * `dkg-publisher.ts:1567-1575`). The seal must hash the same
+       * leaves or every V10 publish with `privateQuads` falls back to
+       * `tentative` on the publisher's `expectedMerkleRoot mismatch`
+       * guard. Pass them through so the agent's pre-seal merkle
+       * matches what the publisher will recompute.
+       */
+      privateQuads?: Quad[];
+    },
+  ): Promise<PublishOptions['precomputedAttestation']> {
+    if (
+      opts?.authorAgentAddress != null &&
+      opts?.preSignedAuthorAttestation != null
+    ) {
+      throw new Error(
+        '_buildPrecomputedAttestationForSelection: authorAgentAddress and preSignedAuthorAttestation are mutually exclusive',
+      );
+    }
+    if (
+      typeof this.chain.getEvmChainId !== 'function' ||
+      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+    ) {
+      throw new Error(
+        'Selection-based VM publish requires a V10-capable chain adapter that exposes ' +
+          'getEvmChainId() and getKnowledgeAssetsV10Address().',
+      );
+    }
+
+    const kaMap = autoPartition(quads);
+    const allSkolemizedQuads = [...kaMap.values()].flat();
+    // Mirror the publisher's per-rootEntity private partition + root
+    // derivation (see `dkg-publisher.ts:1526-1570`). Each public root
+    // entity gets the private quads whose subjects either equal it or
+    // skolemize beneath its `…/.well-known/genid/` namespace; each
+    // such non-empty bag becomes a `computePrivateRootV10` leaf in the
+    // KC merkle. The order MUST follow the publisher's manifest
+    // iteration over `kaMap`, which is the insertion order — same map
+    // we built two lines up.
+    const privateQuads = opts?.privateQuads ?? [];
+    const privateRoots: Uint8Array[] = [];
+    for (const rootEntity of kaMap.keys()) {
+      if (privateQuads.length === 0) break;
+      const entityPrivateQuads = privateQuads.filter(
+        (q) =>
+          q.subject === rootEntity ||
+          q.subject.startsWith(rootEntity + '/.well-known/genid/'),
+      );
+      if (entityPrivateQuads.length === 0) continue;
+      const root = computePrivateRoot(entityPrivateQuads);
+      if (root) privateRoots.push(root);
+    }
+    const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, privateRoots);
+
+    const chainId = await this.chain.getEvmChainId();
+    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const onChainCgId =
+      opts?.targetOnChainCgId !== undefined
+        ? BigInt(opts.targetOnChainCgId)
+        : await this.requireOnChainContextGraphId(contextGraphId);
+
+    const schemeVersion = opts?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
+    let authorAddress: string;
+    let signerPrivateKey: string | undefined;
+    let preSigned: PreSignedAuthorAttestation | undefined;
+    if (opts?.preSignedAuthorAttestation != null) {
+      preSigned = opts.preSignedAuthorAttestation;
+      authorAddress = preSigned.address;
+    } else if (opts?.authorAgentAddress != null) {
+      const mode = this.getLocalAgentMode(opts.authorAgentAddress);
+      if (mode === undefined) {
+        throw new Error(
+          `Selection-based VM publish: authorAgentAddress ${opts.authorAgentAddress} is not a registered local agent on this node`,
+        );
+      }
+      if (mode === 'self-sovereign') {
+        throw new Error(
+          `Selection-based VM publish: agent ${opts.authorAgentAddress} is registered as self-sovereign — ` +
+            `this node does not hold its private key. Use preSignedAuthorAttestation instead.`,
+        );
+      }
+      signerPrivateKey = this.getCustodialAgentPrivateKey(opts.authorAgentAddress);
+      if (!signerPrivateKey) {
+        throw new Error(
+          `Selection-based VM publish: custodial agent ${opts.authorAgentAddress} has no private key on file`,
+        );
+      }
+      authorAddress = opts.authorAgentAddress;
+    } else {
+      const fallbackAddress = await this.publisher.publisherFallbackAuthorAddress();
+      if (!fallbackAddress) {
+        throw new Error(
+          'Selection-based VM publish: no agent override supplied and no publisher signer is available. ' +
+            'Either supply authorAgentAddress / preSignedAuthorAttestation, or configure a publisher private key on the daemon.',
+        );
+      }
+      authorAddress = fallbackAddress;
+    }
+
+    const typedData = buildAuthorAttestationTypedData({
+      chainId,
+      kav10Address,
+      contextGraphId: onChainCgId,
+      merkleRoot,
+      authorAddress,
+      schemeVersion,
+    });
+    const eip712Digest = ethers.TypedDataEncoder.hash(
+      typedData.domain,
+      typedData.types,
+      typedData.message,
+    );
+
+    let r: Uint8Array;
+    let vs: Uint8Array;
+    if (preSigned) {
+      const sig = ethers.Signature.from({
+        r: ethers.hexlify(preSigned.signature.r),
+        yParityAndS: ethers.hexlify(preSigned.signature.vs),
+      });
+      // Same EOA-vs-1271 dispatch as `assertionFinalize` (see comment
+      // there). Skip ECDSA recover for smart-contract / 7702-delegated
+      // authors so the on-chain `IERC1271.isValidSignature` branch can
+      // be the authoritative check.
+      const isContractAuthor =
+        typeof this.chain.hasContractCode === 'function'
+          ? await this.chain.hasContractCode(authorAddress)
+          : false;
+      if (!isContractAuthor) {
+        const recovered = ethers.recoverAddress(eip712Digest, sig);
+        if (recovered.toLowerCase() !== authorAddress.toLowerCase()) {
+          throw new Error(
+            `Selection-based VM publish: preSignedAuthorAttestation signer mismatch — ` +
+              `signature recovers ${recovered} but address claims ${authorAddress}.`,
+          );
+        }
+      }
+      r = preSigned.signature.r;
+      vs = preSigned.signature.vs;
+    } else if (signerPrivateKey) {
+      const wallet = new ethers.Wallet(
+        signerPrivateKey.startsWith('0x') ? signerPrivateKey : '0x' + signerPrivateKey,
+      );
+      const sigHex = await wallet.signTypedData(
+        typedData.domain,
+        typedData.types,
+        typedData.message,
+      );
+      const sig = ethers.Signature.from(sigHex);
+      r = ethers.getBytes(sig.r);
+      vs = ethers.getBytes(sig.yParityAndS);
+    } else {
+      const compact = await this.publisher.signAuthorAttestationAsPublisher(typedData);
+      r = compact.r;
+      vs = compact.vs;
+    }
+
+    return {
+      expectedMerkleRoot: merkleRoot,
+      authorAddress,
+      signature: { r, vs },
+      schemeVersion,
+    };
+  }
+
+  /**
+   * Load the quads that a selection-based publish would target.
+   * Mirrors the SPARQL CONSTRUCT inside
+   * `publisher.publishFromSharedMemory` so the agent can pre-compute
+   * the assertion seal over the same content the publisher will see
+   * at broadcast time. Any drift (e.g. concurrent SWM mutation
+   * between this load and the publisher's load) surfaces as the
+   * publisher's `expectedMerkleRoot mismatch` error rather than a
+   * silent wrong-content publish.
+   */
+  private async _loadSelectedSWMQuads(
+    contextGraphId: string,
+    selection: 'all' | { rootEntities: string[] },
+    subGraphName?: string,
+  ): Promise<Quad[]> {
+    const swmGraph = contextGraphSharedMemoryUri(contextGraphId, subGraphName);
+    let sparql: string;
+    if (selection === 'all') {
+      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${swmGraph}> { ?s ?p ?o } }`;
+    } else {
+      // Round 4 review §10 — mirror the `isSafeIri` filter that
+      // `DKGPublisher.publishFromSharedMemory` applies before its own
+      // SPARQL CONSTRUCT. Without this guard a caller could craft a
+      // `selection.rootEntities` value containing `>` / SPARQL syntax
+      // that breaks out of the `<…>` IRI literal and rewrites the
+      // pre-seal CONSTRUCT into a wider scope. Both seams must agree
+      // on the IRI shape that survives interpolation; the `_meta`
+      // seal writer (`buildAssertionSealQuads`) applies the same
+      // reject-set when it persists rootEntities so any value that
+      // round-trips through finalize → publish is safe here.
+      const roots = [...new Set(
+        selection.rootEntities
+          .map((r) => String(r).trim())
+          .filter((r) => isSafeIri(r)),
+      )];
+      if (roots.length === 0) {
+        const hadInput = selection.rootEntities.length > 0;
+        throw new Error(
+          hadInput
+            ? `_loadSelectedSWMQuads: no valid rootEntities provided ` +
+                `(all ${selection.rootEntities.length} entries failed IRI validation) ` +
+                `for context graph ${contextGraphId}`
+            : `_loadSelectedSWMQuads: no rootEntities supplied for context graph ${contextGraphId}`,
+        );
+      }
+      const values = roots.map((r) => `<${r}>`).join(' ');
+      sparql = `CONSTRUCT { ?s ?p ?o } WHERE {
+        GRAPH <${swmGraph}> {
+          VALUES ?root { ${values} }
+          ?s ?p ?o .
+          FILTER(
+            ?s = ?root
+            || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))
+          )
+        }
+      }`;
+    }
+    const result = await this.store.query(sparql);
+    return result.type === 'quads' ? result.quads : [];
+  }
+
+  /**
+   * RFC-001 §9.x — publish a previously-finalized assertion to the
+   * verified-memory chain.
+   *
+   * Reads the seal from `_meta`, plumbs the seal's
+   * `(merkleRoot, authorAddress, signature, schemeVersion)` into the
+   * publisher as `precomputedAttestation`, and lets
+   * `publishFromSharedMemory` handle everything else (CG registration
+   * check, ACK collection, on-chain submission, post-confirmation
+   * cleanup).
+   *
+   * Pre-condition: the assertion's quads have already been promoted
+   * into SWM via `assertion.promote()`. The publisher pulls quads
+   * from the canonical CG `_shared-memory` graph; if the assertion
+   * hasn't been promoted yet, publish will see an empty/wrong quad
+   * set and the merkleRoot sanity check inside `publish()` will fire.
+   */
+  async publishFromFinalizedAssertion(
+    contextGraphId: string,
+    name: string,
+    opts?: {
+      subGraphName?: string;
+      operationCtx?: OperationContext;
+      onPhase?: PhaseCallback;
+      publisherNodeIdentityIdOverride?: bigint;
+      clearSharedMemoryAfter?: boolean;
+    },
+  ): Promise<PublishResult & { assertionUri: string; seal: AssertionSeal }> {
+    const agentAddress = this.defaultAgentAddress ?? this.peerId;
+    const assertionUri = contextGraphAssertionUri(
+      contextGraphId,
+      agentAddress,
+      name,
+      opts?.subGraphName,
+    );
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+
+    // 1. Read the seal from _meta.
+    const metaResult = await this.store.query(
+      `CONSTRUCT { <${assertionUri}> ?p ?o } WHERE { GRAPH <${metaGraph}> { <${assertionUri}> ?p ?o } }`,
+    );
+    const metaQuads = metaResult.type === 'quads' ? metaResult.quads : [];
+    const seal = parseAssertionSealQuads(metaQuads, assertionUri);
+    if (!seal) {
+      throw new Error(
+        `publishFromFinalizedAssertion: assertion <${assertionUri}> is not finalized. ` +
+          `Call /api/assertion/${name}/finalize before publishing.`,
+      );
+    }
+
+    // 2. Cross-check chain target — refuse to publish a sig signed
+    //    against a different deployment than this daemon currently
+    //    points at. This is the cross-deployment safety the EIP-712
+    //    domain is buying us; surface as an early 4xx-equivalent
+    //    rather than a tx revert.
+    if (
+      typeof this.chain.getEvmChainId === 'function' &&
+      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+    ) {
+      const liveChainId = await this.chain.getEvmChainId();
+      const liveKav10 = await this.chain.getKnowledgeAssetsV10Address();
+      if (liveChainId !== seal.chainId) {
+        throw new Error(
+          `publishFromFinalizedAssertion: seal binds chainId=${seal.chainId.toString()} but daemon ` +
+            `is configured for chainId=${liveChainId.toString()}. The author signature is not valid ` +
+            `against this chain. Re-finalize the assertion against the target chain.`,
+        );
+      }
+      if (liveKav10.toLowerCase() !== seal.kav10Address.toLowerCase()) {
+        throw new Error(
+          `publishFromFinalizedAssertion: seal binds KAv10=${seal.kav10Address} but daemon ` +
+            `is configured for KAv10=${liveKav10}. The signature is not valid against this deployment.`,
+        );
+      }
+    }
+
+    // 3. Run the standard publishFromSharedMemory flow with the
+    //    pre-computed attestation. The publisher will sanity-check
+    //    that its own merkle re-derivation matches the seal.
+    //
+    //    Round 4 review §9 — scope the SWM CONSTRUCT to the seal's
+    //    `rootEntities` instead of `'all'`. With `'all'` a named
+    //    publish would bundle every other promoted assertion sitting
+    //    in shared memory into the same KC; the publisher's recompute
+    //    would then disagree with the seal's `expectedMerkleRoot` and
+    //    flip to `tentative kcId: "0"`. The seal's rootEntities were
+    //    captured at finalize time from the same `autoPartition` call
+    //    that drove the merkle leaves, so this selection deterministically
+    //    yields the post-promote SWM slice the seal commits to.
+    const result = await this.publishFromSharedMemory(
+      contextGraphId,
+      { rootEntities: seal.rootEntities },
+      {
+        operationCtx: opts?.operationCtx,
+        onPhase: opts?.onPhase,
+        subGraphName: opts?.subGraphName,
+        publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
+        clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
+        // Wired through to the inner publisher.publish() via
+        // publishFromSharedMemory's `precomputedAttestation` option.
+        // Skips the publisher's signing entirely.
+        precomputedAttestation: {
+          expectedMerkleRoot: seal.merkleRoot,
+          authorAddress: seal.authorAddress,
+          signature: { r: seal.authorAttestationR, vs: seal.authorAttestationVS },
+          schemeVersion: seal.authorSchemeVersion,
+        },
+      },
+    );
+
+    // 4. On confirmed publish, write receipt triples to _meta.
+    if (result.status === 'confirmed' && result.onChainResult) {
+      try {
+        const receiptQuads = buildAssertionPublishReceiptQuads({
+          assertionUri,
+          metaGraph,
+          txHash: result.onChainResult.txHash ?? '',
+          blockNumber: BigInt(result.onChainResult.blockNumber ?? 0),
+          kcId: result.onChainResult.batchId ?? 0n,
+        });
+        await this.store.insert(receiptQuads);
+      } catch (err) {
+        this.log.warn(
+          opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+          `Failed to write publish receipt for <${assertionUri}>: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
+
+    return { ...result, assertionUri, seal };
+  }
+
+  /**
    * Publish shared memory content: read from SWM graph and publish with full finality (data graph + chain).
    * After on-chain confirmation, broadcasts a lightweight FinalizationMessage so peers with matching
    * SWM state can promote it to canonical without re-downloading the full payload.
@@ -3639,6 +4767,56 @@ export class DKGAgent {
       contextGraphSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
       /** Target sub-graph within the context graph (e.g. "code", "decisions"). */
       subGraphName?: string;
+      /**
+       * Per-publish override for the on-chain
+       * `KnowledgeAssetsV10.PublishParams.publisherNodeIdentityId`
+       * attribution field (RFC-001 §4). Threaded as a per-call option
+       * into `publisher.publishFromSharedMemory` — no global mutation,
+       * so concurrent publishes with conflicting overrides are safe.
+       *
+       * Lets an edge-mode operator route a publish through the
+       * home-core's `publishFromSharedMemory` while attributing the
+       * publishing-factor credit (and PCA discount, when the submitter
+       * is on the named core's `authorizedKeys`) to a different core.
+       * `0n` is a valid explicit value and means "no attribution"
+       * (RFC-001 §4(d)) — the contract validates this case and the
+       * publish proceeds on-chain. The publisher's own
+       * `publisherNodeIdentityId` is unchanged and continues to be
+       * used for ACK self-signing and signer resolution.
+       */
+      publisherNodeIdentityIdOverride?: bigint;
+      /**
+       * RFC-001 §9.x — pre-computed attestation captured by
+       * `agent.assertion.finalize()`. When the caller has already
+       * sealed a named assertion they can plumb the seal here verbatim
+       * and the publisher forwards it unchanged.
+       *
+       * If omitted AND the publish is going on-chain (V10-capable
+       * adapter + on-chain CG id), the agent mints a seal inline at
+       * the selection boundary using `authorAgentAddress` /
+       * `preSignedAuthorAttestation` / publisher fallback. This is the
+       * "selection-based publish" UX bridge — agents/users keep
+       * picking rootEntities post-hoc, but the seal is still computed
+       * and signed before the publisher sees the payload.
+       */
+      precomputedAttestation?: PublishOptions['precomputedAttestation'];
+      /**
+       * Agent address to attribute authorship to when minting an
+       * inline seal at this layer. Must be a registered local agent
+       * with custodial keys (the daemon holds the private key). For
+       * self-sovereign agents use `preSignedAuthorAttestation`. Has
+       * no effect when `precomputedAttestation` is also supplied.
+       */
+      authorAgentAddress?: string;
+      /**
+       * Pre-signed AuthorAttestation by a self-sovereign agent whose
+       * private key isn't held by the daemon. Has no effect when
+       * `precomputedAttestation` is also supplied. Mutually exclusive
+       * with `authorAgentAddress`.
+       */
+      preSignedAuthorAttestation?: PreSignedAuthorAttestation;
+      /** Author scheme version override (defaults to AUTHOR_SCHEME_VERSION_V1). */
+      schemeVersion?: number;
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -3648,6 +4826,46 @@ export class DKGAgent {
     const onChainId = ctxGraphIdStr ?? (await this.getContextGraphOnChainId(contextGraphId)) ?? undefined;
 
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
+
+    // RFC-001 §9.x — selection-based publish bridge. If the caller
+    // already sealed the content (named-assertion lifecycle) they
+    // pass `precomputedAttestation` through and we forward verbatim.
+    // Otherwise, when we know we're going on-chain (V10 adapter + CG
+    // has on-chain id), we mint the seal here at the selection
+    // boundary so the publisher's "no on-chain publish without
+    // precomputedAttestation" guard is satisfied.
+    let resolvedSeal = options?.precomputedAttestation;
+    if (
+      !resolvedSeal &&
+      onChainId != null &&
+      typeof this.chain.getEvmChainId === 'function' &&
+      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+    ) {
+      const swmQuads = await this._loadSelectedSWMQuads(
+        contextGraphId,
+        selection,
+        options?.subGraphName,
+      );
+      if (swmQuads.length > 0) {
+        resolvedSeal = await this._buildPrecomputedAttestationForSelection(
+          contextGraphId,
+          swmQuads,
+          {
+            targetOnChainCgId: onChainId,
+            ...(options?.authorAgentAddress != null
+              ? { authorAgentAddress: options.authorAgentAddress }
+              : {}),
+            ...(options?.preSignedAuthorAttestation != null
+              ? { preSignedAuthorAttestation: options.preSignedAuthorAttestation }
+              : {}),
+            ...(options?.schemeVersion !== undefined
+              ? { schemeVersion: options.schemeVersion }
+              : {}),
+          },
+        );
+      }
+    }
+
     const result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
       operationCtx: ctx,
       clearSharedMemoryAfter: options?.clearSharedMemoryAfter,
@@ -3657,6 +4875,8 @@ export class DKGAgent {
       contextGraphSignatures: options?.contextGraphSignatures,
       v10ACKProvider,
       subGraphName: options?.subGraphName,
+      publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
+      precomputedAttestation: resolvedSeal,
     });
 
     if (result.status === 'confirmed' && result.onChainResult) {
@@ -8452,6 +9672,10 @@ export class DKGAgent {
       clearInterval(this.swmCleanupTimer);
       this.swmCleanupTimer = null;
     }
+    if (this.syncReconcilerTimer) {
+      clearInterval(this.syncReconcilerTimer);
+      this.syncReconcilerTimer = null;
+    }
     this.clearRandomSamplingBindRetry();
     this.clearStorageACKRegistrationRetry();
     this.storageACKRegistrationRetryInFlight = false;
@@ -8733,6 +9957,55 @@ export class DKGAgent {
       },
       async discard(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<void> {
         return agent.publisher.assertionDiscard(contextGraphId, name, agentAddress, opts?.subGraphName);
+      },
+
+      /**
+       * RFC-001 §9.x — finalize a Working Memory assertion.
+       *
+       * This is the moment the assertion's content is cryptographically
+       * committed to a chain target: the daemon computes the canonical
+       * merkleRoot from the assertion's quads, builds the EIP-712
+       * AuthorAttestation typed data, signs it (or verifies a pre-signed
+       * payload), and stamps the result as a block of `_meta` triples
+       * keyed by the assertion URI.
+       *
+       * After finalize, the assertion's content is sealed: subsequent
+       * `write` calls would invalidate the seal. The seal travels with
+       * the assertion through SWM gossip (because `_meta` propagates by
+       * default) and is consumed verbatim by the chain publish path —
+       * publish never re-signs or re-hashes.
+       *
+       * Authorship resolution mirrors `publishFromSharedMemory`:
+       *   1. `preSignedAuthorAttestation` wins (self-sovereign agents).
+       *   2. `authorAgentAddress` → custodial agent's private key from
+       *      the local keystore.
+       *   3. Otherwise → throw. The route layer is responsible for
+       *      defaulting to the request token's agent (or to the
+       *      publisher EOA when an admin token is presented).
+       *
+       * Idempotent: re-finalizing an already-sealed assertion with the
+       * same content returns the existing seal without re-signing. A
+       * conflicting re-finalize (different content / author) throws.
+       */
+      async finalize(
+        contextGraphId: string,
+        name: string,
+        opts?: {
+          subGraphName?: string;
+          authorAgentAddress?: string;
+          preSignedAuthorAttestation?: PreSignedAuthorAttestation;
+          schemeVersion?: number;
+        },
+      ): Promise<{
+        assertionUri: string;
+        merkleRoot: Uint8Array;
+        authorAddress: string;
+        schemeVersion: number;
+        chainId: bigint;
+        kav10Address: string;
+        eip712Digest: string;
+      }> {
+        return agent.assertionFinalize(contextGraphId, name, agentAddress, opts);
       },
 
       async history(contextGraphId: string, name: string, opts?: { agentAddress?: string; subGraphName?: string }): Promise<AssertionDescriptor | null> {

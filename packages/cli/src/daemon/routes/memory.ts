@@ -58,7 +58,7 @@ const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
+import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
   MetricsCollector,
@@ -328,6 +328,72 @@ import {
 
 import type { RequestContext } from './context.js';
 
+/**
+ * Validate a `preSignedAuthorAttestation` payload from a finalize request.
+ *
+ * Shape:
+ *   { address: "0x...", signature: { r: "0x..." | number[], vs: "0x..." | number[] } }
+ *
+ * Returns the normalised value with byte arrays (Uint8Array) ready to forward
+ * into `agent.assertion.finalize`. Returns `undefined` and writes an
+ * appropriate 400 response when the payload is malformed.
+ *
+ * The on-chain signature check happens later inside the agent's finalize
+ * path (it recovers the address from the EIP-712 digest and fails closed
+ * if the recovered signer doesn't match the claimed address).
+ *
+ * RFC-001 §9.x — Phase C — pre-signed attestations are a finalize-time
+ * concern. The publish layer no longer accepts them; they're consumed
+ * here and stamped into the seal.
+ */
+type PreSignedAuthorAttestation = {
+  address: string;
+  signature: { r: Uint8Array; vs: Uint8Array };
+};
+
+export function validatePreSignedAuthorAttestation(
+  raw: unknown,
+  res: ServerResponse,
+): PreSignedAuthorAttestation | undefined {
+  if (raw == null || typeof raw !== 'object') {
+    jsonResponse(res, 400, {
+      error: '"preSignedAuthorAttestation" must be an object',
+    });
+    return undefined;
+  }
+  const obj = raw as Record<string, unknown>;
+  const address = typeof obj.address === 'string' ? obj.address : undefined;
+  const signature = obj.signature && typeof obj.signature === 'object'
+    ? (obj.signature as Record<string, unknown>)
+    : undefined;
+  if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address) || !signature) {
+    jsonResponse(res, 400, {
+      error: '"preSignedAuthorAttestation" requires { address: 0x..., signature: { r, vs } }',
+    });
+    return undefined;
+  }
+  const decode = (label: string, val: unknown): Uint8Array | undefined => {
+    if (typeof val === 'string') {
+      const stripped = val.startsWith('0x') ? val.slice(2) : val;
+      if (stripped.length !== 64 || !/^[0-9a-fA-F]+$/.test(stripped)) return undefined;
+      return Uint8Array.from(Buffer.from(stripped, 'hex'));
+    }
+    if (Array.isArray(val) && val.length === 32 && val.every((b) => typeof b === 'number' && b >= 0 && b <= 255)) {
+      return Uint8Array.from(val as number[]);
+    }
+    void label;
+    return undefined;
+  };
+  const r = decode('r', signature.r);
+  const vs = decode('vs', signature.vs);
+  if (!r || !vs) {
+    jsonResponse(res, 400, {
+      error: '"preSignedAuthorAttestation.signature.r" and ".vs" must each be 32-byte hex strings or 32-element byte arrays',
+    });
+    return undefined;
+  }
+  return { address, signature: { r, vs } };
+}
 
 export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
   const {
@@ -478,11 +544,20 @@ WHERE {
     }
   }
 
-  // POST /api/shared-memory/write (V10) or /api/workspace/write (legacy)
-  if (
-    req.method === "POST" &&
-    (path === "/api/shared-memory/write" || path === "/api/workspace/write")
-  ) {
+  // POST /api/shared-memory/write
+  //
+  // Direct SWM write entry point. Writes loose triples to shared memory
+  // without minting a named-assertion seal. Triples land in SWM as
+  // ungrouped content; downstream selection-based publishes
+  // (POST /api/shared-memory/publish with `selection`) seal them at
+  // the publish boundary via the agent's selection bridge — see
+  // `agent.publishFromSharedMemory` for the inline-seal logic.
+  //
+  // For seal-from-creation provenance, use the named-assertion
+  // lifecycle instead: POST /api/assertion/create with `quads,
+  // finalize: true, promote: true` followed by
+  // POST /api/shared-memory/publish with `assertionName`.
+  if (req.method === "POST" && path === "/api/shared-memory/write") {
     const body = await readBody(req);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
@@ -545,17 +620,36 @@ WHERE {
     }
   }
 
-  // POST /api/shared-memory/publish (V10) or /api/workspace/enshrine (legacy)
-  if (
-    req.method === "POST" &&
-    (path === "/api/shared-memory/publish" ||
-      path === "/api/workspace/enshrine")
-  ) {
+  // POST /api/shared-memory/publish
+  //
+  // Two operating modes (mutually exclusive):
+  //
+  //   1. `assertionName` body field — finalized-assertion fork. The seal
+  //      lives in `_meta` (written by /api/assertion/:name/finalize).
+  //      The agent reads it, threads it as `precomputedAttestation`,
+  //      and the publisher forwards verbatim. No re-sign, no re-hash.
+  //
+  //   2. `selection` body field (or omitted, defaults to 'all') —
+  //      selection-based fork. The agent loads the selected SWM quads,
+  //      mints a precomputedAttestation inline at the selection
+  //      boundary (RFC-001 §9.x sign-at-creation invariant — the seal
+  //      exists before the publisher gets the payload), then publishes.
+  //      `authorAgentAddress` / `preSignedAuthorAttestation` /
+  //      bearer-token attribution all settle here.
+  if (req.method === "POST" && path === "/api/shared-memory/publish") {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
-    const { selection, clearAfter, publishContextGraphId, subGraphName } =
-      parsed;
+    const {
+      selection,
+      clearAfter,
+      publishContextGraphId,
+      subGraphName,
+      publisherNodeIdentityIdOverride,
+      authorAgentAddress: bodyAuthorAgentAddress,
+      preSignedAuthorAttestation: bodyPreSignedAttestation,
+      assertionName: bodyAssertionName,
+    } = parsed;
     const contextGraphId = parsed.contextGraphId;
     if (!contextGraphId)
       return jsonResponse(res, 400, {
@@ -568,6 +662,186 @@ WHERE {
           '"subGraphName" and "publishContextGraphId" cannot be used together',
       });
     }
+    let resolvedPublisherIdentityOverride: bigint | undefined;
+    if (publisherNodeIdentityIdOverride !== undefined && publisherNodeIdentityIdOverride !== null) {
+      const raw = String(publisherNodeIdentityIdOverride);
+      if (!/^\d+$/.test(raw)) {
+        return jsonResponse(res, 400, {
+          error: '"publisherNodeIdentityIdOverride" must be a non-negative integer (string or number)',
+        });
+      }
+      resolvedPublisherIdentityOverride = BigInt(raw);
+    }
+
+    // RFC-001 §4(b) Phase 4 — author attribution resolution.
+    //
+    // Three precedence-ordered sources, all optional. The publisher signs as
+    // its own wallet (today's behaviour) when none are supplied:
+    //
+    //   1. `preSignedAuthorAttestation` in the request body — used when the
+    //      author is a self-sovereign agent whose private key the daemon
+    //      doesn't hold. Caller pre-signs the EIP-712 typed data.
+    //
+    //   2. `authorAgentAddress` in the request body — admin assertion. The
+    //      node-level admin token can run as any registered local agent
+    //      (matches the existing OpenClaw `agentAddress` pattern at
+    //      packages/cli/src/daemon/routes/query.ts). Resolved to a custodial
+    //      private key by `agent.publishFromSharedMemory`.
+    //
+    //   3. Agent-scoped bearer token — a `dkg_at_*` token registered to a
+    //      specific agent automatically attributes authorship to that agent.
+    //      Node-level admin tokens (resolveAgentByToken returns undefined)
+    //      do NOT attribute by default, preserving today's "publisher signs
+    //      as itself" semantics.
+    const requestToken = extractBearerToken(req.headers.authorization);
+    const tokenAgentAddress = requestToken
+      ? agent.resolveAgentByToken(requestToken)
+      : undefined;
+    if (
+      bodyAuthorAgentAddress != null &&
+      bodyPreSignedAttestation != null
+    ) {
+      return jsonResponse(res, 400, {
+        error:
+          '"authorAgentAddress" and "preSignedAuthorAttestation" are mutually exclusive',
+      });
+    }
+    let resolvedPreSignedAttestation: PreSignedAuthorAttestation | undefined;
+    if (bodyPreSignedAttestation != null) {
+      const validated = validatePreSignedAuthorAttestation(bodyPreSignedAttestation, res);
+      if (validated === undefined) return;
+      resolvedPreSignedAttestation = validated;
+    }
+    let resolvedAuthorAgentAddress: string | undefined;
+    if (resolvedPreSignedAttestation == null) {
+      // Pre-signed wins; otherwise body assertion wins; otherwise token.
+      if (typeof bodyAuthorAgentAddress === 'string' && bodyAuthorAgentAddress.length > 0) {
+        if (!/^0x[0-9a-fA-F]{40}$/.test(bodyAuthorAgentAddress)) {
+          return jsonResponse(res, 400, {
+            error: '"authorAgentAddress" must be a 0x-prefixed 20-byte EVM address',
+          });
+        }
+        resolvedAuthorAgentAddress = bodyAuthorAgentAddress;
+      } else if (tokenAgentAddress != null) {
+        resolvedAuthorAgentAddress = tokenAgentAddress;
+      }
+    }
+
+    // RFC-001 §9.x Phase 5 — finalized-assertion fork.
+    //
+    // When the body carries `assertionName`, the assertion was sealed at
+    // a previous /api/assertion/:name/finalize step and the seal lives
+    // in `_meta`. The agent route reads the seal, validates chain
+    // identity, threads the seal as `precomputedAttestation`, and the
+    // publisher forwards it verbatim — no re-sign, no re-hash. Other
+    // body fields (`authorAgentAddress`, `preSignedAuthorAttestation`)
+    // are illegal in this fork because the seal already encodes the
+    // author. `selection` is forced to `'all'` because the seal is keyed
+    // by the assertion's exact merkleRoot.
+    if (typeof bodyAssertionName === 'string' && bodyAssertionName.length > 0) {
+      const nameVal = validateAssertionName(bodyAssertionName);
+      if (!nameVal.valid) {
+        return jsonResponse(res, 400, {
+          error: `Invalid "assertionName": ${nameVal.reason}`,
+        });
+      }
+      if (
+        bodyAuthorAgentAddress != null ||
+        bodyPreSignedAttestation != null
+      ) {
+        return jsonResponse(res, 400, {
+          error:
+            '"authorAgentAddress" and "preSignedAuthorAttestation" cannot be combined with "assertionName" — the seal already encodes the author. Re-finalize the assertion if you need to change authorship.',
+        });
+      }
+      if (selection !== undefined && selection !== 'all') {
+        return jsonResponse(res, 400, {
+          error:
+            '"selection" must be omitted or "all" when "assertionName" is supplied — the seal commits to the entire assertion content.',
+        });
+      }
+      const ctx2 = createOperationContext('publishFromSWM');
+      tracker.start(ctx2, {
+        contextGraphId,
+        details: {
+          source: 'api',
+          assertionName: bodyAssertionName,
+          subGraphName,
+        },
+      });
+      try {
+        const result = await tracker.trackPhase(
+          ctx2,
+          'read-shared-memory',
+          () =>
+            agent.publishFromFinalizedAssertion(contextGraphId, bodyAssertionName, {
+              ...(subGraphName ? { subGraphName } : {}),
+              operationCtx: ctx2,
+              ...(resolvedPublisherIdentityOverride !== undefined
+                ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
+                : {}),
+              // Pass `clearAfter` straight through (incl. `undefined`) so the
+              // publisher's own default — `false` — applies for the named
+              // path. Forcing `?? true` here would silently drain every other
+              // assertion's quads from SWM after publishing the named one,
+              // since the publisher reads `clearSharedMemoryAfter === true`
+              // as "also wipe the unpublished remainder". The named publish
+              // already removes its own roots regardless.
+              ...(clearAfter !== undefined ? { clearSharedMemoryAfter: clearAfter } : {}),
+            }),
+        );
+        const chain = result.onChainResult;
+        if (chain) {
+          tracker.setCost(ctx2, {
+            gasUsed: chain.gasUsed,
+            gasPrice: chain.effectiveGasPrice,
+          });
+          const chainId = resolveChainConfig(config, network)?.chainId;
+          tracker.setTxHash(
+            ctx2,
+            chain.txHash,
+            chainId ? Number(chainId) : undefined,
+          );
+        }
+        tracker.complete(ctx2, { tripleCount: result.kaManifest?.length ?? 0 });
+        const httpStatus = result.contextGraphError ? 207 : 200;
+        return jsonResponse(res, httpStatus, {
+          kcId: String(result.kcId),
+          status: result.status,
+          assertionUri: result.assertionUri,
+          authorAddress: result.seal.authorAddress,
+          merkleRoot:
+            '0x' +
+            Array.from(result.seal.merkleRoot)
+              .map((b) => b.toString(16).padStart(2, '0'))
+              .join(''),
+          kas: result.kaManifest.map((ka: any) => ({
+            tokenId: String(ka.tokenId),
+            rootEntity: ka.rootEntity,
+          })),
+          ...(chain && { txHash: chain.txHash, blockNumber: chain.blockNumber }),
+          ...(result.contextGraphError
+            ? { contextGraphError: result.contextGraphError }
+            : {}),
+        });
+      } catch (err: any) {
+        tracker.fail(ctx2, err);
+        const message = err?.message ?? String(err);
+        if (
+          message.includes('not finalized') ||
+          message.includes('seal binds chainId') ||
+          message.includes('seal binds KAv10') ||
+          message.includes('expectedMerkleRoot mismatch') ||
+          message.includes('precomputedAttestation signer mismatch') ||
+          message.includes('not registered on-chain') ||
+          message.includes('signer mismatch')
+        ) {
+          return jsonResponse(res, 400, { error: message });
+        }
+        throw err;
+      }
+    }
+
     const ctx = createOperationContext("publishFromSWM");
     tracker.start(ctx, {
       contextGraphId: contextGraphId,
@@ -593,6 +867,15 @@ WHERE {
           subGraphName,
           ...(resolvedPublishContextGraphId != null
             ? { contextGraphId: resolvedPublishContextGraphId }
+            : {}),
+          ...(resolvedPublisherIdentityOverride !== undefined
+            ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
+            : {}),
+          ...(resolvedAuthorAgentAddress != null
+            ? { authorAgentAddress: resolvedAuthorAgentAddress }
+            : {}),
+          ...(resolvedPreSignedAttestation != null
+            ? { preSignedAuthorAttestation: resolvedPreSignedAttestation }
             : {}),
         }),
       );

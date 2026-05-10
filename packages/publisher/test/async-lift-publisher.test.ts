@@ -5,6 +5,7 @@ import { TypedEventBus, generateEd25519Keypair, sha256 } from '@origintrail-offi
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { wrapPublisherForTest } from './_helpers/seal.js';
 import {
   DKGPublisher,
   TripleStoreAsyncLiftPublisher,
@@ -47,6 +48,16 @@ describe('TripleStoreAsyncLiftPublisher', () => {
   let store: OxigraphStore;
   let CONTEXT_GRAPH: string;
   let _fileSnapshot: string;
+  let _kav10Address: string;
+  let _provider: ethers.JsonRpcProvider;
+  const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+
+  function makeTestPublisher(opts: ConstructorParameters<typeof DKGPublisher>[0]): DKGPublisher {
+    return wrapPublisherForTest(new DKGPublisher(opts), {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
+    });
+  }
 
   beforeAll(async () => {
     _fileSnapshot = await takeSnapshot();
@@ -56,6 +67,9 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
     const cgId = await createTestContextGraph();
     CONTEXT_GRAPH = cgId.toString();
+    _provider = provider;
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    _kav10Address = await chain.getKnowledgeAssetsV10Address();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -139,7 +153,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
   });
 
   it('exposes the renamed shared-memory publisher contract', async () => {
-    const publisherContract: Publisher = new DKGPublisher({
+    const publisherContract: Publisher = makeTestPublisher({
       store,
       chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       eventBus: new TypedEventBus(),
@@ -601,7 +615,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     });
     const privateStore = new PrivateContentStore(store, new GraphManager(store));
 
-    const dkgPublisher = new DKGPublisher({
+    const dkgPublisher = makeTestPublisher({
       store,
       chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       eventBus: new TypedEventBus(),
@@ -643,7 +657,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
       },
     });
 
-    const dkgPublisher = new DKGPublisher({
+    const dkgPublisher = makeTestPublisher({
       store,
       chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       eventBus: new TypedEventBus(),
@@ -679,7 +693,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
       },
     });
 
-    const dkgPublisher = new DKGPublisher({
+    const dkgPublisher = makeTestPublisher({
       store,
       chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       eventBus: new TypedEventBus(),
@@ -735,7 +749,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
 
   it('uses renamed shared-memory fields in publisher APIs', async () => {
     const publisher = createPublisher();
-    const dkgPublisher = new DKGPublisher({
+    const dkgPublisher = makeTestPublisher({
       store,
       chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       eventBus: new TypedEventBus(),
@@ -767,7 +781,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
   });
 
   it('stores confirmed metadata in the graph manager meta graph', async () => {
-    const dkgPublisher = new DKGPublisher({
+    const dkgPublisher = makeTestPublisher({
       store,
       chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       eventBus: new TypedEventBus(),
@@ -825,7 +839,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     };
     const publisher = createPublisher({ config: { publishExecutor } });
 
-    const dkgPublisher = new DKGPublisher({
+    const dkgPublisher = makeTestPublisher({
       store,
       chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       eventBus: new TypedEventBus(),
@@ -868,7 +882,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     };
     const publisher = createPublisher({ config: { publishExecutor } });
 
-    const dkgPublisher = new DKGPublisher({
+    const dkgPublisher = makeTestPublisher({
       store,
       chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       eventBus: new TypedEventBus(),
@@ -919,7 +933,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
       },
     });
 
-    const dkgPublisher = new DKGPublisher({
+    const dkgPublisher = makeTestPublisher({
       store,
       chain: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       eventBus: new TypedEventBus(),

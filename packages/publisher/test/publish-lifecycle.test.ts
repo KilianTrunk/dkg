@@ -27,9 +27,13 @@ import { computeTripleHashV10 as computeTripleHash } from '../src/merkle.js';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { withSeal as _withSeal } from './_helpers/seal.js';
 
 let CONTEXT_GRAPH: string;
 let GRAPH: string;
+let _kav10Address: string;
+let _provider: ethers.JsonRpcProvider;
+const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 const ENTITY = 'did:dkg:agent:QmLifecycle';
 const TEST_WALLET = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 
@@ -37,17 +41,34 @@ function q(s: string, p: string, o: string, g = GRAPH): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
 }
 
+// Phase C made the publisher require a precomputedAttestation for
+// every on-chain broadcast. `pubS(p, args)` mints a self-signed seal
+// so existing tests stay structurally identical: replace
+// `pubS(publisher, args)` with `pubS(publisher, args)`.
+async function pubS(p: DKGPublisher, args: Parameters<DKGPublisher['publish']>[0]) {
+  return p.publish(
+    await _withSeal(args, _author, { provider: _provider, kav10Address: _kav10Address }),
+  );
+}
+async function updS(p: DKGPublisher, kcId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
+  return p.update(
+    kcId,
+    await _withSeal(args, _author, { provider: _provider, kav10Address: _kav10Address }),
+  );
+}
+
 let _topSnapshot: string;
 beforeAll(async () => {
   _topSnapshot = await takeSnapshot();
   const { hubAddress } = getSharedContext();
-  const provider = createProvider();
+  _provider = createProvider();
   const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
-  await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
+  await mintTokens(_provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
   const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
   const cgId = await createTestContextGraph(chain);
   CONTEXT_GRAPH = String(cgId);
   GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+  _kav10Address = await chain.getKnowledgeAssetsV10Address();
 });
 afterAll(async () => {
   await revertSnapshot(_topSnapshot);
@@ -83,7 +104,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       q(ENTITY, 'http://schema.org/version', '"1.0"'),
     ];
 
-    const result = await publisher.publish({
+    const result = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
@@ -118,7 +139,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       q(entityB, 'http://schema.org/version', '"2"'),
     ];
 
-    const result = await publisher.publish({
+    const result = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
@@ -154,7 +175,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       q('did:dkg:agent:Entity3', 'http://schema.org/version', '"3"'),
     ];
 
-    const result = await publisher.publish({
+    const result = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: fixedQuads,
     });
@@ -185,7 +206,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
-    const result1 = await publisher1.publish({
+    const result1 = await pubS(publisher1, {
       contextGraphId: CONTEXT_GRAPH,
       quads: orderA,
     });
@@ -200,7 +221,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
-    const result2 = await publisher2.publish({
+    const result2 = await pubS(publisher2, {
       contextGraphId: CONTEXT_GRAPH,
       quads: orderB,
     });
@@ -222,7 +243,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
 
-    const result = await publisher.publish({
+    const result = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"PrivBot"')],
       privateQuads: [q(ENTITY, 'http://ex.org/secret', '"s3cret"')],
@@ -296,7 +317,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
       q(entityB, 'http://schema.org/version', '"2"'),
     ];
 
-    const result = await publisher.publish({
+    const result = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
@@ -332,7 +353,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
       q(ENTITY, 'http://schema.org/version', '"3"'),
     ];
 
-    const result = await publisher.publish({
+    const result = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
@@ -365,7 +386,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
       q(ENTITY, 'http://ex.org/apiKey', '"sk-secret"'),
     ];
 
-    const result = await publisher.publish({
+    const result = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       publisherPeerId: 'test-peer',
       quads: publicTriples,
@@ -623,7 +644,7 @@ describe('Tentative data and chain event confirmation', () => {
     });
 
     const triples = [q('did:dkg:agent:QmPolled', 'http://schema.org/name', '"PollBot"')];
-    const publishResult = await publisher.publish({
+    const publishResult = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: triples,
     });
@@ -737,7 +758,7 @@ describe('Update flow', () => {
       q(ENTITY, 'http://schema.org/version', '"1.0"'),
     ];
 
-    const publishResult = await publisher.publish({
+    const publishResult = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: initialTriples,
     });
@@ -758,7 +779,7 @@ describe('Update flow', () => {
       q(ENTITY, 'http://schema.org/version', '"2.0"'),
     ];
 
-    const updateResult = await publisher.update(kcId, {
+    const updateResult = await updS(publisher, kcId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: updatedTriples,
     });
@@ -792,14 +813,14 @@ describe('Update flow', () => {
 
     const entity = 'did:dkg:agent:QmPrivUpdate';
 
-    const result1 = await publisher.publish({
+    const result1 = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"PrivUpdateBot"')],
       privateQuads: [q(entity, 'http://ex.org/secret', '"old-secret"')],
       publisherPeerId: '12D3KooWTestPublisher',
     });
 
-    await publisher.update(result1.kcId, {
+    await updS(publisher, result1.kcId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"PrivUpdateBot v2"')],
       privateQuads: [q(entity, 'http://ex.org/secret', '"new-secret"')],
@@ -828,14 +849,14 @@ describe('Update flow', () => {
     });
 
     const entity = 'did:dkg:agent:QmChainUpdate';
-    const result1 = await publisher.publish({
+    const result1 = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"ChainBot v1"')],
     });
 
     const oldMerkleHex = Buffer.from(result1.merkleRoot).toString('hex');
 
-    const result2 = await publisher.update(result1.kcId, {
+    const result2 = await updS(publisher, result1.kcId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"ChainBot v2"')],
     });
@@ -873,7 +894,7 @@ describe('Tentative publish UAL uniqueness', () => {
 
     const uals = new Set<string>();
     for (let i = 0; i < 5; i++) {
-      const result = await publisher.publish({
+      const result = await pubS(publisher, {
         contextGraphId: CONTEXT_GRAPH,
         quads: [q(`did:dkg:agent:Unique${i}`, 'http://schema.org/name', `"Entity${i}"`)],
       });
@@ -899,7 +920,7 @@ describe('Tentative publish UAL uniqueness', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
 
-    const result = await publisher.publish({
+    const result = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"ConfirmedUAL"')],
     });
@@ -922,7 +943,7 @@ describe('Tentative publish UAL uniqueness', () => {
     });
 
     for (let i = 0; i < 3; i++) {
-      await publisher.publish({
+      await pubS(publisher, {
         contextGraphId: CONTEXT_GRAPH,
         quads: [q(`did:dkg:agent:Meta${i}`, 'http://schema.org/name', `"MetaEntity${i}"`)],
       });
@@ -957,7 +978,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const phases: [string, 'start' | 'end'][] = [];
     const onPhase = (phase: string, status: 'start' | 'end') => phases.push([phase, status]);
 
-    await publisher.publish({
+    await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"PhaseTest"')],
       onPhase,
@@ -986,7 +1007,7 @@ describe('Tentative publish UAL uniqueness', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
 
-    const pub = await publisher.publish({
+    const pub = await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"Original"')],
     });
@@ -994,7 +1015,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const phases: [string, 'start' | 'end'][] = [];
     const onPhase = (phase: string, status: 'start' | 'end') => phases.push([phase, status]);
 
-    await publisher.update(pub.kcId, {
+    await updS(publisher, pub.kcId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"Updated"')],
       onPhase,
@@ -1043,7 +1064,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const phases: [string, 'start' | 'end'][] = [];
     const onPhase = (phase: string, status: 'start' | 'end') => phases.push([phase, status]);
 
-    await publisher.publish({
+    await pubS(publisher, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"V10 Staging Test"')],
       v10ACKProvider,
@@ -1058,5 +1079,107 @@ describe('Tentative publish UAL uniqueness', () => {
 
     const started = phases.filter(([, s]) => s === 'start').map(([p]) => p);
     expect(started).toContain('collect_v10_acks');
+  });
+
+  // -------------------------------------------------------------------------
+  // T-OVERRIDE: per-publish `publisherNodeIdentityIdOverride` regression suite
+  //
+  // Round-3 review feedback (PR #436, @branarakic): the override must
+  // influence the EARLY on-chain attempt gate.
+  //
+  //   "This late gate now treats an explicit override as enough to attempt
+  //    the chain path, but the earlier `willAttemptOnChainPublish`
+  //    calculation still requires `this.publisherNodeIdentityId > 0n`
+  //    before resolving `publisherSigner` or precomputing `tokenAmount`.
+  //    A daemon with persistent identity `0n` and `publisherNodeIdentityIdOverride`
+  //    set ... reaches this chain branch with `publisherSigner === undefined`
+  //    and fails with `PublisherWalletRequiredError`."
+  //
+  // The fix hoists `hasAttributionOverride` into the early gate while
+  // intentionally KEEPING self-ACK tied to the daemon identity (per the
+  // reviewer's "while keeping self-ACK tied to the daemon identity"
+  // guidance). Tests 1+2 below pin both halves of that fix.
+  // -------------------------------------------------------------------------
+  it('T-OVERRIDE: mode (d) — daemon has identity, override=0n confirms on-chain with no attribution', async () => {
+    // Primary mode-(d) e2e: a real running daemon (identity=coreProfileId)
+    // explicitly publishes with `override=0n` to mean "no node attribution
+    // for THIS publish". The chain accepts it (T-VAL skips epoch storage),
+    // self-ACK signs as the daemon's real id, status becomes confirmed.
+    const store = new OxigraphStore();
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const bus = new TypedEventBus();
+    const keypair = await generateEd25519Keypair();
+    const realCoreId = BigInt(getSharedContext().coreProfileId);
+
+    const publisher = new DKGPublisher({
+      store, chain, eventBus: bus, keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: realCoreId,
+    });
+
+    const result = await pubS(publisher, {
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q('did:dkg:agent:OverrideMode-D', 'http://schema.org/name', '"OverrideD"')],
+      publisherNodeIdentityIdOverride: 0n,
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult).toBeDefined();
+    expect(result.onChainResult!.txHash).toBeTruthy();
+  });
+
+  it('T-OVERRIDE: daemon identityId=0 + override does NOT throw PublisherWalletRequiredError', async () => {
+    // Direct regression of the round-3 review thread. Pre-fix path:
+    //   willAttemptOnChainPublish = `this.publisherNodeIdentityId > 0n` = false
+    //   → publisherSigner never resolves
+    //   → late gate (which sees the override) enters the chain branch
+    //   → throws `PublisherWalletRequiredError`.
+    // Post-fix: early gate honors the override, publisherSigner resolves,
+    // chain branch may still fall back to tentative downstream (single-
+    // node mode: self-ACK requires daemon identity, intentionally), but
+    // the publish call MUST resolve cleanly without throwing.
+    const store = new OxigraphStore();
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const bus = new TypedEventBus();
+    const keypair = await generateEd25519Keypair();
+
+    const publisher = new DKGPublisher({
+      store, chain, eventBus: bus, keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: 0n,
+    });
+
+    await expect(
+      pubS(publisher, {
+        contextGraphId: CONTEXT_GRAPH,
+        quads: [q('did:dkg:agent:OverrideEarlyGate', 'http://schema.org/name', '"OverrideEG"')],
+        publisherNodeIdentityIdOverride: 7n,
+      }),
+    ).resolves.toMatchObject({ status: expect.any(String) });
+  });
+
+  it('T-OVERRIDE: daemon identityId=0 with NO override stays tentative (legacy behavior preserved)', async () => {
+    // Sanity check that the gate change didn't accidentally enable
+    // on-chain publishes for the legacy "daemon has no identity, no
+    // override" path.
+    const store = new OxigraphStore();
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const bus = new TypedEventBus();
+    const keypair = await generateEd25519Keypair();
+
+    const publisher = new DKGPublisher({
+      store, chain, eventBus: bus, keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: 0n,
+    });
+
+    const result = await pubS(publisher, {
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q('did:dkg:agent:OverrideNoOverride', 'http://schema.org/name', '"OverrideNone"')],
+      // no publisherNodeIdentityIdOverride
+    });
+
+    expect(result.status).toBe('tentative');
+    expect(result.ual).toContain('/t');
   });
 });

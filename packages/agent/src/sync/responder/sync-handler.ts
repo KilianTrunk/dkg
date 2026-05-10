@@ -171,13 +171,23 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         const cgUriPrefix = `did:dkg:context-graph:${contextGraphId}`;
         const innerMetaGraph = `${cgUriPrefix}/_meta`;
         const DKG_NS = 'http://dkg.io/ontology/';
+        // Exclude only the TOP-LEVEL `${cgUriPrefix}/_meta` graph (handled by the
+        // 'meta' phase above). Per-cgId meta graphs like
+        // `${cgUriPrefix}/context/<cgId>/_meta` MUST be sent by the data phase —
+        // they carry KC metadata (merkleRoot, batchId, tokenId, partOf,
+        // publication, ...) that the RS prover's kc-extractor.ts queries to
+        // resolve a challenge into a concrete chunk. The previous
+        // `!STRENDS(?g, "/_meta")` filter dropped them on the floor, so
+        // non-publisher peers received the per-cgId data but no per-cgId meta
+        // and emitted `kc-not-synced` for every challenge they were assigned
+        // against KCs they hadn't published themselves.
         const queryStartedAt = Date.now();
         const dataResult = await store.query(
           `SELECT ?s ?p ?o ?g WHERE {
             GRAPH ?g { ?s ?p ?o }
             FILTER(
               (STR(?g) = "${cgUriPrefix}" || STRSTARTS(STR(?g), "${cgUriPrefix}/")) &&
-              !STRENDS(STR(?g), "/_meta") &&
+              STR(?g) != "${innerMetaGraph}" &&
               !CONTAINS(STR(?g), "/_private")
             )
             FILTER(

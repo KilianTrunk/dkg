@@ -798,7 +798,7 @@ describe('dkg_publish SWM-first flow', () => {
 
   it('writes to SWM then publishes from SWM', async () => {
     ft.addResponses(
-      new Response(JSON.stringify({ triplesWritten: 1 }), { status: 200 }),
+      new Response(JSON.stringify({ assertionUri: 'urn:assertion:test' }), { status: 200 }),
       new Response(JSON.stringify({ kcId: 'kc-1', kas: [] }), { status: 200 }),
     );
 
@@ -809,9 +809,13 @@ describe('dkg_publish SWM-first flow', () => {
     expect(parsed.kcId).toBe('kc-1');
     expect(parsed.quadsPublished).toBe(1);
 
+    // V10 assertion lifecycle: the publish flow now creates a finalized
+    // assertion (`/api/assertion/create` with `finalize: true`) and then
+    // promotes it via `/api/shared-memory/publish`. The legacy
+    // `/api/shared-memory/write` route was removed in Phase B-1.
     expect(ft.calls).toHaveLength(2);
-    const writeUrl = ft.calls[0][0] as string;
-    expect(writeUrl).toContain('/api/shared-memory/write');
+    const createUrl = ft.calls[0][0] as string;
+    expect(createUrl).toContain('/api/assertion/create');
     const pubUrl = ft.calls[1][0] as string;
     expect(pubUrl).toContain('/api/shared-memory/publish');
   });

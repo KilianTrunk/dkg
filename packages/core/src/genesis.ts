@@ -225,4 +225,11 @@ export const DKG_ONTOLOGY = {
   DKG_AGENT_ADDRESS: `${DKG}agentAddress`,
   DKG_AGENT_MODE: `${DKG}agentMode`,
   DKG_AGENT_AUTH_TOKEN: `${DKG}agentAuthToken`,
+  // RFC-001 §5.2 — off-chain author-attestation provenance vocabulary.
+  // These are pure SPARQL-filtering convenience triples; the on-chain
+  // `KnowledgeBatch.authorAddress` remains canonical. Implementations that
+  // don't need rich provenance queries MAY skip emitting these triples.
+  DKG_PUBLICATION: `${DKG}Publication`,
+  DKG_PUBLISH_OPERATION_ID: `${DKG}publishOperationId`,
+  DKG_AUTHORED_BY: `${DKG}authoredBy`,
 } as const;

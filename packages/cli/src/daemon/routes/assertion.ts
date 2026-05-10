@@ -358,6 +358,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     path,
     requestToken,
     requestAgentAddress,
+    emitMemoryGraphChanged,
   } = ctx;
 
 
@@ -383,6 +384,14 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         name,
         subGraphName ? { subGraphName } : undefined,
       );
+      emitMemoryGraphChanged?.({
+        contextGraphId,
+        layers: ["wm"],
+        subGraphName,
+        operation: "assertion_created",
+        source: "api",
+        counts: { triples: 0 },
+      });
       return jsonResponse(res, 200, { assertionUri });
     } catch (err: any) {
       if (
@@ -427,6 +436,14 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         quads,
         subGraphName ? { subGraphName } : undefined,
       );
+      emitMemoryGraphChanged?.({
+        contextGraphId,
+        layers: ["wm"],
+        subGraphName,
+        operation: "assertion_written",
+        source: "api",
+        counts: { triples: quads.length },
+      });
       return jsonResponse(res, 200, { written: quads.length });
     } catch (err: any) {
       if (
@@ -513,6 +530,17 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         assertionName,
         { entities: entities ?? "all", subGraphName },
       );
+      const promotedCount = typeof result?.promotedCount === "number" ? result.promotedCount : undefined;
+      if (promotedCount !== 0) {
+        emitMemoryGraphChanged?.({
+          contextGraphId,
+          layers: ["wm", "swm"],
+          subGraphName,
+          operation: "assertion_promoted",
+          source: "api",
+          counts: { triples: promotedCount },
+        });
+      }
       return jsonResponse(res, 200, result);
     } catch (err: any) {
       if (
@@ -561,6 +589,13 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         subGraphName,
       );
       extractionStatus.delete(assertionUri);
+      emitMemoryGraphChanged?.({
+        contextGraphId,
+        layers: ["wm"],
+        subGraphName,
+        operation: "assertion_discarded",
+        source: "api",
+      });
       return jsonResponse(res, 200, { discarded: true });
     } catch (err: any) {
       if (
@@ -1518,6 +1553,14 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         assertionUri,
         completedRecord,
       );
+      emitMemoryGraphChanged?.({
+        contextGraphId: contextGraphId!,
+        layers: ["wm"],
+        subGraphName,
+        operation: "assertion_imported",
+        source: "api",
+        counts: { triples: triples.length },
+      });
 
       return respondWithImportFileResponse(200, {
         status: "completed",

@@ -3,8 +3,9 @@ import {
   contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphDataUri, contextGraphMetaUri,
   contextGraphSubGraphUri, validateSubGraphName,
-  Logger, createOperationContext,
+  DKGEvent, Logger, createOperationContext,
   assertSafeIri, isSafeIri,
+  type EventBus,
   type OperationContext,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, type TripleStore, type Quad } from '@origintrail-official/dkg-storage';
@@ -21,12 +22,14 @@ import { ethers } from 'ethers';
 export class FinalizationHandler {
   private readonly store: TripleStore;
   private readonly chain: ChainAdapter | undefined;
+  private readonly eventBus: EventBus | undefined;
   private readonly log = new Logger('FinalizationHandler');
   private readonly processedUals = new Set<string>();
 
-  constructor(store: TripleStore, chain: ChainAdapter | undefined) {
+  constructor(store: TripleStore, chain: ChainAdapter | undefined, eventBus?: EventBus) {
     this.store = store;
     this.chain = chain;
+    this.eventBus = eventBus;
   }
 
   async handleFinalizationMessage(data: Uint8Array, contextGraphId: string): Promise<void> {
@@ -493,6 +496,17 @@ export class FinalizationHandler {
     await this.store.insert(canonicalQuads);
 
     this.log.info(ctx, `Promoted ${canonicalQuads.length} quads from shared memory to canonical for ${ual}`);
+    this.eventBus?.emit(DKGEvent.MEMORY_GRAPH_CHANGED, {
+      contextGraphId,
+      layers: ['swm', 'vm'],
+      subGraphName,
+      operation: 'verified_memory_finalized',
+      source: 'finalization',
+      counts: {
+        roots: rootEntities.length,
+        triples: canonicalQuads.length,
+      },
+    });
   }
 
   private async deleteMetaForRoot(metaGraph: string, rootEntity: string): Promise<void> {

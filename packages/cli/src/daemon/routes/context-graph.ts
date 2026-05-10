@@ -358,6 +358,7 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     path,
     requestToken,
     requestAgentAddress,
+    emitMemoryGraphChanged,
   } = ctx;
 
 
@@ -598,6 +599,13 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       });
     try {
       await agent.createSubGraph(contextGraphId, subGraphName);
+      emitMemoryGraphChanged?.({
+        contextGraphId,
+        layers: [],
+        subGraphName,
+        operation: "sub_graph_created",
+        source: "api",
+      });
       return jsonResponse(res, 200, { created: subGraphName, contextGraphId });
     } catch (err: any) {
       if (

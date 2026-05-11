@@ -1,7 +1,7 @@
 import type { TripleStore } from '@origintrail-official/dkg-storage';
 import {
   DKG_ONTOLOGY,
-  SYSTEM_PARANETS,
+  SYSTEM_CONTEXT_GRAPHS,
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
   computeWorkspaceAgentEncryptionKeyProofPayload,
@@ -65,7 +65,7 @@ async function getWorkspaceAccessMetadata(
 }> {
   const cgData = contextGraphDataUri(contextGraphId);
   const cgMeta = contextGraphMetaUri(contextGraphId);
-  const ontologyGraph = contextGraphDataUri(SYSTEM_PARANETS.ONTOLOGY);
+  const ontologyGraph = contextGraphDataUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
   const swmGraph = contextGraphSharedMemoryUri(contextGraphId);
   const result = await store.query(
     `SELECT ?agent ?policy WHERE {

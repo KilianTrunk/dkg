@@ -14,8 +14,7 @@ curl -X POST "https://euphoria.origin-trail.network/faucet/fund" \
   -H "Idempotency-Key: my-unique-key-001" \
   --data-raw '{
     "mode": "v10_base_sepolia",
-    "wallets": ["0xYOUR_WALLET_ADDRESS"],
-    "callerId": "my-node-installer"
+    "wallets": ["0xYOUR_WALLET_ADDRESS"]
   }'
 ```
 
@@ -25,7 +24,7 @@ curl -X POST "https://euphoria.origin-trail.network/faucet/fund" \
 |-------|----------|-------------|
 | `mode` | Yes | Must be `"v10_base_sepolia"` |
 | `wallets` | Yes | Array of EVM addresses (1-4, no duplicates) |
-| `callerId` | No | Stable identifier for your installer/node — enables per-caller cooldown |
+| `callerId` | No | Stable identifier for your installer/node; enables per-caller cooldown. Bundled setup commands omit this field and rely on `Idempotency-Key` for retry safety. |
 
 ### Headers
 
@@ -61,9 +60,10 @@ Each wallet produces 2 result entries (ETH + TRAC). Possible `status` values: `s
 On `429` responses, back off using the `retry-after` header.
 
 Bundled setup commands such as `dkg init`, `dkg openclaw setup`, `dkg hermes setup`,
-and `dkg mcp setup` send a stable `callerId` derived from the configured node or
-agent name. Removing `~/.dkg` / `~/.dkg-dev` and re-running setup with the same
-name can therefore still hit caller cooldown even when new wallets are generated.
+and `dkg mcp setup` do not send `callerId` because caller cooldown can otherwise
+block later wallets in the same 4-wallet funding request. They still send a
+deterministic `Idempotency-Key` derived from the node/agent name and wallet batch
+so retrying the same funding operation remains safe.
 
 ## Dry run (test without sending transactions)
 

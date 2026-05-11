@@ -291,15 +291,15 @@ describe('requestFaucetFunding', () => {
     expect(result.error).toContain('faucet offline');
   });
 
-  it('includes nodeName in callerId and Idempotency-Key', async () => {
+  it('includes nodeName in the Idempotency-Key without sending callerId', async () => {
     const { fetch, calls } = createTrackingFetch(200, { summary: { success: 0 }, results: [] });
     await requestFaucetFunding(
       'https://faucet.example.com/fund', 'test', ['0xAAA'], 'my-special-node', fetch,
     );
     const reqBody = JSON.parse(calls[0].init.body as string);
-    expect(reqBody.callerId).toBe('dkg-node:my-special-node');
+    expect(reqBody).toEqual({ mode: 'test', wallets: ['0xAAA'] });
     const headers = calls[0].init.headers as Record<string, string>;
-    expect(headers['Idempotency-Key']).toMatch(/^init-test-my-special-node-/);
+    expect(headers['Idempotency-Key']).toMatch(/^init-v2-test-my-special-node-/);
   });
 
   it('sanitizes non-ASCII node names in Idempotency-Key header', async () => {
@@ -309,7 +309,7 @@ describe('requestFaucetFunding', () => {
     );
     const headers = calls[0].init.headers as Record<string, string>;
     const key = headers['Idempotency-Key'];
-    expect(key).toMatch(/^init-test-mon-n_ud-_l_ve-0xAAA$/);
+    expect(key).toMatch(/^init-v2-test-mon-n_ud-_l_ve-0xAAA$/);
     expect(key).toMatch(/^[\x20-\x7E]+$/);
   });
 });

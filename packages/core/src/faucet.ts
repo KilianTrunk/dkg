@@ -82,9 +82,9 @@ export async function requestFaucetFunding(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': `init-${mode}-${safeNodeName}-${[...batch].sort().join(',')}`,
+          'Idempotency-Key': `init-v2-${mode}-${safeNodeName}-${[...batch].sort().join(',')}`,
         },
-        body: JSON.stringify({ mode, wallets: batch, callerId: `dkg-node:${nodeName}` }),
+        body: JSON.stringify({ mode, wallets: batch }),
         signal: AbortSignal.timeout(30_000),
       });
       if (!res.ok) {

@@ -150,6 +150,10 @@ export interface FundWalletsNetworkConfig {
  */
 export interface FundWalletsBestEffortOptions {
   network: FundWalletsNetworkConfig;
+  /**
+   * Historical option name. Used only as the faucet idempotency-key seed;
+   * the request body intentionally omits faucet `callerId`.
+   */
   callerId: string;
   didStartDaemon: boolean;
 }

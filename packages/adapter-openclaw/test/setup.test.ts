@@ -3886,14 +3886,14 @@ describe('runSetup Step 5 — faucet funding', () => {
 
   // ---- C9: effective-name drift protection -----------------------------
   //
-  // The faucet's callerId and Idempotency-Key are derived from the
+  // The faucet Idempotency-Key seed is derived from the
   // `agentName` argument. `writeDkgConfig` uses first-wins semantics on
   // `name` (existing value wins unless --name was passed), so on re-runs
   // the name the node actually persists can differ from whatever
   // `discoverAgentName` returned in-memory this run (specifically when
   // IDENTITY.md has changed between runs). runSetup must thread the
-  // post-writeDkgConfig effective name through to the faucet so the
-  // caller identity matches what's persisted on disk.
+  // post-writeDkgConfig effective name through to the faucet so retry
+  // identity matches what's persisted on disk.
 
   it('faucet receives the persisted config.json name when IDENTITY.md changes between re-runs', async () => {
     const env = setupFaucetEnv();

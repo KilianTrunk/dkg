@@ -6681,6 +6681,13 @@ export class DKGAgent {
       predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
       object: `"${agentAddress}"`,
     });
+    // Also drop any agent-delegation for this agent, otherwise their
+    // node retains sync access via the delegation gate (peer-id /
+    // op-key allowlist) even after the agent is removed from the
+    // primary allowlist. See `inviteAgentToContextGraph` for the
+    // matching write side.
+    const delegationUri = `did:dkg:agent-delegation:${contextGraphId}:${agentAddress.toLowerCase()}`;
+    await this.store.deleteByPattern({ graph: cgMetaGraph, subject: delegationUri });
     this.deleteContextGraphMember(contextGraphId, 'agent', agentAddress);
     this.queueSharedMemoryGossipSubscription(contextGraphId);
 
@@ -6914,11 +6921,17 @@ export class DKGAgent {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
     const DKG = 'https://dkg.network/ontology#';
+    // Pin to `requestStatus = "pending"` so a previously-rejected (or
+    // already-approved) request is not re-loaded and re-approved by
+    // mistake — the join-request URI persists across status transitions
+    // (only `requestStatus` flips), so without this filter
+    // `approveJoinRequest` could resurrect a rejection.
     const result = await this.store.query(
       `SELECT ?sig ?ts ?scope ?expires ?peer ?opkey WHERE {
         GRAPH <${cgMetaGraph}> {
           <${requestUri}> <${DKG}signature> ?sig ;
-                          <${DKG}requestTimestamp> ?ts .
+                          <${DKG}requestTimestamp> ?ts ;
+                          <${DKG}requestStatus> "pending" .
           OPTIONAL { <${requestUri}> <${DKG}delegationScope> ?scope }
           OPTIONAL { <${requestUri}> <${DKG_ONTOLOGY.DKG_DELEGATION_EXPIRES_AT}> ?expires }
           OPTIONAL { <${requestUri}> <${DKG_ONTOLOGY.DKG_DELEGATION_DELEGATEE_PEER}> ?peer }

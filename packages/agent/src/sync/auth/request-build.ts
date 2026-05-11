@@ -93,6 +93,15 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
     request.requesterIdentityId = identityId.toString();
     request.requesterSignatureR = ethers.hexlify(signature.r);
     request.requesterSignatureVS = ethers.hexlify(signature.vs);
+    // Also surface the agent the node is acting on behalf of, so the
+    // curator can pin the delegation lookup to a specific principal
+    // (the op-key alone identifies the node, not the agent). The
+    // signer-mismatch check in `request-authorize` only fires when
+    // identityId == 0 so this carries no signing semantics — it's
+    // strictly an authorisation hint for the delegation gate.
+    if (defaultAgentAddress) {
+      request.requesterAgentAddress = defaultAgentAddress;
+    }
   } else if (defaultAgentAddress && defaultAgentPrivateKey) {
     const wallet = new ethers.Wallet(defaultAgentPrivateKey);
     const sig = ethers.Signature.from(await wallet.signMessage(digest));

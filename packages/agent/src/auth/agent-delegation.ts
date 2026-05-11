@@ -47,28 +47,33 @@ export interface SignedAgentDelegation extends AgentDelegationPayload {
 }
 
 /**
- * Canonical digest used for both signing and verification. The packing
- * order is fixed (changing it is a wire-protocol break) and includes a
- * version tag so we can extend the schema later via a clean cut.
+ * Canonical digest used for both signing and verification.
+ *
+ * Uses `AbiCoder.encode` (length-prefixed ABI encoding) rather than
+ * `solidityPacked` so adjacent dynamic-string fields can't collide
+ * (with packed encoding, moving bytes between e.g. `delegateePeerId`
+ * and `delegateeOpKey` would yield the same digest for two different
+ * payloads). The version tag is part of the digest so we can extend
+ * the schema later via a clean cut without ambiguity.
  *
  * Both delegatee fields are present in the digest as empty strings when
  * absent — this means the same payload always produces the same digest
  * regardless of which delegatee shape was chosen.
  */
 export function computeDelegationDigest(payload: AgentDelegationPayload): Uint8Array {
-  const digestHex = ethers.solidityPackedKeccak256(
-    ['string', 'string', 'string', 'string', 'string', 'uint256', 'uint256'],
+  const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
+    ['string', 'string', 'address', 'string', 'string', 'uint256', 'uint256'],
     [
-      'dkg.agent-delegation.v1',
+      'dkg.agent-delegation.v2',
       payload.scope,
       payload.agentAddress.toLowerCase(),
       payload.delegateePeerId ?? '',
-      (payload.delegateeOpKey ?? '').toLowerCase(),
+      payload.delegateeOpKey ? payload.delegateeOpKey.toLowerCase() : '',
       Math.trunc(payload.issuedAtMs),
       Math.trunc(payload.expiresAtMs ?? 0),
     ],
   );
-  return ethers.getBytes(digestHex);
+  return ethers.getBytes(ethers.keccak256(encoded));
 }
 
 export interface SignAgentDelegationParams extends AgentDelegationPayload {

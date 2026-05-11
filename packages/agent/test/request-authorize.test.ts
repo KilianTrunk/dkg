@@ -87,14 +87,27 @@ interface AuthCallParams {
   participants?: string[] | null;
   agentGateAddresses?: string[] | null;
   allowedPeers?: string[] | null;
-  allowedDelegateePeers?: string[];
-  allowedDelegateeKeys?: string[];
+  /**
+   * Per-agent map of delegated peer-ids. Test helper accepts either
+   * the raw Map or a sugar object `{[agentLower]: peerIds}` so test
+   * cases stay readable.
+   */
+  allowedDelegateePeers?: Map<string, string[]> | Record<string, string[]>;
+  allowedDelegateeKeys?: Map<string, string[]> | Record<string, string[]>;
   verifyIdentity?: (recoveredAddress: string, claimedIdentityId: bigint) => Promise<boolean>;
+}
+
+function toMap(input: Map<string, string[]> | Record<string, string[]> | undefined): Map<string, string[]> {
+  if (!input) return new Map();
+  if (input instanceof Map) return input;
+  return new Map(Object.entries(input).map(([k, v]) => [k.toLowerCase(), v]));
 }
 
 async function callAuth(params: AuthCallParams): Promise<{ allowed: boolean; logs: string[] }> {
   const logs: string[] = [];
   const ctx = { agentId: 'sync', operationId: 'test' } as any;
+  const peersMap = toMap(params.allowedDelegateePeers);
+  const keysMap = toMap(params.allowedDelegateeKeys);
   const allowed = await authorizePrivateSyncRequest({
     ctx,
     request: params.envelope,
@@ -107,8 +120,8 @@ async function callAuth(params: AuthCallParams): Promise<{ allowed: boolean; log
     getParticipants: async () => params.participants ?? null,
     getAllowedPeers: async () => params.allowedPeers ?? null,
     getAgentGateAddresses: async () => params.agentGateAddresses ?? null,
-    getAllowedDelegateePeers: async () => params.allowedDelegateePeers ?? [],
-    getAllowedDelegateeKeys: async () => params.allowedDelegateeKeys ?? [],
+    getAllowedDelegateePeers: async () => peersMap,
+    getAllowedDelegateeKeys: async () => keysMap,
     refreshMetaFromCurator: async () => false,
     logWarn: (_c, m) => logs.push(`WARN: ${m}`),
     logInfo: (_c, m) => logs.push(`INFO: ${m}`),
@@ -125,10 +138,11 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
     agentAddress = ethers.Wallet.createRandom().address;
   });
 
-  it('allows when recovered op-key signer matches an approved delegateeOpKey', async () => {
+  it('allows when recovered op-key signer matches an approved delegateeOpKey for the claimed agent', async () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '5',
+      requesterAgentAddress: agentAddress,
     });
     const { allowed, logs } = await callAuth({
       envelope,
@@ -136,17 +150,17 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
       participants: [agentAddress],
       agentGateAddresses: [agentAddress],
       allowedPeers: null,
-      allowedDelegateePeers: [],
-      allowedDelegateeKeys: [nodeOpKey.address.toLowerCase()],
+      allowedDelegateeKeys: { [agentAddress.toLowerCase()]: [nodeOpKey.address.toLowerCase()] },
     });
     expect(allowed).toBe(true);
     expect(logs.join('\n')).toMatch(/delegateeAllowed=true/);
   });
 
-  it('allows when remote peer-id matches an approved delegateePeer (op-key absent)', async () => {
+  it('allows when remote peer-id matches an approved delegateePeer for the claimed agent', async () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '5',
+      requesterAgentAddress: agentAddress,
     });
     const { allowed, logs } = await callAuth({
       envelope,
@@ -154,8 +168,7 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
       participants: [agentAddress],
       agentGateAddresses: [agentAddress],
       allowedPeers: null,
-      allowedDelegateePeers: [remotePeerId],
-      allowedDelegateeKeys: [],
+      allowedDelegateePeers: { [agentAddress.toLowerCase()]: [remotePeerId] },
     });
     expect(allowed).toBe(true);
     expect(logs.join('\n')).toMatch(/delegateeAllowed=true/);
@@ -165,6 +178,7 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '5',
+      requesterAgentAddress: agentAddress,
     });
     const otherKey = ethers.Wallet.createRandom().address.toLowerCase();
     const { allowed } = await callAuth({
@@ -173,8 +187,42 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
       participants: [agentAddress],
       agentGateAddresses: [agentAddress],
       allowedPeers: null,
-      allowedDelegateePeers: ['12D3KooWNotThisPeer'],
-      allowedDelegateeKeys: [otherKey],
+      allowedDelegateePeers: { [agentAddress.toLowerCase()]: ['12D3KooWNotThisPeer'] },
+      allowedDelegateeKeys: { [agentAddress.toLowerCase()]: [otherKey] },
+    });
+    expect(allowed).toBe(false);
+  });
+
+  it('denies when delegation exists for agent A but envelope claims agent B (cross-principal)', async () => {
+    // Agent B's node tries to use Agent A's delegated op-key. Each
+    // claim must be cross-checked against the SPECIFIC agent's
+    // delegation entity — graph-wide union would silently allow this.
+    const agentA = ethers.Wallet.createRandom().address;
+    const agentB = ethers.Wallet.createRandom().address;
+    const { envelope, remotePeerId } = await buildSignedEnvelope({
+      signer: nodeOpKey,
+      identityId: '5',
+      requesterAgentAddress: agentB, // claims to act for B
+    });
+    const { allowed } = await callAuth({
+      envelope,
+      remotePeerId,
+      // Only A has a delegation; B does not.
+      allowedDelegateeKeys: { [agentA.toLowerCase()]: [nodeOpKey.address.toLowerCase()] },
+    });
+    expect(allowed).toBe(false);
+  });
+
+  it('denies the delegatee path when envelope omits requesterAgentAddress (no principal claim)', async () => {
+    const { envelope, remotePeerId } = await buildSignedEnvelope({
+      signer: nodeOpKey,
+      identityId: '5',
+      // requesterAgentAddress intentionally omitted
+    });
+    const { allowed } = await callAuth({
+      envelope,
+      remotePeerId,
+      allowedDelegateeKeys: { [agentAddress.toLowerCase()]: [nodeOpKey.address.toLowerCase()] },
     });
     expect(allowed).toBe(false);
   });
@@ -202,14 +250,14 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '5',
+      requesterAgentAddress: agentAddress,
     });
     const { allowed } = await callAuth({
       envelope,
       remotePeerId,
       participants: [agentAddress],
       agentGateAddresses: [agentAddress],
-      allowedDelegateePeers: [nodeOpKey.address.toLowerCase()], // wrong list — should not match
-      allowedDelegateeKeys: [],
+      allowedDelegateePeers: { [agentAddress.toLowerCase()]: [nodeOpKey.address.toLowerCase()] }, // wrong list
     });
     expect(allowed).toBe(false);
   });
@@ -218,29 +266,28 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '5',
+      requesterAgentAddress: agentAddress,
     });
     delete (envelope as any).requesterSignatureR;
-    const getKeys = vi.fn(async () => [nodeOpKey.address.toLowerCase()]);
     const { allowed } = await callAuth({
       envelope,
       remotePeerId,
-      allowedDelegateeKeys: [nodeOpKey.address.toLowerCase()],
+      allowedDelegateeKeys: { [agentAddress.toLowerCase()]: [nodeOpKey.address.toLowerCase()] },
     });
     expect(allowed).toBe(false);
-    // Helper should not even be queried in the malformed-envelope short-circuit
-    expect(getKeys).not.toHaveBeenCalled();
   });
 
   it('rejects a stale envelope (older than syncAuthMaxAgeMs) even with a valid delegation', async () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '5',
-      issuedAtMs: Date.now() - 200_000, // > 90s
+      requesterAgentAddress: agentAddress,
+      issuedAtMs: Date.now() - 200_000,
     });
     const { allowed } = await callAuth({
       envelope,
       remotePeerId,
-      allowedDelegateeKeys: [nodeOpKey.address.toLowerCase()],
+      allowedDelegateeKeys: { [agentAddress.toLowerCase()]: [nodeOpKey.address.toLowerCase()] },
     });
     expect(allowed).toBe(false);
   });
@@ -249,11 +296,11 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '5',
+      requesterAgentAddress: agentAddress,
     });
     const seen = new Map<string, number>();
-    const ctx = {} as any;
     const args = {
-      ctx,
+      ctx: {} as any,
       request: envelope,
       remotePeerId,
       localPeerId: LOCAL_PEER,
@@ -264,8 +311,8 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
       getParticipants: async () => null,
       getAllowedPeers: async () => null,
       getAgentGateAddresses: async () => null,
-      getAllowedDelegateePeers: async () => [],
-      getAllowedDelegateeKeys: async () => [nodeOpKey.address.toLowerCase()],
+      getAllowedDelegateePeers: async () => new Map<string, string[]>(),
+      getAllowedDelegateeKeys: async () => new Map([[agentAddress.toLowerCase(), [nodeOpKey.address.toLowerCase()]]]),
       refreshMetaFromCurator: async () => false,
       logWarn: () => {},
       logInfo: () => {},
@@ -280,6 +327,7 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '5',
+      requesterAgentAddress: agentAddress,
     });
     let refreshed = false;
     const callsToGetKeys: string[] = [];
@@ -295,10 +343,12 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
       getParticipants: async () => null,
       getAllowedPeers: async () => null,
       getAgentGateAddresses: async () => null,
-      getAllowedDelegateePeers: async () => [],
+      getAllowedDelegateePeers: async () => new Map<string, string[]>(),
       getAllowedDelegateeKeys: async () => {
         callsToGetKeys.push(refreshed ? 'after-refresh' : 'before-refresh');
-        return refreshed ? [nodeOpKey.address.toLowerCase()] : [];
+        return refreshed
+          ? new Map([[agentAddress.toLowerCase(), [nodeOpKey.address.toLowerCase()]]])
+          : new Map<string, string[]>();
       },
       refreshMetaFromCurator: async () => {
         refreshed = true;
@@ -315,11 +365,12 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '7',
+      requesterAgentAddress: agentAddress,
     });
     const { allowed } = await callAuth({
       envelope,
       remotePeerId,
-      allowedDelegateeKeys: [nodeOpKey.address.toLowerCase()],
+      allowedDelegateeKeys: { [agentAddress.toLowerCase()]: [nodeOpKey.address.toLowerCase()] },
       verifyIdentity: async () => false,
     });
     expect(allowed).toBe(false);
@@ -360,15 +411,15 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
     const { envelope, remotePeerId } = await buildSignedEnvelope({
       signer: nodeOpKey,
       identityId: '5',
+      requesterAgentAddress: agentAddress,
     });
-    // AND-gate present but neither side matches; delegatee key DOES match → allowed.
     const { allowed } = await callAuth({
       envelope,
       remotePeerId,
       participants: null,
       agentGateAddresses: [agentAddress], // signer is op-key, not agent
       allowedPeers: ['12D3KooWNotThisPeer'],
-      allowedDelegateeKeys: [nodeOpKey.address.toLowerCase()],
+      allowedDelegateeKeys: { [agentAddress.toLowerCase()]: [nodeOpKey.address.toLowerCase()] },
     });
     expect(allowed).toBe(true);
   });

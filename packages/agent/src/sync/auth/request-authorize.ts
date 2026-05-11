@@ -24,13 +24,19 @@ interface AuthorizeSyncRequestParams {
   getAllowedPeers: (contextGraphId: string) => Promise<string[] | null>;
   getAgentGateAddresses: (contextGraphId: string) => Promise<string[] | null>;
   /**
-   * Libp2p peer-ids that an approved agent has delegated to act on its
-   * behalf for sync. Hit on either of these (peer-id transport carrier
-   * OR operational signer) is sufficient to authorise — the delegation
-   * was already verified at approval time.
+   * Per-agent map of libp2p peer-ids / op-keys an agent has delegated
+   * to act on its behalf for sync. Keyed by the lowercased agent
+   * address (the principal of the signed delegation).
+   *
+   * Auth binds the lookup to `request.requesterAgentAddress` (the
+   * "on behalf of" claim in the envelope) so a delegation granted by
+   * agent A doesn't authorise traffic claiming to act for agent B,
+   * even when both agents are hosted on the same node and share the
+   * same op-key. This is the single most important property of the
+   * delegation gate: graph-wide unions silently widen access.
    */
-  getAllowedDelegateePeers: (contextGraphId: string) => Promise<string[]>;
-  getAllowedDelegateeKeys: (contextGraphId: string) => Promise<string[]>;
+  getAllowedDelegateePeers: (contextGraphId: string) => Promise<Map<string, string[]>>;
+  getAllowedDelegateeKeys: (contextGraphId: string) => Promise<Map<string, string[]>>;
   refreshMetaFromCurator: (contextGraphId: string) => Promise<boolean>;
   logWarn: (ctx: OperationContext, message: string) => void;
   logInfo: (ctx: OperationContext, message: string) => void;
@@ -138,12 +144,19 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
     agent.toLowerCase() === recoveredAddress.toLowerCase(),
   ) ?? false;
   const isPeerAllowed = () => allowedPeers?.includes(remotePeerId) ?? false;
-  // Agent-signed delegation: the joiner agent authorised this node
-  // (peer-id and/or operational key) at approval time. A hit on either
-  // side suffices — the agent's signature is the source of truth, the
-  // node identifiers are just a convenient way to recognise carrier.
-  const isDelegateePeerAllowed = () => allowedDelegateePeers.includes(remotePeerId);
-  const isDelegateeKeyAllowed = () => allowedDelegateeKeys.includes(recoveredAddress.toLowerCase());
+  // Agent-signed delegation. The envelope's `requesterAgentAddress`
+  // is the "on behalf of" claim — the agent the joiner's node says
+  // it's representing. We then look up the delegation entity for
+  // THAT specific agent and verify the carrier identifiers
+  // (op-key signer and/or transport peer-id) match what the agent
+  // signed. Without an explicit principal claim we deny on this path
+  // — graph-wide union would let any node hosting an approved agent
+  // sync data on behalf of an unapproved one.
+  const claimedAgent = request.requesterAgentAddress?.toLowerCase();
+  const isDelegateePeerAllowed = () =>
+    !!claimedAgent && (allowedDelegateePeers.get(claimedAgent)?.includes(remotePeerId) ?? false);
+  const isDelegateeKeyAllowed = () =>
+    !!claimedAgent && (allowedDelegateeKeys.get(claimedAgent)?.includes(recoveredAddress.toLowerCase()) ?? false);
   const isDelegateeAllowed = () => isDelegateePeerAllowed() || isDelegateeKeyAllowed();
   const resolveAllowed = () => {
     if (isDelegateeAllowed()) return true;
@@ -167,9 +180,11 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
     }
   }
 
+  const delegateePeerSetForClaim = claimedAgent ? allowedDelegateePeers.get(claimedAgent)?.length ?? 0 : 0;
+  const delegateeKeySetForClaim = claimedAgent ? allowedDelegateeKeys.get(claimedAgent)?.length ?? 0 : 0;
   logInfo(
     ctx,
-    `Private sync auth for "${request.contextGraphId}": identityId=${requesterIdentityId.toString()} signer=${recoveredAddress} requesterAgentAddress=${request.requesterAgentAddress ?? 'n/a'} participantCount=${participants?.length ?? 0} agentGateCount=${agentGateAddresses?.length ?? 0} delegateePeerCount=${allowedDelegateePeers.length} delegateeKeyCount=${allowedDelegateeKeys.length} peerAllowed=${isPeerAllowed()} delegateeAllowed=${isDelegateeAllowed()} allowed=${allowed}`,
+    `Private sync auth for "${request.contextGraphId}": identityId=${requesterIdentityId.toString()} signer=${recoveredAddress} requesterAgentAddress=${request.requesterAgentAddress ?? 'n/a'} participantCount=${participants?.length ?? 0} agentGateCount=${agentGateAddresses?.length ?? 0} delegateePeerCount=${delegateePeerSetForClaim} delegateeKeyCount=${delegateeKeySetForClaim} peerAllowed=${isPeerAllowed()} delegateeAllowed=${isDelegateeAllowed()} allowed=${allowed}`,
   );
 
   if (allowed) {

@@ -587,6 +587,423 @@ describe('publishJsonLd', () => {
     expect(job?.request.seal).toBeDefined();
   }, 30_000);
 
+  it('async publish accepts preSignedAuthorAttestation and threads it byte-for-byte into LiftRequest.seal', async () => {
+    // Sync parity: caller pre-signs the AuthorAttestation externally
+    // (e.g. self-sovereign agent holds the key off-node) and passes the
+    // resulting seal as bytes. Mirrors sync's `preSignedAuthorAttestation`
+    // shape on `publishFromSharedMemory` / `assertionFinalize`. The agent
+    // layer threads the bytes verbatim into `LiftRequest.seal`; the
+    // publisher's SEAL INTEGRITY PREFLIGHT validates merkle parity at
+    // processNext-time exactly as it does for sync.
+    const { agent, store } = await createAgent('AsyncSealPreSignedBot');
+    await agent.createContextGraph({ id: 'async-seal-presigned', name: 'AsyncSealPreSigned', description: '' });
+    await agent.registerContextGraph('async-seal-presigned');
+
+    // Arbitrary bytes — passthrough verification doesn't depend on the
+    // seal being valid against the data. The publisher's preflight
+    // would reject these at processNext-time, but that's a separate
+    // concern from this agent-layer wiring test.
+    const expectedMerkleRoot = new Uint8Array(32).fill(0xab);
+    const customAuthor = '0xAaaAAaaaAaaaaaAAAaAaaaaaAAAaaaaAaAaAAaaA';
+    const sigR = new Uint8Array(32).fill(0xbb);
+    const sigVs = new Uint8Array(32).fill(0xcc);
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-seal-presigned',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/PreSignedEntity',
+          '@type': 'Thing',
+          'name': 'PreSigned',
+        },
+      },
+      {
+        localOnly: true,
+        preSignedAuthorAttestation: {
+          expectedMerkleRoot,
+          authorAddress: customAuthor,
+          signature: { r: sigR, vs: sigVs },
+          schemeVersion: 1,
+        },
+      },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    const seal = job?.request.seal;
+    expect(seal).toBeDefined();
+    expect(seal?.merkleRoot).toBe('0x' + 'ab'.repeat(32));
+    expect(seal?.authorAddress.toLowerCase()).toBe(customAuthor.toLowerCase());
+    expect(seal?.signature.r).toBe('0x' + 'bb'.repeat(32));
+    expect(seal?.signature.vs).toBe('0x' + 'cc'.repeat(32));
+    expect(seal?.schemeVersion).toBe(1);
+  }, 30_000);
+
+  it('async publish rejects preSignedAuthorAttestation + authorAgentAddress as mutually exclusive', async () => {
+    // Sync parity: `assertionFinalize` at dkg-agent.ts:4191-4193 throws
+    // when both `preSignedAuthorAttestation` and `authorAgentAddress`
+    // are supplied. Async enforces the same contract — either the
+    // caller delegates signing to the daemon (custodial keystore path)
+    // OR provides their own signature, never both.
+    const { agent } = await createAgent('AsyncSealMutexBot');
+    await agent.createContextGraph({ id: 'async-seal-mutex', name: 'AsyncSealMutex', description: '' });
+    await agent.registerContextGraph('async-seal-mutex');
+
+    const tenant = await agent.registerAgent('TenantMutex');
+
+    await expect(
+      agent.publishAsync(
+        'did:dkg:context-graph:async-seal-mutex',
+        {
+          public: {
+            '@context': 'http://schema.org/',
+            '@id': 'http://example.org/MutexEntity',
+            '@type': 'Thing',
+            'name': 'Mutex',
+          },
+        },
+        {
+          localOnly: true,
+          authorAgentAddress: tenant.agentAddress,
+          preSignedAuthorAttestation: {
+            expectedMerkleRoot: new Uint8Array(32).fill(0xab),
+            authorAddress: tenant.agentAddress,
+            signature: {
+              r: new Uint8Array(32).fill(0xbb),
+              vs: new Uint8Array(32).fill(0xcc),
+            },
+            schemeVersion: 1,
+          },
+        },
+      ),
+    ).rejects.toThrow(/mutually exclusive/);
+  }, 15_000);
+
+  it('async publish supports authorSignTypedData callback for self-sovereign signing (sync parity)', async () => {
+    // The callback path closes the symmetry gap with sync: a registered
+    // self-sovereign agent (caller holds the key off-node) can author
+    // an on-chain publish without the caller having to replicate the
+    // publisher's canonicalization pipeline. The daemon prepares the
+    // EIP-712 typed data over the same canonical bytes the publisher
+    // will see at processNext-time and INVOKES the callback to obtain
+    // the signature.
+    const { agent, store } = await createAgent('AsyncSealCallbackBot');
+    await agent.createContextGraph({ id: 'async-seal-callback', name: 'AsyncSealCallback', description: '' });
+    await agent.registerContextGraph('async-seal-callback');
+
+    // Self-sovereign — daemon never sees the key, only the address.
+    const externallyHeld = ethers.Wallet.createRandom();
+    const publicKeyCompressed = ethers.SigningKey.computePublicKey(externallyHeld.signingKey.publicKey, true);
+    const selfSov = await agent.registerAgent('SelfSovAuthor', { publicKey: publicKeyCompressed });
+    expect(selfSov.agentAddress.toLowerCase()).toBe(externallyHeld.address.toLowerCase());
+
+    let typedDataReceived: { domain: unknown; types: unknown; message: { authorAddress: string; merkleRoot: string } } | null = null;
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-seal-callback',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/SelfSovEntity',
+          '@type': 'Thing',
+          'name': 'SelfSov',
+        },
+      },
+      {
+        localOnly: true,
+        authorAgentAddress: selfSov.agentAddress,
+        authorSignTypedData: async (typedData) => {
+          typedDataReceived = typedData;
+          const sigHex = await externallyHeld.signTypedData(
+            typedData.domain,
+            typedData.types,
+            typedData.message,
+          );
+          const sig = ethers.Signature.from(sigHex);
+          return {
+            r: ethers.getBytes(sig.r),
+            vs: ethers.getBytes(sig.yParityAndS),
+          };
+        },
+      },
+    );
+
+    // The daemon-prepared typed data MUST name the self-sovereign agent
+    // as the author so the on-chain author binding matches.
+    expect(typedDataReceived).not.toBeNull();
+    expect(typedDataReceived!.message.authorAddress.toLowerCase()).toBe(selfSov.agentAddress.toLowerCase());
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    const seal = job?.request.seal;
+    expect(seal).toBeDefined();
+    expect(seal?.authorAddress.toLowerCase()).toBe(selfSov.agentAddress.toLowerCase());
+
+    // Recover author from the stored signature using the daemon-built
+    // canonical typed data — proves the callback's signature is what
+    // landed in the seal AND that it binds to the self-sovereign EOA
+    // (NOT the publisher).
+    const onChainId = (await agent.getContextGraphOnChainId('async-seal-callback')) as string;
+    const kav10Address = await (agent as unknown as {
+      chain: { getKnowledgeAssetsV10Address(): Promise<string> };
+    }).chain.getKnowledgeAssetsV10Address();
+    const chainId = await (agent as unknown as {
+      chain: { getEvmChainId(): Promise<bigint> };
+    }).chain.getEvmChainId();
+    const typed = buildAuthorAttestationTypedData({
+      chainId,
+      kav10Address,
+      contextGraphId: BigInt(onChainId),
+      merkleRoot: ethers.getBytes(seal!.merkleRoot),
+      authorAddress: seal!.authorAddress,
+      schemeVersion: seal!.schemeVersion,
+    });
+    const recovered = ethers.recoverAddress(
+      ethers.TypedDataEncoder.hash(typed.domain, typed.types, typed.message),
+      ethers.Signature.from({
+        r: seal!.signature.r,
+        yParityAndS: seal!.signature.vs,
+      }).serialized,
+    );
+    expect(recovered.toLowerCase()).toBe(externallyHeld.address.toLowerCase());
+    expect(recovered.toLowerCase()).not.toBe(
+      new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address.toLowerCase(),
+    );
+  }, 30_000);
+
+  it('async publish rejects authorSignTypedData without authorAgentAddress', async () => {
+    // A callback alone has no target address to fill into the seal's
+    // `authorAddress` slot. The mutex check fires before
+    // canonicalization to fail fast and clearly.
+    const { agent } = await createAgent('AsyncSealCallbackNoAddrBot');
+    await agent.createContextGraph({ id: 'async-seal-cb-noaddr', name: 'AsyncSealCBNoAddr', description: '' });
+    await agent.registerContextGraph('async-seal-cb-noaddr');
+
+    await expect(
+      agent.publishAsync(
+        'did:dkg:context-graph:async-seal-cb-noaddr',
+        {
+          public: {
+            '@context': 'http://schema.org/',
+            '@id': 'http://example.org/CBNoAddr',
+            '@type': 'Thing',
+            'name': 'CBNoAddr',
+          },
+        },
+        {
+          localOnly: true,
+          authorSignTypedData: async () => ({
+            r: new Uint8Array(32),
+            vs: new Uint8Array(32),
+          }),
+        },
+      ),
+    ).rejects.toThrow(/authorSignTypedData requires authorAgentAddress/);
+  }, 15_000);
+
+  it('E2E: async publish via authorSignTypedData callback lands on-chain with KC.author == self-sovereign agent', async () => {
+    // Top-of-stack proof for the self-sovereign callback path: a
+    // registered SELF-SOVEREIGN agent (caller holds the private key
+    // off-node) signs the daemon-prepared canonical merkle via the
+    // `authorSignTypedData` callback, the publisher consumes the
+    // seal verbatim, and the chain records the self-sovereign agent's
+    // address as KC.author — distinct from both the publisher's
+    // wallet AND any custodial agent the daemon might also hold.
+    const { agent, store } = await createAgent('AsyncCallbackE2EBot');
+    await agent.createContextGraph({ id: 'async-cb-e2e', name: 'AsyncCBE2E', description: '' });
+    await agent.registerContextGraph('async-cb-e2e');
+
+    // Self-sovereign registration: only the public key is on this
+    // node; the private key lives in `externallyHeld` (simulating
+    // a hardware wallet / browser extension / off-node KMS).
+    const externallyHeld = ethers.Wallet.createRandom();
+    const publicKeyCompressed = ethers.SigningKey.computePublicKey(externallyHeld.signingKey.publicKey, true);
+    const selfSov = await agent.registerAgent('SelfSovE2E', { publicKey: publicKeyCompressed });
+    const publisherAddress = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
+    expect(selfSov.agentAddress.toLowerCase()).toBe(externallyHeld.address.toLowerCase());
+    expect(selfSov.agentAddress.toLowerCase()).not.toBe(publisherAddress.toLowerCase());
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-cb-e2e',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/CBE2EEntity',
+          '@type': 'Thing',
+          'name': 'Callback E2E',
+        },
+      },
+      {
+        localOnly: true,
+        authorAgentAddress: selfSov.agentAddress,
+        authorSignTypedData: async (typedData) => {
+          const sigHex = await externallyHeld.signTypedData(
+            typedData.domain,
+            typedData.types,
+            typedData.message,
+          );
+          const sig = ethers.Signature.from(sigHex);
+          return {
+            r: ethers.getBytes(sig.r),
+            vs: ethers.getBytes(sig.yParityAndS),
+          };
+        },
+      },
+    );
+
+    // Drive processNext with the agent's own internal publisher so
+    // wallets + chain adapter match what enqueued the job.
+    const internalPublisher = (agent as unknown as {
+      publisher: {
+        publish: (opts: unknown) => Promise<{ status: string; onChainResult?: { batchId: bigint } }>;
+      };
+    }).publisher;
+    const runner = new TripleStoreAsyncLiftPublisher(store, {
+      publishExecutor: async ({ publishOptions }) => {
+        return internalPublisher.publish(publishOptions) as Promise<any>;
+      },
+    });
+    const finalized = await runner.processNext(publisherAddress);
+    expect(finalized).not.toBeNull();
+    expect(finalized?.jobId).toBe(captureID);
+    expect(finalized?.status === 'broadcast' || finalized?.status === 'included' || finalized?.status === 'finalized').toBe(true);
+
+    const chainAdapter = (agent as unknown as {
+      chain: { getLatestMerkleRootAuthor: (kcId: bigint) => Promise<string> };
+    }).chain;
+    const kcId = (finalized as any)?.broadcast?.batchId
+      ?? (finalized as any)?.inclusion?.batchId
+      ?? (finalized as any)?.finalization?.batchId;
+    expect(kcId).toBeDefined();
+    const onChainAuthor = await chainAdapter.getLatestMerkleRootAuthor(BigInt(kcId));
+    expect(onChainAuthor.toLowerCase()).toBe(selfSov.agentAddress.toLowerCase());
+    expect(onChainAuthor.toLowerCase()).not.toBe(publisherAddress.toLowerCase());
+  }, 60_000);
+
+  it('async publish threads opts.priorVersion into LiftRequest.priorVersion', async () => {
+    // Parity gap closure: `priorVersion` already exists at the
+    // LiftRequest layer and is validated by `mapLiftRequestToPublishOptions`
+    // but was never surfaced on the agent-level `PublishAsyncOpts`. This
+    // confirms a caller-supplied prior-version reference threads through
+    // enqueue unchanged so the canonical handoff sees the same value
+    // validation expects.
+    const { agent, store } = await createAgent('AsyncPriorVerBot');
+    await agent.createContextGraph({ id: 'async-priorver', name: 'AsyncPriorVer', description: '' });
+    await agent.registerContextGraph('async-priorver');
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-priorver',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/PriorVerEntity',
+          '@type': 'Thing',
+          'name': 'PriorVer',
+        },
+      },
+      {
+        localOnly: true,
+        transitionType: 'MUTATE',
+        priorVersion: 'did:dkg:mock:31337/0xabc/7',
+      },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.priorVersion).toBe('did:dkg:mock:31337/0xabc/7');
+    expect(job?.request.transitionType).toBe('MUTATE');
+  }, 15_000);
+
+  it('async publish threads opts.entityProofs into LiftRequest.entityProofs', async () => {
+    // Selective-disclosure mode (sync parity with PublishOptions.entityProofs).
+    // Confirms the flag persists through enqueue so the publisher's
+    // canonical-publish pipeline groups quads per-entity at processNext-time.
+    const { agent, store } = await createAgent('AsyncEntityProofsBot');
+    await agent.createContextGraph({ id: 'async-entity-proofs', name: 'AsyncEntityProofs', description: '' });
+    await agent.registerContextGraph('async-entity-proofs');
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-entity-proofs',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/EntityProofsRoot',
+          '@type': 'Thing',
+          'name': 'EntityProofs',
+        },
+      },
+      {
+        localOnly: true,
+        entityProofs: true,
+      },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.entityProofs).toBe(true);
+  }, 15_000);
+
+  it('async publish threads opts.publisherNodeIdentityIdOverride (bigint) into LiftRequest (stringified)', async () => {
+    // RFC-001 §4 per-publish attribution override (sync parity with
+    // PublishOptions.publisherNodeIdentityIdOverride). Lift queue
+    // persists via JSON-stringify so bigints are serialized as
+    // template-literal strings; the mapper parses back to bigint at
+    // the lift→publish handoff.
+    const { agent, store } = await createAgent('AsyncNodeIdOverrideBot');
+    await agent.createContextGraph({ id: 'async-node-id-override', name: 'AsyncNodeIdOverride', description: '' });
+    await agent.registerContextGraph('async-node-id-override');
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-node-id-override',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/NodeIdOverrideRoot',
+          '@type': 'Thing',
+          'name': 'NodeIdOverride',
+        },
+      },
+      {
+        localOnly: true,
+        publisherNodeIdentityIdOverride: 42n,
+      },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.publisherNodeIdentityIdOverride).toBe('42');
+  }, 15_000);
+
+  it('async publish preserves publisherNodeIdentityIdOverride === 0n (mode d "no attribution")', async () => {
+    // RFC-001 §4 mode d: explicit `0n` means "no attribution".
+    // Distinct from `undefined` (use daemon's persistent identity).
+    // The opts wiring uses `!== undefined` instead of truthy check so
+    // `0n` survives.
+    const { agent, store } = await createAgent('AsyncNodeIdZeroBot');
+    await agent.createContextGraph({ id: 'async-node-id-zero', name: 'AsyncNodeIdZero', description: '' });
+    await agent.registerContextGraph('async-node-id-zero');
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-node-id-zero',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/NodeIdZeroRoot',
+          '@type': 'Thing',
+          'name': 'NodeIdZero',
+        },
+      },
+      {
+        localOnly: true,
+        publisherNodeIdentityIdOverride: 0n,
+      },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.publisherNodeIdentityIdOverride).toBe('0');
+  }, 15_000);
+
   it('async publish records and resolves subGraphName for staged public and private data', async () => {
     const { agent, store } = await createAgent('AsyncSubGraphBot');
     await agent.createContextGraph({ id: 'async-subgraph', name: 'AsyncSubGraph', description: '' });

@@ -336,6 +336,93 @@ describe('mapLiftRequestToPublishOptions', () => {
     expect(seal.signature.vs).toEqual(new Uint8Array(32).fill(0xcc));
   });
 
+  it('forwards request.entityProofs to PublishOptions.entityProofs (overrides resolved.entityProofs)', () => {
+    // Caller intent persisted at enqueue (`request.entityProofs`)
+    // takes precedence over per-process resolution defaults
+    // (`resolved.entityProofs`).
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      request: {
+        ...baseInput().request,
+        entityProofs: true,
+      },
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: '12D3KooWPublisher',
+        // Even if resolution layer set false, request layer wins.
+        entityProofs: false,
+      },
+    });
+
+    expect(options.entityProofs).toBe(true);
+  });
+
+  it('falls back to resolved.entityProofs when request.entityProofs is undefined', () => {
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: '12D3KooWPublisher',
+        entityProofs: true,
+      },
+    });
+
+    expect(options.entityProofs).toBe(true);
+  });
+
+  it('parses request.publisherNodeIdentityIdOverride (stringified bigint) into PublishOptions (bigint)', () => {
+    // RFC-001 §4 attribution override: the lift queue persists bigints
+    // as template-literal strings (`${bigint}`) so JSON round-trips
+    // safely. The mapper parses back to native bigint.
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      request: {
+        ...baseInput().request,
+        publisherNodeIdentityIdOverride: '42',
+      },
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: '12D3KooWPublisher',
+      },
+    });
+
+    expect(options.publisherNodeIdentityIdOverride).toBe(42n);
+  });
+
+  it('preserves publisherNodeIdentityIdOverride === 0n (RFC-001 §4 mode d "no attribution")', () => {
+    // `'0'` is meaningful (no attribution), not "absent". The mapper
+    // distinguishes `'0'` from `undefined` using a strict `!== undefined`
+    // check rather than truthy coercion.
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      request: {
+        ...baseInput().request,
+        publisherNodeIdentityIdOverride: '0',
+      },
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: '12D3KooWPublisher',
+      },
+    });
+
+    expect(options.publisherNodeIdentityIdOverride).toBe(0n);
+  });
+
+  it('omits publisherNodeIdentityIdOverride from PublishOptions when request value is undefined', () => {
+    // When the caller never set the override, the field stays absent
+    // from `PublishOptions` so the publisher uses its persistent
+    // identity (pre-RFC-001 single-tenant semantics).
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: '12D3KooWPublisher',
+      },
+    });
+
+    expect(options.publisherNodeIdentityIdOverride).toBeUndefined();
+  });
+
   it('does NOT set precomputedAttestation when request.seal is absent', () => {
     const options = mapLiftRequestToPublishOptions({
       ...baseInput(),

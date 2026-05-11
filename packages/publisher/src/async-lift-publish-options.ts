@@ -106,6 +106,17 @@ export function mapLiftRequestToPublishOptions(input: LiftPublishMappingInput): 
     throw new Error('Lift publish mapping only allows allowedPeers when accessPolicy is allowList');
   }
 
+  // Per-publish behaviour flags routed via the LiftRequest (caller-
+  // intent, persisted at enqueue) take precedence over per-process
+  // resolution hints (publisher-side defaults set when resolving the
+  // workspace slice). The mapper falls back to `resolved` for
+  // backward compatibility with callers that set these at resolve
+  // time rather than enqueue time.
+  const entityProofs = input.request.entityProofs ?? input.resolved.entityProofs;
+  const publisherNodeIdentityIdOverride = input.request.publisherNodeIdentityIdOverride !== undefined
+    ? BigInt(input.request.publisherNodeIdentityIdOverride)
+    : undefined;
+
   return {
     contextGraphId: input.request.contextGraphId,
     quads: input.resolved.quads,
@@ -113,7 +124,7 @@ export function mapLiftRequestToPublishOptions(input: LiftPublishMappingInput): 
     publisherPeerId,
     accessPolicy,
     allowedPeers: allowedPeers.length > 0 ? allowedPeers : undefined,
-    entityProofs: input.resolved.entityProofs,
+    entityProofs,
     targetGraphUri: input.resolved.targetGraphUri,
     targetMetaGraphUri: input.resolved.targetMetaGraphUri,
     subGraphName: input.request.subGraphName,
@@ -121,6 +132,9 @@ export function mapLiftRequestToPublishOptions(input: LiftPublishMappingInput): 
     onPhase: input.resolved.onPhase,
     receiverSignatureProvider: input.resolved.receiverSignatureProvider,
     publishContextGraphId: input.resolved.publishContextGraphId,
+    ...(publisherNodeIdentityIdOverride !== undefined
+      ? { publisherNodeIdentityIdOverride }
+      : {}),
     // Lift-time author seal → publisher's `precomputedAttestation`.
     // The publisher's SEAL INTEGRITY PREFLIGHT recomputes the merkle
     // from the resolved slice and compares against this — drift kills

@@ -48,6 +48,23 @@ export interface LiftRequest {
   readonly accessPolicy?: LiftAccessPolicy;
   readonly allowedPeers?: readonly string[];
   /**
+   * V10 selective-disclosure flag mirroring `PublishOptions.entityProofs`.
+   * When true, the publisher groups quads by root entity and computes a
+   * per-entity `kaRoot`; the `kcMerkleRoot` becomes a Merkle tree over
+   * those `kaRoot` values (vs. the flat hash of triples). The seal
+   * computed at enqueue MUST honour the same flag so the publisher's
+   * SEAL INTEGRITY PREFLIGHT validates merkle parity.
+   */
+  readonly entityProofs?: boolean;
+  /**
+   * Per-publish override for `PublishOptions.publisherNodeIdentityIdOverride`
+   * (RFC-001 §4 attribution control). Stored as a stringified bigint so
+   * the lift queue's JSON persistence layer can round-trip safely; the
+   * mapper parses back to `bigint` at the lift→publish handoff.
+   * `'0'` is meaningful (mode d — no attribution).
+   */
+  readonly publisherNodeIdentityIdOverride?: LiftJobBigInt;
+  /**
    * Author attestation seal computed by the agent at enqueue time.
    * When present, the publisher consumes it verbatim at processNext-time
    * (after verifying its merkleRoot matches the publisher's canonical
@@ -70,6 +87,8 @@ export const LIFT_REQUEST_IMMUTABLE_FIELDS = [
   'subGraphName',
   'accessPolicy',
   'allowedPeers',
+  'entityProofs',
+  'publisherNodeIdentityIdOverride',
   'seal',
 ] as const;
 

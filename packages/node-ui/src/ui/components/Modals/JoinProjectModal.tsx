@@ -347,20 +347,32 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
     setSendingRequest(true);
     setError(null);
 
+    // Track whether the joiner managed to make a direct libp2p connection
+    // to the curator before posting the signed request. If we couldn't,
+    // delivery falls back to whichever existing peers happen to be the
+    // curator — which may be NONE on a freshly-started or sparsely-meshed
+    // node. The daemon's `forwardJoinRequest` walks `getPeers()` and posts
+    // PROTOCOL_JOIN_REQUEST to each; non-curators reply `not curator` and
+    // the request goes nowhere. Surface this as a soft warning instead of
+    // silently dropping, so the user knows their curator may not have seen
+    // anything yet — and can retry once their node has discovered more
+    // peers (or the curator can re-share the invite once they're online).
+    let curatorConnectFailed = false;
+
     try {
       if (curatorPeerId) {
         try {
           await connectToPeerIdWithTimeout(curatorPeerId);
           await new Promise(r => setTimeout(r, 500));
         } catch {
-          // Non-fatal — signed join requests can still be delivered via existing peers.
+          curatorConnectFailed = true;
         }
       } else if (legacyMultiaddr) {
         try {
           await connectToPeerWithTimeout(legacyMultiaddr);
           await new Promise(r => setTimeout(r, 500));
         } catch {
-          // Non-fatal — signed join requests can still be delivered via existing peers.
+          curatorConnectFailed = true;
         }
       }
 
@@ -374,8 +386,27 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
         // Non-fatal
       }
 
-      await submitJoinRequest(cgId, { ...signed, agentName });
+      const submitResult = await submitJoinRequest(cgId, { ...signed, agentName });
       setRequestSent(true);
+      // The daemon returns `delivered: 'local'` when this node is the curator
+      // (no P2P fan-out happens at all). Otherwise `forwardJoinRequest`
+      // delivers to N peers — the response carries `delivered: <count>`.
+      // If both the upfront connect failed AND the broadcast reached zero
+      // peers, the request is sitting in nowhere — warn the user.
+      const deliveredHint =
+        (submitResult as any)?.delivered ?? null;
+      if (curatorConnectFailed && deliveredHint === 0) {
+        setError(
+          'Request signed and broadcast, but we could neither reach the curator directly nor deliver via any other connected peer. The curator probably won\'t see it. Try again in a moment once your node has discovered more peers.',
+        );
+      } else if (curatorConnectFailed) {
+        // Soft warning: broadcast succeeded to SOMEONE, but not the curator
+        // directly. Delivery might still work (some peer may relay it later
+        // on the curator's next connect), but the user should know.
+        setError(
+          'Request sent, but we couldn\'t reach the curator\'s node directly. Delivery depends on other peers relaying — the curator may take longer than usual to see it.',
+        );
+      }
     } catch (err: any) {
       setError(err?.message || 'Failed to send join request');
     } finally {

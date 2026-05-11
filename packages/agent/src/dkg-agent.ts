@@ -1522,6 +1522,9 @@ export class DKGAgent {
         }
         this.verifyJoinRequest(contextGraphId, agentAddress, timestamp, signature);
         await this.storePendingJoinRequest(contextGraphId, agentAddress, signature, timestamp, agentName);
+        // Note: `storePendingJoinRequest` itself now emits JOIN_REQUEST_RECEIVED.
+        // No duplicate emit here.
+
         // Remember which peer actually delivered this request so we can
         // send approval/rejection back to the same peer later, even if
         // the agent registry hasn't indexed them yet.
@@ -1529,11 +1532,6 @@ export class DKGAgent {
           `${contextGraphId}::${agentAddress.toLowerCase()}`,
           peerId.toString(),
         );
-        this.eventBus.emit(DKGEvent.JOIN_REQUEST_RECEIVED, {
-          contextGraphId,
-          agentAddress,
-          agentName,
-        });
         return new TextEncoder().encode(JSON.stringify({ ok: true }));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -6690,6 +6688,20 @@ export class DKGAgent {
     });
     const ctx = createOperationContext('system');
     this.log.info(ctx, `Stored pending join request from ${agentAddress} for "${contextGraphId}"`);
+    // Emit JOIN_REQUEST_RECEIVED here (single source of truth) so the daemon's
+    // lifecycle.ts hook turns it into a SQLite notification + SSE broadcast
+    // for the curator's UI bell. Previously this emit lived only on the P2P
+    // handler in `setupNetworkHandlers`, so a join request that reached the
+    // curator via the HTTP `request-join` route's `isCurator` branch (e.g.
+    // when joiner and curator are the same node, or when a relay/bridge
+    // re-posts the request locally) silently stored without surfacing in
+    // notifications. Centralising the emit here means every successful
+    // store — regardless of inbound path — produces a notification.
+    this.eventBus.emit(DKGEvent.JOIN_REQUEST_RECEIVED, {
+      contextGraphId,
+      agentAddress,
+      agentName,
+    });
   }
 
   /**

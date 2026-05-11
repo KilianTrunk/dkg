@@ -236,8 +236,29 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
   };
 
   const allowedSet = new Set(allowedAgents.map(a => a.toLowerCase()));
+  // The "Network Agents" picker only shows currently-connected peers.
+  //
+  // `/api/agents` returns the full historical agent registry (every peer
+  // this node has ever discovered/synced with), which on a long-running
+  // testnet node easily reaches 1500+ rows dominated by old `smoke-node`
+  // and one-off test agents. Surfacing all of them as "+ Add" suggestions
+  // is overwhelming and not actionable — adding a long-offline peer to
+  // an allowlist isn't useful in practice.
+  //
+  // `connectionStatus === 'connected'` is computed at request time from
+  // live libp2p connections (`handleAgentChatRoutes` in
+  // `packages/cli/src/daemon/routes/agent-chat.ts`), so the filter is
+  // always accurate to "right now".
+  //
+  // The full `networkAgents` set is still used below to look up friendly
+  // names for already-allowlisted addresses, so an allowlisted peer that
+  // happens to be offline still renders with their name (not just hex).
+  // For ad-hoc adds of a disconnected agent, the operator can paste any
+  // 0x address into the input field below.
   const availablePeers = networkAgents.filter(
-    (a) => a.agentAddress && !allowedSet.has(a.agentAddress.toLowerCase()),
+    (a) => a.connectionStatus === 'connected'
+      && a.agentAddress
+      && !allowedSet.has(a.agentAddress.toLowerCase()),
   );
 
   return (
@@ -290,12 +311,12 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
 
           {activeTab === 'allowlist' && (
             <>
-              {/* Network Agents (Peer Directory) */}
+              {/* Network Agents (Peer Directory) — connected only */}
               {availablePeers.length > 0 && (
                 <div className="v10-form-group">
-                  <label className="v10-form-label">Network Agents</label>
+                  <label className="v10-form-label">Network Agents <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>· {availablePeers.length} online</span></label>
                   <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginBottom: 8 }}>
-                    Connected agents on the network. Click + to add to the allowlist.
+                    Showing agents currently connected to your node. Click + to add to the allowlist.
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 12 }}>
                     {availablePeers.map((a) => (

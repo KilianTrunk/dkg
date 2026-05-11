@@ -249,12 +249,32 @@ export const removeParticipant = (contextGraphId: string, agentAddress: string) 
 export const listParticipants = (contextGraphId: string) =>
   get<{ contextGraphId: string; allowedAgents: string[] }>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/participants`);
 
-// --- Join Request flow (Phase 2: signed requests + approval) ---
-export interface SignedJoinRequest {
-  contextGraphId: string;
+// --- Join Request flow (Phase 2: signed agent delegation) ---
+//
+// A join request now IS a `SignedAgentDelegation` — the agent's
+// signature scoped to `sync:<cgId>` that authorises their hosting node
+// (peer-id and/or operational key) to act on their behalf for that CG.
+// On approval the curator promotes the named delegatee identifiers
+// into the CG allowlist so post-approval sync passes auth without the
+// agent having to co-sign every wire message.
+export interface SignedAgentDelegation {
   agentAddress: string;
-  timestamp: number;
+  scope: string;
+  issuedAtMs: number;
+  expiresAtMs?: number;
+  delegateePeerId?: string;
+  delegateeOpKey?: string;
   signature: string;
+}
+
+export interface SignJoinResponse {
+  ok: boolean;
+  contextGraphId: string;
+  delegation: SignedAgentDelegation;
+  agentAddress: string;
+  delivered: number;
+  errors?: string[];
+  status: 'sent' | 'no-curator-found';
 }
 
 export interface PendingJoinRequest {
@@ -265,10 +285,16 @@ export interface PendingJoinRequest {
   status: string;
 }
 
-export const signJoinRequest = (contextGraphId: string) =>
-  post<SignedJoinRequest>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/sign-join`, {});
+export const signJoinRequest = (contextGraphId: string, curatorPeerId?: string) =>
+  post<SignJoinResponse>(
+    `/api/context-graph/${encodeURIComponent(contextGraphId)}/sign-join`,
+    curatorPeerId ? { curatorPeerId } : {},
+  );
 
-export const submitJoinRequest = (contextGraphId: string, req: SignedJoinRequest & { agentName?: string }) =>
+export const submitJoinRequest = (
+  contextGraphId: string,
+  req: { delegation: SignedAgentDelegation; agentName?: string; curatorPeerId?: string },
+) =>
   post<{ ok: boolean; status: string }>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/request-join`, req);
 
 export const listJoinRequests = (contextGraphId: string) =>

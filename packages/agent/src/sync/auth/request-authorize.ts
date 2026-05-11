@@ -23,6 +23,14 @@ interface AuthorizeSyncRequestParams {
   getParticipants: (contextGraphId: string) => Promise<string[] | null>;
   getAllowedPeers: (contextGraphId: string) => Promise<string[] | null>;
   getAgentGateAddresses: (contextGraphId: string) => Promise<string[] | null>;
+  /**
+   * Libp2p peer-ids that an approved agent has delegated to act on its
+   * behalf for sync. Hit on either of these (peer-id transport carrier
+   * OR operational signer) is sufficient to authorise — the delegation
+   * was already verified at approval time.
+   */
+  getAllowedDelegateePeers: (contextGraphId: string) => Promise<string[]>;
+  getAllowedDelegateeKeys: (contextGraphId: string) => Promise<string[]>;
   refreshMetaFromCurator: (contextGraphId: string) => Promise<boolean>;
   logWarn: (ctx: OperationContext, message: string) => void;
   logInfo: (ctx: OperationContext, message: string) => void;
@@ -41,6 +49,8 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
     getParticipants,
     getAllowedPeers,
     getAgentGateAddresses,
+    getAllowedDelegateePeers,
+    getAllowedDelegateeKeys,
     refreshMetaFromCurator,
     logWarn,
     logInfo,
@@ -118,6 +128,8 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
   let participants = await getParticipants(request.contextGraphId);
   let agentGateAddresses = await getAgentGateAddresses(request.contextGraphId);
   let allowedPeers = await getAllowedPeers(request.contextGraphId);
+  let allowedDelegateePeers = await getAllowedDelegateePeers(request.contextGraphId);
+  let allowedDelegateeKeys = await getAllowedDelegateeKeys(request.contextGraphId);
   const isParticipantAllowed = () => participants?.some((p) =>
     p.toLowerCase() === recoveredAddress.toLowerCase() ||
     (requesterIdentityId > 0n && p === String(requesterIdentityId)),
@@ -126,7 +138,15 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
     agent.toLowerCase() === recoveredAddress.toLowerCase(),
   ) ?? false;
   const isPeerAllowed = () => allowedPeers?.includes(remotePeerId) ?? false;
+  // Agent-signed delegation: the joiner agent authorised this node
+  // (peer-id and/or operational key) at approval time. A hit on either
+  // side suffices — the agent's signature is the source of truth, the
+  // node identifiers are just a convenient way to recognise carrier.
+  const isDelegateePeerAllowed = () => allowedDelegateePeers.includes(remotePeerId);
+  const isDelegateeKeyAllowed = () => allowedDelegateeKeys.includes(recoveredAddress.toLowerCase());
+  const isDelegateeAllowed = () => isDelegateePeerAllowed() || isDelegateeKeyAllowed();
   const resolveAllowed = () => {
+    if (isDelegateeAllowed()) return true;
     if (agentGateAddresses !== null && allowedPeers !== null) {
       return isPeerAllowed() && isAgentGateAllowed();
     }
@@ -141,13 +161,15 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
       participants = await getParticipants(request.contextGraphId);
       agentGateAddresses = await getAgentGateAddresses(request.contextGraphId);
       allowedPeers = await getAllowedPeers(request.contextGraphId);
+      allowedDelegateePeers = await getAllowedDelegateePeers(request.contextGraphId);
+      allowedDelegateeKeys = await getAllowedDelegateeKeys(request.contextGraphId);
       allowed = resolveAllowed();
     }
   }
 
   logInfo(
     ctx,
-    `Private sync auth for "${request.contextGraphId}": identityId=${requesterIdentityId.toString()} signer=${recoveredAddress} requesterAgentAddress=${request.requesterAgentAddress ?? 'n/a'} participantCount=${participants?.length ?? 0} agentGateCount=${agentGateAddresses?.length ?? 0} peerAllowed=${isPeerAllowed()} allowed=${allowed}`,
+    `Private sync auth for "${request.contextGraphId}": identityId=${requesterIdentityId.toString()} signer=${recoveredAddress} requesterAgentAddress=${request.requesterAgentAddress ?? 'n/a'} participantCount=${participants?.length ?? 0} agentGateCount=${agentGateAddresses?.length ?? 0} delegateePeerCount=${allowedDelegateePeers.length} delegateeKeyCount=${allowedDelegateeKeys.length} peerAllowed=${isPeerAllowed()} delegateeAllowed=${isDelegateeAllowed()} allowed=${allowed}`,
   );
 
   if (allowed) {

@@ -376,7 +376,7 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
         }
       }
 
-      const signed = await signJoinRequest(cgId);
+      const signed = await signJoinRequest(cgId, curatorPeerId);
 
       let agentName: string | undefined;
       try {
@@ -386,7 +386,11 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
         // Non-fatal
       }
 
-      const submitResult = await submitJoinRequest(cgId, { ...signed, agentName });
+      const submitResult = await submitJoinRequest(cgId, {
+        delegation: signed.delegation,
+        agentName,
+        curatorPeerId,
+      });
       setRequestSent(true);
       // The daemon returns `delivered: 'local'` when this node is the curator
       // (no P2P fan-out happens at all). Otherwise `forwardJoinRequest`

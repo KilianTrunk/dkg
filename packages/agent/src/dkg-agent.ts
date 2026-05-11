@@ -67,6 +67,11 @@ import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type Di
 import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler } from './messaging.js';
 import { ed25519ToX25519Private, ed25519ToX25519Public } from './encryption.js';
 import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, type AgentProfileConfig } from './profile.js';
+import {
+  signAgentDelegation,
+  verifyAgentDelegation,
+  type SignedAgentDelegation,
+} from './auth/agent-delegation.js';
 import { SyncVerifyWorker } from './sync-verify-worker.js';
 import { bindRandomSampling, type RandomSamplingHandle, type RandomSamplingStatus } from './random-sampling-bind.js';
 import { connectToMultiaddr, ensurePeerConnected as ensurePeerConnectedAtom, primeCatchupConnections as primeCatchupConnectionsAtom } from './p2p/peer-connect.js';
@@ -240,6 +245,20 @@ const SYNC_ROUTER_ATTEMPTS = 3;
 const SYNC_PROTOCOL_CHECK_ATTEMPTS = 3;
 const SYNC_PROTOCOL_CHECK_DELAY_MS = 500;
 const SYNC_AUTH_MAX_AGE_MS = 90_000;
+
+/**
+ * How long an agent's join-request delegation is valid for. The same
+ * delegation authorises the joiner's node to sync this CG on behalf of
+ * the agent for the lifetime of the membership; we default to 1 year so
+ * that approved joiners don't silently lose access after a short window.
+ * The agent can re-issue at any time by signing a fresh delegation.
+ */
+const JOIN_DELEGATION_VALIDITY_MS = 365 * 24 * 60 * 60 * 1000;
+
+/** Scope string for join-request delegations. Authorises the named node to sync the CG. */
+function joinDelegationScope(contextGraphId: string): string {
+  return `sync:${contextGraphId}`;
+}
 
 /**
  * Wire-level sentinel returned by the sync responder when ACL authorization
@@ -1560,8 +1579,12 @@ export class DKGAgent {
           return new TextEncoder().encode(JSON.stringify({ ok: true }));
         }
 
-        const { contextGraphId, agentAddress, signature, timestamp, agentName } = payload;
-        if (!contextGraphId || !agentAddress || !signature || !timestamp) {
+        const { contextGraphId, delegation, agentName } = payload as {
+          contextGraphId?: string;
+          delegation?: SignedAgentDelegation;
+          agentName?: string;
+        };
+        if (!contextGraphId || !delegation?.agentAddress || !delegation?.signature) {
           return new TextEncoder().encode(JSON.stringify({ ok: false, error: 'missing fields' }));
         }
         // Only store if this node is the curator (creator) of the CG
@@ -1577,8 +1600,8 @@ export class DKGAgent {
         if (!isCurator) {
           return new TextEncoder().encode(JSON.stringify({ ok: false, error: 'not curator' }));
         }
-        this.verifyJoinRequest(contextGraphId, agentAddress, timestamp, signature);
-        await this.storePendingJoinRequest(contextGraphId, agentAddress, signature, timestamp, agentName);
+        this.verifyJoinRequest(contextGraphId, delegation);
+        await this.storePendingJoinRequest(contextGraphId, delegation, agentName);
         // Note: `storePendingJoinRequest` itself now emits JOIN_REQUEST_RECEIVED.
         // No duplicate emit here.
 
@@ -1586,7 +1609,7 @@ export class DKGAgent {
         // send approval/rejection back to the same peer later, even if
         // the agent registry hasn't indexed them yet.
         this.joinRequestOriginPeers.set(
-          `${contextGraphId}::${agentAddress.toLowerCase()}`,
+          `${contextGraphId}::${delegation.agentAddress.toLowerCase()}`,
           peerId.toString(),
         );
         return new TextEncoder().encode(JSON.stringify({ ok: true }));
@@ -3678,6 +3701,72 @@ export class DKGAgent {
     }
 
     return sawAgentGate ? agents : null;
+  }
+
+  /**
+   * Read libp2p peer-ids that an approved agent has authorised, via a
+   * signed delegation, to act on its behalf for sync against this CG.
+   * Used by the sync auth path so a sync request signed by the joiner's
+   * NODE (operational) key passes auth — the agent itself doesn't
+   * co-sign every wire message.
+   *
+   * Returns the union across all (cg, agent) delegations recorded in
+   * `_meta`. Empty array means "no delegations recorded" — the sync auth
+   * path then falls back to the legacy peer-id and agent-gate checks.
+   */
+  private async getContextGraphAllowedDelegateePeers(contextGraphId: string): Promise<string[]> {
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?peer WHERE {
+        GRAPH <${cgMetaGraph}> {
+          ?d <${DKG_ONTOLOGY.DKG_ALLOWED_DELEGATEE_PEER}> ?peer
+        }
+      }`,
+    );
+    if (result.type !== 'bindings') return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const row of result.bindings) {
+      const raw = row['peer'];
+      if (typeof raw !== 'string') continue;
+      const v = raw.replace(/^"/, '').replace(/"(@[a-zA-Z-]+|\^\^<[^>]+>)?$/, '');
+      if (v && !seen.has(v)) {
+        seen.add(v);
+        out.push(v);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Same as `getContextGraphAllowedDelegateePeers` but for ethereum
+   * operational-key addresses authorised via a signed delegation.
+   * Addresses are returned in lowercase form for case-insensitive
+   * comparison; callers should `.toLowerCase()` the recovered signer
+   * before lookup.
+   */
+  private async getContextGraphAllowedDelegateeKeys(contextGraphId: string): Promise<string[]> {
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?key WHERE {
+        GRAPH <${cgMetaGraph}> {
+          ?d <${DKG_ONTOLOGY.DKG_ALLOWED_DELEGATEE_KEY}> ?key
+        }
+      }`,
+    );
+    if (result.type !== 'bindings') return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const row of result.bindings) {
+      const raw = row['key'];
+      if (typeof raw !== 'string') continue;
+      const v = raw.replace(/^"/, '').replace(/"(@[a-zA-Z-]+|\^\^<[^>]+>)?$/, '').toLowerCase();
+      if (v && !seen.has(v)) {
+        seen.add(v);
+        out.push(v);
+      }
+    }
+    return out;
   }
 
   private hasLocalAgentInGate(agentGateAddresses: readonly string[]): boolean {
@@ -6459,7 +6548,12 @@ export class DKGAgent {
    * Invite an agent (by Ethereum address) to join an existing context graph.
    * Adds the agent to the local allowlist in `_meta`.
    */
-  async inviteAgentToContextGraph(contextGraphId: string, agentAddress: string, callerAgentAddress?: string): Promise<void> {
+  async inviteAgentToContextGraph(
+    contextGraphId: string,
+    agentAddress: string,
+    callerAgentAddress?: string,
+    delegation?: SignedAgentDelegation,
+  ): Promise<void> {
     const ctx = createOperationContext('system');
     const ethAddrRe = /^0x[0-9a-fA-F]{40}$/;
     if (!ethAddrRe.test(agentAddress)) {
@@ -6484,7 +6578,6 @@ export class DKGAgent {
     const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
     const quadsToInsert: Quad[] = [];
 
-    // If first allowlist entry, also add our own agent so the curator doesn't lock themselves out
     const existingParticipants = await this.getPrivateContextGraphParticipants(contextGraphId);
     if ((!existingParticipants || existingParticipants.length === 0) && this.defaultAgentAddress) {
       quadsToInsert.push({
@@ -6510,6 +6603,33 @@ export class DKGAgent {
       graph: cgMetaGraph,
     });
 
+    // If the agent gave us a signed delegation (via the join-request
+    // path), promote its delegatee identifiers into the CG's allowlist
+    // so post-approval sync requests from the joiner's node pass auth
+    // even though they're signed by the node's operational key (which
+    // is NOT the agent's primary key).
+    //
+    // Each (cg, agent) pair gets ONE delegation node — re-approving
+    // the same agent overwrites the prior delegation.
+    if (delegation) {
+      const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+      const DKG = 'https://dkg.network/ontology#';
+      const delegationUri = `did:dkg:agent-delegation:${contextGraphId}:${agentAddress.toLowerCase()}`;
+      await this.store.deleteByPattern({ graph: cgMetaGraph, subject: delegationUri });
+      quadsToInsert.push({ subject: delegationUri, predicate: RDF_TYPE, object: `${DKG}AgentDelegation`, graph: cgMetaGraph });
+      quadsToInsert.push({ subject: delegationUri, predicate: DKG_ONTOLOGY.DKG_DELEGATION_AGENT, object: `"${agentAddress.toLowerCase()}"`, graph: cgMetaGraph });
+      quadsToInsert.push({ subject: delegationUri, predicate: DKG_ONTOLOGY.DKG_DELEGATION_ISSUED_AT, object: `"${delegation.issuedAtMs}"`, graph: cgMetaGraph });
+      if (delegation.expiresAtMs && delegation.expiresAtMs > 0) {
+        quadsToInsert.push({ subject: delegationUri, predicate: DKG_ONTOLOGY.DKG_DELEGATION_EXPIRES_AT, object: `"${delegation.expiresAtMs}"`, graph: cgMetaGraph });
+      }
+      if (delegation.delegateePeerId) {
+        quadsToInsert.push({ subject: delegationUri, predicate: DKG_ONTOLOGY.DKG_ALLOWED_DELEGATEE_PEER, object: `"${delegation.delegateePeerId}"`, graph: cgMetaGraph });
+      }
+      if (delegation.delegateeOpKey) {
+        quadsToInsert.push({ subject: delegationUri, predicate: DKG_ONTOLOGY.DKG_ALLOWED_DELEGATEE_KEY, object: `"${delegation.delegateeOpKey.toLowerCase()}"`, graph: cgMetaGraph });
+      }
+    }
+
     await this.store.insert(quadsToInsert);
     this.upsertContextGraphMember({
       contextGraphId,
@@ -6520,7 +6640,12 @@ export class DKGAgent {
       source: 'allowed-agent',
     });
 
-    this.log.info(ctx, `Invited agent ${agentAddress} to context graph "${contextGraphId}"`);
+    this.log.info(
+      ctx,
+      delegation
+        ? `Invited agent ${agentAddress} to context graph "${contextGraphId}" with delegation (peer=${delegation.delegateePeerId ?? 'n/a'}, opKey=${delegation.delegateeOpKey ?? 'n/a'})`
+        : `Invited agent ${agentAddress} to context graph "${contextGraphId}"`,
+    );
   }
 
   /**
@@ -6657,7 +6782,7 @@ export class DKGAgent {
   async signJoinRequest(
     contextGraphId: string,
     agentAddress?: string,
-  ): Promise<{ contextGraphId: string; agentAddress: string; timestamp: number; signature: string }> {
+  ): Promise<SignedAgentDelegation> {
     const addr = agentAddress ?? this.defaultAgentAddress;
     if (!addr) throw new Error('No agent address available');
 
@@ -6666,69 +6791,85 @@ export class DKGAgent {
       throw new Error(`No private key for agent ${addr} — self-sovereign agents must sign externally`);
     }
 
-    const timestamp = Date.now();
-    const digest = ethers.solidityPackedKeccak256(
-      ['string', 'string', 'uint256'],
-      [contextGraphId, addr.toLowerCase(), timestamp],
-    );
-    const wallet = new ethers.Wallet(agent.privateKey);
-    const signature = await wallet.signMessage(ethers.getBytes(digest));
-    return { contextGraphId, agentAddress: addr, timestamp, signature };
+    // Bind to BOTH delegatee shapes when available so the agent's
+    // approval survives rotation of either key. The libp2p peer-id is
+    // always available; the operational key is available when the chain
+    // adapter advertises one (typical V10 nodes do).
+    const delegateePeerId = this.peerId;
+    let delegateeOpKey: string | undefined;
+    try {
+      delegateeOpKey = await inferAdapterPublisherAddress(this.chain);
+    } catch {
+      // Best-effort — delegateePeerId alone is sufficient.
+    }
+
+    const issuedAtMs = Date.now();
+    const expiresAtMs = issuedAtMs + JOIN_DELEGATION_VALIDITY_MS;
+
+    return signAgentDelegation({
+      agentAddress: addr,
+      scope: joinDelegationScope(contextGraphId),
+      issuedAtMs,
+      expiresAtMs,
+      delegateePeerId,
+      delegateeOpKey,
+      agentPrivateKey: agent.privateKey,
+    });
   }
 
   /**
-   * Verify a signed join request by recovering the signer address.
-   * Returns the recovered Ethereum address if valid, throws on failure.
+   * Verify a signed join-request delegation. Re-uses the generic
+   * `verifyAgentDelegation` primitive and pins the scope to this CG.
+   * Throws on any failure.
    */
-  verifyJoinRequest(
-    contextGraphId: string,
-    agentAddress: string,
-    timestamp: number,
-    signature: string,
-  ): string {
-    const MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
-    if (Date.now() - timestamp > MAX_AGE_MS) {
-      throw new Error('Join request expired');
-    }
-    const digest = ethers.solidityPackedKeccak256(
-      ['string', 'string', 'uint256'],
-      [contextGraphId, agentAddress.toLowerCase(), timestamp],
-    );
-    const recovered = ethers.verifyMessage(ethers.getBytes(digest), signature);
-    if (recovered.toLowerCase() !== agentAddress.toLowerCase()) {
-      throw new Error(`Signature mismatch: expected ${agentAddress}, recovered ${recovered}`);
-    }
-    return recovered;
+  verifyJoinRequest(contextGraphId: string, delegation: SignedAgentDelegation): SignedAgentDelegation {
+    verifyAgentDelegation(delegation, { expectedScope: joinDelegationScope(contextGraphId) });
+    return delegation;
   }
 
   /**
-   * Store a pending join request in the CG's _meta graph.
-   * The curator can later approve or reject it.
+   * Store a pending join request — the agent's signed delegation — in
+   * the CG's `_meta` graph. The curator can later approve or reject.
+   *
+   * Persists the FULL delegation (agentAddress, scope, issuedAtMs,
+   * expiresAtMs, delegateePeerId, delegateeOpKey, signature) so that
+   * approval can re-verify against the same digest, and so that the
+   * approved delegatee identifiers can be promoted into the CG's
+   * allowlist via `inviteAgentToContextGraph` without round-tripping
+   * the joiner.
    */
   async storePendingJoinRequest(
     contextGraphId: string,
-    agentAddress: string,
-    signature: string,
-    timestamp: number,
+    delegation: SignedAgentDelegation,
     agentName?: string,
   ): Promise<void> {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
+    const requestUri = `did:dkg:join-request:${contextGraphId}:${delegation.agentAddress.toLowerCase()}`;
     const DKG = 'https://dkg.network/ontology#';
     const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
     const SCHEMA_NAME = 'https://schema.org/name';
 
-    // Remove any prior pending request from this agent
     await this.store.deleteByPattern({ graph: cgMetaGraph, subject: requestUri });
 
     const quads: Quad[] = [
       { subject: requestUri, predicate: RDF_TYPE, object: `${DKG}JoinRequest`, graph: cgMetaGraph },
-      { subject: requestUri, predicate: `${DKG}agentAddress`, object: `"${agentAddress}"`, graph: cgMetaGraph },
+      { subject: requestUri, predicate: `${DKG}agentAddress`, object: `"${delegation.agentAddress}"`, graph: cgMetaGraph },
       { subject: requestUri, predicate: `${DKG}contextGraphId`, object: `"${contextGraphId}"`, graph: cgMetaGraph },
-      { subject: requestUri, predicate: `${DKG}signature`, object: `"${signature}"`, graph: cgMetaGraph },
-      { subject: requestUri, predicate: `${DKG}requestTimestamp`, object: `"${timestamp}"`, graph: cgMetaGraph },
+      { subject: requestUri, predicate: `${DKG}signature`, object: `"${delegation.signature}"`, graph: cgMetaGraph },
+      { subject: requestUri, predicate: `${DKG}requestTimestamp`, object: `"${delegation.issuedAtMs}"`, graph: cgMetaGraph },
       { subject: requestUri, predicate: `${DKG}requestStatus`, object: `"pending"`, graph: cgMetaGraph },
+      { subject: requestUri, predicate: `${DKG}delegationScope`, object: `"${delegation.scope}"`, graph: cgMetaGraph },
+      { subject: requestUri, predicate: DKG_ONTOLOGY.DKG_DELEGATION_ISSUED_AT, object: `"${delegation.issuedAtMs}"`, graph: cgMetaGraph },
     ];
+    if (delegation.expiresAtMs && delegation.expiresAtMs > 0) {
+      quads.push({ subject: requestUri, predicate: DKG_ONTOLOGY.DKG_DELEGATION_EXPIRES_AT, object: `"${delegation.expiresAtMs}"`, graph: cgMetaGraph });
+    }
+    if (delegation.delegateePeerId) {
+      quads.push({ subject: requestUri, predicate: DKG_ONTOLOGY.DKG_DELEGATION_DELEGATEE_PEER, object: `"${delegation.delegateePeerId}"`, graph: cgMetaGraph });
+    }
+    if (delegation.delegateeOpKey) {
+      quads.push({ subject: requestUri, predicate: DKG_ONTOLOGY.DKG_DELEGATION_DELEGATEE_KEY, object: `"${delegation.delegateeOpKey.toLowerCase()}"`, graph: cgMetaGraph });
+    }
     if (agentName) {
       quads.push({ subject: requestUri, predicate: SCHEMA_NAME, object: `"${agentName}"`, graph: cgMetaGraph });
     }
@@ -6736,15 +6877,15 @@ export class DKGAgent {
     this.upsertContextGraphMember({
       contextGraphId,
       principalType: 'agent',
-      principalId: agentAddress,
+      principalId: delegation.agentAddress,
       role: 'requester',
       status: 'pending',
       source: 'join-request',
       ...(agentName ? { displayName: agentName } : {}),
-      metadata: { timestamp },
+      metadata: { timestamp: delegation.issuedAtMs },
     });
     const ctx = createOperationContext('system');
-    this.log.info(ctx, `Stored pending join request from ${agentAddress} for "${contextGraphId}"`);
+    this.log.info(ctx, `Stored pending join request from ${delegation.agentAddress} for "${contextGraphId}"`);
     // Emit JOIN_REQUEST_RECEIVED here (single source of truth) so the daemon's
     // lifecycle.ts hook turns it into a SQLite notification + SSE broadcast
     // for the curator's UI bell. Previously this emit lived only on the P2P
@@ -6756,9 +6897,54 @@ export class DKGAgent {
     // store — regardless of inbound path — produces a notification.
     this.eventBus.emit(DKGEvent.JOIN_REQUEST_RECEIVED, {
       contextGraphId,
-      agentAddress,
+      agentAddress: delegation.agentAddress,
       agentName,
     });
+  }
+
+  /**
+   * Reload a stored join-request delegation in its full
+   * `SignedAgentDelegation` shape so it can be re-verified at approval
+   * time and its delegatee identifiers promoted into the CG allowlist.
+   */
+  async loadPendingJoinDelegation(
+    contextGraphId: string,
+    agentAddress: string,
+  ): Promise<SignedAgentDelegation | null> {
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
+    const DKG = 'https://dkg.network/ontology#';
+    const result = await this.store.query(
+      `SELECT ?sig ?ts ?scope ?expires ?peer ?opkey WHERE {
+        GRAPH <${cgMetaGraph}> {
+          <${requestUri}> <${DKG}signature> ?sig ;
+                          <${DKG}requestTimestamp> ?ts .
+          OPTIONAL { <${requestUri}> <${DKG}delegationScope> ?scope }
+          OPTIONAL { <${requestUri}> <${DKG_ONTOLOGY.DKG_DELEGATION_EXPIRES_AT}> ?expires }
+          OPTIONAL { <${requestUri}> <${DKG_ONTOLOGY.DKG_DELEGATION_DELEGATEE_PEER}> ?peer }
+          OPTIONAL { <${requestUri}> <${DKG_ONTOLOGY.DKG_DELEGATION_DELEGATEE_KEY}> ?opkey }
+        }
+      } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return null;
+    const strip = (v?: string) => v?.replace(/^"|"$/g, '').replace(/"?\^\^.*$/, '') ?? '';
+    const row = result.bindings[0];
+    const signature = strip(row['sig']);
+    const issuedAtMs = parseInt(strip(row['ts']), 10) || 0;
+    const expires = row['expires'] ? parseInt(strip(row['expires']), 10) || 0 : 0;
+    const scope = row['scope'] ? strip(row['scope']) : joinDelegationScope(contextGraphId);
+    const delegateePeerId = row['peer'] ? strip(row['peer']) : undefined;
+    const delegateeOpKey = row['opkey'] ? strip(row['opkey']) : undefined;
+    if (!signature || !issuedAtMs) return null;
+    return {
+      agentAddress,
+      scope,
+      issuedAtMs,
+      ...(expires ? { expiresAtMs: expires } : {}),
+      ...(delegateePeerId ? { delegateePeerId } : {}),
+      ...(delegateeOpKey ? { delegateeOpKey } : {}),
+      signature,
+    };
   }
 
   /**
@@ -6801,35 +6987,24 @@ export class DKGAgent {
     const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
     const DKG = 'https://dkg.network/ontology#';
 
-    // Fetch the stored request to verify the signature
-    const result = await this.store.query(
-      `SELECT ?sig ?ts WHERE {
-        GRAPH <${cgMetaGraph}> {
-          <${requestUri}> <${DKG}signature> ?sig ;
-                          <${DKG}requestTimestamp> ?ts ;
-                          <${DKG}requestStatus> "pending" .
-        }
-      } LIMIT 1`,
-    );
-    if (result.type !== 'bindings' || result.bindings.length === 0) {
+    const delegation = await this.loadPendingJoinDelegation(contextGraphId, agentAddress);
+    if (!delegation) {
       throw new Error(`No pending join request found from ${agentAddress}`);
     }
-    const strip = (v?: string) => v?.replace(/^"|"$/g, '').replace(/"?\^\^.*$/, '') ?? '';
-    const signature = strip(result.bindings[0]['sig']);
-    const timestamp = parseInt(strip(result.bindings[0]['ts']), 10) || 0;
+    // Re-verify the signed delegation. We do NOT enforce `expiresAtMs`
+    // here — the curator may legitimately take longer than the
+    // delegation's lifetime to review. The expiry check is enforced at
+    // the wire-receipt boundary (`verifyJoinRequest`); once accepted &
+    // approved, the curator's allowlist write is the source of truth.
+    // Pinning `nowMs` to the issuedAt timestamp anchors both windows
+    // (future-skew + expiry) inside the validity envelope so we
+    // exercise only the cryptographic check here.
+    verifyAgentDelegation(delegation, {
+      expectedScope: joinDelegationScope(contextGraphId),
+      nowMs: delegation.issuedAtMs,
+    });
 
-    // Verify the signature (30-minute expiry is relaxed for approvals — curator may take time)
-    const digest = ethers.solidityPackedKeccak256(
-      ['string', 'string', 'uint256'],
-      [contextGraphId, agentAddress.toLowerCase(), timestamp],
-    );
-    const recovered = ethers.verifyMessage(ethers.getBytes(digest), signature);
-    if (recovered.toLowerCase() !== agentAddress.toLowerCase()) {
-      throw new Error(`Signature verification failed: expected ${agentAddress}, recovered ${recovered}`);
-    }
-
-    // Add agent to allowlist
-    await this.inviteAgentToContextGraph(contextGraphId, agentAddress, callerAgentAddress);
+    await this.inviteAgentToContextGraph(contextGraphId, agentAddress, callerAgentAddress, delegation);
 
     // Mark request as approved
     await this.store.deleteByPattern({
@@ -7070,51 +7245,98 @@ export class DKGAgent {
   }
 
   /**
-   * Forward a signed join request to all connected peers via P2P.
-   * Used by the requesting node to deliver the request to the curator.
+   * Forward a signed join request to the curator via P2P.
+   *
+   * Two-tier delivery:
+   *   1. Targeted send to `curatorPeerId` first (if the V10 invite carried
+   *      one — the common case). On success returns immediately, avoiding
+   *      a fan-out to dozens of unrelated peers.
+   *   2. Fallback broadcast in PARALLEL to every other connected peer via
+   *      `Promise.allSettled`. This bounds total wall-clock time to one
+   *      per-peer timeout (~5s) regardless of peer count, and lets the
+   *      request still find its curator when the targeted dial fails or
+   *      no curator peer id is known (legacy invites).
+   *
+   * The earlier sequential-await loop scaled as O(connected-peers ×
+   * per-peer-timeout). On a real testnet node connected to 30+ peers the
+   * worst-case wait was ~2.5 minutes per click; observed 2-3 min in the
+   * field. Targeted-first collapses the common case to one round-trip,
+   * and parallel broadcast caps the fallback at the timeout.
+   *
+   * Every peer that returns `{ok: true}` (whether via targeted or
+   * broadcast path) is recorded in `joinRequestAcceptedBy` so the
+   * matching `join-approved` / `join-rejected` notification can be
+   * authenticated against them later (see that field's doc comment).
+   *
    * Returns the number of peers that accepted the request.
    */
   async forwardJoinRequest(
     contextGraphId: string,
-    agentAddress: string,
-    signature: string,
-    timestamp: number,
+    delegation: SignedAgentDelegation,
     agentName?: string,
+    curatorPeerId?: string,
   ): Promise<{ delivered: number; errors: string[] }> {
-    const payload = JSON.stringify({ contextGraphId, agentAddress, signature, timestamp, agentName });
+    const payload = JSON.stringify({ contextGraphId, delegation, agentName });
     const payloadBytes = new TextEncoder().encode(payload);
-    const peers = this.node.libp2p.getPeers();
-    let delivered = 0;
+    const ctx = createOperationContext('system');
     const errors: string[] = [];
+    const agentAddress = delegation.agentAddress;
     const acceptedKey = `${contextGraphId}::${agentAddress.toLowerCase()}`;
 
-    for (const pid of peers) {
-      const remotePeerId = pid.toString();
-      if (remotePeerId === this.peerId) continue;
+    const recordAcceptedBy = (remotePeerId: string): void => {
+      let set = this.joinRequestAcceptedBy.get(acceptedKey);
+      if (!set) {
+        set = new Set<string>();
+        this.joinRequestAcceptedBy.set(acceptedKey, set);
+      }
+      set.add(remotePeerId);
+    };
+
+    if (curatorPeerId && curatorPeerId !== this.peerId) {
       try {
-        const responseBytes = await this.router.send(remotePeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, 5000);
+        const responseBytes = await this.router.send(curatorPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, 5000);
         const response = JSON.parse(new TextDecoder().decode(responseBytes));
         if (response.ok) {
-          delivered++;
-          // Remember this peer as a curator candidate authorised to
-          // later send us the matching join-approved / join-rejected
-          // notification. See `joinRequestAcceptedBy` doc comment.
-          let set = this.joinRequestAcceptedBy.get(acceptedKey);
-          if (!set) {
-            set = new Set<string>();
-            this.joinRequestAcceptedBy.set(acceptedKey, set);
-          }
-          set.add(remotePeerId);
-        } else if (response.error !== 'unknown CG') {
-          errors.push(`${remotePeerId.slice(-8)}: ${response.error}`);
+          recordAcceptedBy(curatorPeerId);
+          this.log.info(ctx, `Forwarded join request for "${contextGraphId}" from ${agentAddress}: 1 curator(s) received (direct)`);
+          return { delivered: 1, errors };
+        }
+        // Curator-peer-id responded but said `not curator` / similar.
+        // Rare: the invite's peer id is wrong, or curator role moved to a
+        // different peer (e.g. chain-side governance change after the
+        // invite was generated). Fall through to broadcast as last resort.
+        if (response.error && response.error !== 'unknown CG') {
+          errors.push(`${curatorPeerId.slice(-8)}: ${response.error}`);
         }
       } catch {
-        // Peer doesn't support protocol or timeout — skip
+        // Targeted dial failed — fall through to broadcast.
       }
     }
 
-    const ctx = createOperationContext('system');
-    this.log.info(ctx, `Forwarded join request for "${contextGraphId}" from ${agentAddress}: ${delivered} curator(s) received`);
+    const peers = this.node.libp2p.getPeers();
+    const broadcastTargets = peers
+      .map((p) => p.toString())
+      .filter((id) => id !== this.peerId && id !== curatorPeerId);
+    const results = await Promise.allSettled(
+      broadcastTargets.map(async (remotePeerId) => {
+        const responseBytes = await this.router.send(remotePeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, 5000);
+        const response = JSON.parse(new TextDecoder().decode(responseBytes));
+        return { remotePeerId, response };
+      }),
+    );
+    let delivered = 0;
+    for (const r of results) {
+      if (r.status !== 'fulfilled') continue;
+      const { remotePeerId, response } = r.value;
+      if (response.ok) {
+        delivered++;
+        recordAcceptedBy(remotePeerId);
+      } else if (response.error !== 'unknown CG') {
+        errors.push(`${remotePeerId.slice(-8)}: ${response.error}`);
+      }
+    }
+
+    this.log.info(ctx, `Forwarded join request for "${contextGraphId}" from ${agentAddress}: ${delivered} curator(s) received (broadcast over ${broadcastTargets.length} peer(s))`);
     return { delivered, errors };
   }
 
@@ -8365,6 +8587,8 @@ export class DKGAgent {
       getParticipants: (contextGraphId) => this.getPrivateContextGraphParticipants(contextGraphId),
       getAllowedPeers: (contextGraphId) => this.getContextGraphAllowedPeers(contextGraphId),
       getAgentGateAddresses: (contextGraphId) => this.getContextGraphAgentGateAddresses(contextGraphId),
+      getAllowedDelegateePeers: (contextGraphId) => this.getContextGraphAllowedDelegateePeers(contextGraphId),
+      getAllowedDelegateeKeys: (contextGraphId) => this.getContextGraphAllowedDelegateeKeys(contextGraphId),
       refreshMetaFromCurator: (contextGraphId) => this.refreshMetaFromCurator(contextGraphId),
       logWarn: (ctx, message) => this.log.warn(ctx, message),
       logInfo: (ctx, message) => this.log.info(ctx, message),

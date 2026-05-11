@@ -741,19 +741,22 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     const contextGraphId = decodeURIComponent(requestJoinMatch[1]);
     const body = await readBody(req);
     try {
-      const { agentAddress, signature, timestamp, agentName } = JSON.parse(body);
-      if (!agentAddress || !signature || !timestamp) {
-        return jsonResponse(res, 400, { error: 'Missing agentAddress, signature, or timestamp' });
+      const parsed = JSON.parse(body);
+      const { agentName, curatorPeerId, delegation } = parsed;
+      if (!delegation || !delegation.agentAddress || !delegation.signature) {
+        return jsonResponse(res, 400, {
+          error: 'Missing signed delegation. Expected `delegation` field with agentAddress, signature, scope, issuedAtMs and at least one of delegateePeerId / delegateeOpKey.',
+        });
       }
-      agent.verifyJoinRequest(contextGraphId, agentAddress, timestamp, signature);
+      agent.verifyJoinRequest(contextGraphId, delegation);
 
       const isCurator = await agent.isCuratorOf(contextGraphId);
       if (isCurator) {
-        await agent.storePendingJoinRequest(contextGraphId, agentAddress, signature, timestamp, agentName);
+        await agent.storePendingJoinRequest(contextGraphId, delegation, agentName);
         return jsonResponse(res, 200, { ok: true, status: 'pending', delivered: 'local' });
       }
 
-      const result = await agent.forwardJoinRequest(contextGraphId, agentAddress, signature, timestamp, agentName);
+      const result = await agent.forwardJoinRequest(contextGraphId, delegation, agentName, curatorPeerId);
       if (result.delivered === 0) {
         return jsonResponse(res, 502, { error: 'Could not deliver join request to curator. No reachable curator found.' });
       }
@@ -817,17 +820,29 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       const callerAddress = agent.resolveAgentAddress(
         extractBearerToken(req.headers.authorization),
       );
-      const signed = await agent.signJoinRequest(contextGraphId, callerAddress);
+      let curatorPeerId: string | undefined;
+      try {
+        const raw = await readBody(req, SMALL_BODY_BYTES);
+        if (raw) curatorPeerId = JSON.parse(raw)?.curatorPeerId;
+      } catch {
+        // Body is optional — older callers POST with no payload.
+      }
+      const delegation = await agent.signJoinRequest(contextGraphId, callerAddress);
       const { delivered, errors } = await agent.forwardJoinRequest(
-        signed.contextGraphId,
-        signed.agentAddress,
-        signed.signature,
-        signed.timestamp,
+        contextGraphId,
+        delegation,
         agent.nodeName,
+        curatorPeerId,
       );
       return jsonResponse(res, 200, {
         ok: true,
-        ...signed,
+        contextGraphId,
+        delegation,
+        // Back-compat surface fields for older HTTP clients reading the
+        // top-level `agentAddress`. The full signed delegation lives in
+        // `delegation`; the joiner UI POSTs that whole object back to
+        // `/request-join` to send the actual P2P message.
+        agentAddress: delegation.agentAddress,
         delivered,
         ...(errors.length > 0 ? { errors } : {}),
         status: delivered > 0 ? 'sent' : 'no-curator-found',

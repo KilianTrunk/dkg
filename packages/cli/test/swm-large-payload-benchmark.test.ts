@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const require = createRequire(import.meta.url);
@@ -52,6 +53,12 @@ describe('swm large payload benchmark', () => {
       'urn:test:payload',
       '--progress-every',
       '5',
+      '--output',
+      'bench/results/out.json',
+      '--devnet-dir',
+      '.devnet',
+      '--auth-token-file',
+      'auth.token',
       '--no-scan-logs',
       '--auth-token',
       'secret-token',
@@ -74,6 +81,8 @@ describe('swm large payload benchmark', () => {
       progressEvery: 5,
       scanLogs: false,
       authToken: 'secret-token',
+      output: resolve(process.env.INIT_CWD ?? process.cwd(), 'bench/results/out.json'),
+      devnetDir: resolve(process.env.INIT_CWD ?? process.cwd(), '.devnet'),
     });
   });
 

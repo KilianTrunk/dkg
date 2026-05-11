@@ -134,6 +134,12 @@ export interface ChainConfig {
   mockIdentityId?: string;
 }
 
+export interface LargeLiteralStorageConfig {
+  enabled?: boolean;
+  thresholdBytes?: number;
+  directory?: string;
+}
+
 /** Optional LLM config for the Node UI chatbot (OpenAI-compatible API). */
 export interface LlmConfig {
   /** API key (e.g. OpenAI, Anthropic, or compatible provider). */
@@ -227,6 +233,8 @@ export interface DkgConfig {
   blockExplorerUrl?: string;
   /** Triple store backend override (default: oxigraph-worker with file persistence). */
   store?: { backend: string; options?: Record<string, unknown> };
+  /** Out-of-line storage for large public SWM RDF literal object terms. */
+  largeLiteralStorage?: LargeLiteralStorageConfig;
   /**
    * Generic local agent integration registry used by node-owned connect/install
    * flows. Framework-specific bridges (OpenClaw now, Hermes next) should store

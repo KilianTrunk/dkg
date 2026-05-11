@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { GraphManager, OxigraphStore, PrivateContentStore } from '@origintrail-official/dkg-storage';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { GraphManager, OxigraphStore, PrivateContentStore, SharedMemoryLiteralBlobStore } from '@origintrail-official/dkg-storage';
 import { NoChainAdapter } from '@origintrail-official/dkg-chain';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
 import { DKGPublisher, generateSubGraphRegistration } from '../src/index.js';
@@ -337,6 +340,78 @@ describe('async lift workspace resolution', () => {
     expect(metaResult.type).toBe('bindings');
     if (metaResult.type === 'bindings') {
       expect(JSON.stringify(metaResult.bindings)).not.toContain(marker);
+    }
+  });
+
+  it('resolves compact share metadata against hydrated external SWM literals', async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-literal-blobs-'));
+    const inner = new OxigraphStore();
+    const wrappedStore = new SharedMemoryLiteralBlobStore(inner, { blobDir, thresholdBytes: 20 });
+    const wrappedGraphManager = new GraphManager(wrappedStore);
+    const keypair = await generateEd25519Keypair();
+    const wrappedPublisher = new DKGPublisher({
+      store: wrappedStore,
+      chain: new NoChainAdapter(),
+      eventBus: new TypedEventBus(),
+      keypair,
+    });
+    const largeValue = `externalized-${'x'.repeat(1024)}`;
+    const largeLiteral = JSON.stringify(largeValue);
+
+    try {
+      const write = await wrappedPublisher.share(CONTEXT_GRAPH, [
+        { subject: ENTITY, predicate: 'http://schema.org/name', object: largeLiteral, graph: '' },
+      ], { publisherPeerId: 'peer1' });
+
+      const swmGraph = wrappedGraphManager.sharedMemoryUri(CONTEXT_GRAPH);
+      const raw = await inner.query(
+        `SELECT ?o WHERE { GRAPH <${swmGraph}> { <${ENTITY}> <http://schema.org/name> ?o } } LIMIT 1`,
+      );
+      expect(raw.type).toBe('bindings');
+      if (raw.type === 'bindings') {
+        expect(raw.bindings[0]?.['o']).toContain('sha256:');
+        expect(raw.bindings[0]?.['o']).not.toContain('externalized-');
+      }
+
+      const resolved = await resolveLiftWorkspaceSlice({
+        store: wrappedStore,
+        graphManager: wrappedGraphManager,
+        request: {
+          swmId: 'swm-main',
+          shareOperationId: write.shareOperationId,
+          roots: [ENTITY],
+          contextGraphId: CONTEXT_GRAPH,
+          namespace: 'aloha',
+          scope: 'person-profile',
+          transitionType: 'CREATE',
+          authority: { type: 'owner', proofRef: 'proof:owner:1' },
+        },
+      });
+
+      expect(resolved.quads).toEqual([
+        { subject: ENTITY, predicate: 'http://schema.org/name', object: largeLiteral, graph: '' },
+      ]);
+
+      const metaGraph = wrappedGraphManager.sharedMemoryMetaUri(CONTEXT_GRAPH);
+      const metadata = await wrappedStore.query(
+        `SELECT ?digest ?count ?payload WHERE {
+          GRAPH <${metaGraph}> {
+            OPTIONAL { ?s <${DKG}publicQuadsDigest> ?digest }
+            OPTIONAL { ?s <${DKG}publicQuadsCount> ?count }
+            OPTIONAL { ?s <${DKG}publicStagedQuads> ?payload }
+          }
+        }`,
+      );
+      expect(metadata.type).toBe('bindings');
+      if (metadata.type === 'bindings') {
+        expect(metadata.bindings.some((row) => row['digest']?.includes('sha256:'))).toBe(true);
+        expect(metadata.bindings.some((row) => row['count'] === '"1"^^<http://www.w3.org/2001/XMLSchema#integer>')).toBe(true);
+        expect(metadata.bindings.some((row) => row['payload'])).toBe(false);
+        expect(JSON.stringify(metadata.bindings)).not.toContain('externalized-');
+      }
+    } finally {
+      await wrappedStore.close().catch(() => {});
+      await rm(blobDir, { recursive: true, force: true });
     }
   });
 

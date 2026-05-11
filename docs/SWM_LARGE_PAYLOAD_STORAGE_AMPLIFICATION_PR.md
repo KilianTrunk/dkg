@@ -24,11 +24,18 @@ After that failure, later queries could also fail with:
 table index is out of bounds
 ```
 
-The fix replaces full-payload metadata snapshots with compact operation
-metadata. New SWM writes store only references and provenance in
-`_shared_memory_meta`, while the public payload remains in the SWM data graph.
-Legacy metadata records that already contain `dkg:publicStagedQuads` remain
-readable.
+The fix has two layers:
+
+1. Full-payload metadata snapshots are replaced by compact immutable
+   share-operation metadata and per-root public quad fingerprints.
+2. Large public SWM literal object terms are externalized into
+   content-addressed blob files, leaving only a small placeholder literal in
+   Oxigraph.
+
+New SWM writes no longer serialize public payloads into
+`dkg:publicStagedQuads`, and persistent nodes no longer ask Oxigraph WASM to
+hold large literal bytes directly. Legacy metadata records that already contain
+`dkg:publicStagedQuads` remain readable.
 
 ## Problem
 
@@ -60,33 +67,82 @@ New SWM writes store compact share-operation metadata:
 - root entities
 - publisher peer id
 - published timestamp
+- public quad digest and count for each root
 
-The public payload is not serialized into metadata. Resolution reconstructs the
-operation payload by reading the current SWM graph for the operation roots.
+The public payload is not serialized into metadata. Resolution reconstructs and
+validates the operation payload by reading the current SWM graph for the
+operation roots, then comparing the hydrated quads to the stored digest/count.
 
 ```mermaid
 flowchart TD
   A["Client writes public SWM quads"] --> B["Store quads in SWM graph"]
   A --> C["Generate compact metadata"]
+  B --> L{"Large SWM literal?"}
+  L -->|No| M["Store RDF term inline"]
+  L -->|Yes| N["Write exact RDF object term to literal-blobs/sha256"]
+  N --> O["Store externalLiteralRef placeholder in Oxigraph"]
   C --> D["dkg:shareOperationId"]
   C --> E["dkg:rootEntity"]
   C --> F["dkg:publisherPeerId"]
   C --> G["dkg:publishedAt"]
   C --> H["dkg:contextGraphId"]
   C --> I["optional dkg:subGraphName"]
-  B --> J["Single payload copy in Oxigraph"]
+  C --> P["dkg:publicQuadsDigest + dkg:publicQuadsCount"]
+  M --> J["Small or normal RDF terms in Oxigraph"]
+  O --> J
   D --> K["Small operation reference metadata"]
   E --> K
   F --> K
   G --> K
   H --> K
   I --> K
+  P --> K
 ```
+
+## Large Literal Blob Storage
+
+Local Oxigraph-backed agent stores now enable large SWM literal storage by
+default when `dataDir` is configured. The default settings are:
+
+```ts
+largeLiteralStorage: {
+  enabled: true,
+  thresholdBytes: 65536,
+  directory: "<dataDir>/literal-blobs",
+}
+```
+
+Only RDF literal objects written to graphs ending in `/_shared_memory` are
+eligible. Small literals, IRIs, blank nodes, non-SWM graphs, Verified Memory,
+private encrypted staging, and file import blobs stay unchanged.
+
+For each large SWM literal, the wrapper computes `sha256` over the exact
+serialized RDF object term string and writes that string to:
+
+```text
+<dataDir>/literal-blobs/<sha256>
+```
+
+Oxigraph stores this placeholder instead of the full literal bytes:
+
+```text
+"sha256:<hex>"^^<http://dkg.io/ontology/externalLiteralRef>
+```
+
+Queries and lift resolution hydrate placeholders after Oxigraph returns
+bindings or constructed quads, so normal callers receive the original RDF
+literal term. Exact large-literal constants in simple `SELECT`, `ASK`, and
+equality-filter queries are also translated to the placeholder form before
+querying. Full SPARQL value semantics for functions over externalized literal
+values are intentionally not promised; those expressions still execute inside
+Oxigraph against the stored placeholder.
 
 ## Write Path
 
-The SWM write path still persists and gossips the public payload normally. The
-change is only in the metadata generated for the operation.
+The SWM write path still accepts and gossips normal public RDF quads. The
+storage wrapper externalizes large literal bytes at the local persistence
+boundary, and compact metadata records only operation provenance plus
+digest/count fingerprints.
 
 ```mermaid
 sequenceDiagram
@@ -99,6 +155,7 @@ sequenceDiagram
   Client->>API: POST /api/shared-memory/write
   API->>Publisher: share(contextGraphId, quads, subGraphName?)
   Publisher->>Store: store public quads in SWM graph
+  Store->>Store: externalize large SWM literals to literal-blobs
   Publisher->>Store: store compact share metadata
   Publisher->>Gossip: broadcast SWM operation
   Gossip-->>API: operation propagated to peers
@@ -113,7 +170,8 @@ New writes no longer emit:
 ```
 
 Instead they emit compact metadata that points to roots already present in the
-SWM data graph.
+SWM data graph and records immutable digest/count fingerprints for stale-write
+detection.
 
 ## Resolution Path
 
@@ -127,14 +185,17 @@ flowchart TD
   C -->|Yes| D["Parse legacy serialized quad snapshot"]
   C -->|No| E["Read root entities from metadata"]
   E --> F["Query current SWM graph for those roots"]
-  F --> G["Return public quads for operation"]
+  F --> I["Hydrate externalLiteralRef placeholders from blobs"]
+  I --> J["Compare hydrated digest/count with metadata"]
+  J --> G["Return public quads for operation"]
   D --> G
   G --> H["Build lift request payload"]
 ```
 
 For compact metadata, the resolver validates the operation roots and then reads
-the public quads from the current SWM graph. This keeps new writes small while
-preserving the ability to lift and publish shared-memory content.
+hydrated public quads from the current SWM graph. If the current root slice no
+longer matches the stored digest/count, resolution fails instead of silently
+publishing a mismatched public/private asset.
 
 ## Legacy Compatibility
 
@@ -160,9 +221,10 @@ This PR adds a reusable live benchmark:
 ```bash
 pnpm bench:swm-large-payload -- \
   --ports 19101,19102,19103,19104,19105 \
-  --payload-mib-per-node 100 \
+  --payload-mib-per-node 204.8 \
   --chunk-mib 0.5 \
-  --output bench/results/swm-large-payload-500mib.json
+  --write-concurrency 5 \
+  --output bench/results/swm-large-payload-1gib.json
 ```
 
 The benchmark:
@@ -172,7 +234,9 @@ The benchmark:
 3. Checks per-run metadata for `shareOperationId`, `rootEntity`,
    `publisherPeerId`, and `publishedAt`.
 4. Verifies `dkg:publicStagedQuads` did not grow.
-5. Optionally scans appended daemon logs for known Oxigraph and GossipSub
+5. Selects one sample payload literal per node to prove hydration returns the
+   original payload bytes.
+6. Optionally scans appended daemon logs for known Oxigraph and GossipSub
    failure signatures.
 
 ```mermaid
@@ -184,11 +248,11 @@ sequenceDiagram
   participant N4 as Node 4
   participant N5 as Node 5
 
-  Bench->>N1: write 100 MiB in chunks
-  Bench->>N2: write 100 MiB in chunks
-  Bench->>N3: write 100 MiB in chunks
-  Bench->>N4: write 100 MiB in chunks
-  Bench->>N5: write 100 MiB in chunks
+  Bench->>N1: write 204.8 MiB in chunks
+  Bench->>N2: write 204.8 MiB in chunks
+  Bench->>N3: write 204.8 MiB in chunks
+  Bench->>N4: write 204.8 MiB in chunks
+  Bench->>N5: write 204.8 MiB in chunks
 
   N1-->>N2: gossip SWM operations
   N1-->>N3: gossip SWM operations
@@ -210,16 +274,21 @@ sequenceDiagram
   Bench->>N3: verify compact metadata
   Bench->>N4: verify compact metadata
   Bench->>N5: verify compact metadata
+  Bench->>N1: select one hydrated sample literal
+  Bench->>N2: select one hydrated sample literal
+  Bench->>N3: select one hydrated sample literal
+  Bench->>N4: select one hydrated sample literal
+  Bench->>N5: select one hydrated sample literal
 ```
 
-The reproduced 5-node regression case used `5 x 100 MiB = 500 MiB` total. With
-the compact metadata model, all five nodes converged with:
+The 1 GiB target case uses `5 x 204.8 MiB = 1024 MiB` total. Acceptance is:
 
 ```text
-payload quads:        1000 per node
+payload quads:        all benchmark chunks on every node
 dkg:publicStagedQuads: 0 per node
-shareOperationIds:    1000 per node
-rootEntities:         1000 per node
+shareOperationIds:    one per benchmark write
+rootEntities:         one per benchmark write
+sample literal bytes: expected chunk payload size on every node
 ```
 
 No Oxigraph failure signatures were observed:
@@ -253,12 +322,36 @@ table index is out of bounds
   - Covers compact share-operation resolution.
   - Covers legacy `dkg:publicStagedQuads` compatibility.
   - Covers large literal writes without metadata payload duplication.
+  - Covers compact digest/count resolution over hydrated external SWM literals.
 
 - `packages/publisher/test/metadata.test.ts`
   - Covers the new compact share metadata shape.
 
+- `packages/storage/src/shared-memory-literal-blob-store.ts`
+  - Adds the content-addressed large SWM literal blob wrapper.
+  - Hydrates `SELECT` bindings and `CONSTRUCT` quads back to the original RDF
+    literal term.
+  - Translates deletes and exact large-literal query constants to the
+    placeholder representation.
+
+- `packages/storage/src/triple-store.ts`
+  - Adds the `largeLiteralStorage` configuration surface.
+
+- `packages/storage/test/external-literal-store.test.ts`
+  - Covers externalization, hydration, exact literal matching, deletes,
+    corrupt/missing blob failures, and reopen-from-disk behavior.
+
+- `packages/agent/src/dkg-agent.ts`
+  - Enables large SWM literal storage by default for local Oxigraph-backed
+    `DKGAgent.create({ dataDir })` stores.
+
+- `packages/agent/test/large-literal-storage.test.ts`
+  - Covers the default persistent agent store wiring.
+
 - `packages/cli/scripts/swm-large-payload-benchmark.cjs`
   - Adds the reusable live multi-node SWM payload benchmark.
+  - Uses hydrated sample literal selection instead of `STRLEN(STR(?o))`, so
+    count queries remain cheap and sample checks exercise blob hydration.
 
 - `packages/cli/test/swm-large-payload-benchmark.test.ts`
   - Covers benchmark argument parsing, chunk planning, and generated payload
@@ -273,6 +366,9 @@ Focused validation run for this change:
 
 ```bash
 pnpm --filter @origintrail-official/dkg exec vitest run test/swm-large-payload-benchmark.test.ts
+pnpm --filter @origintrail-official/dkg-storage exec vitest run test/storage.test.ts test/external-literal-store.test.ts
+pnpm --filter @origintrail-official/dkg-publisher exec vitest run test/async-lift-workspace.test.ts
+pnpm --filter @origintrail-official/dkg-agent exec vitest run test/large-literal-storage.test.ts
 ```
 
 Additional validation performed during the fix:
@@ -286,11 +382,14 @@ Live benchmark validation:
 ```bash
 pnpm bench:swm-large-payload -- \
   --ports 19101,19102,19103,19104,19105 \
-  --payload-mib-per-node 100 \
+  --payload-mib-per-node 204.8 \
   --chunk-mib 0.5 \
+  --write-concurrency 5 \
   --auth-token <token> \
-  --output bench/results/swm-large-payload-500mib.json
+  --output bench/results/swm-large-payload-1gib.json
 ```
 
-The full 500 MiB run verified that each node could query all benchmark payloads
-and that `dkg:publicStagedQuads` remained at zero for the new writes.
+The live 1 GiB run should verify that each node converges, hydrated sample
+literals match the expected chunk size, `dkg:publicStagedQuads` remains zero,
+and the logs contain no `RuntimeError: unreachable` or
+`table index is out of bounds`.

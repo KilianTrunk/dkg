@@ -444,13 +444,36 @@ export function parsePositiveIntegerOption(value: string, optionName: string): n
 
 async function createPublisherStore(dataDir: string, config: DkgConfig): Promise<TripleStore> {
   if (config.store) {
-    return await createTripleStore(config.store as any);
+    const storeConfig = config.store as any;
+    return await createTripleStore({
+      ...storeConfig,
+      largeLiteralStorage: config.largeLiteralStorage ?? (
+        isLocalOxigraphStoreConfig(storeConfig)
+          ? defaultLargeLiteralStorage(dataDir, config)
+          : undefined
+      ),
+    });
   }
 
   return await createTripleStore({
     backend: 'oxigraph-worker',
     options: { path: join(dataDir, 'store.nq') },
+    largeLiteralStorage: defaultLargeLiteralStorage(dataDir, config),
   });
+}
+
+function defaultLargeLiteralStorage(dataDir: string, config: DkgConfig) {
+  return {
+    enabled: config.largeLiteralStorage?.enabled ?? true,
+    thresholdBytes: config.largeLiteralStorage?.thresholdBytes,
+    directory: config.largeLiteralStorage?.directory ?? join(dataDir, 'literal-blobs'),
+  };
+}
+
+function isLocalOxigraphStoreConfig(storeConfig: { backend?: unknown }): boolean {
+  return storeConfig.backend === 'oxigraph'
+    || storeConfig.backend === 'oxigraph-worker'
+    || storeConfig.backend === 'oxigraph-persistent';
 }
 
 async function loadOrCreateAgentWallet(dataDir: string): Promise<DKGAgentWallet> {

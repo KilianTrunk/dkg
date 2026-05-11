@@ -565,6 +565,7 @@ export async function runDaemonInner(
       backend: config.store.backend,
       options: config.store.options,
     } : undefined,
+    largeLiteralStorage: config.largeLiteralStorage,
     chainAdapter: mockChainAdapter,
     // Only forward chain to the agent when both required fields resolved.
     // resolveChainConfig() may return a partial block if neither config nor

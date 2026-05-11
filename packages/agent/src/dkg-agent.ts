@@ -53,7 +53,7 @@ import {
   type SwmSenderKeyPackageMsg,
   type WorkspaceRecipientEncryptionKey,
 } from '@origintrail-official/dkg-core';
-import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad } from '@origintrail-official/dkg-storage';
+import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
@@ -74,6 +74,7 @@ import {
   type WorkspaceSenderKeyEncryptInput,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
+import { join } from 'node:path';
 import {
   DKGQueryEngine, QueryHandler,
   emptyQueryResultForKind,
@@ -667,6 +668,8 @@ export interface DKGAgentConfig {
   store?: TripleStore;
   /** Triple store backend configuration (e.g. oxigraph-worker, blazegraph). If omitted, defaults to oxigraph-worker when dataDir is set. */
   storeConfig?: TripleStoreConfig;
+  /** Out-of-line storage for large public SWM RDF literal object terms. Defaults on for local Oxigraph-backed dataDir stores. */
+  largeLiteralStorage?: LargeLiteralStorageConfig;
   /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
   nodeRole?: 'core' | 'edge';
   /**
@@ -874,6 +877,38 @@ async function inferAdapterPublisherAddress(
   } catch {
     return undefined;
   }
+}
+
+function defaultLargeLiteralStorage(
+  dataDir: string,
+  config: LargeLiteralStorageConfig | undefined,
+): LargeLiteralStorageConfig {
+  return {
+    enabled: config?.enabled ?? true,
+    thresholdBytes: config?.thresholdBytes,
+    directory: config?.directory ?? join(dataDir, 'literal-blobs'),
+  };
+}
+
+function applyDefaultLargeLiteralStorage(
+  storeConfig: TripleStoreConfig,
+  dataDir: string | undefined,
+  config: LargeLiteralStorageConfig | undefined,
+): TripleStoreConfig {
+  if (storeConfig.largeLiteralStorage || !dataDir || !isLocalOxigraphConfig(storeConfig)) {
+    return storeConfig;
+  }
+
+  return {
+    ...storeConfig,
+    largeLiteralStorage: defaultLargeLiteralStorage(dataDir, config),
+  };
+}
+
+function isLocalOxigraphConfig(storeConfig: TripleStoreConfig): boolean {
+  return storeConfig.backend === 'oxigraph'
+    || storeConfig.backend === 'oxigraph-worker'
+    || storeConfig.backend === 'oxigraph-persistent';
 }
 
 /**
@@ -1108,12 +1143,16 @@ export class DKGAgent {
     if (config.store) {
       store = config.store;
     } else if (config.storeConfig) {
-      store = await createTripleStore(config.storeConfig);
+      store = await createTripleStore(applyDefaultLargeLiteralStorage(config.storeConfig, config.dataDir, config.largeLiteralStorage));
       log.info(ctx, `Triple store backend: ${config.storeConfig.backend}`);
     } else if (config.dataDir) {
       const { join } = await import('node:path');
       const persistPath = join(config.dataDir, 'store.nq');
-      store = await createTripleStore({ backend: 'oxigraph-worker', options: { path: persistPath } });
+      store = await createTripleStore({
+        backend: 'oxigraph-worker',
+        options: { path: persistPath },
+        largeLiteralStorage: defaultLargeLiteralStorage(config.dataDir, config.largeLiteralStorage),
+      });
       log.info(ctx, `Persistent triple store (worker thread): ${persistPath}`);
     } else {
       store = await createTripleStore({ backend: 'oxigraph' });

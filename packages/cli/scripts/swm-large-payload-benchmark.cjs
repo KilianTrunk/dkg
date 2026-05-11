@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } = require('node:fs');
-const { dirname, join, resolve } = require('node:path');
+const { dirname, isAbsolute, join, resolve } = require('node:path');
 const { performance } = require('node:perf_hooks');
 const { createInterface } = require('node:readline');
 
@@ -10,6 +10,7 @@ const DKG_ONTOLOGY = 'http://dkg.io/ontology/';
 const DEFAULT_CONTEXT_GRAPH_ID = 'devnet-test';
 const DEFAULT_PREDICATE = 'urn:dkg:benchmark:swm-large-payload:payload';
 const DEFAULT_NAMESPACE = 'swm-large-payload';
+const INVOCATION_CWD = process.env.INIT_CWD || process.cwd();
 const FAILURE_PATTERNS = [
   { name: 'oxigraphWasmUnreachable', text: 'RuntimeError: unreachable' },
   { name: 'oxigraphTableIndexOutOfBounds', text: 'table index is out of bounds' },
@@ -118,7 +119,7 @@ function resolveAuthToken(options, env, devnetDir) {
   if (inline) return inline;
 
   const tokenFile = options.authTokenFile
-    ?? env.DKG_BENCH_AUTH_TOKEN_FILE
+    ?? (env.DKG_BENCH_AUTH_TOKEN_FILE ? resolveInputPath(env.DKG_BENCH_AUTH_TOKEN_FILE) : undefined)
     ?? (devnetDir ? join(devnetDir, 'node1', 'auth.token') : undefined);
   if (tokenFile && existsSync(tokenFile)) {
     return readAuthTokenFile(tokenFile);
@@ -205,7 +206,7 @@ function parseBenchmarkArgs(argv = process.argv.slice(2), env = process.env) {
         options.authToken = value;
         break;
       case 'auth-token-file':
-        options.authTokenFile = resolve(value);
+        options.authTokenFile = resolveInputPath(value);
         break;
       case 'run-id':
         options.runId = value;
@@ -220,10 +221,10 @@ function parseBenchmarkArgs(argv = process.argv.slice(2), env = process.env) {
         options.progressEvery = parsePositiveInteger('--progress-every', value);
         break;
       case 'output':
-        options.output = resolve(value);
+        options.output = resolveInputPath(value);
         break;
       case 'devnet-dir':
-        options.devnetDir = resolve(value);
+        options.devnetDir = resolveInputPath(value);
         break;
       default:
         throw new Error(`Unknown option --${name}`);
@@ -232,8 +233,8 @@ function parseBenchmarkArgs(argv = process.argv.slice(2), env = process.env) {
 
   const envPorts = parsePorts(env.DKG_BENCH_SWM_PORTS);
   const devnetDir = options.devnetDir
-    ?? env.DKG_BENCH_SWM_DEVNET_DIR
-    ?? env.DEVNET_DIR
+    ?? (env.DKG_BENCH_SWM_DEVNET_DIR ? resolveInputPath(env.DKG_BENCH_SWM_DEVNET_DIR) : undefined)
+    ?? (env.DEVNET_DIR ? resolveInputPath(env.DEVNET_DIR) : undefined)
     ?? join(REPO_ROOT, '.devnet');
   const nodes = options.nodes
     ?? (env.DKG_BENCH_SWM_NODES ? parsePositiveInteger('DKG_BENCH_SWM_NODES', env.DKG_BENCH_SWM_NODES) : 5);
@@ -282,7 +283,7 @@ function parseBenchmarkArgs(argv = process.argv.slice(2), env = process.env) {
       ?? (env.DKG_BENCH_SWM_PROGRESS_EVERY
         ? parsePositiveInteger('DKG_BENCH_SWM_PROGRESS_EVERY', env.DKG_BENCH_SWM_PROGRESS_EVERY)
         : 25),
-    output: options.output ?? (env.DKG_BENCH_SWM_OUTPUT ? resolve(env.DKG_BENCH_SWM_OUTPUT) : undefined),
+    output: options.output ?? (env.DKG_BENCH_SWM_OUTPUT ? resolveInputPath(env.DKG_BENCH_SWM_OUTPUT) : undefined),
     skipWrite: options.skipWrite ?? parseBoolean(env.DKG_BENCH_SWM_SKIP_WRITE, false),
     noAuth,
     devnetDir,
@@ -291,6 +292,10 @@ function parseBenchmarkArgs(argv = process.argv.slice(2), env = process.env) {
   };
   config.authToken = resolveAuthToken({ ...options, noAuth }, env, devnetDir);
   return Object.freeze(config);
+}
+
+function resolveInputPath(value) {
+  return isAbsolute(value) ? value : resolve(INVOCATION_CWD, value);
 }
 
 function bytesFromMiB(value) {
@@ -361,6 +366,31 @@ function numericBinding(result, name) {
     if (Number.isFinite(parsed)) return parsed;
   }
   return Number.NaN;
+}
+
+function literalLexicalValue(value) {
+  if (value == null) return undefined;
+  if (typeof value !== 'string') return String(value);
+  if (!value.startsWith('"')) return value;
+  const closingQuote = findClosingLiteralQuote(value);
+  if (closingQuote < 0) return value;
+  try {
+    return JSON.parse(value.slice(0, closingQuote + 1));
+  } catch {
+    return value.slice(1, closingQuote);
+  }
+}
+
+function findClosingLiteralQuote(term) {
+  for (let i = 1; i < term.length; i += 1) {
+    if (term[i] !== '"') continue;
+    let backslashes = 0;
+    for (let j = i - 1; j >= 0 && term[j] === '\\'; j -= 1) {
+      backslashes += 1;
+    }
+    if (backslashes % 2 === 0) return i;
+  }
+  return -1;
 }
 
 async function postJson(port, path, body, config, timeoutMs) {
@@ -523,14 +553,15 @@ async function countPayloads(port, config, plan) {
 async function samplePayloadBytes(port, config, plan) {
   const result = await query(
     port,
-    `SELECT (STRLEN(STR(?o)) AS ?len) WHERE {
+    `SELECT ?s ?o WHERE {
        ?s <${config.predicate}> ?o .
        FILTER(STRSTARTS(STR(?s), ${sparqlString(plan.rootPrefix)}))
-     } LIMIT 1`,
+     } ORDER BY ?s LIMIT 1`,
     config,
     { contextGraphId: config.contextGraphId, view: 'shared-working-memory' },
   );
-  return numericBinding(result, 'len');
+  const value = literalLexicalValue(bindingValue(result, 'o'));
+  return typeof value === 'string' ? Buffer.byteLength(value, 'utf8') : Number.NaN;
 }
 
 async function countGlobalMetaPredicate(port, config, plan, predicate) {
@@ -627,10 +658,11 @@ async function collectMetadata(config, plan, baseline) {
     const publisherPeerIds = await countRunMetaPredicate(port, config, plan, `${DKG_ONTOLOGY}publisherPeerId`);
     const publishedAt = await countRunMetaPredicate(port, config, plan, `${DKG_ONTOLOGY}publishedAt`);
     const timestamps = await countRunMetaPredicate(port, config, plan, `${DKG_ONTOLOGY}timestamp`);
+    const sampleBytes = await samplePayloadBytes(port, config, plan);
     entries.push({
       port,
       payloadCount,
-      samplePayloadBytes: await samplePayloadBytes(port, config, plan),
+      samplePayloadBytes: sampleBytes,
       publicStagedQuadsForRun,
       publicStagedQuadsGlobalBefore: before,
       publicStagedQuadsGlobalAfter: after,
@@ -641,6 +673,7 @@ async function collectMetadata(config, plan, baseline) {
       publishedAt,
       timestamps,
       ok: payloadCount === plan.totalOperations
+        && sampleBytes === payloadBytesForChunk(plan, 1)
         && publicStagedQuadsForRun === 0
         && after - before === 0
         && shareOperationIds === plan.totalOperations

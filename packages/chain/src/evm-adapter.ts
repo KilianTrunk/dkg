@@ -246,6 +246,10 @@ interface ContractCache {
  * Resolves contract addresses dynamically from the Hub.
  */
 export class EVMChainAdapter implements ChainAdapter {
+  /** See `ChainAdapter.deploymentId`. */
+  get deploymentId(): string {
+    return `${this.chainId}:hub=${this.hubAddress.toLowerCase()}`;
+  }
   readonly chainType = 'evm' as const;
   readonly chainId: string;
 

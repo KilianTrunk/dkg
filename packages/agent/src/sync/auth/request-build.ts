@@ -34,6 +34,7 @@ interface BuildSyncRequestParams {
     requesterPeerId: string,
     requestId: string,
     issuedAtMs: number,
+    requesterAgentAddress: string | undefined,
   ) => Uint8Array;
   getIdentityId: () => Promise<bigint>;
   signMessage?: (digest: Uint8Array) => Promise<{ r: Uint8Array; vs: Uint8Array }>;
@@ -76,6 +77,14 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
   };
   if (phase) request.phase = phase;
 
+  // Bind the "on behalf of" agent claim INTO the signed digest so the
+  // responder's per-agent delegation lookup can't be steered by post-
+  // signing envelope tampering. For op-key-signed envelopes the agent
+  // address still isn't a signing principal, but it IS material that
+  // the signature must commit to.
+  if (defaultAgentAddress) {
+    request.requesterAgentAddress = defaultAgentAddress;
+  }
   const digest = computeSyncDigest(
     request.contextGraphId,
     request.offset,
@@ -85,6 +94,7 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
     request.requesterPeerId!,
     request.requestId!,
     request.issuedAtMs!,
+    request.requesterAgentAddress,
   );
 
   const identityId = await getIdentityId();
@@ -93,20 +103,11 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
     request.requesterIdentityId = identityId.toString();
     request.requesterSignatureR = ethers.hexlify(signature.r);
     request.requesterSignatureVS = ethers.hexlify(signature.vs);
-    // Also surface the agent the node is acting on behalf of, so the
-    // curator can pin the delegation lookup to a specific principal
-    // (the op-key alone identifies the node, not the agent). The
-    // signer-mismatch check in `request-authorize` only fires when
-    // identityId == 0 so this carries no signing semantics — it's
-    // strictly an authorisation hint for the delegation gate.
-    if (defaultAgentAddress) {
-      request.requesterAgentAddress = defaultAgentAddress;
-    }
   } else if (defaultAgentAddress && defaultAgentPrivateKey) {
     const wallet = new ethers.Wallet(defaultAgentPrivateKey);
     const sig = ethers.Signature.from(await wallet.signMessage(digest));
     request.requesterIdentityId = '0';
-    request.requesterAgentAddress = defaultAgentAddress;
+    // requesterAgentAddress was already set above (and bound into the digest).
     request.requesterSignatureR = ethers.hexlify(sig.r);
     request.requesterSignatureVS = ethers.hexlify(sig.yParityAndS);
   }

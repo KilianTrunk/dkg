@@ -494,6 +494,19 @@ export interface OperationalWalletRegistrationResult {
 export interface ChainAdapter {
   chainType: 'evm' | 'solana';
   chainId: string;
+  /**
+   * Stable identifier for the SPECIFIC deployment this adapter is
+   * bound to (not just the chain). `chainId` alone is too coarse —
+   * every Hardhat instance shares `evm:31337`, and a single chain can
+   * host multiple independent DKG deployments. Consumers that need
+   * deployment-scoped namespacing (e.g. signed-delegation scopes
+   * that must not be replayable across deployments) should bind to
+   * this instead of `chainId`.
+   *
+   * EVM: `${chainId}:hub=${hubAddress.toLowerCase()}`. Mock: just
+   * `chainId` (single in-memory deployment per process).
+   */
+  deploymentId: string;
 
   // Identity
   registerIdentity(proof: IdentityProof): Promise<bigint>;

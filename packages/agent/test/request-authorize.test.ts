@@ -21,7 +21,10 @@ const CG_ID = 'unit-test-cg';
 
 // Deterministic per-input digest so the verifier recovers the exact
 // signer regardless of envelope content. Bound to the request's
-// `issuedAtMs` so different envelopes produce different digests.
+// `issuedAtMs` AND `requesterAgentAddress` so different envelopes
+// produce different digests — and so post-signing tampering with the
+// "on behalf of" agent claim invalidates the signature recovery
+// (see `denies when requesterAgentAddress is tampered after signing`).
 function computeDigestStub(
   _cg: string,
   _offset: number,
@@ -31,11 +34,12 @@ function computeDigestStub(
   requesterPeerId: string,
   requestId: string,
   issuedAtMs: number,
+  requesterAgentAddress: string | undefined,
 ): Uint8Array {
   return ethers.getBytes(
     ethers.solidityPackedKeccak256(
-      ['string', 'string', 'string', 'uint256'],
-      [targetPeerId, requesterPeerId, requestId, issuedAtMs],
+      ['string', 'string', 'string', 'uint256', 'string'],
+      [targetPeerId, requesterPeerId, requestId, issuedAtMs, (requesterAgentAddress ?? '').toLowerCase()],
     ),
   );
 }
@@ -62,7 +66,10 @@ async function buildSignedEnvelope(
   const remotePeerId = opts.remotePeerId ?? REMOTE_PEER;
   const issuedAtMs = opts.issuedAtMs ?? Date.now();
   const requestId = opts.requestId ?? ethers.hexlify(ethers.randomBytes(12));
-  const digest = computeDigestStub(CG_ID, 0, 100, false, LOCAL_PEER, remotePeerId, requestId, issuedAtMs);
+  const digest = computeDigestStub(
+    CG_ID, 0, 100, false, LOCAL_PEER, remotePeerId, requestId, issuedAtMs,
+    opts.requesterAgentAddress,
+  );
   const sig = ethers.Signature.from(await opts.signer.signMessage(digest));
   const envelope: SyncRequestEnvelope = {
     contextGraphId: CG_ID,
@@ -209,6 +216,32 @@ describe('authorizePrivateSyncRequest — agent-delegation path', () => {
       remotePeerId,
       // Only A has a delegation; B does not.
       allowedDelegateeKeys: { [agentA.toLowerCase()]: [nodeOpKey.address.toLowerCase()] },
+    });
+    expect(allowed).toBe(false);
+  });
+
+  it('denies when requesterAgentAddress is tampered after signing (digest binding)', async () => {
+    // Build a properly signed envelope claiming agentAddress, then
+    // overwrite the field with a different agent post-signing. The
+    // digest commits to `requesterAgentAddress`, so signature
+    // recovery on the auth side produces a different signer for the
+    // tampered envelope and the per-agent delegation lookup misses.
+    const otherAgent = ethers.Wallet.createRandom().address;
+    const { envelope, remotePeerId } = await buildSignedEnvelope({
+      signer: nodeOpKey,
+      identityId: '5',
+      requesterAgentAddress: agentAddress,
+    });
+    envelope.requesterAgentAddress = otherAgent;
+    const { allowed } = await callAuth({
+      envelope,
+      remotePeerId,
+      // Both agents have a valid delegation for the same op-key.
+      // The only thing stopping the swap is the digest binding.
+      allowedDelegateeKeys: {
+        [agentAddress.toLowerCase()]: [nodeOpKey.address.toLowerCase()],
+        [otherAgent.toLowerCase()]: [nodeOpKey.address.toLowerCase()],
+      },
     });
     expect(allowed).toBe(false);
   });

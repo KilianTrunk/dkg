@@ -18,6 +18,7 @@ interface AuthorizeSyncRequestParams {
     requesterPeerId: string,
     requestId: string,
     issuedAtMs: number,
+    requesterAgentAddress: string | undefined,
   ) => Uint8Array;
   verifyIdentity?: (recoveredAddress: string, claimedIdentityId: bigint) => Promise<boolean>;
   getParticipants: (contextGraphId: string) => Promise<string[] | null>;
@@ -103,6 +104,7 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
     request.requesterPeerId,
     request.requestId,
     request.issuedAtMs,
+    request.requesterAgentAddress,
   );
 
   let recoveredAddress: string;

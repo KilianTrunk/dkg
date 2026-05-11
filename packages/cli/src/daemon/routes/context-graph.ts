@@ -756,6 +756,17 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         return jsonResponse(res, 200, { ok: true, status: 'pending', delivered: 'local' });
       }
 
+      // V10 invites carry the curator's peer-id (`<cgId>\n<peerId>`).
+      // Without it `forwardJoinRequest` can't authenticate the
+      // returning approval/rejection notification — see that method
+      // for details. Surface the error to the UI so the user sees a
+      // clear "ask curator for an updated invite code" message
+      // instead of a generic 502.
+      if (!curatorPeerId) {
+        return jsonResponse(res, 400, {
+          error: 'Missing curatorPeerId. Invite codes must include the curator peer id (V10 format: "<cgId>\\n<peerId>"). Ask the curator to share an updated invite code.',
+        });
+      }
       const result = await agent.forwardJoinRequest(contextGraphId, delegation, agentName, curatorPeerId);
       if (result.delivered === 0) {
         return jsonResponse(res, 502, { error: 'Could not deliver join request to curator. No reachable curator found.' });
@@ -825,7 +836,12 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         const raw = await readBody(req, SMALL_BODY_BYTES);
         if (raw) curatorPeerId = JSON.parse(raw)?.curatorPeerId;
       } catch {
-        // Body is optional — older callers POST with no payload.
+        // body parse error — surface as missing-curator below.
+      }
+      if (!curatorPeerId) {
+        return jsonResponse(res, 400, {
+          error: 'Missing curatorPeerId. Invite codes must include the curator peer id (V10 format: "<cgId>\\n<peerId>"). Ask the curator to share an updated invite code.',
+        });
       }
       const delegation = await agent.signJoinRequest(contextGraphId, callerAddress);
       const { delivered, errors } = await agent.forwardJoinRequest(

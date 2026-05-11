@@ -37,6 +37,7 @@ N2=http://127.0.0.1:9202
 
 N1_ADDR=""
 N2_ADDR=""
+N1_PEER_ID=""
 
 hr()   { printf '\n\033[1;34m── %s ──\033[0m\n' "$*"; }
 ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
@@ -65,17 +66,20 @@ identify() {
   for i in 1 2; do
     local api_url
     api_url=$(eval echo "\$N${i}")
-    local self
-    self=$(api "$api_url" GET /api/agents | python3 -c "
+    local self_json self_addr self_peer
+    self_json=$(api "$api_url" GET /api/agents | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
 for a in d.get('agents',[]):
     if a.get('connectionStatus')=='self':
-        print(a.get('agentAddress','')); break
+        print(json.dumps({'addr': a.get('agentAddress',''), 'peer': a.get('peerId','')})); break
 ")
-    if [ -z "$self" ]; then fail "N$i: could not fetch agent address"; exit 1; fi
-    eval "N${i}_ADDR=\"$self\""
-    ok "N$i agent address: $self"
+    self_addr=$(echo "$self_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('addr',''))")
+    self_peer=$(echo "$self_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('peer',''))")
+    if [ -z "$self_addr" ]; then fail "N$i: could not fetch agent address"; exit 1; fi
+    eval "N${i}_ADDR=\"$self_addr\""
+    eval "N${i}_PEER_ID=\"$self_peer\""
+    ok "N$i agent address: $self_addr (peer: $self_peer)"
   done
 }
 
@@ -133,7 +137,7 @@ api "$N2" POST /api/subscribe "{\"contextGraphId\":\"$CG_ID\"}" > /dev/null
 poll_catchup "$N2" "$CG_ID" denied 90 || exit 1
 
 hr "Step 3 — N2 signs and forwards a join request to N1"
-sign_resp=$(api "$N2" POST "/api/context-graph/$(urlenc "$CG_ID")/sign-join" "{}")
+sign_resp=$(api "$N2" POST "/api/context-graph/$(urlenc "$CG_ID")/sign-join" "{\"curatorPeerId\":\"$N1_PEER_ID\"}")
 sent=$(echo "$sign_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
 [ "$sent" = "sent" ] && ok "request delivered" || { fail "sign-join: $sign_resp"; exit 1; }
 

@@ -257,15 +257,18 @@ const JOIN_DELEGATION_VALIDITY_MS = 365 * 24 * 60 * 60 * 1000;
 
 /**
  * Scope string for join-request delegations. Authorises the named node
- * to sync the CG on the named chain/network.
+ * to sync the CG on the named DKG deployment.
  *
- * The chain id namespaces the scope so a delegation signed for CG "X"
- * on `evm:84532` (Base Sepolia) can't be replayed against CG "X" on a
- * different network (devnet, hardhat, another chain) that happens to
- * share the same human-named CG id and delegatee identifiers.
+ * The `deploymentId` (e.g. `evm:84532:hub=0x...`) namespaces the scope
+ * to a SPECIFIC deployment, not just a chain — every Hardhat instance
+ * shares `evm:31337`, and a single chain can host multiple independent
+ * DKG deployments with different Hub contracts. Without deployment-id
+ * binding, a delegation signed against testnet's CG "X" could be
+ * replayed against a devnet's CG "X" with the same delegatee
+ * identifiers. See `ChainAdapter.deploymentId`.
  */
-function joinDelegationScope(chainId: string, contextGraphId: string): string {
-  return `sync:chain=${chainId}:${contextGraphId}`;
+function joinDelegationScope(deploymentId: string, contextGraphId: string): string {
+  return `sync:deployment=${deploymentId}:${contextGraphId}`;
 }
 
 /**
@@ -6832,7 +6835,7 @@ export class DKGAgent {
 
     return signAgentDelegation({
       agentAddress: addr,
-      scope: joinDelegationScope(this.chain.chainId, contextGraphId),
+      scope: joinDelegationScope(this.chain.deploymentId, contextGraphId),
       issuedAtMs,
       expiresAtMs,
       delegateePeerId,
@@ -6847,7 +6850,7 @@ export class DKGAgent {
    * Throws on any failure.
    */
   verifyJoinRequest(contextGraphId: string, delegation: SignedAgentDelegation): SignedAgentDelegation {
-    verifyAgentDelegation(delegation, { expectedScope: joinDelegationScope(this.chain.chainId, contextGraphId) });
+    verifyAgentDelegation(delegation, { expectedScope: joinDelegationScope(this.chain.deploymentId, contextGraphId) });
     return delegation;
   }
 
@@ -6962,10 +6965,22 @@ export class DKGAgent {
     const signature = strip(row['sig']);
     const issuedAtMs = parseInt(strip(row['ts']), 10) || 0;
     const expires = row['expires'] ? parseInt(strip(row['expires']), 10) || 0 : 0;
-    const scope = row['scope'] ? strip(row['scope']) : joinDelegationScope(this.chain.chainId, contextGraphId);
+    const scope = row['scope'] ? strip(row['scope']) : joinDelegationScope(this.chain.deploymentId, contextGraphId);
     const delegateePeerId = row['peer'] ? strip(row['peer']) : undefined;
     const delegateeOpKey = row['opkey'] ? strip(row['opkey']) : undefined;
     if (!signature || !issuedAtMs) return null;
+    if (!delegateePeerId && !delegateeOpKey) {
+      // Legacy pending row from before the delegation rework — has
+      // signature + timestamp but no delegatee identifiers, so the
+      // new verifier would reject it with a generic "at least one
+      // delegatee identifier is required". Throw a curator-readable
+      // error with a migration hint instead.
+      throw new Error(
+        `Pending join request from ${agentAddress} predates the V10 delegation rework ` +
+        `(missing delegatee identifiers). Reject this request and ask the joiner to re-submit; ` +
+        `the upgrade is a clean break in the join-request wire format.`,
+      );
+    }
     return {
       agentAddress,
       scope,
@@ -7031,7 +7046,7 @@ export class DKGAgent {
     // into the signed payload. The standard `JOIN_DELEGATION_VALIDITY_MS`
     // is 1 year so this is a non-issue in practice.
     verifyAgentDelegation(delegation, {
-      expectedScope: joinDelegationScope(this.chain.chainId, contextGraphId),
+      expectedScope: joinDelegationScope(this.chain.deploymentId, contextGraphId),
     });
 
     await this.inviteAgentToContextGraph(contextGraphId, agentAddress, callerAgentAddress, delegation);
@@ -7303,9 +7318,23 @@ export class DKGAgent {
   async forwardJoinRequest(
     contextGraphId: string,
     delegation: SignedAgentDelegation,
-    agentName?: string,
-    curatorPeerId?: string,
+    agentName: string | undefined,
+    curatorPeerId: string,
   ): Promise<{ delivered: number; errors: string[] }> {
+    if (!curatorPeerId) {
+      // Required: V10 invites carry the curator's libp2p peer-id
+      // (`<cgId>\n<peerId>`). Without it we can't authenticate the
+      // returning `join-approved` / `join-rejected` notification —
+      // caching arbitrary broadcast acceptors as trusted decision
+      // senders is a security hole (any peer that ack'd the broadcast
+      // could later forge a decision message). Fail fast at the entry
+      // point with a clear error so the UI can surface it to the user.
+      throw new Error(
+        `forwardJoinRequest requires curatorPeerId. ` +
+        `The invite code must include the curator's peer id (V10 format: "<cgId>\\n<peerId>"). ` +
+        `Ask the curator to share an updated invite code.`,
+      );
+    }
     const payload = JSON.stringify({ contextGraphId, delegation, agentName });
     const payloadBytes = new TextEncoder().encode(payload);
     const ctx = createOperationContext('system');
@@ -7333,7 +7362,7 @@ export class DKGAgent {
     //    earlier behaviour skipped curator unconditionally — a single
     //    transient error then meant the request never reached them.
     let curatorTargetedSuccess = false;
-    if (curatorPeerId && curatorPeerId !== this.peerId) {
+    if (curatorPeerId !== this.peerId) {
       try {
         const responseBytes = await this.router.send(curatorPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, 5000);
         const response = JSON.parse(new TextDecoder().decode(responseBytes));
@@ -7386,7 +7415,7 @@ export class DKGAgent {
         // deliver the decision: the joiner will accept it via the
         // `_meta` curator-triple path once that triple lands locally
         // (curator metadata is gossiped along with the CG itself).
-        if (curatorPeerId && remotePeerId === curatorPeerId) {
+        if (remotePeerId === curatorPeerId) {
           recordAcceptedBy(remotePeerId);
         }
       } else if (response.error !== 'unknown CG') {
@@ -8609,10 +8638,17 @@ export class DKGAgent {
     requesterPeerId: string | undefined,
     requestId: string | undefined,
     issuedAtMs: number | undefined,
+    requesterAgentAddress: string | undefined,
   ): Uint8Array {
+    // `requesterAgentAddress` participates in the digest so the
+    // "on behalf of" claim is signed, not free-form envelope data.
+    // Without it, the responder's delegation lookup can be steered by
+    // tampering with `requesterAgentAddress` after the signature was
+    // produced — which would be a way to bypass the per-agent
+    // delegation binding in `request-authorize`.
     return ethers.getBytes(
       ethers.solidityPackedKeccak256(
-        ['string', 'uint256', 'uint256', 'bool', 'string', 'string', 'string', 'uint256'],
+        ['string', 'uint256', 'uint256', 'bool', 'string', 'string', 'string', 'uint256', 'string'],
         [
           contextGraphId,
           BigInt(offset),
@@ -8622,6 +8658,7 @@ export class DKGAgent {
           requesterPeerId ?? '',
           requestId ?? '',
           BigInt(issuedAtMs ?? 0),
+          (requesterAgentAddress ?? '').toLowerCase(),
         ],
       ),
     );

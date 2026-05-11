@@ -38,6 +38,10 @@ N3=http://127.0.0.1:9203
 N1_ADDR=""
 N2_ADDR=""
 N3_ADDR=""
+# Curator peer-id (libp2p) — required by /sign-join in V10. Real users
+# get this from the invite code (`<cgId>\n<peerId>`); test scripts
+# resolve it via /api/agents.
+N1_PEER_ID=""
 
 hr()   { printf '\n\033[1;34m── %s ──\033[0m\n' "$*"; }
 ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
@@ -87,17 +91,20 @@ identify() {
   for i in 1 2 3; do
     local node_url="N$i" api_url
     api_url=$(eval echo "\$N${i}")
-    local self
-    self=$(api "$api_url" GET /api/agents | python3 -c "
+    local self_json self_addr self_peer
+    self_json=$(api "$api_url" GET /api/agents | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
 for a in d.get('agents',[]):
     if a.get('connectionStatus')=='self':
-        print(a.get('agentAddress','')); break
+        print(json.dumps({'addr': a.get('agentAddress',''), 'peer': a.get('peerId','')})); break
 ")
-    if [ -z "$self" ]; then fail "Node $i: could not fetch agent address"; exit 1; fi
-    eval "N${i}_ADDR=\"$self\""
-    ok "Node $i agent address: $self"
+    self_addr=$(echo "$self_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('addr',''))")
+    self_peer=$(echo "$self_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('peer',''))")
+    if [ -z "$self_addr" ]; then fail "Node $i: could not fetch agent address"; exit 1; fi
+    eval "N${i}_ADDR=\"$self_addr\""
+    eval "N${i}_PEER_ID=\"$self_peer\""
+    ok "Node $i agent address: $self_addr (peer: $self_peer)"
   done
 }
 
@@ -234,7 +241,7 @@ else
 fi
 
 hr "Step 4 — N2 signs & forwards a join request to N1 (curator)"
-sign_resp=$(api "$N2" POST "/api/context-graph/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$CG_ID',safe=''))")/sign-join" "{}")
+sign_resp=$(api "$N2" POST "/api/context-graph/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$CG_ID',safe=''))")/sign-join" "{\"curatorPeerId\":\"$N1_PEER_ID\"}")
 sent_status=$(echo "$sign_resp" | jq_field status)
 delivered=$(echo "$sign_resp" | jq_field delivered)
 sig=$(echo "$sign_resp" | jq_field signature)

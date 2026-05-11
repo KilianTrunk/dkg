@@ -285,20 +285,24 @@ describe('publishJsonLd', () => {
     if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(false);
   }, 15000);
 
-  it('E2E: async publish with distinct authorWallet lands on-chain with KC.author == that wallet', async () => {
+  it('E2E: async publish with custodial authorAgentAddress lands on-chain with KC.author == that agent', async () => {
     // Top-of-stack proof that the seal-at-enqueue refactor actually
-    // delivers caller-attested authorship on-chain: caller's wallet
-    // signs at enqueue, the publisher consumes that seal verbatim,
-    // and the chain records the caller's address as KC.author —
-    // demonstrably DIFFERENT from the publisher's own wallet.
+    // delivers caller-attested authorship on-chain: a registered
+    // local agent (custodial) signs at enqueue via the daemon's
+    // keystore, the publisher consumes that seal verbatim, and the
+    // chain records the agent's address as KC.author — demonstrably
+    // DIFFERENT from the publisher's own wallet.
     const { agent, store } = await createAgent('AsyncSealE2EBot');
     await agent.createContextGraph({ id: 'async-seal-e2e', name: 'AsyncSealE2E', description: '' });
     await agent.registerContextGraph('async-seal-e2e');
     const root = 'http://example.org/AsyncSealE2EEntity';
 
-    const distinctAuthor = ethers.Wallet.createRandom();
+    // Same model the sync `assertionFinalize` path uses: register a
+    // custodial agent, daemon holds the key, caller passes the
+    // address only.
+    const tenant = await agent.registerAgent('AcmeBikesTenant');
     const publisherAddress = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
-    expect(distinctAuthor.address.toLowerCase()).not.toBe(publisherAddress.toLowerCase());
+    expect(tenant.agentAddress.toLowerCase()).not.toBe(publisherAddress.toLowerCase());
 
     const { captureID } = await agent.publishAsync(
       'did:dkg:context-graph:async-seal-e2e',
@@ -312,11 +316,7 @@ describe('publishJsonLd', () => {
       },
       {
         localOnly: true,
-        authorWallet: {
-          address: distinctAuthor.address,
-          signTypedData: (domain, types, value) =>
-            distinctAuthor.signTypedData(domain, types, value),
-        },
+        authorAgentAddress: tenant.agentAddress,
       },
     );
 
@@ -350,29 +350,24 @@ describe('publishJsonLd', () => {
       ?? (finalized as any)?.finalization?.batchId;
     expect(kcId).toBeDefined();
     const onChainAuthor = await chainAdapter.getLatestMerkleRootAuthor(BigInt(kcId));
-    expect(onChainAuthor.toLowerCase()).toBe(distinctAuthor.address.toLowerCase());
+    expect(onChainAuthor.toLowerCase()).toBe(tenant.agentAddress.toLowerCase());
     expect(onChainAuthor.toLowerCase()).not.toBe(publisherAddress.toLowerCase());
   }, 60_000);
 
-  it('async publish with caller-supplied authorWallet binds the seal to that wallet (NOT the publisher\'s)', async () => {
+  it('async publish with authorAgentAddress binds the seal to that agent (NOT the publisher\'s wallet)', async () => {
     // This is the architectural payoff of seal-at-enqueue: the on-chain
-    // KC.author can be a wallet completely distinct from the publisher's
-    // own EOA. The agent signs the canonical merkle with the caller's
-    // wallet; the publisher consumes the seal verbatim.
-    //
-    // Without an explicit assertion that author != publisher, the
-    // separation claim is hollow — KC.author would still be the
-    // publisher's address (which it was in PR #451). This test pins
-    // the actual wallet plumbing.
+    // KC.author is a registered agent's address, NOT the publisher's
+    // EOA. The agent signs the canonical merkle with the daemon's
+    // custodial key for that agent; the publisher consumes the seal
+    // verbatim. No private key in the API call — same model as
+    // `assertionFinalize`'s `authorAgentAddress`.
     const { agent, store } = await createAgent('AsyncSealDistinctAuthorBot');
     await agent.createContextGraph({ id: 'async-seal-distinct', name: 'AsyncSealDistinct', description: '' });
     await agent.registerContextGraph('async-seal-distinct');
     const root = 'http://example.org/AsyncSealDistinctEntity';
 
-    // Build a wallet that is NOT in publisher-wallets.json — completely
-    // unrelated to the daemon's signing keys.
-    const distinctAuthor = ethers.Wallet.createRandom();
-    expect(distinctAuthor.address.toLowerCase()).not.toBe(
+    const tenant = await agent.registerAgent('TenantA');
+    expect(tenant.agentAddress.toLowerCase()).not.toBe(
       new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address.toLowerCase(),
     );
 
@@ -388,11 +383,7 @@ describe('publishJsonLd', () => {
       },
       {
         localOnly: true,
-        authorWallet: {
-          address: distinctAuthor.address,
-          signTypedData: (domain, types, value) =>
-            distinctAuthor.signTypedData(domain, types, value),
-        },
+        authorAgentAddress: tenant.agentAddress,
       },
     );
 
@@ -400,14 +391,14 @@ describe('publishJsonLd', () => {
     const job = await asyncPublisher.getStatus(captureID);
     const seal = job?.request.seal;
     expect(seal).toBeDefined();
-    expect(seal?.authorAddress.toLowerCase()).toBe(distinctAuthor.address.toLowerCase());
+    expect(seal?.authorAddress.toLowerCase()).toBe(tenant.agentAddress.toLowerCase());
     expect(seal?.authorAddress.toLowerCase()).not.toBe(
       new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address.toLowerCase(),
     );
 
-    // The signature must recover to the caller's wallet — confirms the
-    // seal was actually signed by `distinctAuthor.signTypedData(...)`
-    // and not silently mis-attributed via some other code path.
+    // The signature must recover to the registered agent's address —
+    // confirms the daemon's custodial key for THIS agent was the one
+    // that signed, not the publisher fallback path.
     const onChainId = (await agent.getContextGraphOnChainId('async-seal-distinct')) as string;
     const kav10Address = await (agent as unknown as {
       chain: { getKnowledgeAssetsV10Address(): Promise<string> };
@@ -431,7 +422,52 @@ describe('publishJsonLd', () => {
         yParityAndS: seal!.signature.vs,
       }).serialized,
     );
-    expect(recoveredFromSeal.toLowerCase()).toBe(distinctAuthor.address.toLowerCase());
+    expect(recoveredFromSeal.toLowerCase()).toBe(tenant.agentAddress.toLowerCase());
+  }, 30_000);
+
+  it('async publish rejects authorAgentAddress for unknown / self-sovereign agents', async () => {
+    // Mirrors the sync `assertionFinalize` error semantics: the daemon
+    // refuses to sign for an agent it doesn't custodially hold the key
+    // for. Caller must register the agent first (custodial mode).
+    const { agent } = await createAgent('AsyncSealRejectBot');
+    await agent.createContextGraph({ id: 'async-seal-reject', name: 'AsyncSealReject', description: '' });
+    await agent.registerContextGraph('async-seal-reject');
+
+    // Random EOA — not registered on this node.
+    const stranger = ethers.Wallet.createRandom().address;
+    await expect(
+      agent.publishAsync(
+        'did:dkg:context-graph:async-seal-reject',
+        {
+          public: {
+            '@context': 'http://schema.org/',
+            '@id': 'http://example.org/RejectEntity',
+            '@type': 'Thing',
+            'name': 'Reject',
+          },
+        },
+        { localOnly: true, authorAgentAddress: stranger },
+      ),
+    ).rejects.toThrow(/is not a registered local agent/);
+
+    // Self-sovereign agent — daemon never had the key.
+    const externallyHeld = ethers.Wallet.createRandom();
+    const publicKeyCompressed = ethers.SigningKey.computePublicKey(externallyHeld.signingKey.publicKey, true);
+    const selfSovereign = await agent.registerAgent('SelfSovereign', { publicKey: publicKeyCompressed });
+    await expect(
+      agent.publishAsync(
+        'did:dkg:context-graph:async-seal-reject',
+        {
+          public: {
+            '@context': 'http://schema.org/',
+            '@id': 'http://example.org/RejectEntity2',
+            '@type': 'Thing',
+            'name': 'Reject2',
+          },
+        },
+        { localOnly: true, authorAgentAddress: selfSovereign.agentAddress },
+      ),
+    ).rejects.toThrow(/self-sovereign/);
   }, 30_000);
 
   it('async publish attaches a seal to the LiftRequest with merkleRoot == canonicalPublishPayload(resolved slice)', async () => {

@@ -139,29 +139,28 @@ export interface PublishAsyncOpts extends PublishOpts {
   authority?: LiftAuthorityProof;
   localOnly?: boolean;
   /**
-   * Caller-supplied author wallet for the EIP-712 AuthorAttestation seal.
-   * When provided, the agent signs the canonical kcMerkleRoot with this
-   * wallet and the on-chain `KC.author` reflects this address — the
-   * publisher's own EOA never enters the seal. Use this for real
-   * per-tenant / per-event author attribution (e.g. operator-managed
-   * tenant key mapped from the EPCIS HTTP API token).
+   * Author attribution for the EIP-712 AuthorAttestation seal. Mirrors
+   * `assertionFinalize`'s `authorAgentAddress` — the caller names a local
+   * agent registered on this node, and the agent's custodial private key
+   * (held in the daemon's keystore) signs the canonical kcMerkleRoot.
+   * The on-chain `KC.author` reflects this address rather than the
+   * publisher's own EOA.
    *
-   * When omitted, the agent falls back to signing via the publisher's
-   * own wallet (legacy behaviour, same as the removed
-   * `allowPublisherFallbackSeal` mode) so non-V10-aware callers still
-   * publish without changes.
+   * Constraints:
+   * - The address MUST refer to an agent registered via
+   *   `agent.registerAgent(name)` (custodial mode — daemon holds the key).
+   * - Self-sovereign agents are rejected: the daemon never has their key
+   *   and the async path has no way to delegate signing to an out-of-process
+   *   wallet (the merkle isn't known until processNext-time).
    *
-   * The wallet only needs `signTypedData(domain, types, value)` — any
-   * `ethers.Signer` (Wallet, JsonRpcSigner, HSM-backed signer) works.
+   * When omitted, the agent falls back to signing as the publisher's
+   * own EOA so non-V10-aware callers keep publishing unchanged.
+   *
+   * Use case: operator-managed tenant key mapped from the EPCIS HTTP API
+   * token. The HTTP route resolves the bearer token → tenant agent address,
+   * then passes that here.
    */
-  authorWallet?: {
-    readonly address: string;
-    signTypedData(
-      domain: ethers.TypedDataDomain,
-      types: Record<string, Array<{ name: string; type: string }>>,
-      value: Record<string, unknown>,
-    ): Promise<string>;
-  };
+  authorAgentAddress?: string;
 }
 
 export interface PublishAsyncQuadEnvelope {
@@ -3803,7 +3802,7 @@ export class DKGAgent {
       allowedPeers: opts?.allowedPeers,
     } as const;
 
-    const seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorWallet);
+    const seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress);
 
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
     const captureID = await asyncPublisher.lift({
@@ -3854,7 +3853,7 @@ export class DKGAgent {
       readonly allowedPeers?: readonly string[];
       readonly swmId: string;
     },
-    authorWallet?: PublishAsyncOpts['authorWallet'],
+    authorAgentAddress?: string,
   ): Promise<LiftRequestAuthorSeal | undefined> {
     if (this.chain.isV10Ready?.() !== true) return undefined;
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
@@ -3892,15 +3891,38 @@ export class DKGAgent {
       validated.resolved.privateQuads ?? [],
     );
 
-    // Caller-supplied author wallet wins. Falls back to publisher's own
-    // wallet only when no `authorWallet` is supplied — that legacy path
-    // keeps callers that haven't migrated yet (e.g. EPCIS HTTP capture
-    // without a tenant-key mapping) working, but it makes author ==
-    // publisher, which is exactly the separation gap we're closing.
-    const authorAddress = authorWallet
-      ? authorWallet.address
-      : await this.publisher.publisherFallbackAuthorAddress();
-    if (!authorAddress) return undefined;
+    // Resolve author: same precedence sync `assertionFinalize` uses.
+    //   1. Caller named a registered local agent → daemon's custodial
+    //      key signs (no key in API call).
+    //   2. No agent named → publisher's own EOA signs (legacy).
+    let authorAddress: string;
+    let signerPrivateKey: string | undefined;
+    if (authorAgentAddress != null) {
+      const mode = this.getLocalAgentMode(authorAgentAddress);
+      if (mode === undefined) {
+        throw new Error(
+          `publishAsync: authorAgentAddress ${authorAgentAddress} is not a registered local agent on this node. ` +
+            `Use \`agent.registerAgent(name)\` first.`,
+        );
+      }
+      if (mode === 'self-sovereign') {
+        throw new Error(
+          `publishAsync: agent ${authorAgentAddress} is self-sovereign — this node does not hold its private key. ` +
+            `The async path cannot delegate signing to an out-of-process wallet because the merkle isn't known until processNext-time.`,
+        );
+      }
+      signerPrivateKey = this.getCustodialAgentPrivateKey(authorAgentAddress);
+      if (!signerPrivateKey) {
+        throw new Error(
+          `publishAsync: custodial agent ${authorAgentAddress} has no private key on file`,
+        );
+      }
+      authorAddress = authorAgentAddress;
+    } else {
+      const fallback = await this.publisher.publisherFallbackAuthorAddress();
+      if (!fallback) return undefined;
+      authorAddress = fallback;
+    }
 
     const typedData = buildAuthorAttestationTypedData({
       chainId,
@@ -3913,10 +3935,13 @@ export class DKGAgent {
 
     let r: Uint8Array;
     let vs: Uint8Array;
-    if (authorWallet) {
-      const sigHex = await authorWallet.signTypedData(
+    if (signerPrivateKey) {
+      const wallet = new ethers.Wallet(
+        signerPrivateKey.startsWith('0x') ? signerPrivateKey : '0x' + signerPrivateKey,
+      );
+      const sigHex = await wallet.signTypedData(
         typedData.domain,
-        typedData.types as Record<string, Array<{ name: string; type: string }>>,
+        typedData.types,
         typedData.message,
       );
       const sig = ethers.Signature.from(sigHex);

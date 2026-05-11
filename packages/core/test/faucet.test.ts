@@ -47,7 +47,7 @@ describe('requestFaucetFunding', () => {
     expect(reqBody.mode).toBe('v10_base_sepolia');
   });
 
-  it('funds wallets in batches of 3', async () => {
+  it('funds wallets in batches of 4', async () => {
     const { fetch, calls } = createTrackingFetch(200, { summary: { success: 1 }, results: [] });
     await requestFaucetFunding(
       'https://faucet.example.com/fund', 'test',
@@ -55,10 +55,10 @@ describe('requestFaucetFunding', () => {
     );
     expect(calls).toHaveLength(2);
     const reqBody = JSON.parse(calls[0].init.body as string);
-    expect(reqBody.wallets).toHaveLength(3);
-    expect(reqBody.wallets).toEqual(['0x1', '0x2', '0x3']);
+    expect(reqBody.wallets).toHaveLength(4);
+    expect(reqBody.wallets).toEqual(['0x1', '0x2', '0x3', '0x4']);
     const secondReqBody = JSON.parse(calls[1].init.body as string);
-    expect(secondReqBody.wallets).toEqual(['0x4', '0x5']);
+    expect(secondReqBody.wallets).toEqual(['0x5']);
   });
 
   it('returns error on HTTP failure', async () => {
@@ -78,7 +78,7 @@ describe('requestFaucetFunding', () => {
       calls.push({ url: url as any, init: init as RequestInit });
       if (calls.length === 1) {
         return new Response(JSON.stringify({
-          summary: { success: 6 },
+          summary: { success: 8 },
           results: [{ chainId: 'eth-sepolia', amount: '0.01', status: 'success' }],
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
@@ -87,14 +87,14 @@ describe('requestFaucetFunding', () => {
 
     const result = await requestFaucetFunding(
       'https://faucet.example.com/fund', 'test',
-      ['0x1', '0x2', '0x3', '0x4'], 'partial-node', fetch,
+      ['0x1', '0x2', '0x3', '0x4', '0x5'], 'partial-node', fetch,
     );
 
     expect(calls).toHaveLength(2);
     expect(result.success).toBe(true);
     expect(result.funded).toEqual(['0.01 ETH']);
-    expect(result.fundedWallets).toEqual(['0x1', '0x2', '0x3']);
-    expect(result.failedWallets).toEqual(['0x4']);
+    expect(result.fundedWallets).toEqual(['0x1', '0x2', '0x3', '0x4']);
+    expect(result.failedWallets).toEqual(['0x5']);
     expect(result.error).toContain('429');
   });
 
@@ -174,7 +174,7 @@ describe('requestFaucetFunding', () => {
       calls.push({ url: url as any, init: init as RequestInit });
       if (calls.length === 1) {
         return new Response(JSON.stringify({
-          summary: { success: 6 },
+          summary: { success: 8 },
           results: [],
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
@@ -183,12 +183,12 @@ describe('requestFaucetFunding', () => {
 
     const result = await requestFaucetFunding(
       'https://faucet.example.com/fund', 'test',
-      ['0x1', '0x2', '0x3', '0x4'], 'throwing-node', fetch,
+      ['0x1', '0x2', '0x3', '0x4', '0x5'], 'throwing-node', fetch,
     );
 
     expect(result.success).toBe(true);
-    expect(result.fundedWallets).toEqual(['0x1', '0x2', '0x3']);
-    expect(result.failedWallets).toEqual(['0x4']);
+    expect(result.fundedWallets).toEqual(['0x1', '0x2', '0x3', '0x4']);
+    expect(result.failedWallets).toEqual(['0x5']);
     expect(result.error).toContain('faucet offline');
   });
 

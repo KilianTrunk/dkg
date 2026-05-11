@@ -9,7 +9,7 @@
  *     not wrong-slot-wired) so deterministic setup errors fail fast
  *     before daemon start and the faucet call burn resources
  *  5. Start the DKG daemon
- *  6. Read wallets and fund the first three via the testnet faucet
+ *  6. Read wallets and fund the admin + operational wallets via the testnet faucet
  *     (skippable with `--no-fund`; non-fatal on failure)
  *  7. Copy the canonical DKG node skill into the OpenClaw workspace
  *  8. Merge adapter plugin into ~/.openclaw/openclaw.json (including
@@ -67,7 +67,7 @@ export interface SetupOptions {
   start?: boolean;
   dryRun?: boolean;
   /**
-   * Fund the first three node wallets via the testnet faucet on first setup.
+   * Fund the node's admin + operational wallets via the testnet faucet on first setup.
    * Defaults to `true`; the adapter treats `fund === false` (set by
    * `--no-fund`) as the only opt-out. Faucet failures are non-fatal — a
    * failed call logs manual `curl` instructions and setup continues.

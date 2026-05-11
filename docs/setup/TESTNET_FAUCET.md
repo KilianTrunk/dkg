@@ -6,7 +6,7 @@ Fund your DKG V9 node wallets with Base Sepolia testnet ETH and TRAC in a single
 
 ## Fund wallets
 
-Send a `POST /fund` request with your node wallet addresses (up to 3 per call). Each wallet receives both Base Sepolia ETH and test TRAC.
+Send a `POST /fund` request with your node wallet addresses (up to 4 per call). Each wallet receives both Base Sepolia ETH and test TRAC.
 
 ```bash
 curl -X POST "https://euphoria.origin-trail.network/faucet/fund" \
@@ -24,7 +24,7 @@ curl -X POST "https://euphoria.origin-trail.network/faucet/fund" \
 | Field | Required | Description |
 |-------|----------|-------------|
 | `mode` | Yes | Must be `"v10_base_sepolia"` |
-| `wallets` | Yes | Array of EVM addresses (1-3, no duplicates) |
+| `wallets` | Yes | Array of EVM addresses (1-4, no duplicates) |
 | `callerId` | No | Stable identifier for your installer/node — enables per-caller cooldown |
 
 ### Headers

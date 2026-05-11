@@ -7,6 +7,7 @@ export interface FaucetResult {
 }
 
 const EXPECTED_FAUCET_TRANSFERS_PER_WALLET = 2;
+export const FAUCET_WALLETS_PER_REQUEST = 4;
 
 export async function requestFaucetFunding(
   faucetUrl: string,
@@ -16,8 +17,8 @@ export async function requestFaucetFunding(
   _fetch = globalThis.fetch,
 ): Promise<FaucetResult> {
   const batches: string[][] = [];
-  for (let i = 0; i < wallets.length; i += 3) {
-    batches.push(wallets.slice(i, i + 3));
+  for (let i = 0; i < wallets.length; i += FAUCET_WALLETS_PER_REQUEST) {
+    batches.push(wallets.slice(i, i + FAUCET_WALLETS_PER_REQUEST));
   }
   if (batches.length === 0) return { success: false, funded: [], error: 'no wallets' };
 

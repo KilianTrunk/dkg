@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { writeFile, unlink } from 'node:fs/promises';
 import { ethers } from 'ethers';
-import { dkgAuthTokenPath, requestFaucetFunding, toErrorMessage, hasErrorCode } from '@origintrail-official/dkg-core';
+import { dkgAuthTokenPath, FAUCET_WALLETS_PER_REQUEST, requestFaucetFunding, toErrorMessage, hasErrorCode } from '@origintrail-official/dkg-core';
 import yaml from 'js-yaml';
 import {
   loadConfig, saveConfig, configExists, configPath,
@@ -433,8 +433,8 @@ program
 
     // Auto-fund from testnet faucet if available
     if (network?.faucet?.url && walletAddresses.length > 0) {
-      if (walletAddresses.length > 3) {
-        console.log(`\nNote: faucet supports up to 3 wallets per request; funding wallets in batches.`);
+      if (walletAddresses.length > FAUCET_WALLETS_PER_REQUEST) {
+        console.log(`\nNote: faucet supports up to ${FAUCET_WALLETS_PER_REQUEST} wallets per request; funding wallets in batches.`);
       }
       console.log(`\nRequesting testnet tokens from faucet...`);
       try {

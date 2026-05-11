@@ -24,7 +24,7 @@ export {
   blueGreenSlotEntryPoint,
   blueGreenSlotReady,
 } from './blue-green.js';
-export { requestFaucetFunding, type FaucetResult } from './faucet.js';
+export { FAUCET_WALLETS_PER_REQUEST, requestFaucetFunding, type FaucetResult } from './faucet.js';
 export {
   fundWalletsBestEffort,
   logManualFundingInstructions,

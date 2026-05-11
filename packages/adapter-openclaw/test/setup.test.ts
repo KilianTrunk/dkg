@@ -3474,6 +3474,61 @@ describe('runSetup preflight runs before faucet (C10)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// readWallets — wallets.json address selection
+// ---------------------------------------------------------------------------
+
+describe('readWallets', () => {
+  let originalDkg: string | undefined;
+  let dkgHome: string;
+
+  beforeEach(() => {
+    originalDkg = process.env.DKG_HOME;
+    dkgHome = join(testDir, '.dkg');
+    mkdirSync(dkgHome, { recursive: true });
+    process.env.DKG_HOME = dkgHome;
+  });
+
+  afterEach(() => {
+    process.env.DKG_HOME = originalDkg;
+  });
+
+  it('returns the generated admin wallet before the three operational wallets', () => {
+    const admin = '0xAAAA000000000000000000000000000000000001';
+    const wallets = [
+      '0xBBBB000000000000000000000000000000000001',
+      '0xBBBB000000000000000000000000000000000002',
+      '0xBBBB000000000000000000000000000000000003',
+    ];
+    writeFileSync(
+      join(dkgHome, 'wallets.json'),
+      JSON.stringify({
+        adminWallet: { address: admin, privateKey: '0xadmin' },
+        wallets: wallets.map(address => ({ address, privateKey: `key-${address}` })),
+      }),
+    );
+
+    expect(readWallets()).toEqual([admin, ...wallets]);
+  });
+
+  it('deduplicates a malformed admin/operational overlap defensively', () => {
+    const shared = '0xCCCC000000000000000000000000000000000001';
+    const other = '0xCCCC000000000000000000000000000000000002';
+    writeFileSync(
+      join(dkgHome, 'wallets.json'),
+      JSON.stringify({
+        adminWallet: { address: shared, privateKey: '0xadmin' },
+        wallets: [
+          { address: shared, privateKey: '0xoperational-1' },
+          { address: other, privateKey: '0xoperational-2' },
+        ],
+      }),
+    );
+
+    expect(readWallets()).toEqual([shared, other]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // readWalletsWithRetry — retry accounting (C4a extraction)
 // ---------------------------------------------------------------------------
 
@@ -3536,7 +3591,7 @@ describe('logManualFundingInstructions', () => {
     logSpy.mockRestore();
   });
 
-  it('caps the curl body at the first 3 addresses matching the auto-path cap', () => {
+  it('batches the curl bodies at 4 addresses matching the auto-path cap', () => {
     const addrs = [
       '0x1111111111111111111111111111111111111111',
       '0x2222222222222222222222222222222222222222',
@@ -3547,36 +3602,38 @@ describe('logManualFundingInstructions', () => {
     logManualFundingInstructions(addrs, 'https://faucet.example.com/fund', 'v10_base_sepolia');
 
     const logged = logSpy.mock.calls.map(c => String(c[0])).join('\n');
-    // The curl body is built from JSON.stringify(fundable) — assert the
-    // cap by looking for the exact first-three array in the output and
-    // the absence of the 4th/5th addresses inside the curl line.
-    expect(logged).toContain(JSON.stringify(addrs.slice(0, 3)));
-    const curlLine = logSpy.mock.calls
+    // The curl body is built from JSON.stringify(batch) — assert the
+    // cap by looking for the exact first-four array in the output and
+    // the fifth address inside the second curl line.
+    expect(logged).toContain(JSON.stringify(addrs.slice(0, 4)));
+    expect(logged).toContain(JSON.stringify(addrs.slice(4)));
+    const curlLines = logSpy.mock.calls
       .map(c => String(c[0]))
-      .find(line => line.includes('--data-raw'));
-    expect(curlLine).toBeDefined();
-    expect(curlLine).not.toContain(addrs[3]);
-    expect(curlLine).not.toContain(addrs[4]);
+      .filter(line => line.includes('--data-raw'));
+    expect(curlLines).toHaveLength(2);
+    expect(curlLines[0]).not.toContain(addrs[4]);
+    expect(curlLines[1]).toContain(addrs[4]);
   });
 
-  // "emits a follow-on note listing the omitted wallets when more than 3
+  // "emits a follow-on note listing the omitted wallets when more than 4
   // are passed" removed: `logManualFundingInstructions` now batches long
   // address lists instead of truncating-with-note, so the
-  // `toMatch(/faucet supports up to 3 wallets/i)` + `toContain('2 wallet')`
+  // `toMatch(/faucet supports up to 4 wallets/i)` + `toContain('1 wallet')`
   // sentinels no longer match the output shape. Batching is already
   // covered by sibling tests.
 
-  it('does not emit the extras note when exactly 3 (or fewer) addresses are passed', () => {
+  it('does not emit the batching note when exactly 4 (or fewer) addresses are passed', () => {
     const addrs = [
       '0x1111111111111111111111111111111111111111',
       '0x2222222222222222222222222222222222222222',
       '0x3333333333333333333333333333333333333333',
+      '0x4444444444444444444444444444444444444444',
     ];
     logManualFundingInstructions(addrs, 'https://faucet.example.com/fund', 'v10_base_sepolia');
 
     const logged = logSpy.mock.calls.map(c => String(c[0])).join('\n');
     expect(logged).toContain('To fund wallets manually');
-    expect(logged).not.toMatch(/up to 3 wallets per call/i);
+    expect(logged).not.toMatch(/up to 4 wallets per call/i);
     expect(logged).not.toMatch(/remaining/i);
   });
 });
@@ -3593,7 +3650,12 @@ describe('logManualFundingInstructions', () => {
 // ---------------------------------------------------------------------------
 
 describe('runSetup Step 5 — faucet funding', () => {
-  const SEEDED_WALLET = '0xAAAA0000000000000000000000000000000000AA';
+  const SEEDED_ADMIN_WALLET = '0xAAAA0000000000000000000000000000000000AA';
+  const SEEDED_OPERATIONAL_WALLETS = [
+    '0xBBBB0000000000000000000000000000000000BB',
+    '0xCCCC0000000000000000000000000000000000CC',
+    '0xDDDD0000000000000000000000000000000000DD',
+  ];
 
   function setupFaucetEnv() {
     const dkgHome = join(testDir, '.dkg');
@@ -3606,12 +3668,15 @@ describe('runSetup Step 5 — faucet funding', () => {
       join(openclawHome, 'openclaw.json'),
       JSON.stringify({ plugins: {} }, null, 2) + '\n',
     );
-    // Pre-seed wallets.json so readWallets() returns a wallet on the first
+    // Pre-seed wallets.json so readWallets() returns wallets on the first
     // attempt (bypasses the retry loop — that behavior is covered by the
     // readWalletsWithRetry suite above).
     writeFileSync(
       join(dkgHome, 'wallets.json'),
-      JSON.stringify({ wallets: [{ address: SEEDED_WALLET, privateKey: '0xdeadbeef' }] }),
+      JSON.stringify({
+        adminWallet: { address: SEEDED_ADMIN_WALLET, privateKey: '0xadmin' },
+        wallets: SEEDED_OPERATIONAL_WALLETS.map(address => ({ address, privateKey: `key-${address}` })),
+      }),
     );
 
     const originalDkg = process.env.DKG_HOME;
@@ -3653,7 +3718,7 @@ describe('runSetup Step 5 — faucet funding', () => {
       expect(url).toMatch(/^https?:\/\//);
       expect(typeof mode).toBe('string');
       expect(mode.length).toBeGreaterThan(0);
-      expect(addresses).toEqual([SEEDED_WALLET]);
+      expect(addresses).toEqual([SEEDED_ADMIN_WALLET, ...SEEDED_OPERATIONAL_WALLETS]);
       expect(nodeName).toBe('test-agent');
 
       // AC3 invariant (plugins.slots.memory === 'adapter-openclaw') must still

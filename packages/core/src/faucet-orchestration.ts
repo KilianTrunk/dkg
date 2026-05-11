@@ -25,7 +25,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveDkgConfigHome } from './dkg-home.js';
-import { requestFaucetFunding } from './faucet.js';
+import { FAUCET_WALLETS_PER_REQUEST, requestFaucetFunding } from './faucet.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -113,13 +113,13 @@ export function readWallets(): string[] {
  * only on faucet failure; the caller is expected to continue (funding is
  * best-effort / non-fatal).
  *
- * Addresses are split into batches of 3 to match the faucet's per-request
+ * Addresses are split into batches of 4 to match the faucet's per-request
  * cap. Including more wallets in one body would be rejected by the faucet.
  */
 export function logManualFundingInstructions(addresses: string[], faucetUrl: string, mode: string): void {
   const batches: string[][] = [];
-  for (let i = 0; i < addresses.length; i += 3) {
-    batches.push(addresses.slice(i, i + 3));
+  for (let i = 0; i < addresses.length; i += FAUCET_WALLETS_PER_REQUEST) {
+    batches.push(addresses.slice(i, i + FAUCET_WALLETS_PER_REQUEST));
   }
   console.log('\nTo fund wallets manually, run:');
   batches.forEach((batch, index) => {
@@ -132,7 +132,7 @@ export function logManualFundingInstructions(addresses: string[], faucetUrl: str
     console.log(`    --data-raw '{"mode":"${mode}","wallets":${JSON.stringify(batch)}}'`);
   });
   if (batches.length > 1) {
-    console.log(`\nNote: faucet supports up to 3 wallets per call; run each batch above.`);
+    console.log(`\nNote: faucet supports up to ${FAUCET_WALLETS_PER_REQUEST} wallets per call; run each batch above.`);
   }
   console.log('');
 }

@@ -64,4 +64,26 @@ export {
   type WorkspaceAgentEncryptionKeyProofFields,
 } from './workspace-encryption.js';
 
+export {
+  SWM_SENDER_KEY_CHAIN_KEY_BYTES,
+  SWM_SENDER_KEY_SKIPPED_MESSAGE_CACHE_LIMIT,
+  generateSwmSenderChainKey,
+  generateSwmSenderEpochId,
+  computeSwmSenderKeyMembershipHash,
+  encryptSwmSenderKeyPackage,
+  decryptSwmSenderKeyPackage,
+  encryptSwmSenderKeyMessage,
+  decryptSwmSenderKeyMessage,
+  ratchetSwmSenderChainKey,
+  assertSupportedSwmSenderKeyPackage,
+  assertSupportedSwmSenderKeyMessage,
+  type SwmSenderKeyMembershipMember,
+  type ComputeSwmSenderKeyMembershipHashInput,
+  type EncryptSwmSenderKeyPackageInput,
+  type DecryptSwmSenderKeyPackageInput,
+  type EncryptSwmSenderKeyMessageInput,
+  type DecryptSwmSenderKeyMessageInput,
+  type SwmSenderKeyMessageCryptResult,
+} from './swm-sender-key.js';
+
 export { resolveRootEntities, type Quad as RootEntityQuad } from './root-entity.js';

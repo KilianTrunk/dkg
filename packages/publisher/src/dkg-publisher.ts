@@ -61,7 +61,24 @@ export interface DKGPublisherConfig {
   writeLocks?: Map<string, Promise<void>>;
   /** Resolves DKG-agent public encryption keys for private/agent-gated remote SWM gossip. */
   workspaceAgentRecipientResolver?: WorkspaceAgentRecipientResolver;
+  /** Encrypts private/agent-gated SWM gossip with the node's Sender Key epoch state. */
+  workspaceSenderKeyEncryptor?: WorkspaceSenderKeyEncryptor;
 }
+
+export interface WorkspaceSenderKeyEncryptInput {
+  contextGraphId: string;
+  plaintext: Uint8Array;
+  senderAgentAddress: string;
+  operationId: string;
+  workspaceOperationId: string;
+  timestampMs: number;
+  subGraphName?: string;
+  publisherPeerId: string;
+}
+
+export type WorkspaceSenderKeyEncryptor = (
+  input: WorkspaceSenderKeyEncryptInput,
+) => Promise<Uint8Array>;
 
 interface PublisherAddressResolutionOptions {
   includeReservingPublisherProbe?: boolean;
@@ -318,6 +335,7 @@ export class DKGPublisher implements Publisher {
   private adapterSignMessagePublisherAddress?: string;
   private readonly adapterSignMessageProbeCache = new Map<string, boolean>();
   private workspaceAgentRecipientResolver?: WorkspaceAgentRecipientResolver;
+  private workspaceSenderKeyEncryptor?: WorkspaceSenderKeyEncryptor;
   /** Additional wallets that can provide receiver signatures. */
   private readonly additionalSignerWallets: ethers.Wallet[] = [];
   private readonly log = new Logger('DKGPublisher');
@@ -375,10 +393,15 @@ export class DKGPublisher implements Publisher {
     this.knownBatchContextGraphs = config.knownBatchContextGraphs ?? new Map();
     this.writeLocks = config.writeLocks ?? new Map();
     this.workspaceAgentRecipientResolver = config.workspaceAgentRecipientResolver;
+    this.workspaceSenderKeyEncryptor = config.workspaceSenderKeyEncryptor;
   }
 
   setWorkspaceAgentRecipientResolver(resolver: WorkspaceAgentRecipientResolver | undefined): void {
     this.workspaceAgentRecipientResolver = resolver;
+  }
+
+  setWorkspaceSenderKeyEncryptor(encryptor: WorkspaceSenderKeyEncryptor | undefined): void {
+    this.workspaceSenderKeyEncryptor = encryptor;
   }
 
   private async resolvePublisherAddress(
@@ -961,6 +984,19 @@ export class DKGPublisher implements Publisher {
     }
     if (!options.senderAgentAddress) {
       throw new Error(`Context graph "${contextGraphId}" requires a DKG agent sender identity for encrypted SWM gossip`);
+    }
+
+    if (this.workspaceSenderKeyEncryptor) {
+      return this.workspaceSenderKeyEncryptor({
+        contextGraphId,
+        plaintext,
+        senderAgentAddress: options.senderAgentAddress,
+        operationId: options.operationId,
+        workspaceOperationId: options.workspaceOperationId,
+        timestampMs: options.timestampMs,
+        subGraphName: options.subGraphName,
+        publisherPeerId: options.publisherPeerId,
+      });
     }
 
     const senderIdentity = `did:dkg:agent:${ethers.getAddress(options.senderAgentAddress)}`;

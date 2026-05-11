@@ -6,6 +6,7 @@ import type { PhaseCallback } from './publisher.js';
 import {
   decodeGossipEnvelope,
   decodeEncryptedWorkspacePayload,
+  decodeSwmSenderKeyMessage as decodeSwmSenderKeyMessageWire,
   decryptWorkspacePayload,
   decodeWorkspacePublishRequest,
   computeGossipSigningPayload,
@@ -17,8 +18,9 @@ import {
   GOSSIP_ENVELOPE_VERSION,
   ENCRYPTED_WORKSPACE_ENVELOPE_TYPE,
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
+  SWM_SENDER_KEY_MESSAGE_TYPE,
 } from '@origintrail-official/dkg-core';
-import type { EncryptedWorkspacePayloadMsg, GossipEnvelopeMsg, WorkspaceCASConditionMsg, WorkspacePublishRequestMsg, WorkspaceRecipientEncryptionKey } from '@origintrail-official/dkg-core';
+import type { EncryptedWorkspacePayloadMsg, GossipEnvelopeMsg, OperationContext, SwmSenderKeyMessageMsg, WorkspaceCASConditionMsg, WorkspacePublishRequestMsg, WorkspaceRecipientEncryptionKey } from '@origintrail-official/dkg-core';
 import { ethers } from 'ethers';
 import { validatePublishRequest } from './validation.js';
 import { generateShareMetadata, generateOwnershipQuads, generateSubGraphRegistration } from './metadata.js';
@@ -31,8 +33,15 @@ interface WorkspaceGossipDecodeResult {
   envelope?: GossipEnvelopeMsg;
   signedPayload: Uint8Array;
   encryptedPayload?: EncryptedWorkspacePayloadMsg;
+  senderKeyMessage?: SwmSenderKeyMessageMsg;
   encrypted: boolean;
 }
+
+export type WorkspaceSenderKeyDecryptor = (
+  message: SwmSenderKeyMessageMsg,
+  contextGraphId: string,
+  ctx: OperationContext,
+) => Promise<Uint8Array>;
 
 /**
  * Handles incoming shared memory topic messages (GossipSub).
@@ -50,6 +59,7 @@ export class SharedMemoryHandler {
   private readonly workspaceRecipientPrivateKeys?: (
     contextGraphId: string,
   ) => readonly WorkspaceRecipientEncryptionKey[] | Promise<readonly WorkspaceRecipientEncryptionKey[]>;
+  private readonly workspaceSenderKeyDecryptor?: WorkspaceSenderKeyDecryptor;
   private readonly now: () => number;
   private readonly log = new Logger('SharedMemoryHandler');
 
@@ -63,6 +73,7 @@ export class SharedMemoryHandler {
       workspaceRecipientPrivateKeys?: (
         contextGraphId: string,
       ) => readonly WorkspaceRecipientEncryptionKey[] | Promise<readonly WorkspaceRecipientEncryptionKey[]>;
+      workspaceSenderKeyDecryptor?: WorkspaceSenderKeyDecryptor;
       now?: () => number;
     },
   ) {
@@ -75,6 +86,7 @@ export class SharedMemoryHandler {
     this.writeLocks = options?.writeLocks ?? new Map();
     this.localAgentAddresses = options?.localAgentAddresses;
     this.workspaceRecipientPrivateKeys = options?.workspaceRecipientPrivateKeys;
+    this.workspaceSenderKeyDecryptor = options?.workspaceSenderKeyDecryptor;
     this.now = options?.now ?? (() => Date.now());
   }
 
@@ -160,7 +172,7 @@ export class SharedMemoryHandler {
       const decoded = this.decodeWorkspaceGossipMessage(data);
       const { envelope, signedPayload } = decoded;
       let request = decoded.request;
-      let contextGraphId = request?.contextGraphId ?? envelope?.contextGraphId;
+      let contextGraphId = request?.contextGraphId ?? decoded.senderKeyMessage?.contextGraphId ?? envelope?.contextGraphId;
       if (!contextGraphId) {
         this.log.warn(ctx, 'SWM write rejected: missing context graph id');
         return;
@@ -186,14 +198,37 @@ export class SharedMemoryHandler {
       }
 
       const requiresEncryptedPayload = hasPrivateAccessPolicy || agentGateAddresses !== null;
-      if (requiresEncryptedPayload && !decoded.encryptedPayload) {
-        this.log.warn(ctx, `SWM write rejected: encrypted workspace payload required for private or agent-gated context graph "${contextGraphId}"`);
+      if (requiresEncryptedPayload && !decoded.encryptedPayload && !decoded.senderKeyMessage) {
+        this.log.warn(ctx, `SWM write rejected: Sender Key encrypted workspace payload required for private or agent-gated context graph "${contextGraphId}"`);
         return;
       }
 
-      if (decoded.encryptedPayload) {
+      if (decoded.senderKeyMessage) {
+        if (!requiresEncryptedPayload) {
+          this.log.warn(ctx, `SWM write rejected: Sender Key payload is only supported for private or agent-gated context graph "${contextGraphId}"`);
+          return;
+        }
+        if (!this.workspaceSenderKeyDecryptor) {
+          this.log.warn(ctx, `SWM write rejected: no local Sender Key state decryptor for context graph "${contextGraphId}"`);
+          return;
+        }
+        if (decoded.senderKeyMessage.contextGraphId !== contextGraphId) {
+          this.log.warn(ctx, `SWM write rejected: Sender Key contextGraphId "${decoded.senderKeyMessage.contextGraphId}" does not match envelope "${contextGraphId}"`);
+          return;
+        }
+        const plaintext = await this.workspaceSenderKeyDecryptor(decoded.senderKeyMessage, contextGraphId, ctx);
+        request = decodeWorkspacePublishRequest(plaintext);
+        if (request.contextGraphId !== contextGraphId) {
+          this.log.warn(ctx, `SWM write rejected: Sender Key decrypted payload contextGraphId "${request.contextGraphId}" does not match envelope "${contextGraphId}"`);
+          return;
+        }
+      } else if (decoded.encryptedPayload) {
         if (!requiresEncryptedPayload) {
           this.log.warn(ctx, `SWM write rejected: encrypted workspace payload is only supported for private or agent-gated context graph "${contextGraphId}"`);
+          return;
+        }
+        if (this.workspaceSenderKeyDecryptor) {
+          this.log.warn(ctx, `SWM write rejected: legacy encrypted workspace payload is not accepted for Sender Key protected context graph "${contextGraphId}"`);
           return;
         }
         if (decoded.encryptedPayload.contextGraphId !== contextGraphId) {
@@ -426,12 +461,14 @@ export class SharedMemoryHandler {
     ) {
       const signedPayload = new Uint8Array(envelope.payload);
       const encryptedPayload = this.decodeEncryptedWorkspacePayload(signedPayload);
+      const senderKeyMessage = encryptedPayload ? undefined : this.decodeSwmSenderKeyMessage(signedPayload);
       return {
-        request: encryptedPayload ? undefined : decodeWorkspacePublishRequest(signedPayload),
+        request: encryptedPayload || senderKeyMessage ? undefined : decodeWorkspacePublishRequest(signedPayload),
         envelope,
         signedPayload,
         encryptedPayload,
-        encrypted: encryptedPayload !== undefined,
+        senderKeyMessage,
+        encrypted: encryptedPayload !== undefined || senderKeyMessage !== undefined,
       };
     }
     return {
@@ -445,6 +482,15 @@ export class SharedMemoryHandler {
     try {
       const encrypted = decodeEncryptedWorkspacePayload(payload);
       return encrypted.type === ENCRYPTED_WORKSPACE_ENVELOPE_TYPE ? encrypted : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private decodeSwmSenderKeyMessage(payload: Uint8Array): SwmSenderKeyMessageMsg | undefined {
+    try {
+      const message = decodeSwmSenderKeyMessageWire(payload);
+      return message.type === SWM_SENDER_KEY_MESSAGE_TYPE ? message : undefined;
     } catch {
       return undefined;
     }

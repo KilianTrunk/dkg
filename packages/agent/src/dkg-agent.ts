@@ -1,6 +1,7 @@
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
+  PROTOCOL_SWM_SENDER_KEY,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
@@ -24,8 +25,31 @@ import {
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
   decodeWorkspaceEncryptionKey,
+  encodeWorkspaceEncryptionKey,
   workspaceAgentEncryptionKeyId,
+  SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+  SWM_SENDER_KEY_PACKAGE_VERSION,
+  computeSwmSenderKeyMembershipHash,
+  computeSwmSenderKeyPackageAAD,
+  decodeWorkspacePublishRequest,
+  decodeSwmSenderKeyPackage,
+  decodeSwmSenderKeyPackageAck,
+  decryptSwmSenderKeyMessage,
+  decryptSwmSenderKeyPackage,
+  encodeSwmSenderKeyMessage,
+  encodeSwmSenderKeyPackage,
+  encodeSwmSenderKeyPackageAck,
+  encryptSwmSenderKeyMessage,
+  encryptSwmSenderKeyPackage,
+  generateEd25519Keypair,
+  generateSwmSenderChainKey,
+  generateSwmSenderEpochId,
+  ratchetSwmSenderChainKey,
+  uint64ForProto,
+  SWM_SENDER_KEY_SKIPPED_MESSAGE_CACHE_LIMIT,
   type DKGNodeConfig, type OperationContext, type GetView, type AssertionDescriptor, type AssertionEvent, type AssertionState,
+  type SwmSenderKeyMessageMsg,
+  type SwmSenderKeyPackageMsg,
   type WorkspaceRecipientEncryptionKey,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad } from '@origintrail-official/dkg-storage';
@@ -40,6 +64,8 @@ import {
   TripleStoreAsyncLiftPublisher,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
+  type WorkspaceAgentRecipient,
+  type WorkspaceSenderKeyEncryptInput,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
 import {
@@ -67,6 +93,32 @@ import { DKGAgentWallet, type AgentWallet } from './agent-wallet.js';
 type PreSignedAuthorAttestation = {
   address: string;
   signature: { r: Uint8Array; vs: Uint8Array };
+};
+
+type LocalSwmSenderKeySendState = {
+  contextGraphId: string;
+  subGraphName?: string;
+  senderAgentAddress: string;
+  epochId: string;
+  membershipHash: string;
+  chainKey: Uint8Array;
+  nextMessageIndex: number;
+  senderSigningSecretKey: Uint8Array;
+  senderSigningPublicKey: Uint8Array;
+  createdAtMs: number;
+};
+
+type LocalSwmSenderKeyReceiveState = {
+  contextGraphId: string;
+  subGraphName?: string;
+  senderAgentAddress: string;
+  epochId: string;
+  membershipHash: string;
+  chainKey: Uint8Array;
+  nextMessageIndex: number;
+  senderSigningPublicKey: Uint8Array;
+  createdAtMs: number;
+  skippedChainKeys: Map<number, Uint8Array>;
 };
 import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
@@ -807,6 +859,9 @@ export class DKGAgent {
   private readonly agentTokenIndex = new Map<string, string>();
   /** The default "owner" agent address (first operational wallet, auto-registered on boot) */
   private defaultAgentAddress: string | undefined;
+  private readonly swmSenderKeySendStates = new Map<string, LocalSwmSenderKeySendState>();
+  private readonly swmSenderKeyReceiveStates = new Map<string, LocalSwmSenderKeyReceiveState>();
+  private swmSenderKeyStateLoaded = false;
 
   private constructor(
     config: DKGAgentConfig,
@@ -833,6 +888,7 @@ export class DKGAgent {
     this.discovery = new DiscoveryClient(queryEngine);
     this.profileManager = new ProfileManager(publisher, store);
     this.publisher.setWorkspaceAgentRecipientResolver((input) => resolveWorkspaceAgentRecipients(this.store, input));
+    this.publisher.setWorkspaceSenderKeyEncryptor((input) => this.encryptWorkspacePayloadWithSenderKey(input));
   }
 
   static async create(config: DKGAgentConfig): Promise<DKGAgent> {
@@ -1057,6 +1113,7 @@ export class DKGAgent {
 
     this.router = new ProtocolRouter(this.node);
     this.gossip = new GossipSubManager(this.node, this.eventBus);
+    await this.loadSwmSenderKeyState();
     await this.rehydrateContextGraphSubscriptions();
 
     // Register protocol handlers
@@ -1083,6 +1140,9 @@ export class DKGAgent {
     }
     const queryRemoteHandler = new QueryHandler(this.queryEngine, queryAccessConfig);
     this.router.register(PROTOCOL_QUERY_REMOTE, queryRemoteHandler.handler);
+    this.router.register(PROTOCOL_SWM_SENDER_KEY, async (data, peerId) => {
+      return this.handleSwmSenderKeyPackage(data, peerId.toString());
+    });
 
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
@@ -3753,6 +3813,501 @@ export class DKGAgent {
     return keys;
   }
 
+  private async encryptWorkspacePayloadWithSenderKey(
+    input: WorkspaceSenderKeyEncryptInput,
+  ): Promise<Uint8Array> {
+    await this.loadSwmSenderKeyState();
+    const ctx = createOperationContext('share', input.operationId);
+    const sender = this.getLocalSigningAgentForAddress(input.senderAgentAddress);
+    if (!sender) {
+      throw new Error(`Cannot create SWM Sender Key epoch: no local custodial signing key for agent ${input.senderAgentAddress}`);
+    }
+
+    const resolution = await resolveWorkspaceAgentRecipients(this.store, { contextGraphId: input.contextGraphId });
+    if (!resolution.requiresEncryption) {
+      return input.plaintext;
+    }
+    if (resolution.recipients.length === 0) {
+      throw new Error(`Context graph "${input.contextGraphId}" requires Sender Key SWM but has no DKG agent recipients`);
+    }
+
+    const senderAddress = ethers.getAddress(sender.agentAddress);
+    const recipientSet = new Set(resolution.recipients.map((recipient) => recipient.agentAddress.toLowerCase()));
+    if (!recipientSet.has(senderAddress.toLowerCase())) {
+      throw new Error(`Sender agent ${senderAddress} is not a DKG agent recipient for context graph "${input.contextGraphId}"`);
+    }
+
+    this.logSwmSenderKeyDebugPlainPayload(ctx, 'plain-before-encrypt', input.plaintext, {
+      senderAgentAddress: senderAddress,
+      contextGraphId: input.contextGraphId,
+      subGraphName: input.subGraphName,
+    });
+
+    const membershipHash = computeSwmSenderKeyMembershipHash({
+      contextGraphId: input.contextGraphId,
+      subGraphName: input.subGraphName,
+      members: resolution.recipients.map((recipient) => ({
+        agentAddress: recipient.agentAddress,
+        recipientKeyId: recipient.recipientKeyId,
+      })),
+    });
+    const stateKey = swmSenderStateKey(input.contextGraphId, input.subGraphName, senderAddress);
+    let state = this.swmSenderKeySendStates.get(stateKey);
+    if (!state || state.membershipHash !== membershipHash) {
+      state = await this.createAndDistributeSwmSenderKeyEpoch({
+        contextGraphId: input.contextGraphId,
+        subGraphName: input.subGraphName,
+        sender,
+        recipients: resolution.recipients,
+        membershipHash,
+        ctx,
+      });
+      this.swmSenderKeySendStates.set(stateKey, state);
+      await this.saveSwmSenderKeyState();
+    }
+
+    const encrypted = await encryptSwmSenderKeyMessage({
+      chainKey: state.chainKey,
+      plaintext: input.plaintext,
+      senderSigningSecretKey: state.senderSigningSecretKey,
+      contextGraphId: state.contextGraphId,
+      subGraphName: state.subGraphName,
+      senderAgentAddress: state.senderAgentAddress,
+      epochId: state.epochId,
+      membershipHash: state.membershipHash,
+      messageIndex: state.nextMessageIndex,
+    });
+    state.chainKey = encrypted.nextChainKey;
+    state.nextMessageIndex += 1;
+    await this.saveSwmSenderKeyState();
+    this.logSwmSenderKeyDebugEncryptedPayload(ctx, encrypted.message);
+
+    this.log.info(
+      ctx,
+      `SWM sender-key broadcast send: senderAgent=${senderAddress} contextGraph=${state.contextGraphId}` +
+      `${state.subGraphName ? `/${state.subGraphName}` : ''} epoch=${state.epochId} ` +
+      `messageIndex=${uint64ForProto(encrypted.message.messageIndex)} membershipHash=${state.membershipHash} ` +
+      `ciphertextBytes=${encrypted.message.ciphertext.length}`,
+    );
+    return encodeSwmSenderKeyMessage(encrypted.message);
+  }
+
+  private async createAndDistributeSwmSenderKeyEpoch(input: {
+    contextGraphId: string;
+    subGraphName?: string;
+    sender: AgentKeyRecord & { privateKey: string };
+    recipients: readonly WorkspaceAgentRecipient[];
+    membershipHash: string;
+    ctx: OperationContext;
+  }): Promise<LocalSwmSenderKeySendState> {
+    const senderAgentAddress = ethers.getAddress(input.sender.agentAddress);
+    const createdAtMs = Date.now();
+    const epochId = generateSwmSenderEpochId();
+    const chainKey = generateSwmSenderChainKey();
+    const senderSigningKeypair = await generateEd25519Keypair();
+    const state: LocalSwmSenderKeySendState = {
+      contextGraphId: input.contextGraphId,
+      subGraphName: input.subGraphName,
+      senderAgentAddress,
+      epochId,
+      membershipHash: input.membershipHash,
+      chainKey,
+      nextMessageIndex: 0,
+      senderSigningSecretKey: senderSigningKeypair.secretKey,
+      senderSigningPublicKey: senderSigningKeypair.publicKey,
+      createdAtMs,
+    };
+
+    for (const recipient of input.recipients) {
+      const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
+      const pkg = await this.createSignedSwmSenderKeyPackage({
+        state,
+        recipient,
+        senderPrivateKey: input.sender.privateKey,
+      });
+
+      const isLocalRecipient = this.hasLocalAgent(recipientAgentAddress);
+      if (isLocalRecipient) {
+        await this.acceptSwmSenderKeyPackage(pkg, this.node.peerId.toString(), input.ctx);
+        continue;
+      }
+
+      if (!recipient.peerId) {
+        throw new Error(
+          `Cannot distribute SWM Sender Key epoch ${epochId}: DKG agent ${recipientAgentAddress} has no advertised peerId`,
+        );
+      }
+
+      this.log.info(
+        input.ctx,
+        `SWM sender-key setup send: senderAgent=${senderAgentAddress} recipientAgent=${recipientAgentAddress} ` +
+        `peerId=${recipient.peerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
+        `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
+      );
+      const ackBytes = await this.router.send(
+        recipient.peerId,
+        PROTOCOL_SWM_SENDER_KEY,
+        encodeSwmSenderKeyPackage(pkg),
+      );
+      const ack = decodeSwmSenderKeyPackageAck(ackBytes);
+      if (
+        ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
+        ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
+        !ack.accepted
+      ) {
+        throw new Error(
+          `SWM Sender Key setup rejected by agent ${recipientAgentAddress}: ${ack.reason ?? 'unknown reason'}`,
+        );
+      }
+    }
+
+    return state;
+  }
+
+  private async createSignedSwmSenderKeyPackage(input: {
+    state: LocalSwmSenderKeySendState;
+    recipient: WorkspaceAgentRecipient;
+    senderPrivateKey: string;
+  }): Promise<SwmSenderKeyPackageMsg> {
+    if (!input.recipient.publicKeyBytes) {
+      throw new Error(`Missing public encryption key bytes for DKG agent ${input.recipient.agentAddress}`);
+    }
+    const pkg = await encryptSwmSenderKeyPackage({
+      contextGraphId: input.state.contextGraphId,
+      subGraphName: input.state.subGraphName,
+      senderAgentAddress: input.state.senderAgentAddress,
+      epochId: input.state.epochId,
+      membershipHash: input.state.membershipHash,
+      recipientAgentAddress: ethers.getAddress(input.recipient.agentAddress),
+      recipientKeyId: input.recipient.recipientKeyId,
+      createdAtMs: input.state.createdAtMs,
+      initialMessageIndex: 0,
+      chainKey: input.state.chainKey,
+      senderSigningPublicKey: input.state.senderSigningPublicKey,
+      recipientPublicKey: input.recipient.publicKeyBytes,
+    });
+    const signature = await new ethers.Wallet(input.senderPrivateKey)
+      .signMessage(computeSwmSenderKeyPackageAAD(pkg));
+    return { ...pkg, signature: ethers.getBytes(signature) };
+  }
+
+  private async handleSwmSenderKeyPackage(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
+    const ctx = createOperationContext('share');
+    let pkg: SwmSenderKeyPackageMsg | undefined;
+    try {
+      pkg = decodeSwmSenderKeyPackage(data);
+      await this.acceptSwmSenderKeyPackage(pkg, fromPeerId, ctx);
+      return encodeSwmSenderKeyPackageAck({
+        version: SWM_SENDER_KEY_PACKAGE_VERSION,
+        type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+        accepted: true,
+        contextGraphId: pkg.contextGraphId,
+        subGraphName: pkg.subGraphName,
+        senderAgentAddress: pkg.senderAgentAddress,
+        epochId: pkg.epochId,
+        membershipHash: pkg.membershipHash,
+        recipientAgentAddress: pkg.recipientAgentAddress,
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      if (pkg) {
+        this.log.warn(
+          ctx,
+          `SWM sender-key setup receive rejected: senderAgent=${pkg.senderAgentAddress} recipientAgent=${pkg.recipientAgentAddress} ` +
+          `fromPeer=${fromPeerId} contextGraph=${pkg.contextGraphId}${pkg.subGraphName ? `/${pkg.subGraphName}` : ''} ` +
+          `epoch=${pkg.epochId} membershipHash=${pkg.membershipHash} reason=${reason}`,
+        );
+      }
+      return encodeSwmSenderKeyPackageAck({
+        version: SWM_SENDER_KEY_PACKAGE_VERSION,
+        type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+        accepted: false,
+        reason,
+        contextGraphId: pkg?.contextGraphId,
+        subGraphName: pkg?.subGraphName,
+        senderAgentAddress: pkg?.senderAgentAddress,
+        epochId: pkg?.epochId,
+        membershipHash: pkg?.membershipHash,
+        recipientAgentAddress: pkg?.recipientAgentAddress,
+      });
+    }
+  }
+
+  private async acceptSwmSenderKeyPackage(
+    pkg: SwmSenderKeyPackageMsg,
+    fromPeerId: string,
+    ctx: OperationContext,
+  ): Promise<void> {
+    const senderAgentAddress = ethers.getAddress(pkg.senderAgentAddress);
+    const recipientAgentAddress = ethers.getAddress(pkg.recipientAgentAddress);
+    const recovered = ethers.verifyMessage(
+      computeSwmSenderKeyPackageAAD(pkg),
+      ethers.hexlify(pkg.signature),
+    );
+    if (recovered.toLowerCase() !== senderAgentAddress.toLowerCase()) {
+      throw new Error(`Sender Key setup signature recovered ${recovered}, expected ${senderAgentAddress}`);
+    }
+
+    const agentGateAddresses = await this.getContextGraphAgentGateAddresses(pkg.contextGraphId);
+    if (!agentGateAddresses) {
+      throw new Error(`Context graph "${pkg.contextGraphId}" is not DKG-agent gated`);
+    }
+    const agentGateSet = new Set(agentGateAddresses.map((agent) => agent.toLowerCase()));
+    if (!agentGateSet.has(senderAgentAddress.toLowerCase())) {
+      throw new Error(`Sender agent ${senderAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`);
+    }
+    if (!agentGateSet.has(recipientAgentAddress.toLowerCase())) {
+      throw new Error(`Recipient agent ${recipientAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`);
+    }
+    if (!this.hasLocalAgent(recipientAgentAddress)) {
+      throw new Error(`Recipient agent ${recipientAgentAddress} is not local to this node`);
+    }
+
+    const localKey = this.getLocalWorkspaceRecipientPrivateKeys().find((key) => (
+      key.recipientId.toLowerCase() === `did:dkg:agent:${recipientAgentAddress}`.toLowerCase() &&
+      key.recipientKeyId === pkg.recipientKeyId
+    ));
+    if (!localKey) {
+      throw new Error(`No local X25519 private key for DKG agent ${recipientAgentAddress} key ${pkg.recipientKeyId}`);
+    }
+
+    const secret = await decryptSwmSenderKeyPackage({ package: pkg, recipientKey: localKey });
+    const state: LocalSwmSenderKeyReceiveState = {
+      contextGraphId: secret.contextGraphId,
+      subGraphName: secret.subGraphName,
+      senderAgentAddress: ethers.getAddress(secret.senderAgentAddress),
+      epochId: secret.epochId,
+      membershipHash: secret.membershipHash,
+      chainKey: secret.chainKey,
+      nextMessageIndex: uint64ForProto(secret.initialMessageIndex),
+      senderSigningPublicKey: secret.senderSigningPublicKey,
+      createdAtMs: uint64ForProto(secret.createdAtMs),
+      skippedChainKeys: new Map(),
+    };
+    this.swmSenderKeyReceiveStates.set(
+      swmReceiverStateKey(state.contextGraphId, state.subGraphName, state.senderAgentAddress, state.epochId),
+      state,
+    );
+    await this.saveSwmSenderKeyState();
+
+    this.log.info(
+      ctx,
+      `SWM sender-key setup receive accepted: senderAgent=${senderAgentAddress} recipientAgent=${recipientAgentAddress} ` +
+      `fromPeer=${fromPeerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
+      `epoch=${state.epochId} membershipHash=${state.membershipHash}`,
+    );
+  }
+
+  private async decryptWorkspacePayloadWithSenderKey(
+    message: SwmSenderKeyMessageMsg,
+    contextGraphId: string,
+    ctx: OperationContext,
+  ): Promise<Uint8Array> {
+    await this.loadSwmSenderKeyState();
+    if (message.contextGraphId !== contextGraphId) {
+      throw new Error(`Sender Key message contextGraphId "${message.contextGraphId}" does not match envelope "${contextGraphId}"`);
+    }
+    const senderAgentAddress = ethers.getAddress(message.senderAgentAddress);
+    const state = this.swmSenderKeyReceiveStates.get(
+      swmReceiverStateKey(contextGraphId, message.subGraphName, senderAgentAddress, message.epochId),
+    );
+    if (!state) {
+      this.log.warn(
+        ctx,
+        `SWM sender-key broadcast receive denied: reason=no-state senderAgent=${senderAgentAddress} ` +
+        `contextGraph=${contextGraphId}${message.subGraphName ? `/${message.subGraphName}` : ''} ` +
+        `epoch=${message.epochId} messageIndex=${uint64ForProto(message.messageIndex)} membershipHash=${message.membershipHash}`,
+      );
+      throw new Error(`No local Sender Key state for ${senderAgentAddress} epoch ${message.epochId}`);
+    }
+    if (state.membershipHash !== message.membershipHash) {
+      throw new Error(`Sender Key membership hash mismatch for ${senderAgentAddress} epoch ${message.epochId}`);
+    }
+
+    const messageIndex = uint64ForProto(message.messageIndex);
+    let chainKey = state.skippedChainKeys.get(messageIndex);
+    let usedSkippedKey = false;
+    if (chainKey) {
+      usedSkippedKey = true;
+      state.skippedChainKeys.delete(messageIndex);
+    } else {
+      if (messageIndex < state.nextMessageIndex) {
+        throw new Error(`Sender Key replay rejected for index ${messageIndex}`);
+      }
+      const gap = messageIndex - state.nextMessageIndex;
+      if (gap > SWM_SENDER_KEY_SKIPPED_MESSAGE_CACHE_LIMIT) {
+        throw new Error(`Sender Key message gap ${gap} exceeds skipped-message cache limit`);
+      }
+      chainKey = state.chainKey;
+      for (let index = state.nextMessageIndex; index < messageIndex; index++) {
+        state.skippedChainKeys.set(index, chainKey);
+        chainKey = ratchetSwmSenderChainKey(chainKey);
+      }
+    }
+
+    const decrypted = await decryptSwmSenderKeyMessage({
+      chainKey,
+      message,
+      senderSigningPublicKey: state.senderSigningPublicKey,
+    });
+
+    if (!usedSkippedKey) {
+      state.chainKey = decrypted.nextChainKey;
+      state.nextMessageIndex = messageIndex + 1;
+    }
+    while (state.skippedChainKeys.size > SWM_SENDER_KEY_SKIPPED_MESSAGE_CACHE_LIMIT) {
+      const oldest = [...state.skippedChainKeys.keys()].sort((a, b) => a - b)[0];
+      state.skippedChainKeys.delete(oldest);
+    }
+    await this.saveSwmSenderKeyState();
+
+    this.log.info(
+      ctx,
+      `SWM sender-key broadcast receive success: senderAgent=${senderAgentAddress} ` +
+      `contextGraph=${contextGraphId}${message.subGraphName ? `/${message.subGraphName}` : ''} ` +
+      `epoch=${message.epochId} messageIndex=${messageIndex} membershipHash=${message.membershipHash}`,
+    );
+    this.logSwmSenderKeyDebugPlainPayload(ctx, 'plain-after-decrypt', decrypted.plaintext, {
+      senderAgentAddress,
+      contextGraphId,
+      subGraphName: message.subGraphName,
+      epochId: message.epochId,
+      membershipHash: message.membershipHash,
+      messageIndex,
+    });
+    return decrypted.plaintext;
+  }
+
+  private isSwmSenderKeyPayloadDebugLoggingEnabled(): boolean {
+    const raw = process.env.DKG_SWM_SENDER_KEY_DEBUG_PAYLOADS;
+    return raw === '1' || raw?.toLowerCase() === 'true';
+  }
+
+  private logSwmSenderKeyDebugPlainPayload(
+    ctx: OperationContext,
+    phase: 'plain-before-encrypt' | 'plain-after-decrypt',
+    payload: Uint8Array,
+    extra: Record<string, unknown>,
+  ): void {
+    if (!this.isSwmSenderKeyPayloadDebugLoggingEnabled()) return;
+    try {
+      const request = decodeWorkspacePublishRequest(payload);
+      const nquads = new TextDecoder().decode(request.nquads);
+      this.log.warn(ctx, `SWM sender-key DEBUG ${phase}: ${JSON.stringify({
+        warning: 'private SWM plaintext debug logging is enabled',
+        ...extra,
+        workspaceOperationId: request.workspaceOperationId,
+        operationId: request.operationId,
+        requestContextGraphId: request.contextGraphId,
+        requestSubGraphName: request.subGraphName,
+        nquads,
+      })}`);
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `SWM sender-key DEBUG ${phase}: failed to decode plaintext WorkspacePublishRequest: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  private logSwmSenderKeyDebugEncryptedPayload(
+    ctx: OperationContext,
+    message: SwmSenderKeyMessageMsg,
+  ): void {
+    if (!this.isSwmSenderKeyPayloadDebugLoggingEnabled()) return;
+    this.log.warn(ctx, `SWM sender-key DEBUG encrypted-before-broadcast: ${JSON.stringify({
+      warning: 'private SWM encrypted payload debug logging is enabled',
+      senderAgentAddress: message.senderAgentAddress,
+      contextGraphId: message.contextGraphId,
+      subGraphName: message.subGraphName,
+      epochId: message.epochId,
+      membershipHash: message.membershipHash,
+      messageIndex: uint64ForProto(message.messageIndex),
+      cipherAlgorithm: message.cipherAlgorithm,
+      nonceBytes: message.nonce.length,
+      ciphertextBytes: message.ciphertext.length,
+      ciphertextBase64: Buffer.from(message.ciphertext).toString('base64'),
+    })}`);
+  }
+
+  private hasLocalAgent(agentAddress: string): boolean {
+    const checksum = ethers.getAddress(agentAddress);
+    for (const record of this.localAgents.values()) {
+      if (record.agentAddress.toLowerCase() === checksum.toLowerCase()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private getLocalSigningAgentForAddress(agentAddress: string): (AgentKeyRecord & { privateKey: string }) | null {
+    const checksum = ethers.getAddress(agentAddress);
+    for (const record of this.localAgents.values()) {
+      if (record.agentAddress.toLowerCase() === checksum.toLowerCase() && record.privateKey) {
+        return { ...record, privateKey: record.privateKey };
+      }
+    }
+    return null;
+  }
+
+  private swmSenderKeyStatePath(): string | null {
+    if (!this.config.dataDir) return null;
+    return `${this.config.dataDir}/swm-sender-keys.json`;
+  }
+
+  private async loadSwmSenderKeyState(): Promise<void> {
+    if (this.swmSenderKeyStateLoaded) return;
+    this.swmSenderKeyStateLoaded = true;
+    const path = this.swmSenderKeyStatePath();
+    if (!path) return;
+    try {
+      const { readFile } = await import('node:fs/promises');
+      const raw = await readFile(path, 'utf-8');
+      const parsed = JSON.parse(raw) as {
+        send?: Array<Record<string, unknown>>;
+        receive?: Array<Record<string, unknown>>;
+      };
+      for (const entry of parsed.send ?? []) {
+        const state = deserializeSwmSenderSendState(entry);
+        this.swmSenderKeySendStates.set(
+          swmSenderStateKey(state.contextGraphId, state.subGraphName, state.senderAgentAddress),
+          state,
+        );
+      }
+      for (const entry of parsed.receive ?? []) {
+        const state = deserializeSwmSenderReceiveState(entry);
+        this.swmSenderKeyReceiveStates.set(
+          swmReceiverStateKey(state.contextGraphId, state.subGraphName, state.senderAgentAddress, state.epochId),
+          state,
+        );
+      }
+    } catch {
+      // No durable state yet, or a corrupt file that should not unblock startup.
+      this.swmSenderKeySendStates.clear();
+      this.swmSenderKeyReceiveStates.clear();
+    }
+  }
+
+  private async saveSwmSenderKeyState(): Promise<void> {
+    const path = this.swmSenderKeyStatePath();
+    if (!path) return;
+    const { mkdir, writeFile, chmod } = await import('node:fs/promises');
+    const { dirname } = await import('node:path');
+    await mkdir(dirname(path), { recursive: true });
+    const payload = {
+      version: 1,
+      send: [...this.swmSenderKeySendStates.values()].map(serializeSwmSenderSendState),
+      receive: [...this.swmSenderKeyReceiveStates.values()].map(serializeSwmSenderReceiveState),
+    };
+    await writeFile(path, JSON.stringify(payload, null, 2), { mode: 0o600 });
+    try {
+      await chmod(path, 0o600);
+    } catch {
+      // Best-effort on platforms/filesystems that do not support chmod.
+    }
+  }
+
   private async resolveWorkspaceGossipSigningAgent(
     contextGraphId: string,
   ): Promise<(AgentKeyRecord & { privateKey: string }) | null> {
@@ -5736,6 +6291,8 @@ export class DKGAgent {
         writeLocks: this.writeLocks,
         localAgentAddresses: () => [...this.localAgents.keys()],
         workspaceRecipientPrivateKeys: () => this.getLocalWorkspaceRecipientPrivateKeys(),
+        workspaceSenderKeyDecryptor: (message, contextGraphId, ctx) =>
+          this.decryptWorkspacePayloadWithSenderKey(message, contextGraphId, ctx),
       });
     }
     return this.sharedMemoryHandler;
@@ -10230,4 +10787,107 @@ export class DKGAgent {
     };
   }
 
+}
+
+function swmSenderStateKey(contextGraphId: string, subGraphName: string | undefined, senderAgentAddress: string): string {
+  return `${contextGraphId}\0${subGraphName ?? ''}\0${senderAgentAddress.toLowerCase()}`;
+}
+
+function swmReceiverStateKey(
+  contextGraphId: string,
+  subGraphName: string | undefined,
+  senderAgentAddress: string,
+  epochId: string,
+): string {
+  return `${swmSenderStateKey(contextGraphId, subGraphName, senderAgentAddress)}\0${epochId}`;
+}
+
+function serializeSwmSenderSendState(state: LocalSwmSenderKeySendState): Record<string, unknown> {
+  return {
+    contextGraphId: state.contextGraphId,
+    subGraphName: state.subGraphName,
+    senderAgentAddress: state.senderAgentAddress,
+    epochId: state.epochId,
+    membershipHash: state.membershipHash,
+    chainKey: encodeWorkspaceEncryptionKey(state.chainKey),
+    nextMessageIndex: state.nextMessageIndex,
+    senderSigningSecretKey: encodeWorkspaceEncryptionKey(state.senderSigningSecretKey),
+    senderSigningPublicKey: encodeWorkspaceEncryptionKey(state.senderSigningPublicKey),
+    createdAtMs: state.createdAtMs,
+  };
+}
+
+function serializeSwmSenderReceiveState(state: LocalSwmSenderKeyReceiveState): Record<string, unknown> {
+  return {
+    contextGraphId: state.contextGraphId,
+    subGraphName: state.subGraphName,
+    senderAgentAddress: state.senderAgentAddress,
+    epochId: state.epochId,
+    membershipHash: state.membershipHash,
+    chainKey: encodeWorkspaceEncryptionKey(state.chainKey),
+    nextMessageIndex: state.nextMessageIndex,
+    senderSigningPublicKey: encodeWorkspaceEncryptionKey(state.senderSigningPublicKey),
+    createdAtMs: state.createdAtMs,
+    skippedChainKeys: [...state.skippedChainKeys.entries()].map(([index, chainKey]) => ({
+      index,
+      chainKey: encodeWorkspaceEncryptionKey(chainKey),
+    })),
+  };
+}
+
+function deserializeSwmSenderSendState(entry: Record<string, unknown>): LocalSwmSenderKeySendState {
+  return {
+    contextGraphId: requiredString(entry.contextGraphId, 'contextGraphId'),
+    subGraphName: optionalString(entry.subGraphName),
+    senderAgentAddress: ethers.getAddress(requiredString(entry.senderAgentAddress, 'senderAgentAddress')),
+    epochId: requiredString(entry.epochId, 'epochId'),
+    membershipHash: requiredString(entry.membershipHash, 'membershipHash'),
+    chainKey: decodeWorkspaceEncryptionKey(requiredString(entry.chainKey, 'chainKey')),
+    nextMessageIndex: requiredNumber(entry.nextMessageIndex, 'nextMessageIndex'),
+    senderSigningSecretKey: decodeWorkspaceEncryptionKey(requiredString(entry.senderSigningSecretKey, 'senderSigningSecretKey')),
+    senderSigningPublicKey: decodeWorkspaceEncryptionKey(requiredString(entry.senderSigningPublicKey, 'senderSigningPublicKey')),
+    createdAtMs: requiredNumber(entry.createdAtMs, 'createdAtMs'),
+  };
+}
+
+function deserializeSwmSenderReceiveState(entry: Record<string, unknown>): LocalSwmSenderKeyReceiveState {
+  const skippedChainKeys = new Map<number, Uint8Array>();
+  const skipped = Array.isArray(entry.skippedChainKeys) ? entry.skippedChainKeys : [];
+  for (const raw of skipped) {
+    const item = raw as Record<string, unknown>;
+    skippedChainKeys.set(
+      requiredNumber(item.index, 'skippedChainKeys.index'),
+      decodeWorkspaceEncryptionKey(requiredString(item.chainKey, 'skippedChainKeys.chainKey')),
+    );
+  }
+  return {
+    contextGraphId: requiredString(entry.contextGraphId, 'contextGraphId'),
+    subGraphName: optionalString(entry.subGraphName),
+    senderAgentAddress: ethers.getAddress(requiredString(entry.senderAgentAddress, 'senderAgentAddress')),
+    epochId: requiredString(entry.epochId, 'epochId'),
+    membershipHash: requiredString(entry.membershipHash, 'membershipHash'),
+    chainKey: decodeWorkspaceEncryptionKey(requiredString(entry.chainKey, 'chainKey')),
+    nextMessageIndex: requiredNumber(entry.nextMessageIndex, 'nextMessageIndex'),
+    senderSigningPublicKey: decodeWorkspaceEncryptionKey(requiredString(entry.senderSigningPublicKey, 'senderSigningPublicKey')),
+    createdAtMs: requiredNumber(entry.createdAtMs, 'createdAtMs'),
+    skippedChainKeys,
+  };
+}
+
+function requiredString(value: unknown, name: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`Invalid Sender Key state: ${name} is required`);
+  }
+  return value;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function requiredNumber(value: unknown, name: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error(`Invalid Sender Key state: ${name} must be a non-negative safe integer`);
+  }
+  return value as number;
 }

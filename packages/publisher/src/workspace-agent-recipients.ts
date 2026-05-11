@@ -18,10 +18,16 @@ const DKG = 'https://dkg.network/ontology#';
 const DKG_PUBLIC_ENCRYPTION_KEY = `${DKG}publicEncryptionKey`;
 const DKG_ENCRYPTION_KEY_ALGORITHM = `${DKG}encryptionKeyAlgorithm`;
 const DKG_ENCRYPTION_KEY_PROOF = `${DKG}encryptionKeyProof`;
+const DKG_PEER_ID = `${DKG}peerId`;
+
+export interface WorkspaceAgentRecipient extends WorkspaceRecipientEncryptionKey {
+  agentAddress: string;
+  peerId?: string;
+}
 
 export interface WorkspaceAgentRecipientResolution {
   requiresEncryption: boolean;
-  recipients: WorkspaceRecipientEncryptionKey[];
+  recipients: WorkspaceAgentRecipient[];
 }
 
 export interface WorkspaceAgentRecipientResolverInput {
@@ -49,7 +55,7 @@ export async function resolveWorkspaceAgentRecipients(
     );
   }
 
-  const recipients: WorkspaceRecipientEncryptionKey[] = [];
+  const recipients: WorkspaceAgentRecipient[] = [];
   for (const agentAddress of access.agentAddresses) {
     recipients.push(await resolveAgentRecipientKey(store, agentAddress));
   }
@@ -118,18 +124,19 @@ async function getWorkspaceAccessMetadata(
 async function resolveAgentRecipientKey(
   store: TripleStore,
   agentAddress: string,
-): Promise<WorkspaceRecipientEncryptionKey> {
+): Promise<WorkspaceAgentRecipient> {
   const checksum = ethers.getAddress(agentAddress);
   const agentUri = `did:dkg:agent:${checksum}`;
   const lowerAgentUri = `did:dkg:agent:${checksum.toLowerCase()}`;
   const agentUriValues = agentUri === lowerAgentUri ? `<${agentUri}>` : `<${agentUri}> <${lowerAgentUri}>`;
   const result = await store.query(
-    `SELECT ?key ?algorithm ?proof WHERE {
+    `SELECT ?key ?algorithm ?proof ?peerId WHERE {
       VALUES ?agentSubject { ${agentUriValues} }
       GRAPH ?g {
         ?agentSubject <${DKG_PUBLIC_ENCRYPTION_KEY}> ?key .
         OPTIONAL { ?agentSubject <${DKG_ENCRYPTION_KEY_ALGORITHM}> ?algorithm }
         OPTIONAL { ?agentSubject <${DKG_ENCRYPTION_KEY_PROOF}> ?proof }
+        OPTIONAL { ?agentSubject <${DKG_PEER_ID}> ?peerId }
       }
     }`,
   );
@@ -138,7 +145,7 @@ async function resolveAgentRecipientKey(
     throw new Error(`Missing public encryption key for DKG agent ${checksum}`);
   }
 
-  const validKeys = new Map<string, WorkspaceRecipientEncryptionKey>();
+  const validKeys = new Map<string, WorkspaceAgentRecipient>();
   let sawWrongAlgorithm = false;
   let sawUntrustedOnly = false;
   let sawInvalidProof = false;
@@ -147,6 +154,7 @@ async function resolveAgentRecipientKey(
     const publicKey = stringBinding(row['key']);
     const algorithm = stringBinding(row['algorithm']);
     const proof = stringBinding(row['proof']);
+    const peerId = stringBinding(row['peerId']);
     if (!publicKey || !algorithm || !proof) {
       sawUntrustedOnly = true;
       continue;
@@ -182,6 +190,8 @@ async function resolveAgentRecipientKey(
       recipientKeyId,
       encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
       publicKeyBytes,
+      agentAddress: checksum,
+      peerId: peerId ? stripRdfLiteral(peerId) : undefined,
     });
   }
 

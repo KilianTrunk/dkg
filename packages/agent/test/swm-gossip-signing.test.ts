@@ -2,21 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { ethers } from 'ethers';
 import {
   computeGossipSigningPayload,
-  decodeEncryptedWorkspacePayload,
   decodeGossipEnvelope,
+  decodeSwmSenderKeyMessage,
   decodeWorkspacePublishRequest,
   DKG_ONTOLOGY,
-  decryptWorkspacePayload,
-  WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
-  WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
-  decodeWorkspaceEncryptionKey,
-  workspaceAgentEncryptionKeyId,
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
   GOSSIP_ENVELOPE_VERSION,
   contextGraphDataUri,
   contextGraphMetaUri,
-  paranetWorkspaceTopic,
-  type WorkspaceRecipientEncryptionKey,
+  contextGraphWorkspaceTopic,
+  SWM_SENDER_KEY_MESSAGE_TYPE,
+  type OperationContext,
+  type SwmSenderKeyMessageMsg,
 } from '@origintrail-official/dkg-core';
 import { MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, agentFromPrivateKey, type AgentKeyRecord } from '../src/index.js';
@@ -25,6 +22,11 @@ interface DKGAgentInternals {
   localAgents: Map<string, AgentKeyRecord>;
   defaultAgentAddress?: string;
   encodeWorkspaceGossipMessage(contextGraphId: string, message: Uint8Array): Promise<Uint8Array>;
+  decryptWorkspacePayloadWithSenderKey(
+    message: SwmSenderKeyMessageMsg,
+    contextGraphId: string,
+    ctx: OperationContext,
+  ): Promise<Uint8Array>;
 }
 
 class CapturingGossip {
@@ -68,25 +70,6 @@ function expectSignedEnvelope(
     ethers.hexlify(envelope.signature),
   );
   expect(recovered).toBe(expectedAgentAddress);
-}
-
-function recipientPrivateKeyFromRecord(record: AgentKeyRecord): WorkspaceRecipientEncryptionKey {
-  if (
-    record.encryptionKeyAlgorithm !== WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519 ||
-    !record.publicEncryptionKey ||
-    !record.privateEncryptionKey
-  ) {
-    throw new Error('test agent is missing workspace encryption key material');
-  }
-  const publicKeyBytes = decodeWorkspaceEncryptionKey(record.publicEncryptionKey);
-  return {
-    purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
-    recipientId: `did:dkg:agent:${record.agentAddress}`,
-    recipientKeyId: workspaceAgentEncryptionKeyId(record.agentAddress, publicKeyBytes),
-    encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
-    publicKeyBytes,
-    privateKeyBytes: decodeWorkspaceEncryptionKey(record.privateEncryptionKey),
-  };
 }
 
 describe('DKGAgent SWM gossip signing', () => {
@@ -157,7 +140,7 @@ describe('DKGAgent SWM gossip signing', () => {
       .rejects.toThrow(/no local allowed signing agent key/);
   });
 
-  it('encrypts agent-gated SWM wire payloads and only an allowed DKG agent recipient can decrypt them', async () => {
+  it('encrypts agent-gated SWM wire payloads as a Sender Key broadcast', async () => {
     const agent = await DKGAgent.create({
       name: 'SwmEncryptedWire',
       chainAdapter: new MockChainAdapter(),
@@ -171,7 +154,6 @@ describe('DKGAgent SWM gossip signing', () => {
     });
 
     const allowedRecord = await agent.registerAgent('allowed-encryption-recipient');
-    const deniedRecord = agentFromPrivateKey(ethers.Wallet.createRandom().privateKey, 'denied');
     internals.defaultAgentAddress = allowedRecord.agentAddress;
     const contextGraphId = 'gated-swm-encrypted-wire';
     await insertAgentGate(agent, contextGraphId, DKG_ONTOLOGY.DKG_ALLOWED_AGENT, allowedRecord.agentAddress);
@@ -184,7 +166,7 @@ describe('DKGAgent SWM gossip signing', () => {
     }]);
 
     expect(gossip.messages).toHaveLength(1);
-    expect(gossip.messages[0]?.topic).toBe(paranetWorkspaceTopic(contextGraphId));
+    expect(gossip.messages[0]?.topic).toBe(contextGraphWorkspaceTopic(contextGraphId));
     const envelope = decodeGossipEnvelope(gossip.messages[0]!.data);
     expect(envelope.agentAddress).toBe(allowedRecord.agentAddress);
     let decodedAsPlainWorkspace = false;
@@ -197,15 +179,21 @@ describe('DKGAgent SWM gossip signing', () => {
     }
     expect(decodedAsPlainWorkspace).toBe(false);
 
-    const encrypted = decodeEncryptedWorkspacePayload(envelope.payload);
+    const senderKeyMessage = decodeSwmSenderKeyMessage(envelope.payload);
+    expect(senderKeyMessage.type).toBe(SWM_SENDER_KEY_MESSAGE_TYPE);
+    expect(senderKeyMessage.contextGraphId).toBe(contextGraphId);
+    expect(senderKeyMessage.senderAgentAddress).toBe(allowedRecord.agentAddress);
+    expect(senderKeyMessage.ciphertext.length).toBeGreaterThan(0);
+    expect(senderKeyMessage).not.toHaveProperty('recipients');
     const wireText = Buffer.from(envelope.payload).toString('utf8');
     expect(wireText).not.toContain('wire secret');
-    await expect(
-      decryptWorkspacePayload(encrypted, [recipientPrivateKeyFromRecord(deniedRecord)]),
-    ).rejects.toThrow('No matching recipient encryption key could decrypt workspace payload');
 
-    const decrypted = await decryptWorkspacePayload(encrypted, [recipientPrivateKeyFromRecord(allowedRecord)]);
-    const request = decodeWorkspacePublishRequest(decrypted.plaintext);
+    const decrypted = await internals.decryptWorkspacePayloadWithSenderKey(
+      senderKeyMessage,
+      contextGraphId,
+      { operationId: 'test', operationName: 'share' },
+    );
+    const request = decodeWorkspacePublishRequest(decrypted);
     expect(new TextDecoder().decode(request.nquads)).toContain('wire secret');
   });
 

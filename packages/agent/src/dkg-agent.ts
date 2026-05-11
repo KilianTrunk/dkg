@@ -749,6 +749,39 @@ export class DKGAgent {
    */
   private readonly joinRequestOriginPeers = new Map<string, string>();
   /**
+   * Symmetric companion to `joinRequestOriginPeers`, populated on the
+   * REQUESTER side. When `forwardJoinRequest` broadcasts to all peers,
+   * any peer that responds `{ok: true}` is self-claiming curator status
+   * for this `(contextGraphId, agentAddress)` pair. We remember those
+   * peers so a subsequent `join-approved` / `join-rejected` notification
+   * can be authenticated against them — without requiring the requester
+   * to have synced the CG's `_meta` graph (which is impossible by
+   * definition: a curated CG denies meta sync until approval, and the
+   * rejection notification is the one case where the request will
+   * never be approved).
+   *
+   * Keyed identically (`${contextGraphId}::${agentAddress_lower}`).
+   * Stored as a Set because the broadcast may legitimately reach
+   * multiple curator nodes for the same CG (multi-curator deployments
+   * are not yet a feature, but the data shape doesn't preclude them).
+   *
+   * Why this is the right authority surface: a peer that previously
+   * accepted `{ok: true}` to a join request has already been trusted
+   * with the request's authenticity; trusting them with the matching
+   * decision is no expansion of attack surface. A peer that lied
+   * about `ok: true` could already grief the requester by silently
+   * dropping the request — letting them also forge a fake "rejected"
+   * notification just collapses the same denial-of-service window
+   * faster, never widens it.
+   *
+   * In-memory only, like `joinRequestOriginPeers`. On requester
+   * restart between submit and decision, we fall back to the
+   * `_meta`-based curator check (which works for already-approved
+   * agents who later get re-rejected, the only scenario where the
+   * requester has meta access).
+   */
+  private readonly joinRequestAcceptedBy = new Map<string, Set<string>>();
+  /**
    * Per-peer timestamp of the last reconnect-on-gossip dial we attempted.
    * Prevents a noisy topic from generating a dial storm against a peer we
    * already tried recently. See DOC: p2p-resilience.md.
@@ -1416,7 +1449,11 @@ export class DKGAgent {
         const payload = JSON.parse(new TextDecoder().decode(data));
 
         // Handle "join-approved" notifications from curator → requester.
-        // Only process if this node owns the target agentAddress.
+        // Only process if this node owns the target agentAddress AND the
+        // sender is a peer we previously trusted as a curator candidate
+        // for THIS specific (cgId, agentAddress) pair (or, as a fallback,
+        // matches the curator triple in our local _meta graph — which
+        // works for already-approved members getting re-approved).
         if (payload.type === 'join-approved') {
           const { contextGraphId, agentAddress: approvedAddr } = payload;
           if (contextGraphId) {
@@ -1425,6 +1462,20 @@ export class DKGAgent {
             );
             if (approvedAddr && !isLocalAgent) {
               return new TextEncoder().encode(JSON.stringify({ ok: true, skipped: true }));
+            }
+            if (approvedAddr) {
+              const senderTrusted = await this.isTrustedJoinDecisionSender(
+                contextGraphId,
+                approvedAddr,
+                peerId.toString(),
+              );
+              if (!senderTrusted) {
+                this.log.warn(
+                  createOperationContext('system'),
+                  `Dropping join-approved for "${contextGraphId}" from ${peerId.toString()} — sender did not previously accept the join request and is not the recorded curator`,
+                );
+                return new TextEncoder().encode(JSON.stringify({ ok: true, skipped: true }));
+              }
             }
             this.preferredSyncPeers.set(contextGraphId, peerId.toString());
             this.log.info(createOperationContext('system'), `Join request approved for "${contextGraphId}" — auto-subscribing`);
@@ -1438,6 +1489,7 @@ export class DKGAgent {
                 status: 'active',
                 source: 'join-approved',
               });
+              this.joinRequestAcceptedBy.delete(`${contextGraphId}::${approvedAddr.toLowerCase()}`);
             }
             this.syncContextGraphFromConnectedPeers(contextGraphId, { includeSharedMemory: true }).catch(() => {});
             this.eventBus.emit(DKGEvent.JOIN_APPROVED, {
@@ -1479,11 +1531,15 @@ export class DKGAgent {
           if (!isLocalAgent) {
             return new TextEncoder().encode(JSON.stringify({ ok: true, skipped: true }));
           }
-          const senderIsCurator = await this.senderIsContextGraphCurator(contextGraphId, peerId.toString());
-          if (!senderIsCurator) {
+          const senderTrusted = await this.isTrustedJoinDecisionSender(
+            contextGraphId,
+            rejectedAddr,
+            peerId.toString(),
+          );
+          if (!senderTrusted) {
             this.log.warn(
               createOperationContext('system'),
-              `Dropping join-rejected for "${contextGraphId}" from ${peerId.toString()} — sender is not the CG curator`,
+              `Dropping join-rejected for "${contextGraphId}" from ${peerId.toString()} — sender did not previously accept the join request and is not the recorded curator`,
             );
             return new TextEncoder().encode(JSON.stringify({ ok: true, skipped: true }));
           }
@@ -1496,6 +1552,7 @@ export class DKGAgent {
             status: 'removed',
             source: 'join-rejected',
           });
+          this.joinRequestAcceptedBy.delete(`${contextGraphId}::${rejectedAddr.toLowerCase()}`);
           this.eventBus.emit(DKGEvent.JOIN_REJECTED, {
             contextGraphId,
             agentAddress: rejectedAddr,
@@ -7029,6 +7086,7 @@ export class DKGAgent {
     const peers = this.node.libp2p.getPeers();
     let delivered = 0;
     const errors: string[] = [];
+    const acceptedKey = `${contextGraphId}::${agentAddress.toLowerCase()}`;
 
     for (const pid of peers) {
       const remotePeerId = pid.toString();
@@ -7038,6 +7096,15 @@ export class DKGAgent {
         const response = JSON.parse(new TextDecoder().decode(responseBytes));
         if (response.ok) {
           delivered++;
+          // Remember this peer as a curator candidate authorised to
+          // later send us the matching join-approved / join-rejected
+          // notification. See `joinRequestAcceptedBy` doc comment.
+          let set = this.joinRequestAcceptedBy.get(acceptedKey);
+          if (!set) {
+            set = new Set<string>();
+            this.joinRequestAcceptedBy.set(acceptedKey, set);
+          }
+          set.add(remotePeerId);
         } else if (response.error !== 'unknown CG') {
           errors.push(`${remotePeerId.slice(-8)}: ${response.error}`);
         }
@@ -9006,6 +9073,31 @@ export class DKGAgent {
    * A missing curator / registry failure is treated as "not curator"
    * — we'd rather drop a real rejection than surface a forged one.
    */
+  /**
+   * Authorise the sender of a join-approved/rejected notification for
+   * `(contextGraphId, agentAddress)`. Tries two sources, in order:
+   *
+   *   1. `joinRequestAcceptedBy` — peers that returned `{ok: true}`
+   *      to our broadcast in `forwardJoinRequest`. This is the only
+   *      check that works for the freshly-rejected case (no _meta
+   *      access yet).
+   *   2. `senderIsContextGraphCurator` — meta-graph curator lookup
+   *      with registry fallback. This catches the case where we
+   *      restarted between submit and decision (in-memory map lost),
+   *      or where we're an already-approved member receiving a later
+   *      decision (we have meta access from the prior approval).
+   */
+  private async isTrustedJoinDecisionSender(
+    contextGraphId: string,
+    agentAddress: string,
+    senderPeerId: string,
+  ): Promise<boolean> {
+    const acceptedKey = `${contextGraphId}::${agentAddress.toLowerCase()}`;
+    const accepted = this.joinRequestAcceptedBy.get(acceptedKey);
+    if (accepted?.has(senderPeerId)) return true;
+    return this.senderIsContextGraphCurator(contextGraphId, senderPeerId);
+  }
+
   private async senderIsContextGraphCurator(contextGraphId: string, senderPeerId: string): Promise<boolean> {
     try {
       const owner = await this.getContextGraphOwner(contextGraphId);

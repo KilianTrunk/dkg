@@ -691,7 +691,7 @@ export async function runHermesSetup(req: HermesSetupRequest): Promise<HermesSet
       try {
         await fundWalletsBestEffort({
           network,
-          callerId: setupOptions.agentName ?? profile.profileName ?? 'hermes-setup',
+          idempotencySeed: setupOptions.agentName ?? profile.profileName ?? 'hermes-setup',
           didStartDaemon: shouldStart,
         });
         // fundWalletsBestEffort never throws and never returns funded list;

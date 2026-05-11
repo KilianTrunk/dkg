@@ -30,7 +30,7 @@ vi.mock('@origintrail-official/dkg-core', async () => {
   return {
     ...actual,
     requestFaucetFunding: requestFaucetFundingSpy,
-    fundWalletsBestEffort: vi.fn(async ({ network, callerId, didStartDaemon }) => {
+    fundWalletsBestEffort: vi.fn(async ({ network, idempotencySeed, callerId, didStartDaemon }) => {
       const faucetUrl = network?.faucet?.url;
       const faucetMode = network?.faucet?.mode;
       if (!faucetUrl || !faucetMode) return;
@@ -41,7 +41,12 @@ vi.mock('@origintrail-official/dkg-core', async () => {
       if (!walletAddresses.length) return;
 
       try {
-        const result = await requestFaucetFundingSpy(faucetUrl, faucetMode, walletAddresses, callerId);
+        const result = await requestFaucetFundingSpy(
+          faucetUrl,
+          faucetMode,
+          walletAddresses,
+          idempotencySeed ?? callerId,
+        );
         if (!result.success || result.error) {
           actual.logManualFundingInstructions(
             result.failedWallets?.length ? result.failedWallets : walletAddresses,

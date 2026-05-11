@@ -1652,7 +1652,7 @@ export async function runSetup(options: SetupOptions): Promise<void> {
   if (!dryRun && shouldFund && network) {
     await fundWalletsBestEffort({
       network,
-      callerId: effectiveAgentName,
+      idempotencySeed: effectiveAgentName,
       didStartDaemon: shouldStart,
     });
   } else if (!dryRun && !shouldFund) {

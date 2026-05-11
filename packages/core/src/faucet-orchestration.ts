@@ -150,11 +150,10 @@ export interface FundWalletsNetworkConfig {
  */
 export interface FundWalletsBestEffortOptions {
   network: FundWalletsNetworkConfig;
-  /**
-   * Historical option name. Used only as the faucet idempotency-key seed;
-   * the request body intentionally omits faucet `callerId`.
-   */
-  callerId: string;
+  /** Stable seed for deterministic faucet idempotency keys. */
+  idempotencySeed?: string;
+  /** @deprecated Use `idempotencySeed`; the faucet request body omits `callerId`. */
+  callerId?: string;
   didStartDaemon: boolean;
 }
 
@@ -180,7 +179,8 @@ export interface FundWalletsBestEffortOptions {
  *     by design — keeps it simple; cancellation lives in the caller).
  */
 export async function fundWalletsBestEffort(opts: FundWalletsBestEffortOptions): Promise<void> {
-  const { network, callerId, didStartDaemon } = opts;
+  const { network, didStartDaemon } = opts;
+  const idempotencySeed = opts.idempotencySeed ?? opts.callerId ?? 'setup';
   const faucetUrl = network?.faucet?.url;
   const faucetMode = network?.faucet?.mode;
   if (!faucetUrl || !faucetMode) {
@@ -200,7 +200,7 @@ export async function fundWalletsBestEffort(opts: FundWalletsBestEffortOptions):
 
   log('Funding wallets via testnet faucet...');
   try {
-    const result = await requestFaucetFunding(faucetUrl, faucetMode, walletAddresses, callerId);
+    const result = await requestFaucetFunding(faucetUrl, faucetMode, walletAddresses, idempotencySeed);
     if (result.success) {
       log(`Funded: ${result.funded.join(', ')}`);
       if (result.error) {

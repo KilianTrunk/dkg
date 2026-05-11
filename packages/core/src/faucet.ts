@@ -97,7 +97,7 @@ export async function requestFaucetFunding(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': `init-v2-${mode}-${safeNodeName}-${[...batch].sort().join(',')}`,
+          'Idempotency-Key': `init-${mode}-${safeNodeName}-${[...batch].sort().join(',')}`,
         },
         body: JSON.stringify({ mode, wallets: batch }),
         signal: AbortSignal.timeout(FAUCET_REQUEST_TIMEOUT_MS),

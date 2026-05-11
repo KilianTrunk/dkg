@@ -241,16 +241,35 @@ else
 fi
 
 hr "Step 4 — N2 signs & forwards a join request to N1 (curator)"
-sign_resp=$(api "$N2" POST "/api/context-graph/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$CG_ID',safe=''))")/sign-join" "{\"curatorPeerId\":\"$N1_PEER_ID\"}")
-sent_status=$(echo "$sign_resp" | jq_field status)
-delivered=$(echo "$sign_resp" | jq_field delivered)
-sig=$(echo "$sign_resp" | jq_field signature)
-ts=$(echo "$sign_resp" | jq_field timestamp)
+# PR #448 review: /sign-join is now sign-only — it returns the
+# SignedAgentDelegation but does NOT forward over P2P. Forwarding lives
+# in /request-join, mirroring the UI's two-step flow. The earlier
+# "sign-and-forward" path duplicated the forward when callers also
+# POSTed the delegation back to /request-join.
+ENC_CG=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$CG_ID',safe=''))")
+sign_resp=$(api "$N2" POST "/api/context-graph/$ENC_CG/sign-join" "{}")
 note "sign-join response: $sign_resp"
-if [ "$sent_status" = "sent" ] && [ -n "$delivered" ] && [ "$delivered" != "0" ]; then
-  ok "join request delivered to $delivered curator candidate(s)"
+delegation=$(echo "$sign_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('delegation') or {}))")
+if [ -z "$delegation" ] || [ "$delegation" = "{}" ]; then
+  fail "sign-join did not return a signed delegation: $sign_resp"
+fi
+ok "sign-join returned a signed delegation"
+
+submit_body=$(python3 -c "
+import sys,json
+print(json.dumps({
+  'delegation': json.loads('''$delegation'''),
+  'curatorPeerId': '$N1_PEER_ID',
+}))
+")
+submit_resp=$(api "$N2" POST "/api/context-graph/$ENC_CG/request-join" "$submit_body")
+note "request-join response: $submit_resp"
+delivered=$(echo "$submit_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('delivered',''))")
+status_field=$(echo "$submit_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))")
+if [ "$status_field" = "pending" ] && [ -n "$delivered" ] && [ "$delivered" != "0" ]; then
+  ok "join request delivered ($delivered)"
 else
-  fail "sign-join did not deliver (status=$sent_status delivered=$delivered)"
+  fail "request-join did not deliver (status=$status_field delivered=$delivered)"
 fi
 
 hr "Step 5 — N1 lists pending join requests (expect: 1 for N2)"

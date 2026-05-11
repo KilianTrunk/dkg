@@ -137,9 +137,22 @@ api "$N2" POST /api/subscribe "{\"contextGraphId\":\"$CG_ID\"}" > /dev/null
 poll_catchup "$N2" "$CG_ID" denied 90 || exit 1
 
 hr "Step 3 — N2 signs and forwards a join request to N1"
-sign_resp=$(api "$N2" POST "/api/context-graph/$(urlenc "$CG_ID")/sign-join" "{\"curatorPeerId\":\"$N1_PEER_ID\"}")
-sent=$(echo "$sign_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
-[ "$sent" = "sent" ] && ok "request delivered" || { fail "sign-join: $sign_resp"; exit 1; }
+# PR #448: /sign-join is sign-only; forwarding lives in /request-join.
+sign_resp=$(api "$N2" POST "/api/context-graph/$(urlenc "$CG_ID")/sign-join" "{}")
+delegation_json=$(echo "$sign_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('delegation') or {}))")
+[ -z "$delegation_json" ] || [ "$delegation_json" = "{}" ] && { fail "sign-join did not return a delegation: $sign_resp"; exit 1; }
+ok "delegation signed"
+
+submit_body=$(python3 -c "
+import sys,json
+print(json.dumps({
+  'delegation': json.loads('''$delegation_json'''),
+  'curatorPeerId': '$N1_PEER_ID',
+}))
+")
+submit_resp=$(api "$N2" POST "/api/context-graph/$(urlenc "$CG_ID")/request-join" "$submit_body")
+delivered=$(echo "$submit_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('delivered',''))")
+[ -n "$delivered" ] && [ "$delivered" != "0" ] && ok "request delivered ($delivered)" || { fail "request-join: $submit_resp"; exit 1; }
 
 hr "Step 4 — N1 lists pending requests (expect N2 present)"
 sleep 1

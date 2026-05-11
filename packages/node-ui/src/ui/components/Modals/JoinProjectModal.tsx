@@ -71,6 +71,16 @@ export function parseInviteCode(raw: string): ParsedInvite {
         break;
       }
     }
+  } else {
+    // Legacy multiaddr invites still carry the curator peer id at the
+    // tail (`/p2p/<peerId>`). Surface it so the join flow has the
+    // V10-required curator binding even for legacy invites — without
+    // this, `/request-join` would 400 with "Missing curatorPeerId" on
+    // every curated-project legacy invite. PR #448 review (round 4).
+    const p2pTail = legacyMultiaddr.match(/\/p2p\/([^/]+)$/);
+    if (p2pTail && PEER_ID_RE.test(p2pTail[1])) {
+      curatorPeerId = p2pTail[1];
+    }
   }
 
   // CG id: strip the inline multiaddr (if it appeared glued onto the same
@@ -376,7 +386,7 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
         }
       }
 
-      const signed = await signJoinRequest(cgId, curatorPeerId);
+      const signed = await signJoinRequest(cgId);
 
       let agentName: string | undefined;
       try {

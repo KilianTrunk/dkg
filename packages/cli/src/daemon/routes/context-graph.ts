@@ -823,7 +823,20 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     }
   }
 
-  // POST /api/context-graph/{id}/sign-join — sign a join request and forward to curator via P2P
+  // POST /api/context-graph/{id}/sign-join — sign a join-request delegation
+  //
+  // SIGN-ONLY. Returns the signed `SignedAgentDelegation` for the caller's
+  // agent to whoever is asking. Does NOT forward over P2P — that is the
+  // sole responsibility of `/api/context-graph/{id}/request-join`.
+  //
+  // Why split? PR #448 review (2026-05-11): an earlier revision of this
+  // route also called `forwardJoinRequest` before returning, but the UI +
+  // CLI then POST the same delegation to `/request-join`, which forwards
+  // it again. Curators received the same join request twice (and emitted
+  // two `JOIN_REQUEST_RECEIVED` notifications) on every single click.
+  // Splitting sign vs forward also lets the CLI sign without a curator
+  // peer id (sign locally, forward later) — the previous mandatory
+  // `curatorPeerId` body param hard-broke `dkg context-graph request-join`.
   const signJoinMatch = path.match(/^\/api\/context-graph\/([^/]+)\/sign-join$/);
   if (req.method === "POST" && signJoinMatch) {
     const contextGraphId = decodeURIComponent(signJoinMatch[1]);
@@ -831,37 +844,19 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       const callerAddress = agent.resolveAgentAddress(
         extractBearerToken(req.headers.authorization),
       );
-      let curatorPeerId: string | undefined;
-      try {
-        const raw = await readBody(req, SMALL_BODY_BYTES);
-        if (raw) curatorPeerId = JSON.parse(raw)?.curatorPeerId;
-      } catch {
-        // body parse error — surface as missing-curator below.
-      }
-      if (!curatorPeerId) {
-        return jsonResponse(res, 400, {
-          error: 'Missing curatorPeerId. Invite codes must include the curator peer id (V10 format: "<cgId>\\n<peerId>"). Ask the curator to share an updated invite code.',
-        });
-      }
+      // Body is intentionally ignored — sign-only. Drain it so a JSON body
+      // sent by older clients doesn't sit on the socket.
+      try { await readBody(req, SMALL_BODY_BYTES); } catch { /* ignored */ }
       const delegation = await agent.signJoinRequest(contextGraphId, callerAddress);
-      const { delivered, errors } = await agent.forwardJoinRequest(
-        contextGraphId,
-        delegation,
-        agent.nodeName,
-        curatorPeerId,
-      );
       return jsonResponse(res, 200, {
         ok: true,
         contextGraphId,
         delegation,
-        // Back-compat surface fields for older HTTP clients reading the
-        // top-level `agentAddress`. The full signed delegation lives in
-        // `delegation`; the joiner UI POSTs that whole object back to
-        // `/request-join` to send the actual P2P message.
+        // Back-compat surface for older HTTP clients reading the
+        // top-level `agentAddress`. The full signed delegation lives
+        // in `delegation`; callers that want delivery POST it (with
+        // a `curatorPeerId`) to `/request-join`.
         agentAddress: delegation.agentAddress,
-        delivered,
-        ...(errors.length > 0 ? { errors } : {}),
-        status: delivered > 0 ? 'sent' : 'no-curator-found',
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

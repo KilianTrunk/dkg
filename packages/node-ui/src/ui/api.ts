@@ -267,14 +267,15 @@ export interface SignedAgentDelegation {
   signature: string;
 }
 
+// SignJoinResponse is intentionally narrow — `/sign-join` is sign-only
+// (PR #448 review: forwarding lives in `/request-join` to avoid a
+// duplicate-forward bug where the UI was sending the same delegation
+// twice). Delivery status comes back from `submitJoinRequest` instead.
 export interface SignJoinResponse {
   ok: boolean;
   contextGraphId: string;
   delegation: SignedAgentDelegation;
   agentAddress: string;
-  delivered: number;
-  errors?: string[];
-  status: 'sent' | 'no-curator-found';
 }
 
 export interface PendingJoinRequest {
@@ -285,10 +286,10 @@ export interface PendingJoinRequest {
   status: string;
 }
 
-export const signJoinRequest = (contextGraphId: string, curatorPeerId?: string) =>
+export const signJoinRequest = (contextGraphId: string) =>
   post<SignJoinResponse>(
     `/api/context-graph/${encodeURIComponent(contextGraphId)}/sign-join`,
-    curatorPeerId ? { curatorPeerId } : {},
+    {},
   );
 
 export const submitJoinRequest = (

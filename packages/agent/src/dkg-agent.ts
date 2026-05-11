@@ -325,8 +325,23 @@ const JOIN_DELEGATION_VALIDITY_MS = 365 * 24 * 60 * 60 * 1000;
  * binding, a delegation signed against testnet's CG "X" could be
  * replayed against a devnet's CG "X" with the same delegatee
  * identifiers. See `ChainAdapter.deploymentId`.
+ *
+ * Fails closed if `deploymentId` is empty/undefined. `ChainAdapter` is
+ * a TypeScript-only interface, so a JS / cast / custom adapter can omit
+ * the field at runtime; without this guard we'd silently sign and
+ * verify against `sync:deployment=undefined:<cgId>`, dropping the
+ * cross-deployment replay protection this scope is meant to add.
+ * PR #448 review (round 4): make misconfigured adapters fail loudly
+ * instead of minting broad delegations.
  */
-function joinDelegationScope(deploymentId: string, contextGraphId: string): string {
+function joinDelegationScope(deploymentId: string | undefined, contextGraphId: string): string {
+  if (!deploymentId || typeof deploymentId !== 'string' || deploymentId.trim().length === 0) {
+    throw new Error(
+      'Cannot derive join-delegation scope: chain adapter did not advertise a deploymentId. '
+      + 'Every adapter (EVM, mock, custom) must implement `get deploymentId(): string` so '
+      + 'delegations can\'t be cross-deployment replayed. Update the adapter or wrap it.',
+    );
+  }
   return `sync:deployment=${deploymentId}:${contextGraphId}`;
 }
 
@@ -3884,11 +3899,20 @@ export class DKGAgent {
    */
   private async getContextGraphAllowedDelegateePeers(contextGraphId: string): Promise<Map<string, string[]>> {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    // SELECT also returns `expiresAtMs` so we can filter expired rows in
+    // JS — pushing the FILTER into SPARQL would force a string→long
+    // cast that not every store backend handles uniformly.
+    // PR #448 review (round 4): without this, an approved delegation
+    // remained authorised forever even after `expiresAtMs` had passed.
+    // `approveJoinRequest()` re-validates expiry only at approval time;
+    // sync auth never checked it again, turning `expiresAtMs` into a
+    // one-time admission gate instead of an ongoing constraint.
     const result = await this.store.query(
-      `SELECT ?agent ?peer WHERE {
+      `SELECT ?agent ?peer ?expiresAt WHERE {
         GRAPH <${cgMetaGraph}> {
           ?d <${DKG_ONTOLOGY.DKG_DELEGATION_AGENT}> ?agent ;
-             <${DKG_ONTOLOGY.DKG_ALLOWED_DELEGATEE_PEER}> ?peer
+             <${DKG_ONTOLOGY.DKG_ALLOWED_DELEGATEE_PEER}> ?peer .
+          OPTIONAL { ?d <${DKG_ONTOLOGY.DKG_DELEGATION_EXPIRES_AT}> ?expiresAt }
         }
       }`,
     );
@@ -3898,10 +3922,16 @@ export class DKGAgent {
       if (typeof raw !== 'string') return '';
       return raw.replace(/^"/, '').replace(/"(@[a-zA-Z-]+|\^\^<[^>]+>)?$/, '');
     };
+    const nowMs = Date.now();
     for (const row of result.bindings) {
       const agent = strip(row['agent']).toLowerCase();
       const peer = strip(row['peer']);
       if (!agent || !peer) continue;
+      const expiresStr = strip(row['expiresAt']);
+      if (expiresStr) {
+        const expiresAt = Number(expiresStr);
+        if (Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt < nowMs) continue;
+      }
       const list = out.get(agent) ?? [];
       if (!list.includes(peer)) list.push(peer);
       out.set(agent, list);
@@ -3914,14 +3944,17 @@ export class DKGAgent {
    * operational-key addresses authorised via a signed delegation.
    * Returns Map<agentLower, opKeyLower[]>. Both keys and values are
    * lowercased so callers can compare against `recoveredAddress.toLowerCase()`.
+   * Expired rows are filtered out — see the peer-lookup helper for the
+   * rationale (PR #448 review round 4).
    */
   private async getContextGraphAllowedDelegateeKeys(contextGraphId: string): Promise<Map<string, string[]>> {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const result = await this.store.query(
-      `SELECT ?agent ?key WHERE {
+      `SELECT ?agent ?key ?expiresAt WHERE {
         GRAPH <${cgMetaGraph}> {
           ?d <${DKG_ONTOLOGY.DKG_DELEGATION_AGENT}> ?agent ;
-             <${DKG_ONTOLOGY.DKG_ALLOWED_DELEGATEE_KEY}> ?key
+             <${DKG_ONTOLOGY.DKG_ALLOWED_DELEGATEE_KEY}> ?key .
+          OPTIONAL { ?d <${DKG_ONTOLOGY.DKG_DELEGATION_EXPIRES_AT}> ?expiresAt }
         }
       }`,
     );
@@ -3931,10 +3964,16 @@ export class DKGAgent {
       if (typeof raw !== 'string') return '';
       return raw.replace(/^"/, '').replace(/"(@[a-zA-Z-]+|\^\^<[^>]+>)?$/, '');
     };
+    const nowMs = Date.now();
     for (const row of result.bindings) {
       const agent = strip(row['agent']).toLowerCase();
       const key = strip(row['key']).toLowerCase();
       if (!agent || !key) continue;
+      const expiresStr = strip(row['expiresAt']);
+      if (expiresStr) {
+        const expiresAt = Number(expiresStr);
+        if (Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt < nowMs) continue;
+      }
       const list = out.get(agent) ?? [];
       if (!list.includes(key)) list.push(key);
       out.set(agent, list);
@@ -9287,6 +9326,46 @@ export class DKGAgent {
     };
   }
 
+  /**
+   * Pick which local agent should sign sync requests for this CG.
+   *
+   * On a multi-agent node, hard-coding `defaultAgentAddress` for every
+   * sync envelope is wrong: if agent B is allowlisted on the CG but
+   * agent A happens to be the process default, the responder's
+   * per-agent delegation lookup will only see A's claim and miss B's
+   * stored delegation, silently failing sync auth for the actually
+   * approved agent.
+   *
+   * Resolution order:
+   *  1. If the process default is in the curator's allowlist (mirrored
+   *     into our local `_meta` after first sync), keep using it. This
+   *     preserves historical behavior for single-agent nodes.
+   *  2. Otherwise pick the first local agent the curator allowlisted.
+   *  3. If no local agent is allowlisted (e.g. we just subscribed and
+   *     haven't synced `_meta` yet, or we're the curator handling our
+   *     own CG), fall back to `defaultAgentAddress`.
+   *
+   * PR #448 review (round 4) — Codex flagged this as a real
+   * "multi-agent silent sync failure" bug.
+   */
+  private async findLocalAgentForContextGraph(contextGraphId: string): Promise<string | undefined> {
+    if (this.localAgents.size === 0) return this.defaultAgentAddress;
+    let allowedAgents: string[] = [];
+    try {
+      allowedAgents = await this.getContextGraphAllowedAgents(contextGraphId);
+    } catch {
+      return this.defaultAgentAddress;
+    }
+    if (allowedAgents.length === 0) return this.defaultAgentAddress;
+    const allowedLower = new Set(allowedAgents.map((a) => a.toLowerCase()));
+    const defaultLower = this.defaultAgentAddress?.toLowerCase();
+    if (defaultLower && allowedLower.has(defaultLower)) return this.defaultAgentAddress;
+    for (const localAddr of this.localAgents.keys()) {
+      if (allowedLower.has(localAddr.toLowerCase())) return localAddr;
+    }
+    return this.defaultAgentAddress;
+  }
+
   private async buildSyncRequest(
     contextGraphId: string,
     offset: number,
@@ -9303,7 +9382,8 @@ export class DKGAgent {
     // against its allowlist.
     const hasLocalData = this.subscribedContextGraphs.get(contextGraphId)?.synced === true;
     const needsAuth = isPrivate || !hasLocalData;
-    const defaultAgent = this.defaultAgentAddress ? this.localAgents.get(this.defaultAgentAddress) : undefined;
+    const claimedAgentAddress = await this.findLocalAgentForContextGraph(contextGraphId);
+    const claimedAgent = claimedAgentAddress ? this.localAgents.get(claimedAgentAddress) : undefined;
     return buildSyncRequestEnvelope({
       contextGraphId,
       offset,
@@ -9316,8 +9396,8 @@ export class DKGAgent {
       computeSyncDigest: this.computeSyncDigest.bind(this),
       getIdentityId: () => this.chain.getIdentityId(),
       signMessage: typeof this.chain.signMessage === 'function' ? this.chain.signMessage.bind(this.chain) : undefined,
-      defaultAgentAddress: this.defaultAgentAddress,
-      defaultAgentPrivateKey: defaultAgent?.privateKey,
+      defaultAgentAddress: claimedAgentAddress,
+      defaultAgentPrivateKey: claimedAgent?.privateKey,
     });
   }
 

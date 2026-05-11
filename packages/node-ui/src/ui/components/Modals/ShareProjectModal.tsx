@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import {
-  authHeaders, addParticipant, removeParticipant, listParticipants,
+  authHeaders, removeParticipant, listParticipants,
   fetchAgents, listJoinRequests, approveJoinRequest, rejectJoinRequest,
   type PendingJoinRequest,
 } from '../../api.js';
@@ -121,9 +121,20 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
   // is much cheaper than the joiner's 90s catchup deadline.
   const [multiaddrs, setMultiaddrs] = useState<string[]>([]);
   const [allowedAgents, setAllowedAgents] = useState<string[]>([]);
-  const [newAgent, setNewAgent] = useState('');
-  const [addingAgent, setAddingAgent] = useState(false);
+  // Surfaced only for join-request approve/reject errors. The previous
+  // address-paste add-path that also wrote here was removed; the only
+  // way to add an agent now is to share the text invite and approve
+  // the inbound signed join request.
   const [agentError, setAgentError] = useState<string | null>(null);
+  // Kept solely for the friendly-name lookup on already-allowlisted
+  // entries (so the Allowed Agents list still renders peer names where
+  // we know them rather than just the raw 0x address). The previous
+  // "Network Agents" picker that surfaced this list as add-suggestions
+  // was removed because on long-running testnet nodes the historical
+  // agent registry routinely accumulates 1500+ rows dominated by
+  // offline smoke-node and one-off test agents — overwhelming and not
+  // actionable as an invite path. Inviting now goes through the text
+  // invite + signed join request flow exclusively.
   const [networkAgents, setNetworkAgents] = useState<NetworkAgent[]>([]);
   const [pendingRequests, setPendingRequests] = useState<PendingJoinRequest[]>([]);
   const [processingRequest, setProcessingRequest] = useState<string | null>(null);
@@ -181,26 +192,6 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
     }).catch(() => {});
   };
 
-  const handleAddAgent = async (addr?: string) => {
-    const address = (addr ?? newAgent).trim();
-    if (!address) return;
-    if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
-      setAgentError('Invalid Ethereum address (expected 0x... 40 hex chars)');
-      return;
-    }
-    setAddingAgent(true);
-    setAgentError(null);
-    try {
-      await addParticipant(contextGraphId, address);
-      setAllowedAgents((prev) => [...new Set([...prev, address])]);
-      setNewAgent('');
-    } catch (err: any) {
-      setAgentError(err?.message || 'Failed to add agent');
-    } finally {
-      setAddingAgent(false);
-    }
-  };
-
   const handleRemoveAgent = async (addr: string) => {
     try {
       await removeParticipant(contextGraphId, addr);
@@ -234,32 +225,6 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
       setProcessingRequest(null);
     }
   };
-
-  const allowedSet = new Set(allowedAgents.map(a => a.toLowerCase()));
-  // The "Network Agents" picker only shows currently-connected peers.
-  //
-  // `/api/agents` returns the full historical agent registry (every peer
-  // this node has ever discovered/synced with), which on a long-running
-  // testnet node easily reaches 1500+ rows dominated by old `smoke-node`
-  // and one-off test agents. Surfacing all of them as "+ Add" suggestions
-  // is overwhelming and not actionable — adding a long-offline peer to
-  // an allowlist isn't useful in practice.
-  //
-  // `connectionStatus === 'connected'` is computed at request time from
-  // live libp2p connections (`handleAgentChatRoutes` in
-  // `packages/cli/src/daemon/routes/agent-chat.ts`), so the filter is
-  // always accurate to "right now".
-  //
-  // The full `networkAgents` set is still used below to look up friendly
-  // names for already-allowlisted addresses, so an allowlisted peer that
-  // happens to be offline still renders with their name (not just hex).
-  // For ad-hoc adds of a disconnected agent, the operator can paste any
-  // 0x address into the input field below.
-  const availablePeers = networkAgents.filter(
-    (a) => a.connectionStatus === 'connected'
-      && a.agentAddress
-      && !allowedSet.has(a.agentAddress.toLowerCase()),
-  );
 
   return (
     <div className="v10-modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -311,51 +276,14 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
 
           {activeTab === 'allowlist' && (
             <>
-              {/* Network Agents (Peer Directory) — connected only */}
-              {availablePeers.length > 0 && (
-                <div className="v10-form-group">
-                  <label className="v10-form-label">Network Agents <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>· {availablePeers.length} online</span></label>
-                  <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginBottom: 8 }}>
-                    Showing agents currently connected to your node. Click + to add to the allowlist.
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 12 }}>
-                    {availablePeers.map((a) => (
-                      <div key={a.peerId} style={{
-                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                        padding: '6px 10px', borderRadius: 6, fontSize: 11,
-                        background: 'var(--bg-surface)', border: '1px solid var(--border-default)',
-                      }}>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                          <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{a.name}</span>
-                          <span style={{
-                            color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', fontSize: 10,
-                          }}>
-                            {a.agentAddress}
-                          </span>
-                        </div>
-                        <button
-                          onClick={() => handleAddAgent(a.agentAddress!)}
-                          disabled={addingAgent}
-                          style={{
-                            background: 'var(--accent-primary)', color: '#fff', border: 'none',
-                            cursor: 'pointer', borderRadius: 4, fontSize: 11, padding: '4px 10px',
-                            fontWeight: 600, whiteSpace: 'nowrap',
-                          }}
-                          title={`Add ${a.name} to allowlist`}
-                        >
-                          + Add
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Allowed Agents section */}
+              {/* Allowed Agents — read-only audit list. Agents are added
+                  exclusively via the text-invite + signed-join-request flow
+                  (see Invite Code below + the Join Requests tab). The ✕
+                  button revokes access for an existing participant. */}
               <div className="v10-form-group">
                 <label className="v10-form-label">Allowed Agents</label>
                 <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginBottom: 8 }}>
-                  Only agents on this list can read and write to the project. Add by Ethereum address or pick from network agents above.
+                  Only agents on this list can read and write to the project. To add someone, share the Invite Code below — they'll send a signed join request you can approve in the <strong>Join Requests</strong> tab.
                 </div>
 
                 {allowedAgents.length > 0 && (
@@ -400,29 +328,6 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
                   }}>
                     No agents on allowlist — project is open to anyone who subscribes.
                   </div>
-                )}
-
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <input
-                    className="v10-form-input"
-                    type="text"
-                    placeholder="0x..."
-                    value={newAgent}
-                    onChange={(e) => { setNewAgent(e.target.value); setAgentError(null); }}
-                    style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 11 }}
-                    onKeyDown={(e) => { if (e.key === 'Enter') handleAddAgent(); }}
-                  />
-                  <button
-                    className="v10-modal-btn primary"
-                    onClick={() => handleAddAgent()}
-                    disabled={!newAgent.trim() || addingAgent}
-                    style={{ whiteSpace: 'nowrap', fontSize: 11 }}
-                  >
-                    {addingAgent ? 'Adding…' : 'Add Agent'}
-                  </button>
-                </div>
-                {agentError && (
-                  <div style={{ fontSize: 10, color: 'var(--accent-red, #ef4444)', marginTop: 4 }}>{agentError}</div>
                 )}
               </div>
 
@@ -475,9 +380,9 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
                       {' '}Their daemon dials your node by peer id over the libp2p DHT, so the
                       invite stays valid even if your relay or public IP changes.
                       {allowedAgents.length > 0 ? (
-                        <> The invitee must have their agent address on the allowlist, or they can submit a signed join request for your approval.</>
+                        <> They'll send a signed join request that appears in the <strong>Join Requests</strong> tab for you to approve.</>
                       ) : (
-                        <> Since no allowlist is set, anyone with this code can join.</>
+                        <> Since no allowlist is set, anyone with this code can join directly.</>
                       )}
                     </>
                   ) : (

@@ -284,6 +284,52 @@ describe('publishJsonLd', () => {
     if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(false);
   }, 15000);
 
+  it('async publish on V10 chain signals allowPublisherFallbackSeal on the lift request', async () => {
+    const { agent, store } = await createAgent('AsyncSealBot');
+    await agent.createContextGraph({ id: 'async-seal', name: 'AsyncSeal', description: '' });
+    await agent.registerContextGraph('async-seal');
+    const root = 'http://example.org/AsyncSealEntity';
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-seal',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': root,
+          '@type': 'Thing',
+          'name': 'Async Seal Public',
+        },
+      },
+      { localOnly: true },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.allowPublisherFallbackSeal).toBe(true);
+  }, 30_000);
+
+  it('async publish for private-only content on V10 chain still signals fallback (mirrors EPCIS capture path)', async () => {
+    const { agent, store } = await createAgent('AsyncSealPrivBot');
+    await agent.createContextGraph({ id: 'async-seal-priv', name: 'AsyncSealPriv', description: '' });
+    await agent.registerContextGraph('async-seal-priv');
+    const root = 'http://example.org/AsyncSealPrivEntity';
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-seal-priv',
+      {
+        '@context': 'http://schema.org/',
+        '@id': root,
+        '@type': 'Thing',
+        'name': 'Private-only Async',
+      },
+      { localOnly: true },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.allowPublisherFallbackSeal).toBe(true);
+  }, 30_000);
+
   it('async publish records and resolves subGraphName for staged public and private data', async () => {
     const { agent, store } = await createAgent('AsyncSubGraphBot');
     await agent.createContextGraph({ id: 'async-subgraph', name: 'AsyncSubGraph', description: '' });

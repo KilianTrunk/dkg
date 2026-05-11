@@ -121,6 +121,7 @@ export function mapLiftRequestToPublishOptions(input: LiftPublishMappingInput): 
     onPhase: input.resolved.onPhase,
     receiverSignatureProvider: input.resolved.receiverSignatureProvider,
     publishContextGraphId: input.resolved.publishContextGraphId,
+    allowPublisherFallbackSeal: input.request.allowPublisherFallbackSeal,
   };
 }
 

@@ -1416,7 +1416,9 @@ export class DKGPublisher implements Publisher {
     return unique;
   }
 
-  async publish(options: PublishOptions): Promise<PublishResult> {
+  async publish(originalOptions: PublishOptions): Promise<PublishResult> {
+    // Allow inline rewrite when minting a publisher-fallback seal below.
+    let options: PublishOptions = originalOptions;
     // Sub-graph routing: data triples go to `did:dkg:context-graph:{id}/{subGraph}`.
     // KC metadata (status, authorship proofs) stays in the root `_meta` graph so that
     // AccessHandler.lookupKAMeta() and DKGQueryEngine.resolveKA() can still discover
@@ -1857,6 +1859,47 @@ export class DKGPublisher implements Publisher {
     } else {
       const tokenAmount = precomputedTokenAmount;
       usedV10Path = true;
+      // Publisher-fallback seal mint (RFC-001 §4 mode (a)) — sign as
+      // self over the merkle we just computed. Same input → same merkle,
+      // so the preflight below cannot mismatch.
+      if (
+        !options.precomputedAttestation
+        && options.allowPublisherFallbackSeal
+        && v10ChainId !== undefined
+        && v10KavAddress !== undefined
+        && publisherSigner !== undefined
+      ) {
+        try {
+          const fallbackAuthorAddress = await this.publisherFallbackAuthorAddress();
+          if (fallbackAuthorAddress) {
+            const fallbackTypedData = buildAuthorAttestationTypedData({
+              chainId: v10ChainId,
+              kav10Address: v10KavAddress,
+              contextGraphId: v10CgId,
+              merkleRoot: kcMerkleRoot,
+              authorAddress: fallbackAuthorAddress,
+              schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+            });
+            const compactSig = await this.signAuthorAttestationAsPublisher(fallbackTypedData);
+            options = {
+              ...options,
+              precomputedAttestation: {
+                expectedMerkleRoot: kcMerkleRoot,
+                authorAddress: fallbackAuthorAddress,
+                signature: compactSig,
+                schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+              },
+            };
+            this.log.info(ctx, `Minted publisher-fallback AuthorAttestation (author=${fallbackAuthorAddress})`);
+          }
+        } catch (err) {
+          this.log.warn(
+            ctx,
+            `Publisher-fallback seal mint failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
       // ─────────────────────────────────────────────────────────────
       // SEAL INTEGRITY PREFLIGHT (Round 4 review §12)
       //

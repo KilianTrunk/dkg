@@ -31,6 +31,8 @@ export interface LiftRequest {
   readonly subGraphName?: string;
   readonly accessPolicy?: LiftAccessPolicy;
   readonly allowedPeers?: readonly string[];
+  /** When set, the publisher mints the seal as itself at processNext-time (mode (a)). */
+  readonly allowPublisherFallbackSeal?: boolean;
 }
 
 export const LIFT_REQUEST_IMMUTABLE_FIELDS = [
@@ -46,6 +48,7 @@ export const LIFT_REQUEST_IMMUTABLE_FIELDS = [
   'subGraphName',
   'accessPolicy',
   'allowedPeers',
+  'allowPublisherFallbackSeal',
 ] as const;
 
 export interface LiftJobTimestamps {

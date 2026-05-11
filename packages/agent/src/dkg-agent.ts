@@ -3754,6 +3754,14 @@ export class DKGAgent {
       }
     }
 
+    // Signal publisher-fallback sealing on V10 chains; publisher mints
+    // the seal at processNext-time. Author == publisher's own EOA.
+    const onChainId = await this.getContextGraphOnChainId(contextGraphId);
+    const allowPublisherFallback =
+      onChainId != null &&
+      typeof this.chain.getEvmChainId === 'function' &&
+      typeof this.chain.getKnowledgeAssetsV10Address === 'function';
+
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
     const captureID = await asyncPublisher.lift({
       swmId: shareOperationId,
@@ -3767,6 +3775,7 @@ export class DKGAgent {
       subGraphName: opts?.subGraphName,
       accessPolicy: opts?.accessPolicy,
       allowedPeers: opts?.allowedPeers,
+      allowPublisherFallbackSeal: allowPublisherFallback,
     });
 
     if (!opts?.localOnly) {

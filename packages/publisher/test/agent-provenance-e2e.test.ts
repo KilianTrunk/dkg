@@ -855,10 +855,12 @@ describe('Diagram 12 — publisher-fallback seal mint signs as own wallet', () =
   });
 
   it('publish({allowPublisherFallbackSeal:true}) is a no-op when a caller seal is also supplied', async () => {
-    // Caller-supplied seals still take priority. The fallback flag is
-    // ignored when the caller already minted; existing strict
-    // validation path runs unchanged.
-    const author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+    // Use a DISTINCT wallet for the author so the assertion actually
+    // distinguishes "caller seal honoured" from "fallback overwrote
+    // it" — if the fallback path ignored precomputedAttestation, the
+    // on-chain author would be the publisher's CORE_OP address, not
+    // FIXTURE_AUTHOR_KEY.
+    const author = new ethers.Wallet(FIXTURE_AUTHOR_KEY);
     const publisher = makePublisher();
     const quads = [q(`${ENTITY}/D12-caller-seal`, 'http://schema.org/name', '"Diagram12-CallerSeal"')];
     const seal = await buildSeal(quads, author);
@@ -872,12 +874,10 @@ describe('Diagram 12 — publisher-fallback seal mint signs as own wallet', () =
 
     expect(result.status).toBe('confirmed');
     expect(result.onChainResult!.batchId).toBeGreaterThan(0n);
-    // Author still attributable to caller (same wallet as publisher
-    // here, but the path proves seal preflight ran on the caller seal,
-    // not the fallback — otherwise an explicitly malformed seal would
-    // be silently replaced).
+
     const kcId = result.onChainResult!.batchId;
     const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
     expect(onChainAuthor.toLowerCase()).toBe(author.address.toLowerCase());
+    expect(onChainAuthor.toLowerCase()).not.toBe(new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address.toLowerCase());
   });
 });

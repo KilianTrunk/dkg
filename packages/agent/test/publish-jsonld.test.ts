@@ -284,6 +284,39 @@ describe('publishJsonLd', () => {
     if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(false);
   }, 15000);
 
+  it('async publish does NOT signal allowPublisherFallbackSeal when chain reports !isV10Ready (despite V10 methods being present)', async () => {
+    // Codex review on #451: NoChainAdapter / partially-configured
+    // adapters expose getEvmChainId / getKnowledgeAssetsV10Address as
+    // throwing stubs, so a method-presence gate sets the flag on a
+    // node that cannot actually mint a V10 seal. The job persists; a
+    // later restart with a real adapter then publishes with publisher-
+    // authored attribution unexpectedly. Gate must use the live
+    // readiness probe.
+    const { agent, store } = await createAgent('AsyncSealNonV10Bot');
+    await agent.createContextGraph({ id: 'async-seal-non-v10', name: 'AsyncSealNonV10', description: '' });
+    await agent.registerContextGraph('async-seal-non-v10');
+
+    // Simulate: chain methods present, but adapter reports not ready.
+    (agent as unknown as { chain: { isV10Ready: () => boolean } }).chain.isV10Ready = () => false;
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-seal-non-v10',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/NonV10Entity',
+          '@type': 'Thing',
+          'name': 'Non-V10 Async',
+        },
+      },
+      { localOnly: true },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.allowPublisherFallbackSeal).not.toBe(true);
+  }, 30_000);
+
   it('async publish on V10 chain signals allowPublisherFallbackSeal on the lift request', async () => {
     const { agent, store } = await createAgent('AsyncSealBot');
     await agent.createContextGraph({ id: 'async-seal', name: 'AsyncSeal', description: '' });

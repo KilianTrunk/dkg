@@ -1860,8 +1860,10 @@ export class DKGPublisher implements Publisher {
       const tokenAmount = precomputedTokenAmount;
       usedV10Path = true;
       // Publisher-fallback seal mint (RFC-001 §4 mode (a)) — sign as
-      // self over the merkle we just computed. Same input → same merkle,
-      // so the preflight below cannot mismatch.
+      // self over the merkle we just computed, using the already-
+      // resolved signer for THIS publish (cg-aware). Skipping the
+      // resolver round-trip guarantees `KC.author == tx submitter`
+      // regardless of how the deployment configures publisherAddressResolver.
       if (
         !options.precomputedAttestation
         && options.allowPublisherFallbackSeal
@@ -1870,28 +1872,30 @@ export class DKGPublisher implements Publisher {
         && publisherSigner !== undefined
       ) {
         try {
-          const fallbackAuthorAddress = await this.publisherFallbackAuthorAddress();
-          if (fallbackAuthorAddress) {
-            const fallbackTypedData = buildAuthorAttestationTypedData({
-              chainId: v10ChainId,
-              kav10Address: v10KavAddress,
-              contextGraphId: v10CgId,
-              merkleRoot: kcMerkleRoot,
-              authorAddress: fallbackAuthorAddress,
+          const fallbackTypedData = buildAuthorAttestationTypedData({
+            chainId: v10ChainId,
+            kav10Address: v10KavAddress,
+            contextGraphId: v10CgId,
+            merkleRoot: kcMerkleRoot,
+            authorAddress: publisherSigner.address,
+            schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+          });
+          const sigHex = await publisherSigner.signTypedData(
+            fallbackTypedData.domain,
+            fallbackTypedData.types as { [k: string]: Array<{ name: string; type: string }> },
+            fallbackTypedData.message,
+          );
+          const sig = ethers.Signature.from(sigHex);
+          options = {
+            ...options,
+            precomputedAttestation: {
+              expectedMerkleRoot: kcMerkleRoot,
+              authorAddress: publisherSigner.address,
+              signature: { r: ethers.getBytes(sig.r), vs: ethers.getBytes(sig.yParityAndS) },
               schemeVersion: AUTHOR_SCHEME_VERSION_V1,
-            });
-            const compactSig = await this.signAuthorAttestationAsPublisher(fallbackTypedData);
-            options = {
-              ...options,
-              precomputedAttestation: {
-                expectedMerkleRoot: kcMerkleRoot,
-                authorAddress: fallbackAuthorAddress,
-                signature: compactSig,
-                schemeVersion: AUTHOR_SCHEME_VERSION_V1,
-              },
-            };
-            this.log.info(ctx, `Minted publisher-fallback AuthorAttestation (author=${fallbackAuthorAddress})`);
-          }
+            },
+          };
+          this.log.info(ctx, `Minted publisher-fallback AuthorAttestation (author=${publisherSigner.address})`);
         } catch (err) {
           this.log.warn(
             ctx,

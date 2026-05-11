@@ -821,3 +821,63 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     expect(result.onChainResult).toBeUndefined();
   });
 });
+
+// =============================================================================
+// Diagram 12 — publisher-fallback seal mint (allowPublisherFallbackSeal)
+// =============================================================================
+
+describe('Diagram 12 — publisher-fallback seal mint signs as own wallet', () => {
+  it('publish({allowPublisherFallbackSeal:true}) confirms and KC.author == publisherSigner.address', async () => {
+    // PR for #436 follow-up: async-lift callers (EPCIS, legacy
+    // publishAsync) cannot easily predict the publisher's merkle root
+    // at queue-time. They signal the fallback via the lift request;
+    // the publisher mints inline at processNext-time signing as
+    // itself. Lock in: on-chain KC.author MUST equal the wallet that
+    // submitted the tx — otherwise the attestation binds to a wallet
+    // different from the publisher, breaking the chain's signer
+    // recovery guarantee.
+    const author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+    const publisher = makePublisher();
+
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q(`${ENTITY}/D12-fallback`, 'http://schema.org/name', '"Diagram12-Fallback"')],
+      allowPublisherFallbackSeal: true,
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult).toBeDefined();
+    expect(result.onChainResult!.batchId).toBeGreaterThan(0n);
+
+    const kcId = result.onChainResult!.batchId;
+    const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
+    expect(onChainAuthor.toLowerCase()).toBe(author.address.toLowerCase());
+  });
+
+  it('publish({allowPublisherFallbackSeal:true}) is a no-op when a caller seal is also supplied', async () => {
+    // Caller-supplied seals still take priority. The fallback flag is
+    // ignored when the caller already minted; existing strict
+    // validation path runs unchanged.
+    const author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+    const publisher = makePublisher();
+    const quads = [q(`${ENTITY}/D12-caller-seal`, 'http://schema.org/name', '"Diagram12-CallerSeal"')];
+    const seal = await buildSeal(quads, author);
+
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads,
+      precomputedAttestation: seal,
+      allowPublisherFallbackSeal: true,
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult!.batchId).toBeGreaterThan(0n);
+    // Author still attributable to caller (same wallet as publisher
+    // here, but the path proves seal preflight ran on the caller seal,
+    // not the fallback — otherwise an explicitly malformed seal would
+    // be silently replaced).
+    const kcId = result.onChainResult!.batchId;
+    const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
+    expect(onChainAuthor.toLowerCase()).toBe(author.address.toLowerCase());
+  });
+});

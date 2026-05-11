@@ -284,23 +284,51 @@ describe('publishJsonLd', () => {
     if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(false);
   }, 15000);
 
-  it('async publish always signals allowPublisherFallbackSeal — V10 readiness is checked at processNext-time, not lift-enqueue-time', async () => {
-    // Codex round-3 on #451: Snapshotting readiness at lift-enqueue
-    // time misses jobs queued before the context graph was registered
-    // or before the adapter became V10-ready. Lift jobs persist; the
-    // publisher re-checks live V10 conditions at processNext-time
-    // (chainId, kav10Address, publisherSigner all resolved) before
-    // minting. On non-V10 chains the fallback simply doesn't fire —
-    // covered by Diagram 12 e2e tests. So the agent always authorizes
-    // fallback at the lift-request level.
+  it('async publish attaches a seal to the LiftRequest with merkleRoot == canonicalPublishPayload(resolved slice)', async () => {
+    // Architectural pivot from PR #451 round-4 follow-up: the agent
+    // canonicalizes the resolved workspace slice at enqueue time and
+    // signs the merkle, so KC.author proves a SPECIFIC wallet attested
+    // to THIS data — not "publisher said so." The publisher consumes
+    // the seal verbatim at processNext-time after verifying parity.
+    const { agent, store } = await createAgent('AsyncSealParityBot');
+    await agent.createContextGraph({ id: 'async-seal-parity', name: 'AsyncSealParity', description: '' });
+    await agent.registerContextGraph('async-seal-parity');
+    const root = 'http://example.org/AsyncSealParityEntity';
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-seal-parity',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': root,
+          '@type': 'Thing',
+          'name': 'Async Seal Parity',
+        },
+      },
+      { localOnly: true },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    const seal = job?.request.seal;
+    expect(seal).toBeDefined();
+    expect(seal?.merkleRoot).toMatch(/^0x[0-9a-f]{64}$/i);
+    expect(seal?.authorAddress).toMatch(/^0x[0-9a-f]{40}$/i);
+    expect(seal?.signature.r).toMatch(/^0x[0-9a-f]{64}$/i);
+    expect(seal?.signature.vs).toMatch(/^0x[0-9a-f]{64}$/i);
+    expect(seal?.schemeVersion).toBe(1);
+  }, 30_000);
+
+  it('async publish on a non-V10 chain enqueues without a seal (no on-chain publish to seal for)', async () => {
+    // Under the seal-at-enqueue model, the agent only builds a seal
+    // when the chain reports V10 readiness AND the CG has an on-chain
+    // numeric id. On a non-V10 environment the on-chain branch is a
+    // no-op anyway, so omitting the seal is correct — the publisher
+    // takes the tentative-only path and never touches KAv10.
     const { agent, store } = await createAgent('AsyncSealNonV10Bot');
     await agent.createContextGraph({ id: 'async-seal-non-v10', name: 'AsyncSealNonV10', description: '' });
     await agent.registerContextGraph('async-seal-non-v10');
 
-    // Even with the adapter reporting !isV10Ready at lift-enqueue-time,
-    // the flag MUST be set: a later run on a fully V10-ready chain
-    // (e.g. after CG registration or adapter swap-in) must still be
-    // eligible for mode-(a) fallback.
     (agent as unknown as { chain: { isV10Ready: () => boolean } }).chain.isV10Ready = () => false;
 
     const { captureID } = await agent.publishAsync(
@@ -318,10 +346,15 @@ describe('publishJsonLd', () => {
 
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
     const job = await asyncPublisher.getStatus(captureID);
-    expect(job?.request.allowPublisherFallbackSeal).toBe(true);
+    expect(job?.request.seal).toBeUndefined();
   }, 30_000);
 
-  it('async publish on V10 chain signals allowPublisherFallbackSeal on the lift request', async () => {
+  it('async publish on V10 chain attaches a seal (no fallback needed)', async () => {
+    // New semantics: when the chain is V10-ready and the CG is
+    // registered, the agent signs the canonical merkle at enqueue
+    // time and attaches the seal to the LiftRequest. The fallback
+    // flag is then `false` because the publisher consumes the seal
+    // verbatim — no inline mint-and-pray at processNext-time.
     const { agent, store } = await createAgent('AsyncSealBot');
     await agent.createContextGraph({ id: 'async-seal', name: 'AsyncSeal', description: '' });
     await agent.registerContextGraph('async-seal');
@@ -342,10 +375,11 @@ describe('publishJsonLd', () => {
 
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
     const job = await asyncPublisher.getStatus(captureID);
-    expect(job?.request.allowPublisherFallbackSeal).toBe(true);
+    expect(job?.request.seal).toBeDefined();
+    expect(job?.request.seal?.merkleRoot).toMatch(/^0x[0-9a-f]{64}$/i);
   }, 30_000);
 
-  it('async publish for private-only content on V10 chain still signals fallback (mirrors EPCIS capture path)', async () => {
+  it('async publish for private-only content on V10 chain attaches a seal (mirrors EPCIS capture path)', async () => {
     const { agent, store } = await createAgent('AsyncSealPrivBot');
     await agent.createContextGraph({ id: 'async-seal-priv', name: 'AsyncSealPriv', description: '' });
     await agent.registerContextGraph('async-seal-priv');
@@ -364,7 +398,7 @@ describe('publishJsonLd', () => {
 
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
     const job = await asyncPublisher.getStatus(captureID);
-    expect(job?.request.allowPublisherFallbackSeal).toBe(true);
+    expect(job?.request.seal).toBeDefined();
   }, 30_000);
 
   it('async publish records and resolves subGraphName for staged public and private data', async () => {

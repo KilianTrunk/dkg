@@ -382,14 +382,6 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
     const authorityType =
       parsed.authorityType ?? parsed.authority?.type ?? "owner";
     const proofRef = authorityProofRef ?? parsed.authority?.proofRef;
-    // Strict boolean check — `Boolean("false")` is `true`, so a client
-    // payload of `"false"` or `1` would silently flip on-chain
-    // authorship to publisher-fallback. Treat any non-boolean as
-    // unset rather than coerce.
-    const allowPublisherFallbackSeal =
-      typeof parsed.allowPublisherFallbackSeal === 'boolean'
-        ? parsed.allowPublisherFallbackSeal
-        : undefined;
     if (
       !contextGraphId ||
       !shareOperationId ||
@@ -413,9 +405,6 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
       transitionType,
       authority: { type: authorityType, proofRef },
       ...(priorVersion ? { priorVersion } : {}),
-      ...(allowPublisherFallbackSeal !== undefined
-        ? { allowPublisherFallbackSeal }
-        : {}),
     } as any);
     return jsonResponse(res, 200, {
       jobId,

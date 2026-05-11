@@ -121,8 +121,43 @@ export function mapLiftRequestToPublishOptions(input: LiftPublishMappingInput): 
     onPhase: input.resolved.onPhase,
     receiverSignatureProvider: input.resolved.receiverSignatureProvider,
     publishContextGraphId: input.resolved.publishContextGraphId,
-    allowPublisherFallbackSeal: input.request.allowPublisherFallbackSeal,
+    // Lift-time author seal → publisher's `precomputedAttestation`.
+    // The publisher's SEAL INTEGRITY PREFLIGHT recomputes the merkle
+    // from the resolved slice and compares against this — drift kills
+    // the job loudly instead of silently downgrading.
+    ...(input.request.seal !== undefined
+      ? { precomputedAttestation: liftSealToPrecomputedAttestation(input.request.seal) }
+      : {}),
   };
+}
+
+function liftSealToPrecomputedAttestation(seal: NonNullable<LiftRequest['seal']>): {
+  expectedMerkleRoot: Uint8Array;
+  authorAddress: string;
+  signature: { r: Uint8Array; vs: Uint8Array };
+  schemeVersion: number;
+} {
+  return {
+    expectedMerkleRoot: hexToBytes(seal.merkleRoot),
+    authorAddress: seal.authorAddress,
+    signature: {
+      r: hexToBytes(seal.signature.r),
+      vs: hexToBytes(seal.signature.vs),
+    },
+    schemeVersion: seal.schemeVersion,
+  };
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+  if (clean.length % 2 !== 0) {
+    throw new Error(`Invalid hex string length: ${hex}`);
+  }
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
 }
 
 export function prepareAsyncPublishPayload(input: LiftPublishMappingInput): AsyncPreparedPublishPayload {

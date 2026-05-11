@@ -31,9 +31,13 @@ import {
   ACKCollector, StorageACKHandler,
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
   computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
+  canonicalPublishPayload,
+  resolveLiftWorkspaceSlice,
+  validateLiftPublishPayload,
   TripleStoreAsyncLiftPublisher,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
+  type LiftRequest, type LiftRequestAuthorSeal,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
 import {
@@ -3754,16 +3758,14 @@ export class DKGAgent {
       }
     }
 
-    // Always authorize publisher-fallback seal at lift-enqueue time.
-    // The publisher re-checks live V10 conditions at processNext-time
-    // (chainId, kav10Address, publisherSigner all resolved) before
-    // minting — on non-V10 chains the fallback simply doesn't fire.
-    // Snapshotting an enqueue-time readiness flag would miss jobs
-    // queued before the CG was registered or before the adapter
-    // became V10-ready, leaving them downgraded to the missing-seal
-    // path on the eventual on-chain publish.
-    const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
-    const captureID = await asyncPublisher.lift({
+    // Build the LiftRequest skeleton. We then resolve the workspace
+    // slice the publisher WILL see at processNext-time (same code path,
+    // `resolveLiftWorkspaceSlice`), compute the canonical merkle over
+    // it, and sign it here so the on-chain `KC.author` reflects an
+    // EIP-712 attestation produced BEFORE the publisher ever touches
+    // the data — eliminating "publisher signs as itself at the last
+    // moment" semantics.
+    const liftRequestDraft = {
       swmId: shareOperationId,
       shareOperationId,
       roots: partitioned.roots,
@@ -3775,7 +3777,14 @@ export class DKGAgent {
       subGraphName: opts?.subGraphName,
       accessPolicy: opts?.accessPolicy,
       allowedPeers: opts?.allowedPeers,
-      allowPublisherFallbackSeal: true,
+    } as const;
+
+    const seal = await this.buildAsyncLiftSeal(liftRequestDraft);
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
+    const captureID = await asyncPublisher.lift({
+      ...liftRequestDraft,
+      ...(seal !== undefined ? { seal } : {}),
     });
 
     if (!opts?.localOnly) {
@@ -3783,6 +3792,101 @@ export class DKGAgent {
     }
 
     return { captureID };
+  }
+
+  /**
+   * Resolve the workspace slice the publisher will see at processNext-time,
+   * canonicalize it via the shared `canonicalPublishPayload()` pipeline,
+   * and sign the resulting `kcMerkleRoot` so the publisher consumes a
+   * caller-attested seal rather than minting one as itself.
+   *
+   * Returns `undefined` on non-V10 chains (no `getEvmChainId` /
+   * `getKnowledgeAssetsV10Address` / on-chain CG ID); the publisher's
+   * on-chain branch is a no-op there, so a missing seal is fine.
+   *
+   * The author here is the publisher's own EOA (via
+   * `publisher.signAuthorAttestationAsPublisher`) — same wallet that
+   * the legacy fallback path used at processNext-time, so this is NOT a
+   * provenance regression vs the previous flow. The architectural win
+   * is that the seal is now produced BEFORE the publish, against the
+   * exact bytes the publisher will see, and the legacy inline mint-and-
+   * pray path has been removed entirely. Real per-event author keys
+   * (e.g. per-tenant wallets keyed off the EPCIS API token) plug in
+   * here later — replace the publisher-signer call with the tenant's
+   * signer.
+   */
+  private async buildAsyncLiftSeal(request: {
+    readonly contextGraphId: string;
+    readonly subGraphName?: string;
+    readonly shareOperationId: string;
+    readonly roots: readonly string[];
+    readonly namespace: string;
+    readonly scope: string;
+    readonly transitionType: LiftTransitionType;
+    readonly authority: LiftAuthorityProof;
+    readonly priorVersion?: string;
+    readonly accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
+    readonly allowedPeers?: readonly string[];
+    readonly swmId: string;
+  }): Promise<LiftRequestAuthorSeal | undefined> {
+    if (this.chain.isV10Ready?.() !== true) return undefined;
+    if (typeof this.chain.getEvmChainId !== 'function') return undefined;
+    if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+
+    const onChainId = await this.getContextGraphOnChainId(request.contextGraphId);
+    if (onChainId == null) return undefined;
+
+    const chainId = await this.chain.getEvmChainId();
+    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    if (chainId === undefined || kav10Address === undefined) return undefined;
+
+    const graphManager = new GraphManager(this.store);
+    const resolved = await resolveLiftWorkspaceSlice({
+      request,
+      store: this.store,
+      graphManager,
+    });
+
+    // Apply the same lift-validation canonicalization the publisher
+    // runs at processNext-time. This rewrites every quad's
+    // subject/object from the request's raw root URIs (e.g.
+    // `urn:uuid:…`) to the per-CG canonical root form (e.g.
+    // `dkg:<cgId>:<namespace>:<scope>/<rootSuffix>-<skolemHash>`).
+    // Without this, the agent's merkle is computed over urn:uuid
+    // subjects but the publisher's is over canonical subjects —
+    // SEAL INTEGRITY PREFLIGHT then rejects with merkle drift.
+    const validated = validateLiftPublishPayload({
+      request: { ...request, authority: request.authority } as LiftRequest,
+      resolved,
+    });
+
+    const canonical = canonicalPublishPayload(
+      validated.resolved.quads,
+      validated.resolved.privateQuads ?? [],
+    );
+
+    const authorAddress = await this.publisher.publisherFallbackAuthorAddress();
+    if (!authorAddress) return undefined;
+
+    const typedData = buildAuthorAttestationTypedData({
+      chainId,
+      kav10Address,
+      contextGraphId: BigInt(onChainId),
+      merkleRoot: canonical.kcMerkleRoot,
+      authorAddress,
+      schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    });
+    const sig = await this.publisher.signAuthorAttestationAsPublisher(typedData);
+
+    return {
+      merkleRoot: ethers.hexlify(canonical.kcMerkleRoot) as `0x${string}`,
+      authorAddress: authorAddress as `0x${string}`,
+      signature: {
+        r: ethers.hexlify(sig.r) as `0x${string}`,
+        vs: ethers.hexlify(sig.vs) as `0x${string}`,
+      },
+      schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    };
   }
 
   private async _publish(

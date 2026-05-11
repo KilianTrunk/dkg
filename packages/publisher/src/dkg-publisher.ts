@@ -6,6 +6,7 @@ import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublis
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import type { Publisher, PublishOptions, PublishResult, KAManifestEntry, PhaseCallback } from './publisher.js';
 import { autoPartition } from './auto-partition.js';
+import { canonicalPublishPayload } from './canonical-publish-payload.js';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
 import {
@@ -1541,7 +1542,10 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:ensureContextGraph', 'end');
 
     onPhase?.('prepare:partition', 'start');
-    const kaMap = autoPartition(quads);
+    // Shared canonicalization — same code path the agent runs at lift-
+    // enqueue time. Guarantees the seal's merkle matches what we
+    // submit on-chain (parity by construction, not by convention).
+    const canonical = canonicalPublishPayload(quads, privateQuads);
     onPhase?.('prepare:partition', 'end');
 
     const manifestEntries: KAManifestEntry[] = [];
@@ -1549,35 +1553,27 @@ export class DKGPublisher implements Publisher {
 
     onPhase?.('prepare:manifest', 'start');
     let tokenCounter = 1n;
-    for (const [rootEntity, publicQuads] of kaMap) {
-      const entityPrivateQuads = privateQuads.filter(
-        (q) => q.subject === rootEntity || q.subject.startsWith(rootEntity + '/.well-known/genid/'),
-      );
-
+    for (const entry of canonical.manifestEntries) {
       manifestEntries.push({
         tokenId: tokenCounter,
-        rootEntity,
-        privateMerkleRoot: entityPrivateQuads.length > 0
-          ? computePrivateRoot(entityPrivateQuads)
-          : undefined,
-        privateTripleCount: entityPrivateQuads.length,
+        rootEntity: entry.rootEntity,
+        privateMerkleRoot: entry.privateMerkleRoot,
+        privateTripleCount: entry.privateTripleCount,
       });
 
       kaMetadata.push({
-        rootEntity,
+        rootEntity: entry.rootEntity,
         kcUal: '',
         tokenId: tokenCounter,
-        publicTripleCount: publicQuads.length,
-        privateTripleCount: entityPrivateQuads.length,
-        privateMerkleRoot: entityPrivateQuads.length > 0
-          ? computePrivateRoot(entityPrivateQuads)
-          : undefined,
+        publicTripleCount: entry.publicTripleCount,
+        privateTripleCount: entry.privateTripleCount,
+        privateMerkleRoot: entry.privateMerkleRoot,
       });
 
       tokenCounter++;
     }
 
-    const allSkolemizedQuads = [...kaMap.values()].flat();
+    const allSkolemizedQuads = canonical.skolemizedPublicQuads;
     onPhase?.('prepare:manifest', 'end');
 
     onPhase?.('prepare:validate', 'start');
@@ -1590,10 +1586,8 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:validate', 'end');
 
     onPhase?.('prepare:merkle', 'start');
-    const privateRoots = manifestEntries
-      .map(m => m.privateMerkleRoot)
-      .filter((r): r is Uint8Array => r != null);
-    const kcMerkleRoot = computeFlatKCRoot(allSkolemizedQuads, privateRoots);
+    const privateRoots = canonical.privateRoots;
+    const kcMerkleRoot = canonical.kcMerkleRoot;
     const kcMerkleLeafCount = computeFlatKCMerkleLeafCountV10(allSkolemizedQuads, privateRoots);
     if (kcMerkleLeafCount > 0xffffffff) {
       throw new Error(`V10 merkleLeafCount exceeds uint32: ${kcMerkleLeafCount}`);
@@ -1611,13 +1605,14 @@ export class DKGPublisher implements Publisher {
     this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store`);
     await this.store.insert(normalizedQuads);
 
-    // Store private quads
-    for (const [rootEntity] of kaMap) {
+    // Store private quads — same per-root partitioning the shared
+    // canonical pipeline used, so what we persist matches what we sealed.
+    for (const entry of canonical.manifestEntries) {
       const entityPrivateQuads = privateQuads.filter(
-        (q) => q.subject === rootEntity || q.subject.startsWith(rootEntity + '/.well-known/genid/'),
+        (q) => q.subject === entry.rootEntity || q.subject.startsWith(entry.rootEntity + '/.well-known/genid/'),
       );
       if (entityPrivateQuads.length > 0) {
-        await this.privateStore.storePrivateTriples(contextGraphId, rootEntity, entityPrivateQuads, options.subGraphName);
+        await this.privateStore.storePrivateTriples(contextGraphId, entry.rootEntity, entityPrivateQuads, options.subGraphName);
       }
     }
 
@@ -1859,47 +1854,6 @@ export class DKGPublisher implements Publisher {
     } else {
       const tokenAmount = precomputedTokenAmount;
       usedV10Path = true;
-      // Publisher-fallback seal mint (RFC-001 §4 mode (a)) — sign as
-      // self over the merkle we just computed, using the already-
-      // resolved signer for THIS publish (cg-aware). Skipping the
-      // resolver round-trip guarantees `KC.author == tx submitter`
-      // regardless of how the deployment configures publisherAddressResolver.
-      // Fallback was explicitly requested by the caller, so signing
-      // failures here are deterministic configuration/signer problems
-      // — surface them as hard rejections rather than degrading into
-      // a retryable tentative path (Codex round-4).
-      if (
-        !options.precomputedAttestation
-        && options.allowPublisherFallbackSeal
-        && v10ChainId !== undefined
-        && v10KavAddress !== undefined
-        && publisherSigner !== undefined
-      ) {
-        const fallbackTypedData = buildAuthorAttestationTypedData({
-          chainId: v10ChainId,
-          kav10Address: v10KavAddress,
-          contextGraphId: v10CgId,
-          merkleRoot: kcMerkleRoot,
-          authorAddress: publisherSigner.address,
-          schemeVersion: AUTHOR_SCHEME_VERSION_V1,
-        });
-        const sigHex = await publisherSigner.signTypedData(
-          fallbackTypedData.domain,
-          fallbackTypedData.types as { [k: string]: Array<{ name: string; type: string }> },
-          fallbackTypedData.message,
-        );
-        const sig = ethers.Signature.from(sigHex);
-        options = {
-          ...options,
-          precomputedAttestation: {
-            expectedMerkleRoot: kcMerkleRoot,
-            authorAddress: publisherSigner.address,
-            signature: { r: ethers.getBytes(sig.r), vs: ethers.getBytes(sig.yParityAndS) },
-            schemeVersion: AUTHOR_SCHEME_VERSION_V1,
-          },
-        };
-        this.log.info(ctx, `Minted publisher-fallback AuthorAttestation (author=${publisherSigner.address})`);
-      }
 
       // ─────────────────────────────────────────────────────────────
       // SEAL INTEGRITY PREFLIGHT (Round 4 review §12)

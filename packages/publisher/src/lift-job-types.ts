@@ -18,6 +18,22 @@ export interface LiftAuthorityProof {
 
 export type LiftAccessPolicy = 'public' | 'ownerOnly' | 'allowList';
 
+/**
+ * EIP-712 AuthorAttestation seal computed at lift-enqueue time over
+ * the canonical merkle root the publisher will submit on-chain.
+ * `merkleRoot` MUST match what `canonicalPublishPayload()` computes
+ * for the resolved workspace slice at processNext-time, otherwise
+ * the publisher rejects the job with a merkle-drift error.
+ *
+ * Hex-encoded for safe JSON persistence in the lift queue store.
+ */
+export interface LiftRequestAuthorSeal {
+  readonly merkleRoot: LiftJobHex;
+  readonly authorAddress: LiftJobHex;
+  readonly signature: { readonly r: LiftJobHex; readonly vs: LiftJobHex };
+  readonly schemeVersion: number;
+}
+
 export interface LiftRequest {
   readonly swmId: string;
   readonly shareOperationId: string;
@@ -31,8 +47,14 @@ export interface LiftRequest {
   readonly subGraphName?: string;
   readonly accessPolicy?: LiftAccessPolicy;
   readonly allowedPeers?: readonly string[];
-  /** When set, the publisher mints the seal as itself at processNext-time (mode (a)). */
-  readonly allowPublisherFallbackSeal?: boolean;
+  /**
+   * Author attestation seal computed by the agent at enqueue time.
+   * When present, the publisher consumes it verbatim at processNext-time
+   * (after verifying its merkleRoot matches the publisher's canonical
+   * recompute). When absent on a V10 chain, the on-chain publish fails
+   * loud — there is no implicit fallback to publisher-as-author.
+   */
+  readonly seal?: LiftRequestAuthorSeal;
 }
 
 export const LIFT_REQUEST_IMMUTABLE_FIELDS = [
@@ -48,7 +70,7 @@ export const LIFT_REQUEST_IMMUTABLE_FIELDS = [
   'subGraphName',
   'accessPolicy',
   'allowedPeers',
-  'allowPublisherFallbackSeal',
+  'seal',
 ] as const;
 
 export interface LiftJobTimestamps {

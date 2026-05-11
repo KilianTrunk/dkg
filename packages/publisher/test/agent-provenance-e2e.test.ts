@@ -822,90 +822,10 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
   });
 });
 
-// =============================================================================
-// Diagram 12 — publisher-fallback seal mint (allowPublisherFallbackSeal)
-// =============================================================================
-
-describe('Diagram 12 — publisher-fallback seal mint signs as own wallet', () => {
-  it('publish({allowPublisherFallbackSeal:true}) confirms and KC.author == publisherSigner.address', async () => {
-    // PR for #436 follow-up: async-lift callers (EPCIS, legacy
-    // publishAsync) cannot easily predict the publisher's merkle root
-    // at queue-time. They signal the fallback via the lift request;
-    // the publisher mints inline at processNext-time signing as
-    // itself. Lock in: on-chain KC.author MUST equal the wallet that
-    // submitted the tx — otherwise the attestation binds to a wallet
-    // different from the publisher, breaking the chain's signer
-    // recovery guarantee.
-    const author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
-    const publisher = makePublisher();
-
-    const result = await publisher.publish({
-      contextGraphId: CONTEXT_GRAPH,
-      quads: [q(`${ENTITY}/D12-fallback`, 'http://schema.org/name', '"Diagram12-Fallback"')],
-      allowPublisherFallbackSeal: true,
-    });
-
-    expect(result.status).toBe('confirmed');
-    expect(result.onChainResult).toBeDefined();
-    expect(result.onChainResult!.batchId).toBeGreaterThan(0n);
-
-    const kcId = result.onChainResult!.batchId;
-    const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
-    expect(onChainAuthor.toLowerCase()).toBe(author.address.toLowerCase());
-  });
-
-  it('publish({allowPublisherFallbackSeal:true}) is a no-op when a caller seal is also supplied', async () => {
-    // Use a DISTINCT wallet for the author so the assertion actually
-    // distinguishes "caller seal honoured" from "fallback overwrote
-    // it" — if the fallback path ignored precomputedAttestation, the
-    // on-chain author would be the publisher's CORE_OP address, not
-    // FIXTURE_AUTHOR_KEY.
-    const author = new ethers.Wallet(FIXTURE_AUTHOR_KEY);
-    const publisher = makePublisher();
-    const quads = [q(`${ENTITY}/D12-caller-seal`, 'http://schema.org/name', '"Diagram12-CallerSeal"')];
-    const seal = await buildSeal(quads, author);
-
-    const result = await publisher.publish({
-      contextGraphId: CONTEXT_GRAPH,
-      quads,
-      precomputedAttestation: seal,
-      allowPublisherFallbackSeal: true,
-    });
-
-    expect(result.status).toBe('confirmed');
-    expect(result.onChainResult!.batchId).toBeGreaterThan(0n);
-
-    const kcId = result.onChainResult!.batchId;
-    const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
-    expect(onChainAuthor.toLowerCase()).toBe(author.address.toLowerCase());
-    expect(onChainAuthor.toLowerCase()).not.toBe(new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address.toLowerCase());
-  });
-
-  it('publish({allowPublisherFallbackSeal:true}) fails fast when signTypedData throws', async () => {
-    // Codex round-4 on #451: a deterministic signer/configuration
-    // problem must NOT degrade into a retryable tentative result.
-    // When fallback was explicitly requested and the publisher cannot
-    // mint, the publish must reject with the original signing error
-    // so the async queue surfaces it as a hard failure.
-    const publisher = makePublisher();
-    const realGet = (publisher as unknown as { getPublisherSigner: (a?: string) => Promise<unknown> })
-      .getPublisherSigner.bind(publisher);
-    (publisher as unknown as { getPublisherSigner: (a?: string) => Promise<unknown> }).getPublisherSigner =
-      async (address?: string) => {
-        const real = await realGet(address) as { signTypedData?: unknown } | undefined;
-        if (!real) return real;
-        return {
-          ...real,
-          signTypedData: async () => {
-            throw new Error('publisher signer offline');
-          },
-        };
-      };
-
-    await expect(publisher.publish({
-      contextGraphId: CONTEXT_GRAPH,
-      quads: [q(`${ENTITY}/D12-fail-fast`, 'http://schema.org/name', '"Diagram12-FailFast"')],
-      allowPublisherFallbackSeal: true,
-    })).rejects.toThrow(/publisher signer offline/);
-  });
-});
+// Publisher-fallback seal mint (mode (a) at processNext-time) was removed
+// when the seal-at-enqueue architecture landed — async-lift callers
+// attach their own seal via `LiftRequest.seal`, so the publisher no
+// longer needs to mint a fallback at all. The "if you don't supply a
+// seal on V10, the publish fails" semantics are covered by the existing
+// `rejects on-chain publish without precomputedAttestation` test
+// earlier in this file.

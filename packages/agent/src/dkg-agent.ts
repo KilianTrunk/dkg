@@ -138,6 +138,30 @@ export interface PublishAsyncOpts extends PublishOpts {
   transitionType?: LiftTransitionType;
   authority?: LiftAuthorityProof;
   localOnly?: boolean;
+  /**
+   * Caller-supplied author wallet for the EIP-712 AuthorAttestation seal.
+   * When provided, the agent signs the canonical kcMerkleRoot with this
+   * wallet and the on-chain `KC.author` reflects this address — the
+   * publisher's own EOA never enters the seal. Use this for real
+   * per-tenant / per-event author attribution (e.g. operator-managed
+   * tenant key mapped from the EPCIS HTTP API token).
+   *
+   * When omitted, the agent falls back to signing via the publisher's
+   * own wallet (legacy behaviour, same as the removed
+   * `allowPublisherFallbackSeal` mode) so non-V10-aware callers still
+   * publish without changes.
+   *
+   * The wallet only needs `signTypedData(domain, types, value)` — any
+   * `ethers.Signer` (Wallet, JsonRpcSigner, HSM-backed signer) works.
+   */
+  authorWallet?: {
+    readonly address: string;
+    signTypedData(
+      domain: ethers.TypedDataDomain,
+      types: Record<string, Array<{ name: string; type: string }>>,
+      value: Record<string, unknown>,
+    ): Promise<string>;
+  };
 }
 
 export interface PublishAsyncQuadEnvelope {
@@ -3779,7 +3803,7 @@ export class DKGAgent {
       allowedPeers: opts?.allowedPeers,
     } as const;
 
-    const seal = await this.buildAsyncLiftSeal(liftRequestDraft);
+    const seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorWallet);
 
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
     const captureID = await asyncPublisher.lift({
@@ -3815,20 +3839,23 @@ export class DKGAgent {
    * here later — replace the publisher-signer call with the tenant's
    * signer.
    */
-  private async buildAsyncLiftSeal(request: {
-    readonly contextGraphId: string;
-    readonly subGraphName?: string;
-    readonly shareOperationId: string;
-    readonly roots: readonly string[];
-    readonly namespace: string;
-    readonly scope: string;
-    readonly transitionType: LiftTransitionType;
-    readonly authority: LiftAuthorityProof;
-    readonly priorVersion?: string;
-    readonly accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
-    readonly allowedPeers?: readonly string[];
-    readonly swmId: string;
-  }): Promise<LiftRequestAuthorSeal | undefined> {
+  private async buildAsyncLiftSeal(
+    request: {
+      readonly contextGraphId: string;
+      readonly subGraphName?: string;
+      readonly shareOperationId: string;
+      readonly roots: readonly string[];
+      readonly namespace: string;
+      readonly scope: string;
+      readonly transitionType: LiftTransitionType;
+      readonly authority: LiftAuthorityProof;
+      readonly priorVersion?: string;
+      readonly accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
+      readonly allowedPeers?: readonly string[];
+      readonly swmId: string;
+    },
+    authorWallet?: PublishAsyncOpts['authorWallet'],
+  ): Promise<LiftRequestAuthorSeal | undefined> {
     if (this.chain.isV10Ready?.() !== true) return undefined;
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
     if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
@@ -3865,7 +3892,14 @@ export class DKGAgent {
       validated.resolved.privateQuads ?? [],
     );
 
-    const authorAddress = await this.publisher.publisherFallbackAuthorAddress();
+    // Caller-supplied author wallet wins. Falls back to publisher's own
+    // wallet only when no `authorWallet` is supplied — that legacy path
+    // keeps callers that haven't migrated yet (e.g. EPCIS HTTP capture
+    // without a tenant-key mapping) working, but it makes author ==
+    // publisher, which is exactly the separation gap we're closing.
+    const authorAddress = authorWallet
+      ? authorWallet.address
+      : await this.publisher.publisherFallbackAuthorAddress();
     if (!authorAddress) return undefined;
 
     const typedData = buildAuthorAttestationTypedData({
@@ -3876,14 +3910,30 @@ export class DKGAgent {
       authorAddress,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
     });
-    const sig = await this.publisher.signAuthorAttestationAsPublisher(typedData);
+
+    let r: Uint8Array;
+    let vs: Uint8Array;
+    if (authorWallet) {
+      const sigHex = await authorWallet.signTypedData(
+        typedData.domain,
+        typedData.types as Record<string, Array<{ name: string; type: string }>>,
+        typedData.message,
+      );
+      const sig = ethers.Signature.from(sigHex);
+      r = ethers.getBytes(sig.r);
+      vs = ethers.getBytes(sig.yParityAndS);
+    } else {
+      const sig = await this.publisher.signAuthorAttestationAsPublisher(typedData);
+      r = sig.r;
+      vs = sig.vs;
+    }
 
     return {
       merkleRoot: ethers.hexlify(canonical.kcMerkleRoot) as `0x${string}`,
       authorAddress: authorAddress as `0x${string}`,
       signature: {
-        r: ethers.hexlify(sig.r) as `0x${string}`,
-        vs: ethers.hexlify(sig.vs) as `0x${string}`,
+        r: ethers.hexlify(r) as `0x${string}`,
+        vs: ethers.hexlify(vs) as `0x${string}`,
       },
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
     };

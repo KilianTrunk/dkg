@@ -297,4 +297,53 @@ describe('mapLiftRequestToPublishOptions', () => {
 
     expect(options.contextGraphId).toBe('music-social');
   });
+
+  it('threads request.seal byte-for-byte into PublishOptions.precomputedAttestation', () => {
+    // This is the linchpin of the agent-side seal model: a seal
+    // computed and signed by the AGENT (any wallet — not necessarily
+    // the publisher's) must land in the publisher's
+    // `precomputedAttestation` slot WITHOUT modification, so the
+    // existing SEAL INTEGRITY PREFLIGHT validates it as-is. Hex →
+    // bytes is the only conversion this layer applies.
+    const customAuthor = '0xAaaAAaaaAaaaaaAAAaAaaaaaAAAaaaaAaAaAAaaA' as `0x${string}`;
+    const merkleRootHex = ('0x' + 'aa'.repeat(32)) as `0x${string}`;
+    const sigR = ('0x' + 'bb'.repeat(32)) as `0x${string}`;
+    const sigVs = ('0x' + 'cc'.repeat(32)) as `0x${string}`;
+
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      request: {
+        ...baseInput().request,
+        seal: {
+          merkleRoot: merkleRootHex,
+          authorAddress: customAuthor,
+          signature: { r: sigR, vs: sigVs },
+          schemeVersion: 1,
+        },
+      },
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: '12D3KooWPublisher',
+      },
+    });
+
+    expect(options.precomputedAttestation).toBeDefined();
+    const seal = options.precomputedAttestation!;
+    expect(seal.authorAddress).toBe(customAuthor);
+    expect(seal.schemeVersion).toBe(1);
+    expect(seal.expectedMerkleRoot).toEqual(new Uint8Array(32).fill(0xaa));
+    expect(seal.signature.r).toEqual(new Uint8Array(32).fill(0xbb));
+    expect(seal.signature.vs).toEqual(new Uint8Array(32).fill(0xcc));
+  });
+
+  it('does NOT set precomputedAttestation when request.seal is absent', () => {
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: '12D3KooWPublisher',
+      },
+    });
+    expect(options.precomputedAttestation).toBeUndefined();
+  });
 });

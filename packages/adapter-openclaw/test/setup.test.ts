@@ -3510,6 +3510,20 @@ describe('readWallets', () => {
     expect(readWallets()).toEqual([admin, ...wallets]);
   });
 
+  it('returns only operational wallets for legacy wallets.json arrays', () => {
+    const wallets = [
+      '0xBBBB000000000000000000000000000000000001',
+      '0xBBBB000000000000000000000000000000000002',
+      '0xBBBB000000000000000000000000000000000003',
+    ];
+    writeFileSync(
+      join(dkgHome, 'wallets.json'),
+      JSON.stringify(wallets.map(address => ({ address, privateKey: `key-${address}` }))),
+    );
+
+    expect(readWallets()).toEqual(wallets);
+  });
+
   it('deduplicates a malformed admin/operational overlap defensively', () => {
     const shared = '0xCCCC000000000000000000000000000000000001';
     const other = '0xCCCC000000000000000000000000000000000002';

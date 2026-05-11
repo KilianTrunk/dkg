@@ -9,6 +9,52 @@ export interface FaucetResult {
 const EXPECTED_FAUCET_TRANSFERS_PER_WALLET = 2;
 export const FAUCET_WALLETS_PER_REQUEST = 4;
 
+export interface FundableWalletEntryLike {
+  address?: unknown;
+}
+
+export interface FundableWalletConfigLike {
+  adminWallet?: FundableWalletEntryLike | null;
+  wallets?: unknown;
+}
+
+export type FundableWalletSource = FundableWalletConfigLike | unknown[];
+
+export function getFundableWalletAddresses(source: FundableWalletSource | null | undefined): string[] {
+  const walletList = Array.isArray(source)
+    ? source
+    : Array.isArray(source?.wallets)
+      ? source.wallets
+      : [];
+
+  const operationalAddresses: string[] = [];
+  for (const wallet of walletList) {
+    const address = (wallet as FundableWalletEntryLike | null | undefined)?.address;
+    if (typeof address !== 'string' || address.length === 0) continue;
+    operationalAddresses.push(address);
+  }
+  if (operationalAddresses.length === 0) return [];
+
+  const addresses: string[] = [];
+  const seen = new Set<string>();
+  const addAddress = (address: unknown) => {
+    if (typeof address !== 'string' || address.length === 0) return;
+    const key = address.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    addresses.push(address);
+  };
+
+  if (!Array.isArray(source)) {
+    addAddress(source?.adminWallet?.address);
+  }
+  for (const address of operationalAddresses) {
+    addAddress(address);
+  }
+
+  return addresses;
+}
+
 export async function requestFaucetFunding(
   faucetUrl: string,
   mode: string,

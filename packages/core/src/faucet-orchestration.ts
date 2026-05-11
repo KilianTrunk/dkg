@@ -25,7 +25,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveDkgConfigHome } from './dkg-home.js';
-import { FAUCET_WALLETS_PER_REQUEST, requestFaucetFunding } from './faucet.js';
+import { FAUCET_WALLETS_PER_REQUEST, getFundableWalletAddresses, requestFaucetFunding } from './faucet.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -67,41 +67,11 @@ export function readWallets(): string[] {
     warn('wallets.json is malformed or still being written — skipping');
     return [];
   }
-  // The daemon writes { adminWallet, wallets: [{ address, privateKey }] }.
-  // Include admin first so profile/key-management transactions have gas, then
-  // fall back to the legacy operational-only array shapes.
-  const walletList: any[] = Array.isArray(raw?.wallets) ? raw.wallets
-    : Array.isArray(raw) ? raw
-    : [];
-  const operationalAddresses: string[] = [];
-  const operationalSeen = new Set<string>();
-  for (const w of walletList) {
-    const address = w?.address;
-    if (typeof address !== 'string' || address.length === 0) continue;
-    const key = address.toLowerCase();
-    if (operationalSeen.has(key)) continue;
-    operationalSeen.add(key);
-    operationalAddresses.push(address);
-  }
-  if (operationalAddresses.length === 0) {
+  const addresses = getFundableWalletAddresses(raw);
+  if (addresses.length === 0) {
     warn('wallets.json has no operational wallets — skipping faucet funding');
     return [];
   }
-
-  const addresses: string[] = [];
-  const seen = new Set<string>();
-  const addAddress = (address: unknown) => {
-    if (typeof address !== 'string' || address.length === 0) return;
-    const key = address.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    addresses.push(address);
-  };
-  addAddress(raw?.adminWallet?.address);
-  for (const address of operationalAddresses) {
-    addAddress(address);
-  }
-
   if (addresses.length) {
     log(`Wallets: ${addresses.join(', ')}`);
   }

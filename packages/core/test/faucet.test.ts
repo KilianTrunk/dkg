@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { requestFaucetFunding } from '../src/faucet.js';
+import { getFundableWalletAddresses, requestFaucetFunding } from '../src/faucet.js';
 
 interface FetchCall {
   url: string | URL | Request;
@@ -21,6 +21,75 @@ function createTrackingFetch(status: number, body: unknown): { fetch: typeof glo
   };
   return { fetch: fn as typeof globalThis.fetch, calls };
 }
+
+describe('getFundableWalletAddresses', () => {
+  it('returns the admin wallet before operational wallets for the current shape', () => {
+    const result = getFundableWalletAddresses({
+      adminWallet: { address: '0xAdmin' },
+      wallets: [
+        { address: '0xWallet1' },
+        { address: '0xWallet2' },
+        { address: '0xWallet3' },
+      ],
+    });
+
+    expect(result).toEqual(['0xAdmin', '0xWallet1', '0xWallet2', '0xWallet3']);
+  });
+
+  it('returns only operational wallets for the legacy array shape', () => {
+    const result = getFundableWalletAddresses([
+      { address: '0xWallet1' },
+      { address: '0xWallet2' },
+    ]);
+
+    expect(result).toEqual(['0xWallet1', '0xWallet2']);
+  });
+
+  it('returns only operational wallets when adminWallet is missing', () => {
+    const result = getFundableWalletAddresses({
+      wallets: [
+        { address: '0xWallet1' },
+        { address: '0xWallet2' },
+      ],
+    });
+
+    expect(result).toEqual(['0xWallet1', '0xWallet2']);
+  });
+
+  it('deduplicates addresses case-insensitively with admin position winning', () => {
+    const result = getFundableWalletAddresses({
+      adminWallet: { address: '0xAdmin' },
+      wallets: [
+        { address: '0xadmin' },
+        { address: '0xWallet1' },
+        { address: '0xwallet1' },
+      ],
+    });
+
+    expect(result).toEqual(['0xAdmin', '0xWallet1']);
+  });
+
+  it('returns an empty list when there are no operational wallet addresses', () => {
+    expect(getFundableWalletAddresses({ adminWallet: { address: '0xAdmin' }, wallets: [] }))
+      .toEqual([]);
+    expect(getFundableWalletAddresses({ adminWallet: { address: '0xAdmin' } }))
+      .toEqual([]);
+  });
+
+  it('ignores malformed wallet address fields', () => {
+    const result = getFundableWalletAddresses({
+      adminWallet: { address: 123 },
+      wallets: [
+        { address: '' },
+        { address: null },
+        {},
+        { address: '0xWallet1' },
+      ],
+    });
+
+    expect(result).toEqual(['0xWallet1']);
+  });
+});
 
 describe('requestFaucetFunding', () => {
   it('returns funded amounts on success', async () => {

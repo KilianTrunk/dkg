@@ -19,7 +19,6 @@ import { validatePublishRequest } from './validation.js';
 import {
   generateTentativeMetadata,
   generateConfirmedFullMetadata,
-  generateShareMetadata,
   generateOwnershipQuads,
   generateAuthorshipProof,
   generateShareTransitionMetadata,
@@ -891,17 +890,7 @@ export class DKGPublisher implements Publisher {
     await this.store.insert(normalized);
 
     const rootEntities = manifestEntries.map((m) => m.rootEntity);
-    const metaQuads = generateShareMetadata(
-      {
-        shareOperationId,
-        contextGraphId,
-        rootEntities,
-        publisherPeerId: options.publisherPeerId,
-        timestamp: new Date(),
-      },
-      swmMetaGraph,
-    );
-    await this.store.insert(metaQuads);
+    const operationTimestamp = new Date();
     await storeWorkspaceOperationPublicQuads({
       store: this.store,
       graphManager: this.graphManager,
@@ -911,6 +900,7 @@ export class DKGPublisher implements Publisher {
       quads: normalized,
       publisherPeerId: options.publisherPeerId,
       subGraphName: options.subGraphName,
+      timestamp: operationTimestamp,
     });
 
     if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {
@@ -3233,11 +3223,7 @@ export class DKGPublisher implements Publisher {
     // _shareImpl and the remote SharedMemoryHandler both produce, so the
     // promoting node and replicas converge on identical ownership state.
     if (opts?.publisherPeerId) {
-      const metaQuads = generateShareMetadata(
-        { shareOperationId: operationId, contextGraphId, rootEntities: effectiveRoots, publisherPeerId: opts.publisherPeerId, timestamp: new Date() },
-        swmMetaGraph,
-      );
-      await this.store.insert(metaQuads);
+      const operationTimestamp = new Date();
       await storeWorkspaceOperationPublicQuads({
         store: this.store,
         graphManager: this.graphManager,
@@ -3247,6 +3233,7 @@ export class DKGPublisher implements Publisher {
         quads: swmQuads,
         publisherPeerId: opts.publisherPeerId,
         subGraphName: opts.subGraphName,
+        timestamp: operationTimestamp,
       });
 
       if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {

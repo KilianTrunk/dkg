@@ -3844,7 +3844,7 @@ describe('runSetup Step 5 — faucet funding', () => {
   });
 
   it('continues non-fatally when requestFaucetFunding throws an AbortError (timeout path)', async () => {
-    // `requestFaucetFunding` in core wraps fetch with AbortSignal.timeout(30_000).
+    // `requestFaucetFunding` in core wraps fetch with AbortSignal.timeout(...).
     // A triggered timeout surfaces as a DOMException with name "TimeoutError"
     // (or AbortError on some runtimes). Cover both.
     const timeoutErr = new DOMException('The operation was aborted due to timeout', 'TimeoutError');

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { getFundableWalletAddresses, requestFaucetFunding } from '../src/faucet.js';
 
 interface FetchCall {
@@ -114,6 +114,21 @@ describe('requestFaucetFunding', () => {
     const reqBody = JSON.parse(calls[0].init.body as string);
     expect(reqBody.wallets).toEqual(['0xAAA', '0xBBB']);
     expect(reqBody.mode).toBe('v10_base_sepolia');
+  });
+
+  it('uses a three-minute timeout for faucet batches', async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
+      .mockReturnValue(new AbortController().signal);
+    const { fetch } = createTrackingFetch(200, { summary: { success: 0 }, results: [] });
+    try {
+      await requestFaucetFunding(
+        'https://faucet.example.com/fund', 'test', ['0xAAA'], 'timeout-node', fetch,
+      );
+
+      expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   it('funds wallets in batches of 4', async () => {
@@ -265,6 +280,16 @@ describe('requestFaucetFunding', () => {
     await expect(requestFaucetFunding(
       'https://faucet.example.com/fund', 'test', ['0xAAA'], 'test-node', fetch,
     )).rejects.toThrow('ECONNREFUSED');
+  });
+
+  it('explains that a first-batch timeout may still complete on-chain', async () => {
+    const fetch = (async () => {
+      throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+    }) as unknown as typeof globalThis.fetch;
+
+    await expect(requestFaucetFunding(
+      'https://faucet.example.com/fund', 'test', ['0xAAA'], 'timeout-node', fetch,
+    )).rejects.toThrow('funding may still complete');
   });
 
   it('preserves earlier funded wallets when a later batch throws', async () => {

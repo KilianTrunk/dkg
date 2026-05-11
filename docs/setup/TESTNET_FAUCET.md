@@ -65,6 +65,12 @@ block later wallets in the same 4-wallet funding request. They still send a
 deterministic `Idempotency-Key` derived from the node/agent name and wallet batch
 so retrying the same funding operation remains safe.
 
+Bundled setup commands wait up to 3 minutes for a faucet response because a
+4-wallet request can broadcast both ETH and TRAC transactions for each wallet
+before the faucet returns. If the client still times out, check wallet balances
+before retrying because the faucet may finish the on-chain work after the local
+request is aborted.
+
 ## Dry run (test without sending transactions)
 
 `POST /dry-run` accepts the same body but doesn't broadcast transactions. Use it to verify your request while avoiding on-chain transactions; note that dry-run requests still count against the shared funding rate limit.

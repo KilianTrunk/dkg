@@ -7,6 +7,7 @@ export interface FaucetResult {
 }
 
 const EXPECTED_FAUCET_TRANSFERS_PER_WALLET = 2;
+const FAUCET_REQUEST_TIMEOUT_MS = 180_000;
 export const FAUCET_WALLETS_PER_REQUEST = 4;
 
 export interface FundableWalletEntryLike {
@@ -19,6 +20,20 @@ export interface FundableWalletConfigLike {
 }
 
 export type FundableWalletSource = FundableWalletConfigLike | unknown[];
+
+function isFaucetTimeoutError(err: unknown): boolean {
+  const maybeError = err as { name?: unknown; message?: unknown } | null | undefined;
+  if (maybeError?.name === 'TimeoutError' || maybeError?.name === 'AbortError') return true;
+  return typeof maybeError?.message === 'string'
+    && /aborted due to timeout|timeout/i.test(maybeError.message);
+}
+
+function formatFaucetRequestError(err: unknown): string {
+  if (isFaucetTimeoutError(err)) {
+    return `Faucet request timed out after ${Math.round(FAUCET_REQUEST_TIMEOUT_MS / 1000)}s; funding may still complete. Check wallet balances before retrying.`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
 
 export function getFundableWalletAddresses(source: FundableWalletSource | null | undefined): string[] {
   const walletList = Array.isArray(source)
@@ -85,7 +100,7 @@ export async function requestFaucetFunding(
           'Idempotency-Key': `init-v2-${mode}-${safeNodeName}-${[...batch].sort().join(',')}`,
         },
         body: JSON.stringify({ mode, wallets: batch }),
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.timeout(FAUCET_REQUEST_TIMEOUT_MS),
       });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
@@ -154,9 +169,10 @@ export async function requestFaucetFunding(
       }
     } catch (err) {
       if (!sawSuccess && funded.length === 0 && fundedWallets.size === 0) {
+        if (isFaucetTimeoutError(err)) throw new Error(formatFaucetRequestError(err));
         throw err;
       }
-      errors.push(`Faucet request failed: ${err instanceof Error ? err.message : String(err)}`);
+      errors.push(`Faucet request failed: ${formatFaucetRequestError(err)}`);
       for (const wallet of batch) {
         failedWallets.add(wallet);
         fundedWallets.delete(wallet);

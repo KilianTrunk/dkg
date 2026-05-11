@@ -1864,6 +1864,10 @@ export class DKGPublisher implements Publisher {
       // resolved signer for THIS publish (cg-aware). Skipping the
       // resolver round-trip guarantees `KC.author == tx submitter`
       // regardless of how the deployment configures publisherAddressResolver.
+      // Fallback was explicitly requested by the caller, so signing
+      // failures here are deterministic configuration/signer problems
+      // — surface them as hard rejections rather than degrading into
+      // a retryable tentative path (Codex round-4).
       if (
         !options.precomputedAttestation
         && options.allowPublisherFallbackSeal
@@ -1871,37 +1875,30 @@ export class DKGPublisher implements Publisher {
         && v10KavAddress !== undefined
         && publisherSigner !== undefined
       ) {
-        try {
-          const fallbackTypedData = buildAuthorAttestationTypedData({
-            chainId: v10ChainId,
-            kav10Address: v10KavAddress,
-            contextGraphId: v10CgId,
-            merkleRoot: kcMerkleRoot,
+        const fallbackTypedData = buildAuthorAttestationTypedData({
+          chainId: v10ChainId,
+          kav10Address: v10KavAddress,
+          contextGraphId: v10CgId,
+          merkleRoot: kcMerkleRoot,
+          authorAddress: publisherSigner.address,
+          schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+        });
+        const sigHex = await publisherSigner.signTypedData(
+          fallbackTypedData.domain,
+          fallbackTypedData.types as { [k: string]: Array<{ name: string; type: string }> },
+          fallbackTypedData.message,
+        );
+        const sig = ethers.Signature.from(sigHex);
+        options = {
+          ...options,
+          precomputedAttestation: {
+            expectedMerkleRoot: kcMerkleRoot,
             authorAddress: publisherSigner.address,
+            signature: { r: ethers.getBytes(sig.r), vs: ethers.getBytes(sig.yParityAndS) },
             schemeVersion: AUTHOR_SCHEME_VERSION_V1,
-          });
-          const sigHex = await publisherSigner.signTypedData(
-            fallbackTypedData.domain,
-            fallbackTypedData.types as { [k: string]: Array<{ name: string; type: string }> },
-            fallbackTypedData.message,
-          );
-          const sig = ethers.Signature.from(sigHex);
-          options = {
-            ...options,
-            precomputedAttestation: {
-              expectedMerkleRoot: kcMerkleRoot,
-              authorAddress: publisherSigner.address,
-              signature: { r: ethers.getBytes(sig.r), vs: ethers.getBytes(sig.yParityAndS) },
-              schemeVersion: AUTHOR_SCHEME_VERSION_V1,
-            },
-          };
-          this.log.info(ctx, `Minted publisher-fallback AuthorAttestation (author=${publisherSigner.address})`);
-        } catch (err) {
-          this.log.warn(
-            ctx,
-            `Publisher-fallback seal mint failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
+          },
+        };
+        this.log.info(ctx, `Minted publisher-fallback AuthorAttestation (author=${publisherSigner.address})`);
       }
 
       // ─────────────────────────────────────────────────────────────

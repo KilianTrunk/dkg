@@ -137,4 +137,56 @@ describe('POST /api/publisher/enqueue allowPublisherFallbackSeal threading', () 
     expect(captured).toBeDefined();
     expect(captured.allowPublisherFallbackSeal).toBe(false);
   });
+
+  // Codex round-4 on #451: `Boolean(...)` coerces non-boolean payloads,
+  // so a client sending `"false"` or `1` would silently flip on-chain
+  // authorship to publisher-fallback. The route must only honour a
+  // strict boolean and ignore any other type.
+  it('ignores string "true" (no coercion)', async () => {
+    let captured: any;
+    const ctx = createContext(
+      { ...BASE_BODY, allowPublisherFallbackSeal: 'true' },
+      async (req) => {
+        captured = req;
+        return 'job-coerce-1';
+      },
+    );
+
+    await handlePublisherRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect('allowPublisherFallbackSeal' in captured).toBe(false);
+  });
+
+  it('ignores string "false" (which would be truthy under Boolean(...))', async () => {
+    let captured: any;
+    const ctx = createContext(
+      { ...BASE_BODY, allowPublisherFallbackSeal: 'false' },
+      async (req) => {
+        captured = req;
+        return 'job-coerce-2';
+      },
+    );
+
+    await handlePublisherRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect('allowPublisherFallbackSeal' in captured).toBe(false);
+  });
+
+  it('ignores numeric 1 (no coercion to true)', async () => {
+    let captured: any;
+    const ctx = createContext(
+      { ...BASE_BODY, allowPublisherFallbackSeal: 1 },
+      async (req) => {
+        captured = req;
+        return 'job-coerce-3';
+      },
+    );
+
+    await handlePublisherRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect('allowPublisherFallbackSeal' in captured).toBe(false);
+  });
 });

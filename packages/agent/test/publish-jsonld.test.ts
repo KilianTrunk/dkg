@@ -284,19 +284,23 @@ describe('publishJsonLd', () => {
     if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(false);
   }, 15000);
 
-  it('async publish does NOT signal allowPublisherFallbackSeal when chain reports !isV10Ready (despite V10 methods being present)', async () => {
-    // Codex review on #451: NoChainAdapter / partially-configured
-    // adapters expose getEvmChainId / getKnowledgeAssetsV10Address as
-    // throwing stubs, so a method-presence gate sets the flag on a
-    // node that cannot actually mint a V10 seal. The job persists; a
-    // later restart with a real adapter then publishes with publisher-
-    // authored attribution unexpectedly. Gate must use the live
-    // readiness probe.
+  it('async publish always signals allowPublisherFallbackSeal — V10 readiness is checked at processNext-time, not lift-enqueue-time', async () => {
+    // Codex round-3 on #451: Snapshotting readiness at lift-enqueue
+    // time misses jobs queued before the context graph was registered
+    // or before the adapter became V10-ready. Lift jobs persist; the
+    // publisher re-checks live V10 conditions at processNext-time
+    // (chainId, kav10Address, publisherSigner all resolved) before
+    // minting. On non-V10 chains the fallback simply doesn't fire —
+    // covered by Diagram 12 e2e tests. So the agent always authorizes
+    // fallback at the lift-request level.
     const { agent, store } = await createAgent('AsyncSealNonV10Bot');
     await agent.createContextGraph({ id: 'async-seal-non-v10', name: 'AsyncSealNonV10', description: '' });
     await agent.registerContextGraph('async-seal-non-v10');
 
-    // Simulate: chain methods present, but adapter reports not ready.
+    // Even with the adapter reporting !isV10Ready at lift-enqueue-time,
+    // the flag MUST be set: a later run on a fully V10-ready chain
+    // (e.g. after CG registration or adapter swap-in) must still be
+    // eligible for mode-(a) fallback.
     (agent as unknown as { chain: { isV10Ready: () => boolean } }).chain.isV10Ready = () => false;
 
     const { captureID } = await agent.publishAsync(
@@ -314,7 +318,7 @@ describe('publishJsonLd', () => {
 
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
     const job = await asyncPublisher.getStatus(captureID);
-    expect(job?.request.allowPublisherFallbackSeal).not.toBe(true);
+    expect(job?.request.allowPublisherFallbackSeal).toBe(true);
   }, 30_000);
 
   it('async publish on V10 chain signals allowPublisherFallbackSeal on the lift request', async () => {

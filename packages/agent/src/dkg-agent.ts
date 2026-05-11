@@ -3754,17 +3754,14 @@ export class DKGAgent {
       }
     }
 
-    // Signal publisher-fallback sealing on V10 chains; publisher mints
-    // the seal at processNext-time. Author == publisher's own EOA.
-    // Use `isV10Ready()` rather than method-presence — `NoChainAdapter`
-    // and partially-configured adapters expose the V10 methods as
-    // throwing stubs but report `isV10Ready() === false`, so a
-    // presence gate would persist the flag on a node that cannot
-    // mint a V10 seal.
-    const onChainId = await this.getContextGraphOnChainId(contextGraphId);
-    const allowPublisherFallback =
-      onChainId != null && this.chain.isV10Ready?.() === true;
-
+    // Always authorize publisher-fallback seal at lift-enqueue time.
+    // The publisher re-checks live V10 conditions at processNext-time
+    // (chainId, kav10Address, publisherSigner all resolved) before
+    // minting — on non-V10 chains the fallback simply doesn't fire.
+    // Snapshotting an enqueue-time readiness flag would miss jobs
+    // queued before the CG was registered or before the adapter
+    // became V10-ready, leaving them downgraded to the missing-seal
+    // path on the eventual on-chain publish.
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
     const captureID = await asyncPublisher.lift({
       swmId: shareOperationId,
@@ -3778,7 +3775,7 @@ export class DKGAgent {
       subGraphName: opts?.subGraphName,
       accessPolicy: opts?.accessPolicy,
       allowedPeers: opts?.allowedPeers,
-      allowPublisherFallbackSeal: allowPublisherFallback,
+      allowPublisherFallbackSeal: true,
     });
 
     if (!opts?.localOnly) {

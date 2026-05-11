@@ -880,4 +880,32 @@ describe('Diagram 12 — publisher-fallback seal mint signs as own wallet', () =
     expect(onChainAuthor.toLowerCase()).toBe(author.address.toLowerCase());
     expect(onChainAuthor.toLowerCase()).not.toBe(new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address.toLowerCase());
   });
+
+  it('publish({allowPublisherFallbackSeal:true}) fails fast when signTypedData throws', async () => {
+    // Codex round-4 on #451: a deterministic signer/configuration
+    // problem must NOT degrade into a retryable tentative result.
+    // When fallback was explicitly requested and the publisher cannot
+    // mint, the publish must reject with the original signing error
+    // so the async queue surfaces it as a hard failure.
+    const publisher = makePublisher();
+    const realGet = (publisher as unknown as { getPublisherSigner: (a?: string) => Promise<unknown> })
+      .getPublisherSigner.bind(publisher);
+    (publisher as unknown as { getPublisherSigner: (a?: string) => Promise<unknown> }).getPublisherSigner =
+      async (address?: string) => {
+        const real = await realGet(address) as { signTypedData?: unknown } | undefined;
+        if (!real) return real;
+        return {
+          ...real,
+          signTypedData: async () => {
+            throw new Error('publisher signer offline');
+          },
+        };
+      };
+
+    await expect(publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q(`${ENTITY}/D12-fail-fast`, 'http://schema.org/name', '"Diagram12-FailFast"')],
+      allowPublisherFallbackSeal: true,
+    })).rejects.toThrow(/publisher signer offline/);
+  });
 });

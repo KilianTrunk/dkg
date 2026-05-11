@@ -2101,12 +2101,13 @@ describe('DkgChannelPlugin', () => {
       'Agent reply',
       { turnId: 'corr-persist' },
     ]);
-    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith({
+    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: 'session-1',
       turnId: 'corr-persist',
       user: 'User message',
+      userAliases: expect.arrayContaining(['[DKG UI Owner] Hello', 'User message']),
       assistant: 'Agent reply',
-    });
+    }));
   });
 
   it('processInbound should persist without throwing when ChatTurnWriter is not wired', async () => {
@@ -2437,12 +2438,12 @@ describe('DkgChannelPlugin', () => {
 
       expect(stopSettled).toBe(true);
       expect(markExternalTurnPersistedDurable).toHaveBeenCalledTimes(1);
-      expect(markExternalTurnPersistedDurable).toHaveBeenLastCalledWith({
+      expect(markExternalTurnPersistedDurable).toHaveBeenLastCalledWith(expect.objectContaining({
         sessionKey: 'session-1',
         turnId: 'corr-marker-initial-hang',
         user: 'Already stored',
         assistant: 'Persisted reply',
-      });
+      }));
       expect((plugin as any).pendingMarkerPersistence.size).toBe(0);
     } finally {
       vi.useRealTimers();
@@ -2497,12 +2498,12 @@ describe('DkgChannelPlugin', () => {
       expect(stopSettled).toBe(true);
       expect(storeCalls).toHaveLength(1);
       expect(markExternalTurnPersistedDurable).toHaveBeenCalledTimes(1);
-      expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith({
+      expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith(expect.objectContaining({
         sessionKey: 'session-1',
         turnId: 'corr-late-marker-after-store',
         user: 'Late store',
         assistant: 'Persisted reply',
-      });
+      }));
       expect((plugin as any).pendingTurnPersistence.size).toBe(0);
       expect((plugin as any).pendingMarkerPersistence.size).toBe(0);
     } finally {
@@ -2610,12 +2611,12 @@ describe('DkgChannelPlugin', () => {
 
       expect(stopSettled).toBe(true);
       expect(markExternalTurnPersistedDurable).toHaveBeenCalledTimes(2);
-      expect(markExternalTurnPersistedDurable).toHaveBeenLastCalledWith({
+      expect(markExternalTurnPersistedDurable).toHaveBeenLastCalledWith(expect.objectContaining({
         sessionKey: 'session-1',
         turnId: 'corr-marker-stop-timeout',
         user: 'Already stored',
         assistant: 'Persisted reply',
-      });
+      }));
       expect((plugin as any).pendingMarkerPersistence.size).toBe(0);
     } finally {
       vi.useRealTimers();
@@ -2844,12 +2845,13 @@ describe('DkgChannelPlugin', () => {
       'Reply!',
       { turnId: 'corr-route-marker' },
     ]);
-    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith({
+    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: 'agent:main:main',
       turnId: 'corr-route-marker',
       user: 'Hello',
+      userAliases: expect.arrayContaining(['Hello']),
       assistant: 'Reply!',
-    });
+    }));
   });
 
   it('processInbound routeInboundMessage fallback hashes the routed agent body for direct-channel markers', async () => {
@@ -2872,12 +2874,13 @@ describe('DkgChannelPlugin', () => {
 
     expect(routeInboundMessage.calls[0][0].text).toContain('Context for this chat turn:');
     expect(storeCalls[0][1]).toBe('Hello');
-    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith({
+    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: 'agent:main:main',
       turnId: 'corr-route-context-marker',
       user: expect.stringContaining('Context for this chat turn:'),
+      userAliases: expect.arrayContaining(['Hello']),
       assistant: 'Reply!',
-    });
+    }));
   });
 
   it('processInbound routeInboundMessage fallback does not collapse owner-like identities into the owner marker bucket', async () => {
@@ -2900,12 +2903,12 @@ describe('DkgChannelPlugin', () => {
     }));
     expect(routeInboundMessage.calls[0][0]).not.toHaveProperty('sessionKey');
     expect(routeInboundMessage.calls[0][0]).not.toHaveProperty('SessionKey');
-    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith({
+    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: 'agent:main:owner',
       turnId: 'corr-route-ownerish',
       user: 'Hello',
       assistant: 'Reply!',
-    });
+    }));
   });
 
   it('processInbound routeInboundMessage fallback marks non-owner direct-channel persists with the non-owner session key', async () => {
@@ -2935,12 +2938,12 @@ describe('DkgChannelPlugin', () => {
       'Worker reply',
       { turnId: 'corr-route-worker' },
     ]);
-    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith({
+    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: 'agent:main:background-worker',
       turnId: 'corr-route-worker',
       user: 'Work item',
       assistant: 'Worker reply',
-    });
+    }));
   });
 
   it('processInbound routeInboundMessage fallback accepts uppercase reply SessionKey for marker persistence', async () => {
@@ -2960,12 +2963,12 @@ describe('DkgChannelPlugin', () => {
 
     expect((reply as any).SessionKey).toBe('agent:legacy:actual');
     expect(reply.sessionKey).toBe('agent:legacy:actual');
-    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith({
+    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: 'agent:legacy:actual',
       turnId: 'corr-route-uppercase-session',
       user: 'Hello',
       assistant: 'Reply!',
-    });
+    }));
   });
 
   it('processInbound routeInboundMessage fallback skips marker persistence when the route does not return its resolved session key', async () => {
@@ -3164,12 +3167,13 @@ describe('DkgChannelPlugin', () => {
       'Streamed reply',
       { turnId: 'corr-stream-runtime', attachmentRefs },
     ]);
-    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith({
+    expect(markExternalTurnPersistedDurable).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: 'session-1',
       turnId: 'corr-stream-runtime',
       user: expect.stringContaining('Attached Working Memory items:'),
+      userAliases: expect.arrayContaining(['Hello']),
       assistant: 'Streamed reply',
-    });
+    }));
   });
 
   it('processInboundStream should wait for a still-running dispatch to settle before persisting a closed stream', async () => {

@@ -6641,12 +6641,12 @@ describe('DkgNodePlugin', () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
 
       expect(storeCalls).toHaveLength(1);
-      expect(markerSpy).toHaveBeenCalledWith({
+      expect(markerSpy).toHaveBeenCalledWith(expect.objectContaining({
         sessionKey: 'session-order',
         turnId: 'corr-writer-order',
         user: 'Immediate inbound',
         assistant: 'Immediate reply',
-      });
+      }));
       expect((plugin as any).channelPlugin.chatTurnWriter).toBe((plugin as any).chatTurnWriter);
     } finally {
       markerSpy.mockRestore();

@@ -39,6 +39,11 @@ export interface OpenClawAttachmentRef {
   rootEntity?: string;
 }
 
+export interface ChatTurnStoreStatus {
+  hasAnyChatTurnData: boolean;
+  existingSessionIds: string[];
+}
+
 export interface LocalAgentIntegrationCapabilities {
   localChat?: boolean;
   connectFromUi?: boolean;
@@ -103,6 +108,64 @@ export interface AgentIdentity {
   framework?: string;
   peerId: string;
   nodeIdentityId: string;
+}
+
+const CHAT_TURNS_CONTEXT_GRAPH_ID = 'agent-context';
+const CHAT_TURNS_ASSERTION_NAME = 'chat-turns';
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+const SCHEMA = 'http://schema.org/';
+const DKG_ONT = 'http://dkg.io/ontology/';
+
+function queryBindings(result: any): Array<Record<string, unknown>> {
+  const candidates = [
+    result?.results?.bindings,
+    result?.result?.bindings,
+    result?.result?.results?.bindings,
+    result?.bindings,
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate as Array<Record<string, unknown>>;
+  }
+  return [];
+}
+
+function bindingValue(binding: Record<string, unknown>, key: string): string | undefined {
+  const value = binding[key];
+  if (typeof value === 'string') return stripRdfLiteral(value);
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    if (typeof record.value === 'string') return stripRdfLiteral(record.value);
+    if (typeof record.id === 'string') return stripRdfLiteral(record.id);
+  }
+  return undefined;
+}
+
+function stripRdfLiteral(value: string): string {
+  if (!value) return '';
+  const typed = value.match(/^"([\s\S]*)"(?:\^\^<[^>]+>)?(?:@[a-zA-Z-]+)?$/);
+  return typed ? typed[1] : value;
+}
+
+function bindingCount(result: any): number {
+  const binding = queryBindings(result)[0];
+  if (!binding) return 0;
+  const value = bindingValue(binding, 'c') ?? bindingValue(binding, 'count');
+  if (!value) return 0;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function isChatTurnStoreNotFoundError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const lower = msg.toLowerCase();
+  if (!lower.includes('responded 404')) return false;
+  return (
+    lower.includes('not found') ||
+    lower.includes('assertion') ||
+    lower.includes('context') ||
+    lower.includes('graph') ||
+    lower.includes(CHAT_TURNS_ASSERTION_NAME)
+  );
 }
 
 export class DkgDaemonClient {
@@ -475,6 +538,59 @@ export class DkgDaemonClient {
   // ---------------------------------------------------------------------------
   // Chat turn persistence  (reuses the existing ChatMemoryManager pathway)
   // ---------------------------------------------------------------------------
+
+  async getChatTurnStoreStatus(sessionIds: string[]): Promise<ChatTurnStoreStatus> {
+    const identity = await this.getAgentIdentity();
+    const agentAddress = identity.ok ? identity.identity?.agentAddress?.trim() : '';
+    if (!agentAddress) {
+      throw new Error(
+        `Unable to resolve daemon agent identity for chat-turn WM status: ${identity.error ?? 'missing agentAddress'}`,
+      );
+    }
+    const wmReadOpts = {
+      contextGraphId: CHAT_TURNS_CONTEXT_GRAPH_ID,
+      view: 'working-memory' as const,
+      assertionName: CHAT_TURNS_ASSERTION_NAME,
+      agentAddress,
+    };
+    try {
+      const countResult = await this.query(
+        'SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }',
+        wmReadOpts,
+      );
+      const hasAnyChatTurnData = bindingCount(countResult) > 0;
+      if (!hasAnyChatTurnData) {
+        return { hasAnyChatTurnData: false, existingSessionIds: [] };
+      }
+      const uniqueSessionIds = Array.from(new Set(
+        sessionIds.map((sessionId) => sessionId.trim()).filter(Boolean),
+      ));
+      if (uniqueSessionIds.length === 0) {
+        return { hasAnyChatTurnData: true, existingSessionIds: [] };
+      }
+      const sessionValues = uniqueSessionIds.map((sessionId) => JSON.stringify(sessionId)).join(' ');
+      const sessionResult = await this.query(
+        `SELECT DISTINCT ?sid WHERE {
+          VALUES ?sid { ${sessionValues} }
+          ?session <${RDF_TYPE}> <${SCHEMA}Conversation> .
+          ?session <${DKG_ONT}sessionId> ?sid .
+        }`,
+        wmReadOpts,
+      );
+      const requested = new Set(uniqueSessionIds);
+      const existingSessionIds = Array.from(new Set(
+        queryBindings(sessionResult)
+          .map((binding) => bindingValue(binding, 'sid'))
+          .filter((value): value is string => typeof value === 'string' && requested.has(value)),
+      ));
+      return { hasAnyChatTurnData: true, existingSessionIds };
+    } catch (err) {
+      if (isChatTurnStoreNotFoundError(err)) {
+        return { hasAnyChatTurnData: false, existingSessionIds: [] };
+      }
+      throw err;
+    }
+  }
 
   /**
    * Persist a chat turn through the daemon's `/api/openclaw-channel/persist-turn`

@@ -213,6 +213,17 @@ function buildAgentBody(text: string, opts?: { attachmentRefs?: OpenClawAttachme
   }
   return sections.join('\n\n');
 }
+
+function buildMarkerUserAliases(...values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const aliases: string[] = [];
+  for (const value of values) {
+    if (typeof value !== 'string' || value.length === 0 || seen.has(value)) continue;
+    seen.add(value);
+    aliases.push(value);
+  }
+  return aliases;
+}
 const moduleRequire = createRequire(import.meta.url);
 
 interface PendingRequest {
@@ -228,15 +239,21 @@ interface PersistTurnOptions {
   sessionKey?: string;
   turnId?: string;
   markerUser?: string;
+  markerUserAliases?: string[];
 }
 
 interface ExternalTurnMarkerPersistOptions {
   sessionKey?: string;
   turnId: string;
   user: string;
+  userAliases?: string[];
   assistant: string;
   correlationId: string;
 }
+
+type ChannelOutboundReplyWithMarkerAliases = ChannelOutboundReply & {
+  markerUserAliases?: string[];
+};
 
 interface InboundChatOptions {
   attachmentRefs?: OpenClawAttachmentRef[];
@@ -1294,8 +1311,11 @@ export class DkgChannelPlugin {
           attachmentRefs,
           sessionKey,
           markerUser: markerUserMessage,
+          markerUserAliases: reply.markerUserAliases,
         }, true);
-        return reply;
+        const publicReply = { ...reply };
+        delete publicReply.markerUserAliases;
+        return publicReply;
       } catch (err: any) {
         api.logger.warn?.(`[dkg-channel] dispatchViaPluginSdk failed: ${err.message}`);
         throw err;
@@ -1346,6 +1366,7 @@ export class DkgChannelPlugin {
         attachmentRefs,
         sessionKey: returnedSessionKey || undefined,
         markerUser: markerUserMessage,
+        markerUserAliases: buildMarkerUserAliases(markerUserMessage, text),
       }, true);
       return normalizedReply;
     }
@@ -1367,7 +1388,7 @@ export class DkgChannelPlugin {
     attachmentRefs?: OpenClawAttachmentRef[],
     contextEntries?: ChatContextEntry[],
     uiContextGraphId?: string,
-  ): Promise<ChannelOutboundReply> {
+  ): Promise<ChannelOutboundReplyWithMarkerAliases> {
     const log = this.api!.logger;
     const runtime = this.runtime;
     const cfg = this.cfg;
@@ -1484,11 +1505,11 @@ export class DkgChannelPlugin {
     storePath: string,
     ctxPayload: any,
     correlationId: string,
-  ): Promise<ChannelOutboundReply> {
+  ): Promise<ChannelOutboundReplyWithMarkerAliases> {
     const log = this.api!.logger;
     const runtime = this.runtime;
 
-    return new Promise<ChannelOutboundReply>((resolve, reject) => {
+    return new Promise<ChannelOutboundReplyWithMarkerAliases>((resolve, reject) => {
       const TIMEOUT_MS = CHANNEL_RESPONSE_TIMEOUT_MS;
       const timer = setTimeout(() => {
         reject(new Error('Agent response timeout'));
@@ -1519,7 +1540,17 @@ export class DkgChannelPlugin {
         clearTimeout(timer);
         const replyText = finalizeAgentReplyText(replyChunks.join('\n'));
         log.info?.(`[dkg-channel] Reply dispatched (${replyText.length} chars) for ${correlationId}`);
-        resolve({ text: replyText, correlationId, sessionKey: route.sessionKey });
+        resolve({
+          text: replyText,
+          correlationId,
+          sessionKey: route.sessionKey,
+          markerUserAliases: buildMarkerUserAliases(
+            ctxPayload?.Body,
+            ctxPayload?.BodyForAgent,
+            ctxPayload?.CommandBody,
+            ctxPayload?.RawBody,
+          ),
+        });
       }).catch((err: any) => {
         clearTimeout(timer);
         log.warn?.(`[dkg-channel] dispatchInboundReplyWithBase failed: ${err.message}`);
@@ -1535,10 +1566,10 @@ export class DkgChannelPlugin {
     storePath: string,
     ctxPayload: any,
     correlationId: string,
-  ): Promise<ChannelOutboundReply> {
+  ): Promise<ChannelOutboundReplyWithMarkerAliases> {
     const log = this.api!.logger;
 
-    return new Promise<ChannelOutboundReply>((resolve, reject) => {
+    return new Promise<ChannelOutboundReplyWithMarkerAliases>((resolve, reject) => {
       const TIMEOUT_MS = CHANNEL_RESPONSE_TIMEOUT_MS;
       const timer = setTimeout(() => {
         reject(new Error('Agent response timeout'));
@@ -1568,7 +1599,17 @@ export class DkgChannelPlugin {
           clearTimeout(timer);
           const replyText = finalizeAgentReplyText(replyChunks.join('\n'));
           log.info?.(`[dkg-channel] Reply dispatched (${replyText.length} chars) for ${correlationId}`);
-          resolve({ text: replyText, correlationId, sessionKey: route.sessionKey });
+          resolve({
+            text: replyText,
+            correlationId,
+            sessionKey: route.sessionKey,
+            markerUserAliases: buildMarkerUserAliases(
+              ctxPayload?.Body,
+              ctxPayload?.BodyForAgent,
+              ctxPayload?.CommandBody,
+              ctxPayload?.RawBody,
+            ),
+          });
         })
         .catch((err: any) => {
           clearTimeout(timer);
@@ -1767,6 +1808,7 @@ export class DkgChannelPlugin {
           attachmentRefs,
           sessionKey: route.sessionKey,
           markerUser: agentBody,
+          markerUserAliases: buildMarkerUserAliases(formattedBody, agentBody, commandBody, text),
         }, true);
       } else if (resolvedTerminalState === 'failed') {
         this.queueTurnPersistence(
@@ -1780,6 +1822,7 @@ export class DkgChannelPlugin {
             attachmentRefs,
             sessionKey: route.sessionKey,
             markerUser: agentBody,
+            markerUserAliases: buildMarkerUserAliases(formattedBody, agentBody, commandBody, text),
           },
           true,
         );
@@ -1795,6 +1838,7 @@ export class DkgChannelPlugin {
             attachmentRefs,
             sessionKey: route.sessionKey,
             markerUser: agentBody,
+            markerUserAliases: buildMarkerUserAliases(formattedBody, agentBody, commandBody, text),
           },
           true,
         );
@@ -2011,6 +2055,7 @@ export class DkgChannelPlugin {
       sessionKey: opts?.sessionKey,
       turnId: opts?.turnId ?? correlationId,
       user: opts?.markerUser ?? userMessage,
+      userAliases: opts?.markerUserAliases,
       assistant: assistantReply,
       correlationId,
     }, allowDuringShutdown);
@@ -2044,6 +2089,7 @@ export class DkgChannelPlugin {
       sessionKey: opts.sessionKey,
       turnId: opts.turnId,
       user: opts.user,
+      ...(opts.userAliases?.length ? { userAliases: opts.userAliases } : {}),
       assistant: opts.assistant,
     });
   }

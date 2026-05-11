@@ -10,11 +10,17 @@ import {
 
 /**
  * Durable direct-channel marker lifecycle:
- * `markExternalTurnPersistedDurable` creates content-bound markers only after
- * channel-side daemon `storeChatTurn` succeeds; marker keys include `turnId`
- * plus canonical user/assistant text to avoid false dedupe for reused IDs or
- * content. W4a matches them in `consumeExternalTurnMarkersForPair` during
- * `runAgentEndPersist`, advancing pair watermarks only after durable commit.
+ * `markExternalTurnPersistedDurable` creates markers only after channel-side
+ * daemon `storeChatTurn` succeeds; exact marker keys include `turnId` plus
+ * canonical user/assistant text to avoid false dedupe for reused IDs or
+ * content. Direct-channel transcripts also get a `turnId` + canonical user-body
+ * marker because OpenClaw can retain a rendered assistant shape that differs
+ * from the final daemon-persisted text, plus one ordered marker for later
+ * transcripts that have stripped direct-channel metadata entirely. W4a
+ * matches them in
+ * `consumeExternalTurnMarkersForPair` during `runAgentEndPersist`, advancing
+ * pair watermarks only after durable commit; the ordered fallback is limited
+ * to historical non-latest pairs so it cannot drop the live Telegram turn.
  * Create failures roll back marker snapshots when `commitWatermarkStateSync`
  * fails; `setStateDir` migrates per-session `m`
  * markers, and graceful `DkgChannelPlugin.stop()` drains in-flight first writes.
@@ -67,7 +73,7 @@ interface ComputedChatTurnPair {
 interface ExternalMarkerAction {
   skip: boolean;
   markers: string[];
-  rollbackMarkers: string[];
+  rollbackMarkers: Array<{ marker: string; count: number }>;
 }
 
 interface WatermarkStateSnapshot {
@@ -80,6 +86,23 @@ interface LegacyMergeSource {
   markerKey: string;
   contentHash: string;
   watermarkFilePath: string;
+}
+
+interface ChatTurnStoreStatus {
+  hasAnyChatTurnData: boolean;
+  existingSessionIds: string[];
+}
+
+interface ChatTurnStoreStatusClient {
+  getChatTurnStoreStatus?: (sessionIds: string[]) => Promise<ChatTurnStoreStatus>;
+}
+
+interface DurableCursorKeySnapshot {
+  cachedWatermark?: number;
+  pendingIndex?: number;
+  w4bCount?: number;
+  markers: Map<string, number>;
+  revision: number;
 }
 
 /**
@@ -194,6 +217,12 @@ export class ChatTurnWriter {
   // skip exactly those already-persisted UI pairs across restarts without
   // confusing two legitimate same-content turns.
   private externalTurnMarkers: Map<string, Map<string, number>> = new Map();
+  private static readonly EXTERNAL_ORDERED_TURN_MARKER = "__external_ordered_turns__";
+  // Cursor facts loaded from disk (active or migrated legacy watermark files)
+  // are only local claims. Before W4a lets those facts suppress a fresh
+  // Telegram `agent_end`, validate them against the daemon's chat-turn store.
+  private untrustedDaemonCursorKeys: Set<string> = new Set();
+  private durableCursorKeyRevisions: Map<string, number> = new Map();
   // In-flight persist tracking — `resetSessionState()` awaits these so a
   // pre-reset persist can't advance the just-reset watermark afterward.
   // Both W4a (`onAgentEnd`) and W4b (`onMessageSent`) MUST register their
@@ -287,6 +316,7 @@ export class ChatTurnWriter {
 
   setClient(client: any): void {
     this.client = client;
+    this.markAllDurableCursorKeysUntrusted();
   }
 
   /**
@@ -501,6 +531,7 @@ export class ChatTurnWriter {
         const data = JSON.parse(content);
         if (data && typeof data === "object") {
           for (const [key, val] of Object.entries(data)) {
+            let loadedCursorState = false;
             // T17 — Two formats supported for backward compat:
             //   * Number `5`             → legacy: watermark only
             //   * Object `{ w: 5, b: 3 }` → watermark + W4b session count
@@ -512,13 +543,16 @@ export class ChatTurnWriter {
             // backfill — daemon-side duplicate writes.
             if (typeof val === "number") {
               this.cachedWatermarks.set(key, val);
+              loadedCursorState = true;
             } else if (val && typeof val === "object") {
               const obj = val as { w?: unknown; b?: unknown; m?: unknown };
               if (typeof obj.w === "number") {
                 this.cachedWatermarks.set(key, obj.w);
+                loadedCursorState = true;
               }
               if (typeof obj.b === "number") {
                 this.w4bSessionCounts.set(key, obj.b);
+                loadedCursorState = true;
               }
               if (obj.m && typeof obj.m === "object" && !Array.isArray(obj.m)) {
                 const markers = new Map<string, number>();
@@ -529,9 +563,11 @@ export class ChatTurnWriter {
                 }
                 if (markers.size > 0) {
                   this.externalTurnMarkers.set(key, markers);
+                  loadedCursorState = true;
                 }
               }
             }
+            if (loadedCursorState) this.markDurableCursorKeyUntrusted(key);
           }
         }
       }
@@ -708,26 +744,32 @@ export class ChatTurnWriter {
     const data = JSON.parse(content);
     if (!data || typeof data !== "object") return;
     for (const [key, val] of Object.entries(data)) {
+      let loadedCursorState = false;
       if (typeof val === "number") {
         targetWm.set(key, Math.max(targetWm.get(key) ?? -1, val));
         mirrorWm?.set(key, val);
+        loadedCursorState = true;
       } else if (val && typeof val === "object") {
         const obj = val as { w?: unknown; b?: unknown; m?: unknown };
         if (typeof obj.w === "number") {
           targetWm.set(key, Math.max(targetWm.get(key) ?? -1, obj.w));
           mirrorWm?.set(key, obj.w);
+          loadedCursorState = true;
         }
         if (typeof obj.b === "number") {
           targetBc.set(key, Math.max(targetBc.get(key) ?? 0, obj.b));
           mirrorBc?.set(key, obj.b);
+          loadedCursorState = true;
         }
         if (obj.m && typeof obj.m === "object" && !Array.isArray(obj.m)) {
           this.mergeExternalTurnMarkers(targetMarkers, key, obj.m as Record<string, unknown>);
           if (mirrorMarkers) {
             this.mergeExternalTurnMarkers(mirrorMarkers, key, obj.m as Record<string, unknown>);
           }
+          loadedCursorState = true;
         }
       }
+      if (loadedCursorState) this.markDurableCursorKeyUntrusted(key);
     }
   }
 
@@ -801,9 +843,14 @@ export class ChatTurnWriter {
       // after the upgrade would otherwise treat every prior pair as
       // unsaved backfill and re-persist it. Using the W4b count as a
       // floor ensures `computeDelta` skips those.
-      const w4aWatermark = this.loadWatermark(sessionId);
-      const w4bCount = this.w4bSessionCounts.get(sessionId) ?? 0;
-      const savedUpTo = Math.max(w4aWatermark, w4bCount - 1);
+      await this.validateUntrustedDurableCursorsBeforeW4a(
+        sessionId,
+        externalCursorKey,
+        typedW4bCursorKeys,
+        w4bInflightSessionIds,
+        w4aCrossPathSessionIds,
+      );
+      const savedUpTo = this.savedUpToForSession(sessionId);
       const pairs = this.computeDelta(event.messages, savedUpTo);
       if (pairs.length === 0) return;
       // T362 — Cold-start clamp. When no prior watermark exists for this
@@ -835,14 +882,19 @@ export class ChatTurnWriter {
       const lastIdx = pairs.length - 1;
       const job = this.trackPersistJob(sessionId, async () => {
         for (let i = 0; i < pairs.length; i++) {
-          const { user, assistant, pairIndex, externalTurnIds, messageIds, assistantMessageIds } = pairs[i];
+          const { user, assistant, pairIndex, externalTurnIds, externalDirect, messageIds, assistantMessageIds } = pairs[i];
           if (!user && !assistant) continue;
+          const laterExactExternalMarker = externalCursorKey
+            ? this.hasExternalTurnMarkerInLaterPairs(externalCursorKey, pairs, i + 1)
+            : false;
           const externalMarkerAction = externalCursorKey
             ? this.consumeExternalTurnMarkersForPair(
               externalCursorKey,
               externalTurnIds,
               user,
               assistant,
+              externalDirect,
+              i < lastIdx && !laterExactExternalMarker,
             )
             : { skip: false, markers: [], rollbackMarkers: [] };
           if (externalCursorKey && externalMarkerAction.markers.length > 0) {
@@ -850,7 +902,7 @@ export class ChatTurnWriter {
             if (externalMarkerAction.skip) this.bumpWatermark(sessionId, pairIndex);
             if (!this.commitWatermarkStateSync(sessionId)) {
               for (const marker of externalMarkerAction.rollbackMarkers) {
-                this.restoreExternalTurnMarker(externalCursorKey, marker);
+                this.restoreExternalTurnMarkerCount(externalCursorKey, marker.marker, marker.count);
               }
               this.restoreWatermarkState(sessionId, watermarkSnapshot);
               throw new Error("Failed to write external chat-turn marker consumption");
@@ -1101,12 +1153,18 @@ export class ChatTurnWriter {
     sessionKey?: string;
     turnId?: string;
     user: string;
+    userAliases?: string[];
     assistant: string;
   }): Promise<void> {
     const externalCursorKey = this.externalCursorKeyFromSessionKey(opts.sessionKey);
-    const markers = [
-      this.externalTurnMarkerId(opts.turnId, opts.user, opts.assistant),
-    ].filter(Boolean);
+    const markerUsers = this.uniqueStrings([opts.user, ...(opts.userAliases ?? [])]);
+    const markers = this.uniqueStrings([
+      ChatTurnWriter.EXTERNAL_ORDERED_TURN_MARKER,
+      ...markerUsers.flatMap((user) => [
+        this.externalTurnMarkerId(opts.turnId, user, opts.assistant),
+        this.externalTurnUserMarkerId(opts.turnId, user),
+      ]),
+    ].filter(Boolean));
     if (!externalCursorKey || markers.length === 0) return;
     const previousMarkerCounts = markers.map((marker) => ({
       marker,
@@ -1167,7 +1225,10 @@ export class ChatTurnWriter {
     sessionKey?: string;
     externalCursorKey?: string;
   }): Promise<void> {
-    const sessionIds = this.collectResetSessionIds(identity);
+    const sessionIds = this.uniqueStrings([
+      ...this.collectResetSessionIds(identity),
+      identity.externalCursorKey,
+    ]);
     if (sessionIds.length === 0) return;
     const preResetChains = new Map<string, Promise<void>>();
     for (const sessionId of sessionIds) {
@@ -1257,6 +1318,8 @@ export class ChatTurnWriter {
       // N turns" no longer maps to the new pair indices. Leaving stale
       // count would skip new pairs in `computeDelta`.
       this.w4bSessionCounts.delete(sessionId);
+      this.clearExternalOrderedTurnMarker(sessionId);
+      this.markDurableCursorKeyTrusted(sessionId);
     }
     this.clearMessageHookDedupForSessions(ids);
     // External markers record daemon-success facts from direct-channel
@@ -1669,6 +1732,7 @@ export class ChatTurnWriter {
                 sessionId,
                 (this.w4bSessionCounts.get(sessionId) ?? 0) + 1,
               );
+              this.bumpDurableCursorKeyRevision(sessionId);
               // T17 — Persist the new count/marker to disk via the
               // debounced flush so a process restart preserves the
               // "skip these pairs in computeDelta" fact.
@@ -2246,6 +2310,251 @@ export class ChatTurnWriter {
     return this.writeWatermarkFile();
   }
 
+  private savedUpToForSession(sessionId: string): number {
+    const w4aWatermark = this.loadWatermark(sessionId);
+    const w4bCount = this.w4bSessionCounts.get(sessionId) ?? 0;
+    return Math.max(w4aWatermark, w4bCount - 1);
+  }
+
+  private markDurableCursorKeyUntrusted(key: string | undefined): void {
+    if (typeof key === "string" && key.length > 0) {
+      this.untrustedDaemonCursorKeys.add(key);
+    }
+  }
+
+  private markDurableCursorKeyTrusted(key: string | undefined): void {
+    if (typeof key === "string" && key.length > 0) {
+      this.untrustedDaemonCursorKeys.delete(key);
+    }
+  }
+
+  private durableCursorRevision(key: string): number {
+    return this.durableCursorKeyRevisions.get(key) ?? 0;
+  }
+
+  private bumpDurableCursorKeyRevision(key: string | undefined): void {
+    if (typeof key !== "string" || key.length === 0) return;
+    this.durableCursorKeyRevisions.set(key, this.durableCursorRevision(key) + 1);
+  }
+
+  private markAllDurableCursorKeysUntrusted(): void {
+    for (const key of this.cachedWatermarks.keys()) this.markDurableCursorKeyUntrusted(key);
+    for (const key of this.w4bSessionCounts.keys()) this.markDurableCursorKeyUntrusted(key);
+    for (const key of this.externalTurnMarkers.keys()) this.markDurableCursorKeyUntrusted(key);
+    for (const key of this.debounceTimers.keys()) this.markDurableCursorKeyUntrusted(key);
+  }
+
+  private hasDurableCursorState(key: string): boolean {
+    return (
+      this.cachedWatermarks.has(key) ||
+      this.w4bSessionCounts.has(key) ||
+      this.externalTurnMarkers.has(key) ||
+      this.debounceTimers.has(key)
+    );
+  }
+
+  private async validateUntrustedDurableCursorsBeforeW4a(
+    sessionId: string,
+    externalCursorKey?: string,
+    typedW4bCursorKeys: string[] = [],
+    w4bInflightSessionIds: string[] = [sessionId],
+    w4aCrossPathSessionIds: string[] = [sessionId],
+  ): Promise<void> {
+    const statusReader = (this.client as ChatTurnStoreStatusClient | undefined)
+      ?.getChatTurnStoreStatus;
+    if (typeof statusReader !== "function") return;
+
+    const candidateSessionIds = this.uniqueStrings([
+      sessionId,
+      ...w4bInflightSessionIds,
+      ...w4aCrossPathSessionIds,
+    ]).filter((candidate) => this.parseComposedSessionId(candidate));
+    const cursorKeys = this.uniqueStrings([
+      ...typedW4bCursorKeys,
+    ]);
+    const externalCursorKeys = this.uniqueStrings([externalCursorKey]);
+    const allKeys = this.uniqueStrings([...candidateSessionIds, ...cursorKeys, ...externalCursorKeys]);
+    const untrustedKeys = allKeys.filter((key) =>
+      this.untrustedDaemonCursorKeys.has(key) && this.hasDurableCursorState(key)
+    );
+    if (untrustedKeys.length === 0) return;
+    const validationSnapshots = this.snapshotDurableCursorKeys(untrustedKeys);
+
+    try {
+      const status = await statusReader.call(this.client, candidateSessionIds);
+      const staleKeys = new Set<string>();
+      const untrustedKeySet = new Set(untrustedKeys);
+      if (!status.hasAnyChatTurnData) {
+        for (const key of untrustedKeys) staleKeys.add(key);
+      } else {
+        const existingSessionIds = new Set(status.existingSessionIds);
+        for (const candidate of candidateSessionIds) {
+          if (!existingSessionIds.has(candidate) && untrustedKeySet.has(candidate)) {
+            staleKeys.add(candidate);
+          }
+        }
+        if (!existingSessionIds.has(sessionId)) {
+          for (const key of cursorKeys) {
+            if (untrustedKeySet.has(key)) staleKeys.add(key);
+          }
+        }
+      }
+
+      if (staleKeys.size > 0) {
+        const clearedKeys = this.clearStaleDurableCursorKeys(staleKeys, validationSnapshots);
+        if (clearedKeys.length > 0) {
+          this.logger.warn?.(
+            "[ChatTurnWriter.onAgentEnd] Cleared stale chat-turn cursor state absent from daemon WM.",
+            { sessionId, clearedKeys },
+          );
+        }
+      }
+      for (const key of untrustedKeys) {
+        if (externalCursorKeys.includes(key) && status.hasAnyChatTurnData) continue;
+        if (!staleKeys.has(key)) this.markDurableCursorKeyTrusted(key);
+      }
+    } catch (err) {
+      this.logger.warn?.(
+        "[ChatTurnWriter.onAgentEnd] Failed to validate chat-turn cursor state against daemon WM; preserving local cursor state.",
+        { err, sessionId },
+      );
+    }
+  }
+
+  private clearStaleDurableCursorKeys(
+    keys: Iterable<string>,
+    validationSnapshots?: Map<string, DurableCursorKeySnapshot>,
+  ): string[] {
+    const parsedSessionIds: string[] = [];
+    const clearedKeys: string[] = [];
+    let changed = false;
+    for (const key of keys) {
+      const keyChanged = validationSnapshots
+        ? this.clearStaleDurableCursorKeyFromSnapshot(key, validationSnapshots.get(key))
+        : this.clearAllDurableCursorStateForKey(key);
+      if (!keyChanged) continue;
+      changed = true;
+      clearedKeys.push(key);
+      if (this.parseComposedSessionId(key) && !this.hasDurableCursorState(key)) {
+        parsedSessionIds.push(key);
+        this.clearSessionTurnIds(key);
+      }
+    }
+    if (parsedSessionIds.length > 0) {
+      this.clearMessageHookDedupForSessions(parsedSessionIds);
+    }
+    if (changed && !this.writeWatermarkFile()) {
+      this.logger.warn?.(
+        "[ChatTurnWriter.onAgentEnd] Failed to persist stale chat-turn cursor cleanup.",
+        { clearedKeys },
+      );
+    }
+    return clearedKeys;
+  }
+
+  private snapshotDurableCursorKeys(keys: string[]): Map<string, DurableCursorKeySnapshot> {
+    return new Map(keys.map((key) => [key, this.snapshotDurableCursorKey(key)] as const));
+  }
+
+  private snapshotDurableCursorKey(key: string): DurableCursorKeySnapshot {
+    return {
+      cachedWatermark: this.cachedWatermarks.get(key),
+      pendingIndex: this.debounceTimers.get(key)?.pendingIndex,
+      w4bCount: this.w4bSessionCounts.get(key),
+      markers: new Map(this.externalTurnMarkers.get(key) ?? []),
+      revision: this.durableCursorRevision(key),
+    };
+  }
+
+  private clearStaleDurableCursorKeyFromSnapshot(
+    key: string,
+    snapshot?: DurableCursorKeySnapshot,
+  ): boolean {
+    if (!snapshot) return false;
+    const revisionChanged = this.durableCursorRevision(key) !== snapshot.revision;
+    let changed = false;
+    const pending = this.debounceTimers.get(key);
+    if (!revisionChanged && pending && pending.pendingIndex === snapshot.pendingIndex) {
+      clearTimeout(pending.timer);
+      this.debounceTimers.delete(key);
+      changed = true;
+    }
+    if (
+      snapshot.pendingIndex !== undefined &&
+      !this.debounceTimers.has(key) &&
+      this.cachedWatermarks.get(key) === snapshot.pendingIndex
+    ) {
+      this.cachedWatermarks.delete(key);
+      changed = true;
+    }
+    if (
+      snapshot.cachedWatermark !== undefined &&
+      this.cachedWatermarks.get(key) === snapshot.cachedWatermark
+    ) {
+      this.cachedWatermarks.delete(key);
+      changed = true;
+    }
+    if (
+      snapshot.w4bCount !== undefined &&
+      this.w4bSessionCounts.get(key) === snapshot.w4bCount
+    ) {
+      this.w4bSessionCounts.delete(key);
+      changed = true;
+    }
+    const bucket = this.externalTurnMarkers.get(key);
+    if (bucket && snapshot.markers.size > 0) {
+      for (const [marker, snapshotCount] of snapshot.markers) {
+        const currentCount = bucket.get(marker);
+        if (currentCount === undefined) continue;
+        if (revisionChanged && currentCount === snapshotCount) continue;
+        if (currentCount <= snapshotCount) {
+          bucket.delete(marker);
+        } else {
+          bucket.set(marker, currentCount - snapshotCount);
+        }
+        changed = true;
+      }
+      if (bucket.size === 0) {
+        this.externalTurnMarkers.delete(key);
+      }
+    }
+    if (!changed) {
+      if (revisionChanged) {
+        this.logger.debug?.(
+          "[ChatTurnWriter.onAgentEnd] Preserved chat-turn cursor state changed during daemon validation.",
+          { key },
+        );
+      }
+      return false;
+    }
+    if (!this.hasDurableCursorState(key)) this.markDurableCursorKeyTrusted(key);
+    this.bumpDurableCursorKeyRevision(key);
+    return true;
+  }
+
+  private clearAllDurableCursorStateForKey(key: string): boolean {
+    let changed = false;
+    const pending = this.debounceTimers.get(key);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.debounceTimers.delete(key);
+      changed = true;
+    }
+    if (this.cachedWatermarks.delete(key)) changed = true;
+    if (this.w4bSessionCounts.delete(key)) changed = true;
+    if (this.externalTurnMarkers.delete(key)) changed = true;
+    if (!changed) return false;
+    this.markDurableCursorKeyTrusted(key);
+    this.bumpDurableCursorKeyRevision(key);
+    return true;
+  }
+
+  private uniqueStrings(values: Array<string | undefined>): string[] {
+    return Array.from(new Set(
+      values.filter((value): value is string => typeof value === "string" && value.length > 0),
+    ));
+  }
+
   private snapshotWatermarksForWrite(): Map<string, number> {
     const wm = new Map(this.cachedWatermarks);
     for (const [key, entry] of this.debounceTimers.entries()) {
@@ -2660,6 +2969,12 @@ export class ChatTurnWriter {
     return `external-id::${idHash}::${this.contentHash(user, this.stripRecalledMemory(assistant))}`;
   }
 
+  private externalTurnUserMarkerId(turnId?: unknown, user?: string): string {
+    if (typeof turnId !== "string" || turnId.trim().length === 0 || typeof user !== "string") return "";
+    const idHash = createHash("sha256").update(turnId.trim()).digest("hex").slice(0, 16);
+    return `external-user::${idHash}::${this.identityHash([user])}`;
+  }
+
   private typedW4bExternalMarkerId(user: string, assistant: string, occurrence: string): string {
     if (!occurrence) return "";
     return `weak-w4b::${this.identityHash([occurrence])}::${this.contentHash(user, this.stripRecalledMemory(assistant))}`;
@@ -2757,7 +3072,10 @@ export class ChatTurnWriter {
         bucket.set(marker, (bucket.get(marker) ?? 0) + 1);
         changed = true;
       }
-      if (bucket.size > 0) this.externalTurnMarkers.set(cursor, bucket);
+      if (bucket.size > 0) {
+        this.externalTurnMarkers.set(cursor, bucket);
+        if (changed) this.bumpDurableCursorKeyRevision(cursor);
+      }
     }
     return changed;
   }
@@ -2767,6 +3085,8 @@ export class ChatTurnWriter {
     turnIds: string[],
     user: string,
     assistant: string,
+    externalDirect: boolean,
+    allowOrderedFallback: boolean,
   ): ExternalMarkerAction {
     for (const turnId of turnIds) {
       const marker = this.externalTurnMarkerId(turnId, user, assistant);
@@ -2777,8 +3097,43 @@ export class ChatTurnWriter {
         // safe GC.
         return { skip: true, markers: [marker], rollbackMarkers: [] };
       }
+      const userMarker = externalDirect ? this.externalTurnUserMarkerId(turnId, user) : "";
+      if (userMarker && this.hasExternalTurnMarker(sessionKeyCursor, userMarker)) {
+        // Direct-channel user/turn markers cover OpenClaw transcript rendering
+        // drift on the assistant side while still requiring the explicit
+        // direct-channel turnId and canonical user body to match.
+        return { skip: true, markers: [userMarker], rollbackMarkers: [] };
+      }
+    }
+    if (allowOrderedFallback && turnIds.length === 0) {
+      const orderedMarker = ChatTurnWriter.EXTERNAL_ORDERED_TURN_MARKER;
+      const count = this.externalTurnMarkers.get(sessionKeyCursor)?.get(orderedMarker) ?? 0;
+      if (count > 0 && this.consumeExternalTurnMarker(sessionKeyCursor, orderedMarker)) {
+        return {
+          skip: true,
+          markers: [orderedMarker],
+          rollbackMarkers: [{ marker: orderedMarker, count }],
+        };
+      }
     }
     return { skip: false, markers: [], rollbackMarkers: [] };
+  }
+
+  private hasExternalTurnMarkerInLaterPairs(
+    sessionKeyCursor: string,
+    pairs: ComputedChatTurnPair[],
+    fromIndex: number,
+  ): boolean {
+    for (let i = fromIndex; i < pairs.length; i++) {
+      const { user, assistant, externalTurnIds, externalDirect } = pairs[i];
+      for (const turnId of externalTurnIds) {
+        const exactMarker = this.externalTurnMarkerId(turnId, user, assistant);
+        if (exactMarker && this.hasExternalTurnMarker(sessionKeyCursor, exactMarker)) return true;
+        const userMarker = externalDirect ? this.externalTurnUserMarkerId(turnId, user) : "";
+        if (userMarker && this.hasExternalTurnMarker(sessionKeyCursor, userMarker)) return true;
+      }
+    }
+    return false;
   }
 
   private hasExternalTurnMarker(sessionKeyCursor: string, marker: string): boolean {
@@ -2804,6 +3159,7 @@ export class ChatTurnWriter {
 
   private restoreExternalTurnMarker(sessionKeyCursor: string, marker: string): void {
     if (!marker) return;
+    this.bumpDurableCursorKeyRevision(sessionKeyCursor);
     const bucket = this.externalTurnMarkers.get(sessionKeyCursor) ?? new Map<string, number>();
     bucket.set(marker, Math.max(bucket.get(marker) ?? 0, 1));
     this.externalTurnMarkers.set(sessionKeyCursor, bucket);
@@ -2811,6 +3167,7 @@ export class ChatTurnWriter {
 
   private restoreExternalTurnMarkerCount(sessionKeyCursor: string, marker: string, count: number): void {
     if (!marker) return;
+    this.bumpDurableCursorKeyRevision(sessionKeyCursor);
     const bucket = this.externalTurnMarkers.get(sessionKeyCursor);
     if (count > 0) {
       const target = bucket ?? new Map<string, number>();
@@ -2820,6 +3177,16 @@ export class ChatTurnWriter {
     }
     if (!bucket) return;
     bucket.delete(marker);
+    if (bucket.size === 0) {
+      this.externalTurnMarkers.delete(sessionKeyCursor);
+    }
+  }
+
+  private clearExternalOrderedTurnMarker(sessionKeyCursor: string): void {
+    const bucket = this.externalTurnMarkers.get(sessionKeyCursor);
+    if (!bucket) return;
+    if (!bucket.delete(ChatTurnWriter.EXTERNAL_ORDERED_TURN_MARKER)) return;
+    this.bumpDurableCursorKeyRevision(sessionKeyCursor);
     if (bucket.size === 0) {
       this.externalTurnMarkers.delete(sessionKeyCursor);
     }
@@ -3346,6 +3713,7 @@ export class ChatTurnWriter {
   }
 
   private saveWatermark(sessionId: string, index: number): void {
+    this.bumpDurableCursorKeyRevision(sessionId);
     const existing = this.debounceTimers.get(sessionId);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => {
@@ -3375,6 +3743,7 @@ export class ChatTurnWriter {
       this.debounceTimers.delete(sessionId);
       opts = { ...opts, pendingIndex: existing.pendingIndex };
     }
+    this.bumpDurableCursorKeyRevision(sessionId);
     const currentWatermark = opts.pendingIndex ?? this.cachedWatermarks.get(sessionId) ?? -1;
     const timer = setTimeout(() => {
       this.debounceTimers.delete(sessionId);
@@ -3440,6 +3809,7 @@ export class ChatTurnWriter {
         if (typeof opts?.pairIndex === "number") {
           this.bumpWatermark(sessionId, opts.pairIndex);
         }
+        this.markDurableCursorKeyTrusted(sessionId);
         // T71 — Info-level persist log so Telegram / W4b chat turns are as
         // visible in the gateway log as Node-UI / W4a turns (which log via
         // DkgChannelPlugin's `[dkg-channel] Turn persisted to DKG graph: …`

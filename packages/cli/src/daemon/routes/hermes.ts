@@ -483,6 +483,8 @@ function buildHermesNodeUiSystemPrompt(
     for (const attachment of attachmentRefs) {
       lines.push(formatHermesAttachmentPromptLine(attachment));
     }
+    lines.push('For completed imported attachments, resolve the artifact with dkg_import_artifact_resolve, read Markdown with dkg_import_artifact_read_markdown when needed, inspect deterministic quads with dkg_assertion_query, and write model-derived triples only through dkg_semantic_enrichment_write unless the user explicitly asks for a different assertion workflow.');
+    lines.push('Keep deterministic import assertions separate from semantic enrichment assertions; do not promote or publish enrichment output unless explicitly instructed.');
   }
   return lines.join('\n');
 }
@@ -491,11 +493,15 @@ function formatHermesAttachmentPromptLine(attachment: OpenClawAttachmentRef): st
   const details = [
     `assertionUri=${formatHermesPromptValue(attachment.assertionUri)}`,
     `contextGraphId=${formatHermesPromptValue(attachment.contextGraphId)}`,
+    attachment.assertionName ? `assertionName=${formatHermesPromptValue(attachment.assertionName)}` : null,
     `fileHash=${formatHermesPromptValue(attachment.fileHash)}`,
     attachment.detectedContentType ? `contentType=${formatHermesPromptValue(attachment.detectedContentType)}` : null,
     attachment.extractionStatus ? `status=${formatHermesPromptValue(attachment.extractionStatus)}` : null,
     attachment.tripleCount != null ? `tripleCount=${attachment.tripleCount}` : null,
     attachment.rootEntity ? `rootEntity=${formatHermesPromptValue(attachment.rootEntity)}` : null,
+    attachment.mdIntermediateHash ? `mdIntermediateHash=${formatHermesPromptValue(attachment.mdIntermediateHash)}` : null,
+    attachment.markdownHash ? `markdownHash=${formatHermesPromptValue(attachment.markdownHash)}` : null,
+    attachment.markdownForm ? `markdownForm=${formatHermesPromptValue(attachment.markdownForm)}` : null,
   ].filter((item): item is string => item != null);
   return `- ${formatHermesPromptValue(attachment.fileName)}: ${details.join('; ')}`;
 }

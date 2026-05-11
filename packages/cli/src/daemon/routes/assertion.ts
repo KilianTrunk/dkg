@@ -57,7 +57,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, assertionLifecycleUri } from '@origintrail-official/dkg-core';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, escapeDkgRdfLiteral, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, assertionLifecycleUri } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import { validatePreSignedAuthorAttestation } from './memory.js';
 import {
@@ -328,6 +328,498 @@ import {
 
 import type { RequestContext } from './context.js';
 
+const DKG_ONTOLOGY = 'http://dkg.io/ontology/';
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+const PROV = 'http://www.w3.org/ns/prov#';
+const XSD_INTEGER = 'http://www.w3.org/2001/XMLSchema#integer';
+const XSD_DATE_TIME = 'http://www.w3.org/2001/XMLSchema#dateTime';
+const MAX_MARKDOWN_READ_BYTES = 5 * 1024 * 1024;
+const DEFAULT_MARKDOWN_READ_BYTES = 1024 * 1024;
+
+type ImportedArtifactResolution = {
+  contextGraphId: string;
+  assertionUri: string;
+  assertionName?: string;
+  assertionAgentAddress?: string;
+  subGraphName?: string;
+  fileHash: string;
+  sourceFileHash: string;
+  detectedContentType: string;
+  sourceContentType: string;
+  extractionStatus: 'completed';
+  extractionMethod?: string;
+  rootEntity?: string;
+  sourceFileName?: string;
+  tripleCount?: number;
+  structuralTripleCount?: number;
+  semanticTripleCount?: number;
+  mdIntermediateHash?: string;
+  markdownForm?: string;
+  markdownHash?: string;
+  canReadMarkdown: boolean;
+};
+
+class ImportArtifactRouteError extends Error {
+  constructor(
+    readonly statusCode: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+function bindingCellValue(cell: unknown): string {
+  if (typeof cell === 'string') return cell;
+  if (cell && typeof cell === 'object' && 'value' in cell) {
+    const value = (cell as { value?: unknown }).value;
+    return typeof value === 'string' ? value : '';
+  }
+  return '';
+}
+
+function normalizeLiteralBinding(cell: unknown): string {
+  return stripOpenClawAttachmentLiteral(bindingCellValue(cell)).trim();
+}
+
+function normalizeIriBinding(cell: unknown): string {
+  return bindingCellValue(cell).replace(/^<|>$/g, '').trim();
+}
+
+function optionalPositiveInteger(cell: unknown): number | undefined {
+  return parseOpenClawAttachmentTripleCount(bindingCellValue(cell));
+}
+
+function hashFromFileUrn(value: string | undefined): string | undefined {
+  const prefix = 'urn:dkg:file:';
+  if (!value?.startsWith(prefix)) return undefined;
+  const hash = value.slice(prefix.length);
+  return /^[a-z0-9]+:[0-9a-f]{64}$/i.test(hash) ? hash : undefined;
+}
+
+function validateContentHash(hash: string): boolean {
+  return /^(?:sha256:|keccak256:)?[0-9a-f]{64}$/i.test(hash);
+}
+
+function parseImportedAssertionUri(
+  assertionUri: string,
+  contextGraphId: string,
+): { assertionAgentAddress: string; assertionName: string; subGraphName?: string } | null {
+  const prefix = `did:dkg:context-graph:${contextGraphId}/`;
+  if (!assertionUri.startsWith(prefix)) return null;
+  const tail = assertionUri.slice(prefix.length);
+  let subGraphName: string | undefined;
+  let assertionTail = tail;
+  if (tail.startsWith('assertion/')) {
+    assertionTail = tail.slice('assertion/'.length);
+  } else {
+    const marker = tail.indexOf('/assertion/');
+    if (marker <= 0) return null;
+    subGraphName = tail.slice(0, marker);
+    const subGraphValidation = validateSubGraphName(subGraphName);
+    if (!subGraphValidation.valid) return null;
+    assertionTail = tail.slice(marker + '/assertion/'.length);
+  }
+
+  const slash = assertionTail.indexOf('/');
+  if (slash <= 0 || slash === assertionTail.length - 1) return null;
+  const assertionAgentAddress = assertionTail.slice(0, slash);
+  const assertionName = assertionTail.slice(slash + 1);
+  if (!assertionAgentAddress || !assertionName) return null;
+  return { assertionAgentAddress, assertionName, subGraphName };
+}
+
+function normalizeSemanticQuads(raw: unknown): Array<{ subject: string; predicate: string; object: string }> {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new ImportArtifactRouteError(400, '"semanticQuads" must be a non-empty array');
+  }
+  return raw.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new ImportArtifactRouteError(400, `semanticQuads[${index}] must be an object`);
+    }
+    const record = entry as Record<string, unknown>;
+    const subject = typeof record.subject === 'string' ? record.subject.trim() : '';
+    const predicate = typeof record.predicate === 'string' ? record.predicate.trim() : '';
+    const object = typeof record.object === 'string' ? record.object.trim() : '';
+    if (record.graph != null) {
+      throw new ImportArtifactRouteError(
+        400,
+        `semanticQuads[${index}].graph is not supported; semantic triples are written to the target assertion graph`,
+      );
+    }
+    if (!subject || !predicate || !object) {
+      throw new ImportArtifactRouteError(
+        400,
+        `semanticQuads[${index}] must include non-empty subject, predicate, and object strings`,
+      );
+    }
+    assertSafeIri(subject);
+    assertSafeIri(predicate);
+    let normalizedObject = object;
+    if (object.startsWith('"')) {
+      assertSafeRdfTerm(object);
+    } else if (isSafeIri(object)) {
+      assertSafeIri(object);
+    } else {
+      normalizedObject = rdfLiteral(object);
+    }
+    return { subject, predicate, object: normalizedObject };
+  });
+}
+
+function rdfLiteral(value: string): string {
+  return `"${escapeRdfLiteralBody(value)}"`;
+}
+
+function typedLiteral(value: string | number, typeIri: string): string {
+  return `"${escapeRdfLiteralBody(String(value))}"^^<${typeIri}>`;
+}
+
+function escapeRdfLiteralBody(value: string): string {
+  return escapeDkgRdfLiteral(value).replace(
+    /[\x00-\x07\x0B\x0E-\x1F\x7F]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`,
+  );
+}
+
+function buildSemanticEnrichmentProvenanceQuads(args: {
+  enrichmentUri: string;
+  source: ImportedArtifactResolution;
+  generatedBy: string;
+  generatedAt: string;
+  generationMethod: string;
+  semanticQuads: Array<{ subject: string; predicate: string; object: string }>;
+}): Array<{ subject: string; predicate: string; object: string }> {
+  const markdownHash = args.source.markdownHash ?? args.source.mdIntermediateHash;
+  const markdownForm = args.source.markdownForm
+    ?? (markdownHash ? `urn:dkg:file:${markdownHash}` : undefined);
+  const provenanceQuads: Array<{ subject: string; predicate: string; object: string }> = [
+    {
+      subject: args.enrichmentUri,
+      predicate: RDF_TYPE,
+      object: `${DKG_ONTOLOGY}SemanticEnrichment`,
+    },
+    {
+      subject: args.enrichmentUri,
+      predicate: `${DKG_ONTOLOGY}sourceAssertion`,
+      object: args.source.assertionUri,
+    },
+    {
+      subject: args.enrichmentUri,
+      predicate: `${PROV}wasDerivedFrom`,
+      object: args.source.assertionUri,
+    },
+    {
+      subject: args.enrichmentUri,
+      predicate: `${DKG_ONTOLOGY}sourceFileHash`,
+      object: rdfLiteral(args.source.fileHash),
+    },
+    {
+      subject: args.enrichmentUri,
+      predicate: `${DKG_ONTOLOGY}generationMethod`,
+      object: rdfLiteral(args.generationMethod),
+    },
+    {
+      subject: args.enrichmentUri,
+      predicate: `${DKG_ONTOLOGY}generatedBy`,
+      object: args.generatedBy,
+    },
+    {
+      subject: args.enrichmentUri,
+      predicate: `${DKG_ONTOLOGY}generatedAt`,
+      object: typedLiteral(args.generatedAt, XSD_DATE_TIME),
+    },
+    {
+      subject: args.enrichmentUri,
+      predicate: `${DKG_ONTOLOGY}semanticTripleCount`,
+      object: typedLiteral(args.semanticQuads.length, XSD_INTEGER),
+    },
+  ];
+
+  if (markdownHash) {
+    provenanceQuads.push({
+      subject: args.enrichmentUri,
+      predicate: `${DKG_ONTOLOGY}markdownHash`,
+      object: rdfLiteral(markdownHash),
+    });
+  }
+  if (markdownForm) {
+    provenanceQuads.push({
+      subject: args.enrichmentUri,
+      predicate: `${DKG_ONTOLOGY}markdownForm`,
+      object: markdownForm,
+    });
+  }
+  if (isSafeIri(args.generatedBy)) {
+    provenanceQuads.push({
+      subject: args.enrichmentUri,
+      predicate: `${PROV}wasAttributedTo`,
+      object: args.generatedBy,
+    });
+  }
+
+  for (const subject of new Set(args.semanticQuads.map((quad) => quad.subject))) {
+    provenanceQuads.push(
+      {
+        subject,
+        predicate: `${PROV}wasGeneratedBy`,
+        object: args.enrichmentUri,
+      },
+      {
+        subject,
+        predicate: `${PROV}wasDerivedFrom`,
+        object: args.source.assertionUri,
+      },
+    );
+  }
+
+  return provenanceQuads;
+}
+
+function semanticEnrichmentAssertionName(source: ImportedArtifactResolution): string {
+  const sourceName = source.assertionName ?? source.assertionUri.split('/').pop() ?? 'attachment';
+  const sourceSlug = sourceName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 42) || 'attachment';
+  return `semantic-enrichment-${sourceSlug}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+}
+
+async function semanticEnrichmentTargetExists(
+  ctx: RequestContext,
+  assertionUri: string,
+  contextGraphId: string,
+): Promise<boolean> {
+  const store = ctx.agent.store as typeof ctx.agent.store & { hasGraph?: (graphUri: string) => Promise<boolean> };
+  if (typeof store.hasGraph === 'function' && await store.hasGraph(assertionUri)) return true;
+  const metaGraph = contextGraphMetaUri(contextGraphId);
+  const result = await ctx.agent.store.query(`
+    SELECT ?p ?o WHERE {
+      GRAPH <${metaGraph}> {
+        <${assertionUri}> ?p ?o .
+      }
+    }
+    LIMIT 1
+  `) as { type?: string; bindings?: Array<Record<string, unknown>> };
+  return Boolean(result.bindings?.length);
+}
+
+function sortAssertionQuads<T>(quads: T[]): T[] {
+  return [...quads].sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+}
+
+function normalizeMarkdownReadLimit(raw: unknown): number {
+  if (raw == null) return DEFAULT_MARKDOWN_READ_BYTES;
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) {
+    throw new ImportArtifactRouteError(400, '"maxBytes" must be a positive integer');
+  }
+  return Math.min(raw, MAX_MARKDOWN_READ_BYTES);
+}
+
+function normalizeGeneratedAt(raw: unknown): string {
+  if (raw == null) return new Date().toISOString();
+  if (typeof raw !== 'string' || !raw.trim()) {
+    throw new ImportArtifactRouteError(400, '"generatedAt" must be an ISO date-time string');
+  }
+  const parsed = new Date(raw);
+  if (!Number.isFinite(parsed.getTime())) {
+    throw new ImportArtifactRouteError(400, '"generatedAt" must be an ISO date-time string');
+  }
+  return parsed.toISOString();
+}
+
+function normalizeGeneratedBy(raw: unknown, requestAgentAddress: string): string {
+  const requestAgent = requestAgentAddress.trim();
+  const fallback = isSafeIri(requestAgent) ? requestAgent : `did:dkg:agent:${requestAgent}`;
+  if (raw == null) return fallback;
+  if (typeof raw !== 'string' || !raw.trim()) {
+    throw new ImportArtifactRouteError(400, '"agentIdentity" must be a non-empty string');
+  }
+  const value = raw.trim();
+  if (isSafeIri(value)) return value;
+  return rdfLiteral(value);
+}
+
+function handleImportArtifactRouteError(res: ServerResponse, err: unknown): boolean {
+  if (err instanceof ImportArtifactRouteError) {
+    jsonResponse(res, err.statusCode, { error: err.message });
+    return true;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  if (
+    message.includes('Invalid') ||
+    message.includes('Unsafe') ||
+    message.includes('reserved namespace') ||
+    message.includes('not found') ||
+    (err as { name?: string })?.name === 'ReservedNamespaceError'
+  ) {
+    jsonResponse(res, 400, { error: message });
+    return true;
+  }
+  return false;
+}
+
+async function resolveImportedArtifact(
+  ctx: RequestContext,
+  raw: Record<string, unknown>,
+): Promise<ImportedArtifactResolution> {
+  const contextGraphId = typeof raw.contextGraphId === 'string' ? raw.contextGraphId.trim() : '';
+  if (!contextGraphId) {
+    throw new ImportArtifactRouteError(400, '"contextGraphId" is required');
+  }
+  if (!isValidContextGraphId(contextGraphId)) {
+    throw new ImportArtifactRouteError(400, 'Invalid contextGraphId');
+  }
+
+  const subGraphName = typeof raw.subGraphName === 'string' && raw.subGraphName.trim()
+    ? raw.subGraphName.trim()
+    : undefined;
+  if (subGraphName) {
+    const subGraphValidation = validateSubGraphName(subGraphName);
+    if (!subGraphValidation.valid) {
+      throw new ImportArtifactRouteError(400, `Invalid subGraphName: ${subGraphValidation.reason}`);
+    }
+  }
+
+  const assertionName = typeof raw.assertionName === 'string' && raw.assertionName.trim()
+    ? raw.assertionName.trim()
+    : undefined;
+  if (assertionName) {
+    const nameValidation = validateAssertionName(assertionName);
+    if (!nameValidation.valid) {
+      throw new ImportArtifactRouteError(400, `Invalid assertionName: ${nameValidation.reason}`);
+    }
+  }
+
+  const rawAssertionUri = typeof raw.assertionUri === 'string' && raw.assertionUri.trim()
+    ? raw.assertionUri.trim()
+    : undefined;
+  if (!rawAssertionUri) {
+    throw new ImportArtifactRouteError(400, '"assertionUri" is required');
+  }
+  if (rawAssertionUri && !isSafeIri(rawAssertionUri)) {
+    throw new ImportArtifactRouteError(400, 'Invalid assertionUri');
+  }
+
+  const assertionUri = rawAssertionUri;
+  const parsedAssertion = parseImportedAssertionUri(assertionUri, contextGraphId);
+  if (!parsedAssertion) {
+    throw new ImportArtifactRouteError(400, 'assertionUri is not an assertion in the supplied contextGraphId');
+  }
+  if (assertionName && assertionName !== parsedAssertion.assertionName) {
+    throw new ImportArtifactRouteError(400, '"assertionName" does not match assertionUri');
+  }
+  if (subGraphName && subGraphName !== parsedAssertion.subGraphName) {
+    throw new ImportArtifactRouteError(400, '"subGraphName" does not match assertionUri');
+  }
+
+  const requestedFileHash = typeof raw.fileHash === 'string' && raw.fileHash.trim()
+    ? raw.fileHash.trim()
+    : undefined;
+  if (requestedFileHash && !validateContentHash(requestedFileHash)) {
+    throw new ImportArtifactRouteError(400, 'Invalid fileHash');
+  }
+
+  const extractionRecord = getExtractionStatusRecord(ctx.extractionStatus, assertionUri);
+  if (extractionRecord && extractionRecord.status !== 'completed') {
+    throw new ImportArtifactRouteError(
+      409,
+      `Import artifact is not a completed extraction (status: ${extractionRecord.status})`,
+    );
+  }
+
+  const metaGraph = contextGraphMetaUri(contextGraphId);
+  const metaResult = await ctx.agent.store.query(`
+    SELECT ?fileHash ?contentType ?rootEntity ?structuralTripleCount ?semanticTripleCount ?extractionMethod ?extractionStatus ?mdIntermediateHash ?sourceFileName WHERE {
+      GRAPH <${metaGraph}> {
+        <${assertionUri}> <${DKG_ONTOLOGY}sourceFileHash> ?fileHash .
+        OPTIONAL { <${assertionUri}> <${DKG_ONTOLOGY}sourceContentType> ?contentType }
+        OPTIONAL { <${assertionUri}> <${DKG_ONTOLOGY}rootEntity> ?rootEntity }
+        OPTIONAL { <${assertionUri}> <${DKG_ONTOLOGY}structuralTripleCount> ?structuralTripleCount }
+        OPTIONAL { <${assertionUri}> <${DKG_ONTOLOGY}semanticTripleCount> ?semanticTripleCount }
+        OPTIONAL { <${assertionUri}> <${DKG_ONTOLOGY}extractionMethod> ?extractionMethod }
+        OPTIONAL { <${assertionUri}> <${DKG_ONTOLOGY}extractionStatus> ?extractionStatus }
+        OPTIONAL { <${assertionUri}> <${DKG_ONTOLOGY}mdIntermediateHash> ?mdIntermediateHash }
+        OPTIONAL { <${assertionUri}> <${DKG_ONTOLOGY}sourceFileName> ?sourceFileName }
+      }
+    }
+    LIMIT 1
+  `) as { type?: string; bindings?: Array<Record<string, unknown>> };
+  const metaBinding = metaResult.bindings?.[0];
+  if (!metaBinding) {
+    throw new ImportArtifactRouteError(404, 'No completed import metadata found for assertionUri');
+  }
+
+  const durableExtractionStatus = normalizeLiteralBinding(metaBinding.extractionStatus) || undefined;
+  if (durableExtractionStatus && durableExtractionStatus !== 'completed') {
+    throw new ImportArtifactRouteError(
+      409,
+      `Import artifact is not a completed extraction (status: ${durableExtractionStatus})`,
+    );
+  }
+
+  const sourceFileHash = normalizeLiteralBinding(metaBinding.fileHash);
+  if (!sourceFileHash || !validateContentHash(sourceFileHash)) {
+    throw new ImportArtifactRouteError(409, 'Import metadata is missing a valid source file hash');
+  }
+  if (requestedFileHash && requestedFileHash !== sourceFileHash) {
+    throw new ImportArtifactRouteError(400, 'fileHash does not match import metadata');
+  }
+
+  const durableSourceContentType = normalizeLiteralBinding(metaBinding.contentType) || undefined;
+  const sourceContentType = normalizeDetectedContentType(
+    durableSourceContentType || extractionRecord?.detectedContentType,
+  );
+  const mdIntermediateHash = normalizeLiteralBinding(metaBinding.mdIntermediateHash) || undefined;
+  if (mdIntermediateHash && !validateContentHash(mdIntermediateHash)) {
+    throw new ImportArtifactRouteError(409, 'Import metadata is missing a valid Markdown intermediate hash');
+  }
+  const markdownFormResult = await ctx.agent.store.query(`
+    SELECT DISTINCT ?markdownForm WHERE {
+      GRAPH <${assertionUri}> {
+        ?document <${DKG_ONTOLOGY}markdownForm> ?markdownForm .
+      }
+    }
+  `) as { type?: string; bindings?: Array<Record<string, unknown>> };
+  const authoritativeMarkdownHash = mdIntermediateHash
+    ?? (durableSourceContentType && normalizeDetectedContentType(durableSourceContentType) === 'text/markdown'
+      ? sourceFileHash
+      : undefined);
+  const graphMarkdownForms = (markdownFormResult.bindings ?? [])
+    .map((binding) => normalizeIriBinding(binding.markdownForm))
+    .filter(Boolean);
+  for (const graphMarkdownForm of graphMarkdownForms) {
+    const markdownFormHash = hashFromFileUrn(graphMarkdownForm);
+    if (!markdownFormHash || !authoritativeMarkdownHash || markdownFormHash !== authoritativeMarkdownHash) {
+      throw new ImportArtifactRouteError(409, 'Import metadata markdown hash does not match assertion markdownForm');
+    }
+  }
+  const markdownHash = authoritativeMarkdownHash;
+  const markdownForm = markdownHash ? `urn:dkg:file:${markdownHash}` : undefined;
+
+  return {
+    contextGraphId,
+    assertionUri,
+    assertionName: parsedAssertion.assertionName,
+    assertionAgentAddress: parsedAssertion.assertionAgentAddress,
+    ...(parsedAssertion.subGraphName ? { subGraphName: parsedAssertion.subGraphName } : {}),
+    fileHash: sourceFileHash,
+    sourceFileHash,
+    detectedContentType: sourceContentType,
+    sourceContentType,
+    extractionStatus: 'completed',
+    extractionMethod: normalizeLiteralBinding(metaBinding.extractionMethod) || extractionRecord?.pipelineUsed || undefined,
+    rootEntity: normalizeIriBinding(metaBinding.rootEntity) || extractionRecord?.rootEntity || undefined,
+    sourceFileName: normalizeLiteralBinding(metaBinding.sourceFileName) || extractionRecord?.fileName || undefined,
+    tripleCount: optionalPositiveInteger(metaBinding.structuralTripleCount) ?? extractionRecord?.tripleCount,
+    structuralTripleCount: optionalPositiveInteger(metaBinding.structuralTripleCount) ?? extractionRecord?.tripleCount,
+    semanticTripleCount: optionalPositiveInteger(metaBinding.semanticTripleCount),
+    ...(mdIntermediateHash ? { mdIntermediateHash } : {}),
+    ...(markdownForm ? { markdownForm } : {}),
+    ...(markdownHash ? { markdownHash } : {}),
+    canReadMarkdown: Boolean(markdownHash),
+  };
+}
 
 export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> {
   const {
@@ -362,6 +854,195 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     emitMemoryGraphChanged,
   } = ctx;
 
+  // POST /api/assertion/import-artifact/resolve
+  // Resolve a completed deterministic import artifact from graph metadata.
+  if (req.method === "POST" && path === "/api/assertion/import-artifact/resolve") {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    try {
+      const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>);
+      return jsonResponse(res, 200, { artifact });
+    } catch (err) {
+      if (handleImportArtifactRouteError(res, err)) return;
+      throw err;
+    }
+  }
+
+  // POST /api/assertion/import-artifact/read-markdown
+  // Read only the Markdown blob tied to a completed imported assertion.
+  if (req.method === "POST" && path === "/api/assertion/import-artifact/read-markdown") {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    try {
+      const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>);
+      const maxBytes = normalizeMarkdownReadLimit((parsed as Record<string, unknown>).maxBytes);
+      if (!artifact.markdownHash) {
+        return jsonResponse(res, 409, {
+          error: 'Import artifact does not have a readable Markdown source',
+          artifact,
+        });
+      }
+      const bytes = await fileStore.get(artifact.markdownHash);
+      if (!bytes) {
+        return jsonResponse(res, 404, {
+          error: 'Markdown content is not present in the file store',
+          artifact,
+        });
+      }
+      if (bytes.length > maxBytes) {
+        return jsonResponse(res, 413, {
+          error: `Markdown content exceeds maxBytes (${maxBytes})`,
+          artifact,
+          bytes: bytes.length,
+        });
+      }
+      return jsonResponse(res, 200, {
+        artifact,
+        markdownHash: artifact.markdownHash,
+        contentType: 'text/markdown',
+        bytes: bytes.length,
+        markdown: bytes.toString('utf8'),
+      });
+    } catch (err) {
+      if (handleImportArtifactRouteError(res, err)) return;
+      throw err;
+    }
+  }
+
+  // POST /api/assertion/semantic-enrichment/write
+  // Write model-derived semantic triples to a separate WM assertion with provenance.
+  if (req.method === "POST" && path === "/api/assertion/semantic-enrichment/write") {
+    const body = await readBody(req);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    try {
+      const record = parsed as Record<string, unknown>;
+      const artifact = await resolveImportedArtifact(ctx, record);
+      const targetName = typeof record.name === 'string' && record.name.trim()
+        ? record.name.trim()
+        : typeof record.semanticAssertionName === 'string' && record.semanticAssertionName.trim()
+          ? record.semanticAssertionName.trim()
+          : semanticEnrichmentAssertionName(artifact);
+      const nameValidation = validateAssertionName(targetName);
+      if (!nameValidation.valid) {
+        throw new ImportArtifactRouteError(400, `Invalid semantic assertion name: ${nameValidation.reason}`);
+      }
+      const semanticQuads = normalizeSemanticQuads(record.semanticQuads);
+      const generatedAt = normalizeGeneratedAt(record.generatedAt);
+      const generationMethod = typeof record.generationMethod === 'string' && record.generationMethod.trim()
+        ? record.generationMethod.trim()
+        : 'agent-semantic-enrichment';
+      const generatedBy = normalizeGeneratedBy(record.agentIdentity, requestAgentAddress);
+      const enrichmentUri = `urn:dkg:semantic-enrichment:${randomUUID()}`;
+      const provenanceQuads = buildSemanticEnrichmentProvenanceQuads({
+        enrichmentUri,
+        source: artifact,
+        generatedBy,
+        generatedAt,
+        generationMethod,
+        semanticQuads,
+      });
+      const targetSubGraphName = artifact.subGraphName;
+      const assertionUri = contextGraphAssertionUri(
+        artifact.contextGraphId,
+        requestAgentAddress,
+        targetName,
+        targetSubGraphName,
+      );
+      if (assertionUri === artifact.assertionUri) {
+        throw new ImportArtifactRouteError(
+          409,
+          'Semantic enrichment assertion must be separate from the source import assertion',
+        );
+      }
+      if (await semanticEnrichmentTargetExists(ctx, assertionUri, artifact.contextGraphId)) {
+        throw new ImportArtifactRouteError(
+          409,
+          'Semantic enrichment assertion already exists; choose a unique target name',
+        );
+      }
+      try {
+        await agent.publisher.assertionCreate(
+          artifact.contextGraphId,
+          targetName,
+          requestAgentAddress,
+          targetSubGraphName,
+        );
+      } catch (err: any) {
+        if (err?.message?.includes('already exists')) {
+          throw new ImportArtifactRouteError(
+            409,
+            'Semantic enrichment assertion already exists; choose a unique target name',
+          );
+        }
+        throw err;
+      }
+      const quads = [...semanticQuads, ...provenanceQuads];
+      try {
+        await agent.publisher.assertionWrite(
+          artifact.contextGraphId,
+          targetName,
+          requestAgentAddress,
+          quads,
+          targetSubGraphName,
+        );
+      } catch (err: any) {
+        try {
+          await agent.publisher.assertionDiscard(
+            artifact.contextGraphId,
+            targetName,
+            requestAgentAddress,
+            targetSubGraphName,
+          );
+        } catch (rollbackErr: any) {
+          const writeMessage = err instanceof Error ? err.message : String(err);
+          const rollbackMessage = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+          throw new Error(
+            `Semantic enrichment write failed and rollback failed: ${writeMessage}; rollback: ${rollbackMessage}`,
+          );
+        }
+        throw err;
+      }
+      emitMemoryGraphChanged?.({
+        contextGraphId: artifact.contextGraphId,
+        layers: ["wm"],
+        subGraphName: targetSubGraphName,
+        operation: "assertion_created",
+        source: "api",
+        counts: { triples: 0 },
+      });
+      emitMemoryGraphChanged?.({
+        contextGraphId: artifact.contextGraphId,
+        layers: ["wm"],
+        subGraphName: targetSubGraphName,
+        operation: "semantic_enrichment_written",
+        source: "api",
+        counts: { triples: quads.length },
+      });
+      return jsonResponse(res, 200, {
+        assertionUri,
+        assertionName: targetName,
+        contextGraphId: artifact.contextGraphId,
+        ...(targetSubGraphName ? { subGraphName: targetSubGraphName } : {}),
+        sourceAssertionUri: artifact.assertionUri,
+        sourceFileHash: artifact.fileHash,
+        markdownHash: artifact.markdownHash,
+        markdownForm: artifact.markdownForm,
+        enrichmentUri,
+        written: quads.length,
+        semanticTripleCount: semanticQuads.length,
+        provenanceTripleCount: provenanceQuads.length,
+        promoted: false,
+        published: false,
+        artifact,
+      });
+    } catch (err) {
+      if (handleImportArtifactRouteError(res, err)) return;
+      throw err;
+    }
+  }
 
   // POST /api/assertion/create
   //   Body: {
@@ -656,7 +1337,8 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         assertionName,
         subGraphName ? { subGraphName } : undefined,
       );
-      return jsonResponse(res, 200, { quads, count: quads.length });
+      const sortedQuads = sortAssertionQuads(quads);
+      return jsonResponse(res, 200, { quads: sortedQuads, count: sortedQuads.length });
     } catch (err: any) {
       if (
         err.message?.includes("not found") ||

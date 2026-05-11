@@ -1265,6 +1265,11 @@ describe('Hermes daemon routes', () => {
       pipelineUsed: null,
       tripleCount: 0,
     };
+    const verifiedAttachmentRef = {
+      ...attachmentRef,
+      markdownHash: attachmentRef.fileHash,
+      markdownForm: `urn:dkg:file:${attachmentRef.fileHash}`,
+    };
     const contextEntries = [{
       key: 'target_context_graph',
       label: 'Target context graph',
@@ -1796,13 +1801,16 @@ describe('Hermes daemon routes', () => {
     expect(systemPrompt).toContain('status="completed"');
     expect(systemPrompt).toContain('tripleCount=12');
     expect(systemPrompt).toContain('rootEntity="did:dkg:context-graph:project-1/assertion/notes"');
+    expect(systemPrompt).toContain(`markdownHash="${attachmentRef.fileHash}"`);
+    expect(systemPrompt).toContain('dkg_import_artifact_read_markdown');
+    expect(systemPrompt).toContain('dkg_semantic_enrichment_write');
     expect(storeChatExchange).toHaveBeenCalledWith(
       'hermes:dkg-ui:attachments',
       'summarize attached context',
       'Hermes attachment reply',
       undefined,
       expect.objectContaining({
-        attachmentRefs: [attachmentRef],
+        attachmentRefs: [verifiedAttachmentRef],
         persistenceState: 'stored',
       }),
     );

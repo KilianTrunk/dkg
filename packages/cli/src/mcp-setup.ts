@@ -1842,7 +1842,9 @@ export async function mcpSetupAction(
             try {
               const result = await deps.requestFaucetFunding(faucetUrl, faucetMode, wallets, effectiveAgentName);
               if (result?.success === false) {
-                console.warn('[setup] Faucet returned failure; emitting manual instructions.');
+                console.warn(
+                  `[setup] Faucet returned failure${result.error ? ` (${result.error})` : ''}; emitting manual instructions.`,
+                );
                 deps.logManualFundingInstructions(wallets, faucetUrl, faucetMode);
               } else if (result?.error) {
                 const failedWallets = Array.isArray(result.failedWallets) && result.failedWallets.length

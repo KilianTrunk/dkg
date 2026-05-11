@@ -73,6 +73,7 @@ export async function requestFaucetFunding(
   const fundedWallets = new Set<string>();
   const failedWallets = new Set<string>();
   const errors: string[] = [];
+  const faucetFailureReasons = new Set<string>();
   let sawSuccess = false;
 
   for (const batch of batches) {
@@ -113,6 +114,12 @@ export async function requestFaucetFunding(
       for (const result of results) {
         if (!result || typeof result !== 'object') continue;
         const record = result as Record<string, unknown>;
+        if (typeof record.status === 'string' && record.status !== 'success') {
+          const reason = typeof record.error === 'string' && record.error.length > 0
+            ? `${record.status}: ${record.error}`
+            : record.status;
+          faucetFailureReasons.add(reason);
+        }
         if (typeof record.address !== 'string' || typeof record.status !== 'string') continue;
         const key = record.address.toLowerCase();
         const statuses = resultStatusesByAddress.get(key) ?? [];
@@ -158,7 +165,12 @@ export async function requestFaucetFunding(
   }
 
   if (failedWallets.size > 0 && errors.length === 0) {
-    errors.push(`Faucet did not fund all wallets: ${Array.from(failedWallets).join(', ')}`);
+    const reasons = Array.from(faucetFailureReasons);
+    errors.push(
+      `Faucet did not fund all wallets: ${Array.from(failedWallets).join(', ')}${reasons.length > 0
+        ? `. Faucet reported: ${reasons.join('; ')}`
+        : ''}`,
+    );
   }
 
   if (errors.length > 0) {

@@ -205,6 +205,36 @@ describe('requestFaucetFunding', () => {
     expect(result.error).toContain('0x2');
   });
 
+  it('surfaces faucet result reasons when no wallets are funded', async () => {
+    const { fetch } = createTrackingFetch(200, {
+      summary: { success: 0, failed: 2 },
+      results: [
+        {
+          chainId: 'v10_base_sepolia_eth',
+          address: '0x1',
+          status: 'cooldown_active',
+          error: 'Caller cooldown active until 2026-05-11T19:17:45.000Z',
+        },
+        {
+          chainId: 'v10_base_sepolia_trac',
+          address: '0x1',
+          status: 'cooldown_active',
+          error: 'Caller cooldown active until 2026-05-11T19:17:49.000Z',
+        },
+      ],
+    });
+    const result = await requestFaucetFunding(
+      'https://faucet.example.com/fund', 'test', ['0x1'], 'cooldown-node', fetch,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.fundedWallets).toEqual([]);
+    expect(result.failedWallets).toEqual(['0x1']);
+    expect(result.error).toContain('Faucet did not fund all wallets: 0x1');
+    expect(result.error).toContain('cooldown_active: Caller cooldown active until 2026-05-11T19:17:45.000Z');
+    expect(result.error).toContain('cooldown_active: Caller cooldown active until 2026-05-11T19:17:49.000Z');
+  });
+
   it('returns no-wallets error for empty array', async () => {
     const { fetch, calls } = createTrackingFetch(200, {});
     const result = await requestFaucetFunding(

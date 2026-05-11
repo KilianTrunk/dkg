@@ -458,6 +458,31 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     fetchSpy.mockRestore();
   });
 
+  it('faucet result failures log faucet-provided reasons', async () => {
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps({
+      requestFaucetFunding: vi.fn(async () => ({
+        success: false,
+        fundedWallets: [],
+        failedWallets: ['0xadmin', '0xtest1', '0xtest2', '0xtest3'],
+        error: 'Faucet did not fund all wallets: 0xadmin. Faucet reported: cooldown_active: Caller cooldown active until 2026-05-11T19:17:45.000Z',
+      }) as any),
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      return new Response('{}', { status: 200 }) as any;
+    });
+
+    await mcpSetupAction({ verify: false }, deps);
+
+    expect(deps.logManualFundingInstructions).toHaveBeenCalledTimes(1);
+    const warned = (warnSpy.mock.calls as any[]).map((c) => c.join(' ')).join('\n');
+    expect(warned).toContain('cooldown_active');
+    expect(warned).toContain('2026-05-11T19:17:45.000Z');
+    expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(true);
+
+    fetchSpy.mockRestore();
+  });
+
   it('faucet partial success logs manual instructions for remaining wallets only', async () => {
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
     const deps = makeDeps({

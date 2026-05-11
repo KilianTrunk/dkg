@@ -60,6 +60,11 @@ Each wallet produces 2 result entries (ETH + TRAC). Possible `status` values: `s
 
 On `429` responses, back off using the `retry-after` header.
 
+Bundled setup commands such as `dkg init`, `dkg openclaw setup`, `dkg hermes setup`,
+and `dkg mcp setup` send a stable `callerId` derived from the configured node or
+agent name. Removing `~/.dkg` / `~/.dkg-dev` and re-running setup with the same
+name can therefore still hit caller cooldown even when new wallets are generated.
+
 ## Dry run (test without sending transactions)
 
 `POST /dry-run` accepts the same body but doesn't broadcast transactions. Use it to verify your request while avoiding on-chain transactions; note that dry-run requests still count against the shared funding rate limit.

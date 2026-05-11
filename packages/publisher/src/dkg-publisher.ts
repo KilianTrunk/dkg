@@ -3006,7 +3006,7 @@ export class DKGPublisher implements Publisher {
     contextGraphId: string,
     name: string,
     agentAddress: string,
-    opts?: { entities?: string[] | 'all'; subGraphName?: string; publisherPeerId?: string },
+    opts?: { entities?: string[] | 'all'; subGraphName?: string; publisherPeerId?: string; senderAgentAddress?: string },
   ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array }> {
     await this.ensureSubGraphRegistered(contextGraphId, opts?.subGraphName);
     const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, opts?.subGraphName);
@@ -3125,24 +3125,46 @@ export class DKGPublisher implements Publisher {
         privateMerkleRoot: undefined,
         privateTripleCount: 0,
       }));
+      const timestampMs = Date.now();
       const encoded = encodeWorkspacePublishRequest({
         contextGraphId: contextGraphId,
         nquads: new TextEncoder().encode(nquadsStr),
         manifest: manifestEntries,
         publisherPeerId: opts.publisherPeerId,
         workspaceOperationId: operationId,
-        timestampMs: Date.now(),
+        timestampMs,
         operationId,
         subGraphName: opts.subGraphName,
       });
 
-      if (encoded.length > DKG_GOSSIP_MAX_MESSAGE_BYTES) {
+      // Wrap the plaintext publish-request in the encrypted envelope
+      // when the CG requires it. Mirrors the `share()` and
+      // `conditionalShare()` paths — without this, the receiver-side
+      // check at `SharedMemoryHandler.handle` rejects the gossip
+      // ("Sender Key encrypted workspace payload required for private
+      // or agent-gated context graph"). Returns plaintext for public
+      // CGs (resolver returns requiresEncryption=false).
+      const wrapped = await this.encodeWorkspaceGossipPayload(
+        contextGraphId,
+        encoded,
+        {
+          localOnly: false,
+          senderAgentAddress: opts.senderAgentAddress,
+          operationId,
+          workspaceOperationId: operationId,
+          timestampMs,
+          subGraphName: opts.subGraphName,
+          publisherPeerId: opts.publisherPeerId,
+        },
+      );
+
+      if (wrapped.length > DKG_GOSSIP_MAX_MESSAGE_BYTES) {
         throw new Error(
-          `Promoted assertion too large for gossip (${formatBytesAsKb(encoded.length)}, limit ${formatGossipLimit(DKG_GOSSIP_MAX_MESSAGE_BYTES)}). ` +
+          `Promoted assertion too large for gossip (${formatBytesAsKb(wrapped.length)}, limit ${formatGossipLimit(DKG_GOSSIP_MAX_MESSAGE_BYTES)}). ` +
           `Promote fewer entities per call.`,
         );
       }
-      gossipMessage = encoded;
+      gossipMessage = wrapped;
     }
 
     // Rule 4: reject roots owned by a different peer before any mutations.

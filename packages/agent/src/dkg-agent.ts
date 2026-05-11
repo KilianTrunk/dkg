@@ -11057,13 +11057,23 @@ export class DKGAgent {
         return agent.publisher.assertionQuery(contextGraphId, name, agentAddress, opts?.subGraphName);
       },
       async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string }): Promise<{ promotedCount: number }> {
+        // Resolve the gossip signer up-front (mirrors `share()` /
+        // `conditionalShare()` patterns) so the publisher can wrap the
+        // promoted SWM gossip in the Sender Key encrypted envelope.
+        // Without this, private/agent-gated CGs receive plaintext
+        // gossip and the new `SharedMemoryHandler` check rejects it.
+        const gossipSigner = await agent.resolveWorkspaceGossipSigningAgent(contextGraphId);
         const { promotedCount, gossipMessage } = await agent.publisher.assertionPromote(
           contextGraphId, name, agentAddress,
-          { ...opts, publisherPeerId: agent.node.peerId.toString() },
+          {
+            ...opts,
+            publisherPeerId: agent.node.peerId.toString(),
+            senderAgentAddress: gossipSigner?.agentAddress,
+          },
         );
         if (gossipMessage) {
           try {
-            await agent.publishWorkspaceGossip(contextGraphId, gossipMessage, createOperationContext('share'));
+            await agent.publishWorkspaceGossip(contextGraphId, gossipMessage, createOperationContext('share'), gossipSigner);
           } catch (err: any) {
             agent.log.warn(createOperationContext('share'), `Promote gossip failed (local SWM committed): ${err?.message ?? err}`);
           }

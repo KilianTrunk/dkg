@@ -382,6 +382,7 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
     const authorityType =
       parsed.authorityType ?? parsed.authority?.type ?? "owner";
     const proofRef = authorityProofRef ?? parsed.authority?.proofRef;
+    const allowPublisherFallbackSeal = parsed.allowPublisherFallbackSeal;
     if (
       !contextGraphId ||
       !shareOperationId ||
@@ -405,6 +406,9 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
       transitionType,
       authority: { type: authorityType, proofRef },
       ...(priorVersion ? { priorVersion } : {}),
+      ...(allowPublisherFallbackSeal !== undefined
+        ? { allowPublisherFallbackSeal: Boolean(allowPublisherFallbackSeal) }
+        : {}),
     } as any);
     return jsonResponse(res, 200, {
       jobId,

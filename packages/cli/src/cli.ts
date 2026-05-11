@@ -2770,6 +2770,7 @@ publisherCmd
   .option('--transition-type <value>', 'Transition type (CREATE|MUTATE|REVOKE)', 'CREATE')
   .option('--authority-type <value>', 'Authority type (owner|multisig|quorum|capability)', 'owner')
   .option('--prior-version <value>', 'Prior version reference for MUTATE/REVOKE flows')
+  .option('--allow-publisher-fallback-seal', 'Allow publisher to mint the AuthorAttestation seal when caller did not supply one (V10 fallback)')
   .action(async (contextGraph: string, opts: ActionOpts) => {
     try {
       const shareOperationId = opts.shareOperationId ?? opts.workspaceOperationId;
@@ -2804,6 +2805,7 @@ publisherCmd
         authorityType: authorityType as 'owner' | 'multisig' | 'quorum' | 'capability',
         authorityProofRef: String(opts.authorityProofRef),
         priorVersion: opts.priorVersion ? String(opts.priorVersion) : undefined,
+        ...(opts.allowPublisherFallbackSeal ? { allowPublisherFallbackSeal: true } : {}),
       };
 
       let jobId: string;

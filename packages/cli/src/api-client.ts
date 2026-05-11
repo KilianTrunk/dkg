@@ -535,6 +535,7 @@ export class ApiClient {
     transitionType?: 'CREATE' | 'MUTATE' | 'REVOKE';
     authorityType?: 'owner' | 'multisig' | 'quorum' | 'capability';
     priorVersion?: string;
+    allowPublisherFallbackSeal?: boolean;
   }): Promise<{ jobId: string; contextGraphId: string; shareOperationId: string; rootsCount: number }> {
     return this.post('/api/publisher/enqueue', request);
   }

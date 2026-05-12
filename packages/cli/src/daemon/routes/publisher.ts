@@ -373,7 +373,19 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
     }
     const parsed =
       raw.request && typeof raw.request === "object" ? raw.request : raw;
-    const { roots, namespace, scope, authorityProofRef, priorVersion } = parsed;
+    const {
+      roots,
+      namespace,
+      scope,
+      authorityProofRef,
+      priorVersion,
+      subGraphName,
+      accessPolicy,
+      allowedPeers,
+      entityProofs,
+      publisherNodeIdentityIdOverride,
+      seal,
+    } = parsed;
     const contextGraphId = parsed.contextGraphId;
     const shareOperationId =
       parsed.shareOperationId ?? parsed.workspaceOperationId;
@@ -395,6 +407,13 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
         error: "Missing required enqueue fields",
       });
     }
+    // V10 sign-at-enqueue extensions (PR #455). The HTTP route is the
+    // low-level lift API; callers that need a sealed on-chain publish
+    // must build the EIP-712 AuthorAttestation themselves (via
+    // `buildAuthorAttestationTypedData` + their own signer) and pass it
+    // here. Sealless enqueues are accepted; the publisher gate at
+    // `dkg-publisher.ts:1825` skips on-chain (tentative) when the CG
+    // is not on-chain, and rejects with a clear error when it is.
     const jobId = await publisherControl.lift({
       swmId,
       shareOperationId,
@@ -405,6 +424,14 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
       transitionType,
       authority: { type: authorityType, proofRef },
       ...(priorVersion ? { priorVersion } : {}),
+      ...(subGraphName ? { subGraphName } : {}),
+      ...(accessPolicy ? { accessPolicy } : {}),
+      ...(Array.isArray(allowedPeers) && allowedPeers.length > 0 ? { allowedPeers } : {}),
+      ...(entityProofs !== undefined ? { entityProofs: !!entityProofs } : {}),
+      ...(publisherNodeIdentityIdOverride !== undefined
+        ? { publisherNodeIdentityIdOverride: String(publisherNodeIdentityIdOverride) }
+        : {}),
+      ...(seal !== undefined ? { seal } : {}),
     } as any);
     return jsonResponse(res, 200, {
       jobId,

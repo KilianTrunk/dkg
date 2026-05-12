@@ -1006,40 +1006,40 @@ describe('publishJsonLd', () => {
     expect(job?.request.publisherNodeIdentityIdOverride).toBe('0');
   }, 15_000);
 
-  it('async publish fails fast when V10+CG-registered but no signer is available (vs silently enqueueing a doomed job)', async () => {
-    // Codex PR #455 comment 2: previously, if no author override was
-    // supplied AND the publisher had no fallback signer, `buildAsyncLiftSeal`
-    // silently returned undefined and the job got enqueued without a
-    // seal — guaranteeing publisher rejection at processNext-time.
-    // Replace that silent path with a clear throw at enqueue time so
-    // the caller learns immediately, with actionable guidance (register
-    // an agent, pre-sign, or configure publisher key).
-    const { agent } = await createAgent('AsyncFailFastBot');
-    await agent.createContextGraph({ id: 'async-fail-fast', name: 'AsyncFailFast', description: '' });
-    await agent.registerContextGraph('async-fail-fast');
+  it('async publish enqueues sealless when no signer is available (sync parity)', async () => {
+    // Codex PR #455 follow-up rounds 1 & 2: chain-prereq failures (no
+    // signer configured, CG not on-chain) downgrade to a sealless
+    // enqueue + warning instead of failing fast — mirroring sync
+    // `_publish` at `dkg-agent.ts:4047`. The publisher's gate at
+    // `dkg-publisher.ts:1825` skips on-chain (tentative) when the CG
+    // is not on-chain, and the V10 path's seal check at
+    // `dkg-publisher.ts:1955` returns a clear error when it is. The
+    // failure mode is the publisher's call, not enqueue's.
+    const { agent, store } = await createAgent('AsyncSealNoSigner');
+    await agent.createContextGraph({ id: 'async-no-signer', name: 'AsyncNoSigner', description: '' });
+    await agent.registerContextGraph('async-no-signer');
 
-    // Stub the publisher's fallback signer resolution to return undefined,
-    // simulating a daemon configured without `publisherPrivateKey` on a
-    // V10-ready chain with an on-chain CG.
     const publisher = (agent as unknown as { publisher: { publisherFallbackAuthorAddress: (cgId?: bigint) => Promise<string | undefined> } }).publisher;
     const original = publisher.publisherFallbackAuthorAddress.bind(publisher);
     publisher.publisherFallbackAuthorAddress = async () => undefined;
 
     try {
-      await expect(
-        agent.publishAsync(
-          'did:dkg:context-graph:async-fail-fast',
-          {
-            public: {
-              '@context': 'http://schema.org/',
-              '@id': 'http://example.org/FailFastEntity',
-              '@type': 'Thing',
-              'name': 'FailFast',
-            },
+      const { captureID } = await agent.publishAsync(
+        'did:dkg:context-graph:async-no-signer',
+        {
+          public: {
+            '@context': 'http://schema.org/',
+            '@id': 'http://example.org/NoSignerEntity',
+            '@type': 'Thing',
+            'name': 'NoSigner',
           },
-          { localOnly: true },
-        ),
-      ).rejects.toThrow(/no publisher signer|no author override/);
+        },
+        { localOnly: true },
+      );
+
+      const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+      const job = await asyncPublisher.getStatus(captureID);
+      expect(job?.request.seal).toBeUndefined();
     } finally {
       publisher.publisherFallbackAuthorAddress = original;
     }
@@ -1110,62 +1110,102 @@ describe('publishJsonLd', () => {
     }
   }, 30_000);
 
-  it('async publish throws at enqueue when V10 is ready but the CG is not registered on-chain', async () => {
-    // Codex PR #455 follow-up review #2: previously, if the CG had no
-    // on-chain id at enqueue-time, `buildAsyncLiftSeal` silently
-    // returned undefined and enqueued a seal-less job that the
-    // publisher would later try to publish on-chain and reject
-    // (since publisher-side fallback was removed in this PR).
-    // Fail-fast at enqueue with actionable guidance.
-    const { agent } = await createAgent('AsyncNoOnChainBot');
+  it('async publish enqueues sealless when CG is not registered on-chain (sync parity)', async () => {
+    // Codex PR #455 follow-up rounds 1 & 2:
+    //
+    //   Sync `agent.publish` skips seal-build when the CG has no
+    //   on-chain id (`dkg-agent.ts:_publish`); the publisher then
+    //   skips on-chain at `dkg-publisher.ts:1825` ("No positive on-chain
+    //   context graph id resolved...") and goes tentative. Async must
+    //   mirror this: enqueue without seal, let the publisher decide
+    //   tentative-or-fail at processNext-time. Failing fast at enqueue
+    //   would block legitimate tentative-only workflows.
+    const { agent, store } = await createAgent('AsyncNoOnChainBot');
     await agent.createContextGraph({ id: 'async-no-onchain', name: 'AsyncNoOnChain', description: '' });
     // Intentionally skip registerContextGraph so the CG has no on-chain id.
 
-    await expect(
-      agent.publishAsync(
-        'did:dkg:context-graph:async-no-onchain',
-        {
-          public: {
-            '@context': 'http://schema.org/',
-            '@id': 'http://example.org/NoOnChainEntity',
-            '@type': 'Thing',
-            'name': 'NoOnChain',
-          },
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-no-onchain',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/NoOnChainEntity',
+          '@type': 'Thing',
+          'name': 'NoOnChain',
         },
-        { localOnly: true },
-      ),
-    ).rejects.toThrow(/not registered on-chain|registerContextGraph/);
+      },
+      { localOnly: true },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.seal).toBeUndefined();
   }, 15_000);
 
-  it('async publish invokes subtractFinalizedExactQuads (codex PR #455 partial-overlap parity)', async () => {
-    // Codex PR #455 follow-up review #1: the publisher runs
+  it('async publish seal reflects subtracted set when canonical root already confirmed (codex PR #455 #3)', async () => {
+    // Codex PR #455 follow-up review #1 + #3: the publisher runs
     // `subtractFinalizedExactQuads` between validation and merkle
-    // compute at processNext-time. If the agent signs over the FULL
-    // pre-subtraction slice, a CREATE job with quads overlapping any
-    // already-finalized publish would fail SEAL INTEGRITY PREFLIGHT
-    // because the publisher recomputes the merkle over the subtracted
-    // set. The fix mirrors the subtraction step into the agent's
-    // seal-build pipeline so both sides compute the same merkle.
+    // compute at processNext-time. The agent must apply the SAME
+    // subtraction at enqueue so both sides compute the same merkle.
     //
-    // This test pins that the agent's pipeline invokes subtraction
-    // — verified by importing the published-package's symbol and
-    // observing the call shape. Full end-to-end partial-overlap
-    // exercise is covered by the EPCIS demo's repeated-publish
-    // smoke path (Aggregate — Finalized: 7 · Failed: 0) and by
-    // unit tests in the publisher package that already pin
-    // `subtractFinalizedExactQuads` behavior. We test the wiring
-    // here rather than the cross-publish state machine, which has
-    // many moving parts (meta-graph confirmed-status writes,
-    // ownedEntities cache, Rule 4 ordering) that are themselves
-    // covered in the publisher suite.
-    const { subtractFinalizedExactQuads } = await import('@origintrail-official/dkg-publisher');
-    expect(typeof subtractFinalizedExactQuads).toBe('function');
+    // Observable test: pre-populate the meta-graph + data-graph with
+    // confirmed state matching the canonical root the agent will
+    // compute, then publishAsync the same root/triple. If the agent's
+    // pipeline invokes subtraction, the buildAsyncLiftSeal full-overlap
+    // short-circuit triggers and the enqueued job has no seal. If
+    // subtraction is removed, the agent signs over the full pre-
+    // subtraction slice and the job carries a seal.
+    const { agent, store } = await createAgent('AsyncSubtractObserve');
+    await agent.createContextGraph({ id: 'async-subtract-observe', name: 'AsyncSubtractObs', description: '' });
+    await agent.registerContextGraph('async-subtract-observe');
 
-    // The agent imports the same symbol via the publisher index, so
-    // verifying its export here pins the contract that the agent's
-    // buildAsyncLiftSeal can reach it. If a future refactor removes
-    // it, this test fails — and the codex bug returns.
-  }, 5_000);
+    const root = 'http://example.org/AlreadyPublished';
+    const namespace = 'async-publish';
+    const scope = 'context-graph';
+    // Mirror `canonicalRootIri` in async-lift-validation.ts: slugged
+    // (cgId:ns:scope) + rootTail + first-6-byte sha256 hex digest.
+    const { sha256 } = await import('@origintrail-official/dkg-core');
+    const slug = (v: string) =>
+      v.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'unknown';
+    const rootTail = (() => {
+      const i = Math.max(root.lastIndexOf('/'), root.lastIndexOf(':'));
+      return i >= 0 ? root.slice(i + 1) : root;
+    })();
+    const rootHash = Array.from(sha256(new TextEncoder().encode(root)))
+      .slice(0, 6)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    const canonical = `dkg:${slug('async-subtract-observe')}:${slug(namespace)}:${slug(scope)}/${slug(rootTail)}-${rootHash}`;
+    const dataGraph = `did:dkg:context-graph:async-subtract-observe`;
+    const metaGraph = `did:dkg:context-graph:async-subtract-observe/_meta`;
+    const kcUal = 'urn:dkg:test:kc:async-subtract-observe';
+
+    // Pre-populate confirmed KC + matching authoritative quad in store.
+    await store.insert([
+      { subject: kcUal, predicate: 'http://dkg.io/ontology/rootEntity', object: `"${canonical}"`, graph: metaGraph },
+      { subject: kcUal, predicate: 'http://dkg.io/ontology/partOf', object: kcUal, graph: metaGraph },
+      { subject: kcUal, predicate: 'http://dkg.io/ontology/status', object: '"confirmed"', graph: metaGraph },
+      { subject: canonical, predicate: 'http://example.org/p', object: '"hello"', graph: dataGraph },
+    ]);
+
+    // publishAsync the same root/triple — full overlap → seal undefined.
+    const { captureID } = await agent.publishAsync(
+      'async-subtract-observe',
+      {
+        publicQuads: [{ subject: root, predicate: 'http://example.org/p', object: '"hello"', graph: '' }],
+        privateQuads: [],
+      },
+      { localOnly: true },
+    );
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    // Full overlap with confirmed state → buildAsyncLiftSeal returns
+    // undefined (short-circuit at `dkg-agent.ts` post-subtraction).
+    // If subtraction is removed from the agent pipeline, the seal
+    // would be present here.
+    expect(job?.request.seal).toBeUndefined();
+  }, 20_000);
 
   it('async publish records and resolves subGraphName for staged public and private data', async () => {
     const { agent, store } = await createAgent('AsyncSubGraphBot');

@@ -3838,9 +3838,44 @@ export class DKGAgent {
     if (opts?.authorSignTypedData !== undefined && opts?.authorAgentAddress === undefined) {
       throw new Error('publishAsync: authorSignTypedData requires authorAgentAddress');
     }
-    const seal: LiftRequestAuthorSeal | undefined = opts?.preSignedAuthorAttestation
-      ? preSignedAttestationToLiftSeal(opts.preSignedAuthorAttestation)
-      : await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, opts?.authorSignTypedData);
+    // User-input pre-validation: caller asked for a specific author but
+    // the daemon can't sign for them. These are config bugs, not prereq
+    // failures — surface them immediately rather than letting the
+    // seal-build try/catch below swallow them into a sealless enqueue.
+    if (opts?.authorAgentAddress != null && opts.authorSignTypedData == null) {
+      const mode = this.getLocalAgentMode(opts.authorAgentAddress);
+      if (mode === undefined) {
+        throw new Error(`publishAsync: ${opts.authorAgentAddress} is not a registered local agent`);
+      }
+      if (mode === 'self-sovereign') {
+        throw new Error(
+          `publishAsync: agent ${opts.authorAgentAddress} is self-sovereign — supply ` +
+            'authorSignTypedData callback or preSignedAuthorAttestation instead',
+        );
+      }
+    }
+    // Sync parity (`_publish` at `dkg-agent.ts:4047`): chain-prereq failures
+    // (CG not on-chain, no signer configured, etc.) downgrade to a sealless
+    // enqueue + warning, never a hard error. The publisher gate at
+    // `dkg-publisher.ts:1825` skips on-chain when the CG is not on-chain
+    // (goes tentative); when it IS on-chain it rejects sealless V10
+    // publishes with a clear error at processNext-time. Either way, the
+    // failure mode is the publisher's call, not enqueue's.
+    let seal: LiftRequestAuthorSeal | undefined;
+    if (opts?.preSignedAuthorAttestation) {
+      seal = preSignedAttestationToLiftSeal(opts.preSignedAuthorAttestation);
+    } else {
+      try {
+        seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, opts?.authorSignTypedData);
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `Async seal mint failed; on-chain publish will fall back to tentative: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
 
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
     const captureID = await asyncPublisher.lift({
@@ -3881,13 +3916,12 @@ export class DKGAgent {
     if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
 
     const onChainId = await this.getContextGraphOnChainId(request.contextGraphId);
-    if (onChainId == null) {
-      // V10 ready but CG not on-chain — fail fast instead of enqueueing a doomed seal-less job.
-      throw new Error(
-        `publishAsync: context graph "${request.contextGraphId}" is not registered on-chain. ` +
-          'Call `agent.registerContextGraph(name)` first.',
-      );
-    }
+    // Sync parity: when CG is not on-chain, the publisher's V10 gate
+    // (`dkg-publisher.ts:1825`) skips on-chain and goes tentative. Return
+    // undefined so the lift job enqueues sealless — publisher decides at
+    // processNext-time whether to go tentative or reject (when CG gets
+    // registered before processNext but no seal was built at enqueue).
+    if (onChainId == null) return undefined;
 
     const chainId = await this.chain.getEvmChainId();
     const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
@@ -3929,35 +3963,21 @@ export class DKGAgent {
     );
 
     // Resolve author (callback → custodial keystore → publisher fallback).
+    // User-input cases (bogus / self-sovereign authorAgentAddress) are
+    // already pre-validated at the publishAsync entry; here we only need
+    // the chain-prereq branch — when no signer is available we return
+    // undefined so the lift enqueues sealless (matches sync `_publish`).
     let authorAddress: string;
     let signerPrivateKey: string | undefined;
     if (authorSignTypedData !== undefined) {
       authorAddress = authorAgentAddress as string;
     } else if (authorAgentAddress != null) {
-      const mode = this.getLocalAgentMode(authorAgentAddress);
-      if (mode === undefined) {
-        throw new Error(`publishAsync: ${authorAgentAddress} is not a registered local agent`);
-      }
-      if (mode === 'self-sovereign') {
-        throw new Error(
-          `publishAsync: agent ${authorAgentAddress} is self-sovereign — supply ` +
-            'authorSignTypedData callback or preSignedAuthorAttestation instead',
-        );
-      }
       signerPrivateKey = this.getCustodialAgentPrivateKey(authorAgentAddress);
-      if (!signerPrivateKey) {
-        throw new Error(`publishAsync: custodial agent ${authorAgentAddress} has no private key`);
-      }
+      if (!signerPrivateKey) return undefined;
       authorAddress = authorAgentAddress;
     } else {
       const fallback = await this.publisher.publisherFallbackAuthorAddress();
-      if (!fallback) {
-        throw new Error(
-          'publishAsync: no author override and no publisher signer configured. ' +
-            'Pass authorAgentAddress / authorSignTypedData / preSignedAuthorAttestation, ' +
-            'or configure a publisher private key.',
-        );
-      }
+      if (!fallback) return undefined;
       authorAddress = fallback;
     }
 

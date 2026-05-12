@@ -3757,6 +3757,35 @@ export class DKGAgent {
       throw new ContextGraphNotFoundError(contextGraphId);
     }
 
+    // Validate caller-controlled options BEFORE writeToWorkspace and
+    // private staging, so a rejected publishAsync leaves no orphan data
+    // in SWM. Mutex (preSigned + authorAgentAddress/authorSignTypedData)
+    // and registered-agent checks are pure input validation — they
+    // don't need the staged data to evaluate.
+    if (opts?.preSignedAuthorAttestation !== undefined) {
+      if (opts?.authorAgentAddress !== undefined) {
+        throw new Error('publishAsync: preSignedAuthorAttestation and authorAgentAddress are mutually exclusive');
+      }
+      if (opts?.authorSignTypedData !== undefined) {
+        throw new Error('publishAsync: preSignedAuthorAttestation and authorSignTypedData are mutually exclusive');
+      }
+    }
+    if (opts?.authorSignTypedData !== undefined && opts?.authorAgentAddress === undefined) {
+      throw new Error('publishAsync: authorSignTypedData requires authorAgentAddress');
+    }
+    if (opts?.authorAgentAddress != null && opts.authorSignTypedData == null) {
+      const mode = this.getLocalAgentMode(opts.authorAgentAddress);
+      if (mode === undefined) {
+        throw new Error(`publishAsync: ${opts.authorAgentAddress} is not a registered local agent`);
+      }
+      if (mode === 'self-sovereign') {
+        throw new Error(
+          `publishAsync: agent ${opts.authorAgentAddress} is self-sovereign — supply ` +
+            'authorSignTypedData callback or preSignedAuthorAttestation instead',
+        );
+      }
+    }
+
     let publicQuads: Quad[];
     let privateQuads: Quad[];
     try {
@@ -3825,35 +3854,6 @@ export class DKGAgent {
         : undefined,
     } as const;
 
-    // Resolution priority: preSigned bytes → custodial agent OR callback → publisher fallback.
-    // Mutex mirrors sync `assertionFinalize`: pick one author-resolution path.
-    if (opts?.preSignedAuthorAttestation !== undefined) {
-      if (opts?.authorAgentAddress !== undefined) {
-        throw new Error('publishAsync: preSignedAuthorAttestation and authorAgentAddress are mutually exclusive');
-      }
-      if (opts?.authorSignTypedData !== undefined) {
-        throw new Error('publishAsync: preSignedAuthorAttestation and authorSignTypedData are mutually exclusive');
-      }
-    }
-    if (opts?.authorSignTypedData !== undefined && opts?.authorAgentAddress === undefined) {
-      throw new Error('publishAsync: authorSignTypedData requires authorAgentAddress');
-    }
-    // User-input pre-validation: caller asked for a specific author but
-    // the daemon can't sign for them. These are config bugs, not prereq
-    // failures — surface them immediately rather than letting the
-    // seal-build try/catch below swallow them into a sealless enqueue.
-    if (opts?.authorAgentAddress != null && opts.authorSignTypedData == null) {
-      const mode = this.getLocalAgentMode(opts.authorAgentAddress);
-      if (mode === undefined) {
-        throw new Error(`publishAsync: ${opts.authorAgentAddress} is not a registered local agent`);
-      }
-      if (mode === 'self-sovereign') {
-        throw new Error(
-          `publishAsync: agent ${opts.authorAgentAddress} is self-sovereign — supply ` +
-            'authorSignTypedData callback or preSignedAuthorAttestation instead',
-        );
-      }
-    }
     // Sync parity (`_publish` at `dkg-agent.ts:4047`): chain-prereq failures
     // (CG not on-chain, no signer configured, etc.) downgrade to a sealless
     // enqueue + warning, never a hard error. The publisher gate at

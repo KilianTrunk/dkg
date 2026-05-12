@@ -1,3 +1,4 @@
+import { ethers } from 'ethers';
 import type { Quad } from '@origintrail-official/dkg-storage';
 import type { OperationContext } from '@origintrail-official/dkg-core';
 import type {
@@ -152,26 +153,44 @@ function liftSealToPrecomputedAttestation(seal: NonNullable<LiftRequest['seal']>
   schemeVersion: number;
 } {
   return {
-    expectedMerkleRoot: hexToBytes(seal.merkleRoot),
+    expectedMerkleRoot: decodeSealField('merkleRoot', seal.merkleRoot, 32),
     authorAddress: seal.authorAddress,
     signature: {
-      r: hexToBytes(seal.signature.r),
-      vs: hexToBytes(seal.signature.vs),
+      r: decodeSealField('signature.r', seal.signature.r, 32),
+      vs: decodeSealField('signature.vs', seal.signature.vs, 32),
     },
     schemeVersion: seal.schemeVersion,
   };
 }
 
-function hexToBytes(hex: string): Uint8Array {
-  const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
-  if (clean.length % 2 !== 0) {
-    throw new Error(`Invalid hex string length: ${hex}`);
+/**
+ * Decode a hex-encoded seal field with content + length validation.
+ *
+ * Uses `ethers.getBytes` (rejects non-hex characters) and binds expected
+ * lengths so a malformed persisted seal can't be silently mutated into
+ * the wrong size. The previous home-grown `parseInt`-based decoder
+ * silently turned `NaN` into `0`, producing a corrupted attestation
+ * that the publisher would then submit on-chain — caught by codex
+ * review on PR #455.
+ */
+function decodeSealField(
+  fieldName: string,
+  hex: string,
+  expectedBytes: number,
+): Uint8Array {
+  let bytes: Uint8Array;
+  try {
+    bytes = ethers.getBytes(hex);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Lift seal ${fieldName} contains invalid hex: ${message}`);
   }
-  const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  if (bytes.length !== expectedBytes) {
+    throw new Error(
+      `Lift seal ${fieldName} must be exactly ${expectedBytes} bytes; got ${bytes.length} (hex: ${hex})`,
+    );
   }
-  return out;
+  return bytes;
 }
 
 export function prepareAsyncPublishPayload(input: LiftPublishMappingInput): AsyncPreparedPublishPayload {

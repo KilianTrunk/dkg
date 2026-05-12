@@ -1004,6 +1004,110 @@ describe('publishJsonLd', () => {
     expect(job?.request.publisherNodeIdentityIdOverride).toBe('0');
   }, 15_000);
 
+  it('async publish fails fast when V10+CG-registered but no signer is available (vs silently enqueueing a doomed job)', async () => {
+    // Codex PR #455 comment 2: previously, if no author override was
+    // supplied AND the publisher had no fallback signer, `buildAsyncLiftSeal`
+    // silently returned undefined and the job got enqueued without a
+    // seal — guaranteeing publisher rejection at processNext-time.
+    // Replace that silent path with a clear throw at enqueue time so
+    // the caller learns immediately, with actionable guidance (register
+    // an agent, pre-sign, or configure publisher key).
+    const { agent } = await createAgent('AsyncFailFastBot');
+    await agent.createContextGraph({ id: 'async-fail-fast', name: 'AsyncFailFast', description: '' });
+    await agent.registerContextGraph('async-fail-fast');
+
+    // Stub the publisher's fallback signer resolution to return undefined,
+    // simulating a daemon configured without `publisherPrivateKey` on a
+    // V10-ready chain with an on-chain CG.
+    const publisher = (agent as unknown as { publisher: { publisherFallbackAuthorAddress: (cgId?: bigint) => Promise<string | undefined> } }).publisher;
+    const original = publisher.publisherFallbackAuthorAddress.bind(publisher);
+    publisher.publisherFallbackAuthorAddress = async () => undefined;
+
+    try {
+      await expect(
+        agent.publishAsync(
+          'did:dkg:context-graph:async-fail-fast',
+          {
+            public: {
+              '@context': 'http://schema.org/',
+              '@id': 'http://example.org/FailFastEntity',
+              '@type': 'Thing',
+              'name': 'FailFast',
+            },
+          },
+          { localOnly: true },
+        ),
+      ).rejects.toThrow(/no publisher signer is configured|no agent override supplied/);
+    } finally {
+      publisher.publisherFallbackAuthorAddress = original;
+    }
+  }, 15_000);
+
+  it('async publish does NOT pass cgId to publisher fallback methods (matches sync assertionFinalize behavior)', async () => {
+    // Codex PR #455 comment 3 asked us to thread `onChainId` into
+    // `publisherFallbackAuthorAddress` / `signAuthorAttestationAsPublisher`
+    // for per-CG resolver parity with `DKGPublisher.publish()`. We
+    // intentionally DON'T — and this test pins that decision so a
+    // future refactor doesn't silently re-introduce the broken state.
+    //
+    // Reasoning: threading cgId surfaces a latent divergence in
+    // `getPublisherSigner` where `signTypedData` falls back to the
+    // chain adapter's default signer when `signTypedDataAs` is
+    // missing — producing seals whose recovered signer doesn't match
+    // the recorded `authorAddress`. The deeper fix (signTypedData
+    // recovery+verify in `getPublisherSigner`, mirroring the existing
+    // signMessage path) lives in the publisher, not the agent, and
+    // is out of scope for this PR. Sync `assertionFinalize` also
+    // does not thread cgId — async stays consistent with sync.
+    const { agent } = await createAgent('AsyncSyncParityBot');
+    await agent.createContextGraph({ id: 'async-sync-parity', name: 'AsyncSyncParity', description: '' });
+    await agent.registerContextGraph('async-sync-parity');
+
+    const publisher = (agent as unknown as {
+      publisher: {
+        publisherFallbackAuthorAddress: (cgId?: bigint) => Promise<string | undefined>;
+        signAuthorAttestationAsPublisher: (typedData: unknown, cgId?: bigint) => Promise<{ r: Uint8Array; vs: Uint8Array }>;
+      };
+    }).publisher;
+    const originalFallback = publisher.publisherFallbackAuthorAddress.bind(publisher);
+    const originalSign = publisher.signAuthorAttestationAsPublisher.bind(publisher);
+
+    const fallbackCalls: Array<bigint | undefined> = [];
+    const signCalls: Array<bigint | undefined> = [];
+    publisher.publisherFallbackAuthorAddress = async (cgId?: bigint) => {
+      fallbackCalls.push(cgId);
+      return originalFallback(cgId);
+    };
+    publisher.signAuthorAttestationAsPublisher = async (typedData: unknown, cgId?: bigint) => {
+      signCalls.push(cgId);
+      return originalSign(typedData as any, cgId);
+    };
+
+    try {
+      await agent.publishAsync(
+        'did:dkg:context-graph:async-sync-parity',
+        {
+          public: {
+            '@context': 'http://schema.org/',
+            '@id': 'http://example.org/SyncParityEntity',
+            '@type': 'Thing',
+            'name': 'SyncParity',
+          },
+        },
+        { localOnly: true },
+      );
+      // Both methods called at least once with undefined cgId (no
+      // CG-aware resolution). Future PR threading cgId properly will
+      // need to update this expectation in lockstep with a fix for
+      // the underlying signer-fallback bug.
+      expect(fallbackCalls).toContain(undefined);
+      expect(signCalls).toContain(undefined);
+    } finally {
+      publisher.publisherFallbackAuthorAddress = originalFallback;
+      publisher.signAuthorAttestationAsPublisher = originalSign;
+    }
+  }, 30_000);
+
   it('async publish records and resolves subGraphName for staged public and private data', async () => {
     const { agent, store } = await createAgent('AsyncSubGraphBot');
     await agent.createContextGraph({ id: 'async-subgraph', name: 'AsyncSubGraph', description: '' });

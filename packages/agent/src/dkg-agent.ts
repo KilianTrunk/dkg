@@ -4091,8 +4091,33 @@ export class DKGAgent {
       }
       authorAddress = authorAgentAddress;
     } else {
+      // Match sync `assertionFinalize` / `publishFromSharedMemory` —
+      // they call these methods without cgId. Threading cgId here
+      // would surface a latent `getPublisherSigner` signer-fallback
+      // divergence (where the resolved address is the per-CG publisher
+      // wallet but the actual signer falls back to the chain
+      // adapter's default), producing seals whose recovered signer
+      // doesn't match the recorded authorAddress. Codex PR #455
+      // comment 3 surfaced this case; the deeper fix lives in
+      // `DKGPublisher.getPublisherSigner` (signTypedData fallback
+      // verification, mirroring the existing signMessage path) and
+      // is out of scope for this PR. Tracked as follow-up.
       const fallback = await this.publisher.publisherFallbackAuthorAddress();
-      if (!fallback) return undefined;
+      if (!fallback) {
+        // Fail-fast at enqueue rather than silently enqueueing a
+        // seal-less job that the publisher will reject at processNext
+        // (codex PR #455 comment 2). The chain IS V10-ready and the
+        // CG IS on-chain — so the publish path REQUIRES a seal. No
+        // fallback signer means the operator has not configured one
+        // and we have nothing to attribute the seal to.
+        throw new Error(
+          'publishAsync: no agent override supplied (authorAgentAddress / authorSignTypedData / ' +
+            'preSignedAuthorAttestation) and no publisher signer is configured for this context graph. ' +
+            'Either register a custodial agent via `agent.registerAgent(name)` and pass its address as ' +
+            '`authorAgentAddress`, supply a pre-signed seal via `preSignedAuthorAttestation`, or configure ' +
+            'a publisher private key on the daemon.',
+        );
+      }
       authorAddress = fallback;
     }
 
@@ -4126,6 +4151,9 @@ export class DKGAgent {
       r = ethers.getBytes(sig.r);
       vs = ethers.getBytes(sig.yParityAndS);
     } else {
+      // No cgId — matches sync `assertionFinalize`. See the comment
+      // above the fallback-address resolution for why threading
+      // cgId here exposes a latent signer-fallback divergence.
       const sig = await this.publisher.signAuthorAttestationAsPublisher(typedData);
       r = sig.r;
       vs = sig.vs;

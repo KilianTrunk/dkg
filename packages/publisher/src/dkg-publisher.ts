@@ -392,6 +392,18 @@ export class DKGPublisher implements Publisher {
    * Returns `undefined` when no publisher signer is configured
    * (tentative-only daemon); finalize must then fail because there's
    * no key to sign with.
+   *
+   * Note: this method intentionally does NOT take a `contextGraphId`
+   * arg. Codex PR #455 review #3 proposed threading cgId for per-CG
+   * `publisherAddressResolver` parity with `DKGPublisher.publish()`,
+   * but doing so surfaces a latent signer-fallback divergence in
+   * `getPublisherSigner` (where `signTypedData` falls back to the
+   * chain adapter's default signer when `signTypedDataAs` is absent)
+   * — producing seals whose recovered signer doesn't match the
+   * recorded `authorAddress`. The cgId-threading change is gated on
+   * a publisher-side fix that mirrors the existing signMessage
+   * recovery+verify into the signTypedData path. Tracked as a
+   * follow-up to PR #455.
    */
   async publisherFallbackAuthorAddress(): Promise<string | undefined> {
     return this.resolvePublisherAddress();

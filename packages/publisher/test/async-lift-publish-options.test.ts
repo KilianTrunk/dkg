@@ -336,6 +336,90 @@ describe('mapLiftRequestToPublishOptions', () => {
     expect(seal.signature.vs).toEqual(new Uint8Array(32).fill(0xcc));
   });
 
+  it('rejects malformed hex in seal.merkleRoot instead of silently zeroing bytes', () => {
+    // Codex caught a real bug: the old `parseInt(pair, 16)` produced
+    // `NaN` for non-hex characters, which `Uint8Array` then coerced to
+    // `0` — silently corrupting the attestation bytes rather than
+    // failing the job. The fix routes through a validating decoder
+    // (`ethers.getBytes`) so non-hex content throws at the boundary.
+    const customAuthor = '0xAaaAAaaaAaaaaaAAAaAaaaaaAAAaAAAaAAAaaaaa' as `0x${string}`;
+    expect(() =>
+      mapLiftRequestToPublishOptions({
+        ...baseInput(),
+        request: {
+          ...baseInput().request,
+          seal: {
+            merkleRoot: ('0x' + 'zz'.repeat(32)) as `0x${string}`,
+            authorAddress: customAuthor,
+            signature: {
+              r: ('0x' + 'bb'.repeat(32)) as `0x${string}`,
+              vs: ('0x' + 'cc'.repeat(32)) as `0x${string}`,
+            },
+            schemeVersion: 1,
+          },
+        },
+        resolved: {
+          ...baseInput().resolved,
+          publisherPeerId: '12D3KooWPublisher',
+        },
+      }),
+    ).toThrow();
+  });
+
+  it('rejects wrong-length seal.merkleRoot (must be 32 bytes)', () => {
+    // Defensive length validation: a malformed seal that decodes
+    // cleanly as hex but has the wrong byte count would slip past
+    // `ethers.getBytes` alone. Bind expected lengths explicitly so
+    // the attestation can't be silently truncated/padded.
+    const customAuthor = '0xAaaAAaaaAaaaaaAAAaAaaaaaAAAaAAAaAAAaaaaa' as `0x${string}`;
+    expect(() =>
+      mapLiftRequestToPublishOptions({
+        ...baseInput(),
+        request: {
+          ...baseInput().request,
+          seal: {
+            merkleRoot: ('0x' + 'aa'.repeat(16)) as `0x${string}`, // 16 bytes, not 32
+            authorAddress: customAuthor,
+            signature: {
+              r: ('0x' + 'bb'.repeat(32)) as `0x${string}`,
+              vs: ('0x' + 'cc'.repeat(32)) as `0x${string}`,
+            },
+            schemeVersion: 1,
+          },
+        },
+        resolved: {
+          ...baseInput().resolved,
+          publisherPeerId: '12D3KooWPublisher',
+        },
+      }),
+    ).toThrow(/merkleRoot|32 bytes/);
+  });
+
+  it('rejects wrong-length seal.signature.r (must be 32 bytes)', () => {
+    const customAuthor = '0xAaaAAaaaAaaaaaAAAaAaaaaaAAAaAAAaAAAaaaaa' as `0x${string}`;
+    expect(() =>
+      mapLiftRequestToPublishOptions({
+        ...baseInput(),
+        request: {
+          ...baseInput().request,
+          seal: {
+            merkleRoot: ('0x' + 'aa'.repeat(32)) as `0x${string}`,
+            authorAddress: customAuthor,
+            signature: {
+              r: ('0x' + 'bb'.repeat(16)) as `0x${string}`, // 16 bytes
+              vs: ('0x' + 'cc'.repeat(32)) as `0x${string}`,
+            },
+            schemeVersion: 1,
+          },
+        },
+        resolved: {
+          ...baseInput().resolved,
+          publisherPeerId: '12D3KooWPublisher',
+        },
+      }),
+    ).toThrow(/signature\.r|32 bytes/);
+  });
+
   it('forwards request.entityProofs to PublishOptions.entityProofs (overrides resolved.entityProofs)', () => {
     // Caller intent persisted at enqueue (`request.entityProofs`)
     // takes precedence over per-process resolution defaults

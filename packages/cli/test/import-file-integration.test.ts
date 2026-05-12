@@ -529,6 +529,84 @@ async function runImportFileOrchestration(params: {
       },
     }));
   };
+  const previousExtractionStatusRecord = extractionStatus.get(assertionUri);
+  const importMetaValue = (
+    snapshot: CapturedQuad[],
+    predicate: string,
+  ): string | undefined => snapshot.find(q =>
+    q.subject === assertionUri &&
+    q.predicate === `http://dkg.io/ontology/${predicate}`
+  )?.object;
+  const parseImportMetaLiteral = (value: string | undefined): string | undefined => {
+    const trimmed = value?.trim();
+    if (!trimmed) return undefined;
+    const literalMatch = /^"((?:[^"\\]|\\.)*)"/.exec(trimmed);
+    if (literalMatch) {
+      try {
+        return JSON.parse(literalMatch[0]);
+      } catch {
+        return literalMatch[1];
+      }
+    }
+    return trimmed.replace(/^<|>$/g, '');
+  };
+  const parseImportMetaInteger = (value: string | undefined): number | undefined => {
+    const integerMatch = /^"(-?\d+)"/.exec(value?.trim() ?? '');
+    if (!integerMatch) return undefined;
+    const parsed = Number.parseInt(integerMatch[1], 10);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+  const buildPreviousExtractionStatusRecordFromMeta = (
+    snapshot: CapturedQuad[],
+  ): ExtractionStatusRecord | undefined => {
+    const fileHash = parseImportMetaLiteral(importMetaValue(snapshot, 'sourceFileHash'));
+    const detectedContentType = parseImportMetaLiteral(importMetaValue(snapshot, 'sourceContentType'));
+    const tripleCount = parseImportMetaInteger(importMetaValue(snapshot, 'structuralTripleCount'));
+    if (!fileHash || !detectedContentType || tripleCount == null) {
+      return undefined;
+    }
+    const extractionStatus = parseImportMetaLiteral(importMetaValue(snapshot, 'extractionStatus'));
+    const statusValue = extractionStatus === 'skipped' ? 'skipped' : 'completed';
+    const restoredAt = new Date().toISOString();
+    const fileName = parseImportMetaLiteral(importMetaValue(snapshot, 'sourceFileName'));
+    const rootEntity = parseImportMetaLiteral(importMetaValue(snapshot, 'rootEntity'));
+    const mdIntermediateHashFromMeta = parseImportMetaLiteral(importMetaValue(snapshot, 'mdIntermediateHash'));
+    return {
+      status: statusValue,
+      fileHash,
+      ...(fileName ? { fileName } : {}),
+      ...(rootEntity ? { rootEntity } : {}),
+      detectedContentType,
+      pipelineUsed: statusValue === 'skipped' ? null : detectedContentType,
+      tripleCount,
+      ...(mdIntermediateHashFromMeta ? { mdIntermediateHash: mdIntermediateHashFromMeta } : {}),
+      startedAt: restoredAt,
+      completedAt: restoredAt,
+    };
+  };
+  const getRestorablePreviousExtractionStatusRecord = (
+    metaSnapshot: CapturedQuad[],
+  ): ExtractionStatusRecord | undefined =>
+    previousExtractionStatusRecord
+      ? { ...previousExtractionStatusRecord }
+      : buildPreviousExtractionStatusRecordFromMeta(metaSnapshot);
+  const restoreExtractionStatusRecord = (record: ExtractionStatusRecord): void => {
+    extractionStatus.set(assertionUri, record);
+  };
+  const failWithRestoredPreviousStatus = (
+    statusCode: number,
+    error: string,
+    tripleCount: number,
+    previousStatusRecord: ExtractionStatusRecord,
+    failedPipelineUsed: string | null = pipelineUsed,
+  ): never => {
+    try {
+      fail(statusCode, error, tripleCount, failedPipelineUsed);
+    } catch (routeError) {
+      restoreExtractionStatusRecord(previousStatusRecord);
+      throw routeError;
+    }
+  };
 
   await recordInProgress();
 
@@ -659,7 +737,19 @@ async function runImportFileOrchestration(params: {
           ? `; rollback failures: ${rollbackErrors.join('; ')}`
           : '';
         if (message.includes('has not been registered') || message.includes('Invalid') || message.includes('Unsafe')) {
+          const previousStatusRecord = rollbackErrors.length === 0
+            ? getRestorablePreviousExtractionStatusRecord(preCreateMetaSnapshot)
+            : undefined;
+          if (previousStatusRecord) {
+            failWithRestoredPreviousStatus(400, `${message}${rollbackSuffix}`, 0, previousStatusRecord);
+          }
           fail(400, `${message}${rollbackSuffix}`, 0);
+        }
+        const previousStatusRecord = rollbackErrors.length === 0
+          ? getRestorablePreviousExtractionStatusRecord(preCreateMetaSnapshot)
+          : undefined;
+        if (previousStatusRecord) {
+          failWithRestoredPreviousStatus(500, `${message}${rollbackSuffix}`, 0, previousStatusRecord);
         }
         fail(500, `${message}${rollbackSuffix}`, 0);
       }
@@ -705,7 +795,14 @@ async function runImportFileOrchestration(params: {
       const rollbackSuffix = rollbackErrors.length > 0
         ? `; rollback failures: ${rollbackErrors.join('; ')}`
         : '';
-      recordFailed(`Failed to persist skipped extraction metadata: ${err?.message ?? String(err)}${rollbackSuffix}`, 0);
+      const previousStatusRecord = rollbackErrors.length === 0
+        ? getRestorablePreviousExtractionStatusRecord(preCreateMetaSnapshot)
+        : undefined;
+      if (previousStatusRecord) {
+        restoreExtractionStatusRecord(previousStatusRecord);
+      } else {
+        recordFailed(`Failed to persist skipped extraction metadata: ${err?.message ?? String(err)}${rollbackSuffix}`, 0);
+      }
       throw err;
     }
 
@@ -962,6 +1059,13 @@ async function runImportFileOrchestration(params: {
           triples.length,
         );
         (writeErr as any).__failureAlreadyRecorded = true;
+      } else {
+        const previousStatusRecord =
+          getRestorablePreviousExtractionStatusRecord(metaSnapshot);
+        if (previousStatusRecord) {
+          (writeErr as any).__previousExtractionStatusRecord =
+            previousStatusRecord;
+        }
       }
       throw writeErr;
     }
@@ -990,6 +1094,12 @@ async function runImportFileOrchestration(params: {
     // landed, but we still record the failure so /extraction-status
     // doesn't stay stuck at in_progress.
     recordFailed(err?.message ?? String(err), triples.length);
+    const previousStatusRecord = err?.__previousExtractionStatusRecord as
+      | ExtractionStatusRecord
+      | undefined;
+    if (previousStatusRecord) {
+      restoreExtractionStatusRecord(previousStatusRecord);
+    }
     throw err;
   }
 
@@ -2101,6 +2211,8 @@ describe('import-file orchestration — graceful degrade', () => {
     const metaBefore = agent.insertedQuads
       .filter(q => q.graph === metaGraph && q.subject === assertionGraph)
       .map(q => ({ ...q }));
+    const statusBefore = { ...status.get(assertionGraph)! };
+    expect(statusBefore.status).toBe('completed');
 
     const failingAgent = makeMockAgent('0xMockAgentPeerId', {
       insertPartialBeforeErrorPredicate: (quads, callNumber) =>
@@ -2132,8 +2244,7 @@ describe('import-file orchestration — graceful degrade', () => {
       q.graph === metaGraph && q.subject === assertionGraph
     )).toEqual(metaBefore);
     expect(failingAgent.insertCallCount).toBe(3);
-    expect(status.get(assertionGraph)?.status).toBe('failed');
-    expect(status.get(assertionGraph)?.error).toContain('Failed to persist skipped extraction metadata');
+    expect(status.get(assertionGraph)).toEqual(statusBefore);
   });
 
   it('skipped re-import restores prior data even when metadata rollback also fails', async () => {
@@ -3266,6 +3377,8 @@ describe('import-file orchestration — source-file linkage (§10.1 / §6.3 / §
       agent, fileStore, extractionRegistry: registry, extractionStatus: status,
       multipartBody: bodyV1, boundary: BOUNDARY, assertionName: 'meta-rollback',
     });
+    const statusBefore = { ...status.get(resultV1.assertionUri)! };
+    expect(statusBefore.status).toBe('completed');
     const metaGraphUri = contextGraphMetaUri('cg');
 
     // Snapshot V1's `_meta` state for post-rollback comparison.
@@ -3309,12 +3422,49 @@ describe('import-file orchestration — source-file linkage (§10.1 / §6.3 / §
     expect(metaAfter).toHaveLength(metaBefore.length);
     const sourceFileHashAfter = metaAfter.find(q => q.predicate === `${DKG}sourceFileHash`);
     expect(sourceFileHashAfter?.object).toBe(`"${resultV1.fileHash}"`);
+    expect(status.get(resultV1.assertionUri)).toEqual(statusBefore);
     // And data-graph rollback still works (Round 4 Bug 11 invariant).
     const assertionGraph = contextGraphAssertionUri('cg', rollbackAgent.peerId, 'meta-rollback');
     const dataContentHash = rollbackAgent.insertedQuads.find(q =>
       q.graph === assertionGraph && q.predicate === `${DKG}contentHash`,
     );
     expect(dataContentHash?.object).toBe(`"${resultV1.fileHash}"`);
+  });
+
+  it('failed re-import after daemon restart rebuilds previous extraction status from restored _meta', async () => {
+    const bodyV1 = buildMultipart([
+      { kind: 'text', name: 'contextGraphId', value: 'cg' },
+      { kind: 'file', name: 'file', filename: 'v1.md', contentType: 'text/markdown', content: Buffer.from('# V1 content\n\nFirst.\n', 'utf-8') },
+    ]);
+    const resultV1 = await runImportFileOrchestration({
+      agent, fileStore, extractionRegistry: registry, extractionStatus: status,
+      multipartBody: bodyV1, boundary: BOUNDARY, assertionName: 'restart-status-rollback',
+    });
+    status.clear();
+
+    const rollbackAgent = makeMockAgent('0xMockAgentPeerId', {
+      insertErrorPredicate: (_quads, callNumber) =>
+        callNumber === 1 ? new Error('simulated V2 atomic insert failure') : null,
+    });
+    for (const q of agent.insertedQuads) {
+      rollbackAgent.insertedQuads.push({ ...q });
+    }
+
+    const bodyV2 = buildMultipart([
+      { kind: 'text', name: 'contextGraphId', value: 'cg' },
+      { kind: 'file', name: 'file', filename: 'v2.md', contentType: 'text/markdown', content: Buffer.from('# V2 content\n\nSecond.\n', 'utf-8') },
+    ]);
+    await expect(runImportFileOrchestration({
+      agent: rollbackAgent, fileStore, extractionRegistry: registry, extractionStatus: status,
+      multipartBody: bodyV2, boundary: BOUNDARY, assertionName: 'restart-status-rollback',
+    })).rejects.toThrow('simulated V2 atomic insert failure');
+
+    const record = status.get(resultV1.assertionUri);
+    expect(record?.status).toBe('completed');
+    expect(record?.fileHash).toBe(resultV1.fileHash);
+    expect(record?.detectedContentType).toBe('text/markdown');
+    expect(record?.pipelineUsed).toBe('text/markdown');
+    expect(record?.tripleCount).toBeGreaterThan(0);
   });
 
   it('Bug 15: rollback does NOT restore `_meta` rows for OTHER assertions', async () => {

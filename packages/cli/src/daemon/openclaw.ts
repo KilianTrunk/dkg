@@ -1211,11 +1211,12 @@ export async function verifyOpenClawAttachmentRefsProvenance(
 
     const metaGraph = contextGraphMetaUri(ref.contextGraphId);
     const metaResult = await agent.store.query(`
-      SELECT ?fileHash ?contentType ?rootEntity ?tripleCount ?sourceFileName WHERE {
+      SELECT ?fileHash ?contentType ?rootEntity ?extractionStatus ?tripleCount ?sourceFileName WHERE {
         GRAPH <${metaGraph}> {
           <${ref.assertionUri}> <http://dkg.io/ontology/sourceFileHash> ?fileHash .
           OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/sourceContentType> ?contentType }
           OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/rootEntity> ?rootEntity }
+          OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/extractionStatus> ?extractionStatus }
           OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/structuralTripleCount> ?tripleCount }
           OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/sourceFileName> ?sourceFileName }
         }
@@ -1234,6 +1235,8 @@ export async function verifyOpenClawAttachmentRefsProvenance(
     ) {
       return undefined;
     }
+    const storedExtractionStatus = stripOpenClawAttachmentLiteral(binding.extractionStatus ?? '').trim();
+    if (storedExtractionStatus && storedExtractionStatus !== 'completed') return undefined;
     if (ref.extractionStatus && ref.extractionStatus !== 'completed') return undefined;
 
     const storedTripleCount = parseOpenClawAttachmentTripleCount(binding.tripleCount ?? '');

@@ -1227,6 +1227,110 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           error,
         });
       };
+      const previousExtractionStatusRecord = getExtractionStatusRecord(
+        extractionStatus,
+        assertionUri,
+      );
+      const importMetaValue = (
+        snapshot: Array<{
+          subject: string;
+          predicate: string;
+          object: string;
+          graph: string;
+        }>,
+        predicate: string,
+      ): string | undefined => snapshot.find((q) =>
+        q.subject === assertionUri &&
+        q.predicate === `http://dkg.io/ontology/${predicate}`
+      )?.object;
+      const parseImportMetaLiteral = (
+        value: string | undefined,
+      ): string | undefined => {
+        const trimmed = value?.trim();
+        if (!trimmed) return undefined;
+        const literalMatch = /^"((?:[^"\\]|\\.)*)"/.exec(trimmed);
+        if (literalMatch) {
+          try {
+            return JSON.parse(literalMatch[0]);
+          } catch {
+            return literalMatch[1];
+          }
+        }
+        return trimmed.replace(/^<|>$/g, "");
+      };
+      const parseImportMetaInteger = (
+        value: string | undefined,
+      ): number | undefined => {
+        const integerMatch = /^"(-?\d+)"/.exec(value?.trim() ?? "");
+        if (!integerMatch) return undefined;
+        const parsed = Number.parseInt(integerMatch[1], 10);
+        return Number.isFinite(parsed) ? parsed : undefined;
+      };
+      const buildPreviousExtractionStatusRecordFromMeta = (
+        snapshot: Array<{
+          subject: string;
+          predicate: string;
+          object: string;
+          graph: string;
+        }>,
+      ): ExtractionStatusRecord | undefined => {
+        const fileHash = parseImportMetaLiteral(
+          importMetaValue(snapshot, "sourceFileHash"),
+        );
+        const detectedContentType = parseImportMetaLiteral(
+          importMetaValue(snapshot, "sourceContentType"),
+        );
+        const tripleCount = parseImportMetaInteger(
+          importMetaValue(snapshot, "structuralTripleCount"),
+        );
+        if (!fileHash || !detectedContentType || tripleCount == null) {
+          return undefined;
+        }
+        const extractionStatus = parseImportMetaLiteral(
+          importMetaValue(snapshot, "extractionStatus"),
+        );
+        const status = extractionStatus === "skipped" ? "skipped" : "completed";
+        const fileName = parseImportMetaLiteral(
+          importMetaValue(snapshot, "sourceFileName"),
+        );
+        const rootEntity = parseImportMetaLiteral(
+          importMetaValue(snapshot, "rootEntity"),
+        );
+        const mdIntermediateHashFromMeta = parseImportMetaLiteral(
+          importMetaValue(snapshot, "mdIntermediateHash"),
+        );
+        const restoredAt = new Date().toISOString();
+        return {
+          status,
+          fileHash,
+          ...(fileName ? { fileName } : {}),
+          ...(rootEntity ? { rootEntity } : {}),
+          detectedContentType,
+          pipelineUsed: status === "skipped" ? null : detectedContentType,
+          tripleCount,
+          ...(mdIntermediateHashFromMeta
+            ? { mdIntermediateHash: mdIntermediateHashFromMeta }
+            : {}),
+          startedAt: restoredAt,
+          completedAt: restoredAt,
+        };
+      };
+      const getRestorablePreviousExtractionStatusRecord = (
+        metaSnapshot: Array<{
+          subject: string;
+          predicate: string;
+          object: string;
+          graph: string;
+        }>,
+      ): ExtractionStatusRecord | undefined =>
+        previousExtractionStatusRecord
+          ? { ...previousExtractionStatusRecord }
+          : buildPreviousExtractionStatusRecordFromMeta(metaSnapshot);
+      const restoreExtractionStatusRecord = (
+        record: ExtractionStatusRecord,
+      ): void => {
+        setExtractionStatusRecord(extractionStatus, assertionUri, record);
+      };
 
       recordInProgressExtraction();
 
@@ -1460,6 +1564,16 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
             const rollbackSuffix = rollbackErrors.length > 0
               ? `; rollback failures: ${rollbackErrors.join("; ")}`
               : "";
+            const previousStatusRecord = rollbackErrors.length === 0
+              ? getRestorablePreviousExtractionStatusRecord(
+                  preCreateMetaSnapshot,
+                )
+              : undefined;
+            if (previousStatusRecord) {
+              const response = respondWithFailedExtraction(400, `${message}${rollbackSuffix}`, 0, null);
+              restoreExtractionStatusRecord(previousStatusRecord);
+              return response;
+            }
             return respondWithFailedExtraction(400, `${message}${rollbackSuffix}`, 0, null);
           } else {
             const rollbackErrors: string[] = [];
@@ -1477,6 +1591,16 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
             const rollbackSuffix = rollbackErrors.length > 0
               ? `; rollback failures: ${rollbackErrors.join("; ")}`
               : "";
+            const previousStatusRecord = rollbackErrors.length === 0
+              ? getRestorablePreviousExtractionStatusRecord(
+                  preCreateMetaSnapshot,
+                )
+              : undefined;
+            if (previousStatusRecord) {
+              const response = respondWithFailedExtraction(500, `${message}${rollbackSuffix}`, 0, null);
+              restoreExtractionStatusRecord(previousStatusRecord);
+              return response;
+            }
             return respondWithFailedExtraction(500, `${message}${rollbackSuffix}`, 0, null);
           }
         }
@@ -1561,12 +1685,21 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           const rollbackSuffix = rollbackErrors.length > 0
             ? `; rollback failures: ${rollbackErrors.join("; ")}`
             : "";
-          recordFailedExtraction(
-            `Failed to persist skipped extraction metadata: ${writeMsg}${rollbackSuffix}`,
-            0,
-            null,
-          );
-          (err as any).__failureAlreadyRecorded = true;
+          const previousStatusRecord = rollbackErrors.length === 0
+            ? getRestorablePreviousExtractionStatusRecord(
+                preCreateMetaSnapshot,
+              )
+            : undefined;
+          if (previousStatusRecord) {
+            restoreExtractionStatusRecord(previousStatusRecord);
+          } else {
+            recordFailedExtraction(
+              `Failed to persist skipped extraction metadata: ${writeMsg}${rollbackSuffix}`,
+              0,
+              null,
+            );
+            (err as any).__failureAlreadyRecorded = true;
+          }
           throw err;
         }
 
@@ -2122,6 +2255,13 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
               triples.length,
             );
             (writeErr as any).__failureAlreadyRecorded = true;
+          } else {
+            const previousStatusRecord =
+              getRestorablePreviousExtractionStatusRecord(metaSnapshot);
+            if (previousStatusRecord) {
+              (writeErr as any).__previousExtractionStatusRecord =
+                previousStatusRecord;
+            }
           }
           throw writeErr;
         }
@@ -2157,6 +2297,12 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         // the insert is atomic across both graphs, nothing landed and a retry
         // sees a clean slate.
         recordFailedExtraction(message, triples.length);
+        const previousStatusRecord = (err as any)?.__previousExtractionStatusRecord as
+          | ExtractionStatusRecord
+          | undefined;
+        if (previousStatusRecord) {
+          restoreExtractionStatusRecord(previousStatusRecord);
+        }
         throw err;
       }
 

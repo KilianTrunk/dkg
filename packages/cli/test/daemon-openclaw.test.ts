@@ -1661,6 +1661,32 @@ describe('OpenClaw persist-turn validation', () => {
     ).resolves.toEqual(attachmentRefs);
   });
 
+  it('rejects completed attachment refs backed only by skipped import metadata', async () => {
+    const attachmentRefs = [{
+      assertionUri: 'did:dkg:context-graph:cg1/assertion/chat-doc',
+      fileHash: 'sha256:abc123',
+      contextGraphId: 'cg1',
+      fileName: 'chat-doc.pdf',
+      extractionStatus: 'completed' as const,
+      tripleCount: 0,
+    }];
+    const store = {
+      query: async () => ({
+        bindings: [{
+          fileHash: '"sha256:abc123"',
+          contentType: '"application/pdf"',
+          extractionStatus: '"skipped"',
+          tripleCount: '"0"^^<http://www.w3.org/2001/XMLSchema#integer>',
+          sourceFileName: '"chat-doc.pdf"',
+        }],
+      }),
+    };
+
+    await expect(
+      verifyOpenClawAttachmentRefsProvenance({ store } as any, new Map(), attachmentRefs),
+    ).resolves.toBeUndefined();
+  });
+
   it('rejects completed attachment refs after the extraction cache entry is gone and the meta graph no longer has the assertion', async () => {
     const attachmentRefs = [{
       assertionUri: 'did:dkg:context-graph:cg1/assertion/chat-doc',

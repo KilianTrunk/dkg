@@ -88,12 +88,37 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install zizmor
-        # Pin the exact version explicitly — `pip install zizmor` floats and
-        # would re-introduce a transitive-dep tag-pin risk identical to the
-        # one this workflow is auditing for. Bump deliberately via PR
-        # (Dependabot does not cover pip versions used in this minimal way).
-        run: pip install 'zizmor==1.7.0'
+      - name: Install zizmor (hash-pinned PyPI wheel)
+        # Pin the exact version AND the exact wheel/sdist sha256s so even a
+        # PyPI compromise (forged release with the same version number)
+        # cannot land arbitrary code in the runner. `--require-hashes`
+        # refuses to install any artifact whose hash is not in the
+        # requirements list; `--no-deps` blocks transitive Python deps from
+        # bypassing the hash check (zizmor 1.7.0's PyPI metadata declares
+        # no Python deps anyway, but the flag is defense-in-depth in case
+        # a future bump introduces one without us updating this list).
+        #
+        # Hashes lifted verbatim from
+        # https://pypi.org/pypi/zizmor/1.7.0/json (.urls[].digests.sha256).
+        # All wheels relevant to a GitHub-hosted ubuntu-latest runner
+        # (manylinux/musllinux x86_64/aarch64/armv7) plus the sdist are
+        # listed so pip can pick the right one without falling open.
+        # Bumps require recomputing this block — Dependabot does not cover
+        # pip versions used in this single-line install.
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/zizmor-requirements.txt" <<'REQ'
+          zizmor==1.7.0 \
+            --hash=sha256:a7dd9fa77086836d4fc270372a4fed6273bb92287585388ba258ccd9f59c044f \
+            --hash=sha256:639d290d5074456542b6e5e275effe9565f88ffb24ef1088102bb7ca118ae7de \
+            --hash=sha256:8dd087a01ac713b8980af73f294c696ebcaafde38bade9a3773a3f792169c4d7 \
+            --hash=sha256:489ae4e9085d5aa80b9ae40e118f6e94a52af020cc17dc3942b51835ee02445b \
+            --hash=sha256:ca8a768db5dd267f985cf25515b99a4d893905fff05f4a45cecfc11dc84e4583 \
+            --hash=sha256:8320f78cf19a65b3e81794a731d64a155c24bc8614347ed946b066e3411bb9de \
+            --hash=sha256:4f987f4b81ef740863db629391c55d1e7ad75723fc30325dfde63ab36537d6b0
+          REQ
+          pip install --require-hashes --no-deps -r "${RUNNER_TEMP}/zizmor-requirements.txt"
+          zizmor --version
 
       - name: Resolve zizmor scan targets
         # Scan EVERYTHING under `.github/` that can land code on the runner:

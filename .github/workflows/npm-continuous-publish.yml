@@ -88,6 +88,7 @@ jobs:
             echo "API response: ${ENV_CONFIG}"
             exit 1
           fi
+
           REVIEWER_COUNT=$(echo "${ENV_CONFIG}" \
             | jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers // []] | flatten | length' \
             || echo 0)
@@ -95,7 +96,22 @@ jobs:
             echo "::error title=npm-publish environment unprotected::Environment exists but has zero required reviewers. NPM_TOKEN would publish without human review. Add at least one required reviewer in repo Settings → Environments → npm-publish."
             exit 1
           fi
-          echo "✓ npm-publish environment configured with ${REVIEWER_COUNT} required reviewer(s)"
+
+          # wait_timer protection rule. The hardening doc + the error message
+          # above both say a wait timer is mandatory, so enforce it here:
+          # without one, a reviewer who clicks "Approve" by mistake has no
+          # window to abort before NPM_TOKEN flows to the runner. Any
+          # wait_timer > 0 satisfies the gate; 5 minutes is the documented
+          # recommended minimum.
+          WAIT_TIMER=$(echo "${ENV_CONFIG}" \
+            | jq -r '[.protection_rules[]? | select(.type == "wait_timer") | .wait_timer] | first // 0' \
+            || echo 0)
+          if [ "${WAIT_TIMER:-0}" -lt 1 ]; then
+            echo "::error title=npm-publish wait_timer missing::Environment has reviewers but no wait_timer protection rule. A reviewer who clicks 'Approve' by mistake would let NPM_TOKEN flow with no recourse. Add a wait_timer (5 minutes recommended) in repo Settings → Environments → npm-publish."
+            exit 1
+          fi
+
+          echo "✓ npm-publish environment configured with ${REVIEWER_COUNT} required reviewer(s) + ${WAIT_TIMER}-min wait timer"
 
   publish:
     name: Build & Publish to NPM

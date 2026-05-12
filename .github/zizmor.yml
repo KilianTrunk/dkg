@@ -8,6 +8,36 @@
 # Format: https://docs.zizmor.sh/configuration/
 
 rules:
+  # `forbidden-uses` is opt-in. We use it as a permanent denylist for the
+  # known-compromised actions involved in real-world supply-chain attacks.
+  # Even if a future PR (or a future maintainer who isn't familiar with the
+  # TeamPCP / Reviewdog incidents) tries to add one of these, the audit
+  # gate will block it before merge.
+  #
+  # Don't remove entries from this list without a security review. Adding
+  # entries is encouraged — every public attribution should be reflected
+  # here. The cost is zero (the audit runs in milliseconds); the upside is
+  # a hard merge gate against known-bad artifacts.
+  forbidden-uses:
+    config:
+      deny:
+        # TeamPCP campaign — March 2026, CVE-2026-33634. Tag-poisoned to
+        # exfiltrate credentials.
+        - aquasecurity/trivy-action
+        - aquasecurity/setup-trivy
+        - Checkmarx/kics-github-action
+        - Checkmarx/ast-github-action
+        # Reviewdog ecosystem compromise — January 2026.
+        - reviewdog/action-setup
+        - reviewdog/action-shellcheck
+        - reviewdog/action-actionlint
+        # tj-actions/changed-files — March 2025 supply-chain attack.
+        - tj-actions/changed-files
+        - tj-actions/branch-names
+        - tj-actions/glob
+        - tj-actions/verify-changed-files
+        - tj-actions/changed-files-action
+
   # `artipacked` flags every `actions/checkout` step that does not pass
   # `persist-credentials: false`. The correct fix in principle is to set
   # it everywhere — but this repo currently carries submodule gitlinks in

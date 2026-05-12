@@ -110,16 +110,6 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
   // moves. The previous multiaddr-in-invite design broke whenever the
   // chosen relay rotated under the curator.
   const [peerId, setPeerId] = useState<string | null>(null);
-  // Multiaddrs are observed so we can refuse to emit an invite before this
-  // node has any remotely-dialable address. Without this gate the curator
-  // could paste an invite from a freshly-started NAT'd node whose AutoRelay
-  // hasn't yet reserved a circuit, and the joiner's DHT walk would return
-  // a record with only LAN/loopback addrs that no remote peer can reach.
-  // Codex review on PR #431 surfaced this as a follow-up to the DHT-only
-  // invite migration; we gate copy here rather than punting it to the
-  // joiner's "unreachable" branch because failing fast on the curator side
-  // is much cheaper than the joiner's 90s catchup deadline.
-  const [multiaddrs, setMultiaddrs] = useState<string[]>([]);
   const [allowedAgents, setAllowedAgents] = useState<string[]>([]);
   // Surfaced only for join-request approve/reject errors. The previous
   // address-paste add-path that also wrote here was removed; the only
@@ -148,9 +138,6 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
         if (typeof data?.peerId === 'string' && data.peerId.length > 0) {
           setPeerId(data.peerId);
         }
-        if (Array.isArray(data?.multiaddrs)) {
-          setMultiaddrs(data.multiaddrs.filter((m: unknown): m is string => typeof m === 'string'));
-        }
       })
       .catch(() => {});
 
@@ -174,16 +161,19 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
 
   if (!open) return null;
 
-  // Refuse to emit a peer-id invite until we have at least one
-  // remotely-dialable multiaddr. Otherwise the DHT record we're about to
-  // ask the joiner to look up will only contain LAN/loopback addrs that no
-  // remote node can reach — guaranteed-broken invite. A curator who legitimately
-  // wants to share a "bare" cgId invite (public CG, joiner discovers us via
-  // gossip) can still copy the contextGraphId directly from the URL.
-  const inviteReady = peerId !== null && multiaddrs.some(isMultiaddrRemotelyDialable);
-  const invitePayload = inviteReady
-    ? `${contextGraphId}\n${peerId}`
-    : contextGraphId;
+  // Always emit `<cgId>\n<peerId>` once peer-id is loaded. The earlier
+  // `inviteReady` gate (which required at least one publicly-dialable
+  // multiaddr) was defensive against "no AutoRelay reservation yet"
+  // scenarios, but it's now too strict in two ways:
+  //   1. V10's `forwardJoinRequest` REQUIRES the curator peer id —
+  //      the bare-cgId fallback is dead, would always throw on submit.
+  //   2. LAN / loopback / CGNAT addrs are perfectly dialable from same-
+  //      machine (devnet) and same-LAN peers; the DHT record carries
+  //      them. The "remotely dialable" predicate was about INTERNET
+  //      reachability — too pessimistic for local / LAN testing.
+  // Worst case (truly isolated curator) the joiner gets an error on
+  // submit, identical to today.
+  const invitePayload = peerId ? `${contextGraphId}\n${peerId}` : null;
 
   const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text).then(() => {
@@ -336,67 +326,36 @@ export function ShareProjectModal({ open, onClose, contextGraphId, contextGraphN
               {/* Invite code */}
               <div className="v10-form-group">
                 <label className="v10-form-label">Invite Code</label>
-                {!inviteReady && (
+                {invitePayload === null ? (
                   <div style={{
-                    padding: '8px 12px', borderRadius: 6, fontSize: 11, marginBottom: 8,
-                    background: 'rgba(245, 158, 11, 0.1)',
-                    border: '1px solid rgba(245, 158, 11, 0.3)',
-                    color: 'var(--accent-amber, #f59e0b)',
+                    padding: '8px 12px', borderRadius: 6, fontSize: 11,
+                    color: 'var(--text-tertiary)', background: 'var(--bg-surface)',
+                    border: '1px dashed var(--border-default)',
                   }}>
-                    <strong>Peer-id invite not ready yet.</strong> Your node has no
-                    remotely-dialable address yet (no circuit-relay reservation, no public
-                    interface). The invite below is the bare project ID — joiners can subscribe
-                    if the project is <em>open</em>, but for <em>curated</em> projects they need
-                    to dial this node directly to send a join request, which won't work until
-                    AutoRelay negotiates a reservation. Re-open this modal in a few seconds to
-                    pick up the peer-id-enhanced form.
+                    Loading peer ID…
+                  </div>
+                ) : (
+                  <div style={{ position: 'relative' }}>
+                    <pre style={{
+                      background: 'var(--bg-surface)', border: '1px solid var(--border-default)',
+                      borderRadius: 6, padding: '10px 12px', fontSize: 11, lineHeight: 1.6,
+                      fontFamily: 'var(--font-mono)', color: 'var(--text-primary)',
+                      overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                    }}>
+                      {invitePayload}
+                    </pre>
+                    <button
+                      className="v10-modal-btn primary"
+                      onClick={() => copyToClipboard(invitePayload, 'invite')}
+                      style={{
+                        position: 'absolute', top: 6, right: 6, fontSize: 10, padding: '4px 10px', height: 26,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {copied === 'invite' ? 'Copied' : 'Copy Invite'}
+                    </button>
                   </div>
                 )}
-                <div style={{ position: 'relative' }}>
-                  <pre style={{
-                    background: 'var(--bg-surface)', border: '1px solid var(--border-default)',
-                    borderRadius: 6, padding: '10px 12px', fontSize: 11, lineHeight: 1.6,
-                    fontFamily: 'var(--font-mono)', color: 'var(--text-primary)',
-                    overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-                  }}>
-                    {invitePayload}
-                  </pre>
-                  <button
-                    className="v10-modal-btn primary"
-                    onClick={() => copyToClipboard(invitePayload, 'invite')}
-                    style={{
-                      position: 'absolute', top: 6, right: 6, fontSize: 10, padding: '4px 10px', height: 26,
-                      cursor: 'pointer',
-                    }}
-                    title={inviteReady ? undefined : 'Bare project ID (works for open projects). Wait for AutoRelay to upgrade to a peer-id invite for curated projects.'}
-                  >
-                    {copied === 'invite' ? 'Copied' : (inviteReady ? 'Copy Invite' : 'Copy Project ID')}
-                  </button>
-                </div>
-                <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginTop: 4 }}>
-                  Share this with collaborators. They paste it into <strong>Join Project</strong> on their node.
-                  {inviteReady ? (
-                    <>
-                      {' '}Their daemon dials your node by peer id over the libp2p DHT, so the
-                      invite stays valid even if your relay or public IP changes.
-                      {allowedAgents.length > 0 ? (
-                        <> They'll send a signed join request that appears in the <strong>Join Requests</strong> tab for you to approve.</>
-                      ) : (
-                        <> Since no allowlist is set, anyone with this code can join directly.</>
-                      )}
-                    </>
-                  ) : (
-                    <>
-                      {' '}This is the bare project ID — sufficient for <em>open</em> projects
-                      (joiners discover via gossip without dialing your node).
-                      {allowedAgents.length > 0 ? (
-                        <> Because this project has an allowlist, joiners would also need to dial your node to submit a signed join request — that path won't work until AutoRelay negotiates a circuit-relay reservation. Re-open this modal then to copy the peer-id-enhanced form.</>
-                      ) : (
-                        <> For curated projects, re-open this modal once AutoRelay has negotiated to copy the peer-id-enhanced form.</>
-                      )}
-                    </>
-                  )}
-                </div>
               </div>
             </>
           )}

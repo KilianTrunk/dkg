@@ -351,17 +351,6 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
               disabled={sending || pending || approved}
               style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}
             />
-            <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginTop: 4 }}>
-              The invite code contains a project ID and the curator's libp2p peer id. Legacy invites
-              with an embedded multiaddr still work but are deprecated — relay rotations break them.
-            </div>
-          </div>
-
-          <div className="v10-modal-tip">
-            <div className="v10-modal-tip-title">How it works</div>
-            Your node signs a join request with your agent's wallet key, looks up the curator on the libp2p
-            DHT, and forwards the signed request directly to them. Once they approve, this modal moves
-            into the wire-workspace step and the project appears in your sidebar.
           </div>
         </div>
 

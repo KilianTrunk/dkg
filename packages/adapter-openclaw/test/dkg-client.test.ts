@@ -195,6 +195,129 @@ describe('DkgDaemonClient', () => {
     expect(body.subGraphName).toBe('protocols');
   });
 
+  it('getChatTurnStoreStatus queries chat-turn WM status and returns matching sessions', async () => {
+    fetchResponses.push(
+      new Response(JSON.stringify({
+        agentAddress: '0x1234567890123456789012345678901234567890',
+        agentDid: 'did:dkg:agent:0x1234567890123456789012345678901234567890',
+        name: 'default-agent',
+        peerId: '12D3KooWPeer',
+        nodeIdentityId: '7',
+      }), { status: 200 }),
+      new Response(JSON.stringify({
+        result: { bindings: [{ c: '"8"^^<http://www.w3.org/2001/XMLSchema#integer>' }] },
+      }), { status: 200 }),
+      new Response(JSON.stringify({
+        result: { bindings: [{ sid: '"openclaw:tg:::sk-1"' }] },
+      }), { status: 200 }),
+    );
+
+    const status = await client.getChatTurnStoreStatus([
+      'openclaw:tg:::sk-1',
+      'openclaw:tg:::missing',
+    ]);
+
+    expect(status).toEqual({
+      hasAnyChatTurnData: true,
+      existingSessionIds: ['openclaw:tg:::sk-1'],
+    });
+    expect(fetchCalls).toHaveLength(3);
+    expect(fetchCalls[0][0]).toBe('http://localhost:9200/api/agent/identity');
+    const countBody = JSON.parse(fetchCalls[1][1]?.body as string);
+    expect(countBody).toMatchObject({
+      contextGraphId: 'agent-context',
+      view: 'working-memory',
+      assertionName: 'chat-turns',
+      agentAddress: '0x1234567890123456789012345678901234567890',
+    });
+    expect(countBody.sparql).toContain('COUNT(*) AS ?c');
+    const sessionBody = JSON.parse(fetchCalls[2][1]?.body as string);
+    expect(sessionBody).toMatchObject({
+      contextGraphId: 'agent-context',
+      view: 'working-memory',
+      assertionName: 'chat-turns',
+      agentAddress: '0x1234567890123456789012345678901234567890',
+    });
+    expect(sessionBody.sparql).toContain('VALUES ?sid');
+    expect(sessionBody.sparql).toContain('"openclaw:tg:::sk-1"');
+    expect(sessionBody.sparql).toContain('"openclaw:tg:::missing"');
+  });
+
+  it('getChatTurnStoreStatus returns empty status when chat-turn assertion has no data', async () => {
+    fetchResponses.push(
+      new Response(JSON.stringify({
+        agentAddress: '0x1234567890123456789012345678901234567890',
+        agentDid: 'did:dkg:agent:0x1234567890123456789012345678901234567890',
+        name: 'default-agent',
+        peerId: '12D3KooWPeer',
+        nodeIdentityId: '7',
+      }), { status: 200 }),
+      new Response(JSON.stringify({
+        results: { bindings: [{ c: { value: '0' } }] },
+      }), { status: 200 }),
+    );
+
+    const status = await client.getChatTurnStoreStatus(['openclaw:tg:::sk']);
+
+    expect(status).toEqual({ hasAnyChatTurnData: false, existingSessionIds: [] });
+    expect(fetchCalls).toHaveLength(2);
+  });
+
+  it('getChatTurnStoreStatus returns empty status for missing chat-turn assertion/context', async () => {
+    fetchResponses.push(
+      new Response(JSON.stringify({
+        agentAddress: '0x1234567890123456789012345678901234567890',
+        agentDid: 'did:dkg:agent:0x1234567890123456789012345678901234567890',
+        name: 'default-agent',
+        peerId: '12D3KooWPeer',
+        nodeIdentityId: '7',
+      }), { status: 200 }),
+      new Response(JSON.stringify({ error: 'Assertion chat-turns not found' }), { status: 404 }),
+    );
+
+    const status = await client.getChatTurnStoreStatus(['openclaw:tg:::sk']);
+
+    expect(status).toEqual({ hasAnyChatTurnData: false, existingSessionIds: [] });
+  });
+
+  it('getChatTurnStoreStatus propagates unexpected daemon failures', async () => {
+    fetchResponses.push(
+      new Response(JSON.stringify({
+        agentAddress: '0x1234567890123456789012345678901234567890',
+        agentDid: 'did:dkg:agent:0x1234567890123456789012345678901234567890',
+        name: 'default-agent',
+        peerId: '12D3KooWPeer',
+        nodeIdentityId: '7',
+      }), { status: 200 }),
+      new Response(JSON.stringify({ error: 'boom' }), { status: 500 }),
+    );
+
+    await expect(client.getChatTurnStoreStatus(['openclaw:tg:::sk']))
+      .rejects
+      .toThrow('responded 500');
+  });
+
+  it('getChatTurnStoreStatus propagates unrelated 404s instead of swallowing them as "no chat data"', async () => {
+    // Regression: an early matcher accepted any 404 whose message mentioned
+    // generic words like "context" or "graph", which would silently clear
+    // local cursor state for unrelated daemon failures. The not-found check
+    // must require the chat-turns assertion name specifically.
+    fetchResponses.push(
+      new Response(JSON.stringify({
+        agentAddress: '0x1234567890123456789012345678901234567890',
+        agentDid: 'did:dkg:agent:0x1234567890123456789012345678901234567890',
+        name: 'default-agent',
+        peerId: '12D3KooWPeer',
+        nodeIdentityId: '7',
+      }), { status: 200 }),
+      new Response(JSON.stringify({ error: 'Context graph some-other-graph not found' }), { status: 404 }),
+    );
+
+    await expect(client.getChatTurnStoreStatus(['openclaw:tg:::sk']))
+      .rejects
+      .toThrow('responded 404');
+  });
+
   // ---------------------------------------------------------------------------
   // Workspace write
   // ---------------------------------------------------------------------------

@@ -8198,6 +8198,13 @@ export class DKGAgent {
           // most common invite-text-mismatch failure mode.
           errors.push(`${curatorPeerId.slice(-8)}: unknown CG`);
         }
+        // The curator gave us an authoritative answer — no point
+        // broadcasting the signed delegation to non-curator peers
+        // (PROTOCOL_JOIN_REQUEST handler at dkg-agent.ts:1788 returns
+        // `not curator` and does not relay; broadcasting just leaks the
+        // delegation payload to unrelated peers without any chance of
+        // delivery). Return the rejection now.
+        return { delivered: 0, errors };
       } catch (dialErr) {
         // Targeted dial failed — fall through to broadcast WITH curator
         // re-included as a target.
@@ -8210,6 +8217,15 @@ export class DKGAgent {
       }
     }
 
+    // Reaching here means either (a) `curatorPeerId` was unset (legacy
+    // multiaddr invite — broadcast is the only delivery option), or (b)
+    // the targeted curator dial threw a transport error and broadcast
+    // re-includes curatorPeerId in the cohort as a second chance over a
+    // fresh stream. Non-curator peers that receive PROTOCOL_JOIN_REQUEST
+    // for a CG they don't curate respond `{ ok: false, error: 'not
+    // curator' }` and don't relay (see handler at dkg-agent.ts:1788),
+    // so a broader "drop V10 broadcast entirely" cleanup is tracked as
+    // a follow-up rather than landed here.
     const peers = this.node.libp2p.getPeers();
     const broadcastTargets = peers
       .map((p) => p.toString())

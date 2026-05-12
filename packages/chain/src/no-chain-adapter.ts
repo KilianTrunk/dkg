@@ -30,6 +30,7 @@ function noChain(): never {
 export class NoChainAdapter implements ChainAdapter {
   readonly chainType = 'evm' as const;
   readonly chainId = 'none';
+  readonly deploymentId = 'none';
 
   async registerIdentity(_proof: IdentityProof): Promise<bigint> { noChain(); }
   async getIdentityId(): Promise<bigint> { return 0n; }

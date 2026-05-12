@@ -972,12 +972,53 @@ export class ApiClient {
     return this.get(`/api/context-graph/${encodeURIComponent(contextGraphId)}/participants`);
   }
 
+  /**
+   * Sign-only join request. Returns the `SignedAgentDelegation` that
+   * the local agent produced; does NOT forward over P2P. To deliver it
+   * to the curator, follow up with `requestJoin(...)` and the
+   * `curatorPeerId` from the V10 invite. PR #448 split sign vs forward
+   * to fix a duplicate-forward bug — see daemon route comment.
+   *
+   * The `delegation` shape mirrors `SignedAgentDelegation` from
+   * `@dkg/agent`: `version` is part of the digest grammar (see
+   * `computeDelegationDigest`), not the on-the-wire payload, so it is
+   * intentionally absent here. Verifiers re-derive the digest from the
+   * fields below.
+   */
   async signJoinRequest(contextGraphId: string): Promise<{
     ok: boolean;
-    status?: string;
-    contextGraphId?: string;
+    contextGraphId: string;
+    delegation: {
+      agentAddress: string;
+      scope: string;
+      issuedAtMs: number;
+      expiresAtMs: number;
+      delegateePeerId?: string;
+      delegateeOpKey?: string;
+      signature: string;
+    };
+    agentAddress: string;
   }> {
     return this.post(`/api/context-graph/${encodeURIComponent(contextGraphId)}/sign-join`, {});
+  }
+
+  /**
+   * Forward a previously-signed join delegation to the curator over
+   * P2P. The daemon dials `curatorPeerId` directly (DHT-resolved if
+   * not currently connected) and falls back to broadcasting through
+   * connected peers. Returns the delivery count so callers can detect
+   * "no curator reachable" without inspecting log output.
+   */
+  async requestJoin(
+    contextGraphId: string,
+    delegation: unknown,
+    curatorPeerId: string,
+    agentName?: string,
+  ): Promise<{ ok: boolean; status: string; delivered: number | 'local'; alreadyMember?: boolean }> {
+    return this.post(
+      `/api/context-graph/${encodeURIComponent(contextGraphId)}/request-join`,
+      { delegation, curatorPeerId, ...(agentName ? { agentName } : {}) },
+    );
   }
 
   async approveJoin(contextGraphId: string, agentAddress: string): Promise<{

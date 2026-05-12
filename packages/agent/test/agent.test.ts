@@ -3485,7 +3485,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       await expect(
         (agent as any).buildSyncRequest('private-cg', 0, 50, false, 'peer-remote'),
       ).rejects.toThrow(
-        `Cannot build authenticated sync request for "private-cg": missing signing key for default agent ${defaultAgentAddress}`,
+        `Cannot build authenticated sync request for "private-cg": missing signing key for claimed agent ${defaultAgentAddress}`,
       );
     } finally {
       await agent.stop().catch(() => {});

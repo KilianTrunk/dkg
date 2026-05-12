@@ -53,6 +53,11 @@ export class MockChainAdapter implements ChainAdapter {
   readonly chainId: string;
   readonly signerAddress: string;
 
+  /** See `ChainAdapter.deploymentId`. Single in-memory deployment per process — chainId is enough. */
+  get deploymentId(): string {
+    return this.chainId;
+  }
+
   private nextIdentityId = 1n;
   private nextBatchId = 1n;
   private nextBlock = 1;

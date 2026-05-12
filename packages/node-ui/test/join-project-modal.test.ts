@@ -19,13 +19,20 @@ describe('JoinProjectModal invite parsing', () => {
       expect(parsed.legacyMultiaddr).toBeNull();
     });
 
-    it('treats invite with only a cgId as valid (cg public, no curator dial)', () => {
+    // PR #448 review: V10 `/request-join` requires a curator peer id, so
+    // a bare cgId now 400s on the daemon. validateInvite rejects it
+    // client-side instead, with actionable copy. The old subscribe-to-public
+    // paste flow has been removed; users who want a public CG that
+    // hasn't surfaced in the Oracle have to ask the curator for an invite.
+    it('rejects invite with only a cgId (no curator peer id)', () => {
       const parsed = parseInviteCode('open-project');
       expect(parsed.cgId).toBe('open-project');
       expect(parsed.curatorPeerId).toBeNull();
       expect(parsed.legacyMultiaddr).toBeNull();
       expect(parsed.hasUnparsedExtra).toBe(false);
-      expect(validateInvite(parsed)).toBeNull();
+      const err = validateInvite(parsed);
+      expect(err).not.toBeNull();
+      expect(err).toContain('curator peer id');
     });
 
     it('validates a peer-id invite as ok', () => {
@@ -66,15 +73,19 @@ describe('JoinProjectModal invite parsing', () => {
       const parsed = parseInviteCode(raw);
       expect(parsed.cgId).toBe('0xabc/project');
       expect(parsed.legacyMultiaddr).toBe('/ip4/178.104.54.178/tcp/9090/p2p/12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M/p2p-circuit/p2p/12D3KooWQz2bQbQueABKRSjV9koF8VYsXk5TdCsUmPf5zAEZg3q6');
-      expect(parsed.curatorPeerId).toBeNull();
+      // PR #448 review (round 4): the parser now also extracts the
+      // peer-id at the multiaddr's `/p2p/<id>` tail so legacy invites
+      // can satisfy V10's mandatory `curatorPeerId` on /request-join.
+      // Without this the curated-project legacy path 400'd at sign time.
+      expect(parsed.curatorPeerId).toBe('12D3KooWQz2bQbQueABKRSjV9koF8VYsXk5TdCsUmPf5zAEZg3q6');
     });
 
     it('parses single-line invite codes with inline multiaddr', () => {
-      const raw = '0xabc/project /ip4/127.0.0.1/tcp/9090/p2p/12D3KooWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+      const raw = '0xabc/project /ip4/127.0.0.1/tcp/9090/p2p/12D3KooWQz2bQbQueABKRSjV9koF8VYsXk5TdCsUmPf5zAEZg3q6';
       const parsed = parseInviteCode(raw);
       expect(parsed.cgId).toBe('0xabc/project');
-      expect(parsed.legacyMultiaddr).toBe('/ip4/127.0.0.1/tcp/9090/p2p/12D3KooWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
-      expect(parsed.curatorPeerId).toBeNull();
+      expect(parsed.legacyMultiaddr).toBe('/ip4/127.0.0.1/tcp/9090/p2p/12D3KooWQz2bQbQueABKRSjV9koF8VYsXk5TdCsUmPf5zAEZg3q6');
+      expect(parsed.curatorPeerId).toBe('12D3KooWQz2bQbQueABKRSjV9koF8VYsXk5TdCsUmPf5zAEZg3q6');
     });
 
     // Codex review on PR #431 (round 2): V9 `<cgId> @ <multiaddr>` form

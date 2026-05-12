@@ -10,11 +10,13 @@ export function authHeaders(): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
 
-class HttpError extends Error {
+export class HttpError extends Error {
   status: number;
-  constructor(status: number) {
-    super(`HTTP ${status}`);
+  body?: unknown;
+  constructor(status: number, message?: string, body?: unknown) {
+    super(message ?? `HTTP ${status}`);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -44,7 +46,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
     const msg = (errBody as { error?: string })?.error ?? `HTTP ${res.status}`;
-    throw new Error(msg);
+    throw new HttpError(res.status, msg, errBody);
   }
   return res.json() as Promise<T>;
 }
@@ -249,12 +251,33 @@ export const removeParticipant = (contextGraphId: string, agentAddress: string) 
 export const listParticipants = (contextGraphId: string) =>
   get<{ contextGraphId: string; allowedAgents: string[] }>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/participants`);
 
-// --- Join Request flow (Phase 2: signed requests + approval) ---
-export interface SignedJoinRequest {
-  contextGraphId: string;
+// --- Join Request flow (Phase 2: signed agent delegation) ---
+//
+// A join request now IS a `SignedAgentDelegation` — the agent's
+// signature scoped to `sync:<cgId>` that authorises their hosting node
+// (peer-id and/or operational key) to act on their behalf for that CG.
+// On approval the curator promotes the named delegatee identifiers
+// into the CG allowlist so post-approval sync passes auth without the
+// agent having to co-sign every wire message.
+export interface SignedAgentDelegation {
   agentAddress: string;
-  timestamp: number;
+  scope: string;
+  issuedAtMs: number;
+  expiresAtMs?: number;
+  delegateePeerId?: string;
+  delegateeOpKey?: string;
   signature: string;
+}
+
+// SignJoinResponse is intentionally narrow — `/sign-join` is sign-only
+// (PR #448 review: forwarding lives in `/request-join` to avoid a
+// duplicate-forward bug where the UI was sending the same delegation
+// twice). Delivery status comes back from `submitJoinRequest` instead.
+export interface SignJoinResponse {
+  ok: boolean;
+  contextGraphId: string;
+  delegation: SignedAgentDelegation;
+  agentAddress: string;
 }
 
 export interface PendingJoinRequest {
@@ -266,10 +289,28 @@ export interface PendingJoinRequest {
 }
 
 export const signJoinRequest = (contextGraphId: string) =>
-  post<SignedJoinRequest>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/sign-join`, {});
+  post<SignJoinResponse>(
+    `/api/context-graph/${encodeURIComponent(contextGraphId)}/sign-join`,
+    {},
+  );
 
-export const submitJoinRequest = (contextGraphId: string, req: SignedJoinRequest & { agentName?: string }) =>
-  post<{ ok: boolean; status: string }>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/request-join`, req);
+/**
+ * Daemon's `/request-join` returns `delivered` describing how the
+ * signed delegation was routed:
+ *  - `'local'`  — local node IS the curator; stored locally, no P2P
+ *  - `number`   — count of remote curator peers that returned `ok` for
+ *                 the broadcast/targeted forward (typically `1`)
+ * The 502 path (no curator reachable) throws here via `post()`, so a
+ * resolved response always implies at least one delivery destination.
+ */
+export const submitJoinRequest = (
+  contextGraphId: string,
+  req: { delegation: SignedAgentDelegation; agentName?: string; curatorPeerId?: string },
+) =>
+  post<{ ok: boolean; status: string; delivered: number | 'local'; alreadyMember?: boolean }>(
+    `/api/context-graph/${encodeURIComponent(contextGraphId)}/request-join`,
+    req,
+  );
 
 export const listJoinRequests = (contextGraphId: string) =>
   get<{ contextGraphId: string; requests: PendingJoinRequest[] }>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/join-requests`);

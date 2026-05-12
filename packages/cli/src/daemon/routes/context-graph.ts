@@ -741,23 +741,50 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     const contextGraphId = decodeURIComponent(requestJoinMatch[1]);
     const body = await readBody(req);
     try {
-      const { agentAddress, signature, timestamp, agentName } = JSON.parse(body);
-      if (!agentAddress || !signature || !timestamp) {
-        return jsonResponse(res, 400, { error: 'Missing agentAddress, signature, or timestamp' });
+      const parsed = JSON.parse(body);
+      const { agentName, curatorPeerId, delegation } = parsed;
+      if (!delegation || !delegation.agentAddress || !delegation.signature) {
+        return jsonResponse(res, 400, {
+          error: 'Missing signed delegation. Expected `delegation` field with agentAddress, signature, scope, issuedAtMs and at least one of delegateePeerId / delegateeOpKey.',
+        });
       }
-      agent.verifyJoinRequest(contextGraphId, agentAddress, timestamp, signature);
+      agent.verifyJoinRequest(contextGraphId, delegation);
 
       const isCurator = await agent.isCuratorOf(contextGraphId);
       if (isCurator) {
-        await agent.storePendingJoinRequest(contextGraphId, agentAddress, signature, timestamp, agentName);
+        await agent.storePendingJoinRequest(contextGraphId, delegation, agentName);
         return jsonResponse(res, 200, { ok: true, status: 'pending', delivered: 'local' });
       }
 
-      const result = await agent.forwardJoinRequest(contextGraphId, agentAddress, signature, timestamp, agentName);
-      if (result.delivered === 0) {
-        return jsonResponse(res, 502, { error: 'Could not deliver join request to curator. No reachable curator found.' });
+      // V10 invites carry the curator's peer-id (`<cgId>\n<peerId>`).
+      // Without it `forwardJoinRequest` can't authenticate the
+      // returning approval/rejection notification — see that method
+      // for details. Surface the error to the UI so the user sees a
+      // clear "ask curator for an updated invite code" message
+      // instead of a generic 502.
+      if (!curatorPeerId) {
+        return jsonResponse(res, 400, {
+          error: 'Missing curatorPeerId. Invite codes must include the curator peer id (V10 format: "<cgId>\\n<peerId>"). Ask the curator to share an updated invite code.',
+        });
       }
-      return jsonResponse(res, 200, { ok: true, status: 'pending', delivered: result.delivered });
+      const result = await agent.forwardJoinRequest(contextGraphId, delegation, agentName, curatorPeerId);
+      if (result.delivered === 0) {
+        // Surface per-peer errors so the joiner can see WHY (curator
+        // rejected with a specific reason, transport timed out, etc.)
+        // instead of a generic "no curator". Silent error swallowing here
+        // hid bugs like protocol-format skew between curator and joiner
+        // versions during PR #448 multi-laptop testing.
+        return jsonResponse(res, 502, {
+          error: 'Could not deliver join request to curator. No reachable curator found.',
+          ...(result.errors.length > 0 ? { errors: result.errors } : {}),
+        });
+      }
+      return jsonResponse(res, 200, {
+        ok: true,
+        status: result.alreadyMember ? 'already-member' : 'pending',
+        delivered: result.delivered,
+        ...(result.alreadyMember ? { alreadyMember: true } : {}),
+      });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return jsonResponse(res, 400, { error: msg });
@@ -809,7 +836,20 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     }
   }
 
-  // POST /api/context-graph/{id}/sign-join — sign a join request and forward to curator via P2P
+  // POST /api/context-graph/{id}/sign-join — sign a join-request delegation
+  //
+  // SIGN-ONLY. Returns the signed `SignedAgentDelegation` for the caller's
+  // agent to whoever is asking. Does NOT forward over P2P — that is the
+  // sole responsibility of `/api/context-graph/{id}/request-join`.
+  //
+  // Why split? PR #448 review (2026-05-11): an earlier revision of this
+  // route also called `forwardJoinRequest` before returning, but the UI +
+  // CLI then POST the same delegation to `/request-join`, which forwards
+  // it again. Curators received the same join request twice (and emitted
+  // two `JOIN_REQUEST_RECEIVED` notifications) on every single click.
+  // Splitting sign vs forward also lets the CLI sign without a curator
+  // peer id (sign locally, forward later) — the previous mandatory
+  // `curatorPeerId` body param hard-broke `dkg context-graph request-join`.
   const signJoinMatch = path.match(/^\/api\/context-graph\/([^/]+)\/sign-join$/);
   if (req.method === "POST" && signJoinMatch) {
     const contextGraphId = decodeURIComponent(signJoinMatch[1]);
@@ -817,20 +857,19 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       const callerAddress = agent.resolveAgentAddress(
         extractBearerToken(req.headers.authorization),
       );
-      const signed = await agent.signJoinRequest(contextGraphId, callerAddress);
-      const { delivered, errors } = await agent.forwardJoinRequest(
-        signed.contextGraphId,
-        signed.agentAddress,
-        signed.signature,
-        signed.timestamp,
-        agent.nodeName,
-      );
+      // Body is intentionally ignored — sign-only. Drain it so a JSON body
+      // sent by older clients doesn't sit on the socket.
+      try { await readBody(req, SMALL_BODY_BYTES); } catch { /* ignored */ }
+      const delegation = await agent.signJoinRequest(contextGraphId, callerAddress);
       return jsonResponse(res, 200, {
         ok: true,
-        ...signed,
-        delivered,
-        ...(errors.length > 0 ? { errors } : {}),
-        status: delivered > 0 ? 'sent' : 'no-curator-found',
+        contextGraphId,
+        delegation,
+        // Back-compat surface for older HTTP clients reading the
+        // top-level `agentAddress`. The full signed delegation lives
+        // in `delegation`; callers that want delivery POST it (with
+        // a `curatorPeerId`) to `/request-join`.
+        agentAddress: delegation.agentAddress,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

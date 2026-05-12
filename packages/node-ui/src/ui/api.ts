@@ -10,11 +10,13 @@ export function authHeaders(): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
 
-class HttpError extends Error {
+export class HttpError extends Error {
   status: number;
-  constructor(status: number) {
-    super(`HTTP ${status}`);
+  body?: unknown;
+  constructor(status: number, message?: string, body?: unknown) {
+    super(message ?? `HTTP ${status}`);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -44,7 +46,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
     const msg = (errBody as { error?: string })?.error ?? `HTTP ${res.status}`;
-    throw new Error(msg);
+    throw new HttpError(res.status, msg, errBody);
   }
   return res.json() as Promise<T>;
 }
@@ -292,11 +294,23 @@ export const signJoinRequest = (contextGraphId: string) =>
     {},
   );
 
+/**
+ * Daemon's `/request-join` returns `delivered` describing how the
+ * signed delegation was routed:
+ *  - `'local'`  — local node IS the curator; stored locally, no P2P
+ *  - `number`   — count of remote curator peers that returned `ok` for
+ *                 the broadcast/targeted forward (typically `1`)
+ * The 502 path (no curator reachable) throws here via `post()`, so a
+ * resolved response always implies at least one delivery destination.
+ */
 export const submitJoinRequest = (
   contextGraphId: string,
   req: { delegation: SignedAgentDelegation; agentName?: string; curatorPeerId?: string },
 ) =>
-  post<{ ok: boolean; status: string }>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/request-join`, req);
+  post<{ ok: boolean; status: string; delivered: number | 'local' }>(
+    `/api/context-graph/${encodeURIComponent(contextGraphId)}/request-join`,
+    req,
+  );
 
 export const listJoinRequests = (contextGraphId: string) =>
   get<{ contextGraphId: string; requests: PendingJoinRequest[] }>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/join-requests`);

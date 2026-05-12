@@ -1500,31 +1500,26 @@ contextGraphCmd
   });
 
 contextGraphCmd
-  .command('request-join <contextGraphId> [curatorPeerId]')
+  .command('request-join <contextGraphId> <curatorPeerId>')
   .description(
-    'Sign a join request and forward it to the curator. The optional ' +
-    'curatorPeerId is the libp2p peer id from the V10 invite ' +
-    '("<cgId>\\n<peerId>"); pass it so the daemon can authenticate the ' +
-    'curator\'s eventual approve/reject notification. Without it the CLI ' +
-    'signs locally but stops short of forwarding (the daemon would 400 ' +
-    'on /request-join with "Missing curatorPeerId").',
+    'Sign a join request and forward it to the curator. The curatorPeerId ' +
+    'is the libp2p peer id from the V10 invite ("<cgId>\\n<peerId>") and ' +
+    'is required so the daemon can authenticate the curator\'s eventual ' +
+    'approve/reject notification. To produce a signed delegation without ' +
+    'forwarding (e.g. to hand off to the curator out-of-band), use ' +
+    '`dkg context-graph sign-join` instead.',
   )
-  .action(async (contextGraphId: string, curatorPeerId?: string) => {
+  .action(async (contextGraphId: string, curatorPeerId: string) => {
     try {
       const client = await ApiClient.connect();
       // Step 1: sign-only. Returns the SignedAgentDelegation. Cheap and
       // independent of P2P delivery — works on a freshly-started node
       // before any peers are connected.
       const signed = await client.signJoinRequest(contextGraphId);
-      if (!curatorPeerId) {
-        console.log(`Signed join request for "${contextGraphId}".`);
-        console.log('  Re-run with the curator peer id from the V10 invite');
-        console.log(`  to forward it:  dkg context-graph request-join ${contextGraphId} <curatorPeerId>`);
-        return;
-      }
       // Step 2: forward via P2P. The daemon delivers the signed
       // delegation to the curator (direct dial first, then broadcast
-      // fallback). Returns delivery count so we can warn on no-curator.
+      // fallback for legacy invites). Returns delivery count so we can
+      // warn on no-curator.
       const result = await client.requestJoin(contextGraphId, signed.delegation, curatorPeerId);
       if (result.delivered === 0) {
         console.error(`Could not deliver join request to curator for "${contextGraphId}". No reachable curator found.`);
@@ -1533,6 +1528,25 @@ contextGraphCmd
       console.log(`Join request sent for "${contextGraphId}" (delivered to ${result.delivered} peer${result.delivered === 1 ? '' : 's'}).`);
       console.log('  Waiting for curator approval. Check status with:');
       console.log(`  dkg context-graph info ${contextGraphId}`);
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
+contextGraphCmd
+  .command('sign-join <contextGraphId>')
+  .description(
+    'Sign a join-request delegation locally without forwarding it to the ' +
+    'curator. Prints the SignedAgentDelegation as JSON, suitable for ' +
+    'piping to another tool or sharing out-of-band. To both sign AND ' +
+    'forward (the common case), use `dkg context-graph request-join`.',
+  )
+  .action(async (contextGraphId: string) => {
+    try {
+      const client = await ApiClient.connect();
+      const signed = await client.signJoinRequest(contextGraphId);
+      console.log(JSON.stringify(signed.delegation, null, 2));
     } catch (err) {
       console.error(toErrorMessage(err));
       process.exit(1);

@@ -3,6 +3,7 @@ import {
   subscribeToContextGraph, fetchContextGraphs,
   signJoinRequest, submitJoinRequest, fetchCurrentAgent, fetchCatchupStatus,
   connectToPeerWithTimeout, connectToPeerIdWithTimeout,
+  HttpError,
 } from '../../api.js';
 import { useProjectsStore } from '../../stores/projects.js';
 import { useTabsStore } from '../../stores/tabs.js';
@@ -402,26 +403,38 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
         curatorPeerId,
       });
       setRequestSent(true);
-      // The daemon returns `delivered: 'local'` when this node is the curator
-      // (no P2P fan-out happens at all). Otherwise `forwardJoinRequest`
-      // delivers to N peers — the response carries `delivered: <count>`.
-      // If both the upfront connect failed AND the broadcast reached zero
-      // peers, the request is sitting in nowhere — warn the user.
-      const deliveredHint =
-        (submitResult as any)?.delivered ?? null;
-      if (curatorConnectFailed && deliveredHint === 0) {
-        setError(
-          'Request signed and broadcast, but we could neither reach the curator directly nor deliver via any other connected peer. The curator probably won\'t see it. Try again in a moment once your node has discovered more peers.',
-        );
-      } else if (curatorConnectFailed) {
-        // Soft warning: broadcast succeeded to SOMEONE, but not the curator
-        // directly. Delivery might still work (some peer may relay it later
-        // on the curator's next connect), but the user should know.
+      // `delivered === 'local'` means this node IS the curator (single-
+      // node / same-daemon flow): the upfront `connectToPeerIdWithTimeout`
+      // would have failed with SELF_DIAL even though the request itself
+      // succeeded. Don't surface a stale `curatorConnectFailed` warning
+      // in that case — there was no remote curator to reach.
+      if (submitResult.delivered === 'local') {
+        curatorConnectFailed = false;
+      }
+      // We never see `delivered === 0` here — the daemon returns 502 for
+      // that case (no curator reachable) and `post()` throws, so we land
+      // in the catch block below. The only way this branch resolves with
+      // a numeric `delivered` is `>= 1`.
+      if (curatorConnectFailed) {
+        // Soft warning: broadcast succeeded to SOMEONE, but the upfront
+        // direct dial to the curator failed. Delivery might still work
+        // (some peer may relay it later on the curator's next connect),
+        // but the user should know it took an indirect path.
         setError(
           'Request sent, but we couldn\'t reach the curator\'s node directly. Delivery depends on other peers relaying — the curator may take longer than usual to see it.',
         );
       }
     } catch (err: any) {
+      // `post()` throws `HttpError` for non-2xx. The daemon returns 502
+      // with a structured `error` for the "no curator reachable" case
+      // (see context-graph.ts:777). Surface that as actionable copy,
+      // distinct from generic "failed to send" for transport errors.
+      if (err instanceof HttpError && err.status === 502) {
+        setError(
+          'Request signed, but we couldn\'t deliver it to any reachable curator. Try again in a moment once your node has discovered more peers, or ask the curator for an updated invite.',
+        );
+        return;
+      }
       setError(err?.message || 'Failed to send join request');
     } finally {
       setSendingRequest(false);

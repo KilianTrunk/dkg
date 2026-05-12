@@ -1814,17 +1814,36 @@ export class DKGAgent {
           `PROTOCOL_JOIN_REQUEST from ${peerTag} for "${contextGraphId}": accepted, verifying delegation for ${delegation.agentAddress}`,
         );
         this.verifyJoinRequest(contextGraphId, delegation);
-        await this.storePendingJoinRequest(contextGraphId, delegation, agentName);
-        // Note: `storePendingJoinRequest` itself now emits JOIN_REQUEST_RECEIVED.
-        // No duplicate emit here.
 
         // Remember which peer actually delivered this request so we can
         // send approval/rejection back to the same peer later, even if
         // the agent registry hasn't indexed them yet.
-        this.joinRequestOriginPeers.set(
-          `${contextGraphId}::${delegation.agentAddress.toLowerCase()}`,
-          peerId.toString(),
-        );
+        const originKey = `${contextGraphId}::${delegation.agentAddress.toLowerCase()}`;
+        this.joinRequestOriginPeers.set(originKey, peerId.toString());
+
+        // Already-member short-circuit: if the requester is already in
+        // the allowlist (e.g. they were added directly via add-agent,
+        // or are re-pasting an old invite), skip the pending-request
+        // dance and immediately fire `join-approved` so their UI flips
+        // to success without curator action. Safe to disclose because
+        // `verifyJoinRequest` already proved the requester owns the
+        // private key for `agentAddress` — only the legitimate owner
+        // learns "you're already a member".
+        const allowed = await this.getContextGraphAllowedAgents(contextGraphId);
+        const addrLower = delegation.agentAddress.toLowerCase();
+        const alreadyMember = allowed.some((a) => a.toLowerCase() === addrLower);
+        if (alreadyMember) {
+          this.log.info(
+            requestCtx,
+            `PROTOCOL_JOIN_REQUEST from ${peerTag} for "${contextGraphId}": already-member short-circuit for ${delegation.agentAddress}`,
+          );
+          this.notifyJoinApproval(contextGraphId, delegation.agentAddress).catch(() => {});
+          return new TextEncoder().encode(JSON.stringify({ ok: true, alreadyMember: true }));
+        }
+
+        await this.storePendingJoinRequest(contextGraphId, delegation, agentName);
+        // Note: `storePendingJoinRequest` itself now emits JOIN_REQUEST_RECEIVED.
+        // No duplicate emit here.
         return new TextEncoder().encode(JSON.stringify({ ok: true }));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -8143,7 +8162,7 @@ export class DKGAgent {
     delegation: SignedAgentDelegation,
     agentName: string | undefined,
     curatorPeerId: string,
-  ): Promise<{ delivered: number; errors: string[] }> {
+  ): Promise<{ delivered: number; errors: string[]; alreadyMember?: boolean }> {
     if (!curatorPeerId) {
       // Required: V10 invites carry the curator's libp2p peer-id
       // (`<cgId>\n<peerId>`). Without it we can't authenticate the
@@ -8195,8 +8214,12 @@ export class DKGAgent {
           // for why we won't trust arbitrary broadcast acceptors.
           recordAcceptedBy(curatorPeerId);
           curatorTargetedSuccess = true;
-          this.log.info(ctx, `Forwarded join request for "${contextGraphId}" from ${agentAddress}: 1 curator(s) received (direct)`);
-          return { delivered: 1, errors };
+          const alreadyMember = !!response.alreadyMember;
+          this.log.info(
+            ctx,
+            `Forwarded join request for "${contextGraphId}" from ${agentAddress}: 1 curator(s) received (direct${alreadyMember ? ', already-member' : ''})`,
+          );
+          return { delivered: 1, errors, ...(alreadyMember ? { alreadyMember: true } : {}) };
         }
         // Curator was reachable but rejected the request. Log + record
         // the reason so the joiner can see WHY (e.g. "unknown CG"
@@ -8253,6 +8276,7 @@ export class DKGAgent {
       }),
     );
     let delivered = 0;
+    let alreadyMember = false;
     for (const r of results) {
       if (r.status !== 'fulfilled') continue;
       const { remotePeerId, response } = r.value;
@@ -8274,14 +8298,18 @@ export class DKGAgent {
         // (curator metadata is gossiped along with the CG itself).
         if (remotePeerId === curatorPeerId) {
           recordAcceptedBy(remotePeerId);
+          if (response.alreadyMember) alreadyMember = true;
         }
       } else if (response.error !== 'unknown CG') {
         errors.push(`${remotePeerId.slice(-8)}: ${response.error}`);
       }
     }
 
-    this.log.info(ctx, `Forwarded join request for "${contextGraphId}" from ${agentAddress}: ${delivered} curator(s) received (broadcast over ${broadcastTargets.length} peer(s))`);
-    return { delivered, errors };
+    this.log.info(
+      ctx,
+      `Forwarded join request for "${contextGraphId}" from ${agentAddress}: ${delivered} curator(s) received (broadcast over ${broadcastTargets.length} peer(s)${alreadyMember ? ', already-member' : ''})`,
+    );
+    return { delivered, errors, ...(alreadyMember ? { alreadyMember: true } : {}) };
   }
 
   /**

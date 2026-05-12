@@ -1001,7 +1001,7 @@ export class ApiClient {
     delegation: unknown,
     curatorPeerId: string,
     agentName?: string,
-  ): Promise<{ ok: boolean; status: string; delivered: number | 'local' }> {
+  ): Promise<{ ok: boolean; status: string; delivered: number | 'local'; alreadyMember?: boolean }> {
     return this.post(
       `/api/context-graph/${encodeURIComponent(contextGraphId)}/request-join`,
       { delegation, curatorPeerId, ...(agentName ? { agentName } : {}) },

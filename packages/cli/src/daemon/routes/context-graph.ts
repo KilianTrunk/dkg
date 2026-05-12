@@ -779,7 +779,12 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
           ...(result.errors.length > 0 ? { errors: result.errors } : {}),
         });
       }
-      return jsonResponse(res, 200, { ok: true, status: 'pending', delivered: result.delivered });
+      return jsonResponse(res, 200, {
+        ok: true,
+        status: result.alreadyMember ? 'already-member' : 'pending',
+        delivered: result.delivered,
+        ...(result.alreadyMember ? { alreadyMember: true } : {}),
+      });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return jsonResponse(res, 400, { error: msg });

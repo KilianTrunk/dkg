@@ -307,7 +307,7 @@ export const submitJoinRequest = (
   contextGraphId: string,
   req: { delegation: SignedAgentDelegation; agentName?: string; curatorPeerId?: string },
 ) =>
-  post<{ ok: boolean; status: string; delivered: number | 'local' }>(
+  post<{ ok: boolean; status: string; delivered: number | 'local'; alreadyMember?: boolean }>(
     `/api/context-graph/${encodeURIComponent(contextGraphId)}/request-join`,
     req,
   );

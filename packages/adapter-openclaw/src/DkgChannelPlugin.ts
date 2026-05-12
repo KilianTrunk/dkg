@@ -224,21 +224,6 @@ function buildMarkerUserAliases(...values: Array<string | undefined>): string[] 
   }
   return aliases;
 }
-
-// Diagnostic helpers — mirror ChatTurnWriter's encodeIdField/externalCursorKeyFromSessionKey
-// so log lines on the channel side and the writer side can be cross-checked by an operator
-// running a live UI->Telegram smoke.
-function describeSessionKey(sessionKey: unknown): string {
-  if (typeof sessionKey !== 'string') return '<missing>';
-  if (sessionKey.length === 0) return '<empty>';
-  return sessionKey;
-}
-
-function describeExternalCursorKey(sessionKey: unknown): string {
-  if (typeof sessionKey !== 'string' || sessionKey.trim().length === 0) return '<none>';
-  const encoded = sessionKey.replace(/[%:]/g, (c) => (c === '%' ? '%25' : '%3A'));
-  return `openclaw:transcript:${encoded}`;
-}
 const moduleRequire = createRequire(import.meta.url);
 
 interface PendingRequest {
@@ -2081,21 +2066,8 @@ export class DkgChannelPlugin {
     opts: ExternalTurnMarkerPersistOptions,
     allowDuringShutdown: boolean,
   ): Promise<void> {
-    if (!this.chatTurnWriter) {
-      this.api?.logger.info?.(
-        `[dkg-channel:marker-write] skip correlationId=${opts.correlationId} reason=no-chat-turn-writer sessionKey=${describeSessionKey(opts.sessionKey)}`,
-      );
-      return;
-    }
-    if (!opts.sessionKey) {
-      this.api?.logger.info?.(
-        `[dkg-channel:marker-write] skip correlationId=${opts.correlationId} reason=no-session-key turnId=${opts.turnId}`,
-      );
-      return;
-    }
-    this.api?.logger.info?.(
-      `[dkg-channel:marker-write] begin correlationId=${opts.correlationId} sessionKey=${describeSessionKey(opts.sessionKey)} externalCursorKey=${describeExternalCursorKey(opts.sessionKey)} turnId=${opts.turnId} aliases=${opts.userAliases?.length ?? 0}`,
-    );
+    if (!this.chatTurnWriter) return;
+    if (!opts.sessionKey) return;
     const markerWrite = this.writeExternalTurnMarker(opts);
     this.pendingMarkerPersistence.set(opts.correlationId, {
       attempt: 1,
@@ -2107,9 +2079,6 @@ export class DkgChannelPlugin {
     try {
       await markerWrite;
       this.deletePendingMarkerPersistence(opts.correlationId);
-      this.api?.logger.info?.(
-        `[dkg-channel:marker-write] ok correlationId=${opts.correlationId} sessionKey=${describeSessionKey(opts.sessionKey)} externalCursorKey=${describeExternalCursorKey(opts.sessionKey)} turnId=${opts.turnId}`,
-      );
     } catch (err: any) {
       this.scheduleExternalTurnMarkerRetry(opts, 1, allowDuringShutdown, err);
     }

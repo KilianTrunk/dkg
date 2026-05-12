@@ -875,13 +875,6 @@ export class ChatTurnWriter {
         );
         pairs.splice(0, dropped);
       }
-      this.logExternalMarkerStateBeforeW4aPersist(
-        sessionId,
-        externalCursorKey,
-        typedW4bCursorKeys,
-        savedUpTo,
-        pairs,
-      );
       // Persist sequentially so a transient failure on pair N leaves the
       // watermark at N-1 and the next agent_end call retries from the same
       // point. Without sequencing, a failed middle pair could be skipped
@@ -894,7 +887,6 @@ export class ChatTurnWriter {
           const laterExactExternalMarker = externalCursorKey
             ? this.hasExternalTurnMarkerInLaterPairs(externalCursorKey, pairs, i + 1)
             : false;
-          const allowOrderedFallback = i < lastIdx && !laterExactExternalMarker;
           const externalMarkerAction = externalCursorKey
             ? this.consumeExternalTurnMarkersForPair(
               externalCursorKey,
@@ -902,22 +894,9 @@ export class ChatTurnWriter {
               user,
               assistant,
               externalDirect,
-              allowOrderedFallback,
+              i < lastIdx && !laterExactExternalMarker,
             )
             : { skip: false, markers: [], rollbackMarkers: [] };
-          this.logExternalMarkerPerPair(
-            sessionId,
-            externalCursorKey,
-            i,
-            lastIdx,
-            pairIndex,
-            user,
-            externalTurnIds,
-            externalDirect,
-            laterExactExternalMarker,
-            allowOrderedFallback,
-            externalMarkerAction,
-          );
           if (externalCursorKey && externalMarkerAction.markers.length > 0) {
             const watermarkSnapshot = this.snapshotWatermarkState(sessionId);
             if (externalMarkerAction.skip) this.bumpWatermark(sessionId, pairIndex);
@@ -3196,58 +3175,6 @@ export class ChatTurnWriter {
       this.externalTurnMarkers.delete(sessionKeyCursor);
     }
     return true;
-  }
-
-  private logExternalMarkerStateBeforeW4aPersist(
-    sessionId: string,
-    externalCursorKey: string | undefined,
-    typedW4bCursorKeys: string[],
-    savedUpTo: number,
-    pairs: ComputedChatTurnPair[],
-  ): void {
-    if (!this.logger.info) return;
-    const bucket = externalCursorKey ? this.externalTurnMarkers.get(externalCursorKey) : undefined;
-    const allBucketKeys = Array.from(this.externalTurnMarkers.keys());
-    this.logger.info(
-      `[ChatTurnWriter:w4a-pre-persist] sessionId=${sessionId} ` +
-      `externalCursorKey=${externalCursorKey ?? '<none>'} ` +
-      `markerBucketSize=${bucket?.size ?? 0} ` +
-      `allBucketKeys=${JSON.stringify(allBucketKeys)} ` +
-      `typedW4bCursorKeys=${JSON.stringify(typedW4bCursorKeys)} ` +
-      `savedUpTo=${savedUpTo} pairs=${pairs.length}`,
-    );
-  }
-
-  private logExternalMarkerPerPair(
-    sessionId: string,
-    externalCursorKey: string | undefined,
-    loopIndex: number,
-    lastIdx: number,
-    pairIndex: number,
-    user: string,
-    externalTurnIds: string[],
-    externalDirect: boolean,
-    laterExactExternalMarker: boolean,
-    allowOrderedFallback: boolean,
-    action: ExternalMarkerAction,
-  ): void {
-    if (!this.logger.info) return;
-    const preview = typeof user === 'string' ? user.slice(0, 80) : '';
-    const orderedAvailable = externalCursorKey
-      ? (this.externalTurnMarkers.get(externalCursorKey)?.get(ChatTurnWriter.EXTERNAL_ORDERED_TURN_MARKER) ?? 0) > 0
-      : false;
-    this.logger.info(
-      `[ChatTurnWriter:w4a-pair] sessionId=${sessionId} ` +
-      `loopIndex=${loopIndex}/${lastIdx} pairIndex=${pairIndex} ` +
-      `externalDirect=${externalDirect} ` +
-      `externalTurnIds=${JSON.stringify(externalTurnIds)} ` +
-      `laterExactMarker=${laterExactExternalMarker} ` +
-      `allowOrderedFallback=${allowOrderedFallback} ` +
-      `orderedAvailable=${orderedAvailable} ` +
-      `markerSkip=${action.skip} ` +
-      `markersConsumed=${JSON.stringify(action.markers)} ` +
-      `userPreview=${JSON.stringify(preview)}`,
-    );
   }
 
   private restoreExternalTurnMarker(sessionKeyCursor: string, marker: string): void {

@@ -32,6 +32,17 @@
     "type": "error"
   },
   {
+    "inputs": [
+      {
+        "internalType": "uint16",
+        "name": "index",
+        "type": "uint16"
+      }
+    ],
+    "name": "EmptyMultiaddr",
+    "type": "error"
+  },
+  {
     "inputs": [],
     "name": "EmptyNodeId",
     "type": "error"
@@ -60,6 +71,22 @@
   {
     "inputs": [],
     "name": "InvalidOperatorFee",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint16",
+        "name": "maxLen",
+        "type": "uint16"
+      },
+      {
+        "internalType": "uint16",
+        "name": "provided",
+        "type": "uint16"
+      }
+    ],
+    "name": "MultiaddrTooLong",
     "type": "error"
   },
   {
@@ -153,6 +180,22 @@
       }
     ],
     "name": "ProfileDoesntExist",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint16",
+        "name": "allowed",
+        "type": "uint16"
+      },
+      {
+        "internalType": "uint16",
+        "name": "provided",
+        "type": "uint16"
+      }
+    ],
+    "name": "TooManyMultiaddrs",
     "type": "error"
   },
   {
@@ -419,12 +462,48 @@
         "type": "uint72"
       },
       {
+        "internalType": "string[]",
+        "name": "multiaddrs",
+        "type": "string[]"
+      }
+    ],
+    "name": "updateMultiaddrs",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint72",
+        "name": "identityId",
+        "type": "uint72"
+      },
+      {
         "internalType": "uint16",
         "name": "newOperatorFee",
         "type": "uint16"
       }
     ],
     "name": "updateOperatorFee",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint72",
+        "name": "identityId",
+        "type": "uint72"
+      },
+      {
+        "internalType": "bool",
+        "name": "relayCapable",
+        "type": "bool"
+      }
+    ],
+    "name": "updateRelayCapable",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

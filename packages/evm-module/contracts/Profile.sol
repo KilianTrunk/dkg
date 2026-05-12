@@ -20,7 +20,9 @@ import {Permissions} from "./libraries/Permissions.sol";
 
 contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     string private constant _NAME = "Profile";
-    string private constant _VERSION = "1.1.0";
+    // Bumped 1.1.0 -> 1.2.0: adds updateRelayCapable + updateMultiaddrs
+    // entry points for the Network Relay Registry (RFC 04 / Issue #461).
+    string private constant _VERSION = "1.2.0";
 
     Ask public askContract;
     Identity public identityContract;
@@ -251,6 +253,57 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
         } else {
             ps.addOperatorFee(identityId, newOperatorFee, effectiveStart);
         }
+    }
+
+    // =====================================================================
+    // RFC 04 / Issue #461 — relay-capability + multiaddr advertisement.
+    //
+    // Both gates are onlyIdentityOwner (admin OR operational): a running
+    // node typically holds an operational key and refreshes its multiaddrs
+    // each time libp2p picks new listen addresses. Operators wanting to
+    // restrict the policy can keep operational keys offline and use the
+    // admin key only.
+    // =====================================================================
+
+    function updateRelayCapable(
+        uint72 identityId,
+        bool relayCapable
+    ) external onlyIdentityOwner(identityId) {
+        if (profileStorage.getNodeId(identityId).length == 0) {
+            revert ProfileLib.ProfileDoesntExist(identityId);
+        }
+        profileStorage.setRelayCapable(identityId, relayCapable);
+    }
+
+    function updateMultiaddrs(
+        uint72 identityId,
+        string[] calldata multiaddrs
+    ) external onlyIdentityOwner(identityId) {
+        if (profileStorage.getNodeId(identityId).length == 0) {
+            revert ProfileLib.ProfileDoesntExist(identityId);
+        }
+        if (multiaddrs.length > ProfileLib.MAX_MULTIADDRS) {
+            revert ProfileLib.TooManyMultiaddrs(
+                ProfileLib.MAX_MULTIADDRS,
+                uint16(multiaddrs.length)
+            );
+        }
+        for (uint256 i; i < multiaddrs.length; ) {
+            uint256 len = bytes(multiaddrs[i]).length;
+            if (len == 0) {
+                revert ProfileLib.EmptyMultiaddr(uint16(i));
+            }
+            if (len > ProfileLib.MAX_MULTIADDR_LENGTH) {
+                revert ProfileLib.MultiaddrTooLong(
+                    ProfileLib.MAX_MULTIADDR_LENGTH,
+                    len > type(uint16).max ? type(uint16).max : uint16(len)
+                );
+            }
+            unchecked {
+                ++i;
+            }
+        }
+        profileStorage.setMultiaddrs(identityId, multiaddrs);
     }
 
     function _checkIdentityOwner(uint72 identityId) internal view virtual {

@@ -29,11 +29,43 @@ jobs:
   # environment is configured correctly; the publish job below `needs:`
   # it and is the ONLY job in this workflow that gates on
   # `environment: npm-publish`.
+  # CHECK-TOKEN — single source of truth for "is publishing enabled".
+  # We cannot reference `secrets.NPM_TOKEN` in a job-level `if:`
+  # condition (GitHub disallows that), so we resolve the secret
+  # presence once here, expose it as a job output, and gate every
+  # downstream job on that output via `needs.check-token.outputs.*`.
+  # The documented disable mechanism — "remove NPM_TOKEN secret" —
+  # MUST short-circuit BOTH the env-verification and the publish job;
+  # otherwise the verifier would fail/wait on a disabled repo and
+  # paint main red (which is what the previous reviewer caught).
+  check-token:
+    name: Check publish gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
+    permissions:
+      contents: read
+    outputs:
+      has_token: ${{ steps.check.outputs.has_token }}
+    steps:
+      - id: check
+        env:
+          HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          echo "has_token=${HAS_NPM_TOKEN}" >> "$GITHUB_OUTPUT"
+          if [ "${HAS_NPM_TOKEN}" = "true" ]; then
+            echo "NPM_TOKEN present → verify + publish will run."
+          else
+            echo "::notice title=NPM publishing disabled::NPM_TOKEN is not configured for this repo. Skipping verify-environment and publish. To re-enable, add an NPM_TOKEN environment secret to the npm-publish Environment."
+          fi
+
   verify-environment:
     name: Verify npm-publish environment has required reviewers
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
+    needs: check-token
+    if: needs.check-token.outputs.has_token == 'true'
     permissions:
       contents: read
       # `actions: read` is the documented minimum scope for reading
@@ -77,12 +109,15 @@ jobs:
     name: Build & Publish to NPM
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # `needs:` ensures the publish job DOES NOT START until the
-    # environment-preflight passes. Combined with `environment:` below,
-    # this is what makes the gate fail-closed: NPM_TOKEN is only
-    # injected into a runner whose preflight already proved the
-    # environment is configured with required reviewers.
-    needs: verify-environment
+    # `needs:` ensures the publish job DOES NOT START until BOTH
+    # check-token confirms publishing is enabled AND verify-environment
+    # confirms the npm-publish environment is configured with required
+    # reviewers. Combined with `environment:` below, this is what makes
+    # the gate fail-closed: NPM_TOKEN is only injected into a runner
+    # whose preflight already proved the environment is configured
+    # AND the disable mechanism is not in effect.
+    needs: [check-token, verify-environment]
+    if: needs.check-token.outputs.has_token == 'true'
     # `npm-publish` Environment gates access to NPM_TOKEN. Configure required
     # reviewers + a wait timer in repo Settings → Environments → `npm-publish`
     # so a compromised merge to main cannot auto-publish without human
@@ -90,9 +125,6 @@ jobs:
     # setup steps. The environment value MUST match the Environment name
     # configured in repo Settings.
     environment: npm-publish
-    if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
-    env:
-      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -153,7 +185,12 @@ jobs:
           "
 
       - name: Publish all public packages
-        if: env.HAS_NPM_TOKEN == 'true'
+        # The job-level `needs.check-token.outputs.has_token == 'true'`
+        # guard already short-circuits this whole job when NPM_TOKEN is
+        # absent, so the step-level `HAS_NPM_TOKEN` belt that lived here
+        # before has been removed (it was redundant with the job-level
+        # gate and confused the disable mechanism — see the bot
+        # discussion on PR #460).
         run: pnpm -r publish --no-git-checks --tag latest
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

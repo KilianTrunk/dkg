@@ -271,6 +271,83 @@ describe("ChatTurnWriter", () => {
     }
   });
 
+  it("validates daemon WM once then trusts the external cursor key on the hot path", async () => {
+    // Regression: an earlier draft kept external cursor keys perpetually
+    // marked untrusted while the daemon had any chat-turn data, so every
+    // subsequent onAgentEnd re-issued the 2-query getChatTurnStoreStatus
+    // round trip even after the first validation already proved the keys
+    // were non-stale. Validation is a one-shot operation per
+    // untrusted-marked key; lifecycle events (load, migrate, setClient)
+    // re-mark it untrusted at the right time.
+    const directStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "chatturnwriter-trust-once-"));
+    const sessionId = "openclaw:tg:acct:conv:trust-sk";
+    const directFile = path.join(directStateDir, "chat-turn-watermarks.json");
+    const localClient = {
+      storeChatTurn: vi.fn().mockResolvedValue(undefined),
+      getChatTurnStoreStatus: vi.fn().mockResolvedValue({
+        hasAnyChatTurnData: true,
+        existingSessionIds: [sessionId],
+      }),
+    };
+    try {
+      const seeder = new ChatTurnWriter({
+        client: localClient,
+        logger: mockLogger,
+        stateDir: directStateDir,
+        stateLayout: "direct",
+      });
+      await seeder.markExternalTurnPersistedDurable({
+        sessionKey: "trust-sk",
+        turnId: "ui-turn",
+        user: "ui user",
+        assistant: "ui assistant",
+      });
+      seeder.flushSync();
+      localClient.storeChatTurn.mockClear();
+      localClient.getChatTurnStoreStatus.mockClear();
+
+      const restarted = new ChatTurnWriter({
+        client: localClient,
+        logger: mockLogger,
+        stateDir: directStateDir,
+        stateLayout: "direct",
+      });
+
+      await restarted.onAgentEnd(
+        {
+          sessionId,
+          messages: [
+            { role: "user", content: "tg user 1" },
+            { role: "assistant", content: "tg assistant 1" },
+          ],
+        },
+        { channelId: "tg", accountId: "acct", conversationId: "conv", sessionKey: "trust-sk" },
+      );
+      await restarted.flush();
+      expect(localClient.getChatTurnStoreStatus).toHaveBeenCalledTimes(1);
+
+      await restarted.onAgentEnd(
+        {
+          sessionId,
+          messages: [
+            { role: "user", content: "tg user 1" },
+            { role: "assistant", content: "tg assistant 1" },
+            { role: "user", content: "tg user 2" },
+            { role: "assistant", content: "tg assistant 2" },
+          ],
+        },
+        { channelId: "tg", accountId: "acct", conversationId: "conv", sessionKey: "trust-sk" },
+      );
+      await restarted.flush();
+      expect(localClient.getChatTurnStoreStatus).toHaveBeenCalledTimes(1);
+      const persistedDoc = JSON.parse(fs.readFileSync(directFile, "utf-8"));
+      expect(persistedDoc["openclaw:transcript:trust-sk"]?.m).toBeDefined();
+      restarted.flushSync();
+    } finally {
+      fs.rmSync(directStateDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not clear fresh direct-channel markers written while stale daemon validation is in flight", async () => {
     const directStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "chatturnwriter-stale-marker-race-"));
     const sessionId = "openclaw:tg:acct:conv:race-sk";

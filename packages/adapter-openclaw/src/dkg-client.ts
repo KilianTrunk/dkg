@@ -156,16 +156,16 @@ function bindingCount(result: any): number {
 }
 
 function isChatTurnStoreNotFoundError(err: unknown): boolean {
+  // Only treat a daemon 404 as "no chat-turn data yet" when the error
+  // message names the specific assertion this query reads. Broader
+  // substring matches (just "not found" / "context" / "graph") would
+  // swallow unrelated 404s and silently clear local cursor state via
+  // validateUntrustedDurableCursorsBeforeW4a, turning real daemon
+  // failures into cold-start replays.
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
   if (!lower.includes('responded 404')) return false;
-  return (
-    lower.includes('not found') ||
-    lower.includes('assertion') ||
-    lower.includes('context') ||
-    lower.includes('graph') ||
-    lower.includes(CHAT_TURNS_ASSERTION_NAME)
-  );
+  return lower.includes(CHAT_TURNS_ASSERTION_NAME);
 }
 
 export class DkgDaemonClient {

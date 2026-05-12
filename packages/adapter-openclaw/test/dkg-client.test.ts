@@ -297,6 +297,27 @@ describe('DkgDaemonClient', () => {
       .toThrow('responded 500');
   });
 
+  it('getChatTurnStoreStatus propagates unrelated 404s instead of swallowing them as "no chat data"', async () => {
+    // Regression: an early matcher accepted any 404 whose message mentioned
+    // generic words like "context" or "graph", which would silently clear
+    // local cursor state for unrelated daemon failures. The not-found check
+    // must require the chat-turns assertion name specifically.
+    fetchResponses.push(
+      new Response(JSON.stringify({
+        agentAddress: '0x1234567890123456789012345678901234567890',
+        agentDid: 'did:dkg:agent:0x1234567890123456789012345678901234567890',
+        name: 'default-agent',
+        peerId: '12D3KooWPeer',
+        nodeIdentityId: '7',
+      }), { status: 200 }),
+      new Response(JSON.stringify({ error: 'Context graph some-other-graph not found' }), { status: 404 }),
+    );
+
+    await expect(client.getChatTurnStoreStatus(['openclaw:tg:::sk']))
+      .rejects
+      .toThrow('responded 404');
+  });
+
   // ---------------------------------------------------------------------------
   // Workspace write
   // ---------------------------------------------------------------------------

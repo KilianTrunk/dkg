@@ -1338,6 +1338,11 @@ export class ChatTurnWriter {
       // N turns" no longer maps to the new pair indices. Leaving stale
       // count would skip new pairs in `computeDelta`.
       this.w4bSessionCounts.delete(sessionId);
+      // `runReset` includes `identity.externalCursorKey` in the iteration
+      // set so this call is meaningful only when the loop reaches an
+      // entry of `openclaw:transcript:<sk>` shape; for composed session
+      // ids it's a no-op. The coupling is intentional but easy to miss
+      // when refactoring `runReset` later — keep them in sync.
       this.clearExternalOrderedTurnMarker(sessionId);
       this.markDurableCursorKeyTrusted(sessionId);
     }
@@ -2429,8 +2434,16 @@ export class ChatTurnWriter {
           );
         }
       }
+      // Mark every non-stale key trusted, including external cursor keys.
+      // Re-validation runs again only when an explicit lifecycle event
+      // (disk load, legacy migration, client swap) flags the key untrusted
+      // through `markDurableCursorKeyUntrusted`. Without this, every
+      // subsequent `onAgentEnd` for a session that owns durable transcript
+      // markers would re-issue the 2-query `getChatTurnStoreStatus` round
+      // trip on the hot Telegram persistence path — and re-validation
+      // doesn't actually verify per-marker content against daemon data,
+      // so the only thing the perpetual untrusted state cost was latency.
       for (const key of untrustedKeys) {
-        if (externalCursorKeys.includes(key) && status.hasAnyChatTurnData) continue;
         if (!staleKeys.has(key)) this.markDurableCursorKeyTrusted(key);
       }
     } catch (err) {

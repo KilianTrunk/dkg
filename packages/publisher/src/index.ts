@@ -150,6 +150,10 @@ export {
   type ValidatedLiftPublishPayload,
 } from './async-lift-validation.js';
 export {
+  subtractFinalizedExactQuads,
+  type ExactQuadSubtractionResult,
+} from './async-lift-subtraction.js';
+export {
   mapPublishResultToLiftJobSuccess,
   mapPublishExceptionToLiftJobFailure,
   type AsyncLiftPublishSuccess,

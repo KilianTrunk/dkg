@@ -34,6 +34,7 @@ import {
   canonicalPublishPayload,
   resolveLiftWorkspaceSlice,
   validateLiftPublishPayload,
+  subtractFinalizedExactQuads,
   TripleStoreAsyncLiftPublisher,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
@@ -4018,7 +4019,20 @@ export class DKGAgent {
     if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
 
     const onChainId = await this.getContextGraphOnChainId(request.contextGraphId);
-    if (onChainId == null) return undefined;
+    if (onChainId == null) {
+      // Codex PR #455 follow-up review #2: previously returned undefined
+      // here and silently enqueued a seal-less job that the publisher
+      // would later try to publish on-chain and reject (since the
+      // publisher-side fallback was removed in this PR). Fail-fast at
+      // enqueue with actionable guidance — the chain IS V10-ready
+      // but the CG hasn't been registered on-chain yet.
+      throw new Error(
+        `publishAsync: context graph "${request.contextGraphId}" is not registered on-chain. ` +
+          'V10 async publishes require an on-chain CG id at enqueue time so the agent can ' +
+          'sign the EIP-712 AuthorAttestation against the same chain context the publisher ' +
+          'will submit against. Call `agent.registerContextGraph(name)` first.',
+      );
+    }
 
     const chainId = await this.chain.getEvmChainId();
     const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
@@ -4044,9 +4058,39 @@ export class DKGAgent {
       resolved,
     });
 
+    // Codex PR #455 follow-up review #1: apply the SAME finalized-quad
+    // subtraction the publisher runs at processNext-time (lines 287-293
+    // of async-lift-publisher-impl.ts). For CREATE jobs whose payload
+    // overlaps with previously-finalized content, the publisher
+    // subtracts the overlap before computing the merkle — so the
+    // agent's seal MUST be over the post-subtraction set or the SEAL
+    // INTEGRITY PREFLIGHT will reject the job. Subtraction is a no-op
+    // for MUTATE/REVOKE per async-lift-subtraction.ts:37-43, so this
+    // is safe for all transition types.
+    const subtracted = await subtractFinalizedExactQuads({
+      store: this.store,
+      graphManager,
+      request: { ...request, authority: request.authority } as LiftRequest,
+      validation: validated.validation,
+      resolved: validated.resolved,
+    });
+
+    // When subtraction yields an empty set (full overlap with already-
+    // finalized content), the publisher's processNext returns noop
+    // BEFORE running any seal preflight (async-lift-publisher-impl.ts:
+    // 295-297). Skip the seal compute — there's nothing on-chain to
+    // attribute and `canonicalPublishPayload` would fail on an empty
+    // quad list anyway.
+    if (
+      subtracted.resolved.quads.length === 0 &&
+      (subtracted.resolved.privateQuads?.length ?? 0) === 0
+    ) {
+      return undefined;
+    }
+
     const canonical = canonicalPublishPayload(
-      validated.resolved.quads,
-      validated.resolved.privateQuads ?? [],
+      subtracted.resolved.quads,
+      subtracted.resolved.privateQuads ?? [],
     );
 
     // Resolve author: same precedence sync `assertionFinalize` uses.

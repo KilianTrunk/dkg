@@ -135,7 +135,7 @@ jobs:
           steps.diff.outputs.diff_lines != '0'
           && steps.diff.outputs.diff_lines <= 5000
           && steps.hash_check.outputs.skipped == 'false'
-        uses: openai/codex-action@a26d2d4d8b78a694338b8e3715c3630254340b2c # v1
+        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 # v1.8
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           model: gpt-5.4

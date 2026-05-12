@@ -95,6 +95,30 @@ jobs:
         # (Dependabot does not cover pip versions used in this minimal way).
         run: pip install 'zizmor==1.7.0'
 
+      - name: Resolve zizmor scan targets
+        # Scan EVERYTHING under `.github/` that can land code on the runner:
+        # workflows + composite actions + reusable workflows. The previous
+        # version only scanned `.github/workflows/`, which left
+        # `.github/actions/` (referenced by the trigger paths above) outside
+        # the audit surface — a future composite action there would inherit
+        # the same trust boundary as a workflow but skip the gate. zizmor
+        # auto-detects workflow + composite-action YAML so passing the
+        # parent dir is safe; it ignores non-workflow YAML (dependabot,
+        # zizmor configs).
+        id: targets
+        run: |
+          set -euo pipefail
+          targets=(.github/workflows)
+          if [ -d .github/actions ]; then
+            targets+=(.github/actions)
+          fi
+          {
+            echo "paths<<EOF"
+            for t in "${targets[@]}"; do echo "${t}"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          printf 'Scanning: %s\n' "${targets[@]}"
+
       - name: Run zizmor (SARIF output)
         # `--persona auditor` enables the strict ruleset (every finding is
         # treated as a defect, including informational ones). `--min-severity
@@ -119,13 +143,19 @@ jobs:
         # scope is enough for zizmor's read-only API calls).
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZIZMOR_TARGETS: ${{ steps.targets.outputs.paths }}
         run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # ZIZMOR_TARGETS is a newline list of
+          # repo-relative paths we control entirely (resolved above); word
+          # splitting is the desired behaviour for the zizmor argv.
+          read -r -a TARGETS <<< "$(echo "$ZIZMOR_TARGETS" | tr '\n' ' ')"
           zizmor \
             --persona auditor \
             --min-severity low \
             --config .github/zizmor.yml \
             --format sarif \
-            .github/workflows/ \
+            "${TARGETS[@]}" \
             > zizmor.sarif
         continue-on-error: true
 
@@ -144,8 +174,11 @@ jobs:
         # same reason as the SARIF step above.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZIZMOR_TARGETS: ${{ steps.targets.outputs.paths }}
         run: |
-          zizmor --persona auditor --min-severity low --config .github/zizmor.yml --format plain .github/workflows/
+          set -euo pipefail
+          read -r -a TARGETS <<< "$(echo "$ZIZMOR_TARGETS" | tr '\n' ' ')"
+          zizmor --persona auditor --min-severity low --config .github/zizmor.yml --format plain "${TARGETS[@]}"
 
   npm-audit:
     name: pnpm audit (informational)
@@ -214,18 +247,50 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Run actionlint (with shellcheck)
-        # Downloads actionlint via the upstream installer script — the
-        # script verifies the artifact's sha256 against an author-signed
-        # list before extracting. No `uses:` to a third-party action is
-        # used; the audit job itself stays outside the TeamPCP threat
-        # model.
+      - name: Download + verify actionlint release asset
+        # SECURITY: we deliberately do NOT `curl … | bash` from
+        # raw.githubusercontent.com here. Even though the upstream
+        # installer script verifies its own download, fetching the
+        # *installer* via a mutable tag ref (e.g. `v1.7.6`) and piping
+        # straight to `bash` reintroduces the exact tag-poisoning class
+        # this workflow exists to detect — a force-moved tag or a
+        # compromised upstream branch would give arbitrary code execution
+        # inside the security scanner. Instead we:
         #
+        #   1. Pin the actionlint version to a specific release.
+        #   2. Download the release binary asset directly (GitHub release
+        #      assets are bound to the immutable release object, not to
+        #      raw.githubusercontent.com mirrored tree).
+        #   3. Verify its SHA-256 against the digest published in the same
+        #      release's `actionlint_${VERSION}_checksums.txt`. The digest
+        #      is committed verbatim into THIS workflow file, so any
+        #      retroactive re-upload of the release asset (or any MITM on
+        #      the download path) fails the check and aborts the run.
+        #   4. Only THEN extract and execute the binary.
+        #
+        # Bumps to a newer actionlint require recomputing ACTIONLINT_SHA256
+        # from the new release's checksums.txt and updating BOTH this
+        # workflow and the version string. Dependabot does not cover this
+        # path; bump deliberately via PR.
+        env:
+          ACTIONLINT_VERSION: 1.7.6
+          # sha256 of actionlint_1.7.6_linux_amd64.tar.gz, lifted from
+          # https://github.com/rhysd/actionlint/releases/download/v1.7.6/actionlint_1.7.6_checksums.txt
+          ACTIONLINT_SHA256: 5d1a70d9de15fee5371e6f9e20cc29b284e814d6ee1b882f9749e91caf716eba
+        run: |
+          set -euo pipefail
+          ASSET="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            -o "${ASSET}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${ASSET}"
+          echo "${ACTIONLINT_SHA256}  ${ASSET}" | sha256sum --check --status
+          tar -xzf "${ASSET}" actionlint
+          ./actionlint --version
+
+      - name: Run actionlint (with shellcheck)
         # `shellcheck` is pre-installed on ubuntu-latest GitHub-hosted
         # runners, so actionlint invokes it as a sub-linter automatically
         # (no `-shellcheck=` flag). Pre-existing SC2086 quoting issues
         # were fixed in this same PR so the gate is clean from the
         # outset.
-        run: |
-          curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.6/scripts/download-actionlint.bash | bash
-          ./actionlint -color
+        run: ./actionlint -color

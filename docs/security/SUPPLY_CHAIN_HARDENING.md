@@ -55,14 +55,36 @@ Security. We do not use it anywhere; `codex-review.yml` uses the safer
 `github.event.pull_request.head.repo.full_name == github.repository`
 to short-circuit fork PRs.
 
-### 4. `npm-continuous-publish.yml` runs in the `npm-publish` Environment
+### 4. `npm-continuous-publish.yml` is gated by a `verify-environment` preflight
 
-The publish job references `environment: npm-publish`. With the matching
-GitHub Environment configured (see [§Tier 2 admin steps](#tier-2-admin-steps)),
-this lets a maintainer require:
-- a manual approval before `NPM_TOKEN` becomes accessible to the job;
-- a wait timer so an emergency revert can land before a malicious push
-  to `main` auto-publishes.
+The workflow is split into two jobs that handle NPM_TOKEN's blast radius
+in two layers:
+
+- A `verify-environment` job (**no** `environment:` block, **no**
+  `NPM_TOKEN` in scope) runs first. It queries
+  `GET /repos/{owner}/{repo}/environments/npm-publish` via the REST API
+  with the workflow `GITHUB_TOKEN` (scoped `contents: read` +
+  `actions: read`) and fails the job if the environment is missing OR if
+  it has zero required reviewers. This closes the silent
+  auto-creation hole: GitHub auto-creates an unconfigured environment
+  with no protection rules, so a bare `environment: npm-publish` is not
+  in itself a gate.
+- A `publish` job with `needs: verify-environment` and
+  `environment: npm-publish`. This is the ONLY job that has `NPM_TOKEN`
+  in its env. Because `needs:` blocks the job from starting until the
+  preflight passes, `NPM_TOKEN` is never injected into a runner whose
+  environment is unprotected.
+
+Why the split: GitHub resolves `environment:` and injects its secrets
+**before** the first step of a job runs. A verification step that lives
+inside the publish job cannot prevent NPM_TOKEN exposure — by the time
+step 1 logs `Run …`, the secret is already in the runner's env.
+Promoting verification to a sibling preflight job (`needs:`) is the
+structural fix.
+
+When the environment IS correctly configured, the publish job pauses
+for reviewer approval + the configured wait timer before `NPM_TOKEN`
+becomes accessible to the build steps.
 
 ### 5. Lifecycle scripts of dependencies are blocked by default
 
@@ -94,8 +116,12 @@ PRs with release notes do not.
 ### 7. Static analysis of every workflow file on every PR
 
 `.github/workflows/supply-chain-scan.yml` runs three audits whenever a
-PR touches `.github/`, `pnpm-lock.yaml`, any `package.json`, or `.npmrc`
-(and weekly via cron):
+PR touches `.github/workflows/`, `.github/actions/`, `.github/dependabot.yml`,
+`.github/zizmor.yml`, `pnpm-lock.yaml`, any `package.json`, or `.npmrc`
+(and weekly via cron). The scan target covers both `.github/workflows/`
+AND `.github/actions/` (added conditionally when the directory exists)
+so a future composite action cannot inherit the workflow trust boundary
+without going through the same gate.
 
 - **zizmor** (`--persona auditor --min-severity low`) — flags
   PWN-request misconfigs, unpinned actions, unsafe expansions in
@@ -111,8 +137,15 @@ PR touches `.github/`, `pnpm-lock.yaml`, any `package.json`, or `.npmrc`
   - `known-vulnerable-actions` — maintained CVE list.
   - `stale-action-refs` — pin is far behind upstream.
 - **actionlint** — workflow syntax + schema linter, with `shellcheck`
-  sub-linter enabled. Catches malformed workflows and `run:` shell
-  bugs before they ship to a runner.
+  sub-linter enabled. Installed from the GitHub release asset
+  `actionlint_<VERSION>_linux_amd64.tar.gz` with the SHA-256 digest
+  pinned verbatim in the workflow (resolved from the upstream
+  release's `actionlint_<VERSION>_checksums.txt`). We deliberately do
+  NOT `curl … | bash` from `raw.githubusercontent.com` — even though
+  the upstream installer self-verifies, fetching the installer via a
+  mutable tag ref and piping straight to `bash` reintroduces the exact
+  tag-poisoning class this workflow exists to detect. Catches
+  malformed workflows and `run:` shell bugs before they ship to a runner.
 - **pnpm audit** (informational) — runs against production deps with
   `--audit-level=high`. Output renders as a job-summary table so
   reviewers see whether a PR introduces a new advisory vs. carrying
@@ -254,21 +287,22 @@ JSON
 
 ### C. Configure the `npm-publish` GitHub Environment
 
-The publish job references `environment: npm-publish` AND contains an
-explicit fail-closed verification step that reads the environment via
-the GitHub API and exits the job if no required reviewers are
-configured. So the publish workflow is already structurally safe —
-this section just walks through the one-time admin setup that lets
-the verification step pass.
+The workflow is structurally safe by code: a `verify-environment`
+preflight job (without `environment:`, without `NPM_TOKEN` in scope)
+runs first and queries the GitHub API for the `npm-publish` environment
+config; the `publish` job has `needs: verify-environment` AND
+`environment: npm-publish`, so `NPM_TOKEN` is only injected into a
+runner whose environment has already been proven to require reviewer
+approval. This section walks through the one-time admin setup that
+lets the preflight pass.
 
 Settings → Environments → **New environment** → name it `npm-publish`,
 then:
 
 1. **Required reviewers**: add at least one (ideally two) maintainer
-   accounts. The publish job's `Verify npm-publish environment has
-   required reviewers` step will refuse to run otherwise — that is
-   what fail-closes the otherwise fail-open auto-creation behaviour
-   GitHub Actions ships with.
+   accounts. The `verify-environment` job will refuse to run otherwise —
+   that is what fail-closes the otherwise fail-open auto-creation
+   behaviour GitHub Actions ships with.
 2. **Wait timer**: 5 minutes is the minimum useful value. Gives a
    reviewer a window to abort if something looks wrong.
 3. **Deployment branches**: restrict to `main` only. Default allows any

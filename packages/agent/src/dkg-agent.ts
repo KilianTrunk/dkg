@@ -134,6 +134,7 @@ import {
 import { SyncVerifyWorker } from './sync-verify-worker.js';
 import { bindRandomSampling, type RandomSamplingHandle, type RandomSamplingStatus } from './random-sampling-bind.js';
 import { connectToMultiaddr, ensurePeerConnected as ensurePeerConnectedAtom, primeCatchupConnections as primeCatchupConnectionsAtom } from './p2p/peer-connect.js';
+import { Messenger } from './p2p/messenger.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
@@ -806,6 +807,7 @@ export class DKGAgent {
   readonly profileManager: ProfileManager;
   gossip!: GossipSubManager;
   router!: ProtocolRouter;
+  messenger!: Messenger;
   readonly eventBus: TypedEventBus;
   private readonly chain: ChainAdapter;
   /** Shared memory-owned root entities per context graph: entity → creatorPeerId. Used by publisher and shared memory handler. */
@@ -1219,6 +1221,11 @@ export class DKGAgent {
     }
 
     this.router = new ProtocolRouter(this.node);
+    this.messenger = new Messenger({
+      libp2p: this.node.libp2p as any,
+      router: this.router,
+      discovery: this.discovery,
+    });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
     await this.loadSwmSenderKeyState();
     await this.rehydrateContextGraphSubscriptions();
@@ -1550,6 +1557,7 @@ export class DKGAgent {
     const x25519Priv = ed25519ToX25519Private(this.wallet.keypair.secretKey);
     this.messageHandler = new MessageHandler(
       this.router,
+      this.messenger,
       this.wallet.keypair,
       x25519Priv,
       this.node.peerId,
@@ -2306,7 +2314,7 @@ export class DKGAgent {
       checkpointStore: this.syncCheckpoints,
       buildSyncRequest: this.buildSyncRequest.bind(this),
       parseAndFilter: (nquadsText, targetGraphUri, targetContextGraphId) => this.getOrCreateSyncVerifyWorker().parseAndFilter(nquadsText, targetGraphUri, targetContextGraphId),
-      send: (peerId, protocolId, data, sendTimeoutMs) => this.router.send(peerId, protocolId, data, sendTimeoutMs),
+      send: (peerId, protocolId, data, sendTimeoutMs) => this.messenger.sendToPeer(peerId, protocolId, data, { timeoutMs: sendTimeoutMs }),
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
       logDebug: (opCtx, message) => this.log.debug(opCtx, message),
@@ -3687,9 +3695,22 @@ export class DKGAgent {
 
   // ---------------------------------------------------------------------------
 
+  /**
+   * Public send-bytes-to-peer primitive. Thin pass-through to `Messenger`,
+   * which handles relay-prime + transport-level retry. All P2P call sites
+   * SHOULD go through this rather than `this.router.send` directly.
+   */
+  async sendToPeer(
+    peerId: string,
+    protocolId: string,
+    data: Uint8Array,
+    opts?: { timeoutMs?: number },
+  ): Promise<Uint8Array> {
+    return this.messenger.sendToPeer(peerId, protocolId, data, opts);
+  }
+
   async sendChat(recipientPeerId: string, text: string): Promise<{ delivered: boolean; error?: string }> {
     if (!this.messageHandler) throw new Error('Agent not started');
-    await this.ensureCircuitRelayAddress(recipientPeerId);
     return this.messageHandler.sendChat(recipientPeerId, text);
   }
 
@@ -3709,8 +3730,6 @@ export class DKGAgent {
     inputData: Uint8Array,
   ): Promise<SkillResponse> {
     if (!this.messageHandler) throw new Error('Agent not started');
-    await this.ensureCircuitRelayAddress(recipientPeerId);
-
     return this.messageHandler.sendSkillRequest(recipientPeerId, {
       skillUri,
       inputData,
@@ -3857,35 +3876,6 @@ export class DKGAgent {
       const error = new Error(`DIAL_FAILED: ${err?.message ?? String(err)}`);
       (error as any).code = 'DIAL_FAILED';
       throw error;
-    }
-  }
-
-  /**
-   * Ensure libp2p knows how to reach a peer via circuit relay. If the peer
-   * isn't directly connected and their profile advertises a relay address, we
-   * add a /p2p-circuit multiaddr to the peer store so dialProtocol can route
-   * through the relay.
-   */
-  private async ensureCircuitRelayAddress(peerIdStr: string): Promise<void> {
-    try {
-      const { peerIdFromString } = await import('@libp2p/peer-id');
-      const peerId = peerIdFromString(peerIdStr);
-
-      const conns = this.node.libp2p.getConnections(peerId);
-      if (conns.length > 0) return;
-
-      const agent = await this.discovery.findAgentByPeerId(peerIdStr);
-      if (!agent?.relayAddress) return;
-
-      const circuitAddr = multiaddr(
-        `${agent.relayAddress}/p2p-circuit/p2p/${peerIdStr}`,
-      );
-      await this.node.libp2p.peerStore.merge(peerId, {
-        multiaddrs: [circuitAddr],
-      });
-    } catch {
-      // Best-effort: if peer ID is invalid or lookup fails, let the
-      // caller proceed — it will get a proper error from dialProtocol.
     }
   }
 
@@ -4232,7 +4222,7 @@ export class DKGAgent {
         `peerId=${recipient.peerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
         `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
       );
-      const ackBytes = await this.router.send(
+      const ackBytes = await this.messenger.sendToPeer(
         recipient.peerId,
         PROTOCOL_SWM_SENDER_KEY,
         encodeSwmSenderKeyPackage(pkg),
@@ -6382,7 +6372,7 @@ export class DKGAgent {
     this.log.info(ctx, `Remote query to ${peerId.slice(-8)} type=${request.lookupType}`);
 
     const payload = new TextEncoder().encode(JSON.stringify(fullRequest));
-    const responseBytes = await this.router.send(peerId, PROTOCOL_QUERY_REMOTE, payload);
+    const responseBytes = await this.messenger.sendToPeer(peerId, PROTOCOL_QUERY_REMOTE, payload);
     const response = JSON.parse(new TextDecoder().decode(responseBytes)) as QueryResponse;
 
     this.log.info(ctx, `Remote query response: status=${response.status} resultCount=${response.resultCount}`);
@@ -8009,7 +7999,6 @@ export class DKGAgent {
     const addrLower = agentAddress.toLowerCase();
 
     let targetPeerId: string | null = null;
-    let targetRelayAddress: string | undefined;
 
     // Preferred source: the peer that actually delivered the join
     // request. This is always correct for the common flow and doesn't
@@ -8051,7 +8040,6 @@ export class DKGAgent {
           // Take the registry's peer ID whenever we don't have a live
           // connection to the remembered one — it may be fresher.
           targetPeerId = match.peerId;
-          targetRelayAddress = match.relayAddress;
         }
       } catch {
         // Registry unavailable — we'll just skip delivery below if we
@@ -8073,31 +8061,8 @@ export class DKGAgent {
       return;
     }
 
-    // Ensure we actually have a path to the target before attempting to
-    // send. If we're not connected and we have a relay hint from the
-    // registry, try a circuit dial once.
-    const hasConnection = this.node.libp2p
-      .getConnections()
-      .some((c) => c.remotePeer.toString() === targetPeerId);
-    if (!hasConnection && targetRelayAddress) {
-      try {
-        const { peerIdFromString } = await import('@libp2p/peer-id');
-        const { multiaddr } = await import('@multiformats/multiaddr');
-        const circuitAddr = multiaddr(`${targetRelayAddress}/p2p-circuit/p2p/${targetPeerId}`);
-        const pid = peerIdFromString(targetPeerId);
-        await this.node.libp2p.peerStore.merge(pid, { multiaddrs: [circuitAddr] });
-        await this.node.libp2p.dial(pid);
-      } catch (dialErr) {
-        this.log.warn(
-          ctx,
-          `Could not dial ${targetPeerId} via relay for ${label} notification: ` +
-            (dialErr instanceof Error ? dialErr.message : String(dialErr)),
-        );
-      }
-    }
-
     try {
-      await this.router.send(targetPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, 5000);
+      await this.messenger.sendToPeer(targetPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: 5000 });
       this.log.info(ctx, `Delivered ${label} for "${contextGraphId}" to ${agentAddress} (${targetPeerId})`);
       // The join request is finalised now — forget the origin peer so
       // the map doesn't grow unbounded over the curator's lifetime.
@@ -8186,19 +8151,7 @@ export class DKGAgent {
     let curatorTargetedSuccess = false;
     if (curatorPeerId !== this.peerId) {
       try {
-        // Mirror what `sendChat` / `invokeSkill` do — register a
-        // /p2p-circuit relay route into the peer store before dialling.
-        // Without it, libp2p's dialProtocol falls back to direct dial,
-        // which fails for any NAT'd peer that doesn't currently hold an
-        // open connection to us. On the public testnet (both laptops
-        // behind home-internet NAT), the curator is reachable only via
-        // circuit relay through testnet relay nodes — exactly the path
-        // chat+skill messaging primes via this helper. Skipping it here
-        // is what made `forwardJoinRequest` fail with "no reachable
-        // curator" on Laptop B even after Laptop A's own restart had
-        // re-established its swarm connections (PR #448 round-7).
-        await this.ensureCircuitRelayAddress(curatorPeerId);
-        const responseBytes = await this.router.send(curatorPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, 5000);
+        const responseBytes = await this.messenger.sendToPeer(curatorPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: 5000 });
         const response = JSON.parse(new TextDecoder().decode(responseBytes));
         if (response.ok) {
           // Only the explicit invite-supplied curator is recorded as a
@@ -8242,7 +8195,7 @@ export class DKGAgent {
       .filter((id) => id !== this.peerId && (!curatorTargetedSuccess || id !== curatorPeerId));
     const results = await Promise.allSettled(
       broadcastTargets.map(async (remotePeerId) => {
-        const responseBytes = await this.router.send(remotePeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, 5000);
+        const responseBytes = await this.messenger.sendToPeer(remotePeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: 5000 });
         const response = JSON.parse(new TextDecoder().decode(responseBytes));
         return { remotePeerId, response };
       }),
@@ -8678,7 +8631,7 @@ export class DKGAgent {
 
     // 5. Collect M-of-N approvals
     const collector = new VerifyCollector({
-      sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => this.router.send(peerId, protocol, data),
+      sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => this.messenger.sendToPeer(peerId, protocol, data),
       getParticipantPeers: (cgId?: string) => {
         const allPeers = this.node.libp2p.getPeers().map(p => p.toString()).filter(id => id !== this.peerId);
         // TODO: Filter by on-chain participant set once getContextGraphParticipants() is available.
@@ -11097,7 +11050,7 @@ export class DKGAgent {
         await this.gossip.publish(topic, data);
       },
       sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
-        return this.router.send(peerId, protocol, data);
+        return this.messenger.sendToPeer(peerId, protocol, data);
       },
       getConnectedCorePeers: () => {
         const peers = this.node.libp2p.getPeers();

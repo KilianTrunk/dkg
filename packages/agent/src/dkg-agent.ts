@@ -338,6 +338,24 @@ const JOIN_DELEGATION_VALIDITY_MS = 365 * 24 * 60 * 60 * 1000;
 const JOIN_REQUEST_SEND_TIMEOUT_MS = 20_000;
 
 /**
+ * Normalise an `did:dkg:agent:<id>` DID for case-insensitive equality
+ * comparison. The agent ID can be either an Ethereum address (which IS
+ * case-insensitive on the wire — checksum is purely advisory per
+ * EIP-55) or a libp2p peer ID (which is NOT case-insensitive — base58
+ * has uppercase characters that carry information). The previous
+ * approach lower-cased the entire DID, which works in practice because
+ * peer IDs round-trip the same way on both sides of a comparison, but
+ * is semantically wrong: a non-EVM owner DID could in principle be
+ * stored with one case and read back with another. Make the
+ * normalisation explicit and only touch the EVM-address suffix.
+ */
+function normalizeAgentDid(did: string): string {
+  const m = did.match(/^did:dkg:agent:(0x[0-9a-fA-F]{40})$/);
+  if (m) return `did:dkg:agent:${m[1].toLowerCase()}`;
+  return did;
+}
+
+/**
  * Scope string for join-request delegations. Authorises the named node
  * to sync the CG on the named DKG deployment.
  *
@@ -1769,22 +1787,21 @@ export class DKGAgent {
           );
           return new TextEncoder().encode(JSON.stringify({ ok: false, error: 'unknown CG' }));
         }
-        // Compare on lower-cased DIDs so we don't reject ourselves over
-        // EIP-55 checksum case drift between the cgId-derived owner DID
-        // (`deriveCuratorDidFromCgId`, preserves whatever case the cgId
-        // shipped with) and the locally-stored agent address (typically
-        // `ethers.getAddress`'d to checksummed form). Ethereum addresses
-        // are case-insensitive on the wire; checksum is purely advisory.
-        // libp2p peer-IDs are deterministic from the public key so the
-        // lower-casing is a no-op for the peer-ID branch.
-        const ownerLower = owner.toLowerCase();
-        const selfDid = `did:dkg:agent:${this.peerId}`.toLowerCase();
+        // Compare on normalised DIDs (see `normalizeAgentDid`): EVM
+        // address suffixes are lowered (case-insensitive on-wire), peer-ID
+        // suffixes pass through (case-sensitive base58). The cgId-derived
+        // owner DID (`deriveCuratorDidFromCgId`) preserves whatever case
+        // the cgId shipped with, while the locally-stored agent address
+        // is typically `ethers.getAddress`'d to checksummed form — both
+        // collapse to the same string here.
+        const ownerNorm = normalizeAgentDid(owner);
+        const selfDid = `did:dkg:agent:${this.peerId}`;
         const selfAgentDid = this.defaultAgentAddress
-          ? `did:dkg:agent:${this.defaultAgentAddress}`.toLowerCase()
+          ? normalizeAgentDid(`did:dkg:agent:${this.defaultAgentAddress}`)
           : null;
-        const isCurator = ownerLower === selfDid ||
-          (selfAgentDid !== null && ownerLower === selfAgentDid) ||
-          [...this.localAgents.keys()].some((addr) => ownerLower === `did:dkg:agent:${addr}`.toLowerCase());
+        const isCurator = ownerNorm === selfDid ||
+          (selfAgentDid !== null && ownerNorm === selfAgentDid) ||
+          [...this.localAgents.keys()].some((addr) => ownerNorm === normalizeAgentDid(`did:dkg:agent:${addr}`));
         if (!isCurator) {
           this.log.warn(
             requestCtx,
@@ -3610,15 +3627,13 @@ export class DKGAgent {
   async isCuratorOf(contextGraphId: string): Promise<boolean> {
     const owner = await this.getContextGraphOwner(contextGraphId);
     if (!owner) return false;
-    // Mirror the case-insensitive comparison in PROTOCOL_JOIN_REQUEST
-    // — the owner can come from `deriveCuratorDidFromCgId` (preserves
-    // cgId case) while local-agent keys are typically EIP-55 checksum.
-    // Both forms denote the same Ethereum address.
-    const ownerLower = owner.toLowerCase();
-    const selfDid = `did:dkg:agent:${this.peerId}`.toLowerCase();
-    if (ownerLower === selfDid) return true;
+    // Mirror the comparison in PROTOCOL_JOIN_REQUEST. `normalizeAgentDid`
+    // collapses EVM-address case drift but preserves peer-ID case.
+    const ownerNorm = normalizeAgentDid(owner);
+    const selfDid = `did:dkg:agent:${this.peerId}`;
+    if (ownerNorm === selfDid) return true;
     for (const addr of this.localAgents.keys()) {
-      if (ownerLower === `did:dkg:agent:${addr}`.toLowerCase()) return true;
+      if (ownerNorm === normalizeAgentDid(`did:dkg:agent:${addr}`)) return true;
     }
     return false;
   }
@@ -9530,8 +9545,8 @@ export class DKGAgent {
       computeSyncDigest: this.computeSyncDigest.bind(this),
       getIdentityId: () => this.chain.getIdentityId(),
       signMessage: typeof this.chain.signMessage === 'function' ? this.chain.signMessage.bind(this.chain) : undefined,
-      defaultAgentAddress: claimedAgentAddress,
-      defaultAgentPrivateKey: claimedAgent?.privateKey,
+      claimedAgentAddress: claimedAgentAddress,
+      claimedAgentPrivateKey: claimedAgent?.privateKey,
     });
   }
 
@@ -9964,7 +9979,16 @@ export class DKGAgent {
           createdAt: row['created'] ? stripLiteral(row['created']) : undefined,
           isSystem: !!row['isSystem'],
           subscribed: sub?.subscribed ?? false,
-          synced: true,
+          // `synced` now means "we've actually pulled CG data from a peer
+          // and stored it locally" — not "we've seen the definition
+          // triple gossip across ONTOLOGY/AGENTS." The earlier behaviour
+          // hard-coded `true` here, which made every gossip-discovered
+          // CG look fully synced and let stale public CGs (curators
+          // long gone) persist in the Oracle browse catalogue
+          // indefinitely. Now `synced` mirrors the daemon's authoritative
+          // subscription state set by the catchup runner (see
+          // `markContextGraphSubscriptionState` at routes/context-graph.ts:1301).
+          synced: sub?.synced ?? false,
           ...(onChainId ? { onChainId } : {}),
         });
       }));
@@ -10371,6 +10395,16 @@ export class DKGAgent {
     // PROTOCOL_JOIN_REQUEST handler silently rejects every join attempt
     // for these CGs and the joiner sees only a generic "no reachable
     // curator". See `deriveCuratorDidFromCgId` for the full rationale.
+    //
+    // Gate: only return the structurally-derived curator when the CG
+    // actually exists locally. Without this gate, a node would accept
+    // PROTOCOL_JOIN_REQUEST for any wallet-prefixed CG id starting
+    // with one of its agent addresses (`0x<my-addr>/<anything>`) and
+    // create stray `_meta` rows for graphs that were never created
+    // here. The fallback is meant to rescue real-but-half-registered
+    // graphs, not impersonate ownership of unknown ones.
+    const exists = await this.contextGraphExists(contextGraphId);
+    if (!exists) return null;
     return deriveCuratorDidFromCgId(contextGraphId);
   }
 
@@ -10861,28 +10895,36 @@ export class DKGAgent {
         // the discovered human-readable `name` (otherwise the UI/listing
         // APIs fall back to the raw CG id).
         //
-        // Intentionally leave `metaSynced` FALSE here. The gossip handler's
-        // "deny until _meta is synced" guard must stay armed until the
-        // authenticated allowlist (`_meta` graph) has actually arrived —
-        // discovery alone can land with just the ontology/access-policy
-        // triples while `allowedPeers` is still null. The follow-up
+        // `synced: false` is the truthful state at discovery — we have
+        // the definition triple but no CG content yet. The catchup
+        // runner flips it to true once data has actually been pulled
+        // (see `markContextGraphSubscriptionState` at
+        // routes/context-graph.ts:1301).
+        //
+        // Intentionally leave `metaSynced` FALSE here for the same
+        // reason: the gossip handler's "deny until _meta is synced"
+        // guard must stay armed until the authenticated allowlist
+        // (`_meta` graph) has actually arrived. The follow-up
         // `refreshMetaSyncedFlags(newlyDiscovered)` call from
-        // `trySyncFromPeer` (see ~#1012) will flip the flag once the
-        // allowlist has been fetched via the authenticated sync path.
+        // `trySyncFromPeer` will flip it once the allowlist has been
+        // fetched via the authenticated sync path.
         this.setContextGraphSubscription(id, {
           name,
           subscribed: false,
-          synced: true,
+          synced: false,
           metaSynced: false,
           onChainId: undefined,
         }, { persist: false });
         this.subscribeToContextGraph(id);
         this.log.info(ctx, `Discovered invited context graph "${name}" (${id}) — auto-subscribed (private/allowlisted)`);
       } else {
+        // Same truthful-flag rationale as the curated branch above:
+        // `synced` reflects "have CG data locally", not "have heard the
+        // definition triple from gossip."
         this.setContextGraphSubscription(id, {
           name,
           subscribed: false,
-          synced: true,
+          synced: false,
           metaSynced: source === 'meta',
           onChainId: undefined,
         }, { persist: false });

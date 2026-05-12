@@ -167,7 +167,11 @@ describe('discoverContextGraphsFromStore', () => {
     const sub = agent.getSubscribedContextGraphs().get('discovered-contextGraph');
     expect(sub).toBeDefined();
     expect(sub!.subscribed).toBe(false);
-    expect(sub!.synced).toBe(true);
+    // `synced` now means "actual CG data was pulled from a peer" — not
+    // "we saw the definition triple from gossip." Discovery from the
+    // store leaves us with the declaration only, so `synced` stays
+    // false until the catchup runner flips it.
+    expect(sub!.synced).toBe(false);
     expect(sub!.name).toBe('Discovered ContextGraph');
   }, 15000);
 
@@ -256,7 +260,10 @@ describe('listContextGraphs merge', () => {
     const entry = contextGraphs.find(p => p.id === 'unsubscribed');
     expect(entry).toBeDefined();
     expect(entry!.subscribed).toBe(false);
-    expect(entry!.synced).toBe(true);
+    // SPARQL-only discovery (definition triple from ONTOLOGY) leaves
+    // `synced=false` — see the same expectation comment in the
+    // "discovers contextGraphs from ONTOLOGY graph" case above.
+    expect(entry!.synced).toBe(false);
     expect(entry!.callerInvolved).toBeUndefined();
   }, 15000);
 
@@ -478,7 +485,10 @@ describe('discoverContextGraphsFromStore', () => {
     expect(entry).toBeDefined();
     expect(entry!.name).toBe('Curated Meta Only');
     expect(entry!.subscribed).toBe(false);
-    expect(entry!.synced).toBe(true);
+    // `synced=false` — discovery from the _meta store gives us the
+    // definition triple but not actual CG data. `metaSynced=true` is
+    // the right flag for "we have the curated _meta allowlist."
+    expect(entry!.synced).toBe(false);
     expect(entry!.metaSynced).toBe(true);
   }, 15000);
 });
@@ -564,7 +574,10 @@ describe('hash-vs-name duplication regression', () => {
     expect(matches.length).toBe(1);
     expect(matches[0].id).toBe(localName);
     expect(matches[0].subscribed).toBe(true);
-    expect(matches[0].synced).toBe(true);
+    // Chain + ontology discovery only deliver definition metadata —
+    // no actual CG data has been pulled from a peer, so `synced`
+    // stays false until the catchup runner flips it.
+    expect(matches[0].synced).toBe(false);
     expect(matches[0].callerInvolved).toBeUndefined();
 
     const ghosts = contextGraphs.filter(p => p.id.startsWith('0x'));

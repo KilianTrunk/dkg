@@ -3,7 +3,20 @@
 # version (e.g. 10.0.0-rc.1-dev.1774300000.abc1234) tagged as `latest`.
 #
 # To switch the release branch: change the branches list below.
-# To disable: remove the NPM_TOKEN secret from the repo settings.
+# To disable publishing:
+#   * Recommended: disable the workflow from the Actions UI
+#     (Actions tab → Continuous NPM Publish → … → Disable workflow).
+#     This stops the push trigger entirely without any code change.
+#   * Alternative: delete the `npm-publish` GitHub Environment in
+#     repo Settings → Environments. The `verify-environment` job
+#     fails-closed when the environment is missing, so the publish
+#     step never runs and NPM_TOKEN is never injected into a runner.
+#
+# What does NOT disable publishing anymore: removing the NPM_TOKEN
+# repo-level secret. After the hardening landed in this PR, NPM_TOKEN
+# should live INSIDE the `npm-publish` Environment, where it is
+# invisible to any job that does not declare `environment: npm-publish`.
+# This is the structural property that makes the gate fail-closed.
 
 name: Continuous NPM Publish
 
@@ -29,43 +42,22 @@ jobs:
   # environment is configured correctly; the publish job below `needs:`
   # it and is the ONLY job in this workflow that gates on
   # `environment: npm-publish`.
-  # CHECK-TOKEN — single source of truth for "is publishing enabled".
-  # We cannot reference `secrets.NPM_TOKEN` in a job-level `if:`
-  # condition (GitHub disallows that), so we resolve the secret
-  # presence once here, expose it as a job output, and gate every
-  # downstream job on that output via `needs.check-token.outputs.*`.
-  # The documented disable mechanism — "remove NPM_TOKEN secret" —
-  # MUST short-circuit BOTH the env-verification and the publish job;
-  # otherwise the verifier would fail/wait on a disabled repo and
-  # paint main red (which is what the previous reviewer caught).
-  check-token:
-    name: Check publish gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 1
-    if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
-    permissions:
-      contents: read
-    outputs:
-      has_token: ${{ steps.check.outputs.has_token }}
-    steps:
-      - id: check
-        env:
-          HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
-        run: |
-          set -euo pipefail
-          echo "has_token=${HAS_NPM_TOKEN}" >> "$GITHUB_OUTPUT"
-          if [ "${HAS_NPM_TOKEN}" = "true" ]; then
-            echo "NPM_TOKEN present → verify + publish will run."
-          else
-            echo "::notice title=NPM publishing disabled::NPM_TOKEN is not configured for this repo. Skipping verify-environment and publish. To re-enable, add an NPM_TOKEN environment secret to the npm-publish Environment."
-          fi
-
+  #
+  # NOTE on the disable mechanism: an earlier revision of this workflow
+  # tried to gate verify+publish on `secrets.NPM_TOKEN != ''` via a
+  # `check-token` preflight job. That breaks once NPM_TOKEN moves from
+  # a repo-level secret to an environment-level secret on `npm-publish`
+  # (which is the hardening recommendation in
+  # docs/security/SUPPLY_CHAIN_HARDENING.md §C step 4) — environment
+  # secrets are ONLY visible to jobs that declare `environment: <name>`,
+  # so the preflight always saw an empty token and skipped both jobs
+  # permanently. The structurally correct disable mechanisms are
+  # documented in the file header above.
   verify-environment:
     name: Verify npm-publish environment has required reviewers
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    needs: check-token
-    if: needs.check-token.outputs.has_token == 'true'
+    if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
     permissions:
       contents: read
       # `actions: read` is the documented minimum scope for reading
@@ -109,15 +101,15 @@ jobs:
     name: Build & Publish to NPM
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # `needs:` ensures the publish job DOES NOT START until BOTH
-    # check-token confirms publishing is enabled AND verify-environment
-    # confirms the npm-publish environment is configured with required
-    # reviewers. Combined with `environment:` below, this is what makes
-    # the gate fail-closed: NPM_TOKEN is only injected into a runner
-    # whose preflight already proved the environment is configured
-    # AND the disable mechanism is not in effect.
-    needs: [check-token, verify-environment]
-    if: needs.check-token.outputs.has_token == 'true'
+    # `needs:` ensures the publish job DOES NOT START until
+    # verify-environment confirms the npm-publish environment is
+    # configured with required reviewers. Combined with `environment:`
+    # below, this is what makes the gate fail-closed: NPM_TOKEN is only
+    # injected into a runner whose preflight already proved the
+    # environment is configured. The `if:` mirrors verify-environment's
+    # guard so a manual rerun of just one job stays consistent.
+    needs: verify-environment
+    if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
     # `npm-publish` Environment gates access to NPM_TOKEN. Configure required
     # reviewers + a wait timer in repo Settings → Environments → `npm-publish`
     # so a compromised merge to main cannot auto-publish without human
@@ -185,12 +177,14 @@ jobs:
           "
 
       - name: Publish all public packages
-        # The job-level `needs.check-token.outputs.has_token == 'true'`
-        # guard already short-circuits this whole job when NPM_TOKEN is
-        # absent, so the step-level `HAS_NPM_TOKEN` belt that lived here
-        # before has been removed (it was redundant with the job-level
-        # gate and confused the disable mechanism — see the bot
-        # discussion on PR #460).
+        # NPM_TOKEN is an environment-level secret on `npm-publish`. It
+        # is ONLY visible to this job (which declares `environment:
+        # npm-publish` above) — no other job in this workflow can read
+        # it. If NPM_TOKEN is missing from the environment, `pnpm
+        # publish` fails with an npm auth error (which is correct
+        # behaviour: the maintainer either misconfigured the env or
+        # intends to disable publishing, both of which the file-header
+        # disable-mechanism docs cover).
         run: pnpm -r publish --no-git-checks --tag latest
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

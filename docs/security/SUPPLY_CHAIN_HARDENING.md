@@ -86,6 +86,18 @@ When the environment IS correctly configured, the publish job pauses
 for reviewer approval + the configured wait timer before `NPM_TOKEN`
 becomes accessible to the build steps.
 
+**Disable mechanism** (replaces the older "remove the NPM_TOKEN repo
+secret" approach, which stopped working once the token moved into the
+environment per §C step 4):
+
+- **Recommended**: disable the workflow from the Actions UI (Actions
+  tab → Continuous NPM Publish → `…` → Disable workflow). The push
+  trigger goes inert immediately, no code change required.
+- **Alternative**: delete the `npm-publish` GitHub Environment in repo
+  Settings → Environments. The `verify-environment` job then fails
+  closed (it cannot find the environment), publish never starts, and
+  `NPM_TOKEN` is never injected into a runner.
+
 ### 5. Lifecycle scripts of dependencies are blocked by default
 
 pnpm 10 refuses to run any package's `preinstall` / `install` / `postinstall`

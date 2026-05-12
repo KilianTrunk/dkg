@@ -108,7 +108,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   // an `address author` argument to `createKnowledgeCollection` /
   // `updateKnowledgeCollection` and the matching indexed topic on the
   // `KnowledgeCollectionCreated` / `KnowledgeCollectionUpdated` events.
-  KnowledgeAssetsV10:           '785311d19ce39743522bf1db501f41276fb22d715a2cc94cc67d96f8a22e519e',
+  KnowledgeAssetsV10:           'df65359e0eb3c29aa00f9955d26ea345545a79eb2458eb0c14ccde43a17ad431',
   KnowledgeCollectionStorage:   'e165cbddc6569602d1d5c05c15909fd0a9ff851f974357cf80297041b2a83fd2',
   KnowledgeCollection:          'c906207c38ffded8944d7255498f7fc9f2c864098a3f8f3670df19006dbcd395',
   ContextGraphs:                'ee69f0d50b54df966b8bfb3bf457fe6d2865393f51f8770b4185fafd324b9462',
@@ -117,7 +117,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
   Identity:                     '29d09dd97de53de69d5bf2282d2f3008044ab43fb86c812fc4912552c9288946',
   IdentityStorage:              'd7c58ba8ae28523dc1a6ff0bc228a3bceb9d327e53d258099dada656db262479',
-  ParametersStorage:            'd8fbd96c9d4115c4d937bb11770c208af68f2b6b8ec1146379997ebdcf484b68',
+  ParametersStorage:            'adc65fdcb6f3b3c4455a02b01c14c3ccba928756d8f107136fbfad31271cb20e',
 };
 
 describe('ABI pin digest — detects silent contract surface drift [CH-5]', () => {

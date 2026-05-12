@@ -55,6 +55,22 @@
   {
     "inputs": [
       {
+        "internalType": "uint256",
+        "name": "expectedEpochs",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "providedEpochs",
+        "type": "uint256"
+      }
+    ],
+    "name": "InvalidPublishingConvictionEpochs",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "uint72",
         "name": "identityId",
         "type": "uint72"

@@ -145,6 +145,7 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
         uint256 _publishingConvictionEpochs
     ) external onlyOwnerOrMultiSigOwner {
         require(_publishingConvictionEpochs > 0, "publishingConvictionEpochs must be > 0");
+        require(_publishingConvictionEpochs <= type(uint16).max, "publishingConvictionEpochs too large");
         publishingConvictionEpochs = _publishingConvictionEpochs;
 
         emit ParameterChanged("publishingConvictionEpochs", _publishingConvictionEpochs);

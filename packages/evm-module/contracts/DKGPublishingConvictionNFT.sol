@@ -470,8 +470,14 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     function getRemainingAllowance(uint256 accountId, uint40 epoch) external view returns (uint96) {
         _requireExists(accountId);
         Account storage acct = accounts[accountId];
+        if (epoch < acct.createdAtEpoch || epoch >= acct.expiresAtEpoch) {
+            return 0;
+        }
+        uint40 billingWindow = uint40(
+            (chronos.timestampForEpoch(epoch) - uint256(acct.createdAtTimestamp)) / chronos.epochLength()
+        );
         uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
-        uint96 spent = epochSpent[accountId][epoch];
+        uint96 spent = epochSpent[accountId][billingWindow];
         uint96 epochRemaining = spent < baseAllowance ? baseAllowance - spent : 0;
         return epochRemaining + topUpBalance[accountId];
     }

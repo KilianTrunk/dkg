@@ -224,6 +224,13 @@ interface ContractCache {
   hub: Contract;
   identity?: Contract;
   profile?: Contract;
+  /**
+   * RFC 04 — read getRelayCapable / getMultiaddrs and listen for
+   * RelayCapabilityUpdated / MultiaddrsUpdated events from here. Profile.sol
+   * is the only writer (via onlyContracts) but the storage contract owns
+   * both the view surface and the event surface.
+   */
+  profileStorage?: Contract;
   knowledgeAssets?: Contract;
   knowledgeAssetsStorage?: Contract;
   knowledgeCollection?: Contract;
@@ -539,6 +546,88 @@ export class EVMChainAdapter implements ChainAdapter {
     return result;
   }
 
+  // =====================================================================
+  // RFC 04 / Issue #461 — Network Relay Registry surface.
+  // =====================================================================
+
+  // Mirrored from contracts/libraries/ProfileLib.sol — kept in lock-step
+  // with the on-chain bounds so we fast-fail before the broadcast.
+  private static readonly MAX_MULTIADDRS = 8;
+  private static readonly MAX_MULTIADDR_LENGTH = 256;
+
+  async getRelayCapable(identityId: bigint): Promise<boolean> {
+    await this.init();
+    if (!this.contracts.profileStorage) {
+      throw new Error('getRelayCapable: ProfileStorage not deployed on this Hub.');
+    }
+    return Boolean(await this.contracts.profileStorage.getRelayCapable(identityId));
+  }
+
+  async getMultiaddrs(identityId: bigint): Promise<string[]> {
+    await this.init();
+    if (!this.contracts.profileStorage) {
+      throw new Error('getMultiaddrs: ProfileStorage not deployed on this Hub.');
+    }
+    const result: string[] = await this.contracts.profileStorage.getMultiaddrs(identityId);
+    return [...result];
+  }
+
+  async setRelayCapable(relayCapable: boolean): Promise<TxResult> {
+    await this.init();
+    if (!this.contracts.profile) {
+      throw new Error('setRelayCapable: Profile not deployed on this Hub.');
+    }
+    const identityId = await this.getIdentityId();
+    if (identityId === 0n) {
+      throw new Error('setRelayCapable: signer has no on-chain profile (call ensureProfile first).');
+    }
+    const tx = await this.contracts.profile.updateRelayCapable(identityId, relayCapable);
+    const receipt = await tx.wait();
+    return {
+      hash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      success: receipt.status === 1,
+    };
+  }
+
+  async setMultiaddrs(multiaddrs: string[]): Promise<TxResult> {
+    await this.init();
+    if (!this.contracts.profile) {
+      throw new Error('setMultiaddrs: Profile not deployed on this Hub.');
+    }
+    if (multiaddrs.length > EVMChainAdapter.MAX_MULTIADDRS) {
+      throw new Error(
+        `setMultiaddrs: too many entries (${multiaddrs.length}); on-chain max is ` +
+        `${EVMChainAdapter.MAX_MULTIADDRS}.`,
+      );
+    }
+    for (let i = 0; i < multiaddrs.length; i++) {
+      const entry = multiaddrs[i];
+      if (entry.length === 0) {
+        throw new Error(`setMultiaddrs: entry[${i}] is empty.`);
+      }
+      // UTF-8 byte length matters for the Solidity bytes(string).length check.
+      const byteLen = new TextEncoder().encode(entry).length;
+      if (byteLen > EVMChainAdapter.MAX_MULTIADDR_LENGTH) {
+        throw new Error(
+          `setMultiaddrs: entry[${i}] is ${byteLen} bytes; on-chain max is ` +
+          `${EVMChainAdapter.MAX_MULTIADDR_LENGTH}.`,
+        );
+      }
+    }
+    const identityId = await this.getIdentityId();
+    if (identityId === 0n) {
+      throw new Error('setMultiaddrs: signer has no on-chain profile (call ensureProfile first).');
+    }
+    const tx = await this.contracts.profile.updateMultiaddrs(identityId, multiaddrs);
+    const receipt = await tx.wait();
+    return {
+      hash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      success: receipt.status === 1,
+    };
+  }
+
   private async resolveContract(name: string, abiName?: string): Promise<Contract> {
     let address: string;
     try {
@@ -593,6 +682,16 @@ export class EVMChainAdapter implements ChainAdapter {
     this.contracts.profile = await this.resolveContract('Profile');
     this.contracts.staking = await this.resolveContract('Staking');
     this.contracts.parametersStorage = await this.resolveContract('ParametersStorage');
+
+    // RFC 04 — ProfileStorage holds the relay registry views + events.
+    // Tolerated as optional so adapters bound to a Hub that pre-dates the
+    // Profile 1.2.0 / ProfileStorage 1.1.0 deploy still init cleanly; the
+    // relay-registry methods will throw with a clear message at call time.
+    try {
+      this.contracts.profileStorage = await this.resolveContract('ProfileStorage');
+    } catch {
+      // Older deployments without the relay registry surface.
+    }
 
     // V8 legacy contracts
     this.contracts.knowledgeCollection = await this.resolveContract('KnowledgeCollection');
@@ -1329,6 +1428,57 @@ export class EVMChainAdapter implements ChainAdapter {
                   requiredSignatures: Number(parsed.args.requiredSignatures ?? 0),
                   accessPolicy: Number(parsed.args.accessPolicy ?? 0),
                   publishPolicy: Number(parsed.args.publishPolicy ?? 0),
+                  txHash: log.transactionHash,
+                },
+              };
+            }
+          }
+        }
+      }
+
+      // RFC 04 / Issue #461 — Network Relay Registry events. The Phase 3
+      // NetworkStateRegistry filters on these to refresh its peerId →
+      // multiaddrs cache without doing a follow-up storage read for every
+      // peer (the event payload is the canonical update).
+      if (eventType === 'RelayCapabilityUpdated') {
+        const profileStorage = this.contracts.profileStorage;
+        if (profileStorage) {
+          const eventFilter = profileStorage.filters.RelayCapabilityUpdated();
+          const logs = await profileStorage.queryFilter(eventFilter, filter.fromBlock ?? 0, filter.toBlock);
+          for (const log of logs) {
+            const parsed = profileStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
+            if (parsed) {
+              yield {
+                type: 'RelayCapabilityUpdated',
+                blockNumber: log.blockNumber,
+                data: {
+                  identityId: parsed.args.identityId?.toString() ?? '0',
+                  oldValue: Boolean(parsed.args.oldValue),
+                  newValue: Boolean(parsed.args.newValue),
+                  txHash: log.transactionHash,
+                },
+              };
+            }
+          }
+        }
+      }
+
+      if (eventType === 'MultiaddrsUpdated') {
+        const profileStorage = this.contracts.profileStorage;
+        if (profileStorage) {
+          const eventFilter = profileStorage.filters.MultiaddrsUpdated();
+          const logs = await profileStorage.queryFilter(eventFilter, filter.fromBlock ?? 0, filter.toBlock);
+          for (const log of logs) {
+            const parsed = profileStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
+            if (parsed) {
+              yield {
+                type: 'MultiaddrsUpdated',
+                blockNumber: log.blockNumber,
+                data: {
+                  identityId: parsed.args.identityId?.toString() ?? '0',
+                  multiaddrs: Array.isArray(parsed.args.multiaddrs)
+                    ? [...parsed.args.multiaddrs]
+                    : [],
                   txHash: log.transactionHash,
                 },
               };

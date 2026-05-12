@@ -94,6 +94,11 @@ export class MockChainAdapter implements ChainAdapter {
   /** Configurable minimum receiver signatures. When > 0, publishKnowledgeAssets will check the count. Default: 1. */
   minimumRequiredSignatures = 1;
 
+  // RFC 04 / Issue #461 — in-memory mirror of ProfileStorage relay-registry
+  // fields. Keyed by identityId (bigint) to match the on-chain shape.
+  private relayCapableByIdentity = new Map<bigint, boolean>();
+  private multiaddrsByIdentity = new Map<bigint, string[]>();
+
   constructor(chainId = 'mock:31337', signerAddress = MOCK_DEFAULT_SIGNER) {
     this.chainId = chainId;
     this.signerAddress = signerAddress;
@@ -144,6 +149,71 @@ export class MockChainAdapter implements ChainAdapter {
    */
   allowPublisherAddress(address: string): void {
     this.allowedPublisherAddresses.add(ethers.getAddress(address).toLowerCase());
+  }
+
+  // --- RFC 04 / Issue #461 — Network Relay Registry surface ---
+  //
+  // Mirrors the bounds enforced by Profile.sol so adapter-parity tests
+  // hold across mock and EVM. Reads return defaults (false/empty) for
+  // unknown identities, matching Solidity's zero-init mapping behaviour.
+
+  private static readonly MAX_MULTIADDRS = 8;
+  private static readonly MAX_MULTIADDR_LENGTH = 256;
+
+  async getRelayCapable(identityId: bigint): Promise<boolean> {
+    return this.relayCapableByIdentity.get(identityId) ?? false;
+  }
+
+  async getMultiaddrs(identityId: bigint): Promise<string[]> {
+    const stored = this.multiaddrsByIdentity.get(identityId);
+    return stored ? [...stored] : [];
+  }
+
+  async setRelayCapable(relayCapable: boolean): Promise<TxResult> {
+    const identityId = await this.getIdentityId();
+    if (identityId === 0n) {
+      throw new Error('setRelayCapable: signer has no profile (call ensureProfile first).');
+    }
+    const oldValue = this.relayCapableByIdentity.get(identityId) ?? false;
+    this.relayCapableByIdentity.set(identityId, relayCapable);
+    this.pushEvent('RelayCapabilityUpdated', {
+      identityId: identityId.toString(),
+      oldValue,
+      newValue: relayCapable,
+    });
+    return this.txResult(true);
+  }
+
+  async setMultiaddrs(multiaddrs: string[]): Promise<TxResult> {
+    if (multiaddrs.length > MockChainAdapter.MAX_MULTIADDRS) {
+      throw new Error(
+        `setMultiaddrs: too many entries (${multiaddrs.length}); on-chain max is ` +
+        `${MockChainAdapter.MAX_MULTIADDRS}.`,
+      );
+    }
+    for (let i = 0; i < multiaddrs.length; i++) {
+      const entry = multiaddrs[i];
+      if (entry.length === 0) {
+        throw new Error(`setMultiaddrs: entry[${i}] is empty.`);
+      }
+      const byteLen = new TextEncoder().encode(entry).length;
+      if (byteLen > MockChainAdapter.MAX_MULTIADDR_LENGTH) {
+        throw new Error(
+          `setMultiaddrs: entry[${i}] is ${byteLen} bytes; on-chain max is ` +
+          `${MockChainAdapter.MAX_MULTIADDR_LENGTH}.`,
+        );
+      }
+    }
+    const identityId = await this.getIdentityId();
+    if (identityId === 0n) {
+      throw new Error('setMultiaddrs: signer has no profile (call ensureProfile first).');
+    }
+    this.multiaddrsByIdentity.set(identityId, [...multiaddrs]);
+    this.pushEvent('MultiaddrsUpdated', {
+      identityId: identityId.toString(),
+      multiaddrs: [...multiaddrs],
+    });
+    return this.txResult(true);
   }
 
   // --- V9 UAL-based methods ---

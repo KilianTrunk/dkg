@@ -379,20 +379,35 @@ describe('@unit KnowledgeAssetsV10', () => {
           publishOperationId: 't1.1-op',
         });
 
-        // Active-sink invariant: ONE `TokensAddedToEpochRange` event from
-        // `EpochStorage` carries the discounted cost across the KC's
-        // epoch range. The remainder field is computed by EpochStorage
-        // and depends on its shard accumulator; we accept any value via
-        // the `(_: unknown) => true` predicate.
-        await expect(KAV10.connect(creator).publish(p))
-          .to.emit(EpochStorageContract, 'TokensAddedToEpochRange')
-          .withArgs(
-            STAKER_SHARD_ID,
-            currentEpoch,
-            currentEpoch + BigInt(epochs) - 1n,
-            expectedDiscounted,
-            (_: unknown) => true,
-          );
+        // Active-sink invariant: the discounted cost is spread across
+        // `epochs + 1` chain epochs (current partial + epochs-1 full +
+        // final partial), mirroring `KnowledgeAssetsV10._distributeTokens`.
+        // Sum of all `TokensAddedToEpochRange` events emitted by
+        // `EpochStorage` against shard 1 inside `[currentEpoch,
+        // currentEpoch+epochs]` MUST equal `expectedDiscounted`. We
+        // assert via the event sum (not per-epoch pool deltas) for the
+        // same reason as the NFT unit suite: shared shard storage with
+        // pre-existing unfinalized diffs pollutes per-epoch math.
+        const tx = await KAV10.connect(creator).publish(p);
+        const receipt = await tx.wait();
+        const epsAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+        const iface = EpochStorageContract.interface;
+        let totalDistributed = 0n;
+        let eventCount = 0;
+        for (const log of receipt!.logs) {
+          if (log.address.toLowerCase() !== epsAddr) continue;
+          let parsed;
+          try { parsed = iface.parseLog({ topics: log.topics as string[], data: log.data }); }
+          catch { continue; }
+          if (parsed?.name !== 'TokensAddedToEpochRange') continue;
+          eventCount++;
+          expect(parsed.args.shardId).to.equal(STAKER_SHARD_ID);
+          expect(parsed.args.startEpoch).to.be.gte(currentEpoch);
+          expect(parsed.args.endEpoch).to.be.lte(currentEpoch + BigInt(epochs));
+          totalDistributed += BigInt(parsed.args.tokenAmount);
+        }
+        expect(eventCount).to.be.greaterThan(0);
+        expect(totalDistributed).to.equal(expectedDiscounted);
 
         // KC landed correctly.
         const meta = await KCS.getKnowledgeCollectionMetadata(1);
@@ -1331,25 +1346,36 @@ describe('@unit KnowledgeAssetsV10', () => {
           updateOperationId: 't1.7f-update',
         });
 
-        // Active-sink invariant for update(): one `TokensAddedToEpochRange`
-        // event emitted for the discounted delta, spanning the KC's
-        // REMAINING epoch range `[currentEpoch, currentEpoch +
-        // remainingEpochs - 1]`. KAV10 still must NOT call
-        // `_distributeTokens` on the conviction branch — the NFT is the
-        // funding agent.
+        // Active-sink invariant for update(): the discounted delta is
+        // prorated across `remainingEpochs + 1` chain epochs (current
+        // partial + remainingEpochs-1 full + final partial), summed
+        // across all `TokensAddedToEpochRange` events emitted by
+        // `EpochStorage`. KAV10 still must NOT call `_distributeTokens`
+        // on the conviction branch — the NFT is the funding agent.
         const currentEpoch = await ChronosContract.getCurrentEpoch();
         const meta = await KCS.getKnowledgeCollectionMetadata(base.kcId);
         const endEpoch = meta[5];
         const remainingEpochs = endEpoch - currentEpoch;
-        await expect(KAV10.connect(base.creator).update(up))
-          .to.emit(EpochStorageContract, 'TokensAddedToEpochRange')
-          .withArgs(
-            STAKER_SHARD_ID,
-            currentEpoch,
-            currentEpoch + remainingEpochs - 1n,
-            expectedDiscountedDelta,
-            (_: unknown) => true,
-          );
+        const tx = await KAV10.connect(base.creator).update(up);
+        const receipt = await tx.wait();
+        const epsAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+        const iface = EpochStorageContract.interface;
+        let totalDistributed = 0n;
+        let eventCount = 0;
+        for (const log of receipt!.logs) {
+          if (log.address.toLowerCase() !== epsAddr) continue;
+          let parsed;
+          try { parsed = iface.parseLog({ topics: log.topics as string[], data: log.data }); }
+          catch { continue; }
+          if (parsed?.name !== 'TokensAddedToEpochRange') continue;
+          eventCount++;
+          expect(parsed.args.shardId).to.equal(STAKER_SHARD_ID);
+          expect(parsed.args.startEpoch).to.be.gte(currentEpoch);
+          expect(parsed.args.endEpoch).to.be.lte(currentEpoch + remainingEpochs);
+          totalDistributed += BigInt(parsed.args.tokenAmount);
+        }
+        expect(eventCount).to.be.greaterThan(0);
+        expect(totalDistributed).to.equal(expectedDiscountedDelta);
 
         const metaAfter = await KCS.getKnowledgeCollectionMetadata(base.kcId);
         expect(metaAfter[6]).to.equal(newTokenAmount);

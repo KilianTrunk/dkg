@@ -331,7 +331,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
         kcStart1,
         LOCK_DURATION,
       );
-      expect(await NFT.epochSpent(1, windowN)).to.equal(baseAllowance);
+      expect(await NFT.windowSpent(1, windowN)).to.equal(baseAllowance);
 
       // Any further cover in window N must revert (no topUp yet).
       await expect(
@@ -360,12 +360,12 @@ describe('@unit DKGPublishingConvictionNFT', function () {
         kcStart2,
         LOCK_DURATION,
       );
-      expect(await NFT.epochSpent(1, windowN1)).to.equal(smallDiscounted);
+      expect(await NFT.windowSpent(1, windowN1)).to.equal(smallDiscounted);
       // Lazy-settlement cursor must have advanced past N now that N is closed.
       const infoAfterAdvance = await NFT.getAccountInfo(1);
       expect(infoAfterAdvance.lastSettledWindow).to.be.gte(windowN + 1n);
       // Previous billing window remains fully drained but untouched.
-      expect(await NFT.epochSpent(1, windowN)).to.equal(baseAllowance);
+      expect(await NFT.windowSpent(1, windowN)).to.equal(baseAllowance);
 
       // --- Phase 3: topUp while account still live ---
       // topUp also lazily settles, but window N is already settled so it's
@@ -390,12 +390,12 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       );
 
       // Current billing window base fully drained.
-      expect(await NFT.epochSpent(1, windowN1)).to.equal(baseAllowance);
+      expect(await NFT.windowSpent(1, windowN1)).to.equal(baseAllowance);
       // topUp buffer reduced by exactly the shortfall.
       const info = await NFT.getAccountInfo(1);
       expect(info.topUpBuffer).to.equal(topAmount - expectedTopUpDraw);
       // Window N still untouched — historical state is immutable.
-      expect(await NFT.epochSpent(1, windowN)).to.equal(baseAllowance);
+      expect(await NFT.windowSpent(1, windowN)).to.equal(baseAllowance);
     });
   });
 
@@ -666,34 +666,48 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       );
       expect(returned).to.equal(expectedDiscount);
 
-      // Pin the active-sink distribution amount via the `TokensAddedToEpochRange`
-      // event emitted by `EpochStorage`: `tokenAmount === expectedDiscount`
-      // for the KC's exact epoch range, distributed in a single call. We
-      // assert via event rather than pool deltas because the V8 staker
-      // shard's `cumulative[...]` storage is shared with pre-existing
-      // unfinalized diffs from the deploy fixture, polluting per-epoch
-      // delta math. The event is the contract's own accounting trail.
-      await expect(
-        NFT.connect(Kav10Signer).coverPublishingCost(
-          agent.address,
-          baseCost,
-          currentEpoch,
-          kcEpochs,
-        ),
-      )
-        .to.emit(EpochStorageContract, 'TokensAddedToEpochRange')
-        .withArgs(
-          STAKER_SHARD_ID,
-          currentEpoch,
-          currentEpoch + kcEpochs - 1n,
-          expectedDiscount,
-          (_: unknown) => true,
-        );
+      // Pin the active-sink distribution via the sum of
+      // `TokensAddedToEpochRange` events emitted by `EpochStorage`. The
+      // distribution now mirrors `KnowledgeAssetsV10._distributeTokens`:
+      // the discountedCost is prorated across `kcEpochs + 1` chain epochs
+      // (partial current + (kcEpochs - 1) full middle + partial final),
+      // so we get up to 3 separate events. The TOTAL summed across all
+      // emissions must equal `expectedDiscount`, and every event must
+      // sit within `[currentEpoch, currentEpoch + kcEpochs]` for shard
+      // STAKER_SHARD_ID. Event-based assertion (rather than per-epoch
+      // pool deltas) because V8 staker-shard `cumulative[...]` storage
+      // is shared with pre-existing unfinalized diffs from the deploy
+      // fixture, polluting per-epoch delta math.
+      const tx = await NFT.connect(Kav10Signer).coverPublishingCost(
+        agent.address,
+        baseCost,
+        currentEpoch,
+        kcEpochs,
+      );
+      const receipt = await tx.wait();
+      const epsAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+      const iface = EpochStorageContract.interface;
+      let totalDistributed = 0n;
+      let eventCount = 0;
+      for (const log of receipt!.logs) {
+        if (log.address.toLowerCase() !== epsAddr) continue;
+        let parsed;
+        try { parsed = iface.parseLog({ topics: log.topics as string[], data: log.data }); }
+        catch { continue; }
+        if (parsed?.name !== 'TokensAddedToEpochRange') continue;
+        eventCount++;
+        expect(parsed.args.shardId).to.equal(STAKER_SHARD_ID);
+        expect(parsed.args.startEpoch).to.be.gte(currentEpoch);
+        expect(parsed.args.endEpoch).to.be.lte(currentEpoch + kcEpochs);
+        totalDistributed += BigInt(parsed.args.tokenAmount);
+      }
+      expect(eventCount).to.be.greaterThan(0);
+      expect(totalDistributed).to.equal(expectedDiscount);
 
       const info = await NFT.getAccountInfo(1);
       const epochLength = await ChronosContract.epochLength();
       const currentWindow = await currentBillingWindow(info.createdAtTimestamp, epochLength);
-      expect(await NFT.epochSpent(1, currentWindow)).to.equal(expectedDiscount);
+      expect(await NFT.windowSpent(1, currentWindow)).to.equal(expectedDiscount);
       expect((await NFT.getAccountInfo(1)).topUpBuffer).to.equal(0n);
     });
 
@@ -719,7 +733,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       const info = await NFT.getAccountInfo(1);
       const epochLength = await ChronosContract.epochLength();
       const currentWindow = await currentBillingWindow(info.createdAtTimestamp, epochLength);
-      expect(await NFT.epochSpent(1, currentWindow)).to.equal(baseAllowance);
+      expect(await NFT.windowSpent(1, currentWindow)).to.equal(baseAllowance);
       expect(info.topUpBuffer).to.equal(top - (discounted - baseAllowance));
     });
 
@@ -809,8 +823,8 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       const windowA = await currentBillingWindow(infoA.createdAtTimestamp, epochLength);
       const windowB = await currentBillingWindow(infoB.createdAtTimestamp, epochLength);
 
-      expect(await NFT.epochSpent(1, windowA)).to.equal(0n);
-      expect(await NFT.epochSpent(2, windowB)).to.equal(0n);
+      expect(await NFT.windowSpent(1, windowA)).to.equal(0n);
+      expect(await NFT.windowSpent(2, windowB)).to.equal(0n);
 
       const kcStart = await ChronosContract.getCurrentEpoch();
       const baseCostA = hre.ethers.parseEther('1000');
@@ -821,8 +835,8 @@ describe('@unit DKGPublishingConvictionNFT', function () {
         kcStart,
         LOCK_DURATION,
       );
-      expect(await NFT.epochSpent(1, windowA)).to.equal(discountedA);
-      expect(await NFT.epochSpent(2, windowB)).to.equal(0n);
+      expect(await NFT.windowSpent(1, windowA)).to.equal(discountedA);
+      expect(await NFT.windowSpent(2, windowB)).to.equal(0n);
 
       const baseCostB = hre.ethers.parseEther('500');
       const discountedB = (baseCostB * (BPS - 2000n)) / BPS; // 400
@@ -832,8 +846,8 @@ describe('@unit DKGPublishingConvictionNFT', function () {
         kcStart,
         LOCK_DURATION,
       );
-      expect(await NFT.epochSpent(1, windowA)).to.equal(discountedA);
-      expect(await NFT.epochSpent(2, windowB)).to.equal(discountedB);
+      expect(await NFT.windowSpent(1, windowA)).to.equal(discountedA);
+      expect(await NFT.windowSpent(2, windowB)).to.equal(discountedB);
     });
 
     it('N28: a non-KAV10 Hub-registered contract cannot call (OnlyKnowledgeAssetsV10)', async () => {

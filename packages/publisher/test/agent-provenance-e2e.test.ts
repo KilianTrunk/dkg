@@ -302,7 +302,7 @@ describe('Diagram 3 — PCA-discounted vs full-fee cost coverage', () => {
     expect(before - after).toBeGreaterThan(0n);
   });
 
-  it('PCA branch: msg.sender registered as agent → epochSpent grows, msg.sender TRAC unchanged', async () => {
+  it('PCA branch: msg.sender registered as agent → windowSpent grows, msg.sender TRAC unchanged', async () => {
     // Admin wallet (separate from CORE_OP so we don't collide with other tests
     // that use CORE_OP) creates an NFT-based PCA and registers CORE_OP — the
     // publisher's submitter EOA — as a registered agent. When publisher.publish
@@ -318,7 +318,7 @@ describe('Diagram 3 — PCA-discounted vs full-fee cost coverage', () => {
         'function registerAgent(uint256 accountId, address agent) external',
         'function agentToAccountId(address) view returns (uint256)',
         'function accounts(uint256) view returns (uint96,uint40,uint40,uint40,uint40,uint16,uint16)',
-        'function epochSpent(uint256 accountId, uint40 epoch) view returns (uint96)',
+        'function windowSpent(uint256 accountId, uint40 billingWindow) view returns (uint96)',
       ],
       admin,
     );
@@ -358,8 +358,8 @@ describe('Diagram 3 — PCA-discounted vs full-fee cost coverage', () => {
     const beforeBillingWindow = (beforeTimestamp - BigInt(createdAtTimestamp)) / epochLength;
 
     const beforeSubmitter: bigint = await trac.balanceOf(submitter.address);
-    const beforeSpentWindow: bigint = await pca.epochSpent(accountId, beforeBillingWindow);
-    const beforeSpentNextWindow: bigint = await pca.epochSpent(
+    const beforeSpentWindow: bigint = await pca.windowSpent(accountId, beforeBillingWindow);
+    const beforeSpentNextWindow: bigint = await pca.windowSpent(
       accountId,
       beforeBillingWindow + 1n,
     );
@@ -373,8 +373,8 @@ describe('Diagram 3 — PCA-discounted vs full-fee cost coverage', () => {
     expect(result.status).toBe('confirmed');
 
     const afterSubmitter: bigint = await trac.balanceOf(submitter.address);
-    const afterSpentWindow: bigint = await pca.epochSpent(accountId, beforeBillingWindow);
-    const afterSpentNextWindow: bigint = await pca.epochSpent(
+    const afterSpentWindow: bigint = await pca.windowSpent(accountId, beforeBillingWindow);
+    const afterSpentNextWindow: bigint = await pca.windowSpent(
       accountId,
       beforeBillingWindow + 1n,
     );

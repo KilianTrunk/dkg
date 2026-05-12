@@ -268,7 +268,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
         .withArgs(acctId, expiresAt);
     });
 
-    it('does NOT mutate epochSpent/topUpBalance when coverPublishingCost reverts post-expiry', async () => {
+    it('does NOT mutate windowSpent/topUpBalance when coverPublishingCost reverts post-expiry', async () => {
       const { kav10, agent, acctId } = await setupWithKAV10Signer();
       const info = await NFT.getAccountInfo(acctId);
       const expiresAt = BigInt(info.expiresAtEpoch);
@@ -277,7 +277,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       await advanceToTimestamp(expiresAtTs);
 
       const bufferBefore = await NFT.topUpBalance(acctId);
-      const spentBefore = await NFT.epochSpent(acctId, 0n);
+      const spentBefore = await NFT.windowSpent(acctId, 0n);
 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
@@ -292,7 +292,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
         .withArgs(acctId, expiresAt);
 
       expect(await NFT.topUpBalance(acctId)).to.equal(bufferBefore);
-      expect(await NFT.epochSpent(acctId, 0n)).to.equal(spentBefore);
+      expect(await NFT.windowSpent(acctId, 0n)).to.equal(spentBefore);
     });
 
     it('SANITY: coverPublishingCost in-lifetime (epoch < expiresAt) succeeds', async () => {

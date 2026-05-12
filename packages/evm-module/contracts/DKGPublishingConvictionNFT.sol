@@ -29,9 +29,9 @@ import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/
  *       1. ACTIVE: each publish through `coverPublishingCost` distributes
  *          its `discountedCost` across the published KC's epoch range via
  *          `EpochStorage.addTokensToEpochRange`. The base portion drawn is
- *          tracked in `epochSpent[accountId][w]`, capped at `B`.
+ *          tracked in `windowSpent[accountId][w]`, capped at `B`.
  *       2. PASSIVE: at the end of window `w`, the unspent remainder
- *          `B - epochSpent[w]` is swept to the staker reward pool for the
+ *          `B - windowSpent[w]` is swept to the staker reward pool for the
  *          chain epochs that window overlaps. Settlement is lazy: triggered
  *          by the next `coverPublishingCost`, `topUp`, ERC-721 transfer, or
  *          an explicit public `settle(accountId)` call.
@@ -101,8 +101,15 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     /// base allowance. Billing windows are fixed-size `Chronos.epochLength()`
     /// intervals anchored at `createdAtTimestamp`, so accounts created mid-chain
     /// epoch still get a full lock duration in wall-clock time.
+    ///
+    /// IMPORTANT: the second key is the billing-window index (0-based, relative
+    /// to the account's `createdAtTimestamp`), NOT a chain-epoch number. Use
+    /// `getCurrentBillingWindow(accountId)` to translate "now" to a window
+    /// index for off-chain reads. The chain-epoch context for each draw is
+    /// surfaced in the `CostCovered`/`WindowSettled` events.
+    ///
     /// `coverPublishingCost` updates this before touching `topUpBalance`.
-    mapping(uint256 => mapping(uint40 => uint96)) public epochSpent;
+    mapping(uint256 => mapping(uint40 => uint96)) public windowSpent;
     /// @notice Persistent top-up buffer per account (NOT per-epoch). Drained
     /// only after the current-epoch base allowance is exhausted.
     mapping(uint256 => uint96) public topUpBalance;
@@ -334,13 +341,13 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
      *      account's `lockDurationEpochs`.
      *   2. Lazily settle any elapsed (closed) billing windows: for each
      *      window `w` between `lastSettledWindow` and the previous window,
-     *      sweep `B - epochSpent[w]` (where `B = committedTRAC /
+     *      sweep `B - windowSpent[w]` (where `B = committedTRAC /
      *      lockDurationEpochs`) into the staker pool for the chain epochs
      *      that window overlaps.
      *   3. Compute `discountedCost = baseCost * (1 - discountBps/1e4)`.
      *   4. Spend order against the current window's budget:
-     *      (a) base allowance `B - epochSpent[currentWindow]` first; only
-     *          this portion increments `epochSpent`,
+     *      (a) base allowance `B - windowSpent[currentWindow]` first; only
+     *          this portion increments `windowSpent`,
      *      (b) `topUpBalance` overflow if (a) is exhausted.
      *   5. Distribute the full `discountedCost` (= base draw + topUp draw)
      *      across the KC's epoch range `[kcStartEpoch, kcStartEpoch +
@@ -384,7 +391,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         );
 
         uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
-        uint96 spent = epochSpent[accountId][currentBillingWindow];
+        uint96 spent = windowSpent[accountId][currentBillingWindow];
         uint96 epochRemaining = spent < baseAllowance ? baseAllowance - spent : 0;
 
         uint96 drawnFromEpoch;
@@ -409,21 +416,82 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         }
 
         if (drawnFromEpoch > 0) {
-            epochSpent[accountId][currentBillingWindow] = spent + drawnFromEpoch;
+            windowSpent[accountId][currentBillingWindow] = spent + drawnFromEpoch;
         }
 
         // Active sink: fund the KC's epoch range with the discounted cost.
+        // MUST mirror `KnowledgeAssetsV10._distributeTokens` semantics so that
+        // the conviction-funded and direct-spend reward curves are identical
+        // (modulo the conviction discount). Concretely: prorate the current
+        // (partial) chain epoch by `timeUntilNextEpoch / epochLength` and
+        // push the leftover into a final (partial) epoch at
+        // `currentEpoch + kcEpochs` — funding `kcEpochs + 1` chain epochs in
+        // total. Equal-split across `kcEpochs` only would underfund the tail
+        // and overfund the current epoch on mid-epoch publishes (Codex
+        // round-1 finding on PR #470).
         uint96 distributed = drawnFromEpoch + drawnFromTopUp;
         if (distributed > 0) {
-            epochStorage.addTokensToEpochRange(
-                STAKER_SHARD_ID,
-                uint256(kcStartEpoch),
-                uint256(kcStartEpoch) + uint256(kcEpochs) - 1,
-                distributed
-            );
+            _distributeProrated(distributed, kcStartEpoch, uint256(kcEpochs));
         }
 
         emit CostCovered(accountId, currentEpoch, baseCost, discountedCost, drawnFromEpoch, drawnFromTopUp);
+    }
+
+    /// @dev Mirrors `KnowledgeAssetsV10._distributeTokens`. Splits `amount`
+    ///      across `storageUnits + 1` chain epochs starting at `firstEpoch`:
+    ///      - `firstEpoch` (partial) gets `base * timeUntilNextEpoch /
+    ///        epochLength` where `base = amount / storageUnits`,
+    ///      - middle `[firstEpoch+1 .. firstEpoch + storageUnits - 1]` each
+    ///        gets `base`,
+    ///      - `firstEpoch + storageUnits` (partial tail) gets the rest
+    ///        (`base - currentEpochAllocation`) plus any rounding dust.
+    ///      Assumes `storageUnits > 0` (caller validates `kcEpochs > 0`).
+    function _distributeProrated(
+        uint96 amount,
+        uint40 firstEpoch,
+        uint256 storageUnits
+    ) internal {
+        uint256 epochLengthSec = chronos.epochLength();
+        uint256 timeRemainingInCurrentEpoch = chronos.timeUntilNextEpoch();
+        uint96 baseTokensPerFullEpoch = uint96(uint256(amount) / storageUnits);
+        uint96 currentEpochAllocation = uint96(
+            (uint256(baseTokensPerFullEpoch) * timeRemainingInCurrentEpoch) / epochLengthSec
+        );
+        uint96 finalEpochAllocation = baseTokensPerFullEpoch - currentEpochAllocation;
+        uint256 numberOfFullEpochs = storageUnits - 1;
+        uint96 totalTokensForFullEpochs = uint96(uint256(baseTokensPerFullEpoch) * numberOfFullEpochs);
+
+        uint96 totalAllocated = currentEpochAllocation + totalTokensForFullEpochs + finalEpochAllocation;
+        if (totalAllocated < amount) {
+            finalEpochAllocation += (amount - totalAllocated);
+        }
+
+        if (currentEpochAllocation > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                firstEpoch,
+                firstEpoch,
+                currentEpochAllocation
+            );
+        }
+
+        if (numberOfFullEpochs > 0 && totalTokensForFullEpochs > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                firstEpoch + 1,
+                firstEpoch + uint40(numberOfFullEpochs),
+                totalTokensForFullEpochs
+            );
+        }
+
+        if (finalEpochAllocation > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                firstEpoch + uint40(storageUnits),
+                firstEpoch + uint40(storageUnits),
+                finalEpochAllocation
+            );
+        }
     }
 
     // ========================================================================
@@ -434,7 +502,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
      * @notice Publicly callable lazy settlement.
      *
      * - Pre-expiry: sweeps every elapsed billing window's unspent base
-     *   remainder (`B - epochSpent[w]`) into the staker pool for the chain
+     *   remainder (`B - windowSpent[w]`) into the staker pool for the chain
      *   epochs that window overlaps.
      * - Post-expiry: in addition to the above, finalises the last window,
      *   sweeps any leftover `topUpBalance`, and sweeps the
@@ -470,21 +538,66 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
 
         for (uint40 w = acct.lastSettledWindow; w < stopAt; w++) {
-            uint96 spent = epochSpent[accountId][w];
+            uint96 spent = windowSpent[accountId][w];
             uint96 remainder = spent < baseAllowance ? baseAllowance - spent : 0;
             (uint40 startEp, uint40 endEp) = _windowChainEpochRange(acct, w);
             if (remainder > 0) {
-                epochStorage.addTokensToEpochRange(
-                    STAKER_SHARD_ID,
-                    uint256(startEp),
-                    uint256(endEp),
-                    remainder
-                );
+                _sweepWindowProrated(acct, w, startEp, endEp, remainder);
             }
             emit WindowSettled(accountId, w, startEp, endEp, remainder);
         }
 
         acct.lastSettledWindow = uint16(stopAt);
+    }
+
+    /// @dev Distribute `amount` across the chain-epoch range `[startEp,
+    ///      endEp]` that billing window `w` of `acct` overlaps,
+    ///      proportional to the wall-clock seconds each chain epoch
+    ///      shares with the window. Equal-split via a single
+    ///      `addTokensToEpochRange(startEp, endEp, amount)` would
+    ///      distort rewards for windows that straddle two chain epochs
+    ///      by only a few seconds (Codex round-1 finding on PR #470).
+    function _sweepWindowProrated(
+        Account storage acct,
+        uint40 w,
+        uint40 startEp,
+        uint40 endEp,
+        uint96 amount
+    ) internal {
+        if (startEp == endEp) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                uint256(startEp),
+                uint256(endEp),
+                amount
+            );
+            return;
+        }
+        // A billing window is exactly `epochLength()` long (same as a chain
+        // epoch), so it can overlap AT MOST two chain epochs — the window
+        // either fits within one, or it straddles exactly one boundary.
+        uint256 epochLengthSec = chronos.epochLength();
+        uint256 winStartTs = uint256(acct.createdAtTimestamp) + uint256(w) * epochLengthSec;
+        uint256 boundaryTs = chronos.timestampForEpoch(uint256(endEp));
+        uint256 startOverlap = boundaryTs - winStartTs;
+        uint96 startAllocation = uint96((uint256(amount) * startOverlap) / epochLengthSec);
+        uint96 endAllocation = amount - startAllocation;
+        if (startAllocation > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                uint256(startEp),
+                uint256(startEp),
+                startAllocation
+            );
+        }
+        if (endAllocation > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                uint256(endEp),
+                uint256(endEp),
+                endAllocation
+            );
+        }
     }
 
     /// @notice Internal helper: post-expiry final sweep. Assumes
@@ -498,16 +611,11 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         // Settle any windows that `_settleElapsed` left for the final one
         // (e.g. the window containing `expiresAtTimestamp` itself).
         for (uint40 w = acct.lastSettledWindow; w < maxWindow; w++) {
-            uint96 spent = epochSpent[accountId][w];
+            uint96 spent = windowSpent[accountId][w];
             uint96 remainder = spent < baseAllowance ? baseAllowance - spent : 0;
             (uint40 startEp, uint40 endEp) = _windowChainEpochRange(acct, w);
             if (remainder > 0) {
-                epochStorage.addTokensToEpochRange(
-                    STAKER_SHARD_ID,
-                    uint256(startEp),
-                    uint256(endEp),
-                    remainder
-                );
+                _sweepWindowProrated(acct, w, startEp, endEp, remainder);
             }
             emit WindowSettled(accountId, w, startEp, endEp, remainder);
         }
@@ -547,6 +655,21 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         );
     }
 
+    /// @notice Public view: current billing-window index for `accountId`.
+    /// @dev Use this to translate "now" into the second key of
+    ///      `windowSpent[accountId][...]`. Reverts if the account does not
+    ///      exist (consistent with other view helpers). Returns
+    ///      `lockDurationEpochs` once the account has fully expired (the
+    ///      first index past the last billable window) so callers can
+    ///      detect "no more active windows" without overflowing.
+    function getCurrentBillingWindow(uint256 accountId) external view returns (uint40) {
+        _requireExists(accountId);
+        Account storage acct = accounts[accountId];
+        uint40 maxWindow = uint40(acct.lockDurationEpochs);
+        uint40 current = _currentBillingWindow(acct);
+        return current < maxWindow ? current : maxWindow;
+    }
+
     /// @notice Map billing-window index `w` to the inclusive chain-epoch
     ///         range it overlaps. A single billing window of length
     ///         `epochLength()` overlaps either 1 or 2 chain epochs
@@ -560,6 +683,19 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         uint256 winEndTs = winStartTs + epLen - 1;
         startEp = uint40(chronos.epochAtTimestamp(winStartTs));
         endEp = uint40(chronos.epochAtTimestamp(winEndTs));
+    }
+
+    /// @notice Public view: chain-epoch range that billing-window `w` of
+    ///         `accountId` overlaps. Useful for off-chain reporting (e.g.
+    ///         "this window will pay stakers across epochs X..Y").
+    function getWindowChainEpochRange(uint256 accountId, uint40 w)
+        external
+        view
+        returns (uint40 startEp, uint40 endEp)
+    {
+        _requireExists(accountId);
+        Account storage acct = accounts[accountId];
+        return _windowChainEpochRange(acct, w);
     }
 
     // ========================================================================
@@ -697,7 +833,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
             );
         }
         uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
-        uint96 spent = epochSpent[accountId][billingWindow];
+        uint96 spent = windowSpent[accountId][billingWindow];
         uint96 epochRemaining = spent < baseAllowance ? baseAllowance - spent : 0;
         return epochRemaining + topUpBalance[accountId];
     }

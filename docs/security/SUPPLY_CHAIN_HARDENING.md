@@ -93,14 +93,40 @@ PRs with release notes do not.
 
 ### 7. Static analysis of every workflow file on every PR
 
-`.github/workflows/supply-chain-scan.yml` runs **zizmor** (purpose-built
-GitHub-Actions audit; flags PWN-request misconfigs, unpinned actions,
-unsafe expansions in `run:` blocks, missing permissions blocks) and
-**actionlint** (workflow syntax + schema linter) on every PR that
-touches `.github/`.
+`.github/workflows/supply-chain-scan.yml` runs three audits whenever a
+PR touches `.github/`, `pnpm-lock.yaml`, any `package.json`, or `.npmrc`
+(and weekly via cron):
 
-Findings upload to GitHub Security → Code scanning so they survive past
-the PR's discussion timeline.
+- **zizmor** (`--persona auditor --min-severity low`) — flags
+  PWN-request misconfigs, unpinned actions, unsafe expansions in
+  `run:` blocks, missing permissions blocks, cache-poisoning vectors,
+  and credential-persistence patterns. Critically, the workflow passes
+  `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` so zizmor's four ONLINE
+  audits run too:
+  - `impostor-commit` — verifies the pinned SHA actually exists on the
+    action's repo history. **This is the exact audit that would catch
+    a TeamPCP-style tag-poisoning attack** (where the SHA points at a
+    commit from a fork's branch rather than the maintainer's tree).
+  - `ref-confusion` — branch/tag/SHA naming ambiguity.
+  - `known-vulnerable-actions` — maintained CVE list.
+  - `stale-action-refs` — pin is far behind upstream.
+- **actionlint** — workflow syntax + schema linter, with `shellcheck`
+  sub-linter enabled. Catches malformed workflows and `run:` shell
+  bugs before they ship to a runner.
+- **pnpm audit** (informational) — runs against production deps with
+  `--audit-level=high`. Output renders as a job-summary table so
+  reviewers see whether a PR introduces a new advisory vs. carrying
+  over the known baseline. **Currently `continue-on-error: true`**
+  because the lockfile already carries 15 high + 1 critical advisory;
+  flip to a hard gate once those are remediated (Tier 3 §H).
+
+zizmor findings upload to GitHub Security → Code scanning so they
+survive past the PR's discussion timeline.
+
+The audit gates are exempt from one rule: `artipacked`. See `.github/zizmor.yml`
+for the full justification — short version, the repo carries orphan
+submodule gitlinks that make `persist-credentials: false` fatal at
+checkout time. Fixed by the Tier-2 follow-up listed below.
 
 ---
 
@@ -228,13 +254,21 @@ JSON
 
 ### C. Configure the `npm-publish` GitHub Environment
 
-The publish job references `environment: npm-publish` but the environment
-itself must be created in repo settings. Settings → Environments → **New
-environment** → name it `npm-publish`, then:
+The publish job references `environment: npm-publish` AND contains an
+explicit fail-closed verification step that reads the environment via
+the GitHub API and exits the job if no required reviewers are
+configured. So the publish workflow is already structurally safe —
+this section just walks through the one-time admin setup that lets
+the verification step pass.
+
+Settings → Environments → **New environment** → name it `npm-publish`,
+then:
 
 1. **Required reviewers**: add at least one (ideally two) maintainer
-   accounts. Without this set the environment is decorative — GitHub
-   Actions does NOT fail-closed on a missing environment configuration.
+   accounts. The publish job's `Verify npm-publish environment has
+   required reviewers` step will refuse to run otherwise — that is
+   what fail-closes the otherwise fail-open auto-creation behaviour
+   GitHub Actions ships with.
 2. **Wait timer**: 5 minutes is the minimum useful value. Gives a
    reviewer a window to abort if something looks wrong.
 3. **Deployment branches**: restrict to `main` only. Default allows any
@@ -247,7 +281,12 @@ environment** → name it `npm-publish`, then:
 Verify via:
 
 ```bash
-gh api repos/OriginTrail/dkg/environments/npm-publish
+gh api repos/OriginTrail/dkg/environments/npm-publish \
+  | jq '.protection_rules[]
+        | select(.type == "required_reviewers")
+        | .reviewers
+        | length'
+# Must print ≥ 1 — exactly what the publish workflow asserts.
 ```
 
 ### D. Enable required signed commits on the personal level
@@ -321,31 +360,26 @@ release tag, and the GitHub web UI marks each release as "Immutable".
 This is the single control that protected `trivy-action@0.35.0` during
 the TeamPCP attack.
 
-### H. Hook `pnpm audit` into CI
+### H. Flip `pnpm audit` from informational to hard gate
 
-Add a job to `.github/workflows/supply-chain-scan.yml` (already in this
-PR) that runs `pnpm audit --audit-level=high` and fails the check on any
-finding. Currently we surface npm advisories via Dependabot alerts; this
-turns the same data into a hard merge gate.
+`supply-chain-scan.yml` already runs `pnpm audit --audit-level=high
+--prod` on every PR that touches the lockfile and weekly via cron.
+Today it carries `continue-on-error: true` because the lockfile has
+15 high + 1 critical baseline advisories (notably a `protobufjs <8.0.1`
+in `@dkg-core` and `fast-uri <3.1.2` transitively via `@dkg-epcis`).
 
-A starter snippet (review before adopting):
+To convert to a hard gate:
 
-```yaml
-  audit:
-    name: pnpm audit (high+ severity)
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    steps:
-      - uses: actions/checkout@<SHA-here>  # see existing SHA pins
-      - uses: pnpm/action-setup@<SHA-here>
-      - uses: actions/setup-node@<SHA-here>
-        with:
-          node-version-file: .nvmrc
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm audit --audit-level=high --prod
-```
-
-`--prod` excludes devDeps so a vuln in `vitest` doesn't block a release.
+1. Remediate the existing advisories. Either:
+   - Bump the offending direct dep to a patched version.
+   - Add a `pnpm.overrides` entry in repo-root `package.json` pinning
+     the transitive dep to the patched range (e.g. add
+     `"fast-uri@<3.1.2": "3.1.2"` next to the existing overrides).
+2. Verify clean: `pnpm audit --audit-level=high --prod` must exit 0.
+3. In `.github/workflows/supply-chain-scan.yml`, remove
+   `continue-on-error: true` from the `Run pnpm audit` step.
+4. Optionally tighten to `--audit-level=moderate` after a settling
+   period to land Dependabot's lower-severity PRs as well.
 
 ### I. Reduce direct npm-publish surface area
 

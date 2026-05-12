@@ -31,13 +31,26 @@ on:
       - '.github/workflows/**'
       - '.github/actions/**'
       - '.github/dependabot.yml'
-      - '.github/workflows/supply-chain-scan.yml'
+      - '.github/zizmor.yml'
+      # `pnpm-lock.yaml` and every `package.json` covers the npm-audit
+      # job — the only change that introduces or removes an npm
+      # advisory in our dep tree. Combined with the weekly cron below,
+      # this means the audit re-runs both on lockfile-touching PRs AND
+      # weekly (to catch newly-published advisories against an
+      # unchanged lockfile).
+      - 'pnpm-lock.yaml'
+      - '**/package.json'
+      - '.npmrc'
   push:
     branches: [main, v10-rc]
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'
       - '.github/dependabot.yml'
+      - '.github/zizmor.yml'
+      - 'pnpm-lock.yaml'
+      - '**/package.json'
+      - '.npmrc'
   schedule:
     # Mondays 06:30 Europe/Belgrade ≈ 04:30 UTC. Same window as Dependabot
     # so any week-over-week drift surfaces in a single review pass.
@@ -86,6 +99,20 @@ jobs:
         # `--config .github/zizmor.yml` loads the per-repo policy. The only
         # entries are documented exceptions with a tracking note + owner;
         # never add a blanket suppression without one.
+        #
+        # `GH_TOKEN` is REQUIRED for zizmor's online audits — without it
+        # the four highest-value checks silently no-op:
+        #   * impostor-commit       — detects a SHA pointing at a commit
+        #                             not in the action's repo history
+        #                             (the TeamPCP attack signature).
+        #   * ref-confusion         — branch/tag/SHA ambiguity.
+        #   * known-vulnerable-     — maintained CVE list.
+        #     actions
+        #   * stale-action-refs     — pin is far behind upstream.
+        # We use the default GITHUB_TOKEN (contents: read at this job's
+        # scope is enough for zizmor's read-only API calls).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           zizmor \
             --persona auditor \
@@ -107,9 +134,73 @@ jobs:
         # The previous run uploaded SARIF unconditionally so the Security tab
         # always reflects the latest state. This second invocation re-runs
         # with the SAME ruleset but allows the exit code to bubble up so the
-        # PR is blocked when findings exist.
+        # PR is blocked when findings exist. GH_TOKEN re-supplied for the
+        # same reason as the SARIF step above.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           zizmor --persona auditor --min-severity low --config .github/zizmor.yml --format plain .github/workflows/
+
+  npm-audit:
+    name: pnpm audit (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      # `pnpm install` runs only the lockfile resolution and metadata pass
+      # we need for `pnpm audit`. We're NOT building anything here — keep
+      # the audit job fast and independent of the heavy CI matrix.
+      - name: Install dependencies (lockfile only)
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Run pnpm audit (production deps)
+        # Informational only for now — the lockfile currently carries a
+        # known baseline of high + critical advisories (see
+        # docs/security/SUPPLY_CHAIN_HARDENING.md → Tier 3 §H). Flipping
+        # this to a hard gate is the second step of that follow-up,
+        # tracked separately. Output uploads as a job-summary table so
+        # reviewers can see at a glance whether a PR INTRODUCES a new
+        # advisory vs. carrying over the baseline.
+        continue-on-error: true
+        run: |
+          set +e
+          pnpm audit --audit-level=high --prod --json > pnpm-audit.json
+          STATUS=$?
+          set -e
+
+          if [ -s pnpm-audit.json ]; then
+            {
+              echo '## pnpm audit (high + critical, production deps)'
+              echo
+              echo '| Severity | Package | Vulnerable | Patched | Path | Advisory |'
+              echo '|----------|---------|------------|---------|------|----------|'
+              jq -r '
+                (.advisories // {}) | to_entries[] |
+                .value |
+                select(.severity == "high" or .severity == "critical") |
+                [
+                  .severity,
+                  .module_name,
+                  .vulnerable_versions,
+                  .patched_versions,
+                  ((.findings[0].paths[0] // "" ) | split(">") | .[0]),
+                  ("[link](" + .url + ")")
+                ] | "| " + join(" | ") + " |"
+              ' pnpm-audit.json
+            } >> "$GITHUB_STEP_SUMMARY" || true
+          else
+            echo 'No advisories ≥ high. ✓' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Surface the count in the job's exit message but do NOT fail
+          # the job (continue-on-error already set above).
+          echo "pnpm audit exit status: ${STATUS} — informational, see job summary"
 
   actionlint:
     name: actionlint (workflow syntax + schema)
@@ -117,12 +208,18 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Run actionlint
-        # Downloads actionlint via the upstream installer script, verifies
-        # the artifact's checksum file (the installer compares against an
-        # author-signed sha256 list), then runs it against every workflow.
-        # No `uses:` to a third-party action — keeps the audit job itself
-        # outside the TeamPCP threat model.
+      - name: Run actionlint (with shellcheck)
+        # Downloads actionlint via the upstream installer script — the
+        # script verifies the artifact's sha256 against an author-signed
+        # list before extracting. No `uses:` to a third-party action is
+        # used; the audit job itself stays outside the TeamPCP threat
+        # model.
+        #
+        # `shellcheck` is pre-installed on ubuntu-latest GitHub-hosted
+        # runners, so actionlint invokes it as a sub-linter automatically
+        # (no `-shellcheck=` flag). Pre-existing SC2086 quoting issues
+        # were fixed in this same PR so the gate is clean from the
+        # outset.
         run: |
           curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.6/scripts/download-actionlint.bash | bash
-          ./actionlint -color -shellcheck=
+          ./actionlint -color

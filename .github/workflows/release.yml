@@ -57,16 +57,17 @@ jobs:
 
       - name: Set version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
       - name: Detect pre-release
         id: prerelease
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
           if [[ "$VERSION" == *-* ]]; then
-            echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
+            echo "IS_PRERELEASE=true" >> "$GITHUB_OUTPUT"
           else
-            echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
+            echo "IS_PRERELEASE=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: pnpm setup
@@ -86,9 +87,11 @@ jobs:
           # blast-radius reduction.
 
       - name: Validate CLI package version matches tag
+        env:
+          TAG_VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
-          TAG_VERSION="${{ steps.version.outputs.VERSION }}"
           PKG_VERSION="$(node -p "require('./packages/cli/package.json').version")"
+          # shellcheck disable=SC2153 # TAG_VERSION comes from the step's `env:` block above
           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
             echo "::error::packages/cli/package.json version ${PKG_VERSION} does not match pushed tag version ${TAG_VERSION}"
             exit 1

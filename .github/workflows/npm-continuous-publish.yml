@@ -39,6 +39,34 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Verify npm-publish environment has required reviewers
+        # GitHub Actions does NOT fail-closed on an unconfigured environment.
+        # Referencing `environment: npm-publish` against a missing env block
+        # SILENTLY auto-creates the environment with no protection rules,
+        # which means NPM_TOKEN flows to this job unguarded. This step
+        # closes that hole by querying the environment via the API and
+        # refusing to proceed if no `required_reviewers` rule is configured.
+        # See docs/security/SUPPLY_CHAIN_HARDENING.md §C for the maintainer
+        # setup runbook this depends on.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! ENV_CONFIG=$(gh api "repos/${GH_REPO}/environments/npm-publish" 2>&1); then
+            echo "::error title=npm-publish environment missing::Configure the npm-publish Environment with required reviewers + a wait timer before this workflow can publish. See docs/security/SUPPLY_CHAIN_HARDENING.md §C."
+            exit 1
+          fi
+          REVIEWER_COUNT=$(echo "${ENV_CONFIG}" \
+            | jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers // []] | flatten | length' \
+            || echo 0)
+          if [ "${REVIEWER_COUNT:-0}" -lt 1 ]; then
+            echo "::error title=npm-publish environment unprotected::Environment exists but has zero required reviewers. NPM_TOKEN would publish without human review. Add at least one required reviewer in repo Settings → Environments → npm-publish."
+            exit 1
+          fi
+          echo "✓ npm-publish environment configured with ${REVIEWER_COUNT} required reviewer(s)"
+
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -72,11 +100,12 @@ jobs:
         run: |
           EPOCH=$(date +%s)
           SHORT_SHA=$(git rev-parse --short=7 HEAD)
-          echo "SUFFIX=dev.${EPOCH}.${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "SUFFIX=dev.${EPOCH}.${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Bump all public packages to dev pre-release
+        env:
+          SUFFIX: ${{ steps.version.outputs.SUFFIX }}
         run: |
-          SUFFIX="${{ steps.version.outputs.SUFFIX }}"
           node -e "
             const fs = require('fs');
             const path = require('path');

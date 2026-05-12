@@ -257,16 +257,37 @@ apiB POST /api/subscribe "{\"contextGraphId\":\"$CG_ID\"}" > /dev/null
 poll_catchup "$N_B_API" "$N_B_TOKEN" "$CG_ID" denied "$DENIED_TIMEOUT"
 
 # -------------------------------------------------------------------------
-hr "Step 4 — Node B signs + forwards a join request to Node A's peer-id"
-sign_resp=$(apiB POST "/api/context-graph/$(urlencode "$CG_ID")/sign-join" \
-  "{\"curatorPeerId\":\"$N_A_PEER\"}")
-sent=$(echo "$sign_resp" | jq_field status)
-delivered=$(echo "$sign_resp" | jq_field delivered)
-note "sign-join: status=$sent delivered=$delivered"
-if [ "$sent" = "sent" ] && [ -n "$delivered" ] && [ "$delivered" != "0" ]; then
-  ok "join request delivered to $delivered curator candidate(s)"
+hr "Step 4 — Node B signs a join-delegation, then forwards it to Node A"
+# PR #448 split sign vs forward into two endpoints: /sign-join is sign-only
+# (no body; returns the SignedAgentDelegation), /request-join takes the
+# delegation + curatorPeerId and dials the curator over P2P. Mirrors the
+# devnet-test-invite-flow.sh flow so this stays in lockstep with what the
+# UI/CLI do in production.
+sign_resp=$(apiB POST "/api/context-graph/$(urlencode "$CG_ID")/sign-join" "{}")
+note "sign-join response: $sign_resp"
+delegation=$(echo "$sign_resp" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('delegation') or {}))")
+if [ -z "$delegation" ] || [ "$delegation" = "{}" ]; then
+  fail "sign-join did not return a signed delegation: $sign_resp"
+fi
+ok "Node B produced a signed delegation"
+
+submit_body=$(DEL="$delegation" PEER="$N_A_PEER" python3 <<'PY'
+import json, os
+print(json.dumps({
+  "delegation": json.loads(os.environ["DEL"]),
+  "curatorPeerId": os.environ["PEER"],
+}))
+PY
+)
+submit_resp=$(apiB POST "/api/context-graph/$(urlencode "$CG_ID")/request-join" "$submit_body")
+note "request-join response: $submit_resp"
+status_field=$(echo "$submit_resp" | jq_field status)
+delivered=$(echo "$submit_resp" | jq_field delivered)
+if [ "$status_field" = "pending" ] && [ -n "$delivered" ] && [ "$delivered" != "0" ]; then
+  ok "join request delivered to Node A ($delivered curator candidate(s))"
 else
-  fail "sign-join did not deliver: $sign_resp"
+  fail "request-join did not deliver: $submit_resp"
 fi
 
 # -------------------------------------------------------------------------

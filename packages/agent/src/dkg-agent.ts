@@ -853,6 +853,34 @@ export class DKGAgent {
    */
   private readonly joinRequestOriginPeers = new Map<string, string>();
   /**
+   * Requester-side hint: which local agent did WE pick when signing the
+   * join-delegation for a given context graph?
+   *
+   * Used by `findLocalAgentForContextGraph` to bind sync envelopes to
+   * the actually-approved agent in the brief window between
+   * `join-approved` arriving and the curator's `_meta` graph being
+   * synced into our local store. Without this hint, a multi-agent node
+   * would fall back to `defaultAgentAddress` for the first
+   * post-approval catch-up, the responder's per-agent delegation lookup
+   * would miss the real claim, and sync would silently fail until the
+   * next `_meta` round-trip propagated the allowlist.
+   *
+   * Populated in two places:
+   *  1. `signJoinRequest` — the moment we sign for a CG, we know our
+   *     intent. Single-agent nodes are a no-op here (the default IS the
+   *     agent), but it's free to maintain.
+   *  2. The `join-approved` handler — definitive: the curator just
+   *     told us this exact agent was promoted. Survives sign-then-restart
+   *     because the curator's notification re-establishes the hint.
+   *
+   * Lower-cased agent address. In-memory only — restart loses it, but
+   * after restart the `_meta` allowlist will have been synced (it's the
+   * very first thing post-approval), so the hint is no longer needed.
+   * Keyed by raw `contextGraphId` (no normalisation needed — every
+   * caller already has the canonical id).
+   */
+  private readonly localApprovedAgentByCG = new Map<string, string>();
+  /**
    * Symmetric companion to `joinRequestOriginPeers`, populated on the
    * REQUESTER side. When `forwardJoinRequest` broadcasts to all peers,
    * any peer that responds `{ok: true}` is self-claiming curator status
@@ -1594,6 +1622,12 @@ export class DKGAgent {
               return new TextEncoder().encode(JSON.stringify({ ok: true, skipped: true }));
             }
             this.preferredSyncPeers.set(contextGraphId, peerId.toString());
+            // Curator just confirmed `approvedAddr` is the principal —
+            // record it BEFORE auto-subscribe / sync kick in, so the
+            // first post-approval `buildSyncRequest` claims the right
+            // agent (the curator's `_meta` graph hasn't been synced
+            // yet at this point on multi-agent nodes).
+            this.localApprovedAgentByCG.set(contextGraphId, approvedAddr.toLowerCase());
             this.log.info(createOperationContext('system'), `Join request approved for "${contextGraphId}" — auto-subscribing`);
             this.subscribeToContextGraph(contextGraphId);
             this.upsertContextGraphMember({
@@ -7564,7 +7598,7 @@ export class DKGAgent {
     const issuedAtMs = Date.now();
     const expiresAtMs = issuedAtMs + JOIN_DELEGATION_VALIDITY_MS;
 
-    return signAgentDelegation({
+    const signed = await signAgentDelegation({
       agentAddress: addr,
       scope: joinDelegationScope(this.chain.deploymentId, contextGraphId),
       issuedAtMs,
@@ -7573,6 +7607,12 @@ export class DKGAgent {
       delegateeOpKey,
       agentPrivateKey: agent.privateKey,
     });
+    // Remember our intent so multi-agent post-approval sync binds to
+    // the right agent before `_meta` catches up. Last-write-wins is
+    // intentional: a node that re-signs with a different agent has
+    // changed its intent for this CG.
+    this.localApprovedAgentByCG.set(contextGraphId, addr.toLowerCase());
+    return signed;
   }
 
   /**
@@ -9341,29 +9381,52 @@ export class DKGAgent {
    *     into our local `_meta` after first sync), keep using it. This
    *     preserves historical behavior for single-agent nodes.
    *  2. Otherwise pick the first local agent the curator allowlisted.
-   *  3. If no local agent is allowlisted (e.g. we just subscribed and
-   *     haven't synced `_meta` yet, or we're the curator handling our
-   *     own CG), fall back to `defaultAgentAddress`.
+   *  3. If neither (no `_meta` yet, e.g. the very first catch-up after
+   *     `join-approved` arrives), fall back to the locally-known
+   *     join-request / join-approved hint in `localApprovedAgentByCG`.
+   *     This is the codex round-4 fix — without it, the first
+   *     post-approval sync on multi-agent nodes would bind to
+   *     `defaultAgentAddress` and the responder would deny.
+   *  4. If even the hint is unset (we're the curator handling our own
+   *     CG, or restarted after approval), fall back to
+   *     `defaultAgentAddress`.
    *
-   * PR #448 review (round 4) — Codex flagged this as a real
-   * "multi-agent silent sync failure" bug.
+   * PR #448 review (rounds 4 and 5) — Codex flagged the multi-agent
+   * silent-sync-failure bug, then the still-broken first-catch-up
+   * case after the round-4 fix landed.
    */
   private async findLocalAgentForContextGraph(contextGraphId: string): Promise<string | undefined> {
     if (this.localAgents.size === 0) return this.defaultAgentAddress;
+
+    // Hint first: if we have a definitive locally-known choice (just
+    // signed, or just received a join-approved for this CG), prefer it
+    // — but only if it still maps to a local agent we can sign with.
+    const hintAddr = this.localApprovedAgentByCG.get(contextGraphId);
+    const hintLocal = hintAddr
+      ? [...this.localAgents.keys()].find((a) => a.toLowerCase() === hintAddr)
+      : undefined;
+
     let allowedAgents: string[] = [];
     try {
       allowedAgents = await this.getContextGraphAllowedAgents(contextGraphId);
     } catch {
-      return this.defaultAgentAddress;
+      return hintLocal ?? this.defaultAgentAddress;
     }
-    if (allowedAgents.length === 0) return this.defaultAgentAddress;
+    if (allowedAgents.length === 0) {
+      // No `_meta` yet — the hint is the most authoritative answer we
+      // have for the post-approval bootstrap window.
+      return hintLocal ?? this.defaultAgentAddress;
+    }
     const allowedLower = new Set(allowedAgents.map((a) => a.toLowerCase()));
+    // Hint wins if it's also on the allowlist — covers the "approved
+    // agent ≠ process default, _meta has caught up" case.
+    if (hintLocal && allowedLower.has(hintLocal.toLowerCase())) return hintLocal;
     const defaultLower = this.defaultAgentAddress?.toLowerCase();
     if (defaultLower && allowedLower.has(defaultLower)) return this.defaultAgentAddress;
     for (const localAddr of this.localAgents.keys()) {
       if (allowedLower.has(localAddr.toLowerCase())) return localAddr;
     }
-    return this.defaultAgentAddress;
+    return hintLocal ?? this.defaultAgentAddress;
   }
 
   private async buildSyncRequest(

@@ -965,12 +965,17 @@ export class ApiClient {
    * to the curator, follow up with `requestJoin(...)` and the
    * `curatorPeerId` from the V10 invite. PR #448 split sign vs forward
    * to fix a duplicate-forward bug — see daemon route comment.
+   *
+   * The `delegation` shape mirrors `SignedAgentDelegation` from
+   * `@dkg/agent`: `version` is part of the digest grammar (see
+   * `computeDelegationDigest`), not the on-the-wire payload, so it is
+   * intentionally absent here. Verifiers re-derive the digest from the
+   * fields below.
    */
   async signJoinRequest(contextGraphId: string): Promise<{
     ok: boolean;
     contextGraphId: string;
     delegation: {
-      version: string;
       agentAddress: string;
       scope: string;
       issuedAtMs: number;

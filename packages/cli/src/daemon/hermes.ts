@@ -438,6 +438,9 @@ export function normalizeHermesChatPayload(raw: unknown): HermesChatPayload | { 
     ]
     : undefined);
 
+  if (raw.text !== undefined && typeof raw.text !== 'string') {
+    return { error: 'Invalid "text"' };
+  }
   const text = typeof raw.text === 'string' ? raw.text : '';
   if (
     text.length === 0 &&

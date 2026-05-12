@@ -432,8 +432,16 @@ async function runImportFileOrchestration(params: {
   // observe the lock must pass a shared map across their parallel calls.
   assertionImportLocks?: Map<string, Promise<void>>;
   requestAgentAddress?: string;
+  onMemoryGraphChanged?: (event: {
+    contextGraphId: string;
+    layers: string[];
+    subGraphName?: string;
+    operation: string;
+    source: string;
+    counts: { triples: number };
+  }) => void | Promise<void>;
 }): Promise<ImportFileResult> {
-  const { agent, fileStore, extractionRegistry, extractionStatus, multipartBody, boundary, assertionName, onInProgress } = params;
+  const { agent, fileStore, extractionRegistry, extractionStatus, multipartBody, boundary, assertionName, onInProgress, onMemoryGraphChanged } = params;
   const assertionImportLocks = params.assertionImportLocks ?? new Map<string, Promise<void>>();
   const requestAgentAddress = params.requestAgentAddress ?? agent.peerId;
 
@@ -695,6 +703,9 @@ async function runImportFileOrchestration(params: {
         if (dataSnapshot.length > 0) {
           await agent.store.dropGraph(assertionUri);
           await agent.store.insert(dataSnapshot);
+        } else if (hadDataGraphBeforeCreate) {
+          await agent.store.dropGraph(assertionUri);
+          await agent.store.createGraph(assertionUri);
         } else if (!hadDataGraphBeforeCreate) {
           await agent.store.dropGraph(assertionUri);
         }
@@ -816,6 +827,16 @@ async function runImportFileOrchestration(params: {
       completedAt: new Date().toISOString(),
     };
     extractionStatus.set(assertionUri, skippedRecord);
+    if (onMemoryGraphChanged) {
+      await onMemoryGraphChanged({
+        contextGraphId,
+        layers: ['wm'],
+        subGraphName,
+        operation: 'assertion_imported',
+        source: 'api',
+        counts: { triples: 0 },
+      });
+    }
     return buildImportFileResponse({
       assertionUri,
       fileHash: fileStoreEntry.keccak256,
@@ -1976,10 +1997,19 @@ describe('import-file orchestration — graceful degrade', () => {
       { kind: 'text', name: 'contextGraphId', value: 'cg' },
       { kind: 'file', name: 'file', filename: 'photo.png', contentType: 'image/png', content: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) },
     ]);
+    const events: Array<{
+      contextGraphId: string;
+      layers: string[];
+      subGraphName?: string;
+      operation: string;
+      source: string;
+      counts: { triples: number };
+    }> = [];
 
     const result = await runImportFileOrchestration({
       agent, fileStore, extractionRegistry: registry, extractionStatus: status,
       multipartBody: body, boundary: BOUNDARY, assertionName: 'photo',
+      onMemoryGraphChanged: event => { events.push(event); },
     });
 
     expect(result.extraction.status).toBe('skipped');
@@ -2032,6 +2062,14 @@ describe('import-file orchestration — graceful degrade', () => {
     expect(record.status).toBe('skipped');
     expect(record.pipelineUsed).toBeNull();
     expect(record.tripleCount).toBe(0);
+    expect(events).toEqual([{
+      contextGraphId: 'cg',
+      layers: ['wm'],
+      subGraphName: undefined,
+      operation: 'assertion_imported',
+      source: 'api',
+      counts: { triples: 0 },
+    }]);
   });
 
   it('unregistered content type fails before durable metadata writes when assertion.create rejects', async () => {
@@ -2244,6 +2282,78 @@ describe('import-file orchestration — graceful degrade', () => {
       q.graph === metaGraph && q.subject === assertionGraph
     )).toEqual(metaBefore);
     expect(failingAgent.insertCallCount).toBe(3);
+    expect(status.get(assertionGraph)).toEqual(statusBefore);
+  });
+
+  it('skipped re-import rollback restores an existing empty assertion graph', async () => {
+    const assertionName = 'skip-empty-graph-rollback';
+    const assertionGraph = contextGraphAssertionUri('cg', agent.peerId, assertionName);
+    const metaGraph = contextGraphMetaUri('cg');
+    const metaBefore = [
+      {
+        subject: assertionGraph,
+        predicate: 'http://dkg.io/ontology/sourceFileHash',
+        object: JSON.stringify('keccak256:previous-empty'),
+        graph: metaGraph,
+      },
+      {
+        subject: assertionGraph,
+        predicate: 'http://dkg.io/ontology/sourceContentType',
+        object: JSON.stringify('text/markdown'),
+        graph: metaGraph,
+      },
+      {
+        subject: assertionGraph,
+        predicate: 'http://dkg.io/ontology/structuralTripleCount',
+        object: '"0"^^<http://www.w3.org/2001/XMLSchema#integer>',
+        graph: metaGraph,
+      },
+    ];
+    await agent.store.createGraph(assertionGraph);
+    await agent.store.insert(metaBefore);
+    const statusBefore: ExtractionStatusRecord = {
+      status: 'completed',
+      fileHash: 'keccak256:previous-empty',
+      detectedContentType: 'text/markdown',
+      pipelineUsed: 'text/markdown',
+      tripleCount: 0,
+      startedAt: new Date(Date.now() - 1000).toISOString(),
+      completedAt: new Date().toISOString(),
+    };
+    status.set(assertionGraph, statusBefore);
+    await expect(agent.store.hasGraph(assertionGraph)).resolves.toBe(true);
+
+    const failingAgent = makeMockAgent('0xMockAgentPeerId', {
+      insertErrorPredicate: (quads) =>
+        quads.some(q =>
+          q.graph === metaGraph &&
+          q.subject === assertionGraph &&
+          q.predicate === 'http://dkg.io/ontology/extractionStatus' &&
+          q.object === JSON.stringify('skipped')
+        )
+          ? new Error('simulated skipped metadata insert outage')
+          : null,
+    });
+    await failingAgent.store.createGraph(assertionGraph);
+    for (const q of agent.insertedQuads) {
+      failingAgent.insertedQuads.push({ ...q });
+    }
+
+    const body = buildMultipart([
+      { kind: 'text', name: 'contextGraphId', value: 'cg' },
+      { kind: 'file', name: 'file', filename: 'unsupported.png', contentType: 'image/png', content: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+    ]);
+
+    await expect(runImportFileOrchestration({
+      agent: failingAgent, fileStore, extractionRegistry: registry, extractionStatus: status,
+      multipartBody: body, boundary: BOUNDARY, assertionName,
+    })).rejects.toThrow('simulated skipped metadata insert outage');
+
+    await expect(failingAgent.store.hasGraph(assertionGraph)).resolves.toBe(true);
+    expect(failingAgent.insertedQuads.filter(q => q.graph === assertionGraph)).toEqual([]);
+    expect(failingAgent.insertedQuads.filter(q =>
+      q.graph === metaGraph && q.subject === assertionGraph
+    )).toEqual(metaBefore);
     expect(status.get(assertionGraph)).toEqual(statusBefore);
   });
 

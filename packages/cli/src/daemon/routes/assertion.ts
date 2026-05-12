@@ -1483,6 +1483,9 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
             if (dataSnapshot.length > 0) {
               await agent.store.dropGraph(assertionUri);
               await agent.store.insert(dataSnapshot);
+            } else if (hadDataGraphBeforeCreate) {
+              await agent.store.dropGraph(assertionUri);
+              await agent.store.createGraph(assertionUri);
             } else if (!hadDataGraphBeforeCreate) {
               await agent.store.dropGraph(assertionUri);
             }
@@ -1718,6 +1721,14 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           assertionUri,
           skippedRecord,
         );
+        emitMemoryGraphChanged?.({
+          contextGraphId: contextGraphId!,
+          layers: ["wm"],
+          subGraphName,
+          operation: "assertion_imported",
+          source: "api",
+          counts: { triples: 0 },
+        });
         return respondWithImportFileResponse(200, {
           status: "skipped",
           tripleCount: 0,

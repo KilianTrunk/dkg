@@ -526,6 +526,9 @@ export async function handleOpenclawRoutes(ctx: RequestContext): Promise<void> {
       typeof payload.contextGraphId === "string" && payload.contextGraphId.trim()
         ? payload.contextGraphId.trim()
         : undefined;
+    if (payload.text !== undefined && typeof payload.text !== "string") {
+      return { ok: false, error: 'Invalid "text"' };
+    }
     const text = typeof payload.text === "string" ? payload.text : "";
     if (payload.persistUserMessage != null && typeof payload.persistUserMessage !== "string") {
       return { ok: false, error: 'Invalid "persistUserMessage"' };

@@ -1440,6 +1440,26 @@ describe('Hermes daemon routes', () => {
     });
   });
 
+  it('rejects non-string text instead of dropping it on context-only sends', async () => {
+    const { ctx, res } = makeHermesRouteContext({
+      text: 123,
+      correlationId: 'corr-invalid-text',
+      contextEntries: [{
+        key: 'target_context_graph',
+        label: 'Target context graph',
+        value: 'Project One (project-1)',
+      }],
+    }, {
+      hasChatTurn: vi.fn(async () => false),
+      storeChatExchange: vi.fn(async () => {}),
+    }, {}, '/api/hermes-channel/send');
+
+    await handleHermesRoutes(ctx);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toMatchObject({ error: 'Invalid "text"' });
+  });
+
   it('forwards skipped import context verified from durable metadata to Hermes', async () => {
     const attachmentImportResult = {
       assertionUri: 'did:dkg:context-graph:project-1/assertion/skipped-restart',

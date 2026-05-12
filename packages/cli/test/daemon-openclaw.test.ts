@@ -767,6 +767,23 @@ describe('OpenClaw channel routing helpers', () => {
     }
   });
 
+  it('rejects non-string text instead of dropping it on context-only sends', async () => {
+    const { ctx, res } = makeOpenClawRouteContext({
+      text: 123,
+      correlationId: 'corr-invalid-text',
+      contextEntries: [{
+        key: 'target_context_graph',
+        label: 'Target context graph',
+        value: 'Project One (project-1)',
+      }],
+    });
+
+    await handleOpenclawRoutes(ctx);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toMatchObject({ error: 'Invalid "text"' });
+  });
+
   it('forwards skipped import context verified from durable metadata after extraction status cache loss', async () => {
     const attachmentImportResult = {
       assertionUri: 'did:dkg:context-graph:cg1/assertion/skipped-restart',

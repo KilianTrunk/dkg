@@ -24,15 +24,20 @@ Run on **both** laptops:
 ```bash
 git clone https://github.com/OriginTrail/dkg.git
 cd dkg
-git checkout followup/436-ui-fixes      # the agent-delegation + SWM-encryption-fix branch
+# Use the merged release tag for the V10 RC that contains the
+# agent-delegation + SWM-encryption-fix work. As of this writing that
+# is the latest `v10.0.0-rc*` tag on `main`. If you need to test an
+# unmerged branch, substitute its name here AND match the autoUpdate
+# branch below — but expect the doc to drift if the branch is later
+# rebased or deleted.
+git checkout main                        # or: git checkout v10.0.0-rc.6
 pnpm install
 pnpm build
 pnpm dkg init                            # name + EVM key (already-funded wallet); accept defaults
 ```
 
 **Critical: disable auto-update before starting.** The default testnet
-config tracks `main`, which would drag both nodes off
-`followup/436-ui-fixes` mid-test:
+config tracks `main`, which can move under you mid-test:
 
 ```bash
 # edit ~/.dkg/config.json — set autoUpdate.enabled to false

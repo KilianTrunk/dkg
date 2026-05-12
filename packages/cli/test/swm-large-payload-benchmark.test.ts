@@ -4,6 +4,11 @@ import { describe, expect, it } from 'vitest';
 
 const require = createRequire(import.meta.url);
 const benchmark = require('../scripts/swm-large-payload-benchmark.cjs') as {
+  buildRunMetaPredicateCountQuery: (
+    plan: { metadataGraph: string; rootPrefix: string },
+    predicate: string,
+    rootPredicates?: string[],
+  ) => string;
   buildWriteTasks: (
     config: { ports: number[] },
     plan: { chunksPerNode: number },
@@ -147,5 +152,25 @@ describe('swm large payload benchmark', () => {
       { nodeIndex: 1, chunkNumber: 2 },
       { nodeIndex: 2, chunkNumber: 2 },
     ]);
+  });
+
+  it('counts per-run publicStagedQuads on operation and public slice metadata subjects', () => {
+    const query = benchmark.buildRunMetaPredicateCountQuery(
+      {
+        metadataGraph: 'did:dkg:context-graph:devnet-test/_shared_memory_meta',
+        rootPrefix: 'urn:dkg:benchmark:swm-large-payload:run-1:',
+      },
+      'http://dkg.io/ontology/publicStagedQuads',
+      [
+        'http://dkg.io/ontology/rootEntity',
+        'http://dkg.io/ontology/publicSliceRootEntity',
+      ],
+    );
+
+    expect(query).toContain('SELECT DISTINCT ?op ?value');
+    expect(query).toContain('<http://dkg.io/ontology/rootEntity> ?root');
+    expect(query).toContain('<http://dkg.io/ontology/publicSliceRootEntity> ?root');
+    expect(query).toContain('<http://dkg.io/ontology/publicStagedQuads> ?value');
+    expect(query).toContain('STRSTARTS(STR(?root), "urn:dkg:benchmark:swm-large-payload:run-1:")');
   });
 });

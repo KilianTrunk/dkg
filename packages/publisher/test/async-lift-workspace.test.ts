@@ -237,7 +237,7 @@ describe('async lift workspace resolution', () => {
     ]);
   });
 
-  it('rejects stale public resolution when a requested share operation has been superseded', async () => {
+  it('resolves superseded share operations from immutable public snapshots', async () => {
     const privateStore = new PrivateContentStore(store, graphManager);
     const secretPredicate = 'http://schema.org/secret';
     const write1 = await publisher.share(CONTEXT_GRAPH, [
@@ -251,13 +251,57 @@ describe('async lift workspace resolution', () => {
       { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Two"', graph: '' },
     ], { publisherPeerId: 'peer1' });
 
+    const resolved = await resolveLiftWorkspaceSlice({
+      store,
+      graphManager,
+      request: {
+        swmId: 'swm-main',
+        shareOperationId: write1.shareOperationId,
+        roots: [ENTITY],
+        contextGraphId: CONTEXT_GRAPH,
+        namespace: 'aloha',
+        scope: 'person-profile',
+        transitionType: 'CREATE',
+        authority: { type: 'owner', proofRef: 'proof:owner:1' },
+      },
+    });
+
+    expect(resolved.quads).toEqual([
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"One"', graph: '' },
+    ]);
+    expect(resolved.privateQuads).toEqual([
+      { subject: ENTITY, predicate: secretPredicate, object: '"first"', graph: '' },
+    ]);
+
+    const liveQuads = await resolveWorkspaceSelection({
+      store,
+      graphManager,
+      contextGraphId: CONTEXT_GRAPH,
+      selection: { rootEntities: [ENTITY] },
+    });
+    expect(liveQuads).toEqual([
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Two"', graph: '' },
+    ]);
+  });
+
+  it('does not fall back to live SWM data when compact snapshot metadata is missing', async () => {
+    const write = await publisher.share(CONTEXT_GRAPH, [
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"One"', graph: '' },
+    ], { publisherPeerId: 'peer1' });
+    const metaGraph = graphManager.sharedMemoryMetaUri(CONTEXT_GRAPH);
+
+    await store.deleteByPattern({
+      graph: metaGraph,
+      predicate: `${DKG}publicSnapshotGraph`,
+    });
+
     await expect(
       resolveLiftWorkspaceSlice({
         store,
         graphManager,
         request: {
           swmId: 'swm-main',
-          shareOperationId: write1.shareOperationId,
+          shareOperationId: write.shareOperationId,
           roots: [ENTITY],
           contextGraphId: CONTEXT_GRAPH,
           namespace: 'aloha',
@@ -266,7 +310,7 @@ describe('async lift workspace resolution', () => {
           authority: { type: 'owner', proofRef: 'proof:owner:1' },
         },
       }),
-    ).rejects.toThrow(`Shared-memory operation ${write1.shareOperationId} no longer matches current public SWM data`);
+    ).rejects.toThrow(`No immutable public snapshot metadata found for context graph ${CONTEXT_GRAPH}`);
   });
 
   it('keeps legacy publicStagedQuads metadata readable', async () => {
@@ -394,11 +438,12 @@ describe('async lift workspace resolution', () => {
 
       const metaGraph = wrappedGraphManager.sharedMemoryMetaUri(CONTEXT_GRAPH);
       const metadata = await wrappedStore.query(
-        `SELECT ?digest ?count ?payload WHERE {
+        `SELECT ?digest ?count ?payload ?snapshotGraph WHERE {
           GRAPH <${metaGraph}> {
             OPTIONAL { ?s <${DKG}publicQuadsDigest> ?digest }
             OPTIONAL { ?s <${DKG}publicQuadsCount> ?count }
             OPTIONAL { ?s <${DKG}publicStagedQuads> ?payload }
+            OPTIONAL { ?s <${DKG}publicSnapshotGraph> ?snapshotGraph }
           }
         }`,
       );
@@ -408,6 +453,19 @@ describe('async lift workspace resolution', () => {
         expect(metadata.bindings.some((row) => row['count'] === '"1"^^<http://www.w3.org/2001/XMLSchema#integer>')).toBe(true);
         expect(metadata.bindings.some((row) => row['payload'])).toBe(false);
         expect(JSON.stringify(metadata.bindings)).not.toContain('externalized-');
+      }
+
+      const snapshotGraph = metadata.type === 'bindings'
+        ? metadata.bindings.find((row) => row['snapshotGraph'])?.['snapshotGraph']
+        : undefined;
+      if (!snapshotGraph) throw new Error('Expected compact metadata to include publicSnapshotGraph');
+      const rawSnapshot = await inner.query(
+        `SELECT ?o WHERE { GRAPH <${snapshotGraph}> { <${ENTITY}> <http://schema.org/name> ?o } } LIMIT 1`,
+      );
+      expect(rawSnapshot.type).toBe('bindings');
+      if (rawSnapshot.type === 'bindings') {
+        expect(rawSnapshot.bindings[0]?.['o']).toContain('sha256:');
+        expect(rawSnapshot.bindings[0]?.['o']).not.toContain('externalized-');
       }
     } finally {
       await wrappedStore.close().catch(() => {});

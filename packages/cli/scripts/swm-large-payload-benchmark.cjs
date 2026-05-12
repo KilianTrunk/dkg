@@ -578,16 +578,40 @@ async function countGlobalMetaPredicate(port, config, plan, predicate) {
 async function countRunMetaPredicate(port, config, plan, predicate) {
   const result = await query(
     port,
-    `SELECT (COUNT(?value) AS ?count) WHERE {
-       GRAPH <${plan.metadataGraph}> {
-         ?op <${DKG_ONTOLOGY}rootEntity> ?root ;
-             <${predicate}> ?value .
-         FILTER(STRSTARTS(STR(?root), ${sparqlString(plan.rootPrefix)}))
-       }
-     }`,
+    buildRunMetaPredicateCountQuery(plan, predicate),
     config,
   );
   return numericBinding(result, 'count');
+}
+
+async function countRunPublicStagedQuads(port, config, plan) {
+  const result = await query(
+    port,
+    buildRunMetaPredicateCountQuery(
+      plan,
+      `${DKG_ONTOLOGY}publicStagedQuads`,
+      [`${DKG_ONTOLOGY}rootEntity`, `${DKG_ONTOLOGY}publicSliceRootEntity`],
+    ),
+    config,
+  );
+  return numericBinding(result, 'count');
+}
+
+function buildRunMetaPredicateCountQuery(plan, predicate, rootPredicates = [`${DKG_ONTOLOGY}rootEntity`]) {
+  const rootClauses = rootPredicates
+    .map((rootPredicate) => `{ ?op <${rootPredicate}> ?root . }`)
+    .join('\n           UNION\n           ');
+  return `SELECT (COUNT(?value) AS ?count) WHERE {
+       {
+         SELECT DISTINCT ?op ?value WHERE {
+           GRAPH <${plan.metadataGraph}> {
+             ?op <${predicate}> ?value .
+             ${rootClauses}
+             FILTER(STRSTARTS(STR(?root), ${sparqlString(plan.rootPrefix)}))
+           }
+         }
+       }
+     }`;
 }
 
 async function countRunRootEntities(port, config, plan) {
@@ -654,7 +678,7 @@ async function collectMetadata(config, plan, baseline) {
     const payloadCount = await countPayloads(port, config, plan);
     const rootEntities = await countRunRootEntities(port, config, plan);
     const shareOperationIds = await countRunMetaPredicate(port, config, plan, `${DKG_ONTOLOGY}shareOperationId`);
-    const publicStagedQuadsForRun = await countRunMetaPredicate(port, config, plan, `${DKG_ONTOLOGY}publicStagedQuads`);
+    const publicStagedQuadsForRun = await countRunPublicStagedQuads(port, config, plan);
     const publisherPeerIds = await countRunMetaPredicate(port, config, plan, `${DKG_ONTOLOGY}publisherPeerId`);
     const publishedAt = await countRunMetaPredicate(port, config, plan, `${DKG_ONTOLOGY}publishedAt`);
     const timestamps = await countRunMetaPredicate(port, config, plan, `${DKG_ONTOLOGY}timestamp`);
@@ -826,6 +850,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  buildRunMetaPredicateCountQuery,
   buildWriteTasks,
   buildBenchmarkPlan,
   makePayload,

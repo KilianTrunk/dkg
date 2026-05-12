@@ -42,6 +42,16 @@ jobs:
     name: Detect changes
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    permissions:
+      contents: read
+      # `dorny/paths-filter` on a `pull_request` event reads the PR file
+      # list via the Pull Requests REST API (`GET /repos/{owner}/{repo}/
+      # pulls/{number}/files`). Without `pull-requests: read` here, the
+      # action fails with `Resource not accessible by integration` and
+      # the whole CI run dies before the test matrix starts. Scoped to
+      # this job only — every other job in this workflow does not call
+      # the API and stays read-only on `contents`.
+      pull-requests: read
     outputs:
       contracts: ${{ steps.filter.outputs.contracts }}
     steps:

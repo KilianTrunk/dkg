@@ -185,7 +185,21 @@ jobs:
         continue-on-error: true
 
       - name: Upload SARIF to GitHub Security
-        if: always()
+        # Skip SARIF upload on forked PRs. GitHub Actions downgrades
+        # `security-events: write` to read-only on `pull_request` runs
+        # from forks, so the upload step would 403 with `Resource not
+        # accessible by integration` and turn an otherwise-clean run
+        # red. The plain-format `Re-run zizmor as a gate` step below
+        # still runs on forked PRs and surfaces findings in the run log
+        # — SARIF persistence in the Security tab is a property of
+        # base-repo runs (push to main / schedule) anyway.
+        # `continue-on-error` is a belt for unrelated upload flakes
+        # (codeql-action retries, large SARIF parse failures, etc).
+        if: |
+          always()
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@42213152a85ae7569bdb6bec7bcd74cd691bfe41 # v3.30.9
         with:
           sarif_file: zizmor.sarif

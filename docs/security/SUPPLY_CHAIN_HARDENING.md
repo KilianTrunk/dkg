@@ -315,12 +315,20 @@ then:
    accounts. The `verify-environment` job will refuse to run otherwise —
    that is what fail-closes the otherwise fail-open auto-creation
    behaviour GitHub Actions ships with.
-2. **Wait timer**: 5 minutes is the minimum useful value. Gives a
+2. **Prevent self-review**: enable "Prevent self-review" on the
+   required-reviewers rule. Without it, the same maintainer who
+   merged a malicious change can approve `npm-publish` themselves and
+   unlock `NPM_TOKEN`, which defeats the separation-of-duties control
+   this preflight enforces. `verify-environment` fails-closed unless
+   this flag is set.
+3. **Wait timer**: 5 minutes is the minimum useful value. Gives a
    reviewer a window to abort if something looks wrong.
-3. **Deployment branches**: restrict to `main` only. Default allows any
+   `verify-environment` fails-closed unless a non-zero wait_timer is
+   configured.
+4. **Deployment branches**: restrict to `main` only. Default allows any
    branch, which would let a feature branch publish if the workflow were
    ever triggered against it.
-4. **Environment secrets**: move `NPM_TOKEN` from repo-level secrets to
+5. **Environment secrets**: move `NPM_TOKEN` from repo-level secrets to
    this environment. Repo-level `NPM_TOKEN` would still be accessible to
    any workflow run on `main`, defeating the point.
 
@@ -328,11 +336,13 @@ Verify via:
 
 ```bash
 gh api repos/OriginTrail/dkg/environments/npm-publish \
-  | jq '.protection_rules[]
-        | select(.type == "required_reviewers")
-        | .reviewers
-        | length'
-# Must print ≥ 1 — exactly what the publish workflow asserts.
+  | jq '{
+      reviewers: [.protection_rules[] | select(.type == "required_reviewers") | .reviewers | length] | first,
+      prevent_self_review: [.protection_rules[] | select(.type == "required_reviewers") | .prevent_self_review] | first,
+      wait_timer: [.protection_rules[] | select(.type == "wait_timer") | .wait_timer] | first
+    }'
+# Must print { "reviewers": ≥1, "prevent_self_review": true, "wait_timer": ≥1 }
+# — exactly the three properties verify-environment asserts.
 ```
 
 ### D. Enable required signed commits on the personal level

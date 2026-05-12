@@ -97,6 +97,21 @@ jobs:
             exit 1
           fi
 
+          # prevent_self_review on the required_reviewers rule. Without
+          # this, the same maintainer who merged a malicious change can
+          # approve `npm-publish` themselves and immediately unlock
+          # NPM_TOKEN, which defeats the separation-of-duties control
+          # this preflight is supposed to enforce. The GitHub API exposes
+          # this as `.prevent_self_review` on the `required_reviewers`
+          # protection rule. We fail-closed unless it's explicitly true.
+          PREVENT_SELF_REVIEW=$(echo "${ENV_CONFIG}" \
+            | jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .prevent_self_review] | first // false' \
+            || echo false)
+          if [ "${PREVENT_SELF_REVIEW}" != "true" ]; then
+            echo "::error title=npm-publish self-review not blocked::Environment has reviewers but \`prevent_self_review\` is disabled. The maintainer who merged the change can approve their own npm-publish gate and unlock NPM_TOKEN, defeating the separation-of-duties control. Enable 'Prevent self-review' under the required-reviewers rule in repo Settings → Environments → npm-publish."
+            exit 1
+          fi
+
           # wait_timer protection rule. The hardening doc + the error message
           # above both say a wait timer is mandatory, so enforce it here:
           # without one, a reviewer who clicks "Approve" by mistake has no
@@ -111,7 +126,7 @@ jobs:
             exit 1
           fi
 
-          echo "✓ npm-publish environment configured with ${REVIEWER_COUNT} required reviewer(s) + ${WAIT_TIMER}-min wait timer"
+          echo "✓ npm-publish environment configured with ${REVIEWER_COUNT} required reviewer(s) (self-review blocked) + ${WAIT_TIMER}-min wait timer"
 
   publish:
     name: Build & Publish to NPM

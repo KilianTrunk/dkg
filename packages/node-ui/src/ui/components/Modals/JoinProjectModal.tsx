@@ -113,6 +113,15 @@ export function validateInvite(invite: ParsedInvite): string | null {
   if (invite.hasUnparsedExtra) {
     return 'Invite contains a second line that is not a valid peer ID (12D3Koo…) or multiaddr (/ip4/…). Check for typos.';
   }
+  // V10: every join requires a curator peer id (the daemon's
+  // `/request-join` returns 400 when curatorPeerId is absent — see
+  // `forwardJoinRequest`). A bare cgId would silently 400 here, so
+  // reject it loudly with actionable copy. The old subscribe-to-public-CG
+  // paste flow has been removed; users who want a public CG that hasn't
+  // surfaced in the Oracle yet need to ask the creator for an invite.
+  if (!invite.curatorPeerId && !invite.legacyMultiaddr) {
+    return 'This invite is missing the curator peer id. Ask the curator to regenerate the invite from the Share Project dialog.';
+  }
   if (invite.legacyMultiaddr) {
     if (!invite.legacyMultiaddr.startsWith('/')) return 'Invalid curator multiaddr';
     if (!invite.legacyMultiaddr.includes('/p2p/')) return 'Curator multiaddr is missing peer ID';
@@ -150,11 +159,35 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
     }
   }, [open, initialContextGraphId]);
 
+  // Drive the post-approval flow: refresh the sidebar, focus the new
+  // CG's tab, and hand off to the wire-workspace step. Idempotent —
+  // safe to call from both the SSE join_approved handler and the
+  // synchronous already-member short-circuit below. PR #448 review:
+  // the curator's `join-approved` P2P notification is fire-and-forget
+  // (`.catch(() => {})`), so the modal cannot rely on the SSE alone to
+  // advance after an authoritative HTTP success.
+  const transitionToApproved = useCallback(async (cgId: string) => {
+    setPhase('approved');
+    try {
+      const { contextGraphs: freshList } = await fetchContextGraphs();
+      setContextGraphs(freshList ?? []);
+      const joined = freshList?.find((cg: any) => cg.id === cgId);
+      if (joined) {
+        setActiveProject(joined.id);
+        openTab({ id: `project:${joined.id}`, label: joined.name || joined.id, closable: true });
+        setWiredProjectName(joined.name ?? cgId);
+        setWiredCgId(cgId);
+      }
+    } catch {
+      // Sidebar refresh is best-effort; the user can still close the
+      // modal and re-open the project from the (eventually-refreshed)
+      // sidebar.
+    }
+  }, [setContextGraphs, setActiveProject, openTab]);
+
   // Auto-transition to wire-workspace when the curator approves a
-  // pending request (or the curator-side already-member backstop fired).
-  // The SSE event arrives when the daemon's `JOIN_APPROVED` event bus
-  // fires for the cgId we're waiting on. Refresh the project list so
-  // the new CG appears in the sidebar before transitioning.
+  // pending request. The SSE event arrives when the daemon's
+  // `JOIN_APPROVED` event bus fires for the cgId we're waiting on.
   const onNodeEvent = useCallback((event: { type: string; data: Record<string, unknown> }) => {
     if (!pendingCgId) return;
     if (event.type !== 'join_approved' && event.type !== 'join_rejected') return;
@@ -166,24 +199,8 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
       return;
     }
 
-    setPhase('approved');
-    fetchContextGraphs()
-      .then(({ contextGraphs: freshList }) => {
-        setContextGraphs(freshList ?? []);
-        const joined = freshList?.find((cg: any) => cg.id === pendingCgId);
-        if (joined) {
-          setActiveProject(joined.id);
-          openTab({ id: `project:${joined.id}`, label: joined.name || joined.id, closable: true });
-          setWiredProjectName(joined.name ?? pendingCgId);
-          setWiredCgId(pendingCgId);
-        }
-      })
-      .catch(() => {
-        // Sidebar refresh is best-effort; the user can still close the
-        // modal and re-open the project from the (eventually-refreshed)
-        // sidebar.
-      });
-  }, [pendingCgId, setContextGraphs, setActiveProject, openTab]);
+    void transitionToApproved(pendingCgId);
+  }, [pendingCgId, transitionToApproved]);
   useNodeEvents(onNodeEvent);
 
   if (!open) return null;
@@ -238,10 +255,11 @@ export function JoinProjectModal({ open, onClose, initialContextGraphId }: JoinP
 
       if (result.alreadyMember) {
         // Curator-side short-circuit: requester is already in the
-        // allowlist. The curator has fired join-approved; the SSE
-        // listener above will catch it and transition to wire. Show
-        // pending UI for the brief moment until that arrives.
-        setPhase('pending');
+        // allowlist. The HTTP response is itself authoritative — the
+        // curator's separate `join-approved` P2P notification is
+        // fire-and-forget and may be dropped, so don't make the modal
+        // depend on it. Drive the transition synchronously.
+        await transitionToApproved(cgId);
         return;
       }
 

@@ -19,13 +19,20 @@ describe('JoinProjectModal invite parsing', () => {
       expect(parsed.legacyMultiaddr).toBeNull();
     });
 
-    it('treats invite with only a cgId as valid (cg public, no curator dial)', () => {
+    // PR #448 review: V10 `/request-join` requires a curator peer id, so
+    // a bare cgId now 400s on the daemon. validateInvite rejects it
+    // client-side instead, with actionable copy. The old subscribe-to-public
+    // paste flow has been removed; users who want a public CG that
+    // hasn't surfaced in the Oracle have to ask the curator for an invite.
+    it('rejects invite with only a cgId (no curator peer id)', () => {
       const parsed = parseInviteCode('open-project');
       expect(parsed.cgId).toBe('open-project');
       expect(parsed.curatorPeerId).toBeNull();
       expect(parsed.legacyMultiaddr).toBeNull();
       expect(parsed.hasUnparsedExtra).toBe(false);
-      expect(validateInvite(parsed)).toBeNull();
+      const err = validateInvite(parsed);
+      expect(err).not.toBeNull();
+      expect(err).toContain('curator peer id');
     });
 
     it('validates a peer-id invite as ok', () => {

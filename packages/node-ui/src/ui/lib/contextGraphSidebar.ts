@@ -67,9 +67,13 @@ export function belongsInMyProjectsSidebar(cg: ContextGraph, identity: AgentSide
  *     or has at least one successful catchup on file (so the CG is known
  *     to actually exist on a reachable peer).
  *
- *     A user who wants to join a public CG that isn't in the Oracle can still
- *     paste its ID into "Join Project" — that path doesn't require the Oracle
- *     to have surfaced the CG first.
+ *     The Join Project modal does NOT compensate for an Oracle miss: it
+ *     now requires a curator-supplied invite (cgId + curator peer id) so
+ *     `/request-join` has somewhere to forward the signed delegation.
+ *     Bare-cgId paste is rejected client-side (see `validateInvite`).
+ *     A user who wants to join a public CG that hasn't surfaced here yet
+ *     either waits for it to gossip from a subscribed peer, or asks the
+ *     creator for an invite.
  *
  *  Older daemons that don't populate `synced` continue to work — `subscribed`
  *  alone gates the result, and brand-new nodes with no subscriptions just see

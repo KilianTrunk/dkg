@@ -235,6 +235,51 @@ else
   exit 1
 fi
 
+hr "Step 1b — assert the curator triple landed in N1's RDF _meta graph"
+# Why this assertion exists: PR #448 round-6 traced "no reachable
+# curator" failures back to CGs whose _meta graph was missing the
+# DKG_CURATOR triple — `getContextGraphOwner` then returned null and
+# PROTOCOL_JOIN_REQUEST silently NACK'd. The wallet-prefix fallback
+# (`deriveCuratorDidFromCgId`) heals stale data from older code, but
+# the *real* prevention is keeping today's create path honest. If a
+# future PR ever drops the DKG_CURATOR write from `createContextGraph`
+# this assertion fails immediately — instead of the bug only showing
+# up on the next invite/sync test downstream.
+curator_query=$(CG="$CG_ID" python3 <<'PY'
+import json, os
+cg = os.environ["CG"]
+meta = f"did:dkg:context-graph:{cg}/_meta"
+subj = f"did:dkg:context-graph:{cg}"
+print(json.dumps({
+  "contextGraphId": cg,
+  "sparql": f"""SELECT ?owner WHERE {{
+    GRAPH <{meta}> {{
+      <{subj}> <https://dkg.network/ontology#curator> ?owner .
+    }}
+  }} LIMIT 1""",
+}))
+PY
+)
+curator_resp=$(api "$N1" POST /api/query "$curator_query")
+curator_owner=$(echo "$curator_resp" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  bindings = d.get('result', {}).get('bindings', [])
+  print(bindings[0].get('owner', '') if bindings else '')
+except Exception:
+  print('')
+")
+expected_owner="did:dkg:agent:${N1_ADDR}"
+if [ "$curator_owner" = "$expected_owner" ]; then
+  ok "DKG_CURATOR triple present and points at N1: $curator_owner"
+elif [ -n "$curator_owner" ]; then
+  fail "DKG_CURATOR triple present but owner unexpected (got '$curator_owner', expected '$expected_owner')"
+else
+  fail "DKG_CURATOR triple MISSING from $CG_ID's _meta graph — createContextGraph regression. Without it, every PROTOCOL_JOIN_REQUEST for this CG silently NACKs."
+  note "raw response: $curator_resp"
+fi
+
 hr "Step 2 — N1 publishes some durable data into the CG (so N2 has something to sync after approval)"
 # Create an assertion and write two sample quads into it.
 ASSERTION_NAME="widget-info"

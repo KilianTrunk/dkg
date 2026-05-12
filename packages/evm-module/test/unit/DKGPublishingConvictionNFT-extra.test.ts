@@ -100,20 +100,32 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
     }
   }
 
+  async function advanceToTimestamp(targetTimestamp: bigint) {
+    const block = await hre.ethers.provider.getBlock('latest');
+    if (!block) {
+      throw new Error('Latest block not found');
+    }
+    const now = BigInt(block.timestamp);
+    if (targetTimestamp > now) {
+      await time.increase(targetTimestamp - now);
+    }
+  }
+
   // ======================================================================
   // E-6 — topUp after expiry must revert with AccountExpired.
   // ======================================================================
   describe('E-6.a: topUp after account expiry', () => {
-    it('reverts AccountExpired once currentEpoch === expiresAtEpoch', async () => {
+    it('reverts AccountExpired once block.timestamp reaches expiresAtTimestamp', async () => {
       const committed = hre.ethers.parseEther('50000');
       const acctId = await createAccount(accounts[0], committed);
 
       const info = await NFT.getAccountInfo(acctId);
       const expiresAt = BigInt(info.expiresAtEpoch);
+      const expiresAtTs = BigInt(info.expiresAtTimestamp);
 
-      // Hit expiry exactly (currentEpoch == expiresAtEpoch). The contract
-      // check is `>=`, so this boundary must revert.
-      await advanceToEpoch(expiresAt);
+      // Hit expiry exactly (block.timestamp == expiresAtTimestamp). The
+      // contract check is `>=`, so this boundary must revert.
+      await advanceToTimestamp(expiresAtTs);
 
       const topUpAmount = hre.ethers.parseEther('1000');
       await TokenContract.connect(accounts[0]).approve(await NFT.getAddress(), topUpAmount);
@@ -128,8 +140,9 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       const acctId = await createAccount(accounts[0], committed);
       const info = await NFT.getAccountInfo(acctId);
       const expiresAt = BigInt(info.expiresAtEpoch);
+      const expiresAtTs = BigInt(info.expiresAtTimestamp);
 
-      await advanceToEpoch(expiresAt + 5n);
+      await advanceToTimestamp(expiresAtTs + 5n);
 
       const topUpAmount = hre.ethers.parseEther('500');
       await TokenContract.connect(accounts[0]).approve(await NFT.getAddress(), topUpAmount);
@@ -144,10 +157,11 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       const acctId = await createAccount(accounts[0], committed);
       const info = await NFT.getAccountInfo(acctId);
       const expiresAt = BigInt(info.expiresAtEpoch);
+      const expiresAtTs = BigInt(info.expiresAtTimestamp);
       const bufferBefore = await NFT.topUpBalance(acctId);
       const publisherBalBefore = await TokenContract.balanceOf(accounts[0].address);
 
-      await advanceToEpoch(expiresAt);
+      await advanceToTimestamp(expiresAtTs);
 
       const topUpAmount = hre.ethers.parseEther('2000');
       await TokenContract.connect(accounts[0]).approve(await NFT.getAddress(), topUpAmount);
@@ -167,9 +181,10 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       const acctId = await createAccount(accounts[0], committed);
       const info = await NFT.getAccountInfo(acctId);
       const expiresAt = BigInt(info.expiresAtEpoch);
+      const expiresAtTs = BigInt(info.expiresAtTimestamp);
 
-      // One epoch below expiry (currentEpoch == expiresAtEpoch - 1): allowed.
-      await advanceToEpoch(expiresAt - 1n);
+      // Keep enough headroom so the transaction-mined block cannot cross expiry.
+      await advanceToTimestamp(expiresAtTs - 10n);
 
       const topUpAmount = hre.ethers.parseEther('1000');
       await TokenContract.connect(accounts[0]).approve(await NFT.getAddress(), topUpAmount);
@@ -213,8 +228,9 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       const { kav10, agent, acctId } = await setupWithKAV10Signer();
       const info = await NFT.getAccountInfo(acctId);
       const expiresAt = BigInt(info.expiresAtEpoch);
+      const expiresAtTs = BigInt(info.expiresAtTimestamp);
 
-      await advanceToEpoch(expiresAt);
+      await advanceToTimestamp(expiresAtTs);
 
       const baseCost = hre.ethers.parseEther('100');
       await expect(
@@ -228,8 +244,9 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       const { kav10, agent, acctId } = await setupWithKAV10Signer();
       const info = await NFT.getAccountInfo(acctId);
       const expiresAt = BigInt(info.expiresAtEpoch);
+      const expiresAtTs = BigInt(info.expiresAtTimestamp);
 
-      await advanceToEpoch(expiresAt + 3n);
+      await advanceToTimestamp(expiresAtTs + 3n);
 
       const baseCost = hre.ethers.parseEther('100');
       await expect(
@@ -243,11 +260,12 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       const { kav10, agent, acctId } = await setupWithKAV10Signer();
       const info = await NFT.getAccountInfo(acctId);
       const expiresAt = BigInt(info.expiresAtEpoch);
+      const expiresAtTs = BigInt(info.expiresAtTimestamp);
 
-      await advanceToEpoch(expiresAt);
+      await advanceToTimestamp(expiresAtTs);
 
       const bufferBefore = await NFT.topUpBalance(acctId);
-      const spentBefore = await NFT.epochSpent(acctId, BigInt(info.createdAtEpoch));
+      const spentBefore = await NFT.epochSpent(acctId, 0n);
 
       // Post-expiry coverPublishingCost reverts with
       // `AccountExpired(accountId, expiresAtEpoch)`. Pinning both the error
@@ -261,16 +279,17 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
         .withArgs(acctId, expiresAt);
 
       expect(await NFT.topUpBalance(acctId)).to.equal(bufferBefore);
-      expect(await NFT.epochSpent(acctId, BigInt(info.createdAtEpoch))).to.equal(spentBefore);
+      expect(await NFT.epochSpent(acctId, 0n)).to.equal(spentBefore);
     });
 
     it('SANITY: coverPublishingCost in-lifetime (epoch < expiresAt) succeeds', async () => {
       const { kav10, agent, acctId } = await setupWithKAV10Signer();
       const info = await NFT.getAccountInfo(acctId);
       const expiresAt = BigInt(info.expiresAtEpoch);
+      const expiresAtTs = BigInt(info.expiresAtTimestamp);
 
-      // One epoch below expiry: allowed.
-      await advanceToEpoch(expiresAt - 1n);
+      // Keep enough headroom so the transaction-mined block cannot cross expiry.
+      await advanceToTimestamp(expiresAtTs - 10n);
 
       const baseCost = hre.ethers.parseEther('10');
       // Compute the expected discounted cost from the on-chain discountBps
@@ -299,25 +318,27 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
     });
 
     it('account created AT epoch N still has a full LOCK_DURATION window before AccountExpired fires', async () => {
-      // Pins the exact lifetime length asserted in the docstring: 12 epochs
-      // from creation. Any off-by-one in expiresAtEpoch math would surface
-      // as this test emitting AccountExpired inside the allowed window.
+      // Pins the exact lifetime length asserted in the docstring: 12 epoch
+      // lengths from creation timestamp.
       const { kav10, agent, acctId } = await setupWithKAV10Signer();
       const info = await NFT.getAccountInfo(acctId);
-      expect(BigInt(info.expiresAtEpoch) - BigInt(info.createdAtEpoch)).to.equal(
-        BigInt(LOCK_DURATION),
+      const epochLength = await ChronosContract.epochLength();
+      expect(BigInt(info.expiresAtTimestamp) - BigInt(info.createdAtTimestamp)).to.equal(
+        BigInt(LOCK_DURATION) * epochLength,
       );
 
-      // Walk through all 12 allowed epochs; every call must succeed.
+      // Walk through all 12 allowed billing windows; every call must succeed.
       for (let delta = 0n; delta < BigInt(LOCK_DURATION); delta++) {
-        await advanceToEpoch(BigInt(info.createdAtEpoch) + delta);
+        await advanceToTimestamp(
+          BigInt(info.createdAtTimestamp) + delta * epochLength,
+        );
         await expect(
           NFT.connect(kav10).coverPublishingCost(agent.address, 1n),
         ).to.not.be.reverted;
       }
 
-      // Then on epoch == expiresAt (13th) it MUST revert.
-      await advanceToEpoch(BigInt(info.expiresAtEpoch));
+      // Then exactly at expiry timestamp it MUST revert.
+      await advanceToTimestamp(BigInt(info.expiresAtTimestamp));
       await expect(
         NFT.connect(kav10).coverPublishingCost(agent.address, 1n),
       ).to.be.revertedWithCustomError(NFT, 'AccountExpired');

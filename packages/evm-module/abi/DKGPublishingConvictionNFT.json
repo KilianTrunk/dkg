@@ -19,7 +19,7 @@
       },
       {
         "internalType": "uint40",
-        "name": "expiresAt",
+        "name": "expiresAtEpoch",
         "type": "uint40"
       }
     ],
@@ -591,6 +591,16 @@
         "type": "uint40"
       },
       {
+        "internalType": "uint40",
+        "name": "createdAtTimestamp",
+        "type": "uint40"
+      },
+      {
+        "internalType": "uint40",
+        "name": "expiresAtTimestamp",
+        "type": "uint40"
+      },
+      {
         "internalType": "uint16",
         "name": "lockDurationEpochs",
         "type": "uint16"
@@ -804,6 +814,16 @@
       {
         "internalType": "uint40",
         "name": "expiresAtEpoch",
+        "type": "uint40"
+      },
+      {
+        "internalType": "uint40",
+        "name": "createdAtTimestamp",
+        "type": "uint40"
+      },
+      {
+        "internalType": "uint40",
+        "name": "expiresAtTimestamp",
         "type": "uint40"
       },
       {

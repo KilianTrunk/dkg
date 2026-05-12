@@ -317,6 +317,27 @@ const SYNC_AUTH_MAX_AGE_MS = 90_000;
 const JOIN_DELEGATION_VALIDITY_MS = 365 * 24 * 60 * 60 * 1000;
 
 /**
+ * Send timeout for `/dkg/.../join-request` deliveries between joiner ↔ curator.
+ *
+ * Why 20s and not the previous 5s: `ProtocolRouter.send` shares a single
+ * `AbortSignal.timeout(timeoutMs)` across its 3 retry attempts (see
+ * `protocol-router.ts:82-97`), so this value is the budget for the *entire*
+ * dial-retry loop, not per attempt. A fresh circuit-relay dial against a
+ * NAT'd peer routinely takes 1-3s to establish; 5s leaves no headroom for
+ * the back-off-and-retry path the loop is designed for, so the very first
+ * approval-notification after a curator's `approve-join` would routinely
+ * abort before libp2p got a chance to upgrade the relay connection. Two
+ * laptops on home internet (PR #448) reproduced this consistently.
+ *
+ * 20s matches `DEFAULT_SEND_TIMEOUT_MS` and gives ProtocolRouter's loop room
+ * for ~3 attempts of ~3-5s each before declaring the peer unreachable.
+ *
+ * The proper fix is per-attempt timeouts in ProtocolRouter (the shared signal
+ * is a latent design issue) — tracked separately, not in scope here.
+ */
+const JOIN_REQUEST_SEND_TIMEOUT_MS = 20_000;
+
+/**
  * Scope string for join-request delegations. Authorises the named node
  * to sync the CG on the named DKG deployment.
  *
@@ -8062,7 +8083,7 @@ export class DKGAgent {
     }
 
     try {
-      await this.messenger.sendToPeer(targetPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: 5000 });
+      await this.messenger.sendToPeer(targetPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: JOIN_REQUEST_SEND_TIMEOUT_MS });
       this.log.info(ctx, `Delivered ${label} for "${contextGraphId}" to ${agentAddress} (${targetPeerId})`);
       // The join request is finalised now — forget the origin peer so
       // the map doesn't grow unbounded over the curator's lifetime.
@@ -8151,7 +8172,7 @@ export class DKGAgent {
     let curatorTargetedSuccess = false;
     if (curatorPeerId !== this.peerId) {
       try {
-        const responseBytes = await this.messenger.sendToPeer(curatorPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: 5000 });
+        const responseBytes = await this.messenger.sendToPeer(curatorPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: JOIN_REQUEST_SEND_TIMEOUT_MS });
         const response = JSON.parse(new TextDecoder().decode(responseBytes));
         if (response.ok) {
           // Only the explicit invite-supplied curator is recorded as a
@@ -8195,7 +8216,7 @@ export class DKGAgent {
       .filter((id) => id !== this.peerId && (!curatorTargetedSuccess || id !== curatorPeerId));
     const results = await Promise.allSettled(
       broadcastTargets.map(async (remotePeerId) => {
-        const responseBytes = await this.messenger.sendToPeer(remotePeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: 5000 });
+        const responseBytes = await this.messenger.sendToPeer(remotePeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: JOIN_REQUEST_SEND_TIMEOUT_MS });
         const response = JSON.parse(new TextDecoder().decode(responseBytes));
         return { remotePeerId, response };
       }),

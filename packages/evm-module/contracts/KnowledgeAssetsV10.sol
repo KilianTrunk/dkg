@@ -196,6 +196,7 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
     error ZeroAddressDependency(string name);
     error ZeroContextGraphId();
     error ZeroEpochs();
+    error InvalidPublishingConvictionEpochs(uint256 expectedEpochs, uint256 providedEpochs);
 
     // --- RFC-001 author attestation errors ---
 
@@ -355,6 +356,11 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
         (currentEpoch, kcId) = _executePublishCore(p);
 
         if (publishingConvictionNFT.agentToAccountId(msg.sender) != 0) {
+            uint256 configuredConvictionEpochs = parametersStorage.publishingConvictionEpochs();
+            if (p.epochs != configuredConvictionEpochs) {
+                revert InvalidPublishingConvictionEpochs(configuredConvictionEpochs, p.epochs);
+            }
+
             // Discount branch. NFT auto-resolves the paying account from
             // `agentToAccountId[msg.sender]` inside `coverPublishingCost`
             // and emits `CostCovered` with full detail for off-chain

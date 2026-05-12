@@ -344,9 +344,13 @@ describe('@unit KnowledgeAssetsV10', () => {
         // Open CG so the creator is authorized without curator config.
         const cgId = await createOpenCG(creator);
 
+        const ParametersStorageContract =
+          await hre.ethers.getContract('ParametersStorage');
         const currentEpoch = await ChronosContract.getCurrentEpoch();
         const tokenAmount = ethers.parseEther('1000');
-        const epochs = 2;
+        const epochs = Number(
+          await ParametersStorageContract.publishingConvictionEpochs(),
+        );
         const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.1-root'));
 
         // Snapshot staker pool across the epoch range that `_distributeTokens`
@@ -2039,6 +2043,11 @@ describe('@unit KnowledgeAssetsV10', () => {
 
         const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t2.3-root'));
         const tokenAmount = ethers.parseEther('100');
+        const ParametersStorageContract =
+          await hre.ethers.getContract('ParametersStorage');
+        const convictionEpochs = Number(
+          await ParametersStorageContract.publishingConvictionEpochs(),
+        );
 
         const p = await buildPublishParams({
           chainId,
@@ -2051,7 +2060,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           merkleRoot,
           knowledgeAssetsAmount: 10,
           byteSize: 1000,
-          epochs: 2,
+          epochs: convictionEpochs,
           tokenAmount,
           isImmutable: false,
           publishOperationId: 't2.3-op',

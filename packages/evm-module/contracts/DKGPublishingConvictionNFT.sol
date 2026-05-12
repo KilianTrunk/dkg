@@ -8,6 +8,7 @@ import {IInitializable} from "./interfaces/IInitializable.sol";
 import {HubDependent} from "./abstract/HubDependent.sol";
 import {Chronos} from "./storage/Chronos.sol";
 import {EpochStorage} from "./storage/EpochStorage.sol";
+import {ParametersStorage} from "./storage/ParametersStorage.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
@@ -19,7 +20,7 @@ import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/
  * V10 flow-through model:
  *   - At createAccount, `committedTRAC` is moved DIRECTLY from the publisher to
  *     the V10 TRAC vault — `ConvictionStakingStorage` (the contract NEVER holds
- *     TRAC) and the full 12-epoch allowance is distributed to the staker
+ *     TRAC) and the full conviction-window allowance is distributed to the staker
  *     reward pool via `EpochStorage.addTokensToEpochRange`.
  *   - The contract stores accounting only: per-account epoch spend and a
  *     persistent `topUpBalance` buffer.
@@ -42,14 +43,14 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     string private constant _NAME = "DKGPublishingConvictionNFT";
     string private constant _VERSION = "2.0.0";
 
-    uint256 public constant LOCK_DURATION_EPOCHS = 12;
     uint256 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant STAKER_SHARD_ID = 1;
 
     struct Account {
         uint96 committedTRAC;
         uint40 createdAtEpoch;
-        uint40 expiresAtEpoch; // createdAtEpoch + LOCK_DURATION_EPOCHS, never extended
+        uint40 expiresAtEpoch; // createdAtEpoch + lockDurationEpochs, never extended
+        uint16 lockDurationEpochs;
         uint16 discountBps;    // fixed at creation
     }
 
@@ -61,11 +62,13 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     address public stakingStorageAddress;
     EpochStorage public epochStorage;
     Chronos public chronos;
+    ParametersStorage public parametersStorage;
 
     uint256 private _nextAccountId;
 
     mapping(uint256 => Account) public accounts;
-    /// @notice Per-epoch spent amount counted against the `committedTRAC / 12`
+    /// @notice Per-epoch spent amount counted against the
+    ///         `committedTRAC / lockDurationEpochs`
     /// base allowance. `coverPublishingCost` updates this before touching
     /// `topUpBalance`.
     mapping(uint256 => mapping(uint40 => uint96)) public epochSpent;
@@ -116,6 +119,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     error AgentNotRegistered(uint256 accountId, address agent);
     error AgentCapReached(uint256 accountId, uint256 cap);
     error TokenTransferFailed();
+    error InvalidPublishingConvictionEpochs(uint256 configuredEpochs);
 
     constructor(address hubAddress) HubDependent(hubAddress) ERC721("DKG Publishing Conviction", "DKGPC") {}
 
@@ -137,6 +141,10 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         address ch = hub.getContractAddress("Chronos");
         if (ch == address(0)) revert ZeroAddressDependency("Chronos");
         chronos = Chronos(ch);
+
+        address params = hub.getContractAddress("ParametersStorage");
+        if (params == address(0)) revert ZeroAddressDependency("ParametersStorage");
+        parametersStorage = ParametersStorage(params);
 
         // accountId == 0 is the "not registered" sentinel for agentToAccountId.
         if (_nextAccountId == 0) _nextAccountId = 1;
@@ -160,7 +168,8 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
      *
      * TRAC flow (fail-closed; any sub-call revert reverts the whole tx):
      *   1. `committedTRAC` is pulled from msg.sender directly into the CSS vault.
-     *   2. The full amount is distributed across the next 12 epochs of the
+     *   2. The full amount is distributed across the configured conviction
+     *      lock window from `ParametersStorage.publishingConvictionEpochs()`.
      *      staker reward pool via EpochStorage.addTokensToEpochRange.
      *   3. Accounting state (Account struct) is written.
      *   4. An ERC-721 token is minted to msg.sender.
@@ -172,13 +181,19 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
 
         accountId = _nextAccountId++;
         uint40 currentEpoch = uint40(chronos.getCurrentEpoch());
-        uint40 expiresAtEpoch = currentEpoch + uint40(LOCK_DURATION_EPOCHS);
+        uint256 configuredEpochs = parametersStorage.publishingConvictionEpochs();
+        if (configuredEpochs == 0 || configuredEpochs > type(uint16).max) {
+            revert InvalidPublishingConvictionEpochs(configuredEpochs);
+        }
+        uint16 lockDurationEpochs = uint16(configuredEpochs);
+        uint40 expiresAtEpoch = currentEpoch + uint40(lockDurationEpochs);
         uint16 discountBps = uint16(getDiscountBps(committedTRAC));
 
         accounts[accountId] = Account({
             committedTRAC: committedTRAC,
             createdAtEpoch: currentEpoch,
             expiresAtEpoch: expiresAtEpoch,
+            lockDurationEpochs: lockDurationEpochs,
             discountBps: discountBps
         });
 
@@ -189,7 +204,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
             revert TokenTransferFailed();
         }
 
-        // Distribute the full committed amount across the 12-epoch lock window
+        // Distribute the full committed amount across the configured lock window
         // (inclusive) so stakers receive it regardless of publish activity.
         epochStorage.addTokensToEpochRange(
             STAKER_SHARD_ID,
@@ -256,7 +271,8 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
      * as the publishing agent, so a malicious EOA going through KAV10 can
      * only drain its own conviction account.
      *
-     * Spend order: current-epoch base allowance (committedTRAC / 12) first,
+     * Spend order: current-epoch base allowance
+     * (`committedTRAC / lockDurationEpochs`) first,
      * then `topUpBalance`. Reverts if the combined balance is insufficient.
      *
      * Does NOT move TRAC — TRAC already lives in the CSS vault from
@@ -284,7 +300,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
             (uint256(baseCost) * (BPS_DENOMINATOR - uint256(acct.discountBps))) / BPS_DENOMINATOR
         );
 
-        uint96 baseAllowance = acct.committedTRAC / uint96(LOCK_DURATION_EPOCHS);
+        uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
         uint96 spent = epochSpent[accountId][currentEpoch];
         uint96 epochRemaining = spent < baseAllowance ? baseAllowance - spent : 0;
 
@@ -418,7 +434,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         return (
             ownerOf(accountId),
             acct.committedTRAC,
-            acct.committedTRAC / uint96(LOCK_DURATION_EPOCHS),
+            acct.committedTRAC / uint96(acct.lockDurationEpochs),
             acct.createdAtEpoch,
             acct.expiresAtEpoch,
             acct.discountBps,
@@ -430,7 +446,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     function getRemainingAllowance(uint256 accountId, uint40 epoch) external view returns (uint96) {
         _requireExists(accountId);
         Account storage acct = accounts[accountId];
-        uint96 baseAllowance = acct.committedTRAC / uint96(LOCK_DURATION_EPOCHS);
+        uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
         uint96 spent = epochSpent[accountId][epoch];
         uint96 epochRemaining = spent < baseAllowance ? baseAllowance - spent : 0;
         return epochRemaining + topUpBalance[accountId];

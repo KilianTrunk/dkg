@@ -360,7 +360,7 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
             (, , , , , uint16 lockDurationEpochs, ) = publishingConvictionNFT.accounts(
                 convictionAccountId
             );
-            if (p.epochs != uint256(lockDurationEpochs)) {
+            if (p.epochs > uint256(lockDurationEpochs)) {
                 revert InvalidPublishingConvictionEpochs(lockDurationEpochs, p.epochs);
             }
 

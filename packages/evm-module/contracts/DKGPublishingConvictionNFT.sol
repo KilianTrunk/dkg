@@ -473,9 +473,15 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         if (epoch < acct.createdAtEpoch || epoch >= acct.expiresAtEpoch) {
             return 0;
         }
-        uint40 billingWindow = uint40(
-            (chronos.timestampForEpoch(epoch) - uint256(acct.createdAtTimestamp)) / chronos.epochLength()
-        );
+        uint256 epochStartTimestamp = chronos.timestampForEpoch(epoch);
+        uint40 billingWindow;
+        if (epochStartTimestamp <= uint256(acct.createdAtTimestamp)) {
+            billingWindow = 0;
+        } else {
+            billingWindow = uint40(
+                (epochStartTimestamp - uint256(acct.createdAtTimestamp)) / chronos.epochLength()
+            );
+        }
         uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
         uint96 spent = epochSpent[accountId][billingWindow];
         uint96 epochRemaining = spent < baseAllowance ? baseAllowance - spent : 0;

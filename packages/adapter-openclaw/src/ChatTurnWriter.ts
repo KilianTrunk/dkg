@@ -781,6 +781,7 @@ export class ChatTurnWriter {
     const sessionId = this.deriveSessionId(ctx);
     if (!sessionId) return;
     const identity = this.identityFieldsFromPayload(ctx);
+    const stripChannelMetadataFromUserText = this.shouldStripChannelMetadataForChannel(identity.channelId);
     const externalCursorKey = this.externalCursorKeyFromSessionKey(identity.sessionKey);
     const typedW4bCursorKeys = this.typedW4bMarkerCursorKeys(identity);
     const w4bInflightSessionIds = this.w4bInflightGuardSessionIds(identity, sessionId);
@@ -811,6 +812,7 @@ export class ChatTurnWriter {
           typedW4bCursorKeys,
           w4bInflightSessionIds,
           w4aCrossPathSessionIds,
+          stripChannelMetadataFromUserText,
         );
       });
     this.w4aSessionChains.set(sessionId, work);
@@ -833,6 +835,7 @@ export class ChatTurnWriter {
     typedW4bCursorKeys: string[] = [],
     w4bInflightSessionIds: string[] = [sessionId],
     w4aCrossPathSessionIds: string[] = [sessionId],
+    stripChannelMetadataFromUserText = false,
   ): Promise<void> {
     try {
       // R18.2 — Take the MAX of W4a's pair-indexed watermark and W4b's
@@ -851,7 +854,7 @@ export class ChatTurnWriter {
         w4aCrossPathSessionIds,
       );
       const savedUpTo = this.savedUpToForSession(sessionId);
-      const pairs = this.computeDelta(event.messages, savedUpTo);
+      const pairs = this.computeDelta(event.messages, savedUpTo, stripChannelMetadataFromUserText);
       if (pairs.length === 0) return;
       // T362 — Cold-start clamp. When no prior watermark exists for this
       // session (savedUpTo === -1) AND `messages[]` carries more than one
@@ -1528,16 +1531,19 @@ export class ChatTurnWriter {
         void pendingReset.then(() => this.onMessageReceived(ev)).catch(() => undefined);
         return;
       }
-      const text = readEventText(ev);
+      const rawText = readEventText(ev);
+      const text = this.shouldStripChannelMetadataForChannel(channelId)
+        ? this.stripChannelMetadata(rawText)
+        : rawText;
       // R15.2 — Skip attachment-only / non-text inbound events. `readEventText`
       // returns "" when the envelope carries no text payload (e.g. an image
       // upload from Telegram). Enqueueing an empty string here would let the
       // next `message:sent` pair its assistant reply with a blank user side,
       // persisting an assistant-only turn for a conversation that had no
-      // textual inbound. Drop until we add a recoverable representation for
-      // attachment-only turns.
+      // textual inbound. Leading channel metadata that strips to empty is
+      // treated the same way because it is runtime-only context, not user text.
       if (!text) return;
-      const inboundDedupKey = this.messageHookDedupKey("inbound", ev, text);
+      const inboundDedupKey = this.messageHookDedupKey("inbound", ev, rawText);
       if (inboundDedupKey) {
         const existingConversationKey = this.messageHookInboundQueueKeys.get(inboundDedupKey);
         if (existingConversationKey && existingConversationKey !== conversationKey) {
@@ -1602,9 +1608,10 @@ export class ChatTurnWriter {
       // Strip injected `<recalled-memory>` from assistant text — the model may
       // echo the auto-recall block, and if we persist the raw version here
       // while the W4a path persists the stripped version, the two turnIds
-      // diverge and cross-path dedup misses. User text is NOT stripped:
-      // legitimate pastes (XML, logs) containing the tag would otherwise be
-      // silently corrupted.
+      // diverge and cross-path dedup misses. Telegram user text was already
+      // normalized at enqueue time by `stripChannelMetadata`, and user text is
+      // not passed through `stripRecalledMemory`: legitimate user pastes
+      // containing XML/log tags must survive verbatim.
       const assistantText = this.stripRecalledMemory(readEventText(ev));
       // R20.1 — Compute `assistantText` BEFORE consuming the pending user.
       // A `message:sent` with `success: true` but no textual content
@@ -2630,6 +2637,7 @@ export class ChatTurnWriter {
   private computeDelta(
     messages: ChatTurnMessage[],
     savedUpTo: number,
+    stripChannelMetadataFromUserText = false,
   ): ComputedChatTurnPair[] {
     const pairs: ComputedChatTurnPair[] = [];
     // R19.1 — Queue of unmatched user messages. Two transcript shapes
@@ -2693,12 +2701,19 @@ export class ChatTurnWriter {
         // that semantic in `computeDelta` or it produces an
         // assistant-only pair (`{ user: "", assistant: reply }`)
         // for any image-only user message followed by a reply.
-        const userText = this.extractText(msg.content);
+        const extractedUserText = this.extractText(msg.content);
+        const externalDirect = this.hasExternalDirectChannelMetadata(msg);
+        // A Telegram W4a transcript can include DKG UI/direct-channel
+        // backfill messages. Those carry their own canonical body and
+        // marker metadata, so preserve them verbatim for marker lookup.
+        const userText = stripChannelMetadataFromUserText && !externalDirect
+          ? this.stripChannelMetadata(extractedUserText)
+          : extractedUserText;
         if (userText) {
           pendingUsers.push({
             text: userText,
             externalTurnIds: this.extractExternalTurnIds(msg),
-            externalDirect: this.hasExternalDirectChannelMetadata(msg),
+            externalDirect,
             messageIds: this.extractMessageIds(msg),
           });
         }
@@ -2777,6 +2792,86 @@ export class ChatTurnWriter {
       value.toolResult === true ||
       value.tool_result === true,
     );
+  }
+
+  /**
+   * Strip leading runtime-only channel metadata blocks from persisted user text.
+   *
+   * OpenClaw's Telegram channel plugin can prepend fenced JSON context for the
+   * agent (Telegram conversation/sender details).
+   * That metadata is useful before the model responds, but persisting it as user
+   * text pollutes recall and may leak sender/chat identifiers.
+   *
+   * Call this only after trusted channel context says the source is Telegram;
+   * the labels below are user-writable text without that channel context. Keep
+   * the recognized labels to the concrete Telegram wrapper shape; broader
+   * channel/message labels need their own trusted source before they can be
+   * stripped safely. The leading `Conversation info` block is stripped, and the
+   * immediately following `Sender` block is stripped only when its JSON agrees
+   * with that conversation block. This keeps a user-pasted `Sender` example
+   * after a conversation-only wrapper verbatim. Separator blank lines after
+   * stripped blocks are removed, but indentation on the first real user line is
+   * kept.
+   *
+   * Because W4a and W4b both call this before turnId/content hashing, metadata
+   * changes do not create distinct persisted turn identities for the same user
+   * utterance. Existing historical turns are not rewritten.
+   */
+  private shouldStripChannelMetadataForChannel(channelId?: unknown): boolean {
+    return typeof channelId === "string" && channelId.trim().toLowerCase() === "telegram";
+  }
+
+  private stripChannelMetadata(text: string): string {
+    if (!text) return "";
+    const first = this.matchLeadingChannelMetadataBlock(text);
+    if (!first) return text;
+    if (first.label === "Sender") return text.slice(first.length);
+    let out = text.slice(first.length);
+    const sender = this.matchLeadingChannelMetadataBlock(out);
+    if (sender?.label === "Sender" && this.senderMetadataMatchesConversation(first.json, sender.json)) {
+      out = out.slice(sender.length);
+    }
+    return out;
+  }
+
+  private matchLeadingChannelMetadataBlock(text: string):
+    | { label: "Conversation info" | "Sender"; json: string; length: number }
+    | undefined {
+    const match =
+      /^(Conversation info|Sender) \(untrusted metadata\):[ \t]*\r?\n[ \t]*```json[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```[ \t]*(?:[ \t]*\r?\n)*/.exec(text);
+    if (!match) return undefined;
+    return {
+      label: match[1] as "Conversation info" | "Sender",
+      json: match[2],
+      length: match[0].length,
+    };
+  }
+
+  private senderMetadataMatchesConversation(conversationJson: string, senderJson: string): boolean {
+    const conversation = this.parseChannelMetadataJson(conversationJson);
+    const sender = this.parseChannelMetadataJson(senderJson);
+    if (!conversation || !sender) return false;
+    const conversationSenderId = firstString(
+      conversation.sender_id,
+      conversation.senderId,
+      (conversation.sender as any)?.id,
+    );
+    const senderId = firstString(sender.id, sender.sender_id, sender.senderId);
+    return conversationSenderId !== undefined && senderId !== undefined && conversationSenderId === senderId;
+  }
+
+  private parseChannelMetadataJson(json: string): Record<string, unknown> | undefined {
+    try {
+      const parsed = JSON.parse(json);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Treat malformed metadata as non-matching; the leading Conversation
+      // block is still runtime-only, but optional Sender stripping must prove
+      // it belongs to the same wrapper.
+    }
+    return undefined;
   }
 
   /**

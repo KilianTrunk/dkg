@@ -288,20 +288,12 @@ describe('publishJsonLd', () => {
   }, 15000);
 
   it('E2E: async publish with custodial authorAgentAddress lands on-chain with KC.author == that agent', async () => {
-    // Top-of-stack proof that the seal-at-enqueue refactor actually
-    // delivers caller-attested authorship on-chain: a registered
-    // local agent (custodial) signs at enqueue via the daemon's
-    // keystore, the publisher consumes that seal verbatim, and the
-    // chain records the agent's address as KC.author — demonstrably
-    // DIFFERENT from the publisher's own wallet.
+    // Caller-attested authorship: daemon-custodial agent signs at enqueue → publisher consumes verbatim → KC.author == agent (NOT publisher).
     const { agent, store } = await createAgent('AsyncSealE2EBot');
     await agent.createContextGraph({ id: 'async-seal-e2e', name: 'AsyncSealE2E', description: '' });
     await agent.registerContextGraph('async-seal-e2e');
     const root = 'http://example.org/AsyncSealE2EEntity';
 
-    // Same model the sync `assertionFinalize` path uses: register a
-    // custodial agent, daemon holds the key, caller passes the
-    // address only.
     const tenant = await agent.registerAgent('AcmeBikesTenant');
     const publisherAddress = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
     expect(tenant.agentAddress.toLowerCase()).not.toBe(publisherAddress.toLowerCase());
@@ -357,12 +349,7 @@ describe('publishJsonLd', () => {
   }, 60_000);
 
   it('async publish with authorAgentAddress binds the seal to that agent (NOT the publisher\'s wallet)', async () => {
-    // This is the architectural payoff of seal-at-enqueue: the on-chain
-    // KC.author is a registered agent's address, NOT the publisher's
-    // EOA. The agent signs the canonical merkle with the daemon's
-    // custodial key for that agent; the publisher consumes the seal
-    // verbatim. No private key in the API call — same model as
-    // `assertionFinalize`'s `authorAgentAddress`.
+    // Architectural payoff: KC.author is the registered agent, not the publisher's EOA. No private key in the API call.
     const { agent, store } = await createAgent('AsyncSealDistinctAuthorBot');
     await agent.createContextGraph({ id: 'async-seal-distinct', name: 'AsyncSealDistinct', description: '' });
     await agent.registerContextGraph('async-seal-distinct');
@@ -473,11 +460,7 @@ describe('publishJsonLd', () => {
   }, 30_000);
 
   it('async publish attaches a seal to the LiftRequest with merkleRoot == canonicalPublishPayload(resolved slice)', async () => {
-    // Architectural pivot from PR #451 round-4 follow-up: the agent
-    // canonicalizes the resolved workspace slice at enqueue time and
-    // signs the merkle, so KC.author proves a SPECIFIC wallet attested
-    // to THIS data — not "publisher said so." The publisher consumes
-    // the seal verbatim at processNext-time after verifying parity.
+    // Agent canonicalizes + signs at enqueue → publisher verifies + consumes verbatim. Real provenance, not "publisher said so".
     const { agent, store } = await createAgent('AsyncSealParityBot');
     await agent.createContextGraph({ id: 'async-seal-parity', name: 'AsyncSealParity', description: '' });
     await agent.registerContextGraph('async-seal-parity');
@@ -508,11 +491,7 @@ describe('publishJsonLd', () => {
   }, 30_000);
 
   it('async publish on a non-V10 chain enqueues without a seal (no on-chain publish to seal for)', async () => {
-    // Under the seal-at-enqueue model, the agent only builds a seal
-    // when the chain reports V10 readiness AND the CG has an on-chain
-    // numeric id. On a non-V10 environment the on-chain branch is a
-    // no-op anyway, so omitting the seal is correct — the publisher
-    // takes the tentative-only path and never touches KAv10.
+    // Seal only built when chain is V10-ready AND CG has on-chain id. Non-V10 → publisher takes tentative-only path.
     const { agent, store } = await createAgent('AsyncSealNonV10Bot');
     await agent.createContextGraph({ id: 'async-seal-non-v10', name: 'AsyncSealNonV10', description: '' });
     await agent.registerContextGraph('async-seal-non-v10');
@@ -538,11 +517,7 @@ describe('publishJsonLd', () => {
   }, 30_000);
 
   it('async publish on V10 chain attaches a seal (no fallback needed)', async () => {
-    // New semantics: when the chain is V10-ready and the CG is
-    // registered, the agent signs the canonical merkle at enqueue
-    // time and attaches the seal to the LiftRequest. The fallback
-    // flag is then `false` because the publisher consumes the seal
-    // verbatim — no inline mint-and-pray at processNext-time.
+    // V10-ready + CG registered → agent signs canonical merkle at enqueue, publisher consumes verbatim.
     const { agent, store } = await createAgent('AsyncSealBot');
     await agent.createContextGraph({ id: 'async-seal', name: 'AsyncSeal', description: '' });
     await agent.registerContextGraph('async-seal');
@@ -590,21 +565,12 @@ describe('publishJsonLd', () => {
   }, 30_000);
 
   it('async publish accepts preSignedAuthorAttestation and threads it byte-for-byte into LiftRequest.seal', async () => {
-    // Sync parity: caller pre-signs the AuthorAttestation externally
-    // (e.g. self-sovereign agent holds the key off-node) and passes the
-    // resulting seal as bytes. Mirrors sync's `preSignedAuthorAttestation`
-    // shape on `publishFromSharedMemory` / `assertionFinalize`. The agent
-    // layer threads the bytes verbatim into `LiftRequest.seal`; the
-    // publisher's SEAL INTEGRITY PREFLIGHT validates merkle parity at
-    // processNext-time exactly as it does for sync.
+    // Sync parity: caller pre-signs off-node, agent threads bytes verbatim. Publisher preflight validates at processNext.
     const { agent, store } = await createAgent('AsyncSealPreSignedBot');
     await agent.createContextGraph({ id: 'async-seal-presigned', name: 'AsyncSealPreSigned', description: '' });
     await agent.registerContextGraph('async-seal-presigned');
 
-    // Arbitrary bytes — passthrough verification doesn't depend on the
-    // seal being valid against the data. The publisher's preflight
-    // would reject these at processNext-time, but that's a separate
-    // concern from this agent-layer wiring test.
+    // Arbitrary bytes — this test is passthrough wiring, not seal validity.
     const expectedMerkleRoot = new Uint8Array(32).fill(0xab);
     const customAuthor = '0xAaaAAaaaAaaaaaAAAaAaaaaaAAAaaaaAaAaAAaaA';
     const sigR = new Uint8Array(32).fill(0xbb);
@@ -643,11 +609,7 @@ describe('publishJsonLd', () => {
   }, 30_000);
 
   it('async publish rejects preSignedAuthorAttestation + authorAgentAddress as mutually exclusive', async () => {
-    // Sync parity: `assertionFinalize` at dkg-agent.ts:4191-4193 throws
-    // when both `preSignedAuthorAttestation` and `authorAgentAddress`
-    // are supplied. Async enforces the same contract — either the
-    // caller delegates signing to the daemon (custodial keystore path)
-    // OR provides their own signature, never both.
+    // Sync parity: pick one signing path (caller-provided seal OR daemon custodial).
     const { agent } = await createAgent('AsyncSealMutexBot');
     await agent.createContextGraph({ id: 'async-seal-mutex', name: 'AsyncSealMutex', description: '' });
     await agent.registerContextGraph('async-seal-mutex');
@@ -683,13 +645,7 @@ describe('publishJsonLd', () => {
   }, 15_000);
 
   it('async publish supports authorSignTypedData callback for self-sovereign signing (sync parity)', async () => {
-    // The callback path closes the symmetry gap with sync: a registered
-    // self-sovereign agent (caller holds the key off-node) can author
-    // an on-chain publish without the caller having to replicate the
-    // publisher's canonicalization pipeline. The daemon prepares the
-    // EIP-712 typed data over the same canonical bytes the publisher
-    // will see at processNext-time and INVOKES the callback to obtain
-    // the signature.
+    // Self-sovereign agents (caller holds key off-node) sign via callback. Daemon prepares typed data, caller signs.
     const { agent, store } = await createAgent('AsyncSealCallbackBot');
     await agent.createContextGraph({ id: 'async-seal-callback', name: 'AsyncSealCallback', description: '' });
     await agent.registerContextGraph('async-seal-callback');
@@ -730,8 +686,7 @@ describe('publishJsonLd', () => {
       },
     );
 
-    // The daemon-prepared typed data MUST name the self-sovereign agent
-    // as the author so the on-chain author binding matches.
+    // Typed data must name the self-sovereign agent as author for on-chain binding to match.
     expect(typedDataReceived).not.toBeNull();
     expect(typedDataReceived!.message.authorAddress.toLowerCase()).toBe(selfSov.agentAddress.toLowerCase());
 
@@ -741,10 +696,7 @@ describe('publishJsonLd', () => {
     expect(seal).toBeDefined();
     expect(seal?.authorAddress.toLowerCase()).toBe(selfSov.agentAddress.toLowerCase());
 
-    // Recover author from the stored signature using the daemon-built
-    // canonical typed data — proves the callback's signature is what
-    // landed in the seal AND that it binds to the self-sovereign EOA
-    // (NOT the publisher).
+    // Recovered signer must match the self-sovereign EOA, not the publisher.
     const onChainId = (await agent.getContextGraphOnChainId('async-seal-callback')) as string;
     const kav10Address = await (agent as unknown as {
       chain: { getKnowledgeAssetsV10Address(): Promise<string> };
@@ -774,9 +726,7 @@ describe('publishJsonLd', () => {
   }, 30_000);
 
   it('async publish rejects authorSignTypedData without authorAgentAddress', async () => {
-    // A callback alone has no target address to fill into the seal's
-    // `authorAddress` slot. The mutex check fires before
-    // canonicalization to fail fast and clearly.
+    // Callback alone has no address to fill into seal.authorAddress — mutex fail-fast.
     const { agent } = await createAgent('AsyncSealCallbackNoAddrBot');
     await agent.createContextGraph({ id: 'async-seal-cb-noaddr', name: 'AsyncSealCBNoAddr', description: '' });
     await agent.registerContextGraph('async-seal-cb-noaddr');
@@ -804,20 +754,12 @@ describe('publishJsonLd', () => {
   }, 15_000);
 
   it('E2E: async publish via authorSignTypedData callback lands on-chain with KC.author == self-sovereign agent', async () => {
-    // Top-of-stack proof for the self-sovereign callback path: a
-    // registered SELF-SOVEREIGN agent (caller holds the private key
-    // off-node) signs the daemon-prepared canonical merkle via the
-    // `authorSignTypedData` callback, the publisher consumes the
-    // seal verbatim, and the chain records the self-sovereign agent's
-    // address as KC.author — distinct from both the publisher's
-    // wallet AND any custodial agent the daemon might also hold.
+    // Self-sovereign callback path E2E: caller signs off-node, publisher consumes verbatim, KC.author == self-sov agent.
     const { agent, store } = await createAgent('AsyncCallbackE2EBot');
     await agent.createContextGraph({ id: 'async-cb-e2e', name: 'AsyncCBE2E', description: '' });
     await agent.registerContextGraph('async-cb-e2e');
 
-    // Self-sovereign registration: only the public key is on this
-    // node; the private key lives in `externallyHeld` (simulating
-    // a hardware wallet / browser extension / off-node KMS).
+    // Self-sovereign: daemon only has the public key; `externallyHeld` simulates an off-node KMS.
     const externallyHeld = ethers.Wallet.createRandom();
     const publicKeyCompressed = ethers.SigningKey.computePublicKey(externallyHeld.signingKey.publicKey, true);
     const selfSov = await agent.registerAgent('SelfSovE2E', { publicKey: publicKeyCompressed });
@@ -883,12 +825,7 @@ describe('publishJsonLd', () => {
   }, 60_000);
 
   it('async publish threads opts.priorVersion into LiftRequest.priorVersion', async () => {
-    // Parity gap closure: `priorVersion` already exists at the
-    // LiftRequest layer and is validated by `mapLiftRequestToPublishOptions`
-    // but was never surfaced on the agent-level `PublishAsyncOpts`. This
-    // confirms a caller-supplied prior-version reference threads through
-    // enqueue unchanged so the canonical handoff sees the same value
-    // validation expects.
+    // `priorVersion` threads through enqueue unchanged for MUTATE/REVOKE transitions.
     const { agent, store } = await createAgent('AsyncPriorVerBot');
     await agent.createContextGraph({ id: 'async-priorver', name: 'AsyncPriorVer', description: '' });
     await agent.registerContextGraph('async-priorver');
@@ -917,9 +854,7 @@ describe('publishJsonLd', () => {
   }, 15_000);
 
   it('async publish threads opts.entityProofs into LiftRequest.entityProofs', async () => {
-    // Selective-disclosure mode (sync parity with PublishOptions.entityProofs).
-    // Confirms the flag persists through enqueue so the publisher's
-    // canonical-publish pipeline groups quads per-entity at processNext-time.
+    // V10 selective-disclosure flag persists through enqueue.
     const { agent, store } = await createAgent('AsyncEntityProofsBot');
     await agent.createContextGraph({ id: 'async-entity-proofs', name: 'AsyncEntityProofs', description: '' });
     await agent.registerContextGraph('async-entity-proofs');
@@ -946,11 +881,7 @@ describe('publishJsonLd', () => {
   }, 15_000);
 
   it('async publish threads opts.publisherNodeIdentityIdOverride (bigint) into LiftRequest (stringified)', async () => {
-    // RFC-001 §4 per-publish attribution override (sync parity with
-    // PublishOptions.publisherNodeIdentityIdOverride). Lift queue
-    // persists via JSON-stringify so bigints are serialized as
-    // template-literal strings; the mapper parses back to bigint at
-    // the lift→publish handoff.
+    // RFC-001 §4 attribution override. BigInt → string for JSON persistence; mapper parses back.
     const { agent, store } = await createAgent('AsyncNodeIdOverrideBot');
     await agent.createContextGraph({ id: 'async-node-id-override', name: 'AsyncNodeIdOverride', description: '' });
     await agent.registerContextGraph('async-node-id-override');
@@ -977,10 +908,7 @@ describe('publishJsonLd', () => {
   }, 15_000);
 
   it('async publish preserves publisherNodeIdentityIdOverride === 0n (mode d "no attribution")', async () => {
-    // RFC-001 §4 mode d: explicit `0n` means "no attribution".
-    // Distinct from `undefined` (use daemon's persistent identity).
-    // The opts wiring uses `!== undefined` instead of truthy check so
-    // `0n` survives.
+    // RFC-001 §4 mode d: explicit `0n` survives (≠ undefined which means "use daemon identity").
     const { agent, store } = await createAgent('AsyncNodeIdZeroBot');
     await agent.createContextGraph({ id: 'async-node-id-zero', name: 'AsyncNodeIdZero', description: '' });
     await agent.registerContextGraph('async-node-id-zero');
@@ -1007,14 +935,7 @@ describe('publishJsonLd', () => {
   }, 15_000);
 
   it('async publish enqueues sealless when no signer is available (sync parity)', async () => {
-    // Codex PR #455 follow-up rounds 1 & 2: chain-prereq failures (no
-    // signer configured, CG not on-chain) downgrade to a sealless
-    // enqueue + warning instead of failing fast — mirroring sync
-    // `_publish` at `dkg-agent.ts:4047`. The publisher's gate at
-    // `dkg-publisher.ts:1825` skips on-chain (tentative) when the CG
-    // is not on-chain, and the V10 path's seal check at
-    // `dkg-publisher.ts:1955` returns a clear error when it is. The
-    // failure mode is the publisher's call, not enqueue's.
+    // Chain-prereq failures downgrade to sealless enqueue. Publisher decides at processNext.
     const { agent, store } = await createAgent('AsyncSealNoSigner');
     await agent.createContextGraph({ id: 'async-no-signer', name: 'AsyncNoSigner', description: '' });
     await agent.registerContextGraph('async-no-signer');
@@ -1046,21 +967,9 @@ describe('publishJsonLd', () => {
   }, 15_000);
 
   it('async publish does NOT pass cgId to publisher fallback methods (matches sync assertionFinalize behavior)', async () => {
-    // Codex PR #455 comment 3 asked us to thread `onChainId` into
-    // `publisherFallbackAuthorAddress` / `signAuthorAttestationAsPublisher`
-    // for per-CG resolver parity with `DKGPublisher.publish()`. We
-    // intentionally DON'T — and this test pins that decision so a
-    // future refactor doesn't silently re-introduce the broken state.
-    //
-    // Reasoning: threading cgId surfaces a latent divergence in
-    // `getPublisherSigner` where `signTypedData` falls back to the
-    // chain adapter's default signer when `signTypedDataAs` is
-    // missing — producing seals whose recovered signer doesn't match
-    // the recorded `authorAddress`. The deeper fix (signTypedData
-    // recovery+verify in `getPublisherSigner`, mirroring the existing
-    // signMessage path) lives in the publisher, not the agent, and
-    // is out of scope for this PR. Sync `assertionFinalize` also
-    // does not thread cgId — async stays consistent with sync.
+    // Pins sync `assertionFinalize` parity. Threading cgId surfaces a publisher-side
+    // `signTypedData` fallback bug (recovers chain default, not the recorded author).
+    // Fix lives in the publisher, not the agent — out of scope for this PR.
     const { agent } = await createAgent('AsyncSyncParityBot');
     await agent.createContextGraph({ id: 'async-sync-parity', name: 'AsyncSyncParity', description: '' });
     await agent.registerContextGraph('async-sync-parity');
@@ -1098,10 +1007,7 @@ describe('publishJsonLd', () => {
         },
         { localOnly: true },
       );
-      // Both methods called at least once with undefined cgId (no
-      // CG-aware resolution). Future PR threading cgId properly will
-      // need to update this expectation in lockstep with a fix for
-      // the underlying signer-fallback bug.
+      // Both methods called with undefined cgId — pinned until the publisher-side fallback fix lands.
       expect(fallbackCalls).toContain(undefined);
       expect(signCalls).toContain(undefined);
     } finally {
@@ -1111,15 +1017,7 @@ describe('publishJsonLd', () => {
   }, 30_000);
 
   it('async publish enqueues sealless when CG is not registered on-chain (sync parity)', async () => {
-    // Codex PR #455 follow-up rounds 1 & 2:
-    //
-    //   Sync `agent.publish` skips seal-build when the CG has no
-    //   on-chain id (`dkg-agent.ts:_publish`); the publisher then
-    //   skips on-chain at `dkg-publisher.ts:1825` ("No positive on-chain
-    //   context graph id resolved...") and goes tentative. Async must
-    //   mirror this: enqueue without seal, let the publisher decide
-    //   tentative-or-fail at processNext-time. Failing fast at enqueue
-    //   would block legitimate tentative-only workflows.
+    // CG without on-chain id → no seal, publisher goes tentative (matches sync `agent.publish`).
     const { agent, store } = await createAgent('AsyncNoOnChainBot');
     await agent.createContextGraph({ id: 'async-no-onchain', name: 'AsyncNoOnChain', description: '' });
     // Intentionally skip registerContextGraph so the CG has no on-chain id.
@@ -1143,18 +1041,8 @@ describe('publishJsonLd', () => {
   }, 15_000);
 
   it('async publish seal reflects subtracted set when canonical root already confirmed (codex PR #455 #3)', async () => {
-    // Codex PR #455 follow-up review #1 + #3: the publisher runs
-    // `subtractFinalizedExactQuads` between validation and merkle
-    // compute at processNext-time. The agent must apply the SAME
-    // subtraction at enqueue so both sides compute the same merkle.
-    //
-    // Observable test: pre-populate the meta-graph + data-graph with
-    // confirmed state matching the canonical root the agent will
-    // compute, then publishAsync the same root/triple. If the agent's
-    // pipeline invokes subtraction, the buildAsyncLiftSeal full-overlap
-    // short-circuit triggers and the enqueued job has no seal. If
-    // subtraction is removed, the agent signs over the full pre-
-    // subtraction slice and the job carries a seal.
+    // Agent must mirror publisher's `subtractFinalizedExactQuads` so both compute the same merkle.
+    // Pre-populate confirmed state matching the canonical root; publishAsync same root → full overlap → seal undefined.
     const { agent, store } = await createAgent('AsyncSubtractObserve');
     await agent.createContextGraph({ id: 'async-subtract-observe', name: 'AsyncSubtractObs', description: '' });
     await agent.registerContextGraph('async-subtract-observe');

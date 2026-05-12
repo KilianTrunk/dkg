@@ -4437,11 +4437,7 @@ export class DKGAgent {
       throw new ContextGraphNotFoundError(contextGraphId);
     }
 
-    // Validate caller-controlled options BEFORE writeToWorkspace and
-    // private staging, so a rejected publishAsync leaves no orphan data
-    // in SWM. Mutex (preSigned + authorAgentAddress/authorSignTypedData)
-    // and registered-agent checks are pure input validation — they
-    // don't need the staged data to evaluate.
+    // Validate caller-controlled options before workspace staging so a rejected publishAsync leaves no orphan data.
     if (opts?.preSignedAuthorAttestation !== undefined) {
       if (opts?.authorAgentAddress !== undefined) {
         throw new Error('publishAsync: preSignedAuthorAttestation and authorAgentAddress are mutually exclusive');
@@ -4537,40 +4533,17 @@ export class DKGAgent {
         : undefined,
     } as const;
 
-    // Sync parity (`_publish` at `dkg-agent.ts:4047`): chain-prereq failures
-    // (CG not on-chain, no signer configured, etc.) downgrade to a sealless
-    // enqueue + warning, never a hard error. The publisher gate at
-    // `dkg-publisher.ts:1825` skips on-chain when the CG is not on-chain
-    // (goes tentative); when it IS on-chain it rejects sealless V10
-    // publishes with a clear error at processNext-time. Either way, the
-    // failure mode is the publisher's call, not enqueue's.
+    // Seal-build: caller-callback errors propagate; daemon-internal misses degrade to sealless (sync `_publish` parity).
     let seal: LiftRequestAuthorSeal | undefined;
     if (opts?.preSignedAuthorAttestation) {
       seal = preSignedAttestationToLiftSeal(opts.preSignedAuthorAttestation);
     } else if (opts?.authorSignTypedData !== undefined) {
-      // Caller-supplied signing callback (wallet, HSM, etc.) — propagate
-      // signing errors so the publisher API caller learns immediately
-      // rather than discovering the failure later as a tentative job.
-      // Chain-prereq misses (CG not on-chain) still degrade quietly:
-      // buildAsyncLiftSeal returns `undefined` for those before reaching
-      // the callback. Only the callback's own errors escape here.
       seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, opts.authorSignTypedData);
     } else {
-      // Daemon-internal signing (custodial agent or publisher fallback).
-      // Mirror sync `_publish` at `dkg-agent.ts:4047` — chain-prereq
-      // failures degrade to a sealless enqueue + warning. The publisher
-      // gate at `dkg-publisher.ts:1825` skips on-chain when the CG is
-      // not on-chain (tentative); when it IS on-chain it rejects
-      // sealless V10 publishes with a clear error at processNext-time.
       try {
         seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, undefined);
       } catch (err) {
-        this.log.warn(
-          ctx,
-          `Async seal mint failed; on-chain publish will fall back to tentative: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+        this.log.warn(ctx, `Async seal mint failed; on-chain publish will fall back to tentative: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -4613,12 +4586,8 @@ export class DKGAgent {
     if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
 
     const onChainId = await this.getContextGraphOnChainId(request.contextGraphId);
-    // Sync parity: when CG is not on-chain, the publisher's V10 gate
-    // (`dkg-publisher.ts:1825`) skips on-chain and goes tentative. Return
-    // undefined so the lift job enqueues sealless — publisher decides at
-    // processNext-time whether to go tentative or reject (when CG gets
-    // registered before processNext but no seal was built at enqueue).
-    if (onChainId == null) return undefined;
+    if (onChainId == null) return undefined; // CG not on-chain — publisher goes tentative
+
 
     const chainId = await this.chain.getEvmChainId();
     const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
@@ -4659,11 +4628,7 @@ export class DKGAgent {
       subtracted.resolved.privateQuads ?? [],
     );
 
-    // Resolve author (callback → custodial keystore → publisher fallback).
-    // User-input cases (bogus / self-sovereign authorAgentAddress) are
-    // already pre-validated at the publishAsync entry; here we only need
-    // the chain-prereq branch — when no signer is available we return
-    // undefined so the lift enqueues sealless (matches sync `_publish`).
+    // Resolve author: callback → custodial keystore → publisher fallback. User-input pre-validated in publishAsync entry.
     let authorAddress: string;
     let signerPrivateKey: string | undefined;
     if (authorSignTypedData !== undefined) {
@@ -6538,7 +6503,7 @@ export class DKGAgent {
         writeLocks: this.writeLocks,
         localAgentAddresses: () => [...this.localAgents.keys()],
         workspaceRecipientPrivateKeys: () => this.getLocalWorkspaceRecipientPrivateKeys(),
-        workspaceSenderKeyDecryptor: (message, contextGraphId, ctx) =>
+        workspaceSenderKeyDecryptor: (message: SwmSenderKeyMessageMsg, contextGraphId: string, ctx: OperationContext) =>
           this.decryptWorkspacePayloadWithSenderKey(message, contextGraphId, ctx),
       });
     }

@@ -407,13 +407,7 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
         error: "Missing required enqueue fields",
       });
     }
-    // V10 sign-at-enqueue extensions (PR #455). The HTTP route is the
-    // low-level lift API; callers that need a sealed on-chain publish
-    // must build the EIP-712 AuthorAttestation themselves (via
-    // `buildAuthorAttestationTypedData` + their own signer) and pass it
-    // here. Sealless enqueues are accepted; the publisher gate at
-    // `dkg-publisher.ts:1825` skips on-chain (tentative) when the CG
-    // is not on-chain, and rejects with a clear error when it is.
+    // V10 sign-at-enqueue: callers build the EIP-712 AuthorAttestation themselves and pass it as `seal`. Sealless enqueues fall back to tentative.
     const jobId = await publisherControl.lift({
       swmId,
       shareOperationId,
@@ -427,8 +421,7 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
       ...(subGraphName ? { subGraphName } : {}),
       ...(accessPolicy ? { accessPolicy } : {}),
       ...(Array.isArray(allowedPeers) && allowedPeers.length > 0 ? { allowedPeers } : {}),
-      // Strict boolean at HTTP boundary — `!!"false"` is `true`, which
-      // would silently invert caller intent. Other types are ignored.
+      // Strict boolean — `!!"false"` is `true`, silently inverting intent.
       ...(typeof entityProofs === 'boolean' ? { entityProofs } : {}),
       ...(publisherNodeIdentityIdOverride !== undefined
         ? { publisherNodeIdentityIdOverride: String(publisherNodeIdentityIdOverride) }

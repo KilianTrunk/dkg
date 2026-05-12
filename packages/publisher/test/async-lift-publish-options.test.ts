@@ -421,9 +421,7 @@ describe('mapLiftRequestToPublishOptions', () => {
   });
 
   it('forwards request.entityProofs to PublishOptions.entityProofs (overrides resolved.entityProofs)', () => {
-    // Caller intent persisted at enqueue (`request.entityProofs`)
-    // takes precedence over per-process resolution defaults
-    // (`resolved.entityProofs`).
+    // Caller intent at enqueue (`request`) > per-process resolution defaults (`resolved`).
     const options = mapLiftRequestToPublishOptions({
       ...baseInput(),
       request: {
@@ -455,9 +453,7 @@ describe('mapLiftRequestToPublishOptions', () => {
   });
 
   it('parses request.publisherNodeIdentityIdOverride (stringified bigint) into PublishOptions (bigint)', () => {
-    // RFC-001 §4 attribution override: the lift queue persists bigints
-    // as template-literal strings (`${bigint}`) so JSON round-trips
-    // safely. The mapper parses back to native bigint.
+    // BigInt persisted as `${bigint}` for JSON safety; mapper parses back.
     const options = mapLiftRequestToPublishOptions({
       ...baseInput(),
       request: {

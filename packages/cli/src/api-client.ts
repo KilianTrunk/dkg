@@ -538,10 +538,7 @@ export class ApiClient {
     subGraphName?: string;
     accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
     allowedPeers?: string[];
-    // V10 sign-at-enqueue extensions (PR #455). When `seal` is absent on a
-    // V10-ready node, the publisher skips on-chain at processNext and goes
-    // tentative; supply it to attest authorship via the EIP-712
-    // `AuthorAttestation` typed-data binding.
+    // V10 sign-at-enqueue. Absent `seal` → tentative; supply for on-chain attestation.
     entityProofs?: boolean;
     /** Stringified bigint; `'0'` = mode d (no attribution) per RFC-001 §4. */
     publisherNodeIdentityIdOverride?: string;

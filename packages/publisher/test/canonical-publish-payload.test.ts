@@ -1,14 +1,4 @@
-// Tracer bullet for the agent ↔ publisher canonicalization parity work.
-//
-// The fix for the EPCIS author-seal regression requires that
-// `agent.publishAsync` compute the EXACT same `kcMerkleRoot` that
-// `publisher.publish` would compute at process-time, so the agent
-// can sign the merkle once with the author's wallet and the
-// publisher consumes the seal verbatim. Any drift between the two
-// canonicalizations breaks every async publish seal.
-//
-// The way to guarantee parity is "one function, two callers." This
-// test pins the contract of the shared helper.
+// Pins the agent ↔ publisher canonicalization parity contract — one function, two callers.
 
 import { describe, expect, it } from 'vitest';
 import { ethers } from 'ethers';

@@ -300,10 +300,10 @@ describe('V10 E2E Conviction System', function () {
   //      kcId) (N20)
   //   9. CG value ledger written via
   //      ContextGraphValueStorage.addCGValueForEpochRange (N20, Phase 1)
-  //  10. Double-count guard: staker pool delta across the publish window
-  //      is EXACTLY ZERO (Phase 1+6+8 critical invariant — T1.1 covers the
-  //      same check from the unit fixture; this e2e test re-verifies it
-  //      through the legacy-PCA fixture to make sure the two coexist)
+  //  10. Active-sink distribution: ONE `TokensAddedToEpochRange` event is
+  //      emitted for `discountedCost` over the KC's epoch range. The NFT
+  //      is the funding agent on the conviction branch — KAV10 MUST NOT
+  //      call `_distributeTokens` (no double-count).
   //  11. KC retrieval through the KCS public reader
   // ========================================================================
   describe('Flow 3: V10 Publish via Conviction NFT + Context Graphs', function () {
@@ -433,22 +433,21 @@ describe('V10 E2E Conviction System', function () {
       // N17 sanity: open CG authorizes the paying principal (creator).
       expect(await CGFacade.isAuthorizedPublisher(cgId, creator.address)).to.be.true;
 
-      // ---- Step 4: Snapshot staker pool across publish window BEFORE publish ----
+      // ---- Step 4: Compute expected active-sink distribution ----
       //
-      // Conviction-path publish MUST NOT write to EpochStorage — Phase 6
-      // createAccount already wrote the full allowance. This pool snapshot
-      // captures the post-createAccount baseline; the post-publish snapshot
-      // must match it exactly (delta == 0 per epoch).
+      // V10 lazy-settlement model: conviction-path publish funds the KC's
+      // epoch range with `discountedCost = tokenAmount * (1 - discountBps/1e4)`
+      // through the NFT's `coverPublishingCost` → `addTokensToEpochRange`.
+      // For COMMITTED_TRAC = 50K, discountBps = 2000 (20%), so the active
+      // sink discounts `tokenAmount` by 20%. KAV10 MUST NOT call
+      // `_distributeTokens` on this branch (double-count guard).
       const currentEpoch = await Chronos.getCurrentEpoch();
       const tokenAmount = ethers.parseEther('1000');
       const epochs = 2;
+      const expectedDiscountBps = 2000n;
+      const expectedDiscounted =
+        (tokenAmount * (10_000n - expectedDiscountBps)) / 10_000n;
       const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('flow3-merkle'));
-      const poolsBefore: bigint[] = [];
-      for (let i = 0n; i <= BigInt(epochs); i++) {
-        poolsBefore.push(
-          await EpochStorageContract.getEpochPool(STAKER_SHARD_ID, currentEpoch + i),
-        );
-      }
 
       // ---- Step 5: Build V10 publish params (N26 + H5 + post-BLOCKER-1 ACK) ----
       const p = await buildPublishParams({
@@ -469,9 +468,50 @@ describe('V10 E2E Conviction System', function () {
       });
 
       // ---- Step 6: publish() (conviction path) ----
+      //
+      // Capture the receipt so we can count `TokensAddedToEpochRange`
+      // emits from EpochStorage. Exactly ONE such event must fire for
+      // the discounted amount on the KC's epoch range — a regression
+      // that re-enables `_distributeTokens` on the conviction branch
+      // would produce a SECOND emit, which we explicitly forbid below.
       const tx = await KAV10.connect(creator).publish(p);
       const receipt = await tx.wait();
       expect(receipt!.status).to.equal(1);
+
+      const epochStorageAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+      type ParsedTokensAdded = {
+        shardId: bigint;
+        startEpoch: bigint;
+        endEpoch: bigint;
+        tokenAmount: bigint;
+      };
+      const tokensAddedEvents: ParsedTokensAdded[] = [];
+      for (const log of receipt!.logs) {
+        if (log.address.toLowerCase() !== epochStorageAddr) continue;
+        try {
+          const parsed = EpochStorageContract.interface.parseLog({
+            topics: [...log.topics],
+            data: log.data,
+          });
+          if (parsed?.name === 'TokensAddedToEpochRange') {
+            tokensAddedEvents.push({
+              shardId: BigInt(parsed.args.shardId),
+              startEpoch: BigInt(parsed.args.startEpoch),
+              endEpoch: BigInt(parsed.args.endEpoch),
+              tokenAmount: BigInt(parsed.args.tokenAmount),
+            });
+          }
+        } catch {
+          // not the event we're after
+        }
+      }
+      // Double-count guard: exactly one active-sink emission.
+      expect(tokensAddedEvents).to.have.length(1);
+      const sink = tokensAddedEvents[0];
+      expect(sink.shardId).to.equal(STAKER_SHARD_ID);
+      expect(sink.startEpoch).to.equal(currentEpoch);
+      expect(sink.endEpoch).to.equal(currentEpoch + BigInt(epochs) - 1n);
+      expect(sink.tokenAmount).to.equal(expectedDiscounted);
 
       // ---- Step 7: KC registered in KCS; publisher of record is msg.sender ----
       const kcId = 1n;
@@ -511,15 +551,14 @@ describe('V10 E2E Conviction System', function () {
       const cgValueNow = await CGV.getCurrentCGValue(cgId);
       expect(cgValueNow).to.equal(tokenAmount / BigInt(epochs));
 
-      // ---- Step 10: Double-count guard — pool deltas all zero ----
-      for (let i = 0n; i <= BigInt(epochs); i++) {
-        const after = await EpochStorageContract.getEpochPool(
-          STAKER_SHARD_ID,
-          currentEpoch + i,
-        );
-        const delta = after - poolsBefore[Number(i)];
-        expect(delta, `epoch +${i} delta must be 0 (double-count guard)`).to.equal(0n);
-      }
+      // ---- Step 10: Double-count guard already pinned at Step 6 ----
+      //
+      // The `tokensAddedEvents.length == 1` assertion at Step 6 is the
+      // active-sink + double-count guard for the conviction branch:
+      // exactly one `TokensAddedToEpochRange` is emitted, for the
+      // discounted cost over the KC's epoch range. A regression that
+      // re-enables `_distributeTokens` on this branch would push the
+      // count to 2 and fail.
 
       // ---- Step 11: KC retrieval via public reader ----
       const retrievedKc = await KnowledgeCollectionStorage.getKnowledgeCollection(kcId);

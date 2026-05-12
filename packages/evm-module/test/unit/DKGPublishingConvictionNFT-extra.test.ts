@@ -233,8 +233,14 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       await advanceToTimestamp(expiresAtTs);
 
       const baseCost = hre.ethers.parseEther('100');
+      const currentEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
-        NFT.connect(kav10).coverPublishingCost(agent.address, baseCost),
+        NFT.connect(kav10).coverPublishingCost(
+          agent.address,
+          baseCost,
+          currentEpoch,
+          BigInt(LOCK_DURATION),
+        ),
       )
         .to.be.revertedWithCustomError(NFT, 'AccountExpired')
         .withArgs(acctId, expiresAt);
@@ -249,8 +255,14 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       await advanceToTimestamp(expiresAtTs + 3n);
 
       const baseCost = hre.ethers.parseEther('100');
+      const currentEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
-        NFT.connect(kav10).coverPublishingCost(agent.address, baseCost),
+        NFT.connect(kav10).coverPublishingCost(
+          agent.address,
+          baseCost,
+          currentEpoch,
+          BigInt(LOCK_DURATION),
+        ),
       )
         .to.be.revertedWithCustomError(NFT, 'AccountExpired')
         .withArgs(acctId, expiresAt);
@@ -267,13 +279,14 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       const bufferBefore = await NFT.topUpBalance(acctId);
       const spentBefore = await NFT.epochSpent(acctId, 0n);
 
-      // Post-expiry coverPublishingCost reverts with
-      // `AccountExpired(accountId, expiresAtEpoch)`. Pinning both the error
-      // selector and its args catches regressions that accidentally ingest
-      // token value at or past the expiry boundary (the exact class of
-      // bug the no-op-on-failure assertions below guard against).
+      const currentEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
-        NFT.connect(kav10).coverPublishingCost(agent.address, hre.ethers.parseEther('10')),
+        NFT.connect(kav10).coverPublishingCost(
+          agent.address,
+          hre.ethers.parseEther('10'),
+          currentEpoch,
+          BigInt(LOCK_DURATION),
+        ),
       )
         .to.be.revertedWithCustomError(NFT, 'AccountExpired')
         .withArgs(acctId, expiresAt);
@@ -285,18 +298,15 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
     it('SANITY: coverPublishingCost in-lifetime (epoch < expiresAt) succeeds', async () => {
       const { kav10, agent, acctId } = await setupWithKAV10Signer();
       const info = await NFT.getAccountInfo(acctId);
-      const expiresAt = BigInt(info.expiresAtEpoch);
       const expiresAtTs = BigInt(info.expiresAtTimestamp);
 
       // Keep enough headroom so the transaction-mined block cannot cross expiry.
       await advanceToTimestamp(expiresAtTs - 10n);
 
       const baseCost = hre.ethers.parseEther('10');
-      // Compute the expected discounted cost from the on-chain discountBps
-      // so this check pins the exact event payload: if a future change
-      // changes the discount formula, drawnFromEpoch, or drops any arg,
-      // this fails. CostCovered(id, epoch, baseCost, discountedCost,
-      // drawnFromEpoch, drawnFromTopUp).
+      // Pin the exact event payload so a future change to the discount
+      // formula, drawnFromEpoch, or arg list fails loudly. CostCovered(id,
+      // epoch, baseCost, discountedCost, drawnFromEpoch, drawnFromTopUp).
       const BPS_DENOMINATOR = 10_000n;
       const discountBps = BigInt(info.discountBps);
       const expectedDiscounted =
@@ -304,7 +314,12 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       const currentEpoch = await ChronosContract.getCurrentEpoch();
 
       await expect(
-        NFT.connect(kav10).coverPublishingCost(agent.address, baseCost),
+        NFT.connect(kav10).coverPublishingCost(
+          agent.address,
+          baseCost,
+          currentEpoch,
+          BigInt(LOCK_DURATION),
+        ),
       )
         .to.emit(NFT, 'CostCovered')
         .withArgs(
@@ -312,8 +327,8 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
           currentEpoch,
           baseCost,
           expectedDiscounted,
-          expectedDiscounted, // drawnFromEpoch: fully covered from baseAllowance
-          0n, // drawnFromTopUp: no buffer used
+          expectedDiscounted,
+          0n,
         );
     });
 
@@ -332,15 +347,22 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
         await advanceToTimestamp(
           BigInt(info.createdAtTimestamp) + delta * epochLength,
         );
+        const currentEpoch = await ChronosContract.getCurrentEpoch();
         await expect(
-          NFT.connect(kav10).coverPublishingCost(agent.address, 1n),
+          NFT.connect(kav10).coverPublishingCost(
+            agent.address,
+            1n,
+            currentEpoch,
+            1n,
+          ),
         ).to.not.be.reverted;
       }
 
       // Then exactly at expiry timestamp it MUST revert.
       await advanceToTimestamp(BigInt(info.expiresAtTimestamp));
+      const finalEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
-        NFT.connect(kav10).coverPublishingCost(agent.address, 1n),
+        NFT.connect(kav10).coverPublishingCost(agent.address, 1n, finalEpoch, 1n),
       ).to.be.revertedWithCustomError(NFT, 'AccountExpired');
     });
   });

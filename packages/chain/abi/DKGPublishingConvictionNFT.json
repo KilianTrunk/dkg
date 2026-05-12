@@ -16,6 +16,17 @@
         "internalType": "uint256",
         "name": "accountId",
         "type": "uint256"
+      }
+    ],
+    "name": "AccountAlreadyFullySettled",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "accountId",
+        "type": "uint256"
       },
       {
         "internalType": "uint40",
@@ -233,6 +244,22 @@
     "inputs": [
       {
         "internalType": "uint256",
+        "name": "lockDurationEpochs",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "kcEpochs",
+        "type": "uint256"
+      }
+    ],
+    "name": "InvalidConvictionKcEpochs",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
         "name": "configuredEpochs",
         "type": "uint256"
       }
@@ -356,6 +383,31 @@
       }
     ],
     "name": "AccountCreated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "accountId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint96",
+        "name": "topUpSwept",
+        "type": "uint96"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint96",
+        "name": "dustSwept",
+        "type": "uint96"
+      }
+    ],
+    "name": "AccountFinalSwept",
     "type": "event"
   },
   {
@@ -540,6 +592,43 @@
     "type": "event"
   },
   {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "accountId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint40",
+        "name": "windowIndex",
+        "type": "uint40"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint40",
+        "name": "startChainEpoch",
+        "type": "uint40"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint40",
+        "name": "endChainEpoch",
+        "type": "uint40"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint96",
+        "name": "remainderSwept",
+        "type": "uint96"
+      }
+    ],
+    "name": "WindowSettled",
+    "type": "event"
+  },
+  {
     "inputs": [],
     "name": "BPS_DENOMINATOR",
     "outputs": [
@@ -609,6 +698,16 @@
         "internalType": "uint16",
         "name": "discountBps",
         "type": "uint16"
+      },
+      {
+        "internalType": "uint16",
+        "name": "lastSettledWindow",
+        "type": "uint16"
+      },
+      {
+        "internalType": "bool",
+        "name": "fullySwept",
+        "type": "bool"
       }
     ],
     "stateMutability": "view",
@@ -694,6 +793,16 @@
         "internalType": "uint96",
         "name": "baseCost",
         "type": "uint96"
+      },
+      {
+        "internalType": "uint40",
+        "name": "kcStartEpoch",
+        "type": "uint40"
+      },
+      {
+        "internalType": "uint40",
+        "name": "kcEpochs",
+        "type": "uint40"
       }
     ],
     "name": "coverPublishingCost",
@@ -840,6 +949,16 @@
         "internalType": "uint256",
         "name": "agentCount",
         "type": "uint256"
+      },
+      {
+        "internalType": "uint16",
+        "name": "lastSettledWindow",
+        "type": "uint16"
+      },
+      {
+        "internalType": "bool",
+        "name": "fullySwept",
+        "type": "bool"
       }
     ],
     "stateMutability": "view",
@@ -1191,6 +1310,19 @@
       }
     ],
     "name": "setMaxAgentsPerAccount",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "accountId",
+        "type": "uint256"
+      }
+    ],
+    "name": "settle",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

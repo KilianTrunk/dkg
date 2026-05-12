@@ -196,7 +196,6 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
     error ZeroAddressDependency(string name);
     error ZeroContextGraphId();
     error ZeroEpochs();
-    error InvalidPublishingConvictionEpochs(uint256 expectedEpochs, uint256 providedEpochs);
 
     // --- RFC-001 author attestation errors ---
 
@@ -331,10 +330,15 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
      *
      * - **Discount branch** — taken when `msg.sender` is registered as an
      *   agent on any active publisher conviction account
-     *   (`agentToAccountId[msg.sender] != 0`). TRAC was already written into
-     *   `EpochStorage.addTokensToEpochRange` at `createAccount` time, so
-     *   this branch MUST NOT call `_distributeTokens` — doing so would
-     *   double-count TRAC in the staker reward pool.
+     *   (`agentToAccountId[msg.sender] != 0`). The NFT contract is the
+     *   funding agent on this branch: `coverPublishingCost` deducts the
+     *   discounted cost from the account's current billing-window budget
+     *   (or top-up buffer), distributes that cost across the published KC's
+     *   epoch range via `EpochStorage.addTokensToEpochRange` (active sink),
+     *   and lazily settles any elapsed billing windows by sweeping their
+     *   unspent base remainder to the staker pool (passive sink). KAv10
+     *   therefore MUST NOT call `_distributeTokens` here — the NFT has
+     *   already accounted for staker rewards directly.
      *
      * - **Direct-spend branch** — taken otherwise. Pulls TRAC from
      *   `msg.sender`'s wallet via `transferFrom` and distributes it across
@@ -357,18 +361,19 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
 
         uint256 convictionAccountId = publishingConvictionNFT.agentToAccountId(msg.sender);
         if (convictionAccountId != 0) {
-            (, , , , , uint16 lockDurationEpochs, ) = publishingConvictionNFT.accounts(
-                convictionAccountId
+            // Discount branch. The NFT auto-resolves the paying account from
+            // `agentToAccountId[msg.sender]`, enforces `p.epochs <=
+            // lockDurationEpochs` internally, deducts the discounted cost,
+            // distributes it across the KC's epoch range (active sink), and
+            // lazily settles any elapsed billing windows (passive sink).
+            // KAv10 MUST NOT call `_distributeTokens` here — the NFT is the
+            // funding agent on this branch.
+            publishingConvictionNFT.coverPublishingCost(
+                msg.sender,
+                p.tokenAmount,
+                currentEpoch,
+                uint40(p.epochs)
             );
-            if (p.epochs > uint256(lockDurationEpochs)) {
-                revert InvalidPublishingConvictionEpochs(lockDurationEpochs, p.epochs);
-            }
-
-            // Discount branch. NFT auto-resolves the paying account from
-            // `agentToAccountId[msg.sender]` inside `coverPublishingCost`
-            // and emits `CostCovered` with full detail for off-chain
-            // accounting. Discounted amount is discarded here.
-            publishingConvictionNFT.coverPublishingCost(msg.sender, p.tokenAmount);
         } else {
             // Direct-spend branch. `transferFrom(msg.sender, CSS, fullCost)`
             // + epoch-range distribution. The named core (if non-zero) still
@@ -843,9 +848,11 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
      * Metadata-only updates (`delta == 0`) bypass `coverPublishingCost`
      * entirely — no conviction spend, no zero-value NFT hop.
      *
-     * Double-count prevention (same reasoning as `publish`): conviction-path
-     * TRAC was already distributed by the NFT's `createAccount` /`topUp` at
-     * lock time, so this path MUST NOT call `_addTokens` / `_distributeTokens`.
+     * Double-count prevention (same reasoning as `publish`): on the
+     * conviction branch the NFT's `coverPublishingCost` directly distributes
+     * `deltaTokenAmount` across the KC's remaining epoch range (active
+     * sink) and lazily sweeps elapsed window remainders (passive sink), so
+     * this path MUST NOT call `_addTokens` / `_distributeTokens`.
      *
      * @param p Update parameters (see `UpdateParams` struct).
      */
@@ -863,7 +870,18 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
         if (deltaTokenAmount == 0) return;
 
         if (publishingConvictionNFT.agentToAccountId(msg.sender) != 0) {
-            publishingConvictionNFT.coverPublishingCost(msg.sender, deltaTokenAmount);
+            // Discount branch — delta funds the KC's REMAINING epoch range
+            // `[currentEpoch, currentEpoch + remainingEpochs - 1]` via the
+            // active sink. NFT enforces `remainingEpochs <=
+            // lockDurationEpochs` internally; the active sink may extend
+            // past the conviction account's `expiresAtEpoch` (harmless —
+            // the staker pool just gets funded normally for those epochs).
+            publishingConvictionNFT.coverPublishingCost(
+                msg.sender,
+                deltaTokenAmount,
+                currentEpoch,
+                remainingEpochs
+            );
         } else {
             _addTokens(deltaTokenAmount);
             _distributeTokens(deltaTokenAmount, uint256(remainingEpochs), currentEpoch);

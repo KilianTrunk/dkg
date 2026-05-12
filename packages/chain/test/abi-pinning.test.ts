@@ -108,7 +108,12 @@ const PINNED_DIGESTS: Record<string, string> = {
   // an `address author` argument to `createKnowledgeCollection` /
   // `updateKnowledgeCollection` and the matching indexed topic on the
   // `KnowledgeCollectionCreated` / `KnowledgeCollectionUpdated` events.
-  KnowledgeAssetsV10:           'df65359e0eb3c29aa00f9955d26ea345545a79eb2458eb0c14ccde43a17ad431',
+  // Updated PR `feature/conviction-lazy-settlement`: conviction-path
+  // publish/update now invokes the NFT's `coverPublishingCost` with
+  // (kcStartEpoch, kcEpochs) so it can fund the KC's epoch range via
+  // the active sink. The `InvalidPublishingConvictionEpochs` error was
+  // removed from KAV10 (the NFT enforces the bound internally).
+  KnowledgeAssetsV10:           '785311d19ce39743522bf1db501f41276fb22d715a2cc94cc67d96f8a22e519e',
   KnowledgeCollectionStorage:   'e165cbddc6569602d1d5c05c15909fd0a9ff851f974357cf80297041b2a83fd2',
   KnowledgeCollection:          'c906207c38ffded8944d7255498f7fc9f2c864098a3f8f3670df19006dbcd395',
   ContextGraphs:                'ee69f0d50b54df966b8bfb3bf457fe6d2865393f51f8770b4185fafd324b9462',

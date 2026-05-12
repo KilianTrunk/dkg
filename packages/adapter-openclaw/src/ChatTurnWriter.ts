@@ -884,8 +884,19 @@ export class ChatTurnWriter {
         for (let i = 0; i < pairs.length; i++) {
           const { user, assistant, pairIndex, externalTurnIds, externalDirect, messageIds, assistantMessageIds } = pairs[i];
           if (!user && !assistant) continue;
-          const laterExactExternalMarker = externalCursorKey
-            ? this.hasExternalTurnMarkerInLaterPairs(externalCursorKey, pairs, i + 1)
+          // Ordered fallback is content-agnostic; it would over-skip if
+          // a later pair already carries a direct-channel exact marker
+          // whose `(turnId, user, assistant)` matches THIS pair's
+          // content (e.g. T84: pair 1 is a real W4a turn whose text
+          // coincidentally matches a direct-persisted pair 2). In that
+          // case the exact marker will handle the later pair and this
+          // pair is a distinct turn that must persist. We only block
+          // ordered fallback when the later exact marker would actually
+          // cover this pair's content — a later exact marker for SOME
+          // OTHER direct turn (different content) must not block
+          // ordered dedupe of an earlier metadata-stripped pair.
+          const laterExactCoversThisPairContent = externalCursorKey
+            ? this.hasLaterExactMarkerForPairContent(externalCursorKey, pairs, i + 1, user, assistant)
             : false;
           const externalMarkerAction = externalCursorKey
             ? this.consumeExternalTurnMarkersForPair(
@@ -894,7 +905,7 @@ export class ChatTurnWriter {
               user,
               assistant,
               externalDirect,
-              i < lastIdx && !laterExactExternalMarker,
+              i < lastIdx && !laterExactCoversThisPairContent,
             )
             : { skip: false, markers: [], rollbackMarkers: [] };
           if (externalCursorKey && externalMarkerAction.markers.length > 0) {
@@ -1171,17 +1182,26 @@ export class ChatTurnWriter {
       marker,
       count: this.externalTurnMarkers.get(externalCursorKey)?.get(marker) ?? 0,
     }));
-    // The ordered marker is a one-shot ticket per direct persist; W4a
-    // consumes it (count - 1) when a historical non-latest pair has no
-    // exact/user marker. N direct persists must accumulate N tickets so
-    // N metadata-stripped UI backfill pairs can each be skipped. Live
-    // smoke (UI3 -> first Telegram) showed Math.max collapsing the
-    // count to 1 even after multiple UI persists, so only the first
-    // historical UI pair was skipped and the rest re-persisted as
-    // duplicates. Content-bound exact/user markers remain idempotent
-    // (Math.max) because identical (turnId + content) is the same
-    // daemon-success fact across replays.
-    this.incrementOrderedExternalTurnMarker(externalCursorKey);
+    // The ordered marker is a one-shot ticket per *distinct* direct
+    // persist. N distinct UI turns must leave N tickets so N metadata-
+    // stripped backfill pairs can each be skipped. A retry of the same
+    // direct persist (same turnId + user + assistant; e.g. the marker-
+    // write retry ladder in DkgChannelPlugin) must NOT add another
+    // ticket — content-bound markers stay at 1 via Math.max while the
+    // ordered count would otherwise drift upward on every retry,
+    // leaking tickets that W4a could later consume against unrelated
+    // stripped pairs. Detect replay by checking that at least one
+    // content marker for this opts already exists in the bucket; if so,
+    // skip the ordered increment. Content-bound exact/user markers
+    // remain idempotent (Math.max) because identical (turnId + content)
+    // is the same daemon-success fact across replays.
+    const isReplay = contentMarkers.length > 0
+      && contentMarkers.some((marker) =>
+        (this.externalTurnMarkers.get(externalCursorKey)?.get(marker) ?? 0) > 0,
+      );
+    if (!isReplay) {
+      this.incrementOrderedExternalTurnMarker(externalCursorKey);
+    }
     for (const marker of contentMarkers) {
       this.restoreExternalTurnMarker(externalCursorKey, marker);
     }
@@ -3152,13 +3172,28 @@ export class ChatTurnWriter {
     return { skip: false, markers: [], rollbackMarkers: [] };
   }
 
-  private hasExternalTurnMarkerInLaterPairs(
+  /**
+   * Returns true when some later pair in this `agent_end` carries a
+   * direct-channel exact marker whose `(turnId, user, assistant)` would
+   * match the SUPPLIED `user`/`assistant` content. Used to block
+   * ordered-fallback skipping for an earlier metadata-less pair whose
+   * content the later exact marker will already deduplicate against —
+   * see T84: a real W4a turn that coincidentally shares text with a
+   * later direct-persisted pair must persist, not be ordered-skipped.
+   *
+   * A later exact marker for SOME OTHER direct turn (different content)
+   * must NOT block ordered dedupe of this stripped pair — that's the
+   * pre-existing over-coarse check this PR is replacing.
+   */
+  private hasLaterExactMarkerForPairContent(
     sessionKeyCursor: string,
     pairs: ComputedChatTurnPair[],
     fromIndex: number,
+    user: string,
+    assistant: string,
   ): boolean {
     for (let i = fromIndex; i < pairs.length; i++) {
-      const { user, assistant, externalTurnIds, externalDirect } = pairs[i];
+      const { externalTurnIds, externalDirect } = pairs[i];
       for (const turnId of externalTurnIds) {
         const exactMarker = this.externalTurnMarkerId(turnId, user, assistant);
         if (exactMarker && this.hasExternalTurnMarker(sessionKeyCursor, exactMarker)) return true;
@@ -3168,6 +3203,7 @@ export class ChatTurnWriter {
     }
     return false;
   }
+
 
   private hasExternalTurnMarker(sessionKeyCursor: string, marker: string): boolean {
     const bucket = this.externalTurnMarkers.get(sessionKeyCursor);

@@ -3140,6 +3140,95 @@ describe("ChatTurnWriter", () => {
     writer.flushSync();
   });
 
+  it("T459 — ordered fallback runs for an earlier metadata-stripped UI pair even when a later pair carries an exact marker for a DIFFERENT direct turn", async () => {
+    // Mixed-metadata regression from PR #457 review round (Codex review
+    // comment on `laterExactExternalMarker`). Transcript shape: an
+    // earlier UI pair has lost its DkgTurnId, a later UI pair still
+    // carries DkgTurnId, then live Telegram. The pre-fix gating
+    // disabled ordered fallback for the earlier pair because SOME
+    // later exact marker existed in the bucket — even though that
+    // marker's content didn't match the earlier pair. After the fix,
+    // ordered fallback is only blocked when the later exact marker's
+    // `(turnId, user, assistant)` actually matches THIS pair's
+    // content; otherwise the earlier stripped pair is correctly
+    // ordered-skipped.
+    await writer.onAgentEnd({
+      sessionId: "seed",
+      messages: [
+        { role: "user", content: "previous telegram question" },
+        { role: "assistant", content: "previous telegram answer" },
+      ],
+    }, { channelId: "telegram", sessionKey: "agent:main:main" });
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
+    await writer.markExternalTurnPersistedDurable({
+      sessionKey: "agent:main:main",
+      turnId: "node-ui-corr-older-stripped",
+      user: "older ui question",
+      assistant: "older ui answer",
+    });
+    await writer.markExternalTurnPersistedDurable({
+      sessionKey: "agent:main:main",
+      turnId: "node-ui-corr-newer-with-id",
+      user: "newer ui question",
+      assistant: "newer ui answer",
+    });
+
+    await writer.onAgentEnd({
+      sessionId: "test",
+      messages: [
+        { role: "user", content: "previous telegram question" },
+        { role: "assistant", content: "previous telegram answer" },
+        { role: "user", content: "older ui question" },
+        { role: "assistant", content: "older ui answer" },
+        {
+          role: "user",
+          content: "newer ui question",
+          context: { Provider: "dkg-ui", DkgTurnId: "node-ui-corr-newer-with-id" },
+        },
+        { role: "assistant", content: "newer ui answer" },
+        { role: "user", content: "next telegram question" },
+        { role: "assistant", content: "next telegram answer" },
+      ],
+    }, { channelId: "telegram", sessionKey: "agent:main:main" });
+    await flushMicrotasks();
+
+    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(1);
+    expect(mockClient.storeChatTurn.mock.calls[0][1]).toBe("next telegram question");
+    writer.flushSync();
+  });
+
+  it("T460 — markExternalTurnPersistedDurable replay does not double the ordered-marker count", async () => {
+    // Marker-only retry idempotency. PR #457 review round (Codex
+    // comment on `incrementOrderedExternalTurnMarker`): a marker-write
+    // retry with identical opts left content-bound markers idempotent
+    // via Math.max but still incremented the ordered ticket count.
+    // After N retries, N - 1 leftover tickets could be consumed by a
+    // later W4a pass against unrelated metadata-stripped pairs (e.g.,
+    // a stale non-latest Telegram pair). After the fix, a replay
+    // detects the existing content markers and skips the ordered
+    // increment.
+    await writer.markExternalTurnPersistedDurable({
+      sessionKey: "agent:main:main",
+      turnId: "node-ui-corr-retry",
+      user: "ui question",
+      assistant: "ui answer",
+    });
+    await writer.markExternalTurnPersistedDurable({
+      sessionKey: "agent:main:main",
+      turnId: "node-ui-corr-retry",
+      user: "ui question",
+      assistant: "ui answer",
+    });
+
+    const externalCursorKey = (writer as any).externalCursorKeyFromSessionKey("agent:main:main");
+    const bucket = (writer as any).externalTurnMarkers.get(externalCursorKey) as Map<string, number>;
+    const orderedKey = (writer as any).constructor.EXTERNAL_ORDERED_TURN_MARKER as string;
+    expect(bucket?.get(orderedKey) ?? 0).toBe(1);
+    writer.flushSync();
+  });
+
   it("T359 - typed Telegram W4b and Node-UI external markers both suppress W4a duplicates after restart", async () => {
     await writer.markExternalTurnPersistedDurable({
       sessionKey: "agent:main:main",

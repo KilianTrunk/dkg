@@ -19,7 +19,7 @@ import {
   getGenesisQuads, computeNetworkId, SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY,
   Logger, createOperationContext, sparqlString, escapeSparqlLiteral, isSafeIri,
   TrustLevel,
-  buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1,
+  buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, type AuthorAttestationTypedData,
   buildAssertionSealQuads, buildAssertionPublishReceiptQuads,
   parseAssertionSealQuads, type AssertionSeal,
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
@@ -61,9 +61,14 @@ import {
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
   resolveWorkspaceAgentRecipients,
   computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
+  canonicalPublishPayload,
+  resolveLiftWorkspaceSlice,
+  validateLiftPublishPayload,
+  subtractFinalizedExactQuads,
   TripleStoreAsyncLiftPublisher,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
+  type LiftRequest, type LiftRequestAuthorSeal,
   type WorkspaceAgentRecipient,
   type WorkspaceSenderKeyEncryptInput,
 } from '@origintrail-official/dkg-publisher';
@@ -192,7 +197,24 @@ export interface PublishAsyncOpts extends PublishOpts {
   scope?: string;
   transitionType?: LiftTransitionType;
   authority?: LiftAuthorityProof;
+  /** Prior KC reference; required for MUTATE/REVOKE. */
+  priorVersion?: string;
+  /** V10 selective-disclosure: per-entity kaRoot instead of flat-hash KC. */
+  entityProofs?: boolean;
+  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
+  publisherNodeIdentityIdOverride?: bigint;
   localOnly?: boolean;
+  /** Registered local agent whose key signs the seal. Mirrors sync `assertionFinalize`. */
+  authorAgentAddress?: string;
+  /** Externally pre-signed seal. Mutually exclusive with `authorAgentAddress` / `authorSignTypedData`. */
+  preSignedAuthorAttestation?: {
+    expectedMerkleRoot: Uint8Array;
+    authorAddress: string;
+    signature: { r: Uint8Array; vs: Uint8Array };
+    schemeVersion: number;
+  };
+  /** Caller signs typed-data built by the daemon. Requires `authorAgentAddress`. */
+  authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>;
 }
 
 export interface PublishAsyncQuadEnvelope {
@@ -286,6 +308,35 @@ function partitionPublishAsyncQuads(publicQuads: Quad[], privateQuads: Quad[]): 
     publicQuads: stagedPublicQuads,
     privateQuadsByRoot: privateByRoot,
     roots,
+  };
+}
+
+/** Sign EIP-712 typed data with a raw private key, returning compact (r, vs). */
+async function signWithPrivateKey(
+  privateKey: string,
+  typedData: AuthorAttestationTypedData,
+): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+  const wallet = new ethers.Wallet(privateKey.startsWith('0x') ? privateKey : '0x' + privateKey);
+  const sigHex = await wallet.signTypedData(typedData.domain, typedData.types, typedData.message);
+  const sig = ethers.Signature.from(sigHex);
+  return { r: ethers.getBytes(sig.r), vs: ethers.getBytes(sig.yParityAndS) };
+}
+
+/** Bytes → hex for lift-queue persistence. Inverse: `liftSealToPrecomputedAttestation`. */
+function preSignedAttestationToLiftSeal(input: {
+  expectedMerkleRoot: Uint8Array;
+  authorAddress: string;
+  signature: { r: Uint8Array; vs: Uint8Array };
+  schemeVersion: number;
+}): LiftRequestAuthorSeal {
+  return {
+    merkleRoot: ethers.hexlify(input.expectedMerkleRoot) as `0x${string}`,
+    authorAddress: input.authorAddress as `0x${string}`,
+    signature: {
+      r: ethers.hexlify(input.signature.r) as `0x${string}`,
+      vs: ethers.hexlify(input.signature.vs) as `0x${string}`,
+    },
+    schemeVersion: input.schemeVersion,
   };
 }
 
@@ -4386,6 +4437,31 @@ export class DKGAgent {
       throw new ContextGraphNotFoundError(contextGraphId);
     }
 
+    // Validate caller-controlled options before workspace staging so a rejected publishAsync leaves no orphan data.
+    if (opts?.preSignedAuthorAttestation !== undefined) {
+      if (opts?.authorAgentAddress !== undefined) {
+        throw new Error('publishAsync: preSignedAuthorAttestation and authorAgentAddress are mutually exclusive');
+      }
+      if (opts?.authorSignTypedData !== undefined) {
+        throw new Error('publishAsync: preSignedAuthorAttestation and authorSignTypedData are mutually exclusive');
+      }
+    }
+    if (opts?.authorSignTypedData !== undefined && opts?.authorAgentAddress === undefined) {
+      throw new Error('publishAsync: authorSignTypedData requires authorAgentAddress');
+    }
+    if (opts?.authorAgentAddress != null && opts.authorSignTypedData == null) {
+      const mode = this.getLocalAgentMode(opts.authorAgentAddress);
+      if (mode === undefined) {
+        throw new Error(`publishAsync: ${opts.authorAgentAddress} is not a registered local agent`);
+      }
+      if (mode === 'self-sovereign') {
+        throw new Error(
+          `publishAsync: agent ${opts.authorAgentAddress} is self-sovereign — supply ` +
+            'authorSignTypedData callback or preSignedAuthorAttestation instead',
+        );
+      }
+    }
+
     let publicQuads: Quad[];
     let privateQuads: Quad[];
     try {
@@ -4437,8 +4513,7 @@ export class DKGAgent {
       }
     }
 
-    const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
-    const captureID = await asyncPublisher.lift({
+    const liftRequestDraft = {
       swmId: shareOperationId,
       shareOperationId,
       roots: partitioned.roots,
@@ -4447,9 +4522,35 @@ export class DKGAgent {
       scope: opts?.scope ?? 'context-graph',
       transitionType: opts?.transitionType ?? 'CREATE',
       authority: opts?.authority ?? { type: 'owner', proofRef: `urn:dkg:publish-async:${shareOperationId}` },
+      priorVersion: opts?.priorVersion,
       subGraphName: opts?.subGraphName,
       accessPolicy: opts?.accessPolicy,
       allowedPeers: opts?.allowedPeers,
+      entityProofs: opts?.entityProofs,
+      // Stringify bigint for JSON-safe persistence; preserve `0n` (mode d).
+      publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride !== undefined
+        ? (opts.publisherNodeIdentityIdOverride.toString() as `${bigint}`)
+        : undefined,
+    } as const;
+
+    // Seal-build: caller-callback errors propagate; daemon-internal misses degrade to sealless (sync `_publish` parity).
+    let seal: LiftRequestAuthorSeal | undefined;
+    if (opts?.preSignedAuthorAttestation) {
+      seal = preSignedAttestationToLiftSeal(opts.preSignedAuthorAttestation);
+    } else if (opts?.authorSignTypedData !== undefined) {
+      seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, opts.authorSignTypedData);
+    } else {
+      try {
+        seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, undefined);
+      } catch (err) {
+        this.log.warn(ctx, `Async seal mint failed; on-chain publish will fall back to tentative: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
+    const captureID = await asyncPublisher.lift({
+      ...liftRequestDraft,
+      ...(seal !== undefined ? { seal } : {}),
     });
 
     if (!opts?.localOnly) {
@@ -4457,6 +4558,117 @@ export class DKGAgent {
     }
 
     return { captureID };
+  }
+
+  /** Build the EIP-712 author seal for the lift request. Runs the same
+   *  canonicalization + subtraction pipeline as the publisher so the
+   *  merkle matches at processNext-time. Returns undefined on non-V10 chains. */
+  private async buildAsyncLiftSeal(
+    request: {
+      readonly contextGraphId: string;
+      readonly subGraphName?: string;
+      readonly shareOperationId: string;
+      readonly roots: readonly string[];
+      readonly namespace: string;
+      readonly scope: string;
+      readonly transitionType: LiftTransitionType;
+      readonly authority: LiftAuthorityProof;
+      readonly priorVersion?: string;
+      readonly accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
+      readonly allowedPeers?: readonly string[];
+      readonly swmId: string;
+    },
+    authorAgentAddress?: string,
+    authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>,
+  ): Promise<LiftRequestAuthorSeal | undefined> {
+    if (this.chain.isV10Ready?.() !== true) return undefined;
+    if (typeof this.chain.getEvmChainId !== 'function') return undefined;
+    if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+
+    const onChainId = await this.getContextGraphOnChainId(request.contextGraphId);
+    if (onChainId == null) return undefined; // CG not on-chain — publisher goes tentative
+
+
+    const chainId = await this.chain.getEvmChainId();
+    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    if (chainId === undefined || kav10Address === undefined) return undefined;
+
+    const graphManager = new GraphManager(this.store);
+    const resolved = await resolveLiftWorkspaceSlice({
+      request,
+      store: this.store,
+      graphManager,
+    });
+
+    // Rewrite raw root URIs (urn:uuid:…) → canonical (dkg:cg:ns:scope/…-hash).
+    const validated = validateLiftPublishPayload({
+      request: { ...request, authority: request.authority } as LiftRequest,
+      resolved,
+    });
+
+    // Strip already-finalized quads (no-op for non-CREATE). Matches publisher.
+    const subtracted = await subtractFinalizedExactQuads({
+      store: this.store,
+      graphManager,
+      request: { ...request, authority: request.authority } as LiftRequest,
+      validation: validated.validation,
+      resolved: validated.resolved,
+    });
+
+    // Full overlap → publisher returns noop without checking the seal.
+    if (
+      subtracted.resolved.quads.length === 0 &&
+      (subtracted.resolved.privateQuads?.length ?? 0) === 0
+    ) {
+      return undefined;
+    }
+
+    const canonical = canonicalPublishPayload(
+      subtracted.resolved.quads,
+      subtracted.resolved.privateQuads ?? [],
+    );
+
+    // Resolve author: callback → custodial keystore → publisher fallback. User-input pre-validated in publishAsync entry.
+    let authorAddress: string;
+    let signerPrivateKey: string | undefined;
+    if (authorSignTypedData !== undefined) {
+      authorAddress = authorAgentAddress as string;
+    } else if (authorAgentAddress != null) {
+      signerPrivateKey = this.getCustodialAgentPrivateKey(authorAgentAddress);
+      if (!signerPrivateKey) return undefined;
+      authorAddress = authorAgentAddress;
+    } else {
+      const fallback = await this.publisher.publisherFallbackAuthorAddress();
+      if (!fallback) return undefined;
+      authorAddress = fallback;
+    }
+
+    const typedData = buildAuthorAttestationTypedData({
+      chainId,
+      kav10Address,
+      contextGraphId: BigInt(onChainId),
+      merkleRoot: canonical.kcMerkleRoot,
+      authorAddress,
+      schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    });
+
+    const { r, vs } = await (
+      authorSignTypedData !== undefined
+        ? authorSignTypedData(typedData)
+        : signerPrivateKey
+          ? signWithPrivateKey(signerPrivateKey, typedData)
+          : this.publisher.signAuthorAttestationAsPublisher(typedData)
+    );
+
+    return {
+      merkleRoot: ethers.hexlify(canonical.kcMerkleRoot) as `0x${string}`,
+      authorAddress: authorAddress as `0x${string}`,
+      signature: {
+        r: ethers.hexlify(r) as `0x${string}`,
+        vs: ethers.hexlify(vs) as `0x${string}`,
+      },
+      schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    };
   }
 
   private async _publish(
@@ -6291,7 +6503,7 @@ export class DKGAgent {
         writeLocks: this.writeLocks,
         localAgentAddresses: () => [...this.localAgents.keys()],
         workspaceRecipientPrivateKeys: () => this.getLocalWorkspaceRecipientPrivateKeys(),
-        workspaceSenderKeyDecryptor: (message, contextGraphId, ctx) =>
+        workspaceSenderKeyDecryptor: (message: SwmSenderKeyMessageMsg, contextGraphId: string, ctx: OperationContext) =>
           this.decryptWorkspacePayloadWithSenderKey(message, contextGraphId, ctx),
       });
     }

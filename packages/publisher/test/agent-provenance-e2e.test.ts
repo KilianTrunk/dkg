@@ -821,3 +821,11 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     expect(result.onChainResult).toBeUndefined();
   });
 });
+
+// Publisher-fallback seal mint (mode (a) at processNext-time) was removed
+// when the seal-at-enqueue architecture landed — async-lift callers
+// attach their own seal via `LiftRequest.seal`, so the publisher no
+// longer needs to mint a fallback at all. The "if you don't supply a
+// seal on V10, the publish fails" semantics are covered by the existing
+// `rejects on-chain publish without precomputedAttestation` test
+// earlier in this file.

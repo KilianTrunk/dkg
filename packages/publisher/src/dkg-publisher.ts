@@ -6,6 +6,7 @@ import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublis
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import type { Publisher, PublishOptions, PublishResult, KAManifestEntry, PhaseCallback } from './publisher.js';
 import { autoPartition } from './auto-partition.js';
+import { canonicalPublishPayload } from './canonical-publish-payload.js';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
 import {
@@ -416,30 +417,12 @@ export class DKGPublisher implements Publisher {
     return this.inferAdapterPublisherAddress(contextGraphId, options);
   }
 
-  /**
-   * RFC-001 §9.x — public wrapper around `resolvePublisherAddress` that
-   * `agent.assertionFinalize()` calls when no agent override was
-   * supplied. Mirrors Phase 4 mode (a): the daemon's own publisher
-   * EOA acts as author when the request is admin-scoped.
-   *
-   * Returns `undefined` when no publisher signer is configured
-   * (tentative-only daemon); finalize must then fail because there's
-   * no key to sign with.
-   */
+  /** RFC-001 §9 fallback author when no agent override is supplied. Returns undefined if no signer configured. */
   async publisherFallbackAuthorAddress(): Promise<string | undefined> {
     return this.resolvePublisherAddress();
   }
 
-  /**
-   * RFC-001 §9.x — sign EIP-712 typed data with the publisher's own
-   * wallet (publisherPrivateKey or chain adapter's signer). Used by
-   * `agent.assertionFinalize()` when no agent override is supplied,
-   * so that the seal can still be produced for admin-scoped
-   * finalize requests.
-   *
-   * Returns the compact `(r, vs)` form expected by KAv10's
-   * AuthorAttestation struct.
-   */
+  /** Sign EIP-712 typed data with the publisher's own wallet. Returns KAv10's compact (r, vs). */
   async signAuthorAttestationAsPublisher(typedData: {
     domain: { name: string; version: string; chainId: bigint; verifyingContract: string };
     types: Record<string, Array<{ name: string; type: string }>>;
@@ -1641,7 +1624,7 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:ensureContextGraph', 'end');
 
     onPhase?.('prepare:partition', 'start');
-    const kaMap = autoPartition(quads);
+    const canonical = canonicalPublishPayload(quads, privateQuads);
     onPhase?.('prepare:partition', 'end');
 
     const manifestEntries: KAManifestEntry[] = [];
@@ -1649,35 +1632,27 @@ export class DKGPublisher implements Publisher {
 
     onPhase?.('prepare:manifest', 'start');
     let tokenCounter = 1n;
-    for (const [rootEntity, publicQuads] of kaMap) {
-      const entityPrivateQuads = privateQuads.filter(
-        (q) => q.subject === rootEntity || q.subject.startsWith(rootEntity + '/.well-known/genid/'),
-      );
-
+    for (const entry of canonical.manifestEntries) {
       manifestEntries.push({
         tokenId: tokenCounter,
-        rootEntity,
-        privateMerkleRoot: entityPrivateQuads.length > 0
-          ? computePrivateRoot(entityPrivateQuads)
-          : undefined,
-        privateTripleCount: entityPrivateQuads.length,
+        rootEntity: entry.rootEntity,
+        privateMerkleRoot: entry.privateMerkleRoot,
+        privateTripleCount: entry.privateTripleCount,
       });
 
       kaMetadata.push({
-        rootEntity,
+        rootEntity: entry.rootEntity,
         kcUal: '',
         tokenId: tokenCounter,
-        publicTripleCount: publicQuads.length,
-        privateTripleCount: entityPrivateQuads.length,
-        privateMerkleRoot: entityPrivateQuads.length > 0
-          ? computePrivateRoot(entityPrivateQuads)
-          : undefined,
+        publicTripleCount: entry.publicTripleCount,
+        privateTripleCount: entry.privateTripleCount,
+        privateMerkleRoot: entry.privateMerkleRoot,
       });
 
       tokenCounter++;
     }
 
-    const allSkolemizedQuads = [...kaMap.values()].flat();
+    const allSkolemizedQuads = canonical.skolemizedPublicQuads;
     onPhase?.('prepare:manifest', 'end');
 
     onPhase?.('prepare:validate', 'start');
@@ -1690,10 +1665,8 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:validate', 'end');
 
     onPhase?.('prepare:merkle', 'start');
-    const privateRoots = manifestEntries
-      .map(m => m.privateMerkleRoot)
-      .filter((r): r is Uint8Array => r != null);
-    const kcMerkleRoot = computeFlatKCRoot(allSkolemizedQuads, privateRoots);
+    const privateRoots = canonical.privateRoots;
+    const kcMerkleRoot = canonical.kcMerkleRoot;
     const kcMerkleLeafCount = computeFlatKCMerkleLeafCountV10(allSkolemizedQuads, privateRoots);
     if (kcMerkleLeafCount > 0xffffffff) {
       throw new Error(`V10 merkleLeafCount exceeds uint32: ${kcMerkleLeafCount}`);
@@ -1711,13 +1684,12 @@ export class DKGPublisher implements Publisher {
     this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store`);
     await this.store.insert(normalizedQuads);
 
-    // Store private quads
-    for (const [rootEntity] of kaMap) {
+    for (const entry of canonical.manifestEntries) {
       const entityPrivateQuads = privateQuads.filter(
-        (q) => q.subject === rootEntity || q.subject.startsWith(rootEntity + '/.well-known/genid/'),
+        (q) => q.subject === entry.rootEntity || q.subject.startsWith(entry.rootEntity + '/.well-known/genid/'),
       );
       if (entityPrivateQuads.length > 0) {
-        await this.privateStore.storePrivateTriples(contextGraphId, rootEntity, entityPrivateQuads, options.subGraphName);
+        await this.privateStore.storePrivateTriples(contextGraphId, entry.rootEntity, entityPrivateQuads, options.subGraphName);
       }
     }
 
@@ -1959,6 +1931,7 @@ export class DKGPublisher implements Publisher {
     } else {
       const tokenAmount = precomputedTokenAmount;
       usedV10Path = true;
+
       // ─────────────────────────────────────────────────────────────
       // SEAL INTEGRITY PREFLIGHT (Round 4 review §12)
       //

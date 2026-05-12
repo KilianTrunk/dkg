@@ -373,7 +373,19 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
     }
     const parsed =
       raw.request && typeof raw.request === "object" ? raw.request : raw;
-    const { roots, namespace, scope, authorityProofRef, priorVersion } = parsed;
+    const {
+      roots,
+      namespace,
+      scope,
+      authorityProofRef,
+      priorVersion,
+      subGraphName,
+      accessPolicy,
+      allowedPeers,
+      entityProofs,
+      publisherNodeIdentityIdOverride,
+      seal,
+    } = parsed;
     const contextGraphId = parsed.contextGraphId;
     const shareOperationId =
       parsed.shareOperationId ?? parsed.workspaceOperationId;
@@ -395,6 +407,7 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
         error: "Missing required enqueue fields",
       });
     }
+    // V10 sign-at-enqueue: callers build the EIP-712 AuthorAttestation themselves and pass it as `seal`. Sealless enqueues fall back to tentative.
     const jobId = await publisherControl.lift({
       swmId,
       shareOperationId,
@@ -405,6 +418,15 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
       transitionType,
       authority: { type: authorityType, proofRef },
       ...(priorVersion ? { priorVersion } : {}),
+      ...(subGraphName ? { subGraphName } : {}),
+      ...(accessPolicy ? { accessPolicy } : {}),
+      ...(Array.isArray(allowedPeers) && allowedPeers.length > 0 ? { allowedPeers } : {}),
+      // Strict boolean — `!!"false"` is `true`, silently inverting intent.
+      ...(typeof entityProofs === 'boolean' ? { entityProofs } : {}),
+      ...(publisherNodeIdentityIdOverride !== undefined
+        ? { publisherNodeIdentityIdOverride: String(publisherNodeIdentityIdOverride) }
+        : {}),
+      ...(seal !== undefined ? { seal } : {}),
     } as any);
     return jsonResponse(res, 200, {
       jobId,

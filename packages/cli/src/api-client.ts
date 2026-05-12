@@ -535,6 +535,19 @@ export class ApiClient {
     transitionType?: 'CREATE' | 'MUTATE' | 'REVOKE';
     authorityType?: 'owner' | 'multisig' | 'quorum' | 'capability';
     priorVersion?: string;
+    subGraphName?: string;
+    accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
+    allowedPeers?: string[];
+    // V10 sign-at-enqueue. Absent `seal` → tentative; supply for on-chain attestation.
+    entityProofs?: boolean;
+    /** Stringified bigint; `'0'` = mode d (no attribution) per RFC-001 §4. */
+    publisherNodeIdentityIdOverride?: string;
+    seal?: {
+      merkleRoot: `0x${string}`;
+      authorAddress: `0x${string}`;
+      signature: { r: `0x${string}`; vs: `0x${string}` };
+      schemeVersion: number;
+    };
   }): Promise<{ jobId: string; contextGraphId: string; shareOperationId: string; rootsCount: number }> {
     return this.post('/api/publisher/enqueue', request);
   }

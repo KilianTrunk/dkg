@@ -287,6 +287,22 @@ export interface DkgConfig {
      */
     useWorkerThread?: boolean;
   };
+  /**
+   * RFC 04 / Issue #461 — opt this node into the Network Relay Registry
+   * as a circuit-relay provider. When true, the daemon flips the
+   * on-chain `relayCapable` flag on the node's profile so other peers
+   * can resolve it as a candidate relay during the chain-driven
+   * NetworkStateRegistry rollout.
+   *
+   * Independent of multiaddr publishing: the daemon ALWAYS publishes
+   * its externally-reachable libp2p multiaddrs to chain at startup
+   * (so peers know how to reach this node), but only flips
+   * `relayCapable=true` when the operator explicitly opts in here —
+   * advertising relay service has bandwidth/availability implications.
+   *
+   * Default: false.
+   */
+  relayCapable?: boolean;
 }
 
 /**

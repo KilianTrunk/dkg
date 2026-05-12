@@ -18,6 +18,7 @@ import {
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
   encodeFinalizationMessage, type FinalizationMessageMsg,
   getGenesisQuads, computeNetworkId, SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY,
+  isPublicLikeAddress,
   Logger, createOperationContext, sparqlString, escapeSparqlLiteral, isSafeIri,
   TrustLevel,
   buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, type AuthorAttestationTypedData,
@@ -874,6 +875,39 @@ async function inferAdapterPublisherAddress(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * RFC 04 / Issue #461 — mirrored from contracts/libraries/ProfileLib.sol
+ * MAX_MULTIADDRS. The daemon clamps its candidate set to this so the
+ * EVM adapter's fast-fail (and the on-chain TooManyMultiaddrs revert)
+ * never trips on a multi-homed node that listens on more interfaces
+ * than fit. Drift detector: see ProfileLib.sol unit test.
+ */
+const RELAY_REGISTRY_MAX_MULTIADDRS = 8;
+
+/**
+ * Filter a libp2p `multiaddrs` snapshot down to the entries worth
+ * publishing on chain. Public IPs / DNS / circuit-relay paths qualify;
+ * loopback, RFC1918, link-local, etc. are dropped. Exported only via
+ * {@link DKGAgent.publishRelayRegistry} — kept module-private so callers
+ * route through the chain-wiring logic that bounds + dedupes the set.
+ */
+export function filterPublishableMultiaddrs(addrs: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const a of addrs) {
+    if (typeof a !== 'string' || a.length === 0) continue;
+    if (seen.has(a)) continue;
+    // /p2p-circuit/ multiaddrs are explicitly publishable — they're how
+    // a NAT'd edge becomes reachable, and the relay portion has already
+    // been validated as publicly dialable elsewhere in the relay setup.
+    if (a.includes('/p2p-circuit/') || isPublicLikeAddress(a)) {
+      seen.add(a);
+      out.push(a);
+    }
+  }
+  return out;
 }
 
 /**
@@ -3242,6 +3276,103 @@ export class DKGAgent {
     await this.broadcastPublish(AGENT_REGISTRY_CONTEXT_GRAPH, result, profileCtx);
 
     return result;
+  }
+
+  /**
+   * Publish this node's externally-reachable libp2p multiaddrs to chain
+   * (RFC 04 / Issue #461 — Network Relay Registry).
+   *
+   * Called once at startup after the relay reservation has settled.
+   * Best-effort: missing chain config, no on-chain profile, or adapters
+   * that pre-date the relay-registry surface (`setMultiaddrs` undefined)
+   * = silent skip. Chain RPC errors are logged but never thrown so the
+   * daemon stays up.
+   *
+   * Filters the libp2p multiaddrs down to externally-dialable entries:
+   *  - /p2p-circuit/ paths (the canonical reach-an-edge route)
+   *  - public IPv4 / IPv6 / DNS-anchored addresses
+   * Local / RFC1918 / link-local addresses are dropped — they're useless
+   * to remote peers and would just churn chain state on every restart.
+   *
+   * Idempotent: compares the candidate set against what's already on
+   * chain and skips the tx when they match. Safe to call on every
+   * restart. Also bound-clamped to 8 entries (the on-chain MAX) to
+   * avoid the EVM adapter's fast-fail.
+   *
+   * @param opts.relayCapable — when true, also flips the on-chain
+   *   `relayCapable` flag to true (idempotent — checked first).
+   *   Operators opt in via `config.relayCapable`. Skipped when false /
+   *   absent so we don't accidentally overwrite an operator's manual
+   *   `dkg admin set-relay-capable` flip.
+   */
+  async publishRelayRegistry(opts?: { relayCapable?: boolean }): Promise<void> {
+    const ctx = createOperationContext('publish');
+    if (!('setMultiaddrs' in this.chain) || typeof this.chain.setMultiaddrs !== 'function') {
+      this.log.info(ctx, 'publishRelayRegistry: chain adapter does not support relay registry — skipping');
+      return;
+    }
+
+    let identityId: bigint;
+    try {
+      identityId = await this.chain.getIdentityId();
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `publishRelayRegistry: getIdentityId failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+    if (identityId === 0n) {
+      this.log.info(ctx, 'publishRelayRegistry: node has no on-chain profile yet — skipping');
+      return;
+    }
+
+    const candidate = filterPublishableMultiaddrs(this.multiaddrs);
+    if (candidate.length === 0) {
+      this.log.info(ctx, 'publishRelayRegistry: no externally-reachable multiaddrs to publish — skipping');
+      return;
+    }
+    // Clamp to the on-chain MAX_MULTIADDRS so the adapter fast-fail
+    // doesn't trip if libp2p reports more listen addresses than fit.
+    const clamped = candidate.slice(0, RELAY_REGISTRY_MAX_MULTIADDRS);
+
+    try {
+      const onChain = (this.chain.getMultiaddrs
+        ? await this.chain.getMultiaddrs(identityId)
+        : []) as string[];
+      const same =
+        onChain.length === clamped.length &&
+        onChain.every((a, i) => a === clamped[i]);
+      if (!same) {
+        await this.chain.setMultiaddrs(clamped);
+        this.log.info(
+          ctx,
+          `publishRelayRegistry: updated on-chain multiaddrs (${clamped.length} entries)`,
+        );
+      }
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `publishRelayRegistry: setMultiaddrs failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    if (opts?.relayCapable === true) {
+      try {
+        const current = this.chain.getRelayCapable
+          ? await this.chain.getRelayCapable(identityId)
+          : false;
+        if (!current && typeof this.chain.setRelayCapable === 'function') {
+          await this.chain.setRelayCapable(true);
+          this.log.info(ctx, 'publishRelayRegistry: flipped relayCapable=true on chain');
+        }
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `publishRelayRegistry: setRelayCapable failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   async findAgents(options?: { framework?: string }): Promise<DiscoveredAgent[]> {

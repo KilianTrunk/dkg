@@ -760,6 +760,24 @@ export async function runDaemonInner(
     }
   }
 
+  // RFC 04 / Issue #461 — push this node's externally-reachable
+  // multiaddrs (and optional relay-capability flag) to the on-chain
+  // Profile so peers can discover us via the chain-driven
+  // NetworkStateRegistry rolled out in Phase 3. Best-effort and
+  // non-blocking: fired on a setTimeout(0) so chain RPC slowness can't
+  // delay daemon ready, and the agent.publishRelayRegistry() impl is
+  // itself a no-throw (logs+returns on every error path).
+  const relayRegistryTimer = setTimeout(() => {
+    void agent
+      .publishRelayRegistry({ relayCapable: config.relayCapable === true })
+      .catch((err: unknown) => {
+        log(
+          `Relay registry publish failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+  }, 0);
+  if (relayRegistryTimer.unref) relayRegistryTimer.unref();
+
   // Ensure configured context graphs + network defaults are subscribed and available.
   // Uses ensureContextGraphLocal (idempotent) to avoid duplicate creator claims
   // and to survive "already exists" gracefully.

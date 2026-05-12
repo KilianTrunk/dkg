@@ -535,7 +535,22 @@ export class ApiClient {
     transitionType?: 'CREATE' | 'MUTATE' | 'REVOKE';
     authorityType?: 'owner' | 'multisig' | 'quorum' | 'capability';
     priorVersion?: string;
-    allowPublisherFallbackSeal?: boolean;
+    subGraphName?: string;
+    accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
+    allowedPeers?: string[];
+    // V10 sign-at-enqueue extensions (PR #455). When `seal` is absent on a
+    // V10-ready node, the publisher skips on-chain at processNext and goes
+    // tentative; supply it to attest authorship via the EIP-712
+    // `AuthorAttestation` typed-data binding.
+    entityProofs?: boolean;
+    /** Stringified bigint; `'0'` = mode d (no attribution) per RFC-001 §4. */
+    publisherNodeIdentityIdOverride?: string;
+    seal?: {
+      merkleRoot: `0x${string}`;
+      authorAddress: `0x${string}`;
+      signature: { r: `0x${string}`; vs: `0x${string}` };
+      schemeVersion: number;
+    };
   }): Promise<{ jobId: string; contextGraphId: string; shareOperationId: string; rootsCount: number }> {
     return this.post('/api/publisher/enqueue', request);
   }

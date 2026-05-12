@@ -180,8 +180,6 @@ export interface PublishOptions {
     signature: { r: Uint8Array; vs: Uint8Array };
     schemeVersion: number;
   };
-  /** When set and no caller seal is supplied, publisher mints fallback seal as itself (mode (a)). */
-  allowPublisherFallbackSeal?: boolean;
 }
 
 export interface PublishResult {

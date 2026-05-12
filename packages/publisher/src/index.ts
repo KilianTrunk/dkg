@@ -3,6 +3,12 @@ export { skolemize, isBlankNode, isSkolemizedUri, rootEntityFromSkolemized } fro
 export { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 export { autoPartition } from './auto-partition.js';
 export {
+  canonicalPublishPayload,
+  type CanonicalPublishPayload,
+  type CanonicalManifestEntry,
+} from './canonical-publish-payload.js';
+export { resolveLiftWorkspaceSlice } from './workspace-resolution.js';
+export {
   computeTripleHash,
   computePublicRoot,
   computePrivateRoot,
@@ -78,6 +84,7 @@ export {
   type LiftJobFailurePolicy,
   type LiftAuthorityProof,
   type LiftRequest,
+  type LiftRequestAuthorSeal,
   type LiftJobTimestamps,
   type LiftJobRetryMetadata,
   type LiftJobRecoveryMetadata,
@@ -142,6 +149,10 @@ export {
   type LiftValidationInput,
   type ValidatedLiftPublishPayload,
 } from './async-lift-validation.js';
+export {
+  subtractFinalizedExactQuads,
+  type ExactQuadSubtractionResult,
+} from './async-lift-subtraction.js';
 export {
   mapPublishResultToLiftJobSuccess,
   mapPublishExceptionToLiftJobFailure,

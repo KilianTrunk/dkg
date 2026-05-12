@@ -36,7 +36,9 @@ describe('LiftJob request and record types', () => {
       'subGraphName',
       'accessPolicy',
       'allowedPeers',
-      'allowPublisherFallbackSeal',
+      'entityProofs',
+      'publisherNodeIdentityIdOverride',
+      'seal',
     ]);
     expect(LIFT_JOB_IMMUTABLE_FIELDS).toEqual([
       'jobId',

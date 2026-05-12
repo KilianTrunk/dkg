@@ -138,105 +138,23 @@ export interface PublishAsyncOpts extends PublishOpts {
   scope?: string;
   transitionType?: LiftTransitionType;
   authority?: LiftAuthorityProof;
-  /**
-   * KC version reference required by `validateLiftPublishPayload` when
-   * `transitionType` is 'MUTATE' or 'REVOKE'. Identifies the prior KC
-   * this publish updates / revokes. Mirror of the LiftRequest field
-   * the validation layer already enforces.
-   */
+  /** Prior KC reference; required for MUTATE/REVOKE. */
   priorVersion?: string;
-  /**
-   * V10 selective-disclosure mode (sync parity with
-   * `PublishOptions.entityProofs` at publisher.ts:91). When true, each
-   * root entity gets its own `kaRoot` and `kcMerkleRoot` is a Merkle
-   * tree over those — enables proving one entity without revealing
-   * siblings. Off by default (flat hash is simpler and cheaper).
-   */
+  /** V10 selective-disclosure: per-entity kaRoot instead of flat-hash KC. */
   entityProofs?: boolean;
-  /**
-   * Per-publish RFC-001 §4 attribution override (sync parity with
-   * `PublishOptions.publisherNodeIdentityIdOverride` at publisher.ts:145).
-   * Sets the on-chain `PublishParams.publisherNodeIdentityId` for this
-   * specific publish without mutating the daemon's persistent identity.
-   * `0n` means "no attribution" (mode d). Non-zero values must name a
-   * real sharding-table node — the contract validates.
-   */
+  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
   publisherNodeIdentityIdOverride?: bigint;
   localOnly?: boolean;
-  /**
-   * Author attribution for the EIP-712 AuthorAttestation seal. Mirrors
-   * `assertionFinalize`'s `authorAgentAddress` — the caller names a local
-   * agent registered on this node, and the agent's custodial private key
-   * (held in the daemon's keystore) signs the canonical kcMerkleRoot.
-   * The on-chain `KC.author` reflects this address rather than the
-   * publisher's own EOA.
-   *
-   * Constraints:
-   * - The address MUST refer to an agent registered via
-   *   `agent.registerAgent(name)` (custodial mode — daemon holds the key).
-   * - Self-sovereign agents are rejected: the daemon never has their key
-   *   and the async path has no way to delegate signing to an out-of-process
-   *   wallet (the merkle isn't known until processNext-time).
-   *
-   * When omitted, the agent falls back to signing as the publisher's
-   * own EOA so non-V10-aware callers keep publishing unchanged.
-   *
-   * Use case: operator-managed tenant key mapped from the EPCIS HTTP API
-   * token. The HTTP route resolves the bearer token → tenant agent address,
-   * then passes that here.
-   */
+  /** Registered local agent whose key signs the seal. Mirrors sync `assertionFinalize`. */
   authorAgentAddress?: string;
-  /**
-   * Externally-signed AuthorAttestation (sync parity with
-   * `assertionFinalize` / `publishFromSharedMemory`'s
-   * `preSignedAuthorAttestation`). When provided, the agent threads
-   * the seal byte-for-byte into the `LiftRequest.seal` slot and
-   * SKIPS the in-process custodial signing path entirely. The
-   * publisher's SEAL INTEGRITY PREFLIGHT validates the merkle at
-   * processNext-time exactly as it does for sync.
-   *
-   * The caller is responsible for:
-   *   - Computing `expectedMerkleRoot` over the same canonical
-   *     publish payload the publisher will see (the canonicalization
-   *     publishAsync would otherwise apply via
-   *     `validateLiftPublishPayload` + `canonicalPublishPayload`).
-   *   - Producing a signature over the EIP-712 typed data returned
-   *     by `buildAuthorAttestationTypedData({chainId, kav10Address,
-   *     contextGraphId, merkleRoot, authorAddress, schemeVersion})`.
-   *
-   * Mutually exclusive with `authorAgentAddress` (same constraint
-   * sync's `assertionFinalize` enforces at `dkg-agent.ts:4191-4193`).
-   *
-   * Self-sovereign authors are the primary use case: caller holds
-   * the private key off-node, signs externally, hands the daemon
-   * only the resulting `(r, vs)` + author address bytes.
-   */
+  /** Externally pre-signed seal. Mutually exclusive with `authorAgentAddress` / `authorSignTypedData`. */
   preSignedAuthorAttestation?: {
     expectedMerkleRoot: Uint8Array;
     authorAddress: string;
     signature: { r: Uint8Array; vs: Uint8Array };
     schemeVersion: number;
   };
-  /**
-   * Async-native ergonomic sibling to `preSignedAuthorAttestation`: the
-   * daemon does the canonicalization (workspace slice resolution +
-   * `validateLiftPublishPayload` + `canonicalPublishPayload`), builds
-   * the EIP-712 typed data, and INVOKES this callback to obtain the
-   * `(r, vs)` signature. Lets self-sovereign callers sign with their
-   * off-node wallet WITHOUT having to replicate the publisher's
-   * canonicalization pipeline themselves.
-   *
-   * Pair with `authorAgentAddress`: the address whose private key
-   * the callback controls (this is what lands as on-chain
-   * `KC.author`). When the callback is supplied the daemon does NOT
-   * consult the local keystore — the caller asserts the signature
-   * matches `authorAgentAddress`.
-   *
-   * Mutually exclusive with `preSignedAuthorAttestation` (you provide
-   * a callback OR the finished bytes, not both).
-   * Requires `authorAgentAddress` (a callback without a target
-   * address has no meaningful seal slot to fill).
-   */
+  /** Caller signs typed-data built by the daemon. Requires `authorAgentAddress`. */
   authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>;
 }
 
@@ -334,19 +252,18 @@ function partitionPublishAsyncQuads(publicQuads: Quad[], privateQuads: Quad[]): 
   };
 }
 
-/**
- * Convert the sync-shaped `preSignedAuthorAttestation` (Uint8Array bytes,
- * matching `PublishOptions.precomputedAttestation` at publisher.ts:177-182)
- * into the persisted hex shape `LiftRequestAuthorSeal` stores on the lift
- * queue. The inverse mapping (hex → bytes) lives at the
- * lift→publish handoff in
- * `packages/publisher/src/async-lift-publish-options.ts::liftSealToPrecomputedAttestation`.
- *
- * No validation here — caller-supplied bytes are forwarded verbatim and
- * the publisher's SEAL INTEGRITY PREFLIGHT validates merkle parity at
- * processNext-time (same contract sync's `precomputedAttestation`
- * passthrough enforces).
- */
+/** Sign EIP-712 typed data with a raw private key, returning compact (r, vs). */
+async function signWithPrivateKey(
+  privateKey: string,
+  typedData: AuthorAttestationTypedData,
+): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+  const wallet = new ethers.Wallet(privateKey.startsWith('0x') ? privateKey : '0x' + privateKey);
+  const sigHex = await wallet.signTypedData(typedData.domain, typedData.types, typedData.message);
+  const sig = ethers.Signature.from(sigHex);
+  return { r: ethers.getBytes(sig.r), vs: ethers.getBytes(sig.yParityAndS) };
+}
+
+/** Bytes → hex for lift-queue persistence. Inverse: `liftSealToPrecomputedAttestation`. */
 function preSignedAttestationToLiftSeal(input: {
   expectedMerkleRoot: Uint8Array;
   authorAddress: string;
@@ -3888,13 +3805,6 @@ export class DKGAgent {
       }
     }
 
-    // Build the LiftRequest skeleton. We then resolve the workspace
-    // slice the publisher WILL see at processNext-time (same code path,
-    // `resolveLiftWorkspaceSlice`), compute the canonical merkle over
-    // it, and sign it here so the on-chain `KC.author` reflects an
-    // EIP-712 attestation produced BEFORE the publisher ever touches
-    // the data — eliminating "publisher signs as itself at the last
-    // moment" semantics.
     const liftRequestDraft = {
       swmId: shareOperationId,
       shareOperationId,
@@ -3904,59 +3814,29 @@ export class DKGAgent {
       scope: opts?.scope ?? 'context-graph',
       transitionType: opts?.transitionType ?? 'CREATE',
       authority: opts?.authority ?? { type: 'owner', proofRef: `urn:dkg:publish-async:${shareOperationId}` },
-      // Optional KC version reference for MUTATE/REVOKE transitions.
-      // Required by `validateLiftPublishPayload` when transitionType is
-      // not 'CREATE'.
       priorVersion: opts?.priorVersion,
       subGraphName: opts?.subGraphName,
       accessPolicy: opts?.accessPolicy,
       allowedPeers: opts?.allowedPeers,
       entityProofs: opts?.entityProofs,
-      // Stringify the bigint for JSON-safe lift-queue persistence (the
-      // mapper parses it back at the lift→publish handoff). Preserve
-      // explicit `0n` (mode d — "no attribution") by treating only
-      // `undefined` as absent.
+      // Stringify bigint for JSON-safe persistence; preserve `0n` (mode d).
       publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride !== undefined
         ? (opts.publisherNodeIdentityIdOverride.toString() as `${bigint}`)
         : undefined,
     } as const;
 
-    // Author-seal resolution priority (mirrors sync `assertionFinalize`):
-    //   1. `preSignedAuthorAttestation` — caller has pre-computed merkle
-    //      + signature externally (self-sovereign authors that hold keys
-    //      off-node). We thread bytes verbatim into `LiftRequest.seal`;
-    //      the publisher's SEAL INTEGRITY PREFLIGHT validates merkle
-    //      parity at processNext-time.
-    //   2. `authorAgentAddress` (custodial) OR no override (publisher
-    //      fallback) — `buildAsyncLiftSeal` canonicalizes and signs.
-    //
-    // Mutual exclusion matches sync `assertionFinalize`
-    // (dkg-agent.ts:4191-4193): the caller either delegates signing to
-    // the daemon's custodial keystore OR provides their own signature,
-    // never both. `authorSignTypedData` is the async-native cousin of
-    // `preSignedAuthorAttestation` (daemon-prepared typed data, caller-
-    // supplied signature) and obeys the same exclusion.
+    // Resolution priority: preSigned bytes → custodial agent OR callback → publisher fallback.
+    // Mutex mirrors sync `assertionFinalize`: pick one author-resolution path.
     if (opts?.preSignedAuthorAttestation !== undefined) {
       if (opts?.authorAgentAddress !== undefined) {
-        throw new Error(
-          'publishAsync: preSignedAuthorAttestation and authorAgentAddress are mutually exclusive. ' +
-            'Pick one — either delegate signing to a registered custodial agent (authorAgentAddress) ' +
-            'or supply a pre-signed AuthorAttestation (preSignedAuthorAttestation).',
-        );
+        throw new Error('publishAsync: preSignedAuthorAttestation and authorAgentAddress are mutually exclusive');
       }
       if (opts?.authorSignTypedData !== undefined) {
-        throw new Error(
-          'publishAsync: preSignedAuthorAttestation and authorSignTypedData are mutually exclusive. ' +
-            'Pick one — either supply the finished signature bytes (preSignedAuthorAttestation) ' +
-            'or a callback the daemon will invoke against canonical typed data (authorSignTypedData).',
-        );
+        throw new Error('publishAsync: preSignedAuthorAttestation and authorSignTypedData are mutually exclusive');
       }
     }
     if (opts?.authorSignTypedData !== undefined && opts?.authorAgentAddress === undefined) {
-      throw new Error(
-        'publishAsync: authorSignTypedData requires authorAgentAddress (the seal needs an authorAddress slot to fill). ' +
-          'Pair the callback with the address whose private key the callback controls.',
-      );
+      throw new Error('publishAsync: authorSignTypedData requires authorAgentAddress');
     }
     const seal: LiftRequestAuthorSeal | undefined = opts?.preSignedAuthorAttestation
       ? preSignedAttestationToLiftSeal(opts.preSignedAuthorAttestation)
@@ -3975,27 +3855,9 @@ export class DKGAgent {
     return { captureID };
   }
 
-  /**
-   * Resolve the workspace slice the publisher will see at processNext-time,
-   * canonicalize it via the shared `canonicalPublishPayload()` pipeline,
-   * and sign the resulting `kcMerkleRoot` so the publisher consumes a
-   * caller-attested seal rather than minting one as itself.
-   *
-   * Returns `undefined` on non-V10 chains (no `getEvmChainId` /
-   * `getKnowledgeAssetsV10Address` / on-chain CG ID); the publisher's
-   * on-chain branch is a no-op there, so a missing seal is fine.
-   *
-   * The author here is the publisher's own EOA (via
-   * `publisher.signAuthorAttestationAsPublisher`) — same wallet that
-   * the legacy fallback path used at processNext-time, so this is NOT a
-   * provenance regression vs the previous flow. The architectural win
-   * is that the seal is now produced BEFORE the publish, against the
-   * exact bytes the publisher will see, and the legacy inline mint-and-
-   * pray path has been removed entirely. Real per-event author keys
-   * (e.g. per-tenant wallets keyed off the EPCIS API token) plug in
-   * here later — replace the publisher-signer call with the tenant's
-   * signer.
-   */
+  /** Build the EIP-712 author seal for the lift request. Runs the same
+   *  canonicalization + subtraction pipeline as the publisher so the
+   *  merkle matches at processNext-time. Returns undefined on non-V10 chains. */
   private async buildAsyncLiftSeal(
     request: {
       readonly contextGraphId: string;
@@ -4020,17 +3882,10 @@ export class DKGAgent {
 
     const onChainId = await this.getContextGraphOnChainId(request.contextGraphId);
     if (onChainId == null) {
-      // Codex PR #455 follow-up review #2: previously returned undefined
-      // here and silently enqueued a seal-less job that the publisher
-      // would later try to publish on-chain and reject (since the
-      // publisher-side fallback was removed in this PR). Fail-fast at
-      // enqueue with actionable guidance — the chain IS V10-ready
-      // but the CG hasn't been registered on-chain yet.
+      // V10 ready but CG not on-chain — fail fast instead of enqueueing a doomed seal-less job.
       throw new Error(
         `publishAsync: context graph "${request.contextGraphId}" is not registered on-chain. ` +
-          'V10 async publishes require an on-chain CG id at enqueue time so the agent can ' +
-          'sign the EIP-712 AuthorAttestation against the same chain context the publisher ' +
-          'will submit against. Call `agent.registerContextGraph(name)` first.',
+          'Call `agent.registerContextGraph(name)` first.',
       );
     }
 
@@ -4045,28 +3900,13 @@ export class DKGAgent {
       graphManager,
     });
 
-    // Apply the same lift-validation canonicalization the publisher
-    // runs at processNext-time. This rewrites every quad's
-    // subject/object from the request's raw root URIs (e.g.
-    // `urn:uuid:…`) to the per-CG canonical root form (e.g.
-    // `dkg:<cgId>:<namespace>:<scope>/<rootSuffix>-<skolemHash>`).
-    // Without this, the agent's merkle is computed over urn:uuid
-    // subjects but the publisher's is over canonical subjects —
-    // SEAL INTEGRITY PREFLIGHT then rejects with merkle drift.
+    // Rewrite raw root URIs (urn:uuid:…) → canonical (dkg:cg:ns:scope/…-hash).
     const validated = validateLiftPublishPayload({
       request: { ...request, authority: request.authority } as LiftRequest,
       resolved,
     });
 
-    // Codex PR #455 follow-up review #1: apply the SAME finalized-quad
-    // subtraction the publisher runs at processNext-time (lines 287-293
-    // of async-lift-publisher-impl.ts). For CREATE jobs whose payload
-    // overlaps with previously-finalized content, the publisher
-    // subtracts the overlap before computing the merkle — so the
-    // agent's seal MUST be over the post-subtraction set or the SEAL
-    // INTEGRITY PREFLIGHT will reject the job. Subtraction is a no-op
-    // for MUTATE/REVOKE per async-lift-subtraction.ts:37-43, so this
-    // is safe for all transition types.
+    // Strip already-finalized quads (no-op for non-CREATE). Matches publisher.
     const subtracted = await subtractFinalizedExactQuads({
       store: this.store,
       graphManager,
@@ -4075,12 +3915,7 @@ export class DKGAgent {
       resolved: validated.resolved,
     });
 
-    // When subtraction yields an empty set (full overlap with already-
-    // finalized content), the publisher's processNext returns noop
-    // BEFORE running any seal preflight (async-lift-publisher-impl.ts:
-    // 295-297). Skip the seal compute — there's nothing on-chain to
-    // attribute and `canonicalPublishPayload` would fail on an empty
-    // quad list anyway.
+    // Full overlap → publisher returns noop without checking the seal.
     if (
       subtracted.resolved.quads.length === 0 &&
       (subtracted.resolved.privateQuads?.length ?? 0) === 0
@@ -4093,73 +3928,34 @@ export class DKGAgent {
       subtracted.resolved.privateQuads ?? [],
     );
 
-    // Resolve author: same precedence sync `assertionFinalize` uses.
-    //   1. Caller supplied `authorSignTypedData` callback (+ required
-    //      `authorAgentAddress`) → daemon builds typed data and invokes
-    //      callback. Self-sovereign-friendly: no keystore lookup.
-    //   2. Caller named a registered local agent → daemon's custodial
-    //      key signs (no key in API call). Self-sovereign registrations
-    //      throw, directing the caller to use callback or
-    //      preSignedAuthorAttestation.
-    //   3. No agent named → publisher's own EOA signs (legacy).
+    // Resolve author (callback → custodial keystore → publisher fallback).
     let authorAddress: string;
     let signerPrivateKey: string | undefined;
     if (authorSignTypedData !== undefined) {
-      // The caller commits that the callback's signature corresponds
-      // to `authorAgentAddress`. We don't consult the keystore (the
-      // key may be off-node). The caller's invariant is enforced
-      // downstream by the publisher's SEAL INTEGRITY PREFLIGHT, which
-      // recovers the signing address from `(typedData, sig)` and
-      // rejects on mismatch.
-      authorAddress = authorAgentAddress as string; // publishAsync validated non-undefined
+      authorAddress = authorAgentAddress as string;
     } else if (authorAgentAddress != null) {
       const mode = this.getLocalAgentMode(authorAgentAddress);
       if (mode === undefined) {
-        throw new Error(
-          `publishAsync: authorAgentAddress ${authorAgentAddress} is not a registered local agent on this node. ` +
-            `Use \`agent.registerAgent(name)\` first.`,
-        );
+        throw new Error(`publishAsync: ${authorAgentAddress} is not a registered local agent`);
       }
       if (mode === 'self-sovereign') {
         throw new Error(
-          `publishAsync: agent ${authorAgentAddress} is self-sovereign — this node does not hold its private key. ` +
-            `Supply an \`authorSignTypedData\` callback (daemon prepares typed data, caller signs externally) ` +
-            `or pass a \`preSignedAuthorAttestation\` with the bytes pre-computed off-node.`,
+          `publishAsync: agent ${authorAgentAddress} is self-sovereign — supply ` +
+            'authorSignTypedData callback or preSignedAuthorAttestation instead',
         );
       }
       signerPrivateKey = this.getCustodialAgentPrivateKey(authorAgentAddress);
       if (!signerPrivateKey) {
-        throw new Error(
-          `publishAsync: custodial agent ${authorAgentAddress} has no private key on file`,
-        );
+        throw new Error(`publishAsync: custodial agent ${authorAgentAddress} has no private key`);
       }
       authorAddress = authorAgentAddress;
     } else {
-      // Match sync `assertionFinalize` / `publishFromSharedMemory` —
-      // they call these methods without cgId. Threading cgId here
-      // would surface a latent `getPublisherSigner` signer-fallback
-      // divergence (where the resolved address is the per-CG publisher
-      // wallet but the actual signer falls back to the chain
-      // adapter's default), producing seals whose recovered signer
-      // doesn't match the recorded authorAddress. Codex PR #455
-      // comment 3 surfaced this case; the deeper fix lives in
-      // `DKGPublisher.getPublisherSigner` (signTypedData fallback
-      // verification, mirroring the existing signMessage path) and
-      // is out of scope for this PR. Tracked as follow-up.
       const fallback = await this.publisher.publisherFallbackAuthorAddress();
       if (!fallback) {
-        // Fail-fast at enqueue rather than silently enqueueing a
-        // seal-less job that the publisher will reject at processNext
-        // (codex PR #455 comment 2). The chain IS V10-ready and the
-        // CG IS on-chain — so the publish path REQUIRES a seal. No
-        // fallback signer means the operator has not configured one
-        // and we have nothing to attribute the seal to.
         throw new Error(
-          'publishAsync: no agent override supplied (authorAgentAddress / authorSignTypedData / ' +
-            'preSignedAuthorAttestation) and no publisher signer is configured for this context graph. ' +
-            'Either register a custodial agent via `agent.registerAgent(name)` and pass its address as ' +
-            '`authorAgentAddress`, supply a pre-signed seal via `preSignedAuthorAttestation`, or configure ' +
-            'a publisher private key on the daemon.',
+          'publishAsync: no author override and no publisher signer configured. ' +
+            'Pass authorAgentAddress / authorSignTypedData / preSignedAuthorAttestation, ' +
+            'or configure a publisher private key.',
         );
       }
       authorAddress = fallback;
@@ -4174,34 +3970,13 @@ export class DKGAgent {
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
     });
 
-    let r: Uint8Array;
-    let vs: Uint8Array;
-    if (authorSignTypedData !== undefined) {
-      // Self-sovereign callback path: caller signs externally against
-      // the daemon-prepared canonical typed data.
-      const sig = await authorSignTypedData(typedData);
-      r = sig.r;
-      vs = sig.vs;
-    } else if (signerPrivateKey) {
-      const wallet = new ethers.Wallet(
-        signerPrivateKey.startsWith('0x') ? signerPrivateKey : '0x' + signerPrivateKey,
-      );
-      const sigHex = await wallet.signTypedData(
-        typedData.domain,
-        typedData.types,
-        typedData.message,
-      );
-      const sig = ethers.Signature.from(sigHex);
-      r = ethers.getBytes(sig.r);
-      vs = ethers.getBytes(sig.yParityAndS);
-    } else {
-      // No cgId — matches sync `assertionFinalize`. See the comment
-      // above the fallback-address resolution for why threading
-      // cgId here exposes a latent signer-fallback divergence.
-      const sig = await this.publisher.signAuthorAttestationAsPublisher(typedData);
-      r = sig.r;
-      vs = sig.vs;
-    }
+    const { r, vs } = await (
+      authorSignTypedData !== undefined
+        ? authorSignTypedData(typedData)
+        : signerPrivateKey
+          ? signWithPrivateKey(signerPrivateKey, typedData)
+          : this.publisher.signAuthorAttestationAsPublisher(typedData)
+    );
 
     return {
       merkleRoot: ethers.hexlify(canonical.kcMerkleRoot) as `0x${string}`,

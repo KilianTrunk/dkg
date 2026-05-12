@@ -1,30 +1,7 @@
-// Shared canonicalization pipeline for the publish flow.
-//
-// Both `agent.publishAsync` (at lift-enqueue time) and
-// `DKGPublisher.publish` (at processNext-time) MUST compute the same
-// `kcMerkleRoot` over the same input, otherwise the agent-signed
-// AuthorAttestation seal won't validate against what the publisher
-// finally submits on-chain. Putting this composition in one place
-// guarantees parity by construction — there is no second
-// implementation to drift.
-//
-// Inputs:
-//   - `quads`         — the public quads for this publish
-//   - `privateQuads`  — optional private quads, partitioned per-root
-//                       via the same `subject` / skolemized-genid
-//                       rule that `DKGPublisher.publish` applies
-//                       inline.
-//
-// Output:
-//   - `skolemizedPublicQuads` — flat-ordered post-partition quads
-//     (input to `publishDirect`'s public-data argument).
-//   - `privateRoots` — per-root private merkle roots, in the same
-//     order as `autoPartition` returns roots.
-//   - `kcMerkleRoot` — the flat KC merkle root, V10 keccak256 variant.
-//     This is what the EIP-712 `AuthorAttestation` seal binds to.
-//   - `manifestEntries` — per-root metadata used by the publisher
-//     to construct `publishDirect` manifest args. Agents only need
-//     `kcMerkleRoot`; they can ignore the rest.
+// Shared canonicalization for the publish flow. Both `agent.publishAsync`
+// (enqueue-time) and `DKGPublisher.publish` (processNext-time) compute
+// `kcMerkleRoot` via this single function so the EIP-712 seal binds to
+// the same bytes the publisher submits.
 
 import type { Quad } from '@origintrail-official/dkg-storage';
 import { autoPartition } from './auto-partition.js';

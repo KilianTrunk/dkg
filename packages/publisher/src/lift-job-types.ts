@@ -18,15 +18,7 @@ export interface LiftAuthorityProof {
 
 export type LiftAccessPolicy = 'public' | 'ownerOnly' | 'allowList';
 
-/**
- * EIP-712 AuthorAttestation seal computed at lift-enqueue time over
- * the canonical merkle root the publisher will submit on-chain.
- * `merkleRoot` MUST match what `canonicalPublishPayload()` computes
- * for the resolved workspace slice at processNext-time, otherwise
- * the publisher rejects the job with a merkle-drift error.
- *
- * Hex-encoded for safe JSON persistence in the lift queue store.
- */
+/** EIP-712 AuthorAttestation seal computed at enqueue. Hex-encoded for JSON persistence. */
 export interface LiftRequestAuthorSeal {
   readonly merkleRoot: LiftJobHex;
   readonly authorAddress: LiftJobHex;
@@ -47,30 +39,11 @@ export interface LiftRequest {
   readonly subGraphName?: string;
   readonly accessPolicy?: LiftAccessPolicy;
   readonly allowedPeers?: readonly string[];
-  /**
-   * V10 selective-disclosure flag mirroring `PublishOptions.entityProofs`.
-   * When true, the publisher groups quads by root entity and computes a
-   * per-entity `kaRoot`; the `kcMerkleRoot` becomes a Merkle tree over
-   * those `kaRoot` values (vs. the flat hash of triples). The seal
-   * computed at enqueue MUST honour the same flag so the publisher's
-   * SEAL INTEGRITY PREFLIGHT validates merkle parity.
-   */
+  /** V10 selective-disclosure mode; agent must sign over the same flag value. */
   readonly entityProofs?: boolean;
-  /**
-   * Per-publish override for `PublishOptions.publisherNodeIdentityIdOverride`
-   * (RFC-001 §4 attribution control). Stored as a stringified bigint so
-   * the lift queue's JSON persistence layer can round-trip safely; the
-   * mapper parses back to `bigint` at the lift→publish handoff.
-   * `'0'` is meaningful (mode d — no attribution).
-   */
+  /** RFC-001 §4 attribution; stringified bigint, `'0'` = mode d (no attribution). */
   readonly publisherNodeIdentityIdOverride?: LiftJobBigInt;
-  /**
-   * Author attestation seal computed by the agent at enqueue time.
-   * When present, the publisher consumes it verbatim at processNext-time
-   * (after verifying its merkleRoot matches the publisher's canonical
-   * recompute). When absent on a V10 chain, the on-chain publish fails
-   * loud — there is no implicit fallback to publisher-as-author.
-   */
+  /** Agent-signed seal. Publisher rejects on-chain publish if absent on V10. */
   readonly seal?: LiftRequestAuthorSeal;
 }
 

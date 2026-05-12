@@ -383,42 +383,12 @@ export class DKGPublisher implements Publisher {
     return this.inferAdapterPublisherAddress(contextGraphId, options);
   }
 
-  /**
-   * RFC-001 §9.x — public wrapper around `resolvePublisherAddress` that
-   * `agent.assertionFinalize()` calls when no agent override was
-   * supplied. Mirrors Phase 4 mode (a): the daemon's own publisher
-   * EOA acts as author when the request is admin-scoped.
-   *
-   * Returns `undefined` when no publisher signer is configured
-   * (tentative-only daemon); finalize must then fail because there's
-   * no key to sign with.
-   *
-   * Note: this method intentionally does NOT take a `contextGraphId`
-   * arg. Codex PR #455 review #3 proposed threading cgId for per-CG
-   * `publisherAddressResolver` parity with `DKGPublisher.publish()`,
-   * but doing so surfaces a latent signer-fallback divergence in
-   * `getPublisherSigner` (where `signTypedData` falls back to the
-   * chain adapter's default signer when `signTypedDataAs` is absent)
-   * — producing seals whose recovered signer doesn't match the
-   * recorded `authorAddress`. The cgId-threading change is gated on
-   * a publisher-side fix that mirrors the existing signMessage
-   * recovery+verify into the signTypedData path. Tracked as a
-   * follow-up to PR #455.
-   */
+  /** RFC-001 §9 fallback author when no agent override is supplied. Returns undefined if no signer configured. */
   async publisherFallbackAuthorAddress(): Promise<string | undefined> {
     return this.resolvePublisherAddress();
   }
 
-  /**
-   * RFC-001 §9.x — sign EIP-712 typed data with the publisher's own
-   * wallet (publisherPrivateKey or chain adapter's signer). Used by
-   * `agent.assertionFinalize()` when no agent override is supplied,
-   * so that the seal can still be produced for admin-scoped
-   * finalize requests.
-   *
-   * Returns the compact `(r, vs)` form expected by KAv10's
-   * AuthorAttestation struct.
-   */
+  /** Sign EIP-712 typed data with the publisher's own wallet. Returns KAv10's compact (r, vs). */
   async signAuthorAttestationAsPublisher(typedData: {
     domain: { name: string; version: string; chainId: bigint; verifyingContract: string };
     types: Record<string, Array<{ name: string; type: string }>>;
@@ -1429,9 +1399,7 @@ export class DKGPublisher implements Publisher {
     return unique;
   }
 
-  async publish(originalOptions: PublishOptions): Promise<PublishResult> {
-    // Allow inline rewrite when minting a publisher-fallback seal below.
-    let options: PublishOptions = originalOptions;
+  async publish(options: PublishOptions): Promise<PublishResult> {
     // Sub-graph routing: data triples go to `did:dkg:context-graph:{id}/{subGraph}`.
     // KC metadata (status, authorship proofs) stays in the root `_meta` graph so that
     // AccessHandler.lookupKAMeta() and DKGQueryEngine.resolveKA() can still discover
@@ -1554,9 +1522,6 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:ensureContextGraph', 'end');
 
     onPhase?.('prepare:partition', 'start');
-    // Shared canonicalization — same code path the agent runs at lift-
-    // enqueue time. Guarantees the seal's merkle matches what we
-    // submit on-chain (parity by construction, not by convention).
     const canonical = canonicalPublishPayload(quads, privateQuads);
     onPhase?.('prepare:partition', 'end');
 
@@ -1617,8 +1582,6 @@ export class DKGPublisher implements Publisher {
     this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store`);
     await this.store.insert(normalizedQuads);
 
-    // Store private quads — same per-root partitioning the shared
-    // canonical pipeline used, so what we persist matches what we sealed.
     for (const entry of canonical.manifestEntries) {
       const entityPrivateQuads = privateQuads.filter(
         (q) => q.subject === entry.rootEntity || q.subject.startsWith(entry.rootEntity + '/.well-known/genid/'),

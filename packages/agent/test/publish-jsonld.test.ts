@@ -1039,7 +1039,7 @@ describe('publishJsonLd', () => {
           },
           { localOnly: true },
         ),
-      ).rejects.toThrow(/no publisher signer is configured|no agent override supplied/);
+      ).rejects.toThrow(/no publisher signer|no author override/);
     } finally {
       publisher.publisherFallbackAuthorAddress = original;
     }

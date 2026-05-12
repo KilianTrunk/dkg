@@ -107,12 +107,7 @@ export function mapLiftRequestToPublishOptions(input: LiftPublishMappingInput): 
     throw new Error('Lift publish mapping only allows allowedPeers when accessPolicy is allowList');
   }
 
-  // Per-publish behaviour flags routed via the LiftRequest (caller-
-  // intent, persisted at enqueue) take precedence over per-process
-  // resolution hints (publisher-side defaults set when resolving the
-  // workspace slice). The mapper falls back to `resolved` for
-  // backward compatibility with callers that set these at resolve
-  // time rather than enqueue time.
+  // Request flags (enqueue-time caller intent) win over resolved hints (per-process defaults).
   const entityProofs = input.request.entityProofs ?? input.resolved.entityProofs;
   const publisherNodeIdentityIdOverride = input.request.publisherNodeIdentityIdOverride !== undefined
     ? BigInt(input.request.publisherNodeIdentityIdOverride)
@@ -136,10 +131,7 @@ export function mapLiftRequestToPublishOptions(input: LiftPublishMappingInput): 
     ...(publisherNodeIdentityIdOverride !== undefined
       ? { publisherNodeIdentityIdOverride }
       : {}),
-    // Lift-time author seal → publisher's `precomputedAttestation`.
-    // The publisher's SEAL INTEGRITY PREFLIGHT recomputes the merkle
-    // from the resolved slice and compares against this — drift kills
-    // the job loudly instead of silently downgrading.
+    // Publisher's SEAL INTEGRITY PREFLIGHT validates this against its own recomputed merkle.
     ...(input.request.seal !== undefined
       ? { precomputedAttestation: liftSealToPrecomputedAttestation(input.request.seal) }
       : {}),
@@ -163,16 +155,7 @@ function liftSealToPrecomputedAttestation(seal: NonNullable<LiftRequest['seal']>
   };
 }
 
-/**
- * Decode a hex-encoded seal field with content + length validation.
- *
- * Uses `ethers.getBytes` (rejects non-hex characters) and binds expected
- * lengths so a malformed persisted seal can't be silently mutated into
- * the wrong size. The previous home-grown `parseInt`-based decoder
- * silently turned `NaN` into `0`, producing a corrupted attestation
- * that the publisher would then submit on-chain — caught by codex
- * review on PR #455.
- */
+/** Validating hex → bytes decoder with bound length check. */
 function decodeSealField(
   fieldName: string,
   hex: string,

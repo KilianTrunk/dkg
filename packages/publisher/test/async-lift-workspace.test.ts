@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { GraphManager, OxigraphStore, PrivateContentStore, SharedMemoryLiteralBlobStore } from '@origintrail-official/dkg-storage';
 import { NoChainAdapter } from '@origintrail-official/dkg-chain';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
-import { DKGPublisher, generateSubGraphRegistration } from '../src/index.js';
+import { DKGPublisher, FileWorkspacePublicSnapshotStore, generateSubGraphRegistration } from '../src/index.js';
 import { resolveLiftWorkspaceSlice, resolveWorkspaceSelection } from '../src/workspace-resolution.js';
 
 const CONTEXT_GRAPH = 'test-workspace';
@@ -387,17 +387,90 @@ describe('async lift workspace resolution', () => {
     }
   });
 
+  it('stores immutable public operation snapshots as disk refs when configured', async () => {
+    const snapshotDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-public-snapshots-'));
+    const publicSnapshotStore = new FileWorkspacePublicSnapshotStore(snapshotDir);
+    const keypair = await generateEd25519Keypair();
+    const snapshotPublisher = new DKGPublisher({
+      store,
+      chain: new NoChainAdapter(),
+      eventBus: new TypedEventBus(),
+      keypair,
+      publicSnapshotStore,
+    });
+
+    try {
+      const marker = 'disk-public-snapshot-marker';
+      const write = await snapshotPublisher.share(CONTEXT_GRAPH, [
+        { subject: ENTITY, predicate: 'http://schema.org/name', object: JSON.stringify(`${marker}-${'x'.repeat(1024)}`), graph: '' },
+      ], { publisherPeerId: 'peer1' });
+
+      const metaGraph = graphManager.sharedMemoryMetaUri(CONTEXT_GRAPH);
+      const metadata = await store.query(
+        `SELECT ?snapshotRef ?snapshotGraph ?payload WHERE {
+          GRAPH <${metaGraph}> {
+            ?s <${DKG}shareOperationId> "${write.shareOperationId}" .
+            OPTIONAL { ?s <${DKG}publicSnapshotRef> ?snapshotRef }
+            OPTIONAL { ?s <${DKG}publicSnapshotGraph> ?snapshotGraph }
+            OPTIONAL { ?s <${DKG}publicStagedQuads> ?payload }
+          }
+        }`,
+      );
+      expect(metadata.type).toBe('bindings');
+      if (metadata.type === 'bindings') {
+        expect(metadata.bindings.some((row) => row['snapshotRef']?.includes('sha256:'))).toBe(true);
+        expect(metadata.bindings.some((row) => row['snapshotGraph'])).toBe(false);
+        expect(metadata.bindings.some((row) => row['payload'])).toBe(false);
+        expect(JSON.stringify(metadata.bindings)).not.toContain(marker);
+      }
+
+      const snapshotGraphRows = await store.query(
+        `SELECT ?g WHERE {
+          GRAPH ?g { ?s ?p ?o }
+          FILTER(CONTAINS(STR(?g), "/_shared_memory_snapshots/"))
+        } LIMIT 1`,
+      );
+      expect(snapshotGraphRows.type).toBe('bindings');
+      if (snapshotGraphRows.type === 'bindings') {
+        expect(snapshotGraphRows.bindings).toHaveLength(0);
+      }
+
+      const resolved = await resolveLiftWorkspaceSlice({
+        store,
+        graphManager,
+        publicSnapshotStore,
+        request: {
+          swmId: 'swm-main',
+          shareOperationId: write.shareOperationId,
+          roots: [ENTITY],
+          contextGraphId: CONTEXT_GRAPH,
+          namespace: 'aloha',
+          scope: 'person-profile',
+          transitionType: 'CREATE',
+          authority: { type: 'owner', proofRef: 'proof:owner:1' },
+        },
+      });
+      expect(resolved.quads).toHaveLength(1);
+      expect(resolved.quads[0]?.object).toContain(marker);
+    } finally {
+      await rm(snapshotDir, { recursive: true, force: true });
+    }
+  });
+
   it('resolves compact share metadata against hydrated external SWM literals', async () => {
     const blobDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-literal-blobs-'));
+    const snapshotDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-public-snapshots-'));
     const inner = new OxigraphStore();
     const wrappedStore = new SharedMemoryLiteralBlobStore(inner, { blobDir, thresholdBytes: 20 });
     const wrappedGraphManager = new GraphManager(wrappedStore);
+    const publicSnapshotStore = new FileWorkspacePublicSnapshotStore(snapshotDir);
     const keypair = await generateEd25519Keypair();
     const wrappedPublisher = new DKGPublisher({
       store: wrappedStore,
       chain: new NoChainAdapter(),
       eventBus: new TypedEventBus(),
       keypair,
+      publicSnapshotStore,
     });
     const largeValue = `externalized-${'x'.repeat(1024)}`;
     const largeLiteral = JSON.stringify(largeValue);
@@ -420,6 +493,7 @@ describe('async lift workspace resolution', () => {
       const resolved = await resolveLiftWorkspaceSlice({
         store: wrappedStore,
         graphManager: wrappedGraphManager,
+        publicSnapshotStore,
         request: {
           swmId: 'swm-main',
           shareOperationId: write.shareOperationId,
@@ -438,11 +512,12 @@ describe('async lift workspace resolution', () => {
 
       const metaGraph = wrappedGraphManager.sharedMemoryMetaUri(CONTEXT_GRAPH);
       const metadata = await wrappedStore.query(
-        `SELECT ?digest ?count ?payload ?snapshotGraph WHERE {
+        `SELECT ?digest ?count ?payload ?snapshotRef ?snapshotGraph WHERE {
           GRAPH <${metaGraph}> {
             OPTIONAL { ?s <${DKG}publicQuadsDigest> ?digest }
             OPTIONAL { ?s <${DKG}publicQuadsCount> ?count }
             OPTIONAL { ?s <${DKG}publicStagedQuads> ?payload }
+            OPTIONAL { ?s <${DKG}publicSnapshotRef> ?snapshotRef }
             OPTIONAL { ?s <${DKG}publicSnapshotGraph> ?snapshotGraph }
           }
         }`,
@@ -452,24 +527,14 @@ describe('async lift workspace resolution', () => {
         expect(metadata.bindings.some((row) => row['digest']?.includes('sha256:'))).toBe(true);
         expect(metadata.bindings.some((row) => row['count'] === '"1"^^<http://www.w3.org/2001/XMLSchema#integer>')).toBe(true);
         expect(metadata.bindings.some((row) => row['payload'])).toBe(false);
+        expect(metadata.bindings.some((row) => row['snapshotRef']?.includes('sha256:'))).toBe(true);
+        expect(metadata.bindings.some((row) => row['snapshotGraph'])).toBe(false);
         expect(JSON.stringify(metadata.bindings)).not.toContain('externalized-');
-      }
-
-      const snapshotGraph = metadata.type === 'bindings'
-        ? metadata.bindings.find((row) => row['snapshotGraph'])?.['snapshotGraph']
-        : undefined;
-      if (!snapshotGraph) throw new Error('Expected compact metadata to include publicSnapshotGraph');
-      const rawSnapshot = await inner.query(
-        `SELECT ?o WHERE { GRAPH <${snapshotGraph}> { <${ENTITY}> <http://schema.org/name> ?o } } LIMIT 1`,
-      );
-      expect(rawSnapshot.type).toBe('bindings');
-      if (rawSnapshot.type === 'bindings') {
-        expect(rawSnapshot.bindings[0]?.['o']).toContain('sha256:');
-        expect(rawSnapshot.bindings[0]?.['o']).not.toContain('externalized-');
       }
     } finally {
       await wrappedStore.close().catch(() => {});
       await rm(blobDir, { recursive: true, force: true });
+      await rm(snapshotDir, { recursive: true, force: true });
     }
   });
 

@@ -32,6 +32,7 @@ import {
   type KAMetadata,
 } from './metadata.js';
 import { storeWorkspaceOperationPublicQuads } from './workspace-resolution.js';
+import type { WorkspacePublicSnapshotStore } from './workspace-snapshot-store.js';
 import { ethers } from 'ethers';
 import type { WorkspaceAgentRecipientResolver } from './workspace-agent-recipients.js';
 
@@ -63,6 +64,8 @@ export interface DKGPublisherConfig {
   workspaceAgentRecipientResolver?: WorkspaceAgentRecipientResolver;
   /** Encrypts private/agent-gated SWM gossip with the node's Sender Key epoch state. */
   workspaceSenderKeyEncryptor?: WorkspaceSenderKeyEncryptor;
+  /** Optional out-of-Oxigraph store for immutable public SWM operation snapshots. */
+  publicSnapshotStore?: WorkspacePublicSnapshotStore;
 }
 
 export interface WorkspaceSenderKeyEncryptInput {
@@ -342,6 +345,7 @@ export class DKGPublisher implements Publisher {
   private readonly sessionId = Date.now().toString(36);
   private tentativeCounter = 0;
   readonly writeLocks: Map<string, Promise<void>>;
+  private readonly publicSnapshotStore?: WorkspacePublicSnapshotStore;
 
   constructor(config: DKGPublisherConfig) {
     this.store = config.store;
@@ -394,6 +398,7 @@ export class DKGPublisher implements Publisher {
     this.writeLocks = config.writeLocks ?? new Map();
     this.workspaceAgentRecipientResolver = config.workspaceAgentRecipientResolver;
     this.workspaceSenderKeyEncryptor = config.workspaceSenderKeyEncryptor;
+    this.publicSnapshotStore = config.publicSnapshotStore;
   }
 
   setWorkspaceAgentRecipientResolver(resolver: WorkspaceAgentRecipientResolver | undefined): void {
@@ -901,6 +906,7 @@ export class DKGPublisher implements Publisher {
       publisherPeerId: options.publisherPeerId,
       subGraphName: options.subGraphName,
       timestamp: operationTimestamp,
+      publicSnapshotStore: this.publicSnapshotStore,
     });
 
     if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {
@@ -3234,6 +3240,7 @@ export class DKGPublisher implements Publisher {
         publisherPeerId: opts.publisherPeerId,
         subGraphName: opts.subGraphName,
         timestamp: operationTimestamp,
+        publicSnapshotStore: this.publicSnapshotStore,
       });
 
       if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {

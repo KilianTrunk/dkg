@@ -267,6 +267,34 @@ counts, write timing summaries, replication polls, metadata counts for
 `publicStagedQuads` delta, and an appended log scan for known
 Oxigraph/GossipSub failure signatures when a devnet directory is available.
 
+### SWM Triple-Volume Benchmark
+
+The live SWM triple-volume benchmark is aimed at Oxigraph graph/index scale,
+not large literal storage. It writes many small triples through every node in a
+running devnet, waits until every node can count all replicated benchmark
+triples from shared working memory, and stores a JSON report with write timing,
+replication polls, sample triples, and log-scan results.
+
+For a 5-node run targeting roughly 1 GiB of serialized N-Quad triples per node:
+
+```bash
+DEVNET_SWM_SYNC_ON_CONNECT=0 ./scripts/devnet.sh start 5
+pnpm bench:swm-triple-volume -- \
+  --ports 20101,20102,20103,20104,20105 \
+  --target-gib-per-node 1 \
+  --triples-per-write 1000 \
+  --write-concurrency 5 \
+  --output bench/results/swm-triple-volume-1gib-per-node.json
+```
+
+The target is based on estimated serialized N-Quad bytes for generated triples.
+This benchmark can be much harder on local Oxigraph than the large-literal
+benchmark because every triple and index entry still lives in the RDF store.
+`DEVNET_SWM_SYNC_ON_CONNECT=0` avoids a peer-connect catch-up storm during bulk
+write runs; live SWM gossip still replicates new writes. The report also checks
+that per-operation public snapshots are stored as disk refs, not Oxigraph
+snapshot graphs or `dkg:publicStagedQuads` literals.
+
 ## Extending the Node
 
 The V9 "installable apps" framework (iframe-hosted third-party UIs loaded from

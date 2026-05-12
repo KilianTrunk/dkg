@@ -460,11 +460,19 @@ This is intentionally asymmetric:
     (`dkg:publicSliceRootEntity`) so a regression on
     `urn:dkg:public-stage:*` records is not missed.
 
+- `packages/cli/scripts/swm-triple-volume-benchmark.cjs`
+  - Adds a separate live multi-node benchmark for many-small-triple SWM scale.
+  - Targets estimated serialized N-Quad bytes per node, for example
+    `--target-gib-per-node 1`.
+  - Uses count queries and one sample triple per node so verification does not
+    pull the full graph back into the client.
+
 - Tests:
   - `packages/storage/test/external-literal-store.test.ts`
   - `packages/publisher/test/async-lift-workspace.test.ts`
   - `packages/agent/test/large-literal-storage.test.ts`
   - `packages/cli/test/swm-large-payload-benchmark.test.ts`
+  - `packages/cli/test/swm-triple-volume-benchmark.test.ts`
 
 ## Test Coverage
 
@@ -496,6 +504,7 @@ Focused validation commands:
 pnpm --filter @origintrail-official/dkg-storage exec vitest run test/storage.test.ts test/external-literal-store.test.ts
 pnpm --filter @origintrail-official/dkg-publisher exec vitest run test/async-lift-workspace.test.ts
 pnpm --filter @origintrail-official/dkg exec vitest run test/swm-large-payload-benchmark.test.ts
+pnpm --filter @origintrail-official/dkg exec vitest run test/swm-triple-volume-benchmark.test.ts
 pnpm --filter @origintrail-official/dkg-agent exec vitest run test/large-literal-storage.test.ts
 pnpm --filter @origintrail-official/dkg-storage build
 pnpm --filter @origintrail-official/dkg-publisher build

@@ -67,11 +67,13 @@ import {
   validateLiftPublishPayload,
   subtractFinalizedExactQuads,
   TripleStoreAsyncLiftPublisher,
+  FileWorkspacePublicSnapshotStore,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
   type WorkspaceAgentRecipient,
   type WorkspaceSenderKeyEncryptInput,
+  type SharedMemoryPublicSnapshotStorageConfig, type WorkspacePublicSnapshotStore,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
 import { join } from 'node:path';
@@ -670,6 +672,10 @@ export interface DKGAgentConfig {
   storeConfig?: TripleStoreConfig;
   /** Out-of-line storage for large public SWM RDF literal object terms. Defaults on for local Oxigraph-backed dataDir stores. */
   largeLiteralStorage?: LargeLiteralStorageConfig;
+  /** Out-of-Oxigraph immutable public SWM operation snapshots. Defaults on when dataDir is set. */
+  sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
+  /** When false, peer-connect sync skips SWM catch-up and relies on gossip for new SWM writes. */
+  syncSharedMemoryOnConnect?: boolean;
   /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
   nodeRole?: 'core' | 'edge';
   /**
@@ -890,6 +896,14 @@ function defaultLargeLiteralStorage(
   };
 }
 
+function createPublicSnapshotStore(
+  dataDir: string | undefined,
+  config: SharedMemoryPublicSnapshotStorageConfig | undefined,
+): WorkspacePublicSnapshotStore | undefined {
+  if (!dataDir || config?.enabled === false) return undefined;
+  return new FileWorkspacePublicSnapshotStore(config?.directory ?? join(dataDir, 'swm-public-snapshots'));
+}
+
 function applyDefaultLargeLiteralStorage(
   storeConfig: TripleStoreConfig,
   dataDir: string | undefined,
@@ -939,6 +953,7 @@ export class DKGAgent {
   private readonly workspaceOwnedEntities: Map<string, Map<string, string>>;
   /** Shared write locks so gossip writes serialize against local CAS writes. */
   private readonly writeLocks: Map<string, Promise<void>>;
+  private readonly publicSnapshotStore?: WorkspacePublicSnapshotStore;
   private sharedMemoryHandler?: InstanceType<typeof SharedMemoryHandler>;
   private gossipPublishHandler?: GossipPublishHandler;
   private finalizationHandler?: FinalizationHandler;
@@ -1108,6 +1123,7 @@ export class DKGAgent {
     chain: ChainAdapter,
     workspaceOwnedEntities: Map<string, Map<string, string>>,
     writeLocks: Map<string, Promise<void>>,
+    publicSnapshotStore?: WorkspacePublicSnapshotStore,
   ) {
     this.config = config;
     this.wallet = wallet;
@@ -1117,6 +1133,7 @@ export class DKGAgent {
     this.queryEngine = queryEngine;
     this.workspaceOwnedEntities = workspaceOwnedEntities;
     this.writeLocks = writeLocks;
+    this.publicSnapshotStore = publicSnapshotStore;
     this.eventBus = eventBus;
     this.chain = chain;
     this.discovery = new DiscoveryClient(queryEngine);
@@ -1205,6 +1222,7 @@ export class DKGAgent {
     const node = new DKGNode(nodeConfig);
     const workspaceOwnedEntities = new Map<string, Map<string, string>>();
     const writeLocks = new Map<string, Promise<void>>();
+    const publicSnapshotStore = createPublicSnapshotStore(config.dataDir, config.sharedMemoryPublicSnapshotStorage);
     const legacyAdapterOperationalKey = opKeys?.[0];
     const legacyAdapterOperationalAddress = privateKeyAddress(legacyAdapterOperationalKey);
     const configuredPublisherAddress = normalizeAdapterPublisherAddress(config.publisherAddress);
@@ -1232,6 +1250,7 @@ export class DKGAgent {
         : (contextGraphId?: bigint) => inferAdapterPublisherAddress(chain, contextGraphId),
       sharedMemoryOwnedEntities: workspaceOwnedEntities,
       writeLocks,
+      publicSnapshotStore,
     });
 
     try {
@@ -1249,7 +1268,7 @@ export class DKGAgent {
 
     return new DKGAgent(
       config, wallet, node, store, publisher, queryEngine, eventBus, chain,
-      workspaceOwnedEntities, writeLocks,
+      workspaceOwnedEntities, writeLocks, publicSnapshotStore,
     );
   }
 
@@ -2244,6 +2263,7 @@ export class DKGAgent {
       refreshMetaSyncedFlags: (contextGraphIds) => this.refreshMetaSyncedFlags(contextGraphIds),
       discoverContextGraphsFromStore: () => this.discoverContextGraphsFromStore(),
       syncSharedMemoryFromPeer: (peerId, contextGraphIds) => this.syncSharedMemoryFromPeer(peerId, contextGraphIds),
+      syncSharedMemoryOnConnect: this.config.syncSharedMemoryOnConnect ?? true,
       logInfo: (ctx, message) => this.log.info(ctx, message),
       onPeerSkippedNoSync: (peerId) => {
         this.skippedNoSyncPeers.add(peerId);
@@ -4929,7 +4949,9 @@ export class DKGAgent {
       }
     }
 
-    const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store, {
+      publicSnapshotStore: this.publicSnapshotStore,
+    });
     const captureID = await asyncPublisher.lift({
       ...liftRequestDraft,
       ...(seal !== undefined ? { seal } : {}),
@@ -6887,6 +6909,7 @@ export class DKGAgent {
         workspaceRecipientPrivateKeys: () => this.getLocalWorkspaceRecipientPrivateKeys(),
         workspaceSenderKeyDecryptor: (message: SwmSenderKeyMessageMsg, contextGraphId: string, ctx: OperationContext) =>
           this.decryptWorkspacePayloadWithSenderKey(message, contextGraphId, ctx),
+        publicSnapshotStore: this.publicSnapshotStore,
       });
     }
     return this.sharedMemoryHandler;

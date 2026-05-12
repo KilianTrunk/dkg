@@ -27,6 +27,7 @@ import { generateOwnershipQuads, generateSubGraphRegistration } from './metadata
 import { parseSimpleNQuads } from './publish-handler.js';
 import { storeWorkspaceOperationPublicQuads } from './workspace-resolution.js';
 import type { KAManifestEntry } from './publisher.js';
+import type { WorkspacePublicSnapshotStore } from './workspace-snapshot-store.js';
 
 interface WorkspaceGossipDecodeResult {
   request?: WorkspacePublishRequestMsg;
@@ -61,6 +62,7 @@ export class SharedMemoryHandler {
   ) => readonly WorkspaceRecipientEncryptionKey[] | Promise<readonly WorkspaceRecipientEncryptionKey[]>;
   private readonly workspaceSenderKeyDecryptor?: WorkspaceSenderKeyDecryptor;
   private readonly now: () => number;
+  private readonly publicSnapshotStore?: WorkspacePublicSnapshotStore;
   private readonly log = new Logger('SharedMemoryHandler');
 
   constructor(
@@ -75,6 +77,7 @@ export class SharedMemoryHandler {
       ) => readonly WorkspaceRecipientEncryptionKey[] | Promise<readonly WorkspaceRecipientEncryptionKey[]>;
       workspaceSenderKeyDecryptor?: WorkspaceSenderKeyDecryptor;
       now?: () => number;
+      publicSnapshotStore?: WorkspacePublicSnapshotStore;
     },
   ) {
     this.store = store;
@@ -88,6 +91,7 @@ export class SharedMemoryHandler {
     this.workspaceRecipientPrivateKeys = options?.workspaceRecipientPrivateKeys;
     this.workspaceSenderKeyDecryptor = options?.workspaceSenderKeyDecryptor;
     this.now = options?.now ?? (() => Date.now());
+    this.publicSnapshotStore = options?.publicSnapshotStore;
   }
 
   private async withWriteLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
@@ -395,6 +399,7 @@ export class SharedMemoryHandler {
           publisherPeerId,
           subGraphName,
           timestamp: operationTimestamp,
+          publicSnapshotStore: this.publicSnapshotStore,
         });
 
         if (!this.sharedMemoryOwnedEntities.has(swmOwnershipKey)) {

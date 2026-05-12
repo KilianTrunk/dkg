@@ -3864,9 +3864,23 @@ export class DKGAgent {
     let seal: LiftRequestAuthorSeal | undefined;
     if (opts?.preSignedAuthorAttestation) {
       seal = preSignedAttestationToLiftSeal(opts.preSignedAuthorAttestation);
+    } else if (opts?.authorSignTypedData !== undefined) {
+      // Caller-supplied signing callback (wallet, HSM, etc.) — propagate
+      // signing errors so the publisher API caller learns immediately
+      // rather than discovering the failure later as a tentative job.
+      // Chain-prereq misses (CG not on-chain) still degrade quietly:
+      // buildAsyncLiftSeal returns `undefined` for those before reaching
+      // the callback. Only the callback's own errors escape here.
+      seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, opts.authorSignTypedData);
     } else {
+      // Daemon-internal signing (custodial agent or publisher fallback).
+      // Mirror sync `_publish` at `dkg-agent.ts:4047` — chain-prereq
+      // failures degrade to a sealless enqueue + warning. The publisher
+      // gate at `dkg-publisher.ts:1825` skips on-chain when the CG is
+      // not on-chain (tentative); when it IS on-chain it rejects
+      // sealless V10 publishes with a clear error at processNext-time.
       try {
-        seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, opts?.authorSignTypedData);
+        seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, undefined);
       } catch (err) {
         this.log.warn(
           ctx,

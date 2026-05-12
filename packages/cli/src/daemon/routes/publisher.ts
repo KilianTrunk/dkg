@@ -427,7 +427,9 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
       ...(subGraphName ? { subGraphName } : {}),
       ...(accessPolicy ? { accessPolicy } : {}),
       ...(Array.isArray(allowedPeers) && allowedPeers.length > 0 ? { allowedPeers } : {}),
-      ...(entityProofs !== undefined ? { entityProofs: !!entityProofs } : {}),
+      // Strict boolean at HTTP boundary — `!!"false"` is `true`, which
+      // would silently invert caller intent. Other types are ignored.
+      ...(typeof entityProofs === 'boolean' ? { entityProofs } : {}),
       ...(publisherNodeIdentityIdOverride !== undefined
         ? { publisherNodeIdentityIdOverride: String(publisherNodeIdentityIdOverride) }
         : {}),

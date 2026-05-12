@@ -55,36 +55,66 @@ Security. We do not use it anywhere; `codex-review.yml` uses the safer
 `github.event.pull_request.head.repo.full_name == github.repository`
 to short-circuit fork PRs.
 
-### 4. `npm-continuous-publish.yml` is gated by a `verify-environment` preflight
+### 4. `npm-continuous-publish.yml` separates verification, code execution, and credential access
 
-The workflow is split into two jobs that handle NPM_TOKEN's blast radius
-in two layers:
+The workflow is split into **three** jobs so the credential-bearing job
+never runs repository or package code:
 
-- A `verify-environment` job (**no** `environment:` block, **no**
-  `NPM_TOKEN` in scope) runs first. It queries
-  `GET /repos/{owner}/{repo}/environments/npm-publish` via the REST API
-  with the workflow `GITHUB_TOKEN` (scoped `contents: read` +
-  `actions: read`) and fails the job if the environment is missing OR if
-  it has zero required reviewers. This closes the silent
-  auto-creation hole: GitHub auto-creates an unconfigured environment
-  with no protection rules, so a bare `environment: npm-publish` is not
-  in itself a gate.
-- A `publish` job with `needs: verify-environment` and
-  `environment: npm-publish`. This is the ONLY job that has `NPM_TOKEN`
-  in its env. Because `needs:` blocks the job from starting until the
-  preflight passes, `NPM_TOKEN` is never injected into a runner whose
-  environment is unprotected.
+- `verify-environment` — **no** `environment:`, **no** `NPM_TOKEN`,
+  **no** repo checkout. Queries the `npm-publish` environment via the
+  GitHub REST API and asserts:
+  1. environment exists,
+  2. has ≥1 required reviewer,
+  3. `prevent_self_review` is true,
+  4. a `wait_timer > 0` is configured,
+  5. `deployment_branch_policy` restricts the environment to the
+     release branch (`main`) — either via "protected branches only" or
+     an explicit custom allow-list containing `main` and no wildcards.
+  All five checks fail-closed. The job only has `contents: read` +
+  `actions: read` (the minimum scope for the environments API).
+- `build-and-pack` — `needs: verify-environment`. **No** `environment:`,
+  **no** `NPM_TOKEN`. Runs `pnpm install`, `pnpm build`, bumps each
+  public package to the dev pre-release suffix, then `pnpm pack`s each
+  one (`prepack`/`prepare` lifecycle hooks run HERE, with no
+  credentials in scope). Tarballs and a `SHASUMS256.txt` manifest are
+  uploaded as a workflow artifact.
+- `publish` — `needs: [verify-environment, build-and-pack]`,
+  `environment: npm-publish`, `permissions: { contents: read,
+  id-token: write }`. This is the ONLY job that has `NPM_TOKEN` in its
+  env. It does NOT check out the source tree (nothing for `npm publish
+  <tarball>` to consume from it), downloads the artifact, re-verifies
+  `SHASUMS256.txt` against the downloaded tarballs, and runs
+  `npm publish <tarball> --ignore-scripts --provenance --tag dev`
+  for each tarball. `--ignore-scripts` is mandatory: lifecycle hooks
+  do not run with `NPM_TOKEN` in scope on the publish job.
 
-Why the split: GitHub resolves `environment:` and injects its secrets
-**before** the first step of a job runs. A verification step that lives
-inside the publish job cannot prevent NPM_TOKEN exposure — by the time
-step 1 logs `Run …`, the secret is already in the runner's env.
-Promoting verification to a sibling preflight job (`needs:`) is the
-structural fix.
+Why the three-way split: GitHub resolves `environment:` and injects its
+secrets **before** the first step of a job runs. A verification step
+that lives inside the publish job cannot prevent NPM_TOKEN exposure —
+by the time step 1 logs `Run …`, the secret is already in the runner's
+env. Promoting verification to a sibling preflight job is the
+structural fix for environment misconfiguration. Separating
+build-and-pack from publish is the structural fix for the larger gap
+the security review called out: a credential-bearing job that also
+runs repository/package code is one rogue `postinstall` away from an
+exfiltration. Splitting build from publish closes that door.
 
-When the environment IS correctly configured, the publish job pauses
+When the environment is correctly configured, the publish job pauses
 for reviewer approval + the configured wait timer before `NPM_TOKEN`
-becomes accessible to the build steps.
+becomes accessible to its single `npm publish` step.
+
+**`--tag dev`, not `--tag latest`**: continuous publishes go to the
+`dev` npm dist-tag so `npm install <pkg>` keeps resolving to the most
+recent intentional release. A bad merge that gets through the env gate
+cannot become the default install target by accident. `latest` is
+reserved for signed releases promoted through `release.yml`.
+
+**`--provenance`** + `id-token: write` mint an in-toto SLSA provenance
+attestation for every tarball. Consumers verify via `npm view <pkg>@<ver>
+--json` → `dist.attestations.provenance.url`. The attestation does not
+replace `NPM_TOKEN` authentication today; it is the precondition for
+the npm Trusted Publishing migration in §F that retires `NPM_TOKEN`
+entirely.
 
 **Disable mechanism** (replaces the older "remove the NPM_TOKEN repo
 secret" approach, which stopped working once the token moved into the
@@ -119,7 +149,18 @@ SHA-256 verification on next install.
 - every `uses:` SHA when upstream cuts a new release (one grouped PR
   for first-party `actions/*` updates; individual PRs for third-party
   actions so each can be reviewed in isolation);
-- every npm dep, with dev/build tooling grouped to manage review noise.
+- every direct npm dep (one PR per runtime dep so behaviour changes
+  are reviewable in isolation; dev/build tooling and the hardhat
+  ecosystem are grouped to manage review noise);
+- every **transitive** runtime npm dep, grouped into a single weekly
+  PR via the `transitive` group on `dependency-type: production` +
+  `update-types: [minor, patch]`. Earlier revisions applied an
+  `allow: dependency-type: direct` filter which blocked transitive
+  fixes from appearing as normal weekly PRs and silently relied on
+  Dependabot security alerts to catch them. That gap is closed: a
+  transitive-only CVE fix now reaches reviewers within a week of
+  upstream landing the patch, regardless of whether GitHub's
+  security-advisory feed has indexed it yet.
 
 Why: the cheapest defence against a zero-day in a dep we already pull is
 to land the patched version fast. Manual lockfile bumps slip; automated
@@ -159,19 +200,132 @@ without going through the same gate.
   tag-poisoning class this workflow exists to detect. Catches
   malformed workflows and `run:` shell bugs before they ship to a runner.
 - **pnpm audit** (informational) — runs against production deps with
-  `--audit-level=high`. Output renders as a job-summary table so
-  reviewers see whether a PR introduces a new advisory vs. carrying
-  over the known baseline. **Currently `continue-on-error: true`**
-  because the lockfile already carries 15 high + 1 critical advisory;
-  flip to a hard gate once those are remediated (Tier 3 §H).
+  `--audit-level=high` and branches on three outcomes that the previous
+  revision collapsed into a single "table or all-clear" rendering:
+  - **clean** — `pnpm audit` exited 0 AND the JSON report parsed as
+    an object AND zero entries match the severity threshold; renders
+    a confident "No advisories ≥ high. ✓" banner.
+  - **findings** — `pnpm audit` exited 1 AND a count ≥ 1 can be
+    extracted from the report. Both schemas are rendered: the legacy
+    pnpm/npm v1 `.advisories` map AND the npm v2 / pnpm 10
+    `.vulnerabilities` map. Earlier the workflow only parsed
+    `.advisories`, so high/critical findings emitted under the v2
+    shape rendered as an empty table that looked clean.
+  - **inconclusive** — `pnpm audit` exited >1 OR the output is empty
+    OR the JSON is not a valid object. Captured stderr is appended to
+    the job summary so reviewers can see the registry / auth /
+    network error that caused the run to short-circuit; the banner
+    says explicitly "this result does NOT mean the dependency tree is
+    clean — it means the audit did not complete and cannot certify
+    either outcome." This closes the false-confidence path the
+    security review flagged.
+
+  Still `continue-on-error: true` for now because the lockfile carries
+  a known 15-high + 1-critical baseline (Tier 3 §H is the follow-up
+  that flips this to a hard gate after those are remediated). Even
+  while informational, the three-state output stops the workflow from
+  printing a green badge over a guilty conscience.
 
 zizmor findings upload to GitHub Security → Code scanning so they
 survive past the PR's discussion timeline.
 
-The audit gates are exempt from one rule: `artipacked`. See `.github/zizmor.yml`
-for the full justification — short version, the repo carries orphan
-submodule gitlinks that make `persist-credentials: false` fatal at
-checkout time. Fixed by the Tier-2 follow-up listed below.
+**`persist-credentials: false` is enforced everywhere.** Every
+`actions/checkout` invocation passes the flag so the workflow does not
+leave the GitHub token persisted in `.git/config` after the checkout
+step. An earlier revision suppressed the `artipacked` zizmor rule
+because the repo carried orphan submodule gitlinks under
+`experiments/agenthub-vs-dkg/` without a corresponding `.gitmodules`,
+which caused checkout cleanup to fatally fail when persist-credentials
+was off. Those gitlinks were removed from the index in the same commit
+that re-enabled the flag, and the global `artipacked` exemption in
+`.github/zizmor.yml` was deleted — a future PR that adds a checkout
+without the flag is now blocked at the audit gate.
+
+### 8. `CODEOWNERS` routes review for security-sensitive paths
+
+`.github/CODEOWNERS` names the maintainers responsible for reviewing
+changes to:
+
+- every file under `.github/` (workflows, composite actions, the
+  Dependabot config, the zizmor config, the CODEOWNERS file itself);
+- every `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, and
+  `.npmrc` at every depth — the surface that determines what gets
+  packed, published, or marked public;
+- `scripts/` and `packages/cli/scripts/` — the release-asset build
+  scripts that determine what `pnpm build` and the release workflow
+  produce;
+- `docs/security/` and `SECURITY.md`.
+
+Each path lists at least two named owners so no single account
+compromise can self-approve a malicious change to one of these
+trust-boundary files. Branch protection on `main` / `v10-rc` should
+have **Require review from Code Owners** enabled (admin task — see
+§A below); without that toggle, CODEOWNERS routes the review but
+does not enforce it.
+
+### 9. Continuous publish goes to `--tag dev`, never `--tag latest`
+
+`latest` is the npm dist-tag `npm install <pkg>` defaults to. Earlier
+revisions of `npm-continuous-publish.yml` set `--tag latest` on every
+push to `main`, which meant a bad merge that cleared the env gate
+became the default install target by accident.
+
+The workflow now publishes to `--tag dev`. `latest` is reserved for
+intentional signed releases promoted by `release.yml` (currently
+`release.yml` only creates GitHub Releases; npm publication on tagged
+releases is a future step that will set `--tag latest` explicitly).
+
+### 10. `TURBO_TOKEN` / `TURBO_TEAM` are scoped to `push` events only
+
+`ci.yml`'s `Build all Node packages` step references the Turbo remote
+cache credentials via:
+
+```yaml
+TURBO_TOKEN: ${{ github.event_name == 'push' && secrets.TURBO_TOKEN || '' }}
+TURBO_TEAM: ${{ github.event_name == 'push' && secrets.TURBO_TEAM || '' }}
+```
+
+On `pull_request` runs the expression evaluates to an empty string and
+turbo's remote-cache integration transparently no-ops. This closes a
+specific exfiltration path: package `build` scripts under
+`packages/*/package.json` are PR-controlled — a malicious PR could
+replace a build script and `curl` `$TURBO_TOKEN` to an attacker
+endpoint. Restricting the secret to protected push events means the
+PR-controlled code paths never see it. Local `.turbo/` caching via
+`actions/cache` still keeps PR builds fast.
+
+### 11. `release.yml` hardens tag trust and emits build-provenance attestations
+
+The release-preflight job now:
+- runs after `Validate tag format` with a `Verify tag points at a
+  commit reachable from a release branch` step. `git merge-base
+  --is-ancestor` exits 0 only if the pushed tag's commit is in the
+  linear history of `main` or `v10-rc`. Without this check, anyone
+  with `push --tags` rights could tag an arbitrary commit they
+  crafted locally — bypassing every branch-protection control — and
+  the release workflow would happily build and publish it.
+- runs `git tag --verify` against the pushed tag and writes the
+  result to the job summary. This is advisory at the runner level
+  (maintainer keys do not ship on GitHub-hosted runners) — server-side
+  enforcement is via the branch ruleset "Require signed tags" toggle
+  configured under §A.
+- generates a CycloneDX 1.5 JSON SBOM via `@cyclonedx/cdxgen` (run in
+  this no-credentials job, not in the credential-bearing release job)
+  and uploads it as an artifact for the release job to consume.
+
+The release job now:
+- holds `id-token: write` and `attestations: write` in addition to
+  `contents: write`;
+- aggregates every release asset (MarkItDown binaries, per-asset
+  `.sha256`s, the CycloneDX SBOM) into a single `SHASUMS256.txt`;
+- emits a build-provenance attestation covering all of them via
+  `actions/attest-build-provenance`. Consumers verify with
+  `gh attestation verify <asset> --repo OriginTrail/dkg` — the
+  attestation records the workflow run id, the workflow file SHA, the
+  runner image, and a digest of every covered file. A tampered
+  release asset fails verification.
+- ships a "Verifying this release" footer in every release body with
+  copy-pasteable verification commands.
 
 ---
 
@@ -327,7 +481,11 @@ then:
    configured.
 4. **Deployment branches**: restrict to `main` only. Default allows any
    branch, which would let a feature branch publish if the workflow were
-   ever triggered against it.
+   ever triggered against it. `verify-environment` now ALSO enforces
+   this: it walks `deployment_branch_policy` (and the sibling
+   `/deployment-branch-policies` endpoint for custom allow-lists) and
+   refuses to publish if the policy is `null` (all branches allowed),
+   the custom allow-list omits `main`, or any entry contains a wildcard.
 5. **Environment secrets**: move `NPM_TOKEN` from repo-level secrets to
    this environment. Repo-level `NPM_TOKEN` would still be accessible to
    any workflow run on `main`, defeating the point.
@@ -339,10 +497,18 @@ gh api repos/OriginTrail/dkg/environments/npm-publish \
   | jq '{
       reviewers: [.protection_rules[] | select(.type == "required_reviewers") | .reviewers | length] | first,
       prevent_self_review: [.protection_rules[] | select(.type == "required_reviewers") | .prevent_self_review] | first,
-      wait_timer: [.protection_rules[] | select(.type == "wait_timer") | .wait_timer] | first
+      wait_timer: [.protection_rules[] | select(.type == "wait_timer") | .wait_timer] | first,
+      deployment_branch_policy: .deployment_branch_policy
     }'
-# Must print { "reviewers": ≥1, "prevent_self_review": true, "wait_timer": ≥1 }
-# — exactly the three properties verify-environment asserts.
+# Must print:
+#   { "reviewers": ≥1,
+#     "prevent_self_review": true,
+#     "wait_timer": ≥1,
+#     "deployment_branch_policy": { "protected_branches": true, ... }
+#       OR { "protected_branches": false, "custom_branch_policies": true } AND
+#       gh api repos/OriginTrail/dkg/environments/npm-publish/deployment-branch-policies
+#       must list `main` (and no wildcards) }
+# — exactly the four properties verify-environment asserts.
 ```
 
 ### D. Enable required signed commits on the personal level
@@ -452,44 +618,74 @@ narrower the CanisterWorm attack surface.
 - SHA-pinned every `uses:` in every workflow.
 - Added explicit `permissions:` blocks to `ci.yml`, `knip.yml`,
   `evm-integration.yml`, and narrowed scope in `release.yml`.
-- Added `environment: npm-publish` to `npm-continuous-publish.yml`.
-- Created `.github/dependabot.yml`.
-- Created `.github/workflows/supply-chain-scan.yml` (zizmor + actionlint).
+- Split `npm-continuous-publish.yml` into three jobs:
+  `verify-environment` (no secrets, validates the npm-publish env's
+  reviewers / self-review block / wait timer / deployment branch
+  policy), `build-and-pack` (no secrets, builds and packs tarballs),
+  and `publish` (gated by `environment: npm-publish`, holds
+  `NPM_TOKEN` + `id-token: write`, runs only
+  `npm publish <tarball> --ignore-scripts --provenance --tag dev`).
+  This is the structural fix for the "secret-bearing job executes
+  package code" risk the security review called out.
+- Switched continuous publish from `--tag latest` to `--tag dev`.
+  `latest` is reserved for signed release tags.
+- Added `id-token: write` + `--provenance` so each continuous publish
+  ships an in-toto SLSA provenance attestation. Precondition for npm
+  Trusted Publishing (Tier 3 §F).
+- Hardened `release.yml` with a tag-ancestry check, an advisory
+  signed-tag check, a CycloneDX 1.5 SBOM generated in
+  `release-preflight` (no privileged credentials), aggregated
+  `SHASUMS256.txt` over every release asset, and an
+  `actions/attest-build-provenance` attestation covering them all.
+- Scoped `TURBO_TOKEN` / `TURBO_TEAM` to `push` events in `ci.yml`
+  so PR-controlled build scripts never see the cache credentials.
+- Created `.github/dependabot.yml` covering direct npm deps,
+  github-actions, **and** a new `transitive` group on
+  `dependency-type: production` so transitive-only fixes get bumped
+  via the normal weekly cadence (the earlier
+  `allow: dependency-type: direct` filter was removed).
+- Created `.github/CODEOWNERS` mapping every security-sensitive path
+  (workflows, package manifests, lockfiles, release scripts, security
+  docs) to ≥2 named owners; effective once admin enables "Require
+  review from Code Owners" on `main` / `v10-rc` (§A).
+- Created `.github/workflows/supply-chain-scan.yml` (zizmor +
+  actionlint + a three-state pnpm audit that distinguishes clean /
+  findings / inconclusive). zizmor scans both
+  `.github/workflows/` AND `.github/actions/`. actionlint installs
+  from a SHA-256-pinned GitHub release asset (not `curl | bash`).
+  zizmor installs from hash-pinned PyPI wheels via
+  `pip install --require-hashes --no-deps`. SARIF upload is gated
+  off forked PRs to avoid 403s on the downgraded write scope.
+- Removed the six orphan submodule gitlinks under
+  `experiments/agenthub-vs-dkg/` that previously blocked
+  `persist-credentials: false`. Restored
+  `persist-credentials: false` on every `actions/checkout`. Removed
+  the global `artipacked` suppression from `.github/zizmor.yml`.
 - Hardened `.npmrc` (explicit `verify-store-integrity`; comments
   documenting why `ignore-scripts` is NOT set).
 - This document.
 
 **Not done in this PR (require maintainer admin clicks):**
-- Tighten the `protect-main` ruleset (Tier 2 §A).
+- Tighten the `protect-main` ruleset (Tier 2 §A) — enables
+  CODEOWNERS enforcement, signed commits, dismiss-stale-reviews,
+  last-push-approval.
 - Create the `protect-v10-rc` ruleset (Tier 2 §B).
-- Configure the `npm-publish` Environment with required reviewers and
-  move `NPM_TOKEN` into it (Tier 2 §C).
+- Configure the `npm-publish` Environment: reviewers,
+  `prevent_self_review`, wait timer, **deployment branch policy
+  restricted to `main`** (the new fourth assertion in
+  `verify-environment`), and move `NPM_TOKEN` into the environment
+  (Tier 2 §C).
 - Enable required-signed-commits + each maintainer's signing key
   (Tier 2 §D).
 - Repo-level security features: private vulnerability reporting,
   secret-scanning push protection (Tier 2 §E).
-- npm Trusted Publishing migration (Tier 3 §F).
+- npm Trusted Publishing migration on npmjs.com (Tier 3 §F) — the
+  code side is ready (`id-token: write`, `--provenance`), the
+  registry-side trusted-publisher record still needs creating.
 - Immutable releases setting (Tier 3 §G).
-- `pnpm audit` CI gate (Tier 3 §H).
+- Flip `pnpm audit` from informational to a hard CI gate after the
+  baseline 15-high + 1-critical advisories are remediated (Tier 3 §H).
 - Workspace-package publish surface review (Tier 3 §I).
-
-**Tracked follow-ups (blocked by other concerns):**
-- **`persist-credentials: false` on every `actions/checkout`.** This is
-  best practice and zizmor's `artipacked` audit flags every step that
-  doesn't set it. We currently cannot apply it because the repo carries
-  orphan submodule gitlinks (`experiments/agenthub-vs-dkg/agenthub`,
-  `…/autoresearch-mlx`) WITHOUT a corresponding `.gitmodules` file.
-  With `persist-credentials: false`, actions/checkout's auth cleanup
-  runs inside the main action step and invokes
-  `git submodule foreach --recursive`, which fails fatally on the
-  orphan gitlinks and kills the job. On `main` the same cleanup runs
-  in the action's POST step where the failure surfaces as
-  `##[warning]` (non-fatal). The fix is a single follow-up commit that
-  either (a) commits a correct `.gitmodules` or (b) removes the orphan
-  gitlinks; after that, drop the `artipacked` exemption in
-  `.github/zizmor.yml` and re-add `persist-credentials: false` to
-  every checkout. The exemption block in `zizmor.yml` carries the same
-  note for the next reviewer.
 
 ---
 

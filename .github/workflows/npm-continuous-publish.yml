@@ -1,6 +1,9 @@
 # Automatically publish all public packages to NPM on every push to the
 # release branch. Uses a dev pre-release suffix so each push gets a unique
-# version (e.g. 10.0.0-rc.1-dev.1774300000.abc1234) tagged as `latest`.
+# version (e.g. 10.0.0-rc.1-dev.1774300000.abc1234) tagged as `dev` on the
+# npm registry. `latest` is intentionally reserved for tagged releases —
+# `release.yml` (when it gets promoted to a publisher) is the only path
+# that should ever set `--tag latest`.
 #
 # To switch the release branch: change the branches list below.
 # To disable publishing:
@@ -17,6 +20,23 @@
 # should live INSIDE the `npm-publish` Environment, where it is
 # invisible to any job that does not declare `environment: npm-publish`.
 # This is the structural property that makes the gate fail-closed.
+#
+# JOB GRAPH (the critical design property):
+#
+#   verify-environment      no env, no secret
+#         ↓
+#   build-and-pack          no env, no secret — runs build + lifecycle
+#         ↓                 scripts, packs tarballs, uploads artifact
+#   publish                 environment: npm-publish, NPM_TOKEN in scope,
+#                           id-token: write for --provenance; runs
+#                           `npm publish <tarball> --ignore-scripts`
+#                           ONLY, no install/build/test happens with
+#                           the secret in scope.
+#
+# This separation is what closes the largest remaining design gap
+# called out in the security review: secret-bearing jobs no longer
+# execute repository or package code, so a compromised lifecycle hook
+# in a transitively-installed dep cannot exfiltrate NPM_TOKEN.
 
 name: Continuous NPM Publish
 
@@ -54,7 +74,7 @@ jobs:
   # permanently. The structurally correct disable mechanisms are
   # documented in the file header above.
   verify-environment:
-    name: Verify npm-publish environment has required reviewers
+    name: Verify npm-publish environment protection rules
     runs-on: ubuntu-latest
     timeout-minutes: 2
     if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
@@ -126,39 +146,90 @@ jobs:
             exit 1
           fi
 
-          echo "✓ npm-publish environment configured with ${REVIEWER_COUNT} required reviewer(s) (self-review blocked) + ${WAIT_TIMER}-min wait timer"
+          # deployment_branch_policy: the environment must be restricted
+          # to the release branch (currently `main`). Otherwise a feature
+          # branch could push to it and reuse the same NPM_TOKEN gate
+          # configured for prod, bypassing branch protection entirely.
+          # The GitHub API shape for this rule is one of:
+          #   * null                    — "all branches" (FAIL-CLOSED)
+          #   * { protected_branches: true, custom_branch_policies: false }
+          #     → "all protected branches" (acceptable: main is protected
+          #     and feature branches are not, so this is a valid mode)
+          #   * { protected_branches: false, custom_branch_policies: true }
+          #     + a custom branch-name list at
+          #     /environments/{name}/deployment-branch-policies that
+          #     explicitly names `main`. We accept either form, but a
+          #     `null` policy (all branches allowed) is rejected.
+          DEPLOY_POLICY=$(echo "${ENV_CONFIG}" | jq -c '.deployment_branch_policy // null' || echo null)
+          if [ "${DEPLOY_POLICY}" = "null" ]; then
+            echo "::error title=npm-publish branch policy missing::Environment allows ANY branch to deploy to npm-publish. A feature branch with a malicious lifecycle script would inherit the same NPM_TOKEN gate as the release branch. Configure deployment branch policy to 'Protected branches only' OR add an explicit allow-list containing only the release branch in repo Settings → Environments → npm-publish → Deployment branches."
+            exit 1
+          fi
 
-  publish:
-    name: Build & Publish to NPM
+          PROTECTED_ONLY=$(echo "${DEPLOY_POLICY}" | jq -r '.protected_branches // false')
+          CUSTOM_POLICIES=$(echo "${DEPLOY_POLICY}" | jq -r '.custom_branch_policies // false')
+
+          if [ "${PROTECTED_ONLY}" = "true" ]; then
+            echo "✓ npm-publish deployment branch policy: protected branches only"
+          elif [ "${CUSTOM_POLICIES}" = "true" ]; then
+            # Custom policies are stored in a sibling API path. Walk it
+            # and verify the release branch (`main`) is listed AND that
+            # the list does not include wildcard branch names that would
+            # silently widen access.
+            CUSTOM_BRANCHES=$(gh api "repos/${GH_REPO}/environments/npm-publish/deployment-branch-policies" --jq '[.branch_policies[]?.name]' 2>/dev/null || echo '[]')
+            HAS_MAIN=$(echo "${CUSTOM_BRANCHES}" | jq -r 'any(. == "main")')
+            HAS_WILDCARD=$(echo "${CUSTOM_BRANCHES}" | jq -r 'any(test("\\*"))')
+            if [ "${HAS_MAIN}" != "true" ]; then
+              echo "::error title=npm-publish custom branch policy excludes main::Environment uses custom branch policies but \`main\` is not in the allow-list. Add it (or remove this workflow's push trigger). Allowed branches: ${CUSTOM_BRANCHES}"
+              exit 1
+            fi
+            if [ "${HAS_WILDCARD}" = "true" ]; then
+              echo "::error title=npm-publish custom branch policy contains wildcard::Wildcards like \`*\` or \`release/*\` defeat the branch-scoping control. Replace with exact branch names. Allowed branches: ${CUSTOM_BRANCHES}"
+              exit 1
+            fi
+            echo "✓ npm-publish deployment branch policy: custom allow-list ${CUSTOM_BRANCHES}"
+          else
+            echo "::error title=npm-publish branch policy invalid::deployment_branch_policy is set but neither protected_branches nor custom_branch_policies is true. The API shape is unexpected; refusing to publish. Raw policy: ${DEPLOY_POLICY}"
+            exit 1
+          fi
+
+          echo "✓ npm-publish environment configured with ${REVIEWER_COUNT} required reviewer(s) (self-review blocked) + ${WAIT_TIMER}-min wait timer + scoped deployment branch policy"
+
+  # BUILD AND PACK — runs WITHOUT `environment: npm-publish`, so NPM_TOKEN
+  # is NOT in scope. This is the job that executes arbitrary repository
+  # and package-lifecycle code (prepack, prepare, build scripts) to
+  # produce the tarballs we will publish. Because no publishing
+  # credential is present, a compromised lifecycle hook (e.g. via a
+  # malicious transitive dep that landed between two pushes) cannot
+  # exfiltrate NPM_TOKEN — there is nothing to exfiltrate.
+  #
+  # Tarballs + a SHASUMS256.txt manifest are uploaded as a workflow
+  # artifact and consumed by the `publish` job below.
+  build-and-pack:
+    name: Build and pack public packages (no secrets in scope)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # `needs:` ensures the publish job DOES NOT START until
-    # verify-environment confirms the npm-publish environment is
-    # configured with required reviewers. Combined with `environment:`
-    # below, this is what makes the gate fail-closed: NPM_TOKEN is only
-    # injected into a runner whose preflight already proved the
-    # environment is configured. The `if:` mirrors verify-environment's
-    # guard so a manual rerun of just one job stays consistent.
     needs: verify-environment
-    if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
-    # `npm-publish` Environment gates access to NPM_TOKEN. Configure required
-    # reviewers + a wait timer in repo Settings → Environments → `npm-publish`
-    # so a compromised merge to main cannot auto-publish without human
-    # approval. See docs/security/SUPPLY_CHAIN_HARDENING.md for the exact
-    # setup steps. The environment value MUST match the Environment name
-    # configured in repo Settings.
-    environment: npm-publish
-
+    permissions:
+      contents: read
+    outputs:
+      suffix: ${{ steps.version.outputs.SUFFIX }}
+      artifact_name: ${{ steps.artifact.outputs.NAME }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
+          # Cache pnpm at the dependency-install layer is acceptable
+          # here because NPM_TOKEN is not in scope. The publish job
+          # disables the cache entirely so a poisoned restored
+          # node_modules cannot influence the credential-bearing run.
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -207,15 +278,186 @@ jobs:
             }
           "
 
-      - name: Publish all public packages
-        # NPM_TOKEN is an environment-level secret on `npm-publish`. It
-        # is ONLY visible to this job (which declares `environment:
-        # npm-publish` above) — no other job in this workflow can read
-        # it. If NPM_TOKEN is missing from the environment, `pnpm
-        # publish` fails with an npm auth error (which is correct
-        # behaviour: the maintainer either misconfigured the env or
-        # intends to disable publishing, both of which the file-header
-        # disable-mechanism docs cover).
-        run: pnpm -r publish --no-git-checks --tag latest
+      - name: Pack public packages into tarballs
+        # `pnpm pack` runs the same prepack/prepare lifecycle hooks
+        # `pnpm publish` would, but EMITS A TARBALL instead of pushing
+        # to the registry. Because we then publish those tarballs
+        # below via `npm publish <tarball> --ignore-scripts`, no
+        # lifecycle hook ever runs with NPM_TOKEN in scope.
+        #
+        # We iterate workspaces explicitly (rather than rely on
+        # `pnpm -r pack`) so we can capture each tarball's path
+        # deterministically and emit the SHASUMS manifest below.
+        # The output dir is `.publish-artifacts/` at the repo root.
+        run: |
+          set -euo pipefail
+          OUT_DIR="${GITHUB_WORKSPACE}/.publish-artifacts"
+          mkdir -p "${OUT_DIR}"
+          PUBLIC_PKGS=$(node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const pkgsDir = path.join(process.cwd(), 'packages');
+            const result = [];
+            for (const dir of fs.readdirSync(pkgsDir)) {
+              const pkgPath = path.join(pkgsDir, dir, 'package.json');
+              if (!fs.existsSync(pkgPath)) continue;
+              const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+              if (pkg.private) continue;
+              result.push(path.join(pkgsDir, dir));
+            }
+            process.stdout.write(result.join('\n'));
+          ")
+          if [ -z "${PUBLIC_PKGS}" ]; then
+            echo "::error::No public packages found to pack"
+            exit 1
+          fi
+          while IFS= read -r pkg_dir; do
+            [ -n "${pkg_dir}" ] || continue
+            echo "::group::pnpm pack ${pkg_dir}"
+            ( cd "${pkg_dir}" && pnpm pack --pack-destination "${OUT_DIR}" )
+            echo "::endgroup::"
+          done <<< "${PUBLIC_PKGS}"
+          ls -la "${OUT_DIR}"
+
+      - name: Generate SHA-256 manifest for tarballs
+        # `SHASUMS256.txt` is consumed by the publish job before each
+        # `npm publish` call to confirm the tarball is the one this
+        # job produced. A swap between artifact upload and download
+        # (or a corrupted artifact) is caught here, not after the
+        # registry already accepted the payload.
+        run: |
+          set -euo pipefail
+          OUT_DIR="${GITHUB_WORKSPACE}/.publish-artifacts"
+          ( cd "${OUT_DIR}" && sha256sum -- *.tgz > SHASUMS256.txt )
+          {
+            echo '## Packed tarballs'
+            echo ''
+            echo '```'
+            cat "${OUT_DIR}/SHASUMS256.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Determine artifact name
+        id: artifact
+        env:
+          SUFFIX: ${{ steps.version.outputs.SUFFIX }}
+        run: echo "NAME=npm-tarballs-${SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload packed tarballs as workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.artifact.outputs.NAME }}
+          path: .publish-artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish prebuilt tarballs to NPM
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # `needs:` ensures the publish job DOES NOT START until
+    # verify-environment confirms the npm-publish environment is
+    # configured with required reviewers + branch policy AND
+    # build-and-pack has produced and uploaded verified tarballs.
+    # Combined with `environment:` below, this is what makes the gate
+    # fail-closed: NPM_TOKEN is only injected into a runner whose
+    # preflight already proved the environment is configured AND
+    # whose payload is already built outside the credential boundary.
+    needs:
+      - verify-environment
+      - build-and-pack
+    if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
+    # `npm-publish` Environment gates access to NPM_TOKEN. Configure required
+    # reviewers + a wait timer in repo Settings → Environments → `npm-publish`
+    # so a compromised merge to main cannot auto-publish without human
+    # approval. See docs/security/SUPPLY_CHAIN_HARDENING.md for the exact
+    # setup steps. The environment value MUST match the Environment name
+    # configured in repo Settings.
+    environment: npm-publish
+    permissions:
+      contents: read
+      # `id-token: write` is required to mint the GitHub Actions OIDC
+      # token that `npm publish --provenance` exchanges for an npm
+      # provenance attestation. The attestation records the workflow
+      # run, repo, ref, and commit that produced each tarball, so any
+      # consumer can independently verify a published version came
+      # from this workflow (`npm view <pkg>@<ver> --json` includes
+      # `dist.attestations.provenance.url`). Provenance does not
+      # replace NPM_TOKEN authentication today, but it is the
+      # mandatory precondition for migrating to npm Trusted Publishing
+      # / OIDC (which removes the NPM_TOKEN dependency entirely).
+      id-token: write
+
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          registry-url: https://registry.npmjs.org
+          # No `cache: pnpm` here. The publish job receives prebuilt
+          # tarballs from `build-and-pack` and runs ONLY `npm publish`.
+          # A poisoned cached `node_modules/` cannot influence the
+          # credential-bearing job because no install runs.
+
+      # `actions/checkout` is deliberately omitted on the publish job:
+      # there is nothing for `npm publish <tarball>` to consume from
+      # the source tree. Skipping the checkout means a malicious
+      # patch landed in the same commit as a Dependabot-bumped
+      # transitive dep cannot inject anything into the publish job's
+      # working directory.
+
+      - name: Download packed tarballs artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.build-and-pack.outputs.artifact_name }}
+          path: .publish-artifacts/
+
+      - name: Verify SHA-256 manifest before publishing
+        # Re-checksum the downloaded tarballs against the manifest
+        # `build-and-pack` produced. A mismatch means either the
+        # artifact upload/download corrupted the payload OR a
+        # malicious actor with workflow-run-modify rights tampered
+        # with the artifact between jobs. Either way we refuse to
+        # publish — better an empty version on the registry than a
+        # silently-swapped tarball.
+        run: |
+          set -euo pipefail
+          cd .publish-artifacts
+          sha256sum --check SHASUMS256.txt
+
+      - name: Publish each tarball with provenance
+        # `npm publish <tarball> --ignore-scripts` is the smallest
+        # publish primitive: it accepts a prebuilt tarball, contacts
+        # the registry, and runs ZERO lifecycle scripts on the
+        # tarball's contents. The combination of
+        #   * `--ignore-scripts`           — no prepack/prepare/etc.
+        #   * `--provenance`               — emits OIDC attestation
+        #   * `--tag dev`                  — channel scoping (NOT
+        #                                    `latest`; that is reserved
+        #                                    for signed release tags
+        #                                    promoted via release.yml)
+        #   * `--access public`            — public packages by default
+        #   * environment-scoped NPM_TOKEN — limits credential lifetime
+        #                                    to this job
+        # is the minimum-privilege publish path. Loop is fail-fast
+        # so the first publish failure aborts the rest instead of
+        # leaving a partially-published version set on the registry.
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd .publish-artifacts
+          shopt -s nullglob
+          tarballs=(*.tgz)
+          if [ "${#tarballs[@]}" -eq 0 ]; then
+            echo "::error::No tarballs to publish — artifact was empty"
+            exit 1
+          fi
+          for tarball in "${tarballs[@]}"; do
+            echo "::group::npm publish ${tarball}"
+            npm publish "${tarball}" \
+              --provenance \
+              --access public \
+              --tag dev \
+              --ignore-scripts
+            echo "::endgroup::"
+          done

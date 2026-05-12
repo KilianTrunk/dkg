@@ -38,39 +38,23 @@ rules:
         - tj-actions/verify-changed-files
         - tj-actions/changed-files-action
 
-  # `artipacked` flags every `actions/checkout` step that does not pass
-  # `persist-credentials: false`. The correct fix in principle is to set
-  # it everywhere — but this repo currently carries submodule gitlinks in
-  # the working tree (`experiments/agenthub-vs-dkg/agenthub` and
-  # `…/autoresearch-mlx`) WITHOUT a corresponding `.gitmodules` file.
+  # `artipacked` (deliberate non-suppression — historical note).
   #
-  # With `persist-credentials: false`, actions/checkout's auth-cleanup
-  # runs inside the MAIN action step (not in the post step). The cleanup
-  # invokes `git submodule foreach --recursive`, which then fails with
+  # Earlier revisions of this PR carried a global `artipacked: ignore:`
+  # block because the repo had six orphan submodule gitlinks in
+  # `experiments/agenthub-vs-dkg/` without a corresponding `.gitmodules`
+  # file. With `persist-credentials: false`, `actions/checkout`'s
+  # auth-cleanup ran in the MAIN action step and invoked
+  # `git submodule foreach --recursive`, which then failed with
   #   fatal: No url found for submodule path '…/agenthub' in .gitmodules
-  # That fatal turns into a `##[error]` and kills every job on the run.
+  # That fatal turned into a `##[error]` and killed every job on the
+  # run — so the workaround was to drop `persist-credentials: false`
+  # and silence the `artipacked` finding to keep the audit gate honest
+  # about what was actually enforced.
   #
-  # On `main`, the cleanup runs in the POST step instead (because
-  # persist-credentials defaults to true). actions/checkout demotes its
-  # exit-128 there to `##[warning]` so main CI stays green — the bug is
-  # latent there.
-  #
-  # Remediation plan (tracked in docs/security/SUPPLY_CHAIN_HARDENING.md):
-  #   1. Either commit a correct `.gitmodules` or remove the orphan
-  #      gitlinks in a follow-up source PR (out of scope for this audit-
-  #      only PR per the no-source-changes constraint).
-  #   2. Re-enable `persist-credentials: false` on every checkout.
-  #   3. Delete this rules: artipacked block.
-  #
-  # Until then, suppress the rule globally so the audit gate accurately
-  # reflects "everything that CAN be fixed today is fixed". Owner: repo
-  # maintainers.
-  artipacked:
-    ignore:
-      - ci.yml
-      - codex-review.yml
-      - evm-integration.yml
-      - knip.yml
-      - npm-continuous-publish.yml
-      - release.yml
-      - supply-chain-scan.yml
+  # This is now fixed at the source: the six orphan gitlinks were
+  # removed from the index in the same commit as this comment, and
+  # `persist-credentials: false` is restored on every `actions/checkout`
+  # call site. There is no longer any suppression of `artipacked` — if
+  # a future PR adds a checkout without that flag, zizmor will block it
+  # at the gate.

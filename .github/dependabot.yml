@@ -85,8 +85,31 @@ updates:
           - 'hardhat'
           - '@nomicfoundation/*'
           - 'hardhat-*'
-    # Runtime/production deps NOT in the groups above (ethers, n3,
-    # commander, better-sqlite3, react, …) each get their own PR so any
-    # behaviour change is reviewable in isolation.
-    allow:
-      - dependency-type: direct
+      # Group transitive-only updates into a single weekly PR. These are
+      # packages we do not import directly but our direct deps drag in
+      # via the lockfile. Without this group every transitive bump opens
+      # its own PR, which used to flood the queue and was the reason an
+      # earlier revision of this file applied `allow: dependency-type:
+      # direct` — that filter, however, also blocked transitive
+      # *security* fixes from showing up as normal weekly PRs and
+      # silently relied on Dependabot security alerts to catch them.
+      # Grouping is the structurally correct fix: noise goes away, but
+      # transitive-only CVE patches still reach reviewers within a
+      # week of upstream landing them.
+      transitive:
+        dependency-type: production
+        update-types:
+          - 'minor'
+          - 'patch'
+        patterns:
+          - '*'
+        # `dev-tooling` and `hardhat` above declare their own patterns,
+        # so they take precedence and this catch-all only grabs what
+        # they don't claim.
+    # Runtime/production direct deps NOT in the groups above (ethers,
+    # n3, commander, better-sqlite3, react, …) each get their own PR
+    # so any behaviour change is reviewable in isolation.
+    #
+    # Intentionally NO `allow: dependency-type: direct` filter — see
+    # the `transitive` group above. The earlier filter is the gap
+    # PR460-02 / P0 #2 flagged in the security review.

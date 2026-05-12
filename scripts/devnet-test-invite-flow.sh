@@ -271,7 +271,17 @@ except Exception:
   print('')
 ")
 expected_owner="did:dkg:agent:${N1_ADDR}"
-if [ "$curator_owner" = "$expected_owner" ]; then
+# Lower-case both sides: `/api/agents` returns wallet addresses
+# lower-cased, but `createContextGraph` writes them in EIP-55
+# checksum case to the RDF triple. Both forms denote the same
+# Ethereum address — and `getContextGraphOwner`'s downstream
+# consumers (`isCuratorOf`, `isCurator`) compare case-insensitively
+# for this exact reason. Mirror that here so the assertion only
+# fires on a real "missing/wrong owner" regression, not on cosmetic
+# checksum drift.
+curator_owner_lc=$(printf '%s' "$curator_owner" | tr '[:upper:]' '[:lower:]')
+expected_owner_lc=$(printf '%s' "$expected_owner" | tr '[:upper:]' '[:lower:]')
+if [ "$curator_owner_lc" = "$expected_owner_lc" ]; then
   ok "DKG_CURATOR triple present and points at N1: $curator_owner"
 elif [ -n "$curator_owner" ]; then
   fail "DKG_CURATOR triple present but owner unexpected (got '$curator_owner', expected '$expected_owner')"

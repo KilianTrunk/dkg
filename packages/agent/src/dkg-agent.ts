@@ -8186,6 +8186,18 @@ export class DKGAgent {
     let curatorTargetedSuccess = false;
     if (curatorPeerId !== this.peerId) {
       try {
+        // Mirror what `sendChat` / `invokeSkill` do — register a
+        // /p2p-circuit relay route into the peer store before dialling.
+        // Without it, libp2p's dialProtocol falls back to direct dial,
+        // which fails for any NAT'd peer that doesn't currently hold an
+        // open connection to us. On the public testnet (both laptops
+        // behind home-internet NAT), the curator is reachable only via
+        // circuit relay through testnet relay nodes — exactly the path
+        // chat+skill messaging primes via this helper. Skipping it here
+        // is what made `forwardJoinRequest` fail with "no reachable
+        // curator" on Laptop B even after Laptop A's own restart had
+        // re-established its swarm connections (PR #448 round-7).
+        await this.ensureCircuitRelayAddress(curatorPeerId);
         const responseBytes = await this.router.send(curatorPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, 5000);
         const response = JSON.parse(new TextDecoder().decode(responseBytes));
         if (response.ok) {

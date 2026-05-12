@@ -211,19 +211,31 @@ without going through the same gate.
     `.vulnerabilities` map. Earlier the workflow only parsed
     `.advisories`, so high/critical findings emitted under the v2
     shape rendered as an empty table that looked clean.
-  - **inconclusive** — `pnpm audit` exited >1 OR the output is empty
-    OR the JSON is not a valid object. Captured stderr is appended to
+  - **inconclusive (operational failure)** — `pnpm audit` exited >1
+    OR the output is empty OR the JSON is not a valid object. Captured
+    stderr is appended to
     the job summary so reviewers can see the registry / auth /
     network error that caused the run to short-circuit; the banner
     says explicitly "this result does NOT mean the dependency tree is
     clean — it means the audit did not complete and cannot certify
     either outcome." This closes the false-confidence path the
     security review flagged.
+  - **inconclusive (schema mismatch)** — `pnpm audit` exited 1
+    (= findings exist at or above the threshold) but the jq
+    extraction returned 0 (= neither the legacy `.advisories` shape
+    nor the npm v2 `.vulnerabilities` shape produced matching
+    entries). This means a FUTURE pnpm version has introduced a new
+    output schema, and rendering "Findings: 0" would be exactly the
+    false-confidence pattern this step exists to prevent. The branch
+    refuses to certify clean, emits a `::warning::` annotation, and
+    dumps the first 200 lines of the raw `pnpm-audit.json` into the
+    job summary so a human can update the jq extraction before
+    treating the run as evidence either way.
 
   Still `continue-on-error: true` for now because the lockfile carries
   a known 15-high + 1-critical baseline (Tier 3 §H is the follow-up
   that flips this to a hard gate after those are remediated). Even
-  while informational, the three-state output stops the workflow from
+  while informational, the four-state output stops the workflow from
   printing a green badge over a guilty conscience.
 
 zizmor findings upload to GitHub Security → Code scanning so they
@@ -326,6 +338,22 @@ The release job now:
   release asset fails verification.
 - ships a "Verifying this release" footer in every release body with
   copy-pasteable verification commands.
+- creates the GitHub Release via the preinstalled `gh` CLI (`gh release
+  create`) rather than `softprops/action-gh-release`. This removes the
+  last third-party action from the credential-bearing job's executable
+  surface — the most privileged step in any workflow (`contents:write`
+  \+ `id-token:write` \+ `attestations:write`) now runs only
+  first-party `actions/*` and `gh` (shipped with the GitHub-hosted
+  runner image). A future supply-chain compromise of any third-party
+  release action cannot reach this token because no third-party code
+  executes here. This closes PR460-12 (P2: "Third-party write-token
+  actions") from the security review.
+- passes every workflow context value into shell via `env:` rather
+  than direct `${{ … }}` interpolation. Although the upstream
+  `Validate tag format` step enforces a semver regex on the version,
+  routing values through the env namespace closes the
+  template-injection class at the parser level regardless of how the
+  upstream validation evolves.
 
 ---
 
@@ -649,8 +677,9 @@ narrower the CanisterWorm attack surface.
   docs) to ≥2 named owners; effective once admin enables "Require
   review from Code Owners" on `main` / `v10-rc` (§A).
 - Created `.github/workflows/supply-chain-scan.yml` (zizmor +
-  actionlint + a three-state pnpm audit that distinguishes clean /
-  findings / inconclusive). zizmor scans both
+  actionlint + a four-state pnpm audit that distinguishes clean /
+  findings / inconclusive-operational-failure / inconclusive-schema-mismatch).
+  zizmor scans both
   `.github/workflows/` AND `.github/actions/`. actionlint installs
   from a SHA-256-pinned GitHub release asset (not `curl | bash`).
   zizmor installs from hash-pinned PyPI wheels via

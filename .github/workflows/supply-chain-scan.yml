@@ -64,9 +64,6 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
@@ -85,10 +82,15 @@ jobs:
         # low` keeps the CI gate noisy-on-purpose: an informational finding
         # like "this third-party action is not SHA-pinned" is exactly the
         # signal TeamPCP exploited and SHOULD block a PR.
+        #
+        # `--config .github/zizmor.yml` loads the per-repo policy. The only
+        # entries are documented exceptions with a tracking note + owner;
+        # never add a blanket suppression without one.
         run: |
           zizmor \
             --persona auditor \
             --min-severity low \
+            --config .github/zizmor.yml \
             --format sarif \
             .github/workflows/ \
             > zizmor.sarif
@@ -107,7 +109,7 @@ jobs:
         # with the SAME ruleset but allows the exit code to bubble up so the
         # PR is blocked when findings exist.
         run: |
-          zizmor --persona auditor --min-severity low --format plain .github/workflows/
+          zizmor --persona auditor --min-severity low --config .github/zizmor.yml --format plain .github/workflows/
 
   actionlint:
     name: actionlint (workflow syntax + schema)
@@ -115,9 +117,6 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-
       - name: Run actionlint
         # Downloads actionlint via the upstream installer script, verifies
         # the artifact's checksum file (the installer compares against an

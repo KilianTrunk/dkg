@@ -383,6 +383,24 @@ narrower the CanisterWorm attack surface.
 - `pnpm audit` CI gate (Tier 3 §H).
 - Workspace-package publish surface review (Tier 3 §I).
 
+**Tracked follow-ups (blocked by other concerns):**
+- **`persist-credentials: false` on every `actions/checkout`.** This is
+  best practice and zizmor's `artipacked` audit flags every step that
+  doesn't set it. We currently cannot apply it because the repo carries
+  orphan submodule gitlinks (`experiments/agenthub-vs-dkg/agenthub`,
+  `…/autoresearch-mlx`) WITHOUT a corresponding `.gitmodules` file.
+  With `persist-credentials: false`, actions/checkout's auth cleanup
+  runs inside the main action step and invokes
+  `git submodule foreach --recursive`, which fails fatally on the
+  orphan gitlinks and kills the job. On `main` the same cleanup runs
+  in the action's POST step where the failure surfaces as
+  `##[warning]` (non-fatal). The fix is a single follow-up commit that
+  either (a) commits a correct `.gitmodules` or (b) removes the orphan
+  gitlinks; after that, drop the `artipacked` exemption in
+  `.github/zizmor.yml` and re-add `persist-credentials: false` to
+  every checkout. The exemption block in `zizmor.yml` carries the same
+  note for the next reviewer.
+
 ---
 
 ## Incident response

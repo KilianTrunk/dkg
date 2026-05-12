@@ -9,9 +9,10 @@ on:
       - 'v*'
 
 # Repository-default token scope is `contents: read`. The release job is the
-# only one that needs to write — it creates a GitHub Release and uploads
-# artifacts via softprops/action-gh-release. Other jobs (matrix resolution,
-# preflight checks, binary builds) only need to read the repo.
+# only one that needs to write — it creates a GitHub Release with the
+# preinstalled `gh` CLI (no third-party release action) and uploads the
+# release assets in one call. Other jobs (matrix resolution, preflight
+# checks, binary builds) only need to read the repo.
 permissions:
   contents: read
 
@@ -442,21 +443,42 @@ jobs:
 
       - name: Extract release notes
         id: notes
+        # SECURITY: every value derived from a workflow context
+        # (`needs.*.outputs.*`, `github.*`, etc.) is passed via `env:`
+        # rather than `${{ … }}` interpolated directly into the shell
+        # body. Even though the upstream `Validate tag format` step
+        # enforces a semver regex on $VERSION, the structural fix is
+        # to keep that value out of the shell parser entirely — the
+        # variable is read from the runner env by the running shell,
+        # not by the workflow-expression preprocessor, which closes
+        # the entire template-injection class regardless of how much
+        # the upstream validation is loosened in the future.
+        env:
+          VERSION: ${{ needs.release-preflight.outputs.version }}
+          REPO: ${{ github.repository }}
         run: |
-          V="${{ needs.release-preflight.outputs.version }}"
+          set -euo pipefail
+          # shellcheck disable=SC2153 # VERSION / REPO come from the env: block above
           if [ -f CHANGELOG.md ]; then
-            sed -n "/^## \[$V\]/,/^## \[/p" CHANGELOG.md | sed '/^## \[/d' | sed '1d' > release_notes.md
+            sed -n "/^## \[${VERSION}\]/,/^## \[/p" CHANGELOG.md | sed '/^## \[/d' | sed '1d' > release_notes.md
           fi
           if [ ! -s release_notes.md ]; then
-            echo "## DKG V10 Node $V" > release_notes.md
-            echo "" >> release_notes.md
-            echo "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/v$V/CHANGELOG.md) for details." >> release_notes.md
+            {
+              echo "## DKG V10 Node ${VERSION}"
+              echo
+              echo "See [CHANGELOG.md](https://github.com/${REPO}/blob/v${VERSION}/CHANGELOG.md) for details."
+            } > release_notes.md
           fi
 
           # Append a stable footer that documents how to verify the
           # attestations + SBOM that ship with every release. Consumers
           # who want to confirm the asset came from this workflow run
-          # have a copy-pasteable command in the release body.
+          # have a copy-pasteable command in the release body. The
+          # heredoc terminator is single-quoted (`<<'NOTE'`) so $REPO
+          # is NOT expanded inside the body — we substitute it once
+          # after the heredoc with sed against the literal ${REPO}
+          # placeholder, avoiding any chance of shell metacharacters in
+          # an attacker-influenced value reaching the parser.
           cat >> release_notes.md <<'NOTE'
 
           ---
@@ -468,23 +490,66 @@ jobs:
           run. To verify locally:
 
           ```sh
-          gh attestation verify <asset> --repo ${{ github.repository }}
+          gh attestation verify <asset> --repo __REPO__
           ```
 
           A CycloneDX 1.5 SBOM (`dkg-<version>.cdx.json`) is attached so
           downstream scanners can audit the dependency closure of this
           release.
           NOTE
+          # Replace the literal placeholder with the runtime repo value.
+          # `${REPO}` is `owner/name` (validated by GitHub itself, no
+          # shell metacharacters possible), but using a placeholder
+          # keeps the heredoc body entirely free of interpolation.
+          sed -i "s|__REPO__|${REPO}|g" release_notes.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          name: v${{ needs.release-preflight.outputs.version }}
-          body_path: release_notes.md
-          draft: false
-          prerelease: ${{ needs.release-preflight.outputs.is_prerelease }}
-          generate_release_notes: true
-          files: |
-            release-assets/*
+        # SECURITY: this is the most privileged step in the workflow —
+        # `contents: write` + `id-token: write` + `attestations: write`
+        # are all in scope here. Replacing `softprops/action-gh-release`
+        # with the preinstalled `gh` CLI removes the last third-party
+        # action from the credential-bearing job's executable surface;
+        # the release job now uses only first-party `actions/*` and
+        # `gh` (shipped with the GitHub-hosted runner image). A future
+        # supply-chain compromise of any third-party release action
+        # cannot reach this token because no third-party code runs here.
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+          REL_VERSION: ${{ needs.release-preflight.outputs.version }}
+          IS_PRERELEASE: ${{ needs.release-preflight.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2153 # TAG_NAME / REL_VERSION / IS_PRERELEASE come from the step's `env:` block above
+          # Build the asset list explicitly so `gh release create` gets a
+          # deterministic argv. The release-assets/ dir is populated by
+          # the earlier `Download MarkItDown release assets`, `Download
+          # SBOM ...`, and `Generate SHA-256 manifest ...` steps.
+          shopt -s nullglob
+          assets=(release-assets/*)
+          shopt -u nullglob
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::release-assets/ is empty; nothing to upload"
+            exit 1
+          fi
+          # `--generate-notes` appends GitHub's auto-generated release
+          # notes after our `release_notes.md` body — same behaviour as
+          # softprops/action-gh-release's `generate_release_notes: true`
+          # combined with `body_path`.
+          # `gh release create [<tag>] [<files>...] [flags]` — tag first,
+          # then assets, then flags (canonical cobra arg order). The
+          # `--prerelease` flag is appended conditionally; we avoid the
+          # empty-array-under-nounset pattern that breaks on bash 3.x.
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            gh release create "${TAG_NAME}" "${assets[@]}" \
+              --title "v${REL_VERSION}" \
+              --notes-file release_notes.md \
+              --generate-notes \
+              --prerelease
+          else
+            gh release create "${TAG_NAME}" "${assets[@]}" \
+              --title "v${REL_VERSION}" \
+              --notes-file release_notes.md \
+              --generate-notes
+          fi

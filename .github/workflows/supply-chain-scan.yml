@@ -361,6 +361,43 @@ jobs:
             exit 0
           fi
 
+          # Edge case: pnpm exited 1 (= findings ≥ threshold exist) but
+          # our jq extraction returned 0. That means a FUTURE pnpm
+          # version emitted findings under a key our `if has(...)`
+          # chain does not yet recognise. Rendering "Findings: 0"
+          # here would be exactly the false-confidence pattern this
+          # whole step exists to prevent. Treat as inconclusive and
+          # leave a copy of the raw JSON in the summary so a human
+          # can adjudicate.
+          if [ "${STATUS}" -eq 1 ] && [ "${COUNT:-0}" -eq 0 ]; then
+            # shellcheck disable=SC2016
+            # The single-quoted strings below contain Markdown backticks
+            # (e.g. `.advisories`, `supply-chain-scan.yml`) used as
+            # code-fence markers in the GitHub Step Summary output.
+            # Shellcheck flags backticks-inside-single-quotes as a
+            # possible missed command substitution; here it's intentional.
+            {
+              echo '## pnpm audit (inconclusive — schema mismatch)'
+              echo
+              echo 'pnpm audit reported findings (exit 1) but neither the'
+              echo 'legacy `.advisories` nor the npm v2 `.vulnerabilities`'
+              echo 'shape contains entries matching the high/critical filter.'
+              echo 'A new schema may have been introduced upstream. Update'
+              echo 'the jq extraction in `supply-chain-scan.yml` to recognise'
+              echo 'it before treating this run as clean.'
+              echo
+              echo '<details><summary>raw pnpm-audit.json (first 200 lines)</summary>'
+              echo
+              echo '```json'
+              head -200 pnpm-audit.json
+              echo '```'
+              echo '</details>'
+            } >> "$GITHUB_STEP_SUMMARY" || true
+            echo "::warning title=pnpm audit schema mismatch::pnpm exited 1 but neither known schema produced findings; refusing to report clean. See job summary for the raw report."
+            echo "pnpm audit exit status: ${STATUS} — inconclusive (schema mismatch)"
+            exit 0
+          fi
+
           # If we got here the report has findings. Render whichever
           # schema is present (or both, if a future pnpm version emits
           # mixed output). Each branch is null-safe and falls open to
@@ -460,3 +497,114 @@ jobs:
         # were fixed in this same PR so the gate is clean from the
         # outset.
         run: ./actionlint -color
+
+  scanner-freshness:
+    name: Scanner pin freshness check
+    # This job is the answer to PR460-06 / P3 of the security review:
+    # "Add a documented scheduled check or Dependabot-compatible
+    # mechanism for scanner versions and hashes." Dependabot does not
+    # cover scanner versions that are pinned inside workflow YAML as
+    # env vars (actionlint binary release, hash-pinned PyPI wheels for
+    # zizmor, the npx-resolved @cyclonedx/cdxgen version). This job
+    # walks each pin, queries the upstream registry for the latest
+    # release, and surfaces drift as a job-summary warning. It is
+    # informational (`continue-on-error: true`) — the goal is to
+    # surface stale pins, not to block PRs. Bumps still go through a
+    # normal review PR.
+    #
+    # Only runs on the weekly cron + manual dispatch — drift is a
+    # cadence problem, not a per-PR problem.
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Compare pinned scanner versions against upstream latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          STALE=0
+          {
+            echo '## Scanner pin freshness'
+            echo
+            echo '| Scanner | Pinned | Latest upstream | Status |'
+            echo '|---------|--------|-----------------|--------|'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          report() {
+            local name="$1" pinned="$2" latest="$3" status="$4"
+            echo "| ${name} | \`${pinned}\` | \`${latest}\` | ${status} |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${status}" != "✓ current" ]; then
+              STALE=1
+              echo "::warning title=Scanner pin stale::${name} pinned to ${pinned}, upstream latest is ${latest}"
+            fi
+          }
+
+          # actionlint: pinned in this workflow's `actionlint` job as
+          # ACTIONLINT_VERSION. Parse it back out of THIS file so a
+          # bump there is automatically the source of truth here.
+          ACTIONLINT_PINNED=$(grep -E '^\s+ACTIONLINT_VERSION:\s*' "${GITHUB_WORKSPACE}/.github/workflows/supply-chain-scan.yml" | head -1 | sed -E 's/.*ACTIONLINT_VERSION:\s*//; s/[\"'\'' ]//g')
+          ACTIONLINT_LATEST=$(gh api repos/rhysd/actionlint/releases/latest --jq '.tag_name' | sed 's/^v//')
+          if [ -n "${ACTIONLINT_PINNED}" ] && [ -n "${ACTIONLINT_LATEST}" ]; then
+            if [ "${ACTIONLINT_PINNED}" = "${ACTIONLINT_LATEST}" ]; then
+              report 'actionlint' "${ACTIONLINT_PINNED}" "${ACTIONLINT_LATEST}" '✓ current'
+            else
+              report 'actionlint' "${ACTIONLINT_PINNED}" "${ACTIONLINT_LATEST}" '⚠ behind'
+            fi
+          else
+            report 'actionlint' "${ACTIONLINT_PINNED:-?}" "${ACTIONLINT_LATEST:-?}" '⚠ unable to compare'
+          fi
+
+          # zizmor: pinned via `zizmor==<version>` line in the
+          # heredoc-generated requirements.txt. Parse it back out of
+          # this workflow file.
+          ZIZMOR_PINNED=$(grep -E '^\s*zizmor==' "${GITHUB_WORKSPACE}/.github/workflows/supply-chain-scan.yml" | head -1 | sed -E 's/.*zizmor==//; s/\\.*$//; s/[[:space:]]//g')
+          # PyPI does not need a token for read-only metadata.
+          ZIZMOR_LATEST=$(curl -fsSL https://pypi.org/pypi/zizmor/json | jq -r '.info.version')
+          if [ -n "${ZIZMOR_PINNED}" ] && [ -n "${ZIZMOR_LATEST}" ]; then
+            if [ "${ZIZMOR_PINNED}" = "${ZIZMOR_LATEST}" ]; then
+              report 'zizmor' "${ZIZMOR_PINNED}" "${ZIZMOR_LATEST}" '✓ current'
+            else
+              report 'zizmor' "${ZIZMOR_PINNED}" "${ZIZMOR_LATEST}" '⚠ behind'
+            fi
+          else
+            report 'zizmor' "${ZIZMOR_PINNED:-?}" "${ZIZMOR_LATEST:-?}" '⚠ unable to compare'
+          fi
+
+          # @cyclonedx/cdxgen: pinned via the `npx --yes
+          # @cyclonedx/cdxgen@<ver>` line in release.yml. Parse it back
+          # out of that file so the check stays correct when release.yml
+          # is bumped.
+          if [ -f "${GITHUB_WORKSPACE}/.github/workflows/release.yml" ]; then
+            CDXGEN_PINNED=$(grep -oE '@cyclonedx/cdxgen@[^[:space:]"]+' "${GITHUB_WORKSPACE}/.github/workflows/release.yml" | head -1 | sed 's|@cyclonedx/cdxgen@||')
+            CDXGEN_LATEST=$(curl -fsSL https://registry.npmjs.org/@cyclonedx/cdxgen | jq -r '.["dist-tags"].latest')
+            if [ -n "${CDXGEN_PINNED}" ] && [ -n "${CDXGEN_LATEST}" ]; then
+              if [ "${CDXGEN_PINNED}" = "${CDXGEN_LATEST}" ]; then
+                report '@cyclonedx/cdxgen' "${CDXGEN_PINNED}" "${CDXGEN_LATEST}" '✓ current'
+              else
+                report '@cyclonedx/cdxgen' "${CDXGEN_PINNED}" "${CDXGEN_LATEST}" '⚠ behind'
+              fi
+            else
+              report '@cyclonedx/cdxgen' "${CDXGEN_PINNED:-?}" "${CDXGEN_LATEST:-?}" '⚠ unable to compare'
+            fi
+          fi
+
+          # shellcheck disable=SC2016
+          # Backticks in the markdown string below are intentional
+          # (code-fence formatting in the GitHub Step Summary), not
+          # missed command substitution.
+          {
+            echo
+            if [ "${STALE}" -eq 0 ]; then
+              echo '_All scanners up to date._'
+            else
+              echo '_One or more scanners are behind upstream. Open a bump PR — recompute hash pins where applicable (zizmor PyPI wheels in `supply-chain-scan.yml`, actionlint release `checksums.txt`)._'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

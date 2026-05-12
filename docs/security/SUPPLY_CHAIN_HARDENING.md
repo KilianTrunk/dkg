@@ -687,6 +687,46 @@ narrower the CanisterWorm attack surface.
   baseline 15-high + 1-critical advisories are remediated (Tier 3 §H).
 - Workspace-package publish surface review (Tier 3 §I).
 
+**Out of scope for code-only changes (tracked separately):**
+- **Egress restrictions for credential-bearing jobs.** The release +
+  publish jobs hold high-trust tokens (`contents: write`,
+  `id-token: write`, `attestations: write`, `NPM_TOKEN`). A
+  compromised dep with arbitrary code execution can still exfiltrate
+  by making an outbound HTTP request, and SHA-pinning does not stop
+  runtime egress. The only effective controls are
+  (a) a hardened/self-hosted runner image with egress firewalling,
+  (b) GitHub Actions ARC + a network policy on the runner pods, or
+  (c) a third-party egress-monitoring service. All three are infra
+  decisions, not YAML ones. Tracked as a follow-up.
+- **Node 24 forced migration (deprecation deadline: 2026-06-02).**
+  Every action we currently pin runs on Node 20 (`actions/checkout@v4`,
+  `actions/setup-node@v4`, `pnpm/action-setup@v4`,
+  `github/codeql-action/*@v3`, `actions/upload-artifact@v4`,
+  `actions/download-artifact@v4`, `actions/cache@v4`,
+  `actions/setup-python@v5`, `actions/attest-build-provenance@v2`,
+  `dorny/paths-filter@v3`). GitHub's runner image will force Node 24
+  for these starting 2026-06-02, removing Node 20 entirely on
+  2026-09-16. Dependabot is configured to bump action SHAs weekly
+  via `.github/dependabot.yml` (the `github-actions` ecosystem + the
+  `actions-core` group), so the major-version bumps will land on
+  review schedule. If June arrives and Dependabot hasn't yet opened
+  the bump PRs, run the supply-chain-scan `scanner-freshness` cron
+  manually and bump by hand.
+
+**Automated drift detection (in this PR):**
+- `supply-chain-scan.yml` carries a `scanner-freshness` job that
+  runs on the weekly cron + `workflow_dispatch`. It parses the
+  pinned versions of `actionlint`, `zizmor`, and
+  `@cyclonedx/cdxgen` directly out of the workflow YAMLs, queries
+  upstream registries for the latest releases, and emits a
+  `::warning::` annotation + job-summary table when any pin lags
+  behind. This closes PR460-06 / P3 ("Add a documented scheduled
+  check or Dependabot-compatible mechanism for scanner versions").
+  The job is informational (`continue-on-error: true`) — drift
+  surfaces in the weekly cron's run summary; the bump itself goes
+  through a normal review PR with the new pin + recomputed
+  hashes/digests.
+
 ---
 
 ## Incident response

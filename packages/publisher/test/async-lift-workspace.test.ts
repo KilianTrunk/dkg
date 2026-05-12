@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { GraphManager, OxigraphStore, PrivateContentStore, SharedMemoryLiteralBlobStore } from '@origintrail-official/dkg-storage';
 import { NoChainAdapter } from '@origintrail-official/dkg-chain';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
@@ -13,6 +13,86 @@ const ENTITY = 'urn:test:entity:1';
 const ENTITY_2 = 'urn:test:entity:2';
 const DKG = 'http://dkg.io/ontology/';
 const PROV = 'http://www.w3.org/ns/prov#';
+const SNAPSHOT_DIGEST = `sha256:${'a'.repeat(64)}`;
+
+describe('FileWorkspacePublicSnapshotStore', () => {
+  it('writes graphless N-Quads snapshots and keeps legacy JSON absent for new writes', async () => {
+    const snapshotDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-public-snapshots-'));
+    const publicSnapshotStore = new FileWorkspacePublicSnapshotStore(snapshotDir);
+    const quads = [
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"One"', graph: '' },
+      {
+        subject: `${ENTITY}/.well-known/genid/child`,
+        predicate: 'http://schema.org/count',
+        object: '"42"^^<http://www.w3.org/2001/XMLSchema#integer>',
+        graph: '',
+      },
+      { subject: ENTITY, predicate: 'http://schema.org/lang', object: '"Zdravo"@sr-Latn', graph: '' },
+    ];
+
+    try {
+      const stored = await publicSnapshotStore.putSnapshot({ digest: SNAPSHOT_DIGEST, quads });
+
+      expect(stored.ref).toBe(SNAPSHOT_DIGEST);
+      await expect(access(snapshotFilePath(snapshotDir, SNAPSHOT_DIGEST, 'nq'))).resolves.toBeUndefined();
+      await expect(access(snapshotFilePath(snapshotDir, SNAPSHOT_DIGEST, 'json'))).rejects.toMatchObject({ code: 'ENOENT' });
+
+      const raw = await readFile(snapshotFilePath(snapshotDir, SNAPSHOT_DIGEST, 'nq'), 'utf8');
+      expect(raw).toContain(`<${ENTITY}> <http://schema.org/name> "One" .`);
+      expect(raw).toContain(`<${ENTITY}/.well-known/genid/child> <http://schema.org/count> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .`);
+      expect(raw).toContain(`<${ENTITY}> <http://schema.org/lang> "Zdravo"@sr-Latn .`);
+      expect(stored.byteLength).toBe(Buffer.byteLength(raw, 'utf8'));
+
+      await expect(publicSnapshotStore.getSnapshot(SNAPSHOT_DIGEST)).resolves.toEqual(quads);
+    } finally {
+      await rm(snapshotDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reads legacy JSON snapshots when no N-Quads snapshot exists', async () => {
+    const snapshotDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-public-snapshots-'));
+    const publicSnapshotStore = new FileWorkspacePublicSnapshotStore(snapshotDir);
+    const legacyQuads = [
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Legacy JSON"', graph: '' },
+    ];
+    const jsonPath = snapshotFilePath(snapshotDir, SNAPSHOT_DIGEST, 'json');
+
+    try {
+      await mkdir(dirname(jsonPath), { recursive: true });
+      await writeFile(
+        jsonPath,
+        `${JSON.stringify(legacyQuads.map((quad) => [quad.subject, quad.predicate, quad.object, quad.graph]))}\n`,
+        'utf8',
+      );
+
+      await expect(publicSnapshotStore.getSnapshot(SNAPSHOT_DIGEST)).resolves.toEqual(legacyQuads);
+    } finally {
+      await rm(snapshotDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed N-Quads snapshots without falling back to legacy JSON', async () => {
+    const snapshotDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-public-snapshots-'));
+    const publicSnapshotStore = new FileWorkspacePublicSnapshotStore(snapshotDir);
+    const nquadsPath = snapshotFilePath(snapshotDir, SNAPSHOT_DIGEST, 'nq');
+    const jsonPath = snapshotFilePath(snapshotDir, SNAPSHOT_DIGEST, 'json');
+
+    try {
+      await mkdir(dirname(nquadsPath), { recursive: true });
+      await writeFile(nquadsPath, `<${ENTITY}> <http://schema.org/name> "broken"\n`, 'utf8');
+      await writeFile(
+        jsonPath,
+        `${JSON.stringify([[ENTITY, 'http://schema.org/name', '"Legacy JSON"', '']])}\n`,
+        'utf8',
+      );
+
+      await expect(publicSnapshotStore.getSnapshot(SNAPSHOT_DIGEST))
+        .rejects.toThrow(`Invalid shared-memory public snapshot blob ${SNAPSHOT_DIGEST}`);
+    } finally {
+      await rm(snapshotDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('async lift workspace resolution', () => {
   let store: OxigraphStore;
@@ -417,12 +497,20 @@ describe('async lift workspace resolution', () => {
         }`,
       );
       expect(metadata.type).toBe('bindings');
+      let snapshotRef: string | undefined;
       if (metadata.type === 'bindings') {
         expect(metadata.bindings.some((row) => row['snapshotRef']?.includes('sha256:'))).toBe(true);
         expect(metadata.bindings.some((row) => row['snapshotGraph'])).toBe(false);
         expect(metadata.bindings.some((row) => row['payload'])).toBe(false);
         expect(JSON.stringify(metadata.bindings)).not.toContain(marker);
+        snapshotRef = metadata.bindings.map((row) => stripLiteral(row['snapshotRef'])).find(Boolean);
       }
+      expect(snapshotRef).toBeDefined();
+      const snapshotFile = snapshotFilePath(snapshotDir, snapshotRef!, 'nq');
+      await expect(access(snapshotFile)).resolves.toBeUndefined();
+      await expect(access(snapshotFilePath(snapshotDir, snapshotRef!, 'json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      const snapshotRaw = await readFile(snapshotFile, 'utf8');
+      expect(snapshotRaw).toContain(marker);
 
       const snapshotGraphRows = await store.query(
         `SELECT ?g WHERE {
@@ -452,6 +540,62 @@ describe('async lift workspace resolution', () => {
       });
       expect(resolved.quads).toHaveLength(1);
       expect(resolved.quads[0]?.object).toContain(marker);
+    } finally {
+      await rm(snapshotDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails corrupted N-Quads snapshots instead of resolving live SWM data', async () => {
+    const snapshotDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-public-snapshots-'));
+    const publicSnapshotStore = new FileWorkspacePublicSnapshotStore(snapshotDir);
+    const keypair = await generateEd25519Keypair();
+    const snapshotPublisher = new DKGPublisher({
+      store,
+      chain: new NoChainAdapter(),
+      eventBus: new TypedEventBus(),
+      keypair,
+      publicSnapshotStore,
+    });
+
+    try {
+      const write1 = await snapshotPublisher.share(CONTEXT_GRAPH, [
+        { subject: ENTITY, predicate: 'http://schema.org/name', object: '"One"', graph: '' },
+      ], { publisherPeerId: 'peer1' });
+      await snapshotPublisher.share(CONTEXT_GRAPH, [
+        { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Two"', graph: '' },
+      ], { publisherPeerId: 'peer1' });
+
+      const snapshotRef = await getPublicSnapshotRef(store, graphManager, write1.shareOperationId);
+      const snapshotFile = snapshotFilePath(snapshotDir, snapshotRef, 'nq');
+      await writeFile(snapshotFile, `<${ENTITY}> <http://schema.org/name> "corrupt"\n`, 'utf8');
+
+      await expect(
+        resolveLiftWorkspaceSlice({
+          store,
+          graphManager,
+          publicSnapshotStore,
+          request: {
+            swmId: 'swm-main',
+            shareOperationId: write1.shareOperationId,
+            roots: [ENTITY],
+            contextGraphId: CONTEXT_GRAPH,
+            namespace: 'aloha',
+            scope: 'person-profile',
+            transitionType: 'CREATE',
+            authority: { type: 'owner', proofRef: 'proof:owner:1' },
+          },
+        }),
+      ).rejects.toThrow(`Invalid shared-memory public snapshot blob ${snapshotRef}`);
+
+      const liveQuads = await resolveWorkspaceSelection({
+        store,
+        graphManager,
+        contextGraphId: CONTEXT_GRAPH,
+        selection: { rootEntities: [ENTITY] },
+      });
+      expect(liveQuads).toEqual([
+        { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Two"', graph: '' },
+      ]);
     } finally {
       await rm(snapshotDir, { recursive: true, force: true });
     }
@@ -630,3 +774,35 @@ describe('async lift workspace resolution', () => {
     ).rejects.toThrow('Shared-memory resolution rejected unsafe shareOperationId: bad>op');
   });
 });
+
+function snapshotFilePath(directory: string, ref: string, extension: 'json' | 'nq'): string {
+  const hash = ref.replace(/^"?(?:sha256:)?/, '').replace(/"?$/, '');
+  return join(directory, hash.slice(0, 2), hash.slice(2, 4), `${hash}.${extension}`);
+}
+
+function stripLiteral(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (!value.startsWith('"')) return value;
+  try {
+    return JSON.parse(value) as string;
+  } catch {
+    return value.slice(1, value.lastIndexOf('"'));
+  }
+}
+
+async function getPublicSnapshotRef(store: OxigraphStore, graphManager: GraphManager, shareOperationId: string): Promise<string> {
+  const metaGraph = graphManager.sharedMemoryMetaUri(CONTEXT_GRAPH);
+  const result = await store.query(
+    `SELECT ?snapshotRef WHERE {
+      GRAPH <${metaGraph}> {
+        ?s <${DKG}shareOperationId> "${shareOperationId}" ;
+           <${DKG}publicSnapshotRef> ?snapshotRef .
+      }
+    } LIMIT 1`,
+  );
+  expect(result.type).toBe('bindings');
+  if (result.type !== 'bindings') throw new Error('Unexpected snapshot metadata result');
+  const snapshotRef = stripLiteral(result.bindings[0]?.['snapshotRef']);
+  if (!snapshotRef) throw new Error(`Missing public snapshot ref for ${shareOperationId}`);
+  return snapshotRef;
+}

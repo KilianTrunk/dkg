@@ -466,6 +466,9 @@ This is intentionally asymmetric:
     `--target-gib-per-node 1`.
   - Uses count queries and one sample triple per node so verification does not
     pull the full graph back into the client.
+  - Records interval throughput, latency percentiles, node store/log/process
+    diagnostics, and daemon-log counters; writes a Markdown throughput analysis
+    next to the JSON report for diagnosing slowdown causes.
 
 - Tests:
   - `packages/storage/test/external-literal-store.test.ts`

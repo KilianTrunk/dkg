@@ -4,6 +4,7 @@ const { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, stat
 const { dirname, isAbsolute, join, resolve } = require('node:path');
 const { performance } = require('node:perf_hooks');
 const { createInterface } = require('node:readline');
+const { execFileSync } = require('node:child_process');
 
 const REPO_ROOT = resolve(__dirname, '../../..');
 const DEFAULT_CONTEXT_GRAPH_ID = 'devnet-test';
@@ -17,6 +18,22 @@ const FAILURE_PATTERNS = [
   { name: 'gossipsubInvalidDataLength', text: 'InvalidDataLengthError' },
   { name: 'gossipsubMessageTooLong', text: 'Message length too long' },
   { name: 'heapOutOfMemory', text: 'JavaScript heap out of memory' },
+];
+const DIAGNOSTIC_LOG_PATTERNS = [
+  ...FAILURE_PATTERNS,
+  { name: 'sharedMemoryWritesStarted', text: 'quads to SWM' },
+  { name: 'sharedMemoryWritesCompleted', text: 'Shared memory write complete' },
+  { name: 'replicatedWritesStored', text: 'Stored SWM write' },
+  { name: 'queryAllContextGraph', text: 'Query on contextGraph="all"' },
+  { name: 'syncingFromPeer', text: 'Syncing from peer' },
+  { name: 'syncTimeout', text: 'Sync timeout' },
+  { name: 'syncFailed', text: 'Sync from ' },
+  { name: 'protocolSyncSend', text: 'send /dkg/10.0.0/sync' },
+  { name: 'skippedSwmSync', text: 'Skipping shared memory sync' },
+  { name: 'rsTick', text: '[rs.tick' },
+  { name: 'rsLoopError', text: '[rs.loop.tick-threw]' },
+  { name: 'socketHangUp', text: 'socket hang up' },
+  { name: 'shuttingDown', text: 'Shutting down' },
 ];
 
 function usage() {
@@ -48,7 +65,11 @@ Options:
   --namespace <name>                Subject namespace segment. Default: swm-triple-volume.
   --predicate-base <iri>            Predicate IRI prefix. Default: ${DEFAULT_PREDICATE_BASE}.
   --progress-every <count>          Emit a progress line every N writes. Default: 25.
+  --max-writes <count>              Stop after N total writes, useful for diagnostic runs.
+  --diagnostic-interval-ms <ms>     Collect process/store/log diagnostics every N ms. Default: 30000.
+  --no-diagnostics                  Disable diagnostic snapshots during the write phase.
   --output <path>                   Write the final JSON result to a file.
+  --analysis-output <path>          Write a Markdown throughput analysis. Default: <output>.analysis.md.
   --skip-write                      Only verify an existing run id.
   --devnet-dir <path>               Devnet directory for appended log scanning. Default: DEVNET_DIR or repo .devnet.
   --scan-logs / --no-scan-logs      Scan appended daemon logs for known failure signatures. Default: scan when devnet dir exists.
@@ -162,6 +183,10 @@ function parseBenchmarkArgs(argv = process.argv.slice(2), env = process.env) {
       options.scanLogs = false;
       continue;
     }
+    if (raw === '--no-diagnostics') {
+      options.diagnostics = false;
+      continue;
+    }
     if (!raw.startsWith('--')) throw new Error(`Unexpected argument ${JSON.stringify(raw)}`);
 
     const eqIndex = raw.indexOf('=');
@@ -231,8 +256,17 @@ function parseBenchmarkArgs(argv = process.argv.slice(2), env = process.env) {
       case 'progress-every':
         options.progressEvery = parsePositiveInteger('--progress-every', value);
         break;
+      case 'max-writes':
+        options.maxWrites = parsePositiveInteger('--max-writes', value);
+        break;
+      case 'diagnostic-interval-ms':
+        options.diagnosticIntervalMs = parsePositiveInteger('--diagnostic-interval-ms', value);
+        break;
       case 'output':
         options.output = resolveInputPath(value);
+        break;
+      case 'analysis-output':
+        options.analysisOutput = resolveInputPath(value);
         break;
       case 'devnet-dir':
         options.devnetDir = resolveInputPath(value);
@@ -305,11 +339,19 @@ function parseBenchmarkArgs(argv = process.argv.slice(2), env = process.env) {
     predicateBase: options.predicateBase ?? env.DKG_BENCH_SWM_TRIPLES_PREDICATE_BASE ?? DEFAULT_PREDICATE_BASE,
     progressEvery: options.progressEvery
       ?? (env.DKG_BENCH_SWM_TRIPLES_PROGRESS_EVERY ? parsePositiveInteger('DKG_BENCH_SWM_TRIPLES_PROGRESS_EVERY', env.DKG_BENCH_SWM_TRIPLES_PROGRESS_EVERY) : 25),
+    maxWrites: options.maxWrites
+      ?? (env.DKG_BENCH_SWM_TRIPLES_MAX_WRITES ? parsePositiveInteger('DKG_BENCH_SWM_TRIPLES_MAX_WRITES', env.DKG_BENCH_SWM_TRIPLES_MAX_WRITES) : undefined),
+    diagnosticIntervalMs: options.diagnosticIntervalMs
+      ?? (env.DKG_BENCH_SWM_TRIPLES_DIAGNOSTIC_INTERVAL_MS
+        ? parsePositiveInteger('DKG_BENCH_SWM_TRIPLES_DIAGNOSTIC_INTERVAL_MS', env.DKG_BENCH_SWM_TRIPLES_DIAGNOSTIC_INTERVAL_MS)
+        : 30_000),
     output: options.output ?? (env.DKG_BENCH_SWM_TRIPLES_OUTPUT ? resolveInputPath(env.DKG_BENCH_SWM_TRIPLES_OUTPUT) : undefined),
+    analysisOutput: options.analysisOutput ?? (env.DKG_BENCH_SWM_TRIPLES_ANALYSIS_OUTPUT ? resolveInputPath(env.DKG_BENCH_SWM_TRIPLES_ANALYSIS_OUTPUT) : undefined),
     skipWrite: options.skipWrite ?? parseBoolean(env.DKG_BENCH_SWM_TRIPLES_SKIP_WRITE, false),
     noAuth,
     devnetDir,
     scanLogs: options.scanLogs ?? parseBoolean(env.DKG_BENCH_SWM_TRIPLES_SCAN_LOGS ?? env.DKG_BENCH_SWM_SCAN_LOGS, existsSync(devnetDir)),
+    diagnostics: options.diagnostics ?? parseBoolean(env.DKG_BENCH_SWM_TRIPLES_DIAGNOSTICS, true),
     quiet: options.quiet ?? parseBoolean(env.DKG_BENCH_SWM_TRIPLES_QUIET ?? env.DKG_BENCH_SWM_QUIET, false),
   };
   config.authToken = resolveAuthToken({ ...options, noAuth }, env, devnetDir);
@@ -398,6 +440,9 @@ function buildWriteTasks(config, plan) {
   for (let writeNumber = 1; writeNumber <= plan.writesPerNode; writeNumber += 1) {
     for (let nodeIndex = 0; nodeIndex < config.ports.length; nodeIndex += 1) {
       tasks.push({ nodeIndex, writeNumber });
+      if (config.maxWrites && tasks.length >= config.maxWrites) {
+        return tasks;
+      }
     }
   }
   return tasks;
@@ -426,6 +471,7 @@ function numericBinding(result, name) {
 async function postJson(port, path, body, config, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = performance.now();
   try {
     const headers = { 'content-type': 'application/json' };
     if (config.authToken && !config.noAuth) headers.authorization = `Bearer ${config.authToken}`;
@@ -446,6 +492,14 @@ async function postJson(port, path, body, config, timeoutMs) {
       throw new Error(`HTTP ${response.status} ${path} on ${port}: ${text.slice(0, 500)}`);
     }
     return json;
+  } catch (error) {
+    const durationMs = Number((performance.now() - startedAt).toFixed(2));
+    const cause = error?.cause;
+    const causeCode = cause?.code ? ` cause=${cause.code}` : '';
+    const message = error instanceof Error ? error.message : String(error);
+    const wrapped = new Error(`${path} on port ${port} failed after ${durationMs}ms: ${message}${causeCode}`);
+    wrapped.cause = error;
+    throw wrapped;
   } finally {
     clearTimeout(timer);
   }
@@ -486,6 +540,25 @@ function percentile(values, p) {
   return sorted[Math.max(0, Math.min(sorted.length - 1, rank))];
 }
 
+function durationSummary(values) {
+  if (values.length === 0) {
+    return {
+      minMs: 0,
+      maxMs: 0,
+      meanMs: 0,
+      p50Ms: 0,
+      p95Ms: 0,
+    };
+  }
+  return {
+    minMs: Number(Math.min(...values).toFixed(2)),
+    maxMs: Number(Math.max(...values).toFixed(2)),
+    meanMs: Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2)),
+    p50Ms: Number(percentile(values, 50).toFixed(2)),
+    p95Ms: Number(percentile(values, 95).toFixed(2)),
+  };
+}
+
 function summarizeWrites(records, config) {
   const durations = records.map((record) => record.durationMs);
   const perNode = config.ports.map((port) => {
@@ -498,22 +571,14 @@ function summarizeWrites(records, config) {
       writes: nodeRecords.length,
       triples,
       estimatedMiB: Number((estimatedBytes / 1024 / 1024).toFixed(3)),
-      minMs: Number(Math.min(...nodeDurations).toFixed(2)),
-      maxMs: Number(Math.max(...nodeDurations).toFixed(2)),
-      meanMs: Number((nodeDurations.reduce((sum, value) => sum + value, 0) / Math.max(1, nodeDurations.length)).toFixed(2)),
-      p50Ms: Number(percentile(nodeDurations, 50).toFixed(2)),
-      p95Ms: Number(percentile(nodeDurations, 95).toFixed(2)),
+      ...durationSummary(nodeDurations),
     };
   });
   return {
     writes: records.length,
     triples: records.reduce((sum, record) => sum + record.triples, 0),
     estimatedMiB: Number((records.reduce((sum, record) => sum + record.estimatedNQuadBytes, 0) / 1024 / 1024).toFixed(3)),
-    minMs: Number(Math.min(...durations).toFixed(2)),
-    maxMs: Number(Math.max(...durations).toFixed(2)),
-    meanMs: Number((durations.reduce((sum, value) => sum + value, 0) / Math.max(1, durations.length)).toFixed(2)),
-    p50Ms: Number(percentile(durations, 50).toFixed(2)),
-    p95Ms: Number(percentile(durations, 95).toFixed(2)),
+    ...durationSummary(durations),
     perNode,
   };
 }
@@ -522,23 +587,303 @@ function emitProgress(config, event) {
   if (!config.quiet) process.stderr.write(`${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`);
 }
 
-async function runWrites(config, plan) {
-  if (config.skipWrite) return { durationMs: 0, records: [], summary: undefined };
+function errorRecord(error) {
+  return {
+    message: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined,
+    cause: error?.cause instanceof Error ? error.cause.message : undefined,
+  };
+}
+
+function safeFileSize(path) {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
+
+function directoryStats(path) {
+  const totals = { files: 0, bytes: 0 };
+  function visit(dir) {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const child = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        visit(child);
+      } else if (entry.isFile()) {
+        totals.files += 1;
+        totals.bytes += safeFileSize(child);
+      }
+    }
+  }
+  visit(path);
+  totals.mib = Number((totals.bytes / 1024 / 1024).toFixed(3));
+  return totals;
+}
+
+function readPid(path) {
+  try {
+    const value = readFileSync(path, 'utf8').trim();
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parsePsRows() {
+  try {
+    const out = execFileSync('ps', ['-axo', 'pid,ppid,stat,etime,rss,pcpu,command'], {
+      encoding: 'utf8',
+      timeout: 3000,
+      maxBuffer: 5 * 1024 * 1024,
+    });
+    const lines = out.trimEnd().split(/\r?\n/).slice(1);
+    return lines.map((line) => {
+      const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d+)\s+([\d.]+)\s+(.*)$/);
+      if (!match) return undefined;
+      return {
+        pid: Number(match[1]),
+        ppid: Number(match[2]),
+        stat: match[3],
+        etime: match[4],
+        rssKiB: Number(match[5]),
+        cpuPercent: Number(match[6]),
+        command: match[7],
+      };
+    }).filter(Boolean);
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function processTreeStats(rootPid, psRows) {
+  if (!rootPid || !Array.isArray(psRows)) return undefined;
+  const byParent = new Map();
+  for (const row of psRows) {
+    if (!byParent.has(row.ppid)) byParent.set(row.ppid, []);
+    byParent.get(row.ppid).push(row);
+  }
+  const rows = [];
+  const stack = [rootPid];
+  const seen = new Set();
+  while (stack.length > 0) {
+    const pid = stack.pop();
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const row = psRows.find((candidate) => candidate.pid === pid);
+    if (row) rows.push(row);
+    for (const child of byParent.get(pid) ?? []) {
+      stack.push(child.pid);
+    }
+  }
+  if (rows.length === 0) return undefined;
+  const rssKiB = rows.reduce((sum, row) => sum + row.rssKiB, 0);
+  const cpuPercent = rows.reduce((sum, row) => sum + row.cpuPercent, 0);
+  return {
+    rootPid,
+    processes: rows.length,
+    rssMiB: Number((rssKiB / 1024).toFixed(2)),
+    cpuPercent: Number(cpuPercent.toFixed(1)),
+    commands: rows.slice(0, 5).map((row) => ({
+      pid: row.pid,
+      ppid: row.ppid,
+      stat: row.stat,
+      etime: row.etime,
+      rssMiB: Number((row.rssKiB / 1024).toFixed(2)),
+      cpuPercent: row.cpuPercent,
+      command: row.command.slice(0, 160),
+    })),
+  };
+}
+
+async function countLogPatternsFromOffsets(offsets, patterns = DIAGNOSTIC_LOG_PATTERNS, options = {}) {
+  const byNode = [];
+  for (const entry of offsets) {
+    const counts = Object.fromEntries(patterns.map((pattern) => [pattern.name, 0]));
+    let bytes = 0;
+    if (existsSync(entry.file)) {
+      const end = safeFileSize(entry.file);
+      bytes = Math.max(0, end - entry.offset);
+      if (bytes > 0) {
+        const stream = createReadStream(entry.file, {
+          encoding: 'utf8',
+          start: entry.offset,
+        });
+        const rl = createInterface({ input: stream, crlfDelay: Infinity });
+        for await (const line of rl) {
+          for (const pattern of patterns) {
+            if (line.includes(pattern.text)) counts[pattern.name] += 1;
+          }
+        }
+      }
+      if (options.updateOffsets) entry.offset = end;
+    }
+    byNode.push({ nodeName: entry.nodeName, bytes, counts });
+  }
+  const totals = Object.fromEntries(patterns.map((pattern) => [pattern.name, 0]));
+  for (const entry of byNode) {
+    for (const [key, value] of Object.entries(entry.counts)) {
+      totals[key] = (totals[key] ?? 0) + value;
+    }
+  }
+  return { totals, byNode };
+}
+
+function emptyLogTotals(patterns = DIAGNOSTIC_LOG_PATTERNS) {
+  return Object.fromEntries(patterns.map((pattern) => [pattern.name, 0]));
+}
+
+function addLogTotals(target, source) {
+  for (const [key, value] of Object.entries(source)) {
+    target[key] = (target[key] ?? 0) + value;
+  }
+}
+
+async function collectDiagnosticSnapshot(config, state, logOffsets, cumulativeLogTotals) {
+  if (!config.diagnostics || !config.devnetDir || !existsSync(config.devnetDir)) return undefined;
+  const psRows = parsePsRows();
+  const logCounters = await countLogPatternsFromOffsets(logOffsets, DIAGNOSTIC_LOG_PATTERNS, {
+    updateOffsets: Boolean(cumulativeLogTotals),
+  });
+  if (cumulativeLogTotals) {
+    addLogTotals(cumulativeLogTotals, logCounters.totals);
+    logCounters.deltaTotals = logCounters.totals;
+    logCounters.totals = { ...cumulativeLogTotals };
+  }
+  const nodes = config.ports.map((port, index) => {
+    const nodeName = `node${index + 1}`;
+    const nodeDir = join(config.devnetDir, nodeName);
+    const rootPid = readPid(join(nodeDir, 'daemon.pid')) ?? readPid(join(nodeDir, 'devnet.pid'));
+    const storePath = join(nodeDir, 'store.nq');
+    const snapshotDir = join(nodeDir, 'swm-public-snapshots');
+    return {
+      nodeName,
+      port,
+      pid: rootPid,
+      process: processTreeStats(rootPid, psRows),
+      storeNqMiB: Number((safeFileSize(storePath) / 1024 / 1024).toFixed(3)),
+      publicSnapshotStore: directoryStats(snapshotDir),
+      daemonLogMiB: Number((safeFileSize(join(nodeDir, 'daemon.log')) / 1024 / 1024).toFixed(3)),
+    };
+  });
+  return {
+    atMs: Number((performance.now() - state.startedAt).toFixed(2)),
+    completed: state.completed,
+    estimatedMiBWritten: Number((state.estimatedBytes / 1024 / 1024).toFixed(3)),
+    nodes,
+    logCounters,
+    psError: psRows.error,
+  };
+}
+
+async function runWrites(config, plan, logOffsets = []) {
+  if (config.skipWrite) {
+    return {
+      ok: true,
+      durationMs: 0,
+      attemptedWrites: 0,
+      completedWrites: 0,
+      records: [],
+      intervals: [],
+      diagnostics: [],
+      summary: undefined,
+    };
+  }
 
   const tasks = buildWriteTasks(config, plan);
   const records = [];
+  const intervals = [];
+  const diagnostics = [];
   let nextTask = 0;
   let completed = 0;
+  let estimatedBytes = 0;
+  let failedError;
   const startedAt = performance.now();
+  let lastProgressAt = startedAt;
+  let lastProgressCompleted = 0;
+  let lastProgressBytes = 0;
+  let lastProgressRecordIndex = 0;
+  const state = { startedAt, completed, estimatedBytes };
+  const diagnosticLogOffsets = logOffsets.map((entry) => ({ ...entry }));
+  const cumulativeLogTotals = emptyLogTotals();
+  let diagnosticInFlight = Promise.resolve();
+
+  function queueDiagnosticSnapshot() {
+    if (!config.diagnostics) return;
+    diagnosticInFlight = diagnosticInFlight
+      .catch(() => {})
+      .then(async () => {
+        const snapshot = await collectDiagnosticSnapshot(config, state, diagnosticLogOffsets, cumulativeLogTotals);
+        if (snapshot) diagnostics.push(snapshot);
+      });
+  }
+
+  const diagnosticTimer = config.diagnostics
+    ? setInterval(queueDiagnosticSnapshot, config.diagnosticIntervalMs)
+    : undefined;
+  if (diagnosticTimer?.unref) diagnosticTimer.unref();
 
   async function worker() {
     while (nextTask < tasks.length) {
+      if (failedError) return;
       const task = tasks[nextTask];
       nextTask += 1;
-      const record = await writeBatch(config, plan, task.nodeIndex, task.writeNumber);
+      let record;
+      try {
+        record = await writeBatch(config, plan, task.nodeIndex, task.writeNumber);
+      } catch (error) {
+        failedError = error;
+        emitProgress(config, {
+          event: 'write-error',
+          completed,
+          total: tasks.length,
+          nodeIndex: task.nodeIndex,
+          port: config.ports[task.nodeIndex],
+          writeNumber: task.writeNumber,
+          error: errorRecord(error).message,
+        });
+        return;
+      }
       records.push(record);
       completed += 1;
+      estimatedBytes += record.estimatedNQuadBytes;
+      state.completed = completed;
+      state.estimatedBytes = estimatedBytes;
       if (completed === 1 || completed === tasks.length || completed % config.progressEvery === 0) {
+        const now = performance.now();
+        const intervalRecords = records.slice(lastProgressRecordIndex);
+        const intervalMs = now - lastProgressAt;
+        const intervalWrites = completed - lastProgressCompleted;
+        const intervalBytes = estimatedBytes - lastProgressBytes;
+        const intervalDurations = intervalRecords.map((entry) => entry.durationMs);
+        const progress = {
+          atMs: Number((now - startedAt).toFixed(2)),
+          completed,
+          total: tasks.length,
+          intervalWrites,
+          intervalMs: Number(intervalMs.toFixed(2)),
+          writesPerSec: Number((intervalWrites / Math.max(1, intervalMs / 1000)).toFixed(3)),
+          miBPerSec: Number((intervalBytes / 1024 / 1024 / Math.max(1, intervalMs / 1000)).toFixed(3)),
+          estimatedMiBWritten: Number((estimatedBytes / 1024 / 1024).toFixed(3)),
+          latencyMs: {
+            mean: Number((intervalDurations.reduce((sum, value) => sum + value, 0) / Math.max(1, intervalDurations.length)).toFixed(2)),
+            p50: Number(percentile(intervalDurations, 50).toFixed(2)),
+            p95: Number(percentile(intervalDurations, 95).toFixed(2)),
+            max: Number(Math.max(...intervalDurations, 0).toFixed(2)),
+          },
+          perPortWrites: Object.fromEntries(config.ports.map((port) => [
+            port,
+            intervalRecords.filter((entry) => entry.port === port).length,
+          ])),
+        };
+        intervals.push(progress);
         emitProgress(config, {
           event: 'write-progress',
           completed,
@@ -547,18 +892,37 @@ async function runWrites(config, plan) {
           triples: record.triples,
           estimatedMiB: Number((record.estimatedNQuadBytes / 1024 / 1024).toFixed(3)),
           durationMs: record.durationMs,
+          writesPerSec: progress.writesPerSec,
+          miBPerSec: progress.miBPerSec,
+          p95Ms: progress.latencyMs.p95,
         });
+        lastProgressAt = now;
+        lastProgressCompleted = completed;
+        lastProgressBytes = estimatedBytes;
+        lastProgressRecordIndex = records.length;
       }
     }
   }
 
   const workers = Array.from({ length: Math.min(config.writeConcurrency, tasks.length) }, () => worker());
-  await Promise.all(workers);
+  try {
+    await Promise.all(workers);
+  } finally {
+    if (diagnosticTimer) clearInterval(diagnosticTimer);
+    queueDiagnosticSnapshot();
+    await diagnosticInFlight.catch(() => {});
+  }
   const durationMs = performance.now() - startedAt;
   return {
+    ok: !failedError && completed === tasks.length,
     durationMs: Number(durationMs.toFixed(2)),
+    attemptedWrites: tasks.length,
+    completedWrites: completed,
     records,
-    summary: summarizeWrites(records, config),
+    intervals,
+    diagnostics,
+    error: failedError ? errorRecord(failedError) : undefined,
+    summary: records.length > 0 ? summarizeWrites(records, config) : undefined,
   };
 }
 
@@ -610,7 +974,7 @@ async function countRunMetaPredicate(port, config, plan, predicate, rootPredicat
   return numericBinding(result, 'count');
 }
 
-async function collectMetadata(config, plan) {
+async function collectMetadata(config, plan, expectedWrites = plan.totalWrites) {
   const entries = [];
   for (const port of config.ports) {
     const publicStagedQuads = await countRunMetaPredicate(
@@ -641,13 +1005,13 @@ async function collectMetadata(config, plan) {
       publicSnapshotRefs,
       ok: publicStagedQuads === 0
         && publicSnapshotGraphs === 0
-        && publicSnapshotRefs === plan.totalWrites,
+        && publicSnapshotRefs === expectedWrites,
     });
   }
   return entries;
 }
 
-async function pollReplication(config, plan) {
+async function pollReplication(config, plan, expectedTriples = plan.totalTriples) {
   const startedAt = performance.now();
   const polls = [];
   while (performance.now() - startedAt <= config.replicationTimeoutMs) {
@@ -661,7 +1025,7 @@ async function pollReplication(config, plan) {
     }
     polls.push({ atMs: Number((performance.now() - startedAt).toFixed(2)), counts });
     emitProgress(config, { event: 'replication-poll', counts });
-    if (counts.every((entry) => entry.count === plan.totalTriples)) {
+    if (counts.every((entry) => entry.count === expectedTriples)) {
       return {
         converged: true,
         durationMs: Number((performance.now() - startedAt).toFixed(2)),
@@ -677,7 +1041,7 @@ async function pollReplication(config, plan) {
   };
 }
 
-async function collectSamples(config, plan) {
+async function collectSamples(config, plan, expectedTriples = plan.totalTriples) {
   const entries = [];
   for (const port of config.ports) {
     const count = await countTriples(port, config, plan);
@@ -686,7 +1050,7 @@ async function collectSamples(config, plan) {
       port,
       count,
       sample,
-      ok: count === plan.totalTriples && Boolean(sample),
+      ok: count === expectedTriples && Boolean(sample),
     });
   }
   return entries;
@@ -744,6 +1108,10 @@ function sanitizeConfig(config) {
     pollIntervalMs: config.pollIntervalMs,
     requestTimeoutMs: config.requestTimeoutMs,
     queryTimeoutMs: config.queryTimeoutMs,
+    progressEvery: config.progressEvery,
+    maxWrites: config.maxWrites,
+    diagnosticIntervalMs: config.diagnosticIntervalMs,
+    diagnostics: config.diagnostics,
     runId: config.runId,
     namespace: config.namespace,
     predicateBase: config.predicateBase,
@@ -753,6 +1121,227 @@ function sanitizeConfig(config) {
     devnetDir: config.devnetDir,
     scanLogs: config.scanLogs,
   };
+}
+
+function finiteNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function summarizeInterval(interval) {
+  if (!interval) return undefined;
+  return {
+    atMs: finiteNumber(interval.atMs),
+    completed: finiteNumber(interval.completed),
+    writesPerSec: finiteNumber(interval.writesPerSec),
+    miBPerSec: finiteNumber(interval.miBPerSec),
+    p95Ms: finiteNumber(interval.latencyMs?.p95),
+    maxMs: finiteNumber(interval.latencyMs?.max),
+  };
+}
+
+function latestDiagnosticWithNodes(diagnostics) {
+  if (!Array.isArray(diagnostics)) return undefined;
+  for (let index = diagnostics.length - 1; index >= 0; index -= 1) {
+    if (Array.isArray(diagnostics[index]?.nodes)) return diagnostics[index];
+  }
+  return diagnostics.at(-1);
+}
+
+function analyzeThroughput(result) {
+  const write = result?.write ?? {};
+  const intervals = Array.isArray(write.intervals)
+    ? write.intervals.filter((interval) => Number.isFinite(Number(interval.writesPerSec)))
+    : [];
+  const first = intervals[0];
+  const peak = intervals.reduce((best, interval) => (
+    finiteNumber(interval.writesPerSec) > finiteNumber(best?.writesPerSec) ? interval : best
+  ), undefined);
+  const final = intervals.at(-1);
+  const peakRate = finiteNumber(peak?.writesPerSec);
+  const finalRate = finiteNumber(final?.writesPerSec);
+  const dropFromPeak = peakRate > 0 ? Number(((peakRate - finalRate) / peakRate).toFixed(3)) : 0;
+  const halfPeakAt = peakRate > 0
+    ? intervals.find((interval) => (
+      finiteNumber(interval.atMs) > finiteNumber(peak?.atMs)
+        && finiteNumber(interval.writesPerSec) <= peakRate / 2
+    ))
+    : undefined;
+  const latestDiagnostic = latestDiagnosticWithNodes(write.diagnostics);
+  const logTotals = latestDiagnostic?.logCounters?.totals
+    ?? result?.logScan?.diagnosticCounts?.totals
+    ?? {};
+  const nodeStorage = Array.isArray(latestDiagnostic?.nodes)
+    ? latestDiagnostic.nodes.map((node) => ({
+      nodeName: node.nodeName,
+      port: node.port,
+      storeNqMiB: finiteNumber(node.storeNqMiB),
+      snapshotMiB: finiteNumber(node.publicSnapshotStore?.mib),
+      snapshotFiles: finiteNumber(node.publicSnapshotStore?.files),
+      daemonLogMiB: finiteNumber(node.daemonLogMiB),
+      rssMiB: finiteNumber(node.process?.rssMiB),
+      cpuPercent: finiteNumber(node.process?.cpuPercent),
+      processes: finiteNumber(node.process?.processes),
+    }))
+    : [];
+
+  const signals = [];
+  if (write.error) {
+    signals.push({
+      name: 'write-failure',
+      severity: 'high',
+      detail: write.error.message,
+    });
+  }
+  if (dropFromPeak >= 0.5 && intervals.length >= 2) {
+    signals.push({
+      name: 'throughput-drop',
+      severity: 'high',
+      detail: `Final interval is ${(dropFromPeak * 100).toFixed(1)}% below peak throughput.`,
+    });
+  }
+  const syncSignals = ['syncTimeout', 'syncFailed', 'syncingFromPeer', 'protocolSyncSend']
+    .reduce((sum, key) => sum + finiteNumber(logTotals[key]), 0);
+  if (syncSignals > 0) {
+    signals.push({
+      name: 'sync-backpressure',
+      severity: 'medium',
+      detail: `Observed ${syncSignals} durable-sync or catch-up log events during the measured window.`,
+    });
+  }
+  if (finiteNumber(logTotals.queryAllContextGraph) > 0) {
+    signals.push({
+      name: 'status-query-load',
+      severity: 'medium',
+      detail: `Observed ${finiteNumber(logTotals.queryAllContextGraph)} all-context query log events during the measured window.`,
+    });
+  }
+  const rpcSignals = ['rsLoopError', 'socketHangUp']
+    .reduce((sum, key) => sum + finiteNumber(logTotals[key]), 0);
+  if (rpcSignals > 0) {
+    signals.push({
+      name: 'rpc-instability',
+      severity: 'high',
+      detail: `Observed ${rpcSignals} RPC loop or socket hang-up events during the measured window.`,
+    });
+  }
+  const storageMiB = nodeStorage.reduce((sum, node) => sum + node.storeNqMiB, 0);
+  if (storageMiB > 0) {
+    signals.push({
+      name: 'store-growth',
+      severity: 'info',
+      detail: `Latest sampled store.nq total is ${storageMiB.toFixed(1)} MiB across ${nodeStorage.length} nodes.`,
+    });
+  }
+
+  return {
+    attemptedWrites: finiteNumber(write.attemptedWrites),
+    completedWrites: finiteNumber(write.completedWrites),
+    intervalCount: intervals.length,
+    firstInterval: summarizeInterval(first),
+    peakInterval: summarizeInterval(peak),
+    finalInterval: summarizeInterval(final),
+    dropFromPeak,
+    halfPeakAt: summarizeInterval(halfPeakAt),
+    slowestIntervals: [...intervals]
+      .sort((a, b) => finiteNumber(a.writesPerSec) - finiteNumber(b.writesPerSec))
+      .slice(0, 5)
+      .map(summarizeInterval),
+    latestDiagnosticsAtMs: finiteNumber(latestDiagnostic?.atMs),
+    nodeStorage,
+    logTotals,
+    signals,
+  };
+}
+
+function tableOrPlaceholder(headers, rows) {
+  if (rows.length === 0) return '_No samples captured._';
+  return [
+    `| ${headers.join(' | ')} |`,
+    `| ${headers.map(() => '---').join(' | ')} |`,
+    ...rows.map((row) => `| ${row.join(' | ')} |`),
+  ].join('\n');
+}
+
+function renderAnalysisMarkdown(result) {
+  const analysis = result.analysis ?? analyzeThroughput(result);
+  const signals = Array.isArray(analysis.signals) ? analysis.signals : [];
+  const slowestIntervals = Array.isArray(analysis.slowestIntervals) ? analysis.slowestIntervals : [];
+  const nodeStorage = Array.isArray(analysis.nodeStorage) ? analysis.nodeStorage : [];
+  const lines = [
+    '# SWM Triple-Volume Throughput Analysis',
+    '',
+    `- Status: ${result.ok ? 'pass' : 'fail'}`,
+    `- Run id: ${result.config?.runId ?? 'unknown'}`,
+    `- Completed writes: ${analysis.completedWrites}/${analysis.attemptedWrites}`,
+    `- Peak throughput: ${analysis.peakInterval?.writesPerSec ?? 0} writes/sec (${analysis.peakInterval?.miBPerSec ?? 0} MiB/sec)`,
+    `- Final throughput: ${analysis.finalInterval?.writesPerSec ?? 0} writes/sec (${analysis.finalInterval?.miBPerSec ?? 0} MiB/sec)`,
+    `- Drop from peak: ${(finiteNumber(analysis.dropFromPeak) * 100).toFixed(1)}%`,
+    '',
+    '## Signals',
+    '',
+  ];
+
+  if (signals.length === 0) {
+    lines.push('_No throughput-drop signal was detected in the captured intervals._');
+  } else {
+    for (const signal of signals) {
+      lines.push(`- ${signal.severity}: ${signal.name} - ${signal.detail}`);
+    }
+  }
+
+  lines.push(
+    '',
+    '## Slowest Intervals',
+    '',
+    tableOrPlaceholder(
+      ['at ms', 'completed', 'writes/sec', 'MiB/sec', 'p95 ms', 'max ms'],
+      slowestIntervals.map((interval) => [
+        interval.atMs,
+        interval.completed,
+        interval.writesPerSec,
+        interval.miBPerSec,
+        interval.p95Ms,
+        interval.maxMs,
+      ]),
+    ),
+    '',
+    '## Latest Node Snapshot',
+    '',
+    tableOrPlaceholder(
+      ['node', 'port', 'store MiB', 'snap MiB', 'snap files', 'rss MiB', 'cpu %', 'log MiB'],
+      nodeStorage.map((node) => [
+        node.nodeName,
+        node.port,
+        node.storeNqMiB,
+        node.snapshotMiB,
+        node.snapshotFiles,
+        node.rssMiB,
+        node.cpuPercent,
+        node.daemonLogMiB,
+      ]),
+    ),
+    '',
+    '## Diagnostic Log Counters',
+    '',
+    '```json',
+    JSON.stringify(analysis.logTotals ?? {}, null, 2),
+    '```',
+    '',
+    '## Interpretation',
+    '',
+    'This benchmark measures write-path throughput while SWM gossip, durable sync, status queries, and Oxigraph persistence are active. A throughput drop with sync-backpressure or all-context query counters points at runtime load around replication/catch-up and query traffic, not large literal externalization. A drop without those counters points more directly at local RDF store/index growth or daemon resource pressure.',
+    '',
+  );
+
+  return `${lines.join('\n')}\n`;
+}
+
+function defaultAnalysisOutput(output) {
+  if (!output) return undefined;
+  return output.endsWith('.json')
+    ? `${output.slice(0, -'.json'.length)}.analysis.md`
+    : `${output}.analysis.md`;
 }
 
 async function runSwmTripleVolumeBenchmark(config) {
@@ -772,18 +1361,55 @@ async function runSwmTripleVolumeBenchmark(config) {
     totalTriples: plan.totalTriples,
   });
 
-  const write = await runWrites(config, plan);
-  const replication = await pollReplication(config, plan);
-  const samples = await collectSamples(config, plan);
-  const metadata = await collectMetadata(config, plan);
+  const write = await runWrites(config, plan, logOffsets);
+  const expectedWrites = config.skipWrite ? plan.totalWrites : write.completedWrites;
+  const expectedTriples = expectedWrites * config.triplesPerWrite;
+  let replication = {
+    skipped: true,
+    reason: write.ok ? 'not run' : 'write phase failed',
+    converged: false,
+    polls: [],
+  };
+  let samples = [];
+  let metadata = [];
+  let verificationError;
+  if (write.ok) {
+    try {
+      replication = await pollReplication(config, plan, expectedTriples);
+      samples = await collectSamples(config, plan, expectedTriples);
+      metadata = await collectMetadata(config, plan, expectedWrites);
+    } catch (error) {
+      verificationError = errorRecord(error);
+      replication = {
+        skipped: false,
+        converged: false,
+        polls: replication.polls ?? [],
+        error: verificationError,
+      };
+      emitProgress(config, {
+        event: 'verification-error',
+        error: verificationError.message,
+      });
+    }
+  } else {
+    emitProgress(config, {
+      event: 'verification-skipped',
+      reason: 'write phase failed',
+      completedWrites: write.completedWrites,
+      attemptedWrites: write.attemptedWrites,
+    });
+  }
+  const diagnosticCounts = config.scanLogs ? await countLogPatternsFromOffsets(logOffsets) : undefined;
   const logScan = config.scanLogs ? await scanLogsFromOffsets(logOffsets) : undefined;
+  if (logScan && diagnosticCounts) logScan.diagnosticCounts = diagnosticCounts;
   const finishedAt = performance.now();
-  const ok = replication.converged
+  const ok = write.ok
+    && !verificationError
+    && replication.converged
     && samples.every((entry) => entry.ok)
     && metadata.every((entry) => entry.ok)
     && (logScan ? logScan.ok : true);
-
-  return {
+  const result = {
     benchmark: 'swm-triple-volume',
     ok,
     startedAt: startedAtIso,
@@ -793,13 +1419,22 @@ async function runSwmTripleVolumeBenchmark(config) {
     plan,
     metadata,
     write: {
+      ok: write.ok,
       durationMs: write.durationMs,
+      attemptedWrites: write.attemptedWrites,
+      completedWrites: write.completedWrites,
       summary: write.summary,
+      intervals: write.intervals,
+      diagnostics: write.diagnostics,
+      error: write.error,
     },
     replication,
     samples,
     logScan,
+    error: verificationError,
   };
+  result.analysis = analyzeThroughput(result);
+  return result;
 }
 
 async function main(argv = process.argv.slice(2), env = process.env) {
@@ -812,6 +1447,11 @@ async function main(argv = process.argv.slice(2), env = process.env) {
   if (config.output) {
     mkdirSync(dirname(config.output), { recursive: true });
     writeFileSync(config.output, `${JSON.stringify(result, null, 2)}\n`);
+  }
+  const analysisOutput = config.analysisOutput ?? defaultAnalysisOutput(config.output);
+  if (analysisOutput) {
+    mkdirSync(dirname(analysisOutput), { recursive: true });
+    writeFileSync(analysisOutput, renderAnalysisMarkdown(result));
   }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   if (!result.ok) process.exitCode = 1;
@@ -827,11 +1467,14 @@ if (require.main === module) {
 module.exports = {
   buildBenchmarkPlan,
   buildWriteTasks,
+  defaultAnalysisOutput,
   estimateQuadNQuadBytes,
   estimateQuadsNQuadBytes,
   makeObjectLexical,
   makeQuads,
+  analyzeThroughput,
   parseBenchmarkArgs,
+  renderAnalysisMarkdown,
   runSwmTripleVolumeBenchmark,
   usage,
 };

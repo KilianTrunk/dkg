@@ -295,6 +295,12 @@ write runs; live SWM gossip still replicates new writes. The report also checks
 that per-operation public snapshots are stored as disk refs, not Oxigraph
 snapshot graphs or `dkg:publicStagedQuads` literals.
 
+For throughput-drop diagnosis, add `--max-writes <count>` to stop at a smaller
+partial run and leave diagnostics enabled. The JSON report records interval
+throughput, write latency percentiles, per-node `store.nq`/snapshot/log/process
+samples, and appended daemon-log counters. A Markdown summary is written to
+`<output>.analysis.md` by default, or to `--analysis-output <path>`.
+
 ## Extending the Node
 
 The V9 "installable apps" framework (iframe-hosted third-party UIs loaded from

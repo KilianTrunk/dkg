@@ -15,9 +15,11 @@ const benchmark = require('../scripts/swm-triple-volume-benchmark.cjs') as {
     rootPrefix: string;
   };
   buildWriteTasks: (
-    config: { ports: number[] },
+    config: { ports: number[]; maxWrites?: number },
     plan: { writesPerNode: number },
   ) => Array<{ nodeIndex: number; writeNumber: number }>;
+  analyzeThroughput: (result: Record<string, unknown>) => Record<string, unknown>;
+  renderAnalysisMarkdown: (result: Record<string, unknown>) => string;
   estimateQuadsNQuadBytes: (quads: Array<{ subject: string; predicate: string; object: string; graph: string }>) => number;
   makeObjectLexical: (
     runId: string,
@@ -52,6 +54,10 @@ describe('swm triple volume benchmark', () => {
       '4',
       '--write-concurrency',
       '2',
+      '--max-writes',
+      '125',
+      '--diagnostic-interval-ms',
+      '5000',
       '--replication-timeout-ms',
       '1000',
       '--poll-interval-ms',
@@ -68,9 +74,12 @@ describe('swm triple volume benchmark', () => {
       'urn:test:p',
       '--output',
       'bench/results/triples.json',
+      '--analysis-output',
+      'bench/results/triples.analysis.md',
       '--devnet-dir',
       '.devnet',
       '--no-scan-logs',
+      '--no-diagnostics',
       '--auth-token',
       'secret-token',
     ], {});
@@ -83,6 +92,9 @@ describe('swm triple volume benchmark', () => {
       objectBytes: 48,
       predicateCount: 4,
       writeConcurrency: 2,
+      maxWrites: 125,
+      diagnosticIntervalMs: 5000,
+      diagnostics: false,
       replicationTimeoutMs: 1000,
       pollIntervalMs: 100,
       requestTimeoutMs: 2000,
@@ -93,6 +105,7 @@ describe('swm triple volume benchmark', () => {
       scanLogs: false,
       authToken: 'secret-token',
       output: resolve(process.env.INIT_CWD ?? process.cwd(), 'bench/results/triples.json'),
+      analysisOutput: resolve(process.env.INIT_CWD ?? process.cwd(), 'bench/results/triples.analysis.md'),
       devnetDir: resolve(process.env.INIT_CWD ?? process.cwd(), '.devnet'),
     });
   });
@@ -165,6 +178,15 @@ describe('swm triple volume benchmark', () => {
     ]);
   });
 
+  it('can cap write tasks for diagnostic runs', () => {
+    expect(benchmark.buildWriteTasks({ ports: [9201, 9202, 9203], maxWrites: 4 }, { writesPerNode: 3 })).toEqual([
+      { nodeIndex: 0, writeNumber: 1 },
+      { nodeIndex: 1, writeNumber: 1 },
+      { nodeIndex: 2, writeNumber: 1 },
+      { nodeIndex: 0, writeNumber: 2 },
+    ]);
+  });
+
   it('estimates serialized N-Quad bytes for generated triples', () => {
     const quads = benchmark.makeQuads(
       {
@@ -181,5 +203,51 @@ describe('swm triple volume benchmark', () => {
     );
 
     expect(benchmark.estimateQuadsNQuadBytes(quads)).toBeGreaterThan(0);
+  });
+
+  it('analyzes throughput drops with runtime log signals', () => {
+    const result = {
+      ok: false,
+      config: { runId: 'analysis-run' },
+      write: {
+        attemptedWrites: 100,
+        completedWrites: 80,
+        error: { message: 'fetch failed' },
+        intervals: [
+          { atMs: 1000, completed: 25, writesPerSec: 20, miBPerSec: 2, latencyMs: { p95: 250, max: 300 } },
+          { atMs: 2000, completed: 50, writesPerSec: 25, miBPerSec: 2.5, latencyMs: { p95: 300, max: 350 } },
+          { atMs: 3000, completed: 75, writesPerSec: 5, miBPerSec: 0.5, latencyMs: { p95: 1800, max: 2100 } },
+        ],
+        diagnostics: [{
+          atMs: 3200,
+          logCounters: {
+            totals: {
+              syncTimeout: 2,
+              syncingFromPeer: 3,
+              queryAllContextGraph: 1,
+              socketHangUp: 1,
+            },
+          },
+          nodes: [{
+            nodeName: 'node1',
+            port: 9201,
+            storeNqMiB: 512,
+            daemonLogMiB: 8,
+            publicSnapshotStore: { files: 80, mib: 1.5 },
+            process: { rssMiB: 1024, cpuPercent: 80, processes: 3 },
+          }],
+        }],
+      },
+    };
+
+    const analysis = benchmark.analyzeThroughput(result);
+    expect(analysis).toMatchObject({
+      completedWrites: 80,
+      attemptedWrites: 100,
+      dropFromPeak: 0.8,
+    });
+    expect(String(JSON.stringify(analysis))).toContain('sync-backpressure');
+    expect(String(JSON.stringify(analysis))).toContain('rpc-instability');
+    expect(benchmark.renderAnalysisMarkdown({ ...result, analysis })).toContain('SWM Triple-Volume Throughput Analysis');
   });
 });

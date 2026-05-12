@@ -5,6 +5,7 @@ import {
   importFile,
   type AgentIdentity,
   type ImportFileResult,
+  type LocalAgentChatAttachmentImportResult,
   type LocalAgentChatAttachmentRef,
   type LocalAgentChatContextEntry,
   type LocalAgentIntegration,
@@ -122,26 +123,88 @@ function buildAttachmentSummary(attachments: LocalAgentChatAttachmentRef[]): str
 }
 
 function isSendableAttachmentDraft(draft: LocalAgentAttachmentDraft): boolean {
-  return draft.status === 'queued' || draft.status === 'completed';
+  return draft.status === 'queued' || draft.status === 'completed' || draft.status === 'skipped';
 }
 
 function getProjectDisplayName(projects: ContextGraph[], projectId: string): string {
   return projects.find((project) => project.id === projectId)?.name ?? projectId;
 }
 
+function normalizeAttachmentFileName(file: File): string {
+  return file.name.trim();
+}
+
 function draftToAttachmentRef(draft: LocalAgentAttachmentDraft): LocalAgentChatAttachmentRef | null {
   if (draft.status !== 'completed' || !draft.result) return null;
   return {
     id: draft.id,
-    fileName: draft.file.name,
+    fileName: normalizeAttachmentFileName(draft.file),
     contextGraphId: draft.contextGraphId,
     assertionName: draft.assertionName,
     assertionUri: draft.result.assertionUri,
     fileHash: draft.result.fileHash,
     detectedContentType: draft.result.detectedContentType,
+    rootEntity: draft.result.rootEntity,
     extractionStatus: 'completed',
     tripleCount: draft.result.extraction.tripleCount ?? draft.result.extraction.triplesWritten,
   };
+}
+
+function formatAttachmentImportContextValue(value: string | number | null | undefined): string {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildAttachmentImportResultRefs(
+  drafts: LocalAgentAttachmentDraft[],
+): { results: LocalAgentChatAttachmentImportResult[]; deliveredDraftIds: string[] } {
+  const deliveredDraftIds: string[] = [];
+  const results = drafts.flatMap((draft): LocalAgentChatAttachmentImportResult[] => {
+    if (draft.status !== 'skipped' || !draft.result) return [];
+    deliveredDraftIds.push(draft.id);
+    const result = draft.result;
+    const extraction = result.extraction;
+    return [{
+      id: draft.id,
+      fileName: normalizeAttachmentFileName(draft.file),
+      contextGraphId: draft.contextGraphId,
+      assertionName: draft.assertionName,
+      assertionUri: result.assertionUri,
+      fileHash: result.fileHash,
+      detectedContentType: result.detectedContentType,
+      extractionStatus: 'skipped',
+      pipelineUsed: extraction.pipelineUsed ?? null,
+      tripleCount: extraction.tripleCount ?? extraction.triplesWritten ?? 0,
+      ...(result.rootEntity ? { rootEntity: result.rootEntity } : {}),
+      ...(extraction.mdIntermediateHash ? { mdIntermediateHash: extraction.mdIntermediateHash } : {}),
+      ...(extraction.error ? { error: extraction.error } : {}),
+    }];
+  });
+
+  return { results, deliveredDraftIds };
+}
+
+function buildAttachmentImportSummary(importResults: LocalAgentChatAttachmentImportResult[]): string {
+  if (importResults.length === 0) return '';
+  if (importResults.length === 1) {
+    return `Attachment import result: ${formatAttachmentImportContextValue(importResults[0].fileName)}.`;
+  }
+  return `Attached ${importResults.length} document import results.`;
+}
+
+function buildAttachmentTurnSummary(
+  attachments: LocalAgentChatAttachmentRef[],
+  importResults: LocalAgentChatAttachmentImportResult[],
+): string {
+  const parts = [
+    buildAttachmentSummary(attachments),
+    buildAttachmentImportSummary(importResults),
+  ]
+    .filter((part) => part.length > 0)
+    .map((part) => part.replace(/\.$/, ''));
+  return parts.length ? `${parts.join('; ')}.` : '';
 }
 
 function buildChatContextEntries(
@@ -905,7 +968,7 @@ export function ConnectedAgentsTab(props: {
                               ? `Ready - ${triples} triples`
                               : 'Ready'
                             : attachment.status === 'skipped'
-                              ? 'Stored only - not sent'
+                              ? 'Stored only - metadata ready'
                               : attachment.error ?? 'Failed';
                       return (
                         <div
@@ -1538,15 +1601,22 @@ export function PanelRight() {
       const attachments = processedDrafts
         .map((draft) => draftToAttachmentRef(draft))
         .filter((item): item is LocalAgentChatAttachmentRef => item != null);
-      if (!text && attachments.length === 0) {
+      const importContext = buildAttachmentImportResultRefs(processedDrafts);
+      if (!text && attachments.length === 0 && importContext.results.length === 0) {
         return;
       }
 
       const correlationId = crypto.randomUUID();
-      const messageText = text || buildAttachmentSummary(attachments);
+      const importSummary = buildAttachmentImportSummary(importContext.results);
+      const textWithImportSummary = [text, importSummary].filter((part) => part.length > 0).join('\n\n');
+      const messageText = text
+        ? textWithImportSummary
+        : buildAttachmentTurnSummary(attachments, importContext.results);
+      const outboundText = text ? textWithImportSummary : '';
       const attachmentIds = attachments
         .map((attachment) => attachment.id)
         .filter((attachmentId): attachmentId is string => typeof attachmentId === 'string' && attachmentId.length > 0);
+      const deliveredAttachmentIds = [...attachmentIds, ...importContext.deliveredDraftIds];
       const userId = `local:${conversationKey}:${correlationId}:user`;
       assistantId = `local:${conversationKey}:${correlationId}:assistant`;
       const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -1560,14 +1630,18 @@ export function PanelRight() {
 
       controller = new AbortController();
       localAbortRef.current = controller;
-      const contextEntries = buildChatContextEntries(availableProjects, activeProjectId, currentAgent);
+      const contextEntries = [
+        ...buildChatContextEntries(availableProjects, activeProjectId, currentAgent),
+      ];
 
-      const result = await streamLocalAgentChat(integrationId, text, {
+      const result = await streamLocalAgentChat(integrationId, outboundText, {
         correlationId,
         signal: controller?.signal,
         sessionId: conversation.sessionId ?? undefined,
         profile: integration.profile,
+        persistUserMessage: outboundText ? undefined : messageText,
         attachments,
+        attachmentImportResults: importContext.results,
         contextEntries,
         contextGraphId: activeProjectId ?? undefined,
         onEvent: (event: LocalAgentStreamEvent) => {
@@ -1594,8 +1668,8 @@ export function PanelRight() {
             : message,
         ),
       );
-      if (attachmentIds.length > 0) {
-        clearCompletedAttachmentsForConversation(conversationKey, attachmentIds);
+      if (deliveredAttachmentIds.length > 0) {
+        clearCompletedAttachmentsForConversation(conversationKey, deliveredAttachmentIds);
       }
       loadSessions();
       if (stage === 0) advance();

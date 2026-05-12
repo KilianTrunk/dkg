@@ -57,7 +57,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, assertionLifecycleUri } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import { validatePreSignedAuthorAttestation } from './memory.js';
 import {
@@ -1105,6 +1105,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       assertionName,
       subGraphName,
     );
+    const uploadedFilename = filePart.filename?.trim() || undefined;
     const startedAt = new Date().toISOString();
 
     // ── Round 14 Bug 42: per-assertion mutex BEFORE extraction ──
@@ -1176,6 +1177,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         setExtractionStatusRecord(extractionStatus, assertionUri, {
           status: "in_progress",
           fileHash: fileStoreEntry.keccak256,
+          ...(uploadedFilename ? { fileName: uploadedFilename } : {}),
           detectedContentType,
           pipelineUsed,
           tripleCount: 0,
@@ -1191,6 +1193,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         const failedRecord: ExtractionStatusRecord = {
           status: "failed",
           fileHash: fileStoreEntry.keccak256,
+          ...(uploadedFilename ? { fileName: uploadedFilename } : {}),
           ...(importRootEntity ? { rootEntity: importRootEntity } : {}),
           detectedContentType,
           pipelineUsed: failedPipelineUsed,
@@ -1223,6 +1226,110 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
             : {}),
           error,
         });
+      };
+      const previousExtractionStatusRecord = getExtractionStatusRecord(
+        extractionStatus,
+        assertionUri,
+      );
+      const importMetaValue = (
+        snapshot: Array<{
+          subject: string;
+          predicate: string;
+          object: string;
+          graph: string;
+        }>,
+        predicate: string,
+      ): string | undefined => snapshot.find((q) =>
+        q.subject === assertionUri &&
+        q.predicate === `http://dkg.io/ontology/${predicate}`
+      )?.object;
+      const parseImportMetaLiteral = (
+        value: string | undefined,
+      ): string | undefined => {
+        const trimmed = value?.trim();
+        if (!trimmed) return undefined;
+        const literalMatch = /^"((?:[^"\\]|\\.)*)"/.exec(trimmed);
+        if (literalMatch) {
+          try {
+            return JSON.parse(literalMatch[0]);
+          } catch {
+            return literalMatch[1];
+          }
+        }
+        return trimmed.replace(/^<|>$/g, "");
+      };
+      const parseImportMetaInteger = (
+        value: string | undefined,
+      ): number | undefined => {
+        const integerMatch = /^"(-?\d+)"/.exec(value?.trim() ?? "");
+        if (!integerMatch) return undefined;
+        const parsed = Number.parseInt(integerMatch[1], 10);
+        return Number.isFinite(parsed) ? parsed : undefined;
+      };
+      const buildPreviousExtractionStatusRecordFromMeta = (
+        snapshot: Array<{
+          subject: string;
+          predicate: string;
+          object: string;
+          graph: string;
+        }>,
+      ): ExtractionStatusRecord | undefined => {
+        const fileHash = parseImportMetaLiteral(
+          importMetaValue(snapshot, "sourceFileHash"),
+        );
+        const detectedContentType = parseImportMetaLiteral(
+          importMetaValue(snapshot, "sourceContentType"),
+        );
+        const tripleCount = parseImportMetaInteger(
+          importMetaValue(snapshot, "structuralTripleCount"),
+        );
+        if (!fileHash || !detectedContentType || tripleCount == null) {
+          return undefined;
+        }
+        const extractionStatus = parseImportMetaLiteral(
+          importMetaValue(snapshot, "extractionStatus"),
+        );
+        const status = extractionStatus === "skipped" ? "skipped" : "completed";
+        const fileName = parseImportMetaLiteral(
+          importMetaValue(snapshot, "sourceFileName"),
+        );
+        const rootEntity = parseImportMetaLiteral(
+          importMetaValue(snapshot, "rootEntity"),
+        );
+        const mdIntermediateHashFromMeta = parseImportMetaLiteral(
+          importMetaValue(snapshot, "mdIntermediateHash"),
+        );
+        const restoredAt = new Date().toISOString();
+        return {
+          status,
+          fileHash,
+          ...(fileName ? { fileName } : {}),
+          ...(rootEntity ? { rootEntity } : {}),
+          detectedContentType,
+          pipelineUsed: status === "skipped" ? null : detectedContentType,
+          tripleCount,
+          ...(mdIntermediateHashFromMeta
+            ? { mdIntermediateHash: mdIntermediateHashFromMeta }
+            : {}),
+          startedAt: restoredAt,
+          completedAt: restoredAt,
+        };
+      };
+      const getRestorablePreviousExtractionStatusRecord = (
+        metaSnapshot: Array<{
+          subject: string;
+          predicate: string;
+          object: string;
+          graph: string;
+        }>,
+      ): ExtractionStatusRecord | undefined =>
+        previousExtractionStatusRecord
+          ? { ...previousExtractionStatusRecord }
+          : buildPreviousExtractionStatusRecordFromMeta(metaSnapshot);
+      const restoreExtractionStatusRecord = (
+        record: ExtractionStatusRecord,
+      ): void => {
+        setExtractionStatusRecord(extractionStatus, assertionUri, record);
       };
 
       recordInProgressExtraction();
@@ -1261,11 +1368,348 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       }
 
       // ── Graceful degrade: no converter registered and not text/markdown ──
-      // Store the file blob, return status=skipped, no triples written.
+      // Store the file blob, return status=skipped, and persist durable
+      // provenance metadata without creating assertion data triples.
       if (mdIntermediate === null) {
+        const skippedMetaGraph = contextGraphMetaUri(contextGraphId!);
+        const lifecycleSubject = assertionLifecycleUri(
+          contextGraphId!,
+          requestAgentAddress,
+          assertionName,
+          subGraphName,
+        );
+        const listCreateMetaSubjects = async (): Promise<string[]> => {
+          const lifecycleSubjectLiteral = JSON.stringify(lifecycleSubject);
+          const lifecyclePrefixLiteral = JSON.stringify(`${lifecycleSubject}/`);
+          const assertionUriLiteral = JSON.stringify(assertionUri);
+          const result = await agent.store.query(
+            `SELECT DISTINCT ?s WHERE { GRAPH <${skippedMetaGraph}> { ?s ?p ?o . FILTER(STR(?s) = ${lifecycleSubjectLiteral} || STRSTARTS(STR(?s), ${lifecyclePrefixLiteral}) || STR(?s) = ${assertionUriLiteral}) } }`,
+          );
+          if (result.type !== "bindings") return [];
+          return result.bindings
+            .map((row) => row["s"])
+            .filter((subject): subject is string => typeof subject === "string" && subject.length > 0);
+        };
+        const snapshotCreateMeta = async (): Promise<
+          Array<{
+            subject: string;
+            predicate: string;
+            object: string;
+            graph: string;
+          }>
+        > => {
+          const subjects = new Set([
+            assertionUri,
+            lifecycleSubject,
+            ...(await listCreateMetaSubjects()),
+          ]);
+          const snapshot: Array<{
+            subject: string;
+            predicate: string;
+            object: string;
+            graph: string;
+          }> = [];
+          for (const subject of subjects) {
+            const result = await agent.store.query(
+              `CONSTRUCT { <${subject}> ?p ?o } WHERE { GRAPH <${skippedMetaGraph}> { <${subject}> ?p ?o } }`,
+            );
+            if (result.type === "quads") {
+              snapshot.push(...result.quads.map((q) => ({
+                ...q,
+                graph: skippedMetaGraph,
+              })));
+            }
+          }
+          return snapshot;
+        };
+        const restoreCreateMetaSnapshot = async (
+          snapshot: Array<{
+            subject: string;
+            predicate: string;
+            object: string;
+            graph: string;
+          }>,
+        ): Promise<void> => {
+          const subjects = new Set([
+            assertionUri,
+            lifecycleSubject,
+            ...snapshot.map((q) => q.subject),
+            ...(await listCreateMetaSubjects()),
+          ]);
+          for (const subject of subjects) {
+            await agent.store.deleteByPattern({
+              subject,
+              graph: skippedMetaGraph,
+            });
+          }
+          if (snapshot.length > 0) {
+            await agent.store.insert(snapshot);
+          }
+        };
+        const snapshotCreateDataGraph = async (): Promise<
+          Array<{
+            subject: string;
+            predicate: string;
+            object: string;
+            graph: string;
+          }>
+        > => {
+          const result = await agent.store.query(
+            `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${assertionUri}> { ?s ?p ?o } }`,
+          );
+          if (result.type !== "quads") return [];
+          return result.quads.map((q) => ({
+            ...q,
+            graph: assertionUri,
+          }));
+        };
+        const restoreCreateSnapshot = async (
+          metaSnapshot: Array<{
+            subject: string;
+            predicate: string;
+            object: string;
+            graph: string;
+          }>,
+          dataSnapshot: Array<{
+            subject: string;
+            predicate: string;
+            object: string;
+            graph: string;
+          }>,
+          hadDataGraphBeforeCreate: boolean,
+        ): Promise<void> => {
+          const restoreErrors: string[] = [];
+          try {
+            if (dataSnapshot.length > 0) {
+              await agent.store.dropGraph(assertionUri);
+              await agent.store.insert(dataSnapshot);
+            } else if (hadDataGraphBeforeCreate) {
+              await agent.store.dropGraph(assertionUri);
+              await agent.store.createGraph(assertionUri);
+            } else if (!hadDataGraphBeforeCreate) {
+              await agent.store.dropGraph(assertionUri);
+            }
+          } catch (err: any) {
+            restoreErrors.push(
+              `data graph rollback failed: ${err?.message ?? err}`,
+            );
+          }
+          try {
+            await restoreCreateMetaSnapshot(metaSnapshot);
+          } catch (err: any) {
+            restoreErrors.push(
+              `metadata rollback failed: ${err?.message ?? err}`,
+            );
+          }
+          if (restoreErrors.length > 0) {
+            throw new Error(restoreErrors.join("; "));
+          }
+        };
+
+        let preCreateDataGraphExisted = false;
+        let preCreateDataSnapshot: Array<{
+          subject: string;
+          predicate: string;
+          object: string;
+          graph: string;
+        }>;
+        let preCreateMetaSnapshot: Array<{
+          subject: string;
+          predicate: string;
+          object: string;
+          graph: string;
+        }>;
+        try {
+          preCreateDataGraphExisted = await agent.store.hasGraph(assertionUri);
+          preCreateDataSnapshot = await snapshotCreateDataGraph();
+          preCreateMetaSnapshot = await snapshotCreateMeta();
+        } catch (err: any) {
+          return respondWithFailedExtraction(
+            500,
+            `Failed to snapshot assertion create state for skipped extraction rollback: ${err?.message ?? String(err)}`,
+            0,
+            null,
+          );
+        }
+
+        try {
+          await agent.publisher.assertionCreate(
+            contextGraphId!,
+            assertionName,
+            requestAgentAddress,
+            subGraphName,
+          );
+        } catch (err: any) {
+          const message = err?.message ?? String(err);
+          if (
+            message.includes("already exists") ||
+            message.includes("duplicate") ||
+            message.includes("conflict")
+          ) {
+            // create() is idempotent when the graph already exists.
+          } else if (
+            message.includes("has not been registered") ||
+            message.includes("Invalid") ||
+            message.includes("Unsafe")
+          ) {
+            const rollbackErrors: string[] = [];
+            try {
+              await restoreCreateSnapshot(
+                preCreateMetaSnapshot,
+                preCreateDataSnapshot,
+                preCreateDataGraphExisted,
+              );
+            } catch (rollbackErr: any) {
+              rollbackErrors.push(
+                `create rollback failed: ${rollbackErr?.message ?? rollbackErr}`,
+              );
+            }
+            const rollbackSuffix = rollbackErrors.length > 0
+              ? `; rollback failures: ${rollbackErrors.join("; ")}`
+              : "";
+            const previousStatusRecord = rollbackErrors.length === 0
+              ? getRestorablePreviousExtractionStatusRecord(
+                  preCreateMetaSnapshot,
+                )
+              : undefined;
+            if (previousStatusRecord) {
+              const response = respondWithFailedExtraction(400, `${message}${rollbackSuffix}`, 0, null);
+              restoreExtractionStatusRecord(previousStatusRecord);
+              return response;
+            }
+            return respondWithFailedExtraction(400, `${message}${rollbackSuffix}`, 0, null);
+          } else {
+            const rollbackErrors: string[] = [];
+            try {
+              await restoreCreateSnapshot(
+                preCreateMetaSnapshot,
+                preCreateDataSnapshot,
+                preCreateDataGraphExisted,
+              );
+            } catch (rollbackErr: any) {
+              rollbackErrors.push(
+                `create rollback failed: ${rollbackErr?.message ?? rollbackErr}`,
+              );
+            }
+            const rollbackSuffix = rollbackErrors.length > 0
+              ? `; rollback failures: ${rollbackErrors.join("; ")}`
+              : "";
+            const previousStatusRecord = rollbackErrors.length === 0
+              ? getRestorablePreviousExtractionStatusRecord(
+                  preCreateMetaSnapshot,
+                )
+              : undefined;
+            if (previousStatusRecord) {
+              const response = respondWithFailedExtraction(500, `${message}${rollbackSuffix}`, 0, null);
+              restoreExtractionStatusRecord(previousStatusRecord);
+              return response;
+            }
+            return respondWithFailedExtraction(500, `${message}${rollbackSuffix}`, 0, null);
+          }
+        }
+
+        const skippedMetaQuads: Array<{
+          subject: string;
+          predicate: string;
+          object: string;
+          graph: string;
+        }> = [
+          {
+            subject: assertionUri,
+            predicate: "http://dkg.io/ontology/sourceContentType",
+            object: JSON.stringify(detectedContentType),
+            graph: skippedMetaGraph,
+          },
+          {
+            subject: assertionUri,
+            predicate: "http://dkg.io/ontology/sourceFileHash",
+            object: JSON.stringify(fileStoreEntry.keccak256),
+            graph: skippedMetaGraph,
+          },
+          {
+            subject: assertionUri,
+            predicate: "http://dkg.io/ontology/extractionStatus",
+            object: JSON.stringify("skipped"),
+            graph: skippedMetaGraph,
+          },
+          {
+            subject: assertionUri,
+            predicate: "http://dkg.io/ontology/structuralTripleCount",
+            object: '"0"^^<http://www.w3.org/2001/XMLSchema#integer>',
+            graph: skippedMetaGraph,
+          },
+        ];
+        if (uploadedFilename) {
+          skippedMetaQuads.push({
+            subject: assertionUri,
+            predicate: "http://dkg.io/ontology/sourceFileName",
+            object: JSON.stringify(uploadedFilename),
+            graph: skippedMetaGraph,
+          });
+        }
+
+        let skippedMetaCleanupSucceeded = false;
+        let skippedDataDropSucceeded = false;
+        try {
+          await agent.store.deleteByPattern({
+            subject: assertionUri,
+            graph: skippedMetaGraph,
+          });
+          skippedMetaCleanupSucceeded = true;
+          await agent.store.dropGraph(assertionUri);
+          skippedDataDropSucceeded = true;
+          await agent.store.insert(skippedMetaQuads);
+        } catch (err: any) {
+          const writeMsg = err?.message ?? String(err);
+          const rollbackErrors: string[] = [];
+          if (skippedMetaCleanupSucceeded) {
+            try {
+              await agent.store.deleteByPattern({
+                subject: assertionUri,
+                graph: skippedMetaGraph,
+              });
+            } catch (partialMetaCleanupErr: any) {
+              rollbackErrors.push(
+                `partial _meta cleanup failed: ${partialMetaCleanupErr?.message ?? partialMetaCleanupErr}`,
+              );
+            }
+          }
+          try {
+            await restoreCreateSnapshot(
+              preCreateMetaSnapshot,
+              preCreateDataSnapshot,
+              preCreateDataGraphExisted,
+            );
+          } catch (createRollbackErr: any) {
+            rollbackErrors.push(
+              `create rollback failed: ${createRollbackErr?.message ?? createRollbackErr}`,
+            );
+          }
+          const rollbackSuffix = rollbackErrors.length > 0
+            ? `; rollback failures: ${rollbackErrors.join("; ")}`
+            : "";
+          const previousStatusRecord = rollbackErrors.length === 0
+            ? getRestorablePreviousExtractionStatusRecord(
+                preCreateMetaSnapshot,
+              )
+            : undefined;
+          if (previousStatusRecord) {
+            restoreExtractionStatusRecord(previousStatusRecord);
+          } else {
+            recordFailedExtraction(
+              `Failed to persist skipped extraction metadata: ${writeMsg}${rollbackSuffix}`,
+              0,
+              null,
+            );
+            (err as any).__failureAlreadyRecorded = true;
+          }
+          throw err;
+        }
+
         const skippedRecord: ExtractionStatusRecord = {
           status: "skipped",
           fileHash: fileStoreEntry.keccak256,
+          ...(uploadedFilename ? { fileName: uploadedFilename } : {}),
           detectedContentType,
           pipelineUsed: null,
           tripleCount: 0,
@@ -1277,6 +1721,14 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           assertionUri,
           skippedRecord,
         );
+        emitMemoryGraphChanged?.({
+          contextGraphId: contextGraphId!,
+          layers: ["wm"],
+          subGraphName,
+          operation: "assertion_imported",
+          source: "api",
+          counts: { triples: 0 },
+        });
         return respondWithImportFileResponse(200, {
           status: "skipped",
           tripleCount: 0,
@@ -1590,8 +2042,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       // the same content-addressed subject. Symmetric to row 15
       // (`dkg:sourceContentType`). Skipped entirely when the upload
       // didn't carry a filename (matches the row 20 optional pattern).
-      const uploadedFilename = filePart.filename?.trim() ?? "";
-      if (uploadedFilename.length > 0) {
+      if (uploadedFilename) {
         metaQuads.push({
           subject: assertionUri,
           predicate: "http://dkg.io/ontology/sourceFileName",
@@ -1612,10 +2063,11 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         // registration check, so bypassing `assertion.write` below doesn't
         // skip that safety gate.
         try {
-          await agent.assertion.create(
+          await agent.publisher.assertionCreate(
             contextGraphId!,
             assertionName,
-            subGraphName ? { subGraphName } : undefined,
+            requestAgentAddress,
+            subGraphName,
           );
         } catch (err: any) {
           const message = err?.message ?? String(err);
@@ -1814,6 +2266,13 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
               triples.length,
             );
             (writeErr as any).__failureAlreadyRecorded = true;
+          } else {
+            const previousStatusRecord =
+              getRestorablePreviousExtractionStatusRecord(metaSnapshot);
+            if (previousStatusRecord) {
+              (writeErr as any).__previousExtractionStatusRecord =
+                previousStatusRecord;
+            }
           }
           throw writeErr;
         }
@@ -1849,12 +2308,19 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         // the insert is atomic across both graphs, nothing landed and a retry
         // sees a clean slate.
         recordFailedExtraction(message, triples.length);
+        const previousStatusRecord = (err as any)?.__previousExtractionStatusRecord as
+          | ExtractionStatusRecord
+          | undefined;
+        if (previousStatusRecord) {
+          restoreExtractionStatusRecord(previousStatusRecord);
+        }
         throw err;
       }
 
       const completedRecord: ExtractionStatusRecord = {
         status: "completed",
         fileHash: fileStoreEntry.keccak256,
+        ...(uploadedFilename ? { fileName: uploadedFilename } : {}),
         ...(importRootEntity ? { rootEntity: importRootEntity } : {}),
         detectedContentType,
         pipelineUsed,

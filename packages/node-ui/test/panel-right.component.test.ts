@@ -19,6 +19,7 @@ const fetchConnectionsMock = vi.fn();
 const fetchLocalAgentIntegrationsMock = vi.fn();
 const fetchLocalAgentHistoryMock = vi.fn();
 const fetchCurrentAgentMock = vi.fn();
+const importFileMock = vi.fn();
 const streamLocalAgentChatMock = vi.fn();
 const connectLocalAgentIntegrationMock = vi.fn();
 const disconnectLocalAgentIntegrationMock = vi.fn();
@@ -33,6 +34,7 @@ vi.mock('../src/ui/api.js', async () => {
     fetchLocalAgentIntegrations: fetchLocalAgentIntegrationsMock,
     fetchLocalAgentHistory: fetchLocalAgentHistoryMock,
     fetchCurrentAgent: fetchCurrentAgentMock,
+    importFile: importFileMock,
     streamLocalAgentChat: streamLocalAgentChatMock,
     connectLocalAgentIntegration: connectLocalAgentIntegrationMock,
     disconnectLocalAgentIntegration: disconnectLocalAgentIntegrationMock,
@@ -44,6 +46,23 @@ vi.mock('../src/ui/api-wrapper.js', () => ({
     fetchMemorySessions: apiFetchMemorySessionsMock,
   },
 }));
+
+async function waitForAssertion(assertion: () => void): Promise<void> {
+  const started = Date.now();
+  let lastError: unknown;
+  while (Date.now() - started < 1000) {
+    try {
+      assertion();
+      return;
+    } catch (err) {
+      lastError = err;
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+  }
+  throw lastError;
+}
 
 describe('PanelRight component', () => {
   beforeEach(() => {
@@ -86,6 +105,12 @@ describe('PanelRight component', () => {
       nodeIdentityId: 'node-self',
     });
     streamLocalAgentChatMock.mockResolvedValue({ text: 'Roger that', correlationId: 'corr-1' });
+    importFileMock.mockResolvedValue({
+      assertionUri: 'urn:dkg:assertion:completed',
+      fileHash: 'sha256:completed',
+      detectedContentType: 'text/markdown',
+      extraction: { status: 'completed', tripleCount: 4, pipelineUsed: 'markdown' },
+    });
     apiFetchMemorySessionsMock.mockResolvedValue({ sessions: [] });
   });
 
@@ -206,7 +231,298 @@ describe('PanelRight component', () => {
     }));
     expect(container.textContent).toContain('Roger that');
 
-    root.unmount();
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it('imports skipped chat attachments as context entries and clears the composer after send', async () => {
+    importFileMock.mockResolvedValue({
+      assertionUri: 'urn:dkg:assertion:epub',
+      fileHash: 'sha256:epub',
+      detectedContentType: 'application/epub+zip',
+      extraction: {
+        status: 'skipped',
+        tripleCount: 0,
+        pipelineUsed: null,
+        error: 'No extractor\navailable',
+      },
+    });
+
+    const { PanelRight } = await import('../src/ui/components/Shell/PanelRight.js');
+    const { useProjectsStore } = await import('../src/ui/stores/projects.js');
+
+    act(() => {
+      useProjectsStore.setState({
+        contextGraphs: [{ id: 'testing', name: 'Testing' }],
+        loading: false,
+        activeProjectId: 'testing',
+      });
+    });
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(React.createElement(PanelRight));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const projectSelect = container.querySelector('select') as HTMLSelectElement | null;
+    expect(projectSelect).toBeTruthy();
+    await act(async () => {
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+      valueSetter?.call(projectSelect, 'testing');
+      projectSelect!.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    const attachInput = container.querySelector('input[type="file"]') as HTMLInputElement | null;
+    expect(attachInput).toBeTruthy();
+    const file = new File(['epub'], ' notes.epub ', {
+      type: 'application/octet-stream',
+      lastModified: 123,
+    });
+    await act(async () => {
+      Object.defineProperty(attachInput, 'files', {
+        configurable: true,
+        value: [file],
+      });
+      attachInput!.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    expect(container.textContent).toContain('notes.epub');
+
+    const textarea = container.querySelector('textarea');
+    expect(textarea).toBeTruthy();
+    await act(async () => {
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      valueSetter?.call(textarea, 'Summarize this file');
+      textarea!.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+
+    const sendButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent?.includes('Send'));
+    expect(sendButton).toBeTruthy();
+    await act(async () => {
+      sendButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    await waitForAssertion(() => {
+      expect(streamLocalAgentChatMock).toHaveBeenCalled();
+    });
+
+    expect(importFileMock).toHaveBeenCalledWith(expect.any(String), 'testing', file);
+    const [integrationId, outboundText, options] = streamLocalAgentChatMock.mock.calls.at(-1) ?? [];
+    expect(integrationId).toBe('openclaw');
+    expect(outboundText).toBe('Summarize this file\n\nAttachment import result: notes.epub.');
+    expect(options.attachments).toEqual([]);
+    expect(options.contextGraphId).toBe('testing');
+    expect(options.contextEntries.some((entry: any) => entry.key.startsWith('attachment_import_result_'))).toBe(false);
+    expect(options.attachmentImportResults).toEqual([
+      expect.objectContaining({
+        fileName: 'notes.epub',
+        contextGraphId: 'testing',
+        assertionUri: 'urn:dkg:assertion:epub',
+        fileHash: 'sha256:epub',
+        detectedContentType: 'application/epub+zip',
+        extractionStatus: 'skipped',
+        pipelineUsed: null,
+        tripleCount: 0,
+        error: 'No extractor\navailable',
+      }),
+    ]);
+
+    await waitForAssertion(() => {
+      expect(container.querySelector('.v10-local-agent-attachment-list')).toBeNull();
+    });
+    expect(container.textContent).toContain('Attachment import result: notes.epub.');
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it('normalizes completed chat attachment filenames before sending refs', async () => {
+    importFileMock.mockResolvedValue({
+      assertionUri: 'urn:dkg:assertion:markdown',
+      fileHash: 'sha256:markdown',
+      detectedContentType: 'text/markdown',
+      rootEntity: 'urn:dkg:assertion:markdown#root',
+      extraction: {
+        status: 'completed',
+        tripleCount: 4,
+        pipelineUsed: 'markdown',
+      },
+    });
+
+    const { PanelRight } = await import('../src/ui/components/Shell/PanelRight.js');
+    const { useProjectsStore } = await import('../src/ui/stores/projects.js');
+
+    act(() => {
+      useProjectsStore.setState({
+        contextGraphs: [{ id: 'testing', name: 'Testing' }],
+        loading: false,
+        activeProjectId: 'testing',
+      });
+    });
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(React.createElement(PanelRight));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const projectSelect = container.querySelector('select') as HTMLSelectElement | null;
+    expect(projectSelect).toBeTruthy();
+    await act(async () => {
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+      valueSetter?.call(projectSelect, 'testing');
+      projectSelect!.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    const attachInput = container.querySelector('input[type="file"]') as HTMLInputElement | null;
+    expect(attachInput).toBeTruthy();
+    const file = new File(['# Notes'], ' notes.md ', {
+      type: 'text/markdown',
+      lastModified: 456,
+    });
+    await act(async () => {
+      Object.defineProperty(attachInput, 'files', {
+        configurable: true,
+        value: [file],
+      });
+      attachInput!.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    const sendButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent?.includes('Send'));
+    expect(sendButton).toBeTruthy();
+    await act(async () => {
+      sendButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    await waitForAssertion(() => {
+      expect(streamLocalAgentChatMock).toHaveBeenCalled();
+    });
+
+    expect(importFileMock).toHaveBeenCalledWith(expect.any(String), 'testing', file);
+    const [integrationId, outboundText, options] = streamLocalAgentChatMock.mock.calls.at(-1) ?? [];
+    expect(integrationId).toBe('openclaw');
+    expect(outboundText).toBe('');
+    expect(options.persistUserMessage).toBe('Attached notes.md.');
+    expect(options.attachments).toEqual([
+      expect.objectContaining({
+        fileName: 'notes.md',
+        contextGraphId: 'testing',
+        assertionUri: 'urn:dkg:assertion:markdown',
+        fileHash: 'sha256:markdown',
+        detectedContentType: 'text/markdown',
+        extractionStatus: 'completed',
+        tripleCount: 4,
+      }),
+    ]);
+    expect(options.attachmentImportResults).toEqual([]);
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it('keeps skipped-import-only transport text blank while showing the import summary locally', async () => {
+    importFileMock.mockResolvedValue({
+      assertionUri: 'urn:dkg:assertion:epub-only',
+      fileHash: 'sha256:epub-only',
+      detectedContentType: 'application/epub+zip',
+      extraction: {
+        status: 'skipped',
+        tripleCount: 0,
+        pipelineUsed: null,
+      },
+    });
+
+    const { PanelRight } = await import('../src/ui/components/Shell/PanelRight.js');
+    const { useProjectsStore } = await import('../src/ui/stores/projects.js');
+
+    act(() => {
+      useProjectsStore.setState({
+        contextGraphs: [{ id: 'testing', name: 'Testing' }],
+        loading: false,
+        activeProjectId: 'testing',
+      });
+    });
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(React.createElement(PanelRight));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const projectSelect = container.querySelector('select') as HTMLSelectElement | null;
+    expect(projectSelect).toBeTruthy();
+    await act(async () => {
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+      valueSetter?.call(projectSelect, 'testing');
+      projectSelect!.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    const attachInput = container.querySelector('input[type="file"]') as HTMLInputElement | null;
+    expect(attachInput).toBeTruthy();
+    const file = new File(['epub'], 'notes.epub', {
+      type: 'application/octet-stream',
+      lastModified: 789,
+    });
+    await act(async () => {
+      Object.defineProperty(attachInput, 'files', {
+        configurable: true,
+        value: [file],
+      });
+      attachInput!.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    const sendButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent?.includes('Send'));
+    expect(sendButton).toBeTruthy();
+    await act(async () => {
+      sendButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    await waitForAssertion(() => {
+      expect(streamLocalAgentChatMock).toHaveBeenCalled();
+    });
+
+    const [integrationId, outboundText, options] = streamLocalAgentChatMock.mock.calls.at(-1) ?? [];
+    expect(integrationId).toBe('openclaw');
+    expect(outboundText).toBe('');
+    expect(options.persistUserMessage).toBe('Attachment import result: notes.epub.');
+    expect(options.attachments).toEqual([]);
+    expect(options.attachmentImportResults).toEqual([
+      expect.objectContaining({
+        fileName: 'notes.epub',
+        contextGraphId: 'testing',
+        assertionUri: 'urn:dkg:assertion:epub-only',
+        fileHash: 'sha256:epub-only',
+        detectedContentType: 'application/epub+zip',
+        extractionStatus: 'skipped',
+      }),
+    ]);
+    expect(container.textContent).toContain('Attachment import result: notes.epub.');
+
+    await act(async () => {
+      root.unmount();
+    });
     container.remove();
   });
 });

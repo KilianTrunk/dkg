@@ -17,6 +17,7 @@ import { promisify } from 'node:util';
 import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 import type { DKGAgent } from '@origintrail-official/dkg-agent';
 import {
@@ -661,6 +662,20 @@ export interface OpenClawAttachmentRef {
   rootEntity?: string;
 }
 
+export interface OpenClawAttachmentImportResult {
+  assertionUri: string;
+  fileHash: string;
+  contextGraphId: string;
+  fileName: string;
+  detectedContentType: string;
+  extractionStatus: 'skipped';
+  pipelineUsed?: string | null;
+  tripleCount?: number;
+  rootEntity?: string;
+  mdIntermediateHash?: string;
+  error?: string;
+}
+
 export function normalizeOpenClawAttachmentRef(raw: unknown): OpenClawAttachmentRef | null {
   if (!isPlainRecord(raw)) return null;
   const assertionUri = typeof raw.assertionUri === 'string' ? raw.assertionUri.trim() : '';
@@ -700,10 +715,119 @@ export function normalizeOpenClawAttachmentRefs(raw: unknown): OpenClawAttachmen
   return refs;
 }
 
+export function normalizeOpenClawAttachmentImportResult(raw: unknown): OpenClawAttachmentImportResult | null {
+  if (!isPlainRecord(raw)) return null;
+  const assertionUri = typeof raw.assertionUri === 'string' ? raw.assertionUri.trim() : '';
+  const fileHash = typeof raw.fileHash === 'string' ? raw.fileHash.trim() : '';
+  const contextGraphId = typeof raw.contextGraphId === 'string' ? raw.contextGraphId.trim() : '';
+  const fileName = typeof raw.fileName === 'string' ? raw.fileName.trim() : '';
+  const detectedContentType = typeof raw.detectedContentType === 'string' ? raw.detectedContentType.trim() : '';
+  if (!assertionUri || !fileHash || !contextGraphId || !fileName || !detectedContentType) return null;
+  if (raw.extractionStatus !== 'skipped') return null;
+
+  const normalized: OpenClawAttachmentImportResult = {
+    assertionUri,
+    fileHash,
+    contextGraphId,
+    fileName,
+    detectedContentType,
+    extractionStatus: 'skipped',
+  };
+  if (raw.pipelineUsed === null) {
+    normalized.pipelineUsed = null;
+  } else if (typeof raw.pipelineUsed === 'string' && raw.pipelineUsed.trim()) {
+    normalized.pipelineUsed = raw.pipelineUsed.trim();
+  } else if (raw.pipelineUsed !== undefined) {
+    return null;
+  }
+  if (typeof raw.tripleCount === 'number' && Number.isFinite(raw.tripleCount) && raw.tripleCount >= 0) {
+    normalized.tripleCount = raw.tripleCount;
+  }
+  if (typeof raw.rootEntity === 'string' && raw.rootEntity.trim()) {
+    normalized.rootEntity = raw.rootEntity.trim();
+  }
+  if (typeof raw.mdIntermediateHash === 'string' && raw.mdIntermediateHash.trim()) {
+    normalized.mdIntermediateHash = raw.mdIntermediateHash.trim();
+  }
+  if (typeof raw.error === 'string' && raw.error.trim()) {
+    normalized.error = raw.error.trim();
+  }
+  return normalized;
+}
+
+export function normalizeOpenClawAttachmentImportResults(raw: unknown): OpenClawAttachmentImportResult[] | undefined {
+  if (raw == null) return undefined;
+  if (!Array.isArray(raw)) return undefined;
+  if (raw.length === 0) return [];
+  const results: OpenClawAttachmentImportResult[] = [];
+  for (const entry of raw) {
+    const normalized = normalizeOpenClawAttachmentImportResult(entry);
+    if (!normalized) return undefined;
+    results.push(normalized);
+  }
+  return results;
+}
+
+export function dedupeOpenClawAttachmentImportResults(
+  attachmentImportResults: OpenClawAttachmentImportResult[] | undefined,
+): OpenClawAttachmentImportResult[] | undefined {
+  if (!attachmentImportResults) return attachmentImportResults;
+  const seen = new Set<string>();
+  const deduped: OpenClawAttachmentImportResult[] = [];
+  for (const result of attachmentImportResults) {
+    const key = `${result.contextGraphId}\0${result.assertionUri}\0${result.fileHash}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(result);
+  }
+  return deduped;
+}
+
 export interface OpenClawChatContextEntry {
   key: string;
   label: string;
   value: string;
+}
+
+const ATTACHMENT_IMPORT_CONTEXT_KEY_PREFIX = 'attachment_import_result_';
+const ATTACHMENT_IMPORT_CONTEXT_LABEL_PATTERN = /^attachment import result\s*:/;
+
+interface LegacyAttachmentImportContextField {
+  keys: readonly string[];
+  required: boolean;
+}
+
+const LEGACY_ATTACHMENT_IMPORT_CONTEXT_FIELD_ORDER: LegacyAttachmentImportContextField[] = [
+  { keys: ['filename'], required: true },
+  { keys: ['assertionname'], required: true },
+  { keys: ['assertionuri'], required: true },
+  { keys: ['contextgraphid'], required: true },
+  { keys: ['filehash'], required: true },
+  { keys: ['contenttype', 'detectedcontenttype'], required: true },
+  { keys: ['extractionstatus'], required: true },
+  { keys: ['pipelineused'], required: false },
+  { keys: ['triplecount', 'structuraltriplecount'], required: false },
+  { keys: ['rootentity'], required: false },
+  { keys: ['mdintermediatehash'], required: false },
+  { keys: ['error'], required: false },
+];
+
+function normalizeOpenClawContextNamespaceLabel(label: string): string {
+  return label
+    .normalize('NFKC')
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function isOpenClawAttachmentImportContextKey(key: string): boolean {
+  return key.toLowerCase().startsWith(ATTACHMENT_IMPORT_CONTEXT_KEY_PREFIX);
+}
+
+function isOpenClawAttachmentImportContextLabel(label: string): boolean {
+  return ATTACHMENT_IMPORT_CONTEXT_LABEL_PATTERN.test(normalizeOpenClawContextNamespaceLabel(label));
 }
 
 export function normalizeOpenClawChatContextEntry(
@@ -718,26 +842,253 @@ export function normalizeOpenClawChatContextEntry(
   return { key, label, value };
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function legacyAttachmentImportFieldPattern(keys: readonly string[], prefix: string): RegExp {
+  return new RegExp(`${prefix}(${keys.map(escapeRegExp).join('|')})\\s*=`, 'i');
+}
+
+function legacyAttachmentImportDelimiterPattern(keys: readonly string[]): RegExp {
+  return new RegExp(`;\\s*(${keys.map(escapeRegExp).join('|')})\\s*=`, 'gi');
+}
+
+function hasRequiredLegacyAttachmentImportField(startIndex: number): boolean {
+  return LEGACY_ATTACHMENT_IMPORT_CONTEXT_FIELD_ORDER
+    .slice(startIndex)
+    .some((field) => field.required);
+}
+
+function canSkipLegacyAttachmentImportFields(startIndex: number, endIndex: number): boolean {
+  return !LEGACY_ATTACHMENT_IMPORT_CONTEXT_FIELD_ORDER
+    .slice(startIndex, endIndex)
+    .some((field) => field.required);
+}
+
+function matchLegacyAttachmentImportFieldAt(
+  source: string,
+  cursor: number,
+  slotIndex: number,
+): { key: string; slotIndex: number; valueStart: number } | null {
+  for (let index = slotIndex; index < LEGACY_ATTACHMENT_IMPORT_CONTEXT_FIELD_ORDER.length; index += 1) {
+    if (!canSkipLegacyAttachmentImportFields(slotIndex, index)) return null;
+    const slot = LEGACY_ATTACHMENT_IMPORT_CONTEXT_FIELD_ORDER[index];
+    const match = legacyAttachmentImportFieldPattern(slot.keys, '^').exec(source.slice(cursor));
+    if (match?.[1]) {
+      return {
+        key: match[1].toLowerCase(),
+        slotIndex: index,
+        valueStart: cursor + match[0].length,
+      };
+    }
+    if (slot.required) return null;
+  }
+  return null;
+}
+
+function findLegacyAttachmentImportNextFieldCandidateGroups(
+  source: string,
+  valueStart: number,
+  slotIndex: number,
+): Array<{ slot: LegacyAttachmentImportContextField; candidates: Array<{ delimiterStart: number; fieldStart: number }> }> {
+  const groups: Array<{
+    slot: LegacyAttachmentImportContextField;
+    candidates: Array<{ delimiterStart: number; fieldStart: number }>;
+  }> = [];
+  for (let index = slotIndex; index < LEGACY_ATTACHMENT_IMPORT_CONTEXT_FIELD_ORDER.length; index += 1) {
+    if (!canSkipLegacyAttachmentImportFields(slotIndex, index)) break;
+    const slot = LEGACY_ATTACHMENT_IMPORT_CONTEXT_FIELD_ORDER[index];
+    const pattern = legacyAttachmentImportDelimiterPattern(slot.keys);
+    pattern.lastIndex = valueStart;
+    const candidates: Array<{ delimiterStart: number; fieldStart: number }> = [];
+    let match = pattern.exec(source);
+    while (match) {
+      const matchedKey = match[1] ?? '';
+      const fieldOffset = match[0].indexOf(matchedKey);
+      if (fieldOffset >= 0) {
+        candidates.push({
+          delimiterStart: match.index,
+          fieldStart: match.index + fieldOffset,
+        });
+      }
+      if (pattern.lastIndex === match.index) pattern.lastIndex += 1;
+      match = pattern.exec(source);
+    }
+    if (candidates.length > 0) {
+      groups.push({
+        slot,
+        candidates: candidates.sort((left, right) => right.delimiterStart - left.delimiterStart),
+      });
+    }
+    if (slot.required) break;
+  }
+  return groups;
+}
+
+function parseLegacyAttachmentImportFields(
+  source: string,
+  slotIndex: number,
+  cursor: number,
+  fields: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const field = matchLegacyAttachmentImportFieldAt(source, cursor, slotIndex);
+  if (!field || fields[field.key] !== undefined) return null;
+
+  const nextGroups = findLegacyAttachmentImportNextFieldCandidateGroups(
+    source,
+    field.valueStart,
+    field.slotIndex + 1,
+  );
+  for (const group of nextGroups) {
+    for (const candidate of group.candidates) {
+      const fieldValue = source.slice(field.valueStart, candidate.delimiterStart).trim();
+      const parsed = parseLegacyAttachmentImportFields(source, field.slotIndex + 1, candidate.fieldStart, {
+        ...fields,
+        [field.key]: fieldValue,
+      });
+      if (parsed) return parsed;
+    }
+    if (group.slot.required) return null;
+  }
+
+  if (hasRequiredLegacyAttachmentImportField(field.slotIndex + 1)) return null;
+  return {
+    ...fields,
+    [field.key]: source.slice(field.valueStart).trim(),
+  };
+}
+
+function parseAttachmentImportContextKeyValue(value: string): Record<string, unknown> | null {
+  const source = value.trim();
+  if (!source) return null;
+  return parseLegacyAttachmentImportFields(source, 0, 0, {});
+}
+
+function parseAttachmentImportContextMetadata(value: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (isPlainRecord(parsed)) return parsed;
+  } catch {
+    /* fall through to legacy key=value parser */
+  }
+  return parseAttachmentImportContextKeyValue(value);
+}
+
+function attachmentImportMetadataValue(
+  metadata: Record<string, unknown>,
+  ...keys: string[]
+): unknown {
+  for (const key of keys) {
+    if (metadata[key] !== undefined) return metadata[key];
+  }
+  const lowerEntries = Object.entries(metadata).map(([key, value]) => [key.toLowerCase(), value] as const);
+  for (const key of keys) {
+    const lowerKey = key.toLowerCase();
+    const entry = lowerEntries.find(([candidate]) => candidate === lowerKey);
+    if (entry) return entry[1];
+  }
+  return undefined;
+}
+
+function normalizeAttachmentImportMetadataPipeline(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const normalized = value.trim();
+  return normalized.toLowerCase() === 'none' ? null : normalized;
+}
+
+function normalizeAttachmentImportMetadataTripleCount(value: unknown): unknown {
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string' || !value.trim()) return value;
+  const parsed = Number.parseInt(value.trim(), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : value;
+}
+
+function normalizeOpenClawAttachmentImportResultFromContextEntry(
+  entry: OpenClawChatContextEntry,
+): OpenClawAttachmentImportResult | null {
+  const metadata = parseAttachmentImportContextMetadata(entry.value);
+  if (!metadata) return null;
+  return normalizeOpenClawAttachmentImportResult({
+    assertionUri: attachmentImportMetadataValue(metadata, 'assertionUri'),
+    fileHash: attachmentImportMetadataValue(metadata, 'fileHash'),
+    contextGraphId: attachmentImportMetadataValue(metadata, 'contextGraphId'),
+    fileName: attachmentImportMetadataValue(metadata, 'fileName'),
+    detectedContentType: attachmentImportMetadataValue(metadata, 'detectedContentType', 'contentType'),
+    extractionStatus: attachmentImportMetadataValue(metadata, 'extractionStatus'),
+    pipelineUsed: normalizeAttachmentImportMetadataPipeline(
+      attachmentImportMetadataValue(metadata, 'pipelineUsed'),
+    ),
+    tripleCount: normalizeAttachmentImportMetadataTripleCount(
+      attachmentImportMetadataValue(metadata, 'tripleCount', 'structuralTripleCount'),
+    ),
+    rootEntity: attachmentImportMetadataValue(metadata, 'rootEntity'),
+    mdIntermediateHash: attachmentImportMetadataValue(metadata, 'mdIntermediateHash'),
+    error: attachmentImportMetadataValue(metadata, 'error'),
+  });
+}
+
+export interface OpenClawChatContextNormalization {
+  contextEntries?: OpenClawChatContextEntry[];
+  attachmentImportResults?: OpenClawAttachmentImportResult[];
+}
+
+export function normalizeOpenClawChatContextEntriesWithAttachmentImportResults(
+  raw: unknown,
+): OpenClawChatContextNormalization | undefined {
+  if (raw == null) return {};
+  if (!Array.isArray(raw)) return undefined;
+  if (raw.length === 0) return { contextEntries: [], attachmentImportResults: [] };
+  const contextEntries: OpenClawChatContextEntry[] = [];
+  const attachmentImportResults: OpenClawAttachmentImportResult[] = [];
+  for (const rawEntry of raw) {
+    if (!isPlainRecord(rawEntry)) return undefined;
+    const entry: OpenClawChatContextEntry = {
+      key: typeof rawEntry.key === 'string' ? rawEntry.key.trim() : '',
+      label: typeof rawEntry.label === 'string' ? rawEntry.label.trim() : '',
+      value: typeof rawEntry.value === 'string' ? rawEntry.value.trim() : '',
+    };
+    if (!entry.key || !entry.label || !entry.value) return undefined;
+
+    if (isOpenClawAttachmentImportContextKey(entry.key)) {
+      const attachmentImportResult = normalizeOpenClawAttachmentImportResultFromContextEntry(entry);
+      if (!attachmentImportResult) return undefined;
+      attachmentImportResults.push(attachmentImportResult);
+      continue;
+    }
+
+    if (isOpenClawAttachmentImportContextLabel(entry.label)) return undefined;
+    contextEntries.push(entry);
+  }
+  return { contextEntries, attachmentImportResults };
+}
+
 export function normalizeOpenClawChatContextEntries(
   raw: unknown,
 ): OpenClawChatContextEntry[] | undefined {
   if (raw == null) return undefined;
   if (!Array.isArray(raw)) return undefined;
-  if (raw.length === 0) return [];
-  const entries: OpenClawChatContextEntry[] = [];
+  const contextEntries: OpenClawChatContextEntry[] = [];
   for (const entry of raw) {
     const normalized = normalizeOpenClawChatContextEntry(entry);
     if (!normalized) return undefined;
-    entries.push(normalized);
+    contextEntries.push(normalized);
   }
-  return entries;
+  return contextEntries;
 }
 
 export function hasOpenClawChatTurnContent(
   text: unknown,
   attachmentRefs: OpenClawAttachmentRef[] | undefined,
+  attachmentImportResults?: OpenClawAttachmentImportResult[] | undefined,
+  contextEntries?: OpenClawChatContextEntry[] | undefined,
 ): text is string {
-  return typeof text === 'string' && (text.length > 0 || Boolean(attachmentRefs?.length));
+  return typeof text === 'string' && (
+    text.length > 0 ||
+    Boolean(attachmentRefs?.length) ||
+    Boolean(attachmentImportResults?.length) ||
+    Boolean(contextEntries?.length)
+  );
 }
 
 export function unescapeOpenClawAttachmentLiteralBody(raw: string): string {
@@ -860,11 +1211,12 @@ export async function verifyOpenClawAttachmentRefsProvenance(
 
     const metaGraph = contextGraphMetaUri(ref.contextGraphId);
     const metaResult = await agent.store.query(`
-      SELECT ?fileHash ?contentType ?rootEntity ?tripleCount ?sourceFileName WHERE {
+      SELECT ?fileHash ?contentType ?rootEntity ?extractionStatus ?tripleCount ?sourceFileName WHERE {
         GRAPH <${metaGraph}> {
           <${ref.assertionUri}> <http://dkg.io/ontology/sourceFileHash> ?fileHash .
           OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/sourceContentType> ?contentType }
           OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/rootEntity> ?rootEntity }
+          OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/extractionStatus> ?extractionStatus }
           OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/structuralTripleCount> ?tripleCount }
           OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/sourceFileName> ?sourceFileName }
         }
@@ -883,6 +1235,8 @@ export async function verifyOpenClawAttachmentRefsProvenance(
     ) {
       return undefined;
     }
+    const storedExtractionStatus = stripOpenClawAttachmentLiteral(binding.extractionStatus ?? '').trim();
+    if (storedExtractionStatus && storedExtractionStatus !== 'completed') return undefined;
     if (ref.extractionStatus && ref.extractionStatus !== 'completed') return undefined;
 
     const storedTripleCount = parseOpenClawAttachmentTripleCount(binding.tripleCount ?? '');
@@ -899,5 +1253,182 @@ export async function verifyOpenClawAttachmentRefsProvenance(
   }
 
   return attachmentRefs;
+}
+
+function extractionRecordMatchesOpenClawAttachmentImportResult(
+  ref: OpenClawAttachmentImportResult,
+  record: ExtractionStatusRecord,
+): boolean {
+  if (record.status !== 'skipped') return false;
+  if (record.fileHash !== ref.fileHash) return false;
+  if (record.fileName && record.fileName !== ref.fileName) return false;
+  if (normalizeDetectedContentType(ref.detectedContentType) !== normalizeDetectedContentType(record.detectedContentType)) {
+    return false;
+  }
+  if (ref.pipelineUsed != null && ref.pipelineUsed !== record.pipelineUsed) return false;
+  if (ref.tripleCount != null && ref.tripleCount !== record.tripleCount) return false;
+  if (ref.rootEntity && ref.rootEntity !== record.rootEntity) return false;
+  if (ref.mdIntermediateHash && ref.mdIntermediateHash !== record.mdIntermediateHash) return false;
+  if (ref.error && ref.error !== record.error) return false;
+  return true;
+}
+
+async function loadOpenClawAttachmentImportResultFromMeta(
+  agent: Pick<DKGAgent, 'store'>,
+  ref: OpenClawAttachmentImportResult,
+): Promise<OpenClawAttachmentImportResult | undefined> {
+  const metaGraph = contextGraphMetaUri(ref.contextGraphId);
+  const metaResult = await agent.store.query(`
+    SELECT ?fileHash ?contentType ?extractionStatus ?tripleCount ?sourceFileName WHERE {
+      GRAPH <${metaGraph}> {
+        <${ref.assertionUri}> <http://dkg.io/ontology/sourceFileHash> ?fileHash .
+        <${ref.assertionUri}> <http://dkg.io/ontology/extractionStatus> ?extractionStatus .
+        OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/sourceContentType> ?contentType }
+        OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/structuralTripleCount> ?tripleCount }
+        OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/sourceFileName> ?sourceFileName }
+      }
+    }
+    LIMIT 1
+  `) as { bindings?: Array<Record<string, string>> };
+  const binding = metaResult?.bindings?.[0];
+  if (!binding) return undefined;
+
+  if (stripOpenClawAttachmentLiteral(binding.extractionStatus ?? '') !== 'skipped') return undefined;
+  if (stripOpenClawAttachmentLiteral(binding.fileHash ?? '') !== ref.fileHash) return undefined;
+  const storedContentType = stripOpenClawAttachmentLiteral(binding.contentType ?? '').trim();
+  if (
+    storedContentType &&
+    normalizeDetectedContentType(ref.detectedContentType) !== normalizeDetectedContentType(storedContentType)
+  ) {
+    return undefined;
+  }
+  const storedTripleCount = parseOpenClawAttachmentTripleCount(binding.tripleCount ?? '');
+  if (ref.tripleCount != null && storedTripleCount != null && ref.tripleCount !== storedTripleCount) {
+    return undefined;
+  }
+  const storedFileName = stripOpenClawAttachmentLiteral(binding.sourceFileName ?? '').trim();
+  if (!storedFileName) return undefined;
+  if (storedFileName !== ref.fileName) return undefined;
+  if (ref.pipelineUsed != null) return undefined;
+
+  return {
+    assertionUri: ref.assertionUri,
+    contextGraphId: ref.contextGraphId,
+    fileName: storedFileName || ref.fileName,
+    fileHash: ref.fileHash,
+    detectedContentType: storedContentType || ref.detectedContentType,
+    extractionStatus: 'skipped',
+    pipelineUsed: null,
+    tripleCount: storedTripleCount ?? 0,
+  };
+}
+
+async function loadOpenClawAttachmentImportSourceFileNameFromMeta(
+  agent: Pick<DKGAgent, 'store'>,
+  ref: OpenClawAttachmentImportResult,
+): Promise<string | undefined> {
+  const metaGraph = contextGraphMetaUri(ref.contextGraphId);
+  const metaResult = await agent.store.query(`
+    SELECT ?fileHash ?extractionStatus ?sourceFileName WHERE {
+      GRAPH <${metaGraph}> {
+        <${ref.assertionUri}> <http://dkg.io/ontology/sourceFileHash> ?fileHash .
+        <${ref.assertionUri}> <http://dkg.io/ontology/extractionStatus> ?extractionStatus .
+        OPTIONAL { <${ref.assertionUri}> <http://dkg.io/ontology/sourceFileName> ?sourceFileName }
+      }
+    }
+    LIMIT 1
+  `) as { bindings?: Array<Record<string, string>> };
+  const binding = metaResult?.bindings?.[0];
+  if (!binding) return undefined;
+  if (stripOpenClawAttachmentLiteral(binding.extractionStatus ?? '') !== 'skipped') return undefined;
+  if (stripOpenClawAttachmentLiteral(binding.fileHash ?? '') !== ref.fileHash) return undefined;
+  const storedFileName = stripOpenClawAttachmentLiteral(binding.sourceFileName ?? '').trim();
+  if (!storedFileName || storedFileName !== ref.fileName) return undefined;
+  return storedFileName;
+}
+
+export async function verifyOpenClawAttachmentImportResultsProvenance(
+  agent: Pick<DKGAgent, 'store'>,
+  extractionStatus: Map<string, ExtractionStatusRecord>,
+  attachmentImportResults: OpenClawAttachmentImportResult[] | undefined,
+): Promise<OpenClawAttachmentImportResult[] | undefined> {
+  if (!attachmentImportResults) return attachmentImportResults;
+
+  const verified: OpenClawAttachmentImportResult[] = [];
+  for (const ref of attachmentImportResults) {
+    if (!isSafeIri(ref.assertionUri)) return undefined;
+    if (ref.rootEntity && !isSafeIri(ref.rootEntity)) return undefined;
+    if (!isOpenClawAttachmentAssertionUriForContextGraph(ref.assertionUri, ref.contextGraphId)) return undefined;
+
+    const extractionRecord = getExtractionStatusRecord(extractionStatus, ref.assertionUri);
+    if (extractionRecord) {
+      if (!extractionRecordMatchesOpenClawAttachmentImportResult(ref, extractionRecord)) return undefined;
+      const verifiedFileName = extractionRecord.fileName
+        ?? await loadOpenClawAttachmentImportSourceFileNameFromMeta(agent, ref);
+      if (!verifiedFileName) return undefined;
+
+      verified.push({
+        assertionUri: ref.assertionUri,
+        contextGraphId: ref.contextGraphId,
+        fileName: verifiedFileName,
+        fileHash: extractionRecord.fileHash,
+        detectedContentType: extractionRecord.detectedContentType,
+        extractionStatus: 'skipped',
+        pipelineUsed: extractionRecord.pipelineUsed,
+        tripleCount: extractionRecord.tripleCount,
+        ...(extractionRecord.rootEntity ? { rootEntity: extractionRecord.rootEntity } : {}),
+        ...(extractionRecord.mdIntermediateHash ? { mdIntermediateHash: extractionRecord.mdIntermediateHash } : {}),
+        ...(extractionRecord.error ? { error: extractionRecord.error } : {}),
+      });
+      continue;
+    }
+
+    const durableResult = await loadOpenClawAttachmentImportResultFromMeta(agent, ref);
+    if (!durableResult) return undefined;
+    verified.push(durableResult);
+  }
+
+  return verified;
+}
+
+function sanitizeAttachmentImportContextValue(value: string | number | null | undefined): string {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function attachmentImportContextKey(ref: OpenClawAttachmentImportResult): string {
+  const digest = createHash('sha256')
+    .update(`${ref.contextGraphId}\n${ref.assertionUri}\n${ref.fileHash}`)
+    .digest('hex')
+    .slice(0, 24);
+  return `${ATTACHMENT_IMPORT_CONTEXT_KEY_PREFIX}${digest}`;
+}
+
+export function buildOpenClawAttachmentImportContextEntries(
+  attachmentImportResults: OpenClawAttachmentImportResult[] | undefined,
+): OpenClawChatContextEntry[] {
+  if (!attachmentImportResults?.length) return [];
+  return attachmentImportResults.map((ref) => {
+    const metadata = {
+      fileName: sanitizeAttachmentImportContextValue(ref.fileName),
+      assertionUri: sanitizeAttachmentImportContextValue(ref.assertionUri),
+      contextGraphId: sanitizeAttachmentImportContextValue(ref.contextGraphId),
+      fileHash: sanitizeAttachmentImportContextValue(ref.fileHash),
+      contentType: sanitizeAttachmentImportContextValue(ref.detectedContentType),
+      extractionStatus: ref.extractionStatus,
+      pipelineUsed: sanitizeAttachmentImportContextValue(ref.pipelineUsed ?? 'none'),
+      tripleCount: ref.tripleCount ?? 0,
+      ...(ref.rootEntity ? { rootEntity: sanitizeAttachmentImportContextValue(ref.rootEntity) } : {}),
+      ...(ref.mdIntermediateHash ? { mdIntermediateHash: sanitizeAttachmentImportContextValue(ref.mdIntermediateHash) } : {}),
+      ...(ref.error ? { error: sanitizeAttachmentImportContextValue(ref.error) } : {}),
+    };
+    return {
+      key: attachmentImportContextKey(ref),
+      label: `Attachment import result: ${sanitizeAttachmentImportContextValue(ref.fileName)}`,
+      value: JSON.stringify(metadata),
+    };
+  });
 }
 

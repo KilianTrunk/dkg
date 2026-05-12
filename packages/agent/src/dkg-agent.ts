@@ -1749,6 +1749,16 @@ export class DKGAgent {
             source: 'join-rejected',
           });
           this.joinRequestAcceptedBy.delete(`${contextGraphId}::${rejectedAddr.toLowerCase()}`);
+          // Drop the optimistic "this CG belongs to <rejectedAddr>" hint
+          // seeded by `signJoinRequest`. Otherwise multi-agent nodes keep
+          // building authenticated sync requests on behalf of the rejected
+          // agent and the curator denies the very next catch-up after a
+          // *different* local agent is allowlisted, until something else
+          // overwrites the map.
+          const localHint = this.localApprovedAgentByCG.get(contextGraphId);
+          if (localHint && localHint === rejectedAddr.toLowerCase()) {
+            this.localApprovedAgentByCG.delete(contextGraphId);
+          }
           this.eventBus.emit(DKGEvent.JOIN_REJECTED, {
             contextGraphId,
             agentAddress: rejectedAddr,
@@ -7745,14 +7755,22 @@ export class DKGAgent {
 
     await this.store.deleteByPattern({ graph: cgMetaGraph, subject: requestUri });
 
+    // Escape every user-controllable literal. `contextGraphId`, `delegation.scope`,
+    // and `agentName` flow from joiner input and can contain `"` or `\`, which
+    // would produce invalid N-Quads and fail the insert (or open a SPARQL
+    // injection surface). Other fields are validated upstream:
+    //   - `agentAddress` and `signature` are 0x-hex (verifyAgentDelegation
+    //     recovers an EVM address, so non-hex throws before we get here)
+    //   - `issuedAtMs` / `expiresAtMs` are numbers serialised by JS
+    //   - `delegateePeerId` / `delegateeOpKey` are protocol-shaped identifiers.
     const quads: Quad[] = [
       { subject: requestUri, predicate: RDF_TYPE, object: `${DKG}JoinRequest`, graph: cgMetaGraph },
       { subject: requestUri, predicate: `${DKG}agentAddress`, object: `"${delegation.agentAddress}"`, graph: cgMetaGraph },
-      { subject: requestUri, predicate: `${DKG}contextGraphId`, object: `"${contextGraphId}"`, graph: cgMetaGraph },
+      { subject: requestUri, predicate: `${DKG}contextGraphId`, object: `"${escapeSparqlLiteral(contextGraphId)}"`, graph: cgMetaGraph },
       { subject: requestUri, predicate: `${DKG}signature`, object: `"${delegation.signature}"`, graph: cgMetaGraph },
       { subject: requestUri, predicate: `${DKG}requestTimestamp`, object: `"${delegation.issuedAtMs}"`, graph: cgMetaGraph },
       { subject: requestUri, predicate: `${DKG}requestStatus`, object: `"pending"`, graph: cgMetaGraph },
-      { subject: requestUri, predicate: `${DKG}delegationScope`, object: `"${delegation.scope}"`, graph: cgMetaGraph },
+      { subject: requestUri, predicate: `${DKG}delegationScope`, object: `"${escapeSparqlLiteral(delegation.scope)}"`, graph: cgMetaGraph },
       { subject: requestUri, predicate: DKG_ONTOLOGY.DKG_DELEGATION_ISSUED_AT, object: `"${delegation.issuedAtMs}"`, graph: cgMetaGraph },
     ];
     if (delegation.expiresAtMs && delegation.expiresAtMs > 0) {
@@ -7765,7 +7783,7 @@ export class DKGAgent {
       quads.push({ subject: requestUri, predicate: DKG_ONTOLOGY.DKG_DELEGATION_DELEGATEE_KEY, object: `"${delegation.delegateeOpKey.toLowerCase()}"`, graph: cgMetaGraph });
     }
     if (agentName) {
-      quads.push({ subject: requestUri, predicate: SCHEMA_NAME, object: `"${agentName}"`, graph: cgMetaGraph });
+      quads.push({ subject: requestUri, predicate: SCHEMA_NAME, object: `"${escapeSparqlLiteral(agentName)}"`, graph: cgMetaGraph });
     }
     await this.store.insert(quads);
     this.upsertContextGraphMember({

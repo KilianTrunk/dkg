@@ -22,14 +22,18 @@ concurrency:
   group: codex-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+# Default everything to read-only; the one job that posts review comments
+# escalates `pull-requests: write` at the job level only.
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   review:
     name: Codex Review
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     # 30 min ceiling: gpt-5.4 / effort: medium can take ~25 min on a
     # large diff, so 15 min was hitting the cap mid-stream. The
     # concurrency group above already cancel-in-progress, so a new push
@@ -43,8 +47,9 @@ jobs:
 
     steps:
       - name: Checkout PR merge commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
           fetch-depth: 0
 
@@ -127,7 +132,7 @@ jobs:
           steps.diff.outputs.diff_lines != '0'
           && steps.diff.outputs.diff_lines <= 5000
           && steps.hash_check.outputs.skipped == 'false'
-        uses: openai/codex-action@v1
+        uses: openai/codex-action@a26d2d4d8b78a694338b8e3715c3630254340b2c # v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           model: gpt-5.4

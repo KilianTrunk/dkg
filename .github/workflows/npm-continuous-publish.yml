@@ -23,6 +23,14 @@ jobs:
     name: Build & Publish to NPM
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # `npm-publish` Environment gates access to NPM_TOKEN. Configure required
+    # reviewers + a wait timer in repo Settings → Environments → `npm-publish`
+    # so a compromised merge to main cannot auto-publish without human
+    # approval. See docs/security/SUPPLY_CHAIN_HARDENING.md for the exact
+    # setup steps. The environment value MUST match the Environment name
+    # configured in repo Settings; runs against an unconfigured environment
+    # block silently (GitHub Actions does NOT fail-closed here).
+    environment: npm-publish
     # Only run when CI passes (this job depends on the CI workflow via branch protection).
     # Skip if the commit message is a version bump from this workflow.
     if: "!startsWith(github.event.head_commit.message, 'chore: continuous publish')"
@@ -30,11 +38,13 @@ jobs:
       HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
           cache: pnpm

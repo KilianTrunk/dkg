@@ -8,8 +8,12 @@ on:
     tags:
       - 'v*'
 
+# Repository-default token scope is `contents: read`. The release job is the
+# only one that needs to write — it creates a GitHub Release and uploads
+# artifacts via softprops/action-gh-release. Other jobs (matrix resolution,
+# preflight checks, binary builds) only need to read the repo.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   markitdown-target-matrix:
@@ -20,10 +24,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Node setup
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
 
@@ -43,7 +49,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Validate tag format
         run: |
@@ -68,13 +76,20 @@ jobs:
           fi
 
       - name: pnpm setup
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
 
       - name: Node setup
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
-          cache: pnpm
+          # Cache disabled on the release path. A tag-triggered run writes
+          # to the actions/cache scope tied to the tag's ref, which is a
+          # cache-key namespace that subsequent CI runs on PR / push could
+          # restore from (cache scopes inherit across refs). A poisoned
+          # node_modules tree planted here would then propagate to every
+          # downstream CI run. The preflight job runs once per release
+          # tag and a clean re-install is ~30s — acceptable for the
+          # blast-radius reduction.
 
       - name: Validate CLI package version matches tag
         run: |
@@ -116,15 +131,17 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Node setup
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
 
       - name: Python setup
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
@@ -229,7 +246,7 @@ jobs:
           NODE
 
       - name: Upload MarkItDown binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: markitdown-${{ matrix.asset_name }}
           path: |
@@ -245,15 +262,20 @@ jobs:
       - release-preflight
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # This is the only release step that needs to write to the repo; scope is
+    # narrowed to JUST this job rather than left on the workflow root.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Download MarkItDown release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: markitdown-*
           merge-multiple: true
@@ -273,7 +295,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: v${{ needs.release-preflight.outputs.version }}
           body_path: release_notes.md

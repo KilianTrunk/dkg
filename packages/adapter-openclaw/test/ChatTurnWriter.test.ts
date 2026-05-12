@@ -1357,6 +1357,24 @@ describe("ChatTurnWriter", () => {
     expect(persistedUser).toContain("user-pasted-sender-999");
   });
 
+  it("T380 - W4a preserves standalone leading Sender block as user text", async () => {
+    const event: AgentEndContext = {
+      sessionId: "test",
+      messages: [
+        { role: "user", content: pastedSenderMetadataBlock },
+        { role: "assistant", content: "reply" },
+      ],
+    };
+
+    writer.onAgentEnd(event, { channelId: "telegram", sessionKey: "sk" });
+    await flushMicrotasks();
+
+    const [, persistedUser] = mockClient.storeChatTurn.mock.calls[0];
+    expect(persistedUser).toBe(pastedSenderMetadataBlock);
+    expect(persistedUser).toContain("Sender (untrusted metadata):");
+    expect(persistedUser).toContain("user-pasted-sender-999");
+  });
+
   it("T380 - W4a preserves non-Telegram metadata labels after Telegram wrapper", async () => {
     const actualUserText = [channelContextMetadataBlock, "This block is part of my message"].join("\n");
     const event: AgentEndContext = {
@@ -1539,6 +1557,27 @@ describe("ChatTurnWriter", () => {
 
     const [, persistedUser] = mockClient.storeChatTurn.mock.calls[0];
     expect(persistedUser).toBe(actualUserText);
+    expect(persistedUser).toContain("Sender (untrusted metadata):");
+    expect(persistedUser).toContain("user-pasted-sender-999");
+  });
+
+  it("T380 - W4b preserves standalone leading Sender block as user text", async () => {
+    writer.onMessageReceived({
+      sessionKey: "key123",
+      direction: "inbound",
+      text: pastedSenderMetadataBlock,
+      ...({ context: { channelId: "telegram" } } as any),
+    } as any);
+    await writer.onMessageSent({
+      sessionKey: "key123",
+      direction: "outbound",
+      text: "response",
+      ...({ context: { success: true, channelId: "telegram" } } as any),
+    } as any);
+    await flushMicrotasks();
+
+    const [, persistedUser] = mockClient.storeChatTurn.mock.calls[0];
+    expect(persistedUser).toBe(pastedSenderMetadataBlock);
     expect(persistedUser).toContain("Sender (untrusted metadata):");
     expect(persistedUser).toContain("user-pasted-sender-999");
   });

@@ -2828,10 +2828,10 @@ export class ChatTurnWriter {
    * channel/message labels need their own trusted source before they can be
    * stripped safely. The leading `Conversation info` block is stripped, and the
    * immediately following `Sender` block is stripped only when its JSON agrees
-   * with that conversation block. This keeps a user-pasted `Sender` example
-   * after a conversation-only wrapper verbatim. Separator blank lines after
-   * stripped blocks are removed, but indentation on the first real user line is
-   * kept.
+   * with that conversation block. Standalone `Sender` blocks are preserved as
+   * user-authored text because there is no trusted wrapper context to bind them
+   * to. Separator blank lines after stripped blocks are removed, but indentation
+   * on the first real user line is kept.
    *
    * Because W4a and W4b both call this before turnId/content hashing, metadata
    * changes do not create distinct persisted turn identities for the same user
@@ -2845,7 +2845,7 @@ export class ChatTurnWriter {
     if (!text) return "";
     const first = this.matchLeadingChannelMetadataBlock(text);
     if (!first) return text;
-    if (first.label === "Sender") return text.slice(first.length);
+    if (first.label === "Sender") return text;
     let out = text.slice(first.length);
     const sender = this.matchLeadingChannelMetadataBlock(out);
     if (sender?.label === "Sender" && this.senderMetadataMatchesConversation(first.json, sender.json)) {

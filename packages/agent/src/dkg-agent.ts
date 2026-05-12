@@ -7,6 +7,7 @@ import {
   contextGraphSharedMemoryUri,
   contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
+  deriveCuratorDidFromCgId,
   MemoryLayer,
   computeACKDigest,
   encodePublishRequest,
@@ -1713,22 +1714,59 @@ export class DKGAgent {
           delegation?: SignedAgentDelegation;
           agentName?: string;
         };
+        // Diagnostic surface for the rejection paths below. Without this
+        // every silent-reject path (`missing fields`, `unknown CG`, `not
+        // curator`, `verifyJoinRequest` throws) is invisible at runtime
+        // — the failing joiner just sees "no reachable curator" and the
+        // curator's log shows nothing. PR #448 round-6 testing burned a
+        // lot of time on that gap; surface it.
+        const remotePeer = peerId.toString();
+        const peerTag = remotePeer.slice(-8);
+        const requestCtx = createOperationContext('system');
         if (!contextGraphId || !delegation?.agentAddress || !delegation?.signature) {
+          this.log.warn(
+            requestCtx,
+            `PROTOCOL_JOIN_REQUEST from ${peerTag}: rejected — missing fields ` +
+              `(contextGraphId=${!!contextGraphId} agentAddress=${!!delegation?.agentAddress} signature=${!!delegation?.signature})`,
+          );
           return new TextEncoder().encode(JSON.stringify({ ok: false, error: 'missing fields' }));
         }
         // Only store if this node is the curator (creator) of the CG
         const owner = await this.getContextGraphOwner(contextGraphId);
         if (!owner) {
+          this.log.warn(
+            requestCtx,
+            `PROTOCOL_JOIN_REQUEST from ${peerTag} for "${contextGraphId}": rejected — unknown CG`,
+          );
           return new TextEncoder().encode(JSON.stringify({ ok: false, error: 'unknown CG' }));
         }
-        const selfDid = `did:dkg:agent:${this.peerId}`;
-        const selfAgentDid = this.defaultAgentAddress ? `did:dkg:agent:${this.defaultAgentAddress}` : null;
-        const isCurator = owner === selfDid ||
-          (selfAgentDid && owner === selfAgentDid) ||
-          [...this.localAgents.keys()].some((addr) => owner === `did:dkg:agent:${addr}`);
+        // Compare on lower-cased DIDs so we don't reject ourselves over
+        // EIP-55 checksum case drift between the cgId-derived owner DID
+        // (`deriveCuratorDidFromCgId`, preserves whatever case the cgId
+        // shipped with) and the locally-stored agent address (typically
+        // `ethers.getAddress`'d to checksummed form). Ethereum addresses
+        // are case-insensitive on the wire; checksum is purely advisory.
+        // libp2p peer-IDs are deterministic from the public key so the
+        // lower-casing is a no-op for the peer-ID branch.
+        const ownerLower = owner.toLowerCase();
+        const selfDid = `did:dkg:agent:${this.peerId}`.toLowerCase();
+        const selfAgentDid = this.defaultAgentAddress
+          ? `did:dkg:agent:${this.defaultAgentAddress}`.toLowerCase()
+          : null;
+        const isCurator = ownerLower === selfDid ||
+          (selfAgentDid !== null && ownerLower === selfAgentDid) ||
+          [...this.localAgents.keys()].some((addr) => ownerLower === `did:dkg:agent:${addr}`.toLowerCase());
         if (!isCurator) {
+          this.log.warn(
+            requestCtx,
+            `PROTOCOL_JOIN_REQUEST from ${peerTag} for "${contextGraphId}": rejected — not curator (owner=${owner})`,
+          );
           return new TextEncoder().encode(JSON.stringify({ ok: false, error: 'not curator' }));
         }
+        this.log.info(
+          requestCtx,
+          `PROTOCOL_JOIN_REQUEST from ${peerTag} for "${contextGraphId}": accepted, verifying delegation for ${delegation.agentAddress}`,
+        );
         this.verifyJoinRequest(contextGraphId, delegation);
         await this.storePendingJoinRequest(contextGraphId, delegation, agentName);
         // Note: `storePendingJoinRequest` itself now emits JOIN_REQUEST_RECEIVED.
@@ -1744,6 +1782,14 @@ export class DKGAgent {
         return new TextEncoder().encode(JSON.stringify({ ok: true }));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        // Mirror the per-rejection-path warns above. The most common
+        // throw-site is `verifyJoinRequest` (signature/scope/expiry
+        // failure); without this log the curator silently NACKs and the
+        // joiner sees only "no reachable curator".
+        this.log.warn(
+          createOperationContext('system'),
+          `PROTOCOL_JOIN_REQUEST handler error: ${msg}`,
+        );
         return new TextEncoder().encode(JSON.stringify({ ok: false, error: msg }));
       }
     });
@@ -3535,10 +3581,15 @@ export class DKGAgent {
   async isCuratorOf(contextGraphId: string): Promise<boolean> {
     const owner = await this.getContextGraphOwner(contextGraphId);
     if (!owner) return false;
-    const selfDid = `did:dkg:agent:${this.peerId}`;
-    if (owner === selfDid) return true;
+    // Mirror the case-insensitive comparison in PROTOCOL_JOIN_REQUEST
+    // — the owner can come from `deriveCuratorDidFromCgId` (preserves
+    // cgId case) while local-agent keys are typically EIP-55 checksum.
+    // Both forms denote the same Ethereum address.
+    const ownerLower = owner.toLowerCase();
+    const selfDid = `did:dkg:agent:${this.peerId}`.toLowerCase();
+    if (ownerLower === selfDid) return true;
     for (const addr of this.localAgents.keys()) {
-      if (owner === `did:dkg:agent:${addr}`) return true;
+      if (ownerLower === `did:dkg:agent:${addr}`.toLowerCase()) return true;
     }
     return false;
   }
@@ -8146,12 +8197,30 @@ export class DKGAgent {
           this.log.info(ctx, `Forwarded join request for "${contextGraphId}" from ${agentAddress}: 1 curator(s) received (direct)`);
           return { delivered: 1, errors };
         }
+        // Curator was reachable but rejected the request. Log + record
+        // the reason so the joiner can see WHY (e.g. "unknown CG"
+        // implies the cgId in the invite text is wrong).
+        const rejectReason = response.error ?? 'unknown';
+        this.log.warn(
+          ctx,
+          `Targeted join-request to curator ${curatorPeerId.slice(-8)} returned non-ok: ${rejectReason}`,
+        );
         if (response.error && response.error !== 'unknown CG') {
           errors.push(`${curatorPeerId.slice(-8)}: ${response.error}`);
+        } else if (response.error === 'unknown CG') {
+          // Surface "unknown CG" too — silent-filter was hiding the
+          // most common invite-text-mismatch failure mode.
+          errors.push(`${curatorPeerId.slice(-8)}: unknown CG`);
         }
-      } catch {
+      } catch (dialErr) {
         // Targeted dial failed — fall through to broadcast WITH curator
         // re-included as a target.
+        const msg = dialErr instanceof Error ? dialErr.message : String(dialErr);
+        this.log.warn(
+          ctx,
+          `Targeted join-request dial to curator ${curatorPeerId.slice(-8)} failed: ${msg}`,
+        );
+        errors.push(`${curatorPeerId.slice(-8)}: dial failed (${msg})`);
       }
     }
 
@@ -10290,7 +10359,17 @@ export class DKGAgent {
       const owner = (curatorResult.bindings[0] as Record<string, string>)['owner'];
       if (owner) return owner;
     }
-    return this.getContextGraphCreator(contextGraphId);
+    const fromCreator = await this.getContextGraphCreator(contextGraphId);
+    if (fromCreator) return fromCreator;
+    // Final fallback: V10 wallet-scoped cgId convention (`0x.../<name>`)
+    // encodes the curator structurally, which lets us answer for CGs
+    // whose RDF `_meta` triples were never written locally — most
+    // commonly because on-chain registration didn't complete (no
+    // identity, RPC down, mid-flight crash). Without this fallback, the
+    // PROTOCOL_JOIN_REQUEST handler silently rejects every join attempt
+    // for these CGs and the joiner sees only a generic "no reachable
+    // curator". See `deriveCuratorDidFromCgId` for the full rationale.
+    return deriveCuratorDidFromCgId(contextGraphId);
   }
 
   private async getContextGraphCurator(contextGraphId: string): Promise<string | null> {

@@ -16,6 +16,9 @@ set -u
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEVNET_DIR="$SCRIPT_DIR/../.devnet"
+N1_LOG="$DEVNET_DIR/node1/daemon.log"
+N2_LOG="$DEVNET_DIR/node2/daemon.log"
 
 # Resolve the devnet auth token the same way the other devnet test scripts do.
 # ./scripts/devnet.sh start generates a fresh shared token per run and writes
@@ -61,6 +64,27 @@ api() {
 }
 
 urlenc() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$1"; }
+
+# See devnet-test-invite-flow.sh for the full rationale; same helper.
+assert_log_recent() {
+  local log_path="$1" since_iso="$2" pattern="$3" label="$4"
+  if [ ! -f "$log_path" ]; then fail "log file missing: $log_path (label=$label)"; return 1; fi
+  local hit
+  hit=$(awk -v since="$since_iso" '
+    match($0, /(\[)?20[0-9]{2}-[0-9]{2}-[0-9]{2}T?[ ][0-9:]{8}/) {
+      ts = substr($0, RSTART, RLENGTH); gsub(/[\[T]/, " ", ts); sub(/^ /, "", ts)
+      if (ts >= since) print
+    }
+  ' "$log_path" | grep -E "$pattern" | head -1)
+  if [ -n "$hit" ]; then
+    ok "log assertion ($label): matched"
+    note "  → $hit"
+    return 0
+  fi
+  fail "log assertion ($label) failed: pattern '$pattern' not in $log_path since $since_iso"
+  tail -n 8 "$log_path" | sed 's/^/    /'
+  return 1
+}
 
 identify() {
   for i in 1 2; do
@@ -150,9 +174,19 @@ print(json.dumps({
   'curatorPeerId': '$N1_PEER_ID',
 }))
 ")
+JOIN_REQUEST_TS=$(date -u +'%Y-%m-%d %H:%M:%S')
 submit_resp=$(api "$N2" POST "/api/context-graph/$(urlenc "$CG_ID")/request-join" "$submit_body")
 delivered=$(echo "$submit_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('delivered',''))")
 [ -n "$delivered" ] && [ "$delivered" != "0" ] && ok "request delivered ($delivered)" || { fail "request-join: $submit_resp"; exit 1; }
+
+# Server-side observability: same assertion as devnet-test-invite-flow.
+# Without it, a "delivered=1" response from a non-curator broadcast
+# acceptor would pass while N1 silently NACK'd the actual request.
+sleep 1
+assert_log_recent "$N1_LOG" "$JOIN_REQUEST_TS" \
+  "PROTOCOL_JOIN_REQUEST from .* for \"$CG_ID\": accepted" \
+  "curator (N1) accepted inbound request" \
+  || fail "curator did not log accepting the join request — silent-NACK regression?"
 
 hr "Step 4 — N1 lists pending requests (expect N2 present)"
 sleep 1
@@ -174,9 +208,20 @@ print(sum(1 for x in n if x.get('type')=='join_rejected'))
 note "N2 has $before join_rejected notification(s) before"
 
 hr "Step 6 — N1 rejects N2's request"
+REJECT_TS=$(date -u +'%Y-%m-%d %H:%M:%S')
 rej_resp=$(api "$N1" POST "/api/context-graph/$(urlenc "$CG_ID")/reject-join" "{\"agentAddress\":\"$N2_ADDR\"}")
 okf=$(echo "$rej_resp" | python3 -c "import sys,json; print(str(json.load(sys.stdin).get('ok','')).lower())")
 [ "$okf" = "true" ] && ok "reject-join: $rej_resp" || { fail "reject-join: $rej_resp"; exit 1; }
+
+# N2 should log receiving the rejection from N1 (it's the trusted
+# decision sender via the join-request acceptance memo). Catches the
+# class of bug where the rejection notification reaches N2's libp2p
+# stack but is silently dropped before the UI emits the bell event.
+sleep 1
+assert_log_recent "$N2_LOG" "$REJECT_TS" \
+  "Join request rejected for \"$CG_ID\"" \
+  "N2 received & accepted rejection notification" \
+  || note "(may take longer in slow devnet — non-fatal here, the API poll below is the strict assertion)"
 
 hr "Step 7 — poll N2 for the join_rejected notification (up to 15s)"
 start=$(date +%s)

@@ -769,7 +769,15 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       }
       const result = await agent.forwardJoinRequest(contextGraphId, delegation, agentName, curatorPeerId);
       if (result.delivered === 0) {
-        return jsonResponse(res, 502, { error: 'Could not deliver join request to curator. No reachable curator found.' });
+        // Surface per-peer errors so the joiner can see WHY (curator
+        // rejected with a specific reason, transport timed out, etc.)
+        // instead of a generic "no curator". Silent error swallowing here
+        // hid bugs like protocol-format skew between curator and joiner
+        // versions during PR #448 multi-laptop testing.
+        return jsonResponse(res, 502, {
+          error: 'Could not deliver join request to curator. No reachable curator found.',
+          ...(result.errors.length > 0 ? { errors: result.errors } : {}),
+        });
       }
       return jsonResponse(res, 200, { ok: true, status: 'pending', delivered: result.delivered });
     } catch (err: unknown) {

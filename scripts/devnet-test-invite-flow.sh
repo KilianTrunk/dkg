@@ -14,6 +14,18 @@ set -u
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEVNET_DIR="$SCRIPT_DIR/../.devnet"
+
+# Devnet daemon log paths — used by `assert_curator_log` to validate
+# server-side observability of the invite flow. Without these checks
+# this script could pass even when the curator silently NACKs every
+# join request (the failure mode that took an entire two-laptop session
+# to root-cause; see PR #448 round-6 + the `deriveCuratorDidFromCgId`
+# fallback). The script is now responsible for asserting curator-side
+# log lines exist whenever a join request is supposed to land.
+N1_LOG="$DEVNET_DIR/node1/daemon.log"
+N2_LOG="$DEVNET_DIR/node2/daemon.log"
+N3_LOG="$DEVNET_DIR/node3/daemon.log"
 
 # Resolve the devnet auth token the same way the other devnet test scripts do.
 # ./scripts/devnet.sh start generates a fresh shared token per run and writes
@@ -142,6 +154,40 @@ poll_catchup() {
   done
 }
 
+# assert_log_recent <log-path> <since-iso> <expected-pattern> <human-label>
+# Greps for `expected-pattern` in `log-path`, restricted to lines that
+# look like they were written after `since-iso`. Uses awk because the
+# devnet logs interleave bracketed ISO timestamps with un-prefixed
+# multi-line stack traces; we want a "this matched while we were
+# watching" semantic, not "this was ever in the log".
+assert_log_recent() {
+  local log_path="$1" since_iso="$2" pattern="$3" label="$4"
+  if [ ! -f "$log_path" ]; then
+    fail "log file missing: $log_path (label=$label)"
+    return 1
+  fi
+  # Ignore lines older than `since_iso`. The grep is on the FILTERED
+  # window so a stale match from a previous test run can't satisfy us.
+  local hit
+  hit=$(awk -v since="$since_iso" '
+    # Match either bracketed ISO ([2026-01-…]) or whitespace-prefixed
+    # ISO (2026-01-… …) — both shapes show up in the devnet log mix.
+    match($0, /(\[)?20[0-9]{2}-[0-9]{2}-[0-9]{2}T?[ ][0-9:]{8}/) {
+      ts = substr($0, RSTART, RLENGTH); gsub(/[\[T]/, " ", ts); sub(/^ /, "", ts)
+      if (ts >= since) print
+    }
+  ' "$log_path" | grep -E "$pattern" | head -1)
+  if [ -n "$hit" ]; then
+    ok "log assertion ($label): matched"
+    note "  → $hit"
+    return 0
+  fi
+  fail "log assertion ($label) failed: pattern '$pattern' not in $log_path since $since_iso"
+  note "  hint: tail of log:"
+  tail -n 8 "$log_path" | sed 's/^/    /'
+  return 1
+}
+
 list_has_cg() {
   local node="$1" cg_id="$2"
   api "$node" GET /api/context-graph/list | python3 -c "
@@ -262,6 +308,10 @@ print(json.dumps({
   'curatorPeerId': '$N1_PEER_ID',
 }))
 ")
+# Mark the moment of request submission so subsequent log assertions
+# only consider lines written from this point onward (avoids matching
+# stale entries from prior test runs that re-used the same fixture).
+JOIN_REQUEST_TS=$(date -u +'%Y-%m-%d %H:%M:%S')
 submit_resp=$(api "$N2" POST "/api/context-graph/$ENC_CG/request-join" "$submit_body")
 note "request-join response: $submit_resp"
 delivered=$(echo "$submit_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('delivered',''))")
@@ -271,6 +321,24 @@ if [ "$status_field" = "pending" ] && [ -n "$delivered" ] && [ "$delivered" != "
 else
   fail "request-join did not deliver (status=$status_field delivered=$delivered)"
 fi
+
+# Server-side observability assertions — protect against the silent-
+# rejection regression class where `delivered>0` is satisfied by a
+# broadcast peer that ack'd "ok" but isn't actually the curator, or
+# where the curator's own handler silently returned "unknown CG" /
+# "missing fields" without surfacing it. Both lines below come from
+# the inbound PROTOCOL_JOIN_REQUEST handler in `dkg-agent.ts` (added
+# in PR #448 round-6 along with the wallet-prefix curator fallback).
+hr "Step 4b — assert curator (N1) logged the inbound join request"
+sleep 1   # give the inbound handler a moment to flush
+assert_log_recent "$N1_LOG" "$JOIN_REQUEST_TS" \
+  "PROTOCOL_JOIN_REQUEST from .* for \"$CG_ID\": accepted" \
+  "curator accepted inbound request" \
+  || fail "curator did not log accepting the join request — silent-NACK regression?"
+assert_log_recent "$N1_LOG" "$JOIN_REQUEST_TS" \
+  "Stored pending join request from .* for \"$CG_ID\"" \
+  "curator persisted the request" \
+  || fail "curator accepted but did not persist — broken store path"
 
 hr "Step 5 — N1 lists pending join requests (expect: 1 for N2)"
 sleep 1  # allow P2P forward + store

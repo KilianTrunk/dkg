@@ -3004,6 +3004,65 @@ describe("ChatTurnWriter", () => {
     writer.flushSync();
   });
 
+  it("T458 — N direct persists accumulate ordered tickets for N metadata-stripped UI backfill pairs", async () => {
+    // Seed prior Telegram persistence so savedUpTo > -1 and the
+    // cold-start clamp does not pre-drop historical UI pairs. This
+    // mirrors the live UI -> first Telegram regression: by the time
+    // the first Telegram agent_end fires after multiple direct UI
+    // persists, the OpenClaw transcript already carries every UI pair
+    // but their direct-channel metadata has been stripped, so only
+    // the ordered marker fallback can dedupe them.
+    await writer.onAgentEnd({
+      sessionId: "seed",
+      messages: [
+        { role: "user", content: "previous telegram question" },
+        { role: "assistant", content: "previous telegram answer" },
+      ],
+    }, { channelId: "telegram", sessionKey: "agent:main:main" });
+    await flushMicrotasks();
+    mockClient.storeChatTurn.mockClear();
+
+    await writer.markExternalTurnPersistedDurable({
+      sessionKey: "agent:main:main",
+      turnId: "node-ui-corr-1",
+      user: "raw ui question 1",
+      assistant: "node ui answer 1",
+    });
+    await writer.markExternalTurnPersistedDurable({
+      sessionKey: "agent:main:main",
+      turnId: "node-ui-corr-2",
+      user: "raw ui question 2",
+      assistant: "node ui answer 2",
+    });
+    await writer.markExternalTurnPersistedDurable({
+      sessionKey: "agent:main:main",
+      turnId: "node-ui-corr-3",
+      user: "raw ui question 3",
+      assistant: "node ui answer 3",
+    });
+
+    await writer.onAgentEnd({
+      sessionId: "test",
+      messages: [
+        { role: "user", content: "previous telegram question" },
+        { role: "assistant", content: "previous telegram answer" },
+        { role: "user", content: "raw ui question 1" },
+        { role: "assistant", content: "[DKG UI delivered] rendered transcript answer 1" },
+        { role: "user", content: "raw ui question 2" },
+        { role: "assistant", content: "[DKG UI delivered] rendered transcript answer 2" },
+        { role: "user", content: "raw ui question 3" },
+        { role: "assistant", content: "[DKG UI delivered] rendered transcript answer 3" },
+        { role: "user", content: "next telegram question" },
+        { role: "assistant", content: "next telegram answer" },
+      ],
+    }, { channelId: "telegram", sessionKey: "agent:main:main" });
+    await flushMicrotasks();
+
+    expect(mockClient.storeChatTurn).toHaveBeenCalledTimes(1);
+    expect(mockClient.storeChatTurn.mock.calls[0][1]).toBe("next telegram question");
+    writer.flushSync();
+  });
+
   it("T359 - typed Telegram W4b and Node-UI external markers both suppress W4a duplicates after restart", async () => {
     await writer.markExternalTurnPersistedDurable({
       sessionKey: "agent:main:main",

@@ -1179,19 +1179,31 @@ export class ChatTurnWriter {
   }): Promise<void> {
     const externalCursorKey = this.externalCursorKeyFromSessionKey(opts.sessionKey);
     const markerUsers = this.uniqueStrings([opts.user, ...(opts.userAliases ?? [])]);
-    const markers = this.uniqueStrings([
-      ChatTurnWriter.EXTERNAL_ORDERED_TURN_MARKER,
-      ...markerUsers.flatMap((user) => [
+    const contentMarkers = this.uniqueStrings(
+      markerUsers.flatMap((user) => [
         this.externalTurnMarkerId(opts.turnId, user, opts.assistant),
         this.externalTurnUserMarkerId(opts.turnId, user),
-      ]),
-    ].filter(Boolean));
-    if (!externalCursorKey || markers.length === 0) return;
-    const previousMarkerCounts = markers.map((marker) => ({
+      ]).filter(Boolean),
+    );
+    const orderedMarker = ChatTurnWriter.EXTERNAL_ORDERED_TURN_MARKER;
+    const allMarkers = [orderedMarker, ...contentMarkers];
+    if (!externalCursorKey) return;
+    const previousMarkerCounts = allMarkers.map((marker) => ({
       marker,
       count: this.externalTurnMarkers.get(externalCursorKey)?.get(marker) ?? 0,
     }));
-    for (const marker of markers) {
+    // The ordered marker is a one-shot ticket per direct persist; W4a
+    // consumes it (count - 1) when a historical non-latest pair has no
+    // exact/user marker. N direct persists must accumulate N tickets so
+    // N metadata-stripped UI backfill pairs can each be skipped. Live
+    // smoke (UI3 -> first Telegram) showed Math.max collapsing the
+    // count to 1 even after multiple UI persists, so only the first
+    // historical UI pair was skipped and the rest re-persisted as
+    // duplicates. Content-bound exact/user markers remain idempotent
+    // (Math.max) because identical (turnId + content) is the same
+    // daemon-success fact across replays.
+    this.incrementOrderedExternalTurnMarker(externalCursorKey);
+    for (const marker of contentMarkers) {
       this.restoreExternalTurnMarker(externalCursorKey, marker);
     }
     if (!this.commitWatermarkStateSync(externalCursorKey)) {
@@ -1200,6 +1212,14 @@ export class ChatTurnWriter {
       }
       throw new Error("Failed to write external chat-turn marker");
     }
+  }
+
+  private incrementOrderedExternalTurnMarker(sessionKeyCursor: string): void {
+    this.bumpDurableCursorKeyRevision(sessionKeyCursor);
+    const bucket = this.externalTurnMarkers.get(sessionKeyCursor) ?? new Map<string, number>();
+    const marker = ChatTurnWriter.EXTERNAL_ORDERED_TURN_MARKER;
+    bucket.set(marker, (bucket.get(marker) ?? 0) + 1);
+    this.externalTurnMarkers.set(sessionKeyCursor, bucket);
   }
 
   private restoreFailedMigrationDestination(

@@ -646,7 +646,7 @@ DKG_IMPORT_ARTIFACT_READ_MARKDOWN_SCHEMA = {
             "assertion_name": {"type": "string", "description": "Optional source assertion name to cross-check against assertion_uri."},
             "file_hash": {"type": "string", "description": "Optional source file hash to verify."},
             "sub_graph_name": {"type": "string", "description": "Optional sub-graph name."},
-            "max_bytes": {"type": "integer", "description": "Optional byte cap; daemon maximum is 5 MiB."},
+            "max_bytes": {"type": "integer", "description": "Optional positive integer byte cap; daemon maximum is 5 MiB."},
         },
         "required": ["context_graph_id", "assertion_uri"],
     },
@@ -1955,10 +1955,20 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error("assertion_uri is required.")
         max_bytes = args.get("max_bytes")
         if max_bytes is not None:
-            try:
-                max_bytes = int(max_bytes)
-            except Exception:
-                return tool_error("max_bytes must be an integer.")
+            if isinstance(max_bytes, bool):
+                return tool_error("max_bytes must be a positive integer.")
+            if isinstance(max_bytes, str):
+                stripped_max_bytes = max_bytes.strip()
+                if not stripped_max_bytes:
+                    return tool_error("max_bytes must be a positive integer.")
+                try:
+                    max_bytes = int(stripped_max_bytes)
+                except Exception:
+                    return tool_error("max_bytes must be a positive integer.")
+            elif not isinstance(max_bytes, int):
+                return tool_error("max_bytes must be a positive integer.")
+            if max_bytes <= 0:
+                return tool_error("max_bytes must be a positive integer.")
         return json.dumps(self._client.read_import_artifact_markdown(
             cg,
             assertion_uri=assertion_uri,

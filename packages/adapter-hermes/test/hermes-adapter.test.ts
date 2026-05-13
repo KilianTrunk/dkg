@@ -2570,6 +2570,32 @@ result = json.loads(provider.handle_tool_call("dkg_query", {
 assert result["ok"] is True, result
 assert provider._client.queries[-1][2]["agent_address"] == "peer-default", provider._client.queries
 
+class ReadMarkdownClient:
+    def __init__(self):
+        self.calls = []
+
+    def read_import_artifact_markdown(self, context_graph_id, **kwargs):
+        self.calls.append((context_graph_id, kwargs))
+        return {"ok": True}
+
+provider._client = ReadMarkdownClient()
+result = json.loads(provider.handle_tool_call("dkg_import_artifact_read_markdown", {
+    "context_graph_id": "cg:test",
+    "assertion_uri": "did:dkg:context-graph:cg:test/assertion/agent/imported",
+    "max_bytes": "4096",
+}))
+assert result["ok"] is True, result
+assert provider._client.calls[-1][1]["max_bytes"] == 4096, provider._client.calls
+
+for bad_max_bytes in [0, -1, 1.5, True, "   "]:
+    result = json.loads(provider.handle_tool_call("dkg_import_artifact_read_markdown", {
+        "context_graph_id": "cg:test",
+        "assertion_uri": "did:dkg:context-graph:cg:test/assertion/agent/imported",
+        "max_bytes": bad_max_bytes,
+    }))
+    assert "positive integer" in result["error"], (bad_max_bytes, result)
+assert len(provider._client.calls) == 1, provider._client.calls
+
 class SemanticClient:
     def __init__(self):
         self.calls = []

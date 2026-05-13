@@ -1348,11 +1348,24 @@ export class DKGAgent {
           if (opts?.signal?.aborted) return null;
           const lookup = this.discovery.findAgentByPeerId(peerId)
             .then((agent) => agent?.relayAddress ?? null);
-          if (!opts?.signal) return lookup;
+          const signal = opts?.signal;
+          if (!signal) return lookup;
           return Promise.race<string | null>([
             lookup,
             new Promise<null>((resolve) => {
-              opts.signal!.addEventListener(
+              // Codex PR #499 round 5 (dkg-agent.ts:1354): the early
+              // `signal.aborted` check above and `addEventListener`
+              // are not atomic — the signal could fire in between, and
+              // since `abort` is a one-shot event, our late listener
+              // would never see it and this Promise would hang for the
+              // full lookup duration. Re-check INSIDE the constructor
+              // before subscribing so the abort branch resolves
+              // immediately if we lost that race.
+              if (signal.aborted) {
+                resolve(null);
+                return;
+              }
+              signal.addEventListener(
                 'abort',
                 () => resolve(null),
                 { once: true },

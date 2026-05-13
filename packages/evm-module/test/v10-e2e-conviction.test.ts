@@ -446,12 +446,13 @@ describe('V10 E2E Conviction System', function () {
       // `_distributeTokens` on this branch (double-count guard).
       const currentEpoch = await Chronos.getCurrentEpoch();
       const tokenAmount = ethers.parseEther('1000');
-      // PCA-funded publish strict-equality (`PCAEpochsMismatch`): the
-      // KC's lifetime MUST equal the PCA's `lockDurationEpochs`, which
-      // the NFT snapshotted at `createAccount` from
-      // `parametersStorage.publishingConvictionEpochs()`. Read it back
-      // from the NFT to keep this test source-of-truth and immune to
-      // governance changes of the default in the deploy script.
+      // PCA discount eligibility: the contract takes the PCA branch
+      // only when `publishEpochs == lockDurationEpochs` (along with
+      // not-expired + registered-agent gates). Any other value
+      // silently falls through to direct spend, which would skip the
+      // discount and break this test's assertions. Read the
+      // `lockDurationEpochs` back from the NFT to keep this test
+      // immune to governance changes of the deploy-script default.
       const acctInfo = await NFT.accounts(1);
       const epochs = Number(acctInfo[5]); // index 5 = lockDurationEpochs
       const expectedDiscountBps = 2000n;

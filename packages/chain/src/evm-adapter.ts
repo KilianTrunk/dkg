@@ -244,8 +244,10 @@ interface ContractCache {
    * cache slot still backs the `getConvictionAccountInfo` / discount
    * read paths off the older `PublishingConvictionAccount` contract.
    * Used by the publisher SDK to detect PCA-funded publishes and
-   * mirror the strict `kcEpochs == lockDurationEpochs` invariant
-   * enforced by `KnowledgeAssetsV10.publish()` (see `PCAEpochsMismatch`).
+   * mirror the `kcEpochs == lockDurationEpochs` eligibility check in
+   * `KnowledgeAssetsV10.publish()` — wrong epochs silently fall
+   * through to direct spend, so the SDK pre-coerces to keep the
+   * discount.
    */
   dkgPublishingConvictionNFT?: Contract;
   randomSampling?: Contract;
@@ -2432,8 +2434,9 @@ export class EVMChainAdapter implements ChainAdapter {
    * The publisher SDK uses this to decide, BEFORE building a publish
    * tx, whether `KnowledgeAssetsV10.publish()` will route through the
    * PCA discount branch — and therefore whether `publishEpochs` must
-   * be coerced to the PCA's `lockDurationEpochs` to satisfy the
-   * `PCAEpochsMismatch` strict-equality check.
+   * be coerced to the PCA's `lockDurationEpochs`. Wrong epochs do NOT
+   * revert the contract any more; they just demote the publish to
+   * direct spend at full price.
    *
    * Returns `0n` (not registered) when the NFT contract is not
    * deployed on this chain, the address is malformed, or the chain

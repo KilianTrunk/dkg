@@ -162,6 +162,13 @@ async function loadContracts(): Promise<Contracts> {
     epsAddress,
     [
       'function getEpochPool(uint256 shardId, uint256 epoch) view returns (uint96)',
+      // MUST mirror `EpochStorage.sol` (only `shardId` is indexed). The
+      // lazy-settlement test asserts active/passive sink amounts from
+      // per-tx events instead of shared `getEpochPool` deltas — the
+      // pools are global on a live devnet and unrelated daemon
+      // publishes in the same epoch range can both mask regressions
+      // and cause flakes (Codex round-3 finding on PR #470).
+      'event TokensAddedToEpochRange(uint256 indexed shardId, uint256 startEpoch, uint256 endEpoch, uint96 tokenAmount, uint96 remainder)',
     ],
     provider,
   );
@@ -279,12 +286,27 @@ const state: {
    * "never captured" — afterAll then skips the restore.
    */
   originalPublishingConvictionEpochs: bigint;
+  /**
+   * Lifecycle accumulators for the conservation assertion in step 6.
+   * The lazy-settlement invariant is:
+   *   `activeSinkTotal + passiveSinkTotal + leftoverTopUp + committedDust`
+   *   == `committedTRAC + sum(topUps)`
+   * We update them as each step runs so step 6 can prove the full
+   * `committedTRAC` has been accounted for end-to-end (active publish
+   * draws + passive window sweeps + final sweep tail) — instead of
+   * only checking `fullySwept` and `committedDust` as a proxy
+   * (Codex round-3 finding on PR #470).
+   */
+  activeSinkTotal: bigint;
+  passiveSinkTotal: bigint;
 } = {
   s: null,
   edge: null,
   admin: null,
   accountId: 0n,
   originalPublishingConvictionEpochs: 0n,
+  activeSinkTotal: 0n,
+  passiveSinkTotal: 0n,
 };
 
 describe('V10 PCA lazy settlement — devnet validation', () => {
@@ -488,55 +510,82 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     // eslint-disable-next-line no-console
     console.log(`step 3: window 0 overlaps chain epochs [${windowStartEp}, ${windowEndEp}]`);
 
-    // PCA-funded publishes now use `kcEpochs = lockDurationEpochs` (the
-    // `PCAEpochsMismatch` invariant added in PR #470 round 2). The active
-    // sink therefore distributes `discountedCost` across
-    // `[currentEpoch, currentEpoch + lockDurationEpochs]` chain epochs —
-    // potentially far beyond the billing-window range. Snapshot the staker
-    // pool across the FULL KC range so the assertion catches the entire
-    // distribution rather than the partial sliver that lands in window 0's
-    // own chain epoch span.
-    const acctSnap = await s.nft.accounts(accountId);
-    const lockDurationEpochs: number = Number(acctSnap.lockDurationEpochs);
-    const currentChainEpoch: bigint = await s.chronos.getCurrentEpoch();
-    const kcStartEp: bigint = currentChainEpoch;
-    const kcEndEp: bigint = currentChainEpoch + BigInt(lockDurationEpochs);
-    // Sample range = union of window 0's chain range and the KC's chain
-    // range, since the active sink could touch either tail epoch.
-    const sampleStartEp = windowStartEp < kcStartEp ? BigInt(windowStartEp) : kcStartEp;
-    const sampleEndEp = BigInt(windowEndEp) > kcEndEp ? BigInt(windowEndEp) : kcEndEp;
-
-    const beforePools = new Map<bigint, bigint>();
-    for (let e = sampleStartEp; e <= sampleEndEp; e++) {
-      beforePools.set(e, await s.eps.getEpochPool(STAKER_SHARD_ID, e));
-    }
+    const spent0Before: bigint = await s.nft.windowSpent(accountId, 0n);
 
     const file = nquadsFile('lazy-settle-publish');
     const result = await dkgPublish(edge, file);
     expect(result.kcId).toBeGreaterThan(0n);
 
-    const spent0After: bigint = await s.nft.windowSpent(accountId, 0n);
-    expect(spent0After).toBeGreaterThan(0n);
+    // Source of truth for the active-sink amount is the publish tx
+    // receipt's `CostCovered` + `TokensAddedToEpochRange` events — not
+    // cumulative `EpochStorage.getEpochPool` deltas. Those pools are
+    // global on a live devnet and unrelated daemon publishes in the
+    // same epoch range can both mask regressions AND cause flakes
+    // (Codex round-3 finding on PR #470).
+    const receipt = await s.provider.getTransactionReceipt(result.txHash);
+    expect(receipt).not.toBeNull();
 
-    let activeSinkDelta = 0n;
-    for (let e = sampleStartEp; e <= sampleEndEp; e++) {
-      const after: bigint = await s.eps.getEpochPool(STAKER_SHARD_ID, e);
-      activeSinkDelta += after - (beforePools.get(e) ?? 0n);
+    let costCoveredEvents = 0;
+    let costCoveredDiscounted = 0n;
+    let costCoveredFromEpoch = 0n;
+    let activeSinkFromEvents = 0n;
+    for (const log of receipt!.logs) {
+      // NFT-emitted `CostCovered`: deltaSpent for window 0 = drawnFromEpoch.
+      if (log.address.toLowerCase() === (await s.nft.getAddress()).toLowerCase()) {
+        try {
+          const parsed = s.nft.interface.parseLog({
+            topics: log.topics as string[],
+            data: log.data,
+          });
+          if (parsed?.name === 'CostCovered' && BigInt(parsed.args.accountId) === accountId) {
+            costCoveredEvents++;
+            costCoveredDiscounted = BigInt(parsed.args.discountedCost);
+            costCoveredFromEpoch = BigInt(parsed.args.drawnFromEpoch);
+          }
+        } catch { /* not from NFT */ }
+      }
+      // EpochStorage-emitted `TokensAddedToEpochRange`: this is the
+      // active-sink write. `coverPublishingCost` -> `_distributeProrated`
+      // can emit up to 3 such events (head partial + middle range +
+      // tail partial). Sum the `tokenAmount` field to recover the full
+      // discounted cost actually distributed.
+      if (log.address.toLowerCase() === s.epsAddress.toLowerCase()) {
+        try {
+          const parsed = s.eps.interface.parseLog({
+            topics: log.topics as string[],
+            data: log.data,
+          });
+          if (parsed?.name === 'TokensAddedToEpochRange') {
+            activeSinkFromEvents += BigInt(parsed.args.tokenAmount);
+          }
+        } catch { /* not from EpochStorage */ }
+      }
     }
+    expect(costCoveredEvents).toBe(1);
 
-    // The active sink distributes `discountedCost` (== windowSpent[0]
-    // for this single publish) across `[kcStartEpoch, kcStartEpoch +
-    // lockDurationEpochs]` chain epochs. Total pool growth across that
-    // range MUST be ≥ windowSpent[0] (proration is exact under
-    // floor-division so rounding crumbs can never under-fund the bound).
-    // Daemon background publishes may push it higher — we only assert
-    // the lower bound.
-    expect(activeSinkDelta).toBeGreaterThanOrEqual(spent0After);
+    // windowSpent delta MUST equal the on-chain `drawnFromEpoch`
+    // reported in `CostCovered` (window 0 has full base allowance
+    // remaining so the entire discounted cost is drawn from the
+    // window — `drawnFromTopUp == 0`).
+    const spent0After: bigint = await s.nft.windowSpent(accountId, 0n);
+    expect(spent0After - spent0Before).toBe(costCoveredFromEpoch);
+
+    // Active sink: sum of `TokensAddedToEpochRange.tokenAmount` over
+    // the publish receipt equals the discounted cost distributed.
+    expect(activeSinkFromEvents).toBe(costCoveredDiscounted);
+
+    // Record for the conservation assertion in step 6. The active
+    // sink across the account's lifetime is the sum of all
+    // `drawnFromEpoch + drawnFromTopUp` across `CostCovered`. With
+    // no topUps in this suite, `drawnFromTopUp == 0` so we can use
+    // `discountedCost` directly.
+    state.activeSinkTotal += costCoveredDiscounted;
 
     // eslint-disable-next-line no-console
     console.log(
-      `step 3: published kcId=${result.kcId} → windowSpent[acct][0]=${ethers.formatEther(spent0After)} TRAC, ` +
-      `staker pool +${ethers.formatEther(activeSinkDelta)} TRAC across epochs [${sampleStartEp},${sampleEndEp}]`,
+      `step 3: published kcId=${result.kcId} → CostCovered.discountedCost=${ethers.formatEther(costCoveredDiscounted)} TRAC, ` +
+      `activeSink(from events)=${ethers.formatEther(activeSinkFromEvents)} TRAC, ` +
+      `windowSpent[acct][0] += ${ethers.formatEther(spent0After - spent0Before)} TRAC`,
     );
   }, 180_000);
 
@@ -570,11 +619,6 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
 
     const [w0Start, w0End] = await s.nft.getWindowChainEpochRange(accountId, 0n);
 
-    const beforePools = new Map<bigint, bigint>();
-    for (let e = w0Start; e <= w0End; e++) {
-      beforePools.set(BigInt(e), await s.eps.getEpochPool(STAKER_SHARD_ID, BigInt(e)));
-    }
-
     // Anyone can call settle — pick the deployer (it's already funded).
     const nftRw = s.nft.connect(s.hubOwner) as ethers.Contract;
     const tx = await nftRw.settle(accountId, {
@@ -582,36 +626,71 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     });
     const receipt = await tx.wait();
 
-    // Parse WindowSettled events from the receipt.
+    // Parse WindowSettled + TokensAddedToEpochRange events from the
+    // settle() receipt. We assert against per-tx events instead of
+    // global `EpochStorage.getEpochPool` deltas — the pools are
+    // global on a live devnet, so any other write touching
+    // `[w0Start..w0End]` between snapshots would fail an exact-equality
+    // pool-delta assertion even when `settle()` is correct (Codex
+    // round-3 finding on PR #470).
+    const nftAddr = (await s.nft.getAddress()).toLowerCase();
+    const epsAddrLc = s.epsAddress.toLowerCase();
     let sweptForWindow0 = 0n;
     let settledWindows = 0;
+    let sweepDistributedFromEvents = 0n;
     for (const log of receipt!.logs) {
+      if (log.address.toLowerCase() === nftAddr) {
+        try {
+          const parsed = s.nft.interface.parseLog({
+            topics: log.topics as string[],
+            data: log.data,
+          });
+          if (parsed?.name === 'WindowSettled' && BigInt(parsed.args.accountId) === accountId) {
+            settledWindows++;
+            if (BigInt(parsed.args.billingWindow) === 0n) {
+              sweptForWindow0 = BigInt(parsed.args.remainder);
+            }
+          }
+        } catch { /* not from NFT */ }
+      }
+      if (log.address.toLowerCase() === epsAddrLc) {
+        try {
+          const parsed = s.eps.interface.parseLog({
+            topics: log.topics as string[],
+            data: log.data,
+          });
+          if (parsed?.name === 'TokensAddedToEpochRange') {
+            sweepDistributedFromEvents += BigInt(parsed.args.tokenAmount);
+          }
+        } catch { /* not from EpochStorage */ }
+      }
+    }
+    expect(settledWindows).toBeGreaterThanOrEqual(1);
+    expect(sweptForWindow0).toBe(expectedRemainder);
+
+    // Conservation: the sum of `tokenAmount` across all
+    // `TokensAddedToEpochRange` emits within this `settle()` receipt
+    // MUST equal the sum of `remainder` across all `WindowSettled`
+    // emits — passive sweep funds exactly the unspent base allowance
+    // for each settled window. Each window emits 1 or 2 such writes
+    // depending on chain-epoch overlap (see `_sweepWindowProrated`).
+    let sweptTotalFromWindows = 0n;
+    for (const log of receipt!.logs) {
+      if (log.address.toLowerCase() !== nftAddr) continue;
       try {
         const parsed = s.nft.interface.parseLog({
           topics: log.topics as string[],
           data: log.data,
         });
         if (parsed?.name === 'WindowSettled' && BigInt(parsed.args.accountId) === accountId) {
-          settledWindows++;
-          if (BigInt(parsed.args.billingWindow) === 0n) {
-            sweptForWindow0 = BigInt(parsed.args.remainder);
-          }
+          sweptTotalFromWindows += BigInt(parsed.args.remainder);
         }
       } catch { /* not from NFT */ }
     }
-    expect(settledWindows).toBeGreaterThanOrEqual(1);
-    expect(sweptForWindow0).toBe(expectedRemainder);
+    expect(sweepDistributedFromEvents).toBe(sweptTotalFromWindows);
 
-    // The contract called addTokensToEpochRange(STAKER_SHARD_ID, w0Start,
-    // w0End, sweptForWindow0). EpochStorage spreads the amount across the
-    // [w0Start, w0End] range evenly, so the per-epoch growth is exactly
-    // remainder for a single-epoch window or remainder split otherwise.
-    let totalPoolGrowth = 0n;
-    for (let e = w0Start; e <= w0End; e++) {
-      const after: bigint = await s.eps.getEpochPool(STAKER_SHARD_ID, BigInt(e));
-      totalPoolGrowth += after - (beforePools.get(BigInt(e)) ?? 0n);
-    }
-    expect(totalPoolGrowth).toBe(sweptForWindow0);
+    // Accumulate passive-sink total for step 6's conservation check.
+    state.passiveSinkTotal += sweptTotalFromWindows;
 
     const acctAfter = await s.nft.accounts(accountId);
     expect(Number(acctAfter.lastSettledWindow)).toBeGreaterThanOrEqual(1);
@@ -620,6 +699,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     // eslint-disable-next-line no-console
     console.log(
       `step 4: settle() swept window 0 → +${ethers.formatEther(sweptForWindow0)} TRAC across chain epochs [${w0Start},${w0End}]; ` +
+      `settledWindows=${settledWindows}, distributedFromEvents=${ethers.formatEther(sweepDistributedFromEvents)} TRAC; ` +
       `lastSettledWindow=${acctAfter.lastSettledWindow}`,
     );
   }, 240_000);
@@ -702,22 +782,67 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     }
     expect(sawFinalSweep).toBe(true);
 
-    // Conservation: sum of all WindowSettled remainders (from steps 4+6) +
-    // all CostCovered drawn amounts + AccountFinalSwept tail must equal
-    // committedTRAC (this devnet account had no topUps). We sample by
-    // reading the contract's accumulators directly.
-    const acctAfter = await s.nft.accounts(accountId);
-    expect(acctAfter.fullySwept).toBe(true);
+    // Accumulate the post-expiry passive sweeps (windows settled by
+    // this final-sweep call, e.g. windows 1..N-1 if step 4 already
+    // settled window 0).
+    state.passiveSinkTotal += sweptTotal;
 
-    // Sanity: committedDust = committedTRAC - (committedTRAC / lockDuration) * lockDuration
+    // No topUps were ever performed on this account, so the final
+    // sweep's leftoverTopUp tail MUST be exactly zero.
+    expect(leftoverTopUp).toBe(0n);
+
+    // ── CONSERVATION INVARIANT ─────────────────────────────────────
+    // For an account with no topUps, the lazy-settlement model
+    // promises:
+    //
+    //     activeSinkTotal + passiveSinkTotal + leftoverTopUp +
+    //     committedDust == committedTRAC
+    //
+    // where
+    //   - `activeSinkTotal` = sum of `CostCovered.discountedCost`
+    //     across all publishes (step 3 in this suite),
+    //   - `passiveSinkTotal` = sum of `WindowSettled.remainder`
+    //     across all settle() calls (step 4 + step 6),
+    //   - `leftoverTopUp` = `AccountFinalSwept.leftoverTopUp` (== 0
+    //     here since no topUps),
+    //   - `committedDust` = `committedTRAC %
+    //     lockDurationEpochs` (the truncation crumb in the per-window
+    //     base allowance).
+    //
+    // The contract's final sweep writes `committedDust` to the
+    // staker pool too, so this equation captures full token
+    // conservation: every wei the publisher escrowed at create has
+    // either funded the published KC (active sink) or the staker
+    // pool (passive sweeps + final dust). Asserting the equation
+    // directly is what Codex round-3 asked for — `fullySwept` and
+    // `committedDust == expectedDust` alone don't prove
+    // conservation.
     const baseAllowance = committedTRAC / BigInt(lockDurationEpochs);
     const expectedDust = committedTRAC - baseAllowance * BigInt(lockDurationEpochs);
     expect(committedDust).toBe(expectedDust);
+
+    const totalAccounted =
+      state.activeSinkTotal +
+      state.passiveSinkTotal +
+      leftoverTopUp +
+      committedDust;
+    expect(totalAccounted).toBe(committedTRAC);
+
+    const acctAfter = await s.nft.accounts(accountId);
+    expect(acctAfter.fullySwept).toBe(true);
 
     // eslint-disable-next-line no-console
     console.log(
       `step 6: final sweep: leftoverTopUp=${ethers.formatEther(leftoverTopUp)} dust=${committedDust} ` +
       `windowsSettled=[${windowsSettled.join(',')}] additionalSweptTotal=${ethers.formatEther(sweptTotal)} TRAC`,
+    );
+    // eslint-disable-next-line no-console
+    console.log(
+      `step 6: CONSERVATION: active=${ethers.formatEther(state.activeSinkTotal)} + ` +
+      `passive=${ethers.formatEther(state.passiveSinkTotal)} + ` +
+      `leftoverTopUp=${ethers.formatEther(leftoverTopUp)} + ` +
+      `dust=${committedDust} = ${ethers.formatEther(totalAccounted)} == ` +
+      `committedTRAC=${ethers.formatEther(committedTRAC)} ✓`,
     );
   }, 240_000);
 

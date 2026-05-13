@@ -1720,15 +1720,13 @@ export class DKGPublisher implements Publisher {
     // `packages/core/src/crypto/ack.ts:computePublishACKDigest` and
     // `KnowledgeAssetsV10._executePublishCore`.
     //
-    // PCA strict-equality (`KnowledgeAssetsV10.publish` -> `PCAEpochsMismatch`):
-    // when the publishing wallet is registered as a PCA agent, the
-    // contract REQUIRES `p.epochs == lockDurationEpochs`. The PCA
-    // escrow was sized as `committedTRAC / lockDurationEpochs` per
-    // billing window and the discount tier was paid for that exact
-    // lifetime; any other value either orphans escrow vs the active
-    // sink or extends the active sink past the escrow runway. We
-    // mirror the contract's decision off-chain: probe for a PCA
-    // mapping and snap `publishEpochs` to the PCA's
+    // PCA discount eligibility (`KnowledgeAssetsV10.publish`): the
+    // contract takes the PCA branch only when (1) the wallet is a
+    // registered PCA agent, (2) the PCA is not expired, AND
+    // (3) `p.epochs == lockDurationEpochs`. Any miss silently falls
+    // through to direct spend at FULL price. To make sure registered
+    // agents actually get the discount they paid for, we probe for the
+    // PCA mapping and snap `publishEpochs` to the PCA's
     // `lockDurationEpochs` when one is found. Wallets without a PCA
     // (direct-spend branch) keep the default lifetime of `1` epoch.
     let publishEpochs = 1;
@@ -1752,10 +1750,13 @@ export class DKGPublisher implements Publisher {
         }
       } catch (err) {
         // PCA probe is best-effort. On any RPC hiccup we keep the
-        // default; the contract is still the source of truth and
-        // will revert with `PCAEpochsMismatch` if the signer is
-        // actually a PCA agent — the caller sees a clear chain error
-        // instead of a silent under-funded publish.
+        // default `publishEpochs=1`. The contract is still the source
+        // of truth: if the signer turns out to be a PCA agent but
+        // `p.epochs != lockDurationEpochs`, the publish silently
+        // falls through to direct spend at full price (no revert).
+        // That degraded path is acceptable for a hot publish — the
+        // missed discount is observable via the lack of a
+        // `CostCovered` event on the receipt.
         this.log.warn(
           ctx,
           `PCA epochs probe failed — falling back to publishEpochs=1: ` +

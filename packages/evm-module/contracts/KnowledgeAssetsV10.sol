@@ -267,21 +267,6 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
     ///      the CG because the CG value ledger needs the target cgId.
     error MissingContextGraphBinding(uint256 kcId);
 
-    /// @dev PCA-funded publish was submitted with `p.epochs` that does not
-    ///      match the publishing agent's PCA `lockDurationEpochs`. The
-    ///      escrow is sized as `committedTRAC / lockDurationEpochs` per
-    ///      billing window, and the discount tier was paid for a KC
-    ///      lifetime of exactly `lockDurationEpochs`; allowing
-    ///      `kcEpochs < lockDurationEpochs` would orphan a window's
-    ///      passive remainder against an under-lived KC, and
-    ///      `kcEpochs > lockDurationEpochs` would extend the active sink
-    ///      past the escrow horizon. Strict equality keeps the
-    ///      conviction-funded reward curve aligned with the commit.
-    ///      Note: only enforced on `publish()`. `update()` legitimately
-    ///      passes the KC's REMAINING lifetime (a delta), which can be
-    ///      any value `1..lockDurationEpochs`.
-    error PCAEpochsMismatch(uint256 expectedLockDurationEpochs, uint256 actualKcEpochs);
-
     constructor(address hubAddress) ContractStatus(hubAddress) {}
 
     function initialize() public onlyHub {
@@ -344,16 +329,22 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
      * coverage:
      *
      * - **Discount branch** — taken when `msg.sender` is registered as an
-     *   agent on any active publisher conviction account
-     *   (`agentToAccountId[msg.sender] != 0`). The NFT contract is the
-     *   funding agent on this branch: `coverPublishingCost` deducts the
-     *   discounted cost from the account's current billing-window budget
-     *   (or top-up buffer), distributes that cost across the published KC's
-     *   epoch range via `EpochStorage.addTokensToEpochRange` (active sink),
-     *   and lazily settles any elapsed billing windows by sweeping their
-     *   unspent base remainder to the staker pool (passive sink). KAv10
+     *   agent on a PCA whose escrow is still active AND whose
+     *   `lockDurationEpochs` exactly matches `p.epochs`. The NFT contract
+     *   is the funding agent on this branch: `coverPublishingCost`
+     *   deducts the discounted cost from the account's current
+     *   billing-window budget (or top-up buffer), distributes that cost
+     *   across the published KC's epoch range via
+     *   `EpochStorage.addTokensToEpochRange` (active sink), and lazily
+     *   settles any elapsed billing windows by sweeping their unspent
+     *   base remainder to the staker pool (passive sink). KAv10
      *   therefore MUST NOT call `_distributeTokens` here — the NFT has
      *   already accounted for staker rewards directly.
+     *
+     *   A stale agent registration (PCA expired) or a publish submitted
+     *   with the wrong epoch count silently falls through to direct
+     *   spend at full price — eligibility is a discount opt-in, never a
+     *   hard gate that bricks the publisher.
      *
      * - **Direct-spend branch** — taken otherwise. Pulls TRAC from
      *   `msg.sender`'s wallet via `transferFrom` and distributes it across
@@ -374,28 +365,39 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
         uint40 currentEpoch;
         (currentEpoch, kcId) = _executePublishCore(p);
 
+        // PCA branch eligibility:
+        //   (1) `msg.sender` is registered as an agent on a PCA,
+        //   (2) the PCA is NOT past its expiry timestamp,
+        //   (3) `p.epochs == lockDurationEpochs` (the discount tier was
+        //       paid up-front for a KC lifetime of exactly that many
+        //       epochs; anything shorter would orphan post-KC windows
+        //       against passive sweeps, anything longer would extend the
+        //       active sink past the escrow runway).
+        //
+        // ALL three must hold to take the PCA path. If any fails, the
+        // publisher falls through to direct spend at full price — a
+        // stale agent registration on an expired PCA, or a publish
+        // submitted with the wrong epoch count, MUST NOT brick the
+        // publisher (Codex round-3 finding on PR #470). `update()`
+        // has a parallel gate (with `<=` instead of `==` since update
+        // legitimately passes the KC's remaining lifetime, a delta).
         uint256 convictionAccountId = publishingConvictionNFT.agentToAccountId(msg.sender);
+        bool useConviction;
         if (convictionAccountId != 0) {
-            // Discount branch. The PCA escrow is sized as
-            // `committedTRAC / lockDurationEpochs` per billing window and
-            // the discount tier was paid up-front for a KC lifetime of
-            // exactly `lockDurationEpochs`. Force the published KC to live
-            // for that same horizon — anything shorter would orphan
-            // post-KC windows against passive sweeps, anything longer
-            // would extend the active sink past the escrow runway.
-            // `update()` does NOT enforce this: it legitimately passes
-            // `remainingEpochs` (a delta), which is bounded above by
-            // `lockDurationEpochs` inside `coverPublishingCost`.
-            (,,,,, uint16 lockDurationEpochs,,,) = publishingConvictionNFT.accounts(convictionAccountId);
-            if (p.epochs != uint256(lockDurationEpochs)) {
-                revert PCAEpochsMismatch(uint256(lockDurationEpochs), p.epochs);
-            }
-            // The NFT auto-resolves the paying account from
-            // `agentToAccountId[msg.sender]`, deducts the discounted cost,
-            // distributes it across the KC's epoch range (active sink),
-            // and lazily settles any elapsed billing windows (passive
-            // sink). KAv10 MUST NOT call `_distributeTokens` here — the
-            // NFT is the funding agent on this branch.
+            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,) =
+                publishingConvictionNFT.accounts(convictionAccountId);
+            useConviction =
+                block.timestamp < uint256(expiresAtTimestamp) &&
+                p.epochs == uint256(lockDurationEpochs);
+        }
+
+        if (useConviction) {
+            // Discount branch. The NFT auto-resolves the paying account
+            // from `agentToAccountId[msg.sender]`, deducts the discounted
+            // cost, distributes it across the KC's epoch range (active
+            // sink), and lazily settles any elapsed billing windows
+            // (passive sink). KAv10 MUST NOT call `_distributeTokens`
+            // here — the NFT is the funding agent on this branch.
             publishingConvictionNFT.coverPublishingCost(
                 msg.sender,
                 p.tokenAmount,
@@ -887,23 +889,42 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
     /**
      * @notice Update a knowledge collection (RFC-001: unified entrypoint).
      *
-     * Mirrors the unified `publish`: branches on
-     * `agentToAccountId[msg.sender]` to pick discount vs direct-spend cost
-     * coverage. Metadata-only updates (`delta == 0`) skip cost coverage
-     * entirely on either branch.
+     * Mirrors the unified `publish`: takes the PCA discount branch when
+     * `msg.sender` is a registered agent on an active PCA whose
+     * `lockDurationEpochs >= remainingEpochs`; otherwise falls through to
+     * direct spend. Metadata-only updates (`delta == 0`) skip cost
+     * coverage entirely on either branch.
      */
     function update(UpdateParams calldata p) external {
         (uint96 deltaTokenAmount, uint40 remainingEpochs, uint40 currentEpoch) = _executeUpdateCore(p);
 
         if (deltaTokenAmount == 0) return;
 
-        if (publishingConvictionNFT.agentToAccountId(msg.sender) != 0) {
+        // PCA branch eligibility (mirrors `publish()`, with `<=` for the
+        // epoch count since `update()` passes the KC's REMAINING lifetime,
+        // a delta bounded above by `lockDurationEpochs`):
+        //   (1) `msg.sender` is registered as an agent on a PCA,
+        //   (2) the PCA is NOT past its expiry timestamp,
+        //   (3) `remainingEpochs <= lockDurationEpochs`.
+        // Otherwise fall through to direct spend so a stale agent
+        // registration / expired PCA / over-large remaining lifetime
+        // cannot brick `update()` (Codex round-3 finding on PR #470).
+        uint256 convictionAccountId = publishingConvictionNFT.agentToAccountId(msg.sender);
+        bool useConviction;
+        if (convictionAccountId != 0) {
+            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,) =
+                publishingConvictionNFT.accounts(convictionAccountId);
+            useConviction =
+                block.timestamp < uint256(expiresAtTimestamp) &&
+                remainingEpochs <= uint40(lockDurationEpochs);
+        }
+
+        if (useConviction) {
             // Discount branch — delta funds the KC's REMAINING epoch range
             // `[currentEpoch, currentEpoch + remainingEpochs - 1]` via the
-            // active sink. NFT enforces `remainingEpochs <=
-            // lockDurationEpochs` internally; the active sink may extend
-            // past the conviction account's `expiresAtEpoch` (harmless —
-            // the staker pool just gets funded normally for those epochs).
+            // active sink. The active sink may extend past the conviction
+            // account's `expiresAtEpoch` (harmless — the staker pool just
+            // gets funded normally for those epochs).
             publishingConvictionNFT.coverPublishingCost(
                 msg.sender,
                 deltaTokenAmount,

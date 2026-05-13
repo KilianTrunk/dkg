@@ -103,12 +103,13 @@ log "Round $ROUND, duration ${DURATION_SEC}s, output dir $OUT_DIR"
   || fail "devnet not running — start with ./scripts/devnet.sh start $NUM_NODES"
 
 # Surface the deployed Chronos.epochLength so the operator knows whether epoch
-# transitions are observable inside the soak window. The default development
-# value (2,592,000s = 30 days) means a 2h soak NEVER crosses an epoch boundary,
-# which suppresses both `setNetNodeEpochRewards` and delegator-roll updates.
-# Patch packages/evm-module/deployments/parameters.json -> development.Chronos
-# .epochLength to e.g. 1800 then `./scripts/devnet.sh clean && ./scripts/devnet
-# .sh start 6` if you want to observe distribution during the soak.
+# transitions are observable inside the soak window. EPOCH_LENGTH is set in the
+# Chronos constructor (immutable post-deploy), so to shorten it we have to
+# bounce the devnet: patch packages/evm-module/deployments/parameters.json ->
+# development.Chronos.epochLength to e.g. 1800, then
+#   ./scripts/devnet.sh clean && ./scripts/devnet.sh start 6
+# We deliberately do NOT touch parameters.json from this script — it is in the
+# Solidity test path and shipping a patched value would break unrelated CI.
 EPOCH_LEN_SEC=$(node -e '
 const { ethers } = require("ethers");
 const fs = require("fs");
@@ -119,9 +120,15 @@ const fs = require("fs");
   console.log((await ch.epochLength()).toString());
 })().catch(()=>console.log("?"));
 ' 2>/dev/null || echo "?")
-if [ "$EPOCH_LEN_SEC" != "?" ] && [ "$EPOCH_LEN_SEC" -gt "$DURATION_SEC" ] 2>/dev/null; then
-  expected_epochs=$((DURATION_SEC / EPOCH_LEN_SEC))
-  log "  Chronos.epochLength=${EPOCH_LEN_SEC}s; with duration=${DURATION_SEC}s expect ${expected_epochs} epoch transitions (rewards distribute on transition)."
+if [ "$EPOCH_LEN_SEC" != "?" ]; then
+  if [ "$EPOCH_LEN_SEC" -gt "$DURATION_SEC" ] 2>/dev/null; then
+    log "  Chronos.epochLength=${EPOCH_LEN_SEC}s > duration=${DURATION_SEC}s — soak will NOT observe an epoch transition."
+    log "  Reward distribution (setNetNodeEpochRewards / delegator-roll updates) only fires at epoch finalize."
+    log "  To observe rewards: edit packages/evm-module/deployments/parameters.json development.Chronos.epochLength to e.g. 1800, then clean + restart devnet."
+  else
+    expected_epochs=$((DURATION_SEC / EPOCH_LEN_SEC))
+    log "  Chronos.epochLength=${EPOCH_LEN_SEC}s; with duration=${DURATION_SEC}s expect ~${expected_epochs} epoch transitions (rewards distribute on transition)."
+  fi
 fi
 [ -f "$CONTRACTS_JSON" ] || fail "missing $CONTRACTS_JSON"
 [ -f "$CLI_JS" ]         || fail "missing $CLI_JS (run pnpm run build)"

@@ -32,22 +32,57 @@ describe('ProtocolRouter.send + PeerResolver', () => {
     return n;
   }
 
-  it('calls resolver.resolve(peerId) before dialing', async () => {
+  it('primes peerStore via resolver BEFORE dialProtocol on a cold peer', async () => {
+    // Codex feedback PR #497 round 3: the previous version of this
+    // test pre-warmed the connection (a.libp2p.dial(b)) before
+    // routerA.send(), so router.send() could succeed even if the
+    // resolver was never consulted before the first dial. Without a
+    // cold peer + an explicit "resolver-must-have-primed-peerStore"
+    // assertion, the test didn't actually prove the PR-448-class
+    // guarantee that the resolver primes peerStore before
+    // dialProtocol.
+    //
+    // This rewrite:
+    //   - keeps the peers cold (no pre-dial, no mDNS)
+    //   - asserts peerStore for B is empty BEFORE routerA.send()
+    //   - wires the resolver to populate peerStore with B's real addr
+    //     when called
+    //   - succeeds in sending, which is only possible if the
+    //     resolver ran before dialProtocol (otherwise libp2p would
+    //     have no addr to dial)
+    //   - asserts peerStore for B is populated AFTER send
+    //
+    // No `dialProtocol` instrumentation is needed — the
+    // "send-succeeded-against-cold-peerStore" property is the
+    // structural proof of ordering.
     const a = spawn();
     const b = spawn();
     await a.start();
     await b.start();
-    await a.libp2p.dial(multiaddr(b.multiaddrs[0]));
-    await new Promise((r) => setTimeout(r, 300));
 
-    const resolveSpy = vi.fn(async () => []);
     const networkA = new LibP2PNetwork(a);
+    const { peerIdFromString } = await import('@libp2p/peer-id');
+    const bPeerIdObj = peerIdFromString(b.peerId);
+    const peerstoreAddrCount = async (): Promise<number> => {
+      try {
+        const peer = await a.libp2p.peerStore.get(bPeerIdObj);
+        return peer.addresses.length;
+      } catch {
+        return 0;
+      }
+    };
+
+    expect(await peerstoreAddrCount()).toBe(0);
+
+    const resolveSpy = vi.fn(async (_peerId, _opts) => {
+      await networkA.addKnownAddresses(b.peerId, [b.multiaddrs[0]]);
+      return [b.multiaddrs[0]];
+    });
     const resolver = new PeerResolver({
       network: networkA,
       registry: new StubNetworkStateRegistry(),
       agentDirectory: { findRelayForPeer: async () => null },
     });
-    // Replace resolve with the spy so we can observe call order.
     resolver.resolve = resolveSpy as unknown as typeof resolver.resolve;
 
     const routerA = new ProtocolRouter(a, { peerResolver: resolver });
@@ -66,9 +101,45 @@ describe('ProtocolRouter.send + PeerResolver', () => {
     );
     expect(dec.decode(response)).toBe('echo:hi');
     expect(resolveSpy).toHaveBeenCalledOnce();
-    // Codex feedback on PR #497: resolver receives the AbortSignal +
-    // remaining time budget so a caller's `timeoutMs` bounds the
-    // entire send (resolver + dial), not just the dial loop.
+    expect(await peerstoreAddrCount()).toBeGreaterThan(0);
+
+    // Brief settle so libp2p teardown doesn't race the next test.
+    await new Promise((r) => setTimeout(r, 50));
+  }, 15000);
+
+  it('passes AbortSignal + perStepTimeoutMs to resolver (PR #497 round 1)', async () => {
+    // Separate from the call-ordering test above so each test asserts
+    // one property. Pre-warming the connection here is fine — we're
+    // testing what arguments the resolver receives, not the priming
+    // side-effect.
+    const a = spawn();
+    const b = spawn();
+    await a.start();
+    await b.start();
+    await a.libp2p.dial(multiaddr(b.multiaddrs[0]));
+    await new Promise((r) => setTimeout(r, 300));
+
+    const resolveSpy = vi.fn(async () => []);
+    const networkA = new LibP2PNetwork(a);
+    const resolver = new PeerResolver({
+      network: networkA,
+      registry: new StubNetworkStateRegistry(),
+      agentDirectory: { findRelayForPeer: async () => null },
+    });
+    resolver.resolve = resolveSpy as unknown as typeof resolver.resolve;
+
+    const routerA = new ProtocolRouter(a, { peerResolver: resolver });
+    const routerB = new ProtocolRouter(b);
+
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+    routerB.register('/test/resolver-args/1.0.0', async (data) => {
+      return enc.encode(`echo:${dec.decode(data)}`);
+    });
+
+    await routerA.send(b.peerId, '/test/resolver-args/1.0.0', enc.encode('hi'));
+
+    expect(resolveSpy).toHaveBeenCalledOnce();
     const callArgs = resolveSpy.mock.calls[0];
     expect(callArgs[0]).toBe(b.peerId);
     const opts = callArgs[1] as { signal?: AbortSignal; perStepTimeoutMs?: number };

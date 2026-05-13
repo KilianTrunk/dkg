@@ -94,6 +94,11 @@ export class MockChainAdapter implements ChainAdapter {
   /** Configurable minimum receiver signatures. When > 0, publishKnowledgeAssets will check the count. Default: 1. */
   minimumRequiredSignatures = 1;
 
+  // RFC 04 v0.3 / Issue #461 — in-memory mirror of ProfileStorage's
+  // relay-capability flag. Keyed by identityId (bigint) to match the
+  // on-chain shape. Multiaddrs are not stored on Profile (RFC 04 §5.2).
+  private relayCapableByIdentity = new Map<bigint, boolean>();
+
   constructor(chainId = 'mock:31337', signerAddress = MOCK_DEFAULT_SIGNER) {
     this.chainId = chainId;
     this.signerAddress = signerAddress;
@@ -144,6 +149,30 @@ export class MockChainAdapter implements ChainAdapter {
    */
   allowPublisherAddress(address: string): void {
     this.allowedPublisherAddresses.add(ethers.getAddress(address).toLowerCase());
+  }
+
+  // --- RFC 04 v0.3 / Issue #461 — Network State Registry surface ---
+  //
+  // Reads return false for unknown identities, matching Solidity's
+  // zero-init mapping behaviour.
+
+  async getRelayCapable(identityId: bigint): Promise<boolean> {
+    return this.relayCapableByIdentity.get(identityId) ?? false;
+  }
+
+  async setRelayCapable(relayCapable: boolean): Promise<TxResult> {
+    const identityId = await this.getIdentityId();
+    if (identityId === 0n) {
+      throw new Error('setRelayCapable: signer has no profile (call ensureProfile first).');
+    }
+    const oldValue = this.relayCapableByIdentity.get(identityId) ?? false;
+    this.relayCapableByIdentity.set(identityId, relayCapable);
+    this.pushEvent('RelayCapabilityUpdated', {
+      identityId: identityId.toString(),
+      oldValue,
+      newValue: relayCapable,
+    });
+    return this.txResult(true);
   }
 
   // --- V9 UAL-based methods ---

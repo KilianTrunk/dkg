@@ -4013,20 +4013,26 @@ export class DKGAgent {
    * Errors:
    *   - `INVALID_PEER_ID` — client-side parse failure (HTTP 400).
    *   - `SELF_DIAL` — caller asked us to dial our own peer id (HTTP 400).
-   *   - `PEER_NOT_FOUND` — resolver returned no addresses (DHT miss AND
-   *     no agents-CG record). Genuine negative lookup → HTTP 404.
+   *   - `CONNECT_TIMEOUT` — caller's `timeoutMs` elapsed mid-resolution
+   *     (the shared AbortSignal fired). Retriable → HTTP 504.
+   *   - `PEER_NOT_FOUND` — resolver completed without aborting and
+   *     returned no addresses (DHT miss AND no agents-CG record).
+   *     Genuine negative lookup → HTTP 404.
    *     Retrying is unlikely to help until the remote node republishes.
    *   - `DIAL_FAILED` — resolver returned addresses but every dial attempt
    *     failed. Retriable transport-level → HTTP 502.
    *
    * Note (regression vs PR #431): the previous implementation distinguished
    * `DHT_TIMEOUT` (504) and `DHT_UNAVAILABLE` (503) from `PEER_NOT_FOUND`
-   * because the inline walk surfaced the underlying failure shape. The
-   * resolver is best-effort and swallows per-step errors (it returns an
-   * empty array on miss). Both transient cases now collapse into `404`.
-   * The 502 (addresses found, dial failed) distinction is preserved.
-   * If reviewers want the 503/504 codes back, the follow-up is to add a
-   * `resolveWithDiagnostics` method to PeerResolver — out of scope here.
+   * because the inline walk surfaced the underlying per-step failure shape.
+   * The resolver is best-effort and swallows per-step errors (returns `[]`
+   * on miss). Codex review feedback on PR #499 round 5: at minimum the
+   * timeout/aborted case must NOT collapse into 404, since `/api/connect`
+   * upstream maps 404 to a terminal "wrong peer id" outcome and 504 to
+   * retriable infrastructure errors. We split out aborted-signal → 504
+   * here; the more granular 503 (DHT specifically unavailable but other
+   * steps not exhausted) still requires a `resolveWithDiagnostics` API
+   * on PeerResolver and is left as a follow-up — see RFC 07 §3.3.
    */
   async connectToPeerId(peerIdStr: string, options?: { timeoutMs?: number }): Promise<void> {
     const ctx = createOperationContext('connect');
@@ -4073,6 +4079,21 @@ export class DKGAgent {
       perStepTimeoutMs: Math.max(0, timeoutMs - (Date.now() - startedAt)),
     });
     if (addrs.length === 0) {
+      // Codex PR #499 round 5: distinguish "abort/timeout swallowed by
+      // best-effort resolver" from "genuine negative lookup". Without
+      // this, transient routing failures (DHT timeout, network blip)
+      // surface as 404 PEER_NOT_FOUND in /api/connect — which the UI
+      // treats as terminal. Mapping aborted-signal → CONNECT_TIMEOUT
+      // (504) preserves the retriable-vs-terminal distinction that
+      // PR #431's inline walk had.
+      if (signal.aborted) {
+        const error = new Error(
+          `CONNECT_TIMEOUT: PeerResolver did not return addresses for ${peerIdStr} ` +
+            `within ${timeoutMs}ms (caller signal aborted; transient routing failure)`,
+        );
+        (error as any).code = 'CONNECT_TIMEOUT';
+        throw error;
+      }
       const error = new Error(
         `PEER_NOT_FOUND: PeerResolver returned no addresses for ${peerIdStr}`,
       );

@@ -18,6 +18,7 @@ import { peerIdFromString } from '@libp2p/peer-id';
 import { ed25519GetPublicKey } from './crypto/ed25519.js';
 import type { ConnectionTransport, DKGNodeConfig } from './types.js';
 import { DHT_PROTOCOL, DKG_GOSSIP_MAX_RPC_BYTES } from './constants.js';
+import { dkgGossipMsgId } from './network/gossip-msg-id.js';
 
 export interface DKGServices extends Record<string, unknown> {
   dht: KadDHT;
@@ -169,6 +170,13 @@ export class DKGNode {
         D: 4,
         Dlo: 2,
         Dhi: 8,
+        // RFC 07 §5.4 — content-deterministic msgId so any future
+        // gossip backend can dedup against libp2p-gossipsub without
+        // protocol-level cooperation. Behaviour-invisible today
+        // (replaces the upstream signed/unsigned defaults with a
+        // single sha256-of-content); locks in the constant before
+        // a second backend exists.
+        msgIdFn: dkgGossipMsgId,
       }),
       dcutr: dcutr(),
     };

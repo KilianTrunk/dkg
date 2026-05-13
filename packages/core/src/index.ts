@@ -21,6 +21,7 @@ export {
   type PeerResolverLogger,
   type ResolveOpts,
   PeerResolver,
+  dkgGossipMsgId,
 } from './network/index.js';
 export {
   ProtocolRouter,

@@ -321,13 +321,22 @@ jobs:
 
             PACKAGE_LIST+="- \`${NAME}\` ${OLD:-?} → ${NEW:-?} (\`${ECO}\`)"$'\n'
 
-            # Defensive: if Dependabot metadata is missing the new
-            # version we cannot meaningfully evaluate this entry —
-            # force the verdict to inconclusive (red check, manual
-            # review) rather than silently passing.
-            if [ -z "${NEW}" ]; then
+            # Defensive: the fresh-vs-baseline diff requires BOTH versions.
+            # Missing NEW → can't even know what to query for.
+            # Missing OLD → every advisory would compute as matchesOld=false
+            #               and the diff would (incorrectly) treat every
+            #               baseline CVE as fresh, auto-closing a safe
+            #               upgrade as "compromised". This is the failure
+            #               mode that motivates failing closed here rather
+            #               than letting either case fall through.
+            if [ -z "${NEW}" ] || [ -z "${OLD}" ]; then
               INCONCLUSIVE=true
-              echo "::warning title=Missing newVersion::${NAME} has no newVersion in Dependabot metadata; manual review required."
+              if [ -z "${NEW}" ]; then
+                echo "::warning title=Missing newVersion::${NAME} has no newVersion in Dependabot metadata; manual review required."
+              fi
+              if [ -z "${OLD}" ]; then
+                echo "::warning title=Missing oldVersion::${NAME} has no previousVersion in Dependabot metadata; cannot compute fresh-vs-baseline diff. Manual review required."
+              fi
               continue
             fi
 
@@ -553,12 +562,28 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Post compromise comment + labels + request changes + close
-        # The full compromise response, ordered so the *visible* steps
-        # land first (comment, labels) even if a later step fails.
-        # Auto-close is last so the workflow doesn't lose access to a
-        # closed PR mid-sequence.
+      # ──────────────────────────────────────────────────────────────────────
+      # COMPROMISE RESPONSE — split into independent steps so a transient
+      # failure in any one of them does not abort the others. The previous
+      # revision bundled comment + labels + review into a single `set -euo
+      # pipefail` shell block; a single `gh pr comment` network blip would
+      # then short-circuit the labels, review, close, AND Teams alert,
+      # leaving a compromised PR open without the merge-block badge. With
+      # the response split, each step has its own error boundary and the
+      # auto-close + dynamic check-name backstop always run.
+      # All compromise-response steps carry `continue-on-error: true` so
+      # the workflow drives to completion no matter which individual call
+      # fails. The final `Final gate` step at the end of the job still
+      # exits non-zero on `compromised == true`, so the overall check is
+      # red whether or not every individual response action succeeded.
+      # ──────────────────────────────────────────────────────────────────────
+
+      - name: Post compromise comment
+        # Visible in-PR record first. Even if every other step in the
+        # response failed, this comment alone tells reviewers why the
+        # gate fired and what advisories matched.
         if: steps.classify.outputs.compromised == 'true'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -567,12 +592,9 @@ jobs:
           ADV_TABLE: ${{ steps.classify.outputs.advisory_summary }}
         run: |
           set -euo pipefail
-
-          # 1) Giant red comment first — even if a later API call fails
-          #    the PR has an unambiguous in-thread record of WHY the bot
-          #    intervened. Composed as a single block redirect so the
-          #    heredoc literal blocks and the printf'd dynamic content
-          #    land in one file open (matches shellcheck SC2129).
+          # One block-redirect so the heredoc literal sections and the
+          # printf'd dynamic content land in a single file open
+          # (matches the SC2129 shellcheck guidance).
           {
             cat <<'MARKER_EOF'
           # 🚨 DO NOT MERGE — COMPROMISED DEPENDENCY DETECTED 🚨
@@ -614,18 +636,37 @@ jobs:
           } > /tmp/comment.md
           gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file /tmp/comment.md
 
-          # 2) Labels — created on the fly if they don't exist. We
-          #    don't fail the step on label-create errors (a label
-          #    already existing is a normal case and returns non-zero).
+      - name: Apply compromise labels
+        # Visual signal in the PR list view. `gh label create` returns
+        # non-zero on already-exists so each create is allowed to fail
+        # silently; the `gh pr edit --add-label` call is what matters
+        # and it carries its own error tolerance via continue-on-error.
+        if: steps.classify.outputs.compromised == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
           for lbl in compromised do-not-merge security; do
             gh label create "${lbl}" --repo "${REPO}" --color D00000 --description 'Applied automatically by dependabot-advisory.yml' >/dev/null 2>&1 || true
           done
           gh pr edit "${PR_NUMBER}" --repo "${REPO}" --add-label 'compromised,do-not-merge,security'
 
-          # 3) Request-changes review from the bot. This shows the
-          #    yellow "Changes requested — merging blocked" badge on
-          #    the PR even without branch-protection rules.
-          gh pr review "${PR_NUMBER}" --repo "${REPO}" --request-changes --body 'Compromised dependency detected by automated advisory gate. See pinned comment for advisory IDs and remediation steps. Do not merge.' || true
+      - name: Post request-changes review
+        # Flips GitHub's merge button to "Changes requested — merging is
+        # blocked" even on repos without a branch-protection ruleset
+        # naming this check as required.
+        if: steps.classify.outputs.compromised == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh pr review "${PR_NUMBER}" --repo "${REPO}" --request-changes --body 'Compromised dependency detected by automated advisory gate. See pinned comment for advisory IDs and remediation steps. Do not merge.'
 
       - name: Send Teams notification
         # Best-effort. Only fires on confirmed compromise (per spec —
@@ -708,8 +749,12 @@ jobs:
         # Last action of the compromise response. By this point the
         # PR has a visible red comment, three labels, and a
         # request-changes review. Closing it now ensures the merge
-        # button is disabled.
+        # button is disabled. `continue-on-error: true` so a transient
+        # close failure does not skip the `Final gate` step below;
+        # the request-changes review already blocks merge by itself
+        # and the dynamic "DO NOT MERGE" check name still fires.
         if: steps.classify.outputs.compromised == 'true'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}

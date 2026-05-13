@@ -913,9 +913,15 @@ if (edgeViolations === 0) {
 //    netNodeEpochRewards is computed lazily on first claim (StakingV10
 //    setNetNodeEpochRewards path) — it can stay 0 even when rewards have
 //    fully accrued in scorePerStake. Do NOT fail on it; just report.
-const epochsTransitioned = stakeAfter.epoch > stakeBefore.epoch;
+// `.epoch` arrives as a string from the JSON snapshot; bare `>` does
+// lexicographic comparison, so "13" > "8" returns false. R2 hit this and
+// reported "no epoch transition" even though 8 -> 13 had happened. Use
+// BigInt for a correct numeric comparison.
+const epochBefore = BigInt(stakeBefore.epoch);
+const epochAfter  = BigInt(stakeAfter.epoch);
+const epochsTransitioned = epochAfter > epochBefore;
 if (epochsTransitioned && scoreEvents.length > 0) {
-  ok.push("REWARDS-LIVENESS " + (stakeAfter.epoch - stakeBefore.epoch) + " epoch transition(s) and " + scoreEvents.length + " on-chain score events captured");
+  ok.push("REWARDS-LIVENESS " + (epochAfter - epochBefore) + " epoch transition(s) and " + scoreEvents.length + " on-chain score events captured");
 } else if (!epochsTransitioned) {
   warn.push("REWARDS-LIVENESS no epoch transition observed — reduce Chronos.epochLength to see distribution");
 }

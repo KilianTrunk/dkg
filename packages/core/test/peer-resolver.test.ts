@@ -202,6 +202,26 @@ describe('PeerResolver', () => {
     expect(out).toEqual(['/ip4/1.2.3.4/tcp/9090']);
   });
 
+  it('step 1 (Codex PR #496 r2): live-conn lookup throwing does not abort resolution', async () => {
+    // Simulates `network.getConnections(peerId)` throwing on a malformed
+    // peerId — which LibP2PNetwork does today by calling peerIdFromString.
+    const throwingNet: typeof net = makeNetwork();
+    throwingNet.getConnections = () => {
+      throw new Error('peerIdFromString boom');
+    };
+    throwingNet.__findPeerImpl = async () => ['/ip4/1.2.3.4/tcp/9090'];
+
+    const resolver = new PeerResolver({
+      network: throwingNet,
+      registry,
+      agentDirectory: makeAgentDir(),
+    });
+    const out = await resolver.resolve(PEER_B);
+
+    // Falls through cleanly to step 2.
+    expect(out).toEqual(['/ip4/1.2.3.4/tcp/9090']);
+  });
+
   it('step 3 (Codex PR #496 feedback): registry throwing does not abort resolution', async () => {
     net.__findPeerImpl = async () => [];
     const throwingRegistry: NetworkStateRegistry = {

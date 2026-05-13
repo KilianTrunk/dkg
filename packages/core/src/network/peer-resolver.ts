@@ -123,10 +123,24 @@ export class PeerResolver {
     // Step 1: active-connection cache. Sub-millisecond. If a live
     // connection exists the caller will reuse it via libp2p
     // connection-deduplication; no need to walk further.
-    const live = this.network.getConnections(peerId);
-    if (live.length > 0) {
-      append(live.map((c) => c.remoteAddr.toString()));
-      return accumulated;
+    //
+    // Codex feedback on PR #496: `getConnections(peerId)` calls
+    // `peerIdFromString(peerId)` under the hood (via LibP2PNetwork)
+    // and that throws on a malformed peerId. The class doc-comment
+    // promises `resolve()` never throws, so wrap step 1 in the same
+    // best-effort handler the later steps use. A bad peerId then
+    // falls through, every later step fails identically, and the
+    // resolver returns []. Callers downstream (e.g. ProtocolRouter
+    // and connectToPeerId) get a clean DIAL_FAILED / PEER_NOT_FOUND
+    // instead of an unhandled exception.
+    try {
+      const live = this.network.getConnections(peerId);
+      if (live.length > 0) {
+        append(live.map((c) => c.remoteAddr.toString()));
+        return accumulated;
+      }
+    } catch (err) {
+      this.logger.debug?.(`live-conn lookup for ${peerId} failed: ${errMsg(err)}`);
     }
 
     // Step 2: DHT lookup. Cheap for peers in the routing table;

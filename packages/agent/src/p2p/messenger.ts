@@ -53,7 +53,24 @@ export class Messenger {
     // a real transport error from dialProtocol if the peer is
     // unreachable, and the resolver itself never throws on resolution
     // failure (it returns an empty array).
-    await this.resolver.resolve(peerId).catch(() => undefined);
+    //
+    // Codex feedback on PR #496: pass `opts.timeoutMs` through so the
+    // resolver's per-step DHT walk doesn't run unbounded against a
+    // cold peer when the caller explicitly asked for a short send
+    // budget. Note: PR-3 of the RFC 07 stack moves the resolver call
+    // into ProtocolRouter and removes this inline call entirely;
+    // until then the budget passthrough keeps PR #496 sound on its
+    // own merits.
+    if (opts.timeoutMs != null) {
+      await this.resolver
+        .resolve(peerId, {
+          signal: AbortSignal.timeout(opts.timeoutMs),
+          perStepTimeoutMs: opts.timeoutMs,
+        })
+        .catch(() => undefined);
+    } else {
+      await this.resolver.resolve(peerId).catch(() => undefined);
+    }
     return this.router.send(peerId, protocolId, data, opts.timeoutMs);
   }
 }

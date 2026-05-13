@@ -37,6 +37,22 @@ interface IDKGPublishingConvictionNFT {
     ///      use try/catch to distinguish "no such account" from a live miss.
     function ownerOf(uint256 accountId) external view returns (address);
 
+    /// @notice Returns a conviction account tuple by id.
+    function accounts(
+        uint256 accountId
+    )
+        external
+        view
+        returns (
+            uint96 committedTRAC,
+            uint40 createdAtEpoch,
+            uint40 expiresAtEpoch,
+            uint40 createdAtTimestamp,
+            uint40 expiresAtTimestamp,
+            uint16 lockDurationEpochs,
+            uint16 discountBps
+        );
+
     /// @notice Spend a publishing agent's conviction allowance for a base cost.
     /// @dev Caller MUST be `KnowledgeAssetsV10` — the NFT gates this via Hub
     ///      lookup. The NFT resolves the paying account internally from

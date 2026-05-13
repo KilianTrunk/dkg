@@ -196,6 +196,7 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
     error ZeroAddressDependency(string name);
     error ZeroContextGraphId();
     error ZeroEpochs();
+    error InvalidPublishingConvictionEpochs(uint256 expectedEpochs, uint256 providedEpochs);
 
     // --- RFC-001 author attestation errors ---
 
@@ -354,7 +355,15 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
         uint40 currentEpoch;
         (currentEpoch, kcId) = _executePublishCore(p);
 
-        if (publishingConvictionNFT.agentToAccountId(msg.sender) != 0) {
+        uint256 convictionAccountId = publishingConvictionNFT.agentToAccountId(msg.sender);
+        if (convictionAccountId != 0) {
+            (, , , , , uint16 lockDurationEpochs, ) = publishingConvictionNFT.accounts(
+                convictionAccountId
+            );
+            if (p.epochs > uint256(lockDurationEpochs)) {
+                revert InvalidPublishingConvictionEpochs(lockDurationEpochs, p.epochs);
+            }
+
             // Discount branch. NFT auto-resolves the paying account from
             // `agentToAccountId[msg.sender]` inside `coverPublishingCost`
             // and emits `CostCovered` with full detail for off-chain
@@ -912,6 +921,7 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
             bool isImmutable,
             uint32 ignoredPreUpdateMerkleLeafCount
         ) = kcs.getKnowledgeCollectionUpdateContext(p.id);
+        ignoredPreUpdateMerkleLeafCount;
 
         if (isImmutable) {
             revert KnowledgeCollectionLib.CannotUpdateImmutableKnowledgeCollection(p.id);

@@ -19,7 +19,7 @@
       },
       {
         "internalType": "uint40",
-        "name": "expiresAt",
+        "name": "expiresAtEpoch",
         "type": "uint40"
       }
     ],
@@ -227,6 +227,17 @@
   {
     "inputs": [],
     "name": "InvalidAmount",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "configuredEpochs",
+        "type": "uint256"
+      }
+    ],
+    "name": "InvalidPublishingConvictionEpochs",
     "type": "error"
   },
   {
@@ -543,19 +554,6 @@
   },
   {
     "inputs": [],
-    "name": "LOCK_DURATION_EPOCHS",
-    "outputs": [
-      {
-        "internalType": "uint256",
-        "name": "",
-        "type": "uint256"
-      }
-    ],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
-    "inputs": [],
     "name": "STAKER_SHARD_ID",
     "outputs": [
       {
@@ -591,6 +589,21 @@
         "internalType": "uint40",
         "name": "expiresAtEpoch",
         "type": "uint40"
+      },
+      {
+        "internalType": "uint40",
+        "name": "createdAtTimestamp",
+        "type": "uint40"
+      },
+      {
+        "internalType": "uint40",
+        "name": "expiresAtTimestamp",
+        "type": "uint40"
+      },
+      {
+        "internalType": "uint16",
+        "name": "lockDurationEpochs",
+        "type": "uint16"
       },
       {
         "internalType": "uint16",
@@ -801,6 +814,16 @@
       {
         "internalType": "uint40",
         "name": "expiresAtEpoch",
+        "type": "uint40"
+      },
+      {
+        "internalType": "uint40",
+        "name": "createdAtTimestamp",
+        "type": "uint40"
+      },
+      {
+        "internalType": "uint40",
+        "name": "expiresAtTimestamp",
         "type": "uint40"
       },
       {
@@ -1052,6 +1075,19 @@
     "outputs": [
       {
         "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "parametersStorage",
+    "outputs": [
+      {
+        "internalType": "contract ParametersStorage",
         "name": "",
         "type": "address"
       }

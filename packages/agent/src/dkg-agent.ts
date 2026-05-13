@@ -1314,7 +1314,6 @@ export class DKGAgent {
       await this.markDefaultAgent(first.agentAddress).catch(() => {});
     }
 
-    this.router = new ProtocolRouter(this.node);
     const network = new LibP2PNetwork(this.node);
     const peerResolver = new PeerResolver({
       network,
@@ -1379,6 +1378,7 @@ export class DKGAgent {
       // Removed here per Codex review feedback on PR #496.
     });
     this.peerResolver = peerResolver;
+    this.router = new ProtocolRouter(this.node, { peerResolver });
     this.messenger = new Messenger({
       resolver: peerResolver,
       router: this.router,

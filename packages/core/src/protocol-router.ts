@@ -1,6 +1,7 @@
 import type { Stream } from '@libp2p/interface';
 import type { StreamHandler as DKGStreamHandler } from './types.js';
 import type { DKGNode } from './node.js';
+import type { PeerResolver } from './network/peer-resolver.js';
 
 /** Default max bytes readAll will buffer before aborting (10 MB). */
 export const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024;
@@ -29,13 +30,31 @@ export function isRecoverableSendError(err: unknown): boolean {
   );
 }
 
+export interface ProtocolRouterOptions {
+  maxReadBytes?: number;
+  /**
+   * RFC 07 §3.2 — when present, `send()` consults the resolver before
+   * dialing so the libp2p peerStore is primed with whatever multiaddrs
+   * the resolution order finds (live-conn → DHT → RFC 04 registry →
+   * agents-CG → bootstrap). Optional during the RFC 07 migration; the
+   * resolver is wired in `dkg-agent.ts` for production daemons. Tests
+   * that don't exercise the resolver may omit it. PR-4 of the RFC 07
+   * rollout adds a CI grep gate that disallows raw `dialProtocol(peerId)`
+   * outside `peer-resolver.ts`, by which point this becomes a structural
+   * property of the codebase rather than a recommendation.
+   */
+  peerResolver?: PeerResolver;
+}
+
 export class ProtocolRouter {
   private readonly node: DKGNode;
+  private readonly peerResolver?: PeerResolver;
   private handlers = new Map<string, DKGStreamHandler>();
   readonly maxReadBytes: number;
 
-  constructor(node: DKGNode, options?: { maxReadBytes?: number }) {
+  constructor(node: DKGNode, options?: ProtocolRouterOptions) {
     this.node = node;
+    this.peerResolver = options?.peerResolver;
     this.maxReadBytes = options?.maxReadBytes ?? DEFAULT_MAX_READ_BYTES;
   }
 
@@ -81,6 +100,19 @@ export class ProtocolRouter {
     const peerId = peerIdFromString(peerIdStr);
     const signal = AbortSignal.timeout(timeoutMs);
     const startedAt = Date.now();
+
+    // RFC 07 §3.2: ensure the libp2p peerStore has fresh multiaddrs
+    // before dialing. The resolver's step 1 is a sub-millisecond
+    // live-connection check, so this is effectively a no-op when we
+    // already have an open connection to the peer; the cost only
+    // shows up on cold dials, where it replaces the failure mode of
+    // "dialProtocol falls back to stale identify-cached addresses".
+    // Best-effort — the resolver itself never throws (it returns an
+    // empty array on miss); the caller's dial loop below will surface
+    // a real transport error if the peer is genuinely unreachable.
+    if (this.peerResolver) {
+      await this.peerResolver.resolve(peerIdStr).catch(() => undefined);
+    }
 
     // libp2p internally upgrades relay connections to direct during
     // dialProtocol/newStream (peerStore.merge triggers the connection manager

@@ -5239,10 +5239,11 @@ export class DKGAgent {
    * When localOnly is false (default), replicates via GossipSub shared memory topic.
    * When localOnly is true, stores locally without broadcasting — use for private data.
    */
-  async share(contextGraphId: string, quads: Quad[], opts?: { localOnly?: boolean; operationCtx?: OperationContext; subGraphName?: string }): Promise<{ shareOperationId: string }> {
+  async share(contextGraphId: string, quads: Quad[], opts?: { localOnly?: boolean; operationCtx?: OperationContext; subGraphName?: string; callerAgentAddress?: string }): Promise<{ shareOperationId: string }> {
     const ctx = opts?.operationCtx ?? createOperationContext('share');
     const sgLabel = opts?.subGraphName ? ` (sub-graph: ${opts.subGraphName})` : '';
     this.log.info(ctx, `Sharing ${quads.length} quads to SWM for context graph ${contextGraphId}${sgLabel}${opts?.localOnly ? ' (local-only)' : ''}`);
+    const shouldCreateImplicitContextGraph = await this.shouldCreateImplicitSharedMemoryContextGraph(contextGraphId);
     const gossipSigner = opts?.localOnly ? null : await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
     const { shareOperationId, message } = await this.publisher.writeToWorkspace(contextGraphId, quads, {
       publisherPeerId: this.node.peerId.toString(),
@@ -5251,6 +5252,11 @@ export class DKGAgent {
       localOnly: opts?.localOnly,
       senderAgentAddress: gossipSigner?.agentAddress,
     });
+    if (shouldCreateImplicitContextGraph) {
+      await this.ensureImplicitSharedMemoryContextGraph(contextGraphId, {
+        callerAgentAddress: opts?.callerAgentAddress,
+      });
+    }
     if (!opts?.localOnly) {
       await this.publishWorkspaceGossip(contextGraphId, message, ctx, gossipSigner);
     }
@@ -5266,11 +5272,12 @@ export class DKGAgent {
     contextGraphId: string,
     quads: Quad[],
     conditions: CASCondition[],
-    opts?: { localOnly?: boolean; operationCtx?: OperationContext; subGraphName?: string },
+    opts?: { localOnly?: boolean; operationCtx?: OperationContext; subGraphName?: string; callerAgentAddress?: string },
   ): Promise<{ shareOperationId: string }> {
     const ctx = opts?.operationCtx ?? createOperationContext('share');
     const sgLabel = opts?.subGraphName ? ` (sub-graph: ${opts.subGraphName})` : '';
     this.log.info(ctx, `CAS write: ${quads.length} quads, ${conditions.length} conditions for ${contextGraphId}${sgLabel}`);
+    const shouldCreateImplicitContextGraph = await this.shouldCreateImplicitSharedMemoryContextGraph(contextGraphId);
     const gossipSigner = opts?.localOnly ? null : await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
     const { shareOperationId, message } = await this.publisher.writeConditionalToWorkspace(contextGraphId, quads, {
       publisherPeerId: this.node.peerId.toString(),
@@ -5280,10 +5287,113 @@ export class DKGAgent {
       localOnly: opts?.localOnly,
       senderAgentAddress: gossipSigner?.agentAddress,
     });
+    if (shouldCreateImplicitContextGraph) {
+      await this.ensureImplicitSharedMemoryContextGraph(contextGraphId, {
+        callerAgentAddress: opts?.callerAgentAddress,
+      });
+    }
     if (!opts?.localOnly) {
       await this.publishWorkspaceGossip(contextGraphId, message, ctx, gossipSigner);
     }
     return { shareOperationId };
+  }
+
+  private async hasAuthoritativeContextGraphDefinition(contextGraphId: string): Promise<boolean> {
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const result = await this.store.query(`
+      ASK WHERE {
+        {
+          GRAPH <${ontologyGraph}> {
+            <${contextGraphUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
+          }
+        }
+        UNION
+        {
+          GRAPH <${cgMetaGraph}> {
+            <${contextGraphUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
+          }
+        }
+      }
+    `);
+    return result.type === 'boolean' && result.value === true;
+  }
+
+  private async shouldCreateImplicitSharedMemoryContextGraph(contextGraphId: string): Promise<boolean> {
+    if (await this.hasAuthoritativeContextGraphDefinition(contextGraphId)) {
+      return false;
+    }
+
+    if ((await this.getContextGraphAgentGateAddresses(contextGraphId)) !== null) {
+      return false;
+    }
+
+    const existingSub = this.subscribedContextGraphs.get(contextGraphId);
+    if (existingSub?.metaSynced === false) {
+      throw new Error(
+        `Context graph "${contextGraphId}" is awaiting metadata sync; refusing to infer public metadata from an SWM write`,
+      );
+    }
+
+    return true;
+  }
+
+  private async ensureImplicitSharedMemoryContextGraph(
+    contextGraphId: string,
+    opts: { callerAgentAddress?: string } = {},
+  ): Promise<void> {
+    if (!(await this.shouldCreateImplicitSharedMemoryContextGraph(contextGraphId))) {
+      return;
+    }
+
+    const gm = new GraphManager(this.store);
+    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const now = new Date().toISOString();
+    const existingSub = this.subscribedContextGraphs.get(contextGraphId);
+    const name = existingSub?.name ?? contextGraphId;
+    const curatorAgentAddress = opts.callerAgentAddress ?? this.defaultAgentAddress ?? this.peerId;
+    const quads: Quad[] = [
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: `"${escapeSparqlLiteral(name)}"`, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: `did:dkg:agent:${this.peerId}`, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATED_AT, object: `"${now}"`, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_GOSSIP_TOPIC, object: `"${contextGraphPublishTopic(contextGraphId)}"`, graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REPLICATION_POLICY, object: '"full"', graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"public"', graph: ontologyGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: '"unregistered"', graph: cgMetaGraph },
+      { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: `did:dkg:agent:${curatorAgentAddress}`, graph: cgMetaGraph },
+    ];
+
+    await this.store.insert(quads);
+    await gm.ensureContextGraph(contextGraphId);
+    await this.store.flush?.();
+    this.subscribeToContextGraph(contextGraphId);
+    this.setContextGraphSubscription(contextGraphId, {
+      ...existingSub,
+      name,
+      subscribed: true,
+      synced: true,
+      metaSynced: true,
+    });
+
+    if (curatorAgentAddress) {
+      this.upsertContextGraphMember({
+        contextGraphId,
+        principalType: 'agent',
+        principalId: curatorAgentAddress,
+        role: 'curator',
+        status: 'active',
+        source: 'implicit-swm-write',
+      });
+    }
+
+    this.log.info(
+      createOperationContext('share'),
+      `Implicitly registered public context graph "${contextGraphId}" from first SWM write`,
+    );
   }
 
   /**

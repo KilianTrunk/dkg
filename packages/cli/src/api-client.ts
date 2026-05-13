@@ -896,15 +896,31 @@ export class ApiClient {
     participantAgents?: string[];
     participantIdentityIds?: Array<string | number | bigint>;
     requiredSignatures?: number;
-    // NOTE: pcaAccountId is intentionally NOT a `createContextGraph`
-    // option here — the agent's createContextGraph no longer persists
-    // it (Codex PR #502 round-4), so passing it on the create call
-    // would be a silent no-op. Use the `pcaAccountId` field on
-    // `registerContextGraph` instead, or call POST /api/context-graph/create
-    // directly with `register: true` for the inline combined flow.
+    /**
+     * Atomic combined-flow flag. When `true`, the daemon registers the
+     * CG on-chain in the same call after the local create step
+     * succeeds. Required when `pcaAccountId` is supplied (a standalone
+     * `createContextGraph` does NOT persist PCA ids — Codex PR #502
+     * round-3).
+     */
+    register?: boolean;
+    /**
+     * Publishing Conviction Account id for PCA-curated registration.
+     * Only meaningful together with `register: true`. The daemon
+     * rejects the create-only-with-pcaAccountId combo with a 400
+     * (Codex PR #502 round-5). For a two-step flow, use
+     * {@link registerContextGraph} instead.
+     */
+    pcaAccountId?: string | number | bigint;
   }, allowedPeers?: string[]): Promise<{
     created: string;
     uri: string;
+    /** Present only when caller passed `register: true`. */
+    registered?: boolean;
+    onChainId?: string;
+    /** Present when `register: true` was requested but the register leg failed. */
+    registerError?: string;
+    hint?: string;
   }> {
     return this.post('/api/context-graph/create', {
       id,
@@ -919,6 +935,8 @@ export class ApiClient {
         ? { participantIdentityIds: options.participantIdentityIds.map((id) => id.toString()) }
         : {}),
       ...(options?.requiredSignatures != null ? { requiredSignatures: options.requiredSignatures } : {}),
+      ...(options?.register === true ? { register: true } : {}),
+      ...(options?.pcaAccountId != null ? { pcaAccountId: options.pcaAccountId.toString() } : {}),
     });
   }
 

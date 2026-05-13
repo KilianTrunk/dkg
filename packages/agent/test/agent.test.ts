@@ -2675,7 +2675,11 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
-  it('rejects PCA account ids on open context graphs', async () => {
+  // Codex PR #502 round-6: createContextGraph used to accept-then-drop
+  // `publishAuthorityAccountId` silently. Direct agent callers (SDK)
+  // now get an immediate error explaining the param belongs on
+  // `registerContextGraph` instead.
+  it('rejects publishAuthorityAccountId on createContextGraph() — PCA ids are register-time-only', async () => {
     const chain = new PcaCuratedRegistrationChainAdapter(new Map([[7n, ethers.Wallet.createRandom().address]]));
     const agent = await DKGAgent.create({
       name: 'PcaOpenPolicyBot',
@@ -2685,12 +2689,22 @@ decisions: []
     });
     await agent.start();
 
+    // Both axes (curated AND open) reject — the param is no longer
+    // a "validate at create time" knob, it's just unsupported here.
     await expect(agent.createContextGraph({
-      id: 'register-open-pca-policy',
-      name: 'Open PCA Policy',
+      id: 'reject-pca-create-open',
+      name: 'Reject PCA Create (Open)',
       publishAuthorityAccountId: 7n,
       callerAgentAddress: ethers.getAddress(chain.signerAddress),
-    })).rejects.toThrow(/PCA account id.*curated/i);
+    })).rejects.toThrow(/not supported on createContextGraph|register-time-only/i);
+
+    await expect(agent.createContextGraph({
+      id: 'reject-pca-create-curated',
+      name: 'Reject PCA Create (Curated)',
+      accessPolicy: 1,
+      publishAuthorityAccountId: 7n,
+      callerAgentAddress: ethers.getAddress(chain.signerAddress),
+    })).rejects.toThrow(/not supported on createContextGraph|register-time-only/i);
 
     await agent.stop().catch(() => {});
   });

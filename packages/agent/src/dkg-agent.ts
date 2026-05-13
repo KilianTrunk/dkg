@@ -7244,7 +7244,16 @@ export class DKGAgent {
     requiredSignatures?: number;
     /** Participant agent addresses for on-chain context graphs. */
     participantAgents?: string[];
-    /** Publishing Conviction Account id for PCA-curated on-chain registration. */
+    /**
+     * Publishing Conviction Account id. NOT a `createContextGraph` knob —
+     * supply on {@link registerContextGraph} instead. Accepted here only
+     * so callers get an immediate error rather than a silent no-op:
+     * `createContextGraph` no longer persists the PCA id (Codex PR #502
+     * round-3) and direct agent callers would otherwise have no signal
+     * that the create-time value was being dropped (Codex round-6).
+     *
+     * @deprecated Use `publishAuthorityAccountId` on `registerContextGraph` instead.
+     */
     publishAuthorityAccountId?: bigint;
     /** When true, skips gossip subscription and broadcast. Data stays local-only. */
     private?: boolean;
@@ -7277,23 +7286,22 @@ export class DKGAgent {
     const isCurated = opts.accessPolicy === LOCAL_ACCESS_CURATED
       || (opts.allowedAgents && opts.allowedAgents.length > 0)
       || (opts.allowedPeers && opts.allowedPeers.length > 0);
-    // pcaAccountId at create time is validated but NOT persisted —
-    // callers must (re)supply it at `registerContextGraph` time. Codex
-    // PR #502 round-3 flagged the create-time persist as unsafe: a
-    // bad id silently replays from local metadata on every later
-    // register retry that omits the param. Treating pcaAccountId as a
-    // register-time-only knob removes the foot-gun entirely; this
-    // parameter remains on `createContextGraph` for backwards-compat
-    // shape validation (it would be confusing to silently drop the
-    // shape mismatch), but its only effect now is input validation.
-    const publishAuthorityAccountId = opts.publishAuthorityAccountId;
-    if (publishAuthorityAccountId !== undefined) {
-      if (publishAuthorityAccountId <= 0n) {
-        throw new Error('PCA account id must be a positive integer.');
-      }
-      if (!isCurated && opts.private !== true) {
-        throw new Error('PCA account id can only be used with curated/private context graphs.');
-      }
+    // pcaAccountId is a register-time-only knob (Codex PR #502 round-3:
+    // `createContextGraph` no longer persists it). Direct agent
+    // callers used to receive a silent drop; per Codex round-6 we now
+    // fail fast at the boundary so they get an immediate, actionable
+    // error instead of a confusing "EOA-curated when I asked for PCA"
+    // outcome at register time. Daemon callers can't hit this path —
+    // the HTTP route already strips the param before calling
+    // `createContextGraph`.
+    if (opts.publishAuthorityAccountId !== undefined) {
+      throw new Error(
+        '`publishAuthorityAccountId` is not supported on createContextGraph(). '
+        + 'PCA account ids are register-time-only — supply `publishAuthorityAccountId` '
+        + 'on registerContextGraph() instead. Background: createContextGraph no '
+        + 'longer persists PCA ids locally, so any value passed here would silently '
+        + 'be dropped before registration (Codex PR #502 round-3/round-6).',
+      );
     }
 
     if (opts.private) {
@@ -7332,11 +7340,10 @@ export class DKGAgent {
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: `"${isCurated || opts.private ? 'private' : 'public'}"`, graph: defGraph },
     ];
 
-    // Store registration status and curator in _meta. NOTE: we
-    // deliberately do NOT persist `publishAuthorityAccountId` here even
-    // though the param was validated above — see the comment near
-    // `const publishAuthorityAccountId = opts.publishAuthorityAccountId`
-    // above for why (Codex PR #502 round-3).
+    // Store registration status and curator in _meta. We do NOT
+    // store any PCA account id here — that param is register-time-only
+    // and createContextGraph rejects it at the boundary (Codex PR
+    // #502 round-3 + round-6).
     quads.push(
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"unregistered"`, graph: cgMetaGraph },
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: curatorDid, graph: cgMetaGraph },
@@ -7774,9 +7781,14 @@ export class DKGAgent {
     const publishPolicy = opts?.publishPolicy ?? (resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED
       ? EVM_PUBLISH_CURATED
       : EVM_PUBLISH_OPEN);
-    const storedPublishAuthorityAccountId = await this.getContextGraphPublishAuthorityAccountId(id);
+    // PCA account id is ONLY honored from the explicit option here.
+    // We deliberately do NOT fall back to a stored value (Codex PR
+    // #502 round-6): legacy CGs created under the old create-time
+    // persistence could have stale/bad ids that would silently replay
+    // on every register retry that omits the param. With explicit-only
+    // resolution, `undefined` unambiguously means "no PCA".
     const requestedPublishAuthorityAccountId = opts?.publishAuthorityAccountId;
-    const publishAuthorityAccountId = requestedPublishAuthorityAccountId ?? storedPublishAuthorityAccountId;
+    const publishAuthorityAccountId = requestedPublishAuthorityAccountId;
     if (requestedPublishAuthorityAccountId !== undefined) {
       if (requestedPublishAuthorityAccountId <= 0n) {
         throw new Error('PCA account id must be a positive integer.');
@@ -7884,14 +7896,22 @@ export class DKGAgent {
           // Patterns we recognise as "this PCA token doesn't exist":
           //   - OZ ERC721 custom error (modern: `ERC721NonexistentToken`,
           //     legacy: `ERC721: invalid token ID` / `nonexistent token`).
-          //   - The mock adapter's `No mock PCA owner for account ...`
-          //     parity throw used in unit tests.
+          //   - The built-in `MockChainAdapter.getPublishingConvictionAccountOwner`
+          //     throws `Mock: PCA account <id> does not exist` (production
+          //     mock used by SDK callers). Recognized via the broader
+          //     `/PCA account \d+ does not exist/` pattern (Codex PR #502
+          //     round-6: this matcher used to recognize only the test
+          //     double's wording, so the built-in mock path bypassed
+          //     normalization).
+          //   - The agent-test test double's `No mock PCA owner for
+          //     account ...` parity throw.
           //   - ethers v6 surfaces these as `BAD_DATA` / `CALL_EXCEPTION`
           //     with the OZ error name in the message.
           const isNonexistentToken =
             /ERC721NonexistentToken/.test(lookupMsg)
             || /invalid token ID/i.test(lookupMsg)
             || /nonexistent token/i.test(lookupMsg)
+            || /PCA account \d+ does not exist/.test(lookupMsg)
             || /No mock PCA owner for account/.test(lookupMsg)
             || (errCode === 'CALL_EXCEPTION' && /ERC721/.test(lookupMsg));
           if (isNonexistentToken) {
@@ -7981,13 +8001,11 @@ export class DKGAgent {
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
       { subject: contextGraphUri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${onChainId}"`, graph: ontologyGraph },
     ]);
-
-    // Persist the (now-validated) PCA account id locally. Deferred until
-    // after on-chain registration succeeds so a bad pcaAccountId never
-    // leaves stale state behind (Codex review #502-1).
-    if (requestedPublishAuthorityAccountId !== undefined) {
-      await this.setContextGraphPublishAuthorityAccountId(id, requestedPublishAuthorityAccountId);
-    }
+    // We no longer persist `publishAuthorityAccountId` locally even on
+    // success (Codex PR #502 round-6 follow-through): with the
+    // stored-value fallback gone, nothing reads it. A CG can only
+    // register on-chain once anyway — re-reads of the stored id
+    // wouldn't be useful.
 
     // Update in-memory subscription record and ensure we're subscribed
     const sub = this.subscribedContextGraphs.get(id);
@@ -11044,41 +11062,14 @@ export class DKGAgent {
     });
   }
 
-  private async getContextGraphPublishAuthorityAccountId(contextGraphId: string): Promise<bigint | undefined> {
-    const cgMetaGraph = contextGraphMetaUri(contextGraphId);
-    const cgUri = `did:dkg:context-graph:${contextGraphId}`;
-    const result = await this.store.query(
-      `SELECT ?accountId WHERE { GRAPH <${cgMetaGraph}> { <${cgUri}> <${DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID}> ?accountId } } LIMIT 1`,
-    );
-    if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
-
-    const raw = result.bindings[0]?.['accountId']?.replace(/^"|"$/g, '');
-    if (!raw) return undefined;
-    if (!/^\d+$/.test(raw)) {
-      throw new Error(`Context graph "${contextGraphId}" has invalid PCA account id "${raw}".`);
-    }
-    const accountId = BigInt(raw);
-    if (accountId <= 0n) {
-      throw new Error(`Context graph "${contextGraphId}" has invalid PCA account id "${raw}".`);
-    }
-    return accountId;
-  }
-
-  private async setContextGraphPublishAuthorityAccountId(contextGraphId: string, accountId: bigint): Promise<void> {
-    const cgMetaGraph = contextGraphMetaUri(contextGraphId);
-    const cgUri = `did:dkg:context-graph:${contextGraphId}`;
-    await this.store.deleteByPattern({
-      graph: cgMetaGraph,
-      subject: cgUri,
-      predicate: DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID,
-    });
-    await this.store.insert([{
-      graph: cgMetaGraph,
-      subject: cgUri,
-      predicate: DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID,
-      object: `"${accountId.toString()}"`,
-    }]);
-  }
+  // NOTE: `getContextGraphPublishAuthorityAccountId` and
+  // `setContextGraphPublishAuthorityAccountId` helpers were removed in
+  // Codex PR #502 round-6. With `registerContextGraph` no longer
+  // falling back to stored values and `createContextGraph` no longer
+  // persisting them, nothing on this code path reads or writes the
+  // `DKG_PUBLISH_AUTHORITY_ACCOUNT_ID` triple anymore — pcaAccountId
+  // lives strictly in the explicit `publishAuthorityAccountId` opt on
+  // `registerContextGraph`.
 
   /**
    * Return true when `senderPeerId` is currently acting as the curator

@@ -511,6 +511,11 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
           ? 1
           : undefined;
     try {
+      // NOTE: parsedPcaAccountId.value is intentionally NOT forwarded
+      // to `agent.createContextGraph` — the agent now rejects that
+      // param at the boundary (Codex PR #502 round-6). The daemon
+      // route uses parsedPcaAccountId.value below in the (optional)
+      // register leg only.
       await agent.createContextGraph({
         id,
         name,
@@ -520,7 +525,6 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         participantAgents: Array.isArray(participantAgents) ? participantAgents : undefined,
         accessPolicy: inferredAccessPolicy,
         callerAgentAddress: requestAgentAddress,
-        publishAuthorityAccountId: parsedPcaAccountId.value,
         ...(parsed.private === true ? { private: true } : {}),
         ...(Array.isArray(parsed.participantIdentityIds)
           ? { participantIdentityIds: parsed.participantIdentityIds.map((v: string | number) => BigInt(v)) }

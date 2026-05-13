@@ -430,17 +430,31 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     const window0: bigint = BigInt(await s.nft.getCurrentBillingWindow(accountId));
     expect(window0).toBe(0n);
 
-    const [startEp, endEp] = await s.nft.getWindowChainEpochRange(accountId, 0n);
+    const [windowStartEp, windowEndEp] = await s.nft.getWindowChainEpochRange(accountId, 0n);
     // eslint-disable-next-line no-console
-    console.log(`step 3: window 0 overlaps chain epochs [${startEp}, ${endEp}]`);
+    console.log(`step 3: window 0 overlaps chain epochs [${windowStartEp}, ${windowEndEp}]`);
 
-    // Snapshot the staker pool across every chain epoch window 0 overlaps so
-    // we can compare growth at the same chain-epoch granularity the contract
-    // settles into. Window 0 typically overlaps two chain epochs when the
-    // account is created mid-epoch.
+    // PCA-funded publishes now use `kcEpochs = lockDurationEpochs` (the
+    // `PCAEpochsMismatch` invariant added in PR #470 round 2). The active
+    // sink therefore distributes `discountedCost` across
+    // `[currentEpoch, currentEpoch + lockDurationEpochs]` chain epochs —
+    // potentially far beyond the billing-window range. Snapshot the staker
+    // pool across the FULL KC range so the assertion catches the entire
+    // distribution rather than the partial sliver that lands in window 0's
+    // own chain epoch span.
+    const acctSnap = await s.nft.accounts(accountId);
+    const lockDurationEpochs: number = Number(acctSnap.lockDurationEpochs);
+    const currentChainEpoch: bigint = await s.chronos.getCurrentEpoch();
+    const kcStartEp: bigint = currentChainEpoch;
+    const kcEndEp: bigint = currentChainEpoch + BigInt(lockDurationEpochs);
+    // Sample range = union of window 0's chain range and the KC's chain
+    // range, since the active sink could touch either tail epoch.
+    const sampleStartEp = windowStartEp < kcStartEp ? BigInt(windowStartEp) : kcStartEp;
+    const sampleEndEp = BigInt(windowEndEp) > kcEndEp ? BigInt(windowEndEp) : kcEndEp;
+
     const beforePools = new Map<bigint, bigint>();
-    for (let e = startEp; e <= endEp; e++) {
-      beforePools.set(BigInt(e), await s.eps.getEpochPool(STAKER_SHARD_ID, BigInt(e)));
+    for (let e = sampleStartEp; e <= sampleEndEp; e++) {
+      beforePools.set(e, await s.eps.getEpochPool(STAKER_SHARD_ID, e));
     }
 
     const file = nquadsFile('lazy-settle-publish');
@@ -450,25 +464,25 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     const spent0After: bigint = await s.nft.windowSpent(accountId, 0n);
     expect(spent0After).toBeGreaterThan(0n);
 
-    const afterPools = new Map<bigint, bigint>();
     let activeSinkDelta = 0n;
-    for (let e = startEp; e <= endEp; e++) {
-      const after: bigint = await s.eps.getEpochPool(STAKER_SHARD_ID, BigInt(e));
-      afterPools.set(BigInt(e), after);
-      activeSinkDelta += after - (beforePools.get(BigInt(e)) ?? 0n);
+    for (let e = sampleStartEp; e <= sampleEndEp; e++) {
+      const after: bigint = await s.eps.getEpochPool(STAKER_SHARD_ID, e);
+      activeSinkDelta += after - (beforePools.get(e) ?? 0n);
     }
 
-    // The active sink distributes `discountedCost` across the KC's epoch
-    // range; the KC has ≥1 epoch lifetime so total pool growth across the
-    // KC's range must be ≥ windowSpent[0] for THIS publish. (Daemon
-    // background publishes may push it higher — we only assert the lower
-    // bound).
+    // The active sink distributes `discountedCost` (== windowSpent[0]
+    // for this single publish) across `[kcStartEpoch, kcStartEpoch +
+    // lockDurationEpochs]` chain epochs. Total pool growth across that
+    // range MUST be ≥ windowSpent[0] (proration is exact under
+    // floor-division so rounding crumbs can never under-fund the bound).
+    // Daemon background publishes may push it higher — we only assert
+    // the lower bound.
     expect(activeSinkDelta).toBeGreaterThanOrEqual(spent0After);
 
     // eslint-disable-next-line no-console
     console.log(
       `step 3: published kcId=${result.kcId} → windowSpent[acct][0]=${ethers.formatEther(spent0After)} TRAC, ` +
-      `staker pool +${ethers.formatEther(activeSinkDelta)} TRAC across epochs [${startEp},${endEp}]`,
+      `staker pool +${ethers.formatEther(activeSinkDelta)} TRAC across epochs [${sampleStartEp},${sampleEndEp}]`,
     );
   }, 180_000);
 

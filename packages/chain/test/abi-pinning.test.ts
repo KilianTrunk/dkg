@@ -113,7 +113,14 @@ const PINNED_DIGESTS: Record<string, string> = {
   // (kcStartEpoch, kcEpochs) so it can fund the KC's epoch range via
   // the active sink. The `InvalidPublishingConvictionEpochs` error was
   // removed from KAV10 (the NFT enforces the bound internally).
-  KnowledgeAssetsV10:           '785311d19ce39743522bf1db501f41276fb22d715a2cc94cc67d96f8a22e519e',
+  // Updated PR #470 round 2: PCA-funded publishes now require
+  // `p.epochs == lockDurationEpochs` (PCAEpochsMismatch error added to
+  // KAV10). The escrow is sized as `committedTRAC / lockDurationEpochs`
+  // per billing window and the discount tier was paid for that exact
+  // lifetime; strict equality keeps the active sink aligned with the
+  // commit. Update path remains unchanged (allows
+  // `remainingEpochs <= lockDurationEpochs`).
+  KnowledgeAssetsV10:           '939198d6c985a6acfe6b7cb106f2fb2a47f65fde86bfbbbbce6478a497536c30',
   KnowledgeCollectionStorage:   'e165cbddc6569602d1d5c05c15909fd0a9ff851f974357cf80297041b2a83fd2',
   KnowledgeCollection:          'c906207c38ffded8944d7255498f7fc9f2c864098a3f8f3670df19006dbcd395',
   ContextGraphs:                'ee69f0d50b54df966b8bfb3bf457fe6d2865393f51f8770b4185fafd324b9462',

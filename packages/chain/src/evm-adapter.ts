@@ -237,6 +237,17 @@ interface ContractCache {
   contextGraphStorage?: Contract;
   knowledgeAssetsV10?: Contract;
   publishingConvictionAccount?: Contract;
+  /**
+   * The V10 NFT-backed PCA (`DKGPublishingConvictionNFT`). Distinct from
+   * the legacy `publishingConvictionAccount` cache slot: lazy-settled
+   * escrow + agent reverse-lookup live on the NFT, while the legacy
+   * cache slot still backs the `getConvictionAccountInfo` / discount
+   * read paths off the older `PublishingConvictionAccount` contract.
+   * Used by the publisher SDK to detect PCA-funded publishes and
+   * mirror the strict `kcEpochs == lockDurationEpochs` invariant
+   * enforced by `KnowledgeAssetsV10.publish()` (see `PCAEpochsMismatch`).
+   */
+  dkgPublishingConvictionNFT?: Contract;
   randomSampling?: Contract;
   randomSamplingStorage?: Contract;
 }
@@ -630,6 +641,12 @@ export class EVMChainAdapter implements ChainAdapter {
       this.contracts.publishingConvictionAccount = await this.resolveContract('PublishingConvictionAccount');
     } catch {
       // PublishingConvictionAccount not deployed — conviction account operations unavailable
+    }
+
+    try {
+      this.contracts.dkgPublishingConvictionNFT = await this.resolveContract('DKGPublishingConvictionNFT');
+    } catch {
+      // DKGPublishingConvictionNFT not deployed — V10 PCA agent-resolution unavailable
     }
 
     try {
@@ -2405,6 +2422,52 @@ export class EVMChainAdapter implements ChainAdapter {
     if (!this.contracts.publishingConvictionAccount) return false;
     if (!ethers.isAddress(key)) return false;
     return await this.contracts.publishingConvictionAccount.authorizedKeys(accountId, key);
+  }
+
+  /**
+   * Reverse-resolve a wallet to its V10 PCA account id, or `0n` if the
+   * wallet is not registered as a publishing agent. Mirrors the
+   * `DKGPublishingConvictionNFT.agentToAccountId(agent)` view.
+   *
+   * The publisher SDK uses this to decide, BEFORE building a publish
+   * tx, whether `KnowledgeAssetsV10.publish()` will route through the
+   * PCA discount branch — and therefore whether `publishEpochs` must
+   * be coerced to the PCA's `lockDurationEpochs` to satisfy the
+   * `PCAEpochsMismatch` strict-equality check.
+   *
+   * Returns `0n` (not registered) when the NFT contract is not
+   * deployed on this chain, the address is malformed, or the chain
+   * call fails — callers treat the unknown case as "no PCA path".
+   */
+  async getConvictionAgentAccountId(agent: string): Promise<bigint> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) return 0n;
+    if (!ethers.isAddress(agent)) return 0n;
+    try {
+      const id: bigint = await this.contracts.dkgPublishingConvictionNFT.agentToAccountId(agent);
+      return BigInt(id);
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return 0n;
+      throw err;
+    }
+  }
+
+  async getConvictionAccountLockDurationEpochs(accountId: bigint): Promise<number> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) return 0;
+    if (accountId <= 0n) return 0;
+    try {
+      // `accounts(uint256)` returns
+      // (committedTRAC, createdAtEpoch, expiresAtEpoch, createdAtTimestamp,
+      //  expiresAtTimestamp, lockDurationEpochs, discountBps,
+      //  lastSettledWindow, fullySwept). Pull index 5.
+      const tuple = await this.contracts.dkgPublishingConvictionNFT.accounts(accountId);
+      const lock = tuple[5];
+      return Number(lock);
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return 0;
+      throw err;
+    }
   }
 
   async getConvictionAccountInfo(accountId: bigint): Promise<ConvictionAccountInfo | null> {

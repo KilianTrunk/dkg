@@ -601,6 +601,36 @@ export interface ChainAdapter {
    */
   isPCAAuthorizedKey?(accountId: bigint, key: string): Promise<boolean>;
 
+  /**
+   * Reverse lookup: which PCA (if any) is `agent` registered against?
+   *
+   * Mirrors `DKGPublishingConvictionNFT.agentToAccountId(agent)`.
+   * Returns `0n` for any non-registered address. The publisher SDK uses
+   * this to decide, before constructing the publish tx, whether the
+   * publishing wallet will route through the PCA discount branch in
+   * `KnowledgeAssetsV10.publish()`. When it does, `publishEpochs` must
+   * be set to that PCA's `lockDurationEpochs` (the contract enforces
+   * strict equality with `PCAEpochsMismatch`).
+   *
+   * Optional on the adapter surface so mock-chain unit tests that
+   * don't model PCA registration can omit the implementation. The
+   * publisher gracefully treats `undefined` as "no PCA path active".
+   */
+  getConvictionAgentAccountId?(agent: string): Promise<bigint>;
+
+  /**
+   * Returns the V10 NFT-backed PCA's `lockDurationEpochs` for the given
+   * `accountId` — i.e. the snapshotted publishing-conviction-epochs the
+   * account was created against. `0` when the account doesn't exist or
+   * the NFT contract isn't deployed.
+   *
+   * The publisher SDK uses this together with
+   * `getConvictionAgentAccountId` to coerce a publish's epochs to the
+   * exact lifetime the PCA's escrow was sized for (matching the
+   * `PCAEpochsMismatch` invariant in `KnowledgeAssetsV10.publish()`).
+   */
+  getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
+
   // Permanent Publishing
   publishKnowledgeAssetsPermanent?(params: PermanentPublishParams): Promise<OnChainPublishResult>;
 

@@ -535,15 +535,34 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       expect(after.createdAtEpoch).to.equal(before.createdAtEpoch);
     });
 
-    it('distributes topUp TRAC across the REMAINING account lifetime', async () => {
-      // Account created at currentEpoch may touch 12 or 13 chain epochs.
+    it('distributes topUp TRAC across a FRESH lockDurationEpochs window from the current epoch (NOT the remaining PCA lifetime)', async () => {
+      // Top-up semantic: independent of the original create clock, the topped-up
+      // amount funds stakers across [currentEpoch, currentEpoch + lockDuration - 1].
+      // The window legitimately extends PAST the PCA's expiresAtEpoch — that
+      // bounds the discount, not the staker reward distribution.
       const initial = hre.ethers.parseEther('120000');
       const top = hre.ethers.parseEther('60000');
       await createAt(initial);
 
+      // Advance several epochs so the original lifetime has shrunk well below
+      // lockDuration. This is where the bug previously manifested: distributing
+      // `top` across [currentEpoch, expiresAtEpoch - 1] would cram it into a
+      // shrinking window, inflating those epochs' pools.
+      const epochLength = await ChronosContract.epochLength();
+      const epochsToAdvance = 5;
+      await time.increase(epochLength * BigInt(epochsToAdvance) + 1n);
+
       const current = await ChronosContract.getCurrentEpoch();
+      const acctInfoBefore = await NFT.getAccountInfo(1);
+      // Sanity: original remaining lifetime is now < lockDuration.
+      const originalRemaining = Number(acctInfoBefore.expiresAtEpoch - current);
+      expect(originalRemaining).to.be.lessThan(LOCK_DURATION);
+
+      // Snapshot pool state across the FRESH window plus a sentinel one
+      // epoch past it (to confirm we don't bleed beyond the window).
+      const windowSize = LOCK_DURATION;
       const before: bigint[] = [];
-      for (let i = 0; i < MAX_CHAIN_EPOCHS_TOUCHED; i++) {
+      for (let i = 0; i < windowSize + 1; i++) {
         before.push(await EpochStorageContract.getEpochPool(STAKER_SHARD_ID, current + BigInt(i)));
       }
       const remainderBefore = await EpochStorageContract.accumulatedRemainder(STAKER_SHARD_ID);
@@ -551,16 +570,34 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       await TokenContract.approve(await NFT.getAddress(), top);
       await NFT.topUp(1, top);
 
-      const info = await NFT.getAccountInfo(1);
-      const touchedEpochs = Number(info.expiresAtEpoch - current);
+      // 1. Distribution covers a full lockDuration-epoch window from `current`.
       let distributed = 0n;
-      for (let i = 0; i < touchedEpochs; i++) {
+      const perEpoch = top / BigInt(windowSize);
+      for (let i = 0; i < windowSize; i++) {
         const after = await EpochStorageContract.getEpochPool(STAKER_SHARD_ID, current + BigInt(i));
         const delta = after - before[i];
+        expect(delta).to.equal(perEpoch);
         distributed += delta;
       }
+
+      // 2. The epoch immediately past the fresh window is untouched.
+      const sentinelAfter = await EpochStorageContract.getEpochPool(
+        STAKER_SHARD_ID,
+        current + BigInt(windowSize),
+      );
+      expect(sentinelAfter - before[windowSize]).to.equal(0n);
+
+      // 3. Some epochs in the fresh window land PAST the PCA's expiresAtEpoch
+      //    — proving the staker stream legitimately outlives the PCA's discount.
+      expect(current + BigInt(windowSize - 1)).to.be.greaterThan(acctInfoBefore.expiresAtEpoch);
+
+      // 4. Full conservation: distributed + remainder dust == top.
       const remainderAfter = await EpochStorageContract.accumulatedRemainder(STAKER_SHARD_ID);
       expect(distributed + (remainderAfter - remainderBefore)).to.equal(top);
+
+      // 5. expiresAtEpoch is unchanged — top-up doesn't extend the PCA clock.
+      const acctInfoAfter = await NFT.getAccountInfo(1);
+      expect(acctInfoAfter.expiresAtEpoch).to.equal(acctInfoBefore.expiresAtEpoch);
     });
 
     it('reverts with InvalidAmount on zero', async () => {

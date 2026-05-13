@@ -234,9 +234,12 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
      * @notice Add TRAC to an existing account's persistent top-up balance.
      *
      * TRAC flows publisher -> CSS vault directly, and is distributed across
-     * the REMAINING epochs of the original account lifetime (current epoch
-     * through expiresAtEpoch-1). Does NOT extend expiry or change the discount
-     * tier.
+     * a FRESH `lockDurationEpochs` window starting at the current epoch
+     * (i.e. [currentEpoch, currentEpoch + lockDurationEpochs - 1]).
+     * Does NOT extend the PCA's expiry / discount eligibility — those are
+     * still bounded by the original `expiresAtTimestamp`. The fresh window
+     * applies only to staker reward distribution: topping up late in the
+     * PCA's life must NOT cram the amount into 1–2 chain epochs.
      */
     function topUp(uint256 accountId, uint96 amount) external {
         _requireOwner(accountId);
@@ -254,10 +257,12 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
             revert TokenTransferFailed();
         }
 
-        // Distribute across remaining lifetime: [currentEpoch, expiresAtEpoch - 1]
-        uint40 distributionEndEpoch = uint40(
-            chronos.epochAtTimestamp(uint256(acct.expiresAtTimestamp) - 1)
-        );
+        // Distribute across a fresh lockDurationEpochs window from NOW:
+        // [currentEpoch, currentEpoch + lockDurationEpochs - 1] (inclusive).
+        // The distribution legitimately extends past the PCA's
+        // `expiresAtEpoch` — only staker rewards see the fresh window,
+        // the discount tier remains bounded by the original create clock.
+        uint40 distributionEndEpoch = currentEpoch + uint40(acct.lockDurationEpochs) - 1;
         epochStorage.addTokensToEpochRange(
             STAKER_SHARD_ID,
             currentEpoch,

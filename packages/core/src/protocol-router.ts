@@ -110,8 +110,18 @@ export class ProtocolRouter {
     // Best-effort — the resolver itself never throws (it returns an
     // empty array on miss); the caller's dial loop below will surface
     // a real transport error if the peer is genuinely unreachable.
+    //
+    // Codex review feedback on PR #497: pass the same AbortSignal +
+    // remaining time budget to the resolver so a caller's `timeoutMs`
+    // bounds the entire send (resolver + dial + read), not just the
+    // dial loop. Without this a `timeoutMs: 1000` could block 5s+ on
+    // the resolver's default per-step DHT timeout before the dial
+    // even starts.
     if (this.peerResolver) {
-      await this.peerResolver.resolve(peerIdStr).catch(() => undefined);
+      const remaining = Math.max(0, timeoutMs - (Date.now() - startedAt));
+      await this.peerResolver
+        .resolve(peerIdStr, { signal, perStepTimeoutMs: remaining })
+        .catch(() => undefined);
     }
 
     // libp2p internally upgrades relay connections to direct during

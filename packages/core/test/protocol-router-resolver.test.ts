@@ -66,7 +66,15 @@ describe('ProtocolRouter.send + PeerResolver', () => {
     );
     expect(dec.decode(response)).toBe('echo:hi');
     expect(resolveSpy).toHaveBeenCalledOnce();
-    expect(resolveSpy).toHaveBeenCalledWith(b.peerId);
+    // Codex feedback on PR #497: resolver receives the AbortSignal +
+    // remaining time budget so a caller's `timeoutMs` bounds the
+    // entire send (resolver + dial), not just the dial loop.
+    const callArgs = resolveSpy.mock.calls[0];
+    expect(callArgs[0]).toBe(b.peerId);
+    const opts = callArgs[1] as { signal?: AbortSignal; perStepTimeoutMs?: number };
+    expect(opts).toBeDefined();
+    expect(opts.signal).toBeInstanceOf(AbortSignal);
+    expect(typeof opts.perStepTimeoutMs).toBe('number');
   }, 15000);
 
   it('resolver throwing does not block send (best-effort)', async () => {

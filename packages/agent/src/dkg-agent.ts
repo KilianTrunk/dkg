@@ -1379,10 +1379,7 @@ export class DKGAgent {
     });
     this.peerResolver = peerResolver;
     this.router = new ProtocolRouter(this.node, { peerResolver });
-    this.messenger = new Messenger({
-      resolver: peerResolver,
-      router: this.router,
-    });
+    this.messenger = new Messenger({ router: this.router });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
     await this.loadSwmSenderKeyState();
     await this.rehydrateContextGraphSubscriptions();

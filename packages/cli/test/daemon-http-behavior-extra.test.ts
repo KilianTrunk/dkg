@@ -642,6 +642,47 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
   // TODO(devnet-smoke): cover the 501 mapping via an adapter that
   // surfaces `getPublishingConvictionAccountOwner()` but no signer.
 
+  // Codex PR #502 round-10 (raised by @branarakic): the combined-flow
+  // path must be able to send `{ accessPolicy: 0, publishPolicy: 0,
+  // pcaAccountId, register: true }` — public-discoverable but
+  // PCA-curated. Before round-10 the API client didn't forward
+  // `publishPolicy`, so `registerContextGraph` defaulted it to
+  // `open` (from `accessPolicy: 0`) and rejected the PCA id with
+  // "PCA account id can only be used with curated publish policy".
+  // This test pins the API-boundary contract: the request shape is
+  // NOT rejected by the daemon's input validation, and the
+  // register-leg failure (no such PCA token on the test chain) is
+  // surfaced via 200 + `registerErrorStatus: 404` — proving the
+  // combo reaches the chain layer.
+  it('accepts accessPolicy=0 + publishPolicy=0 + pcaAccountId + register=true (public-discoverable + PCA-curated combined flow)', async () => {
+    const d = daemon!;
+    const cgId = 'pca-public-discoverable-' + Math.random().toString(36).slice(2, 8);
+    const res = await fetch(urlFor(d, '/api/context-graph/create'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({
+        id: cgId,
+        name: cgId,
+        accessPolicy: 0,
+        publishPolicy: 0,
+        pcaAccountId: '99999999999999999999',
+        register: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      created?: string;
+      registered?: boolean;
+      registerError?: string;
+      registerErrorStatus?: number;
+    };
+    expect(body.created).toBe(cgId);
+    expect(body.registered).toBe(false);
+    expect(body.registerErrorStatus).toBe(404);
+    expect(body.registerError ?? '').toMatch(/PCA account 99999999999999999999 does not exist/);
+    expect(body.registerError ?? '').not.toMatch(/curated publish policy/);
+  });
+
   // Codex review #502-3: a bad pcaAccountId on /register surfaces as a
   // chain revert ("ERC721NonexistentToken" or similar) from the EVM
   // adapter. The daemon must translate it into a clean 4xx with the

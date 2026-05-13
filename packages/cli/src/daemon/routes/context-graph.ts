@@ -509,6 +509,13 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     if (parsedPcaAccountId.error) {
       return jsonResponse(res, 400, { error: parsedPcaAccountId.error });
     }
+    // publishPolicy override is forwarded to `registerContextGraph` in
+    // the combined-flow path (Codex PR #502 round-10) — validate the
+    // shape the same way /api/context-graph/register does so callers
+    // get an actionable 400 instead of a 500 from the agent layer.
+    if (publishPolicy !== undefined && publishPolicy !== 0 && publishPolicy !== 1) {
+      return jsonResponse(res, 400, { error: '"publishPolicy" must be 0 (curated) or 1 (open)' });
+    }
     // pcaAccountId is a curated-publish signal: reject ONLY the
     // explicit `publishPolicy: 1 (open)` combo at the API boundary
     // instead of letting it surface as a 500 from the agent.

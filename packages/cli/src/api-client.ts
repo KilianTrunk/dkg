@@ -905,6 +905,18 @@ export class ApiClient {
      */
     register?: boolean;
     /**
+     * Publish policy override forwarded to `registerContextGraph` in
+     * the combined-flow path. Only meaningful together with
+     * `register: true`. The agent otherwise defaults
+     * `publishPolicy = curated (0)` for curated/private CGs and
+     * `publishPolicy = open (1)` for public CGs — which makes the
+     * valid `{ accessPolicy: 0 (public), publishPolicy: 0 (curated),
+     * pcaAccountId }` combo unreachable unless the caller can pin
+     * `publishPolicy` explicitly. Codex PR #502 round-10 (raised by
+     * @branarakic).
+     */
+    publishPolicy?: number;
+    /**
      * Publishing Conviction Account id for PCA-curated registration.
      * Only meaningful together with `register: true`. The daemon
      * rejects the create-only-with-pcaAccountId combo with a 400
@@ -936,6 +948,7 @@ export class ApiClient {
         : {}),
       ...(options?.requiredSignatures != null ? { requiredSignatures: options.requiredSignatures } : {}),
       ...(options?.register === true ? { register: true } : {}),
+      ...(options?.publishPolicy != null ? { publishPolicy: options.publishPolicy } : {}),
       ...(options?.pcaAccountId != null ? { pcaAccountId: options.pcaAccountId.toString() } : {}),
     });
   }

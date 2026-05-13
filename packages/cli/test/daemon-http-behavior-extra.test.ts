@@ -549,6 +549,64 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     expect([200, 201]).toContain(create.status);
   });
 
+  // Codex review #502 follow-up: when /create { register: true }
+  // includes a bad pcaAccountId, the create-time persist must NOT
+  // leave the bad id in local CG metadata after the register leg
+  // fails. The daemon catch rolls it back so a subsequent /register
+  // call that omits the param falls through cleanly instead of
+  // silently replaying the bad id from storage.
+  it('rolls back the create-time pcaAccountId persist when register fails inside /create', async () => {
+    const d = daemon!;
+    const cgId = 'pca-create-register-rollback-' + Math.random().toString(36).slice(2, 8);
+
+    // /create { register: true } with a bad pcaAccountId. The register
+    // leg fails on chain owner-lookup; the daemon route's catch must
+    // call clearContextGraphPublishAuthorityAccountId so the persisted
+    // id is wiped.
+    const createAndRegister = await fetch(urlFor(d, '/api/context-graph/create'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({
+        id: cgId,
+        name: cgId,
+        accessPolicy: 1,
+        pcaAccountId: '99999999999999999999',
+        register: true,
+      }),
+    });
+    // /create itself succeeds (CG is created locally); only the
+    // register leg fails, so the response is 200 with `registered: false`.
+    expect(createAndRegister.status).toBe(200);
+    const body = (await createAndRegister.json()) as {
+      registered?: boolean;
+      registerError?: string;
+    };
+    expect(body.registered).toBe(false);
+    expect(typeof body.registerError).toBe('string');
+
+    // Follow-up /register call omitting pcaAccountId. If the rollback
+    // worked, the agent resolver finds NOTHING in storage and falls
+    // through to the EOA-curated branch (which on the test daemon's
+    // edge node + shared Hardhat signer succeeds → 200). The
+    // alternative scenario — failure for *any* reason that isn't
+    // "PCA account 99... does not exist" — also counts: the only thing
+    // the rollback contract forbids is silently replaying the stale
+    // bad id.
+    const retryRegister = await fetch(urlFor(d, '/api/context-graph/register'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({ id: cgId, accessPolicy: 1 }),
+    });
+    const retryBody = (await retryRegister.json()) as { error?: string; registered?: string };
+    if (retryRegister.status >= 400) {
+      expect(retryBody.error ?? '').not.toMatch(/99999999999999999999.*does not exist/);
+    } else {
+      // 2xx success path: the create-time bad id is fully gone — the
+      // register call didn't even try the PCA branch.
+      expect([200, 201]).toContain(retryRegister.status);
+    }
+  });
+
   // Codex review #502-3: a bad pcaAccountId on /register surfaces as a
   // chain revert ("ERC721NonexistentToken" or similar) from the EVM
   // adapter. The daemon must translate it into a clean 4xx with the

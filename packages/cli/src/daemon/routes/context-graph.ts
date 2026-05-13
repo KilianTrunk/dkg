@@ -542,6 +542,20 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         });
       } catch (regErr: any) {
         process.stderr.write(`[DKG-Daemon] WARN: Context graph "${id}" created locally but on-chain registration failed: ${regErr?.message ?? 'unknown error'}\n`);
+        // Roll back the create-time pcaAccountId persist on register
+        // failure. Without this, a bad id supplied via /create
+        // { register: true } would stick in local CG metadata and
+        // silently replay on every retry that omits the param (Codex
+        // review #502 follow-up on dkg-agent.ts:7175).
+        if (parsedPcaAccountId.value !== undefined) {
+          try {
+            await agent.clearContextGraphPublishAuthorityAccountId(id);
+          } catch (clearErr: any) {
+            process.stderr.write(
+              `[DKG-Daemon] WARN: failed to roll back pcaAccountId for "${id}" after register failure: ${clearErr?.message ?? 'unknown error'}\n`,
+            );
+          }
+        }
         return jsonResponse(res, 200, {
           created: id,
           uri: `did:dkg:context-graph:${id}`,

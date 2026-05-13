@@ -7777,7 +7777,18 @@ export class DKGAgent {
         throw new Error('PCA account id must be a positive integer.');
       }
     }
-    if (publishPolicy === EVM_PUBLISH_OPEN && publishAuthorityAccountId !== undefined) {
+    // PCA account ids are only valid for curated/private context graphs.
+    // Reject in TWO orthogonal cases (Codex review #502 follow-up):
+    //   (a) publishPolicy resolves to EVM_PUBLISH_OPEN — the on-chain
+    //       contract's PCA branch in `isAuthorizedPublisher` never fires
+    //       for open publish policy.
+    //   (b) resolvedLocalAccessPolicy is LOCAL_ACCESS_OPEN — even if the
+    //       caller explicitly forces `publishPolicy=0 (curated)`, a CG
+    //       that is locally OPEN (public/discoverable) does not match
+    //       the "curated/private" contract enforced at create time and
+    //       advertised by the new API messages.
+    if (publishAuthorityAccountId !== undefined
+      && (publishPolicy === EVM_PUBLISH_OPEN || resolvedLocalAccessPolicy === LOCAL_ACCESS_OPEN)) {
       throw new Error('PCA account id can only be used with curated/private context graphs.');
     }
     // NOTE: we intentionally defer persisting `requestedPublishAuthorityAccountId`
@@ -7850,19 +7861,40 @@ export class DKGAgent {
         if (typeof this.chain.getPublishingConvictionAccountOwner !== 'function') {
           throw new Error('PCA curated context graph registration requires chain adapter PCA owner lookup support.');
         }
-        // Translate raw chain reverts on a nonexistent PCA token to a
-        // stable, caller-input-shaped error so the daemon route can map
-        // it cleanly to 4xx instead of bleeding execution-revert text
-        // through as a 500 (Codex review #502-3).
+        // Translate KNOWN nonexistent-token reverts on the PCA NFT into
+        // a stable, caller-input-shaped error so the daemon route can
+        // map it cleanly to 404. Anything else (RPC outage, network
+        // glitch, adapter-internal failure) is rethrown with its
+        // original class/message so the daemon's catch surfaces it as a
+        // retriable 500/503 rather than a misleading 404 (Codex review
+        // #502-3 follow-up: don't blanket-translate every adapter
+        // failure as "does not exist").
         try {
           publishAuthority = ethers.getAddress(
             await this.chain.getPublishingConvictionAccountOwner(publishAuthorityAccountId),
           );
         } catch (lookupErr: any) {
-          const lookupMsg = String(lookupErr?.message ?? lookupErr ?? 'unknown error');
-          throw new Error(
-            `PCA account ${publishAuthorityAccountId} does not exist or cannot be looked up: ${lookupMsg}`,
-          );
+          const lookupMsg = String(lookupErr?.message ?? lookupErr ?? '');
+          const errCode = String(lookupErr?.code ?? '');
+          // Patterns we recognise as "this PCA token doesn't exist":
+          //   - OZ ERC721 custom error (modern: `ERC721NonexistentToken`,
+          //     legacy: `ERC721: invalid token ID` / `nonexistent token`).
+          //   - The mock adapter's `No mock PCA owner for account ...`
+          //     parity throw used in unit tests.
+          //   - ethers v6 surfaces these as `BAD_DATA` / `CALL_EXCEPTION`
+          //     with the OZ error name in the message.
+          const isNonexistentToken =
+            /ERC721NonexistentToken/.test(lookupMsg)
+            || /invalid token ID/i.test(lookupMsg)
+            || /nonexistent token/i.test(lookupMsg)
+            || /No mock PCA owner for account/.test(lookupMsg)
+            || (errCode === 'CALL_EXCEPTION' && /ERC721/.test(lookupMsg));
+          if (isNonexistentToken) {
+            throw new Error(
+              `PCA account ${publishAuthorityAccountId} does not exist or cannot be looked up: ${lookupMsg}`,
+            );
+          }
+          throw lookupErr;
         }
       } else {
         publishAuthority = await this.getChainPublishAuthorityAddress(id);
@@ -11015,6 +11047,26 @@ export class DKGAgent {
       predicate: DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID,
       object: `"${accountId.toString()}"`,
     }]);
+  }
+
+  /**
+   * Clear the persisted `publishAuthorityAccountId` triple for a context
+   * graph. Used by the daemon's create+register flow to roll back a
+   * pcaAccountId that was written at create time when the immediately-
+   * following register call fails — otherwise a bad PCA id would stick
+   * in local CG metadata and silently replay on every later register
+   * attempt that omits the param (Codex review #502 follow-up).
+   *
+   * Public so the daemon route can invoke it; idempotent.
+   */
+  async clearContextGraphPublishAuthorityAccountId(contextGraphId: string): Promise<void> {
+    const cgMetaGraph = contextGraphMetaUri(contextGraphId);
+    const cgUri = `did:dkg:context-graph:${contextGraphId}`;
+    await this.store.deleteByPattern({
+      graph: cgMetaGraph,
+      subject: cgUri,
+      predicate: DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID,
+    });
   }
 
   /**

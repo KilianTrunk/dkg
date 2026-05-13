@@ -2670,6 +2670,92 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
+  // Codex review #502 follow-up: PCA mode must be rejected when EITHER
+  // axis is open, not just publishPolicy. A caller cannot bypass the
+  // "curated/private only" contract by explicitly forcing
+  // `publishPolicy: 0 (curated)` together with `accessPolicy: 0 (open)`.
+  it('rejects PCA registration when accessPolicy is open even with explicit publishPolicy=0 (curated)', async () => {
+    const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
+    const pcaAccountId = 88n;
+    const chain = new PcaCuratedRegistrationChainAdapter(new Map([[pcaAccountId, pcaOwner]]));
+    const agent = await DKGAgent.create({
+      name: 'PcaOpenAccessPolicyBot',
+      store: new OxigraphStore(),
+      chainAdapter: chain,
+      nodeRole: 'core',
+    });
+    await agent.start();
+
+    // Create as open (no accessPolicy / private / allowlists). The
+    // agent's createContextGraph PCA gate rejects this at create time,
+    // so we have to set up a CG that's open locally without going
+    // through createContextGraph's PCA branch — use a plain create and
+    // then attempt to force the contradictory combo at register time.
+    await agent.createContextGraph({
+      id: 'reject-open-access-with-pca',
+      name: 'Reject Open AccessPolicy with PCA',
+      callerAgentAddress: pcaOwner,
+    });
+
+    await expect(agent.registerContextGraph('reject-open-access-with-pca', {
+      callerAgentAddress: pcaOwner,
+      accessPolicy: 0,
+      publishPolicy: 0,
+      publishAuthorityAccountId: pcaAccountId,
+    })).rejects.toThrow(/PCA account id can only be used with curated\/private context graphs/);
+
+    expect(chain.createOnChainContextGraphCalls).toHaveLength(0);
+    await agent.stop().catch(() => {});
+  });
+
+  // Codex review #502 follow-up: only KNOWN nonexistent-token reverts
+  // should be translated to "PCA account ... does not exist". Transient
+  // RPC / adapter failures must preserve their original message so the
+  // daemon mapping doesn't synthesize a 404 for retriable issues.
+  it('does NOT rewrite generic adapter failures (e.g. RPC outages) as "PCA does not exist"', async () => {
+    const rpcOutageMsg = 'connection refused: chain RPC unreachable';
+    class RpcOutageChainAdapter extends AsyncSignerAddressContextGraphChainAdapter {
+      async getPublishingConvictionAccountOwner(_accountId: bigint): Promise<string> {
+        throw new Error(rpcOutageMsg);
+      }
+    }
+    const chain = new RpcOutageChainAdapter();
+    const pcaOwner = ethers.getAddress(chain.signerAddress);
+    const agent = await DKGAgent.create({
+      name: 'PcaRpcOutageBot',
+      store: new OxigraphStore(),
+      chainAdapter: chain,
+      nodeRole: 'core',
+    });
+    await agent.start();
+
+    await agent.createContextGraph({
+      id: 'rpc-outage-during-register',
+      name: 'RPC Outage During Register',
+      accessPolicy: 1,
+      callerAgentAddress: pcaOwner,
+    });
+
+    // The thrown error must preserve the original RPC outage message
+    // verbatim and must NOT be wrapped as "PCA account ... does not
+    // exist" — the daemon mapping would otherwise turn a retriable
+    // 5xx-class infrastructure failure into a misleading 404.
+    let caught: Error | undefined;
+    try {
+      await agent.registerContextGraph('rpc-outage-during-register', {
+        callerAgentAddress: pcaOwner,
+        publishAuthorityAccountId: 42n,
+      });
+    } catch (err: any) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught?.message ?? '').toContain(rpcOutageMsg);
+    expect(caught?.message ?? '').not.toMatch(/PCA account 42 does not exist/);
+
+    await agent.stop().catch(() => {});
+  });
+
   // Codex review #502-2: `{ private: true, accessPolicy: 0,
   // pcaAccountId }` create+register must not flip-flop between curated
   // (at create time) and open (at register time). The daemon route's

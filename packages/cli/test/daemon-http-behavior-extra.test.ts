@@ -538,15 +538,22 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     expect(body.error).toMatch(/pcaAccountId|PCA account id/i);
   });
 
-  it('treats pcaAccountId as curated input when creating a context graph', async () => {
+  // Codex PR #502 round-5: pcaAccountId on a create-only request used
+  // to be silently accepted (and silently dropped because
+  // createContextGraph no longer persists it). The daemon now rejects
+  // the create-without-register combo at the API boundary.
+  it('rejects pcaAccountId on POST /api/context-graph/create when register is not true', async () => {
     const d = daemon!;
-    const cgId = 'pca-create-' + Math.random().toString(36).slice(2, 8);
+    const cgId = 'pca-create-only-' + Math.random().toString(36).slice(2, 8);
     const create = await fetch(urlFor(d, '/api/context-graph/create'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
       body: JSON.stringify({ id: cgId, name: cgId, pcaAccountId: '1' }),
     });
-    expect([200, 201]).toContain(create.status);
+    expect(create.status).toBe(400);
+    const body = (await create.json()) as { error?: string };
+    expect(body.error ?? '').toMatch(/register: true|register=true|register/i);
+    expect(body.error ?? '').toMatch(/pcaAccountId/);
   });
 
   // Codex review #502 round-3: pcaAccountId is a register-time knob —

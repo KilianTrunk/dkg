@@ -2552,6 +2552,53 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
+  // Codex PR #502 round-5: PCA registration must fail-closed when the
+  // chain adapter exposes `getPublishingConvictionAccountOwner()` but
+  // doesn't surface its tx signer in any introspectable way. Without
+  // this guard, a custom adapter could sneak past the
+  // "chain signer == PCA owner" invariant and the registration tx
+  // would still mint the governance NFT to whatever address the
+  // adapter actually signs with.
+  it('rejects PCA registration when chain adapter does not expose its tx signer', async () => {
+    const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
+    const pcaAccountId = 242n;
+    class SignerlessPcaChainAdapter extends PcaCuratedRegistrationChainAdapter {
+      constructor(accountOwners: Map<bigint, string>) {
+        // signerAddress = zero address: every probe path in
+        // inferAdapterPublisherAddress filters it out via
+        // normalizeAdapterPublisherAddress, so
+        // getChainPublishAuthorityAddress returns undefined.
+        super(accountOwners, ethers.ZeroAddress);
+      }
+      override async getSignerAddress(): Promise<string> {
+        throw new Error('signer address not exposed by this adapter');
+      }
+    }
+    const chain = new SignerlessPcaChainAdapter(new Map([[pcaAccountId, pcaOwner]]));
+    const agent = await DKGAgent.create({
+      name: 'PcaSignerlessAdapterBot',
+      store: new OxigraphStore(),
+      chainAdapter: chain,
+      nodeRole: 'core',
+    });
+    await agent.start();
+
+    await agent.createContextGraph({
+      id: 'reject-pca-signerless-adapter',
+      name: 'Reject PCA signerless adapter',
+      accessPolicy: 1,
+      callerAgentAddress: pcaOwner,
+    });
+
+    await expect(agent.registerContextGraph('reject-pca-signerless-adapter', {
+      callerAgentAddress: pcaOwner,
+      publishAuthorityAccountId: pcaAccountId,
+    })).rejects.toThrow(/does not expose its registration-tx signer|invariant cannot be verified/);
+
+    expect(chain.createOnChainContextGraphCalls).toHaveLength(0);
+    await agent.stop().catch(() => {});
+  });
+
   // Codex PR #502 round-4: rejects PCA registration when the chain
   // signer (registration-tx msg.sender) doesn't match the PCA owner.
   // Without this guard, `ContextGraphs.createContextGraph` on-chain

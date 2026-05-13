@@ -474,6 +474,21 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     if (parsedPcaAccountId.value !== undefined && accessPolicy === 0 && parsed.private !== true) {
       return jsonResponse(res, 400, { error: 'pcaAccountId is only valid for curated/private context graphs' });
     }
+    // pcaAccountId on a create-only request is a silent foot-gun:
+    // `createContextGraph()` no longer persists it (Codex PR #502
+    // round-3), so a later `/register` call without re-supplying the
+    // id would register as plain EOA-curated. Reject the
+    // create-without-register combo so callers either bundle the
+    // combined flow (`register: true`) or move the id to the
+    // dedicated `/register` call. Codex PR #502 round-5.
+    if (parsedPcaAccountId.value !== undefined && parsed.register !== true) {
+      return jsonResponse(res, 400, {
+        error:
+          'pcaAccountId on POST /api/context-graph/create requires `register: true` in the same call. '
+          + 'For two-step flows, pass pcaAccountId on POST /api/context-graph/register instead — '
+          + 'create-only requests do not persist the PCA id locally.',
+      });
+    }
     // Effective accessPolicy for both the create and the (optional)
     // register-during-create leg below. Priority:
     //   1. `private: true` is a curated signal that overrides any

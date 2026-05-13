@@ -19,6 +19,11 @@ Oxigraph metadata and out of Oxigraph literal storage where possible:
 - Public operation snapshots are now stored as compact graphless N-Quads files
   instead of JSON quad arrays, with read compatibility for existing `.json`
   snapshot files.
+- SWM catch-up sync transfers referenced snapshot blobs before inserting
+  `dkg:publicSnapshotRef` metadata, so late peers do not receive dangling local
+  file references.
+- Daemon publisher control uses the same snapshot store as the agent runtime,
+  so `/api/publisher/job-payload` can inspect ref-backed jobs.
 
 ## Implementation Details
 
@@ -45,6 +50,13 @@ Each share operation has an immutable public snapshot backing store. Lift
 resolution checks the requested roots against the operation metadata, reads the
 snapshot, recomputes digest/count, and fails if the snapshot is missing or
 corrupt. It does not fall back to the current live SWM root state.
+
+Catch-up sync treats snapshot refs as required backing data. When a peer fetches
+SWM meta/data and sees `dkg:publicSnapshotRef`, it requests the referenced
+snapshot over a dedicated sync phase, validates the received N-Quads against
+`dkg:publicQuadsDigest` and `dkg:publicQuadsCount`, writes the local snapshot
+file, and only then inserts the fetched RDF metadata. A missing or corrupt
+remote snapshot fails that peer sync instead of leaving unusable metadata.
 
 ```mermaid
 flowchart TD
@@ -97,6 +109,7 @@ compatible.
 sequenceDiagram
   participant Client
   participant Agent
+  participant Peer as Sync peer
   participant Store as Oxigraph-backed store
   participant Blobs as literal-blobs
   participant Snapshots as swm-public-snapshots
@@ -107,6 +120,11 @@ sequenceDiagram
   Store-->>Agent: stored placeholders in Oxigraph
   Agent->>Snapshots: write immutable public snapshot as .nq
   Agent->>Store: insert compact metadata refs
+  Peer->>Agent: SWM sync meta/data
+  Agent-->>Peer: publicSnapshotRef metadata
+  Peer->>Agent: SWM sync snapshot(ref)
+  Agent-->>Peer: graphless .nq snapshot page
+  Peer->>Snapshots: validate digest/count and write local .nq
   Client->>Agent: enqueue/publish by shareOperationId
   Agent->>Snapshots: read .nq snapshot
   Agent->>Store: hydrate external literal refs
@@ -120,6 +138,8 @@ Focused checks run:
 ```bash
 pnpm --filter @origintrail-official/dkg-storage exec vitest run test/storage.test.ts test/external-literal-store.test.ts
 pnpm --filter @origintrail-official/dkg-publisher exec vitest run test/async-lift-workspace.test.ts
+pnpm --filter @origintrail-official/dkg-agent exec vitest run test/swm-snapshot-sync.test.ts
+pnpm --filter @origintrail-official/dkg exec vitest run test/publisher-route-snapshot.test.ts
 pnpm --filter @origintrail-official/dkg exec vitest run test/swm-large-payload-benchmark.test.ts
 pnpm --filter @origintrail-official/dkg exec vitest run test/swm-triple-volume-benchmark.test.ts
 pnpm --filter @origintrail-official/dkg-storage build

@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import type { Quad } from '@origintrail-official/dkg-storage';
 
@@ -24,7 +25,7 @@ export class FileWorkspacePublicSnapshotStore implements WorkspacePublicSnapshot
   }): Promise<{ readonly ref: string; readonly byteLength: number }> {
     const hash = snapshotHash(input.digest);
     const filePath = snapshotPath(this.directory, hash, 'nq');
-    const payload = serializeQuadsToNQuads(input.quads);
+    const payload = serializeWorkspacePublicSnapshotQuads(input.quads);
 
     await mkdir(dirname(filePath), { recursive: true });
     const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
@@ -51,7 +52,7 @@ export class FileWorkspacePublicSnapshotStore implements WorkspacePublicSnapshot
       return this.getLegacyJsonSnapshot(ref, hash);
     }
 
-    return parseQuadsFromNQuads(raw, ref);
+    return parseWorkspacePublicSnapshotNQuads(raw, ref);
   }
 
   private async getLegacyJsonSnapshot(ref: string, hash: string): Promise<Quad[] | null> {
@@ -93,9 +94,18 @@ function snapshotPath(directory: string, hash: string, extension: 'json' | 'nq')
   return join(directory, hash.slice(0, 2), hash.slice(2, 4), `${hash}.${extension}`);
 }
 
-function serializeQuadsToNQuads(quads: readonly Quad[]): string {
+export function serializeWorkspacePublicSnapshotQuads(quads: readonly Quad[]): string {
   if (quads.length === 0) return '';
   return `${quads.map(quadToNQuad).join('\n')}\n`;
+}
+
+export function workspacePublicQuadsDigest(quads: readonly Quad[]): string {
+  const canonical = quads
+    .map((quad) => [quad.subject, quad.predicate, quad.object, ''])
+    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  const hash = createHash('sha256');
+  hash.update(JSON.stringify(canonical));
+  return `sha256:${hash.digest('hex')}`;
 }
 
 function quadToNQuad(quad: Quad): string {
@@ -120,7 +130,7 @@ function escapeIri(iri: string): string {
   return iri.replace(/[<>"{}|\\^`]/g, '');
 }
 
-function parseQuadsFromNQuads(raw: string, ref: string): Quad[] {
+export function parseWorkspacePublicSnapshotNQuads(raw: string, ref: string): Quad[] {
   const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   return lines.map((line, index) => parseNQuadLine(line, ref, index));
 }

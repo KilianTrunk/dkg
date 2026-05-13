@@ -1,11 +1,10 @@
 import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { assertSafeIri, isSafeIri, validateSubGraphName } from '@origintrail-official/dkg-core';
-import { createHash } from 'node:crypto';
 import type { LiftRequest } from './lift-job.js';
 import type { LiftResolvedPublishSlice } from './async-lift-publish-options.js';
 import { generateShareMetadata } from './metadata.js';
-import type { WorkspacePublicSnapshotStore } from './workspace-snapshot-store.js';
+import { workspacePublicQuadsDigest, type WorkspacePublicSnapshotStore } from './workspace-snapshot-store.js';
 
 const DKG = 'http://dkg.io/ontology/';
 const PROV = 'http://www.w3.org/ns/prov#';
@@ -111,7 +110,7 @@ export async function storeWorkspaceOperationPublicQuads(params: {
       subGraphName,
     );
     const rootQuads = filterQuadsForRoot(normalizedQuads, root);
-    const digest = publicQuadsDigest(rootQuads);
+    const digest = workspacePublicQuadsDigest(rootQuads);
     let snapshotRef: string | undefined;
     let snapshotGraph: string | undefined;
     if (params.publicSnapshotStore) {
@@ -387,7 +386,7 @@ async function resolveCompactWorkspaceOperationPublicQuads(params: {
       missingRoots.push(root);
       continue;
     }
-    const snapshotDigest = publicQuadsDigest(snapshotQuads);
+    const snapshotDigest = workspacePublicQuadsDigest(snapshotQuads);
     if (snapshotDigest !== expectedDigest || snapshotQuads.length !== expectedCount) {
       staleRoots.push(root);
       continue;
@@ -585,15 +584,6 @@ function parseStoredPublicQuads(value: string | undefined, shareOperationId: str
 
 function filterQuadsForRoot(quads: readonly Quad[], root: string): Quad[] {
   return quads.filter((quad) => quad.subject === root || quad.subject.startsWith(`${root}/.well-known/genid/`));
-}
-
-function publicQuadsDigest(quads: readonly Quad[]): string {
-  const canonical = quads
-    .map((quad) => [quad.subject, quad.predicate, quad.object, ''])
-    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-  const hash = createHash('sha256');
-  hash.update(JSON.stringify(canonical));
-  return `sha256:${hash.digest('hex')}`;
 }
 
 function lit(value: string): string {

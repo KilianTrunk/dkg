@@ -68,6 +68,7 @@ import {
   subtractFinalizedExactQuads,
   TripleStoreAsyncLiftPublisher,
   FileWorkspacePublicSnapshotStore,
+  parseWorkspacePublicSnapshotNQuads,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
@@ -149,7 +150,7 @@ import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch
 import { getSyncCheckpointKey } from './sync/checkpoint/state.js';
 import { runDurableSync } from './sync/requester/durable-sync.js';
 import { runSharedMemorySync } from './sync/requester/shared-memory-sync.js';
-import { buildSyncRequestEnvelope } from './sync/auth/request-build.js';
+import { buildSyncRequestEnvelope, type SyncPhase } from './sync/auth/request-build.js';
 import { authorizePrivateSyncRequest } from './sync/auth/request-authorize.js';
 import { registerSyncHandler } from './sync/responder/sync-handler.js';
 import { runSyncOnConnect } from './sync/on-connect/sync-on-connect.js';
@@ -526,7 +527,8 @@ interface SyncRequestEnvelope {
   offset: number;
   limit: number;
   includeSharedMemory: boolean;
-  phase?: 'data' | 'meta';
+  phase?: SyncPhase;
+  snapshotRef?: string;
   targetPeerId?: string;
   requesterPeerId?: string;
   requestId?: string;
@@ -535,6 +537,11 @@ interface SyncRequestEnvelope {
   requesterAgentAddress?: string;
   requesterSignatureR?: string;
   requesterSignatureVS?: string;
+}
+
+function normalizeSyncPhase(value: unknown): SyncPhase {
+  if (value === 'meta' || value === 'snapshot') return value;
+  return 'data';
 }
 
 /** Health status of a peer from the last ping round. */
@@ -1733,6 +1740,7 @@ export class DKGAgent {
       syncPageSize: SYNC_PAGE_SIZE,
       sharedMemoryTtlMs: this.config.sharedMemoryTtlMs ?? DEFAULT_SWM_TTL_MS,
       store: this.store,
+      publicSnapshotStore: this.publicSnapshotStore,
       peerId: this.peerId,
       parseSyncRequest: this.parseSyncRequest.bind(this),
       authorizeSyncRequest: this.authorizeSyncRequest.bind(this),
@@ -2461,9 +2469,10 @@ export class DKGAgent {
     remotePeerId: string,
     contextGraphId: string,
     includeSharedMemory: boolean,
-    phase: 'data' | 'meta',
+    phase: SyncPhase,
     graphUri: string,
     deadline: number,
+    snapshotRef?: string,
   ): Promise<SyncPageResult> {
     return fetchSyncPages({
       ctx,
@@ -2472,6 +2481,7 @@ export class DKGAgent {
       includeSharedMemory,
       phase,
       graphUri,
+      snapshotRef,
       deadline,
       syncPageTimeoutMs: SYNC_PAGE_TIMEOUT_MS,
       syncRouterAttempts: SYNC_ROUTER_ATTEMPTS,
@@ -2490,7 +2500,13 @@ export class DKGAgent {
       protocolSync: PROTOCOL_SYNC,
       checkpointStore: this.syncCheckpoints,
       buildSyncRequest: this.buildSyncRequest.bind(this),
-      parseAndFilter: (nquadsText, targetGraphUri, targetContextGraphId) => this.getOrCreateSyncVerifyWorker().parseAndFilter(nquadsText, targetGraphUri, targetContextGraphId),
+      parseAndFilter: (nquadsText, targetGraphUri, targetContextGraphId) => {
+        if (phase === 'snapshot') {
+          const quads = parseWorkspacePublicSnapshotNQuads(nquadsText, snapshotRef ?? 'unknown');
+          return Promise.resolve({ quads, totalQuads: quads.length });
+        }
+        return this.getOrCreateSyncVerifyWorker().parseAndFilter(nquadsText, targetGraphUri, targetContextGraphId);
+      },
       send: (peerId, protocolId, data, sendTimeoutMs) => this.messenger.sendToPeer(peerId, protocolId, data, { timeoutMs: sendTimeoutMs }),
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
@@ -2552,6 +2568,7 @@ export class DKGAgent {
         await graphManager.ensureContextGraph(contextGraphId);
       },
       storeInsert: (quads) => this.store.insert(quads),
+      publicSnapshotStore: this.publicSnapshotStore,
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
       setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
       ensureOwnedMap: (contextGraphId) => {
@@ -9743,7 +9760,8 @@ export class DKGAgent {
         offset: parsed.offset ?? 0,
         limit: Math.min(parsed.limit ?? SYNC_PAGE_SIZE, SYNC_PAGE_SIZE),
         includeSharedMemory: parsed.includeSharedMemory ?? false,
-        phase: parsed.phase === 'meta' ? 'meta' : 'data',
+        phase: normalizeSyncPhase(parsed.phase),
+        snapshotRef: typeof parsed.snapshotRef === 'string' ? parsed.snapshotRef : undefined,
         targetPeerId: parsed.targetPeerId,
         requesterPeerId: parsed.requesterPeerId,
         requestId: parsed.requestId,
@@ -9763,12 +9781,14 @@ export class DKGAgent {
     const ctxGraphPart = parts[0] || '';
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
     const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    const phase = normalizeSyncPhase(parts[3]);
     return {
       contextGraphId,
       offset: parseInt(parts[1], 10) || 0,
       limit: Math.min(parseInt(parts[2], 10) || SYNC_PAGE_SIZE, SYNC_PAGE_SIZE),
       includeSharedMemory,
-      phase: parts[3] === 'meta' ? 'meta' : 'data',
+      phase,
+      snapshotRef: phase === 'snapshot' ? parts[4] : undefined,
     };
   }
 
@@ -9841,7 +9861,8 @@ export class DKGAgent {
     limit: number,
     includeSharedMemory: boolean,
     responderPeerId: string,
-    phase: 'data' | 'meta' = 'data',
+    phase: SyncPhase = 'data',
+    snapshotRef?: string,
   ): Promise<Uint8Array> {
     const isPrivate = await this.isPrivateContextGraph(contextGraphId);
 
@@ -9861,6 +9882,7 @@ export class DKGAgent {
       targetPeerId: responderPeerId,
       requesterPeerId: this.peerId,
       phase,
+      snapshotRef,
       needsAuth,
       computeSyncDigest: this.computeSyncDigest.bind(this),
       getIdentityId: () => this.chain.getIdentityId(),

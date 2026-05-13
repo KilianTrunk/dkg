@@ -101,7 +101,7 @@ import {
   slotEntryPoint,
   CLI_NPM_PACKAGE,
 } from '../config.js';
-import { createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
+import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
 import { loadTokens, httpAuthGuard } from '../auth.js';
 import { ExtractionPipelineRegistry } from '@origintrail-official/dkg-core';
@@ -637,7 +637,10 @@ export async function runDaemonInner(
   let publisherRuntime: PublisherRuntime | null = null;
 
   const networkId = await computeNetworkId();
-  const publisherControl = createPublisherControlFromStore(agent.store);
+  const publisherControl = createPublisherControlFromStore(
+    agent.store,
+    createPublicSnapshotStore(dkgDir(), config),
+  );
   log(`Network: ${networkId.slice(0, 16)}...`);
   if (network?.networkId && network.networkId !== networkId) {
     log(

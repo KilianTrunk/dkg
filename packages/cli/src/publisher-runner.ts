@@ -149,8 +149,11 @@ export function createPublisherInspectorFromStore(
   };
 }
 
-export function createPublisherControlFromStore(store: TripleStore): AsyncLiftPublisher {
-  return new TripleStoreAsyncLiftPublisher(store);
+export function createPublisherControlFromStore(
+  store: TripleStore,
+  publicSnapshotStore?: WorkspacePublicSnapshotStore,
+): AsyncLiftPublisher {
+  return new TripleStoreAsyncLiftPublisher(store, { publicSnapshotStore });
 }
 
 export async function createPublisherRuntimeFromAgent(args: {
@@ -482,7 +485,7 @@ function defaultLargeLiteralStorage(dataDir: string, config: DkgConfig) {
   };
 }
 
-function createPublicSnapshotStore(
+export function createPublicSnapshotStore(
   dataDir: string,
   config?: Pick<DkgConfig, 'sharedMemoryPublicSnapshotStorage'>,
 ): WorkspacePublicSnapshotStore | undefined {

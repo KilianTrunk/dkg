@@ -171,6 +171,9 @@ export {
 export { SharedMemoryHandler, WorkspaceHandler } from './workspace-handler.js';
 export {
   FileWorkspacePublicSnapshotStore,
+  parseWorkspacePublicSnapshotNQuads,
+  serializeWorkspacePublicSnapshotQuads,
+  workspacePublicQuadsDigest,
   type SharedMemoryPublicSnapshotStorageConfig,
   type WorkspacePublicSnapshotStore,
 } from './workspace-snapshot-store.js';

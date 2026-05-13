@@ -15,6 +15,36 @@ PASS=0
 FAIL=0
 WARN=0
 
+# Total-script timing — print elapsed at the bottom so a "this used to take
+# 3 minutes" regression is visible. Per-section timing is wired into the
+# new sections (28-30) only; retrofitting it across all 28 sections would
+# need wrapping each in a function.
+SCRIPT_T0=$(date +%s)
+
+# Optional knobs for the new RFC 07 sections. Defaults are conservative
+# enough to run end-to-end without surprising the operator. Override:
+#   SKIP_RESTART=1        — skip SECTION 30 (Node1 restart, ~30-60s)
+#   SKIP_MATRIX=1         — skip SECTION 29 (cross-node connect matrix)
+#   RESTART_BOOT_TIMEOUT_S=60   — how long SECTION 30 waits for Node1's API
+SKIP_RESTART="${SKIP_RESTART:-0}"
+SKIP_MATRIX="${SKIP_MATRIX:-0}"
+RESTART_BOOT_TIMEOUT_S="${RESTART_BOOT_TIMEOUT_S:-60}"
+
+# Per-section timer helpers (used by sections 28-30). The existing 27
+# sections aren't wrapped — see comment on SCRIPT_T0 above.
+SECTION_T0=0
+section_start() {
+  SECTION_T0=$(date +%s)
+  echo ""
+  echo "=== $1 ==="
+  echo ""
+}
+section_done() {
+  local elapsed=$(( $(date +%s) - SECTION_T0 ))
+  echo ""
+  echo "  -- section took ${elapsed}s --"
+}
+
 # P1-1: Bounded curl — every devnet call gets a connect + total timeout so a
 # hung node stalls CI instead of letting a single test run forever. Override
 # DEVNET_CURL_TIMEOUT / DEVNET_CURL_CONNECT_TIMEOUT to widen if needed.
@@ -2250,6 +2280,263 @@ else
   fail "Dial-protocol audit failed: ${AUDIT_OUT:0:400}"
 fi
 
+echo "--- 28h: legacy /api/connect {multiaddr} form still works ---"
+# /api/connect accepts BOTH `{peerId}` (RFC 07 resolver path) and the
+# legacy `{multiaddr: "/ip4/.../p2p/<id>"}` direct dial. The peerId form
+# is exhaustively covered above (28a-28e); the multiaddr form has zero
+# explicit HTTP coverage, so a regression that breaks the legacy branch
+# while editing the resolver branch (in `agent-chat.ts:611`) would slip.
+# This test pins it.
+#
+# /api/info doesn't expose a node's own listen addrs (would be a useful
+# add-on, but that's a separate change), so we extract the loopback addr
+# from the daemon log — which the libp2p stack prints once at startup.
+# Filter: loopback tcp + matching Node2's OWN peerId (the log also
+# contains Node1's relay addr from Node2's bootstrap; we don't want that).
+NODE2_LOG="$SCRIPT_DIR/../.devnet/node2/daemon.log"
+NODE2_PEERID=$(json_get "$(c "http://127.0.0.1:9202/api/info")" peerId)
+NODE2_MULTIADDR=""
+if [[ -f "$NODE2_LOG" && -n "$NODE2_PEERID" && "$NODE2_PEERID" != "__NONE__" && "$NODE2_PEERID" != "__ERR__" ]]; then
+  NODE2_MULTIADDR=$(grep -oE "/ip4/127\\.0\\.0\\.1/tcp/[0-9]+/p2p/${NODE2_PEERID}" "$NODE2_LOG" 2>/dev/null \
+    | awk 'NR==1 {print; exit}')
+fi
+if [[ -z "$NODE2_MULTIADDR" ]]; then
+  warn "Could not extract Node2 multiaddr from $NODE2_LOG — skipping 28h"
+else
+  http_post_capture "http://127.0.0.1:9201/api/connect" \
+    "{\"multiaddr\":\"$NODE2_MULTIADDR\"}" \
+    MA_BODY MA_CODE
+  MA_FLAG=$(json_get "$MA_BODY" connected)
+  if [[ "$MA_CODE" == "200" && "$MA_FLAG" == "true" ]]; then
+    ok "Legacy {multiaddr} form → HTTP 200 connected=true ($NODE2_MULTIADDR)"
+  else
+    fail "Legacy {multiaddr} form returned HTTP $MA_CODE: ${MA_BODY:0:200}"
+  fi
+fi
+
+#------------------------------------------------------------
+section_start "SECTION 29: RFC 07 — Cross-node /api/connect resolver matrix"
+# §28d only proves Node1 can resolve Node3. This section proves the
+# resolver wiring is uniform across the whole cluster: every node can
+# /api/connect to every OTHER node by peerId alone. Catches:
+#   - one node missing the resolver wiring (e.g. an init-order bug)
+#   - edge nodes (no on-chain identity) using the resolver correctly
+#   - asymmetric NAT / relay scenarios where node_i can dial node_j
+#     but not vice versa
+#
+# Caveats / honest limits:
+#   - There's no /api/disconnect endpoint today, and the devnet mesh
+#     auto-bootstraps via mDNS, so most pair connects will hit the
+#     resolver's step-1 live-conn fast-path rather than the cold DHT
+#     walk. SECTION 30 covers the genuine cold path via a Node1
+#     restart. What §29 verifies is that the resolver+route plumbing
+#     is wired correctly on every node — the slow steps don't get
+#     exercised here, the orchestration does.
+if [[ "$SKIP_MATRIX" == "1" ]]; then
+  skip "SECTION 29: skipped via SKIP_MATRIX=1"
+else
+  echo "--- 29a: every node /api/connect's to every other node by peerId ---"
+  # Collect peerIds first to avoid N² /api/info calls.
+  # NOTE: macOS ships bash 3.x which lacks `declare -A` (associative
+  # arrays). We get the same effect via a sparse indexed array — port
+  # numbers are integers so PEERID_BY_PORT[9201]=... stores at index
+  # 9201 and ${PEERID_BY_PORT[9201]} retrieves it cleanly under bash 3+.
+  PEERID_BY_PORT=()
+  for p in "${NODE_PORTS[@]}"; do
+    PEERID_BY_PORT[$p]=$(json_get "$(c "http://127.0.0.1:$p/api/info")" peerId)
+  done
+  matrix_total=0
+  matrix_ok=0
+  matrix_slow=0
+  matrix_fail=0
+  matrix_failures=()
+  for src in "${NODE_PORTS[@]}"; do
+    for dst in "${NODE_PORTS[@]}"; do
+      [[ "$src" == "$dst" ]] && continue
+      dst_peer="${PEERID_BY_PORT[$dst]}"
+      if [[ -z "$dst_peer" || "$dst_peer" == "__NONE__" || "$dst_peer" == "__ERR__" ]]; then
+        matrix_fail=$((matrix_fail + 1))
+        matrix_failures+=("${src}→${dst}: missing dst peerId")
+        continue
+      fi
+      matrix_total=$((matrix_total + 1))
+      pair_t0=$(date +%s)
+      http_post_capture "http://127.0.0.1:$src/api/connect" \
+        "{\"peerId\":\"$dst_peer\"}" \
+        MX_BODY MX_CODE
+      pair_elapsed=$(( $(date +%s) - pair_t0 ))
+      mx_flag=$(json_get "$MX_BODY" connected)
+      if [[ "$MX_CODE" == "200" && "$mx_flag" == "true" ]]; then
+        matrix_ok=$((matrix_ok + 1))
+        # Anything > 2s in a warm devnet means the resolver chain
+        # actually walked DHT instead of step-1 short-circuiting —
+        # not a fail, but worth surfacing for performance tracking.
+        if [[ "$pair_elapsed" -gt 2 ]]; then
+          matrix_slow=$((matrix_slow + 1))
+          echo "  [SLOW] ${src}→${dst} (${dst_peer:0:16}…) took ${pair_elapsed}s"
+        fi
+      else
+        matrix_fail=$((matrix_fail + 1))
+        matrix_failures+=("${src}→${dst} HTTP $MX_CODE in ${pair_elapsed}s: ${MX_BODY:0:120}")
+      fi
+    done
+  done
+  echo "  matrix: $matrix_ok/$matrix_total succeeded; $matrix_slow slow; $matrix_fail failed"
+  if [[ "$matrix_total" -gt 0 && "$matrix_fail" -eq 0 ]]; then
+    ok "Cross-node connect matrix: all $matrix_total pairs reachable via /api/connect {peerId}"
+  elif [[ "$matrix_fail" -gt 0 ]]; then
+    fail "Cross-node connect matrix: $matrix_fail/$matrix_total pairs failed"
+    for f in "${matrix_failures[@]}"; do echo "    - $f"; done
+  else
+    fail "Cross-node connect matrix: zero pairs attempted (NODE_PORTS empty?)"
+  fi
+fi
+section_done
+
+#------------------------------------------------------------
+section_start "SECTION 30: RFC 07 — Restart-resilience for /api/connect"
+# §28-29 prove the resolver works on warm peerStore. This section
+# verifies that a NODE RESTART doesn't break /api/connect — i.e. after
+# Node1 dies and comes back, asking it to dial a peerId still
+# succeeds end-to-end through the same /api/connect surface.
+#
+# Honest scope note (mDNS race):
+#   The original intent was to force a TRUE cold-path walk (peerStore
+#   empty, resolver must use DHT or agents-CG). But on a loopback
+#   devnet, mDNS reconverges in well under a second after Node1's
+#   listen socket binds, so by the time §30e fires, Node1's peerStore
+#   has typically already been re-warmed by mDNS broadcasts from the
+#   other 5 nodes — and the resolver short-circuits at step 1
+#   (live-connection check / cached addrs).
+#
+#   We don't try to suppress mDNS here because (a) doing so would
+#   require devnet config changes outside the test's scope and (b) the
+#   true cold path IS exercised by the unit tests
+#   (peer-resolver.test.ts walks every step with mocked transports).
+#   What this section uniquely contributes is the END-TO-END process
+#   restart — it catches regressions where Node1 restart fails to
+#   wire the resolver into /api/connect at all (init order bugs,
+#   missing dependency injection, etc), even if the resolver itself
+#   doesn't have to do real cold work.
+#
+# We restart Node1 so this section stays self-contained — every other
+# section's state on Node1 is already validated by the time we get
+# here. Node3 stays up and is the connect target.
+#
+# Destructive (restarts Node1) → gated by SKIP_RESTART=1 and runs
+# LAST so nothing else loses state.
+if [[ "$SKIP_RESTART" == "1" ]]; then
+  skip "SECTION 30: skipped via SKIP_RESTART=1 (destructive — restarts Node1)"
+elif [[ ! -f "$SCRIPT_DIR/../.devnet/node1/devnet.pid" ]]; then
+  skip "SECTION 30: no .devnet/node1/devnet.pid found — script not running against a devnet.sh devnet"
+else
+  echo "--- 30a: capture Node3 peerId (will be the connect target after Node1 restart) ---"
+  N3_PEER_BEFORE=$(json_get "$(c "http://127.0.0.1:9203/api/info")" peerId)
+  if [[ -z "$N3_PEER_BEFORE" || "$N3_PEER_BEFORE" == "__NONE__" || "$N3_PEER_BEFORE" == "__ERR__" ]]; then
+    fail "Could not capture Node3 peerId before restart — aborting SECTION 30"
+  else
+    ok "Captured Node3 peerId: ${N3_PEER_BEFORE:0:32}…"
+
+    echo "--- 30b: restart Node1 (libp2p drops, peerStore goes empty) ---"
+    DEVNET_DIR="$SCRIPT_DIR/../.devnet"
+    CLI_JS="$SCRIPT_DIR/../packages/cli/dist/cli.js"
+    PIDFILE="$DEVNET_DIR/node1/devnet.pid"
+    OLD_PID=$(cat "$PIDFILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+      kill "$OLD_PID" 2>/dev/null || true
+      # Wait for clean shutdown (libp2p's port release + storage flush).
+      for i in $(seq 1 15); do
+        kill -0 "$OLD_PID" 2>/dev/null || break
+        sleep 1
+      done
+      if kill -0 "$OLD_PID" 2>/dev/null; then
+        kill -9 "$OLD_PID" 2>/dev/null || true
+        sleep 2
+      fi
+      ok "Node1 stopped (was PID $OLD_PID)"
+    else
+      warn "Node1 PID $OLD_PID was already dead before kill — proceeding anyway"
+    fi
+    rm -f "$PIDFILE" "$DEVNET_DIR/node1/daemon.pid"
+
+    echo "--- 30c: restart Node1 (fresh libp2p instance, empty peerStore) ---"
+    DKG_HOME="$DEVNET_DIR/node1" DKG_NO_BLUE_GREEN=1 \
+      node "$CLI_JS" start --foreground \
+      >> "$DEVNET_DIR/node1/daemon.log" 2>&1 &
+    NEW_PID=$!
+    echo "$NEW_PID" > "$PIDFILE"
+    ok "Node1 restart launched (PID $NEW_PID)"
+
+    echo "--- 30d: wait for Node1's API to come back up (≤ ${RESTART_BOOT_TIMEOUT_S}s) ---"
+    api_ready=0
+    boot_t0=$(date +%s)
+    for i in $(seq 1 "$RESTART_BOOT_TIMEOUT_S"); do
+      if curl -sf --max-time 2 -H "Authorization: Bearer $AUTH" \
+           "http://127.0.0.1:9201/api/status" > /dev/null 2>&1; then
+        api_ready=1
+        boot_elapsed=$(( $(date +%s) - boot_t0 ))
+        ok "Node1 API responsive again after ${boot_elapsed}s"
+        break
+      fi
+      sleep 1
+    done
+    if [[ "$api_ready" -ne 1 ]]; then
+      fail "Node1 API did not respond within ${RESTART_BOOT_TIMEOUT_S}s after restart — aborting SECTION 30"
+    else
+      # Brief settle so libp2p finishes startup (identify, dht warmup).
+      # On loopback, mDNS will likely have already re-warmed the
+      # peerStore — see the section's "Honest scope note" above. 5s
+      # is enough for libp2p to be in a stable state to accept dials.
+      sleep 5
+
+      echo "--- 30e: post-restart /api/connect {peerId: Node3} from freshly-restarted Node1 ---"
+      post_t0=$(date +%s)
+      http_post_capture "http://127.0.0.1:9201/api/connect" \
+        "{\"peerId\":\"$N3_PEER_BEFORE\"}" \
+        POST_BODY POST_CODE
+      post_elapsed=$(( $(date +%s) - post_t0 ))
+      post_flag=$(json_get "$POST_BODY" connected)
+      post_err=$(json_get "$POST_BODY" code)
+      if [[ "$POST_CODE" == "200" && "$post_flag" == "true" ]]; then
+        ok "Post-restart dial Node3 from restarted Node1 → HTTP 200 connected=true in ${post_elapsed}s (resolver wiring intact across process restart)"
+      elif [[ "$POST_CODE" == "504" && "$post_err" == "CONNECT_TIMEOUT" ]]; then
+        # If mDNS hasn't reconverged yet AND DHT/agents-CG also doesn't
+        # respond in time, this is a legitimate transient timeout.
+        # Surface as warn, not fail — the unit test
+        # (peer-resolver.test.ts: "skips later steps once signal is
+        # aborted mid-resolve") covers the timeout semantics, and we
+        # have §30f below as a follow-up to verify mesh recovery.
+        warn "Post-restart dial returned HTTP 504 CONNECT_TIMEOUT in ${post_elapsed}s — resolver walked but did not find Node3 within the budget"
+      elif [[ "$POST_CODE" == "404" && "$post_err" == "PEER_NOT_FOUND" ]]; then
+        warn "Post-restart dial returned HTTP 404 PEER_NOT_FOUND in ${post_elapsed}s — resolver completed but found no addrs"
+      else
+        fail "Post-restart dial returned HTTP $POST_CODE code=$post_err in ${post_elapsed}s: ${POST_BODY:0:200}"
+      fi
+
+      echo "--- 30f: post-restart Node1 has rebuilt the mesh ---"
+      # After the cold dial succeeded (or even if it didn't, mDNS will
+      # have caught up by now), Node1 should report a full mesh again.
+      # This catches a regression where Node1 restarts and silently
+      # never re-discovers anyone.
+      sleep 5
+      mesh_count=$(c "http://127.0.0.1:9201/api/agents" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  print(sum(1 for a in d.get('agents', []) if a.get('connectionStatus') in ('connected', 'self')))
+except Exception:
+  print(0)
+" 2>/dev/null)
+      if [[ "$mesh_count" -ge 4 ]]; then
+        ok "Node1 mesh restored to $mesh_count peers post-restart"
+      else
+        warn "Node1 mesh only $mesh_count peers post-restart (expected ≥ 4)"
+      fi
+    fi
+  fi
+fi
+section_done
+
 #------------------------------------------------------------
 echo ""
 echo "============================================================"
@@ -2259,6 +2546,7 @@ echo "  PASS: $PASS"
 echo "  FAIL: $FAIL"
 echo "  WARN: $WARN"
 echo "  TOTAL: $((PASS + FAIL + WARN))"
+echo "  Elapsed: $(( $(date +%s) - SCRIPT_T0 ))s"
 echo "============================================================"
 echo ""
 

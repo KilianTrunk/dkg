@@ -1314,13 +1314,7 @@ PQ_WRITE=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d "{
     $(ql "$PQ_ENTITY" 'http://schema.org/name' 'Publisher Queue Test')
   ]
 }")
-# P2-4: shareOperationId is the current field name; workspaceOperationId is
-# the legacy alias still emitted by some node versions. Keep the fallback
-# until we confirm every supported node build has migrated.
 PQ_OP_ID=$(json_get "$PQ_WRITE" shareOperationId)
-if [[ "$PQ_OP_ID" == "__NONE__" || "$PQ_OP_ID" == "__ERR__" ]]; then
-  PQ_OP_ID=$(json_get "$PQ_WRITE" workspaceOperationId)
-fi
 echo "  SWM write shareOperationId=$PQ_OP_ID"
 [[ "$PQ_OP_ID" != "__NONE__" && "$PQ_OP_ID" != "__ERR__" ]] && ok "SWM write for publisher test" || fail "SWM write failed: ${PQ_WRITE:0:200}"
 

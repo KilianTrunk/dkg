@@ -603,7 +603,6 @@ WHERE {
       });
       return jsonResponse(res, 200, {
         shareOperationId: result?.shareOperationId,
-        workspaceOperationId: result?.shareOperationId,
         contextGraphId,
         graph: contextGraphSharedMemoryUri(contextGraphId, subGraphName),
         triplesWritten: quads.length,

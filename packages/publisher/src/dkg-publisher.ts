@@ -73,7 +73,7 @@ export interface WorkspaceSenderKeyEncryptInput {
   plaintext: Uint8Array;
   senderAgentAddress: string;
   operationId: string;
-  workspaceOperationId: string;
+  shareOperationId: string;
   timestampMs: number;
   subGraphName?: string;
   publisherPeerId: string;
@@ -855,7 +855,7 @@ export class DKGPublisher implements Publisher {
         privateTripleCount: m.privateTripleCount,
       })),
       publisherPeerId: options.publisherPeerId,
-      workspaceOperationId: shareOperationId,
+      shareOperationId,
       timestampMs,
       operationId: ctx.operationId,
       casConditions,
@@ -868,7 +868,7 @@ export class DKGPublisher implements Publisher {
         localOnly: options.localOnly === true,
         senderAgentAddress: options.senderAgentAddress,
         operationId: ctx.operationId,
-        workspaceOperationId: shareOperationId,
+        shareOperationId,
         timestampMs,
         subGraphName: options.subGraphName,
         publisherPeerId: options.publisherPeerId,
@@ -944,7 +944,7 @@ export class DKGPublisher implements Publisher {
       localOnly: boolean;
       senderAgentAddress?: string;
       operationId: string;
-      workspaceOperationId: string;
+      shareOperationId: string;
       timestampMs: number;
       subGraphName?: string;
       publisherPeerId: string;
@@ -971,7 +971,7 @@ export class DKGPublisher implements Publisher {
         plaintext,
         senderAgentAddress: options.senderAgentAddress,
         operationId: options.operationId,
-        workspaceOperationId: options.workspaceOperationId,
+        shareOperationId: options.shareOperationId,
         timestampMs: options.timestampMs,
         subGraphName: options.subGraphName,
         publisherPeerId: options.publisherPeerId,
@@ -983,7 +983,7 @@ export class DKGPublisher implements Publisher {
       contextGraphId,
       senderIdentity,
       operationId: options.operationId,
-      workspaceOperationId: options.workspaceOperationId,
+      shareOperationId: options.shareOperationId,
       timestampMs: options.timestampMs,
       subGraphName: options.subGraphName,
       plaintext,
@@ -3100,7 +3100,7 @@ export class DKGPublisher implements Publisher {
         nquads: new TextEncoder().encode(nquadsStr),
         manifest: manifestEntries,
         publisherPeerId: opts.publisherPeerId,
-        workspaceOperationId: operationId,
+        shareOperationId: operationId,
         timestampMs,
         operationId,
         subGraphName: opts.subGraphName,
@@ -3120,7 +3120,7 @@ export class DKGPublisher implements Publisher {
           localOnly: false,
           senderAgentAddress: opts.senderAgentAddress,
           operationId,
-          workspaceOperationId: operationId,
+          shareOperationId: operationId,
           timestampMs,
           subGraphName: opts.subGraphName,
           publisherPeerId: opts.publisherPeerId,

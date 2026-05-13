@@ -4666,7 +4666,7 @@ export class DKGAgent {
       this.log.warn(ctx, `SWM sender-key DEBUG ${phase}: ${JSON.stringify({
         warning: 'private SWM plaintext debug logging is enabled',
         ...extra,
-        workspaceOperationId: request.workspaceOperationId,
+        shareOperationId: request.shareOperationId,
         operationId: request.operationId,
         requestContextGraphId: request.contextGraphId,
         requestSubGraphName: request.subGraphName,

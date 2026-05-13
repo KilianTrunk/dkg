@@ -22,6 +22,8 @@ export {
   type ResolveOpts,
   PeerResolver,
   dkgGossipMsgId,
+  dkgGossipMsgIdRaw,
+  type DkgGossipMsgIdInput,
   DkgGossipUnsignedMessageError,
 } from './network/index.js';
 export {

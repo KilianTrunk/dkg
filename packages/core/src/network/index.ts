@@ -19,4 +19,9 @@ export type {
 } from './peer-resolver.js';
 export { PeerResolver } from './peer-resolver.js';
 
-export { dkgGossipMsgId, DkgGossipUnsignedMessageError } from './gossip-msg-id.js';
+export type { DkgGossipMsgIdInput } from './gossip-msg-id.js';
+export {
+  dkgGossipMsgId,
+  dkgGossipMsgIdRaw,
+  DkgGossipUnsignedMessageError,
+} from './gossip-msg-id.js';

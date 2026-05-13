@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { sha256 } from '@noble/hashes/sha2.js';
 import {
   dkgGossipMsgId,
+  dkgGossipMsgIdRaw,
   DkgGossipUnsignedMessageError,
 } from '../src/network/gossip-msg-id.js';
 
@@ -172,5 +173,118 @@ describe('dkgGossipMsgId (RFC 07 §5.4)', () => {
       sequenceNumber: 1n, signature: new Uint8Array([0xFF, 0xFF]), key: { kind: 'b' } as never,
     });
     expect(a).toEqual(b);
+  });
+
+  // Codex review feedback on PR #501 round 5: the encoding can drift if
+  // both production and test are mutated together via `expected()`. This
+  // pins the exact 32-byte SHA256 output for a known input so any
+  // change to the framing/hash bytes is caught even if the helper is
+  // wrong in the same way the prod code is.
+  //
+  // Vector:
+  //   topic = 'dkg/test/1.0.0'
+  //   data  = [0x01, 0x02, 0x03, 0x04]
+  //   from  = [0x12, 0x34, 0x56]
+  //   seq   = 7n
+  // Pre-hash:
+  //   0000000e 646b672f746573742f312e302e30 00000004 01020304
+  //                                                      00000003 123456 0000000000000007
+  // SHA256:
+  //   17dc679d5ac2b669fc946ead91f08728a2dc33f8799f3b3bf3df04384959caa8
+  it('FIXED VECTOR: pinned 32-byte SHA256 for a known input (libp2p adapter)', () => {
+    const knownFrom = {
+      toMultihash: () => ({ bytes: new Uint8Array([0x12, 0x34, 0x56]) }),
+    } as unknown as Parameters<typeof dkgGossipMsgId>[0] extends infer M
+      ? M extends { from: infer P } ? P : never : never;
+    const id = dkgGossipMsgId({
+      type: 'signed',
+      topic: 'dkg/test/1.0.0',
+      data: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+      from: knownFrom,
+      sequenceNumber: 7n,
+      signature: new Uint8Array(),
+      key: {} as never,
+    });
+    const hex = Array.from(id, (b) => b.toString(16).padStart(2, '0')).join('');
+    expect(hex).toBe(
+      '17dc679d5ac2b669fc946ead91f08728a2dc33f8799f3b3bf3df04384959caa8',
+    );
+  });
+});
+
+// Codex review feedback on PR #501 round 5: the libp2p-shaped function
+// alone makes the "cross-backend dedup" framing aspirational. Pinning
+// the backend-agnostic primitive separately, plus asserting the libp2p
+// adapter delegates to it, locks in the contract: any future backend
+// adapter (iroh-gossip, etc.) just needs to feed canonical bytes into
+// `dkgGossipMsgIdRaw` and gets the same dedup behaviour.
+describe('dkgGossipMsgIdRaw (RFC 07 §5.4 — backend-agnostic primitive)', () => {
+  it('FIXED VECTOR: pinned 32-byte SHA256 (matches libp2p adapter vector)', () => {
+    const id = dkgGossipMsgIdRaw({
+      topic: 'dkg/test/1.0.0',
+      data: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+      publisherIdBytes: new Uint8Array([0x12, 0x34, 0x56]),
+      sequenceNumber: 7n,
+    });
+    const hex = Array.from(id, (b) => b.toString(16).padStart(2, '0')).join('');
+    expect(hex).toBe(
+      '17dc679d5ac2b669fc946ead91f08728a2dc33f8799f3b3bf3df04384959caa8',
+    );
+  });
+
+  it('libp2p adapter agrees with raw primitive on every signed message', () => {
+    const fromBytes = new Uint8Array([0xAA, 0xBB, 0xCC]);
+    const peerId = {
+      toMultihash: () => ({ bytes: fromBytes }),
+    } as unknown as Parameters<typeof dkgGossipMsgId>[0] extends infer M
+      ? M extends { from: infer P } ? P : never : never;
+    const adapterId = dkgGossipMsgId({
+      type: 'signed',
+      topic: 'cg/topic-x/1.0.0',
+      data: new Uint8Array([9, 9, 9]),
+      from: peerId,
+      sequenceNumber: 1234n,
+      signature: new Uint8Array(),
+      key: {} as never,
+    });
+    const rawId = dkgGossipMsgIdRaw({
+      topic: 'cg/topic-x/1.0.0',
+      data: new Uint8Array([9, 9, 9]),
+      publisherIdBytes: fromBytes,
+      sequenceNumber: 1234n,
+    });
+    expect(adapterId).toEqual(rawId);
+  });
+
+  it('length-framing collision check applies at the raw level too', () => {
+    const a = dkgGossipMsgIdRaw({
+      topic: 'ab', data: new TextEncoder().encode('c'),
+      publisherIdBytes: new Uint8Array([1]), sequenceNumber: 0n,
+    });
+    const b = dkgGossipMsgIdRaw({
+      topic: 'a', data: new TextEncoder().encode('bc'),
+      publisherIdBytes: new Uint8Array([1]), sequenceNumber: 0n,
+    });
+    expect(a).not.toEqual(b);
+  });
+
+  it('seqno enters the hash at the raw level too', () => {
+    const a = dkgGossipMsgIdRaw({
+      topic: 't', data: new Uint8Array([1]),
+      publisherIdBytes: new Uint8Array([2]), sequenceNumber: 1n,
+    });
+    const b = dkgGossipMsgIdRaw({
+      topic: 't', data: new Uint8Array([1]),
+      publisherIdBytes: new Uint8Array([2]), sequenceNumber: 2n,
+    });
+    expect(a).not.toEqual(b);
+  });
+
+  it('returns a 32-byte SHA256 digest', () => {
+    const id = dkgGossipMsgIdRaw({
+      topic: 't', data: new Uint8Array(),
+      publisherIdBytes: new Uint8Array(), sequenceNumber: 0n,
+    });
+    expect(id.length).toBe(32);
   });
 });

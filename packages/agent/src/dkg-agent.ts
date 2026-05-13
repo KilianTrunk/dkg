@@ -3324,11 +3324,17 @@ export class DKGAgent {
    * inside the attestation KC body when `submitProofV2` lands (RFC 04
    * Phase 2). This entry point only manages the on-chain hint flag.
    *
-   * @param opts.relayCapable — when true, flips the on-chain `relayCapable`
-   *   flag to true (idempotent — checked first). Operators opt in via
-   *   `config.relayCapable`. Skipped when false / absent so we don't
-   *   accidentally overwrite an operator's manual `dkg admin set-relay-capable`
-   *   flip.
+   * Three-way semantics for `opts.relayCapable` (Codex PR #506 fix):
+   *   - `true`      → ensure on-chain flag is true (flip if currently false)
+   *   - `false`     → ensure on-chain flag is false (flip if currently true)
+   *   - `undefined` → leave on-chain alone (operator hasn't expressed an
+   *                   opinion in config; respects manual `dkg admin
+   *                   set-relay-capable` flips)
+   *
+   * The previous version treated false-or-absent as a no-op, making the
+   * on-chain flag sticky: a node that once ran with `relayCapable: true`
+   * would keep advertising relay capability forever even after the
+   * operator removed it from config. Now `false` actively clears.
    */
   async publishRelayRegistry(opts?: { relayCapable?: boolean }): Promise<void> {
     const ctx = createOperationContext('publish');
@@ -3352,21 +3358,26 @@ export class DKGAgent {
       return;
     }
 
-    if (opts?.relayCapable === true) {
-      try {
-        const current = this.chain.getRelayCapable
-          ? await this.chain.getRelayCapable(identityId)
-          : false;
-        if (!current) {
-          await this.chain.setRelayCapable(true);
-          this.log.info(ctx, 'publishRelayRegistry: flipped relayCapable=true on chain');
-        }
-      } catch (err) {
-        this.log.warn(
-          ctx,
-          `publishRelayRegistry: setRelayCapable failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
+    // Only act on explicit booleans. Anything else (undefined, non-boolean
+    // misconfigurations) is treated as "no opinion" so we don't clobber
+    // operator-managed state.
+    if (opts?.relayCapable !== true && opts?.relayCapable !== false) {
+      return;
+    }
+    const desired = opts.relayCapable;
+    try {
+      const current = this.chain.getRelayCapable
+        ? await this.chain.getRelayCapable(identityId)
+        : false;
+      if (current !== desired) {
+        await this.chain.setRelayCapable(desired);
+        this.log.info(ctx, `publishRelayRegistry: flipped relayCapable=${desired} on chain (was ${current})`);
       }
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `publishRelayRegistry: setRelayCapable failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

@@ -300,7 +300,16 @@ export interface DkgConfig {
    * gates whether they bother running the attestation cosig + submit
    * pipeline at all.
    *
-   * Default: false.
+   * Tri-state semantics on startup (Codex PR #506 fix):
+   *   - true      → daemon ensures on-chain flag is true
+   *   - false     → daemon ensures on-chain flag is false (actively
+   *                 clears any stale prior opt-in)
+   *   - undefined → daemon does not touch the on-chain flag, preserving
+   *                 any manual `dkg admin set-relay-capable` flips
+   *
+   * Default: undefined (i.e. no chain interaction unless the operator
+   * has set this explicitly in config). For a fresh node this is
+   * equivalent to relay-incapable.
    */
   relayCapable?: boolean;
 }

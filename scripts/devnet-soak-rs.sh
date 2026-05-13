@@ -737,26 +737,38 @@ if (pubTotal > 0 && pubOk / pubTotal >= 0.9) {
 // (`rs: {}`, `uptime_ms: null`) when the agent or the snapshot fetcher
 // is mid-shutdown — using the last snapshot then misreports a healthy
 // node as "never submitted" even though the chain shows its proofs.
+//
+// Note: edge nodes legitimately report `loop: null` (role-gated), so
+// "missing loop" only counts as an observability gap on CORE nodes —
+// and only if the entire `rs` object is missing (a transient API
+// unavailability), not when `loop` is intentionally null.
 const peakSubmittedByNode = new Map();
 const enabledByNode = new Map();
 const identityByNode = new Map();
-let snapshotsWithEmptyRs = 0;
+const apiUnavailableByNode = new Map();
 for (const snap of tsLines) {
   for (const node of (snap.perNode || [])) {
-    const rs = node.rs || {};
-    const loop = rs.loop;
-    if (!loop || typeof loop.submittedCount !== "number") {
-      if (node.node <= Number(out.NUM_CORES)) snapshotsWithEmptyRs++;
+    const rs = node.rs;
+    const isCore = node.node <= Number(out.NUM_CORES);
+    if (!rs || Object.keys(rs).length === 0) {
+      if (isCore) {
+        apiUnavailableByNode.set(node.node, (apiUnavailableByNode.get(node.node) ?? 0) + 1);
+      }
       continue;
     }
-    const cur = peakSubmittedByNode.get(node.node) ?? 0;
-    if (loop.submittedCount > cur) peakSubmittedByNode.set(node.node, loop.submittedCount);
     if (rs.enabled === true) enabledByNode.set(node.node, true);
     if (rs.identityId) identityByNode.set(node.node, rs.identityId);
+    const loop = rs.loop;
+    if (loop && typeof loop.submittedCount === "number") {
+      const cur = peakSubmittedByNode.get(node.node) ?? 0;
+      if (loop.submittedCount > cur) peakSubmittedByNode.set(node.node, loop.submittedCount);
+    }
   }
 }
-if (snapshotsWithEmptyRs > 0) {
-  warn.push("OBSERVER " + snapshotsWithEmptyRs + " core snapshots had empty rs:{} (likely API/agent transient unavailability)");
+const totalApiGaps = [...apiUnavailableByNode.values()].reduce((s, v) => s + v, 0);
+if (totalApiGaps > 0) {
+  const detail = [...apiUnavailableByNode.entries()].sort((a, b) => a[0] - b[0]).map(([n, c]) => "node" + n + "=" + c).join(", ");
+  warn.push("OBSERVER " + totalApiGaps + " core snapshots had no rs payload (" + detail + ") — likely API/agent transient unavailability");
 }
 if (peakSubmittedByNode.size === 0 && tsLines.length === 0) {
   fail.push("OBSERVER: no snapshots captured");

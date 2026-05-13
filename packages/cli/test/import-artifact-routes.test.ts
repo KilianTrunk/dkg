@@ -208,7 +208,7 @@ describe('import artifact daemon routes', () => {
                 structuralTripleCount: '3',
                 semanticTripleCount: '0',
                 extractionMethod: 'text/markdown',
-                ...(args.extractionStatus ? { extractionStatus: args.extractionStatus } : {}),
+                extractionStatus: args.extractionStatus ?? 'completed',
                 ...(args.mdIntermediateHash ? { mdIntermediateHash: args.mdIntermediateHash } : {}),
                 sourceFileName: 'imported.md',
               }],
@@ -304,7 +304,7 @@ describe('import artifact daemon routes', () => {
     expect(result.body.error).toMatch(/"assertionUri" is required/);
   });
 
-  it('writes semantic enrichment to a separate WM assertion with explicit provenance only', async () => {
+  it('appends semantic enrichment to the imported assertion with explicit provenance', async () => {
     const entry = await fileStore.put(Buffer.from('# Imported\n'), 'text/markdown');
     const contextGraphId = 'cg-semantic-enrichment';
     const assertionName = 'imported-md';
@@ -324,7 +324,6 @@ describe('import artifact daemon routes', () => {
     const result = await post('/api/assertion/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
-      name: 'semantic-imported-md',
       semanticQuads: [
         { subject: 'urn:doc:imported', predicate: 'http://schema.org/about', object: '"Semantic topic"' },
       ],
@@ -335,7 +334,8 @@ describe('import artifact daemon routes', () => {
 
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({
-      assertionName: 'semantic-imported-md',
+      assertionUri,
+      assertionName,
       sourceAssertionUri: assertionUri,
       sourceFileHash: entry.keccak256,
       markdownHash: entry.keccak256,
@@ -344,14 +344,9 @@ describe('import artifact daemon routes', () => {
       promoted: false,
       published: false,
     });
-    expect(created).toEqual([{
-      contextGraphId,
-      name: 'semantic-imported-md',
-      agentAddress: 'did:dkg:agent:test',
-      subGraphName: undefined,
-    }]);
+    expect(created).toEqual([]);
     expect(writes).toHaveLength(1);
-    expect(writes[0]!.name).toBe('semantic-imported-md');
+    expect(writes[0]!.name).toBe(assertionName);
     expect(writes[0]!.agentAddress).toBe('did:dkg:agent:test');
     expect(writes[0]!.quads).toEqual(expect.arrayContaining([
       { subject: 'urn:doc:imported', predicate: 'http://schema.org/about', object: '"Semantic topic"' },
@@ -365,9 +360,39 @@ describe('import artifact daemon routes', () => {
       { subject: 'urn:doc:imported', predicate: `${PROV}wasDerivedFrom`, object: assertionUri },
     ]));
     expect(events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ operation: 'assertion_created', layers: ['wm'] }),
       expect.objectContaining({ operation: 'semantic_enrichment_written', layers: ['wm'] }),
     ]));
+    expect(events).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ operation: 'assertion_created', layers: ['wm'] }),
+    ]));
+  });
+
+  it('rejects semantic enrichment of imported assertions owned by another agent', async () => {
+    const entry = await fileStore.put(Buffer.from('# Imported\n'), 'text/markdown');
+    const contextGraphId = 'cg-semantic-enrichment-cross-agent';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent, writes } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+    });
+    await startRoutes({ agent });
+
+    const result = await post('/api/assertion/semantic-enrichment/write', {
+      contextGraphId,
+      assertionUri,
+      semanticQuads: [
+        { subject: 'urn:doc:imported', predicate: 'http://schema.org/about', object: '"Semantic topic"' },
+      ],
+    });
+
+    expect(result.status).toBe(403);
+    expect(result.body.error).toMatch(/owned by the requesting agent/);
+    expect(writes).toHaveLength(0);
   });
 
   it('stores non-IRI agent identity labels without emitting prov attribution resources', async () => {
@@ -388,7 +413,6 @@ describe('import artifact daemon routes', () => {
     const result = await post('/api/assertion/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
-      name: 'semantic-imported-md',
       semanticQuads: [
         { subject: 'urn:doc:imported', predicate: 'http://schema.org/about', object: 'Semantic topic' },
       ],
@@ -421,7 +445,6 @@ describe('import artifact daemon routes', () => {
     const result = await post('/api/assertion/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
-      name: 'semantic-imported-md',
       semanticQuads: [
         {
           subject: 'urn:doc:imported',
@@ -461,7 +484,6 @@ describe('import artifact daemon routes', () => {
     const result = await post('/api/assertion/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
-      name: 'semantic-imported-md',
       semanticQuads: [
         { subject: 'urn:doc:imported', predicate: 'http://schema.org/about', object: 'Fallback topic' },
       ],
@@ -479,7 +501,7 @@ describe('import artifact daemon routes', () => {
     ]));
   });
 
-  it('rolls back a newly created semantic enrichment assertion when writing quads fails', async () => {
+  it('does not create or discard assertions when same-assertion semantic append fails', async () => {
     const entry = await fileStore.put(Buffer.from('# Imported\n'), 'text/markdown');
     const contextGraphId = 'cg-semantic-enrichment-write-failure';
     const assertionName = 'imported-md';
@@ -499,7 +521,6 @@ describe('import artifact daemon routes', () => {
     const result = await post('/api/assertion/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
-      name: 'semantic-imported-md',
       semanticQuads: [
         { subject: 'urn:doc:imported', predicate: 'http://schema.org/about', object: '"Semantic topic"' },
       ],
@@ -507,23 +528,13 @@ describe('import artifact daemon routes', () => {
 
     expect(result.status).toBe(500);
     expect(result.body.error).toContain('simulated semantic write failure');
-    expect(created).toEqual([{
-      contextGraphId,
-      name: 'semantic-imported-md',
-      agentAddress: 'did:dkg:agent:test',
-      subGraphName: undefined,
-    }]);
+    expect(created).toEqual([]);
     expect(writes).toHaveLength(0);
-    expect(discards).toEqual([{
-      contextGraphId,
-      name: 'semantic-imported-md',
-      agentAddress: 'did:dkg:agent:test',
-      subGraphName: undefined,
-    }]);
+    expect(discards).toEqual([]);
     expect(events).toEqual([]);
   });
 
-  it('rejects semantic enrichment writes that would target the source import assertion', async () => {
+  it('rejects target assertion names because enrichment appends to the source import assertion', async () => {
     const entry = await fileStore.put(Buffer.from('# Imported\n'), 'text/markdown');
     const contextGraphId = 'cg-semantic-enrichment-separate';
     const assertionName = 'imported-md';
@@ -547,8 +558,8 @@ describe('import artifact daemon routes', () => {
       ],
     });
 
-    expect(result.status).toBe(409);
-    expect(result.body.error).toMatch(/must be separate/);
+    expect(result.status).toBe(400);
+    expect(result.body.error).toMatch(/target assertion names are not supported/);
     expect(writes).toHaveLength(0);
   });
 
@@ -570,7 +581,6 @@ describe('import artifact daemon routes', () => {
     const result = await post('/api/assertion/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
-      name: 'semantic-imported-md',
       semanticQuads: [
         {
           subject: 'urn:doc:imported',
@@ -586,7 +596,7 @@ describe('import artifact daemon routes', () => {
     expect(writes).toHaveLength(0);
   });
 
-  it('rejects reused target semantic enrichment assertion names instead of appending', async () => {
+  it('rejects legacy semanticAssertionName target fields', async () => {
     const entry = await fileStore.put(Buffer.from('# Imported\n'), 'text/markdown');
     const contextGraphId = 'cg-semantic-enrichment-existing-target';
     const assertionName = 'imported-md';
@@ -598,21 +608,20 @@ describe('import artifact daemon routes', () => {
       fileHash: entry.keccak256,
       markdownHash: entry.keccak256,
       markdownForm: `urn:dkg:file:${entry.keccak256}`,
-      targetGraphExists: true,
     });
     await startRoutes({ agent });
 
     const result = await post('/api/assertion/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
-      name: 'semantic-imported-md',
+      semanticAssertionName: 'semantic-imported-md',
       semanticQuads: [
         { subject: 'urn:doc:imported', predicate: 'http://schema.org/about', object: '"Semantic topic"' },
       ],
     });
 
-    expect(result.status).toBe(409);
-    expect(result.body.error).toMatch(/already exists/);
+    expect(result.status).toBe(400);
+    expect(result.body.error).toMatch(/target assertion names are not supported/);
     expect(writes).toHaveLength(0);
   });
 

@@ -483,8 +483,8 @@ function buildHermesNodeUiSystemPrompt(
     for (const attachment of attachmentRefs) {
       lines.push(formatHermesAttachmentPromptLine(attachment));
     }
-    lines.push('For completed imported attachments, resolve the artifact with dkg_import_artifact_resolve, read Markdown with dkg_import_artifact_read_markdown when needed, inspect deterministic quads with dkg_assertion_query, and write model-derived triples only through dkg_semantic_enrichment_write unless the user explicitly asks for a different assertion workflow.');
-    lines.push('Keep deterministic import assertions separate from semantic enrichment assertions; do not promote or publish enrichment output unless explicitly instructed.');
+    lines.push('For completed imported attachments, read Markdown with dkg_import_artifact_read_markdown when needed, inspect assertion quads with dkg_assertion_query when useful, and append model-derived triples to the imported assertion with dkg_semantic_enrichment_write.');
+    lines.push('Use dkg_import_artifact_resolve only when you need to re-check artifact metadata. Do not promote or publish enrichment output unless explicitly instructed.');
   }
   return lines.join('\n');
 }

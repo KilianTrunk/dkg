@@ -2184,6 +2184,12 @@ assert "sub_graph_name" in share_schema["parameters"]["properties"], share_schem
 assert share_schema["parameters"]["required"] == ["content", "context_graph_id"], share_schema
 missing_cg = provider.handle_tool_call("dkg_share", {"content": "alpha"})
 assert "context_graph_id is required" in missing_cg, missing_cg
+semantic_schema = next(schema for schema in provider.get_tool_schemas() if schema["name"] == "dkg_semantic_enrichment_write")
+assert "name" not in semantic_schema["parameters"]["properties"], semantic_schema
+assert "Append model-derived triples" in semantic_schema["description"], semantic_schema
+assert "separate Working Memory assertion" not in semantic_schema["description"], semantic_schema
+resolver_schema = next(schema for schema in provider.get_tool_schemas() if schema["name"] == "dkg_import_artifact_resolve")
+assert "Optional validation/debug helper" in resolver_schema["description"], resolver_schema
 
 provider._config = {
     "publish_tool": "disabled",
@@ -2321,7 +2327,6 @@ client.write_semantic_enrichment(
     "cg:test",
     [{"subject": "urn:doc:1", "predicate": "http://schema.org/about", "object": '"Topic"'}],
     assertion_uri="did:dkg:context-graph:cg:test/assertion/agent/imported",
-    name="semantic-imported",
     generation_method="test-model",
     agent_identity="did:dkg:agent:test",
     generated_at="2026-05-11T00:00:00.000Z",
@@ -2347,7 +2352,7 @@ assert calls == [
     ("POST", "/api/assertion/a%20b/write", {"contextGraphId": "cg:test", "quads": [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "subGraphName": "sub"}),
     ("POST", "/api/assertion/import-artifact/resolve", {"contextGraphId": "cg:test", "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "fileHash": "sha256:" + "a" * 64, "subGraphName": "sub"}),
     ("POST", "/api/assertion/import-artifact/read-markdown", {"contextGraphId": "cg:test", "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "maxBytes": 4096}),
-    ("POST", "/api/assertion/semantic-enrichment/write", {"contextGraphId": "cg:test", "semanticQuads": [{"subject": "urn:doc:1", "predicate": "http://schema.org/about", "object": '"Topic"'}], "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "name": "semantic-imported", "generationMethod": "test-model", "agentIdentity": "did:dkg:agent:test", "generatedAt": "2026-05-11T00:00:00.000Z"}),
+    ("POST", "/api/assertion/semantic-enrichment/write", {"contextGraphId": "cg:test", "semanticQuads": [{"subject": "urn:doc:1", "predicate": "http://schema.org/about", "object": '"Topic"'}], "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "generationMethod": "test-model", "agentIdentity": "did:dkg:agent:test", "generatedAt": "2026-05-11T00:00:00.000Z"}),
     ("POST", "/api/assertion/a%20b/discard", {"contextGraphId": "cg:test"}),
     ("GET", "/api/assertion/a%20b/history?contextGraphId=cg%3Atest&agentAddress=agent&subGraphName=sub", {}),
     ("POST", "/api/sub-graph/create", {"contextGraphId": "cg:test", "subGraphName": "notes"}),
@@ -2589,6 +2594,17 @@ assert provider._client.calls[-1][1] == [
     {"subject": "urn:doc:1", "predicate": "http://schema.org/author", "object": "mailto:alice@example.org"},
     {"subject": "urn:doc:1", "predicate": "http://schema.org/sameAs", "object": "ipfs://bafy-test"},
 ], provider._client.calls
+assert "name" not in provider._client.calls[-1][2], provider._client.calls
+
+name_result = json.loads(provider.handle_tool_call("dkg_semantic_enrichment_write", {
+    "context_graph_id": "cg:test",
+    "assertion_uri": "did:dkg:context-graph:cg:test/assertion/agent/imported",
+    "semanticAssertionName": "semantic-imported",
+    "semantic_quads": [
+        {"subject": "urn:doc:1", "predicate": "http://schema.org/about", "object": "Topic"},
+    ],
+}))
+assert "target assertion names are not supported" in name_result["error"], name_result
 
 graph_result = json.loads(provider.handle_tool_call("dkg_semantic_enrichment_write", {
     "context_graph_id": "cg:test",

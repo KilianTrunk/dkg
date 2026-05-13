@@ -2199,6 +2199,9 @@ describe('DkgChannelPlugin', () => {
     expect(dispatched.ctx.BodyForAgent).toContain('markdownHash="sha256:mdhash"');
     expect(dispatched.ctx.BodyForAgent).toContain('dkg_import_artifact_read_markdown');
     expect(dispatched.ctx.BodyForAgent).toContain('dkg_semantic_enrichment_write');
+    expect(dispatched.ctx.BodyForAgent).toContain('Use dkg_import_artifact_resolve only when you need to re-check artifact metadata');
+    expect(dispatched.ctx.BodyForAgent).not.toContain('resolve the artifact with dkg_import_artifact_resolve');
+    expect(dispatched.ctx.BodyForAgent).not.toContain('Keep deterministic import assertions separate');
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(storeSpy).toHaveBeenCalledWith(
       'openclaw:dkg-ui',

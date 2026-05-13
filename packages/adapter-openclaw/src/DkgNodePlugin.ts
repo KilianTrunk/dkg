@@ -124,7 +124,7 @@ function normalizeSemanticEnrichmentQuads(rawQuads: unknown): {
     }
     const record = raw as Record<string, unknown>;
     if (record.graph !== undefined && record.graph !== null) {
-      return { error: `"semantic_quads[${index}].graph" is not supported; semantic triples are written to the target assertion graph.` };
+      return { error: `"semantic_quads[${index}].graph" is not supported; semantic triples are written to the source imported assertion graph.` };
     }
     const subject = typeof record.subject === 'string' ? record.subject.trim() : '';
     const predicate = typeof record.predicate === 'string' ? record.predicate.trim() : '';
@@ -3047,7 +3047,7 @@ export class DkgNodePlugin {
       {
         name: 'dkg_import_artifact_resolve',
         description:
-          'Resolve a completed imported attachment/assertion into deterministic artifact metadata: source file hash, ' +
+          'Optional validation/debug helper. Resolve a completed imported attachment/assertion into deterministic artifact metadata: source file hash, ' +
           'Markdown hash/form when available, extraction method, root entity, and structural counts. Skipped imports are rejected.',
         parameters: {
           type: 'object',
@@ -3084,8 +3084,8 @@ export class DkgNodePlugin {
       {
         name: 'dkg_semantic_enrichment_write',
         description:
-          'Write model-derived semantic triples into a separate Working Memory assertion with provenance pointing to a completed ' +
-          'import artifact. This does not modify the deterministic import assertion and does not promote or publish.',
+          'Append model-derived semantic triples into the completed imported assertion with daemon-stamped provenance. ' +
+          'This does not promote, finalize, or publish.',
         parameters: {
           type: 'object',
           properties: {
@@ -3093,7 +3093,6 @@ export class DkgNodePlugin {
             assertion_uri: { type: 'string', description: 'Source imported assertion URI from the attachment ref.' },
             assertion_name: { type: 'string', description: 'Optional source assertion name to cross-check against assertion_uri.' },
             file_hash: { type: 'string', description: 'Optional source file hash to verify against deterministic metadata.' },
-            name: { type: 'string', description: 'Optional target semantic enrichment assertion name; generated if omitted.' },
             semantic_quads: {
               type: 'array',
               items: {
@@ -3105,12 +3104,12 @@ export class DkgNodePlugin {
                 },
                 required: ['subject', 'predicate', 'object'],
               },
-              description: 'Model-derived triples to write into the target assertion graph. Plain-text objects become RDF literals; provenance quads are added by the daemon.',
+              description: 'Model-derived triples to append to the source imported assertion graph. Plain-text objects become RDF literals; provenance quads are added by the daemon.',
             },
             generation_method: { type: 'string', description: 'Extraction/generation method label.' },
             agent_identity: { type: 'string', description: 'Agent identity URI or label for provenance; only URIs are emitted as prov:wasAttributedTo resources.' },
             generated_at: { type: 'string', description: 'ISO timestamp for generation; defaults to daemon time.' },
-            sub_graph_name: { type: 'string', description: 'Optional sub-graph for source and target assertions.' },
+            sub_graph_name: { type: 'string', description: 'Optional sub-graph for the source imported assertion.' },
           },
           required: ['context_graph_id', 'assertion_uri', 'semantic_quads'],
         },
@@ -4343,6 +4342,13 @@ export class DkgNodePlugin {
       const assertionUri = String(args.assertion_uri ?? args.source_assertion_uri ?? '').trim() || undefined;
       const assertionName = String(args.assertion_name ?? '').trim() || undefined;
       if (!assertionUri) return this.error('"assertion_uri" is required.');
+      if (
+        args.name !== undefined ||
+        args.semanticAssertionName !== undefined ||
+        args.semantic_assertion_name !== undefined
+      ) {
+        return this.error('Semantic enrichment is written into the source import assertion; target assertion names are not supported.');
+      }
       const normalized = normalizeSemanticEnrichmentQuads(args.semantic_quads);
       if (normalized.error || !normalized.quads) return this.error(normalized.error ?? '"semantic_quads" is invalid.');
       const result = await this.client.writeSemanticEnrichment({
@@ -4350,7 +4356,6 @@ export class DkgNodePlugin {
         assertionUri,
         assertionName,
         fileHash: String(args.file_hash ?? '').trim() || undefined,
-        name: String(args.name ?? args.semantic_assertion_name ?? '').trim() || undefined,
         semanticQuads: normalized.quads,
         generationMethod: String(args.generation_method ?? '').trim() || undefined,
         agentIdentity: String(args.agent_identity ?? '').trim() || undefined,

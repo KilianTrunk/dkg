@@ -621,7 +621,7 @@ DKG_ASSERTION_QUERY_SCHEMA = {
 
 DKG_IMPORT_ARTIFACT_RESOLVE_SCHEMA = {
     "name": "dkg_import_artifact_resolve",
-    "description": "Resolve a completed imported attachment/assertion into deterministic artifact metadata. Skipped imports are rejected.",
+    "description": "Optional validation/debug helper. Resolve a completed imported attachment/assertion into deterministic artifact metadata. Skipped imports are rejected.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -654,7 +654,7 @@ DKG_IMPORT_ARTIFACT_READ_MARKDOWN_SCHEMA = {
 
 DKG_SEMANTIC_ENRICHMENT_WRITE_SCHEMA = {
     "name": "dkg_semantic_enrichment_write",
-    "description": "Write model-derived triples to a separate Working Memory assertion with provenance pointing to a completed import artifact. Does not promote or publish.",
+    "description": "Append model-derived triples to a completed imported assertion with daemon-stamped provenance. Does not promote, finalize, or publish.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -662,8 +662,7 @@ DKG_SEMANTIC_ENRICHMENT_WRITE_SCHEMA = {
             "assertion_uri": {"type": "string", "description": "Source imported assertion URI from the attachment ref."},
             "assertion_name": {"type": "string", "description": "Optional source assertion name to cross-check against assertion_uri."},
             "file_hash": {"type": "string", "description": "Optional source file hash to verify."},
-            "name": {"type": "string", "description": "Optional target semantic enrichment assertion name."},
-            "semantic_quads": {"type": "array", "items": SEMANTIC_TRIPLE_SCHEMA, "description": "Model-derived triples written to the target assertion graph; provenance is added by the daemon."},
+            "semantic_quads": {"type": "array", "items": SEMANTIC_TRIPLE_SCHEMA, "description": "Model-derived triples appended to the source imported assertion graph; provenance is added by the daemon."},
             "generation_method": {"type": "string", "description": "Extraction/generation method label."},
             "agent_identity": {"type": "string", "description": "Agent identity URI or label for provenance; only URIs are emitted as prov:wasAttributedTo resources."},
             "generated_at": {"type": "string", "description": "ISO timestamp; defaults to daemon time."},
@@ -970,7 +969,8 @@ class DKGMemoryProvider(MemoryProvider):
             "  dkg_query — Search knowledge via SPARQL (fast, local)\n"
             "  dkg_assertion_create/write/promote/query/history/discard/import_file — Work with V10 WM assertions\n"
             "\n"
-            "  dkg_import_artifact_resolve/read_markdown + dkg_semantic_enrichment_write - Enrich imported attachments without modifying deterministic import assertions\n"
+            "  dkg_import_artifact_read_markdown + dkg_semantic_enrichment_write - Read imported attachment Markdown and append semantic triples to the imported assertion\n"
+            "  dkg_import_artifact_resolve - Optional metadata re-check for imported attachments\n"
             "\n"
             "COLLABORATION WORKFLOW:\n"
             "  dkg_share — Share findings to Shared Working Memory (team-visible, free)\n"
@@ -1978,6 +1978,8 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error("context_graph_id is required.")
         if not assertion_uri:
             return tool_error("assertion_uri is required.")
+        if "name" in args or "semanticAssertionName" in args or "semantic_assertion_name" in args:
+            return tool_error("Semantic enrichment is written into the source import assertion; target assertion names are not supported.")
         quads, quad_error = _normalize_semantic_quads(args.get("semantic_quads"))
         if quad_error:
             return tool_error(quad_error)
@@ -1987,7 +1989,6 @@ class DKGMemoryProvider(MemoryProvider):
             assertion_uri=assertion_uri,
             assertion_name=assertion_name,
             file_hash=_first_text(args, "file_hash"),
-            name=_first_text(args, "name") or _first_text(args, "semantic_assertion_name"),
             generation_method=_first_text(args, "generation_method"),
             agent_identity=_first_text(args, "agent_identity"),
             generated_at=_first_text(args, "generated_at"),
@@ -2372,7 +2373,7 @@ def _normalize_semantic_quads(raw_quads: Any) -> Tuple[List[Dict[str, str]], Opt
         if not isinstance(raw, dict):
             return [], f"semantic_quads[{index}] must be an object."
         if raw.get("graph") is not None:
-            return [], f"semantic_quads[{index}].graph is not supported; semantic triples are written to the target assertion graph."
+            return [], f"semantic_quads[{index}].graph is not supported; semantic triples are written to the source imported assertion graph."
         subject = str(raw.get("subject", "")).strip()
         predicate = str(raw.get("predicate", "")).strip()
         object_value = str(raw.get("object", "")).strip()

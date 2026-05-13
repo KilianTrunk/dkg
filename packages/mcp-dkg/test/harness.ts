@@ -247,12 +247,12 @@ export class FakeClient {
   async writeSemanticEnrichment(args: {
     contextGraphId: string;
     assertionUri: string;
-    name?: string;
     semanticQuads: Array<{ subject: string; predicate: string; object: string }>;
   }) {
     if (this.overrides.writeSemanticEnrichment) return this.overrides.writeSemanticEnrichment.call(this, args);
     return {
-      assertionName: args.name ?? 'semantic-enrichment-imported',
+      assertionUri: args.assertionUri,
+      assertionName: 'imported-doc',
       sourceAssertionUri: args.assertionUri,
       semanticTripleCount: args.semanticQuads.length,
       provenanceTripleCount: 8,

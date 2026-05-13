@@ -412,13 +412,12 @@ class DKGClient:
         assertion_uri: Optional[str] = None,
         assertion_name: Optional[str] = None,
         file_hash: Optional[str] = None,
-        name: Optional[str] = None,
         generation_method: Optional[str] = None,
         agent_identity: Optional[str] = None,
         generated_at: Optional[str] = None,
         sub_graph_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Write model-derived triples to a separate WM enrichment assertion with provenance."""
+        """Append model-derived triples to a completed imported assertion with provenance."""
         payload: Dict[str, Any] = {
             "contextGraphId": context_graph_id,
             "semanticQuads": semantic_quads,
@@ -429,8 +428,6 @@ class DKGClient:
             payload["assertionName"] = assertion_name
         if file_hash:
             payload["fileHash"] = file_hash
-        if name:
-            payload["name"] = name
         if generation_method:
             payload["generationMethod"] = generation_method
         if agent_identity:

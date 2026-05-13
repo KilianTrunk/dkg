@@ -56,8 +56,18 @@ describe('assertion CRUD quintet — round-trip with @en literal preservation', 
       ],
     });
     expect(enrichment.isError).toBeFalsy();
+    expect(enrichment.content[0].text).toContain(`"assertionUri": "${assertionUri}"`);
+    expect(enrichment.content[0].text).toContain('"sourceAssertionUri": "did:dkg:context-graph:test-cg/assertion/peer-test/imported-doc"');
     expect(enrichment.content[0].text).toContain('"promoted": false');
     expect(enrichment.content[0].text).toContain('"published": false');
+  });
+
+  it('does not expose a target assertion name on the semantic enrichment schema', () => {
+    const tool = server.tools.get('dkg_semantic_enrichment_write');
+    expect(tool).toBeTruthy();
+    expect(tool!.config.description).toMatch(/Append model-derived semantic triples/);
+    expect(tool!.config.description).not.toMatch(/separate Working Memory assertion/);
+    expect(tool!.config.inputSchema).not.toHaveProperty('name');
   });
 
   it('rejects semantic enrichment quads that try to set a graph at the MCP layer', async () => {

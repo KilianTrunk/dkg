@@ -208,8 +208,8 @@ function formatAttachmentContext(attachmentRefs: OpenClawAttachmentRef[]): strin
   return [
     'Attached Working Memory items:',
     ...lines,
-    'For completed imported attachments, resolve the artifact with dkg_import_artifact_resolve, read Markdown with dkg_import_artifact_read_markdown when needed, inspect deterministic quads with dkg_assertion_query, and write model-derived triples only through dkg_semantic_enrichment_write.',
-    'Keep deterministic import assertions separate from semantic enrichment assertions; do not promote or publish enrichment output unless explicitly instructed.',
+    'For completed imported attachments, read Markdown with dkg_import_artifact_read_markdown when needed, inspect assertion quads with dkg_assertion_query when useful, and append model-derived triples to the imported assertion with dkg_semantic_enrichment_write.',
+    'Use dkg_import_artifact_resolve only when you need to re-check artifact metadata. Do not promote or publish enrichment output unless explicitly instructed.',
   ].join('\n');
 }
 

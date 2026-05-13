@@ -310,7 +310,7 @@ export function registerAssertionTools(
     {
       title: 'Resolve Imported Artifact',
       description:
-        'Resolve a completed imported attachment/assertion into deterministic metadata: source file hash, Markdown hash/form, extraction method, root entity, and structural counts. Skipped imports are rejected.',
+        'Optional validation/debug helper: resolve a completed imported attachment/assertion into deterministic metadata such as source file hash, Markdown hash/form, extraction method, root entity, and structural counts. Skipped imports are rejected.',
       inputSchema: {
         projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
         assertionUri: z.string().min(1).describe('Completed imported assertion URI from the attachment ref'),
@@ -372,12 +372,11 @@ export function registerAssertionTools(
     {
       title: 'Write Semantic Enrichment',
       description:
-        'Write model-derived semantic triples into a separate Working Memory assertion with provenance pointing to a completed import artifact. Does not modify deterministic import assertions, promote, or publish.',
+        'Append model-derived semantic triples to a completed imported assertion with daemon-stamped provenance. Does not promote, finalize, or publish.',
       inputSchema: {
         projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
         assertionUri: z.string().min(1).describe('Source imported assertion URI from the attachment ref'),
         fileHash: z.string().optional().describe('Optional source file hash to verify'),
-        name: z.string().optional().describe('Optional target semantic enrichment assertion name'),
         semanticQuads: z
           .array(
             z
@@ -389,7 +388,7 @@ export function registerAssertionTools(
               .strict(),
           )
           .min(1)
-          .describe('Model-derived semantic triples; plain-text objects become RDF literals, provenance is added by the daemon, and all triples are written to the target assertion graph'),
+          .describe('Model-derived semantic triples; plain-text objects become RDF literals, provenance is added by the daemon, and all triples are appended to the source imported assertion graph'),
         generationMethod: z.string().optional(),
         agentIdentity: z.string().optional().describe('Agent identity URI or label; only URIs are emitted as prov:wasAttributedTo resources'),
         generatedAt: z.string().optional(),
@@ -400,7 +399,6 @@ export function registerAssertionTools(
       projectId,
       assertionUri,
       fileHash,
-      name,
       semanticQuads,
       generationMethod,
       agentIdentity,
@@ -415,7 +413,6 @@ export function registerAssertionTools(
           assertionUri,
           fileHash,
           subGraphName,
-          name,
           semanticQuads,
           generationMethod,
           agentIdentity,

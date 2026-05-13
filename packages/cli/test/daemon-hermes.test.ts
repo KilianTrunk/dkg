@@ -1804,6 +1804,9 @@ describe('Hermes daemon routes', () => {
     expect(systemPrompt).toContain(`markdownHash="${attachmentRef.fileHash}"`);
     expect(systemPrompt).toContain('dkg_import_artifact_read_markdown');
     expect(systemPrompt).toContain('dkg_semantic_enrichment_write');
+    expect(systemPrompt).toContain('Use dkg_import_artifact_resolve only when you need to re-check artifact metadata');
+    expect(systemPrompt).not.toContain('resolve the artifact with dkg_import_artifact_resolve');
+    expect(systemPrompt).not.toContain('Keep deterministic import assertions separate');
     expect(storeChatExchange).toHaveBeenCalledWith(
       'hermes:dkg-ui:attachments',
       'summarize attached context',

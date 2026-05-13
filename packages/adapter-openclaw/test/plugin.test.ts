@@ -688,6 +688,10 @@ describe('DkgNodePlugin', () => {
     expectRequired('dkg_import_artifact_resolve', ['context_graph_id', 'assertion_uri']);
     expectRequired('dkg_import_artifact_read_markdown', ['context_graph_id', 'assertion_uri']);
     expectRequired('dkg_semantic_enrichment_write', ['context_graph_id', 'assertion_uri', 'semantic_quads']);
+    expect(byName.get('dkg_semantic_enrichment_write')!.parameters.properties).not.toHaveProperty('name');
+    expect(byName.get('dkg_import_artifact_resolve')!.description).toMatch(/Optional validation\/debug helper/);
+    expect(byName.get('dkg_semantic_enrichment_write')!.description).toMatch(/Append model-derived semantic triples/);
+    expect(byName.get('dkg_semantic_enrichment_write')!.description).not.toMatch(/separate Working Memory assertion/);
     expectRequired('dkg_assertion_history', ['context_graph_id', 'name']);
     expectRequired('dkg_sub_graph_create', ['context_graph_id', 'sub_graph_name']);
     expectRequired('dkg_sub_graph_list', ['context_graph_id']);
@@ -854,7 +858,6 @@ describe('DkgNodePlugin', () => {
       await byName.get('dkg_semantic_enrichment_write')!.execute('tc', {
         context_graph_id: 'ctx',
         assertion_uri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
-        name: 'semantic-imported',
         semantic_quads: [
           { subject: 'urn:doc:1', predicate: 'http://schema.org/about', object: 'Topic' },
           { subject: 'urn:doc:1', predicate: 'http://schema.org/author', object: 'mailto:alice@example.org' },
@@ -869,7 +872,6 @@ describe('DkgNodePlugin', () => {
       expect(body).toEqual({
         contextGraphId: 'ctx',
         assertionUri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
-        name: 'semantic-imported',
         semanticQuads: [
           { subject: 'urn:doc:1', predicate: 'http://schema.org/about', object: '"Topic"' },
           { subject: 'urn:doc:1', predicate: 'http://schema.org/author', object: 'mailto:alice@example.org' },
@@ -878,8 +880,25 @@ describe('DkgNodePlugin', () => {
         agentIdentity: 'did:dkg:agent:test',
         generatedAt: '2026-05-11T00:00:00.000Z',
       });
+      expect(body).not.toHaveProperty('name');
+      expect(body).not.toHaveProperty('semanticAssertionName');
       expect(body).not.toHaveProperty('promote');
       expect(body).not.toHaveProperty('publish');
+    });
+
+    it('dkg_semantic_enrichment_write rejects legacy target assertion names at the adapter boundary', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ promoted: false, published: false });
+      const result = await byName.get('dkg_semantic_enrichment_write')!.execute('tc', {
+        context_graph_id: 'ctx',
+        assertion_uri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
+        semanticAssertionName: 'semantic-imported',
+        semantic_quads: [
+          { subject: 'urn:doc:1', predicate: 'http://schema.org/about', object: 'Topic' },
+        ],
+      });
+
+      expect(result.content[0].text).toMatch(/target assertion names are not supported/);
+      expect(fetchMock).not.toHaveBeenCalled();
     });
 
     it('dkg_semantic_enrichment_write rejects semantic graph placement at the adapter boundary', async () => {

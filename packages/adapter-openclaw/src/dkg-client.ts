@@ -75,8 +75,6 @@ export interface ImportedArtifactResolution {
 }
 
 export interface SemanticEnrichmentWriteRequest extends ImportedArtifactRequest {
-  name?: string;
-  semanticAssertionName?: string;
   semanticQuads: Array<{ subject: string; predicate: string; object: string }>;
   generationMethod?: string;
   agentIdentity?: string;
@@ -504,9 +502,8 @@ export class DkgDaemonClient {
   }
 
   /**
-   * Write model-derived semantic triples into a separate WM assertion with
-   * provenance that points back to the deterministic import artifact. The
-   * daemon intentionally does not promote or publish this assertion.
+   * Append model-derived semantic triples into the completed imported assertion
+   * with provenance. The daemon intentionally does not promote or publish.
    */
   async writeSemanticEnrichment(
     request: SemanticEnrichmentWriteRequest,

@@ -556,7 +556,6 @@ describe('DkgDaemonClient', () => {
     await client.writeSemanticEnrichment({
       contextGraphId: 'ctx',
       assertionUri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
-      name: 'semantic-imported',
       semanticQuads: [
         { subject: 'urn:doc:1', predicate: 'http://schema.org/about', object: '"Topic"' },
       ],
@@ -572,7 +571,6 @@ describe('DkgDaemonClient', () => {
     expect(body).toEqual({
       contextGraphId: 'ctx',
       assertionUri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
-      name: 'semantic-imported',
       semanticQuads: [
         { subject: 'urn:doc:1', predicate: 'http://schema.org/about', object: '"Topic"' },
       ],
@@ -580,6 +578,8 @@ describe('DkgDaemonClient', () => {
       agentIdentity: 'did:dkg:agent:test',
       generatedAt: '2026-05-11T00:00:00.000Z',
     });
+    expect(body).not.toHaveProperty('name');
+    expect(body).not.toHaveProperty('semanticAssertionName');
     expect(body).not.toHaveProperty('promote');
     expect(body).not.toHaveProperty('publish');
   });

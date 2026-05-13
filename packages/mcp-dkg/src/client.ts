@@ -400,14 +400,13 @@ export class DkgClient {
     return this.request('POST', '/api/assertion/import-artifact/read-markdown', body);
   }
 
-  /** Write model-derived semantic triples to a separate WM assertion. */
+  /** Append model-derived semantic triples to the completed imported assertion. */
   async writeSemanticEnrichment(args: {
     contextGraphId: string;
     assertionUri: string;
     assertionName?: string;
     fileHash?: string;
     subGraphName?: string;
-    name?: string;
     semanticQuads: Array<{ subject: string; predicate: string; object: string }>;
     generationMethod?: string;
     agentIdentity?: string;
@@ -421,7 +420,6 @@ export class DkgClient {
     if (args.assertionName) body.assertionName = args.assertionName;
     if (args.fileHash) body.fileHash = args.fileHash;
     if (args.subGraphName) body.subGraphName = args.subGraphName;
-    if (args.name) body.name = args.name;
     if (args.generationMethod) body.generationMethod = args.generationMethod;
     if (args.agentIdentity) body.agentIdentity = args.agentIdentity;
     if (args.generatedAt) body.generatedAt = args.generatedAt;

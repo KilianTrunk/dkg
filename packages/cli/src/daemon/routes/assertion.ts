@@ -339,8 +339,8 @@ const DEFAULT_MARKDOWN_READ_BYTES = 1024 * 1024;
 type ImportedArtifactResolution = {
   contextGraphId: string;
   assertionUri: string;
-  assertionName?: string;
-  assertionAgentAddress?: string;
+  assertionName: string;
+  assertionAgentAddress: string;
   subGraphName?: string;
   fileHash: string;
   sourceFileHash: string;
@@ -443,7 +443,7 @@ function normalizeSemanticQuads(raw: unknown): Array<{ subject: string; predicat
     if (record.graph != null) {
       throw new ImportArtifactRouteError(
         400,
-        `semanticQuads[${index}].graph is not supported; semantic triples are written to the target assertion graph`,
+        `semanticQuads[${index}].graph is not supported; semantic triples are written to the source imported assertion graph`,
       );
     }
     if (!subject || !predicate || !object) {
@@ -575,35 +575,6 @@ function buildSemanticEnrichmentProvenanceQuads(args: {
   return provenanceQuads;
 }
 
-function semanticEnrichmentAssertionName(source: ImportedArtifactResolution): string {
-  const sourceName = source.assertionName ?? source.assertionUri.split('/').pop() ?? 'attachment';
-  const sourceSlug = sourceName
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 42) || 'attachment';
-  return `semantic-enrichment-${sourceSlug}-${Date.now()}-${randomUUID().slice(0, 8)}`;
-}
-
-async function semanticEnrichmentTargetExists(
-  ctx: RequestContext,
-  assertionUri: string,
-  contextGraphId: string,
-): Promise<boolean> {
-  const store = ctx.agent.store as typeof ctx.agent.store & { hasGraph?: (graphUri: string) => Promise<boolean> };
-  if (typeof store.hasGraph === 'function' && await store.hasGraph(assertionUri)) return true;
-  const metaGraph = contextGraphMetaUri(contextGraphId);
-  const result = await ctx.agent.store.query(`
-    SELECT ?p ?o WHERE {
-      GRAPH <${metaGraph}> {
-        <${assertionUri}> ?p ?o .
-      }
-    }
-    LIMIT 1
-  `) as { type?: string; bindings?: Array<Record<string, unknown>> };
-  return Boolean(result.bindings?.length);
-}
-
 function sortAssertionQuads<T>(quads: T[]): T[] {
   return [...quads].sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
 }
@@ -706,6 +677,19 @@ async function resolveImportedArtifact(
   if (!parsedAssertion) {
     throw new ImportArtifactRouteError(400, 'assertionUri is not an assertion in the supplied contextGraphId');
   }
+  const parsedNameValidation = validateAssertionName(parsedAssertion.assertionName);
+  if (!parsedNameValidation.valid) {
+    throw new ImportArtifactRouteError(400, `Invalid assertionUri assertion name: ${parsedNameValidation.reason}`);
+  }
+  const reconstructedAssertionUri = contextGraphAssertionUri(
+    contextGraphId,
+    parsedAssertion.assertionAgentAddress,
+    parsedAssertion.assertionName,
+    parsedAssertion.subGraphName,
+  );
+  if (reconstructedAssertionUri !== assertionUri) {
+    throw new ImportArtifactRouteError(400, 'assertionUri is not in canonical assertion URI form');
+  }
   if (assertionName && assertionName !== parsedAssertion.assertionName) {
     throw new ImportArtifactRouteError(400, '"assertionName" does not match assertionUri');
   }
@@ -751,7 +735,10 @@ async function resolveImportedArtifact(
   }
 
   const durableExtractionStatus = normalizeLiteralBinding(metaBinding.extractionStatus) || undefined;
-  if (durableExtractionStatus && durableExtractionStatus !== 'completed') {
+  if (!durableExtractionStatus) {
+    throw new ImportArtifactRouteError(409, 'Import metadata is missing completed extraction status');
+  }
+  if (durableExtractionStatus !== 'completed') {
     throw new ImportArtifactRouteError(
       409,
       `Import artifact is not a completed extraction (status: ${durableExtractionStatus})`,
@@ -912,24 +899,31 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
   }
 
   // POST /api/assertion/semantic-enrichment/write
-  // Write model-derived semantic triples to a separate WM assertion with provenance.
+  // Write model-derived semantic triples into the completed imported assertion with provenance.
   if (req.method === "POST" && path === "/api/assertion/semantic-enrichment/write") {
     const body = await readBody(req);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
     try {
       const record = parsed as Record<string, unknown>;
-      const artifact = await resolveImportedArtifact(ctx, record);
-      const targetName = typeof record.name === 'string' && record.name.trim()
-        ? record.name.trim()
-        : typeof record.semanticAssertionName === 'string' && record.semanticAssertionName.trim()
-          ? record.semanticAssertionName.trim()
-          : semanticEnrichmentAssertionName(artifact);
-      const nameValidation = validateAssertionName(targetName);
-      if (!nameValidation.valid) {
-        throw new ImportArtifactRouteError(400, `Invalid semantic assertion name: ${nameValidation.reason}`);
+      if (
+        record.name !== undefined ||
+        record.semanticAssertionName !== undefined ||
+        record.semantic_assertion_name !== undefined
+      ) {
+        throw new ImportArtifactRouteError(
+          400,
+          'Semantic enrichment is written into the source import assertion; target assertion names are not supported',
+        );
       }
+      const artifact = await resolveImportedArtifact(ctx, record);
       const semanticQuads = normalizeSemanticQuads(record.semanticQuads);
+      if (artifact.assertionAgentAddress !== requestAgentAddress) {
+        throw new ImportArtifactRouteError(
+          403,
+          'Semantic enrichment can only modify imported assertions owned by the requesting agent',
+        );
+      }
       const generatedAt = normalizeGeneratedAt(record.generatedAt);
       const generationMethod = typeof record.generationMethod === 'string' && record.generationMethod.trim()
         ? record.generationMethod.trim()
@@ -944,88 +938,36 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         generationMethod,
         semanticQuads,
       });
-      const targetSubGraphName = artifact.subGraphName;
-      const assertionUri = contextGraphAssertionUri(
-        artifact.contextGraphId,
-        requestAgentAddress,
-        targetName,
-        targetSubGraphName,
-      );
-      if (assertionUri === artifact.assertionUri) {
-        throw new ImportArtifactRouteError(
-          409,
-          'Semantic enrichment assertion must be separate from the source import assertion',
-        );
-      }
-      if (await semanticEnrichmentTargetExists(ctx, assertionUri, artifact.contextGraphId)) {
-        throw new ImportArtifactRouteError(
-          409,
-          'Semantic enrichment assertion already exists; choose a unique target name',
-        );
-      }
-      try {
-        await agent.publisher.assertionCreate(
-          artifact.contextGraphId,
-          targetName,
-          requestAgentAddress,
-          targetSubGraphName,
-        );
-      } catch (err: any) {
-        if (err?.message?.includes('already exists')) {
-          throw new ImportArtifactRouteError(
-            409,
-            'Semantic enrichment assertion already exists; choose a unique target name',
-          );
-        }
-        throw err;
-      }
       const quads = [...semanticQuads, ...provenanceQuads];
-      try {
-        await agent.publisher.assertionWrite(
-          artifact.contextGraphId,
-          targetName,
-          requestAgentAddress,
-          quads,
-          targetSubGraphName,
-        );
-      } catch (err: any) {
-        try {
-          await agent.publisher.assertionDiscard(
-            artifact.contextGraphId,
-            targetName,
-            requestAgentAddress,
-            targetSubGraphName,
-          );
-        } catch (rollbackErr: any) {
-          const writeMessage = err instanceof Error ? err.message : String(err);
-          const rollbackMessage = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
-          throw new Error(
-            `Semantic enrichment write failed and rollback failed: ${writeMessage}; rollback: ${rollbackMessage}`,
-          );
-        }
-        throw err;
+      const targetAssertionUri = contextGraphAssertionUri(
+        artifact.contextGraphId,
+        artifact.assertionAgentAddress,
+        artifact.assertionName,
+        artifact.subGraphName,
+      );
+      if (targetAssertionUri !== artifact.assertionUri) {
+        throw new ImportArtifactRouteError(409, 'Resolved import artifact target does not match assertionUri');
       }
+      await agent.publisher.assertionWrite(
+        artifact.contextGraphId,
+        artifact.assertionName,
+        artifact.assertionAgentAddress,
+        quads,
+        artifact.subGraphName,
+      );
       emitMemoryGraphChanged?.({
         contextGraphId: artifact.contextGraphId,
         layers: ["wm"],
-        subGraphName: targetSubGraphName,
-        operation: "assertion_created",
-        source: "api",
-        counts: { triples: 0 },
-      });
-      emitMemoryGraphChanged?.({
-        contextGraphId: artifact.contextGraphId,
-        layers: ["wm"],
-        subGraphName: targetSubGraphName,
+        subGraphName: artifact.subGraphName,
         operation: "semantic_enrichment_written",
         source: "api",
         counts: { triples: quads.length },
       });
       return jsonResponse(res, 200, {
-        assertionUri,
-        assertionName: targetName,
+        assertionUri: artifact.assertionUri,
+        assertionName: artifact.assertionName,
         contextGraphId: artifact.contextGraphId,
-        ...(targetSubGraphName ? { subGraphName: targetSubGraphName } : {}),
+        ...(artifact.subGraphName ? { subGraphName: artifact.subGraphName } : {}),
         sourceAssertionUri: artifact.assertionUri,
         sourceFileHash: artifact.fileHash,
         markdownHash: artifact.markdownHash,

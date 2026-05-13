@@ -516,39 +516,54 @@ jobs:
                   const hits = JSON.parse(process.env.GHSA_INPUT);
                   const newVer = process.env.NEW_VER || "";
                   const oldVer = process.env.OLD_VER || "";
+                  // Tri-state matches(): true (definitely in range), false
+                  // (definitely out), or null (cannot tell — unparseable
+                  // range, prerelease version, or any other error).
                   function matches(version, raw) {
                     const r = (raw || "").trim();
-                    if (!r) return true; // empty range → match (no filter)
-                    // Pre-release / build-metadata version → conservative match.
-                    // semver-mini intentionally refuses to parse `1.2.3-rc.1`
-                    // (full prerelease ordering is non-trivial) and we would
-                    // rather over-flag a prerelease bump than silently let one
-                    // sneak past a `< 1.2.3` upper bound.
-                    if (/[-+]/.test(version || "")) return true;
+                    if (!r) return true;
+                    if (/[-+]/.test(version || "")) return null;
                     const parsed = semver.validRange(r);
-                    if (parsed === null) return true; // unparseable range → conservative match
+                    if (parsed === null) return null;
                     try {
                       return semver.satisfies(version, parsed);
-                    } catch (_) { return true; } // any other error → conservative match
+                    } catch (_) { return null; }
                   }
-                  // Each hit gets tagged with whether NEW + OLD versions
-                  // are inside the vulnerable range. Downstream picks the
-                  // "fresh" set (new matches, old does not).
-                  const tagged = hits.map(h => Object.assign({}, h, {
-                    matchesNew: newVer ? matches(newVer, h.range) : false,
-                    matchesOld: oldVer ? matches(oldVer, h.range) : false,
-                    source: "GHSA"
-                  }));
+                  // Coerce null → conservative defaults (matchesNew=true,
+                  // matchesOld=false) so the advisory surfaces in the
+                  // FRESH filter rather than slipping past it as if it
+                  // were a baseline. AND set inconclusive=true so the
+                  // gate flips to red regardless of whether the FRESH
+                  // filter catches it. Without `inconclusive`, a `||`
+                  // disjoint range like `>=1.0.0 <2.0.0 || >=3.0.0 <4.0.0`
+                  // against a 2.5.0 → 3.1.0 bump (genuinely vulnerable)
+                  // would compute matchesNew=null, matchesOld=null →
+                  // coerced (true, false) → in FRESH (correct!), but
+                  // the *same* coercion would also flag (true, false)
+                  // on a baseline that affects neither version, causing
+                  // a false positive. The inconclusive flag tells the
+                  // downstream filter to surface either case as
+                  // "manual review" rather than auto-closing the PR.
+                  const tagged = hits.map(h => {
+                    const mNew = newVer ? matches(newVer, h.range) : false;
+                    const mOld = oldVer ? matches(oldVer, h.range) : false;
+                    return Object.assign({}, h, {
+                      matchesNew:  mNew === null ? true  : mNew,
+                      matchesOld:  mOld === null ? false : mOld,
+                      inconclusive: (mNew === null) || (mOld === null),
+                      source: "GHSA"
+                    });
+                  });
                   process.stdout.write(JSON.stringify(tagged));
                 ' 2>/dev/null || true
               )
               # Conservative fallback: node failure (helper missing, OOM,
-              # parse error) → treat every GHSA hit as matchesNew AND not
-              # matchesOld, so the diff keeps all of them as fresh. This
-              # over-reports rather than under-reports.
+              # parse error) → treat every GHSA hit as inconclusive AND
+              # surface them in FRESH so the package goes red. Better to
+              # over-report than to silently drop the entire GHSA set.
               if [ -z "${FILTERED_GHSA}" ]; then
-                echo "::warning title=GHSA filter degraded::semver-mini filtering failed for ${NAME}; treating every GHSA hit as fresh (conservative)."
-                FILTERED_GHSA=$(echo "${GHSA_HITS}" | jq -c '[.[] | . + {matchesNew:true,matchesOld:false,source:"GHSA"}]')
+                echo "::warning title=GHSA filter degraded::semver-mini filtering failed for ${NAME}; treating every GHSA hit as inconclusive (conservative)."
+                FILTERED_GHSA=$(echo "${GHSA_HITS}" | jq -c '[.[] | . + {matchesNew:true,matchesOld:false,inconclusive:true,source:"GHSA"}]')
               fi
             else
               FILTERED_GHSA='[]'
@@ -556,42 +571,72 @@ jobs:
 
             # OSV does server-side range matching, so each query already
             # returns only matches. Tag the two result sets accordingly.
-            OSV_NEW_TAGGED=$(echo "${OSV_HITS_NEW}" | jq -c '[.[] | . + {matchesNew:true,matchesOld:false,source:"OSV"}]')
-            OSV_OLD_TAGGED=$(echo "${OSV_HITS_OLD}" | jq -c '[.[] | . + {matchesNew:false,matchesOld:true,source:"OSV"}]')
-            # Merge OSV-new and OSV-old by ghsaId, OR'ing the match flags
-            # so a hit that matched BOTH versions has both flags set.
-            OSV_MERGED=$(jq -nc --argjson n "${OSV_NEW_TAGGED}" --argjson o "${OSV_OLD_TAGGED}" '
-              ($n + $o) | group_by(.ghsaId) | map(reduce .[] as $e ({}; . * $e + {
-                matchesNew: ((.matchesNew // false) or ($e.matchesNew // false)),
-                matchesOld: ((.matchesOld // false) or ($e.matchesOld // false))
-              }))
+            # `inconclusive: false` — OSV is authoritative for the rows
+            # it returns; nothing about its API is ambiguous.
+            OSV_NEW_TAGGED=$(echo "${OSV_HITS_NEW}" | jq -c '[.[] | . + {matchesNew:true,matchesOld:false,inconclusive:false,source:"OSV"}]')
+            OSV_OLD_TAGGED=$(echo "${OSV_HITS_OLD}" | jq -c '[.[] | . + {matchesNew:false,matchesOld:true,inconclusive:false,source:"OSV"}]')
+
+            # Merge across (OSV-new + OSV-old + GHSA) by ghsaId using
+            # group_by + any/all so we can preserve a tri-state
+            # `inconclusive` aggregate alongside the boolean matches:
+            #   * matchesNew/matchesOld → ANY source saw a match
+            #   * inconclusive          → ALL sources were inconclusive
+            # The `all` semantics mean a single authoritative source
+            # (OSV with inconclusive=false) deflags the hit, while
+            # GHSA-only inconclusive hits stay flagged. Other metadata
+            # (severity, summary, permalink) is picked from the first
+            # row of the group — they're stable per ghsaId.
+            ALL_HITS=$(jq -nc --argjson g "${FILTERED_GHSA}" --argjson on "${OSV_NEW_TAGGED}" --argjson oo "${OSV_OLD_TAGGED}" '
+              ($g + $on + $oo) | group_by(.ghsaId) | map({
+                ghsaId:      .[0].ghsaId,
+                severity:    .[0].severity,
+                summary:     .[0].summary,
+                permalink:   .[0].permalink,
+                range:       .[0].range,
+                source:      ([.[].source] | unique | join(",")),
+                matchesNew:  any(.[]; .matchesNew  == true),
+                matchesOld:  any(.[]; .matchesOld  == true),
+                inconclusive: all(.[]; .inconclusive == true)
+              })
             ')
 
-            # Same merge across the two sources, again by ghsaId.
-            ALL_HITS=$(jq -nc --argjson g "${FILTERED_GHSA}" --argjson o "${OSV_MERGED}" '
-              ($g + $o) | group_by(.ghsaId) | map(reduce .[] as $e ({}; . * $e + {
-                matchesNew: ((.matchesNew // false) or ($e.matchesNew // false)),
-                matchesOld: ((.matchesOld // false) or ($e.matchesOld // false))
-              }))
-            ')
-
-            # The FRESH set is the gate's verdict: advisories that hit
-            # the new version but did NOT already match the old version.
-            # A long-standing CVE that affects both old and new is
-            # filtered out — it's a pre-existing baseline, not a fresh
-            # threat introduced by this PR. The team already accepted
-            # it on the previous version; surfacing it here would be a
-            # false positive that trains reviewers to ignore the gate.
-            COMBINED=$(echo "${ALL_HITS}" | jq -c '[.[] | select(.matchesNew == true and .matchesOld == false)]')
+            # FRESH = the gate's verdict. Two cases land in the bucket:
+            #   1. Clear fresh — matchesNew=true and matchesOld=false
+            #      under reliable data → known introduced-by-this-PR
+            #      threat. Triggers COMPROMISED (auto-close + Teams).
+            #   2. Inconclusive — at least one source could not
+            #      determine the range membership on at least one side
+            #      AND no source contradicted with reliable data. The
+            #      hit surfaces in the FRESH set with `inconclusive:
+            #      true`, which the downstream logic translates into
+            #      INCONCLUSIVE (red check, no auto-close — reviewer
+            #      manually verifies whether the bump introduces the
+            #      advisory or just inherits it as baseline).
+            # A long-standing CVE that affects both old and new with
+            # reliable data is filtered out — it is a pre-existing
+            # baseline, not a fresh threat introduced by this PR.
+            COMBINED=$(echo "${ALL_HITS}" | jq -c '[.[] | select((.matchesNew == true and .matchesOld == false) or .inconclusive == true)]')
+            CLEAR_FRESH_COUNT=$(echo "${COMBINED}" | jq '[.[] | select(.inconclusive == false)] | length')
+            INCONCLUSIVE_COUNT=$(echo "${COMBINED}" | jq '[.[] | select(.inconclusive == true)] | length')
             HIT_COUNT=$(echo "${COMBINED}" | jq 'length')
-            if [ "${HIT_COUNT:-0}" -gt 0 ]; then
+            if [ "${CLEAR_FRESH_COUNT:-0}" -gt 0 ]; then
               COMPROMISED=true
+              echo "::error title=Compromised dependency::${NAME}@${NEW} matches ${CLEAR_FRESH_COUNT} fresh advisor(y|ies)"
+            fi
+            if [ "${INCONCLUSIVE_COUNT:-0}" -gt 0 ]; then
+              INCONCLUSIVE=true
+              echo "::warning title=Advisory match inconclusive::${NAME}@${NEW} has ${INCONCLUSIVE_COUNT} advisor(y|ies) where semver-mini could not reliably determine fresh-vs-baseline; manual review required."
+            fi
+            if [ "${HIT_COUNT:-0}" -gt 0 ]; then
               ANY_ADVISORY=true
-              echo "::error title=Advisory hit::${NAME}@${NEW} matches ${HIT_COUNT} advisor(y|ies)"
+              # Advisory table row severity prefix is `INCONCLUSIVE` for
+              # the uncertain hits so reviewers can immediately tell which
+              # rows need manual semver verification vs which are
+              # confirmed fresh compromises.
               ROWS=$(
                 echo "${COMBINED}" | jq -r --arg name "${NAME}" --arg ver "${NEW}" '
                   .[] |
-                  "| " + (.severity // "UNKNOWN") +
+                  "| " + (if .inconclusive == true then "INCONCLUSIVE" else (.severity // "UNKNOWN") end) +
                   " | `" + $name + "` " +
                   " | `" + $ver + "`" +
                   " | " + (.source // "?") +

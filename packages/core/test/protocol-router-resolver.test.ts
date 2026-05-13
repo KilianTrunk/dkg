@@ -208,4 +208,40 @@ describe('ProtocolRouter.send + PeerResolver', () => {
     );
     expect(dec.decode(response)).toBe('echo:hi');
   }, 15000);
+
+  // Codex review feedback on PR #497 round 5: keeping peerResolver
+  // optional makes the priming guarantee implicit and a future
+  // `new ProtocolRouter(node)` would silently skip priming. The
+  // mitigation is a one-time loud warn at first cold dial.
+  it('warns once on first send() when peerResolver is omitted (PR #497 round 5)', async () => {
+    const a = spawn();
+    const b = spawn();
+    await a.start();
+    await b.start();
+    await a.libp2p.dial(multiaddr(b.multiaddrs[0]));
+    await new Promise((r) => setTimeout(r, 300));
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const routerA = new ProtocolRouter(a);
+    const routerB = new ProtocolRouter(b);
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+    routerB.register('/test/warn-no-resolver/1.0.0', async (data) =>
+      enc.encode(`echo:${dec.decode(data)}`),
+    );
+
+    await routerA.send(b.peerId, '/test/warn-no-resolver/1.0.0', enc.encode('1'));
+    await routerA.send(b.peerId, '/test/warn-no-resolver/1.0.0', enc.encode('2'));
+    await routerA.send(b.peerId, '/test/warn-no-resolver/1.0.0', enc.encode('3'));
+
+    const matches = warnSpy.mock.calls.filter((c) => {
+      const first = c[0];
+      return typeof first === 'string' && first.includes('peerResolver');
+    });
+    expect(matches.length).toBe(1);
+    expect(matches[0][0]).toMatch(/RFC 07/);
+
+    warnSpy.mockRestore();
+  }, 15000);
 });

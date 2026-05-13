@@ -160,9 +160,14 @@ const ALLOWLIST = new Map([
   ],
 ]);
 
-// Member access: .dialProtocol(  AND  ?.dialProtocol(
+// Member access (Codex feedback PR #499 round 3 added the trailing
+// `?.\s*` to catch optional CALL forms — `foo.dialProtocol?.(...)`
+// and `foo?.dialProtocol?.(...)` — which both execute the same raw
+// dial path):
+//   .dialProtocol(            ?.dialProtocol(
+//   .dialProtocol?.(          ?.dialProtocol?.(
 // Stripped (comments/strings blanked) input is safe to scan with this.
-const MEMBER_ACCESS_RE = /(?:\?\.|\.)\s*dialProtocol\s*\(/g;
+const MEMBER_ACCESS_RE = /(?:\?\.|\.)\s*dialProtocol\s*(?:\?\.\s*)?\(/g;
 
 // Bracket access (any quote style, with optional inline comments).
 // Examples handled (validated by audit-dial-protocol.test.mjs):
@@ -177,9 +182,16 @@ const MEMBER_ACCESS_RE = /(?:\?\.|\.)\s*dialProtocol\s*\(/g;
 // at the file level (commented-out `[...]` blanks to spaces).
 const COMMENT_OR_WS = '(?:\\s|/\\*[\\s\\S]*?\\*/|//[^\\n]*\\n)*';
 const BRACKET_ACCESS_RE = new RegExp(
-  `(?:\\?\\.${COMMENT_OR_WS})?\\[${COMMENT_OR_WS}` +
+  // Optional optional-chaining prefix: `?.`
+  `(?:\\?\\.${COMMENT_OR_WS})?` +
+    // The bracketed property access itself
+    `\\[${COMMENT_OR_WS}` +
     `(?:"dialProtocol"|'dialProtocol'|\`dialProtocol\`)` +
-    `${COMMENT_OR_WS}\\]\\s*\\(`,
+    `${COMMENT_OR_WS}\\]` +
+    // Codex feedback PR #499 round 3: also accept the optional CALL
+    // form `["dialProtocol"]?.(...)`. The `?.` here is BETWEEN the
+    // closing bracket and the open paren.
+    `\\s*(?:\\?\\.\\s*)?\\(`,
   'g',
 );
 

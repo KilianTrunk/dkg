@@ -3997,20 +3997,25 @@ export class DKGAgent {
    *
    * After RFC 07 PR-4 the inline DHT walk is gone; resolution is delegated
    * to the resolver, which runs the full RFC 07 §3.1 order: live conn →
-   * DHT → RFC 04 registry (stub) → agents-CG fallback → bootstrap seeds.
-   * The resolver primes the libp2p peerStore as a side effect, so a plain
-   * `libp2p.dial(peerId)` here finds a route. The agents-CG fallback in
-   * particular is a new capability — the legacy inline path had no way
-   * to reach a peer whose DHT record was stale but whose relay was still
-   * advertised in the agent registry.
+   * DHT → RFC 04 registry (stub) → agents-CG fallback. The resolver primes
+   * the libp2p peerStore as a side effect, so a plain `libp2p.dial(peerId)`
+   * here finds a route. The agents-CG fallback in particular is a new
+   * capability — the legacy inline path had no way to reach a peer whose
+   * DHT record was stale but whose relay was still advertised in the
+   * agent registry.
+   *
+   * (PR #496 originally included a step-5 "bootstrap seeds" fallback in
+   * the resolver itself; that was removed after Codex review pointed out
+   * that bootstrap seeds are addresses for SEED peers, not for the
+   * requested target. Bootstrap stays a libp2p-startup concern via
+   * `bootstrap({ list })` peerDiscovery in node.ts.)
    *
    * Errors:
    *   - `INVALID_PEER_ID` — client-side parse failure (HTTP 400).
    *   - `SELF_DIAL` — caller asked us to dial our own peer id (HTTP 400).
    *   - `PEER_NOT_FOUND` — resolver returned no addresses (DHT miss AND
-   *     no agents-CG record AND no bootstrap seeds). Genuine negative
-   *     lookup → HTTP 404. Retrying is unlikely to help until the remote
-   *     node republishes.
+   *     no agents-CG record). Genuine negative lookup → HTTP 404.
+   *     Retrying is unlikely to help until the remote node republishes.
    *   - `DIAL_FAILED` — resolver returned addresses but every dial attempt
    *     failed. Retriable transport-level → HTTP 502.
    *

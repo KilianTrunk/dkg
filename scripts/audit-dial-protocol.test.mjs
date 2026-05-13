@@ -141,3 +141,28 @@ test('counts member + bracket on the same line as two hits', () => {
   const hits = findHits('await libp2p.dialProtocol(a); await libp2p["dialProtocol"](b);');
   assert.equal(hits.length, 2);
 });
+
+// Codex review feedback on PR #499 (round 3): the audit must also
+// catch optional-CALL forms — `foo.dialProtocol?.(...)` and bracket
+// equivalents. Both execute the raw dial path while bypassing a
+// detector that only looks for `(...)`.
+
+test('catches optional-call: foo.dialProtocol?.(', () => {
+  const hits = findHits('await libp2p.dialProtocol?.(pid, "/p/1");');
+  assert.equal(hits.length, 1);
+});
+
+test('catches optional-call: foo?.dialProtocol?.(', () => {
+  const hits = findHits('await libp2p?.dialProtocol?.(pid, "/p/1");');
+  assert.equal(hits.length, 1);
+});
+
+test('catches optional-call bracket: foo["dialProtocol"]?.(', () => {
+  const hits = findHits('await libp2p["dialProtocol"]?.(pid, "/p/1");');
+  assert.equal(hits.length, 1);
+});
+
+test('catches optional-call bracket with optional chain: foo?.["dialProtocol"]?.(', () => {
+  const hits = findHits('await libp2p?.["dialProtocol"]?.(pid, "/p/1");');
+  assert.equal(hits.length, 1);
+});

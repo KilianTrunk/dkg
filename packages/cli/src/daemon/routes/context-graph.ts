@@ -474,15 +474,27 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     if (parsedPcaAccountId.value !== undefined && accessPolicy === 0 && parsed.private !== true) {
       return jsonResponse(res, 400, { error: 'pcaAccountId is only valid for curated/private context graphs' });
     }
-    // When pcaAccountId is supplied without an explicit accessPolicy, infer
-    // curated. Matches Codex review feedback: pcaAccountId on its own is a
-    // curated signal so raw HTTP/SDK callers don't have to know to also set
-    // accessPolicy=1 just to get past validation.
-    const inferredAccessPolicy = typeof accessPolicy === 'number'
-      ? accessPolicy
-      : parsedPcaAccountId.value !== undefined
-        ? 1
-        : undefined;
+    // Effective accessPolicy for both the create and the (optional)
+    // register-during-create leg below. Priority:
+    //   1. `private: true` is a curated signal that overrides any
+    //      explicit `accessPolicy` (matches the agent's createContextGraph
+    //      treatment of the legacy `private` flag).
+    //   2. Explicit `accessPolicy` wins next.
+    //   3. `pcaAccountId` alone is a curated signal — coerce to 1 so raw
+    //      HTTP/SDK callers don't have to also know to set accessPolicy.
+    //   4. Otherwise leave undefined and let the agent default it.
+    // Codex review #502-2: the register leg used to read raw `accessPolicy`
+    // here, so `{ private: true, accessPolicy: 0, pcaAccountId, register: true }`
+    // created the CG locally and then immediately failed registration as
+    // open-with-PCA. Routing through `inferredAccessPolicy` keeps the
+    // create+register pair consistent.
+    const inferredAccessPolicy = parsed.private === true
+      ? 1
+      : typeof accessPolicy === 'number'
+        ? accessPolicy
+        : parsedPcaAccountId.value !== undefined
+          ? 1
+          : undefined;
     try {
       await agent.createContextGraph({
         id,
@@ -518,7 +530,7 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       try {
         const regResult = await agent.registerContextGraph(id, {
           callerAgentAddress: requestAgentAddress,
-          accessPolicy: typeof accessPolicy === 'number' ? accessPolicy : undefined,
+          accessPolicy: inferredAccessPolicy,
           publishPolicy: typeof publishPolicy === 'number' ? publishPolicy : undefined,
           publishAuthorityAccountId: parsedPcaAccountId.value,
         });
@@ -602,6 +614,22 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       }
       if (msg.includes('PCA account id can only be used with curated/private context graphs')) {
         return jsonResponse(res, 400, { error: msg });
+      }
+      // PCA-specific 4xx mapping (Codex review #502-3): caller-input or
+      // unsupported-feature failures should not surface as 500s with raw
+      // chain/adapter revert text. Order matters — more specific matches
+      // come first.
+      if (msg.includes('PCA account id must be a positive integer')) {
+        return jsonResponse(res, 400, { error: msg });
+      }
+      if (msg.includes('requires chain adapter PCA owner lookup support')) {
+        return jsonResponse(res, 501, { error: msg });
+      }
+      if (/PCA account \d+ does not exist or cannot be looked up/.test(msg)) {
+        return jsonResponse(res, 404, { error: msg });
+      }
+      if (/PCA account \d+ is owned by/.test(msg)) {
+        return jsonResponse(res, 403, { error: msg });
       }
       return jsonResponse(res, 500, { error: msg });
     }

@@ -548,6 +548,48 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     });
     expect([200, 201]).toContain(create.status);
   });
+
+  // Codex review #502-3: a bad pcaAccountId on /register surfaces as a
+  // chain revert ("ERC721NonexistentToken" or similar) from the EVM
+  // adapter. The daemon must translate it into a clean 4xx with the
+  // wrapped agent-error message — never a generic 500 with raw revert
+  // hex bleeding through.
+  it('maps a nonexistent pcaAccountId on register to a 4xx (not 500)', async () => {
+    const d = daemon!;
+    const cgId = 'pca-register-nonexistent-' + Math.random().toString(36).slice(2, 8);
+    const create = await fetch(urlFor(d, '/api/context-graph/create'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({ id: cgId, name: cgId, accessPolicy: 1 }),
+    });
+    expect([200, 201]).toContain(create.status);
+
+    // An astronomically high id that no minted PCA NFT will ever match
+    // on the shared Hardhat node. The agent wraps the ERC721 revert into
+    // "PCA account ... does not exist or cannot be looked up: ..." and
+    // the daemon catch maps that prefix to 404.
+    const register = await fetch(urlFor(d, '/api/context-graph/register'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({ id: cgId, pcaAccountId: '99999999999999999999' }),
+    });
+
+    // The exact 4xx code depends on which branch fires first:
+    //   - 404 when the wrapped "PCA account ... does not exist" error
+    //     bubbles up (EVM contract-deployed-but-token-missing case).
+    //   - 501 when this daemon's EVM adapter version pre-dates
+    //     `getPublishingConvictionAccountOwner` (older deployments).
+    //   - 400 when the value fails pcaAccountId parsing (shouldn't here,
+    //     but guards against regressions in the parser).
+    // The hard contract: NEVER a 5xx — that's the whole point of #502-3.
+    expect(register.status).toBeGreaterThanOrEqual(400);
+    expect(register.status).toBeLessThan(500);
+    const body = await register.json();
+    expect(typeof body.error).toBe('string');
+    // No raw revert hex / Hardhat internal frames in the surfaced
+    // message — callers should see something human-readable.
+    expect(body.error).not.toMatch(/^0x[0-9a-fA-F]+$/);
+  });
 });
 
 describe('DKG-419 — lazy context graph metadata from SWM writes', () => {

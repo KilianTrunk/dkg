@@ -7780,9 +7780,11 @@ export class DKGAgent {
     if (publishPolicy === EVM_PUBLISH_OPEN && publishAuthorityAccountId !== undefined) {
       throw new Error('PCA account id can only be used with curated/private context graphs.');
     }
-    if (requestedPublishAuthorityAccountId !== undefined) {
-      await this.setContextGraphPublishAuthorityAccountId(id, requestedPublishAuthorityAccountId);
-    }
+    // NOTE: we intentionally defer persisting `requestedPublishAuthorityAccountId`
+    // until *after* on-chain registration succeeds (further down). If we
+    // wrote it here and the subsequent owner check / on-chain call failed
+    // with a bad PCA id, the bad id would stick in local CG metadata and
+    // every retry would replay the same failure (Codex review #502-1).
     const isPcaCurated = publishPolicy === EVM_PUBLISH_CURATED
       && publishAuthorityAccountId !== undefined;
 
@@ -7848,9 +7850,20 @@ export class DKGAgent {
         if (typeof this.chain.getPublishingConvictionAccountOwner !== 'function') {
           throw new Error('PCA curated context graph registration requires chain adapter PCA owner lookup support.');
         }
-        publishAuthority = ethers.getAddress(
-          await this.chain.getPublishingConvictionAccountOwner(publishAuthorityAccountId),
-        );
+        // Translate raw chain reverts on a nonexistent PCA token to a
+        // stable, caller-input-shaped error so the daemon route can map
+        // it cleanly to 4xx instead of bleeding execution-revert text
+        // through as a 500 (Codex review #502-3).
+        try {
+          publishAuthority = ethers.getAddress(
+            await this.chain.getPublishingConvictionAccountOwner(publishAuthorityAccountId),
+          );
+        } catch (lookupErr: any) {
+          const lookupMsg = String(lookupErr?.message ?? lookupErr ?? 'unknown error');
+          throw new Error(
+            `PCA account ${publishAuthorityAccountId} does not exist or cannot be looked up: ${lookupMsg}`,
+          );
+        }
       } else {
         publishAuthority = await this.getChainPublishAuthorityAddress(id);
       }
@@ -7905,6 +7918,13 @@ export class DKGAgent {
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
       { subject: contextGraphUri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${onChainId}"`, graph: ontologyGraph },
     ]);
+
+    // Persist the (now-validated) PCA account id locally. Deferred until
+    // after on-chain registration succeeds so a bad pcaAccountId never
+    // leaves stale state behind (Codex review #502-1).
+    if (requestedPublishAuthorityAccountId !== undefined) {
+      await this.setContextGraphPublishAuthorityAccountId(id, requestedPublishAuthorityAccountId);
+    }
 
     // Update in-memory subscription record and ensure we're subscribed
     const sub = this.subscribedContextGraphs.get(id);

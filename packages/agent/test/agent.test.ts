@@ -2611,6 +2611,107 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
+  // Codex review #502-1: a failed PCA registration must not leave the
+  // requested pcaAccountId persisted in local CG metadata. If it did,
+  // every retry would silently replay the same bad id from storage even
+  // after the caller corrects their request.
+  it('does NOT persist the requested PCA account id when registration fails (e.g. nonexistent token)', async () => {
+    const badAccountId = 999n;
+    const chain = new PcaCuratedRegistrationChainAdapter(new Map());
+    // Use the chain's own signer as the local curator so the EOA-curated
+    // branch (the fallback after persist-rollback) can succeed without
+    // chain-signer mismatch. The bad id throws on owner lookup (no entry
+    // in the map), so the persist must NOT fire.
+    const ownerAddr = ethers.getAddress(chain.signerAddress);
+    const agent = await DKGAgent.create({
+      name: 'PcaPersistRollbackBot',
+      store: new OxigraphStore(),
+      chainAdapter: chain,
+      nodeRole: 'core',
+    });
+    await agent.start();
+
+    await agent.createContextGraph({
+      id: 'pca-persist-rollback',
+      name: 'PCA Persist Rollback',
+      accessPolicy: 1,
+      callerAgentAddress: ownerAddr,
+    });
+
+    // First attempt: bad pcaAccountId. PcaCuratedRegistrationChainAdapter
+    // throws on `getPublishingConvictionAccountOwner(badAccountId)`, which
+    // the agent now wraps into a stable "PCA account ... does not exist"
+    // error (#502-3) and short-circuits before persisting.
+    await expect(agent.registerContextGraph('pca-persist-rollback', {
+      callerAgentAddress: ownerAddr,
+      publishAuthorityAccountId: badAccountId,
+    })).rejects.toThrow(/PCA account 999 does not exist/);
+    expect(chain.createOnChainContextGraphCalls).toHaveLength(0);
+
+    // Second attempt: caller omits pcaAccountId. If the bad id had been
+    // persisted on the failed first attempt, the resolver would replay
+    // it from storage and the call would throw the same "PCA account 999
+    // does not exist" error again. With the fix it doesn't — the
+    // resolver finds no stored id and falls through to the EOA-curated
+    // branch (publishAuthority = chain signer = local curator).
+    await expect(agent.registerContextGraph('pca-persist-rollback', {
+      callerAgentAddress: ownerAddr,
+    })).resolves.toMatchObject({ onChainId: expect.any(String) });
+
+    expect(chain.createOnChainContextGraphCalls).toHaveLength(1);
+    expect(chain.createOnChainContextGraphCalls[0]).toMatchObject({
+      publishPolicy: 0,
+      publishAuthority: ownerAddr,
+    });
+    // No `publishAuthorityAccountId` on the on-chain call confirms the
+    // bad id is gone (the field is conditionally spread only when
+    // `isPcaCurated`).
+    expect(chain.createOnChainContextGraphCalls[0]?.publishAuthorityAccountId ?? 0n).toBe(0n);
+    await agent.stop().catch(() => {});
+  });
+
+  // Codex review #502-2: `{ private: true, accessPolicy: 0,
+  // pcaAccountId }` create+register must not flip-flop between curated
+  // (at create time) and open (at register time). The daemon route's
+  // `inferredAccessPolicy` keeps both legs aligned; this test pins the
+  // agent-level contract: `private: true` is a curated signal that
+  // dominates accessPolicy=0.
+  it('treats private:true as a curated signal that dominates accessPolicy=0 for PCA registration', async () => {
+    const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
+    const pcaAccountId = 77n;
+    const chain = new PcaCuratedRegistrationChainAdapter(new Map([[pcaAccountId, pcaOwner]]));
+    const agent = await DKGAgent.create({
+      name: 'PcaPrivateOverridesAccessPolicyBot',
+      store: new OxigraphStore(),
+      chainAdapter: chain,
+      nodeRole: 'core',
+    });
+    await agent.start();
+
+    await agent.createContextGraph({
+      id: 'pca-private-dominates',
+      name: 'PCA Private Dominates AccessPolicy',
+      private: true,
+      publishAuthorityAccountId: pcaAccountId,
+      callerAgentAddress: pcaOwner,
+    });
+
+    // Register with accessPolicy=1 (matches the daemon route's
+    // `inferredAccessPolicy` for `private: true`). The agent must accept
+    // and route into the PCA curated branch.
+    await expect(agent.registerContextGraph('pca-private-dominates', {
+      accessPolicy: 1,
+      callerAgentAddress: pcaOwner,
+    })).resolves.toMatchObject({ onChainId: expect.any(String) });
+
+    expect(chain.createOnChainContextGraphCalls[0]).toMatchObject({
+      publishPolicy: 0,
+      publishAuthority: pcaOwner,
+      publishAuthorityAccountId: pcaAccountId,
+    });
+    await agent.stop().catch(() => {});
+  });
+
 	  it('requires address-scoped curator authority for on-chain registration', async () => {
     const store = new OxigraphStore();
     const chain = new CapturingContextGraphChainAdapter();

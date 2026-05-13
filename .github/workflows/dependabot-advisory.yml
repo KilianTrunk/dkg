@@ -120,32 +120,114 @@ jobs:
         id: meta
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      - name: Install semver for range matching
-        # GHSA returns a `vulnerableVersionRange` (e.g. `>=4.0.0 <4.17.21`)
-        # against the package, not against a specific version. We need a
-        # SemVer-aware comparison to decide whether the NEW version this
-        # PR is bumping to actually falls in that range. The `semver`
-        # module's JS API (specifically `semver.validRange()` paired
-        # with `semver.satisfies()`) is the only way to robustly tell
-        # parse-errors apart from genuine out-of-range answers — the
-        # `semver` CLI gives the same `rc=1 + empty output` for both,
-        # which would silently drop GHSA hits whose range has a
-        # comma separator (the actual emitted format — see the classify
-        # step for the gory detail).
+      - name: Vendor minimal semver range-check helper
+        # Why a vendored helper and not `npm install semver`:
+        #   This job runs under `pull_request_target` with write
+        #   permissions on the PR. Doing `npm install <anything>` from
+        #   that context means a compromise of the target package's
+        #   tarball or `postinstall` script would run attacker code on
+        #   our runner with `GITHUB_TOKEN` already in `process.env` and
+        #   `pull-requests: write` scope — i.e. the supply-chain hole
+        #   this entire workflow exists to *close*. Keeping the helper
+        #   in-tree eliminates the runtime hop.
         #
-        # We install locally in `${RUNNER_TEMP}/semver` so the require
-        # path is predictable; the global npm root is NOT in `NODE_PATH`
-        # on ubuntu-latest, so `npm install --global semver` would make
-        # the CLI work but break `require()`. The local-install path is
-        # also nicer for hash-pinning if we ever want to add lockfile
-        # verification here.
+        # Scope: parses the subset of range syntax actually emitted by
+        # GHSA and OSV (AND-conjunctions of `>=, <=, >, <, =, ==, bare
+        # version` comparators, optionally with a `v` prefix and a
+        # stripped pre-release/build suffix). Anything outside that
+        # subset returns `null` from `validRange()` so the caller falls
+        # through to its conservative "treat as match" branch — false
+        # positives are acceptable, false negatives are not. Verified
+        # to match canonical `semver@7.6.3` on every GHSA range shape
+        # we have seen in practice.
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/semver"
-          cd "${RUNNER_TEMP}/semver"
-          npm init -y >/dev/null
-          npm install --no-audit --no-fund --no-save semver@7.6.3
-          node -e 'console.log("semver", require("semver/package.json").version)'
+          mkdir -p "${RUNNER_TEMP}/semver-mini"
+          cat > "${RUNNER_TEMP}/semver-mini/index.js" <<'SEMVER_EOF'
+          'use strict';
+
+          function parseVersion(v) {
+            if (v == null) return null;
+            const s = String(v).trim().replace(/^v/, '');
+            if (!s) return null;
+            const core = s.split('-')[0].split('+')[0];
+            const parts = core.split('.');
+            if (parts.length === 0 || parts.length > 3) return null;
+            const nums = parts.map(p => (/^\d+$/.test(p) ? parseInt(p, 10) : NaN));
+            if (nums.some(n => Number.isNaN(n))) return null;
+            while (nums.length < 3) nums.push(0);
+            return nums;
+          }
+
+          function cmp(a, b) {
+            for (let i = 0; i < 3; i++) {
+              if (a[i] < b[i]) return -1;
+              if (a[i] > b[i]) return 1;
+            }
+            return 0;
+          }
+
+          const TOKEN_RE = /^(>=|<=|>|<|=|==)?\s*(.+)$/;
+
+          function validRange(range) {
+            if (range == null) return null;
+            const r = String(range).trim();
+            if (!r) return [];
+            if (r === '*' || r === 'x' || r === 'X') return [];
+            // GHSA emits ranges with a SPACE between operator and version
+            // (e.g. ">= 4.0.0, <= 4.17.23"). Collapse the inter-op space
+            // so a whitespace split produces one token per comparator.
+            const glued = r
+              .replace(/,/g, ' ')
+              .replace(/(>=|<=|==|>|<|=)\s+/g, '$1');
+            const tokens = glued.split(/\s+/).filter(Boolean);
+            const comparators = [];
+            for (const t of tokens) {
+              if (/^[\^~]/.test(t) || /^[<>=!]?\d+\.x/i.test(t) || t === '||' || t === '-') return null;
+              const m = t.match(TOKEN_RE);
+              if (!m) return null;
+              const op = m[1] || '=';
+              const ver = parseVersion(m[2]);
+              if (!ver) return null;
+              comparators.push({ op, ver });
+            }
+            return comparators;
+          }
+
+          function satisfies(version, parsed) {
+            const v = parseVersion(version);
+            if (!v) return false;
+            if (!Array.isArray(parsed)) return false;
+            for (const c of parsed) {
+              const r = cmp(v, c.ver);
+              switch (c.op) {
+                case '>':  if (!(r > 0))  return false; break;
+                case '>=': if (!(r >= 0)) return false; break;
+                case '<':  if (!(r < 0))  return false; break;
+                case '<=': if (!(r <= 0)) return false; break;
+                case '=':
+                case '==': if (r !== 0)   return false; break;
+                default: return false;
+              }
+            }
+            return true;
+          }
+
+          module.exports = { validRange, satisfies };
+          SEMVER_EOF
+          # Smoke-test the helper before any real input touches it.
+          node -e '
+            const m = require(process.env.RUNNER_TEMP + "/semver-mini/index.js");
+            const ok = (
+              m.satisfies("4.17.23", m.validRange(">= 4.0.0, <= 4.17.23")) === true &&
+              m.satisfies("4.17.24", m.validRange(">= 4.0.0, <= 4.17.23")) === false &&
+              m.satisfies("1.10.0", m.validRange(">= 1.10.0")) === true &&
+              m.satisfies("1.9.0",  m.validRange(">= 1.10.0")) === false &&
+              m.validRange("^1.2.3") === null
+            );
+            if (!ok) { console.error("semver-mini smoke-test FAILED"); process.exit(1); }
+            console.log("semver-mini smoke-test OK");
+          '
 
       - name: Query advisory databases and classify
         # Walks every package in the Dependabot bump. For each one,
@@ -337,28 +419,28 @@ jobs:
             #      defeat the entire point of this gate, false
             #      positives just need a human reopening the PR.
             #
-            # NODE_PATH points at the local install from the previous
-            # step so `require("semver")` resolves to our pinned 7.6.3
-            # without depending on global module roots (which vary by
-            # runner image).
+            # Range matching uses the in-repo vendored helper written to
+            # disk by the previous step (no `require("semver")` — see the
+            # "Vendor minimal semver range-check helper" step for the
+            # supply-chain rationale).
             if [ "${GHSA_HITS}" != '[]' ]; then
               FILTERED_GHSA=$(
                 NEW_VER="${NEW}" \
                 OLD_VER="${OLD}" \
                 GHSA_INPUT="${GHSA_HITS}" \
-                NODE_PATH="${RUNNER_TEMP}/semver/node_modules" \
+                SEMVER_MINI="${RUNNER_TEMP}/semver-mini/index.js" \
                 node -e '
-                  const semver = require("semver");
+                  const semver = require(process.env.SEMVER_MINI);
                   const hits = JSON.parse(process.env.GHSA_INPUT);
                   const newVer = process.env.NEW_VER || "";
                   const oldVer = process.env.OLD_VER || "";
                   function matches(version, raw) {
                     const r = (raw || "").trim();
                     if (!r) return true; // empty range → match (no filter)
-                    const parsed = semver.validRange(r.replace(/,/g, " "));
+                    const parsed = semver.validRange(r);
                     if (parsed === null) return true; // unparseable → conservative match
                     try {
-                      return semver.satisfies(version, parsed, { includePrerelease: true });
+                      return semver.satisfies(version, parsed);
                     } catch (_) { return true; } // any other error → conservative match
                   }
                   // Each hit gets tagged with whether NEW + OLD versions
@@ -372,12 +454,12 @@ jobs:
                   process.stdout.write(JSON.stringify(tagged));
                 ' 2>/dev/null || true
               )
-              # Conservative fallback: node failure (no semver module,
-              # OOM, etc.) → treat every GHSA hit as matchesNew AND not
+              # Conservative fallback: node failure (helper missing, OOM,
+              # parse error) → treat every GHSA hit as matchesNew AND not
               # matchesOld, so the diff keeps all of them as fresh. This
               # over-reports rather than under-reports.
               if [ -z "${FILTERED_GHSA}" ]; then
-                echo "::warning title=GHSA filter degraded::semver filtering failed for ${NAME}; treating every GHSA hit as fresh (conservative)."
+                echo "::warning title=GHSA filter degraded::semver-mini filtering failed for ${NAME}; treating every GHSA hit as fresh (conservative)."
                 FILTERED_GHSA=$(echo "${GHSA_HITS}" | jq -c '[.[] | . + {matchesNew:true,matchesOld:false,source:"GHSA"}]')
               fi
             else

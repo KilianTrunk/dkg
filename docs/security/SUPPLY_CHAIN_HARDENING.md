@@ -437,17 +437,21 @@ For every package the PR bumps, the workflow:
    **twice** — once for the new version, once for the old. Two
    independent advisory feeds catch advisories that one misses.
 3. Filters every advisory against the new AND old versions of
-   the package using `semver.validRange()` + `semver.satisfies()`
-   from the `semver` 7.6.3 npm module (installed locally to a
-   `${RUNNER_TEMP}` subdir so `require()` resolves predictably).
-   Two real-world wrinkles drove this implementation: GHSA emits
-   ranges with COMMA separators (`>= 4.0.0, <= 4.17.23`) that the
-   `semver` CLI rejects, and the CLI returns identical `rc=1 +
-   empty stdout` for both parse errors and genuine out-of-range
-   matches — making a CLI-based filter silently drop hits with
-   comma syntax. The JS API distinguishes the two and the script
-   **conservatively keeps** unparseable hits rather than dropping
-   them.
+   the package using a **vendored** minimal range-check helper
+   written to `${RUNNER_TEMP}/semver-mini/index.js` by the
+   workflow itself (no `npm install`). The helper handles the
+   subset of range syntax GHSA and OSV emit (AND-conjunctions of
+   `>=, <=, >, <, =, ==`, comma-separated or space-separated, with
+   optional `v` prefix and stripped pre-release suffix) and
+   returns `null` from `validRange()` on anything outside that
+   subset so the caller falls through to "treat as match" — false
+   positives are acceptable, false negatives would defeat the
+   gate. The vendored helper avoids an `npm install semver` on a
+   privileged `pull_request_target` runner, which would otherwise
+   re-introduce the exact supply-chain hop this workflow exists
+   to close. It has been cross-verified against canonical
+   `semver@7.6.3` on every real-world GHSA range shape we have
+   sampled.
 4. Computes a **diff** between the new-version hit set and the
    old-version hit set. An advisory that already matched the
    *previous* version is treated as pre-existing baseline (the

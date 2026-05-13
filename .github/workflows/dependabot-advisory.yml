@@ -290,12 +290,19 @@ jobs:
           fi
 
           # Only the npm ecosystem advisory pipeline is in scope here.
-          # GHSA covers npm + GitHub Actions but the GHSA ecosystem
-          # value for Actions is `GITHUB_ACTIONS`, OSV uses `GitHub
-          # Actions`, and the value Dependabot emits is `github_actions`.
-          # We handle the two we actually receive: `npm` and (optionally)
-          # `github_actions`. Anything else passes through with no
-          # advisory check and a note in the summary.
+          # GHSA covers npm + GitHub Actions but each side spells the
+          # ecosystem identifier differently:
+          #   * GHSA's `SecurityAdvisoryEcosystem` GraphQL enum uses
+          #     `ACTIONS` (not `GITHUB_ACTIONS` — verified against the
+          #     live schema; the enum has no `GITHUB_*` prefix on any
+          #     ecosystem value).
+          #   * OSV's REST API uses `GitHub Actions` (with a space).
+          #   * The value Dependabot emits in commit metadata is
+          #     `github_actions`.
+          # We handle the two ecosystems we actually receive — `npm`
+          # and (optionally) `github_actions` — and pass through
+          # everything else with no advisory check and a note in the
+          # summary.
           jq_filter='[ .[] | { name: .dependencyName, oldVersion: (.prevVersion // .previousVersion // ""), newVersion: (.newVersion // ""), ecosystem: (.packageEcosystem // .ecosystem // "") } ]'
           DEPS=$(echo "${DEPS_JSON}" | jq -c "${jq_filter}")
           COUNT=$(echo "${DEPS}" | jq 'length')
@@ -821,10 +828,20 @@ jobs:
         # Last action of the compromise response. By this point the
         # PR has a visible red comment, three labels, and a
         # request-changes review. Closing it now ensures the merge
-        # button is disabled. `continue-on-error: true` so a transient
-        # close failure does not skip the `Final gate` step below;
-        # the request-changes review already blocks merge by itself
-        # and the dynamic "DO NOT MERGE" check name still fires.
+        # button is disabled.
+        #
+        # We retry up to three times with exponential backoff (5s,
+        # 15s) to absorb transient `gh pr close` failures — GitHub
+        # API blips, 5xx responses during rolling deploys, etc.
+        # `continue-on-error: true` is kept so a hard close failure
+        # after retries does not skip the dependent `do-not-merge`
+        # job that runs `if: always() && compromised == 'true'` and
+        # emits the `🚨 DO NOT MERGE COMPROMISED` failing check; that
+        # check, plus the request-changes review and the three red
+        # labels, remains visible even on a close-step failure. This
+        # workflow runs without branch protection (the user picked
+        # the no-admin-rights option), so structural merge blocking
+        # comes from the failing-check job, not from the close.
         if: steps.classify.outputs.compromised == 'true'
         continue-on-error: true
         env:
@@ -832,8 +849,21 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          gh pr close "${PR_NUMBER}" --repo "${REPO}" --comment 'Automatically closed by the Dependabot advisory gate. See the pinned comment for details. Do not reopen without a security review.'
+          set -uo pipefail
+          closed=false
+          for attempt in 1 2 3; do
+            if gh pr close "${PR_NUMBER}" --repo "${REPO}" --comment 'Automatically closed by the Dependabot advisory gate. See the pinned comment for details. Do not reopen without a security review.'; then
+              closed=true
+              break
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $(( attempt * 10 - 5 ))
+            fi
+          done
+          if [ "${closed}" != 'true' ]; then
+            echo "::warning title=Auto-close failed::gh pr close failed after 3 attempts for PR ${PR_NUMBER}. The request-changes review and the DO NOT MERGE failing-check job still block the PR; manual close recommended."
+            exit 1
+          fi
 
       - name: Post inconclusive notice
         # Fires only when no compromise was confirmed but at least one

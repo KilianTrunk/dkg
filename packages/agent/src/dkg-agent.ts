@@ -1330,7 +1330,9 @@ export class DKGAgent {
           return agent?.relayAddress ?? null;
         },
       },
-      bootstrapSeeds: this.config.bootstrapPeers ?? [],
+      // Bootstrap is a libp2p-startup concern (`bootstrap({ list })` in
+      // peerDiscovery, see node.ts) — not a per-peer resolution concern.
+      // Removed here per Codex review feedback on PR #496.
     });
     this.peerResolver = peerResolver;
     this.messenger = new Messenger({

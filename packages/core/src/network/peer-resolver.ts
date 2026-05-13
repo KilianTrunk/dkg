@@ -13,14 +13,24 @@
  *      Stub in v1; populated when RFC 04 Phase 2 lands.
  *   4. Agent directory (agents-CG SPARQL) — preserves the chat-only
  *      `Messenger.ensureCircuitRelayAddress` behaviour we're replacing.
- *   5. Bootstrap seeds — last resort, only used when steps 1-4
- *      produced nothing (cold-start situation).
  *
  * Each step that finds addresses calls `network.addKnownAddresses` so
  * a subsequent `dialProtocol(peerId)` hits the transport's address
  * book without re-resolving. Returned list is deduplicated, ordered
  * freshest-first; callers should try in order and stop on first
- * successful dial.
+ * successful dial. Never throws — every step's failure is caught and
+ * the resolver falls through to the next.
+ *
+ * Note (Codex review feedback on PR #496): the previous draft included
+ * a step 5 that emitted configured `bootstrapPeers` as candidate
+ * addresses for the target peer. That was semantically wrong: a
+ * bootstrap seed multiaddr names some seed peer (typically a
+ * relay/curator), NOT the requested target. Returning it as a
+ * candidate would either fail loudly (libp2p rejects the
+ * `/p2p/<seed>`-vs-target peerId mismatch) or quietly mislead the
+ * caller. Bootstrap is a libp2p-startup concern (`bootstrap({ list })`
+ * peerDiscovery in `node.ts`), not a per-peer resolution concern;
+ * step 5 has been removed.
  *
  * v1 implements `recordDialSuccess` / `recordDialFailure` /
  * `isHealthy` as stubs; address-health scoring is deferred to a
@@ -50,7 +60,6 @@ export interface PeerResolverDeps {
   network: Network;
   registry: NetworkStateRegistry;
   agentDirectory: AgentDirectoryLookup;
-  bootstrapSeeds?: Address[];
   /** Optional logger; defaults to silent except for serious errors. */
   logger?: PeerResolverLogger;
 }
@@ -85,14 +94,12 @@ export class PeerResolver {
   private readonly network: Network;
   private readonly registry: NetworkStateRegistry;
   private readonly agentDirectory: AgentDirectoryLookup;
-  private readonly bootstrapSeeds: Address[];
   private readonly logger: PeerResolverLogger;
 
   constructor(deps: PeerResolverDeps) {
     this.network = deps.network;
     this.registry = deps.registry;
     this.agentDirectory = deps.agentDirectory;
-    this.bootstrapSeeds = deps.bootstrapSeeds ?? [];
     this.logger = deps.logger ?? SILENT_LOGGER;
   }
 
@@ -142,11 +149,19 @@ export class PeerResolver {
       }
     }
 
-    // Step 3: NetworkStateRegistry (RFC 04). Stub in v1.
-    const registryAddrs = this.registry.lookup(peerId);
-    if (registryAddrs.length > 0) {
-      append(registryAddrs);
-      await this.network.addKnownAddresses(peerId, registryAddrs);
+    // Step 3: NetworkStateRegistry (RFC 04). Stub in v1; the real
+    // implementation can hit a database / mutex / SWM channel, so the
+    // try/catch is the contract that protects callers from a transient
+    // registry hiccup aborting the whole resolve() (and silently
+    // skipping steps 4+).
+    try {
+      const registryAddrs = this.registry.lookup(peerId);
+      if (registryAddrs.length > 0) {
+        append(registryAddrs);
+        await this.network.addKnownAddresses(peerId, registryAddrs);
+      }
+    } catch (err) {
+      this.logger.debug?.(`registry lookup for ${peerId} failed: ${errMsg(err)}`);
     }
 
     // Step 4: agent-directory SPARQL fallback. Replaces the chat-only
@@ -160,13 +175,6 @@ export class PeerResolver {
       }
     } catch (err) {
       this.logger.debug?.(`agents-CG lookup for ${peerId} failed: ${errMsg(err)}`);
-    }
-
-    // Step 5: bootstrap seeds. Only when 1-4 produced nothing — by
-    // then it's cold-start and the seeds may be the only way to
-    // bootstrap a DHT walk on the next attempt.
-    if (accumulated.length === 0 && this.bootstrapSeeds.length > 0) {
-      append(this.bootstrapSeeds);
     }
 
     return accumulated;

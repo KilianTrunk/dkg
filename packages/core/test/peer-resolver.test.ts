@@ -13,8 +13,6 @@ const PEER_A = '12D3KooWA' + 'a'.repeat(43);
 const PEER_B = '12D3KooWB' + 'b'.repeat(43);
 const RELAY_ADDR =
   '/ip4/178.104.54.178/tcp/9090/p2p/12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M';
-const BOOTSTRAP =
-  '/dns4/seed.example.com/tcp/9090/p2p/12D3KooWSeedSeedSeedSeedSeedSeedSeedSeedSeedSeed';
 
 interface MockNetwork extends Network {
   __conns: Map<NodeIdentity, Array<{ remoteAddr: { toString(): string } }>>;
@@ -176,21 +174,20 @@ describe('PeerResolver', () => {
     });
   });
 
-  it('step 4: agents-CG returning null is fine, falls through to bootstrap', async () => {
+  it('step 4: agents-CG returning null is fine, returns empty', async () => {
     net.__findPeerImpl = async () => [];
     const resolver = new PeerResolver({
       network: net,
       registry,
       agentDirectory: makeAgentDir(async () => null),
-      bootstrapSeeds: [BOOTSTRAP],
     });
     const out = await resolver.resolve(PEER_B);
 
-    expect(out).toEqual([BOOTSTRAP]);
+    expect(out).toEqual([]);
   });
 
   it('step 4: agents-CG throwing does not abort resolution', async () => {
-    net.__findPeerImpl = async () => [];
+    net.__findPeerImpl = async () => ['/ip4/1.2.3.4/tcp/9090'];
     const resolver = new PeerResolver({
       network: net,
       registry,
@@ -199,28 +196,31 @@ describe('PeerResolver', () => {
           throw new Error('sparql boom');
         },
       },
-      bootstrapSeeds: [BOOTSTRAP],
-    });
-    const out = await resolver.resolve(PEER_B);
-
-    expect(out).toEqual([BOOTSTRAP]);
-  });
-
-  it('step 5: bootstrap seeds only used when previous steps produced nothing', async () => {
-    net.__findPeerImpl = async () => ['/ip4/1.2.3.4/tcp/9090'];
-    const resolver = new PeerResolver({
-      network: net,
-      registry,
-      agentDirectory: makeAgentDir(),
-      bootstrapSeeds: [BOOTSTRAP],
     });
     const out = await resolver.resolve(PEER_B);
 
     expect(out).toEqual(['/ip4/1.2.3.4/tcp/9090']);
-    expect(out).not.toContain(BOOTSTRAP);
   });
 
-  it('returns empty array when nothing resolves and no seeds configured', async () => {
+  it('step 3 (Codex PR #496 feedback): registry throwing does not abort resolution', async () => {
+    net.__findPeerImpl = async () => [];
+    const throwingRegistry: NetworkStateRegistry = {
+      lookup: () => {
+        throw new Error('registry boom');
+      },
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry: throwingRegistry,
+      agentDirectory: makeAgentDir(async () => RELAY_ADDR),
+    });
+    const out = await resolver.resolve(PEER_B);
+
+    // Falls through to step 4 cleanly.
+    expect(out).toEqual([`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`]);
+  });
+
+  it('returns empty array when nothing resolves', async () => {
     net.__findPeerImpl = async () => [];
     const resolver = new PeerResolver({
       network: net,

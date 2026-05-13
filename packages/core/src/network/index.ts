@@ -24,4 +24,5 @@ export {
   dkgGossipMsgId,
   dkgGossipMsgIdRaw,
   DkgGossipUnsignedMessageError,
+  DkgGossipMissingPublisherError,
 } from './gossip-msg-id.js';

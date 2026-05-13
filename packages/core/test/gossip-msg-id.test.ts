@@ -283,8 +283,21 @@ describe('dkgGossipMsgIdRaw (RFC 07 §5.4 — backend-agnostic primitive)', () =
   it('returns a 32-byte SHA256 digest', () => {
     const id = dkgGossipMsgIdRaw({
       topic: 't', data: new Uint8Array(),
-      publisherIdBytes: new Uint8Array(), sequenceNumber: 0n,
+      publisherIdBytes: new Uint8Array([1]), sequenceNumber: 0n,
     });
     expect(id.length).toBe(32);
+  });
+
+  // Codex review feedback PR #501 round 6 (branarakic, gossip-msg-id.ts:142):
+  // the libp2p adapter rejects unsigned messages because they have no
+  // publisher identity, but the raw primitive used to silently accept
+  // an empty publisherIdBytes — reopening the false-dedup hazard the
+  // adapter fixed. Reject empty publishers at the raw API boundary too.
+  it('Codex PR #501 round 6: throws when publisherIdBytes is empty', () => {
+    expect(() => dkgGossipMsgIdRaw({
+      topic: 't', data: new Uint8Array([1, 2, 3]),
+      publisherIdBytes: new Uint8Array(),
+      sequenceNumber: 0n,
+    })).toThrow(/publisherIdBytes must be non-empty/);
   });
 });

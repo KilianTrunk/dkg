@@ -116,7 +116,8 @@ export class DkgGossipUnsignedMessageError extends Error {
  * - `data` — raw payload bytes.
  * - `publisherIdBytes` — canonical bytes identifying the publisher.
  *   For libp2p, this is `peerId.toMultihash().bytes`. For other
- *   backends, the equivalent canonical identity bytes.
+ *   backends, the equivalent canonical identity bytes. MUST be
+ *   non-empty — see `DkgGossipMissingPublisherError` below.
  * - `sequenceNumber` — per-publisher monotonic sequence (gossipsub
  *   seqno, iroh sequence, etc.).
  *
@@ -130,9 +131,38 @@ export interface DkgGossipMsgIdInput {
 }
 
 /**
+ * Thrown when `publisherIdBytes` is empty. The DKG msgId scheme is
+ * built on the invariant that two payload-identical publishes from
+ * different publishers must hash to different ids; an empty publisher
+ * identity collapses that distinction.
+ *
+ * @experimental
+ */
+export class DkgGossipMissingPublisherError extends Error {
+  constructor() {
+    super(
+      'dkgGossipMsgIdRaw: publisherIdBytes must be non-empty. The DKG ' +
+        'msgId scheme requires publisher identity to avoid false dedup of ' +
+        'payload-identical publishes from different publishers. Future ' +
+        'backends MUST plumb their canonical publisher-identity bytes ' +
+        'into this primitive.',
+    );
+    this.name = 'DkgGossipMissingPublisherError';
+  }
+}
+
+/**
  * Backend-agnostic msgId primitive. Every gossip backend adapter
  * normalises into `DkgGossipMsgIdInput` and the framing + hash
  * lives here once.
+ *
+ * Throws `DkgGossipMissingPublisherError` if `publisherIdBytes` is
+ * empty. Codex review feedback PR #501 round 6: the libp2p adapter
+ * already rejects unsigned messages (where publisher identity is
+ * absent), but the raw primitive used to accept the equivalent
+ * `publisherIdBytes.length === 0` case, reopening the false-dedup
+ * hazard at the cross-backend boundary the primitive was meant to
+ * lock down.
  *
  * @experimental
  */
@@ -141,6 +171,10 @@ export function dkgGossipMsgIdRaw(input: DkgGossipMsgIdInput): Uint8Array {
   const data = input.data;
   const fromBytes = input.publisherIdBytes;
   const seqno = input.sequenceNumber;
+
+  if (fromBytes.length === 0) {
+    throw new DkgGossipMissingPublisherError();
+  }
 
   const total =
     4 + topicBytes.length +

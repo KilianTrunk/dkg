@@ -25,6 +25,7 @@ export {
   dkgGossipMsgIdRaw,
   type DkgGossipMsgIdInput,
   DkgGossipUnsignedMessageError,
+  DkgGossipMissingPublisherError,
 } from './network/index.js';
 export {
   ProtocolRouter,

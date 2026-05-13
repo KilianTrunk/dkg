@@ -129,7 +129,12 @@ const PINNED_DIGESTS: Record<string, string> = {
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
   Identity:                     '29d09dd97de53de69d5bf2282d2f3008044ab43fb86c812fc4912552c9288946',
   IdentityStorage:              'd7c58ba8ae28523dc1a6ff0bc228a3bceb9d327e53d258099dada656db262479',
-  ParametersStorage:            'adc65fdcb6f3b3c4455a02b01c14c3ccba928756d8f107136fbfad31271cb20e',
+  // Updated PR #470 round 2: `MAX_PUBLISHING_CONVICTION_EPOCHS = 60`
+  // exposed as a public constant + tightened bound in
+  // `setPublishingConvictionEpochs`. Caps the worst-case
+  // `_settleElapsed` / `_finalSweep` loop count so governance can no
+  // longer brick PCAs by raising `publishingConvictionEpochs`.
+  ParametersStorage:            '70d4024b4faf2004f59561b8b785a509c3abadaa89b249adfe6177783f996a97',
 };
 
 describe('ABI pin digest — detects silent contract surface drift [CH-5]', () => {

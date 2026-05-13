@@ -35,8 +35,9 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn } from 'node:child_process';
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { ethers } from 'ethers';
 
 const REPO_ROOT = resolve(__dirname, '../..');
@@ -124,7 +125,12 @@ async function loadContracts(): Promise<Contracts> {
       'function settle(uint256) external',
       'function topUp(uint256, uint96) external',
       'event AccountCreated(uint256 indexed accountId, address indexed owner, uint96 committedTRAC, uint16 discountBps, uint40 createdAtEpoch, uint40 expiresAtEpoch)',
-      'event CostCovered(uint256 indexed accountId, address indexed publishingAgent, uint96 baseCost, uint96 discountedCost, uint96 drawnFromEpoch, uint96 drawnFromTopUp, uint40 currentEpoch, uint40 kcStartEpoch, uint40 kcEpochs)',
+      // MUST mirror `DKGPublishingConvictionNFT.sol` (line ~135). A drift
+      // here silently turns every `parseLog({ name: 'CostCovered' })` into
+      // a parse miss in the test — the lazy-settle assertions then pass
+      // even when the contract's distribution math is wrong. Keep the
+      // signature literal in lock-step with the contract event.
+      'event CostCovered(uint256 indexed accountId, uint40 indexed epoch, uint96 baseCost, uint96 discountedCost, uint96 drawnFromEpoch, uint96 drawnFromTopUp)',
       'event WindowSettled(uint256 indexed accountId, uint40 indexed billingWindow, uint40 startEp, uint40 endEp, uint96 remainder)',
       'event AccountFinalSwept(uint256 indexed accountId, uint96 leftoverTopUp, uint96 committedDust)',
     ],
@@ -195,10 +201,15 @@ async function ensureAdminWallet(s: Contracts, tracAmount: bigint): Promise<ethe
   return admin;
 }
 
+// Per-process tmp directory for generated `*.nq` payloads. Previously
+// the test wrote them into the tracked `devnet/conviction-lazy-settle/turns/`
+// directory, which dirtied the worktree on every run (Codex round-2
+// finding on PR #470). We create one tmpdir per process via mkdtempSync
+// and let the OS sweep it.
+const NQUADS_TMP_DIR = mkdtempSync(join(tmpdir(), 'dkg-lazy-settle-'));
+
 function nquadsFile(name: string): string {
-  const dir = join(__dirname, 'turns');
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const p = join(dir, `${name}.nq`);
+  const p = join(NQUADS_TMP_DIR, `${name}.nq`);
   const ts = Date.now();
   writeFileSync(
     p,
@@ -254,11 +265,26 @@ async function rawTxNonce(provider: ethers.JsonRpcProvider, addr: string): Promi
 
 // ------------------------------------------------------------------------
 
-const state: { s: Contracts | null; edge: DevnetNode | null; admin: ethers.Wallet | null; accountId: bigint } = {
+const state: {
+  s: Contracts | null;
+  edge: DevnetNode | null;
+  admin: ethers.Wallet | null;
+  accountId: bigint;
+  /**
+   * Original `publishingConvictionEpochs` captured at suite start.
+   * Step 1 shrinks the parameter to `3` for test runtime; we MUST
+   * restore it so any subsequent devnet suite (e.g. v10-end-to-end,
+   * agent-provenance) that creates a PCA gets the production default
+   * locked in instead of inheriting our shrunken horizon. `0n` flags
+   * "never captured" — afterAll then skips the restore.
+   */
+  originalPublishingConvictionEpochs: bigint;
+} = {
   s: null,
   edge: null,
   admin: null,
   accountId: 0n,
+  originalPublishingConvictionEpochs: 0n,
 };
 
 describe('V10 PCA lazy settlement — devnet validation', () => {
@@ -281,22 +307,47 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
   // don't see this because chain time can't be rewound and operators
   // wouldn't register a long-lived daemon wallet on a PCA they let expire.
   afterAll(async () => {
-    if (!state.s || !state.edge) return;
-    if (state.accountId === 0n) return;
+    if (!state.s) return;
     const s = state.s;
-    const edge = state.edge;
-    const admin = state.admin ?? s.hubOwner;
-    const nftRw = s.nft.connect(admin) as ethers.Contract;
-    for (const w of edge.opWallets) {
+
+    // 1) Deregister agents so subsequent suites don't accidentally route
+    //    through the expired PCA.
+    if (state.edge && state.accountId > 0n) {
+      const admin = state.admin ?? s.hubOwner;
+      const nftRw = s.nft.connect(admin) as ethers.Contract;
+      for (const w of state.edge.opWallets) {
+        try {
+          const bound: bigint = await s.nft.agentToAccountId(w.address);
+          if (bound === state.accountId) {
+            await (await nftRw.deregisterAgent(state.accountId, w.address, {
+              nonce: await rawTxNonce(s.provider, admin.address),
+            })).wait();
+          }
+        } catch {
+          // best-effort cleanup; the next suite will re-check.
+        }
+      }
+    }
+
+    // 2) Restore `publishingConvictionEpochs` to whatever it was before
+    //    step 1 shrank it (typically the production default of 12).
+    //    Otherwise the next devnet suite that creates a PCA inherits
+    //    our 3-window lifetime and its assertions become flaky
+    //    (Codex round-2 finding on PR #470).
+    if (state.originalPublishingConvictionEpochs > 0n) {
       try {
-        const bound: bigint = await s.nft.agentToAccountId(w.address);
-        if (bound === state.accountId) {
-          await (await nftRw.deregisterAgent(state.accountId, w.address, {
-            nonce: await rawTxNonce(s.provider, admin.address),
-          })).wait();
+        const current: bigint = await s.parameters.publishingConvictionEpochs();
+        if (current !== state.originalPublishingConvictionEpochs) {
+          await (await s.paramsRw.setPublishingConvictionEpochs(
+            state.originalPublishingConvictionEpochs,
+            { nonce: await rawTxNonce(s.provider, s.hubOwner.address) },
+          )).wait();
         }
       } catch {
-        // best-effort cleanup; the next suite will re-check.
+        // Tolerated: if governance ownership changed mid-test or the
+        // parameter is already where we want it, the next suite's
+        // assertion that requires the production default will surface
+        // the issue with a clearer message than we can produce here.
       }
     }
   }, 120_000);
@@ -304,6 +355,9 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
   it('step 1: shrink publishingConvictionEpochs so a full lifecycle fits in test time', async () => {
     const s = state.s!;
     const current: bigint = await s.parameters.publishingConvictionEpochs();
+    // Capture the original BEFORE we shrink — afterAll restores it so
+    // subsequent suites get the production default back.
+    state.originalPublishingConvictionEpochs = current;
     // We pick 3 windows for the lifetime so:
     //   - the active-sink test sits in window 0,
     //   - the passive-sink test closes window 0 (advances 1 epoch),

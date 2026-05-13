@@ -19,7 +19,6 @@ import { validatePublishRequest } from './validation.js';
 import {
   generateTentativeMetadata,
   generateConfirmedFullMetadata,
-  generateShareMetadata,
   generateOwnershipQuads,
   generateAuthorshipProof,
   generateShareTransitionMetadata,
@@ -33,6 +32,7 @@ import {
   type KAMetadata,
 } from './metadata.js';
 import { storeWorkspaceOperationPublicQuads } from './workspace-resolution.js';
+import type { WorkspacePublicSnapshotStore } from './workspace-snapshot-store.js';
 import { ethers } from 'ethers';
 import type { WorkspaceAgentRecipientResolver } from './workspace-agent-recipients.js';
 
@@ -64,6 +64,8 @@ export interface DKGPublisherConfig {
   workspaceAgentRecipientResolver?: WorkspaceAgentRecipientResolver;
   /** Encrypts private/agent-gated SWM gossip with the node's Sender Key epoch state. */
   workspaceSenderKeyEncryptor?: WorkspaceSenderKeyEncryptor;
+  /** Optional out-of-Oxigraph store for immutable public SWM operation snapshots. */
+  publicSnapshotStore?: WorkspacePublicSnapshotStore;
 }
 
 export interface WorkspaceSenderKeyEncryptInput {
@@ -343,6 +345,7 @@ export class DKGPublisher implements Publisher {
   private readonly sessionId = Date.now().toString(36);
   private tentativeCounter = 0;
   readonly writeLocks: Map<string, Promise<void>>;
+  private readonly publicSnapshotStore?: WorkspacePublicSnapshotStore;
 
   constructor(config: DKGPublisherConfig) {
     this.store = config.store;
@@ -395,6 +398,7 @@ export class DKGPublisher implements Publisher {
     this.writeLocks = config.writeLocks ?? new Map();
     this.workspaceAgentRecipientResolver = config.workspaceAgentRecipientResolver;
     this.workspaceSenderKeyEncryptor = config.workspaceSenderKeyEncryptor;
+    this.publicSnapshotStore = config.publicSnapshotStore;
   }
 
   setWorkspaceAgentRecipientResolver(resolver: WorkspaceAgentRecipientResolver | undefined): void {
@@ -891,17 +895,7 @@ export class DKGPublisher implements Publisher {
     await this.store.insert(normalized);
 
     const rootEntities = manifestEntries.map((m) => m.rootEntity);
-    const metaQuads = generateShareMetadata(
-      {
-        shareOperationId,
-        contextGraphId,
-        rootEntities,
-        publisherPeerId: options.publisherPeerId,
-        timestamp: new Date(),
-      },
-      swmMetaGraph,
-    );
-    await this.store.insert(metaQuads);
+    const operationTimestamp = new Date();
     await storeWorkspaceOperationPublicQuads({
       store: this.store,
       graphManager: this.graphManager,
@@ -911,6 +905,8 @@ export class DKGPublisher implements Publisher {
       quads: normalized,
       publisherPeerId: options.publisherPeerId,
       subGraphName: options.subGraphName,
+      timestamp: operationTimestamp,
+      publicSnapshotStore: this.publicSnapshotStore,
     });
 
     if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {
@@ -3233,11 +3229,7 @@ export class DKGPublisher implements Publisher {
     // _shareImpl and the remote SharedMemoryHandler both produce, so the
     // promoting node and replicas converge on identical ownership state.
     if (opts?.publisherPeerId) {
-      const metaQuads = generateShareMetadata(
-        { shareOperationId: operationId, contextGraphId, rootEntities: effectiveRoots, publisherPeerId: opts.publisherPeerId, timestamp: new Date() },
-        swmMetaGraph,
-      );
-      await this.store.insert(metaQuads);
+      const operationTimestamp = new Date();
       await storeWorkspaceOperationPublicQuads({
         store: this.store,
         graphManager: this.graphManager,
@@ -3247,6 +3239,8 @@ export class DKGPublisher implements Publisher {
         quads: swmQuads,
         publisherPeerId: opts.publisherPeerId,
         subGraphName: opts.subGraphName,
+        timestamp: operationTimestamp,
+        publicSnapshotStore: this.publicSnapshotStore,
       });
 
       if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {

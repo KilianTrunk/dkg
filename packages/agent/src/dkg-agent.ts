@@ -53,7 +53,7 @@ import {
   type SwmSenderKeyPackageMsg,
   type WorkspaceRecipientEncryptionKey,
 } from '@origintrail-official/dkg-core';
-import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad } from '@origintrail-official/dkg-storage';
+import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
@@ -67,13 +67,17 @@ import {
   validateLiftPublishPayload,
   subtractFinalizedExactQuads,
   TripleStoreAsyncLiftPublisher,
+  FileWorkspacePublicSnapshotStore,
+  parseWorkspacePublicSnapshotNQuads,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
   type WorkspaceAgentRecipient,
   type WorkspaceSenderKeyEncryptInput,
+  type SharedMemoryPublicSnapshotStorageConfig, type WorkspacePublicSnapshotStore,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
+import { join } from 'node:path';
 import {
   DKGQueryEngine, QueryHandler,
   emptyQueryResultForKind,
@@ -146,7 +150,7 @@ import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch
 import { getSyncCheckpointKey } from './sync/checkpoint/state.js';
 import { runDurableSync } from './sync/requester/durable-sync.js';
 import { runSharedMemorySync } from './sync/requester/shared-memory-sync.js';
-import { buildSyncRequestEnvelope } from './sync/auth/request-build.js';
+import { buildSyncRequestEnvelope, type SyncPhase } from './sync/auth/request-build.js';
 import { authorizePrivateSyncRequest } from './sync/auth/request-authorize.js';
 import { registerSyncHandler } from './sync/responder/sync-handler.js';
 import { runSyncOnConnect } from './sync/on-connect/sync-on-connect.js';
@@ -523,7 +527,8 @@ interface SyncRequestEnvelope {
   offset: number;
   limit: number;
   includeSharedMemory: boolean;
-  phase?: 'data' | 'meta';
+  phase?: SyncPhase;
+  snapshotRef?: string;
   targetPeerId?: string;
   requesterPeerId?: string;
   requestId?: string;
@@ -532,6 +537,11 @@ interface SyncRequestEnvelope {
   requesterAgentAddress?: string;
   requesterSignatureR?: string;
   requesterSignatureVS?: string;
+}
+
+function normalizeSyncPhase(value: unknown): SyncPhase {
+  if (value === 'meta' || value === 'snapshot') return value;
+  return 'data';
 }
 
 /** Health status of a peer from the last ping round. */
@@ -667,6 +677,12 @@ export interface DKGAgentConfig {
   store?: TripleStore;
   /** Triple store backend configuration (e.g. oxigraph-worker, blazegraph). If omitted, defaults to oxigraph-worker when dataDir is set. */
   storeConfig?: TripleStoreConfig;
+  /** Out-of-line storage for large public SWM RDF literal object terms. Defaults on for local Oxigraph-backed dataDir stores. */
+  largeLiteralStorage?: LargeLiteralStorageConfig;
+  /** Out-of-Oxigraph immutable public SWM operation snapshots. Defaults on when dataDir is set. */
+  sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
+  /** When false, peer-connect sync skips SWM catch-up and relies on gossip for new SWM writes. */
+  syncSharedMemoryOnConnect?: boolean;
   /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
   nodeRole?: 'core' | 'edge';
   /**
@@ -876,6 +892,46 @@ async function inferAdapterPublisherAddress(
   }
 }
 
+function defaultLargeLiteralStorage(
+  dataDir: string,
+  config: LargeLiteralStorageConfig | undefined,
+): LargeLiteralStorageConfig {
+  return {
+    enabled: config?.enabled ?? true,
+    thresholdBytes: config?.thresholdBytes,
+    directory: config?.directory ?? join(dataDir, 'literal-blobs'),
+  };
+}
+
+function createPublicSnapshotStore(
+  dataDir: string | undefined,
+  config: SharedMemoryPublicSnapshotStorageConfig | undefined,
+): WorkspacePublicSnapshotStore | undefined {
+  if (!dataDir || config?.enabled === false) return undefined;
+  return new FileWorkspacePublicSnapshotStore(config?.directory ?? join(dataDir, 'swm-public-snapshots'));
+}
+
+function applyDefaultLargeLiteralStorage(
+  storeConfig: TripleStoreConfig,
+  dataDir: string | undefined,
+  config: LargeLiteralStorageConfig | undefined,
+): TripleStoreConfig {
+  if (storeConfig.largeLiteralStorage || !dataDir || !isLocalOxigraphConfig(storeConfig)) {
+    return storeConfig;
+  }
+
+  return {
+    ...storeConfig,
+    largeLiteralStorage: defaultLargeLiteralStorage(dataDir, config),
+  };
+}
+
+function isLocalOxigraphConfig(storeConfig: TripleStoreConfig): boolean {
+  return storeConfig.backend === 'oxigraph'
+    || storeConfig.backend === 'oxigraph-worker'
+    || storeConfig.backend === 'oxigraph-persistent';
+}
+
 /**
  * High-level facade that ties together all DKG agent capabilities:
  * identity, networking, publishing, querying, discovery, and messaging.
@@ -904,6 +960,7 @@ export class DKGAgent {
   private readonly workspaceOwnedEntities: Map<string, Map<string, string>>;
   /** Shared write locks so gossip writes serialize against local CAS writes. */
   private readonly writeLocks: Map<string, Promise<void>>;
+  private readonly publicSnapshotStore?: WorkspacePublicSnapshotStore;
   private sharedMemoryHandler?: InstanceType<typeof SharedMemoryHandler>;
   private gossipPublishHandler?: GossipPublishHandler;
   private finalizationHandler?: FinalizationHandler;
@@ -1073,6 +1130,7 @@ export class DKGAgent {
     chain: ChainAdapter,
     workspaceOwnedEntities: Map<string, Map<string, string>>,
     writeLocks: Map<string, Promise<void>>,
+    publicSnapshotStore?: WorkspacePublicSnapshotStore,
   ) {
     this.config = config;
     this.wallet = wallet;
@@ -1082,6 +1140,7 @@ export class DKGAgent {
     this.queryEngine = queryEngine;
     this.workspaceOwnedEntities = workspaceOwnedEntities;
     this.writeLocks = writeLocks;
+    this.publicSnapshotStore = publicSnapshotStore;
     this.eventBus = eventBus;
     this.chain = chain;
     this.discovery = new DiscoveryClient(queryEngine);
@@ -1108,12 +1167,16 @@ export class DKGAgent {
     if (config.store) {
       store = config.store;
     } else if (config.storeConfig) {
-      store = await createTripleStore(config.storeConfig);
+      store = await createTripleStore(applyDefaultLargeLiteralStorage(config.storeConfig, config.dataDir, config.largeLiteralStorage));
       log.info(ctx, `Triple store backend: ${config.storeConfig.backend}`);
     } else if (config.dataDir) {
       const { join } = await import('node:path');
       const persistPath = join(config.dataDir, 'store.nq');
-      store = await createTripleStore({ backend: 'oxigraph-worker', options: { path: persistPath } });
+      store = await createTripleStore({
+        backend: 'oxigraph-worker',
+        options: { path: persistPath },
+        largeLiteralStorage: defaultLargeLiteralStorage(config.dataDir, config.largeLiteralStorage),
+      });
       log.info(ctx, `Persistent triple store (worker thread): ${persistPath}`);
     } else {
       store = await createTripleStore({ backend: 'oxigraph' });
@@ -1166,6 +1229,7 @@ export class DKGAgent {
     const node = new DKGNode(nodeConfig);
     const workspaceOwnedEntities = new Map<string, Map<string, string>>();
     const writeLocks = new Map<string, Promise<void>>();
+    const publicSnapshotStore = createPublicSnapshotStore(config.dataDir, config.sharedMemoryPublicSnapshotStorage);
     const legacyAdapterOperationalKey = opKeys?.[0];
     const legacyAdapterOperationalAddress = privateKeyAddress(legacyAdapterOperationalKey);
     const configuredPublisherAddress = normalizeAdapterPublisherAddress(config.publisherAddress);
@@ -1193,6 +1257,7 @@ export class DKGAgent {
         : (contextGraphId?: bigint) => inferAdapterPublisherAddress(chain, contextGraphId),
       sharedMemoryOwnedEntities: workspaceOwnedEntities,
       writeLocks,
+      publicSnapshotStore,
     });
 
     try {
@@ -1210,7 +1275,7 @@ export class DKGAgent {
 
     return new DKGAgent(
       config, wallet, node, store, publisher, queryEngine, eventBus, chain,
-      workspaceOwnedEntities, writeLocks,
+      workspaceOwnedEntities, writeLocks, publicSnapshotStore,
     );
   }
 
@@ -1675,6 +1740,7 @@ export class DKGAgent {
       syncPageSize: SYNC_PAGE_SIZE,
       sharedMemoryTtlMs: this.config.sharedMemoryTtlMs ?? DEFAULT_SWM_TTL_MS,
       store: this.store,
+      publicSnapshotStore: this.publicSnapshotStore,
       peerId: this.peerId,
       parseSyncRequest: this.parseSyncRequest.bind(this),
       authorizeSyncRequest: this.authorizeSyncRequest.bind(this),
@@ -2205,6 +2271,7 @@ export class DKGAgent {
       refreshMetaSyncedFlags: (contextGraphIds) => this.refreshMetaSyncedFlags(contextGraphIds),
       discoverContextGraphsFromStore: () => this.discoverContextGraphsFromStore(),
       syncSharedMemoryFromPeer: (peerId, contextGraphIds) => this.syncSharedMemoryFromPeer(peerId, contextGraphIds),
+      syncSharedMemoryOnConnect: this.config.syncSharedMemoryOnConnect ?? true,
       logInfo: (ctx, message) => this.log.info(ctx, message),
       onPeerSkippedNoSync: (peerId) => {
         this.skippedNoSyncPeers.add(peerId);
@@ -2402,9 +2469,10 @@ export class DKGAgent {
     remotePeerId: string,
     contextGraphId: string,
     includeSharedMemory: boolean,
-    phase: 'data' | 'meta',
+    phase: SyncPhase,
     graphUri: string,
     deadline: number,
+    snapshotRef?: string,
   ): Promise<SyncPageResult> {
     return fetchSyncPages({
       ctx,
@@ -2413,6 +2481,7 @@ export class DKGAgent {
       includeSharedMemory,
       phase,
       graphUri,
+      snapshotRef,
       deadline,
       syncPageTimeoutMs: SYNC_PAGE_TIMEOUT_MS,
       syncRouterAttempts: SYNC_ROUTER_ATTEMPTS,
@@ -2431,7 +2500,13 @@ export class DKGAgent {
       protocolSync: PROTOCOL_SYNC,
       checkpointStore: this.syncCheckpoints,
       buildSyncRequest: this.buildSyncRequest.bind(this),
-      parseAndFilter: (nquadsText, targetGraphUri, targetContextGraphId) => this.getOrCreateSyncVerifyWorker().parseAndFilter(nquadsText, targetGraphUri, targetContextGraphId),
+      parseAndFilter: (nquadsText, targetGraphUri, targetContextGraphId) => {
+        if (phase === 'snapshot') {
+          const quads = parseWorkspacePublicSnapshotNQuads(nquadsText, snapshotRef ?? 'unknown');
+          return Promise.resolve({ quads, totalQuads: quads.length });
+        }
+        return this.getOrCreateSyncVerifyWorker().parseAndFilter(nquadsText, targetGraphUri, targetContextGraphId);
+      },
       send: (peerId, protocolId, data, sendTimeoutMs) => this.messenger.sendToPeer(peerId, protocolId, data, { timeoutMs: sendTimeoutMs }),
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
@@ -2493,6 +2568,7 @@ export class DKGAgent {
         await graphManager.ensureContextGraph(contextGraphId);
       },
       storeInsert: (quads) => this.store.insert(quads),
+      publicSnapshotStore: this.publicSnapshotStore,
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
       setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
       ensureOwnedMap: (contextGraphId) => {
@@ -4890,7 +4966,9 @@ export class DKGAgent {
       }
     }
 
-    const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store);
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store, {
+      publicSnapshotStore: this.publicSnapshotStore,
+    });
     const captureID = await asyncPublisher.lift({
       ...liftRequestDraft,
       ...(seal !== undefined ? { seal } : {}),
@@ -6848,6 +6926,7 @@ export class DKGAgent {
         workspaceRecipientPrivateKeys: () => this.getLocalWorkspaceRecipientPrivateKeys(),
         workspaceSenderKeyDecryptor: (message: SwmSenderKeyMessageMsg, contextGraphId: string, ctx: OperationContext) =>
           this.decryptWorkspacePayloadWithSenderKey(message, contextGraphId, ctx),
+        publicSnapshotStore: this.publicSnapshotStore,
       });
     }
     return this.sharedMemoryHandler;
@@ -9681,7 +9760,8 @@ export class DKGAgent {
         offset: parsed.offset ?? 0,
         limit: Math.min(parsed.limit ?? SYNC_PAGE_SIZE, SYNC_PAGE_SIZE),
         includeSharedMemory: parsed.includeSharedMemory ?? false,
-        phase: parsed.phase === 'meta' ? 'meta' : 'data',
+        phase: normalizeSyncPhase(parsed.phase),
+        snapshotRef: typeof parsed.snapshotRef === 'string' ? parsed.snapshotRef : undefined,
         targetPeerId: parsed.targetPeerId,
         requesterPeerId: parsed.requesterPeerId,
         requestId: parsed.requestId,
@@ -9701,12 +9781,14 @@ export class DKGAgent {
     const ctxGraphPart = parts[0] || '';
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
     const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    const phase = normalizeSyncPhase(parts[3]);
     return {
       contextGraphId,
       offset: parseInt(parts[1], 10) || 0,
       limit: Math.min(parseInt(parts[2], 10) || SYNC_PAGE_SIZE, SYNC_PAGE_SIZE),
       includeSharedMemory,
-      phase: parts[3] === 'meta' ? 'meta' : 'data',
+      phase,
+      snapshotRef: phase === 'snapshot' ? parts[4] : undefined,
     };
   }
 
@@ -9779,7 +9861,8 @@ export class DKGAgent {
     limit: number,
     includeSharedMemory: boolean,
     responderPeerId: string,
-    phase: 'data' | 'meta' = 'data',
+    phase: SyncPhase = 'data',
+    snapshotRef?: string,
   ): Promise<Uint8Array> {
     const isPrivate = await this.isPrivateContextGraph(contextGraphId);
 
@@ -9799,6 +9882,7 @@ export class DKGAgent {
       targetPeerId: responderPeerId,
       requesterPeerId: this.peerId,
       phase,
+      snapshotRef,
       needsAuth,
       computeSyncDigest: this.computeSyncDigest.bind(this),
       getIdentityId: () => this.chain.getIdentityId(),

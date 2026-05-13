@@ -581,25 +581,27 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
         register: true,
       }),
     });
-    // /create itself succeeds (CG is created locally); the register
-    // leg fails because the PCA token doesn't exist. Codex PR #502
-    // round-8: register-leg failures now map to the same 4xx / 5xx
-    // status codes used by /api/context-graph/register — nonexistent
-    // PCA tokens → 404. The response body still carries
-    // `created: id, registered: false, registerError` so callers can
-    // distinguish "local CG exists, retry register" from "create
-    // failed".
-    expect(createAndRegister.status).toBe(404);
+    // /create itself succeeds (CG is created locally); only the
+    // register leg fails. Codex PR #502 round-9: the 200
+    // partial-success contract is preserved (backwards compat) —
+    // existing SDK callers rely on `created: true, registered: false`
+    // to retry the register step without re-running create. The new
+    // `registerErrorStatus` field surfaces what HTTP status the
+    // standalone /register endpoint would have returned for the same
+    // error (here: 404, nonexistent PCA token) so callers can map it
+    // to 4xx semantics without changing the envelope status.
+    expect(createAndRegister.status).toBe(200);
     const body = (await createAndRegister.json()) as {
-      error?: string;
       created?: string;
       registered?: boolean;
       registerError?: string;
+      registerErrorStatus?: number;
     };
     expect(body.created).toBe(cgId);
     expect(body.registered).toBe(false);
     expect(typeof body.registerError).toBe('string');
     expect(body.registerError ?? '').toMatch(/PCA account 99999999999999999999 does not exist/);
+    expect(body.registerErrorStatus).toBe(404);
 
     // Follow-up /register call omitting pcaAccountId. If the rollback
     // worked, the agent resolver finds NOTHING in storage and falls

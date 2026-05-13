@@ -617,32 +617,26 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         // leaves the CG with no stored PCA id, which is the correct
         // "no PCA yet" state.
         //
-        // Map caller-input / unsupported-feature failures to the same
-        // 4xx / 5xx status codes /api/context-graph/register uses —
-        // returning 200 here silently masked bad PCA ids, authz
-        // failures, etc. as success unless callers remembered to
-        // inspect `registered: false` (Codex PR #502 round-8). The
-        // response body carries `created: true` so callers know the
-        // local create succeeded and they can retry the register leg.
+        // We deliberately keep the 200 partial-success shape here even
+        // for "classified" register failures (Codex PR #502 round-9
+        // reversal of round-8). The create leg already succeeded —
+        // the CG exists locally — so returning a hard HTTP error
+        // would break existing callers that rely on
+        // `created: true, registered: false` to retry the register
+        // step without re-running create (or hitting 409). Callers
+        // detect register-leg failures by inspecting `registered`
+        // (`true`/`false`) and `registerError`; the classified
+        // status code from `classifyRegisterContextGraphError` is
+        // surfaced as `registerErrorStatus` so SDK callers can map
+        // it to the same 4xx semantics as the standalone /register
+        // endpoint without changing the HTTP envelope status.
         const classified = classifyRegisterContextGraphError(regMsg);
-        if (classified) {
-          return jsonResponse(res, classified.status, {
-            ...(classified.body ?? { error: regMsg }),
-            created: id,
-            uri: `did:dkg:context-graph:${id}`,
-            registered: false,
-            registerError: regMsg,
-            hint: 'CG created locally. Fix the register-leg input and call POST /api/context-graph/register to retry on-chain registration.',
-          });
-        }
-        // Unclassified failures (transient chain errors, unknown
-        // adapter reverts) keep the legacy 200-partial-success shape
-        // so callers can retry cheaply without losing the local CG.
         return jsonResponse(res, 200, {
           created: id,
           uri: `did:dkg:context-graph:${id}`,
           registered: false,
           registerError: regMsg,
+          ...(classified ? { registerErrorStatus: classified.status } : {}),
           hint: 'CG created locally. Use POST /api/context-graph/register to retry on-chain registration.',
         });
       }

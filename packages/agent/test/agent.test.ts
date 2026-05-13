@@ -2938,6 +2938,61 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
+  // Codex PR #502 round-9: untyped callers can pass `1` / `'1'` /
+  // `1n` for pcaAccountId. The previous round-8 coercion accepted
+  // `Number.isInteger(...)`, which silently lets unsafe ints
+  // (above 2^53-1) round-trip through `BigInt(...)` with the wrong
+  // value. Test pins the safer `Number.isSafeInteger` contract.
+  it('rejects unsafe JS integers as publishAuthorityAccountId — only safe ints / bigints / decimal strings accepted', async () => {
+    const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
+    const chain = new PcaCuratedRegistrationChainAdapter(
+      new Map([[42n, pcaOwner]]),
+      pcaOwner,
+    );
+    const agent = await DKGAgent.create({
+      name: 'PcaUnsafeIntegerBot',
+      store: new OxigraphStore(),
+      chainAdapter: chain,
+      nodeRole: 'core',
+    });
+    await agent.start();
+
+    await agent.createContextGraph({
+      id: 'reject-unsafe-int-pca',
+      name: 'Reject unsafe int PCA',
+      accessPolicy: 1,
+      callerAgentAddress: pcaOwner,
+    });
+
+    // 2^60 — well above Number.MAX_SAFE_INTEGER (2^53-1). JS would
+    // silently round before BigInt(...) sees it.
+    await expect(agent.registerContextGraph('reject-unsafe-int-pca', {
+      callerAgentAddress: pcaOwner,
+      publishAuthorityAccountId: Math.pow(2, 60) as unknown as bigint,
+    })).rejects.toThrow(/PCA account id must be a positive integer/);
+
+    // Negative number.
+    await expect(agent.registerContextGraph('reject-unsafe-int-pca', {
+      callerAgentAddress: pcaOwner,
+      publishAuthorityAccountId: -1 as unknown as bigint,
+    })).rejects.toThrow(/PCA account id must be a positive integer/);
+
+    // Floating-point.
+    await expect(agent.registerContextGraph('reject-unsafe-int-pca', {
+      callerAgentAddress: pcaOwner,
+      publishAuthorityAccountId: 1.5 as unknown as bigint,
+    })).rejects.toThrow(/PCA account id must be a positive integer/);
+
+    // Non-numeric string.
+    await expect(agent.registerContextGraph('reject-unsafe-int-pca', {
+      callerAgentAddress: pcaOwner,
+      publishAuthorityAccountId: 'abc' as unknown as bigint,
+    })).rejects.toThrow(/PCA account id must be a positive integer/);
+
+    expect(chain.createOnChainContextGraphCalls).toHaveLength(0);
+    await agent.stop().catch(() => {});
+  });
+
   // Codex review #502-2: `{ private: true, accessPolicy: 0,
   // pcaAccountId }` create+register must not flip-flop between curated
   // (at create time) and open (at register time). The daemon route's

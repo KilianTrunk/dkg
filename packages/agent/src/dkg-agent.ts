@@ -7792,11 +7792,20 @@ export class DKGAgent {
       if (typeof rawPublishAuthorityAccountId === 'bigint') {
         requestedPublishAuthorityAccountId = rawPublishAuthorityAccountId;
       } else if (typeof rawPublishAuthorityAccountId === 'number') {
-        if (!Number.isInteger(rawPublishAuthorityAccountId) || rawPublishAuthorityAccountId <= 0) {
+        // Codex PR #502 round-9: reject unsafe JS integers. Anything
+        // above `Number.MAX_SAFE_INTEGER` (2^53-1) is silently
+        // rounded BEFORE `BigInt(...)` sees it, which would let an
+        // untyped caller register against an entirely different PCA
+        // account id than they intended. Mirrors
+        // `parseOptionalPcaAccountId` in the daemon route.
+        if (!Number.isSafeInteger(rawPublishAuthorityAccountId) || rawPublishAuthorityAccountId <= 0) {
           throw new Error('PCA account id must be a positive integer.');
         }
         requestedPublishAuthorityAccountId = BigInt(rawPublishAuthorityAccountId);
       } else if (typeof rawPublishAuthorityAccountId === 'string' && /^[1-9]\d*$/.test(rawPublishAuthorityAccountId)) {
+        // Decimal strings can carry arbitrary-precision values
+        // safely (BigInt preserves them), so no safe-integer ceiling
+        // applies — that's the recommended path for ids above 2^53.
         requestedPublishAuthorityAccountId = BigInt(rawPublishAuthorityAccountId);
       } else {
         throw new Error('PCA account id must be a positive integer.');
@@ -7969,7 +7978,7 @@ export class DKGAgent {
       // probe so future readers can't confuse it with a publish-time
       // delegate principal.
       if (isPcaCurated && publishAuthority) {
-        const chainSigner = await this.getRegistrationTxSignerAddress(id);
+        const chainSigner = await this.getRegistrationTxSignerAddress();
         if (!chainSigner) {
           throw new Error(
             `Context graph "${id}" cannot be PCA-registered: the chain adapter does not expose its registration-tx signer, so the "chain signer == PCA owner" invariant cannot be verified. PCA mode requires a chain adapter that surfaces its signer (e.g. via \`signerAddress\` / \`getSignerAddress()\` / \`getOperationalPrivateKey()\`) so the on-chain governance NFT is guaranteed to mint to the advertised PCA owner.`,
@@ -11054,19 +11063,66 @@ export class DKGAgent {
    * the adapter binds to `contracts.contextGraphs` and invokes
    * `createContextGraph`/`updatePublishPolicy`/etc with).
    *
-   * Codex PR #502 round-8: split out from `getChainPublishAuthorityAddress`
-   * so the PCA "chain signer == PCA owner" invariant has a dedicated,
-   * explicitly-documented probe. In practice the underlying resolution
-   * is identical today — `getChainPublishAuthorityAddress` already
-   * passes `includeReservingPublisherProbe: false` so it never returns
-   * a per-CG publish-time delegate — but a dedicated method makes the
-   * intent (the tx-signing wallet, not any publish-time principal)
-   * obvious to future readers / reviewers and gives us a clean
-   * extension point if an adapter ever needs to advertise a separate
-   * registration signer.
+   * Codex PR #502 round-8/round-9: this MUST be the actual tx signer,
+   * NOT the publishing principal. We deliberately skip:
+   *   - `config.publisherAddress` — the configured KA publisher
+   *     address, which can be a publishing delegate that does NOT
+   *     sign chain txs.
+   *   - `getAuthorizedPublisherAddress(contextGraphId)` — per-CG
+   *     publish-time delegate registered on chain.
+   *   - The generic `signMessage` probe — returns the adapter's
+   *     signing principal for arbitrary messages, not its tx-signing
+   *     wallet specifically.
+   *
+   * We only probe signer-specific adapter surfaces:
+   *   1. `getSignerAddress()` (modern method — used by the EVM
+   *      adapter).
+   *   2. `getSignerAddresses()` (multi-signer pool; we take the
+   *      first valid address).
+   *   3. `signerAddress` property (mock adapter and parity tests).
+   *   4. `getOperationalPrivateKey()` (legacy adapters).
+   *
+   * Returning `undefined` triggers the round-5 "fail closed" branch
+   * in `registerContextGraph`: PCA registration is rejected because
+   * the invariant cannot be verified.
    */
-  private async getRegistrationTxSignerAddress(contextGraphId?: string): Promise<string | undefined> {
-    return this.getChainPublishAuthorityAddress(contextGraphId);
+  private async getRegistrationTxSignerAddress(): Promise<string | undefined> {
+    const chain = this.chain;
+
+    const signerAddressGetter = (chain as unknown as { getSignerAddress?: () => unknown }).getSignerAddress;
+    if (typeof signerAddressGetter === 'function') {
+      try {
+        const address = normalizeAdapterPublisherAddress(await Promise.resolve(signerAddressGetter.call(chain)));
+        if (address) return address;
+      } catch {
+        // Best-effort probe; fall through to broader signer surfaces.
+      }
+    }
+
+    const signerAddressesGetter = (chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
+    if (typeof signerAddressesGetter === 'function') {
+      try {
+        const advertised = await Promise.resolve(signerAddressesGetter.call(chain));
+        if (Array.isArray(advertised)) {
+          for (const value of advertised) {
+            const address = normalizeAdapterPublisherAddress(value);
+            if (address) return address;
+          }
+        }
+      } catch {
+        // Best-effort probe.
+      }
+    }
+
+    const signerAddress = normalizeAdapterPublisherAddress(
+      (chain as unknown as { signerAddress?: unknown }).signerAddress,
+    );
+    if (signerAddress) return signerAddress;
+
+    const adapterOperationalAddress = adapterOperationalPrivateKeyAddress(chain);
+    if (adapterOperationalAddress) return adapterOperationalAddress;
+
+    return undefined;
   }
 
   private async getChainPublishAuthorityAddress(contextGraphId?: string): Promise<string | undefined> {

@@ -465,14 +465,19 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     if (parsedPcaAccountId.error) {
       return jsonResponse(res, 400, { error: parsedPcaAccountId.error });
     }
-    // pcaAccountId is a curated signal: reject explicit incoherent combos
-    // (`publishPolicy: 1 (open)` or `accessPolicy: 0 (open)`) at the API
-    // boundary instead of letting them surface as 500s from the agent.
+    // pcaAccountId is a curated-publish signal: reject ONLY the
+    // explicit `publishPolicy: 1 (open)` combo at the API boundary
+    // instead of letting it surface as a 500 from the agent.
+    //
+    // Note: we deliberately do NOT reject `accessPolicy: 0 (public)`
+    // alongside pcaAccountId — the on-chain
+    // `ContextGraphs.createContextGraph` contract supports
+    // `{ accessPolicy: 0, publishPolicy: 0, pcaAccountId: !=0 }`
+    // (publicly-discoverable CG where only PCA-authorized publishers
+    // can write). Rejecting it here would block a valid registration
+    // mode (Codex PR #502 round-7).
     if (parsedPcaAccountId.value !== undefined && publishPolicy === 1) {
-      return jsonResponse(res, 400, { error: 'pcaAccountId is only valid for curated context graphs (publishPolicy=0)' });
-    }
-    if (parsedPcaAccountId.value !== undefined && accessPolicy === 0 && parsed.private !== true) {
-      return jsonResponse(res, 400, { error: 'pcaAccountId is only valid for curated/private context graphs' });
+      return jsonResponse(res, 400, { error: 'pcaAccountId is only valid with curated publish policy (publishPolicy=0)' });
     }
     // pcaAccountId on a create-only request is a silent foot-gun:
     // `createContextGraph()` no longer persists it (Codex PR #502
@@ -636,7 +641,8 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       if (msg.includes('address-scoped curator')) {
         return jsonResponse(res, 403, { error: msg });
       }
-      if (msg.includes('PCA account id can only be used with curated/private context graphs')) {
+      if (msg.includes('PCA account id can only be used with curated publish policy')
+        || msg.includes('PCA account id can only be used with curated/private context graphs')) {
         return jsonResponse(res, 400, { error: msg });
       }
       // PCA-specific 4xx mapping (Codex review #502-3): caller-input or

@@ -7244,17 +7244,6 @@ export class DKGAgent {
     requiredSignatures?: number;
     /** Participant agent addresses for on-chain context graphs. */
     participantAgents?: string[];
-    /**
-     * Publishing Conviction Account id. NOT a `createContextGraph` knob —
-     * supply on {@link registerContextGraph} instead. Accepted here only
-     * so callers get an immediate error rather than a silent no-op:
-     * `createContextGraph` no longer persists the PCA id (Codex PR #502
-     * round-3) and direct agent callers would otherwise have no signal
-     * that the create-time value was being dropped (Codex round-6).
-     *
-     * @deprecated Use `publishAuthorityAccountId` on `registerContextGraph` instead.
-     */
-    publishAuthorityAccountId?: bigint;
     /** When true, skips gossip subscription and broadcast. Data stays local-only. */
     private?: boolean;
     /** Caller's agent address (resolved from token). Used for curator/creator triples. */
@@ -7286,21 +7275,25 @@ export class DKGAgent {
     const isCurated = opts.accessPolicy === LOCAL_ACCESS_CURATED
       || (opts.allowedAgents && opts.allowedAgents.length > 0)
       || (opts.allowedPeers && opts.allowedPeers.length > 0);
-    // pcaAccountId is a register-time-only knob (Codex PR #502 round-3:
-    // `createContextGraph` no longer persists it). Direct agent
-    // callers used to receive a silent drop; per Codex round-6 we now
-    // fail fast at the boundary so they get an immediate, actionable
+    // pcaAccountId is a register-time-only knob (Codex PR #502
+    // round-3: `createContextGraph` no longer persists it). The field
+    // is intentionally NOT part of the public `createContextGraph`
+    // TypeScript signature — TS-first callers get a compile-time
+    // excess-property error if they try to set it (Codex round-7).
+    // The runtime check below still fires so untyped/JS callers (or
+    // typed callers using `as any`) get an immediate, actionable
     // error instead of a confusing "EOA-curated when I asked for PCA"
     // outcome at register time. Daemon callers can't hit this path —
     // the HTTP route already strips the param before calling
     // `createContextGraph`.
-    if (opts.publishAuthorityAccountId !== undefined) {
+    const optsRecord = opts as unknown as Record<string, unknown>;
+    if (optsRecord.publishAuthorityAccountId !== undefined) {
       throw new Error(
         '`publishAuthorityAccountId` is not supported on createContextGraph(). '
         + 'PCA account ids are register-time-only — supply `publishAuthorityAccountId` '
         + 'on registerContextGraph() instead. Background: createContextGraph no '
         + 'longer persists PCA ids locally, so any value passed here would silently '
-        + 'be dropped before registration (Codex PR #502 round-3/round-6).',
+        + 'be dropped before registration (Codex PR #502 round-3/round-6/round-7).',
       );
     }
 
@@ -7794,19 +7787,20 @@ export class DKGAgent {
         throw new Error('PCA account id must be a positive integer.');
       }
     }
-    // PCA account ids are only valid for curated/private context graphs.
-    // Reject in TWO orthogonal cases (Codex review #502 follow-up):
-    //   (a) publishPolicy resolves to EVM_PUBLISH_OPEN — the on-chain
-    //       contract's PCA branch in `isAuthorizedPublisher` never fires
-    //       for open publish policy.
-    //   (b) resolvedLocalAccessPolicy is LOCAL_ACCESS_OPEN — even if the
-    //       caller explicitly forces `publishPolicy=0 (curated)`, a CG
-    //       that is locally OPEN (public/discoverable) does not match
-    //       the "curated/private" contract enforced at create time and
-    //       advertised by the new API messages.
-    if (publishAuthorityAccountId !== undefined
-      && (publishPolicy === EVM_PUBLISH_OPEN || resolvedLocalAccessPolicy === LOCAL_ACCESS_OPEN)) {
-      throw new Error('PCA account id can only be used with curated/private context graphs.');
+    // PCA account ids are only invalid when the publish policy is
+    // open (`publishPolicy === EVM_PUBLISH_OPEN`) — that combination
+    // is incoherent on-chain because `isAuthorizedPublisher`'s PCA
+    // branch never fires for open publish policy.
+    //
+    // We do NOT also reject `accessPolicy=0 (public/discoverable)`
+    // here: the on-chain `ContextGraphs.createContextGraph` contract
+    // explicitly supports `{ accessPolicy: 0, publishPolicy: 0,
+    // publishAuthorityAccountId: !=0 }` — a publicly-discoverable CG
+    // where only the PCA owner / authorized publishers can write.
+    // Rejecting that combo client-side blocks a valid registration
+    // mode (Codex PR #502 round-7).
+    if (publishAuthorityAccountId !== undefined && publishPolicy === EVM_PUBLISH_OPEN) {
+      throw new Error('PCA account id can only be used with curated publish policy.');
     }
     // NOTE: we intentionally defer persisting `requestedPublishAuthorityAccountId`
     // until *after* on-chain registration succeeds (further down). If we

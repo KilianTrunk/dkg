@@ -2675,10 +2675,16 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
-  // Codex PR #502 round-6: createContextGraph used to accept-then-drop
-  // `publishAuthorityAccountId` silently. Direct agent callers (SDK)
-  // now get an immediate error explaining the param belongs on
-  // `registerContextGraph` instead.
+  // Codex PR #502 round-6/round-7:
+  //   - round-6: createContextGraph used to accept-then-drop
+  //     `publishAuthorityAccountId` silently. Now fails fast at the
+  //     boundary.
+  //   - round-7: the field was also removed from the public TS
+  //     signature, so typed callers get a compile-time
+  //     excess-property error before they ever hit the runtime guard.
+  //     This test exercises the runtime path via `as any` to simulate
+  //     untyped/JS callers (or typed callers casting around the
+  //     signature).
   it('rejects publishAuthorityAccountId on createContextGraph() — PCA ids are register-time-only', async () => {
     const chain = new PcaCuratedRegistrationChainAdapter(new Map([[7n, ethers.Wallet.createRandom().address]]));
     const agent = await DKGAgent.create({
@@ -2691,12 +2697,14 @@ decisions: []
 
     // Both axes (curated AND open) reject — the param is no longer
     // a "validate at create time" knob, it's just unsupported here.
+    // `as any` deliberately bypasses the (now-narrower) TS signature
+    // to reach the runtime guard.
     await expect(agent.createContextGraph({
       id: 'reject-pca-create-open',
       name: 'Reject PCA Create (Open)',
       publishAuthorityAccountId: 7n,
       callerAgentAddress: ethers.getAddress(chain.signerAddress),
-    })).rejects.toThrow(/not supported on createContextGraph|register-time-only/i);
+    } as any)).rejects.toThrow(/not supported on createContextGraph|register-time-only/i);
 
     await expect(agent.createContextGraph({
       id: 'reject-pca-create-curated',
@@ -2704,7 +2712,7 @@ decisions: []
       accessPolicy: 1,
       publishAuthorityAccountId: 7n,
       callerAgentAddress: ethers.getAddress(chain.signerAddress),
-    })).rejects.toThrow(/not supported on createContextGraph|register-time-only/i);
+    } as any)).rejects.toThrow(/not supported on createContextGraph|register-time-only/i);
 
     await agent.stop().catch(() => {});
   });
@@ -2800,39 +2808,83 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
-  // Codex review #502 follow-up: PCA mode must be rejected when EITHER
-  // axis is open, not just publishPolicy. A caller cannot bypass the
-  // "curated/private only" contract by explicitly forcing
-  // `publishPolicy: 0 (curated)` together with `accessPolicy: 0 (open)`.
-  it('rejects PCA registration when accessPolicy is open even with explicit publishPolicy=0 (curated)', async () => {
+  // Codex PR #502 round-7: a previous iteration of this test asserted
+  // that `accessPolicy=0 + publishPolicy=0 + pcaAccountId` should be
+  // rejected client-side as "curated/private only". That was wrong —
+  // the on-chain `ContextGraphs.createContextGraph` contract supports
+  // this exact combo (publicly-discoverable CG, only PCA-authorized
+  // publishers can write). The agent guard now rejects ONLY
+  // `publishPolicy === EVM_PUBLISH_OPEN + PCA`. This positive test
+  // pins the broader valid-mode contract.
+  it('accepts PCA registration with accessPolicy=0 (public) + publishPolicy=0 (curated) + pcaAccountId — public-discoverable + PCA-curated is on-chain valid', async () => {
     const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
     const pcaAccountId = 88n;
-    const chain = new PcaCuratedRegistrationChainAdapter(new Map([[pcaAccountId, pcaOwner]]));
+    // Chain signer == PCA owner per the round-4 invariant.
+    const chain = new PcaCuratedRegistrationChainAdapter(
+      new Map([[pcaAccountId, pcaOwner]]),
+      pcaOwner,
+    );
     const agent = await DKGAgent.create({
-      name: 'PcaOpenAccessPolicyBot',
+      name: 'PcaPublicDiscoverableBot',
       store: new OxigraphStore(),
       chainAdapter: chain,
       nodeRole: 'core',
     });
     await agent.start();
 
-    // Create as open (no accessPolicy / private / allowlists). The
-    // agent's createContextGraph PCA gate rejects this at create time,
-    // so we have to set up a CG that's open locally without going
-    // through createContextGraph's PCA branch — use a plain create and
-    // then attempt to force the contradictory combo at register time.
+    // Create as a plain (no allowlist, no private) CG.
     await agent.createContextGraph({
-      id: 'reject-open-access-with-pca',
-      name: 'Reject Open AccessPolicy with PCA',
+      id: 'accept-public-discoverable-pca',
+      name: 'Accept public-discoverable + PCA',
       callerAgentAddress: pcaOwner,
     });
 
-    await expect(agent.registerContextGraph('reject-open-access-with-pca', {
+    await expect(agent.registerContextGraph('accept-public-discoverable-pca', {
       callerAgentAddress: pcaOwner,
       accessPolicy: 0,
       publishPolicy: 0,
       publishAuthorityAccountId: pcaAccountId,
-    })).rejects.toThrow(/PCA account id can only be used with curated\/private context graphs/);
+    })).resolves.toMatchObject({ onChainId: expect.any(String) });
+
+    expect(chain.createOnChainContextGraphCalls[0]).toMatchObject({
+      accessPolicy: 0,
+      publishPolicy: 0,
+      publishAuthority: pcaOwner,
+      publishAuthorityAccountId: pcaAccountId,
+    });
+    await agent.stop().catch(() => {});
+  });
+
+  // Codex PR #502 round-7 (complementary negative test): the only
+  // axis where PCA is incoherent is `publishPolicy === EVM_PUBLISH_OPEN`.
+  // The on-chain `isAuthorizedPublisher`'s PCA branch never fires for
+  // open publish policy, so the combo is genuinely meaningless.
+  it('rejects PCA registration when publishPolicy is open (regardless of accessPolicy)', async () => {
+    const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
+    const pcaAccountId = 188n;
+    const chain = new PcaCuratedRegistrationChainAdapter(
+      new Map([[pcaAccountId, pcaOwner]]),
+      pcaOwner,
+    );
+    const agent = await DKGAgent.create({
+      name: 'PcaOpenPublishPolicyBot',
+      store: new OxigraphStore(),
+      chainAdapter: chain,
+      nodeRole: 'core',
+    });
+    await agent.start();
+
+    await agent.createContextGraph({
+      id: 'reject-open-publish-policy-pca',
+      name: 'Reject open publishPolicy + PCA',
+      callerAgentAddress: pcaOwner,
+    });
+
+    await expect(agent.registerContextGraph('reject-open-publish-policy-pca', {
+      callerAgentAddress: pcaOwner,
+      publishPolicy: 1,  // open
+      publishAuthorityAccountId: pcaAccountId,
+    })).rejects.toThrow(/curated publish policy/i);
 
     expect(chain.createOnChainContextGraphCalls).toHaveLength(0);
     await agent.stop().catch(() => {});

@@ -112,6 +112,8 @@ describe('import artifact daemon routes', () => {
     markdownForm: string | string[];
     contentType?: string | null;
     extractionStatus?: string;
+    omitExtractionStatus?: boolean;
+    structuralTripleCount?: string;
     mdIntermediateHash?: string;
     publisherCreateError?: Error;
     publisherWriteError?: Error;
@@ -207,10 +209,10 @@ describe('import artifact daemon routes', () => {
                 fileHash: args.fileHash,
                 ...(args.contentType !== null ? { contentType: args.contentType ?? 'text/markdown' } : {}),
                 rootEntity: 'urn:doc:imported',
-                structuralTripleCount: '3',
+                structuralTripleCount: args.structuralTripleCount ?? '3',
                 semanticTripleCount: '0',
                 extractionMethod: 'text/markdown',
-                extractionStatus: args.extractionStatus ?? 'completed',
+                ...(args.omitExtractionStatus ? {} : { extractionStatus: args.extractionStatus ?? 'completed' }),
                 ...(args.mdIntermediateHash ? { mdIntermediateHash: args.mdIntermediateHash } : {}),
                 sourceFileName: 'imported.md',
               }],
@@ -341,6 +343,65 @@ describe('import artifact daemon routes', () => {
       agentAddress: 'did:dkg:agent:test',
     });
   });
+
+  it('accepts legacy completed import metadata that predates durable extractionStatus', async () => {
+    const entry = await fileStore.put(Buffer.from('# Legacy Completed\n'), 'text/markdown');
+    const contextGraphId = 'cg-import-artifact-legacy-status';
+    const assertionName = 'legacy-completed-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:test', assertionName);
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+      omitExtractionStatus: true,
+    });
+    await startRoutes({ agent });
+
+    const result = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri,
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body.artifact).toMatchObject({
+      assertionUri,
+      extractionStatus: 'completed',
+      structuralTripleCount: 3,
+      canReadMarkdown: true,
+    });
+  });
+
+  for (const structuralTripleCount of ['0', '1.5', '1junk']) {
+    it(`still rejects missing durable extractionStatus when structuralTripleCount is ${structuralTripleCount}`, async () => {
+      const entry = await fileStore.put(Buffer.from('# Ambiguous\n'), 'text/markdown');
+      const suffix = structuralTripleCount.replace(/[^a-z0-9]+/gi, '-');
+      const contextGraphId = `cg-import-artifact-missing-status-${suffix}`;
+      const assertionName = `ambiguous-md-${suffix}`;
+      const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:test', assertionName);
+      const { agent } = makeAgent({
+        contextGraphId,
+        assertionName,
+        assertionUri,
+        fileHash: entry.keccak256,
+        markdownHash: entry.keccak256,
+        markdownForm: `urn:dkg:file:${entry.keccak256}`,
+        omitExtractionStatus: true,
+        structuralTripleCount,
+      });
+      await startRoutes({ agent });
+
+      const result = await post('/api/assertion/import-artifact/resolve', {
+        contextGraphId,
+        assertionUri,
+      });
+
+      expect(result.status).toBe(409);
+      expect(result.body.error).toMatch(/missing completed extraction status/);
+    });
+  }
 
   it('rejects cross-agent import artifact metadata and Markdown reads', async () => {
     const entry = await fileStore.put(Buffer.from('# Imported\n'), 'text/markdown');

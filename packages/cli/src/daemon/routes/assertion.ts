@@ -389,6 +389,13 @@ function optionalPositiveInteger(cell: unknown): number | undefined {
   return parseOpenClawAttachmentTripleCount(bindingCellValue(cell));
 }
 
+function optionalStrictPositiveInteger(cell: unknown): number | undefined {
+  const value = normalizeLiteralBinding(cell);
+  if (!/^\+?\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 function hashFromFileUrn(value: string | undefined): string | undefined {
   const prefix = 'urn:dkg:file:';
   if (!value?.startsWith(prefix)) return undefined;
@@ -782,14 +789,16 @@ async function resolveImportedArtifact(
   }
 
   const durableExtractionStatus = normalizeLiteralBinding(metaBinding.extractionStatus) || undefined;
-  if (!durableExtractionStatus) {
-    throw new ImportArtifactRouteError(409, 'Import metadata is missing completed extraction status');
-  }
-  if (durableExtractionStatus !== 'completed') {
+  const structuralTripleCount = optionalPositiveInteger(metaBinding.structuralTripleCount);
+  const legacyCompletedStructuralTripleCount = optionalStrictPositiveInteger(metaBinding.structuralTripleCount);
+  if (durableExtractionStatus && durableExtractionStatus !== 'completed') {
     throw new ImportArtifactRouteError(
       409,
       `Import artifact is not a completed extraction (status: ${durableExtractionStatus})`,
     );
+  }
+  if (!durableExtractionStatus && (legacyCompletedStructuralTripleCount ?? 0) <= 0) {
+    throw new ImportArtifactRouteError(409, 'Import metadata is missing completed extraction status');
   }
 
   const sourceFileHash = normalizeLiteralBinding(metaBinding.fileHash);
@@ -845,8 +854,8 @@ async function resolveImportedArtifact(
     extractionMethod: normalizeLiteralBinding(metaBinding.extractionMethod) || extractionRecord?.pipelineUsed || undefined,
     rootEntity: normalizeIriBinding(metaBinding.rootEntity) || extractionRecord?.rootEntity || undefined,
     sourceFileName: normalizeLiteralBinding(metaBinding.sourceFileName) || extractionRecord?.fileName || undefined,
-    tripleCount: optionalPositiveInteger(metaBinding.structuralTripleCount) ?? extractionRecord?.tripleCount,
-    structuralTripleCount: optionalPositiveInteger(metaBinding.structuralTripleCount) ?? extractionRecord?.tripleCount,
+    tripleCount: structuralTripleCount ?? extractionRecord?.tripleCount,
+    structuralTripleCount: structuralTripleCount ?? extractionRecord?.tripleCount,
     semanticTripleCount: optionalPositiveInteger(metaBinding.semanticTripleCount),
     ...(mdIntermediateHash ? { mdIntermediateHash } : {}),
     ...(markdownForm ? { markdownForm } : {}),
@@ -2685,14 +2694,21 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           object: JSON.stringify("structural"),
           graph: metaGraph,
         },
-        // Row 18
+        // Row 18 - durable terminal import state used by artifact readers after restart.
+        {
+          subject: assertionUri,
+          predicate: "http://dkg.io/ontology/extractionStatus",
+          object: JSON.stringify("completed"),
+          graph: metaGraph,
+        },
+        // Row 19
         {
           subject: assertionUri,
           predicate: "http://dkg.io/ontology/structuralTripleCount",
           object: `"${triples.length}"^^<http://www.w3.org/2001/XMLSchema#integer>`,
           graph: metaGraph,
         },
-        // Row 19 — V10.0 has no semantic (Layer 2) extraction, so always zero.
+        // Row 20 - V10.0 has no semantic (Layer 2) extraction, so always zero.
         {
           subject: assertionUri,
           predicate: "http://dkg.io/ontology/semanticTripleCount",

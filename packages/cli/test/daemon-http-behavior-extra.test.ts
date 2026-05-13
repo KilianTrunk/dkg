@@ -549,20 +549,20 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     expect([200, 201]).toContain(create.status);
   });
 
-  // Codex review #502 follow-up: when /create { register: true }
-  // includes a bad pcaAccountId, the create-time persist must NOT
-  // leave the bad id in local CG metadata after the register leg
-  // fails. The daemon catch rolls it back so a subsequent /register
-  // call that omits the param falls through cleanly instead of
-  // silently replaying the bad id from storage.
-  it('rolls back the create-time pcaAccountId persist when register fails inside /create', async () => {
+  // Codex review #502 round-3: pcaAccountId is a register-time knob —
+  // /create no longer persists it locally. A failed /create
+  // { register: true } leg must therefore leave NO stored PCA id
+  // behind, so a follow-up /register that omits the param can NOT
+  // silently replay the bad id.
+  it('never persists a bad pcaAccountId locally when /create { register: true } register leg fails', async () => {
     const d = daemon!;
-    const cgId = 'pca-create-register-rollback-' + Math.random().toString(36).slice(2, 8);
+    const cgId = 'pca-create-register-no-persist-' + Math.random().toString(36).slice(2, 8);
 
     // /create { register: true } with a bad pcaAccountId. The register
-    // leg fails on chain owner-lookup; the daemon route's catch must
-    // call clearContextGraphPublishAuthorityAccountId so the persisted
-    // id is wiped.
+    // leg fails on chain owner-lookup. Per Codex round-3, the create
+    // path validates but does NOT persist pcaAccountId, so there's
+    // nothing to roll back and a follow-up /register without the
+    // param must NOT see the stale id.
     const createAndRegister = await fetch(urlFor(d, '/api/context-graph/create'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders(d) },

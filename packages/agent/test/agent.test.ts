@@ -2514,12 +2514,17 @@ decisions: []
       id: 'register-pca-curated-policy',
       name: 'PCA Curated Policy',
       accessPolicy: 1,
-      publishAuthorityAccountId: pcaAccountId,
       callerAgentAddress: pcaOwner,
     });
 
-    await expect(agent.registerContextGraph('register-pca-curated-policy', { callerAgentAddress: pcaOwner }))
-      .resolves.toMatchObject({ onChainId: expect.any(String) });
+    // pcaAccountId is a register-time knob now (Codex PR #502 round-3);
+    // callers must resupply it on `registerContextGraph` rather than
+    // relying on a create-time persist that could silently replay a
+    // stale id.
+    await expect(agent.registerContextGraph('register-pca-curated-policy', {
+      callerAgentAddress: pcaOwner,
+      publishAuthorityAccountId: pcaAccountId,
+    })).resolves.toMatchObject({ onChainId: expect.any(String) });
 
     expect(chain.createOnChainContextGraphCalls[0]).toMatchObject({
       publishPolicy: 0,
@@ -2599,12 +2604,14 @@ decisions: []
       id: 'reject-pca-non-owner',
       name: 'Reject PCA non-owner',
       accessPolicy: 1,
-      publishAuthorityAccountId: pcaAccountId,
       callerAgentAddress: nonOwner,
     });
 
+    // pcaAccountId at register time (not create) per Codex PR #502
+    // round-3 contract change.
     await expect(agent.registerContextGraph('reject-pca-non-owner', {
       callerAgentAddress: nonOwner,
+      publishAuthorityAccountId: pcaAccountId,
     })).rejects.toThrow(/PCA account 99|only the PCA owner/i);
 
     expect(chain.createOnChainContextGraphCalls).toHaveLength(0);
@@ -2778,16 +2785,17 @@ decisions: []
       id: 'pca-private-dominates',
       name: 'PCA Private Dominates AccessPolicy',
       private: true,
-      publishAuthorityAccountId: pcaAccountId,
       callerAgentAddress: pcaOwner,
     });
 
     // Register with accessPolicy=1 (matches the daemon route's
     // `inferredAccessPolicy` for `private: true`). The agent must accept
-    // and route into the PCA curated branch.
+    // and route into the PCA curated branch when pcaAccountId is
+    // supplied at register time (Codex PR #502 round-3).
     await expect(agent.registerContextGraph('pca-private-dominates', {
       accessPolicy: 1,
       callerAgentAddress: pcaOwner,
+      publishAuthorityAccountId: pcaAccountId,
     })).resolves.toMatchObject({ onChainId: expect.any(String) });
 
     expect(chain.createOnChainContextGraphCalls[0]).toMatchObject({

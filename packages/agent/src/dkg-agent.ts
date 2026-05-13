@@ -7277,6 +7277,15 @@ export class DKGAgent {
     const isCurated = opts.accessPolicy === LOCAL_ACCESS_CURATED
       || (opts.allowedAgents && opts.allowedAgents.length > 0)
       || (opts.allowedPeers && opts.allowedPeers.length > 0);
+    // pcaAccountId at create time is validated but NOT persisted —
+    // callers must (re)supply it at `registerContextGraph` time. Codex
+    // PR #502 round-3 flagged the create-time persist as unsafe: a
+    // bad id silently replays from local metadata on every later
+    // register retry that omits the param. Treating pcaAccountId as a
+    // register-time-only knob removes the foot-gun entirely; this
+    // parameter remains on `createContextGraph` for backwards-compat
+    // shape validation (it would be confusing to silently drop the
+    // shape mismatch), but its only effect now is input validation.
     const publishAuthorityAccountId = opts.publishAuthorityAccountId;
     if (publishAuthorityAccountId !== undefined) {
       if (publishAuthorityAccountId <= 0n) {
@@ -7323,19 +7332,15 @@ export class DKGAgent {
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: `"${isCurated || opts.private ? 'private' : 'public'}"`, graph: defGraph },
     ];
 
-    // Store registration status and curator in _meta
+    // Store registration status and curator in _meta. NOTE: we
+    // deliberately do NOT persist `publishAuthorityAccountId` here even
+    // though the param was validated above — see the comment near
+    // `const publishAuthorityAccountId = opts.publishAuthorityAccountId`
+    // above for why (Codex PR #502 round-3).
     quads.push(
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"unregistered"`, graph: cgMetaGraph },
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: curatorDid, graph: cgMetaGraph },
     );
-    if (publishAuthorityAccountId !== undefined) {
-      quads.push({
-        subject: contextGraphUri,
-        predicate: DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID,
-        object: `"${publishAuthorityAccountId.toString()}"`,
-        graph: cgMetaGraph,
-      });
-    }
 
     // Store peer allowlist for curated CGs (with validation)
     if (opts.allowedPeers && opts.allowedPeers.length > 0) {
@@ -11047,26 +11052,6 @@ export class DKGAgent {
       predicate: DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID,
       object: `"${accountId.toString()}"`,
     }]);
-  }
-
-  /**
-   * Clear the persisted `publishAuthorityAccountId` triple for a context
-   * graph. Used by the daemon's create+register flow to roll back a
-   * pcaAccountId that was written at create time when the immediately-
-   * following register call fails — otherwise a bad PCA id would stick
-   * in local CG metadata and silently replay on every later register
-   * attempt that omits the param (Codex review #502 follow-up).
-   *
-   * Public so the daemon route can invoke it; idempotent.
-   */
-  async clearContextGraphPublishAuthorityAccountId(contextGraphId: string): Promise<void> {
-    const cgMetaGraph = contextGraphMetaUri(contextGraphId);
-    const cgUri = `did:dkg:context-graph:${contextGraphId}`;
-    await this.store.deleteByPattern({
-      graph: cgMetaGraph,
-      subject: cgUri,
-      predicate: DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID,
-    });
   }
 
   /**

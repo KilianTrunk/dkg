@@ -1326,20 +1326,39 @@ export class DKGAgent {
         // when RFC 04 Phase 2 lands — at that point, the registry
         // step takes precedence and this fallback is rarely hit.
         //
-        // Note: AgentDirectoryLookup.findRelayForPeer accepts an
-        // optional `opts.signal` so the resolver can cancel an
-        // in-flight SPARQL on outer-deadline expiry. The legacy
-        // DiscoveryClient.findAgentByPeerId doesn't expose
-        // cancellation today (its SPARQL fetch is fire-and-await),
-        // so the signal is intentionally ignored here. Wiring it up
-        // is a follow-up that touches DiscoveryClient internals;
-        // until then the resolver's pre-step `signal.aborted` check
-        // still prevents NEW agent-directory work from starting once
-        // the deadline elapses, even if an already-running query
-        // can't be torn down.
-        findRelayForPeer: async (peerId, _opts) => {
-          const agent = await this.discovery.findAgentByPeerId(peerId);
-          return agent?.relayAddress ?? null;
+        // Codex review feedback on PR #496 round 5: the previous
+        // revision dropped `opts.signal` entirely, leaving the
+        // resolver's documented cancellation guarantee unhonored at
+        // the only production AgentDirectoryLookup. DiscoveryClient
+        // itself doesn't (yet) accept an AbortSignal, so we honor
+        // the contract at the adapter boundary instead: if the
+        // signal aborts the adapter resolves to `null` immediately,
+        // unblocking the resolver and the outer caller. The
+        // underlying SPARQL fetch then completes in the background
+        // and its result is discarded — a small leak in the abort
+        // path, acceptable given:
+        //   (a) it's bounded by the discovery client's own internal
+        //       timeout
+        //   (b) RFC 04 Phase 2 replaces this fallback path entirely
+        //   (c) the alternative (refactoring DiscoveryClient end-to-
+        //       end signal threading) is out of scope for this PR
+        // The follow-up to plumb signals into DiscoveryClient is
+        // tracked separately.
+        findRelayForPeer: async (peerId, opts) => {
+          if (opts?.signal?.aborted) return null;
+          const lookup = this.discovery.findAgentByPeerId(peerId)
+            .then((agent) => agent?.relayAddress ?? null);
+          if (!opts?.signal) return lookup;
+          return Promise.race<string | null>([
+            lookup,
+            new Promise<null>((resolve) => {
+              opts.signal!.addEventListener(
+                'abort',
+                () => resolve(null),
+                { once: true },
+              );
+            }),
+          ]);
         },
       },
       // Bootstrap is a libp2p-startup concern (`bootstrap({ list })` in

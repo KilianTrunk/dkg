@@ -4109,6 +4109,31 @@ export class DKGAgent {
       await this.node.libp2p.dial(peerId, { signal });
       this.log.info(ctx, `Connected to ${peerIdStr}`);
     } catch (err: any) {
+      // Codex PR #499 round 5 (dkg-agent.ts:4096): the shared signal
+      // covers BOTH resolution and dial. If most of the budget went
+      // into resolve() and dial() then aborts on the same signal, we
+      // must classify that as CONNECT_TIMEOUT (504, retriable), not
+      // DIAL_FAILED (502, transport failure). Without this split, a
+      // peer that resolves right before the deadline gets misclassified
+      // and the UI's retry logic stops working.
+      //
+      // signal.aborted is the definitive check — it's our signal, so
+      // an abort means the timeout fired. Also accept AbortError-named
+      // errors (libp2p's transport layer surfaces those via DOMException
+      // when the dial is cancelled).
+      const isAbort =
+        signal.aborted ||
+        err?.name === 'AbortError' ||
+        err?.code === 'ABORT_ERR';
+      if (isAbort) {
+        const error = new Error(
+          `CONNECT_TIMEOUT: dial to ${peerIdStr} aborted after ` +
+            `${Date.now() - startedAt}ms of ${timeoutMs}ms budget ` +
+            `(resolution succeeded, dial timed out)`,
+        );
+        (error as any).code = 'CONNECT_TIMEOUT';
+        throw error;
+      }
       const error = new Error(`DIAL_FAILED: ${err?.message ?? String(err)}`);
       (error as any).code = 'DIAL_FAILED';
       throw error;

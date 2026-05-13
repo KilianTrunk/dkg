@@ -2191,18 +2191,28 @@ else
     CONN_NOTFOUND_BODY CONN_NOTFOUND_CODE
   GHOST_ELAPSED=$(( $(date +%s) - GHOST_START ))
   CONN_NF_ERR=$(json_get "$CONN_NOTFOUND_BODY" code)
-  # Either 404 PEER_NOT_FOUND (resolver completed cleanly within budget,
-  # genuine miss) OR 504 CONNECT_TIMEOUT (signal aborted before resolver
-  # finished, transient timeout) is correct. The DISTINCTION between
-  # them is the new behavior added in RFC 07 PR #499 round 5; both
-  # outcomes prove the error mapping is wired. Anything else is a
-  # regression in the route's switch.
-  if [[ "$CONN_NOTFOUND_CODE" == "404" && "$CONN_NF_ERR" == "PEER_NOT_FOUND" ]]; then
-    ok "Ghost peerId → HTTP 404 + code=PEER_NOT_FOUND in ${GHOST_ELAPSED}s (resolver completed cleanly)"
-  elif [[ "$CONN_NOTFOUND_CODE" == "504" && "$CONN_NF_ERR" == "CONNECT_TIMEOUT" ]]; then
-    ok "Ghost peerId → HTTP 504 + code=CONNECT_TIMEOUT in ${GHOST_ELAPSED}s (RFC 07 PR #499 round 5 transient-vs-terminal split)"
+  # Codex PR #499 round 5: pin to one deterministic outcome rather
+  # than accepting either 404 or 504 (which would silently pass a
+  # regression that turned every clean miss into a timeout).
+  #
+  # On this 6-node devnet, the resolver's DHT findPeer step keeps
+  # querying for the ghost peer until the per-step signal fires at
+  # ~timeoutMs (the connectToPeerId default). signal.aborted=true
+  # at that point → CONNECT_TIMEOUT (504). This is the deterministic
+  # outcome here.
+  #
+  # The 404 PEER_NOT_FOUND branch (resolver completes cleanly, no
+  # addrs found, signal NOT aborted) requires either a much smaller
+  # DHT (so findPeer exhausts before the timeout) or a sub-second
+  # timeoutMs. /api/connect doesn't accept timeoutMs from the body
+  # today, and devnet's DHT topology is what it is, so the 404 mapping
+  # is covered by the unit test instead:
+  #   peer-resolver.test.ts → "returns empty array when nothing resolves"
+  #   protocol-router-resolver.test.ts → resolver miss path
+  if [[ "$CONN_NOTFOUND_CODE" == "504" && "$CONN_NF_ERR" == "CONNECT_TIMEOUT" ]]; then
+    ok "Ghost peerId → HTTP 504 + code=CONNECT_TIMEOUT in ${GHOST_ELAPSED}s (RFC 07 PR #499 round 5: transient-vs-terminal split; 504 is the deterministic devnet outcome)"
   else
-    fail "Ghost peerId returned HTTP $CONN_NOTFOUND_CODE code=$CONN_NF_ERR after ${GHOST_ELAPSED}s — neither 404 PEER_NOT_FOUND nor 504 CONNECT_TIMEOUT (RFC 07 route mapping regression?): ${CONN_NOTFOUND_BODY:0:200}"
+    fail "Ghost peerId returned HTTP $CONN_NOTFOUND_CODE code=$CONN_NF_ERR after ${GHOST_ELAPSED}s — expected 504/CONNECT_TIMEOUT on this 6-node devnet (regression in resolver timeout → /api/connect mapping?): ${CONN_NOTFOUND_BODY:0:200}"
   fi
 fi
 
@@ -2490,27 +2500,37 @@ else
       sleep 5
 
       echo "--- 30e: post-restart /api/connect {peerId: Node3} from freshly-restarted Node1 ---"
-      post_t0=$(date +%s)
-      http_post_capture "http://127.0.0.1:9201/api/connect" \
-        "{\"peerId\":\"$N3_PEER_BEFORE\"}" \
-        POST_BODY POST_CODE
-      post_elapsed=$(( $(date +%s) - post_t0 ))
-      post_flag=$(json_get "$POST_BODY" connected)
+      # Codex PR #499 round 5 (devnet-test.sh:2502): downgrading
+      # CONNECT_TIMEOUT / PEER_NOT_FOUND to warn meant the test
+      # silently passed when post-restart connectivity was broken —
+      # defeating the purpose of the section. Strict mode: retry for
+      # a bounded window to absorb mDNS/DHT warmup, but FAIL hard if
+      # it never recovers. The retry budget is generous enough for a
+      # truly cold-restart on loopback (~30s).
+      RETRY_BUDGET_S="${RESTART_RETRY_BUDGET_S:-30}"
+      retry_t0=$(date +%s)
+      attempt=0
+      post_succeeded=0
+      while [[ $(( $(date +%s) - retry_t0 )) -lt "$RETRY_BUDGET_S" ]]; do
+        attempt=$((attempt + 1))
+        http_post_capture "http://127.0.0.1:9201/api/connect" \
+          "{\"peerId\":\"$N3_PEER_BEFORE\"}" \
+          POST_BODY POST_CODE
+        post_flag=$(json_get "$POST_BODY" connected)
+        if [[ "$POST_CODE" == "200" && "$post_flag" == "true" ]]; then
+          post_succeeded=1
+          break
+        fi
+        # 1s pause between retries — mDNS converges in <1s on loopback
+        # so this is plenty for the polling rate.
+        sleep 1
+      done
+      retry_elapsed=$(( $(date +%s) - retry_t0 ))
       post_err=$(json_get "$POST_BODY" code)
-      if [[ "$POST_CODE" == "200" && "$post_flag" == "true" ]]; then
-        ok "Post-restart dial Node3 from restarted Node1 → HTTP 200 connected=true in ${post_elapsed}s (resolver wiring intact across process restart)"
-      elif [[ "$POST_CODE" == "504" && "$post_err" == "CONNECT_TIMEOUT" ]]; then
-        # If mDNS hasn't reconverged yet AND DHT/agents-CG also doesn't
-        # respond in time, this is a legitimate transient timeout.
-        # Surface as warn, not fail — the unit test
-        # (peer-resolver.test.ts: "skips later steps once signal is
-        # aborted mid-resolve") covers the timeout semantics, and we
-        # have §30f below as a follow-up to verify mesh recovery.
-        warn "Post-restart dial returned HTTP 504 CONNECT_TIMEOUT in ${post_elapsed}s — resolver walked but did not find Node3 within the budget"
-      elif [[ "$POST_CODE" == "404" && "$post_err" == "PEER_NOT_FOUND" ]]; then
-        warn "Post-restart dial returned HTTP 404 PEER_NOT_FOUND in ${post_elapsed}s — resolver completed but found no addrs"
+      if [[ "$post_succeeded" == "1" ]]; then
+        ok "Post-restart dial Node3 from restarted Node1 → HTTP 200 connected=true after ${attempt} attempt(s) over ${retry_elapsed}s (resolver wiring intact across process restart)"
       else
-        fail "Post-restart dial returned HTTP $POST_CODE code=$post_err in ${post_elapsed}s: ${POST_BODY:0:200}"
+        fail "Post-restart dial Node3 NEVER succeeded — last attempt: HTTP $POST_CODE code=$post_err after ${retry_elapsed}s of retries (${attempt} attempts). Resolver wiring may be broken across process restart: ${POST_BODY:0:200}"
       fi
 
       echo "--- 30f: post-restart Node1 has rebuilt the mesh ---"

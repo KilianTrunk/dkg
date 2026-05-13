@@ -61,42 +61,45 @@
  * forms like `["dialProtocol"](...)` as easy bypasses. Round 1 added
  * those.
  *
- * Codex review feedback on PR #499 (round 2): the bracket-access
- * detector still missed forms with comments interleaved INSIDE the
- * property expression, e.g.
+ * Codex review feedback on PR #499 (round 4, branarakic): even after
+ * rounds 1-3 added optional-chaining, bracket access (with comments),
+ * and optional-call forms, the audit still only fires when
+ * `dialProtocol` is being CALLED. Aliasing patterns like
  *
- *     libp2p[ <slash-star>x<star-slash> "dialProtocol" ](...)
- *     libp2p[ "dialProtocol" <slash-star>x<star-slash> ](...)
+ *     const rawDial = libp2p.dialProtocol.bind(libp2p);
+ *     await rawDial(peerId, protocol);
  *
- * (literal block-comment delimiters intentionally written out so this
- * doc-comment parses cleanly). Both are valid JS, but the round-1
- * regex required only whitespace between `[` and the string literal.
- * Round 2 makes the bracket regex tolerate either whitespace OR
- * comments anywhere between `[`, the string, and `]`. Also fixed:
- * hits used to be deduplicated by line, so two `dialProtocol(` calls
- * on the same line counted as one — weakening the allowlist gate.
- * Now hits are deduplicated by source index, so each distinct call
- * site counts.
+ *     const { dialProtocol } = libp2p;
+ *     await dialProtocol(peerId, protocol);
  *
- * The detector recognises (concrete cases pinned in the test file):
+ * place the actual call site under a different identifier with no
+ * `dialProtocol(` token in sight, so CI stays green while the new
+ * path skips PeerResolver. Round 4 widens the detector to flag any
+ * PROPERTY ACCESS or DESTRUCTURING of `dialProtocol` outside the
+ * allowlist — concretely: any occurrence of the bare `dialProtocol`
+ * IDENTIFIER token in stripped text, plus the bracket-string forms
+ * (which the stripper blanks out at the identifier level).
  *
- *   foo.dialProtocol(...)         — member access
- *   foo?.dialProtocol(...)        — optional chaining
- *   foo['dialProtocol'](...)      — bracket access, single-quoted
- *   foo["dialProtocol"](...)      — bracket access, double-quoted
- *   foo[`dialProtocol`](...)      — bracket access, backtick-quoted
- *   foo?.['dialProtocol'](...)    — optional chaining + bracket
- *   foo[ <comment> "dialProtocol" ](...)
- *   foo[ "dialProtocol" <comment> ](...)
- *   foo[ <comment> "dialProtocol" <comment> ](...)
+ * The detector recognises (pinned in the test file):
  *
- * Strings inside the brackets aren't blanked because the `[…]` index
- * expression IS code, but the stripper does blank string CONTENTS,
- * which would cause `["dialProtocol"]` to be read as `[          ]`
- * after stripping. To detect bracket access we therefore scan the
- * ORIGINAL text for `["dialProtocol"]` (any quote style, with optional
- * inline comments) AFTER verifying the bracket's position isn't itself
- * inside a comment / string in the stripped text.
+ *   member call           foo.dialProtocol(...)
+ *   optional-chain call   foo?.dialProtocol(...)
+ *   optional-call         foo.dialProtocol?.(...)
+ *   bracket call          foo['dialProtocol'](...)   foo["dialProtocol"](...)
+ *                          foo[`dialProtocol`](...)
+ *   bracket+optional      foo?.["dialProtocol"](...)  foo["dialProtocol"]?.(...)
+ *   bracket+comment       foo[ <comment> "dialProtocol" <comment> ](...)
+ *   aliased via .bind     const fn = foo.dialProtocol.bind(foo); fn(...)
+ *   destructuring         const { dialProtocol } = foo
+ *   bare reference        const fn = foo.dialProtocol; fn(...)
+ *
+ * Strings inside the brackets aren't blanked at the bracket level
+ * because the `[…]` index expression IS code, but the stripper blanks
+ * string CONTENTS, which would cause the inner `dialProtocol` to be
+ * read as blanks after stripping. To detect bracket access we
+ * therefore scan the ORIGINAL text for `["dialProtocol"]` (any quote
+ * style, with optional inline comments) after verifying the bracket's
+ * position isn't itself inside a comment/string in the stripped text.
  */
 
 import { readFile, readdir } from 'node:fs/promises';
@@ -139,16 +142,30 @@ async function* walkSourceFiles(dir) {
   }
 }
 
-// Each entry pins the file path that's allowed to call dialProtocol(.
-// `expectedHits` is the number of distinct dialProtocol( call sites that
-// must appear; a future PR adding a second call to the same file will
-// fail CI even though one is justified.
+// Each entry pins the file path that's allowed to mention the
+// `dialProtocol` identifier. `expectedHits` is the number of distinct
+// occurrences (definitions + accesses) that must appear; a future PR
+// adding a second call/alias to the same file will fail CI even
+// though one is justified.
+//
+// Codex feedback PR #499 round 4: with the broader identifier-level
+// detection, definition sites count too. The allowlist now pins:
+//   - the `Network` interface declaration of the method (network.ts)
+//   - the `LibP2PNetwork` impl: definition + the actual libp2p call
+//   - `ProtocolRouter.send`: the resolver-consulting call
 const ALLOWLIST = new Map([
+  [
+    'packages/core/src/network/network.ts',
+    {
+      expectedHits: 1,
+      justification: 'Network interface declares dialProtocol() — the contract surface (RFC 07 §5)',
+    },
+  ],
   [
     'packages/core/src/network/libp2p-network.ts',
     {
-      expectedHits: 1,
-      justification: 'LibP2PNetwork is the dialProtocol gateway (RFC 07 §5.2)',
+      expectedHits: 2,
+      justification: 'LibP2PNetwork is the dialProtocol gateway (RFC 07 §5.2): method definition + the underlying libp2p call inside it',
     },
   ],
   [
@@ -160,14 +177,25 @@ const ALLOWLIST = new Map([
   ],
 ]);
 
-// Member access (Codex feedback PR #499 round 3 added the trailing
-// `?.\s*` to catch optional CALL forms — `foo.dialProtocol?.(...)`
-// and `foo?.dialProtocol?.(...)` — which both execute the same raw
-// dial path):
-//   .dialProtocol(            ?.dialProtocol(
-//   .dialProtocol?.(          ?.dialProtocol?.(
-// Stripped (comments/strings blanked) input is safe to scan with this.
-const MEMBER_ACCESS_RE = /(?:\?\.|\.)\s*dialProtocol\s*(?:\?\.\s*)?\(/g;
+// Codex feedback PR #499 round 4: detect ANY occurrence of the bare
+// `dialProtocol` identifier in stripped (comments/strings blanked)
+// text. Word boundaries protect against substrings of unrelated
+// identifiers like `dialProtocolFor` or `predialProtocol`. This single
+// pattern covers every CALL form (since the call site uses the
+// identifier) AND every aliasing/destructuring form (since the alias
+// site also uses the identifier).
+//
+// What it deliberately catches that the previous "must be followed by
+// `(`" pattern missed:
+//
+//   const rawDial = foo.dialProtocol.bind(foo);   // .bind alias
+//   const { dialProtocol } = foo;                  // destructuring
+//   const fn = foo.dialProtocol;                   // bare reference
+//
+// Bracket-string access (`foo["dialProtocol"]`) still needs
+// BRACKET_ACCESS_RE below — the stripper blanks the identifier inside
+// the string literal, so this pattern can't see it there.
+const IDENTIFIER_RE = /\bdialProtocol\b/g;
 
 // Bracket access (any quote style, with optional inline comments).
 // Examples handled (validated by audit-dial-protocol.test.mjs):
@@ -216,7 +244,7 @@ export function findHits(originalText) {
     hits.push({ line, index, snippet });
   };
 
-  for (const m of stripped.matchAll(MEMBER_ACCESS_RE)) {
+  for (const m of stripped.matchAll(IDENTIFIER_RE)) {
     recordHit(m.index);
   }
 

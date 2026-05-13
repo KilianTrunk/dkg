@@ -166,3 +166,49 @@ test('catches optional-call bracket with optional chain: foo?.["dialProtocol"]?.
   const hits = findHits('await libp2p?.["dialProtocol"]?.(pid, "/p/1");');
   assert.equal(hits.length, 1);
 });
+
+// Codex review feedback on PR #499 (round 4, branarakic):
+// the audit must also catch ALIASING/DESTRUCTURING patterns that
+// move the call site behind a different identifier, e.g.
+//   const fn = libp2p.dialProtocol.bind(libp2p); fn(...)
+//   const { dialProtocol } = libp2p; dialProtocol(...)
+// Both execute the same raw dial path while leaving no `dialProtocol(`
+// token at the actual call site for the immediate-invocation matcher.
+
+test('catches .bind aliasing: libp2p.dialProtocol.bind(libp2p)', () => {
+  const hits = findHits('const fn = libp2p.dialProtocol.bind(libp2p); await fn(pid, "/p/1");');
+  // 1 hit at the alias site (the only place the identifier appears).
+  assert.equal(hits.length, 1);
+});
+
+test('catches destructuring: const { dialProtocol } = libp2p', () => {
+  const hits = findHits('const { dialProtocol } = libp2p; await dialProtocol(pid, "/p/1");');
+  // 2 hits: the destructure site AND the call site (both use the identifier).
+  assert.equal(hits.length, 2);
+});
+
+test('catches function-arg destructuring: function f({ dialProtocol })', () => {
+  const hits = findHits('function f({ dialProtocol }) { return dialProtocol(pid); }');
+  assert.equal(hits.length, 2);
+});
+
+test('catches bare property reference: const fn = libp2p.dialProtocol', () => {
+  const hits = findHits('const fn = libp2p.dialProtocol;\nawait fn(pid);');
+  assert.equal(hits.length, 1);
+});
+
+test('still ignores DialProtocolOption (case-sensitive identifier)', () => {
+  // Substring of an unrelated camelCase identifier; word boundary protects it.
+  const hits = findHits('import type { DialProtocolOption } from "@libp2p/interface";');
+  assert.equal(hits.length, 0);
+});
+
+test('still ignores dialProtocolFor (substring of longer identifier)', () => {
+  const hits = findHits('const dialProtocolFor = (id) => id;');
+  assert.equal(hits.length, 0);
+});
+
+test('still ignores predialProtocol (substring at start)', () => {
+  const hits = findHits('const predialProtocol = () => {};');
+  assert.equal(hits.length, 0);
+});

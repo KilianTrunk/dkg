@@ -7275,6 +7275,27 @@ export class DKGAgent {
     const isCurated = opts.accessPolicy === LOCAL_ACCESS_CURATED
       || (opts.allowedAgents && opts.allowedAgents.length > 0)
       || (opts.allowedPeers && opts.allowedPeers.length > 0);
+    // pcaAccountId is a register-time-only knob (Codex PR #502
+    // round-3: `createContextGraph` no longer persists it). The field
+    // is intentionally NOT part of the public `createContextGraph`
+    // TypeScript signature — TS-first callers get a compile-time
+    // excess-property error if they try to set it (Codex round-7).
+    // The runtime check below still fires so untyped/JS callers (or
+    // typed callers using `as any`) get an immediate, actionable
+    // error instead of a confusing "EOA-curated when I asked for PCA"
+    // outcome at register time. Daemon callers can't hit this path —
+    // the HTTP route already strips the param before calling
+    // `createContextGraph`.
+    const optsRecord = opts as unknown as Record<string, unknown>;
+    if (optsRecord.publishAuthorityAccountId !== undefined) {
+      throw new Error(
+        '`publishAuthorityAccountId` is not supported on createContextGraph(). '
+        + 'PCA account ids are register-time-only — supply `publishAuthorityAccountId` '
+        + 'on registerContextGraph() instead. Background: createContextGraph no '
+        + 'longer persists PCA ids locally, so any value passed here would silently '
+        + 'be dropped before registration (Codex PR #502 round-3/round-6/round-7).',
+      );
+    }
 
     if (opts.private) {
       this.log.info(ctx, `Creating private context graph "${opts.id}" (local-only, no gossip)`);
@@ -7312,7 +7333,10 @@ export class DKGAgent {
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: `"${isCurated || opts.private ? 'private' : 'public'}"`, graph: defGraph },
     ];
 
-    // Store registration status and curator in _meta
+    // Store registration status and curator in _meta. We do NOT
+    // store any PCA account id here — that param is register-time-only
+    // and createContextGraph rejects it at the boundary (Codex PR
+    // #502 round-3 + round-6).
     quads.push(
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"unregistered"`, graph: cgMetaGraph },
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: curatorDid, graph: cgMetaGraph },
@@ -7611,6 +7635,7 @@ export class DKGAgent {
     accessPolicy?: number;
     publishPolicy?: number;
     callerAgentAddress?: string;
+    publishAuthorityAccountId?: bigint;
   }): Promise<{ onChainId: string; txHash?: string }> {
     const ctx = createOperationContext('system');
 
@@ -7749,6 +7774,69 @@ export class DKGAgent {
     const publishPolicy = opts?.publishPolicy ?? (resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED
       ? EVM_PUBLISH_CURATED
       : EVM_PUBLISH_OPEN);
+    // PCA account id is ONLY honored from the explicit option here.
+    // We deliberately do NOT fall back to a stored value (Codex PR
+    // #502 round-6): legacy CGs created under the old create-time
+    // persistence could have stale/bad ids that would silently replay
+    // on every register retry that omits the param. With explicit-only
+    // resolution, `undefined` unambiguously means "no PCA".
+    //
+    // The option type advertises `bigint`, but untyped / JS callers can
+    // pass `1` or `'1'` — comparing a non-bigint to `0n` would throw a
+    // raw `TypeError: Cannot mix BigInt and other types` instead of the
+    // actionable validation error this API is supposed to provide
+    // (Codex PR #502 round-8). Coerce safely before the `<= 0n` check.
+    const rawPublishAuthorityAccountId = opts?.publishAuthorityAccountId as unknown;
+    let requestedPublishAuthorityAccountId: bigint | undefined;
+    if (rawPublishAuthorityAccountId !== undefined && rawPublishAuthorityAccountId !== null) {
+      if (typeof rawPublishAuthorityAccountId === 'bigint') {
+        requestedPublishAuthorityAccountId = rawPublishAuthorityAccountId;
+      } else if (typeof rawPublishAuthorityAccountId === 'number') {
+        // Codex PR #502 round-9: reject unsafe JS integers. Anything
+        // above `Number.MAX_SAFE_INTEGER` (2^53-1) is silently
+        // rounded BEFORE `BigInt(...)` sees it, which would let an
+        // untyped caller register against an entirely different PCA
+        // account id than they intended. Mirrors
+        // `parseOptionalPcaAccountId` in the daemon route.
+        if (!Number.isSafeInteger(rawPublishAuthorityAccountId) || rawPublishAuthorityAccountId <= 0) {
+          throw new Error('PCA account id must be a positive integer.');
+        }
+        requestedPublishAuthorityAccountId = BigInt(rawPublishAuthorityAccountId);
+      } else if (typeof rawPublishAuthorityAccountId === 'string' && /^[1-9]\d*$/.test(rawPublishAuthorityAccountId)) {
+        // Decimal strings can carry arbitrary-precision values
+        // safely (BigInt preserves them), so no safe-integer ceiling
+        // applies — that's the recommended path for ids above 2^53.
+        requestedPublishAuthorityAccountId = BigInt(rawPublishAuthorityAccountId);
+      } else {
+        throw new Error('PCA account id must be a positive integer.');
+      }
+      if (requestedPublishAuthorityAccountId <= 0n) {
+        throw new Error('PCA account id must be a positive integer.');
+      }
+    }
+    const publishAuthorityAccountId = requestedPublishAuthorityAccountId;
+    // PCA account ids are only invalid when the publish policy is
+    // open (`publishPolicy === EVM_PUBLISH_OPEN`) — that combination
+    // is incoherent on-chain because `isAuthorizedPublisher`'s PCA
+    // branch never fires for open publish policy.
+    //
+    // We do NOT also reject `accessPolicy=0 (public/discoverable)`
+    // here: the on-chain `ContextGraphs.createContextGraph` contract
+    // explicitly supports `{ accessPolicy: 0, publishPolicy: 0,
+    // publishAuthorityAccountId: !=0 }` — a publicly-discoverable CG
+    // where only the PCA owner / authorized publishers can write.
+    // Rejecting that combo client-side blocks a valid registration
+    // mode (Codex PR #502 round-7).
+    if (publishAuthorityAccountId !== undefined && publishPolicy === EVM_PUBLISH_OPEN) {
+      throw new Error('PCA account id can only be used with curated publish policy.');
+    }
+    // NOTE: we intentionally defer persisting `requestedPublishAuthorityAccountId`
+    // until *after* on-chain registration succeeds (further down). If we
+    // wrote it here and the subsequent owner check / on-chain call failed
+    // with a bad PCA id, the bad id would stick in local CG metadata and
+    // every retry would replay the same failure (Codex review #502-1).
+    const isPcaCurated = publishPolicy === EVM_PUBLISH_CURATED
+      && publishAuthorityAccountId !== undefined;
 
     const participantsResult = await this.store.query(
       `SELECT ?identityId WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId } }`,
@@ -7806,30 +7894,113 @@ export class DKGAgent {
         `${MAX_CONTEXT_GRAPH_PARTICIPANT_AGENTS} addresses after merging local allowedAgents.`,
       );
     }
-    const publishAuthority = publishPolicy === EVM_PUBLISH_CURATED
-      ? await this.getChainPublishAuthorityAddress(id)
-      : undefined;
-    if (
-      publishPolicy === EVM_PUBLISH_CURATED
-      && publishAuthority
-      && ownerAddress.toLowerCase() !== publishAuthority.toLowerCase()
-    ) {
-      throw new Error(
-        `Context graph "${id}" cannot be registered as curated by local curator ${ownerAddress} ` +
-        `because the configured chain signer is ${publishAuthority}. Per-agent chain signers are not supported yet.`,
-      );
-    }
-    if (
-      publishPolicy === EVM_PUBLISH_CURATED
-      && !publishAuthority
-      && opts?.callerAgentAddress
-      && this.defaultAgentAddress
-      && opts.callerAgentAddress.toLowerCase() !== this.defaultAgentAddress.toLowerCase()
-    ) {
-      throw new Error(
-        `Context graph "${id}" cannot be registered as curated by non-default local curator ` +
-        `${opts.callerAgentAddress} without chain signer introspection. Per-agent chain signers are not supported yet.`,
-      );
+    let publishAuthority: string | undefined;
+    if (publishPolicy === EVM_PUBLISH_CURATED) {
+      if (isPcaCurated) {
+        if (typeof this.chain.getPublishingConvictionAccountOwner !== 'function') {
+          throw new Error('PCA curated context graph registration requires chain adapter PCA owner lookup support.');
+        }
+        // Translate KNOWN nonexistent-token reverts on the PCA NFT into
+        // a stable, caller-input-shaped error so the daemon route can
+        // map it cleanly to 404. Anything else (RPC outage, network
+        // glitch, adapter-internal failure) is rethrown with its
+        // original class/message so the daemon's catch surfaces it as a
+        // retriable 500/503 rather than a misleading 404 (Codex review
+        // #502-3 follow-up: don't blanket-translate every adapter
+        // failure as "does not exist").
+        try {
+          publishAuthority = ethers.getAddress(
+            await this.chain.getPublishingConvictionAccountOwner(publishAuthorityAccountId),
+          );
+        } catch (lookupErr: any) {
+          const lookupMsg = String(lookupErr?.message ?? lookupErr ?? '');
+          const errCode = String(lookupErr?.code ?? '');
+          // Patterns we recognise as "this PCA token doesn't exist":
+          //   - OZ ERC721 custom error (modern: `ERC721NonexistentToken`,
+          //     legacy: `ERC721: invalid token ID` / `nonexistent token`).
+          //   - The built-in `MockChainAdapter.getPublishingConvictionAccountOwner`
+          //     throws `Mock: PCA account <id> does not exist` (production
+          //     mock used by SDK callers). Recognized via the broader
+          //     `/PCA account \d+ does not exist/` pattern (Codex PR #502
+          //     round-6: this matcher used to recognize only the test
+          //     double's wording, so the built-in mock path bypassed
+          //     normalization).
+          //   - The agent-test test double's `No mock PCA owner for
+          //     account ...` parity throw.
+          //   - ethers v6 surfaces these as `BAD_DATA` / `CALL_EXCEPTION`
+          //     with the OZ error name in the message.
+          const isNonexistentToken =
+            /ERC721NonexistentToken/.test(lookupMsg)
+            || /invalid token ID/i.test(lookupMsg)
+            || /nonexistent token/i.test(lookupMsg)
+            || /PCA account \d+ does not exist/.test(lookupMsg)
+            || /No mock PCA owner for account/.test(lookupMsg)
+            || (errCode === 'CALL_EXCEPTION' && /ERC721/.test(lookupMsg));
+          if (isNonexistentToken) {
+            throw new Error(
+              `PCA account ${publishAuthorityAccountId} does not exist or cannot be looked up: ${lookupMsg}`,
+            );
+          }
+          throw lookupErr;
+        }
+      } else {
+        publishAuthority = await this.getChainPublishAuthorityAddress(id);
+      }
+      // Uniform strict check across EOA and PCA modes:
+      //  - EOA: publishAuthority is the chain signer; local curator
+      //    must equal the chain signer.
+      //  - PCA: publishAuthority is ownerOf(pcaAccountId); local curator
+      //    must equal the PCA owner. Registered agents are publish-time
+      //    delegates only — publish-time authorization lives on chain in
+      //    `ContextGraphs.isAuthorizedPublisher`.
+      if (publishAuthority && ownerAddress.toLowerCase() !== publishAuthority.toLowerCase()) {
+        const reason = isPcaCurated
+          ? `PCA account ${publishAuthorityAccountId} is owned by ${publishAuthority}; only the PCA owner can register, registered agents may only publish.`
+          : `the configured chain signer is ${publishAuthority}. Per-agent chain signers are not supported yet.`;
+        throw new Error(
+          `Context graph "${id}" cannot be registered as curated by local curator ${ownerAddress} because ${reason}`,
+        );
+      }
+      // PCA-only: the chain signer (= msg.sender for the registration
+      // tx) MUST equal the PCA owner. `ContextGraphs.createContextGraph`
+      // on-chain mints the governance NFT to msg.sender, so any
+      // divergence between the configured chain signer and the PCA
+      // owner would make the chain signer (not the advertised PCA owner)
+      // the actual on-chain context-graph owner — breaking later
+      // `onlyContextGraphOwner` operations (publish-policy/authority
+      // updates, etc.). Per Codex PR #502 round-4/5: keep "advertised
+      // curator == on-chain owner == chain signer == PCA owner" and
+      // FAIL CLOSED when the registration signer cannot be
+      // introspected — a custom adapter that exposes
+      // `getPublishingConvictionAccountOwner()` but not its tx signer
+      // would otherwise sneak past the invariant. Codex PR #502
+      // round-8: use the dedicated `getRegistrationTxSignerAddress`
+      // probe so future readers can't confuse it with a publish-time
+      // delegate principal.
+      if (isPcaCurated && publishAuthority) {
+        const chainSigner = await this.getRegistrationTxSignerAddress();
+        if (!chainSigner) {
+          throw new Error(
+            `Context graph "${id}" cannot be PCA-registered: the chain adapter does not expose its registration-tx signer, so the "chain signer == PCA owner" invariant cannot be verified. PCA mode requires a chain adapter that surfaces its signer (e.g. via \`signerAddress\` / \`getSignerAddress()\` / \`getOperationalPrivateKey()\`) so the on-chain governance NFT is guaranteed to mint to the advertised PCA owner.`,
+          );
+        }
+        if (chainSigner.toLowerCase() !== publishAuthority.toLowerCase()) {
+          throw new Error(
+            `Context graph "${id}" cannot be PCA-registered: chain signer ${chainSigner} differs from PCA owner ${publishAuthority}. The PCA owner must control the chain signer used to submit the registration tx; otherwise the on-chain governance NFT mints to ${chainSigner} rather than the advertised curator.`,
+          );
+        }
+      }
+      if (
+        !publishAuthority
+        && opts?.callerAgentAddress
+        && this.defaultAgentAddress
+        && opts.callerAgentAddress.toLowerCase() !== this.defaultAgentAddress.toLowerCase()
+      ) {
+        throw new Error(
+          `Context graph "${id}" cannot be registered as curated by non-default local curator ` +
+          `${opts.callerAgentAddress} without chain signer introspection. Per-agent chain signers are not supported yet.`,
+        );
+      }
     }
 
     const result = await this.registerContextGraphOnChain({
@@ -7838,6 +8009,7 @@ export class DKGAgent {
       accessPolicy: resolvedLocalAccessPolicy,
       publishPolicy,
       ...(publishAuthority ? { publishAuthority } : {}),
+      ...(isPcaCurated ? { publishAuthorityAccountId } : {}),
       participantAgents,
     });
     const onChainId = result.contextGraphId.toString();
@@ -7854,6 +8026,11 @@ export class DKGAgent {
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
       { subject: contextGraphUri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${onChainId}"`, graph: ontologyGraph },
     ]);
+    // We no longer persist `publishAuthorityAccountId` locally even on
+    // success (Codex PR #502 round-6 follow-through): with the
+    // stored-value fallback gone, nothing reads it. A CG can only
+    // register on-chain once anyway — re-reads of the stored id
+    // wouldn't be useful.
 
     // Update in-memory subscription record and ensure we're subscribed
     const sub = this.subscribedContextGraphs.get(id);
@@ -10881,6 +11058,73 @@ export class DKGAgent {
       && ownerAddress.toLowerCase() === this.defaultAgentAddress.toLowerCase();
   }
 
+  /**
+   * Address that will SIGN on-chain CG-state-changing txs (the wallet
+   * the adapter binds to `contracts.contextGraphs` and invokes
+   * `createContextGraph`/`updatePublishPolicy`/etc with).
+   *
+   * Codex PR #502 round-8/round-9: this MUST be the actual tx signer,
+   * NOT the publishing principal. We deliberately skip:
+   *   - `config.publisherAddress` — the configured KA publisher
+   *     address, which can be a publishing delegate that does NOT
+   *     sign chain txs.
+   *   - `getAuthorizedPublisherAddress(contextGraphId)` — per-CG
+   *     publish-time delegate registered on chain.
+   *   - The generic `signMessage` probe — returns the adapter's
+   *     signing principal for arbitrary messages, not its tx-signing
+   *     wallet specifically.
+   *
+   * We only probe signer-specific adapter surfaces:
+   *   1. `getSignerAddress()` (modern method — used by the EVM
+   *      adapter).
+   *   2. `getSignerAddresses()` (multi-signer pool; we take the
+   *      first valid address).
+   *   3. `signerAddress` property (mock adapter and parity tests).
+   *   4. `getOperationalPrivateKey()` (legacy adapters).
+   *
+   * Returning `undefined` triggers the round-5 "fail closed" branch
+   * in `registerContextGraph`: PCA registration is rejected because
+   * the invariant cannot be verified.
+   */
+  private async getRegistrationTxSignerAddress(): Promise<string | undefined> {
+    const chain = this.chain;
+
+    const signerAddressGetter = (chain as unknown as { getSignerAddress?: () => unknown }).getSignerAddress;
+    if (typeof signerAddressGetter === 'function') {
+      try {
+        const address = normalizeAdapterPublisherAddress(await Promise.resolve(signerAddressGetter.call(chain)));
+        if (address) return address;
+      } catch {
+        // Best-effort probe; fall through to broader signer surfaces.
+      }
+    }
+
+    const signerAddressesGetter = (chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
+    if (typeof signerAddressesGetter === 'function') {
+      try {
+        const advertised = await Promise.resolve(signerAddressesGetter.call(chain));
+        if (Array.isArray(advertised)) {
+          for (const value of advertised) {
+            const address = normalizeAdapterPublisherAddress(value);
+            if (address) return address;
+          }
+        }
+      } catch {
+        // Best-effort probe.
+      }
+    }
+
+    const signerAddress = normalizeAdapterPublisherAddress(
+      (chain as unknown as { signerAddress?: unknown }).signerAddress,
+    );
+    if (signerAddress) return signerAddress;
+
+    const adapterOperationalAddress = adapterOperationalPrivateKeyAddress(chain);
+    if (adapterOperationalAddress) return adapterOperationalAddress;
+
+    return undefined;
+  }
+
   private async getChainPublishAuthorityAddress(contextGraphId?: string): Promise<string | undefined> {
     const configuredPublisherAddress = normalizeAdapterPublisherAddress(this.config.publisherAddress);
     if (configuredPublisherAddress) return configuredPublisherAddress;
@@ -10909,6 +11153,15 @@ export class DKGAgent {
       includeGenericSignMessageProbe: false,
     });
   }
+
+  // NOTE: `getContextGraphPublishAuthorityAccountId` and
+  // `setContextGraphPublishAuthorityAccountId` helpers were removed in
+  // Codex PR #502 round-6. With `registerContextGraph` no longer
+  // falling back to stored values and `createContextGraph` no longer
+  // persisting them, nothing on this code path reads or writes the
+  // `DKG_PUBLISH_AUTHORITY_ACCOUNT_ID` triple anymore — pcaAccountId
+  // lives strictly in the explicit `publishAuthorityAccountId` opt on
+  // `registerContextGraph`.
 
   /**
    * Return true when `senderPeerId` is currently acting as the curator

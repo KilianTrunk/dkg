@@ -85,7 +85,7 @@ describe('import artifact daemon routes', () => {
       } catch (err) {
         res.statusCode = 500;
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        res.end(JSON.stringify({ error: 'Unhandled test route error' }));
       }
     });
     await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
@@ -279,6 +279,66 @@ describe('import artifact daemon routes', () => {
       contentType: 'text/markdown',
       bytes: Buffer.byteLength('# Imported\n\nHello DKG.\n'),
       markdown: '# Imported\n\nHello DKG.\n',
+    });
+  });
+
+  it('accepts legacy ownerless attachment assertion URIs by resolving them to the requesting agent assertion', async () => {
+    const entry = await fileStore.put(Buffer.from('# Legacy Imported\n'), 'text/markdown');
+    const contextGraphId = 'cg-import-artifact-legacy-uri';
+    const assertionName = 'legacy-md';
+    const legacyAssertionUri = `did:dkg:context-graph:${contextGraphId}/assertion/${assertionName}`;
+    const canonicalAssertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:test', assertionName);
+    const markdownForm = `urn:dkg:file:${entry.keccak256}`;
+    const { agent, writes } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri: canonicalAssertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm,
+    });
+    await startRoutes({ agent });
+
+    const resolved = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri: legacyAssertionUri,
+      assertionName,
+      fileHash: entry.keccak256,
+    });
+    expect(resolved.status).toBe(200);
+    expect(resolved.body.artifact).toMatchObject({
+      contextGraphId,
+      assertionUri: canonicalAssertionUri,
+      assertionAgentAddress: 'did:dkg:agent:test',
+      assertionName,
+      markdownHash: entry.keccak256,
+    });
+
+    const read = await post('/api/assertion/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri: legacyAssertionUri,
+    });
+    expect(read.status).toBe(200);
+    expect(read.body.markdown).toBe('# Legacy Imported\n');
+
+    const enriched = await post('/api/assertion/semantic-enrichment/write', {
+      contextGraphId,
+      assertionUri: legacyAssertionUri,
+      semanticQuads: [
+        { subject: 'urn:doc:legacy', predicate: 'http://schema.org/about', object: 'Legacy topic' },
+      ],
+    });
+    expect(enriched.status).toBe(200);
+    expect(enriched.body).toMatchObject({
+      sourceAssertionUri: canonicalAssertionUri,
+      assertionUri: canonicalAssertionUri,
+      semanticTripleCount: 1,
+    });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({
+      contextGraphId,
+      name: assertionName,
+      agentAddress: 'did:dkg:agent:test',
     });
   });
 
@@ -591,7 +651,7 @@ describe('import artifact daemon routes', () => {
     });
 
     expect(result.status).toBe(500);
-    expect(result.body.error).toContain('simulated semantic write failure');
+    expect(result.body.error).toBe('Unhandled test route error');
     expect(created).toEqual([]);
     expect(writes).toHaveLength(0);
     expect(discards).toEqual([]);

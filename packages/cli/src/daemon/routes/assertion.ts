@@ -403,7 +403,8 @@ function validateContentHash(hash: string): boolean {
 function parseImportedAssertionUri(
   assertionUri: string,
   contextGraphId: string,
-): { assertionAgentAddress: string; assertionName: string; subGraphName?: string } | null {
+  legacyAssertionAgentAddress?: string,
+): { assertionAgentAddress: string; assertionName: string; subGraphName?: string; legacy?: boolean } | null {
   const prefix = `did:dkg:context-graph:${contextGraphId}/`;
   if (!assertionUri.startsWith(prefix)) return null;
   const tail = assertionUri.slice(prefix.length);
@@ -421,6 +422,14 @@ function parseImportedAssertionUri(
   }
 
   const slash = assertionTail.indexOf('/');
+  if (slash === -1 && legacyAssertionAgentAddress && assertionTail) {
+    return {
+      assertionAgentAddress: legacyAssertionAgentAddress,
+      assertionName: assertionTail,
+      ...(subGraphName ? { subGraphName } : {}),
+      legacy: true,
+    };
+  }
   if (slash <= 0 || slash === assertionTail.length - 1) return null;
   const assertionAgentAddress = assertionTail.slice(0, slash);
   const assertionName = assertionTail.slice(slash + 1);
@@ -698,8 +707,12 @@ async function resolveImportedArtifact(
     throw new ImportArtifactRouteError(400, 'Invalid assertionUri');
   }
 
-  const assertionUri = rawAssertionUri;
-  const parsedAssertion = parseImportedAssertionUri(assertionUri, contextGraphId);
+  const inputAssertionUri = rawAssertionUri;
+  const parsedAssertion = parseImportedAssertionUri(
+    inputAssertionUri,
+    contextGraphId,
+    ownerGuard?.requestAgentAddress,
+  );
   if (!parsedAssertion) {
     throw new ImportArtifactRouteError(400, 'assertionUri is not an assertion in the supplied contextGraphId');
   }
@@ -713,9 +726,10 @@ async function resolveImportedArtifact(
     parsedAssertion.assertionName,
     parsedAssertion.subGraphName,
   );
-  if (reconstructedAssertionUri !== assertionUri) {
+  if (reconstructedAssertionUri !== inputAssertionUri && !parsedAssertion.legacy) {
     throw new ImportArtifactRouteError(400, 'assertionUri is not in canonical assertion URI form');
   }
+  const assertionUri = reconstructedAssertionUri;
   if (ownerGuard) {
     assertImportedArtifactOwnerAddress(
       parsedAssertion.assertionAgentAddress,

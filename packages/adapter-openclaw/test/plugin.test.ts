@@ -692,6 +692,10 @@ describe('DkgNodePlugin', () => {
     expect(byName.get('dkg_import_artifact_resolve')!.description).toMatch(/Optional validation\/debug helper/);
     expect(byName.get('dkg_semantic_enrichment_write')!.description).toMatch(/Append model-derived semantic triples/);
     expect(byName.get('dkg_semantic_enrichment_write')!.description).not.toMatch(/separate Working Memory assertion/);
+    expect(byName.get('dkg_import_artifact_read_markdown')!.parameters.properties.max_bytes).toMatchObject({
+      type: 'integer',
+    });
+    expect(byName.get('dkg_import_artifact_read_markdown')!.parameters.properties.max_bytes.description).toMatch(/positive integer/);
     expectRequired('dkg_assertion_history', ['context_graph_id', 'name']);
     expectRequired('dkg_sub_graph_create', ['context_graph_id', 'sub_graph_name']);
     expectRequired('dkg_sub_graph_list', ['context_graph_id']);
@@ -851,6 +855,26 @@ describe('DkgNodePlugin', () => {
         assertionUri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
         maxBytes: 4096,
       });
+    });
+
+    it('dkg_import_artifact_read_markdown coerces quoted max_bytes integers and rejects fractions', async () => {
+      const { fetchMock, byName } = setupPluginWithFetch({ markdown: '# Doc' });
+      await byName.get('dkg_import_artifact_read_markdown')!.execute('tc', {
+        context_graph_id: 'ctx',
+        assertion_uri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
+        max_bytes: '4096',
+      });
+      expect(JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string)).toMatchObject({
+        maxBytes: 4096,
+      });
+
+      const invalid = await byName.get('dkg_import_artifact_read_markdown')!.execute('tc', {
+        context_graph_id: 'ctx',
+        assertion_uri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
+        max_bytes: 1.5,
+      });
+      expect(invalid.details?.error).toMatch(/positive integer/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it('dkg_semantic_enrichment_write normalizes plain semantic objects without promotion flags', async () => {

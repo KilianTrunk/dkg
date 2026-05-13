@@ -3075,7 +3075,7 @@ export class DkgNodePlugin {
             assertion_name: { type: 'string', description: 'Optional source assertion name to cross-check against assertion_uri.' },
             file_hash: { type: 'string', description: 'Optional source file hash to verify against deterministic metadata.' },
             sub_graph_name: { type: 'string', description: 'Optional sub-graph for the imported assertion.' },
-            max_bytes: { type: 'number', description: 'Optional byte cap; daemon maximum is 5 MiB.' },
+            max_bytes: { type: 'integer', description: 'Optional positive integer byte cap; daemon maximum is 5 MiB.' },
           },
           required: ['context_graph_id', 'assertion_uri'],
         },
@@ -4320,7 +4320,16 @@ export class DkgNodePlugin {
       const assertionUri = String(args.assertion_uri ?? args.source_assertion_uri ?? '').trim() || undefined;
       const assertionName = String(args.assertion_name ?? '').trim() || undefined;
       if (!assertionUri) return this.error('"assertion_uri" is required.');
-      const maxBytes = typeof args.max_bytes === 'number' ? args.max_bytes : undefined;
+      let maxBytes: number | undefined;
+      if (args.max_bytes !== undefined) {
+        const rawMaxBytes = typeof args.max_bytes === 'string' && args.max_bytes.trim()
+          ? Number(args.max_bytes.trim())
+          : args.max_bytes;
+        if (typeof rawMaxBytes !== 'number' || !Number.isInteger(rawMaxBytes) || rawMaxBytes <= 0) {
+          return this.error('"max_bytes" must be a positive integer.');
+        }
+        maxBytes = rawMaxBytes;
+      }
       const result = await this.client.readImportArtifactMarkdown({
         contextGraphId,
         assertionUri,

@@ -48,3 +48,47 @@ test('does not match unrelated method names', () => {
   const hits = findHits(text);
   assert.equal(hits.length, 0);
 });
+
+// Codex review feedback on PR #499: catch optional chaining and
+// bracket-access bypasses.
+
+test('catches optional chaining: foo?.dialProtocol(', () => {
+  const hits = findHits('await libp2p?.dialProtocol(pid, "/p/1");');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].line, 1);
+});
+
+test('catches bracket access: foo["dialProtocol"](', () => {
+  const hits = findHits('await libp2p["dialProtocol"](pid, "/p/1");');
+  assert.equal(hits.length, 1);
+});
+
+test('catches bracket access: foo[\'dialProtocol\'](', () => {
+  const hits = findHits("await libp2p['dialProtocol'](pid, '/p/1');");
+  assert.equal(hits.length, 1);
+});
+
+test('catches bracket access with backticks: foo[`dialProtocol`](', () => {
+  const hits = findHits('await libp2p[`dialProtocol`](pid, "/p/1");');
+  assert.equal(hits.length, 1);
+});
+
+test('catches optional bracket access: foo?.["dialProtocol"](', () => {
+  const hits = findHits('await libp2p?.["dialProtocol"](pid, "/p/1");');
+  assert.equal(hits.length, 1);
+});
+
+test('ignores ["dialProtocol"] inside a comment', () => {
+  const hits = findHits('// libp2p["dialProtocol"](pid, "/p/1");');
+  assert.equal(hits.length, 0);
+});
+
+test('ignores ["dialProtocol"] inside a string', () => {
+  const hits = findHits('const s = `look at libp2p["dialProtocol"](x)`;');
+  assert.equal(hits.length, 0);
+});
+
+test('ignores [\'foo\'] when value is not dialProtocol', () => {
+  const hits = findHits('await libp2p["dialMultiselectProtocol"](pid);');
+  assert.equal(hits.length, 0);
+});

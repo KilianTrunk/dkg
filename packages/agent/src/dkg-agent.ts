@@ -4053,9 +4053,19 @@ export class DKGAgent {
       return;
     }
 
+    // Codex review feedback on PR #499: a single AbortSignal bounds the
+    // entire connect (resolution + dial). Previously `timeoutMs` was
+    // passed as a per-step budget to the resolver AND reused for the
+    // final dial, so a slow DHT walk plus a slow dial could exceed the
+    // caller's deadline by a wide margin. Using one signal threads the
+    // remaining budget through both phases.
+    const startedAt = Date.now();
+    const signal = AbortSignal.timeout(timeoutMs);
+
     this.log.info(ctx, `Resolving ${peerIdStr} via PeerResolver...`);
     const addrs = await this.peerResolver.resolve(peerIdStr, {
-      perStepTimeoutMs: timeoutMs,
+      signal,
+      perStepTimeoutMs: Math.max(0, timeoutMs - (Date.now() - startedAt)),
     });
     if (addrs.length === 0) {
       const error = new Error(
@@ -4066,10 +4076,11 @@ export class DKGAgent {
     }
     this.log.info(ctx, `Resolved ${peerIdStr} → ${addrs.length} addr(s); dialling...`);
 
-    // peerStore is already primed by the resolver. dial(peerId) finds the
-    // addresses there and goes.
+    // peerStore is already primed by the resolver. dial(peerId) finds
+    // the addresses there and goes — same AbortSignal so the overall
+    // budget is honoured end-to-end.
     try {
-      await this.node.libp2p.dial(peerId, { signal: AbortSignal.timeout(timeoutMs) });
+      await this.node.libp2p.dial(peerId, { signal });
       this.log.info(ctx, `Connected to ${peerIdStr}`);
     } catch (err: any) {
       const error = new Error(`DIAL_FAILED: ${err?.message ?? String(err)}`);

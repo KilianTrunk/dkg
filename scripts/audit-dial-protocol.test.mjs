@@ -92,3 +92,52 @@ test('ignores [\'foo\'] when value is not dialProtocol', () => {
   const hits = findHits('await libp2p["dialMultiselectProtocol"](pid);');
   assert.equal(hits.length, 0);
 });
+
+// Codex review feedback on PR #499 (round 2): bracket access with
+// inline comments must still be caught.
+
+test('catches bracket access with comment between [ and string', () => {
+  const hits = findHits('await libp2p[/*x*/"dialProtocol"](pid, "/p/1");');
+  assert.equal(hits.length, 1);
+});
+
+test('catches bracket access with comment between string and ]', () => {
+  const hits = findHits('await libp2p["dialProtocol"/*x*/](pid, "/p/1");');
+  assert.equal(hits.length, 1);
+});
+
+test('catches bracket access with comments on both sides', () => {
+  const hits = findHits(
+    'await libp2p[ /*x*/ "dialProtocol" /*y*/ ](pid, "/p/1");',
+  );
+  assert.equal(hits.length, 1);
+});
+
+test('catches bracket access with line comment + newline inside', () => {
+  const hits = findHits(
+    'await libp2p[ // pick the call\n  "dialProtocol"\n](pid, "/p/1");',
+  );
+  assert.equal(hits.length, 1);
+});
+
+test('still ignores bracket form inside a block comment', () => {
+  const hits = findHits('/* libp2p[/*x*/"dialProtocol"](pid, "/p/1"); */');
+  assert.equal(hits.length, 0);
+});
+
+// Codex review feedback on PR #499 (round 2): two distinct dialProtocol(
+// calls on the same line must count as two hits — otherwise the
+// expectedHits allowlist can be silently doubled.
+
+test('counts two distinct calls on the same line as two hits', () => {
+  const hits = findHits('await libp2p.dialProtocol(a); await libp2p.dialProtocol(b);');
+  assert.equal(hits.length, 2);
+  assert.equal(hits[0].line, 1);
+  assert.equal(hits[1].line, 1);
+  assert.notEqual(hits[0].index, hits[1].index);
+});
+
+test('counts member + bracket on the same line as two hits', () => {
+  const hits = findHits('await libp2p.dialProtocol(a); await libp2p["dialProtocol"](b);');
+  assert.equal(hits.length, 2);
+});

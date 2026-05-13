@@ -56,24 +56,47 @@
  *   - Split invocations like `libp2p\n.dialProtocol(` are caught (the
  *     stripper preserves whitespace/newlines, so the regex sees them).
  *
- * Codex review feedback on PR #499: the original regex only caught
- * `.dialProtocol(`, leaving `?.dialProtocol(` and bracket-access forms
- * like `["dialProtocol"](...)` as easy bypasses. The detector now
- * recognises:
+ * Codex review feedback on PR #499 (round 1): the original regex only
+ * caught `.dialProtocol(`, leaving `?.dialProtocol(` and bracket-access
+ * forms like `["dialProtocol"](...)` as easy bypasses. Round 1 added
+ * those.
  *
- *   foo.dialProtocol(...)       // member access
- *   foo?.dialProtocol(...)      // optional chaining
- *   foo['dialProtocol'](...)    // bracket access, single-quoted
- *   foo["dialProtocol"](...)    // bracket access, double-quoted
- *   foo[`dialProtocol`](...)    // bracket access, backtick-quoted
- *   foo?.['dialProtocol'](...)  // optional chaining + bracket
+ * Codex review feedback on PR #499 (round 2): the bracket-access
+ * detector still missed forms with comments interleaved INSIDE the
+ * property expression, e.g.
+ *
+ *     libp2p[ <slash-star>x<star-slash> "dialProtocol" ](...)
+ *     libp2p[ "dialProtocol" <slash-star>x<star-slash> ](...)
+ *
+ * (literal block-comment delimiters intentionally written out so this
+ * doc-comment parses cleanly). Both are valid JS, but the round-1
+ * regex required only whitespace between `[` and the string literal.
+ * Round 2 makes the bracket regex tolerate either whitespace OR
+ * comments anywhere between `[`, the string, and `]`. Also fixed:
+ * hits used to be deduplicated by line, so two `dialProtocol(` calls
+ * on the same line counted as one — weakening the allowlist gate.
+ * Now hits are deduplicated by source index, so each distinct call
+ * site counts.
+ *
+ * The detector recognises (concrete cases pinned in the test file):
+ *
+ *   foo.dialProtocol(...)         — member access
+ *   foo?.dialProtocol(...)        — optional chaining
+ *   foo['dialProtocol'](...)      — bracket access, single-quoted
+ *   foo["dialProtocol"](...)      — bracket access, double-quoted
+ *   foo[`dialProtocol`](...)      — bracket access, backtick-quoted
+ *   foo?.['dialProtocol'](...)    — optional chaining + bracket
+ *   foo[ <comment> "dialProtocol" ](...)
+ *   foo[ "dialProtocol" <comment> ](...)
+ *   foo[ <comment> "dialProtocol" <comment> ](...)
  *
  * Strings inside the brackets aren't blanked because the `[…]` index
  * expression IS code, but the stripper does blank string CONTENTS,
  * which would cause `["dialProtocol"]` to be read as `[          ]`
  * after stripping. To detect bracket access we therefore scan the
- * ORIGINAL text for `["dialProtocol"]` (any quote style) AFTER
- * verifying the position isn't inside a comment in the stripped text.
+ * ORIGINAL text for `["dialProtocol"]` (any quote style, with optional
+ * inline comments) AFTER verifying the bracket's position isn't itself
+ * inside a comment / string in the stripped text.
  */
 
 import { readFile, readdir } from 'node:fs/promises';
@@ -141,41 +164,54 @@ const ALLOWLIST = new Map([
 // Stripped (comments/strings blanked) input is safe to scan with this.
 const MEMBER_ACCESS_RE = /(?:\?\.|\.)\s*dialProtocol\s*\(/g;
 
-// Bracket access: ["dialProtocol"](  /  ['dialProtocol'](  /  [`dialProtocol`](
-//                 ?.["dialProtocol"]( etc.
-// We scan the ORIGINAL text for this because the stripper blanks the
-// contents of the quoted property name. The stripper-derived `stripped`
-// text is consulted only to confirm the position isn't inside a comment
-// (commented-out brackets blank to spaces, so the original-text match
-// would still resolve to a "code" position in the stripped text only
-// if the brackets themselves survived stripping).
-const BRACKET_ACCESS_RE = /(?:\?\.\s*)?\[\s*(?:"dialProtocol"|'dialProtocol'|`dialProtocol`)\s*\]\s*\(/g;
+// Bracket access (any quote style, with optional inline comments).
+// Examples handled (validated by audit-dial-protocol.test.mjs):
+//   ["dialProtocol"](          ['dialProtocol'](          [`dialProtocol`](
+//   ?.["dialProtocol"](        ?.['dialProtocol'](
+//   [/*x*/"dialProtocol"](     ["dialProtocol"/*x*/](     [/*x*/"dialProtocol"/*y*/](
+//   [ //x\n "dialProtocol" ](
+//
+// Scanned against ORIGINAL text because the stripper blanks string
+// contents (so `"dialProtocol"` becomes `"            "` in stripped).
+// Position-survival check below filters matches inside comments / strings
+// at the file level (commented-out `[...]` blanks to spaces).
+const COMMENT_OR_WS = '(?:\\s|/\\*[\\s\\S]*?\\*/|//[^\\n]*\\n)*';
+const BRACKET_ACCESS_RE = new RegExp(
+  `(?:\\?\\.${COMMENT_OR_WS})?\\[${COMMENT_OR_WS}` +
+    `(?:"dialProtocol"|'dialProtocol'|\`dialProtocol\`)` +
+    `${COMMENT_OR_WS}\\]\\s*\\(`,
+  'g',
+);
 
 export function findHits(originalText) {
   const stripped = stripCommentsPreservingPositions(originalText);
   const hits = [];
-  const seenLines = new Set();
+
+  // Codex feedback PR #499 round 2: dedupe by source INDEX, not by line,
+  // so two distinct invocations on the same line count as two hits and
+  // can't slip past the allowlist's expectedHits gate.
+  const seenIndexes = new Set();
   const recordHit = (index) => {
-    const upToMatch = stripped.slice(0, index);
+    if (seenIndexes.has(index)) return;
+    seenIndexes.add(index);
+    const upToMatch = originalText.slice(0, index);
     const line = upToMatch.split('\n').length;
-    if (seenLines.has(line)) return;
-    seenLines.add(line);
     const lineStart = upToMatch.lastIndexOf('\n') + 1;
-    const lineEnd = stripped.indexOf('\n', index);
+    const lineEnd = originalText.indexOf('\n', index);
     const snippet = originalText
       .slice(lineStart, lineEnd === -1 ? originalText.length : lineEnd)
       .trim();
-    hits.push({ line, snippet });
+    hits.push({ line, index, snippet });
   };
 
   for (const m of stripped.matchAll(MEMBER_ACCESS_RE)) {
     recordHit(m.index);
   }
 
-  // Bracket access: scan original. To filter out hits inside comments
-  // and strings, require the opening `[` to survive in the stripped
-  // text (comments/strings blank to spaces, but the `[` of a real
-  // index expression is preserved as code).
+  // Bracket access scans original to see through string-content blanking.
+  // To exclude commented-out / in-string occurrences, require the opening
+  // `[` to survive in the stripped text (comments/strings blank to spaces,
+  // but a real index expression's `[` is preserved as code).
   for (const m of originalText.matchAll(BRACKET_ACCESS_RE)) {
     const openBracketIdx = originalText.indexOf('[', m.index);
     if (openBracketIdx === -1) continue;
@@ -183,7 +219,7 @@ export function findHits(originalText) {
     recordHit(openBracketIdx);
   }
 
-  hits.sort((a, b) => a.line - b.line);
+  hits.sort((a, b) => a.index - b.index);
   return hits;
 }
 

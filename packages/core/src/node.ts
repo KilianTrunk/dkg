@@ -190,9 +190,18 @@ export class DKGNode {
         // coordinated mesh-wide upgrade — most likely combined with a
         // gossipsub protocol-version bump so old/new nodes segregate
         // into separate meshes during the cutover instead of degrading
-        // a shared one. Tracked in
-        // `dkgv10-spec/production_mainnet/07_IN_PROCESS_PEER_RESOLVER.md`
-        // §5.4 (deferred wiring).
+        // a shared one.
+        //
+        // Cross-references:
+        //   - The function lives at
+        //     `packages/core/src/network/gossip-msg-id.ts` with the
+        //     full encoding test suite at
+        //     `packages/core/test/gossip-msg-id.test.ts`.
+        //   - The architectural rationale + cutover plan is documented
+        //     in the RFC 07 spec doc `07_IN_PROCESS_PEER_RESOLVER.md`
+        //     §5.4 + Phase 5, which lives in the sibling `dkgv10-spec`
+        //     repository (not in this repo). Re-stated in summary form
+        //     above so the wiring decision is reviewable in-place.
       }),
       dcutr: dcutr(),
     };

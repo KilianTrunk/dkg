@@ -268,12 +268,27 @@ changes to:
   produce;
 - `docs/security/` and `SECURITY.md`.
 
-Each path lists at least two named owners so no single account
-compromise can self-approve a malicious change to one of these
-trust-boundary files. Branch protection on `main` / `v10-rc` should
-have **Require review from Code Owners** enabled (admin task — see
-§A below); without that toggle, CODEOWNERS routes the review but
-does not enforce it.
+Each path lists at least two named owners. CODEOWNERS is **only a
+routing file** — it tells GitHub which accounts should be requested
+for review. None of the protection that the security review expects
+("no single-account self-approval") comes from this file by itself.
+The protection is configured server-side in repo Settings → Rules →
+Rulesets → `protect-main`, and the ruleset must carry every one of
+these settings together:
+
+| Ruleset toggle | What it does | Why it matters |
+|----------------|--------------|----------------|
+| Require a pull request before merging — **Required approvals: 2** | Two distinct accounts must approve. | A single compromised maintainer account cannot self-approve. |
+| Require a pull request before merging — **Require review from Code Owners** | At least one of those approvals must come from the path's CODEOWNERS. | Random reviewers cannot rubber-stamp `.github/workflows/*` or `pnpm-lock.yaml`. |
+| Require a pull request before merging — **Dismiss stale pull request approvals when new commits are pushed** | Any push after approval invalidates the approval. | An attacker who lands a push after approval has to be re-approved. |
+| Require a pull request before merging — **Require approval of the most recent reviewable push** | The reviewer cannot be the same account that made the most recent push. | Closes the "approve-then-push-then-merge" race. |
+| Require conversation resolution before merging | All review threads must be marked resolved. | Stops "ignore the security comment and merge anyway". |
+| Require signed commits | Every commit must be signed. | Forged commits in an attacker-stolen branch cannot enter `main`. |
+
+Without those toggles, CODEOWNERS routes the review request but
+**does not enforce** it. The runbook in §A walks through enabling
+each of them via `gh api`; the runbook should be treated as part of
+the hardening, not a separate task.
 
 ### 9. Continuous publish goes to `--tag dev`, never `--tag latest`
 
@@ -316,11 +331,24 @@ The release-preflight job now:
   with `push --tags` rights could tag an arbitrary commit they
   crafted locally — bypassing every branch-protection control — and
   the release workflow would happily build and publish it.
-- runs `git tag --verify` against the pushed tag and writes the
-  result to the job summary. This is advisory at the runner level
-  (maintainer keys do not ship on GitHub-hosted runners) — server-side
-  enforcement is via the branch ruleset "Require signed tags" toggle
-  configured under §A.
+- requires a **structurally signed annotated tag as a hard gate**.
+  The step inspects the tag object: if it's a lightweight ref (no
+  object body, can't carry a signature) OR an annotated tag whose
+  body does NOT contain a `-----BEGIN PGP SIGNATURE-----` or
+  `-----BEGIN SSH SIGNATURE-----` block, the workflow fails and no
+  release is produced. This closes the "advisory-only signed-tag
+  check" gap that the security review (round 2) flagged on `d4f2353`:
+  the workflow is no longer relying on the ruleset alone for the
+  signed-tag gate; the workflow refuses to proceed even if the
+  ruleset is misconfigured or temporarily disabled. See §D for the
+  maintainer-side setup (one-time `git config --global tag.gpgsign
+  true` plus a registered signing key).
+- runs `git tag --verify` as a SECOND layer (advisory). This is the
+  "who signed it" check, but GitHub-hosted runners don't ship
+  maintainer keys, so verify-status is surfaced in the job summary
+  rather than failing the build. The WHO gate lives in the branch
+  ruleset "Require signed tags" toggle on §A; the runtime structural
+  check above is the no-key-required runtime fallback.
 - generates a CycloneDX 1.5 JSON SBOM via `@cyclonedx/cdxgen` (run in
   this no-credentials job, not in the credential-bearing release job)
   and uploads it as an artifact for the release job to consume.
@@ -385,7 +413,7 @@ gh api -X PUT repos/OriginTrail/dkg/rulesets/14325863 -f - <<'JSON'
     {
       "type": "pull_request",
       "parameters": {
-        "required_approving_review_count": 1,
+        "required_approving_review_count": 2,
         "dismiss_stale_reviews_on_push": true,
         "require_code_owner_review": true,
         "require_last_push_approval": true,
@@ -416,6 +444,14 @@ JSON
 ```
 
 What each new bit does:
+- `required_approving_review_count: 2`: two distinct accounts must
+  approve. Without this, a single compromised maintainer account
+  approves their own PR and merges. **This is the toggle the
+  security review specifically called out** ("if the goal is no
+  single-account self-approval, branch protection should require 2
+  approvals"). Bumping from 1 → 2 here is the structural fix; the
+  CODEOWNERS file in this PR routes who gets asked, but only the
+  approval-count rule blocks self-approval.
 - `required_signatures`: blocks unsigned commits. The TeamPCP tag-poisoning
   attack used unsigned commits with cloned author/timestamp metadata.
   Enforcing signatures stops that exact technique.
@@ -454,7 +490,7 @@ gh api -X POST repos/OriginTrail/dkg/rulesets -f - <<'JSON'
     {
       "type": "pull_request",
       "parameters": {
-        "required_approving_review_count": 1,
+        "required_approving_review_count": 2,
         "dismiss_stale_reviews_on_push": true,
         "require_code_owner_review": true,
         "require_last_push_approval": true,
@@ -539,26 +575,57 @@ gh api repos/OriginTrail/dkg/environments/npm-publish \
 # — exactly the four properties verify-environment asserts.
 ```
 
-### D. Enable required signed commits on the personal level
+### D. Enable required signed commits AND signed tags on the personal level
 
-`required_signatures` in §A enforces signatures, but only blocks unsigned
-commits server-side. Each maintainer should also configure local git to
-sign commits by default. Either GPG or SSH-key signing works:
+`required_signatures` in §A enforces commit signatures server-side, but
+that toggle does not touch tags. **Tag signing is enforced at runtime by
+the `release.yml` workflow itself** (the "Require structurally signed
+tag" step, hard-fails on a lightweight tag OR an annotated tag with no
+PGP/SSH signature block in its body). That means:
+
+- Every maintainer who cuts a release **must** have local git
+  configured to sign tags, OR call `git tag -s` explicitly.
+- Cutting a release with `git tag vX.Y.Z` (lightweight) or
+  `git tag -a vX.Y.Z` (annotated but unsigned) will land in CI, the
+  release workflow will refuse to proceed, and no release page or
+  artifact will be produced. This is intentional — the security review
+  flagged the previous "advisory only" behaviour as inadequate.
+
+To configure local git for both commit + tag signing (one-time setup
+per maintainer machine; either GPG or SSH-key signing works):
 
 ```bash
-# SSH-based commit signing (simplest if you already have an SSH key in your
+# SSH-based signing (simplest if you already have an SSH key in your
 # GitHub account's "Signing keys" list):
 git config --global gpg.format ssh
 git config --global user.signingkey ~/.ssh/id_ed25519.pub
 git config --global commit.gpgsign true
-git config --global tag.gpgsign true
+git config --global tag.gpgsign true     # ← also signs tags
 ```
 
-Then verify on the next commit:
+Then verify on the next commit + tag:
 
 ```bash
-git log -1 --show-signature   # should print "Good signature"
+git log -1 --show-signature   # should print "Good signature" / "Good "git ..."
+git tag -s test-sig-only -m "verify signing works"
+git tag --verify test-sig-only            # exits 0 if the runner has your key,
+                                          # but the structural check in release.yml
+                                          # works WITHOUT keys — it only requires
+                                          # that a signature block is present in
+                                          # the tag body.
+git tag -d test-sig-only                  # clean up local test tag
 ```
+
+**Why structural check, not key-verify, at runtime.** GitHub-hosted
+runners ship no maintainer keys, so `git tag --verify` would always
+fail on a hard gate (false negative). The structural detection in
+`release.yml` ("does the annotated tag's body contain a PGP/SSH
+signature block?") works on any runner without any key material —
+it cannot tell us WHO signed it, but it reliably rejects unsigned and
+lightweight tags. The WHO check stays at the ruleset level (§A
+`required_signatures` covers the commit side; admin-side "Require
+signed tags" rule on the same `protect-main` ruleset covers the tag
+side end-to-end).
 
 ### E. Enable repo-level security features
 
@@ -585,22 +652,67 @@ more involved than the Tier 2 list above. Apply when there's bandwidth.
 ### F. Migrate `NPM_TOKEN` to npm Trusted Publishing (OIDC)
 
 npm supports OIDC-based publishing for github.com publishers, removing
-the long-lived `NPM_TOKEN` entirely. The flow is:
+the long-lived `NPM_TOKEN` entirely. The hardening in this PR is the
+**code-side precondition**: the `publish` job already runs with
+`permissions: { id-token: write }` and `npm publish --provenance`, so
+the GitHub-side surface is OIDC-ready right now. What remains is the
+npmjs.com registry-side switch and a single env-line removal — both
+admin actions, run in this exact sequence:
 
-1. On npmjs.com, for each `@origintrail-official/*` package, enable
-   **Trusted publishing** under Package settings, pointing at:
-   - Repository: `OriginTrail/dkg`
-   - Workflow: `.github/workflows/npm-continuous-publish.yml`
-   - Environment: `npm-publish`
-2. Replace the `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` env in
-   `npm-continuous-publish.yml` with `permissions: { id-token: write }`
-   on the job, and use `npm publish --provenance` (pnpm has an
-   equivalent flag).
-3. Revoke the existing `NPM_TOKEN` on npmjs.com once provenance
-   publishes are verified working.
+**Step 1 (npmjs.com — does not affect CI yet).** On npmjs.com, for
+each `@origintrail-official/*` package, enable **Trusted publishing**
+under Package settings → Publishing access → Add trusted publisher.
+Configure exactly:
+- Publisher: `GitHub Actions`
+- Repository owner: `OriginTrail`
+- Repository: `dkg`
+- Workflow filename: `npm-continuous-publish.yml`
+- Environment name: `npm-publish` (must match the `environment:` value
+  on the `publish` job — already configured)
 
-After this, no long-lived npm credential exists anywhere. A
-CanisterWorm-style worm cannot exfiltrate something we don't have.
+After this step the workflow keeps working unchanged — `NPM_TOKEN`
+auth still flows, OIDC is not yet required. Verifying both auth paths
+work side-by-side is intentional; do not skip this verification.
+
+**Step 2 (one-line PR — turns off `NPM_TOKEN` use).** Open a PR that
+removes exactly these three lines from the `Publish each tarball with
+provenance` step in `npm-continuous-publish.yml`:
+
+```yaml
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+With `id-token: write` already on the job and a trusted-publisher
+record on every package, `npm publish` will mint an OIDC token, send
+it to npm, and npm will validate the token's `repo:`, `workflow:`,
+and `environment:` claims against the trusted-publisher record before
+accepting the publish. **This is the only code change needed** — the
+rest of the workflow stays as-is.
+
+**Step 3 (npmjs.com — finalisation).** Once a publish via OIDC has
+succeeded end-to-end (verify by inspecting any published version's
+`dist.attestations.provenance.predicateType` — it will be the
+in-toto SLSA provenance statement):
+- npmjs.com → Account → Access Tokens → revoke `NPM_TOKEN`.
+- GitHub → repo Settings → Environments → `npm-publish` → Secrets →
+  delete `NPM_TOKEN`.
+- GitHub → repo Settings → Secrets and variables → Actions → confirm
+  `NPM_TOKEN` is also absent at the repo level.
+
+After this sequence, no long-lived npm credential exists anywhere
+in the system. A CanisterWorm-style worm cannot exfiltrate something
+that no longer exists. The OIDC token is minted per-run, scoped to
+the publish job's environment, and expires within the run window
+(typically minutes).
+
+**Rollback note.** Trusted Publishing has no real rollback — once
+the npm-side trusted-publisher record exists, an attacker who
+compromises the workflow file could in theory cause an OIDC-signed
+publish. The structural defence is the `npm-publish` environment
+gate (required reviewers + wait timer + branch policy = exactly
+`main`) that this PR already enforces — `id-token: write` only
+fires inside that gate.
 
 ### G. Turn on GitHub immutable releases on this repo
 

@@ -97,37 +97,81 @@ jobs:
           echo "::error title=Release tag rejected::Tag commit ${TAG_COMMIT} is not part of the linear history of any release branch (${RELEASE_BRANCHES}). Push the changes to a release branch via a reviewed PR before tagging."
           exit 1
 
-      - name: Verify tag is signed (best-effort, advisory)
-        # `git tag --verify` requires the signer's PGP key to be in the
-        # runner's keyring AND a `gpg.programs` entry. GitHub-hosted
-        # runners don't ship maintainer keys, so a hard fail here would
-        # require either pre-importing keys into every release (a moving
-        # target) or wiring this to a hosted key server (an outbound
-        # dependency). For now we run the check but treat its result
-        # as a job-summary advisory — actual enforcement lives in the
-        # branch ruleset "Require signed tags" toggle (admin-only, see
-        # docs/security/SUPPLY_CHAIN_HARDENING.md §C step 6). This step
-        # makes the unsigned/forged case visible at run time, so a
-        # missing/disabled ruleset shows up immediately in the release's
-        # job summary instead of silently being trusted.
+      - name: Require structurally signed tag (hard gate)
+        # Two-layer check, both running inside this job:
+        #
+        # LAYER 1 (HARD GATE) — structural signed-tag detection.
+        # GitHub-hosted runners do not ship maintainer GPG keys, so we
+        # cannot do a full trust-verify here without an outbound
+        # dependency on a key server (which itself becomes part of
+        # the trust surface). But we CAN reliably detect whether the
+        # tag is signed AT ALL: a signed annotated tag's object body
+        # always contains a PGP/SSH signature block. An unannotated
+        # ("lightweight") tag has no object body — it is just a ref
+        # to a commit. Either case is rejected here.
+        #
+        # This closes the "unsigned-tag-still-publishes" gap the
+        # security review flagged: it is no longer advisory-only.
+        # Even if a maintainer disables the "Require signed tags"
+        # branch ruleset by mistake, the release workflow itself
+        # refuses to proceed on an unsigned tag.
+        #
+        # LAYER 2 (ADVISORY) — `git tag --verify` for the WHO check.
+        # If a key happens to be available (e.g. via a future
+        # pre-import step), the verify result is surfaced in the job
+        # summary. The hard "who signed it" gate still lives in the
+        # branch ruleset (admin-only — see
+        # docs/security/SUPPLY_CHAIN_HARDENING.md §A).
         run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          # Layer 1: structural check (hard gate).
+          TAG_TYPE=$(git cat-file -t "${TAG}" 2>&1) || {
+            echo "::error title=Release tag missing::git cat-file failed for tag ${TAG}: ${TAG_TYPE}"
+            exit 1
+          }
+          if [ "${TAG_TYPE}" != "tag" ]; then
+            # `tag` = annotated tag object (can carry a signature).
+            # `commit` = lightweight tag pointing straight at a commit
+            # (cannot carry a signature). Reject the lightweight
+            # form outright.
+            echo "::error title=Release tag not annotated::Tag ${TAG} is a lightweight ref (git object type \`${TAG_TYPE}\`), not an annotated tag. Lightweight tags cannot carry a signature. Re-create the tag with \`git tag -s ${TAG} <commit>\` and re-push."
+            exit 1
+          fi
+
+          # Annotated tag object body. A signed tag's body contains
+          # one of these markers (PGP or SSH).
+          TAG_BODY=$(git cat-file -p "${TAG}")
+          if ! printf '%s' "${TAG_BODY}" | grep -qE '^-----BEGIN (PGP SIGNATURE|SSH SIGNATURE)-----'; then
+            echo "::error title=Release tag not signed::Tag ${TAG} is annotated but its body contains no PGP/SSH signature block. Re-create with \`git tag -s ${TAG} <commit>\` (signed) or \`git tag -m \"...\" -S ${TAG}\` and re-push. Branch ruleset \"Require signed tags\" (docs/security/SUPPLY_CHAIN_HARDENING.md §A) is the server-side gate; this workflow step is the runtime fallback that catches a misconfigured or temporarily-disabled ruleset."
+            exit 1
+          fi
+          echo "✓ Tag ${TAG} is annotated AND signed (PGP/SSH signature block present)"
+
+          # Layer 2: best-effort key-based verify (advisory).
           set +e
-          OUTPUT=$(git tag --verify "${GITHUB_REF#refs/tags/}" 2>&1)
-          STATUS=$?
+          VERIFY_OUTPUT=$(git tag --verify "${TAG}" 2>&1)
+          VERIFY_STATUS=$?
           set -e
           {
             echo '## Tag signature verification'
             echo
-            echo '```'
-            echo "${OUTPUT}"
-            echo '```'
+            echo '**Structural check (hard gate):** passed — tag is annotated AND carries a signature block.'
             echo
-            if [ "${STATUS}" -eq 0 ]; then
-              echo '**Result:** signature OK ✓'
-            else
-              echo '**Result:** could not verify signature (status '"${STATUS}"')'
+            echo '**Key-based verify (advisory):**'
+            echo
+            echo '```'
+            echo "${VERIFY_OUTPUT}"
+            echo '```'
+            if [ "${VERIFY_STATUS}" -eq 0 ]; then
               echo
-              echo 'This does NOT block the release. Signature enforcement is configured at the branch-ruleset level ("Require signed tags") and is an admin-only control.'
+              echo '**WHO signed it:** key in runner keyring — verified ✓'
+            else
+              echo
+              echo "**WHO signed it:** could not verify (status ${VERIFY_STATUS})."
+              echo
+              echo 'This is expected on GitHub-hosted runners (no maintainer keys pre-imported). The WHO check lives in the branch ruleset "Require signed tags", configured under docs/security/SUPPLY_CHAIN_HARDENING.md §A. The release was already gated by the structural check above.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

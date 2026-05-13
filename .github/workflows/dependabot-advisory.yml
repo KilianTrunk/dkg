@@ -143,6 +143,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/semver-mini"
+          # shellcheck disable=SC2016
+          # The heredoc body is JS, not shell. The `'$1'` inside `.replace(...)`
+          # is a regex backreference, not a positional parameter — and the
+          # `'SEMVER_EOF'` marker quotes the heredoc so nothing expands anyway.
           cat > "${RUNNER_TEMP}/semver-mini/index.js" <<'SEMVER_EOF'
           'use strict';
 
@@ -150,8 +154,15 @@ jobs:
             if (v == null) return null;
             const s = String(v).trim().replace(/^v/, '');
             if (!s) return null;
-            const core = s.split('-')[0].split('+')[0];
-            const parts = core.split('.');
+            // Pre-release (`-rc.1`) and build-metadata (`+sha.abc`) suffixes
+            // have specific semver-ordering semantics (e.g. `1.2.3-rc.1` MUST
+            // compare < `1.2.3`). Implementing them precisely here is risky;
+            // returning null lets the caller fall through to its conservative
+            // "treat as match" branch instead of stripping the suffix and
+            // mis-ordering a vulnerable prerelease past a `< 1.2.3` upper
+            // bound.
+            if (/[-+]/.test(s)) return null;
+            const parts = s.split('.');
             if (parts.length === 0 || parts.length > 3) return null;
             const nums = parts.map(p => (/^\d+$/.test(p) ? parseInt(p, 10) : NaN));
             if (nums.some(n => Number.isNaN(n))) return null;
@@ -216,6 +227,10 @@ jobs:
           module.exports = { validRange, satisfies };
           SEMVER_EOF
           # Smoke-test the helper before any real input touches it.
+          # shellcheck disable=SC2016
+          # Same rationale as the heredoc above — `process.env.RUNNER_TEMP`
+          # is a Node.js property access, not a shell variable; the
+          # single-quoted JS body is intentional.
           node -e '
             const m = require(process.env.RUNNER_TEMP + "/semver-mini/index.js");
             const ok = (
@@ -223,7 +238,13 @@ jobs:
               m.satisfies("4.17.24", m.validRange(">= 4.0.0, <= 4.17.23")) === false &&
               m.satisfies("1.10.0", m.validRange(">= 1.10.0")) === true &&
               m.satisfies("1.9.0",  m.validRange(">= 1.10.0")) === false &&
-              m.validRange("^1.2.3") === null
+              m.validRange("^1.2.3") === null &&
+              // Pre-release versions are intentionally rejected by parseVersion
+              // so the caller falls through to conservative-match. satisfies()
+              // returns false on a null-parsed version, but the matches()
+              // wrapper in the classify step short-circuits on `[-+]` first.
+              m.satisfies("1.2.3-rc.1", m.validRange("< 1.2.3")) === false &&
+              m.validRange(">= 1.0.0-beta") === null
             );
             if (!ok) { console.error("semver-mini smoke-test FAILED"); process.exit(1); }
             console.log("semver-mini smoke-test OK");
@@ -348,25 +369,64 @@ jobs:
               continue
             fi
 
-            # --- GHSA query (GraphQL) ----------------------------------
+            # --- GHSA query (GraphQL, paginated) -----------------------
+            # The advisory list for a single package can in principle
+            # exceed one page (100 nodes). A naive single-page query
+            # would silently drop anything past the first 100 — the
+            # exact false-negative class this gate exists to prevent.
+            # We loop on `pageInfo.hasNextPage` and accumulate, with a
+            # hard 10-page (= 1000 advisory) safety ceiling so a
+            # pathological response cannot wedge the workflow. Any API
+            # failure mid-pagination drops the package to inconclusive
+            # so reviewers see a red check rather than a silent miss.
             GHSA_HITS='[]'
             GHSA_OK=true
             if [ -n "${GHSA_ECO}" ]; then
-              # shellcheck disable=SC2016
-              # The query string contains `$name` and `$eco` — those are
-              # GraphQL variables passed via `-f name=` / `-f eco=` below,
-              # NOT shell variables. Single-quoting prevents shell from
-              # interpolating them (which is the desired behaviour here).
-              GHSA_RAW=$(
-                gh api graphql \
-                  -f query='query($name: String!, $eco: SecurityAdvisoryEcosystem!) { securityVulnerabilities(ecosystem: $eco, package: $name, first: 100) { nodes { advisory { ghsaId summary severity permalink publishedAt } vulnerableVersionRange firstPatchedVersion { identifier } } } }' \
-                  -f name="${NAME}" \
-                  -f eco="${GHSA_ECO}" \
-                  2>/dev/null
-              ) || GHSA_OK=false
-              if [ "${GHSA_OK}" = 'true' ] && [ -n "${GHSA_RAW}" ]; then
-                GHSA_HITS=$(echo "${GHSA_RAW}" | jq -c '[.data.securityVulnerabilities.nodes[] | { severity: .advisory.severity, ghsaId: .advisory.ghsaId, summary: .advisory.summary, permalink: .advisory.permalink, range: .vulnerableVersionRange }]')
-              fi
+              GHSA_CURSOR=''
+              GHSA_PAGE=0
+              GHSA_ACC='[]'
+              while :; do
+                GHSA_PAGE=$((GHSA_PAGE + 1))
+                if [ "${GHSA_PAGE}" -gt 10 ]; then
+                  echo "::warning title=GHSA pagination ceiling::Package ${NAME} returned >10 pages of advisories; flagging inconclusive."
+                  GHSA_OK=false
+                  break
+                fi
+                # Both query strings contain `$name`, `$eco`, `$cursor` —
+                # those are GraphQL variables passed via `-f` flags below,
+                # NOT shell variables. Single-quoting prevents shell
+                # interpolation, which is exactly what we want. The
+                # SC2016 disables silence shellcheck's warning about
+                # single-quoted `$`-prefixed tokens inside the query.
+                if [ -z "${GHSA_CURSOR}" ]; then
+                  # shellcheck disable=SC2016
+                  GHSA_RAW=$(
+                    gh api graphql \
+                      -f query='query($name: String!, $eco: SecurityAdvisoryEcosystem!) { securityVulnerabilities(ecosystem: $eco, package: $name, first: 100) { pageInfo { hasNextPage endCursor } nodes { advisory { ghsaId summary severity permalink publishedAt withdrawnAt } vulnerableVersionRange firstPatchedVersion { identifier } } } }' \
+                      -f name="${NAME}" \
+                      -f eco="${GHSA_ECO}" \
+                      2>/dev/null
+                  ) || { GHSA_OK=false; break; }
+                else
+                  # shellcheck disable=SC2016
+                  GHSA_RAW=$(
+                    gh api graphql \
+                      -f query='query($name: String!, $eco: SecurityAdvisoryEcosystem!, $cursor: String!) { securityVulnerabilities(ecosystem: $eco, package: $name, first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { advisory { ghsaId summary severity permalink publishedAt withdrawnAt } vulnerableVersionRange firstPatchedVersion { identifier } } } }' \
+                      -f name="${NAME}" \
+                      -f eco="${GHSA_ECO}" \
+                      -f cursor="${GHSA_CURSOR}" \
+                      2>/dev/null
+                  ) || { GHSA_OK=false; break; }
+                fi
+                if [ -z "${GHSA_RAW}" ]; then GHSA_OK=false; break; fi
+                PAGE_HITS=$(echo "${GHSA_RAW}" | jq -c '[.data.securityVulnerabilities.nodes[] | select(.advisory.withdrawnAt == null) | { severity: .advisory.severity, ghsaId: .advisory.ghsaId, summary: .advisory.summary, permalink: .advisory.permalink, range: .vulnerableVersionRange }]') || { GHSA_OK=false; break; }
+                GHSA_ACC=$(jq -nc --argjson a "${GHSA_ACC}" --argjson b "${PAGE_HITS}" '$a + $b') || { GHSA_OK=false; break; }
+                HAS_NEXT=$(echo "${GHSA_RAW}" | jq -r '.data.securityVulnerabilities.pageInfo.hasNextPage // false')
+                if [ "${HAS_NEXT}" != 'true' ]; then break; fi
+                GHSA_CURSOR=$(echo "${GHSA_RAW}" | jq -r '.data.securityVulnerabilities.pageInfo.endCursor // empty')
+                if [ -z "${GHSA_CURSOR}" ]; then break; fi
+              done
+              if [ "${GHSA_OK}" = 'true' ]; then GHSA_HITS="${GHSA_ACC}"; fi
             fi
 
             # --- OSV query (REST) -------------------------------------
@@ -433,6 +493,12 @@ jobs:
             # "Vendor minimal semver range-check helper" step for the
             # supply-chain rationale).
             if [ "${GHSA_HITS}" != '[]' ]; then
+              # shellcheck disable=SC2016
+              # The single-quoted body is JS executed by `node -e`, not
+              # shell. `process.env.X` is a Node.js property access; the
+              # actual values come in via the inline env-var assignments
+              # on the lines above (NEW_VER=, OLD_VER=, etc.). Single
+              # quotes are correct here.
               FILTERED_GHSA=$(
                 NEW_VER="${NEW}" \
                 OLD_VER="${OLD}" \
@@ -446,8 +512,14 @@ jobs:
                   function matches(version, raw) {
                     const r = (raw || "").trim();
                     if (!r) return true; // empty range → match (no filter)
+                    // Pre-release / build-metadata version → conservative match.
+                    // semver-mini intentionally refuses to parse `1.2.3-rc.1`
+                    // (full prerelease ordering is non-trivial) and we would
+                    // rather over-flag a prerelease bump than silently let one
+                    // sneak past a `< 1.2.3` upper bound.
+                    if (/[-+]/.test(version || "")) return true;
                     const parsed = semver.validRange(r);
-                    if (parsed === null) return true; // unparseable → conservative match
+                    if (parsed === null) return true; // unparseable range → conservative match
                     try {
                       return semver.satisfies(version, parsed);
                     } catch (_) { return true; } // any other error → conservative match

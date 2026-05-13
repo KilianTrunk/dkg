@@ -18,7 +18,6 @@ import { peerIdFromString } from '@libp2p/peer-id';
 import { ed25519GetPublicKey } from './crypto/ed25519.js';
 import type { ConnectionTransport, DKGNodeConfig } from './types.js';
 import { DHT_PROTOCOL, DKG_GOSSIP_MAX_RPC_BYTES } from './constants.js';
-import { dkgGossipMsgId } from './network/gossip-msg-id.js';
 
 export interface DKGServices extends Record<string, unknown> {
   dht: KadDHT;
@@ -170,13 +169,30 @@ export class DKGNode {
         D: 4,
         Dlo: 2,
         Dhi: 8,
-        // RFC 07 §5.4 — content-deterministic msgId so any future
-        // gossip backend can dedup against libp2p-gossipsub without
-        // protocol-level cooperation. Behaviour-invisible today
-        // (replaces the upstream signed/unsigned defaults with a
-        // single sha256-of-content); locks in the constant before
-        // a second backend exists.
-        msgIdFn: dkgGossipMsgId,
+        // NOTE — RFC 07 §5.4 ships the constant `dkgGossipMsgId` for
+        // cross-backend dedup, but it is intentionally NOT wired in
+        // here yet. Codex review feedback on PR #501 (round 2) flagged
+        // a real rolling-upgrade hazard: gossipsub puts msgIds into
+        // its IHAVE/IWANT control protocol, so during a rolling
+        // network upgrade old (default upstream `msgIdFnStrictSign`)
+        // and new (`dkgGossipMsgId`) nodes compute different IDs for
+        // the same payload and stop correlating cache entries. Push
+        // delivery still works (the message itself is the same wire
+        // bytes); only the dedup cache fragments, producing extra
+        // IWANT/SERVE round-trips per message until the upgrade
+        // completes. For an isolated devnet that's fine; for a live
+        // mainnet mesh it's wasteful and observable.
+        //
+        // Plan: keep using upstream's default `msgIdFnStrictSign` here
+        // (signed = sha256(from || seqno), unsigned = sha256(data)),
+        // ship `dkgGossipMsgId` and its tests so the constant is
+        // pinned and reviewable, and flip the wiring as part of a
+        // coordinated mesh-wide upgrade — most likely combined with a
+        // gossipsub protocol-version bump so old/new nodes segregate
+        // into separate meshes during the cutover instead of degrading
+        // a shared one. Tracked in
+        // `dkgv10-spec/production_mainnet/07_IN_PROCESS_PEER_RESOLVER.md`
+        // §5.4 (deferred wiring).
       }),
       dcutr: dcutr(),
     };

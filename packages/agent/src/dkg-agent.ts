@@ -7780,13 +7780,32 @@ export class DKGAgent {
     // persistence could have stale/bad ids that would silently replay
     // on every register retry that omits the param. With explicit-only
     // resolution, `undefined` unambiguously means "no PCA".
-    const requestedPublishAuthorityAccountId = opts?.publishAuthorityAccountId;
-    const publishAuthorityAccountId = requestedPublishAuthorityAccountId;
-    if (requestedPublishAuthorityAccountId !== undefined) {
+    //
+    // The option type advertises `bigint`, but untyped / JS callers can
+    // pass `1` or `'1'` — comparing a non-bigint to `0n` would throw a
+    // raw `TypeError: Cannot mix BigInt and other types` instead of the
+    // actionable validation error this API is supposed to provide
+    // (Codex PR #502 round-8). Coerce safely before the `<= 0n` check.
+    const rawPublishAuthorityAccountId = opts?.publishAuthorityAccountId as unknown;
+    let requestedPublishAuthorityAccountId: bigint | undefined;
+    if (rawPublishAuthorityAccountId !== undefined && rawPublishAuthorityAccountId !== null) {
+      if (typeof rawPublishAuthorityAccountId === 'bigint') {
+        requestedPublishAuthorityAccountId = rawPublishAuthorityAccountId;
+      } else if (typeof rawPublishAuthorityAccountId === 'number') {
+        if (!Number.isInteger(rawPublishAuthorityAccountId) || rawPublishAuthorityAccountId <= 0) {
+          throw new Error('PCA account id must be a positive integer.');
+        }
+        requestedPublishAuthorityAccountId = BigInt(rawPublishAuthorityAccountId);
+      } else if (typeof rawPublishAuthorityAccountId === 'string' && /^[1-9]\d*$/.test(rawPublishAuthorityAccountId)) {
+        requestedPublishAuthorityAccountId = BigInt(rawPublishAuthorityAccountId);
+      } else {
+        throw new Error('PCA account id must be a positive integer.');
+      }
       if (requestedPublishAuthorityAccountId <= 0n) {
         throw new Error('PCA account id must be a positive integer.');
       }
     }
+    const publishAuthorityAccountId = requestedPublishAuthorityAccountId;
     // PCA account ids are only invalid when the publish policy is
     // open (`publishPolicy === EVM_PUBLISH_OPEN`) — that combination
     // is incoherent on-chain because `isAuthorizedPublisher`'s PCA
@@ -7945,9 +7964,12 @@ export class DKGAgent {
       // FAIL CLOSED when the registration signer cannot be
       // introspected — a custom adapter that exposes
       // `getPublishingConvictionAccountOwner()` but not its tx signer
-      // would otherwise sneak past the invariant.
+      // would otherwise sneak past the invariant. Codex PR #502
+      // round-8: use the dedicated `getRegistrationTxSignerAddress`
+      // probe so future readers can't confuse it with a publish-time
+      // delegate principal.
       if (isPcaCurated && publishAuthority) {
-        const chainSigner = await this.getChainPublishAuthorityAddress(id);
+        const chainSigner = await this.getRegistrationTxSignerAddress(id);
         if (!chainSigner) {
           throw new Error(
             `Context graph "${id}" cannot be PCA-registered: the chain adapter does not expose its registration-tx signer, so the "chain signer == PCA owner" invariant cannot be verified. PCA mode requires a chain adapter that surfaces its signer (e.g. via \`signerAddress\` / \`getSignerAddress()\` / \`getOperationalPrivateKey()\`) so the on-chain governance NFT is guaranteed to mint to the advertised PCA owner.`,
@@ -11025,6 +11047,26 @@ export class DKGAgent {
     return !!this.defaultAgentAddress
       && ethers.isAddress(this.defaultAgentAddress)
       && ownerAddress.toLowerCase() === this.defaultAgentAddress.toLowerCase();
+  }
+
+  /**
+   * Address that will SIGN on-chain CG-state-changing txs (the wallet
+   * the adapter binds to `contracts.contextGraphs` and invokes
+   * `createContextGraph`/`updatePublishPolicy`/etc with).
+   *
+   * Codex PR #502 round-8: split out from `getChainPublishAuthorityAddress`
+   * so the PCA "chain signer == PCA owner" invariant has a dedicated,
+   * explicitly-documented probe. In practice the underlying resolution
+   * is identical today — `getChainPublishAuthorityAddress` already
+   * passes `includeReservingPublisherProbe: false` so it never returns
+   * a per-CG publish-time delegate — but a dedicated method makes the
+   * intent (the tx-signing wallet, not any publish-time principal)
+   * obvious to future readers / reviewers and gives us a clean
+   * extension point if an adapter ever needs to advertise a separate
+   * registration signer.
+   */
+  private async getRegistrationTxSignerAddress(contextGraphId?: string): Promise<string | undefined> {
+    return this.getChainPublishAuthorityAddress(contextGraphId);
   }
 
   private async getChainPublishAuthorityAddress(contextGraphId?: string): Promise<string | undefined> {

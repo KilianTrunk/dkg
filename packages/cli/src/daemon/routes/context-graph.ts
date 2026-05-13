@@ -327,6 +327,50 @@ import {
 
 import type { RequestContext } from './context.js';
 
+/**
+ * Map a `registerContextGraph` failure message to an HTTP status +
+ * stable error body. Shared by:
+ *   - POST /api/context-graph/register (standalone register call).
+ *   - POST /api/context-graph/create { register: true, pcaAccountId }
+ *     (atomic combined-flow inline register leg).
+ *
+ * Codex PR #502 round-8: the combined-flow register failure used to
+ * always return HTTP 200 with `registered: false`, which silently
+ * masks PCA / authz / shape errors as success unless callers
+ * remember to inspect the response body. Both endpoints now share
+ * the same 4xx / 5xx mapping for caller-input / unsupported-feature
+ * failures; only genuinely transient chain failures keep the
+ * 200-partial-success shape via `genericFallbackStatus = 200`.
+ *
+ * Returns `undefined` when no specific mapping applies — callers
+ * decide whether that means generic 500 (standalone /register
+ * shape) or a 200-partial-success body (combined flow's transient
+ * fallback).
+ */
+function classifyRegisterContextGraphError(msg: string): { status: number; body?: Record<string, unknown> } | undefined {
+  if (msg.includes('already registered')) return { status: 409, body: { error: msg } };
+  if (msg.includes('does not exist')) return { status: 404, body: { error: msg } };
+  if (msg.includes('no known creator')) return { status: 503, body: { error: msg, hint: 'Creator not yet synced. Retry after sync completes.' } };
+  if (msg.includes('Only the context graph creator')) return { status: 403, body: { error: msg } };
+  if (msg.includes('Only the context graph curator')) return { status: 403, body: { error: msg } };
+  if (msg.includes('address-scoped curator')) return { status: 403, body: { error: msg } };
+  if (msg.includes('PCA account id can only be used with curated publish policy')
+    || msg.includes('PCA account id can only be used with curated/private context graphs')) {
+    return { status: 400, body: { error: msg } };
+  }
+  if (msg.includes('PCA account id must be a positive integer')) return { status: 400, body: { error: msg } };
+  if (msg.includes('requires chain adapter PCA owner lookup support')) return { status: 501, body: { error: msg } };
+  if (/PCA account \d+ does not exist or cannot be looked up/.test(msg)) return { status: 404, body: { error: msg } };
+  if (/PCA account \d+ is owned by/.test(msg)) return { status: 403, body: { error: msg } };
+  // PCA chain-signer / signer-introspection invariants (Codex round-4/5/8):
+  if (msg.includes('chain signer') && msg.includes('differs from PCA owner')) return { status: 403, body: { error: msg } };
+  if (msg.includes('does not expose its registration-tx signer')
+    || msg.includes('invariant cannot be verified')) {
+    return { status: 501, body: { error: msg } };
+  }
+  return undefined;
+}
+
 function parseOptionalPcaAccountId(body: Record<string, unknown>): { value?: bigint; error?: string } {
   const raw = body.pcaAccountId;
   if (raw === undefined || raw === null || raw === '') return {};
@@ -565,17 +609,40 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
           onChainId: regResult.onChainId,
         });
       } catch (regErr: any) {
-        process.stderr.write(`[DKG-Daemon] WARN: Context graph "${id}" created locally but on-chain registration failed: ${regErr?.message ?? 'unknown error'}\n`);
+        const regMsg = regErr?.message ?? 'unknown error';
+        process.stderr.write(`[DKG-Daemon] WARN: Context graph "${id}" created locally but on-chain registration failed: ${regMsg}\n`);
         // No rollback of `pcaAccountId` needed: `createContextGraph`
         // no longer persists it (Codex PR #502 round-3) — callers must
         // resupply at register time, so a failed register leg simply
         // leaves the CG with no stored PCA id, which is the correct
         // "no PCA yet" state.
+        //
+        // Map caller-input / unsupported-feature failures to the same
+        // 4xx / 5xx status codes /api/context-graph/register uses —
+        // returning 200 here silently masked bad PCA ids, authz
+        // failures, etc. as success unless callers remembered to
+        // inspect `registered: false` (Codex PR #502 round-8). The
+        // response body carries `created: true` so callers know the
+        // local create succeeded and they can retry the register leg.
+        const classified = classifyRegisterContextGraphError(regMsg);
+        if (classified) {
+          return jsonResponse(res, classified.status, {
+            ...(classified.body ?? { error: regMsg }),
+            created: id,
+            uri: `did:dkg:context-graph:${id}`,
+            registered: false,
+            registerError: regMsg,
+            hint: 'CG created locally. Fix the register-leg input and call POST /api/context-graph/register to retry on-chain registration.',
+          });
+        }
+        // Unclassified failures (transient chain errors, unknown
+        // adapter reverts) keep the legacy 200-partial-success shape
+        // so callers can retry cheaply without losing the local CG.
         return jsonResponse(res, 200, {
           created: id,
           uri: `did:dkg:context-graph:${id}`,
           registered: false,
-          registerError: regErr?.message ?? 'Registration failed',
+          registerError: regMsg,
           hint: 'CG created locally. Use POST /api/context-graph/register to retry on-chain registration.',
         });
       }
@@ -623,43 +690,9 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       });
     } catch (err: any) {
       const msg = err?.message ?? '';
-      if (msg.includes('already registered')) {
-        return jsonResponse(res, 409, { error: msg });
-      }
-      if (msg.includes('does not exist')) {
-        return jsonResponse(res, 404, { error: msg });
-      }
-      if (msg.includes('no known creator')) {
-        return jsonResponse(res, 503, { error: msg, hint: 'Creator not yet synced. Retry after sync completes.' });
-      }
-      if (msg.includes('Only the context graph creator')) {
-        return jsonResponse(res, 403, { error: msg });
-      }
-      if (msg.includes('Only the context graph curator')) {
-        return jsonResponse(res, 403, { error: msg });
-      }
-      if (msg.includes('address-scoped curator')) {
-        return jsonResponse(res, 403, { error: msg });
-      }
-      if (msg.includes('PCA account id can only be used with curated publish policy')
-        || msg.includes('PCA account id can only be used with curated/private context graphs')) {
-        return jsonResponse(res, 400, { error: msg });
-      }
-      // PCA-specific 4xx mapping (Codex review #502-3): caller-input or
-      // unsupported-feature failures should not surface as 500s with raw
-      // chain/adapter revert text. Order matters — more specific matches
-      // come first.
-      if (msg.includes('PCA account id must be a positive integer')) {
-        return jsonResponse(res, 400, { error: msg });
-      }
-      if (msg.includes('requires chain adapter PCA owner lookup support')) {
-        return jsonResponse(res, 501, { error: msg });
-      }
-      if (/PCA account \d+ does not exist or cannot be looked up/.test(msg)) {
-        return jsonResponse(res, 404, { error: msg });
-      }
-      if (/PCA account \d+ is owned by/.test(msg)) {
-        return jsonResponse(res, 403, { error: msg });
+      const classified = classifyRegisterContextGraphError(msg);
+      if (classified) {
+        return jsonResponse(res, classified.status, classified.body ?? { error: msg });
       }
       return jsonResponse(res, 500, { error: msg });
     }

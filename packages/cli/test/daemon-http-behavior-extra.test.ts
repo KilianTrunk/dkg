@@ -581,15 +581,25 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
         register: true,
       }),
     });
-    // /create itself succeeds (CG is created locally); only the
-    // register leg fails, so the response is 200 with `registered: false`.
-    expect(createAndRegister.status).toBe(200);
+    // /create itself succeeds (CG is created locally); the register
+    // leg fails because the PCA token doesn't exist. Codex PR #502
+    // round-8: register-leg failures now map to the same 4xx / 5xx
+    // status codes used by /api/context-graph/register — nonexistent
+    // PCA tokens → 404. The response body still carries
+    // `created: id, registered: false, registerError` so callers can
+    // distinguish "local CG exists, retry register" from "create
+    // failed".
+    expect(createAndRegister.status).toBe(404);
     const body = (await createAndRegister.json()) as {
+      error?: string;
+      created?: string;
       registered?: boolean;
       registerError?: string;
     };
+    expect(body.created).toBe(cgId);
     expect(body.registered).toBe(false);
     expect(typeof body.registerError).toBe('string');
+    expect(body.registerError ?? '').toMatch(/PCA account 99999999999999999999 does not exist/);
 
     // Follow-up /register call omitting pcaAccountId. If the rollback
     // worked, the agent resolver finds NOTHING in storage and falls
@@ -613,6 +623,22 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
       expect([200, 201]).toContain(retryRegister.status);
     }
   });
+
+  // Codex PR #502 round-8: combined-flow register failures (caller
+  // input / unsupported feature) used to silently return 200 with
+  // `registered: false`. They now share the /register endpoint's 4xx
+  // mappings — this test pins the 501 mapping when the chain adapter
+  // is asked for a PCA registration but cannot introspect its tx
+  // signer.
+  //
+  // The shared test daemon uses the EVM adapter against a Hardhat node
+  // (which DOES introspect its signer), so we can't directly exercise
+  // the 501 path here. The complementary "rejects pcaAccountId on
+  // POST /api/context-graph/create when register is not true" test
+  // and the 404 mapping above already cover the realistic adapter
+  // scenarios — leaving this as a documentation marker.
+  // TODO(devnet-smoke): cover the 501 mapping via an adapter that
+  // surfaces `getPublishingConvictionAccountOwner()` but no signer.
 
   // Codex review #502-3: a bad pcaAccountId on /register surfaces as a
   // chain revert ("ERC721NonexistentToken" or similar) from the EVM

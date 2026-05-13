@@ -52,8 +52,21 @@ export interface AgentDirectoryLookup {
    * Returns the relay multiaddr advertised for `peerId` in the agents
    * context graph, or `null` if none is recorded. The resolver
    * appends `/p2p-circuit/p2p/<peerId>` to construct the dialable form.
+   *
+   * Codex review feedback on PR #496 round 4: takes an optional
+   * `opts.signal` so an in-flight SPARQL query can be cancelled when
+   * the resolver's outer signal aborts. Without this, `resolve()`
+   * still checks `signal.aborted` BEFORE step 4 starts, but once
+   * `findRelayForPeer` is running a timed-out call would block until
+   * the SPARQL request finished naturally — defeating the end-to-end
+   * deadline guarantee for `connectToPeerId({ timeoutMs })` callers.
+   * Implementations that can't cancel (e.g. legacy DiscoveryClient)
+   * may ignore the signal; the contract is best-effort.
    */
-  findRelayForPeer(peerId: NodeIdentity): Promise<Address | null>;
+  findRelayForPeer(
+    peerId: NodeIdentity,
+    opts?: { signal?: AbortSignal },
+  ): Promise<Address | null>;
 }
 
 export interface PeerResolverDeps {
@@ -205,7 +218,7 @@ export class PeerResolver {
     // skipping steps 4+).
     if (aborted()) return accumulated;
     try {
-      const registryAddrs = this.registry.lookup(peerId);
+      const registryAddrs = await this.registry.lookup(peerId);
       if (registryAddrs.length > 0) {
         append(registryAddrs);
         await this.network.addKnownAddresses(peerId, registryAddrs);
@@ -215,10 +228,14 @@ export class PeerResolver {
     }
 
     // Step 4: agent-directory SPARQL fallback. Replaces the chat-only
-    // Messenger.ensureCircuitRelayAddress path.
+    // Messenger.ensureCircuitRelayAddress path. Pass `opts.signal`
+    // through so an in-flight SPARQL query honours the outer deadline
+    // (Codex review feedback on PR #496 round 4).
     if (aborted()) return accumulated;
     try {
-      const relay = await this.agentDirectory.findRelayForPeer(peerId);
+      const relay = await this.agentDirectory.findRelayForPeer(peerId, {
+        signal: opts?.signal,
+      });
       if (relay) {
         const circuitAddr = `${relay}/p2p-circuit/p2p/${peerId}`;
         append([circuitAddr]);

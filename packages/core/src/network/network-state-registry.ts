@@ -9,6 +9,16 @@
  * Phase 2 (submitProofV2 + per-round attestation KCs) lands. The
  * interface is fixed so the future PR-4 of the RFC 07 rollout can
  * wire the real implementation in without touching consumers.
+ *
+ * Codex review feedback on PR #496 (round 4): `lookup` returns
+ * `Promise<Address[]>` — not `Address[]`. The v1 stub is in-memory
+ * and could be sync, but the real RFC 04 Phase 2 implementation may
+ * consult a database, an SWM channel, or another async source.
+ * Freezing the contract as sync now would either force the real
+ * impl to block the event loop or require a public-API breaking
+ * change in `@origintrail-official/dkg-core` later. Async from day
+ * one keeps the upgrade path open without observable cost (the v1
+ * stub returns a resolved promise instantly).
  */
 import type { NodeIdentity, Address } from './network.js';
 
@@ -19,7 +29,7 @@ export interface NetworkStateRegistry {
    * today, because no attestation KCs are minted before RFC 04
    * Phase 2 lands.
    */
-  lookup(peerId: NodeIdentity): Address[];
+  lookup(peerId: NodeIdentity): Promise<Address[]>;
 }
 
 /**
@@ -28,7 +38,7 @@ export interface NetworkStateRegistry {
  * `system-dkg-network` syncs to in-memory state.
  */
 export class StubNetworkStateRegistry implements NetworkStateRegistry {
-  lookup(_peerId: NodeIdentity): Address[] {
+  async lookup(_peerId: NodeIdentity): Promise<Address[]> {
     return [];
   }
 }

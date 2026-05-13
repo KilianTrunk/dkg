@@ -141,14 +141,14 @@ describe('PeerResolver', () => {
     });
     const out = await resolver.resolve(PEER_B);
 
-    expect(dirSpy).toHaveBeenCalledWith(PEER_B);
+    expect(dirSpy).toHaveBeenCalledWith(PEER_B, expect.any(Object));
     expect(out).toContain(`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`);
   });
 
   it('step 3: registry hits are appended after DHT', async () => {
     net.__findPeerImpl = async () => ['/ip4/1.2.3.4/tcp/9090'];
     const customRegistry: NetworkStateRegistry = {
-      lookup: () => ['/ip4/5.6.7.8/tcp/9090'],
+      lookup: async () => ['/ip4/5.6.7.8/tcp/9090'],
     };
 
     const resolver = new PeerResolver({
@@ -230,7 +230,7 @@ describe('PeerResolver', () => {
   it('step 3 (Codex PR #496 feedback): registry throwing does not abort resolution', async () => {
     net.__findPeerImpl = async () => [];
     const throwingRegistry: NetworkStateRegistry = {
-      lookup: () => {
+      lookup: async () => {
         throw new Error('registry boom');
       },
     };
@@ -261,7 +261,7 @@ describe('PeerResolver', () => {
       return ['/ip4/1.2.3.4/tcp/9090'];
     };
     const countingRegistry: NetworkStateRegistry = {
-      lookup: () => {
+      lookup: async () => {
         stepsRan++;
         return [];
       },
@@ -297,7 +297,7 @@ describe('PeerResolver', () => {
       return [];
     };
     const trackingRegistry: NetworkStateRegistry = {
-      lookup: () => {
+      lookup: async () => {
         registryCalled = true;
         return [];
       },
@@ -355,6 +355,27 @@ describe('PeerResolver', () => {
     expect(seenSignals[0].aborted).toBe(true);
   });
 
+  it('step 4 (Codex PR #496 round 4): forwards opts.signal to agentDirectory.findRelayForPeer', async () => {
+    net.__findPeerImpl = async () => [];
+    const ctrl = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    const signalingDir: AgentDirectoryLookup = {
+      findRelayForPeer: async (_pid, opts) => {
+        receivedSignal = opts?.signal;
+        return null;
+      },
+    };
+
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: signalingDir,
+    });
+    await resolver.resolve(PEER_B, { signal: ctrl.signal });
+
+    expect(receivedSignal).toBe(ctrl.signal);
+  });
+
   it('returns empty array when nothing resolves', async () => {
     net.__findPeerImpl = async () => [];
     const resolver = new PeerResolver({
@@ -371,7 +392,7 @@ describe('PeerResolver', () => {
     const dup = '/ip4/1.2.3.4/tcp/9090';
     net.__findPeerImpl = async () => [dup];
     const customRegistry: NetworkStateRegistry = {
-      lookup: () => [dup, '/ip4/9.9.9.9/tcp/9090'],
+      lookup: async () => [dup, '/ip4/9.9.9.9/tcp/9090'],
     };
 
     const resolver = new PeerResolver({

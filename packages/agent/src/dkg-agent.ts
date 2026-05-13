@@ -1325,7 +1325,19 @@ export class DKGAgent {
         // need to know about the agents-CG SPARQL surface. Replaced
         // when RFC 04 Phase 2 lands — at that point, the registry
         // step takes precedence and this fallback is rarely hit.
-        findRelayForPeer: async (peerId) => {
+        //
+        // Note: AgentDirectoryLookup.findRelayForPeer accepts an
+        // optional `opts.signal` so the resolver can cancel an
+        // in-flight SPARQL on outer-deadline expiry. The legacy
+        // DiscoveryClient.findAgentByPeerId doesn't expose
+        // cancellation today (its SPARQL fetch is fire-and-await),
+        // so the signal is intentionally ignored here. Wiring it up
+        // is a follow-up that touches DiscoveryClient internals;
+        // until then the resolver's pre-step `signal.aborted` check
+        // still prevents NEW agent-directory work from starting once
+        // the deadline elapses, even if an already-running query
+        // can't be torn down.
+        findRelayForPeer: async (peerId, _opts) => {
           const agent = await this.discovery.findAgentByPeerId(peerId);
           return agent?.relayAddress ?? null;
         },

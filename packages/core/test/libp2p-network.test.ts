@@ -139,6 +139,61 @@ describe('LibP2PNetwork', () => {
     await expect(netA.addKnownAddresses(b.peerId, [])).resolves.toBeUndefined();
   });
 
+  it('handle aborts the stream when an async handler rejects (Codex PR #494)', async () => {
+    // Regression guard: the wrapper used to fire-and-forget the handler
+    // promise, so an async rejection became an unhandledRejection AND
+    // left the inbound stream half-open. The dialer would only notice
+    // when its own read timeout fired, by which time minutes might have
+    // passed. The fix awaits the handler in try/catch and aborts the
+    // stream on failure.
+    //
+    // Test strategy: handler awaits a barrier, THEN throws. Dialer
+    // sends, half-closes, then drains. If the fix works, the drain
+    // either returns clean EOF (handler aborted before any reply was
+    // sent) or throws a stream error — both well under the 5s deadline
+    // we assert on. Without the fix, the drain hangs until vitest's
+    // 10s test timeout.
+    const a = spawn();
+    const b = spawn();
+    const netA = new LibP2PNetwork(a);
+    const netB = new LibP2PNetwork(b);
+    await netA.start();
+    await netB.start();
+    await netA.addKnownAddresses(b.peerId, b.multiaddrs);
+
+    const protocol = '/test/handler-rejects/1.0.0';
+    let handlerEntered = false;
+    await netB.handle(protocol, async () => {
+      handlerEntered = true;
+      // Brief async barrier so the dialer-side send/close completes
+      // before the handler aborts the stream — gives us a clean
+      // observation point for the drain timing assertion.
+      await new Promise((r) => setTimeout(r, 50));
+      throw new Error('intentional handler failure');
+    });
+
+    const stream = await netA.dialProtocol(b.peerId, protocol);
+    try {
+      stream.send(new TextEncoder().encode('ping'));
+      await stream.close();
+    } catch {
+      // Stream may already be aborted by the time we send — that's OK,
+      // it's the same root cause we're testing for.
+    }
+
+    const drainStart = Date.now();
+    try {
+      for await (const _chunk of stream) { /* discard */ }
+    } catch {
+      // Aborted-stream error is one of the two acceptable outcomes.
+    }
+    const drainMs = Date.now() - drainStart;
+    expect(handlerEntered).toBe(true);
+    // Without the fix, the drain hangs until libp2p's own timeout (>>5s).
+    // With the fix, abort propagates immediately.
+    expect(drainMs).toBeLessThan(5000);
+  }, 10000);
+
   it('unhandle removes a previously-registered protocol', async () => {
     const a = spawn();
     const b = spawn();

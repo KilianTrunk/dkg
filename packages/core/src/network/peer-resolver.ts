@@ -107,6 +107,15 @@ export class PeerResolver {
    * Resolve `peerId` to an ordered list of multiaddrs to attempt.
    * See class doc for the resolution order; never throws — failures
    * in one step proceed to the next.
+   *
+   * Cancellation: if `opts.signal` is set, every step checks
+   * `signal.aborted` before running. An already-aborted signal
+   * returns whatever's been accumulated so far (or `[]` if nothing
+   * yet). Per-step timeouts are layered ON TOP of the outer signal,
+   * not subordinated to it: each step that has its own timeout
+   * (DHT today; future: registry, agents-CG) composes a step-local
+   * `AbortSignal.any([opts.signal, AbortSignal.timeout(perStep)])`
+   * so neither input is silently ignored.
    */
   async resolve(peerId: NodeIdentity, opts?: ResolveOpts): Promise<Address[]> {
     const accumulated: Address[] = [];
@@ -118,6 +127,29 @@ export class PeerResolver {
           accumulated.push(a);
         }
       }
+    };
+
+    // Codex feedback PR #499 round 3: callers thread a single
+    // AbortSignal through all steps, but only step 2 (DHT) was
+    // honouring it. After timeout, registry + agents-CG still ran
+    // unbounded, so connectToPeerId({ timeoutMs }) could overrun the
+    // deadline by the registry+SPARQL latency. The check below makes
+    // every step short-circuit when the signal is aborted.
+    const aborted = (): boolean => opts?.signal?.aborted === true;
+
+    // Codex feedback PR #496 round 3: `ResolveOpts.perStepTimeoutMs`
+    // was documented as a real per-step cap, but when `opts.signal`
+    // was also passed, `LibP2PNetwork.findPeer` honoured the signal
+    // and silently dropped the timeout. Compose a step-local signal
+    // that combines BOTH inputs so the per-step contract holds even
+    // when the outer signal is longer-lived. Returns undefined when
+    // no per-step cap and no outer signal are provided.
+    const stepSignal = (perStepMs?: number): AbortSignal | undefined => {
+      const withTimeout =
+        perStepMs && perStepMs > 0 ? AbortSignal.timeout(perStepMs) : undefined;
+      const outer = opts?.signal;
+      if (withTimeout && outer) return AbortSignal.any([withTimeout, outer]);
+      return withTimeout ?? outer;
     };
 
     // Step 1: active-connection cache. Sub-millisecond. If a live
@@ -133,6 +165,7 @@ export class PeerResolver {
     // resolver returns []. Callers downstream (e.g. ProtocolRouter
     // and connectToPeerId) get a clean DIAL_FAILED / PEER_NOT_FOUND
     // instead of an unhandled exception.
+    if (aborted()) return accumulated;
     try {
       const live = this.network.getConnections(peerId);
       if (live.length > 0) {
@@ -147,10 +180,12 @@ export class PeerResolver {
     // expensive for cold peers. Skipped if caller asked or transport
     // doesn't support peer-routing.
     if (!opts?.skipDht && typeof this.network.findPeer === 'function') {
+      if (aborted()) return accumulated;
       try {
+        const perStepMs = opts?.perStepTimeoutMs ?? DEFAULT_PER_STEP_TIMEOUT_MS;
         const dhtAddrs = await this.network.findPeer(peerId, {
-          signal: opts?.signal,
-          timeoutMs: opts?.perStepTimeoutMs ?? DEFAULT_PER_STEP_TIMEOUT_MS,
+          signal: stepSignal(perStepMs),
+          timeoutMs: perStepMs,
         });
         if (dhtAddrs.length > 0) {
           append(dhtAddrs);
@@ -168,6 +203,7 @@ export class PeerResolver {
     // try/catch is the contract that protects callers from a transient
     // registry hiccup aborting the whole resolve() (and silently
     // skipping steps 4+).
+    if (aborted()) return accumulated;
     try {
       const registryAddrs = this.registry.lookup(peerId);
       if (registryAddrs.length > 0) {
@@ -180,6 +216,7 @@ export class PeerResolver {
 
     // Step 4: agent-directory SPARQL fallback. Replaces the chat-only
     // Messenger.ensureCircuitRelayAddress path.
+    if (aborted()) return accumulated;
     try {
       const relay = await this.agentDirectory.findRelayForPeer(peerId);
       if (relay) {

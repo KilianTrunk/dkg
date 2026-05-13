@@ -54,23 +54,29 @@ export class Messenger {
     // unreachable, and the resolver itself never throws on resolution
     // failure (it returns an empty array).
     //
-    // Codex feedback on PR #496: pass `opts.timeoutMs` through so the
-    // resolver's per-step DHT walk doesn't run unbounded against a
-    // cold peer when the caller explicitly asked for a short send
-    // budget. Note: PR-3 of the RFC 07 stack moves the resolver call
-    // into ProtocolRouter and removes this inline call entirely;
-    // until then the budget passthrough keeps PR #496 sound on its
-    // own merits.
-    if (opts.timeoutMs != null) {
-      await this.resolver
-        .resolve(peerId, {
-          signal: AbortSignal.timeout(opts.timeoutMs),
-          perStepTimeoutMs: opts.timeoutMs,
-        })
-        .catch(() => undefined);
-    } else {
-      await this.resolver.resolve(peerId).catch(() => undefined);
-    }
+    // Codex review feedback on PR #496:
+    //   round 1 — "pass timeoutMs through so the resolver doesn't run
+    //              unbounded"
+    //   round 3 — "but then timeoutMs is double-spent: once by the
+    //              resolver, once by router.send()"
+    // Both correct. The RIGHT fix is to share a single deadline /
+    // AbortSignal across resolver + router.send, but ProtocolRouter
+    // doesn't accept an external signal today (it builds its own
+    // internally from `timeoutMs`). Plumbing a shared signal through
+    // the router is its own refactor.
+    //
+    // For PR #496 in isolation: this entire code path is transient.
+    // PR-3 of the RFC 07 stack moves resolution into ProtocolRouter
+    // (where the budget can be shared without leaking through public
+    // surfaces) and reduces Messenger to a pass-through. Reverting
+    // the round-1 timeoutMs passthrough avoids the double-spend
+    // regression Codex flagged in round 3 without needing a router
+    // refactor that PR-3 supersedes anyway. The pre-PR behaviour
+    // (resolver runs with default budget, router runs with caller
+    // budget) is what Messenger users (chat / sync) had before this
+    // PR; both use generous timeouts (≥30s) so the resolver's 5s
+    // default doesn't push them over.
+    await this.resolver.resolve(peerId).catch(() => undefined);
     return this.router.send(peerId, protocolId, data, opts.timeoutMs);
   }
 }

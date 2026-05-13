@@ -14,16 +14,21 @@ const PEER_B = '12D3KooWB' + 'b'.repeat(43);
 const RELAY_ADDR =
   '/ip4/178.104.54.178/tcp/9090/p2p/12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M';
 
+type FindPeerImpl = (
+  peerId: NodeIdentity,
+  opts?: { signal?: AbortSignal; timeoutMs?: number },
+) => Promise<Address[]>;
+
 interface MockNetwork extends Network {
   __conns: Map<NodeIdentity, Array<{ remoteAddr: { toString(): string } }>>;
   __addedAddresses: Array<{ peerId: NodeIdentity; addrs: Address[] }>;
-  __findPeerImpl: ((peerId: NodeIdentity) => Promise<Address[]>) | null;
+  __findPeerImpl: FindPeerImpl | null;
 }
 
 function makeNetwork(): MockNetwork {
   const conns = new Map<NodeIdentity, Array<{ remoteAddr: { toString(): string } }>>();
   const added: Array<{ peerId: NodeIdentity; addrs: Address[] }> = [];
-  let findPeerImpl: ((peerId: NodeIdentity) => Promise<Address[]>) | null = null;
+  let findPeerImpl: FindPeerImpl | null = null;
   const net: Partial<MockNetwork> = {
     localId: PEER_A,
     localAddresses: [],
@@ -41,9 +46,9 @@ function makeNetwork(): MockNetwork {
     async addKnownAddresses(peerId: NodeIdentity, addrs: Address[]) {
       added.push({ peerId, addrs });
     },
-    async findPeer(peerId: NodeIdentity) {
+    async findPeer(peerId: NodeIdentity, opts?: { signal?: AbortSignal; timeoutMs?: number }) {
       if (!findPeerImpl) throw new Error('findPeer not configured');
-      return findPeerImpl(peerId);
+      return findPeerImpl(peerId, opts);
     },
   };
   Object.defineProperty(net, '__conns', { value: conns, enumerable: false });
@@ -238,6 +243,116 @@ describe('PeerResolver', () => {
 
     // Falls through to step 4 cleanly.
     expect(out).toEqual([`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`]);
+  });
+
+  // Codex feedback PR #499 round 3: outer signal must short-circuit
+  // every resolver step (not just step 2 / DHT).
+
+  it('aborts before any step runs when signal is already aborted', async () => {
+    let stepsRan = 0;
+    const countingNet = makeNetwork();
+    const origGetConnections = countingNet.getConnections;
+    countingNet.getConnections = (pid) => {
+      stepsRan++;
+      return origGetConnections(pid);
+    };
+    countingNet.__findPeerImpl = async () => {
+      stepsRan++;
+      return ['/ip4/1.2.3.4/tcp/9090'];
+    };
+    const countingRegistry: NetworkStateRegistry = {
+      lookup: () => {
+        stepsRan++;
+        return [];
+      },
+    };
+    const countingDir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => {
+        stepsRan++;
+        return null;
+      },
+    };
+
+    const resolver = new PeerResolver({
+      network: countingNet,
+      registry: countingRegistry,
+      agentDirectory: countingDir,
+    });
+
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const out = await resolver.resolve(PEER_B, { signal: ctrl.signal });
+
+    expect(out).toEqual([]);
+    expect(stepsRan).toBe(0);
+  });
+
+  it('skips later steps once signal is aborted mid-resolve', async () => {
+    let registryCalled = false;
+    let directoryCalled = false;
+    const ctrl = new AbortController();
+
+    net.__findPeerImpl = async () => {
+      ctrl.abort();
+      return [];
+    };
+    const trackingRegistry: NetworkStateRegistry = {
+      lookup: () => {
+        registryCalled = true;
+        return [];
+      },
+    };
+    const trackingDir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => {
+        directoryCalled = true;
+        return null;
+      },
+    };
+
+    const resolver = new PeerResolver({
+      network: net,
+      registry: trackingRegistry,
+      agentDirectory: trackingDir,
+    });
+    await resolver.resolve(PEER_B, { signal: ctrl.signal });
+
+    expect(registryCalled).toBe(false);
+    expect(directoryCalled).toBe(false);
+  });
+
+  // Codex feedback PR #496 round 3: when both signal and
+  // perStepTimeoutMs are passed, both must be honoured. Pre-fix,
+  // signal silently won and the per-step cap was lost.
+
+  it('composes step-local signal honouring both perStepTimeoutMs and outer signal', async () => {
+    const seenSignals: AbortSignal[] = [];
+    const seenTimeouts: number[] = [];
+    net.__findPeerImpl = async (_pid, opts) => {
+      if (opts?.signal) seenSignals.push(opts.signal);
+      if (opts?.timeoutMs != null) seenTimeouts.push(opts.timeoutMs);
+      return [];
+    };
+
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: makeAgentDir(),
+    });
+    const ctrl = new AbortController();
+    await resolver.resolve(PEER_B, {
+      signal: ctrl.signal,
+      perStepTimeoutMs: 1234,
+    });
+
+    expect(seenTimeouts).toEqual([1234]);
+    expect(seenSignals).toHaveLength(1);
+    // Step-local signal IS NOT the outer signal (it's a composition).
+    expect(seenSignals[0]).not.toBe(ctrl.signal);
+    expect(seenSignals[0].aborted).toBe(false);
+
+    // Aborting the outer should propagate.
+    ctrl.abort();
+    expect(seenSignals[0].aborted).toBe(true);
   });
 
   it('returns empty array when nothing resolves', async () => {

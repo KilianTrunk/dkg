@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { dkgGossipMsgId } from '../src/network/gossip-msg-id.js';
+import {
+  dkgGossipMsgId,
+  DkgGossipUnsignedMessageError,
+} from '../src/network/gossip-msg-id.js';
 
 /**
  * RFC 07 §5.4 — `dkgGossipMsgId` is the content-deterministic msgId
@@ -61,10 +64,14 @@ describe('dkgGossipMsgId (RFC 07 §5.4)', () => {
     expect(id.length).toBe(32);
   });
 
-  it('unsigned: length-framed sha256 with seqno=0n and empty from', () => {
-    const id = dkgGossipMsgId({ type: 'unsigned', topic: TOPIC, data: PAYLOAD });
-    expect(id).toEqual(expected(TOPIC, PAYLOAD, new Uint8Array(0), 0n));
-    expect(id.length).toBe(32);
+  // Codex review feedback on PR #501 round 4: unsigned messages have
+  // no publisher identity and no seqno, which would let two different
+  // publishers' identical payloads collapse to the same msgId. The
+  // function rejects them so the false-dedup case is impossible.
+  it('unsigned: throws DkgGossipUnsignedMessageError', () => {
+    expect(() =>
+      dkgGossipMsgId({ type: 'unsigned', topic: TOPIC, data: PAYLOAD }),
+    ).toThrow(DkgGossipUnsignedMessageError);
   });
 
   it('different topics → different msgIds (same payload + from + seqno)', () => {
@@ -105,15 +112,6 @@ describe('dkgGossipMsgId (RFC 07 §5.4)', () => {
       sequenceNumber: 1n, signature: new Uint8Array(), key: {} as never,
     });
     expect(a).not.toEqual(b);
-  });
-
-  it('signed and unsigned with same topic/payload differ', () => {
-    const signed = dkgGossipMsgId({
-      type: 'signed', topic: TOPIC, data: PAYLOAD, from: fakePeerId,
-      sequenceNumber: 0n, signature: new Uint8Array(), key: {} as never,
-    });
-    const unsigned = dkgGossipMsgId({ type: 'unsigned', topic: TOPIC, data: PAYLOAD });
-    expect(signed).not.toEqual(unsigned);
   });
 
   it('UTF-8 topics work', () => {

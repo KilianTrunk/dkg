@@ -611,6 +611,28 @@ function normalizeGeneratedBy(raw: unknown, requestAgentAddress: string): string
   return rdfLiteral(value);
 }
 
+function comparableAgentAddress(value: string): string {
+  const trimmed = value.trim();
+  const unwrapped = trimmed.startsWith('did:dkg:agent:')
+    ? trimmed.slice('did:dkg:agent:'.length)
+    : trimmed;
+  return /^0x[0-9a-fA-F]{40}$/.test(unwrapped) ? unwrapped.toLowerCase() : unwrapped;
+}
+
+function isSameAgentAddress(left: string, right: string): boolean {
+  return left === right || comparableAgentAddress(left) === comparableAgentAddress(right);
+}
+
+function assertImportedArtifactOwnerAddress(
+  assertionAgentAddress: string,
+  requestAgentAddress: string,
+  message: string,
+): void {
+  if (!isSameAgentAddress(assertionAgentAddress, requestAgentAddress)) {
+    throw new ImportArtifactRouteError(403, message);
+  }
+}
+
 function handleImportArtifactRouteError(res: ServerResponse, err: unknown): boolean {
   if (err instanceof ImportArtifactRouteError) {
     jsonResponse(res, err.statusCode, { error: err.message });
@@ -633,6 +655,10 @@ function handleImportArtifactRouteError(res: ServerResponse, err: unknown): bool
 async function resolveImportedArtifact(
   ctx: RequestContext,
   raw: Record<string, unknown>,
+  ownerGuard?: {
+    requestAgentAddress: string;
+    message: string;
+  },
 ): Promise<ImportedArtifactResolution> {
   const contextGraphId = typeof raw.contextGraphId === 'string' ? raw.contextGraphId.trim() : '';
   if (!contextGraphId) {
@@ -689,6 +715,13 @@ async function resolveImportedArtifact(
   );
   if (reconstructedAssertionUri !== assertionUri) {
     throw new ImportArtifactRouteError(400, 'assertionUri is not in canonical assertion URI form');
+  }
+  if (ownerGuard) {
+    assertImportedArtifactOwnerAddress(
+      parsedAssertion.assertionAgentAddress,
+      ownerGuard.requestAgentAddress,
+      ownerGuard.message,
+    );
   }
   if (assertionName && assertionName !== parsedAssertion.assertionName) {
     throw new ImportArtifactRouteError(400, '"assertionName" does not match assertionUri');
@@ -848,7 +881,10 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
     try {
-      const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>);
+      const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>, {
+        requestAgentAddress,
+        message: 'Import artifact metadata can only be read from imported assertions owned by the requesting agent',
+      });
       return jsonResponse(res, 200, { artifact });
     } catch (err) {
       if (handleImportArtifactRouteError(res, err)) return;
@@ -863,7 +899,10 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
     try {
-      const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>);
+      const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>, {
+        requestAgentAddress,
+        message: 'Import artifact Markdown can only be read from imported assertions owned by the requesting agent',
+      });
       const maxBytes = normalizeMarkdownReadLimit((parsed as Record<string, unknown>).maxBytes);
       if (!artifact.markdownHash) {
         return jsonResponse(res, 409, {
@@ -916,14 +955,11 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           'Semantic enrichment is written into the source import assertion; target assertion names are not supported',
         );
       }
-      const artifact = await resolveImportedArtifact(ctx, record);
+      const artifact = await resolveImportedArtifact(ctx, record, {
+        requestAgentAddress,
+        message: 'Semantic enrichment can only modify imported assertions owned by the requesting agent',
+      });
       const semanticQuads = normalizeSemanticQuads(record.semanticQuads);
-      if (artifact.assertionAgentAddress !== requestAgentAddress) {
-        throw new ImportArtifactRouteError(
-          403,
-          'Semantic enrichment can only modify imported assertions owned by the requesting agent',
-        );
-      }
       const generatedAt = normalizeGeneratedAt(record.generatedAt);
       const generationMethod = typeof record.generationMethod === 'string' && record.generationMethod.trim()
         ? record.generationMethod.trim()

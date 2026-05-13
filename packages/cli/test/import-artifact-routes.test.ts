@@ -140,6 +140,7 @@ describe('import artifact daemon routes', () => {
       agentAddress?: string;
       subGraphName?: string;
     }> = [];
+    const queries: string[] = [];
     const queryQuads = args.queryQuads ?? [
       { subject: 'urn:z', predicate: 'urn:p', object: 'urn:o' },
       { subject: 'urn:a', predicate: 'urn:p', object: '"A"' },
@@ -193,6 +194,7 @@ describe('import artifact daemon routes', () => {
           return Boolean(args.targetGraphExists);
         },
         async query(sparql: string) {
+          queries.push(sparql);
           if (sparql.includes('SELECT ?p ?o')) {
             return { type: 'bindings', bindings: [] };
           }
@@ -228,14 +230,14 @@ describe('import artifact daemon routes', () => {
         },
       },
     };
-    return { agent, created, writes, discards };
+    return { agent, created, writes, discards, queries };
   }
 
   it('resolves and safely reads a completed Markdown import artifact by content hash', async () => {
     const entry = await fileStore.put(Buffer.from('# Imported\n\nHello DKG.\n'), 'text/markdown');
     const contextGraphId = 'cg-import-artifact';
     const assertionName = 'imported-md';
-    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:test', assertionName);
     const markdownForm = `urn:dkg:file:${entry.keccak256}`;
     const { agent } = makeAgent({
       contextGraphId,
@@ -258,7 +260,7 @@ describe('import artifact daemon routes', () => {
       contextGraphId,
       assertionUri,
       assertionName,
-      assertionAgentAddress: 'did:dkg:agent:source',
+      assertionAgentAddress: 'did:dkg:agent:test',
       fileHash: entry.keccak256,
       markdownHash: entry.keccak256,
       markdownForm,
@@ -278,6 +280,53 @@ describe('import artifact daemon routes', () => {
       bytes: Buffer.byteLength('# Imported\n\nHello DKG.\n'),
       markdown: '# Imported\n\nHello DKG.\n',
     });
+  });
+
+  it('rejects cross-agent import artifact metadata and Markdown reads', async () => {
+    const entry = await fileStore.put(Buffer.from('# Imported\n'), 'text/markdown');
+    const contextGraphId = 'cg-import-artifact-cross-agent-read';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent, queries } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+    });
+    const extractionStatus = new Map<string, ExtractionStatusRecord>([[
+      assertionUri,
+      {
+        status: 'skipped',
+        assertionName,
+        assertionUri,
+        fileHash: entry.keccak256,
+        detectedContentType: 'application/octet-stream',
+        pipelineUsed: null,
+        tripleCount: 0,
+        startedAt: '2026-05-11T00:00:00.000Z',
+        completedAt: '2026-05-11T00:00:01.000Z',
+      },
+    ]]);
+    await startRoutes({ agent, extractionStatus });
+
+    const resolved = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri,
+      fileHash: entry.keccak256,
+    });
+    expect(resolved.status).toBe(403);
+    expect(resolved.body.error).toMatch(/owned by the requesting agent/);
+
+    const read = await post('/api/assertion/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri,
+      maxBytes: 1024,
+    });
+    expect(read.status).toBe(403);
+    expect(read.body.error).toMatch(/owned by the requesting agent/);
+    expect(queries).toHaveLength(0);
   });
 
   it('requires full assertionUri instead of guessing the source author from assertionName', async () => {
@@ -372,7 +421,7 @@ describe('import artifact daemon routes', () => {
     const contextGraphId = 'cg-semantic-enrichment-cross-agent';
     const assertionName = 'imported-md';
     const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
-    const { agent, writes } = makeAgent({
+    const { agent, writes, queries } = makeAgent({
       contextGraphId,
       assertionName,
       assertionUri,
@@ -380,7 +429,21 @@ describe('import artifact daemon routes', () => {
       markdownHash: entry.keccak256,
       markdownForm: `urn:dkg:file:${entry.keccak256}`,
     });
-    await startRoutes({ agent });
+    const extractionStatus = new Map<string, ExtractionStatusRecord>([[
+      assertionUri,
+      {
+        status: 'skipped',
+        assertionName,
+        assertionUri,
+        fileHash: entry.keccak256,
+        detectedContentType: 'application/octet-stream',
+        pipelineUsed: null,
+        tripleCount: 0,
+        startedAt: '2026-05-11T00:00:00.000Z',
+        completedAt: '2026-05-11T00:00:01.000Z',
+      },
+    ]]);
+    await startRoutes({ agent, extractionStatus });
 
     const result = await post('/api/assertion/semantic-enrichment/write', {
       contextGraphId,
@@ -393,6 +456,7 @@ describe('import artifact daemon routes', () => {
     expect(result.status).toBe(403);
     expect(result.body.error).toMatch(/owned by the requesting agent/);
     expect(writes).toHaveLength(0);
+    expect(queries).toHaveLength(0);
   });
 
   it('stores non-IRI agent identity labels without emitting prov attribution resources', async () => {

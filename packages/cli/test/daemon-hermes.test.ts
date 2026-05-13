@@ -84,6 +84,41 @@ function freshExtractionStatusTimes() {
   return { startedAt, completedAt };
 }
 
+function makeHermesAttachmentStore(refs: Array<{
+  assertionUri: string;
+  fileHash: string;
+  fileName: string;
+  detectedContentType?: string;
+  rootEntity?: string;
+  tripleCount?: number;
+  mdIntermediateHash?: string;
+  markdownForm?: string;
+}>) {
+  return {
+    query: vi.fn(async (sparql: string) => {
+      const ref = refs.find((candidate) => sparql.includes(`<${candidate.assertionUri}>`));
+      if (!ref) return { bindings: [] };
+      if (sparql.includes('SELECT ?fileHash')) {
+        return {
+          bindings: [{
+            fileHash: ref.fileHash,
+            contentType: ref.detectedContentType,
+            rootEntity: ref.rootEntity,
+            extractionStatus: 'completed',
+            tripleCount: ref.tripleCount != null ? String(ref.tripleCount) : undefined,
+            sourceFileName: ref.fileName,
+            mdIntermediateHash: ref.mdIntermediateHash,
+          }],
+        };
+      }
+      if (sparql.includes('?markdownForm')) {
+        return { bindings: ref.markdownForm ? [{ markdownForm: ref.markdownForm }] : [] };
+      }
+      return { bindings: [] };
+    }),
+  };
+}
+
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -106,7 +141,7 @@ function makeHermesRouteContext(
     ctx: {
       req,
       res,
-      agent: { store: {} },
+      agent: { store: { query: vi.fn(async () => ({ bindings: [] })) } },
       config: makeConfig({
         localAgentIntegrations: {
           hermes: {
@@ -1294,6 +1329,7 @@ describe('Hermes daemon routes', () => {
       hasChatTurn: vi.fn(async () => false),
       storeChatExchange: vi.fn(async () => {}),
     }, {}, '/api/hermes-channel/send');
+    ctx.agent.store = makeHermesAttachmentStore([attachmentRef]);
     ctx.extractionStatus.set(attachmentRef.assertionUri, {
       status: 'completed',
       fileName: attachmentRef.fileName,
@@ -1318,7 +1354,7 @@ describe('Hermes daemon routes', () => {
     expect(forwardedBodies).toHaveLength(1);
     expect(forwardedBodies[0]).toMatchObject({
       contextGraphId: 'project-1',
-      attachmentRefs: [attachmentRef],
+      attachmentRefs: [verifiedAttachmentRef],
     });
     expect(forwardedBodies[0].contextEntries[0]).toEqual(contextEntries[0]);
     expect(forwardedBodies[0].contextEntries[1]).toMatchObject({
@@ -1737,6 +1773,11 @@ describe('Hermes daemon routes', () => {
       pipelineUsed: null,
       tripleCount: 0,
     };
+    const verifiedAttachmentRef = {
+      ...attachmentRef,
+      markdownHash: attachmentRef.fileHash,
+      markdownForm: `urn:dkg:file:${attachmentRef.fileHash}`,
+    };
     vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
       return new Response(JSON.stringify({
@@ -1767,6 +1808,7 @@ describe('Hermes daemon routes', () => {
         },
       },
     }, '/api/hermes-channel/send');
+    ctx.agent.store = makeHermesAttachmentStore([attachmentRef]);
     ctx.extractionStatus.set(attachmentRef.assertionUri, {
       status: 'completed',
       fileName: attachmentRef.fileName,

@@ -191,8 +191,7 @@ export class ApiClient {
   async sharedMemoryWrite(contextGraphId: string, quads: Array<{
     subject: string; predicate: string; object: string; graph: string;
   }>): Promise<{
-    workspaceOperationId: string;
-    shareOperationId?: string;
+    shareOperationId: string;
     contextGraphId: string;
     graph: string;
     triplesWritten: number;

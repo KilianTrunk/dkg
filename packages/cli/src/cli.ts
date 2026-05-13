@@ -2804,15 +2804,14 @@ publisherCmd
   .option('--swm-id <value>', 'Shared memory id', 'swm-main')
   .option('--workspace-id <value>', 'Legacy alias for --swm-id')
   .option('--share-operation-id <value>', 'Share operation id')
-  .option('--workspace-operation-id <value>', 'Legacy alias for --share-operation-id')
   .option('--transition-type <value>', 'Transition type (CREATE|MUTATE|REVOKE)', 'CREATE')
   .option('--authority-type <value>', 'Authority type (owner|multisig|quorum|capability)', 'owner')
   .option('--prior-version <value>', 'Prior version reference for MUTATE/REVOKE flows')
   .action(async (contextGraph: string, opts: ActionOpts) => {
     try {
-      const shareOperationId = opts.shareOperationId ?? opts.workspaceOperationId;
+      const shareOperationId = opts.shareOperationId;
       if (!shareOperationId) {
-        console.error('Provide --share-operation-id (or legacy --workspace-operation-id).');
+        console.error('Provide --share-operation-id.');
         process.exit(1);
       }
       const roots = (opts.root as string[] | undefined)?.map((v) => v.trim()).filter(Boolean) ?? [];

@@ -255,9 +255,15 @@ export class SharedMemoryHandler {
       if (request.operationId) {
         ctx = createOperationContext('share', request.operationId);
       }
-      const { nquads, manifest, publisherPeerId, workspaceOperationId: shareOperationId, timestampMs, casConditions, subGraphName } = request;
+      const { nquads, manifest, publisherPeerId, timestampMs, casConditions, subGraphName } = request;
+      const shareOperationId = request.shareOperationId?.trim();
       const sgLabel = subGraphName ? `/${subGraphName}` : '';
       this.log.info(ctx, `SWM write from ${fromPeerId} for context graph ${contextGraphId}${sgLabel} op=${shareOperationId}`);
+
+      if (!shareOperationId) {
+        this.log.warn(ctx, `SWM write rejected: missing shareOperationId for context graph "${contextGraphId}"`);
+        return;
+      }
 
       if (publisherPeerId !== fromPeerId) {
         this.log.warn(ctx, `SWM write rejected: payload publisherPeerId "${publisherPeerId}" does not match sender "${fromPeerId}"`);

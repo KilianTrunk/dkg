@@ -1,0 +1,190 @@
+/**
+ * PeerResolver — RFC 07 §3.
+ *
+ * Single in-process service every dial path consults before
+ * `network.dialProtocol(peerId, …)`. Defined resolution order
+ * (RFC 07 §3.1):
+ *
+ *   1. Active-connection cache — `network.getConnections(peerId)`.
+ *      If a live conn exists the caller doesn't need any new addresses;
+ *      we return its remote multiaddr and stop.
+ *   2. DHT lookup — `network.findPeer(peerId)` with a per-step timeout.
+ *   3. NetworkStateRegistry (RFC 04) — chain-anchored attestations.
+ *      Stub in v1; populated when RFC 04 Phase 2 lands.
+ *   4. Agent directory (agents-CG SPARQL) — preserves the chat-only
+ *      `Messenger.ensureCircuitRelayAddress` behaviour we're replacing.
+ *   5. Bootstrap seeds — last resort, only used when steps 1-4
+ *      produced nothing (cold-start situation).
+ *
+ * Each step that finds addresses calls `network.addKnownAddresses` so
+ * a subsequent `dialProtocol(peerId)` hits the transport's address
+ * book without re-resolving. Returned list is deduplicated, ordered
+ * freshest-first; callers should try in order and stop on first
+ * successful dial.
+ *
+ * v1 implements `recordDialSuccess` / `recordDialFailure` /
+ * `isHealthy` as stubs; address-health scoring is deferred to a
+ * follow-up RFC.
+ *
+ * See also: `dkgv10-spec/production_mainnet/07_IN_PROCESS_PEER_RESOLVER.md`.
+ */
+import type { Network, NodeIdentity, Address } from './network.js';
+import type { NetworkStateRegistry } from './network-state-registry.js';
+
+/**
+ * Minimal interface PeerResolver needs from the agents-CG. Defined in
+ * core so PeerResolver doesn't import from `packages/agent`. The
+ * existing `DiscoveryClient.findAgentByPeerId` shape is wrapped at
+ * the construction site (see `dkg-agent.ts`).
+ */
+export interface AgentDirectoryLookup {
+  /**
+   * Returns the relay multiaddr advertised for `peerId` in the agents
+   * context graph, or `null` if none is recorded. The resolver
+   * appends `/p2p-circuit/p2p/<peerId>` to construct the dialable form.
+   */
+  findRelayForPeer(peerId: NodeIdentity): Promise<Address | null>;
+}
+
+export interface PeerResolverDeps {
+  network: Network;
+  registry: NetworkStateRegistry;
+  agentDirectory: AgentDirectoryLookup;
+  bootstrapSeeds?: Address[];
+  /** Optional logger; defaults to silent except for serious errors. */
+  logger?: PeerResolverLogger;
+}
+
+export interface PeerResolverLogger {
+  warn(msg: string): void;
+  debug?(msg: string): void;
+}
+
+export interface ResolveOpts {
+  /**
+   * Skip the DHT lookup step. Used by callers that already know the
+   * peer isn't in the routing table — e.g. cold-start `/api/connect`.
+   */
+  skipDht?: boolean;
+  /**
+   * Per-step timeout in ms; default 5_000. Caller is responsible for
+   * the overall timeout budget across steps.
+   */
+  perStepTimeoutMs?: number;
+  /** AbortSignal to cancel in-flight resolution. */
+  signal?: AbortSignal;
+}
+
+const DEFAULT_PER_STEP_TIMEOUT_MS = 5_000;
+
+const SILENT_LOGGER: PeerResolverLogger = {
+  warn: () => undefined,
+};
+
+export class PeerResolver {
+  private readonly network: Network;
+  private readonly registry: NetworkStateRegistry;
+  private readonly agentDirectory: AgentDirectoryLookup;
+  private readonly bootstrapSeeds: Address[];
+  private readonly logger: PeerResolverLogger;
+
+  constructor(deps: PeerResolverDeps) {
+    this.network = deps.network;
+    this.registry = deps.registry;
+    this.agentDirectory = deps.agentDirectory;
+    this.bootstrapSeeds = deps.bootstrapSeeds ?? [];
+    this.logger = deps.logger ?? SILENT_LOGGER;
+  }
+
+  /**
+   * Resolve `peerId` to an ordered list of multiaddrs to attempt.
+   * See class doc for the resolution order; never throws — failures
+   * in one step proceed to the next.
+   */
+  async resolve(peerId: NodeIdentity, opts?: ResolveOpts): Promise<Address[]> {
+    const accumulated: Address[] = [];
+    const seen = new Set<string>();
+    const append = (addrs: Address[]): void => {
+      for (const a of addrs) {
+        if (a && !seen.has(a)) {
+          seen.add(a);
+          accumulated.push(a);
+        }
+      }
+    };
+
+    // Step 1: active-connection cache. Sub-millisecond. If a live
+    // connection exists the caller will reuse it via libp2p
+    // connection-deduplication; no need to walk further.
+    const live = this.network.getConnections(peerId);
+    if (live.length > 0) {
+      append(live.map((c) => c.remoteAddr.toString()));
+      return accumulated;
+    }
+
+    // Step 2: DHT lookup. Cheap for peers in the routing table;
+    // expensive for cold peers. Skipped if caller asked or transport
+    // doesn't support peer-routing.
+    if (!opts?.skipDht && typeof this.network.findPeer === 'function') {
+      try {
+        const dhtAddrs = await this.network.findPeer(peerId, {
+          signal: opts?.signal,
+          timeoutMs: opts?.perStepTimeoutMs ?? DEFAULT_PER_STEP_TIMEOUT_MS,
+        });
+        if (dhtAddrs.length > 0) {
+          append(dhtAddrs);
+          await this.network.addKnownAddresses(peerId, dhtAddrs);
+        }
+      } catch (err) {
+        // DHT miss is the steady-state expectation for non-staked or
+        // not-yet-discovered peers. Log at debug only.
+        this.logger.debug?.(`DHT lookup for ${peerId} failed: ${errMsg(err)}`);
+      }
+    }
+
+    // Step 3: NetworkStateRegistry (RFC 04). Stub in v1.
+    const registryAddrs = this.registry.lookup(peerId);
+    if (registryAddrs.length > 0) {
+      append(registryAddrs);
+      await this.network.addKnownAddresses(peerId, registryAddrs);
+    }
+
+    // Step 4: agent-directory SPARQL fallback. Replaces the chat-only
+    // Messenger.ensureCircuitRelayAddress path.
+    try {
+      const relay = await this.agentDirectory.findRelayForPeer(peerId);
+      if (relay) {
+        const circuitAddr = `${relay}/p2p-circuit/p2p/${peerId}`;
+        append([circuitAddr]);
+        await this.network.addKnownAddresses(peerId, [circuitAddr]);
+      }
+    } catch (err) {
+      this.logger.debug?.(`agents-CG lookup for ${peerId} failed: ${errMsg(err)}`);
+    }
+
+    // Step 5: bootstrap seeds. Only when 1-4 produced nothing — by
+    // then it's cold-start and the seeds may be the only way to
+    // bootstrap a DHT walk on the next attempt.
+    if (accumulated.length === 0 && this.bootstrapSeeds.length > 0) {
+      append(this.bootstrapSeeds);
+    }
+
+    return accumulated;
+  }
+
+  recordDialSuccess(_addr: Address): void {
+    // v1: no-op. Address-health scoring is a follow-up RFC.
+  }
+
+  recordDialFailure(addr: Address, reason: string): void {
+    this.logger.debug?.(`dial failure for ${addr}: ${reason}`);
+  }
+
+  isHealthy(_addr: Address): boolean {
+    return true;
+  }
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}

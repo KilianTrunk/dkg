@@ -1,5 +1,6 @@
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
+  LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
   PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
   PROTOCOL_SWM_SENDER_KEY,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
@@ -898,6 +899,9 @@ export class DKGAgent {
   gossip!: GossipSubManager;
   router!: ProtocolRouter;
   messenger!: Messenger;
+  /** Single in-process peer-address resolver (RFC 07 §3). Used by Messenger
+   * today; ProtocolRouter / /api/connect migrate in PR-3 / PR-4. */
+  peerResolver!: PeerResolver;
   readonly eventBus: TypedEventBus;
   private readonly chain: ChainAdapter;
   /** Shared memory-owned root entities per context graph: entity → creatorPeerId. Used by publisher and shared memory handler. */
@@ -1311,10 +1315,27 @@ export class DKGAgent {
     }
 
     this.router = new ProtocolRouter(this.node);
+    const network = new LibP2PNetwork(this.node);
+    const peerResolver = new PeerResolver({
+      network,
+      registry: new StubNetworkStateRegistry(),
+      agentDirectory: {
+        // Wraps DiscoveryClient.findAgentByPeerId in the resolver's
+        // minimal AgentDirectoryLookup shape so packages/core doesn't
+        // need to know about the agents-CG SPARQL surface. Replaced
+        // when RFC 04 Phase 2 lands — at that point, the registry
+        // step takes precedence and this fallback is rarely hit.
+        findRelayForPeer: async (peerId) => {
+          const agent = await this.discovery.findAgentByPeerId(peerId);
+          return agent?.relayAddress ?? null;
+        },
+      },
+      bootstrapSeeds: this.config.bootstrapPeers ?? [],
+    });
+    this.peerResolver = peerResolver;
     this.messenger = new Messenger({
-      libp2p: this.node.libp2p as any,
+      resolver: peerResolver,
       router: this.router,
-      discovery: this.discovery,
     });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
     await this.loadSwmSenderKeyState();

@@ -40,8 +40,9 @@ export interface SendOpts {
  *
  * Discovery is currently SPARQL-first against the agents context graph; this
  * is preserved verbatim from the previous DKGAgent.ensureCircuitRelayAddress
- * implementation. See dkgv10-spec/production_mainnet/04_NETWORK_RELAY_REGISTRY.md
- * for the planned chain-driven replacement.
+ * implementation. See dkgv10-spec/production_mainnet/04_NETWORK_STATE_REGISTRY.md
+ * for the planned chain-driven replacement, and 07_IN_PROCESS_PEER_RESOLVER.md
+ * for the in-process resolver that all dial paths will eventually consume.
  */
 export class Messenger {
   private readonly libp2p: Libp2pLike;

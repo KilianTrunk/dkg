@@ -327,20 +327,18 @@ describe('@unit Profile contract', function () {
   });
 
   // =====================================================================
-  // RFC 04 / Issue #461 — relay-capability + multiaddr advertisement.
+  // RFC 04 v0.3 / Issue #461 — relay-capability flag.
+  // Multiaddrs are intentionally NOT stored on Profile — they live in
+  // per-round attestation KCs (RFC 04 §5.2).
   // =====================================================================
 
-  describe('Relay registry fields (RFC 04 / Issue #461)', () => {
-    const validMultiaddr =
-      '/ip4/178.104.54.178/tcp/9090/p2p/12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M';
-
+  describe('Relay capability flag (RFC 04 v0.3 / Issue #461)', () => {
     beforeEach(async () => {
       await Profile.createProfile(accounts[1].address, [], 'Node 1', nodeId1, 1000);
     });
 
-    it('relayCapable defaults to false and multiaddrs to empty', async () => {
+    it('relayCapable defaults to false', async () => {
       expect(await ProfileStorage.getRelayCapable(identityId1)).to.equal(false);
-      expect(await ProfileStorage.getMultiaddrs(identityId1)).to.deep.equal([]);
     });
 
     it('admin wallet can flip relayCapable', async () => {
@@ -368,68 +366,14 @@ describe('@unit Profile contract', function () {
       ).to.be.reverted; // onlyIdentityOwner runs first against nonexistent identity
     });
 
-    it('admin wallet can publish multiaddrs and they roundtrip', async () => {
-      const addrs = [validMultiaddr, '/dns/relay.example.com/tcp/443/wss/p2p/12D3KooWAbcDef'];
-      await expect(Profile.connect(accounts[1]).updateMultiaddrs(identityId1, addrs))
-        .to.emit(ProfileStorage, 'MultiaddrsUpdated')
-        .withArgs(identityId1, addrs);
-      expect(await ProfileStorage.getMultiaddrs(identityId1)).to.deep.equal(addrs);
-    });
-
-    it('updateMultiaddrs is wholesale-replacement, not append', async () => {
-      await Profile.connect(accounts[1]).updateMultiaddrs(identityId1, [validMultiaddr, '/ip4/10.0.0.1/tcp/9090']);
-      await Profile.connect(accounts[1]).updateMultiaddrs(identityId1, [validMultiaddr]);
-      expect(await ProfileStorage.getMultiaddrs(identityId1)).to.deep.equal([validMultiaddr]);
-    });
-
-    it('passing an empty array clears multiaddrs', async () => {
-      await Profile.connect(accounts[1]).updateMultiaddrs(identityId1, [validMultiaddr]);
-      await Profile.connect(accounts[1]).updateMultiaddrs(identityId1, []);
-      expect(await ProfileStorage.getMultiaddrs(identityId1)).to.deep.equal([]);
-    });
-
-    it('rejects more than MAX_MULTIADDRS entries (8)', async () => {
-      const tooMany = Array.from({ length: 9 }, (_, i) => `/ip4/10.0.0.${i}/tcp/9090`);
-      await expect(
-        Profile.connect(accounts[1]).updateMultiaddrs(identityId1, tooMany),
-      )
-        .to.be.revertedWithCustomError(Profile, 'TooManyMultiaddrs')
-        .withArgs(8, 9);
-    });
-
-    it('rejects empty multiaddr entries', async () => {
-      await expect(
-        Profile.connect(accounts[1]).updateMultiaddrs(identityId1, [validMultiaddr, '']),
-      )
-        .to.be.revertedWithCustomError(Profile, 'EmptyMultiaddr')
-        .withArgs(1);
-    });
-
-    it('rejects multiaddr entries longer than MAX_MULTIADDR_LENGTH (256)', async () => {
-      const tooLong = '/dns/' + 'x'.repeat(260);
-      await expect(
-        Profile.connect(accounts[1]).updateMultiaddrs(identityId1, [tooLong]),
-      )
-        .to.be.revertedWithCustomError(Profile, 'MultiaddrTooLong')
-        .withArgs(256, tooLong.length);
-    });
-
-    it('non-owner cannot updateMultiaddrs', async () => {
-      await expect(
-        Profile.connect(accounts[5]).updateMultiaddrs(identityId1, [validMultiaddr]),
-      ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminOrOperationalAddressesFunction');
-    });
-
-    it('getProfile surfaces relayCapable and multiaddrs alongside legacy fields', async () => {
+    it('getProfile surfaces relayCapable alongside legacy fields', async () => {
       await Profile.connect(accounts[1]).updateRelayCapable(identityId1, true);
-      await Profile.connect(accounts[1]).updateMultiaddrs(identityId1, [validMultiaddr]);
-      const [name, nodeId, ask, opFees, relayCapable, multiaddrs] = await ProfileStorage.getProfile(identityId1);
+      const [name, nodeId, ask, opFees, relayCapable] = await ProfileStorage.getProfile(identityId1);
       expect(name).to.equal('Node 1');
       expect(nodeId).to.equal(nodeId1);
       expect(ask).to.equal(0n);
       expect(opFees.length).to.equal(1);
       expect(relayCapable).to.equal(true);
-      expect(multiaddrs).to.deep.equal([validMultiaddr]);
     });
   });
 });

@@ -742,15 +742,15 @@ export interface ChainAdapter {
     additionalAddresses?: string[];
   }): Promise<OperationalWalletRegistrationResult>;
 
-  // ----- Network Relay Registry (RFC 04 / Issue #461) -----
+  // ----- Network State Registry (RFC 04 v0.3 / Issue #461) -----
   //
-  // Surfaces the per-profile relay-capability flag and multiaddr
-  // advertisement that core nodes attest to in submitProofV2 (Phase 2)
-  // and edges resolve through the NetworkStateRegistry (Phase 3).
+  // Surfaces the per-profile relay-capability flag. Multiaddrs themselves
+  // are NOT exposed here — they live in per-round attestation KCs that
+  // submitProofV2 mints (Phase 2), not on Profile (RFC 04 §5.2).
   //
-  // Read methods take an explicit identityId so consumers can resolve
-  // any node's profile (their own or a peer's). Write methods resolve
-  // the caller's identityId from the bound signer and call the
+  // The read method takes an explicit identityId so consumers can resolve
+  // any node's flag (their own or a peer's). The write method resolves
+  // the caller's identityId from the bound signer and calls the
   // onlyIdentityOwner-gated update entry point on Profile.sol — an
   // operator wanting to flip another node's flag would need that
   // node's admin/operational key, which the adapter intentionally
@@ -759,23 +759,12 @@ export interface ChainAdapter {
   /** RFC 04 — read the relay-capability flag on a node profile. */
   getRelayCapable?(identityId: bigint): Promise<boolean>;
 
-  /** RFC 04 — read the advertised libp2p multiaddrs on a node profile. */
-  getMultiaddrs?(identityId: bigint): Promise<string[]>;
-
   /**
    * RFC 04 — flip the bound signer's own relay-capability flag.
    * Resolves the caller's identityId from the signer; throws when
    * no profile is registered.
    */
   setRelayCapable?(relayCapable: boolean): Promise<TxResult>;
-
-  /**
-   * RFC 04 — publish the bound signer's listening multiaddrs.
-   * Wholesale replacement: pass the full intended set each call.
-   * Adapters MUST enforce the on-chain bounds (max 8 entries,
-   * each ≤256 bytes) client-side as a fast-fail before broadcast.
-   */
-  setMultiaddrs?(multiaddrs: string[]): Promise<TxResult>;
 
   /**
    * Confirm that an address is registered as an OPERATIONAL_KEY for an identity.

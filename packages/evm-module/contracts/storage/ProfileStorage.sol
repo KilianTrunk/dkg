@@ -10,8 +10,9 @@ import {IVersioned} from "../interfaces/IVersioned.sol";
 contract ProfileStorage is INamed, IVersioned, HubDependent {
     string private constant _NAME = "ProfileStorage";
     // Bumped 1.0.0 -> 1.1.0: ProfileInfo struct extended with relayCapable
-    // and multiaddrs[] fields (RFC 04 / Issue #461). New mapping reads on
-    // existing keys return zero/empty for the new fields.
+    // (RFC 04 v0.3 / Issue #461). New mapping reads on existing keys return
+    // false for the new field. Multiaddrs were briefly added on a prior
+    // revision but are deliberately not stored on Profile (RFC 04 §5.2).
     string private constant _VERSION = "1.1.0";
 
     event ProfileCreated(uint72 indexed identityId, string nodeName, bytes nodeId, uint16 initialOperatorFee);
@@ -27,9 +28,8 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
         uint256 effectiveDate
     );
     event OperatorFeesUpdated(uint72 indexed identityId, ProfileLib.OperatorFee[] operatorFees);
-    // RFC 04: relay-capability + multiaddr advertisement.
+    // RFC 04 v0.3: relay-capability flag (multiaddrs live in attestation KCs, not Profile).
     event RelayCapabilityUpdated(uint72 indexed identityId, bool oldValue, bool newValue);
-    event MultiaddrsUpdated(uint72 indexed identityId, string[] multiaddrs);
 
     mapping(uint72 => ProfileLib.ProfileInfo) public profiles;
     mapping(string => bool) public isNameTaken;
@@ -71,8 +71,7 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
             bytes memory,
             uint96,
             ProfileLib.OperatorFee[] memory,
-            bool,
-            string[] memory
+            bool
         )
     {
         ProfileLib.ProfileInfo storage profile = profiles[identityId];
@@ -82,8 +81,7 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
             profile.nodeId,
             profile.ask,
             profile.operatorFees,
-            profile.relayCapable,
-            profile.multiaddrs
+            profile.relayCapable
         );
     }
 
@@ -161,15 +159,13 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
     }
 
     // =====================================================================
-    // RFC 04 / Issue #461 — relay-capability + multiaddr advertisement.
+    // RFC 04 v0.3 / Issue #461 — relay-capability flag.
     //
-    // These fields populate the on-chain side of the operator-attestation
-    // body that core nodes mint per RandomSampling round in submitProofV2
-    // (Phase 2). Edges resolve circuit-relay multiaddrs from this data
-    // through the NetworkStateRegistry (Phase 3).
-    //
-    // Bound enforcement (length / per-entry size) lives on the Profile.sol
-    // entry points; this storage layer trusts its onlyContracts caller.
+    // This flag is the operator's "I intend to run as a relay" hint. It
+    // gates the operator's per-round attestation publish (RFC 04 Phase 2)
+    // — operators with relayCapable=false don't bother running the cosig
+    // + submit pipeline at all. Multiaddrs themselves live in the
+    // per-round attestation KC body, not on Profile (RFC 04 §5.2).
     // =====================================================================
 
     function getRelayCapable(uint72 identityId) external view returns (bool) {
@@ -182,24 +178,6 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
         profile.relayCapable = relayCapable;
 
         emit RelayCapabilityUpdated(identityId, oldValue, relayCapable);
-    }
-
-    function getMultiaddrs(uint72 identityId) external view returns (string[] memory) {
-        return profiles[identityId].multiaddrs;
-    }
-
-    function setMultiaddrs(uint72 identityId, string[] calldata multiaddrs) external onlyContracts {
-        // Wholesale replacement keeps the storage write predictable and
-        // avoids a partial-update edge case where stale entries linger.
-        delete profiles[identityId].multiaddrs;
-        for (uint256 i; i < multiaddrs.length; ) {
-            profiles[identityId].multiaddrs.push(multiaddrs[i]);
-            unchecked {
-                ++i;
-            }
-        }
-
-        emit MultiaddrsUpdated(identityId, multiaddrs);
     }
 
     function replacePendingOperatorFee(

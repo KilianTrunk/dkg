@@ -760,13 +760,13 @@ export async function runDaemonInner(
     }
   }
 
-  // RFC 04 / Issue #461 — push this node's externally-reachable
-  // multiaddrs (and optional relay-capability flag) to the on-chain
-  // Profile so peers can discover us via the chain-driven
-  // NetworkStateRegistry rolled out in Phase 3. Best-effort and
-  // non-blocking: fired on a setTimeout(0) so chain RPC slowness can't
-  // delay daemon ready, and the agent.publishRelayRegistry() impl is
-  // itself a no-throw (logs+returns on every error path).
+  // RFC 04 v0.3 / Issue #461 — sync the on-chain `relayCapable` hint
+  // flag from the operator's intent (config.relayCapable). Multiaddrs
+  // themselves are NOT published here — they go in per-RS-round
+  // attestation KCs once submitProofV2 lands (RFC 04 Phase 2).
+  // Best-effort and non-blocking: fired on a setTimeout(0) so chain RPC
+  // slowness can't delay daemon ready, and agent.publishRelayRegistry()
+  // is itself a no-throw (logs+returns on every error path).
   const relayRegistryTimer = setTimeout(() => {
     void agent
       .publishRelayRegistry({ relayCapable: config.relayCapable === true })

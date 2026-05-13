@@ -6,7 +6,7 @@ export * from './event-bus.js';
 export { Logger, createOperationContext, type OperationContext, type OperationName, type LogSink } from './logger.js';
 export * from './crypto/index.js';
 export * from './proto/index.js';
-export { DKGNode, isPublicLikeAddress, isLocalOrInternalHostname } from './node.js';
+export { DKGNode } from './node.js';
 export { ProtocolRouter, DEFAULT_MAX_READ_BYTES } from './protocol-router.js';
 export { GossipSubManager, type GossipMessageHandler } from './gossipsub-manager.js';
 export { PeerDiscoveryManager } from './discovery.js';

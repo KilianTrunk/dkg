@@ -3989,30 +3989,39 @@ export class DKGAgent {
   }
 
   /**
-   * Resolve a peer's current multiaddrs via the libp2p Kademlia DHT and
+   * Resolve a peer's current multiaddrs via the {@link PeerResolver} and
    * dial them. Used by the V10 invite flow where invites carry only a peer
    * id — the daemon discovers up-to-date addresses at join time so the
    * invite stays valid across relay rotations and IP changes (which broke
    * the legacy multiaddr-in-invite design).
    *
+   * After RFC 07 PR-4 the inline DHT walk is gone; resolution is delegated
+   * to the resolver, which runs the full RFC 07 §3.1 order: live conn →
+   * DHT → RFC 04 registry (stub) → agents-CG fallback → bootstrap seeds.
+   * The resolver primes the libp2p peerStore as a side effect, so a plain
+   * `libp2p.dial(peerId)` here finds a route. The agents-CG fallback in
+   * particular is a new capability — the legacy inline path had no way
+   * to reach a peer whose DHT record was stale but whose relay was still
+   * advertised in the agent registry.
+   *
    * Errors:
    *   - `INVALID_PEER_ID` — client-side parse failure (HTTP 400).
    *   - `SELF_DIAL` — caller asked us to dial our own peer id (HTTP 400).
-   *   - `PEER_NOT_FOUND` — DHT walk completed cleanly but no record exists
-   *     for the id (libp2p `NotFoundError` or empty multiaddr set). Genuine
-   *     negative lookup → HTTP 404. Retrying is unlikely to help until the
-   *     remote node republishes.
-   *   - `DHT_TIMEOUT` — `peerRouting.findPeer` aborted before completing
-   *     the Kademlia walk (slow network, sparse routing table). Retriable
-   *     → HTTP 504.
-   *   - `DHT_UNAVAILABLE` — peerRouting threw a non-NotFound error before
-   *     the walk could resolve (transport failure, bootstrap unreachable).
-   *     Retriable → HTTP 503.
-   *   - `DIAL_FAILED` — DHT returned multiaddrs but every dial attempt
+   *   - `PEER_NOT_FOUND` — resolver returned no addresses (DHT miss AND
+   *     no agents-CG record AND no bootstrap seeds). Genuine negative
+   *     lookup → HTTP 404. Retrying is unlikely to help until the remote
+   *     node republishes.
+   *   - `DIAL_FAILED` — resolver returned addresses but every dial attempt
    *     failed. Retriable transport-level → HTTP 502.
-   * Distinguishing PEER_NOT_FOUND from the retriable variants matters for
-   * UI copy: a 404 means "wrong peer id" (don't retry, ask the curator),
-   * a 503/504 means "the network is sick" (retry in a moment).
+   *
+   * Note (regression vs PR #431): the previous implementation distinguished
+   * `DHT_TIMEOUT` (504) and `DHT_UNAVAILABLE` (503) from `PEER_NOT_FOUND`
+   * because the inline walk surfaced the underlying failure shape. The
+   * resolver is best-effort and swallows per-step errors (it returns an
+   * empty array on miss). Both transient cases now collapse into `404`.
+   * The 502 (addresses found, dial failed) distinction is preserved.
+   * If reviewers want the 503/504 codes back, the follow-up is to add a
+   * `resolveWithDiagnostics` method to PeerResolver — out of scope here.
    */
   async connectToPeerId(peerIdStr: string, options?: { timeoutMs?: number }): Promise<void> {
     const ctx = createOperationContext('connect');
@@ -4035,82 +4044,30 @@ export class DKGAgent {
     }
 
     // Fast-path: already connected (e.g. via gossipsub mesh / mDNS / a
-    // prior invite). Skip the DHT walk in that case to keep retried
-    // joins snappy.
+    // prior invite). Resolver step 1 would also short-circuit on this,
+    // but the early return preserves the existing log message and skips
+    // the rest of the resolution machinery entirely.
     const existing = this.node.libp2p.getConnections(peerId);
     if (existing.length > 0) {
       this.log.info(ctx, `Already connected to ${peerIdStr}`);
       return;
     }
 
-    const peerRouting = (this.node.libp2p as any).peerRouting;
-    if (!peerRouting || typeof peerRouting.findPeer !== 'function') {
-      const error = new Error('libp2p peerRouting unavailable (DHT not configured)');
-      (error as any).code = 'PEER_ROUTING_UNAVAILABLE';
-      throw error;
-    }
-
-    this.log.info(ctx, `Resolving ${peerIdStr} via DHT...`);
-    let info: { multiaddrs?: any[] };
-    try {
-      info = await peerRouting.findPeer(peerId, {
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch (err: any) {
-      // Distinguish three failure modes so the HTTP layer can map them to
-      // different status codes and the UI can render specific copy:
-      //   - timeout / abort  → DHT_TIMEOUT (504, retriable)
-      //   - genuine NotFound → PEER_NOT_FOUND (404, terminal until republish)
-      //   - anything else    → DHT_UNAVAILABLE (503, retriable transport)
-      // Codex review on PR #431 flagged that collapsing all of these into
-      // PEER_NOT_FOUND made transient DHT issues look like "wrong peer id".
-      const name = err?.name as string | undefined;
-      const errCode = err?.code as string | undefined;
-      const isAbort =
-        name === 'AbortError' ||
-        errCode === 'ABORT_ERR' ||
-        errCode === 'ERR_TIMEOUT' ||
-        /timed?\s*out|aborted/i.test(err?.message ?? '');
-      const isNotFound =
-        name === 'NotFoundError' ||
-        errCode === 'ERR_NOT_FOUND' ||
-        errCode === 'NotFoundError';
-
-      let code: string;
-      let prefix: string;
-      if (isAbort) {
-        code = 'DHT_TIMEOUT';
-        prefix = `DHT_TIMEOUT: peerRouting.findPeer aborted after ${timeoutMs}ms`;
-      } else if (isNotFound) {
-        code = 'PEER_NOT_FOUND';
-        prefix = `PEER_NOT_FOUND: DHT walk completed without locating ${peerIdStr}`;
-      } else {
-        code = 'DHT_UNAVAILABLE';
-        prefix = `DHT_UNAVAILABLE: ${err?.message ?? String(err)}`;
-      }
-      const error = new Error(prefix);
-      (error as any).code = code;
-      throw error;
-    }
-
-    const addrs = (info?.multiaddrs ?? []).map((m: any) => m?.toString?.() ?? String(m)).filter(Boolean);
+    this.log.info(ctx, `Resolving ${peerIdStr} via PeerResolver...`);
+    const addrs = await this.peerResolver.resolve(peerIdStr, {
+      perStepTimeoutMs: timeoutMs,
+    });
     if (addrs.length === 0) {
-      // The walk completed and the DHT gave us a record with no usable
-      // multiaddrs. Practically equivalent to NotFound from a dialer's
-      // perspective.
-      const error = new Error(`PEER_NOT_FOUND: DHT returned a record for ${peerIdStr} with no addresses`);
+      const error = new Error(
+        `PEER_NOT_FOUND: PeerResolver returned no addresses for ${peerIdStr}`,
+      );
       (error as any).code = 'PEER_NOT_FOUND';
       throw error;
     }
-    this.log.info(ctx, `DHT resolved ${peerIdStr} → ${addrs.length} addr(s); dialling...`);
+    this.log.info(ctx, `Resolved ${peerIdStr} → ${addrs.length} addr(s); dialling...`);
 
-    try {
-      await this.node.libp2p.peerStore.merge(peerId, { multiaddrs: info.multiaddrs ?? [] });
-    } catch {
-      // peerStore merge is best-effort; libp2p.dial(peerId) will still
-      // attempt a fresh DHT lookup if the merge didn't take.
-    }
-
+    // peerStore is already primed by the resolver. dial(peerId) finds the
+    // addresses there and goes.
     try {
       await this.node.libp2p.dial(peerId, { signal: AbortSignal.timeout(timeoutMs) });
       this.log.info(ctx, `Connected to ${peerIdStr}`);

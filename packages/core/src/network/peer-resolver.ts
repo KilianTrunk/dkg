@@ -189,6 +189,30 @@ export class PeerResolver {
       this.logger.debug?.(`live-conn lookup for ${peerId} failed: ${errMsg(err)}`);
     }
 
+    // Codex review (PR #496 round 6, peer-resolver.ts:205): the
+    // returned `accumulated` list is the resolver's contract surface —
+    // callers (and ProtocolRouter via the migration in PR #497) treat
+    // a non-empty return as proof the peerStore is primed. Steps 2-4
+    // therefore MUST only append an address after `addKnownAddresses`
+    // has actually written it. The previous order (append → merge)
+    // would on a peerStore failure leave the caller thinking
+    // resolution succeeded while the bare peer-id dial silently
+    // missed every address.
+    const primeAndAppend = async (
+      addrs: Address[],
+      stepLabel: string,
+    ): Promise<void> => {
+      if (addrs.length === 0) return;
+      try {
+        await this.network.addKnownAddresses(peerId, addrs);
+        append(addrs);
+      } catch (err) {
+        this.logger.debug?.(
+          `peerStore merge during ${stepLabel} for ${peerId} failed: ${errMsg(err)}`,
+        );
+      }
+    };
+
     // Step 2: DHT lookup. Cheap for peers in the routing table;
     // expensive for cold peers. Skipped if caller asked or transport
     // doesn't support peer-routing.
@@ -200,10 +224,7 @@ export class PeerResolver {
           signal: stepSignal(perStepMs),
           timeoutMs: perStepMs,
         });
-        if (dhtAddrs.length > 0) {
-          append(dhtAddrs);
-          await this.network.addKnownAddresses(peerId, dhtAddrs);
-        }
+        await primeAndAppend(dhtAddrs, 'DHT');
       } catch (err) {
         // DHT miss is the steady-state expectation for non-staked or
         // not-yet-discovered peers. Log at debug only.
@@ -219,10 +240,7 @@ export class PeerResolver {
     if (aborted()) return accumulated;
     try {
       const registryAddrs = await this.registry.lookup(peerId);
-      if (registryAddrs.length > 0) {
-        append(registryAddrs);
-        await this.network.addKnownAddresses(peerId, registryAddrs);
-      }
+      await primeAndAppend(registryAddrs, 'registry');
     } catch (err) {
       this.logger.debug?.(`registry lookup for ${peerId} failed: ${errMsg(err)}`);
     }
@@ -238,8 +256,7 @@ export class PeerResolver {
       });
       if (relay) {
         const circuitAddr = `${relay}/p2p-circuit/p2p/${peerId}`;
-        append([circuitAddr]);
-        await this.network.addKnownAddresses(peerId, [circuitAddr]);
+        await primeAndAppend([circuitAddr], 'agents-CG');
       }
     } catch (err) {
       this.logger.debug?.(`agents-CG lookup for ${peerId} failed: ${errMsg(err)}`);

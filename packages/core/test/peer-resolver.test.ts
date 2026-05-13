@@ -207,6 +207,34 @@ describe('PeerResolver', () => {
     expect(out).toEqual(['/ip4/1.2.3.4/tcp/9090']);
   });
 
+  it('Codex PR #496 round 6: addr is omitted from result when peerStore merge fails', async () => {
+    // Regression guard: the resolver returns Address[] as a contract
+    // that "the peerStore is primed for these addresses". Earlier
+    // rounds appended addresses BEFORE awaiting addKnownAddresses, so
+    // a peerStore merge failure left the caller seeing a non-empty
+    // resolution while the bare peer-id dial silently missed every
+    // address. Fix: only append after the merge succeeds; on merge
+    // failure the addr stays out of the returned list AND resolution
+    // continues into the next step.
+    const failingNet = makeNetwork();
+    failingNet.__findPeerImpl = async () => ['/ip4/1.2.3.4/tcp/9090'];
+    failingNet.addKnownAddresses = async () => {
+      throw new Error('peerStore merge boom');
+    };
+
+    const resolver = new PeerResolver({
+      network: failingNet,
+      registry,
+      agentDirectory: makeAgentDir(async () => RELAY_ADDR),
+    });
+    const out = await resolver.resolve(PEER_B);
+
+    // DHT merge failed → DHT addr is NOT in the result.
+    // Step 4's relay merge ALSO failed (same stub) → relay addr also out.
+    // Resolver returns []; caller knows nothing was actually primed.
+    expect(out).toEqual([]);
+  });
+
   it('step 1 (Codex PR #496 r2): live-conn lookup throwing does not abort resolution', async () => {
     // Simulates `network.getConnections(peerId)` throwing on a malformed
     // peerId — which LibP2PNetwork does today by calling peerIdFromString.

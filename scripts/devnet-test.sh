@@ -2081,6 +2081,177 @@ http_post_capture "http://127.0.0.1:9201/api/context-graph/create" \
 
 #------------------------------------------------------------
 echo ""
+echo "=== SECTION 28: RFC 07 — /api/connect Resolver Path & HTTP Semantics ==="
+echo ""
+# RFC 07 in-process PeerResolver wires every outbound dial through a single
+# resolution chain (live-conn → DHT → RFC 04 registry stub → agents-CG
+# fallback). `/api/connect` (POST {peerId}) is the public surface of that
+# chain. The legacy `/api/connect {multiaddr}` path is exercised implicitly
+# by §1b/§1c (peers come up via mDNS) but the peerId-only flow had no
+# explicit coverage until now. This section pins:
+#   - 28a INVALID_PEER_ID  → HTTP 400 (terminal client error)
+#   - 28b SELF_DIAL        → HTTP 400 (terminal client error)
+#   - 28c PEER_NOT_FOUND   → HTTP 404 (genuine negative lookup; resolver
+#                            completed cleanly with no addresses)
+#   - 28d Cold-peer dial via PeerResolver — disconnect a known peer, then
+#         /api/connect by peerId only. Requires the resolver to find addrs
+#         from libp2p peerStore / DHT and prime them so dialProtocol works.
+#   - 28e Idempotent fast-path — re-call /api/connect on the just-connected
+#         peer; the resolver's step-1 live-connection check should make this
+#         a sub-ms no-op.
+#   - 28f Missing-body  → HTTP 400 (route-level guard)
+#
+# CONNECT_TIMEOUT (HTTP 504) — the post-RFC-07 distinction added in PR #499
+# round 5 (transient timeout vs terminal not-found) requires a sub-second
+# `timeoutMs` to trigger reliably. The /api/connect route doesn't accept
+# `timeoutMs` from the body today, so the 504 path is covered by the unit
+# test (peer-resolver.test.ts: "skips later steps once signal is aborted
+# mid-resolve") rather than here.
+
+echo "--- 28a: INVALID_PEER_ID returns 400 ---"
+http_post_capture "http://127.0.0.1:9201/api/connect" \
+  '{"peerId":"not-a-real-peer-id"}' \
+  CONN_BAD_BODY CONN_BAD_CODE
+CONN_BAD_CODE_VAL="$CONN_BAD_CODE"
+CONN_BAD_ERR_CODE=$(json_get "$CONN_BAD_BODY" code)
+if [[ "$CONN_BAD_CODE_VAL" == "400" && "$CONN_BAD_ERR_CODE" == "INVALID_PEER_ID" ]]; then
+  ok "Malformed peerId → HTTP 400 + code=INVALID_PEER_ID"
+elif [[ "$CONN_BAD_CODE_VAL" == "400" ]]; then
+  ok "Malformed peerId → HTTP 400 (code=$CONN_BAD_ERR_CODE)"
+else
+  fail "Malformed peerId returned HTTP $CONN_BAD_CODE_VAL (expected 400): ${CONN_BAD_BODY:0:200}"
+fi
+
+echo "--- 28b: SELF_DIAL returns 400 ---"
+SELF_PEER=$(json_get "$(c "http://127.0.0.1:9201/api/info")" peerId)
+if [[ "$SELF_PEER" == "__NONE__" || "$SELF_PEER" == "__ERR__" || -z "$SELF_PEER" ]]; then
+  fail "Could not read Node1's own peerId from /api/info — cannot test SELF_DIAL"
+else
+  http_post_capture "http://127.0.0.1:9201/api/connect" \
+    "{\"peerId\":\"$SELF_PEER\"}" \
+    CONN_SELF_BODY CONN_SELF_CODE
+  CONN_SELF_ERR=$(json_get "$CONN_SELF_BODY" code)
+  if [[ "$CONN_SELF_CODE" == "400" && "$CONN_SELF_ERR" == "SELF_DIAL" ]]; then
+    ok "Self-dial → HTTP 400 + code=SELF_DIAL"
+  elif [[ "$CONN_SELF_CODE" == "400" ]]; then
+    ok "Self-dial → HTTP 400 (code=$CONN_SELF_ERR)"
+  else
+    fail "Self-dial returned HTTP $CONN_SELF_CODE (expected 400): ${CONN_SELF_BODY:0:200}"
+  fi
+fi
+
+echo "--- 28c: PEER_NOT_FOUND or CONNECT_TIMEOUT for unknown valid peerId ---"
+# Generate a fresh, syntactically-valid Ed25519 peerId via libp2p so the
+# format always parses on whatever libp2p version is installed. The
+# generated key is ephemeral (never used by any node) so the resolver's
+# full chain (live-conn → DHT → registry stub → agents-CG) all miss.
+# This run can take up to the default 15s connectToPeerId timeout.
+GHOST_PEER=$(cd "$SCRIPT_DIR/../packages/core" && node --input-type=module -e "
+import { generateKeyPair } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey } from '@libp2p/peer-id';
+const k = await generateKeyPair('Ed25519');
+console.log(peerIdFromPrivateKey(k).toString());
+" 2>/dev/null)
+if [[ -z "$GHOST_PEER" || ! "$GHOST_PEER" =~ ^12D3KooW[A-Za-z0-9]+$ ]]; then
+  warn "Could not generate ghost peerId (got=$GHOST_PEER); skipping 28c"
+else
+  GHOST_START=$(date +%s)
+  http_post_capture "http://127.0.0.1:9201/api/connect" \
+    "{\"peerId\":\"$GHOST_PEER\"}" \
+    CONN_NOTFOUND_BODY CONN_NOTFOUND_CODE
+  GHOST_ELAPSED=$(( $(date +%s) - GHOST_START ))
+  CONN_NF_ERR=$(json_get "$CONN_NOTFOUND_BODY" code)
+  # Either 404 PEER_NOT_FOUND (resolver completed cleanly within budget,
+  # genuine miss) OR 504 CONNECT_TIMEOUT (signal aborted before resolver
+  # finished, transient timeout) is correct. The DISTINCTION between
+  # them is the new behavior added in RFC 07 PR #499 round 5; both
+  # outcomes prove the error mapping is wired. Anything else is a
+  # regression in the route's switch.
+  if [[ "$CONN_NOTFOUND_CODE" == "404" && "$CONN_NF_ERR" == "PEER_NOT_FOUND" ]]; then
+    ok "Ghost peerId → HTTP 404 + code=PEER_NOT_FOUND in ${GHOST_ELAPSED}s (resolver completed cleanly)"
+  elif [[ "$CONN_NOTFOUND_CODE" == "504" && "$CONN_NF_ERR" == "CONNECT_TIMEOUT" ]]; then
+    ok "Ghost peerId → HTTP 504 + code=CONNECT_TIMEOUT in ${GHOST_ELAPSED}s (RFC 07 PR #499 round 5 transient-vs-terminal split)"
+  else
+    fail "Ghost peerId returned HTTP $CONN_NOTFOUND_CODE code=$CONN_NF_ERR after ${GHOST_ELAPSED}s — neither 404 PEER_NOT_FOUND nor 504 CONNECT_TIMEOUT (RFC 07 route mapping regression?): ${CONN_NOTFOUND_BODY:0:200}"
+  fi
+fi
+
+echo "--- 28d: Cold-peer dial via PeerResolver succeeds (peer in libp2p peerStore) ---"
+# devnet nodes connect via mDNS at startup, so node1 already has node3 in
+# its peerStore (and probably an open connection). Disconnecting node3
+# from node1 first makes this a true cold dial: /api/connect by peerId
+# alone must resolve via the libp2p peerStore-cached path the resolver's
+# step 2 (DHT findPeer) walks back to.
+NODE3_PEER=$(json_get "$(c "http://127.0.0.1:9203/api/info")" peerId)
+if [[ "$NODE3_PEER" == "__NONE__" || "$NODE3_PEER" == "__ERR__" || -z "$NODE3_PEER" ]]; then
+  fail "Could not read Node3's peerId from /api/info — cannot test cold-peer dial"
+else
+  # Best-effort disconnect Node3 from Node1's perspective. The
+  # /api/disconnect (or the legacy /api/agents/<peerId>/disconnect) endpoint
+  # may not exist on every build — if not, we still test the (warm) connect
+  # which exercises the resolver's step-1 live-connection short-circuit.
+  curl -sS --max-time 5 -H "Authorization: Bearer $AUTH" \
+    -X POST "http://127.0.0.1:9201/api/disconnect" \
+    -H "Content-Type: application/json" \
+    -d "{\"peerId\":\"$NODE3_PEER\"}" > /dev/null 2>&1 || true
+  sleep 1
+
+  http_post_capture "http://127.0.0.1:9201/api/connect" \
+    "{\"peerId\":\"$NODE3_PEER\"}" \
+    CONN_OK_BODY CONN_OK_CODE
+  CONN_OK_FLAG=$(json_get "$CONN_OK_BODY" connected)
+  if [[ "$CONN_OK_CODE" == "200" && "$CONN_OK_FLAG" == "true" ]]; then
+    ok "Cold dial Node3 by peerId via resolver → HTTP 200 connected=true"
+  else
+    fail "Cold dial Node3 returned HTTP $CONN_OK_CODE (expected 200): ${CONN_OK_BODY:0:200}"
+  fi
+fi
+
+echo "--- 28e: Idempotent fast-path (resolver step-1 live-connection check) ---"
+# The just-completed dial leaves an open connection. Re-calling /api/connect
+# should hit `connectToPeerId`'s `getConnections().length > 0` early-return
+# (which both predates and complements the resolver's step-1 live-conn
+# short-circuit). Should be fast and return 200.
+if [[ -n "${NODE3_PEER:-}" && "$NODE3_PEER" != "__NONE__" && "$NODE3_PEER" != "__ERR__" ]]; then
+  IDEMPOTENT_START=$(date +%s)
+  http_post_capture "http://127.0.0.1:9201/api/connect" \
+    "{\"peerId\":\"$NODE3_PEER\"}" \
+    CONN_AGAIN_BODY CONN_AGAIN_CODE
+  IDEMPOTENT_ELAPSED=$(( $(date +%s) - IDEMPOTENT_START ))
+  CONN_AGAIN_FLAG=$(json_get "$CONN_AGAIN_BODY" connected)
+  if [[ "$CONN_AGAIN_CODE" == "200" && "$CONN_AGAIN_FLAG" == "true" && "$IDEMPOTENT_ELAPSED" -le 3 ]]; then
+    ok "Re-connect to already-connected peer → HTTP 200 in ${IDEMPOTENT_ELAPSED}s (fast-path)"
+  elif [[ "$CONN_AGAIN_CODE" == "200" ]]; then
+    warn "Re-connect succeeded but took ${IDEMPOTENT_ELAPSED}s (expected sub-second fast-path)"
+  else
+    fail "Re-connect returned HTTP $CONN_AGAIN_CODE: ${CONN_AGAIN_BODY:0:200}"
+  fi
+fi
+
+echo "--- 28f: Missing peerId AND multiaddr returns 400 ---"
+http_post_capture "http://127.0.0.1:9201/api/connect" \
+  '{}' \
+  CONN_EMPTY_BODY CONN_EMPTY_CODE
+if [[ "$CONN_EMPTY_CODE" == "400" ]]; then
+  ok "Empty body → HTTP 400 (route-level guard)"
+else
+  fail "Empty body returned HTTP $CONN_EMPTY_CODE (expected 400): ${CONN_EMPTY_BODY:0:200}"
+fi
+
+echo "--- 28g: Audit gate locally — every dialProtocol() goes through the RFC 07 boundary ---"
+# Cheap sanity check: even without re-running CI, assert the audit script
+# still passes on the deployed source. A regression that re-introduces a
+# raw libp2p.dialProtocol(peerId, ...) elsewhere would surface here as a
+# devnet-side smoke test, not just at PR-merge time.
+AUDIT_OUT=$(node "$SCRIPT_DIR/audit-dial-protocol.mjs" 2>&1 || true)
+if echo "$AUDIT_OUT" | grep -q "audit-dial-protocol: OK"; then
+  ok "Dial-protocol audit passes (PeerResolver boundary intact)"
+else
+  fail "Dial-protocol audit failed: ${AUDIT_OUT:0:400}"
+fi
+
+#------------------------------------------------------------
+echo ""
 echo "============================================================"
 echo "TEST SUMMARY"
 echo "============================================================"

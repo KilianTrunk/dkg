@@ -96,6 +96,21 @@ CLI_JS="$REPO_ROOT/packages/cli/dist/cli.js"
 log()  { local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ); echo "[soak-r${ROUND} $ts] $*"; }
 fail() { log "FAIL: $*"; exit 1; }
 
+# Safe line counter that survives missing files and tolerates `set -e`.
+# R1 used `pcount=$([ -f X ] && wc -l < X | tr -d ' ' || echo 0)` which
+# aborted at the END_TS boundary with `=NNNN: command not found` (the
+# inner pipeline interacted badly with operator precedence under load).
+safe_line_count() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    local n
+    n=$(wc -l < "$f" 2>/dev/null | tr -d '[:space:]')
+    echo "${n:-0}"
+  else
+    echo 0
+  fi
+}
+
 # --- 0. Pre-flight ----------------------------------------------------------
 
 log "Round $ROUND, duration ${DURATION_SEC}s, output dir $OUT_DIR"
@@ -644,14 +659,16 @@ while true; do
     restart_done=1
   fi
 
-  # Status heartbeat every ~5min. Tolerate not-yet-existing logs in the first
-  # tick; `[ -f ... ] && wc -l ... || echo 0` keeps the count at 0 instead of
-  # spamming "No such file or directory" on stderr.
+  # Status heartbeat every ~5min. R1 used a `cmd1 && cmd2 | cmd3 || echo 0`
+  # one-liner inside `$(...)` which broke under load with bash's
+  # operator precedence (the && binds before the |, and the || is then
+  # in the wrong position). The script aborted at the END_TS boundary
+  # with `=NNNN: command not found`. Replaced with a plain helper.
   elapsed=$((now - START_TS))
   if [ $((elapsed % 300)) -lt 30 ]; then
-    pcount=$([ -f "$PUBLISH_LOG" ] && wc -l < "$PUBLISH_LOG" | tr -d ' ' || echo 0)
-    tcount=$([ -f "$TIMESERIES" ] && wc -l < "$TIMESERIES" | tr -d ' ' || echo 0)
-    ecount=$([ -f "$EVENTS_LOG" ] && wc -l < "$EVENTS_LOG" | tr -d ' ' || echo 0)
+    pcount=$(safe_line_count "$PUBLISH_LOG")
+    tcount=$(safe_line_count "$TIMESERIES")
+    ecount=$(safe_line_count "$EVENTS_LOG")
     log "  heartbeat: elapsed=${elapsed}s, remaining=${remaining}s, publishes=${pcount}, snapshots=${tcount}, chain-events=${ecount}"
   fi
   sleep 30
@@ -715,27 +732,52 @@ if (pubTotal > 0 && pubOk / pubTotal >= 0.9) {
   fail.push("PUBLISH success rate " + pubOk + "/" + pubTotal + " (failures=" + pubFail + ")");
 }
 
-// 2. RS prover: each core must report submittedCount > 0 by end
-const lastSnap = tsLines[tsLines.length - 1];
-if (!lastSnap) {
+// 2. RS prover: take the PEAK submittedCount per node across the whole
+// timeseries. R1 surfaced that the very last snapshot can be empty
+// (`rs: {}`, `uptime_ms: null`) when the agent or the snapshot fetcher
+// is mid-shutdown — using the last snapshot then misreports a healthy
+// node as "never submitted" even though the chain shows its proofs.
+const peakSubmittedByNode = new Map();
+const enabledByNode = new Map();
+const identityByNode = new Map();
+let snapshotsWithEmptyRs = 0;
+for (const snap of tsLines) {
+  for (const node of (snap.perNode || [])) {
+    const rs = node.rs || {};
+    const loop = rs.loop;
+    if (!loop || typeof loop.submittedCount !== "number") {
+      if (node.node <= Number(out.NUM_CORES)) snapshotsWithEmptyRs++;
+      continue;
+    }
+    const cur = peakSubmittedByNode.get(node.node) ?? 0;
+    if (loop.submittedCount > cur) peakSubmittedByNode.set(node.node, loop.submittedCount);
+    if (rs.enabled === true) enabledByNode.set(node.node, true);
+    if (rs.identityId) identityByNode.set(node.node, rs.identityId);
+  }
+}
+if (snapshotsWithEmptyRs > 0) {
+  warn.push("OBSERVER " + snapshotsWithEmptyRs + " core snapshots had empty rs:{} (likely API/agent transient unavailability)");
+}
+if (peakSubmittedByNode.size === 0 && tsLines.length === 0) {
   fail.push("OBSERVER: no snapshots captured");
 } else {
-  for (const node of (lastSnap.perNode || [])) {
-    const isCore = node.node <= Number(out.NUM_CORES);
-    const submitted = node.rs?.loop?.submittedCount ?? 0;
+  for (let n = 1; n <= Number(out.NUM_CORES) + Number(out.NUM_EDGE); n++) {
+    const isCore = n <= Number(out.NUM_CORES);
+    const peak = peakSubmittedByNode.get(n) ?? 0;
+    const idStr = identityByNode.get(n) ?? "?";
     if (isCore) {
-      if (submitted > 0) {
-        ok.push("RS core node " + node.node + " submitted=" + submitted + " (identity " + (node.rs?.identityId ?? "?") + ")");
+      if (peak > 0) {
+        ok.push("RS core node " + n + " peak submittedCount=" + peak + " (identity " + idStr + ")");
       } else {
-        fail.push("RS core node " + node.node + " never submitted (identity " + (node.rs?.identityId ?? "?") + ")");
+        fail.push("RS core node " + n + " never submitted (identity " + idStr + ")");
       }
     } else {
-      if (submitted > 0) {
-        fail.push("RS edge node " + node.node + " submittedCount=" + submitted + " — edge nodes must NEVER submit");
-      } else if (node.rs?.enabled === true) {
-        fail.push("RS edge node " + node.node + " has enabled=true — edge nodes must report enabled=false");
+      if (peak > 0) {
+        fail.push("RS edge node " + n + " peak submittedCount=" + peak + " — edge nodes must NEVER submit");
+      } else if (enabledByNode.get(n) === true) {
+        fail.push("RS edge node " + n + " has enabled=true — edge nodes must report enabled=false");
       } else {
-        ok.push("RS edge node " + node.node + " correctly disabled (enabled=" + (node.rs?.enabled ?? false) + ")");
+        ok.push("RS edge node " + n + " correctly disabled across " + tsLines.length + " snapshots");
       }
     }
   }
@@ -775,32 +817,55 @@ for (let i = 0; i < stakeBefore.perCore.length; i++) {
   }
 }
 
-// 5. RS score growth: getNodeEpochScore at end must be >= start (could reset on epoch boundary)
-for (let i = 0; i < stakeBefore.perCore.length; i++) {
-  const beforeScore = BigInt(stakeBefore.perCore[i].epochScore);
-  const afterScore  = BigInt(stakeAfter.perCore[i].epochScore);
-  if (stakeBefore.epoch === stakeAfter.epoch) {
-    if (afterScore > beforeScore) {
-      ok.push("SCORE core " + (i+1) + " epochScore grew within epoch " + stakeAfter.epoch + ": " + beforeScore + " -> " + afterScore);
-    } else if (i < 4) {
-      warn.push("SCORE core " + (i+1) + " epochScore did NOT grow within epoch: " + beforeScore + " -> " + afterScore);
-    }
-  } else {
-    ok.push("EPOCH transitioned " + stakeBefore.epoch + " -> " + stakeAfter.epoch + " (rewards may have been claimed)");
+// 5. RS score growth: epochScore resets at every epoch transition. R1
+// crossed 7 epoch boundaries during the soak and the FINAL snapshot
+// landed in a fresh epoch (all zeros) — the simple "after > before"
+// check then warned about no growth even though there were 143 score
+// events on chain. Use NodeEpochScoreAdded events as the cumulative
+// per-(epoch,identity) signal instead.
+const scoreByEpochIdentity = new Map();
+const proofsByIdentity     = new Map();
+for (const e of scoreEvents) {
+  if (!e.args) continue;
+  const [epoch, identityId, , scoreAdded] = e.args;
+  const key = String(epoch) + ":" + String(identityId);
+  const cur = scoreByEpochIdentity.get(key) ?? 0n;
+  scoreByEpochIdentity.set(key, cur + BigInt(scoreAdded ?? 0));
+  const prevCount = proofsByIdentity.get(String(identityId)) ?? 0;
+  proofsByIdentity.set(String(identityId), prevCount + 1);
+}
+const epochsObserved = new Set();
+for (const k of scoreByEpochIdentity.keys()) epochsObserved.add(k.split(":")[0]);
+if (epochsObserved.size === 0) {
+  fail.push("SCORE no NodeEpochScoreAdded events captured");
+} else {
+  ok.push("SCORE accrual observed across " + epochsObserved.size + " distinct epoch(s); " + scoreEvents.length + " events total");
+  for (const [identity, count] of proofsByIdentity.entries()) {
+    ok.push("SCORE identity " + identity + " accrued score on " + count + " proofs");
   }
 }
 
-// 6. Asymmetric reward signal: cores with higher stake should accrue at >= rate of low-stake cores (proxy via score)
-const sortedAfter = [...stakeAfter.perCore].sort((a, b) => Number(BigInt(b.v10StakeWei) - BigInt(a.v10StakeWei)));
-if (sortedAfter.length >= 4) {
-  const high = sortedAfter[0];
-  const low  = sortedAfter[sortedAfter.length - 1];
-  const highScore = BigInt(high.epochScore);
-  const lowScore  = BigInt(low.epochScore);
-  if (highScore > 0n && lowScore > 0n) {
-    ok.push("ASYMMETRY high-stake core score " + highScore + " vs low-stake " + lowScore + " (both proving)");
-  } else if (highScore === 0n && lowScore === 0n) {
-    warn.push("ASYMMETRY all cores show 0 epochScore at end — neither high nor low stake delivered scores");
+// 6. Asymmetric reward signal: aggregate per-identity score across ALL
+// epochs in the soak (so brief downtime of one node does not poison
+// the comparison). High-stake identities should out-score low-stake
+// ones over the full window.
+const totalScoreByIdentity = new Map();
+for (const [k, v] of scoreByEpochIdentity.entries()) {
+  const id = k.split(":")[1];
+  const cur = totalScoreByIdentity.get(id) ?? 0n;
+  totalScoreByIdentity.set(id, cur + v);
+}
+const coreIdentities = stakeAfter.perCore.map(c => ({ identity: String(c.identityId), stakeWei: BigInt(c.v10StakeWei), totalScore: totalScoreByIdentity.get(String(c.identityId)) ?? 0n }));
+const sortedByStake = [...coreIdentities].sort((a, b) => Number(b.stakeWei - a.stakeWei));
+if (sortedByStake.length >= 2) {
+  const high = sortedByStake[0];
+  const low  = sortedByStake[sortedByStake.length - 1];
+  if (high.totalScore > 0n && low.totalScore > 0n) {
+    ok.push("ASYMMETRY high-stake identity " + high.identity + " total score " + high.totalScore + " vs low-stake identity " + low.identity + " " + low.totalScore + " (both proving)");
+  } else if (high.totalScore === 0n && low.totalScore === 0n) {
+    warn.push("ASYMMETRY no aggregated score for any identity (event sniffer may have missed events)");
+  } else {
+    warn.push("ASYMMETRY uneven coverage: high-stake total=" + high.totalScore + " low-stake total=" + low.totalScore);
   }
 }
 
@@ -831,6 +896,18 @@ if (edgeViolations === 0) {
   fail.push("NEG-B edge nodes submitted on " + edgeViolations + " snapshots");
 }
 
+// 9. Reward-mechanism liveness: epoch transitions + score events together
+//    are necessary-and-sufficient evidence the staking pipeline is alive.
+//    netNodeEpochRewards is computed lazily on first claim (StakingV10
+//    setNetNodeEpochRewards path) — it can stay 0 even when rewards have
+//    fully accrued in scorePerStake. Do NOT fail on it; just report.
+const epochsTransitioned = stakeAfter.epoch > stakeBefore.epoch;
+if (epochsTransitioned && scoreEvents.length > 0) {
+  ok.push("REWARDS-LIVENESS " + (stakeAfter.epoch - stakeBefore.epoch) + " epoch transition(s) and " + scoreEvents.length + " on-chain score events captured");
+} else if (!epochsTransitioned) {
+  warn.push("REWARDS-LIVENESS no epoch transition observed — reduce Chronos.epochLength to see distribution");
+}
+
 // Compose findings.md
 const md = [];
 md.push("# Devnet soak round " + out.ROUND + " findings");
@@ -853,12 +930,14 @@ for (const x of fail) md.push("- " + x);
 md.push("");
 md.push("## Stake state (per core)");
 md.push("");
-md.push("| Core | Identity | Stake (TRAC) | Score before | Score after | Score-per-stake after | Net rewards (wei) |");
+md.push("| Core | Identity | Stake (TRAC) | Total score (sum across epochs) | Score-per-stake (final epoch) | Net rewards (wei, lazy) | Peak prover submittedCount |");
 md.push("|---|---|---|---|---|---|---|");
 for (let i = 0; i < stakeBefore.perCore.length; i++) {
-  const b = stakeBefore.perCore[i], a = stakeAfter.perCore[i];
+  const a = stakeAfter.perCore[i];
   const fmt = (wei) => (Number(BigInt(wei)) / 1e18).toFixed(0);
-  md.push("| " + (i+1) + " | " + a.identityId + " | " + fmt(a.v10StakeWei) + " | " + b.epochScore + " | " + a.epochScore + " | " + a.epochScorePerStake + " | " + (a.netNodeEpochRewards ?? "0") + " |");
+  const totalScore = totalScoreByIdentity.get(String(a.identityId)) ?? 0n;
+  const peakSubmitted = peakSubmittedByNode.get(i + 1) ?? 0;
+  md.push("| " + (i+1) + " | " + a.identityId + " | " + fmt(a.v10StakeWei) + " | " + totalScore + " | " + a.epochScorePerStake + " | " + (a.netNodeEpochRewards ?? "0") + " | " + peakSubmitted + " |");
 }
 md.push("");
 md.push("## Delegator state (post-soak)");

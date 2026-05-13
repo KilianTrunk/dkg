@@ -7919,6 +7919,25 @@ export class DKGAgent {
           `Context graph "${id}" cannot be registered as curated by local curator ${ownerAddress} because ${reason}`,
         );
       }
+      // PCA-only: the chain signer (= msg.sender for the registration
+      // tx) MUST equal the PCA owner. `ContextGraphs.createContextGraph`
+      // on-chain mints the governance NFT to msg.sender, so any
+      // divergence between the configured chain signer and the PCA
+      // owner would make the chain signer (not the advertised PCA owner)
+      // the actual on-chain context-graph owner — breaking later
+      // `onlyContextGraphOwner` operations (publish-policy/authority
+      // updates, etc.). Per Codex PR #502 round-4: keep "advertised
+      // curator == on-chain owner == chain signer == PCA owner" until
+      // the registration tx can be submitted by a signer the PCA
+      // owner actually controls.
+      if (isPcaCurated && publishAuthority) {
+        const chainSigner = await this.getChainPublishAuthorityAddress(id);
+        if (chainSigner && chainSigner.toLowerCase() !== publishAuthority.toLowerCase()) {
+          throw new Error(
+            `Context graph "${id}" cannot be PCA-registered: chain signer ${chainSigner} differs from PCA owner ${publishAuthority}. The PCA owner must control the chain signer used to submit the registration tx; otherwise the on-chain governance NFT mints to ${chainSigner} rather than the advertised curator.`,
+          );
+        }
+      }
       if (
         !publishAuthority
         && opts?.callerAgentAddress

@@ -105,8 +105,13 @@ class SignerListContextGraphChainAdapter extends CapturingContextGraphChainAdapt
 class PcaCuratedRegistrationChainAdapter extends AsyncSignerAddressContextGraphChainAdapter {
   constructor(
     private readonly accountOwners: Map<bigint, string>,
+    signerAddress?: string,
   ) {
-    super();
+    // Forward an explicit signer to MockChainAdapter so tests can keep
+    // the "chain signer == PCA owner" invariant the agent enforces
+    // (Codex PR #502 round-4: msg.sender for the registration tx mints
+    // the on-chain governance NFT, so the PCA owner must control it).
+    super('mock:31337', signerAddress);
   }
 
   async getPublishingConvictionAccountOwner(accountId: bigint): Promise<string> {
@@ -2497,10 +2502,23 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
-  it('registers PCA curated context graphs without requiring the chain signer to equal the local curator', async () => {
+  // Codex PR #502 round-4: replaces the previous "without requiring
+  // chain signer == local curator" test. The agent now enforces
+  // "advertised curator == on-chain owner == chain signer == PCA
+  // owner" so the registration tx's msg.sender (which mints the
+  // on-chain governance NFT) is the same address as the PCA owner.
+  // Non-default node operators CAN still PCA-register — they just
+  // need to control the chain signer used for the registration tx.
+  it('registers PCA curated context graphs when the PCA owner controls the chain signer (non-default operator)', async () => {
     const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
     const pcaAccountId = 42n;
-    const chain = new PcaCuratedRegistrationChainAdapter(new Map([[pcaAccountId, pcaOwner]]));
+    // Chain signer is configured to BE the PCA owner — the PCA owner
+    // controls the registration-tx msg.sender, so the governance NFT
+    // mints to them.
+    const chain = new PcaCuratedRegistrationChainAdapter(
+      new Map([[pcaAccountId, pcaOwner]]),
+      pcaOwner,
+    );
     const agent = await DKGAgent.create({
       name: 'PcaRegistrationBot',
       store: new OxigraphStore(),
@@ -2509,7 +2527,7 @@ decisions: []
     });
     await agent.start();
 
-    expect(pcaOwner.toLowerCase()).not.toBe(chain.signerAddress.toLowerCase());
+    expect(pcaOwner.toLowerCase()).toBe(chain.signerAddress.toLowerCase());
     await agent.createContextGraph({
       id: 'register-pca-curated-policy',
       name: 'PCA Curated Policy',
@@ -2518,7 +2536,7 @@ decisions: []
     });
 
     // pcaAccountId is a register-time knob now (Codex PR #502 round-3);
-    // callers must resupply it on `registerContextGraph` rather than
+    // callers must supply it on `registerContextGraph` rather than
     // relying on a create-time persist that could silently replay a
     // stale id.
     await expect(agent.registerContextGraph('register-pca-curated-policy', {
@@ -2534,10 +2552,54 @@ decisions: []
     await agent.stop().catch(() => {});
   });
 
+  // Codex PR #502 round-4: rejects PCA registration when the chain
+  // signer (registration-tx msg.sender) doesn't match the PCA owner.
+  // Without this guard, `ContextGraphs.createContextGraph` on-chain
+  // mints the governance NFT to msg.sender while local metadata says
+  // the PCA owner is the curator — phantom-owner bug breaking later
+  // `onlyContextGraphOwner` ops.
+  it('rejects PCA registration when chain signer differs from PCA owner', async () => {
+    const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
+    const pcaAccountId = 142n;
+    // Chain signer is INTENTIONALLY different from the PCA owner —
+    // simulates a node operator trying to PCA-register a CG using a
+    // PCA they don't control the signer for.
+    const chain = new PcaCuratedRegistrationChainAdapter(
+      new Map([[pcaAccountId, pcaOwner]]),
+      /* signerAddress: */ undefined,  // default MOCK_DEFAULT_SIGNER (0x1111...)
+    );
+    const agent = await DKGAgent.create({
+      name: 'PcaSignerMismatchBot',
+      store: new OxigraphStore(),
+      chainAdapter: chain,
+      nodeRole: 'core',
+    });
+    await agent.start();
+
+    expect(pcaOwner.toLowerCase()).not.toBe(chain.signerAddress.toLowerCase());
+    await agent.createContextGraph({
+      id: 'reject-pca-signer-mismatch',
+      name: 'Reject PCA signer mismatch',
+      accessPolicy: 1,
+      callerAgentAddress: pcaOwner,
+    });
+
+    await expect(agent.registerContextGraph('reject-pca-signer-mismatch', {
+      callerAgentAddress: pcaOwner,
+      publishAuthorityAccountId: pcaAccountId,
+    })).rejects.toThrow(/chain signer .* differs from PCA owner|governance NFT mints to/);
+
+    expect(chain.createOnChainContextGraphCalls).toHaveLength(0);
+    await agent.stop().catch(() => {});
+  });
+
   it('registers PCA curated context graphs when the PCA account id is supplied at registration time', async () => {
     const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
     const pcaAccountId = 43n;
-    const chain = new PcaCuratedRegistrationChainAdapter(new Map([[pcaAccountId, pcaOwner]]));
+    const chain = new PcaCuratedRegistrationChainAdapter(
+      new Map([[pcaAccountId, pcaOwner]]),
+      pcaOwner,
+    );
     const agent = await DKGAgent.create({
       name: 'PcaRegistrationOverrideBot',
       store: new OxigraphStore(),
@@ -2772,7 +2834,12 @@ decisions: []
   it('treats private:true as a curated signal that dominates accessPolicy=0 for PCA registration', async () => {
     const pcaOwner = new ethers.Wallet(HARDHAT_KEYS.REC1_OP).address;
     const pcaAccountId = 77n;
-    const chain = new PcaCuratedRegistrationChainAdapter(new Map([[pcaAccountId, pcaOwner]]));
+    // PCA owner controls the chain signer (Codex PR #502 round-4
+    // contract: chain signer == PCA owner required for PCA mode).
+    const chain = new PcaCuratedRegistrationChainAdapter(
+      new Map([[pcaAccountId, pcaOwner]]),
+      pcaOwner,
+    );
     const agent = await DKGAgent.create({
       name: 'PcaPrivateOverridesAccessPolicyBot',
       store: new OxigraphStore(),

@@ -896,7 +896,12 @@ export class ApiClient {
     participantAgents?: string[];
     participantIdentityIds?: Array<string | number | bigint>;
     requiredSignatures?: number;
-    pcaAccountId?: string | number | bigint;
+    // NOTE: pcaAccountId is intentionally NOT a `createContextGraph`
+    // option here — the agent's createContextGraph no longer persists
+    // it (Codex PR #502 round-4), so passing it on the create call
+    // would be a silent no-op. Use the `pcaAccountId` field on
+    // `registerContextGraph` instead, or call POST /api/context-graph/create
+    // directly with `register: true` for the inline combined flow.
   }, allowedPeers?: string[]): Promise<{
     created: string;
     uri: string;
@@ -914,7 +919,6 @@ export class ApiClient {
         ? { participantIdentityIds: options.participantIdentityIds.map((id) => id.toString()) }
         : {}),
       ...(options?.requiredSignatures != null ? { requiredSignatures: options.requiredSignatures } : {}),
-      ...(options?.pcaAccountId != null ? { pcaAccountId: options.pcaAccountId.toString() } : {}),
     });
   }
 

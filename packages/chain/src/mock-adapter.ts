@@ -621,6 +621,30 @@ export class MockChainAdapter implements ChainAdapter {
     };
   }
 
+  /**
+   * Mock does not model V10 `DKGPublishingConvictionNFT` agent
+   * registration — the legacy mock PCA flow doesn't ship reverse
+   * agent → accountId lookups. Always returns `0n` so the publisher
+   * SDK falls through to the direct-spend `publishEpochs = 1` default
+   * on mock chains (matching how mock-backed unit tests exercise the
+   * non-conviction publish path). Real-chain tests use
+   * `EVMChainAdapter`, which queries the live NFT contract.
+   */
+  async getConvictionAgentAccountId(_agent: string): Promise<bigint> {
+    return 0n;
+  }
+
+  /**
+   * Mock does not model V10 NFT `lockDurationEpochs` snapshotting.
+   * Returns `0` (no PCA path active) so the publisher SDK keeps the
+   * direct-spend default. Mirrors `getConvictionAgentAccountId` —
+   * either both are wired or neither, so the publisher's PCA probe
+   * never returns a half-set state on mock.
+   */
+  async getConvictionAccountLockDurationEpochs(_accountId: bigint): Promise<number> {
+    return 0;
+  }
+
   // --- Staking Conviction ---
 
   private delegatorLocks = new Map<string, { lockTier: number; startEpoch: number }>();

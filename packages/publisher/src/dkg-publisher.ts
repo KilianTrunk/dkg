@@ -1719,7 +1719,51 @@ export class DKGPublisher implements Publisher {
     // H5-prefixed publish ACK digest (incl. merkleLeafCount) — matches
     // `packages/core/src/crypto/ack.ts:computePublishACKDigest` and
     // `KnowledgeAssetsV10._executePublishCore`.
-    const publishEpochs = 1;
+    //
+    // PCA discount eligibility (`KnowledgeAssetsV10.publish`): the
+    // contract takes the PCA branch only when (1) the wallet is a
+    // registered PCA agent, (2) the PCA is not expired, AND
+    // (3) `p.epochs == lockDurationEpochs`. Any miss silently falls
+    // through to direct spend at FULL price. To make sure registered
+    // agents actually get the discount they paid for, we probe for the
+    // PCA mapping and snap `publishEpochs` to the PCA's
+    // `lockDurationEpochs` when one is found. Wallets without a PCA
+    // (direct-spend branch) keep the default lifetime of `1` epoch.
+    let publishEpochs = 1;
+    if (
+      canAttemptOnChainPublish &&
+      publisherSigner !== undefined &&
+      typeof this.chain.getConvictionAgentAccountId === 'function' &&
+      typeof this.chain.getConvictionAccountLockDurationEpochs === 'function'
+    ) {
+      try {
+        const accountId = await this.chain.getConvictionAgentAccountId(publisherSigner.address);
+        if (accountId > 0n) {
+          const lockEpochs = await this.chain.getConvictionAccountLockDurationEpochs(accountId);
+          if (lockEpochs > 0) {
+            publishEpochs = lockEpochs;
+            this.log.info(
+              ctx,
+              `PCA-funded publish detected (signer=${publisherSigner.address}, accountId=${accountId}) — coercing publishEpochs to lockDurationEpochs=${lockEpochs}`,
+            );
+          }
+        }
+      } catch (err) {
+        // PCA probe is best-effort. On any RPC hiccup we keep the
+        // default `publishEpochs=1`. The contract is still the source
+        // of truth: if the signer turns out to be a PCA agent but
+        // `p.epochs != lockDurationEpochs`, the publish silently
+        // falls through to direct spend at full price (no revert).
+        // That degraded path is acceptable for a hot publish — the
+        // missed discount is observable via the lack of a
+        // `CostCovered` event on the receipt.
+        this.log.warn(
+          ctx,
+          `PCA epochs probe failed — falling back to publishEpochs=1: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     let precomputedTokenAmount = 0n;
     if (canAttemptOnChainPublish && typeof this.chain.getRequiredPublishTokenAmount === 'function') {
       try {
@@ -2140,7 +2184,14 @@ export class DKGPublisher implements Publisher {
             merkleRoot: kcMerkleRoot,
             knowledgeAssetsAmount: kaCount,
             byteSize: publicByteSize,
-            epochs: 1,
+            // PCA strict-equality: must match the value committed to the
+            // ACK digest above (`computePublishACKDigest` at line ~1908)
+            // so the on-chain ECDSA recovery yields the same operator
+            // address the publisher signed with. Hard-coding `1` here
+            // re-introduces a digest mismatch on PCA-funded publishes
+            // and trips `SignerIsNotNodeOperator` even though the
+            // signatures were produced correctly.
+            epochs: publishEpochs,
             tokenAmount,
             merkleLeafCount: kcMerkleLeafCount,
             isImmutable: false,

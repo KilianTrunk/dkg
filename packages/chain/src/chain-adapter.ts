@@ -601,6 +601,40 @@ export interface ChainAdapter {
    */
   isPCAAuthorizedKey?(accountId: bigint, key: string): Promise<boolean>;
 
+  /**
+   * Reverse lookup: which PCA (if any) is `agent` registered against?
+   *
+   * Mirrors `DKGPublishingConvictionNFT.agentToAccountId(agent)`.
+   * Returns `0n` for any non-registered address. The publisher SDK uses
+   * this to decide, before constructing the publish tx, whether the
+   * publishing wallet is eligible for the PCA discount branch in
+   * `KnowledgeAssetsV10.publish()`. The contract takes the discount
+   * branch only when (1) the wallet is a registered agent, (2) the
+   * PCA is not past `expiresAtTimestamp`, AND
+   * (3) `publishEpochs == lockDurationEpochs`. Any miss falls through
+   * to direct spend at full price (no revert), so the SDK proactively
+   * coerces `publishEpochs` to keep the discount.
+   *
+   * Optional on the adapter surface so mock-chain unit tests that
+   * don't model PCA registration can omit the implementation. The
+   * publisher gracefully treats `undefined` as "no PCA path active".
+   */
+  getConvictionAgentAccountId?(agent: string): Promise<bigint>;
+
+  /**
+   * Returns the V10 NFT-backed PCA's `lockDurationEpochs` for the given
+   * `accountId` — i.e. the snapshotted publishing-conviction-epochs the
+   * account was created against. `0` when the account doesn't exist or
+   * the NFT contract isn't deployed.
+   *
+   * The publisher SDK uses this together with
+   * `getConvictionAgentAccountId` to coerce a publish's epochs to the
+   * exact lifetime the PCA's escrow was sized for — otherwise the
+   * publish silently falls through to direct spend at full price (the
+   * contract's PCA eligibility check fails the `==` constraint).
+   */
+  getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
+
   // Permanent Publishing
   publishKnowledgeAssetsPermanent?(params: PermanentPublishParams): Promise<OnChainPublishResult>;
 

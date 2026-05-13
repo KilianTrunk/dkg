@@ -2257,8 +2257,8 @@ def _is_safe_iri(value: str) -> bool:
 
 
 def _is_uri(value: str) -> bool:
-    """Check if a value is a safe scheme-based IRI."""
-    return _is_safe_iri(value)
+    """Check if a value looks like a URI for legacy generic quad writes."""
+    return bool(value) and any(value.startswith(prefix) for prefix in ("http://", "https://", "urn:", "did:"))
 
 
 def _escape_sparql(text: str) -> str:

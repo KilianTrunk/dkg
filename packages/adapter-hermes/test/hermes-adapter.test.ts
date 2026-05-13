@@ -2596,6 +2596,25 @@ for bad_max_bytes in [0, -1, 1.5, True, "   "]:
     assert "positive integer" in result["error"], (bad_max_bytes, result)
 assert len(provider._client.calls) == 1, provider._client.calls
 
+class AssertionWriteClient:
+    def __init__(self):
+        self.calls = []
+
+    def write_assertion(self, name, context_graph_id, quads, sub_graph_name=None):
+        self.calls.append((name, context_graph_id, quads, sub_graph_name))
+        return {"ok": True}
+
+provider._client = AssertionWriteClient()
+result = json.loads(provider.handle_tool_call("dkg_assertion_write", {
+    "context_graph_id": "cg:test",
+    "name": "notes",
+    "quads": [
+        {"subject": "urn:doc:1", "predicate": "http://schema.org/contactPoint", "object": "mailto:alice@example.org"},
+    ],
+}))
+assert result["ok"] is True, result
+assert provider._client.calls[-1][2][0]["object"] == '"mailto:alice@example.org"', provider._client.calls
+
 class SemanticClient:
     def __init__(self):
         self.calls = []

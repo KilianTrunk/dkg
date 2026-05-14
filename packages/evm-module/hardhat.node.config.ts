@@ -109,9 +109,12 @@ const config: HardhatUserConfig = {
     tests: './test',
     cache: './cache',
     artifacts: './artifacts',
-    // Pin deploy roots so hardhat-deploy does NOT pick up scripts under
-    // deploy/archive/ (V8/V9 legacy stack archived per PRD §4.1).
-    deploy: ['deploy'],
+    // Pin deploy roots to deploy/active/ so hardhat-deploy's recursive
+    // scan does NOT discover scripts under deploy/archive/ (V8/V9 legacy
+    // stack archived per PRD §4.1). hardhat-deploy 0.12.4 walks the root
+    // recursively, so excluding the archive subdir requires an explicit
+    // sibling-root layout rather than the default 'deploy' single root.
+    deploy: ['deploy/active'],
   },
 };
 

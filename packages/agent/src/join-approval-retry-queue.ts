@@ -1,3 +1,5 @@
+import { RetryQueue, type RetryEntry } from '@origintrail-official/dkg-core';
+
 /**
  * In-memory retry queue for `join-approved` P2P notifications.
  *
@@ -32,58 +34,38 @@
  * its semantics are easy to test in isolation and the call sites in
  * `DKGAgent` stay small.
  *
- * Design notes
- * ------------
+ * Implementation
+ * --------------
+ * Thin domain-typed shim over the generic `RetryQueue<TPayload>` primitive
+ * in `@origintrail-official/dkg-core`. The shim's job is key derivation
+ * (`${cg}::${agent.toLowerCase()}`) and method-name aliasing
+ * (`enqueueFailure(cg, agent, ...)` instead of the generic
+ * `enqueueFailure(key, payload, ...)`). All retry mechanics — backoff
+ * ladder, age-bounded expiry, due-check, mutation semantics — live in
+ * the generic class.
  *
- *   * Keying. Entries are keyed by `${contextGraphId}::${agentAddress.toLowerCase()}`.
- *     This is the exact same shape as the curator's existing
- *     `joinRequestOriginPeers` map, so the two are easy to reason about
- *     side-by-side. Re-enqueueing for the same `(cg, agent)` pair is
- *     idempotent: it bumps `attempts` and pushes `nextAttemptAt` further
- *     into the future according to the backoff ladder.
- *
- *   * Backoff. Configurable backoff array, used as `backoffs[min(attempts-1,
- *     last)]`. Default ladder is 10s → 30s → 90s → 5m → 15m → 1h → 4h →
- *     12h, capped at the last entry. Roughly 24h of total retry budget,
- *     which is plenty for the operator to either bring the invitee back
- *     online or notice the warning logs and re-poke manually.
- *
- *   * Expiry. Entries older than `maxAgeMs` (default 24h since the FIRST
- *     failure) are dropped on the next `dropExpired()` tick. The dropped
- *     entries are returned so the caller can log them — useful diagnostic
- *     when an invitee's peer never comes back and the operator wants to
- *     know "did we ever give up on this approval?".
- *
- *   * Clock injection. All `nextAttemptAt` / `firstFailureAt` values are
- *     supplied by the caller as plain numbers, so tests can drive the
- *     queue with deterministic timestamps. The queue itself never calls
- *     `Date.now()`.
- *
- *   * In-memory. By design — this is the simplest thing that fixes the
- *     bug. A daemon restart will lose pending retries, but the operator
- *     can either (a) re-trigger via `POST /api/context-graph/{id}/redeliver-approval`,
- *     or (b) the invitee can re-submit the join request which the curator
- *     handles idempotently. Persistence is a follow-up if the in-memory
- *     queue proves insufficient in practice.
+ * Sharing the generic primitive matters because the same retry shape
+ * applies to other one-shot P2P sends in the system (notably the
+ * upcoming invitee-side `MessageOutbox` for `dkg_send_message` failures,
+ * which has the symmetric failure mode of join-approval — see chat
+ * thread on PR #510 / issue #518 for the joint design notes).
  */
 
-/** A single (contextGraphId, agentAddress) approval delivery pending retry. */
-export interface JoinApprovalRetryEntry {
+/** Domain payload retained per pending `(cg, agent)` approval. */
+export interface JoinApprovalPayload {
   /** Context graph the approval is for. */
   contextGraphId: string;
   /** Agent address being notified. Preserves caller's case for log readability. */
   agentAddress: string;
-  /** Number of delivery attempts made so far (every attempt that failed). */
-  attempts: number;
-  /** Timestamp (ms since epoch) of the first failed attempt. Used for `maxAgeMs` expiry. */
-  firstFailureAt: number;
-  /** Timestamp (ms since epoch) of the most recent failed attempt. */
-  lastAttemptAt: number;
-  /** Timestamp (ms since epoch) at which the next attempt is due. */
-  nextAttemptAt: number;
-  /** Short string describing the last failure (for logs + diagnostics). */
-  lastError: string;
 }
+
+/**
+ * A single `(contextGraphId, agentAddress)` approval delivery pending
+ * retry. Domain payload fields live directly on the entry alongside
+ * the queue-owned retry metadata (no nested `.payload`), preserving the
+ * shape used by `DKGAgent` since this queue's introduction in PR #510.
+ */
+export type JoinApprovalRetryEntry = RetryEntry<JoinApprovalPayload>;
 
 export interface JoinApprovalRetryQueueOptions {
   /**
@@ -119,17 +101,13 @@ export function joinApprovalRetryKey(contextGraphId: string, agentAddress: strin
 }
 
 export class JoinApprovalRetryQueue {
-  private readonly entries = new Map<string, JoinApprovalRetryEntry>();
-  private readonly backoffs: readonly number[];
-  private readonly maxAgeMs: number;
+  private readonly queue: RetryQueue<JoinApprovalPayload>;
 
   constructor(options: JoinApprovalRetryQueueOptions = {}) {
-    const backoffs = options.backoffs ?? DEFAULT_JOIN_APPROVAL_RETRY_BACKOFFS_MS;
-    if (backoffs.length === 0) {
-      throw new Error('JoinApprovalRetryQueue: backoffs must be non-empty');
-    }
-    this.backoffs = backoffs;
-    this.maxAgeMs = options.maxAgeMs ?? DEFAULT_JOIN_APPROVAL_RETRY_MAX_AGE_MS;
+    this.queue = new RetryQueue<JoinApprovalPayload>({
+      backoffs: options.backoffs ?? DEFAULT_JOIN_APPROVAL_RETRY_BACKOFFS_MS,
+      maxAgeMs: options.maxAgeMs ?? DEFAULT_JOIN_APPROVAL_RETRY_MAX_AGE_MS,
+    });
   }
 
   /**
@@ -143,26 +121,12 @@ export class JoinApprovalRetryQueue {
     error: string,
     now: number,
   ): JoinApprovalRetryEntry {
-    const key = joinApprovalRetryKey(contextGraphId, agentAddress);
-    const existing = this.entries.get(key);
-    if (existing) {
-      existing.attempts += 1;
-      existing.lastAttemptAt = now;
-      existing.nextAttemptAt = now + this.backoffFor(existing.attempts);
-      existing.lastError = error;
-      return existing;
-    }
-    const entry: JoinApprovalRetryEntry = {
-      contextGraphId,
-      agentAddress,
-      attempts: 1,
-      firstFailureAt: now,
-      lastAttemptAt: now,
-      nextAttemptAt: now + this.backoffFor(1),
-      lastError: error,
-    };
-    this.entries.set(key, entry);
-    return entry;
+    return this.queue.enqueueFailure(
+      joinApprovalRetryKey(contextGraphId, agentAddress),
+      { contextGraphId, agentAddress },
+      error,
+      now,
+    );
   }
 
   /**
@@ -170,16 +134,12 @@ export class JoinApprovalRetryQueue {
    * for it. Returns `true` when an entry was actually removed.
    */
   markDelivered(contextGraphId: string, agentAddress: string): boolean {
-    return this.entries.delete(joinApprovalRetryKey(contextGraphId, agentAddress));
+    return this.queue.markDelivered(joinApprovalRetryKey(contextGraphId, agentAddress));
   }
 
   /** Return all entries whose `nextAttemptAt` is at or before `now`. */
   due(now: number): JoinApprovalRetryEntry[] {
-    const out: JoinApprovalRetryEntry[] = [];
-    for (const entry of this.entries.values()) {
-      if (entry.nextAttemptAt <= now) out.push(entry);
-    }
-    return out;
+    return this.queue.due(now);
   }
 
   /**
@@ -187,38 +147,26 @@ export class JoinApprovalRetryQueue {
    * `now`. Returns the dropped entries so the caller can log them.
    */
   dropExpired(now: number): JoinApprovalRetryEntry[] {
-    const dropped: JoinApprovalRetryEntry[] = [];
-    for (const [key, entry] of this.entries) {
-      if (now - entry.firstFailureAt > this.maxAgeMs) {
-        dropped.push(entry);
-        this.entries.delete(key);
-      }
-    }
-    return dropped;
+    return this.queue.dropExpired(now);
   }
 
   /** Get the entry for a `(cg, agent)` pair if any. */
   getEntry(contextGraphId: string, agentAddress: string): JoinApprovalRetryEntry | undefined {
-    return this.entries.get(joinApprovalRetryKey(contextGraphId, agentAddress));
+    return this.queue.getEntry(joinApprovalRetryKey(contextGraphId, agentAddress));
   }
 
   /** Snapshot of all entries for diagnostics. */
   list(): JoinApprovalRetryEntry[] {
-    return Array.from(this.entries.values()).map((e) => ({ ...e }));
+    return this.queue.list();
   }
 
   /** Number of entries currently queued. */
   size(): number {
-    return this.entries.size;
+    return this.queue.size();
   }
 
   /** Drop everything (for shutdown / tests). */
   clear(): void {
-    this.entries.clear();
-  }
-
-  private backoffFor(attempts: number): number {
-    const idx = Math.min(Math.max(attempts - 1, 0), this.backoffs.length - 1);
-    return this.backoffs[idx];
+    this.queue.clear();
   }
 }

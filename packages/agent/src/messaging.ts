@@ -45,7 +45,30 @@ export type ChatHandler = (
   message: string,
   senderPeerId: string,
   conversationId: string,
+  // Optional `contextGraphId` carried in the encrypted payload by the sender.
+  // Receivers that scope chat to a specific CG can use this for ACL bookkeeping
+  // and per-graph storage; legacy chat handlers that don't take this arg keep
+  // working unchanged (extra positional args are silently ignored in JS).
+  senderContextGraphId?: string,
 ) => void | Promise<void>;
+
+/**
+ * Authorisation hook invoked on every inbound chat AFTER signature
+ * verification and decryption, but BEFORE the user-level ChatHandler.
+ *
+ * Returning `{ accept: false, reason }` causes the receiver to send back
+ * `{ success: false, error: reason ?? 'unauthorized' }` and skip the
+ * ChatHandler entirely — the SQLite row + notification on the daemon
+ * side never get created, so unauthorised senders are inert.
+ *
+ * Authentication (who the sender is) is handled by the existing Ed25519
+ * signature check; this hook layers *authorisation* (are they allowed to
+ * be talking to us at all?) on top.
+ */
+export type ChatAclCheck = (
+  senderPeerId: string,
+  payload: { contextGraphId?: string },
+) => { accept: boolean; reason?: string };
 
 interface ConversationState {
   highWaterMark: number;
@@ -73,6 +96,7 @@ export class MessageHandler {
   private readonly skillHandlers = new Map<string, SkillHandler>();
   private readonly peerKeys = new Map<string, Uint8Array>();
   private chatHandler: ChatHandler | null = null;
+  private chatAclCheck: ChatAclCheck | null = null;
 
   constructor(
     router: ProtocolRouter,
@@ -102,6 +126,15 @@ export class MessageHandler {
   }
 
   /**
+   * Install an authorisation hook for inbound chats. When unset, all
+   * authenticated senders are accepted (legacy behaviour). The daemon
+   * sets this from `chat.acl` in the node config — see lifecycle.ts.
+   */
+  setChatAcl(check: ChatAclCheck | null): void {
+    this.chatAclCheck = check;
+  }
+
+  /**
    * Cache a peer's Ed25519 public key for use in outgoing messages.
    * Keys are also auto-cached from incoming messages.
    */
@@ -112,6 +145,7 @@ export class MessageHandler {
   async sendChat(
     recipientPeerId: string,
     text: string,
+    options: { contextGraphId?: string } = {},
   ): Promise<{ delivered: boolean; error?: string }> {
     try {
       const conversationId = bytesToHex(randomBytes(16));
@@ -125,9 +159,14 @@ export class MessageHandler {
         sharedSecret,
       });
 
+      // `contextGraphId` is optional and only included when the caller scopes
+      // chat to a CG (e.g. for the receiver's `scoped`/`shared-context-graph`
+      // ACL modes). Older receivers that don't know the field will simply
+      // ignore it — backwards-compatible JSON addition.
       const payload = new TextEncoder().encode(JSON.stringify({
         type: 'chat',
         text,
+        ...(options.contextGraphId ? { contextGraphId: options.contextGraphId } : {}),
       }));
 
       const nonce = buildNonce(conversationId, 1);
@@ -336,9 +375,33 @@ export class MessageHandler {
 
     if (parsed.type === 'chat') {
       const text = (parsed.text as string) ?? '';
+      const senderContextGraphId =
+        typeof parsed.contextGraphId === 'string' ? parsed.contextGraphId : undefined;
+
+      // Authorisation check (layered on top of the existing Ed25519
+      // signature check above). When unset, all authenticated senders are
+      // accepted — this preserves the legacy behaviour for nodes that
+      // haven't configured `chat.acl`.
+      if (this.chatAclCheck) {
+        const verdict = this.chatAclCheck(fromPeerId.toString(), {
+          contextGraphId: senderContextGraphId,
+        });
+        if (!verdict.accept) {
+          return this.encryptAndSign(conv.sharedSecret, convId, seq + 1, {
+            success: false,
+            error: verdict.reason ?? 'unauthorized',
+          });
+        }
+      }
+
       if (this.chatHandler) {
         try {
-          await this.chatHandler(text, fromPeerId.toString(), convId);
+          await this.chatHandler(
+            text,
+            fromPeerId.toString(),
+            convId,
+            senderContextGraphId,
+          );
         } catch (err) {
           console.error(`[Messaging] chat handler error:`, err instanceof Error ? err.message : err);
         }

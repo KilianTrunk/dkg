@@ -380,4 +380,53 @@ export class FakeClient {
       alreadyRegistered: false,
     };
   }
+
+  // ── Agent-to-agent chat (Phase 1: agent debug chat RFC) ────────
+  /**
+   * Inbound chat history surfaced by `dkg_check_inbox` (via the daemon's
+   * `GET /api/messages`). Pre-seed with `client.chatMessages.push({ … })`
+   * in tests; calls land here for assertions in `client.sendChatCalls`.
+   */
+  readonly chatMessages: Array<{
+    ts: number;
+    direction: 'in' | 'out';
+    peer: string;
+    peerName?: string;
+    text: string;
+    delivered?: boolean;
+  }> = [];
+  readonly sendChatCalls: Array<{
+    to: string;
+    text: string;
+    contextGraphId?: string;
+  }> = [];
+  /** Toggle to make `sendChat` return a delivery failure with custom error. */
+  chatDeliveryOverride: { delivered: boolean; error?: string } | null = null;
+  /** Used by `buildPeerNameMap` to resolve friendly names. */
+  agents: Array<{ peerId: string; name: string }> = [];
+
+  async sendChat(args: { to: string; text: string; contextGraphId?: string }) {
+    if (this.overrides.sendChat) return this.overrides.sendChat.call(this, args);
+    this.sendChatCalls.push(args);
+    if (this.chatDeliveryOverride) return this.chatDeliveryOverride;
+    return { delivered: true };
+  }
+
+  async getMessages(args: {
+    peer?: string;
+    since?: number;
+    limit?: number;
+  } = {}) {
+    if (this.overrides.getMessages) return this.overrides.getMessages.call(this, args);
+    let rows = this.chatMessages.slice();
+    if (args.peer) rows = rows.filter((m) => m.peer === args.peer);
+    if (typeof args.since === 'number') rows = rows.filter((m) => m.ts > args.since!);
+    if (typeof args.limit === 'number') rows = rows.slice(-args.limit);
+    return { messages: rows };
+  }
+
+  async listAgents() {
+    if (this.overrides.listAgents) return this.overrides.listAgents.call(this);
+    return this.agents;
+  }
 }

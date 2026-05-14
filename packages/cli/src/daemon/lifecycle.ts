@@ -291,6 +291,7 @@ import {
   extractionRecordMatchesOpenClawAttachmentRef,
   verifyOpenClawAttachmentRefsProvenance,
 } from './openclaw.js';
+import { buildChatAcl } from './chat-acl.js';
 import {
   type LocalAgentIntegrationDefinition,
   type LocalAgentIntegrationRecord,
@@ -657,8 +658,22 @@ export async function runDaemonInner(
     );
   }
 
+  // Inbound chat authorisation (Phase 1 of agent debug chat RFC). Layered
+  // on top of the protocol-level Ed25519 signature check that messaging.ts
+  // already does — this controls *which* authenticated peers we'll accept
+  // chats from, configured via `chat.acl` in the node config. When unset,
+  // the legacy "accept all authenticated peers" behaviour is preserved.
+  agent.setChatAcl(
+    buildChatAcl({
+      config: config.chat?.acl,
+      dashDb,
+      getLocalPeerId: () => agent.peerId,
+      log,
+    }),
+  );
+
   let chatDb: DashboardDB | null = null;
-  agent.onChat((text, senderPeerId, _convId) => {
+  agent.onChat((text, senderPeerId, _convId, senderContextGraphId) => {
     if (chatDb) {
       try {
         chatDb.insertChatMessage({
@@ -671,10 +686,11 @@ export async function runDaemonInner(
         /* never crash */
       }
       try {
+        const titleSuffix = senderContextGraphId ? ` (${shortId(senderContextGraphId)})` : '';
         chatDb.insertNotification({
           ts: Date.now(),
           type: "chat_message",
-          title: "New message",
+          title: `New message${titleSuffix}`,
           message: `Message from ${shortId(senderPeerId)}: ${text.slice(0, 120)}`,
           source: "peer-chat",
           peer: senderPeerId,
@@ -683,7 +699,8 @@ export async function runDaemonInner(
         /* never crash */
       }
     }
-    log(`CHAT IN  [${shortId(senderPeerId)}]: ${text}`);
+    const cgTag = senderContextGraphId ? ` cg=${shortId(senderContextGraphId)}` : '';
+    log(`CHAT IN  [${shortId(senderPeerId)}]${cgTag}: ${text}`);
   });
 
   await agent.start();

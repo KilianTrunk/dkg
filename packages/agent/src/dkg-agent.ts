@@ -133,7 +133,7 @@ type LocalSwmSenderKeyReceiveState = {
 };
 import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
-import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler } from './messaging.js';
+import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler, type ChatAclCheck } from './messaging.js';
 import { ed25519ToX25519Private, ed25519ToX25519Public } from './encryption.js';
 import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, type AgentProfileConfig } from './profile.js';
 import {
@@ -1787,6 +1787,12 @@ export class DKGAgent {
     if (this._pendingChatHandler) {
       this.messageHandler.onChat(this._pendingChatHandler);
       this._pendingChatHandler = null;
+    }
+
+    // Wire up pending chat ACL (set via `agent.setChatAcl(...)` before start)
+    if (this._pendingChatAcl) {
+      this.messageHandler.setChatAcl(this._pendingChatAcl);
+      this._pendingChatAcl = null;
     }
 
     // Register skill handlers
@@ -4038,9 +4044,13 @@ export class DKGAgent {
     return this.messenger.sendToPeer(peerId, protocolId, data, opts);
   }
 
-  async sendChat(recipientPeerId: string, text: string): Promise<{ delivered: boolean; error?: string }> {
+  async sendChat(
+    recipientPeerId: string,
+    text: string,
+    options: { contextGraphId?: string } = {},
+  ): Promise<{ delivered: boolean; error?: string }> {
     if (!this.messageHandler) throw new Error('Agent not started');
-    return this.messageHandler.sendChat(recipientPeerId, text);
+    return this.messageHandler.sendChat(recipientPeerId, text, options);
   }
 
   onChat(handler: ChatHandler): void {
@@ -4051,7 +4061,21 @@ export class DKGAgent {
     this.messageHandler.onChat(handler);
   }
 
+  /**
+   * Install / clear the inbound-chat ACL. Pass `null` to disable (legacy
+   * "accept all authenticated peers" behaviour). The daemon constructs the
+   * concrete callback from `chat.acl` config — see lifecycle.ts.
+   */
+  setChatAcl(check: ChatAclCheck | null): void {
+    if (!this.messageHandler) {
+      this._pendingChatAcl = check;
+      return;
+    }
+    this.messageHandler.setChatAcl(check);
+  }
+
   private _pendingChatHandler: ChatHandler | null = null;
+  private _pendingChatAcl: ChatAclCheck | null = null;
 
   async invokeSkill(
     recipientPeerId: string,

@@ -115,8 +115,16 @@ export class ApiClient {
     return this.get('/api/skills');
   }
 
-  async sendChat(to: string, text: string): Promise<{ delivered: boolean; error?: string }> {
-    return this.post('/api/chat', { to, text });
+  async sendChat(
+    to: string,
+    text: string,
+    opts?: { contextGraphId?: string },
+  ): Promise<{ delivered: boolean; error?: string }> {
+    return this.post('/api/chat', {
+      to,
+      text,
+      ...(opts?.contextGraphId ? { contextGraphId: opts.contextGraphId } : {}),
+    });
   }
 
   async messages(opts?: { peer?: string; since?: number; limit?: number }): Promise<{

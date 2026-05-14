@@ -205,6 +205,65 @@ export class DkgClient {
     return r.agents ?? [];
   }
 
+  // ── Agent-to-agent chat (Phase 1: agent debug chat RFC) ────────
+  /**
+   * Send an encrypted libp2p chat to another agent on the DKG network.
+   * Wraps `POST /api/chat`, which performs the peerId lookup,
+   * encrypted-and-signed exchange over `/dkg/message/1.0.0`, and (on
+   * the receiver) a SQLite insert + notification.
+   *
+   * `to` accepts a peerId or a friendly node name registered in the
+   * agent registry. `contextGraphId` is optional and is embedded in the
+   * encrypted chat payload so a receiver running `chat.acl.mode =
+   * scoped` / `shared-context-graph` can validate the sender belongs to
+   * the CG (and so the receiver's SQLite notification carries the CG
+   * tag).
+   *
+   * Returns `delivered: false` with an `error` field on any failure,
+   * including ACL rejections — the daemon already surfaces the
+   * receiver's `unauthorized: ...` response verbatim, so the model can
+   * react ("ask the operator to whitelist us in the receiver's chat
+   * ACL") without parsing.
+   */
+  async sendChat(args: {
+    to: string;
+    text: string;
+    contextGraphId?: string;
+  }): Promise<{ delivered: boolean; error?: string; phases?: Record<string, number> }> {
+    const body: Record<string, unknown> = { to: args.to, text: args.text };
+    if (args.contextGraphId) body.contextGraphId = args.contextGraphId;
+    return this.request('POST', '/api/chat', body);
+  }
+
+  /**
+   * Read this node's locally stored chat history. Backed by the
+   * `chat_messages` table in `DashboardDB` — every inbound peer chat
+   * lands here on receipt (after passing the ACL), and every outbound
+   * chat the daemon successfully sends is logged for the operator's
+   * UI. Used by `dkg_check_inbox` to surface unread peer messages.
+   */
+  async getMessages(args: {
+    peer?: string;
+    since?: number;
+    limit?: number;
+  } = {}): Promise<{
+    messages: Array<{
+      ts: number;
+      direction: 'in' | 'out';
+      peer: string;
+      peerName?: string;
+      text: string;
+      delivered?: boolean;
+    }>;
+  }> {
+    const params = new URLSearchParams();
+    if (args.peer) params.set('peer', args.peer);
+    if (typeof args.since === 'number') params.set('since', String(args.since));
+    if (typeof args.limit === 'number') params.set('limit', String(args.limit));
+    const qs = params.toString();
+    return this.request('GET', `/api/messages${qs ? `?${qs}` : ''}`);
+  }
+
   // ── Writes ─────────────────────────────────────────────────────
   /**
    * Ensure a sub-graph exists on a project. Idempotent — a pre-existing

@@ -533,11 +533,21 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     }
   }
 
-  // POST /api/chat  { to: "name-or-peerId", text: "..." }
+  // POST /api/chat  { to: "name-or-peerId", text: "...", contextGraphId?: "..." }
+  //
+  // Optional `contextGraphId` is embedded in the encrypted payload so a
+  // scoped receiver can validate that the sender is talking on behalf of
+  // a context graph both sides recognise. Defaults to `config.chat.acl
+  // .contextGraphId` when omitted, so most callers don't have to think
+  // about it after initial setup.
   if (req.method === "POST" && path === "/api/chat") {
     const serverT0 = Date.now();
     const body = await readBody(req, SMALL_BODY_BYTES);
-    const { to, text } = JSON.parse(body);
+    const { to, text, contextGraphId } = JSON.parse(body) as {
+      to?: string;
+      text?: string;
+      contextGraphId?: string;
+    };
     if (!to || !text)
       return jsonResponse(res, 400, { error: 'Missing "to" or "text"' });
 
@@ -547,9 +557,11 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     if (!peerId)
       return jsonResponse(res, 404, { error: `Agent "${to}" not found` });
 
+    const resolvedCgId = contextGraphId ?? config.chat?.acl?.contextGraphId;
+
     const sendT0 = Date.now();
     const result = await Promise.race([
-      agent.sendChat(peerId, text),
+      agent.sendChat(peerId, text, resolvedCgId ? { contextGraphId: resolvedCgId } : {}),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("sendChat timeout (30s)")), 30_000),
       ),

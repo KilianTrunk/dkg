@@ -101,4 +101,21 @@ describe('inject-inbox.mjs daemonIdentityHash — STATE KEYING', () => {
     expect(hash).toMatch(/^[0-9a-f]+$/);
     expect(hash.length).toBeLessThanOrEqual(16);
   });
+
+  it('agrees byte-for-byte with the TypeScript daemonIdentityHash so hook + tool share state', async () => {
+    // The hook is .mjs and uses `{ api, source }`; the TS helper uses
+    // `{ api, sourcePath }`. Both must produce the same hex digest
+    // for the same daemon — otherwise the hook would notify based on
+    // one state file and the tool would advance a different one.
+    const tsModule = await import('../src/inbox-cursor.js');
+    const tsHash = tsModule.daemonIdentityHash({
+      api: 'http://localhost:9200',
+      sourcePath: '/proj/.dkg/config.yaml',
+    });
+    const jsHash = daemonIdentityHash({
+      api: 'http://localhost:9200',
+      source: '/proj/.dkg/config.yaml',
+    });
+    expect(jsHash).toBe(tsHash);
+  });
 });

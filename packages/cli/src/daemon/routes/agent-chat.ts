@@ -588,29 +588,59 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     });
   }
 
-  // GET /api/messages?peer=<name-or-id>&limit=N&since=<ts>&direction=in|out
+  // GET /api/messages
+  //   ?peer=<name-or-id>
+  //   &limit=N
+  //   &since=<ts>
+  //   &sinceId=<id>          ← lossless compound cursor (Codex PR #510 round 2)
+  //   &direction=in|out
+  //   &order=asc|desc
   //
   // `direction` is a server-side filter applied BEFORE `limit`. Inbox
   // readers (the `dkg_check_inbox` MCP tool, the `inject-inbox` hook)
   // pass `direction=in` so a burst of outbound replies in the newest
   // page cannot push older unread inbound messages off the bottom and
-  // cause the inbox watermark to skip them. Without this, the client-
-  // side `direction === 'in'` filter ran after the LIMIT cap and silently
-  // dropped unread messages whenever the page was direction-mixed.
+  // cause the inbox watermark to skip them.
+  //
+  // `sinceId` enables compound-cursor pagination — when paired with
+  // `since`, the predicate is `(ts > since) OR (ts = since AND id >
+  // sinceId)`. Without this, rows sharing the same millisecond `ts`
+  // would be silently dropped on the next page (chat bursts can easily
+  // produce duplicate `Date.now()` values).
+  //
+  // `order` defaults to `desc` (history view). Inbox readers pass
+  // `asc` for forward pagination so the watermark only advances past
+  // rows we have actually returned. We surface row `id` in the
+  // response so clients can build the next compound cursor.
   if (req.method === "GET" && path === "/api/messages") {
     const peerFilter = url.searchParams.get("peer");
     const limit = parseInt(url.searchParams.get("limit") ?? "100", 10);
     const since = parseInt(url.searchParams.get("since") ?? "0", 10);
+    const sinceIdRaw = url.searchParams.get("sinceId");
+    const sinceId = sinceIdRaw != null && /^\d+$/.test(sinceIdRaw)
+      ? parseInt(sinceIdRaw, 10)
+      : undefined;
     const directionRaw = url.searchParams.get("direction");
     const direction: "in" | "out" | undefined =
       directionRaw === "in" || directionRaw === "out" ? directionRaw : undefined;
+    const orderRaw = url.searchParams.get("order");
+    const order: "asc" | "desc" | undefined =
+      orderRaw === "asc" || orderRaw === "desc" ? orderRaw : undefined;
 
     let peer: string | undefined;
     if (peerFilter) {
       peer = (await resolveNameToPeerId(agent, peerFilter)) ?? undefined;
     }
-    const rows = dashDb.getChatMessages({ peer, since: since || undefined, limit, direction });
+    const rows = dashDb.getChatMessages({
+      peer,
+      since: since || undefined,
+      sinceId,
+      limit,
+      direction,
+      order,
+    });
     const msgs = rows.map((r: any) => ({
+      id: r.id,
       ts: r.ts,
       direction: r.direction,
       peer: r.peer,

@@ -245,6 +245,13 @@ export class DkgClient {
   async getMessages(args: {
     peer?: string;
     since?: number;
+    /**
+     * Compound-cursor secondary key — paired with `since`, makes the
+     * daemon's predicate `(ts > since) OR (ts = since AND id > sinceId)`
+     * so rows sharing a millisecond aren't dropped between pages.
+     * (Codex PR #510 round 2.)
+     */
+    sinceId?: number;
     limit?: number;
     /**
      * Server-side direction filter. Applied BEFORE the daemon's LIMIT
@@ -254,8 +261,19 @@ export class DkgClient {
      * `packages/cli/src/daemon/routes/agent-chat.ts` for the contract.
      */
     direction?: 'in' | 'out';
+    /**
+     * `asc` = forward pagination (oldest first). Inbox readers use this
+     * so the watermark only advances past rows we have actually
+     * returned. Default `desc` keeps history-view callers unchanged.
+     */
+    order?: 'asc' | 'desc';
   } = {}): Promise<{
     messages: Array<{
+      /**
+       * SQLite rowid — exposed so callers can build the next compound
+       * cursor `{ since: ts, sinceId: id }`.
+       */
+      id: number;
       ts: number;
       direction: 'in' | 'out';
       peer: string;
@@ -267,9 +285,13 @@ export class DkgClient {
     const params = new URLSearchParams();
     if (args.peer) params.set('peer', args.peer);
     if (typeof args.since === 'number') params.set('since', String(args.since));
+    if (typeof args.sinceId === 'number') params.set('sinceId', String(args.sinceId));
     if (typeof args.limit === 'number') params.set('limit', String(args.limit));
     if (args.direction === 'in' || args.direction === 'out') {
       params.set('direction', args.direction);
+    }
+    if (args.order === 'asc' || args.order === 'desc') {
+      params.set('order', args.order);
     }
     const qs = params.toString();
     return this.request('GET', `/api/messages${qs ? `?${qs}` : ''}`);

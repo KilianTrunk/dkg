@@ -45,14 +45,23 @@
  *
  * STATE
  * ─────
- * The last-seen-ts watermark lives in
+ * The read-cursor lives in
  * `~/.cache/dkg-mcp/inbox-cursor-<daemon-hash>.json`, keyed by the
- * resolved daemon identity (API URL + config source). This keeps
- * two daemons sharing one OS user from stomping each other's
- * watermark — the two-laptop debugging scenario this PR enables is
- * also the case where someone is most likely to be running two
- * daemons on a single dev box. Codex/branarakic review on PR #510
- * raised this as well.
+ * resolved daemon identity (API URL + config source + DKG_HOME). Two
+ * daemons on the same OS account get distinct state files (the
+ * two-laptop-on-one-box debug scenario this PR enables).
+ *
+ * Format: `{ ts: number, id: number }` — compound cursor because chat
+ * bursts can share `Date.now()` values and a `ts`-only watermark
+ * would silently skip rows that share the boundary millisecond (Codex
+ * PR #510 round 2 flagged this).
+ *
+ * Owner: the HOOK only READS this cursor — it never advances the
+ * watermark on its own. The cursor is advanced by `dkg_check_inbox`
+ * when the agent actually surfaces messages. This keeps the hook's
+ * "you have N unread" notice consistent with the tool's listing:
+ * notice stays until the agent reads (then the cursor jumps), next
+ * prompt sees the empty inbox and shows nothing.
  *
  * Design principles (mirrors capture-chat.mjs):
  *   1. FAIL OPEN — any error returns `{}` so the prompt goes
@@ -242,20 +251,29 @@ function stateFileFor(cfg) {
   return path.join(STATE_DIR, `inbox-cursor-${daemonIdentityHash(cfg)}.json`);
 }
 
-function loadState(cfg) {
+/**
+ * Read the shared compound cursor. Returns `{ ts: 0, id: 0 }` when
+ * the file is missing or unreadable. Migrates legacy `{ lastSeen }`
+ * state files (written by the first version of this hook) into the
+ * new compound shape by treating the bare timestamp as `{ ts, id: 0 }`
+ * — one-shot upgrade cost is at most re-surfacing the message whose
+ * id sat exactly at that watermark.
+ *
+ * The HOOK is read-only on this file. `dkg_check_inbox` advances the
+ * cursor when it surfaces messages; see `src/inbox-cursor.ts`.
+ */
+function loadCursor(cfg) {
   try {
-    return JSON.parse(fs.readFileSync(stateFileFor(cfg), 'utf-8'));
+    const parsed = JSON.parse(fs.readFileSync(stateFileFor(cfg), 'utf-8'));
+    if (typeof parsed.ts === 'number') {
+      return { ts: parsed.ts, id: typeof parsed.id === 'number' ? parsed.id : 0 };
+    }
+    if (typeof parsed.lastSeen === 'number') {
+      return { ts: parsed.lastSeen, id: 0 };
+    }
+    return { ts: 0, id: 0 };
   } catch {
-    return { lastSeen: 0 };
-  }
-}
-
-function saveState(cfg, state) {
-  try {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.writeFileSync(stateFileFor(cfg), JSON.stringify(state, null, 2));
-  } catch (err) {
-    log(`state save failed: ${err?.message ?? err}`);
+    return { ts: 0, id: 0 };
   }
 }
 
@@ -347,19 +365,26 @@ export function renderNotice(messages) {
 }
 
 /**
- * Page through `/api/messages?direction=in&since=<lastSeen>` until
- * we get a partial page or hit the safety cap. Returns the
- * fully-coalesced list of unread inbound messages, ordered by ts asc.
+ * Page through `/api/messages?direction=in&order=asc&since=<ts>&sinceId=<id>`
+ * until we get a partial page or hit the safety cap. Walks
+ * oldest→newest so the compound cursor only ever advances over rows
+ * we have actually surfaced — `ts`-only pagination would silently
+ * skip rows sharing a millisecond (Codex PR #510 round 2). Returns
+ * the fully-coalesced list of unread inbound messages, ordered ts asc.
  */
-async function fetchAllInbound(cfg, since) {
+async function fetchAllInbound(cfg, startCursor) {
   const all = [];
-  let cursor = since;
+  let cursor = { ts: startCursor?.ts ?? 0, id: startCursor?.id ?? 0 };
   while (all.length < MAX_TOTAL) {
     const params = new URLSearchParams({
       direction: 'in',
+      order: 'asc',
       limit: String(PAGE_SIZE),
     });
-    if (cursor) params.set('since', String(cursor));
+    if (cursor.ts) {
+      params.set('since', String(cursor.ts));
+      params.set('sinceId', String(cursor.id));
+    }
     const url = `${cfg.api.replace(/\/$/, '')}/api/messages?${params.toString()}`;
     const headers = { Accept: 'application/json' };
     if (cfg.token) headers.Authorization = `Bearer ${cfg.token}`;
@@ -372,13 +397,20 @@ async function fetchAllInbound(cfg, since) {
     const page = Array.isArray(data?.messages) ? data.messages : [];
     if (page.length === 0) break;
     all.push(...page);
-    // Daemon orders rows ts ASC after its internal reverse, so the
-    // last row in `page` is the newest. Advance the cursor only if
-    // the daemon gave us a full page (i.e. there might be more).
     if (page.length < PAGE_SIZE) break;
-    const newest = page[page.length - 1].ts;
-    if (typeof newest !== 'number' || newest <= cursor) break;
-    cursor = newest;
+    // Advance compound cursor to the LAST row in the asc-ordered page
+    // (which is the newest in the batch). The next request will
+    // exclude rows up to and including this point via the
+    // `(ts > since) OR (ts = since AND id > sinceId)` predicate.
+    const last = page[page.length - 1];
+    const lastTs = typeof last.ts === 'number' ? last.ts : 0;
+    const lastId = typeof last.id === 'number' ? last.id : 0;
+    if (lastTs < cursor.ts || (lastTs === cursor.ts && lastId <= cursor.id)) {
+      // Cursor didn't advance — bail so we don't loop forever on a
+      // misbehaving daemon. Should never happen with the asc query.
+      break;
+    }
+    cursor = { ts: lastTs, id: lastId };
   }
   return all;
 }
@@ -397,12 +429,11 @@ async function main() {
     return;
   }
 
-  const state = loadState(cfg);
-  const since = state.lastSeen || 0;
+  const cursor = loadCursor(cfg);
 
   let messages;
   try {
-    messages = await fetchAllInbound(cfg, since);
+    messages = await fetchAllInbound(cfg, cursor);
   } catch (err) {
     // Daemon offline, auth fail, etc. — silently pass through, the
     // operator's prompt should never be blocked by an inbox check.
@@ -416,12 +447,13 @@ async function main() {
     return;
   }
 
-  // Advance lastSeen to the newest ts we actually surfaced. Because
-  // fetchAllInbound queries direction=in server-side and pages until
-  // exhaustion, this is safe — no unread inbound can be older than
-  // a row we surfaced and still get skipped.
-  const highWater = messages.reduce((max, m) => Math.max(max, m.ts ?? 0), since);
-  saveState(cfg, { lastSeen: highWater });
+  // INTENTIONALLY DO NOT WRITE THE CURSOR HERE. The hook is the
+  // notifier — it tells the agent that unread messages exist but
+  // does not read them. The cursor is advanced by `dkg_check_inbox`
+  // when the agent actually surfaces the contents. This keeps the
+  // notice persistent across prompts until the agent has read the
+  // messages, preventing a "notice fired but agent never followed
+  // up" failure mode.
 
   const notice = renderNotice(messages);
   // Notice goes BEFORE the operator's prompt so the model reads

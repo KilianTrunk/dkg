@@ -2,22 +2,44 @@
 //
 // Unit tests for the Phase 1 agent-to-agent debug-chat MCP tools
 // (`dkg_send_message` + `dkg_check_inbox`). Verifies tool wiring,
-// happy-path behaviour, ACL-error surfacing, and inbox formatting
-// (friendly-name resolution, since/peer/limit filters, direction
-// filtering). Uses the in-memory FakeClient/FakeServer harness.
+// happy-path behaviour, ACL-error surfacing, inbox formatting,
+// the compound-cursor read state (Codex PR #510 round 2), and the
+// unread-vs-ad-hoc-mode split. Uses the in-memory FakeClient /
+// FakeServer harness.
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { registerChatTools } from '../src/tools/chat.js';
+import type { InboxCursor } from '../src/inbox-cursor.js';
 import { FakeServer, FakeClient, makeConfig } from './harness.js';
+
+/**
+ * In-memory storage for the read cursor. Bypasses
+ * `~/.cache/dkg-mcp/inbox-cursor-<hash>.json` so tests don't
+ * cross-contaminate or depend on the operator's actual cache.
+ */
+function inMemoryCursorStorage() {
+  let state: InboxCursor = { ts: 0, id: 0 };
+  return {
+    load: () => state,
+    save: (c: InboxCursor) => {
+      state = { ...c };
+    },
+    current: () => state,
+  };
+}
 
 describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
   let server: FakeServer;
   let client: FakeClient;
+  let cursorStorage: ReturnType<typeof inMemoryCursorStorage>;
 
   beforeEach(() => {
     server = new FakeServer();
     client = new FakeClient();
-    registerChatTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    cursorStorage = inMemoryCursorStorage();
+    registerChatTools(server.asMcpServer(), client.asDkgClient(), makeConfig(), {
+      cursorStorage,
+    });
   });
 
   it('registers both chat tools', () => {
@@ -59,7 +81,6 @@ describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
       expect(result.isError).toBe(true);
       const body = result.content[0].text;
       expect(body).toMatch(/unauthorized/);
-      // The model should be guided toward a human-fixable next step.
       expect(body).toMatch(/peerAllowlist|context graph|ACL/i);
     });
 
@@ -77,7 +98,7 @@ describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
     });
   });
 
-  describe('dkg_check_inbox', () => {
+  describe('dkg_check_inbox — unread (default) mode', () => {
     it('returns a friendly empty-state when no messages exist', async () => {
       const result = await server.call('dkg_check_inbox', {});
       expect(result.isError).toBeFalsy();
@@ -86,109 +107,161 @@ describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
 
     it('formats inbound messages with friendly names + timestamps', async () => {
       client.agents = [{ peerId: '12D3KooWAliceXYZ', name: 'alice-node' }];
-      client.chatMessages.push(
-        { ts: 1715670000000, direction: 'in', peer: '12D3KooWAliceXYZ', text: 'msg-one' },
-        { ts: 1715680000000, direction: 'in', peer: '12D3KooWBobABC', text: 'msg-two' },
-      );
+      client.pushChatMessage({ ts: 1715670000000, direction: 'in', peer: '12D3KooWAliceXYZ', text: 'msg-one' });
+      client.pushChatMessage({ ts: 1715680000000, direction: 'in', peer: '12D3KooWBobABC', text: 'msg-two' });
       const result = await server.call('dkg_check_inbox', {});
       expect(result.isError).toBeFalsy();
       const body = result.content[0].text;
       expect(body).toMatch(/2 unread peer messages/);
-      // Friendly name surfaces for the agent we know about
       expect(body).toMatch(/alice-node \(…AliceXYZ\)/);
-      // Bare short-form for unknown peers
       expect(body).toMatch(/…oWBobABC/);
-      // Both message bodies present
       expect(body).toContain('msg-one');
       expect(body).toContain('msg-two');
-      // Reply hint surfaced
       expect(body).toMatch(/dkg_send_message/);
     });
 
-    it('filters out outbound messages by default (server-side, via direction=in)', async () => {
-      client.chatMessages.push(
-        { ts: 1, direction: 'out', peer: 'peer', text: 'sent', delivered: true },
-        { ts: 2, direction: 'in', peer: 'peer', text: 'received' },
-      );
+    it('filters out outbound messages by default via server-side direction=in', async () => {
+      client.pushChatMessage({ ts: 1, direction: 'out', peer: 'peer', text: 'sent', delivered: true });
+      client.pushChatMessage({ ts: 2, direction: 'in', peer: 'peer', text: 'received' });
       const result = await server.call('dkg_check_inbox', {});
       expect(result.content[0].text).toMatch(/1 unread peer message/);
       expect(result.content[0].text).toContain('received');
       expect(result.content[0].text).not.toContain('sent');
-      // Crucially: the direction filter was pushed to the daemon, so
-      // LIMIT can't push inbound rows off the bottom of the page when
-      // newest entries are outbound. (Codex/branarakic PR #510 fix.)
+      // direction=in pushed to daemon AND order=asc for forward pagination
       expect(client.getMessagesCalls).toHaveLength(1);
-      expect(client.getMessagesCalls[0]).toMatchObject({ direction: 'in' });
+      expect(client.getMessagesCalls[0]).toMatchObject({
+        direction: 'in',
+        order: 'asc',
+      });
     });
 
-    it('shows both directions when directionFilter=both and DROPS the direction param so daemon returns mixed rows', async () => {
-      client.chatMessages.push(
-        { ts: 1, direction: 'out', peer: 'peer', text: 'outbound-text', delivered: true },
-        { ts: 2, direction: 'in', peer: 'peer', text: 'inbound-text' },
-      );
+    // Codex PR #510 round 2 — unread mode must persist a watermark.
+    it('advances the cursor past the newest surfaced message', async () => {
+      client.pushChatMessage({ ts: 1000, direction: 'in', peer: 'p', text: 'a' });
+      const newestId = client.pushChatMessage({ ts: 2000, direction: 'in', peer: 'p', text: 'b' });
+
+      expect(cursorStorage.current()).toEqual({ ts: 0, id: 0 });
+      await server.call('dkg_check_inbox', {});
+      expect(cursorStorage.current()).toEqual({ ts: 2000, id: newestId });
+    });
+
+    it('returns no rows on a second call after the cursor has advanced', async () => {
+      client.pushChatMessage({ ts: 1000, direction: 'in', peer: 'p', text: 'a' });
+      client.pushChatMessage({ ts: 2000, direction: 'in', peer: 'p', text: 'b' });
+
+      const first = await server.call('dkg_check_inbox', {});
+      expect(first.content[0].text).toMatch(/2 unread peer messages/);
+
+      const second = await server.call('dkg_check_inbox', {});
+      expect(second.content[0].text).toMatch(/No unread peer messages/);
+    });
+
+    it('uses the compound cursor (ts + sinceId) on subsequent reads', async () => {
+      // Same-millisecond burst — ts is shared, only the auto-incremented
+      // id distinguishes the rows. After surfacing one, the cursor
+      // must include sinceId so the OTHER same-ts row isn't skipped or
+      // re-shown.
+      const idA = client.pushChatMessage({ ts: 5000, direction: 'in', peer: 'p', text: 'a' });
+      const idB = client.pushChatMessage({ ts: 5000, direction: 'in', peer: 'p', text: 'b' });
+
+      // First call: should return BOTH a and b, advance cursor to
+      // (5000, max(idA, idB)).
+      const first = await server.call('dkg_check_inbox', {});
+      expect(first.content[0].text).toContain('a');
+      expect(first.content[0].text).toContain('b');
+      expect(cursorStorage.current()).toEqual({ ts: 5000, id: Math.max(idA, idB) });
+
+      // Push a third row at the same ts — must still appear next call.
+      const idC = client.pushChatMessage({ ts: 5000, direction: 'in', peer: 'p', text: 'c' });
+      const second = await server.call('dkg_check_inbox', {});
+      expect(second.content[0].text).toContain('c');
+      expect(second.content[0].text).not.toContain('msg "a"');
+      expect(cursorStorage.current()).toEqual({ ts: 5000, id: idC });
+      // The query MUST have used the compound (since, sinceId) cursor.
+      const lastCall = client.getMessagesCalls[client.getMessagesCalls.length - 1];
+      expect(lastCall).toMatchObject({
+        since: 5000,
+        sinceId: Math.max(idA, idB),
+        direction: 'in',
+        order: 'asc',
+      });
+    });
+  });
+
+  describe('dkg_check_inbox — ad-hoc mode (caller-supplied filters)', () => {
+    it('peer= switches to ad-hoc mode: cursor not advanced and no `order` sent', async () => {
+      client.pushChatMessage({ ts: 1, direction: 'in', peer: 'alice', text: 'from-alice' });
+      client.pushChatMessage({ ts: 2, direction: 'in', peer: 'bob', text: 'from-bob' });
+
+      const result = await server.call('dkg_check_inbox', { peer: 'alice' });
+      const body = result.content[0].text;
+      expect(body).toContain('from-alice');
+      expect(body).not.toContain('from-bob');
+      // Cursor must NOT advance — browsing history shouldn't shadow
+      // genuinely-unread rows from a later default call.
+      expect(cursorStorage.current()).toEqual({ ts: 0, id: 0 });
+      // Ad-hoc mode uses the daemon's default order, not the unread
+      // mode's forward pagination.
+      expect(client.getMessagesCalls[0].order).toBeUndefined();
+    });
+
+    it('since= switches to ad-hoc mode', async () => {
+      client.pushChatMessage({ ts: 1000, direction: 'in', peer: 'peer', text: 'old' });
+      client.pushChatMessage({ ts: 5000, direction: 'in', peer: 'peer', text: 'new' });
+      const result = await server.call('dkg_check_inbox', { since: 2000 });
+      expect(result.content[0].text).toContain('new');
+      expect(result.content[0].text).not.toContain('old');
+      expect(cursorStorage.current()).toEqual({ ts: 0, id: 0 });
+    });
+
+    it('directionFilter=both → ad-hoc, no `direction` and no `order` on the daemon query', async () => {
+      client.pushChatMessage({ ts: 1, direction: 'out', peer: 'peer', text: 'outbound-text', delivered: true });
+      client.pushChatMessage({ ts: 2, direction: 'in', peer: 'peer', text: 'inbound-text' });
       const result = await server.call('dkg_check_inbox', { directionFilter: 'both' });
       const body = result.content[0].text;
       expect(body).toContain('outbound-text');
       expect(body).toContain('inbound-text');
       expect(body).toMatch(/direction=both/);
-      // For "both" we want mixed rows, so direction must NOT be set
-      // on the daemon query — otherwise we'd get only one side.
       expect(client.getMessagesCalls[0].direction).toBeUndefined();
+      expect(client.getMessagesCalls[0].order).toBeUndefined();
+      expect(cursorStorage.current()).toEqual({ ts: 0, id: 0 });
     });
 
-    it('directionFilter=out pushes direction=out to the daemon', async () => {
-      client.chatMessages.push(
-        { ts: 1, direction: 'out', peer: 'peer', text: 'sent', delivered: true },
-        { ts: 2, direction: 'in', peer: 'peer', text: 'received' },
-      );
+    it('directionFilter=out → ad-hoc, pushes direction=out', async () => {
+      client.pushChatMessage({ ts: 1, direction: 'out', peer: 'peer', text: 'sent', delivered: true });
+      client.pushChatMessage({ ts: 2, direction: 'in', peer: 'peer', text: 'received' });
       const result = await server.call('dkg_check_inbox', { directionFilter: 'out' });
       expect(client.getMessagesCalls[0]).toMatchObject({ direction: 'out' });
+      expect(client.getMessagesCalls[0].order).toBeUndefined();
       expect(result.content[0].text).toContain('sent');
       expect(result.content[0].text).not.toContain('received');
+      expect(cursorStorage.current()).toEqual({ ts: 0, id: 0 });
     });
 
     it('flags undelivered outbound messages when directionFilter shows out', async () => {
-      client.chatMessages.push(
-        { ts: 1, direction: 'out', peer: 'peer', text: 'failed-message', delivered: false },
-      );
+      client.pushChatMessage({ ts: 1, direction: 'out', peer: 'peer', text: 'failed-message', delivered: false });
       const result = await server.call('dkg_check_inbox', { directionFilter: 'out' });
       expect(result.content[0].text).toMatch(/UNDELIVERED/);
     });
 
-    it('respects since= filter against the daemon query', async () => {
-      client.chatMessages.push(
-        { ts: 1000, direction: 'in', peer: 'peer', text: 'old' },
-        { ts: 5000, direction: 'in', peer: 'peer', text: 'new' },
-      );
-      const result = await server.call('dkg_check_inbox', { since: 2000 });
-      expect(result.content[0].text).toContain('new');
-      expect(result.content[0].text).not.toContain('old');
-    });
-
-    it('passes peer= filter to the daemon query', async () => {
-      client.chatMessages.push(
-        { ts: 1, direction: 'in', peer: 'alice', text: 'from-alice' },
-        { ts: 2, direction: 'in', peer: 'bob', text: 'from-bob' },
-      );
-      const result = await server.call('dkg_check_inbox', { peer: 'alice' });
-      const body = result.content[0].text;
-      expect(body).toContain('from-alice');
-      expect(body).not.toContain('from-bob');
-    });
-
-    it('caps results by limit', async () => {
+    it('caps results by limit in unread mode and STILL advances the cursor only over surfaced rows', async () => {
       for (let i = 0; i < 10; i++) {
-        client.chatMessages.push({ ts: i, direction: 'in', peer: 'peer', text: `m${i}` });
+        client.pushChatMessage({ ts: 1000 + i, direction: 'in', peer: 'peer', text: `m${i}` });
       }
       const result = await server.call('dkg_check_inbox', { limit: 3 });
       const body = result.content[0].text;
       expect(body).toMatch(/3 unread peer messages/);
-      // The FakeClient.getMessages keeps the LAST N rows when limit is set,
-      // matching the daemon's most-recent-first ordering. Tests should
-      // not over-constrain on which specific messages appear; just that
-      // the cap is honoured.
-      const matches = body.match(/m\d/g) ?? [];
-      expect(matches).toHaveLength(3);
+      // Forward (asc) pagination returns the OLDEST 3 — m0, m1, m2 —
+      // and the cursor advances to ts=1002 (m2). The next call should
+      // pick up m3..m9.
+      expect(body).toContain('m0');
+      expect(body).toContain('m2');
+      expect(body).not.toContain('m3');
+      expect(cursorStorage.current().ts).toBe(1002);
+
+      const next = await server.call('dkg_check_inbox', { limit: 3 });
+      expect(next.content[0].text).toContain('m3');
+      expect(next.content[0].text).not.toContain('m2');
     });
   });
 });

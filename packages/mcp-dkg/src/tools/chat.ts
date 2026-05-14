@@ -23,6 +23,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DkgClient } from '../client.js';
 import type { DkgConfig } from '../config.js';
+import {
+  advanceCursor,
+  loadInboxCursor,
+  saveInboxCursor,
+  type DaemonIdentityInput,
+  type InboxCursor,
+} from '../inbox-cursor.js';
 
 type ToolResult = {
   content: Array<{ type: 'text'; text: string }>;
@@ -80,11 +87,36 @@ function formatTs(ts: number): string {
   }
 }
 
+export interface RegisterChatToolsOptions {
+  /**
+   * Override the on-disk cursor with an in-memory one. Used by tests to
+   * avoid touching `~/.cache/dkg-mcp/` (and to assert on advancement).
+   * In production callers omit this and the tool reads/writes the
+   * shared `~/.cache/dkg-mcp/inbox-cursor-<hash>.json` file (same path
+   * as `hooks/inject-inbox.mjs`).
+   */
+  cursorStorage?: {
+    load(): InboxCursor;
+    save(cursor: InboxCursor): void;
+  };
+}
+
 export function registerChatTools(
   server: McpServer,
   client: DkgClient,
-  _config: DkgConfig,
+  config: DkgConfig,
+  options: RegisterChatToolsOptions = {},
 ): void {
+  // Daemon identity for the read-cursor — shared with the inject-inbox
+  // hook so the hook's notice and the tool's listing stay consistent.
+  const cursorId: DaemonIdentityInput = {
+    api: config.api,
+    sourcePath: config.sourcePath ?? null,
+  };
+  const cursorStorage = options.cursorStorage ?? {
+    load: () => loadInboxCursor(cursorId),
+    save: (c: InboxCursor) => saveInboxCursor(cursorId, c),
+  };
   // ── dkg_send_message ─────────────────────────────────────────────
   server.registerTool(
     'dkg_send_message',
@@ -155,20 +187,24 @@ export function registerChatTools(
     {
       title: 'Check Agent Inbox',
       description:
-        'Read recent inbound chat messages from other agents. Call ' +
-        'this at the start of every session and any time the operator ' +
-        "asks 'any messages?' / 'inbox?'. Returns a compact markdown " +
-        'digest of unread peer messages with the sender (friendly name ' +
-        'where known), timestamp, and message text. If the digest is ' +
-        'non-empty, surface it to the operator BEFORE doing anything ' +
-        'else — those peers are waiting for a reply.',
+        'Read UNREAD inbound chat messages from other agents. With no ' +
+        'arguments, returns every peer message that has not yet been ' +
+        'surfaced by a previous `dkg_check_inbox` call, and advances ' +
+        'the persistent read-cursor past them. Call this at the start ' +
+        "of every session and any time the operator asks 'any " +
+        "messages?' / 'inbox?'. Surface any non-empty digest to the " +
+        'operator BEFORE doing anything else — those peers are waiting ' +
+        'for a reply. Supplying any of `peer`, `since`, or a non-default ' +
+        '`directionFilter` switches to AD-HOC mode: the supplied filters ' +
+        'are honoured and the cursor is NOT advanced (use this for ' +
+        'browsing history without losing track of genuinely-unread rows).',
       inputSchema: {
         peer: z
           .string()
           .optional()
           .describe(
             'Filter to messages from a single peer (name or peerId). ' +
-              'Omit to see messages from all peers.',
+              'Switches the tool to ad-hoc mode (cursor not advanced).',
           ),
         since: z
           .number()
@@ -176,7 +212,9 @@ export function registerChatTools(
           .optional()
           .describe(
             'Unix epoch milliseconds. Only return messages with ts > ' +
-              'since. Omit to see everything in the retention window.',
+              'since. Switches the tool to ad-hoc mode (cursor not ' +
+              'advanced). Omit for the normal "unread since last call" ' +
+              'view.',
           ),
         limit: z
           .number()
@@ -191,25 +229,55 @@ export function registerChatTools(
           .describe(
             'Default "in" — only show inbound peer messages (the typical ' +
               'inbox view). Set "both" to also see outbound replies (useful ' +
-              'when reconstructing a thread). Set "out" for outbound-only.',
+              'when reconstructing a thread). Set "out" for outbound-only. ' +
+              'Any non-default value switches to ad-hoc mode.',
           ),
       },
     },
     async ({ peer, since, limit, directionFilter }): Promise<ToolResult> => {
       try {
         const dir = directionFilter ?? 'in';
+        // "Unread mode" = the default `dkg_check_inbox()` call with
+        // no filters. We use the persisted read-cursor as the floor
+        // and advance it past every row we surface so subsequent
+        // calls don't replay the same messages (Codex PR #510 round
+        // 2 flagged the missing watermark — agents previously saw
+        // the same N rows on every call).
+        //
+        // Any caller-supplied filter (`peer`, explicit `since`, or
+        // `directionFilter` other than the default `in`) opts into
+        // ad-hoc lookup mode: we honour the supplied filters and
+        // DON'T touch the cursor. This keeps the cursor a clean
+        // "what the agent has been shown in unread reads" record.
+        const isAdHoc =
+          peer != null ||
+          typeof since === 'number' ||
+          (directionFilter != null && directionFilter !== 'in');
+
         // Push the direction filter to the daemon so the LIMIT cap
         // doesn't push older inbound rows off the bottom of the page
         // when the newest entries are outbound replies. `both` is the
         // only mode where the daemon should return mixed rows.
         const serverDirection: 'in' | 'out' | undefined =
           dir === 'both' ? undefined : dir;
+
+        const cursor = isAdHoc ? null : cursorStorage.load();
+        const effectiveSince = isAdHoc ? since : cursor!.ts || undefined;
+        const effectiveSinceId =
+          isAdHoc || !cursor || !cursor.ts ? undefined : cursor.id;
+        // Forward pagination order for unread reads — the daemon
+        // returns the OLDEST unread rows first so the cursor only
+        // ever advances past rows we have actually surfaced.
+        const order: 'asc' | 'desc' | undefined = isAdHoc ? undefined : 'asc';
+
         const [{ messages }, names] = await Promise.all([
           client.getMessages({
             peer,
-            since,
+            since: effectiveSince,
+            ...(typeof effectiveSinceId === 'number' ? { sinceId: effectiveSinceId } : {}),
             limit,
             ...(serverDirection ? { direction: serverDirection } : {}),
+            ...(order ? { order } : {}),
           }),
           buildPeerNameMap(client),
         ]);
@@ -229,6 +297,22 @@ export function registerChatTools(
               : `No messages${scope}${sinceLabel} (direction=${dir}).`,
           );
         }
+
+        // Advance the cursor past the newest row we are about to
+        // surface. Only in unread mode — ad-hoc reads must not
+        // affect the watermark or the operator would lose track of
+        // genuinely-unread messages by browsing history.
+        if (!isAdHoc && cursor) {
+          let advanced = cursor;
+          for (const m of filtered) {
+            if (m.direction !== 'in') continue;
+            advanced = advanceCursor(advanced, { ts: m.ts, id: m.id });
+          }
+          if (advanced !== cursor) {
+            cursorStorage.save(advanced);
+          }
+        }
+
         const lines = filtered.map((m) => {
           const arrow = m.direction === 'in' ? '←' : '→';
           const who = formatPeer(m.peer, names);

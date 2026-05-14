@@ -158,7 +158,7 @@ describe('buildChatAcl', () => {
       expect(verdict.reason).toMatch(/no contextGraphId/);
     });
 
-    it('reports CG mismatch when sender claims a different CG', () => {
+    it('reports CG mismatch when sender claims a different CG and is not a member', () => {
       const acl = buildChatAcl({
         config: { mode: 'scoped', contextGraphId: 'cg-1' },
         dashDb: makeDb({ members: { 'cg-1': [] } }),
@@ -167,6 +167,30 @@ describe('buildChatAcl', () => {
       const verdict = acl!(ALICE, { contextGraphId: 'cg-2' });
       expect(verdict.accept).toBe(false);
       expect(verdict.reason).toMatch(/cg-2.*cg-1|cg-1.*cg-2/);
+    });
+
+    // Codex PR #510 round 2 — the spoof case: sender IS a valid
+    // member of cg-1, but tags their message as belonging to cg-2.
+    // Previously this returned `accept: true` and downstream
+    // notifications/logs got tagged with the spoofed graph id.
+    // Now the claim mismatch is rejected BEFORE the membership
+    // check accepts.
+    it('rejects a valid member of cg-1 who claims their message belongs to cg-2', () => {
+      const acl = buildChatAcl({
+        config: { mode: 'scoped', contextGraphId: 'cg-1' },
+        dashDb: makeDb({
+          members: { 'cg-1': [makeRow('cg-1', ALICE)] },
+        }),
+        getLocalPeerId: () => LOCAL_PEER,
+      });
+      // Sanity: without a claim, alice is accepted.
+      expect(acl!(ALICE, {})).toEqual({ accept: true });
+      // With a matching claim, still accepted.
+      expect(acl!(ALICE, { contextGraphId: 'cg-1' })).toEqual({ accept: true });
+      // With a spoof claim — must reject, NOT accept.
+      const spoof = acl!(ALICE, { contextGraphId: 'cg-2' });
+      expect(spoof.accept).toBe(false);
+      expect(spoof.reason).toMatch(/cg-2.*cg-1|cg-1.*cg-2/);
     });
   });
 
@@ -209,6 +233,47 @@ describe('buildChatAcl', () => {
         getLocalPeerId: () => LOCAL_PEER,
       });
       expect(acl!(ALICE, {}).accept).toBe(false);
+    });
+
+    // Same spoof family as the scoped mode test above, but for the
+    // shared-context-graph case. If sender is a valid member of
+    // (subscribed) graph cg-1 but claims cg-2, the verified graph
+    // must drive the verdict — accepting and tagging downstream with
+    // a spoofed cg-2 would be a graph-membership impersonation.
+    it('rejects when sender claims a CG they are not a member of, even if they are a member of another subscribed CG', () => {
+      const acl = buildChatAcl({
+        config: { mode: 'shared-context-graph' },
+        dashDb: makeDb({
+          members: {
+            'cg-1': [makeRow('cg-1', ALICE)],
+            'cg-2': [], // we subscribe to cg-2 but Alice is NOT a member
+          },
+          subscriptions: [makeSub('cg-1'), makeSub('cg-2')],
+        }),
+        getLocalPeerId: () => LOCAL_PEER,
+      });
+      // No claim → accept (alice IS a member of cg-1 which we subscribe to).
+      expect(acl!(ALICE, {})).toEqual({ accept: true });
+      // Matching claim → accept.
+      expect(acl!(ALICE, { contextGraphId: 'cg-1' })).toEqual({ accept: true });
+      // Spoof claim (alice tags cg-2 but isn't a member there) → reject.
+      const spoof = acl!(ALICE, { contextGraphId: 'cg-2' });
+      expect(spoof.accept).toBe(false);
+      expect(spoof.reason).toMatch(/cg-2.*not an active member/);
+    });
+
+    it('rejects when sender claims a CG we do not subscribe to', () => {
+      const acl = buildChatAcl({
+        config: { mode: 'shared-context-graph' },
+        dashDb: makeDb({
+          members: { 'cg-1': [makeRow('cg-1', ALICE)] },
+          subscriptions: [makeSub('cg-1')],
+        }),
+        getLocalPeerId: () => LOCAL_PEER,
+      });
+      const verdict = acl!(ALICE, { contextGraphId: 'cg-99' });
+      expect(verdict.accept).toBe(false);
+      expect(verdict.reason).toMatch(/cg-99.*does not subscribe/);
     });
   });
 

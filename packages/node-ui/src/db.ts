@@ -924,24 +924,51 @@ export class DashboardDB {
   }
 
   /**
-   * Read chat history. `direction` filters server-side BEFORE the LIMIT
-   * applies, which matters for inbox reads — if the filter ran
-   * client-side, a burst of outbound replies in the newest 200 rows
-   * would push inbound messages past the cap and they'd never be
-   * surfaced.
+   * Read chat history.
+   *
+   * Server-side `direction` filters BEFORE the LIMIT applies, which
+   * matters for inbox reads — if the filter ran client-side, a burst
+   * of outbound replies in the newest N rows would push inbound
+   * messages past the cap and they'd never be surfaced.
+   *
+   * Forward pagination uses a **compound cursor** `(since, sinceId)`
+   * to avoid losing rows that share the same millisecond `ts`.
+   * Without `sinceId`, the predicate is just `ts > since`, and any
+   * second-or-later row that shares the watermark `ts` is permanently
+   * skipped (Codex PR #510 round 2 flagged this — chat bursts can
+   * easily share `Date.now()` values). The compound cursor uses the
+   * `id INTEGER PRIMARY KEY AUTOINCREMENT` from the schema as a stable
+   * tiebreaker so pagination is lossless.
+   *
+   * `order` defaults to `'desc'` for the dashboard "show recent N"
+   * view. Inbox/feed readers pass `'asc'` so pagination walks
+   * oldest → newest and the cursor advances over rows we have
+   * actually returned, never past unseen older ones.
    */
   getChatMessages(opts: {
     peer?: string;
     since?: number;
+    /**
+     * Secondary cursor — when paired with `since`, the predicate is
+     * `(ts > since) OR (ts = since AND id > sinceId)`, which makes
+     * pagination lossless across rows that share a millisecond.
+     */
+    sinceId?: number;
     limit?: number;
     direction?: 'in' | 'out';
+    order?: 'asc' | 'desc';
   } = {}): ChatMessageRow[] {
     let sql = 'SELECT * FROM chat_messages WHERE 1=1';
     const params: unknown[] = [];
 
     if (opts.since) {
-      sql += ' AND ts > ?';
-      params.push(opts.since);
+      if (typeof opts.sinceId === 'number') {
+        sql += ' AND (ts > ? OR (ts = ? AND id > ?))';
+        params.push(opts.since, opts.since, opts.sinceId);
+      } else {
+        sql += ' AND ts > ?';
+        params.push(opts.since);
+      }
     }
     if (opts.peer) {
       sql += ' AND peer = ?';
@@ -951,9 +978,14 @@ export class DashboardDB {
       sql += ' AND direction = ?';
       params.push(opts.direction);
     }
-    sql += ' ORDER BY ts DESC LIMIT ?';
+    const order = opts.order ?? 'desc';
+    if (order === 'asc') {
+      sql += ' ORDER BY ts ASC, id ASC LIMIT ?';
+      params.push(opts.limit ?? 200);
+      return this.db.prepare(sql).all(...params) as ChatMessageRow[];
+    }
+    sql += ' ORDER BY ts DESC, id DESC LIMIT ?';
     params.push(opts.limit ?? 200);
-
     return (this.db.prepare(sql).all(...params) as ChatMessageRow[]).reverse();
   }
 

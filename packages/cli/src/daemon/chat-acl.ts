@@ -101,17 +101,22 @@ export function buildChatAcl(opts: BuildChatAclOpts): ChatAclCheck | null {
             "unauthorized: receiver's chat ACL is scoped but no contextGraphId is configured",
         };
       }
-      const allowed = isActiveNodeMember(opts.dashDb, cgId, senderPeerId);
-      if (allowed) return { accept: true };
-      // Optional defence-in-depth: the sender SHOULD have included the
-      // CG in their payload; if they did and it disagrees with ours,
-      // surface that explicitly — but acceptance still depends on
-      // membership, not on the sender's claim.
+      // Reject a mismatched sender claim BEFORE the membership check
+      // accepts. A member of cgId who tags their message with a
+      // different graph id is impersonating membership of a graph
+      // they may not actually belong to, and downstream code uses the
+      // claimed value for notifications and logs. Codex PR #510 round
+      // 2 flagged this — previously we returned `accept: true` on
+      // membership before validating the claim, so the spoofed CG
+      // would silently get tagged into notification titles.
       if (payload.contextGraphId && payload.contextGraphId !== cgId) {
         return {
           accept: false,
           reason: `unauthorized: sender claims contextGraphId=${payload.contextGraphId} but receiver is scoped to ${cgId}`,
         };
+      }
+      if (isActiveNodeMember(opts.dashDb, cgId, senderPeerId)) {
+        return { accept: true };
       }
       return {
         accept: false,
@@ -123,6 +128,31 @@ export function buildChatAcl(opts: BuildChatAclOpts): ChatAclCheck | null {
       const subs = opts.dashDb
         .listContextGraphSubscriptions()
         .filter((s) => s.subscribed === 1);
+      const claim = payload.contextGraphId;
+      // Same defence as `scoped`: if the sender supplied a CG claim,
+      // it must be one we subscribe to AND they must be an active
+      // member of that specific graph. Without this, a sender who is
+      // a member of (subscribed) graph A could claim membership in
+      // (subscribed) graph B and have downstream tag the chat as B.
+      if (claim) {
+        const subscribed = subs.some((s) => s.context_graph_id === claim);
+        if (!subscribed) {
+          return {
+            accept: false,
+            reason: `unauthorized: sender claims contextGraphId=${claim} but this node does not subscribe to it`,
+          };
+        }
+        if (isActiveNodeMember(opts.dashDb, claim, senderPeerId)) {
+          return { accept: true };
+        }
+        return {
+          accept: false,
+          reason: `unauthorized: sender claims contextGraphId=${claim} but is not an active member of it`,
+        };
+      }
+      // No claim from the sender — accept if there is ANY shared
+      // graph membership. Downstream will tag the chat without a CG,
+      // which is the safe default.
       for (const sub of subs) {
         if (isActiveNodeMember(opts.dashDb, sub.context_graph_id, senderPeerId)) {
           return { accept: true };

@@ -130,20 +130,26 @@ export class ApiClient {
   async messages(opts?: {
     peer?: string;
     since?: number;
+    sinceId?: number;
     limit?: number;
     direction?: 'in' | 'out';
+    order?: 'asc' | 'desc';
   }): Promise<{
     messages: Array<{
-      ts: number; direction: 'in' | 'out';
+      id: number; ts: number; direction: 'in' | 'out';
       peer: string; peerName?: string; text: string;
     }>;
   }> {
     const params = new URLSearchParams();
     if (opts?.peer) params.set('peer', opts.peer);
     if (opts?.since) params.set('since', String(opts.since));
+    if (typeof opts?.sinceId === 'number') params.set('sinceId', String(opts.sinceId));
     if (opts?.limit) params.set('limit', String(opts.limit));
     if (opts?.direction === 'in' || opts?.direction === 'out') {
       params.set('direction', opts.direction);
+    }
+    if (opts?.order === 'asc' || opts?.order === 'desc') {
+      params.set('order', opts.order);
     }
     const qs = params.toString();
     return this.get(`/api/messages${qs ? '?' + qs : ''}`);

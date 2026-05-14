@@ -14,7 +14,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 CHAIN_TESTS=(
   "packages/chain/test/evm-adapter.test.ts"
-  "packages/chain/test/evm-e2e.test.ts"
+  # NOTE: packages/chain/test/evm-e2e.test.ts is archived (moved under
+  # test/archive/) — it deployed V8+V9 contracts which are no longer in the
+  # V10-only tree. See PRD §4.2 and `packages/chain/test/archive/`.
 )
 PUBLISHER_TESTS=(
   "packages/publisher/test/publisher-evm-e2e.test.ts"

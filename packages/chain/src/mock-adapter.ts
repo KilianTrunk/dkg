@@ -4,18 +4,13 @@ import type {
   ReservedRange,
   BatchMintParams,
   BatchMintResult,
-  UpdateKAParams,
-  ExtendStorageParams,
   CreateKCParams,
   UpdateKCParams,
   TxResult,
   ChainEvent,
   EventFilter,
   CreateContextGraphParams,
-  PublishParams,
   OnChainPublishResult,
-  ConvictionAccountInfo,
-  PermanentPublishParams,
   KAUpdateVerification,
   CreateOnChainContextGraphParams,
   CreateOnChainContextGraphResult,
@@ -228,54 +223,9 @@ export class MockChainAdapter implements ChainAdapter {
     };
   }
 
-  async publishKnowledgeAssets(params: PublishParams): Promise<OnChainPublishResult> {
-    if (params.receiverSignatures.length < this.minimumRequiredSignatures) {
-      throw new Error('MinSignaturesRequirementNotMet');
-    }
-    const { startId, endId } = await this.reserveUALRange(params.kaCount);
-
-    const batchId = this.nextBatchId++;
-    this.batches.set(batchId, {
-      merkleRoot: params.merkleRoot,
-      kaCount: params.kaCount,
-      publisherAddress: this.signerAddress,
-    });
-
-    const txHash = this.peekTxHash();
-    this.pushEvent('KnowledgeBatchCreated', {
-      batchId: batchId.toString(),
-      publisherNodeIdentityId: params.publisherNodeIdentityId.toString(),
-      publisherAddress: this.signerAddress,
-      merkleRoot: toHex(params.merkleRoot),
-      startKAId: startId.toString(),
-      endKAId: endId.toString(),
-      kaCount: params.kaCount,
-      txHash,
-    });
-
-    // Also emit V10-style KCCreated so ChainEventPoller detects events
-    // regardless of isV10Ready() gating (mirrors real-world transition behaviour).
-    this.pushEvent('KCCreated', {
-      kcId: batchId.toString(),
-      merkleRoot: toHex(params.merkleRoot),
-      publisherAddress: this.signerAddress,
-      startKAId: startId.toString(),
-      endKAId: endId.toString(),
-      kaCount: params.kaCount,
-      txHash,
-    });
-
-    const result = this.txResult(true);
-    return {
-      batchId,
-      startKAId: startId,
-      endKAId: endId,
-      txHash: result.hash,
-      blockNumber: result.blockNumber,
-      blockTimestamp: Math.floor(Date.now() / 1000),
-      publisherAddress: this.signerAddress,
-    };
-  }
+  // V9 `publishKnowledgeAssets` mock-adapter stub was archived in
+  // `archive-non-v10-contracts`. V10 publishes route through
+  // `createKnowledgeAssetsV10`.
 
   async resolvePublishByTxHash(txHash: string): Promise<OnChainPublishResult | null> {
     const created = this.events.find((event) =>
@@ -299,39 +249,7 @@ export class MockChainAdapter implements ChainAdapter {
     return 1n;
   }
 
-  async publishKnowledgeAssetsPermanent(params: PermanentPublishParams): Promise<OnChainPublishResult> {
-    const { startId, endId } = await this.reserveUALRange(params.kaCount);
-
-    const batchId = this.nextBatchId++;
-    this.batches.set(batchId, {
-      merkleRoot: params.merkleRoot,
-      kaCount: params.kaCount,
-      publisherAddress: this.signerAddress,
-    });
-
-    const txHash = this.peekTxHash();
-    this.pushEvent('KnowledgeBatchCreated', {
-      batchId: batchId.toString(),
-      publisherAddress: this.signerAddress,
-      merkleRoot: toHex(params.merkleRoot),
-      startKAId: startId.toString(),
-      endKAId: endId.toString(),
-      kaCount: params.kaCount,
-      isPermanent: true,
-      txHash,
-    });
-
-    const result = this.txResult(true);
-    return {
-      batchId,
-      startKAId: startId,
-      endKAId: endId,
-      txHash: result.hash,
-      blockNumber: result.blockNumber,
-      blockTimestamp: Math.floor(Date.now() / 1000),
-      publisherAddress: this.signerAddress,
-    };
-  }
+  // V9 `publishKnowledgeAssetsPermanent` mock-adapter stub archived.
 
   async verifyPublisherOwnsRange(
     publisherAddress: string,
@@ -346,53 +264,9 @@ export class MockChainAdapter implements ChainAdapter {
     return false;
   }
 
-  async transferNamespace(newOwner: string): Promise<TxResult> {
-    const publisher = this.signerAddress;
-    const ranges = this.reservedRangesByPublisher.get(publisher);
-    if (ranges?.length) {
-      this.reservedRangesByPublisher.set(newOwner, [...ranges]);
-      this.reservedRangesByPublisher.delete(publisher);
-    }
-    const nextId = this.namespaceNextId.get(publisher);
-    if (nextId !== undefined) this.namespaceNextId.set(newOwner, nextId);
-    this.namespaceNextId.delete(publisher);
-    this.namespaceOwner.set(publisher, newOwner);
-
-    this.pushEvent('NamespaceTransferred', {
-      from: publisher,
-      to: newOwner,
-    });
-
-    return this.txResult(true);
-  }
-
-  async updateKnowledgeAssets(params: UpdateKAParams): Promise<TxResult> {
-    const existing = this.batches.get(params.batchId);
-    if (!existing) {
-      return this.txResult(false);
-    }
-
-    existing.merkleRoot = params.newMerkleRoot;
-    const hintedPublisherAddress = params.publisherAddress
-      ? ethers.getAddress(params.publisherAddress)
-      : undefined;
-    const publisherAddress = existing.publisherAddress ?? hintedPublisherAddress;
-    const txIndex = this.txIndexInBlock;
-    const blockNumber = this.nextBlock;
-    const txHash = `0x${blockNumber.toString(16).padStart(64, '0')}${txIndex.toString(16).padStart(4, '0')}`;
-    this.pushEvent('KnowledgeBatchUpdated', {
-      batchId: params.batchId.toString(),
-      newMerkleRoot: toHex(params.newMerkleRoot),
-      publisherAddress,
-      txHash,
-      txIndex,
-    });
-
-    return {
-      ...this.txResult(true),
-      publisherAddress,
-    };
-  }
+  // V9 `transferNamespace` and `updateKnowledgeAssets` mock-adapter stubs
+  // archived in `archive-non-v10-contracts`. V10 update path lives on
+  // `updateKnowledgeCollectionV10` below.
 
   async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
     const existing = this.batches.get(params.kcId);
@@ -468,19 +342,7 @@ export class MockChainAdapter implements ChainAdapter {
     };
   }
 
-  async extendStorage(params: ExtendStorageParams): Promise<TxResult> {
-    const existing = this.batches.get(params.batchId);
-    if (!existing) {
-      return this.txResult(false);
-    }
-
-    this.pushEvent('StorageExtended', {
-      batchId: params.batchId.toString(),
-      additionalEpochs: params.additionalEpochs,
-    });
-
-    return this.txResult(true);
-  }
+  // V9 `extendStorage` mock-adapter stub archived.
 
   // --- V8 backward compatibility ---
 
@@ -572,82 +434,35 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   // --- Publishing Conviction Accounts ---
+  //
+  // The V9 PCA family (`createConvictionAccount`, `addConvictionFunds`,
+  // `extendConvictionLock`, `addPCAAuthorizedKey`, `isPCAAuthorizedKey`,
+  // `getConvictionDiscount`, `getConvictionAccountInfo`) was archived in
+  // `archive-non-v10-contracts`. The `convictionAccounts` map is retained
+  // so the V10 NFT-shaped `getPublishingConvictionAccountOwner` view
+  // (used by the daemon's curated-CG preflight) can still resolve
+  // PCA → owner without a live chain. Tests that need to seed the map
+  // do so via `seedConvictionAccount` below.
 
   private convictionAccounts = new Map<bigint, {
     admin: string;
-    balance: bigint;
-    initialDeposit: bigint;
-    lockEpochs: number;
-    conviction: bigint;
-    authorizedKeys: Set<string>;
   }>();
-  private nextConvictionAccountId = 1n;
 
-  async createConvictionAccount(amount: bigint, lockEpochs: number): Promise<{ accountId: bigint } & TxResult> {
-    const accountId = this.nextConvictionAccountId++;
-    const conviction = amount * BigInt(lockEpochs);
-    this.convictionAccounts.set(accountId, {
-      admin: this.signerAddress,
-      balance: amount,
-      initialDeposit: amount,
-      lockEpochs,
-      conviction,
-      authorizedKeys: new Set([this.signerAddress.toLowerCase()]),
-    });
-    this.pushEvent('ConvictionAccountCreated', { accountId: accountId.toString(), admin: this.signerAddress });
-    return { ...this.txResult(true), accountId };
-  }
-
-  async addConvictionFunds(accountId: bigint, amount: bigint): Promise<TxResult> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return this.txResult(false);
-    acct.balance += amount;
-    return this.txResult(true);
-  }
-
-  async extendConvictionLock(accountId: bigint, additionalEpochs: number): Promise<TxResult> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return this.txResult(false);
-    acct.lockEpochs += additionalEpochs;
-    acct.conviction = acct.initialDeposit * BigInt(acct.lockEpochs);
-    return this.txResult(true);
-  }
-
-  async addPCAAuthorizedKey(accountId: bigint, key: string): Promise<TxResult> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return this.txResult(false);
-    acct.authorizedKeys.add(key.toLowerCase());
-    this.pushEvent('AuthorizedKeyAdded', { accountId: accountId.toString(), key });
-    return this.txResult(true);
-  }
-
-  async isPCAAuthorizedKey(accountId: bigint, key: string): Promise<boolean> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return false;
-    return acct.authorizedKeys.has(key.toLowerCase());
-  }
-
-  async getConvictionDiscount(accountId: bigint): Promise<{ discountBps: number; conviction: bigint }> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return { discountBps: 0, conviction: 0n };
-    const cHalf = 3_000_000n * 10n ** 18n;
-    const discountBps = Number((5000n * acct.conviction) / (acct.conviction + cHalf));
-    return { discountBps, conviction: acct.conviction };
-  }
-
-  async getConvictionAccountInfo(accountId: bigint): Promise<ConvictionAccountInfo | null> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return null;
-    const { discountBps } = await this.getConvictionDiscount(accountId);
-    return {
-      accountId,
-      admin: acct.admin,
-      balance: acct.balance,
-      initialDeposit: acct.initialDeposit,
-      lockEpochs: acct.lockEpochs,
-      conviction: acct.conviction,
-      discountBps,
-    };
+  /**
+   * Test helper — seed a PCA into the mock's owner map so the V10
+   * `getPublishingConvictionAccountOwner` view can answer for it. Used
+   * by `mock-adapter-parity.test.ts` when exercising publish-policy
+   * branches that require a known PCA owner address. Not part of the
+   * `ChainAdapter` interface.
+   */
+  seedConvictionAccount(admin: string): bigint {
+    let accountId = 1n;
+    // monotonic ids — never reuse
+    for (const k of this.convictionAccounts.keys()) {
+      if (k >= accountId) accountId = k + 1n;
+    }
+    this.convictionAccounts.set(accountId, { admin });
+    return accountId;
   }
 
   /**
@@ -691,54 +506,11 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   // --- Staking Conviction ---
-
-  private delegatorLocks = new Map<string, { lockTier: number; startEpoch: number }>();
-
-  // Mirror the V10 baseline tier ladder seeded by
-  // `ConvictionStakingStorage._seedBaselineTiers()` so the mock surfaces the same
-  // "tier must exist" error the real `DKGStakingConvictionNFT` reverts with.
-  private static readonly V10_BASELINE_LOCK_TIERS = [0, 1, 3, 6, 12] as const;
-
-  private snapToBaselineLockTier(lockEpochs: number): number {
-    let snapped = 0;
-    for (const tier of MockChainAdapter.V10_BASELINE_LOCK_TIERS) {
-      if (tier <= lockEpochs) snapped = tier;
-      else break;
-    }
-    return snapped;
-  }
-
-  private normalizeLegacyLockEpochs(lockEpochs: number): number {
-    if (!Number.isInteger(lockEpochs) || lockEpochs < 0) {
-      throw new Error(`Mock: invalid lockEpochs ${lockEpochs}`);
-    }
-    return this.snapToBaselineLockTier(lockEpochs);
-  }
-
-  async stakeWithLock(identityId: bigint, amount: bigint, lockEpochs: number): Promise<TxResult> {
-    return this.stakeWithLockTier(identityId, amount, this.normalizeLegacyLockEpochs(lockEpochs));
-  }
-
-  async stakeWithLockTier(identityId: bigint, _amount: bigint, lockTier: number): Promise<TxResult> {
-    if (!Number.isInteger(lockTier) || !(MockChainAdapter.V10_BASELINE_LOCK_TIERS as readonly number[]).includes(lockTier)) {
-      throw new Error(
-        `Mock: lockTier must be one of {${MockChainAdapter.V10_BASELINE_LOCK_TIERS.join(', ')}} (V10 baseline tier ladder), got ${lockTier}`,
-      );
-    }
-    const key = `${identityId}-${this.signerAddress}`;
-    const existing = this.delegatorLocks.get(key);
-    if (!existing || lockTier > existing.lockTier) {
-      this.delegatorLocks.set(key, { lockTier, startEpoch: 0 });
-    }
-    return this.txResult(true);
-  }
-
-  async getDelegatorConvictionMultiplier(identityId: bigint, delegator: string): Promise<{ multiplier: number }> {
-    const key = `${identityId}-${delegator}`;
-    const lock = this.delegatorLocks.get(key);
-    const lockTier = lock?.lockTier ?? 1;
-    return { multiplier: computeConvictionMultiplier(lockTier) };
-  }
+  //
+  // V8 `stakeWithLock` / `stakeWithLockTier` / `getDelegatorConvictionMultiplier`
+  // mock stubs were archived in `archive-non-v10-contracts`. V10 NFT-backed
+  // staking (`DKGStakingConvictionNFT.createConviction`) has no SDK surface
+  // yet — tracked as a §6 followup of the PRD.
 
   // --- On-Chain Context Graphs (ContextGraphs contract) ---
 
@@ -1031,7 +803,30 @@ export class MockChainAdapter implements ChainAdapter {
       );
     }
 
-    const result = await this.publishKnowledgeAssets(params);
+    // V9 `publishKnowledgeAssets` was archived in `archive-non-v10-contracts`.
+    // Inline a minimal mock publish that mirrors what the archived helper
+    // produced — enough to satisfy the V9-shape `OnChainPublishResult`
+    // contract callers expect from this path.
+    if (params.receiverSignatures.length < this.minimumRequiredSignatures) {
+      throw new Error('MinSignaturesRequirementNotMet');
+    }
+    const { startId, endId } = await this.reserveUALRange(params.kaCount);
+    const batchId = this.nextBatchId++;
+    this.batches.set(batchId, {
+      merkleRoot: params.merkleRoot,
+      kaCount: params.kaCount,
+      publisherAddress: this.signerAddress,
+    });
+    const tx = this.txResult(true);
+    const result: OnChainPublishResult = {
+      batchId,
+      startKAId: startId,
+      endKAId: endId,
+      txHash: tx.hash,
+      blockNumber: tx.blockNumber,
+      blockTimestamp: Math.floor(Date.now() / 1000),
+      publisherAddress: this.signerAddress,
+    };
 
     cg.batches.push(result.batchId);
     this.pushEvent('ContextGraphExpanded', {

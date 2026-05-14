@@ -150,14 +150,9 @@ const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([
   'ensureOperationalWalletsRegistered',
   'isOperationalWalletRegistered',
   'updateKnowledgeCollectionV10',
-  'stakeWithLock',
-  'getDelegatorConvictionMultiplier',
-  'createConvictionAccount',
-  'addConvictionFunds',
-  'extendConvictionLock',
-  'getConvictionDiscount',
-  'getConvictionAccountInfo',
-  'publishKnowledgeAssetsPermanent',
+  // V8 staking + V9 PCA family + V9 permanent publish were archived from
+  // EVMChainAdapter in `archive-non-v10-contracts`; both mock and EVM
+  // dropped the surface, so they don't need parity-list entries.
   'createKnowledgeCollection',
   'updateKnowledgeCollection',
 ]);
@@ -286,7 +281,10 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       publishAuthorityAccountId: 1n,
     })).rejects.toThrow(/PCA account 1 does not exist/);
 
-    const { accountId } = await mock.createConvictionAccount(1n, 1);
+    // `createConvictionAccount` was archived in `archive-non-v10-contracts`;
+    // seed the mock's PCA-owner map directly so the publish-policy branch
+    // that requires `ownerOf(accountId)` can still be exercised.
+    const accountId = mock.seedConvictionAccount('0x1111111111111111111111111111111111111111');
 
     await expect(mock.createOnChainContextGraph({
       ...base,
@@ -385,40 +383,10 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     await expect(mock.getLatestMerkleRoot(created.batchId)).resolves.toEqual(newMerkleRoot);
   });
 
-  it('uses stored publisher attribution on the V9 mock update path', async () => {
-    const mock = new MockChainAdapter('mock:31337', '0x1111111111111111111111111111111111111111');
-    const delegatedPublisher = '0x2222222222222222222222222222222222222222';
-    mock.minimumRequiredSignatures = 0;
-    mock.allowPublisherAddress(delegatedPublisher);
-
-    const created = await mock.createKnowledgeAssetsV10({
-      publishOperationId: 'mock-v9-fallback-delegated-update',
-      contextGraphId: 1n,
-      publisherAddress: delegatedPublisher,
-      merkleRoot: new Uint8Array(32),
-      knowledgeAssetsAmount: 1,
-      byteSize: 1n,
-      epochs: 1,
-      tokenAmount: 1n,
-      isImmutable: false,
-      merkleLeafCount: 1,
-      publisherNodeIdentityId: 1n,
-      author: {
-        address: delegatedPublisher,
-        signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
-        schemeVersion: 1,
-      },
-      ackSignatures: [],
-    });
-
-    const update = await mock.updateKnowledgeAssets({
-      batchId: created.batchId,
-      newMerkleRoot: ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes('mock-v9-update'))),
-      newPublicByteSize: 2n,
-    });
-
-    expect(update.publisherAddress?.toLowerCase()).toBe(delegatedPublisher.toLowerCase());
-  });
+  // The "V9 mock update path" parity test was archived alongside
+  // `mock.updateKnowledgeAssets` itself (issue 0004 of
+  // `archive-non-v10-contracts`); V10 update attribution is covered by
+  // the `updateKnowledgeCollectionV10` test above.
 });
 
 describe('NoChainAdapter completeness [CH-9]', () => {
@@ -433,10 +401,9 @@ describe('NoChainAdapter completeness [CH-9]', () => {
       'ensureProfile',
       'reserveUALRange',
       'batchMintKnowledgeAssets',
-      'publishKnowledgeAssets',
-      'updateKnowledgeAssets',
-      'extendStorage',
-      'transferNamespace',
+      // V9 `publishKnowledgeAssets` / `updateKnowledgeAssets` /
+      // `extendStorage` / `transferNamespace` were archived in
+      // `archive-non-v10-contracts` — no longer required surface.
       'listenForEvents',
       'createContextGraph',
       'submitToContextGraph',

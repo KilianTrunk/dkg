@@ -74,30 +74,8 @@ describe('NoChainAdapter — every write method throws with stable message [CH-9
         publisherSignature: zeroSig,
         receiverSignatures: [],
       })],
-    ['publishKnowledgeAssets', () =>
-      adapter.publishKnowledgeAssets({
-        kaCount: 1,
-        publisherNodeIdentityId: 0n,
-        merkleRoot: zeroBytes,
-        publicByteSize: 0n,
-        epochs: 1,
-        tokenAmount: 0n,
-        publisherSignature: zeroSig,
-        receiverSignatures: [],
-      })],
-    ['updateKnowledgeAssets', () =>
-      adapter.updateKnowledgeAssets({
-        batchId: 0n,
-        newMerkleRoot: zeroBytes,
-        newPublicByteSize: 0n,
-      })],
-    ['extendStorage', () =>
-      adapter.extendStorage({
-        batchId: 0n,
-        additionalEpochs: 1,
-        tokenAmount: 0n,
-      })],
-    ['transferNamespace', () => adapter.transferNamespace('0x0')],
+    // V9 publishKnowledgeAssets / updateKnowledgeAssets / extendStorage /
+    // transferNamespace stubs were archived in `archive-non-v10-contracts`.
     ['createContextGraph', () => adapter.createContextGraph({})],
     ['submitToContextGraph', () => adapter.submitToContextGraph('kc1', 'cg1')],
     ['revealContextGraphMetadata', () => adapter.revealContextGraphMetadata('cg1', 'n', 'd')],

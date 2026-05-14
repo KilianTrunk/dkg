@@ -4,10 +4,7 @@ import type {
   ReservedRange,
   BatchMintParams,
   BatchMintResult,
-  PublishParams,
   OnChainPublishResult,
-  UpdateKAParams,
-  ExtendStorageParams,
   TxResult,
   ChainEvent,
   EventFilter,
@@ -37,10 +34,9 @@ export class NoChainAdapter implements ChainAdapter {
   async ensureProfile(_options?: { nodeName?: string; stakeAmount?: bigint; lockTier?: number }): Promise<bigint> { noChain(); }
   async reserveUALRange(_count: number): Promise<ReservedRange> { noChain(); }
   async batchMintKnowledgeAssets(_params: BatchMintParams): Promise<BatchMintResult> { noChain(); }
-  async publishKnowledgeAssets(_params: PublishParams): Promise<OnChainPublishResult> { noChain(); }
-  async updateKnowledgeAssets(_params: UpdateKAParams): Promise<TxResult> { noChain(); }
-  async extendStorage(_params: ExtendStorageParams): Promise<TxResult> { noChain(); }
-  async transferNamespace(_newOwner: string): Promise<TxResult> { noChain(); }
+  // V9 publish / update / extendStorage / transferNamespace parity stubs
+  // were archived in `archive-non-v10-contracts`. V10 callers route
+  // through `createKnowledgeAssetsV10` below.
   async *listenForEvents(_filter: EventFilter): AsyncIterable<ChainEvent> { noChain(); }
   async createContextGraph(_params: CreateContextGraphParams): Promise<TxResult> { noChain(); }
   async submitToContextGraph(_kcId: string, _contextGraphId: string): Promise<TxResult> { noChain(); }

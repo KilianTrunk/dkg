@@ -174,7 +174,7 @@ identified in TB-5.
 ### Verification matrix
 
 - `pnpm -r build` exits 0 from repo root after TB-7.
-- `cd .devnet && DKG_HOME=.devnet/node1 NODE2_DKG_HOME=.devnet/node2 node run.mjs --no-pause` exits 0.
+- `cd .devnet && DKG_HOME=.devnet/node1 NODE2_DKG_HOME=.devnet/node2 node run.mjs --no-pause` exits 0. The entrypoint is the orchestrator's smoke shim `.devnet/run.mjs` (the only checked-in file under `.devnet/` — see `!.devnet/run.mjs` in `.gitignore`); everything else under `.devnet/` is a runtime artefact created by `scripts/devnet.sh start`. The shim chdir's back to repo root, attempts a runtime smoke (`scripts/devnet.sh start 2` → `demo/epcis-bike/run.mjs`), and if the host environment can't host that smoke (port already taken, Docker unavailable, etc.) it falls back to verifying the post-archive structural invariants — the V8/V9 method names are absent from `evm-adapter.ts`, the V9 `KnowledgeBatchCreated` subscription is gone from `chain-event-poller.ts`, and the V9 `updateKnowledgeAssets` call is gone from `dkg-publisher.ts`. The fallback path logs a clear notice so reviewers can distinguish "live publish succeeded" from "structural invariants confirmed". Override modes via `DEVNET_SMOKE_MODE=full|offline` (default `auto`).
 - `pnpm --filter @origintrail-official/dkg-chain test` green.
 - `pnpm --filter @origintrail-official/dkg-publisher test` green.
 - `pnpm --filter @origintrail-official/dkg-agent test` green.

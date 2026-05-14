@@ -74,6 +74,7 @@ export const sel = {
     root: '.v10-panel-right',
     modeTab: '.v10-agent-mode-tab',
     subtab: '.v10-agent-subtab',
+    subtabGroup: '.v10-agent-subtab-group',
     addBtn: '.v10-agent-subtab.add',
     chatInput: '.v10-agent-input',
     sendBtn: '.v10-agent-send-btn',
@@ -81,10 +82,20 @@ export const sel = {
     chatBubble: '.v10-chat-bubble',
     agentCard: '.v10-agent-card',
     connectBtn: '.v10-agent-send-btn.secondary',
-    disconnectBtn: '.v10-agents-refresh.disconnect',
-    refreshBtn: '.v10-agents-refresh',
+    tabMenuTrigger: '.v10-agent-tab-menu-trigger',
+    tabMenuPopover: '.v10-agent-tab-menu-popover',
+    tabMenuItem: '.v10-agent-tab-menu-item',
+    tabMenuItemDanger: '.v10-agent-tab-menu-item.danger',
     sessionItem: '.v10-session-item',
     warning: '.v10-local-agent-warning',
+    projectSelect: '.v10-local-agent-target-select',
+    projectSelectTrigger: '.v10-local-agent-target-select .v10-select-trigger',
+    // The Select menu/options portal to document.body (createPortal), so
+    // they're NOT descendants of `.v10-local-agent-target-select`. Use
+    // top-level selectors so Playwright actually finds them when the
+    // picker is open.
+    projectSelectMenu: '.v10-select-menu',
+    projectSelectOption: '.v10-select-option',
   },
 
   dashboard: {

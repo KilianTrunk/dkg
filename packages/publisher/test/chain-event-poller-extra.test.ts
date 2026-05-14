@@ -4,14 +4,20 @@
  * NO BLOCKCHAIN MOCKS. Every test uses the real `EVMChainAdapter`
  * wired to the shared Hardhat node spun up by
  * `packages/chain/test/hardhat-global-setup.ts` (port 9546 for publisher).
- * Events are produced by real contract calls (`createContextGraph` →
- * `NameClaimed`). Block ranges are advanced using real `hardhat_mine`
- * RPC so cursor / MAX_RANGE behaviour is exercised against genuine
- * on-chain block numbers.
+ * Events are produced by real V10 contract calls
+ * (`createOnChainContextGraph` → `ContextGraphCreated` on
+ * `ContextGraphStorage`). Block ranges are advanced using real
+ * `hardhat_mine` RPC so cursor / MAX_RANGE behaviour is exercised
+ * against genuine on-chain block numbers.
  *
- * publish-lifecycle.test.ts already covers the NameClaimed happy path
- * and the KnowledgeBatchCreated → confirmByMerkleRoot flow. This file
- * covers:
+ * This file was migrated from the V9 NameClaimed flow (which depended on
+ * the now-archived `ContextGraphNameRegistry.createContextGraph` surface)
+ * to the V10 `createOnChainContextGraph` path that emits
+ * `ContextGraphCreated`. The poller dispatches both NameClaimed and
+ * ContextGraphCreated to `onContextGraphCreated`, so this rewire
+ * preserves the original behavioural assertions verbatim.
+ *
+ * This file covers:
  *   - cursor persistence across restart (load + advance)
  *   - load() errors are non-fatal
  *   - head-seed skip for old events when no pending publishes
@@ -23,19 +29,16 @@
  *   - stop() is idempotent and clears the interval
  *
  * ======================================================================
- * SPEC-GAP SG-6 (new finding — added by this file's migration):
- *   The real `EVMChainAdapter.listenForEvents()` only yields
- *   `KnowledgeBatchCreated`, `KCCreated` / `KnowledgeCollectionCreated`,
- *   `NameClaimed`, and `ContextGraphExpanded`. It does NOT yield
- *   `KnowledgeCollectionUpdated`, `AllowListUpdated`,
+ * SPEC-GAP SG-6 (carried forward from the original V9 migration):
+ *   The real `EVMChainAdapter.listenForEvents()` yields only the event
+ *   types the deployed contracts emit (`KCCreated`,
+ *   `ContextGraphExpanded`, `ContextGraphCreated`, ...). It does NOT
+ *   yield `KnowledgeCollectionUpdated`, `AllowListUpdated`,
  *   `ProfileCreated`, or `ProfileUpdated` even though
- *   `ChainEventPoller.poll()` declares callback slots for all four
- *   (see `chain-event-poller.ts:177-184`). Those four callback paths
- *   are dead code in production. A dedicated failing test below
- *   (`[SG-6] EVMChainAdapter does not yield the 4 extended event
- *   types declared by ChainEventPoller`) pins this gap so the fix
- *   (extending listenForEvents with the missing branches) cannot
- *   silently slip.
+ *   `ChainEventPoller.poll()` declares callback slots for all four.
+ *   Those four callback paths are dead code in production. A dedicated
+ *   regression test below pins this gap so the fix (extending
+ *   `listenForEvents` with the missing branches) cannot silently slip.
  * ======================================================================
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -78,19 +81,31 @@ async function mineBlocks(count: number): Promise<void> {
   await provider.send('hardhat_mine', ['0x' + count.toString(16)]);
 }
 
-/** Fresh context-graph name per test so NameClaimed ids don't collide. */
-let _cgCounter = 0;
-function nextCgName(prefix: string): string {
-  _cgCounter += 1;
-  return `${prefix}-${Date.now().toString(36)}-${_cgCounter}`;
+/**
+ * Create a V10 on-chain context graph via the ContextGraphs contract.
+ * Returns `{ contextGraphId, blockNumber }` mirroring the shape the
+ * pre-V10 NameClaimed helper used, so the test bodies need no further
+ * adjustments. `ContextGraphCreated` is the event the poller will
+ * surface through `onContextGraphCreated`.
+ */
+async function createV10Cg(chain: ReturnType<typeof createEVMAdapter>): Promise<{ contextGraphId: string; blockNumber: number }> {
+  const id = BigInt(getSharedContext().coreProfileId);
+  const result = await chain.createOnChainContextGraph({
+    participantIdentityIds: [id],
+    requiredSignatures: 1,
+    publishPolicy: 0,
+  });
+  if (!result.success || result.contextGraphId === 0n) {
+    throw new Error(`createV10Cg failed: ${JSON.stringify(result)}`);
+  }
+  return { contextGraphId: result.contextGraphId.toString(), blockNumber: result.blockNumber! };
 }
 
 let _fileSnapshot: string;
 beforeAll(async () => {
   _fileSnapshot = await takeSnapshot();
-  // Fund CORE_OP with enough TRAC to pay createContextGraph fees, which
-  // the V9 ContextGraphRegistry charges implicitly via gas. Keeps the adapter
-  // transactions from reverting with insufficient funds on long test runs.
+  // Fund CORE_OP with enough TRAC to cover V10 createOnChainContextGraph
+  // gas across all tests in this file (each call is its own real tx).
   const { hubAddress } = getSharedContext();
   const provider = createProvider();
   const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
@@ -106,15 +121,13 @@ describe('ChainEventPoller — cursor persistence', () => {
     const provider = createProvider();
     const handler = new PublishHandler(new OxigraphStore(), new TypedEventBus());
 
-    // Emit a real NameClaimed event; capture the exact block number.
-    const name = nextCgName('cg-restore');
-    const result = await chain.createContextGraph({ name, accessPolicy: 0 });
-    expect(result.success).toBe(true);
-    const eventBlock = result.blockNumber!;
+    // Emit a real ContextGraphCreated event; capture the exact block number.
+    const result = await createV10Cg(chain);
+    const eventBlock = result.blockNumber;
 
     // Persist a cursor one block before the event so restore semantics are
     // observable: the first poll must start at `eventBlock` and pick up
-    // the NameClaimed that would otherwise be missed if the cursor
+    // the ContextGraphCreated that would otherwise be missed if the cursor
     // reset to 0 (slow / redundant) or to head (skips the event).
     const cursor = new InMemoryCursor(eventBlock - 1);
     const received: Array<{ id: string; blockNumber: number }> = [];
@@ -136,7 +149,7 @@ describe('ChainEventPoller — cursor persistence', () => {
     // Our event must be among the restored-cursor scan results (other
     // tests may have created CGs too — we only care that OURS is picked).
     const mine = received.find((r) => r.blockNumber === eventBlock);
-    expect(mine, `expected NameClaimed at block ${eventBlock}; received=${JSON.stringify(received)}`).toBeDefined();
+    expect(mine, `expected ContextGraphCreated at block ${eventBlock}; received=${JSON.stringify(received)}`).toBeDefined();
 
     // Cursor must have advanced past the event block (not regressed).
     expect(cursor.saved.length).toBeGreaterThan(0);
@@ -151,8 +164,8 @@ describe('ChainEventPoller — cursor persistence', () => {
     const cursor = new InMemoryCursor();
 
     // Take a snapshot of current head, then emit an event.
-    const result = await chain.createContextGraph({ name: nextCgName('cg-persist'), accessPolicy: 0 });
-    const eventBlock = result.blockNumber!;
+    const result = await createV10Cg(chain);
+    const eventBlock = result.blockNumber;
 
     const poller = new ChainEventPoller({
       chain,
@@ -198,10 +211,10 @@ describe('ChainEventPoller — head seeding & range capping', () => {
     const provider = createProvider();
     const handler = new PublishHandler(new OxigraphStore(), new TypedEventBus());
 
-    // Emit a NameClaimed at block B, then mine 1000 empty blocks so the
-    // new head is B+1000, putting B well before the seed window (head-500).
-    const result = await chain.createContextGraph({ name: nextCgName('cg-old'), accessPolicy: 0 });
-    const oldEventBlock = result.blockNumber!;
+    // Emit a ContextGraphCreated at block B, then mine 1000 empty blocks so
+    // the new head is B+1000, putting B well before the seed window (head-500).
+    const result = await createV10Cg(chain);
+    const oldEventBlock = result.blockNumber;
     await mineBlocks(1000);
     const head = await provider.getBlockNumber();
     expect(head).toBeGreaterThanOrEqual(oldEventBlock + 1000);
@@ -238,8 +251,8 @@ describe('ChainEventPoller — head seeding & range capping', () => {
     expect(handler.hasPendingPublishes).toBe(true);
 
     const beforeHead = await provider.getBlockNumber();
-    const result = await chain.createContextGraph({ name: nextCgName('cg-early'), accessPolicy: 0 });
-    const earlyBlock = result.blockNumber!;
+    const result = await createV10Cg(chain);
+    const earlyBlock = result.blockNumber;
     expect(earlyBlock).toBeGreaterThan(beforeHead);
 
     // Mine far past the early block — head would trigger head-500 seeding
@@ -276,15 +289,15 @@ describe('ChainEventPoller — head seeding & range capping', () => {
     );
 
     // Emit an early event (current head + 1 after this tx).
-    const earlyResult = await chain.createContextGraph({ name: nextCgName('cg-early-cap'), accessPolicy: 0 });
-    const earlyBlock = earlyResult.blockNumber!;
+    const earlyResult = await createV10Cg(chain);
+    const earlyBlock = earlyResult.blockNumber;
 
     // Mine past MAX_RANGE so cursor cannot cover the gap in one poll.
     await mineBlocks(10_000);
 
     // Emit a late event near current head — two events straddle the cap.
-    const lateResult = await chain.createContextGraph({ name: nextCgName('cg-late-cap'), accessPolicy: 0 });
-    const lateBlock = lateResult.blockNumber!;
+    const lateResult = await createV10Cg(chain);
+    const lateBlock = lateResult.blockNumber;
     const head = await provider.getBlockNumber();
     expect(head - earlyBlock).toBeGreaterThan(9_000);
     expect(lateBlock).toBeGreaterThan(earlyBlock + 9_000);
@@ -315,10 +328,8 @@ describe('ChainEventPoller — fault isolation & lifecycle', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const handler = new PublishHandler(new OxigraphStore(), new TypedEventBus());
 
-    const name1 = nextCgName('cg-throw-1');
-    const name2 = nextCgName('cg-throw-2');
-    const id1 = (await chain.createContextGraph({ name: name1, accessPolicy: 0 })).contextGraphId!;
-    const id2 = (await chain.createContextGraph({ name: name2, accessPolicy: 0 })).contextGraphId!;
+    const id1 = (await createV10Cg(chain)).contextGraphId;
+    const id2 = (await createV10Cg(chain)).contextGraphId;
 
     // First event sees a throwing callback; the second must still be
     // delivered → poller's dispatch loop catches and continues.
@@ -371,9 +382,9 @@ describe('ChainEventPoller — fault isolation & lifecycle', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const handler = new PublishHandler(new OxigraphStore(), new TypedEventBus());
 
-    const result = await chain.createContextGraph({ name: nextCgName('cg-idem'), accessPolicy: 0 });
-    const ourId = result.contextGraphId!;
-    const ourBlock = result.blockNumber!;
+    const result = await createV10Cg(chain);
+    const ourId = result.contextGraphId;
+    const ourBlock = result.blockNumber;
 
     // Probe the timer count directly on the internal state. A non-idempotent
     // start() would overwrite `timer` with a second handle, losing the first
@@ -423,15 +434,16 @@ describe('ChainEventPoller — fault isolation & lifecycle', () => {
   }, 30_000);
 });
 
-describe('ChainEventPoller — SPEC-GAP SG-6: adapter missing 4 of 7 event types', () => {
+describe('ChainEventPoller — SPEC-GAP SG-6: adapter missing 4 extended event types', () => {
   it('EVMChainAdapter.listenForEvents does NOT yield KnowledgeCollectionUpdated / AllowListUpdated / ProfileCreated / ProfileUpdated', async () => {
-    // Spec §5.1 requires the poller to act on seven event types. Four of
-    // them have callback slots on ChainEventPoller but are never produced
-    // by the real adapter (see `packages/chain/src/evm-adapter.ts:793`
-    // `listenForEvents` branches; grep shows only KnowledgeBatchCreated,
-    // KCCreated, ContextGraphExpanded, NameClaimed, and ContextGraphCreated). This test
-    // proves the gap end-to-end: we scan a broad block range asking for
-    // every type and assert the four missing ones are never yielded.
+    // Spec §5.1 names extended event types the poller declares callback
+    // slots for. Four are never produced by the real adapter (the V9
+    // KnowledgeAssetsStorage branches were archived together with the
+    // contract — see `packages/chain/src/archive/`). This test proves
+    // the gap end-to-end against the V10 channels the adapter does
+    // support today: we scan a broad block range asking for every
+    // currently-supported type plus the four missing ones, and assert
+    // the four missing ones are never yielded.
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const provider = createProvider();
 
@@ -440,9 +452,8 @@ describe('ChainEventPoller — SPEC-GAP SG-6: adapter missing 4 of 7 event types
 
     for await (const ev of chain.listenForEvents({
       eventTypes: [
-        'KnowledgeBatchCreated',
         'KCCreated',
-        'NameClaimed',
+        'ContextGraphCreated',
         'KnowledgeCollectionUpdated',
         'AllowListUpdated',
         'ProfileCreated',

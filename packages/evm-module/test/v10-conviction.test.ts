@@ -390,14 +390,8 @@ describe('@integration V10 Phase 5 — NFT-backed staking', function () {
   });
 
   // --------------------------------------------------------------------------
-  // Test 5 — selfMigrateV8 — REMOVED in TB-2
+  // Test 5 — selfMigrateV8 — REMOVED in TB-2 (V8 → V10 migration smoke
+  // depended on archived V8 storage helpers; on-chain function is now dead
+  // code on the happy path — tracking deletion in .ai/todo.md).
   // --------------------------------------------------------------------------
-  //
-  // The V8 → V10 migration smoke depended on seeding a V8 stake state via
-  // direct StakingStorage + DelegatorsInfo writes. DelegatorsInfo is
-  // archived in TB-1 and no longer Hub-registered, so the setup-step calls
-  // can't resolve. The `selfMigrateV8` path itself is now dead code on the
-  // happy path — there are no remaining V8 stakes to migrate once the V8
-  // Staking contract is unregistered. Leaving an explicit TODO in
-  // .ai/todo.md to delete the on-chain function in a follow-up PR.
 });

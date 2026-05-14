@@ -2089,14 +2089,13 @@ describe('@unit KnowledgeAssetsV10', () => {
     });
 
     // ----------------------------------------------------------------------
-    // T2.4 — DELETED in RFC-001.
-    //
-    // Paymaster.sol / PaymasterManager.sol are removed from KAv10's active
-    // path. Sponsorship is now expressed via PCA agent registration: a
-    // sponsoring core calls `DKGPublishingConvictionNFT.registerAgent(its
-    // accountId, sponsoredWallet)`, and that wallet's publishes flow through
-    // the PCA discount branch automatically. The sponsorship semantic is
-    // exercised by T2.3 and T1.1 already.
+    // T2.4 — DELETED in RFC-001 (legacy V9 paymaster sponsorship path archived
+    // under contracts/archive/). Sponsorship is now expressed via PCA agent
+    // registration: a sponsoring core calls
+    // `DKGPublishingConvictionNFT.registerAgent(its accountId, sponsoredWallet)`,
+    // and that wallet's publishes flow through the PCA discount branch
+    // automatically. The sponsorship semantic is exercised by T2.3 and T1.1
+    // already.
     // ----------------------------------------------------------------------
 
     // ----------------------------------------------------------------------

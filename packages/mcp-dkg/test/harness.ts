@@ -412,15 +412,34 @@ export class FakeClient {
     return { delivered: true };
   }
 
+  /**
+   * Captures the params the tool passed through so tests can assert
+   * that e.g. `dkg_check_inbox` is sending `direction=in` to the
+   * daemon. Cleared per-test in `beforeEach`.
+   */
+  readonly getMessagesCalls: Array<{
+    peer?: string;
+    since?: number;
+    limit?: number;
+    direction?: 'in' | 'out';
+  }> = [];
+
   async getMessages(args: {
     peer?: string;
     since?: number;
     limit?: number;
+    direction?: 'in' | 'out';
   } = {}) {
+    this.getMessagesCalls.push(args);
     if (this.overrides.getMessages) return this.overrides.getMessages.call(this, args);
     let rows = this.chatMessages.slice();
     if (args.peer) rows = rows.filter((m) => m.peer === args.peer);
     if (typeof args.since === 'number') rows = rows.filter((m) => m.ts > args.since!);
+    // Mirror the real daemon: direction filter applies BEFORE limit so
+    // the cap doesn't push older direction-matching rows off the page.
+    if (args.direction === 'in' || args.direction === 'out') {
+      rows = rows.filter((m) => m.direction === args.direction);
+    }
     if (typeof args.limit === 'number') rows = rows.slice(-args.limit);
     return { messages: rows };
   }

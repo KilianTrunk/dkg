@@ -197,11 +197,25 @@ export function registerChatTools(
     },
     async ({ peer, since, limit, directionFilter }): Promise<ToolResult> => {
       try {
+        const dir = directionFilter ?? 'in';
+        // Push the direction filter to the daemon so the LIMIT cap
+        // doesn't push older inbound rows off the bottom of the page
+        // when the newest entries are outbound replies. `both` is the
+        // only mode where the daemon should return mixed rows.
+        const serverDirection: 'in' | 'out' | undefined =
+          dir === 'both' ? undefined : dir;
         const [{ messages }, names] = await Promise.all([
-          client.getMessages({ peer, since, limit }),
+          client.getMessages({
+            peer,
+            since,
+            limit,
+            ...(serverDirection ? { direction: serverDirection } : {}),
+          }),
           buildPeerNameMap(client),
         ]);
-        const dir = directionFilter ?? 'in';
+        // Defence in depth: the daemon should already have filtered,
+        // but if a future caller wires an older daemon we still won't
+        // surface the wrong direction.
         const filtered = messages.filter((m) => {
           if (dir === 'both') return true;
           return m.direction === dir;

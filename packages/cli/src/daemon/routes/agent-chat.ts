@@ -588,17 +588,28 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     });
   }
 
-  // GET /api/messages?peer=<name-or-id>&limit=N
+  // GET /api/messages?peer=<name-or-id>&limit=N&since=<ts>&direction=in|out
+  //
+  // `direction` is a server-side filter applied BEFORE `limit`. Inbox
+  // readers (the `dkg_check_inbox` MCP tool, the `inject-inbox` hook)
+  // pass `direction=in` so a burst of outbound replies in the newest
+  // page cannot push older unread inbound messages off the bottom and
+  // cause the inbox watermark to skip them. Without this, the client-
+  // side `direction === 'in'` filter ran after the LIMIT cap and silently
+  // dropped unread messages whenever the page was direction-mixed.
   if (req.method === "GET" && path === "/api/messages") {
     const peerFilter = url.searchParams.get("peer");
     const limit = parseInt(url.searchParams.get("limit") ?? "100", 10);
     const since = parseInt(url.searchParams.get("since") ?? "0", 10);
+    const directionRaw = url.searchParams.get("direction");
+    const direction: "in" | "out" | undefined =
+      directionRaw === "in" || directionRaw === "out" ? directionRaw : undefined;
 
     let peer: string | undefined;
     if (peerFilter) {
       peer = (await resolveNameToPeerId(agent, peerFilter)) ?? undefined;
     }
-    const rows = dashDb.getChatMessages({ peer, since: since || undefined, limit });
+    const rows = dashDb.getChatMessages({ peer, since: since || undefined, limit, direction });
     const msgs = rows.map((r: any) => ({
       ts: r.ts,
       direction: r.direction,

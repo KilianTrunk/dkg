@@ -127,7 +127,12 @@ export class ApiClient {
     });
   }
 
-  async messages(opts?: { peer?: string; since?: number; limit?: number }): Promise<{
+  async messages(opts?: {
+    peer?: string;
+    since?: number;
+    limit?: number;
+    direction?: 'in' | 'out';
+  }): Promise<{
     messages: Array<{
       ts: number; direction: 'in' | 'out';
       peer: string; peerName?: string; text: string;
@@ -137,6 +142,9 @@ export class ApiClient {
     if (opts?.peer) params.set('peer', opts.peer);
     if (opts?.since) params.set('since', String(opts.since));
     if (opts?.limit) params.set('limit', String(opts.limit));
+    if (opts?.direction === 'in' || opts?.direction === 'out') {
+      params.set('direction', opts.direction);
+    }
     const qs = params.toString();
     return this.get(`/api/messages${qs ? '?' + qs : ''}`);
   }

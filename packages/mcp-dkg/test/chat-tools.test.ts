@@ -105,7 +105,7 @@ describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
       expect(body).toMatch(/dkg_send_message/);
     });
 
-    it('filters out outbound messages by default', async () => {
+    it('filters out outbound messages by default (server-side, via direction=in)', async () => {
       client.chatMessages.push(
         { ts: 1, direction: 'out', peer: 'peer', text: 'sent', delivered: true },
         { ts: 2, direction: 'in', peer: 'peer', text: 'received' },
@@ -114,9 +114,14 @@ describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
       expect(result.content[0].text).toMatch(/1 unread peer message/);
       expect(result.content[0].text).toContain('received');
       expect(result.content[0].text).not.toContain('sent');
+      // Crucially: the direction filter was pushed to the daemon, so
+      // LIMIT can't push inbound rows off the bottom of the page when
+      // newest entries are outbound. (Codex/branarakic PR #510 fix.)
+      expect(client.getMessagesCalls).toHaveLength(1);
+      expect(client.getMessagesCalls[0]).toMatchObject({ direction: 'in' });
     });
 
-    it('shows both directions when directionFilter=both', async () => {
+    it('shows both directions when directionFilter=both and DROPS the direction param so daemon returns mixed rows', async () => {
       client.chatMessages.push(
         { ts: 1, direction: 'out', peer: 'peer', text: 'outbound-text', delivered: true },
         { ts: 2, direction: 'in', peer: 'peer', text: 'inbound-text' },
@@ -126,6 +131,20 @@ describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
       expect(body).toContain('outbound-text');
       expect(body).toContain('inbound-text');
       expect(body).toMatch(/direction=both/);
+      // For "both" we want mixed rows, so direction must NOT be set
+      // on the daemon query — otherwise we'd get only one side.
+      expect(client.getMessagesCalls[0].direction).toBeUndefined();
+    });
+
+    it('directionFilter=out pushes direction=out to the daemon', async () => {
+      client.chatMessages.push(
+        { ts: 1, direction: 'out', peer: 'peer', text: 'sent', delivered: true },
+        { ts: 2, direction: 'in', peer: 'peer', text: 'received' },
+      );
+      const result = await server.call('dkg_check_inbox', { directionFilter: 'out' });
+      expect(client.getMessagesCalls[0]).toMatchObject({ direction: 'out' });
+      expect(result.content[0].text).toContain('sent');
+      expect(result.content[0].text).not.toContain('received');
     });
 
     it('flags undelivered outbound messages when directionFilter shows out', async () => {

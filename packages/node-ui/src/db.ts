@@ -923,10 +923,18 @@ export class DashboardDB {
     });
   }
 
+  /**
+   * Read chat history. `direction` filters server-side BEFORE the LIMIT
+   * applies, which matters for inbox reads — if the filter ran
+   * client-side, a burst of outbound replies in the newest 200 rows
+   * would push inbound messages past the cap and they'd never be
+   * surfaced.
+   */
   getChatMessages(opts: {
     peer?: string;
     since?: number;
     limit?: number;
+    direction?: 'in' | 'out';
   } = {}): ChatMessageRow[] {
     let sql = 'SELECT * FROM chat_messages WHERE 1=1';
     const params: unknown[] = [];
@@ -938,6 +946,10 @@ export class DashboardDB {
     if (opts.peer) {
       sql += ' AND peer = ?';
       params.push(opts.peer);
+    }
+    if (opts.direction === 'in' || opts.direction === 'out') {
+      sql += ' AND direction = ?';
+      params.push(opts.direction);
     }
     sql += ' ORDER BY ts DESC LIMIT ?';
     params.push(opts.limit ?? 200);

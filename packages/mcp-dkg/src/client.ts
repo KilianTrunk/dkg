@@ -246,6 +246,14 @@ export class DkgClient {
     peer?: string;
     since?: number;
     limit?: number;
+    /**
+     * Server-side direction filter. Applied BEFORE the daemon's LIMIT
+     * cap, so inbox readers asking for `direction: 'in'` won't have
+     * unread inbound messages skipped when the newest page is a burst
+     * of outbound replies. See `GET /api/messages` in
+     * `packages/cli/src/daemon/routes/agent-chat.ts` for the contract.
+     */
+    direction?: 'in' | 'out';
   } = {}): Promise<{
     messages: Array<{
       ts: number;
@@ -260,6 +268,9 @@ export class DkgClient {
     if (args.peer) params.set('peer', args.peer);
     if (typeof args.since === 'number') params.set('since', String(args.since));
     if (typeof args.limit === 'number') params.set('limit', String(args.limit));
+    if (args.direction === 'in' || args.direction === 'out') {
+      params.set('direction', args.direction);
+    }
     const qs = params.toString();
     return this.request('GET', `/api/messages${qs ? `?${qs}` : ''}`);
   }

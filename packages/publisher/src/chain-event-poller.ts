@@ -58,11 +58,16 @@ export interface ChainEventPollerConfig {
 
 /**
  * Background poller that watches for on-chain events (spec §5.1):
- * - KnowledgeBatchCreated / KCCreated: promotes tentative publishes to confirmed
+ * - KCCreated: promotes tentative publishes to confirmed (V10 batch creation)
  * - NameClaimed / ContextGraphCreated: notifies the agent of new CGs
  * - KnowledgeCollectionUpdated: applies UPDATE to LTM
  * - AllowListUpdated: updates subscription state
  * - ProfileCreated / ProfileUpdated: updates peer identity cache
+ *
+ * NOTE: the legacy V9 batch-creation event was archived together with
+ * `KnowledgeAssets`/`KnowledgeAssetsStorage` (see
+ * `packages/chain/src/archive/`). The poller no longer subscribes to it.
+ * The CHANGELOG entry for the archive PR carries the migration note.
  *
  * The chain is the single source of truth for finalization ordering.
  * GossipSub is best-effort — the poller is the safety net that ensures
@@ -168,11 +173,9 @@ export class ChainEventPoller {
       }
     }
 
-    // Always listen for both V9 and V10 events: even when V10 is deployed,
-    // the publisher still falls back to V9 for private publishes and ACK
-    // collection failures. Stopping legacy event polling would leave those
-    // publishes tentative forever on remote nodes.
-    const eventTypes: string[] = ['KnowledgeBatchCreated', 'KCCreated'];
+    // V10-only event subscription. The archived V9 batch-created event is
+    // intentionally absent — see the file-level docblock and CHANGELOG.
+    const eventTypes: string[] = ['KCCreated'];
     if (watchContextGraphs) {
       eventTypes.push('NameClaimed');
       eventTypes.push('ContextGraphCreated');
@@ -200,7 +203,7 @@ export class ChainEventPoller {
     let maxEventBlock = this.lastBlock;
     for await (const event of this.chain.listenForEvents(filter)) {
       if (event.blockNumber > maxEventBlock) maxEventBlock = event.blockNumber;
-      if (event.type === 'KnowledgeBatchCreated' || event.type === 'KCCreated') {
+      if (event.type === 'KCCreated') {
         await this.handleBatchCreated(event, ctx);
       } else if (event.type === 'NameClaimed' || event.type === 'ContextGraphCreated') {
         await this.handleContextGraphCreated(event, ctx);
@@ -241,7 +244,7 @@ export class ChainEventPoller {
     const endKAId = BigInt(data['endKAId'] as string ?? '0');
 
     this.log.info(ctx,
-      `Chain event: KnowledgeBatchCreated block=${event.blockNumber} ` +
+      `Chain event: KCCreated block=${event.blockNumber} ` +
       `publisher=${publisherAddress} range=${startKAId}..${endKAId}`,
     );
 

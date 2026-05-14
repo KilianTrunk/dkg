@@ -379,6 +379,52 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(ctx.tracker.complete).toHaveBeenCalledWith(expect.anything(), { tripleCount: 2 });
   });
 
+  it('keeps implicit same-graph publishes out of the remap path', async () => {
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kcId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
+      publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
+    });
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      selection: ['urn:root'],
+    }, {
+      agent: { publishFromSharedMemory, getContextGraphOnChainId } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(getContextGraphOnChainId).not.toHaveBeenCalled();
+    expect(publishFromSharedMemory.mock.calls[0][2]).not.toHaveProperty('contextGraphId');
+  });
+
+  it('still forwards explicit publishContextGraphId as a remap request', async () => {
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kcId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
+      publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
+    });
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      publishContextGraphId: '7',
+      selection: ['urn:root'],
+    }, {
+      agent: { publishFromSharedMemory } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(publishFromSharedMemory.mock.calls[0][2]).toMatchObject({
+      contextGraphId: '7',
+    });
+    expect(responseBody(ctx)).toMatchObject({ publishContextGraphId: '7' });
+  });
+
   it('emits VM refresh events after verified-memory verification', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const verify = vi.fn().mockResolvedValue({ verified: true, status: 'verified' });

@@ -20,7 +20,7 @@
 
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error - importing the .mjs hook for its pure-function exports
-import { renderNotice, daemonIdentityHash } from '../hooks/inject-inbox.mjs';
+import { renderNotice, daemonIdentityHash, extractPrompt } from '../hooks/inject-inbox.mjs';
 
 describe('inject-inbox.mjs renderNotice — SECURITY', () => {
   it('NEVER inlines peer message text into the rendered notice', () => {
@@ -119,3 +119,54 @@ describe('inject-inbox.mjs daemonIdentityHash — STATE KEYING', () => {
     expect(jsHash).toBe(tsHash);
   });
 });
+
+// Codex PR #510 round 3 — `extractPrompt` must not silently swallow
+// the operator's text. If stdin is non-JSON (client payload change,
+// partial write, plain-text invocation) `readStdinJson` wraps it as
+// `{ rawPayload }`. The old extractor ignored that, so an unread-
+// message hit would emit only the inbox notice as `updated_input`
+// and the operator's actual prompt got dropped. The new behaviour:
+// surface `rawPayload` if present, and `main()` aborts injection
+// entirely when no prompt can be extracted.
+describe('inject-inbox.mjs extractPrompt — PROMPT PRESERVATION', () => {
+  it('returns the operator prompt from a Cursor-shaped payload', () => {
+    expect(extractPrompt({ prompt: 'fix this test' })).toBe('fix this test');
+  });
+
+  it('descends into nested envelopes (Cursor wraps in different shapes across versions)', () => {
+    expect(
+      extractPrompt({ user: { input: { text: 'nested prompt' } } }),
+    ).toBe('nested prompt');
+  });
+
+  it('returns rawPayload when stdin was non-JSON (the Codex round-3 case)', () => {
+    expect(extractPrompt({ rawPayload: 'plain-text prompt' })).toBe(
+      'plain-text prompt',
+    );
+  });
+
+  it('prefers rawPayload over recursive search so plain-text stays intact', () => {
+    // Defensive: if a future payload shape includes BOTH a top-level
+    // text shape AND a rawPayload, take the raw — that's what the
+    // client actually sent and is least likely to be metadata.
+    expect(
+      extractPrompt({
+        rawPayload: 'authoritative input',
+        nested: { text: 'metadata' },
+      }),
+    ).toBe('authoritative input');
+  });
+
+  it('returns empty string when no prompt can be recovered', () => {
+    expect(extractPrompt(null)).toBe('');
+    expect(extractPrompt({})).toBe('');
+    expect(extractPrompt({ unrelated: 1 })).toBe('');
+    expect(extractPrompt({ rawPayload: '   ' })).toBe('');
+  });
+
+  it('returns empty for whitespace-only string fields (no useful prompt to inject)', () => {
+    expect(extractPrompt({ prompt: '' })).toBe('');
+    expect(extractPrompt({ prompt: '   \n  ' })).toBe('');
+  });
+});
+

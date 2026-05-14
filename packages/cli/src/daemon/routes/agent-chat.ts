@@ -537,9 +537,18 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
   //
   // Optional `contextGraphId` is embedded in the encrypted payload so a
   // scoped receiver can validate that the sender is talking on behalf of
-  // a context graph both sides recognise. Defaults to `config.chat.acl
-  // .contextGraphId` when omitted, so most callers don't have to think
-  // about it after initial setup.
+  // a context graph both sides recognise. Callers must opt in
+  // EXPLICITLY by passing `contextGraphId` on the request; we do NOT
+  // auto-fill from `config.chat.acl.contextGraphId`. Codex PR #510
+  // round 3 caught that conflating the INBOUND ACL config with the
+  // OUTBOUND wire claim broke back-compat: a node configured to
+  // ACL-scope inbound chats to graph X would suddenly stamp every
+  // outgoing chat with the X claim, causing receivers that scope to a
+  // DIFFERENT graph (or to `shared-context-graph` mode) to reject
+  // messages that previously succeeded. ACL config and outbound
+  // claim are distinct concerns — if a future requirement needs a
+  // "default outbound CG" it should be a separate explicit config
+  // field, not overloaded on the ACL one.
   if (req.method === "POST" && path === "/api/chat") {
     const serverT0 = Date.now();
     const body = await readBody(req, SMALL_BODY_BYTES);
@@ -557,11 +566,9 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     if (!peerId)
       return jsonResponse(res, 404, { error: `Agent "${to}" not found` });
 
-    const resolvedCgId = contextGraphId ?? config.chat?.acl?.contextGraphId;
-
     const sendT0 = Date.now();
     const result = await Promise.race([
-      agent.sendChat(peerId, text, resolvedCgId ? { contextGraphId: resolvedCgId } : {}),
+      agent.sendChat(peerId, text, contextGraphId ? { contextGraphId } : {}),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("sendChat timeout (30s)")), 30_000),
       ),

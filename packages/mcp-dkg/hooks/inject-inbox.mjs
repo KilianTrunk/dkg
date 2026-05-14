@@ -296,11 +296,26 @@ async function readStdinJson() {
   }
 }
 
-function extractPrompt(payload) {
-  // Cursor wraps the user prompt in different shapes across versions;
-  // do a best-effort deep search. Falls back to empty string so we can
-  // still detect the no-text case and exit gracefully.
+/**
+ * Extract the operator's prompt from the hook payload. Cursor wraps
+ * the user prompt in different shapes across versions; do a best-
+ * effort deep search. The `rawPayload` branch handles non-JSON
+ * stdin from a future client change or partial-write scenarios so
+ * we never silently swallow the operator's text.
+ *
+ * Codex PR #510 round 3 caught the fail-open hole here: if stdin was
+ * non-JSON, `readStdinJson` returned `{ rawPayload }` and the old
+ * search ignored it — so an unread-message hit emitted only the
+ * inbox notice as `updated_input` and dropped the operator's
+ * prompt entirely. We now look at `rawPayload` too, and `main()`
+ * fails CLOSED on prompt extraction (returns `{}` rather than
+ * overwriting the operator's input).
+ */
+export function extractPrompt(payload) {
   if (!payload || typeof payload !== 'object') return '';
+  if (typeof payload.rawPayload === 'string' && payload.rawPayload.trim()) {
+    return payload.rawPayload;
+  }
   const keys = ['prompt', 'input', 'text', 'message', 'content', 'user_input'];
   function recurse(node, depth) {
     if (depth > 4 || !node || typeof node !== 'object') return undefined;
@@ -365,54 +380,77 @@ export function renderNotice(messages) {
 }
 
 /**
+ * Total time budget for the inbox check. `beforeSubmitPrompt` runs
+ * synchronously between the operator hitting enter and the agent
+ * actually starting work — if the daemon socket hangs (process
+ * starting up, dead but listening, network filter eating SYNs)
+ * we MUST NOT block the prompt indefinitely. Codex PR #510 round 3
+ * caught that the plain `fetch()` here had no timeout, breaking the
+ * documented fail-open contract on slow/hung daemons. 1500 ms is
+ * generous for a localhost call but still imperceptible to a human.
+ */
+const FETCH_BUDGET_MS = 1500;
+
+/**
  * Page through `/api/messages?direction=in&order=asc&since=<ts>&sinceId=<id>`
- * until we get a partial page or hit the safety cap. Walks
- * oldest→newest so the compound cursor only ever advances over rows
- * we have actually surfaced — `ts`-only pagination would silently
- * skip rows sharing a millisecond (Codex PR #510 round 2). Returns
- * the fully-coalesced list of unread inbound messages, ordered ts asc.
+ * until we get a partial page, hit the safety cap, or burn through
+ * the abort budget. Walks oldest→newest so the compound cursor only
+ * ever advances over rows we have actually surfaced — `ts`-only
+ * pagination would silently skip rows sharing a millisecond
+ * (Codex PR #510 round 2). Returns the fully-coalesced list of
+ * unread inbound messages, ordered ts asc.
+ *
+ * Throws on timeout / network error / non-2xx response so the
+ * caller's `try/catch` can emit `{}` and let the operator's prompt
+ * proceed unmodified.
  */
 async function fetchAllInbound(cfg, startCursor) {
   const all = [];
   let cursor = { ts: startCursor?.ts ?? 0, id: startCursor?.id ?? 0 };
-  while (all.length < MAX_TOTAL) {
-    const params = new URLSearchParams({
-      direction: 'in',
-      order: 'asc',
-      limit: String(PAGE_SIZE),
-    });
-    if (cursor.ts) {
-      params.set('since', String(cursor.ts));
-      params.set('sinceId', String(cursor.id));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_BUDGET_MS);
+  try {
+    while (all.length < MAX_TOTAL) {
+      const params = new URLSearchParams({
+        direction: 'in',
+        order: 'asc',
+        limit: String(PAGE_SIZE),
+      });
+      if (cursor.ts) {
+        params.set('since', String(cursor.ts));
+        params.set('sinceId', String(cursor.id));
+      }
+      const url = `${cfg.api.replace(/\/$/, '')}/api/messages?${params.toString()}`;
+      const headers = { Accept: 'application/json' };
+      if (cfg.token) headers.Authorization = `Bearer ${cfg.token}`;
+      const res = await fetch(url, { headers, signal: controller.signal });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`GET /api/messages → ${res.status}: ${body.slice(0, 200)}`);
+      }
+      const data = await res.json();
+      const page = Array.isArray(data?.messages) ? data.messages : [];
+      if (page.length === 0) break;
+      all.push(...page);
+      if (page.length < PAGE_SIZE) break;
+      // Advance compound cursor to the LAST row in the asc-ordered
+      // page (which is the newest in the batch). The next request
+      // will exclude rows up to and including this point via the
+      // `(ts > since) OR (ts = since AND id > sinceId)` predicate.
+      const last = page[page.length - 1];
+      const lastTs = typeof last.ts === 'number' ? last.ts : 0;
+      const lastId = typeof last.id === 'number' ? last.id : 0;
+      if (lastTs < cursor.ts || (lastTs === cursor.ts && lastId <= cursor.id)) {
+        // Cursor didn't advance — bail so we don't loop forever on a
+        // misbehaving daemon. Should never happen with the asc query.
+        break;
+      }
+      cursor = { ts: lastTs, id: lastId };
     }
-    const url = `${cfg.api.replace(/\/$/, '')}/api/messages?${params.toString()}`;
-    const headers = { Accept: 'application/json' };
-    if (cfg.token) headers.Authorization = `Bearer ${cfg.token}`;
-    const res = await fetch(url, { headers });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`GET /api/messages → ${res.status}: ${body.slice(0, 200)}`);
-    }
-    const data = await res.json();
-    const page = Array.isArray(data?.messages) ? data.messages : [];
-    if (page.length === 0) break;
-    all.push(...page);
-    if (page.length < PAGE_SIZE) break;
-    // Advance compound cursor to the LAST row in the asc-ordered page
-    // (which is the newest in the batch). The next request will
-    // exclude rows up to and including this point via the
-    // `(ts > since) OR (ts = since AND id > sinceId)` predicate.
-    const last = page[page.length - 1];
-    const lastTs = typeof last.ts === 'number' ? last.ts : 0;
-    const lastId = typeof last.id === 'number' ? last.id : 0;
-    if (lastTs < cursor.ts || (lastTs === cursor.ts && lastId <= cursor.id)) {
-      // Cursor didn't advance — bail so we don't loop forever on a
-      // misbehaving daemon. Should never happen with the asc query.
-      break;
-    }
-    cursor = { ts: lastTs, id: lastId };
+    return all;
+  } finally {
+    clearTimeout(timeout);
   }
-  return all;
 }
 
 // ── Main ─────────────────────────────────────────────────────────
@@ -455,11 +493,25 @@ async function main() {
   // messages, preventing a "notice fired but agent never followed
   // up" failure mode.
 
+  // FAIL CLOSED on prompt extraction. If we couldn't pull the
+  // operator's input out of the hook payload, `updated_input: notice`
+  // alone would REPLACE the prompt with just our notice — silently
+  // deleting whatever the operator typed. Codex PR #510 round 3
+  // caught this fail-open hole on non-JSON / malformed payloads. The
+  // operator never said "skip my prompt", so refuse to commit to
+  // overwriting and let the daemon's notification + the agent's
+  // next explicit `dkg_check_inbox` call surface the messages.
+  if (!userPrompt) {
+    log('skipping injection: could not extract operator prompt');
+    process.stdout.write('{}');
+    return;
+  }
+
   const notice = renderNotice(messages);
   // Notice goes BEFORE the operator's prompt so the model reads
   // "you have unread messages from X. The operator now says: Y." in
   // that order and surfaces the inbox naturally before processing Y.
-  const updatedInput = userPrompt ? `${notice}\n\n${userPrompt}` : notice;
+  const updatedInput = `${notice}\n\n${userPrompt}`;
 
   process.stdout.write(
     JSON.stringify({

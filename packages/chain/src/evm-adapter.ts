@@ -642,8 +642,19 @@ export class EVMChainAdapter implements ChainAdapter {
 
     this.contracts.identity = await this.resolveContract('Identity');
     this.contracts.profile = await this.resolveContract('Profile');
-    this.contracts.staking = await this.resolveContract('Staking');
     this.contracts.parametersStorage = await this.resolveContract('ParametersStorage');
+
+    // V8 `Staking` is archived (PRD §4.1 — `Staking.sol` moved under
+    // contracts/archive/, deploy script 023 archived). Tolerate its absence
+    // so the V10 surface still initialises. V8 method entry points
+    // (`stakeWithLock`, `stakeWithLockTier`) are dead code paths that
+    // issue 0004 will excise; their `this.contracts.staking` references
+    // were already write-only in init() and unread elsewhere.
+    try {
+      this.contracts.staking = await this.resolveContract('Staking');
+    } catch {
+      // V8 Staking not deployed — legacy stakeWithLock* unavailable.
+    }
 
     // RFC 04 — ProfileStorage holds the relay registry views + events.
     // Tolerated as optional so adapters bound to a Hub that pre-dates the
@@ -655,17 +666,37 @@ export class EVMChainAdapter implements ChainAdapter {
       // Older deployments without the relay registry surface.
     }
 
-    // V8 legacy contracts
-    this.contracts.knowledgeCollection = await this.resolveContract('KnowledgeCollection');
+    // V8 legacy contracts.
+    // `KnowledgeCollection` (V8) is archived (PRD §4.1, deploy script 026
+    // moved under deploy/archive). The V8 method entry points that read
+    // `this.contracts.knowledgeCollection` are scheduled for excision in
+    // issue 0004; tolerate the missing Hub binding here so init() doesn't
+    // throw on a V10-only deploy. `KnowledgeCollectionStorage` remains
+    // active (deploy script 011 still in the active set) so leave it as a
+    // hard requirement.
+    try {
+      this.contracts.knowledgeCollection = await this.resolveContract('KnowledgeCollection');
+    } catch {
+      // V8 KnowledgeCollection not deployed — legacy publish surface unavailable.
+    }
     this.contracts.knowledgeCollectionStorage = await this.resolveAssetStorage('KnowledgeCollectionStorage');
 
-    // V9 contracts (may not be deployed yet on older nodes)
+    // V9 contracts (KnowledgeAssets + KnowledgeAssetsStorage) are archived
+    // (PRD §4.1, deploy scripts 040+041 moved under deploy/archive). Keep
+    // the try/catch so adapters bound to legacy deploys still resolve them.
+    // AskStorage is V10-active (deploy script 017 still in the active set);
+    // split it out so a missing V9 binding doesn't strand AskStorage. The
+    // V10 publish-token-amount path depends on AskStorage being resolved.
     try {
       this.contracts.knowledgeAssets = await this.resolveContract('KnowledgeAssets');
       this.contracts.knowledgeAssetsStorage = await this.resolveAssetStorage('KnowledgeAssetsStorage');
+    } catch {
+      // V9 contracts not deployed — V9 publish/update surface unavailable.
+    }
+    try {
       this.contracts.askStorage = await this.resolveContract('AskStorage');
     } catch {
-      // V9 contracts not deployed — adapter works in V8-only mode
+      // Older deployments that pre-date AskStorage — token-amount derivation unavailable.
     }
 
     try {

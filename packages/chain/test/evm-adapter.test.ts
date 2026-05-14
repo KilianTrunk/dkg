@@ -19,17 +19,20 @@ describe('EVMChainAdapter integration', () => {
     killHardhat(ctx);
   });
 
-  it('should connect and resolve V8 contracts from Hub', async () => {
+  it('should connect and resolve V10 contracts from Hub', async () => {
     const adapter = new EVMChainAdapter(makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.DEPLOYER));
 
     expect(adapter.chainType).toBe('evm');
     expect(adapter.chainId).toBe('evm:31337');
 
-    const kc = await adapter.getContract('KnowledgeCollection');
-    expect(await kc.name()).toBe('KnowledgeCollection');
+    // V8 `KnowledgeCollection` + `Staking` were archived in TB-1 (PRD §4.1)
+    // — their Hub bindings no longer exist. Hub-resolve the V10 successors
+    // instead to assert the adapter still talks to a fresh V10 deploy.
+    const kav10 = await adapter.getContract('KnowledgeAssetsV10');
+    expect(await kav10.name()).toBe('KnowledgeAssetsV10');
 
-    const staking = await adapter.getContract('Staking');
-    expect(await staking.name()).toBe('Staking');
+    const stakingV10 = await adapter.getContract('StakingV10');
+    expect(await stakingV10.name()).toBe('StakingV10');
   }, 30_000);
 
   it('should have correct signer address', () => {

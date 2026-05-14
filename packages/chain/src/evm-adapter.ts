@@ -1092,10 +1092,15 @@ export class EVMChainAdapter implements ChainAdapter {
   async *listenForEvents(filter: EventFilter): AsyncIterable<ChainEvent> {
     await this.init();
 
-    const storage = this.contracts.knowledgeAssetsStorage ?? this.contracts.knowledgeCollectionStorage!;
-
     for (const eventType of filter.eventTypes) {
       if (eventType === 'KnowledgeBatchCreated') {
+        // V8-only event — emitted by archived KnowledgeAssetsStorage. When the
+        // V8 contract is absent (the V10-only deploy path after this PR), this
+        // branch yields nothing and consumers must rely on V10 `KCCreated`.
+        const storage = this.contracts.knowledgeAssetsStorage;
+        if (!storage) {
+          continue;
+        }
         const eventFilter = storage.filters.KnowledgeBatchCreated();
         const logs = await storage.queryFilter(eventFilter, filter.fromBlock ?? 0, filter.toBlock);
 

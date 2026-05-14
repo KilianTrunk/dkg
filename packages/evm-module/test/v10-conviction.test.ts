@@ -27,7 +27,6 @@ import hre from 'hardhat';
 import {
   Chronos,
   ConvictionStakingStorage,
-  DelegatorsInfo,
   DKGStakingConvictionNFT,
   EpochStorage,
   Hub,
@@ -49,7 +48,6 @@ type Fixture = {
   StakingV10: StakingV10;
   StakingStorage: StakingStorage;
   ConvictionStakingStorage: ConvictionStakingStorage;
-  DelegatorsInfo: DelegatorsInfo;
   RandomSamplingStorage: RandomSamplingStorage;
   ParametersStorage: ParametersStorage;
   Profile: Profile;
@@ -86,9 +84,6 @@ async function deployFixture(): Promise<Fixture> {
     ConvictionStakingStorage: await hre.ethers.getContract<ConvictionStakingStorage>(
       'ConvictionStakingStorage',
     ),
-    DelegatorsInfo: await hre.ethers.getContract<DelegatorsInfo>(
-      'DelegatorsInfo',
-    ),
     RandomSamplingStorage: await hre.ethers.getContract<RandomSamplingStorage>(
       'RandomSamplingStorage',
     ),
@@ -108,7 +103,6 @@ describe('@integration V10 Phase 5 — NFT-backed staking', function () {
   let StakingV10Contract: StakingV10;
   let StakingStorageContract: StakingStorage;
   let ConvictionStakingStorageContract: ConvictionStakingStorage;
-  let DelegatorsInfoContract: DelegatorsInfo;
   let RandomSamplingStorageContract: RandomSamplingStorage;
   let ProfileContract: Profile;
   let Token: Token;
@@ -123,7 +117,6 @@ describe('@integration V10 Phase 5 — NFT-backed staking', function () {
       StakingV10: StakingV10Contract,
       StakingStorage: StakingStorageContract,
       ConvictionStakingStorage: ConvictionStakingStorageContract,
-      DelegatorsInfo: DelegatorsInfoContract,
       RandomSamplingStorage: RandomSamplingStorageContract,
       Profile: ProfileContract,
       Token,
@@ -397,100 +390,14 @@ describe('@integration V10 Phase 5 — NFT-backed staking', function () {
   });
 
   // --------------------------------------------------------------------------
-  // Test 5 — selfMigrateV8: V8 → V10 migration (D7 + D8)
+  // Test 5 — selfMigrateV8 — REMOVED in TB-2
   // --------------------------------------------------------------------------
   //
-  // End-to-end V8-to-V10 migration smoke: set up a V8 address-keyed
-  // delegator position directly (faster + decoupled from V8 `stake()`
-  // correctness — `test/unit/Staking.test.ts` owns that), then call
-  // `NFT.selfMigrateV8(identityId, lockTier)` and verify:
-  //   - V8 bucket drained
-  //   - V10 position created with `raw = stakeBaseAbsorbed + pendingAbsorbed` (D8)
-  //   - V10 aggregates (`totalStakeV10`, `nodeStakeV10`) grow by the migrated
-  //     amount (D15 — V10 has its own aggregates; V8 ones are NOT decremented
-  //     in this direct-seeding setup since we never went through V8 `stake()`)
-  //   - NFT owned by the migrator
-  it('selfMigrateV8: V8 stake migrates into V10 NFT position (D7+D8+D15)', async () => {
-    const { identityId } = await createProfile();
-    const amount = hre.ethers.parseEther('1000');
-
-    // V8 delegator key formula — `keccak256(abi.encodePacked(address))`
-    // (see Staking.sol `_getDelegatorKey`).
-    const v8Key = hre.ethers.keccak256(
-      hre.ethers.solidityPacked(['address'], [accounts[0].address]),
-    );
-
-    // Mint vault TRAC so any downstream withdrawal has funds and the V8
-    // totals stay consistent with the on-chain balance.
-    await Token.mint(await StakingStorageContract.getAddress(), amount);
-
-    // Set up a V8 stake directly — the hub owner can call `onlyContracts`
-    // setters (see `HubDependent._checkHubContract`). Mirrors a V8
-    // `Staking.stake` end state with a fully-claimed delegator.
-    await StakingStorageContract.connect(
-      accounts[0],
-    ).increaseDelegatorStakeBase(identityId, v8Key, amount);
-    await StakingStorageContract.connect(accounts[0]).increaseNodeStake(
-      identityId,
-      amount,
-    );
-    await StakingStorageContract.connect(accounts[0]).increaseTotalStake(
-      amount,
-    );
-    await DelegatorsInfoContract.connect(accounts[0]).addDelegator(
-      identityId,
-      accounts[0].address,
-    );
-    await DelegatorsInfoContract.connect(
-      accounts[0],
-    ).setHasEverDelegatedToNode(identityId, accounts[0].address, true);
-    const currentEpoch = await ChronosContract.getCurrentEpoch();
-    // Floor at 0 — currentEpoch on a fresh fixture is 1.
-    const baseline = currentEpoch > 0n ? currentEpoch - 1n : 0n;
-    await DelegatorsInfoContract.connect(accounts[0]).setLastClaimedEpoch(
-      identityId,
-      accounts[0].address,
-      baseline,
-    );
-
-    const totalStakeV10Before =
-      await ConvictionStakingStorageContract.totalStakeV10();
-    const nodeStakeV10Before =
-      await ConvictionStakingStorageContract.getNodeStakeV10(identityId);
-
-    // D8 — both stakeBaseAbsorbed (V8 principal) and pendingAbsorbed (V8
-    // pending withdrawal) collapse into a single V10 `raw` value. In this
-    // direct-seeding setup we only wrote the principal, so pendingAbsorbed
-    // is 0 and `raw = amount`. `isAdmin = false` since this is a
-    // staker-initiated self-migration via the NFT wrapper.
-    await expect(NFT.connect(accounts[0]).selfMigrateV8(identityId, 12))
-      .to.emit(NFT, 'ConvertedFromV8')
-      .withArgs(accounts[0].address, 1n, identityId, 12, false)
-      .and.to.emit(StakingV10Contract, 'ConvertedFromV8')
-      .withArgs(accounts[0].address, 1n, identityId, amount, 0n, 12, false);
-
-    // V8 bucket drained.
-    expect(
-      await StakingStorageContract.getDelegatorStakeBase(identityId, v8Key),
-    ).to.equal(0n);
-
-    // D15 — V10 position lives in ConvictionStakingStorage. V10 does not
-    // write a mirror row into StakingStorage under the tokenId key; V10
-    // aggregates live on CSS.
-    const pos = await ConvictionStakingStorageContract.getPosition(1);
-    expect(pos.raw).to.equal(amount);
-    expect(pos.lockTier).to.equal(12);
-    expect(pos.multiplier18).to.equal(SIX_X);
-
-    // V10 aggregates grow by the migrated amount (D15).
-    expect(await ConvictionStakingStorageContract.totalStakeV10()).to.equal(
-      totalStakeV10Before + amount,
-    );
-    expect(
-      await ConvictionStakingStorageContract.getNodeStakeV10(identityId),
-    ).to.equal(nodeStakeV10Before + amount);
-
-    // NFT owned by migrator.
-    expect(await NFT.ownerOf(1)).to.equal(accounts[0].address);
-  });
+  // The V8 → V10 migration smoke depended on seeding a V8 stake state via
+  // direct StakingStorage + DelegatorsInfo writes. DelegatorsInfo is
+  // archived in TB-1 and no longer Hub-registered, so the setup-step calls
+  // can't resolve. The `selfMigrateV8` path itself is now dead code on the
+  // happy path — there are no remaining V8 stakes to migrate once the V8
+  // Staking contract is unregistered. Leaving an explicit TODO in
+  // .ai/todo.md to delete the on-chain function in a follow-up PR.
 });

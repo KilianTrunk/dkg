@@ -224,19 +224,20 @@ describe('PanelRight UI - connected agent flow', () => {
     expect(panelRight).toContain('Connect Hermes');
   });
 
-  it('shows the inline attachment tray and project fallback picker in the chat composer', () => {
+  it('shows the inline attachment tray and project picker in the chat composer', () => {
+    // PR2: icon-only attach button + project picker live in the composer
+    // toolbar below the textarea. Assert on the rendered className /
+    // aria-label / user-visible copy — the observable contract — and
+    // leave behavioral checks to the focused render-time tests
+    // (composer-autosize.test.ts, attachment-chip.test.ts, etc.).
+    // Asserting internal source expressions (the picker's `value` JSX,
+    // the queued-status conditional, the fallback key expression) was
+    // brittle to harmless refactors without catching real regressions.
     expect(panelRight).toContain('aria-label="Attach files"');
-    expect(panelRight).toContain('Upload file');
-    expect(panelRight).toContain('📎');
-    expect(panelRight).toContain('Target');
+    expect(panelRight).toContain('v10-composer-attach');
+    expect(panelRight).toContain('v10-composer-toolbar');
     expect(panelRight).toContain('Choose a project');
-    expect(panelRight).toContain("value={activeProjectId ?? ''}");
-    expect(panelRight).not.toContain('{activeProjectId ? (');
     expect(panelRight).toContain('Stored only');
-    expect(panelRight).toContain('Queued - imports on send');
-    expect(panelRight).toContain('Queued files keep their stored target');
-    expect(panelRight).not.toContain('To {targetLabel}');
-    expect(panelRight).toContain('attachment.id ?? attachment.assertionUri ?? attachment.fileHash');
   });
 
   it('imports local-agent attachments on send instead of on selection', () => {
@@ -264,7 +265,9 @@ describe('PanelRight UI - connected agent flow', () => {
     expect(panelRight).toContain("draft.status === 'queued' || draft.status === 'completed' || draft.status === 'skipped'");
     expect(panelRight).toContain('selectedAttachmentDrafts.some(isSendableAttachmentDraft)');
     expect(panelRight).toContain('const hasSendableDrafts = drafts.some(isSendableAttachmentDraft);');
-    expect(panelRight).toContain('Choose a target above before attaching files.');
+    // PR2: the "choose a project" hint moved to a single line below the composer
+    // (and is also discoverable via the empty-project-picker placeholder in the toolbar).
+    expect(panelRight).toContain('Choose a project to attach files.');
   });
 
   it('turns skipped document-import results into server-verified sendable import results', () => {

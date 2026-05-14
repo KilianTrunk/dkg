@@ -344,6 +344,21 @@ source-worker integration surfaces. Source workers are part of the CLI-operated
 ingestion path used to turn configured source content into Shared Working Memory
 writes and async publisher jobs.
 
+## Protocol Surface — V10 only
+
+The DKG protocol is V10-only as of PR #500 (`archive-non-V10-contracts`).
+Legacy V8/V9 contracts, deploy scripts, tests, and chain-adapter methods
+live under `archive/` subdirectories — preserved for forensics, not in
+the live deploy or build path. Fresh V10 deploys never register the V8
+`Staking` / `KnowledgeAssets` / `KnowledgeCollection`, V9
+`PublishingConvictionAccount` / `Paymaster` / `PaymasterManager` /
+`DelegatorsInfo` / `ContextGraphNameRegistry` / `KnowledgeAssetsStorage`
+contracts. The chain-adapter SDK targets the V10 contract family
+(`KnowledgeAssetsV10`, `StakingV10`, `DKGStakingConvictionNFT`,
+`DKGPublishingConvictionNFT`, `RandomSampling`, `StakingKPI`,
+`ContextGraphs`, V10 storages, plus shared `Hub` / `Token` / `Profile` /
+`Identity` / `Ask`). Trust model: `Hub.owner` = TracLabs multisig.
+
 ## Component Model
 
 ```mermaid

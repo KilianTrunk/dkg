@@ -19,15 +19,12 @@ data/
 packages/evm-module/artifacts/
 packages/evm-module/cache/
 packages/evm-module/typechain/
-# .devnet/ is a gitignored runtime workspace (Hardhat data dir, per-node
-# DKG_HOME state, daemon logs), with ONE exception: `.devnet/run.mjs` is
-# the orchestrator's smoke entrypoint per issue 0003's test_command and
-# MUST be checked in. Use the `.devnet/*` glob (not bare `.devnet/`) so
-# git descends into the directory and the `!.devnet/run.mjs` negation
-# below actually fires — a directory-level ignore short-circuits all
-# negations on contained paths.
-.devnet/*
-!.devnet/run.mjs
+# .devnet/ is a runtime workspace (Hardhat data dir, per-node DKG_HOME
+# state, daemon logs). Not checked in.
+.devnet/
+
+# Agent scratch (project memory across orchestrator runs). Local only.
+.ai/
 
 packages/evm-module/deployments/hardhat_contracts.json
 packages/evm-module/deployments/localhost_contracts.json

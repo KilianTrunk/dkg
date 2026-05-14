@@ -694,13 +694,23 @@ describe('Tentative data and chain event confirmation', () => {
     expect(handler.hasPendingPublishes).toBe(false);
   }, 10000);
 
-  it('ChainEventPoller invokes onContextGraphCreated for NameClaimed events', async () => {
+  it('ChainEventPoller invokes onContextGraphCreated for ContextGraphCreated events (V10)', async () => {
     const store = new OxigraphStore();
     const bus = new TypedEventBus();
     const handler = new PublishHandler(store, bus);
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
 
-    const cgResult = await chain.createContextGraph({ name: 'on-chain-test', accessPolicy: 0 });
+    // V10 path: emits `ContextGraphCreated` from the ContextGraphStorage
+    // contract. The V9 `createContextGraph({ name, accessPolicy })` flow
+    // (NameClaimed via ContextGraphNameRegistry) was archived together
+    // with the rest of the V8/V9 surface — see
+    // `packages/chain/src/archive/`.
+    const ownerIdentityId = BigInt(getSharedContext().coreProfileId);
+    const cgResult = await chain.createOnChainContextGraph({
+      participantIdentityIds: [ownerIdentityId],
+      requiredSignatures: 1,
+      publishPolicy: 0,
+    });
     expect(cgResult.success).toBe(true);
 
     const received: Array<{ contextGraphId: string; creator: string; accessPolicy: number }> = [];
@@ -721,7 +731,7 @@ describe('Tentative data and chain event confirmation', () => {
     poller.stop();
 
     expect(received.length).toBeGreaterThanOrEqual(1);
-    const event = received.find(e => e.accessPolicy === 0);
+    const event = received.find(e => e.contextGraphId === cgResult.contextGraphId.toString());
     expect(event).toBeDefined();
     expect(event!.contextGraphId).toBeTruthy();
     expect(event!.creator).toBeTruthy();

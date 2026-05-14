@@ -2,22 +2,22 @@
 
 pragma solidity ^0.8.20;
 
-import {AskStorage} from "./storage/AskStorage.sol";
-import {EpochStorage} from "./storage/EpochStorage.sol";
-import {PaymasterManager} from "./storage/PaymasterManager.sol";
-import {Chronos} from "./storage/Chronos.sol";
-import {KnowledgeAssetsStorage} from "./storage/KnowledgeAssetsStorage.sol";
-import {ShardingTableStorage} from "./storage/ShardingTableStorage.sol";
-import {IdentityStorage} from "./storage/IdentityStorage.sol";
-import {ParametersStorage} from "./storage/ParametersStorage.sol";
-import {KnowledgeAssetsLib} from "./libraries/KnowledgeAssetsLib.sol";
-import {TokenLib} from "./libraries/TokenLib.sol";
-import {IdentityLib} from "./libraries/IdentityLib.sol";
-import {INamed} from "./interfaces/INamed.sol";
-import {IPaymaster} from "./interfaces/IPaymaster.sol";
-import {IVersioned} from "./interfaces/IVersioned.sol";
-import {IInitializable} from "./interfaces/IInitializable.sol";
-import {ContractStatus} from "./abstract/ContractStatus.sol";
+import {AskStorage} from "../storage/AskStorage.sol";
+import {EpochStorage} from "../storage/EpochStorage.sol";
+import {PaymasterManager} from "./PaymasterManager.sol";
+import {Chronos} from "../storage/Chronos.sol";
+import {KnowledgeAssetsStorage} from "./KnowledgeAssetsStorage.sol";
+import {ShardingTableStorage} from "../storage/ShardingTableStorage.sol";
+import {IdentityStorage} from "../storage/IdentityStorage.sol";
+import {ParametersStorage} from "../storage/ParametersStorage.sol";
+import {KnowledgeAssetsLib} from "../libraries/KnowledgeAssetsLib.sol";
+import {TokenLib} from "../libraries/TokenLib.sol";
+import {IdentityLib} from "../libraries/IdentityLib.sol";
+import {INamed} from "../interfaces/INamed.sol";
+import {IPaymaster} from "./IPaymaster.sol";
+import {IVersioned} from "../interfaces/IVersioned.sol";
+import {IInitializable} from "../interfaces/IInitializable.sol";
+import {ContractStatus} from "../abstract/ContractStatus.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ECDSA} from "solady/src/utils/ECDSA.sol";
 

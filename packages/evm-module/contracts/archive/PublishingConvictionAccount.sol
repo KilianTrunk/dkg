@@ -2,10 +2,10 @@
 
 pragma solidity ^0.8.20;
 
-import {INamed} from "./interfaces/INamed.sol";
-import {IVersioned} from "./interfaces/IVersioned.sol";
-import {IInitializable} from "./interfaces/IInitializable.sol";
-import {ContractStatus} from "./abstract/ContractStatus.sol";
+import {INamed} from "../interfaces/INamed.sol";
+import {IVersioned} from "../interfaces/IVersioned.sol";
+import {IInitializable} from "../interfaces/IInitializable.sol";
+import {ContractStatus} from "../abstract/ContractStatus.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**

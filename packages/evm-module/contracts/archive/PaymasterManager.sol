@@ -2,7 +2,7 @@
 
 pragma solidity ^0.8.20;
 
-import {Paymaster} from "../Paymaster.sol";
+import {Paymaster} from "./Paymaster.sol";
 import {ContractStatus} from "../abstract/ContractStatus.sol";
 import {INamed} from "../interfaces/INamed.sol";
 import {IVersioned} from "../interfaces/IVersioned.sol";

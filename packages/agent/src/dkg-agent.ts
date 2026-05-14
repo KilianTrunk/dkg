@@ -163,6 +163,10 @@ import {
 } from './agent-keystore.js';
 import { GossipPublishHandler } from './gossip-publish-handler.js';
 import { FinalizationHandler } from './finalization-handler.js';
+import {
+  JoinApprovalRetryQueue,
+  type JoinApprovalRetryEntry,
+} from './join-approval-retry-queue.js';
 import { multiaddr } from '@multiformats/multiaddr';
 import { buildCclPolicyQuads, buildPolicyApprovalQuads, buildPolicyRevocationQuads, hashCclPolicy, type CclPolicyRecord, type PolicyApprovalBinding } from './ccl-policy.js';
 import { CclEvaluator, parseCclPolicy, validateCclPolicy, type CclEvaluationResult, type CclFactTuple } from './ccl-evaluator.js';
@@ -516,6 +520,23 @@ const SYNC_RECONCILER_INTERVAL_MS = 5 * 60_000;
 const SYNC_STALENESS_THRESHOLD_MS = 10 * 60_000;
 const RANDOM_SAMPLING_BIND_RETRY_MS = 30_000;
 const STORAGE_ACK_REGISTRATION_RETRY_MS = 30_000;
+/**
+ * Period of the join-approval retry tick. The retry queue (see
+ * `packages/agent/src/join-approval-retry-queue.ts`) holds entries for
+ * `join-approved` notifications that the curator wrote locally but couldn't
+ * deliver over libp2p — usually because of a transient transport reset
+ * (`Remote closed connection during opening`, NAT mapping flap, the
+ * invitee's daemon restarting). Without retry the invitee gets stuck:
+ * the local curator state is correct but the invitee never learns to
+ * sync, and their own retries can't help because they don't yet hold the
+ * delegation that would let private-sync auth succeed. The tick walks the
+ * queue's `due()` entries with exponential backoff. Opportunistic retries
+ * also fire from `connection:open` when the invitee's peer reconnects,
+ * which usually wins the race; the timer is the safety net for cases
+ * where reconnect events are missed (e.g. relayed reconnects that don't
+ * surface a fresh `connection:open` on the curator).
+ */
+const JOIN_APPROVAL_RETRY_TICK_MS = 30_000;
 
 type RandomSamplingStartResult = 'started' | 'retryable' | 'disabled';
 type ACKSignerResolution = {
@@ -973,6 +994,17 @@ export class DKGAgent {
   private messageHandler: MessageHandler | null = null;
   private chainPoller: ChainEventPoller | null = null;
   private swmCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Retry queue for `join-approved` notifications whose libp2p delivery
+   * failed. See `JOIN_APPROVAL_RETRY_TICK_MS` for the design rationale
+   * and `join-approval-retry-queue.ts` for the queue semantics. The
+   * queue is in-memory; daemon restarts drop pending entries. Operators
+   * can re-trigger manually via `POST /api/context-graph/{id}/redeliver-approval`
+   * and the invitee's own re-submission of the join request is also
+   * handled idempotently by `approveJoinRequest`.
+   */
+  private readonly joinApprovalRetryQueue: JoinApprovalRetryQueue = new JoinApprovalRetryQueue();
+  private joinApprovalRetryTimer: ReturnType<typeof setInterval> | null = null;
   private randomSamplingHandle: RandomSamplingHandle | null = null;
   private randomSamplingBindRetryTimer: ReturnType<typeof setInterval> | null = null;
   private randomSamplingBindRetryInFlight = false;
@@ -2093,6 +2125,18 @@ export class DKGAgent {
     this.node.libp2p.addEventListener('connection:open', (evt) => {
       const remotePeer = evt.detail.remotePeer.toString();
       if (remotePeer === this.node.libp2p.peerId.toString()) return;
+      // Opportunistically flush any pending join-approval retries that
+      // were waiting for this peer to come back. Fires BEFORE the
+      // catch-up cooldown returns so a flaky-relay reconnect that
+      // happens twice in quick succession still gets two retry passes,
+      // which matches the catch-up handler's own per-connection
+      // semantics. Failures inside are swallowed and logged by the
+      // helper — the connection:open listener must not throw.
+      this.processJoinApprovalRetryQueueOnConnect(remotePeer).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Opportunistic join-approval retry on connect failed for ${remotePeer}: ${message}`);
+      });
+
       const now = Date.now();
       const last = this.catchupOnConnectAt.get(remotePeer) ?? 0;
       if (now - last < CATCHUP_ON_CONNECT_COOLDOWN_MS) return;
@@ -2202,6 +2246,18 @@ export class DKGAgent {
       });
     }, SYNC_RECONCILER_INTERVAL_MS);
     if (this.syncReconcilerTimer.unref) this.syncReconcilerTimer.unref();
+
+    // Periodic tick for the join-approval retry queue. See
+    // JOIN_APPROVAL_RETRY_TICK_MS for the rationale (transient transport
+    // resets used to silently lose approvals; this is the safety-net
+    // retry loop that turns them into eventual successes).
+    this.joinApprovalRetryTimer = setInterval(() => {
+      this.processJoinApprovalRetryQueueTick().catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Join-approval retry tick failed: ${message}`);
+      });
+    }, JOIN_APPROVAL_RETRY_TICK_MS);
+    if (this.joinApprovalRetryTimer.unref) this.joinApprovalRetryTimer.unref();
 
     // Wire V10 Random Sampling prover. Edge nodes no-op. Core nodes with
     // transient identity/RPC startup failures retry in the background so
@@ -8739,7 +8795,254 @@ export class DKGAgent {
       contextGraphId,
       agentAddress,
     });
-    return this.deliverPrivateJoinNotification(contextGraphId, agentAddress, payload, 'join-approval');
+    const result = await this.deliverPrivateJoinNotification(
+      contextGraphId,
+      agentAddress,
+      payload,
+      'join-approval',
+    );
+    if (result.delivered) {
+      // Successful delivery clears any pending retry from a prior failure
+      // (covers the "transport hiccup recovered on its own before the
+      // periodic tick fired" case).
+      this.joinApprovalRetryQueue.markDelivered(contextGraphId, agentAddress);
+      return;
+    }
+    // The transport-level failure path (`no target peer` is also covered:
+    // the peer may show up in discovery later or the invitee may
+    // re-submit the join request, both of which we want to retry into).
+    const entry = this.joinApprovalRetryQueue.enqueueFailure(
+      contextGraphId,
+      agentAddress,
+      result.error ?? 'unknown',
+      Date.now(),
+    );
+    const ctx = createOperationContext('system');
+    this.log.warn(
+      ctx,
+      `Queued join-approval retry #${entry.attempts} for "${contextGraphId}" → ${agentAddress} ` +
+        `(next attempt at ${new Date(entry.nextAttemptAt).toISOString()}, ` +
+        `firstFailureAt=${new Date(entry.firstFailureAt).toISOString()}, ` +
+        `lastError=${entry.lastError}). ` +
+        `Curator-local state is correct; retry will fire on the periodic tick ` +
+        `(every ${JOIN_APPROVAL_RETRY_TICK_MS / 1000}s) or opportunistically on the next ` +
+        `direct re-connect from the invitee's peer.`,
+    );
+  }
+
+  /**
+   * Re-fire the `join-approved` P2P notification for a previously-approved
+   * agent. Idempotent and safe to call multiple times; only the most recent
+   * delivery state matters.
+   *
+   * Used by:
+   *   * The periodic retry tick (`processJoinApprovalRetryQueueTick`),
+   *   * Opportunistic retry from `connection:open` when the invitee's peer
+   *     reconnects (`processJoinApprovalRetryQueueOnConnect`),
+   *   * The operator-facing route `POST /api/context-graph/{id}/redeliver-approval`,
+   *     which lets an operator (or peer agent via the chat MCP) re-poke
+   *     the curator when the automated retry isn't fast enough.
+   *
+   * Returns delivery details so the caller can surface them in HTTP
+   * responses / MCP tool output. Throws on caller errors (no approval row,
+   * malformed agent address) so the route handler can return a 4xx.
+   */
+  async redeliverJoinApproval(
+    contextGraphId: string,
+    agentAddress: string,
+    _callerAgentAddress?: string,
+  ): Promise<{
+    delivered: boolean;
+    peerId: string | null;
+    attempts: number;
+    error: string | null;
+  }> {
+    const ethAddrRe = /^0x[0-9a-fA-F]{40}$/;
+    if (!ethAddrRe.test(agentAddress)) {
+      throw new Error(`Invalid Ethereum address: "${agentAddress}".`);
+    }
+    const status = await this.getJoinRequestStatus(contextGraphId, agentAddress);
+    if (status !== 'approved') {
+      // We deliberately don't accept `pending` here. A pending request
+      // means the curator hasn't actually approved — re-firing a
+      // join-approved notification in that state would be a protocol
+      // violation. The caller should go through approveJoinRequest.
+      throw new Error(
+        `Cannot redeliver join-approval for "${contextGraphId}" → ${agentAddress}: ` +
+          `request status is "${status ?? 'none'}", expected "approved". ` +
+          `Approve the request first (or have the joiner re-submit if there is no record).`,
+      );
+    }
+    const payload = JSON.stringify({
+      type: 'join-approved',
+      contextGraphId,
+      agentAddress,
+    });
+    const result = await this.deliverPrivateJoinNotification(
+      contextGraphId,
+      agentAddress,
+      payload,
+      'join-approval',
+    );
+    if (result.delivered) {
+      this.joinApprovalRetryQueue.markDelivered(contextGraphId, agentAddress);
+      const existing = this.joinApprovalRetryQueue.getEntry(contextGraphId, agentAddress);
+      return {
+        delivered: true,
+        peerId: result.peerId,
+        // The successful attempt counts on top of any prior failures —
+        // `existing` is now undefined (we just removed it), so the caller
+        // sees attempts=N where N includes this final successful send.
+        attempts: (existing?.attempts ?? 0) + 1,
+        error: null,
+      };
+    }
+    const entry = this.joinApprovalRetryQueue.enqueueFailure(
+      contextGraphId,
+      agentAddress,
+      result.error ?? 'unknown',
+      Date.now(),
+    );
+    return {
+      delivered: false,
+      peerId: result.peerId,
+      attempts: entry.attempts,
+      error: result.error,
+    };
+  }
+
+  /**
+   * Read the `requestStatus` of a join request. Returns `'pending' |
+   * 'approved' | 'rejected'` or `null` if no row exists. Used by
+   * `redeliverJoinApproval` to validate the operator-driven re-fire
+   * path; not exported as a public method to avoid leaking the raw
+   * status string into other code paths (the dedicated `loadPending…`
+   * / `redeliver…` helpers are the supported API).
+   */
+  private async getJoinRequestStatus(
+    contextGraphId: string,
+    agentAddress: string,
+  ): Promise<'pending' | 'approved' | 'rejected' | null> {
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
+    const DKG = 'https://dkg.network/ontology#';
+    const result = await this.store.query(
+      `SELECT ?status WHERE {
+        GRAPH <${cgMetaGraph}> {
+          <${requestUri}> <${DKG}requestStatus> ?status .
+        }
+      } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return null;
+    const raw = result.bindings[0]['status'];
+    if (typeof raw !== 'string') return null;
+    const stripped = raw.replace(/^"|"$/g, '').replace(/"?\^\^.*$/, '');
+    if (stripped === 'pending' || stripped === 'approved' || stripped === 'rejected') {
+      return stripped;
+    }
+    return null;
+  }
+
+  /**
+   * Snapshot of pending approval retries. Surfaced via the daemon for
+   * operator-facing diagnostics ("how many approvals are stuck on
+   * transport, and how long since the first failure?"). Returns a shallow
+   * copy so callers can't mutate queue internals.
+   */
+  listPendingJoinApprovalRetries(): JoinApprovalRetryEntry[] {
+    return this.joinApprovalRetryQueue.list();
+  }
+
+  /**
+   * Periodic tick: walk the retry queue and fire `redeliverJoinApproval`
+   * for every entry whose `nextAttemptAt` has passed. Also evicts
+   * entries past their max age (24h since first failure by default).
+   * Failures re-enqueue with longer backoffs; successes clear the entry.
+   * Errors thrown by `redeliverJoinApproval` (e.g. the row went away
+   * because the curator manually cleaned it up) are caught and the
+   * entry is dropped to prevent the tick from spinning on a permanently
+   * unrecoverable target.
+   */
+  private async processJoinApprovalRetryQueueTick(): Promise<void> {
+    const ctx = createOperationContext('system');
+    const now = Date.now();
+    const expired = this.joinApprovalRetryQueue.dropExpired(now);
+    for (const entry of expired) {
+      this.log.warn(
+        ctx,
+        `Giving up on join-approval retry for "${entry.contextGraphId}" → ${entry.agentAddress} ` +
+          `after ${entry.attempts} attempt(s) over ${Math.round((now - entry.firstFailureAt) / 1000)}s; ` +
+          `lastError=${entry.lastError}. Operator can re-trigger via ` +
+          `POST /api/context-graph/{id}/redeliver-approval or have the joiner re-submit.`,
+      );
+    }
+    const due = this.joinApprovalRetryQueue.due(now);
+    if (due.length === 0) return;
+    this.log.info(
+      ctx,
+      `Processing ${due.length} due join-approval retry/retries`,
+    );
+    for (const entry of due) {
+      try {
+        await this.redeliverJoinApproval(entry.contextGraphId, entry.agentAddress);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        // The most common cause is "approval row no longer exists" —
+        // e.g. operator manually rejected after queueing, or the CG was
+        // deleted. Drop the entry rather than spinning on it forever.
+        this.log.warn(
+          ctx,
+          `Dropping retry for "${entry.contextGraphId}" → ${entry.agentAddress}: ${errMsg}`,
+        );
+        this.joinApprovalRetryQueue.markDelivered(entry.contextGraphId, entry.agentAddress);
+      }
+    }
+  }
+
+  /**
+   * Opportunistic retry from a `connection:open` event. When the
+   * invitee's peer reconnects, the periodic tick may be up to
+   * `JOIN_APPROVAL_RETRY_TICK_MS` away — much longer than necessary now
+   * that the transport is back. Fire any matching retries immediately.
+   *
+   * Matching is done by re-resolving each entry's target peer via the
+   * agent registry / remembered peer map, which is the same logic
+   * `deliverPrivateJoinNotification` uses. Per-tick cost scales with
+   * queue size, which is bounded in practice (typically < 20 entries)
+   * so the linear scan is acceptable.
+   */
+  private async processJoinApprovalRetryQueueOnConnect(remotePeerId: string): Promise<void> {
+    if (this.joinApprovalRetryQueue.size() === 0) return;
+    const ctx = createOperationContext('system');
+    const candidates = this.joinApprovalRetryQueue.list();
+    for (const entry of candidates) {
+      // Cheap pre-filter: skip entries whose remembered origin peer is
+      // known and does NOT match the connecting peer. Falls through to
+      // a full redeliver attempt (which re-resolves via the registry)
+      // for entries with no remembered peer, so a NAT-flipped peer ID
+      // still benefits.
+      const originKey = `${entry.contextGraphId}::${entry.agentAddress.toLowerCase()}`;
+      const remembered = this.joinRequestOriginPeers.get(originKey);
+      if (remembered && remembered !== remotePeerId) continue;
+      try {
+        const result = await this.redeliverJoinApproval(entry.contextGraphId, entry.agentAddress);
+        if (result.delivered) {
+          this.log.info(
+            ctx,
+            `Opportunistic redelivery succeeded for "${entry.contextGraphId}" → ${entry.agentAddress} ` +
+              `on reconnect from ${remotePeerId} (attempts=${result.attempts})`,
+          );
+        }
+      } catch (err) {
+        // Same drop-on-permanent-failure semantics as the periodic tick.
+        const errMsg = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          ctx,
+          `Dropping retry for "${entry.contextGraphId}" → ${entry.agentAddress} on reconnect: ${errMsg}`,
+        );
+        this.joinApprovalRetryQueue.markDelivered(entry.contextGraphId, entry.agentAddress);
+      }
+    }
   }
 
   /**
@@ -8793,7 +9096,13 @@ export class DKGAgent {
       contextGraphId,
       agentAddress,
     });
-    return this.deliverPrivateJoinNotification(contextGraphId, agentAddress, payload, 'join-rejection');
+    // Discard the result object — rejection deliveries don't enter the
+    // retry queue. The semantics are intentionally weaker than approval:
+    // if the rejection notification is lost the joiner observes silence,
+    // which they'll already treat as "still pending" and either re-poll
+    // or eventually time out. That's a much milder failure than a lost
+    // approval (which leaves a sync-blocked invitee with no recovery path).
+    await this.deliverPrivateJoinNotification(contextGraphId, agentAddress, payload, 'join-rejection');
   }
 
   /**
@@ -8824,7 +9133,7 @@ export class DKGAgent {
     agentAddress: string,
     payload: string,
     label: 'join-approval' | 'join-rejection',
-  ): Promise<void> {
+  ): Promise<{ delivered: boolean; peerId: string | null; error: string | null }> {
     const payloadBytes = new TextEncoder().encode(payload);
     const ctx = createOperationContext('system');
     const addrLower = agentAddress.toLowerCase();
@@ -8879,17 +9188,20 @@ export class DKGAgent {
     }
 
     if (!targetPeerId) {
+      const errMsg = `no origin peer remembered and agent not in local registry`;
       this.log.warn(
         ctx,
-        `Cannot deliver ${label} for "${contextGraphId}" to ${agentAddress} — no origin peer remembered and agent not in local registry. ` +
+        `Cannot deliver ${label} for "${contextGraphId}" to ${agentAddress} — ${errMsg}. ` +
           `Dropping notification (invitee will re-learn on next subscribe).`,
       );
-      return;
+      return { delivered: false, peerId: null, error: errMsg };
     }
 
     if (targetPeerId === this.peerId) {
       this.log.info(ctx, `Skipping ${label} to ${agentAddress}: target is this node`);
-      return;
+      // Self-loopback "delivery" is treated as success — there is no peer to
+      // retry against and the local state is authoritative anyway.
+      return { delivered: true, peerId: targetPeerId, error: null };
     }
 
     try {
@@ -8898,12 +9210,14 @@ export class DKGAgent {
       // The join request is finalised now — forget the origin peer so
       // the map doesn't grow unbounded over the curator's lifetime.
       this.joinRequestOriginPeers.delete(originKey);
+      return { delivered: true, peerId: targetPeerId, error: null };
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
       this.log.warn(
         ctx,
-        `Could not deliver ${label} for "${contextGraphId}" to ${agentAddress} (${targetPeerId}): ` +
-          (err instanceof Error ? err.message : String(err)),
+        `Could not deliver ${label} for "${contextGraphId}" to ${agentAddress} (${targetPeerId}): ${errMsg}`,
       );
+      return { delivered: false, peerId: targetPeerId, error: errMsg };
     }
   }
 
@@ -11942,6 +12256,14 @@ export class DKGAgent {
       clearInterval(this.syncReconcilerTimer);
       this.syncReconcilerTimer = null;
     }
+    if (this.joinApprovalRetryTimer) {
+      clearInterval(this.joinApprovalRetryTimer);
+      this.joinApprovalRetryTimer = null;
+    }
+    // Drop in-memory retry queue on shutdown; entries don't survive a
+    // restart (the operator can re-fire via the redeliver-approval route
+    // when needed).
+    this.joinApprovalRetryQueue.clear();
     this.clearRandomSamplingBindRetry();
     this.clearStorageACKRegistrationRetry();
     this.storageACKRegistrationRetryInFlight = false;

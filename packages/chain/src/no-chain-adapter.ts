@@ -34,9 +34,6 @@ export class NoChainAdapter implements ChainAdapter {
   async ensureProfile(_options?: { nodeName?: string; stakeAmount?: bigint; lockTier?: number }): Promise<bigint> { noChain(); }
   async reserveUALRange(_count: number): Promise<ReservedRange> { noChain(); }
   async batchMintKnowledgeAssets(_params: BatchMintParams): Promise<BatchMintResult> { noChain(); }
-  // Legacy V9 lifecycle parity stubs were archived in
-  // `archive-non-v10-contracts`. V10 callers route through
-  // `createKnowledgeAssetsV10` below.
   async *listenForEvents(_filter: EventFilter): AsyncIterable<ChainEvent> { noChain(); }
   async createContextGraph(_params: CreateContextGraphParams): Promise<TxResult> { noChain(); }
   async submitToContextGraph(_kcId: string, _contextGraphId: string): Promise<TxResult> { noChain(); }

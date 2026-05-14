@@ -3973,15 +3973,8 @@ export class DKGAgent {
    * as the PCA admin EOA for `addPCAAuthorizedKey` to succeed. Read-side
    * `isPCAAuthorizedKey` is permissionless on chain and works from any node.
    */
-  // V9 PCA write/read wrappers (createConvictionAccount / addConvictionFunds /
-  // addAuthorizedKey / isAuthorizedKey / getAccountInfo) were archived in
-  // `archive-non-v10-contracts` (issue 0004). The V10 NFT-backed PCA
-  // mutation surface (DKGPublishingConvictionNFT) has no SDK coverage yet
-  // — tracked as a §6 PRD followup. Until that lands, these wrappers
-  // return null and the daemon HTTP routes translate that to HTTP 503
-  // (FEATURE_UNAVAILABLE_503). Read-side PCA owner lookup
-  // (`getPublishingConvictionAccountOwner`) stays on the live adapter
-  // surface; see `getKnowledgeCollectionAuthor` for the read-side pattern.
+  // V10 NFT-backed PCA writes are not yet wired through the SDK; these
+  // wrappers return null and the daemon routes translate that to HTTP 503.
   async createPublishingConvictionAccount(
     _amount: bigint,
     _lockEpochs: number,

@@ -519,12 +519,6 @@ export interface ChainAdapter {
   // V9 batch minting
   batchMintKnowledgeAssets(params: BatchMintParams): Promise<BatchMintResult>;
 
-  // V9 single-tx publish, update, storage extension, and namespace
-  // transfer were archived in `archive-non-v10-contracts` — V10 callers
-  // route through `createKnowledgeAssetsV10` /
-  // `updateKnowledgeCollectionV10`. Source snapshot:
-  // `packages/chain/src/archive/evm-adapter-v8-v9-methods.ts`.
-
   /**
    * Recover a publish transaction by txHash and reconstruct its on-chain publish result.
    * Returns null when the tx is absent, pending, failed, or not a recognized publish tx.
@@ -565,12 +559,6 @@ export interface ChainAdapter {
   revealContextGraphMetadata?(contextGraphId: string, name: string, description: string): Promise<TxResult>;
   /** List context graphs from chain via `NameClaimed` events. Optional; not supported on no-chain/mock. */
   listContextGraphsFromChain?(fromBlock?: number): Promise<ContextGraphOnChain[]>;
-
-  // Publishing Conviction Account legacy V9 family — ARCHIVED in
-  // `archive-non-v10-contracts`. The V10 successor is the
-  // `DKGPublishingConvictionNFT` contract, reached via the read-side
-  // views below. Source snapshots preserved in
-  // `packages/chain/src/archive/evm-adapter-v8-v9-methods.ts`.
 
   /**
    * Live owner lookup for a PCA NFT — wraps `DKGPublishingConvictionNFT.ownerOf(accountId)`.
@@ -613,13 +601,6 @@ export interface ChainAdapter {
    * contract's PCA eligibility check fails the `==` constraint).
    */
   getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
-
-  // V9 permanent publish and V8 staking entry points were archived in
-  // `archive-non-v10-contracts`. V10 NFT-backed staking lives on
-  // `DKGStakingConvictionNFT.createConviction` — adapter coverage for the
-  // V10 NFT staking surface is tracked as a §6 followup (no current SDK
-  // method). Source snapshots:
-  // `packages/chain/src/archive/evm-adapter-v8-v9-methods.ts`.
 
   /**
    * Sign an arbitrary message hash using the node's primary operational key.

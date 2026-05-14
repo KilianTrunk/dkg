@@ -223,8 +223,6 @@ export class MockChainAdapter implements ChainAdapter {
     };
   }
 
-  // Legacy V9 single-tx publish mock stub archived (issue 0004).
-
   async resolvePublishByTxHash(txHash: string): Promise<OnChainPublishResult | null> {
     const created = this.events.find((event) =>
       (event.type === 'KCCreated' || event.type === 'KnowledgeBatchCreated') && event.data.txHash === txHash,
@@ -247,8 +245,6 @@ export class MockChainAdapter implements ChainAdapter {
     return 1n;
   }
 
-  // Legacy V9 permanent-publish mock stub archived (issue 0004).
-
   async verifyPublisherOwnsRange(
     publisherAddress: string,
     startKAId: bigint,
@@ -261,9 +257,6 @@ export class MockChainAdapter implements ChainAdapter {
     }
     return false;
   }
-
-  // Legacy V9 namespace-transfer + V9 update mock stubs archived
-  // (issue 0004). V10 update path is `updateKnowledgeCollectionV10` below.
 
   async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
     const existing = this.batches.get(params.kcId);
@@ -338,8 +331,6 @@ export class MockChainAdapter implements ChainAdapter {
       txIndex: typeof match.data.txIndex === 'number' ? match.data.txIndex : 0,
     };
   }
-
-  // Legacy V9 storage-extension mock stub archived (issue 0004).
 
   // --- V8 backward compatibility ---
 
@@ -431,12 +422,9 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   // --- Publishing Conviction Accounts ---
-  //
-  // Legacy V9 PCA mutation + read shapes were archived (issue 0004).
-  // The `convictionAccounts` map is retained so the V10 NFT-shaped
-  // `getPublishingConvictionAccountOwner` view (used by the daemon's
-  // curated-CG preflight) can still resolve PCA → owner without a live
-  // chain. Tests seed the map via `seedConvictionAccount` below.
+  // `convictionAccounts` is retained so the V10 NFT-shaped
+  // `getPublishingConvictionAccountOwner` view can resolve PCA → owner
+  // without a live chain. Tests seed via `seedConvictionAccount` below.
 
   private convictionAccounts = new Map<bigint, {
     admin: string;
@@ -498,12 +486,6 @@ export class MockChainAdapter implements ChainAdapter {
     }
     return ethers.getAddress(acct.admin);
   }
-
-  // --- Staking Conviction ---
-  //
-  // Legacy V8 staking mock stubs archived (issue 0004). V10 NFT-backed
-  // staking (`DKGStakingConvictionNFT.createConviction`) has no SDK
-  // surface yet — tracked as a §6 followup of the PRD.
 
   // --- On-Chain Context Graphs (ContextGraphs contract) ---
 
@@ -796,12 +778,9 @@ export class MockChainAdapter implements ChainAdapter {
       );
     }
 
-    // The legacy V9 single-tx publish helper was archived (issue 0004);
-    // inline a minimal mock publish that satisfies the V9-shape
-    // `OnChainPublishResult` contract callers expect on this path AND
-    // emits the same `KnowledgeBatchCreated` / `KCCreated` events the
-    // archived helper produced — `resolvePublishByTxHash` and the
-    // ChainEventPoller / WAL consumers walk those events by txHash.
+    // Mock publish: emits KnowledgeBatchCreated + KCCreated so
+    // resolvePublishByTxHash and ChainEventPoller / WAL consumers can
+    // walk events by txHash.
     if (params.receiverSignatures.length < this.minimumRequiredSignatures) {
       throw new Error('MinSignaturesRequirementNotMet');
     }

@@ -656,14 +656,8 @@ export class EVMChainAdapter implements ChainAdapter {
       // Older deployments without the relay registry surface.
     }
 
-    // V8 legacy contracts.
-    // `KnowledgeCollection` (V8) is archived (PRD §4.1, deploy script 026
-    // moved under deploy/archive). The V8 method entry points that read
-    // `this.contracts.knowledgeCollection` are scheduled for excision in
-    // issue 0004; tolerate the missing Hub binding here so init() doesn't
-    // throw on a V10-only deploy. `KnowledgeCollectionStorage` remains
-    // active (deploy script 011 still in the active set) so leave it as a
-    // hard requirement.
+    // V8 KnowledgeCollection is archived; tolerate missing Hub binding.
+    // KnowledgeCollectionStorage remains active and is required.
     try {
       this.contracts.knowledgeCollection = await this.resolveContract('KnowledgeCollection');
     } catch {
@@ -991,10 +985,6 @@ export class EVMChainAdapter implements ChainAdapter {
     };
   }
 
-  // Legacy V9 single-tx publish + V9 update entry points were archived
-  // (issue 0004). Source snapshot lives at
-  // `src/archive/evm-adapter-v8-v9-methods.ts`.
-
   // =====================================================================
   // V9: Update Verification (for gossip receivers)
   // =====================================================================
@@ -1071,10 +1061,6 @@ export class EVMChainAdapter implements ChainAdapter {
       return { verified: false };
     }
   }
-
-  // Legacy V9 storage-extension and namespace-transfer entry points
-  // were archived (issue 0004). Source snapshot:
-  // `src/archive/evm-adapter-v8-v9-methods.ts`.
 
   async getRequiredPublishTokenAmount(publicByteSize: bigint, epochs: number): Promise<bigint> {
     await this.init();
@@ -2147,19 +2133,6 @@ export class EVMChainAdapter implements ChainAdapter {
 
   // =====================================================================
   // Staking + Publishing Conviction Account legacy surface — ARCHIVED
-  // =====================================================================
-  // The legacy V8 staking entry points and the legacy V9 PCA mutation
-  // and read shapes were archived (issue 0004). The V10 successors
-  // live elsewhere on this class:
-  //
-  //   - V10 NFT-backed staking: `DKGStakingConvictionNFT.createConviction`
-  //     is tracked as a PRD §6 followup (no current SDK method).
-  //   - V10 NFT-backed PCA: `DKGPublishingConvictionNFT` is reachable via
-  //     `getPublishingConvictionAccountOwner` / `getConvictionAgentAccountId`
-  //     / `getConvictionAccountLockDurationEpochs` (retained below).
-  //
-  // Source snapshots: `src/archive/evm-adapter-v8-v9-methods.ts`.
-
   /**
    * Reverse-resolve a wallet to its V10 PCA account id, or `0n` if the
    * wallet is not registered as a publishing agent. Mirrors the
@@ -2206,13 +2179,6 @@ export class EVMChainAdapter implements ChainAdapter {
       throw err;
     }
   }
-
-  // The legacy V9 PCA read shapes were archived (issue 0004); the V10
-  // NFT-backed successor lives on `DKGPublishingConvictionNFT`. The
-  // `getPublishingConvictionAccountOwner` view below stays because it
-  // wraps `DKGPublishingConvictionNFT.ownerOf`, which the daemon's
-  // PCA-curated CG preflight uses to enforce the "PCA-curated CG =
-  // PCA owner only" project-memory rule.
 
   async getPublishingConvictionAccountOwner(accountId: bigint): Promise<string> {
     await this.init();
@@ -2377,10 +2343,6 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     return this.resolveContract(name);
   }
-
-  // ===== Permanent Publishing =====
-  // The legacy V9 permanent-publish entry point was archived (issue 0004).
-  // Source snapshot: `src/archive/evm-adapter-v8-v9-methods.ts`.
 
   // =====================================================================
   // Random Sampling (V10 RandomSampling.sol)

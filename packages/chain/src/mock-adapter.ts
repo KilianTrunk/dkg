@@ -86,7 +86,7 @@ export class MockChainAdapter implements ChainAdapter {
   /** Publisher addresses this mock is explicitly allowed to attribute V10 publishes to. */
   private allowedPublisherAddresses: Set<string>;
 
-  /** Configurable minimum receiver signatures. When > 0, publishKnowledgeAssets will check the count. Default: 1. */
+  /** Configurable minimum receiver signatures. When > 0, the V9 publish-shim path will check the count. Default: 1. */
   minimumRequiredSignatures = 1;
 
   // RFC 04 v0.3 / Issue #461 — in-memory mirror of ProfileStorage's
@@ -223,9 +223,7 @@ export class MockChainAdapter implements ChainAdapter {
     };
   }
 
-  // V9 `publishKnowledgeAssets` mock-adapter stub was archived in
-  // `archive-non-v10-contracts`. V10 publishes route through
-  // `createKnowledgeAssetsV10`.
+  // Legacy V9 single-tx publish mock stub archived (issue 0004).
 
   async resolvePublishByTxHash(txHash: string): Promise<OnChainPublishResult | null> {
     const created = this.events.find((event) =>
@@ -249,7 +247,7 @@ export class MockChainAdapter implements ChainAdapter {
     return 1n;
   }
 
-  // V9 `publishKnowledgeAssetsPermanent` mock-adapter stub archived.
+  // Legacy V9 permanent-publish mock stub archived (issue 0004).
 
   async verifyPublisherOwnsRange(
     publisherAddress: string,
@@ -264,9 +262,8 @@ export class MockChainAdapter implements ChainAdapter {
     return false;
   }
 
-  // V9 `transferNamespace` and `updateKnowledgeAssets` mock-adapter stubs
-  // archived in `archive-non-v10-contracts`. V10 update path lives on
-  // `updateKnowledgeCollectionV10` below.
+  // Legacy V9 namespace-transfer + V9 update mock stubs archived
+  // (issue 0004). V10 update path is `updateKnowledgeCollectionV10` below.
 
   async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
     const existing = this.batches.get(params.kcId);
@@ -342,7 +339,7 @@ export class MockChainAdapter implements ChainAdapter {
     };
   }
 
-  // V9 `extendStorage` mock-adapter stub archived.
+  // Legacy V9 storage-extension mock stub archived (issue 0004).
 
   // --- V8 backward compatibility ---
 
@@ -435,14 +432,11 @@ export class MockChainAdapter implements ChainAdapter {
 
   // --- Publishing Conviction Accounts ---
   //
-  // The V9 PCA family (`createConvictionAccount`, `addConvictionFunds`,
-  // `extendConvictionLock`, `addPCAAuthorizedKey`, `isPCAAuthorizedKey`,
-  // `getConvictionDiscount`, `getConvictionAccountInfo`) was archived in
-  // `archive-non-v10-contracts`. The `convictionAccounts` map is retained
-  // so the V10 NFT-shaped `getPublishingConvictionAccountOwner` view
-  // (used by the daemon's curated-CG preflight) can still resolve
-  // PCA → owner without a live chain. Tests that need to seed the map
-  // do so via `seedConvictionAccount` below.
+  // Legacy V9 PCA mutation + read shapes were archived (issue 0004).
+  // The `convictionAccounts` map is retained so the V10 NFT-shaped
+  // `getPublishingConvictionAccountOwner` view (used by the daemon's
+  // curated-CG preflight) can still resolve PCA → owner without a live
+  // chain. Tests seed the map via `seedConvictionAccount` below.
 
   private convictionAccounts = new Map<bigint, {
     admin: string;
@@ -507,10 +501,9 @@ export class MockChainAdapter implements ChainAdapter {
 
   // --- Staking Conviction ---
   //
-  // V8 `stakeWithLock` / `stakeWithLockTier` / `getDelegatorConvictionMultiplier`
-  // mock stubs were archived in `archive-non-v10-contracts`. V10 NFT-backed
-  // staking (`DKGStakingConvictionNFT.createConviction`) has no SDK surface
-  // yet — tracked as a §6 followup of the PRD.
+  // Legacy V8 staking mock stubs archived (issue 0004). V10 NFT-backed
+  // staking (`DKGStakingConvictionNFT.createConviction`) has no SDK
+  // surface yet — tracked as a §6 followup of the PRD.
 
   // --- On-Chain Context Graphs (ContextGraphs contract) ---
 
@@ -803,10 +796,9 @@ export class MockChainAdapter implements ChainAdapter {
       );
     }
 
-    // V9 `publishKnowledgeAssets` was archived in `archive-non-v10-contracts`.
-    // Inline a minimal mock publish that mirrors what the archived helper
-    // produced — enough to satisfy the V9-shape `OnChainPublishResult`
-    // contract callers expect from this path.
+    // The legacy V9 single-tx publish helper was archived (issue 0004);
+    // inline a minimal mock publish that satisfies the V9-shape
+    // `OnChainPublishResult` contract callers expect on this path.
     if (params.receiverSignatures.length < this.minimumRequiredSignatures) {
       throw new Error('MinSignaturesRequirementNotMet');
     }

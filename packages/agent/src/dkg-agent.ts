@@ -3973,43 +3973,41 @@ export class DKGAgent {
    * as the PCA admin EOA for `addPCAAuthorizedKey` to succeed. Read-side
    * `isPCAAuthorizedKey` is permissionless on chain and works from any node.
    */
+  // V9 PCA write/read wrappers (createConvictionAccount / addConvictionFunds /
+  // addAuthorizedKey / isAuthorizedKey / getAccountInfo) were archived in
+  // `archive-non-v10-contracts` (issue 0004). The V10 NFT-backed PCA
+  // mutation surface (DKGPublishingConvictionNFT) has no SDK coverage yet
+  // — tracked as a §6 PRD followup. Until that lands, these wrappers
+  // return null and the daemon HTTP routes translate that to HTTP 503
+  // (FEATURE_UNAVAILABLE_503). Read-side PCA owner lookup
+  // (`getPublishingConvictionAccountOwner`) stays on the live adapter
+  // surface; see `getKnowledgeCollectionAuthor` for the read-side pattern.
   async createPublishingConvictionAccount(
-    amount: bigint,
-    lockEpochs: number,
+    _amount: bigint,
+    _lockEpochs: number,
   ): Promise<{ accountId: bigint; txHash: string; blockNumber: number } | null> {
-    if (typeof this.chain.createConvictionAccount !== 'function') return null;
-    const result = await this.chain.createConvictionAccount(amount, lockEpochs);
-    return {
-      accountId: result.accountId,
-      txHash: result.hash,
-      blockNumber: result.blockNumber,
-    };
+    return null;
   }
 
   async addPublishingConvictionAccountFunds(
-    accountId: bigint,
-    amount: bigint,
+    _accountId: bigint,
+    _amount: bigint,
   ): Promise<{ txHash: string; blockNumber: number } | null> {
-    if (typeof this.chain.addConvictionFunds !== 'function') return null;
-    const result = await this.chain.addConvictionFunds(accountId, amount);
-    return { txHash: result.hash, blockNumber: result.blockNumber };
+    return null;
   }
 
   async addPCAAuthorizedKey(
-    accountId: bigint,
-    key: string,
+    _accountId: bigint,
+    _key: string,
   ): Promise<{ txHash: string; blockNumber: number } | null> {
-    if (typeof this.chain.addPCAAuthorizedKey !== 'function') return null;
-    const result = await this.chain.addPCAAuthorizedKey(accountId, key);
-    return { txHash: result.hash, blockNumber: result.blockNumber };
+    return null;
   }
 
-  async isPCAAuthorizedKey(accountId: bigint, key: string): Promise<boolean | null> {
-    if (typeof this.chain.isPCAAuthorizedKey !== 'function') return null;
-    return this.chain.isPCAAuthorizedKey(accountId, key);
+  async isPCAAuthorizedKey(_accountId: bigint, _key: string): Promise<boolean | null> {
+    return null;
   }
 
-  async getPublishingConvictionAccountInfo(accountId: bigint): Promise<{
+  async getPublishingConvictionAccountInfo(_accountId: bigint): Promise<{
     accountId: bigint;
     admin: string;
     balance: bigint;
@@ -4018,8 +4016,7 @@ export class DKGAgent {
     conviction: bigint;
     discountBps: number;
   } | null> {
-    if (typeof this.chain.getConvictionAccountInfo !== 'function') return null;
-    return this.chain.getConvictionAccountInfo(accountId);
+    return null;
   }
 
   // ---------------------------------------------------------------------------

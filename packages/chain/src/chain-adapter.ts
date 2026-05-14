@@ -566,16 +566,10 @@ export interface ChainAdapter {
   /** List context graphs from chain via `NameClaimed` events. Optional; not supported on no-chain/mock. */
   listContextGraphsFromChain?(fromBlock?: number): Promise<ContextGraphOnChain[]>;
 
-  // Publishing Conviction Accounts (V9 family) — ARCHIVED in
+  // Publishing Conviction Account legacy V9 family — ARCHIVED in
   // `archive-non-v10-contracts`. The V10 successor is the
-  // `DKGPublishingConvictionNFT` contract, reached via
-  // `getPublishingConvictionAccountOwner` /
-  // `getConvictionAgentAccountId` /
-  // `getConvictionAccountLockDurationEpochs` below. The legacy V9
-  // shapes (`createConvictionAccount`, `addConvictionFunds`,
-  // `extendConvictionLock`, `getConvictionDiscount`,
-  // `getConvictionAccountInfo`, `addPCAAuthorizedKey`,
-  // `isPCAAuthorizedKey`) are preserved in
+  // `DKGPublishingConvictionNFT` contract, reached via the read-side
+  // views below. Source snapshots preserved in
   // `packages/chain/src/archive/evm-adapter-v8-v9-methods.ts`.
 
   /**
@@ -620,13 +614,11 @@ export interface ChainAdapter {
    */
   getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
 
-  // Permanent Publishing (V9 `batchMintKnowledgeAssetsPermanent`) and
-  // V8 staking entry points (`stakeWithLock`, `stakeWithLockTier`,
-  // `getDelegatorConvictionMultiplier`) were archived in
+  // V9 permanent publish and V8 staking entry points were archived in
   // `archive-non-v10-contracts`. V10 NFT-backed staking lives on
   // `DKGStakingConvictionNFT.createConviction` — adapter coverage for the
   // V10 NFT staking surface is tracked as a §6 followup (no current SDK
-  // method). Snapshots:
+  // method). Source snapshots:
   // `packages/chain/src/archive/evm-adapter-v8-v9-methods.ts`.
 
   /**

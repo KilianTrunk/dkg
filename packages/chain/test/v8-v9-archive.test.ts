@@ -114,6 +114,20 @@ describe('V8/V9 archive — ChainAdapter interface is clean', () => {
   }
 });
 
+describe('V8/V9 archive — chain/src files contain no archived names', () => {
+  const SRC_DIR = join(import.meta.dirname, '..', 'src');
+  const FILES = ['evm-adapter.ts', 'mock-adapter.ts', 'no-chain-adapter.ts', 'chain-adapter.ts'];
+  for (const file of FILES) {
+    const src = readFileSync(join(SRC_DIR, file), 'utf8');
+    for (const name of ARCHIVED_METHODS) {
+      it(`src/${file} contains no occurrence of "${name}" (signature, call, or comment)`, () => {
+        const re = new RegExp(`\\b${name}\\b`);
+        expect(src).not.toMatch(re);
+      });
+    }
+  }
+});
+
 describe('V8/V9 archive — source snapshot is preserved on disk', () => {
   it('packages/chain/src/archive/ exists with at least one archived module', () => {
     const archiveDir = join(import.meta.dirname, '..', 'src', 'archive');

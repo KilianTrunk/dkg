@@ -935,12 +935,21 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
         timeoutMs: timeoutMs ? Number(timeoutMs) : undefined,
         requiredSignatures: validatedRequiredSigs,
       });
-      emitMemoryGraphChanged?.({
-        contextGraphId,
-        layers: ["vm"],
-        operation: "verified_memory_updated",
-        source: "api",
-      });
+      if (result.status === "verified") {
+        emitMemoryGraphChanged?.({
+          contextGraphId,
+          layers: ["vm"],
+          operation: "verified_memory_updated",
+          source: "api",
+        });
+      } else if (result.status === "partial") {
+        emitMemoryGraphChanged?.({
+          contextGraphId,
+          layers: ["wm"],
+          operation: "trust_metadata_updated",
+          source: "api",
+        });
+      }
       return jsonResponse(res, 200, { ...result, batchId: String(batchId) });
     } catch (err) {
       // CLI-9 dup #158 #159: a non-existent (cgId, vmId, batchId)
@@ -1008,16 +1017,24 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
           `The endorser is resolved from the bearer token; omit body.agentAddress or use the matching agent's token.`,
       });
     }
-    const result = await agent.endorse({
-      contextGraphId,
-      knowledgeAssetUal: ual,
-      agentAddress: requestAgentAddress,
-    });
-    return jsonResponse(res, 200, {
-      endorsed: true,
-      endorserAddress: requestAgentAddress,
-      ...result,
-    });
+    try {
+      const result = await agent.endorse({
+        contextGraphId,
+        knowledgeAssetUal: ual,
+        agentAddress: requestAgentAddress,
+      });
+      return jsonResponse(res, 200, {
+        endorsed: true,
+        endorserAddress: requestAgentAddress,
+        ...result,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('Endorsement target') && msg.includes('not found')) {
+        return jsonResponse(res, 404, { error: msg });
+      }
+      throw err;
+    }
   }
 
   // POST /api/ccl/policy/publish

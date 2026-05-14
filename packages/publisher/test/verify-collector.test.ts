@@ -60,6 +60,8 @@ describe('VerifyCollector', () => {
     expect(result.approvals).toHaveLength(1);
     expect(result.contextGraphId).toBe('test-cg');
     expect(result.verifiedMemoryId).toBe(1n);
+    expect(result.requiredRemoteApprovals).toBe(1);
+    expect(result.quorumReached).toBe(true);
   });
 
   it('throws when not enough peers are connected', async () => {
@@ -98,5 +100,29 @@ describe('VerifyCollector', () => {
       requiredSignatures: 2, // needs 1 remote, but 0 peers → error
       timeoutMs: 1000,
     })).rejects.toThrow('verify_no_peers');
+  });
+
+  it('returns no-quorum metadata instead of throwing when partial collection is allowed and no peers are connected', async () => {
+    const collector = new VerifyCollector({
+      sendP2P: async () => new Uint8Array(0),
+      getParticipantPeers: () => [],
+    });
+
+    const result = await collector.collect({
+      contextGraphId: 'test-cg',
+      contextGraphIdOnChain: 42n,
+      verifiedMemoryId: 1n,
+      batchId: 100n,
+      merkleRoot: new Uint8Array(32),
+      entities: [],
+      proposerSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      requiredSignatures: 2,
+      timeoutMs: 1000,
+      allowPartial: true,
+    });
+
+    expect(result.approvals).toEqual([]);
+    expect(result.requiredRemoteApprovals).toBe(1);
+    expect(result.quorumReached).toBe(false);
   });
 });

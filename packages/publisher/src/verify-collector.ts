@@ -28,6 +28,8 @@ export interface VerifyCollectionResult {
   merkleRoot: Uint8Array;
   contextGraphId: string;
   verifiedMemoryId: bigint;
+  requiredRemoteApprovals: number;
+  quorumReached: boolean;
 }
 
 const MAX_RETRIES = 2;
@@ -58,11 +60,12 @@ export class VerifyCollector {
     proposerSignature: { r: Uint8Array; vs: Uint8Array };
     requiredSignatures: number;
     timeoutMs: number;
+    allowPartial?: boolean;
   }): Promise<VerifyCollectionResult> {
     const {
       contextGraphId, contextGraphIdOnChain, verifiedMemoryId,
       batchId, merkleRoot, entities, proposerSignature,
-      requiredSignatures, timeoutMs,
+      requiredSignatures, timeoutMs, allowPartial = false,
     } = params;
 
     const log = this.deps.log ?? (() => {});
@@ -92,9 +95,19 @@ export class VerifyCollector {
 
     const peers = this.deps.getParticipantPeers(contextGraphId);
     if (remoteRequired > 0 && peers.length === 0) {
+      if (allowPartial) {
+        return {
+          approvals: [],
+          merkleRoot,
+          contextGraphId,
+          verifiedMemoryId,
+          requiredRemoteApprovals: remoteRequired,
+          quorumReached: false,
+        };
+      }
       throw new Error('verify_no_peers: no participant peers connected');
     }
-    if (peers.length < remoteRequired) {
+    if (peers.length < remoteRequired && !allowPartial) {
       throw new Error(
         `verify_insufficient_peers: need ${remoteRequired} remote approvals but only ${peers.length} participants connected`,
       );
@@ -103,7 +116,14 @@ export class VerifyCollector {
     // Self-sign only (1-of-1): return immediately, no remote collection needed
     if (remoteRequired === 0) {
       log(`[VerifyCollector] Self-sign mode (1-of-1) — no remote approvals needed`);
-      return { approvals: [], merkleRoot, contextGraphId, verifiedMemoryId };
+      return {
+        approvals: [],
+        merkleRoot,
+        contextGraphId,
+        verifiedMemoryId,
+        requiredRemoteApprovals: 0,
+        quorumReached: true,
+      };
     }
 
     log(`[VerifyCollector] Requesting approvals from ${peers.length} participants (need ${remoteRequired} remote, ${requiredSignatures} total)`);
@@ -151,41 +171,53 @@ export class VerifyCollector {
     let quorumResolve: (() => void) | undefined;
     const quorumPromise = new Promise<void>(resolve => { quorumResolve = resolve; });
 
-    await Promise.race([
-      (async () => {
-        const promises = peers.map(async (peerId) => {
-          if (collected.length >= remoteRequired) return;
-          const approval = await requestApproval(peerId);
-          if (approval && !seenAddresses.has(approval.approverAddress)) {
-            seenAddresses.add(approval.approverAddress);
-            collected.push(approval);
-            if (collected.length >= remoteRequired) {
-              quorumResolve?.();
+    try {
+      await Promise.race([
+        (async () => {
+          const promises = peers.map(async (peerId) => {
+            if (collected.length >= remoteRequired) return;
+            const approval = await requestApproval(peerId);
+            if (approval && !seenAddresses.has(approval.approverAddress)) {
+              seenAddresses.add(approval.approverAddress);
+              collected.push(approval);
+              if (collected.length >= remoteRequired) {
+                quorumResolve?.();
+              }
             }
-          }
-        });
-        await Promise.race([Promise.allSettled(promises), quorumPromise]);
-      })(),
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`verify_timeout: ${collected.length}/${remoteRequired} remote approvals within ${timeoutMs}ms`)),
-          timeoutMs,
+          });
+          await Promise.race([Promise.allSettled(promises), quorumPromise]);
+        })(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`verify_timeout: ${collected.length}/${remoteRequired} remote approvals within ${timeoutMs}ms`)),
+            timeoutMs,
+          ),
         ),
-      ),
-    ]);
+      ]);
+    } catch (err) {
+      if (!allowPartial) throw err;
+      log(`[VerifyCollector] Partial verify collection: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
-    if (collected.length < remoteRequired) {
+    if (collected.length < remoteRequired && !allowPartial) {
       throw new Error(
         `verify_insufficient: got ${collected.length}/${remoteRequired} valid remote approvals from ${peers.length} participants`,
       );
     }
 
-    log(`[VerifyCollector] Collected ${collected.length} approvals — quorum reached`);
+    const quorumReached = collected.length >= remoteRequired;
+    log(
+      quorumReached
+        ? `[VerifyCollector] Collected ${collected.length} approvals — quorum reached`
+        : `[VerifyCollector] Collected ${collected.length}/${remoteRequired} approvals — quorum not reached`,
+    );
     return {
       approvals: collected.slice(0, remoteRequired),
       merkleRoot,
       contextGraphId,
       verifiedMemoryId,
+      requiredRemoteApprovals: remoteRequired,
+      quorumReached,
     };
   }
 

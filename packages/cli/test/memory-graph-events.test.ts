@@ -381,7 +381,7 @@ describe('daemon memory_graph_changed route emissions', () => {
 
   it('emits VM refresh events after verified-memory verification', async () => {
     const emitMemoryGraphChanged = vi.fn();
-    const verify = vi.fn().mockResolvedValue({ verified: true });
+    const verify = vi.fn().mockResolvedValue({ verified: true, status: 'verified' });
     const ctx = createContext('/api/verify', {
       contextGraphId: 'project-a',
       verifiedMemoryId: 'vm-1',

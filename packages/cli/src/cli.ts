@@ -945,9 +945,17 @@ program
         timeoutMs: opts.timeout ? Number(opts.timeout) : undefined,
         requiredSignatures: opts.requiredSignatures ? Number(opts.requiredSignatures) : undefined,
       });
-      console.log(`Verified batch ${batchId} → _verified_memory/${result.verifiedMemoryId}`);
-      console.log(`  TX: ${result.txHash}`);
-      console.log(`  Block: ${result.blockNumber}`);
+      if (result.status === 'verified' || result.txHash) {
+        console.log(`Verified batch ${batchId} → _verified_memory/${result.verifiedMemoryId}`);
+        console.log(`  TX: ${result.txHash}`);
+        console.log(`  Block: ${result.blockNumber}`);
+      } else if (result.status === 'partial') {
+        console.log(`Partially verified batch ${batchId} (no chain tx)`);
+        console.log(`  Trust: ${result.trustLevel}`);
+      } else {
+        console.log(`Verification did not reach quorum for batch ${batchId} (no chain tx)`);
+        console.log(`  Trust: ${result.trustLevel ?? 'self-attested'}`);
+      }
       console.log(`  Signers: ${result.signers.join(', ')}`);
     } catch (err) {
       console.error(`Verify failed: ${err instanceof Error ? err.message : String(err)}`);

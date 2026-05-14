@@ -31,3 +31,8 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
 export default func;
 func.tags = ['DelegatorsInfo'];
 func.dependencies = ['Hub'];
+
+// Archived per PRD §4.1 (V8/V9 contract stack retired in V10).
+// hardhat-deploy still discovers this file via recursive scan of paths.deploy;
+// func.skip guarantees the deployment step is a no-op.
+func.skip = async () => true;

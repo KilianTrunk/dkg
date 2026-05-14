@@ -93,4 +93,13 @@ config.contractSizer = {
   except: [],
 };
 
+// Pin deploy roots so hardhat-deploy does NOT pick up scripts under
+// deploy/archive/ (V8/V9 legacy stack archived per PRD §4.1). Also pinned
+// in hardhat.node.config.ts; restated here so a paths.deploy grep across
+// both configs surfaces the explicit single-root form.
+config.paths = {
+  ...(config.paths ?? {}),
+  deploy: ['deploy'],
+};
+
 export default config;

@@ -109,6 +109,9 @@ const config: HardhatUserConfig = {
     tests: './test',
     cache: './cache',
     artifacts: './artifacts',
+    // Pin deploy roots so hardhat-deploy does NOT pick up scripts under
+    // deploy/archive/ (V8/V9 legacy stack archived per PRD §4.1).
+    deploy: ['deploy'],
   },
 };
 

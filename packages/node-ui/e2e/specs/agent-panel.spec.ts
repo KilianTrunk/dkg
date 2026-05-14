@@ -433,4 +433,27 @@ test.describe('Right Panel (Agent Panel)', () => {
       expect(svgCount).toBeGreaterThanOrEqual(1);
     });
   });
+
+  // ─── PR3: Markdown rendering (react-markdown + remark-gfm + shiki) ────
+  //
+  // The four PR3 e2e checks that lived here (rendersTable, codeBlockCopy,
+  // linkOpensExternal, scriptSanitized) silently skipped when daemon-seeded
+  // chat content was absent, which is the common CI case — Codex CHBiK
+  // flagged that as misleading coverage. Removed.
+  //
+  // Coverage is now exclusively in the deterministic unit suites which
+  // exercise the same rendering paths against a real DOM via happy-dom:
+  //   - test/markdown-message.test.ts   (22 tests: GFM tables, blockquote,
+  //                                      task lists, links rel/target, img
+  //                                      placeholder, script sanitization,
+  //                                      lazy-shiki gate, fenced-block
+  //                                      detection inc. unlabelled, inert
+  //                                      relative-href, `node` prop guard)
+  //   - test/code-block.test.ts         (10 tests: shiki render, plaintext
+  //                                      fallback, copy button + clipboard,
+  //                                      language alias map)
+  //
+  // Re-add real-browser e2e checks here when a deterministic markdown
+  // fixture route is available (e.g. a `/test-harness/markdown` page that
+  // mounts MarkdownMessage with a known input).
 });

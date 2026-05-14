@@ -99,7 +99,7 @@ export const sel = {
     // PR2 composer (TextareaAutosize + lucide icons + react-dropzone)
     composerShell: '.v10-local-agent-composer-shell',
     composerAttach: '.v10-composer-attach',
-    composerToolbar: '.v10-composer-toolbar',
+    composerControls: '.v10-composer-controls',
     composerTarget: '.v10-composer-target',
     sendBtnInline: '.v10-local-agent-inline-send',
     sendBtnAria: 'button[aria-label="Send message"]',
@@ -111,6 +111,19 @@ export const sel = {
     dropOverlay: '.v10-drop-overlay',
     dropOverlayAccept: '.v10-drop-overlay.active.accept',
     dropOverlayRefuse: '.v10-drop-overlay.active.refuse',
+    // PR3 markdown rendering (react-markdown + remark-gfm + shiki)
+    markdownRoot: '.v10-md',
+    markdownParagraph: '.v10-md-p',
+    markdownLink: 'a.v10-md-link',
+    markdownInlineCode: 'code.v10-md-code',
+    markdownTable: '.v10-md-table',
+    markdownTableScroll: '.v10-md-table-scroll',
+    markdownBlockquote: 'blockquote.v10-md-blockquote',
+    markdownPre: '.v10-md-pre',
+    markdownPreFallback: '.v10-md-pre-fallback',
+    markdownPreRendered: '.v10-md-pre-rendered',
+    markdownCopy: '.v10-md-copy',
+    markdownCopyAnnounce: '.v10-md-copy-announce',
   },
 
   dashboard: {

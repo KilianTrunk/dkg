@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react';
 import { useJourneyStore } from '../../stores/journey.js';
 import { useProjectsStore, type ContextGraph } from '../../stores/projects.js';
 import {
@@ -26,8 +26,9 @@ import {
 import { api } from '../../api-wrapper.js';
 import TextareaAutosize from 'react-textarea-autosize';
 import { useDropzone } from 'react-dropzone';
-import { ArrowUp, Ban, ChevronDown, MoreHorizontal, Paperclip, Upload, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Ban, ChevronDown, ChevronRight, Folder, MoreHorizontal, Paperclip, Upload, X } from 'lucide-react';
 import { Select } from '../common/Select.js';
+import { MarkdownMessage } from '../chat/MarkdownMessage.js';
 
 export interface LocalAgentMessage {
   id: string;
@@ -38,6 +39,18 @@ export interface LocalAgentMessage {
   ts?: string;
   streaming?: boolean;
   attachments?: LocalAgentChatAttachmentRef[];
+  /**
+   * True when `content` is locally synthesized by the UI (e.g. an
+   * attachment summary fallback from `mapHistoryMessage`, or a local
+   * error/cancel string), NOT real agent-authored markdown. The chat
+   * bubble renderer treats these as literal text — synthesized strings
+   * embed raw filenames / error details that may contain markdown
+   * metacharacters or absolute URLs, so feeding them through
+   * `MarkdownMessage` would let an attacker-controllable filename
+   * synthesize a live external link in an assistant-styled bubble.
+   * (Codex CGpe9.)
+   */
+  synthesized?: boolean;
 }
 
 type LocalAgentAttachmentStatus = 'queued' | 'uploading' | 'completed' | 'skipped' | 'error';
@@ -256,6 +269,7 @@ function buildChatContextEntries(
 
 function mapHistoryMessage(message: LocalAgentHistoryMessage): LocalAgentMessage {
   const author = message.author.toLowerCase();
+  const hasAgentText = Boolean(message.text);
   return {
     id: message.uri || `local-history:${++localMessageId}`,
     uri: message.uri,
@@ -264,6 +278,11 @@ function mapHistoryMessage(message: LocalAgentHistoryMessage): LocalAgentMessage
     content: message.text || buildAttachmentSummary(message.attachmentRefs ?? []),
     ts: formatLocalTimestamp(message.ts),
     attachments: message.attachmentRefs,
+    // The fallback path embeds raw filenames into a synthesized summary
+    // string. Mark synthesized so the renderer skips markdown for those —
+    // a filename like `[spec](https://attacker.example)` would otherwise
+    // render as a live external link in an assistant-styled bubble.
+    synthesized: !hasAgentText,
   };
 }
 
@@ -298,52 +317,46 @@ export function adoptLocalAgentTurnId(
 }
 
 export function normalizeMessageContent(content: string): string {
-  const normalized = content.replace(/\\n/g, '\n').replace(/\r\n/g, '\n');
-  return normalized
+  // Normalize CRLF → LF and trim leading/trailing blank lines so chat
+  // bubbles don't render with extra vertical whitespace.
+  //
+  // Earlier versions also rewrote literal backslash-n (`\\n` in source,
+  // i.e. the two characters `\` + `n`) into real newlines, to recover
+  // from a transport that double-escaped its strings. With PR3's
+  // markdown / code-block rendering, that rewrite actively corrupts
+  // legitimate agent output — a JSON snippet like `{"text":"a\\nb"}`
+  // or a shell sample like `echo -e "a\\nb"` would get split across
+  // two lines, breaking the displayed code (Codex CHWpS). Removed; if
+  // a specific transport ever needs unescaping, do it at the transport
+  // boundary, not in the renderer.
+  return content
+    .replace(/\r\n/g, '\n')
     .replace(/^(?:[ \t]*\n)+/, '')
     .replace(/(?:\n[ \t]*)+$/, '');
 }
 
-function renderInlineMarkdown(text: string): React.ReactNode[] {
-  const nodes: React.ReactNode[] = [];
-  const pattern = /(\*\*[^*]+\*\*|`[^`]+`)/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  let key = 0;
-
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      nodes.push(<React.Fragment key={`md-${key++}`}>{text.slice(lastIndex, match.index)}</React.Fragment>);
-    }
-
-    const token = match[0];
-    if (token.startsWith('**') && token.endsWith('**')) {
-      nodes.push(<strong key={`md-${key++}`}>{token.slice(2, -2)}</strong>);
-    } else if (token.startsWith('`') && token.endsWith('`')) {
-      nodes.push(<code key={`md-${key++}`}>{token.slice(1, -1)}</code>);
-    } else {
-      nodes.push(<React.Fragment key={`md-${key++}`}>{token}</React.Fragment>);
-    }
-
-    lastIndex = match.index + token.length;
-  }
-
-  if (lastIndex < text.length) {
-    nodes.push(<React.Fragment key={`md-${key++}`}>{text.slice(lastIndex)}</React.Fragment>);
-  }
-
-  return nodes;
-}
-
-function renderMessageContent(content: string): React.ReactNode {
+function renderMessageContent(
+  content: string,
+  role: 'user' | 'assistant',
+  synthesized: boolean,
+): React.ReactNode {
   const normalized = normalizeMessageContent(content);
-  const lines = normalized.split('\n');
-  return lines.map((line, index) => (
-    <React.Fragment key={`line-${index}`}>
-      {renderInlineMarkdown(line)}
-      {index < lines.length - 1 && <br />}
-    </React.Fragment>
-  ));
+  // Markdown rendering applies only to agent-authored assistant output
+  // — the only content that's actually written as markdown. Everything
+  // else falls back to plain text:
+  //   - User-typed bubbles: typing `# heading` would otherwise visibly
+  //     transform, so the transcript no longer matches the prompt
+  //     (CBnNU / CCyxn).
+  //   - Synthetic strings (attachment summaries, history fallbacks,
+  //     local error / cancel text) embed raw filenames or error bodies.
+  //     A filename like `[spec](https://attacker.example)` would
+  //     otherwise render as a live external link in an assistant-styled
+  //     bubble (CFNsU / CFXYU / CGpe9). The CFThj relative-link guard
+  //     doesn't help — those hrefs are absolute and allowed.
+  if (role === 'assistant' && !synthesized) {
+    return <MarkdownMessage content={normalized} />;
+  }
+  return <span className="v10-chat-plaintext">{normalized}</span>;
 }
 
 export function getLocalAgentConversationStateKey(
@@ -660,9 +673,35 @@ function AgentTabMenu(props: {
   onDisconnect: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  // Default left-anchored. After the popover opens we measure whether it
+  // would overflow the panel's right edge (rightmost agent tabs on narrow
+  // layouts) and flip to right-anchored if so.
+  const [alignRight, setAlignRight] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const popover = popoverRef.current;
+    const trigger = triggerRef.current;
+    if (!popover || !trigger) return;
+    // Find the nearest scroll/panel container — the right-side chat panel
+    // is the visible boundary the popover must fit inside. Fall back to
+    // the viewport width when there is no panel ancestor.
+    const panel = trigger.closest<HTMLElement>('.v10-panel-right') || document.body;
+    const panelRect = panel.getBoundingClientRect();
+    const triggerRect = trigger.getBoundingClientRect();
+    // Compute where the (left-anchored) popover's right edge would land.
+    // popover.offsetWidth already reflects min-width: 200px, even right
+    // after open when alignRight is still false on the first paint.
+    const projectedRight = triggerRect.left + popover.offsetWidth;
+    if (projectedRight > panelRect.right - 4) {
+      setAlignRight(true);
+    } else {
+      setAlignRight(false);
+    }
+  }, [open]);
 
   const closeAndReturnFocus = useCallback(() => {
     setOpen(false);
@@ -747,7 +786,7 @@ function AgentTabMenu(props: {
       {open && (
         <div
           ref={popoverRef}
-          className="v10-agent-tab-menu-popover"
+          className={`v10-agent-tab-menu-popover${alignRight ? ' align-right' : ''}`}
           role="menu"
           onKeyDown={onPopoverKeyDown}
         >
@@ -876,6 +915,80 @@ export function ConnectedAgentsTab(props: {
     selectedAttachmentDrafts.length > 0 &&
     selectedAttachmentDrafts.some((a) => a.contextGraphId !== activeProjectId);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const messagesRegionRef = useRef<HTMLDivElement>(null);
+  // Mirror of `messagesRegionRef` as state so observer effects can re-run
+  // when the region actually mounts. Necessary because the messages
+  // region is conditionally rendered (loader / add-flow / chat shell) —
+  // a one-shot useEffect at component mount sees `ref.current === null`
+  // when the panel starts in any non-chat state, and never re-attaches
+  // after the chat shell appears. Codex CGpfC. The callback ref below
+  // bridges both consumers.
+  const [messagesRegionEl, setMessagesRegionEl] = useState<HTMLDivElement | null>(null);
+  const setMessagesRegion = useCallback((el: HTMLDivElement | null) => {
+    messagesRegionRef.current = el;
+    setMessagesRegionEl(el);
+  }, []);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+
+  const onMessagesScroll = useCallback(() => {
+    const el = messagesRegionRef.current;
+    if (!el) return;
+    // ~40px slack so the button doesn't flicker at the exact bottom edge.
+    const offFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setShowScrollToBottom(offFromBottom > 40);
+  }, []);
+
+  const scrollMessagesToBottom = useCallback(() => {
+    const el = messagesRegionRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  }, []);
+
+  // Recompute the scroll-pill state whenever the active conversation or its
+  // message list changes. Without this, switching to a conversation with a
+  // shorter history (or whose latest message just landed via auto-scroll)
+  // leaves the pill stuck visible from the previous thread until the user
+  // scrolls again. A rAF lets the layout settle after React commits.
+  useEffect(() => {
+    const el = messagesRegionRef.current;
+    if (!el) return;
+    const raf = requestAnimationFrame(() => {
+      const off = el.scrollHeight - el.scrollTop - el.clientHeight;
+      setShowScrollToBottom(off > 40);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [selectedIntegrationId, selectedSessionId, localMessages.length]);
+
+  // Length-based recompute above misses the streaming case: the assistant's
+  // last message grows in place (text appended to the same array entry),
+  // so `localMessages.length` is unchanged. Watch the messages region's
+  // subtree directly — any DOM mutation (streamed text chunk, new bubble,
+  // markdown re-render, image load resizing) re-evaluates whether the
+  // pill should show. MutationObserver beats ResizeObserver here because
+  // (a) the scroll container has a fixed flex height (ResizeObserver
+  // doesn't fire on scrollHeight changes alone) and (b) it's stable
+  // across content-root transitions — earlier code captured
+  // `firstElementChild` once at mount, which broke when the tab
+  // initially rendered a loader/empty state and then transitioned to
+  // streaming a real conversation. The effect re-runs whenever the
+  // messages region mounts / unmounts (panel may start in add-flow or
+  // empty state and only render the scroll container later) — Codex
+  // CGpfC.
+  useEffect(() => {
+    if (!messagesRegionEl || typeof MutationObserver === 'undefined') return;
+    const recompute = () => {
+      const off = messagesRegionEl.scrollHeight - messagesRegionEl.scrollTop - messagesRegionEl.clientHeight;
+      setShowScrollToBottom(off > 40);
+    };
+    // Initial recompute when the region mounts — without this, switching
+    // from add-flow/loader to an already-populated chat leaves the pill
+    // stuck on its prior `false` until the next mutation or manual
+    // scroll fires (Codex CHBiH).
+    recompute();
+    const mo = new MutationObserver(recompute);
+    mo.observe(messagesRegionEl, { childList: true, subtree: true, characterData: true });
+    return () => mo.disconnect();
+  }, [messagesRegionEl]);
 
   // Drop-zone gating: three different reasons the dropzone refuses files.
   // Each surfaces a different recovery copy in the refuse-state overlay so
@@ -1051,7 +1164,8 @@ export function ConnectedAgentsTab(props: {
         </div>
       ) : (
         selected && (
-          <div className="v10-local-agent-chat-shell">
+          <div {...dropzone.getRootProps({ className: 'v10-local-agent-chat-shell' })}>
+            <input {...dropzone.getInputProps()} />
             {connectNotice && <div className="v10-local-agent-notice">{connectNotice}</div>}
             {connectError && <div className="v10-local-agent-error">{connectError}</div>}
 
@@ -1069,22 +1183,17 @@ export function ConnectedAgentsTab(props: {
               </div>
             )}
 
-            <div
-              {...dropzone.getRootProps({
-                className: 'v10-chat-messages v10-local-agent-messages',
-              })}
-            >
-              <input {...dropzone.getInputProps()} />
-              {dropzone.isDragActive && (
-                <div
-                  className={`v10-drop-overlay active ${attachmentsEnabled ? 'accept' : 'refuse'}`}
-                  role="status"
-                  aria-live="polite"
-                >
+            {dropzone.isDragActive && (
+              <div
+                className={`v10-drop-overlay active ${attachmentsEnabled ? 'accept' : 'refuse'}`}
+                role="status"
+                aria-live="polite"
+              >
+                <div className="v10-drop-overlay-card">
                   {attachmentsEnabled ? (
-                    <Upload className="v10-drop-overlay-icon" size={20} aria-hidden="true" />
+                    <Upload className="v10-drop-overlay-icon" size={32} aria-hidden="true" />
                   ) : (
-                    <Ban className="v10-drop-overlay-icon" size={20} aria-hidden="true" />
+                    <Ban className="v10-drop-overlay-icon" size={32} aria-hidden="true" />
                   )}
                   <div className="v10-drop-overlay-title">
                     {attachmentsEnabled
@@ -1105,7 +1214,13 @@ export function ConnectedAgentsTab(props: {
                           : 'Use the picker below the composer.'}
                   </div>
                 </div>
-              )}
+              </div>
+            )}
+            <div
+              className="v10-chat-messages v10-local-agent-messages"
+              ref={setMessagesRegion}
+              onScroll={onMessagesScroll}
+            >
               {shouldShowConversationLoader && (
                 <div className="v10-agent-empty-state">
                   Loading the latest conversation from DKG memory...
@@ -1141,7 +1256,7 @@ export function ConnectedAgentsTab(props: {
               {localMessages.map((message) => (
                 <div key={message.id} className={`v10-chat-msg ${message.role}`}>
                   <div className={`v10-chat-bubble ${message.role}`}>
-                    {renderMessageContent(message.content)}
+                    {renderMessageContent(message.content, message.role, Boolean(message.synthesized))}
                     {message.streaming && <span className="v10-chat-cursor" />}
                   </div>
                   {message.attachments && message.attachments.length > 0 && (
@@ -1170,6 +1285,17 @@ export function ConnectedAgentsTab(props: {
                 </div>
               ))}
               <div ref={localChatEndRef} />
+              <button
+                type="button"
+                className={`v10-scroll-to-bottom ${showScrollToBottom ? 'visible' : ''}`}
+                onClick={scrollMessagesToBottom}
+                aria-label="Scroll to latest message"
+                title="Scroll to latest message"
+                tabIndex={showScrollToBottom ? 0 : -1}
+                aria-hidden={!showScrollToBottom}
+              >
+                <ArrowDown size={14} aria-hidden="true" />
+              </button>
             </div>
             <div className="v10-agent-input-area">
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%' }}>
@@ -1247,30 +1373,6 @@ export function ConnectedAgentsTab(props: {
 
                 <div className="v10-local-agent-composer-row">
                   <div className="v10-local-agent-composer-shell">
-                    <button
-                      type="button"
-                      className="v10-composer-attach"
-                      onClick={() => attachmentInputRef.current?.click()}
-                      // Single source of truth for "can attach right now": the
-                      // shared `dropDisabledReason` that the drop overlay also
-                      // uses, so the button's disabled state and the dropzone
-                      // stay in lockstep. The tooltip mirrors the same reason
-                      // chain instead of advertising a generic "Attach files"
-                      // in the disabled states.
-                      disabled={!attachmentsEnabled}
-                      title={
-                        attachmentsEnabled
-                          ? 'Attach files'
-                          : dropDisabledReason === 'noProject'
-                            ? 'Choose a project to attach files'
-                            : dropDisabledReason === 'sending'
-                              ? 'Wait for the current message to send'
-                              : 'This agent does not support attachments'
-                      }
-                      aria-label="Attach files"
-                    >
-                      <Paperclip size={14} aria-hidden="true" />
-                    </button>
                     <TextareaAutosize
                       placeholder={
                         showingSessionHistory
@@ -1316,51 +1418,75 @@ export function ConnectedAgentsTab(props: {
                       minRows={1}
                       maxRows={8}
                     />
-                    <button
-                      type="button"
-                      className="v10-agent-send-btn v10-local-agent-inline-send"
-                      onClick={onSendLocalMessage}
-                      disabled={inputDisabled || (!localInput.trim() && !hasSendableAttachmentDrafts)}
-                      aria-label="Send message"
-                      title="Send message"
-                    >
-                      <ArrowUp size={14} aria-hidden="true" />
-                    </button>
+                    <div className="v10-composer-controls">
+                      <div className="v10-composer-controls-left">
+                        <button
+                          type="button"
+                          className="v10-composer-attach"
+                          onClick={() => attachmentInputRef.current?.click()}
+                          // Single source of truth for "can attach right now":
+                          // the shared `dropDisabledReason` that the drop
+                          // overlay also uses, so the button's disabled state
+                          // and the dropzone stay in lockstep. The tooltip
+                          // mirrors the same reason chain instead of
+                          // advertising a generic "Attach files" in the
+                          // disabled states.
+                          disabled={!attachmentsEnabled}
+                          title={
+                            attachmentsEnabled
+                              ? 'Attach files'
+                              : dropDisabledReason === 'noProject'
+                                ? 'Choose a project to attach files'
+                                : dropDisabledReason === 'sending'
+                                  ? 'Wait for the current message to send'
+                                  : 'This agent does not support attachments'
+                          }
+                          aria-label="Attach files"
+                        >
+                          <Paperclip size={14} aria-hidden="true" />
+                        </button>
+                        <div className="v10-composer-target">
+                          <Select
+                            className="v10-local-agent-target-select"
+                            value={activeProjectId ?? ''}
+                            onChange={onSelectProject}
+                            options={[
+                              // The "No project (clear selection)" row only
+                              // renders once a real project is active.
+                              // Otherwise its `value: ''` would match the
+                              // empty trigger value and the picker would show
+                              // "No project (clear selection)" as a fake
+                              // selection instead of the intended "Choose a
+                              // project" placeholder.
+                              ...(activeProjectId
+                                ? [{ value: '', label: 'No project (clear selection)' }]
+                                : []),
+                              ...availableProjects.map((project) => ({ value: project.id, label: project.name })),
+                            ]}
+                            placeholder={projectsLoading ? 'Loading projects…' : 'Choose a project'}
+                            // Disable while loading. When no project is active
+                            // and the list is empty there's nothing to pick
+                            // yet, so disable then too — once a project is
+                            // active the clear row is always there.
+                            disabled={projectsLoading || (!activeProjectId && availableProjects.length === 0)}
+                            ariaLabel="Active project"
+                            prefixIcon={<Folder size={12} aria-hidden="true" />}
+                          />
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="v10-local-agent-inline-send"
+                        onClick={onSendLocalMessage}
+                        disabled={inputDisabled || (!localInput.trim() && !hasSendableAttachmentDrafts)}
+                        aria-label="Send message"
+                        title="Send message"
+                      >
+                        <ArrowUp size={14} aria-hidden="true" />
+                      </button>
+                    </div>
                   </div>
                 </div>
-                <div className="v10-composer-toolbar">
-                  <div className="v10-composer-target">
-                    <Select
-                      className="v10-local-agent-target-select"
-                      value={activeProjectId ?? ''}
-                      onChange={onSelectProject}
-                      options={[
-                        // The "No project (clear selection)" row only renders
-                        // once a real project is active. Otherwise its
-                        // `value: ''` would match the empty trigger value
-                        // and the picker would show "No project (clear
-                        // selection)" as a fake selection instead of the
-                        // intended "Choose a project" placeholder.
-                        ...(activeProjectId
-                          ? [{ value: '', label: 'No project (clear selection)' }]
-                          : []),
-                        ...availableProjects.map((project) => ({ value: project.id, label: project.name })),
-                      ]}
-                      placeholder={projectsLoading ? 'Loading projects…' : 'Choose a project'}
-                      // Disable while loading. When no project is active and
-                      // the list is empty there's nothing to pick yet, so
-                      // disable then too — once a project is active the
-                      // "No project (clear selection)" row is always there.
-                      disabled={projectsLoading || (!activeProjectId && availableProjects.length === 0)}
-                      ariaLabel="Active project"
-                    />
-                  </div>
-                </div>
-                {!activeProjectId && (
-                  <div className="v10-local-agent-copy" style={{ margin: 0, color: 'var(--text-tertiary)' }}>
-                    Choose a project to attach files.
-                  </div>
-                )}
               </div>
             </div>
           </div>
@@ -1370,54 +1496,246 @@ export function ConnectedAgentsTab(props: {
   );
 }
 
+function NetworkPeerCard({ agent }: { agent: AgentInfo }) {
+  const statusClass = networkPeerCardStatusClass(agent);
+  return (
+    <div className={`v10-agent-card ${statusClass}`}>
+      <div className="v10-agent-card-header">
+        <span className={`v10-agent-card-dot ${statusClass}`} />
+        <span className="v10-agent-card-name">{agent.name}</span>
+        <span className="v10-agent-card-badge">
+          {agent.connectionStatus === 'connected'
+            ? (agent.connectionTransport ?? 'direct')
+            : 'Disconnected'}
+        </span>
+      </div>
+      <div className="v10-agent-card-meta">
+        <span>{agent.nodeRole ?? 'core'}</span>
+        <span title={agent.peerId}>{shortPeerId(agent.peerId)}</span>
+        {agent.latencyMs != null && <span>{agent.latencyMs}ms</span>}
+        {agent.lastSeen != null && <span>{formatDuration(Date.now() - agent.lastSeen)} ago</span>}
+      </div>
+    </div>
+  );
+}
+
+function NetworkPeerGroup(props: {
+  label: string;
+  peers: AgentInfo[];
+  expanded: boolean;
+  onToggle: () => void;
+  emptyMessage: string;
+}) {
+  const { label, peers, expanded, onToggle, emptyMessage } = props;
+  return (
+    <div className="v10-peer-group">
+      <button
+        type="button"
+        className="v10-peer-group-header"
+        onClick={onToggle}
+        aria-expanded={expanded}
+      >
+        <ChevronRight
+          size={14}
+          className={`v10-peer-group-chevron ${expanded ? 'expanded' : ''}`}
+          aria-hidden="true"
+        />
+        <span className="v10-peer-group-label">{label}</span>
+        <span className="v10-peer-group-count">{peers.length}</span>
+      </button>
+      {expanded && (
+        <div className="v10-peer-group-body">
+          {peers.length === 0 ? (
+            <div className="v10-agent-empty-state">{emptyMessage}</div>
+          ) : (
+            // Key on the same identity used for dedupe upstream
+            // (agentUri, falling back to peerId). After the BNlko fix,
+            // distinct agents sharing a peerId now render as separate
+            // cards — keying on peerId alone would collide and cause
+            // React to reuse the wrong card across re-renders.
+            peers.map((agent) => (
+              <NetworkPeerCard key={agent.agentUri || agent.peerId} agent={agent} />
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function NetworkTab(props: {
   peerAgents: AgentInfo[];
+  /**
+   * Raw libp2p connection counts from `/api/connections`. Used to drive
+   * the empty-state and to surface a transitional message when libp2p
+   * has connections but `/api/agents` has not emitted records yet — the
+   * deduped peerAgents list can otherwise show "0 connected / No
+   * network peers detected yet" even though the node is connected.
+   */
   connections: { total: number; direct: number; relayed: number };
   loading: boolean;
   onRefresh: () => void;
 }) {
   const { peerAgents, connections, loading, onRefresh } = props;
+  const [connectedExpanded, setConnectedExpanded] = useState(true);
+  const [disconnectedExpanded, setDisconnectedExpanded] = useState(false);
+
+  // The /api/agents feed can report the same agent under multiple records
+  // (e.g. once via a direct transport, once via a relay). Collapse to one
+  // entry per agent. Dedupe on `agentUri` — a stable per-agent identifier
+  // — rather than `peerId`, since a remote node may advertise multiple
+  // distinct agents on the same peer (different `agentUri` values), and
+  // those are NOT duplicates. Fall back to `peerId` only when `agentUri`
+  // is missing so older records still collapse instead of multiplying.
+  //
+  // Tie-break order when collapsing records for the same agent:
+  //   1. Prefer a connected record over a disconnected one.
+  //   2. Among connected records, prefer DIRECT over relayed — direct is
+  //      the better transport, so an agent that has any direct connection
+  //      should be reported as direct (not arbitrarily classed as relayed
+  //      because the relay record arrived more recently in the feed).
+  //   3. Otherwise prefer the more-recently-seen record so latency/status
+  //      reflect current state.
+  // With this rule, direct + relayed = total unique connected agents and
+  // the top summary count agrees with the section counts.
+  const transportRank = (peer: AgentInfo): number =>
+    (peer.connectionTransport ?? 'direct') === 'direct' ? 1 : 0;
+  const dedupeKey = (peer: AgentInfo): string => peer.agentUri || peer.peerId;
+  const uniquePeers = Array.from(
+    peerAgents.reduce<Map<string, AgentInfo>>((acc, peer) => {
+      const key = dedupeKey(peer);
+      const prev = acc.get(key);
+      if (!prev) {
+        acc.set(key, peer);
+        return acc;
+      }
+      const peerConnected = peer.connectionStatus === 'connected';
+      const prevConnected = prev.connectionStatus === 'connected';
+      if (peerConnected !== prevConnected) {
+        // Status disagrees → use the freshest available signal. The rule
+        // has shaken out across several Codex rounds:
+        //   CGaLH: don't naively prefer "connected" — a stale connected
+        //          row after a peer drops keeps the UI wrong.
+        //   CG3Lw: don't `?? 0` missing timestamps either — an older
+        //          timestamped connected row would beat a newer
+        //          un-timestamped disconnect.
+        //   CHMS1: don't fall through to feed-order on missing-timestamp
+        //          ties either — `/api/agents` doesn't sort by recency,
+        //          so an upstream ordering change can silently flip the
+        //          panel back. Prefer the timestamped row when only one
+        //          side has it; when neither has a timestamp, prefer
+        //          the disconnected reading so a stale connected row
+        //          can't mask a fresh disconnect.
+        const peerHasTs = typeof peer.lastSeen === 'number';
+        const prevHasTs = typeof prev.lastSeen === 'number';
+        if (peerHasTs && prevHasTs) {
+          // Both timestamped — pure numeric freshness; tie goes to peer
+          // (later in feed by construction, deterministic within the
+          // same numeric bucket).
+          if (peer.lastSeen! >= prev.lastSeen!) acc.set(key, peer);
+        } else if (peerHasTs) {
+          // Only peer has a timestamp — take it.
+          acc.set(key, peer);
+        } else if (prevHasTs) {
+          // Only prev has a timestamp — keep prev (no-op).
+        } else {
+          // Neither has a timestamp — bias toward disconnected to keep
+          // stale connected rows from masking a real disconnect.
+          if (!peerConnected) acc.set(key, peer);
+        }
+        return acc;
+      }
+      // Same status — prefer DIRECT transport (the better channel),
+      // then most recent.
+      const peerRank = transportRank(peer);
+      const prevRank = transportRank(prev);
+      if (peerRank !== prevRank) {
+        if (peerRank > prevRank) acc.set(key, peer);
+        return acc;
+      }
+      if ((peer.lastSeen ?? 0) >= (prev.lastSeen ?? 0)) {
+        acc.set(key, peer);
+      }
+      return acc;
+    }, new Map()).values(),
+  );
+  const connectedPeers = uniquePeers.filter((a) => a.connectionStatus === 'connected');
+  const disconnectedPeers = uniquePeers.filter((a) => a.connectionStatus !== 'connected');
+  // Derive the top-summary counts from the same deduped list the user is
+  // looking at, instead of pulling raw libp2p connection counts from
+  // /api/connections. /api/connections counts *connections* (so a peer
+  // reachable on direct + relayed transports counts twice), which is
+  // technically correct but confusing when the visible list says
+  // otherwise. Showing *peer* counts here keeps the top summary and the
+  // section counts consistent.
+  const directCount = connectedPeers.filter((a) => (a.connectionTransport ?? 'direct') === 'direct').length;
+  const relayedCount = connectedPeers.length - directCount;
 
   return (
-    <div className="v10-agents-tab">
+    <div className="v10-agent-scroll-tab">
       <div className="v10-agents-summary">
         <span className="v10-agents-stat">
-          <span className={`v10-agents-stat-dot ${connections.total > 0 ? 'connected' : 'known'}`} />
-          {connections.total} peer{connections.total !== 1 ? 's' : ''}
+          {/* Dot reflects actual libp2p connectivity. If raw connections
+              report any peer up, light the dot — otherwise the panel can
+              briefly show a stale "disconnected" indicator while /api/agents
+              is still catching up. */}
+          <span className={`v10-agents-stat-dot ${connectedPeers.length > 0 || connections.total > 0 ? 'connected' : 'known'}`} />
+          {/* "Connected" qualifier matches the Connected section header below
+              — without it, "0 peers" reads as "no peers known" when there
+              might be hundreds of disconnected peers in the section underneath. */}
+          {connectedPeers.length} connected
         </span>
-        <span className="v10-agents-stat">{connections.direct} direct / {connections.relayed} relayed</span>
+        {/*
+          The counts here reflect the *preferred transport per peer*, not
+          raw transport-channel counts. A peer reachable through both
+          transports is collapsed to its DIRECT record by the dedupe rule
+          above, so it shows under `direct` even if a relay path is also
+          active. The title surfaces this so "0 relayed" doesn't read as
+          "no relay paths in use" — for raw libp2p transport diagnostics
+          the /api/connections counters are still the source of truth.
+        */}
+        <span
+          className="v10-agents-stat"
+          title="Preferred transport per peer (peers reachable via direct + relay are bucketed under direct)"
+        >
+          {directCount} direct / {relayedCount} relayed
+        </span>
         <button className="v10-agents-refresh" onClick={onRefresh} title="Refresh network peers">
           Refresh
         </button>
       </div>
 
-      <div className="v10-agents-section-label">Network Peers</div>
       {loading && <p className="v10-agents-loading">Loading peers...</p>}
-      {peerAgents.length === 0 && !loading && (
-        <div className="v10-agent-empty-state">No connected peers yet.</div>
+      {peerAgents.length === 0 && !loading && connections.total === 0 && (
+        <div className="v10-agent-empty-state">No network peers detected yet.</div>
       )}
-      {peerAgents.map((agent) => {
-        const statusClass = networkPeerCardStatusClass(agent);
-        return (
-        <div key={agent.peerId} className={`v10-agent-card ${statusClass}`}>
-          <div className="v10-agent-card-header">
-            <span className={`v10-agent-card-dot ${statusClass}`} />
-            <span className="v10-agent-card-name">{agent.name}</span>
-            <span className="v10-agent-card-badge">
-              {agent.connectionStatus === 'connected'
-                ? (agent.connectionTransport ?? 'direct')
-                : 'Disconnected'}
-            </span>
-          </div>
-          <div className="v10-agent-card-meta">
-            <span>{agent.nodeRole ?? 'core'}</span>
-            <span title={agent.peerId}>{shortPeerId(agent.peerId)}</span>
-            {agent.latencyMs != null && <span>{agent.latencyMs}ms</span>}
-            {agent.lastSeen != null && <span>{formatDuration(Date.now() - agent.lastSeen)} ago</span>}
-          </div>
+      {peerAgents.length === 0 && !loading && connections.total > 0 && (
+        // libp2p reports connections but /api/agents hasn't emitted records
+        // for them yet (slow probe, or remote peers have no agent
+        // metadata). Surface that so the panel doesn't read as "no peers"
+        // when the node is actually connected.
+        <div className="v10-agent-empty-state">
+          Connected to {connections.total} peer{connections.total === 1 ? '' : 's'} (agent metadata syncing…).
         </div>
-        );
-      })}
+      )}
+      {peerAgents.length > 0 && (
+        <>
+          <NetworkPeerGroup
+            label="Connected"
+            peers={connectedPeers}
+            expanded={connectedExpanded}
+            onToggle={() => setConnectedExpanded((p) => !p)}
+            emptyMessage="No peers currently connected."
+          />
+          <NetworkPeerGroup
+            label="Disconnected"
+            peers={disconnectedPeers}
+            expanded={disconnectedExpanded}
+            onToggle={() => setDisconnectedExpanded((p) => !p)}
+            emptyMessage="All known peers are connected."
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -1429,7 +1747,7 @@ function SessionsTab(props: {
   const { sessions, onOpenSession } = props;
 
   return (
-    <div className="v10-agent-content">
+    <div className="v10-agent-scroll-tab">
       <div className="v10-sessions-list">
         <div className="v10-local-agent-copy" style={{ marginBottom: 12 }}>
           Sessions track DKG-persisted conversations for your integrated agents.
@@ -1863,9 +2181,14 @@ export function PanelRight() {
     setConnectError(null);
     let controller: AbortController | null = null;
     let assistantId = '';
+    // Hoisted so the `catch` path can restore the optimistically-cleared
+    // drafts without a TypeScript scope error and without a runtime
+    // ReferenceError when send fails before they're assigned.
+    let processedDrafts: LocalAgentAttachmentDraft[] = [];
+    let deliveredAttachmentIds: string[] = [];
 
     try {
-      const processedDrafts = await prepareAttachmentDraftsForSend(conversationKey, drafts);
+      processedDrafts = await prepareAttachmentDraftsForSend(conversationKey, drafts);
       const attachments = processedDrafts
         .map((draft) => draftToAttachmentRef(draft))
         .filter((item): item is LocalAgentChatAttachmentRef => item != null);
@@ -1884,7 +2207,7 @@ export function PanelRight() {
       const attachmentIds = attachments
         .map((attachment) => attachment.id)
         .filter((attachmentId): attachmentId is string => typeof attachmentId === 'string' && attachmentId.length > 0);
-      const deliveredAttachmentIds = [...attachmentIds, ...importContext.deliveredDraftIds];
+      deliveredAttachmentIds = [...attachmentIds, ...importContext.deliveredDraftIds];
       const userId = `local:${conversationKey}:${correlationId}:user`;
       assistantId = `local:${conversationKey}:${correlationId}:assistant`;
       const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -1895,6 +2218,14 @@ export function PanelRight() {
         { id: assistantId, turnId: correlationId, role: 'assistant', content: '', ts: now, streaming: true },
       ]);
       setLocalInputForConversation(conversationKey, '');
+      // Clear composer chips OPTIMISTICALLY as soon as the user-message
+      // bubble owns the attachments — keeping them visible until the agent
+      // reply makes the attachment look "stuck in queue". If the send fails
+      // or is aborted, the `catch` below restores these drafts so the user
+      // can retry without re-uploading.
+      if (deliveredAttachmentIds.length > 0) {
+        clearCompletedAttachmentsForConversation(conversationKey, deliveredAttachmentIds);
+      }
 
       controller = new AbortController();
       localAbortRef.current = controller;
@@ -1931,14 +2262,16 @@ export function PanelRight() {
                 content: result.text || message.content,
                 turnId: result.turnId?.trim() || message.turnId,
                 streaming: false,
+                // `result.text` is the real agent-authored content; the
+                // fallback path keeps whatever's already in `message.content`
+                // (which is either earlier streamed agent text or — empty).
+                // Only mark synthesized when neither is true.
+                synthesized: !result.text && !message.content ? true : message.synthesized,
                 ts: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
               }
             : message,
         ),
       );
-      if (deliveredAttachmentIds.length > 0) {
-        clearCompletedAttachmentsForConversation(conversationKey, deliveredAttachmentIds);
-      }
       loadSessions();
       if (stage === 0) advance();
     } catch (err: any) {
@@ -1952,10 +2285,27 @@ export function PanelRight() {
                     ? 'Request cancelled.'
                     : `Error: ${formatLocalAgentErrorMessage(integration, err)}`,
                   streaming: false,
+                  // Error / cancel strings are locally synthesized and may
+                  // surface details the agent didn't author (URLs in error
+                  // bodies, raw filenames). Render as plain text.
+                  synthesized: true,
                 }
               : message,
           ),
         );
+      }
+      // Restore the attachment drafts we optimistically cleared so the user
+      // can retry the same files without re-uploading. Merge instead of
+      // overwriting in case the user has queued NEW drafts during the
+      // in-flight request — keep those, prepend the failed ones.
+      if (deliveredAttachmentIds.length > 0 && processedDrafts.length > 0) {
+        setAttachmentDraftsByConversation((prev) => {
+          const current = prev[conversationKey] ?? [];
+          const existingIds = new Set(current.map((d) => d.id));
+          const restored = processedDrafts.filter((d) => !existingIds.has(d.id));
+          if (restored.length === 0) return prev;
+          return { ...prev, [conversationKey]: [...restored, ...current] };
+        });
       }
       void refreshLocalIntegrations();
     } finally {

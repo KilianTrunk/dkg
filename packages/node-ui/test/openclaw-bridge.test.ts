@@ -225,17 +225,18 @@ describe('PanelRight UI - connected agent flow', () => {
   });
 
   it('shows the inline attachment tray and project picker in the chat composer', () => {
-    // PR2: icon-only attach button + project picker live in the composer
-    // toolbar below the textarea. Assert on the rendered className /
-    // aria-label / user-visible copy — the observable contract — and
-    // leave behavioral checks to the focused render-time tests
-    // (composer-autosize.test.ts, attachment-chip.test.ts, etc.).
-    // Asserting internal source expressions (the picker's `value` JSX,
-    // the queued-status conditional, the fallback key expression) was
-    // brittle to harmless refactors without catching real regressions.
+    // PR2 (post iteration 1): composer shell is a vertical stack —
+    // textarea on top, a single .v10-composer-controls row below holding
+    // the attach button + project picker (left) and send button (right).
+    // Assert on the rendered className / aria-label / user-visible copy
+    // — the observable contract — and leave behavioral checks to the
+    // focused render-time tests (composer-autosize.test.ts,
+    // attachment-chip.test.ts, etc.). Asserting internal source
+    // expressions was brittle to harmless refactors without catching
+    // real regressions.
     expect(panelRight).toContain('aria-label="Attach files"');
     expect(panelRight).toContain('v10-composer-attach');
-    expect(panelRight).toContain('v10-composer-toolbar');
+    expect(panelRight).toContain('v10-composer-controls');
     expect(panelRight).toContain('Choose a project');
     expect(panelRight).toContain('Stored only');
   });
@@ -251,7 +252,11 @@ describe('PanelRight UI - connected agent flow', () => {
     );
 
     expect(addAttachmentsBlock).not.toContain('await importFile(');
-    expect(sendLocalMessageBlock).toContain('const processedDrafts = await prepareAttachmentDraftsForSend(conversationKey, drafts);');
+    // PR3 Codex round-2: processedDrafts is now hoisted above the try block
+    // (assigned, not declared with `const`, so the catch path can read it
+    // to restore drafts after a failed send). Assert the assignment shape
+    // without coupling to the lexical `const`.
+    expect(sendLocalMessageBlock).toContain('processedDrafts = await prepareAttachmentDraftsForSend(conversationKey, drafts);');
     expect(sendLocalMessageBlock).toContain('if (!text && attachments.length === 0 && importContext.results.length === 0) {');
     expect(panelRight).not.toContain('selectedCompletedAttachments');
   });
@@ -265,9 +270,14 @@ describe('PanelRight UI - connected agent flow', () => {
     expect(panelRight).toContain("draft.status === 'queued' || draft.status === 'completed' || draft.status === 'skipped'");
     expect(panelRight).toContain('selectedAttachmentDrafts.some(isSendableAttachmentDraft)');
     expect(panelRight).toContain('const hasSendableDrafts = drafts.some(isSendableAttachmentDraft);');
-    // PR2: the "choose a project" hint moved to a single line below the composer
-    // (and is also discoverable via the empty-project-picker placeholder in the toolbar).
-    expect(panelRight).toContain('Choose a project to attach files.');
+    // PR2 polish iter 1: the redundant "choose a project" hint copy was
+    // retired — the project picker now lives INSIDE the composer-controls
+    // row right next to the attach button, so the affordance is self-evident.
+    // The attach-button title still mentions the gating ("Choose a project
+    // to attach files"); after round-8 (CFfZ3) the title chain reuses the
+    // shared `dropDisabledReason` state so it stays in lockstep with the
+    // drop overlay's recovery copy instead of repeating the ternary inline.
+    expect(panelRight).toContain("'Choose a project to attach files'");
   });
 
   it('turns skipped document-import results into server-verified sendable import results', () => {

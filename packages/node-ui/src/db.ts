@@ -978,9 +978,30 @@ export class DashboardDB {
       sql += ' AND direction = ?';
       params.push(opts.direction);
     }
-    const order = opts.order ?? 'desc';
-    if (order === 'asc') {
+    // Three sort modes — explicit values are honored literally, the
+    // implicit (omitted) default preserves the pre-RFC dashboard
+    // history contract.
+    //
+    //   order === 'asc'  → true ASC: oldest first (forward pagination)
+    //   order === 'desc' → true DESC: newest first (inverse history)
+    //   omitted          → legacy "newest N then displayed oldest-first":
+    //                      SQL picks the newest N rows then `.reverse()`
+    //                      flips them to chronological order for UI use.
+    //                      Pre-existing callers (PanelRight, openclaw) rely
+    //                      on this shape, so omitting `order` is the only
+    //                      branch that keeps the post-fetch reverse.
+    //
+    // Codex PR #510 round 4 flagged that previously `order: 'desc'` was
+    // not honored — SQL returned DESC and the unconditional `.reverse()`
+    // flipped it back to ASC, so the API contract didn't match the
+    // behaviour. The explicit `'desc'` branch now drops the reverse.
+    if (opts.order === 'asc') {
       sql += ' ORDER BY ts ASC, id ASC LIMIT ?';
+      params.push(opts.limit ?? 200);
+      return this.db.prepare(sql).all(...params) as ChatMessageRow[];
+    }
+    if (opts.order === 'desc') {
+      sql += ' ORDER BY ts DESC, id DESC LIMIT ?';
       params.push(opts.limit ?? 200);
       return this.db.prepare(sql).all(...params) as ChatMessageRow[];
     }

@@ -383,9 +383,31 @@ export class MessageHandler {
       // accepted — this preserves the legacy behaviour for nodes that
       // haven't configured `chat.acl`.
       if (this.chatAclCheck) {
-        const verdict = this.chatAclCheck(fromPeerId.toString(), {
-          contextGraphId: senderContextGraphId,
-        });
+        // Defence in depth: an unexpected exception from the ACL
+        // callback (db lookup glitch, custom-callback bug, etc.) must
+        // NOT bubble up as a transport-layer error to the sender —
+        // the sender would interpret it as a network failure and
+        // retry, when the right semantic is "we couldn't authorize
+        // you, fail closed". Codex PR #510 round 4 caught this:
+        // without the try/catch, an ACL/db problem turned into a
+        // confusing send-side timeout. We log the exception locally
+        // and return a clean `unauthorized` so the sender's
+        // ACL-aware error handling kicks in.
+        let verdict: { accept: boolean; reason?: string };
+        try {
+          verdict = this.chatAclCheck(fromPeerId.toString(), {
+            contextGraphId: senderContextGraphId,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          // Use console.warn rather than a structured log so we don't
+          // create a new MessageHandler→logger coupling for an edge
+          // case. The daemon's ACL helpers don't throw in normal
+          // operation; this branch is the misbehaving-custom-callback
+          // safety net.
+          console.warn(`[MessageHandler] chat ACL threw, failing closed: ${msg}`);
+          verdict = { accept: false, reason: 'unauthorized: ACL evaluation error' };
+        }
         if (!verdict.accept) {
           return this.encryptAndSign(conv.sharedSecret, convId, seq + 1, {
             success: false,

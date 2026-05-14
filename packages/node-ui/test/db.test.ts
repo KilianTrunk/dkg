@@ -518,13 +518,33 @@ describe('DashboardDB.getChatMessages — chat inbox semantics', () => {
     expect(skipped.map((r) => r.text)).toEqual(['b-in-1']);
   });
 
-  it('`order` defaults to desc (history view) and is preserved for non-paginating callers', () => {
+  it('omitting `order` preserves legacy "newest N displayed oldest-first" dashboard contract', () => {
     seed();
     const rows = db.getChatMessages({ direction: 'in' });
-    // Default desc + .reverse() → final order is ASC for display.
-    // Newest still bounds the page; what we care about here is that
-    // history-view callers (no since/sinceId) get the most recent N.
+    // Pre-RFC dashboard expected the result laid out chronologically
+    // for a "history scroll" view, but bounded to the newest N.
+    // SQL picks DESC then we reverse — keeps existing UI callers
+    // working without any opt-in change.
     expect(rows[rows.length - 1].text).toBe('b-in-1');
+    expect(rows[0].text).toBe('a-in-1');
+  });
+
+  // Codex PR #510 round 4 — previously `order: 'desc'` was not
+  // honoured: SQL returned DESC then `.reverse()` flipped it to ASC,
+  // so the API contract didn't match the behaviour. Explicit values
+  // are now applied literally.
+  it("explicit order='asc' returns oldest-first (true ASC)", () => {
+    seed();
+    const rows = db.getChatMessages({ direction: 'in', order: 'asc' });
+    expect(rows[0].text).toBe('a-in-1');
+    expect(rows[rows.length - 1].text).toBe('b-in-1');
+  });
+
+  it("explicit order='desc' returns newest-first (true DESC, no implicit reverse)", () => {
+    seed();
+    const rows = db.getChatMessages({ direction: 'in', order: 'desc' });
+    expect(rows[0].text).toBe('b-in-1');
+    expect(rows[rows.length - 1].text).toBe('a-in-1');
   });
 
   it('returns SQLite rowid (`id`) on every row so callers can build the next compound cursor', () => {

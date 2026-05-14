@@ -47,6 +47,25 @@ describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
     expect(server.tools.has('dkg_check_inbox')).toBe(true);
   });
 
+  // Codex PR #510 round 4 — the schema description used to say the
+  // daemon defaults `contextGraphId` from `config.chat.acl.contextGraphId`.
+  // After round 3 the daemon no longer auto-fills (ACL config is for
+  // inbound, outbound CG claim is a separate concern). Pinning the
+  // description here so it can't drift back without an explicit test
+  // update.
+  it("dkg_send_message schema describes contextGraphId as caller-supplied (NO auto-fill from ACL config)", () => {
+    const tool = server.get('dkg_send_message');
+    const cgField = (tool.config.inputSchema as Record<string, unknown>)
+      .contextGraphId;
+    // zod field's `.describe()` text is on the internal `_def.description`.
+    const description = String(
+      (cgField as { _def?: { description?: string } })._def?.description ?? '',
+    );
+    expect(description).toMatch(/[Mm]ust be supplied explicitly/);
+    expect(description).toMatch(/does NOT auto-fill from the local node's ACL config/);
+    expect(description).not.toMatch(/Defaults to .*chat\.acl\.contextGraphId/i);
+  });
+
   describe('dkg_send_message', () => {
     it('forwards to / text / contextGraphId to the client', async () => {
       const result = await server.call('dkg_send_message', {

@@ -149,8 +149,12 @@ export function registerChatTools(
           .describe(
             'Optional context graph the sender is talking on behalf ' +
               'of. Embedded in the encrypted payload so a scoped ' +
-              'receiver can validate. Defaults to the local node ' +
-              "config's `chat.acl.contextGraphId` if set.",
+              'receiver can validate the claim against its ACL. ' +
+              'Must be supplied explicitly — the daemon does NOT ' +
+              "auto-fill from the local node's ACL config, since " +
+              'inbound ACL policy and outbound wire claim are ' +
+              "distinct concerns (the local node's chosen scope " +
+              'should not silently appear on every outgoing chat).',
           ),
       },
     },

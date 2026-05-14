@@ -208,6 +208,40 @@ describe('MessageHandler — chat ACL + contextGraphId plumbing', () => {
     expect(legacyHandler).toHaveBeenCalledTimes(1);
   });
 
+  // Codex PR #510 round 4 — a throwing ACL callback must NOT bubble
+  // out as a transport-layer failure (the sender would interpret it
+  // as a network issue and retry). The handler now catches and
+  // surfaces a clean `unauthorized` so the sender's ACL-aware error
+  // path kicks in.
+  it('ACL throw → handler catches and fails closed with "unauthorized" reason', async () => {
+    const { a, b } = await buildPair();
+    // Silence console.warn so the deliberate throw doesn't pollute
+    // the test output.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      b.setChatAcl(() => {
+        throw new Error('db unavailable');
+      });
+      const chatHandler = vi.fn();
+      b.onChat(chatHandler);
+
+      const result = await a.sendChat(PEER_B, 'should-reject-on-throw');
+
+      expect(result.delivered).toBe(false);
+      expect(result.error).toMatch(/unauthorized: ACL evaluation error/);
+      // Critically: chat handler must NOT run when ACL evaluation
+      // failed — fail-closed semantics.
+      expect(chatHandler).not.toHaveBeenCalled();
+      // Diagnostics should land on console.warn so operators can see
+      // why ACL is suddenly rejecting everything.
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('chat ACL threw, failing closed: db unavailable'),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it('ACL runs AFTER signature verification (defence in depth)', async () => {
     const { a, b } = await buildPair();
 

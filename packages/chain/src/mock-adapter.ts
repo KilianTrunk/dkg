@@ -798,7 +798,10 @@ export class MockChainAdapter implements ChainAdapter {
 
     // The legacy V9 single-tx publish helper was archived (issue 0004);
     // inline a minimal mock publish that satisfies the V9-shape
-    // `OnChainPublishResult` contract callers expect on this path.
+    // `OnChainPublishResult` contract callers expect on this path AND
+    // emits the same `KnowledgeBatchCreated` / `KCCreated` events the
+    // archived helper produced — `resolvePublishByTxHash` and the
+    // ChainEventPoller / WAL consumers walk those events by txHash.
     if (params.receiverSignatures.length < this.minimumRequiredSignatures) {
       throw new Error('MinSignaturesRequirementNotMet');
     }
@@ -809,6 +812,31 @@ export class MockChainAdapter implements ChainAdapter {
       kaCount: params.kaCount,
       publisherAddress: this.signerAddress,
     });
+
+    // peek BEFORE txResult() so the event-borne txHash matches the one
+    // txResult() advances onto the wire — same pattern as the publish-
+    // event emitters above.
+    const publishTxHash = this.peekTxHash();
+    this.pushEvent('KnowledgeBatchCreated', {
+      batchId: batchId.toString(),
+      publisherNodeIdentityId: params.publisherNodeIdentityId.toString(),
+      publisherAddress: this.signerAddress,
+      merkleRoot: toHex(params.merkleRoot),
+      startKAId: startId.toString(),
+      endKAId: endId.toString(),
+      kaCount: params.kaCount,
+      txHash: publishTxHash,
+    });
+    this.pushEvent('KCCreated', {
+      kcId: batchId.toString(),
+      merkleRoot: toHex(params.merkleRoot),
+      publisherAddress: this.signerAddress,
+      startKAId: startId.toString(),
+      endKAId: endId.toString(),
+      kaCount: params.kaCount,
+      txHash: publishTxHash,
+    });
+
     const tx = this.txResult(true);
     const result: OnChainPublishResult = {
       batchId,

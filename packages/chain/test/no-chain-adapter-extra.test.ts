@@ -103,6 +103,10 @@ describe('NoChainAdapter — every write method throws with stable message [CH-9
       })],
     ['getKnowledgeAssetsV10Address', () => adapter.getKnowledgeAssetsV10Address()],
     ['getEvmChainId', () => adapter.getEvmChainId()],
+    // The 7 #519 PCA write+read methods are deliberately NOT in this
+    // throw-matrix: NoChainAdapter omits them so the DKGAgent facade's
+    // `typeof guard` returns the documented `null` (feature-unavailable)
+    // instead of throwing. See the "facade contract" describe block below.
   ];
 
   it.each(matrix)('%s throws %s', async (_name, fn) => {
@@ -118,5 +122,38 @@ describe('NoChainAdapter — every write method throws with stable message [CH-9
 
   it('error message mentions DKG_PRIVATE_KEY / chainConfig hint (ops guidance is stable)', async () => {
     await expect(adapter.ensureProfile()).rejects.toThrow(/chainConfig|DKG_PRIVATE_KEY/);
+  });
+});
+
+describe('NoChainAdapter — #519 PCA facade contract (must return null, not throw)', () => {
+  const adapter = new NoChainAdapter();
+
+  // The 7 PCA methods are OPTIONAL on ChainAdapter. The DKGAgent facade
+  // guards each with `if (typeof this.chain.X !== 'function') return null`.
+  // NoChainAdapter MUST omit them so a direct SDK caller in no-chain mode
+  // gets the documented `null` (feature-unavailable) instead of a throw.
+  const facade = (name: keyof NoChainAdapter) => {
+    const fn = (adapter as Record<string, unknown>)[name as string];
+    if (typeof fn !== 'function') return null;
+    return (fn as (...a: unknown[]) => unknown).call(adapter, 1n, 0n);
+  };
+
+  const pcaMethods = [
+    'createPublishingConvictionAccount',
+    'topUpPublishingConvictionAccount',
+    'registerPublishingConvictionAgent',
+    'deregisterPublishingConvictionAgent',
+    'isPublishingConvictionAgent',
+    'settlePublishingConvictionAccount',
+    'getPublishingConvictionAccountInfo',
+  ] as const;
+
+  it.each(pcaMethods)('facade over NoChainAdapter.%s returns null (does NOT throw)', (name) => {
+    expect(() => facade(name)).not.toThrow();
+    expect(facade(name)).toBeNull();
+  });
+
+  it('getPublishingConvictionAccountOwner stays (pre-existing, out of scope) and still throws', async () => {
+    await expect(adapter.getPublishingConvictionAccountOwner(1n)).rejects.toThrow(STABLE_MSG);
   });
 });

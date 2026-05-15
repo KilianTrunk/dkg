@@ -26,6 +26,7 @@ import type {
   ProofPeriodStatus,
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
+  V10PublishingConvictionAccountInfo,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -34,6 +35,7 @@ import {
   ChallengeNoLongerActiveError,
 } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
+import { PcaUnavailableError } from './pca-errors.js';
 import {
   buildAuthorAttestationTypedData,
   AUTHOR_SCHEME_VERSION_V1,
@@ -237,16 +239,8 @@ interface ContractCache {
   contextGraphs?: Contract;
   contextGraphStorage?: Contract;
   knowledgeAssetsV10?: Contract;
-  publishingConvictionAccount?: Contract;
-  /**
-   * The V10 NFT-backed PCA (`DKGPublishingConvictionNFT`). Used by the
-   * publisher SDK to detect PCA-funded publishes and mirror the
-   * `kcEpochs == lockDurationEpochs` eligibility check in
-   * `KnowledgeAssetsV10.publish()` — wrong epochs silently fall through
-   * to direct spend, so the SDK pre-coerces to keep the discount. The
-   * legacy V9 `publishingConvictionAccount` cache slot above is retained
-   * only to satisfy stale Hub bindings on older deploys.
-   */
+  /** V10 NFT-backed PCA. Backs the PCA write surface + the publisher's
+   *  `kcEpochs == lockDurationEpochs` discount check (SDK pre-coerces). */
   dkgPublishingConvictionNFT?: Contract;
   randomSampling?: Contract;
   randomSamplingStorage?: Contract;
@@ -700,12 +694,6 @@ export class EVMChainAdapter implements ChainAdapter {
       this.contracts.knowledgeAssetsV10 = await this.resolveContract('KnowledgeAssetsV10');
     } catch {
       // V10 contract not deployed — createKnowledgeAssetsV10 unavailable
-    }
-
-    try {
-      this.contracts.publishingConvictionAccount = await this.resolveContract('PublishingConvictionAccount');
-    } catch {
-      // PublishingConvictionAccount not deployed — conviction account operations unavailable
     }
 
     try {
@@ -2185,6 +2173,150 @@ export class EVMChainAdapter implements ChainAdapter {
     const nft = await this.resolveContract('DKGPublishingConvictionNFT');
     const owner = await nft.ownerOf(accountId);
     return ethers.getAddress(owner);
+  }
+
+  private requireConvictionNFT(): Contract {
+    const nft = this.contracts.dkgPublishingConvictionNFT;
+    if (!nft) {
+      throw new PcaUnavailableError();
+    }
+    return nft;
+  }
+
+  // Opaque "unknown custom error"+data reverts carry no name; enrich so the
+  // daemon classifier matches it (mirrors isContractMissingRevert et al).
+  private async pcaWrite<T>(op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (err) {
+      if (err instanceof Error) enrichEvmError(err);
+      throw err;
+    }
+  }
+
+  async createPublishingConvictionAccount(
+    committedTRAC: bigint,
+  ): Promise<{ accountId: bigint } & TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const nftAddress = await nft.getAddress();
+
+      // createAccount() does transferFrom(msg.sender → stakingStorage,
+      // committedTRAC) — the signer must allow the NFT to pull the TRAC.
+      if (this.contracts.token) {
+        const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+        if (allowance < committedTRAC) {
+          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+        }
+      }
+
+      const tx = await nft.createAccount(committedTRAC);
+      const receipt = await tx.wait();
+
+      let accountId = 0n;
+      for (const log of receipt.logs) {
+        try {
+          const parsed = nft.interface.parseLog({ topics: [...log.topics], data: log.data });
+          if (parsed?.name === 'AccountCreated') {
+            accountId = BigInt(parsed.args.accountId);
+            break;
+          }
+        } catch { /* not this contract's event */ }
+      }
+      if (accountId === 0n) {
+        throw new Error('createPublishingConvictionAccount succeeded but no AccountCreated event found');
+      }
+
+      return {
+        accountId,
+        hash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        success: receipt.status === 1,
+      };
+    });
+  }
+
+  async getPublishingConvictionAccountInfo(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null> {
+    await this.init();
+    // Undeployed NFT → capability error (503). null is reserved below
+    // for a genuine account-missing revert so the route can disambiguate.
+    if (!this.contracts.dkgPublishingConvictionNFT) throw new PcaUnavailableError();
+    try {
+      const t = await this.contracts.dkgPublishingConvictionNFT.getAccountInfo(accountId);
+      return {
+        owner: ethers.getAddress(t[0]),
+        committedTRAC: BigInt(t[1]),
+        baseEpochAllowance: BigInt(t[2]),
+        createdAtEpoch: Number(t[3]),
+        expiresAtEpoch: Number(t[4]),
+        createdAtTimestamp: Number(t[5]),
+        expiresAtTimestamp: Number(t[6]),
+        discountBps: Number(t[7]),
+        topUpBuffer: BigInt(t[8]),
+        agentCount: Number(t[9]),
+        lastSettledWindow: Number(t[10]),
+        fullySwept: Boolean(t[11]),
+      };
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return null;
+      throw err;
+    }
+  }
+
+  async topUpPublishingConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const nftAddress = await nft.getAddress();
+      if (this.contracts.token) {
+        const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+        if (allowance < amount) {
+          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+        }
+      }
+      const receipt = await (await nft.topUp(accountId, amount)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
+  }
+
+  async settlePublishingConvictionAccount(accountId: bigint): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await (await nft.settle(accountId)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
+  }
+
+  async registerPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await (await nft.registerAgent(accountId, agent)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
+  }
+
+  async deregisterPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await (await nft.deregisterAgent(accountId, agent)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
+  }
+
+  async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) return false;
+    if (!ethers.isAddress(agent)) return false;
+    try {
+      return Boolean(await this.contracts.dkgPublishingConvictionNFT.isAgent(accountId, agent));
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return false;
+      throw err;
+    }
   }
 
   // =====================================================================

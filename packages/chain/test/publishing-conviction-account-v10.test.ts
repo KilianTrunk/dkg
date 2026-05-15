@@ -1,0 +1,137 @@
+/**
+ * V10 Publishing Conviction NFT — chain-adapter write+read lifecycle
+ * against a real Hardhat node (issue #519 / TB-0001).
+ *
+ * Covers the seven V10 `DKGPublishingConvictionNFT` adapter methods:
+ * create / topUp / registerAgent / deregisterAgent / isAgent / settle /
+ * getAccountInfo, plus the owner-gating invariant (non-owner writes must
+ * surface the on-chain revert, never be swallowed).
+ *
+ * Conventions mirror chain-lifecycle-extra.test.ts: real EVMChainAdapter
+ * over the shared Hardhat node, one snapshot per test for isolation.
+ */
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { ethers } from 'ethers';
+import {
+  createEVMAdapter,
+  getSharedContext,
+  createProvider,
+  takeSnapshot,
+  revertSnapshot,
+  HARDHAT_KEYS,
+} from './evm-test-context.js';
+import { mintTokens } from './hardhat-harness.js';
+
+const COMMITTED = ethers.parseEther('10000');
+
+let fileSnapshotId: string;
+let testSnapshotId: string;
+
+async function fundedOwner(key: string = HARDHAT_KEYS.CORE_OP) {
+  const adapter = createEVMAdapter(key);
+  await mintTokens(
+    createProvider(),
+    getSharedContext().hubAddress,
+    HARDHAT_KEYS.DEPLOYER,
+    adapter.getSignerAddress(),
+    COMMITTED * 4n,
+  );
+  return adapter;
+}
+
+describe('V10 Publishing Conviction NFT — chain-adapter lifecycle', () => {
+  beforeAll(async () => { fileSnapshotId = await takeSnapshot(); }, 120_000);
+  afterAll(async () => { await revertSnapshot(fileSnapshotId); });
+  beforeEach(async () => { testSnapshotId = await takeSnapshot(); });
+  afterEach(async () => { await revertSnapshot(testSnapshotId); });
+
+  it('createPublishingConvictionAccount mints the NFT to the signer and returns accountId + txHash', async () => {
+    const owner = await fundedOwner();
+
+    const res = await owner.createPublishingConvictionAccount(COMMITTED);
+    expect(res.success).toBe(true);
+    expect(res.accountId).toBeGreaterThan(0n);
+    expect(res.hash).toMatch(/^0x[0-9a-fA-F]{64}$/);
+    expect(res.blockNumber).toBeGreaterThan(0);
+
+    const onChainOwner = await owner.getPublishingConvictionAccountOwner(res.accountId);
+    expect(onChainOwner.toLowerCase()).toBe(owner.getSignerAddress().toLowerCase());
+
+    const info = await owner.getPublishingConvictionAccountInfo(res.accountId);
+    expect(info).not.toBeNull();
+    expect(info!.owner.toLowerCase()).toBe(owner.getSignerAddress().toLowerCase());
+    expect(info!.committedTRAC).toBe(COMMITTED);
+    expect(info!.agentCount).toBe(0);
+  });
+
+  it('registerPublishingConvictionAgent then isPublishingConvictionAgent returns true and the reverse map resolves', async () => {
+    const owner = await fundedOwner();
+    const { accountId } = await owner.createPublishingConvictionAccount(COMMITTED);
+
+    const agent = ethers.Wallet.createRandom().address;
+    expect(await owner.isPublishingConvictionAgent(accountId, agent)).toBe(false);
+
+    const reg = await owner.registerPublishingConvictionAgent(accountId, agent);
+    expect(reg.success).toBe(true);
+
+    expect(await owner.isPublishingConvictionAgent(accountId, agent)).toBe(true);
+    expect(await owner.getConvictionAgentAccountId(agent)).toBe(accountId);
+
+    const info = await owner.getPublishingConvictionAccountInfo(accountId);
+    expect(info!.agentCount).toBe(1);
+
+    const dereg = await owner.deregisterPublishingConvictionAgent(accountId, agent);
+    expect(dereg.success).toBe(true);
+    expect(await owner.isPublishingConvictionAgent(accountId, agent)).toBe(false);
+    expect(await owner.getConvictionAgentAccountId(agent)).toBe(0n);
+  });
+
+  it('owner topUpPublishingConvictionAccount + settlePublishingConvictionAccount succeed and topUpBuffer updates', async () => {
+    const owner = await fundedOwner();
+    const { accountId } = await owner.createPublishingConvictionAccount(COMMITTED);
+
+    const top = await owner.topUpPublishingConvictionAccount(accountId, COMMITTED);
+    expect(top.success).toBe(true);
+    const info = await owner.getPublishingConvictionAccountInfo(accountId);
+    expect(info!.topUpBuffer).toBe(COMMITTED);
+
+    const settled = await owner.settlePublishingConvictionAccount(accountId);
+    expect(settled.success).toBe(true);
+  });
+
+  it('non-owner topUp / registerPublishingConvictionAgent propagate the on-chain owner revert (not swallowed)', async () => {
+    const owner = await fundedOwner(HARDHAT_KEYS.CORE_OP);
+    const { accountId } = await owner.createPublishingConvictionAccount(COMMITTED);
+
+    const stranger = await fundedOwner(HARDHAT_KEYS.PUBLISHER);
+    expect(stranger.getSignerAddress().toLowerCase())
+      .not.toBe(owner.getSignerAddress().toLowerCase());
+
+    await expect(stranger.topUpPublishingConvictionAccount(accountId, COMMITTED)).rejects.toThrow();
+    await expect(
+      stranger.registerPublishingConvictionAgent(accountId, ethers.Wallet.createRandom().address),
+    ).rejects.toThrow();
+
+    // The owner revert must not have mutated state.
+    const info = await owner.getPublishingConvictionAccountInfo(accountId);
+    expect(info!.topUpBuffer).toBe(0n);
+    expect(info!.agentCount).toBe(0);
+  });
+
+  it('existing V10 read methods are preserved and the dead V9 cache slot is gone', async () => {
+    const owner = await fundedOwner();
+    const { accountId } = await owner.createPublishingConvictionAccount(COMMITTED);
+
+    // getConvictionAccountLockDurationEpochs reads the protocol-wide
+    // ParametersStorage.publishingConvictionEpochs snapshot (default 12).
+    expect(await owner.getConvictionAccountLockDurationEpochs(accountId)).toBe(12);
+    expect((await owner.getPublishingConvictionAccountOwner(accountId)).toLowerCase())
+      .toBe(owner.getSignerAddress().toLowerCase());
+
+    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'evm-adapter.ts'), 'utf8');
+    expect(src).not.toMatch(/\bpublishingConvictionAccount\b/);
+    expect(src).not.toMatch(/resolveContract\(\s*'PublishingConvictionAccount'\s*\)/);
+  });
+});

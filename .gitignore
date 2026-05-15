@@ -25,6 +25,7 @@ packages/evm-module/typechain/
 
 # Agent scratch (project memory across orchestrator runs). Local only.
 .ai/
+.scratch/
 
 packages/evm-module/deployments/hardhat_contracts.json
 packages/evm-module/deployments/localhost_contracts.json

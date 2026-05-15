@@ -204,16 +204,23 @@ export interface PermanentPublishParams {
   receiverSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
 }
 
-// ----- Publishing Conviction Account types -----
+// ----- V10 Publishing Conviction NFT types -----
 
-export interface ConvictionAccountInfo {
-  accountId: bigint;
-  admin: string;
-  balance: bigint;
-  initialDeposit: bigint;
-  lockEpochs: number;
-  conviction: bigint;
+/** Mirrors `DKGPublishingConvictionNFT.getAccountInfo`; adapter returns
+ *  null when the NFT is undeployed or the account is missing. */
+export interface V10PublishingConvictionAccountInfo {
+  owner: string;
+  committedTRAC: bigint;
+  baseEpochAllowance: bigint;
+  createdAtEpoch: number;
+  expiresAtEpoch: number;
+  createdAtTimestamp: number;
+  expiresAtTimestamp: number;
   discountBps: number;
+  topUpBuffer: bigint;
+  agentCount: number;
+  lastSettledWindow: number;
+  fullySwept: boolean;
 }
 
 // ----- V10 publish types -----
@@ -601,6 +608,18 @@ export interface ChainAdapter {
    * contract's PCA eligibility check fails the `==` constraint).
    */
   getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
+
+  // ----- V10 Publishing Conviction NFT write+read surface -----
+  // Wraps `DKGPublishingConvictionNFT`. Optional; owner-gated writes
+  // MUST surface the owner revert (→ 403), never swallow it.
+
+  createPublishingConvictionAccount?(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult>;
+  topUpPublishingConvictionAccount?(accountId: bigint, amount: bigint): Promise<TxResult>;
+  registerPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;
+  deregisterPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;
+  isPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<boolean>;
+  settlePublishingConvictionAccount?(accountId: bigint): Promise<TxResult>;
+  getPublishingConvictionAccountInfo?(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null>;
 
   /**
    * Sign an arbitrary message hash using the node's primary operational key.

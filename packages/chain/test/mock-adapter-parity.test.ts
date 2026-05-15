@@ -120,6 +120,13 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // MockChainAdapter.
   'requireKCStorage',
   'requireContextGraphStorage',
+  // TS-private EVM-only helpers backing the V10 PCA write surface
+  // (no mock equivalent — mock raises typed reverts directly).
+  'requireConvictionNFT',
+  'pcaWrite',
+  // The seven V10 Publishing Conviction NFT methods (issue #519 /
+  // TB-0002) are now mirrored on MockChainAdapter (in-memory account
+  // map + agent reverse map + owner gating) — no longer exempt.
 ]);
 
 const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([
@@ -281,7 +288,7 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       publishAuthorityAccountId: 1n,
     })).rejects.toThrow(/PCA account 1 does not exist/);
 
-    // `createConvictionAccount` was archived in `archive-non-v10-contracts`;
+    // `createPublishingConvictionAccount` was archived in `archive-non-v10-contracts`;
     // seed the mock's PCA-owner map directly so the publish-policy branch
     // that requires `ownerOf(accountId)` can still be exercised.
     const accountId = mock.seedConvictionAccount('0x1111111111111111111111111111111111111111');

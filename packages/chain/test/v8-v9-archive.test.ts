@@ -32,7 +32,10 @@ const ARCHIVED_METHODS: ReadonlyArray<string> = [
   'transferNamespace',
   // V9 permanent publish
   'publishKnowledgeAssetsPermanent',
-  // PCA family
+  // V9 PCA family — all V9-only names. The V10 surface uses explicit
+  // `*PublishingConviction*` names (issue #519, PRD §6) to disambiguate
+  // from staking conviction, so these bare `Conviction` names must stay
+  // absent from the live adapter.
   'createConvictionAccount',
   'addConvictionFunds',
   'extendConvictionLock',

@@ -1,34 +1,19 @@
-// daemon/routes/pca.ts
-//
-// Route handlers for Publishing Conviction Account (PCA) operator
-// surface. Lives in its own file (instead of folding into `assertion.ts`)
-// because PCAs are a distinct economic primitive: they're the off-chain
-// expression of the on-chain `PublishingConvictionAccount` contract,
-// driven by an operator standing up the runbook fixtures, not by the
-// publish/query data path.
-//
-// All four routes delegate to the agent facade methods added in
-// `packages/agent/src/dkg-agent.ts` (createPublishingConvictionAccount,
-// addPCAAuthorizedKey, isPCAAuthorizedKey, getPublishingConvictionAccountInfo,
-// addPublishingConvictionAccountFunds), which in turn delegate to the
-// chain adapter. Reads are permissionless on chain; writes are
-// admin-gated by the on-chain `require(msg.sender == account.admin)`
-// check, so the daemon must be running as the PCA admin EOA for
-// `POST /api/pca/:id/authorize` and `POST /api/pca/:id/funds` to land.
-//
-// Adapters that don't expose the underlying chain methods (no-chain
-// mode, pre-V10.1 adapter copies) return 503 — same convention as the
-// existing `/api/kc/:id/author` route.
+// V10 Publishing Conviction NFT operator routes (see ARCHITECTURE.md
+// § #519). Owner-gated writes: owner revert → 403, no-chain → 503.
 
 import { ethers } from 'ethers';
+import {
+  isPcaUnavailableError,
+  type V10PublishingConvictionAccountInfo,
+} from '@origintrail-official/dkg-chain';
 import { jsonResponse, readBody, SMALL_BODY_BYTES } from '../http-utils.js';
 import type { RequestContext } from './context.js';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 const FEATURE_UNAVAILABLE_503 = {
   error:
-    'Chain adapter does not expose Publishing Conviction Account methods — ' +
-    'V10.1 PCA management is not available on this deployment',
+    'Chain adapter does not expose V10 Publishing Conviction NFT methods — ' +
+    'PCA management is not available on this deployment',
 };
 
 function safeParseJson(body: string): { ok: true; value: any } | { ok: false; error: string } {
@@ -37,6 +22,43 @@ function safeParseJson(body: string): { ok: true; value: any } | { ok: false; er
   } catch (e: any) {
     return { ok: false, error: `Invalid JSON: ${e?.message ?? String(e)}` };
   }
+}
+
+// Owner-gated write by a non-owner daemon EOA → 403 (distinct from 500
+// RPC / 503 no-chain). `NotAccountAdmin` kept for legacy parity.
+function isOwnerRevert(msg: string): boolean {
+  return /NotAccountOwner|NotAccountAdmin/i.test(msg);
+}
+
+// NoChainAdapter throws `noChain()` instead of returning null → 503.
+function isNoChain(msg: string): boolean {
+  return /No blockchain configured/i.test(msg);
+}
+
+// DKGPublishingConvictionNFT undeployed on the Hub → 503 (capability
+// gap, not a caller error). Typed error first, message fallback second.
+function isPcaUnavailable(err: unknown, msg: string): boolean {
+  return isPcaUnavailableError(err) || /not deployed on this Hub/i.test(msg);
+}
+
+// Deterministic PCA contract custom-error reverts → 4xx so clients can
+// tell a bad request from a retryable outage. ethers wraps the name.
+function classifyPcaRevert(msg: string): { status: number; error: string } | null {
+  if (/\bInvalidAmount\b/.test(msg)) return { status: 400, error: 'InvalidAmount' };
+  if (/\bZeroAgentAddress\b/.test(msg)) return { status: 400, error: 'ZeroAgentAddress' };
+  if (/\bTokenTransferFailed\b/.test(msg)) return { status: 400, error: 'TokenTransferFailed' };
+  if (/\bAgentAlreadyRegistered\b/.test(msg)) return { status: 409, error: 'AgentAlreadyRegistered' };
+  if (/\bAgentNotRegistered\b/.test(msg)) return { status: 409, error: 'AgentNotRegistered' };
+  if (/\bAgentCapReached\b/.test(msg)) return { status: 409, error: 'AgentCapReached' };
+  if (/\bAccountExpired\b/.test(msg)) return { status: 409, error: 'AccountExpired' };
+  if (/\bAccountAlreadyFullySettled\b/.test(msg)) return { status: 409, error: 'AccountAlreadyFullySettled' };
+  // OZ v5 _requireOwned on an unminted NFT id → caller mistake, 404.
+  // Legacy string-revert fallback for older OZ ERC721 builds.
+  if (/\bERC721NonexistentToken\b/.test(msg) ||
+      /nonexistent token|owner query for nonexistent token|ERC721: invalid token ID/i.test(msg)) {
+    return { status: 404, error: 'UnknownAccount' };
+  }
+  return null;
 }
 
 function parseAccountId(idStr: string): bigint | null {
@@ -66,25 +88,26 @@ function parseTokenAmount(raw: unknown, field: string): bigint | { error: string
   }
 }
 
-function serializeAccountInfo(info: {
-  accountId: bigint;
-  admin: string;
-  balance: bigint;
-  initialDeposit: bigint;
-  lockEpochs: number;
-  conviction: bigint;
-  discountBps: number;
-}): Record<string, unknown> {
+function serializeAccountInfo(
+  accountId: bigint,
+  info: V10PublishingConvictionAccountInfo,
+): Record<string, unknown> {
   return {
-    accountId: info.accountId.toString(),
-    admin: info.admin,
-    balance: info.balance.toString(),
-    balanceTrac: ethers.formatEther(info.balance),
-    initialDeposit: info.initialDeposit.toString(),
-    initialDepositTrac: ethers.formatEther(info.initialDeposit),
-    lockEpochs: info.lockEpochs,
-    conviction: info.conviction.toString(),
+    accountId: accountId.toString(),
+    owner: info.owner,
+    committedTRAC: info.committedTRAC.toString(),
+    committedTRACTrac: ethers.formatEther(info.committedTRAC),
+    baseEpochAllowance: info.baseEpochAllowance.toString(),
+    topUpBuffer: info.topUpBuffer.toString(),
+    topUpBufferTrac: ethers.formatEther(info.topUpBuffer),
+    createdAtEpoch: info.createdAtEpoch,
+    expiresAtEpoch: info.expiresAtEpoch,
+    createdAtTimestamp: info.createdAtTimestamp,
+    expiresAtTimestamp: info.expiresAtTimestamp,
     discountBps: info.discountBps,
+    agentCount: info.agentCount,
+    lastSettledWindow: info.lastSettledWindow,
+    fullySwept: info.fullySwept,
   };
 }
 
@@ -93,41 +116,39 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
 
   if (!path.startsWith('/api/pca')) return;
 
-  // POST /api/pca — create a new PCA, signed by the daemon's EOA. The
-  // signer becomes the on-chain `admin` and is auto-authorized.
-  // Body: { tokens: "100000", lockEpochs: 12 }
+  // POST /api/pca — mint a conviction NFT to the daemon EOA (the owner).
+  // No `lockEpochs` (global protocol param). Body: { tokens: "100000" }
   if (req.method === 'POST' && path === '/api/pca') {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body);
     if (!parsed.ok) return jsonResponse(res, 400, { error: parsed.error });
-    const { tokens, lockEpochs } = parsed.value ?? {};
+    const { tokens } = parsed.value ?? {};
     const amount = parseTokenAmount(tokens, 'tokens');
     if (typeof amount !== 'bigint') return jsonResponse(res, 400, amount);
-    if (typeof lockEpochs !== 'number' || !Number.isInteger(lockEpochs) || lockEpochs <= 0) {
-      return jsonResponse(res, 400, {
-        error: 'lockEpochs must be a positive integer (number of epochs to lock)',
-      });
-    }
     try {
-      const result = await agent.createPublishingConvictionAccount(amount, lockEpochs);
+      const result = await agent.createPublishingConvictionAccount(amount);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 200, {
         accountId: result.accountId.toString(),
-        txHash: result.txHash,
+        txHash: result.hash,
         blockNumber: result.blockNumber,
         committedTokens: ethers.formatEther(amount),
-        lockEpochs,
       });
     } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error });
       return jsonResponse(res, 500, {
-        error: `createConvictionAccount failed: ${err?.message ?? String(err)}`,
+        error: `createPublishingConvictionAccount failed: ${msg}`,
       });
     }
   }
 
-  // POST /api/pca/:id/authorize — admin-gated; the daemon's EOA must be
-  // the PCA admin. Body: { key: "0x..." }
-  if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/authorize$/.test(path)) {
+  // POST /api/pca/:id/agent — register a publishing agent. Owner-gated;
+  // the daemon's EOA must be the PCA NFT owner. Body: { agent: "0x..." }
+  if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/agent$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);
     if (accountId === null) {
@@ -136,37 +157,95 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body);
     if (!parsed.ok) return jsonResponse(res, 400, { error: parsed.error });
-    const { key } = parsed.value ?? {};
-    if (typeof key !== 'string' || !ethers.isAddress(key)) {
-      return jsonResponse(res, 400, { error: 'key must be a valid 0x-prefixed EVM address' });
+    const { agent: agentAddr } = parsed.value ?? {};
+    if (typeof agentAddr !== 'string' || !ethers.isAddress(agentAddr)) {
+      return jsonResponse(res, 400, { error: 'agent must be a valid 0x-prefixed EVM address' });
+    }
+    // Fast-reject zero address before any RPC; ZeroAgentAddress→400 in
+    // classifyPcaRevert remains as defense-in-depth.
+    if (agentAddr.toLowerCase() === ZERO) {
+      return jsonResponse(res, 400, { error: 'agent must not be the zero address' });
     }
     try {
-      const result = await agent.addPCAAuthorizedKey(accountId, key);
+      const result = await agent.registerPublishingConvictionAgent(accountId, agentAddr);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
-      const verified = (await agent.isPCAAuthorizedKey(accountId, key)) ?? null;
+      // Tx mined → authoritative 200. Verification is best-effort: own
+      // try/catch keeps a probe failure off the outer catch (no false 500).
+      let verified: boolean | null = null;
+      try {
+        verified = await agent.isPublishingConvictionAgent(accountId, agentAddr);
+      } catch {
+        verified = null;
+      }
       return jsonResponse(res, 200, {
         accountId: idStr,
-        key,
-        authorized: verified === true,
-        txHash: result.txHash,
+        agent: agentAddr,
+        registered: verified === true,
+        adapterSupported: verified !== null,
+        txHash: result.hash,
         blockNumber: result.blockNumber,
       });
     } catch (err: any) {
       const msg = err?.message ?? String(err);
-      // Surface the contract's NotAccountAdmin revert as 403 so callers
-      // can distinguish "wrong daemon EOA" from "RPC failure" without
-      // string-sniffing.
-      if (/NotAccountAdmin|admin/i.test(msg)) {
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
-          error: 'NotAccountAdmin — daemon EOA is not the PCA admin',
+          error: 'NotAccountOwner — daemon EOA is not the PCA owner',
           accountId: idStr,
         });
       }
-      return jsonResponse(res, 500, { error: `addAuthorizedKey failed: ${msg}` });
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
+      return jsonResponse(res, 500, { error: `registerPublishingConvictionAgent failed: ${msg}` });
     }
   }
 
-  // POST /api/pca/:id/funds — top-up a PCA. Admin-gated. Body: { tokens: "50000" }
+  // DELETE /api/pca/:id/agent/:address — deregister a publishing agent.
+  // Owner-gated; the daemon's EOA must be the PCA NFT owner.
+  if (req.method === 'DELETE' && /^\/api\/pca\/[^/]+\/agent\/[^/]+$/.test(path)) {
+    const parts = path.split('/');
+    const idStr = decodeURIComponent(parts[3] ?? '');
+    const agentAddr = decodeURIComponent(parts[5] ?? '');
+    const accountId = parseAccountId(idStr);
+    if (accountId === null) {
+      return jsonResponse(res, 400, { error: 'Invalid accountId — must be a non-negative integer' });
+    }
+    if (!ethers.isAddress(agentAddr)) {
+      return jsonResponse(res, 400, { error: 'agent must be a valid 0x-prefixed EVM address' });
+    }
+    // Fast-reject zero address before any RPC; ZeroAgentAddress→400 in
+    // classifyPcaRevert remains as defense-in-depth.
+    if (agentAddr.toLowerCase() === ZERO) {
+      return jsonResponse(res, 400, { error: 'agent must not be the zero address' });
+    }
+    try {
+      const result = await agent.deregisterPublishingConvictionAgent(accountId, agentAddr);
+      if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      return jsonResponse(res, 200, {
+        accountId: idStr,
+        agent: agentAddr,
+        deregistered: true,
+        txHash: result.hash,
+        blockNumber: result.blockNumber,
+      });
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isOwnerRevert(msg)) {
+        return jsonResponse(res, 403, {
+          error: 'NotAccountOwner — daemon EOA is not the PCA owner',
+          accountId: idStr,
+        });
+      }
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
+      return jsonResponse(res, 500, { error: `deregisterPublishingConvictionAgent failed: ${msg}` });
+    }
+  }
+
+  // POST /api/pca/:id/funds — top-up a PCA. Owner-gated. Body: { tokens: "50000" }
   if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/funds$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);
@@ -180,29 +259,59 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     const amount = parseTokenAmount(tokens, 'tokens');
     if (typeof amount !== 'bigint') return jsonResponse(res, 400, amount);
     try {
-      const result = await agent.addPublishingConvictionAccountFunds(accountId, amount);
+      const result = await agent.topUpPublishingConvictionAccount(accountId, amount);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 200, {
         accountId: idStr,
         addedTokens: ethers.formatEther(amount),
-        txHash: result.txHash,
+        txHash: result.hash,
         blockNumber: result.blockNumber,
       });
     } catch (err: any) {
       const msg = err?.message ?? String(err);
-      if (/NotAccountAdmin|admin/i.test(msg)) {
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
-          error: 'NotAccountAdmin — daemon EOA is not the PCA admin',
+          error: 'NotAccountOwner — daemon EOA is not the PCA owner',
           accountId: idStr,
         });
       }
-      return jsonResponse(res, 500, { error: `addConvictionFunds failed: ${msg}` });
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
+      return jsonResponse(res, 500, { error: `topUpPublishingConvictionAccount failed: ${msg}` });
     }
   }
 
-  // GET /api/pca/:id — read-only PCA snapshot (admin, balance, conviction,
-  // current discount). Optional ?key=0x... probes whether `key` is
-  // currently on the account's `authorizedKeys` set.
+  // POST /api/pca/:id/settle — run the lazy-settlement sweep. The
+  // contract method is permissionless, so no owner gating here.
+  if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/settle$/.test(path)) {
+    const idStr = decodeURIComponent(path.split('/')[3] ?? '');
+    const accountId = parseAccountId(idStr);
+    if (accountId === null) {
+      return jsonResponse(res, 400, { error: 'Invalid accountId — must be a non-negative integer' });
+    }
+    try {
+      const result = await agent.settlePublishingConvictionAccount(accountId);
+      if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      return jsonResponse(res, 200, {
+        accountId: idStr,
+        settled: true,
+        txHash: result.hash,
+        blockNumber: result.blockNumber,
+      });
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
+      return jsonResponse(res, 500, { error: `settlePublishingConvictionAccount failed: ${msg}` });
+    }
+  }
+
+  // GET /api/pca/:id — V10 conviction NFT snapshot. Optional ?key=0x...
+  // probes whether that address is a registered agent.
   if (req.method === 'GET' && /^\/api\/pca\/[^/]+$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);
@@ -212,32 +321,34 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     try {
       const info = await agent.getPublishingConvictionAccountInfo(accountId);
       if (info === null) {
-        // Either the chain adapter doesn't expose the view, or the
-        // account doesn't exist. The adapter contract returns null
-        // for both — distinguish by probing the method itself.
-        if (typeof (agent as any).chain?.getConvictionAccountInfo !== 'function') {
+        // null = view absent OR account missing; the facade capability
+        // signal disambiguates (no chain surface → 503, else genuine 404).
+        if (!agent.supportsPublishingConvictionNft) {
           return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
         }
         return jsonResponse(res, 404, { error: `Unknown PCA accountId ${idStr}` });
       }
       const probedKey = ctx.url.searchParams.get('key');
-      const result: Record<string, unknown> = serializeAccountInfo(info);
+      const result: Record<string, unknown> = serializeAccountInfo(accountId, info);
       if (probedKey) {
         if (!ethers.isAddress(probedKey)) {
           result.probedKey = { key: probedKey, error: 'invalid EVM address' };
         } else {
-          const isAuth = await agent.isPCAAuthorizedKey(accountId, probedKey);
+          const isAgent = await agent.isPublishingConvictionAgent(accountId, probedKey);
           result.probedKey = {
             key: probedKey,
-            authorized: isAuth === true,
-            adapterSupported: isAuth !== null,
+            registered: isAgent === true,
+            adapterSupported: isAgent !== null,
           };
         }
       }
       return jsonResponse(res, 200, result);
     } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 500, {
-        error: `getConvictionAccountInfo failed: ${err?.message ?? String(err)}`,
+        error: `getPublishingConvictionAccountInfo failed: ${msg}`,
       });
     }
   }

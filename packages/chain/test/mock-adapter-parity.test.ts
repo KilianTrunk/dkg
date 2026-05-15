@@ -122,17 +122,9 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'requireContextGraphStorage',
   // TS-private helper backing the V10 PCA write surface.
   'requireConvictionNFT',
-  // V10 Publishing Conviction NFT write+read surface (issue #519 /
-  // TB-0001). TB-0002 implements these on MockChainAdapter (in-memory
-  // account map + agent reverse map + owner gating) and removes the
-  // entries below from this exemption set.
-  'createConvictionAccount',
-  'topUpConvictionAccount',
-  'registerConvictionAgent',
-  'deregisterConvictionAgent',
-  'isConvictionAgent',
-  'settleConvictionAccount',
-  'getConvictionAccountInfo',
+  // The seven V10 Publishing Conviction NFT methods (issue #519 /
+  // TB-0002) are now mirrored on MockChainAdapter (in-memory account
+  // map + agent reverse map + owner gating) — no longer exempt.
 ]);
 
 const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([

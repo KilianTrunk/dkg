@@ -169,10 +169,8 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     try {
       const result = await agent.registerPublishingConvictionAgent(accountId, agentAddr);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
-      // Tx mined → response is authoritative 200. The verification probe is
-      // best-effort: its own try/catch keeps a probe failure off the outer
-      // catch (else a retry hits AgentAlreadyRegistered). Tri-state mirrors
-      // the GET route's probedKey shape.
+      // Tx mined → authoritative 200. Verification is best-effort: own
+      // try/catch keeps a probe failure off the outer catch (no false 500).
       let verified: boolean | null = null;
       try {
         verified = await agent.isPublishingConvictionAgent(accountId, agentAddr);

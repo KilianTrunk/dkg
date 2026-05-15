@@ -87,3 +87,40 @@ describe('MockChainAdapter — V10 conviction topUp/settle', () => {
     expect(settled.success).toBe(true);
   });
 });
+
+describe('MockChainAdapter — V10 owner-gating parity', () => {
+  const STRANGER = '0x2222222222222222222222222222222222222222';
+
+  it('rejects non-owner topUp/register/deregister with NotAccountOwner (revert not swallowed)', async () => {
+    // Account owned by STRANGER; this mock's signer is SIGNER → not owner.
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const accountId = mock.seedConvictionAccount(STRANGER);
+    const agent = ethers.Wallet.createRandom().address;
+
+    await expect(mock.topUpConvictionAccount(accountId, COMMITTED))
+      .rejects.toThrow(/NotAccountOwner/);
+    await expect(mock.registerConvictionAgent(accountId, agent))
+      .rejects.toThrow(/NotAccountOwner/);
+    await expect(mock.deregisterConvictionAgent(accountId, agent))
+      .rejects.toThrow(/NotAccountOwner/);
+
+    // Rejected writes must not have mutated state.
+    const info = await mock.getConvictionAccountInfo(accountId);
+    expect(info!.topUpBuffer).toBe(0n);
+    expect(info!.agentCount).toBe(0);
+  });
+
+  it('settle is permissionless (no owner gate, parity with the contract)', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const accountId = mock.seedConvictionAccount(STRANGER);
+    await expect(mock.settleConvictionAccount(accountId)).resolves.toMatchObject({ success: true });
+  });
+
+  it('deregistering an unregistered agent reverts AgentNotRegistered', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createConvictionAccount(COMMITTED);
+    await expect(
+      mock.deregisterConvictionAgent(accountId, ethers.Wallet.createRandom().address),
+    ).rejects.toThrow(/AgentNotRegistered/);
+  });
+});

@@ -498,8 +498,18 @@ export class MockChainAdapter implements ChainAdapter {
     return acct;
   }
 
-  async topUpConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
+  // Owner-gating parity with `_requireOwner` — the SDK must surface the
+  // on-chain owner revert, never swallow it (the daemon maps it to 403).
+  private requireConvictionOwner(accountId: bigint) {
     const acct = this.requireConvictionAccount(accountId);
+    if (acct.owner.toLowerCase() !== ethers.getAddress(this.signerAddress).toLowerCase()) {
+      throw new Error(`Mock: NotAccountOwner(${accountId}, ${this.signerAddress})`);
+    }
+    return acct;
+  }
+
+  async topUpConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
+    const acct = this.requireConvictionOwner(accountId);
     acct.topUpBuffer += amount;
     return this.txResult(true);
   }
@@ -510,10 +520,10 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
-    const acct = this.requireConvictionAccount(accountId);
+    const acct = this.requireConvictionOwner(accountId);
     const key = ethers.getAddress(agent).toLowerCase();
     if (this.agentToConvictionAccount.has(key)) {
-      throw new Error('Mock: AgentAlreadyRegistered');
+      throw new Error(`Mock: AgentAlreadyRegistered(${agent}, ${this.agentToConvictionAccount.get(key)})`);
     }
     acct.agents.add(key);
     this.agentToConvictionAccount.set(key, accountId);
@@ -521,8 +531,11 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   async deregisterConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
-    const acct = this.requireConvictionAccount(accountId);
+    const acct = this.requireConvictionOwner(accountId);
     const key = ethers.getAddress(agent).toLowerCase();
+    if (!acct.agents.has(key)) {
+      throw new Error(`Mock: AgentNotRegistered(${accountId}, ${agent})`);
+    }
     acct.agents.delete(key);
     this.agentToConvictionAccount.delete(key);
     return this.txResult(true);

@@ -139,9 +139,9 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
-  // POST /api/pca/:id/authorize — owner-gated; the daemon's EOA must be
-  // the PCA NFT owner. Body: { key: "0x..." }
-  if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/authorize$/.test(path)) {
+  // POST /api/pca/:id/agent — register a publishing agent. Owner-gated;
+  // the daemon's EOA must be the PCA NFT owner. Body: { agent: "0x..." }
+  if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/agent$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);
     if (accountId === null) {
@@ -150,18 +150,18 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body);
     if (!parsed.ok) return jsonResponse(res, 400, { error: parsed.error });
-    const { key } = parsed.value ?? {};
-    if (typeof key !== 'string' || !ethers.isAddress(key)) {
-      return jsonResponse(res, 400, { error: 'key must be a valid 0x-prefixed EVM address' });
+    const { agent: agentAddr } = parsed.value ?? {};
+    if (typeof agentAddr !== 'string' || !ethers.isAddress(agentAddr)) {
+      return jsonResponse(res, 400, { error: 'agent must be a valid 0x-prefixed EVM address' });
     }
     try {
-      const result = await agent.registerConvictionAgent(accountId, key);
+      const result = await agent.registerConvictionAgent(accountId, agentAddr);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
-      const verified = (await agent.isConvictionAgent(accountId, key)) ?? null;
+      const verified = (await agent.isConvictionAgent(accountId, agentAddr)) ?? null;
       return jsonResponse(res, 200, {
         accountId: idStr,
-        key,
-        authorized: verified === true,
+        agent: agentAddr,
+        registered: verified === true,
         txHash: result.hash,
         blockNumber: result.blockNumber,
       });

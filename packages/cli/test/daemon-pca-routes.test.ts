@@ -42,14 +42,33 @@ describe('daemon /api/pca V10 caller contract', () => {
     expect(JSON.parse(res.body).accountId).toBe('1');
   });
 
+  it('POST /api/pca/:id/agent registers an agent → 200 with txHash', async () => {
+    let registered: { id: bigint; agent: string } | null = null;
+    const addr = '0x' + '1'.repeat(40);
+    const agent = {
+      registerConvictionAgent: async (id: bigint, a: string) => {
+        registered = { id, agent: a };
+        return { hash: '0xreg', blockNumber: 9, success: true };
+      },
+      isConvictionAgent: async () => true,
+    };
+    const { res, done } = runCtx('POST', '/api/pca/1/agent', agent, { agent: addr });
+    await done;
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.txHash).toBe('0xreg');
+    expect(body.registered).toBe(true);
+    expect(registered).toEqual({ id: 1n, agent: addr });
+  });
+
   it('maps an owner-gated NotAccountOwner revert on agent register to HTTP 403', async () => {
     const agent = {
       registerConvictionAgent: async () => {
         throw new Error('Mock: NotAccountOwner(1, 0xdeadbeef)');
       },
     };
-    const key = '0x' + '1'.repeat(40);
-    const { res, done } = runCtx('POST', '/api/pca/1/authorize', agent, { key });
+    const addr = '0x' + '1'.repeat(40);
+    const { res, done } = runCtx('POST', '/api/pca/1/agent', agent, { agent: addr });
     await done;
     expect(res.statusCode).toBe(403);
   });

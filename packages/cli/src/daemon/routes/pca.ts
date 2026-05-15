@@ -1,23 +1,26 @@
 // daemon/routes/pca.ts
 //
-// Route handlers for Publishing Conviction Account (PCA) operator
-// surface. Lives in its own file (instead of folding into `assertion.ts`)
-// because PCAs are a distinct economic primitive: they're the off-chain
-// expression of the on-chain `PublishingConvictionAccount` contract,
-// driven by an operator standing up the runbook fixtures, not by the
-// publish/query data path.
+// Route handlers for the V10 Publishing Conviction NFT operator surface.
+// Lives in its own file (instead of folding into `assertion.ts`) because
+// a conviction account is a distinct economic primitive: it's the
+// off-chain expression of the on-chain `DKGPublishingConvictionNFT`
+// ERC-721 (deploy script 053, Hub key `DKGPublishingConvictionNFT`,
+// invoked directly by `KnowledgeAssetsV10.publish()`), driven by an
+// operator standing up runbook fixtures, not by the publish/query path.
 //
 // The routes delegate to the V10 agent facade methods in
 // `packages/agent/src/dkg-agent.ts` (createConvictionAccount,
-// registerConvictionAgent, isConvictionAgent, getConvictionAccountInfo,
-// topUpConvictionAccount), which in turn delegate to the chain adapter.
-// Reads are permissionless on chain; writes are owner-gated by the
-// on-chain `_requireOwner` check, so the daemon must be running as the
-// PCA owner EOA for the authorize/funds routes to land.
+// topUpConvictionAccount, registerConvictionAgent,
+// deregisterConvictionAgent, isConvictionAgent, settleConvictionAccount,
+// getConvictionAccountInfo), which in turn delegate to the chain adapter.
+// `settle` is permissionless on chain; `topUp` / `registerAgent` /
+// `deregisterAgent` are owner-gated by the on-chain owner check, so the
+// daemon must run as the PCA NFT owner EOA for those routes to land —
+// the owner revert surfaces as HTTP 403.
 //
 // Adapters that don't expose the underlying chain methods (no-chain
-// mode, pre-V10.1 adapter copies) return 503 — same convention as the
-// existing `/api/kc/:id/author` route.
+// mode) return 503 — same convention as the existing
+// `/api/kc/:id/author` route.
 
 import { ethers } from 'ethers';
 import type { V10ConvictionAccountInfo } from '@origintrail-official/dkg-chain';
@@ -27,8 +30,8 @@ import type { RequestContext } from './context.js';
 const ZERO = '0x0000000000000000000000000000000000000000';
 const FEATURE_UNAVAILABLE_503 = {
   error:
-    'Chain adapter does not expose Publishing Conviction Account methods — ' +
-    'V10.1 PCA management is not available on this deployment',
+    'Chain adapter does not expose V10 Publishing Conviction NFT methods — ' +
+    'PCA management is not available on this deployment',
 };
 
 function safeParseJson(body: string): { ok: true; value: any } | { ok: false; error: string } {
@@ -273,9 +276,9 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
-  // GET /api/pca/:id — read-only PCA snapshot (admin, balance, conviction,
-  // current discount). Optional ?key=0x... probes whether `key` is
-  // currently on the account's `authorizedKeys` set.
+  // GET /api/pca/:id — read-only V10 conviction NFT snapshot (owner,
+  // committed TRAC, top-up buffer, discount, agentCount). Optional
+  // ?key=0x... probes whether that address is a registered agent.
   if (req.method === 'GET' && /^\/api\/pca\/[^/]+$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);

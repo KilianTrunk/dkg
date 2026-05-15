@@ -460,6 +460,21 @@ describe('Circuit Relay', () => {
     ).toBeDefined();
 
     warnSpy.mockRestore();
+
+    // Also assert the actual NON-amplification contract — Codex PR #526
+    // round 5d caught that the warning-only assertion above wouldn't
+    // catch a regression where the warning still fires but the
+    // listener was wrongly amplified. Core nodes with relayPeers must
+    // get AT MOST one `/p2p-circuit` listen address (the legacy
+    // single-reservation fallback), regardless of relayReservationCount.
+    const coreCircuitSelfAddrs = core.libp2p
+      .getMultiaddrs()
+      .map(ma => ma.toString())
+      .filter(a => a.includes('/p2p-circuit'));
+    expect(
+      coreCircuitSelfAddrs.length,
+      `core node with relayPeers must NOT amplify into multiple /p2p-circuit reservations; got: ${JSON.stringify(coreCircuitSelfAddrs)}`,
+    ).toBeLessThanOrEqual(1);
   }, 15000);
 
   it('dedupes duplicate relayPeers entries by peerId for clamp + relayTargets', async () => {

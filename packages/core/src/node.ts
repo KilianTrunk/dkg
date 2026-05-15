@@ -612,6 +612,16 @@ export class DKGNode {
     const isEdgeWithRelays = !enableRelay && usableRelayCandidates.length > 0;
     if (isEdgeWithRelays) {
       const verdict = validateRelayReservationCount(this.config.relayReservationCount);
+      // Only an `ok` verdict means the operator EXPLICITLY supplied a
+      // valid count. `null` (unset → default) and a `not ok` verdict
+      // (invalid → fell back to default with its own warning) both
+      // produce the default value, and we shouldn't double-warn on
+      // clamps that result from the default sizing not matching a
+      // small relay set. Codex PR #526 round 5d caught that healthy
+      // 1-relay edge nodes were emitting a "clamping to 1" warning
+      // on every startup with no operator misconfig — buries real
+      // problems in log noise.
+      const isExplicitOverride = verdict?.ok === true;
       if (verdict == null) {
         relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
       } else if (verdict.ok) {
@@ -630,10 +640,15 @@ export class DKGNode {
       // gate `reservedRelayCount >= target` is achievable.
       const usableCount = usableRelayCandidates.length;
       if (relayReservationCount > usableCount) {
-        console.warn(
-          `[dkg-core] relayReservationCount=${relayReservationCount} exceeds ` +
-            `usable relay peers=${usableCount}; clamping to ${usableCount}`,
-        );
+        if (isExplicitOverride) {
+          // Operator explicitly asked for more reservations than there
+          // are usable relays — surface that loudly, it's almost
+          // certainly a config error.
+          console.warn(
+            `[dkg-core] relayReservationCount=${relayReservationCount} exceeds ` +
+              `usable relay peers=${usableCount}; clamping to ${usableCount}`,
+          );
+        }
         relayReservationCount = usableCount;
       }
     } else if (

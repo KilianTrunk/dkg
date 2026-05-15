@@ -273,7 +273,10 @@ export interface DkgConfig {
    * Number of relay reservations to hold in parallel when behind NAT.
    * Forwarded into `DKGNodeConfig.relayReservationCount`. Defaults to 3
    * when relayPeers are configured (N-2 tolerance to relay blackouts).
-   * Capped at 16. Ignored when no relayPeers are set. Invalid values
+   * Capped at 16. Ignored (with a warning when set explicitly) in two
+   * cases: no relayPeers configured, or the node itself runs a relay
+   * server (core / `enableRelayServer: true` — relay servers don't
+   * multi-reserve through other relays). Invalid values
    * (0/neg/NaN/fractional/non-numeric/over-cap) fall back to the
    * default with a warning. See packages/core/src/types.ts for the
    * full rationale.

@@ -93,9 +93,16 @@ export interface DKGNodeConfig {
    * Default: 3. Capped at 16 (above which the failure-tolerance
    * benefit is marginal but the per-relay cost is real).
    *
-   * IGNORED when no relayPeers are configured (i.e. the node isn't
-   * behind NAT). Invalid values (0, negative, NaN, fractional,
-   * non-numeric, > 16) fall back to the default with a warning.
+   * IGNORED in two cases (with a startup warning when set explicitly):
+   *   - No relayPeers configured (the node isn't behind NAT — nothing
+   *     to multi-reserve against).
+   *   - Node is itself a relay server (`enableRelayServer: true` or
+   *     `nodeRole: 'core'`) — relay servers don't multi-reserve
+   *     through other relays; that path falls back to the legacy
+   *     single `/p2p-circuit` listener.
+   *
+   * Invalid values (0, negative, NaN, fractional, non-numeric, > 16)
+   * fall back to the default with a warning.
    */
   relayReservationCount?: number;
 }

@@ -34,7 +34,12 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-import { assertDiscountTaken, buildVerifyMarkdown } from './pca-smoke-lib.mjs';
+import {
+  assertDiscountTaken,
+  assertPublishSignerBound,
+  buildVerifyMarkdown,
+  classifyAgentRegistration,
+} from './pca-smoke-lib.mjs';
 
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SELF_DIR, '..');
@@ -170,13 +175,15 @@ function runDevnetScript(arg) {
   return proc.status ?? 1;
 }
 
+// Review blocker 1: a reused already-green devnet carries forward chain
+// state — the `agentToAccountId` map and the daemon's publish-signer
+// rotation cursor — so a 2nd run hits AgentAlreadyRegistered and/or a
+// drifted publish signer. The smoke needs deterministic fresh chain
+// state, so we ALWAYS stop + wipe + boot a clean devnet; we never
+// short-circuit on a green probe.
 async function ensureDevnetLive() {
   let live = await probeDevnetLive();
-  if (live.allUp) {
-    log('devnet probes green (hardhat RPC + node1 + node2 /api/status)');
-    return 0;
-  }
-  log(`devnet probes red — hardhat=${live.hardhat} node1=${live.node1} node2=${live.node2}; (re)booting`);
+  log(`forcing a clean restart (pre-boot probe: hardhat=${live.hardhat} node1=${live.node1} node2=${live.node2})`);
   runDevnetScript('stop');
   const devnetDir = join(REPO_ROOT, '.devnet');
   for (const sub of ['hardhat', 'node1', 'node2', 'node3', 'node4', 'node5', 'node6']) {
@@ -219,18 +226,27 @@ function readNode1() {
     throw new Error('publisher-wallets.json missing — devnet booted without DEVNET_ENABLE_PUBLISHER=1');
   }
   const pub = JSON.parse(readFileSync(pubPath, 'utf8'));
-  const agent = pub.wallets?.[0]?.address;
-  if (!agent) throw new Error('no publisher agent wallet in publisher-wallets.json');
-  const allAddrs = [
-    wallets.adminWallet?.address,
-    ...(wallets.wallets ?? []).map((w) => w.address),
-  ].filter(Boolean);
+  // The daemon publisher rotates among the node's operational wallets
+  // per publish (see devnet/conviction-lazy-settle's rationale). Register
+  // EVERY candidate the publisher could sign with — the union of
+  // wallets.json `.wallets` and publisher-wallets.json `.wallets` —
+  // de-duplicated and lower-cased. Registering only [0] races the
+  // rotation and demotes the publish to the no-discount branch.
+  const opAddrs = (wallets.wallets ?? []).map((w) => w.address);
+  const pubAddrs = (pub.wallets ?? []).map((w) => w.address);
+  const agentAddrs = [...new Set([...opAddrs, ...pubAddrs].filter(Boolean))];
+  if (agentAddrs.length === 0) {
+    throw new Error('no candidate publisher agent wallets on node1');
+  }
+  const fundAddrs = [
+    ...new Set([wallets.adminWallet?.address, ...opAddrs, ...pubAddrs].filter(Boolean)),
+  ];
   return {
     home,
     apiPort: config.apiPort ?? NODE1_PORT,
     authToken: readAuthToken(1) ?? '',
-    agent,
-    fundAddrs: allAddrs,
+    agentAddrs,
+    fundAddrs,
   };
 }
 
@@ -292,7 +308,7 @@ async function runPcaSmoke() {
       `http://127.0.0.1:${HARDHAT_PORT}`, { chainId: 31337, name: 'localhost' });
     provider.pollingInterval = 250;
     const node = readNode1();
-    log(`node1 apiPort=${node.apiPort} agent=${node.agent}`);
+    log(`node1 apiPort=${node.apiPort} agentCandidates=${node.agentAddrs.length}`);
 
     // Pre-fund every node1 EOA with TRAC so the daemon's chain signer
     // (whichever wallet it is) can cover createAccount's transferFrom.
@@ -306,6 +322,12 @@ async function runPcaSmoke() {
     }
     log(`minted 2,000,000 TRAC to ${node.fundAddrs.length} node1 EOAs`);
 
+    const nft = loadContract(ethers, 'DKGPublishingConvictionNFT', [
+      'event CostCovered(uint256 indexed accountId, uint40 indexed epoch, uint96 baseCost, uint96 discountedCost, uint96 drawnFromEpoch, uint96 drawnFromTopUp)',
+      'function agentToAccountId(address) view returns (uint256)',
+    ], provider);
+    const nftAddr = (await nft.getAddress()).toLowerCase();
+
     // 1) POST /api/pca — mint a V10 conviction NFT to the daemon EOA.
     const create = await api(node, 'POST', '/api/pca', { tokens: COMMIT_TRAC });
     steps.push({
@@ -318,17 +340,33 @@ async function runPcaSmoke() {
     if (create.status !== 200) throw new Error('POST /api/pca did not return 200');
     accountId = create.json.accountId;
 
-    // 2) POST /api/pca/:id/agent — register the publisher wallet.
-    const reg = await api(node, 'POST', `/api/pca/${accountId}/agent`, { agent: node.agent });
+    // 2) POST /api/pca/:id/agent — register EVERY candidate publisher
+    // wallet, idempotently. classifyAgentRegistration consults the
+    // on-chain agentToAccountId so a re-run skips wallets already bound
+    // to this account (no AgentAlreadyRegistered revert) and hard-fails
+    // on a wallet bound elsewhere.
+    let registered = 0;
+    let skipped = 0;
+    for (const addr of node.agentAddrs) {
+      const cur = await nft.agentToAccountId(addr);
+      const decision = classifyAgentRegistration(cur, accountId);
+      if (decision.action === 'conflict') {
+        throw new Error(`agent ${addr} ${decision.reason}`);
+      }
+      if (decision.action === 'skip') { skipped += 1; continue; }
+      const reg = await api(node, 'POST', `/api/pca/${accountId}/agent`, { agent: addr });
+      if (reg.status !== 200 || reg.json?.registered !== true) {
+        throw new Error(`register ${addr} → ${reg.status} ${JSON.stringify(reg.json)}`);
+      }
+      registered += 1;
+    }
     steps.push({
       name: 'POST /api/pca/:id/agent',
-      status: reg.status,
-      detail: reg.status === 200
-        ? `agent=${node.agent} registered=${reg.json.registered}`
-        : JSON.stringify(reg.json),
+      status: 200,
+      detail: `registered=${registered} skipped(idempotent)=${skipped} of ${node.agentAddrs.length} candidate wallets`,
     });
-    if (reg.status !== 200 || reg.json.registered !== true) {
-      throw new Error('agent registration did not return registered=true');
+    if (registered + skipped === 0) {
+      throw new Error('no publisher wallets registered');
     }
 
     // 3) Publish a KC as that agent (operator's official discount path).
@@ -337,15 +375,26 @@ async function runPcaSmoke() {
     const pub = await dkgPublish(node, nq);
     steps.push({ name: 'publish KC as agent', status: 'ok', detail: `kcId=${pub.kcId} txHash=${pub.txHash}` });
 
-    // 4) Assert the discount ON CHAIN via the NFT's CostCovered event.
-    const nft = loadContract(ethers, 'DKGPublishingConvictionNFT', [
-      'event CostCovered(uint256 indexed accountId, uint40 indexed epoch, uint96 baseCost, uint96 discountedCost, uint96 drawnFromEpoch, uint96 drawnFromTopUp)',
-    ], provider);
     const receipt = await provider.getTransactionReceipt(pub.txHash);
     if (!receipt) throw new Error(`no receipt for publish tx ${pub.txHash}`);
+
+    // 4a) Bind the ACTUAL publish signer. receipt.from is the wallet
+    // the daemon publisher rotated to for this tx; assert it is a
+    // registered agent of our account BEFORE the discount math, so a
+    // silent demotion fails here with an actionable message.
+    const signer = receipt.from;
+    const signerAccountId = await nft.agentToAccountId(signer);
+    const bound = assertPublishSignerBound({ signer, signerAccountId, accountId });
+    steps.push({
+      name: 'publish signer bound',
+      status: bound.ok ? 'ok' : 'FAIL',
+      detail: bound.reason,
+    });
+    if (!bound.ok) throw new Error(bound.reason);
+
+    // 4b) Assert the discount ON CHAIN via the NFT's CostCovered event.
     let baseCost = 0n;
     let discountedCost = 0n;
-    const nftAddr = (await nft.getAddress()).toLowerCase();
     for (const lg of receipt.logs) {
       if (lg.address.toLowerCase() !== nftAddr) continue;
       try {

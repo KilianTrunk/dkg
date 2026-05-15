@@ -39,6 +39,14 @@ function safeParseJson(body: string): { ok: true; value: any } | { ok: false; er
   }
 }
 
+// Owner-gated V10 writes (createAccount aside) revert `NotAccountOwner`
+// when the daemon EOA is not the NFT owner. Surface that as 403 so
+// callers can distinguish "wrong daemon EOA" from a 500 RPC failure or
+// a 503 no-chain adapter. `NotAccountAdmin` is kept for legacy parity.
+function isOwnerRevert(msg: string): boolean {
+  return /NotAccountOwner|NotAccountAdmin/i.test(msg);
+}
+
 function parseAccountId(idStr: string): bigint | null {
   if (!/^\d+$/.test(idStr)) return null;
   try {
@@ -94,21 +102,17 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
 
   if (!path.startsWith('/api/pca')) return;
 
-  // POST /api/pca — create a new PCA, signed by the daemon's EOA. The
-  // signer becomes the on-chain `admin` and is auto-authorized.
-  // Body: { tokens: "100000", lockEpochs: 12 }
+  // POST /api/pca — mint a new V10 conviction NFT to the daemon's EOA,
+  // which becomes the on-chain owner. The lock duration is a global
+  // protocol parameter, so the body carries no `lockEpochs`.
+  // Body: { tokens: "100000" }
   if (req.method === 'POST' && path === '/api/pca') {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body);
     if (!parsed.ok) return jsonResponse(res, 400, { error: parsed.error });
-    const { tokens, lockEpochs } = parsed.value ?? {};
+    const { tokens } = parsed.value ?? {};
     const amount = parseTokenAmount(tokens, 'tokens');
     if (typeof amount !== 'bigint') return jsonResponse(res, 400, amount);
-    if (typeof lockEpochs !== 'number' || !Number.isInteger(lockEpochs) || lockEpochs <= 0) {
-      return jsonResponse(res, 400, {
-        error: 'lockEpochs must be a positive integer (number of epochs to lock)',
-      });
-    }
     try {
       const result = await agent.createConvictionAccount(amount);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
@@ -117,7 +121,6 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
         txHash: result.hash,
         blockNumber: result.blockNumber,
         committedTokens: ethers.formatEther(amount),
-        lockEpochs,
       });
     } catch (err: any) {
       return jsonResponse(res, 500, {
@@ -126,8 +129,8 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
-  // POST /api/pca/:id/authorize — admin-gated; the daemon's EOA must be
-  // the PCA admin. Body: { key: "0x..." }
+  // POST /api/pca/:id/authorize — owner-gated; the daemon's EOA must be
+  // the PCA NFT owner. Body: { key: "0x..." }
   if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/authorize$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);
@@ -154,20 +157,17 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       });
     } catch (err: any) {
       const msg = err?.message ?? String(err);
-      // Surface the contract's NotAccountAdmin revert as 403 so callers
-      // can distinguish "wrong daemon EOA" from "RPC failure" without
-      // string-sniffing.
-      if (/NotAccountAdmin|admin/i.test(msg)) {
+      if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
-          error: 'NotAccountAdmin — daemon EOA is not the PCA admin',
+          error: 'NotAccountOwner — daemon EOA is not the PCA owner',
           accountId: idStr,
         });
       }
-      return jsonResponse(res, 500, { error: `addAuthorizedKey failed: ${msg}` });
+      return jsonResponse(res, 500, { error: `registerConvictionAgent failed: ${msg}` });
     }
   }
 
-  // POST /api/pca/:id/funds — top-up a PCA. Admin-gated. Body: { tokens: "50000" }
+  // POST /api/pca/:id/funds — top-up a PCA. Owner-gated. Body: { tokens: "50000" }
   if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/funds$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);
@@ -191,13 +191,13 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       });
     } catch (err: any) {
       const msg = err?.message ?? String(err);
-      if (/NotAccountAdmin|admin/i.test(msg)) {
+      if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
-          error: 'NotAccountAdmin — daemon EOA is not the PCA admin',
+          error: 'NotAccountOwner — daemon EOA is not the PCA owner',
           accountId: idStr,
         });
       }
-      return jsonResponse(res, 500, { error: `addConvictionFunds failed: ${msg}` });
+      return jsonResponse(res, 500, { error: `topUpConvictionAccount failed: ${msg}` });
     }
   }
 

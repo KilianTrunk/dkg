@@ -96,7 +96,7 @@ rejections rather than a crash** — fix it preemptively:
 | Shell session | `ulimit -n 4096` before `dkg start` |
 | systemd unit | `LimitNOFILE=4096` in the `[Service]` block |
 | Docker | `--ulimit nofile=4096:4096` |
-| Kubernetes | `securityContext.sysctls` or container-runtime override |
+| Kubernetes | Configure at the **container runtime**, not in the pod spec — `nofile` is an rlimit, not a kernel sysctl, so `securityContext.sysctls` will NOT raise it. Set `LimitNOFILE` in the containerd / CRI-O runtime config (e.g. `[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options].LimitNOFILE = 4096`), or use a `RuntimeClass` whose underlying runtime has the bump baked in. Confirm with `kubectl exec <pod> -- sh -c 'ulimit -n'`. |
 
 To verify the live daemon's effective limit, look for the startup log line
 `[dkg-core] relay server: ulimit -n soft=<N> >= recommended <M>, ok` (or the

@@ -4,10 +4,15 @@
 // the relay-observability PR (PR2 of the libp2p reachability hardening
 // series). Three contracts under test:
 //
-//   1. `isCircuitRelayConnection` — the predicate that decides whether
-//      a libp2p MultiaddrConnection should be byte-counted. Production
-//      passes only `/p2p-circuit` connections through the adapter; we
-//      verify both the positive and negative paths.
+//   1. `isRelayServerStream` — the predicate that decides whether a
+//      libp2p Stream should be byte-counted. Production passes only
+//      HOP/STOP relay-server streams through the adapter; we verify
+//      both the positive and negative paths. (Replaces the previous
+//      `isCircuitRelayConnection` predicate, which counted zero on
+//      real relay servers — see branarakic's PR #525 review:
+//      forwarded relay traffic does not flow over `/p2p-circuit`
+//      MultiaddrConnections on the relay host; the relay pipes raw
+//      HOP+STOP protocol streams together internally.)
 //
 //   2. The no-op surface — registerMetric/Group/Counter/Histogram/Summary
 //      return objects whose methods don't throw. libp2p calls these at
@@ -15,25 +20,31 @@
 //      is missing a method, libp2p will TypeError in production. We
 //      therefore exercise every method on every returned shape.
 //
-//   3. `trackMultiaddrConnection` — the only "real" code path. Subscribes
-//      to the connection's `'message'` event for inbound bytes and
-//      wraps `.send()` for outbound bytes. We simulate traffic via
-//      both surfaces and assert the running totals.
+//   3. `trackProtocolStream` — the only "real" code path. Subscribes to
+//      the stream's `'message'` event for inbound bytes and wraps
+//      `.send()` for outbound bytes. We simulate traffic via both
+//      surfaces and assert the running totals.
+//      `trackMultiaddrConnection` is now a no-op (counting at the
+//      connection level would inflate totals by including non-relay
+//      streams like DHT / gossipsub).
 
 import { describe, it, expect } from 'vitest';
 import {
   RelayMetricsAdapter,
-  isCircuitRelayConnection,
+  isRelayServerStream,
+  RELAY_V2_HOP_CODEC,
+  RELAY_V2_STOP_CODEC,
   type RelayBytesSnapshot,
 } from '../src/libp2p-metrics-adapter.js';
 
 /**
- * Fake MultiaddrConnection minimal enough to flow through the adapter.
+ * Fake Stream minimal enough to flow through the adapter.
  * Inherits EventTarget so `addEventListener('message'|'close')` works
  * just like the real libp2p MessageStream contract.
  */
-class FakeMaConn extends EventTarget {
-  remoteAddr: { toString: () => string };
+class FakeStream extends EventTarget {
+  readonly id: string;
+  readonly protocol: string;
   // Captures everything passed to send() so tests can inspect the
   // outbound stream.
   sentChunks: any[] = [];
@@ -41,9 +52,10 @@ class FakeMaConn extends EventTarget {
   // a Promise<void>; we just emit the event synchronously.
   closed = false;
 
-  constructor(remoteAddr: string) {
+  constructor(protocol: string, id = 'stream-1') {
     super();
-    this.remoteAddr = { toString: () => remoteAddr };
+    this.id = id;
+    this.protocol = protocol;
   }
 
   send(data: any): boolean {
@@ -65,31 +77,27 @@ class FakeMaConn extends EventTarget {
   }
 }
 
-describe('isCircuitRelayConnection', () => {
-  it('returns true for /p2p-circuit relayed multiaddrs', () => {
-    expect(
-      isCircuitRelayConnection({
-        remoteAddr: { toString: () => '/ip4/1.2.3.4/tcp/4001/p2p/12D3.../p2p-circuit/p2p/12D3...edge' },
-      } as any),
-    ).toBe(true);
+describe('isRelayServerStream', () => {
+  it('returns true for HOP relay-server streams', () => {
+    expect(isRelayServerStream({ protocol: RELAY_V2_HOP_CODEC } as any)).toBe(true);
   });
 
-  it('returns false for direct (non-circuit) multiaddrs', () => {
-    expect(
-      isCircuitRelayConnection({
-        remoteAddr: { toString: () => '/ip4/1.2.3.4/tcp/4001/p2p/12D3...peer' },
-      } as any),
-    ).toBe(false);
+  it('returns true for STOP relay-server streams', () => {
+    expect(isRelayServerStream({ protocol: RELAY_V2_STOP_CODEC } as any)).toBe(true);
   });
 
-  it('returns false defensively when remoteAddr is missing or throws', () => {
-    expect(isCircuitRelayConnection({} as any)).toBe(false);
+  it('returns false for unrelated protocol streams (DHT, gossipsub, identify)', () => {
+    expect(isRelayServerStream({ protocol: '/ipfs/kad/1.0.0' } as any)).toBe(false);
+    expect(isRelayServerStream({ protocol: '/meshsub/1.1.0' } as any)).toBe(false);
+    expect(isRelayServerStream({ protocol: '/ipfs/id/1.0.0' } as any)).toBe(false);
+  });
+
+  it('returns false defensively when protocol is missing or throws', () => {
+    expect(isRelayServerStream({} as any)).toBe(false);
     expect(
-      isCircuitRelayConnection({
-        remoteAddr: {
-          toString: () => {
-            throw new Error('boom');
-          },
+      isRelayServerStream({
+        get protocol() {
+          throw new Error('boom');
         },
       } as any),
     ).toBe(false);
@@ -153,24 +161,32 @@ describe('RelayMetricsAdapter — no-op surface', () => {
     expect(m.createTrace()).toBeUndefined();
   });
 
-  it('trackProtocolStream is a no-op (bytes are counted at the connection level)', () => {
+  it('trackMultiaddrConnection is a no-op (bytes are counted at the protocol-stream level)', () => {
+    // Codex review on PR #525 + branarakic's finding: the previous
+    // design counted bytes on /p2p-circuit MultiaddrConnections, but
+    // those don't exist on the relay host — only on the edge
+    // endpoints. Counting at the connection level was always
+    // returning zero in production. The new design moves byte
+    // counting onto trackProtocolStream + HOP/STOP codec filter, and
+    // makes trackMultiaddrConnection a deliberate no-op so it can't
+    // re-introduce zero-rate counters by mistake.
     const m = new RelayMetricsAdapter();
-    expect(() => m.trackProtocolStream({} as any)).not.toThrow();
-    // Stream tracking must NOT inflate the byte counters — we count at
-    // the multiaddr-conn level only, so streams must contribute zero.
+    expect(() => m.trackMultiaddrConnection({} as any)).not.toThrow();
     expect(m.snapshot().bytesIn).toBe(0n);
     expect(m.snapshot().bytesOut).toBe(0n);
+    expect(m.snapshot().activeTracked).toBe(0);
+    expect(m.snapshot().totalTracked).toBe(0);
   });
 });
 
-describe('RelayMetricsAdapter — trackMultiaddrConnection (the real path)', () => {
-  it('does not count bytes on direct (non-/p2p-circuit) connections', () => {
+describe('RelayMetricsAdapter — trackProtocolStream (the real path)', () => {
+  it('does not count bytes on non-relay protocol streams (DHT, gossipsub, identify)', () => {
     const m = new RelayMetricsAdapter();
-    const conn = new FakeMaConn('/ip4/1.2.3.4/tcp/4001/p2p/12D3...direct');
-    m.trackMultiaddrConnection(conn as any);
+    const dht = new FakeStream('/ipfs/kad/1.0.0', 'dht-1');
+    m.trackProtocolStream(dht as any);
 
-    conn.emitInbound(new Uint8Array(100));
-    conn.send(new Uint8Array(200));
+    dht.emitInbound(new Uint8Array(100));
+    dht.send(new Uint8Array(200));
 
     expect(m.snapshot().bytesIn).toBe(0n);
     expect(m.snapshot().bytesOut).toBe(0n);
@@ -178,46 +194,70 @@ describe('RelayMetricsAdapter — trackMultiaddrConnection (the real path)', () 
     expect(m.snapshot().totalTracked).toBe(0);
   });
 
-  it('counts inbound bytes (message events) on /p2p-circuit connections', () => {
+  it('counts inbound bytes (message events) on HOP relay-server streams', () => {
     const m = new RelayMetricsAdapter();
-    const conn = new FakeMaConn('/ip4/1.2.3.4/tcp/4001/p2p/relay/p2p-circuit/p2p/edge');
-    m.trackMultiaddrConnection(conn as any);
+    const hop = new FakeStream(RELAY_V2_HOP_CODEC, 'hop-1');
+    m.trackProtocolStream(hop as any);
 
     expect(m.snapshot().activeTracked).toBe(1);
     expect(m.snapshot().totalTracked).toBe(1);
 
-    conn.emitInbound(new Uint8Array(100));
-    conn.emitInbound(new Uint8Array(200));
-    conn.emitInbound(new Uint8Array(50));
+    hop.emitInbound(new Uint8Array(100));
+    hop.emitInbound(new Uint8Array(200));
+    hop.emitInbound(new Uint8Array(50));
 
     expect(m.snapshot().bytesIn).toBe(350n);
     expect(m.snapshot().bytesOut).toBe(0n);
   });
 
-  it('counts outbound bytes (.send() wrapper) on /p2p-circuit connections', () => {
+  it('counts outbound bytes (.send() wrapper) on STOP relay-server streams', () => {
     const m = new RelayMetricsAdapter();
-    const conn = new FakeMaConn('/ip4/1.2.3.4/tcp/4001/p2p/relay/p2p-circuit/p2p/edge');
-    m.trackMultiaddrConnection(conn as any);
+    const stop = new FakeStream(RELAY_V2_STOP_CODEC, 'stop-1');
+    m.trackProtocolStream(stop as any);
 
-    const ok1 = conn.send(new Uint8Array(64));
-    const ok2 = conn.send(new Uint8Array(128));
+    const ok1 = stop.send(new Uint8Array(64));
+    const ok2 = stop.send(new Uint8Array(128));
 
     // The wrapper preserves the original send's return value.
     expect(ok1).toBe(true);
     expect(ok2).toBe(true);
     // Outbound chunks reach the underlying send() unchanged.
-    expect(conn.sentChunks).toHaveLength(2);
+    expect(stop.sentChunks).toHaveLength(2);
     expect(m.snapshot().bytesOut).toBe(192n);
     expect(m.snapshot().bytesIn).toBe(0n);
   });
 
+  it('counts forwarded-circuit traffic across both HOP and STOP streams', () => {
+    // Realistic relay forwarding scenario: dialer sends bytes via HOP
+    // (inbound to relay), relay pipes them out via STOP (outbound
+    // from relay), reservee replies via STOP (inbound), relay sends
+    // back via HOP (outbound). Verifies bytesIn/bytesOut aggregate
+    // both sides correctly, mirroring `pipe(src, dst, src)` semantics
+    // in @libp2p/circuit-relay-v2/utils.ts.
+    const m = new RelayMetricsAdapter();
+    const hop = new FakeStream(RELAY_V2_HOP_CODEC, 'hop-1');
+    const stop = new FakeStream(RELAY_V2_STOP_CODEC, 'stop-1');
+    m.trackProtocolStream(hop as any);
+    m.trackProtocolStream(stop as any);
+
+    hop.emitInbound(new Uint8Array(1000));
+    stop.send(new Uint8Array(1000));
+    stop.emitInbound(new Uint8Array(500));
+    hop.send(new Uint8Array(500));
+
+    expect(m.snapshot().bytesIn).toBe(1500n);
+    expect(m.snapshot().bytesOut).toBe(1500n);
+    expect(m.snapshot().activeTracked).toBe(2);
+    expect(m.snapshot().totalTracked).toBe(2);
+  });
+
   it('decrements activeTracked on close (but keeps totalTracked = lifetime count)', () => {
     const m = new RelayMetricsAdapter();
-    const conn = new FakeMaConn('/ip4/1.2.3.4/tcp/4001/p2p/relay/p2p-circuit/p2p/edge');
-    m.trackMultiaddrConnection(conn as any);
+    const hop = new FakeStream(RELAY_V2_HOP_CODEC);
+    m.trackProtocolStream(hop as any);
     expect(m.snapshot().activeTracked).toBe(1);
 
-    conn.emitClose();
+    hop.emitClose();
     expect(m.snapshot().activeTracked).toBe(0);
     // totalTracked is a lifetime counter, never decremented.
     expect(m.snapshot().totalTracked).toBe(1);
@@ -225,54 +265,33 @@ describe('RelayMetricsAdapter — trackMultiaddrConnection (the real path)', () 
     // Idempotent — a second close event must not double-decrement
     // activeTracked into negatives, otherwise repeated teardowns
     // would cause underflow.
-    conn.emitClose();
+    hop.emitClose();
     expect(m.snapshot().activeTracked).toBe(0);
   });
 
   it('stops counting inbound bytes after close (listener was removed)', () => {
     const m = new RelayMetricsAdapter();
-    const conn = new FakeMaConn('/p2p-circuit/p2p/edge');
-    m.trackMultiaddrConnection(conn as any);
+    const stop = new FakeStream(RELAY_V2_STOP_CODEC);
+    m.trackProtocolStream(stop as any);
 
-    conn.emitInbound(new Uint8Array(10));
+    stop.emitInbound(new Uint8Array(10));
     expect(m.snapshot().bytesIn).toBe(10n);
 
-    conn.emitClose();
+    stop.emitClose();
     // Post-close inbound events must NOT inflate the counter — the
     // listener has been removed by the close handler.
-    conn.emitInbound(new Uint8Array(100));
+    stop.emitInbound(new Uint8Array(100));
     expect(m.snapshot().bytesIn).toBe(10n);
-  });
-
-  it('aggregates bytes across multiple concurrent connections', () => {
-    const m = new RelayMetricsAdapter();
-    const a = new FakeMaConn('/p2p-circuit/p2p/edge-a');
-    const b = new FakeMaConn('/p2p-circuit/p2p/edge-b');
-    m.trackMultiaddrConnection(a as any);
-    m.trackMultiaddrConnection(b as any);
-
-    expect(m.snapshot().activeTracked).toBe(2);
-
-    a.emitInbound(new Uint8Array(10));
-    b.emitInbound(new Uint8Array(20));
-    b.emitInbound(new Uint8Array(30));
-
-    expect(m.snapshot().bytesIn).toBe(60n);
-    expect(m.snapshot().totalTracked).toBe(2);
-
-    a.emitClose();
-    expect(m.snapshot().activeTracked).toBe(1);
-    expect(m.snapshot().totalTracked).toBe(2);
   });
 
   it('handles Uint8ArrayList-style chunks via byteLength fallback', () => {
     const m = new RelayMetricsAdapter();
-    const conn = new FakeMaConn('/p2p-circuit/p2p/edge');
-    m.trackMultiaddrConnection(conn as any);
+    const stream = new FakeStream(RELAY_V2_HOP_CODEC);
+    m.trackProtocolStream(stream as any);
 
     // Sneak a Uint8ArrayList-shaped chunk through both surfaces.
-    conn.emitInbound({ byteLength: 17 } as any);
-    conn.send({ byteLength: 42 } as any);
+    stream.emitInbound({ byteLength: 17 } as any);
+    stream.send({ byteLength: 42 } as any);
 
     expect(m.snapshot().bytesIn).toBe(17n);
     expect(m.snapshot().bytesOut).toBe(42n);
@@ -280,10 +299,10 @@ describe('RelayMetricsAdapter — trackMultiaddrConnection (the real path)', () 
 
   it('snapshot() is independently readable as a plain object (not a live binding)', () => {
     const m = new RelayMetricsAdapter();
-    const conn = new FakeMaConn('/p2p-circuit/p2p/edge');
-    m.trackMultiaddrConnection(conn as any);
+    const stream = new FakeStream(RELAY_V2_HOP_CODEC);
+    m.trackProtocolStream(stream as any);
     const before: RelayBytesSnapshot = m.snapshot();
-    conn.emitInbound(new Uint8Array(7));
+    stream.emitInbound(new Uint8Array(7));
     const after: RelayBytesSnapshot = m.snapshot();
     // Each snapshot is a fresh capture; before's bytesIn must NOT
     // mutate when the adapter increments its internal counter.
@@ -293,19 +312,19 @@ describe('RelayMetricsAdapter — trackMultiaddrConnection (the real path)', () 
 });
 
 describe('RelayMetricsAdapter — custom shouldTrack predicate (test override)', () => {
-  it('counts bytes on direct connections when shouldTrack returns true', () => {
+  it('counts bytes on non-relay protocol streams when shouldTrack returns true', () => {
     const m = new RelayMetricsAdapter(() => true);
-    const conn = new FakeMaConn('/ip4/1.2.3.4/tcp/4001/direct');
-    m.trackMultiaddrConnection(conn as any);
-    conn.emitInbound(new Uint8Array(99));
+    const dht = new FakeStream('/ipfs/kad/1.0.0');
+    m.trackProtocolStream(dht as any);
+    dht.emitInbound(new Uint8Array(99));
     expect(m.snapshot().bytesIn).toBe(99n);
   });
 
-  it('skips all connections when shouldTrack returns false', () => {
+  it('skips all streams when shouldTrack returns false', () => {
     const m = new RelayMetricsAdapter(() => false);
-    const conn = new FakeMaConn('/p2p-circuit/p2p/edge');
-    m.trackMultiaddrConnection(conn as any);
-    conn.emitInbound(new Uint8Array(99));
+    const stream = new FakeStream(RELAY_V2_STOP_CODEC);
+    m.trackProtocolStream(stream as any);
+    stream.emitInbound(new Uint8Array(99));
     expect(m.snapshot().bytesIn).toBe(0n);
     expect(m.snapshot().activeTracked).toBe(0);
   });

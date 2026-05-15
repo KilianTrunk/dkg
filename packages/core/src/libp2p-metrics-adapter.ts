@@ -2,27 +2,58 @@
 //
 // Minimal in-process implementation of @libp2p/interface's `Metrics`
 // surface, scoped to ONE thing: counting bytes that flow through
-// circuit-relay v2 forwarded connections on a Core Node. We don't ship
-// a full prom-client-style metrics stack here because the entire
+// circuit-relay v2 forwarded traffic on a Core Node. We don't ship a
+// full prom-client-style metrics stack here because the entire
 // observability story for the dashboard already runs through
 // MetricsCollector + DashboardDB; libp2p's Metrics interface just
 // happens to be the only seam where forwarded byte counts are
 // observable without forking the relay-server module.
 //
-// The other ~50 methods on the interface (registerMetric*,
-// registerCounter*, registerHistogram*, registerSummary*,
-// trackProtocolStream, traceFunction, createTrace) are returned as
-// no-op stubs so the libp2p runtime stays happy. The only "real"
-// behaviour is in `trackMultiaddrConnection` — when libp2p hands us a
-// new connection whose remote address contains `/p2p-circuit`, we
-// subscribe to the connection's `'message'` event for inbound bytes
-// and wrap its `.send()` method for outbound bytes.
+// IMPORTANT — why we instrument PROTOCOL STREAMS, not MultiaddrConnections:
 //
-// Event-based design rationale: the libp2p 3.x MultiaddrConnection
-// is a MessageStream — it dispatches `'message'` events for inbound
-// data and exposes `.send(Uint8Array | Uint8ArrayList)` for outbound.
-// (Older libp2p versions used duplex iterators with `source`/`sink`
-// — that surface no longer exists in the version we ship.)
+// On a circuit-relay v2 server, forwarded traffic does NOT flow over
+// `/p2p-circuit` connections. The `/p2p-circuit` multiaddr only exists
+// on the EDGE endpoints (dialer + reservee). On the relay host, the
+// data path is two raw protocol streams piped together inside the
+// relay-server module:
+//
+//   1. The dialer opens an inbound HOP stream to the relay over its
+//      direct connection (protocol `/libp2p/circuit/relay/0.2.0/hop`).
+//   2. The relay opens an outbound STOP stream to the reservee over
+//      the reservee's direct connection (protocol
+//      `/libp2p/circuit/relay/0.2.0/stop`).
+//   3. `createLimitedRelay()` in `@libp2p/circuit-relay-v2/utils.ts`
+//      then `pipe(src, dst, src)`s the two streams together.
+//
+// So a `MultiaddrConnection`-level filter for `/p2p-circuit` (the
+// previous design) would always count zero on a relay server — the
+// addr only ever shows up on the edge endpoints. To capture relay
+// throughput we have to instrument at the protocol-stream level via
+// `trackProtocolStream`, filtering for HOP+STOP codecs.
+//
+// Caveats of stream-level counting:
+//   - Each HOP/STOP stream carries a small protobuf control header
+//     (RESERVE/CONNECT request + response) before any data flow. For
+//     RESERVE-only HOP streams (no CONNECT), this is the ONLY traffic.
+//     For CONNECT'd streams, the protobuf overhead is dwarfed by the
+//     forwarded payload. Net effect: ~tens of bytes of inflation per
+//     reservation lifecycle, which is in the noise floor of any
+//     real-world Core Node serving forwarded chat / SWM gossip.
+//   - bytesIn = aggregate of `'message'` events on HOP+STOP streams
+//     (= bytes ARRIVING at the relay's HOP+STOP endpoints from the
+//     remote dialer / reservee).
+//   - bytesOut = aggregate of `.send()` calls on HOP+STOP streams
+//     (= bytes DEPARTING from the relay's HOP+STOP endpoints toward
+//     the remote dialer / reservee).
+//   In a healthy bidirectional circuit, bytesIn ≈ bytesOut: every
+//   payload byte is `'message'`d on one side and `.send()`d on the
+//   other after the pipe (`pipe(src, dst, src)`).
+//
+// Event-based design: libp2p 3.x Stream extends MessageStream — it
+// dispatches `'message'` events for inbound data and exposes
+// `.send(Uint8Array | Uint8ArrayList)` for outbound. (Older libp2p
+// versions used duplex iterators with `source`/`sink` — that surface
+// no longer exists in the version we ship.)
 
 import type {
   Counter,
@@ -39,27 +70,39 @@ import type {
   SummaryGroup,
 } from '@libp2p/interface';
 
+/**
+ * libp2p protocol codec for the relay HOP stream (dialer ↔ relay).
+ * Pinned here so the build doesn't depend on the @libp2p/circuit-relay-v2
+ * package's constants module just for two strings — the codec is part
+ * of the wire-stable circuit-relay v2 spec, not an internal libp2p
+ * implementation detail.
+ */
+export const RELAY_V2_HOP_CODEC = '/libp2p/circuit/relay/0.2.0/hop';
+/** libp2p protocol codec for the relay STOP stream (relay ↔ reservee). */
+export const RELAY_V2_STOP_CODEC = '/libp2p/circuit/relay/0.2.0/stop';
+
 /** Live view of relay byte traffic this node has forwarded since startup. */
 export interface RelayBytesSnapshot {
-  /** Total bytes received via 'message' events on relayed connections. */
+  /** Total bytes received via 'message' events on tracked streams. */
   bytesIn: bigint;
-  /** Total bytes sent via .send() on relayed connections. */
+  /** Total bytes sent via .send() on tracked streams. */
   bytesOut: bigint;
-  /** Connections currently being byte-counted (open + tracked). */
+  /** Streams currently being byte-counted (open + tracked). */
   activeTracked: number;
-  /** Connections we have ever started tracking since startup. */
+  /** Streams we have ever started tracking since startup. */
   totalTracked: number;
 }
 
 /**
- * Predicate for "is this connection a circuit-relay forwarded connection
- * we should count bytes for". Exposed for tests; in production the only
- * thing that matters is whether the multiaddr contains `/p2p-circuit`.
+ * Predicate for "is this stream a HOP/STOP relay-server stream we
+ * should count bytes for". On a Core Node these are the only streams
+ * whose payload reflects forwarded relay traffic. Exposed for tests;
+ * production always uses this default.
  */
-export function isCircuitRelayConnection(maConn: MultiaddrConnection): boolean {
+export function isRelayServerStream(stream: Stream): boolean {
   try {
-    const addr = maConn.remoteAddr?.toString?.() ?? '';
-    return addr.includes('/p2p-circuit');
+    const protocol = stream.protocol;
+    return protocol === RELAY_V2_HOP_CODEC || protocol === RELAY_V2_STOP_CODEC;
   } catch {
     return false;
   }
@@ -132,9 +175,14 @@ const NOOP_SUMMARY_GROUP: SummaryGroup = {
 
 /**
  * Adapter implementing libp2p's `Metrics` interface with byte-counting
- * for circuit-relay forwarded connections only. All other Metrics
+ * for circuit-relay v2 HOP+STOP streams only. All other Metrics
  * surface methods return no-op objects so libp2p starts cleanly
  * without us shipping a full prometheus-style stack.
+ *
+ * Production wires this to a relay-server's `metrics:` option in
+ * `createLibp2p()`; the libp2p runtime then calls
+ * `trackProtocolStream(stream)` on every newly opened protocol
+ * stream — we filter for HOP+STOP codecs and instrument those.
  */
 export class RelayMetricsAdapter implements Metrics {
   private bytesIn = 0n;
@@ -144,12 +192,12 @@ export class RelayMetricsAdapter implements Metrics {
 
   /**
    * Override predicate for tests. Production always uses
-   * `isCircuitRelayConnection`; tests can pass `() => true` to count
-   * bytes on every connection without setting up a full circuit-
-   * relay test rig.
+   * `isRelayServerStream`; tests can pass `() => true` to count
+   * bytes on every stream without setting up a full circuit-relay
+   * test rig.
    */
   constructor(
-    private readonly shouldTrack: (maConn: MultiaddrConnection) => boolean = isCircuitRelayConnection,
+    private readonly shouldTrack: (stream: Stream) => boolean = isRelayServerStream,
   ) {}
 
   /** Snapshot of the byte counters; safe to call concurrently with traffic. */
@@ -164,50 +212,58 @@ export class RelayMetricsAdapter implements Metrics {
 
   // ─── Metrics interface — the one method we actually instrument ─────
 
-  trackMultiaddrConnection(maConn: MultiaddrConnection): void {
-    if (!this.shouldTrack(maConn)) return;
+  trackProtocolStream(stream: Stream): void {
+    if (!this.shouldTrack(stream)) return;
     this.activeTracked += 1;
     this.totalTracked += 1;
 
     // INBOUND: subscribe to the 'message' event. Each event's `.data`
-    // is the chunk that just arrived from the remote peer.
+    // is the chunk that just arrived from the remote peer. On the
+    // relay's HOP stream this is bytes from the dialer; on the
+    // STOP stream it's bytes from the reservee. Either way, an
+    // arriving byte counts as bytesIn (relay-perspective).
     const onMessage = (evt: StreamMessageEvent) => {
       const n = chunkByteLength(evt.data);
       if (n > 0) this.bytesIn += BigInt(n);
     };
-    maConn.addEventListener('message', onMessage);
+    stream.addEventListener('message', onMessage);
 
     // OUTBOUND: wrap .send() so every chunk passed in gets its
     // byteLength added to the counter before delegating to the
     // original send. Preserves the original return value (false ==
-    // backpressure signal).
-    const originalSend = maConn.send.bind(maConn);
-    maConn.send = (data: any) => {
+    // backpressure signal). On the relay's HOP stream, bytes sent
+    // here go to the dialer; on the STOP stream, to the reservee.
+    const originalSend = stream.send.bind(stream);
+    stream.send = (data: any) => {
       const n = chunkByteLength(data);
       if (n > 0) this.bytesOut += BigInt(n);
       return originalSend(data);
     };
 
     // CLOSE: on close, remove the message listener and decrement the
-    // active counter. Libp2p emits a 'close' event when the
-    // underlying transport tears down (either side).
+    // active counter. libp2p emits 'close' (sometimes 'remoteCloseWrite'
+    // / 'remoteCloseRead' first) when the underlying stream tears down.
     let alreadyDecremented = false;
     const onClose = () => {
       if (alreadyDecremented) return;
       alreadyDecremented = true;
       this.activeTracked = Math.max(0, this.activeTracked - 1);
-      maConn.removeEventListener('message', onMessage);
-      maConn.removeEventListener('close', onClose as any);
+      stream.removeEventListener('message', onMessage);
+      stream.removeEventListener('close', onClose as any);
     };
-    maConn.addEventListener('close', onClose as any);
+    stream.addEventListener('close', onClose as any);
   }
 
   // ─── Metrics interface — no-op stubs (we don't ship a full stack) ──
 
-  trackProtocolStream(_stream: Stream): void {
-    // Bytes inside individual protocol streams are already counted at
-    // the parent connection level via trackMultiaddrConnection, so
-    // double-counting here would inflate the relay byte total.
+  trackMultiaddrConnection(_maConn: MultiaddrConnection): void {
+    // Bytes are counted at the protocol-stream level via
+    // trackProtocolStream — the only stream codecs we care about
+    // (HOP/STOP) carry the relay's forwarded payload. Counting at
+    // the connection level here would inflate the totals because
+    // every MultiaddrConnection carries many non-relay streams
+    // (DHT, gossipsub, ping, identify, …) and the actual relay
+    // bytes are already accounted for by trackProtocolStream.
   }
 
   registerMetric(..._args: any[]): any { return NOOP_METRIC; }

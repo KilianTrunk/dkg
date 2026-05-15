@@ -1420,21 +1420,40 @@ export interface MetricSnapshotRow {
   /**
    * Operator-configured relay reservation cap (DKGNodeConfig.relayServerCapacity).
    * NULL on edge nodes (no relay server) and on rows written by pre-v10 collectors.
+   *
+   * NOTE: optional on the *insert* shape so pre-v10 callers (test fixtures,
+   * external consumers) that omit relay columns still type-check. The runtime
+   * `insertSnapshot()` defaults missing values to NULL (see migration in
+   * `migrate()` for v9→v10). Rows returned from SQLite SELECTs always have
+   * all columns present (just possibly NULL), so the optional-with-null
+   * shape is safe for both directions.
    */
-  relay_capacity: number | null;
+  relay_capacity?: number | null;
   /** Live count of held reservations at snapshot time. NULL off-relay. */
-  relay_reservation_count: number | null;
-  /** Open `/p2p-circuit` connections at snapshot time (forwarded traffic in flight). NULL off-relay. */
-  relay_active_circuits: number | null;
+  relay_reservation_count?: number | null;
   /**
-   * Total bytes seen on the SOURCE side of `/p2p-circuit` connections since the
-   * relay started. Stored as plain integer (SQLite INTEGER is 8 bytes signed
-   * = ~9.2e18, well above any realistic relay byte total before retention pruning).
-   * NULL off-relay or on pre-v10 rows.
+   * Active forwarded circuits at snapshot time, counted as the number of
+   * open relay STOP streams (`/libp2p/circuit/relay/0.2.0/stop`). NOTE:
+   * forwarded circuits do not appear as `/p2p-circuit` connections on the
+   * relay host — that multiaddr only exists on the edge endpoints. NULL
+   * off-relay.
    */
-  relay_bytes_in: number | null;
-  /** Same as relay_bytes_in but for the SINK side (bytes flowing out to the reservee). */
-  relay_bytes_out: number | null;
+  relay_active_circuits?: number | null;
+  /**
+   * Total bytes received via 'message' events on relay HOP+STOP streams
+   * since the relay started (= bytes ARRIVING at the relay's HOP+STOP
+   * endpoints from the dialer / reservee). Stored as plain integer
+   * (SQLite INTEGER is 8 bytes signed = ~9.2e18, well above any
+   * realistic relay byte total before retention pruning). NULL off-relay
+   * or on pre-v10 rows.
+   */
+  relay_bytes_in?: number | null;
+  /**
+   * Same as relay_bytes_in but for outbound traffic — bytes sent via
+   * `.send()` on relay HOP+STOP streams (= bytes DEPARTING from the
+   * relay toward the dialer / reservee). NULL off-relay.
+   */
+  relay_bytes_out?: number | null;
 }
 
 export interface OperationRow {

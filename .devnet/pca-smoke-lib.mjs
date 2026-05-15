@@ -22,6 +22,23 @@ export function assertDiscountTaken({ baseCost, discountedCost }) {
   return { ok: true, reason: `discount applied: ${disc} < ${base}` };
 }
 
+// Decide what to do with one publisher wallet given its current
+// on-chain `agentToAccountId` mapping (0 = unregistered). Makes the
+// smoke idempotent across re-runs against a reused devnet: a wallet
+// already bound to OUR account must be skipped, not re-POSTed (the
+// contract reverts `AgentAlreadyRegistered`); a wallet bound to a
+// different account is a hard conflict the caller must surface.
+export function classifyAgentRegistration(onChainAccountId, targetAccountId) {
+  const cur = BigInt(onChainAccountId);
+  const tgt = BigInt(targetAccountId);
+  if (cur === 0n) return { action: 'register' };
+  if (cur === tgt) return { action: 'skip' };
+  return {
+    action: 'conflict',
+    reason: `agent already bound to account ${cur}, want ${tgt}`,
+  };
+}
+
 // Round-trip evidence written to .scratch/issue-519/verify.md (issue
 // #519 TB-0007 acceptance criterion 3). One table row per scripted step.
 export function buildVerifyMarkdown({ accountId, steps, passed }) {

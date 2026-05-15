@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { assertDiscountTaken, buildVerifyMarkdown } from './pca-smoke-lib.mjs';
+import {
+  assertDiscountTaken,
+  buildVerifyMarkdown,
+  classifyAgentRegistration,
+} from './pca-smoke-lib.mjs';
 
 test('assertDiscountTaken: discounted < base and > 0 passes', () => {
   const r = assertDiscountTaken({ baseCost: 1000n, discountedCost: 500n });
@@ -47,4 +51,25 @@ test('buildVerifyMarkdown: a failing step yields a FAIL verdict', () => {
     passed: false,
   });
   assert.match(md, /\bFAIL\b/);
+});
+
+test('classifyAgentRegistration: unbound agent → register', () => {
+  assert.deepEqual(classifyAgentRegistration(0n, 5n), { action: 'register' });
+});
+
+test('classifyAgentRegistration: already bound to target → skip (idempotent re-run)', () => {
+  // 2nd smoke run hits the same publisher wallet already mapped to our
+  // PCA — must skip, not re-POST (which reverts AgentAlreadyRegistered).
+  assert.deepEqual(classifyAgentRegistration(5n, 5n), { action: 'skip' });
+});
+
+test('classifyAgentRegistration: bound to a different account → conflict', () => {
+  const r = classifyAgentRegistration(3n, 5n);
+  assert.equal(r.action, 'conflict');
+  assert.match(r.reason, /already bound to account 3/);
+});
+
+test('classifyAgentRegistration: coerces string/number account ids', () => {
+  assert.deepEqual(classifyAgentRegistration('0', '9'), { action: 'register' });
+  assert.deepEqual(classifyAgentRegistration('9', 9), { action: 'skip' });
 });

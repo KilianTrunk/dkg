@@ -31,6 +31,20 @@
 // throughput we have to instrument at the protocol-stream level via
 // `trackProtocolStream`, filtering for HOP+STOP codecs.
 //
+// Direction filter (server-only):
+//   A node may run the relay server AND have its own `relayPeers`
+//   configured (the daemon falls back to network relays unless
+//   `relay: "none"`). Without filtering by `stream.direction`, the
+//   client-side HOP/STOP streams (this node dialing through some
+//   other relay, or being a reservee) would inflate the counters
+//   even though no traffic was actually forwarded BY this relay.
+//   So we filter:
+//     - HOP inbound:  dialer → relay (the relay is receiving)
+//     - STOP outbound: relay → reservee (the relay is initiating)
+//   Anything else (HOP outbound, STOP inbound) is the client-side
+//   surface and is dropped. See `isRelayServerStream` JSDoc for the
+//   full direction-vs-protocol matrix.
+//
 // Caveats of stream-level counting:
 //   - Each HOP/STOP stream carries a small protobuf control header
 //     (RESERVE/CONNECT request + response) before any data flow. For
@@ -39,12 +53,15 @@
 //     forwarded payload. Net effect: ~tens of bytes of inflation per
 //     reservation lifecycle, which is in the noise floor of any
 //     real-world Core Node serving forwarded chat / SWM gossip.
-//   - bytesIn = aggregate of `'message'` events on HOP+STOP streams
+//   - bytesIn = aggregate of `'message'` events on tracked streams
 //     (= bytes ARRIVING at the relay's HOP+STOP endpoints from the
 //     remote dialer / reservee).
-//   - bytesOut = aggregate of `.send()` calls on HOP+STOP streams
-//     (= bytes DEPARTING from the relay's HOP+STOP endpoints toward
-//     the remote dialer / reservee).
+//   - bytesOut = aggregate of `.send()` calls on tracked streams,
+//     incremented AFTER the delegated send returns (= bytes that
+//     actually left the relay's HOP+STOP endpoints toward the remote
+//     dialer / reservee). Counting before send() would double-count
+//     chunks that fail on a closed stream — Codex review caught this
+//     during PR #525.
 //   In a healthy bidirectional circuit, bytesIn ≈ bytesOut: every
 //   payload byte is `'message'`d on one side and `.send()`d on the
 //   other after the pipe (`pipe(src, dst, src)`).
@@ -94,15 +111,38 @@ export interface RelayBytesSnapshot {
 }
 
 /**
- * Predicate for "is this stream a HOP/STOP relay-server stream we
- * should count bytes for". On a Core Node these are the only streams
- * whose payload reflects forwarded relay traffic. Exposed for tests;
- * production always uses this default.
+ * Predicate for "is this stream the relay SERVER side of a HOP/STOP
+ * stream we should count bytes for". On a Core Node these are the
+ * only streams whose payload reflects forwarded relay traffic.
+ *
+ * Direction matters because a node may run the relay server AND have
+ * its own `relayPeers` configured (the daemon falls back to network
+ * relays for both core and edge unless explicitly disabled). Without
+ * the direction filter, the client-side HOP/STOP streams (this node
+ * dialing through another relay or being a reservee) would inflate
+ * `bytesIn` / `bytesOut` even though no traffic was actually
+ * "forwarded by this relay".
+ *
+ * Server-side semantics:
+ *   - HOP inbound:  the dialer opened a HOP stream TO this relay
+ *     (RESERVE or CONNECT request) — the relay receives it.
+ *   - STOP outbound: this relay opened a STOP stream TO the reservee
+ *     to push the dialer's bytes — the relay initiates it.
+ *
+ * Client-side (filtered out here):
+ *   - HOP outbound: this node dialing through some other relay.
+ *   - STOP inbound: this node IS the reservee receiving relayed
+ *     traffic from some peer.
+ *
+ * Exposed for tests; production always uses this default.
  */
 export function isRelayServerStream(stream: Stream): boolean {
   try {
     const protocol = stream.protocol;
-    return protocol === RELAY_V2_HOP_CODEC || protocol === RELAY_V2_STOP_CODEC;
+    const direction = stream.direction;
+    if (protocol === RELAY_V2_HOP_CODEC) return direction === 'inbound';
+    if (protocol === RELAY_V2_STOP_CODEC) return direction === 'outbound';
+    return false;
   } catch {
     return false;
   }
@@ -228,16 +268,35 @@ export class RelayMetricsAdapter implements Metrics {
     };
     stream.addEventListener('message', onMessage);
 
-    // OUTBOUND: wrap .send() so every chunk passed in gets its
-    // byteLength added to the counter before delegating to the
-    // original send. Preserves the original return value (false ==
-    // backpressure signal). On the relay's HOP stream, bytes sent
-    // here go to the dialer; on the STOP stream, to the reservee.
+    // OUTBOUND: wrap .send() so every chunk that successfully leaves
+    // the stream gets its byteLength added to the counter AFTER the
+    // delegated send returns / resolves. Counting before send() would
+    // double-count any chunk that throws on a closed/broken stream
+    // (Codex review on PR #525) — the dashboard would show bytes
+    // that were never actually forwarded.
+    //
+    // libp2p's .send() returns either `boolean` (sync, false ==
+    // backpressure) or `Promise<boolean>` (some impls async). We handle
+    // both: synchronous returns increment immediately; promises
+    // increment in a `.then()` callback. Errors in either case skip
+    // the increment.
     const originalSend = stream.send.bind(stream);
     stream.send = (data: any) => {
       const n = chunkByteLength(data);
+      let result: any;
+      try {
+        result = originalSend(data);
+      } catch (err) {
+        throw err;
+      }
+      if (result && typeof result.then === 'function') {
+        return result.then((v: boolean) => {
+          if (n > 0) this.bytesOut += BigInt(n);
+          return v;
+        });
+      }
       if (n > 0) this.bytesOut += BigInt(n);
-      return originalSend(data);
+      return result;
     };
 
     // CLOSE: on close, remove the message listener and decrement the

@@ -136,7 +136,11 @@ export async function handleNodeUIRequest(
     if (!relayStatsProvider) {
       return json(res, 404, {
         error: 'relay-stats-not-available',
-        message: 'This node is not running a relay server (set nodeRole: "core" + enableRelayServer: true).',
+        // nodeRole: "core" alone is sufficient — `DKGNode.start()`
+        // defaults `enableRelayServer` to true when role is core.
+        // `enableRelayServer: true` is only required to override the
+        // default on a non-core node, which is unusual.
+        message: 'This node is not running a relay server (set nodeRole: "core" in config.json).',
       });
     }
     const stats = relayStatsProvider();

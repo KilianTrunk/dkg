@@ -40,37 +40,51 @@ import {
 /**
  * Fake Stream minimal enough to flow through the adapter.
  * Inherits EventTarget so `addEventListener('message'|'close')` works
- * just like the real libp2p MessageStream contract.
+ * just like the real libp2p MessageStream contract. Direction defaults
+ * to the server-side semantics for each codec (HOP=inbound, STOP=outbound)
+ * so existing tests that didn't pass direction still hit the tracked path.
  */
 class FakeStream extends EventTarget {
   readonly id: string;
   readonly protocol: string;
-  // Captures everything passed to send() so tests can inspect the
-  // outbound stream.
+  readonly direction: 'inbound' | 'outbound';
+  // Allow tests to make send() throw / return a promise to exercise the
+  // bytesOut-after-send invariant introduced in the PR2 review round.
+  sendImpl: ((data: any) => boolean | Promise<boolean>) | null = null;
   sentChunks: any[] = [];
-  // Track whether we've recorded a close. Real libp2p .close() returns
-  // a Promise<void>; we just emit the event synchronously.
   closed = false;
 
-  constructor(protocol: string, id = 'stream-1') {
+  constructor(
+    protocol: string,
+    id = 'stream-1',
+    direction?: 'inbound' | 'outbound',
+  ) {
     super();
     this.id = id;
     this.protocol = protocol;
+    // Default to the relay-server-side direction for each codec so older
+    // tests don't need to be touched.
+    if (direction != null) {
+      this.direction = direction;
+    } else if (protocol === RELAY_V2_HOP_CODEC) {
+      this.direction = 'inbound';
+    } else if (protocol === RELAY_V2_STOP_CODEC) {
+      this.direction = 'outbound';
+    } else {
+      this.direction = 'inbound';
+    }
   }
 
-  send(data: any): boolean {
+  send(data: any): boolean | Promise<boolean> {
+    if (this.sendImpl) return this.sendImpl(data);
     this.sentChunks.push(data);
-    // Mirror libp2p's send() return type: false signals backpressure.
-    // We always return true here to keep tests deterministic.
     return true;
   }
 
-  // Fire a fake inbound 'message' event with arbitrary chunk data.
   emitInbound(data: any): void {
     this.dispatchEvent(new MessageEvent('message', { data }));
   }
 
-  // Fire a fake 'close' event.
   emitClose(): void {
     this.closed = true;
     this.dispatchEvent(new Event('close'));
@@ -78,18 +92,43 @@ class FakeStream extends EventTarget {
 }
 
 describe('isRelayServerStream', () => {
-  it('returns true for HOP relay-server streams', () => {
-    expect(isRelayServerStream({ protocol: RELAY_V2_HOP_CODEC } as any)).toBe(true);
+  it('accepts HOP inbound (dialer → relay) — the relay is receiving', () => {
+    expect(
+      isRelayServerStream({ protocol: RELAY_V2_HOP_CODEC, direction: 'inbound' } as any),
+    ).toBe(true);
   });
 
-  it('returns true for STOP relay-server streams', () => {
-    expect(isRelayServerStream({ protocol: RELAY_V2_STOP_CODEC } as any)).toBe(true);
+  it('accepts STOP outbound (relay → reservee) — the relay is initiating', () => {
+    expect(
+      isRelayServerStream({ protocol: RELAY_V2_STOP_CODEC, direction: 'outbound' } as any),
+    ).toBe(true);
   });
 
-  it('returns false for unrelated protocol streams (DHT, gossipsub, identify)', () => {
-    expect(isRelayServerStream({ protocol: '/ipfs/kad/1.0.0' } as any)).toBe(false);
-    expect(isRelayServerStream({ protocol: '/meshsub/1.1.0' } as any)).toBe(false);
-    expect(isRelayServerStream({ protocol: '/ipfs/id/1.0.0' } as any)).toBe(false);
+  it('rejects HOP outbound (this node dialing through some other relay — client side)', () => {
+    // PR #525 round-2 review (branarakic): without this filter, a node
+    // running the relay server AND configured with `relayPeers` would
+    // double-count its own client-side traffic as "forwarded by this
+    // relay". HOP outbound means we're the dialer, not the relay.
+    expect(
+      isRelayServerStream({ protocol: RELAY_V2_HOP_CODEC, direction: 'outbound' } as any),
+    ).toBe(false);
+  });
+
+  it('rejects STOP inbound (this node IS the reservee receiving relayed traffic — client side)', () => {
+    // Same scenario as above: STOP inbound means we're the reservee
+    // and someone is forwarding bytes TO us — that's not "served by"
+    // this relay.
+    expect(
+      isRelayServerStream({ protocol: RELAY_V2_STOP_CODEC, direction: 'inbound' } as any),
+    ).toBe(false);
+  });
+
+  it('rejects unrelated protocol streams (DHT, gossipsub, identify) regardless of direction', () => {
+    for (const dir of ['inbound', 'outbound'] as const) {
+      expect(isRelayServerStream({ protocol: '/ipfs/kad/1.0.0', direction: dir } as any)).toBe(false);
+      expect(isRelayServerStream({ protocol: '/meshsub/1.1.0', direction: dir } as any)).toBe(false);
+      expect(isRelayServerStream({ protocol: '/ipfs/id/1.0.0', direction: dir } as any)).toBe(false);
+    }
   });
 
   it('returns false defensively when protocol is missing or throws', () => {
@@ -308,6 +347,120 @@ describe('RelayMetricsAdapter — trackProtocolStream (the real path)', () => {
     // mutate when the adapter increments its internal counter.
     expect(before.bytesIn).toBe(0n);
     expect(after.bytesIn).toBe(7n);
+  });
+});
+
+describe('RelayMetricsAdapter — direction filter (PR #525 round-2 fix)', () => {
+  it('does not count client-side HOP outbound (this node dialing through some other relay)', () => {
+    // Reproduces the inflate-self-as-relay scenario branarakic flagged.
+    // A node running the relay server AND configured with relayPeers
+    // also opens HOP streams of its own (when dialing through another
+    // relay). Those bytes must NOT be attributed to "traffic forwarded
+    // by this relay".
+    const m = new RelayMetricsAdapter();
+    const clientHop = new FakeStream(RELAY_V2_HOP_CODEC, 'client-hop', 'outbound');
+    m.trackProtocolStream(clientHop as any);
+
+    clientHop.emitInbound(new Uint8Array(500));
+    clientHop.send(new Uint8Array(800));
+
+    expect(m.snapshot().bytesIn).toBe(0n);
+    expect(m.snapshot().bytesOut).toBe(0n);
+    expect(m.snapshot().activeTracked).toBe(0);
+    expect(m.snapshot().totalTracked).toBe(0);
+  });
+
+  it('does not count client-side STOP inbound (this node IS the reservee receiving relayed bytes)', () => {
+    // Mirror of the above: an edge node behind NAT receives forwarded
+    // bytes via STOP streams (inbound). On a node that ALSO runs the
+    // relay server (e.g. a core node that still falls back to network
+    // relays), those bytes would otherwise be falsely counted as
+    // "forwarded by this relay".
+    const m = new RelayMetricsAdapter();
+    const clientStop = new FakeStream(RELAY_V2_STOP_CODEC, 'client-stop', 'inbound');
+    m.trackProtocolStream(clientStop as any);
+
+    clientStop.emitInbound(new Uint8Array(500));
+    clientStop.send(new Uint8Array(800));
+
+    expect(m.snapshot().bytesIn).toBe(0n);
+    expect(m.snapshot().bytesOut).toBe(0n);
+    expect(m.snapshot().activeTracked).toBe(0);
+    expect(m.snapshot().totalTracked).toBe(0);
+  });
+
+  it('counts only the server-side seam when both client + server streams are open simultaneously', () => {
+    // Realistic mixed scenario: a core node is both a relay server
+    // (forwarding bytes for others via HOP-in/STOP-out) AND a relay
+    // client (dialing peers via HOP-out / receiving via STOP-in).
+    // Only the server-side bytes should land in the snapshot.
+    const m = new RelayMetricsAdapter();
+    const serverHop = new FakeStream(RELAY_V2_HOP_CODEC, 'server-hop', 'inbound');
+    const serverStop = new FakeStream(RELAY_V2_STOP_CODEC, 'server-stop', 'outbound');
+    const clientHop = new FakeStream(RELAY_V2_HOP_CODEC, 'client-hop', 'outbound');
+    const clientStop = new FakeStream(RELAY_V2_STOP_CODEC, 'client-stop', 'inbound');
+    m.trackProtocolStream(serverHop as any);
+    m.trackProtocolStream(serverStop as any);
+    m.trackProtocolStream(clientHop as any);
+    m.trackProtocolStream(clientStop as any);
+
+    serverHop.emitInbound(new Uint8Array(100));
+    serverStop.send(new Uint8Array(100));
+    clientHop.emitInbound(new Uint8Array(9999));
+    clientStop.send(new Uint8Array(9999));
+
+    expect(m.snapshot().bytesIn).toBe(100n);
+    expect(m.snapshot().bytesOut).toBe(100n);
+    expect(m.snapshot().activeTracked).toBe(2);
+    expect(m.snapshot().totalTracked).toBe(2);
+  });
+});
+
+describe('RelayMetricsAdapter — bytesOut-after-send (PR #525 round-2 fix)', () => {
+  it('does NOT increment bytesOut when send() throws synchronously', () => {
+    // Codex review on PR #525: if .send() throws on a closed/broken
+    // stream, the dashboard would otherwise count bytes that never
+    // actually left the relay. The fix is to increment AFTER
+    // delegated send returns successfully.
+    const m = new RelayMetricsAdapter();
+    const stop = new FakeStream(RELAY_V2_STOP_CODEC);
+    stop.sendImpl = () => {
+      throw new Error('stream is closed');
+    };
+    m.trackProtocolStream(stop as any);
+
+    expect(() => stop.send(new Uint8Array(500))).toThrow('stream is closed');
+    expect(m.snapshot().bytesOut).toBe(0n);
+  });
+
+  it('increments bytesOut only AFTER the awaited send promise resolves', async () => {
+    // Some libp2p Stream impls return Promise<boolean>. The fix must
+    // wait for that promise to resolve before incrementing — otherwise
+    // a rejected send still inflates the counter.
+    const m = new RelayMetricsAdapter();
+    const stop = new FakeStream(RELAY_V2_STOP_CODEC);
+    let resolveSend: (v: boolean) => void = () => {};
+    stop.sendImpl = () => new Promise<boolean>((r) => { resolveSend = r; });
+    m.trackProtocolStream(stop as any);
+
+    const sendPromise = stop.send(new Uint8Array(750));
+    // Pre-resolve: send is in-flight, counter must NOT have moved yet.
+    expect(m.snapshot().bytesOut).toBe(0n);
+
+    resolveSend(true);
+    await sendPromise;
+
+    expect(m.snapshot().bytesOut).toBe(750n);
+  });
+
+  it('does NOT increment bytesOut when an awaited send promise rejects', async () => {
+    const m = new RelayMetricsAdapter();
+    const stop = new FakeStream(RELAY_V2_STOP_CODEC);
+    stop.sendImpl = () => Promise.reject(new Error('connection reset'));
+    m.trackProtocolStream(stop as any);
+
+    await expect(stop.send(new Uint8Array(750))).rejects.toThrow('connection reset');
+    expect(m.snapshot().bytesOut).toBe(0n);
   });
 });
 

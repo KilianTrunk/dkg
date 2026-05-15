@@ -307,6 +307,16 @@ export class DKGNode {
   async start(): Promise<void> {
     if (this.node) return;
 
+    // Reset sticky relay state so a node restarted with a different
+    // role / capacity doesn't leak the previous run's adapter or
+    // capacity number into getRelayStats(). Codex review on PR #525
+    // flagged that without this guard, restarting a `nodeRole: 'core'`
+    // instance as edge would still inject the old metrics adapter
+    // and report the prior capacity. Cheap to do unconditionally
+    // since both fields are set below only when relay is enabled.
+    this.relayMetrics = null;
+    this.relayCapacity = null;
+
     let privateKey;
     if (this.config.privateKey) {
       // privateKeyFromRaw needs 64 bytes for Ed25519: seed(32) + publicKey(32)
@@ -862,6 +872,8 @@ export class DKGNode {
     this.relayWatchdogConsecutiveFailures = 0;
     this.relayReservationRedialAt.clear();
     this.relayedPeers.clear();
+    this.relayMetrics = null;
+    this.relayCapacity = null;
     await this.node.stop();
     this.node = null;
   }
@@ -894,16 +906,20 @@ export class DKGNode {
    *
    *   - `capacity`         — operator-configured maxReservations
    *   - `reservationCount` — how many reservations are currently held
-   *   - `activeCircuits`   — count of relay STOP streams currently open
-   *                          on this node. On a relay server, each
+   *   - `activeCircuits`   — count of OUTBOUND STOP streams currently
+   *                          open on this node. On a relay server, each
    *                          forwarded circuit is implemented as a HOP
-   *                          stream (from the dialer) piped into a STOP
-   *                          stream (to the reservee); counting open
-   *                          STOP streams gives exactly one per active
-   *                          forwarded circuit. NOTE: forwarded relay
-   *                          traffic does NOT show up as `/p2p-circuit`
-   *                          connections on the relay host — that
-   *                          multiaddr exists only on the edge endpoints.
+   *                          stream (from the dialer) piped into an
+   *                          outbound STOP stream (to the reservee);
+   *                          counting outbound STOP streams alone gives
+   *                          exactly one per forwarded circuit. The
+   *                          `direction === 'outbound'` filter excludes
+   *                          inbound STOP streams (which are this node
+   *                          BEING a reservee, not forwarding traffic).
+   *                          NOTE: forwarded relay traffic does NOT
+   *                          show up as `/p2p-circuit` connections on
+   *                          the relay host — that multiaddr exists
+   *                          only on the edge endpoints.
    *   - `bytesIn` / `bytesOut`  — total bytes seen on HOP+STOP streams
    *                                since relay startup, counted by the
    *                                RelayMetricsAdapter via libp2p's
@@ -956,19 +972,33 @@ export class DKGNode {
       });
     }
 
-    // Count active forwarded circuits by counting open STOP streams
-    // across all connections. Each relayed circuit on this node = exactly
-    // one outbound STOP stream the relay opened to the reservee. The
-    // matching HOP stream is also open during the lifetime of a circuit,
-    // but counting STOP streams alone gives exactly N rather than 2N.
-    // (See libp2p-metrics-adapter.ts for the full architecture comment.)
+    // Count active forwarded circuits by counting OUTBOUND STOP streams
+    // across all connections. On the relay server, each forwarded circuit
+    // = exactly one STOP stream the relay opened (outbound) to the
+    // reservee. The matching HOP stream is also open during the
+    // lifetime of a circuit, but counting STOP alone gives exactly N
+    // rather than 2N.
+    //
+    // The `direction === 'outbound'` filter is critical when this node
+    // is also a relay client (relayPeers configured). Without it, the
+    // STOP streams opened TO us as a reservee (direction='inbound')
+    // would be counted as forwarded circuits even though no traffic
+    // is being relayed BY this node — same architectural concern as the
+    // adapter's `isRelayServerStream` direction filter. Codex review
+    // on PR #525 (round 2) caught this for the metrics counters; this
+    // line was the parallel issue in `getRelayStats()`.
+    //
+    // (See libp2p-metrics-adapter.ts for the full HOP/STOP architecture
+    // comment + direction matrix.)
     let activeCircuits = 0;
     try {
       for (const conn of this.node.getConnections()) {
-        const streams = (conn as any).streams as Array<{ protocol?: string }> | undefined;
+        const streams = (conn as any).streams as Array<{ protocol?: string; direction?: string }> | undefined;
         if (!Array.isArray(streams)) continue;
         for (const s of streams) {
-          if (s?.protocol === RELAY_V2_STOP_CODEC) activeCircuits += 1;
+          if (s?.protocol === RELAY_V2_STOP_CODEC && s?.direction === 'outbound') {
+            activeCircuits += 1;
+          }
         }
       }
     } catch {

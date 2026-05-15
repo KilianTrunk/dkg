@@ -627,6 +627,54 @@ describe('Circuit Relay', () => {
     expect(distinctRelayPids.size).toBe(1);
   }, 15000);
 
+  it('falls back to no-relays path when every relayPeers entry is unusable (Codex PR #526 round 5b)', async () => {
+    // Bug Codex caught: the legacy `/p2p-circuit` listener fallback
+    // was gated on `else if (this.config.relayPeers?.length)`, which
+    // matched not only the intended core-node case but also edge
+    // nodes whose relayPeers were ALL filtered out
+    // (malformed/self/duplicate) — leaving them half-configured
+    // (`/p2p-circuit` listener with nothing to reserve against).
+    // Round-5b fix: gate the fallback on `enableRelay && relayPeers`,
+    // so the unusable case truly hits the no-relays path.
+    //
+    // Test: edge with `relayPeers: [malformed, malformed]`.
+    //   - Expected: NO `/p2p-circuit` in listen addresses, no
+    //     watchdog started, no `/p2p-circuit` self-addrs ever
+    //     advertised.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const edge = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      relayPeers: ['/not-a-multiaddr', 'also-malformed'],
+      relayReservationCount: 2,
+    });
+    nodes.push(edge);
+    await edge.start();
+
+    const usableWarn = warnSpy.mock.calls.find((call) =>
+      typeof call[0] === 'string'
+      && call[0].includes('0 usable')
+      && call[0].includes('malformed'),
+    );
+    expect(
+      usableWarn,
+      `expected "0 usable / malformed" warning; got: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
+    ).toBeDefined();
+    warnSpy.mockRestore();
+
+    await new Promise(r => setTimeout(r, 500));
+
+    const circuitAddrs = edge.libp2p
+      .getMultiaddrs()
+      .map(ma => ma.toString())
+      .filter(a => a.includes('/p2p-circuit'));
+    expect(
+      circuitAddrs,
+      `expected NO /p2p-circuit self-addrs (edge should have fallen back to no-relays path); got: ${JSON.stringify(circuitAddrs)}`,
+    ).toHaveLength(0);
+  }, 10000);
+
   it('caps forced reservation-redials per tick at the missing-slot count (Codex PR #526 round 5)', async () => {
     // Bug Codex caught: the round-4 watchdog called
     // `refreshReservationSnapshot()` after each successful

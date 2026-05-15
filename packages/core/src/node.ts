@@ -795,9 +795,19 @@ export class DKGNode {
         listenAddrs.push('/p2p-circuit');
       }
       this.relayReservationCountTarget = relayReservationCount;
-    } else if (this.config.relayPeers?.length) {
-      // Core node with explicit relayPeers — push the legacy single
-      // /p2p-circuit listen addr.
+    } else if (enableRelay && this.config.relayPeers?.length) {
+      // Core / relay-server node with explicit relayPeers — push the
+      // legacy single /p2p-circuit listen addr (preserves defensive
+      // multi-relay config without multiplying slot consumption).
+      //
+      // Gated on `enableRelay` (Codex PR #526 round 5): the previous
+      // `else if (relayPeers?.length)` also matched edge nodes where
+      // every relayPeers entry got filtered out as
+      // malformed/self/duplicate (so isEdgeWithRelays became false).
+      // That left the edge half-configured — a `/p2p-circuit`
+      // listener with nothing to reserve against — and inconsistent
+      // with the "value ignored" warning we already emitted up top.
+      // Now the unusable case truly hits the no-relays path.
       listenAddrs.push('/p2p-circuit');
       this.relayReservationCountTarget = 1;
     }

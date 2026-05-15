@@ -2183,45 +2183,60 @@ export class EVMChainAdapter implements ChainAdapter {
     return nft;
   }
 
+  // PCA writes rethrow raw CALL_EXCEPTIONs; providers report custom errors
+  // as opaque "unknown custom error"+data, so the daemon's message-based
+  // classifier never sees the name. Enrich in place, then rethrow the SAME
+  // error (mirrors isContractMissingRevert/translateRandomSamplingError).
+  private async pcaWrite<T>(op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (err) {
+      if (err instanceof Error) enrichEvmError(err);
+      throw err;
+    }
+  }
+
   async createPublishingConvictionAccount(
     committedTRAC: bigint,
   ): Promise<{ accountId: bigint } & TxResult> {
     await this.init();
-    const nft = this.requireConvictionNFT();
-    const nftAddress = await nft.getAddress();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const nftAddress = await nft.getAddress();
 
-    // createAccount() does transferFrom(msg.sender → stakingStorage,
-    // committedTRAC) — the signer must allow the NFT to pull the TRAC.
-    if (this.contracts.token) {
-      const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
-      if (allowance < committedTRAC) {
-        await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
-      }
-    }
-
-    const tx = await nft.createAccount(committedTRAC);
-    const receipt = await tx.wait();
-
-    let accountId = 0n;
-    for (const log of receipt.logs) {
-      try {
-        const parsed = nft.interface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed?.name === 'AccountCreated') {
-          accountId = BigInt(parsed.args.accountId);
-          break;
+      // createAccount() does transferFrom(msg.sender → stakingStorage,
+      // committedTRAC) — the signer must allow the NFT to pull the TRAC.
+      if (this.contracts.token) {
+        const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+        if (allowance < committedTRAC) {
+          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
         }
-      } catch { /* not this contract's event */ }
-    }
-    if (accountId === 0n) {
-      throw new Error('createPublishingConvictionAccount succeeded but no AccountCreated event found');
-    }
+      }
 
-    return {
-      accountId,
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: receipt.status === 1,
-    };
+      const tx = await nft.createAccount(committedTRAC);
+      const receipt = await tx.wait();
+
+      let accountId = 0n;
+      for (const log of receipt.logs) {
+        try {
+          const parsed = nft.interface.parseLog({ topics: [...log.topics], data: log.data });
+          if (parsed?.name === 'AccountCreated') {
+            accountId = BigInt(parsed.args.accountId);
+            break;
+          }
+        } catch { /* not this contract's event */ }
+      }
+      if (accountId === 0n) {
+        throw new Error('createPublishingConvictionAccount succeeded but no AccountCreated event found');
+      }
+
+      return {
+        accountId,
+        hash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        success: receipt.status === 1,
+      };
+    });
   }
 
   async getPublishingConvictionAccountInfo(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null> {
@@ -2253,37 +2268,45 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async topUpPublishingConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
     await this.init();
-    const nft = this.requireConvictionNFT();
-    const nftAddress = await nft.getAddress();
-    if (this.contracts.token) {
-      const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
-      if (allowance < amount) {
-        await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const nftAddress = await nft.getAddress();
+      if (this.contracts.token) {
+        const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+        if (allowance < amount) {
+          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+        }
       }
-    }
-    const receipt = await (await nft.topUp(accountId, amount)).wait();
-    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      const receipt = await (await nft.topUp(accountId, amount)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
   }
 
   async settlePublishingConvictionAccount(accountId: bigint): Promise<TxResult> {
     await this.init();
-    const nft = this.requireConvictionNFT();
-    const receipt = await (await nft.settle(accountId)).wait();
-    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await (await nft.settle(accountId)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
   }
 
   async registerPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
     await this.init();
-    const nft = this.requireConvictionNFT();
-    const receipt = await (await nft.registerAgent(accountId, agent)).wait();
-    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await (await nft.registerAgent(accountId, agent)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
   }
 
   async deregisterPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
     await this.init();
-    const nft = this.requireConvictionNFT();
-    const receipt = await (await nft.deregisterAgent(accountId, agent)).wait();
-    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await (await nft.deregisterAgent(accountId, agent)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
   }
 
   async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {

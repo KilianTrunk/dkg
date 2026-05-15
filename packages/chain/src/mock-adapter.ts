@@ -22,6 +22,7 @@ import type {
   ProofPeriodStatus,
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
+  V10ConvictionAccountInfo,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -421,70 +422,98 @@ export class MockChainAdapter implements ChainAdapter {
     return [];
   }
 
-  // --- Publishing Conviction Accounts ---
-  // `convictionAccounts` is retained so the V10 NFT-shaped
-  // `getPublishingConvictionAccountOwner` view can resolve PCA → owner
-  // without a live chain. Tests seed via `seedConvictionAccount` below.
+  // --- V10 Publishing Conviction NFT (DKGPublishingConvictionNFT) ---
+  // In-memory parity model: incrementing-id account map, agent reverse
+  // map and owner-gating, mirroring the real NFT so offline-mode users
+  // hit the same owner-revert behaviour as the chain.
 
   private convictionAccounts = new Map<bigint, {
-    admin: string;
+    owner: string;
+    committedTRAC: bigint;
+    topUpBuffer: bigint;
+    lockDurationEpochs: number;
+    agents: Set<string>;
   }>();
+  private agentToConvictionAccount = new Map<string, bigint>();
+  private nextConvictionAccountId = 1n;
+
+  // Chain default `ParametersStorage.publishingConvictionEpochs` is 12;
+  // the mock snapshots the same value so the publisher's epoch-coercion
+  // probe behaves identically off-chain.
+  private static readonly MOCK_LOCK_DURATION_EPOCHS = 12;
 
   /**
-   * Test helper — seed a PCA into the mock's owner map so the V10
-   * `getPublishingConvictionAccountOwner` view can answer for it. Used
-   * by `mock-adapter-parity.test.ts` when exercising publish-policy
-   * branches that require a known PCA owner address. Not part of the
-   * `ChainAdapter` interface.
+   * Test helper — seed a PCA owned by `admin` so publish-policy branches
+   * that require a known PCA owner address can be exercised. Not part of
+   * the `ChainAdapter` interface.
    */
   seedConvictionAccount(admin: string): bigint {
-    let accountId = 1n;
-    // monotonic ids — never reuse
-    for (const k of this.convictionAccounts.keys()) {
-      if (k >= accountId) accountId = k + 1n;
-    }
-    this.convictionAccounts.set(accountId, { admin });
+    const accountId = this.nextConvictionAccountId++;
+    this.convictionAccounts.set(accountId, {
+      owner: ethers.getAddress(admin),
+      committedTRAC: 0n,
+      topUpBuffer: 0n,
+      lockDurationEpochs: MockChainAdapter.MOCK_LOCK_DURATION_EPOCHS,
+      agents: new Set<string>(),
+    });
     return accountId;
   }
 
-  /**
-   * Mock does not model V10 `DKGPublishingConvictionNFT` agent
-   * registration — the legacy mock PCA flow doesn't ship reverse
-   * agent → accountId lookups. Always returns `0n` so the publisher
-   * SDK falls through to the direct-spend `publishEpochs = 1` default
-   * on mock chains (matching how mock-backed unit tests exercise the
-   * non-conviction publish path). Real-chain tests use
-   * `EVMChainAdapter`, which queries the live NFT contract.
-   */
-  async getConvictionAgentAccountId(_agent: string): Promise<bigint> {
-    return 0n;
+  async createConvictionAccount(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> {
+    const accountId = this.nextConvictionAccountId++;
+    this.convictionAccounts.set(accountId, {
+      owner: ethers.getAddress(this.signerAddress),
+      committedTRAC,
+      topUpBuffer: 0n,
+      lockDurationEpochs: MockChainAdapter.MOCK_LOCK_DURATION_EPOCHS,
+      agents: new Set<string>(),
+    });
+    return { accountId, ...this.txResult(true) };
+  }
+
+  async getConvictionAccountInfo(accountId: bigint): Promise<V10ConvictionAccountInfo | null> {
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct) return null;
+    return {
+      owner: acct.owner,
+      committedTRAC: acct.committedTRAC,
+      baseEpochAllowance: 0n,
+      createdAtEpoch: 0,
+      expiresAtEpoch: acct.lockDurationEpochs,
+      createdAtTimestamp: 0,
+      expiresAtTimestamp: 0,
+      discountBps: 0,
+      topUpBuffer: acct.topUpBuffer,
+      agentCount: acct.agents.size,
+      lastSettledWindow: 0,
+      fullySwept: false,
+    };
   }
 
   /**
-   * Mock does not model V10 NFT `lockDurationEpochs` snapshotting.
-   * Returns `0` (no PCA path active) so the publisher SDK keeps the
-   * direct-spend default. Mirrors `getConvictionAgentAccountId` —
-   * either both are wired or neither, so the publisher's PCA probe
-   * never returns a half-set state on mock.
+   * Reverse lookup mirroring `agentToAccountId`. Returns `0n` for any
+   * non-registered address so the publisher SDK keeps the direct-spend
+   * default until an agent is explicitly registered.
    */
-  async getConvictionAccountLockDurationEpochs(_accountId: bigint): Promise<number> {
-    return 0;
+  async getConvictionAgentAccountId(agent: string): Promise<bigint> {
+    if (!ethers.isAddress(agent)) return 0n;
+    return this.agentToConvictionAccount.get(ethers.getAddress(agent).toLowerCase()) ?? 0n;
+  }
+
+  async getConvictionAccountLockDurationEpochs(accountId: bigint): Promise<number> {
+    return this.convictionAccounts.get(accountId)?.lockDurationEpochs ?? 0;
   }
 
   /**
    * Mock owner-lookup for the daemon's curated-CG registration
    * preflight (`local curator == ownerOf(pcaAccountId)`).
-   *
-   * Mock does not model PCA NFT transfers, so the account `admin`
-   * doubles as the current "owner" for parity-test purposes. Real-chain
-   * tests use `EVMChainAdapter`, which queries `DKGPublishingConvictionNFT.ownerOf`.
    */
   async getPublishingConvictionAccountOwner(accountId: bigint): Promise<string> {
     const acct = this.convictionAccounts.get(accountId);
     if (!acct) {
       throw new Error(`Mock: PCA account ${accountId} does not exist`);
     }
-    return ethers.getAddress(acct.admin);
+    return acct.owner;
   }
 
   // --- On-Chain Context Graphs (ContextGraphs contract) ---

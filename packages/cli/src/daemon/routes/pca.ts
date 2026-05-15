@@ -47,6 +47,14 @@ function isOwnerRevert(msg: string): boolean {
   return /NotAccountOwner|NotAccountAdmin/i.test(msg);
 }
 
+// NoChainAdapter implements the V10 PCA methods but throws `noChain()`
+// ("No blockchain configured ...") rather than returning null. Treat
+// that throw the same as a null facade result: HTTP 503 unavailable,
+// not a 500 RPC failure.
+function isNoChain(msg: string): boolean {
+  return /No blockchain configured/i.test(msg);
+}
+
 function parseAccountId(idStr: string): bigint | null {
   if (!/^\d+$/.test(idStr)) return null;
   try {
@@ -123,8 +131,10 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
         committedTokens: ethers.formatEther(amount),
       });
     } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 500, {
-        error: `createConvictionAccount failed: ${err?.message ?? String(err)}`,
+        error: `createConvictionAccount failed: ${msg}`,
       });
     }
   }
@@ -157,6 +167,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       });
     } catch (err: any) {
       const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
@@ -191,6 +202,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       });
     } catch (err: any) {
       const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
@@ -237,8 +249,10 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       }
       return jsonResponse(res, 200, result);
     } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 500, {
-        error: `getConvictionAccountInfo failed: ${err?.message ?? String(err)}`,
+        error: `getConvictionAccountInfo failed: ${msg}`,
       });
     }
   }

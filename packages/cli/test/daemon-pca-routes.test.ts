@@ -64,4 +64,20 @@ describe('daemon /api/pca V10 caller contract', () => {
     await done;
     expect(res.statusCode).toBe(403);
   });
+
+  it('maps a NoChainAdapter noChain() throw to HTTP 503, not 500', async () => {
+    const noChainErr = () => {
+      throw new Error(
+        'No blockchain configured. To use on-chain operations, provide chainConfig ' +
+        '(rpcUrl, hubAddress, privateKey) when creating the agent, or set DKG_PRIVATE_KEY.',
+      );
+    };
+    const create = runCtx('POST', '/api/pca', { createConvictionAccount: noChainErr }, { tokens: '1' });
+    await create.done;
+    expect(create.res.statusCode).toBe(503);
+
+    const info = runCtx('GET', '/api/pca/1', { getConvictionAccountInfo: noChainErr });
+    await info.done;
+    expect(info.res.statusCode).toBe(503);
+  });
 });

@@ -55,7 +55,7 @@ import {
   type WorkspaceRecipientEncryptionKey,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
-import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult } from '@origintrail-official/dkg-chain';
+import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10ConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
   PublishJournal, StaleWriteError,
@@ -3956,60 +3956,56 @@ export class DKGAgent {
   }
 
   /**
-   * Publishing Conviction Account (PCA) facade for the agent-provenance
-   * runbook surface. These methods are thin wrappers over the chain adapter
-   * — the agent doesn't keep PCA state of its own; the on-chain
-   * `PublishingConvictionAccount` is the source of truth. The wrappers
-   * exist so daemon HTTP routes don't need to reach into the private
-   * `chain` field, mirroring the `getKnowledgeCollectionAuthor` pattern.
+   * V10 Publishing Conviction NFT facade for the agent-provenance runbook
+   * surface. Thin wrappers over the chain adapter — the agent keeps no PCA
+   * state of its own; the on-chain `DKGPublishingConvictionNFT` is the
+   * source of truth. The wrappers exist so daemon HTTP routes don't reach
+   * into the private `chain` field, mirroring `getKnowledgeCollectionAuthor`.
    *
-   * `createPublishingConvictionAccount`: tx is signed by the agent's
-   * configured EOA; that EOA becomes the PCA `admin` and is automatically
-   * added to its own `authorizedKeys` set. Operators driving the runbook
-   * from a core node use this to stand up the PCA before mode (a)/(b).
-   *
-   * `addPCAAuthorizedKey` and `isPCAAuthorizedKey` are admin-gated on chain
-   * (`require(msg.sender == account.admin)`), so the daemon must be running
-   * as the PCA admin EOA for `addPCAAuthorizedKey` to succeed. Read-side
-   * `isPCAAuthorizedKey` is permissionless on chain and works from any node.
+   * `createConvictionAccount` mints the ERC-721 to the agent's configured
+   * EOA (no `lockEpochs` — it's a global protocol parameter). `topUp` /
+   * `registerConvictionAgent` / `deregisterConvictionAgent` are owner-gated
+   * on chain; the wrappers MUST NOT swallow the owner revert (the daemon
+   * maps it to HTTP 403). A `null` return means the adapter has no V10 PCA
+   * surface (no-chain / pre-V10 copy) — the daemon maps that to HTTP 503.
    */
-  // V10 NFT-backed PCA writes are not yet wired through the SDK; these
-  // wrappers return null and the daemon routes translate that to HTTP 503.
-  async createPublishingConvictionAccount(
-    _amount: bigint,
-    _lockEpochs: number,
-  ): Promise<{ accountId: bigint; txHash: string; blockNumber: number } | null> {
-    return null;
+  async createConvictionAccount(
+    committedTRAC: bigint,
+  ): Promise<({ accountId: bigint } & TxResult) | null> {
+    if (typeof this.chain.createConvictionAccount !== 'function') return null;
+    return this.chain.createConvictionAccount(committedTRAC);
   }
 
-  async addPublishingConvictionAccountFunds(
-    _accountId: bigint,
-    _amount: bigint,
-  ): Promise<{ txHash: string; blockNumber: number } | null> {
-    return null;
+  async topUpConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult | null> {
+    if (typeof this.chain.topUpConvictionAccount !== 'function') return null;
+    return this.chain.topUpConvictionAccount(accountId, amount);
   }
 
-  async addPCAAuthorizedKey(
-    _accountId: bigint,
-    _key: string,
-  ): Promise<{ txHash: string; blockNumber: number } | null> {
-    return null;
+  async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult | null> {
+    if (typeof this.chain.registerConvictionAgent !== 'function') return null;
+    return this.chain.registerConvictionAgent(accountId, agent);
   }
 
-  async isPCAAuthorizedKey(_accountId: bigint, _key: string): Promise<boolean | null> {
-    return null;
+  async deregisterConvictionAgent(accountId: bigint, agent: string): Promise<TxResult | null> {
+    if (typeof this.chain.deregisterConvictionAgent !== 'function') return null;
+    return this.chain.deregisterConvictionAgent(accountId, agent);
   }
 
-  async getPublishingConvictionAccountInfo(_accountId: bigint): Promise<{
-    accountId: bigint;
-    admin: string;
-    balance: bigint;
-    initialDeposit: bigint;
-    lockEpochs: number;
-    conviction: bigint;
-    discountBps: number;
-  } | null> {
-    return null;
+  async isConvictionAgent(accountId: bigint, agent: string): Promise<boolean | null> {
+    if (typeof this.chain.isConvictionAgent !== 'function') return null;
+    return this.chain.isConvictionAgent(accountId, agent);
+  }
+
+  async settleConvictionAccount(accountId: bigint): Promise<TxResult | null> {
+    if (typeof this.chain.settleConvictionAccount !== 'function') return null;
+    return this.chain.settleConvictionAccount(accountId);
+  }
+
+  async getConvictionAccountInfo(
+    accountId: bigint,
+  ): Promise<V10ConvictionAccountInfo | null> {
+    if (typeof this.chain.getConvictionAccountInfo !== 'function') return null;
+    return this.chain.getConvictionAccountInfo(accountId);
   }
 
   // ---------------------------------------------------------------------------

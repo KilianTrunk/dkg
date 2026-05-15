@@ -173,28 +173,26 @@ jobs:
           if [ "${PROTECTED_ONLY}" = "true" ]; then
             echo "✓ npm-publish deployment branch policy: protected branches only"
           elif [ "${CUSTOM_POLICIES}" = "true" ]; then
-            # Custom policies are stored in a sibling API path. We
-            # require `main` in the allow-list (so the tag's target
-            # branch passes). An optional `v*` tag pattern is also
-            # accepted. Arbitrary wildcards (`release/*`, `*`) and
-            # extra exact branches widen the surface — those are
-            # rejected.
-            RELEASE_BRANCH=main
+            # Custom policies are stored in a sibling API path. Every
+            # entry must be a known release branch or the `v*` tag
+            # pattern. Keep ALLOWED_BRANCHES in sync with RELEASE_BRANCHES
+            # used in the ancestry check below and in release.yml.
+            ALLOWED_BRANCHES=("main" "v10-rc")
             ALLOWED_TAG_PATTERN="v*"
             CUSTOM_BRANCHES=$(gh api "repos/${GH_REPO}/environments/npm-publish/deployment-branch-policies" --jq '[.branch_policies[]?.name]' 2>/dev/null || echo '[]')
-            HAS_RELEASE=$(echo "${CUSTOM_BRANCHES}" | jq --arg b "${RELEASE_BRANCH}" -r 'any(. == $b)')
 
-            # Validate every entry is exactly `main` or `v*` — nothing else.
-            # This catches `['main', 'staging']` (count=2 but staging is wrong)
-            # and wildcards like `release/*`.
-            if [ "${HAS_RELEASE}" != "true" ]; then
-              echo "::error title=npm-publish custom branch policy excludes release branch::Environment uses custom branch policies but \`${RELEASE_BRANCH}\` is not in the allow-list. Add it in repo Settings → Environments → npm-publish → Deployment branches. Allowed: ${CUSTOM_BRANCHES}"
-              exit 1
-            fi
-            UNEXPECTED=$(echo "${CUSTOM_BRANCHES}" | jq --arg b "${RELEASE_BRANCH}" --arg t "${ALLOWED_TAG_PATTERN}" -c 'map(select(. != $b and . != $t))')
+            # Build a jq filter for all allowed values
+            ALLOWED_JQ=$(printf '%s\n' "${ALLOWED_BRANCHES[@]}" "${ALLOWED_TAG_PATTERN}" | jq -R . | jq -s .)
+            UNEXPECTED=$(echo "${CUSTOM_BRANCHES}" | jq --argjson allowed "${ALLOWED_JQ}" -c 'map(select(. as $e | $allowed | any(. == $e) | not))')
             UNEXPECTED_COUNT=$(echo "${UNEXPECTED}" | jq 'length')
             if [ "${UNEXPECTED_COUNT}" -gt 0 ]; then
-              echo "::error title=npm-publish custom branch policy has unexpected entries::Only \`${RELEASE_BRANCH}\` and \`${ALLOWED_TAG_PATTERN}\` are allowed. Remove: ${UNEXPECTED}"
+              echo "::error title=npm-publish custom branch policy has unexpected entries::Only release branches and \`${ALLOWED_TAG_PATTERN}\` are allowed. Remove: ${UNEXPECTED}"
+              exit 1
+            fi
+            # At least one release branch must be present
+            HAS_ANY_RELEASE=$(echo "${CUSTOM_BRANCHES}" | jq --argjson allowed "$(printf '%s\n' "${ALLOWED_BRANCHES[@]}" | jq -R . | jq -s .)" 'any(. as $e | $allowed | any(. == $e))')
+            if [ "${HAS_ANY_RELEASE}" != "true" ]; then
+              echo "::error title=npm-publish custom branch policy excludes release branches::None of the release branches (${ALLOWED_BRANCHES[*]}) are in the allow-list. Allowed: ${CUSTOM_BRANCHES}"
               exit 1
             fi
             echo "✓ npm-publish deployment branch policy: custom allow-list ${CUSTOM_BRANCHES}"

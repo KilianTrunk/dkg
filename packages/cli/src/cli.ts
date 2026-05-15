@@ -2648,6 +2648,28 @@ pcaCmd
   });
 
 pcaCmd
+  .command('deregister-agent <accountId> <agent>')
+  .description('Deregister `agent` from the PCA (owner-only on chain)')
+  .action(async (accountId: string, agent: string) => {
+    try {
+      if (!/^\d+$/.test(accountId)) {
+        console.error('accountId must be a non-negative integer');
+        process.exit(1);
+      }
+      const client = await ApiClient.connect();
+      const result = await client.deregisterPcaAgent(accountId, agent);
+      console.log(`Deregistered agent on PCA ${result.accountId}:`);
+      console.log(`  agent:        ${result.agent}`);
+      console.log(`  deregistered: ${result.deregistered}`);
+      console.log(`  txHash:       ${result.txHash}`);
+      console.log(`  block:        ${result.blockNumber}`);
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
+pcaCmd
   .command('funds <accountId>')
   .description('Top up an existing PCA (owner-only). Approves token spend automatically')
   .requiredOption('--tokens <amount>', 'Additional TRAC to commit (decimal)')

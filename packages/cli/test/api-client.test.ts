@@ -280,6 +280,26 @@ describe('ApiClient', () => {
         agent: '0x1111111111111111111111111111111111111111',
       });
     });
+
+    it('deregisterPcaAgent() DELETEs the V10 agent-address route', async () => {
+      const body = {
+        accountId: '7',
+        agent: '0x2222222222222222222222222222222222222222',
+        deregistered: true,
+        txHash: '0xdef',
+        blockNumber: 43,
+      };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const result = await client.deregisterPcaAgent('7', '0x2222222222222222222222222222222222222222');
+
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(
+        `http://127.0.0.1:${PORT}/api/pca/7/agent/0x2222222222222222222222222222222222222222`,
+      );
+      expect(calls[0].opts.method).toBe('DELETE');
+    });
   });
 
   describe('messages() query string building', () => {

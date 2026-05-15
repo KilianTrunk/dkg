@@ -486,6 +486,18 @@ export class ApiClient {
     return this.post('/api/pca', request);
   }
 
+  async deregisterPcaAgent(accountId: string, agent: string): Promise<{
+    accountId: string;
+    agent: string;
+    deregistered: boolean;
+    txHash: string;
+    blockNumber: number;
+  }> {
+    return this.del(
+      `/api/pca/${encodeURIComponent(accountId)}/agent/${encodeURIComponent(agent)}`,
+    );
+  }
+
   async addPcaFunds(accountId: string, tokens: string): Promise<{
     accountId: string;
     addedTokens: string;
@@ -1349,6 +1361,18 @@ export class ApiClient {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...this.authHeaders() },
       body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      throw ApiClient.httpError(res.status, ApiClient.errorMessageFromBody(data, res.statusText), data);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  private async del<T>(path: string): Promise<T> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: 'DELETE',
+      headers: this.authHeaders(),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: res.statusText }));

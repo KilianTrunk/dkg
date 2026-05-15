@@ -10,6 +10,7 @@ import type {
   EventFilter,
   CreateContextGraphParams,
   V10PublishParams,
+  V10ConvictionAccountInfo,
 } from './chain-adapter.js';
 
 function noChain(): never {
@@ -43,6 +44,15 @@ export class NoChainAdapter implements ChainAdapter {
   async getKnowledgeAssetsV10Address(): Promise<string> { noChain(); }
   async getEvmChainId(): Promise<bigint> { noChain(); }
   async getPublishingConvictionAccountOwner(_accountId: bigint): Promise<string> { noChain(); }
+  // V10 Publishing Conviction NFT write+read surface (issue #519). No
+  // chain → every call throws via the shared noChain() helper.
+  async createConvictionAccount(_committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> { noChain(); }
+  async topUpConvictionAccount(_accountId: bigint, _amount: bigint): Promise<TxResult> { noChain(); }
+  async registerConvictionAgent(_accountId: bigint, _agent: string): Promise<TxResult> { noChain(); }
+  async deregisterConvictionAgent(_accountId: bigint, _agent: string): Promise<TxResult> { noChain(); }
+  async isConvictionAgent(_accountId: bigint, _agent: string): Promise<boolean> { noChain(); }
+  async settleConvictionAccount(_accountId: bigint): Promise<TxResult> { noChain(); }
+  async getConvictionAccountInfo(_accountId: bigint): Promise<V10ConvictionAccountInfo | null> { noChain(); }
   isV10Ready(): boolean { return false; }
   isRandomSamplingReady(): boolean { return false; }
 }

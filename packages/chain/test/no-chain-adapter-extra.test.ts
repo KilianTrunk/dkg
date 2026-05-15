@@ -103,6 +103,19 @@ describe('NoChainAdapter — every write method throws with stable message [CH-9
       })],
     ['getKnowledgeAssetsV10Address', () => adapter.getKnowledgeAssetsV10Address()],
     ['getEvmChainId', () => adapter.getEvmChainId()],
+    // V10 Publishing Conviction NFT write+read surface (issue #519 /
+    // TB-0002). NoChainAdapter has no chain, so every PCA call must
+    // throw via the shared noChain() helper — not a half-set 0n/null.
+    ['createConvictionAccount', () => adapter.createConvictionAccount!(0n)],
+    ['topUpConvictionAccount', () => adapter.topUpConvictionAccount!(1n, 0n)],
+    ['registerConvictionAgent', () =>
+      adapter.registerConvictionAgent!(1n, '0x0000000000000000000000000000000000000001')],
+    ['deregisterConvictionAgent', () =>
+      adapter.deregisterConvictionAgent!(1n, '0x0000000000000000000000000000000000000001')],
+    ['isConvictionAgent', () =>
+      adapter.isConvictionAgent!(1n, '0x0000000000000000000000000000000000000001')],
+    ['settleConvictionAccount', () => adapter.settleConvictionAccount!(1n)],
+    ['getConvictionAccountInfo', () => adapter.getConvictionAccountInfo!(1n)],
   ];
 
   it.each(matrix)('%s throws %s', async (_name, fn) => {

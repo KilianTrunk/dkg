@@ -63,4 +63,26 @@ describe('V10 Publishing Conviction NFT — chain-adapter lifecycle', () => {
     expect(info!.committedTRAC).toBe(COMMITTED);
     expect(info!.agentCount).toBe(0);
   });
+
+  it('registerConvictionAgent then isConvictionAgent returns true and the reverse map resolves', async () => {
+    const owner = await fundedOwner();
+    const { accountId } = await owner.createConvictionAccount(COMMITTED);
+
+    const agent = ethers.Wallet.createRandom().address;
+    expect(await owner.isConvictionAgent(accountId, agent)).toBe(false);
+
+    const reg = await owner.registerConvictionAgent(accountId, agent);
+    expect(reg.success).toBe(true);
+
+    expect(await owner.isConvictionAgent(accountId, agent)).toBe(true);
+    expect(await owner.getConvictionAgentAccountId(agent)).toBe(accountId);
+
+    const info = await owner.getConvictionAccountInfo(accountId);
+    expect(info!.agentCount).toBe(1);
+
+    const dereg = await owner.deregisterConvictionAgent(accountId, agent);
+    expect(dereg.success).toBe(true);
+    expect(await owner.isConvictionAgent(accountId, agent)).toBe(false);
+    expect(await owner.getConvictionAgentAccountId(agent)).toBe(0n);
+  });
 });

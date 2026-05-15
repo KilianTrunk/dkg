@@ -2262,6 +2262,32 @@ export class EVMChainAdapter implements ChainAdapter {
     }
   }
 
+  async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    await this.init();
+    const nft = this.requireConvictionNFT();
+    const receipt = await (await nft.registerAgent(accountId, agent)).wait();
+    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+  }
+
+  async deregisterConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    await this.init();
+    const nft = this.requireConvictionNFT();
+    const receipt = await (await nft.deregisterAgent(accountId, agent)).wait();
+    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+  }
+
+  async isConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) return false;
+    if (!ethers.isAddress(agent)) return false;
+    try {
+      return Boolean(await this.contracts.dkgPublishingConvictionNFT.isAgent(accountId, agent));
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return false;
+      throw err;
+    }
+  }
+
   // =====================================================================
   // Utilities
   // =====================================================================

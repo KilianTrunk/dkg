@@ -286,7 +286,7 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       publishAuthorityAccountId: 1n,
     })).rejects.toThrow(/PCA account 1 does not exist/);
 
-    // `createConvictionAccount` was archived in `archive-non-v10-contracts`;
+    // `createPublishingConvictionAccount` was archived in `archive-non-v10-contracts`;
     // seed the mock's PCA-owner map directly so the publish-policy branch
     // that requires `ownerOf(accountId)` can still be exercised.
     const accountId = mock.seedConvictionAccount('0x1111111111111111111111111111111111111111');

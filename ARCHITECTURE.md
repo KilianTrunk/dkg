@@ -746,13 +746,13 @@ KnowledgeAssetsV10.publish() ─▶ DKGPublishingConvictionNFT.coverPublishingCo
 
 **ChainAdapter V10 PCA surface** (`packages/chain/src/chain-adapter.ts`,
 impl `evm-adapter.ts`, parity in `mock-adapter.ts` /
-`no-chain-adapter.ts`): `createConvictionAccount(committedTRAC)`,
-`topUpConvictionAccount(accountId, amount)`,
-`registerConvictionAgent(accountId, agent)`,
-`deregisterConvictionAgent(accountId, agent)`,
-`isConvictionAgent(accountId, agent)`,
-`settleConvictionAccount(accountId)`,
-`getConvictionAccountInfo(accountId)` (V10 12-tuple shape). The dead V9
+`no-chain-adapter.ts`): `createPublishingConvictionAccount(committedTRAC)`,
+`topUpPublishingConvictionAccount(accountId, amount)`,
+`registerPublishingConvictionAgent(accountId, agent)`,
+`deregisterPublishingConvictionAgent(accountId, agent)`,
+`isPublishingConvictionAgent(accountId, agent)`,
+`settlePublishingConvictionAccount(accountId)`,
+`getPublishingConvictionAccountInfo(accountId)` (V10 12-tuple shape). The dead V9
 `publishingConvictionAccount` cache slot was removed.
 
 **V9 → V10 semantic break** (not a rename — DTOs changed shape across
@@ -767,9 +767,9 @@ facade / daemon / api-client):
 | Settlement | implicit per publish | explicit lazy `settle()` + active sink in `coverPublishingCost` |
 | `getAccountInfo` | 6-tuple `(admin,balance,initialDeposit,lockEpochs,conviction,discountBps)` | 12-tuple `(owner,committedTRAC,baseEpochAllowance,createdAtEpoch,expiresAtEpoch,createdAtTimestamp,expiresAtTimestamp,discountBps,topUpBuffer,agentCount,lastSettledWindow,fullySwept)` |
 
-**Owner-gating** (curation trust model): `createConvictionAccount`
-mints to the signer; `topUp` / `registerConvictionAgent` /
-`deregisterConvictionAgent` are owner-only on chain
+**Owner-gating** (curation trust model): `createPublishingConvictionAccount`
+mints to the signer; `topUp` / `registerPublishingConvictionAgent` /
+`deregisterPublishingConvictionAgent` are owner-only on chain
 (`msg.sender == ownerOf(accountId)`). The SDK surfaces the on-chain
 owner revert (`NotAccountOwner`) rather than swallowing it; the daemon
 maps it to HTTP **403** (distinct from **503** = no-chain adapter).

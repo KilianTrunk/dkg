@@ -1,10 +1,8 @@
-// V10 Publishing Conviction NFT operator routes. Delegate to the agent
-// facade (see ARCHITECTURE.md § #519). Writes except createAccount are
-// owner-gated on chain, so the daemon EOA must be the PCA NFT owner;
-// owner revert → 403, no-chain adapter → 503.
+// V10 Publishing Conviction NFT operator routes (see ARCHITECTURE.md
+// § #519). Owner-gated writes: owner revert → 403, no-chain → 503.
 
 import { ethers } from 'ethers';
-import type { V10ConvictionAccountInfo } from '@origintrail-official/dkg-chain';
+import type { V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import { jsonResponse, readBody, SMALL_BODY_BYTES } from '../http-utils.js';
 import type { RequestContext } from './context.js';
 
@@ -63,7 +61,7 @@ function parseTokenAmount(raw: unknown, field: string): bigint | { error: string
 
 function serializeAccountInfo(
   accountId: bigint,
-  info: V10ConvictionAccountInfo,
+  info: V10PublishingConvictionAccountInfo,
 ): Record<string, unknown> {
   return {
     accountId: accountId.toString(),
@@ -99,7 +97,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     const amount = parseTokenAmount(tokens, 'tokens');
     if (typeof amount !== 'bigint') return jsonResponse(res, 400, amount);
     try {
-      const result = await agent.createConvictionAccount(amount);
+      const result = await agent.createPublishingConvictionAccount(amount);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 200, {
         accountId: result.accountId.toString(),
@@ -111,7 +109,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 500, {
-        error: `createConvictionAccount failed: ${msg}`,
+        error: `createPublishingConvictionAccount failed: ${msg}`,
       });
     }
   }
@@ -132,9 +130,9 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 400, { error: 'agent must be a valid 0x-prefixed EVM address' });
     }
     try {
-      const result = await agent.registerConvictionAgent(accountId, agentAddr);
+      const result = await agent.registerPublishingConvictionAgent(accountId, agentAddr);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
-      const verified = (await agent.isConvictionAgent(accountId, agentAddr)) ?? null;
+      const verified = (await agent.isPublishingConvictionAgent(accountId, agentAddr)) ?? null;
       return jsonResponse(res, 200, {
         accountId: idStr,
         agent: agentAddr,
@@ -151,7 +149,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
           accountId: idStr,
         });
       }
-      return jsonResponse(res, 500, { error: `registerConvictionAgent failed: ${msg}` });
+      return jsonResponse(res, 500, { error: `registerPublishingConvictionAgent failed: ${msg}` });
     }
   }
 
@@ -169,7 +167,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 400, { error: 'agent must be a valid 0x-prefixed EVM address' });
     }
     try {
-      const result = await agent.deregisterConvictionAgent(accountId, agentAddr);
+      const result = await agent.deregisterPublishingConvictionAgent(accountId, agentAddr);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 200, {
         accountId: idStr,
@@ -187,7 +185,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
           accountId: idStr,
         });
       }
-      return jsonResponse(res, 500, { error: `deregisterConvictionAgent failed: ${msg}` });
+      return jsonResponse(res, 500, { error: `deregisterPublishingConvictionAgent failed: ${msg}` });
     }
   }
 
@@ -205,7 +203,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     const amount = parseTokenAmount(tokens, 'tokens');
     if (typeof amount !== 'bigint') return jsonResponse(res, 400, amount);
     try {
-      const result = await agent.topUpConvictionAccount(accountId, amount);
+      const result = await agent.topUpPublishingConvictionAccount(accountId, amount);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 200, {
         accountId: idStr,
@@ -222,7 +220,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
           accountId: idStr,
         });
       }
-      return jsonResponse(res, 500, { error: `topUpConvictionAccount failed: ${msg}` });
+      return jsonResponse(res, 500, { error: `topUpPublishingConvictionAccount failed: ${msg}` });
     }
   }
 
@@ -235,7 +233,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 400, { error: 'Invalid accountId — must be a non-negative integer' });
     }
     try {
-      const result = await agent.settleConvictionAccount(accountId);
+      const result = await agent.settlePublishingConvictionAccount(accountId);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 200, {
         accountId: idStr,
@@ -246,7 +244,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
-      return jsonResponse(res, 500, { error: `settleConvictionAccount failed: ${msg}` });
+      return jsonResponse(res, 500, { error: `settlePublishingConvictionAccount failed: ${msg}` });
     }
   }
 
@@ -259,10 +257,10 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 400, { error: 'Invalid accountId — must be a non-negative integer' });
     }
     try {
-      const info = await agent.getConvictionAccountInfo(accountId);
+      const info = await agent.getPublishingConvictionAccountInfo(accountId);
       if (info === null) {
         // null = view absent OR account missing; disambiguate by probe.
-        if (typeof (agent as any).chain?.getConvictionAccountInfo !== 'function') {
+        if (typeof (agent as any).chain?.getPublishingConvictionAccountInfo !== 'function') {
           return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
         }
         return jsonResponse(res, 404, { error: `Unknown PCA accountId ${idStr}` });
@@ -273,7 +271,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
         if (!ethers.isAddress(probedKey)) {
           result.probedKey = { key: probedKey, error: 'invalid EVM address' };
         } else {
-          const isAuth = await agent.isConvictionAgent(accountId, probedKey);
+          const isAuth = await agent.isPublishingConvictionAgent(accountId, probedKey);
           result.probedKey = {
             key: probedKey,
             authorized: isAuth === true,
@@ -286,7 +284,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 500, {
-        error: `getConvictionAccountInfo failed: ${msg}`,
+        error: `getPublishingConvictionAccountInfo failed: ${msg}`,
       });
     }
   }

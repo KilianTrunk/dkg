@@ -26,7 +26,7 @@ import type {
   ProofPeriodStatus,
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
-  V10ConvictionAccountInfo,
+  V10PublishingConvictionAccountInfo,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -238,13 +238,8 @@ interface ContractCache {
   contextGraphs?: Contract;
   contextGraphStorage?: Contract;
   knowledgeAssetsV10?: Contract;
-  /**
-   * The V10 NFT-backed PCA (`DKGPublishingConvictionNFT`). Backs the
-   * create/topUp/registerAgent/deregisterAgent/settle write surface and
-   * the publisher's `kcEpochs == lockDurationEpochs` discount-eligibility
-   * check in `KnowledgeAssetsV10.publish()` — wrong epochs silently fall
-   * through to direct spend, so the SDK pre-coerces to keep the discount.
-   */
+  /** V10 NFT-backed PCA. Backs the PCA write surface + the publisher's
+   *  `kcEpochs == lockDurationEpochs` discount check (SDK pre-coerces). */
   dkgPublishingConvictionNFT?: Contract;
   randomSampling?: Contract;
   randomSamplingStorage?: Contract;
@@ -2187,7 +2182,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return nft;
   }
 
-  async createConvictionAccount(
+  async createPublishingConvictionAccount(
     committedTRAC: bigint,
   ): Promise<{ accountId: bigint } & TxResult> {
     await this.init();
@@ -2217,7 +2212,7 @@ export class EVMChainAdapter implements ChainAdapter {
       } catch { /* not this contract's event */ }
     }
     if (accountId === 0n) {
-      throw new Error('createConvictionAccount succeeded but no AccountCreated event found');
+      throw new Error('createPublishingConvictionAccount succeeded but no AccountCreated event found');
     }
 
     return {
@@ -2228,7 +2223,7 @@ export class EVMChainAdapter implements ChainAdapter {
     };
   }
 
-  async getConvictionAccountInfo(accountId: bigint): Promise<V10ConvictionAccountInfo | null> {
+  async getPublishingConvictionAccountInfo(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null> {
     await this.init();
     if (!this.contracts.dkgPublishingConvictionNFT) return null;
     try {
@@ -2253,7 +2248,7 @@ export class EVMChainAdapter implements ChainAdapter {
     }
   }
 
-  async topUpConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
+  async topUpPublishingConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
     await this.init();
     const nft = this.requireConvictionNFT();
     const nftAddress = await nft.getAddress();
@@ -2267,28 +2262,28 @@ export class EVMChainAdapter implements ChainAdapter {
     return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
   }
 
-  async settleConvictionAccount(accountId: bigint): Promise<TxResult> {
+  async settlePublishingConvictionAccount(accountId: bigint): Promise<TxResult> {
     await this.init();
     const nft = this.requireConvictionNFT();
     const receipt = await (await nft.settle(accountId)).wait();
     return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
   }
 
-  async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+  async registerPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
     await this.init();
     const nft = this.requireConvictionNFT();
     const receipt = await (await nft.registerAgent(accountId, agent)).wait();
     return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
   }
 
-  async deregisterConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+  async deregisterPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
     await this.init();
     const nft = this.requireConvictionNFT();
     const receipt = await (await nft.deregisterAgent(accountId, agent)).wait();
     return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
   }
 
-  async isConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
+  async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
     await this.init();
     if (!this.contracts.dkgPublishingConvictionNFT) return false;
     if (!ethers.isAddress(agent)) return false;

@@ -55,7 +55,7 @@ import {
   type WorkspaceRecipientEncryptionKey,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
-import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10ConvictionAccountInfo } from '@origintrail-official/dkg-chain';
+import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
   PublishJournal, StaleWriteError,
@@ -3955,50 +3955,45 @@ export class DKGAgent {
     return this.chain.getLatestMerkleRootAuthor(kcId);
   }
 
-  /**
-   * V10 Publishing Conviction NFT facade — thin wrappers over the chain
-   * adapter (no local state) so daemon routes don't touch private `chain`.
-   * Owner-gated writes MUST NOT swallow the owner revert (daemon → 403);
-   * `null` = adapter has no V10 PCA surface (daemon → 503).
-   * See ARCHITECTURE.md § #519.
-   */
-  async createConvictionAccount(
+  /** V10 Publishing Conviction NFT facade — thin chain-adapter wrappers.
+   *  Owner revert not swallowed (→ 403); `null` = no surface (→ 503). */
+  async createPublishingConvictionAccount(
     committedTRAC: bigint,
   ): Promise<({ accountId: bigint } & TxResult) | null> {
-    if (typeof this.chain.createConvictionAccount !== 'function') return null;
-    return this.chain.createConvictionAccount(committedTRAC);
+    if (typeof this.chain.createPublishingConvictionAccount !== 'function') return null;
+    return this.chain.createPublishingConvictionAccount(committedTRAC);
   }
 
-  async topUpConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult | null> {
-    if (typeof this.chain.topUpConvictionAccount !== 'function') return null;
-    return this.chain.topUpConvictionAccount(accountId, amount);
+  async topUpPublishingConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult | null> {
+    if (typeof this.chain.topUpPublishingConvictionAccount !== 'function') return null;
+    return this.chain.topUpPublishingConvictionAccount(accountId, amount);
   }
 
-  async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult | null> {
-    if (typeof this.chain.registerConvictionAgent !== 'function') return null;
-    return this.chain.registerConvictionAgent(accountId, agent);
+  async registerPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult | null> {
+    if (typeof this.chain.registerPublishingConvictionAgent !== 'function') return null;
+    return this.chain.registerPublishingConvictionAgent(accountId, agent);
   }
 
-  async deregisterConvictionAgent(accountId: bigint, agent: string): Promise<TxResult | null> {
-    if (typeof this.chain.deregisterConvictionAgent !== 'function') return null;
-    return this.chain.deregisterConvictionAgent(accountId, agent);
+  async deregisterPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult | null> {
+    if (typeof this.chain.deregisterPublishingConvictionAgent !== 'function') return null;
+    return this.chain.deregisterPublishingConvictionAgent(accountId, agent);
   }
 
-  async isConvictionAgent(accountId: bigint, agent: string): Promise<boolean | null> {
-    if (typeof this.chain.isConvictionAgent !== 'function') return null;
-    return this.chain.isConvictionAgent(accountId, agent);
+  async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean | null> {
+    if (typeof this.chain.isPublishingConvictionAgent !== 'function') return null;
+    return this.chain.isPublishingConvictionAgent(accountId, agent);
   }
 
-  async settleConvictionAccount(accountId: bigint): Promise<TxResult | null> {
-    if (typeof this.chain.settleConvictionAccount !== 'function') return null;
-    return this.chain.settleConvictionAccount(accountId);
+  async settlePublishingConvictionAccount(accountId: bigint): Promise<TxResult | null> {
+    if (typeof this.chain.settlePublishingConvictionAccount !== 'function') return null;
+    return this.chain.settlePublishingConvictionAccount(accountId);
   }
 
-  async getConvictionAccountInfo(
+  async getPublishingConvictionAccountInfo(
     accountId: bigint,
-  ): Promise<V10ConvictionAccountInfo | null> {
-    if (typeof this.chain.getConvictionAccountInfo !== 'function') return null;
-    return this.chain.getConvictionAccountInfo(accountId);
+  ): Promise<V10PublishingConvictionAccountInfo | null> {
+    if (typeof this.chain.getPublishingConvictionAccountInfo !== 'function') return null;
+    return this.chain.getPublishingConvictionAccountInfo(accountId);
   }
 
   // ---------------------------------------------------------------------------

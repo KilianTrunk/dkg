@@ -14,17 +14,17 @@ async function makeAgent(chain: MockChainAdapter): Promise<DKGAgent> {
 }
 
 describe('DKGAgent V10 PCA facade', () => {
-  it('createConvictionAccount delegates to the chain adapter and getConvictionAccountInfo reflects it', async () => {
+  it('createPublishingConvictionAccount delegates to the chain adapter and getPublishingConvictionAccountInfo reflects it', async () => {
     const owner = ethers.Wallet.createRandom();
     const chain = new MockChainAdapter('mock:31337', owner.address);
     const agent = await makeAgent(chain);
 
-    const created = await agent.createConvictionAccount(1_000n);
+    const created = await agent.createPublishingConvictionAccount(1_000n);
     expect(created).not.toBeNull();
     expect(created!.accountId).toBeGreaterThan(0n);
     expect(created!.hash).toMatch(/^0x/);
 
-    const info = await agent.getConvictionAccountInfo(created!.accountId);
+    const info = await agent.getPublishingConvictionAccountInfo(created!.accountId);
     expect(info).not.toBeNull();
     expect(info!.owner.toLowerCase()).toBe(owner.address.toLowerCase());
     expect(info!.committedTRAC).toBe(1_000n);

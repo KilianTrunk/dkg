@@ -33,7 +33,7 @@ function runCtx(method: string, path: string, agent: any, body?: unknown) {
 describe('daemon /api/pca V10 caller contract', () => {
   it('POST /api/pca accepts a V10 body with only tokens (no lockEpochs) → 200', async () => {
     const agent = {
-      createConvictionAccount: async () => ({
+      createPublishingConvictionAccount: async () => ({
         accountId: 1n, hash: '0xabc', blockNumber: 7, success: true,
       }),
     };
@@ -47,11 +47,11 @@ describe('daemon /api/pca V10 caller contract', () => {
     let registered: { id: bigint; agent: string } | null = null;
     const addr = '0x' + '1'.repeat(40);
     const agent = {
-      registerConvictionAgent: async (id: bigint, a: string) => {
+      registerPublishingConvictionAgent: async (id: bigint, a: string) => {
         registered = { id, agent: a };
         return { hash: '0xreg', blockNumber: 9, success: true };
       },
-      isConvictionAgent: async () => true,
+      isPublishingConvictionAgent: async () => true,
     };
     const { res, done } = runCtx('POST', '/api/pca/1/agent', agent, { agent: addr });
     await done;
@@ -66,7 +66,7 @@ describe('daemon /api/pca V10 caller contract', () => {
     let deregistered: { id: bigint; agent: string } | null = null;
     const addr = '0x' + '2'.repeat(40);
     const agent = {
-      deregisterConvictionAgent: async (id: bigint, a: string) => {
+      deregisterPublishingConvictionAgent: async (id: bigint, a: string) => {
         deregistered = { id, agent: a };
         return { hash: '0xdereg', blockNumber: 11, success: true };
       },
@@ -82,7 +82,7 @@ describe('daemon /api/pca V10 caller contract', () => {
 
   it('maps an owner-gated NotAccountOwner revert on agent deregister to HTTP 403', async () => {
     const agent = {
-      deregisterConvictionAgent: async () => {
+      deregisterPublishingConvictionAgent: async () => {
         throw new Error('Mock: NotAccountOwner(1, 0xdeadbeef)');
       },
     };
@@ -94,7 +94,7 @@ describe('daemon /api/pca V10 caller contract', () => {
 
   it('maps an owner-gated NotAccountOwner revert on agent register to HTTP 403', async () => {
     const agent = {
-      registerConvictionAgent: async () => {
+      registerPublishingConvictionAgent: async () => {
         throw new Error('Mock: NotAccountOwner(1, 0xdeadbeef)');
       },
     };
@@ -107,7 +107,7 @@ describe('daemon /api/pca V10 caller contract', () => {
   it('POST /api/pca/:id/settle runs settle() → 200', async () => {
     let settledId: bigint | null = null;
     const agent = {
-      settleConvictionAccount: async (id: bigint) => {
+      settlePublishingConvictionAccount: async (id: bigint) => {
         settledId = id;
         return { hash: '0xsettle', blockNumber: 13, success: true };
       },
@@ -122,7 +122,7 @@ describe('daemon /api/pca V10 caller contract', () => {
 
   it('maps a NoChainAdapter noChain() throw on settle to HTTP 503', async () => {
     const agent = {
-      settleConvictionAccount: async () => {
+      settlePublishingConvictionAccount: async () => {
         throw new Error('No blockchain configured. To use on-chain operations, provide chainConfig');
       },
     };
@@ -133,7 +133,7 @@ describe('daemon /api/pca V10 caller contract', () => {
 
   it('maps an owner-gated NotAccountOwner revert on funds top-up to HTTP 403', async () => {
     const agent = {
-      topUpConvictionAccount: async () => {
+      topUpPublishingConvictionAccount: async () => {
         throw new Error('Mock: NotAccountOwner(1, 0xdeadbeef)');
       },
     };
@@ -145,20 +145,20 @@ describe('daemon /api/pca V10 caller contract', () => {
   it('round-trips register/funds → GET reflects agentCount and topUpBuffer', async () => {
     const state = { agents: new Set<string>(), topUp: 0n };
     const agent = {
-      registerConvictionAgent: async (_id: bigint, a: string) => {
+      registerPublishingConvictionAgent: async (_id: bigint, a: string) => {
         state.agents.add(a.toLowerCase());
         return { hash: '0xr', blockNumber: 1, success: true };
       },
-      deregisterConvictionAgent: async (_id: bigint, a: string) => {
+      deregisterPublishingConvictionAgent: async (_id: bigint, a: string) => {
         state.agents.delete(a.toLowerCase());
         return { hash: '0xd', blockNumber: 2, success: true };
       },
-      isConvictionAgent: async (_id: bigint, a: string) => state.agents.has(a.toLowerCase()),
-      topUpConvictionAccount: async (_id: bigint, amount: bigint) => {
+      isPublishingConvictionAgent: async (_id: bigint, a: string) => state.agents.has(a.toLowerCase()),
+      topUpPublishingConvictionAccount: async (_id: bigint, amount: bigint) => {
         state.topUp += amount;
         return { hash: '0xt', blockNumber: 3, success: true };
       },
-      getConvictionAccountInfo: async () => ({
+      getPublishingConvictionAccountInfo: async () => ({
         owner: '0x' + '9'.repeat(40),
         committedTRAC: 100n,
         baseEpochAllowance: 1n,
@@ -195,11 +195,11 @@ describe('daemon /api/pca V10 caller contract', () => {
         '(rpcUrl, hubAddress, privateKey) when creating the agent, or set DKG_PRIVATE_KEY.',
       );
     };
-    const create = runCtx('POST', '/api/pca', { createConvictionAccount: noChainErr }, { tokens: '1' });
+    const create = runCtx('POST', '/api/pca', { createPublishingConvictionAccount: noChainErr }, { tokens: '1' });
     await create.done;
     expect(create.res.statusCode).toBe(503);
 
-    const info = runCtx('GET', '/api/pca/1', { getConvictionAccountInfo: noChainErr });
+    const info = runCtx('GET', '/api/pca/1', { getPublishingConvictionAccountInfo: noChainErr });
     await info.done;
     expect(info.res.statusCode).toBe(503);
   });

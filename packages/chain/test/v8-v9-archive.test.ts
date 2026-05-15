@@ -32,15 +32,16 @@ const ARCHIVED_METHODS: ReadonlyArray<string> = [
   'transferNamespace',
   // V9 permanent publish
   'publishKnowledgeAssetsPermanent',
-  // V9 PCA family. NOTE: `createConvictionAccount` and
-  // `getConvictionAccountInfo` were reclaimed by the V10
-  // DKGPublishingConvictionNFT surface (issue #519 / TB-0001 — PRD §6),
-  // so they are intentionally NOT guarded here. The names below are the
-  // V9-only admin/authorizedKey methods with no V10 successor.
+  // V9 PCA family — all V9-only names. The V10 surface uses explicit
+  // `*PublishingConviction*` names (issue #519, PRD §6) to disambiguate
+  // from staking conviction, so these bare `Conviction` names must stay
+  // absent from the live adapter.
+  'createConvictionAccount',
   'addConvictionFunds',
   'extendConvictionLock',
   'addPCAAuthorizedKey',
   'isPCAAuthorizedKey',
+  'getConvictionAccountInfo',
   'getConvictionDiscount',
 ];
 

@@ -10,7 +10,7 @@ import type {
   EventFilter,
   CreateContextGraphParams,
   V10PublishParams,
-  V10ConvictionAccountInfo,
+  V10PublishingConvictionAccountInfo,
 } from './chain-adapter.js';
 
 function noChain(): never {
@@ -46,13 +46,13 @@ export class NoChainAdapter implements ChainAdapter {
   async getPublishingConvictionAccountOwner(_accountId: bigint): Promise<string> { noChain(); }
   // V10 Publishing Conviction NFT write+read surface (issue #519). No
   // chain → every call throws via the shared noChain() helper.
-  async createConvictionAccount(_committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> { noChain(); }
-  async topUpConvictionAccount(_accountId: bigint, _amount: bigint): Promise<TxResult> { noChain(); }
-  async registerConvictionAgent(_accountId: bigint, _agent: string): Promise<TxResult> { noChain(); }
-  async deregisterConvictionAgent(_accountId: bigint, _agent: string): Promise<TxResult> { noChain(); }
-  async isConvictionAgent(_accountId: bigint, _agent: string): Promise<boolean> { noChain(); }
-  async settleConvictionAccount(_accountId: bigint): Promise<TxResult> { noChain(); }
-  async getConvictionAccountInfo(_accountId: bigint): Promise<V10ConvictionAccountInfo | null> { noChain(); }
+  async createPublishingConvictionAccount(_committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> { noChain(); }
+  async topUpPublishingConvictionAccount(_accountId: bigint, _amount: bigint): Promise<TxResult> { noChain(); }
+  async registerPublishingConvictionAgent(_accountId: bigint, _agent: string): Promise<TxResult> { noChain(); }
+  async deregisterPublishingConvictionAgent(_accountId: bigint, _agent: string): Promise<TxResult> { noChain(); }
+  async isPublishingConvictionAgent(_accountId: bigint, _agent: string): Promise<boolean> { noChain(); }
+  async settlePublishingConvictionAccount(_accountId: bigint): Promise<TxResult> { noChain(); }
+  async getPublishingConvictionAccountInfo(_accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null> { noChain(); }
   isV10Ready(): boolean { return false; }
   isRandomSamplingReady(): boolean { return false; }
 }

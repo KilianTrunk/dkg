@@ -22,7 +22,7 @@ import type {
   ProofPeriodStatus,
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
-  V10ConvictionAccountInfo,
+  V10PublishingConvictionAccountInfo,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -423,9 +423,7 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   // --- V10 Publishing Conviction NFT (DKGPublishingConvictionNFT) ---
-  // In-memory parity model: incrementing-id account map, agent reverse
-  // map and owner-gating, mirroring the real NFT so offline-mode users
-  // hit the same owner-revert behaviour as the chain.
+  // In-memory parity: account map + agent reverse map + owner-gating.
 
   private convictionAccounts = new Map<bigint, {
     owner: string;
@@ -437,16 +435,11 @@ export class MockChainAdapter implements ChainAdapter {
   private agentToConvictionAccount = new Map<string, bigint>();
   private nextConvictionAccountId = 1n;
 
-  // Chain default `ParametersStorage.publishingConvictionEpochs` is 12;
-  // the mock snapshots the same value so the publisher's epoch-coercion
-  // probe behaves identically off-chain.
+  // Mirrors chain `ParametersStorage.publishingConvictionEpochs` (12).
   private static readonly MOCK_LOCK_DURATION_EPOCHS = 12;
 
-  /**
-   * Test helper — seed a PCA owned by `admin` so publish-policy branches
-   * that require a known PCA owner address can be exercised. Not part of
-   * the `ChainAdapter` interface.
-   */
+  /** Test helper (not in `ChainAdapter`): seed a PCA owned by `admin`
+   *  for publish-policy branches that need a known PCA owner. */
   seedConvictionAccount(admin: string): bigint {
     const accountId = this.nextConvictionAccountId++;
     this.convictionAccounts.set(accountId, {
@@ -459,9 +452,8 @@ export class MockChainAdapter implements ChainAdapter {
     return accountId;
   }
 
-  // Parity with the contract: createAccount/topUp revert `InvalidAmount`
-  // for amount == 0 and the uint96 ABI encoding rejects negative /
-  // out-of-range values before any state write.
+  // Contract parity: createAccount/topUp revert `InvalidAmount` for
+  // amount==0 or out-of-uint96-range, before any state write.
   private static readonly MAX_UINT96 = (1n << 96n) - 1n;
   private requireValidConvictionAmount(amount: bigint): void {
     if (amount <= 0n || amount > MockChainAdapter.MAX_UINT96) {
@@ -469,7 +461,7 @@ export class MockChainAdapter implements ChainAdapter {
     }
   }
 
-  async createConvictionAccount(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> {
+  async createPublishingConvictionAccount(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> {
     this.requireValidConvictionAmount(committedTRAC);
     const accountId = this.nextConvictionAccountId++;
     this.convictionAccounts.set(accountId, {
@@ -482,7 +474,7 @@ export class MockChainAdapter implements ChainAdapter {
     return { accountId, ...this.txResult(true) };
   }
 
-  async getConvictionAccountInfo(accountId: bigint): Promise<V10ConvictionAccountInfo | null> {
+  async getPublishingConvictionAccountInfo(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null> {
     const acct = this.convictionAccounts.get(accountId);
     if (!acct) return null;
     return {
@@ -519,19 +511,19 @@ export class MockChainAdapter implements ChainAdapter {
     return acct;
   }
 
-  async topUpConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
+  async topUpPublishingConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
     const acct = this.requireConvictionOwner(accountId);
     this.requireValidConvictionAmount(amount);
     acct.topUpBuffer += amount;
     return this.txResult(true);
   }
 
-  async settleConvictionAccount(accountId: bigint): Promise<TxResult> {
+  async settlePublishingConvictionAccount(accountId: bigint): Promise<TxResult> {
     this.requireConvictionAccount(accountId);
     return this.txResult(true);
   }
 
-  async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+  async registerPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
     const acct = this.requireConvictionOwner(accountId);
     if (agent === ethers.ZeroAddress) {
       throw new Error('Mock: ZeroAgentAddress()');
@@ -545,7 +537,7 @@ export class MockChainAdapter implements ChainAdapter {
     return this.txResult(true);
   }
 
-  async deregisterConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+  async deregisterPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
     const acct = this.requireConvictionOwner(accountId);
     const key = ethers.getAddress(agent).toLowerCase();
     if (!acct.agents.has(key)) {
@@ -556,18 +548,15 @@ export class MockChainAdapter implements ChainAdapter {
     return this.txResult(true);
   }
 
-  async isConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
+  async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
     if (!ethers.isAddress(agent)) return false;
     const acct = this.convictionAccounts.get(accountId);
     if (!acct) return false;
     return acct.agents.has(ethers.getAddress(agent).toLowerCase());
   }
 
-  /**
-   * Reverse lookup mirroring `agentToAccountId`. Returns `0n` for any
-   * non-registered address so the publisher SDK keeps the direct-spend
-   * default until an agent is explicitly registered.
-   */
+  /** Mirrors `agentToAccountId`; `0n` for unregistered → publisher SDK
+   *  stays on direct-spend until an agent is registered. */
   async getConvictionAgentAccountId(agent: string): Promise<bigint> {
     if (!ethers.isAddress(agent)) return 0n;
     return this.agentToConvictionAccount.get(ethers.getAddress(agent).toLowerCase()) ?? 0n;

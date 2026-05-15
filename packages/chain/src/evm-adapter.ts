@@ -26,6 +26,7 @@ import type {
   ProofPeriodStatus,
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
+  V10ConvictionAccountInfo,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -2185,6 +2186,80 @@ export class EVMChainAdapter implements ChainAdapter {
     const nft = await this.resolveContract('DKGPublishingConvictionNFT');
     const owner = await nft.ownerOf(accountId);
     return ethers.getAddress(owner);
+  }
+
+  private requireConvictionNFT(): Contract {
+    const nft = this.contracts.dkgPublishingConvictionNFT;
+    if (!nft) {
+      throw new Error('DKGPublishingConvictionNFT not deployed on this Hub.');
+    }
+    return nft;
+  }
+
+  async createConvictionAccount(
+    committedTRAC: bigint,
+  ): Promise<{ accountId: bigint } & TxResult> {
+    await this.init();
+    const nft = this.requireConvictionNFT();
+    const nftAddress = await nft.getAddress();
+
+    // createAccount() does transferFrom(msg.sender → stakingStorage,
+    // committedTRAC) — the signer must allow the NFT to pull the TRAC.
+    if (this.contracts.token) {
+      const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+      if (allowance < committedTRAC) {
+        await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+      }
+    }
+
+    const tx = await nft.createAccount(committedTRAC);
+    const receipt = await tx.wait();
+
+    let accountId = 0n;
+    for (const log of receipt.logs) {
+      try {
+        const parsed = nft.interface.parseLog({ topics: [...log.topics], data: log.data });
+        if (parsed?.name === 'AccountCreated') {
+          accountId = BigInt(parsed.args.accountId);
+          break;
+        }
+      } catch { /* not this contract's event */ }
+    }
+    if (accountId === 0n) {
+      throw new Error('createConvictionAccount succeeded but no AccountCreated event found');
+    }
+
+    return {
+      accountId,
+      hash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      success: receipt.status === 1,
+    };
+  }
+
+  async getConvictionAccountInfo(accountId: bigint): Promise<V10ConvictionAccountInfo | null> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) return null;
+    try {
+      const t = await this.contracts.dkgPublishingConvictionNFT.getAccountInfo(accountId);
+      return {
+        owner: ethers.getAddress(t[0]),
+        committedTRAC: BigInt(t[1]),
+        baseEpochAllowance: BigInt(t[2]),
+        createdAtEpoch: Number(t[3]),
+        expiresAtEpoch: Number(t[4]),
+        createdAtTimestamp: Number(t[5]),
+        expiresAtTimestamp: Number(t[6]),
+        discountBps: Number(t[7]),
+        topUpBuffer: BigInt(t[8]),
+        agentCount: Number(t[9]),
+        lastSettledWindow: Number(t[10]),
+        fullySwept: Boolean(t[11]),
+      };
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return null;
+      throw err;
+    }
   }
 
   // =====================================================================

@@ -33,6 +33,23 @@ export interface VerifyCollectionResult {
 }
 
 const MAX_RETRIES = 2;
+export const VERIFY_COLLECTION_TIMEOUT_MIN_MS = 1_000;
+export const VERIFY_COLLECTION_TIMEOUT_MAX_MS = 30 * 60 * 1000;
+export const VERIFY_COLLECTION_TIMEOUT_DEFAULT_MS = VERIFY_COLLECTION_TIMEOUT_MAX_MS;
+
+export function assertVerifyCollectionTimeoutMs(timeoutMs: number): number {
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < VERIFY_COLLECTION_TIMEOUT_MIN_MS ||
+    timeoutMs > VERIFY_COLLECTION_TIMEOUT_MAX_MS
+  ) {
+    throw new RangeError(
+      `verify_timeout_invalid: timeoutMs must be an integer between ` +
+        `${VERIFY_COLLECTION_TIMEOUT_MIN_MS} and ${VERIFY_COLLECTION_TIMEOUT_MAX_MS} milliseconds`,
+    );
+  }
+  return timeoutMs;
+}
 
 /**
  * VerifyCollector implements spec §10.1: collecting M-of-N approval
@@ -67,11 +84,15 @@ export class VerifyCollector {
       batchId, merkleRoot, entities, proposerSignature,
       requiredSignatures, timeoutMs, allowPartial = false,
     } = params;
+    const boundedTimeoutMs = Math.min(
+      assertVerifyCollectionTimeoutMs(timeoutMs),
+      VERIFY_COLLECTION_TIMEOUT_MAX_MS,
+    );
 
     const log = this.deps.log ?? (() => {});
 
     const proposalId = crypto.getRandomValues(new Uint8Array(16));
-    const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
+    const expiresAt = new Date(Date.now() + boundedTimeoutMs).toISOString();
 
     // Use { low, high, unsigned } Long objects for uint64 fields to avoid
     // precision loss above 2^53 - 1 (protobufjs uint64 representation).
@@ -171,6 +192,7 @@ export class VerifyCollector {
     let quorumResolve: (() => void) | undefined;
     const quorumPromise = new Promise<void>(resolve => { quorumResolve = resolve; });
 
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         (async () => {
@@ -187,16 +209,20 @@ export class VerifyCollector {
           });
           await Promise.race([Promise.allSettled(promises), quorumPromise]);
         })(),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`verify_timeout: ${collected.length}/${remoteRequired} remote approvals within ${timeoutMs}ms`)),
-            timeoutMs,
-          ),
-        ),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new Error(`verify_timeout: ${collected.length}/${remoteRequired} remote approvals within ${boundedTimeoutMs}ms`)),
+            boundedTimeoutMs,
+          );
+        }),
       ]);
     } catch (err) {
       if (!allowPartial) throw err;
       log(`[VerifyCollector] Partial verify collection: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      if (timeoutHandle !== undefined) {
+        clearTimeout(timeoutHandle);
+      }
     }
 
     if (collected.length < remoteRequired && !allowPartial) {

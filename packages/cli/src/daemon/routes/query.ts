@@ -58,7 +58,10 @@ const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
+import {
+  findReservedSubjectPrefix,
+  isSkolemizedUri,
+} from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
   MetricsCollector,
@@ -328,6 +331,38 @@ import {
 } from '../local-agents.js';
 
 import type { RequestContext } from './context.js';
+
+
+// Keep these in sync with VerifyCollector's hard enforcement in
+// packages/publisher/src/verify-collector.ts. They exist here so bad
+// HTTP input is rejected before the agent starts VERIFY work.
+const VERIFY_COLLECTION_TIMEOUT_MIN_MS = 1_000;
+const VERIFY_COLLECTION_TIMEOUT_MAX_MS = 30 * 60 * 1000;
+
+function parseVerifyTimeoutMs(
+  raw: unknown,
+): { value: number | undefined } | { error: string } {
+  if (raw === undefined || raw === null || raw === '') return { value: undefined };
+  let value: number;
+  if (typeof raw === 'number') {
+    value = raw;
+  } else if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) {
+    value = Number(raw.trim());
+  } else {
+    return { error: 'timeoutMs must be an integer number of milliseconds' };
+  }
+  if (!Number.isSafeInteger(value)) {
+    return { error: 'timeoutMs must be a safe integer number of milliseconds' };
+  }
+  if (value < VERIFY_COLLECTION_TIMEOUT_MIN_MS || value > VERIFY_COLLECTION_TIMEOUT_MAX_MS) {
+    return {
+      error:
+        `timeoutMs must be between ${VERIFY_COLLECTION_TIMEOUT_MIN_MS} and ` +
+        `${VERIFY_COLLECTION_TIMEOUT_MAX_MS} milliseconds`,
+    };
+  }
+  return { value };
+}
 
 
 export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
@@ -917,6 +952,10 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 400, { error: parsedSigs.error });
     }
     const validatedRequiredSigs = parsedSigs.value || undefined;
+    const parsedTimeout = parseVerifyTimeoutMs(timeoutMs);
+    if ("error" in parsedTimeout) {
+      return jsonResponse(res, 400, { error: parsedTimeout.error });
+    }
 
     // CLI-9 (
     // unparseable value used to throw `SyntaxError: Cannot convert ...
@@ -936,7 +975,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
         contextGraphId,
         verifiedMemoryId,
         batchId: parsedBatchId,
-        timeoutMs: timeoutMs ? Number(timeoutMs) : undefined,
+        timeoutMs: parsedTimeout.value,
         requiredSignatures: validatedRequiredSigs,
       });
       if (result.status === "verified") {

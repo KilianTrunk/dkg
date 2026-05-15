@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { Readable } from 'node:stream';
 import { handleQueryRoutes } from '../src/daemon/routes/query.js';
 
+const VERIFY_COLLECTION_TIMEOUT_MAX_MS = 30 * 60 * 1000;
+
 type CapturedResponse = {
   statusCode?: number;
   body?: string;
@@ -114,5 +116,18 @@ describe('trust endpoint input validation', () => {
     expect(result.status).toBe(400);
     expect(result.body.error).toMatch(/ual|safe IRI/i);
     expect(result.agent.endorse).not.toHaveBeenCalled();
+  });
+
+  it('/api/verify rejects oversized timeoutMs before agent.verify', async () => {
+    const result = await callTrustRoute('/api/verify', {
+      contextGraphId: 'cg-safe',
+      verifiedMemoryId: '1',
+      batchId: '1',
+      timeoutMs: VERIFY_COLLECTION_TIMEOUT_MAX_MS + 1,
+    });
+
+    expect(result.status).toBe(400);
+    expect(result.body.error).toMatch(/timeoutMs/);
+    expect(result.agent.verify).not.toHaveBeenCalled();
   });
 });

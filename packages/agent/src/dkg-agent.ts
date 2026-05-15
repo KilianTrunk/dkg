@@ -9590,7 +9590,7 @@ export class DKGAgent {
       entities,
       proposerSignature: { r: ethers.getBytes(proposerSig.r), vs: ethers.getBytes(proposerSig.yParityAndS) },
       requiredSignatures,
-      timeoutMs: opts.timeoutMs ?? 30 * 60 * 1000, // 30 min default
+      timeoutMs: opts.timeoutMs ?? 30 * 60 * 1000, // 30 min default; VerifyCollector also enforces this as its max.
       allowPartial: true,
     });
 

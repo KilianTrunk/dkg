@@ -108,7 +108,6 @@ async function deployFixture(): Promise<Fixture> {
 
 describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function () {
   let accounts: SignerWithAddress[];
-  let Hub: Hub;
   let Token: Token;
   let Chronos: Chronos;
   let ProfileContract: Profile;
@@ -126,7 +125,6 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     hre.helpers.resetDeploymentsJson();
     ({
       accounts,
-      Hub,
       Token,
       Chronos,
       Profile: ProfileContract,
@@ -247,10 +245,11 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     await StakingNFT.connect(staker).createConviction(identityId, amount, 1);
   };
 
-  // --------------------------------------------------------------------------
-  // 2. registered agent publishes via real KnowledgeAssetsV10.publish()
-  // --------------------------------------------------------------------------
-  it('takes the discount branch when epochs == lockDurationEpochs and the discounted cost is asserted on chain', async () => {
+  // Stand up publisher + receiver profiles (V10-staked for the ACK signer
+  // gate), a fresh registered conviction agent, and an open context graph.
+  // Returns everything `buildPublishParams` needs plus the account's
+  // `lockDurationEpochs` (the discount-branch epoch count).
+  const setupRegisteredAgentPublish = async () => {
     const publishingNode = getDefaultPublishingNode(accounts);
     const receivingNodes = getDefaultReceivingNodes(accounts);
     const { identityId: publisherIdentityId } = await createProfile(
@@ -272,13 +271,11 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       );
     }
 
-    // ---- create + register the publishing agent ----
     const creator = getDefaultKCCreator(accounts);
     const accountId = await createAccountFor(creator);
     await NFT.connect(creator).registerAgent(accountId, creator.address);
     expect(await NFT.agentToAccountId(creator.address)).to.equal(accountId);
 
-    // ---- open context graph (any non-zero publisher authorized) ----
     await CGFacade.connect(creator).createContextGraph(
       [10n, 20n, 30n],
       [],
@@ -293,9 +290,32 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     expect(await CGFacade.isAuthorizedPublisher(cgId, creator.address)).to.be
       .true;
 
-    // ---- discount branch requires p.epochs == lockDurationEpochs ----
-    const acctInfo = await NFT.accounts(accountId);
-    const epochs = Number(acctInfo[5]);
+    // Discount branch requires p.epochs == lockDurationEpochs.
+    const epochs = Number((await NFT.accounts(accountId))[5]);
+    return {
+      creator,
+      accountId,
+      cgId,
+      epochs,
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+    };
+  };
+
+  // --------------------------------------------------------------------------
+  // 2. registered agent publishes via real KnowledgeAssetsV10.publish()
+  // --------------------------------------------------------------------------
+  it('takes the discount branch when epochs == lockDurationEpochs and the discounted cost is asserted on chain', async () => {
+    const {
+      creator,
+      epochs,
+      cgId,
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+    } = await setupRegisteredAgentPublish();
+
     const tokenAmount = ethers.parseEther('1000');
     const expectedDiscounted =
       (tokenAmount * (10_000n - EXPECTED_DISCOUNT_BPS)) / 10_000n;
@@ -365,52 +385,66 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   });
 
   // --------------------------------------------------------------------------
-  // 3. expired account: the conviction funding call reverts
+  // 3. expired account: real publish() loses the discount and reverts
   // --------------------------------------------------------------------------
   //
-  // `KnowledgeAssetsV10.publish()` deliberately does NOT revert on an
-  // expired PCA — it gates the discount off and falls through to
-  // direct spend so a stale agent registration cannot brick the
-  // publisher. The on-chain expiry revert lives in the exact funding
-  // call publish() makes on the conviction branch:
-  // `coverPublishingCost`. We drive it directly via an EOA standing in
-  // for KnowledgeAssetsV10 (Hub-resolved gate, same pattern as the unit
-  // suite) to assert `AccountExpired` post-expiry.
-  it('reverts AccountExpired when the publish funding call is attempted post-expiry', async () => {
-    const creator = getDefaultKCCreator(accounts);
-    const agent = accounts[15];
-    const kav10Signer = accounts[16];
+  // On an expired PCA `KnowledgeAssetsV10.publish()` gates the conviction
+  // discount off (block.timestamp >= expiresAtTimestamp) and falls through
+  // to the direct-spend branch — `_addTokens` pulls the FULL cost from the
+  // agent. The registered agent here was only ever funded for the up-front
+  // `committedTRAC` (consumed by createAccount) and never approved KAV10
+  // for a direct spend, so the post-expiry publish reverts with
+  // `TooLowAllowance` and no KC is created (atomic rollback). The same
+  // agent publishing the SAME unfunded params BEFORE expiry succeeds via
+  // the NFT-funded discount branch (asserted in test 2) — the revert is
+  // expiry-driven, not a missing-approval artifact.
+  it('expired account: real publish() drops the discount, reverts TooLowAllowance, creates no KC', async () => {
+    const {
+      creator,
+      accountId,
+      epochs,
+      cgId,
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+    } = await setupRegisteredAgentPublish();
 
-    const accountId = await createAccountFor(creator);
-    await NFT.connect(creator).registerAgent(accountId, agent.address);
-
-    const acct = await NFT.accounts(accountId);
-    const lockDurationEpochs = Number(acct[5]);
+    // Advance past `expiresAtTimestamp` (lockDurationEpochs + 1 to clear
+    // the window containing expiry plus the chain-epoch drift buffer).
     const epochLength = await Chronos.epochLength();
-    await Hub.setContractAddress(
-      'KnowledgeAssetsV10',
-      kav10Signer.address,
-    );
-    const currentEpoch = await Chronos.getCurrentEpoch();
+    await time.increase(Number(epochLength) * (epochs + 1));
+    expect(
+      BigInt((await hre.ethers.provider.getBlock('latest'))!.timestamp),
+    ).to.be.gte((await NFT.getAccountInfo(accountId)).expiresAtTimestamp);
 
-    // Still live → the funding call succeeds (sanity for the gate).
-    await NFT.connect(kav10Signer).coverPublishingCost(
-      agent.address,
-      ethers.parseEther('10'),
-      currentEpoch,
-      lockDurationEpochs,
+    const tokenAmount = ethers.parseEther('1000');
+    const merkleRoot = ethers.keccak256(
+      ethers.toUtf8Bytes('v10-pca-lifecycle-expired'),
     );
-
-    // Advance past `expiresAtTimestamp`.
-    await time.increase(Number(epochLength) * (lockDurationEpochs + 1));
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot,
+      knowledgeAssetsAmount: 10,
+      byteSize: 1000,
+      epochs,
+      tokenAmount,
+      isImmutable: false,
+      publishOperationId: 'v10-pca-lifecycle-expired-op',
+    });
 
     await expect(
-      NFT.connect(kav10Signer).coverPublishingCost(
-        agent.address,
-        ethers.parseEther('10'),
-        currentEpoch,
-        lockDurationEpochs,
-      ),
-    ).to.be.revertedWithCustomError(NFT, 'AccountExpired');
+      KAV10.connect(creator).publish(p),
+    ).to.be.revertedWithCustomError(KAV10, 'TooLowAllowance');
+
+    // Atomic rollback: the expired publish minted no knowledge collection.
+    expect(
+      await KnowledgeCollectionStorage.getLatestKnowledgeCollectionId(),
+    ).to.equal(0n);
   });
 });

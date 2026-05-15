@@ -74,6 +74,37 @@ export interface DKGNodeConfig {
    * an operator-facing warning.
    */
   relayServerCapacity?: number;
+  /**
+   * Number of relay reservations to hold in parallel when behind NAT.
+   * The previous behavior (1) was a single point of failure: if the
+   * sole reserved relay went unreachable, the edge dropped off the
+   * network until the watchdog noticed and re-reserved. Holding 3 in
+   * parallel gives N-2 tolerance — two relays can blink concurrently
+   * and incoming dialers can still find a working circuit.
+   *
+   * Implementation: each `/p2p-circuit` listen address triggers a
+   * separate reservation slot in libp2p's transport reservation store,
+   * so this value translates to N duplicate `/p2p-circuit` entries in
+   * `addresses.listen` paired with `reservationConcurrency: N` on the
+   * circuit-relay transport so all slots are attempted in parallel
+   * at startup. libp2p auto-renews each reservation 5 minutes before
+   * expiry so no application-level renewal is needed.
+   *
+   * Default: 3. Capped at 16 (above which the failure-tolerance
+   * benefit is marginal but the per-relay cost is real).
+   *
+   * IGNORED in two cases (with a startup warning when set explicitly):
+   *   - No relayPeers configured (the node isn't behind NAT — nothing
+   *     to multi-reserve against).
+   *   - Node is itself a relay server (`enableRelayServer: true` or
+   *     `nodeRole: 'core'`) — relay servers don't multi-reserve
+   *     through other relays; that path falls back to the legacy
+   *     single `/p2p-circuit` listener.
+   *
+   * Invalid values (0, negative, NaN, fractional, non-numeric, > 16)
+   * fall back to the default with a warning.
+   */
+  relayReservationCount?: number;
 }
 
 export type ConnectionTransport = 'direct' | 'relayed';

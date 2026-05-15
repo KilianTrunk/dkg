@@ -239,6 +239,39 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(loaded.relayServerCapacity).toBe(2048);
   });
 
+  it('round-trips relayReservationCount through saveConfig/loadConfig (operator override)', async () => {
+    // PR3 multi-reservation tuning: same contract as
+    // relayServerCapacity above — operators should be able to
+    // override the default 3-reservation count from config.json.
+    // This guards against the field getting dropped from the
+    // DkgConfig schema or stripped on serialization.
+    await saveConfig({
+      name: 'test-node',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'edge',
+      relayPeers: ['/dns4/relay.example.com/tcp/4001/p2p/12D3KooWFakeRelayPeerIdForTest'],
+      relayReservationCount: 5,
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.nodeRole).toBe('edge');
+    expect(loaded.relayReservationCount).toBe(5);
+  });
+
+  it('omits relayReservationCount when not set (so DKGNode.start() applies the default)', async () => {
+    await saveConfig({
+      name: 'test-node',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'edge',
+      relayPeers: ['/dns4/relay.example.com/tcp/4001/p2p/12D3KooWFakeRelayPeerIdForTest'],
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.relayReservationCount).toBeUndefined();
+  });
+
   it('omits relayServerCapacity when not set (so DKGNode.start() applies the default)', async () => {
     await saveConfig({
       name: 'test-node',

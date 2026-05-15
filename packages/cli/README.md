@@ -102,6 +102,56 @@ To verify the live daemon's effective limit, look for the startup log line
 `[dkg-core] relay server: ulimit -n soft=<N> >= recommended <M>, ok` (or the
 WARN equivalent if the host needs tuning).
 
+## Edge tuning
+
+### Multi-reservation (NAT'd nodes)
+
+By default an edge node behind NAT holds **3 simultaneous circuit-relay
+reservations** instead of the single reservation it used to hold. Three
+gives N-2 tolerance — two relays can blink concurrently and incoming
+dialers still find a working circuit. Override with `relayReservationCount`
+in `config.json` when you want to dial up tolerance (max 16) or strip back
+down to 1 for the legacy behavior.
+
+```jsonc
+{
+  "nodeRole": "edge",
+  "relayPeers": [
+    "/dns4/relay-a.example.com/tcp/4001/p2p/12D3Koo...",
+    "/dns4/relay-b.example.com/tcp/4001/p2p/12D3Koo...",
+    "/dns4/relay-c.example.com/tcp/4001/p2p/12D3Koo..."
+  ],
+  "relayReservationCount": 3   // default; cap is 16
+}
+```
+
+The knob is:
+- **Edge-only**. Core / relay-server nodes don't multi-reserve through
+  other relays — they have public addresses for incoming traffic. The
+  daemon's CLI fallback supplies `network.relays` to both core and edge
+  by default, so without this gate every core node would also push 3
+  `/p2p-circuit` listen addrs and consume relay slots network-wide.
+  When set on a core node the value is ignored with a warning.
+- **Clamped to `relayPeers.length`**. Requesting more reservations than
+  there are configured relays can't deliver the documented tolerance
+  and just queues an unattainable target. The clamp emits a warning so
+  the misconfig is visible.
+- **Ignored when no `relayPeers` are configured** (a node not behind NAT
+  doesn't need reservations). Invalid values (0, negative, fractional,
+  non-numeric, > 16) fall back to the default with a warning.
+
+Reservation renewal is **automatic** — libp2p refreshes each reservation 5
+minutes before its 2-hour TTL expires, so no application-level renewal
+loop is required. The local relay watchdog handles the harder failure
+modes auto-renewal can't recover from:
+
+- a fully-dropped relay connection (TCP RST, NAT pinhole expiry, ISP
+  routing flap), and
+- per-relay reservation loss when multi-reservation is enabled (e.g. a
+  refresh that returns an error and removes the slot without retrying
+  on the same relay) — without this, N reservations would silently
+  degrade to N-1 and stay there until restart.
+
 ## Commands
 
 | Command | Description |

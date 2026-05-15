@@ -562,6 +562,7 @@ export async function runDaemonInner(
     announceAddresses: config.announceAddresses,
     nodeRole: role,
     relayServerCapacity: config.relayServerCapacity,
+    relayReservationCount: config.relayReservationCount,
     syncContextGraphs: syncContextGraphs,
     storeConfig: config.store ? {
       backend: config.store.backend,

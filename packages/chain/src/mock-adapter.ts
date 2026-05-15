@@ -445,6 +445,10 @@ export class MockChainAdapter implements ChainAdapter {
   // Mirrors chain `ParametersStorage.publishingConvictionEpochs` (12).
   private static readonly MOCK_LOCK_DURATION_EPOCHS = 12;
 
+  // Mirrors DKGPublishingConvictionNFT default maxAgentsPerAccount
+  // (DKGPublishingConvictionNFT.sol:208 — defaults to 100 when unset).
+  private static readonly MOCK_MAX_AGENTS_PER_ACCOUNT = 100;
+
   /**
    * Mirrors `DKGPublishingConvictionNFT.getDiscountBps` exactly
    * (DKGPublishingConvictionNFT.sol L767-775): discrete 6-tier ladder,
@@ -563,6 +567,11 @@ export class MockChainAdapter implements ChainAdapter {
     const key = ethers.getAddress(agent).toLowerCase();
     if (this.agentToConvictionAccount.has(key)) {
       throw new Error(`Mock: AgentAlreadyRegistered(${agent}, ${this.agentToConvictionAccount.get(key)})`);
+    }
+    // Contract parity: revert after the already-registered check, before
+    // any state write (DKGPublishingConvictionNFT.sol:711-712).
+    if (acct.agents.size >= MockChainAdapter.MOCK_MAX_AGENTS_PER_ACCOUNT) {
+      throw new Error(`Mock: AgentCapReached(${accountId}, ${MockChainAdapter.MOCK_MAX_AGENTS_PER_ACCOUNT})`);
     }
     acct.agents.add(key);
     this.agentToConvictionAccount.set(key, accountId);

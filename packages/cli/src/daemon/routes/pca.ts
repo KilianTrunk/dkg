@@ -45,9 +45,13 @@ function isPcaUnavailable(err: unknown, msg: string): boolean {
 // tell a bad request from a retryable outage. ethers wraps the name.
 function classifyPcaRevert(msg: string): { status: number; error: string } | null {
   if (/\bInvalidAmount\b/.test(msg)) return { status: 400, error: 'InvalidAmount' };
+  if (/\bZeroAgentAddress\b/.test(msg)) return { status: 400, error: 'ZeroAgentAddress' };
+  if (/\bTokenTransferFailed\b/.test(msg)) return { status: 400, error: 'TokenTransferFailed' };
   if (/\bAgentAlreadyRegistered\b/.test(msg)) return { status: 409, error: 'AgentAlreadyRegistered' };
   if (/\bAgentNotRegistered\b/.test(msg)) return { status: 409, error: 'AgentNotRegistered' };
+  if (/\bAgentCapReached\b/.test(msg)) return { status: 409, error: 'AgentCapReached' };
   if (/\bAccountExpired\b/.test(msg)) return { status: 409, error: 'AccountExpired' };
+  if (/\bAccountAlreadyFullySettled\b/.test(msg)) return { status: 409, error: 'AccountAlreadyFullySettled' };
   return null;
 }
 
@@ -151,6 +155,11 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     if (typeof agentAddr !== 'string' || !ethers.isAddress(agentAddr)) {
       return jsonResponse(res, 400, { error: 'agent must be a valid 0x-prefixed EVM address' });
     }
+    // Fast-reject zero address before any RPC; ZeroAgentAddress→400 in
+    // classifyPcaRevert remains as defense-in-depth.
+    if (agentAddr.toLowerCase() === ZERO) {
+      return jsonResponse(res, 400, { error: 'agent must not be the zero address' });
+    }
     try {
       const result = await agent.registerPublishingConvictionAgent(accountId, agentAddr);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
@@ -190,6 +199,11 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     }
     if (!ethers.isAddress(agentAddr)) {
       return jsonResponse(res, 400, { error: 'agent must be a valid 0x-prefixed EVM address' });
+    }
+    // Fast-reject zero address before any RPC; ZeroAgentAddress→400 in
+    // classifyPcaRevert remains as defense-in-depth.
+    if (agentAddr.toLowerCase() === ZERO) {
+      return jsonResponse(res, 400, { error: 'agent must not be the zero address' });
     }
     try {
       const result = await agent.deregisterPublishingConvictionAgent(accountId, agentAddr);

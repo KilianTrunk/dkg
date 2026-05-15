@@ -275,6 +275,68 @@ describe('daemon /api/pca V10 caller contract', () => {
     expect(res.statusCode).toBe(403);
   });
 
+  it('POST /api/pca/:id/agent with the zero address → 400, facade not called', async () => {
+    let called = false;
+    const agent = {
+      registerPublishingConvictionAgent: async () => { called = true; return { hash: '0x', blockNumber: 1, success: true }; },
+    };
+    const { res, done } = runCtx('POST', '/api/pca/1/agent', agent, { agent: ethers.ZeroAddress });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('agent must not be the zero address');
+    expect(called).toBe(false);
+  });
+
+  it('DELETE /api/pca/:id/agent/:address with the zero address → 400, facade not called', async () => {
+    let called = false;
+    const agent = {
+      deregisterPublishingConvictionAgent: async () => { called = true; return { hash: '0x', blockNumber: 1, success: true }; },
+    };
+    const { res, done } = runCtx('DELETE', `/api/pca/1/agent/${ethers.ZeroAddress}`, agent);
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('agent must not be the zero address');
+    expect(called).toBe(false);
+  });
+
+  it('maps a ZeroAgentAddress revert (defense-in-depth, guard bypassed) → 400', async () => {
+    const addr = '0x' + '7'.repeat(40);
+    const { res, done } = runCtx('POST', '/api/pca/1/agent', {
+      registerPublishingConvictionAgent: async () => { throw new Error('execution reverted: ZeroAgentAddress()'); },
+    }, { agent: addr });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('ZeroAgentAddress');
+  });
+
+  it('maps an AgentCapReached revert on agent register → 409', async () => {
+    const addr = '0x' + '8'.repeat(40);
+    const { res, done } = runCtx('POST', '/api/pca/1/agent', {
+      registerPublishingConvictionAgent: async () => { throw new Error('execution reverted: AgentCapReached(1, 100)'); },
+    }, { agent: addr });
+    await done;
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).error).toBe('AgentCapReached');
+  });
+
+  it('maps a TokenTransferFailed revert on POST /api/pca → 400', async () => {
+    const { res, done } = runCtx('POST', '/api/pca', {
+      createPublishingConvictionAccount: async () => { throw new Error('execution reverted: TokenTransferFailed()'); },
+    }, { tokens: '100' });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('TokenTransferFailed');
+  });
+
+  it('maps an AccountAlreadyFullySettled revert on POST /api/pca/:id/settle → 409', async () => {
+    const { res, done } = runCtx('POST', '/api/pca/2/settle', {
+      settlePublishingConvictionAccount: async () => { throw new Error('execution reverted: AccountAlreadyFullySettled(2)'); },
+    });
+    await done;
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).error).toBe('AccountAlreadyFullySettled');
+  });
+
   it('GET ?key= probe exposes `registered` (not `authorized`)', async () => {
     const addr = '0x' + '6'.repeat(40);
     const agent = {

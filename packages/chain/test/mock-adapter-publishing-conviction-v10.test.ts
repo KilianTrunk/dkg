@@ -207,3 +207,57 @@ describe('MockChainAdapter — V10 invalid-input parity with the contract', () =
     expect(info.baseEpochAllowance).toBeGreaterThan(0n);
   });
 });
+
+describe('MockChainAdapter — V10 conviction agent-cap parity', () => {
+  // Mirrors DKGPublishingConvictionNFT default maxAgentsPerAccount
+  // (DKGPublishingConvictionNFT.sol:208 — `if (maxAgentsPerAccount == 0) maxAgentsPerAccount = 100;`).
+  const CAP = 100;
+  // Deterministic distinct agent address from a 1-based index.
+  const agentAt = (i: number) => ethers.getAddress('0x' + i.toString(16).padStart(40, '0'));
+
+  it('allows exactly maxAgentsPerAccount registrations (the cap-th still succeeds)', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createPublishingConvictionAccount(COMMITTED);
+
+    for (let i = 1; i <= CAP; i++) {
+      const reg = await mock.registerPublishingConvictionAgent(accountId, agentAt(i));
+      expect(reg.success).toBe(true);
+    }
+    expect((await mock.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(CAP);
+  });
+
+  it('rejects the agent beyond the cap with AgentCapReached and does not grow the set', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createPublishingConvictionAccount(COMMITTED);
+
+    for (let i = 1; i <= CAP; i++) {
+      await mock.registerPublishingConvictionAgent(accountId, agentAt(i));
+    }
+
+    await expect(
+      mock.registerPublishingConvictionAgent(accountId, agentAt(CAP + 1)),
+    ).rejects.toThrow(/AgentCapReached/);
+    // Rejected register must not have mutated state past the cap.
+    expect((await mock.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(CAP);
+    expect(await mock.getConvictionAgentAccountId(agentAt(CAP + 1))).toBe(0n);
+  });
+
+  it('applies the cap per-account (a full account A does not block account B)', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId: a } = await mock.createPublishingConvictionAccount(COMMITTED);
+    const { accountId: b } = await mock.createPublishingConvictionAccount(COMMITTED);
+
+    for (let i = 1; i <= CAP; i++) {
+      await mock.registerPublishingConvictionAgent(a, agentAt(i));
+    }
+    await expect(
+      mock.registerPublishingConvictionAgent(a, agentAt(CAP + 1)),
+    ).rejects.toThrow(/AgentCapReached/);
+
+    // Account B is still empty → registering on it must succeed.
+    const reg = await mock.registerPublishingConvictionAgent(b, agentAt(CAP + 1));
+    expect(reg.success).toBe(true);
+    expect((await mock.getPublishingConvictionAccountInfo(b))!.agentCount).toBe(1);
+    expect(await mock.getConvictionAgentAccountId(agentAt(CAP + 1))).toBe(b);
+  });
+});

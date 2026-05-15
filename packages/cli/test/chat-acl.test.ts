@@ -118,7 +118,7 @@ describe('buildChatAcl', () => {
   });
 
   describe('mode: scoped', () => {
-    it('accepts senders that are active node-members of the scoped CG', () => {
+    it('accepts senders that are active node-members of the scoped CG and surfaces the receiver-scope CG as verified', () => {
       const acl = buildChatAcl({
         config: { mode: 'scoped', contextGraphId: 'cg-1' },
         dashDb: makeDb({
@@ -126,7 +126,9 @@ describe('buildChatAcl', () => {
         }),
         getLocalPeerId: () => LOCAL_PEER,
       });
-      expect(acl!(ALICE, {})).toEqual({ accept: true });
+      // No claim from Alice — we still know which CG this is about
+      // (the receiver's scope) so verifiedContextGraphId === 'cg-1'.
+      expect(acl!(ALICE, {})).toEqual({ accept: true, verifiedContextGraphId: 'cg-1' });
       expect(acl!(BOB, {}).accept).toBe(false);
     });
 
@@ -183,10 +185,14 @@ describe('buildChatAcl', () => {
         }),
         getLocalPeerId: () => LOCAL_PEER,
       });
-      // Sanity: without a claim, alice is accepted.
-      expect(acl!(ALICE, {})).toEqual({ accept: true });
-      // With a matching claim, still accepted.
-      expect(acl!(ALICE, { contextGraphId: 'cg-1' })).toEqual({ accept: true });
+      // Sanity: without a claim, alice is accepted with the
+      // receiver-scope CG marked as verified.
+      expect(acl!(ALICE, {})).toEqual({ accept: true, verifiedContextGraphId: 'cg-1' });
+      // With a matching claim, still accepted with verified === claim.
+      expect(acl!(ALICE, { contextGraphId: 'cg-1' })).toEqual({
+        accept: true,
+        verifiedContextGraphId: 'cg-1',
+      });
       // With a spoof claim — must reject, NOT accept.
       const spoof = acl!(ALICE, { contextGraphId: 'cg-2' });
       expect(spoof.accept).toBe(false);
@@ -195,7 +201,7 @@ describe('buildChatAcl', () => {
   });
 
   describe('mode: shared-context-graph', () => {
-    it('accepts senders that share at least one subscribed CG', () => {
+    it('accepts senders that share at least one subscribed CG (no claim → no verifiedContextGraphId)', () => {
       const acl = buildChatAcl({
         config: { mode: 'shared-context-graph' },
         dashDb: makeDb({
@@ -207,6 +213,7 @@ describe('buildChatAcl', () => {
         }),
         getLocalPeerId: () => LOCAL_PEER,
       });
+      // No claim → no verifiedContextGraphId (we don't guess).
       expect(acl!(ALICE, {})).toEqual({ accept: true });
       expect(acl!(BOB, {})).toEqual({ accept: true });
       expect(acl!(CAROL, {}).accept).toBe(false);
@@ -253,9 +260,14 @@ describe('buildChatAcl', () => {
         getLocalPeerId: () => LOCAL_PEER,
       });
       // No claim → accept (alice IS a member of cg-1 which we subscribe to).
+      // verifiedContextGraphId stays undefined because we don't pick a CG
+      // for the operator when the message itself wasn't tagged.
       expect(acl!(ALICE, {})).toEqual({ accept: true });
-      // Matching claim → accept.
-      expect(acl!(ALICE, { contextGraphId: 'cg-1' })).toEqual({ accept: true });
+      // Matching claim → accept with the verified claim surfaced.
+      expect(acl!(ALICE, { contextGraphId: 'cg-1' })).toEqual({
+        accept: true,
+        verifiedContextGraphId: 'cg-1',
+      });
       // Spoof claim (alice tags cg-2 but isn't a member there) → reject.
       const spoof = acl!(ALICE, { contextGraphId: 'cg-2' });
       expect(spoof.accept).toBe(false);
@@ -306,6 +318,93 @@ describe('buildChatAcl', () => {
       // Loopback check short-circuits; non-loopback path still works.
       expect(acl!(ALICE, {})).toEqual({ accept: true });
       expect(acl!(BOB, {}).accept).toBe(false);
+    });
+  });
+
+  // Codex PR #510 round 4/5 — the lifecycle.ts `chat_message`
+  // notification title and the daemon's `CHAT IN` log line previously
+  // included a `(cg=...)` suffix derived from `senderContextGraphId` —
+  // the raw, attacker-controllable claim from the encrypted payload.
+  // In `any` and `peer-allowlist` modes the ACL doesn't check the
+  // claim, so an authenticated sender could stamp arbitrary CG ids
+  // onto operator-facing surfaces. The fix surfaces a separate
+  // `verifiedContextGraphId` from the verdict that downstream
+  // consumers MUST prefer for display; this block is the cross-mode
+  // contract for that field.
+  describe('verifiedContextGraphId — cross-mode display contract', () => {
+    it('is undefined in mode=any (no ACL → no verification possible)', () => {
+      // mode=any returns null callback; downstream code never has a
+      // verdict to read verifiedContextGraphId from. Confirmed via
+      // the messaging.ts call site: when chatAclCheck is null,
+      // verifiedContextGraphId stays `undefined` regardless of what
+      // the sender claimed.
+      const acl = buildChatAcl({
+        config: { mode: 'any' },
+        dashDb: makeDb({}),
+        getLocalPeerId: () => LOCAL_PEER,
+      });
+      expect(acl).toBeNull();
+    });
+
+    it('is undefined in mode=peer-allowlist (we authorise the peer, not their CG claim)', () => {
+      const acl = buildChatAcl({
+        config: { mode: 'peer-allowlist', peerAllowlist: [ALICE] },
+        dashDb: makeDb({}),
+        getLocalPeerId: () => LOCAL_PEER,
+      });
+      // Even with a claim, the verdict omits verifiedContextGraphId
+      // because peer-allowlist mode never inspected it.
+      const verdict = acl!(ALICE, { contextGraphId: 'cg-attacker' });
+      expect(verdict.accept).toBe(true);
+      expect(verdict.verifiedContextGraphId).toBeUndefined();
+    });
+
+    it('equals the receiver-scope CG in mode=scoped (claim or no-claim, both verified against config)', () => {
+      const acl = buildChatAcl({
+        config: { mode: 'scoped', contextGraphId: 'cg-ok' },
+        dashDb: makeDb({
+          members: { 'cg-ok': [makeRow('cg-ok', ALICE)] },
+        }),
+        getLocalPeerId: () => LOCAL_PEER,
+      });
+      // No claim → verified is the receiver's scope (we know the CG by config).
+      expect(acl!(ALICE, {}).verifiedContextGraphId).toBe('cg-ok');
+      // Matching claim → verified is the (now confirmed) claim.
+      expect(acl!(ALICE, { contextGraphId: 'cg-ok' }).verifiedContextGraphId).toBe('cg-ok');
+    });
+
+    it('equals the verified claim in mode=shared-context-graph when a claim was made and matched a subscribed CG the sender is a member of', () => {
+      const acl = buildChatAcl({
+        config: { mode: 'shared-context-graph' },
+        dashDb: makeDb({
+          members: { 'cg-shared': [makeRow('cg-shared', ALICE)] },
+          subscriptions: [makeSub('cg-shared')],
+        }),
+        getLocalPeerId: () => LOCAL_PEER,
+      });
+      expect(acl!(ALICE, { contextGraphId: 'cg-shared' }).verifiedContextGraphId).toBe('cg-shared');
+    });
+
+    it('is undefined in mode=shared-context-graph when sender did not claim a CG (we deliberately do not pick one)', () => {
+      // Picking a shared CG to surface as "verified" when the sender
+      // didn't tag the message would be guess-work: the sender might
+      // be a member of multiple subscribed CGs and we have no way to
+      // know which conversation context they intended. Safer to
+      // leave the title untagged.
+      const acl = buildChatAcl({
+        config: { mode: 'shared-context-graph' },
+        dashDb: makeDb({
+          members: {
+            'cg-1': [makeRow('cg-1', ALICE)],
+            'cg-2': [makeRow('cg-2', ALICE)],
+          },
+          subscriptions: [makeSub('cg-1'), makeSub('cg-2')],
+        }),
+        getLocalPeerId: () => LOCAL_PEER,
+      });
+      const verdict = acl!(ALICE, {});
+      expect(verdict.accept).toBe(true);
+      expect(verdict.verifiedContextGraphId).toBeUndefined();
     });
   });
 

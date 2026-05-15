@@ -524,10 +524,20 @@ async function main() {
 // side effects must NOT kick off a daemon fetch when this file is
 // imported from tests (vitest imports `renderNotice` /
 // `daemonIdentityHash` to unit-test them in isolation).
+//
+// Codex PR #510 round 4 caught that `process.argv[1]` is whatever path
+// node was invoked with — `.cursor/hooks.json` runs us as
+// `node packages/mcp-dkg/hooks/inject-inbox.mjs` (relative), while
+// `fileURLToPath(import.meta.url)` is always absolute. Without
+// resolving argv[1] first, the equality check is permanently false
+// for the typical hook invocation and `main()` silently never runs —
+// the inbox notice never reaches the prompt. `path.resolve()`
+// canonicalises both sides so the comparison actually works.
+// `capture-chat.mjs` already uses this pattern.
 const isDirectEntrypoint = (() => {
   if (!process.argv[1]) return false;
   try {
-    return fileURLToPath(import.meta.url) === process.argv[1];
+    return fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
   } catch {
     return false;
   }

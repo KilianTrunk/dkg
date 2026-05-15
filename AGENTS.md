@@ -98,7 +98,7 @@ This repository's DKG nodes can be paired with each other. When they are, agents
 
 > "Before I get to that — `bob-node` sent 2 messages while you were away: …"
 
-**Call `dkg_check_inbox` again whenever** the operator's prompt references another node, the current task is part of a known cross-node debugging effort, or you see an injected `<dkg-inbox>` block in the session context (the prompt-hook may have already fetched fresh messages — re-check to be sure nothing was missed).
+**Call `dkg_check_inbox` again whenever** the operator's prompt references another node, the current task is part of a known cross-node debugging effort, or you see an injected `<dkg-inbox-notice>` block in the session context (the prompt-hook may have already fetched fresh messages — re-check to be sure nothing was missed).
 
 **Call `dkg_send_message`** whenever the operator says "ask <name>", "tell <name>", "let <name> know", "ping <name>", or otherwise indicates cross-node communication. Use the operator's word for the recipient as `to` — the daemon resolves it to a peerId. Don't ask the operator to clarify if they used a recognisable name like "alice's agent" → `to: "alice-node"`.
 

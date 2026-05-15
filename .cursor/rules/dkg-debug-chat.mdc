@@ -19,7 +19,7 @@ The two DKG nodes in this workspace can be paired with each other. When they are
 **Call `dkg_check_inbox` again whenever:**
 - The operator's prompt references another node, OR
 - The current task is part of a known cross-node debugging effort, OR
-- You see an injected `<dkg-inbox>` block in the session context (the prompt-hook may have already fetched fresh messages — re-check anyway to be sure nothing was missed).
+- You see an injected `<dkg-inbox-notice>` block in the session context (the prompt-hook may have already fetched fresh messages — re-check anyway to be sure nothing was missed).
 
 **Call `dkg_send_message` whenever** the operator says "ask <name>", "tell <name>", "let <name> know", "ping <name>", or otherwise indicates cross-node communication. Use the operator's word for the recipient as `to` — the daemon resolves it. Don't pause for clarification on recognisable names ("alice's agent" → `to: "alice-node"`).
 

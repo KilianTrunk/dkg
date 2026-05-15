@@ -673,7 +673,7 @@ export async function runDaemonInner(
   );
 
   let chatDb: DashboardDB | null = null;
-  agent.onChat((text, senderPeerId, _convId, senderContextGraphId) => {
+  agent.onChat((text, senderPeerId, _convId, senderContextGraphId, verifiedContextGraphId) => {
     if (chatDb) {
       try {
         chatDb.insertChatMessage({
@@ -686,7 +686,17 @@ export async function runDaemonInner(
         /* never crash */
       }
       try {
-        const titleSuffix = senderContextGraphId ? ` (${shortId(senderContextGraphId)})` : '';
+        // Display the CG ONLY when the ACL has positively verified the
+        // claim (`scoped` / `shared-context-graph` modes). In `any` and
+        // `peer-allowlist` modes `verifiedContextGraphId` is undefined
+        // even when the sender provided a claim, because the ACL
+        // doesn't check it — surfacing the raw claim would let an
+        // authenticated sender stamp arbitrary CG ids onto operator-
+        // facing notifications and logs (Codex PR #510 round 4/5
+        // finding). Storage above already records the message itself;
+        // we don't lose data, we just don't decorate it with an
+        // attacker-controllable label.
+        const titleSuffix = verifiedContextGraphId ? ` (${shortId(verifiedContextGraphId)})` : '';
         chatDb.insertNotification({
           ts: Date.now(),
           type: "chat_message",
@@ -699,7 +709,7 @@ export async function runDaemonInner(
         /* never crash */
       }
     }
-    const cgTag = senderContextGraphId ? ` cg=${shortId(senderContextGraphId)}` : '';
+    const cgTag = verifiedContextGraphId ? ` cg=${shortId(verifiedContextGraphId)}` : '';
     log(`CHAT IN  [${shortId(senderPeerId)}]${cgTag}: ${text}`);
   });
 

@@ -116,7 +116,12 @@ export function buildChatAcl(opts: BuildChatAclOpts): ChatAclCheck | null {
         };
       }
       if (isActiveNodeMember(opts.dashDb, cgId, senderPeerId)) {
-        return { accept: true };
+        // CG is verified: either the sender claimed cgId (and we just
+        // confirmed claim === receiver's scope above) or they made no
+        // claim at all (we still know which CG this conversation is
+        // about — it's the receiver's scope). Either way `cgId` is
+        // safe to surface to operators as the message's CG context.
+        return { accept: true, verifiedContextGraphId: cgId };
       }
       return {
         accept: false,
@@ -143,7 +148,10 @@ export function buildChatAcl(opts: BuildChatAclOpts): ChatAclCheck | null {
           };
         }
         if (isActiveNodeMember(opts.dashDb, claim, senderPeerId)) {
-          return { accept: true };
+          // `claim` is verified — we subscribe to it AND the sender is
+          // an active member of it. Safe to surface as the message's
+          // CG context.
+          return { accept: true, verifiedContextGraphId: claim };
         }
         return {
           accept: false,
@@ -152,7 +160,9 @@ export function buildChatAcl(opts: BuildChatAclOpts): ChatAclCheck | null {
       }
       // No claim from the sender — accept if there is ANY shared
       // graph membership. Downstream will tag the chat without a CG,
-      // which is the safe default.
+      // which is the safe default. We deliberately do NOT pick one
+      // shared CG to surface as "verified" because the message
+      // itself wasn't tagged, so any choice would be guess-work.
       for (const sub of subs) {
         if (isActiveNodeMember(opts.dashDb, sub.context_graph_id, senderPeerId)) {
           return { accept: true };

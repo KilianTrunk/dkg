@@ -50,6 +50,18 @@ export type ChatHandler = (
   // and per-graph storage; legacy chat handlers that don't take this arg keep
   // working unchanged (extra positional args are silently ignored in JS).
   senderContextGraphId?: string,
+  // Same value as `senderContextGraphId`, but ONLY set when the ACL has
+  // positively verified the sender's CG claim (i.e. `scoped` mode where
+  // the claim equals the receiver's configured CG, or `shared-context-graph`
+  // mode where the claim matches a subscribed CG the sender is an active
+  // member of). In `any` and `peer-allowlist` modes this is always
+  // undefined because the ACL doesn't check the CG claim, so downstream
+  // code that surfaces the CG to operators (notification titles, log
+  // suffixes) can show it without risking an attacker-controlled label.
+  // Codex PR #510 round 4/5 finding — `senderContextGraphId` alone is
+  // an unverified attacker-controllable claim outside scoped/shared-CG
+  // modes; consumers MUST prefer `verifiedContextGraphId` for display.
+  verifiedContextGraphId?: string,
 ) => void | Promise<void>;
 
 /**
@@ -68,7 +80,19 @@ export type ChatHandler = (
 export type ChatAclCheck = (
   senderPeerId: string,
   payload: { contextGraphId?: string },
-) => { accept: boolean; reason?: string };
+) => {
+  accept: boolean;
+  reason?: string;
+  // Set ONLY when the ACL implementation has positively verified the
+  // sender's `contextGraphId` claim against its policy (scoped mode:
+  // claim equals the receiver's configured CG; shared-context-graph
+  // mode: claim matches a subscribed CG the sender is an active member
+  // of). MUST remain undefined when the mode does not check the claim
+  // (`any`, `peer-allowlist`) so downstream consumers can distinguish
+  // a verified CG from an attacker-controllable one. See
+  // ChatHandler.verifiedContextGraphId for the consumer-side contract.
+  verifiedContextGraphId?: string;
+};
 
 interface ConversationState {
   highWaterMark: number;
@@ -382,6 +406,12 @@ export class MessageHandler {
       // signature check above). When unset, all authenticated senders are
       // accepted — this preserves the legacy behaviour for nodes that
       // haven't configured `chat.acl`.
+      // `verifiedContextGraphId` is sourced from the ACL verdict (only
+      // set in scoped / shared-context-graph modes that actually check
+      // the claim). When the ACL is null or omits the field, downstream
+      // consumers see only the unverified `senderContextGraphId` and
+      // MUST treat that as attacker-controllable.
+      let verifiedContextGraphId: string | undefined;
       if (this.chatAclCheck) {
         // Defence in depth: an unexpected exception from the ACL
         // callback (db lookup glitch, custom-callback bug, etc.) must
@@ -393,7 +423,7 @@ export class MessageHandler {
         // confusing send-side timeout. We log the exception locally
         // and return a clean `unauthorized` so the sender's
         // ACL-aware error handling kicks in.
-        let verdict: { accept: boolean; reason?: string };
+        let verdict: ReturnType<ChatAclCheck>;
         try {
           verdict = this.chatAclCheck(fromPeerId.toString(), {
             contextGraphId: senderContextGraphId,
@@ -414,6 +444,7 @@ export class MessageHandler {
             error: verdict.reason ?? 'unauthorized',
           });
         }
+        verifiedContextGraphId = verdict.verifiedContextGraphId;
       }
 
       if (this.chatHandler) {
@@ -423,6 +454,7 @@ export class MessageHandler {
             fromPeerId.toString(),
             convId,
             senderContextGraphId,
+            verifiedContextGraphId,
           );
         } catch (err) {
           console.error(`[Messaging] chat handler error:`, err instanceof Error ? err.message : err);

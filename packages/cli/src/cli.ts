@@ -2598,7 +2598,7 @@ sourceWorkerCmd
 //
 // Operator surface for standing up and inspecting on-chain PCAs. Required
 // fixture for RFC §4 modes (a) and (b) of the agent-provenance runbook.
-// Writes are admin-gated by the on-chain `PublishingConvictionAccount`
+// Writes are owner-gated by the on-chain `DKGPublishingConvictionNFT`
 // contract — the daemon's EOA must own the PCA NFT for `pca authorize`
 // and `pca funds` to land. Read-side (`pca info`) is permissionless.
 const pcaCmd = program
@@ -2607,22 +2607,15 @@ const pcaCmd = program
 
 pcaCmd
   .command('create')
-  .description('Create a new PCA. Daemon EOA becomes admin + first authorized key')
+  .description('Create a new V10 conviction NFT. Daemon EOA becomes the owner')
   .requiredOption('--tokens <amount>', 'TRAC commitment (decimal, e.g. 100000)')
-  .requiredOption('--epochs <n>', 'Lock duration in epochs (positive integer)')
-  .action(async (opts: { tokens: string; epochs: string }) => {
+  .action(async (opts: { tokens: string }) => {
     try {
-      const lockEpochs = parseInt(opts.epochs, 10);
-      if (!Number.isFinite(lockEpochs) || lockEpochs <= 0) {
-        console.error('--epochs must be a positive integer');
-        process.exit(1);
-      }
       const client = await ApiClient.connect();
-      const result = await client.createPca({ tokens: opts.tokens, lockEpochs });
-      console.log(`PCA created (admin = daemon EOA):`);
+      const result = await client.createPca({ tokens: opts.tokens });
+      console.log(`PCA created (owner = daemon EOA):`);
       console.log(`  accountId:        ${result.accountId}`);
       console.log(`  committedTokens:  ${result.committedTokens} TRAC`);
-      console.log(`  lockEpochs:       ${result.lockEpochs}`);
       console.log(`  txHash:           ${result.txHash}`);
       console.log(`  block:            ${result.blockNumber}`);
     } catch (err) {
@@ -2633,7 +2626,7 @@ pcaCmd
 
 pcaCmd
   .command('authorize <accountId> <key>')
-  .description('Add `key` to the PCA\'s authorizedKeys set (admin-only on chain)')
+  .description('Register `key` as a conviction agent on the PCA (owner-only on chain)')
   .action(async (accountId: string, key: string) => {
     try {
       if (!/^\d+$/.test(accountId)) {
@@ -2655,7 +2648,7 @@ pcaCmd
 
 pcaCmd
   .command('funds <accountId>')
-  .description('Top up an existing PCA (admin-only). Approves token spend automatically')
+  .description('Top up an existing PCA (owner-only). Approves token spend automatically')
   .requiredOption('--tokens <amount>', 'Additional TRAC to commit (decimal)')
   .action(async (accountId: string, opts: { tokens: string }) => {
     try {
@@ -2677,8 +2670,8 @@ pcaCmd
 
 pcaCmd
   .command('info <accountId>')
-  .description('Read-only PCA snapshot (admin, balance, conviction, discount). Optional `--probe-key` checks authorization')
-  .option('--probe-key <addr>', 'Also check whether <addr> is currently on the PCA\'s authorizedKeys set')
+  .description('Read-only PCA snapshot (owner, committedTRAC, topUpBuffer, discount). Optional `--probe-key` checks agent registration')
+  .option('--probe-key <addr>', 'Also check whether <addr> is currently a registered conviction agent on the PCA')
   .action(async (accountId: string, opts: { probeKey?: string }) => {
     try {
       if (!/^\d+$/.test(accountId)) {
@@ -2688,12 +2681,16 @@ pcaCmd
       const client = await ApiClient.connect();
       const info = await client.getPcaInfo(accountId, opts.probeKey);
       console.log(`PCA ${info.accountId}:`);
-      console.log(`  admin:           ${info.admin}`);
-      console.log(`  balance:         ${info.balanceTrac} TRAC (${info.balance} wei)`);
-      console.log(`  initialDeposit:  ${info.initialDepositTrac} TRAC`);
-      console.log(`  lockEpochs:      ${info.lockEpochs}`);
-      console.log(`  conviction:      ${info.conviction}`);
-      console.log(`  discountBps:     ${info.discountBps} (${(info.discountBps / 100).toFixed(2)}% off base cost)`);
+      console.log(`  owner:            ${info.owner}`);
+      console.log(`  committedTRAC:    ${info.committedTRACTrac} TRAC (${info.committedTRAC} wei)`);
+      console.log(`  topUpBuffer:      ${info.topUpBufferTrac} TRAC (${info.topUpBuffer} wei)`);
+      console.log(`  baseEpochAllow.:  ${info.baseEpochAllowance} wei`);
+      console.log(`  createdAtEpoch:   ${info.createdAtEpoch}`);
+      console.log(`  expiresAtEpoch:   ${info.expiresAtEpoch}`);
+      console.log(`  agentCount:       ${info.agentCount}`);
+      console.log(`  lastSettledWin.:  ${info.lastSettledWindow}`);
+      console.log(`  fullySwept:       ${info.fullySwept}`);
+      console.log(`  discountBps:      ${info.discountBps} (${(info.discountBps / 100).toFixed(2)}% off base cost)`);
       if (info.probedKey) {
         console.log(`  probedKey:`);
         console.log(`    key:        ${info.probedKey.key}`);

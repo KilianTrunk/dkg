@@ -477,13 +477,11 @@ export class ApiClient {
 
   async createPca(request: {
     tokens: string;
-    lockEpochs: number;
   }): Promise<{
     accountId: string;
     txHash: string;
     blockNumber: number;
     committedTokens: string;
-    lockEpochs: number;
   }> {
     return this.post('/api/pca', request);
   }
@@ -509,14 +507,20 @@ export class ApiClient {
 
   async getPcaInfo(accountId: string, probeKey?: string): Promise<{
     accountId: string;
-    admin: string;
-    balance: string;
-    balanceTrac: string;
-    initialDeposit: string;
-    initialDepositTrac: string;
-    lockEpochs: number;
-    conviction: string;
+    owner: string;
+    committedTRAC: string;
+    committedTRACTrac: string;
+    baseEpochAllowance: string;
+    topUpBuffer: string;
+    topUpBufferTrac: string;
+    createdAtEpoch: number;
+    expiresAtEpoch: number;
+    createdAtTimestamp: number;
+    expiresAtTimestamp: number;
     discountBps: number;
+    agentCount: number;
+    lastSettledWindow: number;
+    fullySwept: boolean;
     probedKey?: { key: string; authorized: boolean; adapterSupported?: boolean; error?: string };
   }> {
     const qs = probeKey ? `?key=${encodeURIComponent(probeKey)}` : '';

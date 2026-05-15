@@ -249,6 +249,30 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
+  // POST /api/pca/:id/settle — run the lazy-settlement sweep. The
+  // contract method is permissionless, so no owner gating here.
+  if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/settle$/.test(path)) {
+    const idStr = decodeURIComponent(path.split('/')[3] ?? '');
+    const accountId = parseAccountId(idStr);
+    if (accountId === null) {
+      return jsonResponse(res, 400, { error: 'Invalid accountId — must be a non-negative integer' });
+    }
+    try {
+      const result = await agent.settleConvictionAccount(accountId);
+      if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      return jsonResponse(res, 200, {
+        accountId: idStr,
+        settled: true,
+        txHash: result.hash,
+        blockNumber: result.blockNumber,
+      });
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      return jsonResponse(res, 500, { error: `settleConvictionAccount failed: ${msg}` });
+    }
+  }
+
   // GET /api/pca/:id — read-only PCA snapshot (admin, balance, conviction,
   // current discount). Optional ?key=0x... probes whether `key` is
   // currently on the account's `authorizedKeys` set.

@@ -103,6 +103,33 @@ describe('daemon /api/pca V10 caller contract', () => {
     expect(res.statusCode).toBe(403);
   });
 
+  it('POST /api/pca/:id/settle runs settle() → 200', async () => {
+    let settledId: bigint | null = null;
+    const agent = {
+      settleConvictionAccount: async (id: bigint) => {
+        settledId = id;
+        return { hash: '0xsettle', blockNumber: 13, success: true };
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca/2/settle', agent);
+    await done;
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.txHash).toBe('0xsettle');
+    expect(settledId).toBe(2n);
+  });
+
+  it('maps a NoChainAdapter noChain() throw on settle to HTTP 503', async () => {
+    const agent = {
+      settleConvictionAccount: async () => {
+        throw new Error('No blockchain configured. To use on-chain operations, provide chainConfig');
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca/2/settle', agent);
+    await done;
+    expect(res.statusCode).toBe(503);
+  });
+
   it('maps an owner-gated NotAccountOwner revert on funds top-up to HTTP 403', async () => {
     const agent = {
       topUpConvictionAccount: async () => {

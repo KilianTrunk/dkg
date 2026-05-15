@@ -541,11 +541,16 @@ export class DKGNode {
       // order on dial, so a stale transport doesn't take the relay
       // out of rotation. Same peerId with the SAME multiaddr (e.g.
       // `[relayA, relayA]` or copy-paste) is the true-duplicate
-      // case and gets dropped + warned. Codex PR #526 round 5c
-      // caught that the round-5 fix conflated these two cases and
-      // dropped alternate-transport addrs as duplicates.
+      // case and gets dropped + warned.
+      //
+      // Map keyed by `pid.toString()` (the canonical peerId
+      // encoding) rather than the raw `/p2p/<value>` string a user
+      // might have written — Codex PR #526 round 5e caught that the
+      // raw string can be base58btc OR base32 OR other encodings of
+      // the same peerId, so a mixed-encoding config would bypass
+      // the dedupe and inflate `usableRelayCandidates.length`.
       const candidateByPid = new Map<string, RelayTarget>();
-      const seenAddrStrings = new Set<string>();
+      const seenAddrKeys = new Set<string>();
       let malformed = 0;
       let selfHits = 0;
       let dupAddrs = 0;
@@ -574,31 +579,47 @@ export class DKGNode {
           selfHits += 1;
           continue;
         }
-        const maStr = ma.toString();
-        if (seenAddrStrings.has(maStr)) {
+        // Build a canonical address key (transport prefix + canonical
+        // peerId) so duplicates are detected regardless of which
+        // peerId encoding the operator wrote.
+        const pidStr = pid.toString();
+        const transportPrefix = ma.toString().split('/p2p/')[0] ?? ma.toString();
+        const canonicalAddrKey = `${transportPrefix}/p2p/${pidStr}`;
+        if (seenAddrKeys.has(canonicalAddrKey)) {
           dupAddrs += 1;
           continue;
         }
-        seenAddrStrings.add(maStr);
-        const existing = candidateByPid.get(p2p);
+        seenAddrKeys.add(canonicalAddrKey);
+        const existing = candidateByPid.get(pidStr);
         if (existing) {
           existing.addrs.push(ma);
           altAddrs += 1;
         } else {
           const target: RelayTarget = { peerId: pid, addrs: [ma] };
-          candidateByPid.set(p2p, target);
+          candidateByPid.set(pidStr, target);
           usableRelayCandidates.push(target);
         }
       }
-      if (malformed || selfHits || dupAddrs || altAddrs) {
-        const reasons: string[] = [];
-        if (malformed) reasons.push(`${malformed} malformed (no /p2p component or unparseable)`);
-        if (selfHits) reasons.push(`${selfHits} pointing at this node's own peerId`);
-        if (dupAddrs) reasons.push(`${dupAddrs} exact-duplicate multiaddrs`);
+      // Codex PR #526 round 5e: only emit at warn level when there's
+      // an actual problem (malformed/self/duplicate). Pure alternate-
+      // address aggregation is a healthy supported config and
+      // shouldn't trip operator log filters at warning level on
+      // every startup.
+      const problemReasons: string[] = [];
+      if (malformed) problemReasons.push(`${malformed} malformed (no /p2p component or unparseable)`);
+      if (selfHits) problemReasons.push(`${selfHits} pointing at this node's own peerId`);
+      if (dupAddrs) problemReasons.push(`${dupAddrs} exact-duplicate multiaddrs`);
+      if (problemReasons.length > 0) {
+        const reasons = [...problemReasons];
         if (altAddrs) reasons.push(`${altAddrs} alternate addrs merged into existing relay peers`);
         console.warn(
           `[dkg-core] relayPeers: ${this.config.relayPeers.length} entries supplied, ` +
             `${usableRelayCandidates.length} distinct relay peers usable (${reasons.join(', ')})`,
+        );
+      } else if (altAddrs) {
+        console.log(
+          `[dkg-core] relayPeers: ${this.config.relayPeers.length} entries supplied, ` +
+            `${usableRelayCandidates.length} distinct relay peers (${altAddrs} alternate addrs merged)`,
         );
       }
     }

@@ -8,6 +8,12 @@ describe('Circuit Relay', () => {
   const nodes: DKGNode[] = [];
 
   afterEach(async () => {
+    // Unconditionally restore any console spies created in the test
+    // body. Codex PR #526 round 5e: per-test spies were restored
+    // inline at the bottom of each test, but a thrown assertion or
+    // start() error left them mocked and corrupted later tests.
+    // Restoring at this scope guarantees cleanup even on failure.
+    vi.restoreAllMocks();
     for (const n of nodes) {
       try {
         await n.stop();
@@ -663,7 +669,14 @@ describe('Circuit Relay', () => {
     // count stays 1, AND the edge actually establishes a relay
     // reservation (the real addr works even though the alternate
     // one is unreachable).
+    // Round-5e adjustment: alt-addrs aggregation is a healthy
+    // supported config and is now logged at info level
+    // (`console.log`), NOT at warn level. The test must spy on log
+    // to observe it AND must NOT see any warn call mentioning
+    // "alternate addrs" (otherwise we've regressed to noisy warnings
+    // on healthy startup).
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
     const relay = new DKGNode({
       listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
@@ -687,16 +700,22 @@ describe('Circuit Relay', () => {
     nodes.push(edge);
     await edge.start();
 
-    const altWarn = warnSpy.mock.calls.find((call) =>
+    const altInfo = logSpy.mock.calls.find((call) =>
       typeof call[0] === 'string'
       && call[0].includes('alternate addrs merged')
-      && call[0].includes('1 distinct relay peers usable'),
+      && call[0].includes('1 distinct relay peers'),
+    );
+    expect(
+      altInfo,
+      `expected alt-addrs-merged info log; got: ${JSON.stringify(logSpy.mock.calls.map(c => c[0]))}`,
+    ).toBeDefined();
+    const altWarn = warnSpy.mock.calls.find((call) =>
+      typeof call[0] === 'string' && call[0].includes('alternate addrs'),
     );
     expect(
       altWarn,
-      `expected alt-addrs-merged warning; got: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
-    ).toBeDefined();
-    warnSpy.mockRestore();
+      `alt-addrs aggregation must NOT trigger a warn-level log on a healthy config; got warn calls: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
+    ).toBeUndefined();
 
     const deadline = Date.now() + 5_000;
     let circuitAddrs: string[] = [];

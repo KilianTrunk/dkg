@@ -14,7 +14,7 @@ import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
 import { dcutr } from '@libp2p/dcutr';
 import { autoNAT } from '@libp2p/autonat';
 import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
-import { peerIdFromString } from '@libp2p/peer-id';
+import { peerIdFromString, peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { ed25519GetPublicKey } from './crypto/ed25519.js';
 import type { ConnectionTransport, DKGNodeConfig } from './types.js';
 import { DHT_PROTOCOL, DKG_GOSSIP_MAX_RPC_BYTES } from './constants.js';
@@ -502,8 +502,85 @@ export class DKGNode {
     //
     // Validation defends against the same surface as relayServerCapacity
     // (0/neg/NaN/fractional/non-number/over-cap).
+    // Build the canonical "usable relay candidates" list ONCE, before
+    // anything else looks at relayPeers. The set produced here is the
+    // single source of truth for both the reservation-count clamp
+    // below AND the `relayTargets` push later — keeping them in sync.
+    //
+    // Codex PR #526 round 5 caught that the previous "distinct peerId
+    // count" used by the clamp could disagree with the actual
+    // `relayTargets` set in two ways: it counted entries pointing at
+    // this node's own peerId (later filtered out), and it could be 0
+    // when every entry was malformed (which then clamped a perfectly
+    // valid `relayReservationCount` to 0 — silently disabling
+    // multi-reservation). The canonical list here applies all three
+    // filters (parse → drop-self → dedup) once, with explicit warnings
+    // for each rejection category.
+    //
+    // Self-peerId derivation: needs `peerIdFromPrivateKey(privateKey)`
+    // here because libp2p hasn't been created yet (`this.node` is set
+    // by `createLibp2p({ privateKey, ... })` further down). We have
+    // `privateKey` from the keypair-setup block above, and libp2p's
+    // own peerId is deterministic from it, so this matches what
+    // `this.node.peerId` will be.
+    const selfPeerIdEarly = peerIdFromPrivateKey(privateKey);
+    const usableRelayCandidates: RelayTarget[] = [];
+    if (this.config.relayPeers?.length) {
+      const { multiaddr: parseMultiaddr } = await import('@multiformats/multiaddr');
+      const seenPids = new Set<string>();
+      let malformed = 0;
+      let selfHits = 0;
+      let dupes = 0;
+      for (const raw of this.config.relayPeers) {
+        let ma;
+        try {
+          ma = parseMultiaddr(raw);
+        } catch {
+          malformed += 1;
+          continue;
+        }
+        const p2p = ma.getComponents().find((c) => c.name === 'p2p')?.value;
+        if (!p2p) {
+          malformed += 1;
+          continue;
+        }
+        let pid;
+        try {
+          pid = peerIdFromString(p2p);
+        } catch {
+          malformed += 1;
+          continue;
+        }
+        if (pid.equals(selfPeerIdEarly)) {
+          selfHits += 1;
+          continue;
+        }
+        if (seenPids.has(p2p)) {
+          dupes += 1;
+          continue;
+        }
+        seenPids.add(p2p);
+        usableRelayCandidates.push({ peerId: pid, addr: ma });
+      }
+      if (malformed || selfHits || dupes) {
+        const reasons: string[] = [];
+        if (malformed) reasons.push(`${malformed} malformed (no /p2p component or unparseable)`);
+        if (selfHits) reasons.push(`${selfHits} pointing at this node's own peerId`);
+        if (dupes) reasons.push(`${dupes} duplicate peerIds`);
+        console.warn(
+          `[dkg-core] relayPeers: ${this.config.relayPeers.length} entries supplied, ` +
+            `${usableRelayCandidates.length} usable (skipped ${reasons.join(', ')})`,
+        );
+      }
+    }
+
     let relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
-    const isEdgeWithRelays = !enableRelay && (this.config.relayPeers?.length ?? 0) > 0;
+    // Gate multi-reservation on USABLE peers, not raw config length —
+    // a config like `relayPeers: [malformed, self]` has length>0 but
+    // 0 usable, so the node should fall back to the no-relays path
+    // (no `/p2p-circuit` listen addrs, no watchdog, no
+    // reservationConcurrency override). Codex PR #526 round 5.
+    const isEdgeWithRelays = !enableRelay && usableRelayCandidates.length > 0;
     if (isEdgeWithRelays) {
       const verdict = validateRelayReservationCount(this.config.relayReservationCount);
       if (verdict == null) {
@@ -517,43 +594,18 @@ export class DKGNode {
         );
         relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
       }
-      // Clamp to the count of DISTINCT relay peers — requesting more
-      // reservations than there are unique relays can't deliver the
-      // documented N-(N-1) tolerance and risks duplicate-reservation
-      // churn against an unattainable target. Codex review on PR #526
-      // round 1 caught the over-cap case; round 4 caught that we also
-      // need to dedupe by peerId here, otherwise a config like
-      // `[relayA, relayA]` with `relayReservationCount: 2` looks like
-      // 2 distinct slots to the clamp and the watchdog later "sees"
-      // 2 reservations when only 1 actual relay is involved — which
-      // defeats the redundancy guarantee. Parsing failures are
-      // tolerated here (skipped); the same parser runs again at the
-      // relayTargets push and any malformed entry is dropped consistently.
-      const { multiaddr: parseMultiaddr } = await import('@multiformats/multiaddr');
-      const distinctRelayPeerIds = new Set<string>();
-      for (const raw of this.config.relayPeers!) {
-        try {
-          const ma = parseMultiaddr(raw);
-          const p2p = ma.getComponents().find((c) => c.name === 'p2p')?.value;
-          if (p2p) distinctRelayPeerIds.add(p2p);
-        } catch {
-          // Skipped; will also be dropped at relayTargets push.
-        }
-      }
-      const distinctRelayPeerCount = distinctRelayPeerIds.size;
-      if (distinctRelayPeerCount < this.config.relayPeers!.length) {
-        console.warn(
-          `[dkg-core] relayPeers contains ${this.config.relayPeers!.length} entries but only ` +
-            `${distinctRelayPeerCount} distinct peerIds; using distinct count for ` +
-            `multi-reservation sizing`,
-        );
-      }
-      if (relayReservationCount > distinctRelayPeerCount) {
+      // Clamp to the USABLE relay count (post-parse, post-self-filter,
+      // post-dedup). This guarantees the runtime
+      // `this.relayReservationCountTarget` always matches the actual
+      // `this.relayTargets.length` the watchdog will iterate, so the
+      // gate `reservedRelayCount >= target` is achievable.
+      const usableCount = usableRelayCandidates.length;
+      if (relayReservationCount > usableCount) {
         console.warn(
           `[dkg-core] relayReservationCount=${relayReservationCount} exceeds ` +
-            `distinct relay peers=${distinctRelayPeerCount}; clamping to ${distinctRelayPeerCount}`,
+            `usable relay peers=${usableCount}; clamping to ${usableCount}`,
         );
-        relayReservationCount = distinctRelayPeerCount;
+        relayReservationCount = usableCount;
       }
     } else if (
       this.config.relayReservationCount != null &&
@@ -562,6 +614,16 @@ export class DKGNode {
       console.warn(
         `[dkg-core] relayReservationCount=${this.config.relayReservationCount} ` +
           `set but no relayPeers configured; value ignored`,
+      );
+    } else if (
+      this.config.relayReservationCount != null &&
+      !enableRelay &&
+      this.config.relayPeers?.length &&
+      usableRelayCandidates.length === 0
+    ) {
+      console.warn(
+        `[dkg-core] relayReservationCount=${this.config.relayReservationCount} ` +
+          `set but no usable relayPeers (all malformed/self/duplicate); value ignored`,
       );
     } else if (this.config.relayReservationCount != null && enableRelay) {
       console.warn(
@@ -771,36 +833,25 @@ export class DKGNode {
 
     // Connect to relay peers and tag them as keep-alive so libp2p's
     // connection manager maintains the connection and auto-redials.
-    if (this.config.relayPeers?.length) {
-      const { multiaddr } = await import('@multiformats/multiaddr');
+    // The list `usableRelayCandidates` was already fully filtered
+    // (parse + drop-self + dedup) up top — push it as-is so
+    // `this.relayTargets` is exactly the same set the clamp sized
+    // against. Codex PR #526 round 5 fixed the previous mismatch
+    // where the clamp could pass a count larger than what
+    // `relayTargets` actually held.
+    if (usableRelayCandidates.length > 0) {
+      for (const candidate of usableRelayCandidates) {
+        this.relayTargets.push(candidate);
 
-      // Dedup by peerId (Codex PR #526 round 4): without this a duplicate
-      // entry like `[relayA, relayA]` would be pushed twice, the watchdog
-      // would iterate it twice, and `reservedRelayCount` would count the
-      // single underlying reservation twice — making the gate think the
-      // target is met when only one actual relay is reserved.
-      const seenRelayPeerIds = new Set<string>();
-      for (const addr of this.config.relayPeers) {
-        const ma = multiaddr(addr);
-        const p2pComponent = ma.getComponents().find(c => c.name === 'p2p');
-        if (!p2pComponent?.value) continue;
-
-        const peerId = peerIdFromString(p2pComponent.value);
-        if (peerId.equals(this.node.peerId)) continue;
-        if (seenRelayPeerIds.has(p2pComponent.value)) continue;
-        seenRelayPeerIds.add(p2pComponent.value);
-
-        this.relayTargets.push({ peerId, addr: ma });
-
-        await this.node.peerStore.merge(peerId, {
-          multiaddrs: [ma],
+        await this.node.peerStore.merge(candidate.peerId, {
+          multiaddrs: [candidate.addr],
           tags: {
             'keep-alive-dkg-relay': { value: 100 },
           },
         });
 
         try {
-          await this.node.dial(ma);
+          await this.node.dial(candidate.addr);
         } catch {
           // watchdog will retry
         }
@@ -889,6 +940,27 @@ export class DKGNode {
       haveAnyReservation = circuitSelfAddrs.length > 0;
       reservedRelayCount = computeReservedRelayCount();
     };
+    // Per-tick budget for forced reservation-redials. Codex PR #526
+    // round 5: a completed `node.dial()` does NOT guarantee the new
+    // `/p2p-circuit` self-address has propagated, so during recovery
+    // from `1/2 reservations` in a `3 peers, target=2` setup the
+    // post-dial `refreshReservationSnapshot()` may still report
+    // `reservedRelayCount === 1` and the loop would keep redialing the
+    // remaining peer too — overshooting the target and re-introducing
+    // the churn this PR is meant to avoid. Cap forced redials at the
+    // missing-slot count computed at TICK START (deliberately not
+    // recomputed mid-tick): once we've initiated dials for every
+    // missing slot, the in-flight reservations will fill them
+    // asynchronously, and the next watchdog tick will reassess. If a
+    // dial happens to propagate fast enough that
+    // `reservationGateSatisfied` flips for the next peer, the happy
+    // path skips it naturally — this cap only matters when the
+    // reservations haven't propagated yet.
+    const missingSlotsAtTickStart = Math.max(
+      0,
+      this.relayReservationCountTarget - reservedRelayCount,
+    );
+    let forcedRedialsThisTick = 0;
     const now = Date.now();
 
     for (const { peerId, addr } of this.relayTargets) {
@@ -946,6 +1018,24 @@ export class DKGNode {
           (reservedRelayCount < this.relayReservationCountTarget && !thisRelayHasReservation)
         );
       if (needsForcedReservationRedial) {
+        // Honour the per-tick redial budget. `missingSlotsAtTickStart`
+        // is the deficit at tick start; once we've dispatched dials
+        // for every missing slot we stop, even if the new
+        // `/p2p-circuit` self-addrs haven't shown up yet — the
+        // in-flight reservations will fill the deficit and the next
+        // tick will reassess. Treat this as a benign "still
+        // recovering" state, same as a recent forced redial within
+        // the grace window: account for it as not-fully-healthy but
+        // don't apply exponential backoff (the next tick needs to
+        // arrive to see whether the in-flight dials succeeded).
+        if (
+          this.relayReservationCountTarget > 1 &&
+          missingSlotsAtTickStart > 0 &&
+          forcedRedialsThisTick >= missingSlotsAtTickStart
+        ) {
+          allHealthy = false;
+          continue;
+        }
         const lastForcedRedial = this.relayReservationRedialAt.get(relayPidStr) ?? 0;
         if (now - lastForcedRedial < RELAY_RESERVATION_GRACE_MS) {
           // We just redialed; give libp2p time to finish negotiating a new
@@ -958,6 +1048,7 @@ export class DKGNode {
           continue;
         }
 
+        forcedRedialsThisTick += 1;
         allHealthy = false;
         // Actual corrective action below (drop + redial); this is a
         // real failure the watchdog must back off on.

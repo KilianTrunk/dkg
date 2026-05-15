@@ -501,8 +501,9 @@ describe('Circuit Relay', () => {
 
     const dedupWarn = warnSpy.mock.calls.find((call) =>
       typeof call[0] === 'string'
-      && call[0].includes('2 entries')
-      && call[0].includes('1 distinct peerIds'),
+      && call[0].includes('2 entries supplied')
+      && call[0].includes('1 usable')
+      && call[0].includes('duplicate peerIds'),
     );
     expect(
       dedupWarn,
@@ -535,6 +536,175 @@ describe('Circuit Relay', () => {
 
     warnSpy.mockRestore();
   }, 15000);
+
+  it('drops self-peerId entries from the clamp + relayTargets (Codex PR #526 round 5)', async () => {
+    // Bug Codex caught: the round-4 distinct-peerId clamp counted
+    // entries pointing at this node's OWN peerId, even though the
+    // relayTargets push later filters them out. Result: clamp could
+    // pass `count = N + 1` against actual `relayTargets.length = N`,
+    // making the watchdog gate (`reservedRelayCount >= target`)
+    // unattainable.
+    //
+    // Test: edge with `[realRelayAddr, selfAddr]` and
+    // `relayReservationCount: 2`. Expected behaviour with the
+    // round-5 fix:
+    //   1. Self-filter warning fires (`1 pointing at this node's
+    //      own peerId`).
+    //   2. Clamp warning fires (`clamping to 1`) — the canonical
+    //      usable count is 1, not 2.
+    //   3. Edge gets exactly 1 reservation; watchdog never tries to
+    //      claim a 2nd because target was clamped to the achievable
+    //      1, not the over-counted 2.
+    const { ed25519GetPublicKey } = await import('../src/crypto/ed25519.js');
+    const { peerIdFromPrivateKey } = await import('@libp2p/peer-id');
+    const { privateKeyFromRaw } = await import('@libp2p/crypto/keys');
+    const { randomBytes } = await import('crypto');
+
+    const seed = new Uint8Array(randomBytes(32));
+    const pub = await ed25519GetPublicKey(seed);
+    const raw64 = new Uint8Array(64);
+    raw64.set(seed, 0);
+    raw64.set(pub, 32);
+    const pk = privateKeyFromRaw(raw64);
+    const selfPid = peerIdFromPrivateKey(pk);
+    const selfMultiaddr = `/ip4/127.0.0.1/tcp/9999/p2p/${selfPid.toString()}`;
+
+    const relay = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    nodes.push(relay);
+    await relay.start();
+    const relayAddr = relay.multiaddrs.find(a => a.includes('/tcp/'))!;
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const edge = new DKGNode({
+      privateKey: seed,
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      relayPeers: [relayAddr, selfMultiaddr],
+      relayReservationCount: 2,
+    });
+    nodes.push(edge);
+    await edge.start();
+
+    const selfFilterWarn = warnSpy.mock.calls.find((call) =>
+      typeof call[0] === 'string'
+      && call[0].includes("pointing at this node's own peerId"),
+    );
+    expect(
+      selfFilterWarn,
+      `expected self-filter warning; got: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
+    ).toBeDefined();
+
+    const clampWarn = warnSpy.mock.calls.find((call) =>
+      typeof call[0] === 'string'
+      && call[0].includes('usable relay peers=1')
+      && call[0].includes('clamping to 1'),
+    );
+    expect(
+      clampWarn,
+      `expected clamp-to-usable-count warning; got: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
+    ).toBeDefined();
+
+    warnSpy.mockRestore();
+
+    const deadline = Date.now() + 5_000;
+    let circuitAddrs: string[] = [];
+    while (Date.now() < deadline) {
+      circuitAddrs = edge.libp2p
+        .getMultiaddrs()
+        .map(ma => ma.toString())
+        .filter(a => a.includes('/p2p-circuit'));
+      if (circuitAddrs.length > 0) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+    const distinctRelayPids = new Set(
+      circuitAddrs.map(a => a.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1]).filter(Boolean),
+    );
+    expect(distinctRelayPids.size).toBe(1);
+  }, 15000);
+
+  it('caps forced reservation-redials per tick at the missing-slot count (Codex PR #526 round 5)', async () => {
+    // Bug Codex caught: the round-4 watchdog called
+    // `refreshReservationSnapshot()` after each successful
+    // `node.dial()` but kept iterating. A completed dial doesn't
+    // guarantee the new `/p2p-circuit` self-addr is advertised yet,
+    // so during recovery from `1/2 → 2/2` in a `3 peers, target=2`
+    // setup, the post-dial snapshot would still see
+    // `reservedRelayCount === 1` and the loop would redial the
+    // third relay too — overshooting the target.
+    //
+    // Round-5 fix: cap forced redials per tick at the missing-slot
+    // count computed at TICK START. For 3 peers / target=2 / starting
+    // 2 reservations held, missing=0 → no forced redials at all
+    // even if the snapshot transiently lies about which peer is
+    // reserved during a tick.
+    //
+    // We can't easily simulate "1/2 reservations" deterministically,
+    // so we assert the simpler invariant: when target is fully met,
+    // the watchdog must never log "to force reserve" for any peer.
+    // This catches both the existing round-3 bug AND any regression
+    // where the budget cap is computed incorrectly (since
+    // missing=0 should hard-cap at 0 forced redials regardless of
+    // the per-peer gate state).
+    const relay1 = new DKGNode({ listenAddresses: ['/ip4/127.0.0.1/tcp/0'], enableMdns: false, enableRelayServer: true });
+    const relay2 = new DKGNode({ listenAddresses: ['/ip4/127.0.0.1/tcp/0'], enableMdns: false, enableRelayServer: true });
+    const relay3 = new DKGNode({ listenAddresses: ['/ip4/127.0.0.1/tcp/0'], enableMdns: false, enableRelayServer: true });
+    nodes.push(relay1, relay2, relay3);
+    await relay1.start();
+    await relay2.start();
+    await relay3.start();
+    const relay1Addr = relay1.multiaddrs.find(a => a.includes('/tcp/'))!;
+    const relay2Addr = relay2.multiaddrs.find(a => a.includes('/tcp/'))!;
+    const relay3Addr = relay3.multiaddrs.find(a => a.includes('/tcp/'))!;
+
+    const edge = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      relayPeers: [relay1Addr, relay2Addr, relay3Addr],
+      relayReservationCount: 2,
+    });
+    nodes.push(edge);
+    await edge.start();
+
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const distinct = new Set(
+        edge.libp2p.getMultiaddrs()
+          .map(ma => ma.toString())
+          .filter(a => a.includes('/p2p-circuit'))
+          .map(a => a.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1])
+          .filter(Boolean),
+      );
+      if (distinct.size >= 2) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      // Three back-to-back ticks: even if one tick saw a stale
+      // snapshot, the per-tick budget should keep total forced
+      // redials at 0 across all of them when the target is met.
+      const tick = (edge as unknown as { watchdogTick: () => Promise<void> }).watchdogTick.bind(edge);
+      await tick();
+      await tick();
+      await tick();
+      const churnLogs = logSpy.mock.calls.filter((call) =>
+        typeof call[0] === 'string'
+        && call[0].includes('Relay watchdog')
+        && call[0].includes('to force reserve'),
+      );
+      expect(
+        churnLogs,
+        `expected 0 forced-redial logs across 3 ticks; got: ${JSON.stringify(churnLogs.map(c => c[0]))}`,
+      ).toHaveLength(0);
+    } finally {
+      logSpy.mockRestore();
+    }
+  }, 25000);
 
   it('does not churn the unreserved relay when relayReservationCount < relayPeers.length', async () => {
     // Codex review on PR #526 round 3 caught a real bug in the round-2

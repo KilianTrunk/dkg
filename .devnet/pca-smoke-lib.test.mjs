@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   assertDiscountTaken,
+  assertPublishSignerBound,
   buildVerifyMarkdown,
   classifyAgentRegistration,
 } from './pca-smoke-lib.mjs';
@@ -72,4 +73,29 @@ test('classifyAgentRegistration: bound to a different account → conflict', () 
 test('classifyAgentRegistration: coerces string/number account ids', () => {
   assert.deepEqual(classifyAgentRegistration('0', '9'), { action: 'register' });
   assert.deepEqual(classifyAgentRegistration('9', 9), { action: 'skip' });
+});
+
+test('assertPublishSignerBound: signer is an agent of our account → ok', () => {
+  const r = assertPublishSignerBound({
+    signer: '0xAbc', signerAccountId: 5n, accountId: 5n,
+  });
+  assert.equal(r.ok, true);
+});
+
+test('assertPublishSignerBound: signer not registered → silent demotion fail', () => {
+  // Publisher rotated to a wallet that was never registered as an
+  // agent: KnowledgeAssetsV10 silently takes the no-discount branch.
+  const r = assertPublishSignerBound({
+    signer: '0xAbc', signerAccountId: 0n, accountId: 5n,
+  });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /not a registered agent|demot/i);
+});
+
+test('assertPublishSignerBound: signer bound to a different PCA → fail', () => {
+  const r = assertPublishSignerBound({
+    signer: '0xAbc', signerAccountId: 3n, accountId: 5n,
+  });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /3/);
 });

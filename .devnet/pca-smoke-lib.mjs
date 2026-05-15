@@ -39,6 +39,30 @@ export function classifyAgentRegistration(onChainAccountId, targetAccountId) {
   };
 }
 
+// Bind the ACTUAL publish signer to the discount assertion. The daemon
+// publisher rotates among operational wallets, so the wallet that
+// signed the publish tx (`receipt.from`) is not necessarily the one we
+// registered first. If its on-chain `agentToAccountId` is not our
+// account, KnowledgeAssetsV10 took the no-discount branch silently —
+// surface that distinctly instead of as an opaque discount-math failure.
+export function assertPublishSignerBound({ signer, signerAccountId, accountId }) {
+  const sid = BigInt(signerAccountId);
+  const tgt = BigInt(accountId);
+  if (sid === 0n) {
+    return {
+      ok: false,
+      reason: `publish signer ${signer} is not a registered agent (silent demotion: no discount branch)`,
+    };
+  }
+  if (sid !== tgt) {
+    return {
+      ok: false,
+      reason: `publish signer ${signer} is bound to account ${sid}, not the smoke's account ${tgt}`,
+    };
+  }
+  return { ok: true, reason: `publish signer ${signer} is a registered agent of account ${tgt}` };
+}
+
 // Round-trip evidence written to .scratch/issue-519/verify.md (issue
 // #519 TB-0007 acceptance criterion 3). One table row per scripted step.
 export function buildVerifyMarkdown({ accountId, steps, passed }) {

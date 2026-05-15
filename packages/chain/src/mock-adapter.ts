@@ -438,8 +438,8 @@ export class MockChainAdapter implements ChainAdapter {
   }>();
   private agentToConvictionAccount = new Map<string, bigint>();
   private nextConvictionAccountId = 1n;
-  // Mock has no chronos; a monotonic counter stands in for the creation
-  // epoch so `expiresAtEpoch = createdAtEpoch + lockDurationEpochs` holds.
+  // Mock has no chronos; a monotonic (boundary-aligned) counter stands in
+  // for the creation epoch — a mock-internal model, not contract parity.
   private mockConvictionEpoch = 0;
 
   // Mirrors chain `ParametersStorage.publishingConvictionEpochs` (12).
@@ -514,7 +514,8 @@ export class MockChainAdapter implements ChainAdapter {
       committedTRAC: acct.committedTRAC,
       baseEpochAllowance: acct.committedTRAC / BigInt(acct.lockDurationEpochs),
       createdAtEpoch: acct.createdAtEpoch,
-      // Contract invariant: expiry is lockDurationEpochs after creation.
+      // Mock models boundary-aligned creation only; the contract's mid-epoch
+      // round-up (epochAtTimestamp(expiresAtTimestamp-1)+1) is not modeled.
       expiresAtEpoch: acct.createdAtEpoch + acct.lockDurationEpochs,
       // Mock has no wall clock; timestamps stay 0 (epochs are modeled).
       createdAtTimestamp: 0,

@@ -355,6 +355,34 @@ describe('daemon /api/pca V10 caller contract', () => {
     expect(JSON.parse(res.body).error).toBe('AccountAlreadyFullySettled');
   });
 
+  it('maps an ERC721NonexistentToken revert on POST /api/pca/:id/funds → 404 UnknownAccount', async () => {
+    const { res, done } = runCtx('POST', '/api/pca/7/funds', {
+      topUpPublishingConvictionAccount: async () => { throw new Error('execution reverted: ERC721NonexistentToken(7)'); },
+    }, { tokens: '5' });
+    await done;
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body)).toEqual({ error: 'UnknownAccount', accountId: '7' });
+  });
+
+  it('maps an ERC721NonexistentToken revert on POST /api/pca/:id/agent → 404 UnknownAccount', async () => {
+    const addr = '0x' + '7'.repeat(40);
+    const { res, done } = runCtx('POST', '/api/pca/9/agent', {
+      registerPublishingConvictionAgent: async () => { throw new Error('execution reverted: ERC721NonexistentToken(9)'); },
+    }, { agent: addr });
+    await done;
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body)).toEqual({ error: 'UnknownAccount', accountId: '9' });
+  });
+
+  it('maps an ERC721NonexistentToken revert on POST /api/pca/:id/settle → 404 UnknownAccount', async () => {
+    const { res, done } = runCtx('POST', '/api/pca/9/settle', {
+      settlePublishingConvictionAccount: async () => { throw new Error('execution reverted: ERC721NonexistentToken(9)'); },
+    });
+    await done;
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body)).toEqual({ error: 'UnknownAccount', accountId: '9' });
+  });
+
   it('GET ?key= probe exposes `registered` (not `authorized`)', async () => {
     const addr = '0x' + '6'.repeat(40);
     const agent = {

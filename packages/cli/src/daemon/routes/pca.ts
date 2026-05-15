@@ -52,6 +52,12 @@ function classifyPcaRevert(msg: string): { status: number; error: string } | nul
   if (/\bAgentCapReached\b/.test(msg)) return { status: 409, error: 'AgentCapReached' };
   if (/\bAccountExpired\b/.test(msg)) return { status: 409, error: 'AccountExpired' };
   if (/\bAccountAlreadyFullySettled\b/.test(msg)) return { status: 409, error: 'AccountAlreadyFullySettled' };
+  // OZ v5 _requireOwned on an unminted NFT id → caller mistake, 404.
+  // Legacy string-revert fallback for older OZ ERC721 builds.
+  if (/\bERC721NonexistentToken\b/.test(msg) ||
+      /nonexistent token|owner query for nonexistent token|ERC721: invalid token ID/i.test(msg)) {
+    return { status: 404, error: 'UnknownAccount' };
+  }
   return null;
 }
 

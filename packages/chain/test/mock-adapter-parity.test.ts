@@ -120,12 +120,8 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // MockChainAdapter.
   'requireKCStorage',
   'requireContextGraphStorage',
-  // TS-private helpers backing the V10 PCA write surface. `pcaWrite`
-  // wraps each write so a provider's opaque "unknown custom error"
-  // revert is enriched (via enrichEvmError) before rethrow, so the
-  // daemon classifier sees NotAccountOwner/InvalidAmount/etc. The mock
-  // raises typed reverts directly, so it has no opaque-revert surface
-  // to wrap — EVM-only, like translateRandomSamplingError.
+  // TS-private EVM-only helpers backing the V10 PCA write surface
+  // (no mock equivalent — mock raises typed reverts directly).
   'requireConvictionNFT',
   'pcaWrite',
   // The seven V10 Publishing Conviction NFT methods (issue #519 /

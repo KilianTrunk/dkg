@@ -2183,10 +2183,8 @@ export class EVMChainAdapter implements ChainAdapter {
     return nft;
   }
 
-  // PCA writes rethrow raw CALL_EXCEPTIONs; providers report custom errors
-  // as opaque "unknown custom error"+data, so the daemon's message-based
-  // classifier never sees the name. Enrich in place, then rethrow the SAME
-  // error (mirrors isContractMissingRevert/translateRandomSamplingError).
+  // Opaque "unknown custom error"+data reverts carry no name; enrich so the
+  // daemon classifier matches it (mirrors isContractMissingRevert et al).
   private async pcaWrite<T>(op: () => Promise<T>): Promise<T> {
     try {
       return await op();

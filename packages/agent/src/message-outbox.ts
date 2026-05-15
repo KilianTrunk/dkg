@@ -131,12 +131,70 @@ export function chatOutboxKey(recipientPeerId: string, messageId: string): strin
 
 export class MessageOutbox {
   private readonly queue: RetryQueue<ChatOutboxPayload>;
+  /**
+   * Per-key inflight set to prevent concurrent retry attempts for the
+   * same `(recipient, messageId)` pair. The retry surface has two
+   * triggers — the periodic `processMessageOutboxTick` and the
+   * `connection:open` opportunistic flush in `processMessageOutboxOnConnect`
+   * — and they can interleave: the tick can call
+   * `messageHandler.sendChat` for entry E, JS yields, the recipient's
+   * `connection:open` fires DURING the in-flight send, the on-connect
+   * handler reads `pendingFor(peer)` (entry E is still in the queue —
+   * `markDelivered` hasn't fired yet because the in-flight send hasn't
+   * resolved), and starts a CONCURRENT second `sendChat` for the same
+   * entry. Worst case both succeed and the recipient sees the same
+   * message twice.
+   *
+   * Same race shape exists in `JoinApprovalRetryQueue` but the
+   * consequences there are harmless (join-approved is idempotent at
+   * the receiver — re-confirms subscription state). For chat the
+   * duplicate is real user-visible UX corruption, so we guard at the
+   * MessageOutbox layer with an atomic check-and-set: the second
+   * concurrent attempter sees `tryBeginAttempt` return false and
+   * exits without dialing. Identified by Lex review on PR #521.
+   *
+   * Receiver-side dedup would need a wire-format change (heavyweight,
+   * crosses two PRs); a single shared retry lock would prevent
+   * legitimate concurrent multi-recipient delivery (chat retries can
+   * fan out across many recipients on the same `connection:open`
+   * burst). Per-key inflight is the strictly-contained fix.
+   *
+   * Worth lifting into the generic `RetryQueue<TPayload>` eventually
+   * so `JoinApprovalRetryQueue` can use the same primitive (its race
+   * is harmless today but the symmetry helps with future-resilience).
+   * Left as a follow-up adjacent to OriginTrail/dkg#518.
+   */
+  private readonly inflight = new Set<string>();
 
   constructor(options: MessageOutboxOptions = {}) {
     this.queue = new RetryQueue<ChatOutboxPayload>({
       backoffs: options.backoffs ?? DEFAULT_CHAT_OUTBOX_BACKOFFS_MS,
       maxAgeMs: options.maxAgeMs ?? DEFAULT_CHAT_OUTBOX_MAX_AGE_MS,
     });
+  }
+
+  /**
+   * Atomic check-and-set for the per-key inflight guard. Returns
+   * `true` if the caller now owns the in-flight slot for this
+   * `(recipient, messageId)` and should proceed with the send;
+   * returns `false` if another caller is already attempting it and
+   * the current caller should exit without dialing.
+   *
+   * MUST be paired with `endAttempt(recipient, messageId)` in a
+   * try/finally — leaking an inflight entry would permanently block
+   * future retries for that key, which would silently lose the
+   * message until `dropExpired` evicts it 24h later.
+   */
+  tryBeginAttempt(recipientPeerId: string, messageId: string): boolean {
+    const key = chatOutboxKey(recipientPeerId, messageId);
+    if (this.inflight.has(key)) return false;
+    this.inflight.add(key);
+    return true;
+  }
+
+  /** Release the per-key inflight slot. Idempotent. */
+  endAttempt(recipientPeerId: string, messageId: string): void {
+    this.inflight.delete(chatOutboxKey(recipientPeerId, messageId));
   }
 
   /**

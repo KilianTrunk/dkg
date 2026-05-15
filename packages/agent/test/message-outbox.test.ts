@@ -167,6 +167,51 @@ describe('MessageOutbox', () => {
     });
   });
 
+  // 🔴 Regression for the duplicate-delivery race identified by Lex
+  // review on PR #521. The periodic tick + connection:open
+  // opportunistic flush can both call `retryOutboxEntry` for the same
+  // entry: the first call's `messageHandler.sendChat` yields, the
+  // second call observes the entry still in the queue (`markDelivered`
+  // hasn't fired yet because the first send is still in flight) and
+  // starts a concurrent second send. Without this guard the recipient
+  // sees the message twice. The check-and-set on the inflight Set is
+  // what catches the second concurrent attempter and returns false so
+  // it exits without dialing.
+  describe('inflight guard (PR #521 round-1 race fix)', () => {
+    it('tryBeginAttempt returns true on first call and false on repeat', () => {
+      const outbox = new MessageOutbox();
+      expect(outbox.tryBeginAttempt(PEER_A, 'msg-1')).toBe(true);
+      expect(outbox.tryBeginAttempt(PEER_A, 'msg-1')).toBe(false);
+    });
+
+    it('endAttempt releases the slot so subsequent tryBeginAttempt succeeds', () => {
+      const outbox = new MessageOutbox();
+      expect(outbox.tryBeginAttempt(PEER_A, 'msg-1')).toBe(true);
+      outbox.endAttempt(PEER_A, 'msg-1');
+      expect(outbox.tryBeginAttempt(PEER_A, 'msg-1')).toBe(true);
+    });
+
+    it('endAttempt is idempotent — releasing a non-held slot is a no-op', () => {
+      const outbox = new MessageOutbox();
+      // Never began. Should not throw and should not put the slot
+      // into a corrupt state.
+      expect(() => outbox.endAttempt(PEER_A, 'msg-1')).not.toThrow();
+      expect(outbox.tryBeginAttempt(PEER_A, 'msg-1')).toBe(true);
+    });
+
+    it('different keys are independent — distinct messageIds to same recipient do not block each other', () => {
+      const outbox = new MessageOutbox();
+      expect(outbox.tryBeginAttempt(PEER_A, 'msg-1')).toBe(true);
+      expect(outbox.tryBeginAttempt(PEER_A, 'msg-2')).toBe(true);
+    });
+
+    it('different keys are independent — same messageId to different recipients do not block each other', () => {
+      const outbox = new MessageOutbox();
+      expect(outbox.tryBeginAttempt(PEER_A, 'msg-1')).toBe(true);
+      expect(outbox.tryBeginAttempt(PEER_B, 'msg-1')).toBe(true);
+    });
+  });
+
   describe('defaults', () => {
     it('uses chat-tighter backoff ladder when not overridden', () => {
       expect(DEFAULT_CHAT_OUTBOX_BACKOFFS_MS).toEqual([

@@ -9205,34 +9205,50 @@ export class DKGAgent {
   private async retryOutboxEntry(entry: ChatOutboxRetryEntry): Promise<void> {
     if (!this.messageHandler) return;
     const ctx = createOperationContext('system');
-    const result = await this.messageHandler.sendChat(entry.recipientPeerId, entry.text, {
-      contextGraphId: entry.contextGraphId,
-    });
-    if (result.delivered) {
-      this.messageOutbox.markDelivered(entry.recipientPeerId, entry.messageId);
-      this.log.info(
-        ctx,
-        `Outbox redelivery succeeded for ${entry.recipientPeerId.slice(-8)} ` +
-          `(messageId=${entry.messageId.slice(0, 8)}) after ${entry.attempts + 1} attempt(s)`,
-      );
+    // Per-key inflight guard against the duplicate-delivery race
+    // identified by Lex review on PR #521: the periodic tick and the
+    // connection:open opportunistic flush can both call this method
+    // for the same entry, the first call's `messageHandler.sendChat`
+    // yields, and the second call observes the entry still in the
+    // queue (`markDelivered` hasn't fired yet) and starts a concurrent
+    // second send. Without this guard the recipient sees the message
+    // twice — real user-visible UX corruption. See `MessageOutbox.tryBeginAttempt`
+    // for the full rationale.
+    if (!this.messageOutbox.tryBeginAttempt(entry.recipientPeerId, entry.messageId)) {
       return;
     }
-    const updated = this.messageOutbox.enqueueFailure(
-      {
-        recipientPeerId: entry.recipientPeerId,
-        text: entry.text,
+    try {
+      const result = await this.messageHandler.sendChat(entry.recipientPeerId, entry.text, {
         contextGraphId: entry.contextGraphId,
-        messageId: entry.messageId,
-      },
-      result.error ?? 'unknown',
-      Date.now(),
-    );
-    this.log.warn(
-      ctx,
-      `Outbox redelivery still failing for ${entry.recipientPeerId.slice(-8)} ` +
-        `(messageId=${entry.messageId.slice(0, 8)}, attempts=${updated.attempts}, ` +
-        `next=${new Date(updated.nextAttemptAt).toISOString()}, error=${updated.lastError})`,
-    );
+      });
+      if (result.delivered) {
+        this.messageOutbox.markDelivered(entry.recipientPeerId, entry.messageId);
+        this.log.info(
+          ctx,
+          `Outbox redelivery succeeded for ${entry.recipientPeerId.slice(-8)} ` +
+            `(messageId=${entry.messageId.slice(0, 8)}) after ${entry.attempts + 1} attempt(s)`,
+        );
+        return;
+      }
+      const updated = this.messageOutbox.enqueueFailure(
+        {
+          recipientPeerId: entry.recipientPeerId,
+          text: entry.text,
+          contextGraphId: entry.contextGraphId,
+          messageId: entry.messageId,
+        },
+        result.error ?? 'unknown',
+        Date.now(),
+      );
+      this.log.warn(
+        ctx,
+        `Outbox redelivery still failing for ${entry.recipientPeerId.slice(-8)} ` +
+          `(messageId=${entry.messageId.slice(0, 8)}, attempts=${updated.attempts}, ` +
+          `next=${new Date(updated.nextAttemptAt).toISOString()}, error=${updated.lastError})`,
+      );
+    } finally {
+      this.messageOutbox.endAttempt(entry.recipientPeerId, entry.messageId);
+    }
   }
 
   /**

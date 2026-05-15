@@ -85,4 +85,36 @@ describe('V10 Publishing Conviction NFT — chain-adapter lifecycle', () => {
     expect(await owner.isConvictionAgent(accountId, agent)).toBe(false);
     expect(await owner.getConvictionAgentAccountId(agent)).toBe(0n);
   });
+
+  it('owner topUpConvictionAccount + settleConvictionAccount succeed and topUpBuffer updates', async () => {
+    const owner = await fundedOwner();
+    const { accountId } = await owner.createConvictionAccount(COMMITTED);
+
+    const top = await owner.topUpConvictionAccount(accountId, COMMITTED);
+    expect(top.success).toBe(true);
+    const info = await owner.getConvictionAccountInfo(accountId);
+    expect(info!.topUpBuffer).toBe(COMMITTED);
+
+    const settled = await owner.settleConvictionAccount(accountId);
+    expect(settled.success).toBe(true);
+  });
+
+  it('non-owner topUp / registerConvictionAgent propagate the on-chain owner revert (not swallowed)', async () => {
+    const owner = await fundedOwner(HARDHAT_KEYS.CORE_OP);
+    const { accountId } = await owner.createConvictionAccount(COMMITTED);
+
+    const stranger = await fundedOwner(HARDHAT_KEYS.PUBLISHER);
+    expect(stranger.getSignerAddress().toLowerCase())
+      .not.toBe(owner.getSignerAddress().toLowerCase());
+
+    await expect(stranger.topUpConvictionAccount(accountId, COMMITTED)).rejects.toThrow();
+    await expect(
+      stranger.registerConvictionAgent(accountId, ethers.Wallet.createRandom().address),
+    ).rejects.toThrow();
+
+    // The owner revert must not have mutated state.
+    const info = await owner.getConvictionAccountInfo(accountId);
+    expect(info!.topUpBuffer).toBe(0n);
+    expect(info!.agentCount).toBe(0);
+  });
 });

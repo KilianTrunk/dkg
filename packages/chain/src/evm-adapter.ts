@@ -2262,6 +2262,27 @@ export class EVMChainAdapter implements ChainAdapter {
     }
   }
 
+  async topUpConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
+    await this.init();
+    const nft = this.requireConvictionNFT();
+    const nftAddress = await nft.getAddress();
+    if (this.contracts.token) {
+      const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+      if (allowance < amount) {
+        await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+      }
+    }
+    const receipt = await (await nft.topUp(accountId, amount)).wait();
+    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+  }
+
+  async settleConvictionAccount(accountId: bigint): Promise<TxResult> {
+    await this.init();
+    const nft = this.requireConvictionNFT();
+    const receipt = await (await nft.settle(accountId)).wait();
+    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+  }
+
   async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
     await this.init();
     const nft = this.requireConvictionNFT();

@@ -124,3 +124,42 @@ describe('MockChainAdapter — V10 owner-gating parity', () => {
     ).rejects.toThrow(/AgentNotRegistered/);
   });
 });
+
+describe('MockChainAdapter — V10 invalid-input parity with the contract', () => {
+  const MAX_UINT96 = (1n << 96n) - 1n;
+
+  it('createConvictionAccount rejects zero / negative / uint96-overflow committedTRAC', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    await expect(mock.createConvictionAccount(0n)).rejects.toThrow(/InvalidAmount/);
+    await expect(mock.createConvictionAccount(-1n)).rejects.toThrow(/InvalidAmount/);
+    await expect(mock.createConvictionAccount(MAX_UINT96 + 1n)).rejects.toThrow(/InvalidAmount/);
+  });
+
+  it('topUpConvictionAccount rejects zero / negative / uint96-overflow amount', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createConvictionAccount(COMMITTED);
+    await expect(mock.topUpConvictionAccount(accountId, 0n)).rejects.toThrow(/InvalidAmount/);
+    await expect(mock.topUpConvictionAccount(accountId, -1n)).rejects.toThrow(/InvalidAmount/);
+    await expect(mock.topUpConvictionAccount(accountId, MAX_UINT96 + 1n)).rejects.toThrow(/InvalidAmount/);
+    expect((await mock.getConvictionAccountInfo(accountId))!.topUpBuffer).toBe(0n);
+  });
+
+  it('registerConvictionAgent rejects the zero address (ZeroAgentAddress)', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createConvictionAccount(COMMITTED);
+    await expect(
+      mock.registerConvictionAgent(accountId, ethers.ZeroAddress),
+    ).rejects.toThrow(/ZeroAgentAddress/);
+    expect((await mock.getConvictionAccountInfo(accountId))!.agentCount).toBe(0);
+  });
+
+  it('getConvictionAccountInfo.baseEpochAllowance is committedTRAC / lockDurationEpochs', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createConvictionAccount(COMMITTED);
+    const info = (await mock.getConvictionAccountInfo(accountId))!;
+    const lock = await mock.getConvictionAccountLockDurationEpochs(accountId);
+    expect(lock).toBeGreaterThan(0);
+    expect(info.baseEpochAllowance).toBe(COMMITTED / BigInt(lock));
+    expect(info.baseEpochAllowance).toBeGreaterThan(0n);
+  });
+});

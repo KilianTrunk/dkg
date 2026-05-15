@@ -459,7 +459,18 @@ export class MockChainAdapter implements ChainAdapter {
     return accountId;
   }
 
+  // Parity with the contract: createAccount/topUp revert `InvalidAmount`
+  // for amount == 0 and the uint96 ABI encoding rejects negative /
+  // out-of-range values before any state write.
+  private static readonly MAX_UINT96 = (1n << 96n) - 1n;
+  private requireValidConvictionAmount(amount: bigint): void {
+    if (amount <= 0n || amount > MockChainAdapter.MAX_UINT96) {
+      throw new Error(`Mock: InvalidAmount(${amount})`);
+    }
+  }
+
   async createConvictionAccount(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> {
+    this.requireValidConvictionAmount(committedTRAC);
     const accountId = this.nextConvictionAccountId++;
     this.convictionAccounts.set(accountId, {
       owner: ethers.getAddress(this.signerAddress),
@@ -477,7 +488,7 @@ export class MockChainAdapter implements ChainAdapter {
     return {
       owner: acct.owner,
       committedTRAC: acct.committedTRAC,
-      baseEpochAllowance: 0n,
+      baseEpochAllowance: acct.committedTRAC / BigInt(acct.lockDurationEpochs),
       createdAtEpoch: 0,
       expiresAtEpoch: acct.lockDurationEpochs,
       createdAtTimestamp: 0,
@@ -510,6 +521,7 @@ export class MockChainAdapter implements ChainAdapter {
 
   async topUpConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
     const acct = this.requireConvictionOwner(accountId);
+    this.requireValidConvictionAmount(amount);
     acct.topUpBuffer += amount;
     return this.txResult(true);
   }
@@ -521,6 +533,9 @@ export class MockChainAdapter implements ChainAdapter {
 
   async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
     const acct = this.requireConvictionOwner(accountId);
+    if (agent === ethers.ZeroAddress) {
+      throw new Error('Mock: ZeroAgentAddress()');
+    }
     const key = ethers.getAddress(agent).toLowerCase();
     if (this.agentToConvictionAccount.has(key)) {
       throw new Error(`Mock: AgentAlreadyRegistered(${agent}, ${this.agentToConvictionAccount.get(key)})`);

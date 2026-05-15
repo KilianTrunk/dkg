@@ -363,4 +363,54 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     expect(meta[6]).to.equal(tokenAmount);
     expect(activeSinkSum).to.be.lessThan(meta[6]);
   });
+
+  // --------------------------------------------------------------------------
+  // 3. expired account: the conviction funding call reverts
+  // --------------------------------------------------------------------------
+  //
+  // `KnowledgeAssetsV10.publish()` deliberately does NOT revert on an
+  // expired PCA — it gates the discount off and falls through to
+  // direct spend so a stale agent registration cannot brick the
+  // publisher. The on-chain expiry revert lives in the exact funding
+  // call publish() makes on the conviction branch:
+  // `coverPublishingCost`. We drive it directly via an EOA standing in
+  // for KnowledgeAssetsV10 (Hub-resolved gate, same pattern as the unit
+  // suite) to assert `AccountExpired` post-expiry.
+  it('reverts AccountExpired when the publish funding call is attempted post-expiry', async () => {
+    const creator = getDefaultKCCreator(accounts);
+    const agent = accounts[15];
+    const kav10Signer = accounts[16];
+
+    const accountId = await createAccountFor(creator);
+    await NFT.connect(creator).registerAgent(accountId, agent.address);
+
+    const acct = await NFT.accounts(accountId);
+    const lockDurationEpochs = Number(acct[5]);
+    const epochLength = await Chronos.epochLength();
+    await Hub.setContractAddress(
+      'KnowledgeAssetsV10',
+      kav10Signer.address,
+    );
+    const currentEpoch = await Chronos.getCurrentEpoch();
+
+    // Still live → the funding call succeeds (sanity for the gate).
+    await NFT.connect(kav10Signer).coverPublishingCost(
+      agent.address,
+      ethers.parseEther('10'),
+      currentEpoch,
+      lockDurationEpochs,
+    );
+
+    // Advance past `expiresAtTimestamp`.
+    await time.increase(Number(epochLength) * (lockDurationEpochs + 1));
+
+    await expect(
+      NFT.connect(kav10Signer).coverPublishingCost(
+        agent.address,
+        ethers.parseEther('10'),
+        currentEpoch,
+        lockDurationEpochs,
+      ),
+    ).to.be.revertedWithCustomError(NFT, 'AccountExpired');
+  });
 });

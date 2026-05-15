@@ -724,3 +724,69 @@ DocsAgent->>Architecture: create or update Mermaid diagrams and prose
 DocsAgent-->>Workflow: documentation stage complete
 Workflow->>Git: create local commits in a later commit stage
 ```
+
+---
+
+## V10 Publishing Conviction NFT — SDK + daemon wiring (#519)
+
+The V10 `DKGPublishingConvictionNFT` write+read surface is wired
+end-to-end through the SDK. Prior to this, the contract was deployed and
+invoked by `KnowledgeAssetsV10.publish()` on-chain, but the SDK exposed
+only read shims and the daemon `/api/pca/*` routes returned HTTP 503
+(the V9 `PublishingConvictionAccount` predecessor was archived in #500).
+
+**Call path (operator → chain):**
+
+```
+operator/CLI ─▶ daemon /api/pca/*  ─▶ DKGAgent facade ─▶ ChainAdapter ─▶ DKGPublishingConvictionNFT
+                (cli/src/daemon)      (agent/src)        (chain/src)      (evm-module)
+publisher  ───────────────────────────────────────────▶ ChainAdapter (read: agentToAccountId, lockDuration)
+KnowledgeAssetsV10.publish() ─▶ DKGPublishingConvictionNFT.coverPublishingCost()  (contract-to-contract; NOT in SDK surface)
+```
+
+**ChainAdapter V10 PCA surface** (`packages/chain/src/chain-adapter.ts`,
+impl `evm-adapter.ts`, parity in `mock-adapter.ts` /
+`no-chain-adapter.ts`): `createConvictionAccount(committedTRAC)`,
+`topUpConvictionAccount(accountId, amount)`,
+`registerConvictionAgent(accountId, agent)`,
+`deregisterConvictionAgent(accountId, agent)`,
+`isConvictionAgent(accountId, agent)`,
+`settleConvictionAccount(accountId)`,
+`getConvictionAccountInfo(accountId)` (V10 12-tuple shape). The dead V9
+`publishingConvictionAccount` cache slot was removed.
+
+**V9 → V10 semantic break** (not a rename — DTOs changed shape across
+facade / daemon / api-client):
+
+| Concern | V9 (archived) | V10 (wired) |
+|---|---|---|
+| Lock duration | per-account `lockEpochs` arg | global protocol param (`publishingConvictionEpochs()`); no caller arg |
+| Authorization | `authorizedKeys` + `admin` | `registerAgent` + `agentToAccountId` reverse map (one account per agent) |
+| Ownership | `admin` field | ERC-721 `ownerOf(accountId)` |
+| Funding | `addFunds` → raw balance | `topUp` → persistent `topUpBalance` buffer |
+| Settlement | implicit per publish | explicit lazy `settle()` + active sink in `coverPublishingCost` |
+| `getAccountInfo` | 6-tuple `(admin,balance,initialDeposit,lockEpochs,conviction,discountBps)` | 12-tuple `(owner,committedTRAC,baseEpochAllowance,createdAtEpoch,expiresAtEpoch,createdAtTimestamp,expiresAtTimestamp,discountBps,topUpBuffer,agentCount,lastSettledWindow,fullySwept)` |
+
+**Owner-gating** (curation trust model): `createConvictionAccount`
+mints to the signer; `topUp` / `registerConvictionAgent` /
+`deregisterConvictionAgent` are owner-only on chain
+(`msg.sender == ownerOf(accountId)`). The SDK surfaces the on-chain
+owner revert (`NotAccountOwner`) rather than swallowing it; the daemon
+maps it to HTTP **403** (distinct from **503** = no-chain adapter).
+Agents publish only — they never mutate the account.
+
+**Daemon HTTP contract** (`packages/cli/src/daemon/routes/pca.ts`,
+typed in `packages/cli/src/api-client.ts`): `POST /api/pca`
+(`{tokens}`, no `lockEpochs`), `POST /api/pca/:id/funds` (→ `topUp`),
+`POST /api/pca/:id/agent` (register) + `DELETE /api/pca/:id/agent/:addr`
+(deregister) — replacing the V9 `:id/authorize` key route —
+`POST /api/pca/:id/settle`, `GET /api/pca/:id` (V10-shaped body).
+
+**Test coverage:** `packages/chain/test/` exercises the adapter +
+mock↔EVM parity; `packages/evm-module/test/v10-pca-lifecycle.test.ts`
+covers create → topUp → registerAgent → discounted publish via the real
+`KnowledgeAssetsV10.publish()` → expiry revert; the devnet smoke
+(`.devnet/run.mjs`) force-boots a **clean** devnet and runs a live
+HTTP `/api/pca` round-trip asserting `0 < discountedCost < baseCost`
+**on chain** (guards the silent-demotion risk: KAv10 takes the discount
+branch only when `publishEpochs == lockDurationEpochs`).

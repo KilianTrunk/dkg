@@ -19,6 +19,7 @@ import { ed25519GetPublicKey } from './crypto/ed25519.js';
 import type { ConnectionTransport, DKGNodeConfig } from './types.js';
 import { DHT_PROTOCOL, DKG_GOSSIP_MAX_RPC_BYTES } from './constants.js';
 import { RelayMetricsAdapter, RELAY_V2_STOP_CODEC } from './libp2p-metrics-adapter.js';
+import { readRelayReservations, readConnectionStreams } from './relay-internal-shapes.js';
 
 export interface DKGServices extends Record<string, unknown> {
   dht: KadDHT;
@@ -1202,40 +1203,43 @@ export class DKGNode {
   getRelayStats(): RelayStats | null {
     if (!this.node || !this.relayMetrics) return null;
 
-    const relayService = (this.node.services as any).relay;
-    if (!relayService) return null;
+    // Reservations + per-connection streams are libp2p-internal shapes
+    // that aren't part of the public TypeScript types. Codex review on
+    // PR #525 round 4 caught that scattering `(x as any).y` casts at
+    // the use sites makes a future libp2p refactor silently break the
+    // metrics — these helpers concentrate the brittleness in one
+    // tested module that returns null on shape mismatch.
+    const reservationsMap = readRelayReservations(this.node);
+    if (!reservationsMap) return null;
 
-    const reservationsMap: Map<{ toString(): string }, RelayReservationInfo> | undefined =
-      relayService.reservations;
     const reservations: RelayReservationDetail[] = [];
     let reservationCount = 0;
-    if (reservationsMap && typeof reservationsMap.forEach === 'function') {
-      reservationsMap.forEach((reservation, peerId) => {
-        reservationCount += 1;
-        try {
-          const expiry = reservation?.expiry instanceof Date ? reservation.expiry.getTime() : null;
-          const addr = reservation?.addr?.toString?.() ?? null;
-          reservations.push({
-            peerId: peerId.toString(),
-            expiryTs: expiry,
-            addr,
-            limitDurationMs:
-              typeof reservation?.limit?.duration === 'number'
-                ? reservation.limit.duration
+    reservationsMap.forEach((rawReservation, peerId) => {
+      reservationCount += 1;
+      try {
+        const reservation = rawReservation as RelayReservationInfo | undefined;
+        const expiry = reservation?.expiry instanceof Date ? reservation.expiry.getTime() : null;
+        const addr = reservation?.addr?.toString?.() ?? null;
+        reservations.push({
+          peerId: peerId.toString(),
+          expiryTs: expiry,
+          addr,
+          limitDurationMs:
+            typeof reservation?.limit?.duration === 'number'
+              ? reservation.limit.duration
+              : null,
+          limitDataBytes:
+            typeof reservation?.limit?.data === 'bigint'
+              ? Number(reservation.limit.data)
+              : typeof reservation?.limit?.data === 'number'
+                ? reservation.limit.data
                 : null,
-            limitDataBytes:
-              typeof reservation?.limit?.data === 'bigint'
-                ? Number(reservation.limit.data)
-                : typeof reservation?.limit?.data === 'number'
-                  ? reservation.limit.data
-                  : null,
-          });
-        } catch {
-          // Best-effort — a single misshapen reservation entry must
-          // not poison the whole stats payload.
-        }
-      });
-    }
+        });
+      } catch {
+        // Best-effort — a single misshapen reservation entry must
+        // not poison the whole stats payload.
+      }
+    });
 
     // Count active forwarded circuits by counting OUTBOUND STOP streams
     // across all connections. On the relay server, each forwarded circuit
@@ -1258,8 +1262,8 @@ export class DKGNode {
     let activeCircuits = 0;
     try {
       for (const conn of this.node.getConnections()) {
-        const streams = (conn as any).streams as Array<{ protocol?: string; direction?: string }> | undefined;
-        if (!Array.isArray(streams)) continue;
+        const streams = readConnectionStreams(conn);
+        if (!streams) continue;
         for (const s of streams) {
           if (s?.protocol === RELAY_V2_STOP_CODEC && s?.direction === 'outbound') {
             activeCircuits += 1;

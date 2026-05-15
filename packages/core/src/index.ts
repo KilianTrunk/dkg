@@ -31,13 +31,6 @@ export {
   type RelayReservationCountValidation,
 } from './node.js';
 export {
-  RelayMetricsAdapter,
-  isRelayServerStream,
-  RELAY_V2_HOP_CODEC,
-  RELAY_V2_STOP_CODEC,
-  type RelayBytesSnapshot,
-} from './libp2p-metrics-adapter.js';
-export {
   type Network,
   type NodeIdentity,
   type Address,

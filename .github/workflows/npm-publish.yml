@@ -205,21 +205,50 @@ jobs:
 
           echo "✓ npm-publish environment configured with ${REVIEWER_COUNT} required reviewer(s) (self-review blocked) + ${WAIT_TIMER}-min wait timer + scoped deployment branch policy"
 
-      - name: Verify tag points to a commit on the release branch
+      - name: Verify tag points to a commit on a release branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
           TAG_SHA: ${{ github.sha }}
+          # Keep in sync with release.yml's RELEASE_BRANCHES
+          RELEASE_BRANCHES: "main v10-rc"
         run: |
           set -euo pipefail
-          RELEASE_BRANCH=main
-          STATUS=$(gh api "repos/${GH_REPO}/compare/${RELEASE_BRANCH}...${TAG_SHA}" --jq '.status' 2>/dev/null || echo "error")
-          if [ "${STATUS}" != "identical" ] && [ "${STATUS}" != "behind" ]; then
-            echo "::error title=Tag not on release branch::Tag ${TAG_NAME} (${TAG_SHA}) is not reachable from \`${RELEASE_BRANCH}\`. Compare status: ${STATUS}. Push tags only on commits that are on \`${RELEASE_BRANCH}\`."
+          for branch in ${RELEASE_BRANCHES}; do
+            STATUS=$(gh api "repos/${GH_REPO}/compare/${branch}...${TAG_SHA}" --jq '.status' 2>/dev/null || echo "error")
+            if [ "${STATUS}" = "identical" ] || [ "${STATUS}" = "behind" ]; then
+              echo "✓ Tag ${TAG_NAME} (${TAG_SHA}) is reachable from ${branch} (status: ${STATUS})"
+              exit 0
+            fi
+          done
+          echo "::error title=Tag not on release branch::Tag ${TAG_NAME} (${TAG_SHA}) is not reachable from any release branch (${RELEASE_BRANCHES}). Push tags only on commits that are on a release branch."
+          exit 1
+
+      - name: Require signed annotated tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate tag is annotated and signed
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          TAG_TYPE=$(git cat-file -t "${TAG}" 2>&1) || {
+            echo "::error title=Tag object missing::git cat-file failed for ${TAG}: ${TAG_TYPE}"
+            exit 1
+          }
+          if [ "${TAG_TYPE}" != "tag" ]; then
+            echo "::error title=Tag not annotated::Tag ${TAG} is a lightweight ref (type: ${TAG_TYPE}). Lightweight tags cannot carry signatures. Re-create with: git tag -s ${TAG} <commit>"
             exit 1
           fi
-          echo "✓ Tag ${TAG_NAME} (${TAG_SHA}) is reachable from ${RELEASE_BRANCH} (status: ${STATUS})"
+          TAG_BODY=$(git cat-file -p "${TAG}")
+          if ! printf '%s' "${TAG_BODY}" | grep -qE '^-----BEGIN (PGP SIGNATURE|SSH SIGNATURE)-----'; then
+            echo "::error title=Tag not signed::Tag ${TAG} is annotated but has no signature block. Re-create with: git tag -s ${TAG} <commit>"
+            exit 1
+          fi
+          echo "✓ Tag ${TAG} is annotated and signed"
 
   # BUILD AND PACK — runs WITHOUT `environment: npm-publish`, so NPM_TOKEN
   # is NOT in scope. This is the job that executes arbitrary repository

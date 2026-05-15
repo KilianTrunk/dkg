@@ -165,20 +165,54 @@ export function registerChatTools(
           text,
           ...(contextGraphId ? { contextGraphId } : {}),
         });
-        if (!result.delivered) {
-          const reason = result.error ?? 'unknown error';
+        if (result.delivered) {
+          return ok(`Delivered to ${to}.`);
+        }
+        const reason = result.error ?? 'unknown error';
+        // ACL rejections are NOT queued (the daemon returns delivered=false
+        // without enqueuing because no retry will ever succeed against an
+        // intentional rejection). Surface the actionable guidance so the
+        // operator can fix the ACL on the recipient side.
+        if (reason.includes('unauthorized')) {
           return errResult(
             `Message to ${to} was NOT delivered: ${reason}.\n\n` +
-              (reason.includes('unauthorized')
-                ? 'The receiver rejected this message via its chat ACL. ' +
-                  'Ask the operator on the other node to either:\n' +
-                  '  - add this node to their `chat.acl.peerAllowlist`, or\n' +
-                  '  - add this node as a member of the shared context graph they have scoped to, or\n' +
-                  '  - relax their ACL mode if they were testing.'
-                : 'Retry after a few seconds; if it persists, ask the operator to verify the peer is online (`dkg_status`).'),
+              'The receiver rejected this message via its chat ACL. ' +
+              'Ask the operator on the other node to either:\n' +
+              '  - add this node to their `chat.acl.peerAllowlist`, or\n' +
+              '  - add this node as a member of the shared context graph they have scoped to, or\n' +
+              '  - relax their ACL mode if they were testing.',
           );
         }
-        return ok(`Delivered to ${to}.`);
+        // Transport failure → daemon enqueued for retry. Surface the
+        // queued state to the model so it can tell the operator
+        // "queued, will retry" instead of presenting it as a hard
+        // failure that needs immediate re-send. The retry runs
+        // asynchronously in the daemon (periodic tick + opportunistic
+        // flush on the recipient's next reconnect); the operator
+        // doesn't need to do anything unless the recipient is offline
+        // for >24h (default outbox max age). MessageOutbox PR.
+        if (result.queued) {
+          const nextAttempt = result.nextAttemptAtMs
+            ? formatTs(result.nextAttemptAtMs)
+            : 'unknown';
+          const attempts = result.attempts ?? 1;
+          return ok(
+            `Message to ${to} is QUEUED for retry (attempt #${attempts} just failed: ${reason}).\n\n` +
+              `The daemon will retry automatically — next attempt at ${nextAttempt}, ` +
+              `or sooner if the recipient peer reconnects in the meantime. ` +
+              `No action needed unless ${to} is offline for >24h. ` +
+              `Operator can check pending state with \`dkg_status\` (or just wait — ` +
+              `delivery happens in the background and the recipient will see the message ` +
+              `as soon as the transport recovers).`,
+          );
+        }
+        // delivered=false AND not queued — fall through to legacy error
+        // shape so old behavior is preserved if a future daemon version
+        // returns this shape (shouldn't happen in v10.0.0+).
+        return errResult(
+          `Message to ${to} was NOT delivered: ${reason}.\n\n` +
+            'Retry after a few seconds; if it persists, ask the operator to verify the peer is online (`dkg_status`).',
+        );
       } catch (e) {
         return errResult(`Failed to send message to ${to}: ${formatError(e)}`);
       }

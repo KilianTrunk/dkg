@@ -229,7 +229,24 @@ export class DkgClient {
     to: string;
     text: string;
     contextGraphId?: string;
-  }): Promise<{ delivered: boolean; error?: string; phases?: Record<string, number> }> {
+  }): Promise<{
+    delivered: boolean;
+    /**
+     * True iff `delivered=false` and the daemon enqueued the message
+     * for retry in its in-memory chat outbox. Surfaced to the model so
+     * it can tell the operator "queued for delivery" instead of an
+     * opaque error. Added in the MessageOutbox PR.
+     */
+    queued?: boolean;
+    /** Outbox key fragment; stable across retries. */
+    messageId?: string;
+    /** Number of failed attempts so far (1 on first failure). */
+    attempts?: number;
+    /** Epoch-ms when the next retry is due. */
+    nextAttemptAtMs?: number;
+    error?: string;
+    phases?: Record<string, number>;
+  }> {
     const body: Record<string, unknown> = { to: args.to, text: args.text };
     if (args.contextGraphId) body.contextGraphId = args.contextGraphId;
     return this.request('POST', '/api/chat', body);

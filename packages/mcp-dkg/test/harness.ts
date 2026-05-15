@@ -418,8 +418,20 @@ export class FakeClient {
     text: string;
     contextGraphId?: string;
   }> = [];
-  /** Toggle to make `sendChat` return a delivery failure with custom error. */
-  chatDeliveryOverride: { delivered: boolean; error?: string } | null = null;
+  /**
+   * Toggle to make `sendChat` return a custom delivery result. Shape
+   * matches the DkgClient.sendChat return — supports the new
+   * `queued/messageId/attempts/nextAttemptAtMs` fields added in the
+   * MessageOutbox PR alongside the legacy `delivered/error` shape.
+   */
+  chatDeliveryOverride: {
+    delivered: boolean;
+    queued?: boolean;
+    messageId?: string;
+    attempts?: number;
+    nextAttemptAtMs?: number;
+    error?: string;
+  } | null = null;
   /** Used by `buildPeerNameMap` to resolve friendly names. */
   agents: Array<{ peerId: string; name: string }> = [];
 

@@ -103,7 +103,7 @@ describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
       expect(body).toMatch(/peerAllowlist|context graph|ACL/i);
     });
 
-    it('surfaces transport/timeout errors verbatim', async () => {
+    it('surfaces transport/timeout errors verbatim when daemon did NOT queue', async () => {
       client.chatDeliveryOverride = {
         delivered: false,
         error: 'PEER_NOT_FOUND',
@@ -114,6 +114,72 @@ describe('chat tools — dkg_send_message + dkg_check_inbox', () => {
       });
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toMatch(/PEER_NOT_FOUND/);
+    });
+
+    // MessageOutbox PR — daemon now queues transport-failed sends and
+    // returns `queued + attempts + nextAttemptAtMs` so the tool can
+    // surface "queued for retry" instead of presenting it as a hard
+    // failure. Original failure mode: operator typed message → cold
+    // dial returned `'no valid addresses for peer'` → tool surfaced
+    // hard error → operator re-typed and re-sent. New flow: daemon
+    // enqueues, tool says "queued, retrying", operator does nothing.
+    describe('queued state surfacing (MessageOutbox PR)', () => {
+      it('returns a NON-error result when daemon enqueued for retry', async () => {
+        client.chatDeliveryOverride = {
+          delivered: false,
+          queued: true,
+          messageId: 'd17f8b6e-c0d4-4a8c-9c4f-1234567890ab',
+          attempts: 1,
+          nextAttemptAtMs: 1715670005000,
+          error: 'The dial request has no valid addresses for peer',
+        };
+        const result = await server.call('dkg_send_message', {
+          to: 'lex-node',
+          text: 'are you there?',
+        });
+        expect(result.isError).toBeFalsy();
+        const body = result.content[0].text;
+        expect(body).toMatch(/QUEUED for retry/);
+        expect(body).toMatch(/attempt #1/);
+        expect(body).toMatch(/no valid addresses for peer/);
+        expect(body).toMatch(/next attempt at/);
+        expect(body).toMatch(/recipient peer reconnects/);
+      });
+
+      it('falls back to "next attempt at unknown" when nextAttemptAtMs missing', async () => {
+        client.chatDeliveryOverride = {
+          delivered: false,
+          queued: true,
+          attempts: 2,
+          error: 'Remote closed connection during opening',
+        };
+        const result = await server.call('dkg_send_message', {
+          to: 'lex-node',
+          text: 'follow-up',
+        });
+        expect(result.isError).toBeFalsy();
+        expect(result.content[0].text).toMatch(/QUEUED/);
+        expect(result.content[0].text).toMatch(/attempt #2/);
+        expect(result.content[0].text).toMatch(/next attempt at unknown/);
+      });
+
+      it('still surfaces ACL rejection as a hard error even with queued=undefined', async () => {
+        // ACL rejections are intentional — the daemon must NOT queue
+        // them (no retry will ever succeed). This test pins that
+        // behavior so a future change to the daemon's queueing logic
+        // can't accidentally start enqueuing ACL rejects and silently
+        // hide them from the operator.
+        client.chatDeliveryOverride = {
+          delivered: false,
+          error: 'unauthorized: sender is not an active member of cg-debug',
+        };
+        const result = await server.call('dkg_send_message', {
+          to: 'alice',
+          text: 'ping',
+        });
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toMatch(/peerAllowlist|ACL/);
+      });
     });
   });
 

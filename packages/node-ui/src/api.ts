@@ -2,10 +2,20 @@ import { type IncomingMessage, type ServerResponse } from 'node:http';
 import { join, resolve, relative, sep, isAbsolute } from 'node:path';
 import { createReadStream, existsSync } from 'node:fs';
 import { readFile, stat, realpath } from 'node:fs/promises';
-import { PayloadTooLargeError } from '@origintrail-official/dkg-core';
+import { PayloadTooLargeError, type RelayStats } from '@origintrail-official/dkg-core';
 import type { DashboardDB } from './db.js';
 import { type ChatMemoryManager } from './chat-memory.js';
 import type { MetricsCollector } from './metrics-collector.js';
+
+/**
+ * Live relay-stats provider — wraps `DKGNode.getRelayStats()`. Returns
+ * `null` when the node is not running a relay server (i.e. edge node)
+ * so the route can respond 404. The `/api/relay/stats` route reads
+ * this directly rather than going through the MetricsCollector path
+ * because it needs the per-reservee detail array, which is too large
+ * to persist in periodic snapshots.
+ */
+export type RelayStatsProvider = () => RelayStats | null;
 
 const MIME: Record<string, string> = {
   '.html': 'text/html',
@@ -87,6 +97,7 @@ export async function handleNodeUIRequest(
   llmSettings?: LlmSettingsCallbacks,
   telemetrySettings?: TelemetrySettingsCallbacks,
   corsOrigin?: string | null,
+  relayStatsProvider?: RelayStatsProvider,
 ): Promise<boolean> {
   (res as any).__corsOrigin = corsOrigin ?? null;
   const path = url.pathname;
@@ -113,6 +124,53 @@ export async function handleNodeUIRequest(
     const maxPoints = parseInt(url.searchParams.get('maxPoints') ?? '500', 10);
     const snapshots = db.getSnapshotHistory(from, to, maxPoints);
     return json(res, 200, { snapshots });
+  }
+
+  // --- Relay observability ---
+  //
+  // Live relay-server stats. Always 404 on edge nodes (no relay).
+  // Per-reservee detail is included here but NOT in the periodic
+  // snapshot table — the array is unbounded with reservation count
+  // and not useful for time-series graphing.
+  if (req.method === 'GET' && path === '/api/relay/stats') {
+    if (!relayStatsProvider) {
+      return json(res, 404, {
+        error: 'relay-stats-not-available',
+        message: 'This node is not running a relay server (set nodeRole: "core" + enableRelayServer: true).',
+      });
+    }
+    const stats = relayStatsProvider();
+    if (!stats) {
+      return json(res, 404, {
+        error: 'relay-stats-not-available',
+        message: 'Relay server not started or not yet ready.',
+      });
+    }
+    // Bigints don't survive JSON.stringify. Stringify the cumulative
+    // byte counters so dashboard clients see "12345678901234567890"
+    // (a string they can BigInt-parse) rather than a serialization
+    // error. Number-typed fields stay numeric.
+    return json(res, 200, {
+      capacity: stats.capacity,
+      reservationCount: stats.reservationCount,
+      activeCircuits: stats.activeCircuits,
+      utilization: stats.capacity > 0
+        ? Math.round((stats.reservationCount / stats.capacity) * 10000) / 100
+        : null,
+      bytesIn: stats.bytesIn.toString(),
+      bytesOut: stats.bytesOut.toString(),
+      reservations: stats.reservations.map((r) => ({
+        peerId: r.peerId,
+        expiryTs: r.expiryTs,
+        // Convenience: time-to-expiry in ms so dashboards don't have
+        // to compute it client-side. Negative if already expired (a
+        // libp2p teardown race we'd surface for debugging).
+        ttlMs: r.expiryTs != null ? r.expiryTs - Date.now() : null,
+        addr: r.addr,
+        limitDurationMs: r.limitDurationMs,
+        limitDataBytes: r.limitDataBytes,
+      })),
+    });
   }
 
   // --- Error hotspots ---

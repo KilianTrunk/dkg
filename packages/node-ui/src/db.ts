@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { join } from 'node:path';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const DEFAULT_RETENTION_DAYS = 90;
 
 export interface DashboardDBOptions {
@@ -61,7 +61,12 @@ export class DashboardDB {
           confirmed_kcs INTEGER,
           tentative_kcs INTEGER,
           rpc_latency_ms INTEGER,
-          rpc_healthy INTEGER
+          rpc_healthy INTEGER,
+          relay_capacity INTEGER,
+          relay_reservation_count INTEGER,
+          relay_active_circuits INTEGER,
+          relay_bytes_in INTEGER,
+          relay_bytes_out INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON metric_snapshots(ts);
 
@@ -267,6 +272,29 @@ export class DashboardDB {
       }
     }
 
+    if (version < 10) {
+      // Relay observability columns. Populated only on Core Nodes (relay
+      // server enabled); edge nodes leave them NULL since
+      // DKGNode.getRelayStats() returns null off-relay. Idempotent
+      // ALTER ADDs guarded by PRAGMA so re-running the migration on a
+      // partially-applied DB is safe.
+      const columns = this.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>;
+      const have = new Set(columns.map((c) => c.name));
+      const ensure = (col: string, type: string) => {
+        if (!have.has(col)) {
+          this.db.exec(`ALTER TABLE metric_snapshots ADD COLUMN ${col} ${type};`);
+        }
+      };
+      ensure('relay_capacity', 'INTEGER');
+      ensure('relay_reservation_count', 'INTEGER');
+      ensure('relay_active_circuits', 'INTEGER');
+      // BigInt-shaped totals stored as INTEGER (SQLite stores up to 8
+      // bytes signed = ~9.2e18 ≈ 9.2 EB, well above any realistic
+      // relay byte total before retention pruning kicks in).
+      ensure('relay_bytes_in', 'INTEGER');
+      ensure('relay_bytes_out', 'INTEGER');
+    }
+
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
     const savedRetention = this.db.prepare("SELECT value FROM settings WHERE key = 'retentionDays'").get() as { value: string } | undefined;
@@ -302,21 +330,40 @@ export class DashboardDB {
   // --- Metric snapshots ---
 
   insertSnapshot(snap: MetricSnapshotRow): void {
+    // Default the v10 relay columns to null when the caller passes a
+    // pre-v10-shaped row. Better-sqlite3 throws "Missing named parameter"
+    // for any `@field` not present on the param object, so we can't rely
+    // on undefined here — coerce to an explicit null. Production callers
+    // (MetricsCollector) always supply these fields; this just keeps the
+    // surface backward-compatible for test fixtures and any external
+    // consumers of DashboardDB.insertSnapshot().
+    const row: MetricSnapshotRow = {
+      ...snap,
+      relay_capacity: snap.relay_capacity ?? null,
+      relay_reservation_count: snap.relay_reservation_count ?? null,
+      relay_active_circuits: snap.relay_active_circuits ?? null,
+      relay_bytes_in: snap.relay_bytes_in ?? null,
+      relay_bytes_out: snap.relay_bytes_out ?? null,
+    };
     this.stmt('insertSnapshot', `
       INSERT INTO metric_snapshots (
         ts, cpu_percent, mem_used_bytes, mem_total_bytes,
         disk_used_bytes, disk_total_bytes, heap_used_bytes, uptime_seconds,
         peer_count, direct_peers, relayed_peers, mesh_peers, contextGraph_count,
         total_triples, total_kcs, total_kas, store_bytes,
-        confirmed_kcs, tentative_kcs, rpc_latency_ms, rpc_healthy
+        confirmed_kcs, tentative_kcs, rpc_latency_ms, rpc_healthy,
+        relay_capacity, relay_reservation_count, relay_active_circuits,
+        relay_bytes_in, relay_bytes_out
       ) VALUES (
         @ts, @cpu_percent, @mem_used_bytes, @mem_total_bytes,
         @disk_used_bytes, @disk_total_bytes, @heap_used_bytes, @uptime_seconds,
         @peer_count, @direct_peers, @relayed_peers, @mesh_peers, @contextGraph_count,
         @total_triples, @total_kcs, @total_kas, @store_bytes,
-        @confirmed_kcs, @tentative_kcs, @rpc_latency_ms, @rpc_healthy
+        @confirmed_kcs, @tentative_kcs, @rpc_latency_ms, @rpc_healthy,
+        @relay_capacity, @relay_reservation_count, @relay_active_circuits,
+        @relay_bytes_in, @relay_bytes_out
       )
-    `).run(snap);
+    `).run(row);
   }
 
   getLatestSnapshot(): MetricSnapshotRow | undefined {
@@ -1370,6 +1417,24 @@ export interface MetricSnapshotRow {
   tentative_kcs: number | null;
   rpc_latency_ms: number | null;
   rpc_healthy: number | null;
+  /**
+   * Operator-configured relay reservation cap (DKGNodeConfig.relayServerCapacity).
+   * NULL on edge nodes (no relay server) and on rows written by pre-v10 collectors.
+   */
+  relay_capacity: number | null;
+  /** Live count of held reservations at snapshot time. NULL off-relay. */
+  relay_reservation_count: number | null;
+  /** Open `/p2p-circuit` connections at snapshot time (forwarded traffic in flight). NULL off-relay. */
+  relay_active_circuits: number | null;
+  /**
+   * Total bytes seen on the SOURCE side of `/p2p-circuit` connections since the
+   * relay started. Stored as plain integer (SQLite INTEGER is 8 bytes signed
+   * = ~9.2e18, well above any realistic relay byte total before retention pruning).
+   * NULL off-relay or on pre-v10 rows.
+   */
+  relay_bytes_in: number | null;
+  /** Same as relay_bytes_in but for the SINK side (bytes flowing out to the reservee). */
+  relay_bytes_out: number | null;
 }
 
 export interface OperationRow {

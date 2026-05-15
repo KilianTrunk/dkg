@@ -1049,6 +1049,24 @@ export async function runDaemonInner(
     },
     getRpcLatencyMs: async () => 0,
     isRpcHealthy: async () => true,
+    getRelayStats: () => {
+      // Returns null on edge nodes (no relay server); the collector
+      // tolerates undefined/null and writes the relay_* columns as
+      // NULL in that case.
+      const stats = agent.node.getRelayStats();
+      if (!stats) return null;
+      // Strip the unbounded `reservations[]` array — that lives only
+      // on the live `/api/relay/stats` route, not in the periodic
+      // SQLite snapshot. See RelayStatsSnapshot docstring in
+      // metrics-collector.ts for the full rationale.
+      return {
+        capacity: stats.capacity,
+        reservationCount: stats.reservationCount,
+        activeCircuits: stats.activeCircuits,
+        bytesIn: stats.bytesIn,
+        bytesOut: stats.bytesOut,
+      };
+    },
   };
 
   const metricsCollector = new MetricsCollector(
@@ -1776,7 +1794,7 @@ export async function runDaemonInner(
 
       // Node UI routes (metrics, operations, logs, saved queries, chat, static UI)
       const firstToken = validTokens.size > 0 ? validTokens.values().next().value as string : undefined;
-      const handled = await handleNodeUIRequest(req, res, reqUrl, dashDb, nodeUiStaticDir, undefined, metricsCollector, authEnabled ? firstToken : undefined, memoryManager, llmSettings, telemetrySettings, resolveCorsOrigin(req, corsAllowed));
+      const handled = await handleNodeUIRequest(req, res, reqUrl, dashDb, nodeUiStaticDir, undefined, metricsCollector, authEnabled ? firstToken : undefined, memoryManager, llmSettings, telemetrySettings, resolveCorsOrigin(req, corsAllowed), () => agent.node.getRelayStats());
       if (handled) return;
 
       await handleRequest(

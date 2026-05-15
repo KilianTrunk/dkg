@@ -148,4 +148,126 @@ describe('MetricsCollector', () => {
     expect(snap2.cpu_percent).toBeTypeOf('number');
     expect(snap2.cpu_percent).toBeGreaterThanOrEqual(0);
   });
+
+  // ─── PR2: Relay observability ────────────────────────────────────
+  //
+  // The relay-server columns (relay_capacity, relay_reservation_count,
+  // relay_active_circuits, relay_bytes_in, relay_bytes_out) are NULL
+  // on edge nodes (sources without `getRelayStats`) and populated
+  // from the source on Core Nodes. These tests pin the contract.
+
+  describe('relay-stats integration', () => {
+    it('omits getRelayStats on edge sources → all relay_* columns null', async () => {
+      const collector = new MetricsCollector(db, mockSource(), dir);
+      const snap = await collector.collect();
+      expect(snap.relay_capacity).toBeNull();
+      expect(snap.relay_reservation_count).toBeNull();
+      expect(snap.relay_active_circuits).toBeNull();
+      expect(snap.relay_bytes_in).toBeNull();
+      expect(snap.relay_bytes_out).toBeNull();
+    });
+
+    it('passes through relay snapshot when source provides it (Core Node path)', async () => {
+      const collector = new MetricsCollector(
+        db,
+        mockSource({
+          getRelayStats: () => ({
+            capacity: 1024,
+            reservationCount: 42,
+            activeCircuits: 17,
+            bytesIn: 123_456_789n,
+            bytesOut: 987_654_321n,
+          }),
+        }),
+        dir,
+      );
+      const snap = await collector.collect();
+      expect(snap.relay_capacity).toBe(1024);
+      expect(snap.relay_reservation_count).toBe(42);
+      expect(snap.relay_active_circuits).toBe(17);
+      expect(snap.relay_bytes_in).toBe(123_456_789);
+      expect(snap.relay_bytes_out).toBe(987_654_321);
+    });
+
+    it('returns null relay columns when source.getRelayStats() returns null (edge tier)', async () => {
+      const collector = new MetricsCollector(
+        db,
+        mockSource({ getRelayStats: () => null }),
+        dir,
+      );
+      const snap = await collector.collect();
+      expect(snap.relay_capacity).toBeNull();
+      expect(snap.relay_reservation_count).toBeNull();
+      expect(snap.relay_active_circuits).toBeNull();
+    });
+
+    it('clamps oversized bigint byte totals to MAX_SAFE_INTEGER (defence in depth)', async () => {
+      // 9 PB ≈ 9.0e15 fits MAX_SAFE_INTEGER (9.007e15) but 10 PB doesn't.
+      // The clamp guarantees SQLite gets a finite Number even in the
+      // pathological "relay forwarded EB-scale traffic in one
+      // retention window" case. If you ever see this value in
+      // production, the snapshot column representation should
+      // switch to deltas — see the helper docstring.
+      const collector = new MetricsCollector(
+        db,
+        mockSource({
+          getRelayStats: () => ({
+            capacity: 1024,
+            reservationCount: 1,
+            activeCircuits: 1,
+            bytesIn: BigInt(Number.MAX_SAFE_INTEGER) + 1_000_000n,
+            bytesOut: 0n,
+          }),
+        }),
+        dir,
+      );
+      const snap = await collector.collect();
+      expect(snap.relay_bytes_in).toBe(Number.MAX_SAFE_INTEGER);
+      expect(snap.relay_bytes_out).toBe(0);
+    });
+
+    it('persists relay columns through insertSnapshot → getLatestSnapshot round-trip (schema v10)', async () => {
+      const collector = new MetricsCollector(
+        db,
+        mockSource({
+          getRelayStats: () => ({
+            capacity: 512,
+            reservationCount: 7,
+            activeCircuits: 3,
+            bytesIn: 2_048n,
+            bytesOut: 4_096n,
+          }),
+        }),
+        dir,
+      );
+      await collector.collectAndStore();
+
+      const stored = db.getLatestSnapshot();
+      expect(stored).toBeDefined();
+      expect(stored!.relay_capacity).toBe(512);
+      expect(stored!.relay_reservation_count).toBe(7);
+      expect(stored!.relay_active_circuits).toBe(3);
+      expect(stored!.relay_bytes_in).toBe(2_048);
+      expect(stored!.relay_bytes_out).toBe(4_096);
+    });
+
+    it('isolates relay-source errors — non-relay metrics still ship', async () => {
+      const collector = new MetricsCollector(
+        db,
+        mockSource({
+          getRelayStats: () => {
+            throw new Error('relay service exploded');
+          },
+        }),
+        dir,
+      );
+      const snap = await collector.collect();
+      // Non-relay metrics survive the error path.
+      expect(snap.peer_count).toBe(5);
+      expect(snap.total_triples).toBe(1000);
+      // Relay columns end up NULL because the source threw.
+      expect(snap.relay_capacity).toBeNull();
+      expect(snap.relay_bytes_in).toBeNull();
+    });
+  });
 });

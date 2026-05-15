@@ -18,6 +18,7 @@ import { peerIdFromString } from '@libp2p/peer-id';
 import { ed25519GetPublicKey } from './crypto/ed25519.js';
 import type { ConnectionTransport, DKGNodeConfig } from './types.js';
 import { DHT_PROTOCOL, DKG_GOSSIP_MAX_RPC_BYTES } from './constants.js';
+import { RelayMetricsAdapter, type RelayBytesSnapshot } from './libp2p-metrics-adapter.js';
 
 export interface DKGServices extends Record<string, unknown> {
   dht: KadDHT;
@@ -282,6 +283,22 @@ export class DKGNode {
    * the new reservation on the wire.
    */
   private relayReservationRedialAt: Map<string, number> = new Map();
+  /**
+   * In-process libp2p Metrics adapter. Instantiated only when this node
+   * runs a relay server (`enableRelay` true) — its sole job is counting
+   * bytes that flow through `/p2p-circuit` forwarded connections so the
+   * dashboard can surface "actual relay traffic served" alongside the
+   * static reservation count. Null on edge nodes; `getRelayStats()`
+   * returns null in that case.
+   */
+  private relayMetrics: RelayMetricsAdapter | null = null;
+  /**
+   * Cached value of `relayServerCapacity` after defaulting + role-gating
+   * applied by `start()`. Exposed via `getRelayStats()` so consumers can
+   * compute utilization (reservationCount / capacity) without re-reading
+   * the config.
+   */
+  private relayCapacity: number | null = null;
 
   constructor(config: DKGNodeConfig = {}) {
     this.config = config;
@@ -433,6 +450,14 @@ export class DKGNode {
     }
 
     if (enableRelay && relayCaps) {
+      // Stash the capacity for later getRelayStats() so consumers can
+      // compute utilization without re-deriving it.
+      this.relayCapacity = relayCaps.maxReservations;
+      // Instantiate the byte-counting Metrics adapter ONLY when the
+      // relay server is enabled — there's no point counting relay
+      // bytes on a node that isn't relaying. The adapter is passed
+      // into createLibp2p() below.
+      this.relayMetrics = new RelayMetricsAdapter();
       services.relay = circuitRelayServer({
         // Bumped from the libp2p default (no cap → unlimited but
         // bottlenecked by maxOutboundStopStreams=300) to the derived
@@ -500,6 +525,10 @@ export class DKGNode {
         // pressure and wider headroom adds nothing.
         maxConnections: relayCaps?.maxConnections ?? EDGE_NODE_MAX_CONNECTIONS,
       },
+      // Inject the byte-counting Metrics adapter only on Core Nodes
+      // (relay enabled). On edge nodes libp2p uses its built-in
+      // no-op metrics; the adapter is purely additive.
+      ...(this.relayMetrics ? { metrics: () => this.relayMetrics! } : {}),
     } as any);
 
     this.setupConnectionObservability();
@@ -859,8 +888,124 @@ export class DKGNode {
     return this.node !== null;
   }
 
+  /**
+   * Live relay-server statistics. Returns `null` on edge nodes (no
+   * relay server enabled). On Core Nodes returns:
+   *
+   *   - `capacity`         — operator-configured maxReservations
+   *   - `reservationCount` — how many reservations are currently held
+   *   - `activeCircuits`   — count of `/p2p-circuit` connections open RIGHT NOW
+   *                          (these are connections this node is currently
+   *                          forwarding for; distinct from reservations,
+   *                          which are the reservee's RIGHT to be relayed)
+   *   - `bytesIn` / `bytesOut`  — total bytes counted on the source/sink
+   *                                of every `/p2p-circuit` connection since
+   *                                relay startup. BigInt because a busy
+   *                                Core Node can saturate Number.MAX_SAFE
+   *                                in a few weeks of high traffic.
+   *   - `reservations[]`   — per-reservee detail: peerId, expiry timestamp,
+   *                          optional limit copy. Suitable for
+   *                          /api/relay/stats but NOT for the periodic
+   *                          snapshot table (it's unbounded).
+   */
+  getRelayStats(): RelayStats | null {
+    if (!this.node || !this.relayMetrics) return null;
+
+    const relayService = (this.node.services as any).relay;
+    if (!relayService) return null;
+
+    const reservationsMap: Map<{ toString(): string }, RelayReservationInfo> | undefined =
+      relayService.reservations;
+    const reservations: RelayReservationDetail[] = [];
+    let reservationCount = 0;
+    if (reservationsMap && typeof reservationsMap.forEach === 'function') {
+      reservationsMap.forEach((reservation, peerId) => {
+        reservationCount += 1;
+        try {
+          const expiry = reservation?.expiry instanceof Date ? reservation.expiry.getTime() : null;
+          const addr = reservation?.addr?.toString?.() ?? null;
+          reservations.push({
+            peerId: peerId.toString(),
+            expiryTs: expiry,
+            addr,
+            limitDurationMs:
+              typeof reservation?.limit?.duration === 'number'
+                ? reservation.limit.duration
+                : null,
+            limitDataBytes:
+              typeof reservation?.limit?.data === 'bigint'
+                ? Number(reservation.limit.data)
+                : typeof reservation?.limit?.data === 'number'
+                  ? reservation.limit.data
+                  : null,
+          });
+        } catch {
+          // Best-effort — a single misshapen reservation entry must
+          // not poison the whole stats payload.
+        }
+      });
+    }
+
+    let activeCircuits = 0;
+    try {
+      activeCircuits = this.node
+        .getConnections()
+        .filter((c) => c.remoteAddr?.toString?.().includes('/p2p-circuit'))
+        .length;
+    } catch {
+      /* defensive: connection list iteration shouldn't throw */
+    }
+
+    const bytes = this.relayMetrics.snapshot();
+
+    return {
+      capacity: this.relayCapacity ?? 0,
+      reservationCount,
+      activeCircuits,
+      bytesIn: bytes.bytesIn,
+      bytesOut: bytes.bytesOut,
+      reservations,
+    };
+  }
+
   private requireNode(): Libp2p<DKGServices> {
     if (!this.node) throw new Error('DKGNode not started');
     return this.node;
   }
+}
+
+interface RelayReservationInfo {
+  expiry?: Date;
+  addr?: { toString(): string };
+  limit?: { duration?: number; data?: bigint | number };
+}
+
+/** Per-reservee detail returned by `getRelayStats()`. */
+export interface RelayReservationDetail {
+  /** PeerId of the reservee (the node holding the reservation). */
+  peerId: string;
+  /** Reservation expiry as a unix-ms timestamp; null if upstream omits it. */
+  expiryTs: number | null;
+  /** Multiaddr string the reservation was issued for; null if unreadable. */
+  addr: string | null;
+  /** Per-circuit duration cap in ms, or null if upstream omits it. */
+  limitDurationMs: number | null;
+  /** Per-circuit data cap in bytes, or null if upstream omits it. */
+  limitDataBytes: number | null;
+}
+
+/** Live relay-server statistics returned by `DKGNode.getRelayStats()`. */
+export interface RelayStats {
+  /** Operator-configured maxReservations cap. */
+  capacity: number;
+  /** Number of reservations currently held. Always ≤ capacity in healthy state. */
+  reservationCount: number;
+  /** Open `/p2p-circuit` connections RIGHT NOW (forwarding traffic). */
+  activeCircuits: number;
+  /** Total bytes seen on the source side of forwarded conns since startup. */
+  bytesIn: bigint;
+  /** Total bytes seen on the sink side of forwarded conns since startup. */
+  bytesOut: bigint;
+  /** Per-reservee detail (unbounded; suitable for the /api/relay/stats route, NOT for periodic snapshots). */
+  reservations: RelayReservationDetail[];
 }

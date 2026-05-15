@@ -6,6 +6,23 @@ import { promisify } from 'node:util';
 const statfsAsync = promisify(statfs);
 import type { DashboardDB, MetricSnapshotRow } from './db.js';
 
+/**
+ * Aggregate relay-server snapshot consumed by MetricsCollector. Always
+ * has the same shape as `RelayStats` from `@origintrail-official/dkg-core`
+ * minus the unbounded `reservations[]` array — that lives only on the
+ * live `/api/relay/stats` route, not in the periodic SQLite snapshot
+ * (per-reservee detail would blow up the snapshot row size and isn't
+ * useful for time-series graphing). The source returns `null` when the
+ * node is not running a relay server.
+ */
+export interface RelayStatsSnapshot {
+  capacity: number;
+  reservationCount: number;
+  activeCircuits: number;
+  bytesIn: bigint;
+  bytesOut: bigint;
+}
+
 export interface MetricsSource {
   getPeerCount(): number;
   getDirectPeerCount(): number;
@@ -20,9 +37,28 @@ export interface MetricsSource {
   getStoreBytes(): Promise<number>;
   getRpcLatencyMs(): Promise<number>;
   isRpcHealthy(): Promise<boolean>;
+  /**
+   * Optional. Returns a relay snapshot on Core Nodes (relay server enabled),
+   * or null on edge nodes. Method is optional so existing tests / external
+   * consumers of MetricsSource don't have to stub it.
+   */
+  getRelayStats?(): RelayStatsSnapshot | null;
 }
 
 const SNAPSHOT_INTERVAL_MS = 120_000; // 2 minutes
+
+/**
+ * Clamp a bigint relay byte count to a safe JS Number for SQLite storage.
+ * Returns Number.MAX_SAFE_INTEGER (9.007e15) if the value would overflow,
+ * which is harmless for graphing — if you ever see that exact value in a
+ * snapshot column, the relay has forwarded ≥9 PB in this retention window
+ * and we should switch the column representation to per-snapshot deltas.
+ */
+function bigintToSafeNumber(v: bigint): number {
+  if (v > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
+  if (v < 0n) return 0;
+  return Number(v);
+}
 
 /**
  * Periodically collects system, network, knowledge, and chain metrics
@@ -114,6 +150,30 @@ export class MetricsCollector {
     try { tentativeKCs = await this.source.getTentativeKCs(); } catch { /* ignore */ }
     try { contextGraphCount = await this.source.getContextGraphCount(); } catch { /* ignore */ }
 
+    let relayCapacity: number | null = null;
+    let relayReservationCount: number | null = null;
+    let relayActiveCircuits: number | null = null;
+    let relayBytesIn: number | null = null;
+    let relayBytesOut: number | null = null;
+    try {
+      const relay = this.source.getRelayStats?.();
+      if (relay) {
+        relayCapacity = relay.capacity;
+        relayReservationCount = relay.reservationCount;
+        relayActiveCircuits = relay.activeCircuits;
+        // Clamp BigInt totals to Number for SQLite. Snapshot retention
+        // pruning runs on a 90-day default cutoff, so the cumulative
+        // total inside any retained row stays comfortably below
+        // Number.MAX_SAFE_INTEGER (9.007e15) for any realistic relay
+        // (would need ~9 PB of forwarded traffic in a single retention
+        // window to overflow). If we ever hit that scale the right
+        // answer is per-snapshot DELTA bytes, not raw cumulative; for
+        // now Number is fine.
+        relayBytesIn = bigintToSafeNumber(relay.bytesIn);
+        relayBytesOut = bigintToSafeNumber(relay.bytesOut);
+      }
+    } catch { /* ignore — collector keeps shipping non-relay metrics */ }
+
     return {
       ts: Date.now(),
       cpu_percent: cpuPercent,
@@ -136,6 +196,11 @@ export class MetricsCollector {
       tentative_kcs: tentativeKCs,
       rpc_latency_ms: rpcLatency,
       rpc_healthy: rpcHealthy,
+      relay_capacity: relayCapacity,
+      relay_reservation_count: relayReservationCount,
+      relay_active_circuits: relayActiveCircuits,
+      relay_bytes_in: relayBytesIn,
+      relay_bytes_out: relayBytesOut,
     };
   }
 

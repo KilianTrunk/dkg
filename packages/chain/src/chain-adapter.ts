@@ -206,11 +206,8 @@ export interface PermanentPublishParams {
 
 // ----- V10 Publishing Conviction NFT types -----
 
-/**
- * Mirrors `DKGPublishingConvictionNFT.getAccountInfo(accountId)` — the
- * V10 read shape. The adapter returns `null` when the NFT contract is
- * not deployed on this chain or the account does not exist.
- */
+/** Mirrors `DKGPublishingConvictionNFT.getAccountInfo`; adapter returns
+ *  null when the NFT is undeployed or the account is missing. */
 export interface V10ConvictionAccountInfo {
   owner: string;
   committedTRAC: bigint;
@@ -613,14 +610,10 @@ export interface ChainAdapter {
   getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
 
   // ----- V10 Publishing Conviction NFT write+read surface -----
-  //
-  // Wraps `DKGPublishingConvictionNFT`. Optional on the adapter surface
-  // (the mock / no-chain adapters model these in TB-0002); callers treat
-  // an absent method or `null`/`0n`/`false` return as "no PCA path".
-  // `createConvictionAccount` mints the NFT to the signer; `topUp` /
-  // `registerConvictionAgent` / `deregisterConvictionAgent` are
-  // owner-gated on chain — the adapter MUST surface the owner revert,
-  // never swallow it (the daemon maps it to HTTP 403).
+  // Wraps `DKGPublishingConvictionNFT`. Optional (mock/no-chain model
+  // it); absent method or null/0n/false = "no PCA path". topUp/register/
+  // deregister are owner-gated — MUST surface the owner revert (→ 403),
+  // never swallow it.
 
   createConvictionAccount?(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult>;
   topUpConvictionAccount?(accountId: bigint, amount: bigint): Promise<TxResult>;

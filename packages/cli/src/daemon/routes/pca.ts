@@ -1,26 +1,7 @@
-// daemon/routes/pca.ts
-//
-// Route handlers for the V10 Publishing Conviction NFT operator surface.
-// Lives in its own file (instead of folding into `assertion.ts`) because
-// a conviction account is a distinct economic primitive: it's the
-// off-chain expression of the on-chain `DKGPublishingConvictionNFT`
-// ERC-721 (deploy script 053, Hub key `DKGPublishingConvictionNFT`,
-// invoked directly by `KnowledgeAssetsV10.publish()`), driven by an
-// operator standing up runbook fixtures, not by the publish/query path.
-//
-// The routes delegate to the V10 agent facade methods in
-// `packages/agent/src/dkg-agent.ts` (createConvictionAccount,
-// topUpConvictionAccount, registerConvictionAgent,
-// deregisterConvictionAgent, isConvictionAgent, settleConvictionAccount,
-// getConvictionAccountInfo), which in turn delegate to the chain adapter.
-// `settle` is permissionless on chain; `topUp` / `registerAgent` /
-// `deregisterAgent` are owner-gated by the on-chain owner check, so the
-// daemon must run as the PCA NFT owner EOA for those routes to land —
-// the owner revert surfaces as HTTP 403.
-//
-// Adapters that don't expose the underlying chain methods (no-chain
-// mode) return 503 — same convention as the existing
-// `/api/kc/:id/author` route.
+// V10 Publishing Conviction NFT operator routes. Delegate to the agent
+// facade (see ARCHITECTURE.md § #519). Writes except createAccount are
+// owner-gated on chain, so the daemon EOA must be the PCA NFT owner;
+// owner revert → 403, no-chain adapter → 503.
 
 import { ethers } from 'ethers';
 import type { V10ConvictionAccountInfo } from '@origintrail-official/dkg-chain';
@@ -42,18 +23,13 @@ function safeParseJson(body: string): { ok: true; value: any } | { ok: false; er
   }
 }
 
-// Owner-gated V10 writes (createAccount aside) revert `NotAccountOwner`
-// when the daemon EOA is not the NFT owner. Surface that as 403 so
-// callers can distinguish "wrong daemon EOA" from a 500 RPC failure or
-// a 503 no-chain adapter. `NotAccountAdmin` is kept for legacy parity.
+// Owner-gated write by a non-owner daemon EOA → 403 (distinct from 500
+// RPC / 503 no-chain). `NotAccountAdmin` kept for legacy parity.
 function isOwnerRevert(msg: string): boolean {
   return /NotAccountOwner|NotAccountAdmin/i.test(msg);
 }
 
-// NoChainAdapter implements the V10 PCA methods but throws `noChain()`
-// ("No blockchain configured ...") rather than returning null. Treat
-// that throw the same as a null facade result: HTTP 503 unavailable,
-// not a 500 RPC failure.
+// NoChainAdapter throws `noChain()` instead of returning null → 503.
 function isNoChain(msg: string): boolean {
   return /No blockchain configured/i.test(msg);
 }
@@ -113,10 +89,8 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
 
   if (!path.startsWith('/api/pca')) return;
 
-  // POST /api/pca — mint a new V10 conviction NFT to the daemon's EOA,
-  // which becomes the on-chain owner. The lock duration is a global
-  // protocol parameter, so the body carries no `lockEpochs`.
-  // Body: { tokens: "100000" }
+  // POST /api/pca — mint a conviction NFT to the daemon EOA (the owner).
+  // No `lockEpochs` (global protocol param). Body: { tokens: "100000" }
   if (req.method === 'POST' && path === '/api/pca') {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body);
@@ -276,9 +250,8 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
-  // GET /api/pca/:id — read-only V10 conviction NFT snapshot (owner,
-  // committed TRAC, top-up buffer, discount, agentCount). Optional
-  // ?key=0x... probes whether that address is a registered agent.
+  // GET /api/pca/:id — V10 conviction NFT snapshot. Optional ?key=0x...
+  // probes whether that address is a registered agent.
   if (req.method === 'GET' && /^\/api\/pca\/[^/]+$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);
@@ -288,9 +261,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     try {
       const info = await agent.getConvictionAccountInfo(accountId);
       if (info === null) {
-        // Either the chain adapter doesn't expose the view, or the
-        // account doesn't exist. The adapter contract returns null
-        // for both — distinguish by probing the method itself.
+        // null = view absent OR account missing; disambiguate by probe.
         if (typeof (agent as any).chain?.getConvictionAccountInfo !== 'function') {
           return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
         }

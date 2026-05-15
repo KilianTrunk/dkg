@@ -3956,18 +3956,11 @@ export class DKGAgent {
   }
 
   /**
-   * V10 Publishing Conviction NFT facade for the agent-provenance runbook
-   * surface. Thin wrappers over the chain adapter — the agent keeps no PCA
-   * state of its own; the on-chain `DKGPublishingConvictionNFT` is the
-   * source of truth. The wrappers exist so daemon HTTP routes don't reach
-   * into the private `chain` field, mirroring `getKnowledgeCollectionAuthor`.
-   *
-   * `createConvictionAccount` mints the ERC-721 to the agent's configured
-   * EOA (no `lockEpochs` — it's a global protocol parameter). `topUp` /
-   * `registerConvictionAgent` / `deregisterConvictionAgent` are owner-gated
-   * on chain; the wrappers MUST NOT swallow the owner revert (the daemon
-   * maps it to HTTP 403). A `null` return means the adapter has no V10 PCA
-   * surface (no-chain / pre-V10 copy) — the daemon maps that to HTTP 503.
+   * V10 Publishing Conviction NFT facade — thin wrappers over the chain
+   * adapter (no local state) so daemon routes don't touch private `chain`.
+   * Owner-gated writes MUST NOT swallow the owner revert (daemon → 403);
+   * `null` = adapter has no V10 PCA surface (daemon → 503).
+   * See ARCHITECTURE.md § #519.
    */
   async createConvictionAccount(
     committedTRAC: bigint,

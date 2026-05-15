@@ -165,6 +165,17 @@ export interface DerivedRelayCaps {
 export type RelayCapacityValidation =
   | { ok: true; value: number }
   | { ok: false; reason: string };
+/**
+ * Largest `relayServerCapacity` that keeps every derived cap within
+ * JavaScript's safe-integer range. `deriveRelayCaps` produces values up
+ * to `capacity * RELAY_CAPACITY_MULTIPLIER` and feeds them straight to
+ * libp2p config, so the safe ceiling is `MAX_SAFE_INTEGER /
+ * RELAY_CAPACITY_MULTIPLIER`. Operator-supplied values above this would
+ * silently lose precision when scaled (Codex review on PR #524 round 4
+ * — the previous `Number.isInteger` check accepts e.g.
+ * `9007199254740993` which fails round-trip equality with itself).
+ */
+export const MAX_RELAY_SERVER_CAPACITY = Math.floor(Number.MAX_SAFE_INTEGER / RELAY_CAPACITY_MULTIPLIER);
 export function validateRelayServerCapacity(input: unknown): RelayCapacityValidation | null {
   if (input == null) return null;
   if (typeof input !== 'number') {
@@ -173,11 +184,21 @@ export function validateRelayServerCapacity(input: unknown): RelayCapacityValida
   if (!Number.isFinite(input)) {
     return { ok: false, reason: `expected finite number, got ${input}` };
   }
-  if (!Number.isInteger(input)) {
-    return { ok: false, reason: `expected integer, got ${input}` };
+  // `isSafeInteger` instead of `isInteger` — the latter accepts values
+  // above 2^53 that have already lost their integer identity (e.g.
+  // `9007199254740993 === 9007199254740992`), which would corrupt the
+  // multiplied caps `deriveRelayCaps` hands to libp2p.
+  if (!Number.isSafeInteger(input)) {
+    return { ok: false, reason: `expected safe integer, got ${input}` };
   }
   if (input < 1) {
     return { ok: false, reason: `expected >= 1, got ${input}` };
+  }
+  if (input > MAX_RELAY_SERVER_CAPACITY) {
+    return {
+      ok: false,
+      reason: `expected <= ${MAX_RELAY_SERVER_CAPACITY} (so capacity × ${RELAY_CAPACITY_MULTIPLIER} stays a safe integer), got ${input}`,
+    };
   }
   return { ok: true, value: input };
 }
@@ -195,9 +216,10 @@ export function validateRelayServerCapacity(input: unknown): RelayCapacityValida
  * a defensive backstop for direct callers.
  */
 export function deriveRelayCaps(capacity: number): DerivedRelayCaps {
-  if (!Number.isInteger(capacity) || capacity < 1) {
+  if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > MAX_RELAY_SERVER_CAPACITY) {
     throw new TypeError(
-      `deriveRelayCaps: capacity must be a positive integer, got ${capacity}`,
+      `deriveRelayCaps: capacity must be a safe positive integer ` +
+        `<= ${MAX_RELAY_SERVER_CAPACITY}, got ${capacity}`,
     );
   }
   const streamCap = capacity * RELAY_CAPACITY_MULTIPLIER;

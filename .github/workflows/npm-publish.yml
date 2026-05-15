@@ -1,6 +1,7 @@
-# Publish all public packages to NPM when a version tag is pushed.
-# Only fires on `v*` tags (e.g. `v10.0.0`, `v10.0.0-rc.8`), so
-# merges to main do NOT trigger a publish — only explicit releases do.
+# Publish all public packages to NPM when a semver version tag is pushed.
+# Only fires on tags matching `v<major>.<minor>.<patch>*` (e.g. `v10.0.0`,
+# `v10.0.0-rc.8`). Tags like `vnext` or `v-test` are ignored.
+# Merges to main do NOT trigger a publish — only explicit releases do.
 #
 # The npm dist-tag is derived from the version string:
 #   * `-rc.*`    → `--tag rc`     (release candidates)
@@ -42,7 +43,7 @@ name: NPM Publish
 
 on:
   push:
-    tags: ['v*']
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
 
 permissions:
   contents: read
@@ -185,18 +186,17 @@ jobs:
             HAS_TAG_PATTERN=$(echo "${CUSTOM_BRANCHES}" | jq --arg t "${ALLOWED_TAG_PATTERN}" -r 'any(. == $t)')
             HAS_BAD_WILDCARD=$(echo "${CUSTOM_BRANCHES}" | jq --arg b "${RELEASE_BRANCH}" --arg t "${ALLOWED_TAG_PATTERN}" -r 'any(. != $b and . != $t and test("\\*"))')
 
-            if [ "${HAS_BAD_WILDCARD}" = "true" ]; then
-              echo "::error title=npm-publish custom branch policy contains unexpected wildcard::Wildcards other than \`${ALLOWED_TAG_PATTERN}\` defeat the branch-scoping control. Allowed branches: ${CUSTOM_BRANCHES}"
-              exit 1
-            fi
+            # Validate every entry is exactly `main` or `v*` — nothing else.
+            # This catches `['main', 'staging']` (count=2 but staging is wrong)
+            # and wildcards like `release/*`.
             if [ "${HAS_RELEASE}" != "true" ]; then
               echo "::error title=npm-publish custom branch policy excludes release branch::Environment uses custom branch policies but \`${RELEASE_BRANCH}\` is not in the allow-list. Add it in repo Settings → Environments → npm-publish → Deployment branches. Allowed: ${CUSTOM_BRANCHES}"
               exit 1
             fi
-            EXPECTED_MAX=2
-            if [ "${BRANCH_COUNT}" -gt "${EXPECTED_MAX}" ]; then
-              EXTRA=$(echo "${CUSTOM_BRANCHES}" | jq --arg b "${RELEASE_BRANCH}" --arg t "${ALLOWED_TAG_PATTERN}" -c 'map(select(. != $b and . != $t))')
-              echo "::error title=npm-publish custom branch policy has extra entries::Allow-list contains ${BRANCH_COUNT} entries; expected at most ${EXPECTED_MAX} (\`${RELEASE_BRANCH}\` + optional \`${ALLOWED_TAG_PATTERN}\`). Remove extras: ${EXTRA}"
+            UNEXPECTED=$(echo "${CUSTOM_BRANCHES}" | jq --arg b "${RELEASE_BRANCH}" --arg t "${ALLOWED_TAG_PATTERN}" -c 'map(select(. != $b and . != $t))')
+            UNEXPECTED_COUNT=$(echo "${UNEXPECTED}" | jq 'length')
+            if [ "${UNEXPECTED_COUNT}" -gt 0 ]; then
+              echo "::error title=npm-publish custom branch policy has unexpected entries::Only \`${RELEASE_BRANCH}\` and \`${ALLOWED_TAG_PATTERN}\` are allowed. Remove: ${UNEXPECTED}"
               exit 1
             fi
             echo "✓ npm-publish deployment branch policy: custom allow-list ${CUSTOM_BRANCHES}"
@@ -206,6 +206,22 @@ jobs:
           fi
 
           echo "✓ npm-publish environment configured with ${REVIEWER_COUNT} required reviewer(s) (self-review blocked) + ${WAIT_TIMER}-min wait timer + scoped deployment branch policy"
+
+      - name: Verify tag points to a commit on the release branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG_SHA="${{ github.sha }}"
+          RELEASE_BRANCH=main
+          BRANCHES=$(gh api "repos/${GH_REPO}/commits/${TAG_SHA}/branches-where-head" --jq '[.[].name]' 2>/dev/null || echo '[]')
+          ON_RELEASE=$(echo "${BRANCHES}" | jq --arg b "${RELEASE_BRANCH}" 'any(. == $b)')
+          if [ "${ON_RELEASE}" != "true" ]; then
+            echo "::error title=Tag not on release branch::Tag ${{ github.ref_name }} (${TAG_SHA}) is not the HEAD of \`${RELEASE_BRANCH}\` or does not belong to it. Branches containing this commit: ${BRANCHES}. Push tags only from \`${RELEASE_BRANCH}\`."
+            exit 1
+          fi
+          echo "✓ Tag ${{ github.ref_name }} points to commit ${TAG_SHA} which is on ${RELEASE_BRANCH}"
 
   # BUILD AND PACK — runs WITHOUT `environment: npm-publish`, so NPM_TOKEN
   # is NOT in scope. This is the job that executes arbitrary repository
@@ -288,11 +304,37 @@ jobs:
       # Re-running tests here would block the publish for known-red
       # sentinel tests. See .test-audit/BUGS_FOUND.md.
 
+      - name: Validate git tag matches package.json versions
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VER="${TAG#v}"
+          echo "Git tag: ${TAG} → expected npm version: ${EXPECTED_VER}"
+          MISMATCHES=0
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const expected = '${EXPECTED_VER}';
+            const pkgsDir = path.join(process.cwd(), 'packages');
+            for (const dir of fs.readdirSync(pkgsDir)) {
+              const pkgPath = path.join(pkgsDir, dir, 'package.json');
+              if (!fs.existsSync(pkgPath)) continue;
+              const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+              if (pkg.private) continue;
+              if (pkg.version !== expected) {
+                console.error('MISMATCH: ' + pkg.name + '@' + pkg.version + ' (expected ' + expected + ')');
+                process.exitCode = 1;
+              } else {
+                console.log('✓ ' + pkg.name + '@' + pkg.version);
+              }
+            }
+          "
+
       - name: Derive npm dist-tag from git tag
         id: dist-tag
         run: |
-          TAG="${GITHUB_REF_NAME}"       # e.g. v10.0.0-rc.8 or v10.0.0
-          VER="${TAG#v}"                  # strip leading 'v'
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#v}"
           if [[ "$VER" == *-rc.* ]]; then
             echo "NPM_TAG=rc" >> "$GITHUB_OUTPUT"
           elif [[ "$VER" == *-beta.* ]]; then

@@ -102,6 +102,39 @@ To verify the live daemon's effective limit, look for the startup log line
 `[dkg-core] relay server: ulimit -n soft=<N> >= recommended <M>, ok` (or the
 WARN equivalent if the host needs tuning).
 
+## Edge tuning
+
+### Multi-reservation (NAT'd nodes)
+
+By default an edge node behind NAT holds **3 simultaneous circuit-relay
+reservations** instead of the single reservation it used to hold. Three
+gives N-2 tolerance — two relays can blink concurrently and incoming
+dialers still find a working circuit. Override with `relayReservationCount`
+in `config.json` when you want to dial up tolerance (max 16) or strip back
+down to 1 for the legacy behavior.
+
+```jsonc
+{
+  "nodeRole": "edge",
+  "relayPeers": [
+    "/dns4/relay-a.example.com/tcp/4001/p2p/12D3Koo...",
+    "/dns4/relay-b.example.com/tcp/4001/p2p/12D3Koo...",
+    "/dns4/relay-c.example.com/tcp/4001/p2p/12D3Koo..."
+  ],
+  "relayReservationCount": 3   // default; cap is 16
+}
+```
+
+The knob is **ignored when no `relayPeers` are configured** (a public node
+doesn't need relay reservations). Invalid values (0, negative, fractional,
+non-numeric, > 16) fall back to the default with an operator-facing warning.
+
+Reservation renewal is **automatic** — libp2p refreshes each reservation 5
+minutes before its 2-hour TTL expires, so no application-level renewal
+loop is required. The local watchdog still handles the harder failure
+mode of a fully-dropped relay connection (which auto-renewal can't recover
+from on its own).
+
 ## Commands
 
 | Command | Description |

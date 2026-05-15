@@ -73,6 +73,71 @@ export const RELAY_RESERVATION_TTL_MS = 2 * 60 * 60 * 1000;
 /** maxConnections for nodes that don't run a relay server (edge default). */
 export const EDGE_NODE_MAX_CONNECTIONS = 500;
 
+/**
+ * Default number of relay reservations an edge node tries to hold
+ * simultaneously. The previous default (1) was a single point of failure:
+ * if the only reserved relay went unreachable, the edge dropped off the
+ * network until the watchdog redialed and re-reserved. Holding 3 in
+ * parallel gives N-2 tolerance — two relays can blink concurrently and
+ * incoming dialers can still find a working circuit.
+ *
+ * Implementation: each `/p2p-circuit` listen address triggers a separate
+ * reservation slot in libp2p's transport reservation store, so the
+ * config translates to N duplicate `/p2p-circuit` entries in the
+ * libp2p `addresses.listen` array, paired with `reservationConcurrency:
+ * N` on the circuit-relay transport so they're attempted in parallel.
+ *
+ * NOTE: libp2p auto-renews each reservation 5 minutes before expiry
+ * (REFRESH_TIMEOUT in @libp2p/circuit-relay-v2/transport/reservation-store.js),
+ * so no application-level proactive renewal is needed in our watchdog.
+ * The watchdog still handles the harder failure mode of a fully-dropped
+ * relay connection, which auto-renewal can't recover from.
+ */
+export const DEFAULT_RELAY_RESERVATION_COUNT = 3;
+/**
+ * Hard cap on `relayReservationCount` to keep operators from accidentally
+ * configuring an edge node to hammer the network. Reserving on more than
+ * ~16 relays at a time is a smell — it costs memory + control-stream
+ * keepalive on every reserved relay, and the marginal failure-tolerance
+ * benefit past 4-5 is minimal.
+ */
+export const MAX_RELAY_RESERVATION_COUNT = 16;
+
+/**
+ * Validate an operator-supplied `relayReservationCount`. Same shape +
+ * defensive surface as `validateRelayServerCapacity` (rejects 0,
+ * negatives, NaN, Infinity, fractional, non-numbers). Additionally
+ * caps at `MAX_RELAY_RESERVATION_COUNT` to avoid the
+ * everyone-reserves-on-everyone failure mode on large networks.
+ */
+export type RelayReservationCountValidation =
+  | { ok: true; value: number }
+  | { ok: false; reason: string };
+export function validateRelayReservationCount(
+  input: unknown,
+): RelayReservationCountValidation | null {
+  if (input == null) return null;
+  if (typeof input !== 'number') {
+    return { ok: false, reason: `expected number, got ${typeof input}` };
+  }
+  if (!Number.isFinite(input)) {
+    return { ok: false, reason: `expected finite number, got ${input}` };
+  }
+  if (!Number.isInteger(input)) {
+    return { ok: false, reason: `expected integer, got ${input}` };
+  }
+  if (input < 1) {
+    return { ok: false, reason: `expected >= 1, got ${input}` };
+  }
+  if (input > MAX_RELAY_RESERVATION_COUNT) {
+    return {
+      ok: false,
+      reason: `expected <= ${MAX_RELAY_RESERVATION_COUNT}, got ${input}`,
+    };
+  }
+  return { ok: true, value: input };
+}
+
 export interface DerivedRelayCaps {
   maxReservations: number;
   maxConnections: number;
@@ -379,6 +444,32 @@ export class DKGNode {
     }
     const relayCaps = effectiveRelayCapacity != null ? deriveRelayCaps(effectiveRelayCapacity) : null;
 
+    // Number of relay reservations an edge node tries to hold in parallel.
+    // Only meaningful for nodes with relayPeers configured (i.e. behind
+    // NAT). Defaults to 3 — N-2 tolerance for two simultaneous relay
+    // blackouts. Validation defends against the same surface as
+    // relayServerCapacity (0/neg/NaN/fractional/non-number/over-cap).
+    let relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
+    if (this.config.relayPeers?.length) {
+      const verdict = validateRelayReservationCount(this.config.relayReservationCount);
+      if (verdict == null) {
+        relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
+      } else if (verdict.ok) {
+        relayReservationCount = verdict.value;
+      } else {
+        console.warn(
+          `[dkg-core] relayReservationCount=${String(this.config.relayReservationCount)} ` +
+            `is invalid (${verdict.reason}); falling back to default ${DEFAULT_RELAY_RESERVATION_COUNT}`,
+        );
+        relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
+      }
+    } else if (this.config.relayReservationCount != null) {
+      console.warn(
+        `[dkg-core] relayReservationCount=${this.config.relayReservationCount} ` +
+          `set but no relayPeers configured; value ignored`,
+      );
+    }
+
     // TCP keepAlive helps prevent idle relay connections from being dropped by
     // middleboxes or remote timeouts (common cause of ECONNRESET).
     const transports: any[] = [
@@ -389,13 +480,26 @@ export class DKGNode {
       // implies. Bump the transport-side caps to match the server-side
       // capacity. Edge nodes keep the upstream defaults (passing
       // undefined here is the same as omitting the field).
+      //
+      // reservationConcurrency controls how many reservations libp2p will
+      // attempt in parallel on different relays. Default upstream is 1,
+      // which serializes our N pending /p2p-circuit slots and effectively
+      // collapses multi-reservation back to single-reservation. Set to
+      // relayReservationCount so all N slots are attempted concurrently
+      // at startup. Only set when behind NAT (otherwise no relayPeers
+      // are configured and the field is irrelevant).
       circuitRelayTransport(
         relayCaps
           ? {
               maxInboundStopStreams: relayCaps.maxInboundStopStreams,
               maxOutboundStopStreams: relayCaps.maxOutboundStopStreams,
+              ...(this.config.relayPeers?.length
+                ? { reservationConcurrency: relayReservationCount }
+                : {}),
             }
-          : undefined,
+          : this.config.relayPeers?.length
+            ? { reservationConcurrency: relayReservationCount }
+            : undefined,
       ),
     ];
 
@@ -510,8 +614,16 @@ export class DKGNode {
 
     // When relay peers are configured, listen on circuit addresses to ensure
     // the node requests a reservation and becomes reachable through relays.
+    // Each `/p2p-circuit` listen address triggers a separate reservation
+    // slot in libp2p's transport reservation store (see
+    // `@libp2p/circuit-relay-v2/transport/reservation-store.js#reserveRelay`),
+    // so pushing N entries → N reservations on N (preferentially distinct)
+    // relays. Combined with `reservationConcurrency` above, this gives
+    // the edge N-(N-1) tolerance to relay failures.
     if (this.config.relayPeers?.length) {
-      listenAddrs.push('/p2p-circuit');
+      for (let i = 0; i < relayReservationCount; i++) {
+        listenAddrs.push('/p2p-circuit');
+      }
     }
 
     this.node = await createLibp2p<DKGServices>({

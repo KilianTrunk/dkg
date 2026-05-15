@@ -20,7 +20,14 @@ export {
   EDGE_NODE_MAX_CONNECTIONS,
   deriveRelayCaps,
   checkFdLimit,
+  validateRelayServerCapacity,
+  type RelayCapacityValidation,
   type DerivedRelayCaps,
+  // Multi-reservation tuning (PR3).
+  DEFAULT_RELAY_RESERVATION_COUNT,
+  MAX_RELAY_RESERVATION_COUNT,
+  validateRelayReservationCount,
+  type RelayReservationCountValidation,
 } from './node.js';
 export {
   RelayMetricsAdapter,

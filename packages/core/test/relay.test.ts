@@ -288,4 +288,70 @@ describe('Circuit Relay', () => {
     expect(edge.libp2p.getConnections().length).toBeGreaterThan(0);
     expect(edge.isStarted).toBe(true);
   }, 15000);
+
+  it('edge with relayReservationCount=2 and 2 relays reserves on both', async () => {
+    // PR3 multi-reservation behavior: by configuring N `/p2p-circuit`
+    // listen addrs + `reservationConcurrency: N` we expect libp2p to
+    // hold N parallel reservations on N distinct relays (subject to
+    // discovery — bootstrap supplies the relayPeers list directly so
+    // there's no random-walk delay). This test pins the wiring
+    // end-to-end: 2 relays + 1 edge with count=2 must produce 2
+    // distinct `/p2p-circuit` self-addresses on the edge, each tagged
+    // with a different relay's PeerId.
+    //
+    // Why count=2 not the default 3: keeps the test light (one fewer
+    // libp2p instance to spin up + tear down) while still exercising
+    // the N>1 path. The validation tests cover the full default range.
+    const relay1 = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    const relay2 = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    nodes.push(relay1, relay2);
+    await relay1.start();
+    await relay2.start();
+
+    const relay1Addr = relay1.multiaddrs.find(a => a.includes('/tcp/'))!;
+    const relay2Addr = relay2.multiaddrs.find(a => a.includes('/tcp/'))!;
+
+    const edge = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      relayPeers: [relay1Addr, relay2Addr],
+      relayReservationCount: 2,
+    });
+    nodes.push(edge);
+    await edge.start();
+
+    // Poll for both reservations — discovery + reservation HOP roundtrip
+    // takes a beat per relay. Bound the wait at 10s (ample margin over
+    // the typical 1-2s observed locally) and bail early when both
+    // /p2p-circuit self-addrs land. We assert the relay PeerIds are
+    // distinct so a single reservation announcing two equivalent addrs
+    // can't false-positive.
+    const relay1PidStr = relay1.peerId;
+    const relay2PidStr = relay2.peerId;
+    const deadline = Date.now() + 10_000;
+    let circuitAddrs: string[] = [];
+    while (Date.now() < deadline) {
+      circuitAddrs = edge.libp2p
+        .getMultiaddrs()
+        .map(ma => ma.toString())
+        .filter(a => a.includes('/p2p-circuit'));
+      const hasRelay1 = circuitAddrs.some(a => a.includes(`/p2p/${relay1PidStr}/p2p-circuit`));
+      const hasRelay2 = circuitAddrs.some(a => a.includes(`/p2p/${relay2PidStr}/p2p-circuit`));
+      if (hasRelay1 && hasRelay2) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+
+    const hasRelay1 = circuitAddrs.some(a => a.includes(`/p2p/${relay1PidStr}/p2p-circuit`));
+    const hasRelay2 = circuitAddrs.some(a => a.includes(`/p2p/${relay2PidStr}/p2p-circuit`));
+    expect(hasRelay1, `expected reservation on relay1; circuitAddrs=${JSON.stringify(circuitAddrs)}`).toBe(true);
+    expect(hasRelay2, `expected reservation on relay2; circuitAddrs=${JSON.stringify(circuitAddrs)}`).toBe(true);
+  }, 20000);
 });

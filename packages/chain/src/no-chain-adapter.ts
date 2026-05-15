@@ -10,7 +10,6 @@ import type {
   EventFilter,
   CreateContextGraphParams,
   V10PublishParams,
-  V10PublishingConvictionAccountInfo,
 } from './chain-adapter.js';
 
 function noChain(): never {
@@ -44,15 +43,10 @@ export class NoChainAdapter implements ChainAdapter {
   async getKnowledgeAssetsV10Address(): Promise<string> { noChain(); }
   async getEvmChainId(): Promise<bigint> { noChain(); }
   async getPublishingConvictionAccountOwner(_accountId: bigint): Promise<string> { noChain(); }
-  // V10 Publishing Conviction NFT write+read surface (issue #519). No
-  // chain → every call throws via the shared noChain() helper.
-  async createPublishingConvictionAccount(_committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> { noChain(); }
-  async topUpPublishingConvictionAccount(_accountId: bigint, _amount: bigint): Promise<TxResult> { noChain(); }
-  async registerPublishingConvictionAgent(_accountId: bigint, _agent: string): Promise<TxResult> { noChain(); }
-  async deregisterPublishingConvictionAgent(_accountId: bigint, _agent: string): Promise<TxResult> { noChain(); }
-  async isPublishingConvictionAgent(_accountId: bigint, _agent: string): Promise<boolean> { noChain(); }
-  async settlePublishingConvictionAccount(_accountId: bigint): Promise<TxResult> { noChain(); }
-  async getPublishingConvictionAccountInfo(_accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null> { noChain(); }
+  // The 7 #519 PCA write+read methods are OMITTED on purpose: they are
+  // optional on ChainAdapter, so the DKGAgent facade's `typeof guard`
+  // returns the documented `null` (feature-unavailable) in no-chain mode
+  // instead of throwing. Do NOT re-add them as noChain() stubs.
   isV10Ready(): boolean { return false; }
   isRandomSamplingReady(): boolean { return false; }
 }

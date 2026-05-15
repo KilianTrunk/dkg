@@ -130,6 +130,23 @@ describe('MockChainAdapter — V10 conviction topUp/settle', () => {
     const settled = await mock.settlePublishingConvictionAccount(accountId);
     expect(settled.success).toBe(true);
   });
+
+  it('mock does NOT model settlement — lastSettledWindow/fullySwept are static stubs (verified on-chain instead)', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createPublishingConvictionAccount(COMMITTED);
+
+    const before = (await mock.getPublishingConvictionAccountInfo(accountId))!;
+    expect(before.lastSettledWindow).toBe(0);
+    expect(before.fullySwept).toBe(false);
+
+    // settle is a deliberate no-op; settlement fidelity is out of
+    // mock-parity scope (evm-module hardhat + devnet smoke own it).
+    await mock.settlePublishingConvictionAccount(accountId);
+
+    const after = (await mock.getPublishingConvictionAccountInfo(accountId))!;
+    expect(after.lastSettledWindow).toBe(0);
+    expect(after.fullySwept).toBe(false);
+  });
 });
 
 describe('MockChainAdapter — V10 owner-gating parity', () => {

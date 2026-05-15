@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ethers } from 'ethers';
+import { NoChainAdapter } from '@origintrail-official/dkg-chain';
 import { handlePcaRoutes } from '../src/daemon/routes/pca.js';
 import type { RequestContext } from '../src/daemon/routes/context.js';
 
@@ -236,6 +237,23 @@ describe('daemon /api/pca V10 caller contract', () => {
     const { res, done } = runCtx('GET', '/api/pca/9', agent);
     await done;
     expect(res.statusCode).toBe(404);
+  });
+
+  it('GET /api/pca/:id against a NoChainAdapter-backed agent → 503 (feature-unavailable), not 404', async () => {
+    // Real no-chain adapter: post-#519-fix it OMITS the PCA methods, so
+    // the facade `typeof guard` returns null AND the GET capability probe
+    // (chain.getPublishingConvictionAccountInfo not a function) → 503.
+    const chain = new NoChainAdapter();
+    const agent = {
+      chain,
+      getPublishingConvictionAccountInfo: async () =>
+        typeof (chain as any).getPublishingConvictionAccountInfo !== 'function'
+          ? null
+          : (chain as any).getPublishingConvictionAccountInfo(1n),
+    };
+    const { res, done } = runCtx('GET', '/api/pca/1', agent);
+    await done;
+    expect(res.statusCode).toBe(503);
   });
 
   it('maps known PCA contract reverts to 4xx (InvalidAmount 400, Already/NotRegistered 409, AccountExpired 409)', async () => {

@@ -522,8 +522,8 @@ export class MockChainAdapter implements ChainAdapter {
       discountBps: acct.discountBps,
       topUpBuffer: acct.topUpBuffer,
       agentCount: acct.agents.size,
-      // Settlement accounting not modeled in mock; covered by evm-module
-      // hardhat tests + devnet smoke against the real NFT.
+      // STATIC STUBS — settlement is intentionally out of mock-parity scope.
+      // Fidelity verified on-chain (evm-module hardhat + devnet smoke).
       lastSettledWindow: 0,
       fullySwept: false,
     };
@@ -554,6 +554,8 @@ export class MockChainAdapter implements ChainAdapter {
     return this.txResult(true);
   }
 
+  // DELIBERATE NO-OP — the lazy-settlement cursor is contract accounting,
+  // out of mock-parity scope; verified on-chain (hardhat + devnet smoke).
   async settlePublishingConvictionAccount(accountId: bigint): Promise<TxResult> {
     this.requireConvictionAccount(accountId);
     return this.txResult(true);

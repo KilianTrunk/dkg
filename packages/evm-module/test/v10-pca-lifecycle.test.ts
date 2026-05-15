@@ -231,4 +231,136 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     );
     expect((await NFT.getAccountInfo(accountId)).fullySwept).to.equal(true);
   });
+
+  // V10 ACK signer gate reads `getNodeStakeV10`; bring nodes' V10 stake
+  // above zero via the conviction-staking NFT path.
+  const stakeV10 = async (
+    staker: SignerWithAddress,
+    identityId: number,
+    amount: bigint,
+  ) => {
+    await Token.mint(staker.address, amount);
+    await Token.connect(staker).approve(
+      await StakingV10Contract.getAddress(),
+      amount,
+    );
+    await StakingNFT.connect(staker).createConviction(identityId, amount, 1);
+  };
+
+  // --------------------------------------------------------------------------
+  // 2. registered agent publishes via real KnowledgeAssetsV10.publish()
+  // --------------------------------------------------------------------------
+  it('takes the discount branch when epochs == lockDurationEpochs and the discounted cost is asserted on chain', async () => {
+    const publishingNode = getDefaultPublishingNode(accounts);
+    const receivingNodes = getDefaultReceivingNodes(accounts);
+    const { identityId: publisherIdentityId } = await createProfile(
+      ProfileContract,
+      publishingNode,
+    );
+    const receiverProfiles = await createProfiles(
+      ProfileContract,
+      receivingNodes,
+    );
+    const receiverIdentityIds = receiverProfiles.map((p) => p.identityId);
+
+    await stakeV10(publishingNode.operational, publisherIdentityId, MIN_STAKE);
+    for (let i = 0; i < receivingNodes.length; i++) {
+      await stakeV10(
+        receivingNodes[i].operational,
+        receiverProfiles[i].identityId,
+        MIN_STAKE,
+      );
+    }
+
+    // ---- create + register the publishing agent ----
+    const creator = getDefaultKCCreator(accounts);
+    const accountId = await createAccountFor(creator);
+    await NFT.connect(creator).registerAgent(accountId, creator.address);
+    expect(await NFT.agentToAccountId(creator.address)).to.equal(accountId);
+
+    // ---- open context graph (any non-zero publisher authorized) ----
+    await CGFacade.connect(creator).createContextGraph(
+      [10n, 20n, 30n],
+      [],
+      2,
+      0,
+      0,
+      1,
+      ethers.ZeroAddress,
+      0,
+    );
+    const cgId = await CGS.getLatestContextGraphId();
+    expect(await CGFacade.isAuthorizedPublisher(cgId, creator.address)).to.be
+      .true;
+
+    // ---- discount branch requires p.epochs == lockDurationEpochs ----
+    const acctInfo = await NFT.accounts(accountId);
+    const epochs = Number(acctInfo[5]);
+    const tokenAmount = ethers.parseEther('1000');
+    const expectedDiscounted =
+      (tokenAmount * (10_000n - EXPECTED_DISCOUNT_BPS)) / 10_000n;
+    expect(expectedDiscounted).to.be.lessThan(tokenAmount);
+
+    const currentEpoch = await Chronos.getCurrentEpoch();
+    const merkleRoot = ethers.keccak256(
+      ethers.toUtf8Bytes('v10-pca-lifecycle'),
+    );
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot,
+      knowledgeAssetsAmount: 10,
+      byteSize: 1000,
+      epochs,
+      tokenAmount,
+      isImmutable: false,
+      publishOperationId: 'v10-pca-lifecycle-op',
+    });
+
+    const tx = await KAV10.connect(creator).publish(p);
+    const receipt = await tx.wait();
+    expect(receipt!.status).to.equal(1);
+
+    // The conviction branch funds the staker pool with the DISCOUNTED cost
+    // via the NFT's `coverPublishingCost` → `addTokensToEpochRange`. A
+    // direct-spend fallthrough would instead distribute the full amount.
+    const epochStorageAddr = (
+      await EpochStorageContract.getAddress()
+    ).toLowerCase();
+    let activeSinkSum = 0n;
+    for (const log of receipt!.logs) {
+      if (log.address.toLowerCase() !== epochStorageAddr) continue;
+      try {
+        const parsed = EpochStorageContract.interface.parseLog({
+          topics: [...log.topics],
+          data: log.data,
+        });
+        if (parsed?.name === 'TokensAddedToEpochRange') {
+          expect(BigInt(parsed.args.shardId)).to.equal(STAKER_SHARD_ID);
+          expect(BigInt(parsed.args.startEpoch)).to.be.gte(currentEpoch);
+          expect(BigInt(parsed.args.endEpoch)).to.be.lte(
+            currentEpoch + BigInt(epochs),
+          );
+          activeSinkSum += BigInt(parsed.args.tokenAmount);
+        }
+      } catch {
+        // not the event we're after
+      }
+    }
+    expect(activeSinkSum).to.equal(expectedDiscounted);
+
+    // KC records the FULL tokenAmount; only the staker-pool distribution is
+    // discounted — the on-chain proof the discount branch (not direct
+    // spend) executed.
+    const kcId = 1n;
+    const meta =
+      await KnowledgeCollectionStorage.getKnowledgeCollectionMetadata(kcId);
+    expect(meta[6]).to.equal(tokenAmount);
+    expect(activeSinkSum).to.be.lessThan(meta[6]);
+  });
 });

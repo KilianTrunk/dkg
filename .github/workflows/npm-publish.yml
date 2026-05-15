@@ -182,10 +182,7 @@ jobs:
             RELEASE_BRANCH=main
             ALLOWED_TAG_PATTERN="v*"
             CUSTOM_BRANCHES=$(gh api "repos/${GH_REPO}/environments/npm-publish/deployment-branch-policies" --jq '[.branch_policies[]?.name]' 2>/dev/null || echo '[]')
-            BRANCH_COUNT=$(echo "${CUSTOM_BRANCHES}" | jq 'length')
             HAS_RELEASE=$(echo "${CUSTOM_BRANCHES}" | jq --arg b "${RELEASE_BRANCH}" -r 'any(. == $b)')
-            HAS_TAG_PATTERN=$(echo "${CUSTOM_BRANCHES}" | jq --arg t "${ALLOWED_TAG_PATTERN}" -r 'any(. == $t)')
-            HAS_BAD_WILDCARD=$(echo "${CUSTOM_BRANCHES}" | jq --arg b "${RELEASE_BRANCH}" --arg t "${ALLOWED_TAG_PATTERN}" -r 'any(. != $b and . != $t and test("\\*"))')
 
             # Validate every entry is exactly `main` or `v*` — nothing else.
             # This catches `['main', 'staging']` (count=2 but staging is wrong)
@@ -212,19 +209,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+          TAG_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          TAG_SHA="${{ github.sha }}"
           RELEASE_BRANCH=main
-          # Compare: if main is at or ahead of TAG_SHA, status is
-          # "identical" or "ahead". If TAG_SHA is not reachable from
-          # main at all, status is "diverged" or "behind".
           STATUS=$(gh api "repos/${GH_REPO}/compare/${RELEASE_BRANCH}...${TAG_SHA}" --jq '.status' 2>/dev/null || echo "error")
           if [ "${STATUS}" != "identical" ] && [ "${STATUS}" != "behind" ]; then
-            echo "::error title=Tag not on release branch::Tag ${{ github.ref_name }} (${TAG_SHA}) is not reachable from \`${RELEASE_BRANCH}\`. Compare status: ${STATUS}. Push tags only on commits that are on \`${RELEASE_BRANCH}\`."
+            echo "::error title=Tag not on release branch::Tag ${TAG_NAME} (${TAG_SHA}) is not reachable from \`${RELEASE_BRANCH}\`. Compare status: ${STATUS}. Push tags only on commits that are on \`${RELEASE_BRANCH}\`."
             exit 1
           fi
-          echo "✓ Tag ${{ github.ref_name }} (${TAG_SHA}) is reachable from ${RELEASE_BRANCH} (status: ${STATUS})"
+          echo "✓ Tag ${TAG_NAME} (${TAG_SHA}) is reachable from ${RELEASE_BRANCH} (status: ${STATUS})"
 
   # BUILD AND PACK — runs WITHOUT `environment: npm-publish`, so NPM_TOKEN
   # is NOT in scope. This is the job that executes arbitrary repository
@@ -313,7 +308,6 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           EXPECTED_VER="${TAG#v}"
           echo "Git tag: ${TAG} → expected npm version: ${EXPECTED_VER}"
-          MISMATCHES=0
           node -e "
             const fs = require('fs');
             const path = require('path');

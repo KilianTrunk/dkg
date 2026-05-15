@@ -20,17 +20,12 @@ packages/evm-module/artifacts/
 packages/evm-module/cache/
 packages/evm-module/typechain/
 # .devnet/ is a runtime workspace (Hardhat data dir, per-node DKG_HOME
-# state, daemon logs). Not checked in — except the issue #519 PCA smoke
-# entrypoint + its pure helper/test, which the orchestrator test_command
-# (`cd .devnet && node run.mjs`) requires on the tree. A directory-level
-# ignore short-circuits path negations, so glob the contents instead.
-.devnet/*
-!.devnet/run.mjs
-!.devnet/pca-smoke-lib.mjs
-!.devnet/pca-smoke-lib.test.mjs
+# state, daemon logs). Not checked in.
+.devnet/
 
 # Agent scratch (project memory across orchestrator runs). Local only.
 .ai/
+.scratch/
 
 packages/evm-module/deployments/hardhat_contracts.json
 packages/evm-module/deployments/localhost_contracts.json

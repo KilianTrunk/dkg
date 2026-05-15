@@ -430,13 +430,36 @@ export class MockChainAdapter implements ChainAdapter {
     committedTRAC: bigint;
     topUpBuffer: bigint;
     lockDurationEpochs: number;
+    /** Discount tier (bps) fixed at creation, mirrors the contract. */
+    discountBps: number;
+    /** Monotonic mock epoch captured at creation (no chronos in mock). */
+    createdAtEpoch: number;
     agents: Set<string>;
   }>();
   private agentToConvictionAccount = new Map<string, bigint>();
   private nextConvictionAccountId = 1n;
+  // Mock has no chronos; a monotonic counter stands in for the creation
+  // epoch so `expiresAtEpoch = createdAtEpoch + lockDurationEpochs` holds.
+  private mockConvictionEpoch = 0;
 
   // Mirrors chain `ParametersStorage.publishingConvictionEpochs` (12).
   private static readonly MOCK_LOCK_DURATION_EPOCHS = 12;
+
+  /**
+   * Mirrors `DKGPublishingConvictionNFT.getDiscountBps` exactly
+   * (DKGPublishingConvictionNFT.sol L767-775): discrete 6-tier ladder,
+   * `ether` == 1e18, evaluated highest-first. Fixed at creation.
+   */
+  private static convictionDiscountBps(committedTRAC: bigint): number {
+    const ETHER = 10n ** 18n;
+    if (committedTRAC >= 1_000_000n * ETHER) return 7500; // 75%
+    if (committedTRAC >= 500_000n * ETHER) return 5000; // 50%
+    if (committedTRAC >= 250_000n * ETHER) return 4000; // 40%
+    if (committedTRAC >= 100_000n * ETHER) return 3000; // 30%
+    if (committedTRAC >= 50_000n * ETHER) return 2000; // 20%
+    if (committedTRAC >= 25_000n * ETHER) return 1000; // 10%
+    return 0;
+  }
 
   /** Test helper (not in `ChainAdapter`): seed a PCA owned by `admin`
    *  for publish-policy branches that need a known PCA owner. */
@@ -447,6 +470,8 @@ export class MockChainAdapter implements ChainAdapter {
       committedTRAC: 0n,
       topUpBuffer: 0n,
       lockDurationEpochs: MockChainAdapter.MOCK_LOCK_DURATION_EPOCHS,
+      discountBps: MockChainAdapter.convictionDiscountBps(0n),
+      createdAtEpoch: this.mockConvictionEpoch++,
       agents: new Set<string>(),
     });
     return accountId;
@@ -469,6 +494,9 @@ export class MockChainAdapter implements ChainAdapter {
       committedTRAC,
       topUpBuffer: 0n,
       lockDurationEpochs: MockChainAdapter.MOCK_LOCK_DURATION_EPOCHS,
+      // Tier fixed at creation, identical formula to the contract.
+      discountBps: MockChainAdapter.convictionDiscountBps(committedTRAC),
+      createdAtEpoch: this.mockConvictionEpoch++,
       agents: new Set<string>(),
     });
     return { accountId, ...this.txResult(true) };
@@ -481,13 +509,17 @@ export class MockChainAdapter implements ChainAdapter {
       owner: acct.owner,
       committedTRAC: acct.committedTRAC,
       baseEpochAllowance: acct.committedTRAC / BigInt(acct.lockDurationEpochs),
-      createdAtEpoch: 0,
-      expiresAtEpoch: acct.lockDurationEpochs,
+      createdAtEpoch: acct.createdAtEpoch,
+      // Contract invariant: expiry is lockDurationEpochs after creation.
+      expiresAtEpoch: acct.createdAtEpoch + acct.lockDurationEpochs,
+      // Mock has no wall clock; timestamps stay 0 (epochs are modeled).
       createdAtTimestamp: 0,
       expiresAtTimestamp: 0,
-      discountBps: 0,
+      discountBps: acct.discountBps,
       topUpBuffer: acct.topUpBuffer,
       agentCount: acct.agents.size,
+      // Settlement accounting not modeled in mock; covered by evm-module
+      // hardhat tests + devnet smoke against the real NFT.
       lastSettledWindow: 0,
       fullySwept: false,
     };

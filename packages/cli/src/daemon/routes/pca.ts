@@ -2,7 +2,10 @@
 // § #519). Owner-gated writes: owner revert → 403, no-chain → 503.
 
 import { ethers } from 'ethers';
-import type { V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
+import {
+  isPcaUnavailableError,
+  type V10PublishingConvictionAccountInfo,
+} from '@origintrail-official/dkg-chain';
 import { jsonResponse, readBody, SMALL_BODY_BYTES } from '../http-utils.js';
 import type { RequestContext } from './context.js';
 
@@ -30,6 +33,22 @@ function isOwnerRevert(msg: string): boolean {
 // NoChainAdapter throws `noChain()` instead of returning null → 503.
 function isNoChain(msg: string): boolean {
   return /No blockchain configured/i.test(msg);
+}
+
+// DKGPublishingConvictionNFT undeployed on the Hub → 503 (capability
+// gap, not a caller error). Typed error first, message fallback second.
+function isPcaUnavailable(err: unknown, msg: string): boolean {
+  return isPcaUnavailableError(err) || /not deployed on this Hub/i.test(msg);
+}
+
+// Deterministic PCA contract custom-error reverts → 4xx so clients can
+// tell a bad request from a retryable outage. ethers wraps the name.
+function classifyPcaRevert(msg: string): { status: number; error: string } | null {
+  if (/\bInvalidAmount\b/.test(msg)) return { status: 400, error: 'InvalidAmount' };
+  if (/\bAgentAlreadyRegistered\b/.test(msg)) return { status: 409, error: 'AgentAlreadyRegistered' };
+  if (/\bAgentNotRegistered\b/.test(msg)) return { status: 409, error: 'AgentNotRegistered' };
+  if (/\bAccountExpired\b/.test(msg)) return { status: 409, error: 'AccountExpired' };
+  return null;
 }
 
 function parseAccountId(idStr: string): bigint | null {
@@ -108,6 +127,9 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error });
       return jsonResponse(res, 500, {
         error: `createPublishingConvictionAccount failed: ${msg}`,
       });
@@ -143,12 +165,15 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
           accountId: idStr,
         });
       }
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
       return jsonResponse(res, 500, { error: `registerPublishingConvictionAgent failed: ${msg}` });
     }
   }
@@ -179,12 +204,15 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
           accountId: idStr,
         });
       }
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
       return jsonResponse(res, 500, { error: `deregisterPublishingConvictionAgent failed: ${msg}` });
     }
   }
@@ -214,12 +242,15 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
           accountId: idStr,
         });
       }
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
       return jsonResponse(res, 500, { error: `topUpPublishingConvictionAccount failed: ${msg}` });
     }
   }
@@ -244,6 +275,9 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
       return jsonResponse(res, 500, { error: `settlePublishingConvictionAccount failed: ${msg}` });
     }
   }
@@ -271,11 +305,11 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
         if (!ethers.isAddress(probedKey)) {
           result.probedKey = { key: probedKey, error: 'invalid EVM address' };
         } else {
-          const isAuth = await agent.isPublishingConvictionAgent(accountId, probedKey);
+          const isAgent = await agent.isPublishingConvictionAgent(accountId, probedKey);
           result.probedKey = {
             key: probedKey,
-            authorized: isAuth === true,
-            adapterSupported: isAuth !== null,
+            registered: isAgent === true,
+            adapterSupported: isAgent !== null,
           };
         }
       }
@@ -283,6 +317,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 500, {
         error: `getPublishingConvictionAccountInfo failed: ${msg}`,
       });

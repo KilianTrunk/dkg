@@ -542,7 +542,7 @@ export class ApiClient {
     agentCount: number;
     lastSettledWindow: number;
     fullySwept: boolean;
-    probedKey?: { key: string; authorized: boolean; adapterSupported?: boolean; error?: string };
+    probedKey?: { key: string; registered: boolean; adapterSupported?: boolean; error?: string };
   }> {
     const qs = probeKey ? `?key=${encodeURIComponent(probeKey)}` : '';
     return this.get(`/api/pca/${encodeURIComponent(accountId)}${qs}`);

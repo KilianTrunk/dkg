@@ -18,14 +18,16 @@ function fakeReq(method: string, path: string, body?: unknown) {
   return req;
 }
 
-function runCtx(method: string, path: string, agent: any, body?: unknown) {
+function runCtx(method: string, rawPath: string, agent: any, body?: unknown) {
   const res = fakeRes();
+  // Mirror handle-request.ts: route on url.pathname, query lives on url.
+  const url = new URL(`http://127.0.0.1${rawPath}`);
   const ctx = {
-    req: fakeReq(method, path, body),
+    req: fakeReq(method, rawPath, body),
     res,
     agent,
-    path,
-    url: new URL(`http://127.0.0.1${path}`),
+    path: url.pathname,
+    url,
   } as unknown as RequestContext;
   return { res, done: handlePcaRoutes(ctx) };
 }
@@ -202,5 +204,93 @@ describe('daemon /api/pca V10 caller contract', () => {
     const info = runCtx('GET', '/api/pca/1', { getPublishingConvictionAccountInfo: noChainErr });
     await info.done;
     expect(info.res.statusCode).toBe(503);
+  });
+
+  it('maps a "NFT not deployed on this Hub" throw to HTTP 503 on write and GET, not 500/404', async () => {
+    const undeployed = () => { throw new Error('DKGPublishingConvictionNFT not deployed on this Hub.'); };
+    const create = runCtx('POST', '/api/pca', { createPublishingConvictionAccount: undeployed }, { tokens: '1' });
+    await create.done;
+    expect(create.res.statusCode).toBe(503);
+
+    const get = runCtx('GET', '/api/pca/1', { getPublishingConvictionAccountInfo: undeployed });
+    await get.done;
+    expect(get.res.statusCode).toBe(503);
+  });
+
+  it('maps a typed PcaUnavailableError (code PCA_UNAVAILABLE) to HTTP 503 on settle', async () => {
+    const agent = {
+      settlePublishingConvictionAccount: async () => {
+        const e: any = new Error('boom'); e.code = 'PCA_UNAVAILABLE'; throw e;
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca/2/settle', agent);
+    await done;
+    expect(res.statusCode).toBe(503);
+  });
+
+  it('genuine account-missing (getInfo returns null on a deployed adapter) stays 404', async () => {
+    const agent = {
+      chain: { getPublishingConvictionAccountInfo: () => null },
+      getPublishingConvictionAccountInfo: async () => null,
+    };
+    const { res, done } = runCtx('GET', '/api/pca/9', agent);
+    await done;
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('maps known PCA contract reverts to 4xx (InvalidAmount 400, Already/NotRegistered 409, AccountExpired 409)', async () => {
+    const addr = '0x' + '4'.repeat(40);
+    const inv = runCtx('POST', '/api/pca', {
+      createPublishingConvictionAccount: async () => { throw new Error('execution reverted: InvalidAmount()'); },
+    }, { tokens: '1' });
+    await inv.done;
+    expect(inv.res.statusCode).toBe(400);
+    expect(JSON.parse(inv.res.body).error).toBe('InvalidAmount');
+
+    const dup = runCtx('POST', '/api/pca/1/agent', {
+      registerPublishingConvictionAgent: async () => { throw new Error('reverted: AgentAlreadyRegistered(1)'); },
+    }, { agent: addr });
+    await dup.done;
+    expect(dup.res.statusCode).toBe(409);
+
+    const missing = runCtx('DELETE', `/api/pca/1/agent/${addr}`, {
+      deregisterPublishingConvictionAgent: async () => { throw new Error('reverted: AgentNotRegistered(1)'); },
+    });
+    await missing.done;
+    expect(missing.res.statusCode).toBe(409);
+
+    const expired = runCtx('POST', '/api/pca/1/funds', {
+      topUpPublishingConvictionAccount: async () => { throw new Error('reverted: AccountExpired(1)'); },
+    }, { tokens: '5' });
+    await expired.done;
+    expect(expired.res.statusCode).toBe(409);
+  });
+
+  it('owner revert still wins over generic revert classification (403, not 409)', async () => {
+    const addr = '0x' + '5'.repeat(40);
+    const { res, done } = runCtx('POST', '/api/pca/1/agent', {
+      registerPublishingConvictionAgent: async () => { throw new Error('Mock: NotAccountOwner(1, 0xdead)'); },
+    }, { agent: addr });
+    await done;
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('GET ?key= probe exposes `registered` (not `authorized`)', async () => {
+    const addr = '0x' + '6'.repeat(40);
+    const agent = {
+      getPublishingConvictionAccountInfo: async () => ({
+        owner: '0x' + '9'.repeat(40),
+        committedTRAC: 1n, baseEpochAllowance: 1n, createdAtEpoch: 1, expiresAtEpoch: 9,
+        createdAtTimestamp: 0, expiresAtTimestamp: 0, discountBps: 0, topUpBuffer: 0n,
+        agentCount: 1, lastSettledWindow: 0, fullySwept: false,
+      }),
+      isPublishingConvictionAgent: async () => true,
+    };
+    const { res, done } = runCtx('GET', `/api/pca/1?key=${addr}`, agent);
+    await done;
+    expect(res.statusCode).toBe(200);
+    const probe = JSON.parse(res.body).probedKey;
+    expect(probe.registered).toBe(true);
+    expect(probe).not.toHaveProperty('authorized');
   });
 });

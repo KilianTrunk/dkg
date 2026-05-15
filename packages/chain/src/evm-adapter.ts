@@ -35,6 +35,7 @@ import {
   ChallengeNoLongerActiveError,
 } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
+import { PcaUnavailableError } from './pca-errors.js';
 import {
   buildAuthorAttestationTypedData,
   AUTHOR_SCHEME_VERSION_V1,
@@ -2177,7 +2178,7 @@ export class EVMChainAdapter implements ChainAdapter {
   private requireConvictionNFT(): Contract {
     const nft = this.contracts.dkgPublishingConvictionNFT;
     if (!nft) {
-      throw new Error('DKGPublishingConvictionNFT not deployed on this Hub.');
+      throw new PcaUnavailableError();
     }
     return nft;
   }
@@ -2225,7 +2226,9 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async getPublishingConvictionAccountInfo(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null> {
     await this.init();
-    if (!this.contracts.dkgPublishingConvictionNFT) return null;
+    // Undeployed NFT → capability error (503). null is reserved below
+    // for a genuine account-missing revert so the route can disambiguate.
+    if (!this.contracts.dkgPublishingConvictionNFT) throw new PcaUnavailableError();
     try {
       const t = await this.contracts.dkgPublishingConvictionNFT.getAccountInfo(accountId);
       return {

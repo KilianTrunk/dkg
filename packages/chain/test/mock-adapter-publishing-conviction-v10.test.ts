@@ -37,6 +37,50 @@ describe('MockChainAdapter — V10 conviction account create/read', () => {
 
     expect(await mock.getPublishingConvictionAccountInfo(999n)).toBeNull();
   });
+
+  it('lifecycle metadata is internally consistent: expiresAtEpoch = createdAtEpoch + lockDurationEpochs', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createPublishingConvictionAccount(COMMITTED);
+
+    const info = (await mock.getPublishingConvictionAccountInfo(accountId))!;
+    const lock = await mock.getConvictionAccountLockDurationEpochs(accountId);
+    expect(lock).toBe(12);
+    expect(info.expiresAtEpoch).toBe(info.createdAtEpoch + lock);
+    // Timestamps stay 0 (mock has no wall clock); settlement not modeled.
+    expect(info.createdAtTimestamp).toBe(0);
+    expect(info.expiresAtTimestamp).toBe(0);
+    expect(info.lastSettledWindow).toBe(0);
+    expect(info.fullySwept).toBe(false);
+
+    // createdAtEpoch advances monotonically per account.
+    const { accountId: second } = await mock.createPublishingConvictionAccount(COMMITTED);
+    const info2 = (await mock.getPublishingConvictionAccountInfo(second))!;
+    expect(info2.createdAtEpoch).toBeGreaterThan(info.createdAtEpoch);
+  });
+});
+
+describe('MockChainAdapter — V10 conviction discount tier parity', () => {
+  // Exact mirror of DKGPublishingConvictionNFT.getDiscountBps
+  // (DKGPublishingConvictionNFT.sol L767-775). committedTRAC → bps.
+  const TIERS: Array<[bigint, number]> = [
+    [ethers.parseEther('24999'), 0], // sub-threshold → 0 bps
+    [ethers.parseEther('25000'), 1000], // 10%
+    [ethers.parseEther('50000'), 2000], // 20%
+    [ethers.parseEther('100000'), 3000], // 30%
+    [ethers.parseEther('250000'), 4000], // 40%
+    [ethers.parseEther('500000'), 5000], // 50%
+    [ethers.parseEther('1000000'), 7500], // top tier → 75%
+  ];
+
+  it.each(TIERS)(
+    'committedTRAC %s yields discountBps %i (fixed at creation)',
+    async (committedTRAC, expectedBps) => {
+      const mock = new MockChainAdapter('mock:31337', SIGNER);
+      const { accountId } = await mock.createPublishingConvictionAccount(committedTRAC);
+      const info = (await mock.getPublishingConvictionAccountInfo(accountId))!;
+      expect(info.discountBps).toBe(expectedBps);
+    },
+  );
 });
 
 describe('MockChainAdapter — V10 conviction agent register/deregister', () => {

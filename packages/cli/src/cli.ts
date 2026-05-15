@@ -2741,7 +2741,7 @@ pcaCmd
         if (info.probedKey.error) {
           console.log(`    error:      ${info.probedKey.error}`);
         } else {
-          console.log(`    authorized: ${info.probedKey.authorized}`);
+          console.log(`    registered: ${info.probedKey.registered}`);
         }
       }
     } catch (err) {

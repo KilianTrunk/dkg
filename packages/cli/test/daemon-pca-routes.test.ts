@@ -61,6 +61,36 @@ describe('daemon /api/pca V10 caller contract', () => {
     expect(registered).toEqual({ id: 1n, agent: addr });
   });
 
+  it('DELETE /api/pca/:id/agent/:address deregisters an agent → 200', async () => {
+    let deregistered: { id: bigint; agent: string } | null = null;
+    const addr = '0x' + '2'.repeat(40);
+    const agent = {
+      deregisterConvictionAgent: async (id: bigint, a: string) => {
+        deregistered = { id, agent: a };
+        return { hash: '0xdereg', blockNumber: 11, success: true };
+      },
+    };
+    const { res, done } = runCtx('DELETE', `/api/pca/1/agent/${addr}`, agent);
+    await done;
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.txHash).toBe('0xdereg');
+    expect(body.deregistered).toBe(true);
+    expect(deregistered).toEqual({ id: 1n, agent: addr });
+  });
+
+  it('maps an owner-gated NotAccountOwner revert on agent deregister to HTTP 403', async () => {
+    const agent = {
+      deregisterConvictionAgent: async () => {
+        throw new Error('Mock: NotAccountOwner(1, 0xdeadbeef)');
+      },
+    };
+    const addr = '0x' + '2'.repeat(40);
+    const { res, done } = runCtx('DELETE', `/api/pca/1/agent/${addr}`, agent);
+    await done;
+    expect(res.statusCode).toBe(403);
+  });
+
   it('maps an owner-gated NotAccountOwner revert on agent register to HTTP 403', async () => {
     const agent = {
       registerConvictionAgent: async () => {

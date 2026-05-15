@@ -178,6 +178,42 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
+  // DELETE /api/pca/:id/agent/:address — deregister a publishing agent.
+  // Owner-gated; the daemon's EOA must be the PCA NFT owner.
+  if (req.method === 'DELETE' && /^\/api\/pca\/[^/]+\/agent\/[^/]+$/.test(path)) {
+    const parts = path.split('/');
+    const idStr = decodeURIComponent(parts[3] ?? '');
+    const agentAddr = decodeURIComponent(parts[5] ?? '');
+    const accountId = parseAccountId(idStr);
+    if (accountId === null) {
+      return jsonResponse(res, 400, { error: 'Invalid accountId — must be a non-negative integer' });
+    }
+    if (!ethers.isAddress(agentAddr)) {
+      return jsonResponse(res, 400, { error: 'agent must be a valid 0x-prefixed EVM address' });
+    }
+    try {
+      const result = await agent.deregisterConvictionAgent(accountId, agentAddr);
+      if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      return jsonResponse(res, 200, {
+        accountId: idStr,
+        agent: agentAddr,
+        deregistered: true,
+        txHash: result.hash,
+        blockNumber: result.blockNumber,
+      });
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isOwnerRevert(msg)) {
+        return jsonResponse(res, 403, {
+          error: 'NotAccountOwner — daemon EOA is not the PCA owner',
+          accountId: idStr,
+        });
+      }
+      return jsonResponse(res, 500, { error: `deregisterConvictionAgent failed: ${msg}` });
+    }
+  }
+
   // POST /api/pca/:id/funds — top-up a PCA. Owner-gated. Body: { tokens: "50000" }
   if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/funds$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');

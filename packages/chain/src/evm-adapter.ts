@@ -238,15 +238,12 @@ interface ContractCache {
   contextGraphs?: Contract;
   contextGraphStorage?: Contract;
   knowledgeAssetsV10?: Contract;
-  publishingConvictionAccount?: Contract;
   /**
-   * The V10 NFT-backed PCA (`DKGPublishingConvictionNFT`). Used by the
-   * publisher SDK to detect PCA-funded publishes and mirror the
-   * `kcEpochs == lockDurationEpochs` eligibility check in
-   * `KnowledgeAssetsV10.publish()` — wrong epochs silently fall through
-   * to direct spend, so the SDK pre-coerces to keep the discount. The
-   * legacy V9 `publishingConvictionAccount` cache slot above is retained
-   * only to satisfy stale Hub bindings on older deploys.
+   * The V10 NFT-backed PCA (`DKGPublishingConvictionNFT`). Backs the
+   * create/topUp/registerAgent/deregisterAgent/settle write surface and
+   * the publisher's `kcEpochs == lockDurationEpochs` discount-eligibility
+   * check in `KnowledgeAssetsV10.publish()` — wrong epochs silently fall
+   * through to direct spend, so the SDK pre-coerces to keep the discount.
    */
   dkgPublishingConvictionNFT?: Contract;
   randomSampling?: Contract;
@@ -701,12 +698,6 @@ export class EVMChainAdapter implements ChainAdapter {
       this.contracts.knowledgeAssetsV10 = await this.resolveContract('KnowledgeAssetsV10');
     } catch {
       // V10 contract not deployed — createKnowledgeAssetsV10 unavailable
-    }
-
-    try {
-      this.contracts.publishingConvictionAccount = await this.resolveContract('PublishingConvictionAccount');
-    } catch {
-      // PublishingConvictionAccount not deployed — conviction account operations unavailable
     }
 
     try {

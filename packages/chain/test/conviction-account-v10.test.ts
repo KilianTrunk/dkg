@@ -11,6 +11,8 @@
  * over the shared Hardhat node, one snapshot per test for isolation.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { ethers } from 'ethers';
 import {
   createEVMAdapter,
@@ -116,5 +118,20 @@ describe('V10 Publishing Conviction NFT — chain-adapter lifecycle', () => {
     const info = await owner.getConvictionAccountInfo(accountId);
     expect(info!.topUpBuffer).toBe(0n);
     expect(info!.agentCount).toBe(0);
+  });
+
+  it('existing V10 read methods are preserved and the dead V9 cache slot is gone', async () => {
+    const owner = await fundedOwner();
+    const { accountId } = await owner.createConvictionAccount(COMMITTED);
+
+    // getConvictionAccountLockDurationEpochs reads the protocol-wide
+    // ParametersStorage.publishingConvictionEpochs snapshot (default 12).
+    expect(await owner.getConvictionAccountLockDurationEpochs(accountId)).toBe(12);
+    expect((await owner.getPublishingConvictionAccountOwner(accountId)).toLowerCase())
+      .toBe(owner.getSignerAddress().toLowerCase());
+
+    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'evm-adapter.ts'), 'utf8');
+    expect(src).not.toMatch(/\bpublishingConvictionAccount\b/);
+    expect(src).not.toMatch(/resolveContract\(\s*'PublishingConvictionAccount'\s*\)/);
   });
 });

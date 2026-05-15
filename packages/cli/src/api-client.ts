@@ -495,14 +495,14 @@ export class ApiClient {
     return this.post(`/api/pca/${encodeURIComponent(accountId)}/funds`, { tokens });
   }
 
-  async authorizePcaKey(accountId: string, key: string): Promise<{
+  async registerPcaAgent(accountId: string, agent: string): Promise<{
     accountId: string;
-    key: string;
-    authorized: boolean;
+    agent: string;
+    registered: boolean;
     txHash: string;
     blockNumber: number;
   }> {
-    return this.post(`/api/pca/${encodeURIComponent(accountId)}/authorize`, { key });
+    return this.post(`/api/pca/${encodeURIComponent(accountId)}/agent`, { agent });
   }
 
   async getPcaInfo(accountId: string, probeKey?: string): Promise<{

@@ -2599,11 +2599,12 @@ sourceWorkerCmd
 // Operator surface for standing up and inspecting on-chain PCAs. Required
 // fixture for RFC §4 modes (a) and (b) of the agent-provenance runbook.
 // Writes are owner-gated by the on-chain `DKGPublishingConvictionNFT`
-// contract — the daemon's EOA must own the PCA NFT for `pca authorize`
-// and `pca funds` to land. Read-side (`pca info`) is permissionless.
+// contract — the daemon's EOA must own the PCA NFT for `pca register-agent`,
+// `pca deregister-agent` and `pca funds` to land. `pca settle` is
+// permissionless; read-side (`pca info`) is permissionless.
 const pcaCmd = program
   .command('pca')
-  .description('Publishing Conviction Account: create, authorize keys, top-up, inspect');
+  .description('Publishing Conviction Account: create, register agents, top-up, settle, inspect');
 
 pcaCmd
   .command('create')
@@ -2625,19 +2626,19 @@ pcaCmd
   });
 
 pcaCmd
-  .command('authorize <accountId> <key>')
-  .description('Register `key` as a conviction agent on the PCA (owner-only on chain)')
-  .action(async (accountId: string, key: string) => {
+  .command('register-agent <accountId> <agent>')
+  .description('Register `agent` as a conviction agent on the PCA (owner-only on chain)')
+  .action(async (accountId: string, agent: string) => {
     try {
       if (!/^\d+$/.test(accountId)) {
         console.error('accountId must be a non-negative integer');
         process.exit(1);
       }
       const client = await ApiClient.connect();
-      const result = await client.authorizePcaKey(accountId, key);
-      console.log(`Authorized key on PCA ${result.accountId}:`);
-      console.log(`  key:        ${result.key}`);
-      console.log(`  authorized: ${result.authorized} (verified via on-chain read)`);
+      const result = await client.registerPcaAgent(accountId, agent);
+      console.log(`Registered agent on PCA ${result.accountId}:`);
+      console.log(`  agent:      ${result.agent}`);
+      console.log(`  registered: ${result.registered} (verified via on-chain read)`);
       console.log(`  txHash:     ${result.txHash}`);
       console.log(`  block:      ${result.blockNumber}`);
     } catch (err) {

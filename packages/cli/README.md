@@ -74,9 +74,16 @@ for resource-constrained hosts (a Raspberry Pi runs comfortably at 256-512).
 
 Each open libp2p connection costs one file descriptor. With the default
 capacity and a 1:2 multiplier, the daemon needs **at least `max(4096,
-maxConnections × 2)` file descriptors** of headroom (the 4096 floor accounts
-for SQLite, log files, the daemon HTTP server, and other non-libp2p fd
-consumers). For default capacity that means `ulimit -n ≥ 4096`.
+maxConnections × 2)` file descriptors** (equivalently `max(4096, capacity × 4)`
+since `maxConnections = capacity × 2`). The 4096 floor accounts for SQLite,
+log files, the daemon HTTP server, and other non-libp2p fd consumers.
+
+| `relayServerCapacity` | derived `maxConnections` | recommended `ulimit -n` |
+|---|---|---|
+| 256  (Pi-class)        | 512  | 4096 (floor wins) |
+| 1024 (default)         | 2048 | 4096 (floor wins) |
+| 2048                   | 4096 | 8192 |
+| 4096 (big iron)        | 8192 | 16384 |
 
 The daemon checks the host's `RLIMIT_NOFILE` at startup and emits an
 operator-facing warning if the soft limit is below the recommended value.

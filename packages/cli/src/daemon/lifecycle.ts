@@ -561,6 +561,7 @@ export async function runDaemonInner(
     relayPeers,
     announceAddresses: config.announceAddresses,
     nodeRole: role,
+    relayServerCapacity: config.relayServerCapacity,
     syncContextGraphs: syncContextGraphs,
     storeConfig: config.store ? {
       backend: config.store.backend,

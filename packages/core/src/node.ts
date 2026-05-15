@@ -82,14 +82,57 @@ export interface DerivedRelayCaps {
 }
 
 /**
+ * Validate an operator-supplied `relayServerCapacity` value. Capacity comes
+ * from external config (config.json, env, etc.) so this defends against
+ * `0`, negatives, NaN, Infinity, fractional values, non-numbers, and empty
+ * strings — any of which would silently produce invalid limits or libp2p
+ * startup failures (a `0` capacity, for instance, would cap streams /
+ * connections at 0 and brick the relay; a fractional value would propagate
+ * into libp2p's `maxConnections` which expects an integer).
+ *
+ * Returns `null` when the input is unset (so callers can apply their own
+ * default). Returns an `{ ok: false }` verdict with a human-readable
+ * reason for invalid input — the caller (start()) downgrades to the
+ * default and emits an operator-facing warning.
+ */
+export type RelayCapacityValidation =
+  | { ok: true; value: number }
+  | { ok: false; reason: string };
+export function validateRelayServerCapacity(input: unknown): RelayCapacityValidation | null {
+  if (input == null) return null;
+  if (typeof input !== 'number') {
+    return { ok: false, reason: `expected number, got ${typeof input}` };
+  }
+  if (!Number.isFinite(input)) {
+    return { ok: false, reason: `expected finite number, got ${input}` };
+  }
+  if (!Number.isInteger(input)) {
+    return { ok: false, reason: `expected integer, got ${input}` };
+  }
+  if (input < 1) {
+    return { ok: false, reason: `expected >= 1, got ${input}` };
+  }
+  return { ok: true, value: input };
+}
+
+/**
  * Derive the full relay-related cap set from a single capacity value. The
  * 1:2 ratio is intentional: each reservation costs one long-lived control
  * connection, plus circuits going through this relay open additional
  * HOP+STOP streams (multiplexed) and other peers can connect for non-relay
  * reasons (DHT, gossip, direct dials). Doubling the capacity for streams
  * and connections gives realistic headroom without overcommitting.
+ *
+ * Throws on invalid input (non-finite, non-integer, < 1) — `start()`
+ * gates this with `validateRelayServerCapacity()` so the throw is purely
+ * a defensive backstop for direct callers.
  */
 export function deriveRelayCaps(capacity: number): DerivedRelayCaps {
+  if (!Number.isInteger(capacity) || capacity < 1) {
+    throw new TypeError(
+      `deriveRelayCaps: capacity must be a positive integer, got ${capacity}`,
+    );
+  }
   const streamCap = capacity * RELAY_CAPACITY_MULTIPLIER;
   return {
     maxReservations: capacity,
@@ -100,6 +143,15 @@ export function deriveRelayCaps(capacity: number): DerivedRelayCaps {
     maxInboundStopStreams: streamCap,
   };
 }
+
+/**
+ * Severity of a `checkFdLimit` log emission. The "ok" path is
+ * deliberately `info` — emitting it via `console.warn` would make the
+ * level unreliable for operator alerting (every healthy startup would
+ * trip warning-level filters). Only the under-provisioned and
+ * unreadable-limit paths are `warn`.
+ */
+export type FdLimitLogLevel = 'info' | 'warn';
 
 /**
  * Emit an informational/warning log at relay startup about the host's
@@ -113,8 +165,15 @@ export function deriveRelayCaps(capacity: number): DerivedRelayCaps {
  * EMFILE before libp2p hits its own cap, the only signal is opaque
  * "peer rejected" errors in logs. Surfacing the discrepancy at startup
  * gives operators a loud, actionable signal.
+ *
+ * The callback receives `(level, msg)` so consumers can route each
+ * emission to the appropriate logger sink (info vs warn). Mapping the
+ * "ok" line to `info` keeps the warn channel meaningful for alerting.
  */
-export function checkFdLimit(maxConnections: number, log: (msg: string) => void): void {
+export function checkFdLimit(
+  maxConnections: number,
+  log: (level: FdLimitLogLevel, msg: string) => void,
+): void {
   const recommended = Math.max(4096, maxConnections * RELAY_CAPACITY_MULTIPLIER);
   try {
     const report = (process as any).report?.getReport?.();
@@ -123,7 +182,8 @@ export function checkFdLimit(maxConnections: number, log: (msg: string) => void)
     if (typeof soft === 'number') {
       if (soft < recommended) {
         log(
-          `WARN: relay server enabled with maxConnections=${maxConnections}, ` +
+          'warn',
+          `relay server enabled with maxConnections=${maxConnections}, ` +
             `but host ulimit -n soft=${soft} is below the recommended ${recommended} ` +
             `(= max(4096, maxConnections × 2)). The kernel will reject new ` +
             `socket() calls with EMFILE once the daemon hits the limit, ` +
@@ -133,17 +193,20 @@ export function checkFdLimit(maxConnections: number, log: (msg: string) => void)
         );
       } else {
         log(
+          'info',
           `relay server: ulimit -n soft=${soft} >= recommended ${recommended}, ok`,
         );
       }
     } else {
       log(
+        'warn',
         `relay server: could not read host ulimit -n via process.report.userLimits; ` +
           `ensure ulimit -n >= ${recommended} on this host`,
       );
     }
   } catch (err: any) {
     log(
+      'warn',
       `relay server: error reading ulimit -n (${err?.message ?? String(err)}); ` +
         `ensure ulimit -n >= ${recommended} on this host`,
     );
@@ -265,10 +328,29 @@ export class DKGNode {
           `enableRelayServer=${this.config.enableRelayServer}); value ignored`,
       );
     }
-    const relayCapacity = enableRelay
-      ? (this.config.relayServerCapacity ?? DEFAULT_RELAY_SERVER_CAPACITY)
-      : null;
-    const relayCaps = relayCapacity != null ? deriveRelayCaps(relayCapacity) : null;
+    // Validate the operator-supplied capacity (defends against 0,
+    // negatives, NaN, Infinity, fractional values, non-numbers — any
+    // of which would propagate into libp2p's stream/connection caps
+    // and produce invalid limits or startup failures, per Codex
+    // tier-1 finding on PR #524). Invalid values fall back to the
+    // documented default with a loud warning so the misconfig is
+    // visible.
+    let effectiveRelayCapacity: number | null = null;
+    if (enableRelay) {
+      const verdict = validateRelayServerCapacity(this.config.relayServerCapacity);
+      if (verdict == null) {
+        effectiveRelayCapacity = DEFAULT_RELAY_SERVER_CAPACITY;
+      } else if (verdict.ok) {
+        effectiveRelayCapacity = verdict.value;
+      } else {
+        console.warn(
+          `[dkg-core] relayServerCapacity=${String(this.config.relayServerCapacity)} ` +
+            `is invalid (${verdict.reason}); falling back to default ${DEFAULT_RELAY_SERVER_CAPACITY}`,
+        );
+        effectiveRelayCapacity = DEFAULT_RELAY_SERVER_CAPACITY;
+      }
+    }
+    const relayCaps = effectiveRelayCapacity != null ? deriveRelayCaps(effectiveRelayCapacity) : null;
 
     // TCP keepAlive helps prevent idle relay connections from being dropped by
     // middleboxes or remote timeouts (common cause of ECONNRESET).
@@ -372,7 +454,16 @@ export class DKGNode {
           defaultDataLimit: BigInt(1 << 24),
         },
       });
-      checkFdLimit(relayCaps.maxConnections, (msg) => console.warn(`[dkg-core] ${msg}`));
+      // Route the ulimit log emission to the appropriate console sink
+      // by level. The "ok" line is purely informational; only the
+      // under-provisioned and unreadable-limit paths warrant warn.
+      checkFdLimit(relayCaps.maxConnections, (level, msg) => {
+        if (level === 'warn') {
+          console.warn(`[dkg-core] ${msg}`);
+        } else {
+          console.info(`[dkg-core] ${msg}`);
+        }
+      });
     }
 
     const listenAddrs = [

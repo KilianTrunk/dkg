@@ -767,6 +767,17 @@ export interface DKGAgentConfig {
   /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
   nodeRole?: 'core' | 'edge';
   /**
+   * Core Node relay-server capacity tuning. Forwarded straight into
+   * `DKGNodeConfig.relayServerCapacity` — sets the maximum number of
+   * simultaneous circuit-relay v2 reservations this node will hold.
+   * HOP/STOP stream caps and `connectionManager.maxConnections` are
+   * derived at a 1:2 ratio. Default 1024 when omitted on a Core Node;
+   * ignored on edge nodes (with a startup warning). Invalid values
+   * fall back to the default. See `packages/core/src/types.ts` for
+   * the full rationale + ulimit -n requirements.
+   */
+  relayServerCapacity?: number;
+  /**
    * Path to the V10 Random Sampling prover write-ahead log. Core
    * nodes only; ignored on edge. When omitted, an in-memory WAL is
    * used (loses crash-recovery context on restart). Production
@@ -1329,6 +1340,7 @@ export class DKGAgent {
       enableMdns: !config.bootstrapPeers?.length && !config.relayPeers?.length,
       privateKey: keypair.secretKey,
       nodeRole,
+      relayServerCapacity: config.relayServerCapacity,
     };
 
     const node = new DKGNode(nodeConfig);

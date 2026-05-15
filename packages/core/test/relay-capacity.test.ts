@@ -2,19 +2,24 @@
 //
 // Unit tests for the Core Node relay-server capacity tuning helpers
 // landed in `feat/libp2p-relay-capacity-and-ttl` (PR1 of the libp2p
-// reachability hardening series). Two surfaces under test:
+// reachability hardening series). Three surfaces under test:
 //
 //   1. `deriveRelayCaps(capacity)` — the pure 1:2 ratio derivation
 //      that turns the operator-facing `relayServerCapacity` knob into
 //      the full set of HOP/STOP stream caps + connectionManager limit.
+//      Now also asserts the defensive throw path for direct callers.
 //
-//   2. `checkFdLimit(maxConnections, log)` — the startup helper that
+//   2. `validateRelayServerCapacity(input)` — the input-validation
+//      gate that defends against operator config containing 0,
+//      negatives, NaN, Infinity, fractional values, non-numbers, etc.
+//      Added in response to Codex review on PR #524.
+//
+//   3. `checkFdLimit(maxConnections, log)` — the startup helper that
 //      reads the host's RLIMIT_NOFILE via process.report.userLimits
-//      and emits an actionable warning when the soft limit is below
-//      the recommended `max(4096, maxConnections × 2)`. Critical for
-//      operators on systemd / Docker hosts whose default limits are
-//      typically 1024 — silently below what a 1024-reservation Core
-//      Node needs.
+//      and routes log emissions to the appropriate severity level
+//      (info for ok, warn for under-provisioned / unreadable). The
+//      level split also came from PR #524 review — emitting the ok
+//      line at warn level breaks operator alerting downstream.
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
@@ -24,6 +29,7 @@ import {
   RELAY_RESERVATION_TTL_MS,
   EDGE_NODE_MAX_CONNECTIONS,
   deriveRelayCaps,
+  validateRelayServerCapacity,
   checkFdLimit,
 } from '../src/node.js';
 
@@ -71,6 +77,59 @@ describe('deriveRelayCaps', () => {
     // bump multiplies across the network's broad install base.
     expect(EDGE_NODE_MAX_CONNECTIONS).toBe(500);
   });
+
+  it('throws on invalid input as a defensive backstop for direct callers', () => {
+    // start() gates this with validateRelayServerCapacity(); the
+    // throw is purely insurance in case some future caller wires
+    // around the validator. Hard fail is preferable to silently
+    // shipping invalid limits into libp2p.
+    expect(() => deriveRelayCaps(0)).toThrow(TypeError);
+    expect(() => deriveRelayCaps(-1)).toThrow(TypeError);
+    expect(() => deriveRelayCaps(1.5)).toThrow(TypeError);
+    expect(() => deriveRelayCaps(NaN)).toThrow(TypeError);
+    expect(() => deriveRelayCaps(Infinity)).toThrow(TypeError);
+  });
+});
+
+describe('validateRelayServerCapacity', () => {
+  it('returns null for unset/undefined input (so callers can apply their own default)', () => {
+    expect(validateRelayServerCapacity(undefined)).toBeNull();
+    expect(validateRelayServerCapacity(null)).toBeNull();
+  });
+
+  it('accepts positive integers', () => {
+    expect(validateRelayServerCapacity(1)).toEqual({ ok: true, value: 1 });
+    expect(validateRelayServerCapacity(256)).toEqual({ ok: true, value: 256 });
+    expect(validateRelayServerCapacity(DEFAULT_RELAY_SERVER_CAPACITY)).toEqual({
+      ok: true,
+      value: DEFAULT_RELAY_SERVER_CAPACITY,
+    });
+    expect(validateRelayServerCapacity(8192)).toEqual({ ok: true, value: 8192 });
+  });
+
+  it('rejects 0 and negatives — would brick the relay or produce garbage limits', () => {
+    expect(validateRelayServerCapacity(0)).toEqual({ ok: false, reason: expect.stringContaining('>= 1') });
+    expect(validateRelayServerCapacity(-1)).toEqual({ ok: false, reason: expect.stringContaining('>= 1') });
+    expect(validateRelayServerCapacity(-1024)).toEqual({ ok: false, reason: expect.stringContaining('>= 1') });
+  });
+
+  it('rejects NaN and Infinity — non-finite values would propagate undefined behaviour', () => {
+    expect(validateRelayServerCapacity(NaN)).toEqual({ ok: false, reason: expect.stringContaining('finite') });
+    expect(validateRelayServerCapacity(Infinity)).toEqual({ ok: false, reason: expect.stringContaining('finite') });
+    expect(validateRelayServerCapacity(-Infinity)).toEqual({ ok: false, reason: expect.stringContaining('finite') });
+  });
+
+  it('rejects fractional values — libp2p expects integer caps', () => {
+    expect(validateRelayServerCapacity(1.5)).toEqual({ ok: false, reason: expect.stringContaining('integer') });
+    expect(validateRelayServerCapacity(1024.0001)).toEqual({ ok: false, reason: expect.stringContaining('integer') });
+  });
+
+  it('rejects non-number types (strings, booleans, objects)', () => {
+    expect(validateRelayServerCapacity('1024' as any)).toEqual({ ok: false, reason: expect.stringContaining('number') });
+    expect(validateRelayServerCapacity(true as any)).toEqual({ ok: false, reason: expect.stringContaining('number') });
+    expect(validateRelayServerCapacity({} as any)).toEqual({ ok: false, reason: expect.stringContaining('number') });
+    expect(validateRelayServerCapacity([] as any)).toEqual({ ok: false, reason: expect.stringContaining('number') });
+  });
 });
 
 describe('checkFdLimit', () => {
@@ -88,14 +147,15 @@ describe('checkFdLimit', () => {
     return vi.spyOn(process.report, 'getReport').mockReturnValue(report);
   }
 
-  it('emits WARN when soft limit is below recommended (= max(4096, maxConnections × 2))', () => {
+  it('emits warn level when soft limit is below recommended (= max(4096, maxConnections × 2))', () => {
     spyOnReport({ userLimits: { open_files: { soft: 1024, hard: 'unlimited' } } });
     const log = vi.fn();
     // maxConnections=2048 → recommended = max(4096, 4096) = 4096; soft=1024 is below.
     checkFdLimit(2048, log);
     expect(log).toHaveBeenCalledTimes(1);
-    const msg = log.mock.calls[0][0] as string;
-    expect(msg).toMatch(/^WARN: relay server enabled/);
+    const [level, msg] = log.mock.calls[0];
+    expect(level).toBe('warn');
+    expect(msg).toMatch(/^relay server enabled/);
     expect(msg).toContain('soft=1024');
     expect(msg).toContain('recommended 4096');
     // Operator-facing remediation hint must surface all three deployment
@@ -105,12 +165,18 @@ describe('checkFdLimit', () => {
     expect(msg).toMatch(/--ulimit nofile=4096:4096/);
   });
 
-  it('emits the ok line when soft limit meets or exceeds the recommended value', () => {
+  it('emits info level (NOT warn) when soft limit meets or exceeds the recommended value', () => {
+    // Codex review on PR #524: emitting the ok line at warn level
+    // would trip operator-facing alerting downstream on every
+    // healthy startup. The level split is the contract being
+    // pinned here.
     spyOnReport({ userLimits: { open_files: { soft: 8192, hard: 'unlimited' } } });
     const log = vi.fn();
     checkFdLimit(2048, log);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log.mock.calls[0][0]).toMatch(/soft=8192 >= recommended 4096, ok/);
+    const [level, msg] = log.mock.calls[0];
+    expect(level).toBe('info');
+    expect(msg).toMatch(/soft=8192 >= recommended 4096, ok/);
   });
 
   it('uses the 4096 floor when 2 × maxConnections would be smaller', () => {
@@ -122,18 +188,21 @@ describe('checkFdLimit', () => {
     spyOnReport({ userLimits: { open_files: { soft: 1500, hard: 'unlimited' } } });
     const log = vi.fn();
     checkFdLimit(512, log);
-    const msg = log.mock.calls[0][0] as string;
+    const [level, msg] = log.mock.calls[0];
+    expect(level).toBe('warn');
     expect(msg).toContain('recommended 4096');
     expect(msg).not.toContain('recommended 1024');
   });
 
-  it('logs the can-not-read fallback when userLimits is missing (e.g. exotic Node build)', () => {
+  it('logs the can-not-read fallback at warn level when userLimits is missing (e.g. exotic Node build)', () => {
     spyOnReport({ userLimits: {} });
     const log = vi.fn();
     checkFdLimit(2048, log);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log.mock.calls[0][0]).toMatch(/could not read host ulimit/);
-    expect(log.mock.calls[0][0]).toContain('>= 4096');
+    const [level, msg] = log.mock.calls[0];
+    expect(level).toBe('warn');
+    expect(msg).toMatch(/could not read host ulimit/);
+    expect(msg).toContain('>= 4096');
   });
 
   it('logs the can-not-read fallback when soft is non-numeric (e.g. "unlimited")', () => {
@@ -144,18 +213,22 @@ describe('checkFdLimit', () => {
     const log = vi.fn();
     checkFdLimit(2048, log);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log.mock.calls[0][0]).toMatch(/could not read host ulimit/);
+    const [level, msg] = log.mock.calls[0];
+    expect(level).toBe('warn');
+    expect(msg).toMatch(/could not read host ulimit/);
   });
 
-  it('logs the error fallback when process.report.getReport() throws', () => {
+  it('logs the error fallback at warn level when process.report.getReport() throws', () => {
     vi.spyOn(process.report, 'getReport').mockImplementation(() => {
       throw new Error('exotic test environment');
     });
     const log = vi.fn();
     checkFdLimit(2048, log);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log.mock.calls[0][0]).toMatch(/error reading ulimit/);
-    expect(log.mock.calls[0][0]).toContain('exotic test environment');
-    expect(log.mock.calls[0][0]).toContain('>= 4096');
+    const [level, msg] = log.mock.calls[0];
+    expect(level).toBe('warn');
+    expect(msg).toMatch(/error reading ulimit/);
+    expect(msg).toContain('exotic test environment');
+    expect(msg).toContain('>= 4096');
   });
 });

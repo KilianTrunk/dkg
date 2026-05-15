@@ -64,8 +64,14 @@ export interface DKGNodeConfig {
    *
    * IMPORTANT: bumping this above the host's `ulimit -n` will cause
    * silent peer rejections (EMFILE on socket()) once the connection
-   * count grows. Recommended host limit: max(4096, capacity × 2). The
-   * daemon emits a startup warning if the soft limit is below this.
+   * count grows. Recommended host fd limit: `max(4096, capacity × 4)`
+   * (equivalently `max(4096, maxConnections × 2)` since
+   * `maxConnections = capacity × 2`). The daemon emits a startup
+   * warning if the soft limit is below this.
+   *
+   * Invalid values (0, negative, NaN, fractional, non-numeric) are
+   * rejected at startup and the daemon falls back to the default with
+   * an operator-facing warning.
    */
   relayServerCapacity?: number;
 }

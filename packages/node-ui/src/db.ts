@@ -272,6 +272,35 @@ export class DashboardDB {
       }
     }
 
+    if (version < 10) {
+      // The V1 CREATE statement above already lists the relay_* columns,
+      // which covers fresh installs. For nodes upgrading from a pre-V10
+      // schema the table already exists, so `CREATE TABLE IF NOT EXISTS`
+      // is a no-op and the new columns wouldn't be added — `insertSnapshot()`
+      // would then fail with `no such column: relay_capacity` on the next
+      // metric tick. This block uses the same defensive idempotent
+      // PRAGMA-then-ALTER pattern as `version < 9` to add any missing
+      // relay_* columns. Not "V9 backward compat" in the data-preservation
+      // sense — just making the schema bump safe to apply to whatever
+      // table happens to already exist.
+      const cols = new Set(
+        (this.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
+          .map((c) => c.name),
+      );
+      const relayCols = [
+        'relay_capacity',
+        'relay_reservation_count',
+        'relay_active_circuits',
+        'relay_bytes_in',
+        'relay_bytes_out',
+      ];
+      for (const col of relayCols) {
+        if (!cols.has(col)) {
+          this.db.exec(`ALTER TABLE metric_snapshots ADD COLUMN ${col} INTEGER;`);
+        }
+      }
+    }
+
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
     const savedRetention = this.db.prepare("SELECT value FROM settings WHERE key = 'retentionDays'").get() as { value: string } | undefined;

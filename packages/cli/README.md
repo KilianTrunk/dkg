@@ -46,6 +46,55 @@ dkg shared-memory publish my-project
 dkg query my-project -q "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10"
 ```
 
+## Running a Core Node (relay operator)
+
+A Core Node is a publicly-reachable host that runs a libp2p circuit-relay v2
+server, providing NAT traversal for the (much larger) population of edge
+agents. Edge nodes don't need any of the configuration in this section — only
+operators of relay-serving Core Nodes do.
+
+### Capacity tuning
+
+Default capacity is **1024 simultaneous reservations**. From that single knob
+we derive all the other relay-related libp2p limits at a 1:2 ratio (HOP/STOP
+stream caps, `connectionManager.maxConnections`) so capacity=1024 → 2048
+streams + 2048 max conns. Override via the `relayServerCapacity` field in
+`DKGNodeConfig` (config.json) when you want to scale up for big iron or down
+for resource-constrained hosts (a Raspberry Pi runs comfortably at 256-512).
+
+```jsonc
+{
+  "nodeRole": "core",            // enables the relay server
+  "relayServerCapacity": 1024,   // default; bump or shrink as needed
+  // ...
+}
+```
+
+### Required `ulimit -n`
+
+Each open libp2p connection costs one file descriptor. With the default
+capacity and a 1:2 multiplier, the daemon needs **at least `max(4096,
+maxConnections × 2)` file descriptors** of headroom (the 4096 floor accounts
+for SQLite, log files, the daemon HTTP server, and other non-libp2p fd
+consumers). For default capacity that means `ulimit -n ≥ 4096`.
+
+The daemon checks the host's `RLIMIT_NOFILE` at startup and emits an
+operator-facing warning if the soft limit is below the recommended value.
+**Without the bump, the kernel will reject new `socket()` calls with
+`EMFILE` once the daemon hits the host limit, manifesting as silent peer
+rejections rather than a crash** — fix it preemptively:
+
+| Deployment shape | How to bump |
+|---|---|
+| Shell session | `ulimit -n 4096` before `dkg start` |
+| systemd unit | `LimitNOFILE=4096` in the `[Service]` block |
+| Docker | `--ulimit nofile=4096:4096` |
+| Kubernetes | `securityContext.sysctls` or container-runtime override |
+
+To verify the live daemon's effective limit, look for the startup log line
+`[dkg-core] relay server: ulimit -n soft=<N> >= recommended <M>, ok` (or the
+WARN equivalent if the host needs tuning).
+
 ## Commands
 
 | Command | Description |

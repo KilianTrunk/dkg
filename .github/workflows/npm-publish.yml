@@ -307,11 +307,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ steps.read-nvmrc.outputs.NODE_VERSION }}
-          # Cache pnpm at the dependency-install layer is acceptable
-          # here because NPM_TOKEN is not in scope. The publish job
-          # disables the cache entirely so a poisoned restored
-          # node_modules cannot influence the credential-bearing run.
-          cache: pnpm
+          # No cache on the publish path. Tag-triggered runs are
+          # infrequent (~weekly), so a clean install is acceptable
+          # and avoids the zizmor cache-poisoning surface entirely.
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

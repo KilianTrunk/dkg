@@ -985,7 +985,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
           operation: "verified_memory_updated",
           source: "api",
         });
-      } else if (result.status === "partial") {
+      } else if (result.status === "partial" || result.status === "no_quorum") {
         emitMemoryGraphChanged?.({
           contextGraphId,
           layers: ["wm"],
@@ -993,7 +993,17 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
           source: "api",
         });
       }
-      return jsonResponse(res, 200, { ...result, batchId: String(batchId) });
+      if (result.status === "verified") {
+        return jsonResponse(res, 200, { ...result, batchId: String(batchId) });
+      }
+      return jsonResponse(res, 409, {
+        ...result,
+        batchId: String(batchId),
+        error:
+          result.status === "partial"
+            ? "Verification quorum was not reached; partial trust metadata was written without a chain transaction"
+            : "Verification quorum was not reached; no verified memory was written",
+      });
     } catch (err) {
       // CLI-9 dup #158 #159: a non-existent (cgId, vmId, batchId)
       // tuple used to bubble up a chain custom-error revert as a

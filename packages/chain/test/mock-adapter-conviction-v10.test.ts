@@ -70,3 +70,20 @@ describe('MockChainAdapter — V10 conviction agent register/deregister', () => 
       .rejects.toThrow(/AgentAlreadyRegistered/);
   });
 });
+
+describe('MockChainAdapter — V10 conviction topUp/settle', () => {
+  it('topUpConvictionAccount accumulates the buffer and settle succeeds', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createConvictionAccount(COMMITTED);
+
+    const top = await mock.topUpConvictionAccount(accountId, COMMITTED);
+    expect(top.success).toBe(true);
+    expect((await mock.getConvictionAccountInfo(accountId))!.topUpBuffer).toBe(COMMITTED);
+
+    await mock.topUpConvictionAccount(accountId, COMMITTED);
+    expect((await mock.getConvictionAccountInfo(accountId))!.topUpBuffer).toBe(COMMITTED * 2n);
+
+    const settled = await mock.settleConvictionAccount(accountId);
+    expect(settled.success).toBe(true);
+  });
+});

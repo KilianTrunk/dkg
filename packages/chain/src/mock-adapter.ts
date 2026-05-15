@@ -498,6 +498,17 @@ export class MockChainAdapter implements ChainAdapter {
     return acct;
   }
 
+  async topUpConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
+    const acct = this.requireConvictionAccount(accountId);
+    acct.topUpBuffer += amount;
+    return this.txResult(true);
+  }
+
+  async settleConvictionAccount(accountId: bigint): Promise<TxResult> {
+    this.requireConvictionAccount(accountId);
+    return this.txResult(true);
+  }
+
   async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
     const acct = this.requireConvictionAccount(accountId);
     const key = ethers.getAddress(agent).toLowerCase();

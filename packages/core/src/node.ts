@@ -304,7 +304,15 @@ export function checkFdLimit(
 
 interface RelayTarget {
   peerId: ReturnType<typeof peerIdFromString>;
-  addr: any;
+  /**
+   * All multiaddrs supplied for this relay peer. A config like
+   * `[relayA-tcp, relayA-ws]` (same peerId, different transports)
+   * collapses to one `RelayTarget` whose `addrs` holds both — libp2p
+   * tries each in order so a stale address doesn't take the relay
+   * out of rotation. Codex PR #526 round 5c caught the round-5
+   * regression where same-peerId entries were dropped as duplicates.
+   */
+  addrs: any[];
 }
 
 /**
@@ -527,10 +535,21 @@ export class DKGNode {
     const usableRelayCandidates: RelayTarget[] = [];
     if (this.config.relayPeers?.length) {
       const { multiaddr: parseMultiaddr } = await import('@multiformats/multiaddr');
-      const seenPids = new Set<string>();
+      // Per-peerId aggregation: same peerId with DIFFERENT multiaddrs
+      // (e.g. `[relayA-tcp, relayA-ws]`) collapses to one
+      // `RelayTarget` carrying BOTH addrs — libp2p tries each in
+      // order on dial, so a stale transport doesn't take the relay
+      // out of rotation. Same peerId with the SAME multiaddr (e.g.
+      // `[relayA, relayA]` or copy-paste) is the true-duplicate
+      // case and gets dropped + warned. Codex PR #526 round 5c
+      // caught that the round-5 fix conflated these two cases and
+      // dropped alternate-transport addrs as duplicates.
+      const candidateByPid = new Map<string, RelayTarget>();
+      const seenAddrStrings = new Set<string>();
       let malformed = 0;
       let selfHits = 0;
-      let dupes = 0;
+      let dupAddrs = 0;
+      let altAddrs = 0;
       for (const raw of this.config.relayPeers) {
         let ma;
         try {
@@ -555,21 +574,31 @@ export class DKGNode {
           selfHits += 1;
           continue;
         }
-        if (seenPids.has(p2p)) {
-          dupes += 1;
+        const maStr = ma.toString();
+        if (seenAddrStrings.has(maStr)) {
+          dupAddrs += 1;
           continue;
         }
-        seenPids.add(p2p);
-        usableRelayCandidates.push({ peerId: pid, addr: ma });
+        seenAddrStrings.add(maStr);
+        const existing = candidateByPid.get(p2p);
+        if (existing) {
+          existing.addrs.push(ma);
+          altAddrs += 1;
+        } else {
+          const target: RelayTarget = { peerId: pid, addrs: [ma] };
+          candidateByPid.set(p2p, target);
+          usableRelayCandidates.push(target);
+        }
       }
-      if (malformed || selfHits || dupes) {
+      if (malformed || selfHits || dupAddrs || altAddrs) {
         const reasons: string[] = [];
         if (malformed) reasons.push(`${malformed} malformed (no /p2p component or unparseable)`);
         if (selfHits) reasons.push(`${selfHits} pointing at this node's own peerId`);
-        if (dupes) reasons.push(`${dupes} duplicate peerIds`);
+        if (dupAddrs) reasons.push(`${dupAddrs} exact-duplicate multiaddrs`);
+        if (altAddrs) reasons.push(`${altAddrs} alternate addrs merged into existing relay peers`);
         console.warn(
           `[dkg-core] relayPeers: ${this.config.relayPeers.length} entries supplied, ` +
-            `${usableRelayCandidates.length} usable (skipped ${reasons.join(', ')})`,
+            `${usableRelayCandidates.length} distinct relay peers usable (${reasons.join(', ')})`,
         );
       }
     }
@@ -668,10 +697,18 @@ export class DKGNode {
     ];
 
     // Nodes that already know their NAT status skip autoNAT probing:
-    // - relayPeers set → agent behind NAT (knows it needs relay)
+    // - usable relayPeers configured → agent behind NAT (knows it needs relay)
     // - enableRelayServer/core → public node acting as relay
+    //
+    // Gated on `usableRelayCandidates.length > 0` rather than raw
+    // `relayPeers.length` (Codex PR #526 round 5c): when every
+    // configured relay is filtered out as malformed/self/duplicate,
+    // the node falls back to the no-relays path and would otherwise
+    // also lose AutoNAT — leaving it with neither relay reachability
+    // nor NAT probing. Re-using the same predicate as
+    // `isEdgeWithRelays` keeps the two gates in sync.
     const useAutoNAT = this.config.enableAutoNAT ??
-      !(this.config.relayPeers?.length || enableRelay);
+      !(usableRelayCandidates.length > 0 || enableRelay);
 
     const services: Record<string, any> = {
       identify: identify(),
@@ -853,15 +890,20 @@ export class DKGNode {
       for (const candidate of usableRelayCandidates) {
         this.relayTargets.push(candidate);
 
+        // Merge ALL addrs for this peer so libp2p can fall back to
+        // alternates if the primary multiaddr is stale (Codex PR #526
+        // round 5c).
         await this.node.peerStore.merge(candidate.peerId, {
-          multiaddrs: [candidate.addr],
+          multiaddrs: candidate.addrs,
           tags: {
             'keep-alive-dkg-relay': { value: 100 },
           },
         });
 
         try {
-          await this.node.dial(candidate.addr);
+          // libp2p `dial` accepts an array of multiaddrs and tries
+          // them in order — leverages every supplied transport.
+          await this.node.dial(candidate.addrs);
         } catch {
           // watchdog will retry
         }
@@ -973,7 +1015,7 @@ export class DKGNode {
     let forcedRedialsThisTick = 0;
     const now = Date.now();
 
-    for (const { peerId, addr } of this.relayTargets) {
+    for (const { peerId, addrs } of this.relayTargets) {
       if (peerId.equals(node.peerId)) continue;
 
       const relayPidStr = peerId.toString();
@@ -1029,15 +1071,19 @@ export class DKGNode {
         );
       if (needsForcedReservationRedial) {
         // Honour the per-tick redial budget. `missingSlotsAtTickStart`
-        // is the deficit at tick start; once we've dispatched dials
-        // for every missing slot we stop, even if the new
-        // `/p2p-circuit` self-addrs haven't shown up yet — the
-        // in-flight reservations will fill the deficit and the next
-        // tick will reassess. Treat this as a benign "still
+        // is the deficit at tick start; once we've SUCCESSFULLY
+        // dispatched dials for every missing slot we stop, even if
+        // the new `/p2p-circuit` self-addrs haven't shown up yet —
+        // the in-flight reservations will fill the deficit and the
+        // next tick will reassess. Treat this as a benign "still
         // recovering" state, same as a recent forced redial within
         // the grace window: account for it as not-fully-healthy but
         // don't apply exponential backoff (the next tick needs to
         // arrive to see whether the in-flight dials succeeded).
+        //
+        // Only SUCCESSFUL redials count against the budget (Codex
+        // PR #526 round 5c): a failed `node.dial()` shouldn't lock us
+        // out of trying the next eligible relay this tick.
         if (
           this.relayReservationCountTarget > 1 &&
           missingSlotsAtTickStart > 0 &&
@@ -1058,7 +1104,6 @@ export class DKGNode {
           continue;
         }
 
-        forcedRedialsThisTick += 1;
         allHealthy = false;
         // Actual corrective action below (drop + redial); this is a
         // real failure the watchdog must back off on.
@@ -1087,8 +1132,11 @@ export class DKGNode {
         await new Promise(r => setTimeout(r, delayMs));
         let redialed = false;
         try {
-          await node.dial(addr);
+          // Pass all addrs so libp2p tries each transport in order
+          // (preserves multi-multiaddr-per-relay configs).
+          await node.dial(addrs);
           redialed = true;
+          forcedRedialsThisTick += 1;
           console.log(`[${ts()}] Relay watchdog: redialed ${short(relayPidStr)} for fresh reservation`);
         } catch (err: any) {
           console.log(`[${ts()}] Relay watchdog: reservation-redial failed for ${short(relayPidStr)}: ${err.message}`);
@@ -1120,7 +1168,7 @@ export class DKGNode {
       const delayMs = RELAY_REDIAL_DELAY_MS + Math.floor(Math.random() * 1000);
       await new Promise(r => setTimeout(r, delayMs));
       try {
-        await node.dial(addr);
+        await node.dial(addrs);
         console.log(`[${ts()}] Relay watchdog: reconnected to ${short(relayPidStr)}`);
         // Reservation may have been restored by this dial; refresh the
         // snapshot so the next iteration doesn't tear down another

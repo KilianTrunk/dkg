@@ -502,8 +502,8 @@ describe('Circuit Relay', () => {
     const dedupWarn = warnSpy.mock.calls.find((call) =>
       typeof call[0] === 'string'
       && call[0].includes('2 entries supplied')
-      && call[0].includes('1 usable')
-      && call[0].includes('duplicate peerIds'),
+      && call[0].includes('1 distinct relay peers usable')
+      && call[0].includes('exact-duplicate multiaddrs'),
     );
     expect(
       dedupWarn,
@@ -627,6 +627,78 @@ describe('Circuit Relay', () => {
     expect(distinctRelayPids.size).toBe(1);
   }, 15000);
 
+  it('preserves alternate multiaddrs for the same peerId as fallbacks (Codex PR #526 round 5c)', async () => {
+    // Bug Codex caught: the round-5 dedup-by-peerId dropped alternate
+    // multiaddrs for the same relay (e.g. `[relayA-tcp, relayA-ws]`
+    // collapsed to one address) — defeating libp2p's transport-fallback
+    // behaviour and clamping the node to fewer reservations than
+    // configured if the surviving address went stale.
+    //
+    // Round-5c fix: dedup is now by full multiaddr STRING, not by
+    // peerId; same-peerId-different-multiaddr entries get aggregated
+    // into one `RelayTarget` whose `addrs` carries both, and the
+    // node passes `addrs` (an array) to `node.dial()` so libp2p
+    // tries each in order.
+    //
+    // Test: spin up a real relay. Configure edge with the relay's
+    // real multiaddr PLUS a fake unreachable multiaddr that resolves
+    // to the SAME peerId (different transport endpoint).
+    // Expected: edge merges them under one peer, the warning
+    // categorises them as "alternate addrs merged", reservation
+    // count stays 1, AND the edge actually establishes a relay
+    // reservation (the real addr works even though the alternate
+    // one is unreachable).
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const relay = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    nodes.push(relay);
+    await relay.start();
+    const realAddr = relay.multiaddrs.find(a => a.includes('/tcp/'))!;
+    const realPidMatch = realAddr.match(/\/p2p\/([^/]+)$/);
+    expect(realPidMatch, 'relay multiaddr must include /p2p/<peerId>').not.toBeNull();
+    const relayPid = realPidMatch![1];
+    const fakeAlternateAddr = `/ip4/127.0.0.1/tcp/9/p2p/${relayPid}`;
+
+    const edge = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      relayPeers: [realAddr, fakeAlternateAddr],
+      relayReservationCount: 1,
+    });
+    nodes.push(edge);
+    await edge.start();
+
+    const altWarn = warnSpy.mock.calls.find((call) =>
+      typeof call[0] === 'string'
+      && call[0].includes('alternate addrs merged')
+      && call[0].includes('1 distinct relay peers usable'),
+    );
+    expect(
+      altWarn,
+      `expected alt-addrs-merged warning; got: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
+    ).toBeDefined();
+    warnSpy.mockRestore();
+
+    const deadline = Date.now() + 5_000;
+    let circuitAddrs: string[] = [];
+    while (Date.now() < deadline) {
+      circuitAddrs = edge.libp2p
+        .getMultiaddrs()
+        .map(ma => ma.toString())
+        .filter(a => a.includes('/p2p-circuit'));
+      if (circuitAddrs.length > 0) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+    expect(
+      circuitAddrs.length,
+      `edge should have established a reservation via the working addr; got: ${JSON.stringify(circuitAddrs)}`,
+    ).toBeGreaterThan(0);
+  }, 15000);
+
   it('falls back to no-relays path when every relayPeers entry is unusable (Codex PR #526 round 5b)', async () => {
     // Bug Codex caught: the legacy `/p2p-circuit` listener fallback
     // was gated on `else if (this.config.relayPeers?.length)`, which
@@ -654,12 +726,12 @@ describe('Circuit Relay', () => {
 
     const usableWarn = warnSpy.mock.calls.find((call) =>
       typeof call[0] === 'string'
-      && call[0].includes('0 usable')
+      && call[0].includes('0 distinct relay peers usable')
       && call[0].includes('malformed'),
     );
     expect(
       usableWarn,
-      `expected "0 usable / malformed" warning; got: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
+      `expected "0 distinct relay peers usable / malformed" warning; got: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
     ).toBeDefined();
     warnSpy.mockRestore();
 

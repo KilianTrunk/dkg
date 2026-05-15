@@ -7,7 +7,22 @@ export * from './event-bus.js';
 export { Logger, createOperationContext, type OperationContext, type OperationName, type LogSink } from './logger.js';
 export * from './crypto/index.js';
 export * from './proto/index.js';
-export { DKGNode } from './node.js';
+export {
+  DKGNode,
+  type RelayStats,
+  type RelayReservationDetail,
+  // Capacity helpers + constants from PR #524 (libp2p reachability hardening PR1).
+  // Re-exported here so dashboards / route handlers can import them
+  // without reaching into the deep import path.
+  DEFAULT_RELAY_SERVER_CAPACITY,
+  RELAY_CAPACITY_MULTIPLIER,
+  RELAY_DEFAULT_DURATION_LIMIT_MS,
+  RELAY_RESERVATION_TTL_MS,
+  EDGE_NODE_MAX_CONNECTIONS,
+  deriveRelayCaps,
+  checkFdLimit,
+  type DerivedRelayCaps,
+} from './node.js';
 export {
   type Network,
   type NodeIdentity,

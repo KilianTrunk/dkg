@@ -1049,6 +1049,24 @@ export async function runDaemonInner(
     },
     getRpcLatencyMs: async () => 0,
     isRpcHealthy: async () => true,
+    getRelayStats: () => {
+      // Returns null on edge nodes (no relay server); the collector
+      // tolerates undefined/null and writes the relay_* columns as
+      // NULL in that case.
+      const stats = agent.node.getRelayStats();
+      if (!stats) return null;
+      // Strip the unbounded `reservations[]` array — that lives only
+      // on the live `/api/relay/stats` route, not in the periodic
+      // SQLite snapshot. See RelayStatsSnapshot docstring in
+      // metrics-collector.ts for the full rationale.
+      return {
+        capacity: stats.capacity,
+        reservationCount: stats.reservationCount,
+        activeCircuits: stats.activeCircuits,
+        bytesIn: stats.bytesIn,
+        bytesOut: stats.bytesOut,
+      };
+    },
   };
 
   const metricsCollector = new MetricsCollector(
@@ -1776,7 +1794,22 @@ export async function runDaemonInner(
 
       // Node UI routes (metrics, operations, logs, saved queries, chat, static UI)
       const firstToken = validTokens.size > 0 ? validTokens.values().next().value as string : undefined;
-      const handled = await handleNodeUIRequest(req, res, reqUrl, dashDb, nodeUiStaticDir, undefined, metricsCollector, authEnabled ? firstToken : undefined, memoryManager, llmSettings, telemetrySettings, resolveCorsOrigin(req, corsAllowed));
+      // Only inject the relay-stats provider when this node is actually
+      // running a relay server. Without this gate, edge nodes always
+      // hit the `relayStatsProvider != null` branch in `api.ts` and
+      // surface the "not yet ready" 404 path even though they're a
+      // perfectly healthy non-relay node — Codex review on PR #525
+      // (round 2) flagged this as a misleading 404. The "this node is
+      // not running a relay server" branch was unreachable in
+      // production until now.
+      //
+      // The daemon's DkgConfig doesn't expose `enableRelayServer`
+      // independently of `nodeRole` — DKGNode.start() defaults
+      // `enableRelayServer` to `nodeRole === 'core'`, and that's the
+      // only path the daemon uses. So role-based gating here matches
+      // the actual runtime behaviour.
+      const relayStatsProvider = role === 'core' ? () => agent.node.getRelayStats() : undefined;
+      const handled = await handleNodeUIRequest(req, res, reqUrl, dashDb, nodeUiStaticDir, undefined, metricsCollector, authEnabled ? firstToken : undefined, memoryManager, llmSettings, telemetrySettings, resolveCorsOrigin(req, corsAllowed), relayStatsProvider);
       if (handled) return;
 
       await handleRequest(

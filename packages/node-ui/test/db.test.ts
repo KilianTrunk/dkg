@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { DashboardDB } from '../src/db.js';
 
 let db: DashboardDB;
@@ -19,8 +20,8 @@ afterEach(() => {
 
 describe('DashboardDB — metric snapshots', () => {
   it('inserts and retrieves the latest snapshot', () => {
-    db.insertSnapshot({ ts: 1000, cpu_percent: 42.5, mem_used_bytes: 100, mem_total_bytes: 200, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: 50, uptime_seconds: 60, peer_count: 3, direct_peers: 2, relayed_peers: 1, mesh_peers: 3, contextGraph_count: 1, total_triples: 500, total_kcs: 10, total_kas: 20, store_bytes: 1024, confirmed_kcs: 8, tentative_kcs: 2, rpc_latency_ms: 15, rpc_healthy: 1 });
-    db.insertSnapshot({ ts: 2000, cpu_percent: 55.0, mem_used_bytes: 120, mem_total_bytes: 200, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: 60, uptime_seconds: 120, peer_count: 5, direct_peers: 3, relayed_peers: 2, mesh_peers: 4, contextGraph_count: 2, total_triples: 600, total_kcs: 12, total_kas: 24, store_bytes: 2048, confirmed_kcs: 10, tentative_kcs: 2, rpc_latency_ms: 20, rpc_healthy: 1 });
+    db.insertSnapshot({ ts: 1000, cpu_percent: 42.5, mem_used_bytes: 100, mem_total_bytes: 200, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: 50, uptime_seconds: 60, peer_count: 3, direct_peers: 2, relayed_peers: 1, mesh_peers: 3, contextGraph_count: 1, total_triples: 500, total_kcs: 10, total_kas: 20, store_bytes: 1024, confirmed_kcs: 8, tentative_kcs: 2, rpc_latency_ms: 15, rpc_healthy: 1, relay_capacity: null, relay_reservation_count: null, relay_active_circuits: null, relay_bytes_in: null, relay_bytes_out: null });
+    db.insertSnapshot({ ts: 2000, cpu_percent: 55.0, mem_used_bytes: 120, mem_total_bytes: 200, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: 60, uptime_seconds: 120, peer_count: 5, direct_peers: 3, relayed_peers: 2, mesh_peers: 4, contextGraph_count: 2, total_triples: 600, total_kcs: 12, total_kas: 24, store_bytes: 2048, confirmed_kcs: 10, tentative_kcs: 2, rpc_latency_ms: 20, rpc_healthy: 1, relay_capacity: null, relay_reservation_count: null, relay_active_circuits: null, relay_bytes_in: null, relay_bytes_out: null });
 
     const latest = db.getLatestSnapshot();
     expect(latest).toBeDefined();
@@ -35,7 +36,7 @@ describe('DashboardDB — metric snapshots', () => {
 
   it('retrieves snapshot history within a time range', () => {
     for (let i = 1; i <= 10; i++) {
-      db.insertSnapshot({ ts: i * 1000, cpu_percent: i, mem_used_bytes: null, mem_total_bytes: null, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: null, uptime_seconds: null, peer_count: null, direct_peers: null, relayed_peers: null, mesh_peers: null, contextGraph_count: null, total_triples: null, total_kcs: null, total_kas: null, store_bytes: null, confirmed_kcs: null, tentative_kcs: null, rpc_latency_ms: null, rpc_healthy: null });
+      db.insertSnapshot({ ts: i * 1000, cpu_percent: i, mem_used_bytes: null, mem_total_bytes: null, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: null, uptime_seconds: null, peer_count: null, direct_peers: null, relayed_peers: null, mesh_peers: null, contextGraph_count: null, total_triples: null, total_kcs: null, total_kas: null, store_bytes: null, confirmed_kcs: null, tentative_kcs: null, rpc_latency_ms: null, rpc_healthy: null, relay_capacity: null, relay_reservation_count: null, relay_active_circuits: null, relay_bytes_in: null, relay_bytes_out: null });
     }
 
     const history = db.getSnapshotHistory(3000, 7000);
@@ -46,11 +47,79 @@ describe('DashboardDB — metric snapshots', () => {
 
   it('downsamples when exceeding maxPoints', () => {
     for (let i = 1; i <= 100; i++) {
-      db.insertSnapshot({ ts: i * 1000, cpu_percent: i, mem_used_bytes: null, mem_total_bytes: null, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: null, uptime_seconds: null, peer_count: null, direct_peers: null, relayed_peers: null, mesh_peers: null, contextGraph_count: null, total_triples: null, total_kcs: null, total_kas: null, store_bytes: null, confirmed_kcs: null, tentative_kcs: null, rpc_latency_ms: null, rpc_healthy: null });
+      db.insertSnapshot({ ts: i * 1000, cpu_percent: i, mem_used_bytes: null, mem_total_bytes: null, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: null, uptime_seconds: null, peer_count: null, direct_peers: null, relayed_peers: null, mesh_peers: null, contextGraph_count: null, total_triples: null, total_kcs: null, total_kas: null, store_bytes: null, confirmed_kcs: null, tentative_kcs: null, rpc_latency_ms: null, rpc_healthy: null, relay_capacity: null, relay_reservation_count: null, relay_active_circuits: null, relay_bytes_in: null, relay_bytes_out: null });
     }
 
     const sampled = db.getSnapshotHistory(1000, 100000, 10);
     expect(sampled.length).toBeLessThanOrEqual(10);
+  });
+
+  it('migrates a pre-V10 metric_snapshots table by adding the relay_* columns', () => {
+    // Codex review on PR #525 round 3 flagged that bumping SCHEMA_VERSION
+    // to 10 without an explicit ALTER for existing tables would leave V9
+    // schemas without the new relay_* columns, causing insertSnapshot()
+    // to throw `no such column: relay_capacity`. This regression locks
+    // in the idempotent column-add path in `version < 10`.
+    //
+    // Strategy: take the freshly-created V10 db (full schema), simulate
+    // a V9 baseline by dropping the new relay_* columns and resetting
+    // user_version to 9, then reopen via DashboardDB and verify the
+    // upgrade restores the columns and lets insertSnapshot succeed.
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    const raw = new Database(dbPath);
+    for (const col of [
+      'relay_capacity',
+      'relay_reservation_count',
+      'relay_active_circuits',
+      'relay_bytes_in',
+      'relay_bytes_out',
+    ]) {
+      raw.exec(`ALTER TABLE metric_snapshots DROP COLUMN ${col};`);
+    }
+    const recentTs = Date.now() - 60_000;
+    raw.prepare(
+      `INSERT INTO metric_snapshots (ts, cpu_percent, peer_count) VALUES (?, 10, 3)`,
+    ).run(recentTs);
+    raw.pragma('user_version = 9');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.db.pragma('user_version', { simple: true })).toBe(10);
+
+    const cols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    for (const col of [
+      'relay_capacity',
+      'relay_reservation_count',
+      'relay_active_circuits',
+      'relay_bytes_in',
+      'relay_bytes_out',
+    ]) {
+      expect(cols).toContain(col);
+    }
+
+    const newTs = Date.now();
+    expect(() => db.insertSnapshot({
+      ts: newTs, cpu_percent: 20, mem_used_bytes: null, mem_total_bytes: null,
+      disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: null,
+      uptime_seconds: null, peer_count: 4, direct_peers: 2, relayed_peers: 2,
+      mesh_peers: null, contextGraph_count: null, total_triples: null,
+      total_kcs: null, total_kas: null, store_bytes: null, confirmed_kcs: null,
+      tentative_kcs: null, rpc_latency_ms: null, rpc_healthy: null,
+      relay_capacity: 1024, relay_reservation_count: 3, relay_active_circuits: 5,
+      relay_bytes_in: 12345, relay_bytes_out: 67890,
+    })).not.toThrow();
+
+    const latest = db.getLatestSnapshot();
+    expect(latest!.ts).toBe(newTs);
+    expect(latest!.relay_capacity).toBe(1024);
+    expect(latest!.relay_active_circuits).toBe(5);
+
+    const preExisting = db.getSnapshotHistory(recentTs, recentTs);
+    expect(preExisting).toHaveLength(1);
+    expect(preExisting[0].relay_capacity).toBeNull();
   });
 });
 
@@ -226,7 +295,7 @@ describe('DashboardDB — retention', () => {
   it('prunes data older than retention period', () => {
     const db2 = new DashboardDB({ dataDir: dir, retentionDays: 0 });
 
-    db2.insertSnapshot({ ts: Date.now() - 100_000, cpu_percent: 10, mem_used_bytes: null, mem_total_bytes: null, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: null, uptime_seconds: null, peer_count: null, direct_peers: null, relayed_peers: null, mesh_peers: null, contextGraph_count: null, total_triples: null, total_kcs: null, total_kas: null, store_bytes: null, confirmed_kcs: null, tentative_kcs: null, rpc_latency_ms: null, rpc_healthy: null });
+    db2.insertSnapshot({ ts: Date.now() - 100_000, cpu_percent: 10, mem_used_bytes: null, mem_total_bytes: null, disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: null, uptime_seconds: null, peer_count: null, direct_peers: null, relayed_peers: null, mesh_peers: null, contextGraph_count: null, total_triples: null, total_kcs: null, total_kas: null, store_bytes: null, confirmed_kcs: null, tentative_kcs: null, rpc_latency_ms: null, rpc_healthy: null, relay_capacity: null, relay_reservation_count: null, relay_active_circuits: null, relay_bytes_in: null, relay_bytes_out: null });
     db2.insertLog({ ts: Date.now() - 100_000, level: 'info', module: 'A', message: 'old' });
     db2.insertOperation({ operation_id: 'old-op', operation_name: 'query', started_at: Date.now() - 100_000 });
 

@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { join } from 'node:path';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const DEFAULT_RETENTION_DAYS = 90;
 
 export interface DashboardDBOptions {
@@ -61,7 +61,12 @@ export class DashboardDB {
           confirmed_kcs INTEGER,
           tentative_kcs INTEGER,
           rpc_latency_ms INTEGER,
-          rpc_healthy INTEGER
+          rpc_healthy INTEGER,
+          relay_capacity INTEGER,
+          relay_reservation_count INTEGER,
+          relay_active_circuits INTEGER,
+          relay_bytes_in INTEGER,
+          relay_bytes_out INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON metric_snapshots(ts);
 
@@ -267,6 +272,35 @@ export class DashboardDB {
       }
     }
 
+    if (version < 10) {
+      // The V1 CREATE statement above already lists the relay_* columns,
+      // which covers fresh installs. For nodes upgrading from a pre-V10
+      // schema the table already exists, so `CREATE TABLE IF NOT EXISTS`
+      // is a no-op and the new columns wouldn't be added — `insertSnapshot()`
+      // would then fail with `no such column: relay_capacity` on the next
+      // metric tick. This block uses the same defensive idempotent
+      // PRAGMA-then-ALTER pattern as `version < 9` to add any missing
+      // relay_* columns. Not "V9 backward compat" in the data-preservation
+      // sense — just making the schema bump safe to apply to whatever
+      // table happens to already exist.
+      const cols = new Set(
+        (this.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
+          .map((c) => c.name),
+      );
+      const relayCols = [
+        'relay_capacity',
+        'relay_reservation_count',
+        'relay_active_circuits',
+        'relay_bytes_in',
+        'relay_bytes_out',
+      ];
+      for (const col of relayCols) {
+        if (!cols.has(col)) {
+          this.db.exec(`ALTER TABLE metric_snapshots ADD COLUMN ${col} INTEGER;`);
+        }
+      }
+    }
+
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
     const savedRetention = this.db.prepare("SELECT value FROM settings WHERE key = 'retentionDays'").get() as { value: string } | undefined;
@@ -308,13 +342,17 @@ export class DashboardDB {
         disk_used_bytes, disk_total_bytes, heap_used_bytes, uptime_seconds,
         peer_count, direct_peers, relayed_peers, mesh_peers, contextGraph_count,
         total_triples, total_kcs, total_kas, store_bytes,
-        confirmed_kcs, tentative_kcs, rpc_latency_ms, rpc_healthy
+        confirmed_kcs, tentative_kcs, rpc_latency_ms, rpc_healthy,
+        relay_capacity, relay_reservation_count, relay_active_circuits,
+        relay_bytes_in, relay_bytes_out
       ) VALUES (
         @ts, @cpu_percent, @mem_used_bytes, @mem_total_bytes,
         @disk_used_bytes, @disk_total_bytes, @heap_used_bytes, @uptime_seconds,
         @peer_count, @direct_peers, @relayed_peers, @mesh_peers, @contextGraph_count,
         @total_triples, @total_kcs, @total_kas, @store_bytes,
-        @confirmed_kcs, @tentative_kcs, @rpc_latency_ms, @rpc_healthy
+        @confirmed_kcs, @tentative_kcs, @rpc_latency_ms, @rpc_healthy,
+        @relay_capacity, @relay_reservation_count, @relay_active_circuits,
+        @relay_bytes_in, @relay_bytes_out
       )
     `).run(snap);
   }
@@ -1370,6 +1408,35 @@ export interface MetricSnapshotRow {
   tentative_kcs: number | null;
   rpc_latency_ms: number | null;
   rpc_healthy: number | null;
+  /**
+   * Operator-configured relay reservation cap (DKGNodeConfig.relayServerCapacity).
+   * NULL on edge nodes (no relay server enabled).
+   */
+  relay_capacity: number | null;
+  /** Live count of held reservations at snapshot time. NULL off-relay. */
+  relay_reservation_count: number | null;
+  /**
+   * Active forwarded circuits at snapshot time, counted as the number of
+   * open relay STOP streams (`/libp2p/circuit/relay/0.2.0/stop`). NOTE:
+   * forwarded circuits do not appear as `/p2p-circuit` connections on the
+   * relay host — that multiaddr only exists on the edge endpoints. NULL
+   * off-relay.
+   */
+  relay_active_circuits: number | null;
+  /**
+   * Total bytes received via 'message' events on relay HOP+STOP streams
+   * since the relay started (= bytes ARRIVING at the relay's HOP+STOP
+   * endpoints from the dialer / reservee). Stored as plain integer
+   * (SQLite INTEGER is 8 bytes signed = ~9.2e18, well above any
+   * realistic relay byte total before retention pruning). NULL off-relay.
+   */
+  relay_bytes_in: number | null;
+  /**
+   * Same as relay_bytes_in but for outbound traffic — bytes sent via
+   * `.send()` on relay HOP+STOP streams (= bytes DEPARTING from the
+   * relay toward the dialer / reservee). NULL off-relay.
+   */
+  relay_bytes_out: number | null;
 }
 
 export interface OperationRow {

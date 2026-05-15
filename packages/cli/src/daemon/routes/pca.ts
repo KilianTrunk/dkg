@@ -169,11 +169,21 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     try {
       const result = await agent.registerPublishingConvictionAgent(accountId, agentAddr);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
-      const verified = (await agent.isPublishingConvictionAgent(accountId, agentAddr)) ?? null;
+      // Tx mined → response is authoritative 200. The verification probe is
+      // best-effort: its own try/catch keeps a probe failure off the outer
+      // catch (else a retry hits AgentAlreadyRegistered). Tri-state mirrors
+      // the GET route's probedKey shape.
+      let verified: boolean | null = null;
+      try {
+        verified = await agent.isPublishingConvictionAgent(accountId, agentAddr);
+      } catch {
+        verified = null;
+      }
       return jsonResponse(res, 200, {
         accountId: idStr,
         agent: agentAddr,
         registered: verified === true,
+        adapterSupported: verified !== null,
         txHash: result.hash,
         blockNumber: result.blockNumber,
       });
@@ -313,8 +323,9 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     try {
       const info = await agent.getPublishingConvictionAccountInfo(accountId);
       if (info === null) {
-        // null = view absent OR account missing; disambiguate by probe.
-        if (typeof (agent as any).chain?.getPublishingConvictionAccountInfo !== 'function') {
+        // null = view absent OR account missing; the facade capability
+        // signal disambiguates (no chain surface → 503, else genuine 404).
+        if (!agent.supportsPublishingConvictionNft) {
           return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
         }
         return jsonResponse(res, 404, { error: `Unknown PCA accountId ${idStr}` });

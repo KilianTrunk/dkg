@@ -3957,6 +3957,12 @@ export class DKGAgent {
 
   /** V10 Publishing Conviction NFT facade — thin chain-adapter wrappers.
    *  Owner revert not swallowed (→ 403); `null` = no surface (→ 503). */
+
+  /** True when the chain adapter exposes the V10 Publishing Conviction NFT surface. */
+  get supportsPublishingConvictionNft(): boolean {
+    return typeof this.chain.getPublishingConvictionAccountInfo === 'function';
+  }
+
   async createPublishingConvictionAccount(
     committedTRAC: bigint,
   ): Promise<({ accountId: bigint } & TxResult) | null> {

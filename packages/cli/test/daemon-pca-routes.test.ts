@@ -65,6 +65,51 @@ describe('daemon /api/pca V10 caller contract', () => {
     expect(registered).toEqual({ id: 1n, agent: addr });
   });
 
+  it('register: mined tx authoritative even if the verification probe throws → 200, not 500', async () => {
+    const addr = '0x' + '1'.repeat(40);
+    const agent = {
+      registerPublishingConvictionAgent: async () => ({ hash: '0xreg', blockNumber: 9, success: true }),
+      isPublishingConvictionAgent: async () => { throw new Error('probe RPC blip'); },
+    };
+    const { res, done } = runCtx('POST', '/api/pca/1/agent', agent, { agent: addr });
+    await done;
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.txHash).toBe('0xreg');
+    expect(body.blockNumber).toBe(9);
+    expect(body.registered).toBe(false);
+    expect(body.adapterSupported).toBe(false);
+  });
+
+  it('register: probe returns null (adapter has no probe) → 200, registered:false, adapterSupported:false', async () => {
+    const addr = '0x' + '1'.repeat(40);
+    const agent = {
+      registerPublishingConvictionAgent: async () => ({ hash: '0xreg', blockNumber: 9, success: true }),
+      isPublishingConvictionAgent: async () => null,
+    };
+    const { res, done } = runCtx('POST', '/api/pca/1/agent', agent, { agent: addr });
+    await done;
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.txHash).toBe('0xreg');
+    expect(body.registered).toBe(false);
+    expect(body.adapterSupported).toBe(false);
+  });
+
+  it('register: probe returns true → 200, registered:true, adapterSupported:true', async () => {
+    const addr = '0x' + '1'.repeat(40);
+    const agent = {
+      registerPublishingConvictionAgent: async () => ({ hash: '0xreg', blockNumber: 9, success: true }),
+      isPublishingConvictionAgent: async () => true,
+    };
+    const { res, done } = runCtx('POST', '/api/pca/1/agent', agent, { agent: addr });
+    await done;
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.registered).toBe(true);
+    expect(body.adapterSupported).toBe(true);
+  });
+
   it('DELETE /api/pca/:id/agent/:address deregisters an agent → 200', async () => {
     let deregistered: { id: bigint; agent: string } | null = null;
     const addr = '0x' + '2'.repeat(40);
@@ -230,8 +275,10 @@ describe('daemon /api/pca V10 caller contract', () => {
   });
 
   it('genuine account-missing (getInfo returns null on a deployed adapter) stays 404', async () => {
+    // Adapter exposes the V10 surface → facade capability signal true,
+    // so a null getInfo is a genuine missing account → 404.
     const agent = {
-      chain: { getPublishingConvictionAccountInfo: () => null },
+      supportsPublishingConvictionNft: true,
       getPublishingConvictionAccountInfo: async () => null,
     };
     const { res, done } = runCtx('GET', '/api/pca/9', agent);
@@ -241,11 +288,11 @@ describe('daemon /api/pca V10 caller contract', () => {
 
   it('GET /api/pca/:id against a NoChainAdapter-backed agent → 503 (feature-unavailable), not 404', async () => {
     // Real no-chain adapter: post-#519-fix it OMITS the PCA methods, so
-    // the facade `typeof guard` returns null AND the GET capability probe
-    // (chain.getPublishingConvictionAccountInfo not a function) → 503.
+    // the facade returns null AND its capability getter is false → 503.
     const chain = new NoChainAdapter();
     const agent = {
-      chain,
+      supportsPublishingConvictionNft:
+        typeof (chain as any).getPublishingConvictionAccountInfo === 'function',
       getPublishingConvictionAccountInfo: async () =>
         typeof (chain as any).getPublishingConvictionAccountInfo !== 'function'
           ? null

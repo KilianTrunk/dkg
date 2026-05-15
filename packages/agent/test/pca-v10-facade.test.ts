@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { ethers } from 'ethers';
 import { DKGAgent } from '../src/index.js';
-import { MockChainAdapter } from '@origintrail-official/dkg-chain';
+import { MockChainAdapter, NoChainAdapter } from '@origintrail-official/dkg-chain';
 
-async function makeAgent(chain: MockChainAdapter): Promise<DKGAgent> {
+async function makeAgent(chain: MockChainAdapter | NoChainAdapter): Promise<DKGAgent> {
   return DKGAgent.create({
     name: 'PcaV10Facade',
     listenHost: '127.0.0.1',
@@ -28,5 +28,16 @@ describe('DKGAgent V10 PCA facade', () => {
     expect(info).not.toBeNull();
     expect(info!.owner.toLowerCase()).toBe(owner.address.toLowerCase());
     expect(info!.committedTRAC).toBe(1_000n);
+  });
+
+  it('supportsPublishingConvictionNft is true when the adapter exposes the V10 surface', async () => {
+    const chain = new MockChainAdapter('mock:31337', ethers.Wallet.createRandom().address);
+    const agent = await makeAgent(chain);
+    expect(agent.supportsPublishingConvictionNft).toBe(true);
+  });
+
+  it('supportsPublishingConvictionNft is false when the adapter lacks the V10 surface', async () => {
+    const agent = await makeAgent(new NoChainAdapter());
+    expect(agent.supportsPublishingConvictionNft).toBe(false);
   });
 });

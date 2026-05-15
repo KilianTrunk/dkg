@@ -498,6 +498,15 @@ export class ApiClient {
     );
   }
 
+  async settlePca(accountId: string): Promise<{
+    accountId: string;
+    settled: boolean;
+    txHash: string;
+    blockNumber: number;
+  }> {
+    return this.post(`/api/pca/${encodeURIComponent(accountId)}/settle`, {});
+  }
+
   async addPcaFunds(accountId: string, tokens: string): Promise<{
     accountId: string;
     addedTokens: string;

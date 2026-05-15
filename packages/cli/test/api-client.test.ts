@@ -300,6 +300,18 @@ describe('ApiClient', () => {
       );
       expect(calls[0].opts.method).toBe('DELETE');
     });
+
+    it('settlePca() POSTs the V10 permissionless settle route', async () => {
+      const body = { accountId: '7', settled: true, txHash: '0x999', blockNumber: 44 };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const result = await client.settlePca('7');
+
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/pca/7/settle`);
+      expect(calls[0].opts.method).toBe('POST');
+    });
   });
 
   describe('messages() query string building', () => {

@@ -2692,6 +2692,27 @@ pcaCmd
   });
 
 pcaCmd
+  .command('settle <accountId>')
+  .description('Run the lazy-settlement sweep on a PCA (permissionless on chain)')
+  .action(async (accountId: string) => {
+    try {
+      if (!/^\d+$/.test(accountId)) {
+        console.error('accountId must be a non-negative integer');
+        process.exit(1);
+      }
+      const client = await ApiClient.connect();
+      const result = await client.settlePca(accountId);
+      console.log(`PCA ${result.accountId} settled:`);
+      console.log(`  settled: ${result.settled}`);
+      console.log(`  txHash:  ${result.txHash}`);
+      console.log(`  block:   ${result.blockNumber}`);
+    } catch (err) {
+      console.error(toErrorMessage(err));
+      process.exit(1);
+    }
+  });
+
+pcaCmd
   .command('info <accountId>')
   .description('Read-only PCA snapshot (owner, committedTRAC, topUpBuffer, discount). Optional `--probe-key` checks agent registration')
   .option('--probe-key <addr>', 'Also check whether <addr> is currently a registered conviction agent on the PCA')

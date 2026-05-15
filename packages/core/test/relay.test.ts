@@ -462,6 +462,80 @@ describe('Circuit Relay', () => {
     warnSpy.mockRestore();
   }, 15000);
 
+  it('dedupes duplicate relayPeers entries by peerId for clamp + relayTargets', async () => {
+    // Codex review on PR #526 round 4 caught that `reservedRelayCount`
+    // was derived from raw `relayTargets`, so a duplicate config like
+    // `[relayA-with-suffix-A, relayA-with-suffix-B]` (two entries that
+    // resolve to the same peerId) was counted twice. With
+    // `relayReservationCount: 2`, the watchdog would think target is
+    // met by one actual reservation duplicated in its view — defeating
+    // the redundancy guarantee.
+    //
+    // Fix asserts:
+    //   1. The clamp warns when distinct count < raw entry count, and
+    //      the chosen `relayReservationCount` is bounded by the distinct
+    //      count, not the raw length.
+    //   2. The edge ends up with exactly 1 distinct `/p2p-circuit`
+    //      self-addr (one reservation on the one real relay), not 2
+    //      duplicate entries that would falsely satisfy the watchdog.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const relay = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    nodes.push(relay);
+    await relay.start();
+
+    const relayAddr = relay.multiaddrs.find(a => a.includes('/tcp/'))!;
+
+    const edge = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      relayPeers: [relayAddr, relayAddr],
+      relayReservationCount: 2,
+    });
+    nodes.push(edge);
+    await edge.start();
+
+    const dedupWarn = warnSpy.mock.calls.find((call) =>
+      typeof call[0] === 'string'
+      && call[0].includes('2 entries')
+      && call[0].includes('1 distinct peerIds'),
+    );
+    expect(
+      dedupWarn,
+      `expected dedup warning; got: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
+    ).toBeDefined();
+
+    const clampWarn = warnSpy.mock.calls.find((call) =>
+      typeof call[0] === 'string'
+      && call[0].includes('clamping to 1'),
+    );
+    expect(
+      clampWarn,
+      `expected clamp-to-distinct-count warning; got: ${JSON.stringify(warnSpy.mock.calls.map(c => c[0]))}`,
+    ).toBeDefined();
+
+    const deadline = Date.now() + 5_000;
+    let circuitAddrs: string[] = [];
+    while (Date.now() < deadline) {
+      circuitAddrs = edge.libp2p
+        .getMultiaddrs()
+        .map(ma => ma.toString())
+        .filter(a => a.includes('/p2p-circuit'));
+      if (circuitAddrs.length > 0) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+    const distinctRelayPids = new Set(
+      circuitAddrs.map(a => a.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1]).filter(Boolean),
+    );
+    expect(distinctRelayPids.size).toBe(1);
+
+    warnSpy.mockRestore();
+  }, 15000);
+
   it('does not churn the unreserved relay when relayReservationCount < relayPeers.length', async () => {
     // Codex review on PR #526 round 3 caught a real bug in the round-2
     // watchdog: with target>1, the per-relay gate required EVERY

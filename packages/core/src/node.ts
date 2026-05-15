@@ -494,17 +494,43 @@ export class DKGNode {
         );
         relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
       }
-      // Clamp to relayPeers.length — requesting more reservations than
-      // there are configured relays can't deliver the documented N-(N-1)
-      // tolerance and risks duplicate-reservation churn against an
-      // unattainable target. Codex review on PR #526 caught this.
-      const peerCount = this.config.relayPeers!.length;
-      if (relayReservationCount > peerCount) {
+      // Clamp to the count of DISTINCT relay peers — requesting more
+      // reservations than there are unique relays can't deliver the
+      // documented N-(N-1) tolerance and risks duplicate-reservation
+      // churn against an unattainable target. Codex review on PR #526
+      // round 1 caught the over-cap case; round 4 caught that we also
+      // need to dedupe by peerId here, otherwise a config like
+      // `[relayA, relayA]` with `relayReservationCount: 2` looks like
+      // 2 distinct slots to the clamp and the watchdog later "sees"
+      // 2 reservations when only 1 actual relay is involved — which
+      // defeats the redundancy guarantee. Parsing failures are
+      // tolerated here (skipped); the same parser runs again at the
+      // relayTargets push and any malformed entry is dropped consistently.
+      const { multiaddr: parseMultiaddr } = await import('@multiformats/multiaddr');
+      const distinctRelayPeerIds = new Set<string>();
+      for (const raw of this.config.relayPeers!) {
+        try {
+          const ma = parseMultiaddr(raw);
+          const p2p = ma.getComponents().find((c) => c.name === 'p2p')?.value;
+          if (p2p) distinctRelayPeerIds.add(p2p);
+        } catch {
+          // Skipped; will also be dropped at relayTargets push.
+        }
+      }
+      const distinctRelayPeerCount = distinctRelayPeerIds.size;
+      if (distinctRelayPeerCount < this.config.relayPeers!.length) {
+        console.warn(
+          `[dkg-core] relayPeers contains ${this.config.relayPeers!.length} entries but only ` +
+            `${distinctRelayPeerCount} distinct peerIds; using distinct count for ` +
+            `multi-reservation sizing`,
+        );
+      }
+      if (relayReservationCount > distinctRelayPeerCount) {
         console.warn(
           `[dkg-core] relayReservationCount=${relayReservationCount} exceeds ` +
-            `configured relayPeers.length=${peerCount}; clamping to ${peerCount}`,
+            `distinct relay peers=${distinctRelayPeerCount}; clamping to ${distinctRelayPeerCount}`,
         );
-        relayReservationCount = peerCount;
+        relayReservationCount = distinctRelayPeerCount;
       }
     } else if (
       this.config.relayReservationCount != null &&
@@ -725,6 +751,12 @@ export class DKGNode {
     if (this.config.relayPeers?.length) {
       const { multiaddr } = await import('@multiformats/multiaddr');
 
+      // Dedup by peerId (Codex PR #526 round 4): without this a duplicate
+      // entry like `[relayA, relayA]` would be pushed twice, the watchdog
+      // would iterate it twice, and `reservedRelayCount` would count the
+      // single underlying reservation twice — making the gate think the
+      // target is met when only one actual relay is reserved.
+      const seenRelayPeerIds = new Set<string>();
       for (const addr of this.config.relayPeers) {
         const ma = multiaddr(addr);
         const p2pComponent = ma.getComponents().find(c => c.name === 'p2p');
@@ -732,6 +764,8 @@ export class DKGNode {
 
         const peerId = peerIdFromString(p2pComponent.value);
         if (peerId.equals(this.node.peerId)) continue;
+        if (seenRelayPeerIds.has(p2pComponent.value)) continue;
+        seenRelayPeerIds.add(p2pComponent.value);
 
         this.relayTargets.push({ peerId, addr: ma });
 

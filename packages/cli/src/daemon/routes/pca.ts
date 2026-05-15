@@ -7,20 +7,20 @@
 // driven by an operator standing up the runbook fixtures, not by the
 // publish/query data path.
 //
-// All four routes delegate to the agent facade methods added in
-// `packages/agent/src/dkg-agent.ts` (createPublishingConvictionAccount,
-// addPCAAuthorizedKey, isPCAAuthorizedKey, getPublishingConvictionAccountInfo,
-// addPublishingConvictionAccountFunds), which in turn delegate to the
-// chain adapter. Reads are permissionless on chain; writes are
-// admin-gated by the on-chain `require(msg.sender == account.admin)`
-// check, so the daemon must be running as the PCA admin EOA for
-// `POST /api/pca/:id/authorize` and `POST /api/pca/:id/funds` to land.
+// The routes delegate to the V10 agent facade methods in
+// `packages/agent/src/dkg-agent.ts` (createConvictionAccount,
+// registerConvictionAgent, isConvictionAgent, getConvictionAccountInfo,
+// topUpConvictionAccount), which in turn delegate to the chain adapter.
+// Reads are permissionless on chain; writes are owner-gated by the
+// on-chain `_requireOwner` check, so the daemon must be running as the
+// PCA owner EOA for the authorize/funds routes to land.
 //
 // Adapters that don't expose the underlying chain methods (no-chain
 // mode, pre-V10.1 adapter copies) return 503 — same convention as the
 // existing `/api/kc/:id/author` route.
 
 import { ethers } from 'ethers';
+import type { V10ConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import { jsonResponse, readBody, SMALL_BODY_BYTES } from '../http-utils.js';
 import type { RequestContext } from './context.js';
 
@@ -66,25 +66,26 @@ function parseTokenAmount(raw: unknown, field: string): bigint | { error: string
   }
 }
 
-function serializeAccountInfo(info: {
-  accountId: bigint;
-  admin: string;
-  balance: bigint;
-  initialDeposit: bigint;
-  lockEpochs: number;
-  conviction: bigint;
-  discountBps: number;
-}): Record<string, unknown> {
+function serializeAccountInfo(
+  accountId: bigint,
+  info: V10ConvictionAccountInfo,
+): Record<string, unknown> {
   return {
-    accountId: info.accountId.toString(),
-    admin: info.admin,
-    balance: info.balance.toString(),
-    balanceTrac: ethers.formatEther(info.balance),
-    initialDeposit: info.initialDeposit.toString(),
-    initialDepositTrac: ethers.formatEther(info.initialDeposit),
-    lockEpochs: info.lockEpochs,
-    conviction: info.conviction.toString(),
+    accountId: accountId.toString(),
+    owner: info.owner,
+    committedTRAC: info.committedTRAC.toString(),
+    committedTRACTrac: ethers.formatEther(info.committedTRAC),
+    baseEpochAllowance: info.baseEpochAllowance.toString(),
+    topUpBuffer: info.topUpBuffer.toString(),
+    topUpBufferTrac: ethers.formatEther(info.topUpBuffer),
+    createdAtEpoch: info.createdAtEpoch,
+    expiresAtEpoch: info.expiresAtEpoch,
+    createdAtTimestamp: info.createdAtTimestamp,
+    expiresAtTimestamp: info.expiresAtTimestamp,
     discountBps: info.discountBps,
+    agentCount: info.agentCount,
+    lastSettledWindow: info.lastSettledWindow,
+    fullySwept: info.fullySwept,
   };
 }
 
@@ -109,11 +110,11 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       });
     }
     try {
-      const result = await agent.createPublishingConvictionAccount(amount, lockEpochs);
+      const result = await agent.createConvictionAccount(amount);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 200, {
         accountId: result.accountId.toString(),
-        txHash: result.txHash,
+        txHash: result.hash,
         blockNumber: result.blockNumber,
         committedTokens: ethers.formatEther(amount),
         lockEpochs,
@@ -141,14 +142,14 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 400, { error: 'key must be a valid 0x-prefixed EVM address' });
     }
     try {
-      const result = await agent.addPCAAuthorizedKey(accountId, key);
+      const result = await agent.registerConvictionAgent(accountId, key);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
-      const verified = (await agent.isPCAAuthorizedKey(accountId, key)) ?? null;
+      const verified = (await agent.isConvictionAgent(accountId, key)) ?? null;
       return jsonResponse(res, 200, {
         accountId: idStr,
         key,
         authorized: verified === true,
-        txHash: result.txHash,
+        txHash: result.hash,
         blockNumber: result.blockNumber,
       });
     } catch (err: any) {
@@ -180,12 +181,12 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
     const amount = parseTokenAmount(tokens, 'tokens');
     if (typeof amount !== 'bigint') return jsonResponse(res, 400, amount);
     try {
-      const result = await agent.addPublishingConvictionAccountFunds(accountId, amount);
+      const result = await agent.topUpConvictionAccount(accountId, amount);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 200, {
         accountId: idStr,
         addedTokens: ethers.formatEther(amount),
-        txHash: result.txHash,
+        txHash: result.hash,
         blockNumber: result.blockNumber,
       });
     } catch (err: any) {
@@ -210,7 +211,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 400, { error: 'Invalid accountId — must be a non-negative integer' });
     }
     try {
-      const info = await agent.getPublishingConvictionAccountInfo(accountId);
+      const info = await agent.getConvictionAccountInfo(accountId);
       if (info === null) {
         // Either the chain adapter doesn't expose the view, or the
         // account doesn't exist. The adapter contract returns null
@@ -221,12 +222,12 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
         return jsonResponse(res, 404, { error: `Unknown PCA accountId ${idStr}` });
       }
       const probedKey = ctx.url.searchParams.get('key');
-      const result: Record<string, unknown> = serializeAccountInfo(info);
+      const result: Record<string, unknown> = serializeAccountInfo(accountId, info);
       if (probedKey) {
         if (!ethers.isAddress(probedKey)) {
           result.probedKey = { key: probedKey, error: 'invalid EVM address' };
         } else {
-          const isAuth = await agent.isPCAAuthorizedKey(accountId, probedKey);
+          const isAuth = await agent.isConvictionAgent(accountId, probedKey);
           result.probedKey = {
             key: probedKey,
             authorized: isAuth === true,

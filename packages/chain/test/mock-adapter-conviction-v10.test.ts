@@ -38,3 +38,35 @@ describe('MockChainAdapter — V10 conviction account create/read', () => {
     expect(await mock.getConvictionAccountInfo(999n)).toBeNull();
   });
 });
+
+describe('MockChainAdapter — V10 conviction agent register/deregister', () => {
+  it('registers an agent, exposes it via isConvictionAgent + reverse map, then deregisters', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createConvictionAccount(COMMITTED);
+    const agent = ethers.Wallet.createRandom().address;
+
+    expect(await mock.isConvictionAgent(accountId, agent)).toBe(false);
+
+    const reg = await mock.registerConvictionAgent(accountId, agent);
+    expect(reg.success).toBe(true);
+    expect(await mock.isConvictionAgent(accountId, agent)).toBe(true);
+    expect(await mock.getConvictionAgentAccountId(agent)).toBe(accountId);
+    expect((await mock.getConvictionAccountInfo(accountId))!.agentCount).toBe(1);
+
+    const dereg = await mock.deregisterConvictionAgent(accountId, agent);
+    expect(dereg.success).toBe(true);
+    expect(await mock.isConvictionAgent(accountId, agent)).toBe(false);
+    expect(await mock.getConvictionAgentAccountId(agent)).toBe(0n);
+    expect((await mock.getConvictionAccountInfo(accountId))!.agentCount).toBe(0);
+  });
+
+  it('rejects re-registering an already-registered agent (N28 parity)', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createConvictionAccount(COMMITTED);
+    const agent = ethers.Wallet.createRandom().address;
+
+    await mock.registerConvictionAgent(accountId, agent);
+    await expect(mock.registerConvictionAgent(accountId, agent))
+      .rejects.toThrow(/AgentAlreadyRegistered/);
+  });
+});

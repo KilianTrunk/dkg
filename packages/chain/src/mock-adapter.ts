@@ -490,6 +490,40 @@ export class MockChainAdapter implements ChainAdapter {
     };
   }
 
+  private requireConvictionAccount(accountId: bigint) {
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct) {
+      throw new Error(`Mock: PCA account ${accountId} does not exist`);
+    }
+    return acct;
+  }
+
+  async registerConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    const acct = this.requireConvictionAccount(accountId);
+    const key = ethers.getAddress(agent).toLowerCase();
+    if (this.agentToConvictionAccount.has(key)) {
+      throw new Error('Mock: AgentAlreadyRegistered');
+    }
+    acct.agents.add(key);
+    this.agentToConvictionAccount.set(key, accountId);
+    return this.txResult(true);
+  }
+
+  async deregisterConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    const acct = this.requireConvictionAccount(accountId);
+    const key = ethers.getAddress(agent).toLowerCase();
+    acct.agents.delete(key);
+    this.agentToConvictionAccount.delete(key);
+    return this.txResult(true);
+  }
+
+  async isConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
+    if (!ethers.isAddress(agent)) return false;
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct) return false;
+    return acct.agents.has(ethers.getAddress(agent).toLowerCase());
+  }
+
   /**
    * Reverse lookup mirroring `agentToAccountId`. Returns `0n` for any
    * non-registered address so the publisher SDK keeps the direct-spend

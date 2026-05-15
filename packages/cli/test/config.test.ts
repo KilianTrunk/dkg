@@ -219,6 +219,38 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(loaded.localAgentIntegrations?.openclaw?.manifest?.version).toBe('2026.4.12');
     expect(loaded.localAgentIntegrations?.openclaw?.runtime?.status).toBe('ready');
   });
+
+  it('round-trips relayServerCapacity through saveConfig/loadConfig (operator override)', async () => {
+    // PR #524 review (branarakic): the README documents
+    // `relayServerCapacity` as a `config.json` knob, so the CLI
+    // schema must actually persist + restore it. This guards
+    // against regressions where the field gets dropped from the
+    // DkgConfig type or stripped on serialization.
+    await saveConfig({
+      name: 'test-node',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'core',
+      relayServerCapacity: 2048,
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.nodeRole).toBe('core');
+    expect(loaded.relayServerCapacity).toBe(2048);
+  });
+
+  it('omits relayServerCapacity when not set (so DKGNode.start() applies the default)', async () => {
+    await saveConfig({
+      name: 'test-node',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'core',
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.nodeRole).toBe('core');
+    expect(loaded.relayServerCapacity).toBeUndefined();
+  });
 });
 
 describe('resolveChainConfig (field-level merge)', () => {

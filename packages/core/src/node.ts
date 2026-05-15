@@ -41,6 +41,178 @@ const RELAY_REDIAL_DELAY_MS = 1_500;
  */
 const RELAY_RESERVATION_GRACE_MS = 15_000;
 
+/**
+ * Default relay server capacity — the number of simultaneous circuit-relay v2
+ * reservations a Core Node will hold. All other relay-related caps (HOP/STOP
+ * stream limits, connectionManager.maxConnections) derive from this at a 1:2
+ * ratio so capacity=1024 → 2048 stream caps + 2048 max conns.
+ *
+ * Bumped from the previous hardcoded 256 (libp2p's stock default for the
+ * relay-v2 server is even lower — 15) which capped a single Core Node at
+ * ~256 concurrent edge agents. That was below the natural hundreds-to-
+ * thousands-of-agents trajectory the network is designed for; PR #510's
+ * agent-debug-chat exercised this directly and showed the cap was already
+ * a meaningful ceiling at ~5 active edges. See operator docs for the
+ * `ulimit -n` requirement.
+ */
+export const DEFAULT_RELAY_SERVER_CAPACITY = 1024;
+/** Multiplier for derived stream + connection caps (capacity × 2). */
+export const RELAY_CAPACITY_MULTIPLIER = 2;
+/**
+ * Per-circuit duration limit. Bumped from libp2p's 5-minute default to 30
+ * minutes so chat-style intermittent traffic (5-15 minute silent gaps are
+ * normal) doesn't tear circuits down underneath the application — this was
+ * the proximate cause of the May 2026 NO_RESERVATION blackout pair (Miles
+ * ↔ Lex) that motivated PRs #517, #521, and this one. Reservation TTL
+ * itself stays at the libp2p default (2h) but is set explicitly below for
+ * operator visibility.
+ */
+export const RELAY_DEFAULT_DURATION_LIMIT_MS = 30 * 60 * 1000;
+export const RELAY_RESERVATION_TTL_MS = 2 * 60 * 60 * 1000;
+/** maxConnections for nodes that don't run a relay server (edge default). */
+export const EDGE_NODE_MAX_CONNECTIONS = 500;
+
+export interface DerivedRelayCaps {
+  maxReservations: number;
+  maxConnections: number;
+  maxInboundHopStreams: number;
+  maxOutboundHopStreams: number;
+  maxOutboundStopStreams: number;
+  maxInboundStopStreams: number;
+}
+
+/**
+ * Validate an operator-supplied `relayServerCapacity` value. Capacity comes
+ * from external config (config.json, env, etc.) so this defends against
+ * `0`, negatives, NaN, Infinity, fractional values, non-numbers, and empty
+ * strings — any of which would silently produce invalid limits or libp2p
+ * startup failures (a `0` capacity, for instance, would cap streams /
+ * connections at 0 and brick the relay; a fractional value would propagate
+ * into libp2p's `maxConnections` which expects an integer).
+ *
+ * Returns `null` when the input is unset (so callers can apply their own
+ * default). Returns an `{ ok: false }` verdict with a human-readable
+ * reason for invalid input — the caller (start()) downgrades to the
+ * default and emits an operator-facing warning.
+ */
+export type RelayCapacityValidation =
+  | { ok: true; value: number }
+  | { ok: false; reason: string };
+export function validateRelayServerCapacity(input: unknown): RelayCapacityValidation | null {
+  if (input == null) return null;
+  if (typeof input !== 'number') {
+    return { ok: false, reason: `expected number, got ${typeof input}` };
+  }
+  if (!Number.isFinite(input)) {
+    return { ok: false, reason: `expected finite number, got ${input}` };
+  }
+  if (!Number.isInteger(input)) {
+    return { ok: false, reason: `expected integer, got ${input}` };
+  }
+  if (input < 1) {
+    return { ok: false, reason: `expected >= 1, got ${input}` };
+  }
+  return { ok: true, value: input };
+}
+
+/**
+ * Derive the full relay-related cap set from a single capacity value. The
+ * 1:2 ratio is intentional: each reservation costs one long-lived control
+ * connection, plus circuits going through this relay open additional
+ * HOP+STOP streams (multiplexed) and other peers can connect for non-relay
+ * reasons (DHT, gossip, direct dials). Doubling the capacity for streams
+ * and connections gives realistic headroom without overcommitting.
+ *
+ * Throws on invalid input (non-finite, non-integer, < 1) — `start()`
+ * gates this with `validateRelayServerCapacity()` so the throw is purely
+ * a defensive backstop for direct callers.
+ */
+export function deriveRelayCaps(capacity: number): DerivedRelayCaps {
+  if (!Number.isInteger(capacity) || capacity < 1) {
+    throw new TypeError(
+      `deriveRelayCaps: capacity must be a positive integer, got ${capacity}`,
+    );
+  }
+  const streamCap = capacity * RELAY_CAPACITY_MULTIPLIER;
+  return {
+    maxReservations: capacity,
+    maxConnections: streamCap,
+    maxInboundHopStreams: streamCap,
+    maxOutboundHopStreams: streamCap,
+    maxOutboundStopStreams: streamCap,
+    maxInboundStopStreams: streamCap,
+  };
+}
+
+/**
+ * Severity of a `checkFdLimit` log emission. The "ok" path is
+ * deliberately `info` — emitting it via `console.warn` would make the
+ * level unreliable for operator alerting (every healthy startup would
+ * trip warning-level filters). Only the under-provisioned and
+ * unreadable-limit paths are `warn`.
+ */
+export type FdLimitLogLevel = 'info' | 'warn';
+
+/**
+ * Emit an informational/warning log at relay startup about the host's
+ * `ulimit -n` (RLIMIT_NOFILE) versus what the configured maxConnections
+ * actually needs. We can read this losslessly from
+ * `process.report.getReport().userLimits.open_files` on POSIX (libp2p
+ * Core Nodes are POSIX-only in practice).
+ *
+ * Why this matters: libp2p's maxConnections is an upper bound libp2p
+ * tracks internally; if the kernel rejects the underlying socket() with
+ * EMFILE before libp2p hits its own cap, the only signal is opaque
+ * "peer rejected" errors in logs. Surfacing the discrepancy at startup
+ * gives operators a loud, actionable signal.
+ *
+ * The callback receives `(level, msg)` so consumers can route each
+ * emission to the appropriate logger sink (info vs warn). Mapping the
+ * "ok" line to `info` keeps the warn channel meaningful for alerting.
+ */
+export function checkFdLimit(
+  maxConnections: number,
+  log: (level: FdLimitLogLevel, msg: string) => void,
+): void {
+  const recommended = Math.max(4096, maxConnections * RELAY_CAPACITY_MULTIPLIER);
+  try {
+    const report = (process as any).report?.getReport?.();
+    const openFiles = report?.userLimits?.open_files;
+    const soft = openFiles?.soft;
+    if (typeof soft === 'number') {
+      if (soft < recommended) {
+        log(
+          'warn',
+          `relay server enabled with maxConnections=${maxConnections}, ` +
+            `but host ulimit -n soft=${soft} is below the recommended ${recommended} ` +
+            `(= max(4096, maxConnections × 2)). The kernel will reject new ` +
+            `socket() calls with EMFILE once the daemon hits the limit, ` +
+            `manifesting as silent peer rejections. Bump with ` +
+            `'ulimit -n ${recommended}' (shell), 'LimitNOFILE=${recommended}' (systemd unit), ` +
+            `or '--ulimit nofile=${recommended}:${recommended}' (Docker).`,
+        );
+      } else {
+        log(
+          'info',
+          `relay server: ulimit -n soft=${soft} >= recommended ${recommended}, ok`,
+        );
+      }
+    } else {
+      log(
+        'warn',
+        `relay server: could not read host ulimit -n via process.report.userLimits; ` +
+          `ensure ulimit -n >= ${recommended} on this host`,
+      );
+    }
+  } catch (err: any) {
+    log(
+      'warn',
+      `relay server: error reading ulimit -n (${err?.message ?? String(err)}); ` +
+        `ensure ulimit -n >= ${recommended} on this host`,
+    );
+  }
+}
+
 interface RelayTarget {
   peerId: ReturnType<typeof peerIdFromString>;
   addr: any;
@@ -139,16 +311,66 @@ export class DKGNode {
       peerDiscovery.push(mdns());
     }
 
+    const isCore = this.config.nodeRole === 'core';
+    const enableRelay = this.config.enableRelayServer ?? isCore;
+
+    // Relay-server capacity tuning. When relay is enabled, derive HOP/STOP
+    // stream caps and the connectionManager.maxConnections ceiling from
+    // the operator-configured (or default) capacity. Edge nodes that
+    // don't run a relay server keep the legacy 500-connection ceiling and
+    // the upstream libp2p stream defaults — the bumped caps carry no
+    // benefit there and we don't want to inflate the blast radius of
+    // this change beyond Core Nodes.
+    if (this.config.relayServerCapacity != null && !enableRelay) {
+      console.warn(
+        `[dkg-core] relayServerCapacity=${this.config.relayServerCapacity} ` +
+          `set but relay server is not enabled (nodeRole=${this.config.nodeRole ?? 'edge'}, ` +
+          `enableRelayServer=${this.config.enableRelayServer}); value ignored`,
+      );
+    }
+    // Validate the operator-supplied capacity (defends against 0,
+    // negatives, NaN, Infinity, fractional values, non-numbers — any
+    // of which would propagate into libp2p's stream/connection caps
+    // and produce invalid limits or startup failures, per Codex
+    // tier-1 finding on PR #524). Invalid values fall back to the
+    // documented default with a loud warning so the misconfig is
+    // visible.
+    let effectiveRelayCapacity: number | null = null;
+    if (enableRelay) {
+      const verdict = validateRelayServerCapacity(this.config.relayServerCapacity);
+      if (verdict == null) {
+        effectiveRelayCapacity = DEFAULT_RELAY_SERVER_CAPACITY;
+      } else if (verdict.ok) {
+        effectiveRelayCapacity = verdict.value;
+      } else {
+        console.warn(
+          `[dkg-core] relayServerCapacity=${String(this.config.relayServerCapacity)} ` +
+            `is invalid (${verdict.reason}); falling back to default ${DEFAULT_RELAY_SERVER_CAPACITY}`,
+        );
+        effectiveRelayCapacity = DEFAULT_RELAY_SERVER_CAPACITY;
+      }
+    }
+    const relayCaps = effectiveRelayCapacity != null ? deriveRelayCaps(effectiveRelayCapacity) : null;
+
     // TCP keepAlive helps prevent idle relay connections from being dropped by
     // middleboxes or remote timeouts (common cause of ECONNRESET).
     const transports: any[] = [
       tcp({ dialOpts: { keepAlive: true } }),
       webSockets(),
-      circuitRelayTransport(),
+      // STOP stream caps default to 300 in libp2p; on a Core Node holding
+      // 1024+ reservations that's a lower ceiling than maxReservations
+      // implies. Bump the transport-side caps to match the server-side
+      // capacity. Edge nodes keep the upstream defaults (passing
+      // undefined here is the same as omitting the field).
+      circuitRelayTransport(
+        relayCaps
+          ? {
+              maxInboundStopStreams: relayCaps.maxInboundStopStreams,
+              maxOutboundStopStreams: relayCaps.maxOutboundStopStreams,
+            }
+          : undefined,
+      ),
     ];
-
-    const isCore = this.config.nodeRole === 'core';
-    const enableRelay = this.config.enableRelayServer ?? isCore;
 
     // Nodes that already know their NAT status skip autoNAT probing:
     // - relayPeers set → agent behind NAT (knows it needs relay)
@@ -210,13 +432,37 @@ export class DKGNode {
       services.autoNAT = autoNAT();
     }
 
-    if (enableRelay) {
+    if (enableRelay && relayCaps) {
       services.relay = circuitRelayServer({
+        // Bumped from the libp2p default (no cap → unlimited but
+        // bottlenecked by maxOutboundStopStreams=300) to the derived
+        // capacity-scaled value so a Core Node can actually serve N
+        // simultaneous active circuits when N reservations are held.
+        maxInboundHopStreams: relayCaps.maxInboundHopStreams,
+        maxOutboundHopStreams: relayCaps.maxOutboundHopStreams,
+        maxOutboundStopStreams: relayCaps.maxOutboundStopStreams,
         reservations: {
-          maxReservations: 256,
-          defaultDurationLimit: 5 * 60 * 1000,
+          maxReservations: relayCaps.maxReservations,
+          // Per-circuit duration; bumped 5min → 30min so chat-style
+          // intermittent traffic doesn't tear circuits down underneath
+          // the application during quiet windows.
+          defaultDurationLimit: RELAY_DEFAULT_DURATION_LIMIT_MS,
+          // Reservation TTL set explicitly (matches libp2p default of
+          // 2h) so operators tuning relay behaviour see the value
+          // here instead of having to grep upstream.
+          reservationTtl: RELAY_RESERVATION_TTL_MS,
           defaultDataLimit: BigInt(1 << 24),
         },
+      });
+      // Route the ulimit log emission to the appropriate console sink
+      // by level. The "ok" line is purely informational; only the
+      // under-provisioned and unreadable-limit paths warrant warn.
+      checkFdLimit(relayCaps.maxConnections, (level, msg) => {
+        if (level === 'warn') {
+          console.warn(`[dkg-core] ${msg}`);
+        } else {
+          console.info(`[dkg-core] ${msg}`);
+        }
       });
     }
 
@@ -248,8 +494,11 @@ export class DKGNode {
       services,
       connectionManager: {
         minConnections: 0,
-        // Reserve capacity for relay peers so they are not evicted under load.
-        maxConnections: 500,
+        // Core Nodes scale this with relayServerCapacity (default
+        // capacity=1024 → maxConnections=2048). Edge nodes keep the
+        // legacy 500-connection ceiling — they have no relay-server
+        // pressure and wider headroom adds nothing.
+        maxConnections: relayCaps?.maxConnections ?? EDGE_NODE_MAX_CONNECTIONS,
       },
     } as any);
 

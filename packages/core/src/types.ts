@@ -45,6 +45,35 @@ export interface DKGNodeConfig {
    * Default: 'edge'.
    */
   nodeRole?: 'core' | 'edge';
+  /**
+   * Single-knob capacity tuning for the Core Node relay server. Sets the
+   * maximum number of simultaneous circuit-relay v2 reservations this
+   * node will hold; HOP/STOP stream caps and the libp2p
+   * connectionManager.maxConnections ceiling are derived from this value
+   * at a 1:2 ratio (so capacity=1024 → 2048 streams + 2048 max conns).
+   *
+   * Default: 1024 (replaces the prior hardcoded 256 cap that bottlenecked
+   * a Core Node at ~256 concurrent edge agents — too low for the
+   * hundreds-to-thousands-of-agents trajectory). Operators can dial down
+   * for resource-constrained hosts (e.g. a Raspberry Pi runs comfortably
+   * at 256-512) or up for big iron.
+   *
+   * IGNORED when this node is not running a relay server (i.e. role !==
+   * 'core' and enableRelayServer is false). The knob will log a warning
+   * if set on an edge node so the misconfig is visible.
+   *
+   * IMPORTANT: bumping this above the host's `ulimit -n` will cause
+   * silent peer rejections (EMFILE on socket()) once the connection
+   * count grows. Recommended host fd limit: `max(4096, capacity × 4)`
+   * (equivalently `max(4096, maxConnections × 2)` since
+   * `maxConnections = capacity × 2`). The daemon emits a startup
+   * warning if the soft limit is below this.
+   *
+   * Invalid values (0, negative, NaN, fractional, non-numeric) are
+   * rejected at startup and the daemon falls back to the default with
+   * an operator-facing warning.
+   */
+  relayServerCapacity?: number;
 }
 
 export type ConnectionTransport = 'direct' | 'relayed';

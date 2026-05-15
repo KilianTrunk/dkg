@@ -254,6 +254,21 @@ export interface DkgConfig {
   apiHost?: string;
   listenPort: number;
   nodeRole: 'core' | 'edge';
+  /**
+   * Core Node relay-server capacity tuning. Forwarded into the libp2p
+   * relay configuration via `DKGNodeConfig.relayServerCapacity`. Sets
+   * the maximum number of simultaneous circuit-relay v2 reservations
+   * this node will hold; HOP/STOP stream caps and
+   * `connectionManager.maxConnections` are derived at a 1:2 ratio
+   * (capacity=1024 → 2048 streams + 2048 max conns).
+   *
+   * Default: 1024 when omitted on a Core Node. Ignored on edge nodes
+   * (with a startup warning if set there). Invalid values (0,
+   * negative, fractional, NaN) fall back to the default with a
+   * warning. See packages/core/src/types.ts and packages/cli/README.md
+   * for the full rationale + ulimit -n requirements.
+   */
+  relayServerCapacity?: number;
   /** Public multiaddrs to announce (for VPS/cloud nodes where the public IP is not on the interface). */
   announceAddresses?: string[];
   /** Bootstrap peer multiaddrs to connect to on startup (for direct peer discovery without relay). */

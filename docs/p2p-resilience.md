@@ -14,8 +14,20 @@ Two common DKG deployments sit behind home/office NAT:
 These nodes depend on the testnet **circuit relay** peers to be dialable by
 anyone else. The relay path is fragile by construction:
 
-1. A reservation must be held on the relay (5-minute TTL in our config,
-   `defaultDurationLimit: 5 * 60 * 1000` in `packages/core/src/node.ts`).
+1. A reservation must be held on the relay. Two distinct knobs from
+   libp2p's `circuitRelayServer({ reservations: ... })`, both set
+   explicitly in `packages/core/src/node.ts`:
+   - `reservationTtl` (libp2p `ServerReservationStoreInit.reservationTtl`,
+     `RELAY_RESERVATION_TTL_MS = 2h`) — how long a reservation lasts
+     before the reservee must renew. This is the actual reservation
+     expiry.
+   - `defaultDurationLimit`
+     (`ServerReservationStoreInit.defaultDurationLimit`,
+     `RELAY_DEFAULT_DURATION_LIMIT_MS = 30 min`) — the maximum lifetime
+     of a single relayed *circuit* (per-stream cap). Bumped from
+     libp2p's effectively-5-minute default so chat-style intermittent
+     traffic doesn't tear individual circuits down underneath the
+     application during quiet windows.
 2. The TCP connection to the relay must stay alive.
 3. Both sides must have a relay in common with live reservations, or one
    side must be directly dialable.

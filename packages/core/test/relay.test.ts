@@ -461,4 +461,110 @@ describe('Circuit Relay', () => {
 
     warnSpy.mockRestore();
   }, 15000);
+
+  it('does not churn the unreserved relay when relayReservationCount < relayPeers.length', async () => {
+    // Codex review on PR #526 round 3 caught a real bug in the round-2
+    // watchdog: with target>1, the per-relay gate required EVERY
+    // configured peer to hold a reservation. For configs like 3 peers
+    // + count=2, the unreserved third peer's gate
+    // (`!thisRelayHasReservation`) stayed true forever and the
+    // watchdog would tear it down + redial on every grace-window
+    // expiry — wasted churn at best, breaks the existing 2 reservations
+    // at worst (drop+redial closes the existing connection).
+    //
+    // Round-3 fix: gate is now "this peer holds OR `reservedRelayCount
+    // >= target`". For 2-of-3 we expect 2 reservations and the
+    // watchdog should leave the third peer alone.
+    //
+    // We assert the absence of churn by spying on the watchdog's
+    // dropping/redial log line and triggering watchdogTick directly
+    // (it's `private` so we type-cast — same escape hatch as a few
+    // other tests in this file).
+    const relay1 = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    const relay2 = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    const relay3 = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    nodes.push(relay1, relay2, relay3);
+    await relay1.start();
+    await relay2.start();
+    await relay3.start();
+
+    const relay1Addr = relay1.multiaddrs.find(a => a.includes('/tcp/'))!;
+    const relay2Addr = relay2.multiaddrs.find(a => a.includes('/tcp/'))!;
+    const relay3Addr = relay3.multiaddrs.find(a => a.includes('/tcp/'))!;
+
+    const edge = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      relayPeers: [relay1Addr, relay2Addr, relay3Addr],
+      relayReservationCount: 2,
+    });
+    nodes.push(edge);
+    await edge.start();
+
+    const deadline = Date.now() + 10_000;
+    let circuitAddrs: string[] = [];
+    while (Date.now() < deadline) {
+      circuitAddrs = edge.libp2p
+        .getMultiaddrs()
+        .map(ma => ma.toString())
+        .filter(a => a.includes('/p2p-circuit'));
+      const distinct = new Set(
+        circuitAddrs.map(a => a.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1]).filter(Boolean),
+      );
+      if (distinct.size >= 2) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+    const initialReservedPids = new Set(
+      circuitAddrs.map(a => a.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1]).filter(Boolean),
+    );
+    expect(
+      initialReservedPids.size,
+      `expected exactly 2 reservations from 2-of-3 config; got circuitAddrs=${JSON.stringify(circuitAddrs)}`,
+    ).toBe(2);
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await (edge as unknown as { watchdogTick: () => Promise<void> }).watchdogTick();
+
+      const churnLog = logSpy.mock.calls.find((call) =>
+        typeof call[0] === 'string'
+        && call[0].includes('Relay watchdog')
+        && (
+          call[0].includes('this relay missing')
+          || call[0].includes('to force reserve')
+          || call[0].includes('reservation-redial')
+        ),
+      );
+      expect(
+        churnLog,
+        `expected NO watchdog churn for the unreserved peer; got: ${JSON.stringify(logSpy.mock.calls.map(c => c[0]))}`,
+      ).toBeUndefined();
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    const finalCircuitAddrs = edge.libp2p
+      .getMultiaddrs()
+      .map(ma => ma.toString())
+      .filter(a => a.includes('/p2p-circuit'));
+    const finalReservedPids = new Set(
+      finalCircuitAddrs.map(a => a.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1]).filter(Boolean),
+    );
+    expect(finalReservedPids.size).toBe(2);
+    for (const pid of initialReservedPids) {
+      expect(finalReservedPids.has(pid as string)).toBe(true);
+    }
+  }, 25000);
 });

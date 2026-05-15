@@ -816,9 +816,21 @@ export class DKGNode {
     // hint stays accurate within a single iteration.
     let circuitSelfAddrs = node.getMultiaddrs().map(ma => ma.toString()).filter(a => a.includes('/p2p-circuit'));
     let haveAnyReservation = circuitSelfAddrs.length > 0;
+    // Distinct count of CONFIGURED relays that currently hold a
+    // reservation. This is the "do we have enough reservations?"
+    // signal — not "does every peer hold one?". Recomputed alongside
+    // `circuitSelfAddrs` so a successful mid-tick redial that brings
+    // the count up to target flips remaining peers' gates from
+    // "needs recovery" to "satisfied" without further churn.
+    const computeReservedRelayCount = () => this.relayTargets.filter(({ peerId }) =>
+      !peerId.equals(node.peerId) &&
+      circuitSelfAddrs.some(a => a.includes(`/p2p/${peerId.toString()}/p2p-circuit`)),
+    ).length;
+    let reservedRelayCount = computeReservedRelayCount();
     const refreshReservationSnapshot = () => {
       circuitSelfAddrs = node.getMultiaddrs().map(ma => ma.toString()).filter(a => a.includes('/p2p-circuit'));
       haveAnyReservation = circuitSelfAddrs.length > 0;
+      reservedRelayCount = computeReservedRelayCount();
     };
     const now = Date.now();
 
@@ -833,46 +845,48 @@ export class DKGNode {
         a.includes(`/p2p/${relayPidStr}/p2p-circuit`),
       );
 
-      // Happy path semantics depend on the multi-reservation target:
+      // Happy path. A peer's gate is satisfied if either:
       //
-      // - Single reservation (target=1): "transport up AND any reservation
-      //   exists" is healthy — historical libp2p behavior reserved one
-      //   relay slot at a time, so other configured relays sit connected
-      //   but idle as the steady state. Don't tear them down.
+      //   (a) this peer personally holds our reservation, OR
+      //   (b) we already have ENOUGH distinct reservations elsewhere
+      //       (`reservedRelayCount >= target`).
       //
-      // - Multi reservation (target>1, PR #526 edge nodes): EACH relay
-      //   must hold a reservation. Without this, if reservation N gets
-      //   dropped (e.g. libp2p's auto-renewal at TTL/2 failed because
-      //   the relay returned an error), the other N-1 reservations keep
-      //   `haveAnyReservation=true` and the watchdog would silently let
-      //   N degrade to N-1 forever — Codex review on PR #526 flagged
-      //   this as the silent-degradation bug. Falling through to the
-      //   "no reservation" branch redials this specific relay and
-      //   restores the slot.
+      // The total-count check (b) is the critical fix vs round 2 of
+      // PR #526. The previous "every relay must hold one when target>1"
+      // gate broke valid configs like `relayPeers=3, relayReservationCount=2`:
+      // the third peer never reserves (count clamps at target=2), so
+      // `!thisRelayHasReservation` stayed true forever and the watchdog
+      // would tear down + redial it on every grace-window expiry.
+      // Codex review on PR #526 round 3 flagged this — see
+      // https://github.com/OriginTrail/dkg/pull/526. Counting reserved
+      // relays preserves the round-2 fix (silent degradation when
+      // target > current is still detected and recovered) without
+      // demanding 100% coverage when target < relayPeers.length.
       const reservationGateSatisfied =
         thisRelayHasReservation ||
-        (this.relayReservationCountTarget <= 1 && haveAnyReservation);
+        reservedRelayCount >= this.relayReservationCountTarget;
       if (transportUp && reservationGateSatisfied) {
         this.relayReservationRedialAt.delete(relayPidStr);
         continue;
       }
 
-      // Reservation-recovery branch. Two scenarios both call for
-      // dropping + redialing THIS relay:
+      // Reservation-recovery branch. Drop + redial THIS relay when:
       //
-      //   1. (Single-reservation) transport is up but ZERO reservations
-      //      exist anywhere — libp2p's reservation-pool management has
-      //      lost the only slot.
+      //   1. transport is up AND reservations exist nowhere — libp2p's
+      //      reservation-pool management has lost every slot.
       //
-      //   2. (Multi-reservation, target > 1) transport is up but this
-      //      specific relay no longer holds a reservation, even though
-      //      others do. Without this branch, the watchdog would let
-      //      N degrade to N-1 forever — Codex review on PR #526.
+      //   2. transport is up AND `reservedRelayCount < target` AND this
+      //      specific peer is missing one — try to claim one of the
+      //      missing slots from this peer. Once the redial succeeds
+      //      (`refreshReservationSnapshot` updates `reservedRelayCount`),
+      //      remaining peers' gates may flip to "satisfied" naturally
+      //      and we stop redialing — no over-reservation, no churn on
+      //      the unconfigured-as-target peers.
       const needsForcedReservationRedial =
         transportUp &&
         (
           !haveAnyReservation ||
-          (this.relayReservationCountTarget > 1 && !thisRelayHasReservation)
+          (reservedRelayCount < this.relayReservationCountTarget && !thisRelayHasReservation)
         );
       if (needsForcedReservationRedial) {
         const lastForcedRedial = this.relayReservationRedialAt.get(relayPidStr) ?? 0;
@@ -893,7 +907,7 @@ export class DKGNode {
         onlyWaitingOnGraceWindow = false;
         const reason = !haveAnyReservation
           ? 'no circuit reservation anywhere (0 /p2p-circuit self-addrs)'
-          : `target=${this.relayReservationCountTarget} but this relay holds no reservation`;
+          : `${reservedRelayCount}/${this.relayReservationCountTarget} reservations held; this relay missing`;
         console.log(
           `[${ts()}] Relay watchdog: ${reason}; ` +
           `dropping + redialing ${short(relayPidStr)} to force reserve`,

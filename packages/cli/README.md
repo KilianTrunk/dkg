@@ -125,15 +125,32 @@ down to 1 for the legacy behavior.
 }
 ```
 
-The knob is **ignored when no `relayPeers` are configured** (a public node
-doesn't need relay reservations). Invalid values (0, negative, fractional,
-non-numeric, > 16) fall back to the default with an operator-facing warning.
+The knob is:
+- **Edge-only**. Core / relay-server nodes don't multi-reserve through
+  other relays — they have public addresses for incoming traffic. The
+  daemon's CLI fallback supplies `network.relays` to both core and edge
+  by default, so without this gate every core node would also push 3
+  `/p2p-circuit` listen addrs and consume relay slots network-wide.
+  When set on a core node the value is ignored with a warning.
+- **Clamped to `relayPeers.length`**. Requesting more reservations than
+  there are configured relays can't deliver the documented tolerance
+  and just queues an unattainable target. The clamp emits a warning so
+  the misconfig is visible.
+- **Ignored when no `relayPeers` are configured** (a node not behind NAT
+  doesn't need reservations). Invalid values (0, negative, fractional,
+  non-numeric, > 16) fall back to the default with a warning.
 
 Reservation renewal is **automatic** — libp2p refreshes each reservation 5
 minutes before its 2-hour TTL expires, so no application-level renewal
-loop is required. The local watchdog still handles the harder failure
-mode of a fully-dropped relay connection (which auto-renewal can't recover
-from on its own).
+loop is required. The local relay watchdog handles the harder failure
+modes auto-renewal can't recover from:
+
+- a fully-dropped relay connection (TCP RST, NAT pinhole expiry, ISP
+  routing flap), and
+- per-relay reservation loss when multi-reservation is enabled (e.g. a
+  refresh that returns an error and removes the slot without retrying
+  on the same relay) — without this, N reservations would silently
+  degrade to N-1 and stay there until restart.
 
 ## Commands
 

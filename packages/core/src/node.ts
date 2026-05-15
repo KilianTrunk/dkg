@@ -349,6 +349,16 @@ export class DKGNode {
    */
   private relayReservationRedialAt: Map<string, number> = new Map();
   /**
+   * Target number of simultaneous relay reservations for this edge node
+   * (1 by default, up to `relayReservationCount` for multi-reservation
+   * edges from PR #526). The watchdog uses this to decide whether the
+   * "any /p2p-circuit self-addr exists" healthy gate is sufficient
+   * (target=1) or whether per-relay reservation presence must be
+   * verified (target>1, otherwise N-1 reservations silently degrade
+   * to N-1 forever — Codex review on PR #526).
+   */
+  private relayReservationCountTarget = 1;
+  /**
    * In-process libp2p Metrics adapter. Instantiated only when this node
    * runs a relay server (`enableRelay` true) — its sole job is counting
    * bytes that flow through `/p2p-circuit` forwarded connections so the
@@ -378,9 +388,11 @@ export class DKGNode {
     // flagged that without this guard, restarting a `nodeRole: 'core'`
     // instance as edge would still inject the old metrics adapter
     // and report the prior capacity. Cheap to do unconditionally
-    // since both fields are set below only when relay is enabled.
+    // since these fields are populated below only when relay /
+    // multi-reservation is enabled.
     this.relayMetrics = null;
     this.relayCapacity = null;
+    this.relayReservationCountTarget = 1;
 
     let privateKey;
     if (this.config.privateKey) {
@@ -444,13 +456,32 @@ export class DKGNode {
     }
     const relayCaps = effectiveRelayCapacity != null ? deriveRelayCaps(effectiveRelayCapacity) : null;
 
-    // Number of relay reservations an edge node tries to hold in parallel.
-    // Only meaningful for nodes with relayPeers configured (i.e. behind
-    // NAT). Defaults to 3 — N-2 tolerance for two simultaneous relay
-    // blackouts. Validation defends against the same surface as
-    // relayServerCapacity (0/neg/NaN/fractional/non-number/over-cap).
+    // Number of relay reservations to hold in parallel. Only meaningful
+    // for EDGE nodes behind NAT (relayPeers configured AND no relay
+    // server enabled here). Core / relay-server nodes have public
+    // addresses and don't need to reserve slots on other relays for
+    // incoming traffic — branarakic's PR #526 review caught that the
+    // daemon's CLI fallback supplies `network.relays` to both core and
+    // edge by default, so amplifying 1 → 3 on the core fleet would
+    // multiply reservation-slot consumption network-wide for no
+    // benefit.
+    //
+    // Behaviour by role:
+    //   - Core node  (enableRelay=true) + relayPeers set:  push 1
+    //     `/p2p-circuit` (legacy fallback behaviour, preserves any
+    //     defensive multi-relay config) and IGNORE
+    //     relayReservationCount with a warning if it was set.
+    //   - Edge node  (enableRelay=false) + relayPeers set: apply
+    //     relayReservationCount (default 3, clamped to relayPeers.length
+    //     so we never request more reservations than there are
+    //     configured relays to fulfil them).
+    //   - Any node without relayPeers: skip entirely.
+    //
+    // Validation defends against the same surface as relayServerCapacity
+    // (0/neg/NaN/fractional/non-number/over-cap).
     let relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
-    if (this.config.relayPeers?.length) {
+    const isEdgeWithRelays = !enableRelay && (this.config.relayPeers?.length ?? 0) > 0;
+    if (isEdgeWithRelays) {
       const verdict = validateRelayReservationCount(this.config.relayReservationCount);
       if (verdict == null) {
         relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
@@ -463,10 +494,32 @@ export class DKGNode {
         );
         relayReservationCount = DEFAULT_RELAY_RESERVATION_COUNT;
       }
-    } else if (this.config.relayReservationCount != null) {
+      // Clamp to relayPeers.length — requesting more reservations than
+      // there are configured relays can't deliver the documented N-(N-1)
+      // tolerance and risks duplicate-reservation churn against an
+      // unattainable target. Codex review on PR #526 caught this.
+      const peerCount = this.config.relayPeers!.length;
+      if (relayReservationCount > peerCount) {
+        console.warn(
+          `[dkg-core] relayReservationCount=${relayReservationCount} exceeds ` +
+            `configured relayPeers.length=${peerCount}; clamping to ${peerCount}`,
+        );
+        relayReservationCount = peerCount;
+      }
+    } else if (
+      this.config.relayReservationCount != null &&
+      !this.config.relayPeers?.length
+    ) {
       console.warn(
         `[dkg-core] relayReservationCount=${this.config.relayReservationCount} ` +
           `set but no relayPeers configured; value ignored`,
+      );
+    } else if (this.config.relayReservationCount != null && enableRelay) {
+      console.warn(
+        `[dkg-core] relayReservationCount=${this.config.relayReservationCount} ` +
+          `set but this node runs a relay server (nodeRole=${this.config.nodeRole ?? 'edge'}, ` +
+          `enableRelayServer=${this.config.enableRelayServer}); ` +
+          `relay servers don't multi-reserve through other relays; value ignored`,
       );
     }
 
@@ -486,18 +539,18 @@ export class DKGNode {
       // which serializes our N pending /p2p-circuit slots and effectively
       // collapses multi-reservation back to single-reservation. Set to
       // relayReservationCount so all N slots are attempted concurrently
-      // at startup. Only set when behind NAT (otherwise no relayPeers
-      // are configured and the field is irrelevant).
+      // at startup. Only set on EDGE nodes with relayPeers — core /
+      // relay-server nodes don't multi-reserve through other relays.
       circuitRelayTransport(
         relayCaps
           ? {
               maxInboundStopStreams: relayCaps.maxInboundStopStreams,
               maxOutboundStopStreams: relayCaps.maxOutboundStopStreams,
-              ...(this.config.relayPeers?.length
+              ...(isEdgeWithRelays
                 ? { reservationConcurrency: relayReservationCount }
                 : {}),
             }
-          : this.config.relayPeers?.length
+          : isEdgeWithRelays
             ? { reservationConcurrency: relayReservationCount }
             : undefined,
       ),
@@ -618,12 +671,24 @@ export class DKGNode {
     // slot in libp2p's transport reservation store (see
     // `@libp2p/circuit-relay-v2/transport/reservation-store.js#reserveRelay`),
     // so pushing N entries → N reservations on N (preferentially distinct)
-    // relays. Combined with `reservationConcurrency` above, this gives
-    // the edge N-(N-1) tolerance to relay failures.
-    if (this.config.relayPeers?.length) {
+    // relays.
+    //
+    // Edge nodes get N (relayReservationCount, default 3, clamped to
+    // relayPeers.length) for N-(N-1) fault tolerance. Core / relay-server
+    // nodes that also have relayPeers set keep the legacy single
+    // `/p2p-circuit` (preserves any defensive multi-relay config without
+    // multiplying slot consumption across the core fleet — branarakic
+    // PR #526 review).
+    if (isEdgeWithRelays) {
       for (let i = 0; i < relayReservationCount; i++) {
         listenAddrs.push('/p2p-circuit');
       }
+      this.relayReservationCountTarget = relayReservationCount;
+    } else if (this.config.relayPeers?.length) {
+      // Core node with explicit relayPeers — push the legacy single
+      // /p2p-circuit listen addr.
+      listenAddrs.push('/p2p-circuit');
+      this.relayReservationCountTarget = 1;
     }
 
     this.node = await createLibp2p<DKGServices>({
@@ -768,19 +833,48 @@ export class DKGNode {
         a.includes(`/p2p/${relayPidStr}/p2p-circuit`),
       );
 
-      // Happy path: transport is up AND either this relay is the one
-      // holding our reservation, OR we already have a reservation on some
-      // other relay (libp2p only requests one at a time by default, so
-      // "other relays are connected but idle" is the normal steady state).
-      if (transportUp && (thisRelayHasReservation || haveAnyReservation)) {
+      // Happy path semantics depend on the multi-reservation target:
+      //
+      // - Single reservation (target=1): "transport up AND any reservation
+      //   exists" is healthy — historical libp2p behavior reserved one
+      //   relay slot at a time, so other configured relays sit connected
+      //   but idle as the steady state. Don't tear them down.
+      //
+      // - Multi reservation (target>1, PR #526 edge nodes): EACH relay
+      //   must hold a reservation. Without this, if reservation N gets
+      //   dropped (e.g. libp2p's auto-renewal at TTL/2 failed because
+      //   the relay returned an error), the other N-1 reservations keep
+      //   `haveAnyReservation=true` and the watchdog would silently let
+      //   N degrade to N-1 forever — Codex review on PR #526 flagged
+      //   this as the silent-degradation bug. Falling through to the
+      //   "no reservation" branch redials this specific relay and
+      //   restores the slot.
+      const reservationGateSatisfied =
+        thisRelayHasReservation ||
+        (this.relayReservationCountTarget <= 1 && haveAnyReservation);
+      if (transportUp && reservationGateSatisfied) {
         this.relayReservationRedialAt.delete(relayPidStr);
         continue;
       }
 
-      // Transport is up but we have ZERO reservations across all relays.
-      // Something has gone wrong in libp2p's reservation-pool management;
-      // force a re-listen on this relay by dropping + redialing.
-      if (transportUp && !haveAnyReservation) {
+      // Reservation-recovery branch. Two scenarios both call for
+      // dropping + redialing THIS relay:
+      //
+      //   1. (Single-reservation) transport is up but ZERO reservations
+      //      exist anywhere — libp2p's reservation-pool management has
+      //      lost the only slot.
+      //
+      //   2. (Multi-reservation, target > 1) transport is up but this
+      //      specific relay no longer holds a reservation, even though
+      //      others do. Without this branch, the watchdog would let
+      //      N degrade to N-1 forever — Codex review on PR #526.
+      const needsForcedReservationRedial =
+        transportUp &&
+        (
+          !haveAnyReservation ||
+          (this.relayReservationCountTarget > 1 && !thisRelayHasReservation)
+        );
+      if (needsForcedReservationRedial) {
         const lastForcedRedial = this.relayReservationRedialAt.get(relayPidStr) ?? 0;
         if (now - lastForcedRedial < RELAY_RESERVATION_GRACE_MS) {
           // We just redialed; give libp2p time to finish negotiating a new
@@ -797,8 +891,11 @@ export class DKGNode {
         // Actual corrective action below (drop + redial); this is a
         // real failure the watchdog must back off on.
         onlyWaitingOnGraceWindow = false;
+        const reason = !haveAnyReservation
+          ? 'no circuit reservation anywhere (0 /p2p-circuit self-addrs)'
+          : `target=${this.relayReservationCountTarget} but this relay holds no reservation`;
         console.log(
-          `[${ts()}] Relay watchdog: no circuit reservation anywhere (0 /p2p-circuit self-addrs); ` +
+          `[${ts()}] Relay watchdog: ${reason}; ` +
           `dropping + redialing ${short(relayPidStr)} to force reserve`,
         );
         this.relayReservationRedialAt.set(relayPidStr, now);
@@ -824,15 +921,22 @@ export class DKGNode {
         } catch (err: any) {
           console.log(`[${ts()}] Relay watchdog: reservation-redial failed for ${short(relayPidStr)}: ${err.message}`);
         }
-        // Stop after one reservation-recovery attempt per tick. libp2p's
-        // circuit-relay-v2 only holds one reservation at a time by default,
-        // so if this redial restored a reservation, every remaining relay
-        // in `this.relayTargets` would otherwise still see the stale
-        // `!haveAnyReservation` snapshot from line ~251 and tear-down +
-        // redial itself in the same tick, briefly dropping all relay paths
-        // at once. One recovery per tick is enough; the next tick re-reads
-        // multiaddrs and will handle any remaining unhealthy relays.
-        if (redialed) break;
+        // For single-reservation deployments (target<=1) stop after one
+        // recovery attempt per tick: libp2p only holds one reservation at
+        // a time, so if this redial restored it, every remaining relay
+        // in `this.relayTargets` would still see the stale
+        // `!haveAnyReservation` snapshot and tear-down + redial itself
+        // in the same tick, briefly dropping all relay paths at once.
+        // For multi-reservation (target>1) we want to keep going so all
+        // missing slots are restored in a single tick — each relay has
+        // an independent per-relay reservation, so restoring relay A
+        // doesn't change whether relay B needs the same recovery. We
+        // refresh the snapshot first so the next iteration sees the
+        // up-to-date reservation set.
+        if (redialed) {
+          if (this.relayReservationCountTarget <= 1) break;
+          refreshReservationSnapshot();
+        }
         continue;
       }
 
@@ -986,6 +1090,7 @@ export class DKGNode {
     this.relayedPeers.clear();
     this.relayMetrics = null;
     this.relayCapacity = null;
+    this.relayReservationCountTarget = 1;
     await this.node.stop();
     this.node = null;
   }

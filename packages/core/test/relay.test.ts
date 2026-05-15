@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { DKGNode } from '../src/node.js';
 import { ProtocolRouter } from '../src/protocol-router.js';
 import { PeerDiscoveryManager } from '../src/discovery.js';
@@ -354,4 +354,111 @@ describe('Circuit Relay', () => {
     expect(hasRelay1, `expected reservation on relay1; circuitAddrs=${JSON.stringify(circuitAddrs)}`).toBe(true);
     expect(hasRelay2, `expected reservation on relay2; circuitAddrs=${JSON.stringify(circuitAddrs)}`).toBe(true);
   }, 20000);
+
+  it('clamps relayReservationCount to relayPeers.length and warns', async () => {
+    // Codex review on PR #526: requesting 3 reservations when only 1
+    // relay is configured can't deliver the documented N-(N-1)
+    // tolerance and would queue an unattainable target. The fix is
+    // to clamp + warn at start(). We verify the warn fires and the
+    // edge actually only ends up with 1 /p2p-circuit self-addr (not
+    // 3 attempts queued forever).
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const relay = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    nodes.push(relay);
+    await relay.start();
+
+    const relayAddr = relay.multiaddrs.find(a => a.includes('/tcp/'))!;
+
+    const edge = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      relayPeers: [relayAddr],
+      relayReservationCount: 3,
+    });
+    nodes.push(edge);
+    await edge.start();
+
+    const clampWarn = warnSpy.mock.calls.find(call =>
+      typeof call[0] === 'string' && call[0].includes('clamping to 1'),
+    );
+    expect(clampWarn, `expected clamp warning; got: ${JSON.stringify(warnSpy.mock.calls)}`).toBeDefined();
+
+    // Wait for the (single) reservation, then assert exactly one
+    // distinct circuit self-addr (i.e. no extra duplicate listen addrs
+    // hung up waiting for a relay that doesn't exist).
+    const deadline = Date.now() + 5_000;
+    let circuitAddrs: string[] = [];
+    while (Date.now() < deadline) {
+      circuitAddrs = edge.libp2p
+        .getMultiaddrs()
+        .map(ma => ma.toString())
+        .filter(a => a.includes('/p2p-circuit'));
+      if (circuitAddrs.length > 0) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+    const distinctRelayPids = new Set(
+      circuitAddrs.map(a => a.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1]).filter(Boolean),
+    );
+    expect(distinctRelayPids.size).toBe(1);
+
+    warnSpy.mockRestore();
+  }, 15000);
+
+  it('skips multi-reservation amplification on relay-server (core) nodes with relayPeers', async () => {
+    // PR #526 round-2 review (branarakic): the daemon's CLI fallback
+    // supplies network.relays to BOTH core and edge nodes by default,
+    // so without this gate a `nodeRole: "core"` instance would push
+    // 3 `/p2p-circuit` listen addrs and try to reserve on other
+    // relays. That contradicts the docs framing ("public node doesn't
+    // need relay reservations") and multiplies relay-slot consumption
+    // network-wide. The fix: core nodes with relayPeers fall back to
+    // the legacy single /p2p-circuit listen addr, and
+    // relayReservationCount is ignored with a warning.
+    //
+    // Note: the existing "node with relay peers starts with tcp
+    // keepAlive" test above asserts a core node still functions when
+    // relayPeers are set — this test pins the warning + the absence
+    // of the multi-reservation amplification.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const upstreamRelay = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+    });
+    nodes.push(upstreamRelay);
+    await upstreamRelay.start();
+
+    const upstreamRelayAddr = upstreamRelay.multiaddrs.find(a => a.includes('/tcp/'))!;
+
+    // Core node ALSO running a relay server, which ALSO has a
+    // relayPeer (the daemon-fallback scenario branarakic flagged).
+    // We set count=3 to make sure it's actively ignored.
+    const core = new DKGNode({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/0'],
+      enableMdns: false,
+      enableRelayServer: true,
+      relayPeers: [upstreamRelayAddr],
+      relayReservationCount: 3,
+    });
+    nodes.push(core);
+    await core.start();
+
+    const ignoreWarn = warnSpy.mock.calls.find(call =>
+      typeof call[0] === 'string'
+      && call[0].includes('relayReservationCount=3')
+      && call[0].includes('relay servers don\'t multi-reserve'),
+    );
+    expect(
+      ignoreWarn,
+      `expected core-ignore warning; got: ${JSON.stringify(warnSpy.mock.calls)}`,
+    ).toBeDefined();
+
+    warnSpy.mockRestore();
+  }, 15000);
 });

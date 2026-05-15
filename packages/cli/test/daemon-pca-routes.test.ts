@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { ethers } from 'ethers';
 import { handlePcaRoutes } from '../src/daemon/routes/pca.js';
 import type { RequestContext } from '../src/daemon/routes/context.js';
 
@@ -139,6 +140,52 @@ describe('daemon /api/pca V10 caller contract', () => {
     const { res, done } = runCtx('POST', '/api/pca/1/funds', agent, { tokens: '50' });
     await done;
     expect(res.statusCode).toBe(403);
+  });
+
+  it('round-trips register/funds → GET reflects agentCount and topUpBuffer', async () => {
+    const state = { agents: new Set<string>(), topUp: 0n };
+    const agent = {
+      registerConvictionAgent: async (_id: bigint, a: string) => {
+        state.agents.add(a.toLowerCase());
+        return { hash: '0xr', blockNumber: 1, success: true };
+      },
+      deregisterConvictionAgent: async (_id: bigint, a: string) => {
+        state.agents.delete(a.toLowerCase());
+        return { hash: '0xd', blockNumber: 2, success: true };
+      },
+      isConvictionAgent: async (_id: bigint, a: string) => state.agents.has(a.toLowerCase()),
+      topUpConvictionAccount: async (_id: bigint, amount: bigint) => {
+        state.topUp += amount;
+        return { hash: '0xt', blockNumber: 3, success: true };
+      },
+      getConvictionAccountInfo: async () => ({
+        owner: '0x' + '9'.repeat(40),
+        committedTRAC: 100n,
+        baseEpochAllowance: 1n,
+        createdAtEpoch: 1,
+        expiresAtEpoch: 9,
+        createdAtTimestamp: 0,
+        expiresAtTimestamp: 0,
+        discountBps: 500,
+        topUpBuffer: state.topUp,
+        agentCount: state.agents.size,
+        lastSettledWindow: 0,
+        fullySwept: false,
+      }),
+    };
+    const addr = '0x' + '3'.repeat(40);
+
+    const reg = runCtx('POST', '/api/pca/1/agent', agent, { agent: addr });
+    await reg.done;
+    const fund = runCtx('POST', '/api/pca/1/funds', agent, { tokens: '5' });
+    await fund.done;
+
+    const get = runCtx('GET', '/api/pca/1', agent);
+    await get.done;
+    expect(get.res.statusCode).toBe(200);
+    const body = JSON.parse(get.res.body);
+    expect(body.agentCount).toBe(1);
+    expect(body.topUpBuffer).toBe(ethers.parseEther('5').toString());
   });
 
   it('maps a NoChainAdapter noChain() throw to HTTP 503, not 500', async () => {

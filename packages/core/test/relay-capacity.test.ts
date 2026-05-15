@@ -28,6 +28,8 @@ import {
   RELAY_DEFAULT_DURATION_LIMIT_MS,
   RELAY_RESERVATION_TTL_MS,
   EDGE_NODE_MAX_CONNECTIONS,
+  MAX_RELAY_SERVER_CAPACITY,
+  RELAY_CAPACITY_MULTIPLIER,
   deriveRelayCaps,
   validateRelayServerCapacity,
   checkFdLimit,
@@ -129,6 +131,28 @@ describe('validateRelayServerCapacity', () => {
     expect(validateRelayServerCapacity(true as any)).toEqual({ ok: false, reason: expect.stringContaining('number') });
     expect(validateRelayServerCapacity({} as any)).toEqual({ ok: false, reason: expect.stringContaining('number') });
     expect(validateRelayServerCapacity([] as any)).toEqual({ ok: false, reason: expect.stringContaining('number') });
+  });
+
+  it('rejects values above Number.MAX_SAFE_INTEGER — would lose precision when multiplied', () => {
+    // Codex review on PR #524 round 4: `Number.isInteger(9007199254740993)`
+    // returns true even though that value already collapses into
+    // `9007199254740992` (i.e. it fails round-trip equality with itself).
+    // `deriveRelayCaps` then multiplies by RELAY_CAPACITY_MULTIPLIER and
+    // hands an imprecise cap to libp2p. We now reject anything outside
+    // the safe-integer range before it can leak through.
+    const beyondSafe = Number.MAX_SAFE_INTEGER + 2; // +2 because +1 collides with MAX_SAFE_INTEGER itself
+    expect(validateRelayServerCapacity(beyondSafe))
+      .toEqual({ ok: false, reason: expect.stringContaining('safe integer') });
+  });
+
+  it('rejects values whose derived cap would overflow safe-integer range', () => {
+    // The post-multiply ceiling matters: even if `capacity` is itself
+    // safe, `capacity * RELAY_CAPACITY_MULTIPLIER` (the value libp2p
+    // actually receives for the stream caps) must also stay safe.
+    expect(validateRelayServerCapacity(MAX_RELAY_SERVER_CAPACITY))
+      .toEqual({ ok: true, value: MAX_RELAY_SERVER_CAPACITY });
+    expect(validateRelayServerCapacity(MAX_RELAY_SERVER_CAPACITY + 1))
+      .toEqual({ ok: false, reason: expect.stringContaining(`capacity × ${RELAY_CAPACITY_MULTIPLIER}`) });
   });
 });
 

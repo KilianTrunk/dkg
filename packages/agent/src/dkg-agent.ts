@@ -9349,8 +9349,8 @@ export class DKGAgent {
     targetUalOrRoot: string,
   ): Promise<string[]> {
     assertSafeIri(targetUalOrRoot);
-    const dataGraph = contextGraphDataGraphUri(contextGraphId);
-    const metaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const dataGraph = assertSafeIri(contextGraphDataGraphUri(contextGraphId));
+    const metaGraph = assertSafeIri(contextGraphMetaGraphUri(contextGraphId));
     const target = `<${targetUalOrRoot}>`;
     const namespaces = ['http://dkg.io/ontology/', 'https://dkg.network/ontology#'];
     const existsPatterns = [
@@ -9403,13 +9403,14 @@ export class DKGAgent {
   }
 
   private async getSubjectsForRoots(graph: string, roots: Iterable<string>): Promise<string[]> {
+    const safeGraph = assertSafeIri(graph);
     const rootEntities = [...new Set([...roots].filter(Boolean))];
     if (rootEntities.length === 0) return [];
     const filterClauses = rootEntities
-      .map(e => `(STR(?s) = ${JSON.stringify(e)} || STRSTARTS(STR(?s), ${JSON.stringify(e + '/.well-known/genid/')}))`)
+      .map(e => `(STR(?s) = ${sparqlString(e)} || STRSTARTS(STR(?s), ${sparqlString(e + '/.well-known/genid/')}))`)
       .join(' || ');
     const result = await this.store.query(
-      `SELECT DISTINCT ?s WHERE { GRAPH <${graph}> { ?s ?p ?o . FILTER(${filterClauses}) } }`,
+      `SELECT DISTINCT ?s WHERE { GRAPH <${safeGraph}> { ?s ?p ?o . FILTER(${filterClauses}) } }`,
     );
     const subjects = new Set(rootEntities);
     if (result.type === 'bindings') {
@@ -9495,7 +9496,7 @@ export class DKGAgent {
     const ctx = createOperationContext('verify');
 
     // 1. Look up batch merkle root from local metadata (use typed literal for batchId)
-    const metaGraph = contextGraphMetaGraphUri(opts.contextGraphId);
+    const metaGraph = assertSafeIri(contextGraphMetaGraphUri(opts.contextGraphId));
     const dkgNamespaces = ['http://dkg.io/ontology/', 'https://dkg.network/ontology#'];
     // Try typed literal first, fallback to untyped for backward compat.
     let batchBindings: Record<string, string>[] | null = null;
@@ -9759,8 +9760,8 @@ export class DKGAgent {
       }
     }
 
-    const metaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+    const metaGraph = assertSafeIri(contextGraphMetaGraphUri(contextGraphId));
+    const contextGraphUri = assertSafeIri(`did:dkg:context-graph:${contextGraphId}`);
     const result = await this.store.query(
       `SELECT ?identityId WHERE {
         GRAPH <${metaGraph}> {
@@ -9799,20 +9800,20 @@ export class DKGAgent {
       this.log.warn(createOperationContext('verify'), `No root entities found for batch ${batchId} — skipping VM promotion`);
       return;
     }
-    const dataGraph = contextGraphDataGraphUri(contextGraphId);
+    const dataGraph = assertSafeIri(contextGraphDataGraphUri(contextGraphId));
     // Query root entities AND their skolemized children (subjects starting
     // with the root entity URI, e.g. <root>/.well-known/genid/...).
     // We use FILTER with STRSTARTS to capture the full closure instead of
     // an exact VALUES match, which would miss child/blank-node subjects.
     const filterClauses = rootEntities
-      .map(e => `(STR(?s) = ${JSON.stringify(e)} || STRSTARTS(STR(?s), ${JSON.stringify(e + '/.well-known/genid/')}))`)
+      .map(e => `(STR(?s) = ${sparqlString(e)} || STRSTARTS(STR(?s), ${sparqlString(e + '/.well-known/genid/')}))`)
       .join(' || ');
     const result = await this.store.query(
       `SELECT ?s ?p ?o WHERE { GRAPH <${dataGraph}> { ?s ?p ?o . FILTER(${filterClauses}) } }`,
     );
     if (result.type !== 'bindings') return;
 
-    const vmGraph = contextGraphVerifiedMemoryUri(contextGraphId, verifiedMemoryId);
+    const vmGraph = assertSafeIri(contextGraphVerifiedMemoryUri(contextGraphId, verifiedMemoryId));
     const vmQuads: Quad[] = (result.bindings as Record<string, string>[])
       .filter(row => !isTrustLevelQuad({ predicate: row.p }))
       .map(row => ({
@@ -9861,7 +9862,7 @@ export class DKGAgent {
   }
 
   private async getRootEntities(contextGraphId: string, batchId: bigint): Promise<string[]> {
-    const metaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const metaGraph = assertSafeIri(contextGraphMetaGraphUri(contextGraphId));
     // Try typed literal first, fallback to untyped for backward compat
     for (const ns of ['http://dkg.io/ontology/', 'https://dkg.network/ontology#']) {
       for (const literal of [`"${batchId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, `"${batchId}"`]) {
@@ -9893,7 +9894,7 @@ export class DKGAgent {
     contextGraphId: string,
     batchId: bigint,
   ): Promise<{ hash: string; blockNumber: number } | null> {
-    const metaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const metaGraph = assertSafeIri(contextGraphMetaGraphUri(contextGraphId));
     for (const ns of ['http://dkg.io/ontology/', 'https://dkg.network/ontology#']) {
       for (const literal of [`"${batchId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, `"${batchId}"`]) {
         const result = await this.store.query(

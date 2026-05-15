@@ -903,10 +903,14 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       timeoutMs,
       requiredSignatures,
     } = JSON.parse(body);
-    if (!contextGraphId || !verifiedMemoryId || !batchId) {
+    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    if (!verifiedMemoryId || !batchId) {
       return jsonResponse(res, 400, {
-        error: "Missing contextGraphId, verifiedMemoryId, or batchId",
+        error: "Missing verifiedMemoryId or batchId",
       });
+    }
+    if (typeof verifiedMemoryId !== 'string') {
+      return jsonResponse(res, 400, { error: '"verifiedMemoryId" must be a string' });
     }
     const parsedSigs = parseRequiredSignatures(requiredSignatures);
     if ("error" in parsedSigs) {
@@ -982,10 +986,14 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = JSON.parse(body);
     const { contextGraphId, ual } = parsed;
-    if (!contextGraphId || !ual) {
+    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    if (!ual) {
       return jsonResponse(res, 400, {
-        error: "Missing contextGraphId or ual",
+        error: "Missing ual",
       });
+    }
+    if (typeof ual !== 'string' || !isSafeIri(ual)) {
+      return jsonResponse(res, 400, { error: '"ual" must be a safe IRI' });
     }
     // A-12 review: the endorser MUST come from the authenticated bearer
     // token, not from the request body. Trusting body.agentAddress let

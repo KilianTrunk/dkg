@@ -2609,10 +2609,9 @@ export class DKGPublisher implements Publisher {
     // recovery state when a concrete update tx is imminent) while the
     // outer try/finally still guarantees balanced `:start`/`:end`
     // when the adapter throws after invoking `onBroadcast`. The V9
-    // fallback path (`updateKnowledgeAssets`) does not yet support
-    // the hook — it retains the coarse phase boundary that brackets
-    // the whole adapter call. See the equivalent marker in the
-    // publish path above for the full rationale.
+    // legacy update fallback was archived in
+    // `archive-non-v10-contracts` (issue 0004) — adapters must now
+    // provide the V10 `updateKnowledgeCollectionV10` surface.
     let txResult: { success: boolean; hash: string; blockNumber?: number; publisherAddress?: string };
     let earlyReturn: PublishResult | undefined;
     let wroteAhead = false;
@@ -2662,47 +2661,13 @@ export class DKGPublisher implements Publisher {
               publicQuads: allSkolemizedQuads,
             };
             txResult = { success: false, hash: '' };
-          } else if (typeof this.chain.updateKnowledgeAssets === 'function') {
-            this.log.info(ctx, `V10 update failed (${errorName ?? 'unknown'}), trying V9 path: ${v10Err instanceof Error ? v10Err.message : String(v10Err)}`);
-            // Codex PR #241 iter-6: The V9 `updateKnowledgeAssets()`
-            // adapter path has NO `onBroadcast` hook, so we cannot emit
-            // a true "tx signed, about to broadcast" WAL checkpoint
-            // here. Previously we emitted `chain:writeahead:start`
-            // unconditionally before the adapter call, but that
-            // re-introduced exactly the false-positive WAL boundary
-            // this PR is removing: preflight/estimateGas can throw
-            // before any tx hits the wire, leaving listeners with a
-            // checkpoint for a publish that never broadcast. Safer to
-            // skip the phase entirely on V9 — callers relying on WAL
-            // semantics must upgrade to a V10 adapter that provides
-            // `onBroadcast`.
-            try {
-              txResult = await this.chain.updateKnowledgeAssets({
-                batchId: kcId,
-                newMerkleRoot: kcMerkleRoot,
-                newPublicByteSize: updateByteSize,
-                publisherAddress,
-              });
-            } catch (v9Err) {
-              enrichEvmError(v9Err);
-              throw v9Err;
-            }
           } else {
+            // V9 legacy update fallback archived (issue 0004).
             throw v10Err;
           }
         }
-      } else if (typeof this.chain.updateKnowledgeAssets === 'function') {
-        // Codex PR #241 iter-6: same rationale as the V9 fallback above
-        // — no `onBroadcast` hook means no sound WAL boundary, so we
-        // skip the phase on this legacy V9-only path.
-        txResult = await this.chain.updateKnowledgeAssets({
-          batchId: kcId,
-          newMerkleRoot: kcMerkleRoot,
-          newPublicByteSize: updateByteSize,
-          publisherAddress,
-        });
       } else {
-        throw new Error('Chain adapter does not support updates (no V10 or V9 update method available)');
+        throw new Error('Chain adapter does not support V10 updates (updateKnowledgeCollectionV10 missing)');
       }
     } finally {
       if (wroteAhead) onPhase?.('chain:writeahead', 'end');

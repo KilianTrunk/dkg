@@ -27,7 +27,6 @@ func.dependencies = [
   'ProfileStorage',
   'EpochStorage',
   'AskStorage',
-  'DelegatorsInfo',
   'KnowledgeCollectionStorage',
   'IdentityStorage',
   'ShardingTableStorage',

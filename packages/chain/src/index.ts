@@ -6,3 +6,4 @@ export {
   HubResolutionCache,
   type HubResolutionCacheOptions,
 } from './hub-resolution-cache.js';
+export { PcaUnavailableError, isPcaUnavailableError } from './pca-errors.js';

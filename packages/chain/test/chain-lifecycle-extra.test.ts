@@ -3,19 +3,6 @@
  *
  * Audit findings covered:
  *
- *   CH-2  (CRITICAL) — `EVMChainAdapter.publishToContextGraph` invokes
- *                      `ka.publishToContextGraph(...)` on the V9
- *                      `KnowledgeAssets` contract and *then* chains
- *                      `createKnowledgeAssetsV10`. The V9 ABI shipped with
- *                      the adapter (packages/chain/abi/KnowledgeAssets.json)
- *                      has NO `publishToContextGraph` function, so the
- *                      method is always going to throw on the V9 tx before
- *                      ever reaching the V10 fallback. That means either
- *                      (a) the caller gets two txs on-chain when the ABI
- *                      ever regains the function (double-spend risk), or
- *                      (b) the caller always sees a missing-fragment
- *                      error today (dead code). Both are bugs.
- *
  *   CH-3  (CRITICAL) — The V10 lifecycle
  *                        createKnowledgeAssetsV10 → updateKnowledgeCollectionV10
  *                        → verifyKAUpdate → resolvePublishByTxHash
@@ -166,44 +153,6 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
 
   afterEach(async () => {
     await revertSnapshot(testSnapshotId);
-  });
-
-  // --------------------------------------------------------------------
-  // CH-2 — publishToContextGraph is wired to a dead V9 function.
-  // --------------------------------------------------------------------
-
-  describe('publishToContextGraph wiring [CH-2]', () => {
-    it('the V9 KnowledgeAssets ABI bundled with the adapter has NO `publishToContextGraph` function', () => {
-      const abiPath = join(import.meta.dirname, '..', 'abi', 'KnowledgeAssets.json');
-      const abi = JSON.parse(readFileSync(abiPath, 'utf8')) as Array<{ type: string; name?: string }>;
-      const functionNames = abi.filter((x) => x.type === 'function').map((x) => x.name);
-      // PROD-BUG: the adapter's `publishToContextGraph` method at
-      //   packages/chain/src/evm-adapter.ts:1141
-      // calls `ka.publishToContextGraph(...)` on the V9 KnowledgeAssets
-      // contract. If this assertion flips to include the function,
-      // double-review that the adapter does NOT then also chain
-      // `createKnowledgeAssetsV10` — otherwise each call becomes two
-      // on-chain publishes and a double-charge. See BUGS_FOUND.md CH-2.
-      expect(functionNames).not.toContain('publishToContextGraph');
-    });
-
-    it('the adapter source still chains createKnowledgeAssetsV10 after the V9 call — architectural bug', () => {
-      const src = readFileSync(
-        join(import.meta.dirname, '..', 'src', 'evm-adapter.ts'),
-        'utf8',
-      );
-      // Locate the publishToContextGraph method block.
-      const methodMatch = src.match(/async publishToContextGraph\([^)]*\)[\s\S]*?\n  \}/);
-      expect(methodMatch, 'publishToContextGraph method not found in source').not.toBeNull();
-      const body = methodMatch![0];
-      // PROD-BUG: the current implementation calls the (non-existent) V9
-      // method AND then `return this.createKnowledgeAssetsV10(...)`.
-      // Exactly one of these is the intended behaviour; shipping both
-      // means either (a) the V9 tx throws so the V10 call is dead, or
-      // (b) the V9 tx succeeds and we double-charge. See CH-2.
-      expect(body).toContain('ka.publishToContextGraph(');
-      expect(body).toContain('return this.createKnowledgeAssetsV10(');
-    });
   });
 
   // --------------------------------------------------------------------

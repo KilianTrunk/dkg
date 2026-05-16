@@ -1,9 +1,21 @@
 import 'hardhat-deploy';
 import 'hardhat-deploy-ethers';
 import '@nomicfoundation/hardhat-chai-matchers';
-import { extendEnvironment } from 'hardhat/config';
+import { extendEnvironment, subtask } from 'hardhat/config';
+import { TASK_TEST_GET_TEST_FILES } from 'hardhat/builtin-tasks/task-names';
 import { lazyObject } from 'hardhat/plugins';
 import { HardhatRuntimeEnvironment, HardhatUserConfig } from 'hardhat/types';
+import * as path from 'path';
+
+// Skip pure V8/V9 tests parked under test/archive/ per PRD §4.1.
+// Hardhat's default test-file scanner walks `paths.tests` recursively, so
+// without an override the archived `.test.ts` files would still be picked up
+// and fail at fixture deploy (their V8/V9 contracts are archived in TB-1).
+subtask(TASK_TEST_GET_TEST_FILES, async (_, { config }, runSuper) => {
+  const files: string[] = await runSuper();
+  const archiveRoot = path.join(config.paths.tests, 'archive') + path.sep;
+  return files.filter((f) => !f.startsWith(archiveRoot));
+});
 
 import { Helpers } from './utils/helpers';
 import { rpc, accounts, mainnetAccounts } from './utils/network';
@@ -109,6 +121,12 @@ const config: HardhatUserConfig = {
     tests: './test',
     cache: './cache',
     artifacts: './artifacts',
+    // Pin deploy roots to deploy/active/ so hardhat-deploy's recursive
+    // scan does NOT discover scripts under deploy/archive/ (V8/V9 legacy
+    // stack archived per PRD §4.1). hardhat-deploy 0.12.4 walks the root
+    // recursively, so excluding the archive subdir requires an explicit
+    // sibling-root layout rather than the default 'deploy' single root.
+    deploy: ['deploy/active'],
   },
 };
 

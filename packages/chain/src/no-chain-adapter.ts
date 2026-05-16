@@ -4,10 +4,7 @@ import type {
   ReservedRange,
   BatchMintParams,
   BatchMintResult,
-  PublishParams,
   OnChainPublishResult,
-  UpdateKAParams,
-  ExtendStorageParams,
   TxResult,
   ChainEvent,
   EventFilter,
@@ -37,10 +34,6 @@ export class NoChainAdapter implements ChainAdapter {
   async ensureProfile(_options?: { nodeName?: string; stakeAmount?: bigint; lockTier?: number }): Promise<bigint> { noChain(); }
   async reserveUALRange(_count: number): Promise<ReservedRange> { noChain(); }
   async batchMintKnowledgeAssets(_params: BatchMintParams): Promise<BatchMintResult> { noChain(); }
-  async publishKnowledgeAssets(_params: PublishParams): Promise<OnChainPublishResult> { noChain(); }
-  async updateKnowledgeAssets(_params: UpdateKAParams): Promise<TxResult> { noChain(); }
-  async extendStorage(_params: ExtendStorageParams): Promise<TxResult> { noChain(); }
-  async transferNamespace(_newOwner: string): Promise<TxResult> { noChain(); }
   async *listenForEvents(_filter: EventFilter): AsyncIterable<ChainEvent> { noChain(); }
   async createContextGraph(_params: CreateContextGraphParams): Promise<TxResult> { noChain(); }
   async submitToContextGraph(_kcId: string, _contextGraphId: string): Promise<TxResult> { noChain(); }
@@ -50,6 +43,10 @@ export class NoChainAdapter implements ChainAdapter {
   async getKnowledgeAssetsV10Address(): Promise<string> { noChain(); }
   async getEvmChainId(): Promise<bigint> { noChain(); }
   async getPublishingConvictionAccountOwner(_accountId: bigint): Promise<string> { noChain(); }
+  // The 7 #519 PCA write+read methods are OMITTED on purpose: they are
+  // optional on ChainAdapter, so the DKGAgent facade's `typeof guard`
+  // returns the documented `null` (feature-unavailable) in no-chain mode
+  // instead of throwing. Do NOT re-add them as noChain() stubs.
   isV10Ready(): boolean { return false; }
   isRandomSamplingReady(): boolean { return false; }
 }

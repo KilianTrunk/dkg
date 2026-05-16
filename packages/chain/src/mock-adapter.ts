@@ -4,18 +4,13 @@ import type {
   ReservedRange,
   BatchMintParams,
   BatchMintResult,
-  UpdateKAParams,
-  ExtendStorageParams,
   CreateKCParams,
   UpdateKCParams,
   TxResult,
   ChainEvent,
   EventFilter,
   CreateContextGraphParams,
-  PublishParams,
   OnChainPublishResult,
-  ConvictionAccountInfo,
-  PermanentPublishParams,
   KAUpdateVerification,
   CreateOnChainContextGraphParams,
   CreateOnChainContextGraphResult,
@@ -27,6 +22,7 @@ import type {
   ProofPeriodStatus,
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
+  V10PublishingConvictionAccountInfo,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -91,7 +87,7 @@ export class MockChainAdapter implements ChainAdapter {
   /** Publisher addresses this mock is explicitly allowed to attribute V10 publishes to. */
   private allowedPublisherAddresses: Set<string>;
 
-  /** Configurable minimum receiver signatures. When > 0, publishKnowledgeAssets will check the count. Default: 1. */
+  /** Configurable minimum receiver signatures. When > 0, the V9 publish-shim path will check the count. Default: 1. */
   minimumRequiredSignatures = 1;
 
   // RFC 04 v0.3 / Issue #461 — in-memory mirror of ProfileStorage's
@@ -228,55 +224,6 @@ export class MockChainAdapter implements ChainAdapter {
     };
   }
 
-  async publishKnowledgeAssets(params: PublishParams): Promise<OnChainPublishResult> {
-    if (params.receiverSignatures.length < this.minimumRequiredSignatures) {
-      throw new Error('MinSignaturesRequirementNotMet');
-    }
-    const { startId, endId } = await this.reserveUALRange(params.kaCount);
-
-    const batchId = this.nextBatchId++;
-    this.batches.set(batchId, {
-      merkleRoot: params.merkleRoot,
-      kaCount: params.kaCount,
-      publisherAddress: this.signerAddress,
-    });
-
-    const txHash = this.peekTxHash();
-    this.pushEvent('KnowledgeBatchCreated', {
-      batchId: batchId.toString(),
-      publisherNodeIdentityId: params.publisherNodeIdentityId.toString(),
-      publisherAddress: this.signerAddress,
-      merkleRoot: toHex(params.merkleRoot),
-      startKAId: startId.toString(),
-      endKAId: endId.toString(),
-      kaCount: params.kaCount,
-      txHash,
-    });
-
-    // Also emit V10-style KCCreated so ChainEventPoller detects events
-    // regardless of isV10Ready() gating (mirrors real-world transition behaviour).
-    this.pushEvent('KCCreated', {
-      kcId: batchId.toString(),
-      merkleRoot: toHex(params.merkleRoot),
-      publisherAddress: this.signerAddress,
-      startKAId: startId.toString(),
-      endKAId: endId.toString(),
-      kaCount: params.kaCount,
-      txHash,
-    });
-
-    const result = this.txResult(true);
-    return {
-      batchId,
-      startKAId: startId,
-      endKAId: endId,
-      txHash: result.hash,
-      blockNumber: result.blockNumber,
-      blockTimestamp: Math.floor(Date.now() / 1000),
-      publisherAddress: this.signerAddress,
-    };
-  }
-
   async resolvePublishByTxHash(txHash: string): Promise<OnChainPublishResult | null> {
     const created = this.events.find((event) =>
       (event.type === 'KCCreated' || event.type === 'KnowledgeBatchCreated') && event.data.txHash === txHash,
@@ -299,40 +246,6 @@ export class MockChainAdapter implements ChainAdapter {
     return 1n;
   }
 
-  async publishKnowledgeAssetsPermanent(params: PermanentPublishParams): Promise<OnChainPublishResult> {
-    const { startId, endId } = await this.reserveUALRange(params.kaCount);
-
-    const batchId = this.nextBatchId++;
-    this.batches.set(batchId, {
-      merkleRoot: params.merkleRoot,
-      kaCount: params.kaCount,
-      publisherAddress: this.signerAddress,
-    });
-
-    const txHash = this.peekTxHash();
-    this.pushEvent('KnowledgeBatchCreated', {
-      batchId: batchId.toString(),
-      publisherAddress: this.signerAddress,
-      merkleRoot: toHex(params.merkleRoot),
-      startKAId: startId.toString(),
-      endKAId: endId.toString(),
-      kaCount: params.kaCount,
-      isPermanent: true,
-      txHash,
-    });
-
-    const result = this.txResult(true);
-    return {
-      batchId,
-      startKAId: startId,
-      endKAId: endId,
-      txHash: result.hash,
-      blockNumber: result.blockNumber,
-      blockTimestamp: Math.floor(Date.now() / 1000),
-      publisherAddress: this.signerAddress,
-    };
-  }
-
   async verifyPublisherOwnsRange(
     publisherAddress: string,
     startKAId: bigint,
@@ -344,54 +257,6 @@ export class MockChainAdapter implements ChainAdapter {
       if (r.startId <= startKAId && r.endId >= endKAId) return true;
     }
     return false;
-  }
-
-  async transferNamespace(newOwner: string): Promise<TxResult> {
-    const publisher = this.signerAddress;
-    const ranges = this.reservedRangesByPublisher.get(publisher);
-    if (ranges?.length) {
-      this.reservedRangesByPublisher.set(newOwner, [...ranges]);
-      this.reservedRangesByPublisher.delete(publisher);
-    }
-    const nextId = this.namespaceNextId.get(publisher);
-    if (nextId !== undefined) this.namespaceNextId.set(newOwner, nextId);
-    this.namespaceNextId.delete(publisher);
-    this.namespaceOwner.set(publisher, newOwner);
-
-    this.pushEvent('NamespaceTransferred', {
-      from: publisher,
-      to: newOwner,
-    });
-
-    return this.txResult(true);
-  }
-
-  async updateKnowledgeAssets(params: UpdateKAParams): Promise<TxResult> {
-    const existing = this.batches.get(params.batchId);
-    if (!existing) {
-      return this.txResult(false);
-    }
-
-    existing.merkleRoot = params.newMerkleRoot;
-    const hintedPublisherAddress = params.publisherAddress
-      ? ethers.getAddress(params.publisherAddress)
-      : undefined;
-    const publisherAddress = existing.publisherAddress ?? hintedPublisherAddress;
-    const txIndex = this.txIndexInBlock;
-    const blockNumber = this.nextBlock;
-    const txHash = `0x${blockNumber.toString(16).padStart(64, '0')}${txIndex.toString(16).padStart(4, '0')}`;
-    this.pushEvent('KnowledgeBatchUpdated', {
-      batchId: params.batchId.toString(),
-      newMerkleRoot: toHex(params.newMerkleRoot),
-      publisherAddress,
-      txHash,
-      txIndex,
-    });
-
-    return {
-      ...this.txResult(true),
-      publisherAddress,
-    };
   }
 
   async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
@@ -466,20 +331,6 @@ export class MockChainAdapter implements ChainAdapter {
       blockNumber: match.blockNumber,
       txIndex: typeof match.data.txIndex === 'number' ? match.data.txIndex : 0,
     };
-  }
-
-  async extendStorage(params: ExtendStorageParams): Promise<TxResult> {
-    const existing = this.batches.get(params.batchId);
-    if (!existing) {
-      return this.txResult(false);
-    }
-
-    this.pushEvent('StorageExtended', {
-      batchId: params.batchId.toString(),
-      additionalEpochs: params.additionalEpochs,
-    });
-
-    return this.txResult(true);
   }
 
   // --- V8 backward compatibility ---
@@ -571,173 +422,204 @@ export class MockChainAdapter implements ChainAdapter {
     return [];
   }
 
-  // --- Publishing Conviction Accounts ---
+  // --- V10 Publishing Conviction NFT (DKGPublishingConvictionNFT) ---
+  // In-memory parity: account map + agent reverse map + owner-gating.
 
   private convictionAccounts = new Map<bigint, {
-    admin: string;
-    balance: bigint;
-    initialDeposit: bigint;
-    lockEpochs: number;
-    conviction: bigint;
-    authorizedKeys: Set<string>;
+    owner: string;
+    committedTRAC: bigint;
+    topUpBuffer: bigint;
+    lockDurationEpochs: number;
+    /** Discount tier (bps) fixed at creation, mirrors the contract. */
+    discountBps: number;
+    /** Monotonic mock epoch captured at creation (no chronos in mock). */
+    createdAtEpoch: number;
+    agents: Set<string>;
   }>();
+  private agentToConvictionAccount = new Map<string, bigint>();
   private nextConvictionAccountId = 1n;
+  // Mock has no chronos; a monotonic (boundary-aligned) counter stands in
+  // for the creation epoch — a mock-internal model, not contract parity.
+  private mockConvictionEpoch = 0;
 
-  async createConvictionAccount(amount: bigint, lockEpochs: number): Promise<{ accountId: bigint } & TxResult> {
+  // Mirrors chain `ParametersStorage.publishingConvictionEpochs` (12).
+  private static readonly MOCK_LOCK_DURATION_EPOCHS = 12;
+
+  // Mirrors DKGPublishingConvictionNFT default maxAgentsPerAccount
+  // (DKGPublishingConvictionNFT.sol:208 — defaults to 100 when unset).
+  private static readonly MOCK_MAX_AGENTS_PER_ACCOUNT = 100;
+
+  /**
+   * Mirrors `DKGPublishingConvictionNFT.getDiscountBps` exactly
+   * (DKGPublishingConvictionNFT.sol L767-775): discrete 6-tier ladder,
+   * `ether` == 1e18, evaluated highest-first. Fixed at creation.
+   */
+  private static convictionDiscountBps(committedTRAC: bigint): number {
+    const ETHER = 10n ** 18n;
+    if (committedTRAC >= 1_000_000n * ETHER) return 7500; // 75%
+    if (committedTRAC >= 500_000n * ETHER) return 5000; // 50%
+    if (committedTRAC >= 250_000n * ETHER) return 4000; // 40%
+    if (committedTRAC >= 100_000n * ETHER) return 3000; // 30%
+    if (committedTRAC >= 50_000n * ETHER) return 2000; // 20%
+    if (committedTRAC >= 25_000n * ETHER) return 1000; // 10%
+    return 0;
+  }
+
+  /** Test helper (not in `ChainAdapter`): seed a PCA owned by `admin`
+   *  for publish-policy branches that need a known PCA owner. */
+  seedConvictionAccount(admin: string): bigint {
     const accountId = this.nextConvictionAccountId++;
-    const conviction = amount * BigInt(lockEpochs);
     this.convictionAccounts.set(accountId, {
-      admin: this.signerAddress,
-      balance: amount,
-      initialDeposit: amount,
-      lockEpochs,
-      conviction,
-      authorizedKeys: new Set([this.signerAddress.toLowerCase()]),
+      owner: ethers.getAddress(admin),
+      committedTRAC: 0n,
+      topUpBuffer: 0n,
+      lockDurationEpochs: MockChainAdapter.MOCK_LOCK_DURATION_EPOCHS,
+      discountBps: MockChainAdapter.convictionDiscountBps(0n),
+      createdAtEpoch: this.mockConvictionEpoch++,
+      agents: new Set<string>(),
     });
-    this.pushEvent('ConvictionAccountCreated', { accountId: accountId.toString(), admin: this.signerAddress });
-    return { ...this.txResult(true), accountId };
+    return accountId;
   }
 
-  async addConvictionFunds(accountId: bigint, amount: bigint): Promise<TxResult> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return this.txResult(false);
-    acct.balance += amount;
-    return this.txResult(true);
+  // Contract parity: createAccount/topUp revert `InvalidAmount` for
+  // amount==0 or out-of-uint96-range, before any state write.
+  private static readonly MAX_UINT96 = (1n << 96n) - 1n;
+  private requireValidConvictionAmount(amount: bigint): void {
+    if (amount <= 0n || amount > MockChainAdapter.MAX_UINT96) {
+      throw new Error(`Mock: InvalidAmount(${amount})`);
+    }
   }
 
-  async extendConvictionLock(accountId: bigint, additionalEpochs: number): Promise<TxResult> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return this.txResult(false);
-    acct.lockEpochs += additionalEpochs;
-    acct.conviction = acct.initialDeposit * BigInt(acct.lockEpochs);
-    return this.txResult(true);
+  async createPublishingConvictionAccount(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> {
+    this.requireValidConvictionAmount(committedTRAC);
+    const accountId = this.nextConvictionAccountId++;
+    this.convictionAccounts.set(accountId, {
+      owner: ethers.getAddress(this.signerAddress),
+      committedTRAC,
+      topUpBuffer: 0n,
+      lockDurationEpochs: MockChainAdapter.MOCK_LOCK_DURATION_EPOCHS,
+      // Tier fixed at creation, identical formula to the contract.
+      discountBps: MockChainAdapter.convictionDiscountBps(committedTRAC),
+      createdAtEpoch: this.mockConvictionEpoch++,
+      agents: new Set<string>(),
+    });
+    return { accountId, ...this.txResult(true) };
   }
 
-  async addPCAAuthorizedKey(accountId: bigint, key: string): Promise<TxResult> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return this.txResult(false);
-    acct.authorizedKeys.add(key.toLowerCase());
-    this.pushEvent('AuthorizedKeyAdded', { accountId: accountId.toString(), key });
-    return this.txResult(true);
-  }
-
-  async isPCAAuthorizedKey(accountId: bigint, key: string): Promise<boolean> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return false;
-    return acct.authorizedKeys.has(key.toLowerCase());
-  }
-
-  async getConvictionDiscount(accountId: bigint): Promise<{ discountBps: number; conviction: bigint }> {
-    const acct = this.convictionAccounts.get(accountId);
-    if (!acct) return { discountBps: 0, conviction: 0n };
-    const cHalf = 3_000_000n * 10n ** 18n;
-    const discountBps = Number((5000n * acct.conviction) / (acct.conviction + cHalf));
-    return { discountBps, conviction: acct.conviction };
-  }
-
-  async getConvictionAccountInfo(accountId: bigint): Promise<ConvictionAccountInfo | null> {
+  async getPublishingConvictionAccountInfo(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null> {
     const acct = this.convictionAccounts.get(accountId);
     if (!acct) return null;
-    const { discountBps } = await this.getConvictionDiscount(accountId);
     return {
-      accountId,
-      admin: acct.admin,
-      balance: acct.balance,
-      initialDeposit: acct.initialDeposit,
-      lockEpochs: acct.lockEpochs,
-      conviction: acct.conviction,
-      discountBps,
+      owner: acct.owner,
+      committedTRAC: acct.committedTRAC,
+      baseEpochAllowance: acct.committedTRAC / BigInt(acct.lockDurationEpochs),
+      createdAtEpoch: acct.createdAtEpoch,
+      // Mock models boundary-aligned creation only; the contract's mid-epoch
+      // round-up (epochAtTimestamp(expiresAtTimestamp-1)+1) is not modeled.
+      expiresAtEpoch: acct.createdAtEpoch + acct.lockDurationEpochs,
+      // Mock has no wall clock; timestamps stay 0 (epochs are modeled).
+      createdAtTimestamp: 0,
+      expiresAtTimestamp: 0,
+      discountBps: acct.discountBps,
+      topUpBuffer: acct.topUpBuffer,
+      agentCount: acct.agents.size,
+      // STATIC STUBS — settlement is intentionally out of mock-parity scope.
+      // Fidelity verified on-chain (evm-module hardhat + devnet smoke).
+      lastSettledWindow: 0,
+      fullySwept: false,
     };
   }
 
-  /**
-   * Mock does not model V10 `DKGPublishingConvictionNFT` agent
-   * registration — the legacy mock PCA flow doesn't ship reverse
-   * agent → accountId lookups. Always returns `0n` so the publisher
-   * SDK falls through to the direct-spend `publishEpochs = 1` default
-   * on mock chains (matching how mock-backed unit tests exercise the
-   * non-conviction publish path). Real-chain tests use
-   * `EVMChainAdapter`, which queries the live NFT contract.
-   */
-  async getConvictionAgentAccountId(_agent: string): Promise<bigint> {
-    return 0n;
+  private requireConvictionAccount(accountId: bigint) {
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct) {
+      throw new Error(`Mock: PCA account ${accountId} does not exist`);
+    }
+    return acct;
   }
 
-  /**
-   * Mock does not model V10 NFT `lockDurationEpochs` snapshotting.
-   * Returns `0` (no PCA path active) so the publisher SDK keeps the
-   * direct-spend default. Mirrors `getConvictionAgentAccountId` —
-   * either both are wired or neither, so the publisher's PCA probe
-   * never returns a half-set state on mock.
-   */
-  async getConvictionAccountLockDurationEpochs(_accountId: bigint): Promise<number> {
-    return 0;
+  // Owner-gating parity with `_requireOwner` — the SDK must surface the
+  // on-chain owner revert, never swallow it (the daemon maps it to 403).
+  private requireConvictionOwner(accountId: bigint) {
+    const acct = this.requireConvictionAccount(accountId);
+    if (acct.owner.toLowerCase() !== ethers.getAddress(this.signerAddress).toLowerCase()) {
+      throw new Error(`Mock: NotAccountOwner(${accountId}, ${this.signerAddress})`);
+    }
+    return acct;
+  }
+
+  async topUpPublishingConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
+    const acct = this.requireConvictionOwner(accountId);
+    this.requireValidConvictionAmount(amount);
+    acct.topUpBuffer += amount;
+    return this.txResult(true);
+  }
+
+  // DELIBERATE NO-OP — the lazy-settlement cursor is contract accounting,
+  // out of mock-parity scope; verified on-chain (hardhat + devnet smoke).
+  async settlePublishingConvictionAccount(accountId: bigint): Promise<TxResult> {
+    this.requireConvictionAccount(accountId);
+    return this.txResult(true);
+  }
+
+  async registerPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    const acct = this.requireConvictionOwner(accountId);
+    if (agent === ethers.ZeroAddress) {
+      throw new Error('Mock: ZeroAgentAddress()');
+    }
+    const key = ethers.getAddress(agent).toLowerCase();
+    if (this.agentToConvictionAccount.has(key)) {
+      throw new Error(`Mock: AgentAlreadyRegistered(${agent}, ${this.agentToConvictionAccount.get(key)})`);
+    }
+    // Contract parity: revert after the already-registered check, before
+    // any state write (DKGPublishingConvictionNFT.sol:711-712).
+    if (acct.agents.size >= MockChainAdapter.MOCK_MAX_AGENTS_PER_ACCOUNT) {
+      throw new Error(`Mock: AgentCapReached(${accountId}, ${MockChainAdapter.MOCK_MAX_AGENTS_PER_ACCOUNT})`);
+    }
+    acct.agents.add(key);
+    this.agentToConvictionAccount.set(key, accountId);
+    return this.txResult(true);
+  }
+
+  async deregisterPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    const acct = this.requireConvictionOwner(accountId);
+    const key = ethers.getAddress(agent).toLowerCase();
+    if (!acct.agents.has(key)) {
+      throw new Error(`Mock: AgentNotRegistered(${accountId}, ${agent})`);
+    }
+    acct.agents.delete(key);
+    this.agentToConvictionAccount.delete(key);
+    return this.txResult(true);
+  }
+
+  async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
+    if (!ethers.isAddress(agent)) return false;
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct) return false;
+    return acct.agents.has(ethers.getAddress(agent).toLowerCase());
+  }
+
+  /** Mirrors `agentToAccountId`; `0n` for unregistered → publisher SDK
+   *  stays on direct-spend until an agent is registered. */
+  async getConvictionAgentAccountId(agent: string): Promise<bigint> {
+    if (!ethers.isAddress(agent)) return 0n;
+    return this.agentToConvictionAccount.get(ethers.getAddress(agent).toLowerCase()) ?? 0n;
+  }
+
+  async getConvictionAccountLockDurationEpochs(accountId: bigint): Promise<number> {
+    return this.convictionAccounts.get(accountId)?.lockDurationEpochs ?? 0;
   }
 
   /**
    * Mock owner-lookup for the daemon's curated-CG registration
    * preflight (`local curator == ownerOf(pcaAccountId)`).
-   *
-   * Mock does not model PCA NFT transfers, so the account `admin`
-   * doubles as the current "owner" for parity-test purposes. Real-chain
-   * tests use `EVMChainAdapter`, which queries `DKGPublishingConvictionNFT.ownerOf`.
    */
   async getPublishingConvictionAccountOwner(accountId: bigint): Promise<string> {
     const acct = this.convictionAccounts.get(accountId);
     if (!acct) {
       throw new Error(`Mock: PCA account ${accountId} does not exist`);
     }
-    return ethers.getAddress(acct.admin);
-  }
-
-  // --- Staking Conviction ---
-
-  private delegatorLocks = new Map<string, { lockTier: number; startEpoch: number }>();
-
-  // Mirror the V10 baseline tier ladder seeded by
-  // `ConvictionStakingStorage._seedBaselineTiers()` so the mock surfaces the same
-  // "tier must exist" error the real `DKGStakingConvictionNFT` reverts with.
-  private static readonly V10_BASELINE_LOCK_TIERS = [0, 1, 3, 6, 12] as const;
-
-  private snapToBaselineLockTier(lockEpochs: number): number {
-    let snapped = 0;
-    for (const tier of MockChainAdapter.V10_BASELINE_LOCK_TIERS) {
-      if (tier <= lockEpochs) snapped = tier;
-      else break;
-    }
-    return snapped;
-  }
-
-  private normalizeLegacyLockEpochs(lockEpochs: number): number {
-    if (!Number.isInteger(lockEpochs) || lockEpochs < 0) {
-      throw new Error(`Mock: invalid lockEpochs ${lockEpochs}`);
-    }
-    return this.snapToBaselineLockTier(lockEpochs);
-  }
-
-  async stakeWithLock(identityId: bigint, amount: bigint, lockEpochs: number): Promise<TxResult> {
-    return this.stakeWithLockTier(identityId, amount, this.normalizeLegacyLockEpochs(lockEpochs));
-  }
-
-  async stakeWithLockTier(identityId: bigint, _amount: bigint, lockTier: number): Promise<TxResult> {
-    if (!Number.isInteger(lockTier) || !(MockChainAdapter.V10_BASELINE_LOCK_TIERS as readonly number[]).includes(lockTier)) {
-      throw new Error(
-        `Mock: lockTier must be one of {${MockChainAdapter.V10_BASELINE_LOCK_TIERS.join(', ')}} (V10 baseline tier ladder), got ${lockTier}`,
-      );
-    }
-    const key = `${identityId}-${this.signerAddress}`;
-    const existing = this.delegatorLocks.get(key);
-    if (!existing || lockTier > existing.lockTier) {
-      this.delegatorLocks.set(key, { lockTier, startEpoch: 0 });
-    }
-    return this.txResult(true);
-  }
-
-  async getDelegatorConvictionMultiplier(identityId: bigint, delegator: string): Promise<{ multiplier: number }> {
-    const key = `${identityId}-${delegator}`;
-    const lock = this.delegatorLocks.get(key);
-    const lockTier = lock?.lockTier ?? 1;
-    return { multiplier: computeConvictionMultiplier(lockTier) };
+    return acct.owner;
   }
 
   // --- On-Chain Context Graphs (ContextGraphs contract) ---
@@ -1031,7 +913,54 @@ export class MockChainAdapter implements ChainAdapter {
       );
     }
 
-    const result = await this.publishKnowledgeAssets(params);
+    // Mock publish: emits KnowledgeBatchCreated + KCCreated so
+    // resolvePublishByTxHash and ChainEventPoller / WAL consumers can
+    // walk events by txHash.
+    if (params.receiverSignatures.length < this.minimumRequiredSignatures) {
+      throw new Error('MinSignaturesRequirementNotMet');
+    }
+    const { startId, endId } = await this.reserveUALRange(params.kaCount);
+    const batchId = this.nextBatchId++;
+    this.batches.set(batchId, {
+      merkleRoot: params.merkleRoot,
+      kaCount: params.kaCount,
+      publisherAddress: this.signerAddress,
+    });
+
+    // peek BEFORE txResult() so the event-borne txHash matches the one
+    // txResult() advances onto the wire — same pattern as the publish-
+    // event emitters above.
+    const publishTxHash = this.peekTxHash();
+    this.pushEvent('KnowledgeBatchCreated', {
+      batchId: batchId.toString(),
+      publisherNodeIdentityId: params.publisherNodeIdentityId.toString(),
+      publisherAddress: this.signerAddress,
+      merkleRoot: toHex(params.merkleRoot),
+      startKAId: startId.toString(),
+      endKAId: endId.toString(),
+      kaCount: params.kaCount,
+      txHash: publishTxHash,
+    });
+    this.pushEvent('KCCreated', {
+      kcId: batchId.toString(),
+      merkleRoot: toHex(params.merkleRoot),
+      publisherAddress: this.signerAddress,
+      startKAId: startId.toString(),
+      endKAId: endId.toString(),
+      kaCount: params.kaCount,
+      txHash: publishTxHash,
+    });
+
+    const tx = this.txResult(true);
+    const result: OnChainPublishResult = {
+      batchId,
+      startKAId: startId,
+      endKAId: endId,
+      txHash: tx.hash,
+      blockNumber: tx.blockNumber,
+      blockTimestamp: Math.floor(Date.now() / 1000),
+      publisherAddress: this.signerAddress,
+    };
 
     cg.batches.push(result.batchId);
     this.pushEvent('ContextGraphExpanded', {

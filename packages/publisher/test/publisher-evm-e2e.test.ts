@@ -6,7 +6,7 @@
  * This catches contract ABI changes that mock-based tests miss.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { ethers, Wallet, Contract } from 'ethers';
+import { ethers, Wallet } from 'ethers';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter } from '@origintrail-official/dkg-chain';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
@@ -339,71 +339,18 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
   }, 30_000);
 
   // -------------------------------------------------------------------------
-  // V9 direct adapter operations (exercised through EVMChainAdapter)
+  // V9 / Conviction blocks removed
+  //
+  // Three tests that previously lived here exercised archived V8/V9
+  // chain-adapter methods (`publishKnowledgeAssets`,
+  // `createConvictionAccount`, `getConvictionAccountInfo`,
+  // `getDelegatorConvictionMultiplier`) that no longer exist on the
+  // deployed EVMChainAdapter — they were moved under
+  // `packages/chain/src/archive/evm-adapter-v8-v9-methods.ts` in the
+  // parent archive PR. Calling them now throws at the type boundary;
+  // the V10 CREATE / UPDATE / multi-KA tests above already cover the
+  // publisher's end-to-end EVM contract. Restoring the V9 / Conviction
+  // coverage requires reviving the archived methods, which is out of
+  // scope for the V10-only rollout (see PRD §6 followups).
   // -------------------------------------------------------------------------
-
-  it('V9: reserveUALRange + publishKnowledgeAssets works end-to-end', async () => {
-
-    const pubAdapter = new EVMChainAdapter(
-      makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.PUBLISHER, [HARDHAT_KEYS.PUBLISHER2]),
-    );
-
-    const publisher2 = new Wallet(HARDHAT_KEYS.PUBLISHER, ctx.provider);
-    await mintTokens(
-      ctx.provider, ctx.hubAddress,
-      HARDHAT_KEYS.DEPLOYER,
-      publisher2.address,
-      ethers.parseEther('100000'),
-    );
-
-    const reserved = await pubAdapter.reserveUALRange(10);
-    expect(reserved.startId).toBeGreaterThan(0n);
-    expect(reserved.endId).toBe(reserved.startId + 9n);
-  }, 30_000);
-
-  // -------------------------------------------------------------------------
-  // Publishing conviction account
-  // -------------------------------------------------------------------------
-
-  it('creates conviction account and queries info', async () => {
-
-    const adapter = new EVMChainAdapter(
-      makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.CORE_OP),
-    );
-
-    const lockAmount = ethers.parseEther('10000');
-    await mintTokens(
-      ctx.provider, ctx.hubAddress,
-      HARDHAT_KEYS.DEPLOYER,
-      publisherWallet.address,
-      lockAmount,
-    );
-
-    const result = await adapter.createConvictionAccount(lockAmount, 5);
-    const accountId = result.accountId;
-    expect(result.success).toBe(true);
-    expect(accountId).toBeGreaterThan(0n);
-
-    const info = await adapter.getConvictionAccountInfo(accountId);
-    expect(info).not.toBeNull();
-    expect(info!.accountId).toBe(accountId);
-    expect(info!.balance).toBeGreaterThan(0n);
-  }, 30_000);
-
-  // -------------------------------------------------------------------------
-  // Conviction multiplier query (stakeWithLock removed from Staking contract)
-  // -------------------------------------------------------------------------
-
-  it('queries conviction multiplier for a delegator', async () => {
-
-    const adapter = new EVMChainAdapter(
-      makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.CORE_OP),
-    );
-
-    const { multiplier } = await adapter.getDelegatorConvictionMultiplier(
-      publisherIdentityId,
-      publisherWallet.address,
-    );
-    expect(multiplier).toBeGreaterThanOrEqual(0);
-  }, 30_000);
 });

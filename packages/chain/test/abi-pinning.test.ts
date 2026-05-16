@@ -123,7 +123,8 @@ const PINNED_DIGESTS: Record<string, string> = {
   // `remainingEpochs` since update legitimately passes a delta.
   KnowledgeAssetsV10:           '785311d19ce39743522bf1db501f41276fb22d715a2cc94cc67d96f8a22e519e',
   KnowledgeCollectionStorage:   'e165cbddc6569602d1d5c05c15909fd0a9ff851f974357cf80297041b2a83fd2',
-  KnowledgeCollection:          'c906207c38ffded8944d7255498f7fc9f2c864098a3f8f3670df19006dbcd395',
+  // V8 `KnowledgeCollection` ABI was moved to `abi/archive/` in
+  // `archive-non-v10-contracts`; the pin entry is intentionally dropped.
   ContextGraphs:                'ee69f0d50b54df966b8bfb3bf457fe6d2865393f51f8770b4185fafd324b9462',
   ContextGraphStorage:          '4e0ef683d10ead0f167ee08d7d980df4d37a24dcabf2dad3970cf9d7b6d4813b',
   // Identity / staking — consulted on every publish.

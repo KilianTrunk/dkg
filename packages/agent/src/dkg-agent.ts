@@ -58,7 +58,7 @@ import {
   type WorkspaceRecipientEncryptionKey,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
-import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult } from '@origintrail-official/dkg-chain';
+import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
   PublishJournal, StaleWriteError,
@@ -4261,71 +4261,51 @@ export class DKGAgent {
     return this.chain.getLatestMerkleRootAuthor(kcId);
   }
 
-  /**
-   * Publishing Conviction Account (PCA) facade for the agent-provenance
-   * runbook surface. These methods are thin wrappers over the chain adapter
-   * — the agent doesn't keep PCA state of its own; the on-chain
-   * `PublishingConvictionAccount` is the source of truth. The wrappers
-   * exist so daemon HTTP routes don't need to reach into the private
-   * `chain` field, mirroring the `getKnowledgeCollectionAuthor` pattern.
-   *
-   * `createPublishingConvictionAccount`: tx is signed by the agent's
-   * configured EOA; that EOA becomes the PCA `admin` and is automatically
-   * added to its own `authorizedKeys` set. Operators driving the runbook
-   * from a core node use this to stand up the PCA before mode (a)/(b).
-   *
-   * `addPCAAuthorizedKey` and `isPCAAuthorizedKey` are admin-gated on chain
-   * (`require(msg.sender == account.admin)`), so the daemon must be running
-   * as the PCA admin EOA for `addPCAAuthorizedKey` to succeed. Read-side
-   * `isPCAAuthorizedKey` is permissionless on chain and works from any node.
-   */
+  /** V10 Publishing Conviction NFT facade — thin chain-adapter wrappers.
+   *  Owner revert not swallowed (→ 403); `null` = no surface (→ 503). */
+
+  /** True when the chain adapter exposes the V10 Publishing Conviction NFT surface. */
+  get supportsPublishingConvictionNft(): boolean {
+    return typeof this.chain.getPublishingConvictionAccountInfo === 'function';
+  }
+
   async createPublishingConvictionAccount(
-    amount: bigint,
-    lockEpochs: number,
-  ): Promise<{ accountId: bigint; txHash: string; blockNumber: number } | null> {
-    if (typeof this.chain.createConvictionAccount !== 'function') return null;
-    const result = await this.chain.createConvictionAccount(amount, lockEpochs);
-    return {
-      accountId: result.accountId,
-      txHash: result.hash,
-      blockNumber: result.blockNumber,
-    };
+    committedTRAC: bigint,
+  ): Promise<({ accountId: bigint } & TxResult) | null> {
+    if (typeof this.chain.createPublishingConvictionAccount !== 'function') return null;
+    return this.chain.createPublishingConvictionAccount(committedTRAC);
   }
 
-  async addPublishingConvictionAccountFunds(
+  async topUpPublishingConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult | null> {
+    if (typeof this.chain.topUpPublishingConvictionAccount !== 'function') return null;
+    return this.chain.topUpPublishingConvictionAccount(accountId, amount);
+  }
+
+  async registerPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult | null> {
+    if (typeof this.chain.registerPublishingConvictionAgent !== 'function') return null;
+    return this.chain.registerPublishingConvictionAgent(accountId, agent);
+  }
+
+  async deregisterPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult | null> {
+    if (typeof this.chain.deregisterPublishingConvictionAgent !== 'function') return null;
+    return this.chain.deregisterPublishingConvictionAgent(accountId, agent);
+  }
+
+  async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean | null> {
+    if (typeof this.chain.isPublishingConvictionAgent !== 'function') return null;
+    return this.chain.isPublishingConvictionAgent(accountId, agent);
+  }
+
+  async settlePublishingConvictionAccount(accountId: bigint): Promise<TxResult | null> {
+    if (typeof this.chain.settlePublishingConvictionAccount !== 'function') return null;
+    return this.chain.settlePublishingConvictionAccount(accountId);
+  }
+
+  async getPublishingConvictionAccountInfo(
     accountId: bigint,
-    amount: bigint,
-  ): Promise<{ txHash: string; blockNumber: number } | null> {
-    if (typeof this.chain.addConvictionFunds !== 'function') return null;
-    const result = await this.chain.addConvictionFunds(accountId, amount);
-    return { txHash: result.hash, blockNumber: result.blockNumber };
-  }
-
-  async addPCAAuthorizedKey(
-    accountId: bigint,
-    key: string,
-  ): Promise<{ txHash: string; blockNumber: number } | null> {
-    if (typeof this.chain.addPCAAuthorizedKey !== 'function') return null;
-    const result = await this.chain.addPCAAuthorizedKey(accountId, key);
-    return { txHash: result.hash, blockNumber: result.blockNumber };
-  }
-
-  async isPCAAuthorizedKey(accountId: bigint, key: string): Promise<boolean | null> {
-    if (typeof this.chain.isPCAAuthorizedKey !== 'function') return null;
-    return this.chain.isPCAAuthorizedKey(accountId, key);
-  }
-
-  async getPublishingConvictionAccountInfo(accountId: bigint): Promise<{
-    accountId: bigint;
-    admin: string;
-    balance: bigint;
-    initialDeposit: bigint;
-    lockEpochs: number;
-    conviction: bigint;
-    discountBps: number;
-  } | null> {
-    if (typeof this.chain.getConvictionAccountInfo !== 'function') return null;
-    return this.chain.getConvictionAccountInfo(accountId);
+  ): Promise<V10PublishingConvictionAccountInfo | null> {
+    if (typeof this.chain.getPublishingConvictionAccountInfo !== 'function') return null;
+    return this.chain.getPublishingConvictionAccountInfo(accountId);
   }
 
   // ---------------------------------------------------------------------------

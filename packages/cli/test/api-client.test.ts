@@ -259,6 +259,61 @@ describe('ApiClient', () => {
     });
   });
 
+  describe('PCA V10 endpoints', () => {
+    it('registerPcaAgent() POSTs the V10 agent route with an { agent } body', async () => {
+      const body = {
+        accountId: '7',
+        agent: '0x1111111111111111111111111111111111111111',
+        registered: true,
+        txHash: '0xabc',
+        blockNumber: 42,
+      };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const result = await client.registerPcaAgent('7', '0x1111111111111111111111111111111111111111');
+
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/pca/7/agent`);
+      expect(calls[0].opts.method).toBe('POST');
+      expect(JSON.parse(calls[0].opts.body as string)).toEqual({
+        agent: '0x1111111111111111111111111111111111111111',
+      });
+    });
+
+    it('deregisterPcaAgent() DELETEs the V10 agent-address route', async () => {
+      const body = {
+        accountId: '7',
+        agent: '0x2222222222222222222222222222222222222222',
+        deregistered: true,
+        txHash: '0xdef',
+        blockNumber: 43,
+      };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const result = await client.deregisterPcaAgent('7', '0x2222222222222222222222222222222222222222');
+
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(
+        `http://127.0.0.1:${PORT}/api/pca/7/agent/0x2222222222222222222222222222222222222222`,
+      );
+      expect(calls[0].opts.method).toBe('DELETE');
+    });
+
+    it('settlePca() POSTs the V10 permissionless settle route', async () => {
+      const body = { accountId: '7', settled: true, txHash: '0x999', blockNumber: 44 };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const result = await client.settlePca('7');
+
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/pca/7/settle`);
+      expect(calls[0].opts.method).toBe('POST');
+    });
+  });
+
   describe('messages() query string building', () => {
     it('builds query string from opts', async () => {
       const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: { messages: [] } });

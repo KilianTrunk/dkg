@@ -9,14 +9,11 @@ import type {
   ReservedRange,
   BatchMintParams,
   BatchMintResult,
-  UpdateKAParams,
-  ExtendStorageParams,
   TxResult,
   ChainEvent,
   EventFilter,
   CreateContextGraphParams,
   ContextGraphOnChain,
-  PublishParams,
   OnChainPublishResult,
   KAUpdateVerification,
   CreateOnChainContextGraphParams,
@@ -25,12 +22,11 @@ import type {
   PublishToContextGraphParams,
   V10PublishParams,
   V10UpdateKCParams,
-  ConvictionAccountInfo,
-  PermanentPublishParams,
   NodeChallenge,
   ProofPeriodStatus,
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
+  V10PublishingConvictionAccountInfo,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -39,6 +35,7 @@ import {
   ChallengeNoLongerActiveError,
 } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
+import { PcaUnavailableError } from './pca-errors.js';
 import {
   buildAuthorAttestationTypedData,
   AUTHOR_SCHEME_VERSION_V1,
@@ -242,19 +239,8 @@ interface ContractCache {
   contextGraphs?: Contract;
   contextGraphStorage?: Contract;
   knowledgeAssetsV10?: Contract;
-  publishingConvictionAccount?: Contract;
-  /**
-   * The V10 NFT-backed PCA (`DKGPublishingConvictionNFT`). Distinct from
-   * the legacy `publishingConvictionAccount` cache slot: lazy-settled
-   * escrow + agent reverse-lookup live on the NFT, while the legacy
-   * cache slot still backs the `getConvictionAccountInfo` / discount
-   * read paths off the older `PublishingConvictionAccount` contract.
-   * Used by the publisher SDK to detect PCA-funded publishes and
-   * mirror the `kcEpochs == lockDurationEpochs` eligibility check in
-   * `KnowledgeAssetsV10.publish()` — wrong epochs silently fall
-   * through to direct spend, so the SDK pre-coerces to keep the
-   * discount.
-   */
+  /** V10 NFT-backed PCA. Backs the PCA write surface + the publisher's
+   *  `kcEpochs == lockDurationEpochs` discount check (SDK pre-coerces). */
   dkgPublishingConvictionNFT?: Contract;
   randomSampling?: Contract;
   randomSamplingStorage?: Contract;
@@ -642,8 +628,17 @@ export class EVMChainAdapter implements ChainAdapter {
 
     this.contracts.identity = await this.resolveContract('Identity');
     this.contracts.profile = await this.resolveContract('Profile');
-    this.contracts.staking = await this.resolveContract('Staking');
     this.contracts.parametersStorage = await this.resolveContract('ParametersStorage');
+
+    // V8 `Staking` is archived (PRD §4.1 — `Staking.sol` moved under
+    // contracts/archive/, deploy script 023 archived). Tolerate its absence
+    // so the V10 surface still initialises; the contract slot is retained
+    // only to keep stale Hub bindings on older deploys resolving cleanly.
+    try {
+      this.contracts.staking = await this.resolveContract('Staking');
+    } catch {
+      // V8 Staking not deployed on this Hub — V10 surface continues.
+    }
 
     // RFC 04 — ProfileStorage holds the relay registry views + events.
     // Tolerated as optional so adapters bound to a Hub that pre-dates the
@@ -655,17 +650,31 @@ export class EVMChainAdapter implements ChainAdapter {
       // Older deployments without the relay registry surface.
     }
 
-    // V8 legacy contracts
-    this.contracts.knowledgeCollection = await this.resolveContract('KnowledgeCollection');
+    // V8 KnowledgeCollection is archived; tolerate missing Hub binding.
+    // KnowledgeCollectionStorage remains active and is required.
+    try {
+      this.contracts.knowledgeCollection = await this.resolveContract('KnowledgeCollection');
+    } catch {
+      // V8 KnowledgeCollection not deployed — legacy publish surface unavailable.
+    }
     this.contracts.knowledgeCollectionStorage = await this.resolveAssetStorage('KnowledgeCollectionStorage');
 
-    // V9 contracts (may not be deployed yet on older nodes)
+    // V9 contracts (KnowledgeAssets + KnowledgeAssetsStorage) are archived
+    // (PRD §4.1, deploy scripts 040+041 moved under deploy/archive). Keep
+    // the try/catch so adapters bound to legacy deploys still resolve them.
+    // AskStorage is V10-active (deploy script 017 still in the active set);
+    // split it out so a missing V9 binding doesn't strand AskStorage. The
+    // V10 publish-token-amount path depends on AskStorage being resolved.
     try {
       this.contracts.knowledgeAssets = await this.resolveContract('KnowledgeAssets');
       this.contracts.knowledgeAssetsStorage = await this.resolveAssetStorage('KnowledgeAssetsStorage');
+    } catch {
+      // V9 contracts not deployed — V9 publish/update surface unavailable.
+    }
+    try {
       this.contracts.askStorage = await this.resolveContract('AskStorage');
     } catch {
-      // V9 contracts not deployed — adapter works in V8-only mode
+      // Older deployments that pre-date AskStorage — token-amount derivation unavailable.
     }
 
     try {
@@ -685,12 +694,6 @@ export class EVMChainAdapter implements ChainAdapter {
       this.contracts.knowledgeAssetsV10 = await this.resolveContract('KnowledgeAssetsV10');
     } catch {
       // V10 contract not deployed — createKnowledgeAssetsV10 unavailable
-    }
-
-    try {
-      this.contracts.publishingConvictionAccount = await this.resolveContract('PublishingConvictionAccount');
-    } catch {
-      // PublishingConvictionAccount not deployed — conviction account operations unavailable
     }
 
     try {
@@ -971,142 +974,6 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   // =====================================================================
-  // V9: Single-tx Publish (reserve + mint)
-  // =====================================================================
-
-  async publishKnowledgeAssets(params: PublishParams): Promise<OnChainPublishResult> {
-    await this.init();
-    this.requireV9();
-
-    const txSigner = this.nextSigner();
-    const ka = this.contracts.knowledgeAssets!.connect(txSigner) as Contract;
-    const kaAddress = await this.contracts.knowledgeAssets!.getAddress();
-
-    if (this.contracts.token && params.tokenAmount > 0n) {
-      const token = this.contracts.token.connect(txSigner) as Contract;
-      const currentAllowance: bigint = await token.allowance(txSigner.address, kaAddress);
-      if (currentAllowance < params.tokenAmount) {
-        const approveTx = await token.approve(kaAddress, ethers.MaxUint256);
-        await approveTx.wait();
-      }
-    }
-
-    const identityIds = params.receiverSignatures.map((s) => s.identityId);
-    const rValues = params.receiverSignatures.map((s) => ethers.hexlify(s.r));
-    const vsValues = params.receiverSignatures.map((s) => ethers.hexlify(s.vs));
-
-    const tx = await ka.publishKnowledgeAssets(
-      params.kaCount,
-      params.publisherNodeIdentityId,
-      ethers.hexlify(params.merkleRoot),
-      params.publicByteSize,
-      params.epochs,
-      params.tokenAmount,
-      ethers.ZeroAddress, // paymaster
-      ethers.hexlify(params.publisherSignature.r),
-      ethers.hexlify(params.publisherSignature.vs),
-      identityIds,
-      rValues,
-      vsValues,
-    );
-
-    const receipt = await tx.wait();
-
-    let batchId = 0n;
-    let startKAId = 0n;
-    let endKAId = 0n;
-    let publisherAddress = txSigner.address;
-
-    for (const log of receipt.logs) {
-      try {
-        const parsed = this.contracts.knowledgeAssetsStorage!.interface.parseLog({
-          topics: [...log.topics],
-          data: log.data,
-        });
-        if (parsed?.name === 'UALRangeReserved') {
-          publisherAddress = parsed.args.publisher;
-          startKAId = BigInt(parsed.args.startId);
-          endKAId = BigInt(parsed.args.endId);
-        }
-        if (parsed?.name === 'KnowledgeBatchCreated') {
-          batchId = BigInt(parsed.args.batchId);
-        }
-      } catch { /* not this contract */ }
-    }
-
-    const blockTimestamp = await this.getBlockTimestamp(receipt.blockNumber);
-
-    const gasUsed = BigInt(receipt.gasUsed);
-    const effectiveGasPrice = BigInt(receipt.gasPrice);
-    const gasCostWei = gasUsed * effectiveGasPrice;
-
-    return {
-      batchId,
-      startKAId,
-      endKAId,
-      txHash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      blockTimestamp,
-      publisherAddress,
-      gasUsed,
-      effectiveGasPrice,
-      gasCostWei,
-    };
-  }
-
-  // =====================================================================
-  // V9: Knowledge Updates
-  // =====================================================================
-
-  async updateKnowledgeAssets(params: UpdateKAParams): Promise<TxResult> {
-    await this.init();
-    this.requireV9();
-
-    let signer: Wallet | undefined;
-
-    // The contract requires the original publisher to call update.
-    // Query the on-chain batch publisher and select the matching signer.
-    const storage = this.contracts.knowledgeAssetsStorage;
-    if (storage) {
-      try {
-        const onChainPublisher: string = await storage.getBatchPublisher(params.batchId);
-        if (onChainPublisher && onChainPublisher !== ethers.ZeroAddress) {
-          signer = this.signerPool.find(
-            (s) => s.address.toLowerCase() === onChainPublisher.toLowerCase(),
-          );
-        }
-      } catch {
-        // Fall through to hint-based or round-robin
-      }
-    }
-
-    // Fallback: use the hint from the publisher if chain lookup failed
-    if (!signer && params.publisherAddress) {
-      signer = this.signerPool.find(
-        (s) => s.address.toLowerCase() === params.publisherAddress!.toLowerCase(),
-      );
-    }
-    if (!signer) signer = this.nextSigner();
-
-    const ka = this.contracts.knowledgeAssets!.connect(signer) as Contract;
-
-    const tx = await ka.updateKnowledgeAssets(
-      params.batchId,
-      ethers.hexlify(params.newMerkleRoot),
-      params.newPublicByteSize,
-    );
-
-    const receipt = await tx.wait();
-
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: receipt.status === 1,
-      publisherAddress: signer.address,
-    };
-  }
-
-  // =====================================================================
   // V9: Update Verification (for gossip receivers)
   // =====================================================================
 
@@ -1183,59 +1050,6 @@ export class EVMChainAdapter implements ChainAdapter {
     }
   }
 
-  // =====================================================================
-  // V9: Storage Extension
-  // =====================================================================
-
-  async extendStorage(params: ExtendStorageParams): Promise<TxResult> {
-    await this.init();
-    this.requireV9();
-
-    const ka = this.contracts.knowledgeAssets!;
-
-    if (this.contracts.token && params.tokenAmount > 0n) {
-      const kaAddress = await ka.getAddress();
-      const currentAllowance: bigint = await this.contracts.token.allowance(this.signer.address, kaAddress);
-      if (currentAllowance < params.tokenAmount) {
-        const approveTx = await this.contracts.token.approve(kaAddress, ethers.MaxUint256);
-        await approveTx.wait();
-      }
-    }
-
-    const tx = await ka.extendStorage(
-      params.batchId,
-      params.additionalEpochs,
-      params.tokenAmount,
-      ethers.ZeroAddress,
-    );
-
-    const receipt = await tx.wait();
-
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: receipt.status === 1,
-    };
-  }
-
-  // =====================================================================
-  // V9: Namespace Transfer
-  // =====================================================================
-
-  async transferNamespace(newOwner: string): Promise<TxResult> {
-    await this.init();
-    this.requireV9();
-
-    const tx = await this.contracts.knowledgeAssets!.transferNamespace(newOwner);
-    const receipt = await tx.wait();
-
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: receipt.status === 1,
-    };
-  }
-
   async getRequiredPublishTokenAmount(publicByteSize: bigint, epochs: number): Promise<bigint> {
     await this.init();
     if (!this.contracts.askStorage) {
@@ -1252,10 +1066,15 @@ export class EVMChainAdapter implements ChainAdapter {
   async *listenForEvents(filter: EventFilter): AsyncIterable<ChainEvent> {
     await this.init();
 
-    const storage = this.contracts.knowledgeAssetsStorage ?? this.contracts.knowledgeCollectionStorage!;
-
     for (const eventType of filter.eventTypes) {
       if (eventType === 'KnowledgeBatchCreated') {
+        // V8-only event — emitted by archived KnowledgeAssetsStorage. When the
+        // V8 contract is absent (the V10-only deploy path after this PR), this
+        // branch yields nothing and consumers must rely on V10 `KCCreated`.
+        const storage = this.contracts.knowledgeAssetsStorage;
+        if (!storage) {
+          continue;
+        }
         const eventFilter = storage.filters.KnowledgeBatchCreated();
         const logs = await storage.queryFilter(eventFilter, filter.fromBlock ?? 0, filter.toBlock);
 
@@ -2301,203 +2120,7 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   // =====================================================================
-  // Staking Conviction
-  // =====================================================================
-
-  // V10 baseline tier ladder seeded by `ConvictionStakingStorage._seedBaselineTiers()`
-  // (rest, 30d, 90d, 180d, 366d). Passing a tier outside this set reverts on-chain with
-  // `InvalidLockTier()` from `DKGStakingConvictionNFT._convictionMultiplier`. Validating
-  // off-chain saves a round-trip and surfaces a clearer error to the caller.
-  private static readonly V10_BASELINE_LOCK_TIERS = [0, 1, 3, 6, 12] as const;
-
-  private snapToBaselineLockTier(lockEpochs: number): number {
-    // Snap DOWN to the largest baseline tier ≤ lockEpochs. Conservative: never lock
-    // the user up for longer than the legacy `lockEpochs` they asked for. Examples:
-    //   lockEpochs=2 → 1, lockEpochs=4 → 3, lockEpochs=11 → 6, lockEpochs=30 → 12.
-    let snapped = 0;
-    for (const tier of EVMChainAdapter.V10_BASELINE_LOCK_TIERS) {
-      if (tier <= lockEpochs) snapped = tier;
-      else break;
-    }
-    return snapped;
-  }
-
-  private normalizeLegacyLockEpochs(lockEpochs: number): number {
-    if (!Number.isInteger(lockEpochs)) {
-      throw new Error(`stakeWithLock: lockEpochs must be an integer, got ${lockEpochs}`);
-    }
-    if (lockEpochs < 0) {
-      throw new Error(`stakeWithLock: lockEpochs must be non-negative, got ${lockEpochs}`);
-    }
-    return this.snapToBaselineLockTier(lockEpochs);
-  }
-
-  async stakeWithLock(identityId: bigint, amount: bigint, lockEpochs: number): Promise<TxResult> {
-    return this.stakeWithLockTier(identityId, amount, this.normalizeLegacyLockEpochs(lockEpochs));
-  }
-
-  async stakeWithLockTier(identityId: bigint, amount: bigint, lockTier: number): Promise<TxResult> {
-    if (!Number.isInteger(lockTier) || !(EVMChainAdapter.V10_BASELINE_LOCK_TIERS as readonly number[]).includes(lockTier)) {
-      throw new Error(
-        `stakeWithLockTier: lockTier must be one of {${EVMChainAdapter.V10_BASELINE_LOCK_TIERS.join(', ')}} (V10 baseline tier ladder), got ${lockTier}`,
-      );
-    }
-    await this.init();
-
-    let nft: Contract;
-    try {
-      nft = await this.resolveContract('DKGStakingConvictionNFT');
-    } catch {
-      throw new Error('DKGStakingConvictionNFT contract not deployed.');
-    }
-
-    // V10 consolidation (v4.0.0): TRAC is pulled by `StakingV10`, not by
-    // the NFT — the NFT is only the entry point and never custodies TRAC.
-    // Approving the NFT here would still leave the inner `stakingV10.stake`
-    // call short on allowance and revert. Mirror the pattern used in
-    // `ensureProfile` / `scripts/devnet.sh`.
-    if (this.contracts.token && amount > 0n) {
-      const stakingV10Addr: string = await this.contracts.hub.getContractAddress('StakingV10');
-      if (stakingV10Addr === ethers.ZeroAddress) {
-        throw new Error('StakingV10 not registered in Hub — V10 staking unavailable');
-      }
-      const currentAllowance: bigint = await this.contracts.token.allowance(this.signer.address, stakingV10Addr);
-      if (currentAllowance < amount) {
-        await (await this.contracts.token.approve(stakingV10Addr, ethers.MaxUint256)).wait();
-      }
-    }
-
-    const tx = await nft.createConviction(identityId, amount, lockTier);
-    const receipt = await tx.wait();
-
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: receipt.status === 1,
-    };
-  }
-
-  async getDelegatorConvictionMultiplier(_identityId: bigint, _delegator: string): Promise<{ multiplier: number }> {
-    // V8 address-keyed stakers have no conviction multiplier (always 1x).
-    // V10 per-position multipliers are queried by tokenId via
-    // ConvictionStakingStorage.getPosition(), not this address-keyed function.
-    return { multiplier: 1 };
-  }
-
-  // =====================================================================
-  // Publishing Conviction Accounts
-  // =====================================================================
-
-  async createConvictionAccount(amount: bigint, lockEpochs: number): Promise<{ accountId: bigint } & TxResult> {
-    await this.init();
-    if (!this.contracts.publishingConvictionAccount) {
-      throw new Error('PublishingConvictionAccount contract not deployed.');
-    }
-
-    const pca = this.contracts.publishingConvictionAccount;
-    const pcaAddress = await pca.getAddress();
-
-    if (this.contracts.token && amount > 0n) {
-      const currentAllowance: bigint = await this.contracts.token.allowance(this.signer.address, pcaAddress);
-      if (currentAllowance < amount) {
-        const approveTx = await this.contracts.token.approve(pcaAddress, ethers.MaxUint256);
-        await approveTx.wait();
-      }
-    }
-
-    const tx = await pca.createAccount(amount, lockEpochs);
-    const receipt = await tx.wait();
-
-    let accountId = 0n;
-    for (const log of receipt.logs) {
-      try {
-        const parsed = pca.interface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed?.name === 'AccountCreated') {
-          accountId = BigInt(parsed.args.accountId);
-          break;
-        }
-      } catch { /* not this contract */ }
-    }
-
-    if (accountId === 0n) {
-      throw new Error('createConvictionAccount succeeded but no AccountCreated event found');
-    }
-
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: receipt.status === 1,
-      accountId,
-    };
-  }
-
-  async addConvictionFunds(accountId: bigint, amount: bigint): Promise<TxResult> {
-    await this.init();
-    if (!this.contracts.publishingConvictionAccount) {
-      throw new Error('PublishingConvictionAccount contract not deployed.');
-    }
-
-    const pca = this.contracts.publishingConvictionAccount;
-    const pcaAddress = await pca.getAddress();
-
-    if (this.contracts.token && amount > 0n) {
-      const currentAllowance: bigint = await this.contracts.token.allowance(this.signer.address, pcaAddress);
-      if (currentAllowance < amount) {
-        const approveTx = await this.contracts.token.approve(pcaAddress, ethers.MaxUint256);
-        await approveTx.wait();
-      }
-    }
-
-    const tx = await pca.addFunds(accountId, amount);
-    const receipt = await tx.wait();
-
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: receipt.status === 1,
-    };
-  }
-
-  async extendConvictionLock(accountId: bigint, additionalEpochs: number): Promise<TxResult> {
-    await this.init();
-    if (!this.contracts.publishingConvictionAccount) {
-      throw new Error('PublishingConvictionAccount contract not deployed.');
-    }
-
-    const tx = await this.contracts.publishingConvictionAccount.extendLock(accountId, additionalEpochs);
-    const receipt = await tx.wait();
-
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: receipt.status === 1,
-    };
-  }
-
-  async addPCAAuthorizedKey(accountId: bigint, key: string): Promise<TxResult> {
-    await this.init();
-    if (!this.contracts.publishingConvictionAccount) {
-      throw new Error('PublishingConvictionAccount contract not deployed.');
-    }
-    if (!ethers.isAddress(key)) {
-      throw new Error(`addPCAAuthorizedKey: ${key} is not a valid EVM address`);
-    }
-    const tx = await this.contracts.publishingConvictionAccount.addAuthorizedKey(accountId, key);
-    const receipt = await tx.wait();
-    return {
-      hash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      success: receipt.status === 1,
-    };
-  }
-
-  async isPCAAuthorizedKey(accountId: bigint, key: string): Promise<boolean> {
-    await this.init();
-    if (!this.contracts.publishingConvictionAccount) return false;
-    if (!ethers.isAddress(key)) return false;
-    return await this.contracts.publishingConvictionAccount.authorizedKeys(accountId, key);
-  }
-
+  // Staking + Publishing Conviction Account legacy surface — ARCHIVED
   /**
    * Reverse-resolve a wallet to its V10 PCA account id, or `0n` if the
    * wallet is not registered as a publishing agent. Mirrors the
@@ -2545,31 +2168,6 @@ export class EVMChainAdapter implements ChainAdapter {
     }
   }
 
-  async getConvictionAccountInfo(accountId: bigint): Promise<ConvictionAccountInfo | null> {
-    await this.init();
-    if (!this.contracts.publishingConvictionAccount) return null;
-
-    try {
-      const [admin, balance, initialDeposit, lockEpochs, conviction, discountBps] =
-        await this.contracts.publishingConvictionAccount.getAccountInfo(accountId);
-
-      if (admin === ethers.ZeroAddress) return null;
-
-      return {
-        accountId,
-        admin,
-        balance: BigInt(balance),
-        initialDeposit: BigInt(initialDeposit),
-        lockEpochs: Number(lockEpochs),
-        conviction: BigInt(conviction),
-        discountBps: Number(discountBps),
-      };
-    } catch (err: any) {
-      if (err?.code === 'CALL_EXCEPTION') return null;
-      throw err;
-    }
-  }
-
   async getPublishingConvictionAccountOwner(accountId: bigint): Promise<string> {
     await this.init();
     const nft = await this.resolveContract('DKGPublishingConvictionNFT');
@@ -2577,24 +2175,146 @@ export class EVMChainAdapter implements ChainAdapter {
     return ethers.getAddress(owner);
   }
 
-  async getConvictionDiscount(accountId: bigint): Promise<{ discountBps: number; conviction: bigint }> {
-    await this.init();
-    if (!this.contracts.publishingConvictionAccount) {
-      return { discountBps: 0, conviction: 0n };
+  private requireConvictionNFT(): Contract {
+    const nft = this.contracts.dkgPublishingConvictionNFT;
+    if (!nft) {
+      throw new PcaUnavailableError();
     }
+    return nft;
+  }
 
+  // Opaque "unknown custom error"+data reverts carry no name; enrich so the
+  // daemon classifier matches it (mirrors isContractMissingRevert et al).
+  private async pcaWrite<T>(op: () => Promise<T>): Promise<T> {
     try {
-      const [admin, , , , conviction, discountBps] =
-        await this.contracts.publishingConvictionAccount.getAccountInfo(accountId);
+      return await op();
+    } catch (err) {
+      if (err instanceof Error) enrichEvmError(err);
+      throw err;
+    }
+  }
 
-      if (admin === ethers.ZeroAddress) return { discountBps: 0, conviction: 0n };
+  async createPublishingConvictionAccount(
+    committedTRAC: bigint,
+  ): Promise<{ accountId: bigint } & TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const nftAddress = await nft.getAddress();
+
+      // createAccount() does transferFrom(msg.sender → stakingStorage,
+      // committedTRAC) — the signer must allow the NFT to pull the TRAC.
+      if (this.contracts.token) {
+        const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+        if (allowance < committedTRAC) {
+          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+        }
+      }
+
+      const tx = await nft.createAccount(committedTRAC);
+      const receipt = await tx.wait();
+
+      let accountId = 0n;
+      for (const log of receipt.logs) {
+        try {
+          const parsed = nft.interface.parseLog({ topics: [...log.topics], data: log.data });
+          if (parsed?.name === 'AccountCreated') {
+            accountId = BigInt(parsed.args.accountId);
+            break;
+          }
+        } catch { /* not this contract's event */ }
+      }
+      if (accountId === 0n) {
+        throw new Error('createPublishingConvictionAccount succeeded but no AccountCreated event found');
+      }
 
       return {
-        discountBps: Number(discountBps),
-        conviction: BigInt(conviction),
+        accountId,
+        hash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        success: receipt.status === 1,
+      };
+    });
+  }
+
+  async getPublishingConvictionAccountInfo(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null> {
+    await this.init();
+    // Undeployed NFT → capability error (503). null is reserved below
+    // for a genuine account-missing revert so the route can disambiguate.
+    if (!this.contracts.dkgPublishingConvictionNFT) throw new PcaUnavailableError();
+    try {
+      const t = await this.contracts.dkgPublishingConvictionNFT.getAccountInfo(accountId);
+      return {
+        owner: ethers.getAddress(t[0]),
+        committedTRAC: BigInt(t[1]),
+        baseEpochAllowance: BigInt(t[2]),
+        createdAtEpoch: Number(t[3]),
+        expiresAtEpoch: Number(t[4]),
+        createdAtTimestamp: Number(t[5]),
+        expiresAtTimestamp: Number(t[6]),
+        discountBps: Number(t[7]),
+        topUpBuffer: BigInt(t[8]),
+        agentCount: Number(t[9]),
+        lastSettledWindow: Number(t[10]),
+        fullySwept: Boolean(t[11]),
       };
     } catch (err: any) {
-      if (err?.code === 'CALL_EXCEPTION') return { discountBps: 0, conviction: 0n };
+      if (err?.code === 'CALL_EXCEPTION') return null;
+      throw err;
+    }
+  }
+
+  async topUpPublishingConvictionAccount(accountId: bigint, amount: bigint): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const nftAddress = await nft.getAddress();
+      if (this.contracts.token) {
+        const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+        if (allowance < amount) {
+          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+        }
+      }
+      const receipt = await (await nft.topUp(accountId, amount)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
+  }
+
+  async settlePublishingConvictionAccount(accountId: bigint): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await (await nft.settle(accountId)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
+  }
+
+  async registerPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await (await nft.registerAgent(accountId, agent)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
+  }
+
+  async deregisterPublishingConvictionAgent(accountId: bigint, agent: string): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await (await nft.deregisterAgent(accountId, agent)).wait();
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+    });
+  }
+
+  async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) return false;
+    if (!ethers.isAddress(agent)) return false;
+    try {
+      return Boolean(await this.contracts.dkgPublishingConvictionNFT.isAgent(accountId, agent));
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return false;
       throw err;
     }
   }
@@ -2754,76 +2474,6 @@ export class EVMChainAdapter implements ChainAdapter {
   async getContract(name: string): Promise<Contract> {
     await this.init();
     return this.resolveContract(name);
-  }
-
-  // ===== Permanent Publishing =====
-
-  async publishKnowledgeAssetsPermanent(params: PermanentPublishParams): Promise<OnChainPublishResult> {
-    await this.init();
-    if (!this.contracts.knowledgeAssets) throw new Error('KnowledgeAssets contract not deployed.');
-
-    const publishSigner = this.nextSigner();
-    const kaAddr = await this.contracts.knowledgeAssets.getAddress();
-
-    if (this.contracts.token && params.tokenAmount > 0n) {
-      const allowance: bigint = await this.contracts.token.allowance(publishSigner.address, kaAddr);
-      if (allowance < params.tokenAmount) {
-        await (await (this.contracts.token.connect(publishSigner) as Contract).approve(kaAddr, ethers.MaxUint256)).wait();
-      }
-    }
-
-    const identityIds = params.receiverSignatures.map((s) => s.identityId);
-    const rValues = params.receiverSignatures.map((s) => s.r);
-    const vsValues = params.receiverSignatures.map((s) => s.vs);
-
-    const ka = this.contracts.knowledgeAssets.connect(publishSigner) as Contract;
-    const tx = await ka.batchMintKnowledgeAssetsPermanent(
-      params.kaCount,
-      params.publisherNodeIdentityId,
-      params.merkleRoot,
-      params.publicByteSize,
-      params.tokenAmount,
-      params.publisherSignature.r,
-      params.publisherSignature.vs,
-      identityIds,
-      rValues,
-      vsValues,
-    );
-
-    const receipt = await tx.wait();
-    const storageIface = this.contracts.knowledgeAssetsStorage!.interface;
-
-    let batchId = 0n;
-    let startKAId: bigint | undefined;
-    let endKAId: bigint | undefined;
-    let publisherAddress = publishSigner.address;
-    for (const log of receipt.logs) {
-      try {
-        const parsed = storageIface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed?.name === 'UALRangeReserved') {
-          publisherAddress = parsed.args.publisher;
-          startKAId = BigInt(parsed.args.startId);
-          endKAId = BigInt(parsed.args.endId);
-        }
-        if (parsed?.name === 'KnowledgeBatchCreated') {
-          batchId = BigInt(parsed.args.batchId);
-        }
-      } catch { /* different contract log */ }
-    }
-
-    const blockTimestamp = await this.getBlockTimestamp(receipt.blockNumber);
-    return {
-      batchId,
-      startKAId,
-      endKAId,
-      txHash: receipt.hash,
-      blockNumber: receipt.blockNumber,
-      blockTimestamp,
-      publisherAddress: publishSigner.address,
-      gasUsed: receipt.gasUsed ? BigInt(receipt.gasUsed) : undefined,
-      effectiveGasPrice: receipt.gasPrice ? BigInt(receipt.gasPrice) : undefined,
-      tokenAmount: params.tokenAmount,
-    };
   }
 
   // =====================================================================

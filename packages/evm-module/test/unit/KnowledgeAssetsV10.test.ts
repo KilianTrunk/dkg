@@ -18,7 +18,6 @@ import type {
   KnowledgeCollectionStorage,
   MockERC1271Wallet,
   Profile,
-  Staking,
   StakingV10,
   Token,
 } from '../../typechain';
@@ -74,7 +73,6 @@ describe('@unit KnowledgeAssetsV10', () => {
   let ChronosContract: Chronos;
   let TokenContract: Token;
   let ProfileContract: Profile;
-  let StakingContract: Staking;
   let StakingV10Contract: StakingV10;
   let StakingNFT: DKGStakingConvictionNFT;
   let Facade: ContextGraphs;
@@ -98,7 +96,6 @@ describe('@unit KnowledgeAssetsV10', () => {
     ChronosContract: Chronos;
     TokenContract: Token;
     ProfileContract: Profile;
-    StakingContract: Staking;
     StakingV10Contract: StakingV10;
     StakingNFT: DKGStakingConvictionNFT;
     Facade: ContextGraphs;
@@ -116,11 +113,9 @@ describe('@unit KnowledgeAssetsV10', () => {
       'Chronos',
       'Profile',
       'Identity',
-      'Staking',
       'ParametersStorage',
       'IdentityStorage',
       'KnowledgeCollectionStorage',
-      'PaymasterManager',
       'ContextGraphStorage',
       'ContextGraphs',
       'ContextGraphValueStorage',
@@ -145,7 +140,6 @@ describe('@unit KnowledgeAssetsV10', () => {
     const ChronosContract = await hre.ethers.getContract<Chronos>('Chronos');
     const TokenContract = await hre.ethers.getContract<Token>('Token');
     const ProfileContract = await hre.ethers.getContract<Profile>('Profile');
-    const StakingContract = await hre.ethers.getContract<Staking>('Staking');
     const StakingV10Contract =
       await hre.ethers.getContract<StakingV10>('StakingV10');
     const StakingNFT = await hre.ethers.getContract<DKGStakingConvictionNFT>(
@@ -172,7 +166,6 @@ describe('@unit KnowledgeAssetsV10', () => {
       ChronosContract,
       TokenContract,
       ProfileContract,
-      StakingContract,
       StakingV10Contract,
       StakingNFT,
       Facade,
@@ -194,7 +187,6 @@ describe('@unit KnowledgeAssetsV10', () => {
     ChronosContract = f.ChronosContract;
     TokenContract = f.TokenContract;
     ProfileContract = f.ProfileContract;
-    StakingContract = f.StakingContract;
     StakingV10Contract = f.StakingV10Contract;
     StakingNFT = f.StakingNFT;
     Facade = f.Facade;
@@ -210,11 +202,10 @@ describe('@unit KnowledgeAssetsV10', () => {
   // Shared setup helpers
   // ========================================================================
 
-  // v4.0.0 — KAv10's `_verifySignature` ACK gate now reads
+  // v4.0.0 — KAv10's `_verifySignature` ACK gate reads
   // `convictionStakingStorage.getNodeStakeV10(identityId) > 0`. Stake via the
   // V10 NFT path (`DKGStakingConvictionNFT.createConviction`) so V10 stake is
-  // populated; V8 `Staking.stake` writes V8 storage only and no longer makes
-  // the signer eligible.
+  // populated.
   async function fundAndStakeNode(node: NodeAccounts, identityId: number) {
     await TokenContract.mint(node.operational.address, MIN_STAKE);
     await TokenContract.connect(node.operational).approve(
@@ -2098,14 +2089,13 @@ describe('@unit KnowledgeAssetsV10', () => {
     });
 
     // ----------------------------------------------------------------------
-    // T2.4 — DELETED in RFC-001.
-    //
-    // Paymaster.sol / PaymasterManager.sol are removed from KAv10's active
-    // path. Sponsorship is now expressed via PCA agent registration: a
-    // sponsoring core calls `DKGPublishingConvictionNFT.registerAgent(its
-    // accountId, sponsoredWallet)`, and that wallet's publishes flow through
-    // the PCA discount branch automatically. The sponsorship semantic is
-    // exercised by T2.3 and T1.1 already.
+    // T2.4 — DELETED in RFC-001 (legacy V9 paymaster sponsorship path archived
+    // under contracts/archive/). Sponsorship is now expressed via PCA agent
+    // registration: a sponsoring core calls
+    // `DKGPublishingConvictionNFT.registerAgent(its accountId, sponsoredWallet)`,
+    // and that wallet's publishes flow through the PCA discount branch
+    // automatically. The sponsorship semantic is exercised by T2.3 and T1.1
+    // already.
     // ----------------------------------------------------------------------
 
     // ----------------------------------------------------------------------

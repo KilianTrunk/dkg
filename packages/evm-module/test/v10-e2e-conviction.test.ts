@@ -9,14 +9,11 @@ import {
   Token,
   Chronos,
   Profile,
-  Staking,
   StakingStorage,
   ConvictionStakingStorage,
   StakingV10,
   DKGStakingConvictionNFT,
   ParametersStorage,
-  DelegatorsInfo,
-  PublishingConvictionAccount,
   KnowledgeAssetsV10,
   KnowledgeCollectionStorage,
   EpochStorage,
@@ -42,14 +39,11 @@ type E2EFixture = {
   Token: Token;
   Chronos: Chronos;
   Profile: Profile;
-  Staking: Staking;
   StakingStorage: StakingStorage;
   ConvictionStakingStorage: ConvictionStakingStorage;
   StakingV10: StakingV10;
   StakingNFT: DKGStakingConvictionNFT;
   ParametersStorage: ParametersStorage;
-  DelegatorsInfo: DelegatorsInfo;
-  PCA: PublishingConvictionAccount;
   KnowledgeAssetsV10: KnowledgeAssetsV10;
   KnowledgeCollectionStorage: KnowledgeCollectionStorage;
   EpochStorage: EpochStorage;
@@ -68,10 +62,7 @@ async function deployE2EFixture(): Promise<E2EFixture> {
     'Chronos',
     'Profile',
     'Identity',
-    'Staking',
-    'DelegatorsInfo',
     'KnowledgeAssetsV10',
-    'PublishingConvictionAccount',
     // V10 Phase 8 stack — required by the new `KnowledgeAssetsV10.initialize()`
     // fail-fast Hub lookups (commit e89ecb75). Flow 3 (V10 publish via NFT)
     // depends on the full V10 stack being deployed in the same fixture.
@@ -97,7 +88,6 @@ async function deployE2EFixture(): Promise<E2EFixture> {
     Token: await hre.ethers.getContract<Token>('Token'),
     Chronos: await hre.ethers.getContract<Chronos>('Chronos'),
     Profile: await hre.ethers.getContract<Profile>('Profile'),
-    Staking: await hre.ethers.getContract<Staking>('Staking'),
     StakingStorage: await hre.ethers.getContract<StakingStorage>('StakingStorage'),
     ConvictionStakingStorage: await hre.ethers.getContract<ConvictionStakingStorage>(
       'ConvictionStakingStorage',
@@ -107,8 +97,6 @@ async function deployE2EFixture(): Promise<E2EFixture> {
       'DKGStakingConvictionNFT',
     ),
     ParametersStorage: await hre.ethers.getContract<ParametersStorage>('ParametersStorage'),
-    DelegatorsInfo: await hre.ethers.getContract<DelegatorsInfo>('DelegatorsInfo'),
-    PCA: await hre.ethers.getContract<PublishingConvictionAccount>('PublishingConvictionAccount'),
     KnowledgeAssetsV10: await hre.ethers.getContract<KnowledgeAssetsV10>('KnowledgeAssetsV10'),
     KnowledgeCollectionStorage: await hre.ethers.getContract<KnowledgeCollectionStorage>('KnowledgeCollectionStorage'),
     EpochStorage: await hre.ethers.getContract<EpochStorage>('EpochStorageV8'),
@@ -128,11 +116,8 @@ describe('V10 E2E Conviction System', function () {
   let Token: Token;
   let Chronos: Chronos;
   let ProfileContract: Profile;
-  let Staking: Staking;
   let StakingStorage: StakingStorage;
   let ParametersStorage: ParametersStorage;
-  let DelegatorsInfo: DelegatorsInfo;
-  let PCA: PublishingConvictionAccount;
   let KAV10: KnowledgeAssetsV10;
   let KnowledgeCollectionStorage: KnowledgeCollectionStorage;
 
@@ -145,139 +130,18 @@ describe('V10 E2E Conviction System', function () {
       Token,
       Chronos,
       ParametersStorage,
-      DelegatorsInfo,
-      PCA,
       KnowledgeCollectionStorage,
     } = fixture);
     ProfileContract = fixture.Profile;
-    Staking = fixture.Staking;
     StakingStorage = fixture.StakingStorage;
     KAV10 = fixture.KnowledgeAssetsV10;
   });
 
   // ========================================================================
-  // Flow 1: Staker Conviction Lifecycle
-  // ========================================================================
-  describe('Flow 1: Staker Conviction Lifecycle', function () {
-    let identityId: number;
-    let staker: SignerWithAddress;
-    const STAKE_AMOUNT = ethers.parseEther('50000');
-
-    beforeEach(async () => {
-      const node = {
-        operational: accounts[1],
-        admin: accounts[2],
-      };
-      staker = accounts[1];
-
-      const profile = await createProfile(ProfileContract, node);
-      identityId = profile.identityId;
-
-      await Token.mint(staker.address, STAKE_AMOUNT * 2n);
-      await Token.connect(staker).approve(await Staking.getAddress(), STAKE_AMOUNT * 2n);
-    });
-
-    it('stakes with no lock (1x multiplier)', async () => {
-      await Staking.connect(staker).stake(identityId, STAKE_AMOUNT);
-
-      const nodeStake = await StakingStorage.getNodeStake(identityId);
-      expect(nodeStake).to.equal(STAKE_AMOUNT);
-    });
-  });
-
-  // ========================================================================
-  // Flow 2: Publisher Conviction Lifecycle
-  // ========================================================================
-  describe('Flow 2: Publisher Conviction Lifecycle', function () {
-    const LOCK_AMOUNT = ethers.parseEther('100000');
-    const LOCK_EPOCHS = 12;
-    let publisher: SignerWithAddress;
-    let agent: SignerWithAddress;
-
-    beforeEach(async () => {
-      publisher = accounts[0];
-      agent = accounts[10];
-
-      await Token.mint(publisher.address, LOCK_AMOUNT * 2n);
-      await Token.connect(publisher).approve(await PCA.getAddress(), LOCK_AMOUNT * 2n);
-    });
-
-    it('creates account and verifies info (balance, conviction, discount)', async () => {
-      await PCA.connect(publisher).createAccount(LOCK_AMOUNT, LOCK_EPOCHS);
-
-      const info = await PCA.getAccountInfo(1);
-      expect(info.admin).to.equal(publisher.address);
-      expect(info.balance).to.equal(LOCK_AMOUNT);
-      expect(info.initialDeposit).to.equal(LOCK_AMOUNT);
-      expect(info.lockEpochs).to.equal(LOCK_EPOCHS);
-
-      const expectedConviction = BigInt(LOCK_AMOUNT) * BigInt(LOCK_EPOCHS);
-      expect(info.conviction).to.equal(expectedConviction);
-
-      expect(info.discountBps).to.be.greaterThan(0);
-    });
-
-    it('adds authorized key and verifies access', async () => {
-      await PCA.connect(publisher).createAccount(LOCK_AMOUNT, LOCK_EPOCHS);
-
-      await PCA.connect(publisher).addAuthorizedKey(1, agent.address);
-      expect(await PCA.authorizedKeys(1, agent.address)).to.be.true;
-    });
-
-    it('coverPublishingCost deducts at discounted rate', async () => {
-      await PCA.connect(publisher).createAccount(LOCK_AMOUNT, LOCK_EPOCHS);
-
-      const baseCost = ethers.parseEther('1000');
-      const discountedCost = await PCA.getDiscountedCost(1, baseCost);
-
-      expect(discountedCost).to.be.lessThan(baseCost);
-      expect(discountedCost).to.be.greaterThan(0);
-
-      const discount = await PCA.getDiscount(1);
-      const expectedDiscounted = BigInt(baseCost) * (10000n - discount) / 10000n;
-      expect(discountedCost).to.equal(expectedDiscounted);
-    });
-
-    it('adds funds and verifies updated balance', async () => {
-      await PCA.connect(publisher).createAccount(LOCK_AMOUNT, LOCK_EPOCHS);
-
-      const addAmount = ethers.parseEther('50000');
-      await PCA.connect(publisher).addFunds(1, addAmount);
-
-      const info = await PCA.getAccountInfo(1);
-      expect(info.balance).to.equal(LOCK_AMOUNT + addAmount);
-    });
-
-    it('extends lock and increases conviction', async () => {
-      await PCA.connect(publisher).createAccount(LOCK_AMOUNT, 6);
-
-      const infoBefore = await PCA.getAccountInfo(1);
-      await PCA.connect(publisher).extendLock(1, 6);
-      const infoAfter = await PCA.getAccountInfo(1);
-
-      expect(infoAfter.lockEpochs).to.equal(12);
-      expect(infoAfter.conviction).to.be.greaterThan(infoBefore.conviction);
-      expect(infoAfter.conviction).to.equal(BigInt(LOCK_AMOUNT) * 12n);
-    });
-
-    it('prevents non-admin from adding funds or extending lock', async () => {
-      await PCA.connect(publisher).createAccount(LOCK_AMOUNT, LOCK_EPOCHS);
-
-      await expect(
-        PCA.connect(agent).addFunds(1, ethers.parseEther('1000')),
-      ).to.be.revertedWithCustomError(PCA, 'NotAccountAdmin');
-
-      await expect(
-        PCA.connect(agent).extendLock(1, 3),
-      ).to.be.revertedWithCustomError(PCA, 'NotAccountAdmin');
-    });
-
-    // Legacy V9 PublishingConvictionAccount flows end here. The V10 publish
-    // pipeline (via DKGPublishingConvictionNFT + KnowledgeAssetsV10) is
-    // exercised as a separate Flow 3 below — the legacy PCA and the new
-    // NFT are independent contracts and the tests no longer share state.
-  });
-
+  // Flows 1 + 2 (V8 Staking lifecycle, V9 PublishingConvictionAccount
+  // lifecycle) archived in TB-2 — the underlying contracts moved to
+  // contracts/archive/ and are no longer registered in the Hub. The V10
+  // publish path stands on its own below.
   // ========================================================================
   // Flow 3: V10 Publish via Conviction NFT + Context Graphs
   //
@@ -335,7 +199,6 @@ describe('V10 E2E Conviction System', function () {
         KnowledgeCollectionStorage,
       } = fixture);
       ProfileContract = fixture.Profile;
-      Staking = fixture.Staking;
       StakingStorage = fixture.StakingStorage;
       StakingV10Contract = fixture.StakingV10;
       StakingNFT = fixture.StakingNFT;
@@ -349,8 +212,7 @@ describe('V10 E2E Conviction System', function () {
     });
 
     // v4.0.0 — Bring `nodeStakeV10` > 0 for the ACK signer gate via the V10
-    // path. KAv10 reads `convictionStakingStorage.getNodeStakeV10`, so V8
-    // `Staking.stake` no longer makes the ACK signer eligible.
+    // path. KAv10 reads `convictionStakingStorage.getNodeStakeV10`.
     const stakeV10 = async (
       staker: SignerWithAddress,
       identityId: number,

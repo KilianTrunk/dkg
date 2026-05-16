@@ -15,7 +15,9 @@ func.dependencies = [
   'Chronos',
   'ParametersStorage',
   'IdentityStorage',
-  'PaymasterManager',
+  // PaymasterManager dep removed in TB-2 (archived alongside Paymaster).
+  // KAv10 no longer routes through the Paymaster contract — sponsorship is
+  // expressed as PCA-agent registration on DKGPublishingConvictionNFT.
   // v4.0.0 — KAv10 now reads V10 stake from CSS for the ACK signer gate
   // and routes publish-fee TRAC into the CSS vault. StakingStorage is no
   // longer in the V10 init path.

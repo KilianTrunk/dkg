@@ -2,28 +2,28 @@
 
 pragma solidity ^0.8.20;
 
-import {ShardingTable} from "./ShardingTable.sol";
-import {Ask} from "./Ask.sol";
-import {IdentityStorage} from "./storage/IdentityStorage.sol";
-import {ParametersStorage} from "./storage/ParametersStorage.sol";
-import {ProfileStorage} from "./storage/ProfileStorage.sol";
-import {ShardingTableStorage} from "./storage/ShardingTableStorage.sol";
-import {StakingStorage} from "./storage/StakingStorage.sol";
-import {DelegatorsInfo} from "./storage/DelegatorsInfo.sol";
-import {ContractStatus} from "./abstract/ContractStatus.sol";
-import {IInitializable} from "./interfaces/IInitializable.sol";
-import {INamed} from "./interfaces/INamed.sol";
-import {IVersioned} from "./interfaces/IVersioned.sol";
-import {ProfileLib} from "./libraries/ProfileLib.sol";
-import {ShardingTableLib} from "./libraries/ShardingTableLib.sol";
-import {StakingLib} from "./libraries/StakingLib.sol";
-import {TokenLib} from "./libraries/TokenLib.sol";
-import {IdentityLib} from "./libraries/IdentityLib.sol";
-import {Permissions} from "./libraries/Permissions.sol";
+import {ShardingTable} from "../ShardingTable.sol";
+import {Ask} from "../Ask.sol";
+import {IdentityStorage} from "../storage/IdentityStorage.sol";
+import {ParametersStorage} from "../storage/ParametersStorage.sol";
+import {ProfileStorage} from "../storage/ProfileStorage.sol";
+import {ShardingTableStorage} from "../storage/ShardingTableStorage.sol";
+import {StakingStorage} from "../storage/StakingStorage.sol";
+import {DelegatorsInfo} from "./DelegatorsInfo.sol";
+import {ContractStatus} from "../abstract/ContractStatus.sol";
+import {IInitializable} from "../interfaces/IInitializable.sol";
+import {INamed} from "../interfaces/INamed.sol";
+import {IVersioned} from "../interfaces/IVersioned.sol";
+import {ProfileLib} from "../libraries/ProfileLib.sol";
+import {ShardingTableLib} from "../libraries/ShardingTableLib.sol";
+import {StakingLib} from "../libraries/StakingLib.sol";
+import {TokenLib} from "../libraries/TokenLib.sol";
+import {IdentityLib} from "../libraries/IdentityLib.sol";
+import {Permissions} from "../libraries/Permissions.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {RandomSamplingStorage} from "./storage/RandomSamplingStorage.sol";
-import {Chronos} from "./storage/Chronos.sol";
-import {EpochStorage} from "./storage/EpochStorage.sol";
+import {RandomSamplingStorage} from "../storage/RandomSamplingStorage.sol";
+import {Chronos} from "../storage/Chronos.sol";
+import {EpochStorage} from "../storage/EpochStorage.sol";
 
 contract Staking is INamed, IVersioned, ContractStatus, IInitializable {
     string private constant _NAME = "Staking";

@@ -204,16 +204,23 @@ export interface PermanentPublishParams {
   receiverSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
 }
 
-// ----- Publishing Conviction Account types -----
+// ----- V10 Publishing Conviction NFT types -----
 
-export interface ConvictionAccountInfo {
-  accountId: bigint;
-  admin: string;
-  balance: bigint;
-  initialDeposit: bigint;
-  lockEpochs: number;
-  conviction: bigint;
+/** Mirrors `DKGPublishingConvictionNFT.getAccountInfo`; adapter returns
+ *  null when the NFT is undeployed or the account is missing. */
+export interface V10PublishingConvictionAccountInfo {
+  owner: string;
+  committedTRAC: bigint;
+  baseEpochAllowance: bigint;
+  createdAtEpoch: number;
+  expiresAtEpoch: number;
+  createdAtTimestamp: number;
+  expiresAtTimestamp: number;
   discountBps: number;
+  topUpBuffer: bigint;
+  agentCount: number;
+  lastSettledWindow: number;
+  fullySwept: boolean;
 }
 
 // ----- V10 publish types -----
@@ -519,9 +526,6 @@ export interface ChainAdapter {
   // V9 batch minting
   batchMintKnowledgeAssets(params: BatchMintParams): Promise<BatchMintResult>;
 
-  // V9 single-tx publish (reserve + mint in one call)
-  publishKnowledgeAssets(params: PublishParams): Promise<OnChainPublishResult>;
-
   /**
    * Recover a publish transaction by txHash and reconstruct its on-chain publish result.
    * Returns null when the tx is absent, pending, failed, or not a recognized publish tx.
@@ -535,25 +539,13 @@ export interface ChainAdapter {
   getRequiredPublishTokenAmount?(publicByteSize: bigint, epochs: number): Promise<bigint>;
 
   /**
-   * V9 knowledge updates. Successful update txs must either return
-   * `TxResult.publisherAddress` or support `getLatestMerkleRootPublisher`
-   * so callers can avoid inventing confirmed publisher attribution.
-   */
-  updateKnowledgeAssets(params: UpdateKAParams): Promise<TxResult>;
-
-  /**
-   * Verify that a KnowledgeBatchUpdated event exists for the given batchId and txHash,
-   * and that the publisher address matches the original batch publisher.
-   * Returns chain-verified merkle root and block number so the caller can bind
-   * the gossip payload to on-chain state (instead of trusting gossip-supplied values).
+   * Verify that a knowledge-batch update emitted the expected merkle root
+   * for the given batchId and txHash, and that the publisher address
+   * matches the original batch publisher. Returns chain-verified merkle
+   * root and block number so the caller can bind the gossip payload to
+   * on-chain state.
    */
   verifyKAUpdate?(txHash: string, batchId: bigint, publisherAddress: string): Promise<KAUpdateVerification>;
-
-  // V9 storage extension
-  extendStorage(params: ExtendStorageParams): Promise<TxResult>;
-
-  // V9 namespace transfer
-  transferNamespace(newOwner: string): Promise<TxResult>;
 
   /**
    * Verify that a publisher address owns the UAL range [startKAId, endKAId] on-chain.
@@ -575,12 +567,6 @@ export interface ChainAdapter {
   /** List context graphs from chain via `NameClaimed` events. Optional; not supported on no-chain/mock. */
   listContextGraphsFromChain?(fromBlock?: number): Promise<ContextGraphOnChain[]>;
 
-  // Publishing Conviction Accounts
-  createConvictionAccount?(amount: bigint, lockEpochs: number): Promise<{ accountId: bigint } & TxResult>;
-  addConvictionFunds?(accountId: bigint, amount: bigint): Promise<TxResult>;
-  extendConvictionLock?(accountId: bigint, additionalEpochs: number): Promise<TxResult>;
-  getConvictionDiscount?(accountId: bigint): Promise<{ discountBps: number; conviction: bigint }>;
-  getConvictionAccountInfo?(accountId: bigint): Promise<ConvictionAccountInfo | null>;
   /**
    * Live owner lookup for a PCA NFT — wraps `DKGPublishingConvictionNFT.ownerOf(accountId)`.
    * Used by the daemon's curated-CG registration preflight to enforce
@@ -588,25 +574,6 @@ export interface ChainAdapter {
    * impersonate ownership when tying a CG to a PCA.
    */
   getPublishingConvictionAccountOwner?(accountId: bigint): Promise<string>;
-  /**
-   * Authorize an EOA to draw down on the PCA's discounted publishing
-   * allowance. Wraps `PublishingConvictionAccount.addAuthorizedKey(accountId, key)`,
-   * which the contract gates on `msg.sender == account.admin` — i.e. the
-   * caller MUST be the account admin (NFT owner).
-   *
-   * Mirrors the EvmAdapter ↔ MockChainAdapter parity contract: both
-   * implementations expose the same shape; the mock tracks
-   * authorization in-memory so unit tests can drive the
-   * authorized-key check without a live chain.
-   */
-  addPCAAuthorizedKey?(accountId: bigint, key: string): Promise<TxResult>;
-  /**
-   * Read-side mirror of `PublishingConvictionAccount.authorizedKeys[accountId][key]`.
-   * Returns `true` when `key` is currently authorized to draw on the PCA.
-   * Useful for runbook smoke-checks (the operator wants to confirm
-   * `pca authorize` actually landed on chain before driving a publish).
-   */
-  isPCAAuthorizedKey?(accountId: bigint, key: string): Promise<boolean>;
 
   /**
    * Reverse lookup: which PCA (if any) is `agent` registered against?
@@ -642,36 +609,17 @@ export interface ChainAdapter {
    */
   getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
 
-  // Permanent Publishing
-  publishKnowledgeAssetsPermanent?(params: PermanentPublishParams): Promise<OnChainPublishResult>;
+  // ----- V10 Publishing Conviction NFT write+read surface -----
+  // Wraps `DKGPublishingConvictionNFT`. Optional; owner-gated writes
+  // MUST surface the owner revert (→ 403), never swallow it.
 
-  // Staking Conviction
-  /**
-   * Legacy staking helper that accepts a lock duration-style number.
-   *
-   * V10 stakes are NFT-backed positions keyed by `lockTier`; adapters
-   * snap-down this legacy `lockEpochs` value to the largest baseline V10
-   * tier ≤ `lockEpochs` (baseline ladder = `{0, 1, 3, 6, 12}`). Conservative —
-   * never lock the user up for longer than the legacy parameter requested.
-   * Examples: `lockEpochs=2 → 1`, `lockEpochs=5 → 3`, `lockEpochs=30 → 12`.
-   *
-   * @deprecated Prefer `stakeWithLockTier` for new V10 callers.
-   */
-  stakeWithLock?(identityId: bigint, amount: bigint, lockEpochs: number): Promise<TxResult>;
-  /**
-   * Mint a V10 NFT-backed conviction stake position on `identityId` with
-   * `amount` TRAC at an explicit V10 `lockTier`. Each call mints a new
-   * position; there is no per-delegator-address position to "extend" under
-   * V10. Use the V10 tokenId-keyed `getPosition` for per-position
-   * multipliers.
-   *
-   * `lockTier` MUST be a member of the V10 baseline tier ladder
-   * (`{0, 1, 3, 6, 12}`) seeded by `ConvictionStakingStorage._seedBaselineTiers`;
-   * any other value reverts on-chain with `InvalidLockTier()`. Adapters
-   * validate off-chain and throw a clearer error before broadcasting.
-   */
-  stakeWithLockTier?(identityId: bigint, amount: bigint, lockTier: number): Promise<TxResult>;
-  getDelegatorConvictionMultiplier?(identityId: bigint, delegator: string): Promise<{ multiplier: number }>;
+  createPublishingConvictionAccount?(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult>;
+  topUpPublishingConvictionAccount?(accountId: bigint, amount: bigint): Promise<TxResult>;
+  registerPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;
+  deregisterPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;
+  isPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<boolean>;
+  settlePublishingConvictionAccount?(accountId: bigint): Promise<TxResult>;
+  getPublishingConvictionAccountInfo?(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null>;
 
   /**
    * Sign an arbitrary message hash using the node's primary operational key.

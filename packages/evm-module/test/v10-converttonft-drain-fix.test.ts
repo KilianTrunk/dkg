@@ -26,7 +26,6 @@ import hre from 'hardhat';
 import {
   Chronos,
   ConvictionStakingStorage,
-  DelegatorsInfo,
   DKGStakingConvictionNFT,
   Hub,
   ParametersStorage,
@@ -45,7 +44,6 @@ type Fixture = {
   StakingV10: StakingV10;
   StakingStorage: StakingStorage;
   ConvictionStakingStorage: ConvictionStakingStorage;
-  DelegatorsInfo: DelegatorsInfo;
   ParametersStorage: ParametersStorage;
   Profile: Profile;
   Token: Token;
@@ -72,7 +70,6 @@ async function deployFixture(): Promise<Fixture> {
     ConvictionStakingStorage: await hre.ethers.getContract<ConvictionStakingStorage>(
       'ConvictionStakingStorage',
     ),
-    DelegatorsInfo: await hre.ethers.getContract<DelegatorsInfo>('DelegatorsInfo'),
     ParametersStorage: await hre.ethers.getContract<ParametersStorage>('ParametersStorage'),
     Profile: await hre.ethers.getContract<Profile>('Profile'),
     Token: await hre.ethers.getContract<Token>('Token'),
@@ -86,7 +83,6 @@ describe('@integration TC-B1 regression: _convertToNFT TRAC transfer (drain fix)
   let StakingV10Contract: StakingV10;
   let StakingStorageContract: StakingStorage;
   let ConvictionStakingStorageContract: ConvictionStakingStorage;
-  let DelegatorsInfoContract: DelegatorsInfo;
   let ParametersStorageContract: ParametersStorage;
   let ProfileContract: Profile;
   let Token: Token;
@@ -100,7 +96,6 @@ describe('@integration TC-B1 regression: _convertToNFT TRAC transfer (drain fix)
       StakingV10: StakingV10Contract,
       StakingStorage: StakingStorageContract,
       ConvictionStakingStorage: ConvictionStakingStorageContract,
-      DelegatorsInfo: DelegatorsInfoContract,
       ParametersStorage: ParametersStorageContract,
       Profile: ProfileContract,
       Token,
@@ -158,23 +153,10 @@ describe('@integration TC-B1 regression: _convertToNFT TRAC transfer (drain fix)
       stakeBase,
     );
     await StakingStorageContract.connect(accounts[0]).increaseTotalStake(stakeBase);
-    // Mirror V8 DelegatorsInfo entries required by selfMigrateV8 checks.
-    await DelegatorsInfoContract.connect(accounts[0]).addDelegator(
-      identityId,
-      delegator.address,
-    );
-    await DelegatorsInfoContract.connect(accounts[0]).setHasEverDelegatedToNode(
-      identityId,
-      delegator.address,
-      true,
-    );
-    const currentEpoch = await ChronosContract.getCurrentEpoch();
-    const baseline = currentEpoch > 0n ? currentEpoch - 1n : 0n;
-    await DelegatorsInfoContract.connect(accounts[0]).setLastClaimedEpoch(
-      identityId,
-      delegator.address,
-      baseline,
-    );
+    // V8 DelegatorsInfo mirror is no longer required: StakingV10._convertToNFT
+    // (D3 simplification) drops DelegatorsInfo entirely — pre-migration
+    // rewards are handled by `claim()`'s D6 retroactive branch starting from
+    // `migrationEpoch`. The contract is archived as part of this PR.
     return v8Key;
   };
 

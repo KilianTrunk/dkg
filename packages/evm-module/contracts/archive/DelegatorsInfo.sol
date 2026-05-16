@@ -2,7 +2,7 @@
 
 pragma solidity ^0.8.20;
 
-import {StakingStorage} from "./StakingStorage.sol";
+import {StakingStorage} from "../storage/StakingStorage.sol";
 import {IInitializable} from "../interfaces/IInitializable.sol";
 import {INamed} from "../interfaces/INamed.sol";
 import {IVersioned} from "../interfaces/IVersioned.sol";

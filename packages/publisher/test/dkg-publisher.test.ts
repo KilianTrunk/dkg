@@ -270,7 +270,7 @@ describe('DKGPublisher', () => {
     if (metaResult.type === 'bindings') {
       expect(metaResult.bindings).toHaveLength(1);
       const ual = metaResult.bindings[0]['ual'];
-      // V9 UAL: did:dkg:{chainId}/{publisherAddress}/{startKAId}
+      // UAL shape: did:dkg:{chainId}/{publisherAddress}/{startKAId}
       expect(ual).toMatch(/^did:dkg:evm:31337\/0x[0-9a-fA-F]{40}\/\d+$/);
       expect(ual).toContain(result.onChainResult!.publisherAddress);
     }

@@ -499,15 +499,34 @@ export class ApiClient {
 
   async createPca(request: {
     tokens: string;
-    lockEpochs: number;
   }): Promise<{
     accountId: string;
     txHash: string;
     blockNumber: number;
     committedTokens: string;
-    lockEpochs: number;
   }> {
     return this.post('/api/pca', request);
+  }
+
+  async deregisterPcaAgent(accountId: string, agent: string): Promise<{
+    accountId: string;
+    agent: string;
+    deregistered: boolean;
+    txHash: string;
+    blockNumber: number;
+  }> {
+    return this.del(
+      `/api/pca/${encodeURIComponent(accountId)}/agent/${encodeURIComponent(agent)}`,
+    );
+  }
+
+  async settlePca(accountId: string): Promise<{
+    accountId: string;
+    settled: boolean;
+    txHash: string;
+    blockNumber: number;
+  }> {
+    return this.post(`/api/pca/${encodeURIComponent(accountId)}/settle`, {});
   }
 
   async addPcaFunds(accountId: string, tokens: string): Promise<{
@@ -519,27 +538,33 @@ export class ApiClient {
     return this.post(`/api/pca/${encodeURIComponent(accountId)}/funds`, { tokens });
   }
 
-  async authorizePcaKey(accountId: string, key: string): Promise<{
+  async registerPcaAgent(accountId: string, agent: string): Promise<{
     accountId: string;
-    key: string;
-    authorized: boolean;
+    agent: string;
+    registered: boolean;
     txHash: string;
     blockNumber: number;
   }> {
-    return this.post(`/api/pca/${encodeURIComponent(accountId)}/authorize`, { key });
+    return this.post(`/api/pca/${encodeURIComponent(accountId)}/agent`, { agent });
   }
 
   async getPcaInfo(accountId: string, probeKey?: string): Promise<{
     accountId: string;
-    admin: string;
-    balance: string;
-    balanceTrac: string;
-    initialDeposit: string;
-    initialDepositTrac: string;
-    lockEpochs: number;
-    conviction: string;
+    owner: string;
+    committedTRAC: string;
+    committedTRACTrac: string;
+    baseEpochAllowance: string;
+    topUpBuffer: string;
+    topUpBufferTrac: string;
+    createdAtEpoch: number;
+    expiresAtEpoch: number;
+    createdAtTimestamp: number;
+    expiresAtTimestamp: number;
     discountBps: number;
-    probedKey?: { key: string; authorized: boolean; adapterSupported?: boolean; error?: string };
+    agentCount: number;
+    lastSettledWindow: number;
+    fullySwept: boolean;
+    probedKey?: { key: string; registered: boolean; adapterSupported?: boolean; error?: string };
   }> {
     const qs = probeKey ? `?key=${encodeURIComponent(probeKey)}` : '';
     return this.get(`/api/pca/${encodeURIComponent(accountId)}${qs}`);
@@ -1377,6 +1402,18 @@ export class ApiClient {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...this.authHeaders() },
       body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      throw ApiClient.httpError(res.status, ApiClient.errorMessageFromBody(data, res.statusText), data);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  private async del<T>(path: string): Promise<T> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: 'DELETE',
+      headers: this.authHeaders(),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: res.statusText }));

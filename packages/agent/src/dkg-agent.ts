@@ -2268,37 +2268,48 @@ export class DKGAgent {
       });
 
       // Reverse-path peerStore enrichment for inbound circuit-relay
-      // connections. Closes the "Window D" class from the May 2026
-      // Miles↔Lex 6h soak postmortem: an inbound circuit connection
-      // from peer P via relay R was open and live, but every
+      // connections, then the symmetric chat-outbox flush.
+      //
+      // Closes the "Window D" class from the May 2026 Miles↔Lex 6h
+      // soak postmortem: an inbound circuit connection from peer P
+      // via relay R was open and live, but every
       // `dialProtocol(P, ...)` retry on our side failed with "no
-      // valid addresses for peer" because P's identify-push
-      // didn't replicate the reservation address into our peerStore.
-      // By echoing the inbound circuit's relay back as an outbound
-      // multiaddr for P (`<R>/p2p-circuit/p2p/<P>`), the next
-      // dialProtocol can find an address and try it. The merge runs
-      // BEFORE the outbox flush above completes (fire-and-forget on
-      // both), but the next retry tick — or the next opportunistic
-      // flush triggered by ANY subsequent inbound from P — picks up
-      // the freshly-merged address. We deliberately do not block the
-      // outbox flush on the merge to avoid coupling the latency of
-      // peerStore.merge (which can trigger CM auto-dial side effects,
-      // see docs/archive/UPSTREAM_ISSUE_DRAFT.md) into the chat
-      // delivery hot path.
-      this.enrichPeerStoreFromInboundCircuit(evt.detail).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.log.warn(ctx, `Reverse-path peerStore enrichment failed for ${remotePeer}: ${message}`);
-      });
-
-      // Symmetric flush for the chat outbox: any messages we tried to
-      // send to this peer while they were unreachable get a fresh
-      // delivery attempt now that the peer is back. Independent of
-      // the join-approval flush above (different queue, different
-      // payload shape), but same opportunistic-on-reconnect rationale.
-      this.processMessageOutboxOnConnect(remotePeer).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.log.warn(ctx, `Opportunistic message-outbox retry on connect failed for ${remotePeer}: ${message}`);
-      });
+      // valid addresses for peer" because P's identify-push didn't
+      // replicate the reservation address into our peerStore.
+      // Echoing the inbound circuit's relay back as an outbound
+      // multiaddr for P (`<R>/p2p-circuit/p2p/<P>`) lets the next
+      // dialProtocol find an address and try it.
+      //
+      // User review on PR #536 caught the original ordering bug:
+      // running enrichment and the outbox flush in parallel
+      // fire-and-forget meant the first flush attempt could
+      // still hit `dialProtocol` against an EMPTY peerStore and
+      // fail with the same "no valid addresses" error this PR is
+      // meant to heal — pushing recovery onto the next 30s tick
+      // or another reconnect. Sequence the two: await enrichment
+      // first, then flush. Both stay wrapped in their own
+      // try/catch so an enrichment failure logs a warning and
+      // still lets the outbox flush proceed (it might succeed
+      // anyway via a stale-but-usable cached path).
+      //
+      // The whole chain runs as a fire-and-forget IIFE so the
+      // listener itself doesn't await — libp2p's
+      // `connection:open` emitter is synchronous and we don't
+      // want to slow down other listeners.
+      void (async () => {
+        try {
+          await this.enrichPeerStoreFromInboundCircuit(evt.detail);
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Reverse-path peerStore enrichment failed for ${remotePeer}: ${message}`);
+        }
+        try {
+          await this.processMessageOutboxOnConnect(remotePeer);
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Opportunistic message-outbox retry on connect failed for ${remotePeer}: ${message}`);
+        }
+      })();
 
       const now = Date.now();
       const last = this.catchupOnConnectAt.get(remotePeer) ?? 0;

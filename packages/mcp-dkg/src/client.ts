@@ -108,11 +108,17 @@ export interface PeerInfo {
     lastSeen: number | null;
     lastChecked: number;
   } | null;
-  // Legacy flat fields kept for back-compat.
+  // Flat per-connection projections of `connections[]`. `remoteAddrs`
+  // entries are `string | null` — `null` when libp2p didn't expose a
+  // multiaddr for that connection (see `PeerConnectionSnapshot.remoteAddr`
+  // in `packages/agent/src/dkg-agent.ts`). User review on PR #533
+  // flagged that the original `string[]` typing was a false contract:
+  // TypeScript consumers could treat every entry as a `string` even
+  // though the runtime JSON can contain `null`.
   connectionCount: number;
   transports: Array<'direct' | 'relayed'>;
   directions: Array<'inbound' | 'outbound'>;
-  remoteAddrs: string[];
+  remoteAddrs: Array<string | null>;
 }
 
 export class DkgHttpError extends Error {

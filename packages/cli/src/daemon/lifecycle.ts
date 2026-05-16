@@ -675,17 +675,34 @@ export async function runDaemonInner(
   );
 
   let chatDb: DashboardDB | null = null;
-  agent.onChat((text, senderPeerId, _convId, senderContextGraphId, verifiedContextGraphId) => {
+  agent.onChat((text, senderPeerId, _convId, senderContextGraphId, verifiedContextGraphId, messageId) => {
     if (chatDb) {
+      // `messageId` is forwarded from the encrypted payload (V11+
+      // senders). `insertChatMessage` uses it as the dedup key against
+      // the `idx_chat_msgid` partial unique index — same logical
+      // message arriving twice on parallel transport paths (the
+      // seq=13 class from the May 2026 soak postmortem) gets silently
+      // dropped on the second insert. Returns `false` in the deduped
+      // case so we can also skip the per-message notification spam
+      // for duplicates.
+      let inserted = false;
       try {
-        chatDb.insertChatMessage({
+        inserted = chatDb.insertChatMessage({
           ts: Date.now(),
           direction: "in",
           peer: senderPeerId,
           text,
+          messageId,
         });
       } catch {
         /* never crash */
+      }
+      // A duplicate that the dedup index dropped should not trigger a
+      // second notification — the operator already saw the first one.
+      if (!inserted) {
+        const cgTag = verifiedContextGraphId ? ` cg=${shortId(verifiedContextGraphId)}` : '';
+        log(`CHAT IN  [${shortId(senderPeerId)}]${cgTag} (deduped): ${text}`);
+        return;
       }
       try {
         // Display the CG ONLY when the ACL has positively verified the

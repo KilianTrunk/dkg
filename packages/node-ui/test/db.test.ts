@@ -86,7 +86,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(10);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(11);
 
     const cols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -623,5 +623,181 @@ describe('DashboardDB.getChatMessages — chat inbox semantics', () => {
       expect(typeof r.id).toBe('number');
       expect(r.id).toBeGreaterThan(0);
     }
+  });
+});
+
+// Receiver-side dedup by `message_id` — addresses the seq=13 duplicate
+// class from the May 2026 Miles↔Lex 6h soak postmortem (same encrypted
+// payload arrived on Miles's side twice ~1s apart and both rows were
+// stored because there was no idempotency key). V11 adds the partial
+// unique index `idx_chat_msgid ON (peer, message_id) WHERE message_id
+// IS NOT NULL`, and `insertChatMessage` switches to `INSERT OR IGNORE`.
+describe('DashboardDB.insertChatMessage — V11 receiver-side dedup', () => {
+  it('returns true on first insert with a messageId', () => {
+    const inserted = db.insertChatMessage({
+      ts: 1000,
+      direction: 'in',
+      peer: 'alice',
+      text: 'first',
+      messageId: 'msg-1',
+    });
+    expect(inserted).toBe(true);
+    expect(db.getChatMessages({ peer: 'alice' })).toHaveLength(1);
+  });
+
+  it('returns false and drops the row on duplicate (peer, messageId)', () => {
+    db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'first', messageId: 'msg-1' });
+    // Same peer + same messageId — receiver-side dedup must drop this.
+    // The dropped insert may carry different `ts` / `text` (e.g. an
+    // application-level retry that mutated the timestamp): the index
+    // still recognises it as the same logical message because dedup
+    // keys off `(peer, message_id)` only.
+    const inserted = db.insertChatMessage({
+      ts: 1500,
+      direction: 'in',
+      peer: 'alice',
+      text: 'first-but-different-text',
+      messageId: 'msg-1',
+    });
+    expect(inserted).toBe(false);
+    const rows = db.getChatMessages({ peer: 'alice' });
+    expect(rows).toHaveLength(1);
+    // Original row is the survivor — partial-unique-index INSERT OR
+    // IGNORE drops the second insert before any column is overwritten.
+    expect(rows[0].text).toBe('first');
+    expect(rows[0].ts).toBe(1000);
+  });
+
+  it('different messageIds from the same peer are NOT deduped', () => {
+    db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'a', messageId: 'msg-1' });
+    db.insertChatMessage({ ts: 2000, direction: 'in', peer: 'alice', text: 'b', messageId: 'msg-2' });
+    expect(db.getChatMessages({ peer: 'alice' })).toHaveLength(2);
+  });
+
+  // Per-sender keying — the index is `(peer, message_id)`, not just
+  // `message_id`. Two different senders that happen to pick the same
+  // UUID must NOT collide. Vanishingly unlikely with v4 UUIDs, but
+  // (a) the trust model can't assume a sender picks unique ids, and
+  // (b) any future migration to a smaller id space would make the
+  // collision real.
+  it('same messageId from DIFFERENT peers is NOT deduped (per-sender keying)', () => {
+    db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'from-alice', messageId: 'shared-uuid' });
+    const insertedBob = db.insertChatMessage({
+      ts: 1000,
+      direction: 'in',
+      peer: 'bob',
+      text: 'from-bob',
+      messageId: 'shared-uuid',
+    });
+    expect(insertedBob).toBe(true);
+    expect(db.getChatMessages({ peer: 'alice' })).toHaveLength(1);
+    expect(db.getChatMessages({ peer: 'bob' })).toHaveLength(1);
+  });
+
+  // Pre-V11 senders + future senders that intentionally omit the id
+  // must remain insertable repeatedly. The partial-unique-index
+  // predicate `WHERE message_id IS NOT NULL` ensures null-id rows
+  // sit outside the constraint.
+  it('messageId=null rows are never deduped (legacy + opt-out path)', () => {
+    db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'legacy-a' });
+    db.insertChatMessage({ ts: 2000, direction: 'in', peer: 'alice', text: 'legacy-b' });
+    db.insertChatMessage({ ts: 3000, direction: 'in', peer: 'alice', text: 'legacy-c', messageId: null });
+    const rows = db.getChatMessages({ peer: 'alice' });
+    expect(rows).toHaveLength(3);
+    expect(rows.every((r) => r.message_id === null)).toBe(true);
+  });
+
+  it('persists messageId on the row for `getChatMessages` readers', () => {
+    db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'tracked', messageId: 'mid-XYZ' });
+    const [row] = db.getChatMessages({ peer: 'alice' });
+    expect(row.message_id).toBe('mid-XYZ');
+  });
+
+  // The dedup index does NOT include `direction`, so a second insert
+  // with the same `(peer, messageId)` is dropped regardless of which
+  // side wrote it. The current code paths only INSERT outbound rows
+  // once (via `/api/chat`; retries reuse the row by design — they
+  // don't re-INSERT). This test pins the defensive semantic so any
+  // future code path that DOES re-INSERT — accidentally or as part
+  // of a UPSERT-replacement refactor — gets the receiver-side dedup
+  // applied symmetrically.
+  it('dedup applies symmetrically to outbound rows (defensive — no current path re-INSERTs but the index does not gate on direction)', () => {
+    const firstAttempt = db.insertChatMessage({
+      ts: 1000,
+      direction: 'out',
+      peer: 'alice',
+      text: 'hello',
+      delivered: false,
+      messageId: 'out-msg-1',
+    });
+    expect(firstAttempt).toBe(true);
+    const replay = db.insertChatMessage({
+      ts: 2000,
+      direction: 'out',
+      peer: 'alice',
+      text: 'hello',
+      delivered: true,
+      messageId: 'out-msg-1',
+    });
+    expect(replay).toBe(false);
+    const rows = db.getChatMessages({ peer: 'alice', direction: 'out' });
+    expect(rows).toHaveLength(1);
+  });
+});
+
+// Regression coverage for the V11 schema migration itself — analogous to
+// the V10 metric_snapshots upgrade test above. Strategy: take the freshly
+// created V11 db (full schema), simulate a pre-V11 baseline by dropping
+// the `message_id` column AND the `idx_chat_msgid` index AND resetting
+// `user_version` to 10, then reopen via DashboardDB and verify the
+// upgrade restores both schema artefacts and that the dedup semantic
+// kicks in on subsequent inserts.
+describe('DashboardDB — V11 schema migration', () => {
+  it('upgrades a pre-V11 chat_messages table by adding `message_id` + the partial unique index', () => {
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    // Simulate pre-V11 state on disk.
+    const raw = new Database(dbPath);
+    raw.exec('DROP INDEX IF EXISTS idx_chat_msgid;');
+    raw.exec('ALTER TABLE chat_messages DROP COLUMN message_id;');
+    // Seed a pre-V11 row that has no message_id by definition. After
+    // the upgrade this row must still be addressable AND must not
+    // block future inserts (the partial index excludes NULL rows).
+    // `ts` must be within the DashboardDB retention window (default
+    // 14d) or the constructor's prune-on-open will sweep it before
+    // the test can read it back.
+    const preV11Ts = Date.now() - 60_000;
+    raw.prepare(
+      `INSERT INTO chat_messages (ts, direction, peer, text) VALUES (?, ?, ?, ?)`,
+    ).run(preV11Ts, 'in', 'alice', 'pre-v11-row');
+    raw.pragma('user_version = 10');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.db.pragma('user_version', { simple: true })).toBe(11);
+
+    const cols = (db.db.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols).toContain('message_id');
+
+    const indexes = (db.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='chat_messages'").all() as Array<{ name: string }>)
+      .map((i) => i.name);
+    expect(indexes).toContain('idx_chat_msgid');
+
+    // Pre-V11 row survives the migration with a NULL message_id.
+    const pre = db.getChatMessages({ peer: 'alice' });
+    expect(pre).toHaveLength(1);
+    expect(pre[0].text).toBe('pre-v11-row');
+    expect(pre[0].message_id).toBeNull();
+
+    // V11 semantics kick in for new inserts.
+    expect(
+      db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'v11-a', messageId: 'm1' }),
+    ).toBe(true);
+    expect(
+      db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'v11-a-dup', messageId: 'm1' }),
+    ).toBe(false);
+    expect(db.getChatMessages({ peer: 'alice' })).toHaveLength(2);
   });
 });

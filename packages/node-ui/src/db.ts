@@ -349,12 +349,6 @@ export class DashboardDB {
       if (!chatCols.has('message_id')) {
         this.db.exec(`ALTER TABLE chat_messages ADD COLUMN message_id TEXT;`);
       }
-      // The Codex-flagged index shape regression matters for any DB
-      // that was created on an earlier draft of this PR — the index
-      // there was `(peer, message_id)`. Drop the old shape (if any)
-      // before re-creating with the per-direction shape, so a
-      // pre-merge V11 db gets the correct constraint on next open.
-      this.db.exec(`DROP INDEX IF EXISTS idx_chat_msgid;`);
       this.db.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_msgid
           ON chat_messages(peer, direction, message_id)

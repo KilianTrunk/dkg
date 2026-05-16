@@ -823,11 +823,6 @@ describe('DashboardDB — V11 schema migration', () => {
       .map((i) => i.name);
     expect(indexes).toContain('idx_chat_msgid');
 
-    // Index shape: the V11 migration must produce the per-direction
-    // index even when upgrading from a draft of this PR that landed
-    // the original `(peer, message_id)` shape. The migration block
-    // does `DROP INDEX IF EXISTS idx_chat_msgid` before
-    // `CREATE UNIQUE INDEX` for exactly that case.
     const idxSql = (db.db
       .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_chat_msgid'")
       .get() as { sql: string }).sql;
@@ -848,41 +843,5 @@ describe('DashboardDB — V11 schema migration', () => {
       db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'v11-a-dup', messageId: 'm1' }),
     ).toBe(false);
     expect(db.getChatMessages({ peer: 'alice' })).toHaveLength(2);
-  });
-
-  // Codex review of PR #534: if an early draft of this PR landed in
-  // CI / dogfood envs with the original `(peer, message_id)` index
-  // shape (before per-direction was added), re-opening that DB on
-  // the merged code must rebuild the index with the correct shape.
-  // The migration block does `DROP INDEX IF EXISTS idx_chat_msgid`
-  // before `CREATE UNIQUE INDEX` for exactly this reason. Lock it.
-  it('rebuilds idx_chat_msgid when upgrading from a pre-direction draft of V11', () => {
-    const dbPath = join(dir, 'node-ui.db');
-    db.close();
-
-    const raw = new Database(dbPath);
-    // Simulate "draft V11" state on disk: column present, OLD index
-    // shape (no `direction`). `user_version` stays at 11 since the
-    // draft would have bumped it.
-    raw.exec('DROP INDEX IF EXISTS idx_chat_msgid;');
-    raw.exec(
-      'CREATE UNIQUE INDEX idx_chat_msgid ON chat_messages(peer, message_id) WHERE message_id IS NOT NULL;',
-    );
-    raw.pragma('user_version = 10');
-    raw.close();
-
-    db = new DashboardDB({ dataDir: dir });
-    const idxSql = (db.db
-      .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_chat_msgid'")
-      .get() as { sql: string }).sql;
-    expect(idxSql).toMatch(/\bdirection\b/);
-
-    // And the per-direction semantic actually fires.
-    expect(
-      db.insertChatMessage({ ts: 1000, direction: 'out', peer: 'alice', text: 'O', messageId: 'X' }),
-    ).toBe(true);
-    expect(
-      db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'I', messageId: 'X' }),
-    ).toBe(true);
   });
 });

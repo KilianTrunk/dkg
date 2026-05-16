@@ -49,6 +49,66 @@ export interface DkgClientOptions {
   fetcher?: typeof fetch;
 }
 
+/**
+ * Per-peer diagnostic snapshot returned by `GET /api/peer-info`. Shape
+ * mirrors the daemon-side `PeerDiagnostics` interface plus the legacy
+ * flat fields kept for back-compat with pre-diagnostic callers (the
+ * Node UI's connectivity panel was the only known consumer when this
+ * was introduced).
+ */
+export interface PeerInfo {
+  peerId: string;
+  connected: boolean;
+  /**
+   * Number of open connections to this peer found by walking
+   * `libp2p.getConnections()` and filtering by peerId — the legacy
+   * count.
+   */
+  rawConnectionCount: number;
+  /**
+   * Number of connections returned by libp2p's peerId-keyed lookup
+   * `libp2p.getConnections(peerId)`. When this diverges from
+   * `rawConnectionCount` on an otherwise open peer, libp2p is
+   * filtering out connections the raw walk can see — the Window D
+   * signature documented in the May 2026 soak postmortem.
+   */
+  getConnectionsReturnsForPeer: number;
+  connections: Array<{
+    direction: 'inbound' | 'outbound';
+    transport: 'direct' | 'relayed';
+    remoteAddr: string;
+    limited: boolean;
+    streams: number;
+    openedAt: number | null;
+  }>;
+  peerStore: {
+    knownMultiaddrCount: number;
+    multiaddrs: string[];
+    protocols: string[];
+  } | null;
+  outbox: {
+    pendingCount: number;
+    oldestFirstFailureAt: number | null;
+    attempts: number[];
+  };
+  protocols: string[];
+  syncCapable: boolean;
+  lastSeen: number | null;
+  latencyMs: number | null;
+  health: {
+    peerId: string;
+    alive: boolean;
+    latencyMs: number | null;
+    lastSeen: number | null;
+    lastChecked: number;
+  } | null;
+  // Legacy flat fields kept for back-compat.
+  connectionCount: number;
+  transports: Array<'direct' | 'relayed'>;
+  directions: Array<'inbound' | 'outbound'>;
+  remoteAddrs: string[];
+}
+
 export class DkgHttpError extends Error {
   readonly status: number;
   readonly body: unknown;
@@ -619,6 +679,19 @@ export class DkgClient {
    */
   async getStatus(): Promise<Record<string, unknown>> {
     return this.request('GET', '/api/status');
+  }
+
+  /**
+   * Per-peer diagnostic snapshot. Wraps `GET /api/peer-info?peerId=...`
+   * which surfaces the full {@link PeerInfo} structure (open connections
+   * with direction + transport + limited flag, peerStore contents,
+   * outbox state, and the critical `getConnectionsReturnsForPeer`
+   * discrepancy field that lets operators detect the Window D class of
+   * libp2p asymmetric reachability bugs at a glance).
+   */
+  async getPeerInfo(peerId: string): Promise<PeerInfo> {
+    const qs = `?peerId=${encodeURIComponent(peerId)}`;
+    return this.request('GET', `/api/peer-info${qs}`);
   }
 
   /**

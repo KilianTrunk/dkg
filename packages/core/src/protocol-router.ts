@@ -200,8 +200,45 @@ export class ProtocolRouter {
         // through to the dialProtocol path below WITHIN THE SAME
         // ATTEMPT, so we don't waste a retry slot on the fast-path
         // miss.
+        // CRITICAL: feed the fast path from a RAW `getConnections()`
+        // walk filtered by `remotePeer`, NOT from the peerId-keyed
+        // `libp2p.getConnections(peerId)` lookup.
+        //
+        // The PR #533 diagnostic surface (`PeerDiagnostics`) is
+        // explicitly built around the divergence
+        // `rawConnectionCount > getConnectionsReturnsForPeer` as the
+        // smoking-gun Window D signature: libp2p's peerId-keyed
+        // lookup can return `[]` even when a raw walk over all
+        // connections shows one or more open connections whose
+        // `remotePeer` matches the target peerId. Using the keyed
+        // lookup here would make the fast path miss the EXACT case
+        // it was built to heal — `tryReuseExistingConnection` would
+        // get an empty candidate list, fall through to the resolver
+        // + dialProtocol path, and still fail with "no valid
+        // addresses for peer". Walk raw, filter ourselves, and
+        // accept that we pay the O(N) cost over the whole
+        // connection table per send — N is the total open-conn
+        // count of the node, typically <100, so the cost is a few
+        // microseconds and the correctness win is large.
         const fastStream = await tryReuseExistingConnection(
-          () => libp2p.getConnections(peerId) as ReadonlyArray<ReusableConnection>,
+          () => {
+            try {
+              const all = libp2p.getConnections() as ReadonlyArray<
+                ReusableConnection & {
+                  remotePeer?: { equals?: (other: unknown) => boolean };
+                }
+              >;
+              return all.filter((c) => {
+                try {
+                  return c.remotePeer?.equals?.(peerId) === true;
+                } catch {
+                  return false;
+                }
+              });
+            } catch {
+              return [];
+            }
+          },
           protocolId,
           signal,
           {

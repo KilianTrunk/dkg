@@ -194,6 +194,15 @@ describe('ProtocolRouter', () => {
         // for it to gate the peerStore-direct-addrs probe (PR #537
         // CI fix; see protocol-router.ts JSDoc).
         limits?: unknown;
+        // `remotePeer` is what the fast path's raw `getConnections()`
+        // walk filters on (the per-user-review fix to PR #537:
+        // peerId-keyed lookup would silently miss the Window D
+        // shape because libp2p's keyed lookup can return [] even
+        // when raw walk shows live connections that match the
+        // peerId). Default below stamps FAKE_PEER_ID so connections
+        // pass the filter; tests that want a non-matching
+        // `remotePeer` can override.
+        remotePeer?: { equals: (other: unknown) => boolean; toString: () => string };
         newStream: (
           protocols: string,
           options?: { runOnLimitedConnection?: boolean; signal?: AbortSignal },
@@ -215,11 +224,19 @@ describe('ProtocolRouter', () => {
         (async () => {
           throw new Error('NotFound');
         });
+      const stampedConnections = opts.connections.map((c) => ({
+        ...c,
+        remotePeer:
+          c.remotePeer ?? {
+            equals: (other: unknown) => String(other) === FAKE_PEER_ID,
+            toString: () => FAKE_PEER_ID,
+          },
+      }));
       const node = {
         libp2p: {
           getConnections: () => {
             opts.onGetConnections?.();
-            return opts.connections;
+            return stampedConnections;
           },
           dialProtocol: opts.dialBehavior,
           handle: () => undefined,
@@ -570,6 +587,62 @@ describe('ProtocolRouter', () => {
       // if no connection existed. Anything else risks turning a
       // diagnostic-only assist into a real availability regression.
       expect(dialCalls).toBe(1);
+    });
+
+    // User review on PR #537: the fast path MUST walk
+    // `getConnections()` (raw, no peerId arg) and filter by
+    // `remotePeer.equals(peerId)` ourselves, NOT call the
+    // peerId-keyed `getConnections(peerId)` overload. The Window D
+    // signature (`rawConnectionCount > getConnectionsReturnsForPeer`
+    // in `PeerDiagnostics`) is libp2p's keyed lookup returning `[]`
+    // for a peer whose live connection is still present in the raw
+    // walk. Using the keyed lookup here would make the fast path
+    // miss the exact case it was built to heal. Pin the raw-walk
+    // behavior with a stub whose keyed-lookup overload returns []
+    // but whose no-arg overload returns a usable inbound limited
+    // connection.
+    it('walks raw getConnections() — finds candidates when keyed lookup returns [] (Window D shape)', async () => {
+      let newStreamCalls = 0;
+      let dialCalls = 0;
+      // Build a custom node where `libp2p.getConnections(arg)`
+      // returns [] for the peerId-keyed overload but
+      // `libp2p.getConnections()` (no arg) returns the live
+      // inbound limited connection — exactly the Window D shape
+      // PR #533's `getConnectionsReturnsForPeer` diagnostic
+      // surfaces as `0` against a positive `rawConnectionCount`.
+      const liveConn = {
+        status: 'open' as const,
+        limits: { bytes: 1024 * 1024 },
+        remotePeer: {
+          equals: (other: unknown) => String(other) === FAKE_PEER_ID,
+          toString: () => FAKE_PEER_ID,
+        },
+        newStream: async () => {
+          newStreamCalls += 1;
+          return makeStubStream(new Uint8Array([0x99])) as any;
+        },
+      };
+      const node = {
+        libp2p: {
+          getConnections: (arg?: unknown) => (arg == null ? [liveConn] : []),
+          dialProtocol: async () => {
+            dialCalls += 1;
+            throw new Error('dialProtocol must not be called — fast path must heal Window D');
+          },
+          handle: () => undefined,
+          unhandle: () => undefined,
+          peerStore: { get: async () => { throw new Error('NotFound'); } },
+        },
+      } as unknown as DKGNode;
+      const peerResolver = {
+        resolve: async () => [],
+      } as unknown as PeerResolver;
+      const router = new ProtocolRouter(node, { peerResolver });
+
+      const out = await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]));
+      expect(out).toEqual(new Uint8Array([0x99]));
+      expect(newStreamCalls).toBe(1);
+      expect(dialCalls).toBe(0);
     });
   });
 });

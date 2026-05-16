@@ -172,7 +172,41 @@ export class ProtocolRouter {
         // Codex review feedback on PR #497: pass the same AbortSignal +
         // remaining time budget to the resolver so a caller's
         // `timeoutMs` bounds the entire send (resolver + dial + read).
-        if (this.peerResolver) {
+        // First try the existing-connection fast path: if we already
+        // have at least one open connection to this peer (of ANY
+        // direction, direct OR circuit-relay-limited), open the new
+        // stream on that connection directly via `newStream` instead
+        // of going through `dialProtocol`. This sidesteps the entire
+        // address-resolution + peerStore lookup path that returns
+        // "no valid addresses for peer" when libp2p's peerStore is
+        // empty or stale for the peer — the "Window D" failure class
+        // identified in the May 2026 Miles↔Lex 6h soak postmortem,
+        // where 31 inbound circuit `connection:open` events from peer
+        // P over 4 minutes failed to heal any of 20 opportunistic
+        // outbound flushes because each one went through dialProtocol
+        // and lost the peerStore race.
+        //
+        // Crucially: when peerStore is empty for P (the Window D
+        // shape), the connection-manager-auto-dial side effect of
+        // `peerStore.merge` documented at
+        // docs/archive/UPSTREAM_ISSUE_DRAFT.md does NOT fire — there
+        // are no direct addresses to upgrade to. So this fast path
+        // does not introduce the mid-stream-negotiation race the doc
+        // warns about; it benefits exactly the case where the doc's
+        // race cannot apply.
+        //
+        // Failure here (connection died between `getConnections` and
+        // `newStream`, peer dropped protocol support, etc.) falls
+        // through to the dialProtocol path below WITHIN THE SAME
+        // ATTEMPT, so we don't waste a retry slot on the fast-path
+        // miss.
+        const fastStream = await tryReuseExistingConnection(
+          () => libp2p.getConnections(peerId) as ReadonlyArray<ReusableConnection>,
+          protocolId,
+          signal,
+        );
+
+        if (this.peerResolver && !fastStream) {
           const remaining = Math.max(0, timeoutMs - (Date.now() - startedAt));
           await this.peerResolver
             .resolve(peerIdStr, { signal, perStepTimeoutMs: remaining })
@@ -180,10 +214,12 @@ export class ProtocolRouter {
         }
 
         const dialStartedAt = Date.now();
-        const stream = await libp2p.dialProtocol(peerId, protocolId, {
-          runOnLimitedConnection: true,
-          signal,
-        });
+        const stream =
+          fastStream ??
+          (await libp2p.dialProtocol(peerId, protocolId, {
+            runOnLimitedConnection: true,
+            signal,
+          }));
         const dialDurationMs = Date.now() - dialStartedAt;
 
         if (stream.writeStatus === 'closed' || stream.writeStatus === 'closing') {
@@ -213,6 +249,91 @@ export class ProtocolRouter {
     }
     throw lastErr;
   }
+}
+
+/**
+ * "Window D" workaround — attempts to open `protocolId` on an EXISTING
+ * open connection to `peerId` before paying the address-resolution +
+ * `dialProtocol` cost. Returns the stream on success, `null` on any
+ * failure (no live connection, `newStream` rejects, stream comes back
+ * dead) so the caller can fall through to the dialProtocol path
+ * within the same retry attempt.
+ *
+ * Why a free function and not a method on `ProtocolRouter`:
+ *  - Stateless: every input comes from the call site.
+ *  - Easier to unit-test in isolation (no `ProtocolRouter` mock setup).
+ *  - Keeps the dial-reuse logic adjacent to the hot path in `send()`
+ *    so a reader scrolling the file sees the bypass and the fallback
+ *    in the same screen.
+ *
+ * Connection selection: we DELIBERATELY accept the first open
+ * connection regardless of direction or transport (`direct` /
+ * `relayed` / `limited`). Reasoning:
+ *  - Direct connections are always the best choice.
+ *  - Limited (circuit-relay-v2) connections are explicitly allowed
+ *    via `runOnLimitedConnection: true` here — same flag the
+ *    existing `dialProtocol` call uses below — so a limited
+ *    connection is a valid stream-carrier for our protocols.
+ *  - Filtering "best-first" would add bookkeeping for ~no benefit:
+ *    libp2p's `getConnections(peerId)` already orders the returned
+ *    list with the most-recently-opened connections first, which
+ *    in practice IS the freshest path.
+ */
+interface ReusableConnection {
+  status?: string;
+  newStream: (
+    protocols: string,
+    options?: { runOnLimitedConnection?: boolean; signal?: AbortSignal },
+  ) => Promise<Stream>;
+}
+
+// Minimal shape we depend on from libp2p — the real `Libp2p` type
+// is much richer but using a structural subset lets the unit test
+// pass a fake without re-exporting full libp2p internals. Connection
+// retrieval is wrapped behind a thunk so the structural type doesn't
+// have to mirror libp2p's `getConnections(PeerId)` signature exactly
+// (PeerId itself has dozens of methods we don't need).
+export async function tryReuseExistingConnection(
+  getConnections: () => ReadonlyArray<ReusableConnection>,
+  protocolId: string,
+  signal: AbortSignal,
+): Promise<Stream | null> {
+  let candidates: ReadonlyArray<ReusableConnection> = [];
+  try {
+    candidates = getConnections();
+  } catch {
+    return null;
+  }
+
+  for (const conn of candidates) {
+    if (conn.status && conn.status !== 'open') continue;
+    try {
+      const s = await conn.newStream(protocolId, {
+        runOnLimitedConnection: true,
+        signal,
+      });
+      if (s.writeStatus === 'closed' || s.writeStatus === 'closing') {
+        // The known mid-stream-negotiation race
+        // (docs/archive/UPSTREAM_ISSUE_DRAFT.md): newStream came
+        // back already-dead because peerStore.merge triggered the
+        // connection manager to prune our connection. Abort the
+        // dead stream and fall through to dialProtocol — the
+        // outer retry loop will then re-resolve and try again.
+        s.abort(new Error('reused stream returned in closed state'));
+        return null;
+      }
+      return s;
+    } catch {
+      // Try the next candidate connection (if any), then fall
+      // through to dialProtocol on overall miss. Swallowing here is
+      // safe — every error class that's actually fatal to the send
+      // (transport down, peer gone) will surface again on
+      // dialProtocol, which has the full address-resolution +
+      // backoff path to handle it correctly.
+      continue;
+    }
+  }
+  return null;
 }
 
 async function readAll(

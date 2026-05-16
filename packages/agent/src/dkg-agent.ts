@@ -603,7 +603,16 @@ export interface PeerConnectionSnapshot {
   direction: 'inbound' | 'outbound';
   /** `'relayed'` when the remote multiaddr includes `/p2p-circuit`, else `'direct'`. */
   transport: 'direct' | 'relayed';
-  remoteAddr: string;
+  /**
+   * The connection's remote multiaddr as a string, or `null` when
+   * libp2p didn't expose one. Preserving the `null` (rather than
+   * defaulting to `''`) keeps the legacy `/api/peer-info`
+   * `remoteAddrs` contract intact for callers that distinguish
+   * "address unavailable" from a real multiaddr — Codex review of
+   * PR #533 flagged the prior empty-string default as a silent
+   * response-shape change.
+   */
+  remoteAddr: string | null;
   /**
    * `true` when libp2p marks the connection as limited (circuit-relay v2
    * data-limit + duration-limit semantics). Limited connections can be
@@ -12828,9 +12837,32 @@ export class DKGAgent {
 
     let rawConns: LibConnection[] = [];
     try {
-      rawConns = libp2p
-        .getConnections()
-        .filter((c: LibConnection) => c.remotePeer.equals(pid!));
+      // Codex review of PR #533 flagged the original
+      // `c.remotePeer.equals(pid)` filter: when `remotePeer` only
+      // exposes `toString()` (the comparison this repo used before
+      // PR #533), `.equals` is undefined and the call throws,
+      // collapsing the entire snapshot to `rawConnectionCount=0` via
+      // the outer try/catch. The legacy `/api/peer-info` route used
+      // string comparison for exactly that reason. Try `.equals`
+      // first (matches the libp2p contract when available, handles
+      // multihash variants correctly) and fall back to a stringified
+      // compare when `.equals` is missing so a future PeerId shape
+      // change can't silently zero the diagnostic.
+      const pidStr = peerId;
+      rawConns = libp2p.getConnections().filter((c: LibConnection) => {
+        const rp = c.remotePeer as unknown as {
+          equals?: (other: unknown) => boolean;
+          toString(): string;
+        };
+        if (typeof rp.equals === 'function') {
+          try {
+            return rp.equals(pid);
+          } catch {
+            return rp.toString() === pidStr;
+          }
+        }
+        return rp.toString() === pidStr;
+      });
     } catch {
       rawConns = [];
     }
@@ -12845,10 +12877,10 @@ export class DKGAgent {
     }
 
     const connections: PeerConnectionSnapshot[] = rawConns.map((c) => {
-      const remoteAddr = c.remoteAddr?.toString() ?? '';
+      const remoteAddr = c.remoteAddr?.toString() ?? null;
       return {
         direction: c.direction,
-        transport: remoteAddr.includes('/p2p-circuit') ? 'relayed' : 'direct',
+        transport: remoteAddr?.includes('/p2p-circuit') ? 'relayed' : 'direct',
         remoteAddr,
         // libp2p marks limited circuit-relay connections via
         // `connection.limits` (presence ⇒ limited). Defensive cast

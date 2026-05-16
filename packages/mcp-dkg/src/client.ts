@@ -76,7 +76,13 @@ export interface PeerInfo {
   connections: Array<{
     direction: 'inbound' | 'outbound';
     transport: 'direct' | 'relayed';
-    remoteAddr: string;
+    /**
+     * `null` when libp2p didn't expose a remote multiaddr — see the
+     * `PeerConnectionSnapshot.remoteAddr` JSDoc in
+     * `packages/agent/src/dkg-agent.ts` and the Codex review
+     * feedback on PR #533.
+     */
+    remoteAddr: string | null;
     limited: boolean;
     streams: number;
     openedAt: number | null;

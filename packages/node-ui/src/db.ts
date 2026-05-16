@@ -321,11 +321,22 @@ export class DashboardDB {
       // the partial unique index that powers `INSERT OR IGNORE` dedup
       // semantics in `insertChatMessage`.
       //
-      // The index is keyed by `(peer, message_id)`:
+      // The index is keyed by `(peer, direction, message_id)`:
+      //   - Per-direction keying — Codex review of PR #534 flagged
+      //     that omitting `direction` lets an outbound row collide
+      //     with a legitimate inbound row carrying the same
+      //     `messageId` from the same peer. Negligible probability
+      //     with v4 UUIDs but real for any future caller that
+      //     supplies its own deterministic ids (the MCP layer, an
+      //     external bridge, etc.) — and the failure mode would be
+      //     a SILENTLY dropped inbound message, which is exactly the
+      //     class this PR is trying to close. Including `direction`
+      //     makes inbound + outbound dedup live in independent
+      //     namespaces.
       //   - Per-sender keying — two different senders that happen to
-      //     pick the same UUID (vanishingly unlikely with v4 UUIDs but
-      //     non-zero in theory, and any future migration to a smaller
-      //     id space would make it real) must not collide on us.
+      //     pick the same UUID (vanishingly unlikely with v4 UUIDs
+      //     but non-zero in theory, and any future migration to a
+      //     smaller id space would make it real) must not collide.
       //   - Predicate `WHERE message_id IS NOT NULL` keeps the legacy
       //     null-id rows (pre-V11 messages, plus any future sender
       //     that omits the field) outside the uniqueness constraint
@@ -338,9 +349,15 @@ export class DashboardDB {
       if (!chatCols.has('message_id')) {
         this.db.exec(`ALTER TABLE chat_messages ADD COLUMN message_id TEXT;`);
       }
+      // The Codex-flagged index shape regression matters for any DB
+      // that was created on an earlier draft of this PR — the index
+      // there was `(peer, message_id)`. Drop the old shape (if any)
+      // before re-creating with the per-direction shape, so a
+      // pre-merge V11 db gets the correct constraint on next open.
+      this.db.exec(`DROP INDEX IF EXISTS idx_chat_msgid;`);
       this.db.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_msgid
-          ON chat_messages(peer, message_id)
+          ON chat_messages(peer, direction, message_id)
           WHERE message_id IS NOT NULL;
       `);
     }

@@ -678,28 +678,44 @@ export async function runDaemonInner(
   agent.onChat((text, senderPeerId, _convId, senderContextGraphId, verifiedContextGraphId, messageId) => {
     if (chatDb) {
       // `messageId` is forwarded from the encrypted payload (V11+
-      // senders). `insertChatMessage` uses it as the dedup key against
-      // the `idx_chat_msgid` partial unique index — same logical
-      // message arriving twice on parallel transport paths (the
-      // seq=13 class from the May 2026 soak postmortem) gets silently
-      // dropped on the second insert. Returns `false` in the deduped
-      // case so we can also skip the per-message notification spam
-      // for duplicates.
-      let inserted = false;
+      // senders). `insertChatMessage` uses it as the dedup key
+      // against the `idx_chat_msgid` partial unique index — same
+      // logical message arriving twice on parallel transport paths
+      // (the seq=13 class from the May 2026 soak postmortem) gets
+      // silently dropped on the second insert. We distinguish three
+      // outcomes:
+      //   - `'stored'`  — fresh row written, notify + log normally.
+      //   - `'deduped'` — `INSERT OR IGNORE` dropped a duplicate row,
+      //                   skip notification (operator already saw the
+      //                   first one) but log a `(deduped)` line for
+      //                   visibility.
+      //   - `'failed'`  — `insertChatMessage` threw. The earlier shape
+      //                   of this block conflated this with `'deduped'`
+      //                   via a shared `inserted = false` sentinel,
+      //                   silently swallowing the operator notification
+      //                   for a brand-new message whenever the DB
+      //                   write failed. Codex review of PR #534
+      //                   flagged this — fix is to keep notifications
+      //                   firing on DB failure so the operator can
+      //                   still see + reply.
+      let writeOutcome: 'stored' | 'deduped' | 'failed' = 'failed';
       try {
-        inserted = chatDb.insertChatMessage({
+        const inserted = chatDb.insertChatMessage({
           ts: Date.now(),
           direction: "in",
           peer: senderPeerId,
           text,
           messageId,
         });
-      } catch {
-        /* never crash */
+        writeOutcome = inserted ? 'stored' : 'deduped';
+      } catch (err) {
+        log(
+          `CHAT IN  [${shortId(senderPeerId)}] chat_messages persistence failed (notification still firing): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
       }
-      // A duplicate that the dedup index dropped should not trigger a
-      // second notification — the operator already saw the first one.
-      if (!inserted) {
+      if (writeOutcome === 'deduped') {
         const cgTag = verifiedContextGraphId ? ` cg=${shortId(verifiedContextGraphId)}` : '';
         log(`CHAT IN  [${shortId(senderPeerId)}]${cgTag} (deduped): ${text}`);
         return;

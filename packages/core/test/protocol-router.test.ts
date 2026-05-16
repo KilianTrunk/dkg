@@ -190,6 +190,10 @@ describe('ProtocolRouter', () => {
     function makeRouterWithFastPath(opts: {
       connections: Array<{
         status?: string;
+        // Limited (circuit-relay-v2) marker — the fast path checks
+        // for it to gate the peerStore-direct-addrs probe (PR #537
+        // CI fix; see protocol-router.ts JSDoc).
+        limits?: unknown;
         newStream: (
           protocols: string,
           options?: { runOnLimitedConnection?: boolean; signal?: AbortSignal },
@@ -198,7 +202,19 @@ describe('ProtocolRouter', () => {
       dialBehavior: () => Promise<unknown>;
       onResolve?: () => void;
       onGetConnections?: () => void;
+      // Default: peerStore.get throws (Window D cold-cache shape).
+      // Tests that exercise the DCUtR-upgrade skip-limited path
+      // override with a populated peer that includes a non-circuit
+      // address (or include `/p2p-circuit` only to assert we still
+      // fast-path through limited when peerStore has ONLY relay
+      // addresses).
+      peerStoreGet?: (pid: unknown) => Promise<{ addresses: Array<{ multiaddr: { toString: () => string } }> }>;
     }): ProtocolRouter {
+      const peerStoreGet =
+        opts.peerStoreGet ??
+        (async () => {
+          throw new Error('NotFound');
+        });
       const node = {
         libp2p: {
           getConnections: () => {
@@ -208,6 +224,7 @@ describe('ProtocolRouter', () => {
           dialProtocol: opts.dialBehavior,
           handle: () => undefined,
           unhandle: () => undefined,
+          peerStore: { get: peerStoreGet },
         },
       } as unknown as DKGNode;
       const peerResolver = {
@@ -305,7 +322,7 @@ describe('ProtocolRouter', () => {
       expect(resolveCalls).toBe(1);
     });
 
-    it('aborts dead reused streams (writeStatus=closed) and falls back to dialProtocol', async () => {
+    it('aborts a dead reused stream (writeStatus=closed) and falls back to dialProtocol when no other candidate exists', async () => {
       let abortCalls = 0;
       let dialCalls = 0;
       const router = makeRouterWithFastPath({
@@ -340,6 +357,160 @@ describe('ProtocolRouter', () => {
       // muxer cleans it up — otherwise leak.
       expect(abortCalls).toBe(1);
       expect(dialCalls).toBe(1);
+    });
+
+    // Codex review of PR #537: when the first candidate returns a
+    // dead stream, the fast path MUST continue to the next candidate
+    // before giving up. Returning early (the original PR shape)
+    // disables the entire fast path whenever a single stale
+    // connection happens to be first in `getConnections()`'s output —
+    // exactly the "peerStore is empty but we have multiple live
+    // conns" scenario this PR is meant to heal, since libp2p
+    // sometimes hands back a torn-down connection alongside a
+    // healthy one in the same `getConnections` result.
+    it('continues to the next candidate when an earlier one returns a dead stream (PR #537 Codex fix)', async () => {
+      let firstAborted = 0;
+      let secondUsed = 0;
+      let dialCalls = 0;
+      const router = makeRouterWithFastPath({
+        connections: [
+          {
+            status: 'open',
+            newStream: async () => ({
+              writeStatus: 'closed' as const,
+              send: () => undefined,
+              close: async () => undefined,
+              abort: () => { firstAborted += 1; },
+              async *[Symbol.asyncIterator]() {
+                /* never yields */
+              },
+            }),
+          },
+          {
+            status: 'open',
+            newStream: async () => {
+              secondUsed += 1;
+              return makeStubStream(new Uint8Array([0x55])) as any;
+            },
+          },
+        ],
+        dialBehavior: async () => {
+          dialCalls += 1;
+          throw new Error('dialProtocol must not be called — second candidate is healthy');
+        },
+      });
+
+      const out = await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]));
+      expect(out).toEqual(new Uint8Array([0x55]));
+      expect(firstAborted).toBe(1);
+      expect(secondUsed).toBe(1);
+      expect(dialCalls).toBe(0);
+    });
+
+    // Codex review of PR #537 + CI regression on
+    // `e2e-agents.test.ts > agents exchange encrypted chat through
+    // a relay (DCUtR upgrade)`: opening a stream on a LIMITED
+    // (circuit-relay-v2) connection when peerStore has direct
+    // addresses for the peer triggers libp2p's connection-manager
+    // auto-upgrade race — CM dials direct, succeeds, prunes the
+    // limited connection mid-stream, the just-opened stream dies
+    // and the receiver's `Connection.onIncomingStream → abort`
+    // throws an unhandled `StreamStateError`. Guard: skip limited
+    // candidates when peerStore has any non-circuit address.
+    it('skips a limited (circuit-relay) candidate when peerStore has direct addresses (DCUtR upgrade race)', async () => {
+      let limitedNewStream = 0;
+      let dialCalls = 0;
+      const router = makeRouterWithFastPath({
+        connections: [
+          {
+            status: 'open',
+            limits: { bytes: 1024 * 1024 },
+            newStream: async () => {
+              limitedNewStream += 1;
+              return makeStubStream(new Uint8Array([0x00])) as any;
+            },
+          },
+        ],
+        peerStoreGet: async () => ({
+          addresses: [
+            { multiaddr: { toString: () => '/ip4/1.2.3.4/tcp/4001' } },
+          ],
+        }),
+        dialBehavior: async () => {
+          dialCalls += 1;
+          return makeStubStream(new Uint8Array([0x66])) as any;
+        },
+      });
+
+      const out = await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]));
+      expect(out).toEqual(new Uint8Array([0x66]));
+      expect(limitedNewStream).toBe(0);
+      expect(dialCalls).toBe(1);
+    });
+
+    // The Window D shape this fast path is meant to heal: a single
+    // inbound LIMITED circuit-relay connection AND an empty
+    // peerStore for the peer. Verify the fast path still fires
+    // here (the DCUtR guard above must not regress Window D).
+    it('uses a limited candidate when peerStore is empty (Window D — the case this PR exists to heal)', async () => {
+      let limitedUsed = 0;
+      let dialCalls = 0;
+      const router = makeRouterWithFastPath({
+        connections: [
+          {
+            status: 'open',
+            limits: { bytes: 1024 * 1024 },
+            newStream: async () => {
+              limitedUsed += 1;
+              return makeStubStream(new Uint8Array([0x77])) as any;
+            },
+          },
+        ],
+        // Default peerStoreGet throws — cold-cache miss.
+        dialBehavior: async () => {
+          dialCalls += 1;
+          throw new Error('dialProtocol must not be called — fast path heals Window D');
+        },
+      });
+
+      const out = await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]));
+      expect(out).toEqual(new Uint8Array([0x77]));
+      expect(limitedUsed).toBe(1);
+      expect(dialCalls).toBe(0);
+    });
+
+    // peerStore returns ONLY circuit-relay addresses (no direct).
+    // CM can't auto-upgrade — there's no direct path to upgrade
+    // to. The limited candidate is safe to use.
+    it('uses a limited candidate when peerStore has ONLY circuit addresses (no upgrade target)', async () => {
+      let limitedUsed = 0;
+      let dialCalls = 0;
+      const router = makeRouterWithFastPath({
+        connections: [
+          {
+            status: 'open',
+            limits: { bytes: 1024 * 1024 },
+            newStream: async () => {
+              limitedUsed += 1;
+              return makeStubStream(new Uint8Array([0x88])) as any;
+            },
+          },
+        ],
+        peerStoreGet: async () => ({
+          addresses: [
+            { multiaddr: { toString: () => '/ip4/9.9.9.9/tcp/4001/p2p/Q/p2p-circuit/p2p/P' } },
+          ],
+        }),
+        dialBehavior: async () => {
+          dialCalls += 1;
+          throw new Error('dialProtocol must not be called — limited fast path is safe');
+        },
+      });
+
+      const out = await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]));
+      expect(out).toEqual(new Uint8Array([0x88]));
+      expect(limitedUsed).toBe(1);
+      expect(dialCalls).toBe(0);
     });
 
     it('skips connections whose status is not "open"', async () => {

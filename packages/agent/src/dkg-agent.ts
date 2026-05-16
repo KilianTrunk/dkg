@@ -12837,32 +12837,9 @@ export class DKGAgent {
 
     let rawConns: LibConnection[] = [];
     try {
-      // Codex review of PR #533 flagged the original
-      // `c.remotePeer.equals(pid)` filter: when `remotePeer` only
-      // exposes `toString()` (the comparison this repo used before
-      // PR #533), `.equals` is undefined and the call throws,
-      // collapsing the entire snapshot to `rawConnectionCount=0` via
-      // the outer try/catch. The legacy `/api/peer-info` route used
-      // string comparison for exactly that reason. Try `.equals`
-      // first (matches the libp2p contract when available, handles
-      // multihash variants correctly) and fall back to a stringified
-      // compare when `.equals` is missing so a future PeerId shape
-      // change can't silently zero the diagnostic.
-      const pidStr = peerId;
-      rawConns = libp2p.getConnections().filter((c: LibConnection) => {
-        const rp = c.remotePeer as unknown as {
-          equals?: (other: unknown) => boolean;
-          toString(): string;
-        };
-        if (typeof rp.equals === 'function') {
-          try {
-            return rp.equals(pid);
-          } catch {
-            return rp.toString() === pidStr;
-          }
-        }
-        return rp.toString() === pidStr;
-      });
+      rawConns = libp2p
+        .getConnections()
+        .filter((c: LibConnection) => c.remotePeer.equals(pid!));
     } catch {
       rawConns = [];
     }

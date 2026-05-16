@@ -24,7 +24,7 @@ const PEER_A = '12D3KooWFq5KMnSMyYr8Z8t8a6Vh1Y6N6KkF5UZjLpCqUkBJsAaa';
 const PEER_B = '12D3KooWBqq7vfABCDEFkLmNoPqRsTuVwXyZAbCdEfGhIjKlMnaa';
 
 interface StubConnection {
-  remotePeer: { equals?: (p: unknown) => boolean; toString: () => string };
+  remotePeer: { equals: (p: unknown) => boolean; toString: () => string };
   remoteAddr?: { toString: () => string };
   direction: 'inbound' | 'outbound';
   streams: unknown[];
@@ -308,52 +308,6 @@ describe('DKGAgent.getPeerDiagnostics', () => {
       });
       const diag = await callDiagnostics(agentLike, PEER_A);
       expect(diag.peerStore).toBeNull();
-    });
-
-    // Codex review of PR #533: the raw-walk filter must not collapse
-    // the entire snapshot to `rawConnectionCount=0` when libp2p's
-    // PeerId surface only exposes `toString()` (no `.equals`). A
-    // single shape mismatch — easy to introduce via an upstream
-    // libp2p major bump, easy to miss in code review — would
-    // otherwise produce a silently empty diagnostic exactly when
-    // an operator needs it most. Verify both fallback shapes.
-    it('falls back to toString comparison when remotePeer.equals is missing', async () => {
-      const conn: StubConnection = {
-        remotePeer: { toString: () => PEER_A },
-        remoteAddr: { toString: () => '/ip4/127.0.0.1/tcp/4001' },
-        direction: 'inbound',
-        streams: [],
-        timeline: { open: 1715670000000 },
-      };
-      const agentLike = makeAgentLike({
-        rawConnections: [conn],
-        keyedConnectionsByPeer: new Map([[PEER_A, [conn]]]),
-      });
-      const diag = await callDiagnostics(agentLike, PEER_A);
-      expect(diag.rawConnectionCount).toBe(1);
-      expect(diag.connected).toBe(true);
-    });
-
-    it('falls back to toString comparison when remotePeer.equals throws', async () => {
-      const conn: StubConnection = {
-        remotePeer: {
-          equals: () => {
-            throw new Error('peerId shape mismatch');
-          },
-          toString: () => PEER_A,
-        },
-        remoteAddr: { toString: () => '/ip4/127.0.0.1/tcp/4001' },
-        direction: 'inbound',
-        streams: [],
-        timeline: { open: 1715670000000 },
-      };
-      const agentLike = makeAgentLike({
-        rawConnections: [conn],
-        keyedConnectionsByPeer: new Map([[PEER_A, [conn]]]),
-      });
-      const diag = await callDiagnostics(agentLike, PEER_A);
-      expect(diag.rawConnectionCount).toBe(1);
-      expect(diag.connected).toBe(true);
     });
   });
 });

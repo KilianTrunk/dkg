@@ -1,7 +1,15 @@
 import Database from 'better-sqlite3';
 import { join } from 'node:path';
+import {
+  RESPONSE_CACHE_BYTES,
+  type IdempotencyCheckResult,
+  type MessageDirection,
+  type MessageIdempotencyStore,
+  type ProtocolOutboxEntry,
+  type ProtocolOutboxStore,
+} from '@origintrail-official/dkg-core';
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 const DEFAULT_RETENTION_DAYS = 90;
 
 export interface DashboardDBOptions {
@@ -356,6 +364,90 @@ export class DashboardDB {
       `);
     }
 
+    if (version < 12) {
+      // Universal Messenger substrate (rc.9 plan PR-1).
+      //
+      // Two new tables back the substrate's `MessageIdempotencyStore`
+      // and `ProtocolOutboxStore` ports — protocol-agnostic
+      // counterparts to the chat-specific `idx_chat_msgid` (V11) and
+      // the in-memory `MessageOutbox` (rc.8). Adding them at V12
+      // before any caller migrates onto Messenger (PR-3+) so the
+      // tables are present + tested by the time the substrate
+      // actually wires them.
+      //
+      // The substrate's design constraint: adding a new short-message
+      // protocol requires no new storage. A single
+      // `message_idempotency` row + a single `protocol_outbox` row
+      // describes any peer-to-peer short message regardless of the
+      // protocol prefix (`/dkg/10.0.1/message`, `/dkg/10.0.1/skill_request`,
+      // `/dkg/10.0.1/swm-sender-key`, etc.) — the `protocol` column
+      // partitions the namespace.
+      //
+      // `message_idempotency` design:
+      //   - PRIMARY KEY = (peer_id, protocol, message_id, direction).
+      //     `direction` separates inbound vs outbound so a sender's
+      //     "did I deliver this" cache lives in a distinct namespace
+      //     from a receiver's "did I process this" dedup table — the
+      //     Codex #534 lesson generalised.
+      //   - `response_blob BLOB` holds responses up to
+      //     `RESPONSE_CACHE_BYTES` (256 KiB) for idempotent re-delivery.
+      //     Larger responses store `response_blob = NULL` with the
+      //     actual size in `response_size` (mark-only); duplicate
+      //     receives in that case surface `RESPONSE_GONE` to the
+      //     sender's caller.
+      //   - `ts` is the record-time wall-clock, used by the periodic
+      //     prune (24h TTL default).
+      //
+      // `protocol_outbox` design:
+      //   - PRIMARY KEY = (peer_id, protocol, message_id). One in-
+      //     flight retry slot per `(peer, protocol, message)` tuple.
+      //   - `payload BLOB` stores the envelope-wrapped wire bytes
+      //     (i.e. the `ReliableEnvelope` proto output, not the raw
+      //     application payload), so retries replay byte-identical
+      //     frames without re-encoding.
+      //   - `idx_outbox_next_attempt` indexes the periodic-tick query
+      //     (`SELECT ... WHERE next_attempt_at <= ?`); the
+      //     opportunistic-flush query
+      //     (`SELECT ... WHERE peer_id = ?`) uses an implicit scan
+      //     on the PK prefix, which is fast enough at expected
+      //     queue sizes (~tens of entries per peer).
+      //
+      // No data migration: pure additive. The chat-specific
+      // `idx_chat_msgid` from V11 stays in place — PR-3 will drop
+      // it (V13) once chat migrates onto the substrate and
+      // `message_id` is enforced via `message_idempotency` instead.
+      // V13 will also preserve `chat_messages.message_id` as
+      // nullable + unwritten for rollback safety.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS message_idempotency (
+          peer_id TEXT NOT NULL,
+          protocol TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+          response_blob BLOB,
+          response_size INTEGER NOT NULL DEFAULT 0,
+          ts INTEGER NOT NULL,
+          PRIMARY KEY (peer_id, protocol, message_id, direction)
+        );
+        CREATE INDEX IF NOT EXISTS idx_idem_ts ON message_idempotency(ts);
+
+        CREATE TABLE IF NOT EXISTS protocol_outbox (
+          peer_id TEXT NOT NULL,
+          protocol TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          payload BLOB NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          first_failure_at INTEGER NOT NULL,
+          last_attempt_at INTEGER NOT NULL,
+          next_attempt_at INTEGER NOT NULL,
+          last_error TEXT,
+          PRIMARY KEY (peer_id, protocol, message_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_outbox_next_attempt
+          ON protocol_outbox(next_attempt_at);
+      `);
+    }
+
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
     const savedRetention = this.db.prepare("SELECT value FROM settings WHERE key = 'retentionDays'").get() as { value: string } | undefined;
@@ -377,6 +469,15 @@ export class DashboardDB {
     this.db.exec(`DELETE FROM chat_messages WHERE ts < ${cutoff}`);
     this.db.exec(`DELETE FROM chat_persistence_jobs WHERE updated_at < ${cutoff} AND status IN ('stored', 'failed')`);
     this.db.exec(`DELETE FROM notifications WHERE ts < ${cutoff}`);
+    // Universal Messenger substrate tables. Shorter TTL than the
+    // 90-day operator retention: 24h is plenty for both idempotency
+    // (no realistic dedup window beyond a day) and outbox (entries
+    // older than 24h have hit `maxAgeMs` and are dropped by the
+    // substrate's own `dropExpired` tick anyway — this is the
+    // belt-and-braces sweep for crash-recovered state).
+    const messengerCutoff = Date.now() - 24 * 60 * 60 * 1000;
+    this.db.exec(`DELETE FROM message_idempotency WHERE ts < ${messengerCutoff}`);
+    this.db.exec(`DELETE FROM protocol_outbox WHERE first_failure_at < ${messengerCutoff}`);
   }
 
   // --- Prepared statements (lazy-initialized) ---
@@ -1464,6 +1565,340 @@ export class DashboardDB {
 
   close(): void {
     this.db.close();
+  }
+}
+
+// --- Universal Messenger substrate stores (rc.9 plan PR-1) ---
+
+/**
+ * SQLite-backed `MessageIdempotencyStore` against the V12
+ * `message_idempotency` table in `DashboardDB`. Receiver-side dedup
+ * cache + sender-side "did we deliver this" cache, keyed by
+ * `(peer, protocol, message_id, direction)`.
+ *
+ * Constructed against an already-opened `DashboardDB` so all DKG
+ * persistence shares a single SQLite file (one WAL, one fsync, one
+ * pragma surface). Doesn't open the DB itself — the daemon's
+ * `lifecycle.ts` owns DB lifecycle and hands one in here in PR-2.
+ *
+ * Response caching policy lives in `RESPONSE_CACHE_BYTES` (256 KiB
+ * fixed limit, exported from `@origintrail-official/dkg-core`).
+ * Responses up to the limit are stored inline in `response_blob`;
+ * larger responses store `response_blob = NULL` with the actual
+ * size in `response_size` (mark-only). Duplicate receives whose
+ * original was mark-only surface as `RESPONSE_GONE` to the sender
+ * — see `RESPONSE_GONE_MARKER` for the canonical signal string.
+ */
+export class SqliteMessageIdempotencyStore implements MessageIdempotencyStore {
+  private readonly db: Database.Database;
+  private readonly clock: () => number;
+
+  /** @param clock injectable for deterministic tests. Defaults to `Date.now`. */
+  constructor(dashboard: DashboardDB, options: { clock?: () => number } = {}) {
+    this.db = dashboard.db;
+    this.clock = options.clock ?? (() => Date.now());
+  }
+
+  check(
+    peer: string,
+    protocol: string,
+    messageId: string,
+    direction: MessageDirection,
+  ): IdempotencyCheckResult {
+    const row = this.db
+      .prepare(
+        `SELECT response_blob FROM message_idempotency
+         WHERE peer_id = ? AND protocol = ? AND message_id = ? AND direction = ?`,
+      )
+      .get(peer, protocol, messageId, direction) as
+      | { response_blob: Buffer | null }
+      | undefined;
+    if (!row) return { seen: false };
+    // better-sqlite3 returns Node Buffer for BLOB columns; convert to
+    // Uint8Array view (zero-copy) so the substrate stays Buffer-free.
+    if (row.response_blob === null) return { seen: true };
+    return {
+      seen: true,
+      cachedResponse: new Uint8Array(
+        row.response_blob.buffer,
+        row.response_blob.byteOffset,
+        row.response_blob.byteLength,
+      ),
+    };
+  }
+
+  record(
+    peer: string,
+    protocol: string,
+    messageId: string,
+    direction: MessageDirection,
+    response?: Uint8Array,
+  ): void {
+    const responseSize = response?.length ?? 0;
+    // Mark-only when over the cache limit. Stores NULL blob + the
+    // actual size, so a future duplicate receive can surface
+    // `RESPONSE_GONE`. The 256 KiB cutoff is the rc.9 plan's locked
+    // design decision — no per-protocol/per-call knob.
+    const blob =
+      response !== undefined && response.length <= RESPONSE_CACHE_BYTES
+        ? Buffer.from(response.buffer, response.byteOffset, response.byteLength)
+        : null;
+    // Targeted ON CONFLICT — never the broader INSERT OR IGNORE which
+    // would silently swallow unrelated constraint violations (the
+    // Codex #534 lesson). Idempotent re-record on the same key is a
+    // no-op; any other constraint violation surfaces as a thrown
+    // SqliteError so the substrate's bug doesn't disguise itself as
+    // a normal duplicate.
+    this.db
+      .prepare(
+        `INSERT INTO message_idempotency
+           (peer_id, protocol, message_id, direction, response_blob, response_size, ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (peer_id, protocol, message_id, direction) DO NOTHING`,
+      )
+      .run(peer, protocol, messageId, direction, blob, responseSize, this.clock());
+  }
+
+  pruneOlderThan(tsMs: number): number {
+    const result = this.db
+      .prepare(`DELETE FROM message_idempotency WHERE ts < ?`)
+      .run(tsMs);
+    return result.changes;
+  }
+}
+
+/**
+ * SQLite-backed `ProtocolOutboxStore` against the V12
+ * `protocol_outbox` table. Sender-side durable retry queue, keyed
+ * by `(peer, protocol, message_id)`. The substrate's reliability
+ * floor: a daemon crash mid-retry doesn't lose the message — the
+ * next startup's `Messenger.processOutboxTick` picks up exactly
+ * where the crash left off (modulo the in-flight bytes that died
+ * with the process, which is documented as the "in-flight queue
+ * caveat" in CHANGELOG for rc.9).
+ *
+ * The backoff ladder + max-age are NOT stored in SQL — they live
+ * on the wrapping `ProtocolOutbox` in `packages/core`, and only
+ * the resulting `next_attempt_at` and `first_failure_at` timestamps
+ * land in the table. This keeps the schema independent of policy
+ * changes: bumping the ladder doesn't require a migration.
+ *
+ * Constructor takes a `maxAgeMs` so `dropExpired` can apply it
+ * directly in SQL (avoiding a full table read).
+ */
+export interface SqliteProtocolOutboxStoreOptions {
+  /**
+   * Max age (ms) from `firstFailureAt` before `dropExpired(now)`
+   * evicts an entry. Defaults to 24h. Mirrors the wrapping
+   * `ProtocolOutbox`'s `maxAgeMs` so both layers agree.
+   */
+  maxAgeMs?: number;
+  /**
+   * Function that returns the backoff (ms) to apply for an entry
+   * about to bump to `attempts`. The schema does NOT store the
+   * ladder; PR-2's `lifecycle.ts` wiring passes the wrapping
+   * `ProtocolOutbox`'s `backoffFor` method here so policy lives in
+   * one place. Defaults to a flat 5s backoff so the store works
+   * standalone in tests + before the wrapping outbox is wired.
+   */
+  backoffFor?: (attempts: number) => number;
+}
+
+export class SqliteProtocolOutboxStore implements ProtocolOutboxStore {
+  private readonly db: Database.Database;
+  private readonly maxAgeMs: number;
+  private readonly backoffFor: (attempts: number) => number;
+
+  constructor(dashboard: DashboardDB, options: SqliteProtocolOutboxStoreOptions = {}) {
+    this.db = dashboard.db;
+    this.maxAgeMs = options.maxAgeMs ?? 24 * 60 * 60 * 1000;
+    this.backoffFor = options.backoffFor ?? ((_attempts) => 5_000);
+  }
+
+  enqueue(
+    peer: string,
+    protocol: string,
+    messageId: string,
+    payload: Uint8Array,
+    error: string,
+    now: number,
+  ): ProtocolOutboxEntry {
+    const existing = this.db
+      .prepare(
+        `SELECT * FROM protocol_outbox
+         WHERE peer_id = ? AND protocol = ? AND message_id = ?`,
+      )
+      .get(peer, protocol, messageId) as
+      | {
+          peer_id: string;
+          protocol: string;
+          message_id: string;
+          payload: Buffer;
+          attempts: number;
+          first_failure_at: number;
+          last_attempt_at: number;
+          next_attempt_at: number;
+          last_error: string | null;
+        }
+      | undefined;
+
+    if (existing) {
+      const newAttempts = existing.attempts + 1;
+      const nextAttemptAt = now + this.backoffFor(newAttempts);
+      this.db
+        .prepare(
+          `UPDATE protocol_outbox
+           SET attempts = ?, last_attempt_at = ?, next_attempt_at = ?, last_error = ?
+           WHERE peer_id = ? AND protocol = ? AND message_id = ?`,
+        )
+        .run(newAttempts, now, nextAttemptAt, error, peer, protocol, messageId);
+      return {
+        peer,
+        protocol,
+        messageId,
+        payload: new Uint8Array(
+          existing.payload.buffer,
+          existing.payload.byteOffset,
+          existing.payload.byteLength,
+        ),
+        attempts: newAttempts,
+        firstFailureAt: existing.first_failure_at,
+        lastAttemptAt: now,
+        nextAttemptAt,
+        lastError: error,
+      };
+    }
+
+    const attempts = 1;
+    const nextAttemptAt = now + this.backoffFor(attempts);
+    const blob = Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength);
+    this.db
+      .prepare(
+        `INSERT INTO protocol_outbox
+           (peer_id, protocol, message_id, payload, attempts,
+            first_failure_at, last_attempt_at, next_attempt_at, last_error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(peer, protocol, messageId, blob, attempts, now, now, nextAttemptAt, error);
+    return {
+      peer,
+      protocol,
+      messageId,
+      payload,
+      attempts,
+      firstFailureAt: now,
+      lastAttemptAt: now,
+      nextAttemptAt,
+      lastError: error,
+    };
+  }
+
+  markDelivered(peer: string, protocol: string, messageId: string): boolean {
+    const result = this.db
+      .prepare(
+        `DELETE FROM protocol_outbox
+         WHERE peer_id = ? AND protocol = ? AND message_id = ?`,
+      )
+      .run(peer, protocol, messageId);
+    return result.changes > 0;
+  }
+
+  hasEntry(peer: string, protocol: string, messageId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM protocol_outbox
+         WHERE peer_id = ? AND protocol = ? AND message_id = ? LIMIT 1`,
+      )
+      .get(peer, protocol, messageId) as { 1: number } | undefined;
+    return row !== undefined;
+  }
+
+  pendingFor(peer: string): ProtocolOutboxEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM protocol_outbox WHERE peer_id = ? ORDER BY first_failure_at ASC`,
+      )
+      .all(peer) as Array<{
+      peer_id: string;
+      protocol: string;
+      message_id: string;
+      payload: Buffer;
+      attempts: number;
+      first_failure_at: number;
+      last_attempt_at: number;
+      next_attempt_at: number;
+      last_error: string | null;
+    }>;
+    return rows.map(SqliteProtocolOutboxStore.rowToEntry);
+  }
+
+  due(now: number): ProtocolOutboxEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM protocol_outbox WHERE next_attempt_at <= ?`,
+      )
+      .all(now) as Array<{
+      peer_id: string;
+      protocol: string;
+      message_id: string;
+      payload: Buffer;
+      attempts: number;
+      first_failure_at: number;
+      last_attempt_at: number;
+      next_attempt_at: number;
+      last_error: string | null;
+    }>;
+    return rows.map(SqliteProtocolOutboxStore.rowToEntry);
+  }
+
+  dropExpired(now: number): ProtocolOutboxEntry[] {
+    const cutoff = now - this.maxAgeMs;
+    const rows = this.db
+      .prepare(`SELECT * FROM protocol_outbox WHERE first_failure_at < ?`)
+      .all(cutoff) as Array<{
+      peer_id: string;
+      protocol: string;
+      message_id: string;
+      payload: Buffer;
+      attempts: number;
+      first_failure_at: number;
+      last_attempt_at: number;
+      next_attempt_at: number;
+      last_error: string | null;
+    }>;
+    this.db.prepare(`DELETE FROM protocol_outbox WHERE first_failure_at < ?`).run(cutoff);
+    return rows.map(SqliteProtocolOutboxStore.rowToEntry);
+  }
+
+  size(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as c FROM protocol_outbox`).get() as {
+      c: number;
+    };
+    return row.c;
+  }
+
+  private static rowToEntry(row: {
+    peer_id: string;
+    protocol: string;
+    message_id: string;
+    payload: Buffer;
+    attempts: number;
+    first_failure_at: number;
+    last_attempt_at: number;
+    next_attempt_at: number;
+    last_error: string | null;
+  }): ProtocolOutboxEntry {
+    return {
+      peer: row.peer_id,
+      protocol: row.protocol,
+      messageId: row.message_id,
+      payload: new Uint8Array(row.payload.buffer, row.payload.byteOffset, row.payload.byteLength),
+      attempts: row.attempts,
+      firstFailureAt: row.first_failure_at,
+      lastAttemptAt: row.last_attempt_at,
+      nextAttemptAt: row.next_attempt_at,
+      lastError: row.last_error ?? '',
+    };
   }
 }
 

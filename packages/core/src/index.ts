@@ -73,6 +73,23 @@ export {
   type RetryQueueOptions,
 } from './retry-queue.js';
 export {
+  type MessageIdempotencyStore,
+  type MessageDirection,
+  type IdempotencyCheckResult,
+  type ProtocolOutboxStore,
+  type ProtocolOutboxEntry,
+  RESPONSE_CACHE_BYTES,
+  RESPONSE_GONE_MARKER,
+} from './messenger-types.js';
+export {
+  ProtocolOutbox,
+  type ProtocolOutboxOptions,
+  DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS,
+  DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS,
+  InMemoryProtocolOutboxStore,
+  InMemoryMessageIdempotencyStore,
+} from './protocol-outbox.js';
+export {
   findPackageRepoDir,
   blueGreenSlotEntryPoint,
   blueGreenSlotReady,

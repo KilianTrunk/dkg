@@ -42,6 +42,13 @@ export {
 } from './message.js';
 
 export {
+  type ReliableEnvelopeMsg,
+  RELIABLE_ENVELOPE_VERSION,
+  encodeReliableEnvelope,
+  decodeReliableEnvelope,
+} from './reliable-envelope.js';
+
+export {
   type WorkspacePublishRequestMsg,
   type WorkspaceManifestEntryMsg,
   type WorkspaceCASConditionMsg,

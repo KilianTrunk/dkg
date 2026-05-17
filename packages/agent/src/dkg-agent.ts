@@ -154,7 +154,7 @@ import {
 import { SyncVerifyWorker } from './sync-verify-worker.js';
 import { bindRandomSampling, type RandomSamplingHandle, type RandomSamplingStatus } from './random-sampling-bind.js';
 import { connectToMultiaddr, ensurePeerConnected as ensurePeerConnectedAtom, primeCatchupConnections as primeCatchupConnectionsAtom } from './p2p/peer-connect.js';
-import { Messenger } from './p2p/messenger.js';
+import { Messenger, type SloProtocolStats } from './p2p/messenger.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
@@ -13381,6 +13381,18 @@ export class DKGAgent {
    * that motivated the `getConnectionsReturnsForPeer` field in
    * particular.
    */
+  /**
+   * Snapshot of the Universal Messenger SLO histogram + counters
+   * across every protocol the substrate has seen traffic for.
+   * Source of truth for the rc.9 ship-gate overnight soak; surfaced
+   * via the daemon's localhost-only `/api/slo` endpoint.
+   *
+   * rc.9 PR-12.
+   */
+  getMessengerSloStats(): Record<string, SloProtocolStats> {
+    return this.messenger.getSloStats();
+  }
+
   async getPeerDiagnostics(peerId: string): Promise<PeerDiagnostics> {
     const libp2p = this.node.libp2p;
 

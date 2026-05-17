@@ -15,6 +15,26 @@ import {
 /** Bytes payload the substrate uses to signal `RESPONSE_GONE` on the wire. */
 const RESPONSE_GONE_BYTES = new TextEncoder().encode(RESPONSE_GONE_MARKER);
 
+/** Compose the SLO bookkeeping key shared between firstAttemptAt + counters. */
+function sloKey(protocolId: string, peerId: string, messageId: string): string {
+  return `${protocolId}|${peerId}|${messageId}`;
+}
+
+/**
+ * Pick the `q` percentile out of an unsorted samples array. Sorts a
+ * copy each call — cheap at the 1k-sample window we use. Returns
+ * null on empty input so the JSON shape preserves "no data yet" vs
+ * "all samples were 0ms".
+ */
+function pct(samples: readonly number[], q: number): number | null {
+  if (samples.length === 0) return null;
+  const sorted = [...samples].sort((a, b) => a - b);
+  // Nearest-rank percentile. Adequate for operator-facing dashboards;
+  // we don't need linear interpolation for SLO reporting.
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1));
+  return sorted[idx];
+}
+
 export interface MessengerDeps {
   router: ProtocolRouter;
   /**
@@ -169,6 +189,40 @@ export type ReliableHandler = (
  * See `docs/messenger.md` for the architecture overview and per-
  * protocol coverage table.
  */
+/**
+ * Per-protocol SLO snapshot. Latency stats cover the full
+ * "sendReliable invoked → delivered:true" clock, including time
+ * spent queued in the outbox + every backoff retry. p50/p95/p99
+ * over the last `SLO_WINDOW_SAMPLES` observations; `samples` is the
+ * cardinality of that window (capped at `SLO_WINDOW_SAMPLES`).
+ *
+ * `delivered` + `queued` counters are monotonic (lifetime totals) so
+ * operators can see "delivered 9,830 / queued 12" and compute a
+ * success ratio without needing the histogram.
+ *
+ * rc.9 PR-12.
+ */
+export interface SloProtocolStats {
+  protocolId: string;
+  samples: number;
+  p50Ms: number | null;
+  p95Ms: number | null;
+  p99Ms: number | null;
+  /** Lifetime total of successful deliveries (initial + late-retry). */
+  delivered: number;
+  /** Lifetime total of sendReliable calls that returned queued (not yet delivered when sendReliable returned). */
+  queued: number;
+}
+
+/**
+ * Sliding-window size for per-protocol latency observations. 1000
+ * samples is enough to give a stable p99 for chat-rate (~1Hz peak)
+ * traffic and small enough to keep memory bounded (8 protocols × 1k
+ * samples × 8 bytes/number = ~64 KiB peak). Tunable per-instance
+ * via `sloWindowSamples` in `MessengerDeps`.
+ */
+export const DEFAULT_SLO_WINDOW_SAMPLES = 1000;
+
 export class Messenger {
   private readonly router: ProtocolRouter;
   private readonly idempotencyStore?: MessageIdempotencyStore;
@@ -183,7 +237,35 @@ export class Messenger {
    */
   private readonly handlers = new Map<string, ReliableHandler>();
 
-  constructor(deps: MessengerDeps) {
+  /**
+   * Per-`(protocol, peer, messageId)` "first sendReliable invocation"
+   * timestamp. Used to compute the SLO latency clock per the rc.9
+   * plan: "sendReliable invoke → resolved {delivered:true} (includes
+   * queue + retries)". Cleared on delivery + on outbox expiry; on
+   * non-recoverable throw the entry leaks (acceptable — these are
+   * exceptional cases that the plan's overnight soak surfaces).
+   */
+  private readonly firstAttemptAt = new Map<string, number>();
+
+  /**
+   * Per-protocol latency observations (ms) — sliding window of the
+   * most recent `sloWindowSamples` samples. Rendered into p50/p95/p99
+   * on demand by `getSloStats()`; cheap enough at the default 1k
+   * window that on-demand sort beats keeping a sorted structure.
+   */
+  private readonly sloLatencies = new Map<string, number[]>();
+
+  /**
+   * Per-protocol monotonic counters: lifetime delivered + queued
+   * totals. Operators read these via /api/slo to see the success
+   * ratio without parsing the histogram.
+   */
+  private readonly sloCounters = new Map<string, { delivered: number; queued: number }>();
+
+  /** Sliding-window cap from `MessengerDeps.sloWindowSamples`. */
+  private readonly sloWindowSamples: number;
+
+  constructor(deps: MessengerDeps & { sloWindowSamples?: number }) {
     this.router = deps.router;
     this.idempotencyStore = deps.idempotencyStore;
     if (deps.outboxStore) {
@@ -193,6 +275,77 @@ export class Messenger {
       });
     }
     this.clock = deps.clock ?? (() => Date.now());
+    this.sloWindowSamples = deps.sloWindowSamples ?? DEFAULT_SLO_WINDOW_SAMPLES;
+  }
+
+  /**
+   * Snapshot of the SLO histogram + counters across every protocol
+   * the Messenger has seen traffic for. Stable order (alphabetical
+   * by protocolId) so operator dashboards rendering this don't have
+   * rows reshuffling between requests. Empty `{}` when no traffic
+   * has flowed yet (e.g. node just started).
+   *
+   * rc.9 PR-12.
+   */
+  getSloStats(): Record<string, SloProtocolStats> {
+    const out: Record<string, SloProtocolStats> = {};
+    const protocolIds = new Set<string>([
+      ...this.sloLatencies.keys(),
+      ...this.sloCounters.keys(),
+    ]);
+    for (const protocolId of [...protocolIds].sort()) {
+      const samples = this.sloLatencies.get(protocolId) ?? [];
+      const counters = this.sloCounters.get(protocolId) ?? { delivered: 0, queued: 0 };
+      out[protocolId] = {
+        protocolId,
+        samples: samples.length,
+        p50Ms: pct(samples, 0.50),
+        p95Ms: pct(samples, 0.95),
+        p99Ms: pct(samples, 0.99),
+        delivered: counters.delivered,
+        queued: counters.queued,
+      };
+    }
+    return out;
+  }
+
+  /**
+   * Record a successful delivery for the SLO histogram. Called from
+   * `sendReliable` on synchronous success + from `retryOutboxEntry`
+   * on background retry success. Idempotent on the (protocol, peer,
+   * messageId) key — second call is a no-op because firstAttemptAt
+   * was already cleared.
+   */
+  private noteDeliveredForSlo(protocolId: string, peerId: string, messageId: string): void {
+    const k = sloKey(protocolId, peerId, messageId);
+    const startedAt = this.firstAttemptAt.get(k);
+    if (startedAt == null) {
+      // Sender-idempotency cache hit (we never recorded a start) or
+      // late-retry on an entry whose start was already cleared.
+      // Either way: count the delivery but skip the latency record.
+      this.bumpCounter(protocolId, 'delivered');
+      return;
+    }
+    this.firstAttemptAt.delete(k);
+    const latency = this.clock() - startedAt;
+    const samples = this.sloLatencies.get(protocolId) ?? [];
+    samples.push(latency);
+    if (samples.length > this.sloWindowSamples) {
+      samples.splice(0, samples.length - this.sloWindowSamples);
+    }
+    this.sloLatencies.set(protocolId, samples);
+    this.bumpCounter(protocolId, 'delivered');
+  }
+
+  /** Bump the queued counter without disturbing firstAttemptAt. */
+  private noteQueuedForSlo(protocolId: string): void {
+    this.bumpCounter(protocolId, 'queued');
+  }
+
+  private bumpCounter(protocolId: string, kind: 'delivered' | 'queued'): void {
+    const c = this.sloCounters.get(protocolId) ?? { delivered: 0, queued: 0 };
+    c[kind] += 1;
+    this.sloCounters.set(protocolId, c);
   }
 
   /**
@@ -240,6 +393,16 @@ export class Messenger {
     const idem = this.idempotencyStore!;
     const outbox = this.outbox!;
 
+    // rc.9 PR-12: SLO clock starts on the FIRST sendReliable
+    // invocation for a given (protocol, peer, messageId). If we get
+    // re-entered with the same messageId (e.g. operator clicked send
+    // twice), the existing firstAttemptAt is preserved so the
+    // latency includes the full retry chain.
+    const sloK = sloKey(protocolId, peerId, messageId);
+    if (!this.firstAttemptAt.has(sloK)) {
+      this.firstAttemptAt.set(sloK, this.clock());
+    }
+
     // Sender-side dedup: if we previously delivered this exact
     // `(peer, protocol, messageId)` (e.g. operator clicked send
     // twice; same caller-supplied id replayed across a daemon
@@ -247,6 +410,12 @@ export class Messenger {
     // response without a wire round-trip.
     const sentBefore = idem.check(peerId, protocolId, messageId, 'out');
     if (sentBefore.seen) {
+      // No SLO sample to record here — sender-side dedup means we
+      // didn't actually deliver this call; the original delivery
+      // already counted. Still bump the delivered counter so
+      // operators see traffic.
+      this.bumpCounter(protocolId, 'delivered');
+      this.firstAttemptAt.delete(sloK);
       return {
         delivered: true,
         // Mark-only original response surfaces as RESPONSE_GONE so
@@ -292,6 +461,10 @@ export class Messenger {
       );
       idem.record(peerId, protocolId, messageId, 'out', response);
       outbox.markDelivered(peerId, protocolId, messageId);
+      // rc.9 PR-12: record the SLO sample for the full
+      // sendReliable→delivered clock (this call only — late retries
+      // record via retryOutboxEntry).
+      this.noteDeliveredForSlo(protocolId, peerId, messageId);
       return { delivered: true, response, attempts: 1, messageId };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -309,6 +482,10 @@ export class Messenger {
         errMsg,
         this.clock(),
       );
+      // rc.9 PR-12: queued counter bumps; firstAttemptAt is preserved
+      // so the eventual retryOutboxEntry success can compute total
+      // latency (queue + every backoff retry).
+      this.noteQueuedForSlo(protocolId);
       return {
         delivered: false,
         queued: true,
@@ -464,6 +641,10 @@ export class Messenger {
         response,
       );
       outbox.markDelivered(entry.peer, entry.protocol, entry.messageId);
+      // rc.9 PR-12: late delivery — record SLO sample for the full
+      // queued+retry duration. firstAttemptAt was set by the initial
+      // sendReliable call that returned queued.
+      this.noteDeliveredForSlo(entry.protocol, entry.peer, entry.messageId);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (isRecoverableSendError(err)) {
@@ -497,15 +678,20 @@ export class Messenger {
     lastError: string;
   }> {
     if (!this.outbox) return [];
-    return this.outbox
-      .dropExpired(now)
-      .map(({ peer, protocol, messageId, attempts, lastError }) => ({
-        peer,
-        protocol,
-        messageId,
-        attempts,
-        lastError,
-      }));
+    const dropped = this.outbox.dropExpired(now);
+    // rc.9 PR-12: clean firstAttemptAt for expired entries so the
+    // SLO bookkeeping map doesn't grow unbounded on permanently
+    // unreachable peers.
+    for (const e of dropped) {
+      this.firstAttemptAt.delete(sloKey(e.protocol, e.peer, e.messageId));
+    }
+    return dropped.map(({ peer, protocol, messageId, attempts, lastError }) => ({
+      peer,
+      protocol,
+      messageId,
+      attempts,
+      lastError,
+    }));
   }
 
   /** Outbox size, for diagnostics. Zero when no outbox is wired. */

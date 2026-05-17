@@ -603,6 +603,27 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     });
   }
 
+  // GET /api/slo
+  //
+  // rc.9 PR-12. Per-protocol Universal Messenger SLO snapshot:
+  // p50/p95/p99 latency over the last ~1000 deliveries plus the
+  // monotonic delivered / queued counters. Source of truth for the
+  // ship-gate overnight soak.
+  //
+  // SECURITY: this endpoint is reachable only from localhost via the
+  // daemon's bind address (the daemon binds /api/* to 127.0.0.1 by
+  // default — see packages/cli/src/daemon/lifecycle.ts). Per-protocol
+  // traffic patterns + latency distributions are operationally
+  // sensitive metadata (traffic rates leak peer activity); default-
+  // public would be an info-leak regression. Operators who want
+  // remote visibility should put their own reverse proxy with auth
+  // in front. The agent.getMessengerSloStats() call itself is cheap
+  // (≤ 8 protocols × ≤ 1k samples sort) so no rate limit is needed.
+  if (req.method === "GET" && path === "/api/slo") {
+    const stats = agent.getMessengerSloStats();
+    return jsonResponse(res, 200, { protocols: stats });
+  }
+
   // GET /api/skills
   // Optional query params: ?skillType=X
   if (req.method === "GET" && path === "/api/skills") {

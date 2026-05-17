@@ -323,3 +323,120 @@ describe('Messenger construction guardrails', () => {
     expect(Array.from(out)).toEqual([0x77]);
   });
 });
+
+// rc.9 PR-12 — SLO histogram coverage.
+describe('Messenger.getSloStats (SLO histogram)', () => {
+  it('records latency from sendReliable invoke → delivered:true', async () => {
+    const { messenger, clock } = makeSubstrate();
+    // Start at T=1_700_000_000_000 (from makeSubstrate's clock default).
+    clock.mockImplementation(() => 1_700_000_000_000);
+    const sendPromise = messenger.sendReliable(PEER_B, PROTO, new Uint8Array([1]), {
+      messageId: FIXED_MSG_ID,
+    });
+    // Tick the clock forward before the await resolves — the SLO
+    // sample should be the *delivery* timestamp minus the *first
+    // invocation* timestamp (here: 250ms).
+    clock.mockImplementation(() => 1_700_000_000_250);
+    const result = await sendPromise;
+    expect(result.delivered).toBe(true);
+
+    const stats = messenger.getSloStats();
+    expect(stats[PROTO]).toBeDefined();
+    expect(stats[PROTO].samples).toBe(1);
+    expect(stats[PROTO].p50Ms).toBe(250);
+    expect(stats[PROTO].p95Ms).toBe(250);
+    expect(stats[PROTO].p99Ms).toBe(250);
+    expect(stats[PROTO].delivered).toBe(1);
+    expect(stats[PROTO].queued).toBe(0);
+  });
+
+  it('latency clock spans queue + retries (queued first, then retry succeeds)', async () => {
+    let shouldFail = true;
+    const router = makeRouter(async () => {
+      if (shouldFail) throw new Error('no valid addresses for peer');
+      return new Uint8Array([0x42]);
+    });
+    const { messenger, clock } = makeSubstrate({ router });
+    // First attempt at T=0 fails → queued.
+    clock.mockImplementation(() => 1_700_000_000_000);
+    const first = await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+      messageId: FIXED_MSG_ID,
+    });
+    expect(first.delivered).toBe(false);
+    // queued bumps counter immediately; no latency sample yet.
+    let stats = messenger.getSloStats();
+    expect(stats[PROTO].queued).toBe(1);
+    expect(stats[PROTO].samples).toBe(0);
+
+    // Backoff ladder is 10ms; advance to T+10, retry succeeds.
+    shouldFail = false;
+    clock.mockImplementation(() => 1_700_000_000_010);
+    await messenger.processOutboxTick(1_700_000_000_010);
+
+    stats = messenger.getSloStats();
+    // SLO clock = full queue+retry window = 10ms from initial
+    // sendReliable invocation to first successful delivery.
+    expect(stats[PROTO].samples).toBe(1);
+    expect(stats[PROTO].p99Ms).toBe(10);
+    expect(stats[PROTO].delivered).toBe(1);
+    expect(stats[PROTO].queued).toBe(1);
+  });
+
+  it('p95 / p99 are nearest-rank over the recorded window', async () => {
+    const { messenger, clock } = makeSubstrate();
+    const latencies = [1, 2, 3, 5, 10, 20, 50, 100, 200, 500];
+    let base = 1_700_000_000_000;
+    for (let i = 0; i < latencies.length; i++) {
+      const sendStart = base + i * 1_000_000; // well-separated windows
+      const sendEnd = sendStart + latencies[i];
+      let next = sendStart;
+      clock.mockImplementation(() => next);
+      const p = messenger.sendReliable(PEER_B, PROTO, new Uint8Array([i]), {
+        messageId: `m-${i}-${'0'.repeat(34)}`,
+      });
+      next = sendEnd;
+      await p;
+    }
+    const stats = messenger.getSloStats();
+    expect(stats[PROTO].samples).toBe(latencies.length);
+    // Nearest-rank percentile over sorted = [1,2,3,5,10,20,50,100,200,500]:
+    // p50 = index ceil(0.5*10)-1 = 4 → 10
+    // p95 = index ceil(0.95*10)-1 = 9 → 500
+    // p99 = index ceil(0.99*10)-1 = 9 → 500
+    expect(stats[PROTO].p50Ms).toBe(10);
+    expect(stats[PROTO].p95Ms).toBe(500);
+    expect(stats[PROTO].p99Ms).toBe(500);
+    expect(stats[PROTO].delivered).toBe(latencies.length);
+    expect(stats[PROTO].queued).toBe(0);
+  });
+
+  it('returns empty {} when no substrate traffic has flowed yet', () => {
+    const { messenger } = makeSubstrate();
+    expect(messenger.getSloStats()).toEqual({});
+  });
+
+  it('per-protocol stats are isolated', async () => {
+    const { messenger, clock } = makeSubstrate();
+    const PROTO_B = '/dkg/10.0.1/private-access';
+    clock.mockImplementation(() => 1_000_000);
+    let next = 1_000_000;
+    clock.mockImplementation(() => next);
+    const p1 = messenger.sendReliable(PEER_B, PROTO, new Uint8Array([1]), {
+      messageId: 'msg-A-' + '0'.repeat(30),
+    });
+    next = 1_000_050;
+    await p1;
+
+    next = 2_000_000;
+    const p2 = messenger.sendReliable(PEER_B, PROTO_B, new Uint8Array([2]), {
+      messageId: 'msg-B-' + '0'.repeat(30),
+    });
+    next = 2_000_500;
+    await p2;
+
+    const stats = messenger.getSloStats();
+    expect(Object.keys(stats).sort()).toEqual([PROTO_B, PROTO].sort());
+    expect(stats[PROTO].p99Ms).toBe(50);
+    expect(stats[PROTO_B].p99Ms).toBe(500);
+  });
+});

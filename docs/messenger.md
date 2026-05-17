@@ -191,13 +191,100 @@ is idempotent at the app layer) or surface a terminal error.
 
 ## SLO
 
-Defined fully in [`messenger-operator.md`](./messenger-operator.md).
-TL;DR: per-message latency clock starts at `Messenger.sendToPeer`
-invocation and ends at the promise resolving `{ delivered: true }`
-(includes queue + retries; this is the operator-visible "I clicked
-send → it arrived" time). Target: ≥ 99%/15s on chat/skill/query,
-≥ 99.5% on the rest. Per-protocol histograms via PR-12's `/api/slo`
-endpoint (localhost-only by default).
+### Clock definition
+
+The per-message latency clock starts the **first time**
+`Messenger.sendReliable(peerId, protocol, payload)` is invoked for a
+given `(peer, protocol, messageId)` triple, and stops when **any**
+attempt (initial send or any background outbox retry) resolves to
+`{ delivered: true }`. Concretely:
+
+- Initial wire I/O time is included.
+- Time spent waiting in the outbox between failed attempts is included.
+- Re-issues with a fresh `messageId` (e.g. `RESPONSE_GONE` retry on
+  `/query-remote` — see PR-9) are **separate** SLO samples; each
+  `messageId` is its own user-visible operation.
+- Receiver-side dedup hits (`sentBefore.seen`) are recorded as
+  delivered with zero latency (the caller's effective "perceived" RTT).
+
+This is the operator-visible "I clicked send → it arrived" time, which
+is what the 99.9%/15s ship-gate target measures.
+
+### Target
+
+| Protocol family                                                          | SLO       |
+| ------------------------------------------------------------------------ | --------- |
+| chat / skill_request / query-remote                                      | ≥ 99%/15s |
+| swm-sender-key / private-access / join-request / storage-ack / verify-proposal | ≥ 99.5%/15s |
+
+The ship-gate runs the soak script (`scripts/libp2p-soak-test.sh`)
+across both Lex and Miles for an overnight run; the `/api/slo`
+endpoint is the source of truth for go/no-go on `v10.0.0-rc.9` tag.
+
+### `/api/slo` endpoint (PR-12)
+
+Localhost-only by default (binds to `127.0.0.1` like every other
+`/api/*` route; same `Authorization: Bearer` requirement). One-shot
+snapshot of the in-memory histogram — no cumulative on-disk store.
+Returns the latest 1000 samples per protocol (`DEFAULT_SLO_WINDOW_SAMPLES`).
+
+```
+GET /api/slo
+Authorization: Bearer <token from ~/.dkg/auth.token>
+```
+
+```jsonc
+{
+  "protocols": {
+    "/dkg/10.0.1/message": {
+      "samples": 847,        // current window size (≤ DEFAULT_SLO_WINDOW_SAMPLES)
+      "p50Ms": 42,           // nearest-rank percentile over samples
+      "p95Ms": 380,
+      "p99Ms": 1240,
+      "delivered": 1602,     // monotonic counter (since daemon start)
+      "queued": 14           // monotonic counter; "queued" = first send failed → outbox
+    },
+    "/dkg/10.0.1/storage-ack": { ... }
+  }
+}
+```
+
+Empty body `{ "protocols": {} }` means no substrate traffic has flowed
+since daemon start — either the node is idle, or every protocol it has
+exercised is still on `/dkg/10.0.0/*` and hasn't been migrated yet.
+
+### Reading guide
+
+- **Did we hit SLO?** For each protocol where you care about the
+  target, check `p99Ms` against the 15000 ms budget. If `p99Ms <=
+  15000`, that protocol is meeting the latency target for the last
+  `samples` operations.
+- **Delivery rate.** `delivered / (delivered + queued)` is the
+  approximate single-attempt success rate. The substrate guarantees
+  at-least-once delivery, so `queued` entries are eventually delivered
+  too — they just took at least one retry. A high `queued` count with
+  matching `delivered` growth means the substrate is doing its job;
+  high `queued` with stalled `delivered` is the warning sign (the
+  peer is unreachable for an extended period).
+- **No `samples`, only `queued`?** The protocol has only ever seen
+  failed first attempts — typically a brand-new peer where address
+  resolution hasn't settled. Watch for `delivered` to start climbing
+  as the outbox retries land; PR-5's DHT-walk-on-stall should kick in
+  after 5 failed attempts.
+- **Soak runs.** `scripts/libp2p-soak-test.sh` writes a per-cycle
+  snapshot of `/api/slo` to `~/.dkg/soak-test-*/slo.jsonl` alongside
+  the existing `preflight.jsonl`, `sends.jsonl`, `inbox.jsonl`. The
+  human-readable summary line in `main.log` reads e.g.
+  `slo: message=d12/q0 p99=145ms, query-remote=d3/q0 p99=890ms, ...`.
+
+### Caveats
+
+- The histogram is **in-memory only**. Daemon restart resets all
+  counters and samples. The SQLite outbox itself survives restart;
+  the SLO view does not.
+- Samples are recorded only for protocols routed through the
+  substrate. Protocols still on `/dkg/10.0.0/*` (any not in the
+  per-protocol coverage table above) are invisible to `/api/slo`.
 
 ## Open questions / future work
 

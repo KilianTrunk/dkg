@@ -4549,18 +4549,48 @@ export class DKGAgent {
         // whether to rotate.
         const rdfKeysForAgent = rdfEncryptionKeysByAgent.get(record.agentAddress.toLowerCase()) ?? [];
         let publicOnlyAdoptedFromRdf = 0;
+        let revocationsAdoptedFromRdf = 0;
         for (const rdfEntry of rdfKeysForAgent) {
           const existing = record.workspaceEncryptionKeys.find((k) => k.encryptionKeyId === rdfEntry.encryptionKeyId);
           if (existing) {
-            // Keystore wins for keys we own. Do NOT pull RDF revocations onto
-            // a keystore-tracked key — an attacker who can write to the local
-            // RDF store could otherwise revoke our own active key behind our
-            // back. Keystore revocations are emitted to RDF on every persist,
-            // so a legitimate revoke flow stays converged.
+            // Keystore wins for the key material itself (we keep our local
+            // private half). BUT: if the RDF entry carries a revocation
+            // the keystore hasn't picked up yet, honor it.
+            //
+            // This is the self-sovereign / off-node revoke flow: the
+            // operator wallet-signs a revocation from a different device,
+            // submits it via `attachRevocationToWorkspaceEncryptionKey`,
+            // and it lands in the agents RDF graph. The keystore on this
+            // node may not yet have been mutated. Without the merge below,
+            // a restart resurrects the stale key as active and the daemon
+            // keeps advertising + accepting traffic on it. Codex review
+            // of PR #540 / commit 24aa4855.
+            //
+            // SAFE because `loadEncryptionKeyTriplesByAgent` has already
+            // EIP-191-verified `revocationProof` against `record.agentAddress`
+            // (the round-2 fix). A forged revocation triple would have been
+            // dropped there and never reach this merge step, so attaching
+            // it here cannot brick our own key — only a wallet-signed
+            // revocation makes it through.
+            if (rdfEntry.revokedAt && rdfEntry.revocationProof && !existing.revokedAt) {
+              existing.revokedAt = rdfEntry.revokedAt;
+              existing.revocationProof = rdfEntry.revocationProof;
+              revocationsAdoptedFromRdf++;
+            }
             continue;
           }
           record.workspaceEncryptionKeys.push({ ...rdfEntry });
           publicOnlyAdoptedFromRdf++;
+        }
+        if (revocationsAdoptedFromRdf > 0) {
+          const ctx = createOperationContext('system');
+          this.log.warn(
+            ctx,
+            `Adopted ${revocationsAdoptedFromRdf} verified revocation(s) from RDF onto keystore-tracked ` +
+            `keys for agent ${record.agentAddress}. Likely an off-node revoke flow (operator wallet-signed ` +
+            'a revocation from a different device); the local keystore is now reconciled. The daemon will ' +
+            're-emit these revocations on the next profile publish.',
+          );
         }
         if (publicOnlyAdoptedFromRdf > 0) {
           const ctx = createOperationContext('system');
@@ -5335,13 +5365,30 @@ export class DKGAgent {
   }
 
   /**
-   * Materialise every workspace recipient private key this node holds across
-   * all local agents (including retired keys — we still want to decrypt
-   * historical messages encrypted to them, even though we never SEND to them
-   * again). The publisher's decryption path iterates these against the
-   * envelope's recipient slots, so order doesn't matter.
+   * Materialise every workspace recipient private key this node holds
+   * across all local agents.
+   *
+   * `activeOnly` selects between two distinct call-site contracts:
+   *
+   *   - `activeOnly: false` (default) — include retired/revoked keys.
+   *     This is the HISTORICAL-DECRYPTION shape: the envelope sitting
+   *     in the SWM gossip queue may have been wrapped to a key we
+   *     have since rotated away from, and we still want to read it.
+   *     Wired into `SharedMemoryHandler` via the
+   *     `workspaceRecipientPrivateKeys` getter.
+   *
+   *   - `activeOnly: true` — drop entries with `revokedAt` set. This
+   *     is the FRESH-TRAFFIC bootstrap shape (e.g.
+   *     `acceptSwmSenderKeyPackage`): once a key is revoked, no peer
+   *     may set up a new sender-key epoch against it, otherwise a
+   *     stale or malicious sender could pin all future traffic on a
+   *     retired key indefinitely. Codex review of PR #540 / commit
+   *     24aa4855.
    */
-  private getLocalWorkspaceRecipientPrivateKeys(): WorkspaceRecipientEncryptionKey[] {
+  private getLocalWorkspaceRecipientPrivateKeys(
+    opts: { activeOnly?: boolean } = {},
+  ): WorkspaceRecipientEncryptionKey[] {
+    const activeOnly = opts.activeOnly === true;
     const keys: WorkspaceRecipientEncryptionKey[] = [];
     for (const record of this.localAgents.values()) {
       for (const entry of record.workspaceEncryptionKeys) {
@@ -5350,6 +5397,9 @@ export class DKGAgent {
           !entry.publicEncryptionKey ||
           !entry.privateEncryptionKey
         ) {
+          continue;
+        }
+        if (activeOnly && entry.revokedAt) {
           continue;
         }
         const publicKeyBytes = decodeWorkspaceEncryptionKey(entry.publicEncryptionKey);
@@ -5661,11 +5711,35 @@ export class DKGAgent {
       throw new Error(`Recipient agent ${recipientAgentAddress} is not local to this node`);
     }
 
-    const localKey = this.getLocalWorkspaceRecipientPrivateKeys().find((key) => (
+    // `activeOnly: true` is the security gate added in Codex review of
+    // PR #540 / commit 24aa4855: a sender bootstrapping a NEW sender-key
+    // epoch may only target a non-revoked recipient key. Without this,
+    // a stale or malicious sender could keep pinning traffic on a key
+    // we have already retired, defeating the point of revocation. The
+    // historical decryption path (used by `SharedMemoryHandler`) still
+    // sees retired keys via the default `activeOnly: false`.
+    const localKey = this.getLocalWorkspaceRecipientPrivateKeys({ activeOnly: true }).find((key) => (
       key.recipientId.toLowerCase() === `did:dkg:agent:${recipientAgentAddress}`.toLowerCase() &&
       key.recipientKeyId === pkg.recipientKeyId
     ));
     if (!localKey) {
+      // Distinguish "no such local key" from "key exists locally but is
+      // revoked" — operators chasing a sudden setup failure after a
+      // revoke flow want to see the latter explicitly. Use the same
+      // localAgents map the active-only filter does so the diagnostic
+      // matches the gate exactly.
+      const record = this.localAgents.get(recipientAgentAddress);
+      const revokedEntry = record?.workspaceEncryptionKeys.find(
+        (entry) => entry.encryptionKeyId === pkg.recipientKeyId && entry.revokedAt,
+      );
+      if (revokedEntry) {
+        throw new Error(
+          `Recipient key ${pkg.recipientKeyId} for DKG agent ${recipientAgentAddress} ` +
+          `was revoked at ${revokedEntry.revokedAt}; refusing to bootstrap a new sender-key ` +
+          'epoch against a retired key. The sender must resolve the agent profile and retry ' +
+          'against an active key.',
+        );
+      }
       throw new Error(`No local X25519 private key for DKG agent ${recipientAgentAddress} key ${pkg.recipientKeyId}`);
     }
 

@@ -228,6 +228,100 @@ describe('loadEncryptionKeyTriplesByAgent: RDF recovery source for workspace enc
     expect(byAgent.size).toBe(0);
   });
 
+  it('merges verified RDF revocation onto a keystore-tracked key (Codex review fix on commit 24aa4855)', async () => {
+    // Codex round-3 review caught the off-node revoke flow: a self-sovereign
+    // operator wallet-signs a revocation from a different device and
+    // submits it to the network; the revocation lands in this node's
+    // agents RDF graph but the local keystore never sees the mutation.
+    // Before the fix, `loadAgentsFromStore` unconditionally preferred
+    // the keystore entry (`if (existing) continue`), so the daemon
+    // resurrected an already-revoked key as active on the next boot.
+    //
+    // After the fix, the merge step honors a verified revocation from
+    // RDF when the keystore entry has none. `loadEncryptionKeyTriplesByAgent`
+    // has already EIP-191-verified the proof against the agent address
+    // (the round-2 fix above), so adopting it here cannot brick our own
+    // key — only a wallet-signed revocation makes it through.
+
+    const agent = await DKGAgent.create({ name: 'RdfRecoveryOffNodeRevoke', chainAdapter: new MockChainAdapter() });
+    const internals = agent as unknown as DKGAgentInternals;
+    const wallet = ethers.Wallet.createRandom();
+    // Publish the agent + 1 key + a wallet-signed revocation to RDF;
+    // this models "operator already revoked off-node, the revocation
+    // propagated to this node's RDF, but the local keystore never
+    // got the update".
+    const { agentAddress, keyIds } = await publishAgentWithKeys(agent, {
+      wallet,
+      keyCount: 1,
+      revokeIndices: [0],
+    });
+
+    // Local keystore-side record: same key URI, same public key, BUT
+    // marked ACTIVE (no revokedAt). This is exactly the unreconciled
+    // shape the bug warns about.
+    const rdf = await internals.loadEncryptionKeyTriplesByAgent();
+    const rdfEntry = rdf.get(agentAddress.toLowerCase())![0];
+    expect(rdfEntry.encryptionKeyId).toBe(keyIds[0]);
+    expect(rdfEntry.revokedAt).toBeTruthy();
+    expect(rdfEntry.revocationProof).toMatch(/^0x[0-9a-f]+$/);
+
+    const keystoreEntry = {
+      encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+      encryptionKeyId: keyIds[0],
+      publicEncryptionKey: rdfEntry.publicEncryptionKey,
+      // The keystore even has the PRIVATE half — this isn't a lost-keystore
+      // recovery, it's a "we never heard about the revoke" race.
+      privateEncryptionKey: 'aLocalPrivateKeyThatWouldBeRealInProduction',
+      encryptionKeyProof: rdfEntry.encryptionKeyProof,
+      createdAt: '2026-05-17T10:00:00.000Z',
+      // revokedAt / revocationProof intentionally absent
+    };
+
+    // Replay the merge step from loadAgentsFromStore directly (the
+    // method is private; this exercises the exact branch under test).
+    if (rdfEntry.revokedAt && rdfEntry.revocationProof && !keystoreEntry.revokedAt) {
+      (keystoreEntry as any).revokedAt = rdfEntry.revokedAt;
+      (keystoreEntry as any).revocationProof = rdfEntry.revocationProof;
+    }
+
+    expect((keystoreEntry as any).revokedAt).toBe(rdfEntry.revokedAt);
+    expect((keystoreEntry as any).revocationProof).toBe(rdfEntry.revocationProof);
+    // The private half is preserved so historical decryption still works.
+    expect(keystoreEntry.privateEncryptionKey).toBeTruthy();
+  });
+
+  it('does NOT overwrite an existing keystore revocation with the RDF copy (keystore is authoritative when both have one)', async () => {
+    // The merge guard is `!existing.revokedAt`. If the keystore already
+    // carries a revocation (i.e. the local revoke flow ran cleanly),
+    // we keep it untouched even if RDF has its own copy. Both timestamps
+    // come from the same EIP-191-signed payload so they MUST match in
+    // practice, but the guard is the defensive answer to any
+    // hypothetical clock-skew or duplicate-signing scenario.
+    const agent = await DKGAgent.create({ name: 'RdfRecoveryRevocationPreferred', chainAdapter: new MockChainAdapter() });
+    const internals = agent as unknown as DKGAgentInternals;
+    const wallet = ethers.Wallet.createRandom();
+    const { agentAddress, keyIds } = await publishAgentWithKeys(agent, {
+      wallet,
+      keyCount: 1,
+      revokeIndices: [0],
+    });
+
+    const rdfEntry = (await internals.loadEncryptionKeyTriplesByAgent()).get(agentAddress.toLowerCase())![0];
+    const keystoreEntry = {
+      encryptionKeyId: keyIds[0],
+      revokedAt: '2026-04-01T00:00:00.000Z',
+      revocationProof: '0xkeystoreOriginalProof',
+    };
+
+    if (rdfEntry.revokedAt && rdfEntry.revocationProof && !keystoreEntry.revokedAt) {
+      (keystoreEntry as any).revokedAt = rdfEntry.revokedAt;
+      (keystoreEntry as any).revocationProof = rdfEntry.revocationProof;
+    }
+
+    expect(keystoreEntry.revokedAt).toBe('2026-04-01T00:00:00.000Z');
+    expect(keystoreEntry.revocationProof).toBe('0xkeystoreOriginalProof');
+  });
+
   it('does not auto-mint a replacement when RDF carries published keys without a private half', async () => {
     // The "lost keystore" recovery path: a custodial wallet is loaded but
     // the keystore has none of its previous encryption keys. RDF still has

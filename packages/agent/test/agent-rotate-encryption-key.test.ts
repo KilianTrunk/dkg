@@ -226,3 +226,66 @@ describe('profile-publish failure surfacing (Codex PR review fix)', () => {
     expect(publishCalls).toBe(1);
   });
 });
+
+interface GetRecipientKeysInternals {
+  localAgents: Map<string, AgentKeyRecord>;
+  getLocalWorkspaceRecipientPrivateKeys(opts?: { activeOnly?: boolean }): Array<{ recipientKeyId: string; recipientId: string }>;
+}
+
+describe('getLocalWorkspaceRecipientPrivateKeys: activeOnly filter (Codex review fix on commit 24aa4855)', () => {
+  // Codex round-3 review on PR #540: revoked keys were leaking into
+  // `acceptSwmSenderKeyPackage`'s recipient-key lookup, letting a stale
+  // sender bootstrap fresh sender-key epochs against a retired key
+  // indefinitely. The fix: introduce an `activeOnly` flag so the
+  // bootstrap path drops revoked keys while the historical-decrypt
+  // path (SharedMemoryHandler) keeps seeing them.
+
+  it('default (activeOnly omitted): returns BOTH active and revoked keys for the historical-decrypt path', async () => {
+    const { agent, record } = await bootAgentWithCustodialRecord();
+    const internals = agent as unknown as DKGAgentInternals & GetRecipientKeysInternals;
+    // Rotate once so we have 2 keys, then revoke the original.
+    await agent.rotateWorkspaceEncryptionKey(record.agentAddress);
+    const firstKeyId = record.workspaceEncryptionKeys[0].encryptionKeyId;
+    await agent.revokeWorkspaceEncryptionKey(record.agentAddress, firstKeyId);
+
+    const all = internals.getLocalWorkspaceRecipientPrivateKeys();
+    expect(all.map((k) => k.recipientKeyId).sort()).toEqual(
+      record.workspaceEncryptionKeys.map((k) => k.encryptionKeyId).sort(),
+    );
+    // Specifically: the revoked key is INCLUDED in the default view.
+    expect(all.some((k) => k.recipientKeyId === firstKeyId)).toBe(true);
+  });
+
+  it('activeOnly=true: drops revoked keys so sender-key bootstrap can never target them', async () => {
+    const { agent, record } = await bootAgentWithCustodialRecord();
+    const internals = agent as unknown as DKGAgentInternals & GetRecipientKeysInternals;
+    await agent.rotateWorkspaceEncryptionKey(record.agentAddress);
+    const firstKeyId = record.workspaceEncryptionKeys[0].encryptionKeyId;
+    await agent.revokeWorkspaceEncryptionKey(record.agentAddress, firstKeyId);
+    // active set is exactly the non-revoked entries
+    const activeIds = record.workspaceEncryptionKeys.filter((k) => !k.revokedAt).map((k) => k.encryptionKeyId);
+
+    const active = internals.getLocalWorkspaceRecipientPrivateKeys({ activeOnly: true });
+    expect(active.map((k) => k.recipientKeyId).sort()).toEqual(activeIds.sort());
+    expect(active.some((k) => k.recipientKeyId === firstKeyId)).toBe(false);
+  });
+
+  it('activeOnly=true with all keys revoked: returns empty (no bootstrap possible until rotate)', async () => {
+    const { agent, record } = await bootAgentWithCustodialRecord();
+    const internals = agent as unknown as DKGAgentInternals & GetRecipientKeysInternals;
+    // Mint a second key so we can revoke the first, then mark the
+    // remaining one as revoked too (bypassing the last-active guard
+    // by mutating the record directly — this models the "all keys
+    // revoked at boot from RDF" pathological state).
+    await agent.rotateWorkspaceEncryptionKey(record.agentAddress);
+    const firstKeyId = record.workspaceEncryptionKeys[0].encryptionKeyId;
+    await agent.revokeWorkspaceEncryptionKey(record.agentAddress, firstKeyId);
+    record.workspaceEncryptionKeys[1].revokedAt = new Date().toISOString();
+    record.workspaceEncryptionKeys[1].revocationProof = '0xstub';
+
+    const active = internals.getLocalWorkspaceRecipientPrivateKeys({ activeOnly: true });
+    expect(active).toHaveLength(0);
+    // Default view still surfaces both so historical envelopes are decryptable.
+    expect(internals.getLocalWorkspaceRecipientPrivateKeys()).toHaveLength(2);
+  });
+});

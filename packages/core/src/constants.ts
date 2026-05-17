@@ -15,7 +15,15 @@ export const PROTOCOL_SYNC = '/dkg/10.0.0/sync';
 // same 10.0.1 minor.
 export const PROTOCOL_MESSAGE = '/dkg/10.0.1/message';
 export const PROTOCOL_ACCESS = '/dkg/10.0.0/private-access';
-export const PROTOCOL_QUERY_REMOTE = '/dkg/10.0.0/query-remote';
+// rc.9 PR-9: bumped from /dkg/10.0.0/query-remote to opt into the
+// Universal Messenger substrate. Query responses can be large
+// (SPARQL result sets), so a duplicate receive (multi-path race or
+// idempotency-retry) that hits the 256 KiB mark-only response cache
+// returns RESPONSE_GONE. queryRemote() handles RESPONSE_GONE by
+// re-issuing the query with a fresh messageId — SPARQL is idempotent
+// at the app layer so this is semantically safe (see
+// docs/messenger.md "Response caching policy").
+export const PROTOCOL_QUERY_REMOTE = '/dkg/10.0.1/query-remote';
 export const PROTOCOL_SWM_SENDER_KEY = '/dkg/10.0.0/swm-sender-key';
 
 export const PROTOCOL_JOIN_REQUEST = '/dkg/10.0.0/join-request';

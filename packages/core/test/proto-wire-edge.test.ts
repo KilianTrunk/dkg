@@ -144,27 +144,21 @@ describe('Malformed wire input (03 §14–15): decoders fail closed on corrupt p
     expect(() => decodeKAUpdateRequest(new Uint8Array([0x0a, 0x03, 0x61, 0x62]))).toThrow();
   });
 
-  it('empty buffer decodes to default empty message (callers must validate semantics)', () => {
-    const d = decodeDiscoverRequest(new Uint8Array(0));
-    expect(d.type).toBe('');
-    expect(d.query).toBe('');
+  it('decodeDiscoverRequest throws on semantically empty payloads', () => {
+    expect(() => decodeDiscoverRequest(new Uint8Array(0))).toThrow(/Invalid DiscoverRequest payload/);
   });
 });
 
 describe('Schema isolation: wrong decoder rejects foreign bytes', () => {
-  it('Discover bytes are not decodable as QueryRequest (throws)', () => {
+  it('Discover bytes are not decodable as QueryRequest', () => {
     const discoverBytes = encodeDiscoverRequest({
       type: 't',
       query: 'q',
       contextGraphId: 'p',
       limit: 1,
     });
-    // NOTE: Protobuf decoding is not a fully reliable schema-isolation boundary.
-    // Foreign payloads can sometimes decode as garbage/defaults rather than throwing,
-    // depending on field tag/type layout compatibility between schemas. This assertion
-    // verifies the *current* behavior; if schemas evolve to become accidentally
-    // compatible, this test may need a different approach (e.g., semantic validation).
-    expect(() => decodeQueryRequest(discoverBytes)).toThrow();
+
+    expect(() => decodeQueryRequest(discoverBytes)).toThrow(/Invalid QueryRequest payload/);
 
     // Sanity: the same bytes round-trip correctly with the matching decoder
     const roundTrip = decodeDiscoverRequest(discoverBytes);

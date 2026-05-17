@@ -161,23 +161,28 @@ describe('StorageACKMsg', () => {
   });
 
   it('a new decoder reading bytes from an old encoder still yields a valid ACK (forward compat)', () => {
-    // Pre-decline shape — a fixed byte sequence stands in for what an
-    // older release would have written. We synthesise it with the
-    // current encoder by leaving the new decline fields unset; the
-    // length-prefixed wire format guarantees an old encoder produces
-    // the same bytes (proto3 default-skipping is consistent across
-    // protobufjs versions in this repo).
-    const oldShape: StorageACKMsg = {
-      merkleRoot: new Uint8Array(32).fill(0xa5),
-      coreNodeSignatureR: new Uint8Array(32).fill(0x11),
-      coreNodeSignatureVS: new Uint8Array(32).fill(0x22),
-      contextGraphId: 'cg-100',
-      nodeIdentityId: 7,
-    };
-    const wire = encodeStorageACK(oldShape);
+    // Literal pre-decline wire shape from the old 5-field schema:
+    // 1=merkleRoot, 2=signatureR, 3=signatureVS, 4=contextGraphId,
+    // 5=nodeIdentityId. Keeping this as bytes catches regressions where
+    // the new schema stops decoding historical ACK payloads even though
+    // the current encoder still omits unset decline fields.
+    const wire = Uint8Array.from([
+      0x0a, 0x20,
+      ...new Array(32).fill(0xa5),
+      0x12, 0x20,
+      ...new Array(32).fill(0x11),
+      0x1a, 0x20,
+      ...new Array(32).fill(0x22),
+      0x22, 0x06,
+      0x63, 0x67, 0x2d, 0x31, 0x30, 0x30,
+      0x28, 0x07,
+    ]);
     const decoded = decodeStorageACK(wire);
     expect(decoded.contextGraphId).toBe('cg-100');
     expect(Number(decoded.nodeIdentityId)).toBe(7);
+    expect(new Uint8Array(decoded.merkleRoot)).toEqual(new Uint8Array(32).fill(0xa5));
+    expect(new Uint8Array(decoded.coreNodeSignatureR)).toEqual(new Uint8Array(32).fill(0x11));
+    expect(new Uint8Array(decoded.coreNodeSignatureVS)).toEqual(new Uint8Array(32).fill(0x22));
     expect(decoded.declineCode == null || decoded.declineCode === '').toBe(true);
   });
 });

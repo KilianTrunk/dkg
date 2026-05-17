@@ -83,10 +83,8 @@ export class StorageACKHandler {
   /**
    * Encode a structured decline response. Used in place of `throw` for
    * the subset of failures that represent "I as a core legitimately
-   * cannot ACK this request right now" — most importantly the
-   * `<contextGraphsServed>` mismatch that GitHub issue #541 stalls on,
-   * and the SWM-side cases that present the same way to the publisher
-   * (data missing, data stale).
+   * cannot ACK this request right now" — currently SWM-side cases
+   * that present as "data missing" or "data stale" to the publisher.
    *
    * The publisher's collector treats declines as **permanent for this
    * request** and surfaces the per-peer reason in the final error if

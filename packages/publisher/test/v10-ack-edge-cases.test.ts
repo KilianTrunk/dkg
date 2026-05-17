@@ -1141,7 +1141,7 @@ describe('ACKCollector typed declines (#541)', () => {
 
   it('an unknown decline code is logged and skipped (forward-compat with future codes)', async () => {
     const sendP2P = buildSendP2PWithDeclines({
-      'peer-0': { code: 'CG_NOT_HOSTED_FUTURE_VARIANT', message: 'reserved for follow-up' },
+      'peer-0': { code: 'FUTURE_DECLINE_CODE', message: 'reserved for follow-up' },
     });
     const log = noop();
     const deps: ACKCollectorDeps = {
@@ -1158,7 +1158,7 @@ describe('ACKCollector typed declines (#541)', () => {
 
     expect(log.calls.some(
       (c: unknown[]) => (c[0] as string).includes('Decline from peer-0')
-        && (c[0] as string).includes('CG_NOT_HOSTED_FUTURE_VARIANT'),
+        && (c[0] as string).includes('FUTURE_DECLINE_CODE'),
     )).toBe(true);
   });
 

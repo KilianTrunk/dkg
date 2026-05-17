@@ -29,10 +29,10 @@ const { Type, Field } = protobuf;
 /**
  * Declinable reasons a core node can return on `/dkg/10.0.0/storage-ack`
  * instead of a signed ACK. These are situations where the core
- * legitimately cannot produce an ACK (it doesn't host the CG, its SWM
- * is missing or stale relative to the publisher's payload, or its
- * operational signer was just rotated off-chain) — distinct from a
- * malformed-request error that should still close the libp2p stream.
+ * legitimately cannot produce an ACK (its SWM is missing or stale
+ * relative to the publisher's payload, or its operational signer was
+ * just rotated off-chain) — distinct from a malformed-request error
+ * that should still close the libp2p stream.
  *
  * The publisher treats declines as **permanent for this request** (no
  * retry against the same peer), reports the per-peer decline reason in
@@ -46,8 +46,6 @@ const { Type, Field } = protobuf;
  * "unknown decline" path); renaming or removing one IS breaking.
  */
 export const STORAGE_ACK_DECLINE_CODES = {
-  /** Core does not host the requested CG (no `<contextGraphsServed>`). */
-  NOT_HOSTED: 'NOT_HOSTED',
   /** SWM CONSTRUCT returned no quads for the request. */
   NO_DATA_IN_SWM: 'NO_DATA_IN_SWM',
   /** SWM has data but its merkle root does not match the publisher's. */

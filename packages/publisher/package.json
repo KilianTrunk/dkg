@@ -12,11 +12,11 @@
     "clean": "rm -rf dist tsconfig.tsbuildinfo"
   },
   "dependencies": {
+    "@multiformats/multiaddr": "^13.0.3",
     "@origintrail-official/dkg-chain": "workspace:*",
     "@origintrail-official/dkg-core": "workspace:*",
     "@origintrail-official/dkg-query": "workspace:*",
     "@origintrail-official/dkg-storage": "workspace:*",
-    "@multiformats/multiaddr": "^13.0.1",
     "ethers": "^6.16.0"
   },
   "devDependencies": {

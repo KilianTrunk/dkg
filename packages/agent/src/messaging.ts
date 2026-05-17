@@ -258,11 +258,17 @@ export class MessageHandler {
       );
 
       if (!sendResult.delivered) {
+        // inFlight === true means another sender holds the slot;
+        // no durable outbox row exists yet, so surface it as a
+        // not-yet-queued attempt the caller should retry immediately.
+        const nextAttemptAtMs = sendResult.queued
+          ? sendResult.nextAttemptAtMs
+          : Date.now();
         return {
           delivered: false,
           queued: sendResult.queued,
           attempts: sendResult.attempts,
-          nextAttemptAtMs: sendResult.nextAttemptAtMs,
+          nextAttemptAtMs,
           error: sendResult.error,
         };
       }

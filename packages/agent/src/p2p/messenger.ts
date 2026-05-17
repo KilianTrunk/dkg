@@ -181,6 +181,11 @@ export interface SendReliableOpts {
  *     `attempts` tracks the total retry count so far (starts at 1 for
  *     the first failure).
  *
+ *   - `{ delivered: false, queued: false, inFlight: true, ... }` —
+ *     another sender already owns the in-process attempt for this
+ *     `(peer, protocol, messageId)`. No durable outbox row necessarily
+ *     exists yet, so callers must not treat this as queued.
+ *
  *   - Thrown — non-recoverable error (encoding bug, unhandleable
  *     protocol id, etc.) is rethrown to the caller. The substrate
  *     does NOT enqueue these because retrying won't help.
@@ -211,12 +216,20 @@ export type ReliableSendResult =
        * Wall-clock ms when the next retry attempt is scheduled. The
        * MCP `dkg_send_message` tool surfaces this to operators so
        * they can see "queued, retrying at HH:MM:SS" instead of an
-       * opaque "queued" state. Equals `Date.now()` (i.e. "try
-       * again immediately") when the queued return path is taken
-       * because another in-flight attempter held the inflight slot
-       * — no real outbox entry exists yet in that case.
+       * opaque "queued" state.
        */
       nextAttemptAtMs: number;
+    }
+  | {
+      // Another sender already owns the in-process attempt for this
+      // (peer, protocol, messageId). No durable outbox row necessarily
+      // exists yet, so callers must NOT treat this as queued.
+      delivered: false;
+      queued: false;
+      inFlight: true;
+      attempts: 0;
+      messageId: string;
+      error: string;
     };
 
 /** Handler signature for `Messenger.register`. */
@@ -308,6 +321,7 @@ export class Messenger {
    * caller's handler.
    */
   private readonly handlers = new Map<string, ReliableHandler>();
+  private readonly inboundInFlight = new Map<string, Promise<Uint8Array>>();
 
   /**
    * Per-`(protocol, peer, messageId)` "first sendReliable invocation"
@@ -518,16 +532,16 @@ export class Messenger {
     // when the periodic tick + an opportunistic-flush fire close
     // together. Second attempter exits without dialing.
     if (!outbox.tryBeginAttempt(peerId, protocolId, messageId)) {
-      // Another attempt is in flight. Return queued; the in-flight
-      // one will either deliver (writes to idempotency cache) or
-      // re-enqueue (updates outbox).
+      // Another attempt is in flight. This is not the same thing as
+      // durable queued: the winning attempt may still be on its first
+      // wire send and no outbox row may exist yet.
       return {
         delivered: false,
-        queued: true,
-        attempts: 1,
+        queued: false,
+        inFlight: true,
+        attempts: 0,
         messageId,
         error: 'send already in flight for this messageId',
-        nextAttemptAtMs: this.clock(),
       };
     }
 
@@ -639,9 +653,23 @@ export class Messenger {
         return seen.cachedResponse ?? RESPONSE_GONE_BYTES;
       }
 
-      const response = await handler(envelope.payload, peerKey);
-      idem.record(peerKey, protocolId, envelope.messageId, 'in', response);
-      return response;
+      const inFlightKey = this.idempotencyKey(peerKey, protocolId, envelope.messageId, 'in');
+      const inFlight = this.inboundInFlight.get(inFlightKey);
+      if (inFlight) {
+        return inFlight;
+      }
+
+      const handled = (async () => {
+        const response = await handler(envelope.payload, peerKey);
+        idem.record(peerKey, protocolId, envelope.messageId, 'in', response);
+        return response;
+      })();
+      this.inboundInFlight.set(inFlightKey, handled);
+      try {
+        return await handled;
+      } finally {
+        this.inboundInFlight.delete(inFlightKey);
+      }
     });
   }
 
@@ -852,6 +880,15 @@ export class Messenger {
     if (!this.idempotencyStore || !this.outbox) {
       throw new MessengerNotConfiguredError(method);
     }
+  }
+
+  private idempotencyKey(
+    peer: string,
+    protocol: string,
+    messageId: string,
+    direction: 'in' | 'out',
+  ): string {
+    return `${peer}\x00${protocol}\x00${messageId}\x00${direction}`;
   }
 }
 

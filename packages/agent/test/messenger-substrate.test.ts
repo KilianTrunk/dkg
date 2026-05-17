@@ -143,6 +143,36 @@ describe('Messenger.sendReliable (failure / outbox)', () => {
     expect(outboxStore.hasEntry(PEER_A, PROTO, FIXED_MSG_ID)).toBe(true);
   });
 
+  it('reports inFlight instead of queued when a duplicate send races the active attempt', async () => {
+    let release!: (value: Uint8Array) => void;
+    const router = makeRouter(
+      () => new Promise<Uint8Array>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const { messenger, outboxStore } = makeSubstrate({ router });
+
+    const first = messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+      messageId: FIXED_MSG_ID,
+    });
+    expect(router.send).toHaveBeenCalledTimes(1);
+
+    const second = await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+      messageId: FIXED_MSG_ID,
+    });
+    expect(second).toMatchObject({
+      delivered: false,
+      queued: false,
+      inFlight: true,
+      attempts: 0,
+      messageId: FIXED_MSG_ID,
+    });
+    expect(outboxStore.size()).toBe(0);
+
+    release(new Uint8Array([0x55]));
+    await expect(first).resolves.toMatchObject({ delivered: true, messageId: FIXED_MSG_ID });
+  });
+
   it('rethrows non-recoverable errors without enqueueing', async () => {
     const router = makeRouter(async () => {
       throw new Error('something unexpected exploded');
@@ -219,6 +249,36 @@ describe('Messenger.register (receiver-side idempotency)', () => {
     expect(handler).toHaveBeenCalledTimes(1);
     expect(Array.from(first)).toEqual([0xaa]);
     expect(Array.from(second)).toEqual([0xaa]);
+  });
+
+  it('coalesces concurrent duplicate receives while the first handler is still running', async () => {
+    const { messenger, router } = makeSubstrate();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const handler = vi.fn(async () => {
+      await gate;
+      return new Uint8Array([0xab]);
+    });
+    messenger.register(PROTO, handler);
+
+    const envelope = encodeReliableEnvelope({
+      messageId: FIXED_MSG_ID,
+      version: RELIABLE_ENVELOPE_VERSION,
+      tsMs: 1,
+      payload: new Uint8Array([1]),
+    });
+    const peerIdObj = { toString: () => PEER_A, toBytes: () => new Uint8Array() };
+    const first = router.inboundHandler!(envelope, peerIdObj);
+    const second = router.inboundHandler!(envelope, peerIdObj);
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    release();
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
+    expect(Array.from(firstResponse)).toEqual([0xab]);
+    expect(Array.from(secondResponse)).toEqual([0xab]);
+    expect(handler).toHaveBeenCalledTimes(1);
   });
 
   it('returns RESPONSE_GONE bytes on a duplicate receive when the original response was too big to cache', async () => {

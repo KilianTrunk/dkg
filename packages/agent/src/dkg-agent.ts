@@ -2633,19 +2633,22 @@ export class DKGAgent {
     // operators see a single "outbox tick" beat.
     this.messengerOutboxTimer = setInterval(() => {
       const now = Date.now();
-      this.messenger.processOutboxTick(now).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.log.warn(ctx, `Messenger-outbox retry tick failed: ${message}`);
-      });
-      const dropped = this.messenger.dropExpiredOutbox(now);
-      for (const entry of dropped) {
-        this.log.warn(
-          ctx,
-          `Messenger-outbox dropped after ${entry.attempts} attempts: ` +
-            `peer=${entry.peer.slice(-8)} protocol=${entry.protocol} ` +
-            `msgId=${entry.messageId.slice(0, 8)} lastError="${entry.lastError}"`,
-        );
-      }
+      this.messenger.processOutboxTick(now)
+        .catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Messenger-outbox retry tick failed: ${message}`);
+        })
+        .finally(() => {
+          const dropped = this.messenger.dropExpiredOutbox(now);
+          for (const entry of dropped) {
+            this.log.warn(
+              ctx,
+              `Messenger-outbox dropped after ${entry.attempts} attempts: ` +
+                `peer=${entry.peer.slice(-8)} protocol=${entry.protocol} ` +
+                `msgId=${entry.messageId.slice(0, 8)} lastError="${entry.lastError}"`,
+            );
+          }
+        });
     }, MESSAGE_OUTBOX_TICK_MS);
     if (this.messengerOutboxTimer.unref) this.messengerOutboxTimer.unref();
 

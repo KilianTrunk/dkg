@@ -53,7 +53,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
@@ -642,7 +642,16 @@ export async function runDaemonInner(
   // No caller exercises this path until PR-3 (chat + skill migration);
   // wiring early keeps Milestone A trivially deployable + soak-testable.
   const messengerIdempotencyStore = new SqliteMessageIdempotencyStore(dashDb);
-  const messengerOutboxStore = new SqliteProtocolOutboxStore(dashDb);
+  const messengerOutboxStore = new SqliteProtocolOutboxStore(dashDb, {
+    maxAgeMs: DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS,
+    backoffFor: (attempts) => {
+      const idx = Math.min(
+        Math.max(attempts - 1, 0),
+        DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS.length - 1,
+      );
+      return DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS[idx];
+    },
+  });
 
   const agent = await DKGAgent.create({
     name: config.name,

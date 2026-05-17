@@ -52,7 +52,18 @@ export function encodeQueryRequest(msg: QueryRequestMsg): Uint8Array {
 }
 
 export function decodeQueryRequest(buf: Uint8Array): QueryRequestMsg {
-  return QueryRequestSchema.decode(buf) as unknown as QueryRequestMsg;
+  const decoded = QueryRequestSchema.decode(buf) as unknown as QueryRequestMsg;
+  if (
+    typeof decoded.sparql !== 'string' ||
+    decoded.sparql.length === 0 ||
+    typeof decoded.contextGraphId !== 'string' ||
+    decoded.contextGraphId.length === 0 ||
+    typeof decoded.timeout !== 'number' ||
+    decoded.timeout <= 0
+  ) {
+    throw new Error('Invalid QueryRequest payload');
+  }
+  return decoded;
 }
 
 export function encodeQueryResponse(msg: QueryResponseMsg): Uint8Array {

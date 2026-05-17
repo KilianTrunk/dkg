@@ -58,6 +58,22 @@ describe('SqliteMessageIdempotencyStore', () => {
     expect(result.seen && Array.from(result.cachedResponse ?? [])).toEqual(Array.from(resp));
   });
 
+  it('snapshots cached responses on write and read', () => {
+    const store = new SqliteMessageIdempotencyStore(db);
+    const resp = new Uint8Array([1, 2, 3]);
+    store.record(PEER_A, PROTO, MSG_1, 'in', resp);
+
+    resp[0] = 9;
+    const first = store.check(PEER_A, PROTO, MSG_1, 'in');
+    expect(first.seen && Array.from(first.cachedResponse ?? [])).toEqual([1, 2, 3]);
+
+    if (first.seen && first.cachedResponse) {
+      first.cachedResponse[1] = 8;
+    }
+    const second = store.check(PEER_A, PROTO, MSG_1, 'in');
+    expect(second.seen && Array.from(second.cachedResponse ?? [])).toEqual([1, 2, 3]);
+  });
+
   it('stores mark-only (NULL blob) for responses larger than RESPONSE_CACHE_BYTES', () => {
     const store = new SqliteMessageIdempotencyStore(db);
     const oversize = new Uint8Array(RESPONSE_CACHE_BYTES + 1);
@@ -138,6 +154,31 @@ describe('SqliteProtocolOutboxStore', () => {
     expect(Array.from(entry.payload)).toEqual(Array.from(PAYLOAD));
   });
 
+  it('configurePolicy updates the SQLite store backoff and max age', () => {
+    const store = new SqliteProtocolOutboxStore(db);
+    store.configurePolicy({ backoffFor: () => 123, maxAgeMs: 60_000 });
+
+    const entry = store.enqueue(PEER_A, PROTO, MSG_1, PAYLOAD, 'reset', 0);
+    expect(entry.nextAttemptAt).toBe(123);
+    expect(store.dropExpired(60_000)).toHaveLength(0);
+    expect(store.dropExpired(60_001)).toHaveLength(1);
+  });
+
+  it('snapshots payload bytes on write and read', () => {
+    const store = new SqliteProtocolOutboxStore(db, { backoffFor: () => 5_000 });
+    const payload = new Uint8Array([1, 2, 3]);
+    const entry = store.enqueue(PEER_A, PROTO, MSG_1, payload, 'reset', 1000);
+
+    payload[0] = 9;
+    entry.payload[1] = 8;
+
+    const pending = store.pendingFor(PEER_A);
+    expect(Array.from(pending[0].payload)).toEqual([1, 2, 3]);
+
+    pending[0].payload[2] = 7;
+    expect(Array.from(store.due(6000)[0].payload)).toEqual([1, 2, 3]);
+  });
+
   it('enqueue bumps attempts and reschedules on repeat failure for the same key', () => {
     const store = new SqliteProtocolOutboxStore(db, { backoffFor: (n) => n * 1000 });
     store.enqueue(PEER_A, PROTO, MSG_1, PAYLOAD, 'first', 1_000_000);
@@ -197,11 +238,15 @@ describe('SqliteProtocolOutboxStore', () => {
 
   it('survives re-open with entries preserved (durability sanity)', () => {
     const store = new SqliteProtocolOutboxStore(db);
-    // Use a recent timestamp — DashboardDB's constructor runs prune()
-    // which deletes protocol_outbox rows with first_failure_at older
-    // than 24h, so ancient test timestamps would get swept on reopen.
-    const now = Date.now();
-    store.enqueue(PEER_A, PROTO, MSG_1, PAYLOAD, 'crash-before-delivery', now);
+    const oldEnoughForDefaultPolicy = Date.now() - 25 * 60 * 60 * 1000;
+    store.enqueue(
+      PEER_A,
+      PROTO,
+      MSG_1,
+      PAYLOAD,
+      'crash-before-delivery',
+      oldEnoughForDefaultPolicy,
+    );
 
     db.close();
     db = new DashboardDB({ dataDir: dir });

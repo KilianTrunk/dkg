@@ -67,6 +67,10 @@ function shouldTriggerDhtWalk(errMsg: string): boolean {
   return DHT_WALK_TRIGGER_ERRORS.some((needle) => lower.includes(needle));
 }
 
+function isRecoverableMessengerSendError(err: unknown, errMsg: string): boolean {
+  return isRecoverableSendError(err) || shouldTriggerDhtWalk(errMsg);
+}
+
 export interface MessengerDeps {
   router: ProtocolRouter;
   /**
@@ -364,13 +368,14 @@ export class Messenger {
       );
       idem.record(peerId, protocolId, messageId, 'out', response);
       outbox.markDelivered(peerId, protocolId, messageId);
+      this.clearDhtWalkRateLimitIfDrained(peerId);
       return { delivered: true, response, attempts: 1, messageId };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       // Non-recoverable: rethrow. The caller sees the real error;
       // the outbox stays out of it because retrying an encoding
       // bug / unhandled protocol won't help.
-      if (!isRecoverableSendError(err)) {
+      if (!isRecoverableMessengerSendError(err, errMsg)) {
         throw err;
       }
       const entry = outbox.enqueueFailure(
@@ -536,9 +541,10 @@ export class Messenger {
         response,
       );
       outbox.markDelivered(entry.peer, entry.protocol, entry.messageId);
+      this.clearDhtWalkRateLimitIfDrained(entry.peer);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      if (isRecoverableSendError(err)) {
+      if (isRecoverableMessengerSendError(err, errMsg)) {
         const updated = outbox.enqueueFailure(
           entry.peer,
           entry.protocol,
@@ -608,6 +614,12 @@ export class Messenger {
       });
   }
 
+  private clearDhtWalkRateLimitIfDrained(peerId: string): void {
+    if (!this.outbox || this.outbox.pendingFor(peerId).length === 0) {
+      this.lastDhtWalkAt.delete(peerId);
+    }
+  }
+
   /**
    * Drop outbox entries past `maxAgeMs`. Returns the dropped
    * entries so the caller (lifecycle.ts periodic tick) can log
@@ -621,8 +633,12 @@ export class Messenger {
     lastError: string;
   }> {
     if (!this.outbox) return [];
-    return this.outbox
-      .dropExpired(now)
+    const dropped = this.outbox.dropExpired(now);
+    const droppedPeers = new Set(dropped.map((entry) => entry.peer));
+    for (const peer of droppedPeers) {
+      this.clearDhtWalkRateLimitIfDrained(peer);
+    }
+    return dropped
       .map(({ peer, protocol, messageId, attempts, lastError }) => ({
         peer,
         protocol,

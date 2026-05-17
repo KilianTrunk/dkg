@@ -22,11 +22,14 @@
 # RECIPIENT_PEER_ID is optional; when set, enables per-peer preflight
 # probe of /api/peer-info (PR #533 fields incl. getConnectionsReturnsForPeer).
 #
-# Usage (run from anywhere — logs always go to ~/.dkg/soak-test-<ts>-<TAG>/):
+# Usage (run from anywhere — logs always go to $DKG_HOME/soak-test-<ts>-<TAG>/):
 #   nohup caffeinate -i bash scripts/libp2p-soak-test.sh \
 #     RECIPIENT_PEER_ID=12D3Koo... \
 #     >> ~/.dkg/soak-test.out 2>&1 &
 #   disown
+#
+# Operators with a non-default home (e.g. ~/.dkg-dev) prefix with
+# DKG_HOME=~/.dkg-dev so auth token + log dir resolve correctly.
 #
 # Stop early:
 #   pkill -f libp2p-soak-test.sh
@@ -49,10 +52,17 @@ TOTAL_CYCLES="${TOTAL_CYCLES:-18}"
 INTERVAL_S="${INTERVAL_S:-1200}"   # 20 min
 INTERNET_PROBE_HOST="${INTERNET_PROBE_HOST:-1.1.1.1}"   # cloudflare DNS — universal, fast, no captive-portal interception
 
-API="${API:-http://127.0.0.1:9200}"
-AUTH=$(grep -v '^#' "${HOME}/.dkg/auth.token" | head -1)
+# DKG_HOME defaults to ~/.dkg but operators running dev nodes (e.g. hermes
+# with ~/.dkg-dev) can override it. All filesystem paths derive from this:
+# auth token, log dir, soak.out. Spotted by hermes-default during the 2026-05
+# rc9 soak — they were on ~/.dkg-dev and the hardcoded ~/.dkg path broke
+# auth resolution.
+DKG_HOME="${DKG_HOME:-${HOME}/.dkg}"
 
-LOG_DIR="${HOME}/.dkg/soak-test-$(date -u +%Y%m%d-%H%M%S)-${SENDER_TAG}"
+API="${API:-http://127.0.0.1:9200}"
+AUTH=$(grep -v '^#' "${DKG_HOME}/auth.token" | head -1)
+
+LOG_DIR="${DKG_HOME}/soak-test-$(date -u +%Y%m%d-%H%M%S)-${SENDER_TAG}"
 mkdir -p "$LOG_DIR"
 echo "$$" > "$LOG_DIR/pid"
 

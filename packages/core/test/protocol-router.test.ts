@@ -929,7 +929,10 @@ describe('ProtocolRouter', () => {
 
     function makeConn(opts: {
       label: string;
-      onNewStream: () => Promise<unknown>;
+      onNewStream: (
+        protocols?: string,
+        options?: { runOnLimitedConnection?: boolean; signal?: AbortSignal },
+      ) => Promise<unknown>;
     }) {
       return {
         status: 'open' as const,
@@ -1055,10 +1058,13 @@ describe('ProtocolRouter', () => {
       let aDials = 0;
       let bDials = 0;
       let dialCalls = 0;
+      let multipathSignal: AbortSignal | undefined;
+      let fallbackSignal: AbortSignal | undefined;
       const connA = makeConn({
         label: 'A-dead',
-        onNewStream: async () => {
+        onNewStream: async (_protocols, options) => {
           aDials += 1;
+          multipathSignal ??= options?.signal;
           throw new Error('A: stream returned in closed state');
         },
       });
@@ -1072,8 +1078,9 @@ describe('ProtocolRouter', () => {
       const node = {
         libp2p: {
           getConnections: () => [connA, connB],
-          dialProtocol: async () => {
+          dialProtocol: async (_peer: unknown, _protocol: string, options?: { signal?: AbortSignal }) => {
             dialCalls += 1;
+            fallbackSignal = options?.signal;
             return makeWorkingStream(new Uint8Array([0xCC])) as any;
           },
           handle: () => undefined,
@@ -1097,6 +1104,9 @@ describe('ProtocolRouter', () => {
       expect(aDials).toBeGreaterThanOrEqual(1);
       expect(bDials).toBeGreaterThanOrEqual(1);
       expect(dialCalls).toBeGreaterThanOrEqual(1);
+      expect(fallbackSignal).toBeDefined();
+      expect(fallbackSignal).not.toBe(multipathSignal);
+      expect(fallbackSignal?.aborted).toBe(false);
     });
 
     it('parallelPaths>1 accepts the number-form timeoutMs still working via opts.timeoutMs', async () => {
@@ -1219,9 +1229,50 @@ describe('ProtocolRouter', () => {
         maxReadBytes: 1024,
       });
       expect(result?.response).toEqual(new Uint8Array([0xCC]));
-      // Let the loser settle so the post-winner abort scheduler runs.
-      await new Promise((r) => setTimeout(r, 150));
       expect(loserAborted).toBe(true);
+    });
+
+    it('aborts a late loser stream immediately after newStream returns', async () => {
+      const { raceMultiPath } = await import('../src/protocol-router.js');
+      let lateLoserAborted = false;
+      let lateLoserSent = false;
+      const winnerStream: any = {
+        writeStatus: 'open',
+        send: () => undefined,
+        close: async () => undefined,
+        abort: () => undefined,
+        async *[Symbol.asyncIterator]() { yield new Uint8Array([0xCC]); },
+      };
+      const lateLoserStream: any = {
+        writeStatus: 'open',
+        send: () => { lateLoserSent = true; },
+        close: async () => undefined,
+        abort: () => { lateLoserAborted = true; },
+        async *[Symbol.asyncIterator]() { yield new Uint8Array([0xDD]); },
+      };
+      const conns = [
+        { status: 'open', newStream: async () => winnerStream },
+        {
+          status: 'open',
+          newStream: async () => {
+            await new Promise((r) => setTimeout(r, 25));
+            return lateLoserStream;
+          },
+        },
+      ];
+      const result = await raceMultiPath({
+        getConnections: () => conns as any[],
+        protocolId: '/test/1.0.0',
+        data: new Uint8Array([1]),
+        parallelPaths: 2,
+        signal: AbortSignal.timeout(1000),
+        maxReadBytes: 1024,
+      });
+      expect(result?.response).toEqual(new Uint8Array([0xCC]));
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(lateLoserAborted).toBe(true);
+      expect(lateLoserSent).toBe(false);
     });
   });
 });

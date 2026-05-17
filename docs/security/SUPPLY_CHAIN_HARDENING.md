@@ -35,25 +35,42 @@ Enforced by: `supply-chain-scan.yml` runs `zizmor --persona auditor
 
 ### 2. Every workflow declares an explicit minimum `permissions:` block
 
-`ci.yml`, `knip.yml`, and `evm-integration.yml` declare `permissions:
-contents: read` at the workflow root. `release.yml` and
-`npm-continuous-publish.yml` keep `contents: read` at root and narrow
-write scopes to the single job that needs them. `codex-review.yml` has
-always had this.
+`ci.yml`, `knip.yml`, `evm-integration.yml`, `codex-review.yml`, and
+`dependabot-advisory.yml` declare `permissions: contents: read` at the
+workflow root. `release.yml` and `npm-continuous-publish.yml` keep
+`contents: read` at root and narrow write scopes to the single job that
+needs them. `dependabot-advisory.yml` likewise narrows
+`pull-requests: write` and `issues: write` to its Dependabot-only
+advisory-check job.
 
 Why: without an explicit block, the `GITHUB_TOKEN` inherits the
 permissive legacy default. A successful code-execution exploit on any
 step then has a write-default token in the runner environment.
 
-### 3. No `pull_request_target`, `workflow_run`, or `issue_comment` triggers
+### 3. No broad dangerous triggers; one scoped `pull_request_target` exception
 
-This is verified by inspection (see the matching gh-actions audit notes
-in the v10-ui-tests PR review). `pull_request_target` is the trigger
-class TeamPCP exploited to plant the initial foothold against Aqua
-Security. We do not use it anywhere; `codex-review.yml` uses the safer
-`pull_request` event AND additionally guards on
+We do not use `workflow_run` or `issue_comment` triggers for privileged
+automation. `pull_request_target` is allowed only for
+`.github/workflows/dependabot-advisory.yml`, where the workflow needs
+write access to label, comment on, request changes on, and close
+Dependabot PRs.
+
+That exception is intentionally narrow because `pull_request_target` is
+the trigger class TeamPCP exploited to plant the initial foothold against
+Aqua Security. The Dependabot advisory gate is safe under this trigger
+because it does **not** check out or execute PR code, is fenced to the
+real Dependabot bot by login + numeric ID + account type, uses a
+SHA-pinned `dependabot/fetch-metadata` action, and routes workflow
+context into shell through `env:` rather than direct `${{ ... }}`
+interpolation.
+
+All other PR-facing automation should continue to use the safer
+`pull_request` event. For example, `codex-review.yml` uses
+`pull_request` and additionally guards on
 `github.event.pull_request.head.repo.full_name == github.repository`
-to short-circuit fork PRs.
+to short-circuit fork PRs. Any future `pull_request_target` workflow
+must add its own scoped `.github/zizmor.yml` exception with an equivalent
+security rationale.
 
 ### 4. `npm-continuous-publish.yml` separates verification, code execution, and credential access
 

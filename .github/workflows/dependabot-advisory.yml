@@ -279,11 +279,11 @@ jobs:
           set -euo pipefail
 
           if [ -z "${DEPS_JSON:-}" ] || [ "${DEPS_JSON}" = "null" ] || [ "${DEPS_JSON}" = "[]" ]; then
-            echo "No Dependabot metadata on this PR — nothing to audit."
+            echo "::warning title=Missing Dependabot metadata::No updated-dependencies-json metadata was available; failing closed for manual review."
             {
               echo 'compromised=false'
-              echo 'inconclusive=false'
-              echo 'package_list='
+              echo 'inconclusive=true'
+              echo 'package_list=- Dependabot metadata was missing or empty; the advisory gate could not identify the bumped package set.'
               echo 'advisory_summary='
             } >> "$GITHUB_OUTPUT"
             exit 0

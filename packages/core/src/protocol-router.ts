@@ -159,10 +159,10 @@ export class ProtocolRouter {
     const libp2p = this.node.libp2p;
     const { peerIdFromString } = await import('@libp2p/peer-id');
     const peerId = peerIdFromString(peerIdStr);
-    const signal = AbortSignal.timeout(timeoutMs);
     const startedAt = Date.now();
 
     if (parallelPaths > 1) {
+      const multipathSignal = AbortSignal.timeout(timeoutMs);
       // Multi-path pre-attempt — race up to N live connections.
       // Returns the response on a winning path, or null if there
       // weren't enough live candidates (or all candidates failed).
@@ -175,7 +175,7 @@ export class ProtocolRouter {
         protocolId,
         data,
         parallelPaths,
-        signal,
+        signal: multipathSignal,
         maxReadBytes: this.maxReadBytes,
       });
       if (multipathResult !== null) {
@@ -230,6 +230,12 @@ export class ProtocolRouter {
     const triedConnections = new WeakSet<ReusableConnection>();
     let lastErr: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
+      const remaining = timeoutMs - (Date.now() - startedAt);
+      if (remaining <= 0) {
+        lastErr = new Error('send timeout elapsed');
+        throw lastErr;
+      }
+      const attemptSignal = AbortSignal.timeout(remaining);
       // Track which connection (if any) the fast path picked this
       // attempt so the catch block can blacklist it on failure
       // without needing to inspect stream/connection internals from
@@ -331,7 +337,7 @@ export class ProtocolRouter {
             }
           },
           protocolId,
-          signal,
+          attemptSignal,
           {
             // Probe peerStore for non-circuit (direct) addresses; the
             // fast path uses this to gate whether reusing a LIMITED
@@ -356,9 +362,8 @@ export class ProtocolRouter {
         pickedConnection = fastResult?.connection ?? null;
 
         if (this.peerResolver && !fastStream) {
-          const remaining = Math.max(0, timeoutMs - (Date.now() - startedAt));
           await this.peerResolver
-            .resolve(peerIdStr, { signal, perStepTimeoutMs: remaining })
+            .resolve(peerIdStr, { signal: attemptSignal, perStepTimeoutMs: remaining })
             .catch(() => undefined);
         }
 
@@ -367,7 +372,7 @@ export class ProtocolRouter {
           fastStream ??
           (await libp2p.dialProtocol(peerId, protocolId, {
             runOnLimitedConnection: true,
-            signal,
+            signal: attemptSignal,
           }));
         const dialDurationMs = Date.now() - dialStartedAt;
 
@@ -378,7 +383,7 @@ export class ProtocolRouter {
 
         const sendStartedAt = Date.now();
         stream.send(data);
-        await stream.close({ signal });
+        await stream.close({ signal: attemptSignal });
         const sendDurationMs = Date.now() - sendStartedAt;
 
         const readStartedAt = Date.now();
@@ -700,6 +705,26 @@ export async function raceMultiPath(args: {
   const picked = candidates.slice(0, parallelPaths);
   const streams: Array<{ stream: import('@libp2p/interface').Stream; aborted: boolean } | null> =
     picked.map(() => null);
+  let winnerIdx = -1;
+
+  const abortPath = (idx: number, reason: Error): void => {
+    const s = streams[idx];
+    if (!s || s.aborted) return;
+    s.aborted = true;
+    try {
+      s.stream.abort(reason);
+    } catch {
+      /* already torn down */
+    }
+  };
+
+  const abortLosers = (winningIdx: number): void => {
+    for (let i = 0; i < streams.length; i++) {
+      if (i !== winningIdx) {
+        abortPath(i, new Error('multipath: loser path'));
+      }
+    }
+  };
 
   const attempts = picked.map(async (conn, idx): Promise<Uint8Array> => {
     const stream = await conn.newStream(protocolId, {
@@ -707,6 +732,10 @@ export async function raceMultiPath(args: {
       signal,
     });
     streams[idx] = { stream, aborted: false };
+    if (winnerIdx !== -1 && winnerIdx !== idx) {
+      abortPath(idx, new Error('multipath: late loser path'));
+      throw new Error('multipath: loser path');
+    }
     if (stream.writeStatus === 'closed' || stream.writeStatus === 'closing') {
       try {
         stream.abort(new Error('multipath: stream returned in closed state'));
@@ -720,16 +749,7 @@ export async function raceMultiPath(args: {
     return await readAll(stream, maxReadBytes);
   });
 
-  // Surface a winner via Promise.any (first FULFILLED wins; if all
-  // reject, AggregateError surfaces and we return null). Loser
-  // streams are aborted in the finally block below, AFTER they
-  // resolve naturally — aborting an in-flight newStream from
-  // outside libp2p is racy, so we let each attempt complete and
-  // abort the stream it produced.
-  const losers: Promise<unknown>[] = attempts.map((p) => p.catch(() => undefined));
-
   let winnerResponse: Uint8Array | null = null;
-  let winnerIdx = -1;
   try {
     // Promise.any-equivalent that also gives us the winning index.
     winnerResponse = await new Promise<Uint8Array>((resolve, reject) => {
@@ -739,7 +759,10 @@ export async function raceMultiPath(args: {
         p.then((res) => {
           if (winnerIdx === -1) {
             winnerIdx = i;
+            abortLosers(i);
             resolve(res);
+          } else if (winnerIdx !== i) {
+            abortPath(i, new Error('multipath: loser path'));
           }
         }).catch((err) => {
           errs.push(err);
@@ -752,11 +775,11 @@ export async function raceMultiPath(args: {
     });
   } catch {
     // All N attempts failed — return null so caller falls through
-    // to single-path. Wait for any in-flight stream open to settle
-    // so we can clean up.
-    await Promise.allSettled(losers);
+    // to single-path. At this point every attempt rejected, so any
+    // streams that opened can be aborted synchronously.
     for (const s of streams) {
       if (s && !s.aborted) {
+        s.aborted = true;
         try {
           s.stream.abort(new Error('multipath: all paths failed'));
         } catch {
@@ -765,25 +788,6 @@ export async function raceMultiPath(args: {
       }
     }
     return null;
-  }
-
-  // Abort losers — schedule the aborts but don't block on them; the
-  // winner's response is already in hand and the receiver's dedup
-  // will absorb any in-flight loser bytes.
-  for (let i = 0; i < streams.length; i++) {
-    if (i === winnerIdx) continue;
-    const settled = losers[i];
-    void settled.then(() => {
-      const s = streams[i];
-      if (s && !s.aborted) {
-        s.aborted = true;
-        try {
-          s.stream.abort(new Error('multipath: loser path'));
-        } catch {
-          /* already torn down */
-        }
-      }
-    });
   }
 
   return { response: winnerResponse, attemptedPaths: picked.length };

@@ -899,4 +899,329 @@ describe('ProtocolRouter', () => {
       expect(result).toBeNull();
     });
   });
+
+  // rc.9 PR-4 — multi-path parallel send. ProtocolRouter.send(parallelPaths > 1)
+  // races up to N live connections via Promise.any-equivalent; the
+  // first successful response wins, losers are aborted. Safe by the
+  // /dkg/10.0.1/* prefix invariant (receiver dedupes via
+  // Messenger.register). When fewer than 2 live connections exist or
+  // all parallel attempts fail, falls through to the single-path
+  // resolver + dialProtocol retry loop. See SendOptions JSDoc.
+  describe('send() multi-path parallel race (rc.9 PR-4)', () => {
+    const FAKE_PEER_ID = '12D3KooWBzj7Hg2cKCdsKL6QcjC5UbLztKTvzCZQHaT4P4ZyJEAA';
+
+    function makeWorkingStream(response: Uint8Array, delayMs = 0) {
+      let returned = false;
+      return {
+        writeStatus: 'open' as const,
+        send: () => undefined,
+        close: async () => undefined,
+        abort: () => undefined,
+        async *[Symbol.asyncIterator]() {
+          if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+          if (!returned) {
+            returned = true;
+            yield response;
+          }
+        },
+      };
+    }
+
+    function makeConn(opts: {
+      label: string;
+      onNewStream: () => Promise<unknown>;
+    }) {
+      return {
+        status: 'open' as const,
+        label: opts.label,
+        remotePeer: {
+          equals: (other: unknown) => String(other) === FAKE_PEER_ID,
+          toString: () => FAKE_PEER_ID,
+        },
+        newStream: opts.onNewStream,
+      };
+    }
+
+    function makeRouter(opts: {
+      connections: ReadonlyArray<ReturnType<typeof makeConn>>;
+      onDial?: () => void;
+    }): ProtocolRouter {
+      const node = {
+        libp2p: {
+          getConnections: () => opts.connections,
+          dialProtocol: async () => {
+            opts.onDial?.();
+            throw new Error('dialProtocol should not be reached when multi-path wins');
+          },
+          handle: () => undefined,
+          unhandle: () => undefined,
+          peerStore: { get: async () => { throw new Error('NotFound'); } },
+        },
+      } as unknown as DKGNode;
+      const peerResolver = { resolve: async () => [] } as unknown as PeerResolver;
+      return new ProtocolRouter(node, { peerResolver });
+    }
+
+    it('parallelPaths=1 (default) preserves the single-path code — no multi-path race', async () => {
+      let aDials = 0;
+      let bDials = 0;
+      const connA = makeConn({
+        label: 'A',
+        onNewStream: async () => {
+          aDials += 1;
+          return makeWorkingStream(new Uint8Array([0xAA])) as any;
+        },
+      });
+      const connB = makeConn({
+        label: 'B',
+        onNewStream: async () => {
+          bDials += 1;
+          return makeWorkingStream(new Uint8Array([0xBB])) as any;
+        },
+      });
+      const router = makeRouter({ connections: [connA, connB] });
+
+      const result = await router.send(FAKE_PEER_ID, '/dkg/10.0.1/test', new Uint8Array([1]));
+
+      // Single-path takes the first live connection only.
+      expect(result).toEqual(new Uint8Array([0xAA]));
+      expect(aDials).toBe(1);
+      expect(bDials).toBe(0);
+    });
+
+    it('parallelPaths>1 with N>=2 live connections opens N parallel streams', async () => {
+      let aDials = 0;
+      let bDials = 0;
+      let cDials = 0;
+      const connA = makeConn({
+        label: 'A',
+        onNewStream: async () => {
+          aDials += 1;
+          // Slow-A so B wins; this verifies the winner-selection
+          // path; A's stream gets aborted as a loser.
+          return makeWorkingStream(new Uint8Array([0xAA]), 100) as any;
+        },
+      });
+      const connB = makeConn({
+        label: 'B',
+        onNewStream: async () => {
+          bDials += 1;
+          return makeWorkingStream(new Uint8Array([0xBB])) as any;
+        },
+      });
+      const connC = makeConn({
+        label: 'C',
+        onNewStream: async () => {
+          cDials += 1;
+          return makeWorkingStream(new Uint8Array([0xCC]), 200) as any;
+        },
+      });
+      const router = makeRouter({ connections: [connA, connB, connC] });
+
+      const result = await router.send(FAKE_PEER_ID, '/dkg/10.0.1/test', new Uint8Array([1]), {
+        parallelPaths: 3,
+      });
+
+      // Fast-B wins; we returned its bytes. Slow-A and Slow-C were
+      // also issued (race kicked off all 3 in parallel).
+      expect(result).toEqual(new Uint8Array([0xBB]));
+      expect(aDials).toBe(1);
+      expect(bDials).toBe(1);
+      expect(cDials).toBe(1);
+    });
+
+    it('parallelPaths>1 with only 1 live connection skips the race (multi-path adds no value)', async () => {
+      let aDials = 0;
+      const connA = makeConn({
+        label: 'A',
+        onNewStream: async () => {
+          aDials += 1;
+          return makeWorkingStream(new Uint8Array([0xAA])) as any;
+        },
+      });
+      const router = makeRouter({ connections: [connA] });
+
+      const result = await router.send(FAKE_PEER_ID, '/dkg/10.0.1/test', new Uint8Array([1]), {
+        parallelPaths: 3,
+      });
+
+      expect(result).toEqual(new Uint8Array([0xAA]));
+      // Exactly one newStream — multi-path fell through to single-path
+      // (which then hit the fast-reuse on connA).
+      expect(aDials).toBe(1);
+    });
+
+    it('parallelPaths>1 falls through to single-path when ALL parallel attempts fail', async () => {
+      let aDials = 0;
+      let bDials = 0;
+      let dialCalls = 0;
+      const connA = makeConn({
+        label: 'A-dead',
+        onNewStream: async () => {
+          aDials += 1;
+          throw new Error('A: stream returned in closed state');
+        },
+      });
+      const connB = makeConn({
+        label: 'B-dead',
+        onNewStream: async () => {
+          bDials += 1;
+          throw new Error('B: stream returned in closed state');
+        },
+      });
+      const node = {
+        libp2p: {
+          getConnections: () => [connA, connB],
+          dialProtocol: async () => {
+            dialCalls += 1;
+            return makeWorkingStream(new Uint8Array([0xCC])) as any;
+          },
+          handle: () => undefined,
+          unhandle: () => undefined,
+          peerStore: { get: async () => { throw new Error('NotFound'); } },
+        },
+      } as unknown as DKGNode;
+      const peerResolver = { resolve: async () => [] } as unknown as PeerResolver;
+      const router = new ProtocolRouter(node, { peerResolver });
+
+      const result = await router.send(FAKE_PEER_ID, '/dkg/10.0.1/test', new Uint8Array([1]), {
+        parallelPaths: 2,
+      });
+
+      // All multi-path attempts failed → fell through to single-path
+      // → fast-reuse hits A and B which throw, so dialProtocol takes
+      // over and succeeds.
+      expect(result).toEqual(new Uint8Array([0xCC]));
+      // Each conn dialed at least once during multi-path; single-path
+      // may try them again via fast-reuse before falling to dial.
+      expect(aDials).toBeGreaterThanOrEqual(1);
+      expect(bDials).toBeGreaterThanOrEqual(1);
+      expect(dialCalls).toBeGreaterThanOrEqual(1);
+    });
+
+    it('parallelPaths>1 accepts the number-form timeoutMs still working via opts.timeoutMs', async () => {
+      // Backwards-compat smoke: passing a number as the 4th arg
+      // still works (rc.8 call sites untouched).
+      let dials = 0;
+      const node = {
+        libp2p: {
+          getConnections: () => [],
+          dialProtocol: async () => {
+            dials += 1;
+            return makeWorkingStream(new Uint8Array([0xDD])) as any;
+          },
+          handle: () => undefined,
+          unhandle: () => undefined,
+          peerStore: { get: async () => { throw new Error('NotFound'); } },
+        },
+      } as unknown as DKGNode;
+      const peerResolver = { resolve: async () => [] } as unknown as PeerResolver;
+      const router = new ProtocolRouter(node, { peerResolver });
+
+      const result = await router.send(FAKE_PEER_ID, '/dkg/10.0.1/test', new Uint8Array([1]), 5000);
+      expect(result).toEqual(new Uint8Array([0xDD]));
+      expect(dials).toBe(1);
+    });
+  });
+
+  // Direct unit tests on raceMultiPath itself — independent of
+  // ProtocolRouter.send so future refactors that change how send()
+  // wires the racer still exercise the race semantics directly.
+  describe('raceMultiPath: race semantics (rc.9 PR-4)', () => {
+    it('returns null when fewer than 2 live candidates exist', async () => {
+      const { raceMultiPath } = await import('../src/protocol-router.js');
+      const conn = {
+        status: 'open',
+        newStream: async () => ({ writeStatus: 'open' } as any),
+      };
+      const result = await raceMultiPath({
+        getConnections: () => [conn] as any[],
+        protocolId: '/test/1.0.0',
+        data: new Uint8Array([1]),
+        parallelPaths: 3,
+        signal: AbortSignal.timeout(1000),
+        maxReadBytes: 1024,
+      });
+      expect(result).toBeNull();
+    });
+
+    it('returns the first fulfilled response and reports the count of attempted paths', async () => {
+      const { raceMultiPath } = await import('../src/protocol-router.js');
+      const conns = [
+        { status: 'open', newStream: async () => ({
+          writeStatus: 'open', send: () => undefined, close: async () => undefined, abort: () => undefined,
+          async *[Symbol.asyncIterator]() { await new Promise((r) => setTimeout(r, 50)); yield new Uint8Array([0xAA]); },
+        } as any) },
+        { status: 'open', newStream: async () => ({
+          writeStatus: 'open', send: () => undefined, close: async () => undefined, abort: () => undefined,
+          async *[Symbol.asyncIterator]() { yield new Uint8Array([0xBB]); },
+        } as any) },
+      ];
+      const result = await raceMultiPath({
+        getConnections: () => conns as any[],
+        protocolId: '/test/1.0.0',
+        data: new Uint8Array([1]),
+        parallelPaths: 2,
+        signal: AbortSignal.timeout(1000),
+        maxReadBytes: 1024,
+      });
+      expect(result?.response).toEqual(new Uint8Array([0xBB]));
+      expect(result?.attemptedPaths).toBe(2);
+    });
+
+    it('returns null when every parallel attempt fails (AggregateError swallowed)', async () => {
+      const { raceMultiPath } = await import('../src/protocol-router.js');
+      const conns = [
+        { status: 'open', newStream: async () => { throw new Error('A-dead'); } },
+        { status: 'open', newStream: async () => { throw new Error('B-dead'); } },
+      ];
+      const result = await raceMultiPath({
+        getConnections: () => conns as any[],
+        protocolId: '/test/1.0.0',
+        data: new Uint8Array([1]),
+        parallelPaths: 2,
+        signal: AbortSignal.timeout(1000),
+        maxReadBytes: 1024,
+      });
+      expect(result).toBeNull();
+    });
+
+    it('aborts the loser stream after the winner settles', async () => {
+      const { raceMultiPath } = await import('../src/protocol-router.js');
+      let loserAborted = false;
+      const winnerStream: any = {
+        writeStatus: 'open',
+        send: () => undefined,
+        close: async () => undefined,
+        abort: () => undefined,
+        async *[Symbol.asyncIterator]() { yield new Uint8Array([0xCC]); },
+      };
+      const loserStream: any = {
+        writeStatus: 'open',
+        send: () => undefined,
+        close: async () => undefined,
+        abort: () => { loserAborted = true; },
+        async *[Symbol.asyncIterator]() {
+          await new Promise((r) => setTimeout(r, 100));
+          yield new Uint8Array([0xDD]);
+        },
+      };
+      const conns = [
+        { status: 'open', newStream: async () => winnerStream },
+        { status: 'open', newStream: async () => loserStream },
+      ];
+      const result = await raceMultiPath({
+        getConnections: () => conns as any[],
+        protocolId: '/test/1.0.0',
+        data: new Uint8Array([1]),
+        parallelPaths: 2,
+        signal: AbortSignal.timeout(1000),
+        maxReadBytes: 1024,
+      });
+      expect(result?.response).toEqual(new Uint8Array([0xCC]));
+      // Let the loser settle so the post-winner abort scheduler runs.
+      await new Promise((r) => setTimeout(r, 150));
+      expect(loserAborted).toBe(true);
+    });
+  });
 });

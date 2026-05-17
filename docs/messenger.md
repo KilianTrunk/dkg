@@ -181,8 +181,49 @@ is idempotent at the app layer) or surface a terminal error.
   reconnects, drain its `pendingFor(peer)` queue immediately rather
   than wait for backoff. Stale-snapshot-safe via `hasEntry` guard
   (rc.9 #538).
-- **`parallelPaths`** _(PR-4)_ — `Messenger.sendToPeer` can race N
-  candidate paths; receiver dedup absorbs duplicates.
+- **`parallelPaths`** _(PR-4, shipped)_ — `ProtocolRouter.send` races
+  up to N live connections in parallel via `Promise.any`-equivalent;
+  the first successful response wins, loser streams are aborted.
+  Caller passes `parallelPaths` through `SendOptions`:
+
+  ```ts
+  await router.send(peerId, '/dkg/10.0.1/X', payload, { parallelPaths: 3 });
+  ```
+
+  Two failure modes both fall through to the existing single-path
+  retry loop (so cold-peer behaviour is unchanged):
+  1. Fewer than 2 live connections — multi-path adds no value, skipped.
+  2. All N parallel attempts fail — single-path then runs with the full
+     resolver + dialProtocol + 3-retry budget.
+
+  **SAFETY invariant.** `parallelPaths > 1` is only safe for
+  protocols on the `/dkg/10.0.1/*` prefix (or later substrate
+  prefixes) where the receiver registers via `Messenger.register` and
+  dedupes by `messageId` server-side. Older `/dkg/10.0.0/*` callers
+  MUST keep `parallelPaths = 1` (the default) — without receiver
+  dedup, losing-path bytes that reach the receiver cause the
+  handler to fire twice. **This is a wire-version invariant, not a
+  runtime check** — the sender cannot inspect the receiver's
+  substrate version, the protocol-prefix string IS the contract.
+
+  Per-protocol defaults (set at the call site by each caller):
+
+  | Protocol             | Default `parallelPaths` | Reason                                                                 |
+  | -------------------- | ----------------------- | ---------------------------------------------------------------------- |
+  | chat (`/message`)    | 2                       | Latency-sensitive UX path; cheap to race 2 relays.                     |
+  | skill_request        | 1                       | Same wire prefix as chat; usually synchronous-blocking caller.         |
+  | swm-sender-key       | 1                       | Low frequency; latency tolerates single-path retries.                  |
+  | private-access       | 1                       | Same as swm-key.                                                       |
+  | query-remote         | 1                       | Large response; doubling bandwidth hurts more than it helps.           |
+  | join-request         | 1                       | Workflow-gated, not latency-critical.                                  |
+  | storage-ack          | 1                       | App-level ACKCollector already fans out N peers — 9x amplification.    |
+  | verify-proposal      | 1                       | Same shape as storage-ack.                                             |
+
+  Diversity strategy v1: take up to N candidates from the natural
+  connection list. In practice multi-reservation gives us one
+  connection per relay, so the natural list already provides path
+  diversity. Relay-grouped selection is a follow-up if Gate B data
+  shows duplicate-relay amplification matters.
 - **DHT walk on stall** _(PR-5)_ — outbox entry with ≥ 5 attempts of
   "no valid addresses for peer" triggers a time-bounded, rate-limited
   `libp2p.peerRouting.findPeer()`.

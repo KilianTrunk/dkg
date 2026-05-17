@@ -30,6 +30,43 @@ export function isRecoverableSendError(err: unknown): boolean {
   );
 }
 
+/**
+ * Per-call options for {@link ProtocolRouter.send}. Replaces the prior
+ * `timeoutMs: number` 4th-arg shape; the number form is still accepted
+ * for backwards compat with the rc.8 call sites (rc.9 PR-4).
+ */
+export interface SendOptions {
+  /** Overall send timeout (resolver + dial + write + read). Default {@link DEFAULT_SEND_TIMEOUT_MS}. */
+  timeoutMs?: number;
+  /**
+   * Race up to N parallel `newStream` attempts across the peer's live
+   * connections (different relay paths where the natural connection
+   * list provides them). First successful response wins; loser
+   * streams are aborted as soon as the winner is settled.
+   *
+   * Defaults to **1** (existing single-path behaviour preserved).
+   *
+   * **SAFETY — this is a wire-version invariant, NOT a runtime check.**
+   * `parallelPaths > 1` is only safe for protocols on the
+   * `/dkg/10.0.1/*` prefix (or later substrate-managed prefixes)
+   * where the receiver registers via `Messenger.register` and
+   * dedupes duplicates server-side. Passing `parallelPaths > 1` for
+   * a `/dkg/10.0.0/*` protocol can cause the receiver's handler to
+   * run multiple times for the same logical request — every caller
+   * MUST satisfy this prefix invariant before enabling > 1. The
+   * sender cannot inspect the receiver's substrate version; the
+   * protocol-prefix string IS the contract (see docs/messenger.md
+   * "Versioning" and the rc.9 plan PR-4 invariant note).
+   *
+   * When fewer than 2 live connections exist for the peer, the
+   * multi-path attempt is skipped and `send` falls through to the
+   * existing single-path resolver + dialProtocol retry loop. So
+   * passing a high `parallelPaths` on a cold peer is harmless —
+   * there's just one path available, single-path runs.
+   */
+  parallelPaths?: number;
+}
+
 export interface ProtocolRouterOptions {
   maxReadBytes?: number;
   /**
@@ -112,13 +149,49 @@ export class ProtocolRouter {
     peerIdStr: string,
     protocolId: string,
     data: Uint8Array,
-    timeoutMs = DEFAULT_SEND_TIMEOUT_MS,
+    timeoutMsOrOpts: number | SendOptions = DEFAULT_SEND_TIMEOUT_MS,
   ): Promise<Uint8Array> {
+    const opts: SendOptions =
+      typeof timeoutMsOrOpts === 'number' ? { timeoutMs: timeoutMsOrOpts } : timeoutMsOrOpts;
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
+    const parallelPaths = Math.max(1, Math.floor(opts.parallelPaths ?? 1));
+
     const libp2p = this.node.libp2p;
     const { peerIdFromString } = await import('@libp2p/peer-id');
     const peerId = peerIdFromString(peerIdStr);
     const signal = AbortSignal.timeout(timeoutMs);
     const startedAt = Date.now();
+
+    if (parallelPaths > 1) {
+      // Multi-path pre-attempt — race up to N live connections.
+      // Returns the response on a winning path, or null if there
+      // weren't enough live candidates (or all candidates failed).
+      // On null we fall through to the single-path retry loop below
+      // so cold peers + total-multipath-failure both keep the rc.8
+      // semantics intact.
+      const multipathResult = await raceMultiPath({
+        getConnections: () =>
+          rawGetConnectionsFor(libp2p, peerId),
+        protocolId,
+        data,
+        parallelPaths,
+        signal,
+        maxReadBytes: this.maxReadBytes,
+      });
+      if (multipathResult !== null) {
+        const totalDurationMs = Date.now() - startedAt;
+        if (totalDurationMs > 100) {
+          console.warn(
+            `[ProtocolRouter] send ${protocolId} to ${peerIdStr} via multi-path (${multipathResult.attemptedPaths} paths): total=${totalDurationMs}ms`,
+          );
+        }
+        return multipathResult.response;
+      }
+      // All multi-path candidates failed (or fewer than 2 existed) —
+      // fall through to the single-path retry loop. The single-path
+      // does resolver-prime + dialProtocol with the full 3x retry
+      // budget, so we get cold-peer recovery for free.
+    }
 
     if (!this.peerResolver && !this.warnedMissingResolver) {
       // Codex PR #497 round 5: structural enforcement (CI grep gate)
@@ -542,6 +615,178 @@ export async function tryReuseExistingConnection(
     }
   }
   return null;
+}
+
+/**
+ * Internal helper: walk libp2p's raw connection table and return the
+ * subset whose `remotePeer` matches `peerId`. Used by both the
+ * single-path fast-reuse (`tryReuseExistingConnection`) and the
+ * multi-path racer (`raceMultiPath`). Matches the Window D fix's
+ * "raw walk not peerId-keyed lookup" rationale documented above.
+ */
+function rawGetConnectionsFor(
+  libp2p: { getConnections: () => ReadonlyArray<unknown> },
+  peerId: unknown,
+): ReadonlyArray<ReusableConnection> {
+  try {
+    const all = libp2p.getConnections() as ReadonlyArray<
+      ReusableConnection & {
+        remotePeer?: { equals?: (other: unknown) => boolean };
+      }
+    >;
+    return all.filter((c) => {
+      try {
+        return c.remotePeer?.equals?.(peerId) === true;
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Multi-path send result returned by {@link raceMultiPath}. `null`
+ * when the racer didn't run (fewer than 2 live candidates) or every
+ * candidate failed — caller falls through to single-path.
+ */
+export interface MultiPathResult {
+  response: Uint8Array;
+  /** How many paths were started before the winner settled. Surfaced for diagnostics. */
+  attemptedPaths: number;
+}
+
+/**
+ * Race up to `parallelPaths` parallel `newStream` attempts across the
+ * peer's live connections (one stream per connection). First success
+ * wins; loser streams are aborted as soon as the winner is settled.
+ *
+ * Diversity strategy (rc.9 PR-4 v1): take up to N connections from
+ * the natural connection list, no relay-grouping yet. In practice
+ * multi-reservation gives us one connection per relay, so the
+ * natural list already provides path diversity. Relay-grouped
+ * selection is a follow-up if Gate B shows duplicate-relay
+ * amplification matters.
+ *
+ * Returns `null` (not `throw`) on every failure mode so the caller
+ * can fall through to single-path within the same logical `send()`
+ * call. Throwing here would short-circuit the cold-peer recovery
+ * path that the single-path resolver + retry loop is built for.
+ *
+ * SAFETY: caller is responsible for the `/dkg/10.0.1/*` prefix
+ * invariant (see {@link SendOptions.parallelPaths}). The receiver
+ * MUST run `Messenger.register` to dedupe duplicates; without that,
+ * losing-path bytes reaching the receiver cause double-handler
+ * invocation. This function does not (and cannot) check.
+ */
+export async function raceMultiPath(args: {
+  getConnections: () => ReadonlyArray<ReusableConnection>;
+  protocolId: string;
+  data: Uint8Array;
+  parallelPaths: number;
+  signal: AbortSignal;
+  maxReadBytes: number;
+}): Promise<MultiPathResult | null> {
+  const { protocolId, data, parallelPaths, signal, maxReadBytes } = args;
+  const candidates = args.getConnections().filter((c) => !c.status || c.status === 'open');
+  if (candidates.length < 2) {
+    // Single (or zero) live candidates — multi-path adds no value;
+    // the single-path code already handles "one live connection" via
+    // its fast-reuse logic. Fall through.
+    return null;
+  }
+
+  const picked = candidates.slice(0, parallelPaths);
+  const streams: Array<{ stream: import('@libp2p/interface').Stream; aborted: boolean } | null> =
+    picked.map(() => null);
+
+  const attempts = picked.map(async (conn, idx): Promise<Uint8Array> => {
+    const stream = await conn.newStream(protocolId, {
+      runOnLimitedConnection: true,
+      signal,
+    });
+    streams[idx] = { stream, aborted: false };
+    if (stream.writeStatus === 'closed' || stream.writeStatus === 'closing') {
+      try {
+        stream.abort(new Error('multipath: stream returned in closed state'));
+      } catch {
+        // already torn down
+      }
+      throw new Error('multipath: stream returned in closed state');
+    }
+    stream.send(data);
+    await stream.close({ signal });
+    return await readAll(stream, maxReadBytes);
+  });
+
+  // Surface a winner via Promise.any (first FULFILLED wins; if all
+  // reject, AggregateError surfaces and we return null). Loser
+  // streams are aborted in the finally block below, AFTER they
+  // resolve naturally — aborting an in-flight newStream from
+  // outside libp2p is racy, so we let each attempt complete and
+  // abort the stream it produced.
+  const losers: Promise<unknown>[] = attempts.map((p) => p.catch(() => undefined));
+
+  let winnerResponse: Uint8Array | null = null;
+  let winnerIdx = -1;
+  try {
+    // Promise.any-equivalent that also gives us the winning index.
+    winnerResponse = await new Promise<Uint8Array>((resolve, reject) => {
+      let rejected = 0;
+      const errs: unknown[] = [];
+      attempts.forEach((p, i) => {
+        p.then((res) => {
+          if (winnerIdx === -1) {
+            winnerIdx = i;
+            resolve(res);
+          }
+        }).catch((err) => {
+          errs.push(err);
+          rejected += 1;
+          if (rejected === attempts.length) {
+            reject(new AggregateError(errs, 'multipath: all paths failed'));
+          }
+        });
+      });
+    });
+  } catch {
+    // All N attempts failed — return null so caller falls through
+    // to single-path. Wait for any in-flight stream open to settle
+    // so we can clean up.
+    await Promise.allSettled(losers);
+    for (const s of streams) {
+      if (s && !s.aborted) {
+        try {
+          s.stream.abort(new Error('multipath: all paths failed'));
+        } catch {
+          /* already torn down */
+        }
+      }
+    }
+    return null;
+  }
+
+  // Abort losers — schedule the aborts but don't block on them; the
+  // winner's response is already in hand and the receiver's dedup
+  // will absorb any in-flight loser bytes.
+  for (let i = 0; i < streams.length; i++) {
+    if (i === winnerIdx) continue;
+    const settled = losers[i];
+    void settled.then(() => {
+      const s = streams[i];
+      if (s && !s.aborted) {
+        s.aborted = true;
+        try {
+          s.stream.abort(new Error('multipath: loser path'));
+        } catch {
+          /* already torn down */
+        }
+      }
+    });
+  }
+
+  return { response: winnerResponse, attemptedPaths: picked.length };
 }
 
 async function readAll(

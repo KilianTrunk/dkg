@@ -656,6 +656,12 @@ program
   .command('start')
   .description('Start the DKG daemon')
   .option('-f, --foreground', 'Run in the foreground (don\'t daemonize)')
+  .option(
+    '--relay-preferred <multiaddr>',
+    'Operator-preferred relay multiaddr to prioritise over the network relay set (repeatable; rc.9 PR-7). Multiple uses prepend in CLI-declaration order. See docs/messenger-operator.md for the relay-setup playbook.',
+    (value: string, previous: string[] = []) => [...previous, value],
+    [] as string[],
+  )
   .action(async (opts: ActionOpts) => {
     if (!configExists()) {
       console.error('No config found. Run "dkg init" first.');
@@ -674,6 +680,22 @@ program
         allowRemoteBootstrap: false,
         repairLiveNodeUi: true,
       });
+    }
+
+    // rc.9 PR-7: forward --relay-preferred to the spawned daemon via
+    // env var. Comma-separated so the receiver can split + filter
+    // empty/duplicate entries in `lifecycle.ts`. Persistent config
+    // (`config.preferredRelays`) is a separate source — the daemon
+    // merges both lists with the env taking declaration order first.
+    const relayPreferredOpt = Array.isArray(opts.relayPreferred) ? (opts.relayPreferred as string[]) : [];
+    if (relayPreferredOpt.length > 0) {
+      const cleaned = relayPreferredOpt.map((s) => s.trim()).filter((s) => s.length > 0);
+      if (cleaned.length > 0) {
+        process.env.DKG_RELAY_PREFERRED = cleaned.join(',');
+        console.log(
+          `Preferring ${cleaned.length} operator relay(s) for this run (DKG_RELAY_PREFERRED env var set; see ~/.dkg/config.json#preferredRelays for persistence).`,
+        );
+      }
     }
 
     if (opts.foreground) {

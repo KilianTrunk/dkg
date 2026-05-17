@@ -351,6 +351,69 @@ export function resolveMemoryAgentAddress(agent: {
   return agent.getDefaultAgentAddress() ?? agent.peerId;
 }
 
+/**
+ * rc.9 PR-7 — operator-preferred-relay merge helper.
+ *
+ * Computes the effective `relayPeers` list for daemon startup by
+ * prepending operator-supplied multiaddrs (CLI flag + config field)
+ * onto the network/explicit relay set, while preserving the public
+ * relays as fallback. Exported as a pure function so the merge
+ * contract is unit-testable without booting the full daemon.
+ *
+ * Source precedence (declaration order, then dedupe first-seen):
+ *   1. `envValue` — comma-separated string from `DKG_RELAY_PREFERRED`
+ *      env var. Set by `dkg start --relay-preferred <ma>`.
+ *   2. `configPreferred` — array from `~/.dkg/config.json`
+ *      `preferredRelays` field.
+ *   3. `networkAndConfigRelays` — whatever `config.relay` /
+ *      `network.relays` produced upstream.
+ *
+ * Returned `relayPeers` is the de-duplicated concatenation, with
+ * operator-supplied multiaddrs ALWAYS appearing before public
+ * relays. Counts (`envCount`, `configCount`, `preferredCount`) are
+ * reported back for the operator-visible startup log line.
+ */
+export function mergePreferredRelays(input: {
+  envValue: string | undefined;
+  configPreferred: readonly string[] | undefined;
+  networkAndConfigRelays: readonly string[] | undefined;
+}): {
+  relayPeers: string[];
+  envCount: number;
+  configCount: number;
+  preferredCount: number;
+} {
+  const envParsed = (input.envValue ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const configParsed = (input.configPreferred ?? []).filter(
+    (s): s is string => typeof s === 'string' && s.trim().length > 0,
+  ).map((s) => s.trim());
+
+  const preferred = [...envParsed, ...configParsed];
+  const baseline = [...(input.networkAndConfigRelays ?? [])];
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const ma of [...preferred, ...baseline]) {
+    if (seen.has(ma)) continue;
+    seen.add(ma);
+    merged.push(ma);
+  }
+
+  // Recompute the count of preferred multiaddrs that actually ended
+  // up in the result (some may be duplicated within the preferred
+  // list itself — first wins). This is what the log line wants.
+  const preferredInResult = merged.filter((ma) => preferred.includes(ma));
+
+  return {
+    relayPeers: merged,
+    envCount: envParsed.length,
+    configCount: configParsed.length,
+    preferredCount: preferredInResult.length,
+  };
+}
+
 export async function runDaemon(foreground: boolean): Promise<void> {
   await ensureDkgDir();
   const config = await loadConfig();
@@ -528,6 +591,24 @@ export async function runDaemonInner(
     relayPeers = network.relays;
     log(`Using relay(s) from network config (${network.networkName})`);
   }
+
+  // rc.9 PR-7 — operator-preferred relays. See `mergePreferredRelays`
+  // JSDoc for the merge semantics; this block is just the lifecycle
+  // call site + the operator-visible log line.
+  if (config.relay !== "none") {
+    const result = mergePreferredRelays({
+      envValue: process.env.DKG_RELAY_PREFERRED,
+      configPreferred: config.preferredRelays,
+      networkAndConfigRelays: relayPeers,
+    });
+    if (result.preferredCount > 0) {
+      relayPeers = result.relayPeers;
+      log(
+        `Preferred relays (rc.9 PR-7): ${result.preferredCount} operator-supplied multiaddr(s) prepended (sources: ${result.envCount} from --relay-preferred, ${result.configCount} from config.preferredRelays). Effective relayPeers count: ${relayPeers.length}.`,
+      );
+    }
+  }
+
   if (
     !relayPeers?.length &&
     !config.bootstrapPeers?.length &&

@@ -16,6 +16,8 @@ import {
 
 interface DKGAgentInternals {
   localAgents: Map<string, AgentKeyRecord>;
+  defaultAgentAddress?: string;
+  publishProfile(): Promise<unknown>;
 }
 
 async function bootAgentWithCustodialRecord(): Promise<{
@@ -131,5 +133,96 @@ describe('DKGAgent.revokeWorkspaceEncryptionKey', () => {
     internals.localAgents.set(record.agentAddress, record);
     await expect(agent.revokeWorkspaceEncryptionKey(record.agentAddress, 'did:dkg:agent:0x0#x25519-x'))
       .rejects.toThrow(/non-custodial agent/);
+  });
+});
+
+describe('profile-publish failure surfacing (Codex PR review fix)', () => {
+  // Bug from PR #540 review: rotate/revoke previously logged a warning and
+  // returned `{ ok: true, ... }` when publishProfile() failed. That silently
+  // left peers encrypting to retired keys. These tests pin down the new
+  // contract: failures are visible in the return value, callers can act on
+  // them, but local state is still persisted (so the next publish retry
+  // converges without re-signing).
+
+  it('rotate without --retire-old: surfaces profilePublishError but keystore + RDF still updated', async () => {
+    const { agent, record } = await bootAgentWithCustodialRecord();
+    const internals = agent as unknown as DKGAgentInternals;
+    // Make this the daemon's default so publishProfile() is attempted.
+    internals.defaultAgentAddress = record.agentAddress;
+    // Force publishProfile to fail.
+    internals.publishProfile = async () => { throw new Error('chain RPC unreachable'); };
+
+    const result = await agent.rotateWorkspaceEncryptionKey(record.agentAddress);
+
+    expect(result.profilePublished).toBe(false);
+    expect(result.profilePublishError).toMatch(/chain RPC unreachable/);
+    // Local persistence still happened (the keystore has the new key).
+    expect(record.workspaceEncryptionKeys).toHaveLength(2);
+    expect(record.workspaceEncryptionKeys[1].encryptionKeyId).toBe(result.newKeyId);
+  });
+
+  it('rotate --retire-old: surfaces failure AND records the revocation locally so a retry is idempotent', async () => {
+    const { agent, record } = await bootAgentWithCustodialRecord();
+    const internals = agent as unknown as DKGAgentInternals;
+    internals.defaultAgentAddress = record.agentAddress;
+    const originalKeyId = record.workspaceEncryptionKeys[0].encryptionKeyId;
+    internals.publishProfile = async () => { throw new Error('libp2p dial timeout'); };
+
+    const result = await agent.rotateWorkspaceEncryptionKey(record.agentAddress, { retireOld: true });
+
+    expect(result.profilePublished).toBe(false);
+    expect(result.profilePublishError).toMatch(/libp2p dial timeout/);
+    expect(result.retiredKeyId).toBe(originalKeyId);
+    // The revocation IS locally recorded — peers don't see it yet, but a
+    // simple retry of publishProfile() (no re-signing) would surface it.
+    const retired = record.workspaceEncryptionKeys.find((k) => k.encryptionKeyId === originalKeyId);
+    expect(retired?.revokedAt).toBeTruthy();
+    expect(retired?.revocationProof).toMatch(/^0x[0-9a-f]+$/);
+  });
+
+  it('revoke: surfaces failure (the bug the reviewer flagged)', async () => {
+    const { agent, record } = await bootAgentWithCustodialRecord();
+    const internals = agent as unknown as DKGAgentInternals;
+    internals.defaultAgentAddress = record.agentAddress;
+    const originalKeyId = record.workspaceEncryptionKeys[0].encryptionKeyId;
+    await agent.rotateWorkspaceEncryptionKey(record.agentAddress);
+    internals.publishProfile = async () => { throw new Error('publisher gossip rejected'); };
+
+    const result = await agent.revokeWorkspaceEncryptionKey(record.agentAddress, originalKeyId);
+
+    expect(result.profilePublished).toBe(false);
+    expect(result.profilePublishError).toMatch(/publisher gossip rejected/);
+    expect(result.revokedKeyId).toBe(originalKeyId);
+    // Local state still consistent: the key IS revoked in the keystore,
+    // so a future retry just needs to re-attempt the publish.
+    const target = record.workspaceEncryptionKeys.find((k) => k.encryptionKeyId === originalKeyId);
+    expect(target?.revokedAt).toBeTruthy();
+  });
+
+  it('non-default agent: profilePublished=false with no error (the daemon does not publish that agent\'s profile)', async () => {
+    const { agent, record } = await bootAgentWithCustodialRecord();
+    const internals = agent as unknown as DKGAgentInternals;
+    // Don't set defaultAgentAddress — this agent is not the daemon default.
+    internals.publishProfile = async () => { throw new Error('should not be called'); };
+
+    const result = await agent.rotateWorkspaceEncryptionKey(record.agentAddress);
+
+    expect(result.profilePublished).toBe(false);
+    expect(result.profilePublishError).toBeUndefined();
+    expect(result.newKeyId).toBeTruthy();
+  });
+
+  it('successful publish: profilePublished=true, no error', async () => {
+    const { agent, record } = await bootAgentWithCustodialRecord();
+    const internals = agent as unknown as DKGAgentInternals;
+    internals.defaultAgentAddress = record.agentAddress;
+    let publishCalls = 0;
+    internals.publishProfile = async () => { publishCalls++; };
+
+    const result = await agent.rotateWorkspaceEncryptionKey(record.agentAddress);
+
+    expect(result.profilePublished).toBe(true);
+    expect(result.profilePublishError).toBeUndefined();
+    expect(publishCalls).toBe(1);
   });
 });

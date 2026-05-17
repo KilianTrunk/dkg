@@ -513,6 +513,20 @@ agentCmd
       } else {
         console.log('Previous key remains ACTIVE — call `dkg agent revoke-encryption-key <agent> <key>` once propagation has settled.');
       }
+      if (result.profilePublished) {
+        console.log('Profile re-published:  yes');
+      } else if (result.profilePublishError) {
+        console.error('Profile re-published:  NO — ' + result.profilePublishError);
+        if (result.retiredKeyId) {
+          console.error('Peers will keep encrypting to the retired key until republish succeeds.');
+          console.error('Retry: POST /api/agent/publish-profile, or restart the daemon.');
+        } else {
+          console.error('The new key is persisted locally; peers will pick it up on the next agent-registry sync.');
+        }
+        process.exit(1);
+      } else {
+        console.log('Profile re-published:  skipped (agent is not this node\'s default profile)');
+      }
     } catch (err: any) {
       console.error(`Rotation failed: ${err?.message ?? err}`);
       process.exit(1);
@@ -528,6 +542,21 @@ agentCmd
       const result = await client.revokeAgentEncryptionKey(agentAddress, keyId);
       console.log(`Revoked: ${result.revokedKeyId}`);
       console.log(`At:      ${result.revokedAt}`);
+      if (result.profilePublished) {
+        console.log('Profile re-published: yes');
+      } else if (result.profilePublishError) {
+        console.error('Profile re-published: NO — ' + result.profilePublishError);
+        console.error('Peers will keep encrypting to the revoked key until republish succeeds.');
+        console.error('Retry: POST /api/agent/publish-profile, or restart the daemon.');
+        process.exit(1);
+      } else {
+        // Non-default agent: the revocation is recorded locally but the daemon's
+        // single-profile publishProfile() doesn't cover this agent. Operator
+        // must republish through whichever channel hosts that agent's profile.
+        console.error('Profile re-published: skipped (agent is not this node\'s default profile)');
+        console.error('Peers may keep encrypting to the revoked key until that agent\'s profile is independently republished.');
+        process.exit(1);
+      }
     } catch (err: any) {
       console.error(`Revocation failed: ${err?.message ?? err}`);
       process.exit(1);

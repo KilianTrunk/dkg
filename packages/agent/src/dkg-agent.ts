@@ -29,6 +29,7 @@ import {
   parseAssertionSealQuads, type AssertionSeal,
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+  computeWorkspaceAgentEncryptionKeyProofPayload,
   decodeWorkspaceEncryptionKey,
   encodeWorkspaceEncryptionKey,
   workspaceAgentEncryptionKeyId,
@@ -4004,7 +4005,12 @@ export class DKGAgent {
   async rotateWorkspaceEncryptionKey(
     agentAddress: string,
     opts: { retireOld?: boolean } = {},
-  ): Promise<{ newKeyId: string; retiredKeyId?: string }> {
+  ): Promise<{
+    newKeyId: string;
+    retiredKeyId?: string;
+    profilePublished: boolean;
+    profilePublishError?: string;
+  }> {
     const record = this.localAgents.get(this.resolveLocalAgentAddress(agentAddress));
     if (!record) {
       throw new Error(`Unknown local agent ${agentAddress}`);
@@ -4035,21 +4041,17 @@ export class DKGAgent {
       `new=${newEntry.encryptionKeyId}${retiredKeyId ? ` retired=${retiredKeyId}` : ''}`,
     );
 
-    // Best-effort profile re-publish so peers see the new key. We don't fail
-    // the rotation if publish errors — the keystore + RDF are already
-    // updated; a later publishProfile() call will retry.
-    if (record.agentAddress === this.defaultAgentAddress) {
-      try {
-        await this.publishProfile();
-      } catch (err) {
-        this.log.warn(
-          ctx,
-          `Profile re-publish after rotation failed for agent ${record.agentAddress}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
+    const publishOutcome = await this.publishProfileAfterKeyChange(record, {
+      action: retiredKeyId ? 'rotation (with --retire-old)' : 'rotation',
+      criticalForOtherPeers: !!retiredKeyId,
+    });
 
-    return { newKeyId: newEntry.encryptionKeyId, retiredKeyId };
+    return {
+      newKeyId: newEntry.encryptionKeyId,
+      retiredKeyId,
+      profilePublished: publishOutcome.published,
+      profilePublishError: publishOutcome.error,
+    };
   }
 
   /**
@@ -4064,7 +4066,12 @@ export class DKGAgent {
   async revokeWorkspaceEncryptionKey(
     agentAddress: string,
     keyId: string,
-  ): Promise<{ revokedKeyId: string; revokedAt: string }> {
+  ): Promise<{
+    revokedKeyId: string;
+    revokedAt: string;
+    profilePublished: boolean;
+    profilePublishError?: string;
+  }> {
     const record = this.localAgents.get(this.resolveLocalAgentAddress(agentAddress));
     if (!record) {
       throw new Error(`Unknown local agent ${agentAddress}`);
@@ -4095,18 +4102,61 @@ export class DKGAgent {
     const ctx = createOperationContext('system');
     this.log.info(ctx, `Revoked encryption key ${keyId} for agent ${record.agentAddress}`);
 
-    if (record.agentAddress === this.defaultAgentAddress) {
-      try {
-        await this.publishProfile();
-      } catch (err) {
-        this.log.warn(
-          ctx,
-          `Profile re-publish after revocation failed for agent ${record.agentAddress}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
+    const publishOutcome = await this.publishProfileAfterKeyChange(record, {
+      action: 'revocation',
+      // Revocation always matters for other peers: without the updated profile
+      // they'll keep encrypting to the supposedly retired key.
+      criticalForOtherPeers: true,
+    });
 
-    return { revokedKeyId: keyId, revokedAt: entry.revokedAt! };
+    return {
+      revokedKeyId: keyId,
+      revokedAt: entry.revokedAt!,
+      profilePublished: publishOutcome.published,
+      profilePublishError: publishOutcome.error,
+    };
+  }
+
+  /**
+   * Re-publish the daemon's agent profile after an encryption-key rotation
+   * or revocation, and return a structured outcome so callers can surface
+   * the failure to the operator instead of silently swallowing it.
+   *
+   * - `published: true` means peers will (eventually) see the new key set.
+   * - `published: false` with no `error` means we deliberately skipped the
+   *   publish: the affected agent is not the daemon's default, so the
+   *   single-profile `publishProfile()` flow doesn't cover it. Operators
+   *   must republish that agent's profile through whichever channel they
+   *   normally use (e.g., a separate node hosting it).
+   * - `published: false` with `error` means we tried and failed; the local
+   *   keystore + RDF are already updated, but peers may keep encrypting to
+   *   the supposedly-retired key until the next successful publish. The
+   *   caller MUST treat this as a partial failure for revocation paths.
+   */
+  private async publishProfileAfterKeyChange(
+    record: AgentKeyRecord,
+    opts: { action: string; criticalForOtherPeers: boolean },
+  ): Promise<{ published: boolean; error?: string }> {
+    if (record.agentAddress !== this.defaultAgentAddress) {
+      return { published: false };
+    }
+    const ctx = createOperationContext('system');
+    try {
+      await this.publishProfile();
+      return { published: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const detail = `Profile re-publish after ${opts.action} FAILED for agent ${record.agentAddress}: ${msg}` +
+        (opts.criticalForOtherPeers
+          ? ' — peers will keep encrypting to the retired key until republish succeeds; retry via /api/agent/publish-profile or restart'
+          : ' — the new key is persisted locally but peers will discover it on their next agent-registry sync');
+      if (opts.criticalForOtherPeers) {
+        this.log.error(ctx, detail);
+      } else {
+        this.log.warn(ctx, detail);
+      }
+      return { published: false, error: msg };
+    }
   }
 
   private resolveLocalAgentAddress(addressOrLowercase: string): string {
@@ -4176,6 +4226,146 @@ export class DKGAgent {
     return this.peerId;
   }
 
+  /**
+   * Load every (publicEncryptionKey, algorithm, proof) triple-set we've
+   * previously persisted, grouped by agent address, alongside any
+   * wallet-signed revocations we've published on those key URIs.
+   *
+   * Used by `loadAgentsFromStore` to recover the public side of an agent's
+   * encryption keys when the keystore has been lost or partially overwritten.
+   * Returns a map of `agentAddress.toLowerCase() -> entries[]`.
+   *
+   * The on-the-wire schema currently attaches publicEncryptionKey /
+   * encryptionKeyAlgorithm / encryptionKeyProof directly to the agent URI
+   * (rather than reifying each key as its own subject), so a multi-key agent
+   * produces a small cartesian product across (key, alg, proof). We pair
+   * them up by recomputing `workspaceAgentEncryptionKeyId(agent, publicBytes)`
+   * for each row and filtering by EIP-191 proof validity — mismatched
+   * combinations from the cartesian fail verification and are dropped.
+   */
+  private async loadEncryptionKeyTriplesByAgent(): Promise<Map<string, WorkspaceEncryptionKeyEntry[]>> {
+    const graph = DKGAgent.AGENT_SYSTEM_GRAPH;
+    const DKG = 'https://dkg.network/ontology#';
+    const byAgent = new Map<string, WorkspaceEncryptionKeyEntry[]>();
+    const strip = (v?: string) => v?.replace(/^"|"$/g, '').replace(/"?\^\^.*$/, '') ?? '';
+
+    type KeyRow = { keyB64: string; algorithm: string; proof: string };
+    const rowsByAgent = new Map<string, KeyRow[]>();
+    try {
+      const keysResult = await this.store.query(`
+        SELECT ?address ?key ?algorithm ?proof WHERE {
+          GRAPH <${graph}> {
+            ?agent a <${DKG}Agent> ;
+                   <${DKG}agentAddress> ?address ;
+                   <${DKG}publicEncryptionKey> ?key .
+            OPTIONAL { ?agent <${DKG}encryptionKeyAlgorithm> ?algorithm }
+            OPTIONAL { ?agent <${DKG}encryptionKeyProof> ?proof }
+          }
+        }
+      `);
+      if (keysResult.type !== 'bindings') return byAgent;
+      for (const row of keysResult.bindings) {
+        const addr = strip(row['address']);
+        const keyB64 = strip(row['key']);
+        if (!addr || !keyB64) continue;
+        const lower = addr.toLowerCase();
+        if (!rowsByAgent.has(lower)) rowsByAgent.set(lower, []);
+        rowsByAgent.get(lower)!.push({
+          keyB64,
+          algorithm: strip(row['algorithm']) || WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+          proof: strip(row['proof']),
+        });
+      }
+    } catch {
+      return byAgent;
+    }
+
+    if (rowsByAgent.size === 0) return byAgent;
+
+    // Revocations are keyed by the encryption-key URI (subject =
+    // workspaceAgentEncryptionKeyId), not by agent URI. Fetch them all in
+    // one pass so we can attach them while walking the cartesian above.
+    const revocations = new Map<string, { revokedAt: string; revocationProof: string }>();
+    try {
+      const revResult = await this.store.query(`
+        SELECT ?keyId ?revokedAt ?proof WHERE {
+          GRAPH <${graph}> {
+            ?keyId <${DKG}revokedAt> ?revokedAt ;
+                   <${DKG}encryptionKeyRevocationProof> ?proof .
+          }
+        }
+      `);
+      if (revResult.type === 'bindings') {
+        for (const row of revResult.bindings) {
+          const keyId = strip(row['keyId']);
+          const revokedAt = strip(row['revokedAt']);
+          const proof = strip(row['proof']);
+          if (keyId && revokedAt && proof) {
+            revocations.set(keyId, { revokedAt, revocationProof: proof });
+          }
+        }
+      }
+    } catch {
+      // Revocations are advisory metadata for recovered keys — proceeding
+      // without them just means recovered keys come back active. The
+      // resolver enforces revocation independently from this loader.
+    }
+
+    for (const [lowerAddr, rows] of rowsByAgent) {
+      let checksumAddr: string;
+      try {
+        checksumAddr = ethers.getAddress(lowerAddr);
+      } catch {
+        continue;
+      }
+      const seen = new Set<string>();
+      const entries: WorkspaceEncryptionKeyEntry[] = [];
+      for (const row of rows) {
+        if (row.algorithm !== WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519) continue;
+        if (!row.proof) continue;
+        let publicKeyBytes: Uint8Array;
+        try {
+          publicKeyBytes = decodeWorkspaceEncryptionKey(row.keyB64);
+        } catch {
+          continue;
+        }
+        // EIP-191 verify so we drop cartesian-product mismatches (a key
+        // paired with another key's proof) without trusting input order.
+        let recovered: string;
+        try {
+          const payload = computeWorkspaceAgentEncryptionKeyProofPayload({
+            agentAddress: checksumAddr,
+            encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+            publicKeyBytes,
+          });
+          recovered = ethers.verifyMessage(payload, row.proof);
+        } catch {
+          continue;
+        }
+        if (recovered.toLowerCase() !== lowerAddr) continue;
+        const encryptionKeyId = workspaceAgentEncryptionKeyId(checksumAddr, publicKeyBytes);
+        if (seen.has(encryptionKeyId)) continue;
+        seen.add(encryptionKeyId);
+        const entry: WorkspaceEncryptionKeyEntry = {
+          encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+          encryptionKeyId,
+          publicEncryptionKey: row.keyB64,
+          encryptionKeyProof: row.proof,
+          createdAt: new Date(0).toISOString(),
+        };
+        const rev = revocations.get(encryptionKeyId);
+        if (rev) {
+          entry.revokedAt = rev.revokedAt;
+          entry.revocationProof = rev.revocationProof;
+        }
+        entries.push(entry);
+      }
+      if (entries.length > 0) byAgent.set(lowerAddr, entries);
+    }
+
+    return byAgent;
+  }
+
   private async persistAgentToStore(record: AgentKeyRecord): Promise<void> {
     const graph = DKGAgent.AGENT_SYSTEM_GRAPH;
     const agentUri = `did:dkg:agent:${record.agentAddress}`;
@@ -4232,10 +4422,20 @@ export class DKGAgent {
     // Load raw tokens and custodial keys from the on-disk keystore
     const keystore = await this.loadKeystore();
 
-    // Agent metadata is loaded from RDF; workspace encryption keys are owned
-    // by the keystore (the only place we ever store private halves). Older
-    // singular-form keystore entries are migrated to the multi-key array via
-    // `migrateLegacyWorkspaceEncryptionFields` below.
+    // Encryption keys live in BOTH the keystore (private halves; authoritative
+    // for keys we own) and RDF (public halves + proofs + revocations; what we
+    // previously told the network). On boot we merge both sources so that:
+    //   - a stale/missing keystore can be re-hydrated with the public-side
+    //     metadata for keys we've already published (otherwise peers keep
+    //     encrypting to a key the registry says we have but we don't load),
+    //   - keys we minted but haven't republished yet survive (keystore-only
+    //     entries get carried into the in-memory record and emitted on the
+    //     next persistAgentToStore() pass).
+    // Keystore is authoritative for the private half AND the revocation
+    // status of keys it covers — we never trust an RDF-side revocation that
+    // contradicts our own keystore record, because anyone with insert access
+    // could otherwise brick our own keys.
+    const rdfEncryptionKeysByAgent = await this.loadEncryptionKeyTriplesByAgent();
     const sparql = `
       SELECT ?agent ?name ?address ?mode ?tokenHash ?legacyToken ?publicKey ?framework ?createdAt ?isDefault WHERE {
         GRAPH <${graph}> {
@@ -4312,6 +4512,42 @@ export class DKGAgent {
           record.encryptionKeyProof = ksEntry.encryptionKeyProof;
           migrateLegacyWorkspaceEncryptionFields(record);
         }
+
+        // Merge in any encryption-key entries that exist in RDF but not in the
+        // keystore. This is the recovery path: if the keystore was lost or
+        // never written for this agent, the public-side material we already
+        // published to peers is preserved here so callers see the same key
+        // set as the rest of the network — and the resolver still routes
+        // gossip to the same wrapped slots. Public-only entries cannot
+        // decrypt incoming gossip (no private half), but they keep the
+        // agent's registry-visible identity stable; the operator decides
+        // whether to rotate.
+        const rdfKeysForAgent = rdfEncryptionKeysByAgent.get(record.agentAddress.toLowerCase()) ?? [];
+        let publicOnlyAdoptedFromRdf = 0;
+        for (const rdfEntry of rdfKeysForAgent) {
+          const existing = record.workspaceEncryptionKeys.find((k) => k.encryptionKeyId === rdfEntry.encryptionKeyId);
+          if (existing) {
+            // Keystore wins for keys we own. Do NOT pull RDF revocations onto
+            // a keystore-tracked key — an attacker who can write to the local
+            // RDF store could otherwise revoke our own active key behind our
+            // back. Keystore revocations are emitted to RDF on every persist,
+            // so a legitimate revoke flow stays converged.
+            continue;
+          }
+          record.workspaceEncryptionKeys.push({ ...rdfEntry });
+          publicOnlyAdoptedFromRdf++;
+        }
+        if (publicOnlyAdoptedFromRdf > 0) {
+          const ctx = createOperationContext('system');
+          this.log.warn(
+            ctx,
+            `Recovered ${publicOnlyAdoptedFromRdf} workspace encryption key(s) for agent ${record.agentAddress} ` +
+            'from RDF that are missing from the keystore. The agent will be visible to peers under these keys ' +
+            'but cannot decrypt gossip wrapped to them (private halves are gone). Run ' +
+            '`dkg agent rotate-encryption-key --retire-old` to replace and revoke them.',
+          );
+        }
+
         refreshDefaultEncryptionKeyView(record);
         const generatedEncryptionKey = ensureWorkspaceEncryptionKey(record);
 

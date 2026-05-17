@@ -2,7 +2,7 @@ import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
   PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
-  PROTOCOL_SWM_SENDER_KEY,
+  PROTOCOL_SWM_SENDER_KEY, PROTOCOL_MESSAGE,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
@@ -58,8 +58,11 @@ import {
   type SwmSenderKeyMessageMsg,
   type SwmSenderKeyPackageMsg,
   type WorkspaceRecipientEncryptionKey,
+  InMemoryMessageIdempotencyStore,
+  InMemoryProtocolOutboxStore,
   type MessageIdempotencyStore,
   type ProtocolOutboxStore,
+  type ProtocolOutboxEntry,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
@@ -182,10 +185,6 @@ import {
   JoinApprovalRetryQueue,
   type JoinApprovalRetryEntry,
 } from './join-approval-retry-queue.js';
-import {
-  MessageOutbox,
-  type ChatOutboxRetryEntry,
-} from './message-outbox.js';
 import { multiaddr } from '@multiformats/multiaddr';
 import { buildCclPolicyQuads, buildPolicyApprovalQuads, buildPolicyRevocationQuads, hashCclPolicy, type CclPolicyRecord, type PolicyApprovalBinding } from './ccl-policy.js';
 import { CclEvaluator, parseCclPolicy, validateCclPolicy, type CclEvaluationResult, type CclFactTuple } from './ccl-evaluator.js';
@@ -564,7 +563,7 @@ const JOIN_APPROVAL_RETRY_TICK_MS = 30_000;
  * waiting since 5s after first failure may sit idle for up to 25s
  * before this tick picks it up — but the dominant retry trigger in
  * practice is the `connection:open` opportunistic flush
- * (`processMessageOutboxOnConnect`), which fires the moment the
+ * (`messenger.processOutboxOnConnect`), which fires the moment the
  * recipient peer becomes reachable again. The tick is the safety net
  * for cases where reconnect events are missed (e.g. relayed reconnects
  * that don't surface a fresh `connection:open` on the sender) or
@@ -1220,22 +1219,12 @@ export class DKGAgent {
   private readonly joinApprovalRetryQueue: JoinApprovalRetryQueue = new JoinApprovalRetryQueue();
   private joinApprovalRetryTimer: ReturnType<typeof setInterval> | null = null;
   /**
-   * Retry queue for outbound chat messages whose libp2p delivery
-   * failed. Symmetric to `joinApprovalRetryQueue` but invitee-side:
-   * the operator-typed text from `dkg_send_message` no longer drops
-   * silently when the recipient peer is briefly unreachable. See
-   * `message-outbox.ts` for the queue semantics and the chat thread
-   * with Lex on PR #510 for the joint design notes.
-   */
-  private readonly messageOutbox: MessageOutbox = new MessageOutbox();
-  private messageOutboxTimer: ReturnType<typeof setInterval> | null = null;
-  /**
    * Periodic tick driving `Messenger.processOutboxTick` for the
-   * Universal Messenger substrate outbox. Independent from
-   * `messageOutboxTimer` (chat-specific) so PR-3's deletion of the
-   * chat outbox doesn't accidentally take the substrate tick with
-   * it. Shares the cadence (`MESSAGE_OUTBOX_TICK_MS`) for operator
-   * visibility.
+   * Universal Messenger substrate outbox (rc.9 PR-3+). The
+   * rc.8-era chat-specific `MessageOutbox` was deleted in PR-3 in
+   * favour of the substrate's SQLite-backed generic outbox; the
+   * substrate now carries every short-message protocol that opts
+   * onto `/dkg/10.0.x` with x ≥ 1.
    */
   private messengerOutboxTimer: ReturnType<typeof setInterval> | null = null;
   private randomSamplingHandle: RandomSamplingHandle | null = null;
@@ -1711,9 +1700,25 @@ export class DKGAgent {
     });
     this.peerResolver = peerResolver;
     this.router = new ProtocolRouter(this.node, { peerResolver });
+    // Default to in-memory substrate stores when no durable stores
+    // are supplied. The production daemon (`cli/src/daemon/
+    // lifecycle.ts`) always wires SQLite-backed stores against the
+    // shared DashboardDB; the in-memory fallback exists so that
+    // test fixtures and ad-hoc DKGAgent embedders get working
+    // reliability semantics without having to plumb a database.
+    // In-memory means: substrate works correctly within one daemon
+    // lifetime, but outbox entries don't survive restart.
+    // Production picks up the SQLite path via `messengerStores`.
+    const idempotencyStore =
+      this.config.messengerStores?.idempotencyStore ??
+      new InMemoryMessageIdempotencyStore();
+    const outboxStore =
+      this.config.messengerStores?.outboxStore ??
+      new InMemoryProtocolOutboxStore();
     this.messenger = new Messenger({
       router: this.router,
-      ...(this.config.messengerStores ?? {}),
+      idempotencyStore,
+      outboxStore,
     });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
     await this.loadSwmSenderKeyState();
@@ -2051,7 +2056,6 @@ export class DKGAgent {
     // Set up messaging
     const x25519Priv = ed25519ToX25519Private(this.wallet.keypair.secretKey);
     this.messageHandler = new MessageHandler(
-      this.router,
       this.messenger,
       this.wallet.keypair,
       x25519Priv,
@@ -2444,17 +2448,11 @@ export class DKGAgent {
           const message = err instanceof Error ? err.message : String(err);
           this.log.warn(ctx, `Reverse-path peerStore enrichment failed for ${remotePeer}: ${message}`);
         }
-        try {
-          await this.processMessageOutboxOnConnect(remotePeer);
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          this.log.warn(ctx, `Opportunistic message-outbox retry on connect failed for ${remotePeer}: ${message}`);
-        }
-        // Universal Messenger substrate (rc.9 PR-2): drain the
-        // generic outbox for this peer on the same connection:open
-        // signal. No-op until a caller migrates to
-        // `messenger.sendReliable` (PR-3 chat + skill, then C
-        // migrations).
+        // Universal Messenger substrate (rc.9 PR-2/PR-3): drain
+        // the generic outbox for this peer. Replaces the rc.8
+        // chat-specific outbox flush — the substrate now carries
+        // chat (PR-3) and will carry every other short-message
+        // protocol after PR-8..PR-11.
         try {
           await this.messenger.processOutboxOnConnect(remotePeer);
         } catch (err: unknown) {
@@ -2591,19 +2589,11 @@ export class DKGAgent {
     // `dkg_send_message`; this is the safety-net retry loop that turns
     // them into eventual successes, complemented by the
     // opportunistic-on-reconnect path in the connection:open listener).
-    this.messageOutboxTimer = setInterval(() => {
-      this.processMessageOutboxTick().catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.log.warn(ctx, `Message-outbox retry tick failed: ${message}`);
-      });
-    }, MESSAGE_OUTBOX_TICK_MS);
-    if (this.messageOutboxTimer.unref) this.messageOutboxTimer.unref();
-
-    // Universal Messenger substrate retry tick (rc.9 PR-2). Shares
-    // the same cadence as the chat-specific tick so the operator
-    // sees a single "outbox tick" beat in their dashboard. No-op
-    // until a caller migrates to `messenger.sendReliable` (PR-3+);
-    // the substrate outbox is empty in pre-migration daemons.
+    // Universal Messenger substrate retry tick (rc.9 PR-2 +
+    // PR-3). The rc.8 chat-specific tick was deleted in PR-3;
+    // this is now the only outbox tick — chat (PR-3) and every
+    // future migrated protocol drain on the same cadence so
+    // operators see a single "outbox tick" beat.
     this.messengerOutboxTimer = setInterval(() => {
       const now = Date.now();
       this.messenger.processOutboxTick(now).catch((err: unknown) => {
@@ -4965,21 +4955,32 @@ export class DKGAgent {
     return this.messenger.sendToPeer(peerId, protocolId, data, opts);
   }
 
+  /**
+   * Send a chat message via the Universal Messenger substrate
+   * (rc.9 PR-3). `MessageHandler.sendChat` already wraps the
+   * encrypted AgentMessage in a ReliableEnvelope and routes
+   * through `messenger.sendReliable`, which:
+   *
+   *   * dedups sender-side on `(peer, protocol, messageId)`,
+   *   * encodes the envelope onto the wire,
+   *   * on recoverable failure enqueues to the SQLite outbox and
+   *     surfaces `{ queued: true, attempts, nextAttemptAtMs }`
+   *     so the MCP tool can show "queued, retrying" instead of an
+   *     opaque transport error,
+   *   * on success returns the response bytes.
+   *
+   * The chat-specific `MessageOutbox` from rc.8 has been deleted —
+   * the substrate's outbox is the single source of truth (durable
+   * across restarts, generic across protocols). Existing return
+   * shape is preserved so the MCP `dkg_send_message` tool and the
+   * `/api/chat` HTTP route continue to work unchanged.
+   */
   async sendChat(
     recipientPeerId: string,
     text: string,
     options: { contextGraphId?: string; messageId?: string } = {},
   ): Promise<ChatSendResult> {
     if (!this.messageHandler) throw new Error('Agent not started');
-    // Per-send unique id for the outbox key AND the on-wire receiver
-    // dedup key. Caller-supplied wins so a higher-level component
-    // (e.g. the MCP tool layer or a UI) that wants to correlate
-    // retries with its own bookkeeping can pass its own id. Default
-    // is a uuidv4 from `node:crypto`. The same id is forwarded into
-    // the encrypted payload via `messageHandler.sendChat`, where the
-    // receiver's `idx_chat_msgid` partial unique index uses it to
-    // drop the seq=13 class of multi-path-race duplicates from the
-    // May 2026 soak postmortem.
     const messageId = options.messageId ?? crypto.randomUUID();
     const result = await this.messageHandler.sendChat(recipientPeerId, text, {
       ...options,
@@ -4987,64 +4988,53 @@ export class DKGAgent {
     });
 
     if (result.delivered) {
-      // Successful delivery clears any pending retry from a prior
-      // failure for THIS exact `(recipient, messageId)`. A fresh
-      // first-attempt with a new messageId is a no-op here, which is
-      // the correct semantic — markDelivered returns false in that case
-      // and we ignore the bool.
-      this.messageOutbox.markDelivered(recipientPeerId, messageId);
       return { delivered: true, messageId };
     }
 
-    // First-attempt failure → enqueue for retry. The outbox keeps the
-    // payload, the periodic tick (`processMessageOutboxTick`) and the
-    // `connection:open` opportunistic flush (`processMessageOutboxOnConnect`)
-    // will both try to deliver it again until it succeeds or
-    // `maxAgeMs` runs out.
-    //
-    // The caller-visible return shape gains `queued`, `attempts`, and
-    // `nextAttemptAtMs` so the MCP `dkg_send_message` tool can surface
-    // "queued for retry" to the operator instead of an opaque error.
-    // `delivered` and `error` retain their existing semantics for
-    // backwards-compatibility with any pre-outbox caller.
-    const entry = this.messageOutbox.enqueueFailure(
-      {
-        recipientPeerId,
-        text,
-        contextGraphId: options.contextGraphId,
+    if (result.queued) {
+      const ctx = createOperationContext('system');
+      this.log.warn(
+        ctx,
+        `Substrate-outbox queued chat retry #${result.attempts} for ${recipientPeerId.slice(-8)} ` +
+          `(messageId=${messageId.slice(0, 8)}, ` +
+          `next attempt at ${new Date(result.nextAttemptAtMs ?? Date.now()).toISOString()}, ` +
+          `lastError=${result.error ?? 'unknown'}). ` +
+          `Will retry on the periodic tick (every ${MESSAGE_OUTBOX_TICK_MS / 1000}s) ` +
+          `or opportunistically on the next direct re-connect from the recipient's peer.`,
+      );
+      return {
+        delivered: false,
+        queued: true,
         messageId,
-      },
-      result.error ?? 'unknown',
-      Date.now(),
-    );
-    const ctx = createOperationContext('system');
-    this.log.warn(
-      ctx,
-      `Queued chat outbox retry #${entry.attempts} for ${recipientPeerId.slice(-8)} ` +
-        `(messageId=${messageId.slice(0, 8)}, ` +
-        `next attempt at ${new Date(entry.nextAttemptAt).toISOString()}, ` +
-        `lastError=${entry.lastError}). ` +
-        `Will retry on the periodic tick (every ${MESSAGE_OUTBOX_TICK_MS / 1000}s) ` +
-        `or opportunistically on the next direct re-connect from the recipient's peer.`,
-    );
+        attempts: result.attempts ?? 1,
+        nextAttemptAtMs: result.nextAttemptAtMs ?? Date.now(),
+        error: result.error,
+      };
+    }
+
     return {
       delivered: false,
-      queued: true,
       messageId,
-      attempts: entry.attempts,
-      nextAttemptAtMs: entry.nextAttemptAt,
       error: result.error,
     };
   }
 
   /**
-   * Snapshot of the chat outbox for diagnostics. Used by the
+   * Snapshot of the substrate outbox for diagnostics. Used by the
    * `GET /api/chat/outbox` route + the MCP `dkg_outbox_status` tool
-   * (if/when added) so operators can see what's pending after a long
-   * recipient outage.
+   * so operators can see what's pending after a long recipient
+   * outage. Returns the generic `ProtocolOutboxEntry` shape from
+   * the substrate (rc.9 PR-3) rather than the chat-specific
+   * `ChatOutboxRetryEntry` that rc.8 used — same fields are
+   * exposed (`peer`, `messageId`, `attempts`, `firstFailureAt`,
+   * `nextAttemptAt`, `lastError`), but filtered to the chat
+   * protocol so the existing operator surface still talks about
+   * "the chat outbox".
    */
-  listMessageOutbox(): ChatOutboxRetryEntry[] {
-    return this.messageOutbox.list();
+  listMessageOutbox(): ProtocolOutboxEntry[] {
+    return this.messenger
+      .listOutbox()
+      .filter((entry) => entry.protocol === PROTOCOL_MESSAGE);
   }
 
   onChat(handler: ChatHandler): void {
@@ -10085,153 +10075,6 @@ export class DKGAgent {
    * re-enqueue or re-mint a fresh `messageId` — the outbox owns the
    * messageId for the lifetime of the entry.
    */
-  private async retryOutboxEntry(entry: ChatOutboxRetryEntry): Promise<void> {
-    if (!this.messageHandler) return;
-    const ctx = createOperationContext('system');
-    // Per-key inflight guard against the duplicate-delivery race
-    // identified by Lex review on PR #521: the periodic tick and the
-    // connection:open opportunistic flush can both call this method
-    // for the same entry, the first call's `messageHandler.sendChat`
-    // yields, and the second call observes the entry still in the
-    // queue (`markDelivered` hasn't fired yet) and starts a concurrent
-    // second send. Without this guard the recipient sees the message
-    // twice — real user-visible UX corruption. See `MessageOutbox.tryBeginAttempt`
-    // for the full rationale.
-    if (!this.messageOutbox.tryBeginAttempt(entry.recipientPeerId, entry.messageId)) {
-      return;
-    }
-    try {
-      // Defend against the stale-snapshot race surfaced by the 2026-05
-      // rc9 soak: `processMessageOutboxOnConnect` iterates a snapshot
-      // of `pendingFor(peer)`; during the iteration a concurrent flush
-      // (triggered by a sibling `connection:open` in a reconnect storm)
-      // may have already completed delivery for THIS entry and called
-      // `markDelivered`. The `tryBeginAttempt` guard above only blocks
-      // TRULY-PARALLEL races (the prior flush is still mid-send) — once
-      // the prior flush completes and releases the inflight slot, this
-      // stale-snapshot caller would otherwise fire a duplicate wire
-      // send and, if it fails, `enqueueFailure` resurrects the deleted
-      // entry with `attempts=1`, triggering the full retry storm
-      // again. Re-checking presence inside the inflight guard
-      // (single-threaded, no yield between the check and the send)
-      // makes the no-op exit atomic. Smoking gun: 29 queues -> 63
-      // succeeded events in the soak, attempts counters resetting
-      // to 1 after `markDelivered` had run.
-      if (!this.messageOutbox.hasEntry(entry.recipientPeerId, entry.messageId)) {
-        return;
-      }
-
-      // Forward the outbox entry's `messageId` into the wire-format
-      // payload so the receiver's `idx_chat_msgid` partial unique
-      // index recognises the retry as the same logical message as
-      // the original send (or any prior retry) and dedupes it. This
-      // is the receiver-side complement to the sender-side
-      // inflight-guard above: even if both layers race a duplicate
-      // through, the receiver still sees only one row in
-      // `chat_messages`.
-      const result = await this.messageHandler.sendChat(entry.recipientPeerId, entry.text, {
-        contextGraphId: entry.contextGraphId,
-        messageId: entry.messageId,
-      });
-      if (result.delivered) {
-        this.messageOutbox.markDelivered(entry.recipientPeerId, entry.messageId);
-        this.log.info(
-          ctx,
-          `Outbox redelivery succeeded for ${entry.recipientPeerId.slice(-8)} ` +
-            `(messageId=${entry.messageId.slice(0, 8)}) after ${entry.attempts + 1} attempt(s)`,
-        );
-        return;
-      }
-      const updated = this.messageOutbox.enqueueFailure(
-        {
-          recipientPeerId: entry.recipientPeerId,
-          text: entry.text,
-          contextGraphId: entry.contextGraphId,
-          messageId: entry.messageId,
-        },
-        result.error ?? 'unknown',
-        Date.now(),
-      );
-      this.log.warn(
-        ctx,
-        `Outbox redelivery still failing for ${entry.recipientPeerId.slice(-8)} ` +
-          `(messageId=${entry.messageId.slice(0, 8)}, attempts=${updated.attempts}, ` +
-          `next=${new Date(updated.nextAttemptAt).toISOString()}, error=${updated.lastError})`,
-      );
-    } finally {
-      this.messageOutbox.endAttempt(entry.recipientPeerId, entry.messageId);
-    }
-  }
-
-  /**
-   * Periodic tick: walk the chat outbox and re-attempt every entry
-   * whose `nextAttemptAt` has passed. Also evicts entries past their
-   * max age (24h since first failure by default). Symmetric to
-   * `processJoinApprovalRetryQueueTick` — same shape, different queue.
-   */
-  private async processMessageOutboxTick(): Promise<void> {
-    const ctx = createOperationContext('system');
-    const now = Date.now();
-    const expired = this.messageOutbox.dropExpired(now);
-    for (const entry of expired) {
-      this.log.warn(
-        ctx,
-        `Giving up on chat outbox delivery for ${entry.recipientPeerId.slice(-8)} ` +
-          `(messageId=${entry.messageId.slice(0, 8)}) after ${entry.attempts} attempt(s) ` +
-          `over ${Math.round((now - entry.firstFailureAt) / 1000)}s; lastError=${entry.lastError}. ` +
-          `Operator will need to re-send via dkg_send_message if they still want it delivered.`,
-      );
-    }
-    const due = this.messageOutbox.due(now);
-    if (due.length === 0) return;
-    this.log.info(ctx, `Processing ${due.length} due chat outbox retry/retries`);
-    for (const entry of due) {
-      try {
-        await this.retryOutboxEntry(entry);
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        // Defensive: retryOutboxEntry already routes failures through
-        // enqueueFailure, so a thrown error here is a bug-or-bypass
-        // case (e.g. messageHandler dropped during shutdown). Log and
-        // continue rather than letting the tick crash mid-batch.
-        this.log.warn(
-          ctx,
-          `Outbox retry for ${entry.recipientPeerId.slice(-8)} threw unexpectedly: ${errMsg}`,
-        );
-      }
-    }
-  }
-
-  /**
-   * Opportunistic retry from a `connection:open` event. When a peer
-   * we've been waiting on reconnects, fire any queued messages for
-   * that peer NOW — drains in send-order (FIFO by `firstFailureAt`).
-   * Symmetric to `processJoinApprovalRetryQueueOnConnect` and shares
-   * the same opportunistic-on-reconnect rationale: the periodic tick
-   * may be up to `MESSAGE_OUTBOX_TICK_MS` away, but the transport is
-   * back NOW, so retry NOW.
-   */
-  private async processMessageOutboxOnConnect(remotePeerId: string): Promise<void> {
-    const pending = this.messageOutbox.pendingFor(remotePeerId);
-    if (pending.length === 0) return;
-    const ctx = createOperationContext('system');
-    this.log.info(
-      ctx,
-      `Flushing ${pending.length} pending chat outbox entry/entries for ${remotePeerId.slice(-8)} on reconnect`,
-    );
-    for (const entry of pending) {
-      try {
-        await this.retryOutboxEntry(entry);
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        this.log.warn(
-          ctx,
-          `Outbox retry for ${remotePeerId.slice(-8)} on reconnect threw unexpectedly: ${errMsg}`,
-        );
-      }
-    }
-  }
-
   /**
    * "Reverse-path peerStore enrichment" — when an inbound circuit-relay
    * connection from peer P via relay R opens, echo the inbound circuit
@@ -13573,13 +13416,13 @@ export class DKGAgent {
 
     // Canonical base58btc form. The MCP tool accepts both base58btc
     // and base32 peerId encodings; libp2p's connection/peerStore
-    // lookups normalise via `peerIdFromString`, but `messageOutbox`
-    // and `peerHealth` are keyed by the canonical string from
-    // `peerId.toString()` (see `pingPeers` which populates `peerHealth`
-    // via `peerId.toString()`). Looking them up with the raw input
-    // string would silently miss for base32 callers, returning
-    // `connected:true` alongside empty `outbox`/`health` — a real
-    // diagnostic-noise bug (PR #538 Codex review).
+    // lookups normalise via `peerIdFromString`, but the substrate
+    // outbox and `peerHealth` are keyed by the canonical string
+    // from `peerId.toString()` (see `pingPeers` which populates
+    // `peerHealth` via `peerId.toString()`). Looking them up with
+    // the raw input string would silently miss for base32 callers,
+    // returning `connected:true` alongside empty `outbox`/`health`
+    // — a real diagnostic-noise bug (PR #538 Codex review).
     const peerKey = pid.toString();
 
     let rawConns: LibConnection[] = [];
@@ -13639,7 +13482,17 @@ export class DKGAgent {
       peerStoreSnapshot = null;
     }
 
-    const pending = this.messageOutbox.pendingFor(peerKey);
+    // Substrate outbox snapshot for this peer, filtered to the
+    // chat protocol so the diagnostics surface keeps its rc.8
+    // semantics ("how many CHAT messages are queued for this
+    // peer"). Once other protocols migrate (PR-8..PR-11) the
+    // diagnostics shape can be extended to break out per-protocol
+    // counts; the chat-specific view is what every existing
+    // consumer (HTTP + MCP) expects today.
+    const pending = this.messenger
+      .listOutbox()
+      .filter((entry) => entry.peer === peerKey && entry.protocol === PROTOCOL_MESSAGE)
+      .sort((a, b) => a.firstFailureAt - b.firstFailureAt);
     const outbox = {
       pendingCount: pending.length,
       oldestFirstFailureAt: pending.length > 0 ? pending[0].firstFailureAt : null,
@@ -13977,10 +13830,6 @@ export class DKGAgent {
     if (this.joinApprovalRetryTimer) {
       clearInterval(this.joinApprovalRetryTimer);
       this.joinApprovalRetryTimer = null;
-    }
-    if (this.messageOutboxTimer) {
-      clearInterval(this.messageOutboxTimer);
-      this.messageOutboxTimer = null;
     }
     if (this.messengerOutboxTimer) {
       clearInterval(this.messengerOutboxTimer);

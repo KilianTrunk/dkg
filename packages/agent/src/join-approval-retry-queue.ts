@@ -46,7 +46,7 @@ import { RetryQueue, type RetryEntry } from '@origintrail-official/dkg-core';
  *
  * Sharing the generic primitive matters because the same retry shape
  * applies to other one-shot P2P sends in the system (notably the
- * upcoming invitee-side `MessageOutbox` for `dkg_send_message` failures,
+ * upcoming invitee-side substrate Messenger outbox for `dkg_send_message` failures,
  * which has the symmetric failure mode of join-approval — see chat
  * thread on PR #510 / issue #518 for the joint design notes).
  */

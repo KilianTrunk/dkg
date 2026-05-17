@@ -38,8 +38,15 @@ describe('V12 migration', () => {
     expect(tables).toContain('protocol_outbox');
   });
 
-  it('records user_version = 12 after migration', () => {
-    expect(db.db.pragma('user_version', { simple: true })).toBe(12);
+  it('records user_version = 13 after migration', () => {
+    // V12 introduced the substrate stores; V13 (rc.9 PR-3) drops
+    // the V11 `idx_chat_msgid` partial unique index now that
+    // receiver-side dedup is owned by the substrate's
+    // `message_idempotency` table. Both bumps are tested at the
+    // DB layer in `db.test.ts`; this assertion just pins that
+    // the substrate store fixtures are created against the
+    // current SCHEMA_VERSION.
+    expect(db.db.pragma('user_version', { simple: true })).toBe(13);
   });
 });
 

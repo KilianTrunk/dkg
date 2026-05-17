@@ -18,7 +18,35 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DKGAgent } from '../src/dkg-agent.js';
-import { MessageOutbox } from '../src/message-outbox.js';
+import { PROTOCOL_MESSAGE, type ProtocolOutboxEntry } from '@origintrail-official/dkg-core';
+
+interface StubOutboxEntry {
+  peer: string;
+  protocol: string;
+  messageId: string;
+  attempts: number;
+  firstFailureAt: number;
+  lastAttemptAt: number;
+  nextAttemptAt: number;
+  lastError: string;
+  payload: Uint8Array;
+}
+
+/**
+ * Minimal substrate-outbox fixture for diagnostics tests. The
+ * production `Messenger` uses a SQLite-backed `ProtocolOutboxStore`;
+ * the diagnostics surface only reads `listOutbox()`, so a flat
+ * array of entries is all we need to exercise the snapshot logic.
+ *
+ * rc.9 PR-3: replaces the chat-specific `MessageOutbox` fixture
+ * that this test used to import — the chat outbox was deleted
+ * when chat migrated onto `/dkg/10.0.1/message`.
+ */
+function makeOutboxStub(entries: StubOutboxEntry[]) {
+  return {
+    listOutbox: vi.fn((): ProtocolOutboxEntry[] => entries.map((e) => ({ ...e }))),
+  };
+}
 
 const PEER_A = '12D3KooWFq5KMnSMyYr8Z8t8a6Vh1Y6N6KkF5UZjLpCqUkBJsAaa';
 const PEER_B = '12D3KooWBqq7vfABCDEFkLmNoPqRsTuVwXyZAbCdEfGhIjKlMnaa';
@@ -53,7 +81,7 @@ function makeAgentLike({
   rawConnections,
   keyedConnectionsByPeer,
   peerStoreEntries,
-  outbox,
+  outboxEntries,
   health,
 }: {
   rawConnections: StubConnection[];
@@ -62,7 +90,7 @@ function makeAgentLike({
     string,
     { addresses: Array<{ multiaddr: { toString: () => string } }>; protocols?: string[] }
   >;
-  outbox?: MessageOutbox;
+  outboxEntries?: StubOutboxEntry[];
   health?: Map<string, any>;
 }): any {
   return {
@@ -83,8 +111,23 @@ function makeAgentLike({
         },
       },
     },
-    messageOutbox: outbox ?? new MessageOutbox(),
+    messenger: makeOutboxStub(outboxEntries ?? []),
     peerHealth: health ?? new Map(),
+  };
+}
+
+function makeOutboxEntry(overrides: Partial<StubOutboxEntry>): StubOutboxEntry {
+  return {
+    peer: PEER_A,
+    protocol: PROTOCOL_MESSAGE,
+    messageId: 'm1',
+    attempts: 1,
+    firstFailureAt: 1000,
+    lastAttemptAt: 1000,
+    nextAttemptAt: 6000,
+    lastError: 'transport failed',
+    payload: new Uint8Array(0),
+    ...overrides,
   };
 }
 
@@ -232,32 +275,26 @@ describe('DKGAgent.getPeerDiagnostics', () => {
     });
   });
 
-  describe('outbox snapshot', () => {
-    it('reports pending count + oldest first-failure ts + per-entry attempt counts', async () => {
-      const outbox = new MessageOutbox();
-      outbox.enqueueFailure(
-        { recipientPeerId: PEER_A, text: 'first', messageId: 'm1' },
-        'transport failed',
-        1000,
-      );
-      // Bump the first entry to 2 attempts.
-      outbox.enqueueFailure(
-        { recipientPeerId: PEER_A, text: 'first', messageId: 'm1' },
-        'transport failed again',
-        2000,
-      );
-      outbox.enqueueFailure(
-        { recipientPeerId: PEER_A, text: 'second', messageId: 'm2' },
-        'transport failed',
-        1500,
-      );
-      // Unrelated peer — must NOT appear in PEER_A's diagnostics.
-      outbox.enqueueFailure(
-        { recipientPeerId: PEER_B, text: 'other', messageId: 'm3' },
-        'transport failed',
-        1200,
-      );
-      const agentLike = makeAgentLike({ rawConnections: [], outbox });
+  describe('outbox snapshot (substrate-backed, rc.9 PR-3)', () => {
+    it('reports pending count + oldest first-failure ts + per-entry attempt counts for the chat protocol only', async () => {
+      const outboxEntries: StubOutboxEntry[] = [
+        // PEER_A, chat, attempts=2, oldest.
+        makeOutboxEntry({ peer: PEER_A, messageId: 'm1', attempts: 2, firstFailureAt: 1000 }),
+        // PEER_A, chat, attempts=1.
+        makeOutboxEntry({ peer: PEER_A, messageId: 'm2', attempts: 1, firstFailureAt: 1500 }),
+        // PEER_B, chat — must NOT appear in PEER_A's diagnostics.
+        makeOutboxEntry({ peer: PEER_B, messageId: 'm3', attempts: 1, firstFailureAt: 1200 }),
+        // PEER_A, but a non-chat protocol — the diagnostics surface
+        // is chat-specific by design, so this must be filtered out.
+        makeOutboxEntry({
+          peer: PEER_A,
+          protocol: '/dkg/10.0.1/swm-sender-key',
+          messageId: 'm4',
+          attempts: 5,
+          firstFailureAt: 500,
+        }),
+      ];
+      const agentLike = makeAgentLike({ rawConnections: [], outboxEntries });
       const diag = await callDiagnostics(agentLike, PEER_A);
       expect(diag.outbox.pendingCount).toBe(2);
       expect(diag.outbox.oldestFirstFailureAt).toBe(1000);
@@ -340,42 +377,31 @@ describe('DKGAgent.getPeerDiagnostics', () => {
     });
   });
 
-  // 🔴 Codex review on PR #538: the MCP `dkg_peer_info` tool accepts
-  // both base58btc and base32 peerId encodings. libp2p's connection
-  // and peerStore lookups normalise the input via `peerIdFromString`,
-  // but `messageOutbox` and `peerHealth` are keyed by the canonical
-  // `peerId.toString()` form (base58btc). Without normalising once
-  // up front, a base32 caller would see `connected:true` alongside
-  // empty `outbox`/`health` — silent diagnostic noise.
+  // 🔴 Codex review on PR #538 (preserved through rc.9 PR-3
+  // substrate cutover): the MCP `dkg_peer_info` tool accepts
+  // both base58btc and base32 peerId encodings. libp2p's
+  // connection + peerStore lookups normalise via
+  // `peerIdFromString`, but the substrate outbox + `peerHealth`
+  // are keyed by the canonical `peerId.toString()` form. Without
+  // normalising once up front, a base32 caller would see
+  // `connected:true` alongside empty `outbox`/`health` — silent
+  // diagnostic noise.
   describe('peerId normalization (PR #538 review)', () => {
     it('uses canonical peerId.toString() for outbox and health lookups, and returns it in the result', async () => {
-      // `peerIdFromString` always lowercases base32 inputs to a canonical
-      // form; for this test we'll work in base58btc-land but exercise
-      // the same plumbing: a peerStore/health/outbox keyed by the
-      // canonical `pid.toString()` must be found via getPeerDiagnostics
-      // regardless of whether the input string is the canonical form
-      // (which here it is, but the lookups all go through `peerKey`
-      // not `peerId`).
-      const outbox = new MessageOutbox();
-      outbox.enqueueFailure(
-        { recipientPeerId: PEER_A, text: 'hi', messageId: 'm1' },
-        'transient',
-        1715670000000,
-      );
+      const outboxEntries: StubOutboxEntry[] = [
+        makeOutboxEntry({ peer: PEER_A, messageId: 'm1', firstFailureAt: 1715670000000 }),
+      ];
       const health = new Map([
         [PEER_A, { peerId: PEER_A, alive: true, latencyMs: 42, lastSeen: 1715670000000, lastChecked: 1715670000000 }],
       ]);
       const agentLike = makeAgentLike({
         rawConnections: [makeStubConn(PEER_A)],
         keyedConnectionsByPeer: new Map([[PEER_A, [makeStubConn(PEER_A)]]]),
-        outbox,
+        outboxEntries,
         health,
       });
 
       const diag = await callDiagnostics(agentLike, PEER_A);
-      // The returned peerId should match the canonical form (here
-      // identical to the input because PEER_A is already base58btc),
-      // and the outbox/health lookups must succeed.
       expect(diag.peerId).toBe(PEER_A);
       expect(diag.outbox.pendingCount).toBe(1);
       expect(diag.health).not.toBeNull();

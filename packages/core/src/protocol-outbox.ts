@@ -207,6 +207,24 @@ export class ProtocolOutbox {
     return this.store.size();
   }
 
+  /**
+   * Snapshot of every entry currently in the underlying store. Used
+   * by `Messenger.listOutbox` for the diagnostics surface. Returns
+   * entries in store order — callers that need per-peer FIFO should
+   * sort by `firstFailureAt`.
+   */
+  list(): ProtocolOutboxEntry[] {
+    return this.store.list();
+  }
+
+  /**
+   * Look up a single entry. Used by diagnostics + by stale-snapshot
+   * guards. Returns `undefined` if no such entry exists.
+   */
+  getEntry(peer: string, protocol: string, messageId: string): ProtocolOutboxEntry | undefined {
+    return this.store.getEntry(peer, protocol, messageId);
+  }
+
   /** Compute backoff for a given attempt count. Exposed for testing. */
   backoffFor(attempts: number): number {
     const idx = Math.min(Math.max(attempts - 1, 0), this.backoffs.length - 1);
@@ -309,6 +327,15 @@ export class InMemoryProtocolOutboxStore implements ProtocolOutboxStore {
 
   size(): number {
     return this.entries.size;
+  }
+
+  list(): ProtocolOutboxEntry[] {
+    return Array.from(this.entries.values()).map((e) => ({ ...e }));
+  }
+
+  getEntry(peer: string, protocol: string, messageId: string): ProtocolOutboxEntry | undefined {
+    const entry = this.entries.get(InMemoryProtocolOutboxStore.key(peer, protocol, messageId));
+    return entry ? { ...entry } : undefined;
   }
 }
 

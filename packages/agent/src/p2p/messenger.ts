@@ -8,6 +8,7 @@ import {
   ProtocolOutbox,
   type MessageIdempotencyStore,
   type ProtocolOutboxStore,
+  type ProtocolOutboxEntry,
   type ProtocolRouter,
 } from '@origintrail-official/dkg-core';
 
@@ -115,6 +116,16 @@ export type ReliableSendResult =
       attempts: number;
       messageId: string;
       error: string;
+      /**
+       * Wall-clock ms when the next retry attempt is scheduled. The
+       * MCP `dkg_send_message` tool surfaces this to operators so
+       * they can see "queued, retrying at HH:MM:SS" instead of an
+       * opaque "queued" state. Equals `Date.now()` (i.e. "try
+       * again immediately") when the queued return path is taken
+       * because another in-flight attempter held the inflight slot
+       * — no real outbox entry exists yet in that case.
+       */
+      nextAttemptAtMs: number;
     };
 
 /** Handler signature for `Messenger.register`. */
@@ -268,6 +279,7 @@ export class Messenger {
         attempts: 1,
         messageId,
         error: 'send already in flight for this messageId',
+        nextAttemptAtMs: this.clock(),
       };
     }
 
@@ -303,6 +315,7 @@ export class Messenger {
         attempts: entry.attempts,
         messageId,
         error: errMsg,
+        nextAttemptAtMs: entry.nextAttemptAt,
       };
     } finally {
       outbox.endAttempt(peerId, protocolId, messageId);
@@ -498,6 +511,26 @@ export class Messenger {
   /** Outbox size, for diagnostics. Zero when no outbox is wired. */
   outboxSize(): number {
     return this.outbox?.size() ?? 0;
+  }
+
+  /**
+   * Snapshot of every entry currently in the outbox. Used by the
+   * `/api/chat/outbox` route + the MCP `dkg_outbox_status` tool so
+   * operators can see what's pending after a long recipient outage.
+   * Empty array when no outbox is wired.
+   */
+  listOutbox(): ProtocolOutboxEntry[] {
+    return this.outbox?.list() ?? [];
+  }
+
+  /**
+   * Look up a specific entry. Used by `DKGAgent`'s diagnostics
+   * surfaces to attribute per-message state across the substrate
+   * outbox without exposing the store directly. Returns `undefined`
+   * when no outbox is wired or no such entry exists.
+   */
+  getOutboxEntry(peerId: string, protocolId: string, messageId: string): ProtocolOutboxEntry | undefined {
+    return this.outbox?.getEntry(peerId, protocolId, messageId);
   }
 
   private requireSubstrate(method: string): void {

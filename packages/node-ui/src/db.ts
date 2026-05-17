@@ -9,7 +9,7 @@ import {
   type ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const DEFAULT_RETENTION_DAYS = 90;
 
 export interface DashboardDBOptions {
@@ -445,6 +445,33 @@ export class DashboardDB {
         );
         CREATE INDEX IF NOT EXISTS idx_outbox_next_attempt
           ON protocol_outbox(next_attempt_at);
+      `);
+    }
+
+    if (version < 13) {
+      // PR-3 chat-substrate cutover: the receiver-side dedup that
+      // V11 added via the partial unique index
+      // `idx_chat_msgid(peer, direction, message_id)` is now
+      // owned by `message_idempotency` (V12) — every inbound chat
+      // travels through `Messenger.register` which gates on the
+      // idempotency cache before invoking the application handler,
+      // so the SQL index is no longer the source of truth.
+      //
+      // We DROP the index (lets the column hold non-unique values
+      // again — important for rolling forward without conflicts on
+      // any old non-substrate retries that may still be sitting in
+      // pre-cutover daemons) but we KEEP the `chat_messages.message_id`
+      // column itself, nullable + unwritten by the new code path.
+      // This is the rollback-safety constraint from the rc.9 plan:
+      // if PR-3 lands and a hot rollback to rc.8 is needed, the
+      // V11 schema is still structurally compatible — only the
+      // uniqueness contract changes between V12 and V13, not the
+      // shape. Dropping the column entirely would require a full
+      // table rebuild on downgrade.
+      //
+      // No data migration. No new tables. Pure DROP INDEX.
+      this.db.exec(`
+        DROP INDEX IF EXISTS idx_chat_msgid;
       `);
     }
 
@@ -1097,29 +1124,23 @@ export class DashboardDB {
   // --- Chat messages ---
 
   /**
-   * Insert a chat message. When `messageId` is supplied AND the
-   * `(peer, direction, messageId)` triple already exists in the table,
-   * the insert is silently ignored via a targeted `ON CONFLICT ... DO
-   * NOTHING` clause against the `idx_chat_msgid` partial unique index
-   * — this is the receiver-side dedup that closes the seq=13 duplicate
-   * class from the May 2026 soak postmortem (multi-path race that
-   * delivered the same encrypted payload twice, ~1s apart). Returns
-   * `true` when a row was actually inserted, `false` when the dedup
-   * index dropped a duplicate.
+   * Insert a chat message. rc.9 PR-3 moved the V11 receiver-side
+   * dedup (the partial unique index `idx_chat_msgid`) out of SQL
+   * and into the Universal Messenger substrate
+   * (`Messenger.register` → `message_idempotency` table from V12).
+   * The substrate intercepts duplicate inbound chats BEFORE they
+   * reach this insert, so the table no longer enforces uniqueness
+   * — and this method no longer carries an `ON CONFLICT` clause.
+   * Returns `true` when a row was inserted (always now, modulo
+   * raw SQL constraint failures).
    *
-   * Calls without `messageId` (pre-V11 callers, plus any future sender
-   * that omits the field) fall outside the partial-unique-index
-   * predicate and are always inserted — never blocked, never deduped.
+   * The `message_id` COLUMN is preserved as nullable + persisted
+   * so HTTP/MCP readers can still surface it. V13 dropped only
+   * the INDEX, not the column — rollback to rc.8 finds a
+   * structurally-compatible schema.
    *
-   * Conflict target is explicit (`ON CONFLICT (peer, direction,
-   * message_id) WHERE message_id IS NOT NULL DO NOTHING`) rather than
-   * the looser `INSERT OR IGNORE` — that variant suppresses EVERY
-   * SQLite constraint violation, so a future NOT NULL / CHECK / other
-   * unique-index failure would silently look identical to a dedup hit
-   * (`changes === 0`) and the daemon would skip notification + logging
-   * as if the row were already stored. Targeted conflict handling lets
-   * unrelated persistence bugs surface as thrown errors. Codex review
-   * on PR #538.
+   * Non-dedup SQL constraint failures (NOT NULL on `peer`, etc.)
+   * still throw — pinned by db.test.ts.
    */
   insertChatMessage(msg: {
     ts: number;
@@ -1133,7 +1154,6 @@ export class DashboardDB {
     const info = this.stmt('insertChat', `
       INSERT INTO chat_messages (ts, direction, peer, peer_name, text, delivered, message_id)
       VALUES (@ts, @direction, @peer, @peer_name, @text, @delivered, @message_id)
-      ON CONFLICT (peer, direction, message_id) WHERE message_id IS NOT NULL DO NOTHING
     `).run({
       ts: msg.ts,
       direction: msg.direction,
@@ -1877,6 +1897,45 @@ export class SqliteProtocolOutboxStore implements ProtocolOutboxStore {
     return row.c;
   }
 
+  list(): ProtocolOutboxEntry[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM protocol_outbox ORDER BY first_failure_at ASC`)
+      .all() as Array<{
+      peer_id: string;
+      protocol: string;
+      message_id: string;
+      payload: Buffer;
+      attempts: number;
+      first_failure_at: number;
+      last_attempt_at: number;
+      next_attempt_at: number;
+      last_error: string | null;
+    }>;
+    return rows.map(SqliteProtocolOutboxStore.rowToEntry);
+  }
+
+  getEntry(peer: string, protocol: string, messageId: string): ProtocolOutboxEntry | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM protocol_outbox WHERE peer_id = ? AND protocol = ? AND message_id = ?`,
+      )
+      .get(peer, protocol, messageId) as
+      | {
+          peer_id: string;
+          protocol: string;
+          message_id: string;
+          payload: Buffer;
+          attempts: number;
+          first_failure_at: number;
+          last_attempt_at: number;
+          next_attempt_at: number;
+          last_error: string | null;
+        }
+      | undefined;
+    if (!row) return undefined;
+    return SqliteProtocolOutboxStore.rowToEntry(row);
+  }
+
   private static rowToEntry(row: {
     peer_id: string;
     protocol: string;
@@ -2061,8 +2120,11 @@ export interface ChatMessageRow {
    * Sender-assigned message id (UUID v4 by default; caller-overridable
    * via `dkg-agent.ts`'s `options.messageId`). Nullable for pre-V11
    * rows AND for any future sender that intentionally omits it.
-   * Powers receiver-side dedup via the partial unique index
-   * `idx_chat_msgid` on `(peer, message_id)`.
+   * As of V13 (rc.9 PR-3), receiver-side dedup is owned by the
+   * Universal Messenger substrate (`message_idempotency` table +
+   * `Messenger.register` envelope decode), not by this column's
+   * SQL index — the index was dropped, the column persists for
+   * readers + rollback safety.
    */
   message_id: string | null;
 }

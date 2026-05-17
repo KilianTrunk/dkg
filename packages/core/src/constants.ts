@@ -4,7 +4,16 @@ export const PROTOCOL_PUBLISH = '/dkg/10.0.0/publish';
 export const PROTOCOL_QUERY = '/dkg/10.0.0/query';
 export const PROTOCOL_DISCOVER = '/dkg/10.0.0/discover';
 export const PROTOCOL_SYNC = '/dkg/10.0.0/sync';
-export const PROTOCOL_MESSAGE = '/dkg/10.0.0/message';
+// Universal Messenger pilot protocol (rc.9 PR-3). Bumped from
+// /dkg/10.0.0/message to /dkg/10.0.1/message to opt into the
+// reliability substrate (ReliableEnvelope wrapper, sender +
+// receiver idempotency, durable SQLite outbox). Hard cutover —
+// nodes on rc.8 cannot chat with nodes on rc.9; both daemons MUST
+// be on the same prefix (see docs/messenger.md "Versioning" + the
+// rc.9 plan note "Safe by /dkg/10.0.1/* prefix-version invariant").
+// PR-8+ migrate the remaining short-message protocols onto the
+// same 10.0.1 minor.
+export const PROTOCOL_MESSAGE = '/dkg/10.0.1/message';
 export const PROTOCOL_ACCESS = '/dkg/10.0.0/private-access';
 export const PROTOCOL_QUERY_REMOTE = '/dkg/10.0.0/query-remote';
 export const PROTOCOL_SWM_SENDER_KEY = '/dkg/10.0.0/swm-sender-key';

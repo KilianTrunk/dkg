@@ -131,6 +131,17 @@ export class ApiClient {
   }
 
   /**
+   * Re-publish the daemon's default agent profile. This is the retry
+   * endpoint for the partial-failure path of rotate/revoke: when
+   * local persistence succeeded but the implicit republish errored,
+   * the caller fixes the underlying transport / chain issue and
+   * retries here. Node-admin token only.
+   */
+  async publishAgentProfile(): Promise<{ ok: true; ual: string | null }> {
+    return this.post('/api/agent/publish-profile', {});
+  }
+
+  /**
    * V10 Random Sampling prover snapshot. Cheap; safe to poll. Returns
    * `enabled: false` when the bind layer no-op'd (edge node, no
    * identity, or chain adapter missing methods); the `loop` field is

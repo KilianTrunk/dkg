@@ -113,6 +113,55 @@ describe('loadEncryptionKeyTriplesByAgent: RDF recovery source for workspace enc
     }
   });
 
+  it('drops forged revocations on recovered keys (Codex review fix on commit 60ead6be)', async () => {
+    // Bug from PR #540 round-2 review: a forged
+    // revokedAt/encryptionKeyRevocationProof triple on a recovered
+    // key URI could brick a live key on the next boot. The loader
+    // must EIP-191-verify the proof before adopting the revocation,
+    // mirroring what the resolver already does for cross-agent
+    // revocations.
+    const agent = await DKGAgent.create({ name: 'RdfRecoveryForgedRev', chainAdapter: new MockChainAdapter() });
+    const realWallet = ethers.Wallet.createRandom();
+    const attacker = ethers.Wallet.createRandom();
+    const { agentAddress, keyIds } = await publishAgentWithKeys(agent, { wallet: realWallet, keyCount: 1 });
+
+    // Forge a revocation signed by the attacker on the legitimate
+    // agent's key URI. Insert it directly so we control the proof
+    // bytes; `publishAgentWithKeys` with `revokeIndices` would have
+    // used the real wallet.
+    const keyId = keyIds[0];
+    const revokedAt = new Date(Date.UTC(2026, 4, 17, 13, 0, 0)).toISOString();
+    // Decode the public key so the attacker can produce a real
+    // (but unauthorised) signature over the canonical payload.
+    const rdfDump = await (agent as unknown as DKGAgentInternals).store.query(
+      `SELECT ?key WHERE { GRAPH <${AGENT_GRAPH}> { <did:dkg:agent:${agentAddress}> <${DKG}publicEncryptionKey> ?key } }`,
+    );
+    const keyB64 = ((rdfDump as any).bindings[0].key as string).replace(/^"|"$/g, '');
+    const { decodeWorkspaceEncryptionKey } = await import('@origintrail-official/dkg-core');
+    const publicKeyBytes = decodeWorkspaceEncryptionKey(keyB64);
+    const forgedPayload = computeWorkspaceAgentEncryptionKeyRevocationPayload({
+      agentAddress,
+      encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+      publicKeyBytes,
+      revokedAt,
+    });
+    const forgedProof = attacker.signingKey.sign(ethers.hashMessage(forgedPayload)).serialized;
+    await (agent as unknown as DKGAgentInternals).store.insert([
+      { subject: keyId, predicate: `${DKG}revokedAt`, object: `"${revokedAt}"`, graph: AGENT_GRAPH },
+      { subject: keyId, predicate: `${DKG}revokedBy`, object: `did:dkg:agent:${agentAddress}`, graph: AGENT_GRAPH },
+      { subject: keyId, predicate: `${DKG}encryptionKeyRevocationProof`, object: `"${forgedProof}"`, graph: AGENT_GRAPH },
+    ]);
+
+    const byAgent = await (agent as unknown as DKGAgentInternals).loadEncryptionKeyTriplesByAgent();
+    const entries = byAgent.get(agentAddress.toLowerCase())!;
+    expect(entries).toHaveLength(1);
+    // The forged revocation is silently dropped: the key comes back
+    // as ACTIVE on this node, matching what the resolver and other
+    // peers will continue to see.
+    expect(entries[0].revokedAt).toBeUndefined();
+    expect(entries[0].revocationProof).toBeUndefined();
+  });
+
   it('preserves wallet-signed revocations from RDF (revokedAt + revocationProof recovered)', async () => {
     const agent = await DKGAgent.create({ name: 'RdfRecoveryRevoked', chainAdapter: new MockChainAdapter() });
     const wallet = ethers.Wallet.createRandom();

@@ -558,8 +558,9 @@ Each DKG agent is associated with one or more X25519 **workspace encryption keys
 
 | Method | Route | Purpose |
 |---|---|---|
-| `POST` | `/api/agent/:address/rotate-encryption-key` | Mint a fresh workspace encryption key for a custodial agent, persist it, and re-publish the profile. Body: `{ "retireOld": true }` (default `false`) to also wallet-sign + publish a revocation for the previous default key in the same operation. |
-| `POST` | `/api/agent/:address/revoke-encryption-key` | Wallet-sign and publish a revocation for one specific key. Body: `{ "keyId": "did:dkg:agent:0x...#x25519-..." }`. Refuses to revoke the agent's last active key (would brick SWM); rotate first in that case. |
+| `POST` | `/api/agent/:address/rotate-encryption-key` | Mint a fresh workspace encryption key for a custodial agent, persist it, and re-publish the profile. Body: `{ "retireOld": true }` (default `false`) to also wallet-sign + publish a revocation for the previous default key in the same operation. Authorization: agent-scoped tokens may only manage their own agent; node-admin tokens may manage any local agent. |
+| `POST` | `/api/agent/:address/revoke-encryption-key` | Wallet-sign and publish a revocation for one specific key. Body: `{ "keyId": "did:dkg:agent:0x...#x25519-..." }`. Refuses to revoke the agent's last active key (would brick SWM); rotate first in that case. Same authorization gating as rotate. |
+| `POST` | `/api/agent/publish-profile` | Re-broadcast the default agent's profile. The rotate/revoke routes call this implicitly on success; this endpoint is the retry path for the partial-failure case where local persistence succeeded but the implicit republish errored (the response includes `profilePublished: false` + `profilePublishError`). Node-admin token required. |
 
 CLI equivalents (run on the node operator's machine):
 
@@ -567,6 +568,7 @@ CLI equivalents (run on the node operator's machine):
 dkg agent rotate-encryption-key 0xCdba429ca35B458E83420B8FD101172fd8B7CFA5
 dkg agent rotate-encryption-key 0xCdba... --retire-old
 dkg agent revoke-encryption-key 0xCdba... did:dkg:agent:0xcdba...#x25519-<hash>
+dkg agent publish-profile   # retry after a partial-success rotate/revoke
 ```
 
 **Recommended rotation playbook:**

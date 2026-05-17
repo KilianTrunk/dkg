@@ -30,6 +30,7 @@ import {
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
   computeWorkspaceAgentEncryptionKeyProofPayload,
+  computeWorkspaceAgentEncryptionKeyRevocationPayload,
   decodeWorkspaceEncryptionKey,
   encodeWorkspaceEncryptionKey,
   workspaceAgentEncryptionKeyId,
@@ -4355,8 +4356,32 @@ export class DKGAgent {
         };
         const rev = revocations.get(encryptionKeyId);
         if (rev) {
-          entry.revokedAt = rev.revokedAt;
-          entry.revocationProof = rev.revocationProof;
+          // Verify the revocation proof BEFORE adopting it. Without
+          // this guard, anyone who can write into this node's agents
+          // RDF graph could forge `revokedAt` + `revocationProof`
+          // triples on a key URI, and the daemon would treat its own
+          // public key as retired on the next boot — silently
+          // bricking propagation for an attacker-chosen key. The
+          // resolver already verifies the same proof before honouring
+          // cross-agent revocations; mirror that here so the same
+          // forged triples can't poison local startup state either.
+          // Codex review of PR #540 / commit 60ead6be.
+          let recoveredRev: string;
+          try {
+            const revPayload = computeWorkspaceAgentEncryptionKeyRevocationPayload({
+              agentAddress: checksumAddr,
+              encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+              publicKeyBytes,
+              revokedAt: rev.revokedAt,
+            });
+            recoveredRev = ethers.verifyMessage(revPayload, rev.revocationProof);
+          } catch {
+            recoveredRev = '';
+          }
+          if (recoveredRev && recoveredRev.toLowerCase() === lowerAddr) {
+            entry.revokedAt = rev.revokedAt;
+            entry.revocationProof = rev.revocationProof;
+          }
         }
         entries.push(entry);
       }

@@ -388,6 +388,28 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     }
   }
 
+  // Authorize the new key-management routes: an agent-scoped token may
+  // only act on its own agent. Node-admin tokens (no specific agent
+  // bound) are the operator override and may act on any local agent.
+  // `agent.resolveAgentByToken` returns the agent address for an
+  // agent-scoped token, `undefined` for the node-admin token (which
+  // isn't registered in the per-agent index). Same pattern other
+  // routes (e.g. memory.ts, query.ts) already use for caller-vs-target
+  // gating.
+  function authorizeKeyManagementOnAddress(targetAddress: string): { ok: true } | { ok: false; status: number; body: Record<string, unknown> } {
+    const tokenAgentAddress = requestToken ? agent.resolveAgentByToken(requestToken) : undefined;
+    if (!tokenAgentAddress) return { ok: true };
+    if (tokenAgentAddress.toLowerCase() === targetAddress.toLowerCase()) return { ok: true };
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        error: `Agent token for ${tokenAgentAddress} cannot manage encryption keys for ${targetAddress}. ` +
+          'Use a node-level admin token (~/.dkg/auth.token) to manage other agents on this node.',
+      },
+    };
+  }
+
   // POST /api/agent/:address/rotate-encryption-key — mint a fresh workspace
   // encryption key for a custodial local agent. Body: `{ "retireOld": boolean }`.
   // When `retireOld` is true, the previous default key is also revoked in the
@@ -402,6 +424,8 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
   ) {
     const address = decodeURIComponent(path.slice("/api/agent/".length, -"/rotate-encryption-key".length));
     if (!address) return jsonResponse(res, 404, { error: "Agent address required in path" });
+    const authz = authorizeKeyManagementOnAddress(address);
+    if (!authz.ok) return jsonResponse(res, authz.status, authz.body);
     let parsed: { retireOld?: unknown } = {};
     const body = (await readBody(req, SMALL_BODY_BYTES)).trim();
     if (body) {
@@ -429,6 +453,8 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
   ) {
     const address = decodeURIComponent(path.slice("/api/agent/".length, -"/revoke-encryption-key".length));
     if (!address) return jsonResponse(res, 404, { error: "Agent address required in path" });
+    const authz = authorizeKeyManagementOnAddress(address);
+    if (!authz.ok) return jsonResponse(res, authz.status, authz.body);
     const body = (await readBody(req, SMALL_BODY_BYTES)).trim();
     if (!body) return jsonResponse(res, 400, { error: 'Body required: { "keyId": "..." }' });
     let parsed: { keyId?: unknown };
@@ -442,6 +468,31 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
       return jsonResponse(res, 200, { ok: true, ...result });
     } catch (err: any) {
       return jsonResponse(res, 400, { error: err?.message ?? "Encryption key revocation failed" });
+    }
+  }
+
+  // POST /api/agent/publish-profile — re-broadcast the daemon's default
+  // agent profile. The rotate/revoke flows above call this implicitly on
+  // success; this endpoint exists for the partial-failure path where
+  // local persistence succeeded but the implicit republish errored
+  // (returned `profilePublished: false` + `profilePublishError`). The
+  // operator retries here once whatever blocked the publish (chain RPC,
+  // libp2p dial, etc.) has recovered. Node-admin only — there is no
+  // per-agent profile in the current architecture, only the default
+  // agent's; gating to admin avoids a non-default-agent token tricking
+  // the daemon into republishing on demand for spam.
+  if (req.method === "POST" && path === "/api/agent/publish-profile") {
+    const tokenAgentAddress = requestToken ? agent.resolveAgentByToken(requestToken) : undefined;
+    if (tokenAgentAddress) {
+      return jsonResponse(res, 403, {
+        error: 'POST /api/agent/publish-profile requires a node-level admin token; agent-scoped tokens cannot trigger a profile republish.',
+      });
+    }
+    try {
+      const result = await agent.publishProfile();
+      return jsonResponse(res, 200, { ok: true, ual: (result as any)?.ual ?? null });
+    } catch (err: any) {
+      return jsonResponse(res, 502, { error: err?.message ?? "Profile publish failed" });
     }
   }
 

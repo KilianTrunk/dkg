@@ -519,7 +519,7 @@ agentCmd
         console.error('Profile re-published:  NO — ' + result.profilePublishError);
         if (result.retiredKeyId) {
           console.error('Peers will keep encrypting to the retired key until republish succeeds.');
-          console.error('Retry: POST /api/agent/publish-profile, or restart the daemon.');
+          console.error('Retry with: `dkg agent publish-profile` (or POST /api/agent/publish-profile with a node-admin token).');
         } else {
           console.error('The new key is persisted locally; peers will pick it up on the next agent-registry sync.');
         }
@@ -529,6 +529,21 @@ agentCmd
       }
     } catch (err: any) {
       console.error(`Rotation failed: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+  });
+
+agentCmd
+  .command('publish-profile')
+  .description('Re-publish the daemon\'s default agent profile (retry endpoint for failed rotate/revoke republish)')
+  .action(async () => {
+    try {
+      const client = await ApiClient.connect();
+      const result = await client.publishAgentProfile();
+      console.log('Profile re-published.');
+      if (result.ual) console.log(`UAL: ${result.ual}`);
+    } catch (err: any) {
+      console.error(`Publish failed: ${err?.message ?? err}`);
       process.exit(1);
     }
   });
@@ -547,7 +562,7 @@ agentCmd
       } else if (result.profilePublishError) {
         console.error('Profile re-published: NO — ' + result.profilePublishError);
         console.error('Peers will keep encrypting to the revoked key until republish succeeds.');
-        console.error('Retry: POST /api/agent/publish-profile, or restart the daemon.');
+        console.error('Retry with: `dkg agent publish-profile` (or POST /api/agent/publish-profile with a node-admin token).');
         process.exit(1);
       } else {
         // Non-default agent: the revocation is recorded locally but the daemon's

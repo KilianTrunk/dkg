@@ -25,6 +25,8 @@ export function isRecoverableSendError(err: unknown): boolean {
     msg.includes('epipe') ||
     msg.includes('aborted') ||
     msg.includes('no valid addresses') ||
+    msg.includes('no_reservation') ||
+    msg.includes('no reservation') ||
     msg.includes('protocol selection failed') ||
     msg.includes('could not negotiate')
   );

@@ -511,9 +511,10 @@ describe('Messenger DHT-walk-on-stall recovery (rc.9 PR-5)', () => {
     resolvePeer?: ReturnType<typeof vi.fn>;
     backoffs?: readonly number[];
     initialClock?: number;
+    errorMessage?: string;
   } = {}) {
     const router = makeRouter(async () => {
-      throw new Error('no valid addresses for peer');
+      throw new Error(opts.errorMessage ?? 'no valid addresses for peer');
     });
     const idempotencyStore = new InMemoryMessageIdempotencyStore();
     const outboxStore = new InMemoryProtocolOutboxStore({
@@ -562,6 +563,22 @@ describe('Messenger DHT-walk-on-stall recovery (rc.9 PR-5)', () => {
 
     expect(resolvePeer).toHaveBeenCalledTimes(1);
     expect(resolvePeer).toHaveBeenCalledWith(PEER_A, { signal: expect.any(AbortSignal) });
+  });
+
+  it('treats NO_RESERVATION as recoverable and triggers the DHT walk', async () => {
+    const { messenger, resolvePeer, advance } = makeStallSubstrate({
+      errorMessage: 'NO_RESERVATION',
+    });
+
+    for (let i = 0; i < 5; i++) {
+      const result = await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+      expect(result.queued).toBe(true);
+      advance(1000);
+    }
+
+    expect(resolvePeer).toHaveBeenCalledTimes(1);
   });
 
   it('rate-limits resolvePeer per peer (no second walk within DHT_WALK_RATE_LIMIT_MS)', async () => {
@@ -652,6 +669,30 @@ describe('Messenger DHT-walk-on-stall recovery (rc.9 PR-5)', () => {
     expect(resolvePeer).toHaveBeenCalledTimes(2);
     const peers = resolvePeer.mock.calls.map((c) => c[0]).sort();
     expect(peers).toEqual([PEER_A, PEER_B].sort());
+  });
+
+  it('clears the DHT-walk rate limit when a peer outbox expires empty', async () => {
+    const { messenger, resolvePeer, advance, now } = makeStallSubstrate();
+
+    for (let i = 0; i < 5; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+      advance(1000);
+    }
+    expect(resolvePeer).toHaveBeenCalledTimes(1);
+
+    const dropped = messenger.dropExpiredOutbox(now() + 60_001);
+    expect(dropped).toHaveLength(1);
+    expect(messenger.outboxSize()).toBe(0);
+
+    for (let i = 0; i < 5; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: '00000000-0000-4000-8000-000000000002',
+      });
+      advance(1000);
+    }
+    expect(resolvePeer).toHaveBeenCalledTimes(2);
   });
 
   it('swallows resolvePeer rejections (failure must not bubble to caller)', async () => {

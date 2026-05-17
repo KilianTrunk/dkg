@@ -45,7 +45,20 @@ export function encodeDiscoverRequest(msg: DiscoverRequestMsg): Uint8Array {
 }
 
 export function decodeDiscoverRequest(buf: Uint8Array): DiscoverRequestMsg {
-  return DiscoverRequestSchema.decode(buf) as unknown as DiscoverRequestMsg;
+  const decoded = DiscoverRequestSchema.decode(buf) as unknown as DiscoverRequestMsg;
+  if (
+    typeof decoded.type !== 'string' ||
+    decoded.type.length === 0 ||
+    typeof decoded.query !== 'string' ||
+    decoded.query.length === 0 ||
+    typeof decoded.contextGraphId !== 'string' ||
+    decoded.contextGraphId.length === 0 ||
+    typeof decoded.limit !== 'number' ||
+    decoded.limit <= 0
+  ) {
+    throw new Error('Invalid DiscoverRequest payload');
+  }
+  return decoded;
 }
 
 export function encodeDiscoverResponse(msg: DiscoverResponseMsg): Uint8Array {

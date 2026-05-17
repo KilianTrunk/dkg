@@ -144,15 +144,13 @@ describe('Malformed wire input (03 §14–15): decoders fail closed on corrupt p
     expect(() => decodeKAUpdateRequest(new Uint8Array([0x0a, 0x03, 0x61, 0x62]))).toThrow();
   });
 
-  it('empty buffer decodes to default empty message (callers must validate semantics)', () => {
-    const d = decodeDiscoverRequest(new Uint8Array(0));
-    expect(d.type).toBe('');
-    expect(d.query).toBe('');
+  it('decodeDiscoverRequest throws on semantically empty payloads', () => {
+    expect(() => decodeDiscoverRequest(new Uint8Array(0))).toThrow(/Invalid DiscoverRequest payload/);
   });
 });
 
-describe('Schema isolation: wrong decoder only maps overlapping wire fields', () => {
-  it('Discover bytes decoded as QueryRequest produce overlapping fields plus defaults', () => {
+describe('Schema isolation: wrong decoder rejects foreign bytes', () => {
+  it('Discover bytes are not decodable as QueryRequest', () => {
     const discoverBytes = encodeDiscoverRequest({
       type: 't',
       query: 'q',
@@ -160,15 +158,7 @@ describe('Schema isolation: wrong decoder only maps overlapping wire fields', ()
       limit: 1,
     });
 
-    // Protobuf decoding is intentionally wire-compatible across messages that reuse
-    // field numbers and wire types. With protobufjs 8.3, these bytes decode leniently
-    // instead of throwing, so protocol isolation must come from the negotiated protocol
-    // route plus semantic validation by callers.
-    const decodedAsQuery = decodeQueryRequest(discoverBytes);
-    expect(decodedAsQuery.sparql).toBe('t');
-    expect(decodedAsQuery.contextGraphId).toBe('q');
-    expect(decodedAsQuery.contextGraphId).not.toBe('p');
-    expect(decodedAsQuery.timeout).toBe(0);
+    expect(() => decodeQueryRequest(discoverBytes)).toThrow(/Invalid QueryRequest payload/);
 
     // Sanity: the same bytes round-trip correctly with the matching decoder
     const roundTrip = decodeDiscoverRequest(discoverBytes);

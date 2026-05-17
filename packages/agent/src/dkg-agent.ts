@@ -162,7 +162,15 @@ import {
   generateCustodialAgent, registerSelfSovereignAgent, agentFromPrivateKey,
   ensureWorkspaceEncryptionKey,
   hashAgentToken,
+  activeWorkspaceEncryptionKeys,
+  appendCustodialWorkspaceEncryptionKey,
+  revokeCustodialWorkspaceEncryptionKey,
+  attachRevocationToWorkspaceEncryptionKey,
+  migrateLegacyWorkspaceEncryptionFields,
+  refreshDefaultEncryptionKeyView,
   type AgentKeyRecord,
+  type KeystoreEntry,
+  type WorkspaceEncryptionKeyEntry,
 } from './agent-keystore.js';
 import { GossipPublishHandler } from './gossip-publish-handler.js';
 import { FinalizationHandler } from './finalization-handler.js';
@@ -3801,9 +3809,14 @@ export class DKGAgent {
       publicKey: pubKeyBase64,
       relayAddress: relayAddrs?.[0],
       agentAddress: this.defaultAgentAddress,
-      encryptionKeyAlgorithm: defaultAgent?.encryptionKeyAlgorithm,
-      publicEncryptionKey: defaultAgent?.publicEncryptionKey,
-      encryptionKeyProof: defaultAgent?.encryptionKeyProof,
+      encryptionKeys: defaultAgent?.workspaceEncryptionKeys.map((k) => ({
+        encryptionKeyAlgorithm: k.encryptionKeyAlgorithm,
+        publicEncryptionKey: k.publicEncryptionKey,
+        encryptionKeyProof: k.encryptionKeyProof,
+        encryptionKeyId: k.encryptionKeyId,
+        revokedAt: k.revokedAt,
+        revocationProof: k.revocationProof,
+      })),
       skills: (this.config.skills ?? []).map(s => ({
         skillType: s.skillType,
         pricePerCall: s.pricePerCall,
@@ -3970,6 +3983,142 @@ export class DKGAgent {
   }
 
   /**
+   * Mint a fresh workspace encryption keypair for a local custodial agent,
+   * sign it with the agent's wallet, append it to the keystore, and publish
+   * an updated agent profile so peers learn the new key.
+   *
+   * - The new key starts in the **active** set immediately — encryption-only
+   *   senders (the resolver) will start including it the next time they
+   *   query, so peers can begin encrypting SWM gossip to it as soon as the
+   *   updated profile gossips reach them.
+   * - The previous default key stays active by default; SWM gossip already
+   *   encrypted to it remains decryptable, and senders that haven't seen the
+   *   new profile yet keep working. Pass `retireOld: true` to also emit a
+   *   wallet-signed revocation for the prior default in the same operation
+   *   (use only after you're confident the new key has propagated, or for
+   *   urgent rotations that prioritise blast-radius reduction over
+   *   compatibility).
+   * - Self-sovereign agents must rotate via their own tooling (the daemon
+   *   never has their wallet); this method throws for them.
+   */
+  async rotateWorkspaceEncryptionKey(
+    agentAddress: string,
+    opts: { retireOld?: boolean } = {},
+  ): Promise<{ newKeyId: string; retiredKeyId?: string }> {
+    const record = this.localAgents.get(this.resolveLocalAgentAddress(agentAddress));
+    if (!record) {
+      throw new Error(`Unknown local agent ${agentAddress}`);
+    }
+    if (record.mode !== 'custodial' || !record.privateKey) {
+      throw new Error(
+        `Cannot rotate encryption key for non-custodial agent ${record.agentAddress}: ` +
+        'self-sovereign agents must sign rotations off-node and submit them via the revoke endpoint',
+      );
+    }
+
+    const priorActive = activeWorkspaceEncryptionKeys(record);
+    const priorDefaultId = priorActive[0]?.encryptionKeyId;
+    const newEntry = appendCustodialWorkspaceEncryptionKey(record);
+    let retiredKeyId: string | undefined;
+    if (opts.retireOld && priorDefaultId && priorDefaultId !== newEntry.encryptionKeyId) {
+      revokeCustodialWorkspaceEncryptionKey(record, priorDefaultId);
+      retiredKeyId = priorDefaultId;
+    }
+
+    await this.persistAgentToStore(record);
+    await this.saveToKeystore(record);
+
+    const ctx = createOperationContext('system');
+    this.log.info(
+      ctx,
+      `Rotated workspace encryption key for agent ${record.agentAddress}: ` +
+      `new=${newEntry.encryptionKeyId}${retiredKeyId ? ` retired=${retiredKeyId}` : ''}`,
+    );
+
+    // Best-effort profile re-publish so peers see the new key. We don't fail
+    // the rotation if publish errors — the keystore + RDF are already
+    // updated; a later publishProfile() call will retry.
+    if (record.agentAddress === this.defaultAgentAddress) {
+      try {
+        await this.publishProfile();
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `Profile re-publish after rotation failed for agent ${record.agentAddress}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    return { newKeyId: newEntry.encryptionKeyId, retiredKeyId };
+  }
+
+  /**
+   * Revoke a specific workspace encryption key for a local custodial agent.
+   *
+   * Refuses to revoke the agent's last active key — that would brick SWM
+   * access. Callers should `rotateWorkspaceEncryptionKey` first, let
+   * propagation settle, then revoke. The revocation is wallet-signed using
+   * the agent's secp256k1 private key (which is why this endpoint is custodial-
+   * only); see {@link computeWorkspaceAgentEncryptionKeyRevocationPayload}.
+   */
+  async revokeWorkspaceEncryptionKey(
+    agentAddress: string,
+    keyId: string,
+  ): Promise<{ revokedKeyId: string; revokedAt: string }> {
+    const record = this.localAgents.get(this.resolveLocalAgentAddress(agentAddress));
+    if (!record) {
+      throw new Error(`Unknown local agent ${agentAddress}`);
+    }
+    if (record.mode !== 'custodial' || !record.privateKey) {
+      throw new Error(
+        `Cannot revoke encryption key on non-custodial agent ${record.agentAddress}: ` +
+        'submit a pre-signed revocation via attachRevocationToWorkspaceEncryptionKey for self-sovereign agents',
+      );
+    }
+    const target = record.workspaceEncryptionKeys.find((k) => k.encryptionKeyId === keyId);
+    if (!target) {
+      throw new Error(`Encryption key ${keyId} not found for agent ${record.agentAddress}`);
+    }
+    if (!target.revokedAt) {
+      const remainingActive = activeWorkspaceEncryptionKeys(record).filter((k) => k.encryptionKeyId !== keyId);
+      if (remainingActive.length === 0) {
+        throw new Error(
+          `Refusing to revoke the only active encryption key for agent ${record.agentAddress}: ` +
+          'call rotateWorkspaceEncryptionKey first to mint a replacement',
+        );
+      }
+    }
+    const entry = revokeCustodialWorkspaceEncryptionKey(record, keyId);
+    await this.persistAgentToStore(record);
+    await this.saveToKeystore(record);
+
+    const ctx = createOperationContext('system');
+    this.log.info(ctx, `Revoked encryption key ${keyId} for agent ${record.agentAddress}`);
+
+    if (record.agentAddress === this.defaultAgentAddress) {
+      try {
+        await this.publishProfile();
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `Profile re-publish after revocation failed for agent ${record.agentAddress}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    return { revokedKeyId: keyId, revokedAt: entry.revokedAt! };
+  }
+
+  private resolveLocalAgentAddress(addressOrLowercase: string): string {
+    if (this.localAgents.has(addressOrLowercase)) return addressOrLowercase;
+    try {
+      const checksum = ethers.getAddress(addressOrLowercase);
+      if (this.localAgents.has(checksum)) return checksum;
+    } catch { /* fall through */ }
+    return addressOrLowercase;
+  }
+
+  /**
    * Resolve an agent address from a Bearer token.
    * Returns undefined if the token is not an agent token (could be a node-level token).
    */
@@ -4045,12 +4194,26 @@ export class DKGAgent {
     if (record.publicKey) {
       quads.push({ subject: agentUri, predicate: `${DKG}publicKey`, object: `"${record.publicKey}"`, graph });
     }
-    if (record.publicEncryptionKey && record.encryptionKeyAlgorithm && record.encryptionKeyProof) {
+    // Emit one (publicEncryptionKey, algorithm, proof) tuple per registered key
+    // — the resolver collects every authenticated key into the recipient set, so
+    // multi-key agents need all entries present in RDF. For revoked keys we
+    // additionally publish wallet-signed revocation triples on the key URI; the
+    // resolver honours them and skips the key. Self-sovereign agents whose
+    // entries lack a private half are still authenticatable via their proof
+    // (private bytes never leave the originating node anyway).
+    for (const entry of record.workspaceEncryptionKeys) {
       quads.push(
-        { subject: agentUri, predicate: `${DKG}publicEncryptionKey`, object: `"${record.publicEncryptionKey}"`, graph },
-        { subject: agentUri, predicate: `${DKG}encryptionKeyAlgorithm`, object: `"${record.encryptionKeyAlgorithm}"`, graph },
-        { subject: agentUri, predicate: `${DKG}encryptionKeyProof`, object: `"${record.encryptionKeyProof}"`, graph },
+        { subject: agentUri, predicate: `${DKG}publicEncryptionKey`, object: `"${entry.publicEncryptionKey}"`, graph },
+        { subject: agentUri, predicate: `${DKG}encryptionKeyAlgorithm`, object: `"${entry.encryptionKeyAlgorithm}"`, graph },
+        { subject: agentUri, predicate: `${DKG}encryptionKeyProof`, object: `"${entry.encryptionKeyProof}"`, graph },
       );
+      if (entry.revokedAt && entry.revocationProof) {
+        quads.push(
+          { subject: entry.encryptionKeyId, predicate: `${DKG}revokedAt`, object: `"${entry.revokedAt}"`, graph },
+          { subject: entry.encryptionKeyId, predicate: `${DKG}revokedBy`, object: agentUri, graph },
+          { subject: entry.encryptionKeyId, predicate: `${DKG}encryptionKeyRevocationProof`, object: `"${entry.revocationProof}"`, graph },
+        );
+      }
     }
     if (record.framework) {
       quads.push({ subject: agentUri, predicate: 'https://dkg.origintrail.io/skill#framework', object: `"${record.framework}"`, graph });
@@ -4069,8 +4232,12 @@ export class DKGAgent {
     // Load raw tokens and custodial keys from the on-disk keystore
     const keystore = await this.loadKeystore();
 
+    // Agent metadata is loaded from RDF; workspace encryption keys are owned
+    // by the keystore (the only place we ever store private halves). Older
+    // singular-form keystore entries are migrated to the multi-key array via
+    // `migrateLegacyWorkspaceEncryptionFields` below.
     const sparql = `
-      SELECT ?agent ?name ?address ?mode ?tokenHash ?legacyToken ?publicKey ?publicEncryptionKey ?encryptionKeyAlgorithm ?encryptionKeyProof ?framework ?createdAt ?isDefault WHERE {
+      SELECT ?agent ?name ?address ?mode ?tokenHash ?legacyToken ?publicKey ?framework ?createdAt ?isDefault WHERE {
         GRAPH <${graph}> {
           ?agent a <${DKG}Agent> ;
                  <https://schema.org/name> ?name ;
@@ -4079,9 +4246,6 @@ export class DKGAgent {
           OPTIONAL { ?agent <${DKG}agentAuthTokenHash> ?tokenHash }
           OPTIONAL { ?agent <${DKG}agentAuthToken> ?legacyToken }
           OPTIONAL { ?agent <${DKG}publicKey> ?publicKey }
-          OPTIONAL { ?agent <${DKG}publicEncryptionKey> ?publicEncryptionKey }
-          OPTIONAL { ?agent <${DKG}encryptionKeyAlgorithm> ?encryptionKeyAlgorithm }
-          OPTIONAL { ?agent <${DKG}encryptionKeyProof> ?encryptionKeyProof }
           OPTIONAL { ?agent <https://dkg.origintrail.io/skill#framework> ?framework }
           OPTIONAL { ?agent <${DKG}createdAt> ?createdAt }
           OPTIONAL { ?agent <${DKG}isDefaultAgent> ?isDefault }
@@ -4105,18 +4269,10 @@ export class DKGAgent {
           authToken = legacyToken;
         }
 
-        const storeHasEncryptionKey = Boolean(
-          strip(row['publicEncryptionKey']) &&
-          strip(row['encryptionKeyAlgorithm']) &&
-          strip(row['encryptionKeyProof']),
-        );
         const record: AgentKeyRecord = {
           agentAddress: addr,
           publicKey: strip(row['publicKey']) || '',
-          publicEncryptionKey: strip(row['publicEncryptionKey']) || ksEntry?.publicEncryptionKey,
-          privateEncryptionKey: ksEntry?.privateEncryptionKey,
-          encryptionKeyAlgorithm: (strip(row['encryptionKeyAlgorithm']) || ksEntry?.encryptionKeyAlgorithm) as typeof WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519 | undefined,
-          encryptionKeyProof: strip(row['encryptionKeyProof']) || ksEntry?.encryptionKeyProof,
+          workspaceEncryptionKeys: [],
           name: strip(row['name']),
           framework: strip(row['framework']) || undefined,
           mode: strip(row['mode']) as 'custodial' | 'self-sovereign',
@@ -4144,16 +4300,19 @@ export class DKGAgent {
           }
         }
 
-        if (record.publicEncryptionKey) {
-          try {
-            record.encryptionKeyId = workspaceAgentEncryptionKeyId(
-              record.agentAddress,
-              decodeWorkspaceEncryptionKey(record.publicEncryptionKey),
-            );
-          } catch {
-            record.encryptionKeyId = undefined;
-          }
+        // Hydrate workspaceEncryptionKeys[] from the keystore. v2 keystores have
+        // the array directly; v1 keystores only carry the singular fields, so
+        // we copy them onto the record and let the migration helper backfill.
+        if (ksEntry?.workspaceEncryptionKeys?.length) {
+          record.workspaceEncryptionKeys = ksEntry.workspaceEncryptionKeys.map((k) => ({ ...k }));
+        } else if (ksEntry?.publicEncryptionKey || ksEntry?.privateEncryptionKey || ksEntry?.encryptionKeyProof) {
+          record.publicEncryptionKey = ksEntry.publicEncryptionKey;
+          record.privateEncryptionKey = ksEntry.privateEncryptionKey;
+          record.encryptionKeyAlgorithm = ksEntry.encryptionKeyAlgorithm;
+          record.encryptionKeyProof = ksEntry.encryptionKeyProof;
+          migrateLegacyWorkspaceEncryptionFields(record);
         }
+        refreshDefaultEncryptionKeyView(record);
         const generatedEncryptionKey = ensureWorkspaceEncryptionKey(record);
 
         this.localAgents.set(record.agentAddress, record);
@@ -4169,15 +4328,10 @@ export class DKGAgent {
         if (legacyToken && !ksEntry?.authToken) {
           needsMigration.push(record);
         }
-        if (
-          generatedEncryptionKey ||
-          (
-            !storeHasEncryptionKey &&
-            record.publicEncryptionKey &&
-            record.encryptionKeyAlgorithm &&
-            record.encryptionKeyProof
-          )
-        ) {
+        // Migrate keystore to v2 shape when we minted a fresh key, or when the
+        // keystore lacks the array but has legacy singular fields we've folded
+        // into it above.
+        if (generatedEncryptionKey || (!ksEntry?.workspaceEncryptionKeys?.length && record.workspaceEncryptionKeys.length > 0)) {
           needsMigration.push(record);
         }
       }
@@ -4238,14 +4392,7 @@ export class DKGAgent {
     return `${this.config.dataDir}/agent-keystore.json`;
   }
 
-  private async loadKeystore(): Promise<Record<string, {
-    authToken?: string;
-    privateKey?: string;
-    encryptionKeyAlgorithm?: typeof WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519;
-    publicEncryptionKey?: string;
-    privateEncryptionKey?: string;
-    encryptionKeyProof?: string;
-  }>> {
+  private async loadKeystore(): Promise<Record<string, KeystoreEntry>> {
     const ksPath = this.keystorePath();
     if (!ksPath) return {};
     try {
@@ -4257,31 +4404,35 @@ export class DKGAgent {
     }
   }
 
+  /**
+   * Persist an agent record to disk. We always write the multi-key array
+   * (`workspaceEncryptionKeys`) and also refresh the legacy singular fields to
+   * mirror the default active key — that keeps an older daemon binary that
+   * was downgraded after a rotation able to read its primary key without
+   * crashing, while the v2 daemon reads the array verbatim.
+   */
   private async saveToKeystore(record: AgentKeyRecord): Promise<void> {
     const ksPath = this.keystorePath();
     if (!ksPath) return;
     try {
       const { readFile, writeFile, mkdir, chmod } = await import('node:fs/promises');
       const { dirname } = await import('node:path');
-      let existing: Record<string, {
-        authToken?: string;
-        privateKey?: string;
-        encryptionKeyAlgorithm?: typeof WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519;
-        publicEncryptionKey?: string;
-        privateEncryptionKey?: string;
-        encryptionKeyProof?: string;
-      }> = {};
+      let existing: Record<string, KeystoreEntry> = {};
       try {
         const raw = await readFile(ksPath, 'utf-8');
         existing = JSON.parse(raw);
       } catch { /* first write */ }
+      const defaultActive = activeWorkspaceEncryptionKeys(record)[0];
       existing[record.agentAddress.toLowerCase()] = {
         authToken: record.authToken,
         ...(record.privateKey ? { privateKey: record.privateKey } : {}),
-        ...(record.encryptionKeyAlgorithm ? { encryptionKeyAlgorithm: record.encryptionKeyAlgorithm } : {}),
-        ...(record.publicEncryptionKey ? { publicEncryptionKey: record.publicEncryptionKey } : {}),
-        ...(record.privateEncryptionKey ? { privateEncryptionKey: record.privateEncryptionKey } : {}),
-        ...(record.encryptionKeyProof ? { encryptionKeyProof: record.encryptionKeyProof } : {}),
+        ...(record.workspaceEncryptionKeys.length
+          ? { workspaceEncryptionKeys: record.workspaceEncryptionKeys.map((k) => ({ ...k })) }
+          : {}),
+        ...(defaultActive?.encryptionKeyAlgorithm ? { encryptionKeyAlgorithm: defaultActive.encryptionKeyAlgorithm } : {}),
+        ...(defaultActive?.publicEncryptionKey ? { publicEncryptionKey: defaultActive.publicEncryptionKey } : {}),
+        ...(defaultActive?.privateEncryptionKey ? { privateEncryptionKey: defaultActive.privateEncryptionKey } : {}),
+        ...(defaultActive?.encryptionKeyProof ? { encryptionKeyProof: defaultActive.encryptionKeyProof } : {}),
       };
       await mkdir(dirname(ksPath), { recursive: true });
       await writeFile(ksPath, JSON.stringify(existing, null, 2), { mode: 0o600 });
@@ -4922,27 +5073,36 @@ export class DKGAgent {
     return false;
   }
 
+  /**
+   * Materialise every workspace recipient private key this node holds across
+   * all local agents (including retired keys — we still want to decrypt
+   * historical messages encrypted to them, even though we never SEND to them
+   * again). The publisher's decryption path iterates these against the
+   * envelope's recipient slots, so order doesn't matter.
+   */
   private getLocalWorkspaceRecipientPrivateKeys(): WorkspaceRecipientEncryptionKey[] {
     const keys: WorkspaceRecipientEncryptionKey[] = [];
     for (const record of this.localAgents.values()) {
-      if (
-        record.encryptionKeyAlgorithm !== WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519 ||
-        !record.publicEncryptionKey ||
-        !record.privateEncryptionKey
-      ) {
-        continue;
+      for (const entry of record.workspaceEncryptionKeys) {
+        if (
+          entry.encryptionKeyAlgorithm !== WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519 ||
+          !entry.publicEncryptionKey ||
+          !entry.privateEncryptionKey
+        ) {
+          continue;
+        }
+        const publicKeyBytes = decodeWorkspaceEncryptionKey(entry.publicEncryptionKey);
+        const privateKeyBytes = decodeWorkspaceEncryptionKey(entry.privateEncryptionKey);
+        const recipientId = `did:dkg:agent:${ethers.getAddress(record.agentAddress)}`;
+        keys.push({
+          purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+          recipientId,
+          recipientKeyId: entry.encryptionKeyId,
+          encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+          publicKeyBytes,
+          privateKeyBytes,
+        });
       }
-      const publicKeyBytes = decodeWorkspaceEncryptionKey(record.publicEncryptionKey);
-      const privateKeyBytes = decodeWorkspaceEncryptionKey(record.privateEncryptionKey);
-      const recipientId = `did:dkg:agent:${ethers.getAddress(record.agentAddress)}`;
-      keys.push({
-        purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
-        recipientId,
-        recipientKeyId: workspaceAgentEncryptionKeyId(record.agentAddress, publicKeyBytes),
-        encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
-        publicKeyBytes,
-        privateKeyBytes,
-      });
     }
     return keys;
   }
@@ -5052,6 +5212,22 @@ export class DKGAgent {
       createdAtMs,
     };
 
+    // A recipient agent may hold multiple registered keys. We try each one; if
+    // a remote daemon owns the private half of one of them, that handshake
+    // succeeds and we count the agent as delivered. The other keys will fail
+    // (the recipient daemon has no matching local privkey for them) — that's
+    // expected, not a hard error. We only abort when EVERY key for a given
+    // agent failed.
+    const failuresByAgent = new Map<string, string[]>();
+    const successByAgent = new Set<string>();
+    const recordFailure = (agent: string, keyId: string, err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      const key = agent.toLowerCase();
+      const list = failuresByAgent.get(key) ?? [];
+      list.push(`${keyId}: ${msg}`);
+      failuresByAgent.set(key, list);
+    };
+
     for (const recipient of input.recipients) {
       const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
       const pkg = await this.createSignedSwmSenderKeyPackage({
@@ -5062,14 +5238,18 @@ export class DKGAgent {
 
       const isLocalRecipient = this.hasLocalAgent(recipientAgentAddress);
       if (isLocalRecipient) {
-        await this.acceptSwmSenderKeyPackage(pkg, this.node.peerId.toString(), input.ctx);
+        try {
+          await this.acceptSwmSenderKeyPackage(pkg, this.node.peerId.toString(), input.ctx);
+          successByAgent.add(recipientAgentAddress.toLowerCase());
+        } catch (err) {
+          recordFailure(recipientAgentAddress, recipient.recipientKeyId, err);
+        }
         continue;
       }
 
       if (!recipient.peerId) {
-        throw new Error(
-          `Cannot distribute SWM Sender Key epoch ${epochId}: DKG agent ${recipientAgentAddress} has no advertised peerId`,
-        );
+        recordFailure(recipientAgentAddress, recipient.recipientKeyId, new Error('no advertised peerId'));
+        continue;
       }
 
       this.log.info(
@@ -5078,21 +5258,44 @@ export class DKGAgent {
         `peerId=${recipient.peerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
         `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
       );
-      const ackBytes = await this.messenger.sendToPeer(
-        recipient.peerId,
-        PROTOCOL_SWM_SENDER_KEY,
-        encodeSwmSenderKeyPackage(pkg),
-      );
-      const ack = decodeSwmSenderKeyPackageAck(ackBytes);
-      if (
-        ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
-        ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
-        !ack.accepted
-      ) {
-        throw new Error(
-          `SWM Sender Key setup rejected by agent ${recipientAgentAddress}: ${ack.reason ?? 'unknown reason'}`,
+      try {
+        const ackBytes = await this.messenger.sendToPeer(
+          recipient.peerId,
+          PROTOCOL_SWM_SENDER_KEY,
+          encodeSwmSenderKeyPackage(pkg),
         );
+        const ack = decodeSwmSenderKeyPackageAck(ackBytes);
+        if (
+          ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
+          ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
+          !ack.accepted
+        ) {
+          recordFailure(recipientAgentAddress, recipient.recipientKeyId, new Error(ack.reason ?? 'unknown reason'));
+        } else {
+          successByAgent.add(recipientAgentAddress.toLowerCase());
+        }
+      } catch (err) {
+        recordFailure(recipientAgentAddress, recipient.recipientKeyId, err);
       }
+    }
+
+    // Surface only agents for whom ALL keys failed. Mixed-success failures get
+    // a per-key warning so operators can see the noise but SWM still progresses.
+    const fatalAgents: string[] = [];
+    for (const [agentAddress, reasons] of failuresByAgent.entries()) {
+      if (successByAgent.has(agentAddress)) {
+        this.log.warn(
+          input.ctx,
+          `SWM sender-key setup partial delivery for agent ${agentAddress} (epoch ${state.epochId}): ${reasons.join('; ')} — expected when recipient holds only a subset of registered keys`,
+        );
+      } else {
+        fatalAgents.push(`${agentAddress}: ${reasons.join('; ')}`);
+      }
+    }
+    if (fatalAgents.length > 0) {
+      throw new Error(
+        `SWM Sender Key setup rejected by ${fatalAgents.length} agent(s): ${fatalAgents.join(' | ')}`,
+      );
     }
 
     return state;

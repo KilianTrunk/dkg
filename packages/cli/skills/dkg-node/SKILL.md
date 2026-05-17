@@ -548,6 +548,35 @@ and does not promote, finalize, or publish.
 - `GET /api/events` — SSE stream for real-time notifications (`text/event-stream`). Emits `join_request`, `join_approved`, `project_synced` events with a `: heartbeat` comment every 30 s. Use it to watch for inbound invitations and project sync completions without polling.
 - 🚧 `GET /api/agent/profile` — your agent profile *(planned)*
 
+### Agent encryption-key management
+
+Each DKG agent is associated with one or more X25519 **workspace encryption keys**. SWM gossip is encrypted to every active key registered for an allowed agent, so any node holding the private half of at least one of them can decrypt. Use rotation when:
+
+- Re-bootstrapping an agent on a new node (the new node mints its own key; the previous node's key keeps working until you revoke it).
+- A node's keystore disk leaks or is suspected compromised.
+- Routine hygiene rotation.
+
+| Method | Route | Purpose |
+|---|---|---|
+| `POST` | `/api/agent/:address/rotate-encryption-key` | Mint a fresh workspace encryption key for a custodial agent, persist it, and re-publish the profile. Body: `{ "retireOld": true }` (default `false`) to also wallet-sign + publish a revocation for the previous default key in the same operation. |
+| `POST` | `/api/agent/:address/revoke-encryption-key` | Wallet-sign and publish a revocation for one specific key. Body: `{ "keyId": "did:dkg:agent:0x...#x25519-..." }`. Refuses to revoke the agent's last active key (would brick SWM); rotate first in that case. |
+
+CLI equivalents (run on the node operator's machine):
+
+```bash
+dkg agent rotate-encryption-key 0xCdba429ca35B458E83420B8FD101172fd8B7CFA5
+dkg agent rotate-encryption-key 0xCdba... --retire-old
+dkg agent revoke-encryption-key 0xCdba... did:dkg:agent:0xcdba...#x25519-<hash>
+```
+
+**Recommended rotation playbook:**
+
+1. **Safe rotate** — `dkg agent rotate-encryption-key <agent>` (no flags). Both old and new keys remain active. Peers gradually pick up the new key as they resolve the updated profile; existing SWM ciphertext keyed to the old key remains decryptable.
+2. **Wait for propagation** — give peers' resolvers time to observe the new profile (a few SWM rounds). You can monitor with `dkg query` against the `did:dkg:system/agents` graph.
+3. **Retire the old key** — `dkg agent revoke-encryption-key <agent> <oldKeyId>`. The resolver now skips it; new ciphertext is encrypted only to the survivors.
+
+**Urgent compromise:** `dkg agent rotate-encryption-key <agent> --retire-old` in one shot — peers that haven't seen the new profile yet may fail to encrypt to you for one round (they'll retry after their next resolver query), but the blast radius of the compromised key is minimised. Self-sovereign agents must sign rotations off-node and submit the resulting key + proof via `POST /api/agent/register` (re-register with new encryption material), then revoke the old key with `attachRevocationToWorkspaceEncryptionKey` from a script.
+
 ### Async publishing (job queue)
 
 Use the job queue for bulk or long-running publishes, publishes that must survive the client session, or when the daemon should hold its own signing wallet. For small interactive publishes, use synchronous `/api/shared-memory/publish` instead.

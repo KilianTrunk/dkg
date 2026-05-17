@@ -5,10 +5,12 @@ import {
   DKG_ONTOLOGY,
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
   computeWorkspaceAgentEncryptionKeyProofPayload,
+  computeWorkspaceAgentEncryptionKeyRevocationPayload,
   contextGraphDataUri,
   contextGraphMetaUri,
   encodeWorkspaceEncryptionKey,
   generateWorkspaceRecipientEncryptionKey,
+  workspaceAgentEncryptionKeyId,
 } from '@origintrail-official/dkg-core';
 import { resolveWorkspaceAgentRecipients } from '../src/index.js';
 
@@ -64,7 +66,7 @@ async function insertAgentEncryptionKey(
     omitProof?: boolean;
     keyFill?: number;
   } = {},
-): Promise<void> {
+): Promise<{ publicKeyBytes: Uint8Array; keyId: string }> {
   const recipientKey = generateWorkspaceRecipientEncryptionKey(
     agentUri(wallet.address),
     `${agentUri(wallet.address)}#test-x25519`,
@@ -99,6 +101,63 @@ async function insertAgentEncryptionKey(
     quads.push({
       subject: agentUri(wallet.address),
       predicate: DKG_ENCRYPTION_KEY_PROOF,
+      object: `"${proof}"`,
+      graph: 'did:dkg:system/agents',
+    });
+  }
+  await store.insert(quads);
+  return {
+    publicKeyBytes,
+    keyId: workspaceAgentEncryptionKeyId(ethers.getAddress(wallet.address), publicKeyBytes),
+  };
+}
+
+async function insertAgentEncryptionKeyRevocation(
+  store: OxigraphStore,
+  wallet: ethers.Wallet,
+  publicKeyBytes: Uint8Array,
+  options: {
+    revokedAt?: string;
+    proofWallet?: ethers.Wallet;
+    omitProof?: boolean;
+    tamperProof?: boolean;
+  } = {},
+): Promise<void> {
+  const checksum = ethers.getAddress(wallet.address);
+  const keyId = workspaceAgentEncryptionKeyId(checksum, publicKeyBytes);
+  const revokedAt = options.revokedAt ?? new Date().toISOString();
+  const proofSigner = options.proofWallet ?? wallet;
+  const payload = computeWorkspaceAgentEncryptionKeyRevocationPayload({
+    agentAddress: checksum,
+    encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+    publicKeyBytes,
+    revokedAt,
+  });
+  let proof = proofSigner.signingKey.sign(ethers.hashMessage(payload)).serialized;
+  if (options.tamperProof) {
+    // flip the last byte so it still parses but recovers a different address
+    const buf = Buffer.from(proof.slice(2), 'hex');
+    buf[buf.length - 2] ^= 0xff;
+    proof = `0x${buf.toString('hex')}`;
+  }
+  const quads = [
+    {
+      subject: keyId,
+      predicate: DKG_ONTOLOGY.DKG_REVOKED_AT,
+      object: `"${revokedAt}"`,
+      graph: 'did:dkg:system/agents',
+    },
+    {
+      subject: keyId,
+      predicate: DKG_ONTOLOGY.DKG_REVOKED_BY,
+      object: agentUri(wallet.address),
+      graph: 'did:dkg:system/agents',
+    },
+  ];
+  if (!options.omitProof) {
+    quads.push({
+      subject: keyId,
+      predicate: DKG_ONTOLOGY.DKG_ENCRYPTION_KEY_REVOCATION_PROOF,
       object: `"${proof}"`,
       graph: 'did:dkg:system/agents',
     });
@@ -186,14 +245,92 @@ describe('resolveWorkspaceAgentRecipients', () => {
       .rejects.toThrow(/Spoofed or unverifiable public encryption key/);
   });
 
-  it('rejects ambiguous verified recipient keys', async () => {
+  it('accepts every verified recipient key for an agent with multiple registered keys', async () => {
     const store = new OxigraphStore();
     const wallet = ethers.Wallet.createRandom();
     await insertAgentGate(store, DKG_ONTOLOGY.DKG_ALLOWED_AGENT, wallet.address);
-    await insertAgentEncryptionKey(store, wallet, { keyFill: 1 });
-    await insertAgentEncryptionKey(store, wallet, { keyFill: 2 });
+    const k1 = await insertAgentEncryptionKey(store, wallet, { keyFill: 1 });
+    const k2 = await insertAgentEncryptionKey(store, wallet, { keyFill: 2 });
+
+    const resolution = await resolveWorkspaceAgentRecipients(store, { contextGraphId: CONTEXT_GRAPH_ID });
+
+    expect(resolution.requiresEncryption).toBe(true);
+    expect(resolution.recipients).toHaveLength(2);
+    const ids = resolution.recipients.map((r) => r.recipientKeyId).sort();
+    expect(ids).toEqual([k1.keyId, k2.keyId].sort());
+    for (const recipient of resolution.recipients) {
+      expect(recipient.agentAddress).toBe(ethers.getAddress(wallet.address));
+      expect(recipient.encryptionKeyAlgorithm).toBe(WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519);
+    }
+  });
+
+  it('filters out keys with a verified wallet-signed revocation', async () => {
+    const store = new OxigraphStore();
+    const wallet = ethers.Wallet.createRandom();
+    await insertAgentGate(store, DKG_ONTOLOGY.DKG_ALLOWED_AGENT, wallet.address);
+    const retired = await insertAgentEncryptionKey(store, wallet, { keyFill: 1 });
+    const active = await insertAgentEncryptionKey(store, wallet, { keyFill: 2 });
+    await insertAgentEncryptionKeyRevocation(store, wallet, retired.publicKeyBytes);
+
+    const resolution = await resolveWorkspaceAgentRecipients(store, { contextGraphId: CONTEXT_GRAPH_ID });
+
+    expect(resolution.recipients).toHaveLength(1);
+    expect(resolution.recipients[0]?.recipientKeyId).toBe(active.keyId);
+  });
+
+  it('ignores revocations whose proof was signed by another wallet (no bricking)', async () => {
+    const store = new OxigraphStore();
+    const wallet = ethers.Wallet.createRandom();
+    await insertAgentGate(store, DKG_ONTOLOGY.DKG_ALLOWED_AGENT, wallet.address);
+    const k = await insertAgentEncryptionKey(store, wallet, { keyFill: 3 });
+    await insertAgentEncryptionKeyRevocation(store, wallet, k.publicKeyBytes, {
+      proofWallet: ethers.Wallet.createRandom(),
+    });
+
+    const resolution = await resolveWorkspaceAgentRecipients(store, { contextGraphId: CONTEXT_GRAPH_ID });
+
+    expect(resolution.recipients).toHaveLength(1);
+    expect(resolution.recipients[0]?.recipientKeyId).toBe(k.keyId);
+  });
+
+  it('ignores revocations whose proof was tampered with after signing', async () => {
+    const store = new OxigraphStore();
+    const wallet = ethers.Wallet.createRandom();
+    await insertAgentGate(store, DKG_ONTOLOGY.DKG_ALLOWED_AGENT, wallet.address);
+    const k = await insertAgentEncryptionKey(store, wallet, { keyFill: 4 });
+    await insertAgentEncryptionKeyRevocation(store, wallet, k.publicKeyBytes, {
+      tamperProof: true,
+    });
+
+    const resolution = await resolveWorkspaceAgentRecipients(store, { contextGraphId: CONTEXT_GRAPH_ID });
+
+    expect(resolution.recipients).toHaveLength(1);
+  });
+
+  it('ignores revocation triples missing the encryptionKeyRevocationProof', async () => {
+    const store = new OxigraphStore();
+    const wallet = ethers.Wallet.createRandom();
+    await insertAgentGate(store, DKG_ONTOLOGY.DKG_ALLOWED_AGENT, wallet.address);
+    const k = await insertAgentEncryptionKey(store, wallet, { keyFill: 5 });
+    await insertAgentEncryptionKeyRevocation(store, wallet, k.publicKeyBytes, {
+      omitProof: true,
+    });
+
+    const resolution = await resolveWorkspaceAgentRecipients(store, { contextGraphId: CONTEXT_GRAPH_ID });
+
+    expect(resolution.recipients).toHaveLength(1);
+  });
+
+  it('fails when every registered key for an agent has been revoked', async () => {
+    const store = new OxigraphStore();
+    const wallet = ethers.Wallet.createRandom();
+    await insertAgentGate(store, DKG_ONTOLOGY.DKG_ALLOWED_AGENT, wallet.address);
+    const k1 = await insertAgentEncryptionKey(store, wallet, { keyFill: 6 });
+    const k2 = await insertAgentEncryptionKey(store, wallet, { keyFill: 7 });
+    await insertAgentEncryptionKeyRevocation(store, wallet, k1.publicKeyBytes);
+    await insertAgentEncryptionKeyRevocation(store, wallet, k2.publicKeyBytes);
 
     await expect(resolveWorkspaceAgentRecipients(store, { contextGraphId: CONTEXT_GRAPH_ID }))
-      .rejects.toThrow(/Ambiguous public encryption keys/);
+      .rejects.toThrow(/have been revoked/);
   });
 });

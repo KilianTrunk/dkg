@@ -488,6 +488,52 @@ program
     console.log(`\nRun "dkg start" to start the node.`);
   });
 
+// ─── dkg agent ────────────────────────────────────────────────────────
+//
+// Manage workspace-encryption keys for local DKG agents. The `register` /
+// `identity` / `list` surfaces are still exposed via the bare `/api/agent/*`
+// HTTP routes for backward compatibility; this umbrella focuses on the
+// rotate / revoke flows added with multi-key SWM encryption.
+
+const agentCmd = program
+  .command('agent')
+  .description('Manage local DKG agents (encryption-key rotation + revocation)');
+
+agentCmd
+  .command('rotate-encryption-key <agentAddress>')
+  .description('Mint a fresh workspace encryption key for a custodial local agent and re-publish its profile')
+  .option('--retire-old', 'Also wallet-sign + publish a revocation for the previous default key in the same operation', false)
+  .action(async (agentAddress: string, opts: { retireOld?: boolean }) => {
+    try {
+      const client = await ApiClient.connect();
+      const result = await client.rotateAgentEncryptionKey(agentAddress, { retireOld: !!opts.retireOld });
+      console.log(`New encryption key:    ${result.newKeyId}`);
+      if (result.retiredKeyId) {
+        console.log(`Retired (revoked) key: ${result.retiredKeyId}`);
+      } else {
+        console.log('Previous key remains ACTIVE — call `dkg agent revoke-encryption-key <agent> <key>` once propagation has settled.');
+      }
+    } catch (err: any) {
+      console.error(`Rotation failed: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+  });
+
+agentCmd
+  .command('revoke-encryption-key <agentAddress> <keyId>')
+  .description('Wallet-sign and publish a revocation for a specific workspace encryption key (refuses to revoke the last active key)')
+  .action(async (agentAddress: string, keyId: string) => {
+    try {
+      const client = await ApiClient.connect();
+      const result = await client.revokeAgentEncryptionKey(agentAddress, keyId);
+      console.log(`Revoked: ${result.revokedKeyId}`);
+      console.log(`At:      ${result.revokedAt}`);
+    } catch (err: any) {
+      console.error(`Revocation failed: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+  });
+
 // ─── dkg auth ─────────────────────────────────────────────────────────
 
 const authCmd = program

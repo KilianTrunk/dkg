@@ -388,6 +388,63 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     }
   }
 
+  // POST /api/agent/:address/rotate-encryption-key — mint a fresh workspace
+  // encryption key for a custodial local agent. Body: `{ "retireOld": boolean }`.
+  // When `retireOld` is true, the previous default key is also revoked in the
+  // same operation (use only after propagation has settled, or for urgent
+  // compromise scenarios). The new key is appended to the keystore, RDF
+  // triples are emitted in the local agent registry, and the agent's profile
+  // is re-published so peers update their resolver state.
+  if (
+    req.method === "POST"
+    && path.startsWith("/api/agent/")
+    && path.endsWith("/rotate-encryption-key")
+  ) {
+    const address = decodeURIComponent(path.slice("/api/agent/".length, -"/rotate-encryption-key".length));
+    if (!address) return jsonResponse(res, 404, { error: "Agent address required in path" });
+    let parsed: { retireOld?: unknown } = {};
+    const body = (await readBody(req, SMALL_BODY_BYTES)).trim();
+    if (body) {
+      try { parsed = JSON.parse(body); }
+      catch { return jsonResponse(res, 400, { error: "Invalid JSON body" }); }
+    }
+    const retireOld = parsed.retireOld === true;
+    try {
+      const result = await agent.rotateWorkspaceEncryptionKey(address, { retireOld });
+      return jsonResponse(res, 200, { ok: true, ...result });
+    } catch (err: any) {
+      return jsonResponse(res, 400, { error: err?.message ?? "Encryption key rotation failed" });
+    }
+  }
+
+  // POST /api/agent/:address/revoke-encryption-key — wallet-sign and publish a
+  // revocation for a specific encryption key. Body: `{ "keyId": "did:dkg:agent:..." }`.
+  // Refuses to revoke the agent's last active key (would brick SWM); callers
+  // must rotate first in that case. Idempotent: revoking an already-revoked
+  // key returns the existing revocation timestamp without re-signing.
+  if (
+    req.method === "POST"
+    && path.startsWith("/api/agent/")
+    && path.endsWith("/revoke-encryption-key")
+  ) {
+    const address = decodeURIComponent(path.slice("/api/agent/".length, -"/revoke-encryption-key".length));
+    if (!address) return jsonResponse(res, 404, { error: "Agent address required in path" });
+    const body = (await readBody(req, SMALL_BODY_BYTES)).trim();
+    if (!body) return jsonResponse(res, 400, { error: 'Body required: { "keyId": "..." }' });
+    let parsed: { keyId?: unknown };
+    try { parsed = JSON.parse(body); }
+    catch { return jsonResponse(res, 400, { error: "Invalid JSON body" }); }
+    if (typeof parsed.keyId !== "string" || !parsed.keyId) {
+      return jsonResponse(res, 400, { error: 'Missing required field "keyId"' });
+    }
+    try {
+      const result = await agent.revokeWorkspaceEncryptionKey(address, parsed.keyId);
+      return jsonResponse(res, 200, { ok: true, ...result });
+    } catch (err: any) {
+      return jsonResponse(res, 400, { error: err?.message ?? "Encryption key revocation failed" });
+    }
+  }
+
   // GET /api/agent/identity — current agent identity for the requesting token
   if (req.method === "GET" && path === "/api/agent/identity") {
     const token = extractBearerToken(req.headers.authorization);

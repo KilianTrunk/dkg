@@ -247,6 +247,16 @@ export const DKG_ONTOLOGY = {
   DKG_ALLOWED_AGENT: `${DKG}allowedAgent`,
   DKG_AGENT_ADDRESS: `${DKG}agentAddress`,
   DKG_AGENT_MODE: `${DKG}agentMode`,
+  DKG_PUBLIC_ENCRYPTION_KEY: `${DKG}publicEncryptionKey`,
+  DKG_ENCRYPTION_KEY_ALGORITHM: `${DKG}encryptionKeyAlgorithm`,
+  DKG_ENCRYPTION_KEY_PROOF: `${DKG}encryptionKeyProof`,
+  // Wallet-signed revocation of a previously registered workspace encryption key.
+  // Subject = the key URI from `workspaceAgentEncryptionKeyId(addr, pubBytes)`.
+  // Authentication: ecrecover of the EIP-191 hash of
+  // `computeWorkspaceAgentEncryptionKeyRevocationPayload({ agentAddress, algorithm, publicKeyBytes, revokedAt })`
+  // must equal the agent's wallet address. Authorisation reuses the existing
+  // `DKG_REVOKED_BY`/`DKG_REVOKED_AT` predicates on that same subject.
+  DKG_ENCRYPTION_KEY_REVOCATION_PROOF: `${DKG}encryptionKeyRevocationProof`,
   DKG_AGENT_AUTH_TOKEN: `${DKG}agentAuthToken`,
   // RFC-001 §5.2 — off-chain author-attestation provenance vocabulary.
   // These are pure SPARQL-filtering convenience triples; the on-chain

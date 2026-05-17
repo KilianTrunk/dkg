@@ -47,6 +47,7 @@ export {
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
   WORKSPACE_AGENT_ENCRYPTION_KEY_PROOF_DOMAIN,
+  WORKSPACE_AGENT_ENCRYPTION_KEY_REVOCATION_DOMAIN,
   WORKSPACE_ENCRYPTION_KEY_BYTES,
   WORKSPACE_X25519_KEY_BYTES,
   WORKSPACE_ENCRYPTION_NONCE_BYTES,
@@ -55,6 +56,7 @@ export {
   decryptWorkspacePayload,
   assertSupportedEncryptedWorkspaceEnvelope,
   computeWorkspaceAgentEncryptionKeyProofPayload,
+  computeWorkspaceAgentEncryptionKeyRevocationPayload,
   workspaceAgentEncryptionKeyId,
   encodeWorkspaceEncryptionKey,
   decodeWorkspaceEncryptionKey,
@@ -62,6 +64,7 @@ export {
   type EncryptWorkspacePayloadInput,
   type DecryptedWorkspacePayload,
   type WorkspaceAgentEncryptionKeyProofFields,
+  type WorkspaceAgentEncryptionKeyRevocationFields,
 } from './workspace-encryption.js';
 
 export {

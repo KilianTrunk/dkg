@@ -207,7 +207,7 @@ async function runDaemonSupervisor(): Promise<void> {
   }
 }
 
-async function runForegroundSupervisor(): Promise<void> {
+async function runForegroundSupervisor(childEnv: NodeJS.ProcessEnv = process.env): Promise<void> {
   const maxCrashRestarts = 5;
   let crashRestartCount = 0;
   let currentChild: ReturnType<typeof spawn> | null = null;
@@ -228,7 +228,7 @@ async function runForegroundSupervisor(): Promise<void> {
       [...process.execArgv, resolveDaemonEntryPoint(), 'daemon-foreground-worker'],
       {
         stdio: 'inherit',
-        env: process.env,
+        env: childEnv,
       },
     );
 
@@ -684,22 +684,26 @@ program
 
     // rc.9 PR-7: forward --relay-preferred to the spawned daemon via
     // env var. Comma-separated so the receiver can split + filter
-    // empty/duplicate entries in `lifecycle.ts`. Persistent config
-    // (`config.preferredRelays`) is a separate source — the daemon
-    // merges both lists with the env taking declaration order first.
+    // empty/duplicate entries in `lifecycle.ts`. Build an explicit
+    // child env so an ambient DKG_RELAY_PREFERRED in the user's shell
+    // does not silently affect `dkg start` when the flag is omitted.
+    // Persistent config (`config.preferredRelays`) is a separate
+    // source — the daemon merges both lists with the env taking
+    // declaration order first.
     const relayPreferredOpt = Array.isArray(opts.relayPreferred) ? (opts.relayPreferred as string[]) : [];
-    if (relayPreferredOpt.length > 0) {
-      const cleaned = relayPreferredOpt.map((s) => s.trim()).filter((s) => s.length > 0);
-      if (cleaned.length > 0) {
-        process.env.DKG_RELAY_PREFERRED = cleaned.join(',');
-        console.log(
-          `Preferring ${cleaned.length} operator relay(s) for this run (DKG_RELAY_PREFERRED env var set; see ~/.dkg/config.json#preferredRelays for persistence).`,
-        );
-      }
+    const cleanedRelayPreferred = relayPreferredOpt.map((s) => s.trim()).filter((s) => s.length > 0);
+    const daemonEnv: NodeJS.ProcessEnv = { ...process.env };
+    if (cleanedRelayPreferred.length > 0) {
+      daemonEnv.DKG_RELAY_PREFERRED = cleanedRelayPreferred.join(',');
+      console.log(
+        `Preferring ${cleanedRelayPreferred.length} operator relay(s) for this run (DKG_RELAY_PREFERRED env var set; see ~/.dkg/config.json#preferredRelays for persistence).`,
+      );
+    } else {
+      delete daemonEnv.DKG_RELAY_PREFERRED;
     }
 
     if (opts.foreground) {
-      await runForegroundSupervisor();
+      await runForegroundSupervisor(daemonEnv);
       return;
     }
 
@@ -711,7 +715,7 @@ program
       {
         detached: true,
         stdio: ['ignore', 'ignore', 'ignore'],
-        env: process.env,
+        env: daemonEnv,
       },
     );
     child.unref();

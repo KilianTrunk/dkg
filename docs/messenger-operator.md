@@ -55,7 +55,7 @@ For a node you run continuously, write the same list into
   "preferredRelays": [
     "/ip4/203.0.113.10/tcp/4001/p2p/12D3KooWMyRelayOne...",
     "/dns4/relay.example.com/tcp/4001/p2p/12D3KooWMyRelayTwo..."
-  ]
+  ],
   // ... other config
 }
 ```
@@ -89,9 +89,8 @@ In summary:
 1. **Provision a small cloud VM** (1 vCPU, 1 GiB RAM, 20 GiB disk is
    plenty for relay-only). Public IP + ports 4001/tcp open.
 2. **Install + init DKG** as you would for any other node.
-3. **Set `nodeRole: "core"` + `enableRelayServer: true`** in
-   `config.json` so libp2p flips into relay-server mode (HOP streams
-   + reservations).
+3. **Set `nodeRole: "core"`** in `config.json` so libp2p flips into
+   relay-server mode (HOP streams + reservations).
 4. **Capture the relay's multiaddr** from the startup log:
    `/ip4/<public-ip>/tcp/4001/p2p/<peer-id>` — this is what you
    share with your other nodes' `--relay-preferred`.

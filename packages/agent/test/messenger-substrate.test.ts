@@ -323,3 +323,209 @@ describe('Messenger construction guardrails', () => {
     expect(Array.from(out)).toEqual([0x77]);
   });
 });
+
+// rc.9 PR-5 — DHT walk on stalled outbox entry. When an entry hits
+// OUTBOX_STALL_THRESHOLD attempts on an address-resolution error,
+// the Messenger fires the optional `resolvePeer` hook in the
+// background. Per-peer rate-limited so a stuck peer doesn't burn DHT
+// bandwidth.
+describe('Messenger DHT-walk-on-stall recovery (rc.9 PR-5)', () => {
+  function makeStallSubstrate(opts: {
+    resolvePeer?: ReturnType<typeof vi.fn>;
+    backoffs?: readonly number[];
+    initialClock?: number;
+  } = {}) {
+    const router = makeRouter(async () => {
+      throw new Error('no valid addresses for peer');
+    });
+    const idempotencyStore = new InMemoryMessageIdempotencyStore();
+    const outboxStore = new InMemoryProtocolOutboxStore({
+      backoffs: opts.backoffs ?? [10],
+      maxAgeMs: 60_000,
+    });
+    let nowMs = opts.initialClock ?? 1_700_000_000_000;
+    const advance = (ms: number) => {
+      nowMs += ms;
+    };
+    const resolvePeer = opts.resolvePeer ?? vi.fn(async () => undefined);
+    const messenger = new Messenger({
+      router: router as unknown as ProtocolRouter,
+      idempotencyStore,
+      outboxStore,
+      backoffs: opts.backoffs ?? [10],
+      maxAgeMs: 60_000,
+      clock: () => nowMs,
+      resolvePeer,
+    });
+    return { messenger, router, outboxStore, resolvePeer, advance, now: () => nowMs };
+  }
+
+  it('does NOT fire resolvePeer below the stall threshold', async () => {
+    const { messenger, resolvePeer, advance } = makeStallSubstrate();
+
+    // 4 failures — one below OUTBOX_STALL_THRESHOLD (5).
+    for (let i = 0; i < 4; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+      advance(1000);
+    }
+
+    expect(resolvePeer).not.toHaveBeenCalled();
+  });
+
+  it('fires resolvePeer once when the stall threshold is hit', async () => {
+    const { messenger, resolvePeer, advance } = makeStallSubstrate();
+
+    // 5 failures — equals OUTBOX_STALL_THRESHOLD.
+    for (let i = 0; i < 5; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+      advance(1000);
+    }
+
+    expect(resolvePeer).toHaveBeenCalledTimes(1);
+    expect(resolvePeer).toHaveBeenCalledWith(PEER_A, { signal: expect.any(AbortSignal) });
+  });
+
+  it('rate-limits resolvePeer per peer (no second walk within DHT_WALK_RATE_LIMIT_MS)', async () => {
+    const { messenger, resolvePeer, advance } = makeStallSubstrate();
+
+    // Climb past threshold once → fires walk #1.
+    for (let i = 0; i < 5; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+      advance(1000);
+    }
+    expect(resolvePeer).toHaveBeenCalledTimes(1);
+
+    // 5 more failures within the rate-limit window — should NOT
+    // trigger another walk.
+    for (let i = 0; i < 5; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+      advance(1000);
+    }
+    expect(resolvePeer).toHaveBeenCalledTimes(1);
+
+    // Cross the rate-limit boundary (default 5 min) → next failure
+    // fires walk #2.
+    advance(5 * 60 * 1000 + 1);
+    await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+      messageId: FIXED_MSG_ID,
+    });
+    expect(resolvePeer).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT fire resolvePeer for non-address-resolution errors (stream resets etc.)', async () => {
+    const router = makeRouter(async () => {
+      throw new Error('ECONNRESET: stream closed');
+    });
+    const idempotencyStore = new InMemoryMessageIdempotencyStore();
+    const outboxStore = new InMemoryProtocolOutboxStore({ backoffs: [10], maxAgeMs: 60_000 });
+    const resolvePeer = vi.fn(async () => undefined);
+    const messenger = new Messenger({
+      router: router as unknown as ProtocolRouter,
+      idempotencyStore,
+      outboxStore,
+      backoffs: [10],
+      maxAgeMs: 60_000,
+      resolvePeer,
+    });
+
+    // Even after many failures of a non-address-resolution error,
+    // the DHT walk shouldn't fire — it can't fix a stream reset.
+    for (let i = 0; i < 8; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+    }
+
+    expect(resolvePeer).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op when resolvePeer is not wired (backwards compat)', async () => {
+    const router = makeRouter(async () => {
+      throw new Error('no valid addresses for peer');
+    });
+    const idempotencyStore = new InMemoryMessageIdempotencyStore();
+    const outboxStore = new InMemoryProtocolOutboxStore({ backoffs: [10], maxAgeMs: 60_000 });
+    const messenger = new Messenger({
+      router: router as unknown as ProtocolRouter,
+      idempotencyStore,
+      outboxStore,
+      backoffs: [10],
+      maxAgeMs: 60_000,
+      // resolvePeer omitted intentionally
+    });
+
+    // Just verifying no throw and outbox keeps growing as expected.
+    for (let i = 0; i < 7; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+    }
+    expect(outboxStore.size()).toBe(1);
+  });
+
+  it('rate-limits per-peer, not globally (different peers can each walk independently)', async () => {
+    const { messenger, resolvePeer, advance } = makeStallSubstrate();
+
+    for (let i = 0; i < 5; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), { messageId: 'a' });
+      advance(100);
+    }
+    for (let i = 0; i < 5; i++) {
+      await messenger.sendReliable(PEER_B, PROTO, new Uint8Array([1]), { messageId: 'b' });
+      advance(100);
+    }
+
+    // One walk per peer, even though both walks fall well within
+    // the rate-limit window.
+    expect(resolvePeer).toHaveBeenCalledTimes(2);
+    const peers = resolvePeer.mock.calls.map((c) => c[0]).sort();
+    expect(peers).toEqual([PEER_A, PEER_B].sort());
+  });
+
+  it('swallows resolvePeer rejections (failure must not bubble to caller)', async () => {
+    const resolvePeer = vi.fn(async () => {
+      throw new Error('DHT walk timed out');
+    });
+    const { messenger } = makeStallSubstrate({ resolvePeer });
+
+    // 5 failures → walk fires + rejects. The user-visible send result
+    // should still be the normal queued shape; no unhandled rejection.
+    for (let i = 0; i < 5; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+    }
+    expect(resolvePeer).toHaveBeenCalledTimes(1);
+  });
+
+  it('also fires from the retry tick path (not only from sendReliable)', async () => {
+    // Bump entry to threshold-1 via direct sendReliable calls, then
+    // drive the rest via processOutboxTick so we exercise both
+    // enqueueFailure call sites.
+    const { messenger, resolvePeer, advance, outboxStore } = makeStallSubstrate();
+
+    // 4 sendReliable fails — attempts climbs to 4, threshold-1.
+    for (let i = 0; i < 4; i++) {
+      await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+      advance(1000);
+    }
+    expect(resolvePeer).not.toHaveBeenCalled();
+    expect(outboxStore.size()).toBe(1);
+
+    // One processOutboxTick → attempts climbs to 5 → walk fires.
+    advance(100);
+    await messenger.processOutboxTick(20_000_000_000_000); // far-future due check
+
+    expect(resolvePeer).toHaveBeenCalledTimes(1);
+  });
+});

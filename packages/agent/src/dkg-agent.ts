@@ -1714,6 +1714,17 @@ export class DKGAgent {
     this.messenger = new Messenger({
       router: this.router,
       ...(this.config.messengerStores ?? {}),
+      // Universal Messenger DHT-walk-on-stall recovery (rc.9 PR-5):
+      // when an outbox entry hits OUTBOX_STALL_THRESHOLD attempts on
+      // a "no valid addresses" error, the Messenger fires this hook
+      // in the background so kad-DHT repopulates peerStore for the
+      // next retry. Time-bounded + per-peer rate-limited inside the
+      // Messenger; failures are swallowed (logged only).
+      resolvePeer: async (peerId, { signal }) => {
+        const { peerIdFromString } = await import('@libp2p/peer-id');
+        const pid = peerIdFromString(peerId);
+        await this.node.libp2p.peerRouting.findPeer(pid, { signal });
+      },
     });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
     await this.loadSwmSenderKeyState();

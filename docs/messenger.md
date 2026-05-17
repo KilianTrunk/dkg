@@ -183,9 +183,30 @@ is idempotent at the app layer) or surface a terminal error.
   (rc.9 #538).
 - **`parallelPaths`** _(PR-4)_ — `Messenger.sendToPeer` can race N
   candidate paths; receiver dedup absorbs duplicates.
-- **DHT walk on stall** _(PR-5)_ — outbox entry with ≥ 5 attempts of
-  "no valid addresses for peer" triggers a time-bounded, rate-limited
-  `libp2p.peerRouting.findPeer()`.
+- **DHT walk on stall** _(PR-5, shipped)_ — when an outbox entry hits
+  `OUTBOX_STALL_THRESHOLD` (5) attempts on an address-resolution
+  error (e.g. `"no valid addresses for peer"`, `"NO_RESERVATION"`),
+  the Messenger fires `libp2p.peerRouting.findPeer(pid)` in the
+  background via the injected `resolvePeer` hook. The walk
+  repopulates `peerStore` for the next retry; failures are logged
+  and never block backoff.
+
+  Two safety knobs:
+  - **`DHT_WALK_TIMEOUT_MS`** = 10 s — hard cap so a partitioned
+    network doesn't leave the walk spinning.
+  - **`DHT_WALK_RATE_LIMIT_MS`** = 5 min per peer — prevents the
+    retry tick from burning DHT bandwidth on still-fresh k-bucket
+    data.
+
+  Why the threshold = 5: the default backoff ladder (5s → 15s → 30s
+  → 60s → 5m → 30m → 2h) puts attempt 5 at the boundary between
+  fast sub-minute retries (likely transient blip) and multi-minute
+  retries (genuine reachability degradation — when a DHT walk earns
+  its cost).
+
+  Wiring lives in `cli/src/daemon/lifecycle.ts`'s `DKGAgent`
+  construction — the `Messenger` itself never imports libp2p, so the
+  substrate stays test-friendly.
 - **Gossip peer-hints** _(PR-6, conditional)_ — only ships if Gate B
   shows DHT walk insufficient.
 

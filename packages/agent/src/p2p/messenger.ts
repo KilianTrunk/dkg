@@ -14,6 +14,59 @@ import {
 /** Bytes payload the substrate uses to signal `RESPONSE_GONE` on the wire. */
 const RESPONSE_GONE_BYTES = new TextEncoder().encode(RESPONSE_GONE_MARKER);
 
+/**
+ * Outbox-attempts threshold past which a stalled entry triggers a
+ * DHT-walk via the optional `resolvePeer` hook (rc.9 PR-5). Five was
+ * picked because the default backoff ladder (5s → 15s → 30s → 60s →
+ * 5m → 30m → 2h) puts attempt 5 at the boundary between the fast
+ * sub-minute retries (which should heal on transient relay blips)
+ * and the multi-minute retries (which means relay reachability is
+ * genuinely degraded, not just a transient — exactly when a DHT
+ * walk earns its cost).
+ */
+export const OUTBOX_STALL_THRESHOLD = 5;
+
+/**
+ * Max time the Messenger spends inside the optional `resolvePeer`
+ * hook before aborting via the `signal`. The hook is fire-and-
+ * forget so this never blocks user-visible latency; the timeout
+ * just bounds resource usage when the DHT walk would otherwise
+ * spin (e.g. fully partitioned network).
+ */
+export const DHT_WALK_TIMEOUT_MS = 10_000;
+
+/**
+ * Minimum interval between consecutive DHT walks for the same peer.
+ * Five minutes mirrors the 5m / 30m backoff layers on the outbox
+ * ladder — running a DHT walk more often than the entry itself
+ * retries would burn DHT bandwidth + amplify load with no upside
+ * (the prior walk's result is still fresh in libp2p's k-buckets).
+ */
+export const DHT_WALK_RATE_LIMIT_MS = 5 * 60 * 1000;
+
+/**
+ * Error-message substrings that indicate "the dialer couldn't find
+ * an address for the peer" — exactly the failure class the DHT walk
+ * is designed to heal. Match is case-insensitive `.includes` so we
+ * catch both libp2p's "The dial request has no valid addresses for
+ * peer" and the shorter "no valid addresses" + the relay-specific
+ * "NO_RESERVATION" surfaces from the soak data.
+ *
+ * Other recoverable errors (stream reset, ECONNRESET, etc.) don't
+ * trigger the walk because they don't mean address-resolution
+ * failed — they mean a known address went bad mid-flight, which a
+ * DHT walk doesn't help with.
+ */
+const DHT_WALK_TRIGGER_ERRORS = [
+  'no valid addresses',
+  'no_reservation',
+];
+
+function shouldTriggerDhtWalk(errMsg: string): boolean {
+  const lower = errMsg.toLowerCase();
+  return DHT_WALK_TRIGGER_ERRORS.some((needle) => lower.includes(needle));
+}
+
 export interface MessengerDeps {
   router: ProtocolRouter;
   /**
@@ -38,6 +91,26 @@ export interface MessengerDeps {
    * ladder.
    */
   backoffs?: readonly number[];
+  /**
+   * Optional address-resolver hook for the **DHT-walk-on-stall**
+   * recovery primitive (rc.9 PR-5). When provided, the Messenger
+   * fires `resolvePeer(peerId, { signal })` in the background after
+   * an outbox entry hits `OUTBOX_STALL_THRESHOLD` attempts with an
+   * address-resolution error (e.g. "no valid addresses for peer"),
+   * giving libp2p's kad-DHT a chance to repopulate `peerStore` for
+   * the next retry.
+   *
+   * Production wiring is `libp2p.peerRouting.findPeer(pid, { signal })`
+   * — done in `cli/src/daemon/lifecycle.ts`. The Messenger never
+   * imports libp2p itself; the hook keeps the substrate test-friendly
+   * and lets the agent layer own the libp2p object.
+   *
+   * The Messenger time-bounds the call (`DHT_WALK_TIMEOUT_MS`, 10s)
+   * and rate-limits per-peer (`DHT_WALK_RATE_LIMIT_MS`, 5 min) so
+   * callers don't need to manage either. Failures are logged but
+   * don't block backoff (the entry's `nextAttemptAt` is unaffected).
+   */
+  resolvePeer?: (peerId: string, opts: { signal: AbortSignal }) => Promise<void>;
   /**
    * Max age (ms) from `firstFailureAt` before an outbox entry is
    * dropped. Defaults to 24h. Caller-supplied for tests; production
@@ -163,6 +236,7 @@ export class Messenger {
   private readonly idempotencyStore?: MessageIdempotencyStore;
   private readonly outbox?: ProtocolOutbox;
   private readonly clock: () => number;
+  private readonly resolvePeer?: (peerId: string, opts: { signal: AbortSignal }) => Promise<void>;
 
   /**
    * Application handlers registered via `register`. Stored separately
@@ -171,6 +245,15 @@ export class Messenger {
    * caller's handler.
    */
   private readonly handlers = new Map<string, ReliableHandler>();
+
+  /**
+   * Per-peer wall-clock of the last DHT walk we kicked off via
+   * `resolvePeer`. Used to enforce {@link DHT_WALK_RATE_LIMIT_MS} so
+   * an outbox entry that keeps stalling doesn't fire findPeer once
+   * per retry tick (which would amplify DHT load + waste each walk
+   * on still-fresh peerStore data).
+   */
+  private readonly lastDhtWalkAt = new Map<string, number>();
 
   constructor(deps: MessengerDeps) {
     this.router = deps.router;
@@ -182,6 +265,7 @@ export class Messenger {
       });
     }
     this.clock = deps.clock ?? (() => Date.now());
+    this.resolvePeer = deps.resolvePeer;
   }
 
   /**
@@ -297,6 +381,7 @@ export class Messenger {
         errMsg,
         this.clock(),
       );
+      this.maybeScheduleDhtWalk(peerId, entry.attempts, errMsg);
       return {
         delivered: false,
         queued: true,
@@ -454,7 +539,7 @@ export class Messenger {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (isRecoverableSendError(err)) {
-        outbox.enqueueFailure(
+        const updated = outbox.enqueueFailure(
           entry.peer,
           entry.protocol,
           entry.messageId,
@@ -462,6 +547,7 @@ export class Messenger {
           errMsg,
           this.clock(),
         );
+        this.maybeScheduleDhtWalk(entry.peer, updated.attempts, errMsg);
       }
       // Non-recoverable: leave the entry alone. `dropExpired` will
       // age it out; an operator-facing diagnostic surface (PR-12)
@@ -469,6 +555,57 @@ export class Messenger {
     } finally {
       outbox.endAttempt(entry.peer, entry.protocol, entry.messageId);
     }
+  }
+
+  /**
+   * DHT-walk-on-stall recovery primitive (rc.9 PR-5). Fire a
+   * `resolvePeer` call in the background when an outbox entry hits
+   * `OUTBOX_STALL_THRESHOLD` attempts on an address-resolution
+   * error, subject to per-peer rate-limiting.
+   *
+   * Fire-and-forget: never blocks the caller. The DHT walk's
+   * side-effect (populating `peerStore` for the peer) heals the
+   * next opportunistic-flush or periodic-tick retry, not the
+   * current one. This is intentional — the current retry has
+   * already failed; the walk is for the next attempt.
+   *
+   * Guards:
+   *   1. No-op when `resolvePeer` not wired.
+   *   2. No-op below `OUTBOX_STALL_THRESHOLD` attempts (don't
+   *      spend a DHT walk on a transient blip the backoff would
+   *      have healed anyway).
+   *   3. No-op for non-address-resolution errors (DHT walk
+   *      doesn't fix stream resets or NO_RESERVATION-after-handshake).
+   *   4. Per-peer rate limit (`DHT_WALK_RATE_LIMIT_MS`).
+   *   5. Time-bounded (`DHT_WALK_TIMEOUT_MS`) — failures logged,
+   *      never bubble.
+   */
+  private maybeScheduleDhtWalk(peerId: string, attempts: number, errMsg: string): void {
+    if (!this.resolvePeer) return;
+    if (attempts < OUTBOX_STALL_THRESHOLD) return;
+    if (!shouldTriggerDhtWalk(errMsg)) return;
+    const last = this.lastDhtWalkAt.get(peerId);
+    const now = this.clock();
+    if (last !== undefined && now - last < DHT_WALK_RATE_LIMIT_MS) return;
+
+    this.lastDhtWalkAt.set(peerId, now);
+    const signal = AbortSignal.timeout(DHT_WALK_TIMEOUT_MS);
+    // Fire-and-forget; never await. Any error swallowed + logged.
+    // The walk's value is its side-effect (peerStore population),
+    // not its return value, so we don't even need the resolved
+    // multiaddrs here.
+    void this.resolvePeer(peerId, { signal })
+      .then(() => {
+        console.warn(
+          `[Messenger] DHT walk completed for ${peerId.slice(-8)} after ${attempts} stalled outbox attempts — peerStore should now be primed`,
+        );
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[Messenger] DHT walk for ${peerId.slice(-8)} failed (attempts=${attempts}): ${msg}`,
+        );
+      });
   }
 
   /**

@@ -181,10 +181,20 @@ import {
 } from './agent-keystore.js';
 import { GossipPublishHandler } from './gossip-publish-handler.js';
 import { FinalizationHandler } from './finalization-handler.js';
-import {
-  JoinApprovalRetryQueue,
-  type JoinApprovalRetryEntry,
-} from './join-approval-retry-queue.js';
+// rc.9 PR-10: JoinApprovalRetryQueue removed — substrate outbox
+// (durable, SQLite-backed) replaces it. We keep a minimal local
+// type alias so listPendingJoinApprovalRetries() retains its old
+// public shape while it stubs out to []. PR-12 rebuilds the operator
+// diagnostic surface on top of the substrate outbox and will return
+// real entries with substrate-shaped metadata.
+type JoinApprovalRetryEntry = {
+  contextGraphId: string;
+  agentAddress: string;
+  attempts: number;
+  firstFailureAt: number;
+  nextAttemptAt: number;
+  lastError: string;
+};
 import { multiaddr } from '@multiformats/multiaddr';
 import { buildCclPolicyQuads, buildPolicyApprovalQuads, buildPolicyRevocationQuads, hashCclPolicy, type CclPolicyRecord, type PolicyApprovalBinding } from './ccl-policy.js';
 import { CclEvaluator, parseCclPolicy, validateCclPolicy, type CclEvaluationResult, type CclFactTuple } from './ccl-evaluator.js';
@@ -538,23 +548,12 @@ const SYNC_RECONCILER_INTERVAL_MS = 5 * 60_000;
 const SYNC_STALENESS_THRESHOLD_MS = 10 * 60_000;
 const RANDOM_SAMPLING_BIND_RETRY_MS = 30_000;
 const STORAGE_ACK_REGISTRATION_RETRY_MS = 30_000;
-/**
- * Period of the join-approval retry tick. The retry queue (see
- * `packages/agent/src/join-approval-retry-queue.ts`) holds entries for
- * `join-approved` notifications that the curator wrote locally but couldn't
- * deliver over libp2p — usually because of a transient transport reset
- * (`Remote closed connection during opening`, NAT mapping flap, the
- * invitee's daemon restarting). Without retry the invitee gets stuck:
- * the local curator state is correct but the invitee never learns to
- * sync, and their own retries can't help because they don't yet hold the
- * delegation that would let private-sync auth succeed. The tick walks the
- * queue's `due()` entries with exponential backoff. Opportunistic retries
- * also fire from `connection:open` when the invitee's peer reconnects,
- * which usually wins the race; the timer is the safety net for cases
- * where reconnect events are missed (e.g. relayed reconnects that don't
- * surface a fresh `connection:open` on the curator).
- */
-const JOIN_APPROVAL_RETRY_TICK_MS = 30_000;
+// rc.9 PR-10: JOIN_APPROVAL_RETRY_TICK_MS removed. Retry cadence is
+// now owned by the substrate's outbox tick (driven by the same 30s
+// MESSAGE_OUTBOX_TICK_MS interval below — see Messenger.processOutbox
+// Tick + Messenger.processOutboxOnConnect). The join-approval queue
+// is gone; the substrate's SQLite-backed ProtocolOutbox carries the
+// same backoff-ladder semantics across daemon restarts.
 
 /**
  * Tick interval for the chat outbox retry queue. Same 30s cadence as
@@ -1207,17 +1206,14 @@ export class DKGAgent {
   private messageHandler: MessageHandler | null = null;
   private chainPoller: ChainEventPoller | null = null;
   private swmCleanupTimer: ReturnType<typeof setInterval> | null = null;
-  /**
-   * Retry queue for `join-approved` notifications whose libp2p delivery
-   * failed. See `JOIN_APPROVAL_RETRY_TICK_MS` for the design rationale
-   * and `join-approval-retry-queue.ts` for the queue semantics. The
-   * queue is in-memory; daemon restarts drop pending entries. Operators
-   * can re-trigger manually via `POST /api/context-graph/{id}/redeliver-approval`
-   * and the invitee's own re-submission of the join request is also
-   * handled idempotently by `approveJoinRequest`.
-   */
-  private readonly joinApprovalRetryQueue: JoinApprovalRetryQueue = new JoinApprovalRetryQueue();
-  private joinApprovalRetryTimer: ReturnType<typeof setInterval> | null = null;
+  // rc.9 PR-10: joinApprovalRetryQueue + joinApprovalRetryTimer
+  // deleted. The substrate's SQLite-backed ProtocolOutbox + its tick
+  // (`Messenger.processOutboxTick`) + opportunistic on-connect flush
+  // (`Messenger.processOutboxOnConnect`) replace the entire in-memory
+  // queue: persistence across restart, generic per-protocol coverage,
+  // identical backoff-ladder semantics. Operator-facing diagnostics
+  // (`listPendingJoinApprovalRetries`) are stubbed to [] until PR-12
+  // adds a per-protocol substrate-outbox view.
   /**
    * Periodic tick driving `Messenger.processOutboxTick` for the
    * Universal Messenger substrate outbox (rc.9 PR-3+). The
@@ -2131,7 +2127,12 @@ export class DKGAgent {
 
     // Join-request protocol: receives signed join requests forwarded by peers.
     // Stores them locally if this node is the curator; ACKs with "ok" or "error".
-    this.router.register(PROTOCOL_JOIN_REQUEST, async (data, peerId) => {
+    // rc.9 PR-10: migrated onto the Universal Messenger substrate
+    // (wire prefix bumped to /dkg/10.0.1/join-request). messenger.register
+    // wraps the handler with envelope-decode + receiver-side dedup;
+    // the application logic below is unchanged.
+    this.messenger.register(PROTOCOL_JOIN_REQUEST, async (data, peerIdStr) => {
+      const peerId = { toString: () => peerIdStr, toBytes: () => new Uint8Array() };
       try {
         const payload = JSON.parse(new TextDecoder().decode(data));
 
@@ -2431,17 +2432,11 @@ export class DKGAgent {
     this.node.libp2p.addEventListener('connection:open', (evt) => {
       const remotePeer = evt.detail.remotePeer.toString();
       if (remotePeer === this.node.libp2p.peerId.toString()) return;
-      // Opportunistically flush any pending join-approval retries that
-      // were waiting for this peer to come back. Fires BEFORE the
-      // catch-up cooldown returns so a flaky-relay reconnect that
-      // happens twice in quick succession still gets two retry passes,
-      // which matches the catch-up handler's own per-connection
-      // semantics. Failures inside are swallowed and logged by the
-      // helper — the connection:open listener must not throw.
-      this.processJoinApprovalRetryQueueOnConnect(remotePeer).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.log.warn(ctx, `Opportunistic join-approval retry on connect failed for ${remotePeer}: ${message}`);
-      });
+      // rc.9 PR-10: the dedicated join-approval on-connect flush is
+      // gone. The substrate's `Messenger.processOutboxOnConnect` (a
+      // few lines further down in this handler) now covers join-
+      // approved retries too, since /dkg/10.0.1/join-request is now
+      // a substrate-managed protocol.
 
       // Reverse-path peerStore enrichment for inbound circuit-relay
       // connections, then the symmetric chat-outbox flush.
@@ -2602,17 +2597,11 @@ export class DKGAgent {
     }, SYNC_RECONCILER_INTERVAL_MS);
     if (this.syncReconcilerTimer.unref) this.syncReconcilerTimer.unref();
 
-    // Periodic tick for the join-approval retry queue. See
-    // JOIN_APPROVAL_RETRY_TICK_MS for the rationale (transient transport
-    // resets used to silently lose approvals; this is the safety-net
-    // retry loop that turns them into eventual successes).
-    this.joinApprovalRetryTimer = setInterval(() => {
-      this.processJoinApprovalRetryQueueTick().catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.log.warn(ctx, `Join-approval retry tick failed: ${message}`);
-      });
-    }, JOIN_APPROVAL_RETRY_TICK_MS);
-    if (this.joinApprovalRetryTimer.unref) this.joinApprovalRetryTimer.unref();
+    // rc.9 PR-10: dedicated join-approval retry tick removed. The
+    // substrate's Messenger.processOutboxTick (set up immediately
+    // below) now drives retries for /dkg/10.0.1/join-request the
+    // same way it does for chat — same cadence, same backoff ladder,
+    // persisted across daemon restart.
 
     // Periodic tick for the chat outbox retry queue. See
     // MESSAGE_OUTBOX_TICK_MS for the rationale (silent-drop on
@@ -9917,31 +9906,20 @@ export class DKGAgent {
       'join-approval',
     );
     if (result.delivered) {
-      // Successful delivery clears any pending retry from a prior failure
-      // (covers the "transport hiccup recovered on its own before the
-      // periodic tick fired" case).
-      this.joinApprovalRetryQueue.markDelivered(contextGraphId, agentAddress);
       return;
     }
-    // The transport-level failure path (`no target peer` is also covered:
-    // the peer may show up in discovery later or the invitee may
-    // re-submit the join request, both of which we want to retry into).
-    const entry = this.joinApprovalRetryQueue.enqueueFailure(
-      contextGraphId,
-      agentAddress,
-      result.error ?? 'unknown',
-      Date.now(),
-    );
+    // rc.9 PR-10: the substrate outbox already holds the queued send
+    // (deliverPrivateJoinNotification → messenger.sendReliable enqueues
+    // on failure). All we do here is log the transport failure for
+    // operator visibility — the substrate's periodic tick + on-connect
+    // flush will drive the retry to eventual delivery without our help.
     const ctx = createOperationContext('system');
     this.log.warn(
       ctx,
-      `Queued join-approval retry #${entry.attempts} for "${contextGraphId}" → ${agentAddress} ` +
-        `(next attempt at ${new Date(entry.nextAttemptAt).toISOString()}, ` +
-        `firstFailureAt=${new Date(entry.firstFailureAt).toISOString()}, ` +
-        `lastError=${entry.lastError}). ` +
-        `Curator-local state is correct; retry will fire on the periodic tick ` +
-        `(every ${JOIN_APPROVAL_RETRY_TICK_MS / 1000}s) or opportunistically on the next ` +
-        `direct re-connect from the invitee's peer.`,
+      `join-approval for "${contextGraphId}" → ${agentAddress} not delivered now ` +
+        `(error=${result.error ?? 'unknown'}). Curator-local state is correct; ` +
+        `substrate outbox holds the queued send and will retry on its backoff ` +
+        `ladder + on the invitee's next reconnect.`,
     );
   }
 
@@ -9951,9 +9929,8 @@ export class DKGAgent {
    * delivery state matters.
    *
    * Used by:
-   *   * The periodic retry tick (`processJoinApprovalRetryQueueTick`),
-   *   * Opportunistic retry from `connection:open` when the invitee's peer
-   *     reconnects (`processJoinApprovalRetryQueueOnConnect`),
+   *   * The substrate's periodic outbox tick + on-connect flush —
+   *     both transparent to this call (rc.9 PR-10).
    *   * The operator-facing route `POST /api/context-graph/{id}/redeliver-approval`,
    *     which lets an operator (or peer agent via the chat MCP) re-poke
    *     the curator when the automated retry isn't fast enough.
@@ -9999,29 +9976,25 @@ export class DKGAgent {
       payload,
       'join-approval',
     );
+    // rc.9 PR-10: attempts counter is no longer tracked at the agent
+    // layer (substrate outbox owns retry bookkeeping per messageId).
+    // Operators interested in retry depth can read it from the
+    // substrate diagnostic surface that PR-12 adds. Until then we
+    // surface a flat attempts=1 for delivered / 0 for queued so the
+    // operator UI keeps rendering without code changes; the
+    // delivered/error pair is the source of truth.
     if (result.delivered) {
-      this.joinApprovalRetryQueue.markDelivered(contextGraphId, agentAddress);
-      const existing = this.joinApprovalRetryQueue.getEntry(contextGraphId, agentAddress);
       return {
         delivered: true,
         peerId: result.peerId,
-        // The successful attempt counts on top of any prior failures —
-        // `existing` is now undefined (we just removed it), so the caller
-        // sees attempts=N where N includes this final successful send.
-        attempts: (existing?.attempts ?? 0) + 1,
+        attempts: 1,
         error: null,
       };
     }
-    const entry = this.joinApprovalRetryQueue.enqueueFailure(
-      contextGraphId,
-      agentAddress,
-      result.error ?? 'unknown',
-      Date.now(),
-    );
     return {
       delivered: false,
       peerId: result.peerId,
-      attempts: entry.attempts,
+      attempts: 0,
       error: result.error,
     };
   }
@@ -10061,11 +10034,16 @@ export class DKGAgent {
   /**
    * Snapshot of pending approval retries. Surfaced via the daemon for
    * operator-facing diagnostics ("how many approvals are stuck on
-   * transport, and how long since the first failure?"). Returns a shallow
-   * copy so callers can't mutate queue internals.
+   * transport, and how long since the first failure?").
+   *
+   * rc.9 PR-10: stubbed to return [] until PR-12 rebuilds the
+   * operator diagnostic surface on top of the substrate outbox.
+   * The substrate is now driving retries durably and transparently;
+   * operators who need raw state can inspect the
+   * `protocol_outbox` SQLite table directly in the interim.
    */
   listPendingJoinApprovalRetries(): JoinApprovalRetryEntry[] {
-    return this.joinApprovalRetryQueue.list();
+    return [];
   }
 
   /**
@@ -10078,87 +10056,14 @@ export class DKGAgent {
    * entry is dropped to prevent the tick from spinning on a permanently
    * unrecoverable target.
    */
-  private async processJoinApprovalRetryQueueTick(): Promise<void> {
-    const ctx = createOperationContext('system');
-    const now = Date.now();
-    const expired = this.joinApprovalRetryQueue.dropExpired(now);
-    for (const entry of expired) {
-      this.log.warn(
-        ctx,
-        `Giving up on join-approval retry for "${entry.contextGraphId}" → ${entry.agentAddress} ` +
-          `after ${entry.attempts} attempt(s) over ${Math.round((now - entry.firstFailureAt) / 1000)}s; ` +
-          `lastError=${entry.lastError}. Operator can re-trigger via ` +
-          `POST /api/context-graph/{id}/redeliver-approval or have the joiner re-submit.`,
-      );
-    }
-    const due = this.joinApprovalRetryQueue.due(now);
-    if (due.length === 0) return;
-    this.log.info(
-      ctx,
-      `Processing ${due.length} due join-approval retry/retries`,
-    );
-    for (const entry of due) {
-      try {
-        await this.redeliverJoinApproval(entry.contextGraphId, entry.agentAddress);
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        // The most common cause is "approval row no longer exists" —
-        // e.g. operator manually rejected after queueing, or the CG was
-        // deleted. Drop the entry rather than spinning on it forever.
-        this.log.warn(
-          ctx,
-          `Dropping retry for "${entry.contextGraphId}" → ${entry.agentAddress}: ${errMsg}`,
-        );
-        this.joinApprovalRetryQueue.markDelivered(entry.contextGraphId, entry.agentAddress);
-      }
-    }
-  }
-
-  /**
-   * Opportunistic retry from a `connection:open` event. When the
-   * invitee's peer reconnects, the periodic tick may be up to
-   * `JOIN_APPROVAL_RETRY_TICK_MS` away — much longer than necessary now
-   * that the transport is back. Fire any matching retries immediately.
-   *
-   * Matching is done by re-resolving each entry's target peer via the
-   * agent registry / remembered peer map, which is the same logic
-   * `deliverPrivateJoinNotification` uses. Per-tick cost scales with
-   * queue size, which is bounded in practice (typically < 20 entries)
-   * so the linear scan is acceptable.
-   */
-  private async processJoinApprovalRetryQueueOnConnect(remotePeerId: string): Promise<void> {
-    if (this.joinApprovalRetryQueue.size() === 0) return;
-    const ctx = createOperationContext('system');
-    const candidates = this.joinApprovalRetryQueue.list();
-    for (const entry of candidates) {
-      // Cheap pre-filter: skip entries whose remembered origin peer is
-      // known and does NOT match the connecting peer. Falls through to
-      // a full redeliver attempt (which re-resolves via the registry)
-      // for entries with no remembered peer, so a NAT-flipped peer ID
-      // still benefits.
-      const originKey = `${entry.contextGraphId}::${entry.agentAddress.toLowerCase()}`;
-      const remembered = this.joinRequestOriginPeers.get(originKey);
-      if (remembered && remembered !== remotePeerId) continue;
-      try {
-        const result = await this.redeliverJoinApproval(entry.contextGraphId, entry.agentAddress);
-        if (result.delivered) {
-          this.log.info(
-            ctx,
-            `Opportunistic redelivery succeeded for "${entry.contextGraphId}" → ${entry.agentAddress} ` +
-              `on reconnect from ${remotePeerId} (attempts=${result.attempts})`,
-          );
-        }
-      } catch (err) {
-        // Same drop-on-permanent-failure semantics as the periodic tick.
-        const errMsg = err instanceof Error ? err.message : String(err);
-        this.log.warn(
-          ctx,
-          `Dropping retry for "${entry.contextGraphId}" → ${entry.agentAddress} on reconnect: ${errMsg}`,
-        );
-        this.joinApprovalRetryQueue.markDelivered(entry.contextGraphId, entry.agentAddress);
-      }
-    }
-  }
+  // rc.9 PR-10: processJoinApprovalRetryQueueTick +
+  // processJoinApprovalRetryQueueOnConnect deleted. The substrate's
+  // Messenger.processOutboxTick + Messenger.processOutboxOnConnect
+  // cover /dkg/10.0.1/join-request automatically (same as chat in
+  // PR-3), so the two dedicated processors are obsolete. Operator
+  // re-fire route POST /api/context-graph/{id}/redeliver-approval is
+  // unchanged — it still calls redeliverJoinApproval which now
+  // simply re-issues the substrate send.
 
   /**
    * Re-attempt delivery of a single chat outbox entry. Centralised so
@@ -10410,7 +10315,27 @@ export class DKGAgent {
     }
 
     try {
-      await this.messenger.sendToPeer(targetPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: JOIN_REQUEST_SEND_TIMEOUT_MS });
+      // rc.9 PR-10: send via the Universal Messenger substrate. If
+      // the substrate can't deliver synchronously it enqueues into
+      // the SQLite outbox and retries in the background — this
+      // replaces the deleted in-memory JoinApprovalRetryQueue. Note
+      // queued counts as "not delivered now" so the caller can log
+      // the failure; the substrate keeps trying behind the scenes.
+      const sendResult = await this.messenger.sendReliable(
+        targetPeerId,
+        PROTOCOL_JOIN_REQUEST,
+        payloadBytes,
+        { timeoutMs: JOIN_REQUEST_SEND_TIMEOUT_MS },
+      );
+      if (!sendResult.delivered) {
+        this.log.warn(
+          ctx,
+          `${label} for "${contextGraphId}" to ${agentAddress} (${targetPeerId}) ` +
+          `queued in substrate outbox: ${sendResult.error}. ` +
+          `Substrate will retry on its own backoff ladder + on the invitee's next reconnect.`,
+        );
+        return { delivered: false, peerId: targetPeerId, error: sendResult.error };
+      }
       this.log.info(ctx, `Delivered ${label} for "${contextGraphId}" to ${agentAddress} (${targetPeerId})`);
       // The join request is finalised now — forget the origin peer so
       // the map doesn't grow unbounded over the curator's lifetime.
@@ -10501,7 +10426,19 @@ export class DKGAgent {
     let curatorTargetedSuccess = false;
     if (curatorPeerId !== this.peerId) {
       try {
-        const responseBytes = await this.messenger.sendToPeer(curatorPeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: JOIN_REQUEST_SEND_TIMEOUT_MS });
+        // rc.9 PR-10: substrate send. queued surfaces as a throw
+        // (matches the legacy sendToPeer ergonomics so the existing
+        // catch path with broadcast fallback still kicks in).
+        const sendResult = await this.messenger.sendReliable(
+          curatorPeerId,
+          PROTOCOL_JOIN_REQUEST,
+          payloadBytes,
+          { timeoutMs: JOIN_REQUEST_SEND_TIMEOUT_MS },
+        );
+        if (!sendResult.delivered) {
+          throw new Error(`substrate queued (transport): ${sendResult.error}`);
+        }
+        const responseBytes = sendResult.response;
         const response = JSON.parse(new TextDecoder().decode(responseBytes));
         if (response.ok) {
           // Only the explicit invite-supplied curator is recorded as a
@@ -10565,8 +10502,19 @@ export class DKGAgent {
       .filter((id) => id !== this.peerId && (!curatorTargetedSuccess || id !== curatorPeerId));
     const results = await Promise.allSettled(
       broadcastTargets.map(async (remotePeerId) => {
-        const responseBytes = await this.messenger.sendToPeer(remotePeerId, PROTOCOL_JOIN_REQUEST, payloadBytes, { timeoutMs: JOIN_REQUEST_SEND_TIMEOUT_MS });
-        const response = JSON.parse(new TextDecoder().decode(responseBytes));
+        // rc.9 PR-10: substrate send. Broadcast queued = treat as
+        // failure for this peer (the cohort is parallel — losing one
+        // peer is fine, the others may succeed).
+        const sendResult = await this.messenger.sendReliable(
+          remotePeerId,
+          PROTOCOL_JOIN_REQUEST,
+          payloadBytes,
+          { timeoutMs: JOIN_REQUEST_SEND_TIMEOUT_MS },
+        );
+        if (!sendResult.delivered) {
+          throw new Error(`substrate queued (transport): ${sendResult.error}`);
+        }
+        const response = JSON.parse(new TextDecoder().decode(sendResult.response));
         return { remotePeerId, response };
       }),
     );
@@ -13935,18 +13883,13 @@ export class DKGAgent {
       clearInterval(this.syncReconcilerTimer);
       this.syncReconcilerTimer = null;
     }
-    if (this.joinApprovalRetryTimer) {
-      clearInterval(this.joinApprovalRetryTimer);
-      this.joinApprovalRetryTimer = null;
-    }
     if (this.messengerOutboxTimer) {
       clearInterval(this.messengerOutboxTimer);
       this.messengerOutboxTimer = null;
     }
-    // Drop in-memory retry queue on shutdown; entries don't survive a
-    // restart (the operator can re-fire via the redeliver-approval route
-    // when needed).
-    this.joinApprovalRetryQueue.clear();
+    // rc.9 PR-10: joinApprovalRetryTimer + joinApprovalRetryQueue
+    // deleted; substrate outbox owns retry state and drains itself
+    // via the messengerOutboxTimer cleared just above.
     this.clearRandomSamplingBindRetry();
     this.clearStorageACKRegistrationRetry();
     this.storageACKRegistrationRetryInFlight = false;

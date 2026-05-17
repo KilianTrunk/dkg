@@ -223,6 +223,31 @@ export class MessageOutbox {
   }
 
   /**
+   * Return `true` if an entry for this `(recipient, messageId)` pair
+   * is still in the queue (i.e. not yet delivered or expired). Used
+   * by `DKGAgent.retryOutboxEntry` to defend against the
+   * stale-snapshot race: `processMessageOutboxOnConnect` takes a
+   * snapshot of `pendingFor(peer)` and iterates it; during the iteration
+   * another concurrent `processMessageOutboxOnConnect` call (triggered
+   * by a sibling `connection:open` event in a reconnect storm) may
+   * have already completed delivery for some entry E and called
+   * `markDelivered(E)`. Without re-checking presence between
+   * `tryBeginAttempt` and `sendChat`, the stale-snapshot caller fires
+   * a duplicate wire send for E.
+   *
+   * Discovered in the 2026-05 rc9 soak: 29 outbox queues produced 63
+   * `Outbox redelivery succeeded` events (2.17x amplification),
+   * because `enqueueFailure` on the duplicate-send failure path
+   * resurrects the deleted entry with `attempts=1`, triggering the
+   * full retry storm again. `tryBeginAttempt` alone is insufficient
+   * — it only blocks TRULY-PARALLEL races, not
+   * stale-snapshot-after-completion.
+   */
+  hasEntry(recipientPeerId: string, messageId: string): boolean {
+    return this.queue.getEntry(chatOutboxKey(recipientPeerId, messageId)) !== undefined;
+  }
+
+  /**
    * Return all entries whose `nextAttemptAt` is at or before `now`.
    * Used by the periodic tick to find what to retry. Result is in
    * insertion order; callers that need per-recipient ordering should

@@ -645,4 +645,258 @@ describe('ProtocolRouter', () => {
       expect(dialCalls).toBe(0);
     });
   });
+
+  // Codex review of PR #538: the fast path previously latched a
+  // half-dead connection for the whole 3-attempt retry budget. If
+  // `newStream()` opened a stream on a stale connection and the
+  // subsequent `send`/`readAll` blew up with a recoverable error,
+  // the retry loop would just pick the same dead connection on the
+  // next attempt (libp2p doesn't always prune a torn-down connection
+  // before our 500 ms backoff fires). The fix is a per-`send()`
+  // exclude-set: once a connection produces a failure, it's
+  // blacklisted for the remaining attempts and the loop either
+  // picks a different live candidate or falls through to
+  // `dialProtocol`.
+  describe('fast path connection-blacklist on stream failure (PR #538 Codex feedback)', () => {
+    const FAKE_PEER_ID = '12D3KooWBzj7Hg2cKCdsKL6QcjC5UbLztKTvzCZQHaT4P4ZyJEAA';
+
+    // Stream that succeeds on send/close but throws a recoverable
+    // error during readAll — the stale-half-dead-connection shape
+    // the reviewer flagged.
+    function makeDeadReadStream() {
+      return {
+        writeStatus: 'open' as const,
+        send: () => undefined,
+        close: async () => undefined,
+        abort: () => undefined,
+        async *[Symbol.asyncIterator]() {
+          throw new Error('stream returned in closed state');
+        },
+      };
+    }
+
+    function makeWorkingStream(response: Uint8Array) {
+      let returned = false;
+      return {
+        writeStatus: 'open' as const,
+        send: () => undefined,
+        close: async () => undefined,
+        abort: () => undefined,
+        async *[Symbol.asyncIterator]() {
+          if (!returned) {
+            returned = true;
+            yield response;
+          }
+        },
+      };
+    }
+
+    function makeConn(opts: {
+      onNewStream: () => Promise<unknown>;
+      label: string;
+    }) {
+      return {
+        status: 'open' as const,
+        label: opts.label,
+        remotePeer: {
+          equals: (other: unknown) => String(other) === FAKE_PEER_ID,
+          toString: () => FAKE_PEER_ID,
+        },
+        newStream: opts.onNewStream,
+      };
+    }
+
+    it('skips a connection that failed on a prior attempt and picks the next live one', async () => {
+      // Two live connections to the same peer. The first one's
+      // newStream returns a stream that blows up on readAll
+      // (recoverable). The second is healthy. Without the
+      // blacklist, the retry loop would re-pick the first
+      // connection — libp2p's `getConnections()` returns the same
+      // list across the 500ms backoff. With the blacklist, attempt
+      // 2 picks the second connection and the send succeeds.
+      let connADials = 0;
+      let connBDials = 0;
+      let dialProtocolCalls = 0;
+      const connA = makeConn({
+        label: 'A-stale',
+        onNewStream: async () => {
+          connADials += 1;
+          return makeDeadReadStream() as any;
+        },
+      });
+      const connB = makeConn({
+        label: 'B-healthy',
+        onNewStream: async () => {
+          connBDials += 1;
+          return makeWorkingStream(new Uint8Array([0x42])) as any;
+        },
+      });
+      const node = {
+        libp2p: {
+          getConnections: () => [connA, connB],
+          dialProtocol: async () => {
+            dialProtocolCalls += 1;
+            throw new Error('dialProtocol should not be reached — second connection is healthy');
+          },
+          handle: () => undefined,
+          unhandle: () => undefined,
+          peerStore: { get: async () => { throw new Error('NotFound'); } },
+        },
+      } as unknown as DKGNode;
+      const peerResolver = { resolve: async () => [] } as unknown as PeerResolver;
+      const router = new ProtocolRouter(node, { peerResolver });
+
+      const out = await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]));
+      expect(out).toEqual(new Uint8Array([0x42]));
+      expect(connADials).toBe(1);
+      expect(connBDials).toBe(1);
+      expect(dialProtocolCalls).toBe(0);
+    });
+
+    it('falls through to dialProtocol after the only candidate connection is blacklisted', async () => {
+      // Single bad connection. After attempt 1 blacklists it, the
+      // fast path has no remaining candidates → returns null →
+      // dialProtocol runs on attempts 2 (and 3 if needed). This is
+      // the exact recovery the reviewer was looking for: an
+      // unconditional fallback would risk re-triggering the
+      // upgrade race the fast path was built to avoid, but
+      // blacklisting + relying on the existing `null →
+      // dialProtocol` fallback inside the same retry loop is safe.
+      let newStreamCalls = 0;
+      let dialProtocolCalls = 0;
+      const badConn = makeConn({
+        label: 'only-bad',
+        onNewStream: async () => {
+          newStreamCalls += 1;
+          return makeDeadReadStream() as any;
+        },
+      });
+      const node = {
+        libp2p: {
+          getConnections: () => [badConn],
+          dialProtocol: async () => {
+            dialProtocolCalls += 1;
+            return makeWorkingStream(new Uint8Array([0x77])) as any;
+          },
+          handle: () => undefined,
+          unhandle: () => undefined,
+          peerStore: { get: async () => { throw new Error('NotFound'); } },
+        },
+      } as unknown as DKGNode;
+      const peerResolver = { resolve: async () => [] } as unknown as PeerResolver;
+      const router = new ProtocolRouter(node, { peerResolver });
+
+      const out = await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]));
+      expect(out).toEqual(new Uint8Array([0x77]));
+      // Bad connection was tried exactly once before being
+      // blacklisted — the retry budget is spent on dialProtocol,
+      // not on hammering the same dead connection.
+      expect(newStreamCalls).toBe(1);
+      expect(dialProtocolCalls).toBe(1);
+    });
+
+    it('does not blacklist a connection used by a successful send (no false-positive eviction)', async () => {
+      // Sanity test: the blacklist only kicks in on failure. A
+      // successful send must not poison the connection for future
+      // sends. Because `triedConnections` is per-`send()` it's
+      // technically impossible for a successful send to leak its
+      // entries — but if a future refactor moved the WeakSet up
+      // to the router instance, this test would catch it.
+      let aDials = 0;
+      const goodConn = makeConn({
+        label: 'good',
+        onNewStream: async () => {
+          aDials += 1;
+          return makeWorkingStream(new Uint8Array([0x55])) as any;
+        },
+      });
+      const node = {
+        libp2p: {
+          getConnections: () => [goodConn],
+          dialProtocol: async () => { throw new Error('unused'); },
+          handle: () => undefined,
+          unhandle: () => undefined,
+          peerStore: { get: async () => { throw new Error('NotFound'); } },
+        },
+      } as unknown as DKGNode;
+      const peerResolver = { resolve: async () => [] } as unknown as PeerResolver;
+      const router = new ProtocolRouter(node, { peerResolver });
+
+      await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]));
+      await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([2]));
+      await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([3]));
+
+      // 3 successful sends → 3 newStream calls on the same conn.
+      // If a refactor accidentally promoted the blacklist to the
+      // router scope, sends 2+ would skip this conn and fall
+      // through to dialProtocol (which throws here).
+      expect(aDials).toBe(3);
+    });
+  });
+
+  // Direct unit tests on `tryReuseExistingConnection`'s
+  // `excludeConnections` wiring — independent of `ProtocolRouter.send`
+  // so a future refactor that changes how `send()` plumbs the
+  // blacklist still exercises the candidate-skip logic itself.
+  describe('tryReuseExistingConnection: excludeConnections wiring', () => {
+    it('skips connections present in the exclude WeakSet', async () => {
+      const { tryReuseExistingConnection } = await import('../src/protocol-router.js');
+      const callOrder: string[] = [];
+      const conns = [
+        { status: 'open', label: 'A', newStream: async () => { callOrder.push('A'); throw new Error('boom'); } },
+        { status: 'open', label: 'B', newStream: async () => {
+          callOrder.push('B');
+          return { writeStatus: 'open' } as any;
+        } },
+      ] as any[];
+      const exclude = new WeakSet<object>();
+      exclude.add(conns[0]);
+
+      const result = await tryReuseExistingConnection(
+        () => conns,
+        '/test/1.0.0',
+        AbortSignal.timeout(1000),
+        { peerHasDirectAddrs: async () => false, excludeConnections: exclude },
+      );
+
+      expect(callOrder).toEqual(['B']);
+      expect(result?.connection).toBe(conns[1]);
+    });
+
+    it('returns the connection alongside the stream so callers can blacklist on failure', async () => {
+      const { tryReuseExistingConnection } = await import('../src/protocol-router.js');
+      const targetConn = {
+        status: 'open',
+        newStream: async () => ({ writeStatus: 'open' } as any),
+      };
+      const result = await tryReuseExistingConnection(
+        () => [targetConn] as any[],
+        '/test/1.0.0',
+        AbortSignal.timeout(1000),
+        { peerHasDirectAddrs: async () => false },
+      );
+      expect(result).not.toBeNull();
+      expect(result!.connection).toBe(targetConn);
+      expect(result!.stream.writeStatus).toBe('open');
+    });
+
+    it('returns null when every candidate is excluded', async () => {
+      const { tryReuseExistingConnection } = await import('../src/protocol-router.js');
+      const conns = [
+        { status: 'open', newStream: async () => ({ writeStatus: 'open' } as any) },
+        { status: 'open', newStream: async () => ({ writeStatus: 'open' } as any) },
+      ];
+      const exclude = new WeakSet<object>();
+      exclude.add(conns[0]);
+      exclude.add(conns[1]);
+
+      const result = await tryReuseExistingConnection(
+        () => conns as any[],
+        '/test/1.0.0',
+        AbortSignal.timeout(1000),
+        { peerHasDirectAddrs: async () => false, excludeConnections: exclude },
+      );
+      expect(result).toBeNull();
+    });
+  });
 });

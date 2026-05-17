@@ -1764,7 +1764,18 @@ export class DKGAgent {
       this.log.warn(ctx, 'Query access policy is "public" — all remote queries will be accepted. Set queryAccess.defaultPolicy to "deny" for stricter security.');
     }
     const queryRemoteHandler = new QueryHandler(this.queryEngine, queryAccessConfig);
-    this.router.register(PROTOCOL_QUERY_REMOTE, queryRemoteHandler.handler);
+    // rc.9 PR-9: PROTOCOL_QUERY_REMOTE migrated onto the Universal
+    // Messenger substrate. Wire prefix bumped to /dkg/10.0.1/* (hard
+    // cutover; rc.8 ↔ rc.9 cross-version query stops working) so
+    // receiver-side dedup + envelope unwrap happen transparently.
+    // QueryHandler's contract is unchanged.
+    this.messenger.register(PROTOCOL_QUERY_REMOTE, async (data, peerId) => {
+      const peerIdObj = {
+        toString: () => peerId,
+        toBytes: () => new Uint8Array(),
+      };
+      return queryRemoteHandler.handler(data, peerIdObj);
+    });
     // PROTOCOL_SWM_SENDER_KEY migrated onto the substrate in rc.9 PR-8.
     // messenger.register handles envelope unwrap + receiver dedup
     // before the in-process handleSwmSenderKeyPackage call.
@@ -8124,11 +8135,64 @@ export class DKGAgent {
     this.log.info(ctx, `Remote query to ${peerId.slice(-8)} type=${request.lookupType}`);
 
     const payload = new TextEncoder().encode(JSON.stringify(fullRequest));
-    const responseBytes = await this.messenger.sendToPeer(peerId, PROTOCOL_QUERY_REMOTE, payload);
+    // rc.9 PR-9: route through messenger.sendReliable so the query
+    // gains sender-side idempotency + receiver-side dedup. SPARQL is
+    // idempotent at the app layer so on RESPONSE_GONE (duplicate-
+    // receive on a too-big-to-cache response) we transparently re-
+    // issue with a fresh messageId — the substrate makes this safe.
+    // queued returns are surfaced as a transport error: queryRemote
+    // is synchronous-by-design (callers await results), not a fire-
+    // and-forget enqueue.
+    const responseBytes = await this.sendQueryReliable(peerId, payload);
     const response = JSON.parse(new TextDecoder().decode(responseBytes)) as QueryResponse;
 
     this.log.info(ctx, `Remote query response: status=${response.status} resultCount=${response.resultCount}`);
     return response;
+  }
+
+  /**
+   * Send a query-remote payload via the Messenger substrate with
+   * built-in RESPONSE_GONE retry. SPARQL queries are app-layer
+   * idempotent — if the substrate replies with the RESPONSE_GONE
+   * sentinel (the original response was too big to inline-cache and
+   * we got a duplicate-receive), we re-issue with a fresh messageId
+   * and try again. Capped at 2 attempts so a peer that always blows
+   * the 256 KiB response cache surfaces as a hard error to the
+   * caller instead of looping forever.
+   *
+   * rc.9 PR-9.
+   */
+  private async sendQueryReliable(
+    peerId: string,
+    payload: Uint8Array,
+  ): Promise<Uint8Array> {
+    const RESPONSE_GONE = 'RESPONSE_GONE';
+    const MAX_ATTEMPTS = 2;
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const sendResult = await this.messenger.sendReliable(
+        peerId,
+        PROTOCOL_QUERY_REMOTE,
+        payload,
+      );
+      if (!sendResult.delivered) {
+        throw new Error(
+          `query-remote send not synchronously deliverable (queued): ${sendResult.error}`,
+        );
+      }
+      const respText = new TextDecoder().decode(sendResult.response);
+      if (respText === RESPONSE_GONE) {
+        // Original response was mark-only; re-issue with a fresh
+        // messageId next loop iteration (sendReliable mints one
+        // when opts.messageId is absent).
+        lastErr = new Error('RESPONSE_GONE: original response too large to cache; retrying with fresh messageId');
+        continue;
+      }
+      return sendResult.response;
+    }
+    throw lastErr instanceof Error
+      ? lastErr
+      : new Error('query-remote exhausted RESPONSE_GONE retries');
   }
 
   /**

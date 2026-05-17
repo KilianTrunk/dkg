@@ -407,7 +407,7 @@ in [`messenger-add-protocol.md`](./messenger-add-protocol.md).
 | `/dkg/10.0.1/skill_request`    | PR-3        | 1             | Migrated alongside chat (shares `agent.sendMessage` path).                                             |
 | `/dkg/10.0.1/swm-sender-key`   | PR-8        | 1             | Synchronous: SWM-key send treats `queued` as a hard failure (epoch setup blocks).                      |
 | `/dkg/10.0.1/private-access`   | PR-8        | 1             | Synchronous: `AccessClient.requestAccess` surfaces `queued` as a rejected request via `AccessSendSurface`. |
-| `/dkg/10.0.1/query-remote`     | PR-9        | 1             | Sole caller of `RESPONSE_GONE` retry path; `sendQueryReliable` re-issues with fresh messageId (cap 2). |
+| `/dkg/10.0.1/query-remote`     | PR-9        | 1             | Synchronous; `sendQueryReliable()` retries up to 2× on `RESPONSE_GONE` with a fresh `messageId` (SPARQL is app-layer idempotent). |
 | `/dkg/10.0.1/join-request`     | PR-10       | 1             | Removes `JoinApprovalRetryQueue` in favour of generic outbox — substrate now owns persistence.         |
 | `/dkg/10.0.1/storage-ack`      | PR-11       | 1             | ACKCollector quorum unchanged; only transport swaps. parallelPaths=1 prevents 9x fan-out.              |
 | `/dkg/10.0.1/verify-proposal`  | PR-11       | 1             | Same shape as storage-ack. `/dkg/10.0.0/verify-approval` stays bare (not a substrate caller).          |

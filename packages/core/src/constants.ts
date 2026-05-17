@@ -23,7 +23,15 @@ export const PROTOCOL_MESSAGE = '/dkg/10.0.1/message';
 // publisher AccessClient — currently exercised only by integration
 // tests) routes through messenger.sendReliable.
 export const PROTOCOL_ACCESS = '/dkg/10.0.1/private-access';
-export const PROTOCOL_QUERY_REMOTE = '/dkg/10.0.0/query-remote';
+// rc.9 PR-9: bumped from /dkg/10.0.0/query-remote to opt into the
+// Universal Messenger substrate. Query responses can be large
+// (SPARQL result sets), so a duplicate receive (multi-path race or
+// idempotency-retry) that hits the 256 KiB mark-only response cache
+// returns RESPONSE_GONE. queryRemote() handles RESPONSE_GONE by
+// re-issuing the query with a fresh messageId — SPARQL is idempotent
+// at the app layer so this is semantically safe (see
+// docs/messenger.md "Response caching policy").
+export const PROTOCOL_QUERY_REMOTE = '/dkg/10.0.1/query-remote';
 // rc.9 PR-8: bumped from /dkg/10.0.0/swm-sender-key to opt into the
 // Universal Messenger substrate (same rationale as PROTOCOL_ACCESS).
 // SWM sender-key send sites in dkg-agent.ts route through

@@ -1,12 +1,12 @@
 # Universal Messenger
 
-> Status: shipping in `v10.0.0-rc.9`. Skeleton landed in PR-1 (rc.9 plan). Subsequent PRs flesh out per-protocol coverage; PR-13 is the final coherence pass.
+> Status: shipping in `v10.0.0-rc.9`. All 8 short-message protocols now route through the substrate; per-message delivery + latency observable via `/api/slo`.
 
 The Universal Messenger is the reliability substrate every short
 peer-to-peer DKG protocol travels through. It generalises the chat-
 specific outbox + receiver-dedup work from rc.8 (PRs #533, #534, #536,
 #537, #538) into a single layer that wraps `ProtocolRouter.send` and
-gives every caller — chat, skill request, query, swm-sender-key,
+gives every caller — chat, skill request, query-remote, swm-sender-key,
 private-access, join-request, storage-ack, verify-proposal — the same
 delivery guarantees:
 
@@ -82,9 +82,248 @@ The substrate is composed of:
    by `(peer, protocol, messageId)`. Backoff ladder: 5s → 15s → 30s →
    60s → 5m → 30m → 2h, capped 24h.
 
-4. **`Messenger`** class (`packages/agent/src/messenger.ts`) — wires
-   the above together around `ProtocolRouter`. Provides `sendToPeer`
-   + `register` as the only public surface every protocol needs. _PR-2._
+4. **`Messenger`** class (`packages/agent/src/p2p/messenger.ts`) — wires
+   the above together around `ProtocolRouter`. Provides `sendReliable`
+   + `register` as the only public surface every protocol needs.
+   Legacy `sendToPeer` is retained as a bare pass-through for any
+   `/dkg/10.0.0/*` caller that hasn't migrated yet (none remain at
+   rc.9 ship; the surface exists for future incremental migrations).
+
+## Topology + sequence flows
+
+The relay is a transparent libp2p hop — it sees Noise/TLS-encrypted
+frames at the connection layer; the `ReliableEnvelope` + payload is
+opaque to it, so the relay can't dedup, can't retry, and can't read
+message content. Both daemons run the identical Messenger stack.
+Whichever side initiates a send is labelled "sender" in the diagrams;
+the same code paths exist on both nodes.
+
+### Flow 0 — Topology
+
+```mermaid
+flowchart LR
+  subgraph SenderNode [Sender daemon]
+    SApp[App caller]
+    SMS[Messenger]
+    SIdem[(IdempotencyStore<br/>SQLite)]
+    SOut[(OutboxStore<br/>SQLite)]
+    SRouter[ProtocolRouter]
+    SLib[libp2p stack]
+  end
+  subgraph RelaySet [Testnet relay set — core nodes]
+    R1[Relay R1]
+    R2[Relay R2]
+    R3[Relay R3]
+    R4[Relay R4]
+  end
+  subgraph ReceiverNode [Receiver daemon — IDENTICAL stack]
+    RLib[libp2p stack]
+    RRouter[ProtocolRouter]
+    RMS[Messenger]
+    RIdem[(IdempotencyStore<br/>SQLite)]
+    ROut[(OutboxStore<br/>SQLite)]
+    RApp[App handler]
+  end
+
+  SApp --> SMS
+  SMS <--> SIdem
+  SMS <--> SOut
+  SMS --> SRouter --> SLib
+
+  SLib -.circuit-relay v2.-> R1
+  SLib -.circuit-relay v2.-> R2
+  SLib -.circuit-relay v2.-> R3
+  SLib -.circuit-relay v2.-> R4
+
+  R1 -.forward.-> RLib
+  R2 -.forward.-> RLib
+  R3 -.forward.-> RLib
+  R4 -.forward.-> RLib
+
+  RLib --> RRouter --> RMS
+  RMS <--> RIdem
+  RMS <--> ROut
+  RMS --> RApp
+```
+
+Key topology facts:
+
+- Every agent daemon reserves on **2-4 relays simultaneously**
+  (multi-reservation, rc.8 PR #526). The relay set today is the
+  testnet core nodes; operators stand up their own via PR-7's
+  `--relay-preferred` (see [`messenger-operator.md`](./messenger-operator.md)).
+- The relay is a transparent libp2p hop: it forwards encrypted
+  frames; the `ReliableEnvelope` is opaque to it.
+- Both daemons run the identical Messenger stack — including the
+  outbox. If sender→receiver path breaks, the **sender's** outbox
+  holds the entry; the **sender's** tick + `connection:open` flushes
+  it; the **receiver's** idempotency absorbs any duplicates.
+- Failure modes live at the `SLib ↔ Relay ↔ RLib` boundary
+  (reservation expired, receiver disconnected from a given relay,
+  relay restarted, direct connection died). The substrate layer is
+  what survives those failures.
+
+### Flow 1 — Happy path
+
+Applies to all 8 protocols. The relay forwards bytes opaquely.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SApp as Sender App
+    participant SMS as Sender Messenger
+    participant SIdem as Sender Idem
+    participant SLib as Sender libp2p
+    participant Relay as Relay R (one of N reserved)
+    participant RLib as Receiver libp2p
+    participant RMS as Receiver Messenger
+    participant RIdem as Receiver Idem
+    participant RApp as Receiver App
+
+    Note over Relay: Sees Noise/TLS-encrypted frames only;<br/>ReliableEnvelope opaque to relay
+
+    SApp->>SMS: sendReliable(receiverPid, "/dkg/10.0.1/X", payload)
+    SMS->>SMS: messageId = uuid()
+    SMS->>SIdem: check(receiverPid, X, messageId, 'out')
+    SIdem-->>SMS: { seen: false }
+    SMS->>SMS: env = ReliableEnvelope.encode({messageId, v:1, tsMs, payload})
+    SMS->>SLib: ProtocolRouter.send via /p2p/relayPid/p2p-circuit/p2p/receiverPid
+    SLib->>Relay: open circuit-relay-v2 stream
+    Relay->>RLib: forward bytes (no inspection)
+    RLib->>RMS: deliver to Messenger.register wrapper for X
+    RMS->>RMS: env = ReliableEnvelope.decode(bytes)
+    RMS->>RIdem: check(senderPid, X, env.messageId, 'in')
+    alt duplicate receive (e.g. multi-path race)
+        RIdem-->>RMS: { seen: true, cachedResponse }
+        RMS-->>RLib: respond with cached (or RESPONSE_GONE if mark-only)
+    else first receive
+        RIdem-->>RMS: { seen: false }
+        RMS->>RApp: handler(env.payload, senderPid)
+        RApp-->>RMS: responseBytes
+        RMS->>RIdem: record(senderPid, X, messageId, 'in', responseBytes if cached)
+        RMS-->>RLib: respond(responseBytes)
+    end
+    RLib->>Relay: response bytes
+    Relay->>SLib: forward
+    SLib->>SMS: response
+    SMS->>SIdem: record(receiverPid, X, messageId, 'out', response)
+    SMS-->>SApp: { delivered: true, response, messageId, attempts: 1 }
+```
+
+The receiver-side app handler never sees the envelope or the relay
+topology. It receives the original `payload` (its existing protobuf /
+JSON bytes, unchanged from rc.8) and returns its existing
+`responseBytes`. Reliability + dedup happens transparently around it
+on **both sides**.
+
+### Flow 2 — Path breaks → outbox → recovery → flush
+
+The dominant failure mode in the rc.8 8h soak. Shows two relays in
+different broken states + how the recovery primitives heal the path.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SMS as Sender Messenger
+    participant SLib as Sender libp2p
+    participant R1 as Relay R1 (stale reservation)
+    participant R2 as Relay R2 (receiver gone)
+    participant R3 as Relay R3 (receiver re-reserves here later)
+    participant RLib as Receiver libp2p
+    participant SOut as Sender Outbox
+    participant Recov as Sender recovery<br/>(DHT walk / inbound from receiver)
+
+    Note over SMS,RLib: First attempt — every cached path is broken
+
+    SMS->>SLib: send envelope to receiverPid
+    SLib->>R1: try /p2p/R1/p2p-circuit/p2p/receiverPid
+    R1-->>SLib: NO_RESERVATION
+    SLib->>R2: try /p2p/R2/p2p-circuit/p2p/receiverPid
+    R2-->>SLib: peer not reachable via this relay
+    SLib-->>SMS: error: no valid addresses for peer
+    SMS->>SOut: enqueue(receiverPid, X, messageId, env, error, now)
+    Note over SOut: durable across daemon restart<br/>(SQLite, unlike rc.8's in-memory chat outbox)
+
+    Note over Recov,RLib: Time passes — multiple recovery channels race
+
+    par DHT walk (PR-5) after attempts >= 5
+        Recov->>SLib: peerRouting.findPeer(receiverPid) — populates peerStore with R3
+    and Inbound from receiver (rc.8 #536 + #537)
+        RLib->>R3: receiver opens connection to sender via R3
+        R3->>SLib: inbound circuit connection arrives
+        Note over SLib: rc.8 PR #536 enriches peerStore with reverse path;<br/>rc.8 PR #537 fast-path reuses existing conn for outbound stream
+    end
+
+    Note over SLib,SMS: Connection event triggers opportunistic flush
+
+    SLib->>SMS: connection:open(receiverPid)
+    SMS->>SOut: pendingFor(receiverPid)
+    SOut-->>SMS: [entry]
+    SMS->>SOut: tryBeginAttempt + hasEntry (stale-snapshot guard, rc.8 PR #538)
+    SOut-->>SMS: still pending
+    SMS->>SLib: send envelope via R3 (now in peerStore) or existing inbound conn
+    SLib->>R3: open stream
+    R3->>RLib: forward
+    Note over RLib: Receiver-side idempotency dedupes if this is a re-attempt
+    RLib-->>R3: response
+    R3-->>SLib: forward back
+    SLib-->>SMS: response
+    SMS->>SOut: markDelivered(receiverPid, X, messageId)
+```
+
+This is exactly the failure recipe the rc.8 8h soak surfaced. The new
+substrate makes outbox durability the floor (no chat-specific limit);
+PR-5 adds the DHT-walk-on-stall recovery channel on top of the
+inbound-from-receiver path that rc.8 already provides.
+
+### Flow 3 — Multi-path parallel send (PR-4)
+
+Sender races N relays in parallel; whichever forwards first wins;
+receiver dedup absorbs anything from losing paths.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SMS as Sender Messenger
+    participant SLib as Sender libp2p
+    participant R1 as Relay R1
+    participant R2 as Relay R2
+    participant R3 as Relay R3
+    participant RLib as Receiver libp2p
+    participant RMS as Receiver Messenger
+    participant RIdem as Receiver Idem
+    participant RApp as Receiver App
+
+    SMS->>SLib: send(env, {parallelPaths: 2})
+    SLib->>SLib: enumerate from peerStore + getConnections() (reuses rc.8 PR #537 walk)
+    par parallel newStream on diverse relays
+        SLib->>R1: open circuit stream
+    and
+        SLib->>R2: open circuit stream
+    end
+
+    R1-xRLib: stream forward fails (relay dropped reservation between enum and dial)
+    R2->>RLib: stream forward succeeds
+    RLib->>RMS: handler wrapper (path R2)
+    RMS->>RIdem: check(senderPid, X, env.messageId, 'in')
+    RIdem-->>RMS: { seen: false }
+    RMS->>RApp: handler runs once
+    RApp-->>RMS: responseBytes
+    RMS->>RIdem: record(... 'in', responseBytes)
+
+    Note over R3,RLib: If a slower path arrived later (parallelPaths > 2):<br/>idempotency returns cached; RApp NOT called again
+
+    R2-->>SLib: response (winner)
+    SLib->>SLib: abort loser streams as redundant
+    SLib-->>SMS: response from R2
+```
+
+Critical guard in PR-4: `parallelPaths > 1` is only safe because every
+substrate-routed protocol lives on the `/dkg/10.0.1/*` prefix where
+receiver dedup is mandatory. Default `parallelPaths` per protocol is
+in the [per-protocol coverage table](#per-protocol-coverage) below.
+`/storage-ack` + `/verify-proposal` stay at **1** because they
+already fan out at the app layer — N=3 would be 9x amplification.
 
 ## Wire format
 
@@ -158,36 +397,40 @@ is idempotent at the app layer) or surface a terminal error.
 
 ## Per-protocol coverage
 
-> Filled in as protocols migrate. Empty rows are placeholders for the
-> milestone they land in.
+All 8 short-message protocols ship on the substrate in `v10.0.0-rc.9`.
+The migration recipe (for adding a hypothetical 9th protocol later) is
+in [`messenger-add-protocol.md`](./messenger-add-protocol.md).
 
-| Protocol                        | Migrated in | parallelPaths | Notes                                                                              |
-| ------------------------------- | ----------- | ------------- | ---------------------------------------------------------------------------------- |
-| `/dkg/10.0.1/message` (chat)    | PR-3        | 2 (PR-4)      | Pilot. Wire-format break replaces `chat_messages.message_id` index uniqueness.     |
-| `/dkg/10.0.1/skill_request`     | PR-3        | 1             | Migrated alongside chat (shares `agent.sendMessage` path).                         |
-| `/dkg/10.0.1/swm-sender-key`    | PR-8        | 1             | Batch with `/private-access`.                                                      |
-| `/dkg/10.0.1/private-access`    | PR-8        | 1             | Batch with `/swm-sender-key`.                                                      |
-| `/dkg/10.0.1/query-remote`      | PR-9        | 1             | First caller exercising RESPONSE_GONE retry path.                                  |
-| `/dkg/10.0.1/join-request`      | PR-10       | 1             | Removes `JoinApprovalRetryQueue` in favour of generic outbox.                      |
-| `/dkg/10.0.1/storage-ack`       | PR-11       | 1             | ACKCollector quorum stays untouched; only the transport swaps.                     |
-| `/dkg/10.0.1/verify-proposal`   | PR-11       | 1             | Same shape as storage-ack.                                                         |
+| Protocol                       | Migrated in | parallelPaths | Notes                                                                                            |
+| ------------------------------ | ----------- | ------------- | ------------------------------------------------------------------------------------------------ |
+| `/dkg/10.0.1/message` (chat)   | PR-3        | 2 (default)   | Pilot. Wire-format break replaces `chat_messages.message_id` index uniqueness.                   |
+| `/dkg/10.0.1/skill_request`    | PR-3        | 1             | Migrated alongside chat (shares `agent.sendMessage` path).                                       |
+| `/dkg/10.0.1/swm-sender-key`   | PR-8        | 1             | Batch with `/private-access`.                                                                    |
+| `/dkg/10.0.1/private-access`   | PR-8        | 1             | Batch with `/swm-sender-key`; `AccessClient` takes the minimal `AccessSendSurface` interface.    |
+| `/dkg/10.0.1/query-remote`     | PR-9        | 1             | Sole caller of `RESPONSE_GONE` retry path; `sendQueryReliable` re-issues with fresh messageId (cap 2). |
+| `/dkg/10.0.1/join-request`     | PR-10       | 1             | Removes `JoinApprovalRetryQueue` in favour of generic outbox — substrate now owns persistence.   |
+| `/dkg/10.0.1/storage-ack`      | PR-11       | 1             | ACKCollector quorum unchanged; only transport swaps. parallelPaths=1 prevents 9x fan-out.        |
+| `/dkg/10.0.1/verify-proposal`  | PR-11       | 1             | Same shape as storage-ack. `/dkg/10.0.0/verify-approval` stays bare (not a substrate caller).    |
 
 ## Recovery primitives
 
-> Documented as they ship. Linked PRs are in the rc.9 plan.
-
-- **Outbox-driven retry** (rc.8 carry-over) — backoff ladder above.
+- **Outbox-driven retry** — backoff ladder above. SQLite-persisted;
+  survives daemon restart.
 - **Opportunistic-flush on `connection:open`** — when a peer
   reconnects, drain its `pendingFor(peer)` queue immediately rather
   than wait for backoff. Stale-snapshot-safe via `hasEntry` guard
-  (rc.9 #538).
-- **`parallelPaths`** _(PR-4)_ — `Messenger.sendToPeer` can race N
-  candidate paths; receiver dedup absorbs duplicates.
+  (rc.8 #538 lesson, lifted into the substrate).
+- **`parallelPaths`** _(PR-4)_ — `Messenger.sendReliable` opts can
+  race N candidate paths; receiver dedup absorbs duplicates. Only
+  safe on `/dkg/10.0.1/*` where dedup is mandatory.
 - **DHT walk on stall** _(PR-5)_ — outbox entry with ≥ 5 attempts of
-  "no valid addresses for peer" triggers a time-bounded, rate-limited
-  `libp2p.peerRouting.findPeer()`.
-- **Gossip peer-hints** _(PR-6, conditional)_ — only ships if Gate B
-  shows DHT walk insufficient.
+  "no valid addresses for peer" triggers a time-bounded
+  (`DHT_WALK_TIMEOUT_MS=10s`), rate-limited
+  (`DHT_WALK_RATE_LIMIT_MS=5min/peer`) `libp2p.peerRouting.findPeer()`.
+- **Gossip peer-hints** _(PR-6, cancelled per Gate B)_ — Gate B
+  decision was to skip; DHT walk + inbound-from-receiver are
+  sufficient. If a post-ship soak shows DHT walk insufficient, PR-6
+  lands as a fast follow-up under the original gossip-hints design.
 
 ## SLO
 
@@ -292,5 +535,14 @@ exercised is still on `/dkg/10.0.0/*` and hasn't been migrated yet.
   `messageId`) — out of scope for rc.9; explored in a follow-up RFC.
 - Cross-process idempotency (multiple daemons sharing the same store)
   — not needed today (one daemon per node) but the schema accommodates it.
-- Operator-relay infrastructure — code-side in PR-7; actual relay
-  provisioning is an out-of-band ops track.
+- Operator-relay infrastructure — code-side ships in PR-7
+  (`--relay-preferred`); actual relay provisioning is an out-of-band
+  ops track. See [`messenger-operator.md`](./messenger-operator.md).
+- `Messenger.sendToPeer` legacy pass-through: kept at rc.9 for any
+  future incremental migration; may be deprecated in a later rc once
+  the substrate has had enough operator-time to confirm no surprise
+  caller emerges.
+- Persistent SLO histogram: today the histogram is in-memory only
+  (resets on daemon restart). If operators report that they need
+  multi-day rolling SLO views, a follow-up RFC would persist the
+  histogram to a `slo_samples` SQLite table with a windowed prune.

@@ -14,9 +14,21 @@ export const PROTOCOL_SYNC = '/dkg/10.0.0/sync';
 // PR-8+ migrate the remaining short-message protocols onto the
 // same 10.0.1 minor.
 export const PROTOCOL_MESSAGE = '/dkg/10.0.1/message';
-export const PROTOCOL_ACCESS = '/dkg/10.0.0/private-access';
+// rc.9 PR-8: bumped from /dkg/10.0.0/private-access to opt into the
+// Universal Messenger substrate (envelope wrapper, sender-side
+// idempotency cache, receiver-side dedup, durable SQLite outbox).
+// Hard cutover — rc.8 nodes can no longer request private access
+// from rc.9 nodes and vice versa. The handler registers via
+// messenger.register and the only production-shaped sender (the
+// publisher AccessClient — currently exercised only by integration
+// tests) routes through messenger.sendReliable.
+export const PROTOCOL_ACCESS = '/dkg/10.0.1/private-access';
 export const PROTOCOL_QUERY_REMOTE = '/dkg/10.0.0/query-remote';
-export const PROTOCOL_SWM_SENDER_KEY = '/dkg/10.0.0/swm-sender-key';
+// rc.9 PR-8: bumped from /dkg/10.0.0/swm-sender-key to opt into the
+// Universal Messenger substrate (same rationale as PROTOCOL_ACCESS).
+// SWM sender-key send sites in dkg-agent.ts route through
+// messenger.sendReliable; handler registers via messenger.register.
+export const PROTOCOL_SWM_SENDER_KEY = '/dkg/10.0.1/swm-sender-key';
 
 export const PROTOCOL_JOIN_REQUEST = '/dkg/10.0.0/join-request';
 

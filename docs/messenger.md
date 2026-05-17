@@ -165,8 +165,8 @@ is idempotent at the app layer) or surface a terminal error.
 | ------------------------------- | ----------- | ------------- | ---------------------------------------------------------------------------------- |
 | `/dkg/10.0.1/message` (chat)    | PR-3        | 2 (PR-4)      | Pilot. Wire-format break replaces `chat_messages.message_id` index uniqueness.     |
 | `/dkg/10.0.1/skill_request`     | PR-3        | 1             | Migrated alongside chat (shares `agent.sendMessage` path).                         |
-| `/dkg/10.0.1/swm-sender-key`    | PR-8        | 1             | Batch with `/private-access`.                                                      |
-| `/dkg/10.0.1/private-access`    | PR-8        | 1             | Batch with `/swm-sender-key`.                                                      |
+| `/dkg/10.0.1/swm-sender-key`    | PR-8 ✅      | 1             | Synchronous: SWM-key send treats `queued` as a hard failure (epoch setup blocks).  |
+| `/dkg/10.0.1/private-access`    | PR-8 ✅      | 1             | Synchronous: `AccessClient.requestAccess` surfaces `queued` as a rejected request. |
 | `/dkg/10.0.1/query-remote`      | PR-9        | 1             | First caller exercising RESPONSE_GONE retry path.                                  |
 | `/dkg/10.0.1/join-request`      | PR-10       | 1             | Removes `JoinApprovalRetryQueue` in favour of generic outbox.                      |
 | `/dkg/10.0.1/storage-ack`       | PR-11       | 1             | ACKCollector quorum stays untouched; only the transport swaps.                     |

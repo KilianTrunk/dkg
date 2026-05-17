@@ -1724,9 +1724,21 @@ export class DKGAgent {
     await this.loadSwmSenderKeyState();
     await this.rehydrateContextGraphSubscriptions();
 
-    // Register protocol handlers
+    // Register protocol handlers. PROTOCOL_ACCESS migrated onto the
+    // Universal Messenger substrate in rc.9 PR-8 — handler is
+    // registered via messenger.register so receiver-side dedup +
+    // envelope unwrap happen transparently. AccessHandler's contract
+    // is unchanged (it still receives the application bytes and
+    // returns the application response bytes); the substrate sits
+    // between it and the wire.
     const accessHandler = new AccessHandler(this.store, this.eventBus);
-    this.router.register(PROTOCOL_ACCESS, accessHandler.handler);
+    this.messenger.register(PROTOCOL_ACCESS, async (data, peerId) => {
+      const peerIdObj = {
+        toString: () => peerId,
+        toBytes: () => new Uint8Array(),
+      };
+      return accessHandler.handler(data, peerIdObj);
+    });
 
     const journal = this.config.dataDir ? new PublishJournal(this.config.dataDir) : undefined;
     const publishHandler = new PublishHandler(this.store, this.eventBus, { journal });
@@ -1748,8 +1760,11 @@ export class DKGAgent {
     }
     const queryRemoteHandler = new QueryHandler(this.queryEngine, queryAccessConfig);
     this.router.register(PROTOCOL_QUERY_REMOTE, queryRemoteHandler.handler);
-    this.router.register(PROTOCOL_SWM_SENDER_KEY, async (data, peerId) => {
-      return this.handleSwmSenderKeyPackage(data, peerId.toString());
+    // PROTOCOL_SWM_SENDER_KEY migrated onto the substrate in rc.9 PR-8.
+    // messenger.register handles envelope unwrap + receiver dedup
+    // before the in-process handleSwmSenderKeyPackage call.
+    this.messenger.register(PROTOCOL_SWM_SENDER_KEY, async (data, peerId) => {
+      return this.handleSwmSenderKeyPackage(data, peerId);
     });
 
     const effectiveRole = this.config.nodeRole ?? 'edge';
@@ -5628,12 +5643,24 @@ export class DKGAgent {
         `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
       );
       try {
-        const ackBytes = await this.messenger.sendToPeer(
+        // rc.9 PR-8: route through messenger.sendReliable so
+        // sender-side idempotency + durable outbox + retry-with-
+        // backoff cover this protocol the same way they cover chat.
+        // sendReliable can return queued=true on transient failures;
+        // SWM sender-key send treats that as a hard failure because
+        // the ACK is synchronous-by-contract (epoch setup blocks on
+        // it).
+        const sendResult = await this.messenger.sendReliable(
           recipient.peerId,
           PROTOCOL_SWM_SENDER_KEY,
           encodeSwmSenderKeyPackage(pkg),
         );
-        const ack = decodeSwmSenderKeyPackageAck(ackBytes);
+        if (!sendResult.delivered) {
+          throw new Error(
+            `SWM sender-key send queued (not synchronously deliverable): ${sendResult.error}`,
+          );
+        }
+        const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
         if (
           ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
           ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||

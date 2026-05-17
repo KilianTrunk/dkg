@@ -142,8 +142,26 @@ export class ProtocolRouter {
     // to dial the peer directly, closing the relay and any in-flight streams).
     // We retry up to 3 times with back-off so the direct connection can
     // stabilise before the next attempt.
+    //
+    // Per-call exclude-set for the fast path: when an existing-connection
+    // reuse hits a recoverable failure (stream came back live but
+    // `send`/`close`/`readAll` blew up — the half-dead-connection case
+    // Codex flagged in PR #538), we mark that connection as "tried this
+    // round" so the next retry attempt picks a different live candidate
+    // or falls through to `dialProtocol`. libp2p's connection table
+    // doesn't always prune a torn-down connection between our 500 ms
+    // backoff and the next attempt, so without this guard the loop
+    // could spend all three retries on the same dead connection without
+    // ever exercising the resolver + dialProtocol path that exists
+    // specifically to recover from this case.
+    const triedConnections = new WeakSet<ReusableConnection>();
     let lastErr: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
+      // Track which connection (if any) the fast path picked this
+      // attempt so the catch block can blacklist it on failure
+      // without needing to inspect stream/connection internals from
+      // the error.
+      let pickedConnection: ReusableConnection | null = null;
       try {
         // RFC 07 §3.2: re-prime the libp2p peerStore on EVERY attempt.
         //
@@ -220,7 +238,7 @@ export class ProtocolRouter {
         // connection table per send — N is the total open-conn
         // count of the node, typically <100, so the cost is a few
         // microseconds and the correctness win is large.
-        const fastStream = await tryReuseExistingConnection(
+        const fastResult = await tryReuseExistingConnection(
           () => {
             try {
               const all = libp2p.getConnections() as ReadonlyArray<
@@ -258,8 +276,11 @@ export class ProtocolRouter {
               }
               return false;
             },
+            excludeConnections: triedConnections,
           },
         );
+        const fastStream = fastResult?.stream ?? null;
+        pickedConnection = fastResult?.connection ?? null;
 
         if (this.peerResolver && !fastStream) {
           const remaining = Math.max(0, timeoutMs - (Date.now() - startedAt));
@@ -297,6 +318,19 @@ export class ProtocolRouter {
         return response;
       } catch (err: unknown) {
         lastErr = err;
+        // If this attempt opened the stream via the fast path, mark
+        // the underlying connection as tried-and-failed so subsequent
+        // attempts don't pick it again. The half-dead-connection case
+        // (newStream succeeds, send/readAll blows up because the
+        // transport is gone) leaves the connection in libp2p's table
+        // for some non-zero time before libp2p's own teardown removes
+        // it — without this we'd re-pick the same dead connection on
+        // the next attempt and exhaust the retry budget without ever
+        // reaching dialProtocol. Codex review of PR #538 / PR #537
+        // fast path.
+        if (pickedConnection) {
+          triedConnections.add(pickedConnection);
+        }
         if (!isRecoverableSendError(err) || attempt >= 2) throw err;
         const backoff = (attempt + 1) * 500;
         await new Promise(r => setTimeout(r, backoff));
@@ -365,6 +399,33 @@ interface ReusableConnection {
  */
 interface TryReuseExistingConnectionOptions {
   peerHasDirectAddrs: () => Promise<boolean>;
+  /**
+   * Connections to skip when iterating candidates.
+   *
+   * Lives across multiple `tryReuseExistingConnection` calls within
+   * the same logical `send()` so a connection that already failed a
+   * stream this round isn't picked again on the next retry attempt.
+   * libp2p's connection table doesn't always prune a torn-down
+   * connection between our recoverable-failure backoff and the next
+   * fast-path retry — without this guard, all three retries of a
+   * send can be consumed on the same dead connection, never giving
+   * the resolver + dialProtocol path a chance to recover.
+   *
+   * Codex review feedback on PR #538: `fastStream` previously
+   * latched a half-dead connection for the whole retry budget.
+   */
+  excludeConnections?: WeakSet<ReusableConnection>;
+}
+
+/**
+ * Result of a successful fast-path pick: the freshly-opened stream
+ * plus the connection it was opened on. The caller blacklists
+ * `connection` via `excludeConnections` on failure so the next
+ * retry skips it.
+ */
+export interface TryReuseExistingConnectionResult {
+  stream: Stream;
+  connection: ReusableConnection;
 }
 
 // Minimal shape we depend on from libp2p — the real `Libp2p` type
@@ -378,13 +439,14 @@ export async function tryReuseExistingConnection(
   protocolId: string,
   signal: AbortSignal,
   options: TryReuseExistingConnectionOptions,
-): Promise<Stream | null> {
+): Promise<TryReuseExistingConnectionResult | null> {
   let candidates: ReadonlyArray<ReusableConnection> = [];
   try {
     candidates = getConnections();
   } catch {
     return null;
   }
+  const exclude = options.excludeConnections;
 
   // Lazy + memoized peerStore-direct-addrs probe.
   //
@@ -432,6 +494,7 @@ export async function tryReuseExistingConnection(
 
   for (const conn of candidates) {
     if (conn.status && conn.status !== 'open') continue;
+    if (exclude?.has(conn)) continue;
     if ((conn as unknown as { limits?: unknown }).limits) {
       if (await peerStoreHasDirectAddrs()) {
         continue;
@@ -467,7 +530,7 @@ export async function tryReuseExistingConnection(
         }
         continue;
       }
-      return s;
+      return { stream: s, connection: conn };
     } catch {
       // Try the next candidate connection (if any), then fall
       // through to dialProtocol on overall miss. Swallowing here is

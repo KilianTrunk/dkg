@@ -18,7 +18,11 @@ export const PROTOCOL_ACCESS = '/dkg/10.0.0/private-access';
 export const PROTOCOL_QUERY_REMOTE = '/dkg/10.0.0/query-remote';
 export const PROTOCOL_SWM_SENDER_KEY = '/dkg/10.0.0/swm-sender-key';
 
-export const PROTOCOL_JOIN_REQUEST = '/dkg/10.0.0/join-request';
+// rc.9 PR-10: bumped from /dkg/10.0.0/join-request to opt into the
+// Universal Messenger substrate. The in-memory JoinApprovalRetryQueue
+// (rc.9 PR #510) is replaced by the substrate's durable SQLite outbox
+// — same backoff ladder semantics, persists across daemon restart.
+export const PROTOCOL_JOIN_REQUEST = '/dkg/10.0.1/join-request';
 
 export const PROTOCOL_VERIFY_PROPOSAL = '/dkg/10.0.0/verify-proposal';
 export const PROTOCOL_VERIFY_APPROVAL = '/dkg/10.0.0/verify-approval';

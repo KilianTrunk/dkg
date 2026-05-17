@@ -9495,6 +9495,26 @@ export class DKGAgent {
       return;
     }
     try {
+      // Defend against the stale-snapshot race surfaced by the 2026-05
+      // rc9 soak: `processMessageOutboxOnConnect` iterates a snapshot
+      // of `pendingFor(peer)`; during the iteration a concurrent flush
+      // (triggered by a sibling `connection:open` in a reconnect storm)
+      // may have already completed delivery for THIS entry and called
+      // `markDelivered`. The `tryBeginAttempt` guard above only blocks
+      // TRULY-PARALLEL races (the prior flush is still mid-send) — once
+      // the prior flush completes and releases the inflight slot, this
+      // stale-snapshot caller would otherwise fire a duplicate wire
+      // send and, if it fails, `enqueueFailure` resurrects the deleted
+      // entry with `attempts=1`, triggering the full retry storm
+      // again. Re-checking presence inside the inflight guard
+      // (single-threaded, no yield between the check and the send)
+      // makes the no-op exit atomic. Smoking gun: 29 queues -> 63
+      // succeeded events in the soak, attempts counters resetting
+      // to 1 after `markDelivered` had run.
+      if (!this.messageOutbox.hasEntry(entry.recipientPeerId, entry.messageId)) {
+        return;
+      }
+
       // Forward the outbox entry's `messageId` into the wire-format
       // payload so the receiver's `idx_chat_msgid` partial unique
       // index recognises the retry as the same logical message as

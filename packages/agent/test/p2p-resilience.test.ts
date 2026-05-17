@@ -368,5 +368,84 @@ describe('p2p resilience hooks', () => {
         await agent.stop().catch(() => {});
       }
     }, 15_000);
+
+    // 🔴 Regression for the stale-snapshot race surfaced by the 2026-05
+    // rc9 soak: `processMessageOutboxOnConnect` takes a snapshot of
+    // `pendingFor(peer)` and iterates it. If two `connection:open`
+    // events fire in rapid succession (relay reconnect storm), Flush A
+    // completes (`markDelivered` deletes the entry, `endAttempt` clears
+    // the inflight slot), then Flush B — holding the now-stale entry
+    // reference from its own pre-A snapshot — calls
+    // `retryOutboxEntry(staleEntry)`. The `tryBeginAttempt` guard
+    // returns true (Flush A already released the slot), and without
+    // the `hasEntry` re-check below it, Flush B fires a duplicate
+    // `sendChat` for an already-delivered message. Worst case the
+    // duplicate `sendChat` fails ("Remote closed connection during
+    // opening") and `enqueueFailure` resurrects the deleted entry
+    // with attempts=1, triggering the full retry storm again. Soak
+    // smoking gun: 29 outbox queues produced 63 daemon "succeeded"
+    // events (2.17x amplification).
+    it('does not re-send an entry that a sibling flush already markDelivered (stale-snapshot guard, PR 6)', async () => {
+      const agent = await DKGAgent.create({
+        name: 'StaleSnapshotGuard',
+        listenHost: '127.0.0.1',
+        chainAdapter: new MockChainAdapter(),
+      });
+      try {
+        await agent.start();
+
+        const peer = freshPeerIdString();
+        const messageId = 'soak-rc9-stale-snapshot-msg-1';
+
+        // Pre-populate the outbox with one failed entry so
+        // retryOutboxEntry has something to drain.
+        (agent as any).messageOutbox.enqueueFailure(
+          { recipientPeerId: peer, text: 'hi', messageId },
+          'initial transport failure',
+          Date.now(),
+        );
+        const staleEntry = (agent as any).messageOutbox.pendingFor(peer)[0];
+        expect(staleEntry).toBeTruthy();
+
+        // Capture every sendChat invocation. A correctly-guarded
+        // retryOutboxEntry must call sendChat EXACTLY ONCE across both
+        // flushes — the second flush's stale-snapshot entry should be
+        // dropped by the hasEntry guard before any wire I/O.
+        const sendChatCalls: Array<{ peer: string; messageId: string }> = [];
+        (agent as any).messageHandler = {
+          sendChat: vi.fn(async (peerId: string, _text: string, opts: any) => {
+            sendChatCalls.push({ peer: peerId, messageId: opts?.messageId });
+            return { delivered: true, messageId: opts?.messageId };
+          }),
+        };
+
+        // Flush A: drains the entry cleanly (sendChat returns
+        // delivered, markDelivered fires, entry removed, endAttempt
+        // clears inflight). Same entry reference is reused by Flush B
+        // below — modelling exactly what the sibling-snapshot
+        // iteration does in production.
+        await (agent as any).retryOutboxEntry(staleEntry);
+
+        // Verify Flush A succeeded and the entry is gone.
+        expect((agent as any).messageOutbox.hasEntry(peer, messageId)).toBe(false);
+        expect(sendChatCalls.length).toBe(1);
+
+        // Flush B: stale-snapshot iteration on the same entry. Without
+        // the hasEntry guard added in PR 6, this would call sendChat a
+        // second time (the inflight slot was already released by A).
+        await (agent as any).retryOutboxEntry(staleEntry);
+
+        // The whole regression is captured here: sendChat must NOT
+        // have been called twice.
+        expect(sendChatCalls.length).toBe(1);
+        expect(sendChatCalls[0].messageId).toBe(messageId);
+
+        // Entry must still be gone — Flush B must not have resurrected
+        // it via the enqueueFailure path either.
+        expect((agent as any).messageOutbox.hasEntry(peer, messageId)).toBe(false);
+      } finally {
+        await agent.stop().catch(() => {});
+      }
+    }, 15_000);
   });
 });

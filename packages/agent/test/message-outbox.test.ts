@@ -212,6 +212,59 @@ describe('MessageOutbox', () => {
     });
   });
 
+  // 🔴 Regression for the stale-snapshot race surfaced by the 2026-05
+  // rc9 soak. tryBeginAttempt only blocks TRULY-PARALLEL races (both
+  // attempters in flight simultaneously); once flush A completes,
+  // markDelivered+endAttempt, a stale-snapshot flush B from a sibling
+  // `connection:open` event sees no inflight slot and would resend the
+  // already-delivered entry. hasEntry is the atomic existence check
+  // that paired with the inflight guard makes the no-op exit safe.
+  // Smoking gun: 29 outbox queues → 63 daemon "succeeded" events.
+  describe('hasEntry stale-snapshot guard (PR 6 race fix)', () => {
+    it('returns true for an entry that has been enqueued', () => {
+      const outbox = new MessageOutbox();
+      outbox.enqueueFailure(makePayload(), 'fail', 1000);
+      expect(outbox.hasEntry(PEER_A, 'msg-1')).toBe(true);
+    });
+
+    it('returns false for an entry that was never enqueued', () => {
+      const outbox = new MessageOutbox();
+      expect(outbox.hasEntry(PEER_A, 'msg-never')).toBe(false);
+    });
+
+    it('returns false after markDelivered removes the entry — the stale-snapshot race signal', () => {
+      const outbox = new MessageOutbox();
+      outbox.enqueueFailure(makePayload(), 'fail', 1000);
+      expect(outbox.hasEntry(PEER_A, 'msg-1')).toBe(true);
+      outbox.markDelivered(PEER_A, 'msg-1');
+      // This is the exact check the retryOutboxEntry guard relies on:
+      // after a sibling flush delivered + dropped the entry, a
+      // stale-snapshot caller must see false here and exit before
+      // resending.
+      expect(outbox.hasEntry(PEER_A, 'msg-1')).toBe(false);
+    });
+
+    it('returns false after dropExpired removes the entry', () => {
+      const outbox = new MessageOutbox({ backoffs: [1], maxAgeMs: 100 });
+      outbox.enqueueFailure(makePayload(), 'fail', 1000);
+      expect(outbox.hasEntry(PEER_A, 'msg-1')).toBe(true);
+      outbox.dropExpired(1000 + 200); // 200ms > maxAgeMs (100ms)
+      expect(outbox.hasEntry(PEER_A, 'msg-1')).toBe(false);
+    });
+
+    it('is independent across recipients and messageIds — same key namespace as the rest of the queue', () => {
+      const outbox = new MessageOutbox();
+      outbox.enqueueFailure(makePayload({ recipientPeerId: PEER_A, messageId: 'm1' }), 'fail', 1000);
+      outbox.enqueueFailure(makePayload({ recipientPeerId: PEER_B, messageId: 'm2' }), 'fail', 1100);
+      expect(outbox.hasEntry(PEER_A, 'm1')).toBe(true);
+      expect(outbox.hasEntry(PEER_B, 'm2')).toBe(true);
+      // wrong recipient + right messageId
+      expect(outbox.hasEntry(PEER_B, 'm1')).toBe(false);
+      // right recipient + wrong messageId
+      expect(outbox.hasEntry(PEER_A, 'm2')).toBe(false);
+    });
+  });
+
   describe('defaults', () => {
     it('uses chat-tighter backoff ladder when not overridden', () => {
       expect(DEFAULT_CHAT_OUTBOX_BACKOFFS_MS).toEqual([

@@ -42,6 +42,15 @@ export interface SkillOfferingConfig {
   pricingModel?: 'PerInvocation' | 'Subscription' | 'Free';
 }
 
+export interface AgentProfileEncryptionKey {
+  encryptionKeyAlgorithm: string;
+  publicEncryptionKey: string;
+  encryptionKeyProof: string;
+  encryptionKeyId: string;
+  revokedAt?: string;
+  revocationProof?: string;
+}
+
 export interface AgentProfileConfig {
   peerId: string;
   name: string;
@@ -53,8 +62,20 @@ export interface AgentProfileConfig {
   publicKey?: string;
   relayAddress?: string;
   agentAddress?: string;
+  /**
+   * Every workspace encryption key registered to this agent, including retired
+   * ones (so the registry can publish their wallet-signed revocations and
+   * peers' resolvers can filter them out). When this is non-empty the legacy
+   * `publicEncryptionKey` / `encryptionKeyAlgorithm` / `encryptionKeyProof`
+   * fields below are ignored — callers should populate either the array OR the
+   * singular fields, not both.
+   */
+  encryptionKeys?: readonly AgentProfileEncryptionKey[];
+  /** @deprecated single-key shape kept for backward compatibility with older test fixtures. */
   encryptionKeyAlgorithm?: string;
+  /** @deprecated */
   publicEncryptionKey?: string;
+  /** @deprecated */
   encryptionKeyProof?: string;
 }
 
@@ -112,7 +133,22 @@ export function buildAgentProfile(config: AgentProfileConfig): {
   if (config.agentAddress) {
     q(entity, `${DKG}agentAddress`, `"${canonicalAgentDidSubject(config.agentAddress)}"`);
   }
-  if (config.publicEncryptionKey && config.encryptionKeyAlgorithm && config.encryptionKeyProof) {
+  // Encryption keys: prefer the multi-key array; fall back to the deprecated
+  // singular fields only when the array isn't supplied (legacy callers /
+  // test fixtures). Retired keys still get published so peers learn their
+  // wallet-signed revocations and the resolver can prune them.
+  if (config.encryptionKeys && config.encryptionKeys.length > 0) {
+    for (const key of config.encryptionKeys) {
+      q(entity, `${DKG}publicEncryptionKey`, `"${key.publicEncryptionKey}"`);
+      q(entity, `${DKG}encryptionKeyAlgorithm`, `"${key.encryptionKeyAlgorithm}"`);
+      q(entity, `${DKG}encryptionKeyProof`, `"${key.encryptionKeyProof}"`);
+      if (key.revokedAt && key.revocationProof) {
+        q(key.encryptionKeyId, `${DKG}revokedAt`, `"${key.revokedAt}"`);
+        q(key.encryptionKeyId, `${DKG}revokedBy`, entity);
+        q(key.encryptionKeyId, `${DKG}encryptionKeyRevocationProof`, `"${key.revocationProof}"`);
+      }
+    }
+  } else if (config.publicEncryptionKey && config.encryptionKeyAlgorithm && config.encryptionKeyProof) {
     q(entity, `${DKG}publicEncryptionKey`, `"${config.publicEncryptionKey}"`);
     q(entity, `${DKG}encryptionKeyAlgorithm`, `"${config.encryptionKeyAlgorithm}"`);
     q(entity, `${DKG}encryptionKeyProof`, `"${config.encryptionKeyProof}"`);

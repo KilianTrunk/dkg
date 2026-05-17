@@ -2,7 +2,17 @@ export { DKGAgentWallet, type AgentWallet } from './agent-wallet.js';
 export { loadOpWallets, generateWallets, type OpWalletsConfig, type WalletEntry } from './op-wallets.js';
 export {
   generateCustodialAgent, registerSelfSovereignAgent, agentFromPrivateKey,
-  generateAgentToken, hashAgentToken, type AgentKeyRecord,
+  generateAgentToken, hashAgentToken,
+  ensureWorkspaceEncryptionKey,
+  appendCustodialWorkspaceEncryptionKey,
+  revokeCustodialWorkspaceEncryptionKey,
+  attachRevocationToWorkspaceEncryptionKey,
+  activeWorkspaceEncryptionKeys,
+  refreshDefaultEncryptionKeyView,
+  migrateLegacyWorkspaceEncryptionFields,
+  type AgentKeyRecord,
+  type WorkspaceEncryptionKeyEntry,
+  type KeystoreEntry,
 } from './agent-keystore.js';
 export {
   buildAgentProfile,

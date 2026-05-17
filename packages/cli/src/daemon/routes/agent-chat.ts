@@ -388,6 +388,114 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     }
   }
 
+  // Authorize the new key-management routes: an agent-scoped token may
+  // only act on its own agent. Node-admin tokens (no specific agent
+  // bound) are the operator override and may act on any local agent.
+  // `agent.resolveAgentByToken` returns the agent address for an
+  // agent-scoped token, `undefined` for the node-admin token (which
+  // isn't registered in the per-agent index). Same pattern other
+  // routes (e.g. memory.ts, query.ts) already use for caller-vs-target
+  // gating.
+  function authorizeKeyManagementOnAddress(targetAddress: string): { ok: true } | { ok: false; status: number; body: Record<string, unknown> } {
+    const tokenAgentAddress = requestToken ? agent.resolveAgentByToken(requestToken) : undefined;
+    if (!tokenAgentAddress) return { ok: true };
+    if (tokenAgentAddress.toLowerCase() === targetAddress.toLowerCase()) return { ok: true };
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        error: `Agent token for ${tokenAgentAddress} cannot manage encryption keys for ${targetAddress}. ` +
+          'Use a node-level admin token (~/.dkg/auth.token) to manage other agents on this node.',
+      },
+    };
+  }
+
+  // POST /api/agent/:address/rotate-encryption-key — mint a fresh workspace
+  // encryption key for a custodial local agent. Body: `{ "retireOld": boolean }`.
+  // When `retireOld` is true, the previous default key is also revoked in the
+  // same operation (use only after propagation has settled, or for urgent
+  // compromise scenarios). The new key is appended to the keystore, RDF
+  // triples are emitted in the local agent registry, and the agent's profile
+  // is re-published so peers update their resolver state.
+  if (
+    req.method === "POST"
+    && path.startsWith("/api/agent/")
+    && path.endsWith("/rotate-encryption-key")
+  ) {
+    const address = decodeURIComponent(path.slice("/api/agent/".length, -"/rotate-encryption-key".length));
+    if (!address) return jsonResponse(res, 404, { error: "Agent address required in path" });
+    const authz = authorizeKeyManagementOnAddress(address);
+    if (!authz.ok) return jsonResponse(res, authz.status, authz.body);
+    let parsed: { retireOld?: unknown } = {};
+    const body = (await readBody(req, SMALL_BODY_BYTES)).trim();
+    if (body) {
+      try { parsed = JSON.parse(body); }
+      catch { return jsonResponse(res, 400, { error: "Invalid JSON body" }); }
+    }
+    const retireOld = parsed.retireOld === true;
+    try {
+      const result = await agent.rotateWorkspaceEncryptionKey(address, { retireOld });
+      return jsonResponse(res, 200, { ok: true, ...result });
+    } catch (err: any) {
+      return jsonResponse(res, 400, { error: err?.message ?? "Encryption key rotation failed" });
+    }
+  }
+
+  // POST /api/agent/:address/revoke-encryption-key — wallet-sign and publish a
+  // revocation for a specific encryption key. Body: `{ "keyId": "did:dkg:agent:..." }`.
+  // Refuses to revoke the agent's last active key (would brick SWM); callers
+  // must rotate first in that case. Idempotent: revoking an already-revoked
+  // key returns the existing revocation timestamp without re-signing.
+  if (
+    req.method === "POST"
+    && path.startsWith("/api/agent/")
+    && path.endsWith("/revoke-encryption-key")
+  ) {
+    const address = decodeURIComponent(path.slice("/api/agent/".length, -"/revoke-encryption-key".length));
+    if (!address) return jsonResponse(res, 404, { error: "Agent address required in path" });
+    const authz = authorizeKeyManagementOnAddress(address);
+    if (!authz.ok) return jsonResponse(res, authz.status, authz.body);
+    const body = (await readBody(req, SMALL_BODY_BYTES)).trim();
+    if (!body) return jsonResponse(res, 400, { error: 'Body required: { "keyId": "..." }' });
+    let parsed: { keyId?: unknown };
+    try { parsed = JSON.parse(body); }
+    catch { return jsonResponse(res, 400, { error: "Invalid JSON body" }); }
+    if (typeof parsed.keyId !== "string" || !parsed.keyId) {
+      return jsonResponse(res, 400, { error: 'Missing required field "keyId"' });
+    }
+    try {
+      const result = await agent.revokeWorkspaceEncryptionKey(address, parsed.keyId);
+      return jsonResponse(res, 200, { ok: true, ...result });
+    } catch (err: any) {
+      return jsonResponse(res, 400, { error: err?.message ?? "Encryption key revocation failed" });
+    }
+  }
+
+  // POST /api/agent/publish-profile — re-broadcast the daemon's default
+  // agent profile. The rotate/revoke flows above call this implicitly on
+  // success; this endpoint exists for the partial-failure path where
+  // local persistence succeeded but the implicit republish errored
+  // (returned `profilePublished: false` + `profilePublishError`). The
+  // operator retries here once whatever blocked the publish (chain RPC,
+  // libp2p dial, etc.) has recovered. Node-admin only — there is no
+  // per-agent profile in the current architecture, only the default
+  // agent's; gating to admin avoids a non-default-agent token tricking
+  // the daemon into republishing on demand for spam.
+  if (req.method === "POST" && path === "/api/agent/publish-profile") {
+    const tokenAgentAddress = requestToken ? agent.resolveAgentByToken(requestToken) : undefined;
+    if (tokenAgentAddress) {
+      return jsonResponse(res, 403, {
+        error: 'POST /api/agent/publish-profile requires a node-level admin token; agent-scoped tokens cannot trigger a profile republish.',
+      });
+    }
+    try {
+      const result = await agent.publishProfile();
+      return jsonResponse(res, 200, { ok: true, ual: (result as any)?.ual ?? null });
+    } catch (err: any) {
+      return jsonResponse(res, 502, { error: err?.message ?? "Profile publish failed" });
+    }
+  }
+
   // GET /api/agent/identity — current agent identity for the requesting token
   if (req.method === "GET" && path === "/api/agent/identity") {
     const token = extractBearerToken(req.headers.authorization);

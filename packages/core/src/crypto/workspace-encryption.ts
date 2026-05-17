@@ -21,6 +21,7 @@ import {
 export const WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE = 'dkg.workspace.recipient-encryption-key.v1';
 export const WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519 = 'X25519';
 export const WORKSPACE_AGENT_ENCRYPTION_KEY_PROOF_DOMAIN = 'dkg.workspace.agent-encryption-key-proof.v1';
+export const WORKSPACE_AGENT_ENCRYPTION_KEY_REVOCATION_DOMAIN = 'dkg.workspace.agent-encryption-key-revocation.v1';
 export const WORKSPACE_ENCRYPTION_KEY_BYTES = 32;
 export const WORKSPACE_X25519_KEY_BYTES = 32;
 export const WORKSPACE_ENCRYPTION_NONCE_BYTES = 12;
@@ -50,6 +51,13 @@ export interface WorkspaceAgentEncryptionKeyProofFields {
   agentAddress: string;
   encryptionKeyAlgorithm: typeof WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519;
   publicKeyBytes: Uint8Array;
+}
+
+export interface WorkspaceAgentEncryptionKeyRevocationFields {
+  agentAddress: string;
+  encryptionKeyAlgorithm: typeof WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519;
+  publicKeyBytes: Uint8Array;
+  revokedAt: string;
 }
 
 type WorkspaceEncryptionMetadata = Required<Pick<
@@ -242,6 +250,36 @@ export function computeWorkspaceAgentEncryptionKeyProofPayload(
     framedString(fields.encryptionKeyAlgorithm),
     framedString('publicEncryptionKey'),
     framedBytes(fields.publicKeyBytes),
+  ]);
+}
+
+/**
+ * Build the byte payload an agent's secp256k1 wallet signs to revoke a previously
+ * registered workspace encryption key. The payload is domain-separated from the
+ * registration proof so a stolen registration signature cannot be replayed as a
+ * revocation (and vice versa). Verifiers MUST ecrecover() the EIP-191 message hash
+ * of this payload and check it matches `agentAddress`.
+ */
+export function computeWorkspaceAgentEncryptionKeyRevocationPayload(
+  fields: WorkspaceAgentEncryptionKeyRevocationFields,
+): Uint8Array {
+  if (fields.encryptionKeyAlgorithm !== WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519) {
+    throw new Error(`Unsupported workspace agent encryption key algorithm: ${fields.encryptionKeyAlgorithm}`);
+  }
+  assertNonEmpty('agentAddress', fields.agentAddress);
+  assertNonEmpty('revokedAt', fields.revokedAt);
+  assertX25519KeyBytes('publicEncryptionKey', fields.publicKeyBytes);
+  return concatBytes([
+    framedString('domain'),
+    framedString(WORKSPACE_AGENT_ENCRYPTION_KEY_REVOCATION_DOMAIN),
+    framedString('agentAddress'),
+    framedString(fields.agentAddress.toLowerCase()),
+    framedString('encryptionKeyAlgorithm'),
+    framedString(fields.encryptionKeyAlgorithm),
+    framedString('publicEncryptionKey'),
+    framedBytes(fields.publicKeyBytes),
+    framedString('revokedAt'),
+    framedString(fields.revokedAt),
   ]);
 }
 

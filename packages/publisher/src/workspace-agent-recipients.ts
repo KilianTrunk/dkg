@@ -5,6 +5,7 @@ import {
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
   computeWorkspaceAgentEncryptionKeyProofPayload,
+  computeWorkspaceAgentEncryptionKeyRevocationPayload,
   contextGraphDataUri,
   contextGraphMetaUri,
   contextGraphSharedMemoryUri,
@@ -57,7 +58,8 @@ export async function resolveWorkspaceAgentRecipients(
 
   const recipients: WorkspaceAgentRecipient[] = [];
   for (const agentAddress of access.agentAddresses) {
-    recipients.push(await resolveAgentRecipientKey(store, agentAddress));
+    const agentRecipients = await resolveAgentRecipientKeys(store, agentAddress);
+    recipients.push(...agentRecipients);
   }
   return { requiresEncryption: true, recipients };
 }
@@ -121,10 +123,29 @@ async function getWorkspaceAccessMetadata(
   return { hasPrivateAccessPolicy, agentAddresses };
 }
 
-async function resolveAgentRecipientKey(
+/**
+ * Resolve every valid (non-revoked) workspace encryption key registered for a DKG
+ * agent.
+ *
+ * Each agent MAY hold multiple X25519 public encryption keys at once (e.g. mid-
+ * rotation, after a custodial daemon re-mint on a node that had never run before,
+ * or while different daemons converge on a freshly published key). Each key is
+ * authenticated by an EIP-191 signature from the agent's wallet against
+ * `computeWorkspaceAgentEncryptionKeyProofPayload`; we MUST encrypt the SWM
+ * payload to every authenticated key, otherwise some legitimate recipient daemon
+ * will hold a private half that doesn't match any wrapped slot and decryption
+ * will fail there.
+ *
+ * Keys can be explicitly retired by emitting wallet-signed revocation triples on
+ * the key URI (`dkg:revokedAt`, `dkg:revokedBy`, `dkg:encryptionKeyRevocationProof`
+ * over `computeWorkspaceAgentEncryptionKeyRevocationPayload`). A revocation is
+ * honoured only when the proof ecrecovers to the agent's wallet; bogus revocation
+ * triples are ignored so they can't be used to brick an honest peer's key.
+ */
+async function resolveAgentRecipientKeys(
   store: TripleStore,
   agentAddress: string,
-): Promise<WorkspaceAgentRecipient> {
+): Promise<WorkspaceAgentRecipient[]> {
   const checksum = ethers.getAddress(agentAddress);
   const agentUri = `did:dkg:agent:${checksum}`;
   const lowerAgentUri = `did:dkg:agent:${checksum.toLowerCase()}`;
@@ -145,7 +166,7 @@ async function resolveAgentRecipientKey(
     throw new Error(`Missing public encryption key for DKG agent ${checksum}`);
   }
 
-  const validKeys = new Map<string, WorkspaceAgentRecipient>();
+  const verifiedKeys = new Map<string, WorkspaceAgentRecipient>();
   let sawWrongAlgorithm = false;
   let sawUntrustedOnly = false;
   let sawInvalidProof = false;
@@ -184,7 +205,8 @@ async function resolveAgentRecipientKey(
     }
 
     const recipientKeyId = workspaceAgentEncryptionKeyId(checksum, publicKeyBytes);
-    validKeys.set(recipientKeyId, {
+    if (verifiedKeys.has(recipientKeyId)) continue;
+    verifiedKeys.set(recipientKeyId, {
       purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
       recipientId: agentUri,
       recipientKeyId,
@@ -195,23 +217,75 @@ async function resolveAgentRecipientKey(
     });
   }
 
-  if (validKeys.size > 1) {
-    throw new Error(`Ambiguous public encryption keys for DKG agent ${checksum}`);
+  if (verifiedKeys.size === 0) {
+    if (sawUntrustedOnly) {
+      throw new Error(`Untrusted RDF-only public encryption key for DKG agent ${checksum}`);
+    }
+    if (sawWrongAlgorithm) {
+      throw new Error(`Unsupported public encryption key algorithm for DKG agent ${checksum}; expected X25519`);
+    }
+    if (sawInvalidProof) {
+      throw new Error(`Spoofed or unverifiable public encryption key for DKG agent ${checksum}`);
+    }
+    throw new Error(`Missing public encryption key for DKG agent ${checksum}`);
   }
-  const [recipient] = validKeys.values();
-  if (recipient) {
-    return recipient;
+
+  const revokedKeyIds = await loadVerifiedRevokedKeyIds(store, checksum, [...verifiedKeys.values()]);
+  for (const id of revokedKeyIds) {
+    verifiedKeys.delete(id);
   }
-  if (sawUntrustedOnly) {
-    throw new Error(`Untrusted RDF-only public encryption key for DKG agent ${checksum}`);
+
+  if (verifiedKeys.size === 0) {
+    throw new Error(`All registered public encryption keys for DKG agent ${checksum} have been revoked`);
   }
-  if (sawWrongAlgorithm) {
-    throw new Error(`Unsupported public encryption key algorithm for DKG agent ${checksum}; expected X25519`);
+
+  return [...verifiedKeys.values()];
+}
+
+/**
+ * Fetch revocation triples for the candidate keys and return the subset whose
+ * `encryptionKeyRevocationProof` ecrecovers to the agent's wallet. Bogus
+ * revocations (missing proof, wrong signer, malformed payload) are dropped so
+ * an attacker cannot brick an honest key by writing junk into shared memory.
+ */
+async function loadVerifiedRevokedKeyIds(
+  store: TripleStore,
+  agentAddress: string,
+  candidates: readonly WorkspaceAgentRecipient[],
+): Promise<Set<string>> {
+  const revoked = new Set<string>();
+  if (candidates.length === 0) return revoked;
+  const valuesList = candidates.map((c) => `<${c.recipientKeyId}>`).join(' ');
+  const result = await store.query(
+    `SELECT ?keyId ?revokedAt ?revocationProof WHERE {
+      VALUES ?keyId { ${valuesList} }
+      GRAPH ?g {
+        ?keyId <${DKG_ONTOLOGY.DKG_REVOKED_AT}> ?revokedAt .
+        OPTIONAL { ?keyId <${DKG_ONTOLOGY.DKG_ENCRYPTION_KEY_REVOCATION_PROOF}> ?revocationProof }
+      }
+    }`,
+  );
+  if (result.type !== 'bindings') return revoked;
+
+  const byKey = new Map<string, WorkspaceAgentRecipient>();
+  for (const c of candidates) byKey.set(c.recipientKeyId, c);
+
+  for (const row of result.bindings) {
+    const keyId = stringBinding(row['keyId']);
+    const revokedAt = stringBinding(row['revokedAt']);
+    const revocationProof = stringBinding(row['revocationProof']);
+    if (!keyId || !revokedAt || !revocationProof) continue;
+    const candidate = byKey.get(keyId);
+    if (!candidate) continue;
+    const verified = verifyAgentEncryptionKeyRevocation(
+      agentAddress,
+      candidate.publicKeyBytes!,
+      stripRdfLiteral(revokedAt),
+      stripRdfLiteral(revocationProof),
+    );
+    if (verified) revoked.add(keyId);
   }
-  if (sawInvalidProof) {
-    throw new Error(`Spoofed or unverifiable public encryption key for DKG agent ${checksum}`);
-  }
-  throw new Error(`Missing public encryption key for DKG agent ${checksum}`);
+  return revoked;
 }
 
 function verifyAgentEncryptionKeyProof(
@@ -226,6 +300,26 @@ function verifyAgentEncryptionKeyProof(
       publicKeyBytes,
     });
     const recovered = ethers.verifyMessage(payload, proof);
+    return recovered.toLowerCase() === agentAddress.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function verifyAgentEncryptionKeyRevocation(
+  agentAddress: string,
+  publicKeyBytes: Uint8Array,
+  revokedAt: string,
+  revocationProof: string,
+): boolean {
+  try {
+    const payload = computeWorkspaceAgentEncryptionKeyRevocationPayload({
+      agentAddress,
+      encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+      publicKeyBytes,
+      revokedAt,
+    });
+    const recovered = ethers.verifyMessage(payload, revocationProof);
     return recovered.toLowerCase() === agentAddress.toLowerCase();
   } catch {
     return false;

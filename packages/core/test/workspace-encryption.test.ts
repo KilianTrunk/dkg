@@ -69,6 +69,26 @@ describe('workspace encrypted payload helpers', () => {
     expect(new Uint8Array(decrypted.plaintext)).toEqual(inputFor([alice]).plaintext);
   });
 
+  it('decrypts a multi-key recipient envelope when the holder only owns one of the slots', async () => {
+    // Mid-rotation: Bob has two registered keys; this node only holds the
+    // private half of key 2. The sender wraps the content key under BOTH of
+    // Bob's recipient slots. Decryption MUST succeed with just key 2.
+    const alice = recipientKey('did:dkg:agent:alice', 'alice-key-1', 0xa1);
+    const bobOld = recipientKey('did:dkg:agent:bob', 'bob-key-1', 0xb1);
+    const bobNew = recipientKey('did:dkg:agent:bob', 'bob-key-2', 0xb2);
+    const envelope = await encryptWorkspacePayload(inputFor([alice, bobOld, bobNew]));
+    expect(envelope.recipients).toHaveLength(3);
+
+    // Drop the private half of the OLD key (simulating a node that only has
+    // the freshly-rotated one). Decryption must still resolve via the NEW slot.
+    const bobNewPrivKeyOnly: WorkspaceRecipientEncryptionKey = {
+      ...bobNew,
+    };
+    const decrypted = await decryptWorkspacePayload(envelope, [bobNewPrivKeyOnly]);
+    expect(decrypted.recipientKeyId).toBe(bobNew.recipientKeyId);
+    expect(new Uint8Array(decrypted.plaintext)).toEqual(inputFor([alice]).plaintext);
+  });
+
   it('rejects unsupported envelope type and version if JavaScript callers pass extra fields', async () => {
     const alice = recipientKey('did:dkg:agent:alice', 'alice-key-1', 0xa1);
     const unsupportedVersion = {

@@ -82,6 +82,66 @@ export class ApiClient {
   }
 
   /**
+   * Mint a fresh workspace encryption key for a custodial local agent and
+   * re-publish the agent's profile so peers learn the new key. Pass
+   * `retireOld: true` to also revoke the previous default key in the same
+   * operation (use only after propagation has settled, or for urgent
+   * compromise scenarios). Returns the new key URI plus, optionally, the
+   * retired one.
+   */
+  async rotateAgentEncryptionKey(
+    address: string,
+    opts: { retireOld?: boolean } = {},
+  ): Promise<{
+    ok: true;
+    newKeyId: string;
+    retiredKeyId?: string;
+    profilePublished: boolean;
+    profilePublishError?: string;
+  }> {
+    return this.post(
+      `/api/agent/${encodeURIComponent(address)}/rotate-encryption-key`,
+      opts,
+    );
+  }
+
+  /**
+   * Wallet-sign and publish a revocation for a specific workspace encryption
+   * key. Refuses to revoke the agent's last active key; rotate first in that
+   * case. Idempotent for already-revoked keys.
+   *
+   * The response surfaces `profilePublished` + `profilePublishError`; callers
+   * MUST treat `profilePublished: false` as a partial failure for revocation
+   * (peers still encrypt to the supposedly retired key until profile sync).
+   */
+  async revokeAgentEncryptionKey(
+    address: string,
+    keyId: string,
+  ): Promise<{
+    ok: true;
+    revokedKeyId: string;
+    revokedAt: string;
+    profilePublished: boolean;
+    profilePublishError?: string;
+  }> {
+    return this.post(
+      `/api/agent/${encodeURIComponent(address)}/revoke-encryption-key`,
+      { keyId },
+    );
+  }
+
+  /**
+   * Re-publish the daemon's default agent profile. This is the retry
+   * endpoint for the partial-failure path of rotate/revoke: when
+   * local persistence succeeded but the implicit republish errored,
+   * the caller fixes the underlying transport / chain issue and
+   * retries here. Node-admin token only.
+   */
+  async publishAgentProfile(): Promise<{ ok: true; ual: string | null }> {
+    return this.post('/api/agent/publish-profile', {});
+  }
+
+  /**
    * V10 Random Sampling prover snapshot. Cheap; safe to poll. Returns
    * `enabled: false` when the bind layer no-op'd (edge node, no
    * identity, or chain adapter missing methods); the `loop` field is

@@ -1719,6 +1719,11 @@ export class DKGAgent {
       router: this.router,
       idempotencyStore,
       outboxStore,
+      resolvePeer: async (peerId, { signal }) => {
+        const { peerIdFromString } = await import('@libp2p/peer-id');
+        const pid = peerIdFromString(peerId);
+        await this.node.libp2p.peerRouting.findPeer(pid, { signal });
+      },
     });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
     await this.loadSwmSenderKeyState();

@@ -44,7 +44,7 @@ const config: HardhatUserConfig = {
       gas: 15_000_000,
       gasMultiplier: 1,
       blockGasLimit: 30_000_000,
-      hardfork: 'shanghai',
+      hardfork: 'cancun',
       accounts: { count: 200 },
       throwOnTransactionFailures: true,
       throwOnCallFailures: true,
@@ -91,9 +91,9 @@ const config: HardhatUserConfig = {
   solidity: {
     compilers: [
       {
-        version: '0.8.20',
+        version: '0.8.26',
         settings: {
-          evmVersion: 'london',
+          evmVersion: 'cancun',
           optimizer: {
             enabled: true,
             runs: 200,

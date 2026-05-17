@@ -469,7 +469,16 @@ describe('ACKCollector retry behavior', () => {
     expect(peerIds.has('peer-1')).toBe(false);
   });
 
-  it('timeout after ACK_TIMEOUT_MS produces storage_ack_timeout error', async () => {
+  it('fails fast with storage_ack_insufficient when transport errors exhaust enough peers (no waiting for ACK_TIMEOUT_MS)', async () => {
+    // After the fast-fail change for PR#559, the collector aborts as
+    // soon as the still-pending peer pool can no longer reach
+    // REQUIRED_ACKS — even if the failures are transport errors that
+    // burn MAX_RETRIES per peer rather than typed declines. With 3
+    // peers and need-3, the first peer exhausting its retries already
+    // makes quorum unreachable, so the collector rejects immediately
+    // (well below ACK_TIMEOUT_MS) and the per-peer retry budget is
+    // capped at MAX_RETRIES (verified by the dedicated retry test
+    // earlier in this file).
     const sendP2P = tracked(async () => { throw new Error('connection refused'); });
     const deps: ACKCollectorDeps = {
       gossipPublish: noop(),
@@ -479,12 +488,21 @@ describe('ACKCollector retry behavior', () => {
     };
     const collector = new ACKCollector(deps);
 
+    const start = Date.now();
     const err = await collector.collect(buildCollectParams()).catch((e: Error) => e);
+    const elapsed = Date.now() - start;
+
     expect(err).toBeInstanceOf(Error);
-    expect(err.message).toMatch(/storage_ack_(insufficient|timeout)/);
+    expect(err.message).toContain('storage_ack_insufficient');
+    expect(err.message).not.toContain('storage_ack_timeout');
+    expect(err.message).toContain('quorum no longer reachable');
     expect(err.message).toMatch(/0\/3/);
     expect(sendP2P.calls.length).toBeGreaterThan(0);
-    expect(sendP2P.calls).toHaveLength(9);
+    // Per-peer retry budget is bounded by MAX_RETRIES (3), so total
+    // calls across 3 peers can never exceed 9 even without fast-fail.
+    expect(sendP2P.calls.length).toBeLessThanOrEqual(9);
+    // Fast-fail must beat ACK_TIMEOUT_MS by a wide margin.
+    expect(elapsed).toBeLessThan(10_000);
   });
 });
 
@@ -1166,5 +1184,66 @@ describe('ACKCollector typed declines (#541)', () => {
     }
     expect(captured).toContain('NO_DATA_IN_SWM');
     expect(captured).not.toContain('()');
+  });
+
+  it('fails fast with storage_ack_insufficient when declines + a hung peer make quorum impossible', async () => {
+    // Codex Review on PR#559: in the mixed case where some peers
+    // decline and another hangs, the collector previously waited the
+    // full ACK_TIMEOUT_MS and emitted `storage_ack_timeout` — the new
+    // per-peer decline detail never surfaced. The fast-fail path
+    // should detect the impossible quorum the moment the second
+    // decline lands and reject right away with the decline detail.
+    const hung: string[] = [];
+    const sendP2P = async (peerId: string): Promise<Uint8Array> => {
+      if (peerId === 'peer-0' || peerId === 'peer-1') {
+        return encodeStorageACK({
+          merkleRoot: new Uint8Array(0),
+          coreNodeSignatureR: new Uint8Array(0),
+          coreNodeSignatureVS: new Uint8Array(0),
+          contextGraphId: testCGIdStr,
+          nodeIdentityId: 0,
+          declineCode: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+          declineMessage: peerId === 'peer-0'
+            ? 'no swm data for repnet-v2-official'
+            : 'no swm data for repnet-v2-official (replica missing)',
+        });
+      }
+      // peer-2 hangs forever; without fast-fail this would force the
+      // collector to wait out the full ACK_TIMEOUT_MS.
+      hung.push(peerId);
+      return new Promise<Uint8Array>(() => {});
+    };
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: sendP2P as any,
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      log: noop(),
+    };
+    const collector = new ACKCollector(deps);
+
+    const start = Date.now();
+    let captured: string | undefined;
+    try {
+      await collector.collect(buildCollectParams({ requiredACKs: 3 }));
+    } catch (err) {
+      captured = err instanceof Error ? err.message : String(err);
+    }
+    const elapsed = Date.now() - start;
+
+    expect(captured).toBeDefined();
+    expect(captured).toContain('storage_ack_insufficient');
+    expect(captured).not.toContain('storage_ack_timeout');
+    expect(captured).toContain('quorum no longer reachable');
+    // Decline detail must be present so operators can diagnose the
+    // failure from a single log line.
+    expect(captured).toContain('NO_DATA_IN_SWM');
+    expect(captured).toContain('no swm data for repnet-v2-official');
+    expect(captured).toContain('peer-0'.slice(-8));
+    expect(captured).toContain('peer-1'.slice(-8));
+
+    // Sanity check: peer-2 was actually dialled (so the hang is real)
+    // and the failure landed well below the ACK_TIMEOUT_MS budget.
+    expect(hung).toContain('peer-2');
+    expect(elapsed).toBeLessThan(5_000);
   });
 });

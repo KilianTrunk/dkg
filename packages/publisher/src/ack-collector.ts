@@ -149,14 +149,26 @@ export class ACKCollector {
     const collected: CollectedACK[] = [];
     const seenPeers = new Set<string>();
     const seenIdentityIds = new Set<bigint>();
-    // Per-peer typed declines from new core nodes — see PR#557.
-    // Declines are permanent for THIS request; the publisher records the
-    // reason, skips retries against the declining peer, and surfaces all
-    // collected reasons in the final `storage_ack_insufficient` message
-    // when quorum can't be reached. Old cores that pre-date the typed
-    // wire shape continue to throw / reset and follow the legacy retry
-    // path below — declines are strictly additive.
+    // Per-peer typed declines from core nodes that ran the StorageACK
+    // handler against the request and decided they cannot sign. The
+    // publisher records the reason, skips retries against the declining
+    // peer, and surfaces all collected reasons in the final
+    // `storage_ack_insufficient` message when quorum can't be reached.
+    // Cores that pre-date the typed wire shape continue to throw / reset
+    // and follow the legacy retry path below — declines are strictly
+    // additive on the wire.
     const declines = new Map<string, { code: string; message: string }>();
+
+    const formatDeclineDetail = (): string => {
+      if (declines.size === 0) return '';
+      const formatted = [...declines.entries()]
+        .map(([peer, { code, message }]) => {
+          const tag = `${peer.slice(-8)}→${code}`;
+          return message ? `${tag} (${message})` : tag;
+        })
+        .join('; ');
+      return ` Declines: ${formatted}.`;
+    };
 
     const requestACK = async (peerId: string): Promise<CollectedACK | null> => {
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -222,44 +234,65 @@ export class ACKCollector {
     let quorumResolve: (() => void) | undefined;
     const quorumPromise = new Promise<void>(resolve => { quorumResolve = resolve; });
 
+    // Fast-fail on impossible quorum (Codex Review on PR#559): once
+    // declines + max-retries-failures bring the still-pending pool too
+    // low to ever reach `REQUIRED_ACKS`, surface the
+    // `storage_ack_insufficient` error immediately rather than waiting
+    // out the full ACK_TIMEOUT_MS for a hung peer that — by that point
+    // — couldn't change the outcome anyway. The check is conservative
+    // (counts a still-pending peer as a potential ACK), so we never
+    // fail-fast a quorum that's still attainable.
+    let peersSettled = 0;
+    let impossibleReject: ((reason: Error) => void) | undefined;
+    const impossiblePromise = new Promise<never>((_, reject) => { impossibleReject = reject; });
+
+    const settlePeer = () => {
+      peersSettled += 1;
+      if (collected.length >= REQUIRED_ACKS) return;
+      const stillPending = corePeers.length - peersSettled;
+      if (collected.length + stillPending < REQUIRED_ACKS) {
+        impossibleReject?.(new Error(
+          `storage_ack_insufficient: got ${collected.length}/${REQUIRED_ACKS} valid ACKs after ` +
+          `${peersSettled}/${corePeers.length} core peer(s) settled — quorum no longer reachable.${formatDeclineDetail()}`,
+        ));
+      }
+    };
+
     await Promise.race([
       (async () => {
         const promises = corePeers.map(async (peerId) => {
-          if (collected.length >= REQUIRED_ACKS) return;
-          const ack = await requestACK(peerId);
-          if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
-            seenPeers.add(ack.peerId);
-            seenIdentityIds.add(ack.nodeIdentityId);
-            collected.push(ack);
-            if (collected.length >= REQUIRED_ACKS) {
-              quorumResolve?.();
-              return;
+          if (collected.length >= REQUIRED_ACKS) {
+            settlePeer();
+            return;
+          }
+          try {
+            const ack = await requestACK(peerId);
+            if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
+              seenPeers.add(ack.peerId);
+              seenIdentityIds.add(ack.nodeIdentityId);
+              collected.push(ack);
+              if (collected.length >= REQUIRED_ACKS) {
+                quorumResolve?.();
+              }
             }
+          } finally {
+            settlePeer();
           }
         });
         await Promise.race([Promise.allSettled(promises), quorumPromise]);
       })(),
+      impossiblePromise,
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms`)),
+        setTimeout(() => reject(new Error(`storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms.${formatDeclineDetail()}`)),
           ACK_TIMEOUT_MS,
         ),
       ),
     ]);
 
     if (collected.length < REQUIRED_ACKS) {
-      let detail = '';
-      if (declines.size > 0) {
-        const formatted = [...declines.entries()]
-          .map(([peer, { code, message }]) => {
-            const tag = `${peer.slice(-8)}→${code}`;
-            return message ? `${tag} (${message})` : tag;
-          })
-          .join('; ');
-        detail = ` Declines: ${formatted}.`;
-      }
       throw new Error(
         `storage_ack_insufficient: got ${collected.length}/${REQUIRED_ACKS} valid ACKs. ` +
-        `Tried ${corePeers.length} core peers.${detail}`,
+        `Tried ${corePeers.length} core peers.${formatDeclineDetail()}`,
       );
     }
 

@@ -38,6 +38,39 @@ rules:
         - tj-actions/verify-changed-files
         - tj-actions/changed-files-action
 
+  # `dangerous-triggers` — scoped exception for the Dependabot advisory
+  # gate.
+  #
+  # The advisory-gate workflow legitimately requires
+  # `pull_request_target` so it can label, comment, request-changes,
+  # and close a Dependabot PR — write operations are not available
+  # under the plain `pull_request` event when the PR was authored by
+  # `dependabot[bot]` (GitHub downgrades the `GITHUB_TOKEN` to
+  # read-only for Dependabot-authored runs). The common
+  # `pull_request_target` exploit class (privileged token executing
+  # PR-controlled code) does not apply to this workflow because:
+  #
+  #   1. There is NO `actions/checkout` step — the PR's code is
+  #      never fetched onto the runner.
+  #   2. The only PR-side input read is the Dependabot commit-message
+  #      metadata via `dependabot/fetch-metadata@<sha>` (SHA-pinned);
+  #      that metadata is signed by GitHub's Dependabot integration,
+  #      not by an arbitrary PR author.
+  #   3. The job is fenced behind a three-clause check on the PR
+  #      author identity (login + numeric id + user type), all read
+  #      from the immutable PR object — so a non-Dependabot actor
+  #      cannot reach the privileged steps in the first place.
+  #   4. Every `${{ ... }}` value that flows into a `run:` block is
+  #      routed via `env:` to close the template-injection class.
+  #
+  # Any future workflow that wants `pull_request_target` for a
+  # different reason must add its own scoped exception here with an
+  # equivalent justification — never widen this rule to a blanket
+  # skip.
+  dangerous-triggers:
+    ignore:
+      - dependabot-advisory.yml
+
   # `artipacked` (deliberate non-suppression — historical note).
   #
   # Earlier revisions of this PR carried a global `artipacked: ignore:`

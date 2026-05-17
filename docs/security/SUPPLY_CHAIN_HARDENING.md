@@ -35,25 +35,42 @@ Enforced by: `supply-chain-scan.yml` runs `zizmor --persona auditor
 
 ### 2. Every workflow declares an explicit minimum `permissions:` block
 
-`ci.yml`, `knip.yml`, and `evm-integration.yml` declare `permissions:
-contents: read` at the workflow root. `release.yml` and
-`npm-continuous-publish.yml` keep `contents: read` at root and narrow
-write scopes to the single job that needs them. `codex-review.yml` has
-always had this.
+`ci.yml`, `knip.yml`, `evm-integration.yml`, `codex-review.yml`, and
+`dependabot-advisory.yml` declare `permissions: contents: read` at the
+workflow root. `release.yml` and `npm-continuous-publish.yml` keep
+`contents: read` at root and narrow write scopes to the single job that
+needs them. `dependabot-advisory.yml` likewise narrows
+`pull-requests: write` and `issues: write` to its Dependabot-only
+advisory-check job.
 
 Why: without an explicit block, the `GITHUB_TOKEN` inherits the
 permissive legacy default. A successful code-execution exploit on any
 step then has a write-default token in the runner environment.
 
-### 3. No `pull_request_target`, `workflow_run`, or `issue_comment` triggers
+### 3. No broad dangerous triggers; one scoped `pull_request_target` exception
 
-This is verified by inspection (see the matching gh-actions audit notes
-in the v10-ui-tests PR review). `pull_request_target` is the trigger
-class TeamPCP exploited to plant the initial foothold against Aqua
-Security. We do not use it anywhere; `codex-review.yml` uses the safer
-`pull_request` event AND additionally guards on
+We do not use `workflow_run` or `issue_comment` triggers for privileged
+automation. `pull_request_target` is allowed only for
+`.github/workflows/dependabot-advisory.yml`, where the workflow needs
+write access to label, comment on, request changes on, and close
+Dependabot PRs.
+
+That exception is intentionally narrow because `pull_request_target` is
+the trigger class TeamPCP exploited to plant the initial foothold against
+Aqua Security. The Dependabot advisory gate is safe under this trigger
+because it does **not** check out or execute PR code, is fenced to the
+real Dependabot bot by login + numeric ID + account type, uses a
+SHA-pinned `dependabot/fetch-metadata` action, and routes workflow
+context into shell through `env:` rather than direct `${{ ... }}`
+interpolation.
+
+All other PR-facing automation should continue to use the safer
+`pull_request` event. For example, `codex-review.yml` uses
+`pull_request` and additionally guards on
 `github.event.pull_request.head.repo.full_name == github.repository`
-to short-circuit fork PRs.
+to short-circuit fork PRs. Any future `pull_request_target` workflow
+must add its own scoped `.github/zizmor.yml` exception with an equivalent
+security rationale.
 
 ### 4. `npm-continuous-publish.yml` separates verification, code execution, and credential access
 
@@ -382,6 +399,174 @@ The release job now:
   routing values through the env namespace closes the
   template-injection class at the parser level regardless of how the
   upstream validation evolves.
+
+### 12. Dependabot cooldown + advisory gate
+
+Two paired controls — one in `.github/dependabot.yml`, one in
+`.github/workflows/dependabot-advisory.yml` — that shrink the
+window where a freshly-published malicious dependency can be merged
+through the normal version-update cadence.
+
+**Layer 1 — Native Dependabot cooldown** (`.github/dependabot.yml`,
+`cooldown:` block on both ecosystems):
+
+| Update type | Cooldown |
+|-------------|----------|
+| Patch       | 7 days   |
+| Minor       | 7 days   |
+| Major       | 14 days  |
+| Security    | 0 (bypass — GitHub-documented: `cooldown:` only affects version updates) |
+
+Dependabot will NOT propose a version-update PR for any release
+younger than the corresponding window. The seven-day window is
+calibrated against the actual detect-to-disclose timing of the
+recent npm supply-chain incidents (event-stream, ua-parser-js,
+Lottiefiles, eslint-config-prettier malware, the September 2025
+wave): in each case the malicious version was recorded in GHSA or
+OSV within seven days of upload, and frequently within hours.
+By the time Dependabot is even *willing* to bump to a version,
+the global security-research community has had a week to flag it.
+
+The cooldown is uniform across both `npm` and `github-actions`
+ecosystems even though Actions are already SHA-pinned, because the
+cooldown gates the *underlying release* (which is what an attacker
+would tag-poison), not the pin value itself.
+
+A version that gets unpublished or recalled during its cooldown
+window is therefore **never seen by Dependabot** — there is no
+"open PR sitting in red purgatory for a week" UX. The PR is
+simply never opened against the bad release.
+
+**Layer 2 — Advisory gate workflow**
+(`.github/workflows/dependabot-advisory.yml`):
+
+A `pull_request_target` workflow that runs only on Dependabot-
+authored PRs, fenced by a three-clause actor check (PR author
+login, numeric ID, and account type — all from immutable PR
+metadata, not the easier-to-spoof `github.actor` context).
+
+For every package the PR bumps, the workflow:
+
+1. Reads the Dependabot commit-message metadata via
+   `dependabot/fetch-metadata@<sha>` (SHA-pinned).
+2. Queries the **GitHub Advisory Database** (GHSA) via GraphQL
+   for the full set of package advisories, plus **OSV.dev**
+   **twice** — once for the new version, once for the old. Two
+   independent advisory feeds catch advisories that one misses.
+3. Filters every advisory against the new AND old versions of
+   the package using a **vendored** minimal range-check helper
+   written to `${RUNNER_TEMP}/semver-mini/index.js` by the
+   workflow itself (no `npm install`). The helper handles the
+   subset of range syntax GHSA and OSV emit (AND-conjunctions of
+   `>=, <=, >, <, =, ==`, comma-separated or space-separated, with
+   optional `v` prefix and stripped pre-release suffix) and
+   returns `null` from `validRange()` on anything outside that
+   subset so the caller falls through to "treat as match" — false
+   positives are acceptable, false negatives would defeat the
+   gate. The vendored helper avoids an `npm install semver` on a
+   privileged `pull_request_target` runner, which would otherwise
+   re-introduce the exact supply-chain hop this workflow exists
+   to close. It has been cross-verified against canonical
+   `semver@7.6.3` on every real-world GHSA range shape we have
+   sampled.
+4. Computes a **diff** between the new-version hit set and the
+   old-version hit set. An advisory that already matched the
+   *previous* version is treated as pre-existing baseline (the
+   team already accepted that risk by virtue of shipping the
+   previous version); only advisories that are **fresh to this
+   bump** (`matchesNew && !matchesOld`) drive the verdict. Without
+   this filter, a long-standing CVE like `GHSA-r5fr-rjxr-66jc`
+   against lodash (spans `>= 4.0.0, <= 4.17.23` — i.e. effectively
+   every version) would auto-close every Dependabot PR that
+   touches lodash, training reviewers to ignore the gate.
+5. Classifies as **clean**, **compromised**, or **inconclusive**
+   (inconclusive only when at least one API call errored, OR
+   when Dependabot metadata lacks a `newVersion` — failing
+   closed so a network blip or a malformed event can never be
+   misread as "no advisories found").
+
+A compromised verdict triggers a six-step response, ordered so
+in-PR visibility (comment, labels) lands before potentially-
+fragile network calls (Teams). The full response:
+
+1. **Red banner comment** on the PR with the advisory table,
+   advisory IDs, and explicit "do not reopen unless retracted"
+   guidance. Composed via a single block redirect (heredoc +
+   `printf` for dynamic content) so partial step failures still
+   leave the comment intact.
+2. **Labels applied**: `compromised`, `do-not-merge`, `security`
+   (auto-created if missing).
+3. **Request-changes review** posted from `github-actions[bot]`.
+   This flips GitHub's merge button to a "Changes requested —
+   merging is blocked" warning even when no branch-protection
+   ruleset names this check as required.
+4. **Teams notification** via webhook (Adaptive Card payload to
+   the URL stored in `V10_TEAMS_HOOK`; same naming convention as
+   the existing `V9_TEAMS_HOOK` channel that the e2e suite already
+   uses). Fires ONLY on confirmed compromise — never on
+   inconclusive runs or successful runs, to keep the channel
+   signal-to-noise high.
+5. **PR auto-closed** with a closing comment that references the
+   pinned banner.
+6. A **second job** named
+   `🚨 DO NOT MERGE — COMPROMISED DEPENDENCY DETECTED` runs and
+   immediately fails. The job name is the user-visible signal —
+   it appears next to the regular `Advisory check` entry in the
+   PR check list and is impossible to miss. This is the "dynamic
+   check name" outcome expressed via a conditional second job
+   (cleaner than minting a check run via the Checks API; no extra
+   credentials required).
+
+Inconclusive runs (advisory API unreachable) post a
+"`⚠️ Advisory gate inconclusive`" comment and fail the check, but
+do NOT send a Teams notification. Operational failure of the gate
+itself is a transient signal that should not wake the on-call
+channel.
+
+#### Setup — Teams webhook (one-time)
+
+The workflow reads from the repository secret `V10_TEAMS_HOOK`,
+which is already configured on `OriginTrail/dkg` (matching the
+existing `V9_TEAMS_HOOK` naming convention used by the e2e
+notification pipeline). The Power Automate flow on the Teams
+side is configured separately by whoever owns the v10 channel.
+
+If the secret is ever cleared, the workflow logs a `::notice::`
+and skips the Teams step; every other compromise-response action
+(comment, labels, review, close, dynamic check name) still runs.
+To restore Teams notifications, the channel owner regenerates the
+Power Automate trigger URL and the maintainer updates the
+`V10_TEAMS_HOOK` repository secret. (Microsoft retired the legacy
+"Office 365 Connector" webhooks at the end of 2025; the
+Power-Automate "When an HTTP request is received" trigger is the
+supported replacement and produces a URL of the form
+`https://default<id>.<region>.logic.azure.com/.../triggers/manual/paths/invoke?api-version=…&sig=…`.)
+
+#### Scope and boundaries
+
+What this layer **does**:
+
+- Surfaces every public-advisory hit on a Dependabot-bumped
+  version, visibly and unmissably.
+- Auto-closes the PR so the merge button cannot be clicked by
+  accident.
+- Sends one targeted alert per confirmed compromise.
+
+What this layer **does not** do:
+
+- It is not a *required status check*. Without the corresponding
+  branch-protection ruleset toggle (an admin-only step which is
+  out of scope for the PR introducing this workflow), a reviewer
+  with `write` rights can still technically force-merge past a
+  red check. The combined response (auto-close + request-changes
+  + label + scary check name + Teams alert) makes this
+  vanishingly unlikely in practice but is not enforced at the
+  GitHub-platform level.
+- It does **not** catch attacks that are not (yet) recorded in
+  GHSA or OSV — the residual exposure of a silent / undisclosed
+  attack older than the cooldown window. Closing that gap
+  requires a behaviour-scanning tool (Socket.dev, Phylum, or
+  equivalent) and is tracked as a separate follow-up.
 
 ---
 

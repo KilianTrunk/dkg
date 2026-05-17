@@ -87,8 +87,11 @@ export {
 
 export {
   type StorageACKMsg,
+  type StorageACKDeclineCode,
+  STORAGE_ACK_DECLINE_CODES,
   encodeStorageACK,
   decodeStorageACK,
+  isStorageACKDecline,
 } from './storage-ack.js';
 
 export {

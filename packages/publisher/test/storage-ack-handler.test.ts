@@ -6,6 +6,7 @@ import {
 } from '../src/merkle.js';
 import {
   encodePublishIntent, decodeStorageACK, computePublishACKDigest,
+  isStorageACKDecline, STORAGE_ACK_DECLINE_CODES,
 } from '@origintrail-official/dkg-core';
 import { TypedEventBus } from '@origintrail-official/dkg-core';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
@@ -111,7 +112,11 @@ describe('StorageACKHandler', () => {
     expect(recovered.toLowerCase()).toBe(coreWallet.address.toLowerCase());
   });
 
-  it('refuses to sign when the signer is no longer confirmed registered', async () => {
+  it('declines (SIGNER_NOT_REGISTERED) when the signer is no longer confirmed registered', async () => {
+    // PR #557: this used to throw, which the publisher saw as a libp2p
+    // stream reset; now the handler returns a typed decline so the
+    // collector can record the reason and skip retries against this
+    // peer.
     const handler = await createHandler(swmQuads, {
       isSignerRegistered: async () => false,
     });
@@ -128,9 +133,11 @@ describe('StorageACKHandler', () => {
       merkleLeafCount: swmMerkleLeafCount,
     });
 
-    await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
-      'StorageACK signer is not confirmed on-chain as an operational wallet',
-    );
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED);
+    expect(decoded.declineMessage).toContain('not confirmed on-chain');
   });
 
   it('refuses to sign when signer registration lookup fails', async () => {
@@ -161,7 +168,11 @@ describe('StorageACKHandler', () => {
     expect(unregistered).not.toHaveBeenCalled();
   });
 
-  it('rejects when SWM has no data', async () => {
+  it('declines (NO_DATA_IN_SWM) when SWM has no data', async () => {
+    // PR #557: this is the exact #541 path. Used to throw → stream reset
+    // → publisher retried 3× → quorum failed → on-chain
+    // MinSignaturesRequirementNotMet. Now decline → publisher records
+    // the reason and surfaces it in the final error.
     const handler = await createHandler([]);
     const intent = encodePublishIntent({
       merkleRoot,
@@ -173,11 +184,15 @@ describe('StorageACKHandler', () => {
       rootEntities: ['urn:entity:1'],
     });
 
-    await expect(handler.handler(intent, fakePeerId))
-      .rejects.toThrow('No data found in SWM');
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
+    expect(decoded.declineMessage).toContain('No data found in SWM');
+    expect(decoded.declineMessage).toContain('urn:entity:1');
   });
 
-  it('rejects when merkle root does not match', async () => {
+  it('declines (MERKLE_MISMATCH_IN_SWM) when SWM data does not match the publisher merkle root', async () => {
     const differentQuads = [makeQuad('urn:other', 'urn:p', 'urn:val')];
     const handler = await createHandler(differentQuads);
 
@@ -191,8 +206,11 @@ describe('StorageACKHandler', () => {
       rootEntities: [],
     });
 
-    await expect(handler.handler(intent, fakePeerId))
-      .rejects.toThrow('Merkle root mismatch');
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM);
+    expect(decoded.declineMessage).toContain('Merkle root mismatch');
   });
 
   it('rejects non-core node role', async () => {

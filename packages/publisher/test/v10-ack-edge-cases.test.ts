@@ -5,7 +5,7 @@ import {
   computeFlatKCRootV10 as computeFlatKCRoot,
   computeFlatKCMerkleLeafCountV10,
 } from '../src/merkle.js';
-import { encodeStorageACK, computePublishACKDigest, encodePublishIntent, decodeStorageACK } from '@origintrail-official/dkg-core';
+import { encodeStorageACK, computePublishACKDigest, encodePublishIntent, decodeStorageACK, STORAGE_ACK_DECLINE_CODES, isStorageACKDecline } from '@origintrail-official/dkg-core';
 import { ethers } from 'ethers';
 import { OxigraphStore, type Quad, type TripleStore } from '@origintrail-official/dkg-storage';
 
@@ -581,7 +581,12 @@ describe('StorageACKHandler inline verification', () => {
     expect(ack.contextGraphId).toBe(testCGIdStr);
   });
 
-  it('SWM fallback: rejects when no data in SWM graph', async () => {
+  it('SWM fallback: declines (NO_DATA_IN_SWM) when no data in SWM graph', async () => {
+    // Pre-decline this would `throw`, which the publisher saw as a libp2p
+    // stream reset (the GitHub #541 failure mode). Now the handler returns
+    // a typed decline so the publisher's collector can record the reason
+    // and surface it in the final error without retrying against this
+    // peer or timing out the stream.
     const store = createRecordingStore([]);
     const handler = new StorageACKHandler(store, createConfig(), makeEventBus() as any);
 
@@ -596,12 +601,17 @@ describe('StorageACKHandler inline verification', () => {
       rootEntities: ['urn:a'],
     });
 
-    await expect(handler.handler(intent, fakePeerId))
-      .rejects.toThrow('No data found in SWM');
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
+    expect(decoded.declineMessage).toContain('No data found in SWM');
+    expect(decoded.declineMessage).toContain('urn:a');
+    expect(decoded.contextGraphId).toBe(testCGIdStr);
     expect(store.query.calls.length).toBeGreaterThan(0);
   });
 
-  it("SWM fallback: rejects when merkle root doesn't match SWM data", async () => {
+  it("SWM fallback: declines (MERKLE_MISMATCH_IN_SWM) when merkle root doesn't match SWM data", async () => {
     const differentQuads = [makeQuad('urn:other', 'urn:p', 'urn:v')];
     const store = createRecordingStore(differentQuads);
     const handler = new StorageACKHandler(store, createConfig(), makeEventBus() as any);
@@ -617,9 +627,113 @@ describe('StorageACKHandler inline verification', () => {
       rootEntities: [],
     });
 
-    await expect(handler.handler(intent, fakePeerId))
-      .rejects.toThrow('Merkle root mismatch');
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM);
+    expect(decoded.declineMessage).toContain('Merkle root mismatch');
     expect(store.query.calls.length).toBeGreaterThan(0);
+  });
+
+  it('declines (CG_ID_INVALID) when intent contextGraphId is non-numeric', async () => {
+    const store = createRecordingStore(testQuads);
+    const handler = new StorageACKHandler(store, createConfig(), makeEventBus() as any);
+
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId: 'not-a-number',
+      publisherPeerId: 'pub-0',
+      publicByteSize: 300,
+      isPrivate: false,
+      kaCount: 2,
+      merkleLeafCount: testMerkleLeafCount,
+      rootEntities: [],
+      stagingQuads: new TextEncoder().encode(quadsToNQuads(testQuads)),
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.CG_ID_INVALID);
+    expect(decoded.declineMessage).toContain('numeric on-chain context graph id');
+    expect(decoded.contextGraphId).toBe('not-a-number');
+  });
+
+  it('declines (CG_ID_INVALID) when intent contextGraphId is "0"', async () => {
+    const store = createRecordingStore(testQuads);
+    const handler = new StorageACKHandler(store, createConfig(), makeEventBus() as any);
+
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId: '0',
+      publisherPeerId: 'pub-0',
+      publicByteSize: 300,
+      isPrivate: false,
+      kaCount: 2,
+      merkleLeafCount: testMerkleLeafCount,
+      rootEntities: [],
+      stagingQuads: new TextEncoder().encode(quadsToNQuads(testQuads)),
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.CG_ID_INVALID);
+    expect(decoded.declineMessage).toContain('positive on-chain context graph id');
+  });
+
+  it('declines (SIGNER_NOT_REGISTERED) when isSignerRegistered returns false', async () => {
+    const store = createRecordingStore(testQuads);
+    const onUnregistered = tracked(() => {});
+    const handler = new StorageACKHandler(
+      store,
+      createConfig({
+        isSignerRegistered: async () => false,
+        onSignerUnregistered: onUnregistered,
+      }),
+      makeEventBus() as any,
+    );
+
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId: testCGIdStr,
+      publisherPeerId: 'pub-0',
+      publicByteSize: 300,
+      isPrivate: false,
+      kaCount: 2,
+      merkleLeafCount: testMerkleLeafCount,
+      rootEntities: [],
+      stagingQuads: new TextEncoder().encode(quadsToNQuads(testQuads)),
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED);
+    expect(onUnregistered.calls).toHaveLength(1);
+  });
+
+  it('still throws (no decline) when stagingQuads merkle root mismatches — true publisher protocol error', async () => {
+    // Inline-staging mismatch is a publisher-side bug (not a network state
+    // mismatch), so the connection-level reset path is still appropriate
+    // — keep the legacy throw to match the existing protocol semantics.
+    const store = createRecordingStore([]);
+    const handler = new StorageACKHandler(store, createConfig(), makeEventBus() as any);
+    const wrongPayload = [makeQuad('urn:wrong', 'urn:p', 'urn:v')];
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId: testCGIdStr,
+      publisherPeerId: 'pub-0',
+      publicByteSize: 300,
+      isPrivate: false,
+      kaCount: 1,
+      merkleLeafCount: testMerkleLeafCount,
+      rootEntities: [],
+      stagingQuads: new TextEncoder().encode(quadsToNQuads(wrongPayload)),
+    });
+
+    await expect(handler.handler(intent, fakePeerId))
+      .rejects.toThrow('Merkle root mismatch (inline quads)');
   });
 });
 
@@ -893,5 +1007,164 @@ describe('StorageACKHandler signature format', () => {
       ? BigInt(ack.nodeIdentityId)
       : BigInt(ack.nodeIdentityId.low) | (BigInt(ack.nodeIdentityId.high) << 32n);
     expect(identityId).toBe(coreIdentityId);
+  });
+});
+
+// ── ACKCollector typed declines (PR2 / GitHub issue #541) ────────────────
+//
+// New cores can now respond with a typed decline (e.g. NO_DATA_IN_SWM)
+// instead of throwing into the libp2p stream. The collector must:
+//
+//  - record the decline reason per-peer
+//  - NOT retry against a declining peer (decline is permanent for the
+//    request)
+//  - still reach quorum if other peers ACK
+//  - on quorum failure, surface every per-peer decline reason in the
+//    `storage_ack_insufficient` error so operators can diagnose
+//    hosting / replication issues from a single log line
+//
+// Old cores that still throw / reset the stream continue to follow the
+// legacy retry path (see "ACKCollector retry behavior" above).
+
+describe('ACKCollector typed declines (#541)', () => {
+  /** Build a sendP2P that returns a decline for declinePeerIds and ACK otherwise. */
+  function buildSendP2PWithDeclines(
+    declinePeerIds: Record<string, { code: string; message: string }>,
+    ackBuilder: (peerId: string) => Promise<Uint8Array> = buildSendP2P(),
+  ): (peerId: string) => Promise<Uint8Array> {
+    return async (peerId: string) => {
+      const decline = declinePeerIds[peerId];
+      if (decline) {
+        return encodeStorageACK({
+          merkleRoot: new Uint8Array(0),
+          coreNodeSignatureR: new Uint8Array(0),
+          coreNodeSignatureVS: new Uint8Array(0),
+          contextGraphId: testCGIdStr,
+          nodeIdentityId: 0,
+          declineCode: decline.code,
+          declineMessage: decline.message,
+        });
+      }
+      return ackBuilder(peerId);
+    };
+  }
+
+  it('quorum still reached when some peers decline; declining peers are NOT retried', async () => {
+    const sendCounts = new Map<string, number>();
+    const sendP2P = tracked(async (peerId: string) => {
+      sendCounts.set(peerId, (sendCounts.get(peerId) ?? 0) + 1);
+      const inner = buildSendP2PWithDeclines({
+        'peer-0': { code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM, message: 'no swm data for repnet-v2-official' },
+        'peer-3': { code: STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM, message: 'stale data' },
+      });
+      return inner(peerId);
+    });
+
+    const log = noop();
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: sendP2P as any,
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2', 'peer-3', 'peer-4'],
+      log,
+    };
+    const collector = new ACKCollector(deps);
+
+    const result = await collector.collect(buildCollectParams({ requiredACKs: 3 }));
+    expect(result.acks).toHaveLength(3);
+
+    const ackedPeerIds = new Set(result.acks.map((a) => a.peerId));
+    expect(ackedPeerIds.has('peer-0')).toBe(false);
+    expect(ackedPeerIds.has('peer-3')).toBe(false);
+
+    expect(sendCounts.get('peer-0')).toBe(1);
+    expect(sendCounts.get('peer-3')).toBe(1);
+
+    expect(log.calls.some(
+      (c: unknown[]) => (c[0] as string).includes('Decline from peer-0')
+        && (c[0] as string).includes('NO_DATA_IN_SWM'),
+    )).toBe(true);
+    expect(log.calls.some(
+      (c: unknown[]) => (c[0] as string).includes('Decline from peer-3')
+        && (c[0] as string).includes('MERKLE_MISMATCH_IN_SWM'),
+    )).toBe(true);
+  });
+
+  it('storage_ack_insufficient error surfaces every per-peer decline reason', async () => {
+    const sendP2P = buildSendP2PWithDeclines({
+      'peer-0': { code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM, message: 'no swm data for repnet-v2-official' },
+      'peer-1': { code: STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM, message: 'have 2 triples; root differs' },
+      'peer-2': { code: STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED, message: 'rotated' },
+      'peer-3': { code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM, message: 'cold cache' },
+    });
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: sendP2P as any,
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2', 'peer-3'],
+      log: noop(),
+    };
+    const collector = new ACKCollector(deps);
+
+    let captured: string | undefined;
+    try {
+      await collector.collect(buildCollectParams({ requiredACKs: 3 }));
+    } catch (err) {
+      captured = err instanceof Error ? err.message : String(err);
+    }
+
+    expect(captured).toBeDefined();
+    expect(captured).toContain('storage_ack_insufficient');
+    expect(captured).toContain('NO_DATA_IN_SWM');
+    expect(captured).toContain('MERKLE_MISMATCH_IN_SWM');
+    expect(captured).toContain('SIGNER_NOT_REGISTERED');
+    expect(captured).toContain('no swm data for repnet-v2-official');
+    expect(captured).toContain('peer-0'.slice(-8));
+    expect(captured).toContain('peer-2'.slice(-8));
+  });
+
+  it('an unknown decline code is logged and skipped (forward-compat with future codes)', async () => {
+    const sendP2P = buildSendP2PWithDeclines({
+      'peer-0': { code: 'CG_NOT_HOSTED_FUTURE_VARIANT', message: 'reserved for follow-up' },
+    });
+    const log = noop();
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: sendP2P as any,
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2', 'peer-3'],
+      log,
+    };
+    const collector = new ACKCollector(deps);
+
+    const result = await collector.collect(buildCollectParams({ requiredACKs: 3 }));
+    expect(result.acks).toHaveLength(3);
+    expect(result.acks.find((a) => a.peerId === 'peer-0')).toBeUndefined();
+
+    expect(log.calls.some(
+      (c: unknown[]) => (c[0] as string).includes('Decline from peer-0')
+        && (c[0] as string).includes('CG_NOT_HOSTED_FUTURE_VARIANT'),
+    )).toBe(true);
+  });
+
+  it('a decline with empty message is still recorded (just code, no parens)', async () => {
+    const sendP2P = buildSendP2PWithDeclines({
+      'peer-0': { code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM, message: '' },
+      'peer-1': { code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM, message: '' },
+      'peer-2': { code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM, message: '' },
+    });
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: sendP2P as any,
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      log: noop(),
+    };
+    const collector = new ACKCollector(deps);
+
+    let captured: string | undefined;
+    try {
+      await collector.collect(buildCollectParams({ requiredACKs: 3 }));
+    } catch (err) {
+      captured = err instanceof Error ? err.message : String(err);
+    }
+    expect(captured).toContain('NO_DATA_IN_SWM');
+    expect(captured).not.toContain('()');
   });
 });

@@ -17,6 +17,8 @@ import {
   decodePublishIntent,
   encodeStorageACK,
   decodeStorageACK,
+  isStorageACKDecline,
+  STORAGE_ACK_DECLINE_CODES,
 } from '@origintrail-official/dkg-core';
 import { ACKCollector, type ACKCollectorDeps } from '../src/ack-collector.js';
 import { StorageACKHandler, type StorageACKHandlerConfig } from '../src/storage-ack-handler.js';
@@ -966,7 +968,7 @@ describe('V10 StorageACKHandler round-trip', () => {
       .rejects.toThrow('Merkle root mismatch');
   });
 
-  it('handler rejects empty stagingQuads', async () => {
+  it('handler declines (NO_DATA_IN_SWM) on empty stagingQuads + empty SWM', async () => {
     const handler = createHandler(createRecordingStore([]));
     const emptyNTriples = '';
     const stagingBytes = new TextEncoder().encode(emptyNTriples);
@@ -984,15 +986,15 @@ describe('V10 StorageACKHandler round-trip', () => {
     });
 
     // Empty staging bytes have length 0, which takes the SWM fallback
-    // path; with no SWM data either, the handler rejects with "No data
-    // found in SWM" (or an equivalent empty-input rejection). Pin the
-    // rejection vocabulary — a bare `rejects.toThrow()` would also be
-    // satisfied by a setup crash (e.g. protobuf decode failure) which
-    // would hide a real regression where empty input is silently
-    // accepted and an empty commit is broadcast.
-    await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
-      /no data found in swm|empty|no.*staging|no.*quads/i,
-    );
+    // path; with no SWM data either, PR #557 has the handler return a
+    // typed decline (NO_DATA_IN_SWM) instead of throwing. The decline
+    // code pins the failure mode: a bare positive assertion would also
+    // be satisfied by a default-constructed ACK in the response, which
+    // would let an empty commit slip through.
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
   });
 
   it('handler rejects stagingQuads > 4MB', async () => {

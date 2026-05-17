@@ -3,6 +3,7 @@ import {
   encodePublishIntent,
   decodeStorageACK,
   computePublishACKDigest,
+  isStorageACKDecline,
   type PublishIntentMsg,
   type StorageACKMsg,
 } from '@origintrail-official/dkg-core';
@@ -148,12 +149,31 @@ export class ACKCollector {
     const collected: CollectedACK[] = [];
     const seenPeers = new Set<string>();
     const seenIdentityIds = new Set<bigint>();
+    // Per-peer typed declines from new core nodes — see PR#557.
+    // Declines are permanent for THIS request; the publisher records the
+    // reason, skips retries against the declining peer, and surfaces all
+    // collected reasons in the final `storage_ack_insufficient` message
+    // when quorum can't be reached. Old cores that pre-date the typed
+    // wire shape continue to throw / reset and follow the legacy retry
+    // path below — declines are strictly additive.
+    const declines = new Map<string, { code: string; message: string }>();
 
     const requestACK = async (peerId: string): Promise<CollectedACK | null> => {
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
           const response = await this.deps.sendP2P(peerId, PROTOCOL_STORAGE_ACK, intentBytes);
           const ack: StorageACKMsg = decodeStorageACK(response);
+
+          if (isStorageACKDecline(ack)) {
+            const code = ack.declineCode ?? 'UNKNOWN';
+            const declineMessage = ack.declineMessage ?? '';
+            declines.set(peerId, { code, message: declineMessage });
+            log(
+              `[ACKCollector] Decline from ${peerId.slice(-8)}: ${code}` +
+              (declineMessage ? ` — ${declineMessage}` : ''),
+            );
+            return null;
+          }
 
           const recoveredAddress = this.recoverACKSigner(ack, ackDigest);
           if (!recoveredAddress) {
@@ -227,9 +247,19 @@ export class ACKCollector {
     ]);
 
     if (collected.length < REQUIRED_ACKS) {
+      let detail = '';
+      if (declines.size > 0) {
+        const formatted = [...declines.entries()]
+          .map(([peer, { code, message }]) => {
+            const tag = `${peer.slice(-8)}→${code}`;
+            return message ? `${tag} (${message})` : tag;
+          })
+          .join('; ');
+        detail = ` Declines: ${formatted}.`;
+      }
       throw new Error(
         `storage_ack_insufficient: got ${collected.length}/${REQUIRED_ACKS} valid ACKs. ` +
-        `Tried ${corePeers.length} core peers.`,
+        `Tried ${corePeers.length} core peers.${detail}`,
       );
     }
 

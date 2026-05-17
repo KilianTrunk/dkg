@@ -169,8 +169,8 @@ is idempotent at the app layer) or surface a terminal error.
 | `/dkg/10.0.1/private-access`    | PR-8        | 1             | Batch with `/swm-sender-key`.                                                      |
 | `/dkg/10.0.1/query-remote`      | PR-9        | 1             | First caller exercising RESPONSE_GONE retry path.                                  |
 | `/dkg/10.0.1/join-request`      | PR-10       | 1             | Removes `JoinApprovalRetryQueue` in favour of generic outbox.                      |
-| `/dkg/10.0.1/storage-ack`       | PR-11       | 1             | ACKCollector quorum stays untouched; only the transport swaps.                     |
-| `/dkg/10.0.1/verify-proposal`   | PR-11       | 1             | Same shape as storage-ack.                                                         |
+| `/dkg/10.0.1/storage-ack`       | PR-11 ✅     | **1**         | App-level quorum (`ACKCollector`) untouched; transport sendP2P → `messenger.sendReliable`. `parallelPaths=1` (transport-side; app already fans out to N core peers — `parallelPaths>1` would 9x the wire load for no SLO win). Substrate `queued` returns surface as a per-peer throw, picked up by `ACKCollector`'s `MAX_RETRIES=3` loop. |
+| `/dkg/10.0.1/verify-proposal`   | PR-11 ✅     | **1**         | Same shape + same rationale as `/storage-ack` — app-level quorum (`VerifyCollector`) untouched; only the transport swaps. `parallelPaths=1` for the same amplification reason. |
 
 ## Recovery primitives
 

@@ -20,9 +20,17 @@ export const PROTOCOL_SWM_SENDER_KEY = '/dkg/10.0.0/swm-sender-key';
 
 export const PROTOCOL_JOIN_REQUEST = '/dkg/10.0.0/join-request';
 
-export const PROTOCOL_VERIFY_PROPOSAL = '/dkg/10.0.0/verify-proposal';
+// rc.9 PR-11: bumped from /dkg/10.0.0/* to opt into the Universal
+// Messenger substrate. ACKCollector + VerifyCollector keep their
+// existing app-level fan-out + quorum semantics; substrate gives
+// them envelope-versioned wire + receiver-side dedup + sender
+// idempotency under the hood. Default `parallelPaths` for these two
+// is intentionally **1** (the app already fans out; parallelPaths>1
+// would 9x amplify the wire load with no SLO win — see plan PR-4
+// runtime guard + PR-11 rationale).
+export const PROTOCOL_VERIFY_PROPOSAL = '/dkg/10.0.1/verify-proposal';
 export const PROTOCOL_VERIFY_APPROVAL = '/dkg/10.0.0/verify-approval';
-export const PROTOCOL_STORAGE_ACK = '/dkg/10.0.0/storage-ack';
+export const PROTOCOL_STORAGE_ACK = '/dkg/10.0.1/storage-ack';
 
 export const DHT_PROTOCOL = '/dkg/kad/1.0.0';
 

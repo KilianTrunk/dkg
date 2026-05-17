@@ -890,8 +890,18 @@ export async function runDaemonInner(
           // integration test covering ACK quorum collection + the
           // ackTransportFactory hot path before the prefix bump
           // lands.
+          // rc.9 PR-11: /storage-ack + /verify-proposal migrated to
+          // /dkg/10.0.1/* and now route through messenger.sendReliable
+          // (envelope wrap + sender-side idempotency + durable
+          // outbox). queued surfaces as a thrown transport error so
+          // ACKCollector's MAX_RETRIES loop + per-peer skip semantics
+          // kick in unchanged.
           sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
-            return agent.messenger.sendToPeer(peerId, protocol, data);
+            const sendResult = await agent.messenger.sendReliable(peerId, protocol, data);
+            if (!sendResult.delivered) {
+              throw new Error(`substrate queued (transport): ${sendResult.error}`);
+            }
+            return sendResult.response;
           },
           getConnectedCorePeers: () => {
             const allPeers = agent.node.libp2p

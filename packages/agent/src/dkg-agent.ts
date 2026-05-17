@@ -1923,6 +1923,10 @@ export class DKGAgent {
                 if (storageACKFailoverInFlight) return;
                 storageACKFailoverInFlight = true;
                 storageACKProtocolRegistered = false;
+                // rc.9 PR-11: messenger.register stored the handler
+                // in the substrate's wrapper which delegates to
+                // router.register under the hood (see Messenger.register
+                // implementation), so router.unregister still removes it.
                 this.router.unregister(PROTOCOL_STORAGE_ACK);
                 this.log.warn(
                   attemptCtx,
@@ -1958,7 +1962,14 @@ export class DKGAgent {
                 );
               },
             }, this.eventBus);
-            this.router.register(PROTOCOL_STORAGE_ACK, ackHandler.handler);
+            // rc.9 PR-11: migrated onto the Universal Messenger
+            // substrate (wire prefix /dkg/10.0.1/storage-ack).
+            // messenger.register handles envelope decode + receiver
+            // dedup; ackHandler's signature stays the same.
+            this.messenger.register(PROTOCOL_STORAGE_ACK, async (data, peerIdStr) => {
+              const peerId = { toString: () => peerIdStr, toBytes: () => new Uint8Array() };
+              return ackHandler.handler(data, peerId);
+            });
             storageACKProtocolRegistered = true;
             this.clearStorageACKRegistrationRetry();
             this.log.info(
@@ -2051,7 +2062,13 @@ export class DKGAgent {
           return onChainId ? BigInt(onChainId) : null;
         },
       });
-      this.router.register(PROTOCOL_VERIFY_PROPOSAL, verifyHandler.handler);
+      // rc.9 PR-11: migrated onto the Universal Messenger substrate
+      // (wire prefix /dkg/10.0.1/verify-proposal). messenger.register
+      // wraps the handler with envelope decode + receiver dedup.
+      this.messenger.register(PROTOCOL_VERIFY_PROPOSAL, async (data, peerIdStr) => {
+        const peerId = { toString: () => peerIdStr, toBytes: () => new Uint8Array() };
+        return verifyHandler.handler(data, peerId);
+      });
       this.log.info(ctx, 'Registered VERIFY proposal handler');
     }
 
@@ -11053,7 +11070,19 @@ export class DKGAgent {
 
     // 5. Collect M-of-N approvals
     const collector = new VerifyCollector({
-      sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => this.messenger.sendToPeer(peerId, protocol, data),
+      // rc.9 PR-11: route through messenger.sendReliable so
+      // /dkg/10.0.1/verify-proposal gets envelope wrap + sender-side
+      // idempotency. App-level fan-out via VerifyCollector is
+      // unchanged; queued is treated as a per-peer failure (caller
+      // moves on to the next peer; substrate keeps the queued entry
+      // in the outbox for diagnostics).
+      sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
+        const sendResult = await this.messenger.sendReliable(peerId, protocol, data);
+        if (!sendResult.delivered) {
+          throw new Error(`substrate queued (transport): ${sendResult.error}`);
+        }
+        return sendResult.response;
+      },
       getParticipantPeers: (cgId?: string) => {
         const allPeers = this.node.libp2p.getPeers().map(p => p.toString()).filter(id => id !== this.peerId);
         // TODO: Filter by on-chain participant set once getContextGraphParticipants() is available.
@@ -13961,8 +13990,17 @@ export class DKGAgent {
       gossipPublish: async (topic: string, data: Uint8Array) => {
         await this.gossip.publish(topic, data);
       },
+      // rc.9 PR-11: ACKCollector now routes through messenger.send
+      // Reliable so /dkg/10.0.1/storage-ack gets envelope wrap +
+      // sender-side idempotency. ACKCollector's own MAX_RETRIES=3 loop
+      // sits on top; queued counts as a per-peer failure that the
+      // collector handles via its existing retry-then-skip path.
       sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
-        return this.messenger.sendToPeer(peerId, protocol, data);
+        const sendResult = await this.messenger.sendReliable(peerId, protocol, data);
+        if (!sendResult.delivered) {
+          throw new Error(`substrate queued (transport): ${sendResult.error}`);
+        }
+        return sendResult.response;
       },
       getConnectedCorePeers: () => {
         const peers = this.node.libp2p.getPeers();

@@ -58,6 +58,8 @@ import {
   type SwmSenderKeyMessageMsg,
   type SwmSenderKeyPackageMsg,
   type WorkspaceRecipientEncryptionKey,
+  type MessageIdempotencyStore,
+  type ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
@@ -956,6 +958,26 @@ export interface DKGAgentConfig {
   contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;
   /** Durable local cache for nodes/agents known to be members of a context graph. */
   contextGraphMembershipStore?: ContextGraphMembershipStore;
+  /**
+   * Universal Messenger substrate stores (rc.9 plan PR-2). When
+   * supplied, the `Messenger` instance gets durable receiver-side
+   * idempotency + sender-side outbox semantics for every caller that
+   * switches to `messenger.sendReliable` (the migration starts in
+   * PR-3 with chat + skill). When omitted, the Messenger runs in
+   * legacy pass-through mode — backwards-compatible for callers
+   * still on `/dkg/10.0.0/*`.
+   *
+   * Production: `cli/src/daemon/lifecycle.ts` wires
+   * `SqliteMessageIdempotencyStore` + `SqliteProtocolOutboxStore`
+   * against the shared `DashboardDB`.
+   *
+   * Tests: pass `InMemoryMessageIdempotencyStore` +
+   * `InMemoryProtocolOutboxStore` from `@origintrail-official/dkg-core`.
+   */
+  messengerStores?: {
+    idempotencyStore: MessageIdempotencyStore;
+    outboxStore: ProtocolOutboxStore;
+  };
 }
 
 function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
@@ -1207,6 +1229,15 @@ export class DKGAgent {
    */
   private readonly messageOutbox: MessageOutbox = new MessageOutbox();
   private messageOutboxTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Periodic tick driving `Messenger.processOutboxTick` for the
+   * Universal Messenger substrate outbox. Independent from
+   * `messageOutboxTimer` (chat-specific) so PR-3's deletion of the
+   * chat outbox doesn't accidentally take the substrate tick with
+   * it. Shares the cadence (`MESSAGE_OUTBOX_TICK_MS`) for operator
+   * visibility.
+   */
+  private messengerOutboxTimer: ReturnType<typeof setInterval> | null = null;
   private randomSamplingHandle: RandomSamplingHandle | null = null;
   private randomSamplingBindRetryTimer: ReturnType<typeof setInterval> | null = null;
   private randomSamplingBindRetryInFlight = false;
@@ -1680,7 +1711,10 @@ export class DKGAgent {
     });
     this.peerResolver = peerResolver;
     this.router = new ProtocolRouter(this.node, { peerResolver });
-    this.messenger = new Messenger({ router: this.router });
+    this.messenger = new Messenger({
+      router: this.router,
+      ...(this.config.messengerStores ?? {}),
+    });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
     await this.loadSwmSenderKeyState();
     await this.rehydrateContextGraphSubscriptions();
@@ -2416,6 +2450,17 @@ export class DKGAgent {
           const message = err instanceof Error ? err.message : String(err);
           this.log.warn(ctx, `Opportunistic message-outbox retry on connect failed for ${remotePeer}: ${message}`);
         }
+        // Universal Messenger substrate (rc.9 PR-2): drain the
+        // generic outbox for this peer on the same connection:open
+        // signal. No-op until a caller migrates to
+        // `messenger.sendReliable` (PR-3 chat + skill, then C
+        // migrations).
+        try {
+          await this.messenger.processOutboxOnConnect(remotePeer);
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Opportunistic Messenger-outbox retry on connect failed for ${remotePeer}: ${message}`);
+        }
       })();
 
       const now = Date.now();
@@ -2553,6 +2598,29 @@ export class DKGAgent {
       });
     }, MESSAGE_OUTBOX_TICK_MS);
     if (this.messageOutboxTimer.unref) this.messageOutboxTimer.unref();
+
+    // Universal Messenger substrate retry tick (rc.9 PR-2). Shares
+    // the same cadence as the chat-specific tick so the operator
+    // sees a single "outbox tick" beat in their dashboard. No-op
+    // until a caller migrates to `messenger.sendReliable` (PR-3+);
+    // the substrate outbox is empty in pre-migration daemons.
+    this.messengerOutboxTimer = setInterval(() => {
+      const now = Date.now();
+      this.messenger.processOutboxTick(now).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Messenger-outbox retry tick failed: ${message}`);
+      });
+      const dropped = this.messenger.dropExpiredOutbox(now);
+      for (const entry of dropped) {
+        this.log.warn(
+          ctx,
+          `Messenger-outbox dropped after ${entry.attempts} attempts: ` +
+            `peer=${entry.peer.slice(-8)} protocol=${entry.protocol} ` +
+            `msgId=${entry.messageId.slice(0, 8)} lastError="${entry.lastError}"`,
+        );
+      }
+    }, MESSAGE_OUTBOX_TICK_MS);
+    if (this.messengerOutboxTimer.unref) this.messengerOutboxTimer.unref();
 
     // Wire V10 Random Sampling prover. Edge nodes no-op. Core nodes with
     // transient identity/RPC startup failures retry in the background so
@@ -13913,6 +13981,10 @@ export class DKGAgent {
     if (this.messageOutboxTimer) {
       clearInterval(this.messageOutboxTimer);
       this.messageOutboxTimer = null;
+    }
+    if (this.messengerOutboxTimer) {
+      clearInterval(this.messengerOutboxTimer);
+      this.messengerOutboxTimer = null;
     }
     // Drop in-memory retry queue on shutdown; entries don't survive a
     // restart (the operator can re-fire via the redeliver-approval route

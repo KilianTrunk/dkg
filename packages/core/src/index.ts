@@ -54,6 +54,8 @@ export {
   ProtocolRouter,
   type ProtocolRouterOptions,
   DEFAULT_MAX_READ_BYTES,
+  DEFAULT_SEND_TIMEOUT_MS,
+  isRecoverableSendError,
 } from './protocol-router.js';
 export { GossipSubManager, type GossipMessageHandler } from './gossipsub-manager.js';
 export { PeerDiscoveryManager } from './discovery.js';

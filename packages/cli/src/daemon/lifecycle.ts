@@ -63,6 +63,8 @@ import {
   ChatMemoryManager,
   LogPushWorker,
   LlmClient,
+  SqliteMessageIdempotencyStore,
+  SqliteProtocolOutboxStore,
   type MetricsSource,
 } from "@origintrail-official/dkg-node-ui";
 import {
@@ -552,6 +554,15 @@ export async function runDaemonInner(
 
   const dashDb = new DashboardDB({ dataDir: dkgDir() });
 
+  // Universal Messenger substrate stores (rc.9 PR-2). Wired into the
+  // DKGAgent's Messenger so any caller that opts into
+  // `messenger.sendReliable` gets durable receiver-side idempotency
+  // + sender-side outbox retries against the shared DashboardDB.
+  // No caller exercises this path until PR-3 (chat + skill migration);
+  // wiring early keeps Milestone A trivially deployable + soak-testable.
+  const messengerIdempotencyStore = new SqliteMessageIdempotencyStore(dashDb);
+  const messengerOutboxStore = new SqliteProtocolOutboxStore(dashDb);
+
   const agent = await DKGAgent.create({
     name: config.name,
     framework: "DKG",
@@ -634,6 +645,10 @@ export async function runDaemonInner(
       delete: async (contextGraphId, principalType, principalId) => {
         dashDb.deleteContextGraphMember(contextGraphId, principalType, principalId);
       },
+    },
+    messengerStores: {
+      idempotencyStore: messengerIdempotencyStore,
+      outboxStore: messengerOutboxStore,
     },
   });
 
@@ -777,8 +792,25 @@ export async function runDaemonInner(
           gossipPublish: async (topic: string, data: Uint8Array) => {
             await agent.gossip.publish(topic, data);
           },
+          // Route storage-ack + verify-proposal outbound sends through
+          // the Messenger rather than directly through ProtocolRouter
+          // (rc.9 PR-2 wiring). Today this is semantically identical
+          // to the prior `agent.router.send` path — `/dkg/10.0.0/*`
+          // protocols travel `Messenger.sendToPeer` (legacy pass-
+          // through) → `ProtocolRouter.send`. The wiring matters at
+          // Milestone C PR-11 when `/storage-ack` + `/verify-proposal`
+          // migrate to `/dkg/10.0.1/*` and start using
+          // `messenger.sendReliable`, picking up the substrate's
+          // durable outbox + sender-side idempotency without
+          // touching this factory again.
+          //
+          // HIGH RISK gate (rc.9 plan): Milestone C migration of
+          // these protocols MUST include an explicit publishing-flow
+          // integration test covering ACK quorum collection + the
+          // ackTransportFactory hot path before the prefix bump
+          // lands.
           sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
-            return agent.router.send(peerId, protocol, data);
+            return agent.messenger.sendToPeer(peerId, protocol, data);
           },
           getConnectedCorePeers: () => {
             const allPeers = agent.node.libp2p

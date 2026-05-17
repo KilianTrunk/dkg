@@ -629,6 +629,41 @@ describe('StorageACKHandler inline verification', () => {
     expect(store.query.calls.length).toBeGreaterThan(0);
   });
 
+  it('SWM fallback decline summarizes large root-entity lists', async () => {
+    const store = createRecordingStore([]);
+    const handler = new StorageACKHandler(store, createConfig(), makeEventBus() as any);
+    const rootEntities = [
+      'urn:entity:0',
+      'urn:entity:1',
+      'urn:entity:2',
+      'urn:entity:3',
+      'urn:entity:4',
+      'urn:entity:5',
+      'urn:entity:6',
+      `urn:very-long:${'x'.repeat(200)}`,
+    ];
+
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId: testCGIdStr,
+      publisherPeerId: 'pub-0',
+      publicByteSize: 300,
+      isPrivate: false,
+      kaCount: rootEntities.length,
+      merkleLeafCount: testMerkleLeafCount,
+      rootEntities,
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineMessage).toContain('urn:entity:0');
+    expect(decoded.declineMessage).toContain('urn:entity:4');
+    expect(decoded.declineMessage).toContain('(+3 more)');
+    expect(decoded.declineMessage).not.toContain('urn:entity:5');
+    expect(decoded.declineMessage).not.toContain('x'.repeat(200));
+  });
+
   it("SWM fallback: declines (MERKLE_MISMATCH_IN_SWM) when merkle root doesn't match SWM data", async () => {
     const differentQuads = [makeQuad('urn:other', 'urn:p', 'urn:v')];
     const store = createRecordingStore(differentQuads);
@@ -1184,6 +1219,52 @@ describe('ACKCollector typed declines (#541)', () => {
     }
     expect(captured).toContain('NO_DATA_IN_SWM');
     expect(captured).not.toContain('()');
+  });
+
+  it('sanitizes and truncates peer-controlled decline messages', async () => {
+    const untrustedTail = 'x'.repeat(400);
+    const sendP2P = buildSendP2PWithDeclines({
+      'peer-0': {
+        code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+        message: `line one\nline two\t${untrustedTail}`,
+      },
+      'peer-1': {
+        code: `${STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM}${'Z'.repeat(100)}`,
+        message: 'short',
+      },
+    });
+    const log = noop();
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: sendP2P as any,
+      getConnectedCorePeers: () => ['peer-0', 'peer-1'],
+      log,
+    };
+    const collector = new ACKCollector(deps);
+
+    let captured: string | undefined;
+    try {
+      await collector.collect(buildCollectParams({ requiredACKs: 2 }));
+    } catch (err) {
+      captured = err instanceof Error ? err.message : String(err);
+    }
+    const logLine = log.calls
+      .map((c: unknown[]) => c[0] as string)
+      .find((line: string) => line.includes('Decline from peer-0'));
+
+    expect(logLine).toBeDefined();
+    expect(logLine).toContain('line one line two');
+    expect(logLine).not.toContain('\n');
+    expect(logLine).not.toContain('\t');
+    expect(logLine).not.toContain(untrustedTail);
+    expect(logLine!.length).toBeLessThan(360);
+
+    expect(captured).toContain('storage_ack_insufficient');
+    expect(captured).toContain('line one line two');
+    expect(captured).not.toContain('\n');
+    expect(captured).not.toContain('\t');
+    expect(captured).not.toContain(untrustedTail);
+    expect(captured!.length).toBeLessThan(700);
   });
 
   it('fails fast with storage_ack_insufficient when declines + a hung peer make quorum impossible', async () => {

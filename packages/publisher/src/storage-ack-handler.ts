@@ -16,6 +16,26 @@ import { ethers } from 'ethers';
 
 type PeerId = { toString(): string };
 
+const MAX_DECLINE_ENTITY_COUNT = 5;
+const MAX_DECLINE_ENTITY_CHARS = 120;
+
+function compactDeclineText(value: string, maxChars: number): string {
+  const compacted = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (compacted.length <= maxChars) return compacted;
+  return `${compacted.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function summarizeDeclineEntities(entities: readonly string[]): string {
+  if (entities.length === 0) return '(none)';
+  const visible = entities
+    .slice(0, MAX_DECLINE_ENTITY_COUNT)
+    .map((entity) => compactDeclineText(entity, MAX_DECLINE_ENTITY_CHARS));
+  const remaining = entities.length - visible.length;
+  return remaining > 0
+    ? `${visible.join(', ')} (+${remaining} more)`
+    : visible.join(', ');
+}
+
 export interface StorageACKHandlerConfig {
   nodeRole: 'core' | 'edge';
   nodeIdentityId: bigint;
@@ -221,7 +241,8 @@ export class StorageACKHandler {
         return this.encodeDecline(
           cgId,
           STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
-          `No data found in SWM graph ${swmGraphUri} for entities: ${intent.rootEntities.join(', ')}`,
+          `No data found in SWM graph ${swmGraphUri} for entities: ` +
+          summarizeDeclineEntities(intent.rootEntities ?? []),
         );
       }
 

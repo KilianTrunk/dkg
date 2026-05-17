@@ -33,6 +33,14 @@ export interface ACKCollectionResult {
 const DEFAULT_REQUIRED_ACKS = 3;
 const ACK_TIMEOUT_MS = 120_000;
 const MAX_RETRIES = 3;
+const MAX_DECLINE_CODE_CHARS = 64;
+const MAX_DECLINE_MESSAGE_CHARS = 240;
+
+function sanitizeDeclineField(value: string, maxChars: number): string {
+  const compacted = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (compacted.length <= maxChars) return compacted;
+  return `${compacted.slice(0, Math.max(0, maxChars - 3))}...`;
+}
 
 /**
  * ACKCollector implements V10 spec §9.0 Phase 3: collecting 3 core node
@@ -177,8 +185,14 @@ export class ACKCollector {
           const ack: StorageACKMsg = decodeStorageACK(response);
 
           if (isStorageACKDecline(ack)) {
-            const code = ack.declineCode ?? 'UNKNOWN';
-            const declineMessage = ack.declineMessage ?? '';
+            const code = sanitizeDeclineField(
+              ack.declineCode ?? 'UNKNOWN',
+              MAX_DECLINE_CODE_CHARS,
+            ) || 'UNKNOWN';
+            const declineMessage = sanitizeDeclineField(
+              ack.declineMessage ?? '',
+              MAX_DECLINE_MESSAGE_CHARS,
+            );
             declines.set(peerId, { code, message: declineMessage });
             log(
               `[ACKCollector] Decline from ${peerId.slice(-8)}: ${code}` +

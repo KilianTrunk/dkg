@@ -375,7 +375,7 @@ export function resolveMemoryAgentAddress(agent: {
  */
 export function mergePreferredRelays(input: {
   envValue: string | undefined;
-  configPreferred: readonly string[] | undefined;
+  configPreferred: unknown;
   networkAndConfigRelays: readonly string[] | undefined;
 }): {
   relayPeers: string[];
@@ -387,7 +387,8 @@ export function mergePreferredRelays(input: {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
-  const configParsed = (input.configPreferred ?? []).filter(
+  const rawConfigPreferred = Array.isArray(input.configPreferred) ? input.configPreferred : [];
+  const configParsed = rawConfigPreferred.filter(
     (s): s is string => typeof s === 'string' && s.trim().length > 0,
   ).map((s) => s.trim());
 

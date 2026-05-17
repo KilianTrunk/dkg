@@ -125,7 +125,6 @@ prioritise their own relays via `--relay-preferred` (CLI) or the
    {
      "name": "my-relay-eu",
      "nodeRole": "core",            // enables circuit-relay-v2 server
-     "enableRelayServer": true,
      "relayServerCapacity": 1024,   // tune per the capacity table above
      "announceAddresses": [
        "/ip4/<your-public-ip>/tcp/4001"

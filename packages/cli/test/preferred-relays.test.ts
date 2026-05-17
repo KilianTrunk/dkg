@@ -130,9 +130,7 @@ describe('mergePreferredRelays (rc.9 PR-7)', () => {
       configPreferred: [
         RELAY_OP_A,
         '   ',
-        // @ts-expect-error — intentional defensive case
         null,
-        // @ts-expect-error — intentional defensive case
         42,
         RELAY_OP_B,
       ],
@@ -141,5 +139,17 @@ describe('mergePreferredRelays (rc.9 PR-7)', () => {
 
     expect(result.relayPeers).toEqual([RELAY_OP_A, RELAY_OP_B]);
     expect(result.configCount).toBe(2);
+  });
+
+  it('ignores malformed non-array configPreferred values defensively', () => {
+    const result = mergePreferredRelays({
+      envValue: undefined,
+      configPreferred: { preferredRelays: [RELAY_OP_A] },
+      networkAndConfigRelays: [RELAY_PUB_A],
+    });
+
+    expect(result.relayPeers).toEqual([RELAY_PUB_A]);
+    expect(result.configCount).toBe(0);
+    expect(result.preferredCount).toBe(0);
   });
 });

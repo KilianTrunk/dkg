@@ -81,6 +81,22 @@ function inflightKey(peer: string, protocol: string, messageId: string): string 
   return `${peer}\x00${protocol}\x00${messageId}`;
 }
 
+function cloneBytes(bytes: Uint8Array): Uint8Array {
+  return new Uint8Array(bytes);
+}
+
+function cloneOutboxEntry(entry: ProtocolOutboxEntry): ProtocolOutboxEntry {
+  return { ...entry, payload: cloneBytes(entry.payload) };
+}
+
+interface ProtocolOutboxStorePolicy extends ProtocolOutboxOptions {
+  backoffFor: (attempts: number) => number;
+}
+
+type PolicyAwareProtocolOutboxStore = ProtocolOutboxStore & {
+  configurePolicy?: (policy: ProtocolOutboxStorePolicy) => void;
+};
+
 export class ProtocolOutbox {
   private readonly store: ProtocolOutboxStore;
   private readonly backoffs: readonly number[];
@@ -115,9 +131,11 @@ export class ProtocolOutbox {
     }
     this.store = store;
     this.backoffs = backoffs;
-    // maxAgeMs is consumed by the store impl (it's the one that
-    // implements dropExpired's age-check); we don't carry it here.
-    void options.maxAgeMs;
+    (this.store as PolicyAwareProtocolOutboxStore).configurePolicy?.({
+      backoffs,
+      maxAgeMs: options.maxAgeMs ?? DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS,
+      backoffFor: (attempts) => this.backoffFor(attempts),
+    });
   }
 
   /**
@@ -244,12 +262,11 @@ export class ProtocolOutbox {
  */
 export class InMemoryProtocolOutboxStore implements ProtocolOutboxStore {
   private readonly entries = new Map<string, ProtocolOutboxEntry>();
-  private readonly backoffs: readonly number[];
-  private readonly maxAgeMs: number;
+  private backoffs: readonly number[] = DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS;
+  private maxAgeMs = DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS;
 
   constructor(options: ProtocolOutboxOptions = {}) {
-    this.backoffs = options.backoffs ?? DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS;
-    this.maxAgeMs = options.maxAgeMs ?? DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS;
+    this.configurePolicy(options);
   }
 
   private static key(peer: string, protocol: string, messageId: string): string {
@@ -259,6 +276,15 @@ export class InMemoryProtocolOutboxStore implements ProtocolOutboxStore {
   private backoffFor(attempts: number): number {
     const idx = Math.min(Math.max(attempts - 1, 0), this.backoffs.length - 1);
     return this.backoffs[idx];
+  }
+
+  configurePolicy(options: ProtocolOutboxOptions = {}): void {
+    const backoffs = options.backoffs ?? this.backoffs;
+    if (backoffs.length === 0) {
+      throw new Error('ProtocolOutbox: backoffs must be non-empty');
+    }
+    this.backoffs = backoffs;
+    this.maxAgeMs = options.maxAgeMs ?? this.maxAgeMs;
   }
 
   enqueue(
@@ -276,13 +302,13 @@ export class InMemoryProtocolOutboxStore implements ProtocolOutboxStore {
       existing.lastAttemptAt = now;
       existing.nextAttemptAt = now + this.backoffFor(existing.attempts);
       existing.lastError = error;
-      return { ...existing };
+      return cloneOutboxEntry(existing);
     }
     const entry: ProtocolOutboxEntry = {
       peer,
       protocol,
       messageId,
-      payload,
+      payload: cloneBytes(payload),
       attempts: 1,
       firstFailureAt: now,
       lastAttemptAt: now,
@@ -290,7 +316,7 @@ export class InMemoryProtocolOutboxStore implements ProtocolOutboxStore {
       lastError: error,
     };
     this.entries.set(key, entry);
-    return { ...entry };
+    return cloneOutboxEntry(entry);
   }
 
   markDelivered(peer: string, protocol: string, messageId: string): boolean {
@@ -305,20 +331,20 @@ export class InMemoryProtocolOutboxStore implements ProtocolOutboxStore {
     return Array.from(this.entries.values())
       .filter((e) => e.peer === peer)
       .sort((a, b) => a.firstFailureAt - b.firstFailureAt)
-      .map((e) => ({ ...e }));
+      .map(cloneOutboxEntry);
   }
 
   due(now: number): ProtocolOutboxEntry[] {
     return Array.from(this.entries.values())
       .filter((e) => e.nextAttemptAt <= now)
-      .map((e) => ({ ...e }));
+      .map(cloneOutboxEntry);
   }
 
   dropExpired(now: number): ProtocolOutboxEntry[] {
     const dropped: ProtocolOutboxEntry[] = [];
     for (const [key, entry] of this.entries) {
       if (now - entry.firstFailureAt > this.maxAgeMs) {
-        dropped.push({ ...entry });
+        dropped.push(cloneOutboxEntry(entry));
         this.entries.delete(key);
       }
     }
@@ -382,7 +408,7 @@ export class InMemoryMessageIdempotencyStore implements MessageIdempotencyStore 
     const rec = this.records.get(InMemoryMessageIdempotencyStore.key(peer, protocol, messageId, direction));
     if (!rec) return { seen: false };
     return rec.responseBlob !== undefined
-      ? { seen: true, cachedResponse: rec.responseBlob }
+      ? { seen: true, cachedResponse: cloneBytes(rec.responseBlob) }
       : { seen: true };
   }
 
@@ -400,7 +426,7 @@ export class InMemoryMessageIdempotencyStore implements MessageIdempotencyStore 
     }
     const blob =
       response !== undefined && response.length <= RESPONSE_CACHE_BYTES
-        ? response
+        ? cloneBytes(response)
         : undefined;
     this.records.set(key, { responseBlob: blob, ts: this.clock() });
   }

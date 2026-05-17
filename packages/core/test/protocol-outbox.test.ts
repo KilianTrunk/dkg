@@ -62,6 +62,21 @@ describe('ProtocolOutbox.enqueueFailure', () => {
     outbox.enqueueFailure(PEER_A, PROTO, MSG_2, PAYLOAD, 'b', 1000);
     expect(outbox.size()).toBe(2);
   });
+
+  it('snapshots payload bytes on write and read', () => {
+    const { outbox } = fixture();
+    const payload = new Uint8Array([1, 2, 3]);
+    const entry = outbox.enqueueFailure(PEER_A, PROTO, MSG_1, payload, 'e', 1000);
+
+    payload[0] = 9;
+    entry.payload[1] = 8;
+
+    const pending = outbox.pendingFor(PEER_A);
+    expect(Array.from(pending[0].payload)).toEqual([1, 2, 3]);
+
+    pending[0].payload[2] = 7;
+    expect(Array.from(outbox.due(6000)[0].payload)).toEqual([1, 2, 3]);
+  });
 });
 
 describe('ProtocolOutbox.markDelivered + hasEntry', () => {
@@ -150,6 +165,15 @@ describe('ProtocolOutbox.dropExpired', () => {
     expect(dropped).toHaveLength(0);
     expect(outbox.size()).toBe(1);
   });
+
+  it('applies ProtocolOutbox maxAgeMs to the wrapped store', () => {
+    const store = new InMemoryProtocolOutboxStore();
+    const outbox = new ProtocolOutbox(store, { maxAgeMs: 60 });
+    outbox.enqueueFailure(PEER_A, PROTO, MSG_1, PAYLOAD, 'e', 0);
+
+    expect(outbox.dropExpired(60)).toHaveLength(0);
+    expect(outbox.dropExpired(61)).toHaveLength(1);
+  });
 });
 
 describe('ProtocolOutbox construction', () => {
@@ -161,7 +185,7 @@ describe('ProtocolOutbox construction', () => {
   });
 
   it('caps backoff at the last ladder rung for attempts beyond the ladder length', () => {
-    const store = new InMemoryProtocolOutboxStore({ backoffs: [10, 20, 30] });
+    const store = new InMemoryProtocolOutboxStore();
     const outbox = new ProtocolOutbox(store, { backoffs: [10, 20, 30] });
     // Simulate 5 failures — should cap at 30 (last rung).
     let lastEntry = outbox.enqueueFailure(PEER_A, PROTO, MSG_1, PAYLOAD, 'e', 0);
@@ -188,6 +212,22 @@ describe('InMemoryMessageIdempotencyStore', () => {
     const result = store.check(PEER_A, PROTO, MSG_1, 'in');
     expect(result.seen).toBe(true);
     expect(result.seen && result.cachedResponse).toEqual(resp);
+  });
+
+  it('snapshots cached responses on write and read', () => {
+    const store = new InMemoryMessageIdempotencyStore();
+    const resp = new Uint8Array([1, 2, 3]);
+    store.record(PEER_A, PROTO, MSG_1, 'in', resp);
+
+    resp[0] = 9;
+    const first = store.check(PEER_A, PROTO, MSG_1, 'in');
+    expect(first.seen && Array.from(first.cachedResponse ?? [])).toEqual([1, 2, 3]);
+
+    if (first.seen && first.cachedResponse) {
+      first.cachedResponse[1] = 8;
+    }
+    const second = store.check(PEER_A, PROTO, MSG_1, 'in');
+    expect(second.seen && Array.from(second.cachedResponse ?? [])).toEqual([1, 2, 3]);
   });
 
   it('check returns { seen: true } without cachedResponse for mark-only (oversize) responses', () => {

@@ -496,15 +496,13 @@ export class DashboardDB {
     this.db.exec(`DELETE FROM chat_messages WHERE ts < ${cutoff}`);
     this.db.exec(`DELETE FROM chat_persistence_jobs WHERE updated_at < ${cutoff} AND status IN ('stored', 'failed')`);
     this.db.exec(`DELETE FROM notifications WHERE ts < ${cutoff}`);
-    // Universal Messenger substrate tables. Shorter TTL than the
-    // 90-day operator retention: 24h is plenty for both idempotency
-    // (no realistic dedup window beyond a day) and outbox (entries
-    // older than 24h have hit `maxAgeMs` and are dropped by the
-    // substrate's own `dropExpired` tick anyway — this is the
-    // belt-and-braces sweep for crash-recovered state).
+    // Universal Messenger idempotency table. Shorter TTL than the
+    // 90-day operator retention: no realistic dedup window extends
+    // beyond a day. The protocol_outbox table is intentionally not
+    // pruned here; its max-age is store policy and must be applied
+    // by SqliteProtocolOutboxStore.dropExpired().
     const messengerCutoff = Date.now() - 24 * 60 * 60 * 1000;
     this.db.exec(`DELETE FROM message_idempotency WHERE ts < ${messengerCutoff}`);
-    this.db.exec(`DELETE FROM protocol_outbox WHERE first_failure_at < ${messengerCutoff}`);
   }
 
   // --- Prepared statements (lazy-initialized) ---
@@ -1634,16 +1632,12 @@ export class SqliteMessageIdempotencyStore implements MessageIdempotencyStore {
       | { response_blob: Buffer | null }
       | undefined;
     if (!row) return { seen: false };
-    // better-sqlite3 returns Node Buffer for BLOB columns; convert to
-    // Uint8Array view (zero-copy) so the substrate stays Buffer-free.
+    // better-sqlite3 returns Node Buffer for BLOB columns; copy into a
+    // Uint8Array so callers cannot mutate the cached DB snapshot.
     if (row.response_blob === null) return { seen: true };
     return {
       seen: true,
-      cachedResponse: new Uint8Array(
-        row.response_blob.buffer,
-        row.response_blob.byteOffset,
-        row.response_blob.byteLength,
-      ),
+      cachedResponse: new Uint8Array(row.response_blob),
     };
   }
 
@@ -1661,7 +1655,7 @@ export class SqliteMessageIdempotencyStore implements MessageIdempotencyStore {
     // design decision — no per-protocol/per-call knob.
     const blob =
       response !== undefined && response.length <= RESPONSE_CACHE_BYTES
-        ? Buffer.from(response.buffer, response.byteOffset, response.byteLength)
+        ? Buffer.from(response)
         : null;
     // Targeted ON CONFLICT — never the broader INSERT OR IGNORE which
     // would silently swallow unrelated constraint violations (the
@@ -1726,13 +1720,17 @@ export interface SqliteProtocolOutboxStoreOptions {
 
 export class SqliteProtocolOutboxStore implements ProtocolOutboxStore {
   private readonly db: Database.Database;
-  private readonly maxAgeMs: number;
-  private readonly backoffFor: (attempts: number) => number;
+  private maxAgeMs = 24 * 60 * 60 * 1000;
+  private backoffFor: (attempts: number) => number = (_attempts) => 5_000;
 
   constructor(dashboard: DashboardDB, options: SqliteProtocolOutboxStoreOptions = {}) {
     this.db = dashboard.db;
-    this.maxAgeMs = options.maxAgeMs ?? 24 * 60 * 60 * 1000;
-    this.backoffFor = options.backoffFor ?? ((_attempts) => 5_000);
+    this.configurePolicy(options);
+  }
+
+  configurePolicy(options: SqliteProtocolOutboxStoreOptions = {}): void {
+    this.maxAgeMs = options.maxAgeMs ?? this.maxAgeMs;
+    this.backoffFor = options.backoffFor ?? this.backoffFor;
   }
 
   enqueue(
@@ -1776,11 +1774,7 @@ export class SqliteProtocolOutboxStore implements ProtocolOutboxStore {
         peer,
         protocol,
         messageId,
-        payload: new Uint8Array(
-          existing.payload.buffer,
-          existing.payload.byteOffset,
-          existing.payload.byteLength,
-        ),
+        payload: new Uint8Array(existing.payload),
         attempts: newAttempts,
         firstFailureAt: existing.first_failure_at,
         lastAttemptAt: now,
@@ -1791,7 +1785,7 @@ export class SqliteProtocolOutboxStore implements ProtocolOutboxStore {
 
     const attempts = 1;
     const nextAttemptAt = now + this.backoffFor(attempts);
-    const blob = Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength);
+    const blob = Buffer.from(payload);
     this.db
       .prepare(
         `INSERT INTO protocol_outbox
@@ -1804,7 +1798,7 @@ export class SqliteProtocolOutboxStore implements ProtocolOutboxStore {
       peer,
       protocol,
       messageId,
-      payload,
+      payload: new Uint8Array(blob),
       attempts,
       firstFailureAt: now,
       lastAttemptAt: now,
@@ -1951,7 +1945,7 @@ export class SqliteProtocolOutboxStore implements ProtocolOutboxStore {
       peer: row.peer_id,
       protocol: row.protocol,
       messageId: row.message_id,
-      payload: new Uint8Array(row.payload.buffer, row.payload.byteOffset, row.payload.byteLength),
+      payload: new Uint8Array(row.payload),
       attempts: row.attempts,
       firstFailureAt: row.first_failure_at,
       lastAttemptAt: row.last_attempt_at,

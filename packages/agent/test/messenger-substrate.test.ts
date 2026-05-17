@@ -324,7 +324,6 @@ describe('Messenger construction guardrails', () => {
   });
 });
 
-<<<<<<< HEAD
 // rc.9 PR-12 — SLO histogram coverage.
 describe('Messenger.getSloStats (SLO histogram)', () => {
   it('records latency from sendReliable invoke → delivered:true', async () => {

@@ -912,6 +912,58 @@ describe('SharedMemoryHandler.handle outcome (rc.9 PR-C codex R3)', () => {
     expect(outcome.reason).toContain('does not match sender');
   });
 
+  it('retryable rejection (CAS pre-condition not met) returns { applied: false, retryable: true } — codex R4', async () => {
+    // Codex R4 (dropped review comment): CAS-not-met is
+    // TRANSIENT when SWM writes arrive out of order. The
+    // missed upstream write might still land via gossip and
+    // bring local state up to where the CAS condition would
+    // pass; the substrate outbox must keep this share queued.
+    //
+    // Setup: empty store. Send a publish with a CAS condition
+    // expecting "recruiting" on a subject/predicate that
+    // doesn't exist locally → enforceCASConditions returns
+    // false → withWriteLocks closure returns false with
+    // withWriteLocksRejection = 'cas' → outcome should be
+    // retryable.
+    const nquads = `<${ENTITY}> <http://schema.org/name> "CASRetry" <${DATA_GRAPH}> .`;
+    const msg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeerR4',
+      shareOperationId: 'op-cas-retryable',
+      timestampMs: Date.now(),
+      casConditions: [{
+        subject: ENTITY,
+        predicate: 'http://example.org/status',
+        expectedValue: '"recruiting"',
+        expectAbsent: false,
+      }],
+    });
+
+    const outcome = await handler.handle(msg, '12D3KooWPeerR4');
+    expect(outcome.applied).toBe(false);
+    if (outcome.applied) throw new Error('unreachable');
+    expect(outcome.retryable).toBe(true);
+    expect(outcome.reason).toMatch(/CAS/);
+  });
+
+  it('permanent rejection (malformed protobuf wire bytes) returns { applied: false, retryable: false } — codex R5', async () => {
+    // Codex R5 (dropped review comment): decode failures are
+    // DETERMINISTIC — retrying the same bytes can't make a
+    // malformed envelope parse. The top-level decode try in
+    // handle() short-circuits these as `retryable: false` so
+    // the substrate outbox drops on first attempt instead of
+    // burning retry budget on log noise.
+    const garbage = new Uint8Array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+
+    const outcome = await handler.handle(garbage, '12D3KooWPeerR5');
+    expect(outcome.applied).toBe(false);
+    if (outcome.applied) throw new Error('unreachable');
+    expect(outcome.retryable).toBe(false);
+    expect(outcome.reason).toMatch(/decode/i);
+  });
+
   it('retryable rejection (unexpected throw during apply) returns { applied: false, retryable: true }', async () => {
     // Dominant production case for `retryable: true`: the
     // sender key package for the current epoch hasn't arrived

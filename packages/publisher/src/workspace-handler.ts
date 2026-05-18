@@ -504,9 +504,34 @@ export class SharedMemoryHandler {
    */
   async handle(data: Uint8Array, fromPeerId: string, onPhase?: PhaseCallback): Promise<SharedMemoryApplyOutcome> {
     let ctx = createOperationContext('share');
+    // PR-C codex R5 (dropped review comment): protobuf decode
+    // failures are DETERMINISTIC — retrying the same wire bytes
+    // can't make a malformed envelope parse. Short-circuit
+    // decode errors as `retryable: false` so the substrate
+    // outbox drops them on the first attempt instead of burning
+    // the retry budget on log noise. The remaining body of
+    // `handle()` runs under the inner try whose catch defaults
+    // to `retryable: true` (dominated by I/O paths — sender
+    // key decryptor throws, store hiccups — see the catch
+    // block for details).
+    let decoded: WorkspaceGossipDecodeResult;
     try {
       onPhase?.('decode', 'start');
-      const decoded = this.decodeWorkspaceGossipMessage(data);
+      decoded = this.decodeWorkspaceGossipMessage(data);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.warn(ctx, `SWM write rejected: protobuf decode failed: ${reason}`);
+      return { applied: false, reason: `protobuf decode failed: ${reason}`, retryable: false };
+    }
+    // PR-C codex R4 (dropped review comment): inside the inner
+    // try, `withWriteLocks` returns false for TWO distinct
+    // reasons — validation rejection (deterministic, payload
+    // can never apply) and CAS-not-met (TRANSIENT when SWM
+    // writes arrive out of order). Hoisted here so the closure
+    // can signal which branch fired; the post-closure code
+    // maps `cas` → retryable and `validation` → permanent.
+    let withWriteLocksRejection: 'validation' | 'cas' | undefined;
+    try {
       const { envelope, signedPayload } = decoded;
       let request = decoded.request;
       let contextGraphId = request?.contextGraphId ?? decoded.senderKeyMessage?.contextGraphId ?? envelope?.contextGraphId;
@@ -721,6 +746,7 @@ export class SharedMemoryHandler {
         );
         if (!validation.valid) {
           this.log.warn(ctx, `SWM validation rejected: ${validation.errors.join('; ')}`);
+          withWriteLocksRejection = 'validation';
           return false;
         }
         onPhase?.('validate', 'end');
@@ -734,6 +760,7 @@ export class SharedMemoryHandler {
             // replays missed writes on reconnect, converging replicas eventually.
             // Accepting stale-CAS writes would silently corrupt local state.
             this.log.info(ctx, `Skipping SWM write ${shareOperationId} — remote CAS conditions not met`);
+            withWriteLocksRejection = 'cas';
             return false;
           }
         }
@@ -827,14 +854,26 @@ export class SharedMemoryHandler {
         });
         return { applied: true };
       }
-      // `applied === false` from the withWriteLocks closure: either
-      // validation rejected the payload or CAS pre-conditions
-      // didn't hold against current SWM state. Both are permanent
-      // for this exact wire bytes: retrying the SAME payload would
-      // produce the same outcome (validation is deterministic; CAS
-      // checks current state, which the sender can re-evaluate by
-      // issuing a fresh share with updated conditions).
-      return { applied: false, reason: 'validation or CAS conditions rejected by withWriteLocks closure', retryable: false };
+      // `applied === false` from the withWriteLocks closure. PR-C
+      // codex R4: validation rejection is deterministic (retry
+      // produces the same outcome), but CAS-not-met is
+      // TRANSIENT — the missed write upstream might still arrive
+      // via gossip and bring local state up to where the CAS
+      // condition would pass. Keep retrying so the sender's
+      // outbox doesn't drop a payload that would apply after
+      // out-of-order delivery converges.
+      if (withWriteLocksRejection === 'cas') {
+        return {
+          applied: false,
+          reason: 'CAS pre-conditions not met against current SWM state (transient: may apply after upstream writes converge)',
+          retryable: true,
+        };
+      }
+      return {
+        applied: false,
+        reason: 'validation rejected payload (permanent: triple structure or manifest does not pass validatePublishRequest)',
+        retryable: false,
+      };
     } catch (err) {
       // PR-C codex R3: classify the catch path as `retryable: true`.
       // The dominant production case here is `workspaceSenderKeyDecryptor`

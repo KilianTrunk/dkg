@@ -90,8 +90,8 @@ describe('@unit Profile contract', function () {
     expect(await Profile.name()).to.equal('Profile');
   });
 
-  it('The contract is version "1.2.0"', async () => {
-    expect(await Profile.version()).to.equal('1.2.0');
+  it('The contract is version "1.3.0"', async () => {
+    expect(await Profile.version()).to.equal('1.3.0');
   });
 
   it('Create a profile with valid inputs, expect to pass', async () => {
@@ -324,6 +324,70 @@ describe('@unit Profile contract', function () {
       Profile,
       'OnlyWhitelistedAddressesFunction',
     );
+  });
+
+  // =====================================================================
+  // recreate-profile-recovery 0001 — re-attach a Profile to an existing
+  // Identity (testnet ProfileStorage-redeploy recovery). Admin-only; the
+  // identityId is reused so surviving staking/conviction/sharding state
+  // stays addressable. See docs/adr/0001-recreate-profile-admin-only.md.
+  // =====================================================================
+
+  describe('recreateProfile (testnet recovery)', () => {
+    // createProfile mints identity 1 (operational = accounts[0],
+    // admin = accounts[1]) then we wipe only the Profile — mirroring the
+    // testnet state where the Identity survived a ProfileStorage redeploy.
+    async function seedBrickedIdentity() {
+      await Profile.createProfile(
+        accounts[1].address,
+        [],
+        'Node 1',
+        nodeId1,
+        1000,
+      );
+      await ProfileStorage.deleteProfile(identityId1);
+    }
+
+    it('admin recreates the Profile under the same identityId', async () => {
+      await seedBrickedIdentity();
+      expect(await ProfileStorage.profileExists(identityId1)).to.equal(false);
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.not.be.reverted;
+
+      expect(await ProfileStorage.profileExists(identityId1)).to.equal(true);
+      expect(await ProfileStorage.getNodeId(identityId1)).to.equal(nodeId1);
+      expect(await ProfileStorage.getName(identityId1)).to.equal('Node 1');
+    });
+
+    it('does not mint a new identity (id counter and resolved id unchanged)', async () => {
+      await seedBrickedIdentity();
+      const lastIdBefore = await IdentityStorage.lastIdentityId();
+      const resolvedBefore = await IdentityStorage.getIdentityId(
+        accounts[0].address,
+      );
+
+      await Profile.connect(accounts[1]).recreateProfile(
+        identityId1,
+        'Node 1',
+        nodeId1,
+        1000,
+      );
+
+      expect(await IdentityStorage.lastIdentityId()).to.equal(lastIdBefore);
+      expect(await IdentityStorage.getIdentityId(accounts[0].address)).to.equal(
+        resolvedBefore,
+      );
+      expect(await IdentityStorage.getIdentityId(accounts[0].address)).to.equal(
+        identityId1,
+      );
+    });
   });
 
   // =====================================================================

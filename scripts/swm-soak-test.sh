@@ -60,35 +60,55 @@
 # Defaults: 1440 cycles × 30s = 12h. Aggressive enough to surface
 # the rc8-postmortem "shares disappear" pathology if it recurs.
 #
-# Override via env vars:
+# Required env vars:
+#   SENDER_TAG       short label uniquely identifying THIS daemon
+#                    (appears in subject URI + report breakdown).
+#                    MUST differ between participating peers, else
+#                    the tally collapses their writes into a single
+#                    sender set. No default — script exits early
+#                    if unset.
+#
+# Optional env vars:
 #   SWM_CG_CURATED   comma-separated curated CG ids (default: empty)
 #   SWM_CG_PUBLIC    comma-separated public CG ids   (default: empty)
 #   SWM_INTERVAL_S   seconds between cycles          (default: 30)
 #   SWM_TOTAL_CYCLES number of write cycles          (default: 1440)
-#   SENDER_TAG       label used in subject URI + log (default: MILES)
 #   PEERS_EXPECTED   comma-separated peer tags (other ops) for
-#                    per-peer delivery breakdown in summary (optional)
+#                    per-peer delivery breakdown in summary
+#   SOAK_COHORT_ID   shared cohort id (recommended for multi-peer
+#                    soaks — every participating peer must pass
+#                    the SAME value out-of-band; defaults to the
+#                    per-peer RUN_ID, which is fine for solo runs
+#                    but collapses to "this peer only" filtering)
+#   AUTH / DKG_AUTH  bearer token; if neither is set the script
+#                    falls back to ${DKG_HOME}/auth.token
 #
 # At least one of SWM_CG_CURATED / SWM_CG_PUBLIC MUST be set.
 #
-# Per-run isolation (rc.9 PR-A Codex follow-up #5)
-# ------------------------------------------------
-# Each invocation generates its own RUN_ID + SOAK_START_ISO; every
-# write tags itself with `urn:swm-soak:runId "<RUN_ID>"`, and every
-# tally SPARQL filters on `sentAt >= "<SOAK_START_ISO>"` to exclude
-# pre-soak `swm-soak` rows that may already be sitting in
-# `_shared_memory`. Without this, rerunning the script against a CG
-# that hosted a prior soak (or two operators reusing the same
-# SENDER_TAG across runs) made stale deliveries inflate the
-# final-percentage report.
+# Per-run isolation (rc.9 PR-A Codex follow-ups #5 + #8)
+# ------------------------------------------------------
+# Every write emits `urn:swm-soak:cohortId "<SOAK_COHORT_ID>"` plus
+# `urn:swm-soak:runId "<RUN_ID>"`. The tally SPARQL filters strictly
+# on the cohort id, which gives a SKEW-FREE current-run filter
+# (no comparing remote `sentAt` timestamps against this host's
+# clock). For multi-peer soaks, agree on a SOAK_COHORT_ID
+# out-of-band — the same way you coordinate CG ids and PEERS_EXPECTED.
+# Solo runs can omit it and rely on the per-invocation RUN_ID fallback,
+# which still rejects stale rows from prior solo runs of the same
+# operator.
 #
 # Usage
 # -----
+#   # All four operators agree out-of-band on the same
+#   # SOAK_COHORT_ID (e.g. a git short-sha + day stamp); each picks
+#   # a unique SENDER_TAG. SOAK_COHORT_ID can be omitted for solo
+#   # runs.
 #   nohup caffeinate -i bash scripts/swm-soak-test.sh \
 #     SWM_CG_CURATED=swm-soak-curated \
 #     SWM_CG_PUBLIC=swm-soak-public \
 #     SENDER_TAG=MILES \
 #     PEERS_EXPECTED=LEX,HERMES,ARX \
+#     SOAK_COHORT_ID=rc9-soak-20260518-3bc52a9b \
 #     >> ~/.dkg/swm-soak-test.out 2>&1 &
 #   disown
 #
@@ -106,42 +126,60 @@ SWM_CG_CURATED="${SWM_CG_CURATED:-}"
 SWM_CG_PUBLIC="${SWM_CG_PUBLIC:-}"
 SWM_INTERVAL_S="${SWM_INTERVAL_S:-30}"
 SWM_TOTAL_CYCLES="${SWM_TOTAL_CYCLES:-1440}"
-SENDER_TAG="${SENDER_TAG:-MILES}"
+# Codex PR #572 R7 (round 3): SENDER_TAG previously defaulted to
+# "MILES", which means two operators who forget to override the
+# default collapse their writes into one sender set in the tally,
+# silently corrupting the per-peer delivery percentages. Now
+# required: no default, fail-fast if unset.
+SENDER_TAG="${SENDER_TAG:-}"
 PEERS_EXPECTED="${PEERS_EXPECTED:-}"
 
 DKG_HOME="${DKG_HOME:-${HOME}/.dkg}"
 API="${API:-http://127.0.0.1:9200}"
 
-# Codex PR #572 R3 + R4: fail fast on missing/empty auth token.
-# Pre-fix the script omitted `set -e` AND did not validate the
-# token, so a missing or comments-only `auth.token` degraded into a
-# 12h run of unauthorized reads/writes returning empty JSON, which
-# then showed up as misleading zero-delivery output. Now: explicit
-# file-exists + non-empty checks BEFORE the long-running loop,
-# matching the precedent in scripts/devnet-test.sh.
-#
-# Codex PR #572 R4 also flagged the parser itself: `grep -v '^#'
-# | head -1` returns an empty string when the first non-comment
-# line is blank (`# header\n\ntoken` is a real shape that
-# devnet.sh writes). The replacement filters BOTH comments AND
-# blank/whitespace-only lines, then takes the first surviving
-# line, then trims surrounding whitespace.
-AUTH_TOKEN_FILE="${DKG_HOME}/auth.token"
-if [ ! -f "$AUTH_TOKEN_FILE" ]; then
-  echo "ERROR: auth token file not found at ${AUTH_TOKEN_FILE}." >&2
-  echo "       Start the daemon first ('pnpm dkg start') so it provisions the token, or export AUTH=<token> before running." >&2
-  exit 65
-fi
-AUTH=$(awk '
-  # Codex PR #572 R4: first non-empty, non-comment line, trimmed.
-  /^[[:space:]]*#/ { next }   # drop comment lines
-  /^[[:space:]]*$/ { next }   # drop blank/whitespace-only lines
-  { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print; exit }
-' "$AUTH_TOKEN_FILE")
+# Codex PR #572 R9 (round 3): honor an externally-supplied bearer
+# before falling back to the local `auth.token` file. Pre-fix the
+# script's own error message suggested `export AUTH=<token>`, but
+# the loader never checked `${AUTH:-}` first — so remote / API-only
+# runs (e.g. driving the soak against a daemon on another host)
+# broke even when the caller had already supplied valid creds. We
+# now resolve in the documented precedence
+#   AUTH > DKG_AUTH > ${DKG_HOME}/auth.token
+# matching the pattern in scripts/devnet-test.sh and friends.
+AUTH="${AUTH:-${DKG_AUTH:-}}"
 if [ -z "$AUTH" ]; then
-  echo "ERROR: ${AUTH_TOKEN_FILE} exists but contains no usable token (after stripping # comments and blank lines)." >&2
-  echo "       Inspect the file and re-provision via 'pnpm dkg start'." >&2
-  exit 65
+  # Codex PR #572 R3 + R4: fail fast on missing/empty auth token.
+  # Pre-fix the script omitted `set -e` AND did not validate the
+  # token, so a missing or comments-only `auth.token` degraded
+  # into a 12h run of unauthorized reads/writes returning empty
+  # JSON, which then showed up as misleading zero-delivery output.
+  # Now: explicit file-exists + non-empty checks BEFORE the long-
+  # running loop, matching the precedent in scripts/devnet-test.sh.
+  #
+  # Codex PR #572 R4 also flagged the parser itself: `grep -v '^#'
+  # | head -1` returns an empty string when the first non-comment
+  # line is blank (`# header\n\ntoken` is a real shape that
+  # devnet.sh writes). The replacement filters BOTH comments AND
+  # blank/whitespace-only lines, then takes the first surviving
+  # line, then trims surrounding whitespace.
+  AUTH_TOKEN_FILE="${DKG_HOME}/auth.token"
+  if [ ! -f "$AUTH_TOKEN_FILE" ]; then
+    echo "ERROR: no auth token supplied and no token file at ${AUTH_TOKEN_FILE}." >&2
+    echo "       Either export AUTH=<token> (or DKG_AUTH=<token>) before running," >&2
+    echo "       or start the daemon first ('pnpm dkg start') so it provisions the token file." >&2
+    exit 65
+  fi
+  AUTH=$(awk '
+    # Codex PR #572 R4: first non-empty, non-comment line, trimmed.
+    /^[[:space:]]*#/ { next }   # drop comment lines
+    /^[[:space:]]*$/ { next }   # drop blank/whitespace-only lines
+    { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print; exit }
+  ' "$AUTH_TOKEN_FILE")
+  if [ -z "$AUTH" ]; then
+    echo "ERROR: ${AUTH_TOKEN_FILE} exists but contains no usable token (after stripping # comments and blank lines)." >&2
+    echo "       Either export AUTH=<token> directly, or re-provision the file via 'pnpm dkg start'." >&2
+    exit 65
+  fi
 fi
 
 if [ -z "$SWM_CG_CURATED" ] && [ -z "$SWM_CG_PUBLIC" ]; then
@@ -149,19 +187,42 @@ if [ -z "$SWM_CG_CURATED" ] && [ -z "$SWM_CG_PUBLIC" ]; then
   exit 64
 fi
 
-# Codex PR #572 R5: each soak run gets a fresh RUN_ID so the
-# delivery-tally SPARQL can distinguish the current run from older
-# `swm-soak` writes already sitting in `_shared_memory`. Without
-# this, rerunning against the same CG (or two operators reusing the
-# same SENDER_TAG) makes stale rows count as current-run deliveries
-# and silently inflates the final percentage. We embed the RUN_ID
-# as a third quad (`urn:swm-soak:runId`) on every write AND record
-# SOAK_START_ISO so the SPARQL can additionally exclude pre-soak
-# writes from ANY peer (so we catch other operators' fresh writes
-# without needing to know their RUN_ID, while still rejecting their
-# pre-soak leftovers).
+if [ -z "$SENDER_TAG" ]; then
+  # Codex PR #572 R7 (round 3): require an explicit, unique tag.
+  # A shared default ("MILES") silently collapses two operators'
+  # writes in the tally — see banner notes in the docstring above.
+  echo "ERROR: SENDER_TAG is required and must be unique across participating peers." >&2
+  echo "       Set it to a short identifier for THIS daemon (e.g. SENDER_TAG=NODE-A)." >&2
+  echo "       The tag appears in subject URIs and in the delivery breakdown report;" >&2
+  echo "       two peers reusing the same tag will collapse into one sender set." >&2
+  exit 64
+fi
+
+# Codex PR #572 R5: each soak run emits a per-peer RUN_ID so future
+# forensic tooling can attribute writes to a specific invocation
+# even when SENDER_TAG is reused across runs.
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(hostname -s 2>/dev/null || hostname)-$$-${SENDER_TAG}"
 SOAK_START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Codex PR #572 R8 (round 3): the previous R5 fix filtered tally
+# results on `STR(?sentAt) >= "$SOAK_START_ISO"`, where `?sentAt`
+# is a sender-reported wall-clock timestamp. That makes the result
+# depend on cross-machine clock skew — a peer whose clock is
+# behind this node's clock writes legitimate current-run quads
+# stamped with a "stale-looking" timestamp, and our SPARQL filter
+# silently drops them. The fix is to filter on a SHARED run-scoped
+# identifier instead: every participating peer agrees on a
+# SOAK_COHORT_ID out-of-band (same way they coordinate CG ids),
+# stamps every write with it, and the tally SPARQL filters on
+# exact match. No clock comparisons across machines.
+#
+# Solo-mode default: when SOAK_COHORT_ID is unset, fall back to the
+# per-invocation RUN_ID. That gives a single operator running
+# repeated soaks against the same CG protection against stale
+# rows from prior runs (their own writes are tagged with the new
+# RUN_ID), without forcing operators in a multi-peer cohort to
+# remember an extra env var.
+SOAK_COHORT_ID="${SOAK_COHORT_ID:-$RUN_ID}"
 
 LOG_DIR="${DKG_HOME}/swm-soak-test-$(date -u +%Y%m%d-%H%M%S)-${SENDER_TAG}"
 mkdir -p "$LOG_DIR"
@@ -218,12 +279,19 @@ print(json.dumps({
     'object': '\"$seq/$total\"',
     'graph': '',
   }, {
-    # Codex PR #572 R5: writer-side RUN_ID tag so downstream tally
-    # queries can distinguish current-run writes from stale rows
-    # left in _shared_memory by a prior soak.
+    # Codex PR #572 R5: per-invocation RUN_ID for forensic
+    # attribution. Unique per script invocation per peer.
     'subject': '$subject',
     'predicate': 'urn:swm-soak:runId',
     'object': '\"$RUN_ID\"',
+    'graph': '',
+  }, {
+    # Codex PR #572 R8 (round 3): shared cohort id is the actual
+    # tally filter — replaces the wall-clock comparison so a
+    # peer with a skewed system clock doesn't get filtered out.
+    'subject': '$subject',
+    'predicate': 'urn:swm-soak:cohortId',
+    'object': '\"$SOAK_COHORT_ID\"',
     'graph': '',
   }],
 }))
@@ -253,14 +321,17 @@ snapshot_swm_inbox() {
   # SELECT against the SWM named graph. The "tag" is extracted from
   # the subject pattern urn:swm-soak:<TAG>:<seq>.
   #
-  # Codex PR #572 R5: filter on `sentAt >= SOAK_START_ISO` so the
-  # query excludes pre-soak `swm-soak` writes left in
-  # `_shared_memory` by prior runs. This catches OTHER operators'
-  # current-run writes without needing to know their RUN_ID, while
-  # still rejecting everybody's pre-soak leftovers. Pre-fix, a
-  # rerun against the same CG (or a different operator reusing the
-  # same SENDER_TAG) made stale rows count as current-run
-  # deliveries and inflated the final percentage.
+  # Codex PR #572 R8 (round 3): filter on the shared cohort id
+  # rather than the sender-reported `sentAt` timestamp. The earlier
+  # R5 fix used `STR(?sentAt) >= "$SOAK_START_ISO"` which compared
+  # a REMOTE wall-clock timestamp against THIS host's clock — a
+  # peer whose system clock was a few seconds behind the receiver
+  # would write legitimate current-run quads stamped with a
+  # "stale" timestamp, and the filter silently dropped them. With
+  # the cohort filter every participating peer stamps its writes
+  # with the same SOAK_COHORT_ID (out-of-band coordinated), and
+  # the tally accepts only those writes — no clock comparisons,
+  # no skew dependency.
   local label=$1 cgId=$2 ts
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local swm_graph="did:dkg:context-graph:${cgId}/_shared_memory"
@@ -268,9 +339,8 @@ snapshot_swm_inbox() {
   sparql=$(cat <<SPARQL
 SELECT DISTINCT ?s WHERE {
   GRAPH <${swm_graph}> {
-    ?s <urn:swm-soak:sentBy> ?tag ;
-       <urn:swm-soak:sentAt> ?sentAt .
-    FILTER(STR(?sentAt) >= "${SOAK_START_ISO}")
+    ?s <urn:swm-soak:sentBy>   ?tag ;
+       <urn:swm-soak:cohortId> "${SOAK_COHORT_ID}" .
   }
 }
 SPARQL
@@ -414,6 +484,7 @@ trap 'log "INTERRUPTED — stopping at cycle ${seq:-?}"; exit 130' INT TERM
 log "=== START swm-soak-test ==="
 log "  sender_tag=$SENDER_TAG"
 log "  run_id=$RUN_ID"
+log "  soak_cohort_id=$SOAK_COHORT_ID$( [ "$SOAK_COHORT_ID" = "$RUN_ID" ] && printf ' (defaulted to RUN_ID — solo-mode filter, set SOAK_COHORT_ID to receive other peers writes)' )"
 log "  soak_start_iso=$SOAK_START_ISO"
 log "  self_peer_id=${SELF_PEER_ID:-<unresolved>}"
 log "  curated_cgs=${SWM_CG_CURATED:-<none>}"

@@ -5,7 +5,7 @@
 # Merges to main do NOT trigger a publish — only explicit releases do.
 #
 # The npm dist-tag is derived from the version string:
-#   * `-rc.*`    → `--tag rc`     (release candidates)
+#   * `-rc.*`    → `--tag latest` + `--tag rc` (RCs are the default install)
 #   * `-beta.*`  → `--tag beta`
 #   * `-alpha.*` → `--tag alpha`
 #   * otherwise  → `--tag latest` (stable releases)
@@ -242,6 +242,7 @@ jobs:
       contents: read
     outputs:
       npm_tag: ${{ steps.dist-tag.outputs.NPM_TAG }}
+      extra_tags: ${{ steps.dist-tag.outputs.EXTRA_TAGS }}
       artifact_name: ${{ steps.artifact.outputs.NAME }}
       # `node_version` is the single source of truth for Node version
       # in this workflow. `.nvmrc` lives in the repo, so we can only
@@ -327,25 +328,31 @@ jobs:
             }
           "
 
-      - name: Derive npm dist-tag from git tag
+      - name: Derive npm dist-tags from git tag
         id: dist-tag
         run: |
           TAG="${GITHUB_REF_NAME}"
           VER="${TAG#v}"
           if [[ "$VER" == *-rc.* ]]; then
-            NPM_TAG=rc
+            # RCs are the current install default — publish as latest + rc
+            NPM_TAG=latest
+            EXTRA_TAGS=rc
           elif [[ "$VER" == *-beta.* ]]; then
             NPM_TAG=beta
+            EXTRA_TAGS=""
           elif [[ "$VER" == *-alpha.* ]]; then
             NPM_TAG=alpha
+            EXTRA_TAGS=""
           elif [[ "$VER" == *-* ]]; then
             echo "::error title=Unrecognized prerelease::Version ${VER} has an unrecognized prerelease identifier. Only -rc.*, -beta.*, and -alpha.* are allowed. Refusing to publish to avoid accidentally tagging as 'latest'."
             exit 1
           else
             NPM_TAG=latest
+            EXTRA_TAGS=""
           fi
           echo "NPM_TAG=${NPM_TAG}" >> "$GITHUB_OUTPUT"
-          echo "Resolved dist-tag: ${NPM_TAG} for ${TAG}"
+          echo "EXTRA_TAGS=${EXTRA_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Resolved dist-tags: ${NPM_TAG} ${EXTRA_TAGS:++ $EXTRA_TAGS} for ${TAG}"
 
       - name: Pack public packages into tarballs
         # `pnpm pack` runs the same prepack/prepare lifecycle hooks
@@ -503,8 +510,9 @@ jobs:
         # tarball's contents. The combination of
         #   * `--ignore-scripts`           — no prepack/prepare/etc.
         #   * `--provenance`               — emits OIDC attestation
-        #   * `--tag $NPM_TAG`             — dist-tag derived from the
-        #                                    git tag (latest / rc / beta / alpha)
+        #   * `--tag $NPM_TAG`             — primary dist-tag (latest for
+        #                                    stable + rc, beta/alpha otherwise)
+        #   * extra dist-tags              — e.g. `rc` added alongside `latest`
         #   * `--access public`            — public packages by default
         #   * environment-scoped NPM_TOKEN — limits credential lifetime
         #                                    to this job
@@ -514,6 +522,8 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TAG: ${{ needs.build-and-pack.outputs.npm_tag }}
+          EXTRA_TAGS: ${{ needs.build-and-pack.outputs.extra_tags }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cd publish-artifacts
@@ -523,13 +533,37 @@ jobs:
             echo "::error::No tarballs to publish — artifact was empty"
             exit 1
           fi
+          # shellcheck disable=SC2153
+          VER="${TAG_NAME#v}"
           echo "Publishing with dist-tag: ${NPM_TAG}"
           for tarball in "${tarballs[@]}"; do
-            echo "::group::npm publish ${tarball}"
-            npm publish "${tarball}" \
+            PKG_NAME=$(tar -xf "${tarball}" --to-stdout package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf-8')).name")
+            echo "::group::${PKG_NAME}@${VER}"
+
+            # Publish (tolerate "already exists" for idempotent reruns)
+            set +e
+            PUBLISH_OUT=$(npm publish "${tarball}" \
               --provenance \
               --access public \
               --tag "${NPM_TAG}" \
-              --ignore-scripts
+              --ignore-scripts 2>&1)
+            PUBLISH_STATUS=$?
+            set -e
+            echo "${PUBLISH_OUT}"
+            if [ "${PUBLISH_STATUS}" -eq 0 ]; then
+              echo "Published ${PKG_NAME}@${VER} with --tag ${NPM_TAG}"
+              # Apply extra dist-tags only on fresh publish to avoid
+              # rolling back latest on a rerun of an older tag
+              for extra in ${EXTRA_TAGS}; do
+                echo "Adding dist-tag: ${PKG_NAME}@${VER} → ${extra}"
+                npm dist-tag add "${PKG_NAME}@${VER}" "${extra}"
+              done
+            elif echo "${PUBLISH_OUT}" | grep -qE "EPUBLISHCONFLICT|cannot publish over|previously published"; then
+              echo "⚠ ${PKG_NAME}@${VER} already published — skipping dist-tag changes to avoid rolling back newer versions"
+            else
+              echo "::error::Failed to publish ${PKG_NAME}@${VER} (exit ${PUBLISH_STATUS})"
+              exit 1
+            fi
+
             echo "::endgroup::"
           done

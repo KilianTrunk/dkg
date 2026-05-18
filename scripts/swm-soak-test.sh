@@ -207,7 +207,21 @@ import json, re, sys, os
 self_tag = '$SENDER_TAG'
 try:
   d = json.loads(sys.stdin.read())
-  rows = d.get('bindings', []) if isinstance(d, dict) else (d.get('result', {}) or {}).get('bindings', [])
+  # Codex PR #572 R1: /api/query wraps SPARQL results as
+  # {result: {bindings: [...]}}. Pre-fix this parser only looked
+  # at the top-level 'bindings' key on dict payloads (the else
+  # branch was dead code since json.loads of any JSON object
+  # always returns a dict), so every inbox snapshot was reported
+  # as empty even when SWM data had arrived. Try the wrapped
+  # location first, then fall back to a bare 'bindings' for
+  # forward-compatibility with any future flatter shape.
+  rows = []
+  if isinstance(d, dict):
+    inner = d.get('result')
+    if isinstance(inner, dict) and isinstance(inner.get('bindings'), list):
+      rows = inner['bindings']
+    elif isinstance(d.get('bindings'), list):
+      rows = d['bindings']
   by_tag = {}
   for r in rows:
     s = r.get('s', '')
@@ -343,17 +357,43 @@ try:
       rec = json.loads(line)
       if rec.get('label') != 'final': continue
       cg = rec['cgId']
-      rows = (rec.get('data') or {}).get('bindings') or []
-      by_tag = {}
+      # Codex PR #572 R1: /api/query wraps results as
+      # {result: {bindings: [...]}}. Pre-fix this parser read the
+      # top-level `data.bindings` (always absent), so the final
+      # summary saw zero rows on every record. Same wrap-unwrap
+      # as snapshot_swm_inbox above.
+      data = rec.get('data') or {}
+      rows = []
+      if isinstance(data, dict):
+        inner = data.get('result')
+        if isinstance(inner, dict) and isinstance(inner.get('bindings'), list):
+          rows = inner['bindings']
+        elif isinstance(data.get('bindings'), list):
+          rows = data['bindings']
+      # Codex PR #572 R2: the regex match + tag/seq assignment +
+      # `by_cg_final[cg] = by_tag` were all misindented out of
+      # their respective loops pre-fix — `m = re.match(...)` ran
+      # once per record (on whatever `s` happened to be at the
+      # end of the per-binding loop), `continue` jumped past the
+      # remaining records of the file (not the remaining
+      # bindings), and `by_cg_final[cg] = by_tag` ran exactly
+      # once after the whole file was read, keeping only the LAST
+      # final record. Net result: multi-row / multi-CG runs
+      # silently undercounted delivery to zero on all but one CG.
+      # Now: per-binding statements stay inside `for r in rows`,
+      # per-record assignment stays inside `for line in f`, and
+      # we ACCUMULATE into `by_cg_final[cg]` (merging share-op
+      # sequence sets per tag) so if the same `final` cgId
+      # appears more than once across the jsonl no rows are lost.
+      bucket = by_cg_final.setdefault(cg, {})
       for r in rows:
         s = r.get('s', '')
         if isinstance(s, dict): s = s.get('value', '')
         s = s.strip('<>')
-      m = re.match(r'^urn:swm-soak:([^:]+):(\d+)$', s)
-      if not m: continue
-      tag, seq = m.group(1), m.group(2)
-      by_tag.setdefault(tag, set()).add(seq)
-    by_cg_final[cg] = by_tag
+        m = re.match(r'^urn:swm-soak:([^:]+):(\d+)$', s)
+        if not m: continue
+        tag, seq = m.group(1), m.group(2)
+        bucket.setdefault(tag, set()).add(seq)
 except FileNotFoundError:
   print('  (no swm-inbox.jsonl)')
 

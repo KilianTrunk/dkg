@@ -491,7 +491,7 @@ importers:
     devDependencies:
       3d-force-graph:
         specifier: ^1.79.1
-        version: 1.79.1
+        version: 1.80.0
       '@types/n3':
         specifier: ^1.26.1
         version: 1.26.1
@@ -746,8 +746,8 @@ importers:
 
 packages:
 
-  3d-force-graph@1.79.1:
-    resolution: {integrity: sha512-iscIVt4jWjJ11KEEswgOIOWk8Ew4EFKHRyERJXJ0ouycqzHCtWwb9E5imnxS5rYF1f1IESkFNAfB+h3EkU0Irw==}
+  3d-force-graph@1.80.0:
+    resolution: {integrity: sha512-tzI353gW1nXPpnC7VTa3JjMg+3cp77qOLUFO0vucPTfF+q5R6sQsNsIqVTbRIb7RSypn14nBa4yfkOe9ThxASw==}
     engines: {node: '>=12'}
 
   '@adraffy/ens-normalize@1.10.1':
@@ -829,6 +829,10 @@ packages:
 
   '@babel/runtime@7.28.6':
     resolution: {integrity: sha512-05WQkdpL9COIMz4LjTxGpPNCdlpyimKppYNoJ5Di5EUObifl8t4tuLuUBBZEpoLYOmfvIWrsp9fCl0HoPRVTdA==}
+    engines: {node: '>=6.9.0'}
+
+  '@babel/runtime@7.29.2':
+    resolution: {integrity: sha512-JiDShH45zKHWyGe4ZNVRrCjBz8Nh9TMmZG1kh4QTK8hCBTWBi8Da+i7s1fJw7/lYpM4ccepSNfqzZ/QvABBi5g==}
     engines: {node: '>=6.9.0'}
 
   '@babel/template@7.28.6':
@@ -4000,6 +4004,9 @@ packages:
   lodash-es@4.17.23:
     resolution: {integrity: sha512-kVI48u3PZr38HdYz98UmfPnXl2DXrpdctLrFLCd3kOx1xUkOmpFPx7gCWWM5MPkL/fD8zb+Ph0QzjGFs4+hHWg==}
 
+  lodash-es@4.18.1:
+    resolution: {integrity: sha512-J8xewKD/Gk22OZbhpOVSwcs60zhd95ESDwezOFuA3/099925PdHJ7OFHNTGtajL3AlZkykD32HykiMo+BIBI8A==}
+
   lodash.camelcase@4.3.0:
     resolution: {integrity: sha512-TwuEnCnxbc3rAvhf/LbG7tJUDzhqXyFnv3dtzLOPgCG/hODL7WFnsbwktkD7yUV0RrreP/l1PALq/YSg6VvjlA==}
 
@@ -4635,8 +4642,8 @@ packages:
     resolution: {integrity: sha512-dM0jVuXJPsDN6DvRpea484tCUaMiXWjuCn++HGTqUWzGDjv5tZkEZldAJ/UMlqRYGFrD/etByo4/xOuC/snX2A==}
     engines: {node: '>=20'}
 
-  preact@10.28.4:
-    resolution: {integrity: sha512-uKFfOHWuSNpRFVTnljsCluEFq57OKT+0QdOiQo8XWnQ/pSvg7OpX5eNOejELXJMWy+BwM2nobz0FkvzmnpCNsQ==}
+  preact@10.29.2:
+    resolution: {integrity: sha512-7tNmwg/7mzzAoB/8kSg6Hl37JraAZw3Z3A0JSY7VXlZwo82Xn0G7wKbNNs2qoF4ZEEsQGTwDAroNdqKs1ofJxQ==}
 
   prebuild-install@7.1.3:
     resolution: {integrity: sha512-8Mf2cbV7x1cXPUILADGI3wuhfqWvtiLA1iclTDbFRZkgRQS0NqsPZphna9V+HyTEadheuPmjaJMsbzKQFOzLug==}
@@ -5232,17 +5239,17 @@ packages:
   thenify@3.3.1:
     resolution: {integrity: sha512-RVZSIV5IG10Hk3enotrhvz0T9em6cyHBLkH/YAZuKqd8hRkKhSfCGIcP2KUY0EPxndzANBmNllzWPwak+bheSw==}
 
-  three-forcegraph@1.43.1:
-    resolution: {integrity: sha512-lQnYPLvR31gb91mF5xHhU0jPHJgBPw9QB23R6poCk8Tgvz8sQtq7wTxwClcPdfKCBbHXsb7FSqK06Osiu1kQ5A==}
+  three-forcegraph@1.43.4:
+    resolution: {integrity: sha512-FtmiZP/T16ZQaHza3JDaDn0YTXFtg9e7pGnTeU8nzu0NNkx7MpWbF/GvmpbQsWHx3rukHtkRv1fTorLPB3FDEA==}
     engines: {node: '>=12'}
     peerDependencies:
       three: '>=0.118.3'
 
-  three-render-objects@1.40.4:
-    resolution: {integrity: sha512-Ukpu1pei3L5r809izvjsZxwuRcYLiyn6Uvy3lZ9bpMTdvj3i6PeX6w++/hs2ZS3KnEzGjb6YvTvh4UQuwHTDJg==}
+  three-render-objects@1.42.0:
+    resolution: {integrity: sha512-KYfkPrYGEbIK8ChFocWqOF1aAN80FBUBWVYB8mB2oBpVuVN+52FvvngVYB5ieFANQu7Rt21rPYZ/xKaAgVWWRQ==}
     engines: {node: '>=12'}
     peerDependencies:
-      three: '>=0.168'
+      three: '>=0.179'
 
   three@0.184.0:
     resolution: {integrity: sha512-wtTRjG92pM5eUg/KuUnHsqSAlPM296brTOcLgMRqEeylYTh/CdtvKUvCyyCQTzFuStieWxvZb8mVTMvdPyUpxg==}
@@ -5999,13 +6006,13 @@ packages:
 
 snapshots:
 
-  3d-force-graph@1.79.1:
+  3d-force-graph@1.80.0:
     dependencies:
       accessor-fn: 1.5.3
       kapsule: 1.16.3
       three: 0.184.0
-      three-forcegraph: 1.43.1(three@0.184.0)
-      three-render-objects: 1.40.4(three@0.184.0)
+      three-forcegraph: 1.43.4(three@0.184.0)
+      three-render-objects: 1.42.0(three@0.184.0)
 
   '@adraffy/ens-normalize@1.10.1': {}
 
@@ -6101,6 +6108,8 @@ snapshots:
       '@babel/helper-plugin-utils': 7.28.6
 
   '@babel/runtime@7.28.6': {}
+
+  '@babel/runtime@7.29.2': {}
 
   '@babel/template@7.28.6':
     dependencies:
@@ -8955,7 +8964,7 @@ snapshots:
     dependencies:
       d3-selection: 3.0.0
       kapsule: 1.16.3
-      preact: 10.28.4
+      preact: 10.29.2
 
   fmix@0.1.0:
     dependencies:
@@ -9701,7 +9710,7 @@ snapshots:
 
   kapsule@1.16.3:
     dependencies:
-      lodash-es: 4.17.23
+      lodash-es: 4.18.1
 
   keccak@3.0.4:
     dependencies:
@@ -9787,6 +9796,8 @@ snapshots:
       p-locate: 5.0.0
 
   lodash-es@4.17.23: {}
+
+  lodash-es@4.18.1: {}
 
   lodash.camelcase@4.3.0: {}
 
@@ -10636,7 +10647,7 @@ snapshots:
 
   polished@4.3.1:
     dependencies:
-      '@babel/runtime': 7.28.6
+      '@babel/runtime': 7.29.2
 
   possible-typed-array-names@1.1.0: {}
 
@@ -10657,7 +10668,7 @@ snapshots:
 
   powershell-utils@0.1.0: {}
 
-  preact@10.28.4: {}
+  preact@10.29.2: {}
 
   prebuild-install@7.1.3:
     dependencies:
@@ -11411,7 +11422,7 @@ snapshots:
     dependencies:
       any-promise: 1.3.0
 
-  three-forcegraph@1.43.1(three@0.184.0):
+  three-forcegraph@1.43.4(three@0.184.0):
     dependencies:
       accessor-fn: 1.5.3
       d3-array: 3.2.4
@@ -11425,7 +11436,7 @@ snapshots:
       three: 0.184.0
       tinycolor2: 1.6.0
 
-  three-render-objects@1.40.4(three@0.184.0):
+  three-render-objects@1.42.0(three@0.184.0):
     dependencies:
       '@tweenjs/tween.js': 25.0.0
       accessor-fn: 1.5.3

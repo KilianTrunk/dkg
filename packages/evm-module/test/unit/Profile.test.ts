@@ -388,6 +388,208 @@ describe('@unit Profile contract', function () {
         identityId1,
       );
     });
+
+    it('reverts ProfileAlreadyExists when the Identity still has a Profile', async () => {
+      await Profile.createProfile(
+        accounts[1].address,
+        [],
+        'Node 1',
+        nodeId1,
+        1000,
+      );
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      )
+        .to.be.revertedWithCustomError(Profile, 'ProfileAlreadyExists')
+        .withArgs(identityId1);
+    });
+
+    it('reverts when caller is an operational key (not admin) of the Identity', async () => {
+      await seedBrickedIdentity();
+
+      // accounts[0] is the operational key minted by createProfile.
+      await expect(
+        Profile.connect(accounts[0]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
+    });
+
+    it('reverts when caller holds no admin key for the identityId', async () => {
+      await seedBrickedIdentity();
+
+      await expect(
+        Profile.connect(accounts[5]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
+    });
+
+    it('reverts EmptyNodeName for an empty node name', async () => {
+      await seedBrickedIdentity();
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          '',
+          nodeId1,
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'EmptyNodeName');
+    });
+
+    it('reverts EmptyNodeId for an empty node id', async () => {
+      await seedBrickedIdentity();
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          'Node 1',
+          '0x',
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'EmptyNodeId');
+    });
+
+    it('reverts NodeIdAlreadyExists when the node id is taken by another node', async () => {
+      await seedBrickedIdentity();
+      await Profile.connect(accounts[3]).createProfile(
+        accounts[4].address,
+        [],
+        'Node 2',
+        nodeId1,
+        1000,
+      );
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'NodeIdAlreadyExists');
+    });
+
+    it('reverts NodeNameAlreadyExists when the node name is taken', async () => {
+      await seedBrickedIdentity();
+
+      // isNameTaken has no on-chain setter (pre-existing protocol
+      // behavior), so flip the storage slot directly to exercise the
+      // verbatim createProfile name-uniqueness guard.
+      const nameTakenSlot = hre.ethers.keccak256(
+        hre.ethers.solidityPacked(['string', 'uint256'], ['Node 1', 2]),
+      );
+      await hre.network.provider.send('hardhat_setStorageAt', [
+        await ProfileStorage.getAddress(),
+        nameTakenSlot,
+        hre.ethers.zeroPadValue('0x01', 32),
+      ]);
+      expect(await ProfileStorage.isNameTaken('Node 1')).to.equal(true);
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'NodeNameAlreadyExists');
+    });
+
+    it('accepts initialOperatorFee equal to the max and rejects above it', async () => {
+      await seedBrickedIdentity();
+      const maxFee = await ParametersStorage.maxOperatorFee();
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          maxFee,
+        ),
+      ).to.not.be.reverted;
+    });
+
+    it('reverts OperatorFeeOutOfRange when initialOperatorFee exceeds the max', async () => {
+      await seedBrickedIdentity();
+      const maxFee = await ParametersStorage.maxOperatorFee();
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          maxFee + 1n,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'OperatorFeeOutOfRange');
+    });
+
+    it('is gated by the whitelist: reverts when enabled and admin not whitelisted', async () => {
+      await seedBrickedIdentity();
+      await WhitelistStorage.enableWhitelist();
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(
+        Profile,
+        'OnlyWhitelistedAddressesFunction',
+      );
+    });
+
+    it('whitelist enabled and admin whitelisted -> succeeds', async () => {
+      await seedBrickedIdentity();
+      await WhitelistStorage.enableWhitelist();
+      await WhitelistStorage.whitelistAddress(accounts[1].address);
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          identityId1,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.not.be.reverted;
+    });
+
+    it('regression: a brand-new wallet can still createProfile after a recovery', async () => {
+      await seedBrickedIdentity();
+      await Profile.connect(accounts[1]).recreateProfile(
+        identityId1,
+        'Node 1',
+        nodeId1,
+        1000,
+      );
+
+      const nodeId2 =
+        '0x17f38512786964d9e70453371e7c98975d284100d44bd68dab67fe00b525cb66';
+      await expect(
+        Profile.connect(accounts[3]).createProfile(
+          accounts[4].address,
+          [],
+          'Node 2',
+          nodeId2,
+          1000,
+        ),
+      ).to.not.be.reverted;
+    });
   });
 
   // =====================================================================

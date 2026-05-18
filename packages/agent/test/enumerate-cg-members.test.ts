@@ -97,6 +97,38 @@ describe('createCGMemberEnumerator: public CG (topic-subscribers source)', () =>
     expect(result.source).toBe('topic-subscribers');
     expect(result.members).toEqual(['peerY']);
   });
+
+  /**
+   * Regression for codex review on PR #571 round 2: source label
+   * MUST be derived from the FILTERED member list, not the raw
+   * subscriber count. Otherwise a public CG where only `self` is
+   * subscribed (common bootstrap state — we're first to subscribe,
+   * no one else has joined) returns `{ source: 'topic-subscribers',
+   * members: [] }`, and any caller that treats `source !== 'none'`
+   * as "I have remote recipients" silently skips the gossip-only
+   * fallback.
+   */
+  it('returns source=none when the only subscriber is self', async () => {
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      getContextGraphAllowedPeers: async () => null,
+      getTopicSubscribers: () => [SELF],
+    }));
+
+    const result = await enumerator.enumerate('cg-public-self-only');
+
+    expect(result).toEqual({ source: 'none', members: [] });
+  });
+
+  it('returns source=none when duplicates collapse to an empty filtered set', async () => {
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      getContextGraphAllowedPeers: async () => null,
+      getTopicSubscribers: () => [SELF, SELF, SELF],
+    }));
+
+    const result = await enumerator.enumerate('cg-public-self-dupes');
+
+    expect(result).toEqual({ source: 'none', members: [] });
+  });
 });
 
 /**
@@ -306,6 +338,67 @@ describe('createCGMemberEnumerator: TTL cache', () => {
     // TTL hit the normal cache (no additional dep invocations).
     await enumerator.enumerate('cg-burst');
     expect(allowedCalls).toBe(1);
+  });
+
+  /**
+   * Regression for codex review on PR #571 round 2: `invalidate()`
+   * MUST also drop the in-flight slot AND prevent the stale resolve
+   * from polluting the cache. Otherwise:
+   *   - the next `enumerate(cgId)` joins the still-pending stale
+   *     promise and returns the pre-invalidation roster (visible
+   *     bug, breaks documented "fresh resolution on the next call"
+   *     contract);
+   *   - even after clearing the in-flight slot, the stale resolve's
+   *     `cache.set` could still land after a fresher resolve had
+   *     populated the cache (subtle bug, would cause sporadic
+   *     stale reads on TTL hits).
+   *
+   * The generation counter pinning the stale resolve out of the
+   * cache covers both.
+   */
+  it('invalidate() during an in-flight resolve forces the NEXT enumerate to start a fresh resolve', async () => {
+    let allowedCalls = 0;
+    let resolveSlow!: (peers: string[]) => void;
+    const slowAnswers: Array<Promise<string[]>> = [];
+    slowAnswers.push(new Promise<string[]>((res) => { resolveSlow = res; }));
+
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      getContextGraphAllowedPeers: async () => {
+        allowedCalls += 1;
+        if (allowedCalls === 1) return slowAnswers[0];
+        return ['peerNew'];
+      },
+    }));
+
+    const firstCall = enumerator.enumerate('cg-invalidate-race');
+    // First call is now in flight, blocked on slowAnswers[0]. Drain
+    // microtasks so the in-flight slot is installed.
+    await new Promise<void>((res) => setImmediate(res));
+    expect(allowedCalls).toBe(1);
+
+    enumerator.invalidate('cg-invalidate-race');
+
+    // Second call MUST NOT join the stale promise; it MUST start a
+    // fresh resolve. Pre-fix it would join `firstCall`.
+    const secondCall = enumerator.enumerate('cg-invalidate-race');
+    await new Promise<void>((res) => setImmediate(res));
+    expect(allowedCalls).toBe(2);
+
+    // Resolve the original (stale) promise. Its result MUST NOT
+    // overwrite the cache populated by the fresh resolve. The first
+    // caller still gets the pre-invalidation value (it asked before
+    // invalidate ran — that's the contract).
+    resolveSlow(['peerStale']);
+
+    const [firstResult, secondResult] = await Promise.all([firstCall, secondCall]);
+    expect(firstResult.members).toEqual(['peerStale']);
+    expect(secondResult.members).toEqual(['peerNew']);
+
+    // The cache MUST hold the fresh resolve's value, not the stale
+    // one. Verify by a TTL-hit call: it must reflect `peerNew`.
+    const third = await enumerator.enumerate('cg-invalidate-race');
+    expect(third.members).toEqual(['peerNew']);
+    expect(allowedCalls).toBe(2);
   });
 
   it('releases the in-flight slot on resolution so post-TTL recompute can re-enter', async () => {

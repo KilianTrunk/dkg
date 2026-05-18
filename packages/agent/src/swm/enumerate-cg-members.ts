@@ -136,20 +136,46 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
   const cache = new Map<string, { computedAtMs: number; value: CGMemberEnumeration }>();
   // In-flight promise dedup so a burst of concurrent `enumerate(cgId)`
   // calls for the same cgId collapses onto a single resolution. Bug
-  // fix (codex review on #571): without this, the burst optimisation
-  // the cache TTL is supposed to provide didn't actually fire for
-  // CONCURRENT bursts — every concurrent call saw a cache miss
-  // (cache is populated only after the async resolution finishes) and
-  // each performed its own SPARQL query + `getSubscribers` call. The
-  // entry is removed in `finally` so a future call after the promise
-  // settles consults the TTL cache normally.
+  // fix (codex review on #571 round 1): without this, the burst
+  // optimisation the cache TTL is supposed to provide didn't actually
+  // fire for CONCURRENT bursts — every concurrent call saw a cache
+  // miss (cache is populated only after the async resolution
+  // finishes) and each performed its own SPARQL query +
+  // `getSubscribers` call.
   const inFlight = new Map<string, Promise<CGMemberEnumeration>>();
+  // Per-cgId generation counter bumped on every `invalidate(cgId)`.
+  // Bug fix (codex review on #571 round 2): `invalidate()` previously
+  // only cleared the resolved TTL cache, so concurrent
+  // `enumerate(cgId)` callers that arrived AFTER an `invalidate()`
+  // but while an earlier resolve was still in flight would join the
+  // stale promise and observe the pre-invalidation roster. Even with
+  // the in-flight slot also cleared in `invalidate()`, there is still
+  // a write-after-invalidate race where the stale resolve's
+  // `cache.set` could land after a fresh resolve had already
+  // populated the cache. The generation counter is captured BEFORE
+  // each resolve starts, and the resolve refuses to write to the
+  // cache if the captured generation no longer matches the current
+  // one — pinning the documented "fresh resolution on the next call"
+  // contract end-to-end.
+  const generation = new Map<string, number>();
+  const currentGen = (cgId: string): number => generation.get(cgId) ?? 0;
 
   function isFresh(entry: { computedAtMs: number }, nowMs: number): boolean {
     return nowMs - entry.computedAtMs < ttl;
   }
 
-  async function resolve(cgId: string, computedAtMs: number): Promise<CGMemberEnumeration> {
+  async function resolve(cgId: string, gen: number, computedAtMs: number): Promise<CGMemberEnumeration> {
+    const result = await computeMembers(cgId);
+    // Only commit to the TTL cache if no `invalidate(cgId)` has run
+    // since this resolve started. Otherwise a stale resolve could
+    // overwrite a fresher one (or pollute a freshly-cleared cache).
+    if (currentGen(cgId) === gen) {
+      cache.set(cgId, { computedAtMs, value: result });
+    }
+    return result;
+  }
+
+  async function computeMembers(cgId: string): Promise<CGMemberEnumeration> {
     const allowed = await deps.getContextGraphAllowedPeers(cgId);
 
     if (allowed !== null) {
@@ -158,12 +184,10 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
       // (curator removed every member; do NOT fall through to topic
       // subscribers — that would re-admit peers the curator just
       // kicked).
-      const result: CGMemberEnumeration = {
+      return {
         source: 'allowlist',
         members: dedupAndExcludeSelf(allowed, deps.selfPeerId),
       };
-      cache.set(cgId, { computedAtMs, value: result });
-      return result;
     }
 
     // No peer allowlist exists. Disambiguate private (agent-gated)
@@ -171,22 +195,25 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
     // sync / SWM-share auth. Fail closed for private CGs (see
     // `isPrivateContextGraph` jsdoc on CGMemberEnumeratorDeps).
     if (await deps.isPrivateContextGraph(cgId)) {
-      const result: CGMemberEnumeration = { source: 'none', members: [] };
-      cache.set(cgId, { computedAtMs, value: result });
-      return result;
+      return { source: 'none', members: [] };
     }
 
     // Public CG: no on-chain roster exists by design (subscribers
     // don't pay to subscribe). Use the live GossipSub view.
+    //
+    // Source label is derived from the FILTERED member list, not
+    // from the raw subscriber count. Bug fix (codex review on #571
+    // round 2): when the only subscriber visible is `self` (common
+    // when we're the first to subscribe to a public CG and no one
+    // else has joined yet) or duplicates collapse away, we'd
+    // otherwise return `{ source: 'topic-subscribers', members: [] }`
+    // and any caller that treats `source !== 'none'` as "I have
+    // remote recipients" would skip the intended fallback.
     const subscribers = deps.getTopicSubscribers(deps.topicForCG(cgId));
-    const result: CGMemberEnumeration = subscribers.length === 0
+    const members = dedupAndExcludeSelf(subscribers, deps.selfPeerId);
+    return members.length === 0
       ? { source: 'none', members: [] }
-      : {
-        source: 'topic-subscribers',
-        members: dedupAndExcludeSelf(subscribers, deps.selfPeerId),
-      };
-    cache.set(cgId, { computedAtMs, value: result });
-    return result;
+      : { source: 'topic-subscribers', members };
   }
 
   return {
@@ -200,15 +227,29 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
       const existing = inFlight.get(cgId);
       if (existing) return existing;
 
-      const promise = resolve(cgId, nowMs).finally(() => {
-        inFlight.delete(cgId);
+      const gen = currentGen(cgId);
+      const promise = resolve(cgId, gen, nowMs).finally(() => {
+        // Only release the slot if it still points to OUR promise.
+        // After `invalidate()` clears `inFlight[cgId]` and a fresh
+        // caller installs a new in-flight promise, we must not
+        // delete that fresh entry.
+        if (inFlight.get(cgId) === promise) {
+          inFlight.delete(cgId);
+        }
       });
       inFlight.set(cgId, promise);
       return promise;
     },
 
     invalidate(cgId: string): void {
+      generation.set(cgId, currentGen(cgId) + 1);
       cache.delete(cgId);
+      // Also drop the in-flight slot so the next `enumerate(cgId)`
+      // triggers a fresh resolve instead of joining the now-stale
+      // pending promise. The stale resolve's `cache.set` is gated
+      // by the generation check above, so it can't pollute the cache
+      // after this point.
+      inFlight.delete(cgId);
     },
 
     size(): number {

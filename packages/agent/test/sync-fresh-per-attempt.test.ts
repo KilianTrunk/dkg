@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { fetchSyncPages } from '../src/sync/requester/page-fetch.js';
 import type { OperationContext } from '@origintrail-official/dkg-core';
 
@@ -39,6 +39,38 @@ async function singleQuadParser(nquadsText: string): Promise<{ quads: never[]; t
 }
 
 describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', () => {
+  // Fake timers eliminate the real `withRetry` exponential backoff
+  // (~1s + 2s between attempts for syncPageRetryAttempts=3), which
+  // would otherwise add ~12s of wall-clock to the suite for the
+  // four tests below that each force 3 retries. Codex review
+  // follow-up #11 on #569.
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Runs `fetchSyncPages` while pumping the fake-timer clock until
+   * the promise resolves. `vi.runAllTimersAsync()` flushes one
+   * round of timers AND awaits microtasks they schedule, so calling
+   * it in a loop lets us drain a chain of `setTimeout` calls (one
+   * per `withRetry` attempt) without paying the real wall-clock
+   * cost.
+   */
+  async function runFetchWithFakeTimers<T>(promise: Promise<T>): Promise<T> {
+    let done = false;
+    promise.finally(() => {
+      done = true;
+    });
+    while (!done) {
+      await vi.runAllTimersAsync();
+    }
+    return promise;
+  }
+
   /**
    * Codex review #569 follow-up #1: original PR called
    * `sendReliable` without any `messageId` plumbing. Final design
@@ -51,40 +83,42 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
     const observedMessageIds: string[] = [];
     let sendAttempts = 0;
 
-    await fetchSyncPages({
-      ctx: makeCtx(),
-      remotePeerId: REMOTE_PEER_ID,
-      contextGraphId: CG_ID,
-      includeSharedMemory: false,
-      phase: 'data',
-      graphUri: GRAPH_URI,
-      deadline: Date.now() + 60_000,
-      syncPageTimeoutMs: 5_000,
-      syncRouterAttempts: 1,
-      syncPageRetryAttempts: 3,
-      syncPageSize: 100,
-      syncDeniedResponse: '#DENIED',
-      debugSyncProgress: false,
-      protocolSync: PROTOCOL_ID,
-      checkpointStore: {
-        get: () => 0,
-        set: () => {},
-        delete: () => {},
-      },
-      buildSyncRequest: async () => new TextEncoder().encode('request'),
-      parseAndFilter: singleQuadParser,
-      send: async (_peerId, _protocolId, _data, _timeoutMs, messageId) => {
-        observedMessageIds.push(messageId);
-        sendAttempts++;
-        if (sendAttempts < 3) {
-          throw new Error(`transient failure ${sendAttempts}`);
-        }
-        return new TextEncoder().encode('one-quad-line');
-      },
-      logWarn: noopLog,
-      logInfo: noopLog,
-      logDebug: noopLog,
-    });
+    await runFetchWithFakeTimers(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: false,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 3,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => new TextEncoder().encode('request'),
+        parseAndFilter: singleQuadParser,
+        send: async (_peerId, _protocolId, _data, _timeoutMs, messageId) => {
+          observedMessageIds.push(messageId);
+          sendAttempts++;
+          if (sendAttempts < 3) {
+            throw new Error(`transient failure ${sendAttempts}`);
+          }
+          return new TextEncoder().encode('one-quad-line');
+        },
+        logWarn: noopLog,
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    );
 
     expect(observedMessageIds.length).toBe(3);
     for (const id of observedMessageIds) {
@@ -108,40 +142,42 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
     const observedMessageIds: string[] = [];
     let sendAttempts = 0;
 
-    await fetchSyncPages({
-      ctx: makeCtx(),
-      remotePeerId: REMOTE_PEER_ID,
-      contextGraphId: CG_ID,
-      includeSharedMemory: false,
-      phase: 'data',
-      graphUri: GRAPH_URI,
-      deadline: Date.now() + 60_000,
-      syncPageTimeoutMs: 5_000,
-      syncRouterAttempts: 1,
-      syncPageRetryAttempts: 3,
-      syncPageSize: 100,
-      syncDeniedResponse: '#DENIED',
-      debugSyncProgress: false,
-      protocolSync: PROTOCOL_ID,
-      checkpointStore: {
-        get: () => 0,
-        set: () => {},
-        delete: () => {},
-      },
-      buildSyncRequest: async () => new TextEncoder().encode('request'),
-      parseAndFilter: singleQuadParser,
-      send: async (_peerId, _protocolId, _data, _timeoutMs, messageId) => {
-        observedMessageIds.push(messageId);
-        sendAttempts++;
-        if (sendAttempts < 3) {
-          throw new Error(`transient failure ${sendAttempts}`);
-        }
-        return new TextEncoder().encode('one-quad-line');
-      },
-      logWarn: noopLog,
-      logInfo: noopLog,
-      logDebug: noopLog,
-    });
+    await runFetchWithFakeTimers(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: false,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 3,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => new TextEncoder().encode('request'),
+        parseAndFilter: singleQuadParser,
+        send: async (_peerId, _protocolId, _data, _timeoutMs, messageId) => {
+          observedMessageIds.push(messageId);
+          sendAttempts++;
+          if (sendAttempts < 3) {
+            throw new Error(`transient failure ${sendAttempts}`);
+          }
+          return new TextEncoder().encode('one-quad-line');
+        },
+        logWarn: noopLog,
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    );
 
     expect(observedMessageIds.length).toBe(3);
     expect(new Set(observedMessageIds).size).toBe(3);
@@ -167,49 +203,51 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
     let sendAttempts = 0;
     const builtPayloads: string[] = [];
 
-    await fetchSyncPages({
-      ctx: makeCtx(),
-      remotePeerId: REMOTE_PEER_ID,
-      contextGraphId: CG_ID,
-      includeSharedMemory: false,
-      phase: 'data',
-      graphUri: GRAPH_URI,
-      deadline: Date.now() + 60_000,
-      syncPageTimeoutMs: 5_000,
-      syncRouterAttempts: 1,
-      syncPageRetryAttempts: 3,
-      syncPageSize: 100,
-      syncDeniedResponse: '#DENIED',
-      debugSyncProgress: false,
-      protocolSync: PROTOCOL_ID,
-      checkpointStore: {
-        get: () => 0,
-        set: () => {},
-        delete: () => {},
-      },
-      buildSyncRequest: async () => {
-        buildCalls++;
-        const payload = `request-attempt-${buildCalls}-${Math.random()}`;
-        builtPayloads.push(payload);
-        return new TextEncoder().encode(payload);
-      },
-      parseAndFilter: singleQuadParser,
-      send: async (_peerId, _protocolId, data) => {
-        sendAttempts++;
-        // Capture which build the send received, so the assertion
-        // is checking real per-attempt-build behaviour and not just
-        // a call count.
-        const received = new TextDecoder().decode(data);
-        expect(received).toBe(builtPayloads[sendAttempts - 1]);
-        if (sendAttempts < 3) {
-          throw new Error(`transient failure ${sendAttempts}`);
-        }
-        return new TextEncoder().encode('one-quad-line');
-      },
-      logWarn: noopLog,
-      logInfo: noopLog,
-      logDebug: noopLog,
-    });
+    await runFetchWithFakeTimers(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: false,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 3,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => {
+          buildCalls++;
+          const payload = `request-attempt-${buildCalls}-${Math.random()}`;
+          builtPayloads.push(payload);
+          return new TextEncoder().encode(payload);
+        },
+        parseAndFilter: singleQuadParser,
+        send: async (_peerId, _protocolId, data) => {
+          sendAttempts++;
+          // Capture which build the send received, so the assertion
+          // is checking real per-attempt-build behaviour and not just
+          // a call count.
+          const received = new TextDecoder().decode(data);
+          expect(received).toBe(builtPayloads[sendAttempts - 1]);
+          if (sendAttempts < 3) {
+            throw new Error(`transient failure ${sendAttempts}`);
+          }
+          return new TextEncoder().encode('one-quad-line');
+        },
+        logWarn: noopLog,
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    );
 
     expect(buildCalls).toBe(3);
     expect(sendAttempts).toBe(3);
@@ -229,42 +267,44 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
     let buildCalls = 0;
     let sendCalls = 0;
 
-    await fetchSyncPages({
-      ctx: makeCtx(),
-      remotePeerId: REMOTE_PEER_ID,
-      contextGraphId: CG_ID,
-      includeSharedMemory: false,
-      phase: 'data',
-      graphUri: GRAPH_URI,
-      deadline: Date.now() + 60_000,
-      syncPageTimeoutMs: 5_000,
-      syncRouterAttempts: 1,
-      syncPageRetryAttempts: 5,
-      syncPageSize: 100,
-      syncDeniedResponse: '#DENIED',
-      debugSyncProgress: false,
-      protocolSync: PROTOCOL_ID,
-      checkpointStore: {
-        get: () => 0,
-        set: () => {},
-        delete: () => {},
-      },
-      buildSyncRequest: async () => {
-        buildCalls++;
-        if (buildCalls < 3) {
-          throw new Error(`transient build failure ${buildCalls}`);
-        }
-        return new TextEncoder().encode('request');
-      },
-      parseAndFilter: singleQuadParser,
-      send: async () => {
-        sendCalls++;
-        return new TextEncoder().encode('one-quad-line');
-      },
-      logWarn: noopLog,
-      logInfo: noopLog,
-      logDebug: noopLog,
-    });
+    await runFetchWithFakeTimers(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: false,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 5,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => {
+          buildCalls++;
+          if (buildCalls < 3) {
+            throw new Error(`transient build failure ${buildCalls}`);
+          }
+          return new TextEncoder().encode('request');
+        },
+        parseAndFilter: singleQuadParser,
+        send: async () => {
+          sendCalls++;
+          return new TextEncoder().encode('one-quad-line');
+        },
+        logWarn: noopLog,
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    );
 
     // 3 build attempts (2 throws + 1 success), 1 send. The send
     // call count proves the build retries gated the send (a build

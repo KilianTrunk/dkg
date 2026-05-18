@@ -3101,21 +3101,29 @@ export class DKGAgent {
       // succeed at the receiver but the responses are lost in
       // transit. Bounded waste, app-layer idempotent, acceptable.
       //
-      // `maxAgeMs` bounds the substrate's outbox lifecycle for sync
-      // envelopes specifically. The default 24h outbox window would
-      // let an envelope hang around long past its 90s auth
-      // freshness TTL (`SYNC_AUTH_MAX_AGE_MS`); the outbox's
-      // eventual delivery of a stale envelope would be denied by
-      // the receiver and the denial cached under that messageId.
-      // (With fresh messageIds the cached denial doesn't replay
-      // onto subsequent attempts, but the wasted outbox tick work
-      // still happens.) `SYNC_AUTH_MAX_AGE_MS - 5_000` gives ~5s
-      // of margin for clock skew + network latency.
+      // Known residual concern (codex review #569 follow-up #10,
+      // deferred): recoverable sync send failures land in the
+      // Messenger's shared outbox with the default 24h max-age.
+      // Sync envelopes carry their own 90s freshness TTL
+      // (`SYNC_AUTH_MAX_AGE_MS`), so any outbox-delivered envelope
+      // past that window is denied by the receiver — wasted tick
+      // work, but NOT a correctness problem because fresh
+      // messageIds prevent the cached denial from ever replaying
+      // onto a different attempt. A per-call `maxAgeMs` was
+      // explored, but `Messenger.sendReliable`'s
+      // `enqueueFailure` path doesn't currently read
+      // `opts.maxAgeMs` (only the instance-wide setting at
+      // construction time), so wiring it through is out of scope
+      // for this PR. Also out of scope: extending
+      // `getPeerDiagnostics()` to include per-protocol queued
+      // counts so stuck sync catch-up is observable in the MCP
+      // health endpoint (today only `PROTOCOL_MESSAGE` queued
+      // entries are reported there). Both follow-ups are tracked
+      // for rc.10.
       send: async (peerId, protocolId, data, sendTimeoutMs, messageId) => {
         const result = await this.messenger.sendReliable(peerId, protocolId, data, {
           timeoutMs: sendTimeoutMs,
           messageId,
-          maxAgeMs: SYNC_AUTH_MAX_AGE_MS - 5_000,
         });
         if (!result.delivered) {
           throw new Error(

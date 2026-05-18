@@ -60,15 +60,40 @@ export interface CGMemberEnumeration {
 
 export interface CGMemberEnumeratorDeps {
   /**
-   * Resolves a CG's peer allowlist. Returns `null` for non-curated
-   * CGs (no `DKG_ALLOWED_PEER` triples in the meta graph) — the
-   * enumerator interprets `null` as "fall through to topic-subscribers".
+   * Resolves a CG's peer allowlist. Returns `null` for CGs without
+   * an explicit `DKG_ALLOWED_PEER` allowlist in the meta graph. A
+   * `null` return does NOT by itself mean "public" — agent-gated
+   * private CGs (`DKG_ALLOWED_AGENT` / `DKG_PARTICIPANT_AGENT`
+   * without peer allowlist triples) also return `null` here. The
+   * enumerator disambiguates via {@link isPrivateContextGraph}.
    * Returns `[]` for a curated CG whose allowlist is explicitly
-   * empty (rare; the enumerator surfaces this as `source: 'allowlist'`
-   * with zero members so callers can distinguish "curated with zero
-   * remaining members" from "public CG with no subscribers").
+   * empty (rare; surfaced as `source: 'allowlist'` with zero members
+   * so callers can distinguish "curated with zero remaining members"
+   * from "public CG with no subscribers").
    */
   getContextGraphAllowedPeers: (cgId: string) => Promise<string[] | null>;
+  /**
+   * Returns true for any private CG — peer-allowlisted, agent-gated,
+   * or both. Same predicate the responder consults to gate sync /
+   * SWM-share auth (see `DKGAgent.isPrivateContextGraph`), so
+   * fan-out classification stays consistent with the data-plane
+   * access control.
+   *
+   * Bug fix (codex review on #571): without this, a CG that is
+   * private via `DKG_ALLOWED_AGENT` ONLY (no `DKG_ALLOWED_PEER`
+   * triples) was misclassified as public — `getContextGraphAllowedPeers`
+   * returns null, and the old code fell straight through to live
+   * topic subscribers. That would fan out SWM shares to GossipSub
+   * subscribers who are NOT actually allowed members, risking a
+   * metadata leak (the encrypted payload itself is still gated by
+   * the per-CG key, but the bare fact that a share exists would
+   * reach unauthorized nodes). Fail closed: if the CG is private
+   * but we have no enumerable peer allowlist, return `source:
+   * 'none'` with empty members so the caller falls back to
+   * gossip-only delivery (still safe because the receiver enforces
+   * auth on the gossip path too).
+   */
+  isPrivateContextGraph: (cgId: string) => Promise<boolean>;
   /**
    * Best-effort snapshot of peers subscribed to {@link topic} as
    * observed via GossipSub heartbeat + peer-exchange. May be empty
@@ -109,9 +134,59 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
   const now = deps.now ?? (() => Date.now());
   const ttl = deps.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
   const cache = new Map<string, { computedAtMs: number; value: CGMemberEnumeration }>();
+  // In-flight promise dedup so a burst of concurrent `enumerate(cgId)`
+  // calls for the same cgId collapses onto a single resolution. Bug
+  // fix (codex review on #571): without this, the burst optimisation
+  // the cache TTL is supposed to provide didn't actually fire for
+  // CONCURRENT bursts — every concurrent call saw a cache miss
+  // (cache is populated only after the async resolution finishes) and
+  // each performed its own SPARQL query + `getSubscribers` call. The
+  // entry is removed in `finally` so a future call after the promise
+  // settles consults the TTL cache normally.
+  const inFlight = new Map<string, Promise<CGMemberEnumeration>>();
 
   function isFresh(entry: { computedAtMs: number }, nowMs: number): boolean {
     return nowMs - entry.computedAtMs < ttl;
+  }
+
+  async function resolve(cgId: string, computedAtMs: number): Promise<CGMemberEnumeration> {
+    const allowed = await deps.getContextGraphAllowedPeers(cgId);
+
+    if (allowed !== null) {
+      // Curated CG with explicit peer allowlist: roster is
+      // authoritative. Even an empty allowlist is meaningful
+      // (curator removed every member; do NOT fall through to topic
+      // subscribers — that would re-admit peers the curator just
+      // kicked).
+      const result: CGMemberEnumeration = {
+        source: 'allowlist',
+        members: dedupAndExcludeSelf(allowed, deps.selfPeerId),
+      };
+      cache.set(cgId, { computedAtMs, value: result });
+      return result;
+    }
+
+    // No peer allowlist exists. Disambiguate private (agent-gated)
+    // from public via the same predicate the responder consults for
+    // sync / SWM-share auth. Fail closed for private CGs (see
+    // `isPrivateContextGraph` jsdoc on CGMemberEnumeratorDeps).
+    if (await deps.isPrivateContextGraph(cgId)) {
+      const result: CGMemberEnumeration = { source: 'none', members: [] };
+      cache.set(cgId, { computedAtMs, value: result });
+      return result;
+    }
+
+    // Public CG: no on-chain roster exists by design (subscribers
+    // don't pay to subscribe). Use the live GossipSub view.
+    const subscribers = deps.getTopicSubscribers(deps.topicForCG(cgId));
+    const result: CGMemberEnumeration = subscribers.length === 0
+      ? { source: 'none', members: [] }
+      : {
+        source: 'topic-subscribers',
+        members: dedupAndExcludeSelf(subscribers, deps.selfPeerId),
+      };
+    cache.set(cgId, { computedAtMs, value: result });
+    return result;
   }
 
   return {
@@ -122,34 +197,14 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
         return cached.value;
       }
 
-      const allowed = await deps.getContextGraphAllowedPeers(cgId);
-      let result: CGMemberEnumeration;
+      const existing = inFlight.get(cgId);
+      if (existing) return existing;
 
-      if (allowed !== null) {
-        // Curated CG: allowlist is authoritative. Even an empty
-        // allowlist is meaningful (signals a curator removed every
-        // member; callers should NOT fall through to topic subscribers
-        // because that would re-admit peers the curator just kicked).
-        result = {
-          source: 'allowlist',
-          members: dedupAndExcludeSelf(allowed, deps.selfPeerId),
-        };
-      } else {
-        // Public CG: no on-chain roster exists by design (subscribers
-        // don't pay to subscribe). Use the live GossipSub view.
-        const subscribers = deps.getTopicSubscribers(deps.topicForCG(cgId));
-        if (subscribers.length === 0) {
-          result = { source: 'none', members: [] };
-        } else {
-          result = {
-            source: 'topic-subscribers',
-            members: dedupAndExcludeSelf(subscribers, deps.selfPeerId),
-          };
-        }
-      }
-
-      cache.set(cgId, { computedAtMs: nowMs, value: result });
-      return result;
+      const promise = resolve(cgId, nowMs).finally(() => {
+        inFlight.delete(cgId);
+      });
+      inFlight.set(cgId, promise);
+      return promise;
     },
 
     invalidate(cgId: string): void {

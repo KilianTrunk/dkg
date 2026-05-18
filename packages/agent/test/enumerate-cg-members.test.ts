@@ -9,6 +9,10 @@ const SELF = '12D3KooWSelf';
 function makeDeps(overrides: Partial<CGMemberEnumeratorDeps>): CGMemberEnumeratorDeps {
   return {
     getContextGraphAllowedPeers: async () => null,
+    // Default: NOT private. The dedicated "private CG without
+    // allowlist" describe-block below overrides this to true to
+    // exercise the fail-closed branch (codex review on #571 bug #1).
+    isPrivateContextGraph: async () => false,
     getTopicSubscribers: () => [],
     topicForCG: (cgId) => `dkg/context-graph/${cgId}/shared-memory`,
     selfPeerId: SELF,
@@ -92,6 +96,60 @@ describe('createCGMemberEnumerator: public CG (topic-subscribers source)', () =>
 
     expect(result.source).toBe('topic-subscribers');
     expect(result.members).toEqual(['peerY']);
+  });
+});
+
+/**
+ * Regression for the first codex finding on PR #571: `null` from
+ * `getContextGraphAllowedPeers` does NOT mean "public". A CG can be
+ * private via `DKG_ALLOWED_AGENT` / `DKG_PARTICIPANT_AGENT` without
+ * any peer-allowlist triples, and falling through to live topic
+ * subscribers for those CGs would fan SWM shares out to GossipSub
+ * subscribers who are not actually allowed members. The fix
+ * disambiguates via the same `isPrivateContextGraph` predicate the
+ * responder uses for sync / SWM-share auth — fail closed for any
+ * private CG that lacks an enumerable peer roster.
+ */
+describe('createCGMemberEnumerator: private CG WITHOUT peer allowlist (agent-gated)', () => {
+  it('returns source=none and empty members, ignoring topic subscribers', async () => {
+    let subscribersCalled = 0;
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      getContextGraphAllowedPeers: async () => null,
+      isPrivateContextGraph: async () => true,
+      getTopicSubscribers: () => {
+        subscribersCalled += 1;
+        return ['nonMemberWhoHappensToSubscribe'];
+      },
+    }));
+
+    const result = await enumerator.enumerate('cg-agent-gated');
+
+    expect(result).toEqual({ source: 'none', members: [] });
+    // The whole point of fail-closed: even though there ARE live
+    // topic subscribers, we MUST NOT consult them for private CGs
+    // without a peer allowlist (would risk fan-out to non-members).
+    expect(subscribersCalled).toBe(0);
+  });
+
+  it('still uses the allowlist when one exists (private + peer-allowlisted)', async () => {
+    // Sanity check: a private CG that DOES have a peer allowlist
+    // (e.g. curated by both `DKG_ALLOWED_PEER` and `DKG_ALLOWED_AGENT`)
+    // takes the normal allowlist path and never consults
+    // `isPrivateContextGraph`.
+    let isPrivateCalled = 0;
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      getContextGraphAllowedPeers: async () => ['peerA', 'peerB'],
+      isPrivateContextGraph: async () => {
+        isPrivateCalled += 1;
+        return true;
+      },
+    }));
+
+    const result = await enumerator.enumerate('cg-private-with-allowlist');
+
+    expect(result.source).toBe('allowlist');
+    expect(result.members.sort()).toEqual(['peerA', 'peerB']);
+    expect(isPrivateCalled).toBe(0);
   });
 });
 
@@ -187,6 +245,97 @@ describe('createCGMemberEnumerator: TTL cache', () => {
   it('invalidate() on an unknown cgId is a no-op', () => {
     const enumerator = createCGMemberEnumerator(makeDeps({}));
     expect(() => enumerator.invalidate('never-seen')).not.toThrow();
+  });
+
+  /**
+   * Regression for the second codex finding on PR #571: the cache
+   * is populated only after the async resolution finishes, so a
+   * burst of CONCURRENT enumerate() calls for the same cgId would
+   * each see a cache miss and each perform their own SPARQL +
+   * `getSubscribers` lookup. The fix caches an in-flight promise
+   * keyed by cgId so the burst collapses onto a single resolution.
+   *
+   * Stalls `getContextGraphAllowedPeers` on a manually-resolved
+   * promise so a deterministic burst of 5 concurrent enumerate()s
+   * can be observed before any resolution completes.
+   */
+  it('collapses a CONCURRENT burst of enumerate() calls onto one resolution (in-flight dedup)', async () => {
+    let allowedCalls = 0;
+    let resolveAllowedPeers!: (peers: string[]) => void;
+    const allowedPeersPromise = new Promise<string[]>((res) => {
+      resolveAllowedPeers = res;
+    });
+
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      getContextGraphAllowedPeers: async () => {
+        allowedCalls += 1;
+        return allowedPeersPromise;
+      },
+    }));
+
+    // Fire 5 concurrent enumerate() calls BEFORE the dep's promise
+    // settles. Pre-fix: all 5 missed the cache → 5 invocations of
+    // `getContextGraphAllowedPeers`. Post-fix: only the first
+    // invocation runs; the other 4 join the same in-flight promise.
+    const pending = Promise.all([
+      enumerator.enumerate('cg-burst'),
+      enumerator.enumerate('cg-burst'),
+      enumerator.enumerate('cg-burst'),
+      enumerator.enumerate('cg-burst'),
+      enumerator.enumerate('cg-burst'),
+    ]);
+
+    // Allow the microtask queue to drain so all 5 enumerate() calls
+    // have actually run their cache-miss + register-in-flight steps
+    // before we release the dep promise.
+    await new Promise<void>((res) => setImmediate(res));
+
+    expect(allowedCalls).toBe(1);
+
+    resolveAllowedPeers(['peerA', 'peerB']);
+    const results = await pending;
+
+    // All 5 callers observe the same result.
+    for (const r of results) {
+      expect(r.source).toBe('allowlist');
+      expect(r.members.sort()).toEqual(['peerA', 'peerB']);
+    }
+    expect(allowedCalls).toBe(1);
+
+    // After the in-flight promise settles, subsequent calls within
+    // TTL hit the normal cache (no additional dep invocations).
+    await enumerator.enumerate('cg-burst');
+    expect(allowedCalls).toBe(1);
+  });
+
+  it('releases the in-flight slot on resolution so post-TTL recompute can re-enter', async () => {
+    // Confirms the `finally` cleanup. If the in-flight slot leaked,
+    // the second burst (after TTL elapses + cache eviction) would
+    // either join a stale resolved promise or never fire the dep
+    // again, depending on the bug shape.
+    let allowedCalls = 0;
+    let nowMs = 1_000_000;
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      now: () => nowMs,
+      cacheTtlMs: 100,
+      getContextGraphAllowedPeers: async () => {
+        allowedCalls += 1;
+        return ['peerA'];
+      },
+    }));
+
+    await enumerator.enumerate('cg-leak-check');
+    expect(allowedCalls).toBe(1);
+
+    // Advance past TTL, fire another burst — dep should be invoked
+    // exactly once more (the in-flight slot from the first call
+    // must have been released).
+    nowMs += 200;
+    await Promise.all([
+      enumerator.enumerate('cg-leak-check'),
+      enumerator.enumerate('cg-leak-check'),
+    ]);
+    expect(allowedCalls).toBe(2);
   });
 });
 

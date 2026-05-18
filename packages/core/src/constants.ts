@@ -48,6 +48,19 @@ export const PROTOCOL_QUERY_REMOTE = '/dkg/10.0.1/query-remote';
 // SWM sender-key send sites in dkg-agent.ts route through
 // messenger.sendReliable; handler registers via messenger.register.
 export const PROTOCOL_SWM_SENDER_KEY = '/dkg/10.0.1/swm-sender-key';
+// rc.9 PR-C (SWM reliable fan-out plan, Step 3): NEW protocol — no
+// rc.8 predecessor. Carries the same workspace-gossip wire bytes
+// (produced by `encodeWorkspaceGossipMessage`) point-to-point over
+// the reliable messenger substrate, as a deterministic alternative
+// to GossipSub's best-effort mesh. The receiver handler hands the
+// bytes directly to `SharedMemoryHandler.handle()` — same in-process
+// apply path that the gossip subscription drives, so dedup and
+// metrics behave identically. Activated by the tier-switch in
+// `publishWorkspaceGossip` for any CG whose `CGMemberEnumerator`
+// returns `source: 'allowlist'`, and as a top-up for public CGs at
+// or below `DKG_SWM_SUBSTRATE_MAX_MEMBERS`. See RFC-003 §6 for the
+// full transport policy.
+export const PROTOCOL_SWM_UPDATE = '/dkg/10.0.1/swm-update';
 
 // rc.9 PR-10: bumped from /dkg/10.0.0/join-request to opt into the
 // Universal Messenger substrate. The in-memory JoinApprovalRetryQueue

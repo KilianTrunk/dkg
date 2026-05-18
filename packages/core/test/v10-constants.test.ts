@@ -8,6 +8,7 @@ import {
   PROTOCOL_ACCESS,
   PROTOCOL_QUERY_REMOTE,
   PROTOCOL_SWM_SENDER_KEY,
+  PROTOCOL_SWM_UPDATE,
   PROTOCOL_VERIFY_PROPOSAL,
   PROTOCOL_VERIFY_APPROVAL,
   PROTOCOL_STORAGE_ACK,
@@ -68,6 +69,7 @@ describe('V10 protocol stream IDs', () => {
     expect(PROTOCOL_ACCESS).toBe('/dkg/10.0.1/private-access');
     expect(PROTOCOL_QUERY_REMOTE).toBe('/dkg/10.0.1/query-remote');
     expect(PROTOCOL_SWM_SENDER_KEY).toBe('/dkg/10.0.1/swm-sender-key');
+    expect(PROTOCOL_SWM_UPDATE).toBe('/dkg/10.0.1/swm-update');
     expect(PROTOCOL_VERIFY_PROPOSAL).toBe('/dkg/10.0.1/verify-proposal');
     expect(PROTOCOL_VERIFY_APPROVAL).toBe('/dkg/10.0.0/verify-approval');
     expect(PROTOCOL_STORAGE_ACK).toBe('/dkg/10.0.1/storage-ack');

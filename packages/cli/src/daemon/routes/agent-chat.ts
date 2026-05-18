@@ -976,6 +976,21 @@ export function buildSloPayload(agent: {
     redundantAppliesOverflow: number;
     redundantAppliesTruncated: boolean;
   };
+  /**
+   * rc.9 PR-C addition. Optional on the interface so a hypothetical
+   * test double that only exercises the gossip + receiver sides
+   * doesn't have to stub it. Implementations that omit it simply
+   * leave `swm.substrateFanout` off the response — soak scripts
+   * check for its presence before referencing fields.
+   */
+  getSwmSubstrateFanoutStats?: () => {
+    delivered: Record<string, number>;
+    queued: Record<string, number>;
+    inFlight: Record<string, number>;
+    failed: Record<string, number>;
+    overflow: { delivered: number; queued: number; inFlight: number; failed: number };
+    truncated: boolean;
+  };
 }): {
   protocols: Record<string, unknown>;
   gossip: {
@@ -988,11 +1003,29 @@ export function buildSloPayload(agent: {
     redundantAppliesLowerBound: boolean;
     redundantAppliesOverflow: number;
     redundantAppliesTruncated: boolean;
+    /**
+     * rc.9 PR-C: substrate fan-out per-outcome counters. Present
+     * iff the agent exposes `getSwmSubstrateFanoutStats()` (every
+     * production agent does; opt-out is for test doubles).
+     */
+    substrateFanout?: {
+      delivered: Record<string, number>;
+      queued: Record<string, number>;
+      inFlight: Record<string, number>;
+      failed: Record<string, number>;
+      overflow: { delivered: number; queued: number; inFlight: number; failed: number };
+      truncated: boolean;
+    };
   };
 } {
+  const swmHandler = agent.getSwmHandlerStats();
+  const substrateFanout = agent.getSwmSubstrateFanoutStats?.();
   return {
     protocols: agent.getMessengerSloStats(),
     gossip: agent.getSwmGossipStats(),
-    swm: agent.getSwmHandlerStats(),
+    swm: {
+      ...swmHandler,
+      ...(substrateFanout !== undefined ? { substrateFanout } : {}),
+    },
   };
 }

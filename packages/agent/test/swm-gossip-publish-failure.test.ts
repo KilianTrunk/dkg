@@ -13,6 +13,15 @@ class ThrowingGossip {
     this.publishAttempts.push({ topic, bytes: data.byteLength });
     throw new Error(`simulated mesh failure for ${topic}`);
   }
+
+  // rc.9 PR-C: the tier-switch in publishWorkspaceGossip consults
+  // GossipSubManager.getSubscribers via the CGMemberEnumerator.
+  // Returning [] keeps these PR-A regression tests focused on the
+  // gossip-failure path: no topic subscribers + no allowlist =>
+  // `source: 'none'` => `useSubstrate: false, useGossip: true`,
+  // so the share takes the gossip-only branch and exercises the
+  // PR-A counter exactly like it did before PR-C.
+  getSubscribers(_topic: string): string[] { return []; }
 }
 
 // PR-A R6 regression: throws a named, non-generic error class so the
@@ -35,6 +44,7 @@ class TypedThrowingGossip {
     this.publishAttempts.push({ topic, bytes: data.byteLength });
     throw new NoPeersSubscribedError(`no peers subscribed to ${topic}`);
   }
+  getSubscribers(_topic: string): string[] { return []; }
 }
 
 describe('DKGAgent SWM gossip publish failure (rc.9 PR-A)', () => {

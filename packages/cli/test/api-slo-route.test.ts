@@ -141,6 +141,87 @@ describe('/api/slo wire format (rc.9 PR-A / Codex PR #570 R10)', () => {
     });
   });
 
+  /**
+   * rc.9 PR-C wire-format regression: when the agent exposes
+   * `getSwmSubstrateFanoutStats()`, /api/slo MUST surface it under
+   * `swm.substrateFanout`. The interface marks the getter optional
+   * so test doubles can omit it; the agent's production
+   * implementation always provides it.
+   */
+  it('substrateFanout — when provided, nested under swm with all four outcome maps + overflow', async () => {
+    const agent: FakeAgent = {
+      getMessengerSloStats: () => ({}),
+      getSwmGossipStats: () => ({
+        publishFailures: {},
+        publishFailuresOverflow: 0,
+        publishFailuresTruncated: false,
+      }),
+      getSwmHandlerStats: () => ({
+        redundantApplies: {},
+        redundantAppliesLowerBound: false,
+        redundantAppliesOverflow: 0,
+        redundantAppliesTruncated: false,
+      }),
+      getSwmSubstrateFanoutStats: () => ({
+        delivered: { 'did:dkg:context-graph:lex/curated': 47 },
+        queued: { 'did:dkg:context-graph:lex/curated': 2 },
+        inFlight: {},
+        failed: { 'did:dkg:context-graph:bigpublic': 1 },
+        overflow: { delivered: 12, queued: 3, inFlight: 0, failed: 5 },
+        truncated: true,
+      }),
+    };
+    ({ server, port } = await startSloServer(agent));
+
+    const { status, body } = await get(port, '/api/slo');
+    expect(status).toBe(200);
+    expect(body).toEqual({
+      protocols: {},
+      gossip: {
+        publishFailures: {},
+        publishFailuresOverflow: 0,
+        publishFailuresTruncated: false,
+      },
+      swm: {
+        redundantApplies: {},
+        redundantAppliesLowerBound: false,
+        redundantAppliesOverflow: 0,
+        redundantAppliesTruncated: false,
+        substrateFanout: {
+          delivered: { 'did:dkg:context-graph:lex/curated': 47 },
+          queued: { 'did:dkg:context-graph:lex/curated': 2 },
+          inFlight: {},
+          failed: { 'did:dkg:context-graph:bigpublic': 1 },
+          overflow: { delivered: 12, queued: 3, inFlight: 0, failed: 5 },
+          truncated: true,
+        },
+      },
+    });
+  });
+
+  it('substrateFanout — absent when the agent omits getSwmSubstrateFanoutStats (back-compat with PR-A-only doubles)', async () => {
+    const agent: FakeAgent = {
+      getMessengerSloStats: () => ({}),
+      getSwmGossipStats: () => ({
+        publishFailures: {},
+        publishFailuresOverflow: 0,
+        publishFailuresTruncated: false,
+      }),
+      getSwmHandlerStats: () => ({
+        redundantApplies: {},
+        redundantAppliesLowerBound: false,
+        redundantAppliesOverflow: 0,
+        redundantAppliesTruncated: false,
+      }),
+    };
+    ({ server, port } = await startSloServer(agent));
+
+    const { status, body } = await get(port, '/api/slo');
+    expect(status).toBe(200);
+    // Stricter than toEqual w/ partial — assert the key is genuinely absent.
+    expect((body as { swm: Record<string, unknown> }).swm.substrateFanout).toBeUndefined();
+  });
+
   it('partial / mid-life payload — gossip populated, swm pristine', async () => {
     const agent: FakeAgent = {
       getMessengerSloStats: () => ({}),

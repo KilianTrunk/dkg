@@ -104,5 +104,17 @@ export {
   type CGMemberEnumeratorDeps,
   type CGMemberSource,
 } from './swm/enumerate-cg-members.js';
+export {
+  chooseFanOutTier,
+  executeSubstrateFanOut,
+  type ChooseFanOutTierInput,
+  type FanOutPlan,
+  type FanOutOutcome,
+  type FanOutPeerRecord,
+  type FanOutBookkeeper,
+  type FanOutSubstrate,
+  type ExecuteSubstrateFanOutInput,
+  type ExecuteSubstrateFanOutResult,
+} from './swm/substrate-fanout.js';
 export * from './source-worker.js';
 export * from './source-registry.js';

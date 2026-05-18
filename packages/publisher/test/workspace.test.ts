@@ -862,6 +862,152 @@ describe('SharedMemoryHandler', () => {
   });
 });
 
+/**
+ * rc.9 PR-C codex R3: `handle()` returns a `SharedMemoryApplyOutcome`
+ * so the new substrate-fanout receiver can distinguish "applied
+ * locally" from "silently rejected" without log-scraping. Gossip
+ * callers ignore the return (unchanged behaviour); substrate
+ * callers throw on `retryable: true` so `sendReliable` keeps the
+ * share queued for retry.
+ */
+describe('SharedMemoryHandler.handle outcome (rc.9 PR-C codex R3)', () => {
+  let store: OxigraphStore;
+  let handler: SharedMemoryHandler;
+
+  beforeEach(() => {
+    store = new OxigraphStore();
+    handler = new SharedMemoryHandler(store, new TypedEventBus(), {});
+  });
+
+  it('successful apply returns { applied: true }', async () => {
+    const nquads = `<${ENTITY}> <http://schema.org/name> "Applied" <${DATA_GRAPH}> .`;
+    const msg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeerR3',
+      shareOperationId: 'op-applied',
+      timestampMs: Date.now(),
+    });
+
+    const outcome = await handler.handle(msg, '12D3KooWPeerR3');
+    expect(outcome).toEqual({ applied: true });
+  });
+
+  it('permanent rejection (publisherPeerId / fromPeerId mismatch) returns { applied: false, retryable: false }', async () => {
+    const nquads = `<${ENTITY}> <http://schema.org/name> "PubMismatch" <${DATA_GRAPH}> .`;
+    const msg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWClaimedPublisher',
+      shareOperationId: 'op-pub-mismatch',
+      timestampMs: Date.now(),
+    });
+
+    const outcome = await handler.handle(msg, '12D3KooWActualSender');
+    expect(outcome.applied).toBe(false);
+    if (outcome.applied) throw new Error('unreachable');
+    expect(outcome.retryable).toBe(false);
+    expect(outcome.reason).toContain('does not match sender');
+  });
+
+  it('retryable rejection (CAS pre-condition not met) returns { applied: false, retryable: true } — codex R4', async () => {
+    // Codex R4 (dropped review comment): CAS-not-met is
+    // TRANSIENT when SWM writes arrive out of order. The
+    // missed upstream write might still land via gossip and
+    // bring local state up to where the CAS condition would
+    // pass; the substrate outbox must keep this share queued.
+    //
+    // Setup: empty store. Send a publish with a CAS condition
+    // expecting "recruiting" on a subject/predicate that
+    // doesn't exist locally → enforceCASConditions returns
+    // false → withWriteLocks closure returns false with
+    // withWriteLocksRejection = 'cas' → outcome should be
+    // retryable.
+    const nquads = `<${ENTITY}> <http://schema.org/name> "CASRetry" <${DATA_GRAPH}> .`;
+    const msg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeerR4',
+      shareOperationId: 'op-cas-retryable',
+      timestampMs: Date.now(),
+      casConditions: [{
+        subject: ENTITY,
+        predicate: 'http://example.org/status',
+        expectedValue: '"recruiting"',
+        expectAbsent: false,
+      }],
+    });
+
+    const outcome = await handler.handle(msg, '12D3KooWPeerR4');
+    expect(outcome.applied).toBe(false);
+    if (outcome.applied) throw new Error('unreachable');
+    expect(outcome.retryable).toBe(true);
+    expect(outcome.reason).toMatch(/CAS/);
+  });
+
+  it('permanent rejection (malformed protobuf wire bytes) returns { applied: false, retryable: false } — codex R5', async () => {
+    // Codex R5 (dropped review comment): decode failures are
+    // DETERMINISTIC — retrying the same bytes can't make a
+    // malformed envelope parse. The top-level decode try in
+    // handle() short-circuits these as `retryable: false` so
+    // the substrate outbox drops on first attempt instead of
+    // burning retry budget on log noise.
+    const garbage = new Uint8Array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+
+    const outcome = await handler.handle(garbage, '12D3KooWPeerR5');
+    expect(outcome.applied).toBe(false);
+    if (outcome.applied) throw new Error('unreachable');
+    expect(outcome.retryable).toBe(false);
+    expect(outcome.reason).toMatch(/decode/i);
+  });
+
+  it('retryable rejection (unexpected throw during apply) returns { applied: false, retryable: true }', async () => {
+    // Dominant production case for `retryable: true`: the
+    // sender key package for the current epoch hasn't arrived
+    // yet, so `workspaceSenderKeyDecryptor` rejects with an
+    // Error. The outer catch in `handle()` MUST classify any
+    // such thrown error as retryable so the substrate outbox
+    // keeps the share queued for retry — once the sender key
+    // package arrives, the SAME wire bytes apply cleanly.
+    //
+    // Setting up a real agent-gated CG + sender-key state is
+    // heavyweight here; instead we install a store proxy that
+    // throws inside the handle()'s try-block (a triple-store
+    // hiccup has identical semantics — caught by the same
+    // outer catch and classified by the same rule). Any
+    // unexpected throw → `retryable: true`.
+    const throwingStore = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'insert') {
+          return () => Promise.reject(new Error('simulated triple-store worker hiccup'));
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const throwingHandler = new SharedMemoryHandler(throwingStore, new TypedEventBus(), {});
+
+    const nquads = `<${ENTITY}> <http://schema.org/name> "WillThrow" <${DATA_GRAPH}> .`;
+    const msg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeerR3',
+      shareOperationId: 'op-retryable',
+      timestampMs: Date.now(),
+    });
+
+    const outcome = await throwingHandler.handle(msg, '12D3KooWPeerR3');
+    expect(outcome.applied).toBe(false);
+    if (outcome.applied) throw new Error('unreachable');
+    expect(outcome.retryable).toBe(true);
+    expect(typeof outcome.reason).toBe('string');
+    expect(outcome.reason.length).toBeGreaterThan(0);
+  });
+});
+
 describe('SharedMemoryHandler: redundant-apply counter (rc.9 PR-A)', () => {
   let store: OxigraphStore;
   let handler: SharedMemoryHandler;

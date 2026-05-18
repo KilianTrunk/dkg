@@ -102,11 +102,30 @@ export interface CGMemberEnumeratorDeps {
   getTopicSubscribers: (topic: string) => string[];
   topicForCG: (cgId: string) => string;
   /**
-   * Our own peer ID. Always excluded from the returned member set —
-   * we don't fan-out to ourselves (the local apply already happened
-   * in the caller).
+   * Lazy accessor for our own peer ID. Always excluded from the
+   * returned member set — we don't fan-out to ourselves (the local
+   * apply already happened in the caller).
+   *
+   * Resolved as a thunk (not a captured string) because the canonical
+   * accessor on `DKGAgent` is `this.node.peerId`, which throws
+   * `DKGNode not started` if libp2p hasn't booted yet. Eagerly
+   * capturing it at enumerator construction time would break the
+   * pre-start `share()` contract: callers that construct an agent
+   * and call `share()` before `start()` (e.g. test harnesses, or
+   * production code that queues writes before the node finishes
+   * booting) would crash inside the fan-out planner even when the
+   * share would otherwise take the gossip-only path. With a thunk,
+   * any throw bubbles out of `enumerate()` and gets caught by the
+   * try/catch in `DKGAgent.publishWorkspaceGossip` (PR-C codex R1
+   * fallback), which falls back to gossip-only and preserves the
+   * contract.
+   *
+   * The thunk is called fresh on every `computeMembers` invocation
+   * (cache misses) — peer ID is immutable once the node is started,
+   * so there's no correctness issue if it's read across multiple
+   * resolves with the same node.
    */
-  selfPeerId: string;
+  getSelfPeerId: () => string;
   /** Defaults to `Date.now`; override in tests for deterministic TTL. */
   now?: () => number;
   /** Defaults to 60s; override in tests or for higher-volatility CGs. */
@@ -186,7 +205,7 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
       // kicked).
       return {
         source: 'allowlist',
-        members: dedupAndExcludeSelf(allowed, deps.selfPeerId),
+        members: dedupAndExcludeSelf(allowed, deps.getSelfPeerId()),
       };
     }
 
@@ -210,7 +229,7 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
     // and any caller that treats `source !== 'none'` as "I have
     // remote recipients" would skip the intended fallback.
     const subscribers = deps.getTopicSubscribers(deps.topicForCG(cgId));
-    const members = dedupAndExcludeSelf(subscribers, deps.selfPeerId);
+    const members = dedupAndExcludeSelf(subscribers, deps.getSelfPeerId());
     return members.length === 0
       ? { source: 'none', members: [] }
       : { source: 'topic-subscribers', members };

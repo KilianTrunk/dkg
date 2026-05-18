@@ -2,7 +2,7 @@ import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
   PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
-  PROTOCOL_SWM_SENDER_KEY, PROTOCOL_MESSAGE,
+  PROTOCOL_SWM_SENDER_KEY, PROTOCOL_SWM_UPDATE, PROTOCOL_MESSAGE,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
@@ -155,6 +155,18 @@ import { SyncVerifyWorker } from './sync-verify-worker.js';
 import { bindRandomSampling, type RandomSamplingHandle, type RandomSamplingStatus } from './random-sampling-bind.js';
 import { connectToMultiaddr, ensurePeerConnected as ensurePeerConnectedAtom, primeCatchupConnections as primeCatchupConnectionsAtom } from './p2p/peer-connect.js';
 import { Messenger, type SloProtocolStats } from './p2p/messenger.js';
+import {
+  createCGMemberEnumerator,
+  type CGMemberEnumerator,
+} from './swm/enumerate-cg-members.js';
+import {
+  chooseFanOutTier,
+  executeSubstrateFanOut,
+  FANOUT_RESPONSE_REJECTED,
+  type FanOutBookkeeper,
+  type FanOutPeerRecord,
+  type FanOutPlan,
+} from './swm/substrate-fanout.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
@@ -1272,6 +1284,78 @@ export class DKGAgent {
   private swmGossipPublishFailuresTruncated = false;
   private static readonly SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS = 1024;
 
+  /**
+   * Per-cgId, per-outcome counters for substrate-fan-out SWM
+   * shares (rc.9 PR-C / SWM reliable fan-out plan, Step 3).
+   * Populated by the {@link FanOutBookkeeper} the agent passes to
+   * `executeSubstrateFanOut` inside `publishWorkspaceGossip`.
+   * Same overflow-cap shape as `swmGossipPublishFailures` (Codex
+   * PR #570 R5/R8): the per-cgId map is hard-capped at
+   * {@link SWM_SUBSTRATE_FANOUT_MAX_TRACKED_CGS}; once exceeded,
+   * the cgId with the GLOBAL smallest total (delivered + queued +
+   * inFlight + failed) gets evicted into
+   * {@link swmSubstrateFanoutOverflow} so the grand total stays
+   * accurate. A sticky {@link swmSubstrateFanoutTruncated} flag
+   * tells `/api/slo` consumers that the per-cgId breakdown is
+   * partial.
+   *
+   * `delivered` is the only "good" outcome — `rejected` means
+   * the receiver explicitly dropped the share for a permanent
+   * reason (peer not in allowlist, bad signature, validation
+   * failed; PR-C codex R6 split this out from `delivered` so
+   * the metric doesn't overstate end-to-end success), `queued`
+   * means the substrate accepted the entry into the durable
+   * outbox (will retry; not a delivery confirmation), `inFlight`
+   * means another sender already owns the attempt, `failed` is
+   * the unrecoverable case. PR-D will add an ACK / watchdog that
+   * upgrades `queued → delivered` after the receiver confirms.
+   */
+  private readonly swmSubstrateFanoutDelivered = new Map<string, number>();
+  private readonly swmSubstrateFanoutRejected = new Map<string, number>();
+  private readonly swmSubstrateFanoutQueued = new Map<string, number>();
+  private readonly swmSubstrateFanoutInFlight = new Map<string, number>();
+  private readonly swmSubstrateFanoutFailed = new Map<string, number>();
+  private swmSubstrateFanoutOverflow = {
+    delivered: 0,
+    rejected: 0,
+    queued: 0,
+    inFlight: 0,
+    failed: 0,
+  };
+  private swmSubstrateFanoutTruncated = false;
+  private static readonly SWM_SUBSTRATE_FANOUT_MAX_TRACKED_CGS = 1024;
+  /**
+   * Member-count cap above which public CGs fall back to gossip-
+   * only delivery (substrate fan-out is N-round-trips, so cost
+   * grows linearly in members; gossip cost is independent of N).
+   * Configurable via `DKG_SWM_SUBSTRATE_MAX_MEMBERS` env so soak
+   * runs can sweep the parameter without rebuilding. Curated CGs
+   * (`source: 'allowlist'`) are NOT truncated by this cap — see
+   * `chooseFanOutTier` jsdoc for the rationale.
+   */
+  private readonly swmSubstrateMaxMembers: number = (() => {
+    const raw = process.env.DKG_SWM_SUBSTRATE_MAX_MEMBERS;
+    if (!raw) return 100;
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isFinite(n) || n < 0) return 100;
+    return n;
+  })();
+  /**
+   * Per-send substrate timeout for SWM update fan-out. Matches the
+   * 15s reliability SLO the messenger targets for chat. Kept as a
+   * named constant so the soak script can correlate /api/slo
+   * `protocols['/dkg/10.0.1/swm-update']` p99 latency against the
+   * timeout budget.
+   */
+  private static readonly SWM_SUBSTRATE_FANOUT_TIMEOUT_MS = 15_000;
+
+  /**
+   * Lazy CGMemberEnumerator — single instance per agent. Holds the
+   * 60s membership cache shared across every share to the same
+   * cgId within a window. See {@link getOrCreateCGMemberEnumerator}.
+   */
+  private cgMemberEnumerator?: CGMemberEnumerator;
+
   private messageHandler: MessageHandler | null = null;
   private chainPoller: ChainEventPoller | null = null;
   private swmCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -1847,6 +1931,53 @@ export class DKGAgent {
     this.messenger.register(PROTOCOL_SWM_SENDER_KEY, async (data, peerId) => {
       return this.handleSwmSenderKeyPackage(data, peerId);
     });
+
+    // rc.9 PR-C (SWM reliable fan-out plan, Step 3): NEW protocol
+    // for point-to-point SWM share delivery as an alternative to
+    // GossipSub's best-effort mesh. The wire bytes are the same
+    // encoded workspace gossip message the gossip subscription
+    // delivers (see `encodeWorkspaceGossipMessage` in publisher),
+    // so we route them through the exact same in-process apply
+    // path — `SharedMemoryHandler.handle()`. That means PR-A's
+    // `seenShareOps` / `redundantApplies` accounting transparently
+    // covers double-delivery (gossip + substrate to the same
+    // peer): the second arrival just bumps `swm.redundantApplies`
+    // for that cgId. No separate dedup machinery needed here.
+    //
+    // PR-C codex R3 (receiver ACK semantics): the substrate
+    // response distinguishes three outcomes returned by
+    // `handle()`:
+    //   - `applied: true`         → empty Uint8Array ACK (success).
+    //   - `applied: false, retryable: false` → empty Uint8Array
+    //       (permanent rejection; nothing more for the sender to
+    //       do — bad signature, peer not in allowlist, CAS
+    //       conditions don't hold, etc. The sender drops the
+    //       share, matching pre-PR-C gossip semantics where the
+    //       same rejection would silently fall on the floor).
+    //   - `applied: false, retryable: true`  → THROW from the
+    //       handler so `messenger.sendReliable` reports the send
+    //       as failed and the substrate outbox keeps the share
+    //       queued for retry. Dominant production case: sender
+    //       key package for the current epoch hasn't arrived
+    //       yet; once it does, the same wire bytes apply on the
+    //       next retry.
+    // PR-D will replace the empty response with a structured ACK
+    // message (SwmShareAck) carrying the outcome explicitly, so
+    // the sender's quorum tracker can upgrade queued → delivered
+    // after receiver-side application succeeds (rather than the
+    // current proxy through substrate-level wire delivery).
+    this.messenger.register(PROTOCOL_SWM_UPDATE, async (data, peerId) => this.handleSwmUpdate(data, peerId));
+    // PR-C codex R7: tell Messenger that the 1-byte rejection
+    // sentinel is an APP-LEVEL rejection — Messenger's
+    // protocol-level `delivered` counter + latency histogram
+    // (`/api/slo`'s `protocols['/dkg/10.0.1/swm-update']`) should
+    // NOT bump for these responses. The application-level
+    // truth (delivered vs rejected) lives in
+    // `swm.substrateFanout.{delivered,rejected}`.
+    this.messenger.setResponseDeliveredClassifier(
+      PROTOCOL_SWM_UPDATE,
+      (response) => !(response.byteLength === 1 && response[0] === 0x01),
+    );
 
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
@@ -5920,6 +6051,63 @@ export class DKGAgent {
     return { ...pkg, signature: ethers.getBytes(signature) };
   }
 
+  /**
+   * `PROTOCOL_SWM_UPDATE` substrate receiver. Routes substrate-
+   * delivered SWM share bytes through `SharedMemoryHandler.handle()`
+   * (the same in-process apply path the gossip subscription
+   * drives) and maps the {@link SharedMemoryApplyOutcome} to a
+   * substrate response:
+   *
+   *   - `applied: true`                          → empty Uint8Array
+   *      (ACK; sender records `delivered`).
+   *   - `applied: false, retryable: true`        → THROW so
+   *      `messenger.sendReliable` reports a stream error,
+   *      `isRecoverableSendError` classifies it as recoverable
+   *      (the libp2p stream-reset signature contains "closed" /
+   *      "reset"), and the substrate outbox keeps the share
+   *      queued for retry. Dominant case: sender key package
+   *      for the current epoch hasn't arrived yet — once it
+   *      does, the SAME wire bytes apply cleanly on retry.
+   *   - `applied: false, retryable: false`       → return
+   *      {@link FANOUT_RESPONSE_REJECTED} (1-byte sentinel
+   *      `0x01`). The sender's `classifySendResult` recognises
+   *      the sentinel and records the outcome as `rejected`,
+   *      NOT `delivered` (codex R6 on PR #576). The share is
+   *      dropped — retrying the same wire bytes would produce
+   *      the same permanent rejection (bad signature, peer not
+   *      in allowlist, validation failed, malformed protobuf).
+   *
+   * Extracted into a named method so the receiver contract can
+   * be unit-tested in isolation without spinning up a real
+   * Messenger registration.
+   */
+  private async handleSwmUpdate(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
+    const wh = this.getOrCreateSharedMemoryHandler();
+    const outcome = await wh.handle(data, fromPeerId);
+    if (outcome.applied) {
+      return new Uint8Array();
+    }
+    if (outcome.retryable) {
+      // Throwing here is what tells the substrate outbox to keep
+      // the share queued. The router aborts the stream which the
+      // sender sees as a stream-reset error — `isRecoverableSendError`
+      // matches "reset"/"closed" substrings and enqueues into the
+      // outbox. `handle()` already logged the specific rejection
+      // at WARN/ERROR; the throw message just gives operators the
+      // hint when they grep for "swm apply" in receiver logs.
+      throw new Error(`SWM apply transient rejection from ${fromPeerId}: ${outcome.reason}`);
+    }
+    // Permanent rejection: signal via the 1-byte sentinel so the
+    // sender records `rejected` (not `delivered`) and stops here.
+    // PR-D will replace this with a structured `SwmShareAck`
+    // protobuf carrying outcome + reason on the wire.
+    this.log.warn(
+      createOperationContext('share'),
+      `SWM substrate receiver dropping share from ${fromPeerId} (permanent rejection): ${outcome.reason}`,
+    );
+    return FANOUT_RESPONSE_REJECTED;
+  }
+
   private async handleSwmSenderKeyPackage(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
     const ctx = createOperationContext('share');
     let pkg: SwmSenderKeyPackageMsg | undefined;
@@ -6319,6 +6507,123 @@ export class DKGAgent {
   ): Promise<void> {
     const topic = contextGraphWorkspaceTopic(contextGraphId);
     const wireMessage = await this.encodeWorkspaceGossipMessage(contextGraphId, message, resolvedSigner);
+
+    // rc.9 PR-C (SWM reliable fan-out plan, Step 3): tier-switch
+    // between substrate fan-out (point-to-point reliable via
+    // /dkg/10.0.1/swm-update) and GossipSub mesh based on CG
+    // membership shape. See `chooseFanOutTier` jsdoc + RFC-003 §6
+    // for the full policy. Both legs run when the policy says so
+    // — receiver-side dedup via SharedMemoryHandler's seenShareOps
+    // (PR-A) absorbs the resulting double-delivery cleanly and
+    // PR-A's `swm.redundantApplies` gauge makes it observable.
+    //
+    // Enumeration cost: at most one SPARQL query + one
+    // getSubscribers() call per CG per 60s window (enumerator
+    // caches). Independent of share rate.
+    //
+    // Errors are intentionally NOT re-thrown — share() in the
+    // caller already committed locally; transport failures here
+    // become observable via /api/slo (gossip.publishFailures +
+    // swm.substrateFanout) and the next sync-on-reconnect is the
+    // ultimate safety net.
+    //
+    // PR-C Codex R1 (planning-throw safety): `enumerate()` calls
+    // `getContextGraphAllowedPeers()` + `isPrivateContextGraph()`
+    // which both run SPARQL queries against `this.store`. A
+    // triple-store query failure (worker timeout, transient
+    // backend hiccup, corrupt graph) would otherwise bubble out
+    // of `publishWorkspaceGossip` and reject `share()` AFTER the
+    // local commit already succeeded — silently changing the
+    // pre-PR-C "share() never re-throws on transport failure"
+    // contract. Wrap planning in the same swallow-and-log shell
+    // as the gossip publish: on throw, fall back to a gossip-only
+    // plan (exactly the pre-PR-C behaviour for this share). The
+    // next share to the same cgId pays the SPARQL retry; the
+    // 60s enumeration cache means a one-off blip is recovered on
+    // the next call.
+    let plan: FanOutPlan;
+    try {
+      const enumeration = await this.getOrCreateCGMemberEnumerator().enumerate(contextGraphId);
+      plan = chooseFanOutTier({
+        enumeration,
+        maxSubstrateMembers: this.swmSubstrateMaxMembers,
+      });
+    } catch (err) {
+      const errClass = err instanceof Error
+        ? (err.name && err.name !== 'Error' ? err.name : err.constructor.name)
+        : typeof err;
+      const errMessage = err instanceof Error ? err.message : String(err);
+      this.log.warn(
+        ctx,
+        `SWM fan-out planning FAILED for cgId=${contextGraphId} errorClass="${errClass}" error="${errMessage}" — falling back to gossip-only (pre-PR-C behaviour)`,
+      );
+      plan = {
+        useSubstrate: false,
+        useGossip: true,
+        substrateMembers: [],
+        enumerationSource: 'none',
+        enumeratedCount: 0,
+      };
+    }
+
+    // Substrate fan-out runs first (and in parallel with gossip
+    // when both legs are active) so the parallel send latency
+    // overlaps with the gossip publish round-trip.
+    const substratePromise = plan.useSubstrate
+      ? executeSubstrateFanOut({
+        contextGraphId,
+        protocolId: PROTOCOL_SWM_UPDATE,
+        payload: wireMessage,
+        members: plan.substrateMembers,
+        sendTimeoutMs: DKGAgent.SWM_SUBSTRATE_FANOUT_TIMEOUT_MS,
+        substrate: this.messenger,
+        bookkeeper: this.substrateFanoutBookkeeper(),
+      })
+      : Promise.resolve(null);
+
+    const gossipPromise = plan.useGossip
+      ? this.publishViaGossip(contextGraphId, topic, wireMessage, ctx)
+      : Promise.resolve();
+
+    const [substrateResult] = await Promise.all([substratePromise, gossipPromise]);
+
+    if (substrateResult !== null) {
+      this.log.info(
+        ctx,
+        `SWM substrate fan-out cgId=${contextGraphId} source=${plan.enumerationSource} `
+        + `enumerated=${plan.enumeratedCount} `
+        + `attempted=${substrateResult.attempted} `
+        + `delivered=${substrateResult.delivered} rejected=${substrateResult.rejected} `
+        + `queued=${substrateResult.queued} `
+        + `inFlight=${substrateResult.inFlight} failed=${substrateResult.failed} `
+        + `also_gossiped=${plan.useGossip}`,
+      );
+    } else if (plan.enumerationSource === 'topic-subscribers' && plan.enumeratedCount > this.swmSubstrateMaxMembers) {
+      // Public CG above the threshold: gossip-only. Surface the
+      // gate trip at INFO so soak postmortems can correlate share
+      // delivery against transport choice without grepping for
+      // a separate decision log.
+      this.log.info(
+        ctx,
+        `SWM gossip-only (public CG above substrate cap) cgId=${contextGraphId} `
+        + `enumerated=${plan.enumeratedCount} cap=${this.swmSubstrateMaxMembers}`,
+      );
+    }
+  }
+
+  /**
+   * Pre-rc.9-PR-C body of `publishWorkspaceGossip` — the
+   * GossipSub publish + loud-fail counter from PR-A. Extracted
+   * into a named helper so the tier-switch above can call it
+   * conditionally (alongside or instead of the substrate fan-out
+   * leg) without duplicating the failure-bookkeeping logic.
+   */
+  private async publishViaGossip(
+    contextGraphId: string,
+    topic: string,
+    wireMessage: Uint8Array,
+    ctx: OperationContext,
+  ): Promise<void> {
     try {
       await this.gossip.publish(topic, wireMessage);
     } catch (err) {
@@ -8661,6 +8966,187 @@ export class DKGAgent {
       });
     }
     return this.sharedMemoryHandler;
+  }
+
+  /**
+   * Lazy single-instance CGMemberEnumerator. The enumerator owns
+   * a 60s membership cache so a burst of N shares to the same CG
+   * within the window pays one SPARQL query + one
+   * `getSubscribers` call total, not N.
+   *
+   * Deps are bound here to:
+   *  - `getContextGraphAllowedPeers` — the same accessor
+   *    `authorizePrivateSyncRequest` uses; returns null for CGs
+   *    with no `DKG_ALLOWED_PEER` allowlist triples (curated by
+   *    peer-allowlist returns the array; agent-gated returns
+   *    null, then `isPrivateContextGraph` discriminates).
+   *  - `isPrivateContextGraph` — closes the agent-gated-CG
+   *    misclassification hole (codex review on #571 bug #1): a CG
+   *    private via `DKG_ALLOWED_AGENT` without `DKG_ALLOWED_PEER`
+   *    falls into `source: 'none'` (fail closed) instead of
+   *    falling through to live topic subscribers.
+   *  - `getTopicSubscribers` — wrapping `GossipSubManager`'s
+   *    PR-B-added subscriber-snapshot accessor (best-effort, may
+   *    lag by one heartbeat interval; documented in
+   *    GossipSubManager.getSubscribers).
+   *  - `getSelfPeerId` — never fan out to ourselves; the local apply
+   *    already happened in the caller of `publishWorkspaceGossip`.
+   *    Passed as a thunk (not the resolved string) because
+   *    `this.peerId` throws `DKGNode not started` before libp2p has
+   *    booted — eagerly capturing it here would break pre-start
+   *    `share()` callers (PR-C codex R8). The thunk lets any throw
+   *    bubble out of `enumerate()`, where the R1 try/catch in
+   *    `publishWorkspaceGossip` rescues into the gossip-only path.
+   */
+  private getOrCreateCGMemberEnumerator(): CGMemberEnumerator {
+    if (!this.cgMemberEnumerator) {
+      this.cgMemberEnumerator = createCGMemberEnumerator({
+        getContextGraphAllowedPeers: (cgId) => this.getContextGraphAllowedPeers(cgId),
+        isPrivateContextGraph: (cgId) => this.isPrivateContextGraph(cgId),
+        getTopicSubscribers: (topic) => this.gossip.getSubscribers(topic),
+        topicForCG: (cgId) => contextGraphWorkspaceTopic(cgId),
+        getSelfPeerId: () => this.peerId,
+      });
+    }
+    return this.cgMemberEnumerator;
+  }
+
+  /**
+   * {@link FanOutBookkeeper} implementation backed by the four
+   * per-cgId outcome maps + the overflow buckets. Mirrors the
+   * Codex PR #570 R5/R8 shape from `recordSwmGossipPublishFailure`:
+   * once the per-cgId map crosses
+   * `SWM_SUBSTRATE_FANOUT_MAX_TRACKED_CGS`, the cgId with the
+   * GLOBAL smallest TOTAL count (summed across all four outcome
+   * maps) is evicted into the appropriate overflow bucket, so the
+   * grand total stays accurate and the hot cgIds stay visible.
+   *
+   * Returned as a single object literal (not a class) so the
+   * tier-switch in `publishWorkspaceGossip` can pass it inline
+   * to `executeSubstrateFanOut` without extra plumbing.
+   */
+  private substrateFanoutBookkeeper(): FanOutBookkeeper {
+    return {
+      recordOutcome: (cgId: string, record: FanOutPeerRecord) => {
+        this.recordSwmSubstrateFanoutOutcome(cgId, record);
+      },
+    };
+  }
+
+  /**
+   * Increment the per-(cgId, outcome) substrate counter and apply
+   * the overflow-cap eviction policy. Returns the post-increment
+   * count for the caller's WARN log on `failed` outcomes (parity
+   * with `recordSwmGossipPublishFailure`'s R12-fix shape).
+   */
+  private recordSwmSubstrateFanoutOutcome(cgId: string, record: FanOutPeerRecord): void {
+    const targetMap = this.substrateFanoutMapFor(record.outcome);
+    targetMap.set(cgId, (targetMap.get(cgId) ?? 0) + 1);
+    this.maybeEvictSubstrateFanoutCgId(cgId);
+  }
+
+  private substrateFanoutMapFor(outcome: FanOutPeerRecord['outcome']): Map<string, number> {
+    switch (outcome) {
+      case 'delivered': return this.swmSubstrateFanoutDelivered;
+      case 'rejected':  return this.swmSubstrateFanoutRejected;
+      case 'queued':    return this.swmSubstrateFanoutQueued;
+      case 'inFlight':  return this.swmSubstrateFanoutInFlight;
+      case 'failed':    return this.swmSubstrateFanoutFailed;
+    }
+  }
+
+  private substrateFanoutTotalForCg(cgId: string): number {
+    return (this.swmSubstrateFanoutDelivered.get(cgId) ?? 0)
+      + (this.swmSubstrateFanoutRejected.get(cgId) ?? 0)
+      + (this.swmSubstrateFanoutQueued.get(cgId) ?? 0)
+      + (this.swmSubstrateFanoutInFlight.get(cgId) ?? 0)
+      + (this.swmSubstrateFanoutFailed.get(cgId) ?? 0);
+  }
+
+  /**
+   * If the per-cgId tracking set is at or above
+   * `SWM_SUBSTRATE_FANOUT_MAX_TRACKED_CGS`, find the cgId with
+   * the smallest TOTAL count (summed across all four outcome
+   * maps), drain its four per-outcome counts into the overflow
+   * buckets, and delete it from the four maps. Setting the
+   * sticky `swmSubstrateFanoutTruncated` flag tells operators
+   * the per-cgId breakdown on /api/slo is partial.
+   *
+   * Eviction key = TOTAL across outcomes (not any single map),
+   * because the operator-facing definition of "hot cgId" is "lots
+   * of substrate activity", regardless of how it broke down. A
+   * cgId with 100 delivers is hotter than a cgId with 5 failed,
+   * even though `failed` is the more alarming outcome.
+   */
+  private maybeEvictSubstrateFanoutCgId(_justBumped: string): void {
+    // Use any of the five maps to count distinct tracked cgIds —
+    // they're populated together via `substrateFanoutTotalForCg`.
+    const distinctCgIds = new Set<string>([
+      ...this.swmSubstrateFanoutDelivered.keys(),
+      ...this.swmSubstrateFanoutRejected.keys(),
+      ...this.swmSubstrateFanoutQueued.keys(),
+      ...this.swmSubstrateFanoutInFlight.keys(),
+      ...this.swmSubstrateFanoutFailed.keys(),
+    ]);
+    if (distinctCgIds.size <= DKGAgent.SWM_SUBSTRATE_FANOUT_MAX_TRACKED_CGS) return;
+
+    let smallestCg: string | null = null;
+    let smallestTotal = Infinity;
+    for (const cg of distinctCgIds) {
+      const total = this.substrateFanoutTotalForCg(cg);
+      if (total < smallestTotal) {
+        smallestTotal = total;
+        smallestCg = cg;
+      }
+    }
+    if (smallestCg === null) return;
+
+    this.swmSubstrateFanoutOverflow.delivered += this.swmSubstrateFanoutDelivered.get(smallestCg) ?? 0;
+    this.swmSubstrateFanoutOverflow.rejected  += this.swmSubstrateFanoutRejected.get(smallestCg) ?? 0;
+    this.swmSubstrateFanoutOverflow.queued    += this.swmSubstrateFanoutQueued.get(smallestCg) ?? 0;
+    this.swmSubstrateFanoutOverflow.inFlight  += this.swmSubstrateFanoutInFlight.get(smallestCg) ?? 0;
+    this.swmSubstrateFanoutOverflow.failed    += this.swmSubstrateFanoutFailed.get(smallestCg) ?? 0;
+    this.swmSubstrateFanoutDelivered.delete(smallestCg);
+    this.swmSubstrateFanoutRejected.delete(smallestCg);
+    this.swmSubstrateFanoutQueued.delete(smallestCg);
+    this.swmSubstrateFanoutInFlight.delete(smallestCg);
+    this.swmSubstrateFanoutFailed.delete(smallestCg);
+    this.swmSubstrateFanoutTruncated = true;
+  }
+
+  /**
+   * Snapshot of the substrate fan-out counters for /api/slo.
+   * Same surface shape as `getSwmGossipStats()` / `getSwmHandlerStats()`
+   * — pure read, safe to call from a fresh daemon (returns
+   * pristine zeroes when no shares have fanned out yet). Pre-
+   * serializing into `Record<string, number>` happens via
+   * `Object.fromEntries` consistent with the existing /api/slo
+   * shape.
+   */
+  getSwmSubstrateFanoutStats(): {
+    delivered: Record<string, number>;
+    rejected: Record<string, number>;
+    queued: Record<string, number>;
+    inFlight: Record<string, number>;
+    failed: Record<string, number>;
+    overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
+    truncated: boolean;
+  } {
+    return {
+      delivered: Object.fromEntries(this.swmSubstrateFanoutDelivered),
+      rejected: Object.fromEntries(this.swmSubstrateFanoutRejected),
+      queued: Object.fromEntries(this.swmSubstrateFanoutQueued),
+      inFlight: Object.fromEntries(this.swmSubstrateFanoutInFlight),
+      failed: Object.fromEntries(this.swmSubstrateFanoutFailed),
+      overflow: {
+        delivered: this.swmSubstrateFanoutOverflow.delivered,
+        rejected: this.swmSubstrateFanoutOverflow.rejected,
+        queued: this.swmSubstrateFanoutOverflow.queued,
+        inFlight: this.swmSubstrateFanoutOverflow.inFlight,
+        failed: this.swmSubstrateFanoutOverflow.failed,
+      },
+      truncated: this.swmSubstrateFanoutTruncated,
+    };
   }
 
   private updateHandler?: UpdateHandler;

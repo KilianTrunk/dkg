@@ -475,6 +475,121 @@ describe('Messenger.getSloStats (SLO histogram)', () => {
     expect(messenger.getSloStats()).toEqual({});
   });
 
+  /**
+   * PR-C codex R7: per-protocol classifier hook lets the protocol
+   * owner exclude application-level rejection responses from the
+   * protocol-level `delivered` counter + latency histogram. SWM
+   * uses this for its 1-byte rejection sentinel so
+   * `protocols['/dkg/10.0.1/swm-update'].delivered` stays accurate
+   * to apply-level truth.
+   *
+   * These tests exercise the hook directly against a stock
+   * Messenger (no SWM-specific code involved) so the primitive
+   * stays reusable for future protocols.
+   */
+  describe('setResponseDeliveredClassifier (PR-C codex R7)', () => {
+    const REJECTION_SENTINEL = new Uint8Array([0x01]);
+
+    it('default behaviour (no classifier registered): every response counts as delivered', async () => {
+      const router = makeRouter(async () => REJECTION_SENTINEL);
+      const { messenger } = makeSubstrate({ router });
+      await messenger.sendReliable(PEER_B, PROTO, new Uint8Array([1]), {
+        messageId: 'm-default-' + '0'.repeat(26),
+      });
+
+      const stats = messenger.getSloStats();
+      expect(stats[PROTO].delivered).toBe(1);
+      expect(stats[PROTO].samples).toBe(1);
+    });
+
+    it('classifier returning false for a response skips delivered bump AND latency sample', async () => {
+      const router = makeRouter(async () => REJECTION_SENTINEL);
+      const { messenger, clock } = makeSubstrate({ router });
+      messenger.setResponseDeliveredClassifier(
+        PROTO,
+        (resp) => !(resp.byteLength === 1 && resp[0] === 0x01),
+      );
+
+      clock.mockImplementation(() => 1_700_000_000_000);
+      const p = messenger.sendReliable(PEER_B, PROTO, new Uint8Array([1]), {
+        messageId: 'm-rej-' + '0'.repeat(30),
+      });
+      clock.mockImplementation(() => 1_700_000_000_500);
+      const result = await p;
+
+      // Caller still sees a successful response with the sentinel
+      // bytes — only the metric is adjusted.
+      expect(result.delivered).toBe(true);
+      expect(Array.from(result.response ?? [])).toEqual([0x01]);
+
+      const stats = messenger.getSloStats();
+      // No SLO entry at all because nothing successfully delivered
+      // — getSloStats only emits keys for protocols with traffic.
+      expect(stats[PROTO]).toBeUndefined();
+    });
+
+    it('classifier returning true keeps the delivered bump (apply-OK response)', async () => {
+      const router = makeRouter(async () => new Uint8Array());
+      const { messenger } = makeSubstrate({ router });
+      messenger.setResponseDeliveredClassifier(
+        PROTO,
+        (resp) => !(resp.byteLength === 1 && resp[0] === 0x01),
+      );
+
+      await messenger.sendReliable(PEER_B, PROTO, new Uint8Array([1]), {
+        messageId: 'm-ok-' + '0'.repeat(31),
+      });
+
+      const stats = messenger.getSloStats();
+      expect(stats[PROTO].delivered).toBe(1);
+    });
+
+    it('mix of applied + rejected responses bumps delivered only for applied', async () => {
+      let respondWith = new Uint8Array();
+      const router = makeRouter(async () => respondWith);
+      const { messenger } = makeSubstrate({ router });
+      messenger.setResponseDeliveredClassifier(
+        PROTO,
+        (resp) => !(resp.byteLength === 1 && resp[0] === 0x01),
+      );
+
+      // First: apply OK → counts as delivered.
+      respondWith = new Uint8Array();
+      await messenger.sendReliable(PEER_B, PROTO, new Uint8Array([1]), {
+        messageId: 'm-r7-ok-' + '0'.repeat(28),
+      });
+      // Second: rejected → does NOT count as delivered.
+      respondWith = REJECTION_SENTINEL;
+      await messenger.sendReliable(PEER_B, PROTO, new Uint8Array([2]), {
+        messageId: 'm-r7-rej-' + '0'.repeat(27),
+      });
+      // Third: apply OK → counts as delivered.
+      respondWith = new Uint8Array();
+      await messenger.sendReliable(PEER_B, PROTO, new Uint8Array([3]), {
+        messageId: 'm-r7-ok2-' + '0'.repeat(27),
+      });
+
+      const stats = messenger.getSloStats();
+      expect(stats[PROTO].delivered).toBe(2);
+      expect(stats[PROTO].samples).toBe(2);
+    });
+
+    it('classifier crash fails open (counts as delivered) so a classifier bug does not hide real traffic', async () => {
+      const router = makeRouter(async () => REJECTION_SENTINEL);
+      const { messenger } = makeSubstrate({ router });
+      messenger.setResponseDeliveredClassifier(PROTO, () => {
+        throw new Error('classifier bug');
+      });
+
+      await messenger.sendReliable(PEER_B, PROTO, new Uint8Array([1]), {
+        messageId: 'm-r7-bug-' + '0'.repeat(27),
+      });
+
+      const stats = messenger.getSloStats();
+      expect(stats[PROTO].delivered).toBe(1);
+    });
+  });
+
   it('per-protocol stats are isolated', async () => {
     const { messenger, clock } = makeSubstrate();
     const PROTO_B = '/dkg/10.0.1/private-access';

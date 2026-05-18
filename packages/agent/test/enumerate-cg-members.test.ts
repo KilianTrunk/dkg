@@ -15,7 +15,7 @@ function makeDeps(overrides: Partial<CGMemberEnumeratorDeps>): CGMemberEnumerato
     isPrivateContextGraph: async () => false,
     getTopicSubscribers: () => [],
     topicForCG: (cgId) => `dkg/context-graph/${cgId}/shared-memory`,
-    selfPeerId: SELF,
+    getSelfPeerId: () => SELF,
     ...overrides,
   };
 }
@@ -452,5 +452,68 @@ describe('createCGMemberEnumerator: source label transitions', () => {
     const second = await enumerator.enumerate('cg-transition');
     expect(second.source).toBe('topic-subscribers');
     expect(second.members).toEqual(['peerOpen']);
+  });
+});
+
+/**
+ * PR-C codex R8: `getSelfPeerId` is a thunk (not a captured
+ * string) so that any throw inside the canonical accessor
+ * (`DKGAgent.peerId` → `DKGNode.peerId` → throws `DKGNode not
+ * started` before libp2p boots) doesn't fire at enumerator
+ * construction time. Construction MUST be safe even when the
+ * thunk would throw — only the actual `enumerate()` call should
+ * exercise it, where the throw bubbles into
+ * `publishWorkspaceGossip`'s R1 try/catch (gossip-only fallback).
+ */
+describe('createCGMemberEnumerator: getSelfPeerId thunk (PR-C codex R8)', () => {
+  it('construction does NOT call getSelfPeerId — pre-start agents are safe to wire up', () => {
+    let calls = 0;
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      getSelfPeerId: () => {
+        calls += 1;
+        throw new Error('DKGNode not started');
+      },
+    }));
+
+    expect(calls).toBe(0);
+    expect(enumerator.size()).toBe(0);
+  });
+
+  it('throw inside getSelfPeerId propagates out of enumerate() so callers can rescue', async () => {
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      getContextGraphAllowedPeers: async () => ['peerA'],
+      getSelfPeerId: () => {
+        throw new Error('DKGNode not started');
+      },
+    }));
+
+    await expect(enumerator.enumerate('cg-thunk-throws')).rejects.toThrow(/not started/);
+  });
+
+  it('thunk is called fresh on each cache-miss resolve (allows peerId to become available between calls)', async () => {
+    let nowMs = 1_000_000;
+    const peerIdSnapshots: (string | null)[] = [];
+    let currentPeerId: string | null = null;
+    const enumerator = createCGMemberEnumerator(makeDeps({
+      now: () => nowMs,
+      cacheTtlMs: 100,
+      getContextGraphAllowedPeers: async () => ['peerA', SELF, 'peerB'],
+      getSelfPeerId: () => {
+        peerIdSnapshots.push(currentPeerId);
+        if (currentPeerId === null) {
+          throw new Error('DKGNode not started');
+        }
+        return currentPeerId;
+      },
+    }));
+
+    await expect(enumerator.enumerate('cg-late-start')).rejects.toThrow(/not started/);
+    expect(peerIdSnapshots).toEqual([null]);
+
+    currentPeerId = SELF;
+    nowMs += 200;
+    const result = await enumerator.enumerate('cg-late-start');
+    expect(peerIdSnapshots).toEqual([null, SELF]);
+    expect(result.members.sort()).toEqual(['peerA', 'peerB']);
   });
 });

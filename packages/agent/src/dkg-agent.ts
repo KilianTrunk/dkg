@@ -1967,6 +1967,17 @@ export class DKGAgent {
     // after receiver-side application succeeds (rather than the
     // current proxy through substrate-level wire delivery).
     this.messenger.register(PROTOCOL_SWM_UPDATE, async (data, peerId) => this.handleSwmUpdate(data, peerId));
+    // PR-C codex R7: tell Messenger that the 1-byte rejection
+    // sentinel is an APP-LEVEL rejection — Messenger's
+    // protocol-level `delivered` counter + latency histogram
+    // (`/api/slo`'s `protocols['/dkg/10.0.1/swm-update']`) should
+    // NOT bump for these responses. The application-level
+    // truth (delivered vs rejected) lives in
+    // `swm.substrateFanout.{delivered,rejected}`.
+    this.messenger.setResponseDeliveredClassifier(
+      PROTOCOL_SWM_UPDATE,
+      (response) => !(response.byteLength === 1 && response[0] === 0x01),
+    );
 
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);

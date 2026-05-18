@@ -377,6 +377,30 @@ export class Messenger {
    */
   private readonly lastDhtWalkAt = new Map<string, number>();
 
+  /**
+   * Per-protocol classifier that decides whether a successful wire
+   * response should count as `delivered` in the protocol-level SLO
+   * counters/histogram. Returning `false` skips the delivered bump
+   * (and the latency sample) for THAT response — the caller still
+   * sees the response bytes verbatim and the outbox still removes
+   * the entry; only the metric is adjusted.
+   *
+   * Added in rc.9 PR-C codex R7: SWM's substrate receiver
+   * (`handleSwmUpdate`) signals permanent application-level
+   * rejections (peer not in allowlist, bad signature, validation
+   * failure) with a 1-byte `FANOUT_RESPONSE_REJECTED` sentinel
+   * response. Without this hook, `protocols['/dkg/10.0.1/swm-update']`
+   * would record those rejections as `delivered`, overstating
+   * apply success at the protocol layer. Other protocols don't
+   * register a classifier — every response counts as delivered
+   * (backward-compatible default).
+   *
+   * The classifier is called once per response (success path,
+   * background retry success, sender-side dedup hit) — it must
+   * be pure (no side effects) and cheap (microseconds).
+   */
+  private readonly deliveredResponseClassifiers = new Map<string, (response: Uint8Array) => boolean>();
+
   constructor(deps: MessengerDeps & { sloWindowSamples?: number }) {
     this.router = deps.router;
     this.idempotencyStore = deps.idempotencyStore;
@@ -389,6 +413,39 @@ export class Messenger {
     this.clock = deps.clock ?? (() => Date.now());
     this.sloWindowSamples = deps.sloWindowSamples ?? DEFAULT_SLO_WINDOW_SAMPLES;
     this.resolvePeer = deps.resolvePeer;
+  }
+
+  /**
+   * Register a per-protocol filter that decides whether a wire
+   * response should count toward the protocol-level `delivered`
+   * SLO counter. See {@link deliveredResponseClassifiers} for the
+   * full design rationale. Calling this with `protocolId` that
+   * already has a classifier overwrites it — last-write-wins.
+   *
+   * Typical use: PR-C SWM substrate fan-out registers
+   *   `setResponseDeliveredClassifier(PROTOCOL_SWM_UPDATE, (resp) =>
+   *      !(resp.byteLength === 1 && resp[0] === 0x01))`
+   * so the 1-byte rejection sentinel is excluded from `delivered`.
+   */
+  setResponseDeliveredClassifier(
+    protocolId: string,
+    classifier: (response: Uint8Array) => boolean,
+  ): void {
+    this.deliveredResponseClassifiers.set(protocolId, classifier);
+  }
+
+  private shouldCountResponseAsDelivered(protocolId: string, response: Uint8Array): boolean {
+    const classifier = this.deliveredResponseClassifiers.get(protocolId);
+    if (classifier === undefined) return true;
+    try {
+      return classifier(response);
+    } catch {
+      // Classifier bug — fail open (count as delivered) so a
+      // classifier crash doesn't make every send look like a
+      // rejection. The SWM-specific bucket will record the truth
+      // even if the protocol-level metric is slightly off.
+      return true;
+    }
   }
 
   /**
@@ -423,14 +480,34 @@ export class Messenger {
   }
 
   /**
-   * Record a successful delivery for the SLO histogram. Called from
+   * Record a wire-level response for the SLO histogram. Called from
    * `sendReliable` on synchronous success + from `retryOutboxEntry`
    * on background retry success. Idempotent on the (protocol, peer,
    * messageId) key — second call is a no-op because firstAttemptAt
    * was already cleared.
+   *
+   * PR-C codex R7: consults the per-protocol
+   * `deliveredResponseClassifiers` to decide whether the response
+   * counts as an application-level delivery. Non-applied responses
+   * (e.g. SWM's `FANOUT_RESPONSE_REJECTED` sentinel) clean up
+   * `firstAttemptAt` (no leak) but skip the `delivered` counter
+   * AND the latency histogram sample — operators reading the
+   * protocol-level metric see apply-level truth.
    */
-  private noteDeliveredForSlo(protocolId: string, peerId: string, messageId: string): void {
+  private noteDeliveredForSlo(
+    protocolId: string,
+    peerId: string,
+    messageId: string,
+    response: Uint8Array,
+  ): void {
     const k = sloKey(protocolId, peerId, messageId);
+    if (!this.shouldCountResponseAsDelivered(protocolId, response)) {
+      // App-level rejection (e.g. SWM rejection sentinel).
+      // Bookkeeping cleanup only; SLO bucket stays accurate to
+      // its "apply-level delivered" meaning.
+      this.firstAttemptAt.delete(k);
+      return;
+    }
     const startedAt = this.firstAttemptAt.get(k);
     if (startedAt == null) {
       this.bumpCounter(protocolId, 'delivered');
@@ -524,14 +601,23 @@ export class Messenger {
       // didn't actually deliver this call; the original delivery
       // already counted. Still bump the delivered counter so
       // operators see traffic.
-      this.bumpCounter(protocolId, 'delivered');
+      //
+      // PR-C codex R7: but only if the per-protocol classifier
+      // says the cached response counts as delivered. If the
+      // cached response is e.g. SWM's rejection sentinel, we
+      // shouldn't bump delivered on a dedup re-hit either — the
+      // protocol-level metric stays accurate to "applied".
+      const cached = sentBefore.cachedResponse ?? RESPONSE_GONE_BYTES;
+      if (this.shouldCountResponseAsDelivered(protocolId, cached)) {
+        this.bumpCounter(protocolId, 'delivered');
+      }
       this.firstAttemptAt.delete(sloK);
       return {
         delivered: true,
         // Mark-only original response surfaces as RESPONSE_GONE so
         // the caller can decide whether to re-issue with a fresh
         // messageId (chat: harmless; query: must re-issue).
-        response: sentBefore.cachedResponse ?? RESPONSE_GONE_BYTES,
+        response: cached,
         attempts: 1,
         messageId,
       };
@@ -571,7 +657,7 @@ export class Messenger {
       );
       idem.record(peerId, protocolId, messageId, 'out', response);
       outbox.markDelivered(peerId, protocolId, messageId);
-      this.noteDeliveredForSlo(protocolId, peerId, messageId);
+      this.noteDeliveredForSlo(protocolId, peerId, messageId, response);
       this.clearDhtWalkRateLimitIfDrained(peerId);
       return { delivered: true, response, attempts: 1, messageId };
     } catch (err) {
@@ -761,7 +847,7 @@ export class Messenger {
         response,
       );
       outbox.markDelivered(entry.peer, entry.protocol, entry.messageId);
-      this.noteDeliveredForSlo(entry.protocol, entry.peer, entry.messageId);
+      this.noteDeliveredForSlo(entry.protocol, entry.peer, entry.messageId, response);
       this.clearDhtWalkRateLimitIfDrained(entry.peer);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);

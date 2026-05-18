@@ -27,12 +27,21 @@ import { withRetry } from '@origintrail-official/dkg-core';
  * app-layer idempotent so this is purely a wasted-work concern, not
  * a correctness one — and it's bounded by `syncPageRetryAttempts`.
  *
- * To bound the related concern of "orphaned outbox entries from
- * failed attempts hang around for 24h doing redundant work", the
- * `dkg-agent` send adapter passes `maxAgeMs: SYNC_AUTH_MAX_AGE_MS -
- * 5_000` to `messenger.sendReliable`, so the substrate drops sync
- * outbox entries within ~85s of their first failure — comfortably
- * before any envelope they hold could be denied as stale.
+ * The related concern of "orphaned outbox entries from failed
+ * attempts hang around for 24h doing redundant work" is currently
+ * unbounded for sync (codex follow-up #9). The `dkg-agent` send
+ * adapter previously passed `maxAgeMs: SYNC_AUTH_MAX_AGE_MS -
+ * 5_000` to `messenger.sendReliable`, but Codex correctly flagged
+ * it as a no-op: `Messenger.sendReliable` does not currently read
+ * `opts.maxAgeMs` on the enqueue-failure path, and the underlying
+ * `ProtocolOutbox` carries only an instance-wide max-age. The
+ * misleading option has since been dropped; the wasted-cycles
+ * cost is bounded by `syncPageRetryAttempts` orphaned entries
+ * per failed page and is tracked as an rc.10 follow-up to wire
+ * per-call max-age end-to-end through the substrate (interface +
+ * enqueue/dropExpired + SQLite schema migration). The correctness
+ * story is unchanged: fresh-per-attempt messageIds prevent any
+ * cached stale denial from replaying onto a later attempt.
  */
 interface SyncSendParams {
   remotePeerId: string;

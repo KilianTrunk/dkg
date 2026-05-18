@@ -610,6 +610,13 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
   // monotonic delivered / queued counters. Source of truth for the
   // ship-gate overnight soak.
   //
+  // rc.9 PR-A (SWM reliable fan-out plan, Step 0) extended the
+  // response shape with two new top-level sections — `gossip` for
+  // SWM gossip publish failures (pre-rc.9 silently swallowed) and
+  // `swm` for receiver-side redundant-apply measurement (informs
+  // rc10 Concern-2 dedup decision). Both are additive; existing
+  // consumers that parse `protocols` keep working.
+  //
   // SECURITY: this endpoint is reachable only from localhost via the
   // daemon's bind address (the daemon binds /api/* to 127.0.0.1 by
   // default — see packages/cli/src/daemon/lifecycle.ts). Per-protocol
@@ -620,8 +627,10 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
   // in front. The agent.getMessengerSloStats() call itself is cheap
   // (≤ 8 protocols × ≤ 1k samples sort) so no rate limit is needed.
   if (req.method === "GET" && path === "/api/slo") {
-    const stats = agent.getMessengerSloStats();
-    return jsonResponse(res, 200, { protocols: stats });
+    const protocols = agent.getMessengerSloStats();
+    const gossip = agent.getSwmGossipStats();
+    const swm = agent.getSwmHandlerStats();
+    return jsonResponse(res, 200, { protocols, gossip, swm });
   }
 
   // GET /api/skills

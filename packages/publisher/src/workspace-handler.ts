@@ -66,6 +66,57 @@ export class SharedMemoryHandler {
   private readonly publicSnapshotStore?: WorkspacePublicSnapshotStore;
   private readonly log = new Logger('SharedMemoryHandler');
 
+  /**
+   * Per-(cgId|shareOperationId) timestamp of the most recent legitimate
+   * delivery. Used purely for measurement of the redundant-apply rate
+   * surfaced via /api/slo `swm.redundantApplies`. Bumped (without
+   * blocking the apply) whenever we see a `(cgId, shareOperationId)`
+   * we already processed within the TTL window.
+   *
+   * Lives here rather than in DKGAgent because once Step 1a / 1b of the
+   * SWM reliable fan-out plan land, the gossip and substrate delivery
+   * paths both terminate at `SharedMemoryHandler.handle()` — this is
+   * the natural place to count duplicates that result from the two-
+   * path race (gossip arrives, then substrate top-up fires before
+   * receiver ack catches up to author).
+   *
+   * Bounded LRU: when size exceeds SEEN_OPS_MAX_SIZE, the oldest entries
+   * are evicted in batches. Insertion order is JS-Map-iteration order,
+   * so eviction is O(batch_size).
+   */
+  private readonly seenShareOps = new Map<string, number>();
+  private readonly redundantApplyCounts = new Map<string, number>();
+  /**
+   * Sum of redundant-apply counts evicted into the overflow bucket
+   * when `redundantApplyCounts.size` exceeds `redundantAppliesMaxCgs`.
+   * Always 0 in normal deployments; non-zero only when redundant
+   * applies arrive against thousands of distinct cgIds (typically a
+   * buggy or hostile peer). Surfaces via `getStats()` so /api/slo
+   * stays bounded.
+   *
+   * Codex PR #570 R9 caught the unbounded growth.
+   */
+  private redundantApplyCountsOverflow = 0;
+  /** Sticky truncated flag for `redundantApplyCounts` (R9). */
+  private redundantApplyCountsTruncated = false;
+  private readonly seenOpsTtlMs: number;
+  private readonly seenOpsMaxSize: number;
+  private readonly seenOpsEvictBatch: number;
+  private readonly redundantAppliesMaxCgs: number;
+  /**
+   * Becomes true the first time the cap eviction had to trim a
+   * non-expired entry (i.e., the TTL window stopped being accurate
+   * because throughput outran the cap). Surfaced via `getStats()` so
+   * `/api/slo` operators can see that `redundantApplies` is a lower
+   * bound rather than an exact count. Codex review on PR #570
+   * caught the silent undercount.
+   */
+  private seenOpsCapEvictedLiveEntries = false;
+  private static readonly DEFAULT_SEEN_OPS_TTL_MS = 10 * 60 * 1000;
+  private static readonly DEFAULT_SEEN_OPS_MAX_SIZE = 50_000;
+  private static readonly DEFAULT_SEEN_OPS_EVICT_BATCH = 5_000;
+  private static readonly DEFAULT_REDUNDANT_APPLIES_MAX_CGS = 1024;
+
   constructor(
     store: TripleStore,
     eventBus: EventBus,
@@ -79,6 +130,27 @@ export class SharedMemoryHandler {
       workspaceSenderKeyDecryptor?: WorkspaceSenderKeyDecryptor;
       now?: () => number;
       publicSnapshotStore?: WorkspacePublicSnapshotStore;
+      /**
+       * Override the seen-share-op TTL (default 10 min). Lower values
+       * are useful in tests / very-low-RAM deployments. Codex review
+       * #570 R3 surfaced that the cap-based eviction was potentially
+       * silently trimming live entries above ~83 unique ops/sec; the
+       * configurable knobs let operators tune for their throughput.
+       */
+      seenOpsTtlMs?: number;
+      /** Override the seen-share-op map capacity (default 50_000). */
+      seenOpsMaxSize?: number;
+      /** Override the seen-share-op eviction batch size (default 5_000). */
+      seenOpsEvictBatch?: number;
+      /**
+       * Override the per-cgId `redundantApplyCounts` map capacity
+       * (default 1024). Codex PR #570 R9: the per-cgId redundant-apply
+       * counter map was unbounded — a buggy/hostile peer could grow
+       * memory + /api/slo payload by forcing one duplicate on many
+       * fresh cgIds. Beyond this cap, the smallest counter is evicted
+       * into an overflow bucket so the grand total stays accurate.
+       */
+      redundantAppliesMaxCgs?: number;
     },
   ) {
     this.store = store;
@@ -93,6 +165,177 @@ export class SharedMemoryHandler {
     this.workspaceSenderKeyDecryptor = options?.workspaceSenderKeyDecryptor;
     this.now = options?.now ?? (() => Date.now());
     this.publicSnapshotStore = options?.publicSnapshotStore;
+    this.seenOpsTtlMs = options?.seenOpsTtlMs ?? SharedMemoryHandler.DEFAULT_SEEN_OPS_TTL_MS;
+    this.seenOpsMaxSize = options?.seenOpsMaxSize ?? SharedMemoryHandler.DEFAULT_SEEN_OPS_MAX_SIZE;
+    this.seenOpsEvictBatch = options?.seenOpsEvictBatch ?? SharedMemoryHandler.DEFAULT_SEEN_OPS_EVICT_BATCH;
+    this.redundantAppliesMaxCgs =
+      options?.redundantAppliesMaxCgs ?? SharedMemoryHandler.DEFAULT_REDUNDANT_APPLIES_MAX_CGS;
+  }
+
+  /**
+   * Bump the redundant-apply counter when a (cgId, shareOpId) pair
+   * is observed a second time within the TTL window. Idempotent on
+   * repeat observations within TTL (counter increments each repeat).
+   *
+   * Codex review on PR #570 surfaced four correctness issues that
+   * this fixed shape addresses:
+   *
+   *   R1: callers must only invoke this AFTER the delivery has
+   *       passed allowlist + sub-graph validation + CAS + actual
+   *       write — counting rejected deliveries would skew the
+   *       /api/slo `swm.redundantApplies` gauge that informs the
+   *       rc10 dedup decision. Call site is now inside the
+   *       `if (applied)` block in `handle()`.
+   *
+   *   R2: eviction is true LRU, not just least-recently-inserted.
+   *       `Map#set(existingKey, …)` updates the value but leaves
+   *       iteration order untouched, so a hot key inserted long
+   *       ago could still be evicted when the map crosses
+   *       seenOpsMaxSize. We now `delete(key)` before
+   *       re-inserting on a hit, which moves the key to the end of
+   *       iteration order so eviction takes the genuinely oldest
+   *       entries.
+   *
+   *   R3: eviction prunes TTL-expired entries first, then falls
+   *       back to cap-based batch eviction only if everything is
+   *       still live. Pre-fix, at ~83 unique ops/sec the cap was
+   *       hit before TTL expiry, so live entries got dropped and
+   *       `redundantApplies` undercounted exactly when the metric
+   *       was meant to inform the rc10 dedup decision. When the
+   *       fallback path DOES have to trim live entries (e.g.,
+   *       configured cap too small for the throughput), we set a
+   *       sticky flag so operators see `redundantAppliesLowerBound`
+   *       on the `/api/slo` snapshot.
+   *
+   *   R4: see workspace.test.ts — the regression test now drives
+   *       the map past the configured cap so the LRU refresh +
+   *       prune-expired-first paths are exercised, not just the
+   *       insertion-order assertion.
+   */
+  private recordSeenShareOp(
+    cgId: string,
+    shareOperationId: string,
+    ctx: import('@origintrail-official/dkg-core').OperationContext,
+  ): void {
+    const key = `${cgId}|${shareOperationId}`;
+    const nowMs = this.now();
+    const previousAt = this.seenShareOps.get(key);
+    if (previousAt !== undefined) {
+      if (nowMs - previousAt < this.seenOpsTtlMs) {
+        const next = (this.redundantApplyCounts.get(cgId) ?? 0) + 1;
+        this.redundantApplyCounts.set(cgId, next);
+        this.enforceRedundantApplyCountsCap();
+        this.log.debug(ctx, `SWM redundant apply (cgId=${cgId} op=${shareOperationId} count=${next})`);
+      }
+      // PR-A R2: refresh the LRU position. `Map#set(existingKey, v)`
+      // alone does NOT move the key to the end of iteration order;
+      // we must delete first so the subsequent set re-inserts at the
+      // tail. Without this, a hot key inserted at t=0 keeps the same
+      // position even after a t=now access and eventually gets
+      // evicted as if it were cold.
+      this.seenShareOps.delete(key);
+    }
+    this.seenShareOps.set(key, nowMs);
+    if (this.seenShareOps.size > this.seenOpsMaxSize) {
+      // PR-A R3 Phase 1: prune TTL-expired entries first. Iteration
+      // order is LRU (oldest first thanks to the delete+set in R2),
+      // so we can sweep from the front and bail at the first live
+      // entry — O(actually-expired), not O(n).
+      for (const [k, ts] of this.seenShareOps) {
+        if (nowMs - ts < this.seenOpsTtlMs) break;
+        this.seenShareOps.delete(k);
+      }
+      // PR-A R3 Phase 2: if the map is STILL over the cap after
+      // pruning expired, it means throughput has outrun the
+      // configured cap and we must trim still-live entries to stay
+      // bounded. This makes redundantApplies a lower bound rather
+      // than exact — surface that to operators via the sticky
+      // `seenOpsCapEvictedLiveEntries` flag (exposed through
+      // getStats()) so `/api/slo` can flag it.
+      if (this.seenShareOps.size > this.seenOpsMaxSize) {
+        let evicted = 0;
+        for (const k of this.seenShareOps.keys()) {
+          if (evicted >= this.seenOpsEvictBatch) break;
+          this.seenShareOps.delete(k);
+          evicted += 1;
+        }
+        if (!this.seenOpsCapEvictedLiveEntries) {
+          this.seenOpsCapEvictedLiveEntries = true;
+          this.log.warn(
+            ctx,
+            `SWM seenShareOps cap eviction trimmed ${evicted} live (non-TTL-expired) entries — redundantApplies is now a lower bound. Consider raising seenOpsMaxSize (current=${this.seenOpsMaxSize}).`,
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * PR-A R9: bound the per-cgId redundant-apply counter map. The
+   * receiver-side `redundantApplyCounts` would otherwise grow O(distinct
+   * cgIds ever observed) — a buggy or hostile peer could force one
+   * duplicate apply on many fresh cgIds and inflate both process
+   * memory and the /api/slo response payload indefinitely. Mirrors
+   * the swmGossipPublishFailures cap on the sender side.
+   *
+   * Eviction picks the GLOBAL smallest counter (including the
+   * just-incremented one) — so when the new entry IS the smallest,
+   * it gets evicted into the overflow bucket and the existing hot
+   * cgIds stay intact (Codex PR #570 R8 lifted here too).
+   */
+  private enforceRedundantApplyCountsCap(): void {
+    if (this.redundantApplyCounts.size <= this.redundantAppliesMaxCgs) return;
+    let smallestCg: string | null = null;
+    let smallestCount = Infinity;
+    for (const [cg, count] of this.redundantApplyCounts) {
+      if (count < smallestCount) {
+        smallestCount = count;
+        smallestCg = cg;
+      }
+    }
+    if (smallestCg !== null) {
+      this.redundantApplyCounts.delete(smallestCg);
+      this.redundantApplyCountsOverflow += smallestCount;
+      if (!this.redundantApplyCountsTruncated) {
+        this.redundantApplyCountsTruncated = true;
+      }
+    }
+  }
+
+  /**
+   * Snapshot of receiver-side SWM metrics for /api/slo. rc.9 PR-A.
+   *
+   * - `redundantApplies`: per-cgId counts of redundant applies (same
+   *   `shareOpId` delivered twice within the TTL window AND both
+   *   deliveries actually applied to the store). Counter increments
+   *   each additional delivery beyond the first.
+   * - `redundantAppliesLowerBound`: sticky boolean set to true the
+   *   moment cap-based eviction had to trim a still-live (non-TTL-
+   *   expired) entry from `seenShareOps`. Once true, the
+   *   `redundantApplies` figures are a lower bound for the operating
+   *   window — surfaces via Codex PR #570 R3 so operators can spot
+   *   the configured `seenOpsMaxSize` no longer fits their throughput.
+   * - `redundantAppliesOverflow`: sum of counters evicted into
+   *   overflow when `redundantApplyCounts.size` crossed
+   *   `redundantAppliesMaxCgs`. Surfaces via Codex PR #570 R9 so the
+   *   grand total stays accurate even when the per-cgId breakdown
+   *   gets truncated.
+   * - `redundantAppliesTruncated`: sticky boolean, true once R9
+   *   eviction has fired. Means the per-cgId breakdown is partial;
+   *   total is still `sum(redundantApplies) + redundantAppliesOverflow`.
+   */
+  getStats(): {
+    redundantApplies: Record<string, number>;
+    redundantAppliesLowerBound: boolean;
+    redundantAppliesOverflow: number;
+    redundantAppliesTruncated: boolean;
+  } {
+    return {
+      redundantApplies: Object.fromEntries(this.redundantApplyCounts),
+      redundantAppliesLowerBound: this.seenOpsCapEvictedLiveEntries,
+      redundantAppliesOverflow: this.redundantApplyCountsOverflow,
+      redundantAppliesTruncated: this.redundantApplyCountsTruncated,
+    };
   }
 
   private async withWriteLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
@@ -271,6 +514,13 @@ export class SharedMemoryHandler {
         return;
       }
 
+      // PR-A R1 NOTE: the redundant-apply counter is bumped AFTER the
+      // write succeeds (inside `if (applied)` below), not here. Counting
+      // pre-validation deliveries would let bogus / replay-rejected /
+      // CAS-rejected messages skew the `/api/slo` `redundantApplies`
+      // gauge that the rc10 dedup decision relies on. Codex review on
+      // PR #570 caught the earlier shape.
+
       // Enforce peer allowlist for curated CGs
       if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
         this.log.warn(ctx, `SWM write rejected: peer "${fromPeerId}" not in allowlist for context graph "${contextGraphId}"`);
@@ -439,6 +689,12 @@ export class SharedMemoryHandler {
 
       onPhase?.('store', 'end');
       if (applied) {
+        // PR-A R1: only record the observation after the apply actually
+        // succeeded — passing allowlist + sub-graph validation + CAS +
+        // the durable store insert. Recording earlier would let
+        // rejected duplicate deliveries count as "redundant applies"
+        // and skew the `/api/slo` metric.
+        this.recordSeenShareOp(contextGraphId, shareOperationId, ctx);
         this.log.info(ctx, `Stored SWM write ${shareOperationId} (${quads.length} quads)`);
         this.eventBus.emit(DKGEvent.MEMORY_GRAPH_CHANGED, {
           contextGraphId,

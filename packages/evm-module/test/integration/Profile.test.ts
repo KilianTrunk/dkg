@@ -24,6 +24,8 @@ import {
   ParametersStorage,
   DelegatorsInfo,
   ShardingTable,
+  ConvictionStakingStorage,
+  IdentityStorage,
 } from '../../typechain';
 import { createKnowledgeCollection } from '../helpers/kc-helpers';
 import { createProfile } from '../helpers/profile-helpers';
@@ -1096,5 +1098,96 @@ describe('Profile Contract', () => {
         ).to.be.revertedWithCustomError(Profile, 'InvalidOperatorFee');
       });
     });
+  });
+});
+
+/* ───────── recreate-profile-recovery 0001 — id-keyed state ───────── */
+
+describe('@integration Profile recreate preserves id-keyed state', () => {
+  const fixtureRecreate = deployments.createFixture(async () => {
+    await hre.deployments.fixture(['Profile']);
+    const signers = await hre.ethers.getSigners();
+    const contracts = {
+      hub: await hre.ethers.getContract<Hub>('Hub'),
+      profile: await hre.ethers.getContract<Profile>('Profile'),
+      profileStorage:
+        await hre.ethers.getContract<ProfileStorage>('ProfileStorage'),
+      identityStorage:
+        await hre.ethers.getContract<IdentityStorage>('IdentityStorage'),
+      stakingStorage:
+        await hre.ethers.getContract<StakingStorage>('StakingStorage'),
+      convictionStakingStorage:
+        await hre.ethers.getContract<ConvictionStakingStorage>(
+          'ConvictionStakingStorage',
+        ),
+    };
+    await contracts.hub.setContractAddress('HubOwner', signers[0].address);
+    return { ...contracts, signers };
+  });
+
+  it('staking/conviction state pre-seeded under a bricked identityId survives recreate', async () => {
+    const {
+      profile,
+      profileStorage,
+      identityStorage,
+      stakingStorage,
+      convictionStakingStorage,
+      signers,
+    } = await fixtureRecreate();
+
+    const operational = signers[0];
+    const admin = signers[1];
+    const nodeId =
+      '0x07f38512786964d9e70453371e7c98975d284100d44bd68dab67fe00b525cb66';
+
+    // Mint identity 1 + profile, then wipe ONLY the profile — the testnet
+    // ProfileStorage-redeploy state: Identity + id-keyed state survive.
+    await profile
+      .connect(operational)
+      .createProfile(admin.address, [], 'Recover Node', nodeId, 1000);
+    const identityId = await identityStorage.getIdentityId(
+      operational.address,
+    );
+
+    const seededStake = hre.ethers.parseEther('12345');
+    const seededOperatorFee = hre.ethers.parseEther('67');
+    await stakingStorage
+      .connect(signers[0])
+      .setNodeStake(identityId, seededStake);
+    await convictionStakingStorage
+      .connect(signers[0])
+      .setOperatorFeeBalance(identityId, seededOperatorFee);
+
+    await profileStorage.connect(signers[0]).deleteProfile(identityId);
+    expect(await profileStorage.profileExists(identityId)).to.equal(false);
+    expect(await stakingStorage.getNodeStake(identityId)).to.equal(
+      seededStake,
+    );
+    expect(
+      await convictionStakingStorage.getOperatorFeeBalance(identityId),
+    ).to.equal(seededOperatorFee);
+
+    const lastIdBefore = await identityStorage.lastIdentityId();
+
+    await expect(
+      profile
+        .connect(admin)
+        .recreateProfile(identityId, 'Recover Node', nodeId, 1000),
+    ).to.not.be.reverted;
+
+    // Profile restored under the SAME id; no new identity minted; the
+    // pre-seeded id-keyed state is still addressable and unchanged.
+    expect(await profileStorage.profileExists(identityId)).to.equal(true);
+    expect(await profileStorage.getNodeId(identityId)).to.equal(nodeId);
+    expect(await identityStorage.lastIdentityId()).to.equal(lastIdBefore);
+    expect(
+      await identityStorage.getIdentityId(operational.address),
+    ).to.equal(identityId);
+    expect(await stakingStorage.getNodeStake(identityId)).to.equal(
+      seededStake,
+    );
+    expect(
+      await convictionStakingStorage.getOperatorFeeBalance(identityId),
+    ).to.equal(seededOperatorFee);
   });
 });

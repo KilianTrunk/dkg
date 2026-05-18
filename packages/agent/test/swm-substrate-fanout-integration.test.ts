@@ -117,11 +117,24 @@ async function createAgent(name: string): Promise<DKGAgent> {
 }
 
 function installAllReachableLibp2pStub(agent: DKGAgent): void {
+  const allReachableIds = (): string[] => {
+    const gossip = (agent as unknown as { gossip?: { subscribers?: string[] } }).gossip;
+    return gossip?.subscribers ?? [];
+  };
   const stub = {
     getPeers: (): Array<{ toString: () => string }> => {
-      const gossip = (agent as unknown as { gossip?: { subscribers?: string[] } }).gossip;
-      const subs = gossip?.subscribers ?? [];
-      return subs.map((id) => ({ toString: () => id }));
+      return allReachableIds().map((id) => ({ toString: () => id }));
+    },
+    // PR-K: isPeerDialable now uses getConnections(pid) and filters
+    // out limited-only connectivity. Return a direct-style
+    // connection object (no `limits`) for any gossip-subscribed
+    // peer so the predicate behaves as "everything reachable" in
+    // tests that don't care about the PR-K filter itself.
+    getConnections: (pid?: unknown): Array<{ remoteAddr: { toString: () => string } }> => {
+      const idStr = pid ? (pid as { toString: () => string }).toString() : '';
+      return allReachableIds().includes(idStr)
+        ? [{ remoteAddr: { toString: () => '/ip4/127.0.0.1/tcp/0' } }]
+        : [];
     },
     peerStore: {
       get: async (_peerId: unknown) => ({

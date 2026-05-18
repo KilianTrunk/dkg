@@ -178,12 +178,27 @@ async function createAgent(name: string): Promise<DKGAgent> {
  */
 function installAllReachableLibp2pStub(agent: DKGAgent): { extraDialablePeerIds: string[] } {
   const extraDialablePeerIds: string[] = [];
+  const allReachableIds = (): string[] => {
+    const gossip = (agent as unknown as { gossip?: { subscribers?: string[] } }).gossip;
+    const fromGossip = gossip?.subscribers ?? [];
+    return [...fromGossip, ...extraDialablePeerIds];
+  };
   const stub = {
     getPeers: (): Array<{ toString: () => string }> => {
-      const gossip = (agent as unknown as { gossip?: { subscribers?: string[] } }).gossip;
-      const fromGossip = gossip?.subscribers ?? [];
-      const all = [...fromGossip, ...extraDialablePeerIds];
-      return all.map((id) => ({ toString: () => id }));
+      return allReachableIds().map((id) => ({ toString: () => id }));
+    },
+    // PR-K: isPeerDialable now uses getConnections(pid) and checks
+    // for non-limited connections. Return a single direct-style
+    // connection object (no `limits` property) for any gossip-
+    // subscribed peer so the predicate stays "everything reachable"
+    // in tests that don't care about the PR-K filter itself (the
+    // PR-K unit tests pass the predicate directly in
+    // `enumerate-cg-members.test.ts`).
+    getConnections: (pid?: unknown): Array<{ remoteAddr: { toString: () => string } }> => {
+      const idStr = pid ? (pid as { toString: () => string }).toString() : '';
+      return allReachableIds().includes(idStr)
+        ? [{ remoteAddr: { toString: () => '/ip4/127.0.0.1/tcp/0' } }]
+        : [];
     },
     peerStore: {
       get: async (_peerId: unknown) => ({
@@ -676,61 +691,58 @@ describe('DKGAgent SwmAckQuorum integration (rc.9 PR-D)', () => {
   });
 
   /**
-   * rc.9 PR-D codex follow-up #D3: the ack-quorum tracker MUST
-   * also run for the gossip-only-because-too-many-subscribers
-   * branch (public CG above the substrate cap). Pre-D3 the
-   * track gate required `plan.substrateMembers.length > 0`,
-   * which this branch intentionally empties — so the watchdog
-   * was silently disabled for the dominant use case for
-   * ack-driven reliability.
+   * rc.9 PR-D codex follow-up #D3 (originally) required the
+   * ack-quorum tracker to run for the gossip-only-because-too-
+   * many-subscribers branch (public CG above the substrate cap)
+   * — pre-D3 the track gate keyed off `substrateMembers.length`,
+   * which that branch intentionally empties.
    *
-   * Easiest deterministic exercise: temporarily clamp the
-   * substrate-members cap to 1 so a CG with 3 subscribers
-   * trips the gossip-only branch. Then assert that
-   * `getOrCreateSwmAckQuorum().inspect(...).expectedMembers`
-   * includes all 3 — not 0.
+   * PR-K (2026-05-18 Miles<->Lex soak) reverses D3 for a new
+   * reason. The soak proved that "gossip-deliverable but not
+   * substrate-eligible" peers cannot reliably send
+   * SwmShareAck back either — the ack travels through the same
+   * `messenger.sendReliable` and hits the same limited
+   * Circuit Relay V2 budget exhaustion that broke the
+   * substrate fan-out. Tracking acks from peers that can't
+   * actually ack just produces deadlineExpired noise.
+   *
+   * The post-PR-K contract:
+   *   - `ackQuorumActive` is gated on `substrateMembers.length`
+   *     (back to pre-D3 behaviour, but for the OPPOSITE reason).
+   *   - `expectedMembers` is `substrateMembers` (the
+   *     roundtrip-eligible subset), NOT `enumeratedMembers`.
+   *   - Gossip-only-too-many-subscribers branch publishes via
+   *     gossip and skips quorum tracking entirely. Verification
+   *     for that branch falls back to cross-peer SWM-inbox
+   *     SPARQL, which is the ground truth anyway.
    */
-  it('PR-D #D3: gossip-only-large-public CGs DO get tracked (watchdog covers them)', async () => {
-    const agent = register(await createAgent('AckQuorumD3LargePublic'));
+  it('PR-K (revises D3): gossip-only-large-public CGs are NOT tracked (acks unreliable)', async () => {
+    const agent = register(await createAgent('AckQuorumKLargePublic'));
     const gossip = new CapturingGossip();
     gossip.subscribers = ['12D3KooWBig1', '12D3KooWBig2', '12D3KooWBig3'];
     (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
 
-    // Clamp the substrate cap so 3 subscribers trip the
-    // gossip-only branch.
     (agent as unknown as { swmSubstrateMaxMembers: number }).swmSubstrateMaxMembers = 1;
 
     const { calls, install } = stubMessengerSendReliable(new Map());
     install(agent);
 
-    const { shareOperationId } = await agent.share('cg-d3-large-public', [{
-      subject: 'urn:test:d3', predicate: 'http://schema.org/name', object: '"d3"', graph: '',
+    const { shareOperationId } = await agent.share('cg-k-large-public', [{
+      subject: 'urn:test:k', predicate: 'http://schema.org/name', object: '"k"', graph: '',
     }]);
 
-    // Substrate must NOT have been used (above the clamp).
     const updateCalls = calls.filter((c) => c.protocolId === PROTOCOL_SWM_UPDATE);
     expect(updateCalls).toEqual([]);
 
-    // Pre-D3: this would have been undefined (track was
-    // skipped because substrateMembers.length === 0).
-    // Post-D3: enumeratedMembers carries the full subscriber
-    // list and track() runs against it.
     const quorum = (agent as unknown as {
       getOrCreateSwmAckQuorum: () => {
         inspect: (op: string) => { expectedMembers: readonly string[]; acked: readonly string[] } | undefined;
       };
     }).getOrCreateSwmAckQuorum();
 
-    const record = quorum.inspect(shareOperationId);
-    expect(record).toBeDefined();
-    expect([...(record?.expectedMembers ?? [])].sort()).toEqual([
-      '12D3KooWBig1',
-      '12D3KooWBig2',
-      '12D3KooWBig3',
-    ]);
-    // No substrate sends → no pre-acked peers; everyone is
-    // pending until a SwmShareAck arrives (or watchdog fires).
-    expect(record?.acked).toEqual([]);
+    // PR-K: track is skipped (substrateMembers is empty in the
+    // gossip-only branch). `inspect` returns undefined.
+    expect(quorum.inspect(shareOperationId)).toBeUndefined();
   });
 
   /**

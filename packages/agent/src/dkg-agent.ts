@@ -6726,23 +6726,46 @@ export class DKGAgent {
     //      gossip-applied receivers. A hypothetical future
     //      no-gossip / substrate-only plan would already cover
     //      quorum via PR-C's substrate counters.
-    //   3. We have at least one expected member to wait for.
-    //      (PR-D #D3 keys this off
-    //      `plan.enumeratedMembers.length`, NOT
-    //      `substrateMembers.length`, so the gossip-only
-    //      "public CG above the substrate cap" branch is
-    //      covered too — that's the dominant use case for
-    //      ack-driven reliability.)
+    //   3. We have at least one ack-roundtrip-eligible peer
+    //      (`plan.substrateMembers.length > 0`). PR-K change:
+    //      pre-PR-K keyed off `plan.enumeratedMembers.length` to
+    //      keep the gossip-only-too-many-subscribers branch
+    //      tracking (PR-D #D3, codex RED #3 on PR #584), on the
+    //      assumption that any gossip-deliverable peer can ALSO
+    //      send a SwmShareAck back. The 2026-05-18 Miles<->Lex
+    //      soak refuted that assumption: when both peers have
+    //      only limited Circuit Relay V2 connectivity, gossip
+    //      delivery works (mesh-forwarded, no reservation
+    //      budget consumed) but `messenger.sendReliable` for
+    //      `/dkg/10.0.1/swm-share-ack` exhausts the limited
+    //      reservation just like substrate fan-out does — the
+    //      ack never returns. With ack-quorum keyed to
+    //      enumeratedMembers, those shares stayed `pending` for
+    //      the full deadlineHardMs window then hit
+    //      `deadlineExpired`, making `completed=0` indefinitely
+    //      even though delivery actually worked.
+    //
+    //      Switching to `substrateMembers` collapses the
+    //      visibility model: ack-quorum now tracks the subset
+    //      we can substrate-roundtrip-eligible with (= same
+    //      reachability the `isPeerDialable` predicate accepts
+    //      after PR-K's limited-circuit filter). For CGs whose
+    //      eligible set is empty (all subscribers behind
+    //      limited relays), we publish via gossip and skip
+    //      quorum tracking entirely — gossip is best-effort,
+    //      we don't pretend we can verify those deliveries.
+    //      Cross-peer SWM-inbox SPARQL remains the ground-truth
+    //      check.
     const ackQuorumActive = !!shareOperationId
       && plan.useGossip
-      && plan.enumeratedMembers.length > 0;
+      && plan.substrateMembers.length > 0;
     let trackedQuorum: SwmAckQuorum | null = null;
     if (ackQuorumActive && shareOperationId) {
       trackedQuorum = this.getOrCreateSwmAckQuorum();
       trackedQuorum.track({
         shareOperationId,
         cgId: contextGraphId,
-        expectedMembers: plan.enumeratedMembers,
+        expectedMembers: plan.substrateMembers,
         preAckedFromSubstrate: [],
         payload: wireMessage,
         enumerationSource: plan.enumerationSource,
@@ -9440,9 +9463,54 @@ export class DKGAgent {
    */
   private async isPeerDialable(peerId: string): Promise<boolean> {
     try {
-      if (this.node.libp2p.getPeers().some((p) => p.toString() === peerId)) {
+      const isConnected = this.node.libp2p.getPeers().some((p) => p.toString() === peerId);
+      if (isConnected) {
+        // PR-K (2026-05-18 overnight prep): a peer whose ONLY
+        // live connection is a *limited* Circuit Relay V2
+        // reservation is NOT substrate-roundtrip-eligible.
+        // Limited reservations cap data (~128 KiB) and duration
+        // (~2 min) per stream; the aggressive per-cycle traffic
+        // of SWM substrate fan-out exhausts these caps almost
+        // immediately, after which every `messenger.sendReliable`
+        // call hits a stream-reset / aborted error that
+        // `isRecoverableSendError` (correctly) classifies as
+        // recoverable. The outbox then queues + retries forever,
+        // each retry eating fresh budget on the same exhausted
+        // reservation — a death spiral the May 2026 Miles<->Lex
+        // soak surfaced as `swm-update: d=0 q=2031, samples=0`
+        // after ~60 cycles, with both peers having only
+        // `limited: true, streams: 0` relayed connections (Lex's
+        // diagnostic via `dkg_peer_info`).
+        //
+        // Treat limited-only connectivity as undialable for
+        // substrate-roundtrip purposes. The relay's GossipSub
+        // mesh participation still delivers the share (mesh
+        // forwarding does NOT consume per-stream reservation
+        // budget — different code path on the relay), so
+        // dropping these peers from substrate-eligibility
+        // degrades cleanly to gossip-only delivery for them
+        // rather than burning wire load on impossible retries.
+        try {
+          const { peerIdFromString } = await import('@libp2p/peer-id');
+          const conns = this.node.libp2p.getConnections(peerIdFromString(peerId));
+          if (conns.length > 0) {
+            return conns.some((c) => !((c as unknown as { limits?: unknown }).limits));
+          }
+        } catch {
+          // peerIdFromString throws on malformed strings (e.g.
+          // unit-test stub peer ids like '12D3KooWPeerA' that
+          // don't pass libp2p's base58 length check). Preserve
+          // pre-PR-K "connected ⇒ dialable" semantics in that
+          // path — the limited-circuit filter only applies when
+          // libp2p hands us a real PeerId.
+        }
         return true;
       }
+      // No live connection — fall back to peerStore-cached
+      // addresses (pre-PR-K tier 2 behaviour). A future dial may
+      // yield a limited path; if so, the next `isPeerDialable`
+      // call (typically ≤30s later in the watchdog tick) catches
+      // it via the connected-branch above.
       const { peerIdFromString } = await import('@libp2p/peer-id');
       const peer = await this.node.libp2p.peerStore.get(peerIdFromString(peerId));
       return (peer?.addresses?.length ?? 0) > 0;

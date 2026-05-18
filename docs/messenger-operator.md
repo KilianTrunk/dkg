@@ -130,14 +130,83 @@ curl -s http://127.0.0.1:9200/api/slo \
       "queued": 14           // monotonic; "queued" = first send failed → outbox
     },
     "/dkg/10.0.1/storage-ack": { ... }
+  },
+  // rc.9 PR-A (SWM reliable fan-out, Step 0): two new sections,
+  // additive — soak tooling and operators that only parse `protocols`
+  // still work byte-identically.
+  "gossip": {
+    "publishFailures": {     // per-cgId count of `gossip.publish` errors
+      "did:dkg:context-graph:lex/playground": 3
+    },
+    // Counts evicted into here once the per-cgId tracking map crosses
+    // its hard cap (1024 distinct cgIds). Always 0 in normal
+    // deployments; non-zero only when failing publishes against
+    // thousands of distinct cgIds.
+    "publishFailuresOverflow": 0,
+    // Sticky boolean — true once the eviction path has fired. Means
+    // the per-cgId breakdown is partial; the grand total
+    // (sum(publishFailures) + publishFailuresOverflow) is still
+    // accurate.
+    "publishFailuresTruncated": false
+  },
+  "swm": {
+    "redundantApplies": {    // per-cgId redundant-apply count (RFC-003)
+      "did:dkg:context-graph:lex/playground": 5
+    },
+    // Sticky boolean — true once the receiver-side seenShareOps cap
+    // eviction had to trim a still-live (non-TTL-expired) entry. When
+    // true, `redundantApplies` is a lower bound for the operating
+    // window. Operators can raise `seenOpsMaxSize` (default 50_000)
+    // on the `SharedMemoryHandler` constructor for higher-throughput
+    // nodes.
+    "redundantAppliesLowerBound": false,
+    // Sum of per-cgId counters evicted into overflow once the per-cgId
+    // tracking map crosses its hard cap (default 1024 distinct cgIds).
+    // Non-zero only when a peer has been forcing duplicate applies
+    // against thousands of distinct cgIds.
+    "redundantAppliesOverflow": 0,
+    // Sticky boolean — true once the per-cgId cap eviction has fired.
+    // Means the `redundantApplies` breakdown is partial; the grand
+    // total is still `sum(redundantApplies) + redundantAppliesOverflow`.
+    "redundantAppliesTruncated": false
   }
 }
 ```
 
-Empty body `{ "protocols": {} }` means no substrate traffic has flowed
-since daemon start — either the node is idle, or every protocol it has
-exercised is still on `/dkg/10.0.0/*` and hasn't been migrated yet
-(no such protocol remains at rc.9 ship).
+Empty body with all-zero counters means no substrate traffic has
+flowed and no SWM share has either failed at gossip or been applied
+— typically a freshly restarted idle daemon.
+
+### `gossip` / `swm` reading guide
+
+- **`gossip.publishFailures[cgId] > 0`** → the local node committed a
+  share for `cgId` but `gossip.publish` threw. The share is NOT lost:
+  the local commit succeeded and `runSyncOnConnect` will catch
+  remote peers up on the next reconnect. A non-zero counter that
+  keeps growing without delivery progress is the signal to
+  investigate (mesh failure, no peers subscribed, etc.). The
+  per-failure WARN in `daemon.log` carries both `errorClass=` and
+  `error=` so distinct failure types stay greppable.
+- **`gossip.publishFailuresTruncated = true`** → operations against
+  >1024 distinct cgIds have failed since daemon start. The
+  `publishFailures` map drops the smallest counters into
+  `publishFailuresOverflow` to keep memory + response size bounded;
+  the grand total is still accurate.
+- **`swm.redundantApplies[cgId] > 0`** → a (cgId, shareOpId) was
+  re-delivered within the TTL window and applied a second time.
+  Pure measurement: behaviour is unchanged. Used to inform the rc10
+  dedup decision (RFC-003 Concern-2).
+- **`swm.redundantAppliesLowerBound = true`** → the receiver-side
+  `seenShareOps` cap eviction had to trim a still-live entry to
+  stay bounded. `redundantApplies` is now a lower bound for the
+  operating window. Tune the `SharedMemoryHandler` constructor's
+  `seenOpsMaxSize` upward for higher-throughput nodes.
+- **`swm.redundantAppliesTruncated = true`** → duplicate applies have
+  arrived against more than `redundantAppliesMaxCgs` (default 1024)
+  distinct cgIds, so the per-cgId breakdown is partial. The grand
+  total is still accurate via
+  `sum(redundantApplies) + redundantAppliesOverflow`. If `Truncated`
+  flips in normal operation (no hostile peer), raise the cap.
 
 ### Clock definition
 

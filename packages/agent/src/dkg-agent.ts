@@ -1250,6 +1250,28 @@ export class DKGAgent {
   private finalizationHandler?: FinalizationHandler;
   private readonly log = new Logger('DKGAgent');
 
+  /**
+   * Per-cgId count of SWM gossip publish failures. Populated by
+   * publishWorkspaceGossip's catch block (rc.9 PR-A / SWM reliable
+   * fan-out plan, Step 0). Exposed via /api/slo `gossip.publishFailures`.
+   * Process-lifetime in-memory only — no persistence; on daemon
+   * restart counters reset. Sufficient for soak measurement; if
+   * operators ever need cross-restart aggregation, escalate to a
+   * SQLite table.
+   *
+   * Codex PR #570 R5 caught that the map would grow unbounded for any
+   * caller that fails publishes against arbitrary cgIds. To prevent
+   * runaway memory + a permanently bloated /api/slo payload, we cap
+   * the per-cgId set at SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS. Overflow
+   * counters are summed into `swmGossipPublishFailuresOverflow` so the
+   * total stays accurate; a sticky `swmGossipPublishFailuresTruncated`
+   * flag tells operators that the per-cgId breakdown is partial.
+   */
+  private readonly swmGossipPublishFailures = new Map<string, number>();
+  private swmGossipPublishFailuresOverflow = 0;
+  private swmGossipPublishFailuresTruncated = false;
+  private static readonly SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS = 1024;
+
   private messageHandler: MessageHandler | null = null;
   private chainPoller: ChainEventPoller | null = null;
   private swmCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -6299,9 +6321,99 @@ export class DKGAgent {
     const wireMessage = await this.encodeWorkspaceGossipMessage(contextGraphId, message, resolvedSigner);
     try {
       await this.gossip.publish(topic, wireMessage);
-    } catch {
-      this.log.warn(ctx, `No peers subscribed to ${topic} yet`);
+    } catch (err) {
+      // rc.9 PR-A (SWM reliable fan-out plan, Step 0): replace the
+      // pre-rc.9 silent log.warn with a structured failure record so
+      // operators can see exactly which shares dropped. The local SWM
+      // commit already happened in the caller; on-connect-sync will
+      // catch remote peers up eventually. We intentionally do NOT
+      // re-throw — share() should still return success because the
+      // local commit succeeded — but the failure becomes observable
+      // via the new /api/slo `gossip.publishFailures` counter and the
+      // WARN log now carries the cgId + error class + error message
+      // for greppability (Codex PR #570 R6: previously the comment
+      // claimed "error class" but the implementation only logged
+      // err.message, collapsing distinct failure types).
+      // Codex PR #570 R12: source the running failure count from
+      // `recordSwmGossipPublishFailure`'s return value, not by
+      // re-reading the map. Pre-fix, when the just-incremented
+      // entry was itself the smallest and got evicted into the
+      // overflow bucket on the very same call, the subsequent
+      // map.get() returned 0 (or an older count for a recycled
+      // cgId), producing misleading `failureCountForCg=0` log lines
+      // for a cgId that had just failed. We now log the actual
+      // post-increment count, and flag the overflow case explicitly
+      // so operators can see why the per-cgId breakdown in
+      // /api/slo's `gossip.publishFailures` may not show this cgId.
+      const { failureCountForCg, evictedToOverflow } = this.recordSwmGossipPublishFailure(contextGraphId);
+      const errClass = err instanceof Error
+        ? (err.name && err.name !== 'Error' ? err.name : err.constructor.name)
+        : typeof err;
+      const errMessage = err instanceof Error ? err.message : String(err);
+      const overflowSuffix = evictedToOverflow
+        ? ' (evicted to overflow bucket; per-cgId breakdown truncated)'
+        : '';
+      this.log.warn(
+        ctx,
+        `Gossip publish FAILED for topic="${topic}" cgId=${contextGraphId} errorClass="${errClass}" error="${errMessage}" failureCountForCg=${failureCountForCg}${overflowSuffix}`,
+      );
     }
+  }
+
+  /**
+   * PR-A R5+R8: bookkeep a gossip-publish failure with a hard cap on
+   * the per-cgId tracking set. Once we cross
+   * SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS distinct cgIds, the entry
+   * with the GLOBAL smallest count is evicted into
+   * `swmGossipPublishFailuresOverflow` and a sticky
+   * `swmGossipPublishFailuresTruncated` flag is set so /api/slo can
+   * surface "the per-cgId breakdown is partial; total count is still
+   * accurate". This keeps the most-failing cgIds visible
+   * (operationally what operators care about) while bounding memory /
+   * response size.
+   *
+   * Codex PR #570 R8: the eviction comparison MUST include the
+   * just-incremented entry. Otherwise a stream of one-off failures
+   * against fresh cgIds (count=1 each) would each evict an existing
+   * HOT cgId (count>=2), even though the new entry is by definition
+   * the smallest. With this comparison, when the new entry IS the
+   * smallest, it's the one that gets evicted into overflow — leaving
+   * the existing hot spots intact, exactly what operators want.
+   *
+   * Codex PR #570 R12: returns the post-increment count and an
+   * `evictedToOverflow` flag so the caller's WARN log accurately
+   * reflects what just happened without having to re-read the map
+   * (which is stale if THIS cgId was the one evicted into the
+   * overflow bucket on the same call).
+   */
+  private recordSwmGossipPublishFailure(contextGraphId: string): {
+    failureCountForCg: number;
+    evictedToOverflow: boolean;
+  } {
+    const next = (this.swmGossipPublishFailures.get(contextGraphId) ?? 0) + 1;
+    this.swmGossipPublishFailures.set(contextGraphId, next);
+    let evictedToOverflow = false;
+    if (this.swmGossipPublishFailures.size > DKGAgent.SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS) {
+      let smallestCg: string | null = null;
+      let smallestCount = Infinity;
+      for (const [cg, count] of this.swmGossipPublishFailures) {
+        if (count < smallestCount) {
+          smallestCount = count;
+          smallestCg = cg;
+        }
+      }
+      if (smallestCg !== null) {
+        this.swmGossipPublishFailures.delete(smallestCg);
+        this.swmGossipPublishFailuresOverflow += smallestCount;
+        if (!this.swmGossipPublishFailuresTruncated) {
+          this.swmGossipPublishFailuresTruncated = true;
+        }
+        if (smallestCg === contextGraphId) {
+          evictedToOverflow = true;
+        }
+      }
+    }
+    return { failureCountForCg: next, evictedToOverflow };
   }
 
   async publishAsync(
@@ -13616,6 +13728,81 @@ export class DKGAgent {
    */
   getMessengerSloStats(): Record<string, SloProtocolStats> {
     return this.messenger.getSloStats();
+  }
+
+  /**
+   * Snapshot of SWM gossip publish health (rc.9 PR-A).
+   *
+   * - `publishFailures` — per-cgId count of failed `gossip.publish`
+   *   calls. Pre-rc.9 these were silently swallowed; now they're
+   *   observable. A non-zero counter is operator-visible signal that
+   *   some shares went out-of-band only (local commit succeeded;
+   *   catch-up will run via `runSyncOnConnect` on the next peer
+   *   reconnect).
+   * - `publishFailuresOverflow` — sum of counters that were evicted
+   *   when the per-cgId tracking set crossed
+   *   `SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS`. Always 0 in normal
+   *   deployments; non-zero only when a caller has been failing
+   *   publishes against thousands of distinct cgIds.
+   * - `publishFailuresTruncated` — sticky boolean, true once the
+   *   eviction path has fired. Surfaced via Codex PR #570 R5 so
+   *   operators see that the per-cgId breakdown is partial even
+   *   though the grand total (`sum(publishFailures) +
+   *   publishFailuresOverflow`) is still accurate.
+   */
+  getSwmGossipStats(): {
+    publishFailures: Record<string, number>;
+    publishFailuresOverflow: number;
+    publishFailuresTruncated: boolean;
+  } {
+    return {
+      publishFailures: Object.fromEntries(this.swmGossipPublishFailures),
+      publishFailuresOverflow: this.swmGossipPublishFailuresOverflow,
+      publishFailuresTruncated: this.swmGossipPublishFailuresTruncated,
+    };
+  }
+
+  /**
+   * Snapshot of receiver-side SWM apply metrics (rc.9 PR-A).
+   *
+   * - `redundantApplies` — per-cgId count of times
+   *   `SharedMemoryHandler.handle()` saw a (cgId, shareOpId) it had
+   *   already processed within the TTL window AND both deliveries
+   *   actually applied to the store. Used to inform the rc10
+   *   decision on whether to add explicit receiver-side dedup
+   *   (Concern-2 in the SWM reliable fan-out plan).
+   * - `redundantAppliesLowerBound` — sticky boolean, true once the
+   *   seenShareOps cap eviction had to trim a still-live entry.
+   *   Surfaced via Codex PR #570 R3 so operators can detect that
+   *   the metric has become a lower bound (configured cap too small
+   *   for current throughput).
+   * - `redundantAppliesOverflow` — sum of per-cgId counters evicted
+   *   into the overflow bucket when the per-cgId map crossed the
+   *   `redundantAppliesMaxCgs` cap. Surfaced via Codex PR #570 R9.
+   * - `redundantAppliesTruncated` — sticky boolean, true once R9
+   *   eviction has fired. Means the per-cgId breakdown is partial;
+   *   the grand total is still `sum(redundantApplies) +
+   *   redundantAppliesOverflow`.
+   *
+   * Returns the empty / pristine snapshot if the SharedMemoryHandler
+   * has not yet been initialised (no SWM share has ever been received
+   * locally).
+   */
+  getSwmHandlerStats(): {
+    redundantApplies: Record<string, number>;
+    redundantAppliesLowerBound: boolean;
+    redundantAppliesOverflow: number;
+    redundantAppliesTruncated: boolean;
+  } {
+    if (!this.sharedMemoryHandler) {
+      return {
+        redundantApplies: {},
+        redundantAppliesLowerBound: false,
+        redundantAppliesOverflow: 0,
+        redundantAppliesTruncated: false,
+      };
+    }
+    return this.sharedMemoryHandler.getStats();
   }
 
   async getPeerDiagnostics(peerId: string): Promise<PeerDiagnostics> {

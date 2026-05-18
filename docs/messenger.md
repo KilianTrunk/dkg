@@ -537,13 +537,52 @@ Authorization: Bearer <token from ~/.dkg/auth.token>
       "queued": 14           // monotonic counter; "queued" = first send failed → outbox
     },
     "/dkg/10.0.1/storage-ack": { ... }
+  },
+  // rc.9 PR-A (SWM reliable fan-out, Step 0): two new sections,
+  // additive — existing consumers that only parse `protocols` still
+  // work byte-identically.
+  "gossip": {
+    "publishFailures": {     // per-cgId count of `gossip.publish` errors
+      "did:dkg:context-graph:lex/playground": 3
+    },
+    // Counts evicted into here once the per-cgId tracking map crosses
+    // its hard cap (default 1024 distinct cgIds). Always 0 in normal
+    // deployments; non-zero only when failing publishes against
+    // thousands of distinct cgIds.
+    "publishFailuresOverflow": 0,
+    // Sticky boolean — true once the eviction path has fired. Means
+    // the per-cgId breakdown is partial; the grand total
+    // (sum(publishFailures) + publishFailuresOverflow) is still
+    // accurate.
+    "publishFailuresTruncated": false
+  },
+  "swm": {
+    "redundantApplies": {    // per-cgId redundant-apply count (RFC-003 Concern-2)
+      "did:dkg:context-graph:lex/playground": 5
+    },
+    // Sticky boolean — true once the seenShareOps cap eviction had to
+    // trim a still-live (non-TTL-expired) entry. When true,
+    // `redundantApplies` is a lower bound for the operating window.
+    // Operators can raise `seenOpsMaxSize` (default 50_000) for
+    // higher-throughput nodes.
+    "redundantAppliesLowerBound": false,
+    // Sum of per-cgId counters evicted into overflow once the per-cgId
+    // tracking map crosses its hard cap (default 1024 distinct cgIds).
+    // Always 0 in normal deployments; non-zero only when receiving
+    // duplicate applies against thousands of distinct cgIds.
+    "redundantAppliesOverflow": 0,
+    // Sticky boolean — true once the per-cgId cap eviction has fired.
+    // Means the `redundantApplies` breakdown is partial; the grand
+    // total is still `sum(redundantApplies) + redundantAppliesOverflow`.
+    "redundantAppliesTruncated": false
   }
 }
 ```
 
-Empty body `{ "protocols": {} }` means no substrate traffic has flowed
-since daemon start — either the node is idle, or every protocol it has
-exercised is still on `/dkg/10.0.0/*` and hasn't been migrated yet.
+Empty body `{ "protocols": {}, "gossip": {...}, "swm": {...} }` with
+all-zero counters means no substrate traffic has flowed and no SWM
+share has either failed at gossip or been applied — typically a freshly
+restarted idle daemon.
 
 ### Reading guide
 

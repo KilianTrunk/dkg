@@ -862,6 +862,399 @@ describe('SharedMemoryHandler', () => {
   });
 });
 
+describe('SharedMemoryHandler: redundant-apply counter (rc.9 PR-A)', () => {
+  let store: OxigraphStore;
+  let handler: SharedMemoryHandler;
+
+  beforeEach(() => {
+    store = new OxigraphStore();
+    handler = new SharedMemoryHandler(store, new TypedEventBus(), {});
+  });
+
+  it('returns zero counts initially', () => {
+    expect(handler.getStats()).toEqual({ redundantApplies: {}, redundantAppliesLowerBound: false, redundantAppliesOverflow: 0, redundantAppliesTruncated: false });
+  });
+
+  it('does not count first delivery of a (cgId, shareOpId) pair', async () => {
+    const nquads = `<${ENTITY}> <http://schema.org/name> "First" <${DATA_GRAPH}> .`;
+    const msg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeer',
+      shareOperationId: 'first-only',
+      timestampMs: Date.now(),
+    });
+
+    await handler.handle(msg, '12D3KooWPeer');
+
+    expect(handler.getStats()).toEqual({ redundantApplies: {}, redundantAppliesLowerBound: false, redundantAppliesOverflow: 0, redundantAppliesTruncated: false });
+  });
+
+  it('counts each subsequent delivery of the same (cgId, shareOpId) within TTL', async () => {
+    const nquads = `<${ENTITY}> <http://schema.org/name> "Twice" <${DATA_GRAPH}> .`;
+    const msg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeer',
+      shareOperationId: 'dup-op',
+      timestampMs: Date.now(),
+    });
+
+    await handler.handle(msg, '12D3KooWPeer');
+    await handler.handle(msg, '12D3KooWPeer');
+    await handler.handle(msg, '12D3KooWPeer');
+
+    expect(handler.getStats()).toEqual({
+      redundantApplies: { [CONTEXT_GRAPH]: 2 },
+      redundantAppliesLowerBound: false,
+      redundantAppliesOverflow: 0,
+      redundantAppliesTruncated: false,
+    });
+  });
+
+  it('isolates counts per cgId', async () => {
+    const otherCg = `${CONTEXT_GRAPH}-second`;
+    const otherDataGraph = `did:dkg:context-graph:${otherCg}`;
+
+    const msgA = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(`<${ENTITY}> <http://schema.org/name> "A" <${DATA_GRAPH}> .`),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeer',
+      shareOperationId: 'op-a',
+      timestampMs: Date.now(),
+    });
+    const msgB = encodeWorkspacePublishRequest({
+      contextGraphId: otherCg,
+      nquads: new TextEncoder().encode(`<${ENTITY}> <http://schema.org/name> "B" <${otherDataGraph}> .`),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeer',
+      shareOperationId: 'op-b',
+      timestampMs: Date.now(),
+    });
+
+    await handler.handle(msgA, '12D3KooWPeer');
+    await handler.handle(msgA, '12D3KooWPeer');
+    await handler.handle(msgB, '12D3KooWPeer');
+    await handler.handle(msgB, '12D3KooWPeer');
+    await handler.handle(msgB, '12D3KooWPeer');
+
+    expect(handler.getStats()).toEqual({
+      redundantApplies: {
+        [CONTEXT_GRAPH]: 1,
+        [otherCg]: 2,
+      },
+      redundantAppliesLowerBound: false,
+      redundantAppliesOverflow: 0,
+      redundantAppliesTruncated: false,
+    });
+  });
+
+  it('does not count if same shareOpId is delivered but TTL has elapsed', async () => {
+    let nowMs = 1_000_000;
+    const handlerWithClock = new SharedMemoryHandler(store, new TypedEventBus(), {
+      now: () => nowMs,
+    });
+
+    const msg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(`<${ENTITY}> <http://schema.org/name> "TTL" <${DATA_GRAPH}> .`),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeer',
+      shareOperationId: 'op-ttl',
+      timestampMs: nowMs,
+    });
+
+    await handlerWithClock.handle(msg, '12D3KooWPeer');
+    nowMs += 10 * 60 * 1000 + 1;
+    await handlerWithClock.handle(msg, '12D3KooWPeer');
+
+    expect(handlerWithClock.getStats()).toEqual({ redundantApplies: {}, redundantAppliesLowerBound: false, redundantAppliesOverflow: 0, redundantAppliesTruncated: false });
+  });
+
+  it('still applies the second delivery (no behavior change — measurement only)', async () => {
+    const nquads = `<${ENTITY}> <http://schema.org/name> "Applied" <${DATA_GRAPH}> .`;
+    const msg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeer',
+      shareOperationId: 'op-applied-twice',
+      timestampMs: Date.now(),
+    });
+
+    await handler.handle(msg, '12D3KooWPeer');
+    await handler.handle(msg, '12D3KooWPeer');
+
+    const gm = new GraphManager(store);
+    await gm.ensureContextGraph(CONTEXT_GRAPH);
+    const wsGraph = gm.workspaceGraphUri(CONTEXT_GRAPH);
+    const result = await store.query(
+      `SELECT ?o WHERE { GRAPH <${wsGraph}> { <${ENTITY}> <http://schema.org/name> ?o } }`,
+    );
+    expect(result.type).toBe('bindings');
+    if (result.type === 'bindings') {
+      expect(result.bindings.length).toBe(1);
+      expect(result.bindings[0]['o']).toBe('"Applied"');
+    }
+    expect(handler.getStats()).toEqual({
+      redundantApplies: { [CONTEXT_GRAPH]: 1 },
+      redundantAppliesLowerBound: false,
+      redundantAppliesOverflow: 0,
+      redundantAppliesTruncated: false,
+    });
+  });
+
+  // PR-A R1 regression: a delivery that fails validation (here:
+  // invalid subGraphName — caught by `validateSubGraphName` before the
+  // write lock) MUST NOT bump `redundantApplies`. Pre-fix the counter
+  // was incremented at the top of `handle()` before any validation,
+  // so a steady stream of rejected duplicate messages would silently
+  // inflate the /api/slo metric the rc10 dedup decision is based on.
+  // Codex review on PR #570 caught the early-bump.
+  it('does NOT count a duplicated rejected delivery (R1: rejected messages skipped)', async () => {
+    const nquads = `<${ENTITY}> <http://schema.org/name> "Bad" <${DATA_GRAPH}> .`;
+    const badMsg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWPeer',
+      shareOperationId: 'op-rejected',
+      timestampMs: Date.now(),
+      // Invalid sub-graph name — `validateSubGraphName` rejects, so
+      // `handle()` returns BEFORE the write lock and BEFORE
+      // recordSeenShareOp is invoked.
+      subGraphName: '../illegal',
+    });
+
+    await handler.handle(badMsg, '12D3KooWPeer');
+    await handler.handle(badMsg, '12D3KooWPeer');
+    await handler.handle(badMsg, '12D3KooWPeer');
+
+    expect(handler.getStats()).toEqual({ redundantApplies: {}, redundantAppliesLowerBound: false, redundantAppliesOverflow: 0, redundantAppliesTruncated: false });
+  });
+
+  it('does NOT count a duplicated delivery whose publisherPeerId disagrees with the sender (R1: rejected messages skipped)', async () => {
+    const nquads = `<${ENTITY}> <http://schema.org/name> "Spoofed" <${DATA_GRAPH}> .`;
+    const spoofedMsg = encodeWorkspacePublishRequest({
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: new TextEncoder().encode(nquads),
+      manifest: [{ rootEntity: ENTITY, privateTripleCount: 0 }],
+      // Claims to be from Peer-A but `handle()` receives it from
+      // Peer-Other → rejected at the publisherPeerId check.
+      publisherPeerId: '12D3KooWPeer-A',
+      shareOperationId: 'op-spoofed',
+      timestampMs: Date.now(),
+    });
+
+    await handler.handle(spoofedMsg, '12D3KooWPeer-Other');
+    await handler.handle(spoofedMsg, '12D3KooWPeer-Other');
+
+    expect(handler.getStats()).toEqual({ redundantApplies: {}, redundantAppliesLowerBound: false, redundantAppliesOverflow: 0, redundantAppliesTruncated: false });
+  });
+
+  // PR-A R2 + R4 regression: the seenShareOps map is true LRU AND
+  // the cap-based eviction is exercised. Pre-R2, `Map#set(existing,…)`
+  // didn't move the key in iteration order, so a hot key inserted at
+  // t=0 would be evicted as if cold. Pre-R4 the regression test only
+  // checked insertion order without crossing the cap, so removing the
+  // `delete(key)` fix would still let the test pass.
+  //
+  // This test drives the map past `seenOpsMaxSize` (configured tiny
+  // here, default is 50_000) so the eviction path actually runs and
+  // we can assert the hot key survives. Uses an injected fixed clock
+  // so the TTL prune-first phase doesn't bail anything out for us.
+  it('LRU refresh + cap eviction: a re-observed key survives an actual eviction batch (R2 + R4)', () => {
+    let nowMs = 1_000_000;
+    const handlerForLru = new SharedMemoryHandler(store, new TypedEventBus(), {
+      now: () => nowMs,
+      seenOpsMaxSize: 10,
+      seenOpsEvictBatch: 5,
+      seenOpsTtlMs: 10 * 60 * 1000,
+    });
+    const internals = handlerForLru as unknown as {
+      seenShareOps: Map<string, number>;
+      recordSeenShareOp: (cgId: string, opId: string, ctx: unknown) => void;
+    };
+    const ctx = {} as any;
+
+    internals.recordSeenShareOp('cg', 'hot', ctx);
+    for (let i = 0; i < 8; i++) {
+      internals.recordSeenShareOp('cg', `cold-${i}`, ctx);
+    }
+    internals.recordSeenShareOp('cg', 'hot', ctx);
+    internals.recordSeenShareOp('cg', 'cold-9', ctx);
+    internals.recordSeenShareOp('cg', 'cold-10', ctx);
+
+    // PR-A R11: keys are `JSON.stringify([cgId, shareOperationId])`,
+    // not the legacy `${cgId}|${shareOperationId}` (which was
+    // ambiguous when either field contained `|`).
+    const remaining = [...internals.seenShareOps.keys()];
+    expect(remaining).toContain(JSON.stringify(['cg', 'hot']));
+    expect(remaining.length).toBeLessThanOrEqual(10);
+    expect(remaining).not.toContain(JSON.stringify(['cg', 'cold-0']));
+    expect(remaining).not.toContain(JSON.stringify(['cg', 'cold-1']));
+  });
+
+  // PR-A R3 regression: when the map fills the cap, the FIRST eviction
+  // pass prunes TTL-expired entries — only if that's not enough does
+  // cap-based batch eviction kick in. Pre-fix, cap eviction trimmed
+  // live entries even when TTL-expired entries were sitting right
+  // there waiting to be removed, silently shrinking the measurement
+  // window. This test inserts entries at t=0, advances the clock past
+  // TTL, then inserts more — and asserts the t=0 entries are pruned
+  // by the TTL-first sweep before any live entries get touched.
+  it('cap eviction prunes TTL-expired entries first (R3)', () => {
+    let nowMs = 1_000_000;
+    const handlerForTtl = new SharedMemoryHandler(store, new TypedEventBus(), {
+      now: () => nowMs,
+      seenOpsMaxSize: 5,
+      seenOpsEvictBatch: 5,
+      seenOpsTtlMs: 1_000,
+    });
+    const internals = handlerForTtl as unknown as {
+      seenShareOps: Map<string, number>;
+      seenOpsCapEvictedLiveEntries: boolean;
+      recordSeenShareOp: (cgId: string, opId: string, ctx: unknown) => void;
+    };
+    const ctx = {} as any;
+
+    for (let i = 0; i < 5; i++) {
+      internals.recordSeenShareOp('cg', `expired-${i}`, ctx);
+    }
+    nowMs += 2_000;
+    internals.recordSeenShareOp('cg', 'live-0', ctx);
+    internals.recordSeenShareOp('cg', 'live-1', ctx);
+
+    // PR-A R11: keys are `JSON.stringify([cgId, shareOperationId])`.
+    const remaining = [...internals.seenShareOps.keys()];
+    expect(remaining).toContain(JSON.stringify(['cg', 'live-0']));
+    expect(remaining).toContain(JSON.stringify(['cg', 'live-1']));
+    for (let i = 0; i < 5; i++) {
+      expect(remaining).not.toContain(JSON.stringify(['cg', `expired-${i}`]));
+    }
+    expect(internals.seenOpsCapEvictedLiveEntries).toBe(false);
+    expect(handlerForTtl.getStats().redundantAppliesLowerBound).toBe(false);
+  });
+
+  // PR-A R9 regression: the per-cgId `redundantApplyCounts` map must
+  // be bounded. Pre-fix, a hostile peer could force one duplicate
+  // apply on many fresh cgIds and grow process memory + /api/slo
+  // payload unboundedly. Fix: cap at `redundantAppliesMaxCgs` (default
+  // 1024), evict smallest-count entries into an overflow bucket, flip
+  // a sticky truncated flag. R8 lifted: the eviction comparison is
+  // GLOBAL — when the new entry IS the smallest, it gets evicted
+  // (not pushing out an existing hot cgId).
+  it('caps redundantApplyCounts and protects hot cgIds against one-off bumps (R8 + R9)', () => {
+    let nowMs = 1_000_000;
+    const handlerForR9 = new SharedMemoryHandler(store, new TypedEventBus(), {
+      now: () => nowMs,
+      redundantAppliesMaxCgs: 4,
+      seenOpsTtlMs: 60 * 60 * 1000,
+    });
+    const internals = handlerForR9 as unknown as {
+      recordSeenShareOp: (cgId: string, opId: string, ctx: unknown) => void;
+      enforceRedundantApplyCountsCap: () => void;
+      redundantApplyCounts: Map<string, number>;
+    };
+    const ctx = {} as any;
+
+    for (let i = 0; i < 5; i++) {
+      internals.recordSeenShareOp('cg-hot', 'op-shared', ctx);
+      internals.recordSeenShareOp('cg-hot', 'op-shared', ctx);
+    }
+    const hotCountBeforeEviction = internals.redundantApplyCounts.get('cg-hot');
+    expect(hotCountBeforeEviction).toBeGreaterThanOrEqual(5);
+
+    for (let i = 0; i < 20; i++) {
+      const opId = `op-cold-${i}`;
+      internals.recordSeenShareOp(`cg-cold-${i}`, opId, ctx);
+      internals.recordSeenShareOp(`cg-cold-${i}`, opId, ctx);
+    }
+
+    const stats = handlerForR9.getStats();
+    expect(stats.redundantAppliesTruncated).toBe(true);
+    expect(stats.redundantAppliesOverflow).toBeGreaterThan(0);
+    expect(stats.redundantApplies['cg-hot']).toBe(hotCountBeforeEviction);
+    expect(Object.keys(stats.redundantApplies).length).toBeLessThanOrEqual(4);
+  });
+
+  // PR-A R3 regression: when throughput outruns even the prune-expired
+  // path (everything is still live AND we're over the cap), cap-based
+  // eviction MUST trim live entries to stay bounded. The sticky
+  // `redundantAppliesLowerBound` flag flips so operators see the
+  // /api/slo metric has become a lower bound for the operating window.
+  it('cap eviction sets the lower-bound flag when forced to trim live entries (R3)', () => {
+    let nowMs = 1_000_000;
+    const handlerForLowerBound = new SharedMemoryHandler(store, new TypedEventBus(), {
+      now: () => nowMs,
+      seenOpsMaxSize: 5,
+      seenOpsEvictBatch: 3,
+      seenOpsTtlMs: 60 * 60 * 1000,
+    });
+    const internals = handlerForLowerBound as unknown as {
+      seenShareOps: Map<string, number>;
+      seenOpsCapEvictedLiveEntries: boolean;
+      recordSeenShareOp: (cgId: string, opId: string, ctx: unknown) => void;
+    };
+    const ctx = {} as any;
+
+    expect(handlerForLowerBound.getStats().redundantAppliesLowerBound).toBe(false);
+
+    for (let i = 0; i < 10; i++) {
+      nowMs += 1;
+      internals.recordSeenShareOp('cg', `live-${i}`, ctx);
+    }
+
+    expect(internals.seenOpsCapEvictedLiveEntries).toBe(true);
+    expect(handlerForLowerBound.getStats().redundantAppliesLowerBound).toBe(true);
+  });
+
+  // PR-A R11 regression: prior to the fix, the composite key was
+  // `${cgId}|${shareOperationId}`, which collided whenever either
+  // field contained `|` (both wire-supplied — a hostile peer could
+  // craft them). Two structurally distinct (cgId, op) pairs that
+  // hash to the same string would corrupt `redundantApplies`
+  // accounting: a legitimate first-delivery on one pair would look
+  // like a "redundant" re-delivery of the other and bump the
+  // operator-facing counter under the wrong cgId. The fix uses
+  // `JSON.stringify([cgId, op])`, which is unambiguous (array
+  // delimiters + JSON quote-escaping). This test exercises the
+  // canonical aliasing pair and asserts that the legitimate first
+  // delivery on the second pair is NOT counted as redundant.
+  it('avoids (cgId, shareOpId) composite-key aliasing across pipe-containing values (R11)', () => {
+    let nowMs = 1_000_000;
+    const handlerForR11 = new SharedMemoryHandler(store, new TypedEventBus(), {
+      now: () => nowMs,
+      seenOpsTtlMs: 60 * 60 * 1000,
+    });
+    const internals = handlerForR11 as unknown as {
+      recordSeenShareOp: (cgId: string, opId: string, ctx: unknown) => void;
+    };
+    const ctx = {} as any;
+
+    // Legacy `${cgId}|${shareOperationId}` would produce the same
+    // string `"a|b|c"` for both of these distinct logical pairs:
+    internals.recordSeenShareOp('a|b', 'c', ctx);
+    internals.recordSeenShareOp('a', 'b|c', ctx);
+
+    // Neither call is a redundant apply: the keys must be distinct.
+    const stats = handlerForR11.getStats();
+    expect(stats.redundantApplies).toEqual({});
+    expect(stats.redundantAppliesLowerBound).toBe(false);
+    expect(stats.redundantAppliesOverflow).toBe(0);
+    expect(stats.redundantAppliesTruncated).toBe(false);
+
+    // Now genuinely re-deliver the second pair and assert it IS
+    // counted under the correct cgId (and not under "a|b").
+    internals.recordSeenShareOp('a', 'b|c', ctx);
+    const stats2 = handlerForR11.getStats();
+    expect(stats2.redundantApplies).toEqual({ a: 1 });
+  });
+});
+
 describe('SharedMemoryHandler: CAS gossip enforcement', () => {
   let store: OxigraphStore;
   let handler: SharedMemoryHandler;

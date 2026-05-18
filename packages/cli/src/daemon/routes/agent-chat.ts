@@ -610,6 +610,13 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
   // monotonic delivered / queued counters. Source of truth for the
   // ship-gate overnight soak.
   //
+  // rc.9 PR-A (SWM reliable fan-out plan, Step 0) extended the
+  // response shape with two new top-level sections — `gossip` for
+  // SWM gossip publish failures (pre-rc.9 silently swallowed) and
+  // `swm` for receiver-side redundant-apply measurement (informs
+  // rc10 Concern-2 dedup decision). Both are additive; existing
+  // consumers that parse `protocols` keep working.
+  //
   // SECURITY: this endpoint is reachable only from localhost via the
   // daemon's bind address (the daemon binds /api/* to 127.0.0.1 by
   // default — see packages/cli/src/daemon/lifecycle.ts). Per-protocol
@@ -620,8 +627,7 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
   // in front. The agent.getMessengerSloStats() call itself is cheap
   // (≤ 8 protocols × ≤ 1k samples sort) so no rate limit is needed.
   if (req.method === "GET" && path === "/api/slo") {
-    const stats = agent.getMessengerSloStats();
-    return jsonResponse(res, 200, { protocols: stats });
+    return jsonResponse(res, 200, buildSloPayload(agent));
   }
 
   // GET /api/skills
@@ -942,4 +948,51 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
       throw err;
     }
   }
+}
+
+/**
+ * Build the `/api/slo` response payload. Extracted out of the inline
+ * route block so the public wire shape is testable in isolation
+ * (rc.9 PR-A / Codex PR #570 R10) — production route + regression
+ * test share the exact same code path, so a future drift in any
+ * field name / nesting can't slip past CI.
+ *
+ * Cold-start safety: when `sharedMemoryHandler` has never been
+ * instantiated (no SWM share has ever been received), the agent's
+ * `getSwmHandlerStats()` returns its pristine snapshot rather than
+ * throwing — `buildSloPayload` is safe to call against a fresh
+ * daemon.
+ */
+export function buildSloPayload(agent: {
+  getMessengerSloStats: () => Record<string, unknown>;
+  getSwmGossipStats: () => {
+    publishFailures: Record<string, number>;
+    publishFailuresOverflow: number;
+    publishFailuresTruncated: boolean;
+  };
+  getSwmHandlerStats: () => {
+    redundantApplies: Record<string, number>;
+    redundantAppliesLowerBound: boolean;
+    redundantAppliesOverflow: number;
+    redundantAppliesTruncated: boolean;
+  };
+}): {
+  protocols: Record<string, unknown>;
+  gossip: {
+    publishFailures: Record<string, number>;
+    publishFailuresOverflow: number;
+    publishFailuresTruncated: boolean;
+  };
+  swm: {
+    redundantApplies: Record<string, number>;
+    redundantAppliesLowerBound: boolean;
+    redundantAppliesOverflow: number;
+    redundantAppliesTruncated: boolean;
+  };
+} {
+  return {
+    protocols: agent.getMessengerSloStats(),
+    gossip: agent.getSwmGossipStats(),
+    swm: agent.getSwmHandlerStats(),
+  };
 }

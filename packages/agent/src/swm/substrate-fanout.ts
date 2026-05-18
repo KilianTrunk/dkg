@@ -99,6 +99,23 @@ export interface FanOutPlan {
    */
   substrateMembers: readonly string[];
   /**
+   * Full enumerated recipient set, regardless of whether the
+   * substrate leg actually targets each peer. Equals
+   * `substrateMembers` when `useSubstrate === true`. When
+   * `useSubstrate === false` for a public CG above
+   * `maxSubstrateMembers`, this still carries every subscriber
+   * the enumerator returned — so PR-D's `SwmAckQuorum` can track
+   * the full expected delivery set for large public CGs (where
+   * gossip is the ONLY transport and ack feedback is the only
+   * way to know who actually got the share).
+   *
+   * Added in rc.9 PR-D codex follow-up #D3. Pre-D3 the
+   * `SwmAckQuorum` track gate keyed off `substrateMembers.length
+   * > 0`, which silently disabled the watchdog for the entire
+   * gossip-only-because-too-many-subscribers branch.
+   */
+  enumeratedMembers: readonly string[];
+  /**
    * The {@link CGMemberEnumeration.source} that drove the
    * decision. Surfaced for observability (log lines / per-tier
    * metric breakdown / soak postmortem).
@@ -179,6 +196,7 @@ export function chooseFanOutTier(input: ChooseFanOutTierInput): FanOutPlan {
         useSubstrate: true,
         useGossip: true,
         substrateMembers: enumeration.members,
+        enumeratedMembers: enumeration.members,
         enumerationSource: 'allowlist',
         enumeratedCount,
       };
@@ -188,14 +206,21 @@ export function chooseFanOutTier(input: ChooseFanOutTierInput): FanOutPlan {
           useSubstrate: true,
           useGossip: true,
           substrateMembers: enumeration.members,
+          enumeratedMembers: enumeration.members,
           enumerationSource: 'topic-subscribers',
           enumeratedCount,
         };
       }
+      // rc.9 PR-D codex follow-up #D3: keep the full subscriber
+      // list on `enumeratedMembers` even when we drop substrate.
+      // SwmAckQuorum needs it to track expected delivery for
+      // large public CGs (gossip-only) — pre-D3 the watchdog
+      // was silently disabled here.
       return {
         useSubstrate: false,
         useGossip: true,
         substrateMembers: [],
+        enumeratedMembers: enumeration.members,
         enumerationSource: 'topic-subscribers',
         enumeratedCount,
       };
@@ -204,6 +229,7 @@ export function chooseFanOutTier(input: ChooseFanOutTierInput): FanOutPlan {
         useSubstrate: false,
         useGossip: true,
         substrateMembers: [],
+        enumeratedMembers: [],
         enumerationSource: 'none',
         enumeratedCount,
       };

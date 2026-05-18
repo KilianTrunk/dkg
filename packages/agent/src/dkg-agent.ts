@@ -2043,24 +2043,7 @@ export class DKGAgent {
     // pre-populated into the `acked` set at track time instead,
     // which is structurally identical and avoids a second
     // round-trip per peer).
-    this.messenger.register(PROTOCOL_SWM_SHARE_ACK, async (data, fromPeerId) => {
-      try {
-        const ack = decodeSwmShareAck(data);
-        const ackPeerId = ack.ackPeerId || fromPeerId;
-        this.getOrCreateSwmAckQuorum().onAck(ack.shareOperationId, ackPeerId);
-      } catch (err) {
-        // Malformed ack bytes from a buggy or hostile peer.
-        // Swallow — the worst case is the share's watchdog
-        // eventually fires substrate top-up (which is what would
-        // have happened anyway without the ack arrival).
-        const reason = err instanceof Error ? err.message : String(err);
-        this.log.warn(
-          createOperationContext('share'),
-          `SWM share ack decode failed from ${fromPeerId}: ${reason}`,
-        );
-      }
-      return new Uint8Array();
-    });
+    this.messenger.register(PROTOCOL_SWM_SHARE_ACK, (data, fromPeerId) => this.handleSwmShareAck(data, fromPeerId));
 
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
@@ -6666,6 +6649,7 @@ export class DKGAgent {
         useSubstrate: false,
         useGossip: true,
         substrateMembers: [],
+        enumeratedMembers: [],
         enumerationSource: 'none',
         enumeratedCount: 0,
       };
@@ -6692,18 +6676,26 @@ export class DKGAgent {
     //   1. Caller supplied a shareOperationId (`share()` does;
     //      legacy callers don't).
     //   2. The plan ran a gossip leg — SwmShareAck only covers
-    //      gossip-applied receivers.
+    //      gossip-applied receivers. A hypothetical future
+    //      no-gossip / substrate-only plan would already cover
+    //      quorum via PR-C's substrate counters.
     //   3. We have at least one expected member to wait for.
+    //      (rc.9 PR-D codex #D3 keys this off
+    //      `plan.enumeratedMembers.length`, NOT
+    //      `substrateMembers.length`, so the gossip-only
+    //      "public CG above the substrate cap" branch is
+    //      covered too — that's the dominant use case for
+    //      ack-driven reliability.)
     const ackQuorumActive = !!shareOperationId
       && plan.useGossip
-      && plan.substrateMembers.length > 0;
+      && plan.enumeratedMembers.length > 0;
     let trackedQuorum: SwmAckQuorum | null = null;
     if (ackQuorumActive && shareOperationId) {
       trackedQuorum = this.getOrCreateSwmAckQuorum();
       trackedQuorum.track({
         shareOperationId,
         cgId: contextGraphId,
-        expectedMembers: plan.substrateMembers,
+        expectedMembers: plan.enumeratedMembers,
         preAckedFromSubstrate: [],
         payload: wireMessage,
         enumerationSource: plan.enumerationSource,
@@ -9112,6 +9104,63 @@ export class DKGAgent {
   }
 
   /**
+   * Receiver handler for `PROTOCOL_SWM_SHARE_ACK`. Extracted into
+   * a named method (mirrors `handleSwmUpdate`'s shape) so the
+   * spoof-rejection contract from PR-D codex follow-up #D2 can
+   * be unit-tested in isolation without spinning up a real
+   * Messenger registration. Always returns `new Uint8Array()`
+   * at the wire level — senders don't read the response (acks
+   * use fire-and-forget `sendToPeer` per #D1).
+   */
+  private async handleSwmShareAck(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
+    try {
+      const ack = decodeSwmShareAck(data);
+      // rc.9 PR-D codex follow-up #D2: authoritative ack identity
+      // is the libp2p-authenticated `fromPeerId`, NOT the
+      // self-asserted `ack.ackPeerId` in the protobuf body.
+      // Pre-D2 we trusted the body, which let any peer that had
+      // learned a `shareOperationId` spoof acks on behalf of
+      // other expected members — suppressing watchdog top-up
+      // for those members and degrading delivery quorum
+      // reliability. The body's `ackPeerId` is kept on the wire
+      // for forward-compat with a possible future relayed-ack
+      // path (where `fromPeerId` would be a relay node, not the
+      // original receiver), but in the current direct-Messenger
+      // world we reject any non-empty mismatch as either a
+      // misconfiguration or a spoof attempt.
+      if (ack.ackPeerId && ack.ackPeerId !== fromPeerId) {
+        this.log.warn(
+          createOperationContext('share', ack.shareOperationId),
+          `SWM share ack body/transport peerId mismatch — body=${ack.ackPeerId} transport=${fromPeerId} — dropping (potential spoof)`,
+        );
+        return new Uint8Array();
+      }
+      this.getOrCreateSwmAckQuorum().onAck(ack.shareOperationId, fromPeerId);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.warn(
+        createOperationContext('share'),
+        `SWM share ack decode failed from ${fromPeerId}: ${reason}`,
+      );
+    }
+    return new Uint8Array();
+  }
+
+  /**
+   * Test-only view onto {@link handleSwmShareAck} for the PR-D
+   * codex follow-up #D2 regression. Production traffic invokes
+   * the same handler via the `messenger.register()` callback
+   * registered in {@link initialize}; tests need the same
+   * arrow-function shape without having to intercept the
+   * register call (which happens before the test can install
+   * its messenger stub). Not part of the public API; method
+   * exists purely to make the spoof-rejection contract testable.
+   */
+  async getOrCreateSwmShareAckHandlerForTests(): Promise<(data: Uint8Array, from: string) => Promise<Uint8Array>> {
+    return (data, from) => this.handleSwmShareAck(data, from);
+  }
+
+  /**
    * Best-effort send of `PROTOCOL_SWM_SHARE_ACK` to the share's
    * publisher peer after a successful gossip-path apply.
    * Extracted into a named method so the receiver contract can
@@ -9142,16 +9191,33 @@ export class DKGAgent {
     if (publisherPeerId === selfPeerId) return;
 
     const ackBytes = encodeSwmShareAck({ shareOperationId, ackPeerId: selfPeerId });
+    // rc.9 PR-D codex follow-up #D1: use fire-and-forget
+    // `sendToPeer` instead of durable `sendReliable`. Pre-D1
+    // the ack went through the substrate outbox — but
+    // PROTOCOL_SWM_SHARE_ACK is a new rc.9-PR-D-only protocol,
+    // and during a rolling upgrade the publisher peer may not
+    // have it registered yet. A `sendReliable` to an
+    // unsupported protocol enqueues into the outbox and retries
+    // forever on protocol negotiation, accumulating a permanent
+    // queued row per received share. By contrast `sendToPeer`
+    // just delegates to `ProtocolRouter.send`: one network
+    // attempt, no envelope, no idempotency cache, no outbox row.
+    // On any failure (peer offline, protocol unsupported,
+    // stream reset) we WARN and drop — that's the right
+    // semantic anyway since acks are pure observability: a
+    // missed ack just means the watchdog will eventually fire
+    // substrate top-up, which the receiver dedups via
+    // `seenShareOps`. Losing an ack is recoverable; persisting
+    // a doomed retry forever is not.
     try {
-      await this.messenger.sendReliable(publisherPeerId, PROTOCOL_SWM_SHARE_ACK, ackBytes, {
-        messageId: `swm-share-ack-${shareOperationId}-${selfPeerId}`,
+      await this.messenger.sendToPeer(publisherPeerId, PROTOCOL_SWM_SHARE_ACK, ackBytes, {
         timeoutMs: DKGAgent.SWM_SUBSTRATE_FANOUT_TIMEOUT_MS,
       });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       this.log.warn(
         createOperationContext('share', shareOperationId),
-        `SWM share ack to ${publisherPeerId} failed: ${reason}`,
+        `SWM share ack to ${publisherPeerId} failed (best-effort, watchdog will retry the share if quorum slips): ${reason}`,
       );
     }
   }

@@ -92,6 +92,27 @@ function stubMessengerSendReliable(
         if (out instanceof Error) throw out;
         return out;
       },
+      // rc.9 PR-D codex follow-up #D1: ack emission uses
+      // fire-and-forget `sendToPeer` instead of durable
+      // `sendReliable`. We capture into the same `calls` array
+      // so existing assertions see both kinds of sends; the
+      // `protocolId` discriminates (acks go to
+      // PROTOCOL_SWM_SHARE_ACK). No outbox, no retry — one
+      // network attempt, opaque response.
+      sendToPeer: async (
+        peerId: string,
+        protocolId: string,
+        payload: Uint8Array,
+      ): Promise<Uint8Array> => {
+        calls.push({ peerId, protocolId, bytes: payload.byteLength });
+        return new Uint8Array();
+      },
+      // PR-D registers PROTOCOL_SWM_SHARE_ACK and PR-C registers
+      // a deliveredResponseClassifier — stub these as no-ops so
+      // DKGAgent's constructor / wiring code doesn't crash when
+      // it reaches into the stubbed messenger.
+      register: (_proto: string, _handler: (data: Uint8Array, from: string) => Promise<Uint8Array>): void => {},
+      setResponseDeliveredClassifier: (_proto: string, _fn: (r: Uint8Array) => boolean): void => {},
     };
     (agent as unknown as { messenger: typeof stub }).messenger = stub;
   };
@@ -311,5 +332,184 @@ describe('DKGAgent SwmAckQuorum integration (rc.9 PR-D)', () => {
     expect(bytes.byteLength).toBeGreaterThan(0);
     expect(PROTOCOL_SWM_SHARE_ACK).toBe('/dkg/10.0.1/swm-share-ack');
     expect(PROTOCOL_SWM_UPDATE).toBe('/dkg/10.0.1/swm-update');
+  });
+
+  /**
+   * rc.9 PR-D codex follow-up #D1: ack emission MUST use
+   * fire-and-forget `sendToPeer`, NOT durable `sendReliable`.
+   * Pre-D1 a publisher peer on a build without
+   * PROTOCOL_SWM_SHARE_ACK registered would leave a permanently-
+   * queued outbox row per received share, retrying protocol
+   * negotiation forever. This test pins the call surface: the
+   * ack handler exercised here calls `messenger.sendToPeer`,
+   * not `messenger.sendReliable`.
+   */
+  it('PR-D #D1: ack emission uses sendToPeer (fire-and-forget), not sendReliable (durable)', async () => {
+    const agent = register(await createAgent('AckQuorumD1FireForget'));
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWPublisher'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    const { calls, install } = stubMessengerSendReliable(new Map([
+      ['12D3KooWPublisher', { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'm-pub' }],
+    ]));
+    install(agent);
+
+    // Invoke the ack emit path directly with a synthetic
+    // apply-true outcome — bypasses the gossip mesh dance and
+    // pins the messenger call shape.
+    const emit = (agent as unknown as {
+      maybeEmitSwmShareAck: (o: { applied: true; cgId?: string; shareOperationId?: string; publisherPeerId?: string }) => Promise<void>;
+    }).maybeEmitSwmShareAck.bind(agent);
+
+    await emit({
+      applied: true,
+      cgId: 'cg-d1',
+      shareOperationId: 'op-d1-fire-forget',
+      publisherPeerId: '12D3KooWPublisher',
+    });
+
+    const ackCalls = calls.filter((c) => c.protocolId === PROTOCOL_SWM_SHARE_ACK);
+    expect(ackCalls).toHaveLength(1);
+    expect(ackCalls[0]?.peerId).toBe('12D3KooWPublisher');
+    // sendToPeer doesn't expose a messageId option (fire-and-
+    // forget; no outbox row to key off). The stub leaves
+    // messageId undefined for sendToPeer calls.
+    expect(ackCalls[0]?.messageId).toBeUndefined();
+  });
+
+  /**
+   * rc.9 PR-D codex follow-up #D2: the ack handler MUST trust
+   * the libp2p-authenticated `fromPeerId`, NOT the
+   * self-asserted `ack.ackPeerId` in the protobuf body. Pre-D2
+   * any peer that learned a `shareOperationId` could spoof
+   * acks on behalf of other expected members, suppressing
+   * watchdog top-up for those members.
+   *
+   * This test exercises the handler with a body that claims
+   * peerB acked while the transport identity is peerA, and
+   * asserts:
+   *   1. The spoof attempt is dropped (the quorum's `acked` set
+   *      gains no entry).
+   *   2. Body == transport → the ack lands as expected.
+   */
+  it('PR-D #D2: ack handler rejects body/transport peerId mismatch (anti-spoof)', async () => {
+    const agent = register(await createAgent('AckQuorumD2AntiSpoof'));
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWPeerA', '12D3KooWPeerB', '12D3KooWPeerC'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    const { install } = stubMessengerSendReliable(() => ({
+      delivered: false, queued: true, attempts: 1, messageId: 'q-' + Math.random().toString(36).slice(2),
+      error: 'transient', nextAttemptAtMs: Date.now() + 1000,
+    }));
+    install(agent);
+
+    const { shareOperationId } = await agent.share('cg-d2-antispoof', [{
+      subject: 'urn:test:d2', predicate: 'http://schema.org/name', object: '"d2"', graph: '',
+    }]);
+
+    const quorum = (agent as unknown as {
+      getOrCreateSwmAckQuorum: () => {
+        onAck: (op: string, peer: string) => void;
+        inspect: (op: string) => { acked: readonly string[]; expectedMembers: readonly string[] } | undefined;
+      };
+    }).getOrCreateSwmAckQuorum();
+
+    expect(quorum.inspect(shareOperationId)?.acked).toEqual([]);
+
+    // Find the PROTOCOL_SWM_SHARE_ACK handler. We can't intercept
+    // the stub's register call (PR-D registers BEFORE the stub
+    // is installed), so reach into the real Messenger via the
+    // production-side getter that DKGAgent exposes. Test goes
+    // through the SAME handler in src/dkg-agent.ts that
+    // production traffic hits — that's the whole point.
+    const ackHandler = await agent.getOrCreateSwmShareAckHandlerForTests();
+
+    // Spoof attempt: body claims peerB, transport says peerA.
+    // Expected: ack DROPPED, acked set unchanged.
+    const spoofBytes = encodeSwmShareAck({
+      shareOperationId,
+      ackPeerId: '12D3KooWPeerB',
+    });
+    await ackHandler(spoofBytes, '12D3KooWPeerA');
+    expect(quorum.inspect(shareOperationId)?.acked).toEqual([]);
+
+    // Honest ack: body matches transport. Expected: lands.
+    const honestBytes = encodeSwmShareAck({
+      shareOperationId,
+      ackPeerId: '12D3KooWPeerA',
+    });
+    await ackHandler(honestBytes, '12D3KooWPeerA');
+    expect(quorum.inspect(shareOperationId)?.acked).toEqual(['12D3KooWPeerA']);
+
+    // Empty body ackPeerId is also accepted — back-compat with
+    // a future relayed-ack path where the body field might be
+    // omitted intentionally.
+    const emptyBodyBytes = encodeSwmShareAck({
+      shareOperationId,
+      ackPeerId: '',
+    });
+    await ackHandler(emptyBodyBytes, '12D3KooWPeerC');
+    const after = quorum.inspect(shareOperationId)?.acked ?? [];
+    expect([...after].sort()).toEqual(['12D3KooWPeerA', '12D3KooWPeerC']);
+  });
+
+  /**
+   * rc.9 PR-D codex follow-up #D3: the ack-quorum tracker MUST
+   * also run for the gossip-only-because-too-many-subscribers
+   * branch (public CG above the substrate cap). Pre-D3 the
+   * track gate required `plan.substrateMembers.length > 0`,
+   * which this branch intentionally empties — so the watchdog
+   * was silently disabled for the dominant use case for
+   * ack-driven reliability.
+   *
+   * Easiest deterministic exercise: temporarily clamp the
+   * substrate-members cap to 1 so a CG with 3 subscribers
+   * trips the gossip-only branch. Then assert that
+   * `getOrCreateSwmAckQuorum().inspect(...).expectedMembers`
+   * includes all 3 — not 0.
+   */
+  it('PR-D #D3: gossip-only-large-public CGs DO get tracked (watchdog covers them)', async () => {
+    const agent = register(await createAgent('AckQuorumD3LargePublic'));
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWBig1', '12D3KooWBig2', '12D3KooWBig3'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    // Clamp the substrate cap so 3 subscribers trip the
+    // gossip-only branch.
+    (agent as unknown as { swmSubstrateMaxMembers: number }).swmSubstrateMaxMembers = 1;
+
+    const { calls, install } = stubMessengerSendReliable(new Map());
+    install(agent);
+
+    const { shareOperationId } = await agent.share('cg-d3-large-public', [{
+      subject: 'urn:test:d3', predicate: 'http://schema.org/name', object: '"d3"', graph: '',
+    }]);
+
+    // Substrate must NOT have been used (above the clamp).
+    const updateCalls = calls.filter((c) => c.protocolId === PROTOCOL_SWM_UPDATE);
+    expect(updateCalls).toEqual([]);
+
+    // Pre-D3: this would have been undefined (track was
+    // skipped because substrateMembers.length === 0).
+    // Post-D3: enumeratedMembers carries the full subscriber
+    // list and track() runs against it.
+    const quorum = (agent as unknown as {
+      getOrCreateSwmAckQuorum: () => {
+        inspect: (op: string) => { expectedMembers: readonly string[]; acked: readonly string[] } | undefined;
+      };
+    }).getOrCreateSwmAckQuorum();
+
+    const record = quorum.inspect(shareOperationId);
+    expect(record).toBeDefined();
+    expect([...(record?.expectedMembers ?? [])].sort()).toEqual([
+      '12D3KooWBig1',
+      '12D3KooWBig2',
+      '12D3KooWBig3',
+    ]);
+    // No substrate sends → no pre-acked peers; everyone is
+    // pending until a SwmShareAck arrives (or watchdog fires).
+    expect(record?.acked).toEqual([]);
   });
 });

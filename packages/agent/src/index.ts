@@ -106,8 +106,10 @@ export {
 } from './swm/enumerate-cg-members.js';
 export {
   chooseFanOutTier,
+  classifySendResult,
   executeSubstrateFanOut,
   FANOUT_RESPONSE_REJECTED,
+  FANOUT_RESPONSE_RETRYABLE,
   type ChooseFanOutTierInput,
   type FanOutPlan,
   type FanOutOutcome,
@@ -117,5 +119,15 @@ export {
   type ExecuteSubstrateFanOutInput,
   type ExecuteSubstrateFanOutResult,
 } from './swm/substrate-fanout.js';
+export {
+  createSwmAckQuorum,
+  type SwmAckQuorum,
+  type SwmAckQuorumDeps,
+  type SwmAckQuorumObservers,
+  type SwmAckQuorumStats,
+  type SubstrateTopUp,
+  type TrackInput,
+  type TrackedRecordSnapshot,
+} from './swm/ack-quorum.js';
 export * from './source-worker.js';
 export * from './source-registry.js';

@@ -99,6 +99,23 @@ export interface FanOutPlan {
    */
   substrateMembers: readonly string[];
   /**
+   * Full enumerated recipient set, regardless of whether the
+   * substrate leg actually targets each peer. Equals
+   * `substrateMembers` when `useSubstrate === true`. When
+   * `useSubstrate === false` for a public CG above
+   * `maxSubstrateMembers`, this still carries every subscriber
+   * the enumerator returned — so PR-D's `SwmAckQuorum` can track
+   * the full expected delivery set for large public CGs (where
+   * gossip is the ONLY transport and ack feedback is the only
+   * way to know who actually got the share).
+   *
+   * Added in rc.9 PR-D codex follow-up #D3. Pre-D3 the
+   * `SwmAckQuorum` track gate keyed off `substrateMembers.length
+   * > 0`, which silently disabled the watchdog for the entire
+   * gossip-only-because-too-many-subscribers branch.
+   */
+  enumeratedMembers: readonly string[];
+  /**
    * The {@link CGMemberEnumeration.source} that drove the
    * decision. Surfaced for observability (log lines / per-tier
    * metric breakdown / soak postmortem).
@@ -179,6 +196,7 @@ export function chooseFanOutTier(input: ChooseFanOutTierInput): FanOutPlan {
         useSubstrate: true,
         useGossip: true,
         substrateMembers: enumeration.members,
+        enumeratedMembers: enumeration.members,
         enumerationSource: 'allowlist',
         enumeratedCount,
       };
@@ -188,14 +206,21 @@ export function chooseFanOutTier(input: ChooseFanOutTierInput): FanOutPlan {
           useSubstrate: true,
           useGossip: true,
           substrateMembers: enumeration.members,
+          enumeratedMembers: enumeration.members,
           enumerationSource: 'topic-subscribers',
           enumeratedCount,
         };
       }
+      // rc.9 PR-D codex follow-up #D3: keep the full subscriber
+      // list on `enumeratedMembers` even when we drop substrate.
+      // SwmAckQuorum needs it to track expected delivery for
+      // large public CGs (gossip-only) — pre-D3 the watchdog
+      // was silently disabled here.
       return {
         useSubstrate: false,
         useGossip: true,
         substrateMembers: [],
+        enumeratedMembers: enumeration.members,
         enumerationSource: 'topic-subscribers',
         enumeratedCount,
       };
@@ -204,6 +229,7 @@ export function chooseFanOutTier(input: ChooseFanOutTierInput): FanOutPlan {
         useSubstrate: false,
         useGossip: true,
         substrateMembers: [],
+        enumeratedMembers: [],
         enumerationSource: 'none',
         enumeratedCount,
       };
@@ -227,6 +253,32 @@ export type FanOutOutcome =
   // codex R6 caught that bundling them overstated end-to-end
   // success in `/api/slo`'s `swm.substrateFanout.delivered`.
   | 'rejected'
+  // rc.9 PR-D (codex follow-up from PR-G #G1, deferred here so
+  // it lands together with the watchdog that actually
+  // reschedules retryable peers): `messenger.sendReliable`
+  // returned `delivered: true` but the receiver's response was
+  // the {@link FANOUT_RESPONSE_RETRYABLE} sentinel — the
+  // receiver saw a TRANSIENT rejection (CAS pre-condition not
+  // yet met; upstream writes pending). The sender does NOT
+  // count this as delivered; SwmAckQuorum's watchdog handles
+  // the actual re-send by leaving the peer out of the pre-acked
+  // set so it falls through to the expectedMembers∖acked window
+  // and substrate top-up fires at watchdogMs.
+  //
+  // Pre-PR-D the receiver THREW on retryable rejections, hoping
+  // libp2p would surface the handler-abort as a recoverable
+  // stream-reset that `isRecoverableSendError()` would re-queue
+  // into the outbox. That hope was fragile: the non-pooled
+  // ProtocolRouter aborts with the literal string `"handler
+  // error"`, which matches none of the recoverable substrings,
+  // so the share got DROPPED instead of queued. The sentinel
+  // is deterministic — receiver returns the byte at the wire
+  // layer, sender's classifier re-buckets it into 'retryable',
+  // SwmAckQuorum's watchdog fires top-up. NOTE the throw path
+  // remains in handleSwmUpdate as the fallback when PR-D's
+  // watchdog is disabled (test seam / config flag), so the
+  // pre-PR-D behaviour is recoverable.
+  | 'retryable'
   // `messenger.sendReliable` returned `delivered: false, queued:
   // true`. Persisted into the durable substrate outbox; will be
   // retried by `Messenger.processOutboxTick` and on the next
@@ -270,6 +322,23 @@ export type FanOutOutcome =
  *     further runs on a normal response).
  */
 export const FANOUT_RESPONSE_REJECTED: Uint8Array = new Uint8Array([0x01]);
+
+/**
+ * rc.9 PR-D (codex follow-up from PR-G #G1, deferred here so
+ * it lands together with the SwmAckQuorum watchdog). Wire
+ * sentinel returned by the substrate receiver for TRANSIENT
+ * rejections — the receiver couldn't apply the share right
+ * now (CAS pre-condition not yet met) but the same wire bytes
+ * might apply successfully on retry once upstream state
+ * converges.
+ *
+ * Older substrate senders (pre-PR-D) treat 0x02 identically to
+ * 0x01 — opaque non-empty byte → `delivered: true` in their
+ * classifier. Slight metric overcount during rolling rc.9 PR-C
+ * → PR-D upgrades; no behavioural regression since receivers
+ * still dedup via `seenShareOps` (PR-A).
+ */
+export const FANOUT_RESPONSE_RETRYABLE: Uint8Array = new Uint8Array([0x02]);
 
 /**
  * Per-peer record handed to {@link FanOutBookkeeper.recordOutcome}.
@@ -333,6 +402,13 @@ export interface ExecuteSubstrateFanOutResult {
   delivered: number;
   /** Permanent receiver-side rejections — sender drops, NOT counted as delivered (PR-C codex R6). */
   rejected: number;
+  /**
+   * Transient receiver-side rejections — sender does NOT count
+   * as delivered; SwmAckQuorum's watchdog (PR-D) fires substrate
+   * top-up at watchdogMs so upstream state has time to converge
+   * before retry (codex follow-up from PR-G #G1, landed here).
+   */
+  retryable: number;
   queued: number;
   inFlight: number;
   failed: number;
@@ -359,6 +435,7 @@ export async function executeSubstrateFanOut(
     attempted: members.length,
     delivered: 0,
     rejected: 0,
+    retryable: 0,
     queued: 0,
     inFlight: 0,
     failed: 0,
@@ -387,6 +464,9 @@ export async function executeSubstrateFanOut(
       case 'rejected':
         result.rejected += 1;
         break;
+      case 'retryable':
+        result.retryable += 1;
+        break;
       case 'queued':
         result.queued += 1;
         break;
@@ -403,7 +483,17 @@ export async function executeSubstrateFanOut(
   return result;
 }
 
-function classifySendResult(peerId: string, sendResult: ReliableSendResult): FanOutPeerRecord {
+/**
+ * Map a `ReliableSendResult` (the messenger's send-time outcome)
+ * onto the application-level {@link FanOutOutcome}. Exported so
+ * the watchdog/top-up path (rc.9 PR-D #D6) can reuse the EXACT
+ * same classification rules as the main fan-out — keeping
+ * sentinel handling (`FANOUT_RESPONSE_REJECTED`,
+ * `FANOUT_RESPONSE_RETRYABLE`), queued/inFlight policy, and
+ * error-string conventions in a single place. Pure function;
+ * no I/O.
+ */
+export function classifySendResult(peerId: string, sendResult: ReliableSendResult): FanOutPeerRecord {
   if (sendResult.delivered) {
     // PR-C codex R6: receivers signal permanent rejection (peer
     // not in allowlist, bad signature, validation failure) with
@@ -420,6 +510,18 @@ function classifySendResult(peerId: string, sendResult: ReliableSendResult): Fan
         attempts: sendResult.attempts,
         messageId: sendResult.messageId,
         error: 'receiver returned FANOUT_RESPONSE_REJECTED sentinel (permanent rejection)',
+      };
+    }
+    // rc.9 PR-D (codex follow-up from PR-G #G1): the 0x02
+    // sentinel means TRANSIENT rejection — SwmAckQuorum's
+    // watchdog will fire substrate top-up at watchdogMs.
+    if (isRetryableSentinel(sendResult.response)) {
+      return {
+        peerId,
+        outcome: 'retryable',
+        attempts: sendResult.attempts,
+        messageId: sendResult.messageId,
+        error: 'receiver returned FANOUT_RESPONSE_RETRYABLE sentinel (transient rejection)',
       };
     }
     return {
@@ -474,4 +576,8 @@ function classifySendResult(peerId: string, sendResult: ReliableSendResult): Fan
  */
 function isRejectionSentinel(response: Uint8Array | undefined): boolean {
   return response !== undefined && response.byteLength === 1 && response[0] === 0x01;
+}
+
+function isRetryableSentinel(response: Uint8Array | undefined): boolean {
+  return response !== undefined && response.byteLength === 1 && response[0] === 0x02;
 }

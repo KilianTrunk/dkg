@@ -879,7 +879,7 @@ describe('SharedMemoryHandler.handle outcome (rc.9 PR-C codex R3)', () => {
     handler = new SharedMemoryHandler(store, new TypedEventBus(), {});
   });
 
-  it('successful apply returns { applied: true }', async () => {
+  it('successful apply returns { applied: true } with metadata for PR-D ack-quorum tracking', async () => {
     const nquads = `<${ENTITY}> <http://schema.org/name> "Applied" <${DATA_GRAPH}> .`;
     const msg = encodeWorkspacePublishRequest({
       contextGraphId: CONTEXT_GRAPH,
@@ -891,7 +891,18 @@ describe('SharedMemoryHandler.handle outcome (rc.9 PR-C codex R3)', () => {
     });
 
     const outcome = await handler.handle(msg, '12D3KooWPeerR3');
-    expect(outcome).toEqual({ applied: true });
+    // PR-D extended the applied: true variant to carry cgId,
+    // shareOperationId, and publisherPeerId so the gossip
+    // subscriber can address SwmShareAck back to the publisher
+    // (RFC-003 §4.2). Backward-compat: legacy callers using just
+    // `outcome.applied` still see `true`; only assertions with
+    // strict equality need the new fields.
+    expect(outcome).toEqual({
+      applied: true,
+      cgId: CONTEXT_GRAPH,
+      shareOperationId: 'op-applied',
+      publisherPeerId: '12D3KooWPeerR3',
+    });
   });
 
   it('permanent rejection (publisherPeerId / fromPeerId mismatch) returns { applied: false, retryable: false }', async () => {

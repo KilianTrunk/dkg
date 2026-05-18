@@ -22,7 +22,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { MockChainAdapter } from '@origintrail-official/dkg-chain';
-import { DKGAgent } from '../src/index.js';
+import { DKGAgent, FANOUT_RESPONSE_RETRYABLE } from '../src/index.js';
 import type { ReliableSendResult } from '../src/p2p/messenger.js';
 
 const SELF_PEER = '12D3KooWSelfPubC';
@@ -115,10 +115,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(stats).toEqual({
       delivered: {},
       rejected: {},
+      retryable: {},
       queued: {},
       inFlight: {},
       failed: {},
-      overflow: { delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 },
+      overflow: { delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 },
       truncated: false,
     });
   });
@@ -148,10 +149,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(agent.getSwmSubstrateFanoutStats()).toEqual({
       delivered: {},
       rejected: {},
+      retryable: {},
       queued: {},
       inFlight: {},
       failed: {},
-      overflow: { delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 },
+      overflow: { delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 },
       truncated: false,
     });
   });
@@ -214,7 +216,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(stats.queued).toEqual({ 'cg-public-mixed': 1 });
     expect(stats.inFlight).toEqual({});
     expect(stats.failed).toEqual({ 'cg-public-mixed': 1 });
-    expect(stats.overflow).toEqual({ delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 });
+    expect(stats.overflow).toEqual({ delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 });
     expect(stats.truncated).toBe(false);
   });
 
@@ -364,10 +366,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(agent.getSwmSubstrateFanoutStats()).toEqual({
       delivered: {},
       rejected: {},
+      retryable: {},
       queued: {},
       inFlight: {},
       failed: {},
-      overflow: { delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 },
+      overflow: { delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 },
       truncated: false,
     });
   });
@@ -418,11 +421,12 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
    *      Uint8Array), sender drops the share. Matches the
    *      pre-PR-C gossip behaviour for permanent rejections
    *      (bad signature, peer not in allowlist, CAS-not-met).
-   *   - `applied: false, retryable: true`        → THROW, so
-   *      sendReliable reports failure and the substrate
-   *      outbox keeps the share queued for retry. Dominant
-   *      production case: sender key package for the epoch
-   *      hasn't arrived yet.
+   *   - `applied: false, retryable: true`        → returns
+   *      the `FANOUT_RESPONSE_RETRYABLE` (0x02) sentinel (rc.9
+   *      PR-D, codex follow-up from PR-G #G1). Sender's
+   *      classifier re-buckets into 'retryable'; the peer is
+   *      NOT pre-added to the SwmAckQuorum acked set, so the
+   *      watchdog fires substrate top-up at watchdogMs.
    *
    * We exercise the private `handleSwmUpdate` method directly
    * by stubbing `getOrCreateSharedMemoryHandler` to return a
@@ -480,7 +484,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
       expect(response[0]).toBe(0x01);
     });
 
-    it('retryable rejection (retryable: true) → THROWS so substrate outbox keeps the share queued', async () => {
+    it('retryable rejection (retryable: true) → returns FANOUT_RESPONSE_RETRYABLE sentinel (PR-D, codex from PR-G #G1)', async () => {
       const agent = await createAgent('R3Receiver-Retryable');
       installStubHandler(agent, async () => ({
         applied: false,
@@ -488,9 +492,9 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
         retryable: true,
       }));
 
-      await expect(
-        invokeReceiver(agent, new Uint8Array([7, 8, 9]), '12D3KooWPeerR3c'),
-      ).rejects.toThrow(/transient rejection from 12D3KooWPeerR3c.*epoch 42/);
+      const response = await invokeReceiver(agent, new Uint8Array([7, 8, 9]), '12D3KooWPeerR3c');
+      expect(response).toBeInstanceOf(Uint8Array);
+      expect(response).toEqual(FANOUT_RESPONSE_RETRYABLE);
     });
   });
 
@@ -688,5 +692,44 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     // is correctly removing completed fan-outs.
     expect(agent.inFlightSubstrateFanOutCount()).toBe(0);
     expect(agent.getSwmSubstrateFanoutStats().delivered).toEqual({ 'cg-g2-cleanup': 5 });
+  });
+
+  /**
+   * rc.9 PR-D (codex follow-up from PR-G #G1) end-to-end: the
+   * substrate's per-(cgId, outcome) counter MUST surface a
+   * `retryable` bucket when the receiver returns the 0x02
+   * sentinel, separately from `delivered` AND from `rejected`.
+   * Pre-PR-D the receiver threw on retryable rejections — and
+   * that throw relied on libp2p's handler-abort surfacing as
+   * recoverable, which it did not. The 0x02 sentinel sidesteps
+   * the abort entirely: receiver returns the byte, sender
+   * classifies it as `retryable`, and SwmAckQuorum's watchdog
+   * schedules the actual re-send.
+   */
+  it('PR-D end-to-end (codex from PR-G #G1): 0x02 retryable sentinel moves counter into the retryable bucket', async () => {
+    const agent = await createAgent('SubstrateFanoutRetryablePRD');
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWApplied', '12D3KooWRetryable'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    const { install } = stubMessengerSendReliable(new Map([
+      ['12D3KooWApplied', { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'm-applied' }],
+      ['12D3KooWRetryable', { delivered: true, response: new Uint8Array([0x02]), attempts: 1, messageId: 'm-retryable' }],
+    ]));
+    install(agent);
+
+    await agent.share('cg-prd-retryable', [{
+      subject: 'urn:test:prd-retry', predicate: 'http://schema.org/name', object: '"prd"', graph: '',
+    }]);
+    // PR-G #G2: substrate fan-out is detached from share(); drain
+    // in-flight before asserting on the counters.
+    await agent.awaitInFlightSubstrateFanOuts();
+
+    const stats = agent.getSwmSubstrateFanoutStats();
+    expect(stats.delivered).toEqual({ 'cg-prd-retryable': 1 });
+    expect(stats.retryable).toEqual({ 'cg-prd-retryable': 1 });
+    expect(stats.rejected).toEqual({});
+    expect(stats.queued).toEqual({});
+    expect(stats.failed).toEqual({});
   });
 });

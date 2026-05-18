@@ -986,11 +986,36 @@ export function buildSloPayload(agent: {
   getSwmSubstrateFanoutStats?: () => {
     delivered: Record<string, number>;
     rejected: Record<string, number>;
+    /**
+     * rc.9 PR-D (codex follow-up from PR-G #G1): transient
+     * receiver-side rejections. Optional on the interface for
+     * back-compat with pre-PR-D test doubles.
+     */
+    retryable?: Record<string, number>;
     queued: Record<string, number>;
     inFlight: Record<string, number>;
     failed: Record<string, number>;
-    overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
+    overflow: {
+      delivered: number;
+      rejected: number;
+      retryable?: number;
+      queued: number;
+      inFlight: number;
+      failed: number;
+    };
     truncated: boolean;
+  };
+  /**
+   * rc.9 PR-D addition. Optional for the same reason
+   * getSwmSubstrateFanoutStats is — test doubles don't need to
+   * stub a tracker they aren't exercising.
+   */
+  getSwmAckQuorumStats?: () => {
+    tracked: number;
+    completed: number;
+    watchdogFired: number;
+    deadlineExpired: number;
+    pending: number;
   };
 }): {
   protocols: Record<string, unknown>;
@@ -1012,22 +1037,44 @@ export function buildSloPayload(agent: {
     substrateFanout?: {
       delivered: Record<string, number>;
       rejected: Record<string, number>;
+      retryable?: Record<string, number>;
       queued: Record<string, number>;
       inFlight: Record<string, number>;
       failed: Record<string, number>;
-      overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
+      overflow: {
+        delivered: number;
+        rejected: number;
+        retryable?: number;
+        queued: number;
+        inFlight: number;
+        failed: number;
+      };
       truncated: boolean;
+    };
+    /**
+     * rc.9 PR-D: ack-quorum overlay counters. Same opt-out
+     * mechanic as `substrateFanout` — present iff the agent
+     * exposes `getSwmAckQuorumStats()`.
+     */
+    shareAckQuorum?: {
+      tracked: number;
+      completed: number;
+      watchdogFired: number;
+      deadlineExpired: number;
+      pending: number;
     };
   };
 } {
   const swmHandler = agent.getSwmHandlerStats();
   const substrateFanout = agent.getSwmSubstrateFanoutStats?.();
+  const shareAckQuorum = agent.getSwmAckQuorumStats?.();
   return {
     protocols: agent.getMessengerSloStats(),
     gossip: agent.getSwmGossipStats(),
     swm: {
       ...swmHandler,
       ...(substrateFanout !== undefined ? { substrateFanout } : {}),
+      ...(shareAckQuorum !== undefined ? { shareAckQuorum } : {}),
     },
   };
 }

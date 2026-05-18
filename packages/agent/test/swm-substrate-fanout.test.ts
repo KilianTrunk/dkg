@@ -162,6 +162,59 @@ describe('chooseFanOutTier', () => {
       expect(plan.enumeratedCount).toBe(0);
     });
   });
+
+  /**
+   * rc.9 PR-D codex follow-up #D3: `enumeratedMembers` carries
+   * the full recipient set regardless of whether the substrate
+   * leg is active, so PR-D's `SwmAckQuorum` can track the full
+   * expected delivery for the gossip-only-because-too-many-
+   * subscribers branch (which is the dominant use case for
+   * large public CGs). Pre-D3 the only available field was
+   * `substrateMembers`, which the gossip-only branch
+   * intentionally empties — silently disabling watchdog.
+   */
+  describe('enumeratedMembers (PR-D #D3 regression)', () => {
+    it('curated CG: enumeratedMembers equals substrateMembers (full allowlist)', () => {
+      const plan = chooseFanOutTier({
+        enumeration: enumeration('allowlist', ['peerA', 'peerB']),
+        maxSubstrateMembers: 100,
+      });
+      expect(plan.substrateMembers).toEqual(['peerA', 'peerB']);
+      expect(plan.enumeratedMembers).toEqual(['peerA', 'peerB']);
+    });
+
+    it('public CG below threshold: enumeratedMembers equals substrateMembers', () => {
+      const plan = chooseFanOutTier({
+        enumeration: enumeration('topic-subscribers', ['peerA', 'peerB']),
+        maxSubstrateMembers: 100,
+      });
+      expect(plan.substrateMembers).toEqual(['peerA', 'peerB']);
+      expect(plan.enumeratedMembers).toEqual(['peerA', 'peerB']);
+    });
+
+    it('public CG above threshold (gossip-only): enumeratedMembers KEEPS all subscribers, substrateMembers is empty', () => {
+      const members = Array.from({ length: 150 }, (_, i) => `peer${i}`);
+      const plan = chooseFanOutTier({
+        enumeration: enumeration('topic-subscribers', members),
+        maxSubstrateMembers: 100,
+      });
+      expect(plan.useSubstrate).toBe(false);
+      expect(plan.substrateMembers).toEqual([]);
+      // Pre-D3 this was lost; SwmAckQuorum needs it to track
+      // delivery against the full subscriber set.
+      expect(plan.enumeratedMembers).toEqual(members);
+      expect(plan.enumeratedMembers.length).toBe(150);
+    });
+
+    it('source=none: both substrateMembers and enumeratedMembers are empty', () => {
+      const plan = chooseFanOutTier({
+        enumeration: enumeration('none', []),
+        maxSubstrateMembers: 100,
+      });
+      expect(plan.substrateMembers).toEqual([]);
+      expect(plan.enumeratedMembers).toEqual([]);
+    });
+  });
 });
 
 describe('executeSubstrateFanOut', () => {
@@ -189,7 +242,7 @@ describe('executeSubstrateFanOut', () => {
       bookkeeper: bk,
     });
 
-    expect(result).toEqual({ attempted: 0, delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 });
+    expect(result).toEqual({ attempted: 0, delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 });
     expect(calls).toEqual([]);
   });
 
@@ -290,7 +343,7 @@ describe('executeSubstrateFanOut', () => {
       bookkeeper: bk,
     });
 
-    expect(result).toEqual({ attempted: 4, delivered: 3, rejected: 0, queued: 0, inFlight: 0, failed: 1 });
+    expect(result).toEqual({ attempted: 4, delivered: 3, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 1 });
     expect(calls).toHaveLength(4);
   });
 

@@ -3074,7 +3074,7 @@ export class DKGAgent {
       },
       // rc.9 PR-E: route page fetches through `messenger.sendReliable`
       // so the sync RPC gets the same ReliableEnvelope wrapping +
-      // sender-side idempotency cache + receiver-side dedup as the
+      // outbox + (best-effort) sender-side idempotency cache as the
       // other migrated protocols (chat, access, query-remote,
       // storage-ack, verify-proposal, join-request). Pre-PR-E this
       // used `messenger.sendToPeer` — the raw pass-through — which
@@ -3087,33 +3087,35 @@ export class DKGAgent {
       // response is available yet — the page-fetch layer treats
       // that as a hard failure for this attempt; the surrounding
       // `withRetry` (in sync-transport.ts) handles the retry +
-      // backoff loop. The outbox's eventual delivery will still
-      // populate the receiver's dedup cache, so when withRetry
-      // re-issues with the same messageId the responder returns
-      // the cached response without re-running the handler.
+      // backoff loop.
       //
-      // rc.9 PR-E follow-up #1 (codex review on #569): `messageId` is
-      // the stable per-page key computed by `computeSyncPageMessageId`
-      // in page-fetch.ts BEFORE entering the withRetry loop. Passing
-      // it through to `sendReliable` is what makes dedup actually
-      // work — without it, `sendReliable` falls back to `randomUUID()`
-      // on every retry, producing a fresh outbox entry + fresh
-      // responder-side execution for what is logically the same
-      // request.
+      // `messageId` is freshly minted on every retry attempt by
+      // sync-transport.ts (codex review on #569 follow-ups #1-#8
+      // explored stable messageIds and found that every variant
+      // either defeated dedup OR enabled silent replay of stale
+      // responses past sync's app-layer freshness gate; fresh
+      // per-attempt is the only design that holds under all timing
+      // scenarios). The trade-off is no sender-side dedup of
+      // retry-storms — the responder may run a SPARQL page query
+      // up to `syncPageRetryAttempts` times if all attempts
+      // succeed at the receiver but the responses are lost in
+      // transit. Bounded waste, app-layer idempotent, acceptable.
       //
-      // RESPONSE_GONE handling intentionally lives ONE layer up,
-      // in page-fetch.ts. The sentinel fires on duplicate-receive
-      // for responses larger than the substrate's 256 KiB inline
-      // cache (common for sync N-Quads pages), and recovering from
-      // it requires building a fresh-`requestId` envelope so the
-      // responder's `authorizePrivateSyncRequest` doesn't reject
-      // the re-issue as a replay. Only page-fetch has access to
-      // `buildSyncRequest`, so the recovery lives there — not in
-      // this adapter. (Codex follow-up #6 on PR #569.)
+      // `maxAgeMs` bounds the substrate's outbox lifecycle for sync
+      // envelopes specifically. The default 24h outbox window would
+      // let an envelope hang around long past its 90s auth
+      // freshness TTL (`SYNC_AUTH_MAX_AGE_MS`); the outbox's
+      // eventual delivery of a stale envelope would be denied by
+      // the receiver and the denial cached under that messageId.
+      // (With fresh messageIds the cached denial doesn't replay
+      // onto subsequent attempts, but the wasted outbox tick work
+      // still happens.) `SYNC_AUTH_MAX_AGE_MS - 5_000` gives ~5s
+      // of margin for clock skew + network latency.
       send: async (peerId, protocolId, data, sendTimeoutMs, messageId) => {
         const result = await this.messenger.sendReliable(peerId, protocolId, data, {
           timeoutMs: sendTimeoutMs,
           messageId,
+          maxAgeMs: SYNC_AUTH_MAX_AGE_MS - 5_000,
         });
         if (!result.delivered) {
           throw new Error(

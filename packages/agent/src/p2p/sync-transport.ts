@@ -1,5 +1,39 @@
+import { randomUUID } from 'node:crypto';
 import { withRetry } from '@origintrail-official/dkg-core';
 
+/**
+ * Sync-page transport. Wraps `withRetry` around a per-attempt
+ * `requestFactory()` → `send()` chain, freshly minting both the
+ * envelope bytes AND the substrate messageId on every attempt.
+ *
+ * ## Why fresh-per-attempt (rc.9 PR-E codex follow-up #8)
+ *
+ * Sync's authenticated envelope carries `issuedAtMs` + `requestId`
+ * and the responder enforces a freshness TTL (`SYNC_AUTH_MAX_AGE_MS`
+ * = 90s) plus per-`requestId` replay protection. Combined with the
+ * substrate's 24h-default outbox-retry window, the only design that
+ * is correct under all timing scenarios is "fresh envelope + fresh
+ * messageId per attempt". The intermediate designs explored on this
+ * PR (stable messageId, build-once payload) all had at least one
+ * scenario where a stale envelope from one attempt got delivered
+ * late, cached under the stable messageId at the receiver, and then
+ * replayed onto a later attempt — silently corrupting the sync.
+ *
+ * Trade-off vs the original "stable messageId for dedup" codex
+ * suggestion: we lose sender-side dedup of network-retry storms
+ * within a single page-fetch call. In exchange the receiver may run
+ * the same SPARQL page query up to `retryAttempts` times if all
+ * attempts time out at the same receiver. Sync queries are
+ * app-layer idempotent so this is purely a wasted-work concern, not
+ * a correctness one — and it's bounded by `syncPageRetryAttempts`.
+ *
+ * To bound the related concern of "orphaned outbox entries from
+ * failed attempts hang around for 24h doing redundant work", the
+ * `dkg-agent` send adapter passes `maxAgeMs: SYNC_AUTH_MAX_AGE_MS -
+ * 5_000` to `messenger.sendReliable`, so the substrate drops sync
+ * outbox entries within ~85s of their first failure — comfortably
+ * before any envelope they hold could be denied as stale.
+ */
 interface SyncSendParams {
   remotePeerId: string;
   timeoutMs: number;
@@ -7,33 +41,16 @@ interface SyncSendParams {
   contextGraphId: string;
   offset: number;
   /**
-   * Pre-built envelope bytes for this page request.
-   *
-   * rc.9 PR-E follow-up #4 (codex review on #569): we now build the
-   * envelope ONCE per page, outside this retry loop, and pass the
-   * bytes in. Pre-rc.9 follow-up #4 the request was rebuilt on every
-   * attempt — for private CGs that meant a fresh
-   * `requestId`/`issuedAtMs` per attempt while
-   * {@link Messenger.register}'s dedup keys only on `(peer, protocol,
-   * messageId)` BEFORE the auth handler runs. If attempt 1 produced a
-   * cached denial (e.g. signature aged out at the receiver, transient
-   * authorization failure), subsequent attempts would replay that
-   * denial without re-validating the new envelope — even though the
-   * new envelope might be acceptable. Building the envelope once
-   * keeps "what the sender sent" identical to "what the receiver
-   * cached", so dedup is correct by construction. Sync auth has a
-   * 90s freshness TTL (`SYNC_AUTH_MAX_AGE_MS`); withRetry's max
-   * total budget is ~7s, so this is safely under the TTL.
+   * Builds the envelope bytes for ONE attempt. Called once per
+   * `withRetry` attempt so each attempt carries a fresh
+   * `issuedAtMs`/`requestId` (private CGs) — the auth gate at the
+   * responder enforces freshness, so re-sending the same envelope
+   * past `SYNC_AUTH_MAX_AGE_MS` would be denied.
    */
-  payload: Uint8Array;
+  requestFactory: () => Promise<Uint8Array>;
   /**
-   * rc.9 PR-E follow-up #1 (codex review on #569): `send` receives a
-   * stable `messageId` so that on substrate transports it can pass it
-   * through to `messenger.sendReliable` — keeping the SAME id across
-   * every {@link withRetry} attempt. Without that, each retry would
-   * mint a fresh randomUUID() and defeat both sender-side dedup and
-   * receiver-side response cache, leaving multiple queued outbox
-   * entries for the same logical page request.
+   * Per-attempt send hook. Receives a fresh `messageId` on every
+   * attempt — see jsdoc on `sendSyncRequest` for the rationale.
    */
   send: (
     peerId: string,
@@ -42,19 +59,17 @@ interface SyncSendParams {
     timeoutMs: number,
     messageId: string,
   ) => Promise<Uint8Array>;
-  /**
-   * Stable idempotency key for this logical page request. Same value
-   * is passed to {@link send} on every retry. Construction left to
-   * the caller (see {@link computeSyncPageMessageId} in page-fetch).
-   */
-  messageId: string;
   protocolId: string;
   onRetry: (attempt: number, delay: number, err: unknown) => void;
 }
 
 export async function sendSyncRequest(params: SyncSendParams): Promise<Uint8Array> {
   return withRetry(
-    async () => params.send(params.remotePeerId, params.protocolId, params.payload, params.timeoutMs, params.messageId),
+    async () => {
+      const requestBytes = await params.requestFactory();
+      const messageId = randomUUID();
+      return params.send(params.remotePeerId, params.protocolId, requestBytes, params.timeoutMs, messageId);
+    },
     {
       maxAttempts: params.retryAttempts,
       baseDelayMs: 1000,

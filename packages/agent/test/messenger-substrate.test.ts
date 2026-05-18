@@ -581,6 +581,33 @@ describe('Messenger DHT-walk-on-stall recovery (rc.9 PR-5)', () => {
     expect(resolvePeer).toHaveBeenCalledTimes(1);
   });
 
+  // Regression for the May 2026 multi-node soak. libp2p surfaces
+  // "All multiaddr dials failed" when every candidate address for
+  // a peer fails in a single dial — peerStore briefly stale, all
+  // cached relay addrs dead, etc. PR #567's classifier change made
+  // this recoverable so the outbox queues it, but Codex review
+  // caught that without ALSO adding the string to
+  // `DHT_WALK_TRIGGER_ERRORS`, the outbox would just back off and
+  // retry the SAME dead addresses forever. This test asserts the
+  // string is wired through to the DHT-walk path the same way as
+  // `no valid addresses` / `NO_RESERVATION`.
+  it('treats "All multiaddr dials failed" as recoverable and triggers the DHT walk', async () => {
+    const { messenger, resolvePeer, advance } = makeStallSubstrate({
+      errorMessage: 'All multiaddr dials failed',
+    });
+
+    for (let i = 0; i < 5; i++) {
+      const result = await messenger.sendReliable(PEER_A, PROTO, new Uint8Array([1]), {
+        messageId: FIXED_MSG_ID,
+      });
+      expect(result.queued).toBe(true);
+      advance(1000);
+    }
+
+    expect(resolvePeer).toHaveBeenCalledTimes(1);
+    expect(resolvePeer).toHaveBeenCalledWith(PEER_A, { signal: expect.any(AbortSignal) });
+  });
+
   it('rate-limits resolvePeer per peer (no second walk within DHT_WALK_RATE_LIMIT_MS)', async () => {
     const { messenger, resolvePeer, advance } = makeStallSubstrate();
 

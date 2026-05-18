@@ -30,6 +30,20 @@ export function isRecoverableSendError(err: unknown): boolean {
     msg.includes('epipe') ||
     msg.includes('aborted') ||
     msg.includes('no valid addresses') ||
+    // libp2p dial exhaustion — every known multiaddr for the peer
+    // failed in one attempt. Surfaced by `transportManager.dial` and
+    // by `dialProtocol` after iterating every relay/transport
+    // candidate. Classifying as recoverable lets the substrate
+    // outbox queue + retry via PR-5's DHT-walk-on-stall, which
+    // re-resolves the peer's addresses against the routing layer.
+    //
+    // Without this, an instantaneous routing-table miss (peer's
+    // addresses momentarily absent from local libp2p peerStore)
+    // becomes a terminal application-level loss. The May 2026
+    // multi-node soak surfaced 50/57 of all sender-side hard fails
+    // in this class — making this single string the highest-impact
+    // gap-closer toward the 99.9% delivery SLO.
+    msg.includes('all multiaddr dials failed') ||
     msg.includes('no_reservation') ||
     msg.includes('no reservation') ||
     msg.includes('protocol selection failed') ||

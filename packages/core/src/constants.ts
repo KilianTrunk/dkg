@@ -61,6 +61,20 @@ export const PROTOCOL_SWM_SENDER_KEY = '/dkg/10.0.1/swm-sender-key';
 // or below `DKG_SWM_SUBSTRATE_MAX_MEMBERS`. See RFC-003 §6 for the
 // full transport policy.
 export const PROTOCOL_SWM_UPDATE = '/dkg/10.0.1/swm-update';
+// rc.9 PR-D (SWM reliable fan-out plan, Step 1b): NEW protocol — no
+// rc.8 predecessor. Per-recipient acknowledgement that the receiver
+// successfully applied a SWM share via the GOSSIP path. Receivers
+// emit this on every gossip-applied share to the share's author peer
+// (extracted from the gossip envelope signature); senders track ack
+// arrivals against the enumerated `expectedMembers` set in
+// `SwmAckQuorum` to compute per-share delivery quorum. Substrate-
+// delivered shares (PROTOCOL_SWM_UPDATE) ACK via the substrate
+// response itself and DO NOT emit a separate SwmShareAck to avoid
+// double counting. The watchdog runs substrate top-up over the
+// long-tail non-acked peers (`expectedMembers \ acked`) and gives
+// up at the deadline, falling back to runSyncOnConnect for offline
+// peers. See RFC-003 §4.2 + §5.2 for the full ack-quorum policy.
+export const PROTOCOL_SWM_SHARE_ACK = '/dkg/10.0.1/swm-share-ack';
 
 // rc.9 PR-10: bumped from /dkg/10.0.0/join-request to opt into the
 // Universal Messenger substrate. The in-memory JoinApprovalRetryQueue

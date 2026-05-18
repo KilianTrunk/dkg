@@ -92,6 +92,12 @@ export {
 } from './storage-ack.js';
 
 export {
+  type SwmShareAckMsg,
+  encodeSwmShareAck,
+  decodeSwmShareAck,
+} from './swm-share-ack.js';
+
+export {
   type GossipEnvelopeMsg,
   GOSSIP_ENVELOPE_VERSION,
   GOSSIP_TYPE_WORKSPACE_PUBLISH,

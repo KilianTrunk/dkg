@@ -192,8 +192,8 @@ export class SharedMemoryHandler {
     this.workspaceSenderKeyDecryptor = options?.workspaceSenderKeyDecryptor;
     this.now = options?.now ?? (() => Date.now());
     this.publicSnapshotStore = options?.publicSnapshotStore;
-    // PR #570 Codex follow-up (final, post-merge): validate / clamp
-    // the bounded-memory tuning knobs. Pre-fix, the four `seenOps*` /
+    // PR #570 Codex follow-up (final, post-merge): validate the
+    // bounded-memory tuning knobs. Pre-fix, the four `seenOps*` /
     // `redundantAppliesMaxCgs` options were stored as-is, so a
     // misconfigured `seenOpsEvictBatch: 0` would make Phase-2
     // cap-based eviction a no-op (`evicted >= 0` is immediately
@@ -205,12 +205,13 @@ export class SharedMemoryHandler {
     // makes the "is expired?" comparison invert and evict every
     // entry on every insert) or silently behave nonsensically.
     //
-    // Each knob is now sanitized via `sanitizePositiveInt`:
-    //   - undefined → falls back to the documented default.
-    //   - non-finite (NaN / Infinity) → falls back to default + WARN.
-    //   - < 1 / non-integer → clamped to `Math.max(1, Math.floor(v))`
-    //     and WARN-logged so operators can see their config was
-    //     silently corrected (vs. silently broken).
+    // Each knob is now validated via `sanitizePositiveInt`:
+    //   - undefined → documented default.
+    //   - non-finite (NaN / ±Infinity) → default + WARN.
+    //   - < 1 (zero / negative) → default + WARN. (PR #573 R1: a
+    //     clamp-to-1 would have silently disabled the metric for
+    //     time-based knobs, e.g. seenOpsTtlMs=1ms.)
+    //   - fractional but positive → floored + WARN.
     const sysCtx = createOperationContext('system');
     this.seenOpsTtlMs = this.sanitizePositiveInt(
       options?.seenOpsTtlMs,
@@ -239,22 +240,37 @@ export class SharedMemoryHandler {
   }
 
   /**
-   * Validate / clamp a configurable tuning knob to a positive integer.
+   * Validate a configurable tuning knob and return a safe positive
+   * integer. Fractional but otherwise-valid values are floored (no
+   * behavioral change vs. operator intent), but anything that would
+   * actually break the bounded-memory invariants — `undefined`,
+   * `NaN`, `±Infinity`, zero, or negative — falls back to the
+   * documented default.
    *
-   * @returns the default when `value` is `undefined` or non-finite
-   *   (NaN / Infinity, treated as a programmer / operator error and
-   *   warned about); otherwise `Math.max(1, Math.floor(value))` with
-   *   a WARN log if the sanitization changed the supplied value.
+   * **Why fall back rather than clamp to 1** (Codex PR #573 R1):
+   * the previous version clamped every `< 1` value to `1`, which
+   * is safe for caps/batches but actively misleading for
+   * `seenOpsTtlMs`: a misconfigured negative TTL silently became a
+   * 1ms window — enough to keep the structure bounded, but small
+   * enough that redundant-apply detection was effectively disabled
+   * with only a WARN to surface the regression. Consistent
+   * "fall back to default" gives every knob the same predictable
+   * semantics (a healthy production value rather than a barely-
+   * functional one) and avoids special-casing TTL.
+   *
+   * @returns the validated/floored value if `value` is a positive
+   *   finite number, otherwise `defaultValue`. Emits a WARN log
+   *   when sanitization changes the supplied value so misconfigured
+   *   deployments stay visible in operator logs.
    *
    * Rationale: all four knobs (`seenOpsTtlMs`, `seenOpsMaxSize`,
    * `seenOpsEvictBatch`, `redundantAppliesMaxCgs`) underpin the
    * bounded-memory guarantees of `seenShareOps` /
-   * `redundantApplyCounts`. Accepting 0 / negative / NaN /
-   * non-integer values would silently break those guarantees — most
-   * dangerously `seenOpsEvictBatch: 0`, where the Phase-2 cap
-   * eviction loop short-circuits on `evicted >= 0` and the map can
-   * grow without bound. Clamping + WARN keeps the handler safe
-   * while making misconfiguration visible in operator logs.
+   * `redundantApplyCounts`. The most dangerous of these was
+   * `seenOpsEvictBatch: 0`, where the Phase-2 cap eviction loop
+   * short-circuits on `evicted >= 0` and the map can grow without
+   * bound. WARN + default keeps the handler safe while making
+   * misconfiguration visible.
    */
   private sanitizePositiveInt(
     value: number | undefined,
@@ -270,14 +286,21 @@ export class SharedMemoryHandler {
       );
       return defaultValue;
     }
-    const clamped = Math.max(1, Math.floor(value));
-    if (clamped !== value) {
+    const floored = Math.floor(value);
+    if (floored < 1) {
       this.log.warn(
         ctx,
-        `SharedMemoryHandler option ${name}=${value} is not a positive integer — clamped to ${clamped} (would have defeated bounded-memory guarantees)`,
+        `SharedMemoryHandler option ${name}=${value} is not a positive integer — falling back to default ${defaultValue} (a clamp to 1 would have defeated the metric, e.g. a 1ms TTL effectively disables redundant-apply detection)`,
+      );
+      return defaultValue;
+    }
+    if (floored !== value) {
+      this.log.warn(
+        ctx,
+        `SharedMemoryHandler option ${name}=${value} is fractional — floored to ${floored}`,
       );
     }
-    return clamped;
+    return floored;
   }
 
   /**

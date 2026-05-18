@@ -536,21 +536,26 @@ jobs:
           VER="${TAG_NAME#v}"
           echo "Publishing with dist-tag: ${NPM_TAG}"
           for tarball in "${tarballs[@]}"; do
-            echo "::group::npm publish ${tarball}"
-            npm publish "${tarball}" \
+            PKG_NAME=$(tar -xf "${tarball}" --to-stdout package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf-8')).name")
+            echo "::group::${PKG_NAME}@${VER}"
+
+            # Publish (tolerate "already exists" for idempotent reruns)
+            if ! npm publish "${tarball}" \
               --provenance \
               --access public \
               --tag "${NPM_TAG}" \
-              --ignore-scripts
+              --ignore-scripts 2>&1 | tee /dev/stderr | grep -q "EPUBLISHCONFLICT\|already exists\|previously published"; then
+              echo "Published ${PKG_NAME}@${VER} with --tag ${NPM_TAG}"
+            else
+              echo "⚠ ${PKG_NAME}@${VER} already published — setting dist-tag ${NPM_TAG}"
+              npm dist-tag add "${PKG_NAME}@${VER}" "${NPM_TAG}"
+            fi
+
+            # Apply extra dist-tags (e.g. 'rc' alongside 'latest')
+            for extra in ${EXTRA_TAGS}; do
+              echo "Adding dist-tag: ${PKG_NAME}@${VER} → ${extra}"
+              npm dist-tag add "${PKG_NAME}@${VER}" "${extra}"
+            done
+
             echo "::endgroup::"
           done
-          # Apply additional dist-tags (e.g. 'rc' alongside 'latest')
-          if [ -n "${EXTRA_TAGS}" ]; then
-            for tarball in "${tarballs[@]}"; do
-              PKG_NAME=$(tar -xf "${tarball}" --to-stdout package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf-8')).name")
-              for extra in ${EXTRA_TAGS}; do
-                echo "Adding dist-tag: ${PKG_NAME}@${VER} → ${extra}"
-                npm dist-tag add "${PKG_NAME}@${VER}" "${extra}"
-              done
-            done
-          fi

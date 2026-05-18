@@ -1937,19 +1937,29 @@ export class DKGAgent {
     // peer): the second arrival just bumps `swm.redundantApplies`
     // for that cgId. No separate dedup machinery needed here.
     //
-    // The handler returns an empty Uint8Array because SWM apply
-    // is fire-and-forget (no application response). The
-    // substrate's send-side idempotency cache will return that
-    // empty response verbatim for any duplicate within its
-    // window, which is harmless. PR-D will replace the empty
-    // response with a structured ACK message (SwmShareAck) so the
-    // sender's quorum tracker can upgrade queued → delivered
-    // after receiver-side application succeeds.
-    this.messenger.register(PROTOCOL_SWM_UPDATE, async (data, peerId) => {
-      const wh = this.getOrCreateSharedMemoryHandler();
-      await wh.handle(data, peerId);
-      return new Uint8Array();
-    });
+    // PR-C codex R3 (receiver ACK semantics): the substrate
+    // response distinguishes three outcomes returned by
+    // `handle()`:
+    //   - `applied: true`         → empty Uint8Array ACK (success).
+    //   - `applied: false, retryable: false` → empty Uint8Array
+    //       (permanent rejection; nothing more for the sender to
+    //       do — bad signature, peer not in allowlist, CAS
+    //       conditions don't hold, etc. The sender drops the
+    //       share, matching pre-PR-C gossip semantics where the
+    //       same rejection would silently fall on the floor).
+    //   - `applied: false, retryable: true`  → THROW from the
+    //       handler so `messenger.sendReliable` reports the send
+    //       as failed and the substrate outbox keeps the share
+    //       queued for retry. Dominant production case: sender
+    //       key package for the current epoch hasn't arrived
+    //       yet; once it does, the same wire bytes apply on the
+    //       next retry.
+    // PR-D will replace the empty response with a structured ACK
+    // message (SwmShareAck) carrying the outcome explicitly, so
+    // the sender's quorum tracker can upgrade queued → delivered
+    // after receiver-side application succeeds (rather than the
+    // current proxy through substrate-level wire delivery).
+    this.messenger.register(PROTOCOL_SWM_UPDATE, async (data, peerId) => this.handleSwmUpdate(data, peerId));
 
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
@@ -6021,6 +6031,42 @@ export class DKGAgent {
     const signature = await new ethers.Wallet(input.senderPrivateKey)
       .signMessage(computeSwmSenderKeyPackageAAD(pkg));
     return { ...pkg, signature: ethers.getBytes(signature) };
+  }
+
+  /**
+   * `PROTOCOL_SWM_UPDATE` substrate receiver. Routes substrate-
+   * delivered SWM share bytes through `SharedMemoryHandler.handle()`
+   * (the same in-process apply path the gossip subscription
+   * drives) and maps the outcome to a substrate response:
+   *
+   *   - `applied: true` or permanent rejection → empty Uint8Array
+   *     (ACK; sender drops the share, matches gossip semantics
+   *     for the rejected case).
+   *   - retryable rejection → THROW so `messenger.sendReliable`
+   *     reports a failed send and the substrate outbox keeps the
+   *     share queued for retry. Dominant case: sender key package
+   *     for the current epoch hasn't arrived yet (workspaceSender
+   *     KeyDecryptor missing in the local handler, or the
+   *     decryptor itself rejects). Once the sender key arrives
+   *     the same wire bytes apply cleanly on the next attempt.
+   *
+   * Extracted into a named method so the receiver contract can
+   * be unit-tested in isolation without spinning up a real
+   * Messenger registration.
+   */
+  private async handleSwmUpdate(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
+    const wh = this.getOrCreateSharedMemoryHandler();
+    const outcome = await wh.handle(data, fromPeerId);
+    if (!outcome.applied && outcome.retryable) {
+      // Throwing here is what tells the substrate outbox to keep
+      // the share queued. `handle()` already logged the specific
+      // rejection at WARN/ERROR; the throw message just surfaces
+      // it through the substrate's failure path so /api/slo's
+      // `protocols['/dkg/10.0.1/swm-update']` queued counts make
+      // sense at a glance.
+      throw new Error(`SWM apply transient rejection from ${fromPeerId}: ${outcome.reason}`);
+    }
+    return new Uint8Array();
   }
 
   private async handleSwmSenderKeyPackage(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {

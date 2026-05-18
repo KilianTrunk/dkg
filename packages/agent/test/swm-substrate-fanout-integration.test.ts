@@ -391,4 +391,84 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
       'cg-iso-2': 1,
     });
   });
+
+  /**
+   * PR-C codex R3 regression: the substrate receiver
+   * (`handleSwmUpdate`) MUST map `SharedMemoryHandler.handle()`
+   * outcomes to substrate responses so the sender's
+   * `sendReliable` reports realistic delivery semantics:
+   *
+   *   - `applied: true`                          → ACK (empty
+   *      Uint8Array), sender records delivered.
+   *   - `applied: false, retryable: false`       → ACK (empty
+   *      Uint8Array), sender drops the share. Matches the
+   *      pre-PR-C gossip behaviour for permanent rejections
+   *      (bad signature, peer not in allowlist, CAS-not-met).
+   *   - `applied: false, retryable: true`        → THROW, so
+   *      sendReliable reports failure and the substrate
+   *      outbox keeps the share queued for retry. Dominant
+   *      production case: sender key package for the epoch
+   *      hasn't arrived yet.
+   *
+   * We exercise the private `handleSwmUpdate` method directly
+   * by stubbing `getOrCreateSharedMemoryHandler` to return a
+   * handler whose `handle()` we control per test case. This
+   * pins the response-mapping contract without spinning up a
+   * real Messenger registration.
+   */
+  describe('codex R3: substrate receiver maps handle() outcomes to substrate responses', () => {
+    function installStubHandler(
+      agent: DKGAgent,
+      handle: (data: Uint8Array, peerId: string) => Promise<
+        | { applied: true }
+        | { applied: false; reason: string; retryable: boolean }
+      >,
+    ): void {
+      const stubHandler = { handle };
+      (agent as unknown as {
+        getOrCreateSharedMemoryHandler(): { handle: typeof handle };
+      }).getOrCreateSharedMemoryHandler = () => stubHandler;
+    }
+
+    function invokeReceiver(agent: DKGAgent, data: Uint8Array, peerId: string): Promise<Uint8Array> {
+      return (agent as unknown as {
+        handleSwmUpdate(data: Uint8Array, peerId: string): Promise<Uint8Array>;
+      }).handleSwmUpdate(data, peerId);
+    }
+
+    it('applied: true → empty Uint8Array ACK', async () => {
+      const agent = await createAgent('R3Receiver-Applied');
+      installStubHandler(agent, async () => ({ applied: true }));
+
+      const response = await invokeReceiver(agent, new Uint8Array([1, 2, 3]), '12D3KooWPeerR3a');
+      expect(response).toBeInstanceOf(Uint8Array);
+      expect(response.byteLength).toBe(0);
+    });
+
+    it('permanent rejection (retryable: false) → empty Uint8Array ACK (drop semantics, matches gossip)', async () => {
+      const agent = await createAgent('R3Receiver-Permanent');
+      installStubHandler(agent, async () => ({
+        applied: false,
+        reason: 'peer "12D3KooWPeerR3b" not in allowlist',
+        retryable: false,
+      }));
+
+      const response = await invokeReceiver(agent, new Uint8Array([4, 5, 6]), '12D3KooWPeerR3b');
+      expect(response).toBeInstanceOf(Uint8Array);
+      expect(response.byteLength).toBe(0);
+    });
+
+    it('retryable rejection (retryable: true) → THROWS so substrate outbox keeps the share queued', async () => {
+      const agent = await createAgent('R3Receiver-Retryable');
+      installStubHandler(agent, async () => ({
+        applied: false,
+        reason: 'simulated decryptor throw: sender key package for epoch 42 not yet arrived',
+        retryable: true,
+      }));
+
+      await expect(
+        invokeReceiver(agent, new Uint8Array([7, 8, 9]), '12D3KooWPeerR3c'),
+      ).rejects.toThrow(/transient rejection from 12D3KooWPeerR3c.*epoch 42/);
+    });
+  });
 });

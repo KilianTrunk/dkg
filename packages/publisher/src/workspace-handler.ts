@@ -46,6 +46,44 @@ export type WorkspaceSenderKeyDecryptor = (
 ) => Promise<Uint8Array>;
 
 /**
+ * Outcome of one `SharedMemoryHandler.handle()` invocation. Added
+ * in rc.9 PR-C (codex R3) so the new substrate fan-out receiver
+ * (`PROTOCOL_SWM_UPDATE`) can distinguish "share applied
+ * locally" from "receiver dropped the share for a stated reason"
+ * — without it, the substrate ACKs every delivery as successful
+ * even when the receiver silently `return;`-rejected (sender key
+ * package hasn't arrived yet, peer not in allowlist, etc.) and
+ * the sender's `sendReliable` records a `delivered` count that
+ * misrepresents end-to-end success.
+ *
+ * The `retryable` flag tells the substrate caller whether the
+ * rejection is something a future delivery attempt could
+ * resolve:
+ *
+ *   - `retryable: false` — permanent rejection. Bad signature,
+ *     peer not in allowlist, CAS conditions don't hold, payload
+ *     malformed. A retry with the SAME payload won't apply
+ *     either; the sender should NOT queue the share for retry
+ *     (drop it). The pre-PR-C gossip behaviour was identical:
+ *     drop silently, rely on sync-on-reconnect as the safety
+ *     net.
+ *   - `retryable: true` — transient rejection. Most commonly
+ *     this is an UNEXPECTED throw caught by the outer try/catch
+ *     in `handle()` (sender key state for the current epoch
+ *     hasn't arrived yet, decryptor temporarily unavailable,
+ *     triple-store hiccup). A retry once the local state has
+ *     converged would likely succeed; the substrate caller
+ *     SHOULD keep the share queued so it gets re-attempted.
+ *
+ * Gossip callers ignore the outcome — gossip is best-effort and
+ * its only "retry" is sync-on-reconnect, which doesn't consult
+ * this signal. The new substrate fan-out receiver consumes it.
+ */
+export type SharedMemoryApplyOutcome =
+  | { applied: true }
+  | { applied: false; reason: string; retryable: boolean };
+
+/**
  * Unambiguous composite key for `seenShareOps`.
  *
  * **Why not `${cgId}|${shareOperationId}` (rc.9 PR-A codex follow-up
@@ -437,10 +475,34 @@ export class SharedMemoryHandler {
   }
 
   /**
-   * Handler for GossipSub shared memory topic: (data, fromPeerId) => void.
-   * Validates, stores to SWM + SWM meta, updates sharedMemoryOwnedEntities.
+   * Handler for SWM share delivery. Originally introduced as the
+   * GossipSub shared-memory topic callback; as of rc.9 PR-C it
+   * ALSO services the substrate fan-out path (`PROTOCOL_SWM_UPDATE`).
+   *
+   * Validates, stores to SWM + SWM meta, updates
+   * sharedMemoryOwnedEntities, returns a {@link SharedMemoryApplyOutcome}
+   * the caller can use to decide whether to ACK / retry / drop.
+   *
+   * Codex review on PR #576 (R3) flagged that the previous
+   * `Promise<void>` signature made every substrate delivery look
+   * `delivered: true` from the sender's POV, even when this
+   * function silently `return;`-rejected the share (sender key
+   * package hasn't arrived yet, peer not in allowlist, etc.).
+   * The structured return restores end-to-end semantics: the
+   * caller learns whether the apply succeeded, and if not,
+   * whether a retry with the same payload could plausibly help
+   * (`retryable: true` for thrown errors like missing sender key
+   * state; `retryable: false` for permanent rejections like bad
+   * signatures).
+   *
+   * Existing gossip callers (gossip.onMessage(swmTopic, …))
+   * remain unchanged in BEHAVIOUR — they discard the return,
+   * matching pre-PR-C "fire-and-forget, sync-on-reconnect is the
+   * safety net" semantics. The new PR-C substrate receiver
+   * inspects the outcome and throws on `retryable: true` so the
+   * substrate's outbox keeps the share queued for retry.
    */
-  async handle(data: Uint8Array, fromPeerId: string, onPhase?: PhaseCallback): Promise<void> {
+  async handle(data: Uint8Array, fromPeerId: string, onPhase?: PhaseCallback): Promise<SharedMemoryApplyOutcome> {
     let ctx = createOperationContext('share');
     try {
       onPhase?.('decode', 'start');
@@ -449,8 +511,9 @@ export class SharedMemoryHandler {
       let request = decoded.request;
       let contextGraphId = request?.contextGraphId ?? decoded.senderKeyMessage?.contextGraphId ?? envelope?.contextGraphId;
       if (!contextGraphId) {
-        this.log.warn(ctx, 'SWM write rejected: missing context graph id');
-        return;
+        const reason = 'missing context graph id';
+        this.log.warn(ctx, `SWM write rejected: ${reason}`);
+        return { applied: false, reason, retryable: false };
       }
 
       const agentGateAddresses = await this.getContextGraphAgentGateAddresses(contextGraphId);
@@ -458,69 +521,96 @@ export class SharedMemoryHandler {
       const hasPrivateAccessPolicy = await this.contextGraphHasPrivateAccessPolicy(contextGraphId);
 
       if (hasPrivateAccessPolicy && agentGateAddresses === null && allowedPeers === null) {
-        this.log.warn(ctx, `SWM write rejected: private context graph "${contextGraphId}" has no gossip allowlist`);
-        return;
+        const reason = `private context graph "${contextGraphId}" has no gossip allowlist`;
+        this.log.warn(ctx, `SWM write rejected: ${reason}`);
+        return { applied: false, reason, retryable: false };
       }
 
       if (hasPrivateAccessPolicy && agentGateAddresses === null) {
-        this.log.warn(ctx, `SWM write rejected: private context graph "${contextGraphId}" requires DKG agent encryption recipients`);
-        return;
+        const reason = `private context graph "${contextGraphId}" requires DKG agent encryption recipients`;
+        this.log.warn(ctx, `SWM write rejected: ${reason}`);
+        return { applied: false, reason, retryable: false };
       }
 
       if (agentGateAddresses !== null) {
         const verified = await this.verifyAgentEnvelope(envelope, signedPayload, contextGraphId, agentGateAddresses, ctx);
-        if (!verified) return;
+        if (!verified) {
+          // verifyAgentEnvelope already logged the specific reason
+          // at WARN. Treated as permanent: a bad signature won't
+          // become good on retry.
+          return { applied: false, reason: 'agent envelope verification failed', retryable: false };
+        }
       }
 
       const requiresEncryptedPayload = hasPrivateAccessPolicy || agentGateAddresses !== null;
       if (requiresEncryptedPayload && !decoded.encryptedPayload && !decoded.senderKeyMessage) {
-        this.log.warn(ctx, `SWM write rejected: Sender Key encrypted workspace payload required for private or agent-gated context graph "${contextGraphId}"`);
-        return;
+        const reason = `Sender Key encrypted workspace payload required for private or agent-gated context graph "${contextGraphId}"`;
+        this.log.warn(ctx, `SWM write rejected: ${reason}`);
+        return { applied: false, reason, retryable: false };
       }
 
       if (decoded.senderKeyMessage) {
         if (!requiresEncryptedPayload) {
-          this.log.warn(ctx, `SWM write rejected: Sender Key payload is only supported for private or agent-gated context graph "${contextGraphId}"`);
-          return;
+          const reason = `Sender Key payload is only supported for private or agent-gated context graph "${contextGraphId}"`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
         }
         if (!this.workspaceSenderKeyDecryptor) {
-          this.log.warn(ctx, `SWM write rejected: no local Sender Key state decryptor for context graph "${contextGraphId}"`);
-          return;
+          const reason = `no local Sender Key state decryptor for context graph "${contextGraphId}"`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          // Receiver-side init order: this branch fires when the
+          // SharedMemoryHandler exists but workspaceSenderKeyDecryptor
+          // was not wired by the agent. Marking retryable so the
+          // sender's substrate outbox keeps the share queued
+          // across a daemon restart that re-wires the decryptor.
+          return { applied: false, reason, retryable: true };
         }
         if (decoded.senderKeyMessage.contextGraphId !== contextGraphId) {
-          this.log.warn(ctx, `SWM write rejected: Sender Key contextGraphId "${decoded.senderKeyMessage.contextGraphId}" does not match envelope "${contextGraphId}"`);
-          return;
+          const reason = `Sender Key contextGraphId "${decoded.senderKeyMessage.contextGraphId}" does not match envelope "${contextGraphId}"`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
         }
+        // workspaceSenderKeyDecryptor THROWS when the sender key
+        // package hasn't arrived yet (or epoch state is missing).
+        // That throw falls through to the outer catch below and
+        // is classified as `retryable: true` — once the sender
+        // key package arrives, the same wire bytes apply cleanly.
         const plaintext = await this.workspaceSenderKeyDecryptor(decoded.senderKeyMessage, contextGraphId, ctx);
         request = decodeWorkspacePublishRequest(plaintext);
         if (request.contextGraphId !== contextGraphId) {
-          this.log.warn(ctx, `SWM write rejected: Sender Key decrypted payload contextGraphId "${request.contextGraphId}" does not match envelope "${contextGraphId}"`);
-          return;
+          const reason = `Sender Key decrypted payload contextGraphId "${request.contextGraphId}" does not match envelope "${contextGraphId}"`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
         }
       } else if (decoded.encryptedPayload) {
         if (!requiresEncryptedPayload) {
-          this.log.warn(ctx, `SWM write rejected: encrypted workspace payload is only supported for private or agent-gated context graph "${contextGraphId}"`);
-          return;
+          const reason = `encrypted workspace payload is only supported for private or agent-gated context graph "${contextGraphId}"`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
         }
         if (this.workspaceSenderKeyDecryptor) {
-          this.log.warn(ctx, `SWM write rejected: legacy encrypted workspace payload is not accepted for Sender Key protected context graph "${contextGraphId}"`);
-          return;
+          const reason = `legacy encrypted workspace payload is not accepted for Sender Key protected context graph "${contextGraphId}"`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
         }
         if (decoded.encryptedPayload.contextGraphId !== contextGraphId) {
-          this.log.warn(ctx, `SWM write rejected: encrypted contextGraphId "${decoded.encryptedPayload.contextGraphId}" does not match envelope "${contextGraphId}"`);
-          return;
+          const reason = `encrypted contextGraphId "${decoded.encryptedPayload.contextGraphId}" does not match envelope "${contextGraphId}"`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
         }
         const plaintext = await this.decryptEncryptedWorkspacePayload(decoded.encryptedPayload, contextGraphId);
         request = decodeWorkspacePublishRequest(plaintext);
         if (request.contextGraphId !== contextGraphId) {
-          this.log.warn(ctx, `SWM write rejected: decrypted payload contextGraphId "${request.contextGraphId}" does not match envelope "${contextGraphId}"`);
-          return;
+          const reason = `decrypted payload contextGraphId "${request.contextGraphId}" does not match envelope "${contextGraphId}"`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
         }
       }
 
       if (!request) {
-        this.log.warn(ctx, `SWM write rejected: no workspace publish request for context graph "${contextGraphId}"`);
-        return;
+        const reason = `no workspace publish request for context graph "${contextGraphId}"`;
+        this.log.warn(ctx, `SWM write rejected: ${reason}`);
+        return { applied: false, reason, retryable: false };
       }
 
       if (request.operationId) {
@@ -532,13 +622,15 @@ export class SharedMemoryHandler {
       this.log.info(ctx, `SWM write from ${fromPeerId} for context graph ${contextGraphId}${sgLabel} op=${shareOperationId}`);
 
       if (!shareOperationId) {
-        this.log.warn(ctx, `SWM write rejected: missing shareOperationId for context graph "${contextGraphId}"`);
-        return;
+        const reason = `missing shareOperationId for context graph "${contextGraphId}"`;
+        this.log.warn(ctx, `SWM write rejected: ${reason}`);
+        return { applied: false, reason, retryable: false };
       }
 
       if (publisherPeerId !== fromPeerId) {
-        this.log.warn(ctx, `SWM write rejected: payload publisherPeerId "${publisherPeerId}" does not match sender "${fromPeerId}"`);
-        return;
+        const reason = `payload publisherPeerId "${publisherPeerId}" does not match sender "${fromPeerId}"`;
+        this.log.warn(ctx, `SWM write rejected: ${reason}`);
+        return { applied: false, reason, retryable: false };
       }
 
       // PR-A R1 NOTE: the redundant-apply counter is bumped AFTER the
@@ -550,15 +642,17 @@ export class SharedMemoryHandler {
 
       // Enforce peer allowlist for curated CGs
       if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
-        this.log.warn(ctx, `SWM write rejected: peer "${fromPeerId}" not in allowlist for context graph "${contextGraphId}"`);
-        return;
+        const reason = `peer "${fromPeerId}" not in allowlist for context graph "${contextGraphId}"`;
+        this.log.warn(ctx, `SWM write rejected: ${reason}`);
+        return { applied: false, reason, retryable: false };
       }
 
       if (subGraphName) {
         const v = validateSubGraphName(subGraphName);
         if (!v.valid) {
-          this.log.warn(ctx, `SWM write rejected: invalid subGraphName "${subGraphName}": ${v.reason}`);
-          return;
+          const reason = `invalid subGraphName "${subGraphName}": ${v.reason}`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
         }
       }
 
@@ -731,9 +825,30 @@ export class SharedMemoryHandler {
           source: 'gossip',
           counts: { triples: quads.length },
         });
+        return { applied: true };
       }
+      // `applied === false` from the withWriteLocks closure: either
+      // validation rejected the payload or CAS pre-conditions
+      // didn't hold against current SWM state. Both are permanent
+      // for this exact wire bytes: retrying the SAME payload would
+      // produce the same outcome (validation is deterministic; CAS
+      // checks current state, which the sender can re-evaluate by
+      // issuing a fresh share with updated conditions).
+      return { applied: false, reason: 'validation or CAS conditions rejected by withWriteLocks closure', retryable: false };
     } catch (err) {
-      this.log.error(ctx, `SWM handle failed: ${err instanceof Error ? err.message : String(err)}`);
+      // PR-C codex R3: classify the catch path as `retryable: true`.
+      // The dominant production case here is `workspaceSenderKeyDecryptor`
+      // rejecting because the corresponding sender key package
+      // hasn't arrived for the epoch yet — once it does, the same
+      // wire bytes apply cleanly on the next attempt. Generic
+      // triple-store hiccups (`store.insert` worker timeouts,
+      // transient backend errors) similarly recover on retry.
+      // Genuinely permanent throws (malformed protobuf inside the
+      // try, etc.) will eventually exhaust the substrate outbox's
+      // retry budget and get dropped without operator action.
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.error(ctx, `SWM handle failed: ${reason}`);
+      return { applied: false, reason, retryable: true };
     }
   }
 

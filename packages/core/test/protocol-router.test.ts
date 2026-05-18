@@ -22,6 +22,20 @@ describe('ProtocolRouter', () => {
       expect(isRecoverableSendError(new Error('no reservation for relay'))).toBe(true);
     });
 
+    // Regression for the May 2026 multi-node soak: libp2p surfaces
+    // "All multiaddr dials failed" when every candidate address for
+    // the peer fails in a single dial attempt (instantaneous
+    // routing-table miss). Pre-fix this was terminal; post-fix it
+    // queues so the substrate outbox + PR-5 DHT-walk-on-stall
+    // re-resolves the peer and retries.
+    it('returns true for libp2p multiaddr dial exhaustion (May 2026 soak)', () => {
+      expect(isRecoverableSendError(new Error('All multiaddr dials failed'))).toBe(true);
+      // Matches case-insensitively + within wrapping context (libp2p
+      // sometimes prefixes with the protocol id).
+      expect(isRecoverableSendError(new Error('dialProtocol(/dkg/10.0.1/message): All multiaddr dials failed'))).toBe(true);
+      expect(isRecoverableSendError(new Error('all multiaddr dials failed'))).toBe(true);
+    });
+
     it('returns false for non-recoverable errors', () => {
       expect(isRecoverableSendError(new Error('Read limit exceeded'))).toBe(false);
       expect(isRecoverableSendError(new Error('handler error'))).toBe(false);

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { OperationContext } from '@origintrail-official/dkg-core';
 import type { Quad } from '@origintrail-official/dkg-storage';
 import { sendSyncRequest } from '../../p2p/sync-transport.js';
@@ -66,35 +67,56 @@ interface FetchSyncPagesParams {
 }
 
 /**
- * Stable, deterministic idempotency key for a single sync page request.
+ * Stable, per-retry-chain idempotency key for a single sync page request.
  *
  * Composed from the inputs that uniquely identify "which page from
  * which responder for which slice of state" — `(remotePeerId, cgId,
- * includeSharedMemory, phase, offset, snapshotRef)`. This is unique
- * per logical page from this requester's point of view, which is
- * what the messenger needs to dedup sender-side retries and to serve
- * the receiver's response cache on the second arrival.
+ * includeSharedMemory, phase, offset, snapshotRef)` — PLUS a
+ * per-{@link fetchSyncPages}-call `runNonce`. The static parts let
+ * the key be reconstructed externally for assertions; the nonce
+ * scopes the key to a single fetch run.
  *
- * `includeSharedMemory` MUST be in the key — `runDurableSync` and
- * `runSharedMemorySync` both call `fetchSyncPages` with the same
- * phase (`'data'` / `'meta'`) for overlapping offsets, distinguished
- * only by this flag. The checkpoint key (`getSyncCheckpointKey`)
- * already encodes it for exactly the same reason. If the messageId
- * collapsed durable and SWM into the same key, `Messenger.sendReliable`
- * (dedup on `(peer, protocol, messageId)`) would happily serve a later
- * SWM fetch from a cached durable response — silent cross-scope
- * cache poisoning. Caught by codex review on #569.
+ * ## Why the nonce
  *
- * Note: requester peerId is intentionally NOT in the key — the
- * messenger already namespaces idempotency by `(senderPeerId,
- * protocolId, messageId)` internally, so "our identity" is implicit.
- * Including it would only matter if a single messenger instance ran
- * with multiple identities, which we never do.
+ * rc.9 PR-E follow-up #4 (codex review on #569): without the nonce,
+ * the key was deterministic forever for the same identity tuple.
+ * `Messenger.sendReliable` caches `(peer, protocol, messageId)`
+ * responses, and a completed sync deletes its checkpoints, so the
+ * next full sync of the same graph would reuse this id and get the
+ * OLD page bytes from the sender-side dedup cache — replaying stale
+ * data and hiding newly-added quads until the cache TTL expired.
  *
- * Plain string (not hashed) — it's an idempotency key, not a secret;
- * exact-match lookups in the messenger's Maps so length is fine.
+ * The nonce is minted once per `fetchSyncPages` call and reused
+ * across every page + every withRetry attempt within that call, so:
  *
- * rc.9 PR-E follow-up (codex review on #569).
+ *   - Within one fetch run, retries for the same `(offset, phase,
+ *     scope)` collapse onto the same id — the original purpose of
+ *     the messageId (sender-side dedup of retry storms +
+ *     receiver-side response cache for the SAME logical request).
+ *   - Across fetch runs, the nonce differs — fresh sync passes
+ *     never get poisoned by a stale cached response from a previous
+ *     run.
+ *
+ * ## Why includeSharedMemory is in the key
+ *
+ * Follow-up #2 — `runDurableSync` and `runSharedMemorySync` both
+ * call `fetchSyncPages` with the same phase (`'data'` / `'meta'`)
+ * for overlapping offsets, distinguished only by this flag. The
+ * checkpoint key (`getSyncCheckpointKey`) already encodes it for
+ * the same reason. Without it the receiver might serve a later SWM
+ * fetch from a cached durable response.
+ *
+ * ## What's NOT in the key
+ *
+ * Requester peerId is intentionally omitted — the messenger already
+ * namespaces by `(senderPeerId, protocolId, messageId)`, so "our
+ * identity" is implicit. Including it would only matter if a single
+ * messenger instance ran with multiple identities, which we never
+ * do.
+ *
+ * Plain string (not hashed) — it's an idempotency key, not a
+ * secret; exact-match lookups in the messenger's Maps so length is
+ * fine.
  */
 export function computeSyncPageMessageId(parts: {
   remotePeerId: string;
@@ -103,9 +125,16 @@ export function computeSyncPageMessageId(parts: {
   phase: SyncPhase;
   offset: number;
   snapshotRef?: string;
+  /**
+   * Per-fetchSyncPages-call nonce that scopes the messageId to a
+   * single retry chain. See "Why the nonce" in the function jsdoc.
+   * `fetchSyncPages` generates this once and passes it to every
+   * call; tests construct one freely.
+   */
+  runNonce: string;
 }): string {
   const scope = parts.includeSharedMemory ? 'swm' : 'durable';
-  return `sync:${parts.remotePeerId}:${parts.contextGraphId}:${scope}:${parts.phase}:${parts.offset}:${parts.snapshotRef ?? '-'}`;
+  return `sync:${parts.remotePeerId}:${parts.contextGraphId}:${scope}:${parts.phase}:${parts.offset}:${parts.snapshotRef ?? '-'}:${parts.runNonce}`;
 }
 
 export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<SyncPageResult> {
@@ -141,6 +170,13 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
   const resumedFromOffset = offset;
   let bytesReceived = 0;
   let timedOut = false;
+  // rc.9 PR-E follow-up #4 (codex review on #569): per-run nonce
+  // mixed into every page's messageId. Scopes the substrate's
+  // (peer, protocol, messageId) dedup to a single fetchSyncPages
+  // invocation so a later full-sync pass (after the checkpoint was
+  // deleted) doesn't get poisoned by a cached response from a
+  // previous pass.
+  const runNonce = randomUUID();
 
   while (true) {
     if (Date.now() > deadline) {
@@ -156,11 +192,20 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
 
     const curOffset = offset;
     const transportStartedAt = Date.now();
-    // Compute stable messageId ONCE per page, OUTSIDE the withRetry
-    // wrapper inside sendSyncRequest, so every retry attempt for this
-    // page reuses the same id. See `computeSyncPageMessageId` jsdoc
-    // for rationale; without this, substrate-backed `send`
-    // implementations would defeat dedup.
+    // Compute stable messageId ONCE per page (includes runNonce) and
+    // build the envelope payload ONCE per page, both OUTSIDE the
+    // withRetry wrapper inside sendSyncRequest. Two reasons (codex
+    // review #569 follow-up):
+    //   #1: every retry attempt for this page reuses the SAME id,
+    //       so sender-side dedup + receiver-side response cache
+    //       actually work across the retry chain (defeated when
+    //       sendReliable falls back to randomUUID() per attempt).
+    //   #5: every retry attempt sends the SAME envelope bytes,
+    //       so "what the receiver cached" matches "what the
+    //       sender sent" — no risk of a cached denial replaying
+    //       past a fresh-envelope retry. The signature freshness
+    //       TTL (SYNC_AUTH_MAX_AGE_MS = 90s) comfortably exceeds
+    //       withRetry's max budget (~7s with default backoff).
     const pageMessageId = computeSyncPageMessageId({
       remotePeerId,
       contextGraphId,
@@ -168,7 +213,9 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
       phase,
       offset: curOffset,
       snapshotRef,
+      runNonce,
     });
+    const pagePayload = await buildSyncRequest(contextGraphId, curOffset, syncPageSize, includeSharedMemory, remotePeerId, phase, snapshotRef);
     const responseBytes = await sendSyncRequest({
       remotePeerId,
       timeoutMs,
@@ -176,7 +223,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
       contextGraphId,
       offset,
       protocolId: protocolSync,
-      requestFactory: () => buildSyncRequest(contextGraphId, curOffset, syncPageSize, includeSharedMemory, remotePeerId, phase, snapshotRef),
+      payload: pagePayload,
       send,
       messageId: pageMessageId,
       onRetry: (attempt, delay, err) => {

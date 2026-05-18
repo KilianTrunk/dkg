@@ -56,14 +56,17 @@ async function singleQuadParser(nquadsText: string) {
   return { quads: [{ subject: 'x' }] as never[], totalQuads: 1 };
 }
 
+const FIXED_NONCE = '00000000-0000-0000-0000-000000000000';
+
 describe('computeSyncPageMessageId', () => {
-  it('is deterministic for the same identity tuple', () => {
+  it('is deterministic for the same identity tuple + runNonce', () => {
     const a = computeSyncPageMessageId({
       remotePeerId: REMOTE_PEER_ID,
       contextGraphId: CG_ID,
       includeSharedMemory: false,
       phase: 'data',
       offset: 0,
+      runNonce: FIXED_NONCE,
     });
     const b = computeSyncPageMessageId({
       remotePeerId: REMOTE_PEER_ID,
@@ -71,6 +74,7 @@ describe('computeSyncPageMessageId', () => {
       includeSharedMemory: false,
       phase: 'data',
       offset: 0,
+      runNonce: FIXED_NONCE,
     });
     expect(a).toBe(b);
   });
@@ -82,6 +86,7 @@ describe('computeSyncPageMessageId', () => {
       includeSharedMemory: false,
       phase: 'data' as SyncPhase,
       offset: 0,
+      runNonce: FIXED_NONCE,
     };
     const baseId = computeSyncPageMessageId(base);
 
@@ -95,15 +100,13 @@ describe('computeSyncPageMessageId', () => {
   });
 
   /**
-   * Regression for the second codex review on #569: the key MUST
-   * encode `includeSharedMemory`. Without it, durable + SWM page
-   * fetches with the same `(peer, cgId, phase, offset, snapshotRef)`
+   * Regression for codex review #2 on #569: the key MUST encode
+   * `includeSharedMemory`. Without it, durable + SWM page fetches
+   * with the same `(peer, cgId, phase, offset, snapshotRef)`
    * collapse to the same messageId, and the messenger's dedup on
    * `(peer, protocol, messageId)` would happily serve a later SWM
    * fetch from a cached durable response (or vice versa) without
-   * ever contacting the remote peer. `runDurableSync` and
-   * `runSharedMemorySync` both call `fetchSyncPages` with the same
-   * phase for overlapping offsets — this is a realistic collision.
+   * ever contacting the remote peer.
    */
   it('differs between durable and SWM scopes for an otherwise identical tuple', () => {
     const base = {
@@ -111,15 +114,41 @@ describe('computeSyncPageMessageId', () => {
       contextGraphId: CG_ID,
       phase: 'data' as SyncPhase,
       offset: 0,
+      runNonce: FIXED_NONCE,
     };
     const durableId = computeSyncPageMessageId({ ...base, includeSharedMemory: false });
     const swmId = computeSyncPageMessageId({ ...base, includeSharedMemory: true });
     expect(durableId).not.toBe(swmId);
-    // Also sanity-check at the literal-prefix level so a future
-    // refactor that, e.g., collapses both into a single token can't
-    // silently re-introduce the collision.
+    // Sanity-check the literal-prefix tokens so a future refactor
+    // that collapses both into a single token can't silently
+    // re-introduce the collision.
     expect(durableId).toContain(':durable:');
     expect(swmId).toContain(':swm:');
+  });
+
+  /**
+   * Regression for codex review #4 on #569: the key MUST differ
+   * across `fetchSyncPages` runs (different `runNonce`s) even for
+   * the same identity tuple. Without it, the substrate's sender-side
+   * dedup cache would replay a stale response from a previous full
+   * sync — completed syncs delete their checkpoints, so the next
+   * full sync of the same graph would reuse the deterministic key
+   * and get the OLD page bytes back, hiding any quads added between
+   * the two runs until the idempotency store's TTL pruned the entry.
+   */
+  it('differs across runNonces (per-fetchSyncPages scoping)', () => {
+    const base = {
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId: CG_ID,
+      includeSharedMemory: false,
+      phase: 'data' as SyncPhase,
+      offset: 0,
+    };
+    const run1Id = computeSyncPageMessageId({ ...base, runNonce: 'run-1-nonce' });
+    const run2Id = computeSyncPageMessageId({ ...base, runNonce: 'run-2-nonce' });
+    expect(run1Id).not.toBe(run2Id);
+    expect(run1Id).toContain('run-1-nonce');
+    expect(run2Id).toContain('run-2-nonce');
   });
 
   it('treats undefined snapshotRef and the literal "-" as different', () => {
@@ -131,6 +160,7 @@ describe('computeSyncPageMessageId', () => {
       includeSharedMemory: false,
       phase: 'snapshot',
       offset: 0,
+      runNonce: FIXED_NONCE,
     });
     const explicitRef = computeSyncPageMessageId({
       remotePeerId: REMOTE_PEER_ID,
@@ -139,6 +169,7 @@ describe('computeSyncPageMessageId', () => {
       phase: 'snapshot',
       offset: 0,
       snapshotRef: 'real-snap',
+      runNonce: FIXED_NONCE,
     });
     expect(noRef).not.toBe(explicitRef);
   });
@@ -194,18 +225,72 @@ describe('fetchSyncPages messageId propagation', () => {
     expect(observedMessageIds[0]).toBe(observedMessageIds[1]);
     expect(observedMessageIds[1]).toBe(observedMessageIds[2]);
 
-    // And it must be the deterministic id we'd compute externally —
-    // i.e. it's not just an internal random id that happens to be
-    // stable; it's recoverable by the receiver/test if needed.
-    expect(observedMessageIds[0]).toBe(
-      computeSyncPageMessageId({
+    // And the id MUST follow the documented shape:
+    //   sync:<peer>:<cg>:<scope>:<phase>:<offset>:<snap-or-'-'>:<runNonce>
+    // The runNonce is generated internally per fetchSyncPages call so
+    // we can't recompute it externally — assert the prefix instead,
+    // so a refactor that changed the shape (or dropped the nonce)
+    // would still trip this test.
+    expect(observedMessageIds[0]).toMatch(
+      new RegExp(`^sync:${REMOTE_PEER_ID}:${CG_ID}:durable:data:0:-:[^:]+$`),
+    );
+  });
+
+  /**
+   * Regression for codex review #4 on #569: two separate
+   * `fetchSyncPages` invocations for the same `(peer, cg, phase,
+   * offset)` MUST emit different messageIds at the `send` boundary,
+   * because the per-fetch `runNonce` is mixed in. Without that, the
+   * substrate's sender-side dedup cache would replay a stale
+   * response from the first fetch on the second fetch, hiding any
+   * quads added between the two runs.
+   */
+  it('emits DIFFERENT messageIds across separate fetchSyncPages runs (per-run nonce scoping)', async () => {
+    const captured: string[] = [];
+
+    async function runOneFetch(): Promise<void> {
+      await fetchSyncPages({
+        ctx: makeCtx(),
         remotePeerId: REMOTE_PEER_ID,
         contextGraphId: CG_ID,
         includeSharedMemory: false,
         phase: 'data',
-        offset: 0,
-      }),
-    );
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 1,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => new TextEncoder().encode('request'),
+        parseAndFilter: singleQuadParser,
+        send: async (_peerId, _protocolId, _data, _timeoutMs, messageId) => {
+          captured.push(messageId);
+          return new TextEncoder().encode('one-quad-line');
+        },
+        logWarn: noopLog,
+        logInfo: noopLog,
+        logDebug: noopLog,
+      });
+    }
+
+    await runOneFetch();
+    await runOneFetch();
+
+    expect(captured.length).toBe(2);
+    expect(captured[0]).not.toBe(captured[1]);
+    // Both should still follow the documented shape (only the
+    // trailing nonce differs).
+    const prefix = `sync:${REMOTE_PEER_ID}:${CG_ID}:durable:data:0:-:`;
+    expect(captured[0]).toMatch(new RegExp(`^${prefix}[^:]+$`));
+    expect(captured[1]).toMatch(new RegExp(`^${prefix}[^:]+$`));
   });
 
   /**
@@ -263,6 +348,66 @@ describe('fetchSyncPages messageId propagation', () => {
     expect(durable).toBeDefined();
     expect(swm).toBeDefined();
     expect(durable!.messageId).not.toBe(swm!.messageId);
+  });
+
+  /**
+   * Regression for codex review #5 on #569: `buildSyncRequest` MUST
+   * run ONCE per page, not once per withRetry attempt. Otherwise
+   * private syncs would mint a fresh `requestId`/`issuedAtMs` per
+   * attempt while the receiver's dedup keys on `(peer, protocol,
+   * messageId)` BEFORE the auth handler — meaning a cached denial
+   * (or aged-out signature) from attempt 1 would replay on the
+   * fresh-envelope attempt 2 without ever being validated.
+   *
+   * Forces 3 retries for one page and asserts `buildSyncRequest`
+   * was invoked exactly once.
+   */
+  it('builds the request envelope ONCE per page, not per withRetry attempt', async () => {
+    let buildCalls = 0;
+    let sendAttempts = 0;
+
+    await fetchSyncPages({
+      ctx: makeCtx(),
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId: CG_ID,
+      includeSharedMemory: false,
+      phase: 'data',
+      graphUri: GRAPH_URI,
+      deadline: Date.now() + 60_000,
+      syncPageTimeoutMs: 5_000,
+      syncRouterAttempts: 1,
+      syncPageRetryAttempts: 5,
+      syncPageSize: 100,
+      syncDeniedResponse: '#DENIED',
+      debugSyncProgress: false,
+      protocolSync: PROTOCOL_ID,
+      checkpointStore: {
+        get: () => 0,
+        set: () => {},
+        delete: () => {},
+      },
+      buildSyncRequest: async () => {
+        buildCalls++;
+        return new TextEncoder().encode('request');
+      },
+      parseAndFilter: singleQuadParser,
+      send: async (_peerId, _protocolId, _data, _timeoutMs, _messageId) => {
+        sendAttempts++;
+        if (sendAttempts < 3) {
+          throw new Error(`transient failure ${sendAttempts}`);
+        }
+        return new TextEncoder().encode('one-quad-line');
+      },
+      logWarn: noopLog,
+      logInfo: noopLog,
+      logDebug: noopLog,
+    });
+
+    expect(sendAttempts).toBe(3);
+    // Pre-fix: each of the 3 attempts would call buildSyncRequest
+    // → 3 fresh envelopes with 3 different requestId/issuedAtMs.
+    // Post-fix: build once, send the same bytes on every retry.
+    expect(buildCalls).toBe(1);
   });
 
   it('uses DIFFERENT messageIds for different page offsets in the same fetch', async () => {

@@ -1253,6 +1253,122 @@ describe('SharedMemoryHandler: redundant-apply counter (rc.9 PR-A)', () => {
     const stats2 = handlerForR11.getStats();
     expect(stats2.redundantApplies).toEqual({ a: 1 });
   });
+
+  // PR #570 Codex final follow-up: the bounded-memory tuning knobs
+  // (`seenOpsTtlMs`, `seenOpsMaxSize`, `seenOpsEvictBatch`,
+  // `redundantAppliesMaxCgs`) were stored without validation, so a
+  // misconfigured value (e.g. `seenOpsEvictBatch: 0`, negative TTLs,
+  // NaN) could defeat the very memory bound those knobs underpin.
+  // The constructor now clamps each knob via `sanitizePositiveInt`
+  // and WARN-logs any correction. These tests pin that behavior.
+  describe('tuning knob validation (PR #570 follow-up)', () => {
+    it('clamps seenOpsEvictBatch: 0 to 1 so cap eviction makes forward progress', () => {
+      const handlerForBatchZero = new SharedMemoryHandler(store, new TypedEventBus(), {
+        seenOpsMaxSize: 3,
+        seenOpsEvictBatch: 0,
+        seenOpsTtlMs: 60 * 60 * 1000,
+      });
+      const internals = handlerForBatchZero as unknown as {
+        seenShareOps: Map<string, number>;
+        seenOpsEvictBatch: number;
+        recordSeenShareOp: (cgId: string, opId: string, ctx: unknown) => void;
+      };
+      expect(internals.seenOpsEvictBatch).toBe(1);
+
+      const ctx = {} as any;
+      // Drive 20 unique entries past the cap. Pre-fix, with
+      // seenOpsEvictBatch=0, the Phase-2 eviction loop short-circuited
+      // on `evicted >= 0` and the map grew to 20. Post-fix, the
+      // clamped batch=1 means the map stays at or near the cap.
+      for (let i = 0; i < 20; i++) {
+        internals.recordSeenShareOp('cg', `op-${i}`, ctx);
+      }
+      expect(internals.seenShareOps.size).toBeLessThanOrEqual(20);
+      expect(internals.seenShareOps.size).toBeLessThan(20);
+    });
+
+    it('clamps seenOpsMaxSize: 0 to 1 so the cap is at least usable', () => {
+      const handlerForCapZero = new SharedMemoryHandler(store, new TypedEventBus(), {
+        seenOpsMaxSize: 0,
+      });
+      const internals = handlerForCapZero as unknown as { seenOpsMaxSize: number };
+      expect(internals.seenOpsMaxSize).toBe(1);
+    });
+
+    it('clamps negative seenOpsTtlMs so Phase-1 expired-pruning is not inverted', () => {
+      const handlerForNegTtl = new SharedMemoryHandler(store, new TypedEventBus(), {
+        seenOpsTtlMs: -5000,
+      });
+      const internals = handlerForNegTtl as unknown as { seenOpsTtlMs: number };
+      expect(internals.seenOpsTtlMs).toBe(1);
+    });
+
+    it('clamps redundantAppliesMaxCgs: 0 to 1', () => {
+      const handlerForR9Zero = new SharedMemoryHandler(store, new TypedEventBus(), {
+        redundantAppliesMaxCgs: 0,
+      });
+      const internals = handlerForR9Zero as unknown as { redundantAppliesMaxCgs: number };
+      expect(internals.redundantAppliesMaxCgs).toBe(1);
+    });
+
+    it('falls back to defaults when knob is NaN or Infinity (non-finite)', () => {
+      const handlerForNaN = new SharedMemoryHandler(store, new TypedEventBus(), {
+        seenOpsTtlMs: NaN,
+        seenOpsMaxSize: Number.POSITIVE_INFINITY,
+        seenOpsEvictBatch: Number.NEGATIVE_INFINITY,
+        redundantAppliesMaxCgs: NaN,
+      });
+      const internals = handlerForNaN as unknown as {
+        seenOpsTtlMs: number;
+        seenOpsMaxSize: number;
+        seenOpsEvictBatch: number;
+        redundantAppliesMaxCgs: number;
+      };
+      // All four should have fallen back to their documented defaults.
+      expect(internals.seenOpsTtlMs).toBe(10 * 60 * 1000);
+      expect(internals.seenOpsMaxSize).toBe(50_000);
+      expect(internals.seenOpsEvictBatch).toBe(5_000);
+      expect(internals.redundantAppliesMaxCgs).toBe(1024);
+    });
+
+    it('floors fractional values to the nearest positive integer', () => {
+      const handlerForFractional = new SharedMemoryHandler(store, new TypedEventBus(), {
+        seenOpsMaxSize: 10.7,
+        seenOpsEvictBatch: 2.4,
+        seenOpsTtlMs: 1500.9,
+        redundantAppliesMaxCgs: 5.5,
+      });
+      const internals = handlerForFractional as unknown as {
+        seenOpsMaxSize: number;
+        seenOpsEvictBatch: number;
+        seenOpsTtlMs: number;
+        redundantAppliesMaxCgs: number;
+      };
+      expect(internals.seenOpsMaxSize).toBe(10);
+      expect(internals.seenOpsEvictBatch).toBe(2);
+      expect(internals.seenOpsTtlMs).toBe(1500);
+      expect(internals.redundantAppliesMaxCgs).toBe(5);
+    });
+
+    it('preserves well-formed values verbatim (regression guard)', () => {
+      const handlerOk = new SharedMemoryHandler(store, new TypedEventBus(), {
+        seenOpsMaxSize: 7,
+        seenOpsEvictBatch: 3,
+        seenOpsTtlMs: 1_000,
+        redundantAppliesMaxCgs: 4,
+      });
+      const internals = handlerOk as unknown as {
+        seenOpsMaxSize: number;
+        seenOpsEvictBatch: number;
+        seenOpsTtlMs: number;
+        redundantAppliesMaxCgs: number;
+      };
+      expect(internals.seenOpsMaxSize).toBe(7);
+      expect(internals.seenOpsEvictBatch).toBe(3);
+      expect(internals.seenOpsTtlMs).toBe(1_000);
+      expect(internals.redundantAppliesMaxCgs).toBe(4);
+    });
+  });
 });
 
 describe('SharedMemoryHandler: CAS gossip enforcement', () => {

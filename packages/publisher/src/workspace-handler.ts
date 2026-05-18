@@ -192,11 +192,92 @@ export class SharedMemoryHandler {
     this.workspaceSenderKeyDecryptor = options?.workspaceSenderKeyDecryptor;
     this.now = options?.now ?? (() => Date.now());
     this.publicSnapshotStore = options?.publicSnapshotStore;
-    this.seenOpsTtlMs = options?.seenOpsTtlMs ?? SharedMemoryHandler.DEFAULT_SEEN_OPS_TTL_MS;
-    this.seenOpsMaxSize = options?.seenOpsMaxSize ?? SharedMemoryHandler.DEFAULT_SEEN_OPS_MAX_SIZE;
-    this.seenOpsEvictBatch = options?.seenOpsEvictBatch ?? SharedMemoryHandler.DEFAULT_SEEN_OPS_EVICT_BATCH;
-    this.redundantAppliesMaxCgs =
-      options?.redundantAppliesMaxCgs ?? SharedMemoryHandler.DEFAULT_REDUNDANT_APPLIES_MAX_CGS;
+    // PR #570 Codex follow-up (final, post-merge): validate / clamp
+    // the bounded-memory tuning knobs. Pre-fix, the four `seenOps*` /
+    // `redundantAppliesMaxCgs` options were stored as-is, so a
+    // misconfigured `seenOpsEvictBatch: 0` would make Phase-2
+    // cap-based eviction a no-op (`evicted >= 0` is immediately
+    // true on the first iteration) — letting `seenShareOps` grow
+    // unbounded once all entries were still live and the cap was
+    // hit, defeating the exact memory bound this PR added. Negative
+    // / NaN / non-integer values were similarly accepted and would
+    // either break Phase-1 TTL pruning (negative `seenOpsTtlMs`
+    // makes the "is expired?" comparison invert and evict every
+    // entry on every insert) or silently behave nonsensically.
+    //
+    // Each knob is now sanitized via `sanitizePositiveInt`:
+    //   - undefined → falls back to the documented default.
+    //   - non-finite (NaN / Infinity) → falls back to default + WARN.
+    //   - < 1 / non-integer → clamped to `Math.max(1, Math.floor(v))`
+    //     and WARN-logged so operators can see their config was
+    //     silently corrected (vs. silently broken).
+    const sysCtx = createOperationContext('system');
+    this.seenOpsTtlMs = this.sanitizePositiveInt(
+      options?.seenOpsTtlMs,
+      SharedMemoryHandler.DEFAULT_SEEN_OPS_TTL_MS,
+      'seenOpsTtlMs',
+      sysCtx,
+    );
+    this.seenOpsMaxSize = this.sanitizePositiveInt(
+      options?.seenOpsMaxSize,
+      SharedMemoryHandler.DEFAULT_SEEN_OPS_MAX_SIZE,
+      'seenOpsMaxSize',
+      sysCtx,
+    );
+    this.seenOpsEvictBatch = this.sanitizePositiveInt(
+      options?.seenOpsEvictBatch,
+      SharedMemoryHandler.DEFAULT_SEEN_OPS_EVICT_BATCH,
+      'seenOpsEvictBatch',
+      sysCtx,
+    );
+    this.redundantAppliesMaxCgs = this.sanitizePositiveInt(
+      options?.redundantAppliesMaxCgs,
+      SharedMemoryHandler.DEFAULT_REDUNDANT_APPLIES_MAX_CGS,
+      'redundantAppliesMaxCgs',
+      sysCtx,
+    );
+  }
+
+  /**
+   * Validate / clamp a configurable tuning knob to a positive integer.
+   *
+   * @returns the default when `value` is `undefined` or non-finite
+   *   (NaN / Infinity, treated as a programmer / operator error and
+   *   warned about); otherwise `Math.max(1, Math.floor(value))` with
+   *   a WARN log if the sanitization changed the supplied value.
+   *
+   * Rationale: all four knobs (`seenOpsTtlMs`, `seenOpsMaxSize`,
+   * `seenOpsEvictBatch`, `redundantAppliesMaxCgs`) underpin the
+   * bounded-memory guarantees of `seenShareOps` /
+   * `redundantApplyCounts`. Accepting 0 / negative / NaN /
+   * non-integer values would silently break those guarantees — most
+   * dangerously `seenOpsEvictBatch: 0`, where the Phase-2 cap
+   * eviction loop short-circuits on `evicted >= 0` and the map can
+   * grow without bound. Clamping + WARN keeps the handler safe
+   * while making misconfiguration visible in operator logs.
+   */
+  private sanitizePositiveInt(
+    value: number | undefined,
+    defaultValue: number,
+    name: string,
+    ctx: OperationContext,
+  ): number {
+    if (value === undefined) return defaultValue;
+    if (!Number.isFinite(value)) {
+      this.log.warn(
+        ctx,
+        `SharedMemoryHandler option ${name}=${String(value)} is non-finite — falling back to default ${defaultValue}`,
+      );
+      return defaultValue;
+    }
+    const clamped = Math.max(1, Math.floor(value));
+    if (clamped !== value) {
+      this.log.warn(
+        ctx,
+        `SharedMemoryHandler option ${name}=${value} is not a positive integer — clamped to ${clamped} (would have defeated bounded-memory guarantees)`,
+      );
+    }
+    return clamped;
   }
 
   /**

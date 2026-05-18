@@ -6220,15 +6220,28 @@ export class DKGAgent {
       // for greppability (Codex PR #570 R6: previously the comment
       // claimed "error class" but the implementation only logged
       // err.message, collapsing distinct failure types).
-      this.recordSwmGossipPublishFailure(contextGraphId);
+      // Codex PR #570 R12: source the running failure count from
+      // `recordSwmGossipPublishFailure`'s return value, not by
+      // re-reading the map. Pre-fix, when the just-incremented
+      // entry was itself the smallest and got evicted into the
+      // overflow bucket on the very same call, the subsequent
+      // map.get() returned 0 (or an older count for a recycled
+      // cgId), producing misleading `failureCountForCg=0` log lines
+      // for a cgId that had just failed. We now log the actual
+      // post-increment count, and flag the overflow case explicitly
+      // so operators can see why the per-cgId breakdown in
+      // /api/slo's `gossip.publishFailures` may not show this cgId.
+      const { failureCountForCg, evictedToOverflow } = this.recordSwmGossipPublishFailure(contextGraphId);
       const errClass = err instanceof Error
         ? (err.name && err.name !== 'Error' ? err.name : err.constructor.name)
         : typeof err;
       const errMessage = err instanceof Error ? err.message : String(err);
-      const count = this.swmGossipPublishFailures.get(contextGraphId) ?? 0;
+      const overflowSuffix = evictedToOverflow
+        ? ' (evicted to overflow bucket; per-cgId breakdown truncated)'
+        : '';
       this.log.warn(
         ctx,
-        `Gossip publish FAILED for topic="${topic}" cgId=${contextGraphId} errorClass="${errClass}" error="${errMessage}" failureCountForCg=${count}`,
+        `Gossip publish FAILED for topic="${topic}" cgId=${contextGraphId} errorClass="${errClass}" error="${errMessage}" failureCountForCg=${failureCountForCg}${overflowSuffix}`,
       );
     }
   }
@@ -6252,10 +6265,20 @@ export class DKGAgent {
    * the smallest. With this comparison, when the new entry IS the
    * smallest, it's the one that gets evicted into overflow — leaving
    * the existing hot spots intact, exactly what operators want.
+   *
+   * Codex PR #570 R12: returns the post-increment count and an
+   * `evictedToOverflow` flag so the caller's WARN log accurately
+   * reflects what just happened without having to re-read the map
+   * (which is stale if THIS cgId was the one evicted into the
+   * overflow bucket on the same call).
    */
-  private recordSwmGossipPublishFailure(contextGraphId: string): void {
+  private recordSwmGossipPublishFailure(contextGraphId: string): {
+    failureCountForCg: number;
+    evictedToOverflow: boolean;
+  } {
     const next = (this.swmGossipPublishFailures.get(contextGraphId) ?? 0) + 1;
     this.swmGossipPublishFailures.set(contextGraphId, next);
+    let evictedToOverflow = false;
     if (this.swmGossipPublishFailures.size > DKGAgent.SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS) {
       let smallestCg: string | null = null;
       let smallestCount = Infinity;
@@ -6271,8 +6294,12 @@ export class DKGAgent {
         if (!this.swmGossipPublishFailuresTruncated) {
           this.swmGossipPublishFailuresTruncated = true;
         }
+        if (smallestCg === contextGraphId) {
+          evictedToOverflow = true;
+        }
       }
     }
+    return { failureCountForCg: next, evictedToOverflow };
   }
 
   async publishAsync(

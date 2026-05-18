@@ -129,7 +129,7 @@ describe('DKGAgent SWM gossip publish failure (rc.9 PR-A)', () => {
 
     const internals = agent as unknown as {
       swmGossipPublishFailures: Map<string, number>;
-      recordSwmGossipPublishFailure: (cgId: string) => void;
+      recordSwmGossipPublishFailure: (cgId: string) => { failureCountForCg: number; evictedToOverflow: boolean };
     };
     const Cls = (agent.constructor as unknown as { SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS: number });
     const cap = Cls.SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS;
@@ -171,7 +171,7 @@ describe('DKGAgent SWM gossip publish failure (rc.9 PR-A)', () => {
 
     const internals = agent as unknown as {
       swmGossipPublishFailures: Map<string, number>;
-      recordSwmGossipPublishFailure: (cgId: string) => void;
+      recordSwmGossipPublishFailure: (cgId: string) => { failureCountForCg: number; evictedToOverflow: boolean };
     };
     const Cls = (agent.constructor as unknown as { SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS: number });
     const cap = Cls.SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS;
@@ -226,6 +226,76 @@ describe('DKGAgent SWM gossip publish failure (rc.9 PR-A)', () => {
     expect(warn).toBeDefined();
     expect(warn!.message).toContain('errorClass="NoPeersSubscribedError"');
     expect(warn!.message).toContain('error="no peers subscribed to');
+  });
+
+  // PR-A R12 regression: when the per-cgId tracking map is at the
+  // cap AND the just-incremented entry is the one evicted into the
+  // overflow bucket on the same call, the WARN log must still
+  // report the actual post-increment count (≥1), not the stale 0
+  // returned by re-reading the map after eviction. The log line
+  // also flags the overflow case so operators can see why this
+  // cgId won't show up in /api/slo's per-cgId breakdown.
+  it('WARN log reports accurate failureCountForCg even when the entry is evicted to overflow (R12)', async () => {
+    const agent = await DKGAgent.create({
+      name: 'SwmGossipFailureR12Overflow',
+      chainAdapter: new MockChainAdapter(),
+    });
+    const gossip = new TypedThrowingGossip();
+    (agent as unknown as { gossip: TypedThrowingGossip }).gossip = gossip;
+    Object.defineProperty((agent as unknown as { node: object }).node, 'peerId', {
+      value: { toString: () => '12D3KooWPublisherR12' },
+      configurable: true,
+    });
+
+    const internals = agent as unknown as {
+      swmGossipPublishFailures: Map<string, number>;
+      recordSwmGossipPublishFailure: (cgId: string) => { failureCountForCg: number; evictedToOverflow: boolean };
+    };
+    const Cls = (agent.constructor as unknown as { SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS: number });
+    const cap = Cls.SWM_GOSSIP_FAILURE_MAX_TRACKED_CGS;
+
+    // Saturate the cap with hot cgIds (count >= 2 each) so the
+    // smallest entry after the next single bump will be the new one.
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < cap; i++) {
+        internals.recordSwmGossipPublishFailure(`cg-hot-${i}`);
+      }
+    }
+
+    const captured: Array<{ message: string }> = [];
+    const originalWarn = (agent as unknown as { log: { warn: (ctx: unknown, msg: string) => void } }).log.warn.bind(
+      (agent as unknown as { log: { warn: (ctx: unknown, msg: string) => void } }).log,
+    );
+    (agent as unknown as { log: { warn: (ctx: unknown, msg: string) => void } }).log.warn = (ctx, message) => {
+      captured.push({ message });
+      originalWarn(ctx, message);
+    };
+
+    // This share will go through publishWorkspaceGossip, which fails
+    // and calls recordSwmGossipPublishFailure for a brand-new cgId
+    // (count=1) — guaranteed to be the smallest and thus the one
+    // evicted into overflow. Pre-R12, the WARN log re-read the map
+    // after eviction and printed failureCountForCg=0.
+    const newCg = 'swm-pub-fail-cg-overflow-new';
+    await agent.share(newCg, [{
+      subject: 'urn:test:overflow',
+      predicate: 'http://schema.org/name',
+      object: '"will overflow"',
+      graph: '',
+    }]);
+
+    const warn = captured.find((c) => /Gossip publish FAILED/.test(c.message) && new RegExp(`cgId=${newCg}\\b`).test(c.message));
+    expect(warn).toBeDefined();
+    expect(warn!.message).toContain('failureCountForCg=1');
+    expect(warn!.message).not.toContain('failureCountForCg=0');
+    expect(warn!.message).toContain('evicted to overflow bucket');
+
+    const stats = agent.getSwmGossipStats();
+    expect(stats.publishFailuresTruncated).toBe(true);
+    // The new cgId itself should NOT appear in the per-cgId map
+    // (it was evicted into overflow on the very same call).
+    expect(stats.publishFailures[newCg]).toBeUndefined();
+    expect(stats.publishFailuresOverflow).toBeGreaterThanOrEqual(1);
   });
 
   it('initialises receiver-side handler stats as empty even before any share is received', async () => {

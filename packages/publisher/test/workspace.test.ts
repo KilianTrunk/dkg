@@ -1088,11 +1088,14 @@ describe('SharedMemoryHandler: redundant-apply counter (rc.9 PR-A)', () => {
     internals.recordSeenShareOp('cg', 'cold-9', ctx);
     internals.recordSeenShareOp('cg', 'cold-10', ctx);
 
+    // PR-A R11: keys are `JSON.stringify([cgId, shareOperationId])`,
+    // not the legacy `${cgId}|${shareOperationId}` (which was
+    // ambiguous when either field contained `|`).
     const remaining = [...internals.seenShareOps.keys()];
-    expect(remaining).toContain('cg|hot');
+    expect(remaining).toContain(JSON.stringify(['cg', 'hot']));
     expect(remaining.length).toBeLessThanOrEqual(10);
-    expect(remaining).not.toContain('cg|cold-0');
-    expect(remaining).not.toContain('cg|cold-1');
+    expect(remaining).not.toContain(JSON.stringify(['cg', 'cold-0']));
+    expect(remaining).not.toContain(JSON.stringify(['cg', 'cold-1']));
   });
 
   // PR-A R3 regression: when the map fills the cap, the FIRST eviction
@@ -1125,11 +1128,12 @@ describe('SharedMemoryHandler: redundant-apply counter (rc.9 PR-A)', () => {
     internals.recordSeenShareOp('cg', 'live-0', ctx);
     internals.recordSeenShareOp('cg', 'live-1', ctx);
 
+    // PR-A R11: keys are `JSON.stringify([cgId, shareOperationId])`.
     const remaining = [...internals.seenShareOps.keys()];
-    expect(remaining).toContain('cg|live-0');
-    expect(remaining).toContain('cg|live-1');
+    expect(remaining).toContain(JSON.stringify(['cg', 'live-0']));
+    expect(remaining).toContain(JSON.stringify(['cg', 'live-1']));
     for (let i = 0; i < 5; i++) {
-      expect(remaining).not.toContain(`cg|expired-${i}`);
+      expect(remaining).not.toContain(JSON.stringify(['cg', `expired-${i}`]));
     }
     expect(internals.seenOpsCapEvictedLiveEntries).toBe(false);
     expect(handlerForTtl.getStats().redundantAppliesLowerBound).toBe(false);
@@ -1206,6 +1210,48 @@ describe('SharedMemoryHandler: redundant-apply counter (rc.9 PR-A)', () => {
 
     expect(internals.seenOpsCapEvictedLiveEntries).toBe(true);
     expect(handlerForLowerBound.getStats().redundantAppliesLowerBound).toBe(true);
+  });
+
+  // PR-A R11 regression: prior to the fix, the composite key was
+  // `${cgId}|${shareOperationId}`, which collided whenever either
+  // field contained `|` (both wire-supplied — a hostile peer could
+  // craft them). Two structurally distinct (cgId, op) pairs that
+  // hash to the same string would corrupt `redundantApplies`
+  // accounting: a legitimate first-delivery on one pair would look
+  // like a "redundant" re-delivery of the other and bump the
+  // operator-facing counter under the wrong cgId. The fix uses
+  // `JSON.stringify([cgId, op])`, which is unambiguous (array
+  // delimiters + JSON quote-escaping). This test exercises the
+  // canonical aliasing pair and asserts that the legitimate first
+  // delivery on the second pair is NOT counted as redundant.
+  it('avoids (cgId, shareOpId) composite-key aliasing across pipe-containing values (R11)', () => {
+    let nowMs = 1_000_000;
+    const handlerForR11 = new SharedMemoryHandler(store, new TypedEventBus(), {
+      now: () => nowMs,
+      seenOpsTtlMs: 60 * 60 * 1000,
+    });
+    const internals = handlerForR11 as unknown as {
+      recordSeenShareOp: (cgId: string, opId: string, ctx: unknown) => void;
+    };
+    const ctx = {} as any;
+
+    // Legacy `${cgId}|${shareOperationId}` would produce the same
+    // string `"a|b|c"` for both of these distinct logical pairs:
+    internals.recordSeenShareOp('a|b', 'c', ctx);
+    internals.recordSeenShareOp('a', 'b|c', ctx);
+
+    // Neither call is a redundant apply: the keys must be distinct.
+    const stats = handlerForR11.getStats();
+    expect(stats.redundantApplies).toEqual({});
+    expect(stats.redundantAppliesLowerBound).toBe(false);
+    expect(stats.redundantAppliesOverflow).toBe(0);
+    expect(stats.redundantAppliesTruncated).toBe(false);
+
+    // Now genuinely re-deliver the second pair and assert it IS
+    // counted under the correct cgId (and not under "a|b").
+    internals.recordSeenShareOp('a', 'b|c', ctx);
+    const stats2 = handlerForR11.getStats();
+    expect(stats2.redundantApplies).toEqual({ a: 1 });
   });
 });
 

@@ -46,6 +46,31 @@ export type WorkspaceSenderKeyDecryptor = (
 ) => Promise<Uint8Array>;
 
 /**
+ * Unambiguous composite key for `seenShareOps`.
+ *
+ * **Why not `${cgId}|${shareOperationId}` (rc.9 PR-A codex follow-up
+ * #11)**: both `cgId` and `shareOperationId` are wire-supplied by
+ * the publishing peer, neither is structurally constrained to
+ * exclude `|`. A peer can therefore craft two distinct logical
+ * pairs that hash to the SAME composite-string key
+ * (`cgId="a|b" + op="c"` and `cgId="a" + op="b|c"` both produce
+ * `"a|b|c"`), letting them collide `redundantApplies` accounting:
+ * a legitimate apply on one pair could appear to be a "redundant"
+ * re-delivery of the other. The metric is operator-facing, so the
+ * skew is bounded but it would still let a hostile peer poison the
+ * counter for unrelated tenants.
+ *
+ * `JSON.stringify([cgId, shareOperationId])` is structurally
+ * unambiguous: array delimiters + quote-escaping make every
+ * (cgId, op) pair produce a unique key. The performance cost
+ * (one `JSON.stringify` per apply) is negligible — this runs only
+ * on legitimate deliveries that already passed validation.
+ */
+function seenShareOpKey(cgId: string, shareOperationId: string): string {
+  return JSON.stringify([cgId, shareOperationId]);
+}
+
+/**
  * Handles incoming shared memory topic messages (GossipSub).
  * Validates the request, stores public triples into SWM graph
  * and metadata into SWM meta graph. No chain, no UAL.
@@ -67,8 +92,10 @@ export class SharedMemoryHandler {
   private readonly log = new Logger('SharedMemoryHandler');
 
   /**
-   * Per-(cgId|shareOperationId) timestamp of the most recent legitimate
-   * delivery. Used purely for measurement of the redundant-apply rate
+   * Per-(cgId, shareOperationId) timestamp of the most recent legitimate
+   * delivery, keyed via {@link seenShareOpKey} so neither field can be
+   * crafted to collide with another pair (rc.9 PR-A codex follow-up
+   * #11). Used purely for measurement of the redundant-apply rate
    * surfaced via /api/slo `swm.redundantApplies`. Bumped (without
    * blocking the apply) whenever we see a `(cgId, shareOperationId)`
    * we already processed within the TTL window.
@@ -217,7 +244,7 @@ export class SharedMemoryHandler {
     shareOperationId: string,
     ctx: import('@origintrail-official/dkg-core').OperationContext,
   ): void {
-    const key = `${cgId}|${shareOperationId}`;
+    const key = seenShareOpKey(cgId, shareOperationId);
     const nowMs = this.now();
     const previousAt = this.seenShareOps.get(key);
     if (previousAt !== undefined) {

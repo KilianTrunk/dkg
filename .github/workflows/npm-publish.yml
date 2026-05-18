@@ -540,15 +540,23 @@ jobs:
             echo "::group::${PKG_NAME}@${VER}"
 
             # Publish (tolerate "already exists" for idempotent reruns)
-            if ! npm publish "${tarball}" \
+            set +e
+            PUBLISH_OUT=$(npm publish "${tarball}" \
               --provenance \
               --access public \
               --tag "${NPM_TAG}" \
-              --ignore-scripts 2>&1 | tee /dev/stderr | grep -q "EPUBLISHCONFLICT\|already exists\|previously published"; then
+              --ignore-scripts 2>&1)
+            PUBLISH_STATUS=$?
+            set -e
+            echo "${PUBLISH_OUT}"
+            if [ "${PUBLISH_STATUS}" -eq 0 ]; then
               echo "Published ${PKG_NAME}@${VER} with --tag ${NPM_TAG}"
-            else
+            elif echo "${PUBLISH_OUT}" | grep -qE "EPUBLISHCONFLICT|cannot publish over|previously published"; then
               echo "⚠ ${PKG_NAME}@${VER} already published — setting dist-tag ${NPM_TAG}"
               npm dist-tag add "${PKG_NAME}@${VER}" "${NPM_TAG}"
+            else
+              echo "::error::Failed to publish ${PKG_NAME}@${VER} (exit ${PUBLISH_STATUS})"
+              exit 1
             fi
 
             # Apply extra dist-tags (e.g. 'rc' alongside 'latest')

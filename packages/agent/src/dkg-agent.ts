@@ -691,11 +691,53 @@ export interface PeerDiagnostics {
     multiaddrs: string[];
     protocols: string[];
   } | null;
-  /** Pending chat-outbox entries for this peer (oldest-first). */
+  /**
+   * Pending substrate-outbox entries for this peer.
+   *
+   * Top-level fields (`pendingCount`, `oldestFirstFailureAt`,
+   * `attempts`) keep the rc.8 chat-only contract that
+   * `/api/peer-info` + MCP `dkg_peer_info` consumers depend on.
+   *
+   * {@link byProtocol} (rc.9 PR-E codex follow-up #10) breaks out
+   * queued entries per libp2p protocol id so post-substrate-migration
+   * traffic (sync, SWM, future protocols) is visible to operator
+   * diagnostics — without it, a peer stuck on sync catch-up reports
+   * `pendingCount=0` and looks healthy.
+   */
   outbox: {
+    /**
+     * Pending count for the chat protocol specifically. Retained
+     * as a top-level field for backwards compatibility with the
+     * rc.8 (`/api/peer-info`, MCP `dkg_peer_info`) consumers — the
+     * snapshot was chat-only before sync migrated onto the
+     * substrate. New consumers should prefer {@link byProtocol}.
+     */
     pendingCount: number;
+    /** Oldest `firstFailureAt` among chat-protocol pending entries. */
     oldestFirstFailureAt: number | null;
+    /** Per-entry attempt counts among chat-protocol pending entries. */
     attempts: number[];
+    /**
+     * Per-protocol pending breakdown for this peer (rc.9 PR-E
+     * codex follow-up #10). Surfaces queued entries for EVERY
+     * protocol the substrate carries, so stuck sync catch-up,
+     * stuck SWM gossip, etc. show up here rather than being
+     * invisible in operator diagnostics. Empty object when the
+     * peer has no pending entries at all.
+     *
+     * Each key is the libp2p protocol id (e.g. `/dkg/10.0.1/sync`,
+     * `/dkg/10.0.1/message`); the value mirrors the top-level
+     * chat-specific summary shape so operator tooling can render
+     * a per-protocol view with no extra plumbing.
+     */
+    byProtocol: Record<
+      string,
+      {
+        pendingCount: number;
+        oldestFirstFailureAt: number | null;
+        attempts: number[];
+      }
+    >;
   };
   /** Latest ping-round health snapshot (`null` if never pinged). */
   health: PeerHealth | null;
@@ -13602,7 +13644,7 @@ export class DKGAgent {
         getConnectionsReturnsForPeer: 0,
         connections: [],
         peerStore: null,
-        outbox: { pendingCount: 0, oldestFirstFailureAt: null, attempts: [] },
+        outbox: { pendingCount: 0, oldestFirstFailureAt: null, attempts: [], byProtocol: {} },
         health: null,
         protocols: [],
         syncCapable: false,
@@ -13677,21 +13719,47 @@ export class DKGAgent {
       peerStoreSnapshot = null;
     }
 
-    // Substrate outbox snapshot for this peer, filtered to the
-    // chat protocol so the diagnostics surface keeps its rc.8
-    // semantics ("how many CHAT messages are queued for this
-    // peer"). Once other protocols migrate (PR-8..PR-11) the
-    // diagnostics shape can be extended to break out per-protocol
-    // counts; the chat-specific view is what every existing
-    // consumer (HTTP + MCP) expects today.
-    const pending = this.messenger
+    // Substrate outbox snapshot for this peer.
+    //
+    // The top-level fields (`pendingCount`, `oldestFirstFailureAt`,
+    // `attempts`) summarise the CHAT protocol only — the rc.8
+    // diagnostics shape that `/api/peer-info` + MCP `dkg_peer_info`
+    // consumers expect. Preserved as-is so we don't break that
+    // contract.
+    //
+    // The new `byProtocol` map (rc.9 PR-E codex follow-up #10)
+    // surfaces queued entries for EVERY protocol the substrate
+    // now carries, including sync (`/dkg/10.0.1/sync` migrated in
+    // this PR). Without it, stuck sync catch-up — or any future
+    // protocol-substrate migration — would be invisible in
+    // operator diagnostics. Each per-protocol summary mirrors the
+    // top-level summary's shape so tooling can render a per-
+    // protocol view with zero extra plumbing.
+    const peerEntries = this.messenger
       .listOutbox()
-      .filter((entry) => entry.peer === peerKey && entry.protocol === PROTOCOL_MESSAGE)
+      .filter((entry) => entry.peer === peerKey)
       .sort((a, b) => a.firstFailureAt - b.firstFailureAt);
+    const chatPending = peerEntries.filter((entry) => entry.protocol === PROTOCOL_MESSAGE);
+    const byProtocol: Record<string, { pendingCount: number; oldestFirstFailureAt: number | null; attempts: number[] }> = {};
+    for (const entry of peerEntries) {
+      const bucket = byProtocol[entry.protocol] ?? {
+        pendingCount: 0,
+        oldestFirstFailureAt: null,
+        attempts: [],
+      };
+      bucket.pendingCount += 1;
+      bucket.oldestFirstFailureAt =
+        bucket.oldestFirstFailureAt === null
+          ? entry.firstFailureAt
+          : Math.min(bucket.oldestFirstFailureAt, entry.firstFailureAt);
+      bucket.attempts.push(entry.attempts);
+      byProtocol[entry.protocol] = bucket;
+    }
     const outbox = {
-      pendingCount: pending.length,
-      oldestFirstFailureAt: pending.length > 0 ? pending[0].firstFailureAt : null,
-      attempts: pending.map((e) => e.attempts),
+      pendingCount: chatPending.length,
+      oldestFirstFailureAt: chatPending.length > 0 ? chatPending[0].firstFailureAt : null,
+      attempts: chatPending.map((e) => e.attempts),
+      byProtocol,
     };
 
     const protocols = peerStoreSnapshot?.protocols ?? [];

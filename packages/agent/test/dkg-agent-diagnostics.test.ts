@@ -311,7 +311,10 @@ describe('DKGAgent.getPeerDiagnostics', () => {
         // PEER_B, chat — must NOT appear in PEER_A's diagnostics.
         makeOutboxEntry({ peer: PEER_B, messageId: 'm3', attempts: 1, firstFailureAt: 1200 }),
         // PEER_A, but a non-chat protocol — the diagnostics surface
-        // is chat-specific by design, so this must be filtered out.
+        // is chat-specific at the TOP level by design, so this must
+        // be filtered out of `outbox.pendingCount`. (It still appears
+        // under `outbox.byProtocol`; see the per-protocol breakdown
+        // test below for that contract.)
         makeOutboxEntry({
           peer: PEER_A,
           protocol: '/dkg/10.0.1/swm-sender-key',
@@ -334,6 +337,117 @@ describe('DKGAgent.getPeerDiagnostics', () => {
         pendingCount: 0,
         oldestFirstFailureAt: null,
         attempts: [],
+        byProtocol: {},
+      });
+    });
+
+    /**
+     * rc.9 PR-E codex follow-up #10.
+     *
+     * Sync migrated onto `messenger.sendReliable` in this PR, which
+     * means recoverable sync failures now queue in the same
+     * substrate outbox as chat. Before this fix, the diagnostics
+     * surface only summarised chat-protocol queued entries — stuck
+     * sync catch-up was invisible to operators. The new
+     * `outbox.byProtocol` map breaks out queued entries per protocol
+     * so any future protocol-substrate migration shows up
+     * automatically with zero diagnostics-route changes.
+     */
+    it('surfaces per-protocol pending entries via outbox.byProtocol (sync, swm, chat, anything)', async () => {
+      const outboxEntries: StubOutboxEntry[] = [
+        // 2x chat (newer + older)
+        makeOutboxEntry({ peer: PEER_A, messageId: 'chat-1', attempts: 1, firstFailureAt: 2000 }),
+        makeOutboxEntry({ peer: PEER_A, messageId: 'chat-2', attempts: 2, firstFailureAt: 1000 }),
+        // 1x sync (the migration this PR ships)
+        makeOutboxEntry({
+          peer: PEER_A,
+          protocol: '/dkg/10.0.1/sync',
+          messageId: 'sync-1',
+          attempts: 3,
+          firstFailureAt: 1500,
+        }),
+        // 1x SWM sender-key (representing future protocol migrations)
+        makeOutboxEntry({
+          peer: PEER_A,
+          protocol: '/dkg/10.0.1/swm-sender-key',
+          messageId: 'swm-1',
+          attempts: 5,
+          firstFailureAt: 500,
+        }),
+        // PEER_B entry — must NOT appear in PEER_A's per-protocol view.
+        makeOutboxEntry({
+          peer: PEER_B,
+          protocol: '/dkg/10.0.1/sync',
+          messageId: 'sync-other-peer',
+          attempts: 7,
+          firstFailureAt: 100,
+        }),
+      ];
+      const agentLike = makeAgentLike({ rawConnections: [], outboxEntries });
+      const diag = await callDiagnostics(agentLike, PEER_A);
+
+      // The chat-specific top-level summary is unchanged from rc.8.
+      expect(diag.outbox.pendingCount).toBe(2);
+      expect(diag.outbox.oldestFirstFailureAt).toBe(1000);
+      expect(diag.outbox.attempts).toEqual([2, 1]);
+
+      // Per-protocol breakdown surfaces sync + SWM alongside chat.
+      expect(Object.keys(diag.outbox.byProtocol).sort()).toEqual([
+        '/dkg/10.0.1/message',
+        '/dkg/10.0.1/swm-sender-key',
+        '/dkg/10.0.1/sync',
+      ]);
+      expect(diag.outbox.byProtocol['/dkg/10.0.1/sync']).toEqual({
+        pendingCount: 1,
+        oldestFirstFailureAt: 1500,
+        attempts: [3],
+      });
+      expect(diag.outbox.byProtocol['/dkg/10.0.1/swm-sender-key']).toEqual({
+        pendingCount: 1,
+        oldestFirstFailureAt: 500,
+        attempts: [5],
+      });
+      expect(diag.outbox.byProtocol['/dkg/10.0.1/message']).toEqual({
+        pendingCount: 2,
+        oldestFirstFailureAt: 1000,
+        attempts: [2, 1],
+      });
+      // PEER_B sync entry MUST NOT bleed into PEER_A's per-protocol view.
+      expect(diag.outbox.byProtocol['/dkg/10.0.1/sync'].attempts).not.toContain(7);
+    });
+
+    /**
+     * Regression for the exact bug Codex described: "sync catch-up
+     * gets stuck and is invisible in the diagnostics surface". A peer
+     * with ONLY sync queued (no chat) used to report
+     * `outbox.pendingCount=0` and looked healthy. Now sync is visible
+     * in `byProtocol` so operators can tell the difference.
+     */
+    it('makes a sync-only stuck peer visible in diagnostics (was invisible pre-rc.9 PR-E)', async () => {
+      const outboxEntries: StubOutboxEntry[] = [
+        makeOutboxEntry({
+          peer: PEER_A,
+          protocol: '/dkg/10.0.1/sync',
+          messageId: 'sync-stuck',
+          attempts: 4,
+          firstFailureAt: 7000,
+        }),
+      ];
+      const agentLike = makeAgentLike({ rawConnections: [], outboxEntries });
+      const diag = await callDiagnostics(agentLike, PEER_A);
+
+      // Top-level chat-specific summary still reports zero — that's
+      // intentional (preserves rc.8 contract).
+      expect(diag.outbox.pendingCount).toBe(0);
+      expect(diag.outbox.oldestFirstFailureAt).toBeNull();
+
+      // But the per-protocol view tells operators that sync IS stuck.
+      expect(diag.outbox.byProtocol).toEqual({
+        '/dkg/10.0.1/sync': {
+          pendingCount: 1,
+          oldestFirstFailureAt: 7000,
+          attempts: [4],
+        },
       });
     });
   });

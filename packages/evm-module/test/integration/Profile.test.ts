@@ -1172,7 +1172,7 @@ describe('@integration Profile recreate preserves id-keyed state', () => {
     await expect(
       profile
         .connect(admin)
-        .recreateProfile(identityId, 'Recover Node', nodeId, 1000),
+        .recreateProfile(operational.address, 'Recover Node', nodeId, 1000),
     ).to.not.be.reverted;
 
     // Profile restored under the SAME id; no new identity minted; the

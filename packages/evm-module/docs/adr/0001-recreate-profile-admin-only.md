@@ -19,14 +19,25 @@ third-party delegated stake, and it sets the initial operator fee.
 
 ## Decision
 
-`recreateProfile` is gated `onlyWhitelisted onlyAdmin(identityId)`.
+`recreateProfile(address operationalWallet, …)` is gated `onlyWhitelisted`
+and resolves + enforces the admin check in-body:
 
-- The caller must hold the supplied identity's **Admin** key. This both
-  authorizes the caller and proves the `Identity` exists.
-- The signature takes `identityId` explicitly because Admin keys have no
-  reverse lookup, mirroring other admin-gated, id-parameterised profile
-  mutations (`updateOperatorFee`, `addOperationalWallets`).
+- The caller passes the node's **Operational wallet** — operators know this
+  (it is the node's running key); the numeric `identityId` is internal and
+  often unknown. The contract resolves
+  `identityId = IdentityStorage.getIdentityId(operationalWallet)`.
+- It then calls `_checkAdmin(identityId)`: `msg.sender` must hold that
+  identity's **Admin** key. Authorization is the Admin key, exactly as
+  before — the operational wallet is only an *identifier*, never the
+  authorizer. A zero/unknown wallet resolves to `id 0` (no admin) and
+  reverts, which also proves the `Identity` exists.
 - The existing whitelist gate is preserved.
+
+(Original draft took `uint72 identityId` directly, gated
+`onlyAdmin(identityId)`. Changed to the operational-wallet form for
+operator ergonomics — admins rarely know the numeric id — without
+weakening authorization: the admin key is still enforced, just after
+in-body resolution rather than via the modifier.)
 
 ## Rationale
 

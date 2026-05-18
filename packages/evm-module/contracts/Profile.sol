@@ -129,18 +129,25 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     }
 
     // recreate-profile-recovery 0001 — re-attach a Profile to an Identity
-    // that survived a ProfileStorage redeploy. Admin-only (ADR 0001):
-    // unlike genesis createProfile, the supplied identityId may already
-    // carry third-party delegated stake, so an operational key must not
-    // be able to re-price the operator fee. The identityId is reused — no
-    // new identity is minted — so id-keyed staking/conviction/sharding
-    // state stays addressable.
+    // that survived a ProfileStorage redeploy. The caller passes the node
+    // operational wallet (operators know this; the numeric identityId is
+    // internal and often unknown), and the contract resolves the id via
+    // IdentityStorage. Admin-only (ADR 0001): unlike genesis createProfile,
+    // the resolved identityId may already carry third-party delegated
+    // stake, so an operational key must not be able to re-price the
+    // operator fee — _checkAdmin enforces the admin key after resolution
+    // (a zero/unknown wallet resolves to id 0, which has no admin and
+    // reverts). The identityId is reused — no new identity is minted — so
+    // id-keyed staking/conviction/sharding state stays addressable.
     function recreateProfile(
-        uint72 identityId,
+        address operationalWallet,
         string calldata nodeName,
         bytes calldata nodeId,
         uint16 initialOperatorFee
-    ) external onlyWhitelisted onlyAdmin(identityId) {
+    ) external onlyWhitelisted {
+        uint72 identityId = identityStorage.getIdentityId(operationalWallet);
+        _checkAdmin(identityId);
+
         ProfileStorage ps = profileStorage;
 
         if (ps.profileExists(identityId)) {

@@ -348,13 +348,32 @@ describe('@unit Profile contract', function () {
       await ProfileStorage.deleteProfile(identityId1);
     }
 
+    it('admin recreates by supplying the node operational wallet, not the numeric id', async () => {
+      await seedBrickedIdentity();
+      // accounts[0] is the operational wallet minted by createProfile;
+      // accounts[1] is the admin. The admin recovers WITHOUT knowing the
+      // numeric identityId — it passes the node operational wallet and the
+      // contract resolves the id (admin auth still enforced).
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          accounts[0].address,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.not.be.reverted;
+
+      expect(await ProfileStorage.profileExists(identityId1)).to.equal(true);
+      expect(await ProfileStorage.getNodeId(identityId1)).to.equal(nodeId1);
+    });
+
     it('admin recreates the Profile under the same identityId', async () => {
       await seedBrickedIdentity();
       expect(await ProfileStorage.profileExists(identityId1)).to.equal(false);
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           nodeId1,
           1000,
@@ -374,7 +393,7 @@ describe('@unit Profile contract', function () {
       );
 
       await Profile.connect(accounts[1]).recreateProfile(
-        identityId1,
+        accounts[0].address,
         'Node 1',
         nodeId1,
         1000,
@@ -400,7 +419,7 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           nodeId1,
           1000,
@@ -416,7 +435,7 @@ describe('@unit Profile contract', function () {
       // accounts[0] is the operational key minted by createProfile.
       await expect(
         Profile.connect(accounts[0]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           nodeId1,
           1000,
@@ -429,7 +448,43 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[5]).recreateProfile(
-          identityId1,
+          accounts[0].address,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
+    });
+
+    it('reverts when the operational wallet has no identity (resolves to id 0)', async () => {
+      await seedBrickedIdentity();
+      // accounts[6] has no identity → getIdentityId == 0 → _checkAdmin(0)
+      // reverts (id 0 is never assigned, has no admin key).
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          accounts[6].address,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
+    });
+
+    it('reverts when caller admins a different identity than the operational wallet resolves to', async () => {
+      await seedBrickedIdentity();
+      // identity 2: operational = accounts[3], admin = accounts[4].
+      await Profile.connect(accounts[3]).createProfile(
+        accounts[4].address,
+        [],
+        'Node 2',
+        '0x17f38512786964d9e70453371e7c98975d284100d44bd68dab67fe00b525cb66',
+        1000,
+      );
+      // admin of identity 2 passes identity 1's operational wallet →
+      // resolves to id 1 → _checkAdmin(1) for the wrong admin reverts.
+      await expect(
+        Profile.connect(accounts[4]).recreateProfile(
+          accounts[0].address,
           'Node 1',
           nodeId1,
           1000,
@@ -442,7 +497,7 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           '',
           nodeId1,
           1000,
@@ -455,7 +510,7 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           '0x',
           1000,
@@ -475,7 +530,7 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           nodeId1,
           1000,
@@ -501,7 +556,7 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           nodeId1,
           1000,
@@ -515,7 +570,7 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           nodeId1,
           maxFee,
@@ -529,7 +584,7 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           nodeId1,
           maxFee + 1n,
@@ -543,7 +598,7 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           nodeId1,
           1000,
@@ -561,7 +616,7 @@ describe('@unit Profile contract', function () {
 
       await expect(
         Profile.connect(accounts[1]).recreateProfile(
-          identityId1,
+          accounts[0].address,
           'Node 1',
           nodeId1,
           1000,
@@ -572,7 +627,7 @@ describe('@unit Profile contract', function () {
     it('regression: a brand-new wallet can still createProfile after a recovery', async () => {
       await seedBrickedIdentity();
       await Profile.connect(accounts[1]).recreateProfile(
-        identityId1,
+        accounts[0].address,
         'Node 1',
         nodeId1,
         1000,

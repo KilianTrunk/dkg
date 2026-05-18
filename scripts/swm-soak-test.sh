@@ -35,6 +35,25 @@
 # peers exist in our local SWM graph", which is the ground-truth
 # delivery measurement.
 #
+# Ship-gate denominator (PR #572 R12)
+# -----------------------------------
+# Each peer publishes its OWN accepted-write count after the cycle
+# loop finishes (and before the 5-min settle) under
+#   urn:swm-soak-summary:<TAG>:<SOAK_COHORT_ID>
+# with predicate `urn:swm-soak:writesAccepted "<count>"`. The final
+# tally then uses that count — not the configured cycle target — as
+# each peer's denominator. Pre-fix the denominator was always
+# `SWM_TOTAL_CYCLES`, so any sender that had a local rejection
+# (daemon backpressure, manual ctrl-c, etc.) would be scored below
+# 100% even when every accepted write reached every receiver. The
+# ship gate now strictly measures transport delivery, not the
+# composite write+transport pipeline.
+#
+# Peers whose tombstone never arrives (e.g. their summary share
+# itself was dropped, or they crashed before emitting) are reported
+# as INDETERMINATE so the operator can investigate rather than
+# silently bake a "missing" peer into the pass/fail metric.
+#
 # Expected setup (SETUP STEPS)
 # ----------------------------
 # 1. One operator creates each CG and shares the cgId out-of-band:
@@ -71,15 +90,33 @@
 # Optional env vars:
 #   SWM_CG_CURATED   comma-separated curated CG ids (default: empty)
 #   SWM_CG_PUBLIC    comma-separated public CG ids   (default: empty)
-#   SWM_INTERVAL_S   seconds between cycles          (default: 30)
+#   SWM_INTERVAL_S   start-to-start cycle cadence in seconds
+#                    (default: 30). Wall-clock spacing between
+#                    successive cycle starts — per-cycle work
+#                    (writes + 5s settle + snapshots + /api/slo)
+#                    runs INSIDE this budget rather than stacking
+#                    on top of it. A cycle that exceeds the
+#                    budget logs a WARN and the next cycle starts
+#                    immediately. Pre-fix (PR #572 R11) the loop
+#                    slept this many seconds AFTER each cycle's
+#                    work, so a 12h × 30s soak actually took
+#                    closer to 15h.
 #   SWM_TOTAL_CYCLES number of write cycles          (default: 1440)
 #   PEERS_EXPECTED   comma-separated peer tags (other ops) for
-#                    per-peer delivery breakdown in summary
-#   SOAK_COHORT_ID   shared cohort id (recommended for multi-peer
-#                    soaks — every participating peer must pass
-#                    the SAME value out-of-band; defaults to the
-#                    per-peer RUN_ID, which is fine for solo runs
-#                    but collapses to "this peer only" filtering)
+#                    per-peer delivery breakdown in summary. When
+#                    set, the script requires an explicit
+#                    SOAK_COHORT_ID (see below) and fails fast at
+#                    boot if it's missing — otherwise each peer
+#                    would silently self-filter and report 0%
+#                    delivery from every other peer.
+#   SOAK_COHORT_ID   shared cohort id (REQUIRED for multi-peer
+#                    soaks where PEERS_EXPECTED is set — every
+#                    participating peer must pass the SAME value
+#                    out-of-band). For solo runs (PEERS_EXPECTED
+#                    unset) this defaults to the per-invocation
+#                    RUN_ID, which still rejects stale rows from
+#                    prior solo runs but collapses to
+#                    "this peer only" filtering by design.
 #   AUTH / DKG_AUTH  bearer token; if neither is set the script
 #                    falls back to ${DKG_HOME}/auth.token
 #
@@ -222,7 +259,29 @@ SOAK_START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # rows from prior runs (their own writes are tagged with the new
 # RUN_ID), without forcing operators in a multi-peer cohort to
 # remember an extra env var.
-SOAK_COHORT_ID="${SOAK_COHORT_ID:-$RUN_ID}"
+SOAK_COHORT_ID_EXPLICIT=1
+if [ -z "${SOAK_COHORT_ID:-}" ]; then
+  SOAK_COHORT_ID_EXPLICIT=0
+  SOAK_COHORT_ID="$RUN_ID"
+fi
+
+# Codex PR #572 R10 (round 4): when `PEERS_EXPECTED` is set, the
+# operator is running a coordinated multi-peer soak and EXPECTS to
+# receive other peers' writes. Defaulting SOAK_COHORT_ID to the
+# per-peer RUN_ID in that mode would silently make the receiver
+# only count its own writes — every cross-peer percentage in the
+# final report would be 0% and the operator would only discover
+# this after the run completes. Fail fast at boot instead of
+# burning hours of soak time on data that can't possibly answer
+# the multi-peer reliability question.
+if [ -n "$PEERS_EXPECTED" ] && [ "$SOAK_COHORT_ID_EXPLICIT" = "0" ]; then
+  echo "ERROR: PEERS_EXPECTED is set (multi-peer soak) but SOAK_COHORT_ID was not." >&2
+  echo "       In multi-peer mode every participating operator must supply the SAME" >&2
+  echo "       SOAK_COHORT_ID value out-of-band; otherwise the tally SPARQL filters" >&2
+  echo "       on each peer's per-invocation RUN_ID and silently reports 0% delivery" >&2
+  echo "       from every remote peer. Pick a shared id (e.g. SOAK_COHORT_ID=rc9-soak-$(date -u +%Y%m%d)) and re-run." >&2
+  exit 64
+fi
 
 LOG_DIR="${DKG_HOME}/swm-soak-test-$(date -u +%Y%m%d-%H%M%S)-${SENDER_TAG}"
 mkdir -p "$LOG_DIR"
@@ -469,6 +528,121 @@ except Exception as e:
   log "  $summary"
 }
 
+# Codex PR #572 R12 (round 4): emit a self-described "writes
+# accepted" tombstone for this peer at the end of the cycle loop,
+# BEFORE the 5-min settle window, so receivers can use the
+# correct per-peer denominator in the final tally.
+#
+# Pre-fix the final summary computed `pct = got / cycles * 100`
+# where `cycles` was the CONFIGURED total. Any sender that had
+# local rejections (backpressure, daemon hiccup, ctrl-c after
+# partial run) reduced its accepted-writes count below `cycles`,
+# and even with 100% transport delivery the receiver would
+# report it as failing the 99.9% ship gate. That conflates
+# "writes the peer ever submitted" with "writes the network
+# delivered to me" — the ship gate is meant to measure the
+# latter only.
+#
+# Fix: each peer publishes its own accepted-write count under
+#   urn:swm-soak-summary:<TAG>:<COHORT_ID>
+#   ─ urn:swm-soak:writesAccepted "<count>"
+#   ─ urn:swm-soak:cohortId "<COHORT_ID>"
+#   ─ urn:swm-soak:sentBy "<TAG>"
+# AFTER the cycle loop completes, then receivers SPARQL for
+# those summary subjects during the final snapshot and use each
+# peer's published `writesAccepted` as the denominator. Peers
+# whose summary share didn't arrive (transport loss of the
+# summary itself, or peer crashed before emit) are marked
+# INDETERMINATE in the report rather than being scored against
+# the configured cycle count.
+#
+# Subject scheme is distinct from per-cycle `urn:swm-soak:<TAG>:<seq>`
+# so the per-cycle regex in the final-summary parser doesn't pick
+# up the summary subject.
+emit_writes_accepted_summary() {
+  local cgId=$1 ts subject writes_accepted body resp ok
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  subject="urn:swm-soak-summary:${SENDER_TAG}:${SOAK_COHORT_ID}"
+  writes_accepted=$(grep -c '"shareOperationId"' "$LOG_DIR/writes.jsonl" 2>/dev/null || echo 0)
+  body=$(python3 -c "
+import json
+print(json.dumps({
+  'contextGraphId': '$cgId',
+  'quads': [{
+    'subject': '$subject',
+    'predicate': 'urn:swm-soak:writesAccepted',
+    'object': '\"$writes_accepted\"',
+    'graph': '',
+  }, {
+    'subject': '$subject',
+    'predicate': 'urn:swm-soak:sentBy',
+    'object': '\"$SENDER_TAG\"',
+    'graph': '',
+  }, {
+    'subject': '$subject',
+    'predicate': 'urn:swm-soak:cohortId',
+    'object': '\"$SOAK_COHORT_ID\"',
+    'graph': '',
+  }, {
+    'subject': '$subject',
+    'predicate': 'urn:swm-soak:runId',
+    'object': '\"$RUN_ID\"',
+    'graph': '',
+  }, {
+    'subject': '$subject',
+    'predicate': 'urn:swm-soak:sentAt',
+    'object': '\"$ts\"',
+    'graph': '',
+  }],
+}))
+")
+  resp=$(curl -s --max-time 30 -X POST "$API/api/shared-memory/write" \
+    -H "Authorization: Bearer $AUTH" \
+    -H "Content-Type: application/json" \
+    -d "$body")
+  printf '{"cgId":"%s","writesAccepted":%d,"ts":"%s","subject":"%s","resp":%s}\n' \
+    "$cgId" "$writes_accepted" "$ts" "$subject" "${resp:-{\"error\":\"empty response\"\}}" \
+    >> "$LOG_DIR/writes-accepted-summaries.jsonl"
+  ok=$(printf '%s' "$resp" | python3 -c "
+import json, sys
+try:
+  d = json.loads(sys.stdin.read())
+  print('ok' if d.get('shareOperationId') else 'fail')
+except: print('fail')
+" 2>/dev/null)
+  log "  writes-accepted-summary cg=$cgId tag=$SENDER_TAG writesAccepted=$writes_accepted → $ok"
+}
+
+snapshot_writes_accepted_summaries() {
+  # SPARQL the SWM graph for writes-accepted summary tombstones
+  # from EVERY peer in the cohort (including self). Receivers
+  # consume the resulting jsonl to populate the per-peer
+  # denominator in the final tally.
+  local cgId=$1 ts
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local swm_graph="did:dkg:context-graph:${cgId}/_shared_memory"
+  local sparql
+  sparql=$(cat <<SPARQL
+SELECT ?s ?tag ?writesAccepted WHERE {
+  GRAPH <${swm_graph}> {
+    ?s <urn:swm-soak:cohortId>      "${SOAK_COHORT_ID}" ;
+       <urn:swm-soak:sentBy>        ?tag ;
+       <urn:swm-soak:writesAccepted> ?writesAccepted .
+  }
+}
+SPARQL
+)
+  local body resp
+  body=$(python3 -c "import json; print(json.dumps({'sparql': '''$sparql''', 'contextGraphId': '$cgId'}))")
+  resp=$(curl -s --max-time 30 -X POST "$API/api/query" \
+    -H "Authorization: Bearer $AUTH" \
+    -H "Content-Type: application/json" \
+    -d "$body")
+  printf '{"cgId":"%s","ts":"%s","data":%s}\n' \
+    "$cgId" "$ts" "${resp:-{\"error\":\"empty response\"\}}" \
+    >> "$LOG_DIR/writes-accepted-summaries-observed.jsonl"
+}
+
 split_cgs() {
   local raw=$1
   if [ -z "$raw" ]; then return; fi
@@ -484,7 +658,7 @@ trap 'log "INTERRUPTED — stopping at cycle ${seq:-?}"; exit 130' INT TERM
 log "=== START swm-soak-test ==="
 log "  sender_tag=$SENDER_TAG"
 log "  run_id=$RUN_ID"
-log "  soak_cohort_id=$SOAK_COHORT_ID$( [ "$SOAK_COHORT_ID" = "$RUN_ID" ] && printf ' (defaulted to RUN_ID — solo-mode filter, set SOAK_COHORT_ID to receive other peers writes)' )"
+log "  soak_cohort_id=$SOAK_COHORT_ID$( [ "$SOAK_COHORT_ID_EXPLICIT" = "0" ] && printf ' (defaulted to RUN_ID — solo-mode filter; set SOAK_COHORT_ID to receive other peers writes)' )"
 log "  soak_start_iso=$SOAK_START_ISO"
 log "  self_peer_id=${SELF_PEER_ID:-<unresolved>}"
 log "  curated_cgs=${SWM_CG_CURATED:-<none>}"
@@ -500,6 +674,23 @@ for cg in "${ALL_CGS[@]}"; do snapshot_swm_inbox "baseline" "$cg"; done
 snapshot_slo "baseline"
 log ""
 
+# Codex PR #572 R11 (round 4): SWM_INTERVAL_S is documented as the
+# spacing between cycles, but the pre-fix loop slept the full
+# interval AFTER doing the writes + 5s settle + snapshots + SLO
+# fetch. At 30s interval × 5s settle × ~1–2s per HTTP roundtrip,
+# the actual cycle cadence drifted to ~37–40s and a "12h soak"
+# stretched to closer to 15h.
+#
+# Now: each cycle has a target END timestamp `next_cycle_target_s`
+# = `cycle_start_s + SWM_INTERVAL_S`. After all per-cycle work, we
+# sleep for whatever remains until that target (or warn + skip if
+# the cycle blew the budget). The 5s settle, the snapshots, and
+# the SLO fetch are all INSIDE the budget, so the start-to-start
+# cadence stays at SWM_INTERVAL_S regardless of measurement
+# overhead. If the per-cycle work exceeds the budget the warning
+# surfaces immediately rather than silently extending wall-clock
+# duration.
+next_cycle_target_s=$(( $(date +%s) + SWM_INTERVAL_S ))
 for seq in $(seq 1 "$SWM_TOTAL_CYCLES"); do
   log "--- CYCLE $seq/$SWM_TOTAL_CYCLES ---"
   for cg in "${ALL_CGS[@]}"; do
@@ -511,14 +702,29 @@ for seq in $(seq 1 "$SWM_TOTAL_CYCLES"); do
   done
   snapshot_slo "post-cycle-$seq"
   if [ "$seq" -lt "$SWM_TOTAL_CYCLES" ]; then
-    sleep "$SWM_INTERVAL_S"
+    now_s=$(date +%s)
+    remain_s=$(( next_cycle_target_s - now_s ))
+    if [ "$remain_s" -gt 0 ]; then
+      sleep "$remain_s"
+    elif [ "$remain_s" -lt 0 ]; then
+      log "WARN: cycle $seq overran SWM_INTERVAL_S=${SWM_INTERVAL_S}s budget by $(( -remain_s ))s; cadence has drifted. Consider raising SWM_INTERVAL_S or reducing per-cycle work."
+    fi
+    next_cycle_target_s=$(( next_cycle_target_s + SWM_INTERVAL_S ))
   fi
 done
 
 log ""
+# Codex PR #572 R12 (round 4): emit per-CG writes-accepted
+# tombstone BEFORE settle so receivers have time to observe it
+# and use it as the per-peer denominator in the final tally.
+# (See `emit_writes_accepted_summary` for the rationale.)
+log "Publishing per-peer writes-accepted tombstone before settle window..."
+for cg in "${ALL_CGS[@]}"; do emit_writes_accepted_summary "$cg"; done
+
 log "All cycles done. Waiting 5min for any late inbound to settle (gossip mesh, substrate retries, runSyncOnConnect catch-up)..."
 sleep 300
 for cg in "${ALL_CGS[@]}"; do snapshot_swm_inbox "final" "$cg"; done
+for cg in "${ALL_CGS[@]}"; do snapshot_writes_accepted_summaries "$cg"; done
 snapshot_slo "final"
 
 log ""
@@ -538,6 +744,46 @@ log_dir = "$LOG_DIR"
 self_tag = "$SENDER_TAG"
 peers_expected = [p.strip() for p in "$PEERS_EXPECTED".split(',') if p.strip()]
 cycles = $SWM_TOTAL_CYCLES
+
+# Codex PR #572 R12 (round 4): build per-(cg, sender) denominator
+# table from the writes-accepted summary tombstones each peer
+# emits before the settle window. denom_by_cg[cg][tag] = peer's
+# self-reported accepted-write count. Pre-fix the denominator was
+# always `cycles`, so any sender with local rejections (e.g. a
+# crash mid-run or a daemon backpressure event that returned no
+# shareOperationId) would be scored against an unreachable target
+# even with 100% transport delivery, conflating sender-side
+# rejection with network loss. With the tombstone the ship gate
+# now strictly measures transport reliability.
+denom_by_cg = {}
+try:
+  with open(os.path.join(log_dir, 'writes-accepted-summaries-observed.jsonl')) as f:
+    for line in f:
+      rec = json.loads(line)
+      cg = rec.get('cgId')
+      if not cg: continue
+      data = rec.get('data') or {}
+      rows = []
+      if isinstance(data, dict):
+        inner = data.get('result')
+        if isinstance(inner, dict) and isinstance(inner.get('bindings'), list):
+          rows = inner['bindings']
+        elif isinstance(data.get('bindings'), list):
+          rows = data['bindings']
+      bucket = denom_by_cg.setdefault(cg, {})
+      for r in rows:
+        tag_v = r.get('tag', '')
+        if isinstance(tag_v, dict): tag_v = tag_v.get('value', '')
+        wa_v = r.get('writesAccepted', '')
+        if isinstance(wa_v, dict): wa_v = wa_v.get('value', '')
+        if not tag_v: continue
+        try: wa_int = int(wa_v)
+        except (TypeError, ValueError): continue
+        prev = bucket.get(tag_v)
+        if prev is None or wa_int > prev:
+          bucket[tag_v] = wa_int
+except FileNotFoundError:
+  pass
 
 by_cg_final = {}
 try:
@@ -586,29 +832,61 @@ try:
 except FileNotFoundError:
   print('  (no swm-inbox.jsonl)')
 
+# Resolve our own writes_ok (count of local writes that the
+# daemon accepted with a shareOperationId). Used as the self
+# denominator (we don't need to read our own published
+# tombstone — we have ground truth locally).
+self_writes_accepted = None
+try:
+  with open(os.path.join(log_dir, 'writes.jsonl')) as f:
+    self_writes_accepted = sum(1 for ln in f if '"shareOperationId"' in ln)
+except FileNotFoundError:
+  pass
+
+def denominator_for(cg, tag):
+  # Self: use locally-counted accepted writes (ground truth, no
+  # transport dependence).
+  if tag == self_tag:
+    return ('self', self_writes_accepted if self_writes_accepted is not None else cycles, self_writes_accepted is not None)
+  # Peer: use the writes-accepted tombstone if observed.
+  wa = (denom_by_cg.get(cg) or {}).get(tag)
+  if wa is not None:
+    return ('peer-tombstone', wa, True)
+  # No tombstone observed for this peer in this CG: indeterminate.
+  return ('missing', None, False)
+
 for cg, by_tag in sorted(by_cg_final.items()):
   print(f'  cg={cg}:')
-  print(f'    self ({self_tag}): {len(by_tag.get(self_tag, set()))}/{cycles} (sanity-check: should equal total writes)')
+  src, denom, ok = denominator_for(cg, self_tag)
+  got = len(by_tag.get(self_tag, set()))
+  if denom is None:
+    print(f'    self ({self_tag}): {got} observed (no local writes.jsonl — INDETERMINATE)')
+  else:
+    pct = (got / denom * 100.0) if denom else 0.0
+    sanity = '' if got == denom else f'  [WARN: observed {got} self-shares but accepted {denom} locally]'
+    print(f'    self ({self_tag}): {got}/{denom} = {pct:.2f}% (denom=local writes.jsonl){sanity}')
+
   others_seen = sorted(t for t in by_tag if t != self_tag)
+  reportable = peers_expected if peers_expected else others_seen
+  for peer in reportable:
+    got = len(by_tag.get(peer, set()))
+    src, denom, ok = denominator_for(cg, peer)
+    if not ok:
+      print(f'    from {peer}: {got} observed (no writes-accepted tombstone in cg — INDETERMINATE; review writes-accepted-summaries-observed.jsonl)')
+      continue
+    pct = (got / denom * 100.0) if denom else 0.0
+    ship_gate = '' if pct >= 99.9 else '  [BELOW 99.9% — review postmortem]'
+    print(f'    from {peer}: {got}/{denom} = {pct:.2f}% (denom=peer tombstone){ship_gate}')
   if peers_expected:
-    for peer in peers_expected:
-      got = len(by_tag.get(peer, set()))
-      pct = (got / cycles * 100.0) if cycles else 0.0
-      flag = '' if pct >= 99.9 else '  [BELOW 99.9% — review postmortem]'
-      print(f'    from {peer}: {got}/{cycles} = {pct:.2f}%{flag}')
     unexpected = [t for t in others_seen if t not in peers_expected]
     if unexpected:
       print(f'    unexpected senders observed: {unexpected}')
-  else:
-    for t in others_seen:
-      got = len(by_tag.get(t, set()))
-      pct = (got / cycles * 100.0) if cycles else 0.0
-      flag = '' if pct >= 99.9 else '  [BELOW 99.9%]'
-      print(f'    from {t}: {got}/{cycles} = {pct:.2f}%{flag}')
 PYTHON
 log ""
 log "Detailed logs:"
-log "  writes:     $LOG_DIR/writes.jsonl"
-log "  swm-inbox:  $LOG_DIR/swm-inbox.jsonl  (per-cycle SPARQL snapshots of each CG's local SWM)"
-log "  slo:        $LOG_DIR/slo.jsonl        (per-cycle /api/slo: protocols + gossip + swm sections)"
-log "  trace:      $LOG_DIR/main.log"
+log "  writes:                          $LOG_DIR/writes.jsonl"
+log "  swm-inbox:                       $LOG_DIR/swm-inbox.jsonl  (per-cycle SPARQL snapshots of each CG's local SWM)"
+log "  slo:                             $LOG_DIR/slo.jsonl        (per-cycle /api/slo: protocols + gossip + swm sections)"
+log "  writes-accepted-emitted:         $LOG_DIR/writes-accepted-summaries.jsonl          (this peer's published accepted-write tombstones)"
+log "  writes-accepted-observed:        $LOG_DIR/writes-accepted-summaries-observed.jsonl (other peers' tombstones — denominators for the ship gate)"
+log "  trace:                           $LOG_DIR/main.log"

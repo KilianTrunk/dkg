@@ -3091,9 +3091,19 @@ export class DKGAgent {
       // populate the receiver's dedup cache, so when withRetry
       // re-issues with the same messageId the responder returns
       // the cached response without re-running the handler.
-      send: async (peerId, protocolId, data, sendTimeoutMs) => {
+      //
+      // rc.9 PR-E follow-up (codex review on #569): `messageId` is
+      // the stable per-page key computed by `computeSyncPageMessageId`
+      // in page-fetch.ts BEFORE entering the withRetry loop. Passing
+      // it through to `sendReliable` is what makes the dedup actually
+      // work — without it, `sendReliable` falls back to `randomUUID()`
+      // on every retry, producing a fresh outbox entry + fresh
+      // responder-side execution for what is logically the same
+      // request, the bug this PR was meant to fix.
+      send: async (peerId, protocolId, data, sendTimeoutMs, messageId) => {
         const result = await this.messenger.sendReliable(peerId, protocolId, data, {
           timeoutMs: sendTimeoutMs,
+          messageId,
         });
         if (!result.delivered) {
           throw new Error(

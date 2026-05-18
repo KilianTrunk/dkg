@@ -43,10 +43,57 @@ interface FetchSyncPagesParams {
   checkpointStore: SyncCheckpointStore;
   buildSyncRequest: (contextGraphId: string, offset: number, limit: number, includeSharedMemory: boolean, remotePeerId: string, phase?: SyncPhase, snapshotRef?: string) => Promise<Uint8Array>;
   parseAndFilter: (nquadsText: string, graphUri: string, contextGraphId: string) => Promise<{ quads: Quad[]; totalQuads: number }>;
-  send: (peerId: string, protocolId: string, data: Uint8Array, timeoutMs: number) => Promise<Uint8Array>;
+  /**
+   * rc.9 PR-E follow-up (codex review on #569): `send` receives a
+   * stable per-page `messageId` so a substrate-backed implementation
+   * (e.g. {@link DKGAgent}'s adapter that routes through
+   * `messenger.sendReliable`) keeps the SAME idempotency key across
+   * every {@link withRetry} attempt. Without that, each retry would
+   * mint a fresh randomUUID() and defeat both sender-side dedup and
+   * the receiver's response cache, leaving multiple queued outbox
+   * entries for the same logical page request.
+   */
+  send: (
+    peerId: string,
+    protocolId: string,
+    data: Uint8Array,
+    timeoutMs: number,
+    messageId: string,
+  ) => Promise<Uint8Array>;
   logWarn: (ctx: OperationContext, message: string) => void;
   logInfo: (ctx: OperationContext, message: string) => void;
   logDebug: (ctx: OperationContext, message: string) => void;
+}
+
+/**
+ * Stable, deterministic idempotency key for a single sync page request.
+ *
+ * Composed from the inputs that uniquely identify "which page from
+ * which responder for which slice of state" — `(remotePeerId, cgId,
+ * phase, offset, snapshotRef)`. This is unique per logical page from
+ * this requester's point of view, which is what the messenger needs
+ * to dedup sender-side retries and to serve the receiver's response
+ * cache on the second arrival.
+ *
+ * Note: requester peerId is intentionally NOT in the key — the
+ * messenger already namespaces idempotency by `(senderPeerId,
+ * protocolId, messageId)` internally, so "our identity" is implicit.
+ * Including it would only matter if a single messenger instance ran
+ * with multiple identities, which we never do.
+ *
+ * Plain string (not hashed) — it's an idempotency key, not a secret;
+ * exact-match lookups in the messenger's Maps so length is fine.
+ *
+ * rc.9 PR-E follow-up (codex review on #569).
+ */
+export function computeSyncPageMessageId(parts: {
+  remotePeerId: string;
+  contextGraphId: string;
+  phase: SyncPhase;
+  offset: number;
+  snapshotRef?: string;
+}): string {
+  return `sync:${parts.remotePeerId}:${parts.contextGraphId}:${parts.phase}:${parts.offset}:${parts.snapshotRef ?? '-'}`;
 }
 
 export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<SyncPageResult> {
@@ -97,6 +144,18 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
 
     const curOffset = offset;
     const transportStartedAt = Date.now();
+    // Compute stable messageId ONCE per page, OUTSIDE the withRetry
+    // wrapper inside sendSyncRequest, so every retry attempt for this
+    // page reuses the same id. See `computeSyncPageMessageId` jsdoc
+    // for rationale; without this, substrate-backed `send`
+    // implementations would defeat dedup.
+    const pageMessageId = computeSyncPageMessageId({
+      remotePeerId,
+      contextGraphId,
+      phase,
+      offset: curOffset,
+      snapshotRef,
+    });
     const responseBytes = await sendSyncRequest({
       remotePeerId,
       timeoutMs,
@@ -106,6 +165,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
       protocolId: protocolSync,
       requestFactory: () => buildSyncRequest(contextGraphId, curOffset, syncPageSize, includeSharedMemory, remotePeerId, phase, snapshotRef),
       send,
+      messageId: pageMessageId,
       onRetry: (attempt, delay, err) => {
         logWarn(ctx, `Sync page retry ${attempt}/${syncPageRetryAttempts} for offset ${offset} (delay ${Math.round(delay)}ms): ${err instanceof Error ? err.message : String(err)}`);
       },

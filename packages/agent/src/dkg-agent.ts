@@ -8989,8 +8989,14 @@ export class DKGAgent {
    *    PR-B-added subscriber-snapshot accessor (best-effort, may
    *    lag by one heartbeat interval; documented in
    *    GossipSubManager.getSubscribers).
-   *  - `selfPeerId` — never fan out to ourselves; the local apply
+   *  - `getSelfPeerId` — never fan out to ourselves; the local apply
    *    already happened in the caller of `publishWorkspaceGossip`.
+   *    Passed as a thunk (not the resolved string) because
+   *    `this.peerId` throws `DKGNode not started` before libp2p has
+   *    booted — eagerly capturing it here would break pre-start
+   *    `share()` callers (PR-C codex R8). The thunk lets any throw
+   *    bubble out of `enumerate()`, where the R1 try/catch in
+   *    `publishWorkspaceGossip` rescues into the gossip-only path.
    */
   private getOrCreateCGMemberEnumerator(): CGMemberEnumerator {
     if (!this.cgMemberEnumerator) {
@@ -8999,7 +9005,7 @@ export class DKGAgent {
         isPrivateContextGraph: (cgId) => this.isPrivateContextGraph(cgId),
         getTopicSubscribers: (topic) => this.gossip.getSubscribers(topic),
         topicForCG: (cgId) => contextGraphWorkspaceTopic(cgId),
-        selfPeerId: this.peerId,
+        getSelfPeerId: () => this.peerId,
       });
     }
     return this.cgMemberEnumerator;

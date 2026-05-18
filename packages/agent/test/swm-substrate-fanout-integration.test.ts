@@ -96,8 +96,10 @@ async function createAgent(name: string): Promise<DKGAgent> {
   // DKGNode.peerId is a getter that delegates into the live libp2p
   // node; without `start()` it throws. Pin it to a deterministic
   // string for the substrate-fanout self-exclusion check (the
-  // CGMemberEnumerator captures `selfPeerId: this.peerId` once at
-  // agent constructor time).
+  // CGMemberEnumerator reads `this.peerId` lazily on each resolve
+  // via the `getSelfPeerId` thunk — PR-C codex R8). Most tests rely
+  // on this stub; the dedicated R8 test below removes it to verify
+  // the pre-start `share()` contract.
   Object.defineProperty((agent as unknown as { node: object }).node, 'peerId', {
     value: SELF_PEER,
     configurable: true,
@@ -222,8 +224,9 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
   it('excludes self from substrate fan-out even when self is a topic subscriber', async () => {
     const agent = await createAgent('SubstrateFanoutSelfExclude');
     const gossip = new CapturingGossip();
-    // CGMemberEnumerator filters self out via the `selfPeerId` dep,
-    // which is wired to `this.peerId` (set above to SELF_PEER).
+    // CGMemberEnumerator filters self out via the `getSelfPeerId`
+    // thunk, which is wired to `() => this.peerId` (set above to
+    // SELF_PEER).
     gossip.subscribers = [SELF_PEER, '12D3KooWPeerOther'];
     (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
 

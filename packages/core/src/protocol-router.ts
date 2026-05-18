@@ -2,6 +2,11 @@ import type { Stream } from '@libp2p/interface';
 import type { StreamHandler as DKGStreamHandler } from './types.js';
 import type { DKGNode } from './node.js';
 import type { PeerResolver } from './network/peer-resolver.js';
+import {
+  MessageStreamPool,
+  POOLED_MESSAGE_PROTOCOL,
+  type MessageStreamPoolOptions,
+} from './message-stream-pool.js';
 
 /** Default max bytes readAll will buffer before aborting (10 MB). */
 export const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024;
@@ -109,11 +114,219 @@ export class ProtocolRouter {
    */
   private warnedMissingResolver = false;
   readonly maxReadBytes: number;
+  /**
+   * Per-logical-protocol pooled-transport overlay. When a caller
+   * invokes `router.enablePooling(logicalProtocolId)`, the router
+   * tries the pooled `/dkg/10.0.2/*` wire variant first via
+   * `dialProtocol([pooledId, logicalId])`, and reuses a long-lived
+   * stream per peer. Receivers that don't advertise the pooled wire
+   * variant fall back to the one-shot path within the same `send()`
+   * call (libp2p multistream-select picks the best mutual).
+   *
+   * Stored by LOGICAL protocol id (what the caller passes to
+   * `send`/`register`); the value holds the wire variant + the pool
+   * instance.
+   */
+  private readonly pooledByLogical = new Map<string, PooledOverlay>();
+  /**
+   * Reverse map from WIRE protocol id back to the logical id, so
+   * the inbound handler the pool dispatches to can resolve the
+   * application handler registered under the logical id.
+   */
+  private readonly logicalByWire = new Map<string, string>();
+  /**
+   * Per-peer wire-variant memo. Once a peer has been seen on a
+   * specific wire variant for a given logical protocol, subsequent
+   * sends skip the dial-with-protocol-list overhead by going
+   * directly through the pool (if pooled) or the one-shot path
+   * (otherwise). Cleared on stream reset for the pooled side; the
+   * one-shot side has no memo to clear because every send re-dials
+   * anyway.
+   */
+  private readonly peerWireVariant = new Map<string, Map<string, 'pooled' | 'one-shot'>>();
 
   constructor(node: DKGNode, options?: ProtocolRouterOptions) {
     this.node = node;
     this.peerResolver = options?.peerResolver;
     this.maxReadBytes = options?.maxReadBytes ?? DEFAULT_MAX_READ_BYTES;
+  }
+
+  /**
+   * Opt a logical protocol into the pooled transport overlay. After
+   * this call:
+   *
+   *   * `send(peer, logicalId, data)` first attempts the pooled wire
+   *     variant `/dkg/10.0.2/message` (or the caller-supplied
+   *     `pooledProtocolId`). On multistream-select fallback to the
+   *     logical id, the one-shot path runs unchanged. The wire
+   *     variant chosen per peer is memoized so subsequent sends
+   *     skip the negotiation.
+   *
+   *   * `register(logicalId, handler)` ALSO registers `handler` on
+   *     the pooled wire variant via the pool's inbound handler, so
+   *     peers using the pooled wire reach the same application
+   *     code.
+   *
+   * Calling this method is idempotent; second + later calls update
+   * the per-pool options (handler is re-registered).
+   *
+   * `enablePooling` MUST be called BEFORE `register(logicalId,
+   * handler)` for the pool's inbound handler to pick up the
+   * registration. Re-ordering would silently leave the pooled wire
+   * variant unhandled.
+   */
+  enablePooling(
+    logicalProtocolId: string,
+    options: Partial<MessageStreamPoolOptions> = {},
+  ): void {
+    const existing = this.pooledByLogical.get(logicalProtocolId);
+    if (existing) {
+      // Idempotent — caller might be re-enabling with different
+      // options after a hot-reload; honor the latest config by
+      // tearing down + reopening (no-op for tests that re-construct).
+      // For now, just keep the existing pool and ignore subsequent
+      // calls; callers are expected to enable once at startup.
+      return;
+    }
+    const wireProtocolId = options.protocolId ?? POOLED_MESSAGE_PROTOCOL;
+    // Wire-id collision guard. Codex PR #560 round-3 review caught
+    // that every pool defaults to the same `/dkg/10.0.2/message`
+    // wire id. If a SECOND logical protocol opts in without an
+    // explicit `options.protocolId`, its `libp2p.handle()` would
+    // overwrite the first pool's inbound handler — and inbound
+    // traffic for the first logical protocol would silently
+    // dispatch to the wrong application handler.
+    //
+    // We refuse to install a duplicate wire handler. The caller
+    // must supply a distinct `options.protocolId` for the second
+    // pool (no auto-derived suffix — wire ids are part of the
+    // protocol contract, ad-hoc names would break peer interop).
+    const claimedBy = this.logicalByWire.get(wireProtocolId);
+    if (claimedBy && claimedBy !== logicalProtocolId) {
+      throw new Error(
+        `enablePooling: wire protocol ${wireProtocolId} is already claimed by ` +
+          `logical protocol ${claimedBy}. Pass options.protocolId to use a ` +
+          `distinct wire id for ${logicalProtocolId}.`,
+      );
+    }
+    // Thread the router's `peerResolver` into the pool unless the
+    // caller already supplied a `primePeer` hook. Without this, the
+    // pool would skip resolver priming and regress first-contact
+    // delivery to cold peers (Codex PR #560 review). The router's
+    // own one-shot path already primes per RFC 07 §3.2; this just
+    // keeps the pooled path on parity.
+    const peerResolver = this.peerResolver;
+    const primePeer =
+      options.primePeer ??
+      (peerResolver
+        ? async (peerIdStr: string, opts: { signal?: AbortSignal }) => {
+            await peerResolver
+              .resolve(peerIdStr, { signal: opts.signal })
+              .catch(() => undefined);
+          }
+        : undefined);
+    const pool = new MessageStreamPool(
+      // The node shape required by the pool overlaps with DKGNode but
+      // is narrower; pass the node directly (DKGNode satisfies the
+      // structural subset PoolNode requires).
+      this.node as unknown as Parameters<typeof MessageStreamPool['prototype']['send']>[0] extends never
+        ? never
+        : ConstructorParameters<typeof MessageStreamPool>[0],
+      {
+        ...options,
+        protocolId: wireProtocolId,
+        maxFrameBytes: options.maxFrameBytes ?? this.maxReadBytes,
+        primePeer,
+      },
+    );
+    this.pooledByLogical.set(logicalProtocolId, {
+      pool,
+      wireProtocolId,
+      logicalProtocolId,
+    });
+    this.logicalByWire.set(wireProtocolId, logicalProtocolId);
+    // If a handler is already registered for the logical id, wire it
+    // through the pool's inbound side right away.
+    const handler = this.handlers.get(logicalProtocolId);
+    if (handler) {
+      this.installPoolInboundHandler(logicalProtocolId, pool);
+    }
+  }
+
+  private installPoolInboundHandler(
+    logicalProtocolId: string,
+    pool: MessageStreamPool,
+  ): void {
+    pool.registerHandler(async (requestData, peerId) => {
+      const handler = this.handlers.get(logicalProtocolId);
+      if (!handler) {
+        throw new Error(`no application handler for ${logicalProtocolId}`);
+      }
+      // Wrap into the exact same `{ toString, toBytes }` shape the
+      // one-shot register() path passes to application handlers
+      // (see `register()` ~30 lines below). The pool now threads
+      // the REAL `connection.remotePeer` through, so on production
+      // traffic this exposes `.toMultihash().bytes` just like
+      // one-shot. Tests can pass minimal peer-like objects with
+      // only `.toString()` and the wrap still works (toBytes()
+      // surfaces a typed error rather than silently corrupting).
+      // Codex PR #560 round-3.
+      const remote = peerId as {
+        toString: () => string;
+        toMultihash?: () => { bytes: Uint8Array };
+        toBytes?: () => Uint8Array;
+      };
+      const wrappedPeerId = {
+        toString: () => remote.toString(),
+        toBytes: () => {
+          if (typeof remote.toMultihash === 'function') {
+            return remote.toMultihash().bytes;
+          }
+          if (typeof remote.toBytes === 'function') {
+            return remote.toBytes();
+          }
+          throw new Error('peerId.toBytes not available on pooled handler');
+        },
+      };
+      return handler(requestData, wrappedPeerId);
+    });
+  }
+
+  /**
+   * Diagnostics: snapshot of every pooled overlay (logical id, wire
+   * id, peers-with-live-streams). Empty when no protocols are
+   * pooled.
+   */
+  pooledStatus(): Array<{
+    logicalProtocolId: string;
+    wireProtocolId: string;
+    livePeers: number;
+  }> {
+    return [...this.pooledByLogical.values()].map((overlay) => ({
+      logicalProtocolId: overlay.logicalProtocolId,
+      wireProtocolId: overlay.wireProtocolId,
+      livePeers: overlay.pool.size(),
+    }));
+  }
+
+  /**
+   * Tear down every pooled overlay. Idempotent. The router itself
+   * remains usable for one-shot sends after this — pooling is opt-in
+   * and reversible. Tests call this in `afterEach`; production
+   * daemons call it during shutdown.
+   */
+  async closePooling(): Promise<void> {
+    const overlays = [...this.pooledByLogical.values()];
+    this.pooledByLogical.clear();
+    this.logicalByWire.clear();
+    this.peerWireVariant.clear();
+    for (const overlay of overlays) {
+      try {
+        await overlay.pool.close();
+      } catch {
+        // ignore — best-effort shutdown
+      }
+    }
   }
 
   register(protocolId: string, handler: DKGStreamHandler): void {
@@ -140,11 +353,51 @@ export class ProtocolRouter {
         }
       }
     }, { runOnLimitedConnection: true });
+
+    // If pooling was enabled for this protocol BEFORE the handler
+    // arrived, wire the pool's inbound handler now. (The
+    // `enablePooling` path also calls this once when the handler
+    // already exists — together they cover both orderings.)
+    const overlay = this.pooledByLogical.get(protocolId);
+    if (overlay) {
+      this.installPoolInboundHandler(protocolId, overlay.pool);
+    }
   }
 
   unregister(protocolId: string): void {
     this.handlers.delete(protocolId);
     this.node.libp2p.unhandle(protocolId);
+    // If a pooled overlay is attached to this logical protocol, tear
+    // it down too. Codex PR #560 round-2: leaving the overlay alive
+    // means the `/dkg/10.0.2/...` wire handler stays advertised on
+    // libp2p, and any peer that already memoized this side as
+    // "pooled" will keep dialing the wire variant — but the inbound
+    // handler is gone, so each dial answers "no application
+    // handler" instead of cleanly falling back. The pool's
+    // `close()` `unhandle`s its wire protocol AND rejects every
+    // outstanding request with a recoverable error (substrate
+    // outbox retries → next dial sees protocol-unsupported → memo
+    // flips to one-shot → fallback path runs).
+    //
+    // Fire-and-forget the async close: `unregister` is sync by
+    // contract, and the close is idempotent + safe even if the
+    // pool tears down before its handlers detach from libp2p.
+    // Errors are swallowed (a teardown failure here doesn't block
+    // re-registration).
+    const overlay = this.pooledByLogical.get(protocolId);
+    if (overlay) {
+      this.pooledByLogical.delete(protocolId);
+      this.logicalByWire.delete(overlay.pool.pooledProtocolId);
+      overlay.pool.close().catch(() => undefined);
+    }
+    // Clear any per-peer wire-variant memos for this logical
+    // protocol. Codex PR #560 round-5 caught: without this, a peer
+    // pinned to 'one-shot' for protocol X would stay pinned across
+    // unregister + re-register + re-enable-pooling cycles, never
+    // renegotiating the pooled wire variant until process restart.
+    for (const [_peerId, inner] of this.peerWireVariant) {
+      inner.delete(protocolId);
+    }
   }
 
   async send(
@@ -158,13 +411,101 @@ export class ProtocolRouter {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
     const parallelPaths = Math.max(1, Math.floor(opts.parallelPaths ?? 1));
 
+    // Pooled overlay short-circuit. When `enablePooling(protocolId)`
+    // has been called for this logical protocol AND the peer hasn't
+    // been pinned to the one-shot wire variant by a prior fallback,
+    // route through the pool. The pool handles its own retry, dial,
+    // keepalive, and idle-close semantics, so on success we return
+    // directly. On failure that classifies as "peer doesn't speak
+    // the pooled wire" (multistream-select negotiate / protocol
+    // unsupported), we memoize the peer as one-shot and fall through
+    // to the existing one-shot path below — same `send()` call, no
+    // user-visible retry. Any OTHER pool error (transient transport,
+    // recoverable reset) is bubbled directly to the caller so the
+    // substrate outbox can retry; without bubbling we'd convert a
+    // genuine transport failure into a phantom one-shot fallback and
+    // mask the underlying issue.
+    // Overall wall-clock budget guard. Codex PR #560 round-4 caught
+    // that the pool branch and the one-shot fallback each got a
+    // FRESH `timeoutMs` budget — a slow pool failure followed by a
+    // slow one-shot retry could blow the API contract by ~2x. We
+    // now stamp the start, share a single AbortSignal across both
+    // branches, and compute a remaining-budget that the one-shot
+    // fallback honors. The shared signal aborts BOTH the pool
+    // attempt and any one-shot retry as soon as the overall budget
+    // is exhausted.
+    const overallStartedAt = Date.now();
+    const overallDeadline = AbortSignal.timeout(timeoutMs);
+
+    const overlay = this.pooledByLogical.get(protocolId);
+    const memoizedVariant = this.peerWireVariantFor(peerIdStr, protocolId);
+    if (overlay && memoizedVariant !== 'one-shot') {
+      try {
+        const remainingForPool = Math.max(0, timeoutMs - (Date.now() - overallStartedAt));
+        const response = await overlay.pool.send(peerIdStr, data, {
+          // Share the OVERALL deadline so a fall-through to one-shot
+          // doesn't get a fresh budget. Codex PR #560 round 4.
+          signal: overallDeadline,
+          // Thread the remaining wall-clock into the pool's own
+          // request timer so it lines up with the shared deadline.
+          timeoutMs: remainingForPool,
+        });
+        this.memoizePeerWire(peerIdStr, protocolId, 'pooled');
+        return response;
+      } catch (err) {
+        if (isProtocolUnsupportedError(err)) {
+          // Definitive: peer doesn't advertise the pooled wire
+          // variant. Pin to one-shot for future sends; fall through
+          // to existing single-path / multi-path logic below.
+          this.memoizePeerWire(peerIdStr, protocolId, 'one-shot');
+        } else if (memoizedVariant === 'pooled') {
+          // Peer is KNOWN to speak the pooled wire (we've delivered
+          // on it before). This is a transient failure on the held
+          // stream — the pool has already torn down state and will
+          // reopen on the next call. Bubble the recoverable error
+          // so the substrate's outbox retries on the pooled wire
+          // rather than silently switching to one-shot (which would
+          // pay a fresh dial cost when the next pooled retry would
+          // succeed). Codex PR #560 round 1.
+          throw err;
+        } else {
+          // First contact + non-protocol error (no valid addresses,
+          // dial timeout, ECONNRESET, etc.). Without this fallback,
+          // enabling pooling would regress first-contact delivery
+          // versus the one-shot path: one-shot has the full
+          // resolver-re-prime + 3x retry budget INTERNAL to a
+          // single send, while the pool has just one dial attempt.
+          // Codex PR #560 round 1 caught this.
+          //
+          // Fall through to one-shot WITHOUT memoizing — next send
+          // retries the pool, and if it succeeds we transition to
+          // pooled steady-state. We only memoize on a definitive
+          // negotiation outcome (success → pooled, unsupported →
+          // one-shot).
+        }
+      }
+    }
+
+    // One-shot path: reuse the OVERALL wall-clock budget rather
+    // than starting a fresh timer. If the pool branch already
+    // consumed most of `timeoutMs`, the one-shot retry inherits the
+    // remainder — and `overallDeadline` aborts mid-attempt the
+    // moment the total budget is exhausted. Codex PR #560 round 4.
+    const remainingMs = Math.max(0, timeoutMs - (Date.now() - overallStartedAt));
+    if (remainingMs === 0) {
+      throw new Error(
+        `send timeout: pooled fallback exhausted the ${timeoutMs}ms budget before one-shot attempt`,
+      );
+    }
     const libp2p = this.node.libp2p;
     const { peerIdFromString } = await import('@libp2p/peer-id');
     const peerId = peerIdFromString(peerIdStr);
-    const startedAt = Date.now();
+    const startedAt = overallStartedAt;
 
     if (parallelPaths > 1) {
-      const multipathSignal = AbortSignal.timeout(timeoutMs);
+      // Reuse the overall budget rather than starting a fresh one
+      // — see comment above. Codex PR #560 round 4.
+      const multipathSignal = overallDeadline;
       // Multi-path pre-attempt — race up to N live connections.
       // Returns the response on a winning path, or null if there
       // weren't enough live candidates (or all candidates failed).
@@ -413,7 +754,25 @@ export class ProtocolRouter {
         }
         if (!isRecoverableSendError(err) || attempt >= 2) throw err;
         const backoff = (attempt + 1) * 500;
-        await new Promise(r => setTimeout(r, backoff));
+        // Make the backoff abortable so the overall deadline is
+        // honored. Codex PR #560 round-5 caught: if the pool burned
+        // most of `timeoutMs`, the one-shot retry's fixed 500/1000ms
+        // sleep would still push past the deadline before the next
+        // attempt could fail loudly. Now: if `overallDeadline` fires
+        // during the backoff, we throw immediately rather than
+        // continuing into another attempt that's already over budget.
+        await new Promise<void>((resolve, reject) => {
+          const t = setTimeout(resolve, backoff);
+          const onAbort = (): void => {
+            clearTimeout(t);
+            reject(new Error(`send timeout: backoff aborted by overall deadline (${timeoutMs}ms)`));
+          };
+          if (overallDeadline.aborted) {
+            onAbort();
+            return;
+          }
+          overallDeadline.addEventListener('abort', onAbort, { once: true });
+        });
       }
     }
     throw lastErr;
@@ -814,6 +1173,74 @@ async function readAll(
   }
   return concat(chunks);
 }
+
+/**
+ * Per-(peer, logical-protocol) wire variant memo. Persists across
+ * sends to skip redundant negotiation on subsequent calls.
+ */
+interface PooledOverlay {
+  pool: MessageStreamPool;
+  wireProtocolId: string;
+  logicalProtocolId: string;
+}
+
+/**
+ * Returns true if `err` looks like a multistream-select / protocol-
+ * negotiation failure that justifies falling back to a different
+ * wire variant. Conservative — only fall back on errors that
+ * specifically mean "the peer doesn't speak this protocol", not on
+ * transient transport errors that should retry on the same wire.
+ *
+ * Exported for tests.
+ */
+export function isProtocolUnsupportedError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  // PooledStreamResetError wraps the underlying message verbatim
+  // ("pooled stream reset: <inner>"), so the substrings below
+  // match through the wrapper.
+  return (
+    msg.includes('protocol selection failed') ||
+    msg.includes('could not negotiate') ||
+    msg.includes('unsupported protocol') ||
+    msg.includes('protocol mismatch')
+  );
+}
+
+// Helpers attached to ProtocolRouter via prototype assignment after
+// the class. Implemented this way to keep the class body readable
+// (avoids interleaving the helpers with the long `send` method).
+declare module './protocol-router.js' {
+  interface ProtocolRouter {
+    peerWireVariantFor(peerIdStr: string, logicalProtocolId: string): 'pooled' | 'one-shot' | undefined;
+    memoizePeerWire(peerIdStr: string, logicalProtocolId: string, variant: 'pooled' | 'one-shot'): void;
+  }
+}
+
+ProtocolRouter.prototype.peerWireVariantFor = function (
+  this: ProtocolRouter,
+  peerIdStr: string,
+  logicalProtocolId: string,
+): 'pooled' | 'one-shot' | undefined {
+  const map = (this as unknown as { peerWireVariant: Map<string, Map<string, 'pooled' | 'one-shot'>> })
+    .peerWireVariant;
+  return map.get(peerIdStr)?.get(logicalProtocolId);
+};
+
+ProtocolRouter.prototype.memoizePeerWire = function (
+  this: ProtocolRouter,
+  peerIdStr: string,
+  logicalProtocolId: string,
+  variant: 'pooled' | 'one-shot',
+): void {
+  const map = (this as unknown as { peerWireVariant: Map<string, Map<string, 'pooled' | 'one-shot'>> })
+    .peerWireVariant;
+  let inner = map.get(peerIdStr);
+  if (!inner) {
+    inner = new Map();
+    map.set(peerIdStr, inner);
+  }
+  inner.set(logicalProtocolId, variant);
+};
 
 function concat(arrays: Uint8Array[]): Uint8Array {
   if (arrays.length === 0) return new Uint8Array(0);

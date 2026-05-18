@@ -691,17 +691,64 @@ export interface PeerDiagnostics {
     multiaddrs: string[];
     protocols: string[];
   } | null;
-  /** Pending chat-outbox entries for this peer (oldest-first). */
+  /**
+   * Pending substrate-outbox entries for this peer.
+   *
+   * Top-level fields (`pendingCount`, `oldestFirstFailureAt`,
+   * `attempts`) keep the rc.8 chat-only contract that
+   * `/api/peer-info` + MCP `dkg_peer_info` consumers depend on.
+   *
+   * {@link byProtocol} (rc.9 PR-E codex follow-up #10) breaks out
+   * queued entries per libp2p protocol id so post-substrate-migration
+   * traffic (sync, SWM, future protocols) is visible to operator
+   * diagnostics — without it, a peer stuck on sync catch-up reports
+   * `pendingCount=0` and looks healthy.
+   */
   outbox: {
+    /**
+     * Pending count for the chat protocol specifically. Retained
+     * as a top-level field for backwards compatibility with the
+     * rc.8 (`/api/peer-info`, MCP `dkg_peer_info`) consumers — the
+     * snapshot was chat-only before sync migrated onto the
+     * substrate. New consumers should prefer {@link byProtocol}.
+     */
     pendingCount: number;
+    /** Oldest `firstFailureAt` among chat-protocol pending entries. */
     oldestFirstFailureAt: number | null;
+    /** Per-entry attempt counts among chat-protocol pending entries. */
     attempts: number[];
+    /**
+     * Per-protocol pending breakdown for this peer (rc.9 PR-E
+     * codex follow-up #10). Surfaces queued entries for EVERY
+     * protocol the substrate carries, so stuck sync catch-up,
+     * stuck SWM gossip, etc. show up here rather than being
+     * invisible in operator diagnostics. Empty object when the
+     * peer has no pending entries at all.
+     *
+     * Each key is the libp2p protocol id (e.g. `/dkg/10.0.1/sync`,
+     * `/dkg/10.0.1/message`); the value mirrors the top-level
+     * chat-specific summary shape so operator tooling can render
+     * a per-protocol view with no extra plumbing.
+     */
+    byProtocol: Record<
+      string,
+      {
+        pendingCount: number;
+        oldestFirstFailureAt: number | null;
+        attempts: number[];
+      }
+    >;
   };
   /** Latest ping-round health snapshot (`null` if never pinged). */
   health: PeerHealth | null;
   /** Protocols this peer's identify-handshake advertised. */
   protocols: string[];
-  /** Convenience flag — peer speaks `/dkg/10.0.0/sync`. */
+  /**
+   * Convenience flag — peer advertises the current `PROTOCOL_SYNC`
+   * wire ID. Tracks the constant so the diagnostic stays correct
+   * across protocol-version bumps (rc.9 PR-E: `/dkg/10.0.0/sync` →
+   * `/dkg/10.0.1/sync`).
+   */
   syncCapable: boolean;
 }
 
@@ -2162,8 +2209,14 @@ export class DKGAgent {
       }
     }
 
+    // rc.9 PR-E: bind to messenger.register so the /dkg/10.0.1/sync
+    // handler receives envelope-unwrapped payload + benefits from
+    // receiver-side idempotency dedup. Pre-PR-E this registered on
+    // the raw router, so the constant bump on its own (commit at
+    // PROTOCOL_SYNC declaration) gave the new protocol ID none of
+    // the substrate semantics — Codex review #569 caught the gap.
     registerSyncHandler({
-      router: this.router,
+      register: this.messenger.register.bind(this.messenger),
       protocolSync: PROTOCOL_SYNC,
       syncDeniedResponse: SYNC_DENIED_RESPONSE,
       syncPageSize: SYNC_PAGE_SIZE,
@@ -3061,7 +3114,68 @@ export class DKGAgent {
         }
         return this.getOrCreateSyncVerifyWorker().parseAndFilter(nquadsText, targetGraphUri, targetContextGraphId);
       },
-      send: (peerId, protocolId, data, sendTimeoutMs) => this.messenger.sendToPeer(peerId, protocolId, data, { timeoutMs: sendTimeoutMs }),
+      // rc.9 PR-E: route page fetches through `messenger.sendReliable`
+      // so the sync RPC gets the same ReliableEnvelope wrapping +
+      // outbox + (best-effort) sender-side idempotency cache as the
+      // other migrated protocols (chat, access, query-remote,
+      // storage-ack, verify-proposal, join-request). Pre-PR-E this
+      // used `messenger.sendToPeer` — the raw pass-through — which
+      // gave the new /dkg/10.0.1/sync wire ID none of the substrate
+      // semantics it was named for.
+      //
+      // Sync RPC is synchronous-by-contract: the caller needs the
+      // page bytes back NOW to advance pagination. `queued=true`
+      // means the request landed in the durable outbox but no
+      // response is available yet — the page-fetch layer treats
+      // that as a hard failure for this attempt; the surrounding
+      // `withRetry` (in sync-transport.ts) handles the retry +
+      // backoff loop.
+      //
+      // `messageId` is freshly minted on every retry attempt by
+      // sync-transport.ts (codex review on #569 follow-ups #1-#8
+      // explored stable messageIds and found that every variant
+      // either defeated dedup OR enabled silent replay of stale
+      // responses past sync's app-layer freshness gate; fresh
+      // per-attempt is the only design that holds under all timing
+      // scenarios). The trade-off is no sender-side dedup of
+      // retry-storms — the responder may run a SPARQL page query
+      // up to `syncPageRetryAttempts` times if all attempts
+      // succeed at the receiver but the responses are lost in
+      // transit. Bounded waste, app-layer idempotent, acceptable.
+      //
+      // Known residual concern (codex review #569 follow-up #10,
+      // deferred): recoverable sync send failures land in the
+      // Messenger's shared outbox with the default 24h max-age.
+      // Sync envelopes carry their own 90s freshness TTL
+      // (`SYNC_AUTH_MAX_AGE_MS`), so any outbox-delivered envelope
+      // past that window is denied by the receiver — wasted tick
+      // work, but NOT a correctness problem because fresh
+      // messageIds prevent the cached denial from ever replaying
+      // onto a different attempt. A per-call `maxAgeMs` was
+      // explored, but `Messenger.sendReliable`'s
+      // `enqueueFailure` path doesn't currently read
+      // `opts.maxAgeMs` (only the instance-wide setting at
+      // construction time), so wiring it through is out of scope
+      // for this PR. Also out of scope: extending
+      // `getPeerDiagnostics()` to include per-protocol queued
+      // counts so stuck sync catch-up is observable in the MCP
+      // health endpoint (today only `PROTOCOL_MESSAGE` queued
+      // entries are reported there). Both follow-ups are tracked
+      // for rc.10.
+      send: async (peerId, protocolId, data, sendTimeoutMs, messageId) => {
+        const result = await this.messenger.sendReliable(peerId, protocolId, data, {
+          timeoutMs: sendTimeoutMs,
+          messageId,
+        });
+        if (!result.delivered) {
+          throw new Error(
+            `Sync send to ${peerId} ${
+              result.queued ? 'queued (not synchronously deliverable)' : 'failed'
+            }: ${result.error ?? 'unknown'}`,
+          );
+        }
+        return result.response;
+      },
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
       logDebug: (opCtx, message) => this.log.debug(opCtx, message),
@@ -13530,7 +13644,7 @@ export class DKGAgent {
         getConnectionsReturnsForPeer: 0,
         connections: [],
         peerStore: null,
-        outbox: { pendingCount: 0, oldestFirstFailureAt: null, attempts: [] },
+        outbox: { pendingCount: 0, oldestFirstFailureAt: null, attempts: [], byProtocol: {} },
         health: null,
         protocols: [],
         syncCapable: false,
@@ -13605,25 +13719,57 @@ export class DKGAgent {
       peerStoreSnapshot = null;
     }
 
-    // Substrate outbox snapshot for this peer, filtered to the
-    // chat protocol so the diagnostics surface keeps its rc.8
-    // semantics ("how many CHAT messages are queued for this
-    // peer"). Once other protocols migrate (PR-8..PR-11) the
-    // diagnostics shape can be extended to break out per-protocol
-    // counts; the chat-specific view is what every existing
-    // consumer (HTTP + MCP) expects today.
-    const pending = this.messenger
+    // Substrate outbox snapshot for this peer.
+    //
+    // The top-level fields (`pendingCount`, `oldestFirstFailureAt`,
+    // `attempts`) summarise the CHAT protocol only — the rc.8
+    // diagnostics shape that `/api/peer-info` + MCP `dkg_peer_info`
+    // consumers expect. Preserved as-is so we don't break that
+    // contract.
+    //
+    // The new `byProtocol` map (rc.9 PR-E codex follow-up #10)
+    // surfaces queued entries for EVERY protocol the substrate
+    // now carries, including sync (`/dkg/10.0.1/sync` migrated in
+    // this PR). Without it, stuck sync catch-up — or any future
+    // protocol-substrate migration — would be invisible in
+    // operator diagnostics. Each per-protocol summary mirrors the
+    // top-level summary's shape so tooling can render a per-
+    // protocol view with zero extra plumbing.
+    const peerEntries = this.messenger
       .listOutbox()
-      .filter((entry) => entry.peer === peerKey && entry.protocol === PROTOCOL_MESSAGE)
+      .filter((entry) => entry.peer === peerKey)
       .sort((a, b) => a.firstFailureAt - b.firstFailureAt);
+    const chatPending = peerEntries.filter((entry) => entry.protocol === PROTOCOL_MESSAGE);
+    const byProtocol: Record<string, { pendingCount: number; oldestFirstFailureAt: number | null; attempts: number[] }> = {};
+    for (const entry of peerEntries) {
+      const bucket = byProtocol[entry.protocol] ?? {
+        pendingCount: 0,
+        oldestFirstFailureAt: null,
+        attempts: [],
+      };
+      bucket.pendingCount += 1;
+      bucket.oldestFirstFailureAt =
+        bucket.oldestFirstFailureAt === null
+          ? entry.firstFailureAt
+          : Math.min(bucket.oldestFirstFailureAt, entry.firstFailureAt);
+      bucket.attempts.push(entry.attempts);
+      byProtocol[entry.protocol] = bucket;
+    }
     const outbox = {
-      pendingCount: pending.length,
-      oldestFirstFailureAt: pending.length > 0 ? pending[0].firstFailureAt : null,
-      attempts: pending.map((e) => e.attempts),
+      pendingCount: chatPending.length,
+      oldestFirstFailureAt: chatPending.length > 0 ? chatPending[0].firstFailureAt : null,
+      attempts: chatPending.map((e) => e.attempts),
+      byProtocol,
     };
 
     const protocols = peerStoreSnapshot?.protocols ?? [];
-    const syncCapable = protocols.includes('/dkg/10.0.0/sync');
+    // rc.9 PR-E: tracks the active `PROTOCOL_SYNC` constant rather
+    // than the literal `/dkg/10.0.0/sync`, so a node running rc.9+
+    // (advertising `/dkg/10.0.1/sync`) is correctly reported as
+    // sync-capable. Hard cutover — legacy `/dkg/10.0.0/sync`-only
+    // peers are no longer compatible and intentionally report
+    // syncCapable=false.
+    const syncCapable = protocols.includes(PROTOCOL_SYNC);
 
     return {
       peerId: peerKey,

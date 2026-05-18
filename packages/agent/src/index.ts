@@ -106,6 +106,7 @@ export {
 } from './swm/enumerate-cg-members.js';
 export {
   chooseFanOutTier,
+  classifySendResult,
   executeSubstrateFanOut,
   FANOUT_RESPONSE_REJECTED,
   FANOUT_RESPONSE_RETRYABLE,

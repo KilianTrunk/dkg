@@ -164,6 +164,7 @@ import {
 import {
   chooseFanOutTier,
   executeSubstrateFanOut,
+  classifySendResult,
   FANOUT_RESPONSE_REJECTED,
   FANOUT_RESPONSE_RETRYABLE,
   type FanOutBookkeeper,
@@ -6673,22 +6674,31 @@ export class DKGAgent {
       };
     }
 
-    // rc.9 PR-D wiring (rebased onto PR-G's G2 detach): register
-    // the SwmAckQuorum tracker BEFORE substrate + gossip fire so
-    // a fast receiver's PROTOCOL_SWM_SHARE_ACK arrival lands
-    // against a known shareOperationId. (Pre-D5 the track call
-    // ran AFTER substrate + gossip completed, racing the ack
-    // path; PR-G's G2 detach made that race even tighter since
-    // share() now returns BEFORE substrate finishes. Tracking
-    // up-front side-steps both — the quorum record is alive the
-    // moment any wire packet leaves this method.)
+    // rc.9 PR-D codex follow-up #D5 (rebased onto PR-G's G2
+    // detach): register the SwmAckQuorum tracker BEFORE
+    // substrate + gossip fire so a fast receiver's
+    // PROTOCOL_SWM_SHARE_ACK arrival lands against a known
+    // shareOperationId.
     //
-    // We pipe substrate-delivered peers into the quorum via the
-    // bookkeeper shim (not via the deprecated `preAckedFromSubstrate`
-    // init field), so the quorum counts both transports in one
-    // number. Each substrate `delivered` outcome calls
-    // `quorum.onAck()` exactly like a gossip-applied receiver's
-    // SwmShareAck would.
+    // Pre-D5 the track call ran AFTER `Promise.all([substrate,
+    // gossip])`, so a fast receiver could:
+    //   1. apply the gossip payload,
+    //   2. send PROTOCOL_SWM_SHARE_ACK back to us,
+    //   3. our handler runs `swmAckQuorum.onAck(opId, peer)`,
+    //   4. but the record doesn't exist yet → ack DROPPED,
+    //   5. quorum stays short → spurious watchdog top-up fires.
+    //
+    // PR-G's G2 detach made that race even tighter since
+    // share() now returns BEFORE substrate finishes. Tracking
+    // up-front side-steps both — the quorum record is alive
+    // the moment any wire packet leaves this method.
+    //
+    // We track with `preAckedFromSubstrate: []` and pipe
+    // substrate-delivered peers into the quorum via the
+    // bookkeeper instead — they go through `onAck()` exactly
+    // like gossip-applied receivers do, so the quorum
+    // arithmetic is identical regardless of which transport
+    // delivered first.
     //
     // Three preconditions for tracking:
     //   1. Caller supplied a shareOperationId (`share()` does;
@@ -6698,7 +6708,7 @@ export class DKGAgent {
     //      no-gossip / substrate-only plan would already cover
     //      quorum via PR-C's substrate counters.
     //   3. We have at least one expected member to wait for.
-    //      (rc.9 PR-D codex #D3 keys this off
+    //      (PR-D #D3 keys this off
     //      `plan.enumeratedMembers.length`, NOT
     //      `substrateMembers.length`, so the gossip-only
     //      "public CG above the substrate cap" branch is
@@ -6726,8 +6736,8 @@ export class DKGAgent {
     // feeds per-peer outcomes through the bookkeeper as each
     // send completes. The bookkeeper does double duty:
     //   1. Bump per-(cgId, outcome) counters for /api/slo.
-    //   2. (PR-D) Feed substrate-`delivered` peers into the
-    //      quorum via onAck so they count toward the same
+    //   2. (PR-D #D5) Feed substrate-`delivered` peers into
+    //      the quorum via onAck so they count toward the same
     //      quorum target as gossip-side acks.
     if (plan.useSubstrate) {
       const baseBookkeeper = this.substrateFanoutBookkeeper();
@@ -9180,6 +9190,25 @@ export class DKGAgent {
   }
 
   /**
+   * Test-only inspector for SwmAckQuorum's tracked-record
+   * snapshot, exposed so integration tests can assert on the
+   * `acked` / `expectedMembers` after driving ack arrivals
+   * through `handleSwmShareAck`. Returns `undefined` for
+   * unknown shareOperationIds (matches the underlying
+   * component's `inspect()` contract — once a record completes
+   * quorum or expires, it's reaped). Not part of the public
+   * API surface; the production caller talks to the quorum
+   * directly via `getOrCreateSwmAckQuorum()`.
+   */
+  getSwmAckQuorumRecordSnapshotForTests(shareOperationId: string): {
+    acked: readonly string[];
+    expectedMembers: readonly string[];
+    ackPct: number;
+  } | undefined {
+    return this.swmAckQuorum?.inspect(shareOperationId);
+  }
+
+  /**
    * Best-effort send of `PROTOCOL_SWM_SHARE_ACK` to the share's
    * publisher peer after a successful gossip-path apply.
    * Extracted into a named method so the receiver contract can
@@ -9353,34 +9382,83 @@ export class DKGAgent {
    * tail-latency the rest. Failures get swallowed — the substrate's
    * own outbox handles retry.
    */
+  /**
+   * Watchdog-driven substrate top-up for SwmAckQuorum.
+   * Extracted into a named method (mirrors PR-C's
+   * `handleSwmUpdate` / PR-D's `handleSwmShareAck` shape) so
+   * the per-outcome classification contract from rc.9 PR-D
+   * codex follow-up #D6 can be unit-tested in isolation
+   * without driving real-time watchdog ticks.
+   *
+   * Per-peer outcomes (classified via the SAME
+   * `classifySendResult` the main fan-out uses):
+   *   - `delivered` → call `swmAckQuorum.onAck` so the peer
+   *     counts toward quorum. PROTOCOL_SWM_UPDATE does NOT
+   *     emit `PROTOCOL_SWM_SHARE_ACK` (acks ride the gossip
+   *     applier path only), so without this call a successful
+   *     top-up never moves the peer into `acked` and the
+   *     share stays `pending` until `deadlineHardMs` even
+   *     after the actual delivery succeeded.
+   *   - `retryable` (0x02 sentinel) → no-op; next watchdog
+   *     tick fires another top-up, giving upstream state more
+   *     time to converge.
+   *   - `rejected` (0x01 sentinel) → no-op; receiver
+   *     permanently rejected the share, retrying won't help.
+   *     (Pre-PR-D receivers that fell back to the throw path
+   *     instead of the sentinel surface this as `failed`
+   *     here — also a no-op for the same reason.)
+   *   - `queued` / `inFlight` / `failed` → no-op; the
+   *     substrate outbox owns retry for these.
+   */
+  private async swmSubstrateTopUp({
+    shareOperationId, cgId, payload, missingPeers,
+  }: {
+    shareOperationId: string;
+    cgId: string;
+    payload: Uint8Array;
+    missingPeers: readonly string[];
+  }): Promise<void> {
+    const ctx = createOperationContext('share', shareOperationId);
+    this.log.info(
+      ctx,
+      `SWM ack-quorum watchdog firing substrate top-up for ${shareOperationId} to ${missingPeers.length} peer(s) (cg=${cgId})`,
+    );
+    await Promise.allSettled(missingPeers.map(async (peerId: string) => {
+      try {
+        const sendResult = await this.messenger.sendReliable(peerId, PROTOCOL_SWM_UPDATE, payload, {
+          messageId: `swm-topup-${shareOperationId}-${peerId}`,
+          timeoutMs: DKGAgent.SWM_SUBSTRATE_FANOUT_TIMEOUT_MS,
+        });
+        const classified = classifySendResult(peerId, sendResult);
+        if (classified.outcome === 'delivered') {
+          this.swmAckQuorum?.onAck(shareOperationId, peerId);
+        }
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `SWM top-up to ${peerId} failed: ${reason}`);
+      }
+    }));
+  }
+
+  /**
+   * Test-only view onto {@link swmSubstrateTopUp} for the
+   * PR-D codex follow-up #D6 regression. Bypasses the
+   * watchdog's setInterval so tests can pin the per-outcome
+   * classification → onAck wiring without real-time flake.
+   */
+  async invokeSwmSubstrateTopUpForTests(args: {
+    shareOperationId: string;
+    cgId: string;
+    payload: Uint8Array;
+    missingPeers: readonly string[];
+  }): Promise<void> {
+    return this.swmSubstrateTopUp(args);
+  }
+
   private getOrCreateSwmAckQuorum(): SwmAckQuorum {
     if (!this.swmAckQuorum) {
       this.swmAckQuorum = createSwmAckQuorum({
-        substrateTopUp: async ({
-          shareOperationId, cgId, payload, missingPeers,
-        }: {
-          shareOperationId: string;
-          cgId: string;
-          payload: Uint8Array;
-          missingPeers: readonly string[];
-        }) => {
-          const ctx = createOperationContext('share', shareOperationId);
-          this.log.info(
-            ctx,
-            `SWM ack-quorum watchdog firing substrate top-up for ${shareOperationId} to ${missingPeers.length} peer(s) (cg=${cgId})`,
-          );
-          await Promise.allSettled(missingPeers.map(async (peerId: string) => {
-            try {
-              await this.messenger.sendReliable(peerId, PROTOCOL_SWM_UPDATE, payload, {
-                messageId: `swm-topup-${shareOperationId}-${peerId}`,
-                timeoutMs: DKGAgent.SWM_SUBSTRATE_FANOUT_TIMEOUT_MS,
-              });
-            } catch (err) {
-              const reason = err instanceof Error ? err.message : String(err);
-              this.log.warn(ctx, `SWM top-up to ${peerId} failed: ${reason}`);
-            }
-          }));
-        },
+        substrateTopUp: (args) => this.swmSubstrateTopUp(args),
         observers: {
           onQuorumCompleted: (e: {
             shareOperationId: string; cgId: string; ackedCount: number; expectedCount: number; ackPct: number;

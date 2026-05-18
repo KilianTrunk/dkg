@@ -36,18 +36,26 @@
  *     stale ack arriving after the share's deadlineHardMs expired and
  *     the record was reaped).
  *   - `ackPeerId` — the libp2p peerId of the receiver as a string
- *     (matches `node.peerId.toString()`). Carried in the body rather
- *     than relying on the transport-level `fromPeerId` because the
- *     latter is the immediate connection's peer, which after future
- *     relay/forwarder work may NOT equal the actual applier. We always
- *     trust the body value here; a forged ackPeerId would let a
- *     malicious peer claim delivery on someone else's behalf, but the
- *     blast radius is limited to "watchdog top-up doesn't fire for
- *     that peer" — the share itself is still subject to the per-CG
- *     auth checks on the receiver side, and the long-tail top-up
- *     would retry via substrate anyway if the actual delivery did
- *     fail. Better authentication (signing the ack with the receiver's
- *     agent key) is a PR-G-or-later addition.
+ *     (matches `node.peerId.toString()`). In the rc.9 PR-D
+ *     direct-Messenger world this field is REDUNDANT with the
+ *     transport-authenticated `fromPeerId` that libp2p hands
+ *     `messenger.register()` handlers. The current receiver
+ *     (`DKGAgent.handleSwmShareAck`, PR-D codex follow-up #D2)
+ *     treats `fromPeerId` as authoritative and DROPS the ack on
+ *     any non-empty body/transport mismatch as a likely spoof
+ *     attempt (pre-D2 we trusted the body, which let any peer
+ *     that learned a `shareOperationId` claim delivery on
+ *     someone else's behalf and suppress watchdog top-up for
+ *     them). Empty `ackPeerId` is still accepted — it's the
+ *     forward-compat slot for a future relayed-ack path where
+ *     `fromPeerId` would be a relay node and the body would
+ *     carry the original receiver identity (signed with that
+ *     receiver's agent key, since at that point the transport
+ *     guarantee no longer covers identity end-to-end). That
+ *     relay path is NOT supported today; senders SHOULD set
+ *     `ackPeerId = receiver.peerId.toString()` for symmetry
+ *     with `fromPeerId`, but receivers will reject any other
+ *     non-empty value.
  *
  * @internal
  */

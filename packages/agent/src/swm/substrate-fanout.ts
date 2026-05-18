@@ -483,7 +483,17 @@ export async function executeSubstrateFanOut(
   return result;
 }
 
-function classifySendResult(peerId: string, sendResult: ReliableSendResult): FanOutPeerRecord {
+/**
+ * Map a `ReliableSendResult` (the messenger's send-time outcome)
+ * onto the application-level {@link FanOutOutcome}. Exported so
+ * the watchdog/top-up path (rc.9 PR-D #D6) can reuse the EXACT
+ * same classification rules as the main fan-out — keeping
+ * sentinel handling (`FANOUT_RESPONSE_REJECTED`,
+ * `FANOUT_RESPONSE_RETRYABLE`), queued/inFlight policy, and
+ * error-string conventions in a single place. Pure function;
+ * no I/O.
+ */
+export function classifySendResult(peerId: string, sendResult: ReliableSendResult): FanOutPeerRecord {
   if (sendResult.delivered) {
     // PR-C codex R6: receivers signal permanent rejection (peer
     // not in allowlist, bad signature, validation failure) with

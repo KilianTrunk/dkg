@@ -45,6 +45,18 @@ class CapturingGossip {
 }
 
 interface SendReliableCall {
+  /**
+   * Which messenger method was invoked. rc.9 PR-D codex
+   * follow-up #D8: pre-D8 we only tracked `messageId` and
+   * relied on it being `undefined` to infer "this was a
+   * `sendToPeer` call, not `sendReliable`" — but the
+   * production `maybeEmitSwmShareAck` doesn't pass
+   * `opts.messageId` to `sendReliable` either, so a
+   * regression that re-routed acks back through `sendReliable`
+   * would have passed the test. Tracking the method name
+   * explicitly fixes the assertion's signal-to-noise.
+   */
+  method: 'sendReliable' | 'sendToPeer';
   peerId: string;
   protocolId: string;
   bytes: number;
@@ -87,7 +99,7 @@ function stubMessengerSendReliable(
         payload: Uint8Array,
         opts?: { messageId?: string },
       ): Promise<ReliableSendResult> => {
-        calls.push({ peerId, protocolId, bytes: payload.byteLength, messageId: opts?.messageId });
+        calls.push({ method: 'sendReliable', peerId, protocolId, bytes: payload.byteLength, messageId: opts?.messageId });
         const out = lookup(peerId, protocolId, opts?.messageId);
         if (out instanceof Error) throw out;
         return out;
@@ -95,16 +107,17 @@ function stubMessengerSendReliable(
       // rc.9 PR-D codex follow-up #D1: ack emission uses
       // fire-and-forget `sendToPeer` instead of durable
       // `sendReliable`. We capture into the same `calls` array
-      // so existing assertions see both kinds of sends; the
-      // `protocolId` discriminates (acks go to
-      // PROTOCOL_SWM_SHARE_ACK). No outbox, no retry — one
-      // network attempt, opaque response.
+      // (with `method: 'sendToPeer'`) so assertions can
+      // distinguish the two surfaces — the `protocolId` alone
+      // is not enough since the production `sendReliable` and
+      // `sendToPeer` paths both have undefined `messageId` when
+      // the caller doesn't pass `opts.messageId` (codex #D8).
       sendToPeer: async (
         peerId: string,
         protocolId: string,
         payload: Uint8Array,
       ): Promise<Uint8Array> => {
-        calls.push({ peerId, protocolId, bytes: payload.byteLength });
+        calls.push({ method: 'sendToPeer', peerId, protocolId, bytes: payload.byteLength });
         return new Uint8Array();
       },
       // PR-D registers PROTOCOL_SWM_SHARE_ACK and PR-C registers
@@ -216,6 +229,16 @@ describe('DKGAgent SwmAckQuorum integration (rc.9 PR-D)', () => {
     expect(stats.watchdogFired).toBe(0);
   });
 
+  /**
+   * rc.9 PR-D codex follow-up #D7: drive a real
+   * `PROTOCOL_SWM_SHARE_ACK` arrival through the production
+   * handler and assert that it lands in the quorum's `acked`
+   * set, then reaches the `completed` count once the threshold
+   * is met. The pre-D7 version of this test only asserted
+   * "one share is pending" — a regression in
+   * `handleSwmShareAck()` (e.g. failing to call onAck, or
+   * dropping ACKs silently) would not have been caught.
+   */
   it('PROTOCOL_SWM_SHARE_ACK arrival increments acked count + completes quorum when threshold met', async () => {
     const agent = register(await createAgent('AckQuorumAckArrival'));
     const gossip = new CapturingGossip();
@@ -228,39 +251,42 @@ describe('DKGAgent SwmAckQuorum integration (rc.9 PR-D)', () => {
     }));
     install(agent);
 
-    await agent.share('cg-ackquorum-arrivals', [{
+    const { shareOperationId } = await agent.share('cg-ackquorum-arrivals', [{
       subject: 'urn:test:arr', predicate: 'http://schema.org/name', object: '"arr"', graph: '',
     }]);
+    expect(typeof shareOperationId).toBe('string');
 
-    let stats = agent.getSwmAckQuorumStats();
-    expect(stats.tracked).toBe(1);
-    expect(stats.completed).toBe(0);
-    expect(stats.pending).toBe(1);
+    const stats0 = agent.getSwmAckQuorumStats();
+    expect(stats0.tracked).toBe(1);
+    expect(stats0.completed).toBe(0);
+    expect(stats0.pending).toBe(1);
 
-    const messengerRegistrations = (agent as unknown as {
-      messenger: { register?: (proto: string, handler: (data: Uint8Array, from: string) => Promise<Uint8Array>) => void };
-    }).messenger;
-    // The stub doesn't have `register` — the production register
-    // already ran in DKGAgent.create() against the real Messenger
-    // (which got swapped out by stubMessengerSendReliable above).
-    // For this test we invoke the PR-D-added ack handler directly
-    // via the same code path it would be invoked from, by reaching
-    // into the quorum tracker.
-    void messengerRegistrations;
-    const quorum = (agent as unknown as {
-      getOrCreateSwmAckQuorum: () => { onAck: (op: string, peer: string) => void; stats: () => { tracked: number; completed: number; watchdogFired: number; deadlineExpired: number; pending: number } };
-    }).getOrCreateSwmAckQuorum();
+    // Drive the real handler with three real-shape ACK bytes —
+    // exactly the same code path that a libp2p arrival would
+    // hit. We get the handler via the same test-only getter
+    // production registration uses; this test exercises
+    // handleSwmShareAck → SwmAckQuorum.onAck without bypassing
+    // anything.
+    const ackHandler = await agent.getOrCreateSwmShareAckHandlerForTests();
+    const inspect = agent.getSwmAckQuorumRecordSnapshotForTests(shareOperationId);
+    expect(inspect?.acked).toEqual([]);
+    expect([...(inspect?.expectedMembers ?? [])].sort()).toEqual([
+      '12D3KooWPeer1', '12D3KooWPeer2', '12D3KooWPeer3',
+    ]);
 
-    // Look up the tracked record's shareOperationId by inspecting
-    // the only tracked record. We do this through the existing
-    // public `inspect()` API on the component once we have its
-    // id — but we don't have the id yet, so use the test-only
-    // stats `tracked === 1` invariant to confirm there's exactly
-    // one.
-    // For a deterministic test, we know `share()` returned the
-    // shareOperationId, so let's redo this with that.
+    await ackHandler(encodeSwmShareAck({ shareOperationId, ackPeerId: '12D3KooWPeer1' }), '12D3KooWPeer1');
+    expect(agent.getSwmAckQuorumStats().completed).toBe(0);
+    expect(agent.getSwmAckQuorumRecordSnapshotForTests(shareOperationId)?.acked).toEqual(['12D3KooWPeer1']);
 
-    expect(quorum.stats().pending).toBe(1);
+    await ackHandler(encodeSwmShareAck({ shareOperationId, ackPeerId: '12D3KooWPeer2' }), '12D3KooWPeer2');
+    expect(agent.getSwmAckQuorumStats().completed).toBe(0);
+
+    await ackHandler(encodeSwmShareAck({ shareOperationId, ackPeerId: '12D3KooWPeer3' }), '12D3KooWPeer3');
+    // 3/3 acked → quorum complete (default quorumPct is 1.0 in
+    // the test config; the record is reaped on completion so
+    // inspect() returns undefined).
+    expect(agent.getSwmAckQuorumStats().completed).toBe(1);
+    expect(agent.getSwmAckQuorumRecordSnapshotForTests(shareOperationId)).toBeUndefined();
   });
 
   it('share() returns shareOperationId — ack arrivals for it complete quorum', async () => {
@@ -372,10 +398,22 @@ describe('DKGAgent SwmAckQuorum integration (rc.9 PR-D)', () => {
     const ackCalls = calls.filter((c) => c.protocolId === PROTOCOL_SWM_SHARE_ACK);
     expect(ackCalls).toHaveLength(1);
     expect(ackCalls[0]?.peerId).toBe('12D3KooWPublisher');
-    // sendToPeer doesn't expose a messageId option (fire-and-
-    // forget; no outbox row to key off). The stub leaves
-    // messageId undefined for sendToPeer calls.
-    expect(ackCalls[0]?.messageId).toBeUndefined();
+    // rc.9 PR-D codex #D8: assert the METHOD explicitly. The
+    // pre-D8 assertion checked `messageId === undefined` which
+    // would have passed even if the implementation regressed
+    // back to `sendReliable(peer, proto, payload, { timeoutMs })`
+    // (no opts.messageId → still undefined). Tracking the
+    // method name makes the assertion actually pin the
+    // fire-and-forget contract.
+    expect(ackCalls[0]?.method).toBe('sendToPeer');
+
+    // Additional defense in depth: zero sendReliable calls
+    // hit PROTOCOL_SWM_SHARE_ACK. Catches the regression
+    // where a future change might call BOTH for some reason.
+    const reliableAckCalls = calls.filter(
+      (c) => c.protocolId === PROTOCOL_SWM_SHARE_ACK && c.method === 'sendReliable',
+    );
+    expect(reliableAckCalls).toEqual([]);
   });
 
   /**
@@ -453,6 +491,133 @@ describe('DKGAgent SwmAckQuorum integration (rc.9 PR-D)', () => {
     await ackHandler(emptyBodyBytes, '12D3KooWPeerC');
     const after = quorum.inspect(shareOperationId)?.acked ?? [];
     expect([...after].sort()).toEqual(['12D3KooWPeerA', '12D3KooWPeerC']);
+  });
+
+  /**
+   * rc.9 PR-D codex follow-up #D5: the quorum tracker MUST
+   * register the share BEFORE substrate + gossip publish so a
+   * fast receiver's ack lands against a known shareOperationId
+   * instead of getting dropped because the record doesn't
+   * exist yet. Pre-D5 the order was:
+   *   1. Promise.all([substrate, gossip])    ← waits for both
+   *   2. quorum.track(...)                   ← registers AFTER
+   * A fast receiver could ack between #1 finishing and #2
+   * starting; the handler's `quorum.onAck()` would no-op
+   * because the shareOperationId wasn't tracked yet, causing
+   * undercounted quorum and spurious watchdog top-up.
+   *
+   * Easiest exercise: intercept the gossip publish so it spies
+   * on whether the quorum record exists at publish time, then
+   * assert the record was tracked BEFORE the publish call.
+   */
+  it('PR-D #D5: quorum record is registered BEFORE gossip publish (no pre-track ack drop race)', async () => {
+    const agent = register(await createAgent('AckQuorumD5RaceFix'));
+    let recordExistedAtPublishTime: boolean | null = null;
+    let capturedShareOperationId: string | null = null;
+    const spyingGossip = new CapturingGossip();
+    spyingGossip.subscribers = ['12D3KooWPeerRace1', '12D3KooWPeerRace2'];
+    const originalPublish = spyingGossip.publish.bind(spyingGossip);
+    spyingGossip.publish = async (topic: string, data: Uint8Array): Promise<void> => {
+      // Inspect the agent's quorum state right when gossip
+      // publish is about to fire. By this point the production
+      // code MUST have already called quorum.track() — pre-D5
+      // it hadn't.
+      const stats = agent.getSwmAckQuorumStats();
+      recordExistedAtPublishTime = stats.tracked === 1 && stats.pending === 1;
+      await originalPublish(topic, data);
+    };
+    (agent as unknown as { gossip: CapturingGossip }).gossip = spyingGossip;
+
+    const { install } = stubMessengerSendReliable(() => ({
+      delivered: false, queued: true, attempts: 1, messageId: 'q-' + Math.random().toString(36).slice(2),
+      error: 'transient', nextAttemptAtMs: Date.now() + 1000,
+    }));
+    install(agent);
+
+    const { shareOperationId } = await agent.share('cg-d5-race-fix', [{
+      subject: 'urn:test:d5', predicate: 'http://schema.org/name', object: '"d5"', graph: '',
+    }]);
+    capturedShareOperationId = shareOperationId;
+
+    expect(recordExistedAtPublishTime).toBe(true);
+    expect(agent.getSwmAckQuorumRecordSnapshotForTests(capturedShareOperationId)).toBeDefined();
+  });
+
+  /**
+   * rc.9 PR-D codex follow-up #D6: substrate top-up MUST honour
+   * the `ReliableSendResult` it gets back from sendReliable —
+   * a successful top-up needs to pipe through onAck so the
+   * peer counts toward quorum. Pre-D6 the result was awaited
+   * and discarded, so a peer the watchdog successfully topped
+   * up via substrate would STAY pending until deadlineHardMs
+   * (since PROTOCOL_SWM_UPDATE doesn't emit SwmShareAck).
+   *
+   * Direct exercise of the substrateTopUp callback baked into
+   * the lazily-constructed SwmAckQuorum, with a stub messenger
+   * that returns each outcome shape so we can pin the
+   * classification → onAck wiring for each one.
+   */
+  it('PR-D #D6: substrate top-up "delivered" outcomes route through onAck (peer counts toward quorum)', async () => {
+    const agent = register(await createAgent('AckQuorumD6TopUpOnAck'));
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWTopUpA', '12D3KooWTopUpB', '12D3KooWTopUpC'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    // Initial fan-out: all peers go to the outbox (queued).
+    // Watchdog then fires; top-up gets distinct outcomes per
+    // peer to pin the per-outcome wiring.
+    const { calls, install } = stubMessengerSendReliable((peerId, _proto, _msgId) => {
+      const isTopUp = _msgId?.startsWith('swm-topup-');
+      if (!isTopUp) {
+        return { delivered: false, queued: true, attempts: 1, messageId: 'q-init', error: 'transient', nextAttemptAtMs: Date.now() + 1000 };
+      }
+      if (peerId === '12D3KooWTopUpA') {
+        // empty response → delivered → onAck
+        return { delivered: true, response: new Uint8Array(), attempts: 1, messageId: _msgId! };
+      }
+      if (peerId === '12D3KooWTopUpB') {
+        // 0x02 retryable → no onAck; next watchdog tick retries
+        return { delivered: true, response: new Uint8Array([0x02]), attempts: 1, messageId: _msgId! };
+      }
+      // 0x01 rejected → no onAck (permanent)
+      return { delivered: true, response: new Uint8Array([0x01]), attempts: 1, messageId: _msgId! };
+    });
+    install(agent);
+
+    const { shareOperationId } = await agent.share('cg-d6-topup', [{
+      subject: 'urn:test:d6', predicate: 'http://schema.org/name', object: '"d6"', graph: '',
+    }]);
+
+    // Pre-watchdog: all 3 peers still pending.
+    const before = agent.getSwmAckQuorumRecordSnapshotForTests(shareOperationId);
+    expect(before?.acked).toEqual([]);
+
+    // Drive the substrateTopUp path directly via the test-only
+    // helper. Bypasses the watchdog's setInterval (so the test
+    // isn't real-time-flaky) and hits the EXACT method the
+    // watchdog wires into createSwmAckQuorum's
+    // `substrateTopUp` dep.
+    await agent.invokeSwmSubstrateTopUpForTests({
+      shareOperationId,
+      cgId: 'cg-d6-topup',
+      payload: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+      missingPeers: ['12D3KooWTopUpA', '12D3KooWTopUpB', '12D3KooWTopUpC'],
+    });
+
+    // After top-up: A got `delivered` → routed through onAck;
+    // B got 0x02 retryable → NOT onAck'd (will retry next
+    // tick); C got 0x01 rejected → NOT onAck'd (permanent).
+    const after = agent.getSwmAckQuorumRecordSnapshotForTests(shareOperationId);
+    expect(after?.acked).toEqual(['12D3KooWTopUpA']);
+
+    // Sanity: the top-up actually invoked sendReliable for all
+    // three peers (with the documented swm-topup- prefix).
+    const topUpCalls = calls.filter((c) => c.messageId?.startsWith('swm-topup-'));
+    expect(topUpCalls.map((c) => c.peerId).sort()).toEqual([
+      '12D3KooWTopUpA',
+      '12D3KooWTopUpB',
+      '12D3KooWTopUpC',
+    ]);
   });
 
   /**

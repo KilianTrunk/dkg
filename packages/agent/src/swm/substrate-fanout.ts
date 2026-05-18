@@ -7,11 +7,21 @@
  * Owns three concerns:
  *
  *   1. **Tier decision** — given a `CGMemberEnumeration`, decide
- *      which transports to use:
- *        - `{ useSubstrate: true,  useGossip: false }` — curated
- *          CG (`source: 'allowlist'`); the on-chain roster is
- *          authoritative, gossip would just duplicate the wire
- *          load with no reliability gain.
+ *      which transports to use. As of the PR-C codex review (R2)
+ *      gossip is the UNIVERSAL baseline: it always runs. Substrate
+ *      decides whether to *also* run, adding a per-known-peer
+ *      reliability upgrade for peers we have a roster for:
+ *        - `{ useSubstrate: true,  useGossip: true }` — curated
+ *          CG (`source: 'allowlist'`); roster is authoritative,
+ *          but we still gossip because during a rolling rc.8/rc.9
+ *          upgrade some allowlisted peers won't yet support
+ *          `/dkg/10.0.1/swm-update` — substrate-only would silently
+ *          stop delivering to those peers (libp2p
+ *          protocol-negotiation error → sendReliable queues/retries
+ *          forever, never reaches the receiver). Gossip is the
+ *          cross-version safety net; PR-D will use per-peer ACK
+ *          feedback to opportunistically suppress the gossip leg
+ *          for peers that have confirmed substrate support.
  *        - `{ useSubstrate: true,  useGossip: true  }` — public CG
  *          (`source: 'topic-subscribers'`) at or below
  *          `maxSubstrateMembers`. Gossip remains the canonical
@@ -123,11 +133,13 @@ export interface ChooseFanOutTierInput {
  * to call N times per share if the caller wants (only enumeration
  * cost dominates, and the enumerator has its own 60s cache).
  *
- * Decision matrix (see RFC-003 §6 for the full rationale):
+ * Decision matrix (see RFC-003 §6 + this module's header for the
+ * full rationale). After PR-C codex R2, gossip is always on; the
+ * substrate is an additive per-known-peer reliability layer.
  *
  *   | source              | members vs cap       | substrate | gossip |
  *   |---------------------|----------------------|-----------|--------|
- *   | allowlist           | (any size)           | YES       | NO     |
+ *   | allowlist           | (any size)           | YES       | YES    |
  *   | topic-subscribers   | <= maxSubstrateMembers | YES     | YES    |
  *   | topic-subscribers   | >  maxSubstrateMembers | NO      | YES    |
  *   | none                | (always empty)       | NO        | YES    |
@@ -142,6 +154,20 @@ export interface ChooseFanOutTierInput {
  * peers on the next tick (and the soak postmortem will surface
  * the throughput cost so we can decide whether to add batching
  * or sharding for rc.10).
+ *
+ * Why curated CGs ALSO publish to gossip (PR-C codex R2): rolling
+ * rc.8 → rc.9 upgrades mean some allowlisted peers may not yet
+ * speak `/dkg/10.0.1/swm-update`. Substrate-only delivery would
+ * silently hit libp2p protocol-negotiation errors, sendReliable
+ * would queue/retry forever, and the peer would stop receiving
+ * SWM updates entirely until it upgraded. The gossip leg is a
+ * cross-version safety net. Cost: one extra gossip publish per
+ * share — negligible on small curated rosters, and receiver-side
+ * dedup (`SharedMemoryHandler.seenShareOps`, PR-A) absorbs the
+ * resulting double-delivery cleanly. PR-D will use per-peer ACK
+ * feedback to opportunistically suppress the gossip leg for peers
+ * confirmed to support substrate, recovering the wire-load saving
+ * once a CG's roster is fully on rc.9+.
  */
 export function chooseFanOutTier(input: ChooseFanOutTierInput): FanOutPlan {
   const { enumeration, maxSubstrateMembers } = input;
@@ -151,7 +177,7 @@ export function chooseFanOutTier(input: ChooseFanOutTierInput): FanOutPlan {
     case 'allowlist':
       return {
         useSubstrate: true,
-        useGossip: false,
+        useGossip: true,
         substrateMembers: enumeration.members,
         enumerationSource: 'allowlist',
         enumeratedCount,

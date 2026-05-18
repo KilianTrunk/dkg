@@ -25,24 +25,31 @@ function enumeration(source: CGMemberEnumeration['source'], members: string[]): 
 
 describe('chooseFanOutTier', () => {
   /**
-   * Curated CGs are the headline win for substrate fan-out:
-   * authoritative roster, every member is by definition allowed
-   * to receive the share, so substrate-only is both reliable
-   * (point-to-point ack within the messenger SLO) AND saves the
-   * gossip wire load. We deliberately do NOT truncate curated
-   * CGs even when they exceed `maxSubstrateMembers` — see the
-   * `chooseFanOutTier` jsdoc for why dropping substrate targets
-   * silently regresses curated reliability.
+   * Curated CGs get substrate fan-out for per-known-peer
+   * reliability AND gossip as a cross-version safety net (PR-C
+   * codex R2 fix): during a rolling rc.8 → rc.9 upgrade some
+   * allowlisted peers may not yet support
+   * `/dkg/10.0.1/swm-update`. Substrate-only delivery would
+   * silently hit libp2p protocol-negotiation errors and the
+   * non-upgraded peer would stop receiving SWM updates entirely
+   * until it upgraded. Gossip keeps the delivery path open in the
+   * meantime; receiver-side dedup absorbs the double-arrival
+   * cleanly. PR-D will use ACK feedback to opportunistically
+   * suppress gossip for peers confirmed to support substrate. We
+   * still do NOT truncate curated CGs even when they exceed
+   * `maxSubstrateMembers` — see `chooseFanOutTier` jsdoc for why
+   * dropping substrate targets silently regresses curated
+   * reliability.
    */
   describe('curated CG (source = allowlist)', () => {
-    it('substrate-only for any curated CG, even at or above the threshold', () => {
+    it('substrate + gossip for any curated CG (cross-version safety net, codex R2)', () => {
       const plan = chooseFanOutTier({
         enumeration: enumeration('allowlist', ['peerA', 'peerB', 'peerC']),
         maxSubstrateMembers: 100,
       });
 
       expect(plan.useSubstrate).toBe(true);
-      expect(plan.useGossip).toBe(false);
+      expect(plan.useGossip).toBe(true);
       expect(plan.substrateMembers).toEqual(['peerA', 'peerB', 'peerC']);
       expect(plan.enumerationSource).toBe('allowlist');
       expect(plan.enumeratedCount).toBe(3);
@@ -56,24 +63,27 @@ describe('chooseFanOutTier', () => {
       });
 
       expect(plan.useSubstrate).toBe(true);
-      expect(plan.useGossip).toBe(false);
+      expect(plan.useGossip).toBe(true);
       expect(plan.substrateMembers).toEqual(members);
       expect(plan.enumeratedCount).toBe(250);
     });
 
     it('handles the curated-with-empty-allowlist edge case (curator kicked everyone)', () => {
       // CGMemberEnumerator returns `{ source: 'allowlist', members: [] }`
-      // for a curated CG with an explicitly empty allowlist (NOT to be
-      // re-admitted via gossip subscribers). Substrate fan-out has
-      // nobody to send to; gossip remains OFF. Caller's local apply
-      // already happened; nothing more to do.
+      // for a curated CG with an explicitly empty allowlist (no peer
+      // remains authorised). Substrate fan-out has nobody to send to;
+      // gossip still runs (cross-version safety net is unconditional
+      // for allowlist source) but with no remote peers in the
+      // subscriber set there is effectively nobody to receive it
+      // either — both legs are no-ops at the wire level. Caller's
+      // local apply already happened; nothing more to do.
       const plan = chooseFanOutTier({
         enumeration: enumeration('allowlist', []),
         maxSubstrateMembers: 100,
       });
 
       expect(plan.useSubstrate).toBe(true);
-      expect(plan.useGossip).toBe(false);
+      expect(plan.useGossip).toBe(true);
       expect(plan.substrateMembers).toEqual([]);
     });
   });

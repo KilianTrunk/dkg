@@ -239,6 +239,127 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
   });
 
   /**
+   * PR-C codex R2 regression: curated CGs MUST publish via gossip
+   * in addition to substrate fan-out, as a cross-version safety
+   * net for rolling rc.8 → rc.9 upgrades. If we ever silently
+   * regress to substrate-only here, any allowlisted peer still
+   * on rc.8 (no `/dkg/10.0.1/swm-update` handler) would
+   * permanently stop receiving SWM updates from this node.
+   *
+   * Pure policy is regressed in `swm-substrate-fanout.test.ts`;
+   * this integration test additionally pins the WIRE behaviour
+   * through the agent — both `gossip.publish` AND
+   * `messenger.sendReliable` fire for every allowlist-source
+   * share, with per-cgId counters reflecting the substrate leg.
+   */
+  it('codex R2: curated CG fans out via substrate AND publishes via gossip', async () => {
+    const agent = await createAgent('SubstrateFanoutCuratedR2');
+    const gossip = new CapturingGossip();
+    // Curated enumerator returns 'allowlist' source — gossip
+    // subscriber view is irrelevant for the allowlist branch
+    // (we never call getSubscribers in that case).
+    gossip.subscribers = [];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    const { calls, install } = stubMessengerSendReliable(new Map([
+      ['12D3KooWAllowedA', { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'mA' }],
+      ['12D3KooWAllowedB', { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'mB' }],
+    ]));
+    install(agent);
+
+    // Inject a curated-source enumeration without setting up
+    // real allowlist triples — the integration target here is
+    // the tier-switch wiring, not the SPARQL plumbing (covered
+    // by enumerate-cg-members.test.ts).
+    const enumerator = (agent as unknown as {
+      getOrCreateCGMemberEnumerator(): { enumerate: (cg: string) => Promise<unknown> };
+    }).getOrCreateCGMemberEnumerator();
+    enumerator.enumerate = async () => ({
+      source: 'allowlist',
+      members: ['12D3KooWAllowedA', '12D3KooWAllowedB'],
+    });
+
+    await agent.share('cg-curated-r2', [{
+      subject: 'urn:test:r2', predicate: 'http://schema.org/name', object: '"curated"', graph: '',
+    }]);
+
+    // BOTH legs must have fired. Gossip publish once on the
+    // workspace topic; substrate sendReliable once per
+    // allowlisted peer.
+    expect(gossip.publishes).toHaveLength(1);
+    expect(gossip.publishes[0]?.topic).toMatch(/shared-memory$/);
+
+    expect(calls).toHaveLength(2);
+    expect(calls.map(c => c.peerId).sort()).toEqual(['12D3KooWAllowedA', '12D3KooWAllowedB']);
+    expect(calls.every(c => c.protocolId === '/dkg/10.0.1/swm-update')).toBe(true);
+
+    expect(agent.getSwmSubstrateFanoutStats().delivered).toEqual({ 'cg-curated-r2': 2 });
+  });
+
+  /**
+   * PR-C codex R1 regression: enumeration calls SPARQL through
+   * `this.store`. A triple-store query failure (worker timeout,
+   * transient backend hiccup, corrupt graph) MUST NOT reject
+   * `share()` after the local commit already succeeded. The
+   * agent wraps `enumerate()` + `chooseFanOutTier()` in a
+   * try/catch and falls back to gossip-only on throw (the
+   * pre-PR-C behaviour for this share).
+   *
+   * We trigger the throw by overriding `enumerate` on the lazy
+   * enumerator instance — that's the call site whose SPARQL
+   * helpers raise in production.
+   */
+  it('codex R1: enumeration throw falls back to gossip-only, share() succeeds, no substrate sends', async () => {
+    const agent = await createAgent('SubstrateFanoutPlanningThrow');
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWPeerWouldHaveGottenSubstrate'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    // Substrate stub: assert it's NEVER called on the throw path
+    // — the fallback plan is `useSubstrate: false`.
+    const { calls, install } = stubMessengerSendReliable(new Map());
+    install(agent);
+
+    // Force the lazy enumerator to throw on enumerate() — same
+    // shape `getContextGraphAllowedPeers()` would produce if
+    // `this.store.query()` raised.
+    const enumerator = (agent as unknown as {
+      getOrCreateCGMemberEnumerator(): { enumerate: (cg: string) => Promise<unknown> };
+    }).getOrCreateCGMemberEnumerator();
+    enumerator.enumerate = async () => {
+      throw new Error('simulated SPARQL worker timeout');
+    };
+
+    // share() MUST resolve cleanly — local commit already
+    // succeeded, transport plan fell back to gossip-only.
+    const result = await agent.share('cg-planning-throw', [{
+      subject: 'urn:test:planning-throw',
+      predicate: 'http://schema.org/name',
+      object: '"local commit must survive enumeration throw"',
+      graph: '',
+    }]);
+    expect(typeof result.shareOperationId).toBe('string');
+    expect(result.shareOperationId.length).toBeGreaterThan(0);
+
+    // Gossip publish DID run (the fallback plan keeps it on).
+    expect(gossip.publishes).toHaveLength(1);
+    expect(gossip.publishes[0]?.topic).toMatch(/shared-memory$/);
+
+    // Substrate fan-out did NOT run — fallback plan has
+    // useSubstrate: false, so no per-peer sends and no counter
+    // movement.
+    expect(calls).toEqual([]);
+    expect(agent.getSwmSubstrateFanoutStats()).toEqual({
+      delivered: {},
+      queued: {},
+      inFlight: {},
+      failed: {},
+      overflow: { delivered: 0, queued: 0, inFlight: 0, failed: 0 },
+      truncated: false,
+    });
+  });
+
+  /**
    * Counters MUST isolate per cgId so operator-facing /api/slo
    * shows which CGs are healthy vs which are dragging the
    * delivery rate down.

@@ -164,6 +164,7 @@ import {
   executeSubstrateFanOut,
   type FanOutBookkeeper,
   type FanOutPeerRecord,
+  type FanOutPlan,
 } from './swm/substrate-fanout.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
@@ -6440,11 +6441,45 @@ export class DKGAgent {
     // become observable via /api/slo (gossip.publishFailures +
     // swm.substrateFanout) and the next sync-on-reconnect is the
     // ultimate safety net.
-    const enumeration = await this.getOrCreateCGMemberEnumerator().enumerate(contextGraphId);
-    const plan = chooseFanOutTier({
-      enumeration,
-      maxSubstrateMembers: this.swmSubstrateMaxMembers,
-    });
+    //
+    // PR-C Codex R1 (planning-throw safety): `enumerate()` calls
+    // `getContextGraphAllowedPeers()` + `isPrivateContextGraph()`
+    // which both run SPARQL queries against `this.store`. A
+    // triple-store query failure (worker timeout, transient
+    // backend hiccup, corrupt graph) would otherwise bubble out
+    // of `publishWorkspaceGossip` and reject `share()` AFTER the
+    // local commit already succeeded — silently changing the
+    // pre-PR-C "share() never re-throws on transport failure"
+    // contract. Wrap planning in the same swallow-and-log shell
+    // as the gossip publish: on throw, fall back to a gossip-only
+    // plan (exactly the pre-PR-C behaviour for this share). The
+    // next share to the same cgId pays the SPARQL retry; the
+    // 60s enumeration cache means a one-off blip is recovered on
+    // the next call.
+    let plan: FanOutPlan;
+    try {
+      const enumeration = await this.getOrCreateCGMemberEnumerator().enumerate(contextGraphId);
+      plan = chooseFanOutTier({
+        enumeration,
+        maxSubstrateMembers: this.swmSubstrateMaxMembers,
+      });
+    } catch (err) {
+      const errClass = err instanceof Error
+        ? (err.name && err.name !== 'Error' ? err.name : err.constructor.name)
+        : typeof err;
+      const errMessage = err instanceof Error ? err.message : String(err);
+      this.log.warn(
+        ctx,
+        `SWM fan-out planning FAILED for cgId=${contextGraphId} errorClass="${errClass}" error="${errMessage}" — falling back to gossip-only (pre-PR-C behaviour)`,
+      );
+      plan = {
+        useSubstrate: false,
+        useGossip: true,
+        substrateMembers: [],
+        enumerationSource: 'none',
+        enumeratedCount: 0,
+      };
+    }
 
     // Substrate fan-out runs first (and in parallel with gossip
     // when both legs are active) so the parallel send latency

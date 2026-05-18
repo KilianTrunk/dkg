@@ -552,19 +552,18 @@ jobs:
             echo "${PUBLISH_OUT}"
             if [ "${PUBLISH_STATUS}" -eq 0 ]; then
               echo "Published ${PKG_NAME}@${VER} with --tag ${NPM_TAG}"
+              # Apply extra dist-tags only on fresh publish to avoid
+              # rolling back latest on a rerun of an older tag
+              for extra in ${EXTRA_TAGS}; do
+                echo "Adding dist-tag: ${PKG_NAME}@${VER} → ${extra}"
+                npm dist-tag add "${PKG_NAME}@${VER}" "${extra}"
+              done
             elif echo "${PUBLISH_OUT}" | grep -qE "EPUBLISHCONFLICT|cannot publish over|previously published"; then
-              echo "⚠ ${PKG_NAME}@${VER} already published — setting dist-tag ${NPM_TAG}"
-              npm dist-tag add "${PKG_NAME}@${VER}" "${NPM_TAG}"
+              echo "⚠ ${PKG_NAME}@${VER} already published — skipping dist-tag changes to avoid rolling back newer versions"
             else
               echo "::error::Failed to publish ${PKG_NAME}@${VER} (exit ${PUBLISH_STATUS})"
               exit 1
             fi
-
-            # Apply extra dist-tags (e.g. 'rc' alongside 'latest')
-            for extra in ${EXTRA_TAGS}; do
-              echo "Adding dist-tag: ${PKG_NAME}@${VER} → ${extra}"
-              npm dist-tag add "${PKG_NAME}@${VER}" "${extra}"
-            done
 
             echo "::endgroup::"
           done

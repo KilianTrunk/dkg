@@ -1324,6 +1324,33 @@ export class DKGAgent {
   };
   private swmSubstrateFanoutTruncated = false;
   private static readonly SWM_SUBSTRATE_FANOUT_MAX_TRACKED_CGS = 1024;
+
+  /**
+   * rc.9 PR-G codex follow-up #G2: in-flight substrate fan-out
+   * promises detached from the foreground `share()` call. Pre-PR-G
+   * `publishWorkspaceGossip` awaited both the substrate and
+   * gossip legs together, which meant one slow / offline
+   * allowlisted peer could hold `share()` open for up to
+   * `SWM_SUBSTRATE_FANOUT_TIMEOUT_MS` (15s) — a regression from
+   * the pre-rc.9 gossip-only path that returned in tens of ms.
+   *
+   * Now we fire substrate fan-out without awaiting it, await
+   * only the (fast) gossip publish, and return. The substrate
+   * promise still runs to completion in the background — its
+   * bookkeeper still updates the per-cgId counter maps as each
+   * peer's send completes, and its `.then()` still emits the
+   * fan-out INFO summary log. Failures (which executeSubstrateFanOut
+   * already swallows internally via Promise.allSettled) get a
+   * defensive `.catch()` to log any escaped error without
+   * crashing the unhandled-rejection handler.
+   *
+   * The Set holds the wrapped promises (after the bookkeeper +
+   * INFO-log chain is attached) so tests can drain them via
+   * `awaitInFlightSubstrateFanOuts()`. .finally() removes each
+   * promise on completion so the Set stays bounded by
+   * concurrency, not by cumulative shares.
+   */
+  private readonly inFlightSubstrateFanOuts = new Set<Promise<void>>();
   /**
    * Member-count cap above which public CGs fall back to gossip-
    * only delivery (substrate fan-out is N-round-trips, so cost
@@ -6095,12 +6122,18 @@ export class DKGAgent {
       // outbox. `handle()` already logged the specific rejection
       // at WARN/ERROR; the throw message just gives operators the
       // hint when they grep for "swm apply" in receiver logs.
+      //
+      // (Codex flagged this as PR-G #G1 — the abort string
+      // matching is fragile. The proper fix is a wire sentinel
+      // PLUS a watchdog that reschedules retryable peers when
+      // libp2p drops the abort. That fix lands in PR-D where
+      // the watchdog exists; PR-G keeps the throw path so the
+      // outbox is still the safety net on transports where the
+      // abort happens to match.)
       throw new Error(`SWM apply transient rejection from ${fromPeerId}: ${outcome.reason}`);
     }
     // Permanent rejection: signal via the 1-byte sentinel so the
     // sender records `rejected` (not `delivered`) and stops here.
-    // PR-D will replace this with a structured `SwmShareAck`
-    // protobuf carrying outcome + reason on the wire.
     this.log.warn(
       createOperationContext('share'),
       `SWM substrate receiver dropping share from ${fromPeerId} (permanent rejection): ${outcome.reason}`,
@@ -6566,39 +6599,70 @@ export class DKGAgent {
       };
     }
 
-    // Substrate fan-out runs first (and in parallel with gossip
-    // when both legs are active) so the parallel send latency
-    // overlaps with the gossip publish round-trip.
-    const substratePromise = plan.useSubstrate
-      ? executeSubstrateFanOut({
-        contextGraphId,
-        protocolId: PROTOCOL_SWM_UPDATE,
-        payload: wireMessage,
-        members: plan.substrateMembers,
-        sendTimeoutMs: DKGAgent.SWM_SUBSTRATE_FANOUT_TIMEOUT_MS,
-        substrate: this.messenger,
-        bookkeeper: this.substrateFanoutBookkeeper(),
-      })
-      : Promise.resolve(null);
+    // rc.9 PR-G codex follow-up #G2: detach substrate fan-out
+    // from the foreground share() path. We await ONLY the gossip
+    // publish (fast — a single topic emit), and let the substrate
+    // leg complete in the background. Without this, one slow /
+    // offline allowlisted peer could hold share() open for up to
+    // SWM_SUBSTRATE_FANOUT_TIMEOUT_MS (15s), regressing the
+    // pre-rc.9 gossip-only path's "share returns in tens of ms"
+    // contract.
+    //
+    // Background substrate keeps everything observability-wise:
+    //   - executeSubstrateFanOut still uses Promise.allSettled
+    //     internally, so per-peer outcomes still feed the
+    //     bookkeeper as each send completes.
+    //   - The INFO summary log fires from .then() once all peers
+    //     have responded (or timed out).
+    //   - A defensive .catch() guards against any escaped error
+    //     (should not fire — allSettled never rejects — but cheap
+    //     insurance against future refactors).
+    //   - The promise is registered into
+    //     `this.inFlightSubstrateFanOuts` so tests can drain via
+    //     `awaitInFlightSubstrateFanOuts()`. .finally() removes
+    //     each promise on completion to keep the Set bounded by
+    //     concurrency rather than cumulative shares.
+    if (plan.useSubstrate) {
+      const substratePromise: Promise<void> = (async () => {
+        try {
+          const substrateResult = await executeSubstrateFanOut({
+            contextGraphId,
+            protocolId: PROTOCOL_SWM_UPDATE,
+            payload: wireMessage,
+            members: plan.substrateMembers,
+            sendTimeoutMs: DKGAgent.SWM_SUBSTRATE_FANOUT_TIMEOUT_MS,
+            substrate: this.messenger,
+            bookkeeper: this.substrateFanoutBookkeeper(),
+          });
+          this.log.info(
+            ctx,
+            `SWM substrate fan-out cgId=${contextGraphId} source=${plan.enumerationSource} `
+            + `enumerated=${plan.enumeratedCount} `
+            + `attempted=${substrateResult.attempted} `
+            + `delivered=${substrateResult.delivered} rejected=${substrateResult.rejected} `
+            + `queued=${substrateResult.queued} `
+            + `inFlight=${substrateResult.inFlight} failed=${substrateResult.failed} `
+            + `also_gossiped=${plan.useGossip}`,
+          );
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          this.log.warn(
+            ctx,
+            `SWM substrate fan-out cgId=${contextGraphId} threw out of allSettled boundary: ${reason}`,
+          );
+        }
+      })();
+      const tracked = substratePromise.finally(() => {
+        this.inFlightSubstrateFanOuts.delete(tracked);
+      });
+      this.inFlightSubstrateFanOuts.add(tracked);
+    }
 
-    const gossipPromise = plan.useGossip
-      ? this.publishViaGossip(contextGraphId, topic, wireMessage, ctx)
-      : Promise.resolve();
+    if (plan.useGossip) {
+      await this.publishViaGossip(contextGraphId, topic, wireMessage, ctx);
+    }
 
-    const [substrateResult] = await Promise.all([substratePromise, gossipPromise]);
-
-    if (substrateResult !== null) {
-      this.log.info(
-        ctx,
-        `SWM substrate fan-out cgId=${contextGraphId} source=${plan.enumerationSource} `
-        + `enumerated=${plan.enumeratedCount} `
-        + `attempted=${substrateResult.attempted} `
-        + `delivered=${substrateResult.delivered} rejected=${substrateResult.rejected} `
-        + `queued=${substrateResult.queued} `
-        + `inFlight=${substrateResult.inFlight} failed=${substrateResult.failed} `
-        + `also_gossiped=${plan.useGossip}`,
-      );
-    } else if (plan.enumerationSource === 'topic-subscribers' && plan.enumeratedCount > this.swmSubstrateMaxMembers) {
+    if (!plan.useSubstrate && plan.enumerationSource === 'topic-subscribers' && plan.enumeratedCount > this.swmSubstrateMaxMembers) {
       // Public CG above the threshold: gossip-only. Surface the
       // gate trip at INFO so soak postmortems can correlate share
       // delivery against transport choice without grepping for
@@ -9123,6 +9187,32 @@ export class DKGAgent {
    * `Object.fromEntries` consistent with the existing /api/slo
    * shape.
    */
+  /**
+   * Test/observability helper (rc.9 PR-G codex follow-up #G2).
+   * Resolves once every detached substrate fan-out spawned by
+   * `publishWorkspaceGossip` has settled (counters updated,
+   * INFO log emitted). Production code DOES NOT need to call
+   * this — the whole point of the G2 detach is that share()
+   * returns without waiting on the substrate side. Used by
+   * integration tests that assert on substrate counters after
+   * a `share()` call, and by the soak script's shutdown flush
+   * so in-flight outbox writes don't get lost across process
+   * boundaries.
+   *
+   * Returns a snapshot of the in-flight set at call time, so a
+   * fan-out enqueued AFTER this call returns will not be awaited.
+   * Callers that need full drain should loop until
+   * `inFlightSubstrateFanOutCount() === 0`.
+   */
+  async awaitInFlightSubstrateFanOuts(): Promise<void> {
+    await Promise.allSettled([...this.inFlightSubstrateFanOuts]);
+  }
+
+  /** Sibling of {@link awaitInFlightSubstrateFanOuts} — gauge for diagnostic / drain-loop use. */
+  inFlightSubstrateFanOutCount(): number {
+    return this.inFlightSubstrateFanOuts.size;
+  }
+
   getSwmSubstrateFanoutStats(): {
     delivered: Record<string, number>;
     rejected: Record<string, number>;
@@ -14782,6 +14872,43 @@ export class DKGAgent {
     if (this.randomSamplingHandle) {
       try { await this.randomSamplingHandle.stop(); } catch { /* swallow on shutdown */ }
       this.randomSamplingHandle = null;
+    }
+    // rc.9 PR-G codex follow-up #G3: drain background substrate
+    // fan-outs spawned by `publishWorkspaceGossip` (G2's
+    // fire-and-forget detach) before tearing down libp2p. Without
+    // this drain, a process that calls `share()` and then
+    // shuts down (test runs, soak script SIGTERM, daemon
+    // restart) could abandon mid-flight per-peer substrate sends
+    // — regressing the pre-G2 guarantee that share() didn't
+    // return until every substrate attempt either succeeded or
+    // landed in the durable outbox. The bookkeeper still feeds
+    // the per-cgId counters during the drain, so /api/slo's
+    // last sample before shutdown reflects the true completion
+    // state.
+    //
+    // We bound the wait with `Promise.race` against
+    // `SWM_SUBSTRATE_FANOUT_TIMEOUT_MS + 1s`. Per-peer sends
+    // already have that timeout; the +1s slack covers post-
+    // timeout cleanup (counter update + INFO log emit) for
+    // peers that hit the timeout right as `stop()` is called.
+    // After the bound we proceed with libp2p teardown even if
+    // some fan-outs remain — better to enforce a shutdown SLA
+    // than to hang the process indefinitely on one unresponsive
+    // peer. The unfinished sends will fall back to outbox on
+    // recoverable failures (queued count bumps) just as they
+    // would under any other teardown.
+    if (this.inFlightSubstrateFanOutCount() > 0) {
+      const drainBoundMs = DKGAgent.SWM_SUBSTRATE_FANOUT_TIMEOUT_MS + 1000;
+      await Promise.race([
+        this.awaitInFlightSubstrateFanOuts(),
+        new Promise<void>((resolve) => setTimeout(resolve, drainBoundMs).unref?.()),
+      ]);
+      if (this.inFlightSubstrateFanOutCount() > 0) {
+        this.log.warn(
+          createOperationContext('share'),
+          `DKGAgent.stop: ${this.inFlightSubstrateFanOutCount()} substrate fan-outs still in flight after ${drainBoundMs}ms drain bound — proceeding with shutdown (outbox will pick up residual queued sends on next start)`,
+        );
+      }
     }
     // Tear down any pooled wire-protocol overlays before libp2p
     // stops so per-peer streams close gracefully rather than via

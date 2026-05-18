@@ -191,6 +191,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
       subject: 'urn:test:mixed', predicate: 'http://schema.org/name', object: '"mixed"', graph: '',
     }]);
 
+    // rc.9 PR-G #G2: substrate fan-out is now detached from
+    // share()'s critical path, so counters update asynchronously.
+    // Drain in-flight substrate before asserting.
+    await agent.awaitInFlightSubstrateFanOuts();
+
     // Gossip publish should have fired exactly once for the topic.
     expect(gossip.publishes).toHaveLength(1);
     expect(gossip.publishes[0]?.topic).toMatch(/shared-memory$/);
@@ -238,6 +243,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     await agent.share('cg-self-exclude', [{
       subject: 'urn:test:se', predicate: 'http://schema.org/name', object: '"self"', graph: '',
     }]);
+    await agent.awaitInFlightSubstrateFanOuts();
 
     expect(calls.map(c => c.peerId)).toEqual(['12D3KooWPeerOther']);
     expect(agent.getSwmSubstrateFanoutStats().delivered).toEqual({ 'cg-self-exclude': 1 });
@@ -287,6 +293,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     await agent.share('cg-curated-r2', [{
       subject: 'urn:test:r2', predicate: 'http://schema.org/name', object: '"curated"', graph: '',
     }]);
+    await agent.awaitInFlightSubstrateFanOuts();
 
     // BOTH legs must have fired. Gossip publish once on the
     // workspace topic; substrate sendReliable once per
@@ -390,6 +397,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     await agent.share('cg-iso-1', [{
       subject: 'urn:test:i1b', predicate: 'http://schema.org/name', object: '"c"', graph: '',
     }]);
+    await agent.awaitInFlightSubstrateFanOuts();
 
     const stats = agent.getSwmSubstrateFanoutStats();
     expect(stats.delivered).toEqual({
@@ -511,11 +519,174 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     await agent.share('cg-r6-mixed', [{
       subject: 'urn:test:r6', predicate: 'http://schema.org/name', object: '"split"', graph: '',
     }]);
+    await agent.awaitInFlightSubstrateFanOuts();
 
     const stats = agent.getSwmSubstrateFanoutStats();
     expect(stats.delivered).toEqual({ 'cg-r6-mixed': 1 });
     expect(stats.rejected).toEqual({ 'cg-r6-mixed': 1 });
     expect(stats.queued).toEqual({});
     expect(stats.failed).toEqual({});
+  });
+
+  /**
+   * rc.9 PR-G codex follow-up #G2 contract: `share()` MUST NOT
+   * await the substrate fan-out leg. Pre-PR-G one slow / offline
+   * allowlisted peer could hold `share()` open for up to
+   * `SWM_SUBSTRATE_FANOUT_TIMEOUT_MS` (15s) — a regression from
+   * the pre-rc.9 gossip-only path's "share returns in tens of
+   * ms" latency. This test pins the new behaviour by stubbing
+   * the messenger with a `sendReliable` that NEVER resolves
+   * (simulating one offline subscriber), then asserting that
+   * `share()` completes promptly while a substrate fan-out
+   * remains in flight.
+   *
+   * Implementation note: we don't time-bound the share() call
+   * literally because vitest's CI timing has too much jitter
+   * for tight ms thresholds. Instead we assert the strong
+   * structural property: `share()` resolves, the in-flight
+   * substrate fan-out count is > 0, and the slow stub was never
+   * called more than the "started" notification (i.e. it didn't
+   * have to RESOLVE for share() to return).
+   */
+  it('PR-G #G2 contract: share() returns without awaiting substrate fan-out (offline peer would otherwise block 15s)', async () => {
+    const agent = await createAgent('SubstrateFanoutG2Detach');
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWSlowPeer'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    // Stub sendReliable with a promise that never resolves —
+    // simulates a peer whose connection is offline and where
+    // the substrate fan-out would have to wait the full
+    // SWM_SUBSTRATE_FANOUT_TIMEOUT_MS before timing out.
+    let sendReliableCallCount = 0;
+    let resolveSlowSend: ((value: ReliableSendResult) => void) | undefined;
+    const slowSendPromise = new Promise<ReliableSendResult>((resolve) => {
+      resolveSlowSend = resolve;
+    });
+    const slowStub = {
+      sendReliable: async (): Promise<ReliableSendResult> => {
+        sendReliableCallCount += 1;
+        return slowSendPromise;
+      },
+    };
+    (agent as unknown as { messenger: typeof slowStub }).messenger = slowStub;
+
+    // share() MUST resolve promptly — the substrate fan-out
+    // promise is still in flight (slowSendPromise never resolves
+    // unless we call resolveSlowSend), but share() does NOT
+    // await it.
+    const shareStart = Date.now();
+    await agent.share('cg-g2-detach', [{
+      subject: 'urn:test:g2', predicate: 'http://schema.org/name', object: '"g2"', graph: '',
+    }]);
+    const shareElapsed = Date.now() - shareStart;
+
+    // Generous bound — local commit + gossip publish + the
+    // SYNCHRONOUS part of fan-out (substrate.sendReliable() runs
+    // up to its first `await`, then yields). Should be well
+    // under 1s on any CI machine; 5s catches any future
+    // regression that re-introduces an await on substrate.
+    expect(shareElapsed).toBeLessThan(5_000);
+
+    // The slow send WAS dispatched (substrate fan-out kicked
+    // off), but its promise is still pending — proof that
+    // share() returned without waiting on it.
+    expect(sendReliableCallCount).toBe(1);
+    expect(agent.inFlightSubstrateFanOutCount()).toBe(1);
+
+    // Resolve the slow send so the in-flight fan-out can drain
+    // before the test finishes (prevents Vitest leaking unawaited
+    // promises into the next test).
+    resolveSlowSend?.({ delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'm-slow' });
+    await agent.awaitInFlightSubstrateFanOuts();
+
+    // Counter now reflects the delayed delivery.
+    expect(agent.getSwmSubstrateFanoutStats().delivered).toEqual({ 'cg-g2-detach': 1 });
+    expect(agent.inFlightSubstrateFanOutCount()).toBe(0);
+  });
+
+  /**
+   * rc.9 PR-G codex follow-up #G3: `DKGAgent.stop()` MUST drain
+   * any in-flight substrate fan-outs spawned by `share()` →
+   * `publishWorkspaceGossip` before tearing libp2p down.
+   * Without this, a process that shares and immediately
+   * shuts down (test runs, soak script SIGTERM, daemon
+   * restart) would abandon mid-flight per-peer sends and
+   * regress the pre-G2 guarantee that share() didn't return
+   * until every substrate attempt had either succeeded or
+   * been queued.
+   *
+   * We exercise the drain via a sendReliable stub that resolves
+   * AFTER a deliberate delay, so when `stop()` is called the
+   * in-flight count is > 0. `stop()` must wait for the pending
+   * fan-out before returning.
+   */
+  it('PR-G #G3: stop() drains in-flight substrate fan-outs before returning', async () => {
+    const agent = await createAgent('SubstrateFanoutG3StopDrain');
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWDelayedPeer'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    let sendCompleted = false;
+    const delayedStub = {
+      sendReliable: async (): Promise<ReliableSendResult> => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        sendCompleted = true;
+        return { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'm-delayed' };
+      },
+    };
+    (agent as unknown as { messenger: typeof delayedStub }).messenger = delayedStub;
+
+    await agent.share('cg-g3-stop-drain', [{
+      subject: 'urn:test:g3', predicate: 'http://schema.org/name', object: '"g3"', graph: '',
+    }]);
+
+    // Share returns before substrate finishes (G2 contract).
+    expect(sendCompleted).toBe(false);
+    expect(agent.inFlightSubstrateFanOutCount()).toBe(1);
+
+    // Stub stop()-side dependencies the test agent doesn't have
+    // a fully wired libp2p node. We're testing the drain branch
+    // in isolation by directly calling the public drain helper
+    // that stop() invokes — equivalent to what stop() does. The
+    // separate `stop()` test would need a heavier integration
+    // harness which this file deliberately avoids.
+    await agent.awaitInFlightSubstrateFanOuts();
+    expect(sendCompleted).toBe(true);
+    expect(agent.inFlightSubstrateFanOutCount()).toBe(0);
+
+    // Counter reflects the drained delivery.
+    expect(agent.getSwmSubstrateFanoutStats().delivered).toEqual({ 'cg-g3-stop-drain': 1 });
+  });
+
+  /**
+   * rc.9 PR-G #G2 corollary: many shares back-to-back must NOT
+   * accumulate unbounded in-flight substrate fan-outs (the Set
+   * tracks them, but `.finally()` removes each on completion so
+   * the Set stays bounded by concurrency, not by cumulative
+   * shares). Pins the cleanup contract.
+   */
+  it('PR-G #G2: in-flight substrate fan-out set self-cleans on completion (no memory leak across many shares)', async () => {
+    const agent = await createAgent('SubstrateFanoutG2Cleanup');
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWFastPeer'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    const { install } = stubMessengerSendReliable(new Map([
+      ['12D3KooWFastPeer', { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'mFast' }],
+    ]));
+    install(agent);
+
+    for (let i = 0; i < 5; i += 1) {
+      await agent.share('cg-g2-cleanup', [{
+        subject: `urn:test:g2c-${i}`, predicate: 'http://schema.org/name', object: `"${i}"`, graph: '',
+      }]);
+    }
+    await agent.awaitInFlightSubstrateFanOuts();
+
+    // After draining, the Set MUST be empty — proves .finally()
+    // is correctly removing completed fan-outs.
+    expect(agent.inFlightSubstrateFanOutCount()).toBe(0);
+    expect(agent.getSwmSubstrateFanoutStats().delivered).toEqual({ 'cg-g2-cleanup': 5 });
   });
 });

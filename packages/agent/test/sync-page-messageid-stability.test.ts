@@ -3,7 +3,7 @@ import {
   fetchSyncPages,
   computeSyncPageMessageId,
 } from '../src/sync/requester/page-fetch.js';
-import type { OperationContext } from '@origintrail-official/dkg-core';
+import { RESPONSE_GONE_MARKER, type OperationContext } from '@origintrail-official/dkg-core';
 import type { SyncPhase } from '../src/sync/auth/request-build.js';
 
 /**
@@ -464,5 +464,219 @@ describe('fetchSyncPages messageId propagation', () => {
     const ids = [...observedMessageIdsByOffset.values()];
     const uniqueIds = new Set(ids);
     expect(uniqueIds.size).toBe(ids.length);
+  });
+});
+
+/**
+ * Regression tests for codex review #6 and #7 on PR #569.
+ *
+ * #6: After moving sync onto `sendReliable`, the substrate's
+ * RESPONSE_GONE_MARKER sentinel can come back when a duplicate-
+ * receive lands on a too-large response. Naively returning the
+ * sentinel upstream would let `fetchSyncPages` parse it as
+ * N-Quads (0 quads), trip the empty-page terminator, and silently
+ * drop the rest of the sync. The fix detects the sentinel and
+ * re-issues with a FRESHLY BUILT envelope (new requestId so the
+ * responder's `authorizePrivateSyncRequest` doesn't reject as
+ * replay) AND a fresh substrate messageId.
+ *
+ * #7: After hoisting `buildSyncRequest` out of `sendSyncRequest`'s
+ * withRetry (to keep envelope+messageId 1:1), transient build-time
+ * failures (`isPrivateContextGraph`, `getIdentityId`, signing) no
+ * longer benefit from automatic retry. The fix wraps the build in
+ * its own withRetry around the per-page build call.
+ */
+describe('fetchSyncPages: RESPONSE_GONE recovery + build-time retry', () => {
+  it('rebuilds the envelope AND mints a fresh messageId on RESPONSE_GONE', async () => {
+    let buildCalls = 0;
+    const observedMessageIds: string[] = [];
+    let sendCallIndex = 0;
+
+    await fetchSyncPages({
+      ctx: makeCtx(),
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId: CG_ID,
+      includeSharedMemory: false,
+      phase: 'data',
+      graphUri: GRAPH_URI,
+      deadline: Date.now() + 60_000,
+      syncPageTimeoutMs: 5_000,
+      syncRouterAttempts: 1,
+      syncPageRetryAttempts: 1,
+      syncPageSize: 100,
+      syncDeniedResponse: '#DENIED',
+      debugSyncProgress: false,
+      protocolSync: PROTOCOL_ID,
+      checkpointStore: {
+        get: () => 0,
+        set: () => {},
+        delete: () => {},
+      },
+      buildSyncRequest: async () => {
+        buildCalls++;
+        return new TextEncoder().encode(`request-build-${buildCalls}`);
+      },
+      parseAndFilter: singleQuadParser,
+      send: async (_peerId, _protocolId, _data, _timeoutMs, messageId) => {
+        observedMessageIds.push(messageId);
+        sendCallIndex++;
+        if (sendCallIndex === 1) {
+          // First send: receiver duplicates → substrate returns the
+          // sentinel as the "response".
+          return new TextEncoder().encode(RESPONSE_GONE_MARKER);
+        }
+        return new TextEncoder().encode('one-quad-line');
+      },
+      logWarn: noopLog,
+      logInfo: noopLog,
+      logDebug: noopLog,
+    });
+
+    expect(sendCallIndex).toBe(2);
+
+    // Bug #6: the rebuild MUST run for the retry, so the responder
+    // gets a fresh requestId envelope (not a replay on auth).
+    expect(buildCalls).toBe(2);
+
+    // Bug #6: the substrate messageId must ALSO be fresh, so we
+    // don't hit the same mark-only cache entry that just told us
+    // RESPONSE_GONE. The convention is appending ":gone-retry" to
+    // the original; assert the second messageId differs from the
+    // first AND ends with the marker.
+    expect(observedMessageIds.length).toBe(2);
+    expect(observedMessageIds[0]).not.toBe(observedMessageIds[1]);
+    expect(observedMessageIds[1]).toBe(`${observedMessageIds[0]}:gone-retry`);
+  });
+
+  it('throws when BOTH the initial send and the RESPONSE_GONE retry return the sentinel', async () => {
+    // Pathological responder that always blows the cache.
+    await expect(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: false,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 1,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => new TextEncoder().encode('request'),
+        parseAndFilter: singleQuadParser,
+        send: async () => new TextEncoder().encode(RESPONSE_GONE_MARKER),
+        logWarn: noopLog,
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    ).rejects.toThrow(/exhausted RESPONSE_GONE retries/);
+  });
+
+  it('does NOT trigger RESPONSE_GONE recovery for a normal response that merely CONTAINS the marker as a substring', async () => {
+    // Exact-equality check on the decoded response body, not
+    // substring. A real N-Quads page that embeds the string
+    // "RESPONSE_GONE" inside a literal must NOT be treated as the
+    // sentinel.
+    let buildCalls = 0;
+    let sendCalls = 0;
+
+    await fetchSyncPages({
+      ctx: makeCtx(),
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId: CG_ID,
+      includeSharedMemory: false,
+      phase: 'data',
+      graphUri: GRAPH_URI,
+      deadline: Date.now() + 60_000,
+      syncPageTimeoutMs: 5_000,
+      syncRouterAttempts: 1,
+      syncPageRetryAttempts: 1,
+      syncPageSize: 100,
+      syncDeniedResponse: '#DENIED',
+      debugSyncProgress: false,
+      protocolSync: PROTOCOL_ID,
+      checkpointStore: {
+        get: () => 0,
+        set: () => {},
+        delete: () => {},
+      },
+      buildSyncRequest: async () => {
+        buildCalls++;
+        return new TextEncoder().encode('request');
+      },
+      parseAndFilter: singleQuadParser,
+      send: async () => {
+        sendCalls++;
+        return new TextEncoder().encode(
+          `<s> <p> "RESPONSE_GONE happened in literal text" <g> .\n`,
+        );
+      },
+      logWarn: noopLog,
+      logInfo: noopLog,
+      logDebug: noopLog,
+    });
+
+    expect(sendCalls).toBe(1);
+    expect(buildCalls).toBe(1);
+  });
+
+  it('retries transient envelope-build failures (preserves pre-#5 behaviour)', async () => {
+    // Bug #7: hoisting buildSyncRequest out of withRetry removed
+    // automatic retry for transient build errors. The fix wraps
+    // each per-page build in its own withRetry. Test by failing the
+    // first 2 build attempts.
+    let buildCalls = 0;
+    let sendCalls = 0;
+
+    await fetchSyncPages({
+      ctx: makeCtx(),
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId: CG_ID,
+      includeSharedMemory: false,
+      phase: 'data',
+      graphUri: GRAPH_URI,
+      deadline: Date.now() + 60_000,
+      syncPageTimeoutMs: 5_000,
+      syncRouterAttempts: 1,
+      // Allow enough retry budget for 2 build failures + 1 success.
+      syncPageRetryAttempts: 5,
+      syncPageSize: 100,
+      syncDeniedResponse: '#DENIED',
+      debugSyncProgress: false,
+      protocolSync: PROTOCOL_ID,
+      checkpointStore: {
+        get: () => 0,
+        set: () => {},
+        delete: () => {},
+      },
+      buildSyncRequest: async () => {
+        buildCalls++;
+        if (buildCalls < 3) {
+          throw new Error(`transient build failure ${buildCalls}`);
+        }
+        return new TextEncoder().encode('request');
+      },
+      parseAndFilter: singleQuadParser,
+      send: async () => {
+        sendCalls++;
+        return new TextEncoder().encode('one-quad-line');
+      },
+      logWarn: noopLog,
+      logInfo: noopLog,
+      logDebug: noopLog,
+    });
+
+    // 3 build attempts (2 throws + 1 success), 1 send.
+    expect(buildCalls).toBe(3);
+    expect(sendCalls).toBe(1);
   });
 });

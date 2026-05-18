@@ -155,7 +155,6 @@ import { SyncVerifyWorker } from './sync-verify-worker.js';
 import { bindRandomSampling, type RandomSamplingHandle, type RandomSamplingStatus } from './random-sampling-bind.js';
 import { connectToMultiaddr, ensurePeerConnected as ensurePeerConnectedAtom, primeCatchupConnections as primeCatchupConnectionsAtom } from './p2p/peer-connect.js';
 import { Messenger, type SloProtocolStats } from './p2p/messenger.js';
-import { sendSyncReliable } from './p2p/sync-send-reliable.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
@@ -3102,20 +3101,29 @@ export class DKGAgent {
       // responder-side execution for what is logically the same
       // request.
       //
-      // rc.9 PR-E follow-up #3 (codex review on #569): the actual
-      // sendReliable call now lives in `sendSyncReliable`, which
-      // adds RESPONSE_GONE handling. Sync responses (N-Quads pages)
-      // routinely exceed the substrate's 256 KiB inline response
-      // cache, so a duplicate-receive can yield the RESPONSE_GONE
-      // sentinel instead of the original bytes — fetchSyncPages
-      // would then parse "RESPONSE_GONE" as N-Quads, terminate the
-      // page on empty parse, and silently drop the rest of the
-      // sync. The helper mirrors queryRemote's pattern: re-issue
-      // with a fresh messageId so the responder re-runs the query
-      // from scratch (semantically safe — sync queries are
-      // app-layer idempotent).
-      send: (peerId, protocolId, data, sendTimeoutMs, messageId) =>
-        sendSyncReliable(this.messenger, peerId, protocolId, data, sendTimeoutMs, messageId),
+      // RESPONSE_GONE handling intentionally lives ONE layer up,
+      // in page-fetch.ts. The sentinel fires on duplicate-receive
+      // for responses larger than the substrate's 256 KiB inline
+      // cache (common for sync N-Quads pages), and recovering from
+      // it requires building a fresh-`requestId` envelope so the
+      // responder's `authorizePrivateSyncRequest` doesn't reject
+      // the re-issue as a replay. Only page-fetch has access to
+      // `buildSyncRequest`, so the recovery lives there — not in
+      // this adapter. (Codex follow-up #6 on PR #569.)
+      send: async (peerId, protocolId, data, sendTimeoutMs, messageId) => {
+        const result = await this.messenger.sendReliable(peerId, protocolId, data, {
+          timeoutMs: sendTimeoutMs,
+          messageId,
+        });
+        if (!result.delivered) {
+          throw new Error(
+            `Sync send to ${peerId} ${
+              result.queued ? 'queued (not synchronously deliverable)' : 'failed'
+            }: ${result.error ?? 'unknown'}`,
+          );
+        }
+        return result.response;
+      },
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
       logDebug: (opCtx, message) => this.log.debug(opCtx, message),

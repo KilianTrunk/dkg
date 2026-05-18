@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { OperationContext } from '@origintrail-official/dkg-core';
+import { RESPONSE_GONE_MARKER, withRetry, type OperationContext } from '@origintrail-official/dkg-core';
 import type { Quad } from '@origintrail-official/dkg-storage';
 import { sendSyncRequest } from '../../p2p/sync-transport.js';
 import type { SyncPhase } from '../auth/request-build.js';
@@ -194,7 +194,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
     const transportStartedAt = Date.now();
     // Compute stable messageId ONCE per page (includes runNonce) and
     // build the envelope payload ONCE per page, both OUTSIDE the
-    // withRetry wrapper inside sendSyncRequest. Two reasons (codex
+    // withRetry wrapper inside sendSyncRequest. Three reasons (codex
     // review #569 follow-up):
     //   #1: every retry attempt for this page reuses the SAME id,
     //       so sender-side dedup + receiver-side response cache
@@ -206,6 +206,12 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
     //       past a fresh-envelope retry. The signature freshness
     //       TTL (SYNC_AUTH_MAX_AGE_MS = 90s) comfortably exceeds
     //       withRetry's max budget (~7s with default backoff).
+    //   #7: building the envelope can fail transiently
+    //       (`isPrivateContextGraph`, `getIdentityId()`, signing).
+    //       Pre-fix, `requestFactory` ran inside `withRetry`, so
+    //       transient build errors were retried implicitly. Now
+    //       that the build is hoisted out for #5, we wrap it in
+    //       its own withRetry to preserve that resilience.
     const pageMessageId = computeSyncPageMessageId({
       remotePeerId,
       contextGraphId,
@@ -215,8 +221,22 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
       snapshotRef,
       runNonce,
     });
-    const pagePayload = await buildSyncRequest(contextGraphId, curOffset, syncPageSize, includeSharedMemory, remotePeerId, phase, snapshotRef);
-    const responseBytes = await sendSyncRequest({
+    const buildPayload = () =>
+      withRetry(
+        () => buildSyncRequest(contextGraphId, curOffset, syncPageSize, includeSharedMemory, remotePeerId, phase, snapshotRef),
+        {
+          maxAttempts: syncPageRetryAttempts,
+          baseDelayMs: 1000,
+          onRetry: (attempt, delay, err) => {
+            logWarn(
+              ctx,
+              `Sync envelope build retry ${attempt}/${syncPageRetryAttempts} for offset ${curOffset} (delay ${Math.round(delay)}ms): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          },
+        },
+      );
+    const pagePayload = await buildPayload();
+    let responseBytes = await sendSyncRequest({
       remotePeerId,
       timeoutMs,
       retryAttempts: syncPageRetryAttempts,
@@ -230,6 +250,51 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
         logWarn(ctx, `Sync page retry ${attempt}/${syncPageRetryAttempts} for offset ${offset} (delay ${Math.round(delay)}ms): ${err instanceof Error ? err.message : String(err)}`);
       },
     });
+
+    // rc.9 PR-E follow-up #3 + #6 (codex review on #569): handle the
+    // substrate's RESPONSE_GONE sentinel HERE rather than one layer
+    // down — recovery requires a freshly-built envelope (new
+    // requestId/issuedAtMs/signature) so `authorizePrivateSyncRequest`
+    // doesn't reject the re-issue as a replay (it caches seen
+    // `requestId`s for `syncAuthMaxAgeMs`). Only page-fetch has
+    // access to `buildSyncRequest`, so the recovery lives here.
+    //
+    // The sentinel fires when a duplicate-receive lands on a
+    // response that was too large for the substrate's 256 KiB inline
+    // cache (common for sync N-Quads pages). Re-issue with:
+    //   - fresh envelope bytes (different requestId → not a replay
+    //     on the responder's auth gate)
+    //   - fresh substrate messageId (different from the one whose
+    //     mark-only cache entry just told us RESPONSE_GONE)
+    // Cap at one RESPONSE_GONE retry per page — if both attempts
+    // get RESPONSE_GONE, surface a hard error rather than loop.
+    if (new TextDecoder().decode(responseBytes) === RESPONSE_GONE_MARKER) {
+      logWarn(
+        ctx,
+        `RESPONSE_GONE for offset ${curOffset} (cgId="${contextGraphId}" scope=${includeSharedMemory ? 'swm' : 'durable'} phase=${phase}); re-issuing with fresh envelope + messageId`,
+      );
+      const refreshedPayload = await buildPayload();
+      const refreshedMessageId = `${pageMessageId}:gone-retry`;
+      responseBytes = await sendSyncRequest({
+        remotePeerId,
+        timeoutMs,
+        retryAttempts: syncPageRetryAttempts,
+        contextGraphId,
+        offset,
+        protocolId: protocolSync,
+        payload: refreshedPayload,
+        send,
+        messageId: refreshedMessageId,
+        onRetry: (attempt, delay, err) => {
+          logWarn(ctx, `Sync page retry ${attempt}/${syncPageRetryAttempts} for offset ${offset} after RESPONSE_GONE (delay ${Math.round(delay)}ms): ${err instanceof Error ? err.message : String(err)}`);
+        },
+      });
+      if (new TextDecoder().decode(responseBytes) === RESPONSE_GONE_MARKER) {
+        throw new Error(
+          `Sync page for "${contextGraphId}" offset=${curOffset} phase=${phase} exhausted RESPONSE_GONE retries — responder cache repeatedly mark-only`,
+        );
+      }
+    }
     const transportDurationMs = Date.now() - transportStartedAt;
 
     const decodeStartedAt = Date.now();

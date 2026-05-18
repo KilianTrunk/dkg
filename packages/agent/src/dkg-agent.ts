@@ -162,6 +162,7 @@ import {
 import {
   chooseFanOutTier,
   executeSubstrateFanOut,
+  FANOUT_RESPONSE_REJECTED,
   type FanOutBookkeeper,
   type FanOutPeerRecord,
   type FanOutPlan,
@@ -1298,19 +1299,25 @@ export class DKGAgent {
    * tells `/api/slo` consumers that the per-cgId breakdown is
    * partial.
    *
-   * `delivered` is the only "good" outcome — `queued` means the
-   * substrate accepted the entry into the durable outbox (will
-   * retry; not a delivery confirmation), `inFlight` means another
-   * sender already owns the attempt, `failed` is the
-   * unrecoverable case. PR-D will add an ACK / watchdog that
+   * `delivered` is the only "good" outcome — `rejected` means
+   * the receiver explicitly dropped the share for a permanent
+   * reason (peer not in allowlist, bad signature, validation
+   * failed; PR-C codex R6 split this out from `delivered` so
+   * the metric doesn't overstate end-to-end success), `queued`
+   * means the substrate accepted the entry into the durable
+   * outbox (will retry; not a delivery confirmation), `inFlight`
+   * means another sender already owns the attempt, `failed` is
+   * the unrecoverable case. PR-D will add an ACK / watchdog that
    * upgrades `queued → delivered` after the receiver confirms.
    */
   private readonly swmSubstrateFanoutDelivered = new Map<string, number>();
+  private readonly swmSubstrateFanoutRejected = new Map<string, number>();
   private readonly swmSubstrateFanoutQueued = new Map<string, number>();
   private readonly swmSubstrateFanoutInFlight = new Map<string, number>();
   private readonly swmSubstrateFanoutFailed = new Map<string, number>();
   private swmSubstrateFanoutOverflow = {
     delivered: 0,
+    rejected: 0,
     queued: 0,
     inFlight: 0,
     failed: 0,
@@ -6037,18 +6044,27 @@ export class DKGAgent {
    * `PROTOCOL_SWM_UPDATE` substrate receiver. Routes substrate-
    * delivered SWM share bytes through `SharedMemoryHandler.handle()`
    * (the same in-process apply path the gossip subscription
-   * drives) and maps the outcome to a substrate response:
+   * drives) and maps the {@link SharedMemoryApplyOutcome} to a
+   * substrate response:
    *
-   *   - `applied: true` or permanent rejection → empty Uint8Array
-   *     (ACK; sender drops the share, matches gossip semantics
-   *     for the rejected case).
-   *   - retryable rejection → THROW so `messenger.sendReliable`
-   *     reports a failed send and the substrate outbox keeps the
-   *     share queued for retry. Dominant case: sender key package
-   *     for the current epoch hasn't arrived yet (workspaceSender
-   *     KeyDecryptor missing in the local handler, or the
-   *     decryptor itself rejects). Once the sender key arrives
-   *     the same wire bytes apply cleanly on the next attempt.
+   *   - `applied: true`                          → empty Uint8Array
+   *      (ACK; sender records `delivered`).
+   *   - `applied: false, retryable: true`        → THROW so
+   *      `messenger.sendReliable` reports a stream error,
+   *      `isRecoverableSendError` classifies it as recoverable
+   *      (the libp2p stream-reset signature contains "closed" /
+   *      "reset"), and the substrate outbox keeps the share
+   *      queued for retry. Dominant case: sender key package
+   *      for the current epoch hasn't arrived yet — once it
+   *      does, the SAME wire bytes apply cleanly on retry.
+   *   - `applied: false, retryable: false`       → return
+   *      {@link FANOUT_RESPONSE_REJECTED} (1-byte sentinel
+   *      `0x01`). The sender's `classifySendResult` recognises
+   *      the sentinel and records the outcome as `rejected`,
+   *      NOT `delivered` (codex R6 on PR #576). The share is
+   *      dropped — retrying the same wire bytes would produce
+   *      the same permanent rejection (bad signature, peer not
+   *      in allowlist, validation failed, malformed protobuf).
    *
    * Extracted into a named method so the receiver contract can
    * be unit-tested in isolation without spinning up a real
@@ -6057,16 +6073,28 @@ export class DKGAgent {
   private async handleSwmUpdate(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
     const wh = this.getOrCreateSharedMemoryHandler();
     const outcome = await wh.handle(data, fromPeerId);
-    if (!outcome.applied && outcome.retryable) {
+    if (outcome.applied) {
+      return new Uint8Array();
+    }
+    if (outcome.retryable) {
       // Throwing here is what tells the substrate outbox to keep
-      // the share queued. `handle()` already logged the specific
-      // rejection at WARN/ERROR; the throw message just surfaces
-      // it through the substrate's failure path so /api/slo's
-      // `protocols['/dkg/10.0.1/swm-update']` queued counts make
-      // sense at a glance.
+      // the share queued. The router aborts the stream which the
+      // sender sees as a stream-reset error — `isRecoverableSendError`
+      // matches "reset"/"closed" substrings and enqueues into the
+      // outbox. `handle()` already logged the specific rejection
+      // at WARN/ERROR; the throw message just gives operators the
+      // hint when they grep for "swm apply" in receiver logs.
       throw new Error(`SWM apply transient rejection from ${fromPeerId}: ${outcome.reason}`);
     }
-    return new Uint8Array();
+    // Permanent rejection: signal via the 1-byte sentinel so the
+    // sender records `rejected` (not `delivered`) and stops here.
+    // PR-D will replace this with a structured `SwmShareAck`
+    // protobuf carrying outcome + reason on the wire.
+    this.log.warn(
+      createOperationContext('share'),
+      `SWM substrate receiver dropping share from ${fromPeerId} (permanent rejection): ${outcome.reason}`,
+    );
+    return FANOUT_RESPONSE_REJECTED;
   }
 
   private async handleSwmSenderKeyPackage(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
@@ -6554,7 +6582,8 @@ export class DKGAgent {
         `SWM substrate fan-out cgId=${contextGraphId} source=${plan.enumerationSource} `
         + `enumerated=${plan.enumeratedCount} `
         + `attempted=${substrateResult.attempted} `
-        + `delivered=${substrateResult.delivered} queued=${substrateResult.queued} `
+        + `delivered=${substrateResult.delivered} rejected=${substrateResult.rejected} `
+        + `queued=${substrateResult.queued} `
         + `inFlight=${substrateResult.inFlight} failed=${substrateResult.failed} `
         + `also_gossiped=${plan.useGossip}`,
       );
@@ -9002,6 +9031,7 @@ export class DKGAgent {
   private substrateFanoutMapFor(outcome: FanOutPeerRecord['outcome']): Map<string, number> {
     switch (outcome) {
       case 'delivered': return this.swmSubstrateFanoutDelivered;
+      case 'rejected':  return this.swmSubstrateFanoutRejected;
       case 'queued':    return this.swmSubstrateFanoutQueued;
       case 'inFlight':  return this.swmSubstrateFanoutInFlight;
       case 'failed':    return this.swmSubstrateFanoutFailed;
@@ -9010,6 +9040,7 @@ export class DKGAgent {
 
   private substrateFanoutTotalForCg(cgId: string): number {
     return (this.swmSubstrateFanoutDelivered.get(cgId) ?? 0)
+      + (this.swmSubstrateFanoutRejected.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutQueued.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutInFlight.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutFailed.get(cgId) ?? 0);
@@ -9031,10 +9062,11 @@ export class DKGAgent {
    * even though `failed` is the more alarming outcome.
    */
   private maybeEvictSubstrateFanoutCgId(_justBumped: string): void {
-    // Use any of the four maps to count distinct tracked cgIds —
+    // Use any of the five maps to count distinct tracked cgIds —
     // they're populated together via `substrateFanoutTotalForCg`.
     const distinctCgIds = new Set<string>([
       ...this.swmSubstrateFanoutDelivered.keys(),
+      ...this.swmSubstrateFanoutRejected.keys(),
       ...this.swmSubstrateFanoutQueued.keys(),
       ...this.swmSubstrateFanoutInFlight.keys(),
       ...this.swmSubstrateFanoutFailed.keys(),
@@ -9053,10 +9085,12 @@ export class DKGAgent {
     if (smallestCg === null) return;
 
     this.swmSubstrateFanoutOverflow.delivered += this.swmSubstrateFanoutDelivered.get(smallestCg) ?? 0;
+    this.swmSubstrateFanoutOverflow.rejected  += this.swmSubstrateFanoutRejected.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.queued    += this.swmSubstrateFanoutQueued.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.inFlight  += this.swmSubstrateFanoutInFlight.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.failed    += this.swmSubstrateFanoutFailed.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutDelivered.delete(smallestCg);
+    this.swmSubstrateFanoutRejected.delete(smallestCg);
     this.swmSubstrateFanoutQueued.delete(smallestCg);
     this.swmSubstrateFanoutInFlight.delete(smallestCg);
     this.swmSubstrateFanoutFailed.delete(smallestCg);
@@ -9074,19 +9108,22 @@ export class DKGAgent {
    */
   getSwmSubstrateFanoutStats(): {
     delivered: Record<string, number>;
+    rejected: Record<string, number>;
     queued: Record<string, number>;
     inFlight: Record<string, number>;
     failed: Record<string, number>;
-    overflow: { delivered: number; queued: number; inFlight: number; failed: number };
+    overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
     truncated: boolean;
   } {
     return {
       delivered: Object.fromEntries(this.swmSubstrateFanoutDelivered),
+      rejected: Object.fromEntries(this.swmSubstrateFanoutRejected),
       queued: Object.fromEntries(this.swmSubstrateFanoutQueued),
       inFlight: Object.fromEntries(this.swmSubstrateFanoutInFlight),
       failed: Object.fromEntries(this.swmSubstrateFanoutFailed),
       overflow: {
         delivered: this.swmSubstrateFanoutOverflow.delivered,
+        rejected: this.swmSubstrateFanoutOverflow.rejected,
         queued: this.swmSubstrateFanoutOverflow.queued,
         inFlight: this.swmSubstrateFanoutOverflow.inFlight,
         failed: this.swmSubstrateFanoutOverflow.failed,

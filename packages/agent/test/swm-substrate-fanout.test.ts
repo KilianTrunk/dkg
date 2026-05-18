@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   chooseFanOutTier,
   executeSubstrateFanOut,
+  FANOUT_RESPONSE_REJECTED,
   type FanOutBookkeeper,
   type FanOutPeerRecord,
   type FanOutSubstrate,
@@ -188,7 +189,7 @@ describe('executeSubstrateFanOut', () => {
       bookkeeper: bk,
     });
 
-    expect(result).toEqual({ attempted: 0, delivered: 0, queued: 0, inFlight: 0, failed: 0 });
+    expect(result).toEqual({ attempted: 0, delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 });
     expect(calls).toEqual([]);
   });
 
@@ -289,8 +290,55 @@ describe('executeSubstrateFanOut', () => {
       bookkeeper: bk,
     });
 
-    expect(result).toEqual({ attempted: 4, delivered: 3, queued: 0, inFlight: 0, failed: 1 });
+    expect(result).toEqual({ attempted: 4, delivered: 3, rejected: 0, queued: 0, inFlight: 0, failed: 1 });
     expect(calls).toHaveLength(4);
+  });
+
+  /**
+   * PR-C codex R6: the receiver signals a permanent rejection
+   * (peer not in allowlist, bad signature, validation failure)
+   * by returning the {@link FANOUT_RESPONSE_REJECTED} sentinel
+   * (`Uint8Array([0x01])`). `classifySendResult` MUST recognise
+   * this and bucket the outcome as `rejected`, NOT `delivered`
+   * — otherwise `/api/slo` overstates end-to-end success.
+   *
+   * Forward-compatible: any other response shape (empty or
+   * future PR-D `SwmShareAck` payloads) continues to classify
+   * as `delivered`.
+   */
+  it('rejection sentinel response classifies as rejected, not delivered (codex R6)', async () => {
+    const { calls, bk } = makeBookkeeper();
+    const result = await executeSubstrateFanOut({
+      contextGraphId: 'cg-rejected',
+      protocolId: PROTOCOL,
+      payload: new Uint8Array([1]),
+      members: ['peerApplied', 'peerRejected', 'peerLongResponse'],
+      sendTimeoutMs: 5000,
+      substrate: fakeSubstrate((peerId): ReliableSendResult => {
+        switch (peerId) {
+          case 'peerApplied':
+            return { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'm-ok' };
+          case 'peerRejected':
+            return { delivered: true, response: FANOUT_RESPONSE_REJECTED, attempts: 1, messageId: 'm-rej' };
+          case 'peerLongResponse':
+            return { delivered: true, response: new Uint8Array([0x01, 0x02]), attempts: 1, messageId: 'm-future' };
+          default:
+            throw new Error('unreachable');
+        }
+      }),
+      bookkeeper: bk,
+    });
+
+    expect(result.attempted).toBe(3);
+    expect(result.delivered).toBe(2);
+    expect(result.rejected).toBe(1);
+    expect(result.queued).toBe(0);
+    expect(result.failed).toBe(0);
+
+    const byPeer = new Map(calls.map(c => [c.record.peerId, c.record]));
+    expect(byPeer.get('peerApplied')?.outcome).toBe('delivered');
+    expect(byPeer.get('peerRejected')?.outcome).toBe('rejected');
+    expect(byPeer.get('peerLongResponse')?.outcome).toBe('delivered');
   });
 
   /**

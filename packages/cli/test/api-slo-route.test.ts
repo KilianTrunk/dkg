@@ -164,10 +164,11 @@ describe('/api/slo wire format (rc.9 PR-A / Codex PR #570 R10)', () => {
       }),
       getSwmSubstrateFanoutStats: () => ({
         delivered: { 'did:dkg:context-graph:lex/curated': 47 },
+        rejected: { 'did:dkg:context-graph:lex/curated': 4 },
         queued: { 'did:dkg:context-graph:lex/curated': 2 },
         inFlight: {},
         failed: { 'did:dkg:context-graph:bigpublic': 1 },
-        overflow: { delivered: 12, queued: 3, inFlight: 0, failed: 5 },
+        overflow: { delivered: 12, rejected: 2, queued: 3, inFlight: 0, failed: 5 },
         truncated: true,
       }),
     };
@@ -189,10 +190,11 @@ describe('/api/slo wire format (rc.9 PR-A / Codex PR #570 R10)', () => {
         redundantAppliesTruncated: false,
         substrateFanout: {
           delivered: { 'did:dkg:context-graph:lex/curated': 47 },
+          rejected: { 'did:dkg:context-graph:lex/curated': 4 },
           queued: { 'did:dkg:context-graph:lex/curated': 2 },
           inFlight: {},
           failed: { 'did:dkg:context-graph:bigpublic': 1 },
-          overflow: { delivered: 12, queued: 3, inFlight: 0, failed: 5 },
+          overflow: { delivered: 12, rejected: 2, queued: 3, inFlight: 0, failed: 5 },
           truncated: true,
         },
       },

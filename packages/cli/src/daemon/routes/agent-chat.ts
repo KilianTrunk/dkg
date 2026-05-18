@@ -985,10 +985,11 @@ export function buildSloPayload(agent: {
    */
   getSwmSubstrateFanoutStats?: () => {
     delivered: Record<string, number>;
+    rejected: Record<string, number>;
     queued: Record<string, number>;
     inFlight: Record<string, number>;
     failed: Record<string, number>;
-    overflow: { delivered: number; queued: number; inFlight: number; failed: number };
+    overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
     truncated: boolean;
   };
 }): {
@@ -1010,10 +1011,11 @@ export function buildSloPayload(agent: {
      */
     substrateFanout?: {
       delivered: Record<string, number>;
+      rejected: Record<string, number>;
       queued: Record<string, number>;
       inFlight: Record<string, number>;
       failed: Record<string, number>;
-      overflow: { delivered: number; queued: number; inFlight: number; failed: number };
+      overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
       truncated: boolean;
     };
   };

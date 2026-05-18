@@ -112,10 +112,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
 
     expect(stats).toEqual({
       delivered: {},
+      rejected: {},
       queued: {},
       inFlight: {},
       failed: {},
-      overflow: { delivered: 0, queued: 0, inFlight: 0, failed: 0 },
+      overflow: { delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 },
       truncated: false,
     });
   });
@@ -144,10 +145,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(calls).toEqual([]);
     expect(agent.getSwmSubstrateFanoutStats()).toEqual({
       delivered: {},
+      rejected: {},
       queued: {},
       inFlight: {},
       failed: {},
-      overflow: { delivered: 0, queued: 0, inFlight: 0, failed: 0 },
+      overflow: { delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 },
       truncated: false,
     });
   });
@@ -205,7 +207,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(stats.queued).toEqual({ 'cg-public-mixed': 1 });
     expect(stats.inFlight).toEqual({});
     expect(stats.failed).toEqual({ 'cg-public-mixed': 1 });
-    expect(stats.overflow).toEqual({ delivered: 0, queued: 0, inFlight: 0, failed: 0 });
+    expect(stats.overflow).toEqual({ delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 });
     expect(stats.truncated).toBe(false);
   });
 
@@ -351,10 +353,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(calls).toEqual([]);
     expect(agent.getSwmSubstrateFanoutStats()).toEqual({
       delivered: {},
+      rejected: {},
       queued: {},
       inFlight: {},
       failed: {},
-      overflow: { delivered: 0, queued: 0, inFlight: 0, failed: 0 },
+      overflow: { delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 },
       truncated: false,
     });
   });
@@ -445,7 +448,14 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
       expect(response.byteLength).toBe(0);
     });
 
-    it('permanent rejection (retryable: false) → empty Uint8Array ACK (drop semantics, matches gossip)', async () => {
+    it('permanent rejection (retryable: false) → FANOUT_RESPONSE_REJECTED sentinel (codex R6: distinguishable from delivered)', async () => {
+      // Codex R6: returning an empty Uint8Array on permanent
+      // rejection let the sender count it as `delivered` even
+      // though the receiver explicitly dropped the share. The
+      // 1-byte sentinel `0x01` lets `classifySendResult` bucket
+      // it as `rejected` instead, so /api/slo's
+      // `swm.substrateFanout.delivered` only counts shares the
+      // receiver actually applied.
       const agent = await createAgent('R3Receiver-Permanent');
       installStubHandler(agent, async () => ({
         applied: false,
@@ -455,7 +465,8 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
 
       const response = await invokeReceiver(agent, new Uint8Array([4, 5, 6]), '12D3KooWPeerR3b');
       expect(response).toBeInstanceOf(Uint8Array);
-      expect(response.byteLength).toBe(0);
+      expect(response.byteLength).toBe(1);
+      expect(response[0]).toBe(0x01);
     });
 
     it('retryable rejection (retryable: true) → THROWS so substrate outbox keeps the share queued', async () => {
@@ -470,5 +481,38 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
         invokeReceiver(agent, new Uint8Array([7, 8, 9]), '12D3KooWPeerR3c'),
       ).rejects.toThrow(/transient rejection from 12D3KooWPeerR3c.*epoch 42/);
     });
+  });
+
+  /**
+   * PR-C codex R6 end-to-end: the substrate's per-(cgId,
+   * outcome) counter MUST distinguish `delivered` from
+   * `rejected`. We stub the messenger so one peer's
+   * sendReliable returns the rejection sentinel and another
+   * returns an empty (applied) response, and verify the
+   * counters split correctly. This pins the receiver →
+   * classifier → bookkeeper → getSwmSubstrateFanoutStats
+   * pipeline that /api/slo reads.
+   */
+  it('codex R6 end-to-end: rejection sentinel response moves counter from delivered to rejected', async () => {
+    const agent = await createAgent('SubstrateFanoutRejected');
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWApplied', '12D3KooWRejected'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    const { install } = stubMessengerSendReliable(new Map([
+      ['12D3KooWApplied', { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'm-applied' }],
+      ['12D3KooWRejected', { delivered: true, response: new Uint8Array([0x01]), attempts: 1, messageId: 'm-rejected' }],
+    ]));
+    install(agent);
+
+    await agent.share('cg-r6-mixed', [{
+      subject: 'urn:test:r6', predicate: 'http://schema.org/name', object: '"split"', graph: '',
+    }]);
+
+    const stats = agent.getSwmSubstrateFanoutStats();
+    expect(stats.delivered).toEqual({ 'cg-r6-mixed': 1 });
+    expect(stats.rejected).toEqual({ 'cg-r6-mixed': 1 });
+    expect(stats.queued).toEqual({});
+    expect(stats.failed).toEqual({});
   });
 });

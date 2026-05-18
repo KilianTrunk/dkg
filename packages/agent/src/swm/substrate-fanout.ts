@@ -212,10 +212,21 @@ export function chooseFanOutTier(input: ChooseFanOutTierInput): FanOutPlan {
 
 /** Per-peer substrate fan-out outcome, the bookkeeping vocabulary. */
 export type FanOutOutcome =
-  // `messenger.sendReliable` returned `delivered: true`. Wire ack
-  // received within the timeout; payload is in the receiver's
-  // SharedMemoryHandler. No follow-up needed.
+  // `messenger.sendReliable` returned `delivered: true` AND the
+  // receiver's response was the empty Uint8Array (the
+  // applied-OK ACK from `DKGAgent.handleSwmUpdate`). Payload is
+  // in the receiver's SharedMemoryHandler. No follow-up needed.
   | 'delivered'
+  // `messenger.sendReliable` returned `delivered: true` but the
+  // receiver's response was the {@link FANOUT_RESPONSE_REJECTED}
+  // sentinel — the receiver explicitly rejected the share for
+  // a permanent reason (peer not in allowlist, bad agent
+  // signature, validation failure). The sender drops the share
+  // — retrying the same wire bytes would produce the same
+  // rejection. Counted separately from `delivered` because PR-C
+  // codex R6 caught that bundling them overstated end-to-end
+  // success in `/api/slo`'s `swm.substrateFanout.delivered`.
+  | 'rejected'
   // `messenger.sendReliable` returned `delivered: false, queued:
   // true`. Persisted into the durable substrate outbox; will be
   // retried by `Messenger.processOutboxTick` and on the next
@@ -238,6 +249,27 @@ export type FanOutOutcome =
   // cover it if `useGossip: true`; otherwise the next sync-on-
   // reconnect is the safety net.
   | 'failed';
+
+/**
+ * Wire sentinel returned by the substrate receiver
+ * (`DKGAgent.handleSwmUpdate`) for permanent rejections that
+ * the sender should drop without counting as delivered (peer
+ * not in CG allowlist, bad agent signature, validation
+ * rejection). Single-byte `0x01` chosen because:
+ *
+ *   - Distinguishable from the empty-Uint8Array applied-OK
+ *     response (length 0 vs length 1).
+ *   - Forward-compatible with PR-D's planned `SwmShareAck`:
+ *     PR-D will replace this with a structured protobuf
+ *     payload, but the 1-byte sentinel pins the
+ *     "delivered ≠ applied" semantic for the rc.9 release line.
+ *   - Older substrate senders that don't recognise the sentinel
+ *     treat the 1-byte response as a successful `delivered`
+ *     (slight metric overcount but no behavioural regression —
+ *     they continue to drop the share locally because nothing
+ *     further runs on a normal response).
+ */
+export const FANOUT_RESPONSE_REJECTED: Uint8Array = new Uint8Array([0x01]);
 
 /**
  * Per-peer record handed to {@link FanOutBookkeeper.recordOutcome}.
@@ -299,6 +331,8 @@ export interface ExecuteSubstrateFanOutResult {
   attempted: number;
   /** Per-outcome counts, summed across all peers. */
   delivered: number;
+  /** Permanent receiver-side rejections — sender drops, NOT counted as delivered (PR-C codex R6). */
+  rejected: number;
   queued: number;
   inFlight: number;
   failed: number;
@@ -324,6 +358,7 @@ export async function executeSubstrateFanOut(
   const result: ExecuteSubstrateFanOutResult = {
     attempted: members.length,
     delivered: 0,
+    rejected: 0,
     queued: 0,
     inFlight: 0,
     failed: 0,
@@ -349,6 +384,9 @@ export async function executeSubstrateFanOut(
       case 'delivered':
         result.delivered += 1;
         break;
+      case 'rejected':
+        result.rejected += 1;
+        break;
       case 'queued':
         result.queued += 1;
         break;
@@ -367,6 +405,23 @@ export async function executeSubstrateFanOut(
 
 function classifySendResult(peerId: string, sendResult: ReliableSendResult): FanOutPeerRecord {
   if (sendResult.delivered) {
+    // PR-C codex R6: receivers signal permanent rejection (peer
+    // not in allowlist, bad signature, validation failure) with
+    // the single-byte FANOUT_RESPONSE_REJECTED sentinel response.
+    // The substrate's `delivered: true` just means "got a normal
+    // reply" — we have to peek at the payload to distinguish
+    // "applied OK" from "explicitly dropped". Empty response =
+    // applied (the historical default and PR-D's planned upgrade
+    // path).
+    if (isRejectionSentinel(sendResult.response)) {
+      return {
+        peerId,
+        outcome: 'rejected',
+        attempts: sendResult.attempts,
+        messageId: sendResult.messageId,
+        error: 'receiver returned FANOUT_RESPONSE_REJECTED sentinel (permanent rejection)',
+      };
+    }
     return {
       peerId,
       outcome: 'delivered',
@@ -406,4 +461,17 @@ function classifySendResult(peerId: string, sendResult: ReliableSendResult): Fan
     messageId: '',
     error: 'unrecognised ReliableSendResult variant',
   };
+}
+
+/**
+ * Does the substrate response equal {@link FANOUT_RESPONSE_REJECTED}?
+ *
+ * Direct `===` doesn't work because the response Uint8Array is
+ * reconstructed by the substrate (decode path); we compare bytes
+ * instead. Tight 1-byte check — anything else (empty for applied
+ * OK, or future structured PR-D `SwmShareAck` payloads) is
+ * treated as `delivered`.
+ */
+function isRejectionSentinel(response: Uint8Array | undefined): boolean {
+  return response !== undefined && response.byteLength === 1 && response[0] === 0x01;
 }

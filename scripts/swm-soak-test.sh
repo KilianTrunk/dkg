@@ -71,6 +71,17 @@
 #
 # At least one of SWM_CG_CURATED / SWM_CG_PUBLIC MUST be set.
 #
+# Per-run isolation (rc.9 PR-A Codex follow-up #5)
+# ------------------------------------------------
+# Each invocation generates its own RUN_ID + SOAK_START_ISO; every
+# write tags itself with `urn:swm-soak:runId "<RUN_ID>"`, and every
+# tally SPARQL filters on `sentAt >= "<SOAK_START_ISO>"` to exclude
+# pre-soak `swm-soak` rows that may already be sitting in
+# `_shared_memory`. Without this, rerunning the script against a CG
+# that hosted a prior soak (or two operators reusing the same
+# SENDER_TAG across runs) made stale deliveries inflate the
+# final-percentage report.
+#
 # Usage
 # -----
 #   nohup caffeinate -i bash scripts/swm-soak-test.sh \
@@ -100,12 +111,57 @@ PEERS_EXPECTED="${PEERS_EXPECTED:-}"
 
 DKG_HOME="${DKG_HOME:-${HOME}/.dkg}"
 API="${API:-http://127.0.0.1:9200}"
-AUTH=$(grep -v '^#' "${DKG_HOME}/auth.token" | head -1)
+
+# Codex PR #572 R3 + R4: fail fast on missing/empty auth token.
+# Pre-fix the script omitted `set -e` AND did not validate the
+# token, so a missing or comments-only `auth.token` degraded into a
+# 12h run of unauthorized reads/writes returning empty JSON, which
+# then showed up as misleading zero-delivery output. Now: explicit
+# file-exists + non-empty checks BEFORE the long-running loop,
+# matching the precedent in scripts/devnet-test.sh.
+#
+# Codex PR #572 R4 also flagged the parser itself: `grep -v '^#'
+# | head -1` returns an empty string when the first non-comment
+# line is blank (`# header\n\ntoken` is a real shape that
+# devnet.sh writes). The replacement filters BOTH comments AND
+# blank/whitespace-only lines, then takes the first surviving
+# line, then trims surrounding whitespace.
+AUTH_TOKEN_FILE="${DKG_HOME}/auth.token"
+if [ ! -f "$AUTH_TOKEN_FILE" ]; then
+  echo "ERROR: auth token file not found at ${AUTH_TOKEN_FILE}." >&2
+  echo "       Start the daemon first ('pnpm dkg start') so it provisions the token, or export AUTH=<token> before running." >&2
+  exit 65
+fi
+AUTH=$(awk '
+  # Codex PR #572 R4: first non-empty, non-comment line, trimmed.
+  /^[[:space:]]*#/ { next }   # drop comment lines
+  /^[[:space:]]*$/ { next }   # drop blank/whitespace-only lines
+  { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print; exit }
+' "$AUTH_TOKEN_FILE")
+if [ -z "$AUTH" ]; then
+  echo "ERROR: ${AUTH_TOKEN_FILE} exists but contains no usable token (after stripping # comments and blank lines)." >&2
+  echo "       Inspect the file and re-provision via 'pnpm dkg start'." >&2
+  exit 65
+fi
 
 if [ -z "$SWM_CG_CURATED" ] && [ -z "$SWM_CG_PUBLIC" ]; then
   echo "ERROR: at least one of SWM_CG_CURATED or SWM_CG_PUBLIC must be set" >&2
   exit 64
 fi
+
+# Codex PR #572 R5: each soak run gets a fresh RUN_ID so the
+# delivery-tally SPARQL can distinguish the current run from older
+# `swm-soak` writes already sitting in `_shared_memory`. Without
+# this, rerunning against the same CG (or two operators reusing the
+# same SENDER_TAG) makes stale rows count as current-run deliveries
+# and silently inflates the final percentage. We embed the RUN_ID
+# as a third quad (`urn:swm-soak:runId`) on every write AND record
+# SOAK_START_ISO so the SPARQL can additionally exclude pre-soak
+# writes from ANY peer (so we catch other operators' fresh writes
+# without needing to know their RUN_ID, while still rejecting their
+# pre-soak leftovers).
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(hostname -s 2>/dev/null || hostname)-$$-${SENDER_TAG}"
+SOAK_START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 LOG_DIR="${DKG_HOME}/swm-soak-test-$(date -u +%Y%m%d-%H%M%S)-${SENDER_TAG}"
 mkdir -p "$LOG_DIR"
@@ -161,6 +217,14 @@ print(json.dumps({
     'predicate': 'urn:swm-soak:seq',
     'object': '\"$seq/$total\"',
     'graph': '',
+  }, {
+    # Codex PR #572 R5: writer-side RUN_ID tag so downstream tally
+    # queries can distinguish current-run writes from stale rows
+    # left in _shared_memory by a prior soak.
+    'subject': '$subject',
+    'predicate': 'urn:swm-soak:runId',
+    'object': '\"$RUN_ID\"',
+    'graph': '',
   }],
 }))
 ")
@@ -187,11 +251,30 @@ snapshot_swm_inbox() {
   #   - total tagged quads (any sender)
   #   - per-sender breakdown (sender tag extracted from subject URI)
   # SELECT against the SWM named graph. The "tag" is extracted from
-  # the subject pattern urn:swm-soak:<cgId>:<TAG>:<seq>.
+  # the subject pattern urn:swm-soak:<TAG>:<seq>.
+  #
+  # Codex PR #572 R5: filter on `sentAt >= SOAK_START_ISO` so the
+  # query excludes pre-soak `swm-soak` writes left in
+  # `_shared_memory` by prior runs. This catches OTHER operators'
+  # current-run writes without needing to know their RUN_ID, while
+  # still rejecting everybody's pre-soak leftovers. Pre-fix, a
+  # rerun against the same CG (or a different operator reusing the
+  # same SENDER_TAG) made stale rows count as current-run
+  # deliveries and inflated the final percentage.
   local label=$1 cgId=$2 ts
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local swm_graph="did:dkg:context-graph:${cgId}/_shared_memory"
-  local sparql="SELECT ?s WHERE { GRAPH <${swm_graph}> { ?s <urn:swm-soak:sentBy> ?tag } }"
+  local sparql
+  sparql=$(cat <<SPARQL
+SELECT DISTINCT ?s WHERE {
+  GRAPH <${swm_graph}> {
+    ?s <urn:swm-soak:sentBy> ?tag ;
+       <urn:swm-soak:sentAt> ?sentAt .
+    FILTER(STR(?sentAt) >= "${SOAK_START_ISO}")
+  }
+}
+SPARQL
+)
   local body resp
   body=$(python3 -c "import json; print(json.dumps({'sparql': '''$sparql''', 'contextGraphId': '$cgId'}))")
   resp=$(curl -s --max-time 30 -X POST "$API/api/query" \
@@ -260,6 +343,23 @@ snapshot_slo() {
     "$label" "$ts" "${resp:-{\"error\":\"empty response\"\}}" \
     >> "$LOG_DIR/slo.jsonl"
   local summary
+  # Codex PR #572 R6: include overflow buckets + truncated flags in
+  # the running summary. Pre-fix the summary printed only
+  # `sum(perCg_map)`, which under-reports once either map hits its
+  # configured cap and starts evicting smallest counters into
+  # `*Overflow`. The endpoint documents the correct grand total as
+  # `sum(map) + overflow`; soak diagnostics must reflect that or
+  # operators chasing a stuck-share incident will see misleading
+  # zero/low values during the exact regime they care about.
+  #
+  # Also surface:
+  #   - `publishFailuresTruncated` → marks the per-cgId breakdown
+  #     in `gossip.publishFailures` as partial (totals still
+  #     accurate via overflow).
+  #   - `redundantAppliesTruncated` → same, for swm.redundantApplies.
+  #   - `redundantAppliesLowerBound` → sticky flag set when
+  #     seenShareOps cap eviction trimmed a still-live entry, so
+  #     `redundantApplies` is a lower bound for the window.
   summary=$(printf '%s' "$resp" | python3 -c "
 import json, sys
 try:
@@ -273,10 +373,26 @@ try:
     p99 = s.get('p99Ms')
     p99_s = f'{p99}ms' if p99 is not None else 'n/a'
     parts.append(f'{short}=d{s.get(\"delivered\", 0)}/q{s.get(\"queued\", 0)} p99={p99_s}')
-  pubfail_total = sum((gossip.get('publishFailures') or {}).values())
-  redundant_total = sum((swm.get('redundantApplies') or {}).values())
+  pubfail_perCg = sum((gossip.get('publishFailures') or {}).values())
+  pubfail_overflow = gossip.get('publishFailuresOverflow', 0) or 0
+  pubfail_truncated = bool(gossip.get('publishFailuresTruncated'))
+  pubfail_total = pubfail_perCg + pubfail_overflow
+  redundant_perCg = sum((swm.get('redundantApplies') or {}).values())
+  redundant_overflow = swm.get('redundantAppliesOverflow', 0) or 0
+  redundant_truncated = bool(swm.get('redundantAppliesTruncated'))
+  redundant_lower_bound = bool(swm.get('redundantAppliesLowerBound'))
+  redundant_total = redundant_perCg + redundant_overflow
+  pubfail_flag = ' [TRUNCATED]' if pubfail_truncated else ''
+  redundant_flags = []
+  if redundant_truncated: redundant_flags.append('TRUNCATED')
+  if redundant_lower_bound: redundant_flags.append('LOWER-BOUND')
+  redundant_flag = (' [' + '|'.join(redundant_flags) + ']') if redundant_flags else ''
   proto_s = ' '.join(parts) if parts else '(no substrate traffic yet)'
-  print(f'slo: {proto_s} | gossip.failures={pubfail_total} | swm.redundant={redundant_total}')
+  print(
+    f'slo: {proto_s} | '
+    f'gossip.failures={pubfail_total}{pubfail_flag} (perCg={pubfail_perCg} overflow={pubfail_overflow}) | '
+    f'swm.redundant={redundant_total}{redundant_flag} (perCg={redundant_perCg} overflow={redundant_overflow})'
+  )
 except Exception as e:
   print(f'slo=err({e})')
 " 2>/dev/null)
@@ -297,6 +413,8 @@ trap 'log "INTERRUPTED — stopping at cycle ${seq:-?}"; exit 130' INT TERM
 
 log "=== START swm-soak-test ==="
 log "  sender_tag=$SENDER_TAG"
+log "  run_id=$RUN_ID"
+log "  soak_start_iso=$SOAK_START_ISO"
 log "  self_peer_id=${SELF_PEER_ID:-<unresolved>}"
 log "  curated_cgs=${SWM_CG_CURATED:-<none>}"
 log "  public_cgs=${SWM_CG_PUBLIC:-<none>}"

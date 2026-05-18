@@ -227,25 +227,6 @@ export type FanOutOutcome =
   // codex R6 caught that bundling them overstated end-to-end
   // success in `/api/slo`'s `swm.substrateFanout.delivered`.
   | 'rejected'
-  // rc.9 PR-G (codex follow-up #G1): `messenger.sendReliable`
-  // returned `delivered: true` but the receiver's response was
-  // the {@link FANOUT_RESPONSE_RETRYABLE} sentinel — the receiver
-  // saw a TRANSIENT rejection (e.g. CAS pre-condition not yet
-  // met against current state; upstream writes haven't converged
-  // yet). The sender should NOT count this as delivered and
-  // SHOULD expect a retry to succeed once upstream state
-  // converges. PR-G replaced the pre-existing "throw on
-  // retryable" path because libp2p's handler-error abort gets
-  // classified as non-recoverable by `isRecoverableSendError()`
-  // → the share would be DROPPED instead of queued. The explicit
-  // sentinel makes the retry behaviour deterministic across
-  // libp2p transport quirks. SwmAckQuorum's existing watchdog
-  // (PR-D) covers the re-attempt naturally: 'retryable' peers
-  // are NOT added to the pre-acked set, so they remain in the
-  // expectedMembers∖acked window until the watchdog fires
-  // substrate top-up at watchdogMs (30s default), which gives
-  // upstream writes time to converge before re-trying.
-  | 'retryable'
   // `messenger.sendReliable` returned `delivered: false, queued:
   // true`. Persisted into the durable substrate outbox; will be
   // retried by `Messenger.processOutboxTick` and on the next
@@ -289,42 +270,6 @@ export type FanOutOutcome =
  *     further runs on a normal response).
  */
 export const FANOUT_RESPONSE_REJECTED: Uint8Array = new Uint8Array([0x01]);
-
-/**
- * rc.9 PR-G (codex follow-up #G1). Wire sentinel returned by the
- * substrate receiver for TRANSIENT rejections — the receiver
- * couldn't apply the share right now (CAS pre-condition not yet
- * met) but the same wire bytes might apply successfully on
- * retry once upstream state converges.
- *
- * Why a sentinel instead of throwing (the pre-PR-G handleSwmUpdate
- * approach): the non-pooled `ProtocolRouter` receive path aborts
- * handler failures with the literal string `"handler error"`.
- * `Messenger.sendReliable()` runs `isRecoverableSendError()`
- * against that abort reason, which only matches
- * `reset`/`closed`/`timeout` substrings — `"handler error"`
- * matches none of those, so `sendReliable` RETHROWS the error
- * instead of queueing the share into the outbox. Net effect: a
- * share whose receiver wanted a retry got DROPPED. The 1-byte
- * sentinel sidesteps the abort path entirely — the receiver's
- * response always succeeds at the wire layer, and the sender's
- * `classifySendResult` re-buckets the 0x02 payload into the
- * `retryable` outcome.
- *
- * Forward-compat: a single byte still leaves room for future
- * codes (0x03..0xFF) if we ever need to distinguish more
- * receiver-side states. PR-D's `PROTOCOL_SWM_SHARE_ACK` is a
- * separate protobuf protocol, so its wire shape doesn't conflict.
- *
- * Older substrate senders (pre-rc.9-PR-G) treat the 1-byte 0x02
- * response identically to a 1-byte 0x01: opaque non-empty payload
- * counts as `delivered: true` in their classifier. Slight metric
- * overcount during rolling upgrades but no behavioural
- * regression — they still attempt the share again on the next
- * sync, and the receiver re-applies idempotently via
- * `seenShareOps` (PR-A).
- */
-export const FANOUT_RESPONSE_RETRYABLE: Uint8Array = new Uint8Array([0x02]);
 
 /**
  * Per-peer record handed to {@link FanOutBookkeeper.recordOutcome}.
@@ -388,12 +333,6 @@ export interface ExecuteSubstrateFanOutResult {
   delivered: number;
   /** Permanent receiver-side rejections — sender drops, NOT counted as delivered (PR-C codex R6). */
   rejected: number;
-  /**
-   * Transient receiver-side rejections — sender does NOT count
-   * as delivered, and SwmAckQuorum's watchdog (PR-D) will fire
-   * substrate top-up at watchdogMs (rc.9 PR-G codex follow-up #G1).
-   */
-  retryable: number;
   queued: number;
   inFlight: number;
   failed: number;
@@ -420,7 +359,6 @@ export async function executeSubstrateFanOut(
     attempted: members.length,
     delivered: 0,
     rejected: 0,
-    retryable: 0,
     queued: 0,
     inFlight: 0,
     failed: 0,
@@ -449,9 +387,6 @@ export async function executeSubstrateFanOut(
       case 'rejected':
         result.rejected += 1;
         break;
-      case 'retryable':
-        result.retryable += 1;
-        break;
       case 'queued':
         result.queued += 1;
         break;
@@ -475,9 +410,9 @@ function classifySendResult(peerId: string, sendResult: ReliableSendResult): Fan
     // the single-byte FANOUT_RESPONSE_REJECTED sentinel response.
     // The substrate's `delivered: true` just means "got a normal
     // reply" — we have to peek at the payload to distinguish
-    // "applied OK" from "explicitly dropped" from "transient,
-    // please retry". Empty response = applied (the historical
-    // default).
+    // "applied OK" from "explicitly dropped". Empty response =
+    // applied (the historical default and PR-D's planned upgrade
+    // path).
     if (isRejectionSentinel(sendResult.response)) {
       return {
         peerId,
@@ -485,26 +420,6 @@ function classifySendResult(peerId: string, sendResult: ReliableSendResult): Fan
         attempts: sendResult.attempts,
         messageId: sendResult.messageId,
         error: 'receiver returned FANOUT_RESPONSE_REJECTED sentinel (permanent rejection)',
-      };
-    }
-    // rc.9 PR-G codex follow-up #G1: receivers signal TRANSIENT
-    // rejection (CAS pre-condition not yet met, upstream writes
-    // pending) with the 0x02 sentinel. Replaces the pre-PR-G
-    // "throw on retryable" path that relied on libp2p handler-
-    // abort being classified as recoverable — it wasn't, so
-    // shares were dropped instead of queued. SwmAckQuorum's
-    // watchdog (PR-D) takes care of the actual re-send: this
-    // peer stays out of the pre-acked set, falls through to the
-    // expectedMembers∖acked window, and the 30s watchdog gives
-    // upstream writes time to converge before substrate top-up
-    // fires.
-    if (isRetryableSentinel(sendResult.response)) {
-      return {
-        peerId,
-        outcome: 'retryable',
-        attempts: sendResult.attempts,
-        messageId: sendResult.messageId,
-        error: 'receiver returned FANOUT_RESPONSE_RETRYABLE sentinel (transient rejection)',
       };
     }
     return {
@@ -559,14 +474,4 @@ function classifySendResult(peerId: string, sendResult: ReliableSendResult): Fan
  */
 function isRejectionSentinel(response: Uint8Array | undefined): boolean {
   return response !== undefined && response.byteLength === 1 && response[0] === 0x01;
-}
-
-/**
- * Does the substrate response equal {@link FANOUT_RESPONSE_RETRYABLE}?
- * Tight 1-byte check on the 0x02 sentinel (rc.9 PR-G codex
- * follow-up #G1). See `isRejectionSentinel` for the same shape
- * reasoning.
- */
-function isRetryableSentinel(response: Uint8Array | undefined): boolean {
-  return response !== undefined && response.byteLength === 1 && response[0] === 0x02;
 }

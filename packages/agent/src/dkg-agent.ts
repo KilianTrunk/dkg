@@ -9463,57 +9463,82 @@ export class DKGAgent {
    */
   private async isPeerDialable(peerId: string): Promise<boolean> {
     try {
-      const isConnected = this.node.libp2p.getPeers().some((p) => p.toString() === peerId);
-      if (isConnected) {
-        // PR-K (2026-05-18 overnight prep): a peer whose ONLY
-        // live connection is a *limited* Circuit Relay V2
-        // reservation is NOT substrate-roundtrip-eligible.
-        // Limited reservations cap data (~128 KiB) and duration
-        // (~2 min) per stream; the aggressive per-cycle traffic
-        // of SWM substrate fan-out exhausts these caps almost
-        // immediately, after which every `messenger.sendReliable`
-        // call hits a stream-reset / aborted error that
-        // `isRecoverableSendError` (correctly) classifies as
-        // recoverable. The outbox then queues + retries forever,
-        // each retry eating fresh budget on the same exhausted
-        // reservation — a death spiral the May 2026 Miles<->Lex
-        // soak surfaced as `swm-update: d=0 q=2031, samples=0`
-        // after ~60 cycles, with both peers having only
-        // `limited: true, streams: 0` relayed connections (Lex's
-        // diagnostic via `dkg_peer_info`).
-        //
-        // Treat limited-only connectivity as undialable for
-        // substrate-roundtrip purposes. The relay's GossipSub
-        // mesh participation still delivers the share (mesh
-        // forwarding does NOT consume per-stream reservation
-        // budget — different code path on the relay), so
-        // dropping these peers from substrate-eligibility
-        // degrades cleanly to gossip-only delivery for them
-        // rather than burning wire load on impossible retries.
-        try {
-          const { peerIdFromString } = await import('@libp2p/peer-id');
-          const conns = this.node.libp2p.getConnections(peerIdFromString(peerId));
-          if (conns.length > 0) {
-            return conns.some((c) => !((c as unknown as { limits?: unknown }).limits));
-          }
-        } catch {
-          // peerIdFromString throws on malformed strings (e.g.
-          // unit-test stub peer ids like '12D3KooWPeerA' that
-          // don't pass libp2p's base58 length check). Preserve
-          // pre-PR-K "connected ⇒ dialable" semantics in that
-          // path — the limited-circuit filter only applies when
-          // libp2p hands us a real PeerId.
-        }
-        return true;
-      }
-      // No live connection — fall back to peerStore-cached
-      // addresses (pre-PR-K tier 2 behaviour). A future dial may
-      // yield a limited path; if so, the next `isPeerDialable`
-      // call (typically ≤30s later in the watchdog tick) catches
-      // it via the connected-branch above.
+      // Test-stub fast path: short peer ids like '12D3KooWPeerA'
+      // don't pass libp2p's base58 length check in
+      // peerIdFromString. Preserve pre-PR-K
+      // "connected ⇒ dialable" semantics for them so existing
+      // integration tests that stub gossip subscribers with
+      // these short ids keep working.
       const { peerIdFromString } = await import('@libp2p/peer-id');
-      const peer = await this.node.libp2p.peerStore.get(peerIdFromString(peerId));
-      return (peer?.addresses?.length ?? 0) > 0;
+      let pid: ReturnType<typeof peerIdFromString>;
+      try {
+        pid = peerIdFromString(peerId);
+      } catch {
+        return this.node.libp2p.getPeers().some((p) => p.toString() === peerId);
+      }
+
+      // PR-K filter tier 1: connectivity. Reject peers whose
+      // ONLY live connections are *limited* Circuit Relay V2
+      // reservations. Limited reservations cap data (~128 KiB)
+      // and duration (~2 min) per stream; the aggressive
+      // per-cycle traffic of SWM substrate fan-out exhausts
+      // these caps almost immediately, after which every
+      // `messenger.sendReliable` hits a stream-reset / aborted
+      // error that `isRecoverableSendError` (correctly)
+      // classifies as recoverable. The outbox queues + retries
+      // forever, each retry eating fresh budget — a death
+      // spiral the 2026-05-18 Miles<->Lex soak surfaced as
+      // `swm-update: d=0 q=2031` after ~60 cycles, with both
+      // peers behind NAT and connected only via limited relays.
+      const conns = this.node.libp2p.getConnections(pid);
+      if (conns.length > 0) {
+        const hasNonLimited = conns.some((c) => !((c as unknown as { limits?: unknown }).limits));
+        if (!hasNonLimited) return false;
+      } else {
+        // No live connection — fall back to peerStore-cached
+        // addresses. A future dial may yield a non-limited
+        // path; if it doesn't, the next isPeerDialable call
+        // catches it via the connected branch above.
+        const peerForAddrs = await this.node.libp2p.peerStore.get(pid);
+        if ((peerForAddrs?.addresses?.length ?? 0) === 0) return false;
+      }
+
+      // PR-K filter tier 2: protocol support. The substrate
+      // fan-out specifically uses `/dkg/10.0.1/swm-update`. rc8
+      // beacon relays subscribe to gossip topics (they
+      // participate in the mesh-forwarding to deliver shares)
+      // but they don't register a handler for the rc9-only
+      // `/dkg/10.0.1/swm-update` protocol — sendReliable to
+      // them errors with `"Protocol selection failed - could
+      // not negotiate /dkg/10.0.1/swm-update"`, which
+      // `isRecoverableSendError` matches via the
+      // `"could not negotiate"` substring and queues for
+      // perpetual retry. (The classifier rule itself is
+      // correct for transient connection-warmup negotiation
+      // failures; pre-filtering at enumeration is the
+      // surgical fix.)
+      //
+      // Surfaced by the PR-K verification soak (2026-05-18,
+      // post-restart with PR-K tier 1 only): all 4 queued
+      // sends in the first cycle were to Hetzner beacon
+      // relays (12D3KooW...mkauaijsNrWw etc), each erroring
+      // with "could not negotiate". The relays themselves
+      // are direct TCP connections (NOT limited circuits) so
+      // tier 1 doesn't catch them.
+      try {
+        const peer = await this.node.libp2p.peerStore.get(pid);
+        const protos = peer?.protocols ?? [];
+        if (!protos.includes(PROTOCOL_SWM_UPDATE)) return false;
+      } catch {
+        // peerStore.get can throw on cold-cache miss for a
+        // peer we've just learned about via peer-exchange. Be
+        // conservative: if we can't confirm protocol support,
+        // skip substrate fan-out for them this round. The next
+        // isPeerDialable call (after the next peerStore
+        // identify exchange) will succeed if they speak it.
+        return false;
+      }
+      return true;
     } catch {
       return false;
     }

@@ -79,6 +79,19 @@ export const DHT_WALK_RATE_LIMIT_MS = 5 * 60 * 1000;
 const DHT_WALK_TRIGGER_ERRORS = [
   'no valid addresses',
   'no_reservation',
+  // libp2p surfaces "All multiaddr dials failed" when every
+  // candidate address for the peer fails in a single dial attempt
+  // (instantaneous routing-table miss — typically peerStore briefly
+  // empty after restart, or every cached relay addr dead). This
+  // means the peer's addresses are stale on OUR side; a DHT walk is
+  // exactly the right recovery (re-resolve against the routing
+  // layer + identify cache + agent registry), not just a passive
+  // outbox backoff that would keep retrying the same dead address
+  // until TTL. Codex PR #567 review caught this — adding it to the
+  // classifier (PR #567 main change) made it recoverable, but
+  // without this list entry the retry path back-off-but-doesn't-
+  // re-resolve.
+  'all multiaddr dials failed',
 ];
 
 function shouldTriggerDhtWalk(errMsg: string): boolean {

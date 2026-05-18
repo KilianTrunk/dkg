@@ -163,6 +163,7 @@ import {
   chooseFanOutTier,
   executeSubstrateFanOut,
   FANOUT_RESPONSE_REJECTED,
+  FANOUT_RESPONSE_RETRYABLE,
   type FanOutBookkeeper,
   type FanOutPeerRecord,
   type FanOutPlan,
@@ -1312,18 +1313,54 @@ export class DKGAgent {
    */
   private readonly swmSubstrateFanoutDelivered = new Map<string, number>();
   private readonly swmSubstrateFanoutRejected = new Map<string, number>();
+  /**
+   * rc.9 PR-G codex follow-up #G1: per-cgId count of substrate
+   * sends that returned the FANOUT_RESPONSE_RETRYABLE sentinel
+   * (transient receiver-side rejection — CAS pre-condition not
+   * yet met). NOT counted as delivered; SwmAckQuorum's watchdog
+   * (PR-D) will fire substrate top-up at watchdogMs.
+   */
+  private readonly swmSubstrateFanoutRetryable = new Map<string, number>();
   private readonly swmSubstrateFanoutQueued = new Map<string, number>();
   private readonly swmSubstrateFanoutInFlight = new Map<string, number>();
   private readonly swmSubstrateFanoutFailed = new Map<string, number>();
   private swmSubstrateFanoutOverflow = {
     delivered: 0,
     rejected: 0,
+    retryable: 0,
     queued: 0,
     inFlight: 0,
     failed: 0,
   };
   private swmSubstrateFanoutTruncated = false;
   private static readonly SWM_SUBSTRATE_FANOUT_MAX_TRACKED_CGS = 1024;
+
+  /**
+   * rc.9 PR-G codex follow-up #G2: in-flight substrate fan-out
+   * promises detached from the foreground `share()` call. Pre-PR-G
+   * `publishWorkspaceGossip` awaited both the substrate and
+   * gossip legs together, which meant one slow / offline
+   * allowlisted peer could hold `share()` open for up to
+   * `SWM_SUBSTRATE_FANOUT_TIMEOUT_MS` (15s) — a regression from
+   * the pre-rc.9 gossip-only path that returned in tens of ms.
+   *
+   * Now we fire substrate fan-out without awaiting it, await
+   * only the (fast) gossip publish, and return. The substrate
+   * promise still runs to completion in the background — its
+   * bookkeeper still updates the per-cgId counter maps as each
+   * peer's send completes, and its `.then()` still emits the
+   * fan-out INFO summary log. Failures (which executeSubstrateFanOut
+   * already swallows internally via Promise.allSettled) get a
+   * defensive `.catch()` to log any escaped error without
+   * crashing the unhandled-rejection handler.
+   *
+   * The Set holds the wrapped promises (after the bookkeeper +
+   * INFO-log chain is attached) so tests can drain them via
+   * `awaitInFlightSubstrateFanOuts()`. .finally() removes each
+   * promise on completion so the Set stays bounded by
+   * concurrency, not by cumulative shares.
+   */
+  private readonly inFlightSubstrateFanOuts = new Set<Promise<void>>();
   /**
    * Member-count cap above which public CGs fall back to gossip-
    * only delivery (substrate fan-out is N-round-trips, so cost
@@ -1967,16 +2004,17 @@ export class DKGAgent {
     // after receiver-side application succeeds (rather than the
     // current proxy through substrate-level wire delivery).
     this.messenger.register(PROTOCOL_SWM_UPDATE, async (data, peerId) => this.handleSwmUpdate(data, peerId));
-    // PR-C codex R7: tell Messenger that the 1-byte rejection
-    // sentinel is an APP-LEVEL rejection — Messenger's
-    // protocol-level `delivered` counter + latency histogram
-    // (`/api/slo`'s `protocols['/dkg/10.0.1/swm-update']`) should
-    // NOT bump for these responses. The application-level
-    // truth (delivered vs rejected) lives in
-    // `swm.substrateFanout.{delivered,rejected}`.
+    // PR-C codex R7 + PR-G codex follow-up #G1: tell Messenger
+    // that the 1-byte rejection AND retryable sentinels are
+    // APP-LEVEL non-deliveries — Messenger's protocol-level
+    // `delivered` counter + latency histogram (`/api/slo`'s
+    // `protocols['/dkg/10.0.1/swm-update']`) MUST NOT bump for
+    // either. The application-level truth (delivered vs rejected
+    // vs retryable) lives in `swm.substrateFanout.{delivered,
+    // rejected, retryable}`.
     this.messenger.setResponseDeliveredClassifier(
       PROTOCOL_SWM_UPDATE,
-      (response) => !(response.byteLength === 1 && response[0] === 0x01),
+      (response) => !(response.byteLength === 1 && (response[0] === 0x01 || response[0] === 0x02)),
     );
 
     const effectiveRole = this.config.nodeRole ?? 'edge';
@@ -6088,19 +6126,37 @@ export class DKGAgent {
       return new Uint8Array();
     }
     if (outcome.retryable) {
-      // Throwing here is what tells the substrate outbox to keep
-      // the share queued. The router aborts the stream which the
-      // sender sees as a stream-reset error — `isRecoverableSendError`
-      // matches "reset"/"closed" substrings and enqueues into the
-      // outbox. `handle()` already logged the specific rejection
-      // at WARN/ERROR; the throw message just gives operators the
-      // hint when they grep for "swm apply" in receiver logs.
-      throw new Error(`SWM apply transient rejection from ${fromPeerId}: ${outcome.reason}`);
+      // rc.9 PR-G codex follow-up #G1: signal TRANSIENT rejection
+      // via the 1-byte 0x02 sentinel instead of throwing. The
+      // pre-PR-G implementation re-threw to abort the libp2p
+      // stream — the hope was that the sender would see the
+      // resulting stream-reset, classify it via
+      // `isRecoverableSendError()`, and enqueue the share into
+      // the substrate outbox for retry. That hope was misplaced:
+      // the non-pooled `ProtocolRouter` receive path aborts
+      // handler failures with the literal string `"handler
+      // error"`, and `isRecoverableSendError()` ONLY matches
+      // reset/closed/timeout substrings — so the abort got
+      // re-thrown by `sendReliable()` and the share was DROPPED
+      // instead of queued.
+      //
+      // The sentinel sidesteps the abort path: the receiver's
+      // response succeeds at the wire layer, and the sender's
+      // `classifySendResult` re-buckets the 0x02 byte into the
+      // `retryable` outcome. SwmAckQuorum's existing watchdog
+      // (PR-D) handles the actual re-send: this peer stays out
+      // of the pre-acked set, falls through to
+      // `expectedMembers ∖ acked`, and the 30s watchdog gives
+      // upstream writes time to converge before substrate top-up
+      // fires.
+      this.log.info(
+        createOperationContext('share'),
+        `SWM substrate receiver transient rejection from ${fromPeerId} (will retry via PR-D watchdog): ${outcome.reason}`,
+      );
+      return FANOUT_RESPONSE_RETRYABLE;
     }
     // Permanent rejection: signal via the 1-byte sentinel so the
     // sender records `rejected` (not `delivered`) and stops here.
-    // PR-D will replace this with a structured `SwmShareAck`
-    // protobuf carrying outcome + reason on the wire.
     this.log.warn(
       createOperationContext('share'),
       `SWM substrate receiver dropping share from ${fromPeerId} (permanent rejection): ${outcome.reason}`,
@@ -6566,39 +6622,71 @@ export class DKGAgent {
       };
     }
 
-    // Substrate fan-out runs first (and in parallel with gossip
-    // when both legs are active) so the parallel send latency
-    // overlaps with the gossip publish round-trip.
-    const substratePromise = plan.useSubstrate
-      ? executeSubstrateFanOut({
-        contextGraphId,
-        protocolId: PROTOCOL_SWM_UPDATE,
-        payload: wireMessage,
-        members: plan.substrateMembers,
-        sendTimeoutMs: DKGAgent.SWM_SUBSTRATE_FANOUT_TIMEOUT_MS,
-        substrate: this.messenger,
-        bookkeeper: this.substrateFanoutBookkeeper(),
-      })
-      : Promise.resolve(null);
+    // rc.9 PR-G codex follow-up #G2: detach substrate fan-out
+    // from the foreground share() path. We await ONLY the gossip
+    // publish (fast — a single topic emit), and let the substrate
+    // leg complete in the background. Without this, one slow /
+    // offline allowlisted peer could hold share() open for up to
+    // SWM_SUBSTRATE_FANOUT_TIMEOUT_MS (15s), regressing the
+    // pre-rc.9 gossip-only path's "share returns in tens of ms"
+    // contract.
+    //
+    // Background substrate keeps everything observability-wise:
+    //   - executeSubstrateFanOut still uses Promise.allSettled
+    //     internally, so per-peer outcomes still feed the
+    //     bookkeeper as each send completes.
+    //   - The INFO summary log fires from .then() once all peers
+    //     have responded (or timed out).
+    //   - A defensive .catch() guards against any escaped error
+    //     (should not fire — allSettled never rejects — but cheap
+    //     insurance against future refactors).
+    //   - The promise is registered into
+    //     `this.inFlightSubstrateFanOuts` so tests can drain via
+    //     `awaitInFlightSubstrateFanOuts()`. .finally() removes
+    //     each promise on completion to keep the Set bounded by
+    //     concurrency rather than cumulative shares.
+    if (plan.useSubstrate) {
+      const substratePromise: Promise<void> = (async () => {
+        try {
+          const substrateResult = await executeSubstrateFanOut({
+            contextGraphId,
+            protocolId: PROTOCOL_SWM_UPDATE,
+            payload: wireMessage,
+            members: plan.substrateMembers,
+            sendTimeoutMs: DKGAgent.SWM_SUBSTRATE_FANOUT_TIMEOUT_MS,
+            substrate: this.messenger,
+            bookkeeper: this.substrateFanoutBookkeeper(),
+          });
+          this.log.info(
+            ctx,
+            `SWM substrate fan-out cgId=${contextGraphId} source=${plan.enumerationSource} `
+            + `enumerated=${plan.enumeratedCount} `
+            + `attempted=${substrateResult.attempted} `
+            + `delivered=${substrateResult.delivered} rejected=${substrateResult.rejected} `
+            + `retryable=${substrateResult.retryable} `
+            + `queued=${substrateResult.queued} `
+            + `inFlight=${substrateResult.inFlight} failed=${substrateResult.failed} `
+            + `also_gossiped=${plan.useGossip}`,
+          );
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          this.log.warn(
+            ctx,
+            `SWM substrate fan-out cgId=${contextGraphId} threw out of allSettled boundary: ${reason}`,
+          );
+        }
+      })();
+      const tracked = substratePromise.finally(() => {
+        this.inFlightSubstrateFanOuts.delete(tracked);
+      });
+      this.inFlightSubstrateFanOuts.add(tracked);
+    }
 
-    const gossipPromise = plan.useGossip
-      ? this.publishViaGossip(contextGraphId, topic, wireMessage, ctx)
-      : Promise.resolve();
+    if (plan.useGossip) {
+      await this.publishViaGossip(contextGraphId, topic, wireMessage, ctx);
+    }
 
-    const [substrateResult] = await Promise.all([substratePromise, gossipPromise]);
-
-    if (substrateResult !== null) {
-      this.log.info(
-        ctx,
-        `SWM substrate fan-out cgId=${contextGraphId} source=${plan.enumerationSource} `
-        + `enumerated=${plan.enumeratedCount} `
-        + `attempted=${substrateResult.attempted} `
-        + `delivered=${substrateResult.delivered} rejected=${substrateResult.rejected} `
-        + `queued=${substrateResult.queued} `
-        + `inFlight=${substrateResult.inFlight} failed=${substrateResult.failed} `
-        + `also_gossiped=${plan.useGossip}`,
-      );
-    } else if (plan.enumerationSource === 'topic-subscribers' && plan.enumeratedCount > this.swmSubstrateMaxMembers) {
+    if (!plan.useSubstrate && plan.enumerationSource === 'topic-subscribers' && plan.enumeratedCount > this.swmSubstrateMaxMembers) {
       // Public CG above the threshold: gossip-only. Surface the
       // gate trip at INFO so soak postmortems can correlate share
       // delivery against transport choice without grepping for
@@ -9049,6 +9137,7 @@ export class DKGAgent {
     switch (outcome) {
       case 'delivered': return this.swmSubstrateFanoutDelivered;
       case 'rejected':  return this.swmSubstrateFanoutRejected;
+      case 'retryable': return this.swmSubstrateFanoutRetryable;
       case 'queued':    return this.swmSubstrateFanoutQueued;
       case 'inFlight':  return this.swmSubstrateFanoutInFlight;
       case 'failed':    return this.swmSubstrateFanoutFailed;
@@ -9058,6 +9147,7 @@ export class DKGAgent {
   private substrateFanoutTotalForCg(cgId: string): number {
     return (this.swmSubstrateFanoutDelivered.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutRejected.get(cgId) ?? 0)
+      + (this.swmSubstrateFanoutRetryable.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutQueued.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutInFlight.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutFailed.get(cgId) ?? 0);
@@ -9079,11 +9169,14 @@ export class DKGAgent {
    * even though `failed` is the more alarming outcome.
    */
   private maybeEvictSubstrateFanoutCgId(_justBumped: string): void {
-    // Use any of the five maps to count distinct tracked cgIds —
-    // they're populated together via `substrateFanoutTotalForCg`.
+    // Count distinct cgIds across all outcome maps. PR-G added
+    // `swmSubstrateFanoutRetryable` — include it so a CG that
+    // only ever produces transient rejections is still tracked
+    // for eviction accounting.
     const distinctCgIds = new Set<string>([
       ...this.swmSubstrateFanoutDelivered.keys(),
       ...this.swmSubstrateFanoutRejected.keys(),
+      ...this.swmSubstrateFanoutRetryable.keys(),
       ...this.swmSubstrateFanoutQueued.keys(),
       ...this.swmSubstrateFanoutInFlight.keys(),
       ...this.swmSubstrateFanoutFailed.keys(),
@@ -9103,11 +9196,13 @@ export class DKGAgent {
 
     this.swmSubstrateFanoutOverflow.delivered += this.swmSubstrateFanoutDelivered.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.rejected  += this.swmSubstrateFanoutRejected.get(smallestCg) ?? 0;
+    this.swmSubstrateFanoutOverflow.retryable += this.swmSubstrateFanoutRetryable.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.queued    += this.swmSubstrateFanoutQueued.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.inFlight  += this.swmSubstrateFanoutInFlight.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.failed    += this.swmSubstrateFanoutFailed.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutDelivered.delete(smallestCg);
     this.swmSubstrateFanoutRejected.delete(smallestCg);
+    this.swmSubstrateFanoutRetryable.delete(smallestCg);
     this.swmSubstrateFanoutQueued.delete(smallestCg);
     this.swmSubstrateFanoutInFlight.delete(smallestCg);
     this.swmSubstrateFanoutFailed.delete(smallestCg);
@@ -9123,24 +9218,53 @@ export class DKGAgent {
    * `Object.fromEntries` consistent with the existing /api/slo
    * shape.
    */
+  /**
+   * Test/observability helper (rc.9 PR-G codex follow-up #G2).
+   * Resolves once every detached substrate fan-out spawned by
+   * `publishWorkspaceGossip` has settled (counters updated,
+   * INFO log emitted). Production code DOES NOT need to call
+   * this — the whole point of the G2 detach is that share()
+   * returns without waiting on the substrate side. Used by
+   * integration tests that assert on substrate counters after
+   * a `share()` call, and by the soak script's shutdown flush
+   * so in-flight outbox writes don't get lost across process
+   * boundaries.
+   *
+   * Returns a snapshot of the in-flight set at call time, so a
+   * fan-out enqueued AFTER this call returns will not be awaited.
+   * Callers that need full drain should loop until
+   * `inFlightSubstrateFanOutCount() === 0`.
+   */
+  async awaitInFlightSubstrateFanOuts(): Promise<void> {
+    await Promise.allSettled([...this.inFlightSubstrateFanOuts]);
+  }
+
+  /** Sibling of {@link awaitInFlightSubstrateFanOuts} — gauge for diagnostic / drain-loop use. */
+  inFlightSubstrateFanOutCount(): number {
+    return this.inFlightSubstrateFanOuts.size;
+  }
+
   getSwmSubstrateFanoutStats(): {
     delivered: Record<string, number>;
     rejected: Record<string, number>;
+    retryable: Record<string, number>;
     queued: Record<string, number>;
     inFlight: Record<string, number>;
     failed: Record<string, number>;
-    overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
+    overflow: { delivered: number; rejected: number; retryable: number; queued: number; inFlight: number; failed: number };
     truncated: boolean;
   } {
     return {
       delivered: Object.fromEntries(this.swmSubstrateFanoutDelivered),
       rejected: Object.fromEntries(this.swmSubstrateFanoutRejected),
+      retryable: Object.fromEntries(this.swmSubstrateFanoutRetryable),
       queued: Object.fromEntries(this.swmSubstrateFanoutQueued),
       inFlight: Object.fromEntries(this.swmSubstrateFanoutInFlight),
       failed: Object.fromEntries(this.swmSubstrateFanoutFailed),
       overflow: {
         delivered: this.swmSubstrateFanoutOverflow.delivered,
         rejected: this.swmSubstrateFanoutOverflow.rejected,
+        retryable: this.swmSubstrateFanoutOverflow.retryable,
         queued: this.swmSubstrateFanoutOverflow.queued,
         inFlight: this.swmSubstrateFanoutOverflow.inFlight,
         failed: this.swmSubstrateFanoutOverflow.failed,

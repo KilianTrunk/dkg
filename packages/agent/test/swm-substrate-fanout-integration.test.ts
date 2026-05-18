@@ -22,7 +22,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { MockChainAdapter } from '@origintrail-official/dkg-chain';
-import { DKGAgent } from '../src/index.js';
+import { DKGAgent, FANOUT_RESPONSE_RETRYABLE } from '../src/index.js';
 import type { ReliableSendResult } from '../src/p2p/messenger.js';
 
 const SELF_PEER = '12D3KooWSelfPubC';
@@ -115,10 +115,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(stats).toEqual({
       delivered: {},
       rejected: {},
+      retryable: {},
       queued: {},
       inFlight: {},
       failed: {},
-      overflow: { delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 },
+      overflow: { delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 },
       truncated: false,
     });
   });
@@ -148,10 +149,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(agent.getSwmSubstrateFanoutStats()).toEqual({
       delivered: {},
       rejected: {},
+      retryable: {},
       queued: {},
       inFlight: {},
       failed: {},
-      overflow: { delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 },
+      overflow: { delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 },
       truncated: false,
     });
   });
@@ -191,6 +193,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
       subject: 'urn:test:mixed', predicate: 'http://schema.org/name', object: '"mixed"', graph: '',
     }]);
 
+    // rc.9 PR-G #G2: substrate fan-out is now detached from
+    // share()'s critical path, so counters update asynchronously.
+    // Drain in-flight substrate before asserting.
+    await agent.awaitInFlightSubstrateFanOuts();
+
     // Gossip publish should have fired exactly once for the topic.
     expect(gossip.publishes).toHaveLength(1);
     expect(gossip.publishes[0]?.topic).toMatch(/shared-memory$/);
@@ -209,7 +216,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(stats.queued).toEqual({ 'cg-public-mixed': 1 });
     expect(stats.inFlight).toEqual({});
     expect(stats.failed).toEqual({ 'cg-public-mixed': 1 });
-    expect(stats.overflow).toEqual({ delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 });
+    expect(stats.overflow).toEqual({ delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 });
     expect(stats.truncated).toBe(false);
   });
 
@@ -238,6 +245,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     await agent.share('cg-self-exclude', [{
       subject: 'urn:test:se', predicate: 'http://schema.org/name', object: '"self"', graph: '',
     }]);
+    await agent.awaitInFlightSubstrateFanOuts();
 
     expect(calls.map(c => c.peerId)).toEqual(['12D3KooWPeerOther']);
     expect(agent.getSwmSubstrateFanoutStats().delivered).toEqual({ 'cg-self-exclude': 1 });
@@ -287,6 +295,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     await agent.share('cg-curated-r2', [{
       subject: 'urn:test:r2', predicate: 'http://schema.org/name', object: '"curated"', graph: '',
     }]);
+    await agent.awaitInFlightSubstrateFanOuts();
 
     // BOTH legs must have fired. Gossip publish once on the
     // workspace topic; substrate sendReliable once per
@@ -357,10 +366,11 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     expect(agent.getSwmSubstrateFanoutStats()).toEqual({
       delivered: {},
       rejected: {},
+      retryable: {},
       queued: {},
       inFlight: {},
       failed: {},
-      overflow: { delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 },
+      overflow: { delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 },
       truncated: false,
     });
   });
@@ -390,6 +400,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     await agent.share('cg-iso-1', [{
       subject: 'urn:test:i1b', predicate: 'http://schema.org/name', object: '"c"', graph: '',
     }]);
+    await agent.awaitInFlightSubstrateFanOuts();
 
     const stats = agent.getSwmSubstrateFanoutStats();
     expect(stats.delivered).toEqual({
@@ -410,11 +421,17 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
    *      Uint8Array), sender drops the share. Matches the
    *      pre-PR-C gossip behaviour for permanent rejections
    *      (bad signature, peer not in allowlist, CAS-not-met).
-   *   - `applied: false, retryable: true`        → THROW, so
-   *      sendReliable reports failure and the substrate
-   *      outbox keeps the share queued for retry. Dominant
-   *      production case: sender key package for the epoch
-   *      hasn't arrived yet.
+   *   - `applied: false, retryable: true`        → returns the
+   *      `FANOUT_RESPONSE_RETRYABLE` (0x02) sentinel (rc.9 PR-G
+   *      codex follow-up #G1). Pre-PR-G this branch THREW so
+   *      the substrate outbox would re-queue the share; that
+   *      relied on `isRecoverableSendError()` matching the
+   *      handler-abort reason, which it didn't — the share
+   *      would be dropped instead of retried. The sentinel
+   *      makes the retry path deterministic: the sender's
+   *      `classifySendResult` re-buckets 0x02 into the
+   *      `retryable` outcome and SwmAckQuorum's watchdog
+   *      (PR-D) fires substrate top-up at watchdogMs.
    *
    * We exercise the private `handleSwmUpdate` method directly
    * by stubbing `getOrCreateSharedMemoryHandler` to return a
@@ -472,7 +489,7 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
       expect(response[0]).toBe(0x01);
     });
 
-    it('retryable rejection (retryable: true) → THROWS so substrate outbox keeps the share queued', async () => {
+    it('retryable rejection (retryable: true) → returns FANOUT_RESPONSE_RETRYABLE sentinel (PR-G #G1)', async () => {
       const agent = await createAgent('R3Receiver-Retryable');
       installStubHandler(agent, async () => ({
         applied: false,
@@ -480,9 +497,9 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
         retryable: true,
       }));
 
-      await expect(
-        invokeReceiver(agent, new Uint8Array([7, 8, 9]), '12D3KooWPeerR3c'),
-      ).rejects.toThrow(/transient rejection from 12D3KooWPeerR3c.*epoch 42/);
+      const response = await invokeReceiver(agent, new Uint8Array([7, 8, 9]), '12D3KooWPeerR3c');
+      expect(response).toBeInstanceOf(Uint8Array);
+      expect(response).toEqual(FANOUT_RESPONSE_RETRYABLE);
     });
   });
 
@@ -511,11 +528,159 @@ describe('DKGAgent SWM substrate fan-out integration (rc.9 PR-C)', () => {
     await agent.share('cg-r6-mixed', [{
       subject: 'urn:test:r6', predicate: 'http://schema.org/name', object: '"split"', graph: '',
     }]);
+    await agent.awaitInFlightSubstrateFanOuts();
 
     const stats = agent.getSwmSubstrateFanoutStats();
     expect(stats.delivered).toEqual({ 'cg-r6-mixed': 1 });
     expect(stats.rejected).toEqual({ 'cg-r6-mixed': 1 });
     expect(stats.queued).toEqual({});
     expect(stats.failed).toEqual({});
+  });
+
+  /**
+   * rc.9 PR-G codex follow-up #G1 end-to-end: the substrate's
+   * per-(cgId, outcome) counter MUST surface a `retryable`
+   * bucket when the receiver returns FANOUT_RESPONSE_RETRYABLE
+   * (0x02), separately from `delivered` AND from `rejected`.
+   *
+   * Pre-PR-G the receiver THREW on retryable rejections — and
+   * that throw relied on libp2p's handler-abort surfacing as
+   * recoverable, which it did not. The 0x02 sentinel sidesteps
+   * the abort path entirely: receiver returns the byte, sender
+   * classifies it as `retryable`, and SwmAckQuorum's watchdog
+   * (PR-D) is the one that schedules the actual re-send.
+   */
+  it('PR-G #G1 end-to-end: 0x02 retryable sentinel moves counter into the retryable bucket', async () => {
+    const agent = await createAgent('SubstrateFanoutRetryablePRG');
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWApplied', '12D3KooWRetryable'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    const { install } = stubMessengerSendReliable(new Map([
+      ['12D3KooWApplied', { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'm-applied' }],
+      // PR-G #G1: receiver's 0x02 byte means transient rejection.
+      ['12D3KooWRetryable', { delivered: true, response: new Uint8Array([0x02]), attempts: 1, messageId: 'm-retryable' }],
+    ]));
+    install(agent);
+
+    await agent.share('cg-prg-retryable', [{
+      subject: 'urn:test:prg', predicate: 'http://schema.org/name', object: '"prg"', graph: '',
+    }]);
+    await agent.awaitInFlightSubstrateFanOuts();
+
+    const stats = agent.getSwmSubstrateFanoutStats();
+    expect(stats.delivered).toEqual({ 'cg-prg-retryable': 1 });
+    expect(stats.retryable).toEqual({ 'cg-prg-retryable': 1 });
+    expect(stats.rejected).toEqual({});
+    expect(stats.queued).toEqual({});
+    expect(stats.failed).toEqual({});
+  });
+
+  /**
+   * rc.9 PR-G codex follow-up #G2 contract: `share()` MUST NOT
+   * await the substrate fan-out leg. Pre-PR-G one slow / offline
+   * allowlisted peer could hold `share()` open for up to
+   * `SWM_SUBSTRATE_FANOUT_TIMEOUT_MS` (15s) — a regression from
+   * the pre-rc.9 gossip-only path's "share returns in tens of
+   * ms" latency. This test pins the new behaviour by stubbing
+   * the messenger with a `sendReliable` that NEVER resolves
+   * (simulating one offline subscriber), then asserting that
+   * `share()` completes promptly while a substrate fan-out
+   * remains in flight.
+   *
+   * Implementation note: we don't time-bound the share() call
+   * literally because vitest's CI timing has too much jitter
+   * for tight ms thresholds. Instead we assert the strong
+   * structural property: `share()` resolves, the in-flight
+   * substrate fan-out count is > 0, and the slow stub was never
+   * called more than the "started" notification (i.e. it didn't
+   * have to RESOLVE for share() to return).
+   */
+  it('PR-G #G2 contract: share() returns without awaiting substrate fan-out (offline peer would otherwise block 15s)', async () => {
+    const agent = await createAgent('SubstrateFanoutG2Detach');
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWSlowPeer'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    // Stub sendReliable with a promise that never resolves —
+    // simulates a peer whose connection is offline and where
+    // the substrate fan-out would have to wait the full
+    // SWM_SUBSTRATE_FANOUT_TIMEOUT_MS before timing out.
+    let sendReliableCallCount = 0;
+    let resolveSlowSend: ((value: ReliableSendResult) => void) | undefined;
+    const slowSendPromise = new Promise<ReliableSendResult>((resolve) => {
+      resolveSlowSend = resolve;
+    });
+    const slowStub = {
+      sendReliable: async (): Promise<ReliableSendResult> => {
+        sendReliableCallCount += 1;
+        return slowSendPromise;
+      },
+    };
+    (agent as unknown as { messenger: typeof slowStub }).messenger = slowStub;
+
+    // share() MUST resolve promptly — the substrate fan-out
+    // promise is still in flight (slowSendPromise never resolves
+    // unless we call resolveSlowSend), but share() does NOT
+    // await it.
+    const shareStart = Date.now();
+    await agent.share('cg-g2-detach', [{
+      subject: 'urn:test:g2', predicate: 'http://schema.org/name', object: '"g2"', graph: '',
+    }]);
+    const shareElapsed = Date.now() - shareStart;
+
+    // Generous bound — local commit + gossip publish + the
+    // SYNCHRONOUS part of fan-out (substrate.sendReliable() runs
+    // up to its first `await`, then yields). Should be well
+    // under 1s on any CI machine; 5s catches any future
+    // regression that re-introduces an await on substrate.
+    expect(shareElapsed).toBeLessThan(5_000);
+
+    // The slow send WAS dispatched (substrate fan-out kicked
+    // off), but its promise is still pending — proof that
+    // share() returned without waiting on it.
+    expect(sendReliableCallCount).toBe(1);
+    expect(agent.inFlightSubstrateFanOutCount()).toBe(1);
+
+    // Resolve the slow send so the in-flight fan-out can drain
+    // before the test finishes (prevents Vitest leaking unawaited
+    // promises into the next test).
+    resolveSlowSend?.({ delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'm-slow' });
+    await agent.awaitInFlightSubstrateFanOuts();
+
+    // Counter now reflects the delayed delivery.
+    expect(agent.getSwmSubstrateFanoutStats().delivered).toEqual({ 'cg-g2-detach': 1 });
+    expect(agent.inFlightSubstrateFanOutCount()).toBe(0);
+  });
+
+  /**
+   * rc.9 PR-G #G2 corollary: many shares back-to-back must NOT
+   * accumulate unbounded in-flight substrate fan-outs (the Set
+   * tracks them, but `.finally()` removes each on completion so
+   * the Set stays bounded by concurrency, not by cumulative
+   * shares). Pins the cleanup contract.
+   */
+  it('PR-G #G2: in-flight substrate fan-out set self-cleans on completion (no memory leak across many shares)', async () => {
+    const agent = await createAgent('SubstrateFanoutG2Cleanup');
+    const gossip = new CapturingGossip();
+    gossip.subscribers = ['12D3KooWFastPeer'];
+    (agent as unknown as { gossip: CapturingGossip }).gossip = gossip;
+
+    const { install } = stubMessengerSendReliable(new Map([
+      ['12D3KooWFastPeer', { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'mFast' }],
+    ]));
+    install(agent);
+
+    for (let i = 0; i < 5; i += 1) {
+      await agent.share('cg-g2-cleanup', [{
+        subject: `urn:test:g2c-${i}`, predicate: 'http://schema.org/name', object: `"${i}"`, graph: '',
+      }]);
+    }
+    await agent.awaitInFlightSubstrateFanOuts();
+
+    // After draining, the Set MUST be empty — proves .finally()
+    // is correctly removing completed fan-outs.
+    expect(agent.inFlightSubstrateFanOutCount()).toBe(0);
+    expect(agent.getSwmSubstrateFanoutStats().delivered).toEqual({ 'cg-g2-cleanup': 5 });
   });
 });

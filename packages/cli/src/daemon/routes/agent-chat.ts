@@ -986,10 +986,24 @@ export function buildSloPayload(agent: {
   getSwmSubstrateFanoutStats?: () => {
     delivered: Record<string, number>;
     rejected: Record<string, number>;
+    /**
+     * rc.9 PR-G codex follow-up #G1 — transient receiver-side
+     * rejections (CAS pre-condition not yet met). Optional on
+     * the agent interface for back-compat with pre-PR-G test
+     * doubles; production agents always provide it.
+     */
+    retryable?: Record<string, number>;
     queued: Record<string, number>;
     inFlight: Record<string, number>;
     failed: Record<string, number>;
-    overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
+    overflow: {
+      delivered: number;
+      rejected: number;
+      retryable?: number;
+      queued: number;
+      inFlight: number;
+      failed: number;
+    };
     truncated: boolean;
   };
 }): {
@@ -1012,10 +1026,18 @@ export function buildSloPayload(agent: {
     substrateFanout?: {
       delivered: Record<string, number>;
       rejected: Record<string, number>;
+      retryable?: Record<string, number>;
       queued: Record<string, number>;
       inFlight: Record<string, number>;
       failed: Record<string, number>;
-      overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
+      overflow: {
+        delivered: number;
+        rejected: number;
+        retryable?: number;
+        queued: number;
+        inFlight: number;
+        failed: number;
+      };
       truncated: boolean;
     };
   };

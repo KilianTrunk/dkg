@@ -141,7 +141,62 @@ async function createAgent(name: string): Promise<DKGAgent> {
     value: SELF_PEER,
     configurable: true,
   });
+  // PR-J: CGMemberEnumerator now filters topic-subscribers
+  // through libp2p reachability (connected OR peerStore-known).
+  // These tests don't drive a real libp2p — without a stub the
+  // filter would strip every fake-peer subscriber and `track()`
+  // would never fire. Treat ALL test peers as dialable; the
+  // PR-J test that actually exercises the filter lives in
+  // `enumerate-cg-members.test.ts` where it can drive the
+  // predicate directly.
+  installAllReachableLibp2pStub(agent);
   return agent;
+}
+
+/**
+ * Install a `node.libp2p` shim that reports test peers as
+ * dialable. Matches the pre-PR-J behaviour the integration tests
+ * expect — they care about ack-quorum / fan-out wiring, not
+ * reachability filtering. The PR-J filter is exercised in
+ * `enumerate-cg-members.test.ts` where the predicate is the unit
+ * under test.
+ *
+ * Why a lazy gossip read: PR-J round 2 (codex RED #4) routes the
+ * `isPeerDialable` predicate through `peerIdFromString` before
+ * `peerStore.get`. Short test peer IDs like `12D3KooWPeerA` are
+ * not valid Ed25519 base58 strings, so `peerIdFromString` would
+ * throw → catch → false → substrate target subset empties →
+ * the whole fan-out stops. We side-step by making `getPeers()`
+ * return whatever gossip.subscribers currently contains: the
+ * first branch of `isPeerDialable` (`getPeers().some(...)`)
+ * matches and short-circuits before peerStore is touched.
+ *
+ * For tests whose substrate fan-out targets peer IDs NOT in
+ * gossip.subscribers (e.g. watchdog-top-up tests with custom
+ * `missingPeers`), they can also push into
+ * `_extraDialablePeerIds` after install.
+ */
+function installAllReachableLibp2pStub(agent: DKGAgent): { extraDialablePeerIds: string[] } {
+  const extraDialablePeerIds: string[] = [];
+  const stub = {
+    getPeers: (): Array<{ toString: () => string }> => {
+      const gossip = (agent as unknown as { gossip?: { subscribers?: string[] } }).gossip;
+      const fromGossip = gossip?.subscribers ?? [];
+      const all = [...fromGossip, ...extraDialablePeerIds];
+      return all.map((id) => ({ toString: () => id }));
+    },
+    peerStore: {
+      get: async (_peerId: unknown) => ({
+        addresses: [{ multiaddr: { toString: () => '/ip4/127.0.0.1/tcp/0' } }],
+      }),
+    },
+  };
+  Object.defineProperty((agent as unknown as { node: { libp2p?: unknown } }).node, 'libp2p', {
+    value: stub,
+    configurable: true,
+    writable: true,
+  });
+  return { extraDialablePeerIds };
 }
 
 describe('DKGAgent SwmAckQuorum integration (rc.9 PR-D)', () => {

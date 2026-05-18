@@ -54,8 +54,40 @@ export interface CGMemberEnumeration {
    * guaranteed (depends on SPARQL result ordering or GossipSub's
    * internal peer set iteration). Caller MUST de-duplicate if it
    * combines results across calls.
+   *
+   * This is the FULL set — gossip-delivery-eligible AND
+   * ackQuorum-tracking-eligible. Substrate fan-out should consult
+   * {@link substrateEligibleMembers} instead (when set) so it
+   * doesn't waste sends on peers we have no addressing for. See
+   * the {@link CGMemberEnumeratorDeps.isPeerDialable} jsdoc for
+   * why the two sets diverge.
    */
   members: string[];
+  /**
+   * Subset of {@link members} that {@link CGMemberEnumeratorDeps.isPeerDialable}
+   * accepts — i.e. the peers the substrate fan-out is allowed to
+   * target. Undefined when no `isPeerDialable` predicate was
+   * wired (pre-PR-J behaviour: substrate targets the full set).
+   *
+   * Added in PR-J round 2 (codex feedback on #584 round 2): the
+   * round-1 / round-2-pre-fix design filtered `members` in place,
+   * which silently shrunk the ackQuorum's `expectedMembers` for
+   * gossip-only-large-public CGs and disabled the watchdog. The
+   * dual-field shape keeps `members` as the optimistic upper
+   * bound (gossip + ackQuorum) and `substrateEligibleMembers`
+   * as the dialable subset (substrate target only).
+   *
+   * For the soak bug this PR fixes: a CG with one real
+   * subscriber (Lex) and three ghost peer-exchange entries
+   * returns `members: [Lex, ghostA, ghostB, ghostC]` and
+   * `substrateEligibleMembers: [Lex]`. Substrate targets only
+   * Lex; ackQuorum still tracks all four (so a hypothetical
+   * gossip-reachable ghost could still ack). Ghosts that never
+   * ack reach the hard deadline and surface through
+   * `onDeadlineExpired` — a metric blip, not a wire-load
+   * regression.
+   */
+  substrateEligibleMembers?: string[];
 }
 
 export interface CGMemberEnumeratorDeps {
@@ -101,6 +133,68 @@ export interface CGMemberEnumeratorDeps {
    */
   getTopicSubscribers: (topic: string) => string[];
   topicForCG: (cgId: string) => string;
+  /**
+   * Optional liveness filter for the SUBSTRATE TARGET subset.
+   * Returns true iff the peer is reachable from this node — i.e.
+   * `sendReliable` has a realistic chance of putting bytes on the
+   * wire to them. Populates {@link CGMemberEnumeration.substrateEligibleMembers}
+   * on the result; does NOT touch {@link CGMemberEnumeration.members}.
+   *
+   * Bug fix (PR-J, 2026-05-18): the 2026-05-18 soak between
+   * Miles and Lex surfaced `enumerated=4 attempted=4 queued=4`
+   * every cycle on a public CG that had exactly one real
+   * subscriber (Lex). Three of the four enumerated peers were
+   * ghost entries in our local GossipSub mesh view — sendReliable
+   * to each hit `no valid addresses` (recoverable) → permanent
+   * outbox row, monotonically rising `queued` counter, no acks.
+   * The filter drops those from the substrate target set before
+   * fan-out attempts.
+   *
+   * **MUST match the reachability data the send path uses**, not
+   * just `libp2p.getPeers()` (live connections only). The send
+   * path also dials via peerStore-cached addresses, so a peer we
+   * briefly disconnected from but still know addresses for is
+   * dialable — filtering it out would silently drop a legitimate
+   * subscriber from substrate fan-out. The wiring in `DKGAgent`
+   * therefore returns true for `connected OR peerStore-has-addresses`
+   * (codex RED #1 on #584 round 1).
+   *
+   * Async to accommodate libp2p's `peerStore.get` API (sync
+   * `getPeers()` alone is too narrow per the bug above). The
+   * enumerator awaits each peer in parallel — the dedup'd
+   * subscriber list is small (tens of peers typical), so the
+   * extra await batch is negligible.
+   *
+   * Intentionally NOT applied to the `allowlist` branch: curated
+   * CGs deliberately track ALL allowlisted peers (online or not)
+   * so the watchdog can fire substrate top-up when a previously
+   * offline allowlistee reconnects. For `allowlist` the offline
+   * peer eventually recovers via `runSyncOnConnect`; for
+   * `topic-subscribers` offline subscribers are noise we can't
+   * distinguish from churn, so we drop them.
+   *
+   * Applied OUTSIDE the TTL cache (codex YELLOW on #584 round
+   * 1): the cache stores the unfiltered deduped subscriber
+   * snapshot (the expensive SPARQL + getSubscribers work), and
+   * the filter runs on EVERY `enumerate()` against the current
+   * connection state. A peer that briefly disconnects and
+   * reconnects within the 60s cache window is therefore eligible
+   * again on the very next call, not stranded for up to a
+   * minute.
+   *
+   * Does NOT shrink `members` (codex RED #3 on #584 round 2):
+   * the pre-round-2 design filtered `members` in place, which
+   * silently shrunk the ackQuorum's `expectedMembers` for
+   * gossip-only-large-public CGs and disabled the watchdog. The
+   * filter now populates a separate `substrateEligibleMembers`
+   * subset; `members` stays as the full gossip-eligible set.
+   *
+   * Optional so existing tests / non-substrate callers that
+   * construct an enumerator without a libp2p handle keep
+   * working. When omitted, `substrateEligibleMembers` stays
+   * undefined and pre-PR-J behaviour is preserved.
+   */
+  isPeerDialable?: (peerId: string) => boolean | Promise<boolean>;
   /**
    * Lazy accessor for our own peer ID. Always excluded from the
    * returned member set — we don't fan-out to ourselves (the local
@@ -220,14 +314,29 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
     // Public CG: no on-chain roster exists by design (subscribers
     // don't pay to subscribe). Use the live GossipSub view.
     //
-    // Source label is derived from the FILTERED member list, not
-    // from the raw subscriber count. Bug fix (codex review on #571
-    // round 2): when the only subscriber visible is `self` (common
-    // when we're the first to subscribe to a public CG and no one
-    // else has joined yet) or duplicates collapse away, we'd
-    // otherwise return `{ source: 'topic-subscribers', members: [] }`
-    // and any caller that treats `source !== 'none'` as "I have
-    // remote recipients" would skip the intended fallback.
+    // Source label is derived from the deduped member list. Bug
+    // fix (codex review on #571 round 2): when the only subscriber
+    // visible is `self` (common when we're the first to subscribe
+    // to a public CG and no one else has joined yet) or duplicates
+    // collapse away, we'd otherwise return `{ source:
+    // 'topic-subscribers', members: [] }` and any caller that
+    // treats `source !== 'none'` as "I have remote recipients"
+    // would skip the intended fallback.
+    //
+    // PR-J round 2: the `isPeerDialable` filter (added for the
+    // 2026-05-18 ghost-subscribers soak bug — see jsdoc) populates
+    // a SEPARATE `substrateEligibleMembers` field outside the
+    // cache (in `enumerate()`); `members` here stays as the full
+    // gossip-eligible set so ackQuorum keeps tracking everyone.
+    // Reasons:
+    //   - codex YELLOW on round 1: a transient disconnect
+    //     shouldn't strand a real subscriber for up to 60s.
+    //   - codex RED on round 2: filtering `members` in place would
+    //     shrink ackQuorum's expectedMembers and silently disable
+    //     the watchdog for gossip-only-large-public CGs.
+    // The expensive work the TTL was meant to amortise (SPARQL
+    // allowlist resolution, GossipSub subscriber snapshot) IS
+    // cached; only the cheap liveness check repeats.
     const subscribers = deps.getTopicSubscribers(deps.topicForCG(cgId));
     const members = dedupAndExcludeSelf(subscribers, deps.getSelfPeerId());
     return members.length === 0
@@ -235,16 +344,48 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
       : { source: 'topic-subscribers', members };
   }
 
+  /**
+   * Populate `substrateEligibleMembers` on a topic-subscribers
+   * result by awaiting `isPeerDialable` per-peer. No-op for
+   * other sources or when no filter is wired. Async to
+   * accommodate libp2p's `peerStore.get`. Throws caught + treated
+   * as "not dialable" — a single bad peerStore lookup shouldn't
+   * shrink the substrate target set across the whole CG.
+   *
+   * Returns the input unchanged when there's nothing to filter;
+   * otherwise returns a NEW object sharing the same `members`
+   * array (callers that mutate the result get the dual-field
+   * shape they expect).
+   */
+  async function populateSubstrateEligibleMembers(value: CGMemberEnumeration): Promise<CGMemberEnumeration> {
+    if (value.source !== 'topic-subscribers') return value;
+    if (!deps.isPeerDialable) return value;
+    const predicate = deps.isPeerDialable;
+    const checks = await Promise.all(value.members.map(async (peerId) => {
+      try {
+        return await predicate(peerId);
+      } catch {
+        return false;
+      }
+    }));
+    const filtered = value.members.filter((_, idx) => checks[idx]);
+    return {
+      source: value.source,
+      members: value.members,
+      substrateEligibleMembers: filtered,
+    };
+  }
+
   return {
     async enumerate(cgId: string): Promise<CGMemberEnumeration> {
       const nowMs = now();
       const cached = cache.get(cgId);
       if (cached && isFresh(cached, nowMs)) {
-        return cached.value;
+        return populateSubstrateEligibleMembers(cached.value);
       }
 
       const existing = inFlight.get(cgId);
-      if (existing) return existing;
+      if (existing) return populateSubstrateEligibleMembers(await existing);
 
       const gen = currentGen(cgId);
       const promise = resolve(cgId, gen, nowMs).finally(() => {
@@ -257,7 +398,7 @@ export function createCGMemberEnumerator(deps: CGMemberEnumeratorDeps): CGMember
         }
       });
       inFlight.set(cgId, promise);
-      return promise;
+      return populateSubstrateEligibleMembers(await promise);
     },
 
     invalidate(cgId: string): void {

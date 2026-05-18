@@ -108,6 +108,7 @@ export {
   chooseFanOutTier,
   executeSubstrateFanOut,
   FANOUT_RESPONSE_REJECTED,
+  FANOUT_RESPONSE_RETRYABLE,
   type ChooseFanOutTierInput,
   type FanOutPlan,
   type FanOutOutcome,

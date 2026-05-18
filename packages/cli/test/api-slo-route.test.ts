@@ -278,6 +278,49 @@ describe('/api/slo wire format (rc.9 PR-A / Codex PR #570 R10)', () => {
     expect((body as { swm: Record<string, unknown> }).swm.shareAckQuorum).toBeUndefined();
   });
 
+  /**
+   * rc.9 PR-D (codex follow-up from PR-G #G1): agents that ship
+   * the `retryable` outcome bucket (transient receiver-side
+   * rejections — CAS pre-condition not yet met, etc.) must
+   * see it surface end-to-end on `/api/slo`. Operators rely
+   * on this to distinguish "share dropped permanently" from
+   * "share will retry shortly via watchdog top-up", which
+   * have very different incident-response implications.
+   */
+  it('substrateFanout — retryable bucket (PR-D, codex from PR-G #G1) flows through end-to-end', async () => {
+    const agent: FakeAgent = {
+      getMessengerSloStats: () => ({}),
+      getSwmGossipStats: () => ({
+        publishFailures: {},
+        publishFailuresOverflow: 0,
+        publishFailuresTruncated: false,
+      }),
+      getSwmHandlerStats: () => ({
+        redundantApplies: {},
+        redundantAppliesLowerBound: false,
+        redundantAppliesOverflow: 0,
+        redundantAppliesTruncated: false,
+      }),
+      getSwmSubstrateFanoutStats: () => ({
+        delivered: { 'did:dkg:context-graph:curated': 10 },
+        rejected: {},
+        retryable: { 'did:dkg:context-graph:curated': 3 },
+        queued: {},
+        inFlight: {},
+        failed: {},
+        overflow: { delivered: 0, rejected: 0, retryable: 7, queued: 0, inFlight: 0, failed: 0 },
+        truncated: false,
+      }),
+    };
+    ({ server, port } = await startSloServer(agent));
+
+    const { status, body } = await get(port, '/api/slo');
+    expect(status).toBe(200);
+    const substrateFanout = (body as { swm: { substrateFanout: Record<string, unknown> } }).swm.substrateFanout;
+    expect(substrateFanout.retryable).toEqual({ 'did:dkg:context-graph:curated': 3 });
+    expect((substrateFanout.overflow as Record<string, number>).retryable).toBe(7);
+  });
+
   it('substrateFanout — absent when the agent omits getSwmSubstrateFanoutStats (back-compat with PR-A-only doubles)', async () => {
     const agent: FakeAgent = {
       getMessengerSloStats: () => ({}),

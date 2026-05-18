@@ -253,6 +253,32 @@ export type FanOutOutcome =
   // codex R6 caught that bundling them overstated end-to-end
   // success in `/api/slo`'s `swm.substrateFanout.delivered`.
   | 'rejected'
+  // rc.9 PR-D (codex follow-up from PR-G #G1, deferred here so
+  // it lands together with the watchdog that actually
+  // reschedules retryable peers): `messenger.sendReliable`
+  // returned `delivered: true` but the receiver's response was
+  // the {@link FANOUT_RESPONSE_RETRYABLE} sentinel — the
+  // receiver saw a TRANSIENT rejection (CAS pre-condition not
+  // yet met; upstream writes pending). The sender does NOT
+  // count this as delivered; SwmAckQuorum's watchdog handles
+  // the actual re-send by leaving the peer out of the pre-acked
+  // set so it falls through to the expectedMembers∖acked window
+  // and substrate top-up fires at watchdogMs.
+  //
+  // Pre-PR-D the receiver THREW on retryable rejections, hoping
+  // libp2p would surface the handler-abort as a recoverable
+  // stream-reset that `isRecoverableSendError()` would re-queue
+  // into the outbox. That hope was fragile: the non-pooled
+  // ProtocolRouter aborts with the literal string `"handler
+  // error"`, which matches none of the recoverable substrings,
+  // so the share got DROPPED instead of queued. The sentinel
+  // is deterministic — receiver returns the byte at the wire
+  // layer, sender's classifier re-buckets it into 'retryable',
+  // SwmAckQuorum's watchdog fires top-up. NOTE the throw path
+  // remains in handleSwmUpdate as the fallback when PR-D's
+  // watchdog is disabled (test seam / config flag), so the
+  // pre-PR-D behaviour is recoverable.
+  | 'retryable'
   // `messenger.sendReliable` returned `delivered: false, queued:
   // true`. Persisted into the durable substrate outbox; will be
   // retried by `Messenger.processOutboxTick` and on the next
@@ -296,6 +322,23 @@ export type FanOutOutcome =
  *     further runs on a normal response).
  */
 export const FANOUT_RESPONSE_REJECTED: Uint8Array = new Uint8Array([0x01]);
+
+/**
+ * rc.9 PR-D (codex follow-up from PR-G #G1, deferred here so
+ * it lands together with the SwmAckQuorum watchdog). Wire
+ * sentinel returned by the substrate receiver for TRANSIENT
+ * rejections — the receiver couldn't apply the share right
+ * now (CAS pre-condition not yet met) but the same wire bytes
+ * might apply successfully on retry once upstream state
+ * converges.
+ *
+ * Older substrate senders (pre-PR-D) treat 0x02 identically to
+ * 0x01 — opaque non-empty byte → `delivered: true` in their
+ * classifier. Slight metric overcount during rolling rc.9 PR-C
+ * → PR-D upgrades; no behavioural regression since receivers
+ * still dedup via `seenShareOps` (PR-A).
+ */
+export const FANOUT_RESPONSE_RETRYABLE: Uint8Array = new Uint8Array([0x02]);
 
 /**
  * Per-peer record handed to {@link FanOutBookkeeper.recordOutcome}.
@@ -359,6 +402,13 @@ export interface ExecuteSubstrateFanOutResult {
   delivered: number;
   /** Permanent receiver-side rejections — sender drops, NOT counted as delivered (PR-C codex R6). */
   rejected: number;
+  /**
+   * Transient receiver-side rejections — sender does NOT count
+   * as delivered; SwmAckQuorum's watchdog (PR-D) fires substrate
+   * top-up at watchdogMs so upstream state has time to converge
+   * before retry (codex follow-up from PR-G #G1, landed here).
+   */
+  retryable: number;
   queued: number;
   inFlight: number;
   failed: number;
@@ -385,6 +435,7 @@ export async function executeSubstrateFanOut(
     attempted: members.length,
     delivered: 0,
     rejected: 0,
+    retryable: 0,
     queued: 0,
     inFlight: 0,
     failed: 0,
@@ -412,6 +463,9 @@ export async function executeSubstrateFanOut(
         break;
       case 'rejected':
         result.rejected += 1;
+        break;
+      case 'retryable':
+        result.retryable += 1;
         break;
       case 'queued':
         result.queued += 1;
@@ -446,6 +500,18 @@ function classifySendResult(peerId: string, sendResult: ReliableSendResult): Fan
         attempts: sendResult.attempts,
         messageId: sendResult.messageId,
         error: 'receiver returned FANOUT_RESPONSE_REJECTED sentinel (permanent rejection)',
+      };
+    }
+    // rc.9 PR-D (codex follow-up from PR-G #G1): the 0x02
+    // sentinel means TRANSIENT rejection — SwmAckQuorum's
+    // watchdog will fire substrate top-up at watchdogMs.
+    if (isRetryableSentinel(sendResult.response)) {
+      return {
+        peerId,
+        outcome: 'retryable',
+        attempts: sendResult.attempts,
+        messageId: sendResult.messageId,
+        error: 'receiver returned FANOUT_RESPONSE_RETRYABLE sentinel (transient rejection)',
       };
     }
     return {
@@ -500,4 +566,8 @@ function classifySendResult(peerId: string, sendResult: ReliableSendResult): Fan
  */
 function isRejectionSentinel(response: Uint8Array | undefined): boolean {
   return response !== undefined && response.byteLength === 1 && response[0] === 0x01;
+}
+
+function isRetryableSentinel(response: Uint8Array | undefined): boolean {
+  return response !== undefined && response.byteLength === 1 && response[0] === 0x02;
 }

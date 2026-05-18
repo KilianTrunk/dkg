@@ -165,6 +165,7 @@ import {
   chooseFanOutTier,
   executeSubstrateFanOut,
   FANOUT_RESPONSE_REJECTED,
+  FANOUT_RESPONSE_RETRYABLE,
   type FanOutBookkeeper,
   type FanOutPeerRecord,
   type FanOutPlan,
@@ -1318,12 +1319,20 @@ export class DKGAgent {
    */
   private readonly swmSubstrateFanoutDelivered = new Map<string, number>();
   private readonly swmSubstrateFanoutRejected = new Map<string, number>();
+  /**
+   * rc.9 PR-D (codex follow-up from PR-G #G1): per-cgId count
+   * of substrate sends that returned the FANOUT_RESPONSE_RETRYABLE
+   * sentinel. NOT counted as delivered; SwmAckQuorum's watchdog
+   * fires substrate top-up.
+   */
+  private readonly swmSubstrateFanoutRetryable = new Map<string, number>();
   private readonly swmSubstrateFanoutQueued = new Map<string, number>();
   private readonly swmSubstrateFanoutInFlight = new Map<string, number>();
   private readonly swmSubstrateFanoutFailed = new Map<string, number>();
   private swmSubstrateFanoutOverflow = {
     delivered: 0,
     rejected: 0,
+    retryable: 0,
     queued: 0,
     inFlight: 0,
     failed: 0,
@@ -2026,9 +2035,15 @@ export class DKGAgent {
     // NOT bump for these responses. The application-level
     // truth (delivered vs rejected) lives in
     // `swm.substrateFanout.{delivered,rejected}`.
+    // rc.9 PR-D (codex follow-up from PR-G #G1): exclude BOTH
+    // the 0x01 (permanent) AND 0x02 (transient) sentinels from
+    // the protocol-level `delivered` count — neither maps to an
+    // application-level successful apply. The application-side
+    // truth (delivered / rejected / retryable) lives in
+    // `swm.substrateFanout.*`.
     this.messenger.setResponseDeliveredClassifier(
       PROTOCOL_SWM_UPDATE,
-      (response) => !(response.byteLength === 1 && response[0] === 0x01),
+      (response) => !(response.byteLength === 1 && (response[0] === 0x01 || response[0] === 0x02)),
     );
 
     // rc.9 PR-D: gossip-applied share acks. Receiver-only —
@@ -6154,22 +6169,25 @@ export class DKGAgent {
       return new Uint8Array();
     }
     if (outcome.retryable) {
-      // Throwing here is what tells the substrate outbox to keep
-      // the share queued. The router aborts the stream which the
-      // sender sees as a stream-reset error — `isRecoverableSendError`
-      // matches "reset"/"closed" substrings and enqueues into the
-      // outbox. `handle()` already logged the specific rejection
-      // at WARN/ERROR; the throw message just gives operators the
-      // hint when they grep for "swm apply" in receiver logs.
-      //
-      // (Codex flagged this as PR-G #G1 — the abort string
-      // matching is fragile. The proper fix is a wire sentinel
-      // PLUS a watchdog that reschedules retryable peers when
-      // libp2p drops the abort. That fix lands in PR-D where
-      // the watchdog exists; PR-G keeps the throw path so the
-      // outbox is still the safety net on transports where the
-      // abort happens to match.)
-      throw new Error(`SWM apply transient rejection from ${fromPeerId}: ${outcome.reason}`);
+      // rc.9 PR-D (codex follow-up from PR-G #G1): return the
+      // 0x02 sentinel instead of throwing. Pre-PR-D this branch
+      // threw, hoping libp2p would surface the handler abort as
+      // a recoverable stream-reset so `isRecoverableSendError`
+      // would re-queue into the outbox. That hope was fragile:
+      // the non-pooled ProtocolRouter aborts with the literal
+      // string "handler error", which doesn't match
+      // reset/closed/timeout — the share got DROPPED instead of
+      // queued. The sentinel sidesteps the abort path entirely:
+      // wire layer succeeds, sender's `classifySendResult`
+      // re-buckets 0x02 into the `retryable` outcome, the peer
+      // is NOT added to the pre-acked set, and SwmAckQuorum's
+      // watchdog fires substrate top-up at watchdogMs — giving
+      // upstream state time to converge before the retry.
+      this.log.info(
+        createOperationContext('share'),
+        `SWM substrate receiver transient rejection from ${fromPeerId} (PR-D watchdog will retry): ${outcome.reason}`,
+      );
+      return FANOUT_RESPONSE_RETRYABLE;
     }
     // Permanent rejection: signal via the 1-byte sentinel so the
     // sender records `rejected` (not `delivered`) and stops here.
@@ -6741,6 +6759,7 @@ export class DKGAgent {
             + `enumerated=${plan.enumeratedCount} `
             + `attempted=${substrateResult.attempted} `
             + `delivered=${substrateResult.delivered} rejected=${substrateResult.rejected} `
+            + `retryable=${substrateResult.retryable} `
             + `queued=${substrateResult.queued} `
             + `inFlight=${substrateResult.inFlight} failed=${substrateResult.failed} `
             + `also_gossiped=${plan.useGossip}`,
@@ -9444,6 +9463,7 @@ export class DKGAgent {
     switch (outcome) {
       case 'delivered': return this.swmSubstrateFanoutDelivered;
       case 'rejected':  return this.swmSubstrateFanoutRejected;
+      case 'retryable': return this.swmSubstrateFanoutRetryable;
       case 'queued':    return this.swmSubstrateFanoutQueued;
       case 'inFlight':  return this.swmSubstrateFanoutInFlight;
       case 'failed':    return this.swmSubstrateFanoutFailed;
@@ -9453,6 +9473,7 @@ export class DKGAgent {
   private substrateFanoutTotalForCg(cgId: string): number {
     return (this.swmSubstrateFanoutDelivered.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutRejected.get(cgId) ?? 0)
+      + (this.swmSubstrateFanoutRetryable.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutQueued.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutInFlight.get(cgId) ?? 0)
       + (this.swmSubstrateFanoutFailed.get(cgId) ?? 0);
@@ -9479,6 +9500,7 @@ export class DKGAgent {
     const distinctCgIds = new Set<string>([
       ...this.swmSubstrateFanoutDelivered.keys(),
       ...this.swmSubstrateFanoutRejected.keys(),
+      ...this.swmSubstrateFanoutRetryable.keys(),
       ...this.swmSubstrateFanoutQueued.keys(),
       ...this.swmSubstrateFanoutInFlight.keys(),
       ...this.swmSubstrateFanoutFailed.keys(),
@@ -9498,11 +9520,13 @@ export class DKGAgent {
 
     this.swmSubstrateFanoutOverflow.delivered += this.swmSubstrateFanoutDelivered.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.rejected  += this.swmSubstrateFanoutRejected.get(smallestCg) ?? 0;
+    this.swmSubstrateFanoutOverflow.retryable += this.swmSubstrateFanoutRetryable.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.queued    += this.swmSubstrateFanoutQueued.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.inFlight  += this.swmSubstrateFanoutInFlight.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutOverflow.failed    += this.swmSubstrateFanoutFailed.get(smallestCg) ?? 0;
     this.swmSubstrateFanoutDelivered.delete(smallestCg);
     this.swmSubstrateFanoutRejected.delete(smallestCg);
+    this.swmSubstrateFanoutRetryable.delete(smallestCg);
     this.swmSubstrateFanoutQueued.delete(smallestCg);
     this.swmSubstrateFanoutInFlight.delete(smallestCg);
     this.swmSubstrateFanoutFailed.delete(smallestCg);
@@ -9547,21 +9571,24 @@ export class DKGAgent {
   getSwmSubstrateFanoutStats(): {
     delivered: Record<string, number>;
     rejected: Record<string, number>;
+    retryable: Record<string, number>;
     queued: Record<string, number>;
     inFlight: Record<string, number>;
     failed: Record<string, number>;
-    overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
+    overflow: { delivered: number; rejected: number; retryable: number; queued: number; inFlight: number; failed: number };
     truncated: boolean;
   } {
     return {
       delivered: Object.fromEntries(this.swmSubstrateFanoutDelivered),
       rejected: Object.fromEntries(this.swmSubstrateFanoutRejected),
+      retryable: Object.fromEntries(this.swmSubstrateFanoutRetryable),
       queued: Object.fromEntries(this.swmSubstrateFanoutQueued),
       inFlight: Object.fromEntries(this.swmSubstrateFanoutInFlight),
       failed: Object.fromEntries(this.swmSubstrateFanoutFailed),
       overflow: {
         delivered: this.swmSubstrateFanoutOverflow.delivered,
         rejected: this.swmSubstrateFanoutOverflow.rejected,
+        retryable: this.swmSubstrateFanoutOverflow.retryable,
         queued: this.swmSubstrateFanoutOverflow.queued,
         inFlight: this.swmSubstrateFanoutOverflow.inFlight,
         failed: this.swmSubstrateFanoutOverflow.failed,

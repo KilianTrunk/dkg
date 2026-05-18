@@ -986,10 +986,23 @@ export function buildSloPayload(agent: {
   getSwmSubstrateFanoutStats?: () => {
     delivered: Record<string, number>;
     rejected: Record<string, number>;
+    /**
+     * rc.9 PR-D (codex follow-up from PR-G #G1): transient
+     * receiver-side rejections. Optional on the interface for
+     * back-compat with pre-PR-D test doubles.
+     */
+    retryable?: Record<string, number>;
     queued: Record<string, number>;
     inFlight: Record<string, number>;
     failed: Record<string, number>;
-    overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
+    overflow: {
+      delivered: number;
+      rejected: number;
+      retryable?: number;
+      queued: number;
+      inFlight: number;
+      failed: number;
+    };
     truncated: boolean;
   };
   /**
@@ -1024,10 +1037,18 @@ export function buildSloPayload(agent: {
     substrateFanout?: {
       delivered: Record<string, number>;
       rejected: Record<string, number>;
+      retryable?: Record<string, number>;
       queued: Record<string, number>;
       inFlight: Record<string, number>;
       failed: Record<string, number>;
-      overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
+      overflow: {
+        delivered: number;
+        rejected: number;
+        retryable?: number;
+        queued: number;
+        inFlight: number;
+        failed: number;
+      };
       truncated: boolean;
     };
     /**

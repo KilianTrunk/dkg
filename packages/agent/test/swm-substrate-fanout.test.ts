@@ -242,7 +242,7 @@ describe('executeSubstrateFanOut', () => {
       bookkeeper: bk,
     });
 
-    expect(result).toEqual({ attempted: 0, delivered: 0, rejected: 0, queued: 0, inFlight: 0, failed: 0 });
+    expect(result).toEqual({ attempted: 0, delivered: 0, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 0 });
     expect(calls).toEqual([]);
   });
 
@@ -343,7 +343,7 @@ describe('executeSubstrateFanOut', () => {
       bookkeeper: bk,
     });
 
-    expect(result).toEqual({ attempted: 4, delivered: 3, rejected: 0, queued: 0, inFlight: 0, failed: 1 });
+    expect(result).toEqual({ attempted: 4, delivered: 3, rejected: 0, retryable: 0, queued: 0, inFlight: 0, failed: 1 });
     expect(calls).toHaveLength(4);
   });
 

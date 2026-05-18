@@ -525,6 +525,7 @@ jobs:
           EXTRA_TAGS: ${{ needs.build-and-pack.outputs.extra_tags }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          # shellcheck disable=SC2153 # TAG_NAME, NPM_TAG, EXTRA_TAGS come from the env: block above
           set -euo pipefail
           cd publish-artifacts
           shopt -s nullglob

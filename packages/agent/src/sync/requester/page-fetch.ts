@@ -70,10 +70,20 @@ interface FetchSyncPagesParams {
  *
  * Composed from the inputs that uniquely identify "which page from
  * which responder for which slice of state" — `(remotePeerId, cgId,
- * phase, offset, snapshotRef)`. This is unique per logical page from
- * this requester's point of view, which is what the messenger needs
- * to dedup sender-side retries and to serve the receiver's response
- * cache on the second arrival.
+ * includeSharedMemory, phase, offset, snapshotRef)`. This is unique
+ * per logical page from this requester's point of view, which is
+ * what the messenger needs to dedup sender-side retries and to serve
+ * the receiver's response cache on the second arrival.
+ *
+ * `includeSharedMemory` MUST be in the key — `runDurableSync` and
+ * `runSharedMemorySync` both call `fetchSyncPages` with the same
+ * phase (`'data'` / `'meta'`) for overlapping offsets, distinguished
+ * only by this flag. The checkpoint key (`getSyncCheckpointKey`)
+ * already encodes it for exactly the same reason. If the messageId
+ * collapsed durable and SWM into the same key, `Messenger.sendReliable`
+ * (dedup on `(peer, protocol, messageId)`) would happily serve a later
+ * SWM fetch from a cached durable response — silent cross-scope
+ * cache poisoning. Caught by codex review on #569.
  *
  * Note: requester peerId is intentionally NOT in the key — the
  * messenger already namespaces idempotency by `(senderPeerId,
@@ -89,11 +99,13 @@ interface FetchSyncPagesParams {
 export function computeSyncPageMessageId(parts: {
   remotePeerId: string;
   contextGraphId: string;
+  includeSharedMemory: boolean;
   phase: SyncPhase;
   offset: number;
   snapshotRef?: string;
 }): string {
-  return `sync:${parts.remotePeerId}:${parts.contextGraphId}:${parts.phase}:${parts.offset}:${parts.snapshotRef ?? '-'}`;
+  const scope = parts.includeSharedMemory ? 'swm' : 'durable';
+  return `sync:${parts.remotePeerId}:${parts.contextGraphId}:${scope}:${parts.phase}:${parts.offset}:${parts.snapshotRef ?? '-'}`;
 }
 
 export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<SyncPageResult> {
@@ -152,6 +164,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
     const pageMessageId = computeSyncPageMessageId({
       remotePeerId,
       contextGraphId,
+      includeSharedMemory,
       phase,
       offset: curOffset,
       snapshotRef,

@@ -61,12 +61,14 @@ describe('computeSyncPageMessageId', () => {
     const a = computeSyncPageMessageId({
       remotePeerId: REMOTE_PEER_ID,
       contextGraphId: CG_ID,
+      includeSharedMemory: false,
       phase: 'data',
       offset: 0,
     });
     const b = computeSyncPageMessageId({
       remotePeerId: REMOTE_PEER_ID,
       contextGraphId: CG_ID,
+      includeSharedMemory: false,
       phase: 'data',
       offset: 0,
     });
@@ -77,6 +79,7 @@ describe('computeSyncPageMessageId', () => {
     const base = {
       remotePeerId: REMOTE_PEER_ID,
       contextGraphId: CG_ID,
+      includeSharedMemory: false,
       phase: 'data' as SyncPhase,
       offset: 0,
     };
@@ -91,18 +94,48 @@ describe('computeSyncPageMessageId', () => {
     expect(computeSyncPageMessageId({ ...base, snapshotRef: 'snap-1' })).not.toBe(baseId);
   });
 
+  /**
+   * Regression for the second codex review on #569: the key MUST
+   * encode `includeSharedMemory`. Without it, durable + SWM page
+   * fetches with the same `(peer, cgId, phase, offset, snapshotRef)`
+   * collapse to the same messageId, and the messenger's dedup on
+   * `(peer, protocol, messageId)` would happily serve a later SWM
+   * fetch from a cached durable response (or vice versa) without
+   * ever contacting the remote peer. `runDurableSync` and
+   * `runSharedMemorySync` both call `fetchSyncPages` with the same
+   * phase for overlapping offsets — this is a realistic collision.
+   */
+  it('differs between durable and SWM scopes for an otherwise identical tuple', () => {
+    const base = {
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId: CG_ID,
+      phase: 'data' as SyncPhase,
+      offset: 0,
+    };
+    const durableId = computeSyncPageMessageId({ ...base, includeSharedMemory: false });
+    const swmId = computeSyncPageMessageId({ ...base, includeSharedMemory: true });
+    expect(durableId).not.toBe(swmId);
+    // Also sanity-check at the literal-prefix level so a future
+    // refactor that, e.g., collapses both into a single token can't
+    // silently re-introduce the collision.
+    expect(durableId).toContain(':durable:');
+    expect(swmId).toContain(':swm:');
+  });
+
   it('treats undefined snapshotRef and the literal "-" as different', () => {
     // Sanity: the placeholder is intentionally outside the valid
     // snapshotRef alphabet so it can't collide with a real ref.
     const noRef = computeSyncPageMessageId({
       remotePeerId: REMOTE_PEER_ID,
       contextGraphId: CG_ID,
+      includeSharedMemory: false,
       phase: 'snapshot',
       offset: 0,
     });
     const explicitRef = computeSyncPageMessageId({
       remotePeerId: REMOTE_PEER_ID,
       contextGraphId: CG_ID,
+      includeSharedMemory: false,
       phase: 'snapshot',
       offset: 0,
       snapshotRef: 'real-snap',
@@ -168,10 +201,68 @@ describe('fetchSyncPages messageId propagation', () => {
       computeSyncPageMessageId({
         remotePeerId: REMOTE_PEER_ID,
         contextGraphId: CG_ID,
+        includeSharedMemory: false,
         phase: 'data',
         offset: 0,
       }),
     );
+  });
+
+  /**
+   * End-to-end regression for the codex review on #569: when a
+   * durable fetch and an SWM fetch race for the same `(peer, cgId,
+   * phase, offset, snapshotRef)`, the messageIds observed at the
+   * `send` boundary MUST differ. Otherwise the messenger's dedup
+   * would silently serve one from the other's cached response.
+   *
+   * Drives two `fetchSyncPages` calls with `includeSharedMemory`
+   * toggled and asserts the captured messageIds are distinct.
+   */
+  it('emits distinct messageIds for durable vs SWM fetches with the same phase/offset', async () => {
+    const captured: Array<{ scope: 'durable' | 'swm'; messageId: string }> = [];
+
+    async function runOneFetch(includeSharedMemory: boolean): Promise<void> {
+      await fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 1,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => new TextEncoder().encode('request'),
+        parseAndFilter: singleQuadParser,
+        send: async (_peerId, _protocolId, _data, _timeoutMs, messageId) => {
+          captured.push({ scope: includeSharedMemory ? 'swm' : 'durable', messageId });
+          return new TextEncoder().encode('one-quad-line');
+        },
+        logWarn: noopLog,
+        logInfo: noopLog,
+        logDebug: noopLog,
+      });
+    }
+
+    await runOneFetch(false);
+    await runOneFetch(true);
+
+    expect(captured.length).toBe(2);
+    const durable = captured.find((c) => c.scope === 'durable');
+    const swm = captured.find((c) => c.scope === 'swm');
+    expect(durable).toBeDefined();
+    expect(swm).toBeDefined();
+    expect(durable!.messageId).not.toBe(swm!.messageId);
   });
 
   it('uses DIFFERENT messageIds for different page offsets in the same fetch', async () => {

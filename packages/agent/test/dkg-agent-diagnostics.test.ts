@@ -249,6 +249,9 @@ describe('DKGAgent.getPeerDiagnostics', () => {
     });
 
     it('extracts multiaddrs + protocols from a populated peerStore entry', async () => {
+      // rc.9 PR-E: `syncCapable` now tracks the current PROTOCOL_SYNC
+      // wire ID (`/dkg/10.0.1/sync`), not the legacy `/dkg/10.0.0/sync`.
+      // A peer advertising the bumped protocol is reported sync-capable.
       const agentLike = makeAgentLike({
         rawConnections: [],
         peerStoreEntries: new Map([
@@ -259,7 +262,7 @@ describe('DKGAgent.getPeerDiagnostics', () => {
                 { multiaddr: { toString: () => '/ip4/1.2.3.4/tcp/4001' } },
                 { multiaddr: { toString: () => `/ip4/5.6.7.8/tcp/4001/p2p/${PEER_A}` } },
               ],
-              protocols: ['/dkg/10.0.0/sync', '/dkg/10.0.0/message'],
+              protocols: ['/dkg/10.0.1/sync', '/dkg/10.0.1/message'],
             },
           ],
         ]),
@@ -268,10 +271,33 @@ describe('DKGAgent.getPeerDiagnostics', () => {
       expect(diag.peerStore).toEqual({
         knownMultiaddrCount: 2,
         multiaddrs: ['/ip4/1.2.3.4/tcp/4001', `/ip4/5.6.7.8/tcp/4001/p2p/${PEER_A}`],
-        protocols: ['/dkg/10.0.0/sync', '/dkg/10.0.0/message'],
+        protocols: ['/dkg/10.0.1/sync', '/dkg/10.0.1/message'],
       });
-      expect(diag.protocols).toEqual(['/dkg/10.0.0/sync', '/dkg/10.0.0/message']);
+      expect(diag.protocols).toEqual(['/dkg/10.0.1/sync', '/dkg/10.0.1/message']);
       expect(diag.syncCapable).toBe(true);
+    });
+
+    // Regression for the rc.9 PR-E hard cutover: a peer that still
+    // only advertises the legacy `/dkg/10.0.0/sync` protocol is now
+    // *intentionally* reported as `syncCapable: false`. Without this
+    // assertion, a future regression that relaxed the check to "any
+    // sync version" would slip through silently.
+    it('reports syncCapable=false for a legacy peer that only advertises /dkg/10.0.0/sync', async () => {
+      const agentLike = makeAgentLike({
+        rawConnections: [],
+        peerStoreEntries: new Map([
+          [
+            PEER_A,
+            {
+              addresses: [],
+              protocols: ['/dkg/10.0.0/sync', '/dkg/10.0.0/message'],
+            },
+          ],
+        ]),
+      });
+      const diag = await callDiagnostics(agentLike, PEER_A);
+      expect(diag.protocols).toEqual(['/dkg/10.0.0/sync', '/dkg/10.0.0/message']);
+      expect(diag.syncCapable).toBe(false);
     });
   });
 

@@ -701,7 +701,12 @@ export interface PeerDiagnostics {
   health: PeerHealth | null;
   /** Protocols this peer's identify-handshake advertised. */
   protocols: string[];
-  /** Convenience flag — peer speaks `/dkg/10.0.0/sync`. */
+  /**
+   * Convenience flag — peer advertises the current `PROTOCOL_SYNC`
+   * wire ID. Tracks the constant so the diagnostic stays correct
+   * across protocol-version bumps (rc.9 PR-E: `/dkg/10.0.0/sync` →
+   * `/dkg/10.0.1/sync`).
+   */
   syncCapable: boolean;
 }
 
@@ -2162,8 +2167,14 @@ export class DKGAgent {
       }
     }
 
+    // rc.9 PR-E: bind to messenger.register so the /dkg/10.0.1/sync
+    // handler receives envelope-unwrapped payload + benefits from
+    // receiver-side idempotency dedup. Pre-PR-E this registered on
+    // the raw router, so the constant bump on its own (commit at
+    // PROTOCOL_SYNC declaration) gave the new protocol ID none of
+    // the substrate semantics — Codex review #569 caught the gap.
     registerSyncHandler({
-      router: this.router,
+      register: this.messenger.register.bind(this.messenger),
       protocolSync: PROTOCOL_SYNC,
       syncDeniedResponse: SYNC_DENIED_RESPONSE,
       syncPageSize: SYNC_PAGE_SIZE,
@@ -3061,7 +3072,38 @@ export class DKGAgent {
         }
         return this.getOrCreateSyncVerifyWorker().parseAndFilter(nquadsText, targetGraphUri, targetContextGraphId);
       },
-      send: (peerId, protocolId, data, sendTimeoutMs) => this.messenger.sendToPeer(peerId, protocolId, data, { timeoutMs: sendTimeoutMs }),
+      // rc.9 PR-E: route page fetches through `messenger.sendReliable`
+      // so the sync RPC gets the same ReliableEnvelope wrapping +
+      // sender-side idempotency cache + receiver-side dedup as the
+      // other migrated protocols (chat, access, query-remote,
+      // storage-ack, verify-proposal, join-request). Pre-PR-E this
+      // used `messenger.sendToPeer` — the raw pass-through — which
+      // gave the new /dkg/10.0.1/sync wire ID none of the substrate
+      // semantics it was named for.
+      //
+      // Sync RPC is synchronous-by-contract: the caller needs the
+      // page bytes back NOW to advance pagination. `queued=true`
+      // means the request landed in the durable outbox but no
+      // response is available yet — the page-fetch layer treats
+      // that as a hard failure for this attempt; the surrounding
+      // `withRetry` (in sync-transport.ts) handles the retry +
+      // backoff loop. The outbox's eventual delivery will still
+      // populate the receiver's dedup cache, so when withRetry
+      // re-issues with the same messageId the responder returns
+      // the cached response without re-running the handler.
+      send: async (peerId, protocolId, data, sendTimeoutMs) => {
+        const result = await this.messenger.sendReliable(peerId, protocolId, data, {
+          timeoutMs: sendTimeoutMs,
+        });
+        if (!result.delivered) {
+          throw new Error(
+            `Sync send to ${peerId} ${
+              result.queued ? 'queued (not synchronously deliverable)' : 'failed'
+            }: ${result.error ?? 'unknown'}`,
+          );
+        }
+        return result.response;
+      },
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
       logDebug: (opCtx, message) => this.log.debug(opCtx, message),
@@ -13623,7 +13665,13 @@ export class DKGAgent {
     };
 
     const protocols = peerStoreSnapshot?.protocols ?? [];
-    const syncCapable = protocols.includes('/dkg/10.0.0/sync');
+    // rc.9 PR-E: tracks the active `PROTOCOL_SYNC` constant rather
+    // than the literal `/dkg/10.0.0/sync`, so a node running rc.9+
+    // (advertising `/dkg/10.0.1/sync`) is correctly reported as
+    // sync-capable. Hard cutover — legacy `/dkg/10.0.0/sync`-only
+    // peers are no longer compatible and intentionally report
+    // syncCapable=false.
+    const syncCapable = protocols.includes(PROTOCOL_SYNC);
 
     return {
       peerId: peerKey,

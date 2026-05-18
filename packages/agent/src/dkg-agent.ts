@@ -92,50 +92,6 @@ import {
 } from '@origintrail-official/dkg-query';
 import { DKGAgentWallet, type AgentWallet } from './agent-wallet.js';
 
-/**
- * Pre-signed AuthorAttestation payload supplied at finalize-time by
- * self-sovereign agents whose private key isn't held by the daemon.
- * Compact ECDSA `(r, vs)` over the EIP-712 typed data
- * `buildAuthorAttestationTypedData({ chainId, kav10Address,
- * contextGraphId, merkleRoot, authorAddress: address })`. The agent
- * verifies the recovered signer matches `address` before stamping the
- * seal.
- *
- * Lives at the agent layer (rather than as a publisher
- * `PublishOptions` field) since RFC-001 §9.x — Phase C — the
- * publisher only accepts already-sealed `precomputedAttestation`
- * payloads. Pre-signed signing is a finalize-time concern.
- */
-type PreSignedAuthorAttestation = {
-  address: string;
-  signature: { r: Uint8Array; vs: Uint8Array };
-};
-
-type LocalSwmSenderKeySendState = {
-  contextGraphId: string;
-  subGraphName?: string;
-  senderAgentAddress: string;
-  epochId: string;
-  membershipHash: string;
-  chainKey: Uint8Array;
-  nextMessageIndex: number;
-  senderSigningSecretKey: Uint8Array;
-  senderSigningPublicKey: Uint8Array;
-  createdAtMs: number;
-};
-
-type LocalSwmSenderKeyReceiveState = {
-  contextGraphId: string;
-  subGraphName?: string;
-  senderAgentAddress: string;
-  epochId: string;
-  membershipHash: string;
-  chainKey: Uint8Array;
-  nextMessageIndex: number;
-  senderSigningPublicKey: Uint8Array;
-  createdAtMs: number;
-  skippedChainKeys: Map<number, Uint8Array>;
-};
 import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
 import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler, type ChatAclCheck } from './messaging.js';
@@ -193,958 +149,136 @@ import {
   strip, stripLiteral, jsonLdToQuads,
   type JsonLdContent,
 } from './dkg-agent-utils.js';
-
-export interface CclPublishedResultEntry {
-  entryUri: string;
-  kind: 'derived' | 'decision';
-  name: string;
-  tuple: unknown[];
-}
-
-export interface CclPublishedEvaluationRecord {
-  evaluationUri: string;
-  policyUri: string;
-  factSetHash: string;
-   factQueryHash?: string;
-   factResolverVersion?: string;
-   factResolutionMode?: CclFactResolutionMode;
-  createdAt?: string;
-  view?: string;
-  snapshotId?: string;
-  scopeUal?: string;
-  contextType?: string;
-  results: CclPublishedResultEntry[];
-}
-
-export interface PublishOpts {
-  onPhase?: PhaseCallback;
-  operationCtx?: OperationContext;
-  accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
-  allowedPeers?: string[];
-  /** Target sub-graph within the context graph (e.g. "code", "decisions"). */
-  subGraphName?: string;
-}
-
-export interface PublishAsyncOpts extends PublishOpts {
-  namespace?: string;
-  scope?: string;
-  transitionType?: LiftTransitionType;
-  authority?: LiftAuthorityProof;
-  /** Prior KC reference; required for MUTATE/REVOKE. */
-  priorVersion?: string;
-  /** V10 selective-disclosure: per-entity kaRoot instead of flat-hash KC. */
-  entityProofs?: boolean;
-  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
-  publisherNodeIdentityIdOverride?: bigint;
-  localOnly?: boolean;
-  /** Registered local agent whose key signs the seal. Mirrors sync `assertionFinalize`. */
-  authorAgentAddress?: string;
-  /** Externally pre-signed seal. Mutually exclusive with `authorAgentAddress` / `authorSignTypedData`. */
-  preSignedAuthorAttestation?: {
-    expectedMerkleRoot: Uint8Array;
-    authorAddress: string;
-    signature: { r: Uint8Array; vs: Uint8Array };
-    schemeVersion: number;
-  };
-  /** Caller signs typed-data built by the daemon. Requires `authorAgentAddress`. */
-  authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>;
-}
-
-export interface PublishAsyncQuadEnvelope {
-  publicQuads?: Quad[];
-  privateQuads?: Quad[];
-}
-
-export type PublishAsyncContent = JsonLdContent | PublishAsyncQuadEnvelope;
-
-export class ContextGraphNotFoundError extends Error {
-  readonly code = 'ContextGraphNotFound';
-
-  constructor(contextGraphId: string) {
-    super(`Context graph "${contextGraphId}" does not exist or is not subscribed locally`);
-    this.name = 'ContextGraphNotFound';
-  }
-}
-
-export class InvalidContentError extends Error {
-  readonly code = 'InvalidContent';
-
-  constructor(message: string) {
-    super(message);
-    this.name = 'InvalidContent';
-  }
-}
-
-const PRIVATE_DATA_ANCHOR = 'http://dkg.io/ontology/privateDataAnchor';
-
-function normalizePublishContextGraphId(input: string): string {
-  const value = String(input).trim().replace(/^<(.+)>$/, '$1');
-  const prefix = 'did:dkg:context-graph:';
-  if (!value.startsWith(prefix)) return value;
-  const rest = value.slice(prefix.length);
-  const slash = rest.indexOf('/');
-  return slash >= 0 ? rest.slice(0, slash) : rest;
-}
-
-function isPublishAsyncQuadEnvelope(input: unknown): input is PublishAsyncQuadEnvelope {
-  return !!input
-    && typeof input === 'object'
-    && !Array.isArray(input)
-    && ('publicQuads' in input || 'privateQuads' in input);
-}
-
-function assertQuadArray(value: unknown, fieldName: string): Quad[] {
-  if (value == null) return [];
-  if (!Array.isArray(value)) {
-    throw new InvalidContentError(`${fieldName} must be an array of RDF quads`);
-  }
-  for (const quad of value) {
-    if (
-      !quad
-      || typeof quad.subject !== 'string'
-      || typeof quad.predicate !== 'string'
-      || typeof quad.object !== 'string'
-    ) {
-      throw new InvalidContentError(`${fieldName} must contain RDF quads with subject, predicate, and object strings`);
-    }
-  }
-  return value.map((quad) => ({ ...quad, graph: quad.graph ?? '' })) as Quad[];
-}
-
-function partitionPublishAsyncQuads(publicQuads: Quad[], privateQuads: Quad[]): {
-  publicQuads: Quad[];
-  privateQuadsByRoot: Map<string, Quad[]>;
-  roots: string[];
-} {
-  const privateByRoot = autoPartition(privateQuads);
-  let stagedPublicQuads = [...publicQuads];
-  let publicByRoot = autoPartition(stagedPublicQuads);
-
-  for (const rootEntity of privateByRoot.keys()) {
-    if (!publicByRoot.has(rootEntity)) {
-      stagedPublicQuads.push({
-        subject: rootEntity,
-        predicate: PRIVATE_DATA_ANCHOR,
-        object: '"true"',
-        graph: '',
-      });
-    }
-  }
-
-  publicByRoot = autoPartition(stagedPublicQuads);
-  const roots = [...publicByRoot.keys()];
-  if (roots.length === 0) {
-    throw new InvalidContentError('Content produced no publishable root entities');
-  }
-
-  return {
-    publicQuads: stagedPublicQuads,
-    privateQuadsByRoot: privateByRoot,
-    roots,
-  };
-}
-
-/** Sign EIP-712 typed data with a raw private key, returning compact (r, vs). */
-async function signWithPrivateKey(
-  privateKey: string,
-  typedData: AuthorAttestationTypedData,
-): Promise<{ r: Uint8Array; vs: Uint8Array }> {
-  const wallet = new ethers.Wallet(privateKey.startsWith('0x') ? privateKey : '0x' + privateKey);
-  const sigHex = await wallet.signTypedData(typedData.domain, typedData.types, typedData.message);
-  const sig = ethers.Signature.from(sigHex);
-  return { r: ethers.getBytes(sig.r), vs: ethers.getBytes(sig.yParityAndS) };
-}
-
-/** Bytes → hex for lift-queue persistence. Inverse: `liftSealToPrecomputedAttestation`. */
-function preSignedAttestationToLiftSeal(input: {
-  expectedMerkleRoot: Uint8Array;
-  authorAddress: string;
-  signature: { r: Uint8Array; vs: Uint8Array };
-  schemeVersion: number;
-}): LiftRequestAuthorSeal {
-  return {
-    merkleRoot: ethers.hexlify(input.expectedMerkleRoot) as `0x${string}`,
-    authorAddress: input.authorAddress as `0x${string}`,
-    signature: {
-      r: ethers.hexlify(input.signature.r) as `0x${string}`,
-      vs: ethers.hexlify(input.signature.vs) as `0x${string}`,
-    },
-    schemeVersion: input.schemeVersion,
-  };
-}
-
-const SYNC_PAGE_SIZE = 500;
-const SYNC_PAGE_RETRY_ATTEMPTS = 3;
-const SYNC_TOTAL_TIMEOUT_MS = 120_000;
-/** Per-page timeout for sync when we have budget (relay links can be slow). */
-const SYNC_PAGE_TIMEOUT_MS = 45_000;
-/** ProtocolRouter.send retries internally 3 times with the same timeout; cap so 3× fits in remaining budget. */
-const SYNC_ROUTER_ATTEMPTS = 3;
-const SYNC_PROTOCOL_CHECK_ATTEMPTS = 3;
-const SYNC_PROTOCOL_CHECK_DELAY_MS = 500;
-const SYNC_AUTH_MAX_AGE_MS = 90_000;
-
-/**
- * How long an agent's join-request delegation is valid for. The same
- * delegation authorises the joiner's node to sync this CG on behalf of
- * the agent for the lifetime of the membership; we default to 1 year so
- * that approved joiners don't silently lose access after a short window.
- * The agent can re-issue at any time by signing a fresh delegation.
- */
-const JOIN_DELEGATION_VALIDITY_MS = 365 * 24 * 60 * 60 * 1000;
-
-/**
- * Send timeout for `/dkg/.../join-request` deliveries between joiner ↔ curator.
- *
- * Why 20s and not the previous 5s: `ProtocolRouter.send` shares a single
- * `AbortSignal.timeout(timeoutMs)` across its 3 retry attempts (see
- * `protocol-router.ts:82-97`), so this value is the budget for the *entire*
- * dial-retry loop, not per attempt. A fresh circuit-relay dial against a
- * NAT'd peer routinely takes 1-3s to establish; 5s leaves no headroom for
- * the back-off-and-retry path the loop is designed for, so the very first
- * approval-notification after a curator's `approve-join` would routinely
- * abort before libp2p got a chance to upgrade the relay connection. Two
- * laptops on home internet (PR #448) reproduced this consistently.
- *
- * 20s matches `DEFAULT_SEND_TIMEOUT_MS` and gives ProtocolRouter's loop room
- * for ~3 attempts of ~3-5s each before declaring the peer unreachable.
- *
- * The proper fix is per-attempt timeouts in ProtocolRouter (the shared signal
- * is a latent design issue) — tracked separately, not in scope here.
- */
-const JOIN_REQUEST_SEND_TIMEOUT_MS = 20_000;
-
-/**
- * Normalise an `did:dkg:agent:<id>` DID for case-insensitive equality
- * comparison. The agent ID can be either an Ethereum address (which IS
- * case-insensitive on the wire — checksum is purely advisory per
- * EIP-55) or a libp2p peer ID (which is NOT case-insensitive — base58
- * has uppercase characters that carry information). The previous
- * approach lower-cased the entire DID, which works in practice because
- * peer IDs round-trip the same way on both sides of a comparison, but
- * is semantically wrong: a non-EVM owner DID could in principle be
- * stored with one case and read back with another. Make the
- * normalisation explicit and only touch the EVM-address suffix.
- */
-function normalizeAgentDid(did: string): string {
-  const m = did.match(/^did:dkg:agent:(0x[0-9a-fA-F]{40})$/);
-  if (m) return `did:dkg:agent:${m[1].toLowerCase()}`;
-  return did;
-}
-
-/**
- * Scope string for join-request delegations. Authorises the named node
- * to sync the CG on the named DKG deployment.
- *
- * The `deploymentId` (e.g. `evm:84532:hub=0x...`) namespaces the scope
- * to a SPECIFIC deployment, not just a chain — every Hardhat instance
- * shares `evm:31337`, and a single chain can host multiple independent
- * DKG deployments with different Hub contracts. Without deployment-id
- * binding, a delegation signed against testnet's CG "X" could be
- * replayed against a devnet's CG "X" with the same delegatee
- * identifiers. See `ChainAdapter.deploymentId`.
- *
- * Fails closed if `deploymentId` is empty/undefined. `ChainAdapter` is
- * a TypeScript-only interface, so a JS / cast / custom adapter can omit
- * the field at runtime; without this guard we'd silently sign and
- * verify against `sync:deployment=undefined:<cgId>`, dropping the
- * cross-deployment replay protection this scope is meant to add.
- * PR #448 review (round 4): make misconfigured adapters fail loudly
- * instead of minting broad delegations.
- */
-function joinDelegationScope(deploymentId: string | undefined, contextGraphId: string): string {
-  if (!deploymentId || typeof deploymentId !== 'string' || deploymentId.trim().length === 0) {
-    throw new Error(
-      'Cannot derive join-delegation scope: chain adapter did not advertise a deploymentId. '
-      + 'Every adapter (EVM, mock, custom) must implement `get deploymentId(): string` so '
-      + 'delegations can\'t be cross-deployment replayed. Update the adapter or wrap it.',
-    );
-  }
-  return `sync:deployment=${deploymentId}:${contextGraphId}`;
-}
-
-/**
- * Wire-level sentinel returned by the sync responder when ACL authorization
- * fails for a request. Distinguishes an explicit denial from an empty page
- * (peer is up but has no data) and a transport error (peer unreachable).
- * Chosen to never collide with nquads output (nquads lines always contain
- * `<…>` tokens and end with `.`; this is a `#`-comment string).
- */
-const SYNC_ACCESS_DENIED_MARKER = '#DKG-SYNC-ACCESS-DENIED';
-
-const LOCAL_ACCESS_OPEN = 0;
-const LOCAL_ACCESS_CURATED = 1;
-const EVM_PUBLISH_CURATED = 0;
-const EVM_PUBLISH_OPEN = 1;
-const MAX_CONTEXT_GRAPH_PARTICIPANT_AGENTS = 256;
-
-/**
- * Thrown by `fetchSyncPages` when the remote responder returned
- * SYNC_ACCESS_DENIED_MARKER. Caught by `syncFromPeer` and surfaced as a
- * per-CG denial observation to the caller via its `onAccessDenied` hook,
- * so higher-level flows (catch-up job) can distinguish ACL denial from
- * transport errors without heuristics.
- */
-class SyncAccessDeniedError extends Error {
-  readonly contextGraphId: string;
-  constructor(contextGraphId: string) {
-    super(`Sync access denied for context graph "${contextGraphId}"`);
-    this.name = 'SyncAccessDeniedError';
-    this.contextGraphId = contextGraphId;
-  }
-}
-const META_REFRESH_COOLDOWN_MS = 30_000;
-const SYNC_MIN_GRAPH_BUDGET_MS = 10_000;
-const DEBUG_SYNC_PROGRESS = process.env.DKG_DEBUG_SYNC_PROGRESS === '1';
-const DEFAULT_SWM_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const SWM_CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // run cleanup every 15 minutes
-const SYNC_DENIED_RESPONSE = '__DKG_SYNC_DENIED__';
-/**
- * How long to wait between reconnect-on-gossip dial attempts for the same peer.
- * A CG with chatty gossip could otherwise produce a dial per message; this
- * throttles us to at most one attempted dial per peer per window.
- */
-const GOSSIP_DIAL_COOLDOWN_MS = 30_000;
-/** Per-dial-attempt timeout for reconnect-on-gossip so a stuck dial can't starve the gossip handler path. */
-const GOSSIP_DIAL_TIMEOUT_MS = 10_000;
-/**
- * Cooldown for catchup-on-connection:open: suppresses duplicate catchup kicks
- * when the same peer briefly has overlapping direct + relayed connections
- * (each of which fires its own connection:open).
- */
-const CATCHUP_ON_CONNECT_COOLDOWN_MS = 60_000;
-/**
- * Period of the sync reconciler tick. The reconciler is the safety net
- * for the event-driven `peer:update` retry path: if libp2p drops a
- * `peer:update` event (in-process race, version bug, listener thrown),
- * or if a peer's protocol list changes via a transport we don't get
- * notified about, the reconciler eventually re-probes and re-syncs.
- *
- * Worst-case sync staleness for a connected peer is ~ this interval.
- * 5 minutes balances "catch missed events quickly enough that RS
- * proofs don't drift" against "don't pin the event loop with chatty
- * sync probes". See the dkg-agent design notes around
- * `startSyncReconciler` for the trade-off.
- */
-const SYNC_RECONCILER_INTERVAL_MS = 5 * 60_000;
-/**
- * A peer is considered "stale" — eligible for a reconciler-driven sync
- * retry — if no successful sync has completed for it within this window.
- * Set higher than `SYNC_RECONCILER_INTERVAL_MS` so a single missed
- * tick doesn't immediately retry every connected peer; that gives
- * the event-driven path time to win the race in the common case.
- */
-const SYNC_STALENESS_THRESHOLD_MS = 10 * 60_000;
-const RANDOM_SAMPLING_BIND_RETRY_MS = 30_000;
-const STORAGE_ACK_REGISTRATION_RETRY_MS = 30_000;
-/**
- * Period of the join-approval retry tick. The retry queue (see
- * `packages/agent/src/join-approval-retry-queue.ts`) holds entries for
- * `join-approved` notifications that the curator wrote locally but couldn't
- * deliver over libp2p — usually because of a transient transport reset
- * (`Remote closed connection during opening`, NAT mapping flap, the
- * invitee's daemon restarting). Without retry the invitee gets stuck:
- * the local curator state is correct but the invitee never learns to
- * sync, and their own retries can't help because they don't yet hold the
- * delegation that would let private-sync auth succeed. The tick walks the
- * queue's `due()` entries with exponential backoff. Opportunistic retries
- * also fire from `connection:open` when the invitee's peer reconnects,
- * which usually wins the race; the timer is the safety net for cases
- * where reconnect events are missed (e.g. relayed reconnects that don't
- * surface a fresh `connection:open` on the curator).
- */
-const JOIN_APPROVAL_RETRY_TICK_MS = 30_000;
-
-/**
- * Tick interval for the chat outbox retry queue. Same 30s cadence as
- * the join-approval queue (`JOIN_APPROVAL_RETRY_TICK_MS`). The cadence
- * doesn't gate the FIRST retry — a backoff-due entry that's been
- * waiting since 5s after first failure may sit idle for up to 25s
- * before this tick picks it up — but the dominant retry trigger in
- * practice is the `connection:open` opportunistic flush
- * (`processMessageOutboxOnConnect`), which fires the moment the
- * recipient peer becomes reachable again. The tick is the safety net
- * for cases where reconnect events are missed (e.g. relayed reconnects
- * that don't surface a fresh `connection:open` on the sender) or
- * where the recipient was reachable all along but transport failures
- * are coming from somewhere upstream of libp2p.
- */
-const MESSAGE_OUTBOX_TICK_MS = 30_000;
-
-type RandomSamplingStartResult = 'started' | 'retryable' | 'disabled';
-type ACKSignerResolution = {
-  wallet: ethers.Wallet | null;
-  retryable: boolean;
+import {
+  PRIVATE_DATA_ANCHOR,
+  SYNC_PAGE_SIZE,
+  SYNC_PAGE_RETRY_ATTEMPTS,
+  SYNC_TOTAL_TIMEOUT_MS,
+  SYNC_PAGE_TIMEOUT_MS,
+  SYNC_ROUTER_ATTEMPTS,
+  SYNC_PROTOCOL_CHECK_ATTEMPTS,
+  SYNC_PROTOCOL_CHECK_DELAY_MS,
+  SYNC_AUTH_MAX_AGE_MS,
+  JOIN_DELEGATION_VALIDITY_MS,
+  JOIN_REQUEST_SEND_TIMEOUT_MS,
+  SYNC_ACCESS_DENIED_MARKER,
+  LOCAL_ACCESS_OPEN,
+  LOCAL_ACCESS_CURATED,
+  EVM_PUBLISH_CURATED,
+  EVM_PUBLISH_OPEN,
+  MAX_CONTEXT_GRAPH_PARTICIPANT_AGENTS,
+  META_REFRESH_COOLDOWN_MS,
+  SYNC_MIN_GRAPH_BUDGET_MS,
+  DEBUG_SYNC_PROGRESS,
+  DEFAULT_SWM_TTL_MS,
+  SWM_CLEANUP_INTERVAL_MS,
+  SYNC_DENIED_RESPONSE,
+  GOSSIP_DIAL_COOLDOWN_MS,
+  GOSSIP_DIAL_TIMEOUT_MS,
+  CATCHUP_ON_CONNECT_COOLDOWN_MS,
+  SYNC_RECONCILER_INTERVAL_MS,
+  SYNC_STALENESS_THRESHOLD_MS,
+  RANDOM_SAMPLING_BIND_RETRY_MS,
+  STORAGE_ACK_REGISTRATION_RETRY_MS,
+  JOIN_APPROVAL_RETRY_TICK_MS,
+  MESSAGE_OUTBOX_TICK_MS,
+} from './dkg-agent-constants.js';
+import {
+  ContextGraphNotFoundError,
+  InvalidContentError,
+  SyncAccessDeniedError,
+  type PreSignedAuthorAttestation,
+  type LocalSwmSenderKeySendState,
+  type LocalSwmSenderKeyReceiveState,
+  type RandomSamplingStartResult,
+  type ACKSignerResolution,
+  type SyncRequestEnvelope,
+  type CclPublishedResultEntry,
+  type CclPublishedEvaluationRecord,
+  type PublishOpts,
+  type PublishAsyncOpts,
+  type PublishAsyncQuadEnvelope,
+  type PublishAsyncContent,
+  type PeerHealth,
+  type PeerConnectionSnapshot,
+  type PeerDiagnostics,
+  type ChatSendResult,
+  type ContextGraphSub,
+  type ContextGraphSubscriptionRecord,
+  type ContextGraphSubscriptionStore,
+  type ContextGraphMemberPrincipalType,
+  type ContextGraphMemberStatus,
+  type ContextGraphMembershipRecord,
+  type ContextGraphMembershipStore,
+  type DurableSyncDiagnostics,
+  type SharedMemorySyncDiagnostics,
+  type CatchupSyncDiagnostics,
+  type DurableSyncResult,
+  type SharedMemorySyncResult,
+  type DKGAgentConfig,
+} from './dkg-agent-types.js';
+import {
+  normalizePublishContextGraphId,
+  isPublishAsyncQuadEnvelope,
+  assertQuadArray,
+  partitionPublishAsyncQuads,
+  signWithPrivateKey,
+  preSignedAttestationToLiftSeal,
+  normalizeAgentDid,
+  joinDelegationScope,
+  normalizeSyncPhase,
+  normalizeAdapterPublisherAddress,
+  recoverCompactSigner,
+  adapterOperationalPrivateKeyAddress,
+  adapterHasOperationalPrivateKey,
+  adapterGenericSignMessageMatchesAddress,
+  adapterAdvertisesPublisherSigner,
+  privateKeyAddress,
+  inferAdapterPublisherAddress,
+  defaultLargeLiteralStorage,
+  createPublicSnapshotStore,
+  applyDefaultLargeLiteralStorage,
+  isLocalOxigraphConfig,
+} from './dkg-agent-helpers.js';
+import {
+  swmSenderStateKey,
+  swmReceiverStateKey,
+  serializeSwmSenderSendState,
+  serializeSwmSenderReceiveState,
+  deserializeSwmSenderSendState,
+  deserializeSwmSenderReceiveState,
+} from './dkg-agent-swm-state.js';
+// Public surface re-exported so external consumers that import directly
+// from `./dkg-agent.js` keep working. The new file `dkg-agent-types.ts`
+// is the canonical home; `packages/agent/src/index.ts` re-exports from
+// there.
+export {
+  ContextGraphNotFoundError,
+  InvalidContentError,
 };
-
-interface SyncRequestEnvelope {
-  contextGraphId: string;
-  offset: number;
-  limit: number;
-  includeSharedMemory: boolean;
-  phase?: SyncPhase;
-  snapshotRef?: string;
-  targetPeerId?: string;
-  requesterPeerId?: string;
-  requestId?: string;
-  issuedAtMs?: number;
-  requesterIdentityId?: string;
-  requesterAgentAddress?: string;
-  requesterSignatureR?: string;
-  requesterSignatureVS?: string;
-}
-
-function normalizeSyncPhase(value: unknown): SyncPhase {
-  if (value === 'meta' || value === 'snapshot') return value;
-  return 'data';
-}
-
-/** Health status of a peer from the last ping round. */
-export interface PeerHealth {
-  peerId: string;
-  alive: boolean;
-  latencyMs: number | null;
-  lastSeen: number | null;
-  lastChecked: number;
-}
-
-/** Per-connection snapshot for diagnostics. */
-export interface PeerConnectionSnapshot {
-  direction: 'inbound' | 'outbound';
-  /** `'relayed'` when the remote multiaddr includes `/p2p-circuit`, else `'direct'`. */
-  transport: 'direct' | 'relayed';
-  /**
-   * The connection's remote multiaddr as a string, or `null` when
-   * libp2p didn't expose one. Preserving the `null` (rather than
-   * defaulting to `''`) keeps the legacy `/api/peer-info`
-   * `remoteAddrs` contract intact for callers that distinguish
-   * "address unavailable" from a real multiaddr — Codex review of
-   * PR #533 flagged the prior empty-string default as a silent
-   * response-shape change.
-   */
-  remoteAddr: string | null;
-  /**
-   * `true` when libp2p marks the connection as limited (circuit-relay v2
-   * data-limit + duration-limit semantics). Limited connections can be
-   * dialed via {@link CONNECTION_REUSE_PROTOCOLS} but are subject to the
-   * relay's per-connection caps; the Window D postmortem traced the
-   * "outbound failed while inbound from same peer was open" class to
-   * limited connections not being reused by `dialProtocol`.
-   */
-  limited: boolean;
-  /** Active stream count (multiplexer-level). */
-  streams: number;
-  /** UNIX-ms when the connection was opened, or `null` if libp2p didn't expose it. */
-  openedAt: number | null;
-}
-
-/**
- * Per-peer diagnostic snapshot. Surfaces the libp2p observability state
- * we need to triage the Window D class of asymmetric reachability bugs
- * documented in the Miles↔Lex 6h soak postmortem (May 16 2026), where an
- * inbound circuit-relay connection from peer P was open but
- * `dialProtocol(P, ...)` kept failing with "no valid addresses for peer"
- * for several minutes. The key field is `getConnectionsReturnsForPeer`,
- * which lets an operator (or a downstream test) detect at a glance when
- * libp2p's peerId-keyed lookup disagrees with a raw walk over all open
- * connections — the smoking gun for the "limited connection not
- * surfaced for outbound stream-open" behaviour.
- *
- * All fields are best-effort: any libp2p internal that throws or
- * returns an unexpected shape degrades to `null`/`[]` rather than
- * surfacing as a route 500. This route is most useful WHEN the network
- * is broken; it must not itself break.
- */
-export interface PeerDiagnostics {
-  peerId: string;
-  /** `true` when at least one open connection to this peer exists. */
-  connected: boolean;
-  /**
-   * Number of connections returned by walking every open libp2p
-   * connection and filtering by `remotePeer === peerId`. This is the
-   * legacy path used by `/api/peer-info` before this PR.
-   */
-  rawConnectionCount: number;
-  /**
-   * Number of connections returned by the peerId-keyed lookup
-   * `libp2p.getConnections(peerId)`. This is the path `PeerResolver`
-   * (see `packages/core/src/network/peer-resolver.ts`) uses to decide
-   * whether to short-circuit address resolution.
-   *
-   * When this value is LESS than `rawConnectionCount` for an otherwise
-   * open peer, libp2p's peerId-keyed lookup is filtering out connections
-   * the raw walk can see — the exact Window D signature. The operator
-   * can then file an upstream issue against js-libp2p with this number
-   * as repro evidence, and the local workaround in PR 5
-   * (`dialProtocol`-reuses-inbound-circuit) becomes the right next step.
-   */
-  getConnectionsReturnsForPeer: number;
-  connections: PeerConnectionSnapshot[];
-  /**
-   * Snapshot of what libp2p's local peerStore knows about this peer.
-   * `null` when the peer has no peerStore entry at all (cold cache) —
-   * a common precondition for the "no valid addresses for peer" dial
-   * failure that the soak postmortem identified.
-   */
-  peerStore: {
-    knownMultiaddrCount: number;
-    multiaddrs: string[];
-    protocols: string[];
-  } | null;
-  /** Pending chat-outbox entries for this peer (oldest-first). */
-  outbox: {
-    pendingCount: number;
-    oldestFirstFailureAt: number | null;
-    attempts: number[];
-  };
-  /** Latest ping-round health snapshot (`null` if never pinged). */
-  health: PeerHealth | null;
-  /** Protocols this peer's identify-handshake advertised. */
-  protocols: string[];
-  /** Convenience flag — peer speaks `/dkg/10.0.0/sync`. */
-  syncCapable: boolean;
-}
-
-/**
- * Caller-visible result of `DKGAgent.sendChat`. Backwards-compatible
- * extension of the original `{ delivered, error }` shape: existing
- * callers that only check `delivered` keep working, callers that want
- * to surface "queued for retry" (e.g. the MCP `dkg_send_message` tool)
- * can read `queued + attempts + nextAttemptAtMs`.
- */
-export interface ChatSendResult {
-  /** Whether the FIRST attempt's wire send + handler reply succeeded. */
-  delivered: boolean;
-  /** True iff `delivered=false` and the message was added to the outbox for retry. */
-  queued?: boolean;
-  /**
-   * Outbox key fragment for this send. Stable across retries so a
-   * caller can correlate the queued state with later delivery
-   * notifications. Currently a uuidv4 unless the caller passed
-   * `options.messageId`.
-   */
-  messageId?: string;
-  /** Number of failed attempts so far (1 on first failure). Only set when `queued=true`. */
-  attempts?: number;
-  /** Epoch-ms when the next retry is due. Only set when `queued=true`. */
-  nextAttemptAtMs?: number;
-  /** Last error string from the wire send. Set on `delivered=false`. */
-  error?: string;
-}
-
-/** Tracks the subscription and sync state of a context graph. */
-export interface ContextGraphSub {
-  name?: string;
-  /** GossipSub topics are active for this context graph. */
-  subscribed: boolean;
-  /** Definition triples exist in the local triple store. */
-  synced: boolean;
-  /** Shared-memory catch-up has completed at least once for this subscription. */
-  sharedMemorySynced?: boolean;
-  /**
-   * Whether the `_meta` graph (allowlist, registration status) has been
-   * fetched via authenticated sync or is known from local creation.
-   * When false, the gossip handler denies writes to prevent unauthorized
-   * access during the window before _meta arrives.
-   */
-  metaSynced?: boolean;
-  /** On-chain context graph ID (keccak256 hash), if known. */
-  onChainId?: string;
-  /** Local participant identities used for private SWM authorization before anchoring. */
-  participantIdentityIds?: bigint[];
-  /** Participant agent addresses (V10 agent identity model). */
-  participantAgents?: string[];
-  /**
-   * Set to true between receiving a curator `join-approved` notification
-   * and the first successful meta sync for this CG. Lets `listContextGraphs`
-   * surface freshly-joined curated CGs in the UI's "waiting for sync" state
-   * before `_meta` triples arrive — without this flag, a curated CG with
-   * no `onChainId` and no local content yet is filtered out as a "phantom"
-   * subscription and the project entry doesn't appear in the sidebar until
-   * the periodic catchup reconciler eventually pulls meta (~2 min worst
-   * case). In-memory only; not persisted because the periodic reconciler
-   * always recovers post-restart by populating `metaSynced` directly.
-   */
-  pendingMeta?: boolean;
-}
-
-export interface ContextGraphSubscriptionRecord {
-  id: string;
-  name?: string;
-  subscribed: boolean;
-  synced: boolean;
-  sharedMemorySynced?: boolean;
-  metaSynced?: boolean;
-  onChainId?: string;
-  syncScoped: boolean;
-}
-
-export interface ContextGraphSubscriptionStore {
-  loadAll(): Promise<ContextGraphSubscriptionRecord[]>;
-  save(record: ContextGraphSubscriptionRecord): Promise<void>;
-  delete(contextGraphId: string): Promise<void>;
-}
-
-export type ContextGraphMemberPrincipalType = 'node' | 'agent' | 'identity';
-export type ContextGraphMemberStatus = 'active' | 'removed' | 'pending';
-
-export interface ContextGraphMembershipRecord {
-  contextGraphId: string;
-  principalType: ContextGraphMemberPrincipalType;
-  principalId: string;
-  role?: string;
-  status: ContextGraphMemberStatus;
-  source?: string;
-  displayName?: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface ContextGraphMembershipStore {
-  upsert(record: ContextGraphMembershipRecord & { firstSeenAt?: number; updatedAt: number }): Promise<void>;
-  delete(contextGraphId: string, principalType: ContextGraphMemberPrincipalType, principalId: string): Promise<void>;
-}
-
-export interface DurableSyncDiagnostics {
-  fetchedMetaTriples: number;
-  fetchedDataTriples: number;
-  insertedMetaTriples: number;
-  insertedDataTriples: number;
-  bytesReceived: number;
-  resumedPhases: number;
-  emptyResponses: number;
-  metaOnlyResponses: number;
-  dataRejectedMissingMeta: number;
-  rejectedKcs: number;
-  failedPeers: number;
-}
-
-export interface SharedMemorySyncDiagnostics {
-  fetchedMetaTriples: number;
-  fetchedDataTriples: number;
-  insertedMetaTriples: number;
-  insertedDataTriples: number;
-  bytesReceived: number;
-  resumedPhases: number;
-  emptyResponses: number;
-  droppedDataTriples: number;
-  failedPeers: number;
-}
-
-export interface CatchupSyncDiagnostics {
-  noProtocolPeers: number;
-  durable: DurableSyncDiagnostics;
-  sharedMemory: SharedMemorySyncDiagnostics;
-}
-
-interface DurableSyncResult extends DurableSyncDiagnostics {
-  insertedTriples: number;
-  deniedPhases: number;
-}
-
-interface SharedMemorySyncResult extends SharedMemorySyncDiagnostics {
-  insertedTriples: number;
-  deniedPhases: number;
-}
-
-export interface DKGAgentConfig {
-  name: string;
-  framework?: string;
-  description?: string;
-  listenPort?: number;
-  /** IP address to listen on. Default: '0.0.0.0' (all interfaces). Use '127.0.0.1' for tests. */
-  listenHost?: string;
-  bootstrapPeers?: string[];
-  /** Multiaddrs of relay nodes for NAT traversal. */
-  relayPeers?: string[];
-  /** Multiaddrs to announce to the network (for VPS/cloud nodes with a public IP not on the interface). */
-  announceAddresses?: string[];
-  skills?: Array<{
-    skillType: string;
-    pricePerCall?: number;
-    currency?: string;
-    handler: SkillHandler;
-  }>;
-  dataDir?: string;
-  store?: TripleStore;
-  /** Triple store backend configuration (e.g. oxigraph-worker, blazegraph). If omitted, defaults to oxigraph-worker when dataDir is set. */
-  storeConfig?: TripleStoreConfig;
-  /** Out-of-line storage for large public SWM RDF literal object terms. Defaults on for local Oxigraph-backed dataDir stores. */
-  largeLiteralStorage?: LargeLiteralStorageConfig;
-  /** Out-of-Oxigraph immutable public SWM operation snapshots. Defaults on when dataDir is set. */
-  sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
-  /** When false, peer-connect sync skips SWM catch-up and relies on gossip for new SWM writes. */
-  syncSharedMemoryOnConnect?: boolean;
-  /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
-  nodeRole?: 'core' | 'edge';
-  /**
-   * Core Node relay-server capacity tuning. Forwarded straight into
-   * `DKGNodeConfig.relayServerCapacity` — sets the maximum number of
-   * simultaneous circuit-relay v2 reservations this node will hold.
-   * HOP/STOP stream caps and `connectionManager.maxConnections` are
-   * derived at a 1:2 ratio. Default 1024 when omitted on a Core Node;
-   * ignored on edge nodes (with a startup warning). Invalid values
-   * fall back to the default. See `packages/core/src/types.ts` for
-   * the full rationale + ulimit -n requirements.
-   */
-  relayServerCapacity?: number;
-  /**
-   * Number of relay reservations to hold in parallel when behind NAT.
-   * Forwarded straight into `DKGNodeConfig.relayReservationCount`.
-   * Default 3 when relayPeers are configured (N-2 tolerance to relay
-   * blackouts). Capped at 16. Ignored (with a warning when set
-   * explicitly) when no relayPeers are configured or when the node
-   * itself runs a relay server — relay servers don't multi-reserve
-   * through other relays. Invalid values fall back to the default
-   * with a warning. See `packages/core/src/types.ts` for the full
-   * rationale.
-   */
-  relayReservationCount?: number;
-  /**
-   * Path to the V10 Random Sampling prover write-ahead log. Core
-   * nodes only; ignored on edge. When omitted, an in-memory WAL is
-   * used (loses crash-recovery context on restart). Production
-   * deployments SHOULD set this to a persistent path under `dataDir`.
-   */
-  randomSamplingWalPath?: string;
-  /**
-   * If true (default on core), run the V10 Merkle proof build on a
-   * `worker_threads` worker so a 100k-leaf KC does not block the
-   * agent's event loop. Set false to keep the build on the main
-   * thread (test ergonomics, deterministic profiling).
-   */
-  randomSamplingUseWorkerThread?: boolean;
-  /**
-   * Tick cadence for the prover loop (ms). Default 30s. The
-   * orchestrator is idempotent under double-ticks; a tighter cadence
-   * is safe but yields more chain reads.
-   */
-  randomSamplingTickIntervalMs?: number;
-  /** Pre-built chain adapter (for testing). If provided, chainConfig is ignored. */
-  chainAdapter?: ChainAdapter;
-  /** Private key for the V10 ACK signer. When omitted, falls back to chainConfig.operationalKeys[0]. */
-  ackSignerKey?: string;
-  /**
-   * Publisher EVM address used when publish signing is delegated to the
-   * ChainAdapter instead of an in-process publisherPrivateKey.
-   */
-  publisherAddress?: string;
-  /**
-   * EVM chain configuration. If omitted, publishing won't have on-chain finality.
-   * `adminPrivateKey` is the private key for the profile admin wallet used
-   * only for profile/key-management transactions. Nodes may omit it when they
-   * already have an on-chain identity and do not need profile creation/key-repair
-   * privileges; profile mutation paths will fail fast if admin authority is
-   * required but unavailable.
-   * `operationalKeys` are the private keys for operational wallets.
-   * The first key is the primary signer (identity, staking); all are used
-   * round-robin for publish TXs to avoid nonce collisions on parallel publishes.
-   */
-  chainConfig?: {
-    rpcUrl: string;
-    hubAddress: string;
-    adminPrivateKey?: string;
-    operationalKeys: string[];
-    chainId?: string;
-  };
-  /** Cross-agent query access configuration. */
-  queryAccess?: QueryAccessConfig;
-  /** Additional context graph IDs to sync on peer connect (beyond system context graphs). */
-  syncContextGraphs?: string[];
-  /** TTL for shared memory data in milliseconds. Expired operations are periodically cleaned up. Default: 48 hours. Set to 0 to disable. */
-  sharedMemoryTtlMs?: number;
-  /** Durable local store for subscribed context-graph runtime state. */
-  contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;
-  /** Durable local cache for nodes/agents known to be members of a context graph. */
-  contextGraphMembershipStore?: ContextGraphMembershipStore;
-}
-
-function normalizeAdapterPublisherAddress(value: unknown): string | undefined {
-  if (typeof value !== 'string' || !ethers.isAddress(value)) return undefined;
-  const address = ethers.getAddress(value);
-  return address === ethers.ZeroAddress ? undefined : address;
-}
-
-function recoverCompactSigner(message: Uint8Array, compact: { r: Uint8Array; vs: Uint8Array }): string {
-  const signature = ethers.Signature.from({
-    r: ethers.hexlify(compact.r),
-    yParityAndS: ethers.hexlify(compact.vs),
-  }).serialized;
-  return ethers.verifyMessage(message, signature);
-}
-
-function adapterOperationalPrivateKeyAddress(chain: ChainAdapter): string | undefined {
-  const operationalKeyGetter = (chain as unknown as { getOperationalPrivateKey?: () => unknown })
-    .getOperationalPrivateKey;
-  if (typeof operationalKeyGetter !== 'function') return undefined;
-  try {
-    const privateKey = operationalKeyGetter.call(chain);
-    return typeof privateKey === 'string' && privateKey.length > 0
-      ? privateKeyAddress(privateKey)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function adapterHasOperationalPrivateKey(chain: ChainAdapter): boolean {
-  return adapterOperationalPrivateKeyAddress(chain) !== undefined;
-}
-
-async function adapterGenericSignMessageMatchesAddress(
-  chain: ChainAdapter,
-  expectedAddress: string,
-): Promise<boolean> {
-  if (chain.chainId === 'none' || typeof chain.signMessage !== 'function') return false;
-  const normalized = normalizeAdapterPublisherAddress(expectedAddress);
-  if (!normalized) return false;
-
-  try {
-    const challenge = ethers.getBytes(ethers.id(`dkg-agent:chain-signer-probe:${normalized.toLowerCase()}`));
-    const compact = await chain.signMessage(challenge);
-    const recovered = normalizeAdapterPublisherAddress(recoverCompactSigner(challenge, compact));
-    return recovered?.toLowerCase() === normalized.toLowerCase();
-  } catch {
-    return false;
-  }
-}
-
-async function adapterAdvertisesPublisherSigner(chain: ChainAdapter): Promise<boolean> {
-  const hasReservingOrMultiAddressProbe = typeof chain.getAuthorizedPublisherAddress === 'function' ||
-    typeof (chain as unknown as { getSignerAddresses?: unknown }).getSignerAddresses === 'function';
-  const hasSingleAddressProbe = typeof (chain as unknown as { getSignerAddress?: unknown }).getSignerAddress === 'function' ||
-    Boolean(normalizeAdapterPublisherAddress((chain as unknown as { signerAddress?: unknown }).signerAddress));
-  const hasAnyAddressProbe = hasReservingOrMultiAddressProbe || hasSingleAddressProbe;
-
-  if (typeof chain.signMessageAs === 'function') return hasAnyAddressProbe;
-  if (adapterHasOperationalPrivateKey(chain)) return true;
-  if (typeof chain.signMessage !== 'function') return false;
-
-  const advertisedAddress = await inferAdapterPublisherAddress(chain, undefined, {
-    includeReservingPublisherProbe: false,
-    includeGenericSignMessageProbe: false,
-  });
-  if (!advertisedAddress) return false;
-  return adapterGenericSignMessageMatchesAddress(chain, advertisedAddress);
-}
-
-function privateKeyAddress(privateKey: string | undefined): string | undefined {
-  if (!privateKey) return undefined;
-  try {
-    return normalizeAdapterPublisherAddress(new ethers.Wallet(privateKey).address);
-  } catch {
-    return undefined;
-  }
-}
-
-async function inferAdapterPublisherAddress(
-  chain: ChainAdapter,
-  contextGraphId?: bigint,
-  options?: {
-    includeReservingPublisherProbe?: boolean;
-    includeGenericSignMessageProbe?: boolean;
-  },
-): Promise<string | undefined> {
-  if (
-    options?.includeReservingPublisherProbe !== false &&
-    contextGraphId !== undefined &&
-    typeof chain.getAuthorizedPublisherAddress === 'function'
-  ) {
-    try {
-      const address = normalizeAdapterPublisherAddress(
-        await chain.getAuthorizedPublisherAddress(contextGraphId),
-      );
-      if (address) return address;
-    } catch {
-      // Best-effort probe; the publisher resolver retries on later publish/update attempts.
-    }
-  }
-
-  const signerAddressGetter = (chain as unknown as { getSignerAddress?: () => unknown }).getSignerAddress;
-  if (typeof signerAddressGetter === 'function') {
-    try {
-      const address = normalizeAdapterPublisherAddress(
-        await Promise.resolve(signerAddressGetter.call(chain)),
-      );
-      if (address) return address;
-    } catch {
-      // Best-effort probe; fall through to broader adapter surfaces.
-    }
-  }
-
-  const signerAddresses = (chain as unknown as { getSignerAddresses?: () => unknown }).getSignerAddresses;
-  if (typeof signerAddresses === 'function') {
-    try {
-      const advertised = await Promise.resolve(signerAddresses.call(chain));
-      if (Array.isArray(advertised)) {
-        for (const value of advertised) {
-          const address = normalizeAdapterPublisherAddress(value);
-          if (address) return address;
-        }
-      }
-    } catch {
-      // Best-effort probe; the publisher resolver retries on later publish/update attempts.
-    }
-  }
-
-  const signerAddress = normalizeAdapterPublisherAddress(
-    (chain as unknown as { signerAddress?: unknown }).signerAddress,
-  );
-  if (signerAddress) return signerAddress;
-
-  const adapterOperationalAddress = adapterOperationalPrivateKeyAddress(chain);
-  if (adapterOperationalAddress) return adapterOperationalAddress;
-
-  if (options?.includeGenericSignMessageProbe === false) return undefined;
-  if (chain.chainId === 'none' || typeof chain.signMessage !== 'function') return undefined;
-
-  try {
-    const challenge = ethers.getBytes(ethers.id('dkg-agent:publisher-address-probe'));
-    const compact = await chain.signMessage(challenge);
-    return normalizeAdapterPublisherAddress(recoverCompactSigner(challenge, compact));
-  } catch {
-    return undefined;
-  }
-}
-
-function defaultLargeLiteralStorage(
-  dataDir: string,
-  config: LargeLiteralStorageConfig | undefined,
-): LargeLiteralStorageConfig {
-  return {
-    enabled: config?.enabled ?? true,
-    thresholdBytes: config?.thresholdBytes,
-    directory: config?.directory ?? join(dataDir, 'literal-blobs'),
-  };
-}
-
-function createPublicSnapshotStore(
-  dataDir: string | undefined,
-  config: SharedMemoryPublicSnapshotStorageConfig | undefined,
-): WorkspacePublicSnapshotStore | undefined {
-  if (!dataDir || config?.enabled === false) return undefined;
-  return new FileWorkspacePublicSnapshotStore(config?.directory ?? join(dataDir, 'swm-public-snapshots'));
-}
-
-function applyDefaultLargeLiteralStorage(
-  storeConfig: TripleStoreConfig,
-  dataDir: string | undefined,
-  config: LargeLiteralStorageConfig | undefined,
-): TripleStoreConfig {
-  if (storeConfig.largeLiteralStorage || !dataDir || !isLocalOxigraphConfig(storeConfig)) {
-    return storeConfig;
-  }
-
-  return {
-    ...storeConfig,
-    largeLiteralStorage: defaultLargeLiteralStorage(dataDir, config),
-  };
-}
-
-function isLocalOxigraphConfig(storeConfig: TripleStoreConfig): boolean {
-  return storeConfig.backend === 'oxigraph'
-    || storeConfig.backend === 'oxigraph-worker'
-    || storeConfig.backend === 'oxigraph-persistent';
-}
+export type {
+  CclPublishedResultEntry,
+  CclPublishedEvaluationRecord,
+  PublishOpts,
+  PublishAsyncOpts,
+  PublishAsyncQuadEnvelope,
+  PublishAsyncContent,
+  PeerHealth,
+  PeerConnectionSnapshot,
+  PeerDiagnostics,
+  ChatSendResult,
+  ContextGraphSub,
+  ContextGraphSubscriptionRecord,
+  ContextGraphSubscriptionStore,
+  ContextGraphMemberPrincipalType,
+  ContextGraphMemberStatus,
+  ContextGraphMembershipRecord,
+  ContextGraphMembershipStore,
+  DurableSyncDiagnostics,
+  SharedMemorySyncDiagnostics,
+  CatchupSyncDiagnostics,
+  DKGAgentConfig,
+};
 
 /**
  * High-level facade that ties together all DKG agent capabilities:
@@ -14349,105 +13483,3 @@ export class DKGAgent {
 
 }
 
-function swmSenderStateKey(contextGraphId: string, subGraphName: string | undefined, senderAgentAddress: string): string {
-  return `${contextGraphId}\0${subGraphName ?? ''}\0${senderAgentAddress.toLowerCase()}`;
-}
-
-function swmReceiverStateKey(
-  contextGraphId: string,
-  subGraphName: string | undefined,
-  senderAgentAddress: string,
-  epochId: string,
-): string {
-  return `${swmSenderStateKey(contextGraphId, subGraphName, senderAgentAddress)}\0${epochId}`;
-}
-
-function serializeSwmSenderSendState(state: LocalSwmSenderKeySendState): Record<string, unknown> {
-  return {
-    contextGraphId: state.contextGraphId,
-    subGraphName: state.subGraphName,
-    senderAgentAddress: state.senderAgentAddress,
-    epochId: state.epochId,
-    membershipHash: state.membershipHash,
-    chainKey: encodeWorkspaceEncryptionKey(state.chainKey),
-    nextMessageIndex: state.nextMessageIndex,
-    senderSigningSecretKey: encodeWorkspaceEncryptionKey(state.senderSigningSecretKey),
-    senderSigningPublicKey: encodeWorkspaceEncryptionKey(state.senderSigningPublicKey),
-    createdAtMs: state.createdAtMs,
-  };
-}
-
-function serializeSwmSenderReceiveState(state: LocalSwmSenderKeyReceiveState): Record<string, unknown> {
-  return {
-    contextGraphId: state.contextGraphId,
-    subGraphName: state.subGraphName,
-    senderAgentAddress: state.senderAgentAddress,
-    epochId: state.epochId,
-    membershipHash: state.membershipHash,
-    chainKey: encodeWorkspaceEncryptionKey(state.chainKey),
-    nextMessageIndex: state.nextMessageIndex,
-    senderSigningPublicKey: encodeWorkspaceEncryptionKey(state.senderSigningPublicKey),
-    createdAtMs: state.createdAtMs,
-    skippedChainKeys: [...state.skippedChainKeys.entries()].map(([index, chainKey]) => ({
-      index,
-      chainKey: encodeWorkspaceEncryptionKey(chainKey),
-    })),
-  };
-}
-
-function deserializeSwmSenderSendState(entry: Record<string, unknown>): LocalSwmSenderKeySendState {
-  return {
-    contextGraphId: requiredString(entry.contextGraphId, 'contextGraphId'),
-    subGraphName: optionalString(entry.subGraphName),
-    senderAgentAddress: ethers.getAddress(requiredString(entry.senderAgentAddress, 'senderAgentAddress')),
-    epochId: requiredString(entry.epochId, 'epochId'),
-    membershipHash: requiredString(entry.membershipHash, 'membershipHash'),
-    chainKey: decodeWorkspaceEncryptionKey(requiredString(entry.chainKey, 'chainKey')),
-    nextMessageIndex: requiredNumber(entry.nextMessageIndex, 'nextMessageIndex'),
-    senderSigningSecretKey: decodeWorkspaceEncryptionKey(requiredString(entry.senderSigningSecretKey, 'senderSigningSecretKey')),
-    senderSigningPublicKey: decodeWorkspaceEncryptionKey(requiredString(entry.senderSigningPublicKey, 'senderSigningPublicKey')),
-    createdAtMs: requiredNumber(entry.createdAtMs, 'createdAtMs'),
-  };
-}
-
-function deserializeSwmSenderReceiveState(entry: Record<string, unknown>): LocalSwmSenderKeyReceiveState {
-  const skippedChainKeys = new Map<number, Uint8Array>();
-  const skipped = Array.isArray(entry.skippedChainKeys) ? entry.skippedChainKeys : [];
-  for (const raw of skipped) {
-    const item = raw as Record<string, unknown>;
-    skippedChainKeys.set(
-      requiredNumber(item.index, 'skippedChainKeys.index'),
-      decodeWorkspaceEncryptionKey(requiredString(item.chainKey, 'skippedChainKeys.chainKey')),
-    );
-  }
-  return {
-    contextGraphId: requiredString(entry.contextGraphId, 'contextGraphId'),
-    subGraphName: optionalString(entry.subGraphName),
-    senderAgentAddress: ethers.getAddress(requiredString(entry.senderAgentAddress, 'senderAgentAddress')),
-    epochId: requiredString(entry.epochId, 'epochId'),
-    membershipHash: requiredString(entry.membershipHash, 'membershipHash'),
-    chainKey: decodeWorkspaceEncryptionKey(requiredString(entry.chainKey, 'chainKey')),
-    nextMessageIndex: requiredNumber(entry.nextMessageIndex, 'nextMessageIndex'),
-    senderSigningPublicKey: decodeWorkspaceEncryptionKey(requiredString(entry.senderSigningPublicKey, 'senderSigningPublicKey')),
-    createdAtMs: requiredNumber(entry.createdAtMs, 'createdAtMs'),
-    skippedChainKeys,
-  };
-}
-
-function requiredString(value: unknown, name: string): string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new Error(`Invalid Sender Key state: ${name} is required`);
-  }
-  return value;
-}
-
-function optionalString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
-}
-
-function requiredNumber(value: unknown, name: string): number {
-  if (!Number.isSafeInteger(value) || (value as number) < 0) {
-    throw new Error(`Invalid Sender Key state: ${name} must be a non-negative safe integer`);
-  }
-  return value as number;
-}

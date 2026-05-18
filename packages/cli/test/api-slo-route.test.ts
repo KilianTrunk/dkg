@@ -201,6 +201,83 @@ describe('/api/slo wire format (rc.9 PR-A / Codex PR #570 R10)', () => {
     });
   });
 
+  /**
+   * rc.9 PR-D wire-format regression: when the agent exposes
+   * `getSwmAckQuorumStats()`, /api/slo MUST surface it under
+   * `swm.shareAckQuorum`. Mirrors the PR-C pattern so test doubles
+   * can opt-out and production agents always supply it.
+   */
+  it('shareAckQuorum — when provided, nested under swm with all five counters', async () => {
+    const agent: FakeAgent = {
+      getMessengerSloStats: () => ({}),
+      getSwmGossipStats: () => ({
+        publishFailures: {},
+        publishFailuresOverflow: 0,
+        publishFailuresTruncated: false,
+      }),
+      getSwmHandlerStats: () => ({
+        redundantApplies: {},
+        redundantAppliesLowerBound: false,
+        redundantAppliesOverflow: 0,
+        redundantAppliesTruncated: false,
+      }),
+      getSwmAckQuorumStats: () => ({
+        tracked: 1024,
+        completed: 998,
+        watchdogFired: 21,
+        deadlineExpired: 5,
+        pending: 7,
+      }),
+    };
+    ({ server, port } = await startSloServer(agent));
+
+    const { status, body } = await get(port, '/api/slo');
+    expect(status).toBe(200);
+    expect(body).toEqual({
+      protocols: {},
+      gossip: {
+        publishFailures: {},
+        publishFailuresOverflow: 0,
+        publishFailuresTruncated: false,
+      },
+      swm: {
+        redundantApplies: {},
+        redundantAppliesLowerBound: false,
+        redundantAppliesOverflow: 0,
+        redundantAppliesTruncated: false,
+        shareAckQuorum: {
+          tracked: 1024,
+          completed: 998,
+          watchdogFired: 21,
+          deadlineExpired: 5,
+          pending: 7,
+        },
+      },
+    });
+  });
+
+  it('shareAckQuorum — absent when the agent omits getSwmAckQuorumStats (back-compat with pre-PR-D doubles)', async () => {
+    const agent: FakeAgent = {
+      getMessengerSloStats: () => ({}),
+      getSwmGossipStats: () => ({
+        publishFailures: {},
+        publishFailuresOverflow: 0,
+        publishFailuresTruncated: false,
+      }),
+      getSwmHandlerStats: () => ({
+        redundantApplies: {},
+        redundantAppliesLowerBound: false,
+        redundantAppliesOverflow: 0,
+        redundantAppliesTruncated: false,
+      }),
+    };
+    ({ server, port } = await startSloServer(agent));
+
+    const { status, body } = await get(port, '/api/slo');
+    expect(status).toBe(200);
+    expect((body as { swm: Record<string, unknown> }).swm.shareAckQuorum).toBeUndefined();
+  });
+
   it('substrateFanout — absent when the agent omits getSwmSubstrateFanoutStats (back-compat with PR-A-only doubles)', async () => {
     const agent: FakeAgent = {
       getMessengerSloStats: () => ({}),

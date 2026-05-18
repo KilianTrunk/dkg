@@ -992,6 +992,18 @@ export function buildSloPayload(agent: {
     overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
     truncated: boolean;
   };
+  /**
+   * rc.9 PR-D addition. Optional for the same reason
+   * getSwmSubstrateFanoutStats is — test doubles don't need to
+   * stub a tracker they aren't exercising.
+   */
+  getSwmAckQuorumStats?: () => {
+    tracked: number;
+    completed: number;
+    watchdogFired: number;
+    deadlineExpired: number;
+    pending: number;
+  };
 }): {
   protocols: Record<string, unknown>;
   gossip: {
@@ -1018,16 +1030,30 @@ export function buildSloPayload(agent: {
       overflow: { delivered: number; rejected: number; queued: number; inFlight: number; failed: number };
       truncated: boolean;
     };
+    /**
+     * rc.9 PR-D: ack-quorum overlay counters. Same opt-out
+     * mechanic as `substrateFanout` — present iff the agent
+     * exposes `getSwmAckQuorumStats()`.
+     */
+    shareAckQuorum?: {
+      tracked: number;
+      completed: number;
+      watchdogFired: number;
+      deadlineExpired: number;
+      pending: number;
+    };
   };
 } {
   const swmHandler = agent.getSwmHandlerStats();
   const substrateFanout = agent.getSwmSubstrateFanoutStats?.();
+  const shareAckQuorum = agent.getSwmAckQuorumStats?.();
   return {
     protocols: agent.getMessengerSloStats(),
     gossip: agent.getSwmGossipStats(),
     swm: {
       ...swmHandler,
       ...(substrateFanout !== undefined ? { substrateFanout } : {}),
+      ...(shareAckQuorum !== undefined ? { shareAckQuorum } : {}),
     },
   };
 }

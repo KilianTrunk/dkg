@@ -75,12 +75,43 @@ export type WorkspaceSenderKeyDecryptor = (
  *     converged would likely succeed; the substrate caller
  *     SHOULD keep the share queued so it gets re-attempted.
  *
- * Gossip callers ignore the outcome — gossip is best-effort and
- * its only "retry" is sync-on-reconnect, which doesn't consult
- * this signal. The new substrate fan-out receiver consumes it.
+ * Gossip callers consume the `applied: true` variant — rc.9 PR-D
+ * (SWM ack-quorum overlay) reads `cgId`, `shareOperationId` and
+ * `publisherPeerId` to address the `PROTOCOL_SWM_SHARE_ACK`
+ * message back to the original publisher. Substrate callers
+ * consume `applied + retryable` to decide whether to ACK / throw /
+ * return the rejection sentinel. The substrate path DOES NOT
+ * emit a PROTOCOL_SWM_SHARE_ACK — the substrate response is
+ * itself the ack signal at the substrate layer; the metadata
+ * fields are populated regardless so a future receiver
+ * (e.g. a sync-emitted apply) could choose its own ack policy.
+ *
+ * The metadata fields are optional because two early-return paths
+ * (missing contextGraphId / pre-decode of the publish request)
+ * applied successfully in a prior shape can't surface them
+ * reliably; if a caller can't extract them from the outcome it
+ * MUST fall back to NOT emitting an ack (silent best-effort, same
+ * as pre-PR-D gossip behaviour).
  */
 export type SharedMemoryApplyOutcome =
-  | { applied: true }
+  | {
+      applied: true;
+      /** Context graph the share applied into. Set on the apply path. */
+      cgId?: string;
+      /**
+       * Publisher-minted unique ID for the original share. Same
+       * value the sender keyed its `SwmAckQuorum` record on.
+       * Optional only because legacy callers shouldn't be forced
+       * to consume it; the apply path always sets it when known.
+       */
+      shareOperationId?: string;
+      /**
+       * libp2p peerId of the publisher (`request.publisherPeerId`,
+       * which the apply path enforces equals `fromPeerId`).
+       * Caller addresses the PROTOCOL_SWM_SHARE_ACK to this peer.
+       */
+      publisherPeerId?: string;
+    }
   | { applied: false; reason: string; retryable: boolean };
 
 /**
@@ -956,7 +987,12 @@ export class SharedMemoryHandler {
           source: 'gossip',
           counts: { triples: quads.length },
         });
-        return { applied: true };
+        return {
+          applied: true,
+          cgId: contextGraphId,
+          shareOperationId,
+          publisherPeerId,
+        };
       }
       // `applied === false` from the withWriteLocks closure. PR-C
       // codex R4: validation rejection is deterministic (retry

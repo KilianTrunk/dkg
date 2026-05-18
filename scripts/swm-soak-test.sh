@@ -235,6 +235,27 @@ if [ -z "$SENDER_TAG" ]; then
   exit 64
 fi
 
+# Codex PR #572 R15 (round 5): SENDER_TAG is interpolated into
+#   urn:swm-soak:${SENDER_TAG}:<seq>      (subject URI)
+#   urn:swm-soak-summary:${SENDER_TAG}:<COHORT>
+# and later parsed with `^urn:swm-soak:([^:]+):(\d+)$`. A tag
+# containing a literal `:` would split the subject into the wrong
+# components and the parser regex would silently drop those rows;
+# whitespace would corrupt SPARQL/JSON payload escaping; non-ASCII
+# would produce invalid IRIs that the daemon may accept or reject
+# depending on backend. Constrain to a portable identifier shape
+# now rather than spend hours debugging missing peers in the
+# tally after the fact.
+if ! printf '%s' "$SENDER_TAG" | grep -Eq '^[A-Za-z0-9_-]{1,32}$'; then
+  echo "ERROR: SENDER_TAG must match ^[A-Za-z0-9_-]{1,32}$ (got: '${SENDER_TAG}')." >&2
+  echo "       The tag is interpolated into subject URIs of the form" >&2
+  echo "         urn:swm-soak:<TAG>:<seq>" >&2
+  echo "       and parsed with that exact regex on the receiver side. Colons," >&2
+  echo "       whitespace, non-ASCII, or empty strings will either produce" >&2
+  echo "       invalid RDF or be silently excluded from the delivery counts." >&2
+  exit 64
+fi
+
 # Codex PR #572 R5: each soak run emits a per-peer RUN_ID so future
 # forensic tooling can attribute writes to a specific invocation
 # even when SENDER_TAG is reused across runs.
@@ -560,10 +581,34 @@ except Exception as e:
 # so the per-cycle regex in the final-summary parser doesn't pick
 # up the summary subject.
 emit_writes_accepted_summary() {
+  # Codex PR #572 R13 (round 5): count accepted writes scoped to
+  # the *current* cgId. Pre-fix the grep was unfiltered, so a soak
+  # against N>1 context graphs emitted the same global aggregate
+  # writesAccepted=count value into every CG's tombstone. The
+  # receiver then divided per-CG observations by the aggregate
+  # cross-CG count, producing per-CG percentages of ~100/N% even
+  # under perfect delivery.
   local cgId=$1 ts subject writes_accepted body resp ok
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   subject="urn:swm-soak-summary:${SENDER_TAG}:${SOAK_COHORT_ID}"
-  writes_accepted=$(grep -c '"shareOperationId"' "$LOG_DIR/writes.jsonl" 2>/dev/null || echo 0)
+  writes_accepted=$(python3 -c "
+import json, sys
+n = 0
+try:
+  with open('$LOG_DIR/writes.jsonl') as f:
+    for line in f:
+      try:
+        r = json.loads(line)
+      except Exception:
+        continue
+      if r.get('cgId') != '$cgId': continue
+      resp = r.get('resp')
+      if isinstance(resp, dict) and resp.get('shareOperationId'):
+        n += 1
+except FileNotFoundError:
+  pass
+print(n)
+" 2>/dev/null)
   body=$(python3 -c "
 import json
 print(json.dumps({
@@ -738,11 +783,19 @@ log "  writes accepted by local daemon: $writes_ok"
 log ""
 log "Per-CG final inbox (delivery validation — operators cross-reference):"
 log ""
+ALL_CGS_CSV=$(IFS=','; printf '%s' "${ALL_CGS[*]}")
 python3 <<PYTHON | tee -a "$LOG_DIR/main.log"
 import json, os, re
 log_dir = "$LOG_DIR"
 self_tag = "$SENDER_TAG"
 peers_expected = [p.strip() for p in "$PEERS_EXPECTED".split(',') if p.strip()]
+# Codex PR #572 R14 (round 5): seed the report set from the
+# configured CG list so a context graph that observed ZERO final
+# rows (total failure: nothing — even our own writes — landed in
+# its local SWM) is still surfaced in the breakdown as
+# INDETERMINATE rather than being silently omitted because it
+# never appeared in `by_cg_final`.
+all_cgs_configured = [c.strip() for c in "$ALL_CGS_CSV".split(',') if c.strip()]
 cycles = $SWM_TOTAL_CYCLES
 
 # Codex PR #572 R12 (round 4): build per-(cg, sender) denominator
@@ -832,22 +885,38 @@ try:
 except FileNotFoundError:
   print('  (no swm-inbox.jsonl)')
 
-# Resolve our own writes_ok (count of local writes that the
-# daemon accepted with a shareOperationId). Used as the self
-# denominator (we don't need to read our own published
-# tombstone — we have ground truth locally).
-self_writes_accepted = None
+# Codex PR #572 R13 (round 5): per-CG self denominator. Pre-fix
+# this counted the entire writes.jsonl regardless of cgId, so on
+# multi-CG runs every CG's "self" row showed denom=cycles*cgCount
+# while the numerator only contained that CG's observations,
+# producing per-CG percentages of ~100/cgCount% even under
+# perfect delivery. Same scope rule is now applied to peer
+# tombstones via the writes-accepted-summary subject — each
+# tombstone is published per CG with that CG's accepted count.
+self_writes_accepted_by_cg = {}
 try:
   with open(os.path.join(log_dir, 'writes.jsonl')) as f:
-    self_writes_accepted = sum(1 for ln in f if '"shareOperationId"' in ln)
+    for line in f:
+      try:
+        rec = json.loads(line)
+      except Exception:
+        continue
+      cg = rec.get('cgId')
+      resp = rec.get('resp')
+      if not cg or not isinstance(resp, dict): continue
+      if resp.get('shareOperationId'):
+        self_writes_accepted_by_cg[cg] = self_writes_accepted_by_cg.get(cg, 0) + 1
 except FileNotFoundError:
   pass
+have_writes_jsonl = bool(self_writes_accepted_by_cg) or os.path.exists(os.path.join(log_dir, 'writes.jsonl'))
 
 def denominator_for(cg, tag):
-  # Self: use locally-counted accepted writes (ground truth, no
-  # transport dependence).
+  # Self: use locally-counted accepted writes for this CG
+  # (ground truth, no transport dependence).
   if tag == self_tag:
-    return ('self', self_writes_accepted if self_writes_accepted is not None else cycles, self_writes_accepted is not None)
+    if not have_writes_jsonl:
+      return ('self', None, False)
+    return ('self', self_writes_accepted_by_cg.get(cg, 0), True)
   # Peer: use the writes-accepted tombstone if observed.
   wa = (denom_by_cg.get(cg) or {}).get(tag)
   if wa is not None:
@@ -855,12 +924,24 @@ def denominator_for(cg, tag):
   # No tombstone observed for this peer in this CG: indeterminate.
   return ('missing', None, False)
 
-for cg, by_tag in sorted(by_cg_final.items()):
-  print(f'  cg={cg}:')
+# Codex PR #572 R14 (round 5): iterate over CONFIGURED CGs so a
+# total-failure CG (no inbox rows at all) still appears in the
+# report. Union with by_cg_final keys catches unexpected CGs that
+# somehow show up in the inbox without being configured (defense
+# in depth).
+report_cgs = sorted(set(all_cgs_configured) | set(by_cg_final.keys()))
+for cg in report_cgs:
+  by_tag = by_cg_final.get(cg, {})
+  if cg not in by_cg_final:
+    print(f'  cg={cg}: [no `final` SWM-inbox rows observed for this CG — INDETERMINATE; total transport failure or final SPARQL errored]')
+  else:
+    print(f'  cg={cg}:')
   src, denom, ok = denominator_for(cg, self_tag)
   got = len(by_tag.get(self_tag, set()))
-  if denom is None:
+  if not ok:
     print(f'    self ({self_tag}): {got} observed (no local writes.jsonl — INDETERMINATE)')
+  elif denom == 0:
+    print(f'    self ({self_tag}): {got}/0 — no accepted writes recorded locally for this CG (script wrote nothing here)')
   else:
     pct = (got / denom * 100.0) if denom else 0.0
     sanity = '' if got == denom else f'  [WARN: observed {got} self-shares but accepted {denom} locally]'
@@ -873,6 +954,9 @@ for cg, by_tag in sorted(by_cg_final.items()):
     src, denom, ok = denominator_for(cg, peer)
     if not ok:
       print(f'    from {peer}: {got} observed (no writes-accepted tombstone in cg — INDETERMINATE; review writes-accepted-summaries-observed.jsonl)')
+      continue
+    if denom == 0:
+      print(f'    from {peer}: {got}/0 — peer reported zero accepted writes for this CG (peer ran but did not write here)')
       continue
     pct = (got / denom * 100.0) if denom else 0.0
     ship_gate = '' if pct >= 99.9 else '  [BELOW 99.9% — review postmortem]'

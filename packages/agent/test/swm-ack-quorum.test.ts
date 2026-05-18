@@ -455,6 +455,282 @@ describe('createSwmAckQuorum: tick + watchdog + deadline', () => {
   });
 });
 
+describe('createSwmAckQuorum: rearmWatchdog (PR-H bug 1)', () => {
+  it('re-arms the watchdog so it can fire again after another watchdogMs', () => {
+    let nowMs = 1_000_000;
+    const { calls, fn } = makeTopUp();
+    const q = makeQuorum({ now: () => nowMs, topUp: fn });
+
+    q.track({
+      shareOperationId: 'op-rearm',
+      cgId: 'cg',
+      expectedMembers: ['p1', 'p2', 'p3'],
+      payload: PAYLOAD,
+      enumerationSource: 'allowlist',
+      watchdogMs: 30_000,
+      deadlineHardMs: 5 * 60_000,
+    });
+
+    nowMs += 30_000;
+    q.tick();
+    expect(calls).toHaveLength(1);
+    expect(q.stats().watchdogFired).toBe(1);
+    expect(q.inspect('op-rearm')?.watchdogFired).toBe(true);
+
+    nowMs += 60_000;
+    q.tick();
+    expect(calls).toHaveLength(1);
+
+    q.rearmWatchdog('op-rearm');
+    expect(q.inspect('op-rearm')?.watchdogFired).toBe(false);
+    expect(q.inspect('op-rearm')?.watchdogArmedAtMs).toBe(nowMs);
+
+    nowMs += 20_000;
+    q.tick();
+    expect(calls).toHaveLength(1);
+
+    nowMs += 10_000;
+    q.tick();
+    expect(calls).toHaveLength(2);
+    expect(q.stats().watchdogFired).toBe(2);
+  });
+
+  it('rearm does NOT extend the hard deadline (deadline reference is the original startedAtMs)', () => {
+    let nowMs = 1_000_000;
+    const { calls, fn } = makeTopUp();
+    const onDeadlineExpired = vi.fn();
+    const q = makeQuorum({
+      now: () => nowMs,
+      topUp: fn,
+      observers: { onDeadlineExpired },
+    });
+
+    q.track({
+      shareOperationId: 'op-rearm-dl',
+      cgId: 'cg',
+      expectedMembers: ['p1', 'p2', 'p3'],
+      payload: PAYLOAD,
+      enumerationSource: 'allowlist',
+      watchdogMs: 30_000,
+      deadlineHardMs: 2 * 60_000,
+    });
+
+    nowMs += 30_000;
+    q.tick();
+    expect(calls).toHaveLength(1);
+
+    nowMs += 60_000;
+    q.rearmWatchdog('op-rearm-dl');
+
+    nowMs += 31_000;
+    q.tick();
+
+    expect(q.stats().deadlineExpired).toBe(1);
+    expect(q.inspect('op-rearm-dl')).toBeUndefined();
+    expect(onDeadlineExpired).toHaveBeenCalledTimes(1);
+  });
+
+  it('rearm on an unknown shareOperationId is a no-op (does not throw)', () => {
+    const q = makeQuorum();
+    expect(() => q.rearmWatchdog('op-unknown')).not.toThrow();
+    expect(q.stats()).toMatchObject({ pending: 0 });
+  });
+
+  it('rearm before the first watchdog fire pushes the first fire out by the elapsed gap', () => {
+    let nowMs = 1_000_000;
+    const { calls, fn } = makeTopUp();
+    const q = makeQuorum({ now: () => nowMs, topUp: fn });
+
+    q.track({
+      shareOperationId: 'op-early-rearm',
+      cgId: 'cg',
+      expectedMembers: ['p1', 'p2'],
+      payload: PAYLOAD,
+      enumerationSource: 'allowlist',
+      watchdogMs: 30_000,
+      deadlineHardMs: 5 * 60_000,
+    });
+
+    nowMs += 10_000;
+    q.rearmWatchdog('op-early-rearm');
+
+    nowMs += 25_000;
+    q.tick();
+    expect(calls).toHaveLength(0);
+
+    nowMs += 10_000;
+    q.tick();
+    expect(calls).toHaveLength(1);
+  });
+});
+
+/**
+ * PR-H round 2 (codex feedback on #582 bug 2): `dropPeer` removes
+ * a peer from `expectedMembers` so future watchdog ticks don't
+ * keep resending to permanently-rejected peers AND the shrunken
+ * denominator lets quorum complete on the remaining acks instead
+ * of waiting out `deadlineHardMs`.
+ */
+describe('createSwmAckQuorum: dropPeer (PR-H bug 2)', () => {
+  it('removes the peer from missingPeers on subsequent watchdog fires', () => {
+    let nowMs = 1_000_000;
+    const { calls, fn } = makeTopUp();
+    const q = makeQuorum({ now: () => nowMs, topUp: fn });
+    q.track({
+      shareOperationId: 'op-drop',
+      cgId: 'cg',
+      expectedMembers: ['p1', 'p2', 'p3'],
+      payload: PAYLOAD,
+      enumerationSource: 'allowlist',
+      watchdogMs: 30_000,
+      deadlineHardMs: 5 * 60_000,
+    });
+
+    nowMs += 30_001;
+    q.tick();
+    expect(calls).toHaveLength(1);
+    expect([...calls[0].missingPeers].sort()).toEqual(['p1', 'p2', 'p3']);
+
+    q.dropPeer('op-drop', 'p2');
+    q.rearmWatchdog('op-drop');
+
+    nowMs += 30_001;
+    q.tick();
+    expect(calls).toHaveLength(2);
+    expect([...calls[1].missingPeers].sort()).toEqual(['p1', 'p3']);
+  });
+
+  it('completes quorum when dropping a peer pushes ackPct past threshold', () => {
+    const q = makeQuorum();
+    q.track({
+      shareOperationId: 'op-drop-complete',
+      cgId: 'cg',
+      expectedMembers: ['p1', 'p2', 'p3'],
+      payload: PAYLOAD,
+      enumerationSource: 'allowlist',
+      quorumThreshold: 0.9,
+    });
+
+    q.onAck('op-drop-complete', 'p1');
+    q.onAck('op-drop-complete', 'p2');
+    expect(q.stats().pending).toBe(1);
+    expect(q.stats().completed).toBe(0);
+
+    q.dropPeer('op-drop-complete', 'p3');
+
+    expect(q.stats().pending).toBe(0);
+    expect(q.stats().completed).toBe(1);
+  });
+
+  it('is idempotent for repeated drops of the same peer', () => {
+    const q = makeQuorum();
+    q.track({
+      shareOperationId: 'op-drop-idem',
+      cgId: 'cg',
+      expectedMembers: ['p1', 'p2'],
+      payload: PAYLOAD,
+      enumerationSource: 'allowlist',
+    });
+
+    q.dropPeer('op-drop-idem', 'p1');
+    q.dropPeer('op-drop-idem', 'p1');
+    q.dropPeer('op-drop-idem', 'p1');
+
+    const snap = q.inspect('op-drop-idem');
+    expect(snap?.expectedMembers).toEqual(['p2']);
+  });
+
+  it('is a no-op when peer is not in expectedMembers', () => {
+    const q = makeQuorum();
+    q.track({
+      shareOperationId: 'op-drop-noop',
+      cgId: 'cg',
+      expectedMembers: ['p1', 'p2'],
+      payload: PAYLOAD,
+      enumerationSource: 'allowlist',
+    });
+
+    expect(() => q.dropPeer('op-drop-noop', 'pX')).not.toThrow();
+    const snap = q.inspect('op-drop-noop');
+    expect([...(snap?.expectedMembers ?? [])].sort()).toEqual(['p1', 'p2']);
+  });
+
+  it('is a no-op for an unknown shareOperationId', () => {
+    const q = makeQuorum();
+    expect(() => q.dropPeer('op-unknown', 'p1')).not.toThrow();
+  });
+
+  /**
+   * PR-H round 2 (codex feedback on #582 round 2): if dropPeer
+   * empties `expectedMembers` while `acked` is also empty
+   * (all-rejected, nobody accepted), the share MUST surface as
+   * a deadline-expiry — NOT a completion. The naive
+   * implementation would let `ackPctOf` return 1 (the empty-set
+   * guard) and fire `completeRecord`, converting an
+   * all-rejection into a false success and skewing the SLO
+   * metric.
+   */
+  it('treats an all-rejected share (no acks) as deadline-expired, NOT completed', () => {
+    let expiredCalls = 0;
+    let completedCalls = 0;
+    const q = makeQuorum({
+      observers: {
+        onDeadlineExpired: () => { expiredCalls += 1; },
+        onQuorumCompleted: () => { completedCalls += 1; },
+      },
+    });
+    q.track({
+      shareOperationId: 'op-all-rejected',
+      cgId: 'cg',
+      expectedMembers: ['p1', 'p2'],
+      payload: PAYLOAD,
+      enumerationSource: 'allowlist',
+    });
+
+    q.dropPeer('op-all-rejected', 'p1');
+    q.dropPeer('op-all-rejected', 'p2');
+
+    expect(completedCalls).toBe(0);
+    expect(expiredCalls).toBe(1);
+    expect(q.stats().completed).toBe(0);
+    expect(q.stats().deadlineExpired).toBe(1);
+    expect(q.stats().pending).toBe(0);
+    expect(q.inspect('op-all-rejected')).toBeUndefined();
+  });
+
+  /**
+   * Companion to the all-rejected test: when SOME peers acked
+   * before all remaining peers rejected, dropPeer'ing the last
+   * non-acked peer is a legitimate completion (the share got
+   * acks from everyone it possibly could). Pins the
+   * "expectedMembers empty BUT acked non-empty" branch as
+   * complete, not expired.
+   */
+  it('completes when dropPeer empties expected but acked has at least one entry', () => {
+    let expiredCalls = 0;
+    let completedCalls = 0;
+    const q = makeQuorum({
+      observers: {
+        onDeadlineExpired: () => { expiredCalls += 1; },
+        onQuorumCompleted: () => { completedCalls += 1; },
+      },
+    });
+    q.track({
+      shareOperationId: 'op-partial-then-drop',
+      cgId: 'cg',
+      expectedMembers: ['p1', 'p2'],
+      payload: PAYLOAD,
+      enumerationSource: 'allowlist',
+    });
+
+    q.onAck('op-partial-then-drop', 'p1');
+    q.dropPeer('op-partial-then-drop', 'p2');
+
+    expect(completedCalls).toBe(1);
+    expect(expiredCalls).toBe(0);
+  });
+});
+
 describe('createSwmAckQuorum: error isolation', () => {
   it('throwing observer does not crash the tick', () => {
     let nowMs = 1_000_000;

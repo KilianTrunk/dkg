@@ -580,31 +580,12 @@ describe('@unit Profile contract', function () {
       ).to.be.revertedWithCustomError(Profile, 'NodeIdAlreadyExists');
     });
 
-    it('reverts NodeNameAlreadyExists when the node name is taken', async () => {
-      await seedBrickedIdentity();
-
-      // isNameTaken has no on-chain setter (pre-existing protocol
-      // behavior), so flip the storage slot directly to exercise the
-      // verbatim createProfile name-uniqueness guard.
-      const nameTakenSlot = hre.ethers.keccak256(
-        hre.ethers.solidityPacked(['string', 'uint256'], ['Node 1', 2]),
-      );
-      await hre.network.provider.send('hardhat_setStorageAt', [
-        await ProfileStorage.getAddress(),
-        nameTakenSlot,
-        hre.ethers.zeroPadValue('0x01', 32),
-      ]);
-      expect(await ProfileStorage.isNameTaken('Node 1')).to.equal(true);
-
-      await expect(
-        Profile.connect(accounts[1]).recreateProfile(
-          accounts[0].address,
-          'Node 1',
-          nodeId1,
-          1000,
-        ),
-      ).to.be.revertedWithCustomError(Profile, 'NodeNameAlreadyExists');
-    });
+    // NOTE: a `NodeNameAlreadyExists` recreate test was removed here — it
+    // asserted an unreachable revert. `ProfileStorage.isNameTaken` is never
+    // written by any contract path, so the name-uniqueness guard (copied
+    // verbatim from createProfile) cannot fire in production; the old test
+    // only "passed" by faking it via a hardcoded storage slot. The dead
+    // mapping itself is tracked as separate pre-existing cleanup.
 
     it('accepts initialOperatorFee equal to the max and rejects above it', async () => {
       await seedBrickedIdentity();

@@ -33,12 +33,16 @@ const RESTORE_ICON = (
   </svg>
 );
 
-// ── Node Log ─────────────────────────────────────────────────────────────────
+// ── Shared utils ─────────────────────────────────────────────────────────────
 
-// Log levels mapped from ANSI colour codes / keywords in raw log lines.
+// Strip ANSI escape sequences that leak through from Node.js stderr/stdout.
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /(\x1B\[[0-9;]*[mGKHFJA-Z]|\[[0-9;]*m)/g;
+function stripAnsi(s: string): string { return s.replace(ANSI_RE, ''); }
+
 function classifyLine(line: string): 'error' | 'warn' | 'info' | 'debug' {
   const l = line.toLowerCase();
-  if (l.includes('error') || l.includes('err ') || l.includes('[error]')) return 'error';
+  if (l.includes('error') || l.includes(' err ') || l.includes('[error]')) return 'error';
   if (l.includes('warn') || l.includes('[warn]')) return 'warn';
   if (l.includes('debug') || l.includes('[debug]') || l.includes('trace')) return 'debug';
   return 'info';
@@ -51,45 +55,42 @@ const LEVEL_COLORS: Record<string, string> = {
   debug: 'var(--text-tertiary)',
 };
 
-function NodeLogContent() {
-  const [lines, setLines] = useState<string[]>([]);
-  const [filter, setFilter] = useState('');
-  const [level, setLevel] = useState<'all' | 'error' | 'warn' | 'info' | 'debug'>('all');
-  const [paused, setPaused] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
+function useAutoScroll(dep: unknown) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const atBottomRef = useRef(true);
-
-  const load = useCallback(() => {
-    if (paused) return;
-    api.fetchNodeLog({ lines: 300, q: filter || undefined })
-      .then(({ lines: l }: any) => setLines(l ?? []))
-      .catch(() => {});
-  }, [filter, paused]);
-
-  useEffect(() => {
-    load();
-    const iv = setInterval(load, 3_000);
-    return () => clearInterval(iv);
-  }, [load]);
-
-  // Auto-scroll to bottom only when already at bottom.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const onScroll = () => {
-      atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-    };
+    const onScroll = () => { atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40; };
     el.addEventListener('scroll', onScroll);
     return () => el.removeEventListener('scroll', onScroll);
   }, []);
-
   useEffect(() => {
     if (atBottomRef.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [lines]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dep]);
+  return scrollRef;
+}
+
+// ── Node Log ─────────────────────────────────────────────────────────────────
+
+function NodeLogContent() {
+  const [lines, setLines] = useState<string[]>([]);
+  const [filter, setFilter] = useState('');
+  const [level, setLevel] = useState<'all' | 'error' | 'warn' | 'info' | 'debug'>('all');
+
+  const load = useCallback(() => {
+    api.fetchNodeLog({ lines: 300, q: filter || undefined })
+      .then(({ lines: l }: any) => setLines((l ?? []).map(stripAnsi)))
+      .catch(() => {});
+  }, [filter]);
+
+  useEffect(() => { load(); const iv = setInterval(load, 3_000); return () => clearInterval(iv); }, [load]);
 
   const visible = lines.filter(l => level === 'all' || classifyLine(l) === level);
+  const scrollRef = useAutoScroll(visible.length);
 
   return (
     <div className="v10-log-container">
@@ -102,8 +103,7 @@ function NodeLogContent() {
           onChange={(e) => setFilter(e.target.value)}
         />
         <select
-          className="v10-log-filter"
-          style={{ width: 80 }}
+          className="v10-log-level-select"
           value={level}
           onChange={e => setLevel(e.target.value as typeof level)}
         >
@@ -113,20 +113,10 @@ function NodeLogContent() {
           <option value="info">Info</option>
           <option value="debug">Debug</option>
         </select>
-        <button
-          className="v10-log-filter"
-          style={{ width: 64, cursor: 'pointer', background: paused ? 'var(--accent-yellow, #f59e0b)' : undefined, color: paused ? '#000' : undefined }}
-          onClick={() => setPaused(p => !p)}
-          title={paused ? 'Resume live tail' : 'Pause live tail'}
-        >
-          {paused ? '▶ Live' : '⏸ Pause'}
-        </button>
       </div>
       <div className="v10-log-output" ref={scrollRef}>
         {visible.map((line, i) => (
-          <div key={i} className="v10-log-line" style={{ color: LEVEL_COLORS[classifyLine(line)] }}>
-            {line}
-          </div>
+          <div key={i} className="v10-log-line" style={{ color: LEVEL_COLORS[classifyLine(line)] }}>{line}</div>
         ))}
         {visible.length === 0 && (
           <div className="v10-log-line" style={{ color: 'var(--text-tertiary)' }}>No log output</div>
@@ -262,60 +252,47 @@ function TransactionsContent() {
 }
 
 // ── Gossip ────────────────────────────────────────────────────────────────────
-// Filters the node log to libp2p / gossipsub / peer lines.
+// Shows only raw libp2p / ProtocolRouter / GossipSub lines — NOT structured
+// DKGAgent operation logs (those live in Node Log and Operations).
 // Once OTEL is live this tab will be backed by a dedicated trace/metric stream.
 
-const GOSSIP_KEYWORDS = ['gossip', 'libp2p', 'peer', 'pubsub', 'relay', 'swm', 'dht', 'dial', 'connect', 'disconnect', 'protocol'];
+// Structured DKGAgent lines start with: "YYYY-MM-DD HH:MM:SS <optype> <uuid>"
+const STRUCTURED_LOG_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+ [0-9a-f-]{36}/;
 
-function isGossipLine(line: string): boolean {
-  const l = line.toLowerCase();
-  return GOSSIP_KEYWORDS.some(k => l.includes(k));
+function isLibp2pLine(line: string): boolean {
+  const s = stripAnsi(line);
+  if (STRUCTURED_LOG_RE.test(s)) return false; // skip DKGAgent structured lines
+  if (/Connection (opened|closed):/i.test(s)) return true;
+  if (/\[ProtocolRouter\]/i.test(s)) return true;
+  if (/Circuit reservation/i.test(s)) return true;
+  if (/Node is remotely-dialable/i.test(s)) return true;
+  if (/gossipsub|pubsub/i.test(s)) return true;
+  if (/FinalizationHandler/i.test(s)) return true;
+  if (/swm-ack|swm-share|swm-update/i.test(s)) return true;
+  return false;
 }
 
 function GossipContent() {
   const [lines, setLines] = useState<string[]>([]);
   const [filter, setFilter] = useState('');
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const atBottomRef = useRef(true);
 
   const load = useCallback(() => {
     api.fetchNodeLog({ lines: 500 })
-      .then(({ lines: l }: any) => setLines((l ?? []).filter(isGossipLine)))
+      .then(({ lines: l }: any) => setLines((l ?? []).map(stripAnsi).filter(isLibp2pLine)))
       .catch(() => {});
   }, []);
 
-  useEffect(() => {
-    load();
-    const iv = setInterval(load, 5_000);
-    return () => clearInterval(iv);
-  }, [load]);
+  useEffect(() => { load(); const iv = setInterval(load, 5_000); return () => clearInterval(iv); }, [load]);
 
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const onScroll = () => {
-      atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-    };
-    el.addEventListener('scroll', onScroll);
-    return () => el.removeEventListener('scroll', onScroll);
-  }, []);
-
-  useEffect(() => {
-    if (atBottomRef.current && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [lines]);
-
-  const visible = filter
-    ? lines.filter(l => l.toLowerCase().includes(filter.toLowerCase()))
-    : lines;
+  const visible = filter ? lines.filter(l => l.toLowerCase().includes(filter.toLowerCase())) : lines;
+  const scrollRef = useAutoScroll(visible.length);
 
   return (
     <div className="v10-log-container">
       <div className="v10-log-toolbar">
         <input
           type="text"
-          placeholder="Filter gossip / peer events..."
+          placeholder="Filter libp2p / gossip events..."
           className="v10-log-filter"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
@@ -323,12 +300,12 @@ function GossipContent() {
       </div>
       <div className="v10-log-output" ref={scrollRef}>
         {visible.map((line, i) => (
-          <div key={i} className="v10-log-line" style={{ color: LEVEL_COLORS[classifyLine(line)] }}>
-            {line}
-          </div>
+          <div key={i} className="v10-log-line" style={{ color: 'var(--text-secondary)' }}>{line}</div>
         ))}
         {visible.length === 0 && (
-          <div className="v10-log-line" style={{ color: 'var(--text-tertiary)' }}>No peer / gossip events in log tail</div>
+          <div className="v10-log-line" style={{ color: 'var(--text-tertiary)' }}>
+            No libp2p / gossip events in log tail
+          </div>
         )}
       </div>
     </div>

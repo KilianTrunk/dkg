@@ -3017,8 +3017,9 @@ elif [[ "$NUM_NODES" -lt 2 ]]; then
   skip "SECTION 33: need ≥2 nodes (have $NUM_NODES)"
 else
   # rc.9 substrate protocol IDs we expect to see on every healthy
-  # peer. Skip /dkg/10.0.1/access — only advertised once an agent
-  # actually consumes a private CG, not part of the base set.
+  # peer. PROTOCOL_ACCESS (/dkg/10.0.1/private-access) is registered
+  # unconditionally by DKGAgent.start() — round-3 Codex fix corrects
+  # the earlier mistaken comment that claimed it was conditional.
   EXPECTED=(
     "/dkg/10.0.1/message"
     "/dkg/10.0.1/sync"
@@ -3029,6 +3030,7 @@ else
     "/dkg/10.0.1/verify-proposal"
     "/dkg/10.0.1/join-request"
     "/dkg/10.0.1/query-remote"
+    "/dkg/10.0.1/private-access"
   )
   # Walk the full observer × target matrix so a single rc.8 straggler
   # on ANY node breaks an assertion (Codex PR #588: the original
@@ -3081,7 +3083,7 @@ except Exception:
         fi
       done
       legacy_seen=()
-      for legacy in "/dkg/10.0.0/message" "/dkg/10.0.0/sync"; do
+      for legacy in "/dkg/10.0.0/message" "/dkg/10.0.0/sync" "/dkg/10.0.0/private-access"; do
         if echo "$protos" | grep -qx "$legacy"; then
           legacy_seen+=("$legacy")
         fi
@@ -3116,40 +3118,42 @@ elif [[ "$NUM_NODES" -lt 2 ]]; then
   skip "SECTION 34: need ≥2 nodes (have $NUM_NODES)"
 else
   N1_PORT=${NODE_PORTS[0]}
-  # `delivered` is keyed by contextGraphId. Sum across all CGs for
-  # the baseline → after-write delta. A simple grand-total avoids
-  # us having to know which CGs N1 has fanned out to.
-  sum_delivered() {
-    echo "$1" | python3 -c "
-import sys, json
+  # `delivered` is keyed by contextGraphId (a literal cgId string,
+  # the same value passed to /api/shared-memory/write). Codex PR #588
+  # round 3: summing across ALL cgIds let unrelated background traffic
+  # (retries on other CGs) make the canary pass; compare the delta
+  # for $CONTEXT_GRAPH specifically so this section actually proves
+  # the write issued here exercised the substrate path.
+  cg_delivered() {
+    echo "$1" | CG="$2" python3 -c "
+import os, sys, json
+cg = os.environ.get('CG','')
 try:
   d = json.load(sys.stdin)
   sf = (d.get('swm') or {}).get('substrateFanout') or {}
-  delivered = sf.get('delivered') or {}
-  print(sum(int(v) for v in delivered.values()))
+  print(int((sf.get('delivered') or {}).get(cg, 0)))
 except Exception:
   print(0)
 " 2>/dev/null
   }
-  sum_queued() {
-    echo "$1" | python3 -c "
-import sys, json
+  cg_queued_inflight() {
+    echo "$1" | CG="$2" python3 -c "
+import os, sys, json
+cg = os.environ.get('CG','')
 try:
   d = json.load(sys.stdin)
   sf = (d.get('swm') or {}).get('substrateFanout') or {}
-  q = sf.get('queued') or {}
-  inflight = sf.get('inFlight') or {}
-  print(sum(int(v) for v in q.values()) + sum(int(v) for v in inflight.values()))
+  q = int((sf.get('queued') or {}).get(cg, 0))
+  i = int((sf.get('inFlight') or {}).get(cg, 0))
+  print(q + i)
 except Exception:
   print(0)
 " 2>/dev/null
   }
 
   SLO_BEFORE=$(c "http://127.0.0.1:$N1_PORT/api/slo")
-  DELIVERED_BEFORE=$(sum_delivered "$SLO_BEFORE")
+  DELIVERED_BEFORE=$(cg_delivered "$SLO_BEFORE" "$CONTEXT_GRAPH")
 
-  # Write a tagged quad so we can correlate with the after-snapshot.
-  # `ql` wraps the object as a literal; `q` would pass the raw URI form.
   TAG="urn:rc9-fanout:$(date +%s%N)"
   WRITE=$(c -X POST "http://127.0.0.1:$N1_PORT/api/shared-memory/write" -d "{
     \"contextGraphId\":\"$CONTEXT_GRAPH\",
@@ -3160,19 +3164,17 @@ except Exception:
     fail "N1 SWM write for substrate fan-out canary failed (triplesWritten=$WRITE_OK)"
   else
     ok "N1 wrote canary $TAG to '$CONTEXT_GRAPH'"
-    # Substrate fan-out fires synchronously inside publishWorkspaceGossip,
-    # but ack-arrival is async. Give it gossip-wait + a few seconds.
     sleep $((GOSSIP_WAIT_S + 3))
 
     SLO_AFTER=$(c "http://127.0.0.1:$N1_PORT/api/slo")
-    DELIVERED_AFTER=$(sum_delivered "$SLO_AFTER")
-    QUEUED_AFTER=$(sum_queued "$SLO_AFTER")
+    DELIVERED_AFTER=$(cg_delivered "$SLO_AFTER" "$CONTEXT_GRAPH")
+    QUEUED_AFTER=$(cg_queued_inflight "$SLO_AFTER" "$CONTEXT_GRAPH")
 
     DELTA=$((DELIVERED_AFTER - DELIVERED_BEFORE))
     if [[ "$DELTA" -ge 1 ]]; then
-      ok "swm.substrateFanout.delivered grew by $DELTA (before=$DELIVERED_BEFORE after=$DELIVERED_AFTER) — substrate path exercised"
+      ok "swm.substrateFanout.delivered['$CONTEXT_GRAPH'] grew by $DELTA (before=$DELIVERED_BEFORE after=$DELIVERED_AFTER) — substrate path exercised for this CG"
     else
-      fail "swm.substrateFanout.delivered did NOT grow (before=$DELIVERED_BEFORE after=$DELIVERED_AFTER) — substrate fan-out not firing"
+      fail "swm.substrateFanout.delivered['$CONTEXT_GRAPH'] did NOT grow (before=$DELIVERED_BEFORE after=$DELIVERED_AFTER) — substrate fan-out not firing for the canary CG"
     fi
     # Queue depth on a healthy loopback mesh should be ~0. Allow a
     # small floor (e.g. 2) so a single in-flight ack doesn't flake.
@@ -3293,37 +3295,52 @@ elif [[ "$NUM_NODES" -lt 2 ]]; then
   skip "SECTION 37: need ≥2 nodes (have $NUM_NODES)"
 else
   N1_PORT=${NODE_PORTS[0]}
-  # Walk NODE_PORTS to find an EDGE node (Codex PR #588 round 2:
-  # the "no consensus impact" assumption only holds for edge nodes;
-  # devnet.sh seeds 1-4 as core, 5+ as edge, so on a small devnet
-  # the last detected node is still core). Iterate in reverse so we
-  # prefer the highest-numbered (most likely edge) node when several
-  # exist.
+  # Walk NODE_PORTS to find an EDGE node. The "no consensus impact"
+  # assumption only holds for edge nodes; devnet.sh seeds 1-4 as core,
+  # 5+ as edge. Iterate in reverse so we prefer the highest-numbered
+  # (most likely edge) node when several exist.
   RECIPIENT_PORT=""
-  RECIPIENT_IDX=-1
   for idx in $(seq $((NUM_NODES - 1)) -1 0); do
     p=${NODE_PORTS[$idx]}
     role=$(json_get "$(c "http://127.0.0.1:$p/api/info")" nodeRole)
     if [[ "$role" == "edge" ]]; then
       RECIPIENT_PORT="$p"
-      RECIPIENT_IDX="$idx"
       break
     fi
   done
-  # devnet.sh seeds .devnet/nodeN where N = NODE_PORTS index + 1
-  # (regardless of API_PORT_BASE — round 2 fix for the hardcoded
-  # 9200 base). NODE_PORTS[0] is always node 1.
+  # Resolve .devnet/nodeN by matching RECIPIENT_PORT against each
+  # node dir's config.json.apiPort. Robust to (a) filtered/reordered
+  # DEVNET_NODES (e.g. DEVNET_NODES="9205 9206" — round 3 fix) and
+  # (b) non-default API_PORT_BASE (round 2 fix). Reading config.json
+  # is the only source of truth that survives both.
+  RECIPIENT_DIR=""
+  RECIPIENT_NODE_NUM=""
   if [[ -n "$RECIPIENT_PORT" ]]; then
-    RECIPIENT_NODE_NUM=$((RECIPIENT_IDX + 1))
-    RECIPIENT_DIR="$SCRIPT_DIR/../.devnet/node${RECIPIENT_NODE_NUM}"
-    RECIPIENT_PIDFILE="$RECIPIENT_DIR/devnet.pid"
+    for d in "$SCRIPT_DIR/../.devnet/"node*; do
+      [[ -d "$d" && -f "$d/config.json" ]] || continue
+      cfg_port=$(python3 -c "
+import sys, json
+try:
+  print(json.load(open('$d/config.json')).get('apiPort') or '')
+except Exception:
+  pass
+" 2>/dev/null)
+      if [[ "$cfg_port" == "$RECIPIENT_PORT" ]]; then
+        RECIPIENT_DIR="$d"
+        RECIPIENT_NODE_NUM=$(basename "$d" | sed 's/node//')
+        break
+      fi
+    done
   fi
+  RECIPIENT_PIDFILE="${RECIPIENT_DIR:+$RECIPIENT_DIR/devnet.pid}"
   CLI_JS="$SCRIPT_DIR/../packages/cli/dist/cli.js"
 
   if [[ -z "$RECIPIENT_PORT" ]]; then
     skip "SECTION 37: no edge node detected (all $NUM_NODES nodes report nodeRole != 'edge'); restarting a core would break consensus — skipping"
+  elif [[ -z "$RECIPIENT_DIR" ]]; then
+    skip "SECTION 37: could not match port $RECIPIENT_PORT to any .devnet/nodeN/config.json — script not running against devnet.sh layout"
   elif [[ ! -f "$RECIPIENT_PIDFILE" ]]; then
-    skip "SECTION 37: no $RECIPIENT_PIDFILE — script not running against devnet.sh layout (port $RECIPIENT_PORT)"
+    skip "SECTION 37: no $RECIPIENT_PIDFILE — daemon not under devnet.sh management (port $RECIPIENT_PORT)"
   else
     echo "--- 37a: capture recipient identity (port $RECIPIENT_PORT = node $RECIPIENT_NODE_NUM) ---"
     RCPT_INFO=$(c "http://127.0.0.1:$RECIPIENT_PORT/api/info")

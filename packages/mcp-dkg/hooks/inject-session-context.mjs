@@ -78,16 +78,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-// Lockstep contract: reuse capture-chat's `extractText` so the two
-// hooks recognise the SAME set of prompt-bearing payload shapes. If
-// capture-chat persists a turn for some shape, this hook must inject
-// a session-context block for that shape too — otherwise annotations
-// authored during the turn are orphaned (no `chat:Turn` exists for
-// the predicted URI). capture-chat exports the helper for exactly
-// this reason; this is a same-directory sibling import, no side
-// effects at import time (capture-chat's `main()` runs only under
-// its own `isMainModule` guard).
-import { extractText as captureExtractText } from './capture-chat.mjs';
+// Lockstep contract: reuse capture-chat's helpers verbatim so the
+// two hooks recognise the SAME payload shapes, derive the SAME
+// session keys, and predict / write the SAME turn URIs. Any drift
+// here silently orphans annotations (capture-chat persists a turn
+// the agent can't link back to, or vice versa). capture-chat
+// already exports these for exactly this purpose; same-directory
+// sibling import is safe (capture-chat's `main()` runs only under
+// its own `isMainModule` guard, so importing it has no side
+// effects). See Codex PR #589 finding 2.
+import {
+  extractText as captureExtractText,
+  extractSessionKey as captureExtractSessionKey,
+  sanitiseSlug as captureSanitiseSlug,
+  pick as capturePick,
+} from './capture-chat.mjs';
 
 const LOG_FILE = process.env.DKG_SESSION_CTX_LOG ?? '/tmp/dkg-inject-session-context.log';
 const STATE_DIR = path.join(os.homedir(), '.cache', 'dkg-mcp', 'sessions');
@@ -100,55 +105,14 @@ function log(msg) {
   }
 }
 
-// Generic deep-search for the first matching key. Same pattern as
-// sibling hooks; lets us tolerate field-name drift across Cursor /
-// Claude Code / future tools without per-tool branching.
-function pick(obj, candidates, depth = 0) {
-  if (depth > 4 || obj == null || typeof obj !== 'object') return undefined;
-  for (const c of candidates) {
-    if (Object.prototype.hasOwnProperty.call(obj, c)) {
-      const v = obj[c];
-      if (typeof v === 'string' && v.trim()) return v;
-      if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-    }
-  }
-  for (const v of Object.values(obj)) {
-    if (v && typeof v === 'object') {
-      const nested = pick(v, candidates, depth + 1);
-      if (nested !== undefined) return nested;
-    }
-  }
-  return undefined;
-}
-
-export function sanitiseSlug(s) {
-  return String(s).replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 80);
-}
-
-// Mirror capture-chat.mjs `extractSessionKey` so both hooks compute
-// the same `sessionKey` for the same payload — any drift here would
-// silently produce a turn URI the capture hook never writes.
-export function extractSessionKey(payload) {
-  const id = pick(payload, [
-    'conversation_id', 'session_id', 'thread_id', 'chat_id',
-    'conversationId', 'sessionId', 'threadId', 'chatId', 'convId', 'id',
-  ]);
-  if (id) return sanitiseSlug(id);
-  // Anon-session fallback identical to capture-chat.mjs: read the
-  // per-process index file. capture-chat's `anonSessionKey()` writes
-  // it; we only read.
-  try {
-    const stateDir = path.join(os.homedir(), '.dkg', 'hook-state');
-    const idxFile = path.join(stateDir, `anon-session-${process.ppid || process.pid}.txt`);
-    if (fs.existsSync(idxFile)) {
-      const buf = fs.readFileSync(idxFile, 'utf-8').trim();
-      if (buf) return sanitiseSlug(buf);
-    }
-  } catch {
-    /* fall through */
-  }
-  return null;
-}
+// Re-export the capture-chat helpers under our own names so existing
+// tests (and any future ones) that import `pick` / `sanitiseSlug` /
+// `extractSessionKey` from this module continue to resolve. By
+// re-exporting (rather than re-implementing) we get drift-proof
+// lockstep with capture-chat by construction.
+export const pick = capturePick;
+export const sanitiseSlug = captureSanitiseSlug;
+export const extractSessionKey = captureExtractSessionKey;
 
 export function extractPrompt(payload) {
   if (!payload || typeof payload !== 'object') return '';
@@ -223,23 +187,34 @@ function loadAgentUri() {
   }
 }
 
-// Read-only consumer of capture-chat's session state. We never write
-// this file — capture-chat owns the writes; we only need `turnIndex`
-// to predict the next turn URI.
-function loadTurnIndex(sessionKey) {
+// Read-only consumer of capture-chat's session state. capture-chat
+// owns the writes; we only need the slot it reserved for THIS prompt
+// (in its `beforeSubmitPrompt` handler, which runs before us).
+//
+// Returns the index capture-chat will write turn-URI to, or `null`
+// if we can't determine it (caller treats `null` as "skip injection"
+// — better to lose a session-context block on one turn than predict
+// a URI capture-chat doesn't honour).
+//
+// `pendingTurnIndex` is the canonical value: it's reserved fresh in
+// every beforeSubmitPrompt via `maxAssignedTurnIndex`, so it's
+// guaranteed unique across the session's lifetime, even when a
+// previous afterAgentResponse write failed (Codex PR #589 finding 1).
+// `turnIndex + 1` is the legacy back-compat fallback for state files
+// written by capture-chat versions that predate `pendingTurnIndex`.
+function loadPendingTurnIndex(sessionKey) {
   try {
     const raw = fs.readFileSync(path.join(STATE_DIR, `${sessionKey}.json`), 'utf-8');
     const state = JSON.parse(raw);
-    return typeof state.turnIndex === 'number' ? state.turnIndex : 0;
+    if (typeof state.pendingTurnIndex === 'number') return state.pendingTurnIndex;
+    if (typeof state.turnIndex === 'number') return state.turnIndex + 1;
+    return 1;
   } catch {
-    // Missing state file → first turn of a fresh session. capture-chat
-    // creates the state file in its own beforeSubmitPrompt handler, which
-    // runs BEFORE this hook per .cursor/hooks.json ordering, so this
-    // branch only fires when (a) it's literally turn 1, or (b)
-    // capture-chat errored out on this turn (in which case fail-open is
-    // the right move — emit nextTurnIndex=1 and the capture hook will
-    // self-heal on its next successful event).
-    return 0;
+    // Missing state file → either turn 1 of a fresh session OR
+    // capture-chat errored out before writing state. Returning `null`
+    // makes main() fall back to skipping injection rather than
+    // predicting a URI that may collide.
+    return null;
   }
 }
 
@@ -287,8 +262,16 @@ async function main() {
     return;
   }
 
-  const turnIndex = loadTurnIndex(sessionKey);
-  const nextTurnIndex = turnIndex + 1;
+  const nextTurnIndex = loadPendingTurnIndex(sessionKey);
+  // No state file (capture-chat ran before us but errored out, or
+  // never ran at all on this hook ordering) → skip injection. Better
+  // to lose a session-context block on one turn than predict a URI
+  // capture-chat doesn't honour.
+  if (nextTurnIndex == null) {
+    log(`skipping injection: no capture-chat session state for ${sessionKey}`);
+    process.stdout.write('{}\n');
+    return;
+  }
   // Mirror capture-chat.mjs `turnUri(slug, idx)`. For sanitised slugs
   // encodeURIComponent is a no-op, but we keep it for byte-alignment
   // with the producer of the URI we're predicting.

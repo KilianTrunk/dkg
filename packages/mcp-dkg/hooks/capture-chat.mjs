@@ -500,8 +500,25 @@ async function handleBeforeSubmitPrompt(cfg, payload) {
   };
   state.pendingPrompt = extractText(payload) ?? '';
   state.pendingPromptAt = new Date().toISOString();
+  // Reserve a UNIQUE turn slot for this prompt. `maxAssignedTurnIndex`
+  // is monotonic — it advances on every beforeSubmitPrompt and is
+  // never rolled back, even when a previous afterAgentResponse write
+  // fails. That's the contract `inject-session-context.mjs` relies on
+  // to predict a turn URI that capture-chat will write to exactly
+  // once: if turn N+1's write fails, the slot is ABANDONED (graph
+  // gap) and the next prompt is assigned slot N+2, so annotations
+  // emitted against #turn:N+1 can never be silently re-attributed to
+  // a later, content-different turn. See Codex PR #589 finding 1.
+  //
+  // Back-compat: older state files lack `maxAssignedTurnIndex`; the
+  // Math.max() seed keeps numbering monotonic across the upgrade.
+  state.maxAssignedTurnIndex = Math.max(
+    state.maxAssignedTurnIndex ?? 0,
+    state.turnIndex ?? 0,
+  ) + 1;
+  state.pendingTurnIndex = state.maxAssignedTurnIndex;
   saveSessionState(sessionKey, state);
-  log(`queued prompt (${state.pendingPrompt.length} chars) for session ${sessionKey}`);
+  log(`queued prompt (${state.pendingPrompt.length} chars) for session ${sessionKey} as turn #${state.pendingTurnIndex}`);
 }
 
 async function handleAfterAgentResponse(cfg, payload) {
@@ -513,11 +530,15 @@ async function handleAfterAgentResponse(cfg, payload) {
     turnIndex: 0,
     pendingPrompt: null,
   };
-  // Compute the next index *without* committing it yet. We only advance
-  // state.turnIndex (and clear pendingPrompt) after writeTriples()
-  // succeeds — otherwise a transient daemon/network error would silently
-  // burn a turn slot and shift numbering for every subsequent turn.
-  const idx = state.turnIndex + 1;
+  // Consume the slot reserved by handleBeforeSubmitPrompt. This is
+  // unique per prompt by construction (see the comment there). Older
+  // state files written before the maxAssignedTurnIndex contract was
+  // introduced won't have `pendingTurnIndex`; fall back to the legacy
+  // turnIndex+1 calc so an in-flight upgrade doesn't lose a turn.
+  // We DON'T advance state.turnIndex yet — only after writeTriples()
+  // succeeds — so reads of state.turnIndex elsewhere still reflect
+  // "last successfully committed turn".
+  const idx = state.pendingTurnIndex ?? (state.turnIndex + 1);
   const turn = turnUri(sessionKey, idx);
   const now = new Date().toISOString();
   const userText = state.pendingPrompt ?? '';
@@ -573,6 +594,7 @@ async function handleAfterAgentResponse(cfg, payload) {
     writeOk = true;
     state.turnIndex = idx;
     state.pendingPrompt = null;
+    state.pendingTurnIndex = null;
     if (bootstrapSession) state.sessionWritten = true;
     if (await shouldPromote(cfg, state)) {
       // Promote both the session and the individual turn so the team
@@ -584,9 +606,21 @@ async function handleAfterAgentResponse(cfg, payload) {
     }
     log(`wrote turn #${idx} for session ${sessionKey}${bootstrapSession ? ' (bootstrapped session)' : ''}`);
   } catch (err) {
-    // Leave state.turnIndex + state.pendingPrompt untouched so the next
-    // afterAgentResponse retries the same slot with the same prompt.
-    log(`turn write failed (turn #${idx} not committed; will retry next event): ${err?.message ?? err}`);
+    // Slot idx is ABANDONED — `maxAssignedTurnIndex` was already
+    // advanced past it in handleBeforeSubmitPrompt, so the NEXT
+    // beforeSubmitPrompt reserves a strictly greater
+    // pendingTurnIndex and #turn:${idx} can never be re-used for a
+    // different prompt. Annotations the agent emitted against
+    // #turn:${idx} during the failed exchange become dangling
+    // references (a chat:Turn that was never persisted), which graph
+    // consumers can recover; the prior "retry the same slot with the
+    // next prompt" behaviour silently misattributed those
+    // annotations to whichever turn next wrote to the slot. See
+    // Codex PR #589 finding 1. We deliberately do NOT clear
+    // pendingPrompt / pendingTurnIndex here so post-mortem logs and
+    // future "show me uncommitted turns" tooling can still see what
+    // was lost.
+    log(`turn write failed (turn #${idx} abandoned; slot will not be reused): ${err?.message ?? err}`);
   }
 
   state.lastEventAt = now;

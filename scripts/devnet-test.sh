@@ -3041,14 +3041,26 @@ else
     pid=$(json_get "$(c "http://127.0.0.1:$tp/api/info")" peerId)
     TARGET_PEER_IDS+=("$pid")
   done
+  # Hard fail (Codex PR #588 round 2) once per unreachable target so a
+  # broken /api/info doesn't silently skip protocol-advertisement
+  # checks for that node and hide a wire-version regression.
+  for j in $(seq 0 $((NUM_NODES - 1))); do
+    target_port=${NODE_PORTS[$j]}
+    target_peer=${TARGET_PEER_IDS[$j]}
+    if [[ -z "$target_peer" || "$target_peer" == "__NONE__" || "$target_peer" == "__ERR__" ]]; then
+      fail "N$((j+1)) ($target_port) peerId unreadable via /api/info — cannot verify substrate protocol advertisements"
+    fi
+  done
   for i in $(seq 0 $((NUM_NODES - 1))); do
     observer_port=${NODE_PORTS[$i]}
     for j in $(seq 0 $((NUM_NODES - 1))); do
       [[ "$i" == "$j" ]] && continue
       target_port=${NODE_PORTS[$j]}
       target_peer=${TARGET_PEER_IDS[$j]}
+      # Already failed once above — silently skip the pair iteration
+      # rather than re-emitting per observer (N-1 noisy lines per bad
+      # target).
       if [[ -z "$target_peer" || "$target_peer" == "__NONE__" || "$target_peer" == "__ERR__" ]]; then
-        warn "N$((j+1)) ($target_port) peerId unavailable — skipping observer pair"
         continue
       fi
       pi=$(c "http://127.0.0.1:$observer_port/api/peer-info?peerId=$target_peer")
@@ -3267,11 +3279,12 @@ section_start "SECTION 37: rc.9 — outbox durability + idempotency across recip
 # WITHOUT operator intervention — and arrives EXACTLY ONCE (substrate
 # `message_idempotency` dedups any internal retries).
 #
-# We target the LAST detected node as the restart victim — typically
-# an edge node on a 6-node devnet (devnet.sh seeds 1-4 core, 5+
-# edge). Edge nodes are simpler to restart (no consensus impact, no
-# RS prover state). Gated by SKIP_EDGE_RESTART because it kills a
-# daemon process.
+# We walk NODE_PORTS for a node whose /api/info.nodeRole == 'edge'
+# (devnet.sh seeds 1-4 as core, 5+ as edge). Edge nodes are simpler
+# to restart — no consensus impact, no RS prover state. If no edge
+# node exists (small devnet) the section is skipped cleanly rather
+# than restarting a core. Gated by SKIP_EDGE_RESTART because it
+# kills a daemon process.
 if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
   skip "SECTION 37: skipped via SKIP_RC9_SUBSTRATE=1"
 elif [[ "$SKIP_EDGE_RESTART" == "1" ]]; then
@@ -3280,17 +3293,36 @@ elif [[ "$NUM_NODES" -lt 2 ]]; then
   skip "SECTION 37: need ≥2 nodes (have $NUM_NODES)"
 else
   N1_PORT=${NODE_PORTS[0]}
-  # Last element — written for bash 3.2 (macOS) compatibility,
-  # `${arr[-1]}` is bash 4+.
-  RECIPIENT_PORT=${NODE_PORTS[$((NUM_NODES - 1))]}
-  # Map port → devnet node dir (devnet.sh seeds .devnet/nodeN with
-  # API port 9200+N).
-  RECIPIENT_NODE_NUM=$((RECIPIENT_PORT - 9200))
-  RECIPIENT_DIR="$SCRIPT_DIR/../.devnet/node${RECIPIENT_NODE_NUM}"
-  RECIPIENT_PIDFILE="$RECIPIENT_DIR/devnet.pid"
+  # Walk NODE_PORTS to find an EDGE node (Codex PR #588 round 2:
+  # the "no consensus impact" assumption only holds for edge nodes;
+  # devnet.sh seeds 1-4 as core, 5+ as edge, so on a small devnet
+  # the last detected node is still core). Iterate in reverse so we
+  # prefer the highest-numbered (most likely edge) node when several
+  # exist.
+  RECIPIENT_PORT=""
+  RECIPIENT_IDX=-1
+  for idx in $(seq $((NUM_NODES - 1)) -1 0); do
+    p=${NODE_PORTS[$idx]}
+    role=$(json_get "$(c "http://127.0.0.1:$p/api/info")" nodeRole)
+    if [[ "$role" == "edge" ]]; then
+      RECIPIENT_PORT="$p"
+      RECIPIENT_IDX="$idx"
+      break
+    fi
+  done
+  # devnet.sh seeds .devnet/nodeN where N = NODE_PORTS index + 1
+  # (regardless of API_PORT_BASE — round 2 fix for the hardcoded
+  # 9200 base). NODE_PORTS[0] is always node 1.
+  if [[ -n "$RECIPIENT_PORT" ]]; then
+    RECIPIENT_NODE_NUM=$((RECIPIENT_IDX + 1))
+    RECIPIENT_DIR="$SCRIPT_DIR/../.devnet/node${RECIPIENT_NODE_NUM}"
+    RECIPIENT_PIDFILE="$RECIPIENT_DIR/devnet.pid"
+  fi
   CLI_JS="$SCRIPT_DIR/../packages/cli/dist/cli.js"
 
-  if [[ ! -f "$RECIPIENT_PIDFILE" ]]; then
+  if [[ -z "$RECIPIENT_PORT" ]]; then
+    skip "SECTION 37: no edge node detected (all $NUM_NODES nodes report nodeRole != 'edge'); restarting a core would break consensus — skipping"
+  elif [[ ! -f "$RECIPIENT_PIDFILE" ]]; then
     skip "SECTION 37: no $RECIPIENT_PIDFILE — script not running against devnet.sh layout (port $RECIPIENT_PORT)"
   else
     echo "--- 37a: capture recipient identity (port $RECIPIENT_PORT = node $RECIPIENT_NODE_NUM) ---"
@@ -3358,25 +3390,46 @@ else
         MSG_ID=$(json_get "$CHAT_RESP" messageId)
       fi
       ABORT_RESTART=0
-      if [[ "$DELIVERED_NOW" == "false" || "$QUEUED_NOW" == "true" ]]; then
-        ok "Chat returned delivered=$DELIVERED_NOW queued=$QUEUED_NOW messageId=${MSG_ID:0:12}… (substrate outbox holding it)"
+      # REQUIRE delivered=false AND queued=true (Codex PR #588 round 2):
+      # a plain send failure can return delivered=false WITHOUT queued=true,
+      # which is NOT the outbox path — treating it as durable would let the
+      # inbox-poll below pass on a message that never persisted for retry.
+      if [[ "$DELIVERED_NOW" == "false" && "$QUEUED_NOW" == "true" ]]; then
+        ok "Chat returned delivered=false queued=true messageId=${MSG_ID:0:12}… (substrate outbox holding it)"
       else
-        # delivered=true on the retry too → libp2p still believes the
-        # peer is reachable. The chat may have landed before our kill;
-        # we cannot meaningfully test outbox-durability in this state.
-        # Skip §37d-§37e to avoid a false positive (Codex PR #588).
-        skip "Chat still reports delivered=$DELIVERED_NOW queued=$QUEUED_NOW after retry — disconnect did not propagate; cannot exercise outbox path. Skipping §37d-§37e (no regression vs no-test)"
+        # Either delivered=true (raced the disconnect), or
+        # delivered=false+queued=false (plain send failure, message
+        # not persisted). Neither lets us meaningfully test outbox
+        # durability. Skip §37d-§37e to avoid a false positive.
+        skip "Chat returned delivered=$DELIVERED_NOW queued=$QUEUED_NOW after retry — cannot exercise outbox path (need delivered=false AND queued=true). Skipping §37d-§37e (no regression vs no-test)"
         ABORT_RESTART=1
       fi
 
       if [[ "$ABORT_RESTART" == "1" ]]; then
         # Restart recipient anyway so subsequent runs / sections see a
-        # healthy mesh, but don't run the inbox-poll assertions.
+        # healthy mesh — and health-check it (Codex PR #588 round 2:
+        # if `start --foreground` exits immediately, the suite would
+        # end with the node still down and no failure signal).
         DKG_HOME="$RECIPIENT_DIR" DKG_NO_BLUE_GREEN=1 \
           node "$CLI_JS" start --foreground \
           >> "$RECIPIENT_DIR/daemon.log" 2>&1 &
         NEW_PID=$!
         echo "$NEW_PID" > "$RECIPIENT_PIDFILE"
+        cleanup_ready=0
+        cleanup_t0=$(date +%s)
+        for i in $(seq 1 "$RESTART_BOOT_TIMEOUT_S"); do
+          if curl -sf --max-time 2 -H "Authorization: Bearer $AUTH" \
+               "http://127.0.0.1:$RECIPIENT_PORT/api/status" > /dev/null 2>&1; then
+            cleanup_ready=1
+            cleanup_elapsed=$(( $(date +%s) - cleanup_t0 ))
+            ok "Recipient (skipped section) restored after ${cleanup_elapsed}s"
+            break
+          fi
+          sleep 1
+        done
+        if [[ "$cleanup_ready" -ne 1 ]]; then
+          fail "Recipient did NOT come back within ${RESTART_BOOT_TIMEOUT_S}s after §37c abort — devnet left in degraded state"
+        fi
       else
       echo "--- 37d: restart recipient (substrate should drain on connection re-establishment) ---"
       DKG_HOME="$RECIPIENT_DIR" DKG_NO_BLUE_GREEN=1 \

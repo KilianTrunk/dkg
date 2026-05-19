@@ -69,8 +69,8 @@ export {
   type CclPolicyRecord,
   type PolicyApprovalBinding,
 } from './ccl-policy.js';
+export { DKGAgent } from './dkg-agent.js';
 export {
-  DKGAgent,
   ContextGraphNotFoundError,
   InvalidContentError,
   type DKGAgentConfig,
@@ -86,8 +86,9 @@ export {
   type ContextGraphSubscriptionRecord,
   type ContextGraphSubscriptionStore,
   type PeerHealth,
-} from './dkg-agent.js';
-export type { CclPublishedEvaluationRecord, CclPublishedResultEntry } from './dkg-agent.js';
+  type CclPublishedEvaluationRecord,
+  type CclPublishedResultEntry,
+} from './dkg-agent-types.js';
 export {
   bindRandomSampling,
   type RandomSamplingBindOptions,

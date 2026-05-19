@@ -83,6 +83,8 @@ export interface InstallContext {
   mcpDkgSrcAbsPath: string;
   /** Absolute path to the capture-chat.mjs hook script. */
   captureScriptPath: string;
+  /** Absolute path to the inject-session-context.mjs hook script. */
+  injectSessionContextScriptPath: string;
   /** Override $HOME for tests; defaults to os.homedir(). */
   homedir?: string;
 }
@@ -156,6 +158,7 @@ function buildSubstitutionValues(
     mcpDkgPackageDir: ctx.mcpDkgPackageDir,
     mcpDkgSrcAbsPath: ctx.mcpDkgSrcAbsPath,
     captureScriptPath: ctx.captureScriptPath,
+    injectSessionContextScriptPath: ctx.injectSessionContextScriptPath,
     network: ctx.manifest.network,
   };
 }

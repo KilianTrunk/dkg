@@ -87,6 +87,7 @@ export const MANIFEST_PLACEHOLDERS = [
   'mcpDkgPackageDir',   // absolute path to packages/mcp-dkg — used to run `pnpm --dir … exec tsx src/index.ts` on the TS source (dist/ is gitignored)
   'mcpDkgSrcAbsPath',   // absolute path to packages/mcp-dkg/src/index.ts — passed to tsx so we don't depend on CWD
   'captureScriptPath',  // absolute path to packages/mcp-dkg/hooks/capture-chat.mjs
+  'injectSessionContextScriptPath',  // absolute path to packages/mcp-dkg/hooks/inject-session-context.mjs
   'network',            // testnet / mainnet / devnet
 ] as const;
 

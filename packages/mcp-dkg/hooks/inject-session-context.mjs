@@ -77,6 +77,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const LOG_FILE = process.env.DKG_SESSION_CTX_LOG ?? '/tmp/dkg-inject-session-context.log';
 const STATE_DIR = path.join(os.homedir(), '.cache', 'dkg-mcp', 'sessions');
@@ -284,11 +285,15 @@ async function main() {
 }
 
 // Self-execute only when invoked directly (avoids running during
-// import from a future unit test).
+// import from a future unit test). Mirrors the Windows-safe pattern
+// used by inject-inbox.mjs / capture-chat.mjs: `fileURLToPath` round-
+// trips the module URL into a real filesystem path so the equality
+// check works on Windows too (where `new URL("file://" + path)` would
+// otherwise mangle drive-letter paths and silently disable the hook).
 const isMainModule = (() => {
   try {
     if (!process.argv[1]) return false;
-    return import.meta.url === new URL(`file://${path.resolve(process.argv[1])}`).href;
+    return fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
   } catch {
     return false;
   }

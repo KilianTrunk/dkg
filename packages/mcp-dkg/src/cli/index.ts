@@ -437,6 +437,7 @@ async function cmdJoin(args: string[]): Promise<number> {
     mcpDkgPackageDir: path.resolve(HERE, '..', '..'),
     mcpDkgSrcAbsPath: path.resolve(HERE, '..', '..', 'src', 'index.ts'),
     captureScriptPath: path.resolve(HERE, '..', '..', 'hooks', 'capture-chat.mjs'),
+    injectSessionContextScriptPath: path.resolve(HERE, '..', '..', 'hooks', 'inject-session-context.mjs'),
     homedir: os.homedir(),
   };
   const plan = planInstall(ctx);

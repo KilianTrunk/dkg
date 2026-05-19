@@ -24,6 +24,8 @@ import type {
 import type {
   OperationContext,
   AuthorAttestationTypedData,
+  MessageIdempotencyStore,
+  ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
 import type {
   PhaseCallback,
@@ -304,11 +306,40 @@ export interface PeerDiagnostics {
     multiaddrs: string[];
     protocols: string[];
   } | null;
-  /** Pending chat-outbox entries for this peer (oldest-first). */
+  /**
+   * Pending substrate-outbox entries for this peer.
+   *
+   * Top-level fields (`pendingCount`, `oldestFirstFailureAt`,
+   * `attempts`) keep the rc.8 chat-only contract that
+   * `/api/peer-info` + MCP `dkg_peer_info` consumers depend on.
+   *
+   * `byProtocol` (rc.9 PR-E codex follow-up #10) breaks out queued
+   * entries per libp2p protocol id so post-substrate-migration
+   * traffic (sync, SWM, future protocols) is visible to operator
+   * diagnostics — without it, a peer stuck on sync catch-up reports
+   * `pendingCount=0` and looks healthy.
+   */
   outbox: {
+    /** Pending count for the chat protocol specifically (rc.8 contract). */
     pendingCount: number;
+    /** Oldest `firstFailureAt` among chat-protocol pending entries. */
     oldestFirstFailureAt: number | null;
+    /** Per-entry attempt counts among chat-protocol pending entries. */
     attempts: number[];
+    /**
+     * Per-protocol pending breakdown for this peer (rc.9 PR-E codex
+     * follow-up #10). Each key is the libp2p protocol id; value
+     * mirrors the chat-only summary shape so operator tooling can
+     * render per-protocol with no extra plumbing.
+     */
+    byProtocol: Record<
+      string,
+      {
+        pendingCount: number;
+        oldestFirstFailureAt: number | null;
+        attempts: number[];
+      }
+    >;
   };
   /** Latest ping-round health snapshot (`null` if never pinged). */
   health: PeerHealth | null;
@@ -575,4 +606,24 @@ export interface DKGAgentConfig {
   contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;
   /** Durable local cache for nodes/agents known to be members of a context graph. */
   contextGraphMembershipStore?: ContextGraphMembershipStore;
+  /**
+   * Universal Messenger substrate stores (rc.9 plan PR-2). When
+   * supplied, the `Messenger` instance gets durable receiver-side
+   * idempotency + sender-side outbox semantics for every caller that
+   * switches to `messenger.sendReliable` (the migration starts in
+   * PR-3 with chat + skill). When omitted, the Messenger runs in
+   * legacy pass-through mode — backwards-compatible for callers
+   * still on `/dkg/10.0.0/*`.
+   *
+   * Production: `cli/src/daemon/lifecycle.ts` wires
+   * `SqliteMessageIdempotencyStore` + `SqliteProtocolOutboxStore`
+   * against the shared `DashboardDB`.
+   *
+   * Tests: pass `InMemoryMessageIdempotencyStore` +
+   * `InMemoryProtocolOutboxStore` from `@origintrail-official/dkg-core`.
+   */
+  messengerStores?: {
+    idempotencyStore: MessageIdempotencyStore;
+    outboxStore: ProtocolOutboxStore;
+  };
 }

@@ -31,6 +31,7 @@ SCRIPT_T0=$(date +%s)
 #   RESTART_BOOT_TIMEOUT_S=60   — how long SECTION 30 / 37 waits for the node's API
 #   INVITE_DENIED_TIMEOUT_S=90  — SECTION 31 catch-up poll budget (denied/done)
 #   EDGE_OUTBOX_FLUSH_TIMEOUT_S=45  — SECTION 37 poll budget for substrate flush after recipient restart
+#   IDEMPOTENCY_QUIET_PERIOD_S=10   — SECTION 37 post-first-match window to catch late duplicates before asserting exactly-once
 SKIP_RESTART="${SKIP_RESTART:-0}"
 SKIP_MATRIX="${SKIP_MATRIX:-0}"
 SKIP_INVITE_FLOW="${SKIP_INVITE_FLOW:-0}"
@@ -39,6 +40,7 @@ SKIP_EDGE_RESTART="${SKIP_EDGE_RESTART:-0}"
 RESTART_BOOT_TIMEOUT_S="${RESTART_BOOT_TIMEOUT_S:-60}"
 INVITE_DENIED_TIMEOUT_S="${INVITE_DENIED_TIMEOUT_S:-90}"
 EDGE_OUTBOX_FLUSH_TIMEOUT_S="${EDGE_OUTBOX_FLUSH_TIMEOUT_S:-45}"
+IDEMPOTENCY_QUIET_PERIOD_S="${IDEMPOTENCY_QUIET_PERIOD_S:-10}"
 
 # Per-section timer helpers (used by sections 28-30). The existing 27
 # sections aren't wrapped — see comment on SCRIPT_T0 above.
@@ -3014,15 +3016,43 @@ if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
 elif [[ "$NUM_NODES" -lt 2 ]]; then
   skip "SECTION 33: need ≥2 nodes (have $NUM_NODES)"
 else
-  N1_PORT=${NODE_PORTS[0]}
-  N2_PORT=${NODE_PORTS[1]}
-  N2_PEER=$(json_get "$(c "http://127.0.0.1:$N2_PORT/api/info")" peerId)
-  if [[ -z "$N2_PEER" || "$N2_PEER" == "__NONE__" || "$N2_PEER" == "__ERR__" ]]; then
-    fail "Could not capture N2 peerId — aborting SECTION 33"
-  else
-    PI=$(c "http://127.0.0.1:$N1_PORT/api/peer-info?peerId=$N2_PEER")
-    # peerStore.protocols is an array of advertised protocol IDs.
-    PROTOS=$(echo "$PI" | python3 -c "
+  # rc.9 substrate protocol IDs we expect to see on every healthy
+  # peer. Skip /dkg/10.0.1/access — only advertised once an agent
+  # actually consumes a private CG, not part of the base set.
+  EXPECTED=(
+    "/dkg/10.0.1/message"
+    "/dkg/10.0.1/sync"
+    "/dkg/10.0.1/swm-update"
+    "/dkg/10.0.1/swm-share-ack"
+    "/dkg/10.0.1/swm-sender-key"
+    "/dkg/10.0.1/storage-ack"
+    "/dkg/10.0.1/verify-proposal"
+    "/dkg/10.0.1/join-request"
+    "/dkg/10.0.1/query-remote"
+  )
+  # Walk the full observer × target matrix so a single rc.8 straggler
+  # on ANY node breaks an assertion (Codex PR #588: the original
+  # version only inspected N2 from N1 and would miss a stale advert on
+  # any other peer). One PASS line per (observer, target) pair when
+  # all 9 protocols are present; a FAIL listing the missing protocols
+  # otherwise.
+  declare -a TARGET_PEER_IDS=()
+  for tp in "${NODE_PORTS[@]}"; do
+    pid=$(json_get "$(c "http://127.0.0.1:$tp/api/info")" peerId)
+    TARGET_PEER_IDS+=("$pid")
+  done
+  for i in $(seq 0 $((NUM_NODES - 1))); do
+    observer_port=${NODE_PORTS[$i]}
+    for j in $(seq 0 $((NUM_NODES - 1))); do
+      [[ "$i" == "$j" ]] && continue
+      target_port=${NODE_PORTS[$j]}
+      target_peer=${TARGET_PEER_IDS[$j]}
+      if [[ -z "$target_peer" || "$target_peer" == "__NONE__" || "$target_peer" == "__ERR__" ]]; then
+        warn "N$((j+1)) ($target_port) peerId unavailable — skipping observer pair"
+        continue
+      fi
+      pi=$(c "http://127.0.0.1:$observer_port/api/peer-info?peerId=$target_peer")
+      protos=$(echo "$pi" | python3 -c "
 import sys, json
 try:
   d = json.load(sys.stdin)
@@ -3032,37 +3062,28 @@ try:
 except Exception:
   pass
 " 2>/dev/null)
-    # rc.9 substrate protocol IDs we expect to see on every healthy
-    # peer. Skip /dkg/10.0.1/access — only advertised once an agent
-    # actually consumes a private CG, not part of the base set.
-    EXPECTED=(
-      "/dkg/10.0.1/message"
-      "/dkg/10.0.1/sync"
-      "/dkg/10.0.1/swm-update"
-      "/dkg/10.0.1/swm-share-ack"
-      "/dkg/10.0.1/swm-sender-key"
-      "/dkg/10.0.1/storage-ack"
-      "/dkg/10.0.1/verify-proposal"
-      "/dkg/10.0.1/join-request"
-      "/dkg/10.0.1/query-remote"
-    )
-    for proto in "${EXPECTED[@]}"; do
-      if echo "$PROTOS" | grep -qx "$proto"; then
-        ok "N1 sees N2 advertising $proto"
+      missing=()
+      for proto in "${EXPECTED[@]}"; do
+        if ! echo "$protos" | grep -qx "$proto"; then
+          missing+=("$proto")
+        fi
+      done
+      legacy_seen=()
+      for legacy in "/dkg/10.0.0/message" "/dkg/10.0.0/sync"; do
+        if echo "$protos" | grep -qx "$legacy"; then
+          legacy_seen+=("$legacy")
+        fi
+      done
+      if [[ ${#missing[@]} -eq 0 ]]; then
+        ok "N$((i+1)) ($observer_port) sees N$((j+1)) ($target_port) advertising all 9 substrate protocols"
       else
-        fail "N1 does NOT see N2 advertising $proto (peerStore.protocols mismatch — possible wire-prefix drift)"
+        fail "N$((i+1)) ($observer_port) does NOT see N$((j+1)) ($target_port) advertising: ${missing[*]} (peerStore.protocols mismatch — possible wire-prefix drift)"
+      fi
+      if [[ ${#legacy_seen[@]} -gt 0 ]]; then
+        warn "N$((i+1)) ($observer_port) still sees N$((j+1)) ($target_port) advertising legacy: ${legacy_seen[*]} — peer may be on rc.8"
       fi
     done
-    # Also verify the rc.8 legacy prefix is GONE for the migrated
-    # protocols. /dkg/10.0.0/verify-approval is the documented
-    # survivor — everything else should be cleared. If we still see
-    # /dkg/10.0.0/message etc., a peer is on a stale build.
-    for legacy in "/dkg/10.0.0/message" "/dkg/10.0.0/sync"; do
-      if echo "$PROTOS" | grep -qx "$legacy"; then
-        warn "N1 still sees N2 advertising legacy $legacy — peer may be on rc.8"
-      fi
-    done
-  fi
+  done
 fi
 section_done
 
@@ -3228,7 +3249,10 @@ except Exception:
     if [[ "$failed" -eq 0 ]]; then
       ok "Node $p substrateFanout.failed=0"
     else
-      warn "Node $p substrateFanout.failed=$failed (non-zero — investigate substrate send errors)"
+      # Hard fail (Codex PR #588): section comment says non-zero failed
+      # indicates a dialability/protocol regression — warn would let CI
+      # stay green while substrate fan-out is actively failing.
+      fail "Node $p substrateFanout.failed=$failed (non-zero — substrate send errors; possible dialability/protocol regression)"
     fi
   done
 fi
@@ -3312,12 +3336,17 @@ else
       DELIVERED_NOW=$(json_get "$CHAT_RESP" delivered)
       QUEUED_NOW=$(json_get "$CHAT_RESP" queued)
       MSG_ID=$(json_get "$CHAT_RESP" messageId)
-      # Either delivered=false+queued=true (substrate held it) OR an
-      # error response — both prove the recipient is offline. What
-      # we DON'T want is delivered=true (would mean we raced the
-      # disconnect; section won't be meaningful).
+      # We REQUIRE delivered=false / queued=true to prove the outbox
+      # path is being exercised. delivered=true means we raced the
+      # disconnect (libp2p hasn't surfaced the EOF on N1 yet) and the
+      # chat was actually delivered BEFORE we killed the recipient —
+      # in which case the §37e inbox poll would succeed on a
+      # pre-restart delivery, falsely confirming durability without
+      # ever testing it. One retry attempt with a fresh marker; if
+      # we STILL see delivered=true, abort the section cleanly rather
+      # than report a false positive (Codex PR #588).
       if [[ "$DELIVERED_NOW" == "true" ]]; then
-        warn "Chat returned delivered=true before recipient could go down — sleeping 5s and retrying once"
+        warn "Chat returned delivered=true before recipient could go down — sleeping 5s and retrying once with a fresh marker"
         sleep 5
         DURABLE_MARKER="rc9-durable-$(date +%s%N)-r2"
         CHAT_RESP=$(c -X POST "http://127.0.0.1:$N1_PORT/api/chat" -d "{
@@ -3328,12 +3357,27 @@ else
         QUEUED_NOW=$(json_get "$CHAT_RESP" queued)
         MSG_ID=$(json_get "$CHAT_RESP" messageId)
       fi
+      ABORT_RESTART=0
       if [[ "$DELIVERED_NOW" == "false" || "$QUEUED_NOW" == "true" ]]; then
         ok "Chat returned delivered=$DELIVERED_NOW queued=$QUEUED_NOW messageId=${MSG_ID:0:12}… (substrate outbox holding it)"
       else
-        warn "Chat response shape unexpected: delivered=$DELIVERED_NOW queued=$QUEUED_NOW (proceeding — restart will tell us if delivery still works)"
+        # delivered=true on the retry too → libp2p still believes the
+        # peer is reachable. The chat may have landed before our kill;
+        # we cannot meaningfully test outbox-durability in this state.
+        # Skip §37d-§37e to avoid a false positive (Codex PR #588).
+        skip "Chat still reports delivered=$DELIVERED_NOW queued=$QUEUED_NOW after retry — disconnect did not propagate; cannot exercise outbox path. Skipping §37d-§37e (no regression vs no-test)"
+        ABORT_RESTART=1
       fi
 
+      if [[ "$ABORT_RESTART" == "1" ]]; then
+        # Restart recipient anyway so subsequent runs / sections see a
+        # healthy mesh, but don't run the inbox-poll assertions.
+        DKG_HOME="$RECIPIENT_DIR" DKG_NO_BLUE_GREEN=1 \
+          node "$CLI_JS" start --foreground \
+          >> "$RECIPIENT_DIR/daemon.log" 2>&1 &
+        NEW_PID=$!
+        echo "$NEW_PID" > "$RECIPIENT_PIDFILE"
+      else
       echo "--- 37d: restart recipient (substrate should drain on connection re-establishment) ---"
       DKG_HOME="$RECIPIENT_DIR" DKG_NO_BLUE_GREEN=1 \
         node "$CLI_JS" start --foreground \
@@ -3359,25 +3403,28 @@ else
         fail "Recipient API never responded within ${RESTART_BOOT_TIMEOUT_S}s — aborting SECTION 37"
       else
         echo "--- 37e: poll inbox for the durable marker (≤ ${EDGE_OUTBOX_FLUSH_TIMEOUT_S}s) ---"
-        # Substrate outbox tick + libp2p reconnection + dial: bounded
-        # by EDGE_OUTBOX_FLUSH_TIMEOUT_S. We poll every 3s.
-        delivered=0
-        match_count=0
-        poll_t0=$(date +%s)
-        while [[ $(( $(date +%s) - poll_t0 )) -lt "$EDGE_OUTBOX_FLUSH_TIMEOUT_S" ]]; do
-          INBOX=$(c "http://127.0.0.1:$RECIPIENT_PORT/api/messages?peer=$N1_PEER&direction=in&limit=50")
-          match_count=$(echo "$INBOX" | python3 -c "
+        # Phase 1: poll every 3s until the marker first appears (or
+        # timeout). Substrate outbox tick + libp2p reconnect + dial is
+        # bounded by EDGE_OUTBOX_FLUSH_TIMEOUT_S.
+        inbox_count_for_marker() {
+          c "http://127.0.0.1:$RECIPIENT_PORT/api/messages?peer=$N1_PEER&direction=in&limit=50" \
+            | python3 -c "
 import sys, json
 marker = '$DURABLE_MARKER'
 try:
   d = json.load(sys.stdin)
   msgs = d.get('messages') or d.get('result') or []
-  count = sum(1 for m in msgs if m.get('text') == marker)
-  print(count)
+  print(sum(1 for m in msgs if m.get('text') == marker))
 except Exception:
   print(0)
-" 2>/dev/null)
-          if [[ "$match_count" -ge 1 ]]; then
+" 2>/dev/null
+        }
+        delivered=0
+        first_match_count=0
+        poll_t0=$(date +%s)
+        while [[ $(( $(date +%s) - poll_t0 )) -lt "$EDGE_OUTBOX_FLUSH_TIMEOUT_S" ]]; do
+          first_match_count=$(inbox_count_for_marker)
+          if [[ "$first_match_count" -ge 1 ]]; then
             delivered=1
             break
           fi
@@ -3386,19 +3433,33 @@ except Exception:
         poll_elapsed=$(( $(date +%s) - poll_t0 ))
         if [[ "$delivered" == "1" ]]; then
           ok "Recipient received '$DURABLE_MARKER' after ${poll_elapsed}s without operator resend (outbox-durability ✓)"
-          # Idempotency check: substrate's message_idempotency table
-          # should ensure exactly ONE inbox row for the marker, even
-          # if the sender's outbox retried internally during the
-          # disconnect→reconnect window.
-          if [[ "$match_count" -eq 1 ]]; then
-            ok "Inbox has exactly 1 row for the marker (idempotency ✓)"
+          # Phase 2: idempotency quiet-period (Codex PR #588 fix).
+          # Breaking on the first match would miss a duplicate that
+          # arrives a few seconds later during the same reconnect/
+          # flush window. Keep polling for IDEMPOTENCY_QUIET_PERIOD_S
+          # past the first match; assert exactly-once based on the
+          # MAX seen across the whole window.
+          QUIET_PERIOD_S="${IDEMPOTENCY_QUIET_PERIOD_S:-10}"
+          echo "  observing idempotency quiet period (${QUIET_PERIOD_S}s) for late duplicates..."
+          max_count=$first_match_count
+          quiet_t0=$(date +%s)
+          while [[ $(( $(date +%s) - quiet_t0 )) -lt "$QUIET_PERIOD_S" ]]; do
+            n=$(inbox_count_for_marker)
+            if [[ "$n" -gt "$max_count" ]]; then
+              max_count=$n
+            fi
+            sleep 2
+          done
+          if [[ "$max_count" -eq 1 ]]; then
+            ok "Inbox has exactly 1 row for the marker after ${QUIET_PERIOD_S}s quiet period (idempotency ✓)"
           else
-            fail "Inbox has $match_count rows for the marker — expected 1 (idempotency regression: substrate isn't deduping retries)"
+            fail "Inbox saw $max_count rows for the marker during ${QUIET_PERIOD_S}s quiet period — expected 1 (idempotency regression: substrate isn't deduping retries)"
           fi
         else
           fail "Recipient did NOT receive '$DURABLE_MARKER' within ${EDGE_OUTBOX_FLUSH_TIMEOUT_S}s — outbox-durability regression"
         fi
       fi
+      fi  # close the ABORT_RESTART else-branch
     fi
   fi
 fi

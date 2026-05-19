@@ -32,6 +32,8 @@ SCRIPT_T0=$(date +%s)
 #   INVITE_DENIED_TIMEOUT_S=90  — SECTION 31 catch-up poll budget (denied/done)
 #   EDGE_OUTBOX_FLUSH_TIMEOUT_S=45  — SECTION 37 poll budget for substrate flush after recipient restart
 #   IDEMPOTENCY_QUIET_PERIOD_S=10   — SECTION 37 post-first-match window to catch late duplicates before asserting exactly-once
+#   ACK_DRAIN_TIMEOUT_S=30          — SECTION 35 poll budget for shareAckQuorum.pending to drain to ≤1
+#   FANOUT_QUIET_WINDOW_S=8         — SECTION 36 quiet-window length to observe substrate counter deltas
 SKIP_RESTART="${SKIP_RESTART:-0}"
 SKIP_MATRIX="${SKIP_MATRIX:-0}"
 SKIP_INVITE_FLOW="${SKIP_INVITE_FLOW:-0}"
@@ -41,6 +43,8 @@ RESTART_BOOT_TIMEOUT_S="${RESTART_BOOT_TIMEOUT_S:-60}"
 INVITE_DENIED_TIMEOUT_S="${INVITE_DENIED_TIMEOUT_S:-90}"
 EDGE_OUTBOX_FLUSH_TIMEOUT_S="${EDGE_OUTBOX_FLUSH_TIMEOUT_S:-45}"
 IDEMPOTENCY_QUIET_PERIOD_S="${IDEMPOTENCY_QUIET_PERIOD_S:-10}"
+ACK_DRAIN_TIMEOUT_S="${ACK_DRAIN_TIMEOUT_S:-30}"
+FANOUT_QUIET_WINDOW_S="${FANOUT_QUIET_WINDOW_S:-8}"
 
 # Per-section timer helpers (used by sections 28-30). The existing 27
 # sections aren't wrapped — see comment on SCRIPT_T0 above.
@@ -3020,17 +3024,22 @@ else
   # peer. PROTOCOL_ACCESS (/dkg/10.0.1/private-access) is registered
   # unconditionally by DKGAgent.start() — round-3 Codex fix corrects
   # the earlier mistaken comment that claimed it was conditional.
-  EXPECTED=(
+  # /dkg/10.0.1/storage-ack is core-only — DKGAgent.start() registers
+  # it under `if (effectiveRole === 'core')` (round-4 Codex fix), so
+  # it's expected only when the TARGET is a core node.
+  EXPECTED_UNIVERSAL=(
     "/dkg/10.0.1/message"
     "/dkg/10.0.1/sync"
     "/dkg/10.0.1/swm-update"
     "/dkg/10.0.1/swm-share-ack"
     "/dkg/10.0.1/swm-sender-key"
-    "/dkg/10.0.1/storage-ack"
     "/dkg/10.0.1/verify-proposal"
     "/dkg/10.0.1/join-request"
     "/dkg/10.0.1/query-remote"
     "/dkg/10.0.1/private-access"
+  )
+  EXPECTED_CORE_ONLY=(
+    "/dkg/10.0.1/storage-ack"
   )
   # Walk the full observer × target matrix so a single rc.8 straggler
   # on ANY node breaks an assertion (Codex PR #588: the original
@@ -3039,9 +3048,13 @@ else
   # all 9 protocols are present; a FAIL listing the missing protocols
   # otherwise.
   declare -a TARGET_PEER_IDS=()
+  declare -a TARGET_NODE_ROLES=()
   for tp in "${NODE_PORTS[@]}"; do
-    pid=$(json_get "$(c "http://127.0.0.1:$tp/api/info")" peerId)
+    info_blob=$(c "http://127.0.0.1:$tp/api/info")
+    pid=$(json_get "$info_blob" peerId)
+    role=$(json_get "$info_blob" nodeRole)
     TARGET_PEER_IDS+=("$pid")
+    TARGET_NODE_ROLES+=("$role")
   done
   # Hard fail (Codex PR #588 round 2) once per unreachable target so a
   # broken /api/info doesn't silently skip protocol-advertisement
@@ -3076,8 +3089,15 @@ try:
 except Exception:
   pass
 " 2>/dev/null)
+      # Build the per-target expected set: universal protocols on
+      # every node + core-only protocols when target is core.
+      target_role=${TARGET_NODE_ROLES[$j]}
+      expected_for_target=("${EXPECTED_UNIVERSAL[@]}")
+      if [[ "$target_role" == "core" ]]; then
+        expected_for_target+=("${EXPECTED_CORE_ONLY[@]}")
+      fi
       missing=()
-      for proto in "${EXPECTED[@]}"; do
+      for proto in "${expected_for_target[@]}"; do
         if ! echo "$protos" | grep -qx "$proto"; then
           missing+=("$proto")
         fi
@@ -3089,9 +3109,9 @@ except Exception:
         fi
       done
       if [[ ${#missing[@]} -eq 0 ]]; then
-        ok "N$((i+1)) ($observer_port) sees N$((j+1)) ($target_port) advertising all 9 substrate protocols"
+        ok "N$((i+1)) ($observer_port) sees N$((j+1)) ($target_port, $target_role) advertising all ${#expected_for_target[@]} substrate protocols"
       else
-        fail "N$((i+1)) ($observer_port) does NOT see N$((j+1)) ($target_port) advertising: ${missing[*]} (peerStore.protocols mismatch — possible wire-prefix drift)"
+        fail "N$((i+1)) ($observer_port) does NOT see N$((j+1)) ($target_port, $target_role) advertising: ${missing[*]} (peerStore.protocols mismatch — possible wire-prefix drift)"
       fi
       if [[ ${#legacy_seen[@]} -gt 0 ]]; then
         warn "N$((i+1)) ($observer_port) still sees N$((j+1)) ($target_port) advertising legacy: ${legacy_seen[*]} — peer may be on rc.8"
@@ -3136,16 +3156,20 @@ except Exception:
   print(0)
 " 2>/dev/null
   }
-  cg_queued_inflight() {
-    echo "$1" | CG="$2" python3 -c "
+  cg_substrate_counter() {
+    # cg_substrate_counter <slo_json> <cg> <bucket>
+    # Returns the per-CG count for any swm.substrateFanout bucket
+    # (delivered / queued / inFlight / failed / retryable / rejected).
+    # All buckets are cumulative — callers MUST compare before/after
+    # deltas for the specific write under test (Codex PR #588 round 4).
+    echo "$1" | CG="$2" BUCKET="$3" python3 -c "
 import os, sys, json
 cg = os.environ.get('CG','')
+bucket = os.environ.get('BUCKET','')
 try:
   d = json.load(sys.stdin)
   sf = (d.get('swm') or {}).get('substrateFanout') or {}
-  q = int((sf.get('queued') or {}).get(cg, 0))
-  i = int((sf.get('inFlight') or {}).get(cg, 0))
-  print(q + i)
+  print(int((sf.get(bucket) or {}).get(cg, 0)))
 except Exception:
   print(0)
 " 2>/dev/null
@@ -3153,6 +3177,9 @@ except Exception:
 
   SLO_BEFORE=$(c "http://127.0.0.1:$N1_PORT/api/slo")
   DELIVERED_BEFORE=$(cg_delivered "$SLO_BEFORE" "$CONTEXT_GRAPH")
+  QUEUED_BEFORE=$(cg_substrate_counter "$SLO_BEFORE" "$CONTEXT_GRAPH" queued)
+  INFLIGHT_BEFORE=$(cg_substrate_counter "$SLO_BEFORE" "$CONTEXT_GRAPH" inFlight)
+  FAILED_BEFORE=$(cg_substrate_counter "$SLO_BEFORE" "$CONTEXT_GRAPH" failed)
 
   TAG="urn:rc9-fanout:$(date +%s%N)"
   WRITE=$(c -X POST "http://127.0.0.1:$N1_PORT/api/shared-memory/write" -d "{
@@ -3168,7 +3195,9 @@ except Exception:
 
     SLO_AFTER=$(c "http://127.0.0.1:$N1_PORT/api/slo")
     DELIVERED_AFTER=$(cg_delivered "$SLO_AFTER" "$CONTEXT_GRAPH")
-    QUEUED_AFTER=$(cg_queued_inflight "$SLO_AFTER" "$CONTEXT_GRAPH")
+    QUEUED_AFTER=$(cg_substrate_counter "$SLO_AFTER" "$CONTEXT_GRAPH" queued)
+    INFLIGHT_AFTER=$(cg_substrate_counter "$SLO_AFTER" "$CONTEXT_GRAPH" inFlight)
+    FAILED_AFTER=$(cg_substrate_counter "$SLO_AFTER" "$CONTEXT_GRAPH" failed)
 
     DELTA=$((DELIVERED_AFTER - DELIVERED_BEFORE))
     if [[ "$DELTA" -ge 1 ]]; then
@@ -3176,12 +3205,17 @@ except Exception:
     else
       fail "swm.substrateFanout.delivered['$CONTEXT_GRAPH'] did NOT grow (before=$DELIVERED_BEFORE after=$DELIVERED_AFTER) — substrate fan-out not firing for the canary CG"
     fi
-    # Queue depth on a healthy loopback mesh should be ~0. Allow a
-    # small floor (e.g. 2) so a single in-flight ack doesn't flake.
-    if [[ "$QUEUED_AFTER" -le 2 ]]; then
-      ok "swm.substrateFanout queued+inFlight=$QUEUED_AFTER (≤2 expected on healthy loopback)"
+    # All cumulative substrate counters are deltas (round-4 fix —
+    # the absolute floor check was meaningless against cumulative
+    # numbers). On a healthy loopback mesh the canary write should
+    # contribute zero queued/inFlight/failed entries for $CONTEXT_GRAPH.
+    QUEUED_DELTA=$((QUEUED_AFTER - QUEUED_BEFORE))
+    INFLIGHT_DELTA=$((INFLIGHT_AFTER - INFLIGHT_BEFORE))
+    FAILED_DELTA=$((FAILED_AFTER - FAILED_BEFORE))
+    if [[ "$QUEUED_DELTA" -eq 0 && "$INFLIGHT_DELTA" -eq 0 && "$FAILED_DELTA" -eq 0 ]]; then
+      ok "swm.substrateFanout queued/inFlight/failed deltas all 0 for '$CONTEXT_GRAPH' (canary delivered cleanly)"
     else
-      warn "swm.substrateFanout queued+inFlight=$QUEUED_AFTER (>2 — possible substrate fan-out stall)"
+      fail "swm.substrateFanout deltas for '$CONTEXT_GRAPH' non-zero: queued+=$QUEUED_DELTA inFlight+=$INFLIGHT_DELTA failed+=$FAILED_DELTA (substrate fan-out stall on healthy loopback)"
     fi
   fi
 fi
@@ -3197,76 +3231,104 @@ section_start "SECTION 35: rc.9 — SWM ack-quorum reaches steady state (PR-D)"
 if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
   skip "SECTION 35: skipped via SKIP_RC9_SUBSTRATE=1"
 else
+  # shareAckQuorum.pending is a LIVE gauge (records.size in
+  # ack-quorum.ts), so polling for drain is the right shape — and
+  # makes "reaches steady state" actually enforceable (Codex PR #588
+  # round 4: warning here let a stuck backlog stay green).
+  ACK_DRAIN_TIMEOUT_S="${ACK_DRAIN_TIMEOUT_S:-30}"
   for p in "${NODE_PORTS[@]}"; do
-    slo=$(c "http://127.0.0.1:$p/api/slo")
-    tracked=$(json_get "$slo" swm.shareAckQuorum.tracked)
-    completed=$(json_get "$slo" swm.shareAckQuorum.completed)
-    pending=$(json_get "$slo" swm.shareAckQuorum.pending)
-    watchdog=$(json_get "$slo" swm.shareAckQuorum.watchdogFired)
-    deadline=$(json_get "$slo" swm.shareAckQuorum.deadlineExpired)
-    if ! [[ "$tracked" =~ ^[0-9]+$ && "$completed" =~ ^[0-9]+$ && "$pending" =~ ^[0-9]+$ ]]; then
-      fail "Node $p shareAckQuorum counters missing or non-numeric (tracked=$tracked completed=$completed pending=$pending)"
+    drained=0
+    drain_t0=$(date +%s)
+    last_pending=""
+    last_tracked=""
+    last_completed=""
+    last_watchdog=""
+    last_deadline=""
+    while [[ $(( $(date +%s) - drain_t0 )) -lt "$ACK_DRAIN_TIMEOUT_S" ]]; do
+      slo=$(c "http://127.0.0.1:$p/api/slo")
+      last_tracked=$(json_get "$slo" swm.shareAckQuorum.tracked)
+      last_completed=$(json_get "$slo" swm.shareAckQuorum.completed)
+      last_pending=$(json_get "$slo" swm.shareAckQuorum.pending)
+      last_watchdog=$(json_get "$slo" swm.shareAckQuorum.watchdogFired)
+      last_deadline=$(json_get "$slo" swm.shareAckQuorum.deadlineExpired)
+      if ! [[ "$last_tracked" =~ ^[0-9]+$ && "$last_completed" =~ ^[0-9]+$ && "$last_pending" =~ ^[0-9]+$ ]]; then
+        break
+      fi
+      if [[ "$last_pending" -le 1 ]]; then
+        drained=1
+        break
+      fi
+      sleep 2
+    done
+    if ! [[ "$last_tracked" =~ ^[0-9]+$ && "$last_completed" =~ ^[0-9]+$ && "$last_pending" =~ ^[0-9]+$ ]]; then
+      fail "Node $p shareAckQuorum counters missing or non-numeric (tracked=$last_tracked completed=$last_completed pending=$last_pending)"
       continue
     fi
-    # On the sender (the node that published a share), tracked > 0
-    # is the strong signal. On receivers tracked stays 0. So we
-    # don't enforce a global tracked>0 here — just verify the
-    # pending invariant on every node.
-    if [[ "$pending" -le 1 ]]; then
-      ok "Node $p shareAckQuorum.pending=$pending (tracked=$tracked completed=$completed watchdogFired=$watchdog deadlineExpired=$deadline)"
+    drain_elapsed=$(( $(date +%s) - drain_t0 ))
+    # On the sender tracked>0 is the strong signal. On receivers
+    # tracked stays 0. Don't enforce a global tracked>0 — just
+    # verify the pending invariant.
+    if [[ "$drained" == "1" ]]; then
+      ok "Node $p shareAckQuorum.pending=$last_pending after ${drain_elapsed}s (tracked=$last_tracked completed=$last_completed watchdogFired=$last_watchdog deadlineExpired=$last_deadline)"
     else
-      warn "Node $p shareAckQuorum.pending=$pending — non-trivial backlog (tracked=$tracked completed=$completed)"
+      fail "Node $p shareAckQuorum.pending=$last_pending did NOT drain within ${ACK_DRAIN_TIMEOUT_S}s (tracked=$last_tracked completed=$last_completed) — stuck backlog"
     fi
   done
 fi
 section_done
 
 #------------------------------------------------------------
-section_start "SECTION 36: rc.9 PR-K — substrate fan-out queue depth healthy on dialable mesh"
+section_start "SECTION 36: rc.9 PR-K — no new substrate queued/failed during quiet window"
 # rc.9 PR-K tier-1+2 added `isPeerDialable` filtering: drop limited-
 # circuit-only peers (tier-1) and peers without PROTOCOL_SWM_UPDATE
-# handler (tier-2). On a devnet loopback mesh every peer is fully
-# dialable AND on rc.9, so the substrate fan-out should never accrue
-# `queued` or `failed` counts — both should be effectively zero.
+# handler (tier-2). On a dialable mesh that filter should prevent
+# any new `queued` or `failed` counters from accruing when no writes
+# are in flight.
 #
-# A non-zero count here would mean either PR-K isn't filtering
-# correctly (peers are being dialed that shouldn't be) or peers are
-# on stale rc.8 builds (no /dkg/10.0.1/swm-update handler).
+# Codex PR #588 round 4: the substrateFanout buckets are CUMULATIVE
+# (recordSwmSubstrateFanoutOutcome only increments) — absolute-value
+# checks are meaningless because earlier transient retries leave the
+# totals non-zero forever. We instead snapshot, sleep through a
+# write-free quiet window, snapshot again, and assert that NO new
+# queued/failed entries accrued on ANY CG. Stale-rc.8 peers or
+# broken dialability filter would manifest as ongoing background
+# retries that grow these counters even with no new writes.
 if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
   skip "SECTION 36: skipped via SKIP_RC9_SUBSTRATE=1"
 else
+  bucket_total() {
+    # Sum a bucket across all CGs in one SLO snapshot.
+    echo "$1" | BUCKET="$2" python3 -c "
+import os, sys, json
+bucket = os.environ.get('BUCKET','')
+try:
+  d = json.load(sys.stdin)
+  sf = (d.get('swm') or {}).get('substrateFanout') or {}
+  print(sum(int(v) for v in (sf.get(bucket) or {}).values()))
+except Exception:
+  print(0)
+" 2>/dev/null
+  }
+  declare -a QUEUED_BEFORE_36=()
+  declare -a FAILED_BEFORE_36=()
   for p in "${NODE_PORTS[@]}"; do
     slo=$(c "http://127.0.0.1:$p/api/slo")
-    queued=$(echo "$slo" | python3 -c "
-import sys, json
-try:
-  d = json.load(sys.stdin)
-  sf = (d.get('swm') or {}).get('substrateFanout') or {}
-  print(sum(int(v) for v in (sf.get('queued') or {}).values()))
-except Exception:
-  print(0)
-" 2>/dev/null)
-    failed=$(echo "$slo" | python3 -c "
-import sys, json
-try:
-  d = json.load(sys.stdin)
-  sf = (d.get('swm') or {}).get('substrateFanout') or {}
-  print(sum(int(v) for v in (sf.get('failed') or {}).values()))
-except Exception:
-  print(0)
-" 2>/dev/null)
-    if [[ "$queued" -le 1 ]]; then
-      ok "Node $p substrateFanout.queued=$queued (≤1 — PR-K dialable-only filter working)"
+    QUEUED_BEFORE_36+=("$(bucket_total "$slo" queued)")
+    FAILED_BEFORE_36+=("$(bucket_total "$slo" failed)")
+  done
+  echo "  observing substrate counters across ${FANOUT_QUIET_WINDOW_S}s quiet window (no writes)..."
+  sleep "$FANOUT_QUIET_WINDOW_S"
+  for idx in $(seq 0 $((NUM_NODES - 1))); do
+    p=${NODE_PORTS[$idx]}
+    slo=$(c "http://127.0.0.1:$p/api/slo")
+    q_after=$(bucket_total "$slo" queued)
+    f_after=$(bucket_total "$slo" failed)
+    q_delta=$((q_after - ${QUEUED_BEFORE_36[$idx]}))
+    f_delta=$((f_after - ${FAILED_BEFORE_36[$idx]}))
+    if [[ "$q_delta" -eq 0 && "$f_delta" -eq 0 ]]; then
+      ok "Node $p substrateFanout queued/failed deltas both 0 across ${FANOUT_QUIET_WINDOW_S}s quiet window (PR-K dialable-only filter healthy)"
     else
-      fail "Node $p substrateFanout.queued=$queued (>1 — possible dialability regression)"
-    fi
-    if [[ "$failed" -eq 0 ]]; then
-      ok "Node $p substrateFanout.failed=0"
-    else
-      # Hard fail (Codex PR #588): section comment says non-zero failed
-      # indicates a dialability/protocol regression — warn would let CI
-      # stay green while substrate fan-out is actively failing.
-      fail "Node $p substrateFanout.failed=$failed (non-zero — substrate send errors; possible dialability/protocol regression)"
+      fail "Node $p substrateFanout grew during ${FANOUT_QUIET_WINDOW_S}s quiet window: queued+=$q_delta failed+=$f_delta (background retries — possible dialability regression or stale-rc.8 peer)"
     fi
   done
 fi

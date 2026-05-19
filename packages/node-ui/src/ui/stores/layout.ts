@@ -4,16 +4,20 @@ interface LayoutState {
   leftCollapsed: boolean;
   rightCollapsed: boolean;
   bottomCollapsed: boolean;
+  bottomMaximised: boolean;
   theme: 'dark' | 'light';
   leftWidth: number;
   rightWidth: number;
+  bottomHeight: number;
 
   toggleLeft: () => void;
   toggleRight: () => void;
   toggleBottom: () => void;
+  toggleBottomMaximised: () => void;
   setTheme: (t: 'dark' | 'light') => void;
   setLeftWidth: (w: number) => void;
   setRightWidth: (w: number) => void;
+  setBottomHeight: (h: number) => void;
 }
 
 const LAYOUT_STORAGE_KEY = 'dkg-layout';
@@ -24,7 +28,12 @@ interface PersistedLayout {
   bottomCollapsed?: boolean;
   leftWidth?: number;
   rightWidth?: number;
+  bottomHeight?: number;
 }
+
+const BOTTOM_HEIGHT_MIN = 80;
+const BOTTOM_HEIGHT_MAX = 900;
+const BOTTOM_HEIGHT_DEFAULT = 260;
 
 const DEFAULTS = {
   leftCollapsed: false,
@@ -32,6 +41,7 @@ const DEFAULTS = {
   bottomCollapsed: true,
   leftWidth: 240,
   rightWidth: 360,
+  bottomHeight: BOTTOM_HEIGHT_DEFAULT,
 };
 
 // Must match the live drag handlers in App.tsx (`useDragResize`); without
@@ -61,6 +71,7 @@ function loadPersisted(): Required<PersistedLayout> {
       bottomCollapsed: typeof parsed.bottomCollapsed === 'boolean' ? parsed.bottomCollapsed : DEFAULTS.bottomCollapsed,
       leftWidth: clampWidth(parsed.leftWidth, DEFAULTS.leftWidth, LEFT_WIDTH_MIN, LEFT_WIDTH_MAX),
       rightWidth: clampWidth(parsed.rightWidth, DEFAULTS.rightWidth, RIGHT_WIDTH_MIN, RIGHT_WIDTH_MAX),
+      bottomHeight: clampWidth(parsed.bottomHeight, DEFAULTS.bottomHeight, BOTTOM_HEIGHT_MIN, BOTTOM_HEIGHT_MAX),
     };
   } catch {
     return DEFAULTS;
@@ -82,45 +93,51 @@ function persist(state: PersistedLayout): void {
 
 const initial = loadPersisted();
 
+function getAndPersist(get: () => LayoutState) {
+  const { leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth, bottomHeight } = get();
+  persist({ leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth, bottomHeight });
+}
+
 export const useLayoutStore = create<LayoutState>((set, get) => ({
   leftCollapsed: initial.leftCollapsed,
   rightCollapsed: initial.rightCollapsed,
   bottomCollapsed: initial.bottomCollapsed,
+  bottomMaximised: false,
   theme: (localStorage.getItem('dkg-theme') as 'dark' | 'light') || 'dark',
   leftWidth: initial.leftWidth,
   rightWidth: initial.rightWidth,
+  bottomHeight: initial.bottomHeight,
 
   toggleLeft: () => {
     set((s) => ({ leftCollapsed: !s.leftCollapsed }));
-    const { leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth } = get();
-    persist({ leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth });
+    getAndPersist(get);
   },
   toggleRight: () => {
     set((s) => ({ rightCollapsed: !s.rightCollapsed }));
-    const { leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth } = get();
-    persist({ leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth });
+    getAndPersist(get);
   },
   toggleBottom: () => {
-    set((s) => ({ bottomCollapsed: !s.bottomCollapsed }));
-    const { leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth } = get();
-    persist({ leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth });
+    set((s) => ({ bottomCollapsed: !s.bottomCollapsed, bottomMaximised: false }));
+    getAndPersist(get);
+  },
+  toggleBottomMaximised: () => {
+    set((s) => ({ bottomMaximised: !s.bottomMaximised, bottomCollapsed: false }));
+    getAndPersist(get);
   },
   setTheme: (t) => {
     localStorage.setItem('dkg-theme', t);
     set({ theme: t });
   },
   setLeftWidth: (w) => {
-    // Clamp at the setter boundary so the store itself enforces the layout
-    // contract — any caller (not just the drag handler in App.tsx) pushes
-    // values within the supported bounds, and persisted state stays
-    // consistent with what loadPersisted accepts on reload.
     set({ leftWidth: clamp(w, LEFT_WIDTH_MIN, LEFT_WIDTH_MAX) });
-    const { leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth } = get();
-    persist({ leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth });
+    getAndPersist(get);
   },
   setRightWidth: (w) => {
     set({ rightWidth: clamp(w, RIGHT_WIDTH_MIN, RIGHT_WIDTH_MAX) });
-    const { leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth } = get();
-    persist({ leftCollapsed, rightCollapsed, bottomCollapsed, leftWidth, rightWidth });
+    getAndPersist(get);
+  },
+  setBottomHeight: (h) => {
+    set({ bottomHeight: clamp(h, BOTTOM_HEIGHT_MIN, BOTTOM_HEIGHT_MAX) });
+    getAndPersist(get);
   },
 }));

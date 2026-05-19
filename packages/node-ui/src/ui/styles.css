@@ -1968,16 +1968,22 @@ button:focus:not(:focus-visible) { outline: none; }
 }
 .v10-log-filter:focus { border-color: var(--accent-blue, #3b82f6); }
 .v10-log-level-select {
-  padding: 3px 6px;
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 3px 22px 3px 8px;
   font-size: 11px;
-  background: var(--bg-surface);
+  background: var(--bg-surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b7280'/%3E%3C/svg%3E") no-repeat right 6px center;
   border: 1px solid var(--border-subtle);
   border-radius: 4px;
   color: var(--text-secondary);
   font-family: var(--font-sans);
   outline: none;
   flex-shrink: 0;
+  cursor: pointer;
+  transition: border-color 0.15s;
 }
+.v10-log-level-select:hover { border-color: var(--border-default); color: var(--text-primary); }
+.v10-log-level-select:focus { outline: none; border-color: var(--accent-blue, #3b82f6); }
 .v10-log-output {
   flex: 1;
   overflow: auto;

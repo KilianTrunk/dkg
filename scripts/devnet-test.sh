@@ -3062,12 +3062,21 @@ else
   done
   # Hard fail (Codex PR #588 round 2) once per unreachable target so a
   # broken /api/info doesn't silently skip protocol-advertisement
-  # checks for that node and hide a wire-version regression.
+  # checks for that node and hide a wire-version regression. Round 6
+  # adds the same sentinel validation for nodeRole — if that field
+  # stops parsing on a core node, we'd silently drop /dkg/10.0.1/
+  # storage-ack from expected_for_target and pass without checking it.
   for j in $(seq 0 $((NUM_NODES - 1))); do
     target_port=${NODE_PORTS[$j]}
     target_peer=${TARGET_PEER_IDS[$j]}
+    target_role=${TARGET_NODE_ROLES[$j]}
     if [[ -z "$target_peer" || "$target_peer" == "__NONE__" || "$target_peer" == "__ERR__" ]]; then
       fail "N$((j+1)) ($target_port) peerId unreadable via /api/info — cannot verify substrate protocol advertisements"
+    fi
+    if [[ -z "$target_role" || "$target_role" == "__NONE__" || "$target_role" == "__ERR__" ]]; then
+      fail "N$((j+1)) ($target_port) nodeRole unreadable via /api/info — cannot decide expected core-only protocols"
+    elif [[ "$target_role" != "core" && "$target_role" != "edge" ]]; then
+      fail "N$((j+1)) ($target_port) nodeRole='$target_role' is not 'core' or 'edge' — unrecognised role; cannot decide expected protocols"
     fi
   done
   for i in $(seq 0 $((NUM_NODES - 1))); do
@@ -3076,10 +3085,15 @@ else
       [[ "$i" == "$j" ]] && continue
       target_port=${NODE_PORTS[$j]}
       target_peer=${TARGET_PEER_IDS[$j]}
-      # Already failed once above — silently skip the pair iteration
-      # rather than re-emitting per observer (N-1 noisy lines per bad
-      # target).
+      target_role=${TARGET_NODE_ROLES[$j]}
+      # Already failed once above for bad peerId or nodeRole — silently
+      # skip the pair iteration rather than re-emitting per observer
+      # (N-1 noisy lines per bad target).
       if [[ -z "$target_peer" || "$target_peer" == "__NONE__" || "$target_peer" == "__ERR__" ]]; then
+        continue
+      fi
+      if [[ -z "$target_role" || "$target_role" == "__NONE__" || "$target_role" == "__ERR__" \
+            || ( "$target_role" != "core" && "$target_role" != "edge" ) ]]; then
         continue
       fi
       pi=$(c "http://127.0.0.1:$observer_port/api/peer-info?peerId=$target_peer")
@@ -3095,7 +3109,7 @@ except Exception:
 " 2>/dev/null)
       # Build the per-target expected set: universal protocols on
       # every node + core-only protocols when target is core.
-      target_role=${TARGET_NODE_ROLES[$j]}
+      # (target_role already captured above for sentinel validation.)
       expected_for_target=("${EXPECTED_UNIVERSAL[@]}")
       if [[ "$target_role" == "core" ]]; then
         expected_for_target+=("${EXPECTED_CORE_ONLY[@]}")
@@ -3312,40 +3326,62 @@ if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
   skip "SECTION 36: skipped via SKIP_RC9_SUBSTRATE=1"
 else
   bucket_total() {
-    # Sum a bucket across all CGs in one SLO snapshot.
+    # Sum a bucket across all CGs in one SLO snapshot. Emits __ERR__
+    # on parse/schema failure (Codex PR #588 round 6: collapsing parse
+    # errors to 0 produced false PASSes when /api/slo was unreadable).
     echo "$1" | BUCKET="$2" python3 -c "
 import os, sys, json
 bucket = os.environ.get('BUCKET','')
 try:
   d = json.load(sys.stdin)
   sf = (d.get('swm') or {}).get('substrateFanout') or {}
-  print(sum(int(v) for v in (sf.get(bucket) or {}).values()))
+  b = sf.get(bucket)
+  if not isinstance(b, dict):
+    # Bucket can legitimately be absent (no writes yet) → 0.
+    print(0)
+  else:
+    print(sum(int(v) for v in b.values()))
 except Exception:
-  print(0)
+  print('__ERR__')
 " 2>/dev/null
   }
   declare -a QUEUED_BEFORE_36=()
   declare -a FAILED_BEFORE_36=()
+  abort_36=0
   for p in "${NODE_PORTS[@]}"; do
     slo=$(c "http://127.0.0.1:$p/api/slo")
-    QUEUED_BEFORE_36+=("$(bucket_total "$slo" queued)")
-    FAILED_BEFORE_36+=("$(bucket_total "$slo" failed)")
-  done
-  echo "  observing substrate counters across ${FANOUT_QUIET_WINDOW_S}s quiet window (no writes)..."
-  sleep "$FANOUT_QUIET_WINDOW_S"
-  for idx in $(seq 0 $((NUM_NODES - 1))); do
-    p=${NODE_PORTS[$idx]}
-    slo=$(c "http://127.0.0.1:$p/api/slo")
-    q_after=$(bucket_total "$slo" queued)
-    f_after=$(bucket_total "$slo" failed)
-    q_delta=$((q_after - ${QUEUED_BEFORE_36[$idx]}))
-    f_delta=$((f_after - ${FAILED_BEFORE_36[$idx]}))
-    if [[ "$q_delta" -eq 0 && "$f_delta" -eq 0 ]]; then
-      ok "Node $p substrateFanout queued/failed deltas both 0 across ${FANOUT_QUIET_WINDOW_S}s quiet window (PR-K dialable-only filter healthy)"
-    else
-      fail "Node $p substrateFanout grew during ${FANOUT_QUIET_WINDOW_S}s quiet window: queued+=$q_delta failed+=$f_delta (background retries — possible dialability regression or stale-rc.8 peer)"
+    qb=$(bucket_total "$slo" queued)
+    fb=$(bucket_total "$slo" failed)
+    if [[ "$qb" == "__ERR__" || "$fb" == "__ERR__" ]]; then
+      fail "Node $p /api/slo unparseable for BEFORE snapshot (queued=$qb failed=$fb) — observability broken; cannot run quiet-window check"
+      abort_36=1
     fi
+    QUEUED_BEFORE_36+=("$qb")
+    FAILED_BEFORE_36+=("$fb")
   done
+  if [[ "$abort_36" == "1" ]]; then
+    skip "SECTION 36: aborted — at least one BEFORE snapshot was unreadable (see fail(s) above)"
+  else
+    echo "  observing substrate counters across ${FANOUT_QUIET_WINDOW_S}s quiet window (no writes)..."
+    sleep "$FANOUT_QUIET_WINDOW_S"
+    for idx in $(seq 0 $((NUM_NODES - 1))); do
+      p=${NODE_PORTS[$idx]}
+      slo=$(c "http://127.0.0.1:$p/api/slo")
+      q_after=$(bucket_total "$slo" queued)
+      f_after=$(bucket_total "$slo" failed)
+      if [[ "$q_after" == "__ERR__" || "$f_after" == "__ERR__" ]]; then
+        fail "Node $p /api/slo unparseable for AFTER snapshot (queued=$q_after failed=$f_after) — observability broken; cannot assert quiet-window invariant"
+        continue
+      fi
+      q_delta=$((q_after - ${QUEUED_BEFORE_36[$idx]}))
+      f_delta=$((f_after - ${FAILED_BEFORE_36[$idx]}))
+      if [[ "$q_delta" -eq 0 && "$f_delta" -eq 0 ]]; then
+        ok "Node $p substrateFanout queued/failed deltas both 0 across ${FANOUT_QUIET_WINDOW_S}s quiet window (PR-K dialable-only filter healthy)"
+      else
+        fail "Node $p substrateFanout grew during ${FANOUT_QUIET_WINDOW_S}s quiet window: queued+=$q_delta failed+=$f_delta (background retries — possible dialability regression or stale-rc.8 peer)"
+      fi
+    done
+  fi
 fi
 section_done
 
@@ -3423,15 +3459,20 @@ except Exception:
     RCPT_INFO=$(c "http://127.0.0.1:$RECIPIENT_PORT/api/info")
     RCPT_PEER=$(json_get "$RCPT_INFO" peerId)
     RCPT_NAME=$(json_get "$(c "http://127.0.0.1:$RECIPIENT_PORT/api/agent/identity")" name)
-    if [[ -z "$RCPT_PEER" || "$RCPT_PEER" == "__NONE__" ]]; then
-      fail "Could not capture recipient peerId on port $RECIPIENT_PORT — aborting SECTION 37"
+    # Sentinel-validate BOTH RCPT_PEER and N1_PEER (Codex PR #588
+    # round 6: missing __ERR__ guard would let us send chats to a
+    # bogus peer ID and turn a setup/diagnostic failure into a
+    # misleading outbox failure).
+    if [[ -z "$RCPT_PEER" || "$RCPT_PEER" == "__NONE__" || "$RCPT_PEER" == "__ERR__" ]]; then
+      fail "Could not capture recipient peerId on port $RECIPIENT_PORT (got '$RCPT_PEER') — aborting SECTION 37"
     else
-      ok "Recipient: name='$RCPT_NAME' peerId=${RCPT_PEER:0:32}…"
-
-      # Capture N1's peerId so we can filter the inbox query.
       N1_PEER=$(json_get "$(c "http://127.0.0.1:$N1_PORT/api/info")" peerId)
+      if [[ -z "$N1_PEER" || "$N1_PEER" == "__NONE__" || "$N1_PEER" == "__ERR__" ]]; then
+        fail "Could not capture N1 peerId on port $N1_PORT (got '$N1_PEER') — inbox filter would not work; aborting SECTION 37"
+      else
+        ok "Recipient: name='$RCPT_NAME' peerId=${RCPT_PEER:0:32}… (N1 peerId=${N1_PEER:0:32}…)"
 
-      echo "--- 37b: stop recipient daemon (substrate outbox should hold messages) ---"
+        echo "--- 37b: stop recipient daemon (substrate outbox should hold messages) ---"
       OLD_PID=$(cat "$RECIPIENT_PIDFILE")
       if kill -0 "$OLD_PID" 2>/dev/null; then
         kill "$OLD_PID" 2>/dev/null || true
@@ -3607,6 +3648,7 @@ except Exception:
         fi
       fi
       fi  # close the ABORT_RESTART else-branch
+      fi  # close the N1_PEER sentinel-validation else-branch (round 6)
     fi
   fi
 fi

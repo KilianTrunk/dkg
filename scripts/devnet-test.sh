@@ -32,8 +32,12 @@ SCRIPT_T0=$(date +%s)
 #   INVITE_DENIED_TIMEOUT_S=90  — SECTION 31 catch-up poll budget (denied/done)
 #   EDGE_OUTBOX_FLUSH_TIMEOUT_S=45  — SECTION 37 poll budget for substrate flush after recipient restart
 #   IDEMPOTENCY_QUIET_PERIOD_S=10   — SECTION 37 post-first-match window to catch late duplicates before asserting exactly-once
-#   ACK_DRAIN_TIMEOUT_S=30          — SECTION 35 poll budget for shareAckQuorum.pending to drain to ≤1
-#   FANOUT_QUIET_WINDOW_S=8         — SECTION 36 quiet-window length to observe substrate counter deltas
+#   ACK_DRAIN_TIMEOUT_S=75          — SECTION 35 poll budget for shareAckQuorum.pending to drain to ≤1.
+#                                     Default is 2.5× DEFAULT_WATCHDOG_MS (30s in swm/ack-quorum.ts) so a
+#                                     share recovering only on the first watchdog cycle has time to drain.
+#   FANOUT_QUIET_WINDOW_S=40        — SECTION 36 quiet-window length to observe substrate counter deltas.
+#                                     Default exceeds MESSAGE_OUTBOX_TICK_MS (30s in dkg-agent-constants.ts)
+#                                     so the window covers at least one full retry-tick cycle.
 SKIP_RESTART="${SKIP_RESTART:-0}"
 SKIP_MATRIX="${SKIP_MATRIX:-0}"
 SKIP_INVITE_FLOW="${SKIP_INVITE_FLOW:-0}"
@@ -43,8 +47,8 @@ RESTART_BOOT_TIMEOUT_S="${RESTART_BOOT_TIMEOUT_S:-60}"
 INVITE_DENIED_TIMEOUT_S="${INVITE_DENIED_TIMEOUT_S:-90}"
 EDGE_OUTBOX_FLUSH_TIMEOUT_S="${EDGE_OUTBOX_FLUSH_TIMEOUT_S:-45}"
 IDEMPOTENCY_QUIET_PERIOD_S="${IDEMPOTENCY_QUIET_PERIOD_S:-10}"
-ACK_DRAIN_TIMEOUT_S="${ACK_DRAIN_TIMEOUT_S:-30}"
-FANOUT_QUIET_WINDOW_S="${FANOUT_QUIET_WINDOW_S:-8}"
+ACK_DRAIN_TIMEOUT_S="${ACK_DRAIN_TIMEOUT_S:-75}"
+FANOUT_QUIET_WINDOW_S="${FANOUT_QUIET_WINDOW_S:-40}"
 
 # Per-section timer helpers (used by sections 28-30). The existing 27
 # sections aren't wrapped — see comment on SCRIPT_T0 above.
@@ -3208,14 +3212,24 @@ except Exception:
     # All cumulative substrate counters are deltas (round-4 fix —
     # the absolute floor check was meaningless against cumulative
     # numbers). On a healthy loopback mesh the canary write should
-    # contribute zero queued/inFlight/failed entries for $CONTEXT_GRAPH.
+    # contribute zero failed entries for $CONTEXT_GRAPH; transient
+    # queued/inFlight can occur after the earlier restart/connectivity
+    # sections and are still healthy if they later flush — that
+    # property is enforced by §35 (poll-to-drain) + §36 (quiet-window
+    # delta). So we hard-fail on `failed` (terminal) and warn on
+    # transient queued/inFlight (Codex PR #588 round 5).
     QUEUED_DELTA=$((QUEUED_AFTER - QUEUED_BEFORE))
     INFLIGHT_DELTA=$((INFLIGHT_AFTER - INFLIGHT_BEFORE))
     FAILED_DELTA=$((FAILED_AFTER - FAILED_BEFORE))
-    if [[ "$QUEUED_DELTA" -eq 0 && "$INFLIGHT_DELTA" -eq 0 && "$FAILED_DELTA" -eq 0 ]]; then
-      ok "swm.substrateFanout queued/inFlight/failed deltas all 0 for '$CONTEXT_GRAPH' (canary delivered cleanly)"
+    if [[ "$FAILED_DELTA" -eq 0 ]]; then
+      ok "swm.substrateFanout.failed delta=0 for '$CONTEXT_GRAPH' (no terminal send errors on canary)"
     else
-      fail "swm.substrateFanout deltas for '$CONTEXT_GRAPH' non-zero: queued+=$QUEUED_DELTA inFlight+=$INFLIGHT_DELTA failed+=$FAILED_DELTA (substrate fan-out stall on healthy loopback)"
+      fail "swm.substrateFanout.failed['$CONTEXT_GRAPH'] grew by $FAILED_DELTA after canary write (terminal send error on healthy loopback)"
+    fi
+    if [[ "$QUEUED_DELTA" -eq 0 && "$INFLIGHT_DELTA" -eq 0 ]]; then
+      ok "swm.substrateFanout queued/inFlight deltas both 0 for '$CONTEXT_GRAPH' (canary cleanly delivered, no backlog)"
+    else
+      warn "swm.substrateFanout transient queued+=$QUEUED_DELTA inFlight+=$INFLIGHT_DELTA for '$CONTEXT_GRAPH' (still healthy if §35 drains + §36 quiet window stays flat)"
     fi
   fi
 fi
@@ -3234,8 +3248,9 @@ else
   # shareAckQuorum.pending is a LIVE gauge (records.size in
   # ack-quorum.ts), so polling for drain is the right shape — and
   # makes "reaches steady state" actually enforceable (Codex PR #588
-  # round 4: warning here let a stuck backlog stay green).
-  ACK_DRAIN_TIMEOUT_S="${ACK_DRAIN_TIMEOUT_S:-30}"
+  # round 4: warning here let a stuck backlog stay green). Default
+  # budget is set at file-top (75s = 2.5× DEFAULT_WATCHDOG_MS) so a
+  # share recovering only on the first watchdog cycle has time to drain.
   for p in "${NODE_PORTS[@]}"; do
     drained=0
     drain_t0=$(date +%s)

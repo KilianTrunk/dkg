@@ -26,13 +26,19 @@ SCRIPT_T0=$(date +%s)
 #   SKIP_RESTART=1        — skip SECTION 30 (Node1 restart, ~30-60s)
 #   SKIP_MATRIX=1         — skip SECTION 29 (cross-node connect matrix)
 #   SKIP_INVITE_FLOW=1    — skip SECTION 31 (curated CG invite/join e2e, ~10-30s)
-#   RESTART_BOOT_TIMEOUT_S=60   — how long SECTION 30 waits for Node1's API
+#   SKIP_RC9_SUBSTRATE=1  — skip SECTIONS 32-36 (rc.9 SLO + SWM substrate observability)
+#   SKIP_EDGE_RESTART=1   — skip SECTION 37 (edge restart outbox-durability, ~30-60s)
+#   RESTART_BOOT_TIMEOUT_S=60   — how long SECTION 30 / 37 waits for the node's API
 #   INVITE_DENIED_TIMEOUT_S=90  — SECTION 31 catch-up poll budget (denied/done)
+#   EDGE_OUTBOX_FLUSH_TIMEOUT_S=45  — SECTION 37 poll budget for substrate flush after recipient restart
 SKIP_RESTART="${SKIP_RESTART:-0}"
 SKIP_MATRIX="${SKIP_MATRIX:-0}"
 SKIP_INVITE_FLOW="${SKIP_INVITE_FLOW:-0}"
+SKIP_RC9_SUBSTRATE="${SKIP_RC9_SUBSTRATE:-0}"
+SKIP_EDGE_RESTART="${SKIP_EDGE_RESTART:-0}"
 RESTART_BOOT_TIMEOUT_S="${RESTART_BOOT_TIMEOUT_S:-60}"
 INVITE_DENIED_TIMEOUT_S="${INVITE_DENIED_TIMEOUT_S:-90}"
+EDGE_OUTBOX_FLUSH_TIMEOUT_S="${EDGE_OUTBOX_FLUSH_TIMEOUT_S:-45}"
 
 # Per-section timer helpers (used by sections 28-30). The existing 27
 # sections aren't wrapped — see comment on SCRIPT_T0 above.
@@ -2923,6 +2929,476 @@ except Exception:
       ok "N3's project list correctly omits the inaccessible CG"
     else
       fail "N3 has a phantom entry for $INVITE_CG_ID"
+    fi
+  fi
+fi
+section_done
+
+#------------------------------------------------------------
+# SECTIONS 32-37 — rc.9 Universal Messenger + SWM substrate observability.
+#
+# Backstory: rc.9 (PR #587 merge train) introduced the Universal
+# Messenger substrate (`/dkg/10.0.1/*`) with durable per-protocol
+# outbox + receiver idempotency, the SWM substrate fan-out path with
+# ack-quorum watchdog (`/dkg/10.0.1/swm-update` + `/dkg/10.0.1/
+# swm-share-ack`), and the `/api/slo` diagnostics endpoint. Sections
+# 32-37 verify the user-observable contracts of those changes that
+# pre-rc.9 devnet sections don't actively assert (most sections pass
+# unchanged because chat/SWM read-back is unchanged from outside).
+#
+# All 6 sections are gated by SKIP_RC9_SUBSTRATE=1 for operators
+# running this script against pre-rc.9 nodes. SECTION 37 is also gated
+# by SKIP_EDGE_RESTART=1 because it kills/restarts an edge daemon.
+
+#------------------------------------------------------------
+section_start "SECTION 32: rc.9 — /api/slo endpoint shape & cold-start safety"
+# The /api/slo endpoint (rc.9 PR-12 + PR-A/C/D additions) is the
+# operator's primary lens into messenger latency, gossip publish
+# failures, SWM redundant-apply counters, substrate fan-out outcomes,
+# and ack-quorum tracker state. This section verifies the wire shape
+# is intact on every node — schema drift here would silently break
+# every soak script + operator dashboard.
+if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
+  skip "SECTION 32: skipped via SKIP_RC9_SUBSTRATE=1"
+else
+  for p in "${NODE_PORTS[@]}"; do
+    slo=$(c "http://127.0.0.1:$p/api/slo")
+    # Top-level keys must exist on every production agent.
+    has_protocols=$(json_get "$slo" protocols)
+    has_gossip=$(json_get "$slo" gossip.publishFailuresOverflow)
+    has_swm=$(json_get "$slo" swm.redundantAppliesOverflow)
+    if [[ "$has_protocols" != "__NONE__" && "$has_protocols" != "__ERR__" ]]; then
+      ok "Node $p /api/slo returns protocols map"
+    else
+      fail "Node $p /api/slo missing protocols"
+    fi
+    if [[ "$has_gossip" =~ ^[0-9]+$ ]]; then
+      ok "Node $p /api/slo gossip.publishFailuresOverflow=$has_gossip (numeric)"
+    else
+      fail "Node $p /api/slo gossip.publishFailuresOverflow not numeric: $has_gossip"
+    fi
+    if [[ "$has_swm" =~ ^[0-9]+$ ]]; then
+      ok "Node $p /api/slo swm.redundantAppliesOverflow=$has_swm (numeric)"
+    else
+      fail "Node $p /api/slo swm.redundantAppliesOverflow not numeric: $has_swm"
+    fi
+    # rc.9 PR-C: substrate fan-out overlay must be present on every
+    # production agent (the optional-on-interface caveat in the code
+    # is only there for test doubles).
+    sf_truncated=$(json_get "$slo" swm.substrateFanout.truncated)
+    if [[ "$sf_truncated" == "true" || "$sf_truncated" == "false" ]]; then
+      ok "Node $p exposes swm.substrateFanout (PR-C)"
+    else
+      fail "Node $p missing swm.substrateFanout overlay (got truncated=$sf_truncated)"
+    fi
+    # rc.9 PR-D: ack-quorum overlay must be present.
+    aq_pending=$(json_get "$slo" swm.shareAckQuorum.pending)
+    if [[ "$aq_pending" =~ ^[0-9]+$ ]]; then
+      ok "Node $p exposes swm.shareAckQuorum (PR-D), pending=$aq_pending"
+    else
+      fail "Node $p missing swm.shareAckQuorum overlay (got pending=$aq_pending)"
+    fi
+  done
+fi
+section_done
+
+#------------------------------------------------------------
+section_start "SECTION 33: rc.9 — substrate protocols negotiated on the wire (/dkg/10.0.1/*)"
+# rc.9 bumped 8+ short-message protocols from /dkg/10.0.0/* to
+# /dkg/10.0.1/*. A devnet-wide mismatch (one node still on 10.0.0)
+# would manifest as silently queued substrate messages. The peerStore
+# protocols list returned by /api/peer-info?peerId=<X> proves the
+# identify handshake advertised the rc.9 prefix on both sides.
+if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
+  skip "SECTION 33: skipped via SKIP_RC9_SUBSTRATE=1"
+elif [[ "$NUM_NODES" -lt 2 ]]; then
+  skip "SECTION 33: need ≥2 nodes (have $NUM_NODES)"
+else
+  N1_PORT=${NODE_PORTS[0]}
+  N2_PORT=${NODE_PORTS[1]}
+  N2_PEER=$(json_get "$(c "http://127.0.0.1:$N2_PORT/api/info")" peerId)
+  if [[ -z "$N2_PEER" || "$N2_PEER" == "__NONE__" || "$N2_PEER" == "__ERR__" ]]; then
+    fail "Could not capture N2 peerId — aborting SECTION 33"
+  else
+    PI=$(c "http://127.0.0.1:$N1_PORT/api/peer-info?peerId=$N2_PEER")
+    # peerStore.protocols is an array of advertised protocol IDs.
+    PROTOS=$(echo "$PI" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  ps = d.get('peerStore') or {}
+  for p in ps.get('protocols', []):
+    print(p)
+except Exception:
+  pass
+" 2>/dev/null)
+    # rc.9 substrate protocol IDs we expect to see on every healthy
+    # peer. Skip /dkg/10.0.1/access — only advertised once an agent
+    # actually consumes a private CG, not part of the base set.
+    EXPECTED=(
+      "/dkg/10.0.1/message"
+      "/dkg/10.0.1/sync"
+      "/dkg/10.0.1/swm-update"
+      "/dkg/10.0.1/swm-share-ack"
+      "/dkg/10.0.1/swm-sender-key"
+      "/dkg/10.0.1/storage-ack"
+      "/dkg/10.0.1/verify-proposal"
+      "/dkg/10.0.1/join-request"
+      "/dkg/10.0.1/query-remote"
+    )
+    for proto in "${EXPECTED[@]}"; do
+      if echo "$PROTOS" | grep -qx "$proto"; then
+        ok "N1 sees N2 advertising $proto"
+      else
+        fail "N1 does NOT see N2 advertising $proto (peerStore.protocols mismatch — possible wire-prefix drift)"
+      fi
+    done
+    # Also verify the rc.8 legacy prefix is GONE for the migrated
+    # protocols. /dkg/10.0.0/verify-approval is the documented
+    # survivor — everything else should be cleared. If we still see
+    # /dkg/10.0.0/message etc., a peer is on a stale build.
+    for legacy in "/dkg/10.0.0/message" "/dkg/10.0.0/sync"; do
+      if echo "$PROTOS" | grep -qx "$legacy"; then
+        warn "N1 still sees N2 advertising legacy $legacy — peer may be on rc.8"
+      fi
+    done
+  fi
+fi
+section_done
+
+#------------------------------------------------------------
+section_start "SECTION 34: rc.9 — SWM substrate fan-out delivers (PR-C counters)"
+# rc.9 PR-C added a direct substrate fan-out for SWM shares
+# (PROTOCOL_SWM_UPDATE = /dkg/10.0.1/swm-update). Existing SWM
+# sections only assert read-back via SPARQL, which passes equally
+# whether gossip OR substrate delivered. This section asserts that
+# `swm.substrateFanout.delivered` ACTUALLY grows when N1 writes a
+# share — i.e. that the substrate path is exercised, not just gossip.
+#
+# We use the pre-existing `devnet-test` CG (which other nodes are
+# already subscribed to from earlier sections) to avoid extra setup.
+if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
+  skip "SECTION 34: skipped via SKIP_RC9_SUBSTRATE=1"
+elif [[ "$NUM_NODES" -lt 2 ]]; then
+  skip "SECTION 34: need ≥2 nodes (have $NUM_NODES)"
+else
+  N1_PORT=${NODE_PORTS[0]}
+  # `delivered` is keyed by contextGraphId. Sum across all CGs for
+  # the baseline → after-write delta. A simple grand-total avoids
+  # us having to know which CGs N1 has fanned out to.
+  sum_delivered() {
+    echo "$1" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  sf = (d.get('swm') or {}).get('substrateFanout') or {}
+  delivered = sf.get('delivered') or {}
+  print(sum(int(v) for v in delivered.values()))
+except Exception:
+  print(0)
+" 2>/dev/null
+  }
+  sum_queued() {
+    echo "$1" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  sf = (d.get('swm') or {}).get('substrateFanout') or {}
+  q = sf.get('queued') or {}
+  inflight = sf.get('inFlight') or {}
+  print(sum(int(v) for v in q.values()) + sum(int(v) for v in inflight.values()))
+except Exception:
+  print(0)
+" 2>/dev/null
+  }
+
+  SLO_BEFORE=$(c "http://127.0.0.1:$N1_PORT/api/slo")
+  DELIVERED_BEFORE=$(sum_delivered "$SLO_BEFORE")
+
+  # Write a tagged quad so we can correlate with the after-snapshot.
+  # `ql` wraps the object as a literal; `q` would pass the raw URI form.
+  TAG="urn:rc9-fanout:$(date +%s%N)"
+  WRITE=$(c -X POST "http://127.0.0.1:$N1_PORT/api/shared-memory/write" -d "{
+    \"contextGraphId\":\"$CONTEXT_GRAPH\",
+    \"quads\":[$(ql "$TAG" "http://schema.org/name" "rc9-substrate-fanout-canary")]
+  }")
+  WRITE_OK=$(json_get "$WRITE" triplesWritten)
+  if [[ "$WRITE_OK" != "1" ]]; then
+    fail "N1 SWM write for substrate fan-out canary failed (triplesWritten=$WRITE_OK)"
+  else
+    ok "N1 wrote canary $TAG to '$CONTEXT_GRAPH'"
+    # Substrate fan-out fires synchronously inside publishWorkspaceGossip,
+    # but ack-arrival is async. Give it gossip-wait + a few seconds.
+    sleep $((GOSSIP_WAIT_S + 3))
+
+    SLO_AFTER=$(c "http://127.0.0.1:$N1_PORT/api/slo")
+    DELIVERED_AFTER=$(sum_delivered "$SLO_AFTER")
+    QUEUED_AFTER=$(sum_queued "$SLO_AFTER")
+
+    DELTA=$((DELIVERED_AFTER - DELIVERED_BEFORE))
+    if [[ "$DELTA" -ge 1 ]]; then
+      ok "swm.substrateFanout.delivered grew by $DELTA (before=$DELIVERED_BEFORE after=$DELIVERED_AFTER) — substrate path exercised"
+    else
+      fail "swm.substrateFanout.delivered did NOT grow (before=$DELIVERED_BEFORE after=$DELIVERED_AFTER) — substrate fan-out not firing"
+    fi
+    # Queue depth on a healthy loopback mesh should be ~0. Allow a
+    # small floor (e.g. 2) so a single in-flight ack doesn't flake.
+    if [[ "$QUEUED_AFTER" -le 2 ]]; then
+      ok "swm.substrateFanout queued+inFlight=$QUEUED_AFTER (≤2 expected on healthy loopback)"
+    else
+      warn "swm.substrateFanout queued+inFlight=$QUEUED_AFTER (>2 — possible substrate fan-out stall)"
+    fi
+  fi
+fi
+section_done
+
+#------------------------------------------------------------
+section_start "SECTION 35: rc.9 — SWM ack-quorum reaches steady state (PR-D)"
+# rc.9 PR-D + PR-H added an ack-quorum watchdog that tracks per-share
+# delivery quorum and re-arms substrate top-ups on stalls. After the
+# §34 write (or any earlier SWM write in this run), the tracker
+# should show `pending ≈ 0` on a healthy mesh — every started share
+# either completed or got dropped via deadline/watchdog.
+if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
+  skip "SECTION 35: skipped via SKIP_RC9_SUBSTRATE=1"
+else
+  for p in "${NODE_PORTS[@]}"; do
+    slo=$(c "http://127.0.0.1:$p/api/slo")
+    tracked=$(json_get "$slo" swm.shareAckQuorum.tracked)
+    completed=$(json_get "$slo" swm.shareAckQuorum.completed)
+    pending=$(json_get "$slo" swm.shareAckQuorum.pending)
+    watchdog=$(json_get "$slo" swm.shareAckQuorum.watchdogFired)
+    deadline=$(json_get "$slo" swm.shareAckQuorum.deadlineExpired)
+    if ! [[ "$tracked" =~ ^[0-9]+$ && "$completed" =~ ^[0-9]+$ && "$pending" =~ ^[0-9]+$ ]]; then
+      fail "Node $p shareAckQuorum counters missing or non-numeric (tracked=$tracked completed=$completed pending=$pending)"
+      continue
+    fi
+    # On the sender (the node that published a share), tracked > 0
+    # is the strong signal. On receivers tracked stays 0. So we
+    # don't enforce a global tracked>0 here — just verify the
+    # pending invariant on every node.
+    if [[ "$pending" -le 1 ]]; then
+      ok "Node $p shareAckQuorum.pending=$pending (tracked=$tracked completed=$completed watchdogFired=$watchdog deadlineExpired=$deadline)"
+    else
+      warn "Node $p shareAckQuorum.pending=$pending — non-trivial backlog (tracked=$tracked completed=$completed)"
+    fi
+  done
+fi
+section_done
+
+#------------------------------------------------------------
+section_start "SECTION 36: rc.9 PR-K — substrate fan-out queue depth healthy on dialable mesh"
+# rc.9 PR-K tier-1+2 added `isPeerDialable` filtering: drop limited-
+# circuit-only peers (tier-1) and peers without PROTOCOL_SWM_UPDATE
+# handler (tier-2). On a devnet loopback mesh every peer is fully
+# dialable AND on rc.9, so the substrate fan-out should never accrue
+# `queued` or `failed` counts — both should be effectively zero.
+#
+# A non-zero count here would mean either PR-K isn't filtering
+# correctly (peers are being dialed that shouldn't be) or peers are
+# on stale rc.8 builds (no /dkg/10.0.1/swm-update handler).
+if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
+  skip "SECTION 36: skipped via SKIP_RC9_SUBSTRATE=1"
+else
+  for p in "${NODE_PORTS[@]}"; do
+    slo=$(c "http://127.0.0.1:$p/api/slo")
+    queued=$(echo "$slo" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  sf = (d.get('swm') or {}).get('substrateFanout') or {}
+  print(sum(int(v) for v in (sf.get('queued') or {}).values()))
+except Exception:
+  print(0)
+" 2>/dev/null)
+    failed=$(echo "$slo" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  sf = (d.get('swm') or {}).get('substrateFanout') or {}
+  print(sum(int(v) for v in (sf.get('failed') or {}).values()))
+except Exception:
+  print(0)
+" 2>/dev/null)
+    if [[ "$queued" -le 1 ]]; then
+      ok "Node $p substrateFanout.queued=$queued (≤1 — PR-K dialable-only filter working)"
+    else
+      fail "Node $p substrateFanout.queued=$queued (>1 — possible dialability regression)"
+    fi
+    if [[ "$failed" -eq 0 ]]; then
+      ok "Node $p substrateFanout.failed=0"
+    else
+      warn "Node $p substrateFanout.failed=$failed (non-zero — investigate substrate send errors)"
+    fi
+  done
+fi
+section_done
+
+#------------------------------------------------------------
+section_start "SECTION 37: rc.9 — outbox durability + idempotency across recipient restart"
+# rc.9 PR-2 introduced a SQLite-backed `protocol_outbox` that holds
+# substrate messages until they're delivered. This section proves the
+# end-to-end property operators care about: send a message while the
+# recipient is DOWN, restart the recipient, and the message arrives
+# WITHOUT operator intervention — and arrives EXACTLY ONCE (substrate
+# `message_idempotency` dedups any internal retries).
+#
+# We target the LAST detected node as the restart victim — typically
+# an edge node on a 6-node devnet (devnet.sh seeds 1-4 core, 5+
+# edge). Edge nodes are simpler to restart (no consensus impact, no
+# RS prover state). Gated by SKIP_EDGE_RESTART because it kills a
+# daemon process.
+if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
+  skip "SECTION 37: skipped via SKIP_RC9_SUBSTRATE=1"
+elif [[ "$SKIP_EDGE_RESTART" == "1" ]]; then
+  skip "SECTION 37: skipped via SKIP_EDGE_RESTART=1 (destructive — restarts an edge daemon)"
+elif [[ "$NUM_NODES" -lt 2 ]]; then
+  skip "SECTION 37: need ≥2 nodes (have $NUM_NODES)"
+else
+  N1_PORT=${NODE_PORTS[0]}
+  # Last element — written for bash 3.2 (macOS) compatibility,
+  # `${arr[-1]}` is bash 4+.
+  RECIPIENT_PORT=${NODE_PORTS[$((NUM_NODES - 1))]}
+  # Map port → devnet node dir (devnet.sh seeds .devnet/nodeN with
+  # API port 9200+N).
+  RECIPIENT_NODE_NUM=$((RECIPIENT_PORT - 9200))
+  RECIPIENT_DIR="$SCRIPT_DIR/../.devnet/node${RECIPIENT_NODE_NUM}"
+  RECIPIENT_PIDFILE="$RECIPIENT_DIR/devnet.pid"
+  CLI_JS="$SCRIPT_DIR/../packages/cli/dist/cli.js"
+
+  if [[ ! -f "$RECIPIENT_PIDFILE" ]]; then
+    skip "SECTION 37: no $RECIPIENT_PIDFILE — script not running against devnet.sh layout (port $RECIPIENT_PORT)"
+  else
+    echo "--- 37a: capture recipient identity (port $RECIPIENT_PORT = node $RECIPIENT_NODE_NUM) ---"
+    RCPT_INFO=$(c "http://127.0.0.1:$RECIPIENT_PORT/api/info")
+    RCPT_PEER=$(json_get "$RCPT_INFO" peerId)
+    RCPT_NAME=$(json_get "$(c "http://127.0.0.1:$RECIPIENT_PORT/api/agent/identity")" name)
+    if [[ -z "$RCPT_PEER" || "$RCPT_PEER" == "__NONE__" ]]; then
+      fail "Could not capture recipient peerId on port $RECIPIENT_PORT — aborting SECTION 37"
+    else
+      ok "Recipient: name='$RCPT_NAME' peerId=${RCPT_PEER:0:32}…"
+
+      # Capture N1's peerId so we can filter the inbox query.
+      N1_PEER=$(json_get "$(c "http://127.0.0.1:$N1_PORT/api/info")" peerId)
+
+      echo "--- 37b: stop recipient daemon (substrate outbox should hold messages) ---"
+      OLD_PID=$(cat "$RECIPIENT_PIDFILE")
+      if kill -0 "$OLD_PID" 2>/dev/null; then
+        kill "$OLD_PID" 2>/dev/null || true
+        for i in $(seq 1 15); do
+          kill -0 "$OLD_PID" 2>/dev/null || break
+          sleep 1
+        done
+        if kill -0 "$OLD_PID" 2>/dev/null; then
+          kill -9 "$OLD_PID" 2>/dev/null || true
+          sleep 2
+        fi
+        ok "Recipient stopped (was PID $OLD_PID)"
+      else
+        warn "Recipient PID $OLD_PID was already dead — proceeding"
+      fi
+      rm -f "$RECIPIENT_PIDFILE" "$RECIPIENT_DIR/daemon.pid"
+      # Give libp2p a moment to register the disconnect on N1 — otherwise
+      # the first /api/chat might race the still-warm connection and
+      # appear delivered=true (the OS hasn't surfaced the EOF yet).
+      sleep 3
+
+      echo "--- 37c: send a uniquely-tagged chat from N1 → recipient (expect queued) ---"
+      DURABLE_MARKER="rc9-durable-$(date +%s%N)"
+      CHAT_RESP=$(c -X POST "http://127.0.0.1:$N1_PORT/api/chat" -d "{
+        \"to\":\"$RCPT_PEER\",
+        \"text\":\"$DURABLE_MARKER\"
+      }")
+      DELIVERED_NOW=$(json_get "$CHAT_RESP" delivered)
+      QUEUED_NOW=$(json_get "$CHAT_RESP" queued)
+      MSG_ID=$(json_get "$CHAT_RESP" messageId)
+      # Either delivered=false+queued=true (substrate held it) OR an
+      # error response — both prove the recipient is offline. What
+      # we DON'T want is delivered=true (would mean we raced the
+      # disconnect; section won't be meaningful).
+      if [[ "$DELIVERED_NOW" == "true" ]]; then
+        warn "Chat returned delivered=true before recipient could go down — sleeping 5s and retrying once"
+        sleep 5
+        DURABLE_MARKER="rc9-durable-$(date +%s%N)-r2"
+        CHAT_RESP=$(c -X POST "http://127.0.0.1:$N1_PORT/api/chat" -d "{
+          \"to\":\"$RCPT_PEER\",
+          \"text\":\"$DURABLE_MARKER\"
+        }")
+        DELIVERED_NOW=$(json_get "$CHAT_RESP" delivered)
+        QUEUED_NOW=$(json_get "$CHAT_RESP" queued)
+        MSG_ID=$(json_get "$CHAT_RESP" messageId)
+      fi
+      if [[ "$DELIVERED_NOW" == "false" || "$QUEUED_NOW" == "true" ]]; then
+        ok "Chat returned delivered=$DELIVERED_NOW queued=$QUEUED_NOW messageId=${MSG_ID:0:12}… (substrate outbox holding it)"
+      else
+        warn "Chat response shape unexpected: delivered=$DELIVERED_NOW queued=$QUEUED_NOW (proceeding — restart will tell us if delivery still works)"
+      fi
+
+      echo "--- 37d: restart recipient (substrate should drain on connection re-establishment) ---"
+      DKG_HOME="$RECIPIENT_DIR" DKG_NO_BLUE_GREEN=1 \
+        node "$CLI_JS" start --foreground \
+        >> "$RECIPIENT_DIR/daemon.log" 2>&1 &
+      NEW_PID=$!
+      echo "$NEW_PID" > "$RECIPIENT_PIDFILE"
+      ok "Recipient restart launched (PID $NEW_PID)"
+
+      api_ready=0
+      boot_t0=$(date +%s)
+      for i in $(seq 1 "$RESTART_BOOT_TIMEOUT_S"); do
+        if curl -sf --max-time 2 -H "Authorization: Bearer $AUTH" \
+             "http://127.0.0.1:$RECIPIENT_PORT/api/status" > /dev/null 2>&1; then
+          api_ready=1
+          boot_elapsed=$(( $(date +%s) - boot_t0 ))
+          ok "Recipient API responsive after ${boot_elapsed}s"
+          break
+        fi
+        sleep 1
+      done
+
+      if [[ "$api_ready" -ne 1 ]]; then
+        fail "Recipient API never responded within ${RESTART_BOOT_TIMEOUT_S}s — aborting SECTION 37"
+      else
+        echo "--- 37e: poll inbox for the durable marker (≤ ${EDGE_OUTBOX_FLUSH_TIMEOUT_S}s) ---"
+        # Substrate outbox tick + libp2p reconnection + dial: bounded
+        # by EDGE_OUTBOX_FLUSH_TIMEOUT_S. We poll every 3s.
+        delivered=0
+        match_count=0
+        poll_t0=$(date +%s)
+        while [[ $(( $(date +%s) - poll_t0 )) -lt "$EDGE_OUTBOX_FLUSH_TIMEOUT_S" ]]; do
+          INBOX=$(c "http://127.0.0.1:$RECIPIENT_PORT/api/messages?peer=$N1_PEER&direction=in&limit=50")
+          match_count=$(echo "$INBOX" | python3 -c "
+import sys, json
+marker = '$DURABLE_MARKER'
+try:
+  d = json.load(sys.stdin)
+  msgs = d.get('messages') or d.get('result') or []
+  count = sum(1 for m in msgs if m.get('text') == marker)
+  print(count)
+except Exception:
+  print(0)
+" 2>/dev/null)
+          if [[ "$match_count" -ge 1 ]]; then
+            delivered=1
+            break
+          fi
+          sleep 3
+        done
+        poll_elapsed=$(( $(date +%s) - poll_t0 ))
+        if [[ "$delivered" == "1" ]]; then
+          ok "Recipient received '$DURABLE_MARKER' after ${poll_elapsed}s without operator resend (outbox-durability ✓)"
+          # Idempotency check: substrate's message_idempotency table
+          # should ensure exactly ONE inbox row for the marker, even
+          # if the sender's outbox retried internally during the
+          # disconnect→reconnect window.
+          if [[ "$match_count" -eq 1 ]]; then
+            ok "Inbox has exactly 1 row for the marker (idempotency ✓)"
+          else
+            fail "Inbox has $match_count rows for the marker — expected 1 (idempotency regression: substrate isn't deduping retries)"
+          fi
+        else
+          fail "Recipient did NOT receive '$DURABLE_MARKER' within ${EDGE_OUTBOX_FLUSH_TIMEOUT_S}s — outbox-durability regression"
+        fi
+      fi
     fi
   fi
 fi

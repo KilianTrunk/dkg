@@ -190,6 +190,16 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
         }
 
         ps.createProfile(identityId, nodeName, nodeId, initialOperatorFee);
+
+        // ShardingTable survived a ProfileStorage-only redeploy: if this
+        // node is already in the ring, Ask's active-set / pricing
+        // aggregates (recomputed from ProfileStorage.getAsk per ring node)
+        // are stale until something recomputes. Trigger it now so the
+        // recovered node's contribution is consistent. Genesis
+        // createProfile has no ring entry, so it never needs this.
+        if (sts.nodeExists(identityId)) {
+            askContract.recalculateActiveSet();
+        }
     }
 
     function addOperationalWallets(

@@ -26,6 +26,7 @@ import {
   ShardingTable,
   ConvictionStakingStorage,
   IdentityStorage,
+  ShardingTableStorage,
 } from '../../typechain';
 import { createKnowledgeCollection } from '../helpers/kc-helpers';
 import { createProfile } from '../helpers/profile-helpers';
@@ -1120,6 +1121,11 @@ describe('@integration Profile recreate preserves id-keyed state', () => {
         await hre.ethers.getContract<ConvictionStakingStorage>(
           'ConvictionStakingStorage',
         ),
+      askStorage: await hre.ethers.getContract<AskStorage>('AskStorage'),
+      shardingTableStorage:
+        await hre.ethers.getContract<ShardingTableStorage>(
+          'ShardingTableStorage',
+        ),
     };
     await contracts.hub.setContractAddress('HubOwner', signers[0].address);
     return { ...contracts, signers };
@@ -1130,7 +1136,6 @@ describe('@integration Profile recreate preserves id-keyed state', () => {
       profile,
       profileStorage,
       identityStorage,
-      stakingStorage,
       convictionStakingStorage,
       signers,
     } = await fixtureRecreate();
@@ -1149,20 +1154,21 @@ describe('@integration Profile recreate preserves id-keyed state', () => {
       operational.address,
     );
 
-    const seededStake = hre.ethers.parseEther('12345');
     const seededOperatorFee = hre.ethers.parseEther('67');
-    await stakingStorage
-      .connect(signers[0])
-      .setNodeStake(identityId, seededStake);
+    // Canonical V10 stake is ConvictionStakingStorage.nodeStakeV10 (read by
+    // Ask/ShardingTable/StakingV10). V8 StakingStorage.getNodeStake is
+    // unmaintained post-migration. No public nodeStakeV10 setter exists, so
+    // assert it is invariant across recreate (recreate writes only
+    // ProfileStorage, never CSS) alongside a non-zero operator-fee balance
+    // (a real CSS setter) to prove id-keyed CSS state survives.
     await convictionStakingStorage
       .connect(signers[0])
       .setOperatorFeeBalance(identityId, seededOperatorFee);
+    const stakeV10Before =
+      await convictionStakingStorage.getNodeStakeV10(identityId);
 
     await profileStorage.connect(signers[0]).deleteProfile(identityId);
     expect(await profileStorage.profileExists(identityId)).to.equal(false);
-    expect(await stakingStorage.getNodeStake(identityId)).to.equal(
-      seededStake,
-    );
     expect(
       await convictionStakingStorage.getOperatorFeeBalance(identityId),
     ).to.equal(seededOperatorFee);
@@ -1183,11 +1189,79 @@ describe('@integration Profile recreate preserves id-keyed state', () => {
     expect(
       await identityStorage.getIdentityId(operational.address),
     ).to.equal(identityId);
-    expect(await stakingStorage.getNodeStake(identityId)).to.equal(
-      seededStake,
-    );
+    expect(
+      await convictionStakingStorage.getNodeStakeV10(identityId),
+    ).to.equal(stakeV10Before);
     expect(
       await convictionStakingStorage.getOperatorFeeBalance(identityId),
     ).to.equal(seededOperatorFee);
+  });
+
+  it('recomputes the Ask active set when the recovered node is in the sharding table', async () => {
+    const {
+      profile,
+      profileStorage,
+      identityStorage,
+      askStorage,
+      shardingTableStorage,
+      signers,
+    } = await fixtureRecreate();
+    const operational = signers[0];
+    const admin = signers[1];
+    const nodeId =
+      '0x07f38512786964d9e70453371e7c98975d284100d44bd68dab67fe00b525cb66';
+
+    await profile
+      .connect(operational)
+      .createProfile(admin.address, [], 'Recover Node', nodeId, 1000);
+    const identityId = await identityStorage.getIdentityId(
+      operational.address,
+    );
+    await profileStorage.connect(signers[0]).deleteProfile(identityId);
+
+    // Node still in the ring; AskStorage carries a stale aggregate.
+    await shardingTableStorage
+      .connect(signers[0])
+      .createNodeObject(1, nodeId, identityId, 1);
+    await askStorage.connect(signers[0]).setTotalActiveStake(777n);
+    expect(await askStorage.prevTotalActiveStake()).to.equal(0n);
+
+    await profile
+      .connect(admin)
+      .recreateProfile(operational.address, 'Recover Node', nodeId, 1000);
+
+    // recalculateActiveSet ran: it copies totalActiveStake -> prev first.
+    expect(await askStorage.prevTotalActiveStake()).to.equal(777n);
+  });
+
+  it('does not recompute the Ask active set when the recovered node is not in the sharding table', async () => {
+    const {
+      profile,
+      profileStorage,
+      identityStorage,
+      askStorage,
+      signers,
+    } = await fixtureRecreate();
+    const operational = signers[0];
+    const admin = signers[1];
+    const nodeId =
+      '0x07f38512786964d9e70453371e7c98975d284100d44bd68dab67fe00b525cb66';
+
+    await profile
+      .connect(operational)
+      .createProfile(admin.address, [], 'Recover Node', nodeId, 1000);
+    const identityId = await identityStorage.getIdentityId(
+      operational.address,
+    );
+    await profileStorage.connect(signers[0]).deleteProfile(identityId);
+
+    await askStorage.connect(signers[0]).setTotalActiveStake(777n);
+
+    await profile
+      .connect(admin)
+      .recreateProfile(operational.address, 'Recover Node', nodeId, 1000);
+
+    // Node not in the ring → guard skips recalc → prev stays 0.
+    expect(await askStorage.prevTotalActiveStake()).to.equal(0n);
   });
 });

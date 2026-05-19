@@ -78,6 +78,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// Lockstep contract: reuse capture-chat's `extractText` so the two
+// hooks recognise the SAME set of prompt-bearing payload shapes. If
+// capture-chat persists a turn for some shape, this hook must inject
+// a session-context block for that shape too — otherwise annotations
+// authored during the turn are orphaned (no `chat:Turn` exists for
+// the predicted URI). capture-chat exports the helper for exactly
+// this reason; this is a same-directory sibling import, no side
+// effects at import time (capture-chat's `main()` runs only under
+// its own `isMainModule` guard).
+import { extractText as captureExtractText } from './capture-chat.mjs';
 
 const LOG_FILE = process.env.DKG_SESSION_CTX_LOG ?? '/tmp/dkg-inject-session-context.log';
 const STATE_DIR = path.join(os.homedir(), '.cache', 'dkg-mcp', 'sessions');
@@ -142,12 +152,20 @@ export function extractSessionKey(payload) {
 
 export function extractPrompt(payload) {
   if (!payload || typeof payload !== 'object') return '';
+  // `readStdinJson` wraps non-JSON stdin in `{ rawPayload: <text> }`
+  // so the operator's prompt is recoverable even when Cursor sends
+  // a plain string. Honour that envelope before delegating to the
+  // shared key-extraction helper.
   if (typeof payload.rawPayload === 'string' && payload.rawPayload.trim()) {
     return payload.rawPayload;
   }
-  return pick(payload, [
-    'prompt', 'input', 'text', 'message', 'content', 'user_input',
-  ]) ?? '';
+  // Delegate to capture-chat's `extractText` so the user-prompt
+  // candidate list (`prompt`, `userPrompt`, `user_prompt`, `request`,
+  // `input`, …) stays in exact sync. Any future Cursor / Claude /
+  // Aider payload-shape change captured there flows through here for
+  // free, eliminating the orphan-annotation drift Codex flagged on
+  // PR #589.
+  return captureExtractText(payload);
 }
 
 function findWorkspaceConfig(start) {

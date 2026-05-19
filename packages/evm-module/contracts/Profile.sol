@@ -10,6 +10,8 @@ import {ProfileStorage} from "./storage/ProfileStorage.sol";
 import {WhitelistStorage} from "./storage/WhitelistStorage.sol";
 import {Chronos} from "./storage/Chronos.sol";
 import {ConvictionStakingStorage} from "./storage/ConvictionStakingStorage.sol";
+import {ShardingTableStorage} from "./storage/ShardingTableStorage.sol";
+import {ShardingTableLib} from "./libraries/ShardingTableLib.sol";
 import {ContractStatus} from "./abstract/ContractStatus.sol";
 import {IInitializable} from "./interfaces/IInitializable.sol";
 import {INamed} from "./interfaces/INamed.sol";
@@ -44,6 +46,9 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     // Profile reads `isOperatorFeeClaimedForEpoch` in `updateOperatorFee`
     // to gate fee changes on prior-epoch fee claims being fully settled.
     ConvictionStakingStorage public convictionStakingStorage;
+    // recreate-profile-recovery 0001 — read-only: recreateProfile checks the
+    // recovered nodeId against any surviving sharding-table entry.
+    ShardingTableStorage public shardingTableStorage;
 
     // solhint-disable-next-line no-empty-blocks
     constructor(address hubAddress) ContractStatus(hubAddress) {}
@@ -77,6 +82,7 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
         whitelistStorage = WhitelistStorage(hub.getContractAddress("WhitelistStorage"));
         chronos = Chronos(hub.getContractAddress("Chronos"));
         convictionStakingStorage = ConvictionStakingStorage(hub.getContractAddress("ConvictionStakingStorage"));
+        shardingTableStorage = ShardingTableStorage(hub.getContractAddress("ShardingTableStorage"));
     }
 
     function name() external pure virtual override returns (string memory) {
@@ -147,6 +153,20 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     ) external onlyWhitelisted {
         uint72 identityId = identityStorage.getIdentityId(operationalWallet);
         _checkAdmin(identityId);
+
+        // ShardingTableStorage survived the ProfileStorage redeploy and
+        // caches nodeId per identityId. If this node is still in the ring,
+        // the recovered nodeId MUST match the surviving entry — otherwise
+        // ProfileStorage and the sharding table would disagree about the
+        // same identityId (consumers would see a stale ring node). Read-only:
+        // ring state is not rewritten here (out of scope — ADR 0001).
+        ShardingTableStorage sts = shardingTableStorage;
+        if (sts.nodeExists(identityId)) {
+            bytes memory ringNodeId = sts.getNode(identityId).nodeId;
+            if (keccak256(nodeId) != keccak256(ringNodeId)) {
+                revert ProfileLib.NodeIdShardingMismatch(identityId, ringNodeId, nodeId);
+            }
+        }
 
         ProfileStorage ps = profileStorage;
 

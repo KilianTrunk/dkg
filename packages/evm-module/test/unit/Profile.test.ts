@@ -9,6 +9,7 @@ import {
   ParametersStorage,
   Profile,
   ProfileStorage,
+  ShardingTableStorage,
   StakingStorage,
   Token,
   WhitelistStorage,
@@ -24,6 +25,7 @@ type ProfileFixture = {
   WhitelistStorage: WhitelistStorage;
   Token: Token;
   StakingStorage: StakingStorage;
+  ShardingTableStorage: ShardingTableStorage;
 };
 
 describe('@unit Profile contract', function () {
@@ -36,6 +38,7 @@ describe('@unit Profile contract', function () {
   let WhitelistStorage: WhitelistStorage;
   let Token: Token;
   let StakingStorage: StakingStorage;
+  let ShardingTableStorage: ShardingTableStorage;
 
   const nodeId1 =
     '0x07f38512786964d9e70453371e7c98975d284100d44bd68dab67fe00b525cb66';
@@ -55,6 +58,10 @@ describe('@unit Profile contract', function () {
     Token = await hre.ethers.getContract<Token>('Token');
     StakingStorage =
       await hre.ethers.getContract<StakingStorage>('StakingStorage');
+    ShardingTableStorage =
+      await hre.ethers.getContract<ShardingTableStorage>(
+        'ShardingTableStorage',
+      );
     accounts = await hre.ethers.getSigners();
     Hub = await hre.ethers.getContract<Hub>('Hub');
     await Hub.setContractAddress('HubOwner', accounts[0].address);
@@ -69,6 +76,7 @@ describe('@unit Profile contract', function () {
       WhitelistStorage,
       Token,
       StakingStorage,
+      ShardingTableStorage,
     };
   }
 
@@ -83,6 +91,7 @@ describe('@unit Profile contract', function () {
       WhitelistStorage,
       Token,
       StakingStorage,
+      ShardingTableStorage,
     } = await loadFixture(deployProfileFixture));
   });
 
@@ -490,6 +499,39 @@ describe('@unit Profile contract', function () {
           1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
+    });
+
+    it('reverts when the supplied nodeId diverges from a surviving sharding-table entry', async () => {
+      await seedBrickedIdentity();
+      // Node still in the sharding ring under its ORIGINAL nodeId — the
+      // testnet state (ShardingTableStorage survived; ProfileStorage did not).
+      await ShardingTableStorage.createNodeObject(1, nodeId1, identityId1, 1);
+      const differentNodeId =
+        '0x17f38512786964d9e70453371e7c98975d284100d44bd68dab67fe00b525cb66';
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          accounts[0].address,
+          'Node 1',
+          differentNodeId,
+          1000,
+        ),
+      ).to.be.revertedWithCustomError(Profile, 'NodeIdShardingMismatch');
+    });
+
+    it('succeeds when the supplied nodeId matches the surviving sharding-table entry', async () => {
+      await seedBrickedIdentity();
+      await ShardingTableStorage.createNodeObject(1, nodeId1, identityId1, 1);
+
+      await expect(
+        Profile.connect(accounts[1]).recreateProfile(
+          accounts[0].address,
+          'Node 1',
+          nodeId1,
+          1000,
+        ),
+      ).to.not.be.reverted;
+      expect(await ProfileStorage.profileExists(identityId1)).to.equal(true);
     });
 
     it('reverts EmptyNodeName for an empty node name', async () => {

@@ -54,3 +54,26 @@ recover their nodes with a single transaction.
 - If testnet whitelisting is enabled, the bricked identities' **Admin**
   wallets must be whitelisted before recovery — the genesis flow
   whitelisted the Operational caller instead.
+- **Sharding-table consistency (enforced).** `ShardingTableStorage`
+  survives a ProfileStorage-only redeploy and caches `nodeId` per
+  `identityId`. `recreateProfile` therefore *reverts* (`NodeIdShardingMismatch`)
+  if the node is still in the ring (`nodeExists(identityId)`) and the
+  supplied `nodeId` differs from the surviving ring entry. This is a
+  **read-only** check — recovery deliberately does **not** rewrite ring
+  state (out of scope; would touch ShardingTable). Honest recovery (same
+  node, same `nodeId`) is unaffected; only a divergent `nodeId` is refused.
+
+## Known limitations
+
+- **Operator-fee history is not recoverable.** The pre-redeploy operator-fee
+  schedule was Profile-resident and is gone. `recreateProfile` seeds a
+  single fresh fee at recovery time (like genesis `createProfile`). For any
+  **unclaimed pre-recovery epochs**, `StakingV10._claim` resolves the
+  historical split via `getOperatorFeePercentageByTimestampReverse`, which
+  now falls back to the new recovery-time fee — i.e. recovery can
+  retroactively change reward splits for those epochs. This is **accepted
+  as a known testnet limitation**: the data is unrecoverable on-chain, and
+  a real (mainnet) event of this kind would be handled by a state
+  migration, not this recovery path. Operationally: settle/claim all
+  pre-recovery epochs before recovering, or accept reward drift for
+  unclaimed ones.

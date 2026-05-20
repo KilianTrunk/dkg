@@ -6,10 +6,12 @@ import { handlePluginRoutes } from '../../../src/daemon/routes/plugins.js';
 
 interface FakeRes {
   writableEnded: boolean;
+  headersSent: boolean;
   statusCode: number;
   headers: Record<string, string | number | string[]>;
   body: string;
   writeHead: (status: number, headers?: Record<string, string | number | string[]>) => FakeRes;
+  write: (chunk: string) => boolean;
   end: (chunk?: string) => void;
   setHeader: (k: string, v: string) => void;
   getHeader: (k: string) => string | undefined;
@@ -18,16 +20,27 @@ interface FakeRes {
 function makeRes(): FakeRes {
   const res: FakeRes = {
     writableEnded: false,
+    headersSent: false,
     statusCode: 200,
     headers: {},
     body: '',
     writeHead(status, headers) {
+      if (res.headersSent) {
+        throw new Error('ERR_HTTP_HEADERS_SENT');
+      }
       res.statusCode = status;
       if (headers) Object.assign(res.headers, headers);
+      res.headersSent = true;
       return res;
     },
+    write(chunk: string) {
+      if (!res.headersSent) res.headersSent = true;
+      res.body += chunk;
+      return true;
+    },
     end(chunk?: string) {
-      if (typeof chunk === 'string') res.body = chunk;
+      if (typeof chunk === 'string') res.body += chunk;
+      if (!res.headersSent) res.headersSent = true;
       res.writableEnded = true;
     },
     setHeader(k, v) { res.headers[k] = v; },
@@ -105,6 +118,34 @@ describe('handlePluginRoutes', () => {
       plugin: 'boom',
       message: 'intentional',
     });
+  });
+
+  it('does not emit a second response when a plugin throws after starting the response', async () => {
+    const calls: string[] = [];
+    const partialThenThrow: RoutePlugin = {
+      name: 'half-written',
+      handle(c) {
+        calls.push('half-written');
+        // Plugin has already started the response (headersSent=true) but
+        // has not finished (writableEnded=false), then throws.
+        c.res.writeHead(200, { 'Content-Type': 'application/json' });
+        c.res.write('{"partial":');
+        throw new Error('mid-stream failure');
+      },
+    };
+    const next: RoutePlugin = {
+      name: 'next',
+      handle() {
+        calls.push('next');
+      },
+    };
+    const { ctx, res } = makeCtx([partialThenThrow, next]);
+    await expect(handlePluginRoutes(ctx)).resolves.toBeUndefined();
+    expect(calls).toEqual(['half-written']);
+    // Status must remain the one the plugin already wrote, not be overwritten
+    // by an attempted 500.
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe('{"partial":');
   });
 
   it('falls through to the next plugin when one returns without writing', async () => {

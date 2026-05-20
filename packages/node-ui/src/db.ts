@@ -9,7 +9,7 @@ import {
   type ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 const DEFAULT_RETENTION_DAYS = 90;
 
 export interface DashboardDBOptions {
@@ -473,6 +473,21 @@ export class DashboardDB {
       this.db.exec(`
         DROP INDEX IF EXISTS idx_chat_msgid;
       `);
+    }
+
+    if (version < 14) {
+      // Rename legacy "paranet_*" columns to "contextGraph_*" so INSERT
+      // statements using the new names succeed on databases created before
+      // the v10 terminology rename. Column existence is checked via
+      // pragma to avoid errors when the DB was already created at v14+.
+      const snapshotCols = this.db.pragma('table_info(metric_snapshots)') as { name: string }[];
+      if (snapshotCols.some(c => c.name === 'paranet_count')) {
+        this.db.exec(`ALTER TABLE metric_snapshots RENAME COLUMN paranet_count TO contextGraph_count`);
+      }
+      const opsCols = this.db.pragma('table_info(operations)') as { name: string }[];
+      if (opsCols.some(c => c.name === 'paranet_id')) {
+        this.db.exec(`ALTER TABLE operations RENAME COLUMN paranet_id TO contextGraph_id`);
+      }
     }
 
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);

@@ -399,6 +399,7 @@ export async function handleRequest(
     validTokens,
     apiHost,
     apiPortRef,
+    routePlugins: [],
     url,
     path,
     requestToken,

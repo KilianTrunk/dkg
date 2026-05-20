@@ -790,3 +790,147 @@ covers create → topUp → registerAgent → discounted publish via the real
 HTTP `/api/pca` round-trip asserting `0 < discountedCost < baseCost`
 **on chain** (guards the silent-demotion risk: KAv10 takes the discount
 branch only when `publishEpochs == lockDurationEpochs`).
+
+---
+
+## Daemon HTTP Router & Extension Surfaces
+
+The DKG daemon lives in `packages/cli/src/daemon/`. `lifecycle.ts`
+(~2,086 LOC) owns process boot — config load, agent/publisher/dashDb
+init, Node UI mounting, CORS preflight, and the single global auth
+gate. `handle-request.ts` (~446 LOC) owns the per-request HTTP router
+and is the file forks historically had to edit to add their own
+endpoints. The split between the two is load-bearing for the
+route-plugin work: auth and operator-state loading stay in
+`lifecycle.ts`, while *dispatch* is a thin sequential chain inside
+`handle-request.ts`.
+
+### Request lifecycle
+
+```
+HTTP request
+  → CORS preflight                                    (lifecycle.ts)
+  → httpAuthGuard()        ← single global auth gate  (lifecycle.ts:1865)
+  → handleNodeUIRequest()  ← Node UI static + dashboard
+  → handleRequest(ctx)     ← per-request router       (handle-request.ts)
+      → handleStatusRoutes(ctx)
+      → handleAgentChatRoutes(ctx)
+      → handleOpenclawRoutes(ctx)
+      → handleHermesRoutes(ctx)
+      → handleMemoryRoutes(ctx)
+      → handlePublisherRoutes(ctx)
+      → handleContextGraphRoutes(ctx)
+      → handleAssertionRoutes(ctx)
+      → handleQueryRoutes(ctx)
+      → handleLocalAgentsRoutes(ctx)
+      → handleEpcisRoutes(ctx)
+      → handlePcaRoutes(ctx)
+      → handlePluginRoutes(ctx)   ← route plugins (ADR 0001, slice 1)
+      → jsonResponse(res, 404, …)
+```
+
+Every dispatcher has the signature
+`(ctx: RequestContext) => Promise<void>`. The implicit `next` is
+`ctx.res.writableEnded` — whichever dispatcher writes a response first
+claims the request; the rest short-circuit at the next
+`if (res.writableEnded) return;` check. There is no Express/Koa/Fastify
+abstraction; the daemon is bare `node:http`.
+
+### RequestContext — the shared bag
+
+`RequestContext` is defined in `packages/cli/src/daemon/routes/context.ts`
+and ferries 24 runtime singletons plus 4 per-request derived locals into
+every route group. The fields fall into three buckets:
+
+- **Long-lived runtime handles**: `agent` (DKGAgent), `publisherControl`,
+  `publisherRuntime`, `dashDb`, `tracker`, `memoryManager`, `fileStore`,
+  `vectorStore`, `embeddingProvider`, `extractionRegistry`,
+  `catchupTracker`, `opWallets`, `network`.
+- **Configuration & identity**: `config` (DkgConfig), `bridgeAuthToken`,
+  `nodeVersion`, `nodeCommit`, `apiHost`, `apiPortRef`, `validTokens`,
+  `startedAt`, `assertionImportLocks`, `extractionStatus`.
+- **Per-request derived**: `req`, `res`, `url`, `path`, `requestToken`,
+  `requestAgentAddress` — the last computed by
+  `agent.resolveAgentAddress(requestToken)` so route bodies see a
+  uniform agent identity whether the bearer was a node-level token or
+  a per-agent token. `emitMemoryGraphChanged` is the SSE fan-out for
+  Node UI updates.
+
+The `apiHost` + `apiPortRef` pair exists specifically for
+`manifestSelfClient()` to build a self-pointing URL from trusted
+server state rather than request headers — SSRF defence carried in
+the context.
+
+### Auth boundary — `httpAuthGuard`
+
+The auth boundary is a **single, global, upstream-of-dispatch** check
+at `packages/cli/src/daemon/lifecycle.ts:1865`. It runs after CORS
+preflight and before `handleRequest()`, rejecting with 401 if the
+bearer token is missing or not in `validTokens`. As a consequence,
+**every** route group — built-in or route-plugin — sees only
+authenticated requests; there is no per-route auth surface to
+re-implement. Finer-grained policy decisions are made inside a route
+by reading `ctx.requestToken` or `ctx.requestAgentAddress`.
+
+### Two distinct extension surfaces
+
+The repo deliberately keeps two extension surfaces, with different
+trust models and different runtime endpoints. Calling the wrong one a
+"plugin" is the most common confusion — see
+`packages/cli/src/daemon/CONTEXT.md` for the glossary.
+
+| Surface | Mechanism | Lives in | Trust model | Adds HTTP routes? |
+|---|---|---|---|---|
+| **`dkg integration`** | Curated registry installer (`InstallCli` / `InstallMcp` / `InstallService` / `InstallAgentPlugin` / `InstallManual`) | `packages/cli/src/integrations/` (`commands.ts`, `schema.ts`, `install-cli.ts`, `install-mcp.ts`, `registry-client.ts`, `verify-npm-provenance.ts`) | Registry-mediated `community` / `verified` / `featured` trust tiers; npm provenance check available | **No** — installs CLI binaries, MCP servers, Docker services, and ElizaOS agent plugins; never mounts daemon endpoints |
+| **Route plugin** | npm package exporting `{ name, handle(ctx) }`, named in `config.routePlugins` and loaded once at daemon boot | `packages/cli/src/daemon/plugin-api.ts`, `plugin-loader.ts`, `routes/plugins.ts` (ADR 0001) | Operator-trust (slice 1); npm provenance verification reuses the integrations verifier in v2 | **Yes** — dispatched as the trailing step in the `handleRequest` chain |
+
+The two surfaces may converge later (a new `InstallSpec` kind could
+carry a route plugin spec), but slice 1 keeps them separate so fork
+authors can ship route plugins without a registry review cycle.
+
+### Route plugin mechanism (ADR 0001)
+
+Approved 2026-05-20 (`docs/adr/0001-daemon-route-plugins.md`, design
+`docs/superpowers/specs/2026-05-20-daemon-route-plugins-design.md`):
+
+- **Public contract.** `plugin-api.ts` re-exports `RequestContext` and
+  the small set of `http-utils` helpers (`jsonResponse`, `readBody`,
+  `readBodyBuffer`, `MAX_BODY_BYTES`, `SMALL_BODY_BYTES`) and defines
+  `interface RoutePlugin { name: string; handle(ctx): Promise<void> | void; }`.
+  Exposed via a new `./daemon/plugin-api` subpath export on
+  `@origintrail-official/dkg`'s `package.json`. Breaking changes are
+  semver-major.
+- **Startup load.** `loadRoutePlugins(specs, logger)` in
+  `plugin-loader.ts` runs once during `lifecycle.ts` boot (after
+  agent/publisher init, before `server.listen()`). Absolute paths are
+  imported directly; bare specifiers go through
+  `createRequire(import.meta.url).resolve`. Validation requires a
+  non-empty `name` and a function `handle`. **Fail-soft**: a bad
+  plugin is logged (`route-plugin-load-failed`) and skipped; the
+  daemon still boots, emitting `route-plugins-loaded { loaded, configured }`
+  so operators see the count delta.
+- **Per-request dispatch.** `routes/plugins.ts` exports
+  `handlePluginRoutes(ctx)` — the thirteenth chain step. It iterates
+  `ctx.routePlugins` and calls each plugin's `handle(ctx)` in order.
+  An unhandled throw mid-request emits
+  `500 { error: 'PluginError', plugin, message }` (only if the
+  response hasn't started) and stops the chain. Conflict detection
+  between plugins claiming the same path is intentionally absent:
+  first plugin in config-list order wins via the same
+  `res.writableEnded` short-circuit the built-in chain uses.
+- **Operator state, not package state.** `routePlugins?: string[]`
+  lives on `DkgConfig` and is read from `~/.dkg/config.json`
+  (per-install operator state) so daemon upgrades don't overwrite a
+  fork's plugin list. Hot reload is out of scope — restart to pick up
+  changes.
+- **Footprint.** Adds three files (`plugin-api.ts`, `plugin-loader.ts`,
+  `routes/plugins.ts`) and edits five (`handle-request.ts` — one
+  import, one parameter, one chain step; `routes/context.ts` — one
+  `RoutePlugin[]` field; `lifecycle.ts` — one `loadRoutePlugins` call
+  + the new `handleRequest` argument; `config.ts` — one optional
+  field; `package.json` — `exports` field). Forks stop conflicting on
+  `handle-request.ts` upstream syncs.
+
+EPCIS migration to a route plugin is explicitly out of scope; EPCIS
+stays a hard-coded chain step and only moves if/when it needs a code
+change for an unrelated reason.

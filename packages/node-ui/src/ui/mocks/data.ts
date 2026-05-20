@@ -29,6 +29,8 @@ export const MOCK_CONTEXT_GRAPHS = {
       description: 'Drug interaction knowledge graph for clinical decision support',
       assetCount: 227,
       agentCount: 3,
+      callerInvolved: true,
+      curator: 'did:dkg:agent:0x1111111111111111111111111111111111111111',
     },
     {
       id: 'cg:climate-science',
@@ -36,6 +38,8 @@ export const MOCK_CONTEXT_GRAPHS = {
       description: 'Climate research data and projections',
       assetCount: 45,
       agentCount: 2,
+      callerInvolved: true,
+      curator: 'did:dkg:agent:0x1111111111111111111111111111111111111111',
     },
     {
       id: 'cg:supply-chain-eu',
@@ -43,8 +47,34 @@ export const MOCK_CONTEXT_GRAPHS = {
       description: 'European supply chain provenance tracking',
       assetCount: 89,
       agentCount: 1,
+      callerInvolved: true,
+      curator: 'did:dkg:agent:0x5555555555555555555555555555555555555555',
     },
   ],
+};
+
+// Mock allow-lists keyed by CG id. Curator is intentionally a
+// `did:dkg:agent:` URI while participants are bare EVM addresses
+// (mirrors the real /participants vs cg.curator shape) so mock mode
+// exercises canonicalAgentDid convergence + cross-CG dedup: the same
+// curator 0x1111… spans pharma + climate, so the aggregate unique
+// count is 5, not 3+2+1.
+export const MOCK_PARTICIPANTS: Record<string, { contextGraphId: string; allowedAgents: string[] }> = {
+  'cg:pharma-drug-interactions': {
+    contextGraphId: 'cg:pharma-drug-interactions',
+    allowedAgents: [
+      '0x2222222222222222222222222222222222222222',
+      '0x3333333333333333333333333333333333333333',
+    ],
+  },
+  'cg:climate-science': {
+    contextGraphId: 'cg:climate-science',
+    allowedAgents: ['0x4444444444444444444444444444444444444444'],
+  },
+  'cg:supply-chain-eu': {
+    contextGraphId: 'cg:supply-chain-eu',
+    allowedAgents: [],
+  },
 };
 
 export const MOCK_OPERATIONS = {
@@ -60,10 +90,41 @@ export const MOCK_OPERATIONS = {
 };
 
 export const MOCK_ECONOMICS = {
+  // Labels mirror the real /api/economics scheme (db.ts: 24h/7d/30d/all).
   periods: [
-    { label: 'Last 7 days', publishCount: 14, successCount: 12, totalGasEth: 0.0034, totalTrac: 42.5, avgGasEth: 0.00024, avgTrac: 3.04 },
-    { label: 'Last 30 days', publishCount: 47, successCount: 43, totalGasEth: 0.012, totalTrac: 156.8, avgGasEth: 0.00026, avgTrac: 3.34 },
+    { label: '24h', publishCount: 3, successCount: 3, totalGasEth: 0.0007, totalTrac: 9.1, avgGasEth: 0.00023, avgTrac: 3.03 },
+    { label: '7d', publishCount: 14, successCount: 12, totalGasEth: 0.0034, totalTrac: 42.5, avgGasEth: 0.00024, avgTrac: 3.04 },
+    { label: '30d', publishCount: 47, successCount: 43, totalGasEth: 0.012, totalTrac: 156.8, avgGasEth: 0.00026, avgTrac: 3.34 },
   ],
+};
+
+// Mock node-agent identity. agentDid matches the pharma + climate
+// mock curators (0x1111…) so mock mode exercises curator-aware UI
+// (CURATOR vs JOINED badge, identity-based membership fallback) the
+// same way the real daemon would.
+export const MOCK_AGENT_IDENTITY = {
+  agentAddress: '0x1111111111111111111111111111111111111111',
+  agentDid: 'did:dkg:agent:0x1111111111111111111111111111111111111111',
+  name: 'mock-node-agent',
+  framework: 'mock',
+  peerId: 'QmMockNodeAgentPeer000000000000000000000000',
+  nodeIdentityId: 'mock-node-identity',
+};
+
+export const MOCK_WALLETS = {
+  wallets: [
+    '0xA1b2C3d4E5f60718293a4B5c6D7e8F9012345678',
+    '0xB2c3D4e5F60718293a4B5c6D7e8F90123456789a',
+    '0xC3d4E5f60718293a4B5c6D7e8F90123456789aB1',
+  ],
+  balances: [
+    { address: '0xA1b2C3d4E5f60718293a4B5c6D7e8F9012345678', eth: '0.842', trac: '1250.50', symbol: 'TRAC' },
+    { address: '0xB2c3D4e5F60718293a4B5c6D7e8F90123456789a', eth: '0.310', trac: '480.00', symbol: 'TRAC' },
+    { address: '0xC3d4E5f60718293a4B5c6D7e8F90123456789aB1', eth: '0.005', trac: '0.00', symbol: 'TRAC' },
+  ],
+  chainId: '8453',
+  rpcUrl: 'https://mock.rpc',
+  symbol: 'TRAC',
 };
 
 export const MOCK_NOTIFICATIONS = {

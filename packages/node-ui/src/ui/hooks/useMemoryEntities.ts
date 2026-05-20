@@ -37,6 +37,9 @@ export interface MemoryData {
   counts: { wm: number; swm: number; vm: number; total: number };
   loading: boolean;
   error: string | null;
+  /** True when some (but not all) layer queries failed — counts are
+   *  incomplete but not absent. `error` stays null in this case. */
+  partial: boolean;
   refresh: () => void;
 }
 
@@ -169,11 +172,21 @@ function subGraphOf(gUri: string, cgId: string): string | undefined {
   return seg;
 }
 
+interface LayerResult { triples: Triple[]; ok: boolean }
+
 async function queryLayer(
   sparql: string,
   contextGraphId: string,
   opts?: { view?: string; includeSharedMemory?: boolean; graphSuffix?: string },
-): Promise<Triple[]> {
+): Promise<LayerResult> {
+  // Never throws and never loses the failed-vs-empty distinction: it
+  // returns `{ triples, ok }`. A failed/unreachable `/api/query` yields
+  // `{ triples: [], ok: false }` so triple data still degrades to
+  // "empty" for every consumer (unchanged behavior), while `ok=false`
+  // lets the hook compute `partial` UNCONDITIONALLY — previously it was
+  // dead for non-opt-in callers, making truncated counts look exact
+  // (Codex). Whether a total failure escalates to a hard `error` stays
+  // the configurable part (see `signalErrors`).
   try {
     const body: any = { sparql, contextGraphId, ...opts };
     const res = await fetch('/api/query', {
@@ -181,10 +194,10 @@ async function queryLayer(
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify(body),
     });
-    if (!res.ok) return [];
+    if (!res.ok) throw new Error(`/api/query failed (${res.status})`);
     const data = await res.json();
     const bindings = data?.result?.bindings ?? data?.results?.bindings ?? [];
-    return bindings
+    const triples = bindings
       .map((row: any) => {
         const g = bv(row.g);
         return {
@@ -195,8 +208,9 @@ async function queryLayer(
         };
       })
       .filter((t: Triple) => t.subject && t.predicate && t.object);
+    return { triples, ok: true };
   } catch {
-    return [];
+    return { triples: [], ok: false };
   }
 }
 
@@ -273,10 +287,19 @@ function buildEntities(layered: LayeredTriple[]): Map<string, MemoryEntity> {
   return entities;
 }
 
-export function useMemoryEntities(contextGraphId: string): MemoryData {
+export function useMemoryEntities(
+  contextGraphId: string,
+  opts?: { signalErrors?: boolean },
+): MemoryData {
+  // Off by default: every existing caller (ProjectView/MemoryStackView/
+  // AgentProfilePage) keeps the original "failed query → empty, never a
+  // hard error" behavior. Only the dashboard opts in so it alone gets
+  // the failed-vs-empty distinction it needs (Codex).
+  const signalErrors = opts?.signalErrors ?? false;
   const [layeredTriples, setLayeredTriples] = useState<LayeredTriple[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [partial, setPartial] = useState(false);
   const versionRef = useRef(0);
 
   const fetchAll = useCallback(async () => {
@@ -284,9 +307,13 @@ export function useMemoryEntities(contextGraphId: string): MemoryData {
     const version = ++versionRef.current;
     setLoading(true);
     setError(null);
+    setPartial(false);
 
     try {
-      const [wmTriples, swmTriples, vmTriples] = await Promise.all([
+      // queryLayer never throws — it returns { triples, ok }. We keep
+      // whatever layers succeeded (failed layers contribute []), so a
+      // single-layer 500 never blanks the others for any consumer.
+      const [wmR, swmR, vmR] = await Promise.all([
         queryLayer(wmSparql(contextGraphId), contextGraphId),
         queryLayer(swmSparql(contextGraphId), contextGraphId),
         queryLayer(vmSparql(contextGraphId), contextGraphId),
@@ -295,12 +322,21 @@ export function useMemoryEntities(contextGraphId: string): MemoryData {
       if (version !== versionRef.current) return;
 
       const all: LayeredTriple[] = [
-        ...wmTriples.map(t => ({ ...t, layer: 'working' as const })),
-        ...swmTriples.map(t => ({ ...t, layer: 'shared' as const })),
-        ...vmTriples.map(t => ({ ...t, layer: 'verified' as const })),
+        ...wmR.triples.map(t => ({ ...t, layer: 'working' as const })),
+        ...swmR.triples.map(t => ({ ...t, layer: 'shared' as const })),
+        ...vmR.triples.map(t => ({ ...t, layer: 'verified' as const })),
       ];
 
       setLayeredTriples(all);
+      const failed = [wmR, swmR, vmR].filter(r => !r.ok).length;
+      // `partial` is computed UNCONDITIONALLY for every caller — it was
+      // previously dead unless a caller opted in, making truncated
+      // counts look exact in MemoryStackView/ProjectView (Codex).
+      // Whether a *total* failure also escalates to a hard `error`
+      // (dashboard assetCount fallback / views' error screen) stays the
+      // configurable part via `signalErrors`.
+      setPartial(failed > 0 && failed < 3);
+      setError(signalErrors && failed === 3 ? 'Failed to load memory data' : null);
     } catch (err: any) {
       if (version === versionRef.current) {
         setError(err.message ?? 'Failed to load memory data');
@@ -308,7 +344,7 @@ export function useMemoryEntities(contextGraphId: string): MemoryData {
     } finally {
       if (version === versionRef.current) setLoading(false);
     }
-  }, [contextGraphId]);
+  }, [contextGraphId, signalErrors]);
 
   useMemoryGraphEvents(contextGraphId, fetchAll);
 
@@ -363,6 +399,7 @@ export function useMemoryEntities(contextGraphId: string): MemoryData {
     counts,
     loading,
     error,
+    partial,
     refresh: fetchAll,
   };
 }

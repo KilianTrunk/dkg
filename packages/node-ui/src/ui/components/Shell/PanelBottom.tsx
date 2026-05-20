@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { useLayoutStore } from '../../stores/layout.js';
+import { useLayoutStore, maxBottomHeight, readPxVar } from '../../stores/layout.js';
 import { api } from '../../api-wrapper.js';
 
-const BOTTOM_TABS = ['Node Log', 'Transactions', 'Gossip', 'Agent Runs', 'SPARQL'] as const;
+const BOTTOM_TABS = ['Node Log', 'Transactions'] as const;
 type BottomTab = typeof BOTTOM_TABS[number];
 
 const CHEVRON_DOWN = (
@@ -56,11 +56,21 @@ function NodeLogContent() {
 }
 
 export function PanelBottom() {
-  const { bottomCollapsed, toggleBottom } = useLayoutStore();
+  const { bottomCollapsed, toggleBottom, bottomHeight } = useLayoutStore();
   const [activeTab, setActiveTab] = useState<BottomTab>('Node Log');
+  // The tab-strip height lives in CSS (`--tab-h`); read it at runtime
+  // so a CSS tweak can't silently break the floor below (Codex).
+  const tabStripH = readPxVar('--tab-h', 36);
 
   return (
-    <div className={`v10-panel-bottom ${bottomCollapsed ? 'collapsed' : ''}`}>
+    <div
+      className={`v10-panel-bottom ${bottomCollapsed ? 'collapsed' : ''}`}
+      // Clamp against the viewport at render so a height persisted on a
+      // taller screen can't crush the center pane after reload on a
+      // shorter one; floor at the tab-strip height so the controls stay
+      // reachable on very short viewports (Codex / ui-lead).
+      style={bottomCollapsed ? undefined : { height: Math.max(tabStripH, Math.min(bottomHeight, maxBottomHeight())) }}
+    >
       <div className="v10-bottom-tabs">
         {BOTTOM_TABS.map((tab) => (
           <button

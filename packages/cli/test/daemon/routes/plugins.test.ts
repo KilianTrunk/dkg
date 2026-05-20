@@ -106,4 +106,27 @@ describe('handlePluginRoutes', () => {
       message: 'intentional',
     });
   });
+
+  it('falls through to the next plugin when one returns without writing', async () => {
+    const calls: string[] = [];
+    const skip: RoutePlugin = {
+      name: 'skip',
+      handle() {
+        calls.push('skip');
+      },
+    };
+    const handler: RoutePlugin = {
+      name: 'handler',
+      handle(c) {
+        calls.push('handler');
+        c.res.writeHead(201);
+        c.res.end('done');
+      },
+    };
+    const { ctx, res } = makeCtx([skip, handler]);
+    await handlePluginRoutes(ctx);
+    expect(calls).toEqual(['skip', 'handler']);
+    expect(res.statusCode).toBe(201);
+    expect(res.body).toBe('done');
+  });
 });

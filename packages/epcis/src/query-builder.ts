@@ -13,6 +13,7 @@ const PREFIXES = `
 PREFIX epcis: <https://gs1.github.io/EPCIS/>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX dkg: <http://dkg.io/ontology/>
+PREFIX dmaast: <https://dmaast.eu/ontology/>
 `;
 
 /** Escape special characters in SPARQL string literals. */
@@ -203,6 +204,21 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   optionalClauses.push('OPTIONAL { ?event epcis:inputEPCList ?inputEPCList . }');
   optionalClauses.push('OPTIONAL { ?event epcis:outputEPCList ?outputEPCList . }');
 
+  // DMaaST/JPB identifiers carried as JSON-LD extension triples.
+  if (params.configurationId) {
+    wherePatterns.push('?event dmaast:configurationId ?configurationId .');
+    filterClauses.push(`FILTER(STR(?configurationId) = "${escapeSparql(params.configurationId)}")`);
+  } else {
+    optionalClauses.push('OPTIONAL { ?event dmaast:configurationId ?configurationId . }');
+  }
+
+  if (params.shipmentId) {
+    wherePatterns.push('?event dmaast:shipmentId ?shipmentId .');
+    filterClauses.push(`FILTER(STR(?shipmentId) = "${escapeSparql(params.shipmentId)}")`);
+  } else {
+    optionalClauses.push('OPTIONAL { ?event dmaast:shipmentId ?shipmentId . }');
+  }
+
   // Pagination
   const limit = Math.min(Math.max(params.limit ?? 100, 1), 1000);
   const offset = Math.max(params.offset ?? 0, 0);
@@ -212,7 +228,7 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   ].join('\n      ');
 
   return `${PREFIXES}
-SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?ual
+SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual
   (GROUP_CONCAT(DISTINCT ?epc; SEPARATOR=", ") AS ?epcList)
   (GROUP_CONCAT(DISTINCT ?childEPCs; SEPARATOR=", ") AS ?childEPCList)
   (GROUP_CONCAT(DISTINCT ?inputEPCList; SEPARATOR=", ") AS ?inputEPCs)
@@ -242,7 +258,7 @@ WHERE {
     }
   }
 }
-GROUP BY ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?ual
+GROUP BY ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual
 ORDER BY DESC(?eventTime) ?event
 LIMIT ${limit}
 OFFSET ${offset}`;

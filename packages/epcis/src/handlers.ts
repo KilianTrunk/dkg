@@ -105,6 +105,12 @@ export function toEpcisEvent(binding: Record<string, string>): Record<string, un
   const parentID = unwrapLiteral(binding['parentID']);
   if (parentID) event.parentID = parentID;
 
+  const configurationId = unwrapLiteral(binding['configurationId']);
+  if (configurationId) event.configurationId = configurationId;
+
+  const shipmentId = unwrapLiteral(binding['shipmentId']);
+  if (shipmentId) event.shipmentId = shipmentId;
+
   // DKG provenance — namespaced field
   const ual = unwrapLiteral(binding['ual']);
   if (ual) event['dkg:ual'] = ual;
@@ -138,6 +144,12 @@ export function toEpcisEvent(binding: Record<string, string>): Record<string, un
 
 const GS1_EPCIS_CONTEXT = 'https://ref.gs1.org/standards/epcis/2.0.0/epcis-context.jsonld';
 const DKG_CONTEXT = { dkg: 'http://dkg.io/ontology/' };
+const DMAAST_BASE_IRI = 'https://dmaast.eu/ontology/';
+const DMAAST_CONTEXT = {
+  dmaast: DMAAST_BASE_IRI,
+  configurationId: `${DMAAST_BASE_IRI}configurationId`,
+  shipmentId: `${DMAAST_BASE_IRI}shipmentId`,
+};
 
 export async function handleEventsQuery(
   searchParams: URLSearchParams,
@@ -167,7 +179,7 @@ export async function handleEventsQuery(
   const eventList = bindings.map(toEpcisEvent);
 
   const body: EPCISQueryDocumentResponse = {
-    '@context': [GS1_EPCIS_CONTEXT, DKG_CONTEXT],
+    '@context': [GS1_EPCIS_CONTEXT, DKG_CONTEXT, DMAAST_CONTEXT],
     type: 'EPCISQueryDocument',
     schemaVersion: '2.0',
     epcisBody: {

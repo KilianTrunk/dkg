@@ -3451,6 +3451,8 @@ epcisCmd
   .option('--disposition <d>', 'Filter by disposition')
   .option('--read-point <uri>', 'Filter by readPoint id')
   .option('--biz-location <uri>', 'Filter by bizLocation id')
+  .option('--configuration-id <id>', 'Filter by DMaaST configurationId')
+  .option('--shipment-id <id>', 'Filter by DMaaST shipmentId')
   .option('--per-page <n>', 'Page size')
   .option('--next-page-token <t>', 'Continuation token from a prior response')
   .option('--all', 'Follow Link: rel="next" pages and merge eventList in-place')
@@ -3486,6 +3488,8 @@ epcisCmd
         ...(opts.disposition ? { disposition: String(opts.disposition) } : {}),
         ...(opts.readPoint ? { readPoint: String(opts.readPoint) } : {}),
         ...(opts.bizLocation ? { bizLocation: String(opts.bizLocation) } : {}),
+        ...(opts.configurationId ? { configurationId: String(opts.configurationId) } : {}),
+        ...(opts.shipmentId ? { shipmentId: String(opts.shipmentId) } : {}),
         ...(perPage !== undefined ? { perPage } : {}),
         ...(opts.nextPageToken ? { nextPageToken: String(opts.nextPageToken) } : {}),
       };

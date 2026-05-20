@@ -236,6 +236,11 @@ describe('[K-6] EPCIS capture → query contract (always runs, no devnet)', () =
       expect(body['@context']).toEqual([
         'https://ref.gs1.org/standards/epcis/2.0.0/epcis-context.jsonld',
         { dkg: 'http://dkg.io/ontology/' },
+        {
+          dmaast: 'https://dmaast.eu/ontology/',
+          configurationId: 'https://dmaast.eu/ontology/configurationId',
+          shipmentId: 'https://dmaast.eu/ontology/shipmentId',
+        },
       ]);
       const events = body.epcisBody.queryResults.resultsBody.eventList;
       expect(events.length).toBeGreaterThan(0);

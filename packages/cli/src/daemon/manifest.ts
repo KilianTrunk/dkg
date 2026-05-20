@@ -133,6 +133,16 @@ export interface McpDkgAssets {
   packageDir: string;
   distEntry: string;       // <pkg>/dist/index.js
   captureScript: string;   // <pkg>/hooks/capture-chat.mjs
+  /**
+   * Absolute path to `<pkg>/hooks/inject-session-context.mjs`. Used
+   * by `buildManifestInstallContext` to populate the
+   * `{{injectSessionContextScriptPath}}` placeholder in the Cursor
+   * + Claude Code hook templates so installs done via the daemon's
+   * `/manifest/plan-install` and `/manifest/install` routes wire the
+   * inject-session-context hook the same way the MCP CLI's
+   * `dkg-mcp join` flow does. See Codex PR #589 finding 3.
+   */
+  injectSessionContextScript: string;
   source: 'node-resolution' | 'repo-fallback';
 }
 export function resolveMcpDkgAssets(): McpDkgAssets {
@@ -141,8 +151,9 @@ export function resolveMcpDkgAssets(): McpDkgAssets {
     const packageDir = dirname(pkgJsonPath);
     const distEntry = resolve(packageDir, 'dist', 'index.js');
     const captureScript = resolve(packageDir, 'hooks', 'capture-chat.mjs');
-    if (existsSync(distEntry) && existsSync(captureScript)) {
-      return { packageDir, distEntry, captureScript, source: 'node-resolution' };
+    const injectSessionContextScript = resolve(packageDir, 'hooks', 'inject-session-context.mjs');
+    if (existsSync(distEntry) && existsSync(captureScript) && existsSync(injectSessionContextScript)) {
+      return { packageDir, distEntry, captureScript, injectSessionContextScript, source: 'node-resolution' };
     }
     // Resolution worked but assets are missing (e.g. a pruned install).
     // Fall through to repo-layout path so checkouts still work.
@@ -161,8 +172,9 @@ export function resolveMcpDkgAssets(): McpDkgAssets {
   const packageDir = resolve(repoRoot, 'packages', 'mcp-dkg');
   const distEntry = resolve(packageDir, 'dist', 'index.js');
   const captureScript = resolve(packageDir, 'hooks', 'capture-chat.mjs');
-  if (existsSync(distEntry) && existsSync(captureScript)) {
-    return { packageDir, distEntry, captureScript, source: 'repo-fallback' };
+  const injectSessionContextScript = resolve(packageDir, 'hooks', 'inject-session-context.mjs');
+  if (existsSync(distEntry) && existsSync(captureScript) && existsSync(injectSessionContextScript)) {
+    return { packageDir, distEntry, captureScript, injectSessionContextScript, source: 'repo-fallback' };
   }
   throw new Error(
     `resolveMcpDkgAssets: could not locate @origintrail-official/dkg-mcp. ` +
@@ -505,6 +517,7 @@ export function buildManifestInstallContext(
       // entry so this being stale is fine.
       mcpDkgSrcAbsPath: resolve(mcpDkgAssets.packageDir, 'src', 'index.ts'),
       captureScriptPath: mcpDkgAssets.captureScript,
+      injectSessionContextScriptPath: mcpDkgAssets.injectSessionContextScript,
       tools,
       agentNickname: rawNickname,
       // Cryptographic agent URI derived from the daemon's wallet (the

@@ -326,6 +326,7 @@ import {
 } from './local-agents.js';
 
 import { handleRequest } from './handle-request.js';
+import { loadRoutePlugins } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
 
 /**
@@ -2005,6 +2006,7 @@ export async function runDaemonInner(
         validTokens,
         apiHost,
         apiPortRef,
+        routePlugins,
         emitMemoryGraphChanged,
       );
     } catch (err: any) {
@@ -2032,6 +2034,19 @@ export async function runDaemonInner(
 
   const apiPort = config.apiPort || 0;
   const apiHost = config.apiHost || "127.0.0.1";
+
+  // Fork-authored route plugins: loaded once before the listen() so
+  // requests cannot race the plugin array. `loadRoutePlugins` is
+  // fail-soft — bad specs warn and skip; the daemon still boots.
+  const configuredPlugins = config.routePlugins ?? [];
+  const routePlugins = await loadRoutePlugins(
+    configuredPlugins,
+    new Logger('route-plugins'),
+  );
+  log(
+    `route-plugins-loaded loaded=${routePlugins.length} configured=${configuredPlugins.length}`,
+  );
+
   await new Promise<void>((resolve) => {
     server.listen(apiPort, apiHost, () => resolve());
   });

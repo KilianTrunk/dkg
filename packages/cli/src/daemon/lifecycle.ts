@@ -1404,6 +1404,54 @@ export async function runDaemonInner(
     }
   });
 
+  // Track sync completions
+  agent.eventBus.on(DKGEvent.PROJECT_SYNCED, (data: any) => {
+    try {
+      const ctx = createOperationContext("sync");
+      tracker.start(ctx, {
+        contextGraphId: data.contextGraphId,
+        details: { dataSynced: data.dataSynced, sharedMemorySynced: data.sharedMemorySynced },
+      });
+      tracker.complete(ctx);
+    } catch { /* never crash */ }
+  });
+
+  // Track gossip messages
+  agent.eventBus.on(DKGEvent.GOSSIP_MESSAGE, (data: any) => {
+    try {
+      const ctx = createOperationContext("gossip");
+      tracker.start(ctx, {
+        peerId: data.from,
+        details: { topic: data.topic },
+      });
+      tracker.complete(ctx);
+    } catch { /* never crash */ }
+  });
+
+  // Track KC confirmation (on-chain verify)
+  agent.eventBus.on(DKGEvent.KC_CONFIRMED, (data: any) => {
+    try {
+      const ctx = createOperationContext("verify");
+      tracker.start(ctx, {
+        contextGraphId: data.contextGraphId,
+        details: { kcId: data.kcId != null ? String(data.kcId) : undefined },
+      });
+      tracker.complete(ctx);
+    } catch { /* never crash */ }
+  });
+
+  // Track KA updates
+  agent.eventBus.on(DKGEvent.KA_UPDATED, (data: any) => {
+    try {
+      const ctx = createOperationContext("ka-update");
+      tracker.start(ctx, {
+        contextGraphId: data.contextGraphId,
+        details: { kaUri: data.kaUri },
+      });
+      tracker.complete(ctx);
+    } catch { /* never crash */ }
+  });
+
   // SSE (Server-Sent Events) broadcast: real-time push to connected UI clients
   const sseClients = new Set<ServerResponse>();
   function sseBroadcast(event: string, payload: Record<string, unknown>) {

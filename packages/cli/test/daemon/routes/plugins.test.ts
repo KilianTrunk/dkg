@@ -56,4 +56,27 @@ describe('handlePluginRoutes', () => {
     expect(res.writableEnded).toBe(false);
     expect(res.body).toBe('');
   });
+
+  it('stops at the first plugin that claims the request by writing', async () => {
+    const calls: string[] = [];
+    const first: RoutePlugin = {
+      name: 'first',
+      handle(c) {
+        calls.push('first');
+        c.res.writeHead(200, { 'Content-Type': 'application/json' });
+        c.res.end('{"ok":true}');
+      },
+    };
+    const second: RoutePlugin = {
+      name: 'second',
+      handle() {
+        calls.push('second');
+      },
+    };
+    const { ctx, res } = makeCtx([first, second]);
+    await handlePluginRoutes(ctx);
+    expect(calls).toEqual(['first']);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe('{"ok":true}');
+  });
 });

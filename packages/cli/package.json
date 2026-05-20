@@ -6,6 +6,12 @@
   "bin": {
     "dkg": "./dist/cli.js"
   },
+  "exports": {
+    "./daemon/plugin-api": {
+      "types": "./dist/daemon/plugin-api.d.ts",
+      "import": "./dist/daemon/plugin-api.js"
+    }
+  },
   "scripts": {
     "prebuild": "pnpm --filter @origintrail-official/dkg-adapter-openclaw run build && pnpm --filter @origintrail-official/dkg-adapter-hermes run build && pnpm --filter @origintrail-official/dkg-mcp run build",
     "build": "tsc && node -e \"const fs=require('fs');const p=require('path');fs.mkdirSync('network',{recursive:true});for(const f of fs.readdirSync('../../network')){if(f.endsWith('.json'))fs.copyFileSync(p.join('../../network',f),p.join('network',f))};fs.copyFileSync('../../project.json','project.json')\"",

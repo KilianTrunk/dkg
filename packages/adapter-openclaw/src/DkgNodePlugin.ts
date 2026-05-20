@@ -72,7 +72,7 @@ const USER_QUERY_CATALOG_DESCRIPTION = 'Queries saved from the Query tab.';
 const PROFILE_NS = 'http://dkg.io/ontology/profile/';
 const SCHEMA_NS = 'http://schema.org/';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
-const XSD_INT = 'http://www.w3.org/2001/XMLSchema#int';
+const XSD_INTEGER = 'http://www.w3.org/2001/XMLSchema#integer';
 
 type QueryCatalogToolItem = {
   slug: string;
@@ -222,7 +222,7 @@ function queryCatalogLiteral(value: string): string {
 }
 
 function queryCatalogIntLiteral(value: number): string {
-  return `"${value}"^^<${XSD_INT}>`;
+  return `"${value}"^^<${XSD_INTEGER}>`;
 }
 
 function optionalString(value: unknown): string | undefined {

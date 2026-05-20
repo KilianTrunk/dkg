@@ -7,6 +7,8 @@
     "dkg": "./dist/cli.js"
   },
   "exports": {
+    ".": "./dist/cli.js",
+    "./package.json": "./package.json",
     "./daemon/plugin-api": {
       "types": "./dist/daemon/plugin-api.d.ts",
       "import": "./dist/daemon/plugin-api.js"

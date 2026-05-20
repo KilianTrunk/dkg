@@ -79,4 +79,31 @@ describe('handlePluginRoutes', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe('{"ok":true}');
   });
+
+  it('returns a 500 PluginError when a plugin throws and stops the chain', async () => {
+    const calls: string[] = [];
+    const thrower: RoutePlugin = {
+      name: 'boom',
+      handle() {
+        calls.push('boom');
+        throw new Error('intentional');
+      },
+    };
+    const next: RoutePlugin = {
+      name: 'next',
+      handle() {
+        calls.push('next');
+      },
+    };
+    const { ctx, res } = makeCtx([thrower, next]);
+    await handlePluginRoutes(ctx);
+    expect(calls).toEqual(['boom']);
+    expect(res.statusCode).toBe(500);
+    const parsed = JSON.parse(res.body);
+    expect(parsed).toEqual({
+      error: 'PluginError',
+      plugin: 'boom',
+      message: 'intentional',
+    });
+  });
 });

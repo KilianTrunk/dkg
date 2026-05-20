@@ -526,11 +526,16 @@ Plugins are wired into the daemon via `~/.dkg/config.json`:
 ```json
 {
   "routePlugins": [
-    "./plugins/my-fork-routes.js",
+    "/opt/my-fork/plugins/my-fork-routes.js",
     "@my-fork/dkg-extra-routes"
   ]
 }
 ```
+
+Each entry is either an **absolute filesystem path** to a built plugin
+module (relative paths are not resolved against `~/.dkg` and will fail to
+load) or a **resolvable package name** that `@origintrail-official/dkg`'s
+daemon can `require.resolve` from its own install location.
 
 On path collisions the first plugin listed in `routePlugins` wins: the
 dispatcher invokes plugins in array order and stops at the first one that

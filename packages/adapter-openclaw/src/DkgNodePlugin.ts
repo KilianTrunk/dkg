@@ -65,17 +65,34 @@ function isValidEthAddressString(value: string | undefined): boolean {
   return typeof value === 'string' && ETH_ADDR_RE_LC.test(value.trim().toLowerCase());
 }
 
+const CONTEXT_GRAPH_QUERY_SUBGRAPH = '__context_graph';
+const USER_QUERY_CATALOG_SLUG = 'ui-saved-queries';
+const USER_QUERY_CATALOG_NAME = 'Saved queries';
+const USER_QUERY_CATALOG_DESCRIPTION = 'Queries saved from the Query tab.';
+const PROFILE_NS = 'http://dkg.io/ontology/profile/';
+const SCHEMA_NS = 'http://schema.org/';
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+const XSD_INTEGER = 'http://www.w3.org/2001/XMLSchema#integer';
+
 type QueryCatalogToolItem = {
   slug: string;
   name: string;
   description?: string;
   sparql: string;
+  resultColumn?: string;
   rank: number;
   catalogSlug: string;
   catalogName: string;
   catalogDescription?: string;
   catalogRank: number;
   subGraph: string;
+};
+
+type QueryCatalogWriteQuad = {
+  subject: string;
+  predicate: string;
+  object: string;
+  graph: string;
 };
 
 function stripRdfTerm(value: unknown): string {
@@ -166,6 +183,7 @@ function normalizeQueryCatalogItems(response: Record<string, unknown>): QueryCat
         name: stripRdfTerm(r.name) || slug,
         description: r.description !== undefined ? stripRdfTerm(r.description) : undefined,
         sparql,
+        resultColumn: r.resultColumn !== undefined ? stripRdfTerm(r.resultColumn) : undefined,
         rank: Number.parseInt(stripRdfTerm(r.rank) || '99', 10) || 99,
         catalogSlug,
         catalogName: stripRdfTerm(r.catalogName) || 'Queries',
@@ -181,6 +199,108 @@ function normalizeQueryCatalogItems(response: Record<string, unknown>): QueryCat
       || a.rank - b.rank
       || a.name.localeCompare(b.name),
     );
+}
+
+function queryCatalogSlug(value: string): string {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return slug || 'saved-query';
+}
+
+function queryCatalogProfileUri(contextGraphId: string, kind: 'catalog' | 'query', slug: string): string {
+  return `urn:dkg:profile:${encodeURIComponent(contextGraphId)}:${kind}:${encodeURIComponent(slug)}`;
+}
+
+function queryCatalogLiteral(value: string): string {
+  return JSON.stringify(value);
+}
+
+function queryCatalogIntLiteral(value: number): string {
+  return `"${value}"^^<${XSD_INTEGER}>`;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function readOnlySparqlOperation(sparql: string): string | null {
+  const normalized = sparql
+    .split(/\r?\n/)
+    .filter((line) => !line.trimStart().startsWith('#'))
+    .join('\n')
+    .trim();
+  const match = normalized.match(/^(?:(?:PREFIX\s+\S+\s*<[^>]+>|BASE\s+<[^>]+>)\s*)*(SELECT|ASK|CONSTRUCT|DESCRIBE)\b/i);
+  return match?.[1]?.toUpperCase() ?? null;
+}
+
+function buildQueryCatalogSaveWrite(input: {
+  contextGraphId: string;
+  name: string;
+  description?: string;
+  sparql: string;
+  subGraph: string;
+  catalogSlug: string;
+  catalogName: string;
+  catalogDescription?: string;
+  resultColumn?: string;
+  rank: number;
+  catalogRank: number;
+}): {
+  savedQuery: QueryCatalogToolItem & {
+    queryUri: string;
+    catalogUri: string;
+    resultColumn?: string;
+  };
+  quads: QueryCatalogWriteQuad[];
+} {
+  const slug = `${queryCatalogSlug(input.name)}-${input.rank.toString(36)}`;
+  const catalogUri = queryCatalogProfileUri(input.contextGraphId, 'catalog', input.catalogSlug);
+  const queryUri = queryCatalogProfileUri(input.contextGraphId, 'query', slug);
+  const quads: QueryCatalogWriteQuad[] = [
+    { subject: catalogUri, predicate: RDF_TYPE, object: `${PROFILE_NS}QueryCatalog`, graph: '' },
+    { subject: catalogUri, predicate: `${PROFILE_NS}forSubGraph`, object: queryCatalogLiteral(input.subGraph), graph: '' },
+    { subject: catalogUri, predicate: `${PROFILE_NS}displayName`, object: queryCatalogLiteral(input.catalogName), graph: '' },
+    { subject: catalogUri, predicate: `${PROFILE_NS}rank`, object: queryCatalogIntLiteral(input.catalogRank), graph: '' },
+    { subject: queryUri, predicate: RDF_TYPE, object: `${PROFILE_NS}SavedQuery`, graph: '' },
+    { subject: queryUri, predicate: `${PROFILE_NS}forSubGraph`, object: queryCatalogLiteral(input.subGraph), graph: '' },
+    { subject: queryUri, predicate: `${PROFILE_NS}inCatalog`, object: catalogUri, graph: '' },
+    { subject: queryUri, predicate: `${PROFILE_NS}displayName`, object: queryCatalogLiteral(input.name), graph: '' },
+    { subject: queryUri, predicate: `${PROFILE_NS}sparqlQuery`, object: queryCatalogLiteral(input.sparql), graph: '' },
+    { subject: queryUri, predicate: `${PROFILE_NS}rank`, object: queryCatalogIntLiteral(input.rank), graph: '' },
+  ];
+  if (input.catalogDescription) {
+    quads.push({ subject: catalogUri, predicate: `${SCHEMA_NS}description`, object: queryCatalogLiteral(input.catalogDescription), graph: '' });
+  }
+  if (input.description) {
+    quads.push({ subject: queryUri, predicate: `${SCHEMA_NS}description`, object: queryCatalogLiteral(input.description), graph: '' });
+  }
+  if (input.resultColumn) {
+    quads.push({ subject: queryUri, predicate: `${PROFILE_NS}resultColumn`, object: queryCatalogLiteral(input.resultColumn), graph: '' });
+  }
+  return {
+    savedQuery: {
+      slug,
+      name: input.name,
+      description: input.description,
+      sparql: input.sparql,
+      rank: input.rank,
+      catalogSlug: input.catalogSlug,
+      catalogName: input.catalogName,
+      catalogDescription: input.catalogDescription,
+      catalogRank: input.catalogRank,
+      subGraph: input.subGraph,
+      queryUri,
+      catalogUri,
+      resultColumn: input.resultColumn,
+    },
+    quads,
+  };
 }
 
 const OPENCLAW_LOCAL_AGENT_CAPABILITIES = {
@@ -2840,7 +2960,7 @@ export class DkgNodePlugin {
         description:
           'Run a saved SPARQL query from a context graph profile query catalog by slug or exact display name. ' +
           'Call dkg_query_catalog_list first if the selector is ambiguous. Executes the saved SPARQL against ' +
-          'the same context graph using the standard DKG query route.',
+          'the same context graph and saved sub-graph scope using the standard DKG query route.',
         parameters: {
           type: 'object',
           properties: {
@@ -2856,6 +2976,57 @@ export class DkgNodePlugin {
           required: ['context_graph_id', 'query'],
         },
         execute: async (_toolCallId, args) => this.handleQueryCatalogRun(args),
+      },
+      {
+        name: 'dkg_query_catalog_save',
+        description:
+          'Save a read-only SPARQL query into a context graph profile query catalog. Use only when the user ' +
+          'explicitly asks to save a query and you have the query text. Defaults to the UI "Saved queries" ' +
+          'catalog for whole-context-graph queries.',
+        parameters: {
+          type: 'object',
+          properties: {
+            context_graph_id: {
+              type: 'string',
+              description: 'Context graph/project ID whose profile query catalog should receive the saved query.',
+            },
+            name: {
+              type: 'string',
+              description: 'Human-readable saved query name.',
+            },
+            sparql: {
+              type: 'string',
+              description: 'Read-only SPARQL query text. Must start with SELECT, ASK, CONSTRUCT, or DESCRIBE after optional PREFIX/BASE declarations.',
+            },
+            description: {
+              type: 'string',
+              description: 'Optional short description of what the saved query returns.',
+            },
+            sub_graph: {
+              type: 'string',
+              description:
+                'Optional profile sub-graph scope. Defaults to "__context_graph", the whole-context-graph query surface.',
+            },
+            catalog_slug: {
+              type: 'string',
+              description: 'Optional catalog slug. Defaults to "ui-saved-queries".',
+            },
+            catalog_name: {
+              type: 'string',
+              description: 'Optional catalog display name. Defaults to "Saved queries".',
+            },
+            catalog_description: {
+              type: 'string',
+              description: 'Optional catalog description. Defaults to the UI saved-query catalog description.',
+            },
+            result_column: {
+              type: 'string',
+              description: 'Optional SELECT variable name, without "?", that identifies entity URI results for UI entity-list rendering.',
+            },
+          },
+          required: ['context_graph_id', 'name', 'sparql'],
+        },
+        execute: async (_toolCallId, args) => this.handleQueryCatalogSave(args),
       },
       {
         name: 'dkg_find_agents',
@@ -3719,11 +3890,63 @@ export class DkgNodePlugin {
       }
 
       const savedQuery = matches[0];
-      const result = await this.client.query(savedQuery.sparql, { contextGraphId });
+      const queryOpts = savedQuery.subGraph && savedQuery.subGraph !== CONTEXT_GRAPH_QUERY_SUBGRAPH
+        ? { contextGraphId, subGraphName: savedQuery.subGraph }
+        : { contextGraphId };
+      const result = await this.client.query(savedQuery.sparql, queryOpts);
       return this.json({
         contextGraphId,
         savedQuery,
         result,
+      });
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleQueryCatalogSave(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const name = String(args.name ?? '').trim();
+      const sparql = String(args.sparql ?? '').trim();
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      if (!name) return this.error('"name" is required.');
+      if (!sparql) return this.error('"sparql" is required.');
+
+      const operation = readOnlySparqlOperation(sparql);
+      if (!operation) {
+        return this.error(
+          '"sparql" must be a read-only query starting with SELECT, ASK, CONSTRUCT, or DESCRIBE ' +
+            'after optional PREFIX/BASE declarations.',
+        );
+      }
+
+      const description = optionalString(args.description);
+      const subGraph = optionalString(args.sub_graph) ?? CONTEXT_GRAPH_QUERY_SUBGRAPH;
+      const catalogSlug = queryCatalogSlug(optionalString(args.catalog_slug) ?? USER_QUERY_CATALOG_SLUG);
+      const catalogName = optionalString(args.catalog_name) ?? USER_QUERY_CATALOG_NAME;
+      const catalogDescription = optionalString(args.catalog_description) ?? USER_QUERY_CATALOG_DESCRIPTION;
+      const resultColumn = optionalString(args.result_column)?.replace(/^\?/, '');
+      const rank = Date.now();
+      const { savedQuery, quads } = buildQueryCatalogSaveWrite({
+        contextGraphId,
+        name,
+        description,
+        sparql,
+        subGraph,
+        catalogSlug,
+        catalogName,
+        catalogDescription,
+        resultColumn,
+        rank,
+        catalogRank: 50,
+      });
+      const write = await this.client.writeQueryCatalog(contextGraphId, quads);
+      return this.json({
+        contextGraphId,
+        operation,
+        savedQuery,
+        write,
       });
     } catch (err: any) {
       return this.daemonError(err);

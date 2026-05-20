@@ -67,6 +67,96 @@ describe('DkgNodePlugin', () => {
     });
   });
 
+  it('round-trips query catalog resultColumn metadata in list output', async () => {
+    const plugin = new DkgNodePlugin();
+    (plugin as any).client = {
+      readQueryCatalog: vi.fn(async () => ({
+        result: {
+          type: 'bindings',
+          bindings: [
+            {
+              q: 'urn:dkg:profile:cg-1:query:orders',
+              catalog: 'urn:dkg:profile:cg-1:catalog:saved',
+              name: '"Orders"',
+              sparql: '"SELECT ?uri WHERE { ?uri ?p ?o }"',
+              resultColumn: '"uri"',
+              subGraph: '"__context_graph"',
+            },
+          ],
+        },
+      })),
+    };
+
+    const result = await (plugin as any).handleQueryCatalogList({ context_graph_id: 'cg-1' });
+
+    expect((result.details as any).items[0]).toMatchObject({
+      slug: 'orders',
+      name: 'Orders',
+      resultColumn: 'uri',
+      subGraph: '__context_graph',
+    });
+  });
+
+  it('runs saved query catalog entries against their saved sub-graph scope', async () => {
+    const query = vi.fn(async () => ({ result: { bindings: [] } }));
+    const plugin = new DkgNodePlugin();
+    (plugin as any).client = {
+      readQueryCatalog: vi.fn(async () => ({
+        result: {
+          type: 'bindings',
+          bindings: [
+            {
+              q: 'urn:dkg:profile:cg-1:query:orders',
+              catalog: 'urn:dkg:profile:cg-1:catalog:saved',
+              name: '"Orders"',
+              sparql: '"SELECT ?s WHERE { ?s ?p ?o }"',
+              resultColumn: '"s"',
+              subGraph: '"production"',
+            },
+          ],
+        },
+      })),
+      query,
+    };
+
+    const result = await (plugin as any).handleQueryCatalogRun({ context_graph_id: 'cg-1', query: 'orders' });
+
+    expect(query).toHaveBeenCalledWith('SELECT ?s WHERE { ?s ?p ?o }', {
+      contextGraphId: 'cg-1',
+      subGraphName: 'production',
+    });
+    expect((result.details as any).savedQuery).toMatchObject({
+      resultColumn: 's',
+      subGraph: 'production',
+    });
+  });
+
+  it('saves query catalog timestamp ranks as unbounded integer literals', async () => {
+    const rank = 1_714_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(rank);
+    const writeQueryCatalog = vi.fn(async () => ({ written: true }));
+    const plugin = new DkgNodePlugin();
+    (plugin as any).client = { writeQueryCatalog };
+
+    try {
+      const result = await (plugin as any).handleQueryCatalogSave({
+        context_graph_id: 'cg-1',
+        name: 'Orders',
+        sparql: 'SELECT ?s WHERE { ?s ?p ?o }',
+      });
+
+      const savedQuery = (result.details as any).savedQuery;
+      const quads = writeQueryCatalog.mock.calls[0][1];
+      const rankQuad = quads.find((q: any) =>
+        q.subject === savedQuery.queryUri && q.predicate === 'http://dkg.io/ontology/profile/rank'
+      );
+
+      expect(rankQuad?.object).toBe(`"${rank}"^^<http://www.w3.org/2001/XMLSchema#integer>`);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   it('bootstraps resolver state even when slot is owned by another plugin (R10.2)', async () => {
     // Pre-fix: when memory slot was owned by a different plugin, the
     // resolver bootstrap (`memoryResolverApi = api` + `refreshMemoryResolverState`)

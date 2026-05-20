@@ -3840,6 +3840,7 @@ type QueryCatalogItem = {
   name: string;
   description?: string;
   sparql: string;
+  resultColumn?: string;
   rank: number;
   catalogSlug: string;
   catalogName: string;
@@ -3847,6 +3848,8 @@ type QueryCatalogItem = {
   catalogRank: number;
   subGraph: string;
 };
+
+const CONTEXT_GRAPH_QUERY_SUBGRAPH = '__context_graph';
 
 async function loadSavedQueriesForCatalog(contextGraphId: string): Promise<QueryCatalogItem[]> {
   const client = await ApiClient.connect();
@@ -3863,6 +3866,7 @@ async function loadSavedQueriesForCatalog(contextGraphId: string): Promise<Query
         name: stripQuotes(String(row.name ?? slug)),
         description: row.description ? stripQuotes(String(row.description)) : undefined,
         sparql: stripQuotes(String(row.sparql ?? '')),
+        resultColumn: row.resultColumn ? stripQuotes(String(row.resultColumn)) : undefined,
         rank: Number.parseInt(stripQuotes(String(row.rank ?? '99')), 10) || 99,
         catalogSlug,
         catalogName: stripQuotes(String(row.catalogName ?? 'Queries')),
@@ -3924,6 +3928,7 @@ queryCatalogCmd
         console.log(`  Name:        ${item.name}`);
         console.log(`  Catalog:     ${item.catalogName} (${item.catalogSlug})`);
         console.log(`  Sub-graph:   ${item.subGraph}`);
+        if (item.resultColumn) console.log(`  Result col:  ${item.resultColumn}`);
         if (item.description) console.log(`  Description: ${item.description}`);
         console.log('');
       }
@@ -3945,7 +3950,13 @@ queryCatalogCmd
         process.exit(1);
       }
       const client = await ApiClient.connect();
-      const result = await client.query(match.sparql, contextGraphId);
+      const result = await client.query(
+        match.sparql,
+        contextGraphId,
+        match.subGraph && match.subGraph !== CONTEXT_GRAPH_QUERY_SUBGRAPH
+          ? { subGraphName: match.subGraph }
+          : undefined,
+      );
       console.log(`Running saved query: ${match.name}`);
       console.log(`Slug: ${match.slug}\n`);
       console.log(JSON.stringify(result.result, null, 2));

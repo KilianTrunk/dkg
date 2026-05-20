@@ -331,6 +331,8 @@ import { handleQueryRoutes } from './routes/query.js';
 import { handleLocalAgentsRoutes } from './routes/local-agents.js';
 import { handleEpcisRoutes } from './routes/epcis.js';
 import { handlePcaRoutes } from './routes/pca.js';
+import { handlePluginRoutes } from './routes/plugins.js';
+import type { RoutePlugin } from './plugin-api.js';
 
 
 export async function handleRequest(
@@ -362,6 +364,7 @@ export async function handleRequest(
   // server state instead of request headers (SSRF defence).
   apiHost: string,
   apiPortRef: { value: number },
+  routePlugins: RoutePlugin[],
   emitMemoryGraphChanged?: (event: MemoryGraphChangedEvent) => void,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
@@ -399,6 +402,7 @@ export async function handleRequest(
     validTokens,
     apiHost,
     apiPortRef,
+    routePlugins,
     url,
     path,
     requestToken,
@@ -440,6 +444,9 @@ export async function handleRequest(
   if (res.writableEnded) return;
 
   await handlePcaRoutes(ctx);
+  if (res.writableEnded) return;
+
+  await handlePluginRoutes(ctx);
   if (res.writableEnded) return;
 
   jsonResponse(res, 404, { error: 'Not found' });

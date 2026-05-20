@@ -420,6 +420,12 @@ export interface DkgConfig {
    * See {@link ChatConfig} / {@link ChatAclConfig}.
    */
   chat?: ChatConfig;
+  /**
+   * Fork-authored route-plugin specs (absolute paths or resolvable
+   * package names) loaded once at daemon startup; survives auto-update
+   * because it lives in operator-state config rather than node source.
+   */
+  routePlugins?: string[];
 }
 
 /**

@@ -495,6 +495,55 @@ the `dkg integration` CLI (see `packages/cli/src/integrations/`), which installs
 trusted `cli` / `mcp` integrations from a registry with npm provenance
 verification.
 
+### Route plugins
+
+Route plugins are an in-process extension hook for fork operators who need to
+add custom HTTP routes to the daemon without patching upstream. They are
+distinct from the `dkg integration` system: integrations are third-party
+packages installed by end-users from a registry, while route plugins are
+loaded from a fork's own configured module paths and run inside the daemon's
+own request loop with access to the same `RequestContext` that built-in
+routes receive.
+
+A plugin is a module exporting an object matching this shape:
+
+```ts
+import type { RoutePlugin } from '@origintrail-official/dkg/daemon/plugin-api';
+
+export const plugin: RoutePlugin = {
+  name: 'my-fork-routes',
+  async handle(ctx) {
+    if (ctx.url.pathname === '/my-fork/hello') {
+      ctx.res.statusCode = 200;
+      ctx.res.end('hi');
+    }
+  },
+};
+```
+
+Plugins are wired into the daemon via `~/.dkg/config.json`:
+
+```json
+{
+  "routePlugins": [
+    "/opt/my-fork/plugins/my-fork-routes.js",
+    "@my-fork/dkg-extra-routes"
+  ]
+}
+```
+
+Each entry is either an **absolute filesystem path** to a built plugin
+module (relative paths are not resolved against `~/.dkg` and will fail to
+load) or a **resolvable package name** that `@origintrail-official/dkg`'s
+daemon can `require.resolve` from its own install location.
+
+On path collisions the first plugin listed in `routePlugins` wins: the
+dispatcher invokes plugins in array order and stops at the first one that
+writes a response, so earlier entries shadow later ones for the same path.
+
+See [`docs/adr/0001-daemon-route-plugins.md`](../../docs/adr/0001-daemon-route-plugins.md)
+for the design rationale, threat model, and stability guarantees.
+
 ## Internal Dependencies
 
 - `@origintrail-official/dkg-agent` — agent runtime, wallet, publishing, querying

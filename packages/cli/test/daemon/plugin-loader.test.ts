@@ -26,4 +26,13 @@ describe('loadRoutePlugins', () => {
     expect(plugins).toEqual([]);
     expect(warn).not.toHaveBeenCalled();
   });
+
+  it('loads a single plugin from an absolute-path spec (default export)', async () => {
+    const { log, warn } = makeLogger();
+    const plugins = await loadRoutePlugins([fixtureAbs], log);
+    expect(plugins).toHaveLength(1);
+    expect(plugins[0].name).toBe('sample-fixture-echo');
+    expect(typeof plugins[0].handle).toBe('function');
+    expect(warn).not.toHaveBeenCalled();
+  });
 });

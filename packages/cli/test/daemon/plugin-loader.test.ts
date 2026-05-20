@@ -69,6 +69,22 @@ describe('loadRoutePlugins', () => {
     }
   });
 
+  it('accepts a CommonJS module that exposes the plugin as a named `plugin` export', async () => {
+    const tempAbs = writeTempEsm(
+      'cjs-named.cjs',
+      "module.exports.plugin = { name: 'cjs-named-plugin', handle() {} };",
+    );
+    try {
+      const { log, warn } = makeLogger();
+      const plugins = await loadRoutePlugins([tempAbs], log);
+      expect(plugins).toHaveLength(1);
+      expect(plugins[0].name).toBe('cjs-named-plugin');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dirname(tempAbs), { recursive: true, force: true });
+    }
+  });
+
   it('keeps the valid plugin and warns on the broken one in a mixed list', async () => {
     const { log, warn } = makeLogger();
     const plugins = await loadRoutePlugins(

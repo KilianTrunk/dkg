@@ -15,6 +15,8 @@ function isRoutePlugin(value: unknown): value is RoutePlugin {
 function pickCandidate(mod: unknown): unknown {
   if (mod && typeof mod === 'object') {
     const m = mod as Record<string, unknown>;
+    if (isRoutePlugin(m.plugin)) return m.plugin;
+    if (isRoutePlugin(m.default)) return m.default;
     if (m.default !== undefined) return m.default;
     if (m.plugin !== undefined) return m.plugin;
   }

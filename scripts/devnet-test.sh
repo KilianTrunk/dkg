@@ -3283,7 +3283,10 @@ else
       if ! [[ "$last_tracked" =~ ^[0-9]+$ && "$last_completed" =~ ^[0-9]+$ && "$last_pending" =~ ^[0-9]+$ ]]; then
         break
       fi
-      if [[ "$last_pending" -le 1 ]]; then
+      # Round 7: tighten to pending == 0. `pending` is the live
+      # records.size gauge from SwmAckQuorum.stats(); allowing ≤1
+      # let one wedged share pass as "steady state".
+      if [[ "$last_pending" -eq 0 ]]; then
         drained=1
         break
       fi
@@ -3413,9 +3416,25 @@ else
   # 5+ as edge. Iterate in reverse so we prefer the highest-numbered
   # (most likely edge) node when several exist.
   RECIPIENT_PORT=""
+  EDGE_DISCOVERY_BROKEN=0
   for idx in $(seq $((NUM_NODES - 1)) -1 0); do
     p=${NODE_PORTS[$idx]}
     role=$(json_get "$(c "http://127.0.0.1:$p/api/info")" nodeRole)
+    # Round 7: sentinel-validate before classifying. An unreadable
+    # nodeRole silently falling through to "not edge" let a broken
+    # /api/info on the only edge node skip §37 as "no edge node
+    # detected" while the devnet was actually unhealthy. Treat
+    # unreadable as a fail rather than a silent skip.
+    if [[ -z "$role" || "$role" == "__NONE__" || "$role" == "__ERR__" ]]; then
+      fail "Node $p /api/info.nodeRole unreadable ('$role') — cannot decide if this is an edge restart candidate"
+      EDGE_DISCOVERY_BROKEN=1
+      continue
+    fi
+    if [[ "$role" != "core" && "$role" != "edge" ]]; then
+      fail "Node $p /api/info.nodeRole='$role' is not 'core' or 'edge' — unrecognised role; cannot decide if it's an edge restart candidate"
+      EDGE_DISCOVERY_BROKEN=1
+      continue
+    fi
     if [[ "$role" == "edge" ]]; then
       RECIPIENT_PORT="$p"
       break
@@ -3448,7 +3467,9 @@ except Exception:
   RECIPIENT_PIDFILE="${RECIPIENT_DIR:+$RECIPIENT_DIR/devnet.pid}"
   CLI_JS="$SCRIPT_DIR/../packages/cli/dist/cli.js"
 
-  if [[ -z "$RECIPIENT_PORT" ]]; then
+  if [[ -z "$RECIPIENT_PORT" && "$EDGE_DISCOVERY_BROKEN" == "1" ]]; then
+    fail "SECTION 37: edge-node discovery broken — at least one /api/info.nodeRole was unreadable (see fail(s) above); refusing to skip a stale-build mismatch as 'no edge'"
+  elif [[ -z "$RECIPIENT_PORT" ]]; then
     skip "SECTION 37: no edge node detected (all $NUM_NODES nodes report nodeRole != 'edge'); restarting a core would break consensus — skipping"
   elif [[ -z "$RECIPIENT_DIR" ]]; then
     skip "SECTION 37: could not match port $RECIPIENT_PORT to any .devnet/nodeN/config.json — script not running against devnet.sh layout"
@@ -3525,11 +3546,21 @@ except Exception:
         MSG_ID=$(json_get "$CHAT_RESP" messageId)
       fi
       ABORT_RESTART=0
+      # Round 7: validate the chat response shape BEFORE the
+      # delivered/queued branching. If /api/chat returned junk,
+      # DELIVERED_NOW/QUEUED_NOW will be __ERR__/__NONE__ — that's
+      # a broken endpoint, not a "couldn't exercise outbox path"
+      # condition. Hard-fail on unreadable responses; only THEN
+      # interpret the boolean shape.
+      if [[ "$DELIVERED_NOW" != "true" && "$DELIVERED_NOW" != "false" ]] \
+         || [[ "$QUEUED_NOW" != "true" && "$QUEUED_NOW" != "false" ]]; then
+        fail "Chat /api/chat returned unreadable response shape: delivered='$DELIVERED_NOW' queued='$QUEUED_NOW' (expected true/false). Broken endpoint, not an outbox-path failure — aborting §37d-§37e"
+        ABORT_RESTART=1
       # REQUIRE delivered=false AND queued=true (Codex PR #588 round 2):
       # a plain send failure can return delivered=false WITHOUT queued=true,
       # which is NOT the outbox path — treating it as durable would let the
       # inbox-poll below pass on a message that never persisted for retry.
-      if [[ "$DELIVERED_NOW" == "false" && "$QUEUED_NOW" == "true" ]]; then
+      elif [[ "$DELIVERED_NOW" == "false" && "$QUEUED_NOW" == "true" ]]; then
         ok "Chat returned delivered=false queued=true messageId=${MSG_ID:0:12}… (substrate outbox holding it)"
       else
         # Either delivered=true (raced the disconnect), or

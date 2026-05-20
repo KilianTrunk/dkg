@@ -116,6 +116,17 @@ export const extractSessionKey = captureExtractSessionKey;
 
 export function extractPrompt(payload) {
   if (!payload || typeof payload !== 'object') return '';
+  // Defensive: an upstream beforeSubmitPrompt hook may have already
+  // emitted `updated_input`. Cursor's docs don't specify how the
+  // field composes across sequential hooks, but if it IS surfaced
+  // to downstream hooks we want to treat it as the canonical prompt
+  // rather than going back to the original `prompt` field — that
+  // would silently overwrite any earlier prepended block. Mirrors
+  // the matching guard in inject-inbox.mjs. See Codex PR #589
+  // round 3 finding on hook composition.
+  if (typeof payload.updated_input === 'string' && payload.updated_input.trim()) {
+    return payload.updated_input;
+  }
   // `readStdinJson` wraps non-JSON stdin in `{ rawPayload: <text> }`
   // so the operator's prompt is recoverable even when Cursor sends
   // a plain string. Honour that envelope before delegating to the

@@ -322,6 +322,19 @@ export function extractSessionKey(payload) {
   return sanitiseSlug(anonSessionKey());
 }
 
+// Generate a fresh anon-session suffix. Uses `crypto.randomBytes`
+// (CSPRNG) rather than `Math.random` so the session key is hard to
+// predict — the anon-session id is used as both a filesystem path
+// segment and a chat:Session URI fragment, so weak entropy is a
+// (minor) attack surface for anyone with read access to the user's
+// state dir or graph. CodeQL flagged the pre-existing `Math.random`
+// path as reachable from inject-session-context.mjs via the
+// `extractSessionKey` re-export added in PR #589 round 3; this is
+// the fix at the source.
+function freshAnonKey() {
+  return `anon-${Date.now().toString(36)}-${crypto.randomBytes(6).toString('hex')}`;
+}
+
 function anonSessionKey() {
   try {
     const stateDir = path.join(os.homedir(), '.dkg', 'hook-state');
@@ -331,11 +344,11 @@ function anonSessionKey() {
       const buf = fs.readFileSync(idxFile, 'utf-8').trim();
       if (buf) return buf;
     }
-    const fresh = `anon-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    const fresh = freshAnonKey();
     fs.writeFileSync(idxFile, fresh, 'utf-8');
     return fresh;
   } catch {
-    return `anon-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    return freshAnonKey();
   }
 }
 

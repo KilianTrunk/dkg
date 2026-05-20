@@ -310,9 +310,33 @@ async function readStdinJson() {
  * prompt entirely. We now look at `rawPayload` too, and `main()`
  * fails CLOSED on prompt extraction (returns `{}` rather than
  * overwriting the operator's input).
+ *
+ * Codex PR #589 round 3 raised a related concern: when multiple
+ * beforeSubmitPrompt hooks chain (capture-chat → inject-session-
+ * context → inject-inbox), if Cursor passes each downstream hook
+ * the UPSTREAM hook's `updated_input` value, this hook used to
+ * ignore it — silently overwriting any prepended block (e.g. the
+ * `<dkg-session-context>` block inject-session-context emits) with
+ * its own `<dkg-inbox-notice>` + ORIGINAL prompt. Cursor's docs
+ * don't explicitly specify how `updated_input` composes across
+ * sequential hooks (and a known Cursor bug
+ * <https://forum.cursor.com/t/.../158883> strips `updated_input`
+ * for beforeSubmitPrompt entirely on some versions), so we can't
+ * test this end-to-end against Cursor itself. We DEFENSIVELY prefer
+ * `payload.updated_input` when it's present: if Cursor's protocol
+ * passes upstream values through, the chain composes correctly; if
+ * not (or if the field is stripped), nothing changes vs. before.
  */
 export function extractPrompt(payload) {
   if (!payload || typeof payload !== 'object') return '';
+  // Defensive: an upstream beforeSubmitPrompt hook may have already
+  // emitted `updated_input`. If Cursor's hook executor surfaces that
+  // to downstream hooks (the unspecified composition case), treat it
+  // as the canonical prompt — this preserves any prepended block
+  // such as <dkg-session-context>.
+  if (typeof payload.updated_input === 'string' && payload.updated_input.trim()) {
+    return payload.updated_input;
+  }
   if (typeof payload.rawPayload === 'string' && payload.rawPayload.trim()) {
     return payload.rawPayload;
   }

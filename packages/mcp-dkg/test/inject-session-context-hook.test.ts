@@ -130,6 +130,31 @@ describe('inject-session-context.mjs — LOCKSTEP with capture-chat.mjs', () => 
       expect(extractPrompt({})).toBe('');
     });
   });
+
+  describe('hook composition: defensive updated_input extraction', () => {
+    // Codex PR #589 round 3: if a different upstream hook (or
+    // ourselves on a re-entry) has already emitted `updated_input`
+    // and Cursor surfaces it to this hook, we want to preserve it.
+    // Mirrors the matching defensive guard in inject-inbox.mjs.
+
+    it('prefers payload.updated_input over the original prompt when present', () => {
+      const upstreamBlock = '<dkg-inbox-notice>peer count</dkg-inbox-notice>\n\noriginal prompt';
+      expect(extractPrompt({
+        prompt: 'original prompt',
+        updated_input: upstreamBlock,
+      })).toBe(upstreamBlock);
+    });
+
+    it('falls back to the original prompt when updated_input is absent / empty', () => {
+      expect(extractPrompt({ prompt: 'p' })).toBe('p');
+      expect(extractPrompt({ prompt: 'p', updated_input: '' })).toBe('p');
+      expect(extractPrompt({ prompt: 'p', updated_input: '   ' })).toBe('p');
+    });
+
+    it('ignores updated_input when it is not a string', () => {
+      expect(extractPrompt({ prompt: 'p', updated_input: { command: 'x' } } as any)).toBe('p');
+    });
+  });
 });
 
 describe('inject-session-context.mjs — renderBlock', () => {

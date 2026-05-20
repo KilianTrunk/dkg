@@ -4,6 +4,7 @@ import {
   decodeStorageACK,
   computePublishACKDigest,
   isStorageACKDecline,
+  isTransientStorageACKDeclineCode,
   type PublishIntentMsg,
   type StorageACKMsg,
 } from '@origintrail-official/dkg-core';
@@ -193,7 +194,30 @@ export class ACKCollector {
               ack.declineMessage ?? '',
               MAX_DECLINE_MESSAGE_CHARS,
             );
+            // Record the latest decline reason so it surfaces in the
+            // final `storage_ack_insufficient` error. Overwriting any
+            // prior entry is intentional — operators care most about
+            // why the peer ultimately could not ACK.
             declines.set(peerId, { code, message: declineMessage });
+
+            // Transient declines (SWM replication catching up via
+            // gossip) can resolve on a retry, so re-send through the
+            // same backoff as transport errors instead of permanently
+            // deselecting the peer. Codex review on PR #559 flagged
+            // the "every decline is permanent" path as a regression:
+            // a core that would have ACKed seconds later was being
+            // removed from the quorum pool the moment its SWM trailed
+            // the publish by even one gossip cycle.
+            if (isTransientStorageACKDeclineCode(code) && attempt < MAX_RETRIES - 1) {
+              log(
+                `[ACKCollector] Transient decline from ${peerId.slice(-8)}: ${code}` +
+                (declineMessage ? ` — ${declineMessage}` : '') +
+                ` (retry ${attempt + 1}/${MAX_RETRIES})`,
+              );
+              await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
+              continue;
+            }
+
             log(
               `[ACKCollector] Decline from ${peerId.slice(-8)}: ${code}` +
               (declineMessage ? ` — ${declineMessage}` : ''),
@@ -223,6 +247,12 @@ export class ACKCollector {
               return null;
             }
           }
+
+          // Clear any prior transient-decline record now that this peer
+          // has produced a valid ACK on a later retry — otherwise the
+          // stale decline would still appear in `storage_ack_insufficient`
+          // if quorum fails for unrelated reasons.
+          declines.delete(peerId);
 
           log(`[ACKCollector] Valid ACK from ${peerId.slice(-8)} (identity=${identityId}, signer=${recoveredAddress.slice(0, 10)}...)`);
 

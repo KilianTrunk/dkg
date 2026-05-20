@@ -276,23 +276,26 @@ export class StorageACKHandler {
     // `KnowledgeAssetsV10.sol:379`, so signing an ACK against CG 0 (or a
     // negative id from `BigInt("-1")`, which would die later in the
     // evm-adapter's uint256 encoder) would just produce a signature the
-    // contract rejects downstream. Refuse the PublishIntent here with a
-    // clear error so the publisher sees the failure on the P2P stream.
+    // contract rejects downstream.
+    //
+    // Throw rather than decline: this is a malformed PublishIntent (the
+    // publisher built a request the contract will never accept), not
+    // peer-local state. A typed decline would make the publisher fan
+    // out to every other core looking for a different answer and
+    // report `storage_ack_insufficient` after the full retry budget,
+    // masking the real caller error. The stream reset surfaces the
+    // original message to the caller immediately.
     let contextGraphIdBigInt: bigint;
     try {
       contextGraphIdBigInt = BigInt(cgId);
     } catch {
-      return this.encodeDecline(
-        cgId,
-        STORAGE_ACK_DECLINE_CODES.CG_ID_INVALID,
+      throw new Error(
         `StorageACK: V10 publish requires a numeric on-chain context graph id; ` +
         `got '${cgId}'. Register the CG on-chain via ContextGraphs.createContextGraph first.`,
       );
     }
     if (contextGraphIdBigInt <= 0n) {
-      return this.encodeDecline(
-        cgId,
-        STORAGE_ACK_DECLINE_CODES.CG_ID_INVALID,
+      throw new Error(
         `StorageACK: V10 publish requires a positive on-chain context graph id; ` +
         `got ${contextGraphIdBigInt}. Register the CG on-chain via ContextGraphs.createContextGraph first.`,
       );

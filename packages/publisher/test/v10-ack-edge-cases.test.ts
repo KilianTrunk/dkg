@@ -688,7 +688,14 @@ describe('StorageACKHandler inline verification', () => {
     expect(store.query.calls.length).toBeGreaterThan(0);
   });
 
-  it('declines (CG_ID_INVALID) when intent contextGraphId is non-numeric', async () => {
+  // Non-numeric / non-positive `contextGraphId` is a malformed PublishIntent
+  // (the contract will reject it with ZeroContextGraphId / will never accept
+  // it), not a peer-local state. Codex review on PR #559 pointed out that
+  // returning a typed decline here would make the publisher fan out to every
+  // other core looking for a different answer and eventually report
+  // `storage_ack_insufficient` — masking the real caller error. The handler
+  // throws so the libp2p stream surfaces the original message immediately.
+  it('throws when intent contextGraphId is non-numeric', async () => {
     const store = createRecordingStore(testQuads);
     const handler = new StorageACKHandler(store, createConfig(), makeEventBus() as any);
 
@@ -704,15 +711,12 @@ describe('StorageACKHandler inline verification', () => {
       stagingQuads: new TextEncoder().encode(quadsToNQuads(testQuads)),
     });
 
-    const response = await handler.handler(intent, fakePeerId);
-    const decoded = decodeStorageACK(response);
-    expect(isStorageACKDecline(decoded)).toBe(true);
-    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.CG_ID_INVALID);
-    expect(decoded.declineMessage).toContain('numeric on-chain context graph id');
-    expect(decoded.contextGraphId).toBe('not-a-number');
+    await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+      /numeric on-chain context graph id/,
+    );
   });
 
-  it('declines (CG_ID_INVALID) when intent contextGraphId is "0"', async () => {
+  it('throws when intent contextGraphId is "0"', async () => {
     const store = createRecordingStore(testQuads);
     const handler = new StorageACKHandler(store, createConfig(), makeEventBus() as any);
 
@@ -728,11 +732,9 @@ describe('StorageACKHandler inline verification', () => {
       stagingQuads: new TextEncoder().encode(quadsToNQuads(testQuads)),
     });
 
-    const response = await handler.handler(intent, fakePeerId);
-    const decoded = decodeStorageACK(response);
-    expect(isStorageACKDecline(decoded)).toBe(true);
-    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.CG_ID_INVALID);
-    expect(decoded.declineMessage).toContain('positive on-chain context graph id');
+    await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+      /positive on-chain context graph id/,
+    );
   });
 
   it('declines (SIGNER_NOT_REGISTERED) when isSignerRegistered returns false', async () => {
@@ -1069,8 +1071,13 @@ describe('StorageACKHandler signature format', () => {
 // instead of throwing into the libp2p stream. The collector must:
 //
 //  - record the decline reason per-peer
-//  - NOT retry against a declining peer (decline is permanent for the
-//    request)
+//  - distinguish TRANSIENT declines (NO_DATA_IN_SWM / MERKLE_MISMATCH_IN_SWM
+//    — SWM replication still catching up via gossip) from PERMANENT
+//    ones (e.g. SIGNER_NOT_REGISTERED — operator rotated the key):
+//      * transient → retry the same peer through normal backoff;
+//        a peer that would have ACKed seconds later still counts.
+//      * permanent → return null immediately; the peer is deselected
+//        for this request and the publisher fans out to others.
 //  - still reach quorum if other peers ACK
 //  - on quorum failure, surface every per-peer decline reason in the
 //    `storage_ack_insufficient` error so operators can diagnose
@@ -1102,13 +1109,18 @@ describe('ACKCollector typed declines (#541)', () => {
     };
   }
 
-  it('quorum still reached when some peers decline; declining peers are NOT retried', async () => {
+  it('quorum still reached when some peers decline permanently; permanent-declining peers are NOT retried', async () => {
+    // Permanent declines (operator rotated the signer off-chain) should
+    // never cause a retry — the publisher deselects the peer for this
+    // request the moment the decline lands. SIGNER_NOT_REGISTERED is the
+    // canonical permanent code; NO_DATA_IN_SWM / MERKLE_MISMATCH_IN_SWM
+    // are transient and exercised in the next test.
     const sendCounts = new Map<string, number>();
     const sendP2P = tracked(async (peerId: string) => {
       sendCounts.set(peerId, (sendCounts.get(peerId) ?? 0) + 1);
       const inner = buildSendP2PWithDeclines({
-        'peer-0': { code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM, message: 'no swm data for repnet-v2-official' },
-        'peer-3': { code: STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM, message: 'stale data' },
+        'peer-0': { code: STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED, message: 'key rotated' },
+        'peer-3': { code: STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED, message: 'key removed' },
       });
       return inner(peerId);
     });
@@ -1134,13 +1146,102 @@ describe('ACKCollector typed declines (#541)', () => {
 
     expect(log.calls.some(
       (c: unknown[]) => (c[0] as string).includes('Decline from peer-0')
-        && (c[0] as string).includes('NO_DATA_IN_SWM'),
+        && (c[0] as string).includes('SIGNER_NOT_REGISTERED'),
     )).toBe(true);
     expect(log.calls.some(
       (c: unknown[]) => (c[0] as string).includes('Decline from peer-3')
-        && (c[0] as string).includes('MERKLE_MISMATCH_IN_SWM'),
+        && (c[0] as string).includes('SIGNER_NOT_REGISTERED'),
     )).toBe(true);
   });
+
+  it('transient declines (NO_DATA_IN_SWM) are retried against the same peer up to MAX_RETRIES', async () => {
+    // Codex review on PR #559: treating NO_DATA_IN_SWM as permanent
+    // shrinks the quorum pool the moment a core's SWM trails the
+    // publish by even one gossip cycle. The fix is to retry transient
+    // declines through the normal backoff so a peer whose replication
+    // catches up seconds later still contributes to quorum.
+    //
+    // Setup: 3 peers, all must ACK (requiredACKs=3). peer-0 declines
+    // transiently on every attempt; peer-1 and peer-2 ACK. Quorum
+    // therefore cannot complete via shortcut — the collector has no
+    // reason to bail on peer-0's retries and we can observe the
+    // full retry budget being spent against the declining peer.
+    const sendCounts = new Map<string, number>();
+    const sendP2P = tracked(async (peerId: string) => {
+      sendCounts.set(peerId, (sendCounts.get(peerId) ?? 0) + 1);
+      const inner = buildSendP2PWithDeclines({
+        'peer-0': { code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM, message: 'replication lagging' },
+      });
+      return inner(peerId);
+    });
+
+    const log = noop();
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: sendP2P as any,
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      log,
+    };
+    const collector = new ACKCollector(deps);
+
+    await expect(
+      collector.collect(buildCollectParams({ requiredACKs: 3 })),
+    ).rejects.toThrow(/storage_ack_insufficient/);
+
+    // peer-0 was dialled 3 times (MAX_RETRIES) before giving up;
+    // every transient decline triggered another attempt. Lower bound
+    // is 2 (1 initial + ≥1 retry) so the test is robust to a future
+    // MAX_RETRIES bump; upper bound pins the current contract.
+    expect(sendCounts.get('peer-0')).toBeGreaterThanOrEqual(2);
+    expect(sendCounts.get('peer-0')).toBeLessThanOrEqual(3);
+
+    expect(log.calls.some(
+      (c: unknown[]) => (c[0] as string).includes('Transient decline from peer-0')
+        && (c[0] as string).includes('NO_DATA_IN_SWM'),
+    )).toBe(true);
+  }, 15_000);
+
+  it('a transient decline that resolves to a valid ACK on retry contributes to quorum', async () => {
+    // Models the gossip-replication-catching-up case: peer's first
+    // call returns NO_DATA_IN_SWM, the retry returns a real ACK. The
+    // peer must end up in `result.acks` and the prior decline reason
+    // must be cleared from the per-peer record so it does not leak
+    // into operator-facing diagnostics for unrelated failures.
+    const sendCounts = new Map<string, number>();
+    const ackBuilder = buildSendP2P();
+    const sendP2P = tracked(async (peerId: string) => {
+      const calls = (sendCounts.get(peerId) ?? 0) + 1;
+      sendCounts.set(peerId, calls);
+      if (peerId === 'peer-0' && calls === 1) {
+        return encodeStorageACK({
+          merkleRoot: new Uint8Array(0),
+          coreNodeSignatureR: new Uint8Array(0),
+          coreNodeSignatureVS: new Uint8Array(0),
+          contextGraphId: testCGIdStr,
+          nodeIdentityId: 0,
+          declineCode: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+          declineMessage: 'replication lagging',
+        });
+      }
+      return ackBuilder(peerId);
+    });
+
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: sendP2P as any,
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      log: noop(),
+    };
+    const collector = new ACKCollector(deps);
+
+    const result = await collector.collect(buildCollectParams({ requiredACKs: 3 }));
+    expect(result.acks).toHaveLength(3);
+
+    const ackedPeerIds = new Set(result.acks.map((a) => a.peerId));
+    expect(ackedPeerIds.has('peer-0')).toBe(true);
+
+    expect(sendCounts.get('peer-0')).toBe(2);
+  }, 15_000);
 
   it('storage_ack_insufficient error surfaces every per-peer decline reason', async () => {
     const sendP2P = buildSendP2PWithDeclines({
@@ -1172,7 +1273,7 @@ describe('ACKCollector typed declines (#541)', () => {
     expect(captured).toContain('no swm data for repnet-v2-official');
     expect(captured).toContain('peer-0'.slice(-8));
     expect(captured).toContain('peer-2'.slice(-8));
-  });
+  }, 15_000); // transient declines retry through backoff before settling
 
   it('an unknown decline code is logged and skipped (forward-compat with future codes)', async () => {
     const sendP2P = buildSendP2PWithDeclines({
@@ -1219,7 +1320,7 @@ describe('ACKCollector typed declines (#541)', () => {
     }
     expect(captured).toContain('NO_DATA_IN_SWM');
     expect(captured).not.toContain('()');
-  });
+  }, 15_000);
 
   it('sanitizes and truncates peer-controlled decline messages', async () => {
     const untrustedTail = 'x'.repeat(400);
@@ -1248,9 +1349,13 @@ describe('ACKCollector typed declines (#541)', () => {
     } catch (err) {
       captured = err instanceof Error ? err.message : String(err);
     }
+    // Match either the per-retry "Transient decline from peer-0" line
+    // or the final "Decline from peer-0" line, depending on whether
+    // the fast-fail path fires before or after peer-0 exhausts its
+    // retry budget. Both lines apply the same sanitizer.
     const logLine = log.calls
       .map((c: unknown[]) => c[0] as string)
-      .find((line: string) => line.includes('Decline from peer-0'));
+      .find((line: string) => /decline from peer-0/i.test(line));
 
     expect(logLine).toBeDefined();
     expect(logLine).toContain('line one line two');
@@ -1265,7 +1370,7 @@ describe('ACKCollector typed declines (#541)', () => {
     expect(captured).not.toContain('\t');
     expect(captured).not.toContain(untrustedTail);
     expect(captured!.length).toBeLessThan(700);
-  });
+  }, 15_000);
 
   it('fails fast with storage_ack_insufficient when declines + a hung peer make quorum impossible', async () => {
     // Codex Review on PR#559: in the mixed case where some peers
@@ -1324,7 +1429,11 @@ describe('ACKCollector typed declines (#541)', () => {
 
     // Sanity check: peer-2 was actually dialled (so the hang is real)
     // and the failure landed well below the ACK_TIMEOUT_MS budget.
+    // Floor pushed up from the original ~instant decline path now that
+    // NO_DATA_IN_SWM is a TRANSIENT decline that retries through the
+    // 1s + 2s transport backoff before settling — the fast-fail still
+    // beats the 120s ACK_TIMEOUT_MS budget by two orders of magnitude.
     expect(hung).toContain('peer-2');
-    expect(elapsed).toBeLessThan(5_000);
-  });
+    expect(elapsed).toBeLessThan(15_000);
+  }, 30_000);
 });

@@ -268,6 +268,20 @@ export class ACKCollector {
             log(`[ACKCollector] Retry ${attempt + 1}/${MAX_RETRIES} for ${peerId.slice(-8)}: ${msg}`);
             await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
           } else {
+            // Terminal transport failure on the final attempt. If this
+            // peer transient-declined on an earlier attempt the
+            // `declines` map still holds that stale code — overwrite
+            // it with the actual terminal reason so the aggregated
+            // `storage_ack_insufficient` diagnostic reflects the last
+            // observed outcome (the codex review on PR #559 caught
+            // the original "stale decline shadows the real failure"
+            // path here).
+            if (declines.has(peerId)) {
+              declines.set(peerId, {
+                code: 'TRANSPORT_ERROR',
+                message: sanitizeDeclineField(msg, MAX_DECLINE_MESSAGE_CHARS),
+              });
+            }
             log(`[ACKCollector] Failed to get ACK from ${peerId.slice(-8)} after ${MAX_RETRIES} attempts: ${msg}`);
           }
         }

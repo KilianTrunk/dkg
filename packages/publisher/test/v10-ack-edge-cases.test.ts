@@ -1201,6 +1201,61 @@ describe('ACKCollector typed declines (#541)', () => {
     )).toBe(true);
   }, 15_000);
 
+  it('a transient decline followed by terminal transport errors reports the transport reason, not the stale decline', async () => {
+    // Codex review on PR #559: when a peer transient-declines first
+    // and then transport-errors on every retry, the per-peer record
+    // must reflect the terminal outcome. Otherwise the aggregated
+    // `storage_ack_insufficient` diagnostic shadows the real failure
+    // mode (connection reset / timeout) with a stale decline code,
+    // sending operators down the wrong investigation path.
+    const sendCounts = new Map<string, number>();
+    const transportErrorMessage = 'simulated stream reset on retry';
+    const sendP2P = tracked(async (peerId: string) => {
+      const calls = (sendCounts.get(peerId) ?? 0) + 1;
+      sendCounts.set(peerId, calls);
+      if (peerId === 'peer-0') {
+        if (calls === 1) {
+          return encodeStorageACK({
+            merkleRoot: new Uint8Array(0),
+            coreNodeSignatureR: new Uint8Array(0),
+            coreNodeSignatureVS: new Uint8Array(0),
+            contextGraphId: testCGIdStr,
+            nodeIdentityId: 0,
+            declineCode: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+            declineMessage: 'replication lagging (stale on transport tail)',
+          });
+        }
+        throw new Error(transportErrorMessage);
+      }
+      throw new Error('no other peers configured');
+    });
+
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: sendP2P as any,
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      log: noop(),
+    };
+    const collector = new ACKCollector(deps);
+
+    let captured: string | undefined;
+    try {
+      await collector.collect(buildCollectParams({ requiredACKs: 3 }));
+    } catch (err) {
+      captured = err instanceof Error ? err.message : String(err);
+    }
+
+    expect(captured).toBeDefined();
+    expect(captured).toContain('storage_ack_insufficient');
+    expect(captured).toContain('peer-0'.slice(-8));
+    expect(captured).toContain('TRANSPORT_ERROR');
+    expect(captured).toContain(transportErrorMessage);
+    expect(captured).not.toContain('NO_DATA_IN_SWM');
+    expect(captured).not.toContain('replication lagging (stale on transport tail)');
+
+    expect(sendCounts.get('peer-0')).toBe(3);
+  }, 15_000);
+
   it('a transient decline that resolves to a valid ACK on retry contributes to quorum', async () => {
     // Models the gossip-replication-catching-up case: peer's first
     // call returns NO_DATA_IN_SWM, the retry returns a real ACK. The

@@ -67,6 +67,70 @@ describe('DkgNodePlugin', () => {
     });
   });
 
+  it('round-trips query catalog resultColumn metadata in list output', async () => {
+    const plugin = new DkgNodePlugin();
+    (plugin as any).client = {
+      readQueryCatalog: vi.fn(async () => ({
+        result: {
+          type: 'bindings',
+          bindings: [
+            {
+              q: 'urn:dkg:profile:cg-1:query:orders',
+              catalog: 'urn:dkg:profile:cg-1:catalog:saved',
+              name: '"Orders"',
+              sparql: '"SELECT ?uri WHERE { ?uri ?p ?o }"',
+              resultColumn: '"uri"',
+              subGraph: '"__context_graph"',
+            },
+          ],
+        },
+      })),
+    };
+
+    const result = await (plugin as any).handleQueryCatalogList({ context_graph_id: 'cg-1' });
+
+    expect((result.details as any).items[0]).toMatchObject({
+      slug: 'orders',
+      name: 'Orders',
+      resultColumn: 'uri',
+      subGraph: '__context_graph',
+    });
+  });
+
+  it('runs saved query catalog entries against their saved sub-graph scope', async () => {
+    const query = vi.fn(async () => ({ result: { bindings: [] } }));
+    const plugin = new DkgNodePlugin();
+    (plugin as any).client = {
+      readQueryCatalog: vi.fn(async () => ({
+        result: {
+          type: 'bindings',
+          bindings: [
+            {
+              q: 'urn:dkg:profile:cg-1:query:orders',
+              catalog: 'urn:dkg:profile:cg-1:catalog:saved',
+              name: '"Orders"',
+              sparql: '"SELECT ?s WHERE { ?s ?p ?o }"',
+              resultColumn: '"s"',
+              subGraph: '"production"',
+            },
+          ],
+        },
+      })),
+      query,
+    };
+
+    const result = await (plugin as any).handleQueryCatalogRun({ context_graph_id: 'cg-1', query: 'orders' });
+
+    expect(query).toHaveBeenCalledWith('SELECT ?s WHERE { ?s ?p ?o }', {
+      contextGraphId: 'cg-1',
+      subGraphName: 'production',
+    });
+    expect((result.details as any).savedQuery).toMatchObject({
+      resultColumn: 's',
+      subGraph: 'production',
+    });
+  });
+
   it('bootstraps resolver state even when slot is owned by another plugin (R10.2)', async () => {
     // Pre-fix: when memory slot was owned by a different plugin, the
     // resolver bootstrap (`memoryResolverApi = api` + `refreshMemoryResolverState`)

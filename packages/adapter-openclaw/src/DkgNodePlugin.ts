@@ -79,6 +79,7 @@ type QueryCatalogToolItem = {
   name: string;
   description?: string;
   sparql: string;
+  resultColumn?: string;
   rank: number;
   catalogSlug: string;
   catalogName: string;
@@ -182,6 +183,7 @@ function normalizeQueryCatalogItems(response: Record<string, unknown>): QueryCat
         name: stripRdfTerm(r.name) || slug,
         description: r.description !== undefined ? stripRdfTerm(r.description) : undefined,
         sparql,
+        resultColumn: r.resultColumn !== undefined ? stripRdfTerm(r.resultColumn) : undefined,
         rank: Number.parseInt(stripRdfTerm(r.rank) || '99', 10) || 99,
         catalogSlug,
         catalogName: stripRdfTerm(r.catalogName) || 'Queries',
@@ -2958,7 +2960,7 @@ export class DkgNodePlugin {
         description:
           'Run a saved SPARQL query from a context graph profile query catalog by slug or exact display name. ' +
           'Call dkg_query_catalog_list first if the selector is ambiguous. Executes the saved SPARQL against ' +
-          'the same context graph using the standard DKG query route.',
+          'the same context graph and saved sub-graph scope using the standard DKG query route.',
         parameters: {
           type: 'object',
           properties: {
@@ -3888,7 +3890,10 @@ export class DkgNodePlugin {
       }
 
       const savedQuery = matches[0];
-      const result = await this.client.query(savedQuery.sparql, { contextGraphId });
+      const queryOpts = savedQuery.subGraph && savedQuery.subGraph !== CONTEXT_GRAPH_QUERY_SUBGRAPH
+        ? { contextGraphId, subGraphName: savedQuery.subGraph }
+        : { contextGraphId };
+      const result = await this.client.query(savedQuery.sparql, queryOpts);
       return this.json({
         contextGraphId,
         savedQuery,

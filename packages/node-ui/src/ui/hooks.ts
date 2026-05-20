@@ -19,7 +19,15 @@ export function useFetch<T>(
         setError(null);
       }
     } catch (err: any) {
-      if (mountedRef.current) setError(err.message);
+      if (mountedRef.current) {
+        // 401 means the page token is stale (node restarted) — force a reload
+        // so the server re-injects a fresh token rather than silently staying empty.
+        if (err?.status === 401) {
+          window.location.reload();
+          return;
+        }
+        setError(err.message);
+      }
     } finally {
       if (mountedRef.current) setLoading(false);
     }

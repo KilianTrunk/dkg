@@ -130,6 +130,61 @@ describe('StorageACKMsg', () => {
   it('deterministic encoding', () => {
     expect(encodeStorageACK(ack)).toEqual(encodeStorageACK(ack));
   });
+
+  it('decodes an old ACK (no decline fields) without populating declineCode', async () => {
+    const decoded = decodeStorageACK(encodeStorageACK(ack));
+    expect(decoded.declineCode == null || decoded.declineCode === '').toBe(true);
+    expect(decoded.declineMessage == null || decoded.declineMessage === '').toBe(true);
+    const { isStorageACKDecline } = await import('../src/proto/storage-ack.js');
+    expect(isStorageACKDecline(decoded)).toBe(false);
+  });
+
+  it('decline-only message: empty ACK fields + populated decline code/message round-trip', async () => {
+    const { STORAGE_ACK_DECLINE_CODES, isStorageACKDecline } = await import('../src/proto/storage-ack.js');
+    const decline: StorageACKMsg = {
+      merkleRoot: new Uint8Array(0),
+      coreNodeSignatureR: new Uint8Array(0),
+      coreNodeSignatureVS: new Uint8Array(0),
+      contextGraphId: '15',
+      nodeIdentityId: 0,
+      declineCode: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+      declineMessage:
+        'No data found in SWM graph did:dkg:context-graph:15/_shared_memory for entities: urn:a, urn:b',
+    };
+    const decoded = decodeStorageACK(encodeStorageACK(decline));
+    expect(decoded.declineCode).toBe('NO_DATA_IN_SWM');
+    expect(decoded.declineMessage).toContain('No data found in SWM graph');
+    expect(decoded.contextGraphId).toBe('15');
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(new Uint8Array(decoded.merkleRoot).length).toBe(0);
+    expect(new Uint8Array(decoded.coreNodeSignatureR).length).toBe(0);
+  });
+
+  it('a new decoder reading bytes from an old encoder still yields a valid ACK (forward compat)', () => {
+    // Literal pre-decline wire shape from the old 5-field schema:
+    // 1=merkleRoot, 2=signatureR, 3=signatureVS, 4=contextGraphId,
+    // 5=nodeIdentityId. Keeping this as bytes catches regressions where
+    // the new schema stops decoding historical ACK payloads even though
+    // the current encoder still omits unset decline fields.
+    const wire = Uint8Array.from([
+      0x0a, 0x20,
+      ...new Array(32).fill(0xa5),
+      0x12, 0x20,
+      ...new Array(32).fill(0x11),
+      0x1a, 0x20,
+      ...new Array(32).fill(0x22),
+      0x22, 0x06,
+      0x63, 0x67, 0x2d, 0x31, 0x30, 0x30,
+      0x28, 0x07,
+    ]);
+    const decoded = decodeStorageACK(wire);
+    expect(decoded.contextGraphId).toBe('cg-100');
+    expect(Number(decoded.nodeIdentityId)).toBe(7);
+    expect(new Uint8Array(decoded.merkleRoot)).toEqual(new Uint8Array(32).fill(0xa5));
+    expect(new Uint8Array(decoded.coreNodeSignatureR)).toEqual(new Uint8Array(32).fill(0x11));
+    expect(new Uint8Array(decoded.coreNodeSignatureVS)).toEqual(new Uint8Array(32).fill(0x22));
+    expect(decoded.declineCode == null || decoded.declineCode === '').toBe(true);
+  });
 });
 
 // ── SwmShareAck (rc.9 PR-D) ───────────────────────────────────────────

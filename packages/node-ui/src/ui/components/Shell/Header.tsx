@@ -147,7 +147,7 @@ export function Header() {
       <div className="v10-header-agent-switcher" title={currentAgent ? `${currentAgent.agentDid}\n${currentAgent.agentAddress}` : undefined}>
         <span className="v10-header-agent-dot" />
         <span className="v10-header-agent-name">
-          {currentAgent?.name || nodeStatus?.name || 'Agent'}
+          {(currentAgent?.name && currentAgent.name !== '**' ? currentAgent.name : null) || nodeStatus?.name || 'Agent'}
         </span>
         {currentAgent?.agentAddress && (
           <span className="v10-header-agent-addr">

@@ -72,11 +72,15 @@ const GRAPH_ICON = (
 interface MemoryLayerViewProps {
   layer: MemoryLayer;
   contextGraphId: string;
+  externalQuery?: string;
+  externalQueryKey?: string;
+  queryPresetOptions?: Array<{ label: string; query: string }>;
 }
 
-export function MemoryLayerView({ layer, contextGraphId }: MemoryLayerViewProps) {
+export function MemoryLayerView({ layer, contextGraphId, externalQuery, externalQueryKey, queryPresetOptions }: MemoryLayerViewProps) {
   const meta = LAYER_META[layer];
   const [viewMode, setViewMode] = useState<ViewMode>('graph');
+  const [selectedPresetLabel, setSelectedPresetLabel] = useState('');
   const [draftQuery, setDraftQuery] = useState('');
   const [activeQuery, setActiveQuery] = useState('');
   const [draftSearch, setDraftSearch] = useState('');
@@ -91,6 +95,7 @@ export function MemoryLayerView({ layer, contextGraphId }: MemoryLayerViewProps)
   React.useEffect(() => {
     if (prevLayerRef.current !== layer) {
       prevLayerRef.current = layer;
+      setSelectedPresetLabel('');
       setShowAdvancedQuery(layer !== 'vm');
       setDraftQuery('');
       setActiveQuery('');
@@ -102,6 +107,13 @@ export function MemoryLayerView({ layer, contextGraphId }: MemoryLayerViewProps)
       setAppliedLimit(50);
     }
   }, [layer]);
+
+  React.useEffect(() => {
+    if (externalQuery === undefined) return;
+    setSelectedPresetLabel('');
+    setDraftQuery(externalQuery);
+    setActiveQuery(externalQuery);
+  }, [externalQuery, externalQueryKey]);
 
   const defaultSparql = useMemo(() => {
     if (layer === 'wm') {
@@ -248,14 +260,34 @@ export function MemoryLayerView({ layer, contextGraphId }: MemoryLayerViewProps)
 
       {(layer !== 'vm' || showAdvancedQuery) && (
         <div className="v10-mlv-query-bar">
-          <input
-            type="text"
-            className="v10-mlv-query-input"
-            placeholder="Custom SPARQL query..."
-            value={draftQuery}
-            onChange={(e) => setDraftQuery(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') runQuery(); }}
-          />
+          {queryPresetOptions?.length ? (
+            <select
+              className="v10-vm-search-select"
+              value={selectedPresetLabel}
+              onChange={(e) => {
+                const nextLabel = e.target.value;
+                setSelectedPresetLabel(nextLabel);
+                const preset = queryPresetOptions.find((option) => option.label === nextLabel);
+                const nextQuery = preset?.query ?? '';
+                setDraftQuery(nextQuery);
+                setActiveQuery(nextQuery);
+              }}
+            >
+              <option value="">Select common query...</option>
+              {queryPresetOptions.map((option) => (
+                <option key={option.label} value={option.label}>{option.label}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              type="text"
+              className="v10-mlv-query-input"
+              placeholder="Custom SPARQL query..."
+              value={draftQuery}
+              onChange={(e) => setDraftQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') runQuery(); }}
+            />
+          )}
           <button className="v10-mlv-run-btn" onClick={runQuery}>
             Run
           </button>

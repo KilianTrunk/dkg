@@ -156,40 +156,60 @@ async function startDaemon(): Promise<Daemon> {
     daemon.signal = signal;
   });
 
-  for (let i = 0; i < 90; i++) {
-    if (child.exitCode !== null) {
-      const tail = await readDaemonStdioTail();
-      throw new Error(
-        `Daemon exited early with code ${child.exitCode}.\n--- daemon stdio tail ---\n${tail}`,
-      );
+  // If startup fails after this point, we own a spawned daemon process,
+  // an open log handle, and a temp DKG_HOME — none of which the outer
+  // `afterAll(stopDaemon(daemon))` can reach, because `daemon` is still
+  // null in the test scope until we return. Codex PR #593 review round
+  // 11: cleanup-on-error so a flaky/timeout startup doesn't leak a live
+  // daemon (and its bound port) into the next CI retry.
+  try {
+    for (let i = 0; i < 90; i++) {
+      if (child.exitCode !== null) {
+        const tail = await readDaemonStdioTail();
+        throw new Error(
+          `Daemon exited early with code ${child.exitCode}.\n--- daemon stdio tail ---\n${tail}`,
+        );
+      }
+      try {
+        const res = await fetch(`http://127.0.0.1:${apiPort}/api/status`);
+        if (res.ok) break;
+      } catch {
+        /* not ready yet */
+      }
+      await sleep(500);
+      if (i === 89) {
+        const tail = await readDaemonStdioTail();
+        throw new Error(
+          `Daemon did not become ready within 45s.\n--- daemon stdio tail ---\n${tail}`,
+        );
+      }
     }
-    try {
-      const res = await fetch(`http://127.0.0.1:${apiPort}/api/status`);
-      if (res.ok) break;
-    } catch {
-      /* not ready yet */
+    // Once ready, the daemon stdio handle stays open for diagnostics until
+    // stopDaemon. The OS will reclaim it on process exit if we crash here.
+    await logHandle.close();
+
+    const raw = await readFile(join(home, 'auth.token'), 'utf-8');
+    const token = raw
+      .split('\n')
+      .map((l) => l.trim())
+      .find((l) => l.length > 0 && !l.startsWith('#'));
+    if (!token) throw new Error('No auth token found in auth.token');
+    daemon.token = token;
+
+    return daemon;
+  } catch (err) {
+    if (child.exitCode === null) {
+      child.kill('SIGTERM');
+      await Promise.race([
+        new Promise<void>((resolve) => child.once('exit', () => resolve())),
+        sleep(5_000),
+      ]);
+      if (child.exitCode === null) child.kill('SIGKILL');
     }
-    await sleep(500);
-    if (i === 89) {
-      const tail = await readDaemonStdioTail();
-      throw new Error(
-        `Daemon did not become ready within 45s.\n--- daemon stdio tail ---\n${tail}`,
-      );
-    }
+    await logHandle.close().catch(() => {});
+    await rm(home, { recursive: true, force: true }).catch(() => {});
+    throw err;
   }
-  // Once ready, the daemon stdio handle stays open for diagnostics until
-  // stopDaemon. The OS will reclaim it on process exit if we crash here.
-  await logHandle.close();
-
-  const raw = await readFile(join(home, 'auth.token'), 'utf-8');
-  const token = raw
-    .split('\n')
-    .map((l) => l.trim())
-    .find((l) => l.length > 0 && !l.startsWith('#'));
-  if (!token) throw new Error('No auth token found in auth.token');
-  daemon.token = token;
-
-  return daemon;
 }
 
 async function stopDaemon(d: Daemon | null): Promise<void> {

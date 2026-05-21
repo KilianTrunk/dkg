@@ -830,11 +830,17 @@ HTTP request
 ```
 
 Every dispatcher has the signature
-`(ctx: RequestContext) => Promise<void>`. The implicit `next` is
-`ctx.res.writableEnded` — whichever dispatcher writes a response first
-claims the request; the rest short-circuit at the next
-`if (res.writableEnded) return;` check. There is no Express/Koa/Fastify
-abstraction; the daemon is bare `node:http`.
+`(ctx: RequestContext) => Promise<void>`. The implicit `next` is "the
+response is claimed" — operationally `ctx.res.writableEnded` for
+one-shot handlers and `ctx.res.headersSent` for streaming handlers
+(SSE, `source.pipe(res)`, chunked transfer). Whichever dispatcher writes
+first wins; the rest short-circuit at the next
+`if (res.writableEnded || res.headersSent) return;` check. The
+`headersSent`-as-claimed semantics are what let a route plugin start
+streaming without the trailing 404 firing — see
+`handle-request.ts` after `handlePluginRoutes(ctx)` and the dispatcher
+inside `routes/plugins.ts`. There is no Express/Koa/Fastify abstraction;
+the daemon is bare `node:http`.
 
 ### RequestContext — the shared bag
 
@@ -927,13 +933,23 @@ Approved 2026-05-20 (`docs/adr/0001-daemon-route-plugins.md`, design
   semver-major.
 - **Startup load.** `loadRoutePlugins(specs, logger)` in
   `plugin-loader.ts` runs once during `lifecycle.ts` boot (after
-  agent/publisher init, before `server.listen()`). Absolute paths are
-  imported directly; bare specifiers go through
-  `createRequire(import.meta.url).resolve`. Validation requires a
-  non-empty `name` and a function `handle`. **Fail-soft**: a bad
-  plugin is logged (`route-plugin-load-failed`) and skipped; the
-  daemon still boots, emitting `route-plugins-loaded { loaded, configured }`
-  so operators see the count delta.
+  agent/publisher init, before `server.listen()`). Spec resolution has
+  three cases: (a) absolute filesystem paths are imported directly via
+  `pathToFileURL(spec)`; (b) bare specifiers (`@scope/pkg`, `pkg-name`)
+  try the ESM resolver first (`await import(spec)`), which honours
+  `import` and `default` conditions in the package's `exports` map, and
+  on failure (e.g. a CJS-only package whose `exports` declares only a
+  `require` condition) fall back to
+  `createRequire(import.meta.url).resolve(spec)` and re-import the
+  resolved file URL; (c) relative paths (`./foo`, `../foo`) are rejected
+  with a fail-soft warn — they would otherwise resolve relative to the
+  loader source inside `packages/cli/dist/daemon/` rather than the
+  operator's `~/.dkg/config.json`, a footgun that could silently load an
+  unrelated daemon module. Validation requires a non-empty `name` and a
+  function `handle`. **Fail-soft**: a bad plugin is logged
+  (`route-plugin-load-failed`) and skipped; the daemon still boots,
+  emitting `route-plugins-loaded { loaded, configured }` so operators
+  see the count delta.
 - **Per-request dispatch.** `routes/plugins.ts` exports
   `handlePluginRoutes(ctx)` — the thirteenth chain step. It iterates
   `ctx.routePlugins` and calls each plugin's `handle(ctx)` in order.

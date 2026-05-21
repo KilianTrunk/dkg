@@ -210,22 +210,27 @@ describe('handlePluginRoutes', () => {
     expect(res.body).toBe('{"partial":');
   });
 
-  it('terminates the response when a plugin writes headers but never calls end (partial-write, no throw)', async () => {
-    // Regression for codex PR review #593: symmetric with the throw-after-
-    // writeHead case. A plugin can also leak a half-state response by
-    // calling writeHead+write and then RETURNING NORMALLY without invoking
-    // end(). After the plugin returns the dispatcher must terminate the
-    // response itself so handleRequest's `if (res.writableEnded) return;`
-    // short-circuit fires and the trailing 404 doesn't crash with
-    // ERR_HTTP_HEADERS_SENT.
+  it('leaves a streaming response open when a plugin writes headers and returns without calling end', async () => {
+    // Regression for codex PR review #593 (round 4): the round-3 dispatcher
+    // change unconditionally called res.end() whenever a plugin returned
+    // with headersSent && !writableEnded. That killed legitimate streaming
+    // plugins (SSE, source.pipe(res), chunked transfer) which deliberately
+    // return without ending so an async writer can keep sending bytes.
+    //
+    // Correct contract: the dispatcher must NOT mutate the response after a
+    // plugin returns. "headersSent && !writableEnded" means the plugin
+    // claimed the request and is streaming — the chain's short-circuit in
+    // handleRequest is responsible for treating that as "claimed", not the
+    // dispatcher.
     const calls: string[] = [];
-    const partialNoEnd: RoutePlugin = {
-      name: 'partial-no-end',
+    const streamingPlugin: RoutePlugin = {
+      name: 'sse-stream',
       handle(c) {
-        calls.push('partial-no-end');
-        c.res.writeHead(200, { 'Content-Type': 'application/json' });
-        c.res.write('{"partial":true}');
-        // intentionally does NOT call end()
+        calls.push('sse-stream');
+        c.res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        c.res.write('event: connected\ndata: {}\n\n');
+        // intentionally does NOT call end() — an async source would keep
+        // writing later via setInterval / event subscription
       },
     };
     const followOn: RoutePlugin = {
@@ -234,13 +239,17 @@ describe('handlePluginRoutes', () => {
         calls.push('follow-on');
       },
     };
-    const { ctx, res } = makeCtx([partialNoEnd, followOn]);
+    const { ctx, res } = makeCtx([streamingPlugin, followOn]);
     await handlePluginRoutes(ctx);
-    expect(calls).toEqual(['partial-no-end']);
+    expect(calls).toEqual(['sse-stream']);
     expect(res.headersSent).toBe(true);
-    expect(res.writableEnded).toBe(true);
+    // Stream must stay alive — dispatcher must NOT have called end().
+    expect(res.writableEnded).toBe(false);
     expect(res.statusCode).toBe(200);
-    expect(res.body).toBe('{"partial":true}');
+    expect(res.body).toBe('event: connected\ndata: {}\n\n');
+    // Follow-on plugin must not run (the top-of-iteration check sees
+    // headersSent and stops the chain).
+    expect(calls).not.toContain('follow-on');
   });
 
   it('falls through to the next plugin when one returns without writing', async () => {

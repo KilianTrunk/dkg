@@ -447,7 +447,12 @@ export async function handleRequest(
   if (res.writableEnded) return;
 
   await handlePluginRoutes(ctx);
-  if (res.writableEnded) return;
+  // Plugins may stream — they can call `writeHead`/`write` and return
+  // without `end()` so an async source keeps writing later (SSE,
+  // `source.pipe(res)`, chunked transfer). Treat `headersSent` as
+  // "request claimed" too, otherwise the trailing 404 below would
+  // attempt a second `writeHead` and crash with `ERR_HTTP_HEADERS_SENT`.
+  if (res.writableEnded || res.headersSent) return;
 
   jsonResponse(res, 404, { error: 'Not found' });
 }

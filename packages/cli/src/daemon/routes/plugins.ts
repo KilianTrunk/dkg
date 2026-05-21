@@ -13,7 +13,9 @@ function responseStarted(res: RequestContext['res']): boolean {
 
 export async function handlePluginRoutes(ctx: RequestContext): Promise<void> {
   for (const plugin of ctx.routePlugins) {
-    if (ctx.res.writableEnded) return;
+    // Top-of-iteration short-circuit: if any previous plugin already
+    // claimed the request (either fully ended OR started streaming), stop.
+    if (responseStarted(ctx.res)) return;
     try {
       await plugin.handle(ctx);
     } catch (err) {
@@ -32,23 +34,16 @@ export async function handlePluginRoutes(ctx: RequestContext): Promise<void> {
         });
       } else if (!ctx.res.writableEnded) {
         // Plugin already started the response (headersSent=true) and then
-        // threw. We can't emit a clean 500 over headers that are already
-        // out, but we MUST terminate the response — otherwise handleRequest's
-        // `if (res.writableEnded) return;` short-circuit doesn't fire and
-        // the chain falls through to the trailing 404, which would attempt
-        // a second writeHead and crash with ERR_HTTP_HEADERS_SENT.
+        // threw. The stream is broken — terminate it so the client doesn't
+        // hang. We can't emit a clean 500 over headers that are already out.
         ctx.res.end();
       }
       return;
     }
-    // Plugin returned normally. Symmetric to the throw-after-writeHead
-    // branch above: if the plugin started the response but forgot to call
-    // end() (e.g. `res.writeHead(200); res.write('partial');` and return),
-    // terminate it now so the chain's writableEnded short-circuit fires
-    // and we don't fall through to the trailing 404.
-    if (ctx.res.headersSent && !ctx.res.writableEnded) {
-      ctx.res.end();
-      return;
-    }
+    // Plugin returned normally. Do NOT mutate the response here — if the
+    // plugin called writeHead/write but not end(), it is intentionally
+    // streaming (SSE, source.pipe(res), chunked transfer, ...). The chain's
+    // short-circuit in handleRequest treats `headersSent` as "claimed"; the
+    // dispatcher's only job is to stop iterating and return.
   }
 }

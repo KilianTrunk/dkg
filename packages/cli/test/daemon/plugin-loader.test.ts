@@ -165,6 +165,71 @@ describe('loadRoutePlugins', () => {
     }
   });
 
+  it('returns [] and warns once when routePlugins is a non-array string value', async () => {
+    // Regression for codex PR review #593: `config.routePlugins` is untyped
+    // operator input (JSON edited by humans). A common typo is to forget the
+    // brackets and write a single string. The loader must reject the wrong
+    // shape with one warning instead of iterating string characters as
+    // individual plugin specs.
+    const { log, warn } = makeLogger();
+    const plugins = await loadRoutePlugins(
+      // Intentionally wrong shape — bypass the typed signature in the test.
+      '@my-fork/dkg-routes' as unknown as readonly string[],
+      log,
+    );
+    expect(plugins).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const msg = String(warn.mock.calls[0][1]);
+    expect(msg).toContain('route-plugins-invalid-config');
+    expect(msg).toContain('string');
+  });
+
+  it('returns [] and warns once when routePlugins is a plain object', async () => {
+    const { log, warn } = makeLogger();
+    const plugins = await loadRoutePlugins(
+      { foo: '@my-fork/dkg-routes' } as unknown as readonly string[],
+      log,
+    );
+    expect(plugins).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const msg = String(warn.mock.calls[0][1]);
+    expect(msg).toContain('route-plugins-invalid-config');
+  });
+
+  it('returns [] silently when routePlugins is undefined or null', async () => {
+    const { log: log1, warn: warn1 } = makeLogger();
+    const plugins1 = await loadRoutePlugins(
+      undefined as unknown as readonly string[],
+      log1,
+    );
+    expect(plugins1).toEqual([]);
+    expect(warn1).not.toHaveBeenCalled();
+
+    const { log: log2, warn: warn2 } = makeLogger();
+    const plugins2 = await loadRoutePlugins(
+      null as unknown as readonly string[],
+      log2,
+    );
+    expect(plugins2).toEqual([]);
+    expect(warn2).not.toHaveBeenCalled();
+  });
+
+  it('filters non-string entries from a partially-malformed array, warning per bad entry', async () => {
+    const { log, warn } = makeLogger();
+    const plugins = await loadRoutePlugins(
+      [fixtureAbs, 42, null, '', { not: 'a string' }] as unknown as readonly string[],
+      log,
+    );
+    // Only the valid absolute path should resolve to a plugin.
+    expect(plugins).toHaveLength(1);
+    expect(plugins[0].name).toBe('sample-fixture-echo');
+    // One warn per non-string entry: 42, null, '' (empty), object → 4 warns.
+    expect(warn).toHaveBeenCalledTimes(4);
+    for (const [, msg] of warn.mock.calls) {
+      expect(String(msg)).toContain('route-plugins-invalid-spec');
+    }
+  });
+
   it('keeps the valid plugin and warns on the broken one in a mixed list', async () => {
     const { log, warn } = makeLogger();
     const plugins = await loadRoutePlugins(

@@ -46,12 +46,34 @@ function pickCandidate(mod: unknown): unknown {
 }
 
 export async function loadRoutePlugins(
-  specs: readonly string[],
+  // `unknown` (not `readonly string[]`) because the caller passes raw
+  // operator config from a JSON file. A typo there must not crash the
+  // daemon — we validate shape inside and fall back to [] on anything
+  // that isn't a clean string array.
+  specs: unknown,
   log: Logger,
 ): Promise<RoutePlugin[]> {
   const out: RoutePlugin[] = [];
   const ctx = createOperationContext('system');
-  for (const spec of specs) {
+
+  if (specs === undefined || specs === null) return out;
+  if (!Array.isArray(specs)) {
+    log.warn(
+      ctx,
+      `route-plugins-invalid-config: expected an array of plugin spec strings, got ${typeof specs}; ignoring`,
+    );
+    return out;
+  }
+
+  for (const rawSpec of specs as readonly unknown[]) {
+    if (typeof rawSpec !== 'string' || rawSpec.length === 0) {
+      log.warn(
+        ctx,
+        `route-plugins-invalid-spec: ignoring non-string entry: ${safeStringify(rawSpec)}`,
+      );
+      continue;
+    }
+    const spec = rawSpec;
     try {
       const mod = await importSpec(spec);
       const candidate = pickCandidate(mod);
@@ -66,4 +88,12 @@ export async function loadRoutePlugins(
     }
   }
   return out;
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
 }

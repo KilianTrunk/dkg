@@ -76,8 +76,28 @@ without a semver-major bump.
 - **CORS inherited** from the outer lifecycle wrapper.
 - **Operator-state config.** `routePlugins` lives in `~/.dkg/config.json`
   so it survives `npm install -g @origintrail-official/dkg` upgrades.
-- **Local-dev path resolution.** Absolute paths are loaded directly;
-  other strings resolve via `createRequire(import.meta.url).resolve`.
+- **Spec resolution.** Each entry in `routePlugins` is resolved by
+  `importSpec` in `plugin-loader.ts`:
+  1. **Absolute filesystem paths** (`isAbsolute(spec)`) are loaded
+     directly via `import(pathToFileURL(spec).href)`.
+  2. **Relative paths** (`./foo`, `../foo`) are **rejected** with a
+     fail-soft warn. They would otherwise resolve relative to the
+     loader's source file inside `packages/cli/dist/daemon/`, not
+     relative to `~/.dkg/config.json` where the operator wrote them —
+     a footgun that could silently import an unrelated daemon module.
+  3. **Bare package names** (`@scope/pkg`, `pkg-name`) try the ESM
+     resolver first (`await import(spec)`), which honours `import` and
+     `default` conditions in the package's `exports` map. On failure —
+     e.g. for a CJS-only package whose `exports` declares only a
+     `require` condition — fall back to
+     `createRequire(import.meta.url).resolve(spec)` and re-import the
+     resolved file URL. Node's dynamic import of a CJS file gives us
+     `{ default: module.exports }`, which `pickCandidate` handles.
+
+  The loader's input type is `unknown`: a malformed `routePlugins`
+  field (string, object, ...) is validated at the boundary, logged
+  once, and treated as an empty array — so a typo cannot prevent the
+  daemon from starting.
 
 ## Alternatives considered
 

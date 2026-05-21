@@ -5,7 +5,10 @@ import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Logger } from '@origintrail-official/dkg-core';
-import { loadRoutePlugins } from '../../src/daemon/plugin-loader.js';
+import {
+  loadRoutePlugins,
+  countConfiguredPluginSpecs,
+} from '../../src/daemon/plugin-loader.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixtureAbs = resolve(
@@ -25,6 +28,41 @@ function writeTempEsm(filename: string, source: string): string {
   writeFileSync(abs, source);
   return abs;
 }
+
+describe('countConfiguredPluginSpecs', () => {
+  // Regression for codex PR review #593 (round 9): the startup log line
+  // `route-plugins-loaded loaded=X configured=Y` was reading `Y` straight
+  // from `config.routePlugins?.length`. For a malformed config (string,
+  // object, ...) that produced misleading telemetry — e.g. an operator
+  // typo `"routePlugins": "@foo/bar"` would log `configured=8` (string
+  // length) rather than 0 (the count the loader actually validates). The
+  // count must match the validation path: array → length, anything else → 0.
+
+  it('returns the array length when given a proper array of specs', () => {
+    expect(countConfiguredPluginSpecs(['@x/y', '/abs/path/plugin.js'])).toBe(2);
+  });
+
+  it('returns 0 for an empty array', () => {
+    expect(countConfiguredPluginSpecs([])).toBe(0);
+  });
+
+  it('returns 0 for a string (operator forgot the brackets)', () => {
+    expect(countConfiguredPluginSpecs('@my-fork/plugin')).toBe(0);
+  });
+
+  it('returns 0 for a plain object', () => {
+    expect(countConfiguredPluginSpecs({ '0': '@my-fork/plugin' })).toBe(0);
+  });
+
+  it('returns 0 for null / undefined', () => {
+    expect(countConfiguredPluginSpecs(null)).toBe(0);
+    expect(countConfiguredPluginSpecs(undefined)).toBe(0);
+  });
+
+  it('returns 0 for a number', () => {
+    expect(countConfiguredPluginSpecs(42)).toBe(0);
+  });
+});
 
 describe('loadRoutePlugins', () => {
   it('returns empty array for empty input without warnings', async () => {

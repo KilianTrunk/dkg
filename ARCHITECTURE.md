@@ -865,12 +865,37 @@ the context.
 
 The auth boundary is a **single, global, upstream-of-dispatch** check
 at `packages/cli/src/daemon/lifecycle.ts:1865`. It runs after CORS
-preflight and before `handleRequest()`, rejecting with 401 if the
-bearer token is missing or not in `validTokens`. As a consequence,
-**every** route group — built-in or route-plugin — sees only
-authenticated requests; there is no per-route auth surface to
-re-implement. Finer-grained policy decisions are made inside a route
-by reading `ctx.requestToken` or `ctx.requestAgentAddress`.
+preflight (which short-circuits `OPTIONS`) and before `handleRequest()`,
+rejecting with 401 if the bearer token is missing or not in
+`validTokens`.
+
+There is one carve-out: a **narrow, GET-only public allowlist** in
+`packages/cli/src/auth.ts` lets unauthenticated requests through for
+specific read-only surfaces:
+
+- `PUBLIC_PATHS` (exact match): `/api/status`, `/api/chain/rpc-health`,
+  `/.well-known/skill.md`, `/ui`.
+- `PUBLIC_PREFIXES` (trailing-slash anchored): `/ui/`, `/apps/`.
+- `PUBLIC_SAFE_METHODS`: `GET` only. Any non-GET method on those exact
+  paths (including `POST /api/status`, `PUT /.well-known/skill.md`,
+  `HEAD /api/status`) goes through auth like everything else.
+
+Built-in route groups for those public paths therefore can see
+unauthenticated GET requests. The route-plugin dispatcher
+(`handlePluginRoutes`) is the **trailing** step in the chain — it only
+runs after every built-in handler has had a chance to claim the
+request. A plugin reached by an unauthenticated request would be one
+whose path+method overlapped a public allowlist entry that no built-in
+claimed. The combination of the GET-only safe-method allowlist + exact
+path matching + trailing-slash anchored prefixes is designed to make
+that overlap empty in practice; route plugins reached after a public
+fall-through still see the same `ctx.requestToken` /
+`ctx.requestAgentAddress` (empty for unauthenticated) so they can apply
+finer-grained policy if needed.
+
+For everything outside the allowlist, **every** route group — built-in
+or route-plugin — sees only authenticated requests; there is no
+per-route auth surface to re-implement.
 
 ### Two distinct extension surfaces
 

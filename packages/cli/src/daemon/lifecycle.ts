@@ -326,7 +326,7 @@ import {
 } from './local-agents.js';
 
 import { handleRequest } from './handle-request.js';
-import { loadRoutePlugins } from './plugin-loader.js';
+import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
 
 /**
@@ -2038,13 +2038,17 @@ export async function runDaemonInner(
   // Fork-authored route plugins: loaded once before the listen() so
   // requests cannot race the plugin array. `loadRoutePlugins` is
   // fail-soft — bad specs warn and skip; the daemon still boots.
-  const configuredPlugins = config.routePlugins ?? [];
   const routePlugins = await loadRoutePlugins(
-    configuredPlugins,
+    config.routePlugins,
     new Logger('route-plugins'),
   );
+  // `countConfiguredPluginSpecs` mirrors the loader's validation path:
+  // arrays report their length, anything else reports 0. Without this,
+  // an operator typo (`"routePlugins": "@foo/bar"`) would emit
+  // `configured=N` where N is the string's character count.
+  const configuredCount = countConfiguredPluginSpecs(config.routePlugins);
   log(
-    `route-plugins-loaded loaded=${routePlugins.length} configured=${configuredPlugins.length}`,
+    `route-plugins-loaded loaded=${routePlugins.length} configured=${configuredCount}`,
   );
 
   await new Promise<void>((resolve) => {

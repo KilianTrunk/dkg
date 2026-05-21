@@ -103,6 +103,19 @@ export async function loadRoutePlugins(
   return out;
 }
 
+/**
+ * Count plugin specs the way the validation path in `loadRoutePlugins`
+ * sees them. Use this for startup telemetry (the `route-plugins-loaded`
+ * log line) so that a malformed config (string, object, ...) reports
+ * `configured=0` instead of leaking the raw `.length` of whatever
+ * `config.routePlugins` happened to be. Arrays return their length —
+ * the individual element validation still happens inside the loader and
+ * can drop entries.
+ */
+export function countConfiguredPluginSpecs(raw: unknown): number {
+  return Array.isArray(raw) ? raw.length : 0;
+}
+
 function safeStringify(value: unknown): string {
   try {
     return JSON.stringify(value);

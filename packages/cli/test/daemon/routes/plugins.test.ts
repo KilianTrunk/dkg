@@ -210,6 +210,39 @@ describe('handlePluginRoutes', () => {
     expect(res.body).toBe('{"partial":');
   });
 
+  it('terminates the response when a plugin writes headers but never calls end (partial-write, no throw)', async () => {
+    // Regression for codex PR review #593: symmetric with the throw-after-
+    // writeHead case. A plugin can also leak a half-state response by
+    // calling writeHead+write and then RETURNING NORMALLY without invoking
+    // end(). After the plugin returns the dispatcher must terminate the
+    // response itself so handleRequest's `if (res.writableEnded) return;`
+    // short-circuit fires and the trailing 404 doesn't crash with
+    // ERR_HTTP_HEADERS_SENT.
+    const calls: string[] = [];
+    const partialNoEnd: RoutePlugin = {
+      name: 'partial-no-end',
+      handle(c) {
+        calls.push('partial-no-end');
+        c.res.writeHead(200, { 'Content-Type': 'application/json' });
+        c.res.write('{"partial":true}');
+        // intentionally does NOT call end()
+      },
+    };
+    const followOn: RoutePlugin = {
+      name: 'follow-on',
+      handle() {
+        calls.push('follow-on');
+      },
+    };
+    const { ctx, res } = makeCtx([partialNoEnd, followOn]);
+    await handlePluginRoutes(ctx);
+    expect(calls).toEqual(['partial-no-end']);
+    expect(res.headersSent).toBe(true);
+    expect(res.writableEnded).toBe(true);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe('{"partial":true}');
+  });
+
   it('falls through to the next plugin when one returns without writing', async () => {
     const calls: string[] = [];
     const skip: RoutePlugin = {

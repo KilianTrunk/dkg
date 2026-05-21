@@ -541,6 +541,46 @@ On path collisions the first plugin listed in `routePlugins` wins: the
 dispatcher invokes plugins in array order and stops at the first one that
 writes a response, so earlier entries shadow later ones for the same path.
 
+#### ESM-only public API
+
+`@origintrail-official/dkg/daemon/plugin-api` is published as **ES Modules
+only** — the `exports` block in `package.json` intentionally declares only
+an `import` condition (no `require`, no `default`). ESM plugins consume the
+helpers directly:
+
+```ts
+import { jsonResponse, readBody } from '@origintrail-official/dkg/daemon/plugin-api';
+```
+
+The loader itself supports CommonJS plugin **modules** (the orchestrator's
+loader honours `module.exports`, `module.exports.plugin`, and ESM
+`default`/`plugin` named exports — see `plugin-loader.ts`), so a CJS plugin
+still loads fine. The narrow gap is only synchronous `require()` of the
+public helper module from CJS code. From a CommonJS plugin, load the
+helpers with dynamic import inside an async function instead:
+
+```js
+// my-cjs-plugin.cjs
+module.exports.plugin = {
+  name: 'cjs-plugin',
+  async handle(ctx) {
+    const { jsonResponse, readBody } = await import(
+      '@origintrail-official/dkg/daemon/plugin-api'
+    );
+    if (ctx.url.pathname === '/my-fork/echo') {
+      const body = await readBody(ctx.req);
+      return jsonResponse(ctx.res, 200, { received: body });
+    }
+  },
+};
+```
+
+This is by design: the CLI package is `"type": "module"` end-to-end and
+ships only ESM build artifacts under `dist/`, so an `exports` `require`
+condition pointing at the same `.js` files would put us in the "require
+ESM" mode that is unreliable across Node versions. Plugin authors who
+write CommonJS use the one-line `await import()` workaround above.
+
 See [`docs/adr/0001-daemon-route-plugins.md`](../../docs/adr/0001-daemon-route-plugins.md)
 for the design rationale, threat model, and stability guarantees.
 

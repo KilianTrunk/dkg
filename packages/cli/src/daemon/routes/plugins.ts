@@ -13,7 +13,7 @@ function responseStarted(res: RequestContext['res']): boolean {
 
 export async function handlePluginRoutes(ctx: RequestContext): Promise<void> {
   for (const plugin of ctx.routePlugins) {
-    if (responseStarted(ctx.res)) return;
+    if (ctx.res.writableEnded) return;
     try {
       await plugin.handle(ctx);
     } catch (err) {
@@ -39,6 +39,15 @@ export async function handlePluginRoutes(ctx: RequestContext): Promise<void> {
         // a second writeHead and crash with ERR_HTTP_HEADERS_SENT.
         ctx.res.end();
       }
+      return;
+    }
+    // Plugin returned normally. Symmetric to the throw-after-writeHead
+    // branch above: if the plugin started the response but forgot to call
+    // end() (e.g. `res.writeHead(200); res.write('partial');` and return),
+    // terminate it now so the chain's writableEnded short-circuit fires
+    // and we don't fall through to the trailing 404.
+    if (ctx.res.headersSent && !ctx.res.writableEnded) {
+      ctx.res.end();
       return;
     }
   }

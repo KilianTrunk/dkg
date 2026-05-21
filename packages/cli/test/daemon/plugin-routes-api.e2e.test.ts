@@ -48,6 +48,14 @@ function uniquePort(base: number): number {
   return base + Math.floor(Math.random() * 1000);
 }
 
+// API and libp2p port bases must be at least 1000 apart so the two
+// `uniquePort` rolls (each picking a port in `[base, base+1000)`) never
+// overlap. Codex PR #593 review round 8: prior bases 19900 + 20000
+// overlapped on [20000, 20899], so ~9% of e2e runs could pick the same
+// port for both and fail with EADDRINUSE.
+const API_PORT_BASE = 19900; // -> [19900, 20899]
+const LISTEN_PORT_BASE = 21000; // -> [21000, 21999]
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -102,8 +110,8 @@ async function startDaemon(): Promise<Daemon> {
     throw new Error(`Sample route-plugin fixtures missing under ${FIXTURE_DIR}`);
   }
   const home = await mkdtemp(join(tmpdir(), 'dkg-plugin-routes-e2e-'));
-  const apiPort = uniquePort(19900);
-  const listenPort = uniquePort(20000);
+  const apiPort = uniquePort(API_PORT_BASE);
+  const listenPort = uniquePort(LISTEN_PORT_BASE);
   await writeDaemonConfig(home, apiPort, listenPort);
 
   const child = spawn('node', [CLI_ENTRY, 'daemon-worker'], {

@@ -230,6 +230,36 @@ describe('loadRoutePlugins', () => {
     }
   });
 
+  it('rejects a relative-path spec (./foo) instead of resolving it from the loader source dir', async () => {
+    // Regression for codex PR review #593 (round 8): the README promises
+    // that relative paths in routePlugins config "are not resolved against
+    // ~/.dkg and will fail to load". But Node's dynamic import resolves
+    // ./foo relative to the IMPORTING module (the loader source file),
+    // not relative to ~/.dkg/. That could silently load an unrelated
+    // daemon module that happens to live next to the loader. The loader
+    // must reject relative specs explicitly with a clear log.
+    const { log, warn } = makeLogger();
+    const plugins = await loadRoutePlugins(['./not-a-real-plugin.js'], log);
+    expect(plugins).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const msg = String(warn.mock.calls[0][1]);
+    expect(msg).toContain('route-plugin-load-failed');
+    expect(msg.toLowerCase()).toContain('relative');
+  });
+
+  it('rejects a parent-relative path spec (../foo)', async () => {
+    // `../config.js` actually resolves to `packages/cli/dist/config.js` —
+    // a real daemon module that just happens to live up one directory from
+    // the loader. Without an explicit rejection, the loader would import
+    // an internal daemon module as a plugin candidate.
+    const { log, warn } = makeLogger();
+    const plugins = await loadRoutePlugins(['../config.js'], log);
+    expect(plugins).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const msg = String(warn.mock.calls[0][1]);
+    expect(msg.toLowerCase()).toContain('relative');
+  });
+
   it('keeps the valid plugin and warns on the broken one in a mixed list', async () => {
     const { log, warn } = makeLogger();
     const plugins = await loadRoutePlugins(

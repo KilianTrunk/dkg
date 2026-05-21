@@ -10,6 +10,19 @@ async function importSpec(spec: string): Promise<unknown> {
   if (isAbsolute(spec)) {
     return import(pathToFileURL(spec).href);
   }
+  // Reject relative specs ('./foo', '../foo'). The README promises that
+  // relative paths fail to load. Without this guard, Node's dynamic
+  // import would resolve them relative to THIS loader's source file
+  // (packages/cli/dist/daemon/plugin-loader.js), not relative to the
+  // operator's ~/.dkg/config.json. That could silently import an
+  // unrelated daemon module — e.g. `../config.js` resolves to the real
+  // daemon config module — and pass it to pickCandidate as if it were a
+  // plugin. Force operators onto absolute paths or bare package names.
+  if (spec.startsWith('./') || spec.startsWith('../')) {
+    throw new Error(
+      `relative paths are not supported in routePlugins; use an absolute filesystem path or a resolvable package name (got "${spec}")`,
+    );
+  }
   // Bare specifier: try Node's ESM resolver first (honours `import` and
   // `default` exports conditions). If that fails — e.g. for a CJS-only
   // package whose `exports` map declares only a `require` condition —

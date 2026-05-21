@@ -154,6 +154,32 @@ describe('httpAuthGuard', () => {
     expect(res.status).toBe(200);
   });
 
+  it('allows /ui exact without token (static UI root)', async () => {
+    const res = await fetch(`${baseUrl}/ui`);
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects /ui-custom — sibling paths must not bypass auth via the /ui prefix', async () => {
+    // Regression for codex PR review #593: PUBLIC_PREFIXES used to contain
+    // '/ui' (no trailing slash) and isPublicPath checked `startsWith`. That
+    // made any path starting with '/ui...' (`/ui-custom`, `/ui_admin`,
+    // `/uistuff`, ...) skip the auth guard, defeating the daemon's "all
+    // protected endpoints require a Bearer token" contract. Route plugins
+    // mounted at such paths would have run unauthenticated.
+    const res = await fetch(`${baseUrl}/ui-custom/anything`, { method: 'GET' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects /ui_admin — auth must not be bypassed by a non-/ui-prefix path', async () => {
+    const res = await fetch(`${baseUrl}/ui_admin`, { method: 'GET' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects /uistuff — auth must not be bypassed by a concatenated /ui path', async () => {
+    const res = await fetch(`${baseUrl}/uistuff`, { method: 'GET' });
+    expect(res.status).toBe(401);
+  });
+
   it('rejects protected endpoint without token', async () => {
     const res = await fetch(`${baseUrl}/api/shared-memory/publish`, { method: 'POST' });
     expect(res.status).toBe(401);

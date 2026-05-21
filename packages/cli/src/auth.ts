@@ -730,10 +730,19 @@ const PUBLIC_PATHS = new Set([
   '/api/status',
   '/api/chain/rpc-health',
   '/.well-known/skill.md',
+  // Static UI root (exact match). The `/ui/...` subtree is public via
+  // PUBLIC_PREFIXES below; bare `/ui` lives here so that `/ui-custom`,
+  // `/ui_admin`, `/uistuff`, ... do NOT accidentally bypass auth via a
+  // loose prefix match. Route plugins mounted at sibling paths would
+  // otherwise have run unauthenticated.
+  '/ui',
 ]);
 
+// Every prefix MUST end with '/' so the match is unambiguous —
+// `pathname.startsWith('/ui/')` correctly excludes `/ui-custom` whereas
+// `startsWith('/ui')` would have included it.
 const PUBLIC_PREFIXES = [
-  '/ui',
+  '/ui/',
   '/apps/',
 ];
 

@@ -180,6 +180,43 @@ describe('httpAuthGuard', () => {
     expect(res.status).toBe(401);
   });
 
+  it('rejects POST /api/status — public allowlist must be method-aware (GET only)', async () => {
+    // Regression for codex PR review #593: every entry in PUBLIC_PATHS /
+    // PUBLIC_PREFIXES is a read-only surface (status / health / skill file /
+    // static UI). A method-agnostic matcher let POST/PUT/DELETE on these
+    // exact paths bypass auth, which let route plugins mounted at the same
+    // path under a non-GET method run unauthenticated.
+    const res = await fetch(`${baseUrl}/api/status`, { method: 'POST' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects PUT /.well-known/skill.md — non-GET on public path requires auth', async () => {
+    const res = await fetch(`${baseUrl}/.well-known/skill.md`, { method: 'PUT', body: '' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects DELETE /api/chain/rpc-health — non-GET on public path requires auth', async () => {
+    const res = await fetch(`${baseUrl}/api/chain/rpc-health`, { method: 'DELETE' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects POST /ui — non-GET on public exact path requires auth', async () => {
+    const res = await fetch(`${baseUrl}/ui`, { method: 'POST' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects POST /ui/index.html — non-GET on public prefix path requires auth', async () => {
+    const res = await fetch(`${baseUrl}/ui/index.html`, { method: 'POST' });
+    expect(res.status).toBe(401);
+  });
+
+  it('allows HEAD /api/status — HEAD is safe and treated as GET-equivalent', async () => {
+    // HEAD is widely used by health probes; the safe-method allowlist must
+    // include it alongside GET.
+    const res = await fetch(`${baseUrl}/api/status`, { method: 'HEAD' });
+    expect(res.status).toBe(200);
+  });
+
   it('rejects protected endpoint without token', async () => {
     const res = await fetch(`${baseUrl}/api/shared-memory/publish`, { method: 'POST' });
     expect(res.status).toBe(401);

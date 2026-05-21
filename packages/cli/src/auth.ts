@@ -746,7 +746,17 @@ const PUBLIC_PREFIXES = [
   '/apps/',
 ];
 
-function isPublicPath(pathname: string): boolean {
+// Every entry in PUBLIC_PATHS / PUBLIC_PREFIXES is semantically a read-only
+// surface (status info, health checks, the skill file, static UI assets).
+// The allowlist must be method-aware so a non-GET request on those exact
+// paths still goes through auth — otherwise `POST /api/status` (or any
+// non-GET method) would skip the gate and reach route plugins
+// unauthenticated. HEAD is included because it is the canonical no-body
+// counterpart to GET that health probes use.
+const PUBLIC_SAFE_METHODS = new Set(['GET', 'HEAD']);
+
+function isPublicPath(method: string, pathname: string): boolean {
+  if (!PUBLIC_SAFE_METHODS.has(method)) return false;
   if (PUBLIC_PATHS.has(pathname)) return true;
   for (const prefix of PUBLIC_PREFIXES) {
     if (pathname.startsWith(prefix)) return true;
@@ -823,7 +833,7 @@ export function httpAuthGuard(
   if (req.method === 'OPTIONS') return true;
 
   const pathname = new URL(req.url ?? '/', `http://${req.headers.host}`).pathname;
-  if (isPublicPath(pathname)) return true;
+  if (isPublicPath(req.method ?? '', pathname)) return true;
 
   const token = extractBearerToken(req.headers.authorization);
   let acceptedToken: string | undefined;

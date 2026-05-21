@@ -532,10 +532,22 @@ Plugins are wired into the daemon via `~/.dkg/config.json`:
 }
 ```
 
-Each entry is either an **absolute filesystem path** to a built plugin
-module (relative paths are not resolved against `~/.dkg` and will fail to
-load) or a **resolvable package name** that `@origintrail-official/dkg`'s
-daemon can `require.resolve` from its own install location.
+Each entry is either:
+
+- An **absolute filesystem path** to a built plugin module — loaded
+  directly via `pathToFileURL` + dynamic `import()`.
+- A **resolvable package name** (`@scope/name` or `name`) — resolved by
+  Node's ESM resolver first (`await import(spec)`, which honours both
+  `import` and `default` conditions in the package's `exports` map);
+  if that fails (e.g. a CJS-only package whose `exports` declares only
+  a `require` condition), the loader falls back to
+  `createRequire(import.meta.url).resolve(spec)` and re-imports the
+  resolved file URL.
+
+**Relative paths** (`./foo`, `../foo`) are explicitly rejected — Node's
+dynamic import would otherwise resolve them relative to the loader's
+source file inside `packages/cli/dist/daemon/`, not relative to
+`~/.dkg/config.json`. Use an absolute path or a package name instead.
 
 On path collisions the first plugin listed in `routePlugins` wins: the
 dispatcher invokes plugins in array order and stops at the first one that

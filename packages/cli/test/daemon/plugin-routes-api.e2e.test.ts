@@ -13,7 +13,7 @@
  */
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -114,6 +114,15 @@ async function startDaemon(): Promise<Daemon> {
   const listenPort = uniquePort(LISTEN_PORT_BASE);
   await writeDaemonConfig(home, apiPort, listenPort);
 
+  // Capture daemon stdio so startup failures (port bind, plugin load,
+  // chain init, auth-token write) are visible in test failure messages.
+  // `stdio: 'ignore'` discards these and leaves the harness reporting
+  // only an early exit or a readiness timeout with no context — first
+  // CI flake is then unrecoverable without re-running locally with
+  // tracing. Use a buffered tail so a chatty daemon doesn't balloon
+  // memory.
+  const stdioLog = join(home, 'daemon-stdio.log');
+  const logHandle = await open(stdioLog, 'a');
   const child = spawn('node', [CLI_ENTRY, 'daemon-worker'], {
     env: {
       ...process.env,
@@ -122,8 +131,18 @@ async function startDaemon(): Promise<Daemon> {
       DKG_NO_BLUE_GREEN: '1',
       DKG_DISABLE_TELEMETRY: '1',
     },
-    stdio: 'ignore',
+    stdio: ['ignore', logHandle.fd, logHandle.fd],
   });
+
+  const readDaemonStdioTail = async (n = 80): Promise<string> => {
+    try {
+      const buf = await readFile(stdioLog, 'utf-8');
+      const lines = buf.split('\n');
+      return lines.slice(-n).join('\n').trim();
+    } catch {
+      return '<could not read daemon stdio log>';
+    }
+  };
 
   const daemon: Daemon = {
     home,
@@ -139,7 +158,10 @@ async function startDaemon(): Promise<Daemon> {
 
   for (let i = 0; i < 90; i++) {
     if (child.exitCode !== null) {
-      throw new Error(`Daemon exited early with code ${child.exitCode}`);
+      const tail = await readDaemonStdioTail();
+      throw new Error(
+        `Daemon exited early with code ${child.exitCode}.\n--- daemon stdio tail ---\n${tail}`,
+      );
     }
     try {
       const res = await fetch(`http://127.0.0.1:${apiPort}/api/status`);
@@ -148,8 +170,16 @@ async function startDaemon(): Promise<Daemon> {
       /* not ready yet */
     }
     await sleep(500);
-    if (i === 89) throw new Error('Daemon did not become ready within 45s');
+    if (i === 89) {
+      const tail = await readDaemonStdioTail();
+      throw new Error(
+        `Daemon did not become ready within 45s.\n--- daemon stdio tail ---\n${tail}`,
+      );
+    }
   }
+  // Once ready, the daemon stdio handle stays open for diagnostics until
+  // stopDaemon. The OS will reclaim it on process exit if we crash here.
+  await logHandle.close();
 
   const raw = await readFile(join(home, 'auth.token'), 'utf-8');
   const token = raw

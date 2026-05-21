@@ -13,10 +13,12 @@ calls each route group in order; the first one to write a response wins.
 Examples: `routes/epcis.ts`, `routes/status.ts`.
 
 **Route plugin**:
-A fork-supplied npm package whose default export is `{ name, handle(ctx) }`,
-loaded at daemon startup and dispatched as the last step in the route
-group chain. Lets forks add HTTP endpoints without editing `handle-request.ts`.
-See `docs/adr/0001-daemon-route-plugins.md`.
+A fork-supplied npm package (or absolute-path module) that exports a
+`RoutePlugin` object — `{ name, handle(ctx) }`. The loader accepts the
+shape as the module's default export, a named `plugin` export, or
+`module.exports` (CJS). Loaded at daemon startup and dispatched as the
+last step in the route group chain. Lets forks add HTTP endpoints without
+editing `handle-request.ts`. See `docs/adr/0001-daemon-route-plugins.md`.
 _Distinct from_: **Agent plugin** (ElizaOS-style), **Integration**.
 
 **Integration**:
@@ -41,9 +43,17 @@ and the derived per-request fields (`url`, `path`, `requestToken`,
 
 **httpAuthGuard**:
 The single global authentication gate at `lifecycle.ts:1865`. Runs **before**
-`handleRequest`, so every route group and route plugin downstream sees only
-authenticated requests. Plugins inherit auth from it — there is no
-per-plugin auth surface.
+`handleRequest`, so route groups and route plugins downstream see only
+authenticated requests **outside the public allowlist**. The allowlist is
+narrow and GET-only — `PUBLIC_PATHS` (exact match: `/api/status`,
+`/api/chain/rpc-health`, `/.well-known/skill.md`, `/ui`) and
+`PUBLIC_PREFIXES` (trailing-slash anchored: `/ui/`, `/apps/`) — and any
+non-GET method on those exact paths still goes through auth. Built-in
+handlers claim the public paths during the chain, so a route plugin in
+practice only sees authenticated requests. Plugins do not get a
+per-plugin auth surface — finer-grained policy reads `ctx.requestToken`
+/ `ctx.requestAgentAddress`. See `ARCHITECTURE.md` "Auth boundary —
+`httpAuthGuard`" for the full breakdown.
 
 **Operator state**:
 Per-install daemon state in `~/.dkg/` — PID file, log file, API port marker,

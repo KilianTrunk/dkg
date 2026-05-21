@@ -1,8 +1,15 @@
 // daemon/routes/plugins.ts
 //
 // Per-request dispatcher for fork-authored route plugins. Iterates
-// `ctx.routePlugins` in config order, claims via `res.writableEnded`,
-// and converts any plugin throw into a 500 PluginError response.
+// `ctx.routePlugins` in config order. A request is considered claimed
+// once `res.headersSent` is true — that covers both fully-ended responses
+// (`writableEnded`) AND mid-stream plugins (SSE, source.pipe(res), ...).
+// `handleRequest`'s short-circuit before the trailing 404 mirrors this
+// (`writableEnded || headersSent`) so streaming responses are preserved
+// and a second `writeHead` is never attempted. Plugin throws become a
+// 500 PluginError when no response has been started; if headers were
+// already sent the dispatcher just ends the (now-broken) stream so the
+// chain's short-circuit fires cleanly.
 
 import { jsonResponse } from '../http-utils.js';
 import type { RequestContext } from './context.js';

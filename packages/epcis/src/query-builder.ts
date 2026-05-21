@@ -204,7 +204,7 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   optionalClauses.push('OPTIONAL { ?event epcis:inputEPCList ?inputEPCList . }');
   optionalClauses.push('OPTIONAL { ?event epcis:outputEPCList ?outputEPCList . }');
 
-  // DMaaST/JPB identifiers carried as JSON-LD extension triples.
+  // Extension identifiers carried as JSON-LD triples.
   if (params.configurationId) {
     wherePatterns.push('?event dmaast:configurationId ?configurationId .');
     filterClauses.push(`FILTER(STR(?configurationId) = "${escapeSparql(params.configurationId)}")`);

@@ -154,8 +154,8 @@ describe('ApiClient EPCIS methods', () => {
         to: '2026-05-31T00:00:00Z',
         eventType: 'ObjectEvent',
         action: 'ADD',
-        configurationId: 'JPB-CFG-46975',
-        shipmentId: 'JPB-SHIP-46975',
+        configurationId: 'CFG-001',
+        shipmentId: 'SHIP-001',
         perPage: 50,
         nextPageToken: 'b2Zmc2V0OjUw',
       });
@@ -173,8 +173,8 @@ describe('ApiClient EPCIS methods', () => {
       expect(params.get('bizStep')).toBe('https://ref.gs1.org/cbv/BizStep-receiving');
       expect(params.get('eventType')).toBe('ObjectEvent');
       expect(params.get('action')).toBe('ADD');
-      expect(params.get('configurationId')).toBe('JPB-CFG-46975');
-      expect(params.get('shipmentId')).toBe('JPB-SHIP-46975');
+      expect(params.get('configurationId')).toBe('CFG-001');
+      expect(params.get('shipmentId')).toBe('SHIP-001');
       expect(params.get('perPage')).toBe('50');
       expect(params.get('nextPageToken')).toBe('b2Zmc2V0OjUw');
     });

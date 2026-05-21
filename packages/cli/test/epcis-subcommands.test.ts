@@ -435,8 +435,8 @@ describe.sequential('dkg epcis subcommands', { timeout: 240_000 }, () => {
               eventList: [{
                 type: 'ObjectEvent',
                 eventTime: '2026-05-05T11:00:00Z',
-                configurationId: 'JPB-CFG-46975',
-                shipmentId: 'JPB-SHIP-46975',
+                configurationId: 'CFG-001',
+                shipmentId: 'SHIP-001',
               }],
             },
           },
@@ -455,8 +455,8 @@ describe.sequential('dkg epcis subcommands', { timeout: 240_000 }, () => {
           '--to', '2026-05-31T00:00:00Z',
           '--event-type', 'ObjectEvent',
           '--action', 'ADD',
-          '--configuration-id', 'JPB-CFG-46975',
-          '--shipment-id', 'JPB-SHIP-46975',
+          '--configuration-id', 'CFG-001',
+          '--shipment-id', 'SHIP-001',
           '--per-page', '10',
         ],
         env(),
@@ -464,8 +464,8 @@ describe.sequential('dkg epcis subcommands', { timeout: 240_000 }, () => {
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain('ObjectEvent');
       const out = JSON.parse(result.stdout);
-      expect(out.epcisBody.queryResults.resultsBody.eventList[0].configurationId).toBe('JPB-CFG-46975');
-      expect(out.epcisBody.queryResults.resultsBody.eventList[0].shipmentId).toBe('JPB-SHIP-46975');
+      expect(out.epcisBody.queryResults.resultsBody.eventList[0].configurationId).toBe('CFG-001');
+      expect(out.epcisBody.queryResults.resultsBody.eventList[0].shipmentId).toBe('SHIP-001');
       expect(stub.calls[0].method).toBe('GET');
       const url = new URL(`http://x${stub.calls[0].url}`);
       expect(url.pathname).toBe('/api/epcis/events');
@@ -476,8 +476,8 @@ describe.sequential('dkg epcis subcommands', { timeout: 240_000 }, () => {
       expect(url.searchParams.get('bizStep')).toBe('https://ref.gs1.org/cbv/BizStep-receiving');
       expect(url.searchParams.get('eventType')).toBe('ObjectEvent');
       expect(url.searchParams.get('action')).toBe('ADD');
-      expect(url.searchParams.get('configurationId')).toBe('JPB-CFG-46975');
-      expect(url.searchParams.get('shipmentId')).toBe('JPB-SHIP-46975');
+      expect(url.searchParams.get('configurationId')).toBe('CFG-001');
+      expect(url.searchParams.get('shipmentId')).toBe('SHIP-001');
       expect(url.searchParams.get('perPage')).toBe('10');
     });
 

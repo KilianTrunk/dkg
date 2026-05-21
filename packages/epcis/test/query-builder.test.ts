@@ -138,16 +138,16 @@ describe('buildEpcisQuery', () => {
 
   it('selects and filters by DMaaST configurationId and shipmentId', () => {
     const sparql = buildEpcisQuery(
-      { configurationId: 'JPB-CFG-46975', shipmentId: 'JPB-SHIP-46975' },
+      { configurationId: 'CFG-001', shipmentId: 'SHIP-001' },
       CONTEXT_GRAPH_ID,
     );
 
     expect(sparql).toContain('PREFIX dmaast: <https://dmaast.eu/ontology/>');
     expect(sparql).toContain('SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual');
     expect(sparql).toContain('?event dmaast:configurationId ?configurationId .');
-    expect(sparql).toContain('FILTER(STR(?configurationId) = "JPB-CFG-46975")');
+    expect(sparql).toContain('FILTER(STR(?configurationId) = "CFG-001")');
     expect(sparql).toContain('?event dmaast:shipmentId ?shipmentId .');
-    expect(sparql).toContain('FILTER(STR(?shipmentId) = "JPB-SHIP-46975")');
+    expect(sparql).toContain('FILTER(STR(?shipmentId) = "SHIP-001")');
     expect(sparql).toContain('GROUP BY ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual');
   });
 

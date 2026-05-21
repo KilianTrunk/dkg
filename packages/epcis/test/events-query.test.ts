@@ -45,8 +45,8 @@ describe('handleEventsQuery', () => {
   it('returns EPCISQueryDocument envelope with reconstructed events', async () => {
     const { engine, calls } = createTrackingQueryEngine([
       makeBindings({
-        configurationId: 'JPB-CFG-46975',
-        shipmentId: 'JPB-SHIP-46975',
+        configurationId: 'CFG-001',
+        shipmentId: 'SHIP-001',
       }),
     ]);
     const sp = new URLSearchParams('epc=urn:epc:id:sgtin:4012345.011111.1001');
@@ -73,8 +73,8 @@ describe('handleEventsQuery', () => {
     const event = eventList[0];
     expect(event.type).toBe('ObjectEvent');
     expect(event['dkg:ual']).toBe('did:dkg:mock:31337/42');
-    expect(event.configurationId).toBe('JPB-CFG-46975');
-    expect(event.shipmentId).toBe('JPB-SHIP-46975');
+    expect(event.configurationId).toBe('CFG-001');
+    expect(event.shipmentId).toBe('SHIP-001');
     expect(event.epcList).toEqual(['urn:epc:id:sgtin:4012345.011111.1001']);
     expect(event.readPoint).toEqual({ id: 'urn:epc:id:sgln:4012345.00001.0' });
     expect(event.bizLocation).toEqual({ id: 'urn:epc:id:sgln:4012345.00001.0' });
@@ -240,15 +240,15 @@ describe('handleEventsQuery', () => {
     const { engine, calls } = createTrackingQueryEngine([makeBindings()]);
 
     await handleEventsQuery(
-      new URLSearchParams('EQ_configurationId=JPB-CFG-46975&shipmentId=JPB-SHIP-46975'),
+      new URLSearchParams('EQ_configurationId=CFG-001&shipmentId=SHIP-001'),
       { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
     );
 
     expect(calls[0].sparql).toContain('PREFIX dmaast: <https://dmaast.eu/ontology/>');
     expect(calls[0].sparql).toContain('?event dmaast:configurationId ?configurationId');
-    expect(calls[0].sparql).toContain('FILTER(STR(?configurationId) = "JPB-CFG-46975")');
+    expect(calls[0].sparql).toContain('FILTER(STR(?configurationId) = "CFG-001")');
     expect(calls[0].sparql).toContain('?event dmaast:shipmentId ?shipmentId');
-    expect(calls[0].sparql).toContain('FILTER(STR(?shipmentId) = "JPB-SHIP-46975")');
+    expect(calls[0].sparql).toContain('FILTER(STR(?shipmentId) = "SHIP-001")');
   });
 
   it('returns Link header when more pages exist (perPage+1 trick)', async () => {
@@ -488,12 +488,12 @@ describe('toEpcisEvent', () => {
 
   it('includes DMaaST configurationId and shipmentId when bindings are present', () => {
     const binding = makeBindings({
-      configurationId: '"JPB-CFG-46975"',
-      shipmentId: '"JPB-SHIP-46975"',
+      configurationId: '"CFG-001"',
+      shipmentId: '"SHIP-001"',
     });
     const event = toEpcisEvent(binding);
-    expect(event.configurationId).toBe('JPB-CFG-46975');
-    expect(event.shipmentId).toBe('JPB-SHIP-46975');
+    expect(event.configurationId).toBe('CFG-001');
+    expect(event.shipmentId).toBe('SHIP-001');
   });
 
   it('omits dkg:ual when UAL binding is empty', () => {

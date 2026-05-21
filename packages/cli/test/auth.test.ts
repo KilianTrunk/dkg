@@ -210,11 +210,16 @@ describe('httpAuthGuard', () => {
     expect(res.status).toBe(401);
   });
 
-  it('allows HEAD /api/status — HEAD is safe and treated as GET-equivalent', async () => {
-    // HEAD is widely used by health probes; the safe-method allowlist must
-    // include it alongside GET.
+  it('rejects HEAD /api/status — HEAD bypass kept the round-6 hole open for plugin dispatch', async () => {
+    // Regression for codex PR review #593 (round 7): round 6 added HEAD to
+    // PUBLIC_SAFE_METHODS thinking it was the no-body twin of GET. But the
+    // daemon's built-in route handlers (`handleStatusRoutes`, etc.) only
+    // claim GET on these paths, so a HEAD request still fell through the
+    // chain to handlePluginRoutes — and a fork plugin matching `HEAD
+    // /api/status` would have run unauthenticated. Keep the public bypass
+    // to GET only until the built-in chain is HEAD-aware end-to-end.
     const res = await fetch(`${baseUrl}/api/status`, { method: 'HEAD' });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(401);
   });
 
   it('rejects protected endpoint without token', async () => {

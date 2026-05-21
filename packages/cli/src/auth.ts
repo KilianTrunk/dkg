@@ -751,9 +751,14 @@ const PUBLIC_PREFIXES = [
 // The allowlist must be method-aware so a non-GET request on those exact
 // paths still goes through auth — otherwise `POST /api/status` (or any
 // non-GET method) would skip the gate and reach route plugins
-// unauthenticated. HEAD is included because it is the canonical no-body
-// counterpart to GET that health probes use.
-const PUBLIC_SAFE_METHODS = new Set(['GET', 'HEAD']);
+// unauthenticated.
+//
+// GET only. HEAD was briefly included for health probes, but the built-in
+// route handlers only claim GET on these paths — a HEAD request fell
+// through the chain to `handlePluginRoutes`, so a fork plugin matching
+// `HEAD /api/status` would have run unauthenticated. Restore HEAD here
+// only after the built-in chain is HEAD-aware end-to-end.
+const PUBLIC_SAFE_METHODS = new Set(['GET']);
 
 function isPublicPath(method: string, pathname: string): boolean {
   if (!PUBLIC_SAFE_METHODS.has(method)) return false;

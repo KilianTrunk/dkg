@@ -164,10 +164,16 @@ async function startDaemon(): Promise<Daemon> {
   // daemon (and its bound port) into the next CI retry.
   try {
     for (let i = 0; i < 90; i++) {
-      if (child.exitCode !== null) {
+      // Cover BOTH normal-exit (exitCode !== null) AND signal-exit
+      // (exitCode === null but signalCode !== null). Without the
+      // signalCode branch, a daemon killed by SIGSEGV mid-startup would
+      // sail past this check, the fetch loop would keep retrying for the
+      // full 45s, and the test would report a misleading "did not become
+      // ready" instead of the actual crash signal. Codex PR #593 round 13.
+      if (child.exitCode !== null || child.signalCode !== null) {
         const tail = await readDaemonStdioTail();
         throw new Error(
-          `Daemon exited early with code ${child.exitCode}.\n--- daemon stdio tail ---\n${tail}`,
+          `Daemon exited early (code=${child.exitCode}, signal=${child.signalCode}).\n--- daemon stdio tail ---\n${tail}`,
         );
       }
       try {

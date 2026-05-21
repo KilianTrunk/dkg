@@ -6,25 +6,31 @@ import type { RoutePlugin } from './plugin-api.js';
 
 const require_ = createRequire(import.meta.url);
 
-// Detect "ESM resolver could not find a usable entry" vs "ESM source
-// blew up during parse/evaluation". Production Node sets `err.code` to
-// `ERR_PACKAGE_PATH_NOT_EXPORTED` (the exports map matched no `import`
-// condition) or `ERR_MODULE_NOT_FOUND` (no such package). Test runtimes
-// that go through a Vite-based loader (vitest) wrap the underlying
-// failure and drop the typed code — they emit untyped errors with a
-// recognizable message like `No known conditions for "." specifier`.
-// Both shapes are resolver failures and safe to fall back to CJS;
-// anything else (SyntaxError in the ESM, top-level evaluation crash,
-// rejected top-level await) must bubble up so the plugin author and
-// the operator who installed the package can see the broken build
-// instead of being silently rescued by a CJS twin.
+// Detect "the ESM resolver could not pick an entry for this spec"
+// (the package exists but its `exports` map matched no `import`/`default`
+// condition) vs "the ESM loaded and then failed". Only the first case
+// is safe to retry via CJS; everything else — a `SyntaxError` in the
+// ESM source, a top-level evaluation crash, a rejected top-level
+// `await`, OR an `ERR_MODULE_NOT_FOUND` raised from inside the loaded
+// ESM because one of its own imports is missing — must bubble up so
+// the plugin author and the operator who installed the package see the
+// broken build instead of being silently rescued by a CJS twin (Codex
+// PR #593 round 13).
+//
+// Production Node sets `err.code` to `ERR_PACKAGE_PATH_NOT_EXPORTED`
+// for the "no condition matched" case. Vitest's Vite-based resolver
+// wraps the underlying failure and strips the typed code, emitting
+// untyped errors whose message contains a recognizable phrase ("No
+// known conditions for…", `No "exports" main defined`, "Failed to
+// resolve entry for package"). We deliberately do NOT match on the
+// broader `ERR_MODULE_NOT_FOUND` / "Cannot find package" — those are
+// ambiguous with "the ESM tried to import a transitive that wasn't
+// installed", which is a real failure we want to surface, not rescue.
 const RESOLVER_FAILURE_CODES = new Set([
   'ERR_PACKAGE_PATH_NOT_EXPORTED',
-  'ERR_MODULE_NOT_FOUND',
 ]);
 const RESOLVER_FAILURE_MESSAGE_PATTERNS = [
   /No known conditions for/i,
-  /Cannot find package/i,
   /No "exports" main defined/i,
   /Failed to resolve entry for package/i,
 ];

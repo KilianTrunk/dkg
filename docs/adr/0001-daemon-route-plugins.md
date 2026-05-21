@@ -87,12 +87,18 @@ without a semver-major bump.
      a footgun that could silently import an unrelated daemon module.
   3. **Bare package names** (`@scope/pkg`, `pkg-name`) try the ESM
      resolver first (`await import(spec)`), which honours `import` and
-     `default` conditions in the package's `exports` map. On failure —
-     e.g. for a CJS-only package whose `exports` declares only a
-     `require` condition — fall back to
+     `default` conditions in the package's `exports` map. If ESM
+     **resolution** fails because no `import` condition matches — e.g.
+     for a CJS-only package whose `exports` declares only a `require`
+     condition — fall back to
      `createRequire(import.meta.url).resolve(spec)` and re-import the
      resolved file URL. Node's dynamic import of a CJS file gives us
-     `{ default: module.exports }`, which `pickCandidate` handles.
+     `{ default: module.exports }`, which `pickCandidate` handles. ESM
+     **runtime** failures — a `SyntaxError` in the ESM source, a
+     missing transitive import, a rejected top-level `await` — are not
+     rescued by CJS; the original error bubbles up through the
+     fail-soft `route-plugin-load-failed` log so plugin authors see
+     the broken build instead of getting a silent CJS sidestep.
 
   The loader's input type is `unknown`: a malformed `routePlugins`
   field (string, object, ...) is validated at the boundary, logged

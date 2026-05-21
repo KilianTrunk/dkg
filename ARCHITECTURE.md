@@ -831,16 +831,20 @@ HTTP request
 
 Every dispatcher has the signature
 `(ctx: RequestContext) => Promise<void>`. The implicit `next` is "the
-response is claimed" — operationally `ctx.res.writableEnded` for
-one-shot handlers and `ctx.res.headersSent` for streaming handlers
-(SSE, `source.pipe(res)`, chunked transfer). Whichever dispatcher writes
-first wins; the rest short-circuit at the next
-`if (res.writableEnded || res.headersSent) return;` check. The
-`headersSent`-as-claimed semantics are what let a route plugin start
-streaming without the trailing 404 firing — see
-`handle-request.ts` after `handlePluginRoutes(ctx)` and the dispatcher
-inside `routes/plugins.ts`. There is no Express/Koa/Fastify abstraction;
-the daemon is bare `node:http`.
+response is claimed". The twelve built-in route groups are all
+one-shot (they `jsonResponse` / `writeHead` + `end`), so the
+short-circuit between them in `handle-request.ts` is just
+`if (res.writableEnded) return;` — there is no point checking
+`headersSent` for handlers that always end the response synchronously.
+Route plugins introduce the streaming case (SSE, `source.pipe(res)`,
+chunked transfer); the short-circuit AFTER `handlePluginRoutes(ctx)`
+and BEFORE the trailing 404 therefore reads
+`if (res.writableEnded || res.headersSent) return;`, so a plugin that
+called `writeHead` and is still writing chunks asynchronously is
+treated as "claimed" instead of falling through to a 404 + the dispatcher
+inside `routes/plugins.ts` retains the same `headersSent`-aware top-of-loop
+check across plugins. There is no Express/Koa/Fastify abstraction; the
+daemon is bare `node:http`.
 
 ### RequestContext — the shared bag
 

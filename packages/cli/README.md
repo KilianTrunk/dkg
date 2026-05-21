@@ -538,11 +538,16 @@ Each entry is either:
   directly via `pathToFileURL` + dynamic `import()`.
 - A **resolvable package name** (`@scope/name` or `name`) — resolved by
   Node's ESM resolver first (`await import(spec)`, which honours both
-  `import` and `default` conditions in the package's `exports` map);
-  if that fails (e.g. a CJS-only package whose `exports` declares only
-  a `require` condition), the loader falls back to
+  `import` and `default` conditions in the package's `exports` map). If
+  ESM **resolution** fails because the package's `exports` map matches
+  no ESM condition (e.g. a CJS-only package whose `exports` declares
+  only a `require` condition), the loader falls back to
   `createRequire(import.meta.url).resolve(spec)` and re-imports the
-  resolved file URL.
+  resolved file URL. ESM **runtime** failures — a `SyntaxError` in the
+  ESM source, a missing transitive import inside the loaded ESM, a
+  rejected top-level `await` — are NOT rescued by CJS; they bubble up
+  as `route-plugin-load-failed` so plugin authors actually see their
+  broken ESM build instead of getting a silent CJS sidestep.
 
 **Relative paths** (`./foo`, `../foo`) are explicitly rejected — Node's
 dynamic import would otherwise resolve them relative to the loader's

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { ServerResponse } from 'node:http';
 import type { RequestContext } from '../../../src/daemon/routes/context.js';
 import type { RoutePlugin } from '../../../src/daemon/plugin-api.js';
@@ -63,6 +63,22 @@ function makeCtx(routePlugins: RoutePlugin[], res = makeRes()): {
 }
 
 describe('handlePluginRoutes', () => {
+  // Several tests exercise the "plugin throws" path. The dispatcher
+  // intentionally logs the throw to `console.error` (the round-2
+  // operator-side breadcrumb), so without a global stub those expected
+  // throws would dump real stack traces into the CI test output on every
+  // passing run. Stub console.error per test and restore after.
+  // The "logs the plugin name and underlying error" test reads
+  // `errorSpy.mock.calls` directly; the other throw-path tests just
+  // want the noise suppressed.
+  let errorSpy: ReturnType<typeof vi.spyOn<typeof console, 'error'>>;
+  beforeEach(() => {
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    errorSpy.mockRestore();
+  });
+
   it('returns without writing when routePlugins is empty', async () => {
     const { ctx, res } = makeCtx([]);
     await handlePluginRoutes(ctx);
@@ -153,37 +169,34 @@ describe('handlePluginRoutes', () => {
     // the client when a plugin throws, but operators also need a daemon-side
     // log line with the plugin name + error so they can diagnose failures.
     // Without it, a misbehaving plugin shows up as opaque 500s in the client
-    // log with no daemon-side breadcrumb.
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      const thrower: RoutePlugin = {
-        name: 'logging-test-plugin',
-        handle() {
-          throw new Error('boom-message');
-        },
-      };
-      const { ctx } = makeCtx([thrower]);
-      await handlePluginRoutes(ctx);
+    // log with no daemon-side breadcrumb. Uses the shared `errorSpy` from
+    // beforeEach so both the assertion and the noise suppression happen
+    // against the same stub.
+    const thrower: RoutePlugin = {
+      name: 'logging-test-plugin',
+      handle() {
+        throw new Error('boom-message');
+      },
+    };
+    const { ctx } = makeCtx([thrower]);
+    await handlePluginRoutes(ctx);
 
-      expect(errorSpy).toHaveBeenCalled();
-      const joined = errorSpy.mock.calls
-        .map((args) =>
-          args
-            .map((a) =>
-              typeof a === 'string'
-                ? a
-                : a instanceof Error
-                ? a.stack ?? a.message
-                : JSON.stringify(a),
-            )
-            .join(' '),
-        )
-        .join('\n');
-      expect(joined).toContain('logging-test-plugin');
-      expect(joined).toContain('boom-message');
-    } finally {
-      errorSpy.mockRestore();
-    }
+    expect(errorSpy).toHaveBeenCalled();
+    const joined = errorSpy.mock.calls
+      .map((args) =>
+        args
+          .map((a) =>
+            typeof a === 'string'
+              ? a
+              : a instanceof Error
+              ? a.stack ?? a.message
+              : JSON.stringify(a),
+          )
+          .join(' '),
+      )
+      .join('\n');
+    expect(joined).toContain('logging-test-plugin');
+    expect(joined).toContain('boom-message');
   });
 
   it('ends the half-written response when a plugin throws after writeHead', async () => {

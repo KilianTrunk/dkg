@@ -958,7 +958,9 @@ Approved 2026-05-20 (`docs/adr/0001-daemon-route-plugins.md`, design
   response hasn't started) and stops the chain. Conflict detection
   between plugins claiming the same path is intentionally absent:
   first plugin in config-list order wins via the same
-  `res.writableEnded` short-circuit the built-in chain uses.
+  `res.writableEnded || res.headersSent` short-circuit the built-in
+  chain uses (so streaming plugins claim by starting the response,
+  not just by ending it).
 - **Operator state, not package state.** `routePlugins?: string[]`
   lives on `DkgConfig` and is read from `~/.dkg/config.json`
   (per-install operator state) so daemon upgrades don't overwrite a

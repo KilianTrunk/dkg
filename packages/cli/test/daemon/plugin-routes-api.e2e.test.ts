@@ -184,8 +184,11 @@ async function startDaemon(): Promise<Daemon> {
         );
       }
     }
-    // Once ready, the daemon stdio handle stays open for diagnostics until
-    // stopDaemon. The OS will reclaim it on process exit if we crash here.
+    // Close the parent-side file handle now that startup succeeded.
+    // The child still owns its own duplicated fd (we passed
+    // `logHandle.fd` into `spawn`'s stdio array), so the daemon keeps
+    // writing to `daemon-stdio.log` until it exits. `readDaemonStdioTail`
+    // re-opens the file by path when assertions need diagnostic output.
     await logHandle.close();
 
     const raw = await readFile(join(home, 'auth.token'), 'utf-8');
@@ -198,13 +201,22 @@ async function startDaemon(): Promise<Daemon> {
 
     return daemon;
   } catch (err) {
-    if (child.exitCode === null) {
+    // `exitCode === null` alone is ambiguous: when a child exits via
+    // signal Node leaves `exitCode = null` but sets `signalCode` to
+    // "SIGTERM" / "SIGSEGV" / ... So a daemon that crashed with a
+    // signal mid-startup would still pass an `exitCode === null` check
+    // — we'd then wait the full 5s race, send SIGKILL to a ghost PID,
+    // and waste real time on every signal-exit failure path. Both
+    // fields null => still alive.
+    if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM');
       await Promise.race([
         new Promise<void>((resolve) => child.once('exit', () => resolve())),
         sleep(5_000),
       ]);
-      if (child.exitCode === null) child.kill('SIGKILL');
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
     }
     await logHandle.close().catch(() => {});
     await rm(home, { recursive: true, force: true }).catch(() => {});

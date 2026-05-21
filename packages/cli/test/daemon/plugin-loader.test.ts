@@ -308,4 +308,49 @@ describe('loadRoutePlugins', () => {
     expect(plugins[0].name).toBe('sample-fixture-echo');
     expect(warn).toHaveBeenCalledTimes(1);
   });
+
+  it('does not silently fall back to CJS when the ESM entry has a syntax error', async () => {
+    // Regression for codex PR review #593 round 12: a dual-published
+    // package whose `exports.import` points at a broken ESM file (e.g.
+    // a syntax error escaped a build) used to silently load via the
+    // CJS `exports.require` path, hiding the broken publish from the
+    // plugin author. The fallback must fire only on resolver errors
+    // (`ERR_PACKAGE_PATH_NOT_EXPORTED`, `ERR_MODULE_NOT_FOUND`) — real
+    // evaluation errors in the ESM must bubble up so operators see
+    // them.
+    const pkgName = `@dkg-test/broken-esm-fixture-${process.pid}-${Date.now()}`;
+    const cliNodeModules = resolve(__dirname, '../../node_modules');
+    const installDir = join(cliNodeModules, ...pkgName.split('/'));
+    const parentDir = dirname(installDir);
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(
+      join(installDir, 'package.json'),
+      JSON.stringify({
+        name: pkgName,
+        version: '0.0.0',
+        type: 'module',
+        exports: { '.': { import: './index.mjs', require: './index.cjs' } },
+      }),
+    );
+    // Broken ESM: stray `{{` causes a SyntaxError during parse.
+    writeFileSync(
+      join(installDir, 'index.mjs'),
+      "export default { name: 'broken-esm-plugin', handle() {{} };\n",
+    );
+    // Valid CJS — would silently rescue the load before the fix.
+    writeFileSync(
+      join(installDir, 'index.cjs'),
+      "module.exports = { name: 'broken-esm-plugin', handle() {} };\n",
+    );
+    try {
+      const { log, warn } = makeLogger();
+      const plugins = await loadRoutePlugins([pkgName], log);
+      expect(plugins).toEqual([]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const msg = String(warn.mock.calls[0][1]);
+      expect(msg).toContain('route-plugin-load-failed');
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true });
+    }
+  });
 });

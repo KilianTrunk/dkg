@@ -14,7 +14,13 @@ describe('source worker daemon client', () => {
         return new Response(JSON.stringify({ jobId: 'job-1' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
       if (url.includes('/api/publisher/job')) {
-        return new Response(JSON.stringify({ job: { status: 'finalized' } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({
+          job: {
+            status: 'finalized',
+            txHash: '0xabc',
+            ual: 'did:dkg:evm:31337/0xabc/1',
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
       return new Response('{}', { status: 404, headers: { 'Content-Type': 'application/json' } });
     }) as any;
@@ -38,6 +44,11 @@ describe('source worker daemon client', () => {
       transitionType: 'CREATE',
       authority: { type: 'owner', proofRef: 'proof' },
     })).resolves.toBe('job-1');
-    await expect(jobs.getJobStatus('job-1')).resolves.toBe('finalized');
+    await expect(jobs.getJobStatus('job-1')).resolves.toEqual({
+      status: 'finalized',
+      txHash: '0xabc',
+      ual: 'did:dkg:evm:31337/0xabc/1',
+      failureDetails: undefined,
+    });
   });
 });

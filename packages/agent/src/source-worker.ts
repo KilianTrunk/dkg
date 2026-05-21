@@ -8,11 +8,32 @@ export interface SourceWorkerJobState {
   lastJobIds?: string[];
   lastJobStatuses?: Record<string, string>;
   lastStatus?: string;
+  pendingPublisherJobIds?: string[];
+  finalDaemonStatus?: string;
+  txHash?: string;
+  ual?: string;
+  failureDetails?: SourceWorkerJobFailureDetails;
   lastError?: string;
   attemptCount?: number;
   manualReviewRequired?: boolean;
   manualReviewReason?: string;
 }
+
+export interface SourceWorkerJobFailureDetails {
+  status?: string;
+  code?: string;
+  message?: string;
+  details?: unknown;
+}
+
+export interface SourceWorkerJobStatusSnapshot {
+  status: string;
+  txHash?: string;
+  ual?: string;
+  failureDetails?: SourceWorkerJobFailureDetails;
+}
+
+export type SourceWorkerJobStatusResult = string | SourceWorkerJobStatusSnapshot;
 
 export interface SourceWorkerState {
   sources: Record<string, SourceWorkerJobState>;
@@ -46,6 +67,11 @@ export interface SourceWorkerResult {
   jobIds?: string[];
   jobStatuses?: Record<string, string>;
   status?: string;
+  pendingPublisherJobIds?: string[];
+  finalDaemonStatus?: string;
+  txHash?: string;
+  ual?: string;
+  failureDetails?: SourceWorkerJobFailureDetails;
   nextState: SourceWorkerJobState;
 }
 
@@ -60,14 +86,14 @@ export interface SourceWorkerDeps<TSource extends SourceWorkerSource> {
    */
   getFingerprint(source: TSource): Promise<string>;
   processSource(source: TSource, fingerprint: string, state: SourceWorkerJobState | undefined): Promise<SourceWorkerResult>;
-  getJobStatus(jobId: string): Promise<string>;
+  getJobStatus(jobId: string): Promise<SourceWorkerJobStatusResult>;
 }
 
 export async function loadSourceWorkerState(path: string): Promise<SourceWorkerState> {
   try {
     const raw = await readFile(path, 'utf8');
     const parsed = JSON.parse(raw) as SourceWorkerState;
-    return { sources: parsed.sources ?? {} };
+    return normalizeSourceWorkerState(parsed);
   } catch (error: any) {
     if (error?.code === 'ENOENT') return { sources: {} };
     throw error;
@@ -109,10 +135,19 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
   for (const source of sources) {
     const current = state.sources[source.id];
     const fingerprint = await deps.getFingerprint(source);
-    const statuses = current?.lastJobIds?.length
-      ? Object.fromEntries(await Promise.all(current.lastJobIds.map(async (jobId) => [jobId, await deps.getJobStatus(jobId)] as const)))
-      : {};
+    const jobIdsToPoll = getPublisherJobIdsToPoll(current);
+    const collected = jobIdsToPoll.length > 0
+      ? await collectJobStatuses(jobIdsToPoll, deps)
+      : emptyCollectedJobStatuses();
+    const statuses = mergeJobStatuses(current?.lastJobStatuses, collected.statuses);
     const aggregate = aggregateStatuses(statuses);
+    const pendingPublisherJobIds = derivePendingPublisherJobIds(statuses);
+    const txHash = collected.txHash ?? current?.txHash;
+    const ual = collected.ual ?? current?.ual;
+    const finalDaemonStatus = pendingPublisherJobIds.length > 0
+      ? undefined
+      : normalizeFinalStatus(aggregate || current?.finalDaemonStatus || current?.lastStatus);
+    const failureDetails = collected.failureDetails ?? current?.failureDetails ?? deriveFailureDetails(finalDaemonStatus, current?.lastError);
 
     if (current?.fingerprint === fingerprint && current.manualReviewRequired) {
       nextState.sources[source.id] = {
@@ -120,6 +155,11 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
         lastRunAt: deps.now(),
         lastJobStatuses: statuses,
         lastStatus: 'manual-review-required',
+        pendingPublisherJobIds,
+        finalDaemonStatus,
+        txHash,
+        ual,
+        failureDetails,
       };
       continue;
     }
@@ -130,6 +170,11 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
         lastRunAt: deps.now(),
         lastJobStatuses: statuses,
         lastStatus: aggregate,
+        pendingPublisherJobIds,
+        finalDaemonStatus: undefined,
+        txHash,
+        ual,
+        failureDetails: undefined,
       };
       continue;
     }
@@ -139,7 +184,27 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
         ...current,
         lastRunAt: deps.now(),
         lastJobStatuses: statuses,
-        lastStatus: aggregate,
+        lastStatus: normalizeFinalStatus(aggregate) ?? aggregate,
+        pendingPublisherJobIds,
+        finalDaemonStatus: normalizeFinalStatus(aggregate),
+        txHash,
+        ual,
+        failureDetails: undefined,
+      };
+      continue;
+    }
+
+    if (current?.fingerprint === fingerprint && isFailureStatus(aggregate)) {
+      nextState.sources[source.id] = {
+        ...current,
+        lastRunAt: deps.now(),
+        lastJobStatuses: statuses,
+        lastStatus: 'failed',
+        pendingPublisherJobIds,
+        finalDaemonStatus: 'failed',
+        txHash,
+        ual,
+        failureDetails: failureDetails ?? { status: 'failed' },
       };
       continue;
     }
@@ -153,6 +218,11 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
         lastJobStatuses: statuses,
         lastStatus: 'manual-review-required',
         lastError: `max retries exceeded (${maxRetries})`,
+        pendingPublisherJobIds,
+        finalDaemonStatus,
+        txHash,
+        ual,
+        failureDetails: failureDetails ?? { status: 'manual-review-required', message: `max retries exceeded (${maxRetries})` },
         attemptCount: nextAttemptCount,
         manualReviewRequired: true,
         manualReviewReason: `max retries exceeded (${maxRetries})`,
@@ -162,7 +232,7 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
 
     try {
       const result = await deps.processSource(source, fingerprint, current);
-      nextState.sources[source.id] = result.nextState;
+      nextState.sources[source.id] = normalizeProcessedState(result);
     } catch (error: any) {
       nextState.sources[source.id] = {
         ...current,
@@ -170,6 +240,9 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
         lastRunAt: deps.now(),
         lastStatus: 'failed',
         lastError: error?.message ?? String(error),
+        pendingPublisherJobIds: [],
+        finalDaemonStatus: 'failed',
+        failureDetails: { status: 'failed', message: error?.message ?? String(error) },
         attemptCount: nextAttemptCount,
       };
     }
@@ -177,6 +250,133 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
 
   await saveSourceWorkerState(statePath, nextState);
   return nextState;
+}
+
+interface CollectedJobStatuses {
+  statuses: Record<string, string>;
+  txHash?: string;
+  ual?: string;
+  failureDetails?: SourceWorkerJobFailureDetails;
+}
+
+function emptyCollectedJobStatuses(): CollectedJobStatuses {
+  return { statuses: {} };
+}
+
+async function collectJobStatuses<TSource extends SourceWorkerSource>(
+  jobIds: readonly string[],
+  deps: SourceWorkerDeps<TSource>,
+): Promise<CollectedJobStatuses> {
+  const entries = await Promise.all(jobIds.map(async (jobId) => {
+    const snapshot = normalizeJobStatusResult(await deps.getJobStatus(jobId));
+    return [jobId, snapshot] as const;
+  }));
+  return {
+    statuses: Object.fromEntries(entries.map(([jobId, snapshot]) => [jobId, snapshot.status])),
+    txHash: entries.find(([, snapshot]) => snapshot.txHash)?.[1].txHash,
+    ual: entries.find(([, snapshot]) => snapshot.ual)?.[1].ual,
+    failureDetails: entries.find(([, snapshot]) => snapshot.failureDetails)?.[1].failureDetails,
+  };
+}
+
+function normalizeJobStatusResult(result: SourceWorkerJobStatusResult): SourceWorkerJobStatusSnapshot {
+  return typeof result === 'string' ? { status: result } : result;
+}
+
+function normalizeSourceWorkerState(state: SourceWorkerState): SourceWorkerState {
+  return {
+    sources: Object.fromEntries(
+      Object.entries(state.sources ?? {}).map(([sourceId, sourceState]) => [
+        sourceId,
+        normalizeSourceWorkerJobState(sourceState),
+      ]),
+    ),
+  };
+}
+
+function normalizeSourceWorkerJobState(state: SourceWorkerJobState): SourceWorkerJobState {
+  const statuses = state.lastJobStatuses ?? {};
+  const pendingPublisherJobIds = Object.prototype.hasOwnProperty.call(state, 'pendingPublisherJobIds')
+    ? (state.pendingPublisherJobIds ?? []).filter((jobId) => {
+        const status = statuses[jobId];
+        return status === undefined || isActiveStatus(status);
+      })
+    : getPublisherJobIdsToPoll(state);
+  const mergedPendingPublisherJobIds = unique([
+    ...pendingPublisherJobIds,
+    ...derivePendingPublisherJobIds(statuses),
+  ]);
+  const aggregate = aggregateStatuses(statuses);
+  const finalDaemonStatus = mergedPendingPublisherJobIds.length > 0
+    ? undefined
+    : state.finalDaemonStatus ?? normalizeFinalStatus(aggregate || state.lastStatus);
+  return {
+    ...state,
+    pendingPublisherJobIds: mergedPendingPublisherJobIds,
+    finalDaemonStatus,
+    failureDetails: state.failureDetails ?? deriveFailureDetails(finalDaemonStatus, state.lastError),
+  };
+}
+
+function normalizeProcessedState(result: SourceWorkerResult): SourceWorkerJobState {
+  const statuses = result.nextState.lastJobStatuses ?? result.jobStatuses ?? {};
+  const pendingPublisherJobIds = result.nextState.pendingPublisherJobIds
+    ?? result.pendingPublisherJobIds
+    ?? deriveProcessedPendingPublisherJobIds(result, statuses);
+  return {
+    ...result.nextState,
+    pendingPublisherJobIds,
+    finalDaemonStatus: result.nextState.finalDaemonStatus ?? result.finalDaemonStatus,
+    txHash: result.nextState.txHash ?? result.txHash,
+    ual: result.nextState.ual ?? result.ual,
+    failureDetails: result.nextState.failureDetails ?? result.failureDetails,
+  };
+}
+
+function deriveProcessedPendingPublisherJobIds(
+  result: SourceWorkerResult,
+  statuses: Record<string, string>,
+): string[] {
+  const activeJobIds = derivePendingPublisherJobIds(statuses);
+  if (activeJobIds.length > 0) {
+    return activeJobIds;
+  }
+  if (Object.keys(statuses).length === 0 && isActiveStatus(result.nextState.lastStatus ?? result.status)) {
+    return result.nextState.lastJobIds ?? result.jobIds ?? [];
+  }
+  return [];
+}
+
+function getPublisherJobIdsToPoll(state: SourceWorkerJobState | undefined): string[] {
+  if (!state) return [];
+  if (Object.prototype.hasOwnProperty.call(state, 'pendingPublisherJobIds')) {
+    return state.pendingPublisherJobIds ?? [];
+  }
+  const statuses = state.lastJobStatuses ?? {};
+  const statusEntries = Object.entries(statuses);
+  const activeJobIds = statusEntries
+    .filter(([, status]) => isActiveStatus(status))
+    .map(([jobId]) => jobId);
+  if (activeJobIds.length > 0) {
+    return activeJobIds;
+  }
+  if (statusEntries.length === 0 && isActiveStatus(state.lastStatus)) {
+    return state.lastJobIds ?? [];
+  }
+  return [];
+}
+
+function mergeJobStatuses(
+  previous: Record<string, string> | undefined,
+  next: Record<string, string>,
+): Record<string, string> {
+  return Object.keys(next).length > 0 ? { ...(previous ?? {}), ...next } : (previous ?? {});
+}
+
+function derivePendingPublisherJobIds(statuses: Record<string, string>): string[] {
+  return Object.entries(statuses)
+    .filter(([, status]) => isActiveStatus(status))
+    .map(([jobId]) => jobId);
 }
 
 function aggregateStatuses(statuses: Record<string, string>): string {
@@ -192,8 +392,36 @@ function isSuccessStatus(status: string | undefined): boolean {
   return status === 'completed' || status === 'finalized' || status === 'no-matching-rows';
 }
 
+function isFailureStatus(status: string | undefined): boolean {
+  return status === 'failed' || status === 'error';
+}
+
 function isActiveStatus(status: string | undefined): boolean {
   return status === 'accepted' || status === 'claimed' || status === 'validated' || status === 'broadcast' || status === 'included' || status === 'queued' || status === 'in-flight';
+}
+
+function normalizeFinalStatus(status: string | undefined): string | undefined {
+  if (!status) return undefined;
+  if (status === 'completed' || status === 'finalized') return 'finalized';
+  if (status === 'failed' || status === 'error') return 'failed';
+  return undefined;
+}
+
+function deriveFailureDetails(
+  finalDaemonStatus: string | undefined,
+  message: string | undefined,
+): SourceWorkerJobFailureDetails | undefined {
+  if (!isFailureStatus(finalDaemonStatus) && !message) {
+    return undefined;
+  }
+  return {
+    status: finalDaemonStatus,
+    message,
+  };
+}
+
+function unique(values: readonly string[]): string[] {
+  return [...new Set(values)];
 }
 
 async function syncDirectory(path: string): Promise<void> {

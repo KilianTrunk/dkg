@@ -1,7 +1,32 @@
+import { createRequire } from 'node:module';
 import { isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Logger, createOperationContext } from '@origintrail-official/dkg-core';
 import type { RoutePlugin } from './plugin-api.js';
+
+const require_ = createRequire(import.meta.url);
+
+async function importSpec(spec: string): Promise<unknown> {
+  if (isAbsolute(spec)) {
+    return import(pathToFileURL(spec).href);
+  }
+  // Bare specifier: try Node's ESM resolver first (honours `import` and
+  // `default` exports conditions). If that fails — e.g. for a CJS-only
+  // package whose `exports` map declares only a `require` condition —
+  // fall back to CJS resolution and re-import the resolved file URL.
+  // Node's dynamic `import()` of a CJS file gives us
+  // `{ default: module.exports }`, which `pickCandidate` handles.
+  try {
+    return await import(spec);
+  } catch (esmErr) {
+    try {
+      const resolved = require_.resolve(spec);
+      return await import(pathToFileURL(resolved).href);
+    } catch {
+      throw esmErr;
+    }
+  }
+}
 
 function isRoutePlugin(value: unknown): value is RoutePlugin {
   if (!value || typeof value !== 'object') return false;
@@ -28,13 +53,7 @@ export async function loadRoutePlugins(
   const ctx = createOperationContext('system');
   for (const spec of specs) {
     try {
-      // Bare package names go through Node's ESM resolver (which honours
-      // both `import` and `require` conditions in the package's `exports`
-      // map). Using `require.resolve` here would refuse to resolve any
-      // package that only declares an `import` condition — common in
-      // ESM-first packages — and silently fail the load.
-      const target = isAbsolute(spec) ? pathToFileURL(spec).href : spec;
-      const mod = await import(target);
+      const mod = await importSpec(spec);
       const candidate = pickCandidate(mod);
       if (!isRoutePlugin(candidate)) {
         log.warn(ctx, `route-plugin-load-failed: ${spec}: invalid shape`);

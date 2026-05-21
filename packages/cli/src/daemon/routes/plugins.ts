@@ -18,6 +18,12 @@ export async function handlePluginRoutes(ctx: RequestContext): Promise<void> {
       await plugin.handle(ctx);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // Operators need a daemon-side breadcrumb when a plugin throws — the
+      // 500 sent to the client only carries the message, not the stack.
+      // Use console.error so the daemon stdout/stderr capture (devnet
+      // daemon.log, systemd journal, etc.) records the failure with the
+      // plugin name for correlation.
+      console.error(`[route-plugin:${plugin.name}] handler threw:`, err);
       if (!responseStarted(ctx.res)) {
         jsonResponse(ctx.res, 500, {
           error: 'PluginError',

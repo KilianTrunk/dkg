@@ -148,6 +148,44 @@ describe('handlePluginRoutes', () => {
     expect(res.body).toBe('{"partial":');
   });
 
+  it('logs the plugin name and underlying error when a plugin throws', async () => {
+    // Regression for codex PR review #593: the dispatcher returns a 500 to
+    // the client when a plugin throws, but operators also need a daemon-side
+    // log line with the plugin name + error so they can diagnose failures.
+    // Without it, a misbehaving plugin shows up as opaque 500s in the client
+    // log with no daemon-side breadcrumb.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const thrower: RoutePlugin = {
+        name: 'logging-test-plugin',
+        handle() {
+          throw new Error('boom-message');
+        },
+      };
+      const { ctx } = makeCtx([thrower]);
+      await handlePluginRoutes(ctx);
+
+      expect(errorSpy).toHaveBeenCalled();
+      const joined = errorSpy.mock.calls
+        .map((args) =>
+          args
+            .map((a) =>
+              typeof a === 'string'
+                ? a
+                : a instanceof Error
+                ? a.stack ?? a.message
+                : JSON.stringify(a),
+            )
+            .join(' '),
+        )
+        .join('\n');
+      expect(joined).toContain('logging-test-plugin');
+      expect(joined).toContain('boom-message');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it('ends the half-written response when a plugin throws after writeHead', async () => {
     // Regression for codex PR review: when a plugin calls writeHead/write and
     // then throws, the catch must terminate the response (res.end()) so that

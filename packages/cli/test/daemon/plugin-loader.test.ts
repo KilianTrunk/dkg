@@ -125,6 +125,46 @@ describe('loadRoutePlugins', () => {
     }
   });
 
+  it('loads a CJS-only package referenced by bare name (exports.require only)', async () => {
+    // Regression for codex PR review #593: the dual `import()` fix introduced
+    // for ESM-only packages must not regress the inverse case — a package
+    // whose `exports` map declares only a `require` condition (no `import`,
+    // no `default`). Dynamic `import(spec)` runs in import-context and
+    // refuses to match those, so the loader needs a CJS-resolve fallback
+    // before declaring the spec dead.
+    //
+    // Fixture: a tiny CJS-only package installed into the CLI's
+    // node_modules so bare-name resolution from the loader's
+    // `import.meta.url` finds it via standard Node lookup.
+    const pkgName = `@dkg-test/cjs-only-fixture-${process.pid}-${Date.now()}`;
+    const cliNodeModules = resolve(__dirname, '../../node_modules');
+    const installDir = join(cliNodeModules, ...pkgName.split('/'));
+    const parentDir = dirname(installDir);
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(
+      join(installDir, 'package.json'),
+      JSON.stringify({
+        name: pkgName,
+        version: '0.0.0',
+        // No `"type": "module"` — defaults to CommonJS.
+        exports: { '.': { require: './index.cjs' } },
+      }),
+    );
+    writeFileSync(
+      join(installDir, 'index.cjs'),
+      "module.exports = { name: 'cjs-only-fixture-plugin', handle() {} };\n",
+    );
+    try {
+      const { log, warn } = makeLogger();
+      const plugins = await loadRoutePlugins([pkgName], log);
+      expect(plugins).toHaveLength(1);
+      expect(plugins[0].name).toBe('cjs-only-fixture-plugin');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the valid plugin and warns on the broken one in a mixed list', async () => {
     const { log, warn } = makeLogger();
     const plugins = await loadRoutePlugins(

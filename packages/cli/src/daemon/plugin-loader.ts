@@ -1,10 +1,7 @@
-import { createRequire } from 'node:module';
 import { isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Logger, createOperationContext } from '@origintrail-official/dkg-core';
 import type { RoutePlugin } from './plugin-api.js';
-
-const require_ = createRequire(import.meta.url);
 
 function isRoutePlugin(value: unknown): value is RoutePlugin {
   if (!value || typeof value !== 'object') return false;
@@ -31,7 +28,12 @@ export async function loadRoutePlugins(
   const ctx = createOperationContext('system');
   for (const spec of specs) {
     try {
-      const target = isAbsolute(spec) ? pathToFileURL(spec).href : require_.resolve(spec);
+      // Bare package names go through Node's ESM resolver (which honours
+      // both `import` and `require` conditions in the package's `exports`
+      // map). Using `require.resolve` here would refuse to resolve any
+      // package that only declares an `import` condition — common in
+      // ESM-first packages — and silently fail the load.
+      const target = isAbsolute(spec) ? pathToFileURL(spec).href : spec;
       const mod = await import(target);
       const candidate = pickCandidate(mod);
       if (!isRoutePlugin(candidate)) {

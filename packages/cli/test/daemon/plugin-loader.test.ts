@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Logger } from '@origintrail-official/dkg-core';
@@ -82,6 +82,46 @@ describe('loadRoutePlugins', () => {
       expect(warn).not.toHaveBeenCalled();
     } finally {
       rmSync(dirname(tempAbs), { recursive: true, force: true });
+    }
+  });
+
+  it('loads an ESM-only package referenced by bare name (exports.import only)', async () => {
+    // Regression for codex PR review #593: the loader must support packages
+    // whose package.json `exports` block declares only an `import` condition
+    // (no `require`, no `default`). `require.resolve` throws
+    // `ERR_PACKAGE_PATH_NOT_EXPORTED` for such packages because no CJS
+    // condition matches; a direct `await import(spec)` honours the `import`
+    // condition and succeeds.
+    //
+    // We install a tiny ESM-only fixture into the CLI package's node_modules
+    // so that bare-name resolution from the loader's `import.meta.url` (a file
+    // under `packages/cli/src/daemon/`) can find it via standard Node lookup.
+    const pkgName = `@dkg-test/esm-only-fixture-${process.pid}-${Date.now()}`;
+    const cliNodeModules = resolve(__dirname, '../../node_modules');
+    const installDir = join(cliNodeModules, ...pkgName.split('/'));
+    const parentDir = dirname(installDir);
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(
+      join(installDir, 'package.json'),
+      JSON.stringify({
+        name: pkgName,
+        version: '0.0.0',
+        type: 'module',
+        exports: { '.': { import: './index.mjs' } },
+      }),
+    );
+    writeFileSync(
+      join(installDir, 'index.mjs'),
+      "export default { name: 'esm-only-fixture-plugin', handle() {} };\n",
+    );
+    try {
+      const { log, warn } = makeLogger();
+      const plugins = await loadRoutePlugins([pkgName], log);
+      expect(plugins).toHaveLength(1);
+      expect(plugins[0].name).toBe('esm-only-fixture-plugin');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true });
     }
   });
 

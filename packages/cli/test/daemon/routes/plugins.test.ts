@@ -148,6 +148,30 @@ describe('handlePluginRoutes', () => {
     expect(res.body).toBe('{"partial":');
   });
 
+  it('ends the half-written response when a plugin throws after writeHead', async () => {
+    // Regression for codex PR review: when a plugin calls writeHead/write and
+    // then throws, the catch must terminate the response (res.end()) so that
+    // handleRequest's `if (res.writableEnded) return;` short-circuit fires.
+    // If we leave writableEnded=false, the chain falls through to the trailing
+    // jsonResponse(res, 404, ...) which throws ERR_HTTP_HEADERS_SENT and the
+    // client is left with a half-written response.
+    const partialThenThrow: RoutePlugin = {
+      name: 'half-written-terminator',
+      handle(c) {
+        c.res.writeHead(200, { 'Content-Type': 'application/json' });
+        c.res.write('{"partial":');
+        throw new Error('mid-stream failure');
+      },
+    };
+    const { ctx, res } = makeCtx([partialThenThrow]);
+    await handlePluginRoutes(ctx);
+    expect(res.headersSent).toBe(true);
+    expect(res.writableEnded).toBe(true);
+    // Status and body were claimed by the plugin and must not be overwritten.
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe('{"partial":');
+  });
+
   it('falls through to the next plugin when one returns without writing', async () => {
     const calls: string[] = [];
     const skip: RoutePlugin = {

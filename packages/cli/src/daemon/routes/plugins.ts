@@ -24,6 +24,14 @@ export async function handlePluginRoutes(ctx: RequestContext): Promise<void> {
           plugin: plugin.name,
           message,
         });
+      } else if (!ctx.res.writableEnded) {
+        // Plugin already started the response (headersSent=true) and then
+        // threw. We can't emit a clean 500 over headers that are already
+        // out, but we MUST terminate the response — otherwise handleRequest's
+        // `if (res.writableEnded) return;` short-circuit doesn't fire and
+        // the chain falls through to the trailing 404, which would attempt
+        // a second writeHead and crash with ERR_HTTP_HEADERS_SENT.
+        ctx.res.end();
       }
       return;
     }

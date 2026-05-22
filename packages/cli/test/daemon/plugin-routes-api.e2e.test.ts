@@ -257,4 +257,31 @@ describe('Route plugins — live daemon E2E', () => {
     const res = await fetch(urlFor('/api/status'));
     expect(res.status).toBe(200);
   });
+
+  it('HEAD /.well-known/skill.md mirrors the GET headers (ETag, Cache-Control, Vary) with no body', async () => {
+    // HEAD must return the same caching headers GET would, so HTTP-cache-aware clients can validate
+    // their cached copy without a body roundtrip. Body must be empty (HEAD spec).
+    const headRes = await fetch(urlFor('/.well-known/skill.md'), { method: 'HEAD' });
+    expect(headRes.status).toBe(200);
+    expect(headRes.headers.get('content-type')).toContain('text/markdown');
+    const etag = headRes.headers.get('etag');
+    expect(etag).toBeTruthy();
+    expect(headRes.headers.get('cache-control')).toBeTruthy();
+    expect(headRes.headers.get('vary')).toBeTruthy();
+    const headBody = await headRes.text();
+    expect(headBody).toBe('');
+
+    // Conditional GET with the HEAD-discovered ETag must return 304.
+    const getRes = await fetch(urlFor('/.well-known/skill.md'), {
+      headers: { 'If-None-Match': etag! },
+    });
+    expect(getRes.status).toBe(304);
+
+    // Conditional HEAD with matching ETag must also return 304.
+    const headIfMatch = await fetch(urlFor('/.well-known/skill.md'), {
+      method: 'HEAD',
+      headers: { 'If-None-Match': etag! },
+    });
+    expect(headIfMatch.status).toBe(304);
+  });
 });

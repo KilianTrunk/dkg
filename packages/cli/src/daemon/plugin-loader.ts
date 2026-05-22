@@ -30,7 +30,8 @@ async function importSpec(spec: string): Promise<unknown> {
   }
   // Reject relative specs — Node resolves them relative to this loader source
   // (packages/cli/dist/daemon/), not to ~/.dkg/config.json. See ADR 0001.
-  if (spec.startsWith('./') || spec.startsWith('../')) {
+  // Separator-agnostic so Windows-style `.\foo`, `..\foo` are also caught.
+  if (/^\.{1,2}[\\/]/.test(spec)) {
     throw new Error(
       `relative paths are not supported in routePlugins; use an absolute filesystem path or a resolvable package name (got "${spec}")`,
     );

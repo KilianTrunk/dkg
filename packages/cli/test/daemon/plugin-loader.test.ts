@@ -268,6 +268,19 @@ describe('loadRoutePlugins', () => {
     expect(msg.toLowerCase()).toContain('relative');
   });
 
+  it('rejects Windows-style relative path specs (.\\foo, ..\\foo)', async () => {
+    // Windows operators write backslash paths in config.json. The original POSIX-only check let
+    // these slip through as bare specifiers, producing a confusing "module not found" instead of
+    // the documented "relative paths not supported" rejection.
+    const { log, warn } = makeLogger();
+    const plugins = await loadRoutePlugins(['.\\plugin.js', '..\\config.js'], log);
+    expect(plugins).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(2);
+    for (const call of warn.mock.calls) {
+      expect(String(call[1]).toLowerCase()).toContain('relative');
+    }
+  });
+
   it('keeps the valid plugin and warns on the broken one in a mixed list', async () => {
     const { log, warn } = makeLogger();
     const plugins = await loadRoutePlugins(

@@ -412,23 +412,17 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
   } = ctx;
 
   if ((req.method === "GET" || req.method === "HEAD") && path === "/.well-known/skill.md") {
-    // Liveness probes use HEAD; built-in must claim it so the request never reaches route plugins unauthenticated.
-    if (req.method === "HEAD") {
-      res.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8" });
-      res.end();
-      return;
-    }
+    // HEAD must return the same ETag/Cache-Control/Vary headers as GET so HTTP-cache-aware clients
+    // can validate without a body roundtrip. Compute body+ETag, honour If-None-Match, then emit
+    // headers and (for GET only) the body.
     const proto = req.headers["x-forwarded-proto"] ?? "http";
     const host =
       req.headers["x-forwarded-host"] ??
       req.headers.host ??
       `localhost:${config.listenPort ?? 9200}`;
     const baseUrl = `${proto}://${host}`;
-    // text/markdown is always handled natively by the import-file route
-    // (skip Phase 1, run the Phase 2 markdown extractor directly), even when
-    // no Phase 1 converter is registered. Surface it in the discovery list so
-    // skill-driven clients see Markdown ingestion as supported regardless of
-    // converter availability.
+    // text/markdown is always handled natively by the import-file route, so surface it in the
+    // discovery list even when no Phase 1 converter is registered.
     const pipelines = extractionRegistry.availableContentTypes();
     const content = buildSkillMd({
       version: nodeVersion,
@@ -448,7 +442,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       "Cache-Control": "public, max-age=300",
       Vary: "Host, X-Forwarded-Host, X-Forwarded-Proto",
     });
-    res.end(content);
+    res.end(req.method === "HEAD" ? undefined : content);
     return;
   }
 

@@ -411,7 +411,13 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     requestAgentAddress,
   } = ctx;
 
-  if (req.method === "GET" && path === "/.well-known/skill.md") {
+  if ((req.method === "GET" || req.method === "HEAD") && path === "/.well-known/skill.md") {
+    // Liveness probes use HEAD; built-in must claim it so the request never reaches route plugins unauthenticated.
+    if (req.method === "HEAD") {
+      res.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8" });
+      res.end();
+      return;
+    }
     const proto = req.headers["x-forwarded-proto"] ?? "http";
     const host =
       req.headers["x-forwarded-host"] ??
@@ -460,8 +466,13 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     });
   }
 
-  // GET /api/status
-  if (req.method === "GET" && path === "/api/status") {
+  // GET/HEAD /api/status — HEAD claims early so liveness probes never reach plugins.
+  if ((req.method === "GET" || req.method === "HEAD") && path === "/api/status") {
+    if (req.method === "HEAD") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end();
+      return;
+    }
     const allConns = agent.node.libp2p.getConnections();
     const directConns = allConns.filter(
       (c) => !c.remoteAddr?.toString().includes("/p2p-circuit"),
@@ -755,8 +766,13 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
-  // GET /api/chain/rpc-health
-  if (req.method === "GET" && path === "/api/chain/rpc-health") {
+  // GET/HEAD /api/chain/rpc-health — HEAD claims early to short-circuit the RPC roundtrip for liveness probes.
+  if ((req.method === "GET" || req.method === "HEAD") && path === "/api/chain/rpc-health") {
+    if (req.method === "HEAD") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end();
+      return;
+    }
     const chain = resolveChainConfig(config, network);
     const rpcUrl = chain?.rpcUrl;
     if (!rpcUrl) {

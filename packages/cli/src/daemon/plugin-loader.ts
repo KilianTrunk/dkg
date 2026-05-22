@@ -41,12 +41,15 @@ async function importSpec(spec: string): Promise<unknown> {
     return await import(spec);
   } catch (esmErr) {
     if (!isResolverFailure(esmErr)) throw esmErr;
+    let resolved: string;
     try {
-      const resolved = require_.resolve(spec);
-      return await import(pathToFileURL(resolved).href);
+      resolved = require_.resolve(spec);
     } catch {
       throw esmErr;
     }
+    // CJS resolve succeeded — any error from loading the resolved file is a real
+    // evaluation failure (SyntaxError, missing transitive) and must bubble up, not be rewritten as esmErr.
+    return await import(pathToFileURL(resolved).href);
   }
 }
 

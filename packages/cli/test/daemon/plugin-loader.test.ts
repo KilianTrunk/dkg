@@ -359,4 +359,39 @@ describe('loadRoutePlugins', () => {
       rmSync(parentDir, { recursive: true, force: true });
     }
   });
+
+  it('surfaces the real CJS error when the CJS fallback resolves but its entry is broken', async () => {
+    // CJS-only package whose `require.resolve` succeeds but the resolved file has a syntax error.
+    // Current code rethrows the unrelated ESM resolver error; the fix must let the SyntaxError bubble.
+    const pkgName = `@dkg-test/broken-cjs-fixture-${process.pid}-${Date.now()}`;
+    const cliNodeModules = resolve(__dirname, '../../node_modules');
+    const installDir = join(cliNodeModules, ...pkgName.split('/'));
+    const parentDir = dirname(installDir);
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(
+      join(installDir, 'package.json'),
+      JSON.stringify({
+        name: pkgName,
+        version: '0.0.0',
+        exports: { '.': { require: './index.cjs' } },
+      }),
+    );
+    // Broken CJS: unterminated string — V8 raises a SyntaxError during parse.
+    writeFileSync(
+      join(installDir, 'index.cjs'),
+      "module.exports = { name: 'broken-cjs-plugin', message: 'unterminated string };\n",
+    );
+    try {
+      const { log, warn } = makeLogger();
+      const plugins = await loadRoutePlugins([pkgName], log);
+      expect(plugins).toEqual([]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const msg = String(warn.mock.calls[0][1]);
+      expect(msg).toContain('route-plugin-load-failed');
+      // The diagnostic must be the CJS SyntaxError, NOT the ESM "no exports condition" message.
+      expect(msg).not.toMatch(/No known conditions|No "exports" main defined|Failed to resolve entry/i);
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true });
+    }
+  });
 });

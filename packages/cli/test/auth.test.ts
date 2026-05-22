@@ -201,9 +201,27 @@ describe('httpAuthGuard', () => {
     expect(res.status).toBe(401);
   });
 
-  it('rejects HEAD /api/status — HEAD bypass kept the round-6 hole open for plugin dispatch', async () => {
-    // Built-in handlers only claim GET, so HEAD falls through to plugins — keep HEAD out of the public allowlist.
+  it('allows HEAD /api/status without auth — built-in claims HEAD so liveness probes succeed', async () => {
+    // status.ts now claims HEAD on the three public-allowlisted paths, so HEAD never reaches plugins;
+    // the public-HEAD allowlist exists for this case (k8s/load-balancer health probes).
     const res = await fetch(`${baseUrl}/api/status`, { method: 'HEAD' });
+    expect(res.status).toBe(200);
+  });
+
+  it('allows HEAD /.well-known/skill.md without auth — same liveness contract', async () => {
+    const res = await fetch(`${baseUrl}/.well-known/skill.md`, { method: 'HEAD' });
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects HEAD /ui — HEAD allowlist excludes paths without a built-in HEAD handler', async () => {
+    // `/ui` is GET-public but has no built-in HEAD claim, so HEAD on /ui must go through auth to
+    // prevent a fork plugin matching `HEAD /ui` from running unauthenticated (round-7 vulnerability).
+    const res = await fetch(`${baseUrl}/ui`, { method: 'HEAD' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects HEAD /ui/something — HEAD allowlist excludes the /ui/* prefix', async () => {
+    const res = await fetch(`${baseUrl}/ui/something`, { method: 'HEAD' });
     expect(res.status).toBe(401);
   });
 

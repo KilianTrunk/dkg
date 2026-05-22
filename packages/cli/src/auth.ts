@@ -726,7 +726,7 @@ export function extractBearerToken(headerValue: string | undefined): string | un
 // HTTP middleware
 // ---------------------------------------------------------------------------
 
-const PUBLIC_PATHS = new Set([
+const PUBLIC_GET_PATHS = new Set([
   '/api/status',
   '/api/chain/rpc-health',
   '/.well-known/skill.md',
@@ -735,21 +735,29 @@ const PUBLIC_PATHS = new Set([
 ]);
 
 // Trailing slash required; `startsWith('/ui/')` excludes `/ui-custom`.
-const PUBLIC_PREFIXES = [
+const PUBLIC_GET_PREFIXES = [
   '/ui/',
   '/apps/',
 ];
 
-// GET only — non-GET on these paths goes through auth. HEAD is excluded because the built-in chain only claims GET,
-// so `HEAD /api/status` would fall through to plugins unauthenticated.
-const PUBLIC_SAFE_METHODS = new Set(['GET']);
+// HEAD allowlist is narrower than GET: only paths whose built-in handlers explicitly claim HEAD
+// (status.ts `/api/status`, `/api/chain/rpc-health`, `/.well-known/skill.md`). Adding /ui or /apps prefixes
+// without a built-in claim would let `HEAD /ui/foo` fall through to route plugins unauthenticated (round-7).
+const PUBLIC_HEAD_PATHS = new Set([
+  '/api/status',
+  '/api/chain/rpc-health',
+  '/.well-known/skill.md',
+]);
 
 function isPublicPath(method: string, pathname: string): boolean {
-  if (!PUBLIC_SAFE_METHODS.has(method)) return false;
-  if (PUBLIC_PATHS.has(pathname)) return true;
-  for (const prefix of PUBLIC_PREFIXES) {
-    if (pathname.startsWith(prefix)) return true;
+  if (method === 'GET') {
+    if (PUBLIC_GET_PATHS.has(pathname)) return true;
+    for (const prefix of PUBLIC_GET_PREFIXES) {
+      if (pathname.startsWith(prefix)) return true;
+    }
+    return false;
   }
+  if (method === 'HEAD') return PUBLIC_HEAD_PATHS.has(pathname);
   return false;
 }
 

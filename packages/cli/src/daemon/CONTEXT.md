@@ -45,15 +45,13 @@ and the derived per-request fields (`url`, `path`, `requestToken`,
 The single global authentication gate at `lifecycle.ts:1865`. Runs **before**
 `handleRequest`, so route groups and route plugins downstream see only
 authenticated requests **outside the public allowlist**. The allowlist is
-narrow and GET-only — `PUBLIC_PATHS` (exact match: `/api/status`,
-`/api/chain/rpc-health`, `/.well-known/skill.md`, `/ui`) and
-`PUBLIC_PREFIXES` (trailing-slash anchored: `/ui/`, `/apps/`) — and any
-non-GET method on those exact paths still goes through auth. Built-in
-handlers claim the public paths during the chain, so a route plugin in
-practice only sees authenticated requests. Plugins do not get a
-per-plugin auth surface — finer-grained policy reads `ctx.requestToken`
-/ `ctx.requestAgentAddress`. See `ARCHITECTURE.md` "Auth boundary —
-`httpAuthGuard`" for the full breakdown.
+per-method: `PUBLIC_GET_PATHS` + `PUBLIC_GET_PREFIXES` (for GET) and a
+narrower `PUBLIC_HEAD_PATHS` (HEAD on `/api/status`, `/api/chain/rpc-health`,
+`/.well-known/skill.md` only — the three paths where `routes/status.ts`
+explicitly claims HEAD so liveness probes never reach plugins). Other methods
+go through auth. Plugins do not get a per-plugin auth surface — finer-grained
+policy reads `ctx.requestToken` / `ctx.requestAgentAddress`. See
+`ARCHITECTURE.md` "Auth boundary — `httpAuthGuard`" for the full breakdown.
 
 **Operator state**:
 Per-install daemon state in `~/.dkg/` — PID file, log file, API port marker,

@@ -7,12 +7,14 @@ import { handlePluginRoutes } from '../../../src/daemon/routes/plugins.js';
 interface FakeRes {
   writableEnded: boolean;
   headersSent: boolean;
+  destroyed: boolean;
   statusCode: number;
   headers: Record<string, string | number | string[]>;
   body: string;
   writeHead: (status: number, headers?: Record<string, string | number | string[]>) => FakeRes;
   write: (chunk: string) => boolean;
   end: (chunk?: string) => void;
+  destroy: (err?: Error) => void;
   setHeader: (k: string, v: string) => void;
   getHeader: (k: string) => string | undefined;
 }
@@ -21,6 +23,7 @@ function makeRes(): FakeRes {
   const res: FakeRes = {
     writableEnded: false,
     headersSent: false,
+    destroyed: false,
     statusCode: 200,
     headers: {},
     body: '',
@@ -42,6 +45,11 @@ function makeRes(): FakeRes {
       if (typeof chunk === 'string') res.body += chunk;
       if (!res.headersSent) res.headersSent = true;
       res.writableEnded = true;
+    },
+    destroy() {
+      // Mirrors Node's ServerResponse.destroy(): socket aborted, no clean
+      // terminator chunk. `writableEnded` stays false (no graceful end).
+      res.destroyed = true;
     },
     setHeader(k, v) { res.headers[k] = v; },
     getHeader(k) { return res.headers[k] as string | undefined; },
@@ -185,8 +193,9 @@ describe('handlePluginRoutes', () => {
     expect(joined).toContain('boom-message');
   });
 
-  it('ends the half-written response when a plugin throws after writeHead', async () => {
-    // catch must call res.end() so writableEnded short-circuits; else the trailing 404 attempts a second writeHead.
+  it('aborts the socket (not res.end) when a plugin throws after writeHead', async () => {
+    // res.end() would emit a clean HTTP/1.1 terminator and clients/CDNs could cache the truncated body as 200.
+    // Destroy the socket instead so the client sees ECONNRESET — visibly a failure.
     const partialThenThrow: RoutePlugin = {
       name: 'half-written-terminator',
       handle(c) {
@@ -198,7 +207,8 @@ describe('handlePluginRoutes', () => {
     const { ctx, res } = makeCtx([partialThenThrow]);
     await handlePluginRoutes(ctx);
     expect(res.headersSent).toBe(true);
-    expect(res.writableEnded).toBe(true);
+    expect(res.destroyed).toBe(true);
+    expect(res.writableEnded).toBe(false); // no clean terminator
     // Status / body claimed by the plugin — must not be overwritten.
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe('{"partial":');

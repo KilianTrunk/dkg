@@ -1,5 +1,5 @@
 // Per-request dispatcher for route plugins. `headersSent` claims the request (covers streaming);
-// throws → 500 PluginError before response start, else end the now-broken stream.
+// throws → 500 PluginError before response start, else destroy the socket so a truncated body isn't seen as 200.
 
 import { jsonResponse } from '../http-utils.js';
 import type { RequestContext } from './context.js';
@@ -24,8 +24,10 @@ export async function handlePluginRoutes(ctx: RequestContext): Promise<void> {
           message,
         });
       } else if (!ctx.res.writableEnded) {
-        // Headers already out — can't emit a clean 500; just end the stream so the client doesn't hang.
-        ctx.res.end();
+        // Headers out, plugin threw mid-stream. Calling res.end() would emit a clean HTTP/1.1 terminator and
+        // clients / caching proxies could treat the truncated body as a successful 200. Destroy the socket so
+        // the client sees ECONNRESET — visibly a failure, never cacheable.
+        ctx.res.destroy();
       }
       return;
     }

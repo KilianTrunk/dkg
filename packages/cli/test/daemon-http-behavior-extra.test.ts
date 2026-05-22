@@ -724,6 +724,53 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     // message — callers should see something human-readable.
     expect(body.error).not.toMatch(/^0x[0-9a-fA-F]+$/);
   });
+
+  // SPEC_CG_MEMORY_MODEL / Codex PR #595 round-2: per-CG hosting
+  // committees and per-CG quorum overrides were removed. Two paths
+  // exist for legacy clients:
+  //   (a) modern `{ id, name, ...deprecated }` body — the daemon
+  //       strips the dead fields and the request succeeds.
+  //   (b) legacy multisig-only `{ participantIdentityIds, requiredSignatures }`
+  //       body with no `id`/`name` — pre-LU2 there was a dedicated
+  //       branch that bypassed id/name; post-LU2 we MUST fail with an
+  //       explicit deprecation error pointing at the new combined flow
+  //       rather than silently falling through to the generic
+  //       "Missing id or name" 400 (which doesn't tell the caller
+  //       their request shape was retired).
+  it('strips deprecated participantIdentityIds/requiredSignatures from a modern body and still creates the CG', async () => {
+    const d = daemon!;
+    const cgId = 'depr-fields-modern-' + Math.random().toString(36).slice(2, 8);
+    const res = await fetch(urlFor(d, '/api/context-graph/create'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({
+        id: cgId,
+        name: cgId,
+        participantIdentityIds: ['1', '2', '3'],
+        requiredSignatures: 2,
+      }),
+    });
+    expect([200, 201]).toContain(res.status);
+    const body = (await res.json()) as { created?: string };
+    expect(body.created).toBe(cgId);
+  });
+
+  it('rejects legacy multisig-only POST /api/context-graph/create (no id/name) with an explicit deprecation 400', async () => {
+    const d = daemon!;
+    const res = await fetch(urlFor(d, '/api/context-graph/create'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({
+        participantIdentityIds: ['1', '2'],
+        requiredSignatures: 1,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: string; code?: string };
+    expect(body.code).toBe('DEPRECATED_MULTISIG_CREATE_FLOW');
+    expect(body.error ?? '').toMatch(/SPEC_CG_MEMORY_MODEL/);
+    expect(body.error ?? '').toMatch(/id.*name/);
+  });
 });
 
 describe('DKG-419 — lazy context graph metadata from SWM writes', () => {

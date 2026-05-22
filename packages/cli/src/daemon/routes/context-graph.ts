@@ -425,17 +425,33 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
 
   // POST /api/context-graph/create — context graph definition create.
   // LU-2: per SPEC_CG_MEMORY_MODEL the legacy multisig-creation branch
-  // (driven by a `participantIdentityIds`-only body) is gone. CGs no
-  // longer carry per-CG hosting committees or quorum overrides; hosts
-  // are picked from the network sharding table at publish time and the
-  // ACK quorum is `parametersStorage.minimumRequiredSignatures()`. We
-  // accept the legacy body for backward compatibility but drop the dead
-  // fields with a one-line deprecation warning so older clients keep
-  // working.
+  // (driven by a `participantIdentityIds`-only body, no id/name) is gone.
+  // CGs no longer carry per-CG hosting committees or quorum overrides;
+  // hosts are picked from the network sharding table at publish time
+  // and the ACK quorum is `parametersStorage.minimumRequiredSignatures()`.
+  //
+  // Two client groups exist for these deprecated fields:
+  //   (a) modern clients that send the full `{ id, name, participantIdentityIds, requiredSignatures }`
+  //       body — we strip the dead fields and continue.
+  //   (b) legacy multisig-only clients that send `{ participantIdentityIds, requiredSignatures }`
+  //       with no `id`/`name` — there is no automatic translation that
+  //       preserves caller intent (we can't synthesise a meaningful slug),
+  //       so we fail with an explicit 410-style deprecation error pointing
+  //       at the new combined flow instead of letting the request fall
+  //       through to a generic "Missing id or name" 400.
   if (req.method === "POST" && path === "/api/context-graph/create") {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = JSON.parse(body);
     if (parsed.participantIdentityIds !== undefined || parsed.requiredSignatures !== undefined) {
+      const isLegacyMultisigOnly =
+        typeof parsed.id !== 'string' && typeof parsed.name !== 'string';
+      if (isLegacyMultisigOnly) {
+        return jsonResponse(res, 400, {
+          error:
+            'The multisig-only POST /api/context-graph/create flow (participantIdentityIds without id/name) was removed in SPEC_CG_MEMORY_MODEL. Per-CG hosting committees and per-CG quorum overrides no longer exist. Send a regular `{ id, name, accessPolicy?, publishPolicy? }` body and (if you want chain registration) follow up with POST /api/context-graph/register.',
+          code: 'DEPRECATED_MULTISIG_CREATE_FLOW',
+        });
+      }
       console.warn(
         '[DKG-Daemon] WARN: POST /api/context-graph/create — `participantIdentityIds` and `requiredSignatures` are deprecated and ignored; per-CG hosting committees and quorums were removed in SPEC_CG_MEMORY_MODEL.',
       );

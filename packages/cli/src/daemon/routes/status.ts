@@ -411,18 +411,18 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     requestAgentAddress,
   } = ctx;
 
-  if (req.method === "GET" && path === "/.well-known/skill.md") {
+  if ((req.method === "GET" || req.method === "HEAD") && path === "/.well-known/skill.md") {
+    // HEAD must return the same ETag/Cache-Control/Vary headers as GET so HTTP-cache-aware clients
+    // can validate without a body roundtrip. Compute body+ETag, honour If-None-Match, then emit
+    // headers and (for GET only) the body.
     const proto = req.headers["x-forwarded-proto"] ?? "http";
     const host =
       req.headers["x-forwarded-host"] ??
       req.headers.host ??
       `localhost:${config.listenPort ?? 9200}`;
     const baseUrl = `${proto}://${host}`;
-    // text/markdown is always handled natively by the import-file route
-    // (skip Phase 1, run the Phase 2 markdown extractor directly), even when
-    // no Phase 1 converter is registered. Surface it in the discovery list so
-    // skill-driven clients see Markdown ingestion as supported regardless of
-    // converter availability.
+    // text/markdown is always handled natively by the import-file route, so surface it in the
+    // discovery list even when no Phase 1 converter is registered.
     const pipelines = extractionRegistry.availableContentTypes();
     const content = buildSkillMd({
       version: nodeVersion,
@@ -442,7 +442,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       "Cache-Control": "public, max-age=300",
       Vary: "Host, X-Forwarded-Host, X-Forwarded-Proto",
     });
-    res.end(content);
+    res.end(req.method === "HEAD" ? undefined : content);
     return;
   }
 
@@ -460,8 +460,13 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     });
   }
 
-  // GET /api/status
-  if (req.method === "GET" && path === "/api/status") {
+  // GET/HEAD /api/status — HEAD claims early so liveness probes never reach plugins.
+  if ((req.method === "GET" || req.method === "HEAD") && path === "/api/status") {
+    if (req.method === "HEAD") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end();
+      return;
+    }
     const allConns = agent.node.libp2p.getConnections();
     const directConns = allConns.filter(
       (c) => !c.remoteAddr?.toString().includes("/p2p-circuit"),
@@ -755,8 +760,13 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     }
   }
 
-  // GET /api/chain/rpc-health
-  if (req.method === "GET" && path === "/api/chain/rpc-health") {
+  // GET/HEAD /api/chain/rpc-health — HEAD claims early to short-circuit the RPC roundtrip for liveness probes.
+  if ((req.method === "GET" || req.method === "HEAD") && path === "/api/chain/rpc-health") {
+    if (req.method === "HEAD") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end();
+      return;
+    }
     const chain = resolveChainConfig(config, network);
     const rpcUrl = chain?.rpcUrl;
     if (!rpcUrl) {

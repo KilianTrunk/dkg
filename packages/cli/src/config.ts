@@ -420,6 +420,8 @@ export interface DkgConfig {
    * See {@link ChatConfig} / {@link ChatAclConfig}.
    */
   chat?: ChatConfig;
+  /** Route-plugin specs (absolute paths / package names) loaded at daemon startup. ADR 0001. */
+  routePlugins?: string[];
 }
 
 /**

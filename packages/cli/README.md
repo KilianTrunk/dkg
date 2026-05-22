@@ -495,6 +495,112 @@ the `dkg integration` CLI (see `packages/cli/src/integrations/`), which installs
 trusted `cli` / `mcp` integrations from a registry with npm provenance
 verification.
 
+### Route plugins
+
+Route plugins are an in-process extension hook for fork operators who need to
+add custom HTTP routes to the daemon without patching upstream. They are
+distinct from the `dkg integration` system: integrations are third-party
+packages installed by end-users from a registry, while route plugins are
+loaded from a fork's own configured module paths and run inside the daemon's
+own request loop with access to the same `RequestContext` that built-in
+routes receive.
+
+A plugin is a module exporting an object matching this shape:
+
+```ts
+import type { RoutePlugin } from '@origintrail-official/dkg/daemon/plugin-api';
+
+export const plugin: RoutePlugin = {
+  name: 'my-fork-routes',
+  async handle(ctx) {
+    if (ctx.url.pathname === '/my-fork/hello') {
+      ctx.res.statusCode = 200;
+      ctx.res.end('hi');
+    }
+  },
+};
+```
+
+Plugins are wired into the daemon via `~/.dkg/config.json`:
+
+```json
+{
+  "routePlugins": [
+    "/opt/my-fork/plugins/my-fork-routes.js",
+    "@my-fork/dkg-extra-routes"
+  ]
+}
+```
+
+Each entry is either:
+
+- An **absolute filesystem path** to a built plugin module — loaded
+  directly via `pathToFileURL` + dynamic `import()`.
+- A **resolvable package name** (`@scope/name` or `name`) — resolved by
+  Node's ESM resolver first (`await import(spec)`, which honours both
+  `import` and `default` conditions in the package's `exports` map). If
+  ESM **resolution** fails because the package's `exports` map matches
+  no ESM condition (e.g. a CJS-only package whose `exports` declares
+  only a `require` condition), the loader falls back to
+  `createRequire(import.meta.url).resolve(spec)` and re-imports the
+  resolved file URL. ESM **runtime** failures — a `SyntaxError` in the
+  ESM source, a missing transitive import inside the loaded ESM, a
+  rejected top-level `await` — are NOT rescued by CJS; they bubble up
+  as `route-plugin-load-failed` so plugin authors actually see their
+  broken ESM build instead of getting a silent CJS sidestep.
+
+**Relative paths** (`./foo`, `../foo`) are explicitly rejected — Node's
+dynamic import would otherwise resolve them relative to the loader's
+source file inside `packages/cli/dist/daemon/`, not relative to
+`~/.dkg/config.json`. Use an absolute path or a package name instead.
+
+On path collisions the first plugin listed in `routePlugins` wins: the
+dispatcher invokes plugins in array order and stops at the first one that
+writes a response, so earlier entries shadow later ones for the same path.
+
+#### ESM-only public API
+
+`@origintrail-official/dkg/daemon/plugin-api` is published as **ES Modules
+only** — the `exports` block in `package.json` intentionally declares only
+an `import` condition (no `require`, no `default`). ESM plugins consume the
+helpers directly:
+
+```ts
+import { jsonResponse, readBody } from '@origintrail-official/dkg/daemon/plugin-api';
+```
+
+The loader itself supports CommonJS plugin **modules** (the orchestrator's
+loader honours `module.exports`, `module.exports.plugin`, and ESM
+`default`/`plugin` named exports — see `plugin-loader.ts`), so a CJS plugin
+still loads fine. The narrow gap is only synchronous `require()` of the
+public helper module from CJS code. From a CommonJS plugin, load the
+helpers with dynamic import inside an async function instead:
+
+```js
+// my-cjs-plugin.cjs
+module.exports.plugin = {
+  name: 'cjs-plugin',
+  async handle(ctx) {
+    const { jsonResponse, readBody } = await import(
+      '@origintrail-official/dkg/daemon/plugin-api'
+    );
+    if (ctx.url.pathname === '/my-fork/echo') {
+      const body = await readBody(ctx.req);
+      return jsonResponse(ctx.res, 200, { received: body });
+    }
+  },
+};
+```
+
+This is by design: the CLI package is `"type": "module"` end-to-end and
+ships only ESM build artifacts under `dist/`, so an `exports` `require`
+condition pointing at the same `.js` files would put us in the "require
+ESM" mode that is unreliable across Node versions. Plugin authors who
+write CommonJS use the one-line `await import()` workaround above.
+
+See [`docs/adr/0001-daemon-route-plugins.md`](../../docs/adr/0001-daemon-route-plugins.md)
+for the design rationale, threat model, and stability guarantees.
+
 ## Internal Dependencies
 
 - `@origintrail-official/dkg-agent` — agent runtime, wallet, publishing, querying

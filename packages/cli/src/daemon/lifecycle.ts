@@ -326,6 +326,7 @@ import {
 } from './local-agents.js';
 
 import { handleRequest } from './handle-request.js';
+import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
 
 /**
@@ -2005,6 +2006,7 @@ export async function runDaemonInner(
         validTokens,
         apiHost,
         apiPortRef,
+        routePlugins,
         emitMemoryGraphChanged,
       );
     } catch (err: any) {
@@ -2032,6 +2034,18 @@ export async function runDaemonInner(
 
   const apiPort = config.apiPort || 0;
   const apiHost = config.apiHost || "127.0.0.1";
+
+  // Route plugins: loaded before listen() so requests can't race the array; fail-soft per ADR 0001.
+  const routePlugins = await loadRoutePlugins(
+    config.routePlugins,
+    new Logger('route-plugins'),
+  );
+  // Validated count for telemetry — `configured=` is 0 for non-arrays so a typo doesn't report character count.
+  const configuredCount = countConfiguredPluginSpecs(config.routePlugins);
+  log(
+    `route-plugins-loaded loaded=${routePlugins.length} configured=${configuredCount}`,
+  );
+
   await new Promise<void>((resolve) => {
     server.listen(apiPort, apiHost, () => resolve());
   });

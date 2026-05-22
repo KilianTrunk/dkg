@@ -301,9 +301,16 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
               </label>
               <label className="v10-form-radio">
                 <input type="radio" checked={publishPolicy === 'open'} onChange={() => setPublishPolicy('open')} />
-                Open — any collaborator may publish to Verified Memory
+                Open — any wallet may publish to Verified Memory (not just members)
               </label>
             </div>
+            {access === 'curated' && publishPolicy === 'open' && (
+              <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-tertiary)' }}>
+                Note: an invite-only sharing graph with open contribution still lets <em>any</em> wallet
+                publish to Verified Memory — the on-chain publish check is not gated by the allowlist.
+                See SPEC_CG_MEMORY_MODEL §2.5.
+              </div>
+            )}
           </div>
 
           <div className="v10-form-group">

@@ -592,10 +592,11 @@ CG=$(c -X POST "http://127.0.0.1:9201/api/context-graph/create" -d "{
   \"accessPolicy\":0,
   \"publishPolicy\":1
 }")
-CG_ID=$(json_get "$CG" contextGraphId)
-CG_OK=$(json_get "$CG" success)
-echo "  CG result: id=$CG_ID success=$CG_OK"
-[[ "$CG_OK" == "true" ]] && ok "Context Graph created (id=$CG_ID)" || fail "CG creation: $CG"
+# Daemon returns { created: "<slug>", uri: "<did>" } on success, { error: "..." } on failure.
+CG_ID=$(json_get "$CG" created)
+CG_URI=$(json_get "$CG" uri)
+echo "  CG result: created=$CG_ID uri=$CG_URI"
+[[ -n "$CG_ID" ]] && ok "Context Graph created (id=$CG_ID)" || fail "CG creation: $CG"
 
 #------------------------------------------------------------
 echo ""

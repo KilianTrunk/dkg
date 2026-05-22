@@ -21,14 +21,10 @@ export function useFetch<T>(
     } catch (err: any) {
       if (mountedRef.current) {
         if (err?.status === 401) {
-          // One-shot recovery: if the page has a token but the server rejected
-          // it (node restarted), reload once so the server re-injects a fresh
-          // token. Skip if no token was ever injected (dev mode) or if we
-          // already attempted a reload this session to avoid infinite loops.
           const hasToken = !!(window as any).__DKG_TOKEN__;
-          const alreadyRetried = !!(window as any).__DKG_401_RELOADED__;
+          const alreadyRetried = sessionStorage.getItem('__dkg_401_reloaded') === '1';
           if (hasToken && !alreadyRetried) {
-            (window as any).__DKG_401_RELOADED__ = true;
+            sessionStorage.setItem('__dkg_401_reloaded', '1');
             window.location.reload();
             return;
           }

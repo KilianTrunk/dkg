@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { useLayoutStore } from '../../stores/layout.js';
+import { useLayoutStore, maxBottomHeight } from '../../stores/layout.js';
 import { api } from '../../api-wrapper.js';
 import { formatTime, formatDuration, shortId } from '../../hooks.js';
 
@@ -89,7 +89,8 @@ function NodeLogContent() {
   useEffect(() => { load(); const iv = setInterval(load, 3_000); return () => clearInterval(iv); }, [load]);
 
   const visible = lines.filter(l => level === 'all' || classifyLine(l) === level);
-  const scrollRef = useAutoScroll(visible.length);
+  const lastLine = visible.length > 0 ? visible[visible.length - 1] : '';
+  const scrollRef = useAutoScroll(lastLine);
 
   return (
     <div className="v10-log-container">
@@ -146,7 +147,8 @@ function TransactionsContent() {
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const load = useCallback(() => {
-    api.fetchOperationsWithPhases({ limit: '100', periodMs: String(6 * 60 * 60_000) })
+    const from = String(Date.now() - 6 * 60 * 60_000);
+    api.fetchOperationsWithPhases({ limit: '100', from })
       .then((data: any) => {
         const filtered = (data?.operations ?? []).filter((op: any) =>
           TX_OP_TYPES.has(op.operation_name) &&
@@ -285,7 +287,8 @@ function GossipContent() {
   useEffect(() => { load(); const iv = setInterval(load, 5_000); return () => clearInterval(iv); }, [load]);
 
   const visible = filter ? lines.filter(l => l.toLowerCase().includes(filter.toLowerCase())) : lines;
-  const scrollRef = useAutoScroll(visible.length);
+  const gossipLastLine = visible.length > 0 ? visible[visible.length - 1] : '';
+  const scrollRef = useAutoScroll(gossipLastLine);
 
   return (
     <div className="v10-log-container">
@@ -365,7 +368,7 @@ export function PanelBottom() {
     ? undefined
     : bottomMaximised
       ? '80vh'
-      : bottomHeight;
+      : Math.min(bottomHeight, maxBottomHeight());
 
   return (
     <div

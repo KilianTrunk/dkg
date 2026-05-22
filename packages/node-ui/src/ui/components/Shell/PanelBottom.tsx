@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useLayoutStore } from '../../stores/layout.js';
 import { api } from '../../api-wrapper.js';
 import { formatTime, formatDuration, shortId } from '../../hooks.js';
-import { fetchOperationsWithPhases } from '../../api.js';
 
 const BOTTOM_TABS = ['Node Log', 'Transactions', 'Gossip'] as const;
 type BottomTab = typeof BOTTOM_TABS[number];
@@ -146,7 +145,7 @@ function TransactionsContent() {
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const load = useCallback(() => {
-    fetchOperationsWithPhases({ limit: '100', periodMs: String(6 * 60 * 60_000) })
+    api.fetchOperationsWithPhases({ limit: '100', periodMs: String(6 * 60 * 60_000) })
       .then((data: any) => {
         const filtered = (data?.operations ?? []).filter((op: any) =>
           TX_OP_TYPES.has(op.operation_name) &&
@@ -225,7 +224,7 @@ function TransactionsContent() {
                         <span><b>ID:</b> <span style={{ fontFamily: 'var(--font-mono)' }}>{op.operation_id}</span></span>
                         {txHash && <span><b>Tx:</b> <span style={{ fontFamily: 'var(--font-mono)' }}>{txHash}</span></span>}
                         {op.peer_id && <span><b>Peer:</b> <span style={{ fontFamily: 'var(--font-mono)' }}>{shortId(op.peer_id)}</span></span>}
-                        {op.error && <span style={{ color: '#ef4444' }}><b>Error:</b> {op.error}</span>}
+                        {op.error_message && <span style={{ color: '#ef4444' }}><b>Error:</b> {op.error_message}</span>}
                       </div>
                       {(op.phases ?? []).length > 0 && (
                         <div style={{ marginTop: 8, display: 'flex', gap: 6, flexWrap: 'wrap' }}>

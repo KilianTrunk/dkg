@@ -1404,30 +1404,6 @@ export async function runDaemonInner(
     }
   });
 
-  // Track sync completions
-  agent.eventBus.on(DKGEvent.PROJECT_SYNCED, (data: any) => {
-    try {
-      const ctx = createOperationContext("sync");
-      tracker.start(ctx, {
-        contextGraphId: data.contextGraphId,
-        details: { dataSynced: data.dataSynced, sharedMemorySynced: data.sharedMemorySynced },
-      });
-      tracker.complete(ctx);
-    } catch { /* never crash */ }
-  });
-
-  // Track gossip messages
-  agent.eventBus.on(DKGEvent.GOSSIP_MESSAGE, (data: any) => {
-    try {
-      const ctx = createOperationContext("gossip");
-      tracker.start(ctx, {
-        peerId: data.from,
-        details: { topic: data.topic },
-      });
-      tracker.complete(ctx);
-    } catch { /* never crash */ }
-  });
-
   // Track KC confirmation (on-chain verify)
   agent.eventBus.on(DKGEvent.KC_CONFIRMED, (data: any) => {
     try {
@@ -1446,7 +1422,10 @@ export async function runDaemonInner(
       const ctx = createOperationContext("ka-update");
       tracker.start(ctx, {
         contextGraphId: data.contextGraphId,
-        details: { kaUri: data.kaUri },
+        details: {
+          ual: data.ual,
+          rootEntities: Array.isArray(data.rootEntities) ? data.rootEntities.slice(0, 5) : undefined,
+        },
       });
       tracker.complete(ctx);
     } catch { /* never crash */ }

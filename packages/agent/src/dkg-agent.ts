@@ -9697,48 +9697,10 @@ export class DKGAgent {
     const isPcaCurated = publishPolicy === EVM_PUBLISH_CURATED
       && publishAuthorityAccountId !== undefined;
 
-    // LU-2: per SPEC_CG_MEMORY_MODEL on-chain CGs are now edge-owned by
+    // Per SPEC_CG_MEMORY_MODEL on-chain CGs are now edge-owned by
     // default — no per-CG hosting committee, no per-CG quorum override.
-    // The previous code read participant identity IDs and a stored
-    // `requiredSignatures` from `_meta` and forwarded them on-chain;
-    // both surfaces are gone. The publish path uses
-    // `parametersStorage.minimumRequiredSignatures()` and gates ACK
-    // signers on sharding-table membership instead.
-    //
-    // Pre-LU2 migration warning (Codex PR #595 round-3): CGs created
-    // on rc.x builds before this change may have a stored per-CG
-    // `RequiredSignatures` triple in `_meta`. That value is now dead
-    // data — the new contract has no slot for it. Persisted
-    // `DKG_PARTICIPANT_IDENTITY_ID` triples are NOT dead: the verify
-    // path still consults them as an off-chain advisory allowlist (see
-    // `getVerifyParticipantIdentityIds`), so a warning isn't needed
-    // for those. We surface the quorum-override mismatch loudly so a
-    // user upgrading an existing edge node knows the security model
-    // shifted from per-CG M-of-N to system-wide quorum.
-    try {
-      const staleQuorumResult = await this.store.query(
-        `SELECT ?required WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}RequiredSignatures> ?required } } LIMIT 1`,
-      );
-      if (staleQuorumResult.type === 'bindings' && staleQuorumResult.bindings.length > 0) {
-        const storedValue = staleQuorumResult.bindings[0]?.['required']?.replace(/^"|"$/g, '') ?? 'unknown';
-        let sysMinStr = 'unknown';
-        if (typeof this.chain.getMinimumRequiredSignatures === 'function') {
-          try {
-            const sysMin = await this.chain.getMinimumRequiredSignatures();
-            if (Number.isInteger(sysMin) && sysMin >= 1) sysMinStr = String(sysMin);
-          } catch { /* tolerate: this is a warning path */ }
-        }
-        this.log.warn(
-          ctx,
-          `[migration] Context graph "${id}" has a pre-LU2 stored per-CG requiredSignatures=${storedValue}. ` +
-          `SPEC_CG_MEMORY_MODEL removed per-CG quorum overrides; the system-wide ACK quorum ` +
-          `(parametersStorage.minimumRequiredSignatures()=${sysMinStr}) applies on-chain. ` +
-          `The stored value is now advisory only — chain enforcement does NOT see it.`,
-        );
-      }
-    } catch (err: any) {
-      this.log.warn(ctx, `[migration] pre-LU2 metadata probe failed for "${id}": ${err?.message ?? err}`);
-    }
+    // Hosts come from the sharding table at publish time; ACK quorum
+    // is `parametersStorage.minimumRequiredSignatures()`.
 
     // Check if already registered on-chain (prevents duplicate minting)
     const existingOnChainId = await this.getContextGraphOnChainId(id);
@@ -11806,27 +11768,27 @@ export class DKGAgent {
     const isEligibleParticipant = (identityId: bigint): boolean =>
       participantIdentityIds === null || participantIdentityIds.has(identityId);
 
-    // Sharding-table eligibility (Codex PR #595 round-4):
-    // SPEC_CG_MEMORY_MODEL §4.3 + §6 promise that only sharding-table
-    // members can ACK a VM publish. Pre-LU2 the per-CG hosting-committee
-    // allowlist did this gating implicitly; post-LU2 that allowlist is
-    // gone and we have to check membership at signer-resolution time.
-    // Failure modes:
-    //   - adapter doesn't implement `isShardingTableMember` → log once
-    //     and fall back to legacy behavior (test mocks / no-chain envs).
-    //   - membership probe throws for a specific signer → drop that
-    //     approval (fail-closed per signer, not per batch).
-    // Cache decisions per batch so we don't hammer the RPC for repeated
-    // approvers across re-tries.
+    // Sharding-table eligibility: SPEC_CG_MEMORY_MODEL §4.3 promises
+    // that only sharding-table members can ACK a VM publish. Probe
+    // membership for every resolved signer and drop non-members
+    // fail-closed. Adapters that don't implement the probe are a
+    // misconfiguration in this code path (real EVM and the in-tree
+    // mock both implement it) — fail loudly instead of silently
+    // accepting any signer. Cache per batch to avoid repeated RPCs.
+    if (typeof this.chain.isShardingTableMember !== 'function') {
+      throw new Error(
+        'verify: chain adapter does not implement `isShardingTableMember()`. ' +
+        'Cannot enforce SPEC_CG_MEMORY_MODEL §4.3 sharding-table ACK eligibility — refusing fail-open.',
+      );
+    }
     const shardingMembershipCache = new Map<string, boolean>();
     const probeShardingTableMembership = async (identityId: bigint): Promise<boolean> => {
       if (identityId <= 0n) return false;
-      if (typeof this.chain.isShardingTableMember !== 'function') return true;
       const key = identityId.toString();
       const cached = shardingMembershipCache.get(key);
       if (cached !== undefined) return cached;
       try {
-        const ok = await this.chain.isShardingTableMember(identityId);
+        const ok = await this.chain.isShardingTableMember!(identityId);
         shardingMembershipCache.set(key, ok);
         return ok;
       } catch (err: any) {

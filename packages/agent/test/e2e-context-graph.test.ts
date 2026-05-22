@@ -79,10 +79,7 @@ describe('E2E: context graph publish + finalization (shared chain)', () => {
   }, 15_000);
 
   it('creates a context graph on the shared chain', async () => {
-    const result = await nodeA.registerContextGraphOnChain({
-      participantIdentityIds: [1n, 2n],
-      requiredSignatures: 1,
-    });
+    const result = await nodeA.registerContextGraphOnChain({});
 
     contextGraphId = result.contextGraphId;
     expect(contextGraphId).toBeDefined();

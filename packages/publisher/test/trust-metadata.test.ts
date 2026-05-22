@@ -87,8 +87,6 @@ describe('publisher trust metadata', () => {
     const chain = new MockChainAdapter('mock:31337', wallet.address);
     chain.seedIdentity(wallet.address, 1n);
     const created = await chain.createOnChainContextGraph({
-      participantIdentityIds: [1n],
-      requiredSignatures: 1,
       metadataBatchId: 0n,
     });
     const contextGraphId = created.contextGraphId;

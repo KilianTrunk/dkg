@@ -579,20 +579,18 @@ echo ""
 echo "=== SECTION 7: Context Graph Creation ==="
 echo ""
 
-# Participant-CG creation (`publishPolicy=participant`, M-of-N signatures
-# over SWM promotes) requires every listed participant to have an on-chain
-# identityId. Edge nodes don't stake — see §1a — so Node5's identityId is
-# always 0 and fails contract-side `onlyRegistered(identityId)` validation.
-# This section therefore lists core nodes only (1 / 2 / 3); see §4/§5
-# for the curator / non-curator publish-authority semantics.
-ID1=$(c "http://127.0.0.1:9201/api/identity" | python3 -c "import sys,json; print(json.load(sys.stdin).get('identityId',0))" 2>/dev/null)
-ID2=$(c "http://127.0.0.1:9202/api/identity" | python3 -c "import sys,json; print(json.load(sys.stdin).get('identityId',0))" 2>/dev/null)
-ID3=$(c "http://127.0.0.1:9203/api/identity" | python3 -c "import sys,json; print(json.load(sys.stdin).get('identityId',0))" 2>/dev/null)
-echo "  Core identity IDs: $ID1, $ID2, $ID3"
-
+# Per SPEC_CG_MEMORY_MODEL, per-CG hosting committees and per-CG quorum
+# overrides were removed from the wire format end-to-end. Hosting is
+# handled by the network sharding table at publish time, and the ACK
+# quorum is the system parameter parametersStorage.minimumRequiredSignatures().
+# This section simply creates a public CG (accessPolicy=0, publishPolicy=1)
+# and exercises the downstream dedup / publish paths.
+CG_SLUG="devnet-test-section7-$(date +%s)"
 CG=$(c -X POST "http://127.0.0.1:9201/api/context-graph/create" -d "{
-  \"participantIdentityIds\":[$ID1,$ID2,$ID3],
-  \"requiredSignatures\":2
+  \"id\":\"$CG_SLUG\",
+  \"name\":\"Devnet Test Section 7\",
+  \"accessPolicy\":0,
+  \"publishPolicy\":1
 }")
 CG_ID=$(json_get "$CG" contextGraphId)
 CG_OK=$(json_get "$CG" success)

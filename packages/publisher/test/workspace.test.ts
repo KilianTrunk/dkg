@@ -382,10 +382,7 @@ describe('Workspace: publishFromSharedMemory', () => {
   });
 
   it('publishFromSharedMemory with contextGraphId remaps quads to context graph URIs', async () => {
-    const cgResult = await chain.createOnChainContextGraph({
-      participantIdentityIds: [BigInt(getSharedContext().coreProfileId)],
-      requiredSignatures: 1,
-    });
+    const cgResult = await chain.createOnChainContextGraph({});
     const ctxId = String(cgResult.contextGraphId);
     const ctxDataGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${ctxId}`;
     const ctxMetaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${ctxId}/_meta`;
@@ -422,10 +419,7 @@ describe('Workspace: publishFromSharedMemory', () => {
   });
 
   it('publishFromSharedMemory with contextGraphId calls verify', async () => {
-    const cgResult = await chain.createOnChainContextGraph({
-      participantIdentityIds: [BigInt(getSharedContext().coreProfileId)],
-      requiredSignatures: 1,
-    });
+    const cgResult = await chain.createOnChainContextGraph({});
     const ctxId = String(cgResult.contextGraphId);
 
     const quads = [q(ENTITY, 'http://schema.org/name', '"Batch Test"')];

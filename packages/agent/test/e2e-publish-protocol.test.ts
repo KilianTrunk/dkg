@@ -255,10 +255,7 @@ describe('E2E: Context graph publish with receiver + participant signatures', ()
     await sleep(1500);
 
     // Both A and B are participants
-    const result = await nodeA.registerContextGraphOnChain({
-      participantIdentityIds: [BigInt(ctx.coreProfileId), BigInt(ctx.receiverIds[0])],
-      requiredSignatures: 1,
-    });
+    const result = await nodeA.registerContextGraphOnChain({});
     contextGraphId = result.contextGraphId;
     expect(Number(contextGraphId)).toBeGreaterThan(0);
   }, 20_000);
@@ -451,10 +448,7 @@ describe('E2E: Context graph registration rejected with insufficient participant
     nodeA.subscribeToContextGraph(CONTEXT_GRAPH);
 
     // Context graph requires 2 signatures, but only 1 node available
-    const cgResult = await nodeA.registerContextGraphOnChain({
-      participantIdentityIds: [BigInt(ctx.coreProfileId), BigInt(ctx.receiverIds[0])],
-      requiredSignatures: 2,
-    });
+    const cgResult = await nodeA.registerContextGraphOnChain({});
     const contextGraphId = cgResult.contextGraphId;
 
     await nodeA.share(CONTEXT_GRAPH, [
@@ -467,11 +461,10 @@ describe('E2E: Context graph registration rejected with insufficient participant
       { subContextGraphId: contextGraphId },
     );
 
-    // V10: publishDirect enforces the *global* minimumRequiredSignatures
-    // (set via ParametersStorage), not the per-CG requiredSignatures.
-    // The per-CG quorum governs context-graph governance, not publish gating.
-    // With the global minimum at 1 and a valid self-signed ACK the publish
-    // succeeds even though the CG's own quorum is 2.
+    // V10 + LU-2: publishDirect enforces the *global*
+    // minimumRequiredSignatures (set via ParametersStorage). Per-CG
+    // hosting committees and per-CG quorum overrides are gone, so the
+    // global minimum (1) plus a valid self-signed ACK is enough.
     expect(result.status).toBe('confirmed');
   }, 20_000);
 });
@@ -531,10 +524,7 @@ describe('E2E: Edge node participates in context graph governance', () => {
     const coreIdentity = await chainCore.getIdentityId();
     expect(coreIdentity).toBeGreaterThan(0n);
 
-    const cgResult = await coreNode.registerContextGraphOnChain({
-      participantIdentityIds: [BigInt(ctx.coreProfileId), BigInt(ctx.receiverIds[0])],
-      requiredSignatures: 2,
-    });
+    const cgResult = await coreNode.registerContextGraphOnChain({});
     contextGraphId = cgResult.contextGraphId;
 
     // Core writes data

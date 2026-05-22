@@ -13,6 +13,15 @@ export interface VerifyCollectorDeps {
   getParticipantPeers: (contextGraphId: string) => string[];
   verifyIdentity?: (recoveredAddress: string, claimedIdentityId: bigint) => Promise<boolean>;
   log?: (msg: string) => void;
+  /**
+   * LU-2 (SPEC_CG_MEMORY_MODEL): per-CG quorum is gone — every CG uses
+   * the system parameter `parametersStorage.minimumRequiredSignatures()`.
+   * When `collect()` is called without an explicit `requiredSignatures`,
+   * the collector consults this accessor to obtain the system default.
+   * Optional: callers that always pass an explicit override (e.g. the
+   * legacy verify HTTP route with `?requiredSignatures=N`) can omit it.
+   */
+  getMinimumRequiredSignatures?: () => Promise<number>;
 }
 
 export interface CollectedApproval {
@@ -75,15 +84,35 @@ export class VerifyCollector {
     merkleRoot: Uint8Array;
     entities: string[];
     proposerSignature: { r: Uint8Array; vs: Uint8Array };
-    requiredSignatures: number;
+    /**
+     * LU-2: optional — when omitted we fall back to the system parameter
+     * via `deps.getMinimumRequiredSignatures()`. Explicit overrides are
+     * still honoured (e.g. `/api/verify` with a `requiredSignatures`
+     * advisory).
+     */
+    requiredSignatures?: number;
     timeoutMs: number;
     allowPartial?: boolean;
   }): Promise<VerifyCollectionResult> {
     const {
       contextGraphId, contextGraphIdOnChain, verifiedMemoryId,
       batchId, merkleRoot, entities, proposerSignature,
-      requiredSignatures, timeoutMs, allowPartial = false,
+      timeoutMs, allowPartial = false,
     } = params;
+    let requiredSignatures = params.requiredSignatures ?? 0;
+    if (requiredSignatures <= 0 && this.deps.getMinimumRequiredSignatures) {
+      try {
+        const sysMin = await this.deps.getMinimumRequiredSignatures();
+        if (Number.isInteger(sysMin) && sysMin >= 1) {
+          requiredSignatures = sysMin;
+        }
+      } catch {
+        // Fall through to the 1-of-1 default below.
+      }
+    }
+    if (requiredSignatures <= 0) {
+      requiredSignatures = 1;
+    }
     const boundedTimeoutMs = Math.min(
       assertVerifyCollectionTimeoutMs(timeoutMs),
       VERIFY_COLLECTION_TIMEOUT_MAX_MS,

@@ -136,6 +136,22 @@ describe('buildEpcisQuery', () => {
     expect(sparql).toContain('epcis:bizLocation <urn:loc:1>');
   });
 
+  it('selects and filters by extension configurationId and shipmentId', () => {
+    const sparql = buildEpcisQuery(
+      { configurationId: 'CFG-001', shipmentId: 'SHIP-001' },
+      CONTEXT_GRAPH_ID,
+    );
+
+    expect(sparql).toContain('SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual');
+    expect(sparql).toContain('?event ?configurationIdPredicate ?configurationId .');
+    expect(sparql).toContain('FILTER(REPLACE(STR(?configurationIdPredicate), "^.*[/#]", "") = "configurationId")');
+    expect(sparql).toContain('FILTER(STR(?configurationId) = "CFG-001")');
+    expect(sparql).toContain('?event ?shipmentIdPredicate ?shipmentId .');
+    expect(sparql).toContain('FILTER(REPLACE(STR(?shipmentIdPredicate), "^.*[/#]", "") = "shipmentId")');
+    expect(sparql).toContain('FILTER(STR(?shipmentId) = "SHIP-001")');
+    expect(sparql).toContain('GROUP BY ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual');
+  });
+
   it('uses default pagination (limit 100, offset 0)', () => {
     const sparql = buildEpcisQuery({ epc: 'urn:test' }, CONTEXT_GRAPH_ID);
 

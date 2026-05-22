@@ -235,7 +235,11 @@ describe('[K-6] EPCIS capture → query contract (always runs, no devnet)', () =
       expect(body.schemaVersion).toBe('2.0');
       expect(body['@context']).toEqual([
         'https://ref.gs1.org/standards/epcis/2.0.0/epcis-context.jsonld',
-        { dkg: 'http://dkg.io/ontology/' },
+        {
+          dkg: 'http://dkg.io/ontology/',
+          configurationId: 'http://dkg.io/ontology/epcis/configurationId',
+          shipmentId: 'http://dkg.io/ontology/epcis/shipmentId',
+        },
       ]);
       const events = body.epcisBody.queryResults.resultsBody.eventList;
       expect(events.length).toBeGreaterThan(0);

@@ -45,6 +45,10 @@ export function normalizeBizStep(value: string): string {
   return normalizeGs1Vocabulary('BizStep', value);
 }
 
+function extensionLocalNameFilter(predicateVariable: string, localName: string): string {
+  return `FILTER(REPLACE(STR(?${predicateVariable}), "^.*[/#]", "") = "${localName}")`;
+}
+
 /**
  * Build a composite SPARQL query for EPCIS events.
  *
@@ -203,6 +207,26 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   optionalClauses.push('OPTIONAL { ?event epcis:inputEPCList ?inputEPCList . }');
   optionalClauses.push('OPTIONAL { ?event epcis:outputEPCList ?outputEPCList . }');
 
+  // Extension identifiers carried as JSON-LD triples. Match by predicate local
+  // name so project-specific ontologies stay outside the generic DKG EPCIS API.
+  if (params.configurationId) {
+    wherePatterns.push(`?event ?configurationIdPredicate ?configurationId .
+      ${extensionLocalNameFilter('configurationIdPredicate', 'configurationId')}`);
+    filterClauses.push(`FILTER(STR(?configurationId) = "${escapeSparql(params.configurationId)}")`);
+  } else {
+    optionalClauses.push(`OPTIONAL { ?event ?configurationIdPredicate ?configurationId .
+      ${extensionLocalNameFilter('configurationIdPredicate', 'configurationId')} }`);
+  }
+
+  if (params.shipmentId) {
+    wherePatterns.push(`?event ?shipmentIdPredicate ?shipmentId .
+      ${extensionLocalNameFilter('shipmentIdPredicate', 'shipmentId')}`);
+    filterClauses.push(`FILTER(STR(?shipmentId) = "${escapeSparql(params.shipmentId)}")`);
+  } else {
+    optionalClauses.push(`OPTIONAL { ?event ?shipmentIdPredicate ?shipmentId .
+      ${extensionLocalNameFilter('shipmentIdPredicate', 'shipmentId')} }`);
+  }
+
   // Pagination
   const limit = Math.min(Math.max(params.limit ?? 100, 1), 1000);
   const offset = Math.max(params.offset ?? 0, 0);
@@ -212,7 +236,7 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   ].join('\n      ');
 
   return `${PREFIXES}
-SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?ual
+SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual
   (GROUP_CONCAT(DISTINCT ?epc; SEPARATOR=", ") AS ?epcList)
   (GROUP_CONCAT(DISTINCT ?childEPCs; SEPARATOR=", ") AS ?childEPCList)
   (GROUP_CONCAT(DISTINCT ?inputEPCList; SEPARATOR=", ") AS ?inputEPCs)
@@ -242,7 +266,7 @@ WHERE {
     }
   }
 }
-GROUP BY ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?ual
+GROUP BY ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual
 ORDER BY DESC(?eventTime) ?event
 LIMIT ${limit}
 OFFSET ${offset}`;

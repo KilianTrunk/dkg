@@ -16,6 +16,8 @@ export interface EPCISEvent {
   type: string;
   eventTime: string;
   eventTimeZoneOffset?: string;
+  configurationId?: string;
+  shipmentId?: string;
   epcList?: string[];
   action?: string;
   bizStep?: string;
@@ -76,6 +78,8 @@ export interface EpcisQueryParams {
   inputEPC?: string;
   outputEPC?: string;
   anyEPC?: string;
+  configurationId?: string;
+  shipmentId?: string;
   eventType?: string;
   action?: string;
   disposition?: string;

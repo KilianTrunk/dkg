@@ -2,7 +2,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { runSourceWorkerOnce, saveSourceWorkerState } from '../src/source-worker.js';
+import { loadSourceWorkerState, runSourceWorkerOnce, saveSourceWorkerState } from '../src/source-worker.js';
 
 const cleanup: string[] = [];
 afterEach(async () => {
@@ -20,7 +20,11 @@ describe('source worker runtime', () => {
     const deps = {
       now: () => '2026-04-28T00:00:00.000Z',
       getFingerprint: vi.fn(async () => 'fp-1'),
-      getJobStatus: vi.fn(async () => 'finalized'),
+      getJobStatus: vi.fn(async () => ({
+        status: 'finalized',
+        txHash: '0xabc',
+        ual: 'did:dkg:evm:31337/0xabc/1',
+      })),
       processSource: vi.fn(async () => ({
         sourceId: 'src-1',
         skipped: false,
@@ -34,7 +38,143 @@ describe('source worker runtime', () => {
     const second = await runSourceWorkerOnce([{ id: 'src-1', maxRetries: 3 }], statePath, deps);
 
     expect(deps.processSource).toHaveBeenCalledTimes(1);
-    expect(second.sources['src-1']?.lastStatus).toBe('finalized');
+    expect(second.sources['src-1']).toMatchObject({
+      lastStatus: 'finalized',
+      finalDaemonStatus: 'finalized',
+      pendingPublisherJobIds: [],
+      txHash: '0xabc',
+      ual: 'did:dkg:evm:31337/0xabc/1',
+    });
+  });
+
+  it('records failed async jobs without leaving the source queued', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'source-worker-'));
+    cleanup.push(dir);
+    const statePath = join(dir, 'state.json');
+
+    const deps = {
+      now: () => '2026-04-28T00:00:00.000Z',
+      getFingerprint: vi.fn(async () => 'fp-1'),
+      getJobStatus: vi.fn(async () => ({
+        status: 'failed',
+        failureDetails: { status: 'failed', message: 'publisher failed' },
+      })),
+      processSource: vi.fn(async () => ({
+        sourceId: 'src-1',
+        skipped: false,
+        fingerprint: 'fp-1',
+        status: 'queued',
+        jobIds: ['job-1'],
+        jobStatuses: { 'job-1': 'accepted' },
+        nextState: {
+          fingerprint: 'fp-1',
+          lastStatus: 'queued',
+          lastJobIds: ['job-1'],
+          lastJobStatuses: { 'job-1': 'accepted' },
+        },
+      })),
+    };
+
+    await runSourceWorkerOnce([{ id: 'src-1', maxRetries: 3 }], statePath, deps);
+    const second = await runSourceWorkerOnce([{ id: 'src-1', maxRetries: 3 }], statePath, deps);
+
+    expect(deps.processSource).toHaveBeenCalledTimes(1);
+    expect(second.sources['src-1']).toMatchObject({
+      lastStatus: 'failed',
+      finalDaemonStatus: 'failed',
+      pendingPublisherJobIds: [],
+      failureDetails: { status: 'failed', message: 'publisher failed' },
+    });
+  });
+
+  it('does not resurrect terminal legacy jobs from active lastStatus', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'source-worker-'));
+    cleanup.push(dir);
+    const statePath = join(dir, 'state.json');
+
+    await saveSourceWorkerState(statePath, {
+      sources: {
+        'src-1': {
+          fingerprint: 'fp-1',
+          lastJobIds: ['job-1'],
+          lastJobStatuses: { 'job-1': 'finalized' },
+          lastStatus: 'queued',
+        },
+      },
+    });
+
+    const deps = {
+      now: () => '2026-04-28T00:00:00.000Z',
+      getFingerprint: vi.fn(async () => 'fp-1'),
+      getJobStatus: vi.fn(async () => {
+        throw new Error('terminal job should not be polled');
+      }),
+      processSource: vi.fn(async () => {
+        throw new Error('unchanged finalized source should not be processed');
+      }),
+    };
+
+    const state = await runSourceWorkerOnce([{ id: 'src-1', maxRetries: 3 }], statePath, deps);
+
+    expect(deps.getJobStatus).not.toHaveBeenCalled();
+    expect(deps.processSource).not.toHaveBeenCalled();
+    expect(state.sources['src-1']).toMatchObject({
+      lastStatus: 'finalized',
+      finalDaemonStatus: 'finalized',
+      pendingPublisherJobIds: [],
+    });
+  });
+
+  it('does not restore failure details from stale lastError after finalization', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'source-worker-'));
+    cleanup.push(dir);
+    const statePath = join(dir, 'state.json');
+
+    await saveSourceWorkerState(statePath, {
+      sources: {
+        'src-1': {
+          fingerprint: 'fp-1',
+          lastJobIds: ['job-1'],
+          lastJobStatuses: { 'job-1': 'finalized' },
+          lastStatus: 'finalized',
+          finalDaemonStatus: 'finalized',
+          lastError: 'previous publisher failure',
+        },
+      },
+    });
+
+    await expect(loadSourceWorkerState(statePath)).resolves.toMatchObject({
+      sources: {
+        'src-1': {
+          lastStatus: 'finalized',
+          finalDaemonStatus: 'finalized',
+          failureDetails: undefined,
+        },
+      },
+    });
+
+    const deps = {
+      now: () => '2026-04-28T00:00:00.000Z',
+      getFingerprint: vi.fn(async () => 'fp-1'),
+      getJobStatus: vi.fn(async () => {
+        throw new Error('finalized job should not be polled');
+      }),
+      processSource: vi.fn(async () => {
+        throw new Error('unchanged finalized source should not be processed');
+      }),
+    };
+
+    const state = await runSourceWorkerOnce([{ id: 'src-1', maxRetries: 3 }], statePath, deps);
+
+    expect(deps.getJobStatus).not.toHaveBeenCalled();
+    expect(deps.processSource).not.toHaveBeenCalled();
+    expect(state.sources['src-1']).toMatchObject({
+      lastStatus: 'finalized',
+      finalDaemonStatus: 'finalized',
+      pendingPublisherJobIds: [],
+      failureDetails: undefined,
+      lastError: undefined,
+    });
   });
 
   it('reprocesses stable sources only when their content fingerprint changes', async () => {

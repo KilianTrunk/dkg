@@ -105,6 +105,12 @@ export function toEpcisEvent(binding: Record<string, string>): Record<string, un
   const parentID = unwrapLiteral(binding['parentID']);
   if (parentID) event.parentID = parentID;
 
+  const configurationId = unwrapLiteral(binding['configurationId']);
+  if (configurationId) event.configurationId = configurationId;
+
+  const shipmentId = unwrapLiteral(binding['shipmentId']);
+  if (shipmentId) event.shipmentId = shipmentId;
+
   // DKG provenance — namespaced field
   const ual = unwrapLiteral(binding['ual']);
   if (ual) event['dkg:ual'] = ual;
@@ -137,7 +143,12 @@ export function toEpcisEvent(binding: Record<string, string>): Record<string, un
 }
 
 const GS1_EPCIS_CONTEXT = 'https://ref.gs1.org/standards/epcis/2.0.0/epcis-context.jsonld';
-const DKG_CONTEXT = { dkg: 'http://dkg.io/ontology/' };
+const DKG_BASE_IRI = 'http://dkg.io/ontology/';
+const DKG_CONTEXT = {
+  dkg: DKG_BASE_IRI,
+  configurationId: `${DKG_BASE_IRI}epcis/configurationId`,
+  shipmentId: `${DKG_BASE_IRI}epcis/shipmentId`,
+};
 
 export async function handleEventsQuery(
   searchParams: URLSearchParams,

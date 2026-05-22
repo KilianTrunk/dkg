@@ -43,7 +43,12 @@ function makeBindings(overrides: Partial<Record<string, string>> = {}): Record<s
 
 describe('handleEventsQuery', () => {
   it('returns EPCISQueryDocument envelope with reconstructed events', async () => {
-    const { engine, calls } = createTrackingQueryEngine([makeBindings()]);
+    const { engine, calls } = createTrackingQueryEngine([
+      makeBindings({
+        configurationId: 'CFG-001',
+        shipmentId: 'SHIP-001',
+      }),
+    ]);
     const sp = new URLSearchParams('epc=urn:epc:id:sgtin:4012345.011111.1001');
 
     const { body } = await handleEventsQuery(sp, { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH });
@@ -52,7 +57,11 @@ describe('handleEventsQuery', () => {
     expect(body.schemaVersion).toBe('2.0');
     expect(body['@context']).toEqual([
       'https://ref.gs1.org/standards/epcis/2.0.0/epcis-context.jsonld',
-      { dkg: 'http://dkg.io/ontology/' },
+      {
+        dkg: 'http://dkg.io/ontology/',
+        configurationId: 'http://dkg.io/ontology/epcis/configurationId',
+        shipmentId: 'http://dkg.io/ontology/epcis/shipmentId',
+      },
     ]);
 
     const queryResults = body.epcisBody.queryResults;
@@ -63,6 +72,8 @@ describe('handleEventsQuery', () => {
     const event = eventList[0];
     expect(event.type).toBe('ObjectEvent');
     expect(event['dkg:ual']).toBe('did:dkg:mock:31337/42');
+    expect(event.configurationId).toBe('CFG-001');
+    expect(event.shipmentId).toBe('SHIP-001');
     expect(event.epcList).toEqual(['urn:epc:id:sgtin:4012345.011111.1001']);
     expect(event.readPoint).toEqual({ id: 'urn:epc:id:sgln:4012345.00001.0' });
     expect(event.bizLocation).toEqual({ id: 'urn:epc:id:sgln:4012345.00001.0' });
@@ -222,6 +233,22 @@ describe('handleEventsQuery', () => {
     );
 
     expect(calls[0].sparql).toContain('epcis:readPoint <urn:epc:id:sgln:4012345.00001.0>');
+  });
+
+  it('passes extension configurationId and shipmentId filters through to SPARQL', async () => {
+    const { engine, calls } = createTrackingQueryEngine([makeBindings()]);
+
+    await handleEventsQuery(
+      new URLSearchParams('EQ_configurationId=CFG-001&shipmentId=SHIP-001'),
+      { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
+    );
+
+    expect(calls[0].sparql).toContain('?event ?configurationIdPredicate ?configurationId');
+    expect(calls[0].sparql).toContain('FILTER(REPLACE(STR(?configurationIdPredicate), "^.*[/#]", "") = "configurationId")');
+    expect(calls[0].sparql).toContain('FILTER(STR(?configurationId) = "CFG-001")');
+    expect(calls[0].sparql).toContain('?event ?shipmentIdPredicate ?shipmentId');
+    expect(calls[0].sparql).toContain('FILTER(REPLACE(STR(?shipmentIdPredicate), "^.*[/#]", "") = "shipmentId")');
+    expect(calls[0].sparql).toContain('FILTER(STR(?shipmentId) = "SHIP-001")');
   });
 
   it('returns Link header when more pages exist (perPage+1 trick)', async () => {
@@ -457,6 +484,16 @@ describe('toEpcisEvent', () => {
     const binding = makeBindings({ ual: 'did:dkg:hardhat1:31337/0x123/42' });
     const event = toEpcisEvent(binding);
     expect(event['dkg:ual']).toBe('did:dkg:hardhat1:31337/0x123/42');
+  });
+
+  it('includes extension configurationId and shipmentId when bindings are present', () => {
+    const binding = makeBindings({
+      configurationId: '"CFG-001"',
+      shipmentId: '"SHIP-001"',
+    });
+    const event = toEpcisEvent(binding);
+    expect(event.configurationId).toBe('CFG-001');
+    expect(event.shipmentId).toBe('SHIP-001');
   });
 
   it('omits dkg:ual when UAL binding is empty', () => {

@@ -735,6 +735,8 @@ export class ApiClient {
     inputEPC?: string;
     outputEPC?: string;
     anyEPC?: string;
+    configurationId?: string;
+    shipmentId?: string;
     perPage?: number;
     nextPageToken?: string;
   } = {}): Promise<{

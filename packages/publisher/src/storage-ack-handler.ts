@@ -1,10 +1,11 @@
 import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
-import type { EventBus } from '@origintrail-official/dkg-core';
+import type { EventBus, StorageACKDeclineCode } from '@origintrail-official/dkg-core';
 import {
   decodePublishIntent,
   encodeStorageACK,
   computePublishACKDigest,
   assertSafeIri,
+  STORAGE_ACK_DECLINE_CODES,
 } from '@origintrail-official/dkg-core';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot,
@@ -14,6 +15,26 @@ import { parseSimpleNQuads } from './publish-handler.js';
 import { ethers } from 'ethers';
 
 type PeerId = { toString(): string };
+
+const MAX_DECLINE_ENTITY_COUNT = 5;
+const MAX_DECLINE_ENTITY_CHARS = 120;
+
+function compactDeclineText(value: string, maxChars: number): string {
+  const compacted = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (compacted.length <= maxChars) return compacted;
+  return `${compacted.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function summarizeDeclineEntities(entities: readonly string[]): string {
+  if (entities.length === 0) return '(none)';
+  const visible = entities
+    .slice(0, MAX_DECLINE_ENTITY_COUNT)
+    .map((entity) => compactDeclineText(entity, MAX_DECLINE_ENTITY_CHARS));
+  const remaining = entities.length - visible.length;
+  return remaining > 0
+    ? `${visible.join(', ')} (+${remaining} more)`
+    : visible.join(', ');
+}
 
 export interface StorageACKHandlerConfig {
   nodeRole: 'core' | 'edge';
@@ -77,6 +98,38 @@ export class StorageACKHandler {
     this.store = store;
     this.config = config;
     this.eventBus = eventBus;
+  }
+
+  /**
+   * Encode a structured decline response. Used in place of `throw` for
+   * the subset of failures that represent "I as a core legitimately
+   * cannot ACK this request right now" — currently SWM-side cases
+   * that present as "data missing" or "data stale" to the publisher.
+   *
+   * The publisher's collector treats declines as **permanent for this
+   * request** and surfaces the per-peer reason in the final error if
+   * quorum fails. Throwing instead would close the libp2p stream as a
+   * reset, which the publisher only sees as a generic IO error and
+   * retries 3× against the same peer before giving up.
+   *
+   * Old senders never produce these fields and old receivers ignore
+   * them, so adding declines is a strictly additive wire change — see
+   * `packages/core/src/proto/storage-ack.ts` for the schema rationale.
+   */
+  private encodeDecline(
+    cgId: string,
+    code: StorageACKDeclineCode,
+    message: string,
+  ): Uint8Array {
+    return encodeStorageACK({
+      merkleRoot: new Uint8Array(0),
+      coreNodeSignatureR: new Uint8Array(0),
+      coreNodeSignatureVS: new Uint8Array(0),
+      contextGraphId: cgId,
+      nodeIdentityId: 0,
+      declineCode: code,
+      declineMessage: message,
+    });
   }
 
   /**
@@ -175,16 +228,29 @@ export class StorageACKHandler {
         try { await this.store.dropGraph(stagingGraphUri); } catch { /* ignore */ }
       }, 10 * 60 * 1000);
     } else {
-      // Fallback: data should already be in SWM (publishFromSharedMemory path)
+      // Fallback: data should already be in SWM (publishFromSharedMemory path).
+      // Both the "no data" and "data but wrong merkle root" cases below are
+      // reasons this specific core can't ACK this specific request — the
+      // publisher should deselect this peer (no retry against it) and try
+      // another core. Returning a typed decline instead of throwing keeps
+      // the libp2p stream alive so the publisher sees the reason in band
+      // rather than as an opaque stream reset (the #541 failure mode).
       swmQuads = await this.loadSWMQuads(swmGraphUri, intent.rootEntities);
 
       if (swmQuads.length === 0) {
-        throw new Error(`No data found in SWM graph ${swmGraphUri} for entities: ${intent.rootEntities.join(', ')}`);
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+          `No data found in SWM graph ${swmGraphUri} for entities: ` +
+          summarizeDeclineEntities(intent.rootEntities ?? []),
+        );
       }
 
       const recomputedRoot = computeFlatKCRoot(swmQuads, []);
       if (!bytesEqual(recomputedRoot, merkleRoot)) {
-        throw new Error(
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
           `Merkle root mismatch: publisher=${ethers.hexlify(merkleRoot).slice(0, 18)}..., ` +
           `local=${ethers.hexlify(recomputedRoot).slice(0, 18)}... ` +
           `(${swmQuads.length} triples in SWM)`,
@@ -210,8 +276,15 @@ export class StorageACKHandler {
     // `KnowledgeAssetsV10.sol:379`, so signing an ACK against CG 0 (or a
     // negative id from `BigInt("-1")`, which would die later in the
     // evm-adapter's uint256 encoder) would just produce a signature the
-    // contract rejects downstream. Refuse the PublishIntent here with a
-    // clear error so the publisher sees the failure on the P2P stream.
+    // contract rejects downstream.
+    //
+    // Throw rather than decline: this is a malformed PublishIntent (the
+    // publisher built a request the contract will never accept), not
+    // peer-local state. A typed decline would make the publisher fan
+    // out to every other core looking for a different answer and
+    // report `storage_ack_insufficient` after the full retry budget,
+    // masking the real caller error. The stream reset surfaces the
+    // original message to the caller immediately.
     let contextGraphIdBigInt: bigint;
     try {
       contextGraphIdBigInt = BigInt(cgId);
@@ -277,7 +350,15 @@ export class StorageACKHandler {
         } catch {
           // Keep the signing refusal deterministic even if protocol cleanup fails.
         }
-        throw new Error('StorageACK signer is not confirmed on-chain as an operational wallet');
+        // Decline rather than throw: the operator can rotate / re-register
+        // a key without restarting publishers, and the publisher should
+        // deselect this core for THIS request and move on rather than
+        // retry-and-time-out against a known-rejecting signer.
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          'StorageACK signer is not confirmed on-chain as an operational wallet',
+        );
       }
     }
 

@@ -3,6 +3,8 @@ import {
   encodePublishIntent,
   decodeStorageACK,
   computePublishACKDigest,
+  isStorageACKDecline,
+  isTransientStorageACKDeclineCode,
   type PublishIntentMsg,
   type StorageACKMsg,
 } from '@origintrail-official/dkg-core';
@@ -32,6 +34,14 @@ export interface ACKCollectionResult {
 const DEFAULT_REQUIRED_ACKS = 3;
 const ACK_TIMEOUT_MS = 120_000;
 const MAX_RETRIES = 3;
+const MAX_DECLINE_CODE_CHARS = 64;
+const MAX_DECLINE_MESSAGE_CHARS = 240;
+
+function sanitizeDeclineField(value: string, maxChars: number): string {
+  const compacted = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (compacted.length <= maxChars) return compacted;
+  return `${compacted.slice(0, Math.max(0, maxChars - 3))}...`;
+}
 
 /**
  * ACKCollector implements V10 spec §9.0 Phase 3: collecting 3 core node
@@ -148,12 +158,72 @@ export class ACKCollector {
     const collected: CollectedACK[] = [];
     const seenPeers = new Set<string>();
     const seenIdentityIds = new Set<bigint>();
+    // Per-peer typed declines from core nodes that ran the StorageACK
+    // handler against the request and decided they cannot sign. The
+    // publisher records the reason, skips retries against the declining
+    // peer, and surfaces all collected reasons in the final
+    // `storage_ack_insufficient` message when quorum can't be reached.
+    // Cores that pre-date the typed wire shape continue to throw / reset
+    // and follow the legacy retry path below — declines are strictly
+    // additive on the wire.
+    const declines = new Map<string, { code: string; message: string }>();
+
+    const formatDeclineDetail = (): string => {
+      if (declines.size === 0) return '';
+      const formatted = [...declines.entries()]
+        .map(([peer, { code, message }]) => {
+          const tag = `${peer.slice(-8)}→${code}`;
+          return message ? `${tag} (${message})` : tag;
+        })
+        .join('; ');
+      return ` Declines: ${formatted}.`;
+    };
 
     const requestACK = async (peerId: string): Promise<CollectedACK | null> => {
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
           const response = await this.deps.sendP2P(peerId, PROTOCOL_STORAGE_ACK, intentBytes);
           const ack: StorageACKMsg = decodeStorageACK(response);
+
+          if (isStorageACKDecline(ack)) {
+            const code = sanitizeDeclineField(
+              ack.declineCode ?? 'UNKNOWN',
+              MAX_DECLINE_CODE_CHARS,
+            ) || 'UNKNOWN';
+            const declineMessage = sanitizeDeclineField(
+              ack.declineMessage ?? '',
+              MAX_DECLINE_MESSAGE_CHARS,
+            );
+            // Record the latest decline reason so it surfaces in the
+            // final `storage_ack_insufficient` error. Overwriting any
+            // prior entry is intentional — operators care most about
+            // why the peer ultimately could not ACK.
+            declines.set(peerId, { code, message: declineMessage });
+
+            // Transient declines (SWM replication catching up via
+            // gossip) can resolve on a retry, so re-send through the
+            // same backoff as transport errors instead of permanently
+            // deselecting the peer. Codex review on PR #559 flagged
+            // the "every decline is permanent" path as a regression:
+            // a core that would have ACKed seconds later was being
+            // removed from the quorum pool the moment its SWM trailed
+            // the publish by even one gossip cycle.
+            if (isTransientStorageACKDeclineCode(code) && attempt < MAX_RETRIES - 1) {
+              log(
+                `[ACKCollector] Transient decline from ${peerId.slice(-8)}: ${code}` +
+                (declineMessage ? ` — ${declineMessage}` : '') +
+                ` (retry ${attempt + 1}/${MAX_RETRIES})`,
+              );
+              await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
+              continue;
+            }
+
+            log(
+              `[ACKCollector] Decline from ${peerId.slice(-8)}: ${code}` +
+              (declineMessage ? ` — ${declineMessage}` : ''),
+            );
+            return null;
+          }
 
           const recoveredAddress = this.recoverACKSigner(ack, ackDigest);
           if (!recoveredAddress) {
@@ -178,6 +248,12 @@ export class ACKCollector {
             }
           }
 
+          // Clear any prior transient-decline record now that this peer
+          // has produced a valid ACK on a later retry — otherwise the
+          // stale decline would still appear in `storage_ack_insufficient`
+          // if quorum fails for unrelated reasons.
+          declines.delete(peerId);
+
           log(`[ACKCollector] Valid ACK from ${peerId.slice(-8)} (identity=${identityId}, signer=${recoveredAddress.slice(0, 10)}...)`);
 
           return {
@@ -192,6 +268,20 @@ export class ACKCollector {
             log(`[ACKCollector] Retry ${attempt + 1}/${MAX_RETRIES} for ${peerId.slice(-8)}: ${msg}`);
             await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
           } else {
+            // Terminal transport failure on the final attempt. If this
+            // peer transient-declined on an earlier attempt the
+            // `declines` map still holds that stale code — overwrite
+            // it with the actual terminal reason so the aggregated
+            // `storage_ack_insufficient` diagnostic reflects the last
+            // observed outcome (the codex review on PR #559 caught
+            // the original "stale decline shadows the real failure"
+            // path here).
+            if (declines.has(peerId)) {
+              declines.set(peerId, {
+                code: 'TRANSPORT_ERROR',
+                message: sanitizeDeclineField(msg, MAX_DECLINE_MESSAGE_CHARS),
+              });
+            }
             log(`[ACKCollector] Failed to get ACK from ${peerId.slice(-8)} after ${MAX_RETRIES} attempts: ${msg}`);
           }
         }
@@ -202,25 +292,56 @@ export class ACKCollector {
     let quorumResolve: (() => void) | undefined;
     const quorumPromise = new Promise<void>(resolve => { quorumResolve = resolve; });
 
+    // Fast-fail on impossible quorum (Codex Review on PR#559): once
+    // declines + max-retries-failures bring the still-pending pool too
+    // low to ever reach `REQUIRED_ACKS`, surface the
+    // `storage_ack_insufficient` error immediately rather than waiting
+    // out the full ACK_TIMEOUT_MS for a hung peer that — by that point
+    // — couldn't change the outcome anyway. The check is conservative
+    // (counts a still-pending peer as a potential ACK), so we never
+    // fail-fast a quorum that's still attainable.
+    let peersSettled = 0;
+    let impossibleReject: ((reason: Error) => void) | undefined;
+    const impossiblePromise = new Promise<never>((_, reject) => { impossibleReject = reject; });
+
+    const settlePeer = () => {
+      peersSettled += 1;
+      if (collected.length >= REQUIRED_ACKS) return;
+      const stillPending = corePeers.length - peersSettled;
+      if (collected.length + stillPending < REQUIRED_ACKS) {
+        impossibleReject?.(new Error(
+          `storage_ack_insufficient: got ${collected.length}/${REQUIRED_ACKS} valid ACKs after ` +
+          `${peersSettled}/${corePeers.length} core peer(s) settled — quorum no longer reachable.${formatDeclineDetail()}`,
+        ));
+      }
+    };
+
     await Promise.race([
       (async () => {
         const promises = corePeers.map(async (peerId) => {
-          if (collected.length >= REQUIRED_ACKS) return;
-          const ack = await requestACK(peerId);
-          if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
-            seenPeers.add(ack.peerId);
-            seenIdentityIds.add(ack.nodeIdentityId);
-            collected.push(ack);
-            if (collected.length >= REQUIRED_ACKS) {
-              quorumResolve?.();
-              return;
+          if (collected.length >= REQUIRED_ACKS) {
+            settlePeer();
+            return;
+          }
+          try {
+            const ack = await requestACK(peerId);
+            if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
+              seenPeers.add(ack.peerId);
+              seenIdentityIds.add(ack.nodeIdentityId);
+              collected.push(ack);
+              if (collected.length >= REQUIRED_ACKS) {
+                quorumResolve?.();
+              }
             }
+          } finally {
+            settlePeer();
           }
         });
         await Promise.race([Promise.allSettled(promises), quorumPromise]);
       })(),
+      impossiblePromise,
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms`)),
+        setTimeout(() => reject(new Error(`storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms.${formatDeclineDetail()}`)),
           ACK_TIMEOUT_MS,
         ),
       ),
@@ -229,7 +350,7 @@ export class ACKCollector {
     if (collected.length < REQUIRED_ACKS) {
       throw new Error(
         `storage_ack_insufficient: got ${collected.length}/${REQUIRED_ACKS} valid ACKs. ` +
-        `Tried ${corePeers.length} core peers.`,
+        `Tried ${corePeers.length} core peers.${formatDeclineDetail()}`,
       );
     }
 

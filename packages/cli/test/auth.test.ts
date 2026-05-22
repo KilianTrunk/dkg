@@ -154,6 +154,77 @@ describe('httpAuthGuard', () => {
     expect(res.status).toBe(200);
   });
 
+  it('allows /ui exact without token (static UI root)', async () => {
+    const res = await fetch(`${baseUrl}/ui`);
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects /ui-custom — sibling paths must not bypass auth via the /ui prefix', async () => {
+    // `/ui` prefix without trailing slash matched `/ui-custom`, `/ui_admin`, ... — route plugins at sibling paths bypassed auth.
+    const res = await fetch(`${baseUrl}/ui-custom/anything`, { method: 'GET' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects /ui_admin — auth must not be bypassed by a non-/ui-prefix path', async () => {
+    const res = await fetch(`${baseUrl}/ui_admin`, { method: 'GET' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects /uistuff — auth must not be bypassed by a concatenated /ui path', async () => {
+    const res = await fetch(`${baseUrl}/uistuff`, { method: 'GET' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects POST /api/status — public allowlist must be method-aware (GET only)', async () => {
+    // Public allowlist is read-only — non-GET on these paths must still go through auth, else plugins bypass via POST/PUT/DELETE.
+    const res = await fetch(`${baseUrl}/api/status`, { method: 'POST' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects PUT /.well-known/skill.md — non-GET on public path requires auth', async () => {
+    const res = await fetch(`${baseUrl}/.well-known/skill.md`, { method: 'PUT', body: '' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects DELETE /api/chain/rpc-health — non-GET on public path requires auth', async () => {
+    const res = await fetch(`${baseUrl}/api/chain/rpc-health`, { method: 'DELETE' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects POST /ui — non-GET on public exact path requires auth', async () => {
+    const res = await fetch(`${baseUrl}/ui`, { method: 'POST' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects POST /ui/index.html — non-GET on public prefix path requires auth', async () => {
+    const res = await fetch(`${baseUrl}/ui/index.html`, { method: 'POST' });
+    expect(res.status).toBe(401);
+  });
+
+  it('allows HEAD /api/status without auth — built-in claims HEAD so liveness probes succeed', async () => {
+    // status.ts now claims HEAD on the three public-allowlisted paths, so HEAD never reaches plugins;
+    // the public-HEAD allowlist exists for this case (k8s/load-balancer health probes).
+    const res = await fetch(`${baseUrl}/api/status`, { method: 'HEAD' });
+    expect(res.status).toBe(200);
+  });
+
+  it('allows HEAD /.well-known/skill.md without auth — same liveness contract', async () => {
+    const res = await fetch(`${baseUrl}/.well-known/skill.md`, { method: 'HEAD' });
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects HEAD /ui — HEAD allowlist excludes paths without a built-in HEAD handler', async () => {
+    // `/ui` is GET-public but has no built-in HEAD claim, so HEAD on /ui must go through auth to
+    // prevent a fork plugin matching `HEAD /ui` from running unauthenticated (round-7 vulnerability).
+    const res = await fetch(`${baseUrl}/ui`, { method: 'HEAD' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects HEAD /ui/something — HEAD allowlist excludes the /ui/* prefix', async () => {
+    const res = await fetch(`${baseUrl}/ui/something`, { method: 'HEAD' });
+    expect(res.status).toBe(401);
+  });
+
   it('rejects protected endpoint without token', async () => {
     const res = await fetch(`${baseUrl}/api/shared-memory/publish`, { method: 'POST' });
     expect(res.status).toBe(401);

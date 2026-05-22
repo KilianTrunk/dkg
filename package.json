@@ -49,6 +49,7 @@
     "test:all": "pnpm test && pnpm test:evm"
   },
   "devDependencies": {
+    "@origintrail-official/dkg": "workspace:*",
     "@types/node": "^22",
     "@vitest/coverage-v8": "^4.0.18",
     "esbench": "^0.8.1",

@@ -78,6 +78,51 @@ describe('inject-inbox.mjs renderNotice — SECURITY', () => {
   });
 });
 
+describe('inject-inbox.mjs extractPrompt — HOOK COMPOSITION', () => {
+  // Codex PR #589 round 3 finding: if Cursor passes an upstream
+  // beforeSubmitPrompt hook's `updated_input` to downstream hooks
+  // (composition semantics aren't documented), the old extractor
+  // ignored it and went back to the original `prompt` field —
+  // silently overwriting any prepended block (e.g. the
+  // <dkg-session-context> emitted by inject-session-context.mjs).
+  // These tests pin the new defensive behaviour.
+
+  it('prefers payload.updated_input over the original prompt field when both are present', () => {
+    const upstreamBlock =
+      '<dkg-session-context>\n' +
+      '  <session-id>abc-123</session-id>\n' +
+      '  <next-turn-index>5</next-turn-index>\n' +
+      '  <turn-uri>urn:dkg:chat:session:abc-123#turn:5</turn-uri>\n' +
+      '  <agent-uri>urn:dkg:agent:0xdef</agent-uri>\n' +
+      '</dkg-session-context>\n\n' +
+      'what is the meaning of life?';
+    const composed = extractPrompt({
+      prompt: 'what is the meaning of life?',
+      updated_input: upstreamBlock,
+      conversation_id: 'abc-123',
+    });
+    expect(composed).toBe(upstreamBlock);
+    expect(composed).toContain('<dkg-session-context>');
+    expect(composed).toContain('what is the meaning of life?');
+  });
+
+  it('falls back to the original prompt when updated_input is absent', () => {
+    expect(extractPrompt({ prompt: 'plain prompt' })).toBe('plain prompt');
+  });
+
+  it('ignores updated_input when empty or whitespace-only', () => {
+    expect(extractPrompt({ prompt: 'p', updated_input: '' })).toBe('p');
+    expect(extractPrompt({ prompt: 'p', updated_input: '   \n  ' })).toBe('p');
+  });
+
+  it('ignores updated_input when it is not a string', () => {
+    // Hardening: if a future Cursor schema makes updated_input an
+    // object (matching preToolUse's shape), don't treat it as a
+    // string prompt.
+    expect(extractPrompt({ prompt: 'p', updated_input: { command: 'x' } as any })).toBe('p');
+  });
+});
+
 describe('inject-inbox.mjs daemonIdentityHash — STATE KEYING', () => {
   it('is deterministic for identical inputs', () => {
     const cfg = { api: 'http://localhost:9200', source: '/some/.dkg/config.yaml' };

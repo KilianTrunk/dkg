@@ -161,7 +161,7 @@ export function ProjectHeaderStrip({
         className="v10-project-strip-name"
         onClick={activeSubGraph ? onClearSubGraph : undefined}
         disabled={!activeSubGraph}
-        title={activeSubGraph ? 'Back to project overview' : cg.id}
+        title={activeSubGraph ? 'Back to context graph overview' : cg.id}
       >
         {name}
       </button>
@@ -1165,7 +1165,7 @@ const USER_QUERY_CATALOG_DESCRIPTION = 'Queries saved from the Query tab.';
 const PROFILE_NS = 'http://dkg.io/ontology/profile/';
 const SCHEMA_NS = 'http://schema.org/';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
-const XSD_INT = 'http://www.w3.org/2001/XMLSchema#int';
+const XSD_INTEGER = 'http://www.w3.org/2001/XMLSchema#integer';
 type SavedCatalogQuery = QueryCatalog['queries'][number];
 
 function sparqlString(value: string): string {
@@ -1273,7 +1273,7 @@ function literal(value: string): string {
 }
 
 function intLiteral(value: number): string {
-  return `"${value}"^^<${XSD_INT}>`;
+  return `"${value}"^^<${XSD_INTEGER}>`;
 }
 
 function buildSavedQueryWrite(contextGraphId: string, name: string, description: string, sparql: string): {

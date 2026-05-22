@@ -39,6 +39,8 @@
  *                           NOT shipped in the published tarball; kept for
  *                           legacy templates and `tsx`-based dev flows)
  *   {{captureScriptPath}}   absolute path to @origintrail-official/dkg-mcp/hooks/capture-chat.mjs
+ *   {{injectSessionContextScriptPath}}
+ *                           absolute path to @origintrail-official/dkg-mcp/hooks/inject-session-context.mjs
  *   {{network}}             testnet / mainnet / devnet
  */
 
@@ -80,9 +82,24 @@ export const CURSOR_HOOKS_TEMPLATE = JSON.stringify(
       ],
       beforeSubmitPrompt: [
         {
+          // capture-chat MUST run first — it stashes the operator's ORIGINAL prompt
+          // for later afterAgentResponse capture and persists session state
+          // (turnIndex), which inject-session-context reads on the next line.
           command:
             'DKG_WORKSPACE={{sh:workspaceAbsPath}} DKG_API={{sh:daemonApiUrl}} DKG_AGENT_URI={{sh:agentUri}} ' +
             'node {{sh:captureScriptPath}} beforeSubmitPrompt',
+          failClosed: false,
+        },
+        {
+          // inject-session-context prepends <dkg-session-context> to the prompt
+          // with sessionId + nextTurnIndex + predicted turn URI so the agent
+          // can author annotations carrying graph edges back to the chat:Turn
+          // capture-chat writes after the response. Restores the V9 forSession
+          // linkage that the V10 MCP consolidation (#381) + R3 capture-chat
+          // reduction (0e7abdf9) retired.
+          command:
+            'DKG_WORKSPACE={{sh:workspaceAbsPath}} DKG_AGENT_URI={{sh:agentUri}} ' +
+            'node {{sh:injectSessionContextScriptPath}}',
           failClosed: false,
         },
       ],
@@ -125,10 +142,21 @@ export const CLAUDE_HOOKS_TEMPLATE = JSON.stringify(
         {
           hooks: [
             {
+              // capture-chat MUST run first — see the matching Cursor hook
+              // for the rationale (stash prompt + persist turnIndex).
               type: 'command',
               command:
                 'DKG_WORKSPACE={{sh:workspaceAbsPath}} DKG_CAPTURE_TOOL=claude-code DKG_API={{sh:daemonApiUrl}} ' +
                 'DKG_AGENT_URI={{sh:agentUri}} node {{sh:captureScriptPath}} UserPromptSubmit',
+            },
+            {
+              // inject-session-context — see the matching Cursor hook for
+              // the rationale (restores the V9 forSession linkage that the
+              // V10 MCP consolidation retired).
+              type: 'command',
+              command:
+                'DKG_WORKSPACE={{sh:workspaceAbsPath}} DKG_CAPTURE_TOOL=claude-code ' +
+                'DKG_AGENT_URI={{sh:agentUri}} node {{sh:injectSessionContextScriptPath}}',
             },
           ],
         },

@@ -138,6 +138,7 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 | `dkg_query` | `POST /api/query` | Read-only SPARQL across assertions in a CG. Pass `view` (`working-memory` / `shared-working-memory` / `verified-memory`) to pick the layer — when `view` is set, `context_graph_id` is required; for WM reads, optional `agent_address` targets another agent's WM (defaults to this node). Omit `view` for a legacy cross-graph data-path query. |
 | `dkg_query_catalog_list` | `POST /api/profile/query-catalog/read` | List saved SPARQL queries declared in the project profile query catalog |
 | `dkg_query_catalog_run` | `POST /api/profile/query-catalog/read` + `POST /api/query` | Run a saved catalog query by slug or exact display name |
+| `dkg_query_catalog_save` | `POST /api/profile/query-catalog/write` | Save a read-only SPARQL query into the project profile query catalog |
 | `dkg_find_agents` | `GET /api/agents` | Discover other agents (best-effort P2P) |
 | `dkg_send_message` | `POST /api/chat` | Send a direct message (best-effort P2P) |
 | `dkg_read_messages` | `GET /api/messages` | Read inbound messages |
@@ -150,7 +151,7 @@ P2P tools fail gracefully when the peer is offline. `dkg_publish` (fresh quads +
 - **Participant self-service join/sign flow** — see §6.
 - **Conditional writes** (`POST /api/shared-memory/conditional-write`) — see §5 SWM.
 - **Async publisher job queue** (`/api/publisher/*`) — see §8.
-- **Query catalog writes** (`POST /api/profile/query-catalog/write`) — see §5 "Saved Query Catalog".
+- **Raw query catalog writes** (`POST /api/profile/query-catalog/write`) when not using `dkg_query_catalog_save` — see §5 "Saved Query Catalog".
 - **Raw file retrieval** (`GET /api/file/{fileHash}`) — see §7.
 - **Endorse / verify / update** (`POST /api/endorse`, `/verify`, `/update`) — see §5 VM.
 - **SSE event stream** (`GET /api/events`) — see §8.
@@ -274,10 +275,15 @@ Use this decision order:
    `dkg_query_catalog_run` with the selected `context_graph_id` and the saved
    query slug or exact display name. If the name is ambiguous, list first and
    ask/choose by slug.
-7. If no query catalog tool is available, use `dkg_query` against the profile
+7. If the user asks to save the current/query/SPARQL, call
+   `dkg_query_catalog_save` with the selected `context_graph_id`, a concise
+   `name`, optional `description`, and the exact read-only SPARQL text. If the
+   SPARQL text is not present in the user message or turn context, ask for it;
+   do not invent a query and save it as if it came from the user.
+8. If no query catalog tool is available, use `dkg_query` against the profile
    graph (`did:dkg:context-graph:<id>/meta/query-catalog`) to read saved
    queries, then run the selected `prof:sparqlQuery` with `dkg_query`.
-8. Only write or change query catalog entries when the user explicitly asks to
+9. Only write or change query catalog entries when the user explicitly asks to
    save/update catalog queries.
 
 OpenClaw tool path:
@@ -285,6 +291,10 @@ OpenClaw tool path:
 - `dkg_query_catalog_list` input: `{ "context_graph_id": "<contextGraphId>" }`
 - `dkg_query_catalog_run` input:
   `{ "context_graph_id": "<contextGraphId>", "query": "<slug-or-exact-name>" }`
+- `dkg_query_catalog_save` input:
+  `{ "context_graph_id": "<contextGraphId>", "name": "<display-name>", "sparql": "<read-only-sparql>", "description"?: "...", "result_column"?: "uri" }`
+  Optional advanced fields: `sub_graph` (defaults to `__context_graph`),
+  `catalog_slug`, `catalog_name`, and `catalog_description`.
 
 CLI fallback:
 
@@ -303,8 +313,9 @@ HTTP fallback:
   Body: `{ "contextGraphId": "<contextGraphId>", "quads": [...] }`
   The daemon stores these triples in
   `did:dkg:context-graph:<contextGraphId>/meta/query-catalog` regardless of
-  the incoming quad `graph` field. This route appends profile triples; prefer
-  a new saved-query URI for new saved queries and avoid overwriting unrelated
+  the incoming quad `graph` field. Prefer `dkg_query_catalog_save` for normal
+  user-requested saves. Raw writes append profile triples; prefer a new
+  saved-query URI for new saved queries and avoid overwriting unrelated
   catalog/profile metadata.
 
 Profile RDF shape for writes:

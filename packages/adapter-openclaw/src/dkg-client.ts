@@ -342,6 +342,19 @@ export class DkgDaemonClient {
     return this.post('/api/profile/query-catalog/read', { contextGraphId });
   }
 
+  /**
+   * Append profile query catalog triples for a context graph.
+   *
+   * The daemon ignores caller-supplied graph names and writes into the
+   * context graph's local `meta/query-catalog` profile graph.
+   */
+  async writeQueryCatalog(
+    contextGraphId: string,
+    quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
+  ): Promise<Record<string, unknown>> {
+    return this.post('/api/profile/query-catalog/write', { contextGraphId, quads });
+  }
+
   // ---------------------------------------------------------------------------
   // Shared memory write (SWM layer — NOT used by v1 chat-turn / memory paths)
   // ---------------------------------------------------------------------------

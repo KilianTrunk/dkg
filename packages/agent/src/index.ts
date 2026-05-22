@@ -132,3 +132,4 @@ export {
 } from './swm/ack-quorum.js';
 export * from './source-worker.js';
 export * from './source-registry.js';
+export * from './generic-sql-source.js';

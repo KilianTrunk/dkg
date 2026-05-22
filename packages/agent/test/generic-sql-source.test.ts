@@ -78,6 +78,38 @@ describe('generic SQL source handler', () => {
     }))).rejects.toThrow('dataset orders is missing required columns: quantity');
   });
 
+  it('renders mapping templates without regular expression replacement', async () => {
+    registerGenericSqlConnector(TEST_DIALECT, async (): Promise<GenericSqlClient> => ({
+      async query(_sql, _parameters, dataset) {
+        return rowsByDataset()[dataset] ?? [];
+      },
+    }));
+
+    const result = await genericSqlSourceHandler.prepare(memorySource({
+      ...mapping,
+      entities: [
+        {
+          name: 'order',
+          from: 'orders',
+          id: 'urn:neutral:order:{order_id}',
+          properties: {
+            'https://example.test/composite': 'order-{order_id}-{status}',
+            'https://example.test/emptyBraces': 'literal-{}',
+            'https://example.test/unclosedBrace': 'literal-{status',
+          },
+        },
+      ],
+      relations: [],
+    }));
+
+    const quads = result.assets.flatMap((asset) => asset.quads);
+    expect(quads).toEqual(expect.arrayContaining([
+      quad('urn:neutral:order:A100', 'https://example.test/composite', '"order-A100-ready"'),
+      quad('urn:neutral:order:A100', 'https://example.test/emptyBraces', '"literal-{}"'),
+      quad('urn:neutral:order:A100', 'https://example.test/unclosedBrace', '"literal-{status"'),
+    ]));
+  });
+
   it('selects only asset groups for changed partitions', async () => {
     let rows = rowsByDataset();
     registerGenericSqlConnector(TEST_DIALECT, async (): Promise<GenericSqlClient> => ({

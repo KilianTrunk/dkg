@@ -752,12 +752,43 @@ function parseQualifiedField(value: string): { dataset?: string; field: string }
 }
 
 function renderTemplate(template: string, row: GenericSqlRow): string {
-  return template.replace(/\{([^}]+)\}/g, (_, field: string) => stringifyRawValue(row[field]));
+  const rendered: string[] = [];
+  let cursor = 0;
+  while (cursor < template.length) {
+    const open = template.indexOf('{', cursor);
+    if (open === -1) {
+      rendered.push(template.slice(cursor));
+      break;
+    }
+    const close = template.indexOf('}', open + 1);
+    if (close === -1) {
+      rendered.push(template.slice(cursor));
+      break;
+    }
+
+    rendered.push(template.slice(cursor, open));
+    const field = template.slice(open + 1, close);
+    rendered.push(field ? stringifyRawValue(row[field]) : template.slice(open, close + 1));
+    cursor = close + 1;
+  }
+  return rendered.join('');
 }
 
 function resolveTemplateArgument(value: string, row: GenericSqlRow): unknown {
-  const exact = /^\{([^}]+)\}$/.exec(value);
-  return exact ? row[exact[1]!] : renderTemplate(value, row);
+  const exact = exactTemplateField(value);
+  return exact ? row[exact] : renderTemplate(value, row);
+}
+
+function exactTemplateField(value: string): string | null {
+  if (!value.startsWith('{') || !value.endsWith('}') || value.length <= 2) {
+    return null;
+  }
+  const close = value.indexOf('}', 1);
+  if (close !== value.length - 1) {
+    return null;
+  }
+  const field = value.slice(1, -1);
+  return field || null;
 }
 
 function stringifyRawValue(value: unknown): string {

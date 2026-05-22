@@ -124,16 +124,8 @@ describe('loadRoutePlugins', () => {
   });
 
   it('loads an ESM-only package referenced by bare name (exports.import only)', async () => {
-    // Regression for codex PR review #593: the loader must support packages
-    // whose package.json `exports` block declares only an `import` condition
-    // (no `require`, no `default`). `require.resolve` throws
-    // `ERR_PACKAGE_PATH_NOT_EXPORTED` for such packages because no CJS
-    // condition matches; a direct `await import(spec)` honours the `import`
-    // condition and succeeds.
-    //
-    // We install a tiny ESM-only fixture into the CLI package's node_modules
-    // so that bare-name resolution from the loader's `import.meta.url` (a file
-    // under `packages/cli/src/daemon/`) can find it via standard Node lookup.
+    // Packages with `exports: { import: ... }` only: `require.resolve` would throw `ERR_PACKAGE_PATH_NOT_EXPORTED`;
+    // `await import(spec)` honours the `import` condition. Fixture installed under cli/node_modules for bare-name lookup.
     const pkgName = `@dkg-test/esm-only-fixture-${process.pid}-${Date.now()}`;
     const cliNodeModules = resolve(__dirname, '../../node_modules');
     const installDir = join(cliNodeModules, ...pkgName.split('/'));
@@ -164,16 +156,7 @@ describe('loadRoutePlugins', () => {
   });
 
   it('loads a CJS-only package referenced by bare name (exports.require only)', async () => {
-    // Regression for codex PR review #593: the dual `import()` fix introduced
-    // for ESM-only packages must not regress the inverse case — a package
-    // whose `exports` map declares only a `require` condition (no `import`,
-    // no `default`). Dynamic `import(spec)` runs in import-context and
-    // refuses to match those, so the loader needs a CJS-resolve fallback
-    // before declaring the spec dead.
-    //
-    // Fixture: a tiny CJS-only package installed into the CLI's
-    // node_modules so bare-name resolution from the loader's
-    // `import.meta.url` finds it via standard Node lookup.
+    // Inverse case: `exports: { require: ... }` only. ESM import refuses; loader must fall back to CJS resolve.
     const pkgName = `@dkg-test/cjs-only-fixture-${process.pid}-${Date.now()}`;
     const cliNodeModules = resolve(__dirname, '../../node_modules');
     const installDir = join(cliNodeModules, ...pkgName.split('/'));
@@ -204,11 +187,7 @@ describe('loadRoutePlugins', () => {
   });
 
   it('returns [] and warns once when routePlugins is a non-array string value', async () => {
-    // Regression for codex PR review #593: `config.routePlugins` is untyped
-    // operator input (JSON edited by humans). A common typo is to forget the
-    // brackets and write a single string. The loader must reject the wrong
-    // shape with one warning instead of iterating string characters as
-    // individual plugin specs.
+    // Typo case: operator writes a bare string instead of an array. Reject with one warn, don't iterate characters.
     const { log, warn } = makeLogger();
     const plugins = await loadRoutePlugins(
       // Intentionally wrong shape — bypass the typed signature in the test.
@@ -269,13 +248,7 @@ describe('loadRoutePlugins', () => {
   });
 
   it('rejects a relative-path spec (./foo) instead of resolving it from the loader source dir', async () => {
-    // Regression for codex PR review #593 (round 8): the README promises
-    // that relative paths in routePlugins config "are not resolved against
-    // ~/.dkg and will fail to load". But Node's dynamic import resolves
-    // ./foo relative to the IMPORTING module (the loader source file),
-    // not relative to ~/.dkg/. That could silently load an unrelated
-    // daemon module that happens to live next to the loader. The loader
-    // must reject relative specs explicitly with a clear log.
+    // Node would resolve ./foo against the loader source, not ~/.dkg — risks silent import of daemon internals. Reject explicitly.
     const { log, warn } = makeLogger();
     const plugins = await loadRoutePlugins(['./not-a-real-plugin.js'], log);
     expect(plugins).toEqual([]);
@@ -286,10 +259,7 @@ describe('loadRoutePlugins', () => {
   });
 
   it('rejects a parent-relative path spec (../foo)', async () => {
-    // `../config.js` actually resolves to `packages/cli/dist/config.js` —
-    // a real daemon module that just happens to live up one directory from
-    // the loader. Without an explicit rejection, the loader would import
-    // an internal daemon module as a plugin candidate.
+    // `../config.js` resolves to the real daemon config module up one dir from the loader — must be rejected.
     const { log, warn } = makeLogger();
     const plugins = await loadRoutePlugins(['../config.js'], log);
     expect(plugins).toEqual([]);
@@ -310,15 +280,8 @@ describe('loadRoutePlugins', () => {
   });
 
   it('does not silently fall back to CJS when the ESM entry has a syntax error', async () => {
-    // Regression for codex PR review #593 round 12: a dual-published
-    // package whose `exports.import` points at a broken ESM file (e.g.
-    // a syntax error escaped a build) used to silently load via the
-    // CJS `exports.require` path, hiding the broken publish from the
-    // plugin author. The fallback must fire only on
-    // "no ESM condition matched" failures
-    // (`ERR_PACKAGE_PATH_NOT_EXPORTED` + the Vite-resolver equivalents);
-    // real evaluation errors in the ESM must bubble up so operators see
-    // them.
+    // Dual-publish with a broken ESM `import` entry: must surface the SyntaxError,
+    // not silently load the CJS twin and hide the broken publish.
     const pkgName = `@dkg-test/broken-esm-fixture-${process.pid}-${Date.now()}`;
     const cliNodeModules = resolve(__dirname, '../../node_modules');
     const installDir = join(cliNodeModules, ...pkgName.split('/'));
@@ -356,17 +319,8 @@ describe('loadRoutePlugins', () => {
   });
 
   it('does not silently fall back to CJS when the ESM entry is missing an internal import', async () => {
-    // Regression for codex PR review #593 round 13: Node throws
-    // `ERR_MODULE_NOT_FOUND` for two distinct situations:
-    // (a) the configured plugin spec does not resolve to any package
-    //     ("@scope/pkg" is not installed);
-    // (b) the ESM entry resolves and starts loading, but one of its
-    //     own internal imports — a relative file, a transitive package
-    //     — cannot be found.
-    // Falling back to CJS on (b) silently rescues a broken ESM build by
-    // running the CJS twin instead, leaving the plugin author unaware
-    // their ESM is missing a dependency. The loader must surface (b)
-    // unchanged so it shows up in `route-plugin-load-failed`.
+    // `ERR_MODULE_NOT_FOUND` is ambiguous: (a) plugin spec not installed, (b) ESM's own transitive import missing.
+    // Case (b) must surface as `route-plugin-load-failed`, not get silently rescued by the CJS twin.
     const pkgName = `@dkg-test/missing-import-fixture-${process.pid}-${Date.now()}`;
     const cliNodeModules = resolve(__dirname, '../../node_modules');
     const installDir = join(cliNodeModules, ...pkgName.split('/'));
@@ -399,9 +353,7 @@ describe('loadRoutePlugins', () => {
       expect(warn).toHaveBeenCalledTimes(1);
       const msg = String(warn.mock.calls[0][1]);
       expect(msg).toContain('route-plugin-load-failed');
-      // The original "module not found" diagnostic should reach the
-      // operator. We don't pin the exact phrasing (Node vs Vite differ)
-      // but the missing file's basename is the recognizable handle.
+      // Phrasing differs Node vs Vite; the missing filename is the cross-env anchor.
       expect(msg).toContain('missing-helper');
     } finally {
       rmSync(parentDir, { recursive: true, force: true });

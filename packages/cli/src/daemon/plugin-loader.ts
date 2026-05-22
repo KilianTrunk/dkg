@@ -6,26 +6,8 @@ import type { RoutePlugin } from './plugin-api.js';
 
 const require_ = createRequire(import.meta.url);
 
-// Detect "the ESM resolver could not pick an entry for this spec"
-// (the package exists but its `exports` map matched no `import`/`default`
-// condition) vs "the ESM loaded and then failed". Only the first case
-// is safe to retry via CJS; everything else — a `SyntaxError` in the
-// ESM source, a top-level evaluation crash, a rejected top-level
-// `await`, OR an `ERR_MODULE_NOT_FOUND` raised from inside the loaded
-// ESM because one of its own imports is missing — must bubble up so
-// the plugin author and the operator who installed the package see the
-// broken build instead of being silently rescued by a CJS twin (Codex
-// PR #593 round 13).
-//
-// Production Node sets `err.code` to `ERR_PACKAGE_PATH_NOT_EXPORTED`
-// for the "no condition matched" case. Vitest's Vite-based resolver
-// wraps the underlying failure and strips the typed code, emitting
-// untyped errors whose message contains a recognizable phrase ("No
-// known conditions for…", `No "exports" main defined`, "Failed to
-// resolve entry for package"). We deliberately do NOT match on the
-// broader `ERR_MODULE_NOT_FOUND` / "Cannot find package" — those are
-// ambiguous with "the ESM tried to import a transitive that wasn't
-// installed", which is a real failure we want to surface, not rescue.
+// Only retry CJS when ESM failed because no `import` condition matched; everything else (SyntaxError,
+// missing transitive `ERR_MODULE_NOT_FOUND`, ...) bubbles up so authors see the broken build.
 const RESOLVER_FAILURE_CODES = new Set([
   'ERR_PACKAGE_PATH_NOT_EXPORTED',
 ]);
@@ -46,35 +28,15 @@ async function importSpec(spec: string): Promise<unknown> {
   if (isAbsolute(spec)) {
     return import(pathToFileURL(spec).href);
   }
-  // Reject relative specs ('./foo', '../foo'). The README promises that
-  // relative paths fail to load. Without this guard, Node's dynamic
-  // import would resolve them relative to THIS loader's source file
-  // (packages/cli/dist/daemon/plugin-loader.js), not relative to the
-  // operator's ~/.dkg/config.json. That could silently import an
-  // unrelated daemon module — e.g. `../config.js` resolves to the real
-  // daemon config module — and pass it to pickCandidate as if it were a
-  // plugin. Force operators onto absolute paths or bare package names.
+  // Reject relative specs — Node resolves them relative to this loader source
+  // (packages/cli/dist/daemon/), not to ~/.dkg/config.json. See ADR 0001.
   if (spec.startsWith('./') || spec.startsWith('../')) {
     throw new Error(
       `relative paths are not supported in routePlugins; use an absolute filesystem path or a resolvable package name (got "${spec}")`,
     );
   }
-  // Bare specifier: try Node's ESM resolver first (honours `import` and
-  // `default` exports conditions). If that fails — e.g. for a CJS-only
-  // package whose `exports` map declares only a `require` condition —
-  // fall back to CJS resolution and re-import the resolved file URL.
-  // Node's dynamic `import()` of a CJS file gives us
-  // `{ default: module.exports }`, which `pickCandidate` handles.
-  //
-  // Codex PR #593 review round 12: the fallback fires ONLY for typed
-  // resolver errors (`ERR_PACKAGE_PATH_NOT_EXPORTED` =
-  // exports map matched no `import` condition; `ERR_MODULE_NOT_FOUND` =
-  // the spec did not resolve to anything Node can find). Any other
-  // failure — `SyntaxError` in the ESM source, `ReferenceError` during
-  // top-level evaluation, a rejected top-level `await` — bubbles up so
-  // the plugin author (and the operator who installed the package)
-  // actually see the broken ESM build instead of having the loader
-  // silently rescue them with the CJS path.
+  // Bare specifier: ESM first (honours `import`/`default` conditions), then CJS resolve only on
+  // resolver failure. Dynamic import of CJS yields { default: module.exports } for pickCandidate.
   try {
     return await import(spec);
   } catch (esmErr) {
@@ -106,10 +68,7 @@ function pickCandidate(mod: unknown): unknown {
 }
 
 export async function loadRoutePlugins(
-  // `unknown` (not `readonly string[]`) because the caller passes raw
-  // operator config from a JSON file. A typo there must not crash the
-  // daemon — we validate shape inside and fall back to [] on anything
-  // that isn't a clean string array.
+  // `unknown` — caller passes raw JSON; we validate inside, fail-soft to [].
   specs: unknown,
   log: Logger,
 ): Promise<RoutePlugin[]> {
@@ -150,15 +109,7 @@ export async function loadRoutePlugins(
   return out;
 }
 
-/**
- * Count plugin specs the way the validation path in `loadRoutePlugins`
- * sees them. Use this for startup telemetry (the `route-plugins-loaded`
- * log line) so that a malformed config (string, object, ...) reports
- * `configured=0` instead of leaking the raw `.length` of whatever
- * `config.routePlugins` happened to be. Arrays return their length —
- * the individual element validation still happens inside the loader and
- * can drop entries.
- */
+/** Spec count for `route-plugins-loaded` telemetry; non-arrays report 0 so malformed config isn't leaked. */
 export function countConfiguredPluginSpecs(raw: unknown): number {
   return Array.isArray(raw) ? raw.length : 0;
 }

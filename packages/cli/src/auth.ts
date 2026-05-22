@@ -730,34 +730,18 @@ const PUBLIC_PATHS = new Set([
   '/api/status',
   '/api/chain/rpc-health',
   '/.well-known/skill.md',
-  // Static UI root (exact match). The `/ui/...` subtree is public via
-  // PUBLIC_PREFIXES below; bare `/ui` lives here so that `/ui-custom`,
-  // `/ui_admin`, `/uistuff`, ... do NOT accidentally bypass auth via a
-  // loose prefix match. Route plugins mounted at sibling paths would
-  // otherwise have run unauthenticated.
+  // Exact match — `/ui-custom` etc. would otherwise bypass auth via a loose prefix.
   '/ui',
 ]);
 
-// Every prefix MUST end with '/' so the match is unambiguous —
-// `pathname.startsWith('/ui/')` correctly excludes `/ui-custom` whereas
-// `startsWith('/ui')` would have included it.
+// Trailing slash required; `startsWith('/ui/')` excludes `/ui-custom`.
 const PUBLIC_PREFIXES = [
   '/ui/',
   '/apps/',
 ];
 
-// Every entry in PUBLIC_PATHS / PUBLIC_PREFIXES is semantically a read-only
-// surface (status info, health checks, the skill file, static UI assets).
-// The allowlist must be method-aware so a non-GET request on those exact
-// paths still goes through auth — otherwise `POST /api/status` (or any
-// non-GET method) would skip the gate and reach route plugins
-// unauthenticated.
-//
-// GET only. HEAD was briefly included for health probes, but the built-in
-// route handlers only claim GET on these paths — a HEAD request fell
-// through the chain to `handlePluginRoutes`, so a fork plugin matching
-// `HEAD /api/status` would have run unauthenticated. Restore HEAD here
-// only after the built-in chain is HEAD-aware end-to-end.
+// GET only — non-GET on these paths goes through auth. HEAD is excluded because the built-in chain only claims GET,
+// so `HEAD /api/status` would fall through to plugins unauthenticated.
 const PUBLIC_SAFE_METHODS = new Set(['GET']);
 
 function isPublicPath(method: string, pathname: string): boolean {

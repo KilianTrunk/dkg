@@ -1,16 +1,5 @@
-/**
- * Route-plugins live-daemon E2E.
- *
- * Spins one daemon with a temporary DKG_HOME whose `config.json` lists the
- * pre-built sample-route-plugin fixture (built once at `packages/cli/test-fixtures/sample-route-plugin/dist/index.js`)
- * in its `routePlugins` array, then asserts that the configured plugins
- * answer real HTTP requests on the live daemon without breaking the
- * built-in `/api/status` route.
- *
- * Patterned after `packages/cli/test/daemon-http-behavior-extra.test.ts`
- * for daemon spawning + Hardhat-shared-chain config (edge-role node so we
- * never touch profile registration).
- */
+/** Route-plugins live-daemon E2E: spawns one daemon with the sample-fixture plugins and asserts HTTP behaviour.
+ *  Patterned after `daemon-http-behavior-extra.test.ts` (edge-role node, no profile registration). */
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
@@ -48,11 +37,7 @@ function uniquePort(base: number): number {
   return base + Math.floor(Math.random() * 1000);
 }
 
-// API and libp2p port bases must be at least 1000 apart so the two
-// `uniquePort` rolls (each picking a port in `[base, base+1000)`) never
-// overlap. Codex PR #593 review round 8: prior bases 19900 + 20000
-// overlapped on [20000, 20899], so ~9% of e2e runs could pick the same
-// port for both and fail with EADDRINUSE.
+// Bases must be ≥1000 apart so the two `uniquePort` rolls never overlap (each samples [base, base+1000)).
 const API_PORT_BASE = 19900; // -> [19900, 20899]
 const LISTEN_PORT_BASE = 21000; // -> [21000, 21999]
 
@@ -114,13 +99,7 @@ async function startDaemon(): Promise<Daemon> {
   const listenPort = uniquePort(LISTEN_PORT_BASE);
   await writeDaemonConfig(home, apiPort, listenPort);
 
-  // Capture daemon stdio so startup failures (port bind, plugin load,
-  // chain init, auth-token write) are visible in test failure messages.
-  // `stdio: 'ignore'` discards these and leaves the harness reporting
-  // only an early exit or a readiness timeout with no context — first
-  // CI flake is then unrecoverable without re-running locally with
-  // tracing. Use a buffered tail so a chatty daemon doesn't balloon
-  // memory.
+  // Pipe daemon stdio to a file so startup failures (port bind, plugin load, chain init) surface in error messages.
   const stdioLog = join(home, 'daemon-stdio.log');
   const logHandle = await open(stdioLog, 'a');
   const child = spawn('node', [CLI_ENTRY, 'daemon-worker'], {
@@ -156,20 +135,10 @@ async function startDaemon(): Promise<Daemon> {
     daemon.signal = signal;
   });
 
-  // If startup fails after this point, we own a spawned daemon process,
-  // an open log handle, and a temp DKG_HOME — none of which the outer
-  // `afterAll(stopDaemon(daemon))` can reach, because `daemon` is still
-  // null in the test scope until we return. Codex PR #593 review round
-  // 11: cleanup-on-error so a flaky/timeout startup doesn't leak a live
-  // daemon (and its bound port) into the next CI retry.
+  // afterAll can't reach our resources until we return — clean up on throw so a flaky startup doesn't leak the daemon / port.
   try {
     for (let i = 0; i < 90; i++) {
-      // Cover BOTH normal-exit (exitCode !== null) AND signal-exit
-      // (exitCode === null but signalCode !== null). Without the
-      // signalCode branch, a daemon killed by SIGSEGV mid-startup would
-      // sail past this check, the fetch loop would keep retrying for the
-      // full 45s, and the test would report a misleading "did not become
-      // ready" instead of the actual crash signal. Codex PR #593 round 13.
+      // Cover signal-exit too: `exitCode === null` with `signalCode !== null` means the daemon was killed mid-startup.
       if (child.exitCode !== null || child.signalCode !== null) {
         const tail = await readDaemonStdioTail();
         throw new Error(
@@ -190,11 +159,7 @@ async function startDaemon(): Promise<Daemon> {
         );
       }
     }
-    // Close the parent-side file handle now that startup succeeded.
-    // The child still owns its own duplicated fd (we passed
-    // `logHandle.fd` into `spawn`'s stdio array), so the daemon keeps
-    // writing to `daemon-stdio.log` until it exits. `readDaemonStdioTail`
-    // re-opens the file by path when assertions need diagnostic output.
+    // Close the parent's handle; the child still owns its dup'd fd so the log keeps growing until daemon exit.
     await logHandle.close();
 
     const raw = await readFile(join(home, 'auth.token'), 'utf-8');
@@ -207,13 +172,7 @@ async function startDaemon(): Promise<Daemon> {
 
     return daemon;
   } catch (err) {
-    // `exitCode === null` alone is ambiguous: when a child exits via
-    // signal Node leaves `exitCode = null` but sets `signalCode` to
-    // "SIGTERM" / "SIGSEGV" / ... So a daemon that crashed with a
-    // signal mid-startup would still pass an `exitCode === null` check
-    // — we'd then wait the full 5s race, send SIGKILL to a ghost PID,
-    // and waste real time on every signal-exit failure path. Both
-    // fields null => still alive.
+    // Both fields null = still alive; signal-exits leave exitCode null but set signalCode.
     if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM');
       await Promise.race([

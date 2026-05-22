@@ -160,12 +160,7 @@ describe('httpAuthGuard', () => {
   });
 
   it('rejects /ui-custom — sibling paths must not bypass auth via the /ui prefix', async () => {
-    // Regression for codex PR review #593: PUBLIC_PREFIXES used to contain
-    // '/ui' (no trailing slash) and isPublicPath checked `startsWith`. That
-    // made any path starting with '/ui...' (`/ui-custom`, `/ui_admin`,
-    // `/uistuff`, ...) skip the auth guard, defeating the daemon's "all
-    // protected endpoints require a Bearer token" contract. Route plugins
-    // mounted at such paths would have run unauthenticated.
+    // `/ui` prefix without trailing slash matched `/ui-custom`, `/ui_admin`, ... — route plugins at sibling paths bypassed auth.
     const res = await fetch(`${baseUrl}/ui-custom/anything`, { method: 'GET' });
     expect(res.status).toBe(401);
   });
@@ -181,11 +176,7 @@ describe('httpAuthGuard', () => {
   });
 
   it('rejects POST /api/status — public allowlist must be method-aware (GET only)', async () => {
-    // Regression for codex PR review #593: every entry in PUBLIC_PATHS /
-    // PUBLIC_PREFIXES is a read-only surface (status / health / skill file /
-    // static UI). A method-agnostic matcher let POST/PUT/DELETE on these
-    // exact paths bypass auth, which let route plugins mounted at the same
-    // path under a non-GET method run unauthenticated.
+    // Public allowlist is read-only — non-GET on these paths must still go through auth, else plugins bypass via POST/PUT/DELETE.
     const res = await fetch(`${baseUrl}/api/status`, { method: 'POST' });
     expect(res.status).toBe(401);
   });
@@ -211,13 +202,7 @@ describe('httpAuthGuard', () => {
   });
 
   it('rejects HEAD /api/status — HEAD bypass kept the round-6 hole open for plugin dispatch', async () => {
-    // Regression for codex PR review #593 (round 7): round 6 added HEAD to
-    // PUBLIC_SAFE_METHODS thinking it was the no-body twin of GET. But the
-    // daemon's built-in route handlers (`handleStatusRoutes`, etc.) only
-    // claim GET on these paths, so a HEAD request still fell through the
-    // chain to handlePluginRoutes — and a fork plugin matching `HEAD
-    // /api/status` would have run unauthenticated. Keep the public bypass
-    // to GET only until the built-in chain is HEAD-aware end-to-end.
+    // Built-in handlers only claim GET, so HEAD falls through to plugins — keep HEAD out of the public allowlist.
     const res = await fetch(`${baseUrl}/api/status`, { method: 'HEAD' });
     expect(res.status).toBe(401);
   });

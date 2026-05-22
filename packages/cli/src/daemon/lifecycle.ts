@@ -2035,17 +2035,12 @@ export async function runDaemonInner(
   const apiPort = config.apiPort || 0;
   const apiHost = config.apiHost || "127.0.0.1";
 
-  // Fork-authored route plugins: loaded once before the listen() so
-  // requests cannot race the plugin array. `loadRoutePlugins` is
-  // fail-soft — bad specs warn and skip; the daemon still boots.
+  // Route plugins: loaded before listen() so requests can't race the array; fail-soft per ADR 0001.
   const routePlugins = await loadRoutePlugins(
     config.routePlugins,
     new Logger('route-plugins'),
   );
-  // `countConfiguredPluginSpecs` mirrors the loader's validation path:
-  // arrays report their length, anything else reports 0. Without this,
-  // an operator typo (`"routePlugins": "@foo/bar"`) would emit
-  // `configured=N` where N is the string's character count.
+  // Validated count for telemetry — `configured=` is 0 for non-arrays so a typo doesn't report character count.
   const configuredCount = countConfiguredPluginSpecs(config.routePlugins);
   log(
     `route-plugins-loaded loaded=${routePlugins.length} configured=${configuredCount}`,

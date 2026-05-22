@@ -1,10 +1,4 @@
-// Public surface for fork-authored "route plugins". The only module a
-// plugin package imports from. Re-exports the `RequestContext` type
-// (the bag every daemon route handler receives) and a small set of
-// HTTP helpers so plugin code looks like daemon code. The `RoutePlugin`
-// interface is the contract every fork plugin implements.
-//
-// Once shipped, breaking changes to the symbols here are semver-major.
+// Public surface for route plugins. The only module a plugin imports from; breaking changes are semver-major.
 
 export type { RequestContext } from './routes/context.js';
 

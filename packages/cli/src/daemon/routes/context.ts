@@ -69,8 +69,7 @@ export interface RequestContext {
   // SSRF defence.
   apiHost: string;
   apiPortRef: { value: number };
-  // Fork-authored route plugins loaded at daemon startup. Dispatched
-  // by `handlePluginRoutes` before the 404 fallback.
+  // Route plugins; dispatched by `handlePluginRoutes` before the trailing 404.
   routePlugins: RoutePlugin[];
   // Derived per-request (from req.url + headers + token). Routes read
   // `path`, `url`, `requestAgentAddress` extensively; pre-computing

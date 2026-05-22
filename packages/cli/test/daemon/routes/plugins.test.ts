@@ -63,14 +63,8 @@ function makeCtx(routePlugins: RoutePlugin[], res = makeRes()): {
 }
 
 describe('handlePluginRoutes', () => {
-  // Several tests exercise the "plugin throws" path. The dispatcher
-  // intentionally logs the throw to `console.error` (the round-2
-  // operator-side breadcrumb), so without a global stub those expected
-  // throws would dump real stack traces into the CI test output on every
-  // passing run. Stub console.error per test and restore after.
-  // The "logs the plugin name and underlying error" test reads
-  // `errorSpy.mock.calls` directly; the other throw-path tests just
-  // want the noise suppressed.
+  // Throw-path tests would otherwise dump real stack traces from the dispatcher's `console.error` breadcrumb.
+  // Stub per test; the "logs the plugin name" test reads `errorSpy.mock.calls` directly.
   let errorSpy: ReturnType<typeof vi.spyOn<typeof console, 'error'>>;
   beforeEach(() => {
     errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -142,8 +136,7 @@ describe('handlePluginRoutes', () => {
       name: 'half-written',
       handle(c) {
         calls.push('half-written');
-        // Plugin has already started the response (headersSent=true) but
-        // has not finished (writableEnded=false), then throws.
+        // headersSent=true, writableEnded=false, then throws.
         c.res.writeHead(200, { 'Content-Type': 'application/json' });
         c.res.write('{"partial":');
         throw new Error('mid-stream failure');
@@ -158,20 +151,13 @@ describe('handlePluginRoutes', () => {
     const { ctx, res } = makeCtx([partialThenThrow, next]);
     await expect(handlePluginRoutes(ctx)).resolves.toBeUndefined();
     expect(calls).toEqual(['half-written']);
-    // Status must remain the one the plugin already wrote, not be overwritten
-    // by an attempted 500.
+    // Status stays as the plugin wrote it — no overwrite-attempt 500.
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe('{"partial":');
   });
 
   it('logs the plugin name and underlying error when a plugin throws', async () => {
-    // Regression for codex PR review #593: the dispatcher returns a 500 to
-    // the client when a plugin throws, but operators also need a daemon-side
-    // log line with the plugin name + error so they can diagnose failures.
-    // Without it, a misbehaving plugin shows up as opaque 500s in the client
-    // log with no daemon-side breadcrumb. Uses the shared `errorSpy` from
-    // beforeEach so both the assertion and the noise suppression happen
-    // against the same stub.
+    // Operators need a daemon-side breadcrumb (plugin name + error) — the client's 500 only carries the message.
     const thrower: RoutePlugin = {
       name: 'logging-test-plugin',
       handle() {
@@ -200,12 +186,7 @@ describe('handlePluginRoutes', () => {
   });
 
   it('ends the half-written response when a plugin throws after writeHead', async () => {
-    // Regression for codex PR review: when a plugin calls writeHead/write and
-    // then throws, the catch must terminate the response (res.end()) so that
-    // handleRequest's `if (res.writableEnded) return;` short-circuit fires.
-    // If we leave writableEnded=false, the chain falls through to the trailing
-    // jsonResponse(res, 404, ...) which throws ERR_HTTP_HEADERS_SENT and the
-    // client is left with a half-written response.
+    // catch must call res.end() so writableEnded short-circuits; else the trailing 404 attempts a second writeHead.
     const partialThenThrow: RoutePlugin = {
       name: 'half-written-terminator',
       handle(c) {
@@ -218,23 +199,13 @@ describe('handlePluginRoutes', () => {
     await handlePluginRoutes(ctx);
     expect(res.headersSent).toBe(true);
     expect(res.writableEnded).toBe(true);
-    // Status and body were claimed by the plugin and must not be overwritten.
+    // Status / body claimed by the plugin — must not be overwritten.
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe('{"partial":');
   });
 
   it('leaves a streaming response open when a plugin writes headers and returns without calling end', async () => {
-    // Regression for codex PR review #593 (round 4): the round-3 dispatcher
-    // change unconditionally called res.end() whenever a plugin returned
-    // with headersSent && !writableEnded. That killed legitimate streaming
-    // plugins (SSE, source.pipe(res), chunked transfer) which deliberately
-    // return without ending so an async writer can keep sending bytes.
-    //
-    // Correct contract: the dispatcher must NOT mutate the response after a
-    // plugin returns. "headersSent && !writableEnded" means the plugin
-    // claimed the request and is streaming — the chain's short-circuit in
-    // handleRequest is responsible for treating that as "claimed", not the
-    // dispatcher.
+    // Dispatcher must NOT call end() after normal return — `headersSent && !writableEnded` is intentional streaming (SSE etc.).
     const calls: string[] = [];
     const streamingPlugin: RoutePlugin = {
       name: 'sse-stream',
@@ -242,8 +213,7 @@ describe('handlePluginRoutes', () => {
         calls.push('sse-stream');
         c.res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         c.res.write('event: connected\ndata: {}\n\n');
-        // intentionally does NOT call end() — an async source would keep
-        // writing later via setInterval / event subscription
+        // No end() — async writer would keep emitting via setInterval / event subscription.
       },
     };
     const followOn: RoutePlugin = {
@@ -256,12 +226,11 @@ describe('handlePluginRoutes', () => {
     await handlePluginRoutes(ctx);
     expect(calls).toEqual(['sse-stream']);
     expect(res.headersSent).toBe(true);
-    // Stream must stay alive — dispatcher must NOT have called end().
+    // Stream stays alive — dispatcher never called end().
     expect(res.writableEnded).toBe(false);
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe('event: connected\ndata: {}\n\n');
-    // Follow-on plugin must not run (the top-of-iteration check sees
-    // headersSent and stops the chain).
+    // Follow-on must not run — top-of-iteration `headersSent` check stops the chain.
     expect(calls).not.toContain('follow-on');
   });
 

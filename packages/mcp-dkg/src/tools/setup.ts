@@ -57,6 +57,14 @@ export function registerSetupTools(
   // reconciliation note (SKILL.md §6 line 297 user-vs-internal
   // terminology). The follow-up sentence about slug derivation is
   // mcp-dkg-specific UX ergonomics.
+  //
+  // Policy dials (`sharing` / `contribution`) follow SPEC_CG_MEMORY_MODEL
+  // and map onto the daemon's `accessPolicy` / `publishPolicy` wire
+  // fields. Defaults are safe (`invite-only` + `curators-only`) so an
+  // agent that "just creates a CG" starts in the most-locked-down
+  // state; opening it up later is explicit. Sharing controls who can
+  // read (off-chain peers) and Contribution controls who can publish
+  // to Verified Memory.
   server.registerTool(
     'dkg_context_graph_create',
     {
@@ -68,7 +76,10 @@ export function registerSetupTools(
         "CG's id, URI, and whether it was newly created or already existed. " +
         'The `id` slug is auto-derived from `name` when omitted (e.g. ' +
         '"My Research" → "my-research"); slugs must match ' +
-        '/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.',
+        '/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/. ' +
+        'Defaults to safe `sharing="invite-only"` + `contribution="curators-only"`; ' +
+        'switch to `"open"` to make the CG publicly discoverable or to allow ' +
+        'anyone to publish to Verified Memory respectively.',
       inputSchema: {
         name: z.string().min(1).describe('Human-readable name (e.g. "My Research Context Graph")'),
         description: z.string().optional().describe('Optional description of the CG\'s purpose'),
@@ -79,9 +90,27 @@ export function registerSetupTools(
             'Optional explicit slug. Auto-derived from `name` when omitted. ' +
               'Must match /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.',
           ),
+        sharing: z
+          .enum(['open', 'invite-only'])
+          .optional()
+          .default('invite-only')
+          .describe(
+            '"open" = publicly discoverable, anyone may subscribe. ' +
+              '"invite-only" = curator gates membership (default). ' +
+              'Maps to on-chain accessPolicy.',
+          ),
+        contribution: z
+          .enum(['open', 'curators-only'])
+          .optional()
+          .default('curators-only')
+          .describe(
+            '"open" = any agent may publish to Verified Memory. ' +
+              '"curators-only" = only the curator may publish (default). ' +
+              'Maps to on-chain publishPolicy.',
+          ),
       },
     },
-    async ({ name, description, id }): Promise<ToolResult> => {
+    async ({ name, description, id, sharing, contribution }): Promise<ToolResult> => {
       const trimmedName = name.trim();
       if (!trimmedName) return errResult('"name" is required.');
       const explicitId = id?.trim();
@@ -96,11 +125,17 @@ export function registerSetupTools(
           `Invalid context graph ID "${cgId}". Use lowercase letters, numbers, and hyphens (e.g. "my-research"). Must start and end with a letter or digit.`,
         );
       }
+      // Map UX-level dials to wire fields. accessPolicy: 0 = public, 1 = private.
+      // publishPolicy: 0 = curated, 1 = open. Defaults above keep both locked.
+      const accessPolicy = sharing === 'open' ? 0 : 1;
+      const publishPolicy = contribution === 'open' ? 1 : 0;
       try {
         const result = await client.createContextGraph({
           id: cgId,
           name: trimmedName,
           description: description?.trim() || undefined,
+          accessPolicy,
+          publishPolicy,
         });
         // Mirror dkg_assertion_create's idempotency surfacing: distinct
         // success messages for "newly created" vs "already existed" so

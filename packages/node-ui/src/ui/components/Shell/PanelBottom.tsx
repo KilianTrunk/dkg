@@ -148,10 +148,10 @@ function TransactionsContent() {
 
   const load = useCallback(() => {
     const from = String(Date.now() - 6 * 60 * 60_000);
-    api.fetchOperationsWithPhases({ limit: '100', from })
+    const names = [...TX_OP_TYPES].join(',');
+    api.fetchOperationsWithPhases({ limit: '100', from, names })
       .then((data: any) => {
         const filtered = (data?.operations ?? []).filter((op: any) =>
-          TX_OP_TYPES.has(op.operation_name) &&
           (op.phases ?? []).some((p: any) => p.phase === 'chain')
         );
         setOps(filtered);

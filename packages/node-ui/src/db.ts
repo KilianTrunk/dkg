@@ -753,6 +753,7 @@ export class DashboardDB {
 
   getOperations(opts: {
     name?: string;
+    names?: string[];
     status?: string;
     operationId?: string;
     from?: number;
@@ -763,7 +764,12 @@ export class DashboardDB {
     const wheres: string[] = [];
     const params: unknown[] = [];
 
-    if (opts.name) { wheres.push('operation_name = ?'); params.push(opts.name); }
+    if (opts.names?.length) {
+      wheres.push(`operation_name IN (${opts.names.map(() => '?').join(',')})`);
+      params.push(...opts.names);
+    } else if (opts.name) {
+      wheres.push('operation_name = ?'); params.push(opts.name);
+    }
     if (opts.status) { wheres.push('status = ?'); params.push(opts.status); }
     if (opts.operationId) { wheres.push('operation_id = ?'); params.push(opts.operationId); }
     if (opts.from) { wheres.push('started_at >= ?'); params.push(opts.from); }
@@ -783,6 +789,7 @@ export class DashboardDB {
 
   getOperationsWithPhases(opts: {
     name?: string;
+    names?: string[];
     status?: string;
     operationId?: string;
     from?: number;

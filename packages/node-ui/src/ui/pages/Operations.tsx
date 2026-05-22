@@ -693,6 +693,7 @@ function MiniGantt({ phases, totalMs }: { phases: any[]; totalMs: number }) {
   const [hover, setHover] = useState<number | null>(null);
 
   if (!phases?.length) return <span style={{ fontSize: 10, color: 'var(--text-dim)', fontStyle: 'italic' }}>event-based</span>;
+  if (totalMs <= 0) return <span style={{ color: 'var(--text-dim)' }}>—</span>;
   const phaseTotal = phases.reduce((s: number, p: any) => s + (p.duration_ms ?? 0), 0) || totalMs;
   return (
     <div style={{ position: 'relative', minWidth: 120, maxWidth: 260 }}>

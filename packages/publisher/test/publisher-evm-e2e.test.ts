@@ -52,7 +52,10 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
     );
 
     // Create an on-chain context graph so V10 publish uses a real numeric ID
-    const cgResult = await adapter.createOnChainContextGraph({});
+    const cgResult = await adapter.createOnChainContextGraph({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
     if (!cgResult.success || cgResult.contextGraphId <= 0n) {
       throw new Error(`Failed to create on-chain context graph: ${JSON.stringify(cgResult)}`);
     }
@@ -230,7 +233,10 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
       makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.CORE_OP),
     );
 
-    const result = await adapter.createOnChainContextGraph({});
+    const result = await adapter.createOnChainContextGraph({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
 
     expect(result.success).toBe(true);
     expect(result.contextGraphId).toBeGreaterThan(0n);

@@ -203,7 +203,10 @@ describe('EVM E2E: Full on-chain publishing lifecycle', () => {
     // Create an on-chain context graph. Per SPEC_CG_MEMORY_MODEL there is
     // no per-CG hosting committee; ACK quorum comes from the system
     // `minimumRequiredSignatures` parameter, raised to 3 above.
-    const cgResult = await adapter.createOnChainContextGraph({});
+    const cgResult = await adapter.createOnChainContextGraph({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
     expect(cgResult.success).toBe(true);
     const contextGraphId = cgResult.contextGraphId;
     expect(contextGraphId).toBeGreaterThan(0n);

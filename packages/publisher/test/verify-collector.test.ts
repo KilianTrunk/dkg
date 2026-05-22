@@ -254,4 +254,94 @@ describe('VerifyCollector', () => {
       );
     });
   });
+
+  // Codex PR #595 round-5: when the proposer is dropped from the
+  // resolved-signatures set (edge node with identityId=0, or signer
+  // not in the sharding table), the collector must demand the FULL
+  // `requiredSignatures` from remote peers instead of
+  // `requiredSignatures - 1`. The default behaviour
+  // (proposerCountsTowardQuorum=true) preserves the legacy "proposer
+  // self-counts" math; the fix is opt-in via the new flag.
+  describe('proposerCountsTowardQuorum=false (edge / non-member proposers)', () => {
+    const baseCollectArgs = {
+      contextGraphId: 'test-cg',
+      contextGraphIdOnChain: 42n,
+      verifiedMemoryId: 1n,
+      batchId: 100n,
+      merkleRoot: new Uint8Array(32),
+      entities: [],
+      proposerSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      timeoutMs: 1000,
+    } as const;
+
+    it('requires full quorum from remote peers when proposer cannot self-count (system minimum=1)', async () => {
+      // System min = 1. Default math (proposerCountsTowardQuorum=true)
+      // would return quorumReached=true with 0 remote ACKs. With the
+      // proposer flagged ineligible, the collector must ask for 1
+      // remote ACK and fail no-peer when none are connected.
+      const collector = new VerifyCollector({
+        sendP2P: async () => new Uint8Array(0),
+        getParticipantPeers: () => [],
+      });
+      await expect(collector.collect({
+        ...baseCollectArgs,
+        requiredSignatures: 1,
+        proposerCountsTowardQuorum: false,
+      })).rejects.toThrow(/verify_no_peers/);
+    });
+
+    it('requires 2 remote ACKs when proposer cannot self-count and system minimum=2', async () => {
+      const collector = new VerifyCollector({
+        sendP2P: async () => new Uint8Array(0),
+        getParticipantPeers: () => ['peer-a'],
+      });
+      await expect(collector.collect({
+        ...baseCollectArgs,
+        requiredSignatures: 2,
+        proposerCountsTowardQuorum: false,
+        allowPartial: false,
+      })).rejects.toThrow(/verify_insufficient_peers: need 2 remote approvals/);
+    });
+
+    it('returns self-sign-style early-return only when proposer counts AND requiredSignatures=1', async () => {
+      const collector = new VerifyCollector({
+        sendP2P: async () => new Uint8Array(0),
+        getParticipantPeers: () => [],
+      });
+      const result = await collector.collect({
+        ...baseCollectArgs,
+        requiredSignatures: 1,
+        proposerCountsTowardQuorum: true,
+      });
+      expect(result.quorumReached).toBe(true);
+      expect(result.requiredRemoteApprovals).toBe(0);
+    });
+  });
+
+  // Codex PR #595 round-5: verify-proposal payloads include
+  // contextGraphId, verifiedMemoryId, batchId, and root entities — for
+  // curated CGs that's CG-visible metadata. The collector must accept
+  // an async `getParticipantPeers` so the caller can await an
+  // enumerator that returns only CG-member peers.
+  it('awaits a Promise-returning getParticipantPeers', async () => {
+    const peersByCg: Record<string, string[]> = { 'cg-x': [] };
+    const collector = new VerifyCollector({
+      sendP2P: async () => new Uint8Array(0),
+      getParticipantPeers: async (cgId) => {
+        await new Promise(r => setTimeout(r, 5));
+        return peersByCg[cgId] ?? [];
+      },
+    });
+    await expect(collector.collect({
+      contextGraphId: 'cg-x',
+      contextGraphIdOnChain: 42n,
+      verifiedMemoryId: 1n,
+      batchId: 100n,
+      merkleRoot: new Uint8Array(32),
+      entities: [],
+      proposerSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      requiredSignatures: 2,
+      timeoutMs: 1000,
+    })).rejects.toThrow(/verify_no_peers/);
+  });
 });

@@ -638,8 +638,12 @@ export class MockChainAdapter implements ChainAdapter {
   private nextContextGraphId = 1n;
 
   async createOnChainContextGraph(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult> {
-    const publishPolicy = params.publishPolicy ?? 1;
-    const accessPolicy = params.accessPolicy ?? 0;
+    if (params.accessPolicy === undefined || params.publishPolicy === undefined) {
+      throw new Error(
+        'Mock createOnChainContextGraph: `accessPolicy` and `publishPolicy` are required (SPEC_CG_MEMORY_MODEL).',
+      );
+    }
+    const { accessPolicy, publishPolicy } = params;
     if (accessPolicy !== 0 && accessPolicy !== 1) {
       throw new Error('Mock: invalid accessPolicy');
     }

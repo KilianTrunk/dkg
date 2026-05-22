@@ -123,6 +123,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
     // for random sampling. publishPolicy: 0 means "curated" and
     // RandomSampling._isCGEligible() filters those out at draw time.
     const cgResult = await publisherAdapter.createOnChainContextGraph({
+      accessPolicy: 0,
       publishPolicy: 1,
     });
     if (!cgResult.success || cgResult.contextGraphId === 0n) {

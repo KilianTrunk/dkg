@@ -255,7 +255,10 @@ describe('E2E: Context graph publish with receiver + participant signatures', ()
     await sleep(1500);
 
     // Both A and B are participants
-    const result = await nodeA.registerContextGraphOnChain({});
+    const result = await nodeA.registerContextGraphOnChain({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
     contextGraphId = result.contextGraphId;
     expect(Number(contextGraphId)).toBeGreaterThan(0);
   }, 20_000);
@@ -448,7 +451,10 @@ describe('E2E: Context graph registration rejected with insufficient participant
     nodeA.subscribeToContextGraph(CONTEXT_GRAPH);
 
     // Context graph requires 2 signatures, but only 1 node available
-    const cgResult = await nodeA.registerContextGraphOnChain({});
+    const cgResult = await nodeA.registerContextGraphOnChain({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
     const contextGraphId = cgResult.contextGraphId;
 
     await nodeA.share(CONTEXT_GRAPH, [
@@ -524,7 +530,10 @@ describe('E2E: Edge node participates in context graph governance', () => {
     const coreIdentity = await chainCore.getIdentityId();
     expect(coreIdentity).toBeGreaterThan(0n);
 
-    const cgResult = await coreNode.registerContextGraphOnChain({});
+    const cgResult = await coreNode.registerContextGraphOnChain({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
     contextGraphId = cgResult.contextGraphId;
 
     // Core writes data

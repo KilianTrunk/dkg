@@ -90,6 +90,7 @@ export async function createTestContextGraph(
 ): Promise<bigint> {
   const adapter = chain ?? createEVMAdapter(HARDHAT_KEYS.CORE_OP);
   const result = await adapter.createOnChainContextGraph({
+    accessPolicy: 1,
     publishPolicy: 0,
   });
   if (!result.success || result.contextGraphId === 0n) {

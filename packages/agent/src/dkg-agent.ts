@@ -11717,64 +11717,11 @@ export class DKGAgent {
     const proposerAddress = ethers.computeAddress(signingKey.publicKey);
 
     // 5. Collect M-of-N approvals
-    const collector = new VerifyCollector({
-      // rc.9 PR-11: route through messenger.sendReliable so
-      // /dkg/10.0.1/verify-proposal gets envelope wrap + sender-side
-      // idempotency. App-level fan-out via VerifyCollector is
-      // unchanged; queued is treated as a per-peer failure (caller
-      // moves on to the next peer; substrate keeps the queued entry
-      // in the outbox for diagnostics).
-      sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
-        const sendResult = await this.messenger.sendReliable(peerId, protocol, data);
-        if (!sendResult.delivered) {
-          throw new Error(`substrate queued (transport): ${sendResult.error}`);
-        }
-        return sendResult.response;
-      },
-      getParticipantPeers: (cgId?: string) => {
-        const allPeers = this.node.libp2p.getPeers().map(p => p.toString()).filter(id => id !== this.peerId);
-        // LU-2: per SPEC_CG_MEMORY_MODEL there is no per-CG hosting
-        // committee — any sharding-table member can ACK. We pass all
-        // connected peers; signer eligibility is enforced via
-        // signature recovery + identityId resolution downstream.
-        return allPeers;
-      },
-      log: (msg: string) => this.log.info(ctx, msg),
-    });
-
-    const entities = await this.getRootEntities(opts.contextGraphId, opts.batchId);
-
-    const result = await collector.collect({
-      contextGraphId: opts.contextGraphId,
-      contextGraphIdOnChain,
-      verifiedMemoryId: (() => {
-        try { return BigInt(opts.verifiedMemoryId); }
-        catch { throw new Error(`verifiedMemoryId must be a numeric string, got: "${opts.verifiedMemoryId}"`); }
-      })(),
-      batchId: opts.batchId,
-      merkleRoot,
-      entities,
-      proposerSignature: { r: ethers.getBytes(proposerSig.r), vs: ethers.getBytes(proposerSig.yParityAndS) },
-      requiredSignatures,
-      timeoutMs: opts.timeoutMs ?? 30 * 60 * 1000, // 30 min default; VerifyCollector also enforces this as its max.
-      allowPartial: true,
-    });
-
-    // 6. Resolve identity IDs for each approver before on-chain submission.
-    const participantIdentityIds = await this.getVerifyParticipantIdentityIds(
-      opts.contextGraphId,
-      contextGraphIdOnChain,
-    );
-    const isEligibleParticipant = (identityId: bigint): boolean =>
-      participantIdentityIds === null || participantIdentityIds.has(identityId);
-
-    // Sharding-table eligibility: SPEC_CG_MEMORY_MODEL §4.3 promises
-    // that only sharding-table members can ACK a VM publish. Probe
-    // membership for every resolved signer and drop non-members
-    // fail-closed. Adapters that don't implement the probe are a
-    // misconfiguration in this code path (real EVM and the in-tree
-    // mock both implement it) — fail loudly instead of silently
-    // accepting any signer. Cache per batch to avoid repeated RPCs.
+    // SPEC_CG_MEMORY_MODEL §4.3: sharding-table membership is the only
+    // authoritative gate for who can ACK a VM publish. Adapters that
+    // don't implement the membership probe are a misconfiguration here
+    // (real EVM and the in-tree mock both implement it). Cache decisions
+    // per batch to avoid hammering the RPC for repeated approvers.
     if (typeof this.chain.isShardingTableMember !== 'function') {
       throw new Error(
         'verify: chain adapter does not implement `isShardingTableMember()`. ' +
@@ -11802,13 +11749,69 @@ export class DKGAgent {
       }
     };
 
+    // Proposer eligibility computed BEFORE collect() so VerifyCollector
+    // can require the full `requiredSignatures` remote ACKs (instead of
+    // `requiredSignatures - 1`) when the proposer can't self-count.
+    // Edge nodes have identityId=0 and aren't in the sharding table, so
+    // they always need every ACK to come from a member peer.
+    const proposerEligible =
+      this.identityId > 0n && await probeShardingTableMembership(this.identityId);
+
+    // CG-visible peer set for verify-proposal fan-out:
+    // SPEC_CG_MEMORY_MODEL §4.4 — the verify proposal payload includes
+    // contextGraphId, verifiedMemoryId, batchId, and root entities; for
+    // curated CGs that's metadata only allowlisted members may see. Run
+    // every recipient through `getOrCreateCGMemberEnumerator()` so
+    // unrelated peers don't receive the proposal. Public CGs fall
+    // through to the topic-subscribers set; legacy CGs with no member
+    // signal return an empty set (verify just degrades to no-quorum).
+    const cgMemberEnumerator = this.getOrCreateCGMemberEnumerator();
+
+    const collector = new VerifyCollector({
+      // rc.9 PR-11: route through messenger.sendReliable so
+      // /dkg/10.0.1/verify-proposal gets envelope wrap + sender-side
+      // idempotency. App-level fan-out via VerifyCollector is
+      // unchanged; queued is treated as a per-peer failure (caller
+      // moves on to the next peer; substrate keeps the queued entry
+      // in the outbox for diagnostics).
+      sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
+        const sendResult = await this.messenger.sendReliable(peerId, protocol, data);
+        if (!sendResult.delivered) {
+          throw new Error(`substrate queued (transport): ${sendResult.error}`);
+        }
+        return sendResult.response;
+      },
+      getParticipantPeers: async (cgId?: string) => {
+        const targetCg = cgId ?? opts.contextGraphId;
+        const enumeration = await cgMemberEnumerator.enumerate(targetCg);
+        return enumeration.members;
+      },
+      log: (msg: string) => this.log.info(ctx, msg),
+    });
+
+    const entities = await this.getRootEntities(opts.contextGraphId, opts.batchId);
+
+    const result = await collector.collect({
+      contextGraphId: opts.contextGraphId,
+      contextGraphIdOnChain,
+      verifiedMemoryId: (() => {
+        try { return BigInt(opts.verifiedMemoryId); }
+        catch { throw new Error(`verifiedMemoryId must be a numeric string, got: "${opts.verifiedMemoryId}"`); }
+      })(),
+      batchId: opts.batchId,
+      merkleRoot,
+      entities,
+      proposerSignature: { r: ethers.getBytes(proposerSig.r), vs: ethers.getBytes(proposerSig.yParityAndS) },
+      requiredSignatures,
+      proposerCountsTowardQuorum: proposerEligible,
+      timeoutMs: opts.timeoutMs ?? 30 * 60 * 1000, // 30 min default; VerifyCollector also enforces this as its max.
+      allowPartial: true,
+    });
+
+    // 6. Resolve identity IDs for each approver before on-chain submission.
     const resolvedSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }> = [];
     const resolvedSignerAddresses: string[] = [];
-    if (
-      this.identityId > 0n
-      && isEligibleParticipant(this.identityId)
-      && await probeShardingTableMembership(this.identityId)
-    ) {
+    if (proposerEligible) {
       resolvedSignatures.push({
         identityId: this.identityId,
         r: ethers.getBytes(proposerSig.r),
@@ -11816,26 +11819,22 @@ export class DKGAgent {
       });
       resolvedSignerAddresses.push(proposerAddress);
     }
-    const participantResolvedRemoteAddresses: string[] = [];
     for (const a of result.approvals) {
-      let id = a.identityId || await this.resolveVerifyApprovalIdentityId(
-        a.approverAddress,
-        participantIdentityIds,
-      );
+      let id = a.identityId || await this.resolveVerifyApprovalIdentityId(a.approverAddress);
       if (!id || id === 0n) continue;
-      if (!isEligibleParticipant(id)) continue;
       if (!(await probeShardingTableMembership(id))) continue;
       resolvedSignatures.push({ identityId: id, r: a.signatureR, vs: a.signatureVS });
       resolvedSignerAddresses.push(a.approverAddress);
-      if (participantIdentityIds !== null && participantIdentityIds.has(id)) {
-        participantResolvedRemoteAddresses.push(a.approverAddress);
-      }
     }
     if (!result.quorumReached || resolvedSignatures.length < requiredSignatures) {
-      const trustLevel = participantResolvedRemoteAddresses.length > 0
+      // Trust degradation: any remote sharding-table-eligible ACK we
+      // collected (i.e. any signer past the proposer slot) lifts the
+      // batch to PartiallyVerified; otherwise it's self-attested.
+      const remoteCount = resolvedSignatures.length - (proposerEligible ? 1 : 0);
+      const trustLevel = remoteCount > 0
         ? TrustLevel.PartiallyVerified
         : TrustLevel.SelfAttested;
-      const status = participantResolvedRemoteAddresses.length > 0 ? 'partial' : 'no_quorum';
+      const status = remoteCount > 0 ? 'partial' : 'no_quorum';
       await this.stampBatchTrustLevel(
         opts.contextGraphId,
         opts.batchId,
@@ -11845,8 +11844,8 @@ export class DKGAgent {
       this.log.info(
         ctx,
         `Verify batch ${opts.batchId} did not reach quorum ` +
-          `(${resolvedSignatures.length}/${requiredSignatures} identity-resolved signers, ` +
-          `${participantResolvedRemoteAddresses.length}/${result.requiredRemoteApprovals} participant remote approvals) — ` +
+          `(${resolvedSignatures.length}/${requiredSignatures} sharding-table-eligible signers, ` +
+          `${remoteCount}/${result.requiredRemoteApprovals} remote approvals) — ` +
           `stamped trustLevel=${trustLevel} without chain tx`,
       );
       return {
@@ -11908,81 +11907,23 @@ export class DKGAgent {
     };
   }
 
-  private async resolveVerifyApprovalIdentityId(
-    approverAddress: string,
-    participantIdentityIds: Set<bigint> | null,
-  ): Promise<bigint> {
-    if (typeof (this.chain as any).getIdentityIdForAddress === 'function') {
-      try {
-        const id = await (this.chain as any).getIdentityIdForAddress(approverAddress);
-        if (id && id !== 0n) return BigInt(id);
-      } catch {
-        // Fall through to participant-set probing below.
-      }
+  private async resolveVerifyApprovalIdentityId(approverAddress: string): Promise<bigint> {
+    // Post-SPEC_CG_MEMORY_MODEL: identity resolution is whatever the
+    // chain adapter exposes via `getIdentityIdForAddress`. The legacy
+    // candidate-set probe against per-CG `participantIdentityId`
+    // triples was a pre-LU2 affordance and has been removed (Codex
+    // PR #595 round-5: stop using legacy roster as a verify filter).
+    // Modern responders that want to be counted MUST stamp their
+    // identityId in the VerifyApproval payload.
+    if (typeof (this.chain as any).getIdentityIdForAddress !== 'function') {
+      return 0n;
     }
-
-    if (participantIdentityIds === null || participantIdentityIds.size === 0) return 0n;
-    if (typeof this.chain.verifyACKIdentity === 'function') {
-      for (const candidateIdentityId of participantIdentityIds) {
-        try {
-          if (await this.chain.verifyACKIdentity.call(this.chain, approverAddress, candidateIdentityId)) {
-            return candidateIdentityId;
-          }
-        } catch {
-          // Ignore individual lookup failures; another participant may still match.
-        }
-      }
+    try {
+      const id = await (this.chain as any).getIdentityIdForAddress(approverAddress);
+      return id ? BigInt(id) : 0n;
+    } catch {
+      return 0n;
     }
-
-    if (typeof this.chain.isOperationalWalletRegistered !== 'function') return 0n;
-    for (const candidateIdentityId of participantIdentityIds) {
-      try {
-        if (await this.chain.isOperationalWalletRegistered.call(this.chain, candidateIdentityId, approverAddress)) {
-          return candidateIdentityId;
-        }
-      } catch {
-        // Ignore individual lookup failures; another participant may still match.
-      }
-    }
-    return 0n;
-  }
-
-  private async getVerifyParticipantIdentityIds(
-    contextGraphId: string,
-    contextGraphIdOnChain: bigint,
-  ): Promise<Set<bigint> | null> {
-    // LU-2: on-chain CGs no longer carry per-CG hosting committees, so
-    // there is no `chain.getContextGraphParticipants()` to consult.
-    // Any sharding-table member can ACK; participant gating is removed.
-    // We still return locally-cached participant identity IDs (legacy
-    // `_meta` triples written before LU-2) when present, so existing
-    // CGs that pre-date this change continue to filter signers the same
-    // way until they're re-registered.
-    void contextGraphIdOnChain;
-    const metaGraph = assertSafeIri(contextGraphMetaGraphUri(contextGraphId));
-    const contextGraphUri = assertSafeIri(`did:dkg:context-graph:${contextGraphId}`);
-    const result = await this.store.query(
-      `SELECT ?identityId WHERE {
-        GRAPH <${metaGraph}> {
-          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId
-        }
-      }`,
-    );
-    if (result.type !== 'bindings' || result.bindings.length === 0) {
-      return null;
-    }
-    const ids = new Set<bigint>();
-    for (const row of result.bindings as Record<string, string>[]) {
-      const raw = row.identityId?.replace(/^"|"$/g, '');
-      if (!raw) continue;
-      try {
-        const parsed = BigInt(raw);
-        if (parsed > 0n) ids.add(parsed);
-      } catch {
-        // Ignore malformed local metadata; it is not usable for trust elevation.
-      }
-    }
-    return ids.size > 0 ? ids : null;
   }
 
   private async promoteToVerifiedMemory(

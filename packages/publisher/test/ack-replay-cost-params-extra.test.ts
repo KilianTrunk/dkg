@@ -163,7 +163,10 @@ describe('P-3: ACK replay across cost parameters must be rejected by the chain',
     kav10Address = await adapter.getKnowledgeAssetsV10Address();
     coreIdentityId = BigInt(getSharedContext().coreProfileId);
 
-    const cgRes = await adapter.createOnChainContextGraph({});
+    const cgRes = await adapter.createOnChainContextGraph({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
     cgId = cgRes.contextGraphId;
   }, 60_000);
 

@@ -112,7 +112,10 @@ describe('E2E: DKGAgent with real blockchain', () => {
     const chainAdapter = new EVMChainAdapter(
       makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.EXTRA1),
     );
-    const cgResult = await chainAdapter.createOnChainContextGraph({});
+    const cgResult = await chainAdapter.createOnChainContextGraph({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
     CONTEXT_GRAPH_ID = String(cgResult.contextGraphId);
 
     await agents[0].createContextGraph({
@@ -222,7 +225,10 @@ describe('E2E: DKGAgent with real blockchain', () => {
     const chainAdapter = new EVMChainAdapter(
       makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.EXTRA1),
     );
-    const cgResult = await chainAdapter.createOnChainContextGraph({});
+    const cgResult = await chainAdapter.createOnChainContextGraph({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
     const secondCG = String(cgResult.contextGraphId);
 
     await agents[0].createContextGraph({
@@ -315,7 +321,10 @@ describe('E2E: DKGAgent with real blockchain', () => {
     const chainAdapter = new EVMChainAdapter(
       makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.EXTRA1),
     );
-    const cgResult = await chainAdapter.createOnChainContextGraph({});
+    const cgResult = await chainAdapter.createOnChainContextGraph({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
     const gossipCG = String(cgResult.contextGraphId);
 
     await agents[0].createContextGraph({

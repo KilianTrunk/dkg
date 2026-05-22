@@ -288,6 +288,7 @@ describe('Access protocol denial', () => {
     }), chainA);
 
     const cgResult = await chainA.createOnChainContextGraph({
+      accessPolicy: 0,
       publishPolicy: 1,
     });
 
@@ -420,6 +421,7 @@ describe('Access protocol round-trip', () => {
     }), chainA);
 
     const cgResult = await chainA.createOnChainContextGraph({
+      accessPolicy: 0,
       publishPolicy: 1,
     });
     const onChainCgId = cgResult.contextGraphId.toString();

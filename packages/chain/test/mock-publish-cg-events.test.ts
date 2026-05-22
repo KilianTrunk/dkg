@@ -14,6 +14,7 @@ import { MockChainAdapter } from '../src/mock-adapter.js';
 describe('MockChainAdapter.publishToContextGraph — emits publish events', () => {
   async function createOpenCG(mock: MockChainAdapter): Promise<bigint> {
     const result = await mock.createOnChainContextGraph({
+      accessPolicy: 0,
       publishPolicy: 1, // open
     });
     return result.contextGraphId;

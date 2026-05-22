@@ -159,14 +159,21 @@ export interface ContextGraphOnChain {
  * table at publish time and the ACK quorum is the system parameter
  * `parametersStorage.minimumRequiredSignatures()`. CGs do not declare
  * per-CG hosting committees or per-CG quorum.
+ *
+ * `accessPolicy` and `publishPolicy` are REQUIRED (Codex PR #595
+ * round-5): the previous all-optional shape let `{}` silently create a
+ * public + open-contribution CG, which is a privilege widening relative
+ * to the safe defaults the MCP/UI surfaces use. Callers must state both
+ * dials explicitly so migrations from the pre-LU2 signature can't
+ * accidentally leak data.
  */
 export interface CreateOnChainContextGraphParams {
+  /** 0 = public/discoverable, 1 = private/curated. */
+  accessPolicy: number;
+  /** 0 = curated publishing, 1 = open publishing. */
+  publishPolicy: number;
   participantAgents?: string[];
   metadataBatchId?: bigint;
-  /** 0 = public/discoverable, 1 = private/curated. */
-  accessPolicy?: number;
-  /** 0 = curated publishing, 1 = open publishing. */
-  publishPolicy?: number;
   publishAuthority?: string;
   publishAuthorityAccountId?: bigint;
 }

@@ -1372,11 +1372,17 @@ export class EVMChainAdapter implements ChainAdapter {
       throw new Error('ContextGraphs contract not deployed. Deploy ContextGraphs and ContextGraphStorage first.');
     }
 
+    if (params.accessPolicy === undefined || params.publishPolicy === undefined) {
+      throw new Error(
+        'createOnChainContextGraph: `accessPolicy` and `publishPolicy` are required (SPEC_CG_MEMORY_MODEL). ' +
+        'Pass both explicitly — e.g. { accessPolicy: 1, publishPolicy: 0 } for invite-only + curators-only.',
+      );
+    }
     const tx = await this.contracts.contextGraphs.createContextGraph(
       params.participantAgents ?? [],
       params.metadataBatchId ?? 0n,
-      params.accessPolicy ?? 0,
-      params.publishPolicy ?? 1,
+      params.accessPolicy,
+      params.publishPolicy,
       params.publishAuthority ?? ethers.ZeroAddress,
       params.publishAuthorityAccountId ?? 0n,
     );
@@ -2311,7 +2317,17 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async getMinimumRequiredSignatures(): Promise<number> {
     await this.init();
-    if (!this.contracts.parametersStorage) return 3;
+    // FAIL-CLOSED (Codex PR #595 round-5): the agent + publisher
+    // verify paths trust whatever this method returns. A silent
+    // fallback to a hardcoded `3` (or any other value) when
+    // ParametersStorage isn't resolvable would let verify use the
+    // wrong quorum without anyone noticing. Refuse to guess.
+    if (!this.contracts.parametersStorage) {
+      throw new Error(
+        'getMinimumRequiredSignatures: ParametersStorage contract is not resolvable. ' +
+        'Verify cannot enforce ACK quorum without a real chain read — fix the adapter wiring or pass an explicit override.',
+      );
+    }
     return Number(await this.contracts.parametersStorage.minimumRequiredSignatures());
   }
 

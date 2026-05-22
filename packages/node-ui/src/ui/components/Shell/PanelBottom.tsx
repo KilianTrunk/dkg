@@ -130,13 +130,14 @@ function NodeLogContent() {
 // on-chain activity. Covers all op types that can submit a tx.
 // Replaces with OTEL-sourced chain events once the telemetry stack is live.
 
-const TX_OP_TYPES = new Set(['publish', 'publishFromSWM', 'update', 'ka-update', 'reconstruct']);
+const TX_OP_TYPES = new Set(['publish', 'publishFromSWM', 'update', 'ka-update', 'verify', 'reconstruct']);
 
 const TX_TYPE_COLORS: Record<string, string> = {
   publish:        '#22c55e',
   publishFromSWM: '#16a34a',
   update:         '#14b8a6',
   'ka-update':    '#0d9488',
+  verify:         '#8b5cf6',
   reconstruct:    '#fb923c',
 };
 

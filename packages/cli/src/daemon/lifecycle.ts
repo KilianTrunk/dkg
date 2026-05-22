@@ -1405,24 +1405,15 @@ export async function runDaemonInner(
     }
   });
 
-  // Track KC confirmation (on-chain verify)
-  agent.eventBus.on(DKGEvent.KC_CONFIRMED, (data: any) => {
-    try {
-      const ctx = createOperationContext("verify");
-      tracker.start(ctx, {
-        contextGraphId: data.contextGraphId,
-        details: { kcId: data.kcId != null ? String(data.kcId) : undefined },
-      });
-      tracker.complete(ctx);
-    } catch { /* never crash */ }
-  });
-
-  // Track KA updates
+  // Track remote KA updates (gossipsub-received only — local updates are
+  // already tracked by the /api/update route with full phase/tx context)
   agent.eventBus.on(DKGEvent.KA_UPDATED, (data: any) => {
     try {
+      if (!data.fromPeerId) return;
       const ctx = createOperationContext("ka-update");
       tracker.start(ctx, {
         contextGraphId: data.contextGraphId,
+        peerId: data.fromPeerId,
         details: {
           ual: data.ual,
           rootEntities: Array.isArray(data.rootEntities) ? data.rootEntities.slice(0, 5) : undefined,

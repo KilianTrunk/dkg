@@ -20,10 +20,19 @@ export function useFetch<T>(
       }
     } catch (err: any) {
       if (mountedRef.current) {
-        // 401 means the page token is stale (node restarted) — force a reload
-        // so the server re-injects a fresh token rather than silently staying empty.
         if (err?.status === 401) {
-          window.location.reload();
+          // One-shot recovery: if the page has a token but the server rejected
+          // it (node restarted), reload once so the server re-injects a fresh
+          // token. Skip if no token was ever injected (dev mode) or if we
+          // already attempted a reload this session to avoid infinite loops.
+          const hasToken = !!(window as any).__DKG_TOKEN__;
+          const alreadyRetried = !!(window as any).__DKG_401_RELOADED__;
+          if (hasToken && !alreadyRetried) {
+            (window as any).__DKG_401_RELOADED__ = true;
+            window.location.reload();
+            return;
+          }
+          setError('Authentication expired — please refresh the page.');
           return;
         }
         setError(err.message);

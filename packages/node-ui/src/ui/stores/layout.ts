@@ -37,8 +37,6 @@ interface PersistedLayout {
   bottomHeight?: number;
 }
 
-const BOTTOM_HEIGHT_MIN = 80;
-const BOTTOM_HEIGHT_MAX = 900;
 const BOTTOM_HEIGHT_DEFAULT = 260;
 
 const DEFAULTS = {

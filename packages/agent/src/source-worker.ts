@@ -147,7 +147,14 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
     const finalDaemonStatus = pendingPublisherJobIds.length > 0
       ? undefined
       : normalizeFinalStatus(aggregate || current?.finalDaemonStatus || current?.lastStatus);
-    const failureDetails = collected.failureDetails ?? current?.failureDetails ?? deriveFailureDetails(finalDaemonStatus, current?.lastError);
+    const failureStatus = failureStatusForDetails(
+      finalDaemonStatus,
+      aggregate || current?.lastStatus,
+      current?.manualReviewRequired,
+    );
+    const failureDetails = failureStatus
+      ? collected.failureDetails ?? current?.failureDetails ?? deriveFailureDetails(failureStatus, current?.lastError)
+      : undefined;
 
     if (current?.fingerprint === fingerprint && current.manualReviewRequired) {
       nextState.sources[source.id] = {
@@ -189,6 +196,7 @@ export async function runSourceWorkerOnce<TSource extends SourceWorkerSource>(
         finalDaemonStatus: normalizeFinalStatus(aggregate),
         txHash,
         ual,
+        lastError: undefined,
         failureDetails: undefined,
       };
       continue;
@@ -310,11 +318,14 @@ function normalizeSourceWorkerJobState(state: SourceWorkerJobState): SourceWorke
   const finalDaemonStatus = mergedPendingPublisherJobIds.length > 0
     ? undefined
     : state.finalDaemonStatus ?? normalizeFinalStatus(aggregate || state.lastStatus);
+  const failureStatus = failureStatusForDetails(finalDaemonStatus, aggregate || state.lastStatus, state.manualReviewRequired);
   return {
     ...state,
     pendingPublisherJobIds: mergedPendingPublisherJobIds,
     finalDaemonStatus,
-    failureDetails: state.failureDetails ?? deriveFailureDetails(finalDaemonStatus, state.lastError),
+    failureDetails: failureStatus
+      ? state.failureDetails ?? deriveFailureDetails(failureStatus, state.lastError)
+      : undefined,
   };
 }
 
@@ -323,13 +334,25 @@ function normalizeProcessedState(result: SourceWorkerResult): SourceWorkerJobSta
   const pendingPublisherJobIds = result.nextState.pendingPublisherJobIds
     ?? result.pendingPublisherJobIds
     ?? deriveProcessedPendingPublisherJobIds(result, statuses);
+  const finalDaemonStatus = result.nextState.finalDaemonStatus ?? result.finalDaemonStatus;
+  const resultStatus = result.nextState.lastStatus ?? result.status;
+  const failureStatus = failureStatusForDetails(
+    finalDaemonStatus,
+    resultStatus,
+    result.nextState.manualReviewRequired,
+  );
   return {
     ...result.nextState,
     pendingPublisherJobIds,
-    finalDaemonStatus: result.nextState.finalDaemonStatus ?? result.finalDaemonStatus,
+    finalDaemonStatus,
     txHash: result.nextState.txHash ?? result.txHash,
     ual: result.nextState.ual ?? result.ual,
-    failureDetails: result.nextState.failureDetails ?? result.failureDetails,
+    lastError: isSuccessStatus(finalDaemonStatus) || isSuccessStatus(resultStatus)
+      ? undefined
+      : result.nextState.lastError,
+    failureDetails: failureStatus
+      ? result.nextState.failureDetails ?? result.failureDetails
+      : undefined,
   };
 }
 
@@ -407,15 +430,32 @@ function normalizeFinalStatus(status: string | undefined): string | undefined {
   return undefined;
 }
 
-function deriveFailureDetails(
+function failureStatusForDetails(
   finalDaemonStatus: string | undefined,
+  status: string | undefined,
+  manualReviewRequired: boolean | undefined,
+): string | undefined {
+  if (manualReviewRequired || status === 'manual-review-required') {
+    return 'manual-review-required';
+  }
+  if (isFailureStatus(finalDaemonStatus)) {
+    return finalDaemonStatus;
+  }
+  if (isFailureStatus(status)) {
+    return status;
+  }
+  return undefined;
+}
+
+function deriveFailureDetails(
+  status: string | undefined,
   message: string | undefined,
 ): SourceWorkerJobFailureDetails | undefined {
-  if (!isFailureStatus(finalDaemonStatus) && !message) {
+  if (!status) {
     return undefined;
   }
   return {
-    status: finalDaemonStatus,
+    status,
     message,
   };
 }

@@ -2,7 +2,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { runSourceWorkerOnce, saveSourceWorkerState } from '../src/source-worker.js';
+import { loadSourceWorkerState, runSourceWorkerOnce, saveSourceWorkerState } from '../src/source-worker.js';
 
 const cleanup: string[] = [];
 afterEach(async () => {
@@ -122,6 +122,58 @@ describe('source worker runtime', () => {
       lastStatus: 'finalized',
       finalDaemonStatus: 'finalized',
       pendingPublisherJobIds: [],
+    });
+  });
+
+  it('does not restore failure details from stale lastError after finalization', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'source-worker-'));
+    cleanup.push(dir);
+    const statePath = join(dir, 'state.json');
+
+    await saveSourceWorkerState(statePath, {
+      sources: {
+        'src-1': {
+          fingerprint: 'fp-1',
+          lastJobIds: ['job-1'],
+          lastJobStatuses: { 'job-1': 'finalized' },
+          lastStatus: 'finalized',
+          finalDaemonStatus: 'finalized',
+          lastError: 'previous publisher failure',
+        },
+      },
+    });
+
+    await expect(loadSourceWorkerState(statePath)).resolves.toMatchObject({
+      sources: {
+        'src-1': {
+          lastStatus: 'finalized',
+          finalDaemonStatus: 'finalized',
+          failureDetails: undefined,
+        },
+      },
+    });
+
+    const deps = {
+      now: () => '2026-04-28T00:00:00.000Z',
+      getFingerprint: vi.fn(async () => 'fp-1'),
+      getJobStatus: vi.fn(async () => {
+        throw new Error('finalized job should not be polled');
+      }),
+      processSource: vi.fn(async () => {
+        throw new Error('unchanged finalized source should not be processed');
+      }),
+    };
+
+    const state = await runSourceWorkerOnce([{ id: 'src-1', maxRetries: 3 }], statePath, deps);
+
+    expect(deps.getJobStatus).not.toHaveBeenCalled();
+    expect(deps.processSource).not.toHaveBeenCalled();
+    expect(state.sources['src-1']).toMatchObject({
+      lastStatus: 'finalized',
+      finalDaemonStatus: 'finalized',
+      pendingPublisherJobIds: [],
+      failureDetails: undefined,
+      lastError: undefined,
     });
   });
 

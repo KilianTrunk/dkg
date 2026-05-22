@@ -9704,6 +9704,41 @@ export class DKGAgent {
     // both surfaces are gone. The publish path uses
     // `parametersStorage.minimumRequiredSignatures()` and gates ACK
     // signers on sharding-table membership instead.
+    //
+    // Pre-LU2 migration warning (Codex PR #595 round-3): CGs created
+    // on rc.x builds before this change may have a stored per-CG
+    // `RequiredSignatures` triple in `_meta`. That value is now dead
+    // data — the new contract has no slot for it. Persisted
+    // `DKG_PARTICIPANT_IDENTITY_ID` triples are NOT dead: the verify
+    // path still consults them as an off-chain advisory allowlist (see
+    // `getVerifyParticipantIdentityIds`), so a warning isn't needed
+    // for those. We surface the quorum-override mismatch loudly so a
+    // user upgrading an existing edge node knows the security model
+    // shifted from per-CG M-of-N to system-wide quorum.
+    try {
+      const staleQuorumResult = await this.store.query(
+        `SELECT ?required WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}RequiredSignatures> ?required } } LIMIT 1`,
+      );
+      if (staleQuorumResult.type === 'bindings' && staleQuorumResult.bindings.length > 0) {
+        const storedValue = staleQuorumResult.bindings[0]?.['required']?.replace(/^"|"$/g, '') ?? 'unknown';
+        let sysMinStr = 'unknown';
+        if (typeof this.chain.getMinimumRequiredSignatures === 'function') {
+          try {
+            const sysMin = await this.chain.getMinimumRequiredSignatures();
+            if (Number.isInteger(sysMin) && sysMin >= 1) sysMinStr = String(sysMin);
+          } catch { /* tolerate: this is a warning path */ }
+        }
+        this.log.warn(
+          ctx,
+          `[migration] Context graph "${id}" has a pre-LU2 stored per-CG requiredSignatures=${storedValue}. ` +
+          `SPEC_CG_MEMORY_MODEL removed per-CG quorum overrides; the system-wide ACK quorum ` +
+          `(parametersStorage.minimumRequiredSignatures()=${sysMinStr}) applies on-chain. ` +
+          `The stored value is now advisory only — chain enforcement does NOT see it.`,
+        );
+      }
+    } catch (err: any) {
+      this.log.warn(ctx, `[migration] pre-LU2 metadata probe failed for "${id}": ${err?.message ?? err}`);
+    }
 
     // Check if already registered on-chain (prevents duplicate minting)
     const existingOnChainId = await this.getContextGraphOnChainId(id);
@@ -11672,21 +11707,39 @@ export class DKGAgent {
     // override (`opts.requiredSignatures`) wins for advisory/test paths
     // (e.g. `/api/verify?requiredSignatures=...`); otherwise we read the
     // system param off-chain via the adapter accessor.
+    //
+    // FAIL-CLOSED (Codex PR #595 round-3): `chain.verify()` only calls
+    // `registerKnowledgeCollection()` — it does NOT submit the collected
+    // signatures on-chain. This local quorum check is therefore the
+    // *only* enforcement gate. If the chain adapter can't tell us the
+    // system minimum (RPC outage, missing method, invalid value), we
+    // must NOT silently downgrade to quorum=1 — that's fail-open. We
+    // throw with an actionable error pointing the caller at the
+    // explicit override knob instead.
     let requiredSignatures = opts.requiredSignatures ?? 0;
-    if (requiredSignatures === 0 && typeof this.chain.getMinimumRequiredSignatures === 'function') {
-      try {
-        const sysMin = await this.chain.getMinimumRequiredSignatures();
-        if (Number.isInteger(sysMin) && sysMin >= 1) {
-          requiredSignatures = sysMin;
-        }
-      } catch (err: any) {
-        this.log.warn(ctx, `getMinimumRequiredSignatures failed (${err?.message ?? err}); falling back to 1`);
-      }
-    }
     if (requiredSignatures === 0) {
-      requiredSignatures = 1;
-      this.log.warn(ctx, `requiredSignatures defaults to 1 — adapter does not implement getMinimumRequiredSignatures. ` +
-        `Pass opts.requiredSignatures explicitly to override.`);
+      if (typeof this.chain.getMinimumRequiredSignatures !== 'function') {
+        throw new Error(
+          'Cannot determine ACK quorum for verify: chain adapter does not implement `getMinimumRequiredSignatures()`. ' +
+          'Pass `opts.requiredSignatures` explicitly (advisory paths only) or use a chain adapter that supports the system-parameter lookup.',
+        );
+      }
+      let sysMin: number;
+      try {
+        sysMin = await this.chain.getMinimumRequiredSignatures();
+      } catch (err: any) {
+        throw new Error(
+          `Cannot determine ACK quorum for verify: getMinimumRequiredSignatures() failed (${err?.message ?? err}). ` +
+          `Pass opts.requiredSignatures explicitly or fix the chain adapter connection.`,
+        );
+      }
+      if (!Number.isInteger(sysMin) || sysMin < 1) {
+        throw new Error(
+          `Cannot determine ACK quorum for verify: getMinimumRequiredSignatures() returned invalid value ${sysMin} (must be a positive integer). ` +
+          `Pass opts.requiredSignatures explicitly or fix the chain adapter.`,
+        );
+      }
+      requiredSignatures = sysMin;
     }
 
     // 4. Sign the verify digest as proposer

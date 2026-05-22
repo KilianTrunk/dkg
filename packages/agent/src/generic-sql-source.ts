@@ -624,6 +624,7 @@ function sourceFingerprintConfig(source: GenericSqlSourceDefinition, mapping: Ge
     },
     mappingId: mapping.id,
     mappingVersion: mapping.version,
+    mappingDefinitionFingerprint: hashStable(mapping),
     parameters: source.parameters ?? {},
   };
 }

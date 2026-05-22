@@ -136,6 +136,35 @@ describe('generic SQL source handler', () => {
     expect(groups[0]!.roots).toEqual(['urn:neutral:order:B200']);
   });
 
+  it('changes the source fingerprint when mapping contents change without a version bump', async () => {
+    registerGenericSqlConnector(TEST_DIALECT, async (): Promise<GenericSqlClient> => ({
+      async query(_sql, _parameters, dataset) {
+        return rowsByDataset()[dataset] ?? [];
+      },
+    }));
+
+    const prior = await genericSqlSourceHandler.prepare(memorySource());
+    const current = await genericSqlSourceHandler.prepare(memorySource({
+      ...mapping,
+      relations: mapping.relations?.map((relation) => ({
+        ...relation,
+        predicate: 'https://example.test/includesLine',
+      })),
+    }));
+    const groups = selectGenericSqlAssetGroupsForChangedPartitions(
+      current.assets,
+      current.fingerprintMetadata,
+      prior.fingerprintMetadata,
+    );
+
+    expect(current.fingerprintMetadata.mappingId).toBe(prior.fingerprintMetadata.mappingId);
+    expect(current.fingerprintMetadata.mappingVersion).toBe(prior.fingerprintMetadata.mappingVersion);
+    expect(current.fingerprintMetadata.sourceConfigFingerprint).not.toBe(prior.fingerprintMetadata.sourceConfigFingerprint);
+    expect(current.fingerprint).not.toBe(prior.fingerprint);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.roots).toEqual(current.assets.map((asset) => asset.rootEntity).sort());
+  });
+
   it('rejects rows missing the configured partition key', async () => {
     registerGenericSqlConnector(TEST_DIALECT, async (): Promise<GenericSqlClient> => ({
       async query(_sql, _parameters, dataset) {

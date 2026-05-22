@@ -136,6 +136,41 @@ describe('generic SQL source handler', () => {
     expect(groups[0]!.roots).toEqual(['urn:neutral:order:B200']);
   });
 
+  it('rejects rows missing the configured partition key', async () => {
+    registerGenericSqlConnector(TEST_DIALECT, async (): Promise<GenericSqlClient> => ({
+      async query(_sql, _parameters, dataset) {
+        if (dataset === 'orders') {
+          return [
+            { order_id: '', sku: 'W-missing-key', quantity: '1', status: 'ready' },
+          ];
+        }
+        return [];
+      },
+    }));
+
+    await expect(genericSqlSourceHandler.prepare(memorySource({
+      ...mapping,
+      entities: [
+        {
+          name: 'order',
+          from: 'orders',
+          id: 'urn:neutral:sku:{sku}',
+          properties: {
+            'https://example.test/status': '{status}',
+          },
+        },
+      ],
+      relations: [],
+      fingerprint: {
+        mapperVersion: 1,
+        partitionBy: {
+          field: 'order_id',
+          datasets: ['orders'],
+        },
+      },
+    }))).rejects.toThrow('dataset orders row 1 is missing partition key order_id');
+  });
+
   it('preflights missing SQL Server environment before loading optional driver', async () => {
     await expect(genericSqlSourceHandler.prepare({
       ...memorySource(),

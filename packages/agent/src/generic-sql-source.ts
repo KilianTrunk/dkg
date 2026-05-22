@@ -508,13 +508,16 @@ function buildGenericSqlFingerprintMetadata(
     rowsByPartition.set('__all__', rowsByDataset);
   } else {
     for (const [dataset, rows] of Object.entries(rowsByDataset)) {
-      for (const row of rows) {
+      if (!partitionDatasets.has(dataset)) {
+        globalDatasets.add(dataset);
+        continue;
+      }
+      for (const [rowIndex, row] of rows.entries()) {
         const key = stringifyRawValue(row[partitionSpec.field]);
-        if (!key || !partitionDatasets.has(dataset)) {
-          if (!partitionDatasets.has(dataset)) {
-            globalDatasets.add(dataset);
-          }
-          continue;
+        if (!key) {
+          throw new Error(
+            `Generic SQL source ${source.id} mapping ${mapping.id} dataset ${dataset} row ${rowIndex + 1} is missing partition key ${partitionSpec.field}`,
+          );
         }
         const partition = rowsByPartition.get(key) ?? {};
         partition[dataset] = [...(partition[dataset] ?? []), row];

@@ -15,10 +15,13 @@ import {KnowledgeAssetsLib} from "./libraries/KnowledgeAssetsLib.sol";
  * @notice Stateless logic facade for Context Graph operations. All state lives in
  *         ContextGraphStorage (ERC-721 registry). This contract is replaceable via Hub.
  *
- * @dev V10 Phase 7 Task 2: the legacy `addBatchToContextGraph` attestation /
- *      inclusion-proof path is REMOVED (closes audit H2). Participants are
- *      split into hosting nodes (uint72 identity IDs — quorum attesters) and
- *      participant agents (EOA allow-list used for curated / PCA flows).
+ * @dev The legacy `addBatchToContextGraph` attestation / inclusion-proof
+ *      path is REMOVED (closes audit H2). Per-CG hosting committees and
+ *      per-CG quorum were removed in SPEC_CG_MEMORY_MODEL: every CG is
+ *      hosted by the sharding table at publish time, and the ACK quorum
+ *      is the system parameter `parametersStorage.minimumRequiredSignatures()`.
+ *      The only per-CG participant list is the EOA allow-list used for
+ *      curated / PCA flows.
  *
  *      Publish authorization supports the three curator types encoded in
  *      ContextGraphStorage (see decision #22):
@@ -75,20 +78,20 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
 
     /**
      * @notice Create a new context graph. Mints an ERC-721 to msg.sender.
-     * @param hostingNodes              Sorted ascending node identity IDs (storage attestation set)
      * @param participantAgents         EOA allow-list (no zeros, no dups)
-     * @param requiredSignatures        M-of-N quorum (≤ hostingNodes.length)
      * @param metadataBatchId           Batch ID describing the CG metadata (0 if none)
      * @param accessPolicy              0 = public/discoverable, 1 = private/curated
      * @param publishPolicy             0 = curated, 1 = open
      * @param publishAuthority          Curator address (required when curated; ignored when open)
      * @param publishAuthorityAccountId Non-zero -> PCA curator type. Requires curated. Ignored when open.
      * @return contextGraphId           Newly assigned context graph ID (= ERC-721 token ID)
+     *
+     * @dev Hosts and ACK quorum are network-level concerns: the sharding table
+     *      supplies hosts at publish time and `parametersStorage.minimumRequiredSignatures()`
+     *      sets the quorum. CGs do not declare a per-CG hosting committee.
      */
     function createContextGraph(
-        uint72[] calldata hostingNodes,
         address[] calldata participantAgents,
-        uint8 requiredSignatures,
         uint256 metadataBatchId,
         uint8 accessPolicy,
         uint8 publishPolicy,
@@ -112,9 +115,7 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
 
         contextGraphId = contextGraphStorage.createContextGraph(
             msg.sender,
-            hostingNodes,
             participantAgents,
-            requiredSignatures,
             metadataBatchId,
             accessPolicy,
             publishPolicy,
@@ -255,13 +256,6 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
         );
     }
 
-    function setHostingNodes(
-        uint256 contextGraphId,
-        uint72[] calldata nodes
-    ) external onlyContextGraphOwner(contextGraphId) {
-        contextGraphStorage.setHostingNodes(contextGraphId, nodes);
-    }
-
     function addParticipantAgent(
         uint256 contextGraphId,
         address agent
@@ -274,13 +268,6 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
         address agent
     ) external onlyContextGraphOwnerOrAuthority(contextGraphId) {
         contextGraphStorage.removeParticipantAgent(contextGraphId, agent);
-    }
-
-    function updateQuorum(
-        uint256 contextGraphId,
-        uint8 requiredSignatures
-    ) external onlyContextGraphOwner(contextGraphId) {
-        contextGraphStorage.updateQuorum(contextGraphId, requiredSignatures);
     }
 
     // --- Publish authorization ---

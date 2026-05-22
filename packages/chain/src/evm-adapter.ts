@@ -1212,7 +1212,6 @@ export class EVMChainAdapter implements ChainAdapter {
                   contextGraphId: parsed.args.contextGraphId?.toString() ?? '',
                   creator: parsed.args.owner?.toString() ?? '',
                   owner: parsed.args.owner?.toString() ?? '',
-                  requiredSignatures: Number(parsed.args.requiredSignatures ?? 0),
                   accessPolicy: Number(parsed.args.accessPolicy ?? 0),
                   publishPolicy: Number(parsed.args.publishPolicy ?? 0),
                   txHash: log.transactionHash,
@@ -1275,8 +1274,8 @@ export class EVMChainAdapter implements ChainAdapter {
   //
   // Thin transitional affordance — reserves a bytes32 name-hash with an
   // optional cleartext metadata reveal. Governance for the context graph
-  // itself (hosting nodes, publish policy, participants, quorum) lives in
-  // `ContextGraphs` / `ContextGraphStorage` — see createOnChainContextGraph.
+  // itself (publish policy, participant agents) lives in `ContextGraphs` /
+  // `ContextGraphStorage` — see createOnChainContextGraph.
   // =====================================================================
 
   async createContextGraph(params: CreateContextGraphParams): Promise<TxResult> {
@@ -1373,11 +1372,8 @@ export class EVMChainAdapter implements ChainAdapter {
       throw new Error('ContextGraphs contract not deployed. Deploy ContextGraphs and ContextGraphStorage first.');
     }
 
-    const hostingNodes = params.participantIdentityIds.map((id) => id);
     const tx = await this.contracts.contextGraphs.createContextGraph(
-      hostingNodes,
       params.participantAgents ?? [],
-      params.requiredSignatures,
       params.metadataBatchId ?? 0n,
       params.accessPolicy ?? 0,
       params.publishPolicy ?? 1,
@@ -1415,20 +1411,6 @@ export class EVMChainAdapter implements ChainAdapter {
       success: receipt.status === 1,
       contextGraphId,
     };
-  }
-
-  async getContextGraphParticipants(contextGraphId: bigint): Promise<bigint[] | null> {
-    await this.init();
-    if (!this.contracts.contextGraphStorage) {
-      return null;
-    }
-
-    try {
-      const hostingNodes: bigint[] = await this.contracts.contextGraphStorage.getHostingNodes(contextGraphId);
-      return hostingNodes.map((id) => BigInt(id));
-    } catch {
-      return null;
-    }
   }
 
   async verify(params: VerifyParams): Promise<TxResult> {

@@ -200,11 +200,10 @@ describe('EVM E2E: Full on-chain publishing lifecycle', () => {
     const coreOp = new Wallet(HARDHAT_KEYS.CORE_OP, ctx.provider);
     await mintTokens(ctx.provider, ctx.hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('500000'));
 
-    // Create an on-chain context graph with all 3 receivers as hosting nodes (M/N: 3/3)
-    const cgResult = await adapter.createOnChainContextGraph({
-      participantIdentityIds: ctx.receiverIds.map((id) => BigInt(id)),
-      requiredSignatures: 3,
-    });
+    // Create an on-chain context graph. Per SPEC_CG_MEMORY_MODEL there is
+    // no per-CG hosting committee; ACK quorum comes from the system
+    // `minimumRequiredSignatures` parameter, raised to 3 above.
+    const cgResult = await adapter.createOnChainContextGraph({});
     expect(cgResult.success).toBe(true);
     const contextGraphId = cgResult.contextGraphId;
     expect(contextGraphId).toBeGreaterThan(0n);

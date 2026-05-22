@@ -626,9 +626,7 @@ export class MockChainAdapter implements ChainAdapter {
 
   private contextGraphs = new Map<bigint, {
     manager: string;
-    participantIdentityIds: bigint[];
     participantAgents: string[];
-    requiredSignatures: number;
     metadataBatchId: bigint;
     accessPolicy: number;
     publishPolicy: number;
@@ -640,17 +638,6 @@ export class MockChainAdapter implements ChainAdapter {
   private nextContextGraphId = 1n;
 
   async createOnChainContextGraph(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult> {
-    if (params.requiredSignatures < 1) {
-      throw new Error('Mock: requiredSignatures must be >= 1');
-    }
-    if (params.requiredSignatures > params.participantIdentityIds.length) {
-      throw new Error(`Mock: requiredSignatures (${params.requiredSignatures}) exceeds participant count (${params.participantIdentityIds.length})`);
-    }
-    for (let i = 1; i < params.participantIdentityIds.length; i++) {
-      if (params.participantIdentityIds[i] <= params.participantIdentityIds[i - 1]) {
-        throw new Error('Mock: participantIdentityIds must be strictly increasing (sorted, unique)');
-      }
-    }
     const publishPolicy = params.publishPolicy ?? 1;
     const accessPolicy = params.accessPolicy ?? 0;
     if (accessPolicy !== 0 && accessPolicy !== 1) {
@@ -708,9 +695,7 @@ export class MockChainAdapter implements ChainAdapter {
     const contextGraphId = this.nextContextGraphId++;
     this.contextGraphs.set(contextGraphId, {
       manager: this.signerAddress,
-      participantIdentityIds: [...params.participantIdentityIds],
       participantAgents: participantAgents.map((agent) => ethers.getAddress(agent)),
-      requiredSignatures: params.requiredSignatures,
       metadataBatchId: params.metadataBatchId ?? 0n,
       accessPolicy,
       publishPolicy,
@@ -725,9 +710,7 @@ export class MockChainAdapter implements ChainAdapter {
       creator: this.signerAddress,
       owner: this.signerAddress,
       manager: this.signerAddress,
-      participantIdentityIds: params.participantIdentityIds.map((id) => id.toString()),
       participantAgents: participantAgents.map((agent) => ethers.getAddress(agent)),
-      requiredSignatures: params.requiredSignatures,
       accessPolicy,
       publishPolicy,
     });
@@ -887,8 +870,8 @@ export class MockChainAdapter implements ChainAdapter {
       }
     }
 
-    if (params.signerSignatures.length < cg.requiredSignatures) {
-      throw new Error(`Not enough signatures: need ${cg.requiredSignatures}, got ${params.signerSignatures.length}`);
+    if (params.signerSignatures.length < this.minimumRequiredSignatures) {
+      throw new Error(`Not enough signatures: need ${this.minimumRequiredSignatures}, got ${params.signerSignatures.length}`);
     }
 
     cg.batches.push(params.batchId);
@@ -907,9 +890,9 @@ export class MockChainAdapter implements ChainAdapter {
       throw new Error(`Context graph ${params.contextGraphId} not found or inactive`);
     }
 
-    if (params.participantSignatures.length < cg.requiredSignatures) {
+    if (params.participantSignatures.length < this.minimumRequiredSignatures) {
       throw new Error(
-        `Not enough participant signatures: need ${cg.requiredSignatures}, got ${params.participantSignatures.length}`,
+        `Not enough participant signatures: need ${this.minimumRequiredSignatures}, got ${params.participantSignatures.length}`,
       );
     }
 
@@ -973,11 +956,6 @@ export class MockChainAdapter implements ChainAdapter {
 
   getContextGraph(contextGraphId: bigint) {
     return this.contextGraphs.get(contextGraphId);
-  }
-
-  async getContextGraphParticipants(contextGraphId: bigint): Promise<bigint[] | null> {
-    const cg = this.contextGraphs.get(contextGraphId);
-    return cg ? [...cg.participantIdentityIds] : null;
   }
 
   // --- V10 Publish (KnowledgeAssetsV10 → KnowledgeCollectionStorage) ---

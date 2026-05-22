@@ -86,13 +86,10 @@ export async function revertToBase(): Promise<void> {
  */
 export async function createTestContextGraph(
   chain?: EVMChainAdapter,
-  identityId?: bigint,
+  _identityId?: bigint,
 ): Promise<bigint> {
   const adapter = chain ?? createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-  const id = identityId ?? BigInt(getSharedContext().coreProfileId);
   const result = await adapter.createOnChainContextGraph({
-    participantIdentityIds: [id],
-    requiredSignatures: 1,
     publishPolicy: 0,
   });
   if (!result.success || result.contextGraphId === 0n) {

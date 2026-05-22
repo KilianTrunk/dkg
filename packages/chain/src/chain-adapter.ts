@@ -154,10 +154,14 @@ export interface ContextGraphOnChain {
 
 // ----- On-Chain Context Graph types (ContextGraphs contract) -----
 
+/**
+ * Per SPEC_CG_MEMORY_MODEL: every CG is hosted by the network's sharding
+ * table at publish time and the ACK quorum is the system parameter
+ * `parametersStorage.minimumRequiredSignatures()`. CGs do not declare
+ * per-CG hosting committees or per-CG quorum.
+ */
 export interface CreateOnChainContextGraphParams {
-  participantIdentityIds: bigint[];
   participantAgents?: string[];
-  requiredSignatures: number;
   metadataBatchId?: bigint;
   /** 0 = public/discoverable, 1 = private/curated. */
   accessPolicy?: number;
@@ -701,7 +705,6 @@ export interface ChainAdapter {
 
   // On-Chain Context Graphs (ContextGraphs contract)
   createOnChainContextGraph?(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult>;
-  getContextGraphParticipants?(contextGraphId: bigint): Promise<bigint[] | null>;
   verify?(params: VerifyParams): Promise<TxResult>;
   publishToContextGraph?(params: PublishToContextGraphParams): Promise<OnChainPublishResult>;
 

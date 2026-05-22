@@ -13,7 +13,6 @@ const PREFIXES = `
 PREFIX epcis: <https://gs1.github.io/EPCIS/>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX dkg: <http://dkg.io/ontology/>
-PREFIX dmaast: <https://dmaast.eu/ontology/>
 `;
 
 /** Escape special characters in SPARQL string literals. */
@@ -44,6 +43,10 @@ export function normalizeBizStep(value: string): string {
     throw new Error('Invalid bizStep value');
   }
   return normalizeGs1Vocabulary('BizStep', value);
+}
+
+function extensionLocalNameFilter(predicateVariable: string, localName: string): string {
+  return `FILTER(REPLACE(STR(?${predicateVariable}), "^.*[/#]", "") = "${localName}")`;
 }
 
 /**
@@ -204,19 +207,24 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   optionalClauses.push('OPTIONAL { ?event epcis:inputEPCList ?inputEPCList . }');
   optionalClauses.push('OPTIONAL { ?event epcis:outputEPCList ?outputEPCList . }');
 
-  // Extension identifiers carried as JSON-LD triples.
+  // Extension identifiers carried as JSON-LD triples. Match by predicate local
+  // name so project-specific ontologies stay outside the generic DKG EPCIS API.
   if (params.configurationId) {
-    wherePatterns.push('?event dmaast:configurationId ?configurationId .');
+    wherePatterns.push(`?event ?configurationIdPredicate ?configurationId .
+      ${extensionLocalNameFilter('configurationIdPredicate', 'configurationId')}`);
     filterClauses.push(`FILTER(STR(?configurationId) = "${escapeSparql(params.configurationId)}")`);
   } else {
-    optionalClauses.push('OPTIONAL { ?event dmaast:configurationId ?configurationId . }');
+    optionalClauses.push(`OPTIONAL { ?event ?configurationIdPredicate ?configurationId .
+      ${extensionLocalNameFilter('configurationIdPredicate', 'configurationId')} }`);
   }
 
   if (params.shipmentId) {
-    wherePatterns.push('?event dmaast:shipmentId ?shipmentId .');
+    wherePatterns.push(`?event ?shipmentIdPredicate ?shipmentId .
+      ${extensionLocalNameFilter('shipmentIdPredicate', 'shipmentId')}`);
     filterClauses.push(`FILTER(STR(?shipmentId) = "${escapeSparql(params.shipmentId)}")`);
   } else {
-    optionalClauses.push('OPTIONAL { ?event dmaast:shipmentId ?shipmentId . }');
+    optionalClauses.push(`OPTIONAL { ?event ?shipmentIdPredicate ?shipmentId .
+      ${extensionLocalNameFilter('shipmentIdPredicate', 'shipmentId')} }`);
   }
 
   // Pagination

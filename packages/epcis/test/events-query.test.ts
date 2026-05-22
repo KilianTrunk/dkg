@@ -57,11 +57,10 @@ describe('handleEventsQuery', () => {
     expect(body.schemaVersion).toBe('2.0');
     expect(body['@context']).toEqual([
       'https://ref.gs1.org/standards/epcis/2.0.0/epcis-context.jsonld',
-      { dkg: 'http://dkg.io/ontology/' },
       {
-        dmaast: 'https://dmaast.eu/ontology/',
-        configurationId: 'https://dmaast.eu/ontology/configurationId',
-        shipmentId: 'https://dmaast.eu/ontology/shipmentId',
+        dkg: 'http://dkg.io/ontology/',
+        configurationId: 'http://dkg.io/ontology/epcis/configurationId',
+        shipmentId: 'http://dkg.io/ontology/epcis/shipmentId',
       },
     ]);
 
@@ -236,7 +235,7 @@ describe('handleEventsQuery', () => {
     expect(calls[0].sparql).toContain('epcis:readPoint <urn:epc:id:sgln:4012345.00001.0>');
   });
 
-  it('passes DMaaST configurationId and shipmentId filters through to SPARQL', async () => {
+  it('passes extension configurationId and shipmentId filters through to SPARQL', async () => {
     const { engine, calls } = createTrackingQueryEngine([makeBindings()]);
 
     await handleEventsQuery(
@@ -244,10 +243,11 @@ describe('handleEventsQuery', () => {
       { contextGraphId: CONTEXT_GRAPH_ID, queryEngine: engine, basePath: BASE_PATH },
     );
 
-    expect(calls[0].sparql).toContain('PREFIX dmaast: <https://dmaast.eu/ontology/>');
-    expect(calls[0].sparql).toContain('?event dmaast:configurationId ?configurationId');
+    expect(calls[0].sparql).toContain('?event ?configurationIdPredicate ?configurationId');
+    expect(calls[0].sparql).toContain('FILTER(REPLACE(STR(?configurationIdPredicate), "^.*[/#]", "") = "configurationId")');
     expect(calls[0].sparql).toContain('FILTER(STR(?configurationId) = "CFG-001")');
-    expect(calls[0].sparql).toContain('?event dmaast:shipmentId ?shipmentId');
+    expect(calls[0].sparql).toContain('?event ?shipmentIdPredicate ?shipmentId');
+    expect(calls[0].sparql).toContain('FILTER(REPLACE(STR(?shipmentIdPredicate), "^.*[/#]", "") = "shipmentId")');
     expect(calls[0].sparql).toContain('FILTER(STR(?shipmentId) = "SHIP-001")');
   });
 
@@ -486,7 +486,7 @@ describe('toEpcisEvent', () => {
     expect(event['dkg:ual']).toBe('did:dkg:hardhat1:31337/0x123/42');
   });
 
-  it('includes DMaaST configurationId and shipmentId when bindings are present', () => {
+  it('includes extension configurationId and shipmentId when bindings are present', () => {
     const binding = makeBindings({
       configurationId: '"CFG-001"',
       shipmentId: '"SHIP-001"',

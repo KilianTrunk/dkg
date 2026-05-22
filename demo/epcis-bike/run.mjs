@@ -41,7 +41,7 @@ const SKIP_CG_CREATE = process.argv.includes('--skip-cg-create');
 // Pin a stable name via `EPCIS_DEMO_CG=<name>` when iterating Phase 7
 // verifications against the same data set across runs (and accept the
 // duplicate-root rejection if the prior run's data is still there).
-const DEFAULT_CG_INPUT = `dmaast-bike-demo-${Date.now().toString(36)}`;
+const DEFAULT_CG_INPUT = `epcis-bike-demo-${Date.now().toString(36)}`;
 const CG_INPUT = process.env.EPCIS_DEMO_CG ?? DEFAULT_CG_INPUT;
 const CG_INPUT_AUTO_GENERATED = !process.env.EPCIS_DEMO_CG;
 const SUB = 'bike-line';
@@ -63,7 +63,7 @@ const NODE2_DKG_HOME =
 
 // `CG_ID` holds the canonical, fully-resolved context-graph identifier. When
 // the user passes a bare name (no `/`), the daemon auto-prefixes it with the
-// agent address (e.g. `0xabc.../dmaast-bike-demo`). Phase 0 parses the
+// agent address (e.g. `0xabc.../epcis-bike-demo`). Phase 0 parses the
 // `context-graph create` output and updates these. Both CLI commands AND
 // SPARQL graph URIs must use the resolved form — the EPCIS plugin's
 // `ContextGraphNotFound` lookup is exact-match.
@@ -120,7 +120,7 @@ let phase6AnchoredCount = 0;
 if (SKIP_CG_CREATE && !CG_INPUT.includes('/')) {
   const skipBareNameMsg =
     '--skip-cg-create requires EPCIS_DEMO_CG to be the fully-qualified CG ID ' +
-    '(e.g. "0xabc.../dmaast-bike-demo"), not a bare name. Skip mode bypasses ' +
+    '(e.g. "0xabc.../epcis-bike-demo"), not a bare name. Skip mode bypasses ' +
     'the auto-resolution that turns bare names into canonical IDs.';
   if (JSON_MODE) {
     // Surface the error as a single NDJSON record so machine consumers
@@ -729,7 +729,7 @@ async function phase0() {
 
   // Surface the resolved CG_INPUT once, here, so the user sees the
   // auto-suffixed default before Phase 0 starts creating it. Without
-  // this, the auto-generated name (e.g. `dmaast-bike-demo-mz4hk7n0`)
+  // this, the auto-generated name (e.g. `epcis-bike-demo-mz4hk7n0`)
   // would only appear in `context-graph create` output, several
   // emit() calls deeper — and a user re-running the demo to compare
   // outputs has no quick way to see what CG name they'd need to set

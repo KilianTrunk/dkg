@@ -99,19 +99,37 @@ export class VerifyCollector {
       batchId, merkleRoot, entities, proposerSignature,
       timeoutMs, allowPartial = false,
     } = params;
+    // FAIL-CLOSED (Codex PR #595 round-4): a caller that omits an
+    // explicit `requiredSignatures` MUST get the system-parameter
+    // quorum. Defaulting to 1 on lookup failure would let the
+    // proposer self-approve and pass quorum, and `chain.verify()`
+    // doesn't re-check signatures on-chain, so this local count is
+    // the only enforcement gate. If we can't determine the system
+    // minimum (no probe wired, RPC fails, garbage value), refuse to
+    // proceed.
     let requiredSignatures = params.requiredSignatures ?? 0;
-    if (requiredSignatures <= 0 && this.deps.getMinimumRequiredSignatures) {
-      try {
-        const sysMin = await this.deps.getMinimumRequiredSignatures();
-        if (Number.isInteger(sysMin) && sysMin >= 1) {
-          requiredSignatures = sysMin;
-        }
-      } catch {
-        // Fall through to the 1-of-1 default below.
-      }
-    }
     if (requiredSignatures <= 0) {
-      requiredSignatures = 1;
+      if (!this.deps.getMinimumRequiredSignatures) {
+        throw new Error(
+          'VerifyCollector: requiredSignatures was omitted and no `getMinimumRequiredSignatures` probe was wired. ' +
+          'Pass `params.requiredSignatures` explicitly or supply a probe at construction.',
+        );
+      }
+      let sysMin: number;
+      try {
+        sysMin = await this.deps.getMinimumRequiredSignatures();
+      } catch (err: any) {
+        throw new Error(
+          `VerifyCollector: getMinimumRequiredSignatures() failed (${err?.message ?? err}). ` +
+          `Pass params.requiredSignatures explicitly or fix the probe.`,
+        );
+      }
+      if (!Number.isInteger(sysMin) || sysMin < 1) {
+        throw new Error(
+          `VerifyCollector: getMinimumRequiredSignatures() returned invalid value ${sysMin} (must be a positive integer).`,
+        );
+      }
+      requiredSignatures = sysMin;
     }
     const boundedTimeoutMs = Math.min(
       assertVerifyCollectionTimeoutMs(timeoutMs),

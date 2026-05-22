@@ -11806,9 +11806,47 @@ export class DKGAgent {
     const isEligibleParticipant = (identityId: bigint): boolean =>
       participantIdentityIds === null || participantIdentityIds.has(identityId);
 
+    // Sharding-table eligibility (Codex PR #595 round-4):
+    // SPEC_CG_MEMORY_MODEL §4.3 + §6 promise that only sharding-table
+    // members can ACK a VM publish. Pre-LU2 the per-CG hosting-committee
+    // allowlist did this gating implicitly; post-LU2 that allowlist is
+    // gone and we have to check membership at signer-resolution time.
+    // Failure modes:
+    //   - adapter doesn't implement `isShardingTableMember` → log once
+    //     and fall back to legacy behavior (test mocks / no-chain envs).
+    //   - membership probe throws for a specific signer → drop that
+    //     approval (fail-closed per signer, not per batch).
+    // Cache decisions per batch so we don't hammer the RPC for repeated
+    // approvers across re-tries.
+    const shardingMembershipCache = new Map<string, boolean>();
+    const probeShardingTableMembership = async (identityId: bigint): Promise<boolean> => {
+      if (identityId <= 0n) return false;
+      if (typeof this.chain.isShardingTableMember !== 'function') return true;
+      const key = identityId.toString();
+      const cached = shardingMembershipCache.get(key);
+      if (cached !== undefined) return cached;
+      try {
+        const ok = await this.chain.isShardingTableMember(identityId);
+        shardingMembershipCache.set(key, ok);
+        return ok;
+      } catch (err: any) {
+        this.log.warn(
+          ctx,
+          `[verify] isShardingTableMember(${identityId}) probe failed (${err?.message ?? err}); ` +
+          `dropping that signer's approval as fail-closed`,
+        );
+        shardingMembershipCache.set(key, false);
+        return false;
+      }
+    };
+
     const resolvedSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }> = [];
     const resolvedSignerAddresses: string[] = [];
-    if (this.identityId > 0n && isEligibleParticipant(this.identityId)) {
+    if (
+      this.identityId > 0n
+      && isEligibleParticipant(this.identityId)
+      && await probeShardingTableMembership(this.identityId)
+    ) {
       resolvedSignatures.push({
         identityId: this.identityId,
         r: ethers.getBytes(proposerSig.r),
@@ -11824,6 +11862,7 @@ export class DKGAgent {
       );
       if (!id || id === 0n) continue;
       if (!isEligibleParticipant(id)) continue;
+      if (!(await probeShardingTableMembership(id))) continue;
       resolvedSignatures.push({ identityId: id, r: a.signatureR, vs: a.signatureVS });
       resolvedSignerAddresses.push(a.approverAddress);
       if (participantIdentityIds !== null && participantIdentityIds.has(id)) {

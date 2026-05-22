@@ -151,6 +151,7 @@ const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([
   'signACKDigest',
   'getACKSignerKey',
   'getMinimumRequiredSignatures',
+  'isShardingTableMember',
   'verifyACKIdentity',
   'verifySyncIdentity',
   'ensureOperationalWalletsRegistered',
@@ -216,6 +217,17 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
   it('isV10Ready is a capability gate — mock returns true (used to exercise V10 unit tests)', () => {
     const mock = new MockChainAdapter();
     expect(mock.isV10Ready()).toBe(true);
+  });
+
+  // Codex PR #595 round-4: isShardingTableMember gates VM ACK eligibility.
+  // The mock can't model a real sharding table, so it treats every
+  // registered (non-zero) identity as a member; tests needing
+  // non-membership behaviour spy/monkey-patch the method.
+  it('isShardingTableMember returns true for any non-zero identityId and false for 0n', async () => {
+    const mock = new MockChainAdapter();
+    expect(await mock.isShardingTableMember(0n)).toBe(false);
+    expect(await mock.isShardingTableMember(1n)).toBe(true);
+    expect(await mock.isShardingTableMember(99999n)).toBe(true);
   });
 
   it('getEvmChainId returns a bigint (not a namespaced string like "mock:31337")', async () => {

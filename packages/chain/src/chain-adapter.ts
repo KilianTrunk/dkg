@@ -725,6 +725,20 @@ export interface ChainAdapter {
   /** Read minimumRequiredSignatures from ParametersStorage. Used by ACKCollector. */
   getMinimumRequiredSignatures?(): Promise<number>;
 
+  /**
+   * Sharding-table membership check (Codex PR #595 round-4 follow-up).
+   *
+   * SPEC_CG_MEMORY_MODEL §4.3 promises that only sharding-table members
+   * can ACK a VM publish. The agent's verify path calls this on every
+   * resolved signer identityId and DROPS any approval whose signer is
+   * not in the sharding table. Adapters that can't probe membership
+   * (test mocks, legacy in-tree fakes) return `true` for any non-zero
+   * identityId — those environments aren't security-sensitive.
+   *
+   * Implementation maps to `ShardingTableStorage.nodeExists(uint72)`.
+   */
+  isShardingTableMember?(identityId: bigint): Promise<boolean>;
+
   /** Verify that a recovered signer address is a registered operational key for the given identity. */
   verifyACKIdentity?(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean>;
 

@@ -2315,6 +2315,19 @@ export class EVMChainAdapter implements ChainAdapter {
     return Number(await this.contracts.parametersStorage.minimumRequiredSignatures());
   }
 
+  async isShardingTableMember(identityId: bigint): Promise<boolean> {
+    if (identityId <= 0n) return false;
+    await this.init();
+    const storage = await this.resolveContract('ShardingTableStorage');
+    if (!storage) {
+      throw new Error(
+        'isShardingTableMember: ShardingTableStorage contract is not resolvable. ' +
+        'Verify path cannot enforce sharding-table eligibility without it.',
+      );
+    }
+    return Boolean(await storage.nodeExists(identityId));
+  }
+
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
     await this.init();
     const identityStorage = await this.resolveContract('IdentityStorage');

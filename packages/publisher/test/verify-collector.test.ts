@@ -190,4 +190,68 @@ describe('VerifyCollector', () => {
 
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  // Codex PR #595 round-4: a caller that omits `requiredSignatures` MUST
+  // get the system minimum, never a silent default of 1. `chain.verify()`
+  // does not revalidate signatures on-chain, so this local count is the
+  // only enforcement gate — defaulting to 1 would let the proposer
+  // self-approve and pass quorum on a single signature.
+  describe('fail-closed when requiredSignatures is omitted', () => {
+    const baseCollectArgs = {
+      contextGraphId: 'test-cg',
+      contextGraphIdOnChain: 42n,
+      verifiedMemoryId: 1n,
+      batchId: 100n,
+      merkleRoot: new Uint8Array(32),
+      entities: [],
+      proposerSignature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      timeoutMs: 1000,
+    } as const;
+
+    it('throws when no `getMinimumRequiredSignatures` probe is wired', async () => {
+      const collector = new VerifyCollector({
+        sendP2P: async () => new Uint8Array(0),
+        getParticipantPeers: () => ['peer-a'],
+        // no getMinimumRequiredSignatures
+      });
+      await expect(collector.collect(baseCollectArgs)).rejects.toThrow(
+        /requiredSignatures was omitted and no `getMinimumRequiredSignatures` probe/,
+      );
+    });
+
+    it('throws when the probe rejects (RPC outage)', async () => {
+      const collector = new VerifyCollector({
+        sendP2P: async () => new Uint8Array(0),
+        getParticipantPeers: () => ['peer-a'],
+        getMinimumRequiredSignatures: async () => { throw new Error('RPC down'); },
+      });
+      await expect(collector.collect(baseCollectArgs)).rejects.toThrow(
+        /getMinimumRequiredSignatures\(\) failed.*RPC down/,
+      );
+    });
+
+    it('throws when the probe returns garbage (non-positive integer)', async () => {
+      const collector = new VerifyCollector({
+        sendP2P: async () => new Uint8Array(0),
+        getParticipantPeers: () => ['peer-a'],
+        getMinimumRequiredSignatures: async () => 0,
+      });
+      await expect(collector.collect(baseCollectArgs)).rejects.toThrow(
+        /returned invalid value 0/,
+      );
+    });
+
+    it('honours the system minimum when the probe is wired correctly', async () => {
+      const collector = new VerifyCollector({
+        sendP2P: async () => new Uint8Array(0),
+        getParticipantPeers: () => [],
+        getMinimumRequiredSignatures: async () => 3,
+      });
+      // remoteRequired = 3 - 1 = 2 > 0 peers → verify_no_peers (proves
+      // the probe value was used, not the silent fallback of 1).
+      await expect(collector.collect(baseCollectArgs)).rejects.toThrow(
+        /verify_no_peers/,
+      );
+    });
+  });
 });

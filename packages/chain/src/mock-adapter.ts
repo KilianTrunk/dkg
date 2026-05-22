@@ -760,6 +760,14 @@ export class MockChainAdapter implements ChainAdapter {
     return this.minimumRequiredSignatures;
   }
 
+  // Codex PR #595 round-4: mock environments don't model the sharding
+  // table, so any registered (non-zero) identity counts as a member.
+  // Tests that need to exercise non-membership rejection should
+  // override this with a vi.spyOn / monkey-patch.
+  async isShardingTableMember(identityId: bigint): Promise<boolean> {
+    return identityId > 0n;
+  }
+
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
     // Strict binding: recovered address must match the identity's registered address
     const normalizedAddress = recoveredAddress.toLowerCase();

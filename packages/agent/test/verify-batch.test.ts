@@ -114,6 +114,31 @@ describe('buildBatchRejectionRecord', () => {
     expect(a.digest).toBe(b.digest);
   });
 
+  it('Codex PR #609: digest is independent of reportedAt (retry-dedupe)', () => {
+    // A member that retries the same rejection (transient gossip
+    // drop, restart) MUST produce the same digest so the SWM
+    // substrate hash-dedupes the record on the consumer side.
+    // Including `reportedAt` in the digest would defeat that — the
+    // exact regression Codex flagged.
+    const earlier = buildBatchRejectionRecord({
+      contextGraphId: 'agent/lu8',
+      batchId: 'batch-7',
+      verifyResult,
+      rejectedBy: { agentAddress: '0xM' },
+      now: () => new Date('2026-05-24T00:00:00.000Z'),
+    });
+    const later = buildBatchRejectionRecord({
+      contextGraphId: 'agent/lu8',
+      batchId: 'batch-7',
+      verifyResult,
+      rejectedBy: { agentAddress: '0xM' },
+      now: () => new Date('2026-05-24T18:42:00.000Z'),
+    });
+    expect(earlier.digest).toBe(later.digest);
+    // `reportedAt` is still preserved as metadata for both records.
+    expect(earlier.reportedAt).not.toBe(later.reportedAt);
+  });
+
   it('produces distinct digests when the rejecter or batchId differs', () => {
     const a = buildBatchRejectionRecord({
       contextGraphId: 'agent/lu8',

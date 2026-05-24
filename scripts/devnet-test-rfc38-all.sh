@@ -91,8 +91,20 @@ log "================================================================"
 log "  OT-RFC-38 INTEGRATION RUN SUMMARY"
 log "================================================================"
 note "OT-RFC-38 INTEGRATION RUN SUMMARY"
-note "Run started: $(date -u -r "$START_TS" +'%Y-%m-%dT%H:%M:%SZ')"
-note "Run ended:   $(date -u -r "$END_TS" +'%Y-%m-%dT%H:%M:%SZ')"
+# Codex PR #609: `date -r <epoch>` is BSD/macOS syntax; on GNU/Linux
+# `-r` expects a FILE path, so the summary step previously errored on
+# Linux CI / dev environments. Probe for BSD vs. GNU once and use the
+# portable form for each.
+epoch_to_iso() {
+  local epoch="$1"
+  if date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ' >/dev/null 2>&1; then
+    date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ'        # BSD (macOS)
+  else
+    date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ'       # GNU coreutils
+  fi
+}
+note "Run started: $(epoch_to_iso "$START_TS")"
+note "Run ended:   $(epoch_to_iso "$END_TS")"
 note "Duration:    ${DURATION}s"
 note ""
 

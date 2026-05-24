@@ -57,7 +57,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
@@ -777,14 +777,35 @@ WHERE {
         graph: String(q.graph ?? ''),
       }));
     } else {
-      // Reconstruct from local store. Try in order:
+      // Codex PR #609: when the caller passes `batchId`, they are
+      // asking us to verify ONE specific batch — but the SWM /
+      // data-graph reconstruction below loads EVERY triple in the
+      // context graph. For a CG with more than one published batch
+      // (i.e. nearly every real CG after the second publish), this
+      // deterministically false-positives `root-mismatch` because we
+      // hash a superset of leaves against a single-batch expected
+      // root. The local triple store has no per-batch label on the
+      // SWM data, so we can't safely scope the read here without
+      // additional metadata. Fail explicitly so the caller passes
+      // `quads` directly (which they typically already have from the
+      // member-side LU-7 catch-up that produced the batch).
+      if (parsed.batchId !== undefined && parsed.batchId !== null && String(parsed.batchId).length > 0) {
+        return jsonResponse(res, 400, {
+          error:
+            `verify-batch with \`batchId\` requires explicit \`quads\` in the request body. ` +
+            `Reconstruction from local SWM / data graph would include triples from OTHER ` +
+            `batches in the same CG and deterministically report \`root-mismatch\` against ` +
+            `the single-batch \`expectedMerkleRoot\`. Supply the exact batch quads (typically ` +
+            `from the LU-7 catch-up response) or omit \`batchId\` if you really do want to ` +
+            `verify the entire CG against a single root.`,
+        });
+      }
+      // No batchId — caller wants to verify the entire CG against a
+      // single root (legacy / single-batch use). Reconstruct from
+      // local store as before:
       //   1. _shared_memory (live SWM, before promote-to-VM)
       //   2. CG data graph (post-publish — selection moves quads from
       //      SWM into the named-graph as part of the seal step)
-      // Either is valid input for verification: the publisher hashed
-      // the plaintext leaves once; wherever those triples now live
-      // locally, recomputing the root over them must match the on-chain
-      // commitment.
       const swmGraphUri = contextGraphSharedMemoryUri(contextGraphId, subGraphName);
       const dataGraphUri = `did:dkg:context-graph:${contextGraphId}`;
       try {
@@ -874,18 +895,30 @@ WHERE {
     // Persist the record as SWM triples so it gossips via the
     // standard SWM substrate to other members. Reuses agent.share()
     // for the write — no new transport.
+    //
+    // Codex PR #609: every value that originates from HTTP body
+    // (contextGraphId, batchId, peerId, reason, agentAddress) is
+    // interpolated into an N-Quads literal. Without escaping, a value
+    // containing `"`, newlines, or RDF syntax either breaks the
+    // store insert outright or lets the caller smuggle malformed /
+    // attacker-controlled triples through this endpoint. We pipe
+    // every interpolated literal body through `escapeDkgRdfLiteral`
+    // (defense in depth — even fields like rootHashes that are
+    // structurally constrained to 0x-hex still get escaped, so a
+    // future input-validation regression doesn't reopen the hole).
+    const lit = (s: string) => `"${escapeDkgRdfLiteral(s)}"`;
     const subject = `did:dkg:batch-rejection:${record.digest}`;
     const NS = 'http://dkg.io/ontology/';
     const quads = [
-      { subject, predicate: `${NS}rejectedContextGraphId`, object: `"${record.contextGraphId}"`, graph: '' },
-      { subject, predicate: `${NS}expectedMerkleRoot`, object: `"${record.expectedRoot}"`, graph: '' },
-      { subject, predicate: `${NS}actualMerkleRoot`, object: `"${record.actualRoot}"`, graph: '' },
-      { subject, predicate: `${NS}rejectionReason`, object: `"${record.reason ?? 'unknown'}"`, graph: '' },
-      { subject, predicate: `${NS}rejectedByAgent`, object: `"${record.rejectedBy.agentAddress}"`, graph: '' },
-      { subject, predicate: `${NS}rejectedByPeer`, object: `"${record.rejectedBy.peerId ?? ''}"`, graph: '' },
-      { subject, predicate: `${NS}rejectionReportedAt`, object: `"${record.reportedAt}"`, graph: '' },
+      { subject, predicate: `${NS}rejectedContextGraphId`, object: lit(record.contextGraphId), graph: '' },
+      { subject, predicate: `${NS}expectedMerkleRoot`, object: lit(record.expectedRoot), graph: '' },
+      { subject, predicate: `${NS}actualMerkleRoot`, object: lit(record.actualRoot), graph: '' },
+      { subject, predicate: `${NS}rejectionReason`, object: lit(record.reason ?? 'unknown'), graph: '' },
+      { subject, predicate: `${NS}rejectedByAgent`, object: lit(record.rejectedBy.agentAddress), graph: '' },
+      { subject, predicate: `${NS}rejectedByPeer`, object: lit(record.rejectedBy.peerId ?? ''), graph: '' },
+      { subject, predicate: `${NS}rejectionReportedAt`, object: lit(record.reportedAt), graph: '' },
       ...(record.batchId !== undefined
-        ? [{ subject, predicate: `${NS}rejectedBatchId`, object: `"${record.batchId}"`, graph: '' }]
+        ? [{ subject, predicate: `${NS}rejectedBatchId`, object: lit(record.batchId), graph: '' }]
         : []),
     ];
 
@@ -950,15 +983,51 @@ WHERE {
     }
 
     // Resolve on-chain contextGraphId.
-    let onChainCgId: string;
+    //
+    // Codex PR #609: previously fell back to `"0"` when local
+    // subscription metadata couldn't resolve the on-chain id. That
+    // silently minted an attestation token bound to ContextGraphId=0
+    // (the sentinel for "no on-chain CG") even though a real KC for
+    // this batch already exists on-chain — outsiders verifying the
+    // token would see it pass cryptographic checks but reject as
+    // wrong-domain, with no diagnostic linking back to the actual CG.
+    // Three resolution layers, all fail-closed:
+    //   1. Caller-supplied `onChainContextGraphId` (explicit override).
+    //   2. Chain-truth via `chain.getKCContextGraphId(batchId)` —
+    //      authoritative because the KC ↔ CG binding is on-chain.
+    //   3. Local CG listing (last-resort, may be stale post-event-replay).
+    // If none resolve, reject with 400 — minting against id=0 is never
+    // correct.
+    let onChainCgId: string | undefined;
     if (typeof parsed.onChainContextGraphId === 'string' && /^\d+$/.test(parsed.onChainContextGraphId)) {
       onChainCgId = parsed.onChainContextGraphId;
     } else {
       try {
-        const cgList = await (agent as any).listContextGraphs?.();
-        const match = (cgList ?? []).find((cg: any) => cg.id === contextGraphId);
-        onChainCgId = match?.onChainId ?? '0';
-      } catch { onChainCgId = '0'; }
+        if (typeof chain?.getKCContextGraphId === 'function' && /^\d+$/.test(String(batchId))) {
+          const chainCgId = await chain.getKCContextGraphId(BigInt(batchId)).catch(() => null);
+          if (chainCgId != null && chainCgId !== 0n) {
+            onChainCgId = chainCgId.toString();
+          }
+        }
+      } catch { /* fall through to local lookup */ }
+      if (!onChainCgId) {
+        try {
+          const cgList = await (agent as any).listContextGraphs?.();
+          const match = (cgList ?? []).find((cg: any) => cg.id === contextGraphId);
+          if (match?.onChainId && /^\d+$/.test(String(match.onChainId)) && match.onChainId !== '0') {
+            onChainCgId = String(match.onChainId);
+          }
+        } catch { /* exhausted */ }
+      }
+    }
+    if (!onChainCgId) {
+      return jsonResponse(res, 400, {
+        error:
+          `Cannot mint attestation: unable to resolve on-chain contextGraphId for ` +
+          `cg="${contextGraphId}" batch=${batchId}. The KC for this batch may not be ` +
+          `published yet, or the local CG metadata is stale. Pass ` +
+          `\`onChainContextGraphId\` explicitly to bypass auto-resolution.`,
+      });
     }
 
     const attesterAddress =

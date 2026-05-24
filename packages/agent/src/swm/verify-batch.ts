@@ -183,6 +183,16 @@ export function buildBatchRejectionRecord(input: {
   }
 
   const reportedAt = (input.now ?? (() => new Date()))().toISOString();
+  // Codex PR #609: `reportedAt` MUST NOT be in the digest. The doc
+  // contract is "hash-dedupe identical rejection reports": when a
+  // member retries the same rejection (e.g. transient gossip drop,
+  // restart), the digest is the dedupe key on the consuming side. If
+  // we include `reportedAt` in the hash, every retry produces a fresh
+  // digest → fresh subject URI → the SWM substrate stores every retry
+  // as a distinct record, defeating dedupe. The digest covers the
+  // identity of the rejection (which CG, which batch, what verify
+  // result, who reported it); `reportedAt` is metadata that travels
+  // alongside the record but does not gate identity.
   const digestInput = new TextEncoder().encode(
     [
       input.contextGraphId,
@@ -191,7 +201,6 @@ export function buildBatchRejectionRecord(input: {
       input.verifyResult.actualRoot,
       input.verifyResult.reason ?? 'unknown',
       input.rejectedBy.agentAddress,
-      reportedAt,
     ].join('|'),
   );
   const digest = bytesToHex(keccak256(digestInput));

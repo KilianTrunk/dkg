@@ -649,6 +649,20 @@ export interface DKGAgentConfig {
     registered?: SwmHostModeStoreLimits;
     pruneIntervalMs?: number;
     reconcileIntervalMs?: number;
+    /**
+     * OT-RFC-38 / LU-6 Phase B — discovery-beacon rate limits for
+     * pre-registration (freemium-tier) ciphertext writes. All three
+     * fields are optional; omit any to use the default from
+     * {@link DiscoveryRateLimit}.
+     *  - `perCuratorBytesPerMinute` — SPEC §1.2.4 default 1 MiB.
+     *  - `perCuratorBytesPerHour`   — SPEC §1.2.4 default 50 MiB.
+     *  - `coreAggregateBytes`       — across-all-wallets cap; default 4 GiB.
+     */
+    discoveryRateLimit?: {
+      perCuratorBytesPerMinute?: number;
+      perCuratorBytesPerHour?: number;
+      coreAggregateBytes?: number;
+    };
   };
   /** Durable local store for subscribed context-graph runtime state. */
   contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;

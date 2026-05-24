@@ -137,6 +137,16 @@ import {
 } from './swm/ack-quorum.js';
 import { SwmHostModeStore, type SwmHostModeStoreLimits } from './swm/host-mode-store.js';
 import {
+  BEACON_ACCESS_POLICY_CURATED,
+  BEACON_REANNOUNCE_INTERVAL_MS,
+  DKG_CG_DISCOVERY_TOPIC,
+  decodeCgDiscoveryBeacon,
+  encodeCgDiscoveryBeacon,
+  mintCgDiscoveryBeacon,
+  verifyCgDiscoveryBeacon,
+} from './swm/cg-discovery-beacon.js';
+import { DiscoveryRateLimit } from './swm/discovery-rate-limit.js';
+import {
   decodeSwmHostCatchupRequest,
   encodeSwmHostCatchupRequest,
   encodeSwmHostCatchupResponse,
@@ -576,6 +586,65 @@ export class DKGAgent {
    * by lowercase 0x-prefixed hex.
    */
   private readonly wireIdToLocalCgId = new Map<string, string>();
+  /**
+   * OT-RFC-38 / LU-6 Phase B — curator-side beacon registry.
+   *
+   * Each CG the local node CREATED that wants pre-registration
+   * auto-host registers an entry here. The periodic re-announce
+   * timer (see {@link beaconReannounceTimer}) iterates this map
+   * every {@link BEACON_REANNOUNCE_INTERVAL_MS} and broadcasts a
+   * fresh-`ts`-signed beacon for each entry on the global
+   * `dkg/cg-discovery` topic so cores joining the network late can
+   * still discover and auto-host the CG before the curator pays
+   * gas to register it on chain.
+   *
+   * Keyed by LOCAL CG id (cleartext or hash, whatever the create
+   * flow recorded). Values include the wire id (always the hash)
+   * the curator commits to so re-announces don't have to re-derive.
+   *
+   * Lifecycle:
+   *   - `registerCgForBeaconAnnouncement` (called from
+   *     `createContextGraph` for curated CGs) inserts.
+   *   - `unregisterCgFromBeaconAnnouncement` (called from CG
+   *     deletion / unsubscribe paths) removes.
+   *   - Stays populated AFTER on-chain registration so cores that
+   *     came online after the `ContextGraphCreated` event was
+   *     emitted (and rolled off the chain poller's lookback window)
+   *     still get the beacon — chain events are the primary path
+   *     but beacons are the safety net.
+   */
+  private readonly beaconRegistry = new Map<string, {
+    wireId: string;
+    curatorEoa: string;
+    accessPolicy: number;
+  }>();
+  /**
+   * OT-RFC-38 / LU-6 Phase B — core-side reverse map: which curator
+   * EOA last beaconed each wire id. Populated by the beacon
+   * listener; consulted by {@link ingestSwmHostModeEnvelope} when
+   * the CG is NOT yet on-chain-registered, so the per-curator
+   * sliding-window budget (see {@link DiscoveryRateLimit}) can be
+   * applied against the wallet that authored the beacon — not
+   * against the libp2p peer id (which rotates and can't be tied
+   * to identity / abuse history).
+   */
+  private readonly beaconCuratorByWireId = new Map<string, string>();
+  /**
+   * OT-RFC-38 / LU-6 Phase B — periodic beacon re-announce timer
+   * (curators only). See {@link beaconRegistry} jsdoc.
+   */
+  private beaconReannounceTimer?: ReturnType<typeof setInterval>;
+  /**
+   * OT-RFC-38 / LU-6 Phase B — sliding-window rate-limiter applied
+   * to pre-registration (beacon-discovered) ciphertext writes.
+   * Bounds the freemium-tier abuse vector: any wallet can broadcast
+   * beacons and trigger cores to host ciphertext, so cores cap how
+   * many bytes per wallet they admit per minute / per hour and how
+   * much total pre-registration ciphertext they hold across all
+   * wallets. Lazily constructed on the core role; undefined on
+   * edges (which never auto-host).
+   */
+  private discoveryRateLimit?: DiscoveryRateLimit;
   /**
    * OT-RFC-38 / LU-5: per-core cache of on-chain CG access policies,
    * keyed by the on-chain numeric id (uint256). Populated by:
@@ -1701,6 +1770,36 @@ export class DKGAgent {
       });
       this.chainPoller.start();
       this.log.info(ctx, `Chain event poller started`);
+    }
+
+    // OT-RFC-38 / LU-6 Phase B — discovery beacon wiring.
+    //
+    // CURATOR side (any node with the chain signer + a curated CG
+    // it created): the periodic re-announce timer is wired
+    // unconditionally — entries are added/removed by
+    // `registerCgForBeaconAnnouncement` /
+    // `unregisterCgFromBeaconAnnouncement`. An empty `beaconRegistry`
+    // makes each tick a no-op, so leaving the timer running on
+    // edge nodes with no CGs is harmless.
+    //
+    // CORE side: subscribe to the global discovery topic only when
+    // host-mode is enabled (otherwise we'd accept beacons but have
+    // nowhere to host the resulting ciphertext, leaking beacon
+    // bookkeeping memory on every signal).
+    if (this.swmHostModeStore) {
+      this.subscribeCgDiscoveryTopic();
+      this.log.info(ctx, `Subscribed to ${DKG_CG_DISCOVERY_TOPIC} for pre-registration auto-host`);
+    }
+    this.beaconReannounceTimer = setInterval(() => {
+      this.reannounceAllBeacons().catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Beacon re-announce sweep failed: ${msg}`);
+      });
+    }, BEACON_REANNOUNCE_INTERVAL_MS);
+    // Prevent the re-announce timer from holding the event loop
+    // open during test teardown.
+    if (typeof this.beaconReannounceTimer.unref === 'function') {
+      this.beaconReannounceTimer.unref();
     }
 
     // Set up messaging
@@ -8754,6 +8853,33 @@ export class DKGAgent {
       registeredLimits: hostModeCfg.registered ?? defaults.registered,
     });
     await this.swmHostModeStore.init();
+
+    // OT-RFC-38 / LU-6 Phase B — sliding-window rate-limiter for
+    // pre-registration ciphertext writes. Configurable via the
+    // same `swmHostMode` config block so operators can dial limits
+    // up/down for testnet vs mainnet. Defaults match SPEC §1.2.4.
+    const rlCfg = hostModeCfg.discoveryRateLimit ?? {};
+    this.discoveryRateLimit = new DiscoveryRateLimit({
+      perCuratorBytesPerMinute: rlCfg.perCuratorBytesPerMinute,
+      perCuratorBytesPerHour: rlCfg.perCuratorBytesPerHour,
+      coreAggregateBytes: rlCfg.coreAggregateBytes,
+    });
+    // Seed the per-core aggregate counter from on-disk unregistered
+    // ciphertext so a restart doesn't reset the budget. Per-curator
+    // windows intentionally cold-start (the abuse-control horizon
+    // is "ongoing", not "lifetime").
+    try {
+      const stats = await this.swmHostModeStore.stats();
+      let unregisteredBytesOnDisk = 0;
+      for (const cgStats of Object.values(stats.perCg)) {
+        if (!cgStats.registered) unregisteredBytesOnDisk += cgStats.bytes;
+      }
+      this.discoveryRateLimit.seedAggregate(unregisteredBytesOnDisk);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.debug(createOperationContext('system'), `Could not seed discovery rate-limit aggregate from disk: ${msg}`);
+    }
+
     this.log.info(
       createOperationContext('system'),
       `SWM host-mode store initialized at ${join(this.config.dataDir, 'swm-host')} (role=${role})`,
@@ -8975,11 +9101,245 @@ export class DKGAgent {
       return;
     }
 
+    // OT-RFC-38 / LU-6 Phase B — pre-registration ciphertext rate-
+    // limit. Apply only to CGs that have NOT been marked registered
+    // on the host-mode store (registered CGs are gated by chain
+    // economics + the on-chain participant allowlist, not the
+    // freemium-tier per-wallet windows). The rate-limit decision
+    // mutates `discoveryRateLimit` ONLY when it admits, so a
+    // rejection here does not consume any per-curator budget.
+    let isRegistered = false;
+    try {
+      isRegistered = await this.swmHostModeStore.isRegistered(contextGraphId);
+    } catch {
+      // Treat unreadable meta as pre-registration — fail closed
+      // toward stricter limits; the next chain-event probe will
+      // flip the flag once the CG registers on chain.
+      isRegistered = false;
+    }
+    if (!isRegistered && this.discoveryRateLimit) {
+      const curatorEoa = this.beaconCuratorByWireId.get(contextGraphId.toLowerCase());
+      if (!curatorEoa) {
+        // No beacon was ever received for this wire id, yet
+        // ciphertext arrived. This shouldn't happen on a well-
+        // behaved core (auto-subscribe paths always populate
+        // either the chain-event or beacon registries), but we
+        // reject defensively so an attacker can't bypass the
+        // per-wallet window by skipping the beacon altogether.
+        this.log.warn(
+          ctx,
+          `Host-mode rejected pre-reg cg=${contextGraphId}: no curator EOA recorded (beacon missing); dropping envelope`,
+        );
+        return;
+      }
+      const admission = this.discoveryRateLimit.admit(curatorEoa, data.length);
+      if (!admission.admit) {
+        this.log.warn(
+          ctx,
+          `Host-mode rejected pre-reg envelope cg=${contextGraphId} curator=${curatorEoa}: ${admission.reason}`,
+        );
+        return;
+      }
+    }
+
     const seqno = await this.swmHostModeStore.append(contextGraphId, data);
     this.log.debug(
       ctx,
       `Host-mode stored opaque SWM envelope cg=${contextGraphId} seqno=${seqno} bytes=${data.length}`,
     );
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — curator-side: record a CG so the
+   * periodic beacon timer keeps re-announcing it AND broadcast an
+   * immediate first beacon. Called from {@link createContextGraph}
+   * for curated CGs.
+   *
+   * Best-effort. Failures (no chain signer, no listening cores yet,
+   * gossip publish error) are logged at WARN and do not block CG
+   * creation — without a beacon the CG falls back to the chain-event
+   * auto-subscribe path on register, which still works for cores
+   * that come online after registration.
+   */
+  private async registerCgForBeaconAnnouncement(localCgId: string, accessPolicy: number): Promise<void> {
+    if (accessPolicy !== BEACON_ACCESS_POLICY_CURATED) {
+      // Public CGs don't need pre-registration auto-host: their
+      // SWM substrate carries plaintext that any core can apply
+      // directly via the gossip subscription. The beacon flow is
+      // specifically for curated ciphertext custody.
+      return;
+    }
+    const curatorEoa = await this.getRegistrationTxSignerAddress();
+    if (!curatorEoa) {
+      this.log.warn(
+        createOperationContext('system'),
+        `Beacon registration skipped for "${localCgId}": no chain tx signer (likely a chain-disabled config); pre-registration auto-host won't run for this CG`,
+      );
+      return;
+    }
+    const wireId = this.gossipWireIdFor(localCgId);
+    this.beaconRegistry.set(localCgId, {
+      wireId,
+      curatorEoa: curatorEoa.toLowerCase(),
+      accessPolicy,
+    });
+    await this.broadcastCgDiscoveryBeacon(localCgId);
+  }
+
+  /**
+   * Single-shot broadcast of the CG-discovery beacon for one
+   * locally-curated CG. Idempotent w.r.t. cores: a core that
+   * already auto-subscribed treats a duplicate beacon as a refresh
+   * (timestamp + signature still validate against the same curator
+   * EOA + nameHash; rate-limit doesn't count beacons themselves).
+   */
+  private async broadcastCgDiscoveryBeacon(localCgId: string): Promise<void> {
+    const entry = this.beaconRegistry.get(localCgId);
+    if (!entry) return;
+    const ctx = createOperationContext('share');
+    let beacon;
+    try {
+      beacon = await mintCgDiscoveryBeacon({
+        nameHash: entry.wireId,
+        accessPolicy: entry.accessPolicy,
+        curatorEoa: entry.curatorEoa,
+        sign: async (digest) => {
+          // Chain adapter's `signMessage` returns `{r, vs}`; re-
+          // serialise to the 65-byte hex shape ethers expects. The
+          // EVM adapter routes through `Signer.signMessage` which
+          // applies the EIP-191 framing, matching what
+          // `verifyCgDiscoveryBeacon` recovers.
+          if (typeof this.chain.signMessage !== 'function') {
+            throw new Error('chain adapter does not implement signMessage');
+          }
+          const { r, vs } = await this.chain.signMessage(digest);
+          const sig = ethers.Signature.from({ r: ethers.hexlify(r), yParityAndS: ethers.hexlify(vs) });
+          return sig.serialized;
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.warn(ctx, `Beacon mint failed for "${localCgId}" (wireId=${entry.wireId.slice(0, 12)}…): ${msg}`);
+      return;
+    }
+    try {
+      this.gossip.subscribe(DKG_CG_DISCOVERY_TOPIC);
+      await this.gossip.publish(DKG_CG_DISCOVERY_TOPIC, encodeCgDiscoveryBeacon(beacon));
+      this.log.info(
+        ctx,
+        `Beacon broadcast for "${localCgId}" wireId=${entry.wireId.slice(0, 12)}… curator=${entry.curatorEoa.slice(0, 10)}…`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.debug(ctx, `Beacon publish for "${localCgId}" had no subscribers / failed: ${msg}`);
+    }
+  }
+
+  /**
+   * Re-announce every CG in {@link beaconRegistry}. Driven by
+   * {@link beaconReannounceTimer} on the
+   * {@link BEACON_REANNOUNCE_INTERVAL_MS} cadence. Sequential to
+   * keep memory bounded on agents with many CGs; the per-broadcast
+   * cost is dominated by one keccak256 + one EIP-191 sign + one
+   * gossip publish, all << 1ms on commodity hardware.
+   */
+  private async reannounceAllBeacons(): Promise<void> {
+    for (const localCgId of this.beaconRegistry.keys()) {
+      await this.broadcastCgDiscoveryBeacon(localCgId);
+    }
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — core-side: subscribe to the global
+   * discovery topic. Wired from {@link start} once the agent has
+   * a working gossip handle AND has confirmed `nodeRole === 'core'`
+   * with host mode enabled. Idempotent — the gossip layer dedupes
+   * subscribe/onMessage calls for the same topic.
+   */
+  private subscribeCgDiscoveryTopic(): void {
+    this.gossip.subscribe(DKG_CG_DISCOVERY_TOPIC);
+    this.gossip.onMessage(DKG_CG_DISCOVERY_TOPIC, (_topic, data, from) => {
+      this.handleIncomingCgDiscoveryBeacon(data, from).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log.warn(createOperationContext('share'), `Beacon handler error from ${from}: ${msg}`);
+      });
+    });
+  }
+
+  /**
+   * Validate a received beacon and, on accept, register the
+   * `wireId → curator EOA` mapping plus delegate to the host-mode
+   * reconciler — which applies the sharding-table + role checks the
+   * same way the chain-event auto-subscribe path does.
+   *
+   * Rejections are logged at DEBUG (one per failed beacon would
+   * flood logs on a busy network); we surface only the first
+   * rejection per curator per minute. Accepted beacons log at INFO.
+   */
+  private async handleIncomingCgDiscoveryBeacon(data: Uint8Array, fromPeer: string): Promise<void> {
+    if (!this.swmHostModeStore) return;
+    const ctx = createOperationContext('share');
+    const beacon = decodeCgDiscoveryBeacon(data);
+    if (!beacon) {
+      this.log.debug(ctx, `Beacon from ${fromPeer} dropped: malformed wire bytes`);
+      return;
+    }
+    const verdict = verifyCgDiscoveryBeacon(beacon, Math.floor(Date.now() / 1000));
+    if (!verdict.ok) {
+      this.log.debug(ctx, `Beacon from ${fromPeer} rejected: ${verdict.reason}`);
+      return;
+    }
+    if (beacon.accessPolicy !== BEACON_ACCESS_POLICY_CURATED) {
+      // Public CG beacons are a no-op for host mode — the curator
+      // shouldn't have broadcast one; ignore quietly.
+      return;
+    }
+    const wireId = beacon.nameHash;
+    const curatorEoa = beacon.curatorEoa;
+
+    const previousCurator = this.beaconCuratorByWireId.get(wireId);
+    if (previousCurator && previousCurator !== curatorEoa) {
+      // Two different wallets claiming the same wireId is a hash
+      // collision OR a curator-rotation event. Reject the second
+      // claim (first-claim-wins) so an attacker can't hijack the
+      // budget bookkeeping for an already-trusted CG.
+      this.log.warn(
+        ctx,
+        `Beacon from ${fromPeer} for wireId=${wireId.slice(0, 12)}… rejected: ` +
+          `claimed curator ${curatorEoa.slice(0, 10)}… contradicts pinned ${previousCurator.slice(0, 10)}…`,
+      );
+      return;
+    }
+    this.beaconCuratorByWireId.set(wireId, curatorEoa);
+
+    // Stage the synthetic subscription record + wire-id reverse
+    // mapping — same as the chain-event auto-subscribe path. The
+    // hash IS the local id for cores that didn't create or join
+    // the CG, so `recordCgWireId(wireId, wireId)` is the right
+    // identity-translation entry.
+    if (!this.subscribedContextGraphs.has(wireId)) {
+      this.subscribedContextGraphs.set(wireId, {
+        subscribed: false,
+        synced: false,
+        onChainHash: wireId,
+        pendingMeta: true,
+      });
+    } else {
+      const existing = this.subscribedContextGraphs.get(wireId)!;
+      existing.onChainHash = wireId;
+    }
+    this.recordCgWireId(wireId, wireId);
+
+    try {
+      await this.reconcileSwmHostModeSubscription(wireId);
+      this.log.info(
+        ctx,
+        `Beacon-driven auto-host engaged for wireId=${wireId.slice(0, 12)}… (curator=${curatorEoa.slice(0, 10)}…, from=${fromPeer})`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.warn(ctx, `Beacon-driven host-mode reconcile failed for ${wireId.slice(0, 12)}…: ${msg}`);
+    }
   }
 
   /**
@@ -10548,6 +10908,20 @@ export class DKGAgent {
     // up to 30s for the next periodic tick.
     if (isCurated || opts.private) {
       this.queueSharedMemoryGossipSubscription(opts.id);
+    }
+
+    // OT-RFC-38 / LU-6 Phase B — register this CG for the discovery
+    // beacon so cores can pre-register-auto-host it (the freemium
+    // tier path). Only curated CGs have ciphertext custody to
+    // delegate; private (local-only) and public CGs don't run the
+    // beacon. The first beacon is broadcast immediately so cores
+    // listening before the curator pays gas can already start
+    // hosting.
+    if (isCurated && !opts.private) {
+      this.registerCgForBeaconAnnouncement(opts.id, BEACON_ACCESS_POLICY_CURATED).catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `Beacon registration for "${opts.id}" failed: ${msg}`);
+      });
     }
 
     if (!opts.private) {
@@ -16110,6 +16484,10 @@ export class DKGAgent {
     if (this.hostModePruneTimer) {
       clearInterval(this.hostModePruneTimer);
       this.hostModePruneTimer = null;
+    }
+    if (this.beaconReannounceTimer) {
+      clearInterval(this.beaconReannounceTimer);
+      this.beaconReannounceTimer = undefined;
     }
     if (this.syncReconcilerTimer) {
       clearInterval(this.syncReconcilerTimer);

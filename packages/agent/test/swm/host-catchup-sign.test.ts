@@ -62,6 +62,40 @@ describe('host-catchup-sign (B1: signed catchup requests)', () => {
     });
   });
 
+  describe('B1 round-2: requesterEoa derivation from signer', () => {
+    it('discovery mode (no requesterEoa supplied) binds digest to recovered signer', async () => {
+      const wallet = ethers.Wallet.createRandom();
+      const req = await mintSignedCatchupRequest({
+        contextGraphId: 'cg/x',
+        sinceSeqno: 0,
+        maxEntries: 32,
+        maxBytes: 64 * 1024,
+        // requesterEoa intentionally omitted
+        issuedAtMs: FIXED_NOW,
+        sign: async (digest) => wallet.signMessage(digest),
+      });
+      expect(req.requesterEoa).toBe(wallet.address.toLowerCase());
+      const result = verifySignedCatchupRequest(req, FIXED_NOW + 1000);
+      expect(result.ok).toBe(true);
+    });
+
+    it('throws when caller claims a requesterEoa that does not match the actual signer', async () => {
+      const signing = ethers.Wallet.createRandom();
+      const wrongClaim = ethers.Wallet.createRandom();
+      await expect(
+        mintSignedCatchupRequest({
+          contextGraphId: 'cg/x',
+          sinceSeqno: 0,
+          maxEntries: 32,
+          maxBytes: 64 * 1024,
+          requesterEoa: wrongClaim.address,
+          issuedAtMs: FIXED_NOW,
+          sign: async (digest) => signing.signMessage(digest),
+        }),
+      ).rejects.toThrow(/does not match signature signer/i);
+    });
+  });
+
   describe('freshness window', () => {
     it('rejects requests older than CATCHUP_REQUEST_MAX_AGE_MS', async () => {
       const wallet = ethers.Wallet.createRandom();

@@ -9678,49 +9678,85 @@ export class DKGAgent {
       return { ok: false, reason: 'replayed catchup nonce' };
     }
 
-    // 3. chain-anchored authority
-    let chainParticipants: string[] | null = null;
+    // The authority sources below use UNION semantics: any source
+    // that recognises the requester EOA (or, as transport-layer
+    // fallback, the peer-id) is sufficient to accept. Codex PR #618
+    // R2 caught a fail-closed bug in the prior implementation where
+    // `chainParticipants` was treated as authoritative — if the
+    // chain returned a set that didn't include a legitimate
+    // delegatee or allowed-agent, we'd hard-deny without checking
+    // the locally-persisted allowlist. The current logic accepts
+    // on the first match across:
+    //   3a. on-chain participant agents
+    //   3b. beacon-pinned curator (pre-registration)
+    //   3c. locally-persisted agent-gate set (allowedAgent UNION
+    //       participantAgent from _meta + subscription cache)
+    //   3d. transport-layer allowedPeers (libp2p peer-id allowlist)
+    // Only if none accept do we deny.
+    const requesterLower = requesterEoa.toLowerCase();
+    let anyAuthoritySourceFound = false;
+
     try {
-      chainParticipants = await this.resolveOnChainParticipantAgents(req.contextGraphId);
-    } catch {
-      // Adapter probe failure is non-fatal; fall through to beacon/local checks.
-    }
-    if (chainParticipants !== null) {
-      const lowered = chainParticipants.map((a) => a.toLowerCase());
-      if (lowered.includes(requesterEoa.toLowerCase())) {
-        return { ok: true, recoveredSigner: requesterEoa };
+      const chainParticipants = await this.resolveOnChainParticipantAgents(req.contextGraphId);
+      if (chainParticipants !== null) {
+        anyAuthoritySourceFound = true;
+        if (chainParticipants.some((a) => a.toLowerCase() === requesterLower)) {
+          return { ok: true, recoveredSigner: requesterEoa };
+        }
       }
-      return { ok: false, reason: 'requester EOA not in on-chain participant set' };
-    }
-
-    // 4. pre-registration fallback — beacon-pinned curator
-    let beaconCurator: string | null = null;
-    try {
-      beaconCurator = await this.resolveBeaconPinnedCuratorEoa(req.contextGraphId);
     } catch {
-      // ignore; fall through to local allowlist
-    }
-    if (beaconCurator && beaconCurator.toLowerCase() === requesterEoa.toLowerCase()) {
-      return { ok: true, recoveredSigner: requesterEoa };
+      // Adapter probe failure is non-fatal; fall through to other sources.
     }
 
-    // 5. member-side local allowedPeers (transport-layer ACL); only
-    // gates when local meta exists (the host-only-core case is
-    // already handled by chain/beacon above).
+    try {
+      const beaconCurator = await this.resolveBeaconPinnedCuratorEoa(req.contextGraphId);
+      if (beaconCurator) {
+        anyAuthoritySourceFound = true;
+        if (beaconCurator.toLowerCase() === requesterLower) {
+          return { ok: true, recoveredSigner: requesterEoa };
+        }
+      }
+    } catch {
+      // Beacon cache miss is non-fatal.
+    }
+
+    // Locally-persisted agent gate: `getContextGraphAgentGateAddresses`
+    // unions `dkg:allowedAgent` + `dkg:participantAgent` from the CG's
+    // `_meta` graph and the in-memory subscription cache. On a member-
+    // side host this is the canonical allowlist + delegatee set;
+    // chain-derived sets often miss recently-approved delegatees that
+    // haven't been mirrored on chain yet.
+    try {
+      const agentGate = await this.getContextGraphAgentGateAddresses(req.contextGraphId);
+      if (agentGate !== null) {
+        anyAuthoritySourceFound = true;
+        if (agentGate.some((a) => a.toLowerCase() === requesterLower)) {
+          return { ok: true, recoveredSigner: requesterEoa };
+        }
+      }
+    } catch {
+      // Local-meta probe failure is non-fatal.
+    }
+
+    // Transport-layer ACL (libp2p peer-id allowlist). Only meaningful
+    // on nodes that have persisted the CG's `allowedPeers`; host-only
+    // cores never see it.
     try {
       const allowedPeers = await this.getContextGraphAllowedPeers(req.contextGraphId);
       if (allowedPeers !== null) {
+        anyAuthoritySourceFound = true;
         if (allowedPeers.includes(fromPeerId)) {
           return { ok: true, recoveredSigner: requesterEoa };
         }
-        return { ok: false, reason: 'peer not in context-graph allowedPeers' };
       }
     } catch {
-      // local-meta probe failure is non-fatal; the deny in step 6 still applies.
+      // local-meta probe failure is non-fatal; the deny below still applies.
     }
 
-    // 6. no authority source produced an accept → deny by default.
-    return { ok: false, reason: 'no authority source authorized requester EOA' };
+    const reason = anyAuthoritySourceFound
+      ? 'requester EOA not in any of: on-chain participants, beacon curator, local agent-gate, allowedPeers'
+      : 'no authority source available for context graph';
+    return { ok: false, reason };
   }
 
   /**
@@ -9769,12 +9805,15 @@ export class DKGAgent {
     // OT-RFC-38 LU-6 B1 — every catchup request is signed by the
     // requesting agent's chain EOA so the host can authenticate via
     // on-chain participant set without trusting the libp2p peer-id.
-    const requesterEoa = await this.getRegistrationTxSignerAddress();
-    if (!requesterEoa) {
-      const reason = 'no chain signer address available — cannot mint signed catchup request';
-      this.log.warn(ctx, `host-catchup ${reason} to=${remotePeerId} cg=${contextGraphId}`);
-      return { rounds: 0, fetched: 0, applied: 0, appliedTriples: 0, skipped: 0, nextSeqno: sinceSeqno, denied: reason };
-    }
+    //
+    // Codex PR #618 R2: we deliberately do NOT pre-compute the
+    // requester EOA from `getRegistrationTxSignerAddress()`. The
+    // chain adapter's tx-signer can differ from its message-signer
+    // (per the helper's own doc-comment), and binding the two
+    // independently produced "signer mismatch" rejections in every
+    // adapter except the EVM one. `mintSignedCatchupRequest` now
+    // recovers the actual signer from the signature itself and
+    // binds the digest to it — no caller-side lookup needed.
     if (typeof this.chain.signMessage !== 'function') {
       const reason = 'chain adapter does not implement signMessage — cannot mint signed catchup request';
       this.log.warn(ctx, `host-catchup ${reason} to=${remotePeerId} cg=${contextGraphId}`);
@@ -9793,7 +9832,12 @@ export class DKGAgent {
         sinceSeqno,
         maxEntries,
         maxBytes,
-        requesterEoa,
+        // requesterEoa intentionally omitted — the helper recovers
+        // the signer from the signature itself, which is the only
+        // way to guarantee the digest binds to the actual signing
+        // key (the chain adapter's tx-signer and message-signer can
+        // differ). See `MintSignedCatchupRequestInput.requesterEoa`
+        // doc comment for the full rationale.
         sign: async (digest) => {
           const { r, vs } = await this.chain.signMessage!(digest);
           const sig = ethers.Signature.from({ r: ethers.hexlify(r), yParityAndS: ethers.hexlify(vs) });

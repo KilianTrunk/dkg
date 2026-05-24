@@ -127,7 +127,22 @@ export interface MintSignedCatchupRequestInput {
   sinceSeqno: number;
   maxEntries: number;
   maxBytes: number;
-  requesterEoa: string;
+  /**
+   * Optional. If provided, MUST match the address recovered from
+   * `sign(digest)`; otherwise the mint throws. If omitted, the
+   * helper computes the digest with a placeholder zero address,
+   * recovers the signer from the signature, then re-computes the
+   * digest binding to that recovered address.
+   *
+   * Codex PR #618 round-2: callers used to advertise the chain
+   * tx-signer address here (`getRegistrationTxSignerAddress`), but
+   * `sign` is wired to `chain.signMessage` which CAN sign with a
+   * different key (per its own helper comment). The receiver's
+   * verify step then rejected every request as "signer mismatch".
+   * Letting the helper recover the truth from the signature itself
+   * removes that whole class of mis-binding.
+   */
+  requesterEoa?: string;
   /** Unix epoch ms. Defaults to Date.now(). */
   issuedAtMs?: number;
   /** Hex-encoded 16-byte nonce. Auto-generated if omitted. */
@@ -143,25 +158,58 @@ export interface MintSignedCatchupRequestInput {
   version?: number;
 }
 
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
 export async function mintSignedCatchupRequest(
   input: MintSignedCatchupRequestInput,
 ): Promise<SignedCatchupRequest> {
   const version = input.version ?? 2;
   const issuedAtMs = input.issuedAtMs ?? Date.now();
   const nonce = input.nonce ?? randomNonceHex();
-  const fields: SignedCatchupRequestFields = {
+
+  // Two-pass to bind the digest to the actual signer:
+  // 1. Compute digest with claimed-or-placeholder address.
+  // 2. Sign it. Recover the address from the signature.
+  // 3. If claim was provided: require match (fail closed).
+  //    If not: re-build the request bound to the recovered
+  //    address and sign that.
+  const claimedEoa = input.requesterEoa?.toLowerCase();
+  const probeFields: SignedCatchupRequestFields = {
     version,
     contextGraphId: input.contextGraphId,
     sinceSeqno: input.sinceSeqno,
     maxEntries: input.maxEntries,
     maxBytes: input.maxBytes,
-    requesterEoa: input.requesterEoa.toLowerCase(),
+    requesterEoa: claimedEoa ?? ZERO_ADDRESS,
     issuedAtMs,
     nonce: nonce.toLowerCase(),
   };
-  const digest = computeCatchupRequestDigest(fields);
-  const sig = await input.sign(digest);
-  return { ...fields, sig };
+
+  if (claimedEoa) {
+    // Caller asserts the signer address. Sign + verify recovery matches.
+    const digest = computeCatchupRequestDigest(probeFields);
+    const sig = await input.sign(digest);
+    const recovered = ethers.verifyMessage(digest, sig).toLowerCase();
+    if (recovered !== claimedEoa) {
+      throw new Error(
+        `mintSignedCatchupRequest: requesterEoa=${claimedEoa} does not match signature signer ${recovered}. ` +
+          'Drop the explicit requesterEoa and let the helper bind to the actual signer, ' +
+          'or pass the chain.signMessage()-paired EOA.',
+      );
+    }
+    return { ...probeFields, sig };
+  }
+
+  // Discovery mode: sign a placeholder digest, recover the signer,
+  // then sign the FINAL digest with the bound address. Two sigs, but
+  // only the second one is ever sent over the wire.
+  const probeDigest = computeCatchupRequestDigest(probeFields);
+  const probeSig = await input.sign(probeDigest);
+  const recovered = ethers.verifyMessage(probeDigest, probeSig).toLowerCase();
+  const finalFields: SignedCatchupRequestFields = { ...probeFields, requesterEoa: recovered };
+  const finalDigest = computeCatchupRequestDigest(finalFields);
+  const finalSig = await input.sign(finalDigest);
+  return { ...finalFields, sig: finalSig };
 }
 
 /**

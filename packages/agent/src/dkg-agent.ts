@@ -581,6 +581,30 @@ export class DKGAgent {
    * positive curation signal — fall through to the chain.
    */
   private readonly onChainAccessPolicyCache = new Map<string, number>();
+  /**
+   * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent
+   * allowlist cache. Keyed by `contextGraphId.toString()` (stringified
+   * on-chain numeric id; the resolver normalises any cleartext form
+   * to numeric before consulting). Values are EIP-55 checksum
+   * addresses sourced from `chain.getContextGraphParticipantAgents`.
+   *
+   * Consulted by `resolveOnChainParticipantAgents` (wired into
+   * `SharedMemoryHandler.chainAgentGateOracle`) to authenticate
+   * host-mode gossip envelopes on cores that have no local meta
+   * for the CG. Stale entries are tolerable: on chain the allowlist
+   * is mutable but changes slowly, and admitting a previously-
+   * removed agent only affects ciphertext acceptance into the host-
+   * mode store — the CG members' decrypt path remains gated by the
+   * sender-key issuance, so a stale allowlist hit can't escalate
+   * privilege. Invalidation is therefore best-effort (on receipt of
+   * `ContextGraphAgentsUpdated`-class events; not yet wired) and
+   * the cache TTL is intentionally long (process lifetime).
+   *
+   * Empty arrays cache the answer too (negative caching for ids
+   * with no agents) — without it, the resolver would keep paying
+   * the RPC every envelope for an unknown id, opening a DoS lever.
+   */
+  private readonly onChainParticipantAgentsCache = new Map<string, string[]>();
   private readonly peerHealth = new Map<string, PeerHealth>();
   private readonly knownCorePeerIds = new Set<string>();
   private readonly syncingPeers = new Set<string>();
@@ -9387,6 +9411,14 @@ export class DKGAgent {
         sharedMemoryOwnedEntities: this.workspaceOwnedEntities,
         writeLocks: this.writeLocks,
         localAgentAddresses: () => [...this.localAgents.keys()],
+        // OT-RFC-38 / LU-6 Phase B: chain-backed agent-allowlist
+        // fallback. Cores hosting curated CGs they are NOT members
+        // of have no local meta for the allowlist — without this,
+        // every host-mode envelope fails verification with "no
+        // agent allowlist on context graph" and the LU-6 substrate
+        // collapses for any CG the hosting core didn't itself
+        // create or join. See `resolveOnChainParticipantAgents`.
+        chainAgentGateOracle: (cgId: string) => this.resolveOnChainParticipantAgents(cgId),
         workspaceRecipientPrivateKeys: () => this.getLocalWorkspaceRecipientPrivateKeys(),
         workspaceSenderKeyDecryptor: (message: SwmSenderKeyMessageMsg, contextGraphId: string, ctx: OperationContext) =>
           this.decryptWorkspacePayloadWithSenderKey(message, contextGraphId, ctx),
@@ -13912,6 +13944,69 @@ export class DKGAgent {
       logWarn: (ctx, message) => this.log.warn(ctx, message),
       logInfo: (ctx, message) => this.log.info(ctx, message),
     });
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent oracle
+   * for {@link SharedMemoryHandler#chainAgentGateOracle}.
+   *
+   * Maps a CG identifier (cleartext or numeric form) to the on-chain
+   * `ContextGraphStorage.getParticipantAgents` result, with in-memory
+   * caching keyed by the numeric id (so cleartext and numeric callers
+   * share cache entries). Used to authenticate gossip envelopes on
+   * cores that host curated CGs they are not members of — the local
+   * meta-graph has no allowlist triples for such CGs, so without the
+   * chain fallback every envelope would be rejected at
+   * `verifyHostModeEnvelopeAuthority` and the LU-6 substrate would
+   * never collect ciphertext for them.
+   *
+   * Cleartext → numeric resolution probes (in order):
+   *   1. `subscribedContextGraphs[cgId].onChainId` (set by the
+   *      curator on create and by chain-event auto-discovery).
+   *   2. `BigInt(cgId)` parse (covers the publishes that address the
+   *      CG by its numeric on-chain id directly — see PublishIntent
+   *      shape and the matching `isCgCurated` resolver above).
+   *
+   * Returns `null` when no resolution path yields a positive-id
+   * numeric (the caller treats `null` as "no allowlist → reject
+   * defensively"); empty `[]` from the chain is cached and returned
+   * as-is so a brand-new id doesn't keep paying RPC per envelope.
+   */
+  private async resolveOnChainParticipantAgents(contextGraphId: string): Promise<string[] | null> {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
+      return null;
+    }
+    let numericId: bigint | null = null;
+    const sub = this.subscribedContextGraphs.get(contextGraphId);
+    if (sub?.onChainId) {
+      try { numericId = BigInt(sub.onChainId); } catch { /* fall through */ }
+    }
+    if (numericId === null) {
+      try { numericId = BigInt(contextGraphId); } catch { /* not a numeric form */ }
+    }
+    if (numericId === null || numericId <= 0n) return null;
+
+    const cacheKey = numericId.toString();
+    const cached = this.onChainParticipantAgentsCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached.length === 0 ? null : cached;
+    }
+    if (typeof this.chain.getContextGraphParticipantAgents !== 'function') {
+      return null;
+    }
+    try {
+      const agents = await this.chain.getContextGraphParticipantAgents(numericId);
+      const normalised = Array.isArray(agents) ? agents : [];
+      this.onChainParticipantAgentsCache.set(cacheKey, normalised);
+      return normalised.length === 0 ? null : normalised;
+    } catch (err) {
+      this.log.warn(
+        createOperationContext('system'),
+        `resolveOnChainParticipantAgents: chain.getContextGraphParticipantAgents(${cacheKey}) failed — treating as UNKNOWN: ` +
+        (err instanceof Error ? err.message : String(err)),
+      );
+      return null;
+    }
   }
 
   private async isPrivateContextGraph(contextGraphId: string): Promise<boolean> {

@@ -983,6 +983,21 @@ export class MockChainAdapter implements ChainAdapter {
     return typeof ap === 'number' ? ap : 0;
   }
 
+  /**
+   * OT-RFC-38 / LU-6 Phase B: chain-backed participant-agent allowlist
+   * parity for the mock. Mirrors {@link getContextGraphAccessPolicy}
+   * shape. Returns an empty array when the CG is unknown or has no
+   * `participantAgents` field set on the mock state — matching the
+   * Solidity getter's behavior on unregistered ids.
+   */
+  async getContextGraphParticipantAgents(contextGraphId: bigint): Promise<string[]> {
+    const cg = this.contextGraphs.get(contextGraphId);
+    if (!cg) return [];
+    const agents = (cg as { participantAgents?: string[] }).participantAgents;
+    if (!Array.isArray(agents)) return [];
+    return agents.map((a) => ethers.getAddress(a));
+  }
+
   // --- V10 Publish (KnowledgeAssetsV10 → KnowledgeCollectionStorage) ---
 
   async getKnowledgeAssetsV10Address(): Promise<string> {

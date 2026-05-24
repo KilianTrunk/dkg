@@ -121,6 +121,15 @@ function makeHandler(): SharedMemoryHandler {
   });
 }
 
+function makeHandlerWithChainOracle(
+  oracle: (contextGraphId: string) => Promise<string[] | null>,
+): SharedMemoryHandler {
+  return new SharedMemoryHandler(store, new TypedEventBus(), {
+    sharedMemoryOwnedEntities: new Map(),
+    chainAgentGateOracle: oracle,
+  });
+}
+
 async function insertAgentGate(predicate: string, agentAddress: string): Promise<void> {
   await store.insert([{
     subject: DATA_GRAPH,
@@ -280,5 +289,120 @@ describe('SharedMemoryHandler.verifyHostModeEnvelopeAuthority (LU-6 host-mode ga
     if (!verdict.accepted) {
       expect(verdict.reason).toMatch(/decode failed/i);
     }
+  });
+
+  // OT-RFC-38 / LU-6 Phase B — chain-backed agent-allowlist fallback.
+  //
+  // The whole point of LU-6 is "cores host curated CGs they are NOT
+  // members of" (sharding-table-driven, hosting decoupled from
+  // membership). Such cores have NO local meta-graph for those CGs,
+  // so the local SPARQL probe in `getContextGraphAgentGateAddresses`
+  // returns no bindings, and the host-mode gate would defensively
+  // reject every envelope as `"no agent allowlist on context graph"`.
+  //
+  // The fix wires a chain-backed oracle that maps CG id → on-chain
+  // `ContextGraphStorage.getParticipantAgents` result. These tests
+  // exercise the three meaningful outcomes:
+  describe('chain-backed agent-gate fallback (LU-6 Phase B)', () => {
+    it('uses the chain oracle when the local store has no allowlist triples', async () => {
+      const allowed = ethers.Wallet.createRandom();
+      const recipientKey = recipientKeyFor(allowed.address);
+      // NOTE: no insertAgentGate() — the local store has NO allowlist
+      // (mirrors a hosting core that never joined the CG).
+      let oracleCalls = 0;
+      const oracle = async (cgId: string) => {
+        oracleCalls++;
+        expect(cgId).toBe(CONTEXT_GRAPH_ID);
+        return [allowed.address];
+      };
+
+      const raw = workspaceMessage('Chain Fallback Accept', 'op-host-auth-chain-accept');
+      const encrypted = await encryptForCg(allowed.address, raw, recipientKey);
+      const wire = await signWorkspaceMessage(allowed, encrypted);
+
+      const handler = makeHandlerWithChainOracle(oracle);
+      const verdict = await handler.verifyHostModeEnvelopeAuthority(wire, CONTEXT_GRAPH_ID, HOST_PEER_ID);
+
+      expect(verdict.accepted).toBe(true);
+      expect(oracleCalls).toBe(1);
+    });
+
+    it('prefers the local store when allowlist triples are present (chain oracle not consulted)', async () => {
+      const allowed = ethers.Wallet.createRandom();
+      const recipientKey = recipientKeyFor(allowed.address);
+      await insertPrivateAccessPolicy();
+      await insertAgentGate(DKG_ONTOLOGY.DKG_ALLOWED_AGENT, allowed.address);
+
+      let oracleCalls = 0;
+      const oracle = async () => {
+        oracleCalls++;
+        return [allowed.address];
+      };
+
+      const raw = workspaceMessage('Local Preferred', 'op-host-auth-local-preferred');
+      const encrypted = await encryptForCg(allowed.address, raw, recipientKey);
+      const wire = await signWorkspaceMessage(allowed, encrypted);
+
+      const handler = makeHandlerWithChainOracle(oracle);
+      const verdict = await handler.verifyHostModeEnvelopeAuthority(wire, CONTEXT_GRAPH_ID, HOST_PEER_ID);
+
+      expect(verdict.accepted).toBe(true);
+      expect(oracleCalls).toBe(0);
+    });
+
+    it('falls back to reject when the chain oracle returns null (unregistered / unknown CG)', async () => {
+      const allowed = ethers.Wallet.createRandom();
+      const recipientKey = recipientKeyFor(allowed.address);
+      const oracle = async () => null;
+
+      const raw = workspaceMessage('Chain Null', 'op-host-auth-chain-null');
+      const encrypted = await encryptForCg(allowed.address, raw, recipientKey);
+      const wire = await signWorkspaceMessage(allowed, encrypted);
+
+      const handler = makeHandlerWithChainOracle(oracle);
+      const verdict = await handler.verifyHostModeEnvelopeAuthority(wire, CONTEXT_GRAPH_ID, HOST_PEER_ID);
+
+      expect(verdict.accepted).toBe(false);
+      if (!verdict.accepted) {
+        expect(verdict.reason).toMatch(/no agent allowlist/i);
+      }
+    });
+
+    it('rejects when the chain oracle returns a list that does NOT include the signer (DoS-resistance)', async () => {
+      const allowed = ethers.Wallet.createRandom();
+      const attacker = ethers.Wallet.createRandom();
+      const attackerRecipientKey = recipientKeyFor(attacker.address);
+      const oracle = async () => [allowed.address];
+
+      const raw = workspaceMessage('Chain Reject Attacker', 'op-host-auth-chain-reject');
+      const encrypted = await encryptForCg(attacker.address, raw, attackerRecipientKey);
+      const wire = await signWorkspaceMessage(attacker, encrypted);
+
+      const handler = makeHandlerWithChainOracle(oracle);
+      const verdict = await handler.verifyHostModeEnvelopeAuthority(wire, CONTEXT_GRAPH_ID, HOST_PEER_ID);
+
+      expect(verdict.accepted).toBe(false);
+      if (!verdict.accepted) {
+        expect(verdict.reason).toMatch(/agent envelope verification failed/i);
+      }
+    });
+
+    it('treats a thrown oracle as no-allowlist (fail-closed)', async () => {
+      const allowed = ethers.Wallet.createRandom();
+      const recipientKey = recipientKeyFor(allowed.address);
+      const oracle = async () => { throw new Error('rpc unreachable'); };
+
+      const raw = workspaceMessage('Chain Throws', 'op-host-auth-chain-throws');
+      const encrypted = await encryptForCg(allowed.address, raw, recipientKey);
+      const wire = await signWorkspaceMessage(allowed, encrypted);
+
+      const handler = makeHandlerWithChainOracle(oracle);
+      const verdict = await handler.verifyHostModeEnvelopeAuthority(wire, CONTEXT_GRAPH_ID, HOST_PEER_ID);
+
+      expect(verdict.accepted).toBe(false);
+      if (!verdict.accepted) {
+        expect(verdict.reason).toMatch(/no agent allowlist/i);
+      }
+    });
   });
 });

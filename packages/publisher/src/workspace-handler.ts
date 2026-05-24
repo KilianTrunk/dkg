@@ -168,6 +168,24 @@ export class SharedMemoryHandler {
   private readonly sharedMemoryOwnedEntities: Map<string, Map<string, string>> = new Map();
   private readonly writeLocks: Map<string, Promise<void>>;
   private readonly localAgentAddresses?: () => readonly string[] | Promise<readonly string[]>;
+  /**
+   * OT-RFC-38 / LU-6 Phase B — chain-backed fallback for the agent
+   * allowlist read. Returns the participant-agent EOA set for a
+   * given cleartext CG id (which the oracle implementation maps to
+   * the on-chain numeric id internally), or `null` when the chain
+   * has no answer (unregistered id / non-V10 adapter / lookup
+   * failure). Consulted only when the local meta-graph has no
+   * `DKG_ALLOWED_AGENT`/`DKG_PARTICIPANT_AGENT` triples (the host-
+   * mode ingest case on cores that are NOT CG members).
+   *
+   * The oracle SHOULD cache results (chain reads dominate ingest
+   * latency otherwise); this class is intentionally cache-free here
+   * because the wiring agent owns the (chainId, cgId) → agents map
+   * and can invalidate on chain events.
+   */
+  private readonly chainAgentGateOracle?: (
+    contextGraphId: string,
+  ) => Promise<string[] | null>;
   private readonly workspaceRecipientPrivateKeys?: (
     contextGraphId: string,
   ) => readonly WorkspaceRecipientEncryptionKey[] | Promise<readonly WorkspaceRecipientEncryptionKey[]>;
@@ -236,6 +254,15 @@ export class SharedMemoryHandler {
       sharedMemoryOwnedEntities?: Map<string, Map<string, string>>;
       writeLocks?: Map<string, Promise<void>>;
       localAgentAddresses?: () => readonly string[] | Promise<readonly string[]>;
+      /**
+       * OT-RFC-38 / LU-6 Phase B chain-backed agent-allowlist
+       * fallback. See {@link SharedMemoryHandler#chainAgentGateOracle}.
+       * Optional; omitted on test rigs and edge-only deployments
+       * that do not host curated CGs.
+       */
+      chainAgentGateOracle?: (
+        contextGraphId: string,
+      ) => Promise<string[] | null>;
       workspaceRecipientPrivateKeys?: (
         contextGraphId: string,
       ) => readonly WorkspaceRecipientEncryptionKey[] | Promise<readonly WorkspaceRecipientEncryptionKey[]>;
@@ -273,6 +300,7 @@ export class SharedMemoryHandler {
     }
     this.writeLocks = options?.writeLocks ?? new Map();
     this.localAgentAddresses = options?.localAgentAddresses;
+    this.chainAgentGateOracle = options?.chainAgentGateOracle;
     this.workspaceRecipientPrivateKeys = options?.workspaceRecipientPrivateKeys;
     this.workspaceSenderKeyDecryptor = options?.workspaceSenderKeyDecryptor;
     this.now = options?.now ?? (() => Date.now());
@@ -1319,16 +1347,44 @@ export class SharedMemoryHandler {
         { <${cgData}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
       } }`,
     );
-    if (result.type !== 'bindings' || result.bindings.length === 0) {
-      return null;
+    if (result.type === 'bindings' && result.bindings.length > 0) {
+      const agents = result.bindings
+        .map(row => row['agent'])
+        .filter((v): v is string => typeof v === 'string')
+        .map(stripRdfLiteral)
+        .filter((v) => ethers.isAddress(v))
+        .map((v) => ethers.getAddress(v));
+      return [...new Set(agents)];
     }
-    const agents = result.bindings
-      .map(row => row['agent'])
-      .filter((v): v is string => typeof v === 'string')
-      .map(stripRdfLiteral)
-      .filter((v) => ethers.isAddress(v))
-      .map((v) => ethers.getAddress(v));
-    return [...new Set(agents)];
+
+    // OT-RFC-38 / LU-6 Phase B: chain-backed fallback when the local
+    // meta-graph has no allowlist triples. Hits on hosting cores that
+    // are NOT CG members (so they never received the curator's meta
+    // gossip), letting them authoritatively verify gossip envelopes
+    // against the on-chain `ContextGraphStorage.getParticipantAgents`
+    // truth. Returns `null` when the chain has no answer either —
+    // the caller treats that as "not curated, reject defensively"
+    // (`verifyHostModeEnvelopeAuthority`) which is the correct
+    // failure mode.
+    if (this.chainAgentGateOracle) {
+      try {
+        const chainAgents = await this.chainAgentGateOracle(contextGraphId);
+        if (chainAgents && chainAgents.length > 0) {
+          const normalised = chainAgents
+            .filter((v) => ethers.isAddress(v))
+            .map((v) => ethers.getAddress(v));
+          if (normalised.length > 0) {
+            return [...new Set(normalised)];
+          }
+        }
+      } catch (err) {
+        this.log.warn(
+          createOperationContext('share'),
+          `chainAgentGateOracle threw for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)} — treating as no allowlist`,
+        );
+      }
+    }
+    return null;
   }
 
   private async contextGraphHasPrivateAccessPolicy(contextGraphId: string): Promise<boolean> {

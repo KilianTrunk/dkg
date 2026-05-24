@@ -2964,4 +2964,24 @@ export class EVMChainAdapter implements ChainAdapter {
     const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
     return Number(raw);
   }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent
+   * allowlist read. Mirrors {@link getContextGraphAccessPolicy}
+   * (single eth_call, used as the authoritative oracle when the
+   * local store has no answer).
+   *
+   * `ContextGraphStorage.getParticipantAgents` returns the address
+   * array as registered at create time. Empty array for unregistered
+   * ids or CGs that genuinely have no agents (the Solidity getter
+   * just returns the stored mapping; absent ids return zero-length).
+   * Addresses are returned in EIP-55 checksum form to keep callers
+   * consistent with the local-store accessor.
+   */
+  async getContextGraphParticipantAgents(contextGraphId: bigint): Promise<string[]> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const raw: string[] = await cgs.getParticipantAgents(contextGraphId);
+    return raw.map((addr: string) => ethers.getAddress(addr));
+  }
 }

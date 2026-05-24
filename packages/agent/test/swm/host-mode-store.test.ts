@@ -125,6 +125,40 @@ describe('SwmHostModeStore', () => {
     await expect(store.append('cg/empty', new Uint8Array(0))).rejects.toThrow(/zero-length/);
   });
 
+  it('recovers seqno from log tail when meta cursor is stale (crash between appendFile and persistMeta)', async () => {
+    const cgId = 'curator/test-7';
+    const limits = { perCgByteCap: 1024 * 1024, ttlMs: 60_000 };
+    const first = new SwmHostModeStore({ dataDir: dir, unregisteredLimits: limits, registeredLimits: limits });
+    await first.append(cgId, new Uint8Array([1]));
+    await first.append(cgId, new Uint8Array([2]));
+    await first.append(cgId, new Uint8Array([3]));
+
+    // Simulate a crash where persistMeta lost a race and the meta
+    // file reports a lower seqno than the log actually contains.
+    // We do this by overwriting the meta file in place with the
+    // stale cursor (seqno=1, but the log has 3 entries).
+    const { promises: fs } = await import('node:fs');
+    const { createHash } = await import('node:crypto');
+    const cgKey = createHash('sha256').update(cgId).digest('base64url');
+    const metaPath = path.join(dir, `${cgKey}.meta`);
+    await fs.writeFile(metaPath, JSON.stringify({ seqno: 1, registered: false, contextGraphId: cgId }));
+
+    // Fresh store instance reads the stale meta + scans the log tail
+    // and reconciles to max(1, 3) = 3. The next append MUST assign
+    // seqno 4, not 2 (which would otherwise collide with the
+    // existing entry).
+    const second = new SwmHostModeStore({ dataDir: dir, unregisteredLimits: limits, registeredLimits: limits });
+    const recovered = await second.getLastSeqno(cgId);
+    expect(recovered).toBe(3);
+    const next = await second.append(cgId, new Uint8Array([4]));
+    expect(next).toBe(4);
+
+    // All four entries are visible via iterate, with unique
+    // strictly-increasing seqnos.
+    const all = await second.iterate(cgId, 0);
+    expect(all.map((e) => e.seqno)).toEqual([1, 2, 3, 4]);
+  });
+
   it('isolates CGs by id', async () => {
     const store = new SwmHostModeStore({
       dataDir: dir,

@@ -8497,8 +8497,24 @@ export class DKGAgent {
     const ctx = createOperationContext('system');
     if (!(await this.canUseSharedMemoryForContextGraph(contextGraphId))) {
       if (isRegistered) {
+        // `gossip.unsubscribe()` drops EVERY handler on the topic,
+        // not just the member-mode one. If this core was already
+        // hosting the curated SWM in HOST MODE (LU-6), losing
+        // member authorisation here would also kill the host
+        // listener, and `swmHostModeSubscribed` would still be set
+        // — making `reconcileSwmHostModeSubscription()` early-
+        // return on the next pass and stranding the hosting state
+        // until restart (Codex PR #610 R1 comment 4).
+        //
+        // We work around the topic-wide unsubscribe by clearing
+        // the host-mode subscribed flag here so the immediate
+        // `reconcileSwmHostModeSubscription()` call below will
+        // re-wire the host listener if host mode is still
+        // applicable.
+        const wasHostModeSubscribed = this.swmHostModeSubscribed.has(contextGraphId);
         this.gossip.unsubscribe(swmTopic);
         this.sharedMemoryGossipRegistered.delete(contextGraphId);
+        if (wasHostModeSubscribed) this.swmHostModeSubscribed.delete(contextGraphId);
         this.log.warn(ctx, `SWM gossip unsubscribed for "${contextGraphId}": local node is no longer authorized`);
       } else {
         this.log.warn(ctx, `SWM gossip subscription denied for "${contextGraphId}": local node is not authorized`);
@@ -8611,14 +8627,7 @@ export class DKGAgent {
       });
     });
 
-    // If the CG is already on-chain registered, transition the
-    // store immediately to the larger registered-CG limits.
-    try {
-      const onChainKnown = await this.isContextGraphRegisteredOnChain(contextGraphId);
-      if (onChainKnown) {
-        await this.swmHostModeStore.markRegistered(contextGraphId);
-      }
-    } catch { /* best-effort */ }
+    await this.maybeMarkRegisteredForHostMode(contextGraphId);
 
     this.log.info(
       createOperationContext('system'),
@@ -9008,6 +9017,12 @@ export class DKGAgent {
       return { subscribed: false, alreadySubscribed: false, hostingEnabled: true };
     }
     if (this.swmHostModeSubscribed.has(contextGraphId)) {
+      // Idempotent re-entry: even when the subscription is already
+      // active, re-probe registration state. This handles the
+      // legitimate "CG was unregistered when first subscribed,
+      // operator later registered it on-chain, operator re-calls
+      // /host-mode/subscribe" flow without forcing a daemon restart.
+      await this.maybeMarkRegisteredForHostMode(contextGraphId);
       return { subscribed: false, alreadySubscribed: true, hostingEnabled: true };
     }
     const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
@@ -9022,11 +9037,34 @@ export class DKGAgent {
         );
       });
     });
+    // Codex PR #610 R1 comment 5: a core that only knows the CG by
+    // topic id (the explicit /host-mode/subscribe entrypoint) must
+    // still transition the store to the registered-CG limits as
+    // soon as the on-chain record exists. Without this probe the
+    // store would stay on the 6h/1MiB pre-registration defaults
+    // forever and prune ciphertext from registered CGs much
+    // earlier than intended.
+    await this.maybeMarkRegisteredForHostMode(contextGraphId);
     this.log.info(
       createOperationContext('system'),
       `SWM host-mode subscription explicitly enabled for "${contextGraphId}" via API (role=${this.config.nodeRole ?? 'edge'})`,
     );
     return { subscribed: true, alreadySubscribed: false, hostingEnabled: true };
+  }
+
+  /**
+   * Probe on-chain registration and flip the host-mode store's
+   * per-CG cursor to the registered-CG limits when the CG is
+   * already known to the contracts. Safe to call repeatedly and on
+   * unregistered CGs — both branches early-return without touching
+   * the store.
+   */
+  private async maybeMarkRegisteredForHostMode(contextGraphId: string): Promise<void> {
+    if (!this.swmHostModeStore) return;
+    try {
+      const onChainKnown = await this.isContextGraphRegisteredOnChain(contextGraphId);
+      if (onChainKnown) await this.swmHostModeStore.markRegistered(contextGraphId);
+    } catch { /* best-effort; pre-registration defaults stay in place */ }
   }
 
   /**

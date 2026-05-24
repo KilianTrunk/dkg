@@ -352,21 +352,75 @@ export class SwmHostModeStore {
     return meta.registered ? this.registeredLimits : this.unregisteredLimits;
   }
 
+  /**
+   * Load (and cache) the per-CG metadata. On a cold load the seqno
+   * cursor is reconciled against the actual log file: a crash
+   * between `appendFile` (durable) and `persistMeta` (durable) would
+   * otherwise let the next append reuse the same seqno, which would
+   * break host-catchup paging that uses strict-greater-than seqno.
+   *
+   * The log is the source of truth for what was actually persisted;
+   * the meta file is a cache of the highest-known seqno plus the
+   * `registered` flag. After process start we always trust the log
+   * tail's max seqno over the meta file's cursor if the two disagree
+   * — taking `max(metaSeqno, lastLogSeqno)` guarantees we never
+   * recycle a seqno even if the meta write lost a race to the crash.
+   */
   private async loadMeta(contextGraphId: string): Promise<CgMetaState> {
     const cgKey = this.cgKey(contextGraphId);
     const cached = this.metaCache.get(cgKey);
     if (cached) return cached;
     const metaPath = this.metaPath(contextGraphId);
+    let parsed: CgMetaState | undefined;
     try {
       const txt = await fs.readFile(metaPath, 'utf-8');
-      const parsed = JSON.parse(txt) as CgMetaState;
-      this.metaCache.set(cgKey, parsed);
-      return parsed;
+      parsed = JSON.parse(txt) as CgMetaState;
     } catch {
-      const fresh: CgMetaState = { seqno: 0, registered: false, contextGraphId };
-      this.metaCache.set(cgKey, fresh);
-      return fresh;
+      parsed = undefined;
     }
+    const logSeqno = await this.recoverLastSeqnoFromLog(contextGraphId);
+    const state: CgMetaState = {
+      seqno: Math.max(parsed?.seqno ?? 0, logSeqno),
+      registered: parsed?.registered ?? false,
+      contextGraphId,
+    };
+    // If the log says more than the meta does, persist the
+    // reconciled cursor so subsequent cold loads don't have to
+    // re-scan the log tail.
+    if (parsed && state.seqno !== parsed.seqno) {
+      await fs.writeFile(metaPath, JSON.stringify(state)).catch(() => { /* best-effort */ });
+    }
+    this.metaCache.set(cgKey, state);
+    return state;
+  }
+
+  /**
+   * Scan the per-CG log tail and return the highest seqno actually
+   * persisted on disk. Reads the whole file (the per-CG cap keeps
+   * this bounded — default 1 MiB unregistered, 64 MiB registered)
+   * and walks frame-by-frame. Returns 0 if no log file exists or
+   * the file is empty/corrupt at the head.
+   */
+  private async recoverLastSeqnoFromLog(contextGraphId: string): Promise<number> {
+    const filePath = this.logPath(contextGraphId);
+    if (!(await fileExists(filePath))) return 0;
+    let buf: Buffer;
+    try {
+      buf = await fs.readFile(filePath);
+    } catch {
+      return 0;
+    }
+    let lastSeqno = 0;
+    let offset = 0;
+    while (offset + ENTRY_HEADER_BYTES <= buf.length) {
+      const seqno = Number(buf.readBigUInt64BE(offset + 8));
+      const len = buf.readUInt32BE(offset + 16);
+      const end = offset + ENTRY_HEADER_BYTES + len;
+      if (end > buf.length) break;
+      if (seqno > lastSeqno) lastSeqno = seqno;
+      offset = end;
+    }
+    return lastSeqno;
   }
 
   private async persistMeta(contextGraphId: string, meta: CgMetaState): Promise<void> {

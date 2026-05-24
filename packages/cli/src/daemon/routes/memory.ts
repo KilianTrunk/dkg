@@ -649,103 +649,169 @@ WHERE {
       });
     }
 
-    // Parallelize across peers — each peer's sync is independent
-    // and the per-peer dial+request takes 5-20s on devnet. Serial
-    // iteration over N peers would compound to N×20s, easily
-    // exceeding the daemon's default request timeout.
-    const settled = await Promise.allSettled(
-      candidatePeers.map(async (candidate) => {
-        let swm = 0;
-        let durable = 0;
-        let swmError: string | undefined;
-        let durableError: string | undefined;
-        try {
-          swm = await withTimeout(
-            agent.syncSharedMemoryFromPeer(candidate, cgIds),
-            PER_PEER_SWM_BUDGET_MS,
-            `SWM catchup from ${candidate}`,
-          );
-        } catch (err: any) {
-          swmError = err?.message ?? String(err);
-        }
-        if (includeDurable) {
+    // Per-CG × per-peer sync. The previous shape called
+    // `syncSharedMemoryFromPeer(peer, cgIds)` ONCE per peer with the
+    // full CG list, which only returned an aggregate count and made
+    // a per-CG LU-6 fallback decision impossible (Codex PR #610 R1
+    // comment 1: if one CG got triples from standard sync, fallback
+    // for the others got skipped on the aggregate gate).
+    //
+    // Now: iterate CGs serially (keeps wire load bounded across many
+    // peers × many CGs), and within each CG parallelize the per-peer
+    // sync exactly like before. Per-peer dial+request is 5-20s on
+    // devnet; serialising peers would compound to N×20s.
+    type PerPeerLeg = {
+      peerId: string;
+      insertedTriples: number;
+      durableInsertedTriples: number;
+      swmError?: string;
+      durableError?: string;
+      error?: string;
+    };
+    type PerCgLeg = {
+      contextGraphId: string;
+      perPeer: PerPeerLeg[];
+      insertedTriples: number;
+      durableInsertedTriples: number;
+    };
+    const perCgLegs: PerCgLeg[] = [];
+    for (const cgId of cgIds) {
+      const settled = await Promise.allSettled(
+        candidatePeers.map(async (candidate) => {
+          let swm = 0;
+          let durable = 0;
+          let swmError: string | undefined;
+          let durableError: string | undefined;
           try {
-            durable = await withTimeout(
-              (agent as any).syncFromPeer?.(candidate, cgIds) ?? Promise.resolve(0),
-              PER_PEER_DURABLE_BUDGET_MS,
-              `Durable catchup from ${candidate}`,
+            swm = await withTimeout(
+              agent.syncSharedMemoryFromPeer(candidate, [cgId]),
+              PER_PEER_SWM_BUDGET_MS,
+              `SWM catchup from ${candidate} for ${cgId}`,
             );
           } catch (err: any) {
-            durableError = err?.message ?? String(err);
+            swmError = err?.message ?? String(err);
           }
+          if (includeDurable) {
+            try {
+              durable = await withTimeout(
+                (agent as any).syncFromPeer?.(candidate, [cgId]) ?? Promise.resolve(0),
+                PER_PEER_DURABLE_BUDGET_MS,
+                `Durable catchup from ${candidate} for ${cgId}`,
+              );
+            } catch (err: any) {
+              durableError = err?.message ?? String(err);
+            }
+          }
+          return { peerId: candidate, insertedTriples: swm, durableInsertedTriples: durable, swmError, durableError } as PerPeerLeg;
+        }),
+      );
+      const perPeer: PerPeerLeg[] = settled.map((s, idx) => {
+        if (s.status === 'fulfilled') {
+          return {
+            peerId: candidatePeers[idx],
+            insertedTriples: s.value.insertedTriples,
+            durableInsertedTriples: s.value.durableInsertedTriples,
+            ...(s.value.swmError ? { swmError: s.value.swmError } : {}),
+            ...(s.value.durableError ? { durableError: s.value.durableError } : {}),
+          };
         }
-        return { peerId: candidate, insertedTriples: swm, durableInsertedTriples: durable, swmError, durableError };
-      }),
-    );
-
-    const results = settled.map((s, idx) => {
-      if (s.status === 'fulfilled') {
         return {
           peerId: candidatePeers[idx],
-          insertedTriples: s.value.insertedTriples,
-          durableInsertedTriples: s.value.durableInsertedTriples,
-          ...(s.value.swmError ? { swmError: s.value.swmError } : {}),
-          ...(s.value.durableError ? { durableError: s.value.durableError } : {}),
+          insertedTriples: 0,
+          durableInsertedTriples: 0,
+          error: s.reason?.message ?? String(s.reason),
         };
-      }
-      return {
-        peerId: candidatePeers[idx],
-        insertedTriples: 0,
-        durableInsertedTriples: 0,
-        error: s.reason?.message ?? String(s.reason),
-      };
-    });
+      });
+      perCgLegs.push({
+        contextGraphId: cgId,
+        perPeer,
+        insertedTriples: perPeer.reduce((sum, p) => sum + p.insertedTriples, 0),
+        durableInsertedTriples: perPeer.reduce((sum, p) => sum + (p.durableInsertedTriples ?? 0), 0),
+      });
+    }
 
-    const totalInserted = results.reduce((sum, r) => sum + r.insertedTriples, 0);
-    const totalDurable = results.reduce((sum, r) => sum + (r.durableInsertedTriples ?? 0), 0);
-
-    // OT-RFC-38 LU-6: if the standard sync path produced zero SWM
-    // triples, fall back to the host-catchup path against the same
-    // peer set. This handles the "every member is offline; only
-    // cores still hold the ciphertext substrate" scenario — the
-    // standard sync path can't return triples cores never had,
-    // but host-catchup returns the opaque envelopes which the
-    // local agent can decrypt with its own chain key.
+    // OT-RFC-38 LU-6 — per-CG host-catchup fallback. For each CG
+    // whose standard sync inserted 0 triples, fall back to fetching
+    // opaque ciphertext envelopes from connected core hosts and
+    // re-applying them through the local sender-key decryptor.
+    // This is the "every member is offline; only cores still hold
+    // the substrate" recovery path.
     //
     // Behaviour:
     //  - Default ON; opt out via { hostCatchupFallback: false }.
-    //  - Only fires when total triples inserted via standard sync
-    //    is 0 AND at least one CG is curated. Public CGs are
-    //    plaintext-only and don't need this path.
+    //  - Decision is per-CG: a multi-CG catchup where some CGs got
+    //    triples from standard sync and others didn't will still run
+    //    fallback for the empty ones (Codex PR #610 R1 fix).
     //  - The host-catchup leg has its own internal time budget
-    //    (sendReliable + a few rounds per peer); it runs serially
-    //    per CG to keep wire load low.
+    //    (sendReliable + a few rounds per peer); CGs are processed
+    //    serially to keep wire load low.
     const hostCatchupOpted = parsed.hostCatchupFallback !== false;
-    let hostCatchup: Array<{
+    const hostCatchupSupported = typeof (agent as any).catchupSwmFromConnectedHosts === 'function';
+    type HostCatchupLeg = {
       contextGraphId: string;
       peers: Awaited<ReturnType<typeof agent.catchupSwmFromConnectedHosts>>;
       appliedTotal: number;
-    }> = [];
-    if (hostCatchupOpted && totalInserted === 0 && typeof (agent as any).catchupSwmFromConnectedHosts === 'function') {
-      for (const cgId of cgIds) {
+      error?: string;
+    };
+    const hostCatchup: HostCatchupLeg[] = [];
+    if (hostCatchupOpted && hostCatchupSupported) {
+      for (const cg of perCgLegs) {
+        if (cg.insertedTriples > 0) continue;
         try {
-          const peerResults = await (agent as any).catchupSwmFromConnectedHosts(cgId, {
+          const peerResults = await (agent as any).catchupSwmFromConnectedHosts(cg.contextGraphId, {
             peers: peerIdParam ? [peerIdParam] : undefined,
             maxRounds: 8,
           });
           const appliedTotal = peerResults.reduce((sum: number, r: any) => sum + (r.applied ?? 0), 0);
-          hostCatchup.push({ contextGraphId: cgId, peers: peerResults, appliedTotal });
+          hostCatchup.push({ contextGraphId: cg.contextGraphId, peers: peerResults, appliedTotal });
         } catch (err: any) {
           hostCatchup.push({
-            contextGraphId: cgId,
+            contextGraphId: cg.contextGraphId,
             peers: [],
             appliedTotal: 0,
+            error: err?.message ?? String(err),
           });
-          (results as any).push({ peerId: 'host-catchup', insertedTriples: 0, durableInsertedTriples: 0, error: err?.message ?? String(err) });
         }
       }
     }
     const hostCatchupAppliedTotal = hostCatchup.reduce((sum, h) => sum + h.appliedTotal, 0);
+
+    // Codex PR #610 R1 comment 2: `totalInsertedTriples` must cover
+    // BOTH the standard sync leg and the LU-6 host-catchup leg so
+    // callers that read just this top-level field don't mistake a
+    // successful host-catchup recovery for a no-op.
+    const standardInserted = perCgLegs.reduce((sum, c) => sum + c.insertedTriples, 0);
+    const totalInserted = standardInserted + hostCatchupAppliedTotal;
+    const totalDurable = perCgLegs.reduce((sum, c) => sum + c.durableInsertedTriples, 0);
+
+    // Flatten per-peer into a backward-compatible `results` array
+    // for callers that only care about the aggregate peer view.
+    // The richer per-CG / per-peer breakdown lives in `perContextGraph`.
+    const perPeerAggregate = new Map<string, {
+      peerId: string;
+      insertedTriples: number;
+      durableInsertedTriples: number;
+      errors?: string[];
+    }>();
+    for (const cg of perCgLegs) {
+      for (const p of cg.perPeer) {
+        const entry = perPeerAggregate.get(p.peerId) ?? { peerId: p.peerId, insertedTriples: 0, durableInsertedTriples: 0 };
+        entry.insertedTriples += p.insertedTriples;
+        entry.durableInsertedTriples += p.durableInsertedTriples;
+        const errs: string[] = [];
+        if (p.swmError) errs.push(p.swmError);
+        if (p.durableError) errs.push(p.durableError);
+        if (p.error) errs.push(p.error);
+        if (errs.length > 0) entry.errors = [...(entry.errors ?? []), ...errs];
+        perPeerAggregate.set(p.peerId, entry);
+      }
+    }
+    const results = [...perPeerAggregate.values()].map((r) => ({
+      peerId: r.peerId,
+      insertedTriples: r.insertedTriples,
+      durableInsertedTriples: r.durableInsertedTriples,
+      ...(r.errors && r.errors.length > 0 ? { errors: r.errors } : {}),
+    }));
 
     return jsonResponse(res, 200, {
       contextGraphIds: cgIds,
@@ -753,12 +819,20 @@ WHERE {
       includeDurable,
       totalInsertedTriples: totalInserted,
       totalDurableInsertedTriples: totalDurable,
+      standardInsertedTriples: standardInserted,
       results,
+      perContextGraph: perCgLegs.map((cg) => ({
+        contextGraphId: cg.contextGraphId,
+        insertedTriples: cg.insertedTriples,
+        durableInsertedTriples: cg.durableInsertedTriples,
+        perPeer: cg.perPeer,
+      })),
       hostCatchup: hostCatchupOpted ? {
-        ranFallback: totalInserted === 0,
+        ranFallback: hostCatchup.length > 0,
+        triggeredForContextGraphIds: hostCatchup.map((h) => h.contextGraphId),
         appliedTotal: hostCatchupAppliedTotal,
         perContextGraph: hostCatchup,
-      } : { ranFallback: false, appliedTotal: 0, perContextGraph: [] },
+      } : { ranFallback: false, triggeredForContextGraphIds: [], appliedTotal: 0, perContextGraph: [] },
     });
   }
 

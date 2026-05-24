@@ -190,6 +190,38 @@ restart_node() {
   wait_for_node_up "$node"
 }
 
+# Poll `/api/connections` on $node until $targetPeer is in the
+# connection list (direct OR relayed). The sender-key handshake send
+# has a 20s deadline; if libp2p hasn't converged after a restart, the
+# first SWM write fails with `send timeout: backoff aborted by
+# overall deadline`. This polls for up to 90s so the test is not
+# subject to libp2p re-dial timing.
+wait_for_peer_link() {
+  local node="$1" target_peer="$2"
+  local label="node $node → $target_peer"
+  for _ in $(seq 1 90); do
+    local conn
+    conn=$(api_call "$node" GET /api/connections 2>/dev/null | TARGET="$target_peer" node -e '
+      let d=""; process.stdin.on("data",c=>d+=c);
+      process.stdin.on("end",()=>{
+        try {
+          const j = JSON.parse(d);
+          const list = Array.isArray(j.connections) ? j.connections : [];
+          const found = list.some(c => c.peerId === process.env.TARGET);
+          console.log(found ? "1" : "0");
+        } catch { console.log("0"); }
+      });
+    ' 2>/dev/null || echo 0)
+    if [ "$conn" = "1" ]; then
+      log "  peer-link OK: $label"
+      return 0
+    fi
+    sleep 1
+  done
+  warn "peer-link probe timed out: $label (continuing; SWM write may fail)"
+  return 1
+}
+
 CURATOR_AGENT=$(api_call "$CURATOR_NODE"      GET /api/agent/identity | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).agentAddress))')
 CURATOR_PEER=$(api_call "$CURATOR_NODE"       GET /api/agent/identity | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).peerId))')
 MEMBER_AGENT=$(api_call "$MEMBER_NODE"        GET /api/agent/identity | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).agentAddress))')
@@ -412,6 +444,12 @@ done
 
 sleep 3
 
+# Third-member (N4) is the only other allowed agent — wait for the
+# curator→N4 link to come up after the prior SCENARIO B restart so
+# the sender-key setup doesn't time out.
+THIRD_PEER=$(api_call "$THIRD_MEMBER_NODE" GET /api/agent/identity | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).peerId))')
+wait_for_peer_link "$CURATOR_NODE" "$THIRD_PEER"
+
 log "Curator writes 4 SWM triples to CG_C..."
 C_PAYLOAD=$(CG_ID="$CG_C" N=4 LABEL="C" node -e '
   const cgId = process.env.CG_ID;
@@ -526,6 +564,8 @@ done
 
 # Give cores a beat to wire up the pubsub topic listeners.
 sleep 5
+
+wait_for_peer_link "$CURATOR_NODE" "$MEMBER_PEER"
 
 log "Initial write (1 triple) to drive sender-key handshake to member..."
 D0_PAYLOAD=$(CG_ID="$CG_D" node -e '

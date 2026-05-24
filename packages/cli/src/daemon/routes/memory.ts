@@ -703,6 +703,50 @@ WHERE {
 
     const totalInserted = results.reduce((sum, r) => sum + r.insertedTriples, 0);
     const totalDurable = results.reduce((sum, r) => sum + (r.durableInsertedTriples ?? 0), 0);
+
+    // OT-RFC-38 LU-6: if the standard sync path produced zero SWM
+    // triples, fall back to the host-catchup path against the same
+    // peer set. This handles the "every member is offline; only
+    // cores still hold the ciphertext substrate" scenario — the
+    // standard sync path can't return triples cores never had,
+    // but host-catchup returns the opaque envelopes which the
+    // local agent can decrypt with its own chain key.
+    //
+    // Behaviour:
+    //  - Default ON; opt out via { hostCatchupFallback: false }.
+    //  - Only fires when total triples inserted via standard sync
+    //    is 0 AND at least one CG is curated. Public CGs are
+    //    plaintext-only and don't need this path.
+    //  - The host-catchup leg has its own internal time budget
+    //    (sendReliable + a few rounds per peer); it runs serially
+    //    per CG to keep wire load low.
+    const hostCatchupOpted = parsed.hostCatchupFallback !== false;
+    let hostCatchup: Array<{
+      contextGraphId: string;
+      peers: Awaited<ReturnType<typeof agent.catchupSwmFromConnectedHosts>>;
+      appliedTotal: number;
+    }> = [];
+    if (hostCatchupOpted && totalInserted === 0 && typeof (agent as any).catchupSwmFromConnectedHosts === 'function') {
+      for (const cgId of cgIds) {
+        try {
+          const peerResults = await (agent as any).catchupSwmFromConnectedHosts(cgId, {
+            peers: peerIdParam ? [peerIdParam] : undefined,
+            maxRounds: 8,
+          });
+          const appliedTotal = peerResults.reduce((sum: number, r: any) => sum + (r.applied ?? 0), 0);
+          hostCatchup.push({ contextGraphId: cgId, peers: peerResults, appliedTotal });
+        } catch (err: any) {
+          hostCatchup.push({
+            contextGraphId: cgId,
+            peers: [],
+            appliedTotal: 0,
+          });
+          (results as any).push({ peerId: 'host-catchup', insertedTriples: 0, durableInsertedTriples: 0, error: err?.message ?? String(err) });
+        }
+      }
+    }
+    const hostCatchupAppliedTotal = hostCatchup.reduce((sum, h) => sum + h.appliedTotal, 0);
+
     return jsonResponse(res, 200, {
       contextGraphIds: cgIds,
       peersAttempted: candidatePeers.length,
@@ -710,7 +754,97 @@ WHERE {
       totalInsertedTriples: totalInserted,
       totalDurableInsertedTriples: totalDurable,
       results,
+      hostCatchup: hostCatchupOpted ? {
+        ranFallback: totalInserted === 0,
+        appliedTotal: hostCatchupAppliedTotal,
+        perContextGraph: hostCatchup,
+      } : { ranFallback: false, appliedTotal: 0, perContextGraph: [] },
     });
+  }
+
+  // OT-RFC-38 LU-6 — dedicated host-catchup endpoint.
+  //
+  // POST /api/shared-memory/host-catchup
+  // Body: { contextGraphId: string, peerId?: string, sinceSeqno?: number, maxRounds?: number }
+  //
+  // Pulls opaque ciphertext envelopes from cores that have been
+  // hosting the curated CG's SWM substrate and re-applies each
+  // through the local agent so the existing Sender-Key decrypt
+  // path runs verbatim. Distinct from the "fallback" leg embedded
+  // in /catchup above — exposed so operators can debug host
+  // hosting independently (e.g. to confirm a specific core has
+  // stored ciphertext for a CG).
+  if (req.method === 'POST' && path === '/api/shared-memory/host-catchup') {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    if (typeof parsed.contextGraphId !== 'string' || !parsed.contextGraphId.trim()) {
+      return jsonResponse(res, 400, { error: 'Missing or invalid "contextGraphId"' });
+    }
+    const cgId = parsed.contextGraphId.trim();
+    const peerIdParam = typeof parsed.peerId === 'string' ? parsed.peerId.trim() : undefined;
+    const sinceSeqno = typeof parsed.sinceSeqno === 'number' && parsed.sinceSeqno >= 0 ? Math.floor(parsed.sinceSeqno) : 0;
+    const maxRounds = typeof parsed.maxRounds === 'number' && parsed.maxRounds > 0 ? Math.min(64, Math.floor(parsed.maxRounds)) : 8;
+    if (typeof (agent as any).catchupSwmFromConnectedHosts !== 'function') {
+      return jsonResponse(res, 501, { error: 'Host-catchup is not supported on this agent build' });
+    }
+    try {
+      const peerResults = await (agent as any).catchupSwmFromConnectedHosts(cgId, {
+        peers: peerIdParam ? [peerIdParam] : undefined,
+        sinceSeqno,
+        maxRounds,
+      });
+      const appliedTotal = peerResults.reduce((sum: number, r: any) => sum + (r.applied ?? 0), 0);
+      const fetchedTotal = peerResults.reduce((sum: number, r: any) => sum + (r.fetched ?? 0), 0);
+      return jsonResponse(res, 200, {
+        contextGraphId: cgId,
+        peers: peerResults,
+        appliedTotal,
+        fetchedTotal,
+      });
+    } catch (err: any) {
+      return jsonResponse(res, 500, { error: err?.message ?? String(err) });
+    }
+  }
+
+  // OT-RFC-38 LU-6 — host-mode store diagnostics.
+  // GET /api/shared-memory/host-mode/stats
+  // Returns { enabled, cgCount, totalBytes, totalEntries, subscribedCgIds }.
+  if (req.method === 'GET' && path === '/api/shared-memory/host-mode/stats') {
+    if (typeof (agent as any).getSwmHostModeStats !== 'function') {
+      return jsonResponse(res, 501, { error: 'Host-mode store is not supported on this agent build' });
+    }
+    try {
+      const stats = await (agent as any).getSwmHostModeStats();
+      return jsonResponse(res, 200, stats ?? { enabled: false });
+    } catch (err: any) {
+      return jsonResponse(res, 500, { error: err?.message ?? String(err) });
+    }
+  }
+
+  // OT-RFC-38 LU-6 — explicit host-mode subscribe.
+  // POST /api/shared-memory/host-mode/subscribe { contextGraphId }
+  // Tells a core to start hosting the curated CG's encrypted SWM
+  // substrate WITHOUT requiring the core to become a CG member.
+  // Used by operators in Phase A to designate per-core hosting
+  // assignments while the sharding-table-based auto-discovery
+  // matures. No-op on edges (host mode disabled).
+  if (req.method === 'POST' && path === '/api/shared-memory/host-mode/subscribe') {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    if (typeof parsed.contextGraphId !== 'string' || !parsed.contextGraphId.trim()) {
+      return jsonResponse(res, 400, { error: 'Missing or invalid "contextGraphId"' });
+    }
+    if (typeof (agent as any).enableSwmHostModeFor !== 'function') {
+      return jsonResponse(res, 501, { error: 'Host-mode subscribe is not supported on this agent build' });
+    }
+    try {
+      const result = await (agent as any).enableSwmHostModeFor(parsed.contextGraphId.trim());
+      return jsonResponse(res, 200, { contextGraphId: parsed.contextGraphId.trim(), ...result });
+    } catch (err: any) {
+      return jsonResponse(res, 500, { error: err?.message ?? String(err) });
+    }
   }
 
   // Tiny local helper — kept inline to avoid adding a new import for

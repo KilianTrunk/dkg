@@ -637,7 +637,31 @@ export class SharedMemoryHandler {
    * inspects the outcome and throws on `retryable: true` so the
    * substrate's outbox keeps the share queued for retry.
    */
-  async handle(data: Uint8Array, fromPeerId: string, onPhase?: PhaseCallback): Promise<SharedMemoryApplyOutcome> {
+  /**
+   * Apply a wire-format SWM gossip message.
+   *
+   * `options.trustedReplay` (OT-RFC-38 LU-6): when true, the handler
+   * SKIPS the two pubsub-transport-layer peer assertions:
+   *   1. `publisherPeerId === fromPeerId` (gossipsub `from` matches
+   *       envelope-declared publisher)
+   *   2. `allowedPeers.includes(fromPeerId)` (peer allowlist gate)
+   *
+   * Used by LU-6 host-catchup, where the member replays opaque
+   * ciphertext envelopes it just fetched from a CORE host. The CORE
+   * is NOT the original publisher (its peerId won't match what the
+   * sender packaged), and it isn't necessarily in the curated peer
+   * allowlist. The cryptographic chain (gossip-envelope signature
+   * verification + sender-key AEAD decryption) is still enforced
+   * for every replayed envelope — so a host can't forge or tamper
+   * with what it stored opaquely, only relay it.
+   */
+  async handle(
+    data: Uint8Array,
+    fromPeerId: string,
+    onPhase?: PhaseCallback,
+    options?: { trustedReplay?: boolean },
+  ): Promise<SharedMemoryApplyOutcome> {
+    const trustedReplay = options?.trustedReplay === true;
     let ctx = createOperationContext('share');
     // PR-C codex R5 (dropped review comment): protobuf decode
     // failures are DETERMINISTIC — retrying the same wire bytes
@@ -787,7 +811,7 @@ export class SharedMemoryHandler {
         return { applied: false, reason, retryable: false };
       }
 
-      if (publisherPeerId !== fromPeerId) {
+      if (!trustedReplay && publisherPeerId !== fromPeerId) {
         const reason = `payload publisherPeerId "${publisherPeerId}" does not match sender "${fromPeerId}"`;
         this.log.warn(ctx, `SWM write rejected: ${reason}`);
         return { applied: false, reason, retryable: false };
@@ -800,8 +824,12 @@ export class SharedMemoryHandler {
       // gauge that the rc10 dedup decision relies on. Codex review on
       // PR #570 caught the earlier shape.
 
-      // Enforce peer allowlist for curated CGs
-      if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
+      // Enforce peer allowlist for curated CGs. Skipped under
+      // `trustedReplay` (LU-6 host-catchup): the relaying host
+      // need not be in the curated peer allowlist; the original
+      // publisher's identity is bound by the envelope signature
+      // and the sender-key AEAD chain.
+      if (!trustedReplay && allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
         const reason = `peer "${fromPeerId}" not in allowlist for context graph "${contextGraphId}"`;
         this.log.warn(ctx, `SWM write rejected: ${reason}`);
         return { applied: false, reason, retryable: false };

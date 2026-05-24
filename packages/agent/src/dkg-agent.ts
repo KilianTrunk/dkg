@@ -2,7 +2,7 @@ import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
   PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
-  PROTOCOL_SWM_SENDER_KEY, PROTOCOL_SWM_UPDATE, PROTOCOL_SWM_SHARE_ACK, PROTOCOL_MESSAGE,
+  PROTOCOL_SWM_SENDER_KEY, PROTOCOL_SWM_UPDATE, PROTOCOL_SWM_SHARE_ACK, PROTOCOL_SWM_HOST_CATCHUP, PROTOCOL_MESSAGE,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
@@ -18,6 +18,9 @@ import {
   GOSSIP_ENVELOPE_VERSION,
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
   encodeFinalizationMessage, type FinalizationMessageMsg,
+  decodeGossipEnvelope, type GossipEnvelopeMsg,
+  decodeEncryptedWorkspacePayload, ENCRYPTED_WORKSPACE_ENVELOPE_TYPE,
+  decodeSwmSenderKeyMessage, SWM_SENDER_KEY_MESSAGE_TYPE,
   getGenesisQuads, computeNetworkId, SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY,
   Logger, createOperationContext, sparqlString, escapeSparqlLiteral, isSafeIri, assertSafeIri,
   TrustLevel,
@@ -132,6 +135,16 @@ import {
   createSwmAckQuorum,
   type SwmAckQuorum,
 } from './swm/ack-quorum.js';
+import { SwmHostModeStore, type SwmHostModeStoreLimits } from './swm/host-mode-store.js';
+import {
+  decodeSwmHostCatchupRequest,
+  encodeSwmHostCatchupRequest,
+  encodeSwmHostCatchupResponse,
+  decodeSwmHostCatchupResponse,
+  DEFAULT_MAX_BYTES as SWM_HOST_CATCHUP_DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_ENTRIES as SWM_HOST_CATCHUP_DEFAULT_MAX_ENTRIES,
+  type SwmHostCatchupResponseEntry,
+} from './swm/host-catchup-wire.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
@@ -347,6 +360,16 @@ export class DKGAgent {
   private sharedMemoryHandler?: InstanceType<typeof SharedMemoryHandler>;
   private gossipPublishHandler?: GossipPublishHandler;
   private finalizationHandler?: FinalizationHandler;
+  /**
+   * OT-RFC-38 LU-6 — opaque ciphertext store used only when this
+   * node is a core hosting curated CG substrate on behalf of members.
+   * Lazily constructed on first use; absent on edge nodes by default.
+   */
+  private swmHostModeStore?: SwmHostModeStore;
+  /** CGs we've subscribed to in host mode (cores only). */
+  private readonly swmHostModeSubscribed = new Set<string>();
+  /** Async lock for the host-mode reconciler so simultaneous calls don't double-subscribe. */
+  private hostModeReconcileInflight?: Promise<void>;
   private readonly log = new Logger('DKGAgent');
 
   /**
@@ -500,6 +523,8 @@ export class DKGAgent {
   private messageHandler: MessageHandler | null = null;
   private chainPoller: ChainEventPoller | null = null;
   private swmCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private hostModeReconcilerTimer: ReturnType<typeof setInterval> | null = null;
+  private hostModePruneTimer: ReturnType<typeof setInterval> | null = null;
   // rc.9 PR-10: joinApprovalRetryQueue + joinApprovalRetryTimer
   // deleted. The substrate's SQLite-backed ProtocolOutbox + its tick
   // (`Messenger.processOutboxTick`) + opportunistic on-connect flush
@@ -1034,6 +1059,7 @@ export class DKGAgent {
     });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
     await this.loadSwmSenderKeyState();
+    await this.initializeSwmHostModeStore();
     await this.rehydrateContextGraphSubscriptions();
 
     // Register protocol handlers. PROTOCOL_ACCESS migrated onto the
@@ -1156,6 +1182,14 @@ export class DKGAgent {
     // which is structurally identical and avoids a second
     // round-trip per peer).
     this.messenger.register(PROTOCOL_SWM_SHARE_ACK, (data, fromPeerId) => this.handleSwmShareAck(data, fromPeerId));
+
+    // OT-RFC-38 LU-6: cores expose stored ciphertext envelopes to
+    // members via /dkg/10.0.1/swm-host-catchup. Registered
+    // unconditionally — the handler itself checks node role + host-
+    // mode store presence and serves a `denied` response on edges.
+    // Going through messenger.register opts into the substrate's
+    // envelope versioning, idempotency cache, and `/api/slo` stats.
+    this.messenger.register(PROTOCOL_SWM_HOST_CATCHUP, (data, fromPeerId) => this.handleSwmHostCatchup(data, fromPeerId));
 
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
@@ -2100,6 +2134,33 @@ export class DKGAgent {
         this.cleanupExpiredSharedMemory().catch(() => {});
       }, SWM_CLEANUP_INTERVAL_MS);
       if (this.swmCleanupTimer.unref) this.swmCleanupTimer.unref();
+    }
+
+    // OT-RFC-38 LU-6: periodic reconciler that ensures the local
+    // node is subscribed in host-mode to every locally-known
+    // curated CG (cores only). Without this tick, a CG learned of
+    // after `subscribeToContextGraph` already ran (e.g. via on-
+    // connect sync from a peer) would miss host-mode coverage
+    // until the next explicit subscribe call. Also runs the
+    // store's TTL/cap prune.
+    if (this.swmHostModeStore) {
+      const reconcileEveryMs = this.config.swmHostMode?.reconcileIntervalMs ?? 30_000;
+      const pruneEveryMs = this.config.swmHostMode?.pruneIntervalMs ?? 5 * 60_000;
+      this.reconcileHostModeSubscriptions().catch(() => {});
+      this.hostModeReconcilerTimer = setInterval(() => {
+        this.reconcileHostModeSubscriptions().catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log.warn(createOperationContext('system'), `Host-mode reconciler tick failed: ${msg}`);
+        });
+      }, reconcileEveryMs);
+      if (this.hostModeReconcilerTimer.unref) this.hostModeReconcilerTimer.unref();
+      this.hostModePruneTimer = setInterval(() => {
+        this.swmHostModeStore?.prune().catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log.warn(createOperationContext('system'), `Host-mode prune tick failed: ${msg}`);
+        });
+      }, pruneEveryMs);
+      if (this.hostModePruneTimer.unref) this.hostModePruneTimer.unref();
     }
 
     // Start the periodic sync reconciler — the safety net for the
@@ -8439,9 +8500,15 @@ export class DKGAgent {
         this.gossip.unsubscribe(swmTopic);
         this.sharedMemoryGossipRegistered.delete(contextGraphId);
         this.log.warn(ctx, `SWM gossip unsubscribed for "${contextGraphId}": local node is no longer authorized`);
-        return;
+      } else {
+        this.log.warn(ctx, `SWM gossip subscription denied for "${contextGraphId}": local node is not authorized`);
       }
-      this.log.warn(ctx, `SWM gossip subscription denied for "${contextGraphId}": local node is not authorized`);
+      // OT-RFC-38 LU-6: even if the local node is not a CG member,
+      // a CORE node may still serve as a ciphertext host for the
+      // curated SWM substrate. We delegate to the host-mode
+      // reconciler — which is a no-op on edges and on cores when
+      // the swmHostMode config is disabled.
+      await this.reconcileSwmHostModeSubscription(contextGraphId);
       return;
     }
 
@@ -8471,6 +8538,495 @@ export class DKGAgent {
       if (!outcome.applied) return;
       this.maybeEmitSwmShareAck(outcome).catch(() => { /* swallowed; logged inside */ });
     });
+  }
+
+  /**
+   * OT-RFC-38 LU-6 — initialize the on-disk opaque ciphertext store
+   * for hosting curated CG SWM substrate. No-op on edges and on
+   * cores where the operator has explicitly opted out via
+   * `config.swmHostMode.enabled === false`.
+   */
+  private async initializeSwmHostModeStore(): Promise<void> {
+    const role = this.config.nodeRole ?? 'edge';
+    const hostModeCfg = this.config.swmHostMode ?? {};
+    const enabled = hostModeCfg.enabled ?? (role === 'core');
+    if (!enabled) return;
+    if (!this.config.dataDir) {
+      this.log.warn(
+        createOperationContext('system'),
+        'SWM host-mode requested but no dataDir configured — disk-backed store cannot be created; host-mode disabled',
+      );
+      return;
+    }
+    const defaults = SwmHostModeStore.defaultLimits();
+    const { join } = await import('node:path');
+    this.swmHostModeStore = new SwmHostModeStore({
+      dataDir: join(this.config.dataDir, 'swm-host'),
+      unregisteredLimits: hostModeCfg.unregistered ?? defaults.unregistered,
+      registeredLimits: hostModeCfg.registered ?? defaults.registered,
+    });
+    await this.swmHostModeStore.init();
+    this.log.info(
+      createOperationContext('system'),
+      `SWM host-mode store initialized at ${join(this.config.dataDir, 'swm-host')} (role=${role})`,
+    );
+  }
+
+  /**
+   * OT-RFC-38 LU-6 — subscribe to a single CG's SWM topic in host
+   * mode (store opaque ciphertext envelopes instead of decrypting).
+   * No-op when the store isn't initialized, when the CG is system-
+   * reserved, or when the node is already subscribed in member mode.
+   */
+  private async reconcileSwmHostModeSubscription(contextGraphId: string): Promise<void> {
+    if (!this.swmHostModeStore) return;
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) return;
+    if (this.sharedMemoryGossipRegistered.has(contextGraphId)) {
+      // Member-mode subscription already active — apply path covers
+      // local consumption; no need to also opaquely store.
+      return;
+    }
+    if (this.swmHostModeSubscribed.has(contextGraphId)) return;
+
+    // Only host curated CGs. Public CGs already have plaintext SWM
+    // distribution and don't need an opaque ciphertext custodian.
+    let curated = false;
+    try {
+      curated = await this.isPrivateContextGraph(contextGraphId);
+    } catch {
+      return;
+    }
+    if (!curated) return;
+
+    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
+    this.swmHostModeSubscribed.add(contextGraphId);
+    this.gossip.subscribe(swmTopic);
+    this.gossip.onMessage(swmTopic, (_topic, data, _from) => {
+      this.ingestSwmHostModeEnvelope(contextGraphId, data).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          createOperationContext('system'),
+          `Host-mode SWM ingest failed for "${contextGraphId}": ${msg}`,
+        );
+      });
+    });
+
+    // If the CG is already on-chain registered, transition the
+    // store immediately to the larger registered-CG limits.
+    try {
+      const onChainKnown = await this.isContextGraphRegisteredOnChain(contextGraphId);
+      if (onChainKnown) {
+        await this.swmHostModeStore.markRegistered(contextGraphId);
+      }
+    } catch { /* best-effort */ }
+
+    this.log.info(
+      createOperationContext('system'),
+      `SWM host-mode subscription enabled for "${contextGraphId}" (role=core)`,
+    );
+  }
+
+  /**
+   * Periodic reconciler driven by `hostModeReconcilerTimer`. Sweeps
+   * every locally-known CG and ensures host-mode subscription is
+   * in sync. Cheap to call repeatedly because the per-CG
+   * reconciler is idempotent.
+   *
+   * Serialized via `hostModeReconcileInflight` so an overlap with
+   * the cleanup timer (or a manual call from a test) doesn't
+   * double-subscribe.
+   */
+  private async reconcileHostModeSubscriptions(): Promise<void> {
+    if (!this.swmHostModeStore) return;
+    if (this.hostModeReconcileInflight) {
+      await this.hostModeReconcileInflight;
+      return;
+    }
+    const inflight = (async () => {
+      try {
+        const graphManager = new GraphManager(this.store);
+        const knownCgs = await graphManager.listContextGraphs();
+        for (const cgId of knownCgs) {
+          await this.reconcileSwmHostModeSubscription(cgId);
+        }
+      } finally {
+        this.hostModeReconcileInflight = undefined;
+      }
+    })();
+    this.hostModeReconcileInflight = inflight;
+    await inflight;
+  }
+
+  /** Probes the local on-chain meta to decide if a CG is registered. Tolerant of missing chain adapter. */
+  private async isContextGraphRegisteredOnChain(contextGraphId: string): Promise<boolean> {
+    try {
+      if (typeof (this.chain as any).getContextGraphOnChain !== 'function') return false;
+      const onChain = await (this.chain as any).getContextGraphOnChain(contextGraphId);
+      return Boolean(onChain);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Tap registered with `gossip.onMessage` for host-mode topics.
+   * Performs the absolute minimum validation needed to drop
+   * obvious garbage (non-envelope bytes, public/plaintext payloads,
+   * cross-CG spoofs) and appends everything else opaquely to
+   * {@link SwmHostModeStore} for later catchup serving.
+   *
+   * Designed to be CHEAP: no signature crypto, no decrypt attempt.
+   * Members re-verify the envelope signature when they pull the
+   * ciphertext back via host-catchup and feed it through
+   * `SharedMemoryHandler.handle()`.
+   */
+  private async ingestSwmHostModeEnvelope(contextGraphId: string, data: Uint8Array): Promise<void> {
+    if (!this.swmHostModeStore) return;
+    if (data.length === 0) return;
+    // Light structural check: the bytes MUST decode as a gossip
+    // envelope whose payload references this CG and carries an
+    // encrypted SWM marker (either `senderKeyMessage` or
+    // `encryptedPayload`). Plaintext public-CG bytes are dropped
+    // (curated CGs only) — that filters bursts from cross-talk
+    // when a topic is re-used.
+    let envelope: GossipEnvelopeMsg | undefined;
+    try {
+      envelope = decodeGossipEnvelope(data);
+    } catch {
+      return;
+    }
+    if (!envelope || envelope.type !== GOSSIP_TYPE_WORKSPACE_PUBLISH || envelope.contextGraphId !== contextGraphId) {
+      return;
+    }
+    if (envelope.payload.length === 0) return;
+    // Cheap "is this ciphertext" sniff: try to decode as one of the
+    // two encrypted carriers; if neither parses, drop. We do NOT
+    // attempt decryption — the chain key lives on members, not on
+    // the hosting core.
+    let isCiphertext = false;
+    try {
+      const enc = decodeEncryptedWorkspacePayload(envelope.payload);
+      isCiphertext = enc.type === ENCRYPTED_WORKSPACE_ENVELOPE_TYPE;
+    } catch { /* fall through */ }
+    if (!isCiphertext) {
+      try {
+        const skm = decodeSwmSenderKeyMessage(envelope.payload);
+        isCiphertext = skm.type === SWM_SENDER_KEY_MESSAGE_TYPE;
+      } catch { /* fall through */ }
+    }
+    if (!isCiphertext) return;
+
+    const seqno = await this.swmHostModeStore.append(contextGraphId, data);
+    this.log.debug(
+      createOperationContext('share'),
+      `Host-mode stored opaque SWM envelope cg=${contextGraphId} seqno=${seqno} bytes=${data.length}`,
+    );
+  }
+
+  /**
+   * Receiver handler for `/dkg/10.0.1/swm-host-catchup`. Responds
+   * with stored ciphertext envelopes for the requested CG, paged
+   * by `sinceSeqno`. Always returns a structured response; denial
+   * is communicated via the `denied` field rather than throwing
+   * (which would make the messenger substrate classify the call as
+   * a transport failure and retry).
+   */
+  private async handleSwmHostCatchup(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
+    const ctx = createOperationContext('share');
+    if (!this.swmHostModeStore) {
+      return encodeSwmHostCatchupResponse({
+        version: 1,
+        contextGraphId: '',
+        nextSeqno: 0,
+        truncated: false,
+        denied: 'host-mode not enabled on this node',
+        entries: [],
+      });
+    }
+    let req;
+    try {
+      req = decodeSwmHostCatchupRequest(data);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return encodeSwmHostCatchupResponse({
+        version: 1,
+        contextGraphId: '',
+        nextSeqno: 0,
+        truncated: false,
+        denied: `malformed request: ${reason}`,
+        entries: [],
+      });
+    }
+    const maxEntries = req.maxEntries ?? SWM_HOST_CATCHUP_DEFAULT_MAX_ENTRIES;
+    const maxBytes = req.maxBytes ?? SWM_HOST_CATCHUP_DEFAULT_MAX_BYTES;
+    let raw;
+    try {
+      raw = await this.swmHostModeStore.iterate(req.contextGraphId, req.sinceSeqno, maxEntries + 1);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.warn(ctx, `host-catchup iterate failed cg=${req.contextGraphId} from=${fromPeerId}: ${reason}`);
+      return encodeSwmHostCatchupResponse({
+        version: 1,
+        contextGraphId: req.contextGraphId,
+        nextSeqno: req.sinceSeqno,
+        truncated: false,
+        denied: `store error: ${reason}`,
+        entries: [],
+      });
+    }
+    const truncatedByEntries = raw.length > maxEntries;
+    if (truncatedByEntries) raw = raw.slice(0, maxEntries);
+    const entries: SwmHostCatchupResponseEntry[] = [];
+    let runningBytes = 0;
+    let truncatedByBytes = false;
+    for (const entry of raw) {
+      if (runningBytes + entry.envelopeBytes.length > maxBytes && entries.length > 0) {
+        truncatedByBytes = true;
+        break;
+      }
+      entries.push({
+        seqno: entry.seqno,
+        timestampMs: entry.timestampMs,
+        envelopeB64: Buffer.from(entry.envelopeBytes).toString('base64'),
+      });
+      runningBytes += entry.envelopeBytes.length;
+    }
+    const nextSeqno = entries.length > 0 ? entries[entries.length - 1].seqno : req.sinceSeqno;
+    this.log.info(
+      ctx,
+      `host-catchup served cg=${req.contextGraphId} from=${fromPeerId} sinceSeqno=${req.sinceSeqno} entries=${entries.length} bytes=${runningBytes} truncated=${truncatedByEntries || truncatedByBytes}`,
+    );
+    return encodeSwmHostCatchupResponse({
+      version: 1,
+      contextGraphId: req.contextGraphId,
+      nextSeqno,
+      truncated: truncatedByEntries || truncatedByBytes,
+      entries,
+    });
+  }
+
+  /**
+   * Member-side helper: fetches opaque ciphertext envelopes for
+   * `contextGraphId` from a single remote peer (typically a core
+   * that has been observed as a host) and re-feeds each through
+   * the local `SharedMemoryHandler.handle()` so the existing
+   * Sender-Key decrypt-and-apply path runs verbatim. Returns the
+   * counters from the apply loop.
+   *
+   * Iterates pages internally — when the responder marks the
+   * response `truncated`, the helper resends with `sinceSeqno`
+   * updated to `nextSeqno` until either the response comes back
+   * non-truncated or `maxRounds` is reached.
+   */
+  async catchupSwmFromHost(
+    remotePeerId: string,
+    contextGraphId: string,
+    options?: { sinceSeqno?: number; maxRounds?: number; maxEntriesPerRound?: number },
+  ): Promise<{
+    rounds: number;
+    fetched: number;
+    applied: number;
+    skipped: number;
+    nextSeqno: number;
+    denied?: string;
+  }> {
+    const ctx = createOperationContext('share');
+    let sinceSeqno = options?.sinceSeqno ?? 0;
+    const maxRounds = Math.max(1, options?.maxRounds ?? 8);
+    const maxEntries = options?.maxEntriesPerRound ?? SWM_HOST_CATCHUP_DEFAULT_MAX_ENTRIES;
+    let rounds = 0;
+    let fetched = 0;
+    let applied = 0;
+    let skipped = 0;
+    let lastDenied: string | undefined;
+    while (rounds < maxRounds) {
+      rounds += 1;
+      const reqBytes = encodeSwmHostCatchupRequest({
+        version: 1,
+        contextGraphId,
+        sinceSeqno,
+        maxEntries,
+      });
+      let sendResult;
+      try {
+        sendResult = await this.messenger.sendReliable(remotePeerId, PROTOCOL_SWM_HOST_CATCHUP, reqBytes);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `host-catchup call failed to=${remotePeerId} cg=${contextGraphId}: ${reason}`);
+        break;
+      }
+      if (!sendResult.delivered) {
+        // `queued: true` means the substrate is retrying in the
+        // background; we don't get the response on this call. Treat
+        // it as a transport failure for this round so the caller can
+        // try another peer.
+        const reason = 'error' in sendResult ? sendResult.error : 'undelivered';
+        this.log.info(ctx, `host-catchup undelivered to=${remotePeerId} cg=${contextGraphId}: ${reason}`);
+        break;
+      }
+      const resp = decodeSwmHostCatchupResponse(sendResult.response);
+      if (resp.denied) {
+        lastDenied = resp.denied;
+        this.log.info(ctx, `host-catchup denied by=${remotePeerId} cg=${contextGraphId}: ${resp.denied}`);
+        break;
+      }
+      if (resp.entries.length === 0) {
+        break;
+      }
+      const handler = this.getOrCreateSharedMemoryHandler();
+      for (const entry of resp.entries) {
+        fetched += 1;
+        const envelope = Buffer.from(entry.envelopeB64, 'base64');
+        try {
+          const outcome = await handler.handle(
+            new Uint8Array(envelope),
+            remotePeerId,
+            undefined,
+            { trustedReplay: true },
+          );
+          if (outcome.applied) {
+            applied += 1;
+          } else {
+            skipped += 1;
+            const reason = 'reason' in outcome ? outcome.reason : 'unknown';
+            this.log.debug(
+              ctx,
+              `host-catchup envelope skipped cg=${contextGraphId} seqno=${entry.seqno}: ${reason}`,
+            );
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `host-catchup apply failed cg=${contextGraphId} seqno=${entry.seqno}: ${reason}`);
+          skipped += 1;
+        }
+      }
+      sinceSeqno = resp.nextSeqno;
+      if (!resp.truncated) break;
+    }
+    return { rounds, fetched, applied, skipped, nextSeqno: sinceSeqno, ...(lastDenied ? { denied: lastDenied } : {}) };
+  }
+
+  /**
+   * Member-side helper: fans out `catchupSwmFromHost` across all
+   * currently-connected peers. Used as a fallback when standard
+   * catchup (sync from CG members) returns 0 — typical of the
+   * scenario where every CG member is simultaneously offline and
+   * only cores still hold the substrate. Returns the per-peer
+   * outcomes.
+   */
+  async catchupSwmFromConnectedHosts(
+    contextGraphId: string,
+    options?: { sinceSeqno?: number; maxRounds?: number; maxEntriesPerRound?: number; peers?: string[] },
+  ): Promise<Array<{
+    peerId: string;
+    rounds: number;
+    fetched: number;
+    applied: number;
+    skipped: number;
+    nextSeqno: number;
+    denied?: string;
+    error?: string;
+  }>> {
+    const ctx = createOperationContext('share');
+    const explicitPeers = options?.peers;
+    const candidates: string[] = (() => {
+      if (explicitPeers && explicitPeers.length > 0) return [...new Set(explicitPeers)];
+      const connections = this.node.libp2p.getConnections();
+      const seen = new Set<string>();
+      for (const c of connections) {
+        const id = c.remotePeer.toString();
+        if (id !== this.peerId) seen.add(id);
+      }
+      return [...seen];
+    })();
+    const results: Array<{
+      peerId: string;
+      rounds: number;
+      fetched: number;
+      applied: number;
+      skipped: number;
+      nextSeqno: number;
+      denied?: string;
+      error?: string;
+    }> = [];
+    for (const peerId of candidates) {
+      try {
+        const r = await this.catchupSwmFromHost(peerId, contextGraphId, {
+          sinceSeqno: options?.sinceSeqno,
+          maxRounds: options?.maxRounds,
+          maxEntriesPerRound: options?.maxEntriesPerRound,
+        });
+        results.push({ peerId, ...r });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        this.log.warn(ctx, `host-catchup peer=${peerId} cg=${contextGraphId} failed: ${reason}`);
+        results.push({ peerId, rounds: 0, fetched: 0, applied: 0, skipped: 0, nextSeqno: options?.sinceSeqno ?? 0, error: reason });
+      }
+    }
+    return results;
+  }
+
+  /** Diagnostics surface for the host-mode store (or `null` when not initialized). */
+  async getSwmHostModeStats(): Promise<{
+    enabled: boolean;
+    cgCount: number;
+    totalBytes: number;
+    totalEntries: number;
+    subscribedCgIds: string[];
+  } | null> {
+    if (!this.swmHostModeStore) {
+      return { enabled: false, cgCount: 0, totalBytes: 0, totalEntries: 0, subscribedCgIds: [] };
+    }
+    const stats = await this.swmHostModeStore.stats();
+    return { enabled: true, ...stats, subscribedCgIds: [...this.swmHostModeSubscribed] };
+  }
+
+  /**
+   * OT-RFC-38 LU-6 — operator-driven host-mode subscribe.
+   *
+   * Forcibly enables host-mode subscription for `contextGraphId`
+   * even when the local store has no CG metadata yet. Designed for
+   * Phase A where sharding-table auto-discovery is approximated by
+   * an explicit operator designation per core. Idempotent.
+   *
+   * Returns `{ subscribed, alreadySubscribed, hostingEnabled }`:
+   *  - `subscribed`: true if the call actually wired the topic listener
+   *    on this invocation (false on re-entry when already subscribed).
+   *  - `alreadySubscribed`: mirror of `subscribed === false`.
+   *  - `hostingEnabled`: whether the host-mode store is initialized
+   *    on this node (false on edges or when explicitly disabled).
+   */
+  async enableSwmHostModeFor(contextGraphId: string): Promise<{
+    subscribed: boolean;
+    alreadySubscribed: boolean;
+    hostingEnabled: boolean;
+  }> {
+    if (!this.swmHostModeStore) {
+      return { subscribed: false, alreadySubscribed: false, hostingEnabled: false };
+    }
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
+      return { subscribed: false, alreadySubscribed: false, hostingEnabled: true };
+    }
+    if (this.swmHostModeSubscribed.has(contextGraphId)) {
+      return { subscribed: false, alreadySubscribed: true, hostingEnabled: true };
+    }
+    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
+    this.swmHostModeSubscribed.add(contextGraphId);
+    this.gossip.subscribe(swmTopic);
+    this.gossip.onMessage(swmTopic, (_topic, data, _from) => {
+      this.ingestSwmHostModeEnvelope(contextGraphId, data).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          createOperationContext('system'),
+          `Host-mode SWM ingest failed for "${contextGraphId}": ${msg}`,
+        );
+      });
+    });
+    this.log.info(
+      createOperationContext('system'),
+      `SWM host-mode subscription explicitly enabled for "${contextGraphId}" via API (role=${this.config.nodeRole ?? 'edge'})`,
+    );
+    return { subscribed: true, alreadySubscribed: false, hostingEnabled: true };
   }
 
   /**
@@ -9642,6 +10198,15 @@ export class DKGAgent {
     // (`packages/publisher/src/dkg-publisher.ts:569-594`) throws
     // `Context graph "<id>" is not registered on-chain` on any VM
     // publish attempt.
+
+    // OT-RFC-38 LU-6: every locally-created CG (curated OR public,
+    // member OR not) should trigger the host-mode subscription
+    // reconciler so a core that pre-creates a CG it isn't a member
+    // of starts hosting its substrate immediately instead of waiting
+    // up to 30s for the next periodic tick.
+    if (isCurated || opts.private) {
+      this.queueSharedMemoryGossipSubscription(opts.id);
+    }
 
     if (!opts.private) {
       this.subscribeToContextGraph(opts.id);
@@ -14856,6 +15421,14 @@ export class DKGAgent {
     if (this.swmCleanupTimer) {
       clearInterval(this.swmCleanupTimer);
       this.swmCleanupTimer = null;
+    }
+    if (this.hostModeReconcilerTimer) {
+      clearInterval(this.hostModeReconcilerTimer);
+      this.hostModeReconcilerTimer = null;
+    }
+    if (this.hostModePruneTimer) {
+      clearInterval(this.hostModePruneTimer);
+      this.hostModePruneTimer = null;
     }
     if (this.syncReconcilerTimer) {
       clearInterval(this.syncReconcilerTimer);

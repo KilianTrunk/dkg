@@ -38,6 +38,7 @@ import type { QueryAccessConfig } from '@origintrail-official/dkg-query';
 import type { SkillHandler } from './messaging.js';
 import type { CclFactResolutionMode } from './ccl-fact-resolution.js';
 import type { JsonLdContent } from './dkg-agent-utils.js';
+import type { SwmHostModeStoreLimits } from './swm/host-mode-store.js';
 import type { SyncPhase } from './sync/auth/request-build.js';
 
 // ── File-local structural types ─────────────────────────────────────
@@ -600,6 +601,25 @@ export interface DKGAgentConfig {
   syncContextGraphs?: string[];
   /** TTL for shared memory data in milliseconds. Expired operations are periodically cleaned up. Default: 48 hours. Set to 0 to disable. */
   sharedMemoryTtlMs?: number;
+  /**
+   * OT-RFC-38 LU-6 — settings for the core-side host-mode SWM store.
+   * Only honoured when `nodeRole === 'core'`. Omit on edges (the
+   * store is never initialized there).
+   *
+   * Fields:
+   *  - `enabled`: when `false`, cores skip host-mode entirely and behave like edges. Default `true` for cores.
+   *  - `unregistered`: TTL/byte-cap for CGs the core knows about but that aren't on-chain registered yet.
+   *  - `registered`: TTL/byte-cap for on-chain registered CGs (typically larger).
+   *  - `pruneIntervalMs`: how often the TTL/cap sweep runs.
+   *  - `reconcileIntervalMs`: how often the host-mode subscription reconciler ensures cores are subscribed to all known curated CGs.
+   */
+  swmHostMode?: {
+    enabled?: boolean;
+    unregistered?: SwmHostModeStoreLimits;
+    registered?: SwmHostModeStoreLimits;
+    pruneIntervalMs?: number;
+    reconcileIntervalMs?: number;
+  };
   /** Durable local store for subscribed context-graph runtime state. */
   contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;
   /** Durable local cache for nodes/agents known to be members of a context graph. */

@@ -2470,7 +2470,16 @@ decisions: []
     expect(chain.createOnChainContextGraphCalls[2]?.accessPolicy).toBe(1);
     expect(chain.createOnChainContextGraphCalls[2]?.publishPolicy).toBe(0);
     expect(chain.createOnChainContextGraphCalls[2]?.publishAuthority).toBe(ethers.getAddress(chain.signerAddress));
-    expect(chain.createOnChainContextGraphCalls[2]?.participantAgents).toEqual([]);
+    // OT-RFC-38 / LU-6 Phase B — `getContextGraphParticipantAgentAddresses`
+    // now unions DKG_PARTICIPANT_AGENT with DKG_ALLOWED_AGENT so the
+    // on-chain participant list is a superset of the local allowlist.
+    // This CG was registered via `inviteAgentToContextGraph(... allowedAgent)`
+    // which writes a DKG_ALLOWED_AGENT triple; under Phase B the
+    // chain registration must forward that wallet so cores can
+    // authority-check its envelopes after auto-hosting. Pre-Phase-B
+    // expectation was `[]` (only explicit participantAgents flowed);
+    // updated to assert the new superset semantics.
+    expect(chain.createOnChainContextGraphCalls[2]?.participantAgents).toEqual([allowedAgent]);
     expect(chain.createOnChainContextGraphCalls[3]?.accessPolicy).toBe(0);
     expect(chain.createOnChainContextGraphCalls[3]?.publishPolicy).toBe(0);
     expect(chain.createOnChainContextGraphCalls[3]?.publishAuthority).toBe(ethers.getAddress(chain.signerAddress));

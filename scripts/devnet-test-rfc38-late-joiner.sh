@@ -329,6 +329,15 @@ done
 
 sleep 3
 
+# Sender-key handshake from curator → both other members fans out
+# in parallel and tolerates no "All multiaddr dials failed" loss.
+# Probe libp2p connectivity to both BEFORE the write so we don't
+# burn the ~20s sender-key-setup deadline waiting for a re-dial
+# (devnet-test-rfc38-all triggers this transition with stale dials
+# from SCENARIO A still in some caches).
+wait_for_peer_link "$CURATOR_NODE" "$MEMBER_PEER"
+wait_for_peer_link "$CURATOR_NODE" "$(api_call "$THIRD_MEMBER_NODE" GET /api/agent/identity | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).peerId))')"
+
 log "Curator writes 7 SWM triples to CG_B..."
 B_PAYLOAD=$(CG_ID="$CG_B" N=7 LABEL="B" node -e '
   const cgId = process.env.CG_ID;

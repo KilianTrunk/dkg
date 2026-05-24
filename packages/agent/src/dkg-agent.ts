@@ -8602,7 +8602,17 @@ export class DKGAgent {
       // local consumption; no need to also opaquely store.
       return;
     }
-    if (this.swmHostModeSubscribed.has(contextGraphId)) return;
+    if (this.swmHostModeSubscribed.has(contextGraphId)) {
+      // Codex PR #610 R2: idempotent re-entry on the periodic
+      // reconcile path must still re-probe on-chain registration
+      // state. Without this, a core that subscribed while the CG
+      // was unregistered stays on the 6h/1MiB pre-registration
+      // limits forever — even after the CG is registered — and
+      // ciphertext gets pruned much earlier than intended.
+      // Mirrors the same safeguard in `enableSwmHostModeFor`.
+      await this.maybeMarkRegisteredForHostMode(contextGraphId);
+      return;
+    }
 
     // Only host curated CGs. Public CGs already have plaintext SWM
     // distribution and don't need an opaque ciphertext custodian.
@@ -8834,7 +8844,20 @@ export class DKGAgent {
   ): Promise<{
     rounds: number;
     fetched: number;
+    /**
+     * Number of envelopes whose apply path returned `applied: true`.
+     * NOT the same as triples — one envelope can carry many quads.
+     * For triples-applied accounting, callers MUST sum
+     * {@link appliedTriples}. Codex PR #610 R2 caught the previous
+     * conflation where `memory.ts` aggregated this count into a
+     * field named `totalInsertedTriples`.
+     */
     applied: number;
+    /**
+     * Total triples (N-Quads) inserted by successful replays.
+     * Summed from `SharedMemoryApplyOutcome.insertedTriples`.
+     */
+    appliedTriples: number;
     skipped: number;
     nextSeqno: number;
     denied?: string;
@@ -8846,6 +8869,7 @@ export class DKGAgent {
     let rounds = 0;
     let fetched = 0;
     let applied = 0;
+    let appliedTriples = 0;
     let skipped = 0;
     let lastDenied: string | undefined;
     while (rounds < maxRounds) {
@@ -8895,6 +8919,10 @@ export class DKGAgent {
           );
           if (outcome.applied) {
             applied += 1;
+            // Triples per envelope is variable; track it separately
+            // from the envelope count so callers reporting a
+            // triples total don't undercount. Codex PR #610 R2.
+            appliedTriples += outcome.insertedTriples ?? 0;
           } else {
             skipped += 1;
             const reason = 'reason' in outcome ? outcome.reason : 'unknown';
@@ -8912,7 +8940,7 @@ export class DKGAgent {
       sinceSeqno = resp.nextSeqno;
       if (!resp.truncated) break;
     }
-    return { rounds, fetched, applied, skipped, nextSeqno: sinceSeqno, ...(lastDenied ? { denied: lastDenied } : {}) };
+    return { rounds, fetched, applied, appliedTriples, skipped, nextSeqno: sinceSeqno, ...(lastDenied ? { denied: lastDenied } : {}) };
   }
 
   /**
@@ -8931,6 +8959,7 @@ export class DKGAgent {
     rounds: number;
     fetched: number;
     applied: number;
+    appliedTriples: number;
     skipped: number;
     nextSeqno: number;
     denied?: string;
@@ -8953,6 +8982,7 @@ export class DKGAgent {
       rounds: number;
       fetched: number;
       applied: number;
+      appliedTriples: number;
       skipped: number;
       nextSeqno: number;
       denied?: string;
@@ -8969,7 +8999,7 @@ export class DKGAgent {
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         this.log.warn(ctx, `host-catchup peer=${peerId} cg=${contextGraphId} failed: ${reason}`);
-        results.push({ peerId, rounds: 0, fetched: 0, applied: 0, skipped: 0, nextSeqno: options?.sinceSeqno ?? 0, error: reason });
+        results.push({ peerId, rounds: 0, fetched: 0, applied: 0, appliedTriples: 0, skipped: 0, nextSeqno: options?.sinceSeqno ?? 0, error: reason });
       }
     }
     return results;

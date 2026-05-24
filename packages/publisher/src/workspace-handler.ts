@@ -111,6 +111,22 @@ export type SharedMemoryApplyOutcome =
        * Caller addresses the PROTOCOL_SWM_SHARE_ACK to this peer.
        */
       publisherPeerId?: string;
+      /**
+       * Number of N-Quads that were inserted into the SWM graph
+       * by this apply (i.e., `quads.length` after decode + decrypt).
+       *
+       * Distinct from "envelope was applied" (the boolean
+       * `applied` flag): one envelope can carry many quads, so
+       * callers aggregating per-triple counts (e.g. the LU-6
+       * host-catchup endpoint that reports `totalInsertedTriples`)
+       * MUST consume this field rather than counting `applied`
+       * booleans. Codex PR #610 R2 caught the undercount when
+       * `hostCatchup.appliedTotal` was being summed from envelope
+       * counts. Optional only because the false variant cannot
+       * carry it; the true variant always sets it from the same
+       * `quads.length` used in the success-path log line.
+       */
+      insertedTriples?: number;
     }
   | { applied: false; reason: string; retryable: boolean };
 
@@ -1020,6 +1036,7 @@ export class SharedMemoryHandler {
           cgId: contextGraphId,
           shareOperationId,
           publisherPeerId,
+          insertedTriples: quads.length,
         };
       }
       // `applied === false` from the withWriteLocks closure. PR-C

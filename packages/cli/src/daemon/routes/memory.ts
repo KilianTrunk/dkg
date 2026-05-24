@@ -750,6 +750,9 @@ WHERE {
     type HostCatchupLeg = {
       contextGraphId: string;
       peers: Awaited<ReturnType<typeof agent.catchupSwmFromConnectedHosts>>;
+      /** Envelope-level counter from the replay path. NOT a triples count. */
+      appliedEnvelopes: number;
+      /** Triples (N-Quads) inserted by successful replays. Maps to the public `appliedTotal`. */
       appliedTotal: number;
       error?: string;
     };
@@ -762,12 +765,22 @@ WHERE {
             peers: peerIdParam ? [peerIdParam] : undefined,
             maxRounds: 8,
           });
-          const appliedTotal = peerResults.reduce((sum: number, r: any) => sum + (r.applied ?? 0), 0);
-          hostCatchup.push({ contextGraphId: cg.contextGraphId, peers: peerResults, appliedTotal });
+          // Codex PR #610 R2: `r.applied` is the count of replayed
+          // envelopes (booleans), NOT inserted triples. One envelope
+          // can carry many quads, so summing `r.applied` here would
+          // undercount whenever a publisher batched > 1 triple per
+          // share. Use `r.appliedTriples` (threaded through
+          // `catchupSwmFromHost` / `SharedMemoryApplyOutcome`) for
+          // the triples total surfaced as `appliedTotal` and rolled
+          // into the top-level `totalInsertedTriples`.
+          const appliedTotal = peerResults.reduce((sum: number, r: any) => sum + (r.appliedTriples ?? 0), 0);
+          const appliedEnvelopes = peerResults.reduce((sum: number, r: any) => sum + (r.applied ?? 0), 0);
+          hostCatchup.push({ contextGraphId: cg.contextGraphId, peers: peerResults, appliedEnvelopes, appliedTotal });
         } catch (err: any) {
           hostCatchup.push({
             contextGraphId: cg.contextGraphId,
             peers: [],
+            appliedEnvelopes: 0,
             appliedTotal: 0,
             error: err?.message ?? String(err),
           });
@@ -775,6 +788,7 @@ WHERE {
       }
     }
     const hostCatchupAppliedTotal = hostCatchup.reduce((sum, h) => sum + h.appliedTotal, 0);
+    const hostCatchupEnvelopesTotal = hostCatchup.reduce((sum, h) => sum + h.appliedEnvelopes, 0);
 
     // Codex PR #610 R1 comment 2: `totalInsertedTriples` must cover
     // BOTH the standard sync leg and the LU-6 host-catchup leg so
@@ -830,9 +844,13 @@ WHERE {
       hostCatchup: hostCatchupOpted ? {
         ranFallback: hostCatchup.length > 0,
         triggeredForContextGraphIds: hostCatchup.map((h) => h.contextGraphId),
+        // `appliedTotal` is triples (the user-facing unit); the
+        // separate `appliedEnvelopes` is exposed for operators who
+        // want to know how many discrete shares were replayed.
         appliedTotal: hostCatchupAppliedTotal,
+        appliedEnvelopes: hostCatchupEnvelopesTotal,
         perContextGraph: hostCatchup,
-      } : { ranFallback: false, triggeredForContextGraphIds: [], appliedTotal: 0, perContextGraph: [] },
+      } : { ranFallback: false, triggeredForContextGraphIds: [], appliedTotal: 0, appliedEnvelopes: 0, perContextGraph: [] },
     });
   }
 
@@ -868,12 +886,18 @@ WHERE {
         sinceSeqno,
         maxRounds,
       });
-      const appliedTotal = peerResults.reduce((sum: number, r: any) => sum + (r.applied ?? 0), 0);
+      // Codex PR #610 R2: report triples (`appliedTriples`) as the
+      // user-facing total; keep envelope count alongside as
+      // `appliedEnvelopes` for diagnostics. Same fix as the
+      // `/catchup` fallback leg above.
+      const appliedTotal = peerResults.reduce((sum: number, r: any) => sum + (r.appliedTriples ?? 0), 0);
+      const appliedEnvelopes = peerResults.reduce((sum: number, r: any) => sum + (r.applied ?? 0), 0);
       const fetchedTotal = peerResults.reduce((sum: number, r: any) => sum + (r.fetched ?? 0), 0);
       return jsonResponse(res, 200, {
         contextGraphId: cgId,
         peers: peerResults,
         appliedTotal,
+        appliedEnvelopes,
         fetchedTotal,
       });
     } catch (err: any) {

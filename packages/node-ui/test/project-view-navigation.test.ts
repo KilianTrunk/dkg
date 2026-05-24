@@ -74,12 +74,18 @@ const agentsData = {
   openAgent: vi.fn(),
 };
 
+const tabsStoreMock = vi.hoisted(() => ({
+  openTab: vi.fn(),
+}));
+
+const apiWrapperMock = vi.hoisted(() => ({
+  fetchContextGraphs: vi.fn(),
+  fetchCurrentAgent: vi.fn(),
+  listParticipants: vi.fn(),
+}));
+
 vi.mock('../src/ui/api-wrapper.js', () => ({
-  api: {
-    fetchContextGraphs: vi.fn(async () => ({
-      contextGraphs: [{ id: 'cg-test', name: 'Context Graph Test' }],
-    })),
-  },
+  api: apiWrapperMock,
 }));
 
 vi.mock('../src/ui/api.js', () => ({
@@ -101,7 +107,10 @@ vi.mock('../src/ui/hooks/useAgents.js', () => ({
 }));
 
 vi.mock('../src/ui/stores/tabs.js', () => ({
-  useTabsStore: () => vi.fn(),
+  useTabsStore: (selector?: (state: { openTab: typeof tabsStoreMock.openTab }) => unknown) => {
+    const state = { openTab: tabsStoreMock.openTab };
+    return selector ? selector(state) : state;
+  },
 }));
 
 vi.mock('../src/ui/components/Modals/ImportFilesModal.js', () => ({
@@ -133,7 +142,8 @@ vi.mock('../src/ui/views/project/components.js', () => ({
   LayerSwitcher: ({ active, onSwitch }: { active: string; onSwitch: (layer: string) => void }) =>
     React.createElement('div', { 'data-testid': 'active-layer', 'data-layer': active },
       React.createElement('button', { 'data-testid': 'switch-wm', onClick: () => onSwitch('wm') }, 'WM'),
-      React.createElement('button', { 'data-testid': 'switch-swm', onClick: () => onSwitch('swm') }, 'SWM')),
+      React.createElement('button', { 'data-testid': 'switch-swm', onClick: () => onSwitch('swm') }, 'SWM'),
+      React.createElement('button', { 'data-testid': 'switch-subgraphs', onClick: () => onSwitch('graph-overview') }, 'Subgraphs')),
   KADetailView: ({ entity, onNavigate, onClose }: { entity: any; onNavigate: (uri: string) => void; onClose: () => void }) =>
     React.createElement('section', { 'data-testid': 'entity-detail', 'data-entity': entity.uri },
       React.createElement('div', {}, entity.label),
@@ -149,7 +159,18 @@ vi.mock('../src/ui/views/project/components.js', () => ({
       React.createElement('button', { 'data-testid': 'subgraph-tab-graph', onClick: () => onTabChange('graph') }, 'Graph'),
       React.createElement('div', { 'data-testid': 'subgraph-scroll', 'data-cg-scroll-key': `subgraph:${slug}:${activeTab}` },
         React.createElement('button', { 'data-testid': 'open-subgraph-entity', onClick: () => onSelectEntity('urn:entity:demo') }, 'Open demo entity'))),
-  ProjectOverviewCard: () => React.createElement('div', {}, 'Overview'),
+  ProjectOverviewCard: ({ onOpenPrimer, participants, participantsStatus }: {
+    onOpenPrimer: () => void;
+    participants: string[];
+    participantsStatus: string;
+  }) =>
+    React.createElement('div', {
+      'data-testid': 'overview-card',
+      'data-participants': participants.join(','),
+      'data-participants-status': participantsStatus,
+    },
+      'Overview',
+      React.createElement('button', { 'data-testid': 'open-primer', onClick: onOpenPrimer }, 'What is a Context Graph?')),
   PendingJoinRequestsBar: () => null,
   MemoryStrip: ({ expandedLayer, onExpandedLayerChange, expandTabs, onExpandTabChange, onSelectEntity }: {
     expandedLayer: 'wm' | 'swm' | 'vm' | null;
@@ -182,7 +203,11 @@ vi.mock('../src/ui/views/project/components.js', () => ({
             onClick: () => onSelectEntity('urn:entity:working'),
           }, 'Open strip entity'))));
   },
-  SubGraphOverviewGrid: () => null,
+  SubGraphOverviewGrid: ({ onSelectSubGraph }: { onSelectSubGraph: (slug: string) => void }) =>
+    React.createElement('button', {
+      'data-testid': 'select-subgraph-demo',
+      onClick: () => onSelectSubGraph('demo'),
+    }, 'Open demo subgraph'),
   ContextGraphQueryView: () => null,
   LayerDetailView: ({ layer, activeTab, onTabChange, onSelectEntity }: {
     layer: string;
@@ -230,6 +255,14 @@ describe('ProjectView entity detail navigation', () => {
 
   beforeEach(async () => {
     resetMemory();
+    apiWrapperMock.fetchContextGraphs.mockResolvedValue({
+      contextGraphs: [{ id: 'cg-test', name: 'Context Graph Test' }],
+    });
+    apiWrapperMock.fetchCurrentAgent.mockResolvedValue({
+      agentDid: 'did:dkg:agent:0xabc',
+      peerId: 'peer-1',
+    });
+    apiWrapperMock.listParticipants.mockResolvedValue({ allowedAgents: [] });
     document.body.innerHTML = '<div id="root"></div>';
     originalRaf = window.requestAnimationFrame;
     Object.defineProperty(window, 'requestAnimationFrame', {
@@ -278,33 +311,9 @@ describe('ProjectView entity detail navigation', () => {
     expect(query('layer-scroll').scrollTop).toBe(86);
   });
 
-  it('restores overview strip expansion, subtab, and scroll when entity detail closes', async () => {
-    await click('expand-strip-swm');
-    await click('strip-tab-graph');
-
-    const scroller = query('strip-scroll');
-    scroller.scrollTop = 64;
-
-    await click('open-strip-entity');
-    expect(query('entity-detail').dataset.entity).toBe('urn:entity:working');
-
-    await click('detail-back');
-    await flush();
-
-    expect(query('active-layer').dataset.layer).toBe('overview');
-    expect(query('memory-strip').dataset.expanded).toBe('swm');
-    expect(query('memory-strip').dataset.tab).toBe('graph');
-    expect(query('strip-scroll').scrollTop).toBe(64);
-  });
-
-  it('restores page scroll when overview activity opens while the strip is expanded', async () => {
-    await click('expand-strip-swm');
-    await click('strip-tab-graph');
-
+  it('restores page scroll when overview activity opens an entity detail', async () => {
     const pageScroller = scrollRoot('page');
-    const stripScroller = query('strip-scroll');
     pageScroller.scrollTop = 140;
-    stripScroller.scrollTop = 32;
 
     await click('open-activity-entity');
     expect(query('entity-detail').dataset.entity).toBe('urn:entity:working');
@@ -315,12 +324,62 @@ describe('ProjectView entity detail navigation', () => {
     await flush();
 
     expect(query('active-layer').dataset.layer).toBe('overview');
-    expect(query('memory-strip').dataset.expanded).toBe('swm');
-    expect(query('memory-strip').dataset.tab).toBe('graph');
     expect(scrollRoot('page').scrollTop).toBe(140);
   });
 
+  it('opens the primer as a tab without mutating browser history', async () => {
+    const pushStateSpy = vi.spyOn(window.history, 'pushState');
+
+    await click('open-primer');
+
+    expect(tabsStoreMock.openTab).toHaveBeenCalledWith({
+      id: 'context-graph-primer',
+      label: 'What is a Context Graph?',
+      closable: true,
+    });
+    expect(pushStateSpy).not.toHaveBeenCalled();
+
+    pushStateSpy.mockRestore();
+  });
+
+  it('does not pass participants loaded for another context graph into Overview', async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    document.body.innerHTML = '<div id="root"></div>';
+    const container = document.getElementById('root');
+    if (!container) throw new Error('Missing root');
+    root = createRoot(container);
+
+    apiWrapperMock.fetchContextGraphs.mockResolvedValue({
+      contextGraphs: [
+        { id: 'cg-test', name: 'Context Graph Test' },
+        { id: 'cg-next', name: 'Next Context Graph' },
+      ],
+    });
+    apiWrapperMock.listParticipants.mockReset();
+    apiWrapperMock.listParticipants
+      .mockResolvedValueOnce({ allowedAgents: ['0xabc'] })
+      .mockImplementation(() => new Promise(() => {}));
+
+    await act(async () => {
+      root.render(React.createElement(ProjectView, { contextGraphId: 'cg-test' }));
+    });
+    await flush();
+    expect(query('overview-card').dataset.participants).toBe('0xabc');
+    expect(query('overview-card').dataset.participantsStatus).toBe('ok');
+
+    await act(async () => {
+      root.render(React.createElement(ProjectView, { contextGraphId: 'cg-next' }));
+    });
+    await flush();
+
+    expect(query('overview-card').dataset.participants).toBe('');
+    expect(query('overview-card').dataset.participantsStatus).toBe('loading');
+  });
+
   it('keeps the originating subgraph stable while following cross-subgraph entity links', async () => {
+    await click('switch-subgraphs');
     await click('select-subgraph-demo');
     await click('subgraph-tab-graph');
     expect(query('active-subgraph').textContent).toBe('demo');

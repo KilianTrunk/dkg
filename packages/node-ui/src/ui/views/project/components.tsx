@@ -1,15 +1,15 @@
-import React, { useMemo, useState, useCallback, useEffect, lazy, Suspense } from 'react';
+import React, { useMemo, useState, useCallback, useEffect, useRef, lazy, Suspense } from 'react';
 import type { ReactNode } from 'react';
 import { useFetch } from '../../hooks.js';
 import { api } from '../../api-wrapper.js';
 import { encodeDocTabId, resolveDocRef } from '../../lib/doc-tab-id.js';
 import {
   listJoinRequests, approveJoinRequest, rejectJoinRequest,
-  listParticipants, listAssertions, promoteAssertion,
+  listAssertions, promoteAssertion,
   publishSharedMemory, executeQuery,
   writeProfileQueryCatalog,
   fetchSubGraphs,
-  type PendingJoinRequest, type PublishResult, type SubGraphInfo,
+  type AgentIdentity, type PendingJoinRequest, type PublishResult, type SubGraphInfo,
 } from '../../api.js';
 import { ImportFilesModal } from '../../components/Modals/ImportFilesModal.js';
 import { ShareProjectModal } from '../../components/Modals/ShareProjectModal.js';
@@ -31,6 +31,7 @@ import { VerifiedIdentityBanner } from '../../components/VerifiedIdentityBanner.
 import { SubGraphBar } from '../../components/SubGraphBar.js';
 import { GenUIEntityPanel } from '../../genui/index.js';
 import { memoryGraphLabels } from '../../lib/memoryLabels.js';
+import { canonicalAgentDid, normalizeAccessPolicy } from '../../lib/contextGraphSidebar.js';
 import { useTabsStore } from '../../stores/tabs.js';
 import {
   useVerifiedMemoryAnchors,
@@ -71,58 +72,133 @@ export function LayerSwitcher({ active, counts, onSwitch, onShare, onImport, onR
   onImport: () => void;
   onRefresh: () => void;
 }) {
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLDivElement | null>(null);
+  const switchTo = (layer: LayerView) => {
+    setMoreOpen(false);
+    onSwitch(layer);
+  };
+
+  useEffect(() => {
+    if (!moreOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && moreRef.current?.contains(target)) return;
+      setMoreOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
+  }, [moreOpen]);
+
   return (
     <div className="v10-layer-switcher">
       <button
         className={`v10-layer-switch-btn ${active === 'overview' ? 'active' : ''}`}
         data-layer="overview"
-        onClick={() => onSwitch('overview')}
+        aria-label="Overview"
+        title="Overview"
+        onClick={() => switchTo('overview')}
       >
-        <span className="v10-layer-switch-icon">◎</span> Overview
+        <span className="v10-layer-switch-icon">◎</span>
+        <span className="v10-layer-switch-label">Overview</span>
       </button>
-      <button
-        className={`v10-layer-switch-btn ${active === 'graph-overview' ? 'active' : ''}`}
-        data-layer="graph-overview"
-        onClick={() => onSwitch('graph-overview')}
-      >
-        <span className="v10-layer-switch-icon">⌬</span> Graph Overview
-      </button>
-      <button
-        className={`v10-layer-switch-btn ${active === 'query' ? 'active' : ''}`}
-        data-layer="query"
-        onClick={() => onSwitch('query')}
-      >
-        <span className="v10-layer-switch-icon">⟐</span> Query
-      </button>
+      <span className="v10-layer-switch-separator" aria-hidden="true" />
       <button
         className={`v10-layer-switch-btn ${active === 'wm' ? 'active' : ''}`}
         data-layer="wm"
-        onClick={() => onSwitch('wm')}
+        aria-label="Working Memory"
+        title="Working Memory"
+        onClick={() => switchTo('wm')}
       >
-        <span className="v10-layer-switch-icon" style={{ color: '#64748b' }}>◇</span> Working Memory
+        <span className="v10-layer-switch-icon" style={{ color: '#64748b' }}>◇</span>
+        <span className="v10-layer-switch-label v10-layer-switch-label-full">Working Memory</span>
+        <span className="v10-layer-switch-label v10-layer-switch-label-compact">WM</span>
         {counts.wm > 0 && <span className="v10-layer-switch-count">{counts.wm}</span>}
       </button>
       <button
         className={`v10-layer-switch-btn ${active === 'swm' ? 'active' : ''}`}
         data-layer="swm"
-        onClick={() => onSwitch('swm')}
+        aria-label="Shared Working Memory"
+        title="Shared Working Memory"
+        onClick={() => switchTo('swm')}
       >
-        <span className="v10-layer-switch-icon" style={{ color: '#f59e0b' }}>◈</span> Shared Memory
+        <span className="v10-layer-switch-icon" style={{ color: '#f59e0b' }}>◈</span>
+        <span className="v10-layer-switch-label v10-layer-switch-label-full">Shared Working Memory</span>
+        <span className="v10-layer-switch-label v10-layer-switch-label-compact">SWM</span>
         {counts.swm > 0 && <span className="v10-layer-switch-count">{counts.swm}</span>}
       </button>
       <button
         className={`v10-layer-switch-btn ${active === 'vm' ? 'active' : ''}`}
         data-layer="vm"
-        onClick={() => onSwitch('vm')}
+        aria-label="Verifiable Memory"
+        title="Verifiable Memory"
+        onClick={() => switchTo('vm')}
       >
-        <span className="v10-layer-switch-icon" style={{ color: '#22c55e' }}>◉</span> Verified Memory
+        <span className="v10-layer-switch-icon" style={{ color: '#22c55e' }}>◉</span>
+        <span className="v10-layer-switch-label v10-layer-switch-label-full">Verifiable Memory</span>
+        <span className="v10-layer-switch-label v10-layer-switch-label-compact">VM</span>
         {counts.vm > 0 && <span className="v10-layer-switch-count">{counts.vm}</span>}
       </button>
+      <span className="v10-layer-switch-separator" aria-hidden="true" />
+      <button
+        className={`v10-layer-switch-btn ${active === 'graph-overview' ? 'active' : ''}`}
+        data-layer="graph-overview"
+        aria-label="Subgraphs"
+        title="Subgraphs"
+        onClick={() => switchTo('graph-overview')}
+      >
+        <span className="v10-layer-switch-icon">⌬</span>
+        <span className="v10-layer-switch-label">Subgraphs</span>
+      </button>
+      <div
+        ref={moreRef}
+        className="v10-layer-more"
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+            setMoreOpen(false);
+          }
+        }}
+      >
+        <button
+          type="button"
+          className={`v10-layer-switch-btn v10-layer-more-btn ${active === 'query' ? 'active' : ''}`}
+          data-layer="query"
+          aria-haspopup="menu"
+          aria-expanded={moreOpen}
+          aria-label="More Context Graph views"
+          title="More Context Graph views"
+          onClick={() => setMoreOpen(open => !open)}
+        >
+          <span className="v10-layer-switch-icon">⋯</span>
+          <span className="v10-layer-switch-label">More</span>
+        </button>
+        {moreOpen && (
+          <div className="v10-layer-more-menu" role="menu">
+            <button
+              type="button"
+              role="menuitem"
+              className={`v10-layer-more-item ${active === 'query' ? 'active' : ''}`}
+              onClick={() => switchTo('query')}
+            >
+              <span className="v10-layer-switch-icon">⟐</span>
+              Query Catalogue
+            </button>
+          </div>
+        )}
+      </div>
       <div className="v10-layer-switcher-spacer" />
       <div className="v10-layer-switcher-actions">
-        <button className="v10-layer-action-btn" onClick={onShare}>⤴ Share</button>
-        <button className="v10-layer-action-btn" onClick={onImport}>↑ Import</button>
-        <button className="v10-layer-action-btn" onClick={onRefresh}>↻</button>
+        <button className="v10-layer-action-btn" onClick={onShare} aria-label="Share Context Graph">
+          <span className="v10-layer-action-icon">⤴</span>
+          <span className="v10-layer-action-label">Share</span>
+        </button>
+        <button className="v10-layer-action-btn" onClick={onImport} aria-label="Import into Context Graph">
+          <span className="v10-layer-action-icon">↑</span>
+          <span className="v10-layer-action-label">Import</span>
+        </button>
+        <button className="v10-layer-action-btn" onClick={onRefresh} aria-label="Refresh Context Graph data">
+          <span className="v10-layer-action-icon">↻</span>
+        </button>
       </div>
     </div>
   );
@@ -198,39 +274,293 @@ export function ProjectHeaderStrip({
 
 // ─── Project Overview Card ───────────────────────────────────
 
-export function ProjectOverviewCard({ cg, memory, participants }: {
+type OverviewRoleState = {
+  label: string;
+  title: string;
+  tone: 'curator' | 'participant' | 'viewer' | 'unknown';
+};
+type OverviewAgentStatus = 'loading' | 'ok' | 'error';
+type OverviewParticipantsStatus = 'loading' | 'ok' | 'error';
+type OverviewAgentIdentity = Pick<AgentIdentity, 'agentDid'> & Partial<Pick<AgentIdentity, 'agentAddress'>>;
+
+function overviewRoleState(
+  cg: any,
+  currentAgent: OverviewAgentIdentity | null,
+  currentAgentStatus: OverviewAgentStatus,
+  participants: string[],
+  participantsStatus: OverviewParticipantsStatus,
+): OverviewRoleState {
+  const curator = typeof cg?.curator === 'string' ? cg.curator.trim() : '';
+  const agentDid = currentAgent?.agentDid?.trim() ?? '';
+  const agentIds = new Set(
+    [currentAgent?.agentDid, currentAgent?.agentAddress]
+      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+      .map(canonicalAgentDid),
+  );
+  if (curator && agentDid && canonicalAgentDid(curator) === canonicalAgentDid(agentDid)) {
+    return {
+      label: 'Curator',
+      title: 'This agent is the curator for this Context Graph.',
+      tone: 'curator',
+    };
+  }
+  if (cg?.callerInvolved === true) {
+    if (curator && !agentDid && currentAgentStatus === 'loading') {
+      return {
+        label: 'Role checking',
+        title: 'This agent is involved in this Context Graph; curator status is still loading.',
+        tone: 'unknown',
+      };
+    }
+    if (curator && !agentDid && currentAgentStatus === 'error') {
+      return {
+        label: 'Role unknown',
+        title: 'This agent is involved in this Context Graph, but curator status could not be confirmed.',
+        tone: 'unknown',
+      };
+    }
+    return {
+      label: 'Joined',
+      title: 'This agent is involved in this Context Graph; curator status is shown only when identity metadata confirms it.',
+      tone: 'participant',
+    };
+  }
+  if (cg?.callerInvolved === false) {
+    return {
+      label: 'Not joined',
+      title: 'This agent is not listed as curator or participant for this Context Graph.',
+      tone: 'viewer',
+    };
+  }
+  const isListedParticipant = participantsStatus === 'ok' && participants
+    .map(participant => participant.trim())
+    .filter(Boolean)
+    .some(participant => agentIds.has(canonicalAgentDid(participant)));
+  if (isListedParticipant) {
+    return {
+      label: 'Joined',
+      title: 'This agent is listed as a participant for this Context Graph.',
+      tone: 'participant',
+    };
+  }
+  return {
+    label: 'Role unknown',
+    title: 'The node did not provide enough role metadata for this Context Graph.',
+    tone: 'unknown',
+  };
+}
+
+function overviewAccessAgentStat(
+  cg: any,
+  participants: string[],
+  participantsStatus: OverviewParticipantsStatus,
+) {
+  const policy = normalizeAccessPolicy(cg?.accessPolicy);
+  if (policy === 'public') {
+    return {
+      id: 'participants',
+      value: 'Open',
+      label: 'Public access',
+      hint: 'Public Context Graphs do not have an authoritative allowlist count.',
+    };
+  }
+  if (participantsStatus === 'loading') {
+    return {
+      id: 'participants',
+      value: '...',
+      label: 'Agents with access',
+      hint: 'Participant list is loading.',
+    };
+  }
+  if (participantsStatus === 'error') {
+    return {
+      id: 'participants',
+      value: 'Unavailable',
+      label: 'Agents with access',
+      hint: 'Participant list unavailable; access count is unknown.',
+    };
+  }
+
+  const agents = new Set(
+    participants
+      .map(agent => agent.trim())
+      .filter(Boolean)
+      .map(canonicalAgentDid),
+  );
+  const curator = typeof cg?.curator === 'string' ? cg.curator.trim() : '';
+  if (curator) agents.add(canonicalAgentDid(curator));
+
+  return {
+    id: 'participants',
+    value: agents.size.toLocaleString(),
+    label: 'Agents with access',
+    hint: 'Includes the curator plus allowlisted participants reported by the node.',
+  };
+}
+
+function overviewAccessState(raw?: string): { label: string; title: string; tone: 'public' | 'curated' | 'unknown' } {
+  const policy = normalizeAccessPolicy(raw);
+  if (policy === 'public') {
+    return {
+      label: 'Public',
+      title: 'Public Context Graph.',
+      tone: 'public',
+    };
+  }
+  if (policy === 'private') {
+    return {
+      label: 'Curated',
+      title: 'Curated Context Graph with access controlled by the curator.',
+      tone: 'curated',
+    };
+  }
+  return {
+    label: 'Access unknown',
+    title: 'The node did not provide an access policy for this Context Graph.',
+    tone: 'unknown',
+  };
+}
+
+export function ProjectOverviewCard({
+  cg,
+  memory,
+  participants,
+  participantsStatus = 'ok',
+  currentAgent,
+  currentAgentStatus = 'ok',
+  onSwitchLayer,
+  onOpenPrimer,
+}: {
   cg: any;
   memory: ReturnType<typeof useMemoryEntities>;
   participants: string[];
+  participantsStatus?: OverviewParticipantsStatus;
+  currentAgent?: OverviewAgentIdentity | null;
+  currentAgentStatus?: OverviewAgentStatus;
+  onSwitchLayer?: (layer: LayerView) => void;
+  onOpenPrimer?: () => void;
 }) {
   const { wm: working, swm: shared, vm: verified } = memory.counts;
   const layerSum = working + shared + verified;
-  const pctVm = layerSum > 0 ? Math.round((verified / layerSum) * 100) : 0;
-  const pctSwm = layerSum > 0 ? Math.round((shared / layerSum) * 100) : 0;
-  const pctWm = layerSum > 0 ? Math.max(0, 100 - pctVm - pctSwm) : 0;
+  const role = overviewRoleState(cg, currentAgent ?? null, currentAgentStatus, participants, participantsStatus);
+  const access = overviewAccessState(cg?.accessPolicy);
+  const isPublicAccess = normalizeAccessPolicy(cg?.accessPolicy) === 'public';
+  const accessAgentStat = overviewAccessAgentStat(cg, participants, participantsStatus);
+  const layerStatuses = Object.values(memory.layerStatus ?? {});
+  const unavailableLayerCount = layerStatuses.filter(status => status === 'error').length;
+  const allLayerCountsUnavailable =
+    !memory.loading && layerStatuses.length === 3 && unavailableLayerCount === 3;
+  const hasUnavailableLayer = !memory.loading && unavailableLayerCount > 0;
+  const statusHint = memory.loading
+    ? 'Loading memory layers...'
+    : allLayerCountsUnavailable || memory.error
+        ? 'Live memory counts are unavailable.'
+        : memory.partial || hasUnavailableLayer
+          ? 'One or more layer counts are currently a lower bound.'
+          : 'Canonical current-layer entity counts.';
+  const totalEntitiesValue = allLayerCountsUnavailable ? 'Unavailable' : layerSum.toLocaleString();
+  const pipeline = [
+    {
+      key: 'wm' as const,
+      label: 'Working Memory',
+      desc: 'Private staging area',
+      count: working,
+      status: memory.layerStatus?.wm ?? 'ok',
+      color: '#64748b',
+    },
+    {
+      key: 'swm' as const,
+      label: 'Shared Working Memory',
+      desc: 'Collaborative review',
+      count: shared,
+      status: memory.layerStatus?.swm ?? 'ok',
+      color: '#f59e0b',
+    },
+    {
+      key: 'vm' as const,
+      label: 'Verifiable Memory',
+      desc: 'Published on-chain',
+      count: verified,
+      status: memory.layerStatus?.vm ?? 'ok',
+      color: '#22c55e',
+    },
+  ];
+  const pipelineHasUnavailableLayer = pipeline.some(item => item.status === 'error');
 
   return (
     <div className="v10-po">
       <div className="v10-po-top">
         <span className="v10-po-dot" />
-        <div>
+        <div className="v10-po-heading">
           <div className="v10-po-title">{cg.name || cg.id}</div>
           {cg.description && <div className="v10-po-desc">{cg.description}</div>}
+        </div>
+        <div className="v10-po-badges">
+          <span className={`v10-po-badge ${role.tone}`} title={role.title}>{role.label}</span>
+          <span className={`v10-po-badge ${access.tone}`} title={access.title}>{access.label}</span>
         </div>
       </div>
       <StatStrip
         className="v10-po-stat-strip"
         items={[
-          { id: 'total', value: layerSum, label: 'Entities total' },
-          { id: 'wm', value: working, label: 'in Working' },
-          { id: 'swm', value: shared, label: 'in Shared' },
-          { id: 'vm', value: verified, label: 'in Verified' },
-          { id: 'participants', value: participants.length, label: 'participants' },
+          { id: 'total', value: totalEntitiesValue, label: 'Total entities', hint: statusHint },
+          accessAgentStat,
         ]}
       />
+      <div className="v10-po-pipeline" aria-label="Knowledge Pipeline">
+        <div className="v10-po-pipeline-head">
+          <div>
+            <div className="v10-po-section-title">Knowledge Pipeline</div>
+            <div className="v10-po-section-desc">Entities move from private staging to shared review; published assertion bundles become Knowledge Assets with on-chain provenance.</div>
+          </div>
+          {onOpenPrimer && (
+            <button type="button" className="v10-po-primer-link" onClick={onOpenPrimer}>
+              What is a Context Graph?
+            </button>
+          )}
+        </div>
+        <div className="v10-po-pipeline-track" aria-hidden="true">
+          {!pipelineHasUnavailableLayer && layerSum > 0
+            ? pipeline.map(item => {
+              const width = item.count > 0 ? (item.count / layerSum) * 100 : 0;
+              return (
+                <span
+                  key={item.key}
+                  className={`v10-po-pipeline-seg ${item.key}`}
+                  style={{ width: `${width}%`, background: item.color }}
+                />
+              );
+            })
+            : <span className="v10-po-pipeline-empty" />}
+        </div>
+        <div className="v10-po-pipeline-steps">
+          {pipeline.map((item, index) => (
+            <button
+              key={item.key}
+              type="button"
+              className={`v10-po-pipeline-step ${item.key}`}
+              onClick={() => onSwitchLayer?.(item.key)}
+              style={{ '--po-layer-color': item.color } as React.CSSProperties}
+            >
+              <span className="v10-po-pipeline-step-index">{index + 1}</span>
+              <span className="v10-po-pipeline-step-copy">
+                <span className="v10-po-pipeline-step-label">{item.label}</span>
+                <span className="v10-po-pipeline-step-desc">{item.desc}</span>
+              </span>
+              <span className="v10-po-pipeline-step-count">
+                {item.status === 'error'
+                  ? 'Unavailable'
+                  : `${item.count.toLocaleString()} ${layerNoun(item.key, item.count)}`}
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
       {participants.length > 0 && (
         <div className="v10-po-participants">
-          <div className="v10-po-participants-label">Participants</div>
+          <div className="v10-po-participants-label">
+            {isPublicAccess ? 'Known participants' : 'Allowlisted participants'}
+          </div>
           <div className="v10-po-participants-list">
             {participants.map(addr => (
               <span key={addr} className="v10-po-participant" title={addr}>
@@ -238,24 +568,6 @@ export function ProjectOverviewCard({ cg, memory, participants }: {
                 {addr.slice(0, 6)}…{addr.slice(-4)}
               </span>
             ))}
-          </div>
-        </div>
-      )}
-      {layerSum > 0 && (
-        <div className="v10-po-progress">
-          <div className="v10-po-progress-label">
-            <span>Knowledge Progress</span>
-            <span style={{ color: 'var(--text-success)', fontWeight: 600 }}>{pctVm}% verified</span>
-          </div>
-          <div className="v10-po-progress-bar">
-            {pctVm > 0 && <div className="v10-po-progress-seg vm" style={{ width: `${pctVm}%` }} />}
-            {pctSwm > 0 && <div className="v10-po-progress-seg swm" style={{ width: `${pctSwm}%` }} />}
-            {pctWm > 0 && <div className="v10-po-progress-seg wm" style={{ width: `${pctWm}%` }} />}
-          </div>
-          <div className="v10-po-progress-legend">
-            <span className="v10-po-legend-item"><span className="v10-po-legend-dot" style={{ background: '#22c55e' }} />Verified ({verified})</span>
-            <span className="v10-po-legend-item"><span className="v10-po-legend-dot" style={{ background: '#f59e0b' }} />Shared ({shared})</span>
-            <span className="v10-po-legend-item"><span className="v10-po-legend-dot" style={{ background: '#64748b' }} />Working ({working})</span>
           </div>
         </div>
       )}
@@ -471,7 +783,7 @@ export function SwmAttributionLegend({ palette, conflicts }: { palette: AgentPal
   );
 }
 
-// ─── Verified Memory graph legend (floating overlay) ─────────
+// ─── Verifiable Memory graph legend (floating overlay) ─────────
 // Lives in the top-right of the VM graph view. Explains the two new glyphs
 // (gold anchor, lavender agent) introduced by `useVerifiedMemoryAnchors`
 // so viewers can decode the graph at a glance. Also doubles as an anchor
@@ -494,7 +806,7 @@ export function VerifiedGraphLegend({ anchors }: { anchors: PublishAnchor[] }) {
   })();
 
   return (
-    <div className="v10-vm-legend" aria-label="Verified Memory legend">
+    <div className="v10-vm-legend" aria-label="Verifiable Memory legend">
       <div className="v10-vm-legend-row v10-vm-legend-head">
         <span>VM provenance layer</span>
         <span className="v10-vm-legend-count">{anchors.length} anchor{anchors.length === 1 ? '' : 's'}</span>
@@ -597,8 +909,8 @@ export function MemoryStrip({
     viewLayer: LayerView;
   }> = [
     { key: 'wm', label: 'Working Memory', color: '#64748b', icon: '◇', entities: layerEntities.wm, count: memory.counts.wm, promoteLabel: 'Promote All → Shared', viewLayer: 'wm' },
-    { key: 'swm', label: 'Shared Working Memory', color: '#f59e0b', icon: '◈', entities: layerEntities.swm, count: memory.counts.swm, promoteLabel: 'Publish to Verified Memory', viewLayer: 'swm' },
-    { key: 'vm', label: 'Verified Memory', color: '#22c55e', icon: '◉', entities: layerEntities.vm, count: memory.counts.vm, promoteLabel: null, viewLayer: 'vm' },
+    { key: 'swm', label: 'Shared Working Memory', color: '#f59e0b', icon: '◈', entities: layerEntities.swm, count: memory.counts.swm, promoteLabel: 'Publish to Verifiable Memory', viewLayer: 'swm' },
+    { key: 'vm', label: 'Verifiable Memory', color: '#22c55e', icon: '◉', entities: layerEntities.vm, count: memory.counts.vm, promoteLabel: null, viewLayer: 'vm' },
   ];
 
   return (
@@ -837,7 +1149,7 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }:
         setResult(`Promoted ${promoted} triple${promoted !== 1 ? 's' : ''} to Shared Memory`);
       } else {
         await publishSharedMemory(contextGraphId);
-        setResult('Published to Verified Memory');
+        setResult('Published to Verifiable Memory');
       }
       onComplete?.();
     } catch (err: any) {
@@ -849,13 +1161,13 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }:
 
   if (count === 0) return null;
   const color = isWm ? '#f59e0b' : '#22c55e';
-  const target = isWm ? 'Shared Working Memory' : 'Verified Memory';
+  const target = isWm ? 'Shared Working Memory' : 'Verifiable Memory';
   const noun = layerNoun(layer, count).toLowerCase();
 
   return (
     <GenWidget title={isWm ? 'Promote' : 'Publish'} footnote={`Moves ${noun} from this layer to ${target}.`}>
       <div className="v10-decision-context" style={{ marginBottom: 10 }}>
-        {count} {noun} in this layer can be {isWm ? 'promoted to Shared Working Memory for collaborative review' : 'published to Verified Memory on-chain'}.
+        {count} {noun} in this layer can be {isWm ? 'promoted to Shared Working Memory for collaborative review' : 'published to Verifiable Memory on-chain'}.
       </div>
       {result && <div style={{ fontSize: 11, color: 'var(--text-success)', marginBottom: 8 }}>✓ {result}</div>}
       {error && <div style={{ fontSize: 11, color: 'var(--text-danger)', marginBottom: 8 }}>✕ {error}</div>}
@@ -868,7 +1180,7 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }:
           disabled={busy}
           onClick={handleAction}
         >
-          {busy ? '...' : (isWm ? '✓ Promote All → Shared' : '◉ Publish to Verified Memory')}
+          {busy ? '...' : (isWm ? '✓ Promote All → Shared' : '◉ Publish to Verifiable Memory')}
         </button>
       </div>
     </GenWidget>
@@ -1116,7 +1428,7 @@ export function LayerContent({
                 compact
                 tone="vm"
                 icon={LAYER_CONFIG.vm.icon}
-                title="Loading Verified Memory..."
+                title="Loading Verifiable Memory..."
                 description="Knowledge Assets are being read from the verified layer."
               />
             </div>
@@ -1126,7 +1438,7 @@ export function LayerContent({
                 compact
                 tone="vm"
                 icon={LAYER_CONFIG.vm.icon}
-                title="Verified Memory status unavailable."
+                title="Verifiable Memory status unavailable."
                 description="This node could not read the verified layer right now."
               />
             </div>
@@ -1187,7 +1499,7 @@ export function LayerContent({
   );
 }
 
-// ─── Verified Memory Hero Banner ──────────────────────────────
+// ─── Verifiable Memory Hero Banner ──────────────────────────────
 // Sits at the top of the VM tab's "Knowledge Assets" view. Pulls together
 // the DKG "secret sauce" into a compact visual: anchoring, consensus,
 // agent identity — the verifiability elements that justify the VM's cost.
@@ -1205,7 +1517,7 @@ export function VerifiedMemoryHeroBanner({ entities, tripleCount, contextGraphId
     return (
       <div className="v10-vm-hero v10-vm-hero-empty">
         <div className="v10-vm-hero-title">
-          <span className="v10-vm-hero-badge">◉ Verified Memory</span>
+          <span className="v10-vm-hero-badge">◉ Verifiable Memory</span>
           <div className="v10-vm-hero-heading">
             <span className="v10-vm-hero-headline">Nothing published yet</span>
             <span className="v10-vm-hero-context" title={contextGraphId}>
@@ -1228,7 +1540,7 @@ export function VerifiedMemoryHeroBanner({ entities, tripleCount, contextGraphId
   return (
     <div className="v10-vm-hero">
       <div className="v10-vm-hero-title">
-        <span className="v10-vm-hero-badge">◉ Verified Memory</span>
+        <span className="v10-vm-hero-badge">◉ Verifiable Memory</span>
         <div className="v10-vm-hero-heading">
           <span className="v10-vm-hero-headline">On-chain anchored · cryptographically signed</span>
           <span className="v10-vm-hero-context" title={contextGraphId}>
@@ -1784,7 +2096,7 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
         setResult(`Promoted ${res.promotedCount} triples to Shared Memory`);
       } else {
         await publishSharedMemory(contextGraphId);
-        setResult('Published to Verified Memory');
+        setResult('Published to Verifiable Memory');
       }
       refresh();
       onComplete();
@@ -1810,7 +2122,7 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
         setResult(`Promoted ${total} triples across ${assertions.length} assertion${assertions.length !== 1 ? 's' : ''}`);
       } else {
         await publishSharedMemory(contextGraphId);
-        setResult('Published all to Verified Memory');
+        setResult('Published all to Verifiable Memory');
       }
       refresh();
       onComplete();
@@ -1854,7 +2166,7 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
   }
 
   const actionLabel = layer === 'wm' ? 'Promote → Shared' : 'Publish to VM';
-  const actionAllLabel = layer === 'wm' ? 'Promote All → Shared' : 'Publish all to Verified Memory';
+  const actionAllLabel = layer === 'wm' ? 'Promote All → Shared' : 'Publish all to Verifiable Memory';
 
   return (
     <div style={scrollRootStyle} data-cg-scroll-key={scrollKey}>
@@ -2280,7 +2592,7 @@ export function KADetailView({ entity, allEntities, allTriples, onNavigate, onCl
   const authorUri = entityAuthorUri(entity);
   const author = authorUri ? agents?.get(authorUri) ?? null : null;
   const layerBadge = entity.trustLevel === 'verified' ? 'vm' : entity.trustLevel === 'shared' ? 'swm' : 'wm';
-  const layerLabel = entity.trustLevel === 'verified' ? 'Verified Memory' : entity.trustLevel === 'shared' ? 'Shared Working Memory' : 'Working Memory';
+  const layerLabel = entity.trustLevel === 'verified' ? 'Verifiable Memory' : entity.trustLevel === 'shared' ? 'Shared Working Memory' : 'Working Memory';
   const detailNoun = layerNoun(entity.trustLevel, 1);
 
   const incoming = useMemo(() => {
@@ -2566,7 +2878,7 @@ export function ProvenanceTrail({ entity }: { entity: MemoryEntity }) {
       {entity.trustLevel === 'verified' && (
         <TrailEvent
           toneClass="verified"
-          title="Published to Verified Memory"
+          title="Published to Verifiable Memory"
           actionWord="Published"
           agent={published.agent}
           agentUri={published.uri}

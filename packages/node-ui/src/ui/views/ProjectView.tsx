@@ -1,14 +1,15 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from 'react';
 import { useFetch } from '../hooks.js';
 import { api } from '../api-wrapper.js';
-import { listParticipants } from '../api.js';
 import { ImportFilesModal } from '../components/Modals/ImportFilesModal.js';
 import { ShareProjectModal } from '../components/Modals/ShareProjectModal.js';
 import { useMemoryEntities } from '../hooks/useMemoryEntities.js';
 import { useProjectProfile, ProjectProfileContext } from '../hooks/useProjectProfile.js';
 import { useAgents, AgentsContext } from '../hooks/useAgents.js';
+import { useCurrentAgent } from '../hooks/useCurrentAgent.js';
 import { ActivityFeed } from '../components/ActivityFeed.js';
 import { SubGraphBar } from '../components/SubGraphBar.js';
+import { CONTEXT_GRAPH_PRIMER_TAB } from '../lib/contextGraphPrimer.js';
 import { useTabsStore } from '../stores/tabs.js';
 import type { LayerView, LayerContentTab, SubGraphTab } from './project/helpers.js';
 import {
@@ -18,7 +19,6 @@ import {
   SubGraphDetailView,
   ProjectOverviewCard,
   PendingJoinRequestsBar,
-  MemoryStrip,
   SubGraphOverviewGrid,
   ContextGraphQueryView,
   LayerDetailView,
@@ -30,13 +30,17 @@ interface ProjectViewProps {
 }
 
 type MemoryLayerView = Extract<LayerView, 'wm' | 'swm' | 'vm'>;
+type ParticipantsStatus = 'loading' | 'ok' | 'error';
+type ParticipantsState = {
+  contextGraphId: string | null;
+  list: string[];
+  status: ParticipantsStatus;
+};
 
 interface DetailOrigin {
   activeLayer: LayerView;
   activeSubGraph: string | null;
   layerTabs: Record<MemoryLayerView, LayerContentTab>;
-  overviewExpandedLayer: MemoryLayerView | null;
-  overviewLayerTabs: Record<MemoryLayerView, LayerContentTab>;
   subGraphTabs: Record<string, SubGraphTab>;
   scroll: { key: string; top: number };
 }
@@ -66,7 +70,11 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
   const [showShare, setShowShare] = useState(false);
   const [activeLayer, setActiveLayer] = useState<LayerView>('overview');
   const [selectedUri, setSelectedUri] = useState<string | null>(null);
-  const [participants, setParticipants] = useState<string[]>([]);
+  const [participantsState, setParticipantsState] = useState<ParticipantsState>({
+    contextGraphId: null,
+    list: [],
+    status: 'loading',
+  });
   // Active sub-graph *page* — when set, the middle pane renders the sub-graph
   // detail view instead of the overview / layer views. This is structurally
   // a sibling of `activeLayer`, not a filter over it: sub-graphs are a peer
@@ -75,17 +83,15 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
   const [layerContentTabs, setLayerContentTabs] = useState<Record<MemoryLayerView, LayerContentTab>>(
     DEFAULT_LAYER_TABS,
   );
-  const [overviewExpandedLayer, setOverviewExpandedLayer] = useState<MemoryLayerView | null>(null);
-  const [overviewLayerTabs, setOverviewLayerTabs] = useState<Record<MemoryLayerView, LayerContentTab>>(
-    DEFAULT_LAYER_TABS,
-  );
   const [subGraphTabs, setSubGraphTabs] = useState<Record<string, SubGraphTab>>({});
   const pageRef = useRef<HTMLElement | null>(null);
   const detailOriginRef = useRef<DetailOrigin | null>(null);
   const pendingScrollRestoreRef = useRef<DetailOrigin['scroll'] | null>(null);
+  const participantsRequestRef = useRef(0);
   const profile = useProjectProfile(contextGraphId);
   const agentsData = useAgents(contextGraphId);
   const openTab = useTabsStore((s) => s.openTab);
+  const { data: currentAgent, loading: currentAgentLoading, error: currentAgentError } = useCurrentAgent();
 
   const currentScrollKey = useCallback(() => {
     if (activeSubGraph) {
@@ -104,8 +110,6 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
       activeLayer,
       activeSubGraph,
       layerTabs: { ...layerContentTabs },
-      overviewExpandedLayer,
-      overviewLayerTabs: { ...overviewLayerTabs },
       subGraphTabs: { ...subGraphTabs },
       scroll: { key, top: scrollEl?.scrollTop ?? 0 },
     };
@@ -114,8 +118,6 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     activeSubGraph,
     currentScrollKey,
     layerContentTabs,
-    overviewExpandedLayer,
-    overviewLayerTabs,
     subGraphTabs,
   ]);
 
@@ -194,11 +196,20 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
   const rawMemory = useMemoryEntities(contextGraphId);
 
   const refreshParticipants = useCallback(() => {
-    if (cg?.id) {
-      listParticipants(cg.id)
-        .then(data => setParticipants(data.allowedAgents))
-        .catch(() => setParticipants([]));
-    }
+    const targetId = cg?.id;
+    if (!targetId) return;
+    const requestId = participantsRequestRef.current + 1;
+    participantsRequestRef.current = requestId;
+    setParticipantsState({ contextGraphId: targetId, list: [], status: 'loading' });
+    api.listParticipants(targetId)
+      .then(data => {
+        if (participantsRequestRef.current !== requestId) return;
+        setParticipantsState({ contextGraphId: targetId, list: data.allowedAgents, status: 'ok' });
+      })
+      .catch(() => {
+        if (participantsRequestRef.current !== requestId) return;
+        setParticipantsState({ contextGraphId: targetId, list: [], status: 'error' });
+      });
   }, [cg?.id]);
 
   useEffect(() => { refreshParticipants(); }, [refreshParticipants]);
@@ -234,10 +245,6 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     setLayerContentTabs(prev => prev[layer] === tab ? prev : { ...prev, [layer]: tab });
   }, []);
 
-  const handleOverviewLayerTabChange = useCallback((layer: MemoryLayerView, tab: LayerContentTab) => {
-    setOverviewLayerTabs(prev => prev[layer] === tab ? prev : { ...prev, [layer]: tab });
-  }, []);
-
   const handleSubGraphTabChange = useCallback((slug: string, tab: SubGraphTab) => {
     setSubGraphTabs(prev => prev[slug] === tab ? prev : { ...prev, [slug]: tab });
   }, []);
@@ -257,8 +264,6 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     setActiveLayer(origin.activeLayer);
     setActiveSubGraph(origin.activeSubGraph);
     setLayerContentTabs(origin.layerTabs);
-    setOverviewExpandedLayer(origin.overviewExpandedLayer);
-    setOverviewLayerTabs(origin.overviewLayerTabs);
     setSubGraphTabs(origin.subGraphTabs);
     pendingScrollRestoreRef.current = origin.scroll;
   }, []);
@@ -271,16 +276,9 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     handleNavigate(uri, 'page');
   }, [handleNavigate]);
 
-  const handleOverviewStripNavigate = useCallback((uri: string) => {
-    const key = overviewExpandedLayer
-      ? `layer:${overviewExpandedLayer}:${overviewLayerTabs[overviewExpandedLayer]}`
-      : 'page';
-    handleNavigate(uri, key);
-  }, [handleNavigate, overviewExpandedLayer, overviewLayerTabs]);
-
-  const handleOverviewStripNodeClick = useCallback((node: any) => {
-    if (node?.id) handleOverviewStripNavigate(node.id);
-  }, [handleOverviewStripNavigate]);
+  const handleOpenPrimer = useCallback(() => {
+    openTab(CONTEXT_GRAPH_PRIMER_TAB);
+  }, [openTab]);
 
   if (!cg) {
     return (
@@ -298,6 +296,12 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     : activeSubGraph
       ? 'subgraph'
       : activeLayer;
+  const participantsForCurrentGraph = participantsState.contextGraphId === cg.id
+    ? participantsState.list
+    : [];
+  const participantsStatusForCurrentGraph = participantsState.contextGraphId === cg.id
+    ? participantsState.status
+    : 'loading';
 
   return (
     <ProjectProfileContext.Provider value={profile}>
@@ -364,15 +368,17 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
       {/* Overview View */}
       {!activeSubGraph && activeLayer === 'overview' && !selectedEntity && (
         <>
-          <ProjectOverviewCard cg={cg} memory={rawMemory} participants={participants} />
-          <PendingJoinRequestsBar contextGraphId={contextGraphId} onParticipantsChanged={refreshParticipants} />
-          <SubGraphBar
-            contextGraphId={contextGraphId}
-            profile={profile}
-            selected={activeSubGraph}
-            entities={rawMemory.entityList}
-            onSelect={handleSelectSubGraph}
+          <ProjectOverviewCard
+            cg={cg}
+            memory={rawMemory}
+            participants={participantsForCurrentGraph}
+            participantsStatus={participantsStatusForCurrentGraph}
+            currentAgent={currentAgent ?? null}
+            currentAgentStatus={currentAgentLoading ? 'loading' : currentAgentError ? 'error' : 'ok'}
+            onSwitchLayer={handleLayerSwitch}
+            onOpenPrimer={handleOpenPrimer}
           />
+          <PendingJoinRequestsBar contextGraphId={contextGraphId} onParticipantsChanged={refreshParticipants} />
           {rawMemory.loading && (
             <div className="v10-me-loading"><div className="v10-me-loading-text">Loading memory...</div></div>
           )}
@@ -388,21 +394,10 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
             emptyHint="Once agents start proposing decisions or tasks they'll show up here as a live feed."
             className="v10-overview-activity"
           />
-          <MemoryStrip
-            memory={rawMemory}
-            onSwitchLayer={handleLayerSwitch}
-            onSelectEntity={handleOverviewStripNavigate}
-            contextGraphId={contextGraphId}
-            onNodeClick={handleOverviewStripNodeClick}
-            expandedLayer={overviewExpandedLayer}
-            onExpandedLayerChange={setOverviewExpandedLayer}
-            expandTabs={overviewLayerTabs}
-            onExpandTabChange={handleOverviewLayerTabChange}
-          />
         </>
       )}
 
-      {/* Graph Overview — one mini graph per sub-graph, side-by-side */}
+      {/* Subgraphs — one mini graph per sub-graph, side-by-side */}
       {!activeSubGraph && activeLayer === 'graph-overview' && !selectedEntity && (
         <SubGraphOverviewGrid
           contextGraphId={contextGraphId}

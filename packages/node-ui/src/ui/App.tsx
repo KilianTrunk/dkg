@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useCallback, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useCallback, useState } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { Header } from './components/Shell/Header.js';
 import { PanelLeft } from './components/Shell/PanelLeft.js';
@@ -7,7 +7,9 @@ import { PanelBottom } from './components/Shell/PanelBottom.js';
 import { PanelRight } from './components/Shell/PanelRight.js';
 import { useLayoutStore, maxBottomHeight } from './stores/layout.js';
 import { useAgentsStore } from './stores/agents.js';
+import { useTabsStore } from './stores/tabs.js';
 import { api } from './api-wrapper.js';
+import { CONTEXT_GRAPH_PRIMER_TAB } from './lib/contextGraphPrimer.js';
 
 function useLiveStatus() {
   const setNodeStatus = useAgentsStore((s) => s.setNodeStatus);
@@ -230,6 +232,16 @@ const NetworkDebugPage = React.lazy(() =>
   import('./pages/Network.js').then((m) => ({ default: m.NetworkPage }))
 );
 
+function ContextGraphPrimerRoute() {
+  const openTab = useTabsStore((s) => s.openTab);
+
+  useLayoutEffect(() => {
+    openTab(CONTEXT_GRAPH_PRIMER_TAB);
+  }, [openTab]);
+
+  return <Navigate to="/" replace />;
+}
+
 export function App() {
   return (
     <Routes>
@@ -238,6 +250,7 @@ export function App() {
           <NetworkDebugPage />
         </React.Suspense>
       } />
+      <Route path="/context-graph-primer" element={<ContextGraphPrimerRoute />} />
       <Route path="/agent" element={<Navigate to="/" replace />} />
       <Route path="/explorer" element={<Navigate to="/" replace />} />
       <Route path="/settings" element={<Navigate to="/" replace />} />

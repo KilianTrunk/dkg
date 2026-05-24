@@ -55,6 +55,27 @@ export interface SwmHostModeStoreOptions {
   registeredLimits: SwmHostModeStoreLimits;
   /** Clock override for tests. Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Optional callback fired by `init()` after the orphan-log
+   * reconciliation pass. Receives the per-startup totals so the
+   * agent can surface them through its own logging facade. Pure
+   * observability — the store itself does not log.
+   */
+  onStartupReconcile?: (report: SwmHostModeStartupReconcileReport) => void;
+}
+
+/**
+ * Summary of the orphan-log sweep performed by `init()`. A `.log`
+ * file without a matching `.meta` cannot be served via catchup (no
+ * cleartext `contextGraphId` to dispatch on), pruned (the prune
+ * path keys off meta files), or reported in stats — those bytes are
+ * dead storage that accumulate after a crash between `appendFile`
+ * (durable) and `persistMeta` (durable) for a brand-new CG's first
+ * envelope. We delete orphans at init to recover the disk.
+ */
+export interface SwmHostModeStartupReconcileReport {
+  orphanLogsRemoved: number;
+  orphanBytesRemoved: number;
 }
 
 export interface SwmHostModeStats {
@@ -109,6 +130,7 @@ export class SwmHostModeStore {
   private readonly unregisteredLimits: SwmHostModeStoreLimits;
   private readonly registeredLimits: SwmHostModeStoreLimits;
   private readonly now: () => number;
+  private readonly onStartupReconcile?: (report: SwmHostModeStartupReconcileReport) => void;
   private readonly metaCache = new Map<string, CgMetaState>();
   private readonly inflightWrites = new Map<string, Promise<void>>();
   private initialized = false;
@@ -118,6 +140,7 @@ export class SwmHostModeStore {
     this.unregisteredLimits = options.unregisteredLimits ?? DEFAULT_UNREGISTERED_LIMITS;
     this.registeredLimits = options.registeredLimits ?? DEFAULT_REGISTERED_LIMITS;
     this.now = options.now ?? (() => Date.now());
+    this.onStartupReconcile = options.onStartupReconcile;
   }
 
   static defaultLimits(): { unregistered: SwmHostModeStoreLimits; registered: SwmHostModeStoreLimits } {
@@ -127,7 +150,75 @@ export class SwmHostModeStore {
   async init(): Promise<void> {
     if (this.initialized) return;
     await fs.mkdir(this.dataDir, { recursive: true });
+    const report = await this.reconcileOrphanLogs();
     this.initialized = true;
+    if (this.onStartupReconcile && (report.orphanLogsRemoved > 0 || report.orphanBytesRemoved > 0)) {
+      try {
+        this.onStartupReconcile(report);
+      } catch {
+        // observability callback must never break init
+      }
+    }
+  }
+
+  /**
+   * Test-only / operator helper: re-run the orphan-log sweep without
+   * re-initialising. Returns the totals for the current pass.
+   */
+  async reconcileOrphanLogsNow(): Promise<SwmHostModeStartupReconcileReport> {
+    await this.init();
+    return this.reconcileOrphanLogs();
+  }
+
+  /**
+   * Scan `dataDir` for `.log` files without a matching `.meta` and
+   * delete them. Orphans typically result from a crash between
+   * `appendFile` (durable) and `persistMeta` (durable) during the
+   * first envelope for a brand-new CG. Without meta we cannot:
+   *   - serve catchup (no cleartext contextGraphId to dispatch on)
+   *   - prune (the prune path keys off meta files)
+   *   - report in stats
+   * so the bytes are dead storage. Delete-at-init recovers the disk.
+   *
+   * `.meta` files without a matching `.log` are deliberately NOT
+   * removed: `markRegistered` writes a meta even for CGs that have
+   * never received an envelope, and a prune-to-empty leaves the meta
+   * behind. Both are harmless (zero-byte footprint) and the meta
+   * carries the cleartext `contextGraphId` we need for future
+   * append-time meta reconstruction.
+   */
+  private async reconcileOrphanLogs(): Promise<SwmHostModeStartupReconcileReport> {
+    let entries: Dirent[] = [];
+    try {
+      entries = await fs.readdir(this.dataDir, { withFileTypes: true });
+    } catch {
+      return { orphanLogsRemoved: 0, orphanBytesRemoved: 0 };
+    }
+    const metaKeys = new Set<string>();
+    const logFiles: { key: string; name: string }[] = [];
+    for (const e of entries) {
+      if (!e.isFile()) continue;
+      if (e.name.endsWith('.meta')) {
+        metaKeys.add(e.name.slice(0, -'.meta'.length));
+      } else if (e.name.endsWith('.log')) {
+        logFiles.push({ key: e.name.slice(0, -'.log'.length), name: e.name });
+      }
+    }
+    let orphanLogsRemoved = 0;
+    let orphanBytesRemoved = 0;
+    for (const { key, name } of logFiles) {
+      if (metaKeys.has(key)) continue;
+      const fullPath = path.join(this.dataDir, name);
+      try {
+        const stat = await fs.stat(fullPath);
+        orphanBytesRemoved += stat.size;
+        await fs.rm(fullPath, { force: true });
+        orphanLogsRemoved += 1;
+      } catch {
+        // best-effort; another process may have removed the file
+      }
+    }
+    return { orphanLogsRemoved, orphanBytesRemoved };
   }
 
   /**

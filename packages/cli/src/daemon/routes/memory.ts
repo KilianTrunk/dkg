@@ -545,6 +545,506 @@ WHERE {
     }
   }
 
+  // POST /api/shared-memory/catchup
+  //
+  // OT-RFC-38 LU-7 — explicit SWMCatchupRequest endpoint. Pulls the
+  // remote SWM state for one or more context graphs from connected
+  // peers, applying everything authorized into the local triple store.
+  //
+  // Body: { contextGraphId: string | string[], peerId?: string }
+  //   - peerId: optional. When set, sync only from this specific peer.
+  //     When omitted, iterate ALL currently-connected libp2p peers and
+  //     try each — first peer that authorises serves the request,
+  //     subsequent peers' decisions are independent.
+  //
+  // Returns: per-peer outcome with inserted/fetched counters.
+  //
+  // Auth model (per SPEC_CG_HOSTING_MEMBERSHIP §5.6.4):
+  //   - Public CGs (accessPolicy == 0): the responder's sync handler
+  //     accepts anonymous catchup (no `authorizePrivateSyncRequest`
+  //     gate). Any reachable peer can backfill SWM.
+  //   - Curated CGs (accessPolicy == 1): the responder's sync handler
+  //     runs `authorizePrivateSyncRequest`, which verifies the
+  //     requester's signed envelope against the CG's
+  //     `agentGateAddresses` / `allowedPeers` set. Members get
+  //     served; outsiders get a `syncDeniedResponse`.
+  //   - Token-bearer (outsider-with-curator-issued-bearer): not yet
+  //     implemented; tracked under LU-9 member-attestation work.
+  if (req.method === "POST" && path === "/api/shared-memory/catchup") {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    const peerIdParam = typeof parsed.peerId === 'string' ? parsed.peerId.trim() : undefined;
+    const cgIdsInput = Array.isArray(parsed.contextGraphId)
+      ? parsed.contextGraphId
+      : parsed.contextGraphId !== undefined
+        ? [parsed.contextGraphId]
+        : [];
+    const cgIds: string[] = [];
+    for (const id of cgIdsInput) {
+      if (typeof id !== 'string' || !validateRequiredContextGraphId(id, res)) return;
+      cgIds.push(id);
+    }
+    if (cgIds.length === 0) {
+      return jsonResponse(res, 400, {
+        error:
+          'Missing "contextGraphId" — pass a single context graph id string or an array of ids',
+      });
+    }
+
+    // OT-RFC-38 LU-7: SWMCatchupRequest is SWM-only. The durable
+    // (knowledge-collection) layer has its own publish-time
+    // commit→fanout→ACK protocol and a separate sync substrate; it's
+    // out of scope for the catchup endpoint and would otherwise compound
+    // the request budget (240s vs 120s). Opt-in via includeDurable=true
+    // for callers that want the full data leg in the same call.
+    const includeDurable = parsed.includeDurable === true;
+
+    // Per-peer hard cap on the catchup duration. Keeps the endpoint
+    // response within a single HTTP-level timeout even if the underlying
+    // sync internals retry their way to completion. SWM-only path:
+    // ~45s/page * a couple of pages worst-case; under heavy gossip
+    // load (the integration suite) backed-off retries can stretch this
+    // out further. Underlying SYNC_TOTAL_TIMEOUT_MS in dkg-agent is
+    // 120s, so use 110s by default and let callers override via the
+    // request body for slow or congested networks.
+    const DEFAULT_PER_PEER_SWM_BUDGET_MS = 110_000;
+    const DEFAULT_PER_PEER_DURABLE_BUDGET_MS = 110_000;
+    const PER_PEER_SWM_BUDGET_MS = (typeof parsed.perPeerBudgetMs === 'number' && parsed.perPeerBudgetMs > 0)
+      ? Math.min(parsed.perPeerBudgetMs, 300_000)
+      : DEFAULT_PER_PEER_SWM_BUDGET_MS;
+    const PER_PEER_DURABLE_BUDGET_MS = (typeof parsed.perPeerDurableBudgetMs === 'number' && parsed.perPeerDurableBudgetMs > 0)
+      ? Math.min(parsed.perPeerDurableBudgetMs, 300_000)
+      : DEFAULT_PER_PEER_DURABLE_BUDGET_MS;
+
+    const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
+      new Promise<T>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        p.then(
+          (v) => { clearTimeout(t); resolve(v); },
+          (e) => { clearTimeout(t); reject(e); },
+        );
+      });
+
+    // Discover candidate peers. The single-peer mode is opt-in; the
+    // default fan-out mode mirrors what runSyncOnConnect does on every
+    // peer:connect event, but caller-initiated rather than event-driven.
+    let candidatePeers: string[];
+    if (peerIdParam) {
+      candidatePeers = [peerIdParam];
+    } else {
+      candidatePeers = agent.node.libp2p
+        .getConnections()
+        .map((c: any) => c.remotePeer.toString());
+      const selfPeer = agent.peerId;
+      candidatePeers = Array.from(new Set(candidatePeers.filter((p: string) => p !== selfPeer)));
+    }
+
+    if (candidatePeers.length === 0) {
+      return jsonResponse(res, 200, {
+        contextGraphIds: cgIds,
+        peersAttempted: 0,
+        results: [],
+        hint: 'No connected peers to catch up from. Wait for inbound connections or pass an explicit `peerId`.',
+      });
+    }
+
+    // Parallelize across peers — each peer's sync is independent
+    // and the per-peer dial+request takes 5-20s on devnet. Serial
+    // iteration over N peers would compound to N×20s, easily
+    // exceeding the daemon's default request timeout.
+    const settled = await Promise.allSettled(
+      candidatePeers.map(async (candidate) => {
+        let swm = 0;
+        let durable = 0;
+        let swmError: string | undefined;
+        let durableError: string | undefined;
+        try {
+          swm = await withTimeout(
+            agent.syncSharedMemoryFromPeer(candidate, cgIds),
+            PER_PEER_SWM_BUDGET_MS,
+            `SWM catchup from ${candidate}`,
+          );
+        } catch (err: any) {
+          swmError = err?.message ?? String(err);
+        }
+        if (includeDurable) {
+          try {
+            durable = await withTimeout(
+              (agent as any).syncFromPeer?.(candidate, cgIds) ?? Promise.resolve(0),
+              PER_PEER_DURABLE_BUDGET_MS,
+              `Durable catchup from ${candidate}`,
+            );
+          } catch (err: any) {
+            durableError = err?.message ?? String(err);
+          }
+        }
+        return { peerId: candidate, insertedTriples: swm, durableInsertedTriples: durable, swmError, durableError };
+      }),
+    );
+
+    const results = settled.map((s, idx) => {
+      if (s.status === 'fulfilled') {
+        return {
+          peerId: candidatePeers[idx],
+          insertedTriples: s.value.insertedTriples,
+          durableInsertedTriples: s.value.durableInsertedTriples,
+          ...(s.value.swmError ? { swmError: s.value.swmError } : {}),
+          ...(s.value.durableError ? { durableError: s.value.durableError } : {}),
+        };
+      }
+      return {
+        peerId: candidatePeers[idx],
+        insertedTriples: 0,
+        durableInsertedTriples: 0,
+        error: s.reason?.message ?? String(s.reason),
+      };
+    });
+
+    const totalInserted = results.reduce((sum, r) => sum + r.insertedTriples, 0);
+    const totalDurable = results.reduce((sum, r) => sum + (r.durableInsertedTriples ?? 0), 0);
+    return jsonResponse(res, 200, {
+      contextGraphIds: cgIds,
+      peersAttempted: candidatePeers.length,
+      includeDurable,
+      totalInsertedTriples: totalInserted,
+      totalDurableInsertedTriples: totalDurable,
+      results,
+    });
+  }
+
+  // Tiny local helper — kept inline to avoid adding a new import for
+  // a single use; the existing route module already has utilities
+  // for hex/bytes interop scattered across the file but none are
+  // strictly typed `bytes32`. 64-char hex (no 0x) → 32-byte buffer.
+  function hexToBytes32(h: string): Uint8Array {
+    const clean = h.startsWith('0x') ? h.slice(2) : h;
+    if (clean.length !== 64) throw new Error('expected 32-byte hex');
+    const out = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+    return out;
+  }
+
+  // POST /api/shared-memory/verify-batch
+  //
+  // OT-RFC-38 LU-8 — Member post-decrypt batch verification.
+  //
+  // SPEC_CG_HOSTING_MEMBERSHIP §5.3.1: members re-derive the plaintext
+  // merkle root from a reconstructed batch and compare to the on-chain
+  // anchor. This endpoint exposes the recompute step.
+  //
+  // Body: {
+  //   contextGraphId: string,
+  //   expectedMerkleRoot: hex32 string ("0x" + 64 hex chars),
+  //   quads?: Quad[],            // if omitted, fetched from local SWM
+  //   subGraphName?: string,     // narrows the SWM source slice
+  //   privateRoots?: hex32[],    // optional per-KA private sub-roots
+  //   batchId?: string,          // round-tripped into rejection record
+  // }
+  //
+  // Returns: { ok, expectedRoot, actualRoot, leafCount, reason? }
+  if (req.method === "POST" && path === "/api/shared-memory/verify-batch") {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    const contextGraphId = parsed.contextGraphId;
+    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const subGraphName = parsed.subGraphName;
+    if (subGraphName !== undefined && !validateOptionalSubGraphName(subGraphName, res)) return;
+    const expectedHex = String(parsed.expectedMerkleRoot ?? '');
+    if (!/^0x[0-9a-fA-F]{64}$/.test(expectedHex)) {
+      return jsonResponse(res, 400, {
+        error: 'expectedMerkleRoot must be a 0x-prefixed 32-byte hex string',
+      });
+    }
+    const expectedRoot = hexToBytes32(expectedHex);
+    const privateRootsHex = Array.isArray(parsed.privateRoots) ? parsed.privateRoots : [];
+    const privateRoots: Uint8Array[] = [];
+    for (const ph of privateRootsHex) {
+      if (typeof ph !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(ph)) {
+        return jsonResponse(res, 400, {
+          error: 'privateRoots[*] must be 0x-prefixed 32-byte hex strings',
+        });
+      }
+      privateRoots.push(hexToBytes32(ph));
+    }
+    let quads: Array<{ subject: string; predicate: string; object: string; graph: string }> = [];
+    if (Array.isArray(parsed.quads)) {
+      quads = parsed.quads.map((q: any) => ({
+        subject: String(q.subject),
+        predicate: String(q.predicate),
+        object: String(q.object),
+        graph: String(q.graph ?? ''),
+      }));
+    } else {
+      // Reconstruct from local store. Try in order:
+      //   1. _shared_memory (live SWM, before promote-to-VM)
+      //   2. CG data graph (post-publish — selection moves quads from
+      //      SWM into the named-graph as part of the seal step)
+      // Either is valid input for verification: the publisher hashed
+      // the plaintext leaves once; wherever those triples now live
+      // locally, recomputing the root over them must match the on-chain
+      // commitment.
+      const swmGraphUri = contextGraphSharedMemoryUri(contextGraphId, subGraphName);
+      const dataGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+      try {
+        const swmResult = await (agent as any).store.query(
+          `SELECT ?s ?p ?o WHERE { GRAPH <${swmGraphUri}> { ?s ?p ?o } }`,
+        );
+        if (swmResult?.type === 'bindings') {
+          for (const b of swmResult.bindings) {
+            quads.push({ subject: b['s'], predicate: b['p'], object: b['o'], graph: '' });
+          }
+        }
+        if (quads.length === 0) {
+          const dataResult = await (agent as any).store.query(
+            `SELECT ?s ?p ?o WHERE { GRAPH <${dataGraphUri}> { ?s ?p ?o } }`,
+          );
+          if (dataResult?.type === 'bindings') {
+            for (const b of dataResult.bindings) {
+              quads.push({ subject: b['s'], predicate: b['p'], object: b['o'], graph: '' });
+            }
+          }
+        }
+      } catch (err: any) {
+        return jsonResponse(res, 500, { error: `Failed to read local SWM/workspace: ${err?.message ?? err}` });
+      }
+    }
+
+    const { verifyBatch } = await import('@origintrail-official/dkg-agent');
+    const verifyResult = verifyBatch({ quads, privateRoots, expectedRoot });
+    return jsonResponse(res, 200, {
+      contextGraphId,
+      ...(parsed.batchId !== undefined ? { batchId: parsed.batchId } : {}),
+      quadsConsidered: quads.length,
+      ...verifyResult,
+    });
+  }
+
+  // POST /api/shared-memory/report-batch-rejection
+  //
+  // OT-RFC-38 LU-8 — when verifyBatch returns ok=false, the member
+  // gossips a structured BatchRejection record so other members can
+  // sanity-check and re-pull from a different host.
+  //
+  // Body: {
+  //   contextGraphId: string,
+  //   batchId?: string,
+  //   verifyResult: { ok: false, expectedRoot, actualRoot, leafCount, reason },
+  //   rejectedBy?: { agentAddress, peerId },    // defaults to local agent
+  // }
+  if (req.method === "POST" && path === "/api/shared-memory/report-batch-rejection") {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    const contextGraphId = parsed.contextGraphId;
+    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const verifyResult = parsed.verifyResult;
+    if (!verifyResult || verifyResult.ok !== false) {
+      return jsonResponse(res, 400, {
+        error: 'verifyResult.ok must be false; nothing to report on an ok batch',
+      });
+    }
+
+    const { buildBatchRejectionRecord } = await import('@origintrail-official/dkg-agent');
+    const inferredAgentAddress =
+      (agent as any).getAgentAddress?.() ??
+      (agent as any).agentAddress ??
+      (agent as any).config?.agentAddress ??
+      (agent as any).wallet?.address ??
+      requestAgentAddress ??
+      'unknown';
+    const rejectedBy = parsed.rejectedBy ?? {
+      agentAddress: inferredAgentAddress,
+      peerId: (agent as any).peerId,
+    };
+
+    let record;
+    try {
+      record = buildBatchRejectionRecord({
+        contextGraphId,
+        batchId: parsed.batchId,
+        verifyResult,
+        rejectedBy,
+      });
+    } catch (err: any) {
+      return jsonResponse(res, 400, { error: err?.message ?? String(err) });
+    }
+
+    // Persist the record as SWM triples so it gossips via the
+    // standard SWM substrate to other members. Reuses agent.share()
+    // for the write — no new transport.
+    const subject = `did:dkg:batch-rejection:${record.digest}`;
+    const NS = 'http://dkg.io/ontology/';
+    const quads = [
+      { subject, predicate: `${NS}rejectedContextGraphId`, object: `"${record.contextGraphId}"`, graph: '' },
+      { subject, predicate: `${NS}expectedMerkleRoot`, object: `"${record.expectedRoot}"`, graph: '' },
+      { subject, predicate: `${NS}actualMerkleRoot`, object: `"${record.actualRoot}"`, graph: '' },
+      { subject, predicate: `${NS}rejectionReason`, object: `"${record.reason ?? 'unknown'}"`, graph: '' },
+      { subject, predicate: `${NS}rejectedByAgent`, object: `"${record.rejectedBy.agentAddress}"`, graph: '' },
+      { subject, predicate: `${NS}rejectedByPeer`, object: `"${record.rejectedBy.peerId ?? ''}"`, graph: '' },
+      { subject, predicate: `${NS}rejectionReportedAt`, object: `"${record.reportedAt}"`, graph: '' },
+      ...(record.batchId !== undefined
+        ? [{ subject, predicate: `${NS}rejectedBatchId`, object: `"${record.batchId}"`, graph: '' }]
+        : []),
+    ];
+
+    try {
+      await agent.share(contextGraphId, quads, {
+        operationCtx: createOperationContext('share'),
+        callerAgentAddress: requestAgentAddress,
+      });
+    } catch (err: any) {
+      // The record itself is the deliverable; gossip is best-effort.
+      // Surface the error but still return the constructed record so
+      // callers can persist it elsewhere.
+      return jsonResponse(res, 200, {
+        record,
+        gossiped: false,
+        gossipError: err?.message ?? String(err),
+      });
+    }
+
+    return jsonResponse(res, 200, { record, gossiped: true });
+  }
+
+  // POST /api/attestation/mint
+  //
+  // OT-RFC-38 LU-9 — Member-attested verification token.
+  //
+  // Body: {
+  //   contextGraphId: string,            // local CG id (numeric on-chain id resolved server-side)
+  //   batchId: string,                   // typically the KC id
+  //   merkleRoot: hex32,
+  //   plaintextLeafHash: hex32,          // keccak256 over the canonical leaf
+  // }
+  // The daemon signs the attestation using the node's wallet
+  // (`chain.signMessage`). The returned token is self-contained and can
+  // be handed to any outsider for verification.
+  if (req.method === "POST" && path === "/api/attestation/mint") {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    const contextGraphId = parsed.contextGraphId;
+    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const { batchId, merkleRoot, plaintextLeafHash } = parsed;
+    if (!batchId || typeof batchId !== 'string') {
+      return jsonResponse(res, 400, { error: 'batchId is required' });
+    }
+    if (!/^0x[0-9a-fA-F]{64}$/.test(String(merkleRoot ?? ''))) {
+      return jsonResponse(res, 400, { error: 'merkleRoot must be 0x + 64 hex chars' });
+    }
+    if (!/^0x[0-9a-fA-F]{64}$/.test(String(plaintextLeafHash ?? ''))) {
+      return jsonResponse(res, 400, { error: 'plaintextLeafHash must be 0x + 64 hex chars' });
+    }
+
+    const chain: any = (agent as any).chain ?? (agent as any).chainAdapter;
+    const kavAddress = chain?.contracts?.knowledgeAssetsV10?.target?.toString()
+      ?? chain?.kavAddress
+      ?? parsed.kavAddress;
+    const chainId = chain?.chainId ?? parsed.chainId ?? '31337';
+    if (!kavAddress || !/^0x[0-9a-fA-F]{40}$/.test(String(kavAddress))) {
+      return jsonResponse(res, 400, {
+        error: 'cannot determine KAV10 address — pass `kavAddress` explicitly',
+      });
+    }
+
+    // Resolve on-chain contextGraphId.
+    let onChainCgId: string;
+    if (typeof parsed.onChainContextGraphId === 'string' && /^\d+$/.test(parsed.onChainContextGraphId)) {
+      onChainCgId = parsed.onChainContextGraphId;
+    } else {
+      try {
+        const cgList = await (agent as any).listContextGraphs?.();
+        const match = (cgList ?? []).find((cg: any) => cg.id === contextGraphId);
+        onChainCgId = match?.onChainId ?? '0';
+      } catch { onChainCgId = '0'; }
+    }
+
+    const attesterAddress =
+      (agent as any).getAgentAddress?.() ??
+      (agent as any).agentAddress ??
+      requestAgentAddress ??
+      '';
+    if (!/^0x[0-9a-fA-F]{40}$/.test(String(attesterAddress))) {
+      return jsonResponse(res, 500, { error: 'cannot resolve local agent address' });
+    }
+
+    const { mintMemberAttestation } = await import('@origintrail-official/dkg-agent');
+    try {
+      const attestation = await mintMemberAttestation({
+        payload: {
+          chainId: String(typeof chainId === 'string' ? chainId.replace(/^evm:/, '') : chainId),
+          kavAddress: String(kavAddress).toLowerCase(),
+          contextGraphId: onChainCgId,
+          batchId: String(batchId),
+          merkleRoot: String(merkleRoot),
+          plaintextLeafHash: String(plaintextLeafHash),
+          attesterAddress: String(attesterAddress),
+          attestedAt: Math.floor(Date.now() / 1000),
+        },
+        sign: async (digest) => {
+          // Convert (r, vs) → compact 65-byte hex via ethers.Signature.
+          const sigParts = await chain.signMessage(digest);
+          const r = '0x' + Array.from(sigParts.r as Uint8Array).map((b: number) => b.toString(16).padStart(2, '0')).join('');
+          const vs = '0x' + Array.from(sigParts.vs as Uint8Array).map((b: number) => b.toString(16).padStart(2, '0')).join('');
+          const ethersMod = await import('ethers');
+          const sig = ethersMod.Signature.from({ r, yParityAndS: vs });
+          return sig.serialized;
+        },
+      });
+      return jsonResponse(res, 200, { attestation });
+    } catch (err: any) {
+      return jsonResponse(res, 400, { error: err?.message ?? String(err) });
+    }
+  }
+
+  // POST /api/attestation/verify
+  //
+  // OT-RFC-38 LU-9 — outsider-side verification.
+  //
+  // Body: {
+  //   attestation: MemberAttestation,
+  //   candidateLeafHex?: string,        // optional 0x-prefixed bytes for leaf check
+  //   chainCheckMembership?: boolean    // if true, the daemon attempts a chain-side
+  //                                     // membership lookup (Phase B); currently
+  //                                     // always returns "unknown" — surfaces the
+  //                                     // gap honestly.
+  // }
+  if (req.method === "POST" && path === "/api/attestation/verify") {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    if (!parsed.attestation?.payload || !parsed.attestation?.signature) {
+      return jsonResponse(res, 400, { error: 'attestation.payload and attestation.signature are required' });
+    }
+    let candidateLeaf: Uint8Array | undefined;
+    if (parsed.candidateLeafHex && typeof parsed.candidateLeafHex === 'string') {
+      const clean = parsed.candidateLeafHex.replace(/^0x/, '');
+      if (!/^[0-9a-fA-F]+$/.test(clean) || clean.length % 2 !== 0) {
+        return jsonResponse(res, 400, { error: 'candidateLeafHex must be 0x-prefixed even-length hex' });
+      }
+      candidateLeaf = new Uint8Array(clean.length / 2);
+      for (let i = 0; i < candidateLeaf.length; i++) {
+        candidateLeaf[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+      }
+    }
+
+    const { verifyMemberAttestation } = await import('@origintrail-official/dkg-agent');
+    // membershipResolver = a thin stub for Phase A — the chain-side
+    // historical-membership lookup is not in scope (curated CG
+    // allowlists are stored in `_meta` graphs maintained off-chain;
+    // a proper chain-side resolver lands in Phase B with the
+    // membership-at-epoch SPARQL query). Returning undefined here
+    // surfaces `membership: 'unknown'` to the caller.
+    const result = await verifyMemberAttestation({
+      attestation: parsed.attestation,
+      candidateLeaf,
+      membershipResolver: async () => undefined,
+    });
+    return jsonResponse(res, 200, result);
+  }
+
   // POST /api/shared-memory/write
   //
   // Direct SWM write entry point. Writes loose triples to shared memory

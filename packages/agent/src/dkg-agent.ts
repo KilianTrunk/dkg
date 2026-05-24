@@ -8914,11 +8914,40 @@ export class DKGAgent {
 
     // Only host curated CGs. Public CGs already have plaintext SWM
     // distribution and don't need an opaque ciphertext custodian.
+    //
+    // OT-RFC-38 / LU-6 Phase B — three-source curation probe in
+    // cheapest-first order. The local SPARQL probe (the original
+    // gate) only finds the access-policy triple for CGs the local
+    // node CREATED or JOINED with metadata; for a chain-event-
+    // driven host-only core OR a beacon-driven pre-reg auto-host,
+    // no local meta exists and `isPrivateContextGraph` returns
+    // false, stranding the subscription. We supplement it with:
+    //
+    //   (a) `subscribedContextGraphs[contextGraphId].onChainHash` —
+    //       set ONLY by code paths that already proved curation
+    //       (chain-event handler with accessPolicy==1, beacon
+    //       handler with accessPolicy==BEACON_ACCESS_POLICY_CURATED,
+    //       successful curator-side `registerContextGraph` on a
+    //       curated CG). Cheapest of the three.
+    //   (b) `onChainAccessPolicyCache` — populated by the chain-
+    //       event poller; keyed by on-chain numeric id. Falls
+    //       through to the existing per-CG cache for CGs whose
+    //       cleartext is unknown locally.
+    //
+    // Any of the three returning "curated" is sufficient. If all
+    // three return "not curated", we bail (same as before).
     let curated = false;
-    try {
-      curated = await this.isPrivateContextGraph(contextGraphId);
-    } catch {
-      return;
+    const sub = this.subscribedContextGraphs.get(contextGraphId);
+    if (sub?.onChainHash) {
+      curated = true;
+    } else if (sub?.onChainId && this.onChainAccessPolicyCache.get(sub.onChainId) === 1) {
+      curated = true;
+    } else {
+      try {
+        curated = await this.isPrivateContextGraph(contextGraphId);
+      } catch {
+        return;
+      }
     }
     if (!curated) return;
 
@@ -9067,10 +9096,45 @@ export class DKGAgent {
     } catch {
       return;
     }
-    if (!envelope || envelope.type !== GOSSIP_TYPE_WORKSPACE_PUBLISH || envelope.contextGraphId !== contextGraphId) {
+    if (!envelope || envelope.type !== GOSSIP_TYPE_WORKSPACE_PUBLISH) {
       return;
     }
     if (envelope.payload.length === 0) return;
+    // OT-RFC-38 / LU-6 Phase B — `contextGraphId` is the SUBSCRIPTION
+    // key, which can be EITHER cleartext (operator-driven
+    // `/host-mode/subscribe`, or a node that's also a CG member) OR
+    // the wire-id hash (chain-event / beacon driven auto-host on a
+    // host-only core). The envelope itself still carries CLEARTEXT in
+    // `envelope.contextGraphId` (see `publishWorkspaceGossip` comment
+    // about the "envelope stays cleartext" compromise).
+    //
+    // The legacy strict equality check rejected the host-only-core
+    // path 100% of the time, silently dropping every Phase B auto-
+    // hosted envelope. Translate both sides to the wire-form (hash)
+    // and compare there — this accepts the envelope whenever it was
+    // published for the same CG as the local subscription, regardless
+    // of which side speaks cleartext.
+    //
+    // From here on, prefer `envelope.contextGraphId` as the canonical
+    // local key for store + authority lookups: it's the cleartext
+    // form, which the meta-graph + chain-fallback resolvers can
+    // translate to numeric / chain queries natively, and matches
+    // what the member's LU-6 host-catchup request will use to fetch
+    // the ciphertext back. This means a host-only core's per-CG
+    // store entries are keyed by cleartext from the FIRST received
+    // envelope onward — cleaner than maintaining two parallel keys.
+    const envelopeWireId = this.gossipWireIdFor(envelope.contextGraphId);
+    const subscriptionWireId = this.gossipWireIdFor(contextGraphId);
+    if (envelopeWireId !== subscriptionWireId) {
+      return;
+    }
+    const storageCgId = envelope.contextGraphId;
+    // Keep the wire-id → cleartext reverse index in sync so the
+    // chain-fallback resolver and the catchup-request path can
+    // translate either direction without an extra RPC.
+    if (storageCgId !== contextGraphId) {
+      this.recordCgWireId(storageCgId, subscriptionWireId);
+    }
     // Cheap "is this ciphertext" sniff: try to decode as one of the
     // two encrypted carriers; if neither parses, drop early so we
     // don't pay the signature-verify cost on obvious garbage.
@@ -9091,12 +9155,18 @@ export class DKGAgent {
     // curated CG's agent allowlist. Without this, a topic-reachable
     // peer can fill per-CG storage with valid-looking ciphertext
     // and evict legitimate history.
+    //
+    // Use `storageCgId` (cleartext from the envelope) so the
+    // member-side meta-graph + chain-fallback resolvers in
+    // `verifyHostModeEnvelopeAuthority` work on the canonical id
+    // shape. The hash subscription key is internal bookkeeping;
+    // never crosses an external authorization boundary.
     const handler = this.getOrCreateSharedMemoryHandler();
-    const verdict = await handler.verifyHostModeEnvelopeAuthority(data, contextGraphId, fromPeerId);
+    const verdict = await handler.verifyHostModeEnvelopeAuthority(data, storageCgId, fromPeerId);
     if (!verdict.accepted) {
       this.log.warn(
         ctx,
-        `Host-mode SWM envelope rejected for cg=${contextGraphId} from=${fromPeerId}: ${verdict.reason}`,
+        `Host-mode SWM envelope rejected for cg=${storageCgId} from=${fromPeerId}: ${verdict.reason}`,
       );
       return;
     }
@@ -9108,44 +9178,66 @@ export class DKGAgent {
     // freemium-tier per-wallet windows). The rate-limit decision
     // mutates `discoveryRateLimit` ONLY when it admits, so a
     // rejection here does not consume any per-curator budget.
+    //
+    // Step 1: opportunistically flip the store's `registered` flag
+    // BEFORE the rate-limit decision. Without this, an envelope
+    // that arrives on a CG that was registered on chain seconds
+    // earlier (but where the periodic reconciler hasn't swept yet)
+    // would still hit the per-curator window and likely get dropped
+    // — a known race when the curator publishes immediately after
+    // their `registerContextGraph` tx confirms.
+    await this.maybeMarkRegisteredForHostMode(storageCgId);
     let isRegistered = false;
     try {
-      isRegistered = await this.swmHostModeStore.isRegistered(contextGraphId);
+      isRegistered = await this.swmHostModeStore.isRegistered(storageCgId);
     } catch {
-      // Treat unreadable meta as pre-registration — fail closed
-      // toward stricter limits; the next chain-event probe will
-      // flip the flag once the CG registers on chain.
       isRegistered = false;
     }
     if (!isRegistered && this.discoveryRateLimit) {
-      const curatorEoa = this.beaconCuratorByWireId.get(contextGraphId.toLowerCase());
+      // `beaconCuratorByWireId` is keyed by the WIRE id (hash);
+      // `subscriptionWireId` IS the wire id already (we hashed
+      // `contextGraphId` above), so look up directly.
+      const curatorEoa = this.beaconCuratorByWireId.get(subscriptionWireId);
       if (!curatorEoa) {
         // No beacon was ever received for this wire id, yet
-        // ciphertext arrived. This shouldn't happen on a well-
-        // behaved core (auto-subscribe paths always populate
-        // either the chain-event or beacon registries), but we
-        // reject defensively so an attacker can't bypass the
-        // per-wallet window by skipping the beacon altogether.
-        this.log.warn(
+        // ciphertext arrived. Two legitimate windows produce this:
+        //   - The CG is registered on chain but the local node has
+        //     not seen the `ContextGraphCreated` event yet (the
+        //     event poller's lookback hasn't covered the block).
+        //     Mitigated by the `maybeMarkRegisteredForHostMode`
+        //     call above — but that's best-effort and a transient
+        //     RPC failure can leave us here.
+        //   - An attacker is trying to bypass the per-wallet window
+        //     by skipping the beacon broadcast.
+        // We fail OPEN in both cases: the per-CG byte cap +
+        // pre-reg TTL on the SwmHostModeStore is the safety net.
+        // Promoting this from "drop" to "log + admit" trades a
+        // marginal abuse window (an unauthenticated wallet can
+        // burn one per-CG byte cap before the chain reconciler
+        // catches up) for not losing freshly-registered CG
+        // ciphertext during the chain-event race. The chain-
+        // economics gate on actually-registered CGs makes the
+        // exposure bounded.
+        this.log.debug(
           ctx,
-          `Host-mode rejected pre-reg cg=${contextGraphId}: no curator EOA recorded (beacon missing); dropping envelope`,
+          `Host-mode admitting pre-reg cg=${storageCgId} wireId=${subscriptionWireId.slice(0, 12)}… without curator binding (no beacon yet; per-CG byte cap remains the safety net)`,
         );
-        return;
-      }
-      const admission = this.discoveryRateLimit.admit(curatorEoa, data.length);
-      if (!admission.admit) {
-        this.log.warn(
-          ctx,
-          `Host-mode rejected pre-reg envelope cg=${contextGraphId} curator=${curatorEoa}: ${admission.reason}`,
-        );
-        return;
+      } else {
+        const admission = this.discoveryRateLimit.admit(curatorEoa, data.length);
+        if (!admission.admit) {
+          this.log.warn(
+            ctx,
+            `Host-mode rejected pre-reg envelope cg=${storageCgId} curator=${curatorEoa}: ${admission.reason}`,
+          );
+          return;
+        }
       }
     }
 
-    const seqno = await this.swmHostModeStore.append(contextGraphId, data);
+    const seqno = await this.swmHostModeStore.append(storageCgId, data);
     this.log.debug(
       ctx,
-      `Host-mode stored opaque SWM envelope cg=${contextGraphId} seqno=${seqno} bytes=${data.length}`,
+      `Host-mode stored opaque SWM envelope cg=${storageCgId} seqno=${seqno} bytes=${data.length}`,
     );
   }
 
@@ -15657,10 +15749,34 @@ export class DKGAgent {
 
     const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     const cgMetaGraph = contextGraphMetaUri(contextGraphId);
+    // OT-RFC-38 / LU-6 Phase B — the on-chain participant-agent list
+    // is now the authoritative source for the host-mode envelope
+    // authority check on cores (see `resolveOnChainParticipantAgents`
+    // + `chainAgentGateOracle` in the publisher). For cores hosting
+    // CGs they didn't create or join, the local `_meta` allowlist is
+    // unreachable, so the chain list MUST contain every wallet that
+    // will sign envelopes — otherwise valid ciphertext gets rejected
+    // and pre-registration auto-host can't bootstrap.
+    //
+    // Pre-Phase-B, `DKG_PARTICIPANT_AGENT` and `DKG_ALLOWED_AGENT`
+    // were semantically distinct: PARTICIPANT was the chain-side
+    // allowlist (for KA publish + attestation signing), ALLOWED was
+    // the local-side allowlist (for SWM decrypt). Cores never needed
+    // ALLOWED because they didn't subscribe to curated SWM. With
+    // Phase B they do, so the chain list MUST be a SUPERSET of the
+    // local list. We merge `DKG_ALLOWED_AGENT` into the result here.
+    //
+    // Backward-compat: callers that explicitly passed
+    // `participantAgents` on `createContextGraph` keep their values
+    // (those are persisted as PARTICIPANT triples). The merge below
+    // is a UNION so any per-CG explicit list survives and just gets
+    // augmented with whatever local allowlist exists.
     const agentResult = await this.store.query(
       `SELECT ?agent WHERE {
         GRAPH <${cgMetaGraph}> {
-          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent
+          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
+          UNION
+          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent }
         }
       }`,
     );

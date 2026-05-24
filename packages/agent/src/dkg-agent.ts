@@ -1271,6 +1271,29 @@ export class DKGAgent {
               contextGraphSharedMemoryUri,
               chainId: chainIdForHandler,
               kav10Address: kav10AddressForHandler,
+              // Codex PR #608: independently verify the publisher's
+              // `isEncryptedPayload=true` claim against this node's
+              // local view of the CG. `isPrivateContextGraph()` is the
+              // same predicate the SWM data-plane uses to gate
+              // sync / share auth, so the ACK path stays consistent.
+              // Prefer `swmGraphId` (the cleartext form the publisher
+              // ships with curated publishes) over the numeric on-chain
+              // id — the latter only resolves to a local access-policy
+              // record after the CG has been synced from chain events,
+              // which is racy for very fresh CGs. If neither form
+              // resolves to a curated entry, return `false` (handler
+              // treats this as "publisher must use plaintext path").
+              isCgCurated: async (cgId: string, swmGraphId?: string) => {
+                const probes = swmGraphId && swmGraphId !== cgId
+                  ? [swmGraphId, cgId]
+                  : [swmGraphId ?? cgId];
+                for (const probe of probes) {
+                  try {
+                    if (await this.isPrivateContextGraph(probe)) return true;
+                  } catch { /* probe next form */ }
+                }
+                return false;
+              },
               isSignerRegistered: async () => {
                 const isOperationalWalletRegistered = this.chain.isOperationalWalletRegistered;
                 if (typeof isOperationalWalletRegistered !== 'function') return false;
@@ -7274,15 +7297,24 @@ export class DKGAgent {
     const stateKey = swmSenderStateKey(contextGraphId, subGraphName, senderAddress);
     const state = this.swmSenderKeySendStates.get(stateKey);
     if (!state) {
-      this.log.warn(
-        ctx,
+      // Codex PR #608: fail closed. The pre-fix behaviour returned
+      // `undefined` here, which silently sent the publisher into its
+      // PLAINTEXT-inline fallback for a CURATED CG — the exact data
+      // leak this resolver is meant to prevent. Even when cores
+      // would (today) decline plaintext for curated CGs with
+      // NO_DATA_IN_SWM, the ack handler still RECEIVES the plaintext
+      // in the PublishIntent's `stagingQuads`, and any core upgraded
+      // to handle plaintext-inline (or any malicious core) would
+      // hold the cleartext payload of an invite-only graph. Throw
+      // so the caller surfaces an actionable error to the user
+      // instead of leaking.
+      throw new Error(
         `LU-5: curated CG ${contextGraphId} (sender=${senderAddress}${subGraphName ? `/${subGraphName}` : ''}) ` +
-        `has no swm-sender-key send state — cannot encrypt inline payload. ` +
-        `The publisher will fall through to its default path; cores without curated SWM subscriptions ` +
-        `(pre-LU-6) will decline with NO_DATA_IN_SWM. Establish the send state by writing at least one ` +
-        `SWM share to this CG before publishing to VM.`,
+        `has no swm-sender-key send state — refusing to publish to Verified Memory because falling back ` +
+        `to the plaintext-inline path would expose curated CG payload to cores. ` +
+        `Establish the send state by writing at least one SWM share to this CG (this gossips a ` +
+        `sender-key bootstrap to current members) before retrying the publish.`,
       );
-      return undefined;
     }
 
     const chainKey = state.chainKey;
@@ -11860,24 +11892,45 @@ export class DKGAgent {
         }
         return sendResult.response;
       },
-      // TODO(SPEC_CG_MEMORY_MODEL §4.3 follow-up): fan out only to
-      // connected peers that are sharding-table-eligible cores. Doing
-      // that needs a peerId→identityId mapping (via on-chain Profile
-      // scan or a libp2p node-info exchange) we don't have a cheap
-      // path for yet. For now we send to all connected peers; the
-      // downstream `probeShardingTableMembership` filter on each
-      // received approval still ensures only sharding-table-member
-      // ACKs count toward quorum, so the worst case is wasted bytes
-      // on non-eligible peers (proposal payload is the only thing
-      // leaked: contextGraphId / verifiedMemoryId / batchId are
-      // already discoverable on-chain once the CG is registered; the
-      // residual concern is root-entity URIs on curated CGs). The
-      // round-5 attempt to use the CG agent-allowlist conflated
-      // agent membership with hosting membership and broke verify
-      // entirely for curated CGs (cores aren't agents in the
-      // allowlist) — revert kept here as Codex round-5 follow-up.
-      getParticipantPeers: () => {
-        return this.node.libp2p.getPeers().map(p => p.toString()).filter(id => id !== this.peerId);
+      // Codex PR #608: previously fanned out to ALL connected libp2p
+      // peers, which broadcast `rootEntities` (subject URIs of the
+      // batch) on EVERY verify proposal — a privacy regression for
+      // invite-only CGs where those URIs are part of the curated
+      // payload. The fix is two-tier:
+      //   1. Curated CGs (peer-allowlist OR agent-gated): only fan out
+      //      to peers in `cgMemberEnumerator.enumerate(cg).members`,
+      //      which mirrors the same authority the SWM data-plane uses.
+      //      For agent-gated CGs without a peer allowlist, that returns
+      //      `{ source: 'none', members: [] }` (fail-closed) — verify
+      //      then has no remote recipients and `allowPartial: true` lets
+      //      the proposer collect its own self-attestation as the only
+      //      vote, which is correct: only members can verify a curated
+      //      batch's plaintext root anyway.
+      //   2. Public CGs: fall back to the gossip-eligible member set
+      //      (live topic subscribers), which still narrows the broadcast
+      //      versus "every connected libp2p peer".
+      // Downstream `probeShardingTableMembership` continues to filter
+      // approvals by sharding-table membership before they count toward
+      // quorum, so this only changes WHO RECEIVES the proposal, not
+      // who can vote.
+      getParticipantPeers: async (contextGraphId: string) => {
+        try {
+          const enumeration = await this.getOrCreateCGMemberEnumerator().enumerate(contextGraphId);
+          return enumeration.members.filter((id) => id !== this.peerId);
+        } catch (err) {
+          // Degrade gracefully: if enumeration fails (e.g. SPARQL
+          // backend hiccup) we don't want to silently broadcast to
+          // every connected peer (the leak we just plugged). Log and
+          // return empty so `allowPartial: true` lets the proposer
+          // proceed with just its self-attestation rather than
+          // leaking via a fail-open fallback.
+          this.log.warn(
+            ctx,
+            `[verify] CG-member enumeration failed for ${contextGraphId} — broadcasting to no remote peers ` +
+            `(prevents fail-open leak of rootEntities). Error: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return [];
+        }
       },
       log: (msg: string) => this.log.info(ctx, msg),
     });

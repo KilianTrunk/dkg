@@ -75,6 +75,29 @@ export interface StorageACKHandlerConfig {
    * registered on-chain at signing time.
    */
   onSignerRegistrationLookupFailed?: (err: unknown) => void | Promise<void>;
+  /**
+   * Codex PR #608: independent curation oracle. The handler MUST verify a
+   * publisher's `isEncryptedPayload=true` claim against the CG's real
+   * access policy before signing — without this, a malicious publisher
+   * could set the encrypted bit on a PUBLIC CG and have the core sign an
+   * ACK over whatever `merkleRoot`/`kaCount`/`merkleLeafCount` it claimed
+   * (cores skip plaintext verification on the encrypted path because they
+   * can't decrypt). Return `true` only when the CG is curated (private /
+   * invite-only / allowlisted). Return `false` for public CGs and `null`
+   * for "cannot determine locally" — the handler treats both as
+   * "publisher must use the non-encrypted path".
+   *
+   * When omitted, the handler defaults to fail-closed: encrypted-payload
+   * publishes are rejected wholesale (operators wiring a core without
+   * curated-CG support shouldn't be tricked into signing for them).
+   *
+   * Inputs:
+   *   - `cgId`: numeric on-chain id used in the V10 ACK digest
+   *   - `swmGraphId`: cleartext CG id (may equal `cgId`); the publisher
+   *     sends this for curated publishes so the core can resolve the
+   *     local access-policy record without a chain RPC.
+   */
+  isCgCurated?: (cgId: string, swmGraphId?: string) => Promise<boolean | null>;
 }
 
 /**
@@ -172,6 +195,32 @@ export class StorageACKHandler {
     // verify after the fact. Cores DO verify `stagingQuads.length` matches
     // `publicByteSize` so a misreported size can't slip past pricing.
     if (intent.isEncryptedPayload === true) {
+      // Codex PR #608: independently verify the CG is actually curated
+      // before honoring the encrypted-payload claim. Without this, a
+      // publisher could set `isEncryptedPayload=true` on a PUBLIC CG
+      // and bypass every root / KA / merkleLeafCount verification path
+      // below (the handler signs whatever the publisher claimed because
+      // cores can't decrypt to recompute). Fail closed when no oracle
+      // is wired or curation cannot be determined.
+      const swmGraphIdForCuration = intent.swmGraphId && intent.swmGraphId.length > 0
+        ? intent.swmGraphId
+        : undefined;
+      if (!this.config.isCgCurated) {
+        throw new Error(
+          `PublishIntent.isEncryptedPayload=true rejected: this core has no curation oracle wired, ` +
+          `so it cannot verify the CG is curated. Cores must independently confirm the access policy ` +
+          `before signing an opaque (un-verifiable) ACK payload.`,
+        );
+      }
+      const curationVerdict = await this.config.isCgCurated(cgId, swmGraphIdForCuration);
+      if (curationVerdict !== true) {
+        throw new Error(
+          `PublishIntent.isEncryptedPayload=true rejected for cg=${cgId}${swmGraphIdForCuration ? ` (swmGraph=${swmGraphIdForCuration})` : ''}: ` +
+          `local curation oracle reports ${curationVerdict === false ? 'PUBLIC (not curated)' : 'UNKNOWN'}. ` +
+          `The encrypted-payload ACK path is restricted to verifiably-curated CGs. Resubmit using the ` +
+          `plaintext-inline path so root + KA count + merkle leaf count can be verified.`,
+        );
+      }
       if (!intent.stagingQuads || intent.stagingQuads.length === 0) {
         throw new Error(
           'PublishIntent.isEncryptedPayload=true but stagingQuads is empty — ' +
@@ -216,9 +265,31 @@ export class StorageACKHandler {
         object: ciphertextLiteral,
         graph: stagingGraphUri,
       }]);
+      // Codex PR #608: the previous 10-minute timer ran from the moment
+      // we persisted ciphertext — well BEFORE the publish outcome was
+      // known. Under realistic chain latency (mainnet block confirmation
+      // can exceed 10 min during congestion; testnets can stall longer)
+      // the timer would unconditionally drop the ciphertext before the
+      // V10 publish landed, breaking the "persist-before-sign" contract
+      // and starving any LU-7 catch-up requests that arrived after the
+      // drop. We extend the reap window to 60 minutes as a conservative
+      // upper-bound on chain confirmation, knowing that:
+      //   (1) The LU-6 `SwmHostModeStore` is the DURABLE copy for
+      //       opaque ciphertext on participating cores — members catch
+      //       up from there once the CG is on-chain, so this staging
+      //       graph is just bridge storage between ACK-sign and the
+      //       first successful catch-up; 60 min comfortably covers a
+      //       slow chain plus one member-catchup round-trip.
+      //   (2) The 4MB-per-payload cap + per-CG quotas already bound
+      //       staging growth, so extending the timer doesn't open a
+      //       new resource exhaustion vector.
+      // TODO: replace the timer with a publish-finalization hook so
+      // cleanup runs exactly when the V10 tx is confirmed (or
+      // permanently failed). The 60-min reap is a safety net, not the
+      // primary cleanup path.
       setTimeout(async () => {
         try { await this.store.dropGraph(stagingGraphUri); } catch { /* ignore */ }
-      }, 10 * 60 * 1000);
+      }, 60 * 60 * 1000);
 
       // Cores can't enumerate KAs from ciphertext — use the publisher's
       // claimed counts for the V10 digest. Validate they're positive so

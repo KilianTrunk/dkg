@@ -61,6 +61,11 @@ describe('StorageACKHandler', () => {
         `did:dkg:context-graph:${cgId}/_shared_memory`,
       chainId: TEST_CHAIN_ID,
       kav10Address: TEST_KAV10_ADDR,
+      // Codex PR #608: default to "all test CGs are curated" so the
+      // pre-existing `isEncryptedPayload` test cases keep exercising
+      // the happy path; tests that need to assert the bypass-rejection
+      // semantics override this explicitly.
+      isCgCurated: async () => true,
       ...configOverrides,
     };
 
@@ -342,6 +347,82 @@ describe('StorageACKHandler', () => {
       });
       await expect(handler.handler(noLeafCountIntent, fakePeerId)).rejects.toThrow(
         /encrypted PublishIntent.merkleLeafCount must be a positive integer/,
+      );
+    });
+
+    it('Codex PR #608: rejects isEncryptedPayload=true when the local curation oracle says the CG is PUBLIC', async () => {
+      // The bypass we're plugging: a malicious publisher sets
+      // `isEncryptedPayload=true` on a CG that is actually public so
+      // the core skips merkle / KA / leaf verification and signs over
+      // arbitrary publisher-supplied bytes. The oracle reports
+      // "not curated" → handler MUST refuse before signing.
+      const handler = await createHandler([], {
+        isCgCurated: async () => false,
+      });
+      const intent = encodePublishIntent({
+        merkleRoot: claimedRoot,
+        contextGraphId,
+        publisherPeerId: 'malicious-publisher',
+        publicByteSize: ciphertextBytes.length,
+        isPrivate: true,
+        kaCount: claimedKaCount,
+        rootEntities: [],
+        stagingQuads: ciphertextBytes,
+        merkleLeafCount: claimedLeafCount,
+        isEncryptedPayload: true,
+      });
+      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+        /isEncryptedPayload=true rejected.*PUBLIC \(not curated\)/,
+      );
+    });
+
+    it('Codex PR #608: rejects isEncryptedPayload=true when the oracle returns null (curation unknown)', async () => {
+      // Fail-closed: if the core can't determine whether the CG is
+      // curated (e.g. CG metadata not yet synced from chain), it MUST
+      // NOT honour the encrypted-payload claim. The publisher should
+      // retry via the plaintext-inline path (which IS verifiable).
+      const handler = await createHandler([], {
+        isCgCurated: async () => null,
+      });
+      const intent = encodePublishIntent({
+        merkleRoot: claimedRoot,
+        contextGraphId,
+        publisherPeerId: 'curator-edge',
+        publicByteSize: ciphertextBytes.length,
+        isPrivate: true,
+        kaCount: claimedKaCount,
+        rootEntities: [],
+        stagingQuads: ciphertextBytes,
+        merkleLeafCount: claimedLeafCount,
+        isEncryptedPayload: true,
+      });
+      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+        /isEncryptedPayload=true rejected.*UNKNOWN/,
+      );
+    });
+
+    it('Codex PR #608: rejects isEncryptedPayload=true when no curation oracle is wired (defensive default)', async () => {
+      // Operators wiring a core without curated-CG support (e.g. only
+      // care about public CGs) shouldn't be silently tricked into
+      // signing for opaque blobs. With no oracle, every encrypted-
+      // payload claim is refused.
+      const handler = await createHandler([], {
+        isCgCurated: undefined,
+      });
+      const intent = encodePublishIntent({
+        merkleRoot: claimedRoot,
+        contextGraphId,
+        publisherPeerId: 'curator-edge',
+        publicByteSize: ciphertextBytes.length,
+        isPrivate: true,
+        kaCount: claimedKaCount,
+        rootEntities: [],
+        stagingQuads: ciphertextBytes,
+        merkleLeafCount: claimedLeafCount,
+        isEncryptedPayload: true,
+      });
+      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+        /no curation oracle wired/,
       );
     });
 

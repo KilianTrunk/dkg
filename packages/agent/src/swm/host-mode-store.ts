@@ -260,12 +260,19 @@ export class SwmHostModeStore {
     let totalBytes = 0;
     let totalEntries = 0;
     const perCg: Record<string, { entries: number; bytes: number; registered: boolean }> = {};
+    // Codex PR #610 R4: derive `cgCount` from CGs that still
+    // have ciphertext (log file present + at least 1 entry),
+    // NOT from the count of meta files. `markRegistered()`
+    // creates a meta file even for CGs that never receive an
+    // envelope, and a prune-to-empty can leave the .meta
+    // behind too — both would otherwise inflate the visible
+    // hosted-CG count.
+    let cgsWithEntries = 0;
     for (const cgInfo of cgs) {
       const filePath = this.logPath(cgInfo.contextGraphId);
       if (!(await fileExists(filePath))) continue;
       const stat = await fs.stat(filePath);
       const bytes = stat.size;
-      totalBytes += bytes;
       const buf = await fs.readFile(filePath);
       let offset = 0;
       let entries = 0;
@@ -276,11 +283,14 @@ export class SwmHostModeStore {
         entries += 1;
         offset = end;
       }
+      if (entries === 0) continue;
+      totalBytes += bytes;
       totalEntries += entries;
+      cgsWithEntries += 1;
       const meta = await this.loadMeta(cgInfo.contextGraphId).catch(() => null);
       perCg[cgInfo.contextGraphId] = { entries, bytes, registered: meta?.registered ?? false };
     }
-    return { cgCount: cgs.length, totalBytes, totalEntries, perCg };
+    return { cgCount: cgsWithEntries, totalBytes, totalEntries, perCg };
   }
 
   /** Test-only: returns the persisted seqno cursor for a CG, or 0 if unknown. */

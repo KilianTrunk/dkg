@@ -202,4 +202,29 @@ describe('SwmHostModeStore', () => {
 
     expect(stats.perCg['cg/never-seen']).toBeUndefined();
   });
+
+  it('cgCount only counts CGs that still have ciphertext entries (Codex PR #610 R4)', async () => {
+    // markRegistered() creates a meta file even when the CG has
+    // received zero envelopes. A prune-to-empty can also leave the
+    // .meta behind. stats().cgCount must reflect "CGs with hosted
+    // ciphertext", not "CGs the store has any record of", so
+    // operators don't see inflated cg counts.
+    const store = new SwmHostModeStore({
+      dataDir: dir,
+      unregisteredLimits: { perCgByteCap: 1024 * 1024, ttlMs: 60_000 },
+      registeredLimits: { perCgByteCap: 1024 * 1024, ttlMs: 60_000 },
+    });
+    // Meta-only CG: registered up-front, never receives an envelope.
+    await store.markRegistered('cg/meta-only');
+    // Real CG: has hosted ciphertext.
+    await store.append('cg/real-1', new Uint8Array([1, 2, 3]));
+    await store.append('cg/real-2', new Uint8Array([4, 5, 6]));
+
+    const stats = await store.stats();
+    expect(stats.cgCount).toBe(2);
+    expect(stats.totalEntries).toBe(2);
+    expect(stats.perCg['cg/meta-only']).toBeUndefined();
+    expect(stats.perCg['cg/real-1']).toBeDefined();
+    expect(stats.perCg['cg/real-2']).toBeDefined();
+  });
 });

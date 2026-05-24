@@ -798,25 +798,35 @@ WHERE {
     const totalInserted = standardInserted + hostCatchupAppliedTotal;
     const totalDurable = perCgLegs.reduce((sum, c) => sum + c.durableInsertedTriples, 0);
 
-    // Flatten per-peer into a backward-compatible `results` array
-    // for callers that only care about the aggregate peer view.
-    // The richer per-CG / per-peer breakdown lives in `perContextGraph`.
+    // Flatten per-peer into a `results` array for callers that
+    // only care about the aggregate peer view. The richer per-CG
+    // breakdown lives in `perContextGraph`.
+    //
+    // Codex PR #610 R4: preserve `swmError` and `durableError` as
+    // SEPARATE fields (legacy shape) instead of collapsing them
+    // into a single `errors[]` array. The two errors come from
+    // distinct legs of the catchup pipeline (live sync vs durable
+    // VM reconstruction) and operators / dashboards have always
+    // distinguished them. The first non-empty value per peer wins
+    // (multiple CGs against the same peer are rare and the leg
+    // identity is what matters, not which CG produced the
+    // specific message).
     const perPeerAggregate = new Map<string, {
       peerId: string;
       insertedTriples: number;
       durableInsertedTriples: number;
-      errors?: string[];
+      swmError?: string;
+      durableError?: string;
+      otherErrors?: string[];
     }>();
     for (const cg of perCgLegs) {
       for (const p of cg.perPeer) {
         const entry = perPeerAggregate.get(p.peerId) ?? { peerId: p.peerId, insertedTriples: 0, durableInsertedTriples: 0 };
         entry.insertedTriples += p.insertedTriples;
         entry.durableInsertedTriples += p.durableInsertedTriples;
-        const errs: string[] = [];
-        if (p.swmError) errs.push(p.swmError);
-        if (p.durableError) errs.push(p.durableError);
-        if (p.error) errs.push(p.error);
-        if (errs.length > 0) entry.errors = [...(entry.errors ?? []), ...errs];
+        if (p.swmError && !entry.swmError) entry.swmError = p.swmError;
+        if (p.durableError && !entry.durableError) entry.durableError = p.durableError;
+        if (p.error) entry.otherErrors = [...(entry.otherErrors ?? []), p.error];
         perPeerAggregate.set(p.peerId, entry);
       }
     }
@@ -824,7 +834,9 @@ WHERE {
       peerId: r.peerId,
       insertedTriples: r.insertedTriples,
       durableInsertedTriples: r.durableInsertedTriples,
-      ...(r.errors && r.errors.length > 0 ? { errors: r.errors } : {}),
+      ...(r.swmError ? { swmError: r.swmError } : {}),
+      ...(r.durableError ? { durableError: r.durableError } : {}),
+      ...(r.otherErrors && r.otherErrors.length > 0 ? { errors: r.otherErrors } : {}),
     }));
 
     return jsonResponse(res, 200, {
@@ -1648,6 +1660,46 @@ WHERE {
       details: { source: "api", publishContextGraphId, subGraphName },
     });
     try {
+      // OT-RFC-38 LU-6 — transparent register-then-publish.
+      //
+      // Project creation is local-only by design (no chain
+      // interaction, no gas) so that SWM works immediately. The
+      // first time the user opts into VM publish IS the implicit
+      // moment they accept the chain cost — we auto-register
+      // here so the user experiences a single action (and a
+      // single spinner) rather than having to remember a
+      // separate `/api/context-graph/register` call first.
+      //
+      // Idempotent on the agent side: `registerContextGraph`
+      // short-circuits when an on-chain id already exists, so
+      // racing publishes / re-publishes don't double-mint.
+      //
+      // If the user already explicitly registered (e.g. from
+      // project Settings to upgrade SWM host-mode quotas), this
+      // is a cheap no-op probe.
+      try {
+        const existingOnChainId = await agent.getContextGraphOnChainId(contextGraphId);
+        if (!existingOnChainId) {
+          await tracker.trackPhase(ctx, "register-on-chain", () =>
+            agent.registerContextGraph(contextGraphId, {
+              ...(resolvedAuthorAgentAddress != null
+                ? { callerAgentAddress: resolvedAuthorAgentAddress }
+                : {}),
+            }),
+          );
+        }
+      } catch (regErr: any) {
+        // Surface registration failures as a 400 with a clear
+        // breadcrumb so the UI can show the actionable message
+        // (insufficient TRAC, missing chain signer, etc.)
+        // instead of a generic 500 from the publish leg later.
+        tracker.fail(ctx, regErr);
+        return jsonResponse(res, 400, {
+          error:
+            `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
+            `${regErr?.message ?? String(regErr)}`,
+        });
+      }
       const sel: "all" | { rootEntities: string[] } = Array.isArray(selection)
         ? { rootEntities: selection }
         : selection || "all";

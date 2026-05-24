@@ -8677,8 +8677,8 @@ export class DKGAgent {
     const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
     this.swmHostModeSubscribed.add(contextGraphId);
     this.gossip.subscribe(swmTopic);
-    const handler = (_topic: string, data: Uint8Array, _from: string) => {
-      this.ingestSwmHostModeEnvelope(contextGraphId, data).catch((err: unknown) => {
+    const handler = (_topic: string, data: Uint8Array, from: string) => {
+      this.ingestSwmHostModeEnvelope(contextGraphId, data, from).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         this.log.warn(
           createOperationContext('system'),
@@ -8756,25 +8756,33 @@ export class DKGAgent {
 
   /**
    * Tap registered with `gossip.onMessage` for host-mode topics.
-   * Performs the absolute minimum validation needed to drop
-   * obvious garbage (non-envelope bytes, public/plaintext payloads,
-   * cross-CG spoofs) and appends everything else opaquely to
-   * {@link SwmHostModeStore} for later catchup serving.
    *
-   * Designed to be CHEAP: no signature crypto, no decrypt attempt.
-   * Members re-verify the envelope signature when they pull the
-   * ciphertext back via host-catchup and feed it through
-   * `SharedMemoryHandler.handle()`.
+   * Two-phase validation before opaque storage:
+   *   1. Cheap structural sniff — drop non-envelopes, cross-CG
+   *      spoofs, plaintext bursts (curated SWM is always
+   *      ciphertext-wrapped).
+   *   2. Codex PR #610 R4: cryptographic authority check via
+   *      `SharedMemoryHandler.verifyHostModeEnvelopeAuthority` —
+   *      verify the envelope signature and confirm the recovered
+   *      signer is in the CG's agent allowlist (and `from` is in
+   *      the peer allowlist if one is set). Without this, an
+   *      unauthorized peer could fill the per-CG FIFO cap with
+   *      structurally-valid junk and evict legitimate ciphertext
+   *      history once eviction kicked in.
+   *
+   * We do NOT attempt decryption — the chain key lives on
+   * members, not on the hosting core. Members re-verify the
+   * envelope signature on replay too via
+   * `SharedMemoryHandler.handle({ trustedReplay: true })`.
    */
-  private async ingestSwmHostModeEnvelope(contextGraphId: string, data: Uint8Array): Promise<void> {
+  private async ingestSwmHostModeEnvelope(
+    contextGraphId: string,
+    data: Uint8Array,
+    fromPeerId: string,
+  ): Promise<void> {
     if (!this.swmHostModeStore) return;
     if (data.length === 0) return;
-    // Light structural check: the bytes MUST decode as a gossip
-    // envelope whose payload references this CG and carries an
-    // encrypted SWM marker (either `senderKeyMessage` or
-    // `encryptedPayload`). Plaintext public-CG bytes are dropped
-    // (curated CGs only) — that filters bursts from cross-talk
-    // when a topic is re-used.
+    const ctx = createOperationContext('share');
     let envelope: GossipEnvelopeMsg | undefined;
     try {
       envelope = decodeGossipEnvelope(data);
@@ -8786,9 +8794,8 @@ export class DKGAgent {
     }
     if (envelope.payload.length === 0) return;
     // Cheap "is this ciphertext" sniff: try to decode as one of the
-    // two encrypted carriers; if neither parses, drop. We do NOT
-    // attempt decryption — the chain key lives on members, not on
-    // the hosting core.
+    // two encrypted carriers; if neither parses, drop early so we
+    // don't pay the signature-verify cost on obvious garbage.
     let isCiphertext = false;
     try {
       const enc = decodeEncryptedWorkspacePayload(envelope.payload);
@@ -8802,9 +8809,23 @@ export class DKGAgent {
     }
     if (!isCiphertext) return;
 
+    // Authority check: verify the envelope signature against the
+    // curated CG's agent allowlist. Without this, a topic-reachable
+    // peer can fill per-CG storage with valid-looking ciphertext
+    // and evict legitimate history.
+    const handler = this.getOrCreateSharedMemoryHandler();
+    const verdict = await handler.verifyHostModeEnvelopeAuthority(data, contextGraphId, fromPeerId);
+    if (!verdict.accepted) {
+      this.log.warn(
+        ctx,
+        `Host-mode SWM envelope rejected for cg=${contextGraphId} from=${fromPeerId}: ${verdict.reason}`,
+      );
+      return;
+    }
+
     const seqno = await this.swmHostModeStore.append(contextGraphId, data);
     this.log.debug(
-      createOperationContext('share'),
+      ctx,
       `Host-mode stored opaque SWM envelope cg=${contextGraphId} seqno=${seqno} bytes=${data.length}`,
     );
   }
@@ -9110,23 +9131,41 @@ export class DKGAgent {
    * Phase A where sharding-table auto-discovery is approximated by
    * an explicit operator designation per core. Idempotent.
    *
-   * Returns `{ subscribed, alreadySubscribed, hostingEnabled }`:
+   * Returns `{ subscribed, alreadySubscribed, hostingEnabled, memberMode }`:
    *  - `subscribed`: true if the call actually wired the topic listener
    *    on this invocation (false on re-entry when already subscribed).
    *  - `alreadySubscribed`: mirror of `subscribed === false`.
    *  - `hostingEnabled`: whether the host-mode store is initialized
    *    on this node (false on edges or when explicitly disabled).
+   *  - `memberMode`: true if this CG is already in member-mode on
+   *    this node — host-mode subscription is refused because the
+   *    two would race / duplicate every apply (Codex PR #610 R4).
    */
   async enableSwmHostModeFor(contextGraphId: string): Promise<{
     subscribed: boolean;
     alreadySubscribed: boolean;
     hostingEnabled: boolean;
+    memberMode?: boolean;
   }> {
     if (!this.swmHostModeStore) {
       return { subscribed: false, alreadySubscribed: false, hostingEnabled: false };
     }
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return { subscribed: false, alreadySubscribed: false, hostingEnabled: true };
+    }
+    // Codex PR #610 R4: refuse host-mode subscribe when the same
+    // CG is already in member-mode on this node. Wiring both
+    // handlers would cause every gossip message to be (a)
+    // decrypted-and-applied via the member handler AND (b)
+    // opaquely appended via the host handler. The reconciler
+    // path already refuses this; the operator-driven entrypoint
+    // must do the same to keep the invariant globally true.
+    if (this.sharedMemoryGossipRegistered.has(contextGraphId)) {
+      this.log.info(
+        createOperationContext('system'),
+        `SWM host-mode subscribe refused for "${contextGraphId}": local node is already a CG member (member-mode handler is authoritative)`,
+      );
+      return { subscribed: false, alreadySubscribed: false, hostingEnabled: true, memberMode: true };
     }
     if (this.swmHostModeSubscribed.has(contextGraphId)) {
       // Idempotent re-entry: even when the subscription is already
@@ -10396,6 +10435,18 @@ export class DKGAgent {
     publishPolicy?: number;
     callerAgentAddress?: string;
     publishAuthorityAccountId?: bigint;
+    /**
+     * When `true`, refuse curated EOA-mode registration if the
+     * calling agent's address differs from the configured chain
+     * signer (the pre-existing strict invariant). When `false`
+     * (default), the chain signer is auto-promoted to be the
+     * on-chain governance owner and the calling agent is recorded
+     * as a participantAgent so curated-SWM writes still pass the
+     * agent gate. See the inline rationale in the implementation
+     * for the trade-offs (local DKG_CURATOR keeps the calling
+     * agent; on-chain governance NFT goes to the chain signer).
+     */
+    strictEoaCuratorMatch?: boolean;
   }): Promise<{ onChainId: string; txHash?: string }> {
     const ctx = createOperationContext('system');
 
@@ -10495,7 +10546,7 @@ export class DKGAgent {
         `Curator=${owner}, caller=${`did:dkg:agent:${opts?.callerAgentAddress ?? this.defaultAgentAddress ?? this.peerId}`}`,
       );
     }
-    const ownerAddress = ethers.getAddress(owner.replace(/^did:dkg:agent:/, ''));
+    let ownerAddress = ethers.getAddress(owner.replace(/^did:dkg:agent:/, ''));
     // Check if already registered
     const cgMetaGraph = contextGraphMetaUri(id);
     const contextGraphUri = `did:dkg:context-graph:${id}`;
@@ -10621,7 +10672,7 @@ export class DKGAgent {
     // LU-2: edge-owned CG pattern — no `participantIdentityIds`/
     // `requiredSignatures` derivation. Edge agents that lack an
     // on-chain identity can still register CGs.
-    const participantAgents = await this.getContextGraphParticipantAgentAddresses(id);
+    let participantAgents = await this.getContextGraphParticipantAgentAddresses(id);
     if (participantAgents.length > MAX_CONTEXT_GRAPH_PARTICIPANT_AGENTS) {
       throw new Error(
         `Context graph "${id}" cannot be registered on-chain: participantAgents cannot exceed ` +
@@ -10682,18 +10733,109 @@ export class DKGAgent {
       }
       // Uniform strict check across EOA and PCA modes:
       //  - EOA: publishAuthority is the chain signer; local curator
-      //    must equal the chain signer.
+      //    must equal the chain signer — UNLESS the EOA mismatch
+      //    auto-promotion below relaxes it.
       //  - PCA: publishAuthority is ownerOf(pcaAccountId); local curator
       //    must equal the PCA owner. Registered agents are publish-time
       //    delegates only — publish-time authorization lives on chain in
       //    `ContextGraphs.isAuthorizedPublisher`.
       if (publishAuthority && ownerAddress.toLowerCase() !== publishAuthority.toLowerCase()) {
-        const reason = isPcaCurated
-          ? `PCA account ${publishAuthorityAccountId} is owned by ${publishAuthority}; only the PCA owner can register, registered agents may only publish.`
-          : `the configured chain signer is ${publishAuthority}. Per-agent chain signers are not supported yet.`;
-        throw new Error(
-          `Context graph "${id}" cannot be registered as curated by local curator ${ownerAddress} because ${reason}`,
+        if (isPcaCurated) {
+          // PCA mode stays strict: `ContextGraphs.createContextGraph`
+          // mints the governance NFT to msg.sender (= chain signer),
+          // and a mismatch would silently produce a CG whose
+          // on-chain owner is NOT the advertised PCA owner.
+          // Relaxing this would let users create CGs they cannot
+          // govern. The PCA owner must control the chain signer.
+          throw new Error(
+            `Context graph "${id}" cannot be registered as curated by local curator ${ownerAddress} because ` +
+            `PCA account ${publishAuthorityAccountId} is owned by ${publishAuthority}; only the PCA owner can register, registered agents may only publish.`,
+          );
+        }
+        if (opts?.strictEoaCuratorMatch) {
+          // Opt-in strict mode for callers that explicitly want
+          // the legacy "curator agent MUST equal chain signer"
+          // invariant (e.g. multi-tenant cores where the operator
+          // does NOT want every agent's CG governance to default
+          // to the node's chain signer).
+          throw new Error(
+            `Context graph "${id}" cannot be registered as curated by local curator ${ownerAddress} because ` +
+            `the configured chain signer is ${publishAuthority} and strictEoaCuratorMatch was requested. ` +
+            `Either retry with strictEoaCuratorMatch=false to auto-promote the chain signer as on-chain owner, ` +
+            `or register from an agent whose address matches ${publishAuthority}.`,
+          );
+        }
+        // Auto-promote chain signer to on-chain governance owner.
+        //
+        // Why this is safe and what it means:
+        //
+        //  * Structural: `ContextGraphs.createContextGraph` mints
+        //    the governance NFT to `msg.sender`, which is always
+        //    the chain signer. Previously we refused to register
+        //    when `local curator agent ≠ chain signer` to avoid
+        //    the silent divergence "local says agent owns it /
+        //    chain says signer owns it". That refusal blocked a
+        //    legitimate single-operator flow ("I am the human
+        //    behind this core; I use an agent wallet for my UI
+        //    interactions; the node's chain signer is also mine")
+        //    with a hard error and no automatic resolution.
+        //
+        //  * The relaxation: register the CG with chain signer
+        //    as the on-chain owner/publishAuthority (matches
+        //    msg.sender, no divergence), AND record the calling
+        //    agent as a `DKG_PARTICIPANT_AGENT` so the curated-
+        //    SWM agent gate (`getContextGraphAgentGateAddresses`
+        //    in SharedMemoryHandler) accepts their writes.
+        //    LU-5's no-attribution VM publish (attributionId=0)
+        //    continues to work because it never depends on the
+        //    publisher being the on-chain `publishAuthority` —
+        //    only ACK quorum over the agent signature.
+        //
+        //  * Local UI consistency: the local `DKG_CURATOR` triple
+        //    keeps its existing value (the calling agent). UIs
+        //    that say "your CG" continue to say that. The new
+        //    `DKG_CHAIN_OWNER` triple records who actually holds
+        //    the governance NFT so introspection / dashboards
+        //    can surface the asymmetry.
+        //
+        //  * The trade-off: future on-chain governance ops
+        //    (change publishPolicy, transfer the NFT, etc.)
+        //    require the chain signer, not the calling agent.
+        //    For single-operator setups this is the same human;
+        //    for true multi-tenant cores, operators should set
+        //    `strictEoaCuratorMatch: true` or use PCA mode.
+        this.log.info(
+          ctx,
+          `Curated CG "${id}": calling agent ${ownerAddress} ≠ chain signer ${publishAuthority}. ` +
+          `Auto-promoting chain signer as on-chain governance owner and adding the calling agent as a participantAgent. ` +
+          `Local DKG_CURATOR stays ${ownerAddress}; on-chain NFT mints to ${publishAuthority}. ` +
+          `Pass { strictEoaCuratorMatch: true } to suppress this relaxation.`,
         );
+        // Persist the calling agent as a local participant agent
+        // so SWM writes pass the agent gate. Idempotent — RDF
+        // triples deduplicate.
+        await this.store.insert([
+          {
+            subject: contextGraphUri,
+            predicate: DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT,
+            object: `"${ethers.getAddress(ownerAddress)}"`,
+            graph: cgMetaGraph,
+          },
+        ]);
+        // Re-fetch participantAgents so the on-chain
+        // registration also lists the calling agent (matches
+        // what the local agent gate now enforces).
+        participantAgents = await this.getContextGraphParticipantAgentAddresses(id);
+        if (participantAgents.length > MAX_CONTEXT_GRAPH_PARTICIPANT_AGENTS) {
+          throw new Error(
+            `Context graph "${id}" cannot be registered on-chain: participantAgents cannot exceed ` +
+            `${MAX_CONTEXT_GRAPH_PARTICIPANT_AGENTS} addresses after auto-adding the calling agent as a participant.`,
+          );
+        }
+        // Treat the chain signer as the local on-chain owner from
+        // here on — downstream PCA/signer parity checks compare
+        // against this value.
+        ownerAddress = publishAuthority;
       }
       // PCA-only: the chain signer (= msg.sender for the registration
       // tx) MUST equal the PCA owner. `ContextGraphs.createContextGraph`

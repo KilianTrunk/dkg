@@ -1138,12 +1138,88 @@ export class SharedMemoryHandler {
     return decrypted.plaintext;
   }
 
+  /**
+   * Lightweight authority check for LU-6 host-mode ingest.
+   *
+   * Validates raw gossip bytes against the curated CG's agent
+   * allowlist + peer allowlist WITHOUT attempting decryption — the
+   * chain key lives on members, not on the hosting core. Returns
+   * `{ accepted: true }` only if:
+   *   - the bytes decode as an agent-signed `GossipEnvelopeMsg`
+   *     bound to `contextGraphId`,
+   *   - the envelope signature is valid and recovers to an
+   *     address present in the CG's agent gate
+   *     (DKG_ALLOWED_AGENT ∪ DKG_PARTICIPANT_AGENT),
+   *   - if a peer allowlist is set on the CG, `fromPeerId` is in
+   *     it.
+   *
+   * Codex PR #610 R4 (DoS): without this check, any peer that
+   * could reach the gossip topic could spam a core's
+   * `SwmHostModeStore` with structurally-valid-but-unauthorized
+   * envelopes and evict legitimate history once the per-CG FIFO
+   * cap kicked in.
+   *
+   * Returns `{ accepted: false, reason }` on every failure so
+   * the caller can log a single concise breadcrumb.
+   */
+  async verifyHostModeEnvelopeAuthority(
+    rawBytes: Uint8Array,
+    contextGraphId: string,
+    fromPeerId: string,
+  ): Promise<{ accepted: true } | { accepted: false; reason: string }> {
+    const ctx = createOperationContext('share');
+    let decoded: WorkspaceGossipDecodeResult;
+    try {
+      decoded = this.decodeWorkspaceGossipMessage(rawBytes);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return { accepted: false, reason: `decode failed: ${reason}` };
+    }
+    const { envelope, signedPayload } = decoded;
+    if (!envelope) {
+      return { accepted: false, reason: 'unsigned envelope (host mode requires agent-signed gossip)' };
+    }
+    const agentGateAddresses = await this.getContextGraphAgentGateAddresses(contextGraphId);
+    const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
+    if (agentGateAddresses === null) {
+      // No agent gate → not curated → host mode shouldn't be
+      // active for this CG. Drop defensively.
+      return { accepted: false, reason: 'no agent allowlist on context graph' };
+    }
+    if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
+      return { accepted: false, reason: `peer ${fromPeerId} not in peer allowlist` };
+    }
+    const verified = await this.verifyAgentEnvelope(
+      envelope,
+      signedPayload,
+      contextGraphId,
+      agentGateAddresses,
+      ctx,
+      { requireLocalMembership: false },
+    );
+    if (!verified) {
+      return { accepted: false, reason: 'agent envelope verification failed (see preceding WARN log)' };
+    }
+    return { accepted: true };
+  }
+
   private async verifyAgentEnvelope(
     envelope: GossipEnvelopeMsg | undefined,
     payload: Uint8Array,
     contextGraphId: string,
     agentGateAddresses: string[],
     ctx: import('@origintrail-official/dkg-core').OperationContext,
+    options?: {
+      /**
+       * When false, skip the final "local node is a CG member"
+       * check. LU-6 host-mode ingest uses this — a core node
+       * relays/stores ciphertext for a CG it is NOT a member of,
+       * so requiring `localAgentAddresses` overlap with the
+       * allowlist would always fail and reject every host-mode
+       * envelope. The remaining (cryptographic) checks still run.
+       */
+      requireLocalMembership?: boolean;
+    },
   ): Promise<boolean> {
     if (!envelope) {
       this.log.warn(ctx, `SWM write rejected: unsigned workspace gossip for agent-gated context graph "${contextGraphId}"`);
@@ -1196,7 +1272,8 @@ export class SharedMemoryHandler {
       return false;
     }
 
-    if (this.localAgentAddresses) {
+    const requireLocalMembership = options?.requireLocalMembership !== false;
+    if (requireLocalMembership && this.localAgentAddresses) {
       const localAgents = await this.localAgentAddresses();
       const localAllowed = localAgents.some((agent) => agentGateSet.has(agent.toLowerCase()));
       if (!localAllowed) {

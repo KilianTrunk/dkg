@@ -800,7 +800,22 @@ export class SharedMemoryHandler {
       }
 
       if (agentGateAddresses !== null) {
-        const verified = await this.verifyAgentEnvelope(envelope, signedPayload, contextGraphId, agentGateAddresses, ctx);
+        const verified = await this.verifyAgentEnvelope(envelope, signedPayload, contextGraphId, agentGateAddresses, ctx, {
+          // LU-6 host-catchup replay (PR #610 Codex round-2 #1): the
+          // 5-minute `GOSSIP_ENVELOPE_FRESHNESS_MS` window protects
+          // live gossip against replay attacks, but it BREAKS the
+          // host-catchup recovery path — a member that comes online
+          // hours/days after a curator wrote to SWM legitimately
+          // needs to replay envelopes whose timestamps are far older
+          // than the freshness window. Skipping the freshness check
+          // on trusted replays is safe because the (cryptographic)
+          // signature + decryption chain still verifies, and `seqno`
+          // monotonicity in the host catalog prevents re-applying
+          // already-seen entries. Without this skip, every aged
+          // host-catchup envelope returned `stale or invalid gossip
+          // timestamp` and the off-line member could never catch up.
+          skipTimestampFreshness: trustedReplay,
+        });
         if (!verified) {
           // verifyAgentEnvelope already logged the specific reason
           // at WARN. Treated as permanent: a bad signature won't
@@ -1286,6 +1301,17 @@ export class SharedMemoryHandler {
        * envelope. The remaining (cryptographic) checks still run.
        */
       requireLocalMembership?: boolean;
+      /**
+       * When true, skip the `GOSSIP_ENVELOPE_FRESHNESS_MS` 5-minute
+       * timestamp window. LU-6 host-catchup replay uses this — a
+       * member replaying envelopes pulled from a host store hours/
+       * days after the original write would otherwise reject every
+       * aged envelope as `stale or invalid gossip timestamp`. Safe
+       * because the signature + sender-key AEAD chain still
+       * verifies, and host catalog `seqno` monotonicity prevents
+       * actual replay attacks. Codex PR #610 round-2 finding #1.
+       */
+      skipTimestampFreshness?: boolean;
     },
   ): Promise<boolean> {
     if (!envelope) {
@@ -1307,7 +1333,11 @@ export class SharedMemoryHandler {
     }
 
     const timestampMs = Date.parse(envelope.timestamp);
-    if (!Number.isFinite(timestampMs) || Math.abs(this.now() - timestampMs) > GOSSIP_ENVELOPE_FRESHNESS_MS) {
+    if (!Number.isFinite(timestampMs)) {
+      this.log.warn(ctx, `SWM write rejected: invalid gossip timestamp "${envelope.timestamp}"`);
+      return false;
+    }
+    if (!options?.skipTimestampFreshness && Math.abs(this.now() - timestampMs) > GOSSIP_ENVELOPE_FRESHNESS_MS) {
       this.log.warn(ctx, `SWM write rejected: stale or invalid gossip timestamp "${envelope.timestamp}"`);
       return false;
     }

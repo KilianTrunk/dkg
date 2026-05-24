@@ -131,10 +131,22 @@ export function decodeSwmHostCatchupResponse(bytes: Uint8Array): SwmHostCatchupR
       throw new Error('SwmHostCatchup response entry is malformed');
     }
   }
+  // Codex PR #610 round-2 #9: harden `nextSeqno` decoding. A
+  // malformed or hostile host could return non-numeric / negative /
+  // NaN values; without validation the bare `Number(...)` coerced
+  // them silently and the next pagination round throwed inside
+  // `encodeSwmHostCatchupRequest`'s `sinceSeqno` validation —
+  // surfacing as an opaque encode error far from the source.
+  // Validate at the decode boundary instead.
+  const rawNextSeqno = (parsed as { nextSeqno?: unknown }).nextSeqno;
+  const nextSeqnoNum = typeof rawNextSeqno === 'number' ? rawNextSeqno : Number(rawNextSeqno ?? 0);
+  if (!Number.isFinite(nextSeqnoNum) || nextSeqnoNum < 0 || !Number.isInteger(nextSeqnoNum)) {
+    throw new Error(`SwmHostCatchup response has invalid nextSeqno: ${String(rawNextSeqno)}`);
+  }
   return {
     version: SWM_HOST_CATCHUP_WIRE_VERSION,
     contextGraphId: parsed.contextGraphId,
-    nextSeqno: Number(parsed.nextSeqno ?? 0),
+    nextSeqno: nextSeqnoNum,
     truncated: Boolean(parsed.truncated),
     ...(typeof parsed.denied === 'string' ? { denied: parsed.denied } : {}),
     entries: entries as SwmHostCatchupResponseEntry[],

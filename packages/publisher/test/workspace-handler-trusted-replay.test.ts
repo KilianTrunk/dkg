@@ -328,4 +328,60 @@ describe('SharedMemoryHandler trustedReplay (LU-6 host-catchup)', () => {
     }
     await expectWorkspaceEmpty();
   });
+
+  it('applies an OLD envelope under trustedReplay (PR #610 round-2 #1 — host-catchup recovery beyond 5-minute freshness window)', async () => {
+    // Codex finding: `verifyHostModeEnvelopeAuthority` / `handle()`
+    // shared `verifyAgentEnvelope`, which enforced
+    // GOSSIP_ENVELOPE_FRESHNESS_MS (5 min). Members replaying
+    // legitimate envelopes pulled from a core's host store hours/
+    // days after the original write hit `stale or invalid gossip
+    // timestamp` and the off-line member could never catch up.
+    // The fix: skip the freshness check under trustedReplay, where
+    // the cryptographic chain (signature + AEAD) still verifies.
+    const allowed = ethers.Wallet.createRandom();
+    const recipientKey = recipientKeyFor(allowed.address);
+    const handler = makeHandler({ allowedAgentAddress: allowed.address, recipientKey });
+    await insertPrivateAccessPolicy();
+    await insertAgentGate(DKG_ONTOLOGY.DKG_ALLOWED_AGENT, allowed.address);
+    await insertPeerGate(PUBLISHER_PEER_ID);
+
+    const raw = workspaceMessage('Aged Replay', 'ws-trusted-replay-aged');
+    const encrypted = await encryptForCg(allowed.address, raw, recipientKey);
+    // Sign with a timestamp 1 hour in the past (well beyond the
+    // 5-minute freshness window).
+    const oneHourAgoIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const wire = await signWorkspaceMessage(allowed, encrypted, allowed.address, oneHourAgoIso);
+
+    // Without trustedReplay this would reject as `stale or invalid
+    // gossip timestamp`. With trustedReplay the apply succeeds.
+    const outcome = await handler.handle(wire, HOST_PEER_ID, undefined, { trustedReplay: true });
+
+    expect(outcome.applied).toBe(true);
+    if (outcome.applied) {
+      expect(outcome.insertedTriples).toBe(1);
+      expect(outcome.cgId).toBe(CONTEXT_GRAPH_ID);
+    }
+    await expectStoredName('Aged Replay');
+  });
+
+  it('still rejects truly invalid timestamps under trustedReplay (skipFreshness only relaxes the staleness window, not malformed values)', async () => {
+    const allowed = ethers.Wallet.createRandom();
+    const recipientKey = recipientKeyFor(allowed.address);
+    const handler = makeHandler({ allowedAgentAddress: allowed.address, recipientKey });
+    await insertPrivateAccessPolicy();
+    await insertAgentGate(DKG_ONTOLOGY.DKG_ALLOWED_AGENT, allowed.address);
+    await insertPeerGate(PUBLISHER_PEER_ID);
+
+    const raw = workspaceMessage('Bad TS', 'ws-trusted-replay-bad-ts');
+    const encrypted = await encryptForCg(allowed.address, raw, recipientKey);
+    const wire = await signWorkspaceMessage(allowed, encrypted, allowed.address, 'not-a-date');
+
+    const outcome = await handler.handle(wire, HOST_PEER_ID, undefined, { trustedReplay: true });
+
+    expect(outcome.applied).toBe(false);
+    if (!outcome.applied) {
+      expect(outcome.retryable).toBe(false);
+    }
+    await expectWorkspaceEmpty();
+  });
 });

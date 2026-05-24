@@ -1680,6 +1680,30 @@ WHERE {
       try {
         const existingOnChainId = await agent.getContextGraphOnChainId(contextGraphId);
         if (!existingOnChainId) {
+          // OT-RFC-38 / LU-6 Phase B (Codex PR #610 round-2 #5):
+          // cheap preflight BEFORE spending gas on registration. If
+          // SWM is empty for this CG, the publish leg below would
+          // fail with `no entities to publish` anyway — register
+          // first and we'd burn gas on a doomed publish. Skip
+          // preflight when caller passed a `rootEntities` selection
+          // (the entity-presence check happens deeper in the publish
+          // path) or supplied a `publishContextGraphId` override
+          // (cross-CG attribution: SWM may live elsewhere).
+          if (
+            selection === undefined || selection === "all"
+          ) {
+            if (
+              publishContextGraphId == null
+              && !agent.hasPendingSharedMemoryWrites(contextGraphId)
+            ) {
+              tracker.fail(ctx, new Error('SWM empty for context graph'));
+              return jsonResponse(res, 400, {
+                error:
+                  `Context graph "${contextGraphId}" has no pending shared-memory writes — `
+                  + `nothing to publish to Verified Memory. Stage entities into SWM first, then retry publish.`,
+              });
+            }
+          }
           // OT-RFC-38 / LU-6 Phase B (Codex PR #610 fd5b31f1 fix):
           // load create-time `publishPolicy` and
           // `publishAuthorityAccountId` so the deferred-registration

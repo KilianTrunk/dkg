@@ -364,6 +364,22 @@ export class DKGAgent {
   private readonly chain: ChainAdapter;
   /** Shared memory-owned root entities per context graph: entity → creatorPeerId. Used by publisher and shared memory handler. */
   private readonly workspaceOwnedEntities: Map<string, Map<string, string>>;
+  /**
+   * OT-RFC-38 / LU-6 Phase B (Codex PR #610 round-2 #2) — highest
+   * `nextSeqno` already consumed per (contextGraphId, hostPeerId)
+   * pair from a successful `catchupSwmFromHost` round. Drives
+   * `catchupSwmFromConnectedHosts` resume so steady-state members
+   * don't re-download the entire host log every time the daemon's
+   * standard catchup returns 0 and falls back to host-catchup.
+   *
+   * In-memory only: a daemon restart resets the cursor and the
+   * first post-restart fallback rebuilds from `0`. That's correct —
+   * after restart we don't trust our prior position estimate, and
+   * the host's `seenShareOps`/sender-key replay-prevention layer
+   * dedupes the re-applied envelopes so the only cost is one
+   * round-trip of bandwidth, not duplicate state.
+   */
+  private readonly lastHostCatchupSeqno: Map<string, Map<string, number>> = new Map();
   /** Shared write locks so gossip writes serialize against local CAS writes. */
   private readonly writeLocks: Map<string, Promise<void>>;
   private readonly publicSnapshotStore?: WorkspacePublicSnapshotStore;
@@ -9487,6 +9503,43 @@ export class DKGAgent {
         entries: [],
       });
     }
+    // Codex PR #610 round-2 #6 (partial mitigation): when the local
+    // node has explicit peer-allowlist meta for this CG (the member-
+    // side case), require the requesting peer to be in it. Pre-fix,
+    // any connected peer that knew or guessed a `contextGraphId`
+    // could pull stored envelopes; ciphertext is useless without
+    // the chain key but the activity metadata (existence, timing,
+    // volume) still leaked. We DON'T yet authenticate the host-only-
+    // core case (no local allowlist, chain-only authority) — that
+    // needs a signed catchup-request wire change and is tracked as
+    // a separate post-launch follow-up. For now host-only cores
+    // still serve openly, mitigated by per-peer rate limiting on
+    // the wire and the fact that ciphertext leaks no useful data
+    // without the curator-issued chain key.
+    try {
+      const allowedPeers = await this.getContextGraphAllowedPeers(req.contextGraphId);
+      if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
+        this.log.info(
+          ctx,
+          `host-catchup denied cg=${req.contextGraphId} from=${fromPeerId}: peer not in allowedPeers (len=${allowedPeers.length})`,
+        );
+        return encodeSwmHostCatchupResponse({
+          version: 1,
+          contextGraphId: req.contextGraphId,
+          nextSeqno: req.sinceSeqno,
+          truncated: false,
+          denied: 'peer not in context-graph allowlist',
+          entries: [],
+        });
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.debug(ctx, `host-catchup peer-allowlist probe failed cg=${req.contextGraphId}: ${reason}`);
+      // Fall through — local-allowlist read failure is non-fatal
+      // (host-only cores hit this path) and the iterate call below
+      // still gates on the existence of the CG in the host store.
+    }
+
     const maxEntries = req.maxEntries ?? SWM_HOST_CATCHUP_DEFAULT_MAX_ENTRIES;
     const maxBytes = req.maxBytes ?? SWM_HOST_CATCHUP_DEFAULT_MAX_BYTES;
     let raw;
@@ -9509,8 +9562,21 @@ export class DKGAgent {
     const entries: SwmHostCatchupResponseEntry[] = [];
     let runningBytes = 0;
     let truncatedByBytes = false;
+    let skippedOversizeFirst = false;
     for (const entry of raw) {
-      if (runningBytes + entry.envelopeBytes.length > maxBytes && entries.length > 0) {
+      // Codex PR #610 round-2 #4: don't bypass the byte cap for the
+      // first entry. Pre-fix, the `entries.length > 0` guard meant a
+      // single oversize envelope (close to or above `maxBytes`) was
+      // always returned even when it exceeded the caller's cap. The
+      // base64 expansion (~33% overhead) plus protocol-router wrapper
+      // pushed responses past the messenger's 10 MiB read limit and
+      // made catchup fail for legitimate large shares. Treat an
+      // oversize first entry as truncation instead — the caller
+      // either bumps `maxBytes` and retries or skips past the
+      // problematic seqno.
+      const base64Size = Math.ceil(entry.envelopeBytes.length / 3) * 4;
+      if (runningBytes + base64Size > maxBytes) {
+        if (entries.length === 0) skippedOversizeFirst = true;
         truncatedByBytes = true;
         break;
       }
@@ -9519,7 +9585,28 @@ export class DKGAgent {
         timestampMs: entry.timestampMs,
         envelopeB64: Buffer.from(entry.envelopeBytes).toString('base64'),
       });
-      runningBytes += entry.envelopeBytes.length;
+      runningBytes += base64Size;
+    }
+    if (skippedOversizeFirst) {
+      const oversizeSeqno = raw[0]?.seqno ?? req.sinceSeqno;
+      const oversizeBase64 = Math.ceil((raw[0]?.envelopeBytes.length ?? 0) / 3) * 4;
+      this.log.warn(
+        ctx,
+        `host-catchup oversize entry at seqno=${oversizeSeqno} cg=${req.contextGraphId} from=${fromPeerId}: ` +
+        `envelope alone exceeds maxBytes=${maxBytes} after base64 (~${oversizeBase64}B) — returning denied`,
+      );
+      // Surface as `denied` so the caller breaks out of its
+      // pagination loop instead of spinning forever on a seqno that
+      // can't fit in the response (would otherwise loop because
+      // `nextSeqno` stays equal to `sinceSeqno` when entries=0).
+      return encodeSwmHostCatchupResponse({
+        version: 1,
+        contextGraphId: req.contextGraphId,
+        nextSeqno: req.sinceSeqno,
+        truncated: true,
+        denied: `oversize-entry: seqno=${oversizeSeqno} envelope=${oversizeBase64}B > maxBytes=${maxBytes}`,
+        entries: [],
+      });
     }
     const nextSeqno = entries.length > 0 ? entries[entries.length - 1].seqno : req.sinceSeqno;
     this.log.info(
@@ -9716,11 +9803,31 @@ export class DKGAgent {
     }> = [];
     for (const peerId of candidates) {
       try {
+        // Codex PR #610 round-2 #2: resume from the highest seqno we
+        // previously consumed from this (cgId, peerId), not from 0.
+        // Pre-fix, every fallback catchup re-downloaded the entire
+        // host log even when the member was already up-to-date,
+        // inflating `totalInsertedTriples` (counting redundant
+        // applies) and burning bandwidth on a steady-state member
+        // that just happened to ask. Explicit `options.sinceSeqno`
+        // still wins so operators / callers can force a re-scan.
+        const resumeSeqno =
+          options?.sinceSeqno !== undefined
+            ? options.sinceSeqno
+            : this.lastHostCatchupSeqno.get(contextGraphId)?.get(peerId) ?? 0;
         const r = await this.catchupSwmFromHost(peerId, contextGraphId, {
-          sinceSeqno: options?.sinceSeqno,
+          sinceSeqno: resumeSeqno,
           maxRounds: options?.maxRounds,
           maxEntriesPerRound: options?.maxEntriesPerRound,
         });
+        if (r.nextSeqno > 0) {
+          let perPeer = this.lastHostCatchupSeqno.get(contextGraphId);
+          if (!perPeer) {
+            perPeer = new Map();
+            this.lastHostCatchupSeqno.set(contextGraphId, perPeer);
+          }
+          perPeer.set(peerId, r.nextSeqno);
+        }
         results.push({ peerId, ...r });
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
@@ -13024,6 +13131,29 @@ export class DKGAgent {
       `SELECT ?status WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_REGISTRATION_STATUS}> ?status } } LIMIT 1`,
     );
     return result.type === 'bindings' && result.bindings[0]?.['status']?.replace(/^"|"$/g, '') === 'registered';
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B (Codex PR #610 round-2 #5) — cheap
+   * preflight for the deferred-registration auto-register-then-
+   * publish flow. Returns true iff this agent has at least one
+   * locally-owned entity staged in shared memory for the given CG.
+   *
+   * Used by `memory.ts` to short-circuit BEFORE spending gas on
+   * `registerContextGraph` when the publish would have failed anyway
+   * (e.g. SWM empty because the agent never wrote, or the user
+   * cleared SWM after staging). Pre-fix, the flow registered first
+   * and then surfaced a 500 from the publish leg — wasting the
+   * registration gas on a publish that couldn't succeed.
+   *
+   * Note: this only catches the "no local writes" case. Invalid
+   * `selection.rootEntities` (referencing entities never staged)
+   * still fails inside `publishFromSharedMemory` after register —
+   * the cheap preflight here doesn't materialise the selection.
+   */
+  hasPendingSharedMemoryWrites(contextGraphId: string): boolean {
+    const owned = this.workspaceOwnedEntities.get(contextGraphId);
+    return owned !== undefined && owned.size > 0;
   }
 
   async getContextGraphOnChainId(contextGraphId: string): Promise<string | null> {

@@ -227,4 +227,57 @@ describe('SwmHostModeStore', () => {
     expect(stats.perCg['cg/real-1']).toBeDefined();
     expect(stats.perCg['cg/real-2']).toBeDefined();
   });
+
+  describe('B3: host-mode designation persistence', () => {
+    const limits = { perCgByteCap: 1024 * 1024, ttlMs: 60_000 };
+
+    it('persists hostModeSubscribed across new store instances', async () => {
+      const first = new SwmHostModeStore({ dataDir: dir, unregisteredLimits: limits, registeredLimits: limits });
+      await first.markHostModeSubscribed('curator/cg-host');
+
+      const second = new SwmHostModeStore({ dataDir: dir, unregisteredLimits: limits, registeredLimits: limits });
+      const restored = await second.listHostModeSubscribedCgs();
+      expect(restored).toEqual(['curator/cg-host']);
+    });
+
+    it('listHostModeSubscribedCgs returns only flagged CGs', async () => {
+      const store = new SwmHostModeStore({ dataDir: dir, unregisteredLimits: limits, registeredLimits: limits });
+      await store.markHostModeSubscribed('curator/cg-a');
+      await store.markRegistered('curator/cg-b'); // registered but never subscribed
+      await store.append('curator/cg-c', new Uint8Array([1])); // ciphertext but no host-mode flag
+
+      const restored = await store.listHostModeSubscribedCgs();
+      expect(restored).toEqual(['curator/cg-a']);
+    });
+
+    it('markHostModeUnsubscribed clears the flag (unwire path)', async () => {
+      const store = new SwmHostModeStore({ dataDir: dir, unregisteredLimits: limits, registeredLimits: limits });
+      await store.markHostModeSubscribed('curator/cg-x');
+      expect(await store.listHostModeSubscribedCgs()).toContain('curator/cg-x');
+      await store.markHostModeUnsubscribed('curator/cg-x');
+      expect(await store.listHostModeSubscribedCgs()).not.toContain('curator/cg-x');
+    });
+
+    it('preserves hostModeSubscribed alongside append-driven seqno updates', async () => {
+      const first = new SwmHostModeStore({ dataDir: dir, unregisteredLimits: limits, registeredLimits: limits });
+      await first.markHostModeSubscribed('curator/cg-active');
+      await first.append('curator/cg-active', new Uint8Array([1, 2, 3]));
+      await first.append('curator/cg-active', new Uint8Array([4, 5, 6]));
+
+      const second = new SwmHostModeStore({ dataDir: dir, unregisteredLimits: limits, registeredLimits: limits });
+      expect(await second.listHostModeSubscribedCgs()).toEqual(['curator/cg-active']);
+      // Seqno bookkeeping also survives — append picks up at 3.
+      const s3 = await second.append('curator/cg-active', new Uint8Array([7]));
+      expect(s3).toBe(3);
+    });
+
+    it('mark + unmark are idempotent', async () => {
+      const store = new SwmHostModeStore({ dataDir: dir, unregisteredLimits: limits, registeredLimits: limits });
+      await store.markHostModeSubscribed('curator/cg-1');
+      await store.markHostModeSubscribed('curator/cg-1');
+      await store.markHostModeUnsubscribed('curator/cg-1');
+      await store.markHostModeUnsubscribed('curator/cg-1');
+      expect(await store.listHostModeSubscribedCgs()).toEqual([]);
+    });
+  });
 });

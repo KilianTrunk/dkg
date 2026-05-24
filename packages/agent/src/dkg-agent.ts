@@ -8900,6 +8900,45 @@ export class DKGAgent {
       createOperationContext('system'),
       `SWM host-mode store initialized at ${join(this.config.dataDir, 'swm-host')} (role=${role})`,
     );
+
+    // OT-RFC-38 LU-6 B3 — restore persisted host-mode subscriptions
+    // BEFORE the chain-event poller starts. Chain events older than
+    // the poller's lookback window would otherwise be silently lost
+    // on restart, stranding CGs that the curator registered weeks
+    // ago. The chain-event path + beacons remain the primary
+    // mechanisms; this is the "we already knew about this CG before"
+    // shortcut that keeps the per-restart re-derivation cheap.
+    try {
+      const previouslySubscribed = await this.swmHostModeStore.listHostModeSubscribedCgs();
+      if (previouslySubscribed.length > 0) {
+        this.log.info(
+          createOperationContext('system'),
+          `Restoring ${previouslySubscribed.length} persisted host-mode subscription(s) from disk`,
+        );
+        for (const cgId of previouslySubscribed) {
+          // Re-engage the gossip handler directly; we trust the
+          // previous decision (the curated check ran when the
+          // subscription was first wired). The chain-anchored
+          // authority check on every envelope ingest still catches
+          // revocations even if curator state has changed since.
+          try {
+            this.wireSwmHostModeHandler(cgId);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.log.warn(
+              createOperationContext('system'),
+              `Failed to restore host-mode subscription for "${cgId}": ${msg}`,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.warn(
+        createOperationContext('system'),
+        `Failed to list persisted host-mode subscriptions: ${msg}`,
+      );
+    }
   }
 
   /**
@@ -9010,6 +9049,18 @@ export class DKGAgent {
     };
     this.swmHostModeHandlers.set(contextGraphId, handler);
     this.gossip.onMessage(swmTopic, handler);
+    // B3: persist the host-mode designation so a restart re-engages
+    // this handler before the chain-event poller catches up.
+    // Best-effort — never fail the wire on a persistence error.
+    if (this.swmHostModeStore) {
+      this.swmHostModeStore.markHostModeSubscribed(contextGraphId).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log.debug(
+          createOperationContext('system'),
+          `Host-mode persistence (mark) failed for "${contextGraphId}": ${msg}`,
+        );
+      });
+    }
   }
 
   /**
@@ -9033,6 +9084,17 @@ export class DKGAgent {
     this.gossip.offMessage(swmTopic, handler);
     this.swmHostModeHandlers.delete(contextGraphId);
     this.swmHostModeSubscribed.delete(contextGraphId);
+    // B3: clear the persisted host-mode designation so a restart
+    // does NOT re-engage. Best-effort.
+    if (this.swmHostModeStore) {
+      this.swmHostModeStore.markHostModeUnsubscribed(contextGraphId).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log.debug(
+          createOperationContext('system'),
+          `Host-mode persistence (unmark) failed for "${contextGraphId}": ${msg}`,
+        );
+      });
+    }
   }
 
   /**

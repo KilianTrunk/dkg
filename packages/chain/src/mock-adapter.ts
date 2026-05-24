@@ -634,6 +634,9 @@ export class MockChainAdapter implements ChainAdapter {
     publishAuthorityAccountId: bigint;
     active: boolean;
     batches: bigint[];
+    // OT-RFC-38 / LU-6 Phase B — curator-committed wire id.
+    // `null` indicates the curator opted out at create time.
+    nameHash?: string | null;
   }>();
   private nextContextGraphId = 1n;
 
@@ -696,6 +699,20 @@ export class MockChainAdapter implements ChainAdapter {
       seenParticipantAgents.add(key);
     }
 
+    // OT-RFC-38 / LU-6 Phase B — accept the curator's wire-id commitment
+    // verbatim. Validation is intentionally permissive: the contract
+    // accepts ANY non-zero 32-byte value, including ones that aren't
+    // derivable from a known cleartext (forward compatibility). Mock
+    // stores `null` for the opt-out path so the event surface matches
+    // the EVM adapter's `nameHashRaw === '0x' ? null : ...` shape.
+    let nameHash: string | null = null;
+    if (params.nameHash !== undefined && params.nameHash !== ethers.ZeroHash) {
+      if (!/^0x[0-9a-fA-F]{64}$/.test(params.nameHash)) {
+        throw new Error(`Mock: invalid nameHash ${params.nameHash}`);
+      }
+      nameHash = params.nameHash.toLowerCase();
+    }
+
     const contextGraphId = this.nextContextGraphId++;
     this.contextGraphs.set(contextGraphId, {
       manager: this.signerAddress,
@@ -707,6 +724,7 @@ export class MockChainAdapter implements ChainAdapter {
       publishAuthorityAccountId,
       active: true,
       batches: [],
+      nameHash,
     });
 
     this.pushEvent('ContextGraphCreated', {
@@ -717,6 +735,7 @@ export class MockChainAdapter implements ChainAdapter {
       participantAgents: participantAgents.map((agent) => ethers.getAddress(agent)),
       accessPolicy,
       publishPolicy,
+      nameHash,
     });
 
     return {
@@ -996,6 +1015,19 @@ export class MockChainAdapter implements ChainAdapter {
     const agents = (cg as { participantAgents?: string[] }).participantAgents;
     if (!Array.isArray(agents)) return [];
     return agents.map((a) => ethers.getAddress(a));
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — mock mirror of
+   * `ContextGraphStorage.getNameHash(uint256)`. Returns `null` for
+   * unregistered ids OR for ids the curator opted out of committing
+   * to a name hash (matches the EVM adapter's `'0x' → null` mapping
+   * on the event surface for symmetry).
+   */
+  async getContextGraphNameHash(contextGraphId: bigint): Promise<string | null> {
+    const cg = this.contextGraphs.get(contextGraphId);
+    if (!cg) return null;
+    return cg.nameHash ?? null;
   }
 
   // --- V10 Publish (KnowledgeAssetsV10 → KnowledgeCollectionStorage) ---

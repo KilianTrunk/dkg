@@ -397,6 +397,30 @@ export interface ContextGraphSub {
   metaSynced?: boolean;
   /** On-chain context graph ID (keccak256 hash), if known. */
   onChainId?: string;
+  /**
+   * OT-RFC-38 / LU-6 Phase B — curator-committed wire identifier.
+   * `keccak256(bytes(cleartextId))` lowercase hex (0x-prefixed). Used as
+   * the SWM gossip topic key, envelope `contextGraphId`, signing-payload
+   * id, and host-mode store key — privacy-preserving (cleartext never
+   * leaves the local node) and chain-derivable (cores hosting CGs they
+   * didn't create or join read it from the `ContextGraphCreated.nameHash`
+   * event topic).
+   *
+   * For CGs the local node CREATED, this is set at create-time before
+   * the chain call (the agent commits to the hash and passes it as the
+   * `nameHash` param so the create transaction emits a consistent value
+   * — failure to do this opens a curator/host topic mismatch where
+   * members publish on topic-A and cores host on topic-B).
+   *
+   * For CGs the local node JOINED via curator invite, this is populated
+   * when the join-approved payload arrives. For CGs the local node
+   * HOSTS (core, not a member), this is set by the chain-event handler
+   * and IS the local id (the cleartext is never known).
+   *
+   * Undefined for pre-Phase-B CGs (legacy path; cleartext is still the
+   * wire form for those — they pre-date the contract change).
+   */
+  onChainHash?: string;
   /** Participant agent addresses (V10 agent identity model). */
   participantAgents?: string[];
   /**
@@ -421,6 +445,12 @@ export interface ContextGraphSubscriptionRecord {
   sharedMemorySynced?: boolean;
   metaSynced?: boolean;
   onChainId?: string;
+  /**
+   * OT-RFC-38 / LU-6 Phase B — persisted wire-id commitment. Persisted
+   * so cores recovering from a restart can resume host-mode subscription
+   * on the correct topic without needing a new chain-event read.
+   */
+  onChainHash?: string;
   syncScoped: boolean;
 }
 

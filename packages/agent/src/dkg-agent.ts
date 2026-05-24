@@ -565,6 +565,18 @@ export class DKGAgent {
   private readonly sharedMemoryGossipRegistered = new Set<string>();
   private readonly seenOnChainIds = new Set<string>();
   /**
+   * OT-RFC-38 / LU-6 Phase B — reverse index from `onChainHash` (the
+   * curator-committed wire id) to the local cleartext id. Lets the
+   * receive path translate a wire-form envelope back to the local CG
+   * record in O(1) without scanning `subscribedContextGraphs`. The
+   * canonical write site is wherever `subscribedContextGraphs.onChainHash`
+   * is set (chain-event handler, register-on-chain success path, join-
+   * approved payload handler) — direct writes elsewhere can drift, so
+   * keep the two maps in lockstep via {@link recordCgWireId}. Keyed
+   * by lowercase 0x-prefixed hex.
+   */
+  private readonly wireIdToLocalCgId = new Map<string, string>();
+  /**
    * OT-RFC-38 / LU-5: per-core cache of on-chain CG access policies,
    * keyed by the on-chain numeric id (uint256). Populated by:
    *   1. `onContextGraphCreated` chain-event handler (eager) — fills in
@@ -1595,13 +1607,10 @@ export class DKGAgent {
       this.chainPoller = new ChainEventPoller({
         chain: this.chain,
         publishHandler,
-        onContextGraphCreated: async ({ contextGraphId, creator, accessPolicy, blockNumber }) => {
-          this.log.info(ctx, `Discovered on-chain context graph ${contextGraphId.slice(0, 16)}… (block ${blockNumber}, creator ${creator.slice(0, 10)}…, policy ${accessPolicy})`);
+        onContextGraphCreated: async ({ contextGraphId, creator, accessPolicy, nameHash, blockNumber }) => {
+          this.log.info(ctx, `Discovered on-chain context graph ${contextGraphId.slice(0, 16)}… (block ${blockNumber}, creator ${creator.slice(0, 10)}…, policy ${accessPolicy}, nameHash ${nameHash ? nameHash.slice(0, 10) + '…' : '(opt-out)'})`);
 
-          // Track the hash for dedup but don't pollute subscribedContextGraphs.
-          // Gossip topics are keyed by cleartext name, not the on-chain hash.
-          // The context graph will be fully subscribed once ontology sync or
-          // discoverContextGraphsFromChain resolves the cleartext name.
+          // Track the numeric on-chain id for dedup.
           const alreadyKnown = this.seenOnChainIds.has(contextGraphId)
             || [...this.subscribedContextGraphs.values()].some(s => s.onChainId === contextGraphId);
           if (!alreadyKnown) {
@@ -1619,6 +1628,74 @@ export class DKGAgent {
           // so the keying matches the lazy-fallback lookup below.
           if (accessPolicy === 0 || accessPolicy === 1) {
             this.onChainAccessPolicyCache.set(contextGraphId, accessPolicy);
+          }
+
+          // OT-RFC-38 / LU-6 Phase B — host-mode auto-subscribe path for
+          // sharding-table cores. The event carries the curator-committed
+          // wire id (`nameHash`); cores derive the SWM gossip topic from
+          // it directly and start hosting ciphertext for the CG without
+          // needing the cleartext name, without an operator-driven
+          // `/api/shared-memory/host-mode/subscribe`, and without an off-
+          // chain discovery channel for *registered* CGs (pre-reg CGs
+          // go through the discovery-beacon path instead).
+          //
+          // Gate conditions (all must hold):
+          //   1. Curator opted into the hash commitment (nameHash != null
+          //      — opt-out CGs run through the beacon path only).
+          //   2. CG is curated (accessPolicy == 1). Public CGs don't have
+          //      curated SWM substrate to host; LU-6 only applies to
+          //      curated.
+          //   3. Local node has `nodeRole === 'core'` AND swmHostMode is
+          //      enabled. The reconciler below applies the same checks
+          //      so this branch is purely an optimisation (eliminates
+          //      the discovery-beacon round-trip + the host-mode
+          //      reconciler poll latency).
+          //   4. Local node is in the sharding table. Probed by the
+          //      reconciler; we pass through to it rather than
+          //      duplicating the check here.
+          //
+          // The reconciler is robust to being called for a CG it can't
+          // act on (returns early on `nodeRole !== 'core'`, swmHostMode
+          // disabled, off-sharding-table, etc.), so the call below
+          // doesn't need any of those gates beyond the event-side hash
+          // presence and the curated flag.
+          if (nameHash && accessPolicy === 1) {
+            // Register the wire id → numeric id mapping so the receive
+            // path's chain fallback resolver (Scope A) can take a hash
+            // input and find the on-chain participant agents without an
+            // RPC round-trip per envelope.
+            const hashLower = nameHash.toLowerCase();
+            // Stage a synthetic subscription record for the host-only
+            // case: cores hosting CGs they never joined have no
+            // cleartext; the hash IS their local id. `recordCgWireId`
+            // would no-op on this without a pre-existing record, so
+            // upsert a minimal stub first.
+            if (!this.subscribedContextGraphs.has(hashLower)) {
+              this.subscribedContextGraphs.set(hashLower, {
+                subscribed: false,
+                synced: false,
+                onChainId: contextGraphId,
+                onChainHash: hashLower,
+                pendingMeta: true,
+              });
+            } else {
+              const existing = this.subscribedContextGraphs.get(hashLower)!;
+              existing.onChainId = contextGraphId;
+              existing.onChainHash = hashLower;
+            }
+            this.recordCgWireId(hashLower, hashLower);
+
+            // Delegate to the host-mode reconciler — it owns the
+            // sharding-table check, swmHostMode flag, and the wire-up
+            // of the host-mode gossip handler. Async + best-effort:
+            // the periodic reconciler covers the timer-driven fallback
+            // path, so a missed event here heals on the next sweep.
+            void this.reconcileSwmHostModeSubscription(hashLower).catch((err) => {
+              this.log.warn(
+                ctx,
+                `Phase B chain-event auto-subscribe for ${hashLower.slice(0, 18)}… failed: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            });
           }
         },
       });
@@ -5905,8 +5982,44 @@ export class DKGAgent {
      */
     shareOperationId?: string,
   ): Promise<void> {
-    const topic = contextGraphWorkspaceTopic(contextGraphId);
-    const wireMessage = await this.encodeWorkspaceGossipMessage(contextGraphId, message, resolvedSigner);
+    // OT-RFC-38 / LU-6 Phase B — derive the wire-form id ONCE at the
+    // publish-side boundary and use it consistently across the topic,
+    // envelope, and signing payload. The curator's local id stays
+    // cleartext for everything inside the agent (display, CLI, meta-
+    // graph queries). On the wire, only the hash leaves the node.
+    //
+    // If `contextGraphId` has no recorded wire id (e.g. pre-Phase-B
+    // CG, or a CG created locally but not yet registered), the helper
+    // falls back to computing `keccak256(bytes(contextGraphId))`
+    // deterministically — so members can fan out a share immediately
+    // after `createContextGraph()` and before `registerContextGraph()`
+    // / a beacon broadcast, and the receivers who derive the wire id
+    // the same way meet them on the right topic.
+    // OT-RFC-38 / LU-6 Phase B compromise — the gossip TOPIC uses the
+    // wire-form (hash) id so hosting cores can auto-subscribe via the
+    // chain-event path without ever learning cleartext, but the
+    // ENVELOPE itself still carries cleartext in `contextGraphId`.
+    // Rationale: keeping cleartext inside the envelope preserves the
+    // existing inner-vs-envelope id consistency check (curator can't
+    // hijack CG-B with CG-A's encrypted payload), and lets the
+    // receiver's meta-graph queries (`getContextGraphAgentGateAddresses`,
+    // `getContextGraphAllowedPeers`, etc.) hit member-side local
+    // triples directly without a hash → cleartext translation.
+    //
+    // The trade-off: subscribed hosting cores learn the cleartext CG
+    // name even though they can't read the encrypted payload. For
+    // curated CGs the DATA is encrypted, so this leaks only the CG's
+    // human-readable label, not its contents. A follow-up iteration
+    // can migrate the envelope id to hash and add a translation layer
+    // (inner senderKey.contextGraphId hashed before the consistency
+    // check, agent-gate queries take a `wireToLocalCg` injection) once
+    // the freemium-tier launch baseline has stabilised.
+    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    const topic = contextGraphWorkspaceTopic(wireCgId);
+    const signer = resolvedSigner === undefined
+      ? await this.resolveWorkspaceGossipSigningAgent(contextGraphId)
+      : resolvedSigner;
+    const wireMessage = await this.encodeWorkspaceGossipMessage(contextGraphId, message, signer);
 
     // rc.9 PR-C (SWM reliable fan-out plan, Step 3): tier-switch
     // between substrate fan-out (point-to-point reliable via
@@ -8527,7 +8640,14 @@ export class DKGAgent {
   }
 
   private async reconcileSharedMemoryGossipSubscription(contextGraphId: string): Promise<void> {
-    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
+    // OT-RFC-38 / LU-6 Phase B — subscribe on the wire-form (hash) topic.
+    // Members compute the hash from their local cleartext id via
+    // {@link gossipWireIdFor}; cores hosting CGs they never joined
+    // already have the hash AS their local id (chain-event auto-
+    // subscribe / discovery-beacon path), so `gossipWireIdFor` is the
+    // identity for them.
+    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    const swmTopic = contextGraphWorkspaceTopic(wireCgId);
     const isRegistered = this.sharedMemoryGossipRegistered.has(contextGraphId);
     const ctx = createOperationContext('system');
     if (!(await this.canUseSharedMemoryForContextGraph(contextGraphId))) {
@@ -8698,7 +8818,14 @@ export class DKGAgent {
    */
   private wireSwmHostModeHandler(contextGraphId: string): void {
     if (this.swmHostModeHandlers.has(contextGraphId)) return;
-    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
+    // OT-RFC-38 / LU-6 Phase B — host-mode subscribes on the wire-form
+    // topic. For chain-event-driven auto-subscribe, `contextGraphId`
+    // IS the wire id (the core has no cleartext to translate from).
+    // For an operator-driven `enableSwmHostModeFor("cleartext-id")`
+    // path on a node that's also a member, `gossipWireIdFor`
+    // resolves to the curator-committed hash via the local meta.
+    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    const swmTopic = contextGraphWorkspaceTopic(wireCgId);
     this.swmHostModeSubscribed.add(contextGraphId);
     this.gossip.subscribe(swmTopic);
     const handler = (_topic: string, data: Uint8Array, from: string) => {
@@ -8730,7 +8857,8 @@ export class DKGAgent {
   private unwireSwmHostModeHandler(contextGraphId: string): void {
     const handler = this.swmHostModeHandlers.get(contextGraphId);
     if (!handler) return;
-    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
+    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    const swmTopic = contextGraphWorkspaceTopic(wireCgId);
     this.gossip.offMessage(swmTopic, handler);
     this.swmHostModeHandlers.delete(contextGraphId);
     this.swmHostModeSubscribed.delete(contextGraphId);
@@ -9585,7 +9713,11 @@ export class DKGAgent {
         getContextGraphAllowedPeers: (cgId) => this.getContextGraphAllowedPeers(cgId),
         isPrivateContextGraph: (cgId) => this.isPrivateContextGraph(cgId),
         getTopicSubscribers: (topic) => this.gossip.getSubscribers(topic),
-        topicForCG: (cgId) => contextGraphWorkspaceTopic(cgId),
+        // OT-RFC-38 / LU-6 Phase B — substrate caller passes the local
+        // cleartext id; resolver derives the wire-form topic for the
+        // peer-subscriber probe so the substrate doesn't query the
+        // wrong topic and conclude a CG has no gossip subscribers.
+        topicForCG: (cgId) => contextGraphWorkspaceTopic(this.gossipWireIdFor(cgId)),
         getSelfPeerId: () => this.peerId,
         // PR-J liveness filter: marks the substrate target subset
         // (NOT `members`/`enumeratedMembers`) so the substrate
@@ -10911,16 +11043,34 @@ export class DKGAgent {
       }
     }
 
+    // OT-RFC-38 / LU-6 Phase B — compute the curator-committed wire id
+    // BEFORE the chain call. Doing this here (rather than letting the
+    // chain adapter default it) keeps the curator/host topic invariant
+    // tight: we publish the same hash on chain that we'll later use
+    // for the SWM gossip topic, envelope `contextGraphId`, signing
+    // payload, and host-mode store key. If we let any layer compute a
+    // different value, members would publish on topic-A while cores
+    // host on topic-B and the substrate silently fragments.
+    //
+    // Cleartext is UTF-8 encoded; matches what `keccak256(bytes(s))`
+    // returns in Solidity for `bytes(string)` casts. Lowercase 0x-
+    // prefixed hex string (ethers' canonical shape) — must round-trip
+    // bit-identically through `getNameHash(uint256)` and the
+    // `ContextGraphCreated.nameHash` topic, otherwise host-mode auto-
+    // subscribe will key on the wrong topic.
+    const nameHash = ethers.keccak256(ethers.toUtf8Bytes(id)).toLowerCase();
+
     const result = await this.registerContextGraphOnChain({
       accessPolicy: resolvedLocalAccessPolicy,
       publishPolicy,
       ...(publishAuthority ? { publishAuthority } : {}),
       ...(isPcaCurated ? { publishAuthorityAccountId } : {}),
       participantAgents,
+      nameHash,
     });
     const onChainId = result.contextGraphId.toString();
 
-    this.log.info(ctx, `Context graph "${id}" registered on-chain: ${onChainId}`);
+    this.log.info(ctx, `Context graph "${id}" registered on-chain: ${onChainId} (nameHash=${nameHash.slice(0, 18)}…)`);
 
     // Update _meta with registered status and on-chain ID
     await this.store.deleteByPattern({
@@ -10931,6 +11081,10 @@ export class DKGAgent {
     await this.store.insert([
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
       { subject: contextGraphUri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${onChainId}"`, graph: ontologyGraph },
+      // Persist the wire-id commitment in the cg's _meta graph so a
+      // restart can resume host-mode subscription on the correct
+      // topic without re-reading the chain event.
+      { subject: contextGraphUri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainHash`, object: `"${nameHash}"`, graph: cgMetaGraph },
     ]);
     // We no longer persist `publishAuthorityAccountId` locally even on
     // success (Codex PR #502 round-6 follow-through): with the
@@ -10942,6 +11096,10 @@ export class DKGAgent {
     const sub = this.subscribedContextGraphs.get(id);
     if (sub) {
       sub.onChainId = onChainId;
+      // Keep the forward + reverse maps in lockstep so the receive
+      // path can translate the wire id back to `id` (see
+      // {@link recordCgWireId}).
+      this.recordCgWireId(id, nameHash);
       if (!sub.subscribed) {
         sub.subscribed = true;
         this.subscribeToContextGraph(id, { trackSyncScope: true });
@@ -13977,11 +14135,54 @@ export class DKGAgent {
       return null;
     }
     let numericId: bigint | null = null;
+    // OT-RFC-38 / LU-6 Phase B — input may be cleartext (member-side
+    // call), hash form (envelope from the wire), or already-numeric
+    // (legacy publish path). Probe in cheapest-first order; we cache
+    // by stringified numeric id below so an early hit reuses the
+    // result regardless of which form the input took.
+    //
+    //   1. Direct hit on `subscribedContextGraphs` — covers cleartext
+    //      (member local id) and hash form when the local node is a
+    //      host-only core whose subscription key IS the hash.
     const sub = this.subscribedContextGraphs.get(contextGraphId);
     if (sub?.onChainId) {
       try { numericId = BigInt(sub.onChainId); } catch { /* fall through */ }
     }
-    if (numericId === null) {
+    //   2. Hash-form input where the local node is a MEMBER (the
+    //      subscription is keyed by cleartext, not hash). Translate
+    //      via the reverse index and re-probe.
+    if (numericId === null && /^0x[0-9a-fA-F]{64}$/.test(contextGraphId)) {
+      const localId = this.wireIdToLocalCgId.get(contextGraphId.toLowerCase());
+      if (localId) {
+        const memberSub = this.subscribedContextGraphs.get(localId);
+        if (memberSub?.onChainId) {
+          try { numericId = BigInt(memberSub.onChainId); } catch { /* fall through */ }
+        }
+      }
+    }
+    //   3. Cleartext-form input on a host-only core. Cores subscribed
+    //      via the chain-event path keep their `subscribedContextGraphs`
+    //      keyed by HASH (the curator-committed wire id), not cleartext.
+    //      When a member's envelope arrives with cleartext in
+    //      `contextGraphId` (the publish path keeps cleartext in the
+    //      envelope for inner-consistency reasons — see
+    //      `publishWorkspaceGossip`), the cleartext direct lookup at
+    //      step 1 misses on the core. Hash the cleartext on-the-fly
+    //      and re-probe before falling through to numeric parse.
+    if (numericId === null && !/^0x[0-9a-fA-F]{64}$/.test(contextGraphId)) {
+      try {
+        const computedHash = ethers.keccak256(ethers.toUtf8Bytes(contextGraphId)).toLowerCase();
+        const hostSub = this.subscribedContextGraphs.get(computedHash);
+        if (hostSub?.onChainId) {
+          try { numericId = BigInt(hostSub.onChainId); } catch { /* fall through */ }
+        }
+      } catch { /* malformed cleartext — fall through */ }
+    }
+    //   4. Numeric form input — accept it directly, but only AFTER the
+    //      hash-form branch above. Otherwise a 32-byte hex hash would
+    //      `BigInt(...)` cleanly and we'd treat its raw integer value
+    //      as an on-chain id (it isn't — the on-chain id is sequential).
+    if (numericId === null && !/^0x[0-9a-fA-F]{64}$/.test(contextGraphId)) {
       try { numericId = BigInt(contextGraphId); } catch { /* not a numeric form */ }
     }
     if (numericId === null || numericId <= 0n) return null;
@@ -14006,6 +14207,110 @@ export class DKGAgent {
         (err instanceof Error ? err.message : String(err)),
       );
       return null;
+    }
+  }
+
+  // ── OT-RFC-38 / LU-6 Phase B — wire-id translation surface ────────
+  //
+  // All SWM wire forms (gossip topic, envelope `contextGraphId`,
+  // signing payload, LU-7 catchup, host-mode store keys) are keyed by
+  // `onChainHash` — `keccak256(bytes(cleartextId))` lowercase 0x-
+  // prefixed hex. The wire id is the same for every node so cores can
+  // derive it directly from the `ContextGraphCreated.nameHash` event
+  // topic without ever learning the cleartext.
+  //
+  // Local form, by contrast, is whatever the node knows: cleartext for
+  // CG members (who learned it via create / curator invite) and the
+  // hash itself for cores that only host (never were members). The
+  // helpers below are the SINGLE translation surface — every place
+  // that crosses the local↔wire boundary MUST go through them. Direct
+  // string concatenation against the topic format string is a recipe
+  // for the curator/host topic-fragmentation bug.
+  //
+  // For backwards compatibility with CGs created before Phase B (the
+  // `onChainHash` mapping is empty), the helpers fall back to the
+  // cleartext local id as the wire id. Those CGs never went through
+  // the chain-anchored discovery path so this preserves their behavior
+  // — they'll keep working with curator-driven explicit subscribes.
+
+  /**
+   * Resolve the gossip wire id (hash form) for a local CG id.
+   *
+   * Lookup order:
+   *   1. `subscribedContextGraphs[localId].onChainHash` — populated by
+   *      the register-on-chain success path, the chain-event auto-
+   *      discovery handler, the join-approved payload handler, and
+   *      the discovery-beacon listener.
+   *   2. If `localId` already looks like a wire id (32-byte hex), use
+   *      it directly — handles the "core hosting a CG it never joined"
+   *      case where `localId === wireId === onChainHash`.
+   *   3. Compute on-the-fly via `keccak256(bytes(localId))` for CGs
+   *      we created locally but haven't yet registered (allows
+   *      pre-registration discovery-beacon broadcast to use a
+   *      stable wire id).
+   *
+   * Returns lowercase 0x-prefixed hex.
+   */
+  private gossipWireIdFor(localId: string): string {
+    const sub = this.subscribedContextGraphs.get(localId);
+    if (sub?.onChainHash) return sub.onChainHash;
+    if (/^0x[0-9a-fA-F]{64}$/.test(localId)) return localId.toLowerCase();
+    return ethers.keccak256(ethers.toUtf8Bytes(localId)).toLowerCase();
+  }
+
+  /**
+   * Resolve the local CG id from a wire id. Used by the receive path
+   * to map an envelope's `contextGraphId` (hash) back to the local id
+   * used as storage/SPARQL key.
+   *
+   * Returns:
+   *   - cleartext id if the local node is a member of the CG
+   *   - the hash itself if the local node hosts but isn't a member
+   *     (cores' canonical local id IS the hash — this is the
+   *     "I never knew the cleartext" path)
+   *   - the input as-is for non-hash inputs (pre-Phase-B fallback,
+   *     plus a safety net for callers that already passed cleartext
+   *     by mistake)
+   *
+   * Never throws. Read-only.
+   */
+  private localCgIdForWireId(wireId: string): string {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(wireId)) return wireId;
+    const lower = wireId.toLowerCase();
+    const localId = this.wireIdToLocalCgId.get(lower);
+    if (localId) return localId;
+    // Not a known member CG — return the hash as the local id. This
+    // is the canonical "host-only core" path: the core's
+    // subscribedContextGraphs is keyed by the hash and there's no
+    // cleartext to recover.
+    return lower;
+  }
+
+  /**
+   * Record the curator-committed wire id for a local CG. Keeps the
+   * forward (subscribedContextGraphs) and reverse (wireIdToLocalCgId)
+   * mappings in lockstep. Idempotent.
+   *
+   * Pass `null` to clear the mapping (rare — used when a CG is
+   * deactivated and we want to free the reverse-index slot).
+   */
+  private recordCgWireId(localId: string, wireId: string | null): void {
+    const sub = this.subscribedContextGraphs.get(localId);
+    const lower = wireId ? wireId.toLowerCase() : null;
+    if (sub) {
+      sub.onChainHash = lower ?? undefined;
+    }
+    // Drop any stale reverse entry that pointed at this localId under
+    // a different hash (curator rotated the wire id — currently
+    // unsupported but cheap to defend against).
+    if (sub?.onChainHash && (!lower || sub.onChainHash !== lower)) {
+      const prev = sub.onChainHash;
+      if (this.wireIdToLocalCgId.get(prev) === localId) {
+        this.wireIdToLocalCgId.delete(prev);
+      }
+    }
+    if (lower) {
+      this.wireIdToLocalCgId.set(lower, localId);
     }
   }
 

@@ -528,6 +528,23 @@ export class DKGAgent {
   private readonly gossipRegistered = new Set<string>();
   private readonly sharedMemoryGossipRegistered = new Set<string>();
   private readonly seenOnChainIds = new Set<string>();
+  /**
+   * OT-RFC-38 / LU-5: per-core cache of on-chain CG access policies,
+   * keyed by the on-chain numeric id (uint256). Populated by:
+   *   1. `onContextGraphCreated` chain-event handler (eager) — fills in
+   *      the access policy as soon as the core sees the `ContextGraphCreated`
+   *      / `NameClaimed` event from chain, BEFORE the publisher's
+   *      first publish intent arrives.
+   *   2. `isCgCurated` callback (lazy) — when local store has no
+   *      access-policy triple AND the cache is cold, the callback falls
+   *      back to a single `chain.getContextGraphAccessPolicy` RPC and
+   *      memoizes the answer here.
+   *
+   * `1` = curated/private, `0` = public, `undefined` = not yet
+   * resolved. Callers MUST NOT interpret missing-from-cache as a
+   * positive curation signal — fall through to the chain.
+   */
+  private readonly onChainAccessPolicyCache = new Map<string, number>();
   private readonly peerHealth = new Map<string, PeerHealth>();
   private readonly knownCorePeerIds = new Set<string>();
   private readonly syncingPeers = new Set<string>();
@@ -1275,14 +1292,30 @@ export class DKGAgent {
               // `isEncryptedPayload=true` claim against this node's
               // local view of the CG. `isPrivateContextGraph()` is the
               // same predicate the SWM data-plane uses to gate
-              // sync / share auth, so the ACK path stays consistent.
-              // Prefer `swmGraphId` (the cleartext form the publisher
-              // ships with curated publishes) over the numeric on-chain
-              // id — the latter only resolves to a local access-policy
-              // record after the CG has been synced from chain events,
-              // which is racy for very fresh CGs. If neither form
-              // resolves to a curated entry, return `false` (handler
-              // treats this as "publisher must use plaintext path").
+              // sync / share auth, so the ACK path stays consistent
+              // for curators / members that have already synced the
+              // CG metadata locally.
+              //
+              // Chain fallback (regression fix, post-R5): for a CG that
+              // a non-curator core just learned about via on-chain
+              // event but whose meta-graph triples haven't been
+              // gossipped yet, the local-store probes both miss. The
+              // `ContextGraphCreated` event handler eagerly seeds
+              // `onChainAccessPolicyCache`, but for cores that started
+              // AFTER a CG's create-block (or missed the event), we
+              // also do a single lazy chain read via
+              // `chain.getContextGraphAccessPolicy`. The chain is the
+              // source of truth — Solidity stores the policy as a
+              // uint8 on `ContextGraphStorage`. `cgId` here is the
+              // PublishIntent's on-chain numeric id (see
+              // `core/proto/publish-intent.ts:62` — "TARGET on-chain
+              // numeric CG id"), so it maps directly to the contract
+              // call.
+              //
+              // Returns `null` when curation is genuinely indeterminate
+              // (chain adapter doesn't expose the getter; chain read
+              // throws). The handler treats `null !== true` as
+              // fail-closed, preserving the original auth-bypass guard.
               isCgCurated: async (cgId: string, swmGraphId?: string) => {
                 const probes = swmGraphId && swmGraphId !== cgId
                   ? [swmGraphId, cgId]
@@ -1292,7 +1325,38 @@ export class DKGAgent {
                     if (await this.isPrivateContextGraph(probe)) return true;
                   } catch { /* probe next form */ }
                 }
-                return false;
+                const cached = this.onChainAccessPolicyCache.get(cgId);
+                if (cached !== undefined) {
+                  return cached === 1;
+                }
+                const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+                if (typeof getAccessPolicy !== 'function') {
+                  return null;
+                }
+                let numericId: bigint;
+                try {
+                  numericId = BigInt(cgId);
+                } catch {
+                  return null;
+                }
+                if (numericId <= 0n) {
+                  return null;
+                }
+                try {
+                  const policy = await getAccessPolicy.call(this.chain, numericId);
+                  if (policy === 0 || policy === 1) {
+                    this.onChainAccessPolicyCache.set(cgId, policy);
+                    return policy === 1;
+                  }
+                  return null;
+                } catch (err) {
+                  this.log.warn(
+                    ctx,
+                    `isCgCurated: chain.getContextGraphAccessPolicy(${cgId}) failed — treating as UNKNOWN (fail-closed at handler): ` +
+                    (err instanceof Error ? err.message : String(err)),
+                  );
+                  return null;
+                }
               },
               isSignerRegistered: async () => {
                 const isOperationalWalletRegistered = this.chain.isOperationalWalletRegistered;
@@ -1474,6 +1538,18 @@ export class DKGAgent {
           if (!alreadyKnown) {
             this.seenOnChainIds.add(contextGraphId);
             this.log.info(ctx, `Noted on-chain context graph ${contextGraphId.slice(0, 16)}… — will subscribe once cleartext name is resolved`);
+          }
+
+          // OT-RFC-38 / LU-5: eagerly populate the on-chain access-policy
+          // cache so the StorageACK encrypted-payload guard can answer
+          // `isCgCurated` from local state without an extra RPC. The
+          // event itself carries the policy enum — no need to re-read.
+          // `contextGraphId` here is the on-chain numeric id (stringified
+          // bigint) for V10 `ContextGraphCreated` events, which is also
+          // what the publish-intent ships in `PublishIntent.contextGraphId`,
+          // so the keying matches the lazy-fallback lookup below.
+          if (accessPolicy === 0 || accessPolicy === 1) {
+            this.onChainAccessPolicyCache.set(contextGraphId, accessPolicy);
           }
         },
       });

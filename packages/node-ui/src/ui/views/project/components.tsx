@@ -30,6 +30,7 @@ import { ActivityFeed } from '../../components/ActivityFeed.js';
 import { VerifiedIdentityBanner } from '../../components/VerifiedIdentityBanner.js';
 import { SubGraphBar } from '../../components/SubGraphBar.js';
 import { GenUIEntityPanel } from '../../genui/index.js';
+import { memoryGraphLabels } from '../../lib/memoryLabels.js';
 import { useTabsStore } from '../../stores/tabs.js';
 import {
   useVerifiedMemoryAnchors,
@@ -2266,10 +2267,7 @@ export function KADetailView({ entity, allEntities, allTriples, onNavigate, onCl
   const graphOptions = useMemo(() => ({
     labelMode: 'humanized' as const,
     renderer: '2d' as const,
-    labels: {
-      predicates: ['http://schema.org/name', 'http://www.w3.org/2000/01/rdf-schema#label'],
-      minZoomForLabels: 0.2,
-    },
+    labels: memoryGraphLabels({ minZoomForLabels: 0.2 }),
     style: {
       defaultNodeColor: TRUST_COLORS[entity.trustLevel],
       defaultEdgeColor: '#475569',
@@ -2753,14 +2751,7 @@ export function SubGraphMiniCard({
   const graphOptions = useMemo(() => ({
     labelMode: 'humanized' as const,
     renderer: '2d' as const,
-    labels: {
-      predicates: [
-        'http://schema.org/name',
-        'http://www.w3.org/2000/01/rdf-schema#label',
-        'http://purl.org/dc/terms/title',
-      ],
-      minZoomForLabels: 0.8, // Keep labels out of the way in the mini view.
-    },
+    labels: memoryGraphLabels({ minZoomForLabels: 0.8 }), // Keep labels out of the way in the mini view.
     style: {
       classColors: CODE_CLASS_COLORS,
       predicateColors: CODE_PREDICATE_COLORS,

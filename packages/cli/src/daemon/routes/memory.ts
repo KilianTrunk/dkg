@@ -1680,10 +1680,25 @@ WHERE {
       try {
         const existingOnChainId = await agent.getContextGraphOnChainId(contextGraphId);
         if (!existingOnChainId) {
+          // OT-RFC-38 / LU-6 Phase B (Codex PR #610 fd5b31f1 fix):
+          // load create-time `publishPolicy` and
+          // `publishAuthorityAccountId` so the deferred-registration
+          // call preserves the user's intent end-to-end. Pre-fix, this
+          // call forwarded only `callerAgentAddress` and silently
+          // coerced the policy back to the access-policy default —
+          // breaking curated-access + open-contribution and PCA-
+          // curated registrations.
+          const storedOpts = await agent.getStoredContextGraphRegistrationOptions(contextGraphId);
           await tracker.trackPhase(ctx, "register-on-chain", () =>
             agent.registerContextGraph(contextGraphId, {
               ...(resolvedAuthorAgentAddress != null
                 ? { callerAgentAddress: resolvedAuthorAgentAddress }
+                : {}),
+              ...(storedOpts.publishPolicy !== undefined
+                ? { publishPolicy: storedOpts.publishPolicy }
+                : {}),
+              ...(storedOpts.publishAuthorityAccountId !== undefined
+                ? { publishAuthorityAccountId: storedOpts.publishAuthorityAccountId }
                 : {}),
             }),
           );

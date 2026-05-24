@@ -186,6 +186,35 @@ export class SharedMemoryHandler {
   private readonly chainAgentGateOracle?: (
     contextGraphId: string,
   ) => Promise<string[] | null>;
+  /**
+   * OT-RFC-38 / LU-6 Phase B — beacon-curator fallback for the agent
+   * allowlist read. Returns the curator EOA pinned for `contextGraphId`
+   * via a previously-received discovery beacon (first-claim-wins),
+   * or `null` when no beacon has been observed.
+   *
+   * Consulted ONLY when both the local meta-graph and the chain
+   * oracle returned empty. Hits during two race windows that would
+   * otherwise drop legitimate ciphertext:
+   *
+   *   1. Pre-registration: the curator broadcast a beacon and is
+   *      already writing SWM, but hasn't sent the on-chain
+   *      `ContextGraphCreated` tx yet (or it's pending).
+   *   2. Chain-event race: the curator registered on chain N seconds
+   *      ago, but the core's `ChainEventPoller` hasn't observed the
+   *      event yet (poll cadence ~12s). The local CG-id → numeric-id
+   *      mapping in `resolveOnChainParticipantAgents` is therefore
+   *      cold, and the chain oracle returns null.
+   *
+   * Returning the curator EOA is safe: the beacon protocol verifies
+   * the curator's EIP-191 signature over `(nameHash, accessPolicy,
+   * curatorEoa, timestamp)` before recording the binding, so we
+   * KNOW the EOA controls the CG name. Restricting the allowlist
+   * to a single address (the curator) during the race window blocks
+   * any other signer until the chain truth catches up.
+   */
+  private readonly beaconCuratorOracle?: (
+    contextGraphId: string,
+  ) => Promise<string | null>;
   private readonly workspaceRecipientPrivateKeys?: (
     contextGraphId: string,
   ) => readonly WorkspaceRecipientEncryptionKey[] | Promise<readonly WorkspaceRecipientEncryptionKey[]>;
@@ -263,6 +292,15 @@ export class SharedMemoryHandler {
       chainAgentGateOracle?: (
         contextGraphId: string,
       ) => Promise<string[] | null>;
+      /**
+       * OT-RFC-38 / LU-6 Phase B beacon-pinned curator fallback. See
+       * {@link SharedMemoryHandler#beaconCuratorOracle}. Optional;
+       * omitted on test rigs and edge-only deployments that don't run
+       * the discovery-beacon machinery.
+       */
+      beaconCuratorOracle?: (
+        contextGraphId: string,
+      ) => Promise<string | null>;
       workspaceRecipientPrivateKeys?: (
         contextGraphId: string,
       ) => readonly WorkspaceRecipientEncryptionKey[] | Promise<readonly WorkspaceRecipientEncryptionKey[]>;
@@ -301,6 +339,7 @@ export class SharedMemoryHandler {
     this.writeLocks = options?.writeLocks ?? new Map();
     this.localAgentAddresses = options?.localAgentAddresses;
     this.chainAgentGateOracle = options?.chainAgentGateOracle;
+    this.beaconCuratorOracle = options?.beaconCuratorOracle;
     this.workspaceRecipientPrivateKeys = options?.workspaceRecipientPrivateKeys;
     this.workspaceSenderKeyDecryptor = options?.workspaceSenderKeyDecryptor;
     this.now = options?.now ?? (() => Date.now());
@@ -1381,6 +1420,32 @@ export class SharedMemoryHandler {
         this.log.warn(
           createOperationContext('share'),
           `chainAgentGateOracle threw for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)} — treating as no allowlist`,
+        );
+      }
+    }
+
+    // OT-RFC-38 / LU-6 Phase B — final fallback: beacon-pinned curator
+    // EOA. Hits during the pre-registration and chain-event-race
+    // windows where the chain oracle has no answer but the curator has
+    // already broadcast (and we verified) a discovery beacon
+    // committing themselves as the curator for this CG. Returning
+    // `[curatorEoa]` admits envelopes signed by that one address only
+    // — sufficient to keep curator-side writes flowing until the
+    // chain truth catches up, and tight enough that no other signer
+    // can sneak ciphertext through during the race window.
+    //
+    // See `beaconCuratorOracle` jsdoc for why the curator signature on
+    // the beacon makes this safe.
+    if (this.beaconCuratorOracle) {
+      try {
+        const curatorEoa = await this.beaconCuratorOracle(contextGraphId);
+        if (curatorEoa && ethers.isAddress(curatorEoa)) {
+          return [ethers.getAddress(curatorEoa)];
+        }
+      } catch (err) {
+        this.log.warn(
+          createOperationContext('share'),
+          `beaconCuratorOracle threw for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)} — treating as no allowlist`,
         );
       }
     }

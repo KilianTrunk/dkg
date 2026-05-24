@@ -9164,10 +9164,29 @@ export class DKGAgent {
     const handler = this.getOrCreateSharedMemoryHandler();
     const verdict = await handler.verifyHostModeEnvelopeAuthority(data, storageCgId, fromPeerId);
     if (!verdict.accepted) {
-      this.log.warn(
-        ctx,
-        `Host-mode SWM envelope rejected for cg=${storageCgId} from=${fromPeerId}: ${verdict.reason}`,
-      );
+      // "no agent allowlist" is the expected outcome during the brief
+      // chain-event race window (cores see the beacon, auto-engage
+      // host-mode, then receive ciphertext BEFORE the
+      // `ContextGraphCreated` event lands AND before the curator
+      // beacon arrived). The beaconCuratorOracle fallback closes
+      // most of that window; the remaining race (envelope arrives
+      // before the beacon is received & verified) is recoverable
+      // via member catchup and should not spam WARN logs in steady-
+      // state operation. Other rejection reasons (sig mismatch, peer
+      // not in allowlist, decode failure) remain WARN — those are
+      // real authority failures that operators need to see.
+      const isTransientRace = verdict.reason === 'no agent allowlist on context graph';
+      if (isTransientRace) {
+        this.log.debug(
+          ctx,
+          `Host-mode SWM envelope dropped for cg=${storageCgId} from=${fromPeerId}: ${verdict.reason} (transient chain-event race; member will catchup)`,
+        );
+      } else {
+        this.log.warn(
+          ctx,
+          `Host-mode SWM envelope rejected for cg=${storageCgId} from=${fromPeerId}: ${verdict.reason}`,
+        );
+      }
       return;
     }
 
@@ -9806,8 +9825,41 @@ export class DKGAgent {
   private async maybeMarkRegisteredForHostMode(contextGraphId: string): Promise<void> {
     if (!this.swmHostModeStore) return;
     try {
-      const onChainKnown = await this.isContextGraphRegisteredOnChain(contextGraphId);
-      if (onChainKnown) await this.swmHostModeStore.markRegistered(contextGraphId);
+      // OT-RFC-38 / LU-6 Phase B — three-way registration probe.
+      //
+      //   1. Legacy: ask the chain adapter directly (if it exposes
+      //      `getContextGraphOnChain(cleartextId)`). The default
+      //      adapter doesn't, so this returns false on most setups.
+      //
+      //   2. Host-only-core path: the chain-event handler populated
+      //      `subscribedContextGraphs.get(wireIdHash).onChainId` when
+      //      it observed `ContextGraphCreated(nameHash, ...)`. If the
+      //      cleartext hash hits an entry with `onChainId`, the CG IS
+      //      registered.
+      //
+      //   3. Member-side path: a node that created the CG locally and
+      //      then registered keeps `subscribedContextGraphs.get(cleartext)
+      //      .onChainId` populated. This is the cleartext-keyed
+      //      shortcut.
+      //
+      // Any positive probe flips the store flag so the registered
+      // per-CG byte cap (64MB) replaces the pre-reg cap (1MB) and
+      // the pre-reg rate-limit short-circuits in
+      // `ingestSwmHostModeEnvelope` (registered CGs are gated by
+      // chain economics, not the freemium-tier window).
+      let registered = await this.isContextGraphRegisteredOnChain(contextGraphId);
+      if (!registered) {
+        const directSub = this.subscribedContextGraphs.get(contextGraphId);
+        if (directSub?.onChainId) registered = true;
+      }
+      if (!registered) {
+        try {
+          const wireId = this.gossipWireIdFor(contextGraphId);
+          const wireSub = this.subscribedContextGraphs.get(wireId);
+          if (wireSub?.onChainId) registered = true;
+        } catch { /* malformed cleartext — fall through */ }
+      }
+      if (registered) await this.swmHostModeStore.markRegistered(contextGraphId);
     } catch { /* best-effort; pre-registration defaults stay in place */ }
   }
 
@@ -9999,6 +10051,14 @@ export class DKGAgent {
         // collapses for any CG the hosting core didn't itself
         // create or join. See `resolveOnChainParticipantAgents`.
         chainAgentGateOracle: (cgId: string) => this.resolveOnChainParticipantAgents(cgId),
+        // OT-RFC-38 / LU-6 Phase B — final fallback when chain has no
+        // answer yet. Looks up the curator EOA the local node pinned
+        // from this CG's discovery beacon. Hits during the pre-reg
+        // and chain-event-race windows where the chain oracle is cold
+        // but a valid beacon has already verified the curator's
+        // signature, so admitting envelopes signed by that EOA is
+        // safe. See `resolveBeaconPinnedCuratorEoa`.
+        beaconCuratorOracle: (cgId: string) => this.resolveBeaconPinnedCuratorEoa(cgId),
         workspaceRecipientPrivateKeys: () => this.getLocalWorkspaceRecipientPrivateKeys(),
         workspaceSenderKeyDecryptor: (message: SwmSenderKeyMessageMsg, contextGraphId: string, ctx: OperationContext) =>
           this.decryptWorkspacePayloadWithSenderKey(message, contextGraphId, ctx),
@@ -10682,6 +10742,23 @@ export class DKGAgent {
     allowedAgents?: string[];
     /** Participant agent addresses for on-chain context graphs. */
     participantAgents?: string[];
+    /**
+     * Optional contribution-policy override persisted at create time
+     * so the deferred-registration path
+     * (auto-register-on-first-VM-publish at memory.ts) preserves the
+     * user's create-time choice. `0` = curators-only, `1` = open.
+     * When omitted, registration derives the default from accessPolicy.
+     */
+    publishPolicy?: number;
+    /**
+     * Optional PCA (publish-curated-authority) account id persisted
+     * at create time. When set, registerContextGraph uses it to
+     * register the CG under a delegated authority instead of the
+     * raw EOA-curated path. Persisted alongside publishPolicy for
+     * the same deferred-registration reason — without persistence,
+     * auto-register would silently drop PCA-curated configs.
+     */
+    publishAuthorityAccountId?: bigint | string | number;
     /** When true, skips gossip subscription and broadcast. Data stays local-only. */
     private?: boolean;
     /** Caller's agent address (resolved from token). Used for curator/creator triples. */
@@ -10713,26 +10790,44 @@ export class DKGAgent {
     const isCurated = opts.accessPolicy === LOCAL_ACCESS_CURATED
       || (opts.allowedAgents && opts.allowedAgents.length > 0)
       || (opts.allowedPeers && opts.allowedPeers.length > 0);
-    // pcaAccountId is a register-time-only knob (Codex PR #502
-    // round-3: `createContextGraph` no longer persists it). The field
-    // is intentionally NOT part of the public `createContextGraph`
-    // TypeScript signature — TS-first callers get a compile-time
-    // excess-property error if they try to set it (Codex round-7).
-    // The runtime check below still fires so untyped/JS callers (or
-    // typed callers using `as any`) get an immediate, actionable
-    // error instead of a confusing "EOA-curated when I asked for PCA"
-    // outcome at register time. Daemon callers can't hit this path —
-    // the HTTP route already strips the param before calling
-    // `createContextGraph`.
-    const optsRecord = opts as unknown as Record<string, unknown>;
-    if (optsRecord.publishAuthorityAccountId !== undefined) {
+    // OT-RFC-38 / LU-6 Phase B (Codex PR #610 fd5b31f1 fix): persist
+    // `publishPolicy` and `publishAuthorityAccountId` when supplied.
+    // Pre-fix, both were register-time-only — fine in the original
+    // "register synchronously at create-time" model. But this PR made
+    // deferred registration the default (`memory.ts` auto-registers
+    // on first VM publish, no longer requiring the user to call
+    // `/register` first). Without persistence, the auto-register call
+    // forwarded only `callerAgentAddress`, silently dropping the
+    // user's create-time choice and falling back to the access-policy-
+    // derived default. That broke valid combinations like
+    // curated-access + open-contribution (publishPolicy=1) and PCA-
+    // curated registration. Persisting at create time and reading at
+    // register time keeps the user's intent end-to-end.
+    if (opts.publishPolicy !== undefined && opts.publishPolicy !== 0 && opts.publishPolicy !== 1) {
       throw new Error(
-        '`publishAuthorityAccountId` is not supported on createContextGraph(). '
-        + 'PCA account ids are register-time-only — supply `publishAuthorityAccountId` '
-        + 'on registerContextGraph() instead. Background: createContextGraph no '
-        + 'longer persists PCA ids locally, so any value passed here would silently '
-        + 'be dropped before registration (Codex PR #502 round-3/round-6/round-7).',
+        '`publishPolicy` must be 0 (curators-only) or 1 (open).',
       );
+    }
+    let normalisedPublishAuthorityAccountId: bigint | undefined;
+    if (opts.publishAuthorityAccountId !== undefined) {
+      const raw = opts.publishAuthorityAccountId;
+      try {
+        normalisedPublishAuthorityAccountId =
+          typeof raw === 'bigint' ? raw : BigInt(raw as never);
+      } catch {
+        throw new Error('`publishAuthorityAccountId` must be a positive integer.');
+      }
+      if (normalisedPublishAuthorityAccountId <= 0n) {
+        throw new Error('`publishAuthorityAccountId` must be a positive integer.');
+      }
+      // PCA is only meaningful on curated-contribution registrations.
+      // Mirror the daemon-route guard so direct agent callers can't
+      // accidentally smuggle a PCA id onto an open-publish CG.
+      if (opts.publishPolicy === 1) {
+        throw new Error(
+          '`publishAuthorityAccountId` is only valid with curated publishPolicy (0).',
+        );
+      }
     }
 
     if (opts.private) {
@@ -10771,14 +10866,32 @@ export class DKGAgent {
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: `"${isCurated || opts.private ? 'private' : 'public'}"`, graph: defGraph },
     ];
 
-    // Store registration status and curator in _meta. We do NOT
-    // store any PCA account id here — that param is register-time-only
-    // and createContextGraph rejects it at the boundary (Codex PR
-    // #502 round-3 + round-6).
+    // Store registration status and curator in _meta. Also persist
+    // `publishPolicy` / `publishAuthorityAccountId` when supplied so
+    // the deferred-registration path (memory.ts auto-register on
+    // first VM publish) can re-load the user's create-time choices.
+    // See the boundary block above for rationale (Codex PR #610
+    // fd5b31f1 follow-up).
     quads.push(
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"unregistered"`, graph: cgMetaGraph },
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: curatorDid, graph: cgMetaGraph },
     );
+    if (opts.publishPolicy !== undefined) {
+      quads.push({
+        subject: contextGraphUri,
+        predicate: DKG_ONTOLOGY.DKG_PUBLISH_POLICY,
+        object: `"${opts.publishPolicy}"`,
+        graph: cgMetaGraph,
+      });
+    }
+    if (normalisedPublishAuthorityAccountId !== undefined) {
+      quads.push({
+        subject: contextGraphUri,
+        predicate: DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID,
+        object: `"${normalisedPublishAuthorityAccountId.toString()}"`,
+        graph: cgMetaGraph,
+      });
+    }
 
     // Store peer allowlist for curated CGs (with validation)
     if (opts.allowedPeers && opts.allowedPeers.length > 0) {
@@ -12928,6 +13041,50 @@ export class DKGAgent {
   }
 
   /**
+   * OT-RFC-38 / LU-6 Phase B — read create-time `publishPolicy` and
+   * `publishAuthorityAccountId` persisted by `createContextGraph`.
+   * Returns `{}` when neither is set, mirroring the existing
+   * "register-time-only knobs are undefined" behaviour for legacy CGs
+   * created before this PR landed.
+   *
+   * Consumed by the deferred-registration auto-register call in the
+   * VM-publish daemon route (`memory.ts`) to preserve the user's
+   * create-time choice instead of silently falling back to the
+   * access-policy-derived default. Codex PR #610 fd5b31f1 follow-up.
+   */
+  async getStoredContextGraphRegistrationOptions(contextGraphId: string): Promise<{
+    publishPolicy?: number;
+    publishAuthorityAccountId?: bigint;
+  }> {
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+    const result = await this.store.query(
+      `SELECT ?pp ?paa WHERE { GRAPH <${cgMetaGraph}> {
+        OPTIONAL { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PUBLISH_POLICY}> ?pp }
+        OPTIONAL { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PUBLISH_AUTHORITY_ACCOUNT_ID}> ?paa }
+      } } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return {};
+    const row = result.bindings[0] ?? {};
+    const out: { publishPolicy?: number; publishAuthorityAccountId?: bigint } = {};
+    const rawPp = row['pp'];
+    if (typeof rawPp === 'string') {
+      const stripped = rawPp.replace(/^"|"$/g, '');
+      const n = Number(stripped);
+      if (n === 0 || n === 1) out.publishPolicy = n;
+    }
+    const rawPaa = row['paa'];
+    if (typeof rawPaa === 'string') {
+      const stripped = rawPaa.replace(/^"|"$/g, '');
+      try {
+        const v = BigInt(stripped);
+        if (v > 0n) out.publishAuthorityAccountId = v;
+      } catch { /* not a valid bigint literal — skip */ }
+    }
+    return out;
+  }
+
+  /**
    * Get the peer allowlist for a context graph (if curated).
    * Returns null if no allowlist is set (open CG).
    */
@@ -14674,6 +14831,44 @@ export class DKGAgent {
       );
       return null;
     }
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — chain-race / pre-reg fallback for the
+   * authority check on host-only cores. Returns the curator EOA the
+   * local node pinned for `contextGraphId` from a previously-
+   * received & verified discovery beacon (`beaconCuratorByWireId`,
+   * keyed by wire-id hash).
+   *
+   * Wired into {@link SharedMemoryHandler#beaconCuratorOracle} as the
+   * tertiary fallback after the local meta-graph and the chain
+   * oracle. Input may be cleartext (envelope payload) or hash form
+   * (host-only-core subscription key); we hash on the fly when the
+   * input doesn't already match the wire-id regex.
+   *
+   * Returning a single address (the curator) is intentional: during
+   * the race window we want to admit ONLY the curator's writes, not
+   * the eventual member set. Once the chain event lands the
+   * `chainAgentGateOracle` returns the full participant list and
+   * this fallback drops out naturally.
+   */
+  private async resolveBeaconPinnedCuratorEoa(contextGraphId: string): Promise<string | null> {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
+      return null;
+    }
+    let wireId: string;
+    if (/^0x[0-9a-fA-F]{64}$/.test(contextGraphId)) {
+      wireId = contextGraphId.toLowerCase();
+    } else {
+      try {
+        wireId = ethers.keccak256(ethers.toUtf8Bytes(contextGraphId)).toLowerCase();
+      } catch {
+        return null;
+      }
+    }
+    const curatorEoa = this.beaconCuratorByWireId.get(wireId);
+    if (!curatorEoa || !ethers.isAddress(curatorEoa)) return null;
+    return ethers.getAddress(curatorEoa);
   }
 
   // ── OT-RFC-38 / LU-6 Phase B — wire-id translation surface ────────

@@ -172,4 +172,34 @@ describe('SwmHostModeStore', () => {
     expect(Array.from(a[0].envelopeBytes)).toEqual([1, 2]);
     expect(Array.from(b[0].envelopeBytes)).toEqual([3, 4]);
   });
+
+  it('exposes a per-CG breakdown via stats() with entries, bytes, and registered flag', async () => {
+    // Codex PR #610 R3: callers asserting "ciphertext was stored
+    // for CG X" must be able to filter — relying on the global
+    // totals lets unrelated CGs mask a missing entry for X.
+    const store = new SwmHostModeStore({
+      dataDir: dir,
+      unregisteredLimits: { perCgByteCap: 1024 * 1024, ttlMs: 60_000 },
+      registeredLimits: { perCgByteCap: 1024 * 1024, ttlMs: 60_000 },
+    });
+    await store.append('cg/per-cg-A', new Uint8Array([1, 2, 3, 4]));
+    await store.append('cg/per-cg-A', new Uint8Array([5, 6, 7, 8]));
+    await store.append('cg/per-cg-B', new Uint8Array([9, 10]));
+    await store.markRegistered('cg/per-cg-A');
+
+    const stats = await store.stats();
+    expect(stats.cgCount).toBe(2);
+    expect(stats.totalEntries).toBe(3);
+
+    expect(stats.perCg['cg/per-cg-A']).toBeDefined();
+    expect(stats.perCg['cg/per-cg-A'].entries).toBe(2);
+    expect(stats.perCg['cg/per-cg-A'].registered).toBe(true);
+    expect(stats.perCg['cg/per-cg-A'].bytes).toBeGreaterThan(0);
+
+    expect(stats.perCg['cg/per-cg-B']).toBeDefined();
+    expect(stats.perCg['cg/per-cg-B'].entries).toBe(1);
+    expect(stats.perCg['cg/per-cg-B'].registered).toBe(false);
+
+    expect(stats.perCg['cg/never-seen']).toBeUndefined();
+  });
 });

@@ -64,6 +64,16 @@ export interface SwmHostModeStats {
   totalBytes: number;
   /** Total stored entries (sum across CGs). */
   totalEntries: number;
+  /**
+   * Per-CG breakdown. Keys are the raw contextGraphIds (not the
+   * hashed on-disk filenames). Tests and operators that need to
+   * assert "ciphertext was stored for CG X" must consume this
+   * field rather than the global totals — those can be polluted
+   * by ciphertext from other CGs the same core happens to host
+   * (Codex PR #610 R3 caught the false-positive risk in the
+   * SCENARIO D devnet assertion).
+   */
+  perCg: Record<string, { entries: number; bytes: number; registered: boolean }>;
 }
 
 const DEFAULT_UNREGISTERED_LIMITS: SwmHostModeStoreLimits = {
@@ -249,22 +259,28 @@ export class SwmHostModeStore {
     const cgs = await this.listKnownCgs();
     let totalBytes = 0;
     let totalEntries = 0;
+    const perCg: Record<string, { entries: number; bytes: number; registered: boolean }> = {};
     for (const cgInfo of cgs) {
       const filePath = this.logPath(cgInfo.contextGraphId);
       if (!(await fileExists(filePath))) continue;
       const stat = await fs.stat(filePath);
-      totalBytes += stat.size;
+      const bytes = stat.size;
+      totalBytes += bytes;
       const buf = await fs.readFile(filePath);
       let offset = 0;
+      let entries = 0;
       while (offset + ENTRY_HEADER_BYTES <= buf.length) {
         const len = buf.readUInt32BE(offset + 16);
         const end = offset + ENTRY_HEADER_BYTES + len;
         if (end > buf.length) break;
-        totalEntries += 1;
+        entries += 1;
         offset = end;
       }
+      totalEntries += entries;
+      const meta = await this.loadMeta(cgInfo.contextGraphId).catch(() => null);
+      perCg[cgInfo.contextGraphId] = { entries, bytes, registered: meta?.registered ?? false };
     }
-    return { cgCount: cgs.length, totalBytes, totalEntries };
+    return { cgCount: cgs.length, totalBytes, totalEntries, perCg };
   }
 
   /** Test-only: returns the persisted seqno cursor for a CG, or 0 if unknown. */

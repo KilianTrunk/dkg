@@ -368,6 +368,17 @@ export class DKGAgent {
   private swmHostModeStore?: SwmHostModeStore;
   /** CGs we've subscribed to in host mode (cores only). */
   private readonly swmHostModeSubscribed = new Set<string>();
+  /**
+   * Per-CG reference to the host-mode gossip handler closure. Kept
+   * so we can call `gossip.offMessage(topic, handler)` to remove
+   * JUST the host-mode handler when the same core later becomes
+   * member-authorized for the CG, without disturbing other handlers
+   * for the same topic. Codex PR #610 R3 caught the duplicate-apply
+   * defect where both host- and member-mode handlers ran in
+   * parallel after authorization flipped, causing every gossip
+   * message to be both decrypted-and-applied AND opaquely appended.
+   */
+  private readonly swmHostModeHandlers = new Map<string, (topic: string, data: Uint8Array, from: string) => void>();
   /** Async lock for the host-mode reconciler so simultaneous calls don't double-subscribe. */
   private hostModeReconcileInflight?: Promise<void>;
   private readonly log = new Logger('DKGAgent');
@@ -8507,14 +8518,14 @@ export class DKGAgent {
         // until restart (Codex PR #610 R1 comment 4).
         //
         // We work around the topic-wide unsubscribe by clearing
-        // the host-mode subscribed flag here so the immediate
-        // `reconcileSwmHostModeSubscription()` call below will
-        // re-wire the host listener if host mode is still
-        // applicable.
-        const wasHostModeSubscribed = this.swmHostModeSubscribed.has(contextGraphId);
+        // host-mode bookkeeping (handler ref + subscribed flag)
+        // here so the immediate `reconcileSwmHostModeSubscription()`
+        // call below will re-wire the host listener if host mode
+        // is still applicable.
         this.gossip.unsubscribe(swmTopic);
         this.sharedMemoryGossipRegistered.delete(contextGraphId);
-        if (wasHostModeSubscribed) this.swmHostModeSubscribed.delete(contextGraphId);
+        this.swmHostModeSubscribed.delete(contextGraphId);
+        this.swmHostModeHandlers.delete(contextGraphId);
         this.log.warn(ctx, `SWM gossip unsubscribed for "${contextGraphId}": local node is no longer authorized`);
       } else {
         this.log.warn(ctx, `SWM gossip subscription denied for "${contextGraphId}": local node is not authorized`);
@@ -8529,6 +8540,14 @@ export class DKGAgent {
     }
 
     if (isRegistered) return;
+
+    // Codex PR #610 R3: if this core was previously hosting the
+    // curated SWM in HOST MODE, member authorization now takes
+    // over — apply-and-ack via the member handler replaces opaque
+    // hosting. Surgically remove the host-mode handler (without
+    // dropping every handler on the topic) so we don't double-
+    // process every envelope (apply + opaque append).
+    this.unwireSwmHostModeHandler(contextGraphId);
 
     this.sharedMemoryGossipRegistered.add(contextGraphId);
     this.gossip.subscribe(swmTopic);
@@ -8564,8 +8583,17 @@ export class DKGAgent {
    */
   private async initializeSwmHostModeStore(): Promise<void> {
     const role = this.config.nodeRole ?? 'edge';
+    // OT-RFC-38 LU-6 — host mode is a CORE-NODE-ONLY capability:
+    // it holds curated CG ciphertext on behalf of members and
+    // serves it back over `PROTOCOL_SWM_HOST_CATCHUP`. Edges
+    // have no role in that custody chain and shouldn't retain
+    // other CGs' encrypted SWM substrate on disk. Hard-gate
+    // here so a copied `core` config dropped onto an edge does
+    // NOT accidentally turn it into a ciphertext relay
+    // (Codex PR #610 R3).
+    if (role !== 'core') return;
     const hostModeCfg = this.config.swmHostMode ?? {};
-    const enabled = hostModeCfg.enabled ?? (role === 'core');
+    const enabled = hostModeCfg.enabled ?? true;
     if (!enabled) return;
     if (!this.config.dataDir) {
       this.log.warn(
@@ -8624,18 +8652,7 @@ export class DKGAgent {
     }
     if (!curated) return;
 
-    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
-    this.swmHostModeSubscribed.add(contextGraphId);
-    this.gossip.subscribe(swmTopic);
-    this.gossip.onMessage(swmTopic, (_topic, data, _from) => {
-      this.ingestSwmHostModeEnvelope(contextGraphId, data).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.log.warn(
-          createOperationContext('system'),
-          `Host-mode SWM ingest failed for "${contextGraphId}": ${msg}`,
-        );
-      });
-    });
+    this.wireSwmHostModeHandler(contextGraphId);
 
     await this.maybeMarkRegisteredForHostMode(contextGraphId);
 
@@ -8643,6 +8660,56 @@ export class DKGAgent {
       createOperationContext('system'),
       `SWM host-mode subscription enabled for "${contextGraphId}" (role=core)`,
     );
+  }
+
+  /**
+   * Register the host-mode gossip handler for `contextGraphId` and
+   * track its reference so {@link unwireSwmHostModeHandler} can
+   * remove ONLY that handler later (without touching member-mode
+   * handlers or other consumers of the same topic). Idempotent.
+   *
+   * Both `reconcileSwmHostModeSubscription` (sharding-driven) and
+   * `enableSwmHostModeFor` (operator-driven) funnel through here
+   * so the host-mode lifecycle is in one place.
+   */
+  private wireSwmHostModeHandler(contextGraphId: string): void {
+    if (this.swmHostModeHandlers.has(contextGraphId)) return;
+    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
+    this.swmHostModeSubscribed.add(contextGraphId);
+    this.gossip.subscribe(swmTopic);
+    const handler = (_topic: string, data: Uint8Array, _from: string) => {
+      this.ingestSwmHostModeEnvelope(contextGraphId, data).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          createOperationContext('system'),
+          `Host-mode SWM ingest failed for "${contextGraphId}": ${msg}`,
+        );
+      });
+    };
+    this.swmHostModeHandlers.set(contextGraphId, handler);
+    this.gossip.onMessage(swmTopic, handler);
+  }
+
+  /**
+   * Surgically remove the host-mode gossip handler for
+   * `contextGraphId` (does NOT call `gossip.unsubscribe`, which
+   * would drop every handler on the topic). Used when the same
+   * core gains member authorization for the CG — apply-and-ack
+   * via the member handler then supersedes opaque hosting.
+   * Idempotent; no-op when no host handler is registered.
+   *
+   * Codex PR #610 R3: without this, member- and host-mode
+   * handlers would both fire on every gossip message, causing
+   * each envelope to be (a) decrypted-and-applied AND (b)
+   * appended opaquely. Wasted disk + apply work.
+   */
+  private unwireSwmHostModeHandler(contextGraphId: string): void {
+    const handler = this.swmHostModeHandlers.get(contextGraphId);
+    if (!handler) return;
+    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
+    this.gossip.offMessage(swmTopic, handler);
+    this.swmHostModeHandlers.delete(contextGraphId);
+    this.swmHostModeSubscribed.delete(contextGraphId);
   }
 
   /**
@@ -8898,6 +8965,21 @@ export class DKGAgent {
         break;
       }
       const resp = decodeSwmHostCatchupResponse(sendResult.response);
+      // Codex PR #610 R3: cross-CG safety. The wire response
+      // echoes the contextGraphId; a buggy or hostile host
+      // could return valid envelopes for a DIFFERENT CG. We
+      // hand the bytes to `SharedMemoryHandler.handle()` with
+      // `trustedReplay: true`, which bypasses transport
+      // identity checks — without this guard the inner
+      // payload would apply to whichever CG the envelope was
+      // bound to, NOT the CG we asked for. Reject the entire
+      // response before replaying anything from it.
+      if (resp.contextGraphId !== contextGraphId) {
+        const reason = `cgId mismatch in host response: requested="${contextGraphId}" got="${resp.contextGraphId}"`;
+        this.log.warn(ctx, `host-catchup ${reason} from=${remotePeerId}`);
+        lastDenied = reason;
+        break;
+      }
       if (resp.denied) {
         lastDenied = resp.denied;
         this.log.info(ctx, `host-catchup denied by=${remotePeerId} cg=${contextGraphId}: ${resp.denied}`);
@@ -9055,18 +9137,7 @@ export class DKGAgent {
       await this.maybeMarkRegisteredForHostMode(contextGraphId);
       return { subscribed: false, alreadySubscribed: true, hostingEnabled: true };
     }
-    const swmTopic = contextGraphWorkspaceTopic(contextGraphId);
-    this.swmHostModeSubscribed.add(contextGraphId);
-    this.gossip.subscribe(swmTopic);
-    this.gossip.onMessage(swmTopic, (_topic, data, _from) => {
-      this.ingestSwmHostModeEnvelope(contextGraphId, data).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.log.warn(
-          createOperationContext('system'),
-          `Host-mode SWM ingest failed for "${contextGraphId}": ${msg}`,
-        );
-      });
-    });
+    this.wireSwmHostModeHandler(contextGraphId);
     // Codex PR #610 R1 comment 5: a core that only knows the CG by
     // topic id (the explicit /host-mode/subscribe entrypoint) must
     // still transition the store to the registered-CG limits as

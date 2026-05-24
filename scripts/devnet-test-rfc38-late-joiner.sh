@@ -638,17 +638,34 @@ log "✓ curator wrote 5 triples while member offline"
 # Give cores a moment to absorb ciphertext into host-mode storage.
 sleep 5
 
-log "Probing core host-mode stores on all 4 cores to confirm ciphertext was captured..."
-HOST_TOTAL=0
+log "Probing core host-mode stores on all 4 cores to confirm ciphertext was captured for CG_D specifically..."
+# Codex PR #610 R3: assert on per-CG entries for $CG_D rather
+# than the global totalEntries — the latter would silently pass
+# if SCENARIO C left residue but CG_D itself was never hosted.
+HOST_D_TOTAL=0
 for N in 1 2 3 4; do
   HS=$(api_call $N GET /api/shared-memory/host-mode/stats || true)
   log "  host-mode stats node$N: $HS"
-  E=$(printf '%s' "$HS" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{const j=JSON.parse(d);console.log(j.totalEntries||0)}catch{console.log(0)}})')
-  HOST_TOTAL=$((HOST_TOTAL + E))
+  # NB: env-var prefix in a pipeline binds to the LEFTMOST command,
+  # so `CG_ID=... printf | node` does NOT export CG_ID into node's
+  # environment. Wrap the pipeline in a subshell with `export` so
+  # CG_ID reaches the `process.env.CG_ID` lookup below.
+  E=$(export CG_ID="$CG_D"; printf '%s' "$HS" | node -e '
+    let d=""; process.stdin.on("data",c=>d+=c);
+    process.stdin.on("end",()=>{
+      try {
+        const j = JSON.parse(d);
+        const cg = process.env.CG_ID;
+        const perCg = j.perCg || {};
+        const e = (perCg[cg] && perCg[cg].entries) || 0;
+        console.log(e);
+      } catch { console.log(0); }
+    })')
+  HOST_D_TOTAL=$((HOST_D_TOTAL + E))
 done
-log "  total host-mode entries across cores: $HOST_TOTAL"
-[ "$HOST_TOTAL" -gt 0 ] \
-  || fail "LU-6 host-mode regression: 0 ciphertext envelopes stored across cores (expected at least 1)"
+log "  CG_D-specific host-mode entries across cores: $HOST_D_TOTAL"
+[ "$HOST_D_TOTAL" -gt 0 ] \
+  || fail "LU-6 host-mode regression: 0 ciphertext envelopes stored for CG_D across cores (expected at least 1)"
 
 log "Killing curator ($CURATOR_NODE) — now no CG member is online."
 kill_node "$CURATOR_NODE"

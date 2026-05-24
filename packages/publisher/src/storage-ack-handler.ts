@@ -161,6 +161,147 @@ export class StorageACKHandler {
 
     let swmQuads: Quad[];
 
+    // OT-RFC-38 / LU-5 encrypted-payload path. For curated CGs the publisher
+    // ships AEAD-encrypted nquad bytes inline so cores can store the
+    // ciphertext (durably enough to ACK the V10 publish) without ever
+    // holding plaintext. Cores can't decrypt → can't recompute the
+    // plaintext merkle root → MUST trust the publisher's `merkleRoot` and
+    // `merkleLeafCount` claims for the V10 ACK signature. Member
+    // post-decrypt verification (LU-8) catches plaintext-vs-on-chain-root
+    // mismatches; outsider attestation tokens (LU-9) let third parties
+    // verify after the fact. Cores DO verify `stagingQuads.length` matches
+    // `publicByteSize` so a misreported size can't slip past pricing.
+    if (intent.isEncryptedPayload === true) {
+      if (!intent.stagingQuads || intent.stagingQuads.length === 0) {
+        throw new Error(
+          'PublishIntent.isEncryptedPayload=true but stagingQuads is empty — ' +
+          'curated-CG ACK requires the ciphertext bytes inline (no SWM fallback path for opaque blobs)',
+        );
+      }
+      const MAX_ENCRYPTED_BYTES = 4 * 1024 * 1024;
+      if (intent.stagingQuads.length > MAX_ENCRYPTED_BYTES) {
+        throw new Error(
+          `encrypted stagingQuads payload (${intent.stagingQuads.length} bytes) exceeds ` +
+          `${MAX_ENCRYPTED_BYTES} byte limit — rejecting request`,
+        );
+      }
+      const claimedByteSize = typeof intent.publicByteSize === 'number'
+        ? intent.publicByteSize
+        : Number(intent.publicByteSize);
+      if (intent.stagingQuads.length !== claimedByteSize) {
+        throw new Error(
+          `encrypted payload byteSize mismatch: stagingQuads.length=${intent.stagingQuads.length} ` +
+          `but publicByteSize=${claimedByteSize}. For curated CGs publicByteSize MUST equal the ` +
+          `ciphertext byte count (cores price the publish off this number).`,
+        );
+      }
+
+      // Persist the opaque ciphertext to a scoped staging graph as a
+      // single binary literal so it survives long enough for the
+      // V10 chain TX to land and for LU-7 catchup to pull it. Stored
+      // under a stable predicate so LU-7's wire handler can locate it
+      // by (cgId, merkleRoot) without needing a new store API.
+      const stagingGraphUri = `${swmGraphUri}/staging-encrypted/${ethers.hexlify(merkleRoot).slice(2, 18)}`;
+      const ciphertextSubject = `${stagingGraphUri}/ciphertext`;
+      const ciphertextPredicate = 'urn:dkg:swm:v10-publish-ciphertext';
+      // Base64 keeps the blob as a valid N3 literal without depending on
+      // the underlying triple-store accepting arbitrary binary. AES-GCM
+      // ciphertext is roughly the same size as plaintext + 16-byte tag,
+      // so the 33% base64 inflation stays well under the 4 MB cap above.
+      const ciphertextLiteral = `"${Buffer.from(intent.stagingQuads).toString('base64')}"`;
+      await this.store.dropGraph(stagingGraphUri);
+      await this.store.insert([{
+        subject: ciphertextSubject,
+        predicate: ciphertextPredicate,
+        object: ciphertextLiteral,
+        graph: stagingGraphUri,
+      }]);
+      setTimeout(async () => {
+        try { await this.store.dropGraph(stagingGraphUri); } catch { /* ignore */ }
+      }, 10 * 60 * 1000);
+
+      // Cores can't enumerate KAs from ciphertext — use the publisher's
+      // claimed counts for the V10 digest. Validate they're positive so
+      // an obviously malformed intent (kaCount=0) doesn't waste a sign.
+      if (!intent.kaCount || intent.kaCount <= 0) {
+        throw new Error(
+          `encrypted PublishIntent.kaCount must be positive; got ${intent.kaCount}`,
+        );
+      }
+      const claimedLeafCount = intent.merkleLeafCount == null ? 0 : Number(intent.merkleLeafCount);
+      if (claimedLeafCount < 1) {
+        throw new Error(
+          `encrypted PublishIntent.merkleLeafCount must be a positive integer; got ${claimedLeafCount}`,
+        );
+      }
+
+      const intentEpochs = (typeof intent.epochs === 'number' && intent.epochs > 0) ? intent.epochs : 1;
+      const intentTokenAmount = intent.tokenAmountStr ? BigInt(intent.tokenAmountStr) : 0n;
+
+      let contextGraphIdBigInt: bigint;
+      try {
+        contextGraphIdBigInt = BigInt(cgId);
+      } catch {
+        throw new Error(
+          `encrypted StorageACK: V10 publish requires a numeric on-chain context graph id; got '${cgId}'.`,
+        );
+      }
+      if (contextGraphIdBigInt <= 0n) {
+        throw new Error(
+          `encrypted StorageACK: V10 publish requires a positive on-chain context graph id; got ${contextGraphIdBigInt}.`,
+        );
+      }
+
+      const digest = computePublishACKDigest(
+        this.config.chainId,
+        this.config.kav10Address,
+        contextGraphIdBigInt,
+        merkleRoot,
+        BigInt(intent.kaCount),
+        BigInt(claimedByteSize),
+        BigInt(intentEpochs),
+        intentTokenAmount,
+        BigInt(claimedLeafCount),
+      );
+
+      if (this.config.isSignerRegistered) {
+        let signerRegistered: boolean | undefined;
+        try {
+          signerRegistered = await this.config.isSignerRegistered();
+        } catch (err) {
+          try { await this.config.onSignerRegistrationLookupFailed?.(err); } catch { /* swallow */ }
+          throw new Error('StorageACK signer registration lookup failed; refusing to sign');
+        }
+        if (signerRegistered === false) {
+          try { await this.config.onSignerUnregistered?.(); } catch { /* swallow */ }
+          return this.encodeDecline(
+            cgId,
+            STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+            'StorageACK signer is not confirmed on-chain as an operational wallet',
+          );
+        }
+      }
+
+      const signature = ethers.Signature.from(
+        await this.config.signerWallet.signMessage(digest),
+      );
+      const MAX_UINT64 = (1n << 64n) - 1n;
+      if (this.config.nodeIdentityId > MAX_UINT64) {
+        throw new Error(
+          `nodeIdentityId ${this.config.nodeIdentityId} exceeds uint64 wire format`,
+        );
+      }
+      return encodeStorageACK({
+        merkleRoot,
+        coreNodeSignatureR: ethers.getBytes(signature.r),
+        coreNodeSignatureVS: ethers.getBytes(signature.yParityAndS),
+        contextGraphId: cgId,
+        nodeIdentityId: this.config.nodeIdentityId <= BigInt(Number.MAX_SAFE_INTEGER)
+          ? Number(this.config.nodeIdentityId)
+          : { low: Number(this.config.nodeIdentityId & 0xFFFFFFFFn), high: Number((this.config.nodeIdentityId >> 32n) & 0xFFFFFFFFn), unsigned: true },
+      });
+    }
+
     if (intent.stagingQuads && intent.stagingQuads.length > 0) {
       // Size limit: reject payloads over 4 MB to prevent memory exhaustion
       const MAX_STAGING_BYTES = 4 * 1024 * 1024;

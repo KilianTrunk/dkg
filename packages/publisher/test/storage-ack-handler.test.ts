@@ -213,6 +213,161 @@ describe('StorageACKHandler', () => {
     expect(decoded.declineMessage).toContain('Merkle root mismatch');
   });
 
+  // OT-RFC-38 / LU-5 — encrypted-payload branch for curated CGs.
+  describe('isEncryptedPayload (curated CG path)', () => {
+    // Opaque AEAD ciphertext as far as the handler is concerned. The
+    // handler MUST NOT try to parse this as N-Quads. We use distinctive
+    // bytes so a mistakenly-applied parse path would obviously fail.
+    const ciphertextBytes = new Uint8Array([0x01, 0xff, 0x00, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78]);
+    // The publisher's claimed plaintext merkle root. The handler MUST NOT
+    // recompute against the ciphertext — it just signs what was claimed.
+    const claimedRoot = ethers.getBytes(ethers.keccak256(new TextEncoder().encode('test-plaintext-root')));
+    const claimedKaCount = 3;
+    const claimedLeafCount = 9;
+    const claimedEpochs = 2;
+    const claimedTokenAmountStr = '5000';
+
+    it('signs the V10 digest from publisher-claimed fields without parsing ciphertext', async () => {
+      const handler = await createHandler([]);
+      const intent = encodePublishIntent({
+        merkleRoot: claimedRoot,
+        contextGraphId,
+        publisherPeerId: 'curator-edge',
+        publicByteSize: ciphertextBytes.length,
+        isPrivate: true,
+        kaCount: claimedKaCount,
+        rootEntities: [],
+        stagingQuads: ciphertextBytes,
+        epochs: claimedEpochs,
+        tokenAmountStr: claimedTokenAmountStr,
+        merkleLeafCount: claimedLeafCount,
+        isEncryptedPayload: true,
+      });
+
+      const response = await handler.handler(intent, fakePeerId);
+      const ack = decodeStorageACK(response);
+
+      expect(isStorageACKDecline(ack)).toBe(false);
+      const decodedRoot = ack.merkleRoot instanceof Uint8Array
+        ? ack.merkleRoot : new Uint8Array(ack.merkleRoot);
+      expect(Buffer.from(decodedRoot).equals(Buffer.from(claimedRoot))).toBe(true);
+
+      const expectedDigest = computePublishACKDigest(
+        TEST_CHAIN_ID,
+        TEST_KAV10_ADDR,
+        cgIdBigInt,
+        claimedRoot,
+        BigInt(claimedKaCount),
+        BigInt(ciphertextBytes.length),
+        BigInt(claimedEpochs),
+        BigInt(claimedTokenAmountStr),
+        BigInt(claimedLeafCount),
+      );
+      const prefixedHash = ethers.hashMessage(expectedDigest);
+      const recovered = ethers.recoverAddress(prefixedHash, {
+        r: ethers.hexlify(ack.coreNodeSignatureR instanceof Uint8Array
+          ? ack.coreNodeSignatureR : new Uint8Array(ack.coreNodeSignatureR)),
+        yParityAndS: ethers.hexlify(ack.coreNodeSignatureVS instanceof Uint8Array
+          ? ack.coreNodeSignatureVS : new Uint8Array(ack.coreNodeSignatureVS)),
+      });
+      expect(recovered.toLowerCase()).toBe(coreWallet.address.toLowerCase());
+    });
+
+    it('throws when ciphertext byteSize does not match publicByteSize (prevents pricing fraud)', async () => {
+      const handler = await createHandler([]);
+      const intent = encodePublishIntent({
+        merkleRoot: claimedRoot,
+        contextGraphId,
+        publisherPeerId: 'curator-edge',
+        publicByteSize: ciphertextBytes.length + 100,
+        isPrivate: true,
+        kaCount: claimedKaCount,
+        rootEntities: [],
+        stagingQuads: ciphertextBytes,
+        merkleLeafCount: claimedLeafCount,
+        isEncryptedPayload: true,
+      });
+      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+        /encrypted payload byteSize mismatch/,
+      );
+    });
+
+    it('throws when stagingQuads is missing (no SWM fallback for opaque blobs)', async () => {
+      const handler = await createHandler([]);
+      const intent = encodePublishIntent({
+        merkleRoot: claimedRoot,
+        contextGraphId,
+        publisherPeerId: 'curator-edge',
+        publicByteSize: 0,
+        isPrivate: true,
+        kaCount: claimedKaCount,
+        rootEntities: [],
+        merkleLeafCount: claimedLeafCount,
+        isEncryptedPayload: true,
+      });
+      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+        /isEncryptedPayload=true but stagingQuads is empty/,
+      );
+    });
+
+    it('throws when kaCount or merkleLeafCount is missing/zero (publisher must supply both)', async () => {
+      const handler = await createHandler([]);
+      const noKaCountIntent = encodePublishIntent({
+        merkleRoot: claimedRoot,
+        contextGraphId,
+        publisherPeerId: 'curator-edge',
+        publicByteSize: ciphertextBytes.length,
+        isPrivate: true,
+        kaCount: 0,
+        rootEntities: [],
+        stagingQuads: ciphertextBytes,
+        merkleLeafCount: claimedLeafCount,
+        isEncryptedPayload: true,
+      });
+      await expect(handler.handler(noKaCountIntent, fakePeerId)).rejects.toThrow(
+        /encrypted PublishIntent.kaCount must be positive/,
+      );
+
+      const noLeafCountIntent = encodePublishIntent({
+        merkleRoot: claimedRoot,
+        contextGraphId,
+        publisherPeerId: 'curator-edge',
+        publicByteSize: ciphertextBytes.length,
+        isPrivate: true,
+        kaCount: claimedKaCount,
+        rootEntities: [],
+        stagingQuads: ciphertextBytes,
+        merkleLeafCount: 0,
+        isEncryptedPayload: true,
+      });
+      await expect(handler.handler(noLeafCountIntent, fakePeerId)).rejects.toThrow(
+        /encrypted PublishIntent.merkleLeafCount must be a positive integer/,
+      );
+    });
+
+    it('honours the signer-registration gate (declines instead of signing when key is unregistered)', async () => {
+      const handler = await createHandler([], {
+        isSignerRegistered: async () => false,
+      });
+      const intent = encodePublishIntent({
+        merkleRoot: claimedRoot,
+        contextGraphId,
+        publisherPeerId: 'curator-edge',
+        publicByteSize: ciphertextBytes.length,
+        isPrivate: true,
+        kaCount: claimedKaCount,
+        rootEntities: [],
+        stagingQuads: ciphertextBytes,
+        merkleLeafCount: claimedLeafCount,
+        isEncryptedPayload: true,
+      });
+      const response = await handler.handler(intent, fakePeerId);
+      const decoded = decodeStorageACK(response);
+      expect(isStorageACKDecline(decoded)).toBe(true);
+      expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED);
+    });
+  });
+
   it('rejects non-core node role', async () => {
     const store = new OxigraphStore();
     const config: StorageACKHandlerConfig = {

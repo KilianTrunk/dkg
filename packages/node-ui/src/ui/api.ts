@@ -212,7 +212,7 @@ export async function createContextGraph(
   name: string,
   description?: string,
   opts?: { allowedAgents?: string[]; accessPolicy?: number; publishPolicy?: number },
-): Promise<{ created: string; uri: string }> {
+): Promise<{ created: string; uri: string; registered?: boolean; onChainId?: string; registerError?: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
@@ -221,6 +221,12 @@ export async function createContextGraph(
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         id, name, description,
+        // UI primary "Create project" always wants an on-chain CG —
+        // otherwise the user can't publish to Verified Memory (the
+        // publish path requires an on-chain CG id). The modal already
+        // tells the user "Registering context graph on the network…",
+        // so the combined create+register flow matches the UX promise.
+        register: true,
         ...(opts?.allowedAgents ? { allowedAgents: opts.allowedAgents } : {}),
         ...(opts?.accessPolicy !== undefined ? { accessPolicy: opts.accessPolicy } : {}),
         ...(opts?.publishPolicy !== undefined ? { publishPolicy: opts.publishPolicy } : {}),
@@ -231,7 +237,7 @@ export async function createContextGraph(
       const errBody = await res.json().catch(() => ({}));
       throw new Error((errBody as { error?: string })?.error ?? `HTTP ${res.status}`);
     }
-    return res.json() as Promise<{ created: string; uri: string }>;
+    return res.json() as Promise<{ created: string; uri: string; registered?: boolean; onChainId?: string; registerError?: string }>;
   } catch (err: any) {
     if (err.name === 'AbortError') {
       throw new Error('Creating project is taking longer than expected — it may still complete in the background. Refresh the page in a moment.');

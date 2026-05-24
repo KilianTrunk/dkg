@@ -109,6 +109,20 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
       const result = await createContextGraph(cgId, trimmedName, description.trim() || undefined, opts);
       clearTimeout(slowTimer);
 
+      // Daemon returns 200 with `{ created, registered: false, registerError }`
+      // when the local create succeeded but the on-chain registration
+      // leg failed. Without surfacing this, the user would land on a
+      // CG that looks fine in the UI but can never publish to VM
+      // (publish-to-VM requires an on-chain CG id). Fail loud with
+      // an actionable hint pointing at the retry endpoint.
+      if (result.registered === false) {
+        throw new Error(
+          `Context graph created locally but on-chain registration failed: ${result.registerError ?? 'unknown error'}. ` +
+          `Verified Memory publishing requires an on-chain CG — retry registration from the project's Settings, ` +
+          `or POST /api/context-graph/register with {"id":"${cgId}"}.`,
+        );
+      }
+
       // Phase 7: install the chosen ontology into meta/project-ontology so
       // the agent has the project's predicate vocabulary and URI patterns
       // from turn #1. Both `community` (operator picked a starter) and

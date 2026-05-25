@@ -35,6 +35,11 @@
  * Restart matrix:
  *   - --restart-mode clean|kill   (default clean)
  *   - --pause-ms <ms>             (delay between stop and restart; default 0)
+ *   - --wait-for-exit-ms <ms>     (hard timeout the harness gives the daemon to
+ *                                 exit before failing the run; default 30000.
+ *                                 Bump this for very large workloads where a
+ *                                 clean shutdown's WM flush genuinely takes
+ *                                 longer.)
  *   - --matrix                    run the full matrix
  *                                   (clean × kill) × (small/medium/large)
  *                                   × (pause=0 / pause=30000) and write a
@@ -58,9 +63,10 @@
  *   node scripts/repro/wm-persistence-regression.mjs --num-assertions=50 --quads-per-assertion=10000 --restart-mode=kill
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -87,6 +93,7 @@ const RESTART_MODE = args['restart-mode'] ?? 'clean';
 const NUM_ASSERTIONS = Number(args['num-assertions'] ?? 5);
 const QUADS_PER_ASSERTION = Number(args['quads-per-assertion'] ?? 1000);
 const PAUSE_MS = Number(args['pause-ms'] ?? 0);
+const WAIT_FOR_EXIT_MS = Number(args['wait-for-exit-ms'] ?? 30_000);
 const QUAD_SHAPE = args['quad-shape'] ?? 'generic';
 const KEEP_CG = args['keep-cg'] === 'true';
 const RUN_MATRIX = args.matrix === 'true';
@@ -112,11 +119,50 @@ if (!Number.isFinite(PORT) || PORT < 1024 || PORT > 65535) {
   console.error(`[FATAL] invalid port ${PORT}. Must be in [1024, 65535].`);
   process.exit(2);
 }
-if (!HOME_DIR || HOME_DIR === '~/.dkg' || HOME_DIR === '~/.dkg-dev') {
-  console.error(`[FATAL] refusing to use HOME=${HOME_DIR} — please point DKG_HOME at the dedicated repro dir (REPRO.md).`);
+if (!HOME_DIR) {
+  console.error('[FATAL] DKG_HOME is empty.');
   process.exit(2);
 }
-const HOME_ABS = resolve(HOME_DIR);
+// Resolve to a fully-resolved absolute path (including following symlinks
+// on any ancestor that already exists). The earlier literal-string check
+// (`HOME_DIR === '~/.dkg'`) only caught the bare tilde form — it accepted
+// `/Users/aleatoric/.dkg`, `~/.dkg/`, symlinks to the default home, etc.,
+// any of which would let the SIGKILL cycle target the operator's real node.
+const HOME_ABS = ((dir) => {
+  const absRaw = resolve(dir);
+  let probe = absRaw;
+  while (probe !== dirname(probe)) {
+    if (existsSync(probe)) {
+      try {
+        const real = realpathSync(probe);
+        return resolve(real, absRaw.slice(probe.length).replace(/^\//, ''));
+      } catch { /* fall through to next ancestor */ }
+    }
+    probe = dirname(probe);
+  }
+  return absRaw;
+})(HOME_DIR);
+const FORBIDDEN_HOMES = (() => {
+  const candidates = [join(homedir(), '.dkg'), join(homedir(), '.dkg-dev')];
+  const out = new Set();
+  for (const c of candidates) {
+    out.add(resolve(c));
+    if (existsSync(c)) {
+      try { out.add(resolve(realpathSync(c))); } catch { /* ok */ }
+    }
+  }
+  return out;
+})();
+for (const forbidden of FORBIDDEN_HOMES) {
+  if (HOME_ABS === forbidden || HOME_ABS.startsWith(forbidden + '/')) {
+    console.error(
+      `[FATAL] DKG_HOME resolves to ${HOME_ABS}, which is inside or equal to ` +
+      `a real DKG node home (${forbidden}). The script does kill -9 cycles and ` +
+      `MUST run against a dedicated throwaway home — see REPRO.md.`,
+    );
+    process.exit(2);
+  }
+}
 
 // ─── daemon helpers ────────────────────────────────────────────────
 
@@ -155,6 +201,33 @@ function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+/**
+ * Return the pid that is currently listening on `port` according to `lsof`,
+ * or null if lsof reports nothing (or is unavailable). This is the source
+ * of truth for "is daemon.pid actually the daemon we think it is?" — bare
+ * `process.kill(pid, 0)` only proves the pid exists, not that it owns the
+ * port (which is the exact PID-reuse hazard Codex flagged).
+ */
+function listenerPidOnPort(port) {
+  // `lsof -nP -i 4TCP:<port> -sTCP:LISTEN -t` prints just the listening pids.
+  // Available on macOS by default and on most Linuxes; the harness already
+  // assumes a POSIX-y env (spawn `dkg`, etc.) so this isn't a new dependency.
+  let res;
+  try {
+    res = spawnSync('lsof', ['-nP', '-iTCP:' + port, '-sTCP:LISTEN', '-t'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 3_000,
+    });
+  } catch {
+    return null;
+  }
+  if (!res || res.status !== 0) return null;
+  const lines = String(res.stdout || '').trim().split(/\s+/).filter(Boolean);
+  if (lines.length === 0) return null;
+  const n = Number(lines[0]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 async function apiFetch(method, path, body) {
   const token = await readAuthToken();
   const headers = { 'Content-Type': 'application/json' };
@@ -190,9 +263,12 @@ async function pingStatus(timeoutMs) {
 }
 
 async function ensureNoForeignDaemon() {
-  // Reject if a daemon is responding at our port but the PID does NOT match
-  // the file in HOME_ABS — that means someone else is squatting our port and
-  // we must NOT kill it.
+  // Reject if a daemon is responding at our port but we cannot prove it
+  // belongs to HOME_ABS. The previous "pid file points at a live process"
+  // check is unsafe under PID reuse — a stale pid file could happen to
+  // match an unrelated long-running process (a shell, a watcher, …) and
+  // the kill cycle would later SIGKILL it. The fix is to cross-reference
+  // the pid that's actually listening on PORT.
   let healthy;
   try {
     const r = await fetch(`${API_BASE}/api/status`);
@@ -200,18 +276,41 @@ async function ensureNoForeignDaemon() {
   } catch { healthy = false; }
   if (!healthy) return; // nothing listening — safe.
 
-  const pid = await readDaemonPid();
-  if (pid && isAlive(pid)) return; // our daemon — fine.
+  const pidFile = await readDaemonPid();
+  const listener = listenerPidOnPort(PORT);
 
-  // The daemon at our port has no matching pid file under HOME_ABS. Refuse.
-  throw new Error(
-    `Port ${PORT} is occupied but ${join(HOME_ABS, 'daemon.pid')} does not point at a live process. ` +
-    `Refusing to proceed: this is exactly the scenario the isolation contract forbids — ` +
-    `the script would otherwise kill a daemon it doesn't own. Free port ${PORT} or set a different one.`,
-  );
+  if (!pidFile) {
+    throw new Error(
+      `Port ${PORT} is occupied but ${join(HOME_ABS, 'daemon.pid')} does not exist. ` +
+      `The harness cannot prove ownership of the listener — refusing to proceed. ` +
+      `Either free port ${PORT}, or write the correct daemon.pid into ${HOME_ABS}.`,
+    );
+  }
+  if (listener == null) {
+    throw new Error(
+      `Port ${PORT} appears occupied (HTTP responded) but \`lsof\` could not name the ` +
+      `listener. The harness needs lsof to prove pid-vs-port ownership before it is ` +
+      `allowed to SIGKILL anything. Install lsof or run the matrix on a machine that has it.`,
+    );
+  }
+  if (listener !== pidFile) {
+    throw new Error(
+      `Port ${PORT} is owned by pid ${listener}, but ${join(HOME_ABS, 'daemon.pid')} ` +
+      `says ${pidFile}. The pid file does NOT belong to the listener — refusing to ` +
+      `proceed because killing pid ${pidFile} would not stop the daemon AND killing ` +
+      `pid ${listener} would target a process the harness does not own.`,
+    );
+  }
+  // pidFile === listener AND it's alive → our daemon.
 }
 
 let spawnedChild = null;
+// The pid we will SIGKILL on a hard-restart. Recorded ONCE after spawn
+// + pingStatus + listener cross-check so PID reuse between then and the
+// kill cannot redirect us at an unrelated process. Same for the
+// supervisor (spawnedChild) — that one we kill via its process group.
+let expectedWorkerPid = null;
+let expectedSupervisorPgid = null;
 
 async function spawnDaemon() {
   log(`spawning daemon: ${START_CMD} (HOME=${HOME_ABS}, PORT=${PORT})`);
@@ -221,19 +320,42 @@ async function spawnDaemon() {
     DKG_API_PORT: String(PORT),
   };
   const [cmd, ...rest] = START_CMD.split(/\s+/);
+  // detached: true puts the daemon (and its supervisor) into a NEW
+  // process group whose pgid equals spawnedChild.pid. That lets us
+  // signal the whole group atomically via `process.kill(-pgid, …)`
+  // on hard restart — otherwise SIGKILLing the worker alone lets the
+  // foreground supervisor respawn a fresh worker and the matrix would
+  // measure the auto-restarted daemon instead of the one it killed.
   spawnedChild = spawn(cmd, rest, {
     cwd: REPO_ROOT,
     env,
     stdio: ['ignore', 'inherit', 'inherit'],
-    detached: false,
+    detached: true,
   });
   spawnedChild.on('exit', (code, signal) => {
     log(`daemon child exited (code=${code}, signal=${signal})`);
     spawnedChild = null;
   });
+  expectedSupervisorPgid = spawnedChild.pid;
   const ok = await pingStatus(120_000);
   if (!ok) throw new Error('daemon did not become responsive at /api/status within 120s');
-  log('daemon is up.');
+  // Race window between pingStatus returning and the daemon writing
+  // daemon.pid; give it a beat then read + cross-check.
+  await sleep(500);
+  const workerPid = await readDaemonPid();
+  const listener = listenerPidOnPort(PORT);
+  if (!workerPid) {
+    throw new Error(`spawn succeeded but ${join(HOME_ABS, 'daemon.pid')} is missing — refusing to continue without provable identity.`);
+  }
+  if (listener != null && listener !== workerPid) {
+    throw new Error(
+      `spawn succeeded but the listener on port ${PORT} (pid ${listener}) does not ` +
+      `match daemon.pid (${workerPid}). Aborting — the harness will not trust an ` +
+      `identity it cannot verify.`,
+    );
+  }
+  expectedWorkerPid = workerPid;
+  log(`daemon is up (worker=${expectedWorkerPid}, supervisor-pgid=${expectedSupervisorPgid}).`);
 }
 
 async function stopDaemonClean() {
@@ -245,45 +367,102 @@ async function stopDaemonClean() {
     // sometimes fails to read on a fast machine. Treat connection errors as success.
     warn(`shutdown returned ${e.message}; relying on PID death`);
   }
-  await waitForDaemonExit();
+  await waitForDaemonExit({ timeoutMs: WAIT_FOR_EXIT_MS });
+  expectedWorkerPid = null;
+  expectedSupervisorPgid = null;
 }
 
 async function killDaemonHard() {
-  const pid = await readDaemonPid();
-  if (!pid) {
-    warn('no daemon.pid found — nothing to kill');
+  // Re-verify identity at kill time, not just at spawn time, to defend
+  // against PID reuse during a long matrix run. If daemon.pid drifted
+  // from expectedWorkerPid (because the supervisor respawned without us
+  // noticing, or someone hand-restarted the daemon), refuse.
+  const pidFile = await readDaemonPid();
+  const listener = listenerPidOnPort(PORT);
+  if (expectedWorkerPid != null && pidFile != null && pidFile !== expectedWorkerPid) {
+    throw new Error(
+      `daemon.pid (${pidFile}) no longer matches the pid recorded at spawn ` +
+      `(${expectedWorkerPid}). The supervisor may have respawned the worker or ` +
+      `something else restarted the daemon — refusing to SIGKILL the new process.`,
+    );
+  }
+  if (listener != null && pidFile != null && listener !== pidFile) {
+    throw new Error(
+      `Port ${PORT} is now owned by pid ${listener} but daemon.pid says ${pidFile}. ` +
+      `Refusing the kill — see ensureNoForeignDaemon for the symmetric guard.`,
+    );
+  }
+  const target = expectedWorkerPid ?? pidFile ?? listener;
+  if (!target) {
+    warn('no provable daemon pid to kill — skipping');
     return;
   }
-  if (!isAlive(pid)) {
-    warn(`pid ${pid} is not alive`);
-    return;
+  // 1) Kill the supervisor process group FIRST so it cannot respawn the
+  //    worker once we kill it. `process.kill(-pgid, ...)` on a negative
+  //    pid signals the entire group; we only have a valid pgid if the
+  //    daemon was spawned by THIS harness (we did `detached: true`).
+  if (expectedSupervisorPgid && isAlive(expectedSupervisorPgid)) {
+    log(`SIGKILL supervisor process group (pgid=${expectedSupervisorPgid})`);
+    try { process.kill(-expectedSupervisorPgid, 'SIGKILL'); }
+    catch (e) {
+      // Fall back to a per-pid kill if pgid signalling is unsupported.
+      warn(`process-group kill failed (${e.message}); falling back to per-pid SIGKILL`);
+      try { process.kill(expectedSupervisorPgid, 'SIGKILL'); } catch { /* */ }
+    }
   }
-  log(`SIGKILL daemon pid=${pid}`);
-  try { process.kill(pid, 'SIGKILL'); } catch (e) {
-    warn(`kill -9 ${pid} failed: ${e.message}`);
+  // 2) Belt-and-braces: SIGKILL the worker directly. If the supervisor
+  //    is already gone the worker may have died too, but this is harmless.
+  if (isAlive(target)) {
+    log(`SIGKILL daemon worker pid=${target}`);
+    try { process.kill(target, 'SIGKILL'); } catch (e) {
+      warn(`kill -9 ${target} failed: ${e.message}`);
+    }
   }
-  // Also kill our spawned child shell, in case start-cmd was a wrapper.
-  if (spawnedChild && spawnedChild.pid && isAlive(spawnedChild.pid)) {
-    try { process.kill(spawnedChild.pid, 'SIGKILL'); } catch { /* */ }
+  await waitForDaemonExit({ timeoutMs: WAIT_FOR_EXIT_MS });
+  // 3) After-kill assertion: port must be free AND the worker pid we
+  //    targeted must be dead. If either is still up, fail loud.
+  const stillListening = listenerPidOnPort(PORT);
+  if (stillListening != null) {
+    throw new Error(
+      `after SIGKILL, port ${PORT} is still owned by pid ${stillListening}. ` +
+      `The daemon (or a respawned worker) is still alive — abort.`,
+    );
   }
-  await waitForDaemonExit();
+  if (isAlive(target)) {
+    throw new Error(`after SIGKILL, target pid ${target} is still alive. Abort.`);
+  }
+  // Reset state so the next spawnDaemon doesn't carry stale identity.
+  expectedWorkerPid = null;
+  expectedSupervisorPgid = null;
 }
 
-async function waitForDaemonExit() {
-  const deadline = Date.now() + 30_000;
+async function waitForDaemonExit({ timeoutMs = 30_000 } = {}) {
+  // Hard deadline: previously this warn()'d and returned on timeout, which
+  // let the next snapshot talk to a still-alive (or auto-restarted) daemon
+  // and silently record a false post-restart result. Now we throw so the
+  // run aborts; the operator can re-run with a longer timeout for large
+  // datasets if needed.
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     let alive = false;
     try { await fetch(`${API_BASE}/api/status`); alive = true; } catch { alive = false; }
     const pid = await readDaemonPid();
     const pidAlive = pid != null && isAlive(pid);
-    if (!alive && !pidAlive) {
-      // Give the OS another tick to clean up port-bind state.
+    const listener = listenerPidOnPort(PORT);
+    if (!alive && !pidAlive && listener == null) {
+      // Belt-and-braces: HTTP, pid file, AND listener-on-port all agree
+      // the daemon is gone. Give the OS another tick to clean up
+      // port-bind state.
       await sleep(250);
       return;
     }
     await sleep(250);
   }
-  warn('daemon did not exit cleanly within 30s — proceeding anyway');
+  throw new Error(
+    `daemon did not exit cleanly within ${timeoutMs}ms — refusing to snapshot. ` +
+    `For large workloads use --wait-for-exit-ms=<larger>; for small/medium runs ` +
+    `this timeout indicates a real shutdown hang.`,
+  );
 }
 
 // ─── workload ──────────────────────────────────────────────────────

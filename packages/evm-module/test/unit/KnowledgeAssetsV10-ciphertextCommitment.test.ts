@@ -175,14 +175,13 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
 
   async function createPublicCG(creator: SignerWithAddress): Promise<bigint> {
     await Facade.connect(creator).createContextGraph(
-      [10n, 20n, 30n], // hostingNodes (not validated against identity storage in unit tests)
       [], // participantAgents
-      2, // requiredSignatures
       0, // metadataBatchId
       0, // accessPolicy = public/discoverable
       1, // publishPolicy = open
       ethers.ZeroAddress,
       0, // publishAuthorityAccountId
+      ethers.ZeroHash, // nameHash
     );
     return CGStorageContract.getLatestContextGraphId();
   }
@@ -199,14 +198,13 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
     // stays exercised, but the ciphertext-commitment branch on the
     // publish path is gated by `accessPolicy != 0`.
     await Facade.connect(creator).createContextGraph(
-      [10n, 20n, 30n], // hostingNodes
       [], // participantAgents
-      2, // requiredSignatures
       0, // metadataBatchId
       1, // accessPolicy = curated (encrypted)
       0, // publishPolicy = curated (single-authority publish)
       authority,
       0, // publishAuthorityAccountId
+      ethers.ZeroHash, // nameHash
     );
     return CGStorageContract.getLatestContextGraphId();
   }

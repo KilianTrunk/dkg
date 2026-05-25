@@ -35,7 +35,21 @@ import {
  * `previewChallengeForSeed` helper so the curated branch is testable
  * without a full proof-period dance.
  */
-describe('@unit RandomSampling — RFC-39 curated picker', () => {
+// RFC-39 Phase B (deferred): curated CG random sampling is gated at the
+// `_isCGEligible` level until the off-chain prover (`packages/random-sampling
+// /src/prover.ts`) learns to fetch `getCiphertextChunkCount` /
+// `getCiphertextChunksRoot` and build the proof against the ciphertext
+// chunks on disk. Today the prover still queries `getMerkleLeafCount` and
+// proves against plaintext leaves, so any draw the contract picker resolved
+// to a curated KC produced `V10ProofLeafCountMismatchError` for every
+// proving period (devnet sweep confirmed this on every core node).
+//
+// Until the prover lands its ciphertext path, the contract picker treats
+// curated CGs as ineligible. The picker code in steps 2/3 of
+// `_pickWeightedChallenge` retains the curated branches so the unskip is a
+// one-line revert in `RandomSampling._isCGEligible` + removing the
+// `.skip` below.
+describe.skip('@unit RandomSampling — RFC-39 curated picker [Phase B deferred]', () => {
   const CURATED_POLICY = 0;
   const OPEN_POLICY = 1;
   const TEST_KC_BYTE_SIZE = 128n;
@@ -132,14 +146,13 @@ describe('@unit RandomSampling — RFC-39 curated picker', () => {
       publishPolicy === CURATED_POLICY ? 1 : 0;
     const tx = await CGStorageContract.connect(opSigner).createContextGraph(
       owner,
-      [], // hostingNodes
       [], // participantAgents
-      0, // requiredSignatures
       0, // metadataBatchId
       accessPolicy,
       publishPolicy,
       authority,
       0, // publishAuthorityAccountId
+      ethers.ZeroHash, // nameHash
     );
     await tx.wait();
     return CGStorageContract.getLatestContextGraphId();

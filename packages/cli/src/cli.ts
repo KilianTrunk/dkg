@@ -7,6 +7,7 @@ import { spawn, execSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { writeFile, unlink } from 'node:fs/promises';
 import { ethers } from 'ethers';
 import {
@@ -23,7 +24,7 @@ import {
   readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir,
   loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveChainConfig,
   releasesDir, activeSlot, swapSlot,
-  slotEntryPoint, isStandaloneInstall,
+  slotEntryPoint, isStandaloneInstall, repoDir,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
   type AutoUpdateConfig,
 } from './config.js';
@@ -3882,6 +3883,70 @@ async function stopDaemonIfRunning(): Promise<boolean> {
   console.error('Daemon is still running after SIGTERM. Stop it manually before restarting.');
   return false;
 }
+
+// ─── dkg migrate-to-npm ──────────────────────────────────────────────
+
+program
+  .command('migrate-to-npm')
+  .description('Convert a git-checkout install into an npm-style install in place (renames source-tree markers + pins autoUpdate.source = "npm")')
+  .option('--apply', 'Mutate the filesystem. Without this flag, prints the plan and exits.', false)
+  .option('--force', 'Bypass the daemon-alive safety check. Operator must SIGKILL the worker first; in-flight writes may be lost.', false)
+  .action(async (opts: ActionOpts) => {
+    const { buildMigrationPlan, applyPlan, renderPlan } = await import('./migrate-to-npm.js');
+    const repoRoot = repoDir();
+    if (!repoRoot) {
+      console.log('No git-checkout install detected at this location (repoDir() === null).');
+      console.log('Nothing to migrate — the auto-updater is already taking the npm path.');
+      return;
+    }
+    const dkgHomeNow = dkgDir();
+    const dkgHomePostMigration = process.env.DKG_HOME ?? join(homedir(), '.dkg');
+    const pid = await readPid();
+    const daemonAlive = pid !== null && isProcessRunning(pid);
+    let currentAutoUpdateSource: 'npm' | 'git' | 'auto' | undefined;
+    try {
+      const cfg = await loadConfig();
+      currentAutoUpdateSource = (cfg.autoUpdate as { source?: 'npm' | 'git' | 'auto' } | undefined)?.source;
+    } catch {
+      currentAutoUpdateSource = undefined;
+    }
+    const backupSuffix = new Date()
+      .toISOString()
+      .replace(/[:.]/g, '-')
+      .replace(/T/, '_')
+      .replace(/Z$/, '');
+    const plan = buildMigrationPlan({
+      repoRoot,
+      backupSuffix,
+      dkgHomeNow,
+      dkgHomePostMigration,
+      daemonAlive,
+      forceAliveBypass: Boolean(opts.force),
+      currentAutoUpdateSource,
+    });
+    process.stdout.write(renderPlan(plan));
+    if (plan.alreadyMigrated) return;
+    if (!opts.apply) {
+      console.log('Re-run with --apply to execute.');
+      return;
+    }
+    if (plan.blockers.length > 0) {
+      console.error('Refusing to apply: resolve the blocker(s) above and re-run.');
+      process.exit(1);
+    }
+    await applyPlan(plan, (msg) => console.log(`  ${msg}`));
+    console.log('');
+    console.log('Done. Next steps:');
+    console.log('  1. Verify the renames:');
+    for (const action of plan.actions) {
+      if (action.kind === 'rename') console.log(`     ls -ld ${action.to}`);
+    }
+    console.log('  2. Restart the daemon:');
+    console.log('     dkg start');
+    console.log('  3. (Optional) globally install the npm package so `dkg` no longer depends on this tree:');
+    console.log('     npm install -g @origintrail-official/dkg');
+    console.log('     After that, `rm -rf packages node_modules pnpm-lock.yaml` is safe.');
+  });
 
 // ─── dkg update ──────────────────────────────────────────────────────
 

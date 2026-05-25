@@ -132,14 +132,13 @@ describe('@unit RandomSampling — RFC-39 curated picker', () => {
       publishPolicy === CURATED_POLICY ? 1 : 0;
     const tx = await CGStorageContract.connect(opSigner).createContextGraph(
       owner,
-      [], // hostingNodes
       [], // participantAgents
-      0, // requiredSignatures
       0, // metadataBatchId
       accessPolicy,
       publishPolicy,
       authority,
       0, // publishAuthorityAccountId
+      ethers.ZeroHash, // nameHash
     );
     await tx.wait();
     return CGStorageContract.getLatestContextGraphId();

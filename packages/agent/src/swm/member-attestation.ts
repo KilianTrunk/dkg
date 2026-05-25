@@ -161,26 +161,59 @@ export interface MintMemberAttestationInput {
   sign: (digest: Uint8Array) => Promise<string>;
 }
 
+/**
+ * Codex PR #609 R2 — structural payload validator. Used by BOTH the
+ * mint and verify paths so malformed input fails the same way in both
+ * directions (mint throws; verify returns a structured failure rather
+ * than 500-crashing the HTTP route). Returns `null` on success or a
+ * human-readable reason string on the first validation miss.
+ *
+ * Specifically catches: non-numeric chainId / contextGraphId /
+ * attestedAt, malformed hex in merkleRoot / plaintextLeafHash /
+ * attesterAddress / kavAddress, and missing batchId. Before this,
+ * `computeAttestationDigest` would either throw out of the parsing
+ * helpers (non-numeric / wrong-length hex) OR coerce malformed hex to
+ * zero bytes (the parser is permissive on shorter input), letting bad
+ * payloads slip through into the recover path.
+ */
+export function validateAttestationPayload(
+  payload: Partial<MemberAttestationPayload>,
+): string | null {
+  if (typeof payload.batchId !== 'string' || payload.batchId.length === 0) {
+    return 'batchId must be a non-empty string';
+  }
+  if (typeof payload.chainId !== 'string' || payload.chainId.length === 0) {
+    return 'chainId must be a non-empty string';
+  }
+  try { BigInt(payload.chainId); } catch { return `chainId must be a numeric string (got "${payload.chainId}")`; }
+  if (typeof payload.contextGraphId !== 'string' || payload.contextGraphId.length === 0) {
+    return 'contextGraphId must be a non-empty string';
+  }
+  try { BigInt(payload.contextGraphId); } catch { return `contextGraphId must be a numeric string (got "${payload.contextGraphId}")`; }
+  if (typeof payload.merkleRoot !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(payload.merkleRoot)) {
+    return 'merkleRoot must be 0x + 64 hex chars';
+  }
+  if (typeof payload.plaintextLeafHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(payload.plaintextLeafHash)) {
+    return 'plaintextLeafHash must be 0x + 64 hex chars';
+  }
+  if (typeof payload.attesterAddress !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(payload.attesterAddress)) {
+    return 'attesterAddress must be 0x + 40 hex chars';
+  }
+  if (typeof payload.kavAddress !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(payload.kavAddress)) {
+    return 'kavAddress must be 0x + 40 hex chars';
+  }
+  if (typeof payload.attestedAt !== 'number' || !Number.isFinite(payload.attestedAt) || payload.attestedAt < 0 || !Number.isInteger(payload.attestedAt)) {
+    return 'attestedAt must be a non-negative integer (unix epoch seconds)';
+  }
+  return null;
+}
+
 export async function mintMemberAttestation(
   input: MintMemberAttestationInput,
 ): Promise<MemberAttestation> {
   const payload: MemberAttestationPayload = { ...input.payload, version: 1 };
-  // Light sanity checks — a malformed token is unrecoverable later
-  if (!/^0x[0-9a-fA-F]{64}$/.test(payload.merkleRoot)) {
-    throw new Error('merkleRoot must be 0x + 64 hex chars');
-  }
-  if (!/^0x[0-9a-fA-F]{64}$/.test(payload.plaintextLeafHash)) {
-    throw new Error('plaintextLeafHash must be 0x + 64 hex chars');
-  }
-  if (!/^0x[0-9a-fA-F]{40}$/.test(payload.attesterAddress)) {
-    throw new Error('attesterAddress must be 0x + 40 hex chars');
-  }
-  if (!/^0x[0-9a-fA-F]{40}$/.test(payload.kavAddress)) {
-    throw new Error('kavAddress must be 0x + 40 hex chars');
-  }
-  if (!Number.isFinite(payload.attestedAt) || payload.attestedAt < 0) {
-    throw new Error('attestedAt must be a non-negative unix epoch (seconds)');
-  }
+  const invalid = validateAttestationPayload(payload);
+  if (invalid) throw new Error(invalid);
 
   const digest = computeAttestationDigest(payload);
   const signature = await input.sign(digest);
@@ -240,7 +273,38 @@ export async function verifyMemberAttestation(
   input: VerifyMemberAttestationInput,
 ): Promise<VerifyMemberAttestationResult> {
   const { attestation, candidateLeaf, membershipResolver } = input;
-  const digest = computeAttestationDigest(attestation.payload);
+
+  // Codex PR #609 R2 — validate payload BEFORE digesting. Without this,
+  // non-numeric chainId/contextGraphId/attestedAt throws out of the
+  // parsing helpers inside `computeAttestationDigest`, turning the
+  // HTTP verifier into a 500; malformed hex in roots/addresses gets
+  // coerced to zero bytes by the permissive parser, letting false
+  // positives slip through. Surface both as structured `ok: false`.
+  const invalid = validateAttestationPayload(attestation.payload);
+  if (invalid) {
+    return {
+      ok: false,
+      recoveredSigner: '',
+      signerMatchesAttester: false,
+      leafCheck: 'skipped',
+      membership: 'skipped',
+      reason: `malformed attestation payload: ${invalid}`,
+    };
+  }
+
+  let digest: Uint8Array;
+  try {
+    digest = computeAttestationDigest(attestation.payload);
+  } catch (err: any) {
+    return {
+      ok: false,
+      recoveredSigner: '',
+      signerMatchesAttester: false,
+      leafCheck: 'skipped',
+      membership: 'skipped',
+      reason: `digest construction failed: ${err?.message ?? err}`,
+    };
+  }
 
   let recovered: string;
   try {

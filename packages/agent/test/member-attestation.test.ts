@@ -177,4 +177,42 @@ describe('verifyMemberAttestation', () => {
     expect(res.ok).toBe(true);
     expect(res.membership).toBe('unknown');
   });
+
+  // Codex PR #609 R2 — verifyMemberAttestation must NOT throw on
+  // malformed caller-controlled payloads. Both "throws inside digest"
+  // (non-numeric chainId/contextGraphId/attestedAt) and "permissive
+  // parser coerces malformed hex to zero bytes → false positive"
+  // paths now produce a structured ok=false instead of a 500.
+  it('returns structured failure on non-numeric chainId (was: throws 500)', async () => {
+    const att = await mint();
+    const corrupt: MemberAttestation = {
+      ...att,
+      payload: { ...att.payload, chainId: 'not-a-number' as any },
+    };
+    const res = await verifyMemberAttestation({ attestation: corrupt });
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/chainId|malformed/);
+  });
+
+  it('returns structured failure on malformed merkleRoot hex', async () => {
+    const att = await mint();
+    const corrupt: MemberAttestation = {
+      ...att,
+      payload: { ...att.payload, merkleRoot: '0xabcd' as any },
+    };
+    const res = await verifyMemberAttestation({ attestation: corrupt });
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/merkleRoot|malformed/);
+  });
+
+  it('returns structured failure on non-integer attestedAt', async () => {
+    const att = await mint();
+    const corrupt: MemberAttestation = {
+      ...att,
+      payload: { ...att.payload, attestedAt: 12.5 as any },
+    };
+    const res = await verifyMemberAttestation({ attestation: corrupt });
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/attestedAt|malformed/);
+  });
 });

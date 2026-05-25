@@ -82,6 +82,7 @@ export {
   mintMemberAttestation,
   verifyMemberAttestation,
   computeAttestationDigest,
+  validateAttestationPayload,
   type MemberAttestation,
   type MemberAttestationPayload,
   type MintMemberAttestationInput,

@@ -57,7 +57,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral } from '@origintrail-official/dkg-core';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, contextGraphDataUri, escapeDkgRdfLiteral } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
@@ -629,15 +629,31 @@ WHERE {
     // Discover candidate peers. The single-peer mode is opt-in; the
     // default fan-out mode mirrors what runSyncOnConnect does on every
     // peer:connect event, but caller-initiated rather than event-driven.
+    //
+    // Codex PR #609 R2 — route through `createCGHostEnumerator` so the
+    // hosting-peer policy stays centralized. Today's Phase-A enumerator
+    // returns all connected peers (minus self); when Phase B lands shard-
+    // aware host selection in LU-6, this call site picks it up for free
+    // instead of needing to be updated in lockstep.
     let candidatePeers: string[];
     if (peerIdParam) {
       candidatePeers = [peerIdParam];
     } else {
-      candidatePeers = agent.node.libp2p
-        .getConnections()
-        .map((c: any) => c.remotePeer.toString());
-      const selfPeer = agent.peerId;
-      candidatePeers = Array.from(new Set(candidatePeers.filter((p: string) => p !== selfPeer)));
+      const { createCGHostEnumerator } = await import('@origintrail-official/dkg-agent');
+      const enumerator = createCGHostEnumerator({
+        getConnectedPeers: () =>
+          agent.node.libp2p.getConnections().map((c: any) => c.remotePeer.toString()),
+        getSelfPeerId: () => agent.peerId,
+      });
+      // Per-CG enumeration unioned across all requested CGs — phase A's
+      // enumerator returns the same connected-peers set for every cgId,
+      // but unioning keeps us forward-compatible with phase B's per-CG
+      // shard filtering.
+      const unioned = new Set<string>();
+      for (const cgId of cgIds) {
+        for (const p of await enumerator.enumerate(cgId)) unioned.add(p);
+      }
+      candidatePeers = Array.from(unioned);
     }
 
     if (candidatePeers.length === 0) {
@@ -807,7 +823,12 @@ WHERE {
       //   2. CG data graph (post-publish — selection moves quads from
       //      SWM into the named-graph as part of the seal step)
       const swmGraphUri = contextGraphSharedMemoryUri(contextGraphId, subGraphName);
-      const dataGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+      // Codex PR #609 R2 — when `subGraphName` is set and the batch has
+      // already been published (i.e. SWM is empty post-promote), the
+      // finalized triples live under the sub-graph-specific data graph,
+      // not the root CG graph. Use the same sub-graph-aware helper the
+      // publisher uses so the fallback path actually finds them.
+      const dataGraphUri = contextGraphDataUri(contextGraphId, subGraphName);
       try {
         const swmResult = await (agent as any).store.query(
           `SELECT ?s ?p ?o WHERE { GRAPH <${swmGraphUri}> { ?s ?p ?o } }`,

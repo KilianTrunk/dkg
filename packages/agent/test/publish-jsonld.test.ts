@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DKGAgent, type DKGAgentConfig } from '../src/index.js';
 import { OxigraphStore, SharedMemoryLiteralBlobStore, type TripleStore } from '@origintrail-official/dkg-storage';
 import { TripleStoreAsyncLiftPublisher } from '@origintrail-official/dkg-publisher';
-import { buildAuthorAttestationTypedData } from '@origintrail-official/dkg-core';
+import { DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, buildAuthorAttestationTypedData, contextGraphDataGraphUri } from '@origintrail-official/dkg-core';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
@@ -61,15 +61,28 @@ afterEach(async () => {
 });
 
 describe('publishJsonLd', () => {
-  it('returns the override store used by the agent', async () => {
+  it('uses the override store for agent writes and helper bookkeeping', async () => {
     const overrideStore = new SharedMemoryLiteralBlobStore(new OxigraphStore(), {
       blobDir: await createTempDataDir('dkg-agent-override-store-blobs-'),
       thresholdBytes: 65_536,
     });
 
-    const { store } = await createAgent('OverrideStoreBot', { store: overrideStore });
+    const { agent, store } = await createAgent('OverrideStoreBot', { store: overrideStore });
 
     expect(store).toBe(overrideStore);
+    await agent.createContextGraph({ id: 'override-store-observable', name: 'OverrideStoreObservable', description: '' });
+
+    const result = await store.query(`
+      ASK {
+        GRAPH <${contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY)}> {
+          <${contextGraphDataGraphUri('override-store-observable')}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}>
+        }
+      }
+    `);
+    expect(result.type).toBe('boolean');
+    if (result.type === 'boolean') {
+      expect(result.value).toBe(true);
+    }
   }, 30_000);
 
   it('bare JSON-LD doc defaults to private quads (with synthetic public anchor)', async () => {

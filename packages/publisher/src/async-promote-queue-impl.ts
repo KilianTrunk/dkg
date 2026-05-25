@@ -9,9 +9,10 @@
  *    `(contextGraphId, subGraphName, assertionName)` runs at a time. N
  *    workers total.
  *  - **No private staging.** The worker calls `assertionPromote` directly.
- *  - **No chain integration.** Recovery decides "rerun safely" vs
- *    "needs human inspection" via the `commitMarker.swmInserted` flag,
- *    not via on-chain lookups.
+ *  - **No chain integration.** Expired running attempts are parked for
+ *    operator inspection unless a worker explicitly fails before the ambiguous
+ *    promote window. The commit marker is observability, not proof that an
+ *    unmarked crash left SWM untouched.
  *
  * See `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` (RFC) and
  * `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE_IMPLEMENTATION_PLAN.md` (plan).
@@ -68,6 +69,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
   private readonly leaseMs: number;
   private readonly now: () => number;
   private readonly idGenerator: () => string;
+  private readonly claimTokenGenerator: () => string;
   private readonly backoff: (attemptCount: number) => number;
   private paused = false;
   private graphEnsured = false;
@@ -81,6 +83,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     this.leaseMs = config.leaseMs ?? TripleStoreAsyncPromoteQueue.DEFAULT_LEASE_MS;
     this.now = config.now ?? (() => Date.now());
     this.idGenerator = config.idGenerator ?? (() => crypto.randomUUID());
+    this.claimTokenGenerator = config.claimTokenGenerator ?? (() => crypto.randomUUID());
     this.backoff = config.backoff ?? defaultBackoffMs;
   }
 
@@ -201,7 +204,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       if (eligible.length === 0) return null;
 
       const next = eligible.sort(comparePromoteJobs)[0]!;
-      const claimToken = `${workerId}:${now}:${next.jobId}`;
+      const claimToken = `${workerId}:${next.jobId}:${this.claimTokenGenerator()}`;
       const claimed: PromoteJob = {
         ...next,
         state: 'running',
@@ -343,20 +346,6 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
         const expiresAt = job.lease?.expiresAt ?? 0;
         if (expiresAt > now) continue; // lease still valid; worker is fine
 
-        if (job.commitMarker?.swmInserted) {
-          // RFC §4.4: partial-promote ambiguity. SWM already has the data;
-          // re-running would double-gossip and could leave WM in an
-          // inconsistent state. Park for operator inspection.
-          await this.abandonStartupRecovery(
-            job,
-            now,
-            'partial promote ambiguity: lease expired after SWM insert; needs operator inspection',
-            'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip',
-          );
-          abandoned += 1;
-          continue;
-        }
-
         const conflicting = await this.findActiveByUniquenessKey(uniquenessKey(job.request), job.jobId);
         if (conflicting) {
           await this.abandonStartupRecovery(
@@ -369,18 +358,22 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
           continue;
         }
 
-        // Safe to rerun: nothing landed in SWM yet, so a fresh attempt is idempotent.
-        const requeued: PromoteJob = {
-          ...job,
-          state: 'queued',
-          updatedAt: now,
-          lease: undefined,
-          // Preserve attempt count — this is a recovery, not a normal retry.
-          // The job will be picked up immediately by the next claimNext().
-          commitMarker: undefined,
-        };
-        await this.writeJob(requeued);
-        reclaimed += 1;
+        // The worker records `swmInserted` only after `assertionPromote()`
+        // returns. A crash with the marker still false may have happened before
+        // promote started, or after the internal SWM write but before the marker
+        // write. Without a stronger on-store reconciliation signal, rerun is
+        // unsafe.
+        await this.abandonStartupRecovery(
+          job,
+          now,
+          job.commitMarker?.swmInserted
+            ? 'partial promote ambiguity: lease expired after SWM insert; needs operator inspection'
+            : 'partial promote ambiguity: lease expired before durable SWM marker; needs operator inspection',
+          job.commitMarker?.swmInserted
+            ? 'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip'
+            : 'Worker crashed during promote with no durable commit marker; recovery aborted because SWM state is ambiguous',
+        );
+        abandoned += 1;
       }
 
       return { reclaimed, abandoned };
@@ -420,6 +413,9 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       throw new Error('entities must be either "all" or an array of URIs');
     }
     if (Array.isArray(request.entities)) {
+      if (request.entities.length === 0) {
+        throw new Error('entities array must not be empty; use "all" to promote every root');
+      }
       for (const e of request.entities) {
         if (typeof e !== 'string' || e.length === 0) {
           throw new Error('entities array must contain non-empty strings');

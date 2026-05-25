@@ -85,11 +85,10 @@ export interface PromoteResult {
 
 /**
  * Per-job commit marker — written by the worker as it observes
- * `assertionPromote` advancing through its internal phases. Recovery uses
- * `swmInserted` to decide whether re-running a crashed job is safe (see
- * RFC §4.4 and plan §7). The other three flags are informational; we
- * record them so an operator can see which step in the multi-step commit
- * was reached, but they don't gate any control-flow decision in v1.
+ * `assertionPromote` advancing through its internal phases. These flags are
+ * operator-facing evidence for partial-promote diagnosis. They are not enough
+ * to prove an expired running job is safe to rerun, because the first marker is
+ * recorded after `assertionPromote()` returns.
  */
 export interface PromoteCommitMarker {
   swmInserted: boolean;
@@ -134,15 +133,13 @@ export interface PromoteListFilter {
 /**
  * Result of a startup recovery sweep. See RFC §4.4.
  *
- * - `reclaimed`  — `running` jobs whose lease expired but whose
- *                  `commitMarker.swmInserted` was still `false`. The
- *                  queue moves them back to `queued` for a clean rerun.
- * - `abandoned`  — `running` jobs whose lease expired AND whose
- *                  `commitMarker.swmInserted` was `true`. The queue parks
- *                  them in `failed` with `reason="partial promote
- *                  ambiguity"` because re-running risks duplicate gossip
- *                  and partial WM state. An operator inspects and either
- *                  cancels or manually `recover()`s after verifying SWM.
+ * - `reclaimed`  — reserved for a future reconciler that can prove an expired
+ *                  running attempt did not touch SWM. The v1 implementation
+ *                  leaves this at zero.
+ * - `abandoned`  — expired `running` jobs parked in `failed` with
+ *                  `reason="partial promote ambiguity"` because re-running
+ *                  risks duplicate gossip and partial WM state. An operator
+ *                  inspects and manually `recover()`s after verifying SWM.
  */
 export interface PromoteRecoverySummary {
   reclaimed: number;
@@ -187,6 +184,8 @@ export interface AsyncPromoteQueueConfig {
   now?: () => number;
   /** Defaults to `crypto.randomUUID()`. Tests inject deterministic ids. */
   idGenerator?: () => string;
+  /** Defaults to `crypto.randomUUID()`. Must be fresh for every lease claim. */
+  claimTokenGenerator?: () => string;
   /**
    * Backoff curve for `failed_retrying` jobs. Receives the next attempt
    * count (1-indexed — first retry is attempt 1) and returns ms-from-now.

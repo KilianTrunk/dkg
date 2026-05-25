@@ -87,6 +87,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const queue = createQueue();
     await expect(queue.enqueue(makeRequest({ assertionName: '' }))).rejects.toThrow(/assertionName/);
     await expect(queue.enqueue(makeRequest({ contextGraphId: '' }))).rejects.toThrow(/contextGraphId/);
+    await expect(queue.enqueue(makeRequest({ entities: [] }))).rejects.toThrow(/entities array must not be empty/);
   });
 
   it('3. enqueue() rejects with PromoteJobConflictError when (cgId, subGraphName, assertionName) has an active job', async () => {
@@ -431,6 +432,25 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(reclaim?.attempt.count).toBe(1);
   });
 
+  it('21b. claimNext() generates a fresh claim token when the same worker reclaims the same job in the same millisecond', async () => {
+    const queue = createQueue({ backoff: () => 0 });
+    const jobId = await queue.enqueue(makeRequest());
+    const firstClaim = await queue.claimNext('worker-1');
+    const firstToken = firstClaim!.lease!.claimToken;
+
+    await queue.fail(jobId, firstToken, {
+      message: 'retry immediately',
+      retryable: true,
+      classification: 'transient',
+      recordedAt: now,
+    });
+
+    const secondClaim = await queue.claimNext('worker-1');
+    const secondToken = secondClaim!.lease!.claimToken;
+    expect(secondToken).not.toBe(firstToken);
+    await expect(queue.heartbeat(jobId, firstToken)).rejects.toBeInstanceOf(PromoteJobLeaseError);
+  });
+
   it('22. claimNext() does NOT pick up failed_retrying before nextRetryAt', async () => {
     const queue = createQueue({ backoff: () => 60_000 });
     const jobId = await queue.enqueue(makeRequest());
@@ -526,22 +546,23 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.lease).toBeUndefined();
   });
 
-  it('26. recoverOnStartup() requeues running jobs whose lease expired AND swmInserted=false', async () => {
+  it('26. recoverOnStartup() abandons expired running jobs even when swmInserted=false', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const jobId = await queue.enqueue(makeRequest());
     await queue.claimNext('worker-1');
-    // No commit marker recorded — worker crashed before assertionPromote returned.
+    // No commit marker recorded. That could mean the worker crashed before
+    // assertionPromote started, or after the internal SWM write and before the
+    // marker write, so automatic rerun is unsafe.
 
     advance(60_000);
     const summary = await queue.recoverOnStartup();
 
-    expect(summary.reclaimed).toBe(1);
-    expect(summary.abandoned).toBe(0);
+    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(1);
     const job = await queue.getStatus(jobId);
-    expect(job?.state).toBe('queued');
+    expect(job?.state).toBe('failed');
+    expect(job?.reason).toMatch(/partial promote ambiguity/i);
     expect(job?.lease).toBeUndefined();
-    // Attempt counter preserved — this is a recovery, not a normal retry.
-    expect(job?.attempt.count).toBe(0);
   });
 
   it('27. recoverOnStartup() leaves `running` jobs alone when the lease is still valid', async () => {
@@ -603,8 +624,8 @@ describe('TripleStoreAsyncPromoteQueue', () => {
 
     advance(60_000);
     const summary = await queue.recoverOnStartup();
-    expect(summary.abandoned).toBe(2);
-    expect(summary.reclaimed).toBe(2);
+    expect(summary.abandoned).toBe(4);
+    expect(summary.reclaimed).toBe(0);
   });
 
   // ---------------------------------------------------------------------------
@@ -661,7 +682,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     // The good token still works.
     await queue.recordCommitMarker(jobId, goodToken, 'swmInserted');
 
-    // A stale token (e.g. another worker reclaimed after lease expiry) — all
+    // A stale token (e.g. another worker reclaimed after retry backoff) — all
     // four lease-protected ops reject.
     await expect(queue.recordCommitMarker(jobId, 'stale', 'wmCleaned')).rejects.toBeInstanceOf(PromoteJobLeaseError);
     await expect(queue.heartbeat(jobId, 'stale')).rejects.toBeInstanceOf(PromoteJobLeaseError);

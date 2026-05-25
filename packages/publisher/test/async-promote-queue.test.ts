@@ -176,6 +176,18 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(cg1.every((j) => j.request.contextGraphId === 'cg-1')).toBe(true);
   });
 
+  it('7b. list({limit}) slices after deterministic queue ordering', async () => {
+    const queue = createQueue();
+    await queue.enqueue(makeRequest({ assertionName: 'oldest' }));
+    advance(10);
+    await queue.enqueue(makeRequest({ assertionName: 'middle' }));
+    advance(10);
+    await queue.enqueue(makeRequest({ assertionName: 'newest' }));
+
+    const limited = await queue.list({ limit: 2 });
+    expect(limited.map((j) => j.request.assertionName)).toEqual(['oldest', 'middle']);
+  });
+
   // ---------------------------------------------------------------------------
   // §3.4 cancel / recover
   // ---------------------------------------------------------------------------
@@ -197,6 +209,21 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     await queue.claimNext('worker-1');
 
     await expect(queue.cancel(jobId)).rejects.toThrow(/running/);
+  });
+
+  it('9b. cancel() on `failed_retrying` rejects so transient failures keep their retry budget', async () => {
+    const queue = createQueue({ backoff: () => 1_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    await queue.fail(jobId, claimed!.lease!.claimToken, {
+      message: 'transient blip',
+      retryable: true,
+      classification: 'transient',
+      recordedAt: now,
+    });
+
+    await expect(queue.cancel(jobId)).rejects.toThrow(/failed_retrying/);
+    expect((await queue.getStatus(jobId))?.state).toBe('failed_retrying');
   });
 
   // ---------------------------------------------------------------------------
@@ -644,6 +671,23 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     await expect(
       queue.succeed(jobId, 'stale', { promotedCount: 1, succeededAt: now }),
     ).rejects.toBeInstanceOf(PromoteJobLeaseError);
+  });
+
+  it('31b. concurrent heartbeat and succeed transitions cannot resurrect a succeeded job', async () => {
+    const queue = createQueue({ leaseMs: 60_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    const token = claimed!.lease!.claimToken;
+    await queue.recordCommitMarker(jobId, token, 'swmInserted');
+
+    await Promise.allSettled([
+      queue.heartbeat(jobId, token),
+      queue.succeed(jobId, token, { promotedCount: 1, succeededAt: now }),
+    ]);
+
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('succeeded');
+    expect(job?.lease).toBeUndefined();
   });
 
   // ---------------------------------------------------------------------------

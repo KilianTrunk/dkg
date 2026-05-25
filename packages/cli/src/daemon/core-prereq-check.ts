@@ -40,9 +40,10 @@
  * specific ranges in narrowing order — loopback → CGNAT → RFC1918 →
  * link-local → ULAv6 — so a more-specific class wins over a less-specific
  * one. DNS multiaddrs deliberately classify as `dns` rather than resolving at
- * boot (DNS resolution is async + flaky + the answer can change); operators
- * who use `/dns4/foo.example/...` should pair it with at least one IP
- * address or accept the degraded-warning at boot.
+ * boot (DNS resolution is async + flaky + the answer can change). DNS listen
+ * addresses are not themselves proof of public reachability, but DNS announce
+ * addresses can rescue an otherwise private/wildcard binding because the
+ * operator is explicitly advertising a stable externally-routable name.
  */
 
 import type { NetworkInterfaceInfo } from 'node:os';
@@ -268,9 +269,10 @@ export function checkCoreRelayPrereqs(
     .map((c) => c.addr);
   const nonRoutableAddresses = classified.filter((c) => c.class !== 'public');
 
-  const announcePublic = announceAddresses.some(
-    (a) => classifyMultiaddr(a, hostInterfaces) === 'public',
-  );
+  const announcePublic = announceAddresses.some((a) => {
+    const klass = classifyMultiaddr(a, hostInterfaces);
+    return klass === 'public' || klass === 'dns';
+  });
   const announceCanServe = classified.some(
     (c) => c.class === 'dns'
       || c.class === 'rfc1918'
@@ -305,7 +307,7 @@ export function checkCoreRelayPrereqs(
     }
     if (announceAddresses.length > 0 && !announcePublic) {
       reasons.push(
-        `${announceAddresses.length} announceAddress${announceAddresses.length === 1 ? '' : 'es'} present but none classify as public`,
+        `${announceAddresses.length} announceAddress${announceAddresses.length === 1 ? '' : 'es'} present but none classify as public or DNS`,
       );
     }
     if (announceAddresses.length === 0) {

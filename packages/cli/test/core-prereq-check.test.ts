@@ -211,6 +211,18 @@ describe('checkCoreRelayPrereqs — 7 canonical cases from the plan', () => {
     expect(result.looksDegraded).toBe(false);
     expect(result.nonRoutableAddresses[0].class).toBe('dns');
   });
+
+  it('DNS announce rescues a private bound listener for stable public-DNS deployments', () => {
+    const result = checkCoreRelayPrereqs({
+      listenAddresses: ['/ip4/192.168.1.1/tcp/4001'],
+      hostInterfaces: [RFC1918_IFACE],
+      announceAddresses: ['/dnsaddr/relay.example.com'],
+      nodeRole: 'core',
+    });
+
+    expect(result.looksDegraded).toBe(false);
+    expect(result.nonRoutableAddresses[0].class).toBe('rfc1918');
+  });
 });
 
 describe('checkCoreRelayPrereqs — additional safety cases', () => {
@@ -288,7 +300,7 @@ describe('checkCoreRelayPrereqs — additional safety cases', () => {
       nodeRole: 'core',
     });
     expect(result.looksDegraded).toBe(true);
-    expect(result.reasons.some((r) => r.includes('announceAddress') && r.includes('none classify as public'))).toBe(true);
+    expect(result.reasons.some((r) => r.includes('announceAddress') && r.includes('none classify as public or DNS'))).toBe(true);
   });
 
   it('no announceAddresses on a degraded result surfaces the missing-rescue hint', () => {

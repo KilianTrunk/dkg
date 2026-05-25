@@ -65,6 +65,16 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
     );
   });
 
+  it('rejects catchall extension schemas that would allow arbitrary request keys', () => {
+    const ext: KafkaPluginExtension<Record<string, unknown>> = {
+      schema: z.object({}).catchall(z.string()),
+      augment: () => ({}),
+    };
+    expect(() => validateExtensionAgainstCore(ext, coreSchema)).toThrow(
+      ExtensionSchemaUnsupportedFieldError,
+    );
+  });
+
   it('allows optional scalar extension fields', () => {
     const ext: KafkaPluginExtension<Record<string, unknown>> = {
       schema: z.object({ externalRef: z.string().optional() }),

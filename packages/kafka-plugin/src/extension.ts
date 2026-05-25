@@ -37,6 +37,10 @@ export function validateExtensionAgainstCore<TParsed>(
   if (!extShape || typeof extShape !== 'object') {
     throw new TypeError('kafka-plugin extension.schema must be a Zod object schema (has .shape)');
   }
+  const catchall = extension.schema._def.catchall;
+  if (catchall && !(catchall instanceof z.ZodNever)) {
+    throw new ExtensionSchemaUnsupportedFieldError(['*']);
+  }
   const coreKeys = new Set(Object.keys(coreSchema.shape));
   const colliding = Object.keys(extShape).filter((k) => coreKeys.has(k));
   if (colliding.length > 0) {

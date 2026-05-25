@@ -23,7 +23,7 @@ export function parseConfigYaml(text) {
     const indent = line.match(/^ */)[0].length;
 
     if (trimmed.startsWith('- ')) {
-      if (!section || !listKey) throw new Error(`line ${idx + 1}: list item has no parent key`);
+      if (!section || !listKey) continue;
       root[section][listKey].push(parseScalar(trimmed.slice(2).trim()));
       continue;
     }

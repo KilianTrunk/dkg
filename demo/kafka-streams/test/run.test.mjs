@@ -134,6 +134,28 @@ test('validateKafkaContextGraphConfig supports config.yaml and keeps config.json
   await validateKafkaContextGraphConfig([{ label: 'node3', dkgHome: node3Home }], 'json-cg');
 });
 
+test('validateKafkaContextGraphConfig tolerates top-level routePlugins lists in config.yaml', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'kafka-streams-demo-run-'));
+  test.after(() => rm(dir, { recursive: true, force: true }));
+  const node1Home = join(dir, 'node1');
+  const node2Home = join(dir, 'node2');
+  await Promise.all([mkdir(node1Home), mkdir(node2Home)]);
+  const config = [
+    'routePlugins:',
+    '  - ./packages/kafka-plugin/dist/index.js',
+    'kafka:',
+    '  contextGraphId: demo-cg',
+    '',
+  ].join('\n');
+  await writeFile(join(node1Home, 'config.yaml'), config);
+  await writeFile(join(node2Home, 'config.yaml'), config);
+
+  await validateKafkaContextGraphConfig([
+    { label: 'node1', dkgHome: node1Home },
+    { label: 'node2', dkgHome: node2Home },
+  ], 'demo-cg');
+});
+
 test('validateKafkaContextGraphConfig rejects node1 and node2 kafka contextGraphId mismatches', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'kafka-streams-demo-run-'));
   test.after(() => rm(dir, { recursive: true, force: true }));

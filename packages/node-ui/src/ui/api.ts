@@ -211,7 +211,7 @@ export async function createContextGraph(
   id: string,
   name: string,
   description?: string,
-  opts?: { allowedAgents?: string[]; accessPolicy?: number },
+  opts?: { allowedAgents?: string[]; accessPolicy?: number; publishPolicy?: number },
 ): Promise<{ created: string; uri: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
@@ -223,6 +223,7 @@ export async function createContextGraph(
         id, name, description,
         ...(opts?.allowedAgents ? { allowedAgents: opts.allowedAgents } : {}),
         ...(opts?.accessPolicy !== undefined ? { accessPolicy: opts.accessPolicy } : {}),
+        ...(opts?.publishPolicy !== undefined ? { publishPolicy: opts.publishPolicy } : {}),
       }),
       signal: controller.signal,
     });

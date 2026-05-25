@@ -396,8 +396,6 @@ export interface ContextGraphSub {
   metaSynced?: boolean;
   /** On-chain context graph ID (keccak256 hash), if known. */
   onChainId?: string;
-  /** Local participant identities used for private SWM authorization before anchoring. */
-  participantIdentityIds?: bigint[];
   /** Participant agent addresses (V10 agent identity model). */
   participantAgents?: string[];
   /**

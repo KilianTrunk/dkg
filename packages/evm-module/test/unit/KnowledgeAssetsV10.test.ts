@@ -252,9 +252,7 @@ describe('@unit KnowledgeAssetsV10', () => {
    */
   async function createOpenCG(creator: SignerWithAddress): Promise<bigint> {
     await Facade.connect(creator).createContextGraph(
-      [10n, 20n, 30n], // hosting nodes (not validated against identity storage)
       [], // participant agents
-      2, // requiredSignatures
       0, // metadataBatchId
       0, // accessPolicy = public/discoverable
       1, // publishPolicy = open
@@ -273,9 +271,7 @@ describe('@unit KnowledgeAssetsV10', () => {
     accountId: bigint = 0n,
   ): Promise<bigint> {
     await Facade.connect(creator).createContextGraph(
-      [10n, 20n, 30n],
       [],
-      2,
       0,
       0, // accessPolicy = public/discoverable
       0, // publishPolicy = curated
@@ -2045,9 +2041,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         // owner. Using accounts[0] as CG creator keeps TRAC on the deployer
         // (which is fine because the agent is the real publishing principal).
         await Facade.connect(accounts[0]).createContextGraph(
-          [10n, 20n, 30n],
           [],
-          2,
           0,
           0, // accessPolicy = public/discoverable
           0, // publishPolicy = curated

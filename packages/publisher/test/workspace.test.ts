@@ -383,8 +383,8 @@ describe('Workspace: publishFromSharedMemory', () => {
 
   it('publishFromSharedMemory with contextGraphId remaps quads to context graph URIs', async () => {
     const cgResult = await chain.createOnChainContextGraph({
-      participantIdentityIds: [BigInt(getSharedContext().coreProfileId)],
-      requiredSignatures: 1,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
     const ctxId = String(cgResult.contextGraphId);
     const ctxDataGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${ctxId}`;
@@ -423,8 +423,8 @@ describe('Workspace: publishFromSharedMemory', () => {
 
   it('publishFromSharedMemory with contextGraphId calls verify', async () => {
     const cgResult = await chain.createOnChainContextGraph({
-      participantIdentityIds: [BigInt(getSharedContext().coreProfileId)],
-      requiredSignatures: 1,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
     const ctxId = String(cgResult.contextGraphId);
 

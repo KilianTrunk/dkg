@@ -284,9 +284,7 @@ describe('V10 E2E Conviction System', function () {
 
       // ---- Step 3: Context Graph creation (open policy) ----
       await CGFacade.connect(creator).createContextGraph(
-        [10n, 20n, 30n], // hosting nodes
         [],                // participant agents
-        2,                 // requiredSignatures
         0,                 // metadataBatchId
         0,                 // accessPolicy = public/discoverable
         1,                 // publishPolicy = open (any non-zero publisher auth'd)

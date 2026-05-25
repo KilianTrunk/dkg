@@ -91,8 +91,7 @@ async function mineBlocks(count: number): Promise<void> {
 async function createV10Cg(chain: ReturnType<typeof createEVMAdapter>): Promise<{ contextGraphId: string; blockNumber: number }> {
   const id = BigInt(getSharedContext().coreProfileId);
   const result = await chain.createOnChainContextGraph({
-    participantIdentityIds: [id],
-    requiredSignatures: 1,
+    accessPolicy: 1,
     publishPolicy: 0,
   });
   if (!result.success || result.contextGraphId === 0n) {

@@ -855,9 +855,7 @@ describe('@unit RandomSampling', () => {
           : ethers.ZeroAddress;
       const tx = await ContextGraphStorage.connect(opSigner).createContextGraph(
         owner,
-        [10n, 20n, 30n], // hosting nodes (sorted, non-zero, distinct)
         [], // no participant agents
-        2, // requiredSignatures
         0, // metadataBatchId
         0, // accessPolicy = public/discoverable
         publishPolicy,

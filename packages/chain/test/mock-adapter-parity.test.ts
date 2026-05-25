@@ -144,7 +144,6 @@ const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([
   'resolvePublishByTxHash',
   'verifyKAUpdate',
   'listContextGraphsFromChain',
-  'getContextGraphParticipants',
   'createOnChainContextGraph',
   'verify',
   'publishToContextGraph',
@@ -152,6 +151,7 @@ const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([
   'signACKDigest',
   'getACKSignerKey',
   'getMinimumRequiredSignatures',
+  'isShardingTableMember',
   'verifyACKIdentity',
   'verifySyncIdentity',
   'ensureOperationalWalletsRegistered',
@@ -219,6 +219,41 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     expect(mock.isV10Ready()).toBe(true);
   });
 
+  // Codex PR #595 round-4: isShardingTableMember gates VM ACK eligibility.
+  // The mock can't model a real sharding table, so it treats every
+  // registered (non-zero) identity as a member; tests needing
+  // non-membership behaviour spy/monkey-patch the method.
+  it('isShardingTableMember returns true for any non-zero identityId and false for 0n', async () => {
+    const mock = new MockChainAdapter();
+    expect(await mock.isShardingTableMember(0n)).toBe(false);
+    expect(await mock.isShardingTableMember(1n)).toBe(true);
+    expect(await mock.isShardingTableMember(99999n)).toBe(true);
+  });
+
+  // Codex PR #595 round-5: EVMChainAdapter.getMinimumRequiredSignatures
+  // previously returned a hardcoded 3 when ParametersStorage couldn't be
+  // resolved. The agent + publisher verify paths trust this value, so a
+  // silent fallback meant verify could enforce the wrong quorum without
+  // anyone noticing. The adapter now throws so the upstream fail-closed
+  // guards actually fire.
+  it('EVMChainAdapter.getMinimumRequiredSignatures throws when ParametersStorage is unresolvable', async () => {
+    const evm = new EVMChainAdapter({
+      rpcUrl: 'http://127.0.0.1:1',
+      hubAddress: '0x0000000000000000000000000000000000000001',
+      privateKey: '0x' + '1'.repeat(64),
+      allowNoAdminSigner: true,
+    });
+    // Force the contracts cache into a state where parametersStorage is
+    // missing without touching the network — mirrors the adapter
+    // misconfiguration / network-outage case that previously fell back
+    // to a hardcoded 3.
+    (evm as any).contracts = { parametersStorage: undefined };
+    (evm as any).initialized = true;
+    await expect(evm.getMinimumRequiredSignatures()).rejects.toThrow(
+      /ParametersStorage contract is not resolvable/,
+    );
+  });
+
   it('getEvmChainId returns a bigint (not a namespaced string like "mock:31337")', async () => {
     const mock = new MockChainAdapter();
     const id = await mock.getEvmChainId();
@@ -234,18 +269,16 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
 
   it('rejects participant agent configs that would revert on-chain', async () => {
     const mock = new MockChainAdapter();
-    const base = {
-      participantIdentityIds: [1n],
-      requiredSignatures: 1,
-    };
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 0,
+      publishPolicy: 1,
       participantAgents: ['0x0000000000000000000000000000000000000000'],
     })).rejects.toThrow(/zero participant agent/);
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 0,
+      publishPolicy: 1,
       participantAgents: [
         '0x1111111111111111111111111111111111111111',
         '0x1111111111111111111111111111111111111111',
@@ -253,37 +286,51 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     })).rejects.toThrow(/duplicate participant agent/);
   });
 
+  it('requires explicit accessPolicy and publishPolicy (no silent public/open default)', async () => {
+    // Codex PR #595 round-5: making the policy fields optional with
+    // permissive defaults (accessPolicy=0, publishPolicy=1) silently
+    // created public + open CGs for any caller that didn't pass them.
+    // Both fields are now required at the type level AND enforced at
+    // runtime so out-of-tree callers can't accidentally widen perms.
+    const mock = new MockChainAdapter('mock:31337', '0x1111111111111111111111111111111111111111');
+    await expect(
+      mock.createOnChainContextGraph({} as any),
+    ).rejects.toThrow(/accessPolicy.*publishPolicy.*required/);
+    await expect(
+      mock.createOnChainContextGraph({ accessPolicy: 1 } as any),
+    ).rejects.toThrow(/accessPolicy.*publishPolicy.*required/);
+    await expect(
+      mock.createOnChainContextGraph({ publishPolicy: 0 } as any),
+    ).rejects.toThrow(/accessPolicy.*publishPolicy.*required/);
+  });
+
   it('normalizes and rejects publish-policy configs like the EVM facade', async () => {
     const mock = new MockChainAdapter('mock:31337', '0x1111111111111111111111111111111111111111');
-    const base = {
-      participantIdentityIds: [1n],
-      requiredSignatures: 1,
-    };
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
       accessPolicy: 2,
+      publishPolicy: 1,
     })).rejects.toThrow(/invalid accessPolicy/);
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 0,
       publishPolicy: 2,
     })).rejects.toThrow(/invalid publishPolicy/);
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 0,
       publishPolicy: 1,
       publishAuthority: '0x2222222222222222222222222222222222222222',
     })).rejects.toThrow(/open policy requires zero publishAuthority/);
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 0,
       publishPolicy: 1,
       publishAuthorityAccountId: 1n,
     })).rejects.toThrow(/open policy requires zero publishAuthorityAccountId/);
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 1,
       publishPolicy: 0,
       publishAuthorityAccountId: 1n,
     })).rejects.toThrow(/PCA account 1 does not exist/);
@@ -294,27 +341,27 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     const accountId = mock.seedConvictionAccount('0x1111111111111111111111111111111111111111');
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 1,
       publishPolicy: 0,
       publishAuthority: '0x2222222222222222222222222222222222222222',
       publishAuthorityAccountId: accountId,
     })).rejects.toThrow(/PCA publishAuthority must match account owner/);
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 1,
       publishPolicy: 0,
       publishAuthority: '0x1111111111111111111111111111111111111111',
       publishAuthorityAccountId: accountId,
     })).resolves.toMatchObject({ contextGraphId: 1n });
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 1,
       publishPolicy: 0,
       publishAuthorityAccountId: accountId,
     })).resolves.toMatchObject({ contextGraphId: 2n });
 
     await expect(mock.createOnChainContextGraph({
-      ...base,
+      accessPolicy: 1,
       publishPolicy: 0,
     })).resolves.toMatchObject({ contextGraphId: 3n });
   });

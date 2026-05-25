@@ -95,9 +95,16 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
     try {
       const slowTimer = setTimeout(() => setProgress('On-chain registration in progress — this can take up to 30s…'), 5000);
 
+      // SPEC_CG_MEMORY_MODEL dials:
+      //   Sharing      → accessPolicy   (0 = open, 1 = invite-only)
+      //   Contribution → publishPolicy  (0 = curators-only, 1 = open)
+      // Defaults are safe (invite-only + curators-only); the radios
+      // let the curator dial either side open explicitly.
+      const accessPolicy = access === 'curated' ? 1 : 0;
+      const publishPolicyWire = publishPolicy === 'curator-only' ? 0 : 1;
       const opts = access === 'curated'
-        ? { accessPolicy: 1, allowedAgents: agentAddress ? [agentAddress] : [] }
-        : { accessPolicy: 0 };
+        ? { accessPolicy, publishPolicy: publishPolicyWire, allowedAgents: agentAddress ? [agentAddress] : [] }
+        : { accessPolicy, publishPolicy: publishPolicyWire };
 
       const result = await createContextGraph(cgId, trimmedName, description.trim() || undefined, opts);
       clearTimeout(slowTimer);
@@ -272,31 +279,38 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
           <div className="v10-form-divider" />
 
           <div className="v10-form-group">
-            <label className="v10-form-label">Access</label>
+            <label className="v10-form-label">Sharing</label>
             <div className="v10-form-radio-group">
               <label className="v10-form-radio">
                 <input type="radio" checked={access === 'curated'} onChange={() => setAccess('curated')} />
-                Curated — only invited agents can participate
+                Invite-only — only invited agents can read and subscribe
               </label>
               <label className="v10-form-radio">
                 <input type="radio" checked={access === 'public'} onChange={() => setAccess('public')} />
-                Public — anyone can view and join
+                Open — publicly discoverable; anyone can subscribe
               </label>
             </div>
           </div>
 
-          <div className="v10-form-group" style={{ opacity: 0.5, pointerEvents: 'none' }}>
-            <label className="v10-form-label">Publish Policy <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--text-tertiary)' }}>(coming soon)</span></label>
+          <div className="v10-form-group">
+            <label className="v10-form-label">Contribution</label>
             <div className="v10-form-radio-group">
               <label className="v10-form-radio">
-                <input type="radio" checked={publishPolicy === 'curator-only'} readOnly disabled />
-                Curator only — only the curator can publish to Verifiable Memory
+                <input type="radio" checked={publishPolicy === 'curator-only'} onChange={() => setPublishPolicy('curator-only')} />
+                Curators-only — only the curator may publish to Verified Memory
               </label>
               <label className="v10-form-radio">
-                <input type="radio" checked={publishPolicy === 'open'} readOnly disabled />
-                Open — any collaborator can publish to Verifiable Memory
+                <input type="radio" checked={publishPolicy === 'open'} onChange={() => setPublishPolicy('open')} />
+                Open — any wallet may publish to Verified Memory (not just members)
               </label>
             </div>
+            {access === 'curated' && publishPolicy === 'open' && (
+              <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-tertiary)' }}>
+                Note: an invite-only sharing graph with open contribution still lets <em>any</em> wallet
+                publish to Verified Memory — the on-chain publish check is not gated by the allowlist.
+                See SPEC_CG_MEMORY_MODEL §2.5.
+              </div>
+            )}
           </div>
 
           <div className="v10-form-group">

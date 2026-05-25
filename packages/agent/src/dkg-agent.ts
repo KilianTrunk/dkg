@@ -7585,16 +7585,10 @@ export class DKGAgent {
     }
     const result = await this.chain.createOnChainContextGraph(params);
     const contextGraphId = result.contextGraphId.toString();
-    for (const identityId of params.participantIdentityIds) {
-      this.upsertContextGraphMember({
-        contextGraphId,
-        principalType: 'identity',
-        principalId: identityId.toString(),
-        role: 'hosting-node',
-        status: 'active',
-        source: 'on-chain-registration',
-      });
-    }
+    // LU-2: per SPEC_CG_MEMORY_MODEL the on-chain CG no longer carries a
+    // hosting committee — hosts are picked from the network sharding table
+    // at publish time, so there is no per-CG `hosting-node` member roster
+    // to upsert here. Participant-agent membership is unchanged.
     for (const agentAddress of params.participantAgents ?? []) {
       this.upsertContextGraphMember({
         contextGraphId,
@@ -7605,7 +7599,7 @@ export class DKGAgent {
         source: 'on-chain-registration',
       });
     }
-    this.log.info(ctx, `Created on-chain context graph ${result.contextGraphId} (M=${params.requiredSignatures}, N=${params.participantIdentityIds.length})`);
+    this.log.info(ctx, `Created on-chain context graph ${result.contextGraphId}`);
     return result;
   }
 
@@ -9139,10 +9133,6 @@ export class DKGAgent {
     allowedPeers?: string[];
     /** Agent address allowlist for curated CGs. Omit for open CGs. */
     allowedAgents?: string[];
-    /** Identity IDs for private CG access control (chain-based). */
-    participantIdentityIds?: bigint[];
-    /** Required signatures threshold for participant-based CGs. */
-    requiredSignatures?: number;
     /** Participant agent addresses for on-chain context graphs. */
     participantAgents?: string[];
     /** When true, skips gossip subscription and broadcast. Data stays local-only. */
@@ -9324,35 +9314,13 @@ export class DKGAgent {
       }
     }
 
-    // Store participant identity IDs for private CG access control (chain-based, legacy)
-    const creatorIdentityId = await this.chain.getIdentityId();
-    const participantIdentityIds = new Set<bigint>(opts.participantIdentityIds ?? []);
-    if (creatorIdentityId > 0n) {
-      participantIdentityIds.add(creatorIdentityId);
-    }
-    for (const participantIdentityId of participantIdentityIds) {
-      quads.push({
-        subject: contextGraphUri,
-        predicate: DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID,
-        object: `"${participantIdentityId.toString()}"`,
-        graph: cgMetaGraph,
-      });
-    }
-    if (participantIdentityIds.size > 0 && typeof opts.requiredSignatures === 'number' && opts.requiredSignatures > 0) {
-      const reqSig = Math.floor(opts.requiredSignatures);
-      if (reqSig < 1) {
-        throw new Error(`requiredSignatures must be >= 1, got ${opts.requiredSignatures}`);
-      }
-      if (reqSig > participantIdentityIds.size) {
-        throw new Error(`requiredSignatures (${reqSig}) exceeds participant count (${participantIdentityIds.size})`);
-      }
-      quads.push({
-        subject: contextGraphUri,
-        predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}RequiredSignatures`,
-        object: `"${reqSig}"`,
-        graph: cgMetaGraph,
-      });
-    }
+    // LU-2: per SPEC_CG_MEMORY_MODEL the legacy hosting-committee model
+    // (per-CG `participantIdentityIds` + `requiredSignatures`) is gone.
+    // Hosts are picked from the network sharding table at publish time
+    // and the ACK quorum is the system parameter
+    // `parametersStorage.minimumRequiredSignatures()`. The creator's
+    // curator role is recorded above as `dkg:curator`; we no longer
+    // also auto-add the creator's chain identity as a hosting-node.
 
     if (opts.description) {
       quads.push({
@@ -9448,16 +9416,6 @@ export class DKGAgent {
       });
     }
 
-    for (const identityId of participantIdentityIds) {
-      this.upsertContextGraphMember({
-        contextGraphId: opts.id,
-        principalType: 'identity',
-        principalId: identityId.toString(),
-        role: 'hosting-node',
-        status: 'active',
-        source: 'participant-identity',
-      });
-    }
 
     // On-chain registration is intentionally NOT done here — per v10 spec
     // §2.2 / §2.3 Context Graphs are a local-first primitive. A CG exists
@@ -9739,24 +9697,10 @@ export class DKGAgent {
     const isPcaCurated = publishPolicy === EVM_PUBLISH_CURATED
       && publishAuthorityAccountId !== undefined;
 
-    const participantsResult = await this.store.query(
-      `SELECT ?identityId WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId } }`,
-    );
-    const participantIdentityIds = participantsResult.type === 'bindings'
-      ? participantsResult.bindings
-          .map((binding) => binding['identityId']?.replace(/^"|"$/g, ''))
-          .filter((value): value is string => !!value)
-          .map((value) => BigInt(value))
-          .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-          .filter((value, index, arr) => index === 0 || value !== arr[index - 1])
-      : [];
-
-    const requiredSignaturesResult = await this.store.query(
-      `SELECT ?required WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}RequiredSignatures> ?required } } LIMIT 1`,
-    );
-    const storedRequiredSignatures = requiredSignaturesResult.type === 'bindings'
-      ? Number(requiredSignaturesResult.bindings[0]?.['required']?.replace(/^"|"$/g, ''))
-      : NaN;
+    // Per SPEC_CG_MEMORY_MODEL on-chain CGs are now edge-owned by
+    // default — no per-CG hosting committee, no per-CG quorum override.
+    // Hosts come from the sharding table at publish time; ACK quorum
+    // is `parametersStorage.minimumRequiredSignatures()`.
 
     // Check if already registered on-chain (prevents duplicate minting)
     const existingOnChainId = await this.getContextGraphOnChainId(id);
@@ -9773,21 +9717,9 @@ export class DKGAgent {
       return { onChainId: existingOnChainId, txHash: undefined };
     }
 
-    let effectiveParticipantIdentityIds = participantIdentityIds;
-    if (effectiveParticipantIdentityIds.length === 0) {
-      const selfIdentityId = await this.ensureIdentity();
-      if (selfIdentityId === 0n) {
-        throw new Error(
-          `Context graph "${id}" cannot be registered on-chain without an on-chain identity. ` +
-          'Create/ensure the curator identity first.',
-        );
-      }
-      effectiveParticipantIdentityIds = [selfIdentityId];
-    }
-
-    const effectiveRequiredSignatures = Number.isInteger(storedRequiredSignatures) && storedRequiredSignatures > 0
-      ? storedRequiredSignatures
-      : 1;
+    // LU-2: edge-owned CG pattern — no `participantIdentityIds`/
+    // `requiredSignatures` derivation. Edge agents that lack an
+    // on-chain identity can still register CGs.
     const participantAgents = await this.getContextGraphParticipantAgentAddresses(id);
     if (participantAgents.length > MAX_CONTEXT_GRAPH_PARTICIPANT_AGENTS) {
       throw new Error(
@@ -9905,8 +9837,6 @@ export class DKGAgent {
     }
 
     const result = await this.registerContextGraphOnChain({
-      participantIdentityIds: effectiveParticipantIdentityIds,
-      requiredSignatures: effectiveRequiredSignatures,
       accessPolicy: resolvedLocalAccessPolicy,
       publishPolicy,
       ...(publishAuthority ? { publishAuthority } : {}),
@@ -11732,28 +11662,46 @@ export class DKGAgent {
       throw new Error(`Context graph ${opts.contextGraphId} not found on-chain`);
     }
 
-    // 3. Get required signatures from chain config or opts
+    // 3. Determine ACK quorum.
+    // LU-2: per SPEC_CG_MEMORY_MODEL there is no per-CG `requiredSignatures`
+    // — every CG uses the system parameter
+    // `parametersStorage.minimumRequiredSignatures()`. An explicit caller
+    // override (`opts.requiredSignatures`) wins for advisory/test paths
+    // (e.g. `/api/verify?requiredSignatures=...`); otherwise we read the
+    // system param off-chain via the adapter accessor.
+    //
+    // FAIL-CLOSED (Codex PR #595 round-3): `chain.verify()` only calls
+    // `registerKnowledgeCollection()` — it does NOT submit the collected
+    // signatures on-chain. This local quorum check is therefore the
+    // *only* enforcement gate. If the chain adapter can't tell us the
+    // system minimum (RPC outage, missing method, invalid value), we
+    // must NOT silently downgrade to quorum=1 — that's fail-open. We
+    // throw with an actionable error pointing the caller at the
+    // explicit override knob instead.
     let requiredSignatures = opts.requiredSignatures ?? 0;
-    if (requiredSignatures === 0 && typeof (this.chain as any).getContextGraphConfig === 'function') {
+    if (requiredSignatures === 0) {
+      if (typeof this.chain.getMinimumRequiredSignatures !== 'function') {
+        throw new Error(
+          'Cannot determine ACK quorum for verify: chain adapter does not implement `getMinimumRequiredSignatures()`. ' +
+          'Pass `opts.requiredSignatures` explicitly (advisory paths only) or use a chain adapter that supports the system-parameter lookup.',
+        );
+      }
+      let sysMin: number;
       try {
-        const cgConfig = await (this.chain as any).getContextGraphConfig(contextGraphIdOnChain);
-        const raw = cgConfig?.requiredSignatures;
-        const parsed = raw != null ? Number(raw) : 0;
-        if (!Number.isInteger(parsed) || parsed < 1) {
-          throw new Error(`getContextGraphConfig returned invalid requiredSignatures: ${raw} (must be a positive integer)`);
-        }
-        requiredSignatures = parsed;
+        sysMin = await this.chain.getMinimumRequiredSignatures();
       } catch (err: any) {
         throw new Error(
-          `Cannot determine requiredSignatures for context graph ${contextGraphIdOnChain}: ${err?.message ?? err}. ` +
+          `Cannot determine ACK quorum for verify: getMinimumRequiredSignatures() failed (${err?.message ?? err}). ` +
           `Pass opts.requiredSignatures explicitly or fix the chain adapter connection.`,
         );
       }
-    }
-    if (requiredSignatures === 0) {
-      requiredSignatures = 1;
-      this.log.warn(ctx, `requiredSignatures defaults to 1 — adapter does not implement getContextGraphConfig. ` +
-        `For M-of-N context graphs, pass --required-signatures via CLI or requiredSignatures in the API body.`);
+      if (!Number.isInteger(sysMin) || sysMin < 1) {
+        throw new Error(
+          `Cannot determine ACK quorum for verify: getMinimumRequiredSignatures() returned invalid value ${sysMin} (must be a positive integer). ` +
+          `Pass opts.requiredSignatures explicitly or fix the chain adapter.`,
+        );
+      }
+      requiredSignatures = sysMin;
     }
 
     // 4. Sign the verify digest as proposer
@@ -11769,6 +11717,56 @@ export class DKGAgent {
     const proposerAddress = ethers.computeAddress(signingKey.publicKey);
 
     // 5. Collect M-of-N approvals
+    // SPEC_CG_MEMORY_MODEL §4.3: sharding-table membership is the only
+    // authoritative gate for who can ACK a VM publish. Adapters that
+    // don't implement the membership probe are a misconfiguration here
+    // (real EVM and the in-tree mock both implement it). Cache decisions
+    // per batch to avoid hammering the RPC for repeated approvers.
+    if (typeof this.chain.isShardingTableMember !== 'function') {
+      throw new Error(
+        'verify: chain adapter does not implement `isShardingTableMember()`. ' +
+        'Cannot enforce SPEC_CG_MEMORY_MODEL §4.3 sharding-table ACK eligibility — refusing fail-open.',
+      );
+    }
+    const shardingMembershipCache = new Map<string, boolean>();
+    const probeShardingTableMembership = async (identityId: bigint): Promise<boolean> => {
+      if (identityId <= 0n) return false;
+      const key = identityId.toString();
+      const cached = shardingMembershipCache.get(key);
+      if (cached !== undefined) return cached;
+      try {
+        const ok = await this.chain.isShardingTableMember!(identityId);
+        shardingMembershipCache.set(key, ok);
+        return ok;
+      } catch (err: any) {
+        this.log.warn(
+          ctx,
+          `[verify] isShardingTableMember(${identityId}) probe failed (${err?.message ?? err}); ` +
+          `dropping that signer's approval as fail-closed`,
+        );
+        shardingMembershipCache.set(key, false);
+        return false;
+      }
+    };
+
+    // Proposer eligibility computed BEFORE collect() so VerifyCollector
+    // can require the full `requiredSignatures` remote ACKs (instead of
+    // `requiredSignatures - 1`) when the proposer can't self-count.
+    // Edge nodes have identityId=0 and aren't in the sharding table, so
+    // they always need every ACK to come from a member peer.
+    const proposerEligible =
+      this.identityId > 0n && await probeShardingTableMembership(this.identityId);
+
+    // CG-visible peer set for verify-proposal fan-out:
+    // SPEC_CG_MEMORY_MODEL §4.4 — the verify proposal payload includes
+    // contextGraphId, verifiedMemoryId, batchId, and root entities; for
+    // curated CGs that's metadata only allowlisted members may see. Run
+    // every recipient through `getOrCreateCGMemberEnumerator()` so
+    // unrelated peers don't receive the proposal. Public CGs fall
+    // through to the topic-subscribers set; legacy CGs with no member
+    // signal return an empty set (verify just degrades to no-quorum).
+    const cgMemberEnumerator = this.getOrCreateCGMemberEnumerator();
+
     const collector = new VerifyCollector({
       // rc.9 PR-11: route through messenger.sendReliable so
       // /dkg/10.0.1/verify-proposal gets envelope wrap + sender-side
@@ -11783,11 +11781,10 @@ export class DKGAgent {
         }
         return sendResult.response;
       },
-      getParticipantPeers: (cgId?: string) => {
-        const allPeers = this.node.libp2p.getPeers().map(p => p.toString()).filter(id => id !== this.peerId);
-        // TODO: Filter by on-chain participant set once getContextGraphParticipants() is available.
-        // Currently relies on signature recovery + identityId resolution to reject non-participants.
-        return allPeers;
+      getParticipantPeers: async (cgId?: string) => {
+        const targetCg = cgId ?? opts.contextGraphId;
+        const enumeration = await cgMemberEnumerator.enumerate(targetCg);
+        return enumeration.members;
       },
       log: (msg: string) => this.log.info(ctx, msg),
     });
@@ -11806,21 +11803,15 @@ export class DKGAgent {
       entities,
       proposerSignature: { r: ethers.getBytes(proposerSig.r), vs: ethers.getBytes(proposerSig.yParityAndS) },
       requiredSignatures,
+      proposerCountsTowardQuorum: proposerEligible,
       timeoutMs: opts.timeoutMs ?? 30 * 60 * 1000, // 30 min default; VerifyCollector also enforces this as its max.
       allowPartial: true,
     });
 
     // 6. Resolve identity IDs for each approver before on-chain submission.
-    const participantIdentityIds = await this.getVerifyParticipantIdentityIds(
-      opts.contextGraphId,
-      contextGraphIdOnChain,
-    );
-    const isEligibleParticipant = (identityId: bigint): boolean =>
-      participantIdentityIds === null || participantIdentityIds.has(identityId);
-
     const resolvedSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }> = [];
     const resolvedSignerAddresses: string[] = [];
-    if (this.identityId > 0n && isEligibleParticipant(this.identityId)) {
+    if (proposerEligible) {
       resolvedSignatures.push({
         identityId: this.identityId,
         r: ethers.getBytes(proposerSig.r),
@@ -11828,25 +11819,22 @@ export class DKGAgent {
       });
       resolvedSignerAddresses.push(proposerAddress);
     }
-    const participantResolvedRemoteAddresses: string[] = [];
     for (const a of result.approvals) {
-      let id = a.identityId || await this.resolveVerifyApprovalIdentityId(
-        a.approverAddress,
-        participantIdentityIds,
-      );
+      let id = a.identityId || await this.resolveVerifyApprovalIdentityId(a.approverAddress);
       if (!id || id === 0n) continue;
-      if (!isEligibleParticipant(id)) continue;
+      if (!(await probeShardingTableMembership(id))) continue;
       resolvedSignatures.push({ identityId: id, r: a.signatureR, vs: a.signatureVS });
       resolvedSignerAddresses.push(a.approverAddress);
-      if (participantIdentityIds !== null && participantIdentityIds.has(id)) {
-        participantResolvedRemoteAddresses.push(a.approverAddress);
-      }
     }
     if (!result.quorumReached || resolvedSignatures.length < requiredSignatures) {
-      const trustLevel = participantResolvedRemoteAddresses.length > 0
+      // Trust degradation: any remote sharding-table-eligible ACK we
+      // collected (i.e. any signer past the proposer slot) lifts the
+      // batch to PartiallyVerified; otherwise it's self-attested.
+      const remoteCount = resolvedSignatures.length - (proposerEligible ? 1 : 0);
+      const trustLevel = remoteCount > 0
         ? TrustLevel.PartiallyVerified
         : TrustLevel.SelfAttested;
-      const status = participantResolvedRemoteAddresses.length > 0 ? 'partial' : 'no_quorum';
+      const status = remoteCount > 0 ? 'partial' : 'no_quorum';
       await this.stampBatchTrustLevel(
         opts.contextGraphId,
         opts.batchId,
@@ -11856,8 +11844,8 @@ export class DKGAgent {
       this.log.info(
         ctx,
         `Verify batch ${opts.batchId} did not reach quorum ` +
-          `(${resolvedSignatures.length}/${requiredSignatures} identity-resolved signers, ` +
-          `${participantResolvedRemoteAddresses.length}/${result.requiredRemoteApprovals} participant remote approvals) — ` +
+          `(${resolvedSignatures.length}/${requiredSignatures} sharding-table-eligible signers, ` +
+          `${remoteCount}/${result.requiredRemoteApprovals} remote approvals) — ` +
           `stamped trustLevel=${trustLevel} without chain tx`,
       );
       return {
@@ -11919,87 +11907,23 @@ export class DKGAgent {
     };
   }
 
-  private async resolveVerifyApprovalIdentityId(
-    approverAddress: string,
-    participantIdentityIds: Set<bigint> | null,
-  ): Promise<bigint> {
-    if (typeof (this.chain as any).getIdentityIdForAddress === 'function') {
-      try {
-        const id = await (this.chain as any).getIdentityIdForAddress(approverAddress);
-        if (id && id !== 0n) return BigInt(id);
-      } catch {
-        // Fall through to participant-set probing below.
-      }
+  private async resolveVerifyApprovalIdentityId(approverAddress: string): Promise<bigint> {
+    // Post-SPEC_CG_MEMORY_MODEL: identity resolution is whatever the
+    // chain adapter exposes via `getIdentityIdForAddress`. The legacy
+    // candidate-set probe against per-CG `participantIdentityId`
+    // triples was a pre-LU2 affordance and has been removed (Codex
+    // PR #595 round-5: stop using legacy roster as a verify filter).
+    // Modern responders that want to be counted MUST stamp their
+    // identityId in the VerifyApproval payload.
+    if (typeof (this.chain as any).getIdentityIdForAddress !== 'function') {
+      return 0n;
     }
-
-    if (participantIdentityIds === null || participantIdentityIds.size === 0) return 0n;
-    if (typeof this.chain.verifyACKIdentity === 'function') {
-      for (const candidateIdentityId of participantIdentityIds) {
-        try {
-          if (await this.chain.verifyACKIdentity.call(this.chain, approverAddress, candidateIdentityId)) {
-            return candidateIdentityId;
-          }
-        } catch {
-          // Ignore individual lookup failures; another participant may still match.
-        }
-      }
+    try {
+      const id = await (this.chain as any).getIdentityIdForAddress(approverAddress);
+      return id ? BigInt(id) : 0n;
+    } catch {
+      return 0n;
     }
-
-    if (typeof this.chain.isOperationalWalletRegistered !== 'function') return 0n;
-    for (const candidateIdentityId of participantIdentityIds) {
-      try {
-        if (await this.chain.isOperationalWalletRegistered.call(this.chain, candidateIdentityId, approverAddress)) {
-          return candidateIdentityId;
-        }
-      } catch {
-        // Ignore individual lookup failures; another participant may still match.
-      }
-    }
-    return 0n;
-  }
-
-  private async getVerifyParticipantIdentityIds(
-    contextGraphId: string,
-    contextGraphIdOnChain: bigint,
-  ): Promise<Set<bigint> | null> {
-    if (typeof this.chain.getContextGraphParticipants === 'function') {
-      try {
-        const participants = await this.chain.getContextGraphParticipants(contextGraphIdOnChain);
-        if (participants && participants.length > 0) {
-          return new Set(participants);
-        }
-      } catch (err) {
-        this.log.warn(
-          createOperationContext('verify'),
-          `Could not resolve on-chain participants for context graph ${contextGraphIdOnChain}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
-
-    const metaGraph = assertSafeIri(contextGraphMetaGraphUri(contextGraphId));
-    const contextGraphUri = assertSafeIri(`did:dkg:context-graph:${contextGraphId}`);
-    const result = await this.store.query(
-      `SELECT ?identityId WHERE {
-        GRAPH <${metaGraph}> {
-          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId
-        }
-      }`,
-    );
-    if (result.type !== 'bindings' || result.bindings.length === 0) {
-      return null;
-    }
-    const ids = new Set<bigint>();
-    for (const row of result.bindings as Record<string, string>[]) {
-      const raw = row.identityId?.replace(/^"|"$/g, '');
-      if (!raw) continue;
-      try {
-        const parsed = BigInt(raw);
-        if (parsed > 0n) ids.add(parsed);
-      } catch {
-        // Ignore malformed local metadata; it is not usable for trust elevation.
-      }
-    }
-    return ids.size > 0 ? ids : null;
   }
 
   private async promoteToVerifiedMemory(
@@ -13028,14 +12952,10 @@ export class DKGAgent {
 
     if (merged.length > 0) return merged;
 
-    // Fall back to on-chain participants (identity IDs as strings)
-    const onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId;
-    if (!onChainId || typeof this.chain.getContextGraphParticipants !== 'function') {
-      return null;
-    }
-    const onChainParticipants = await this.chain.getContextGraphParticipants(BigInt(onChainId));
-    if (!onChainParticipants) return null;
-    return onChainParticipants.map((id) => String(id));
+    // LU-2: on-chain CGs no longer expose `getContextGraphParticipants`.
+    // Locally-stored allowedAgents/participantAgents/participantIdentityIds
+    // (`merged` above) are the only authoritative source.
+    return null;
   }
 
   /**

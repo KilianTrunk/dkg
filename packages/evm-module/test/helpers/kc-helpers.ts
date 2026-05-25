@@ -285,9 +285,7 @@ async function _autoBridgeKCToDefaultCG(kcId: number): Promise<void> {
       cgOpSigner,
     ).createContextGraph(
       cgOpSigner.address, // owner
-      [10n, 20n, 30n], // hosting nodes
       [], // participant agents
-      2, // requiredSignatures
       0, // metadataBatchId
       0, // accessPolicy = public/discoverable
       1, // publishPolicy = open

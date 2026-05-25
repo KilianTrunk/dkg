@@ -1047,8 +1047,11 @@ cmd_start() {
   #
   # We now delegate to `POST /api/context-graph/register` on node 1, which
   # runs the same `agent.registerContextGraph` path production nodes use
-  # (calls `ContextGraphs.createContextGraph`, reads the `ContextGraphCreated`
-  # event, writes `dkg:onChainId` + `status="registered"` to _meta). Every
+  # (calls `ContextGraphs.createContextGraph(participantAgents, metadataBatchId,
+  # accessPolicy, publishPolicy, publishAuthority, publishAuthorityAccountId)`
+  # — no per-CG hosting / quorum since SPEC_CG_MEMORY_MODEL — reads the
+  # `ContextGraphCreated` event, writes `dkg:onChainId` + `status="registered"`
+  # to _meta). Every
   # node locally bootstraps the CG on boot via the `contextGraphs` config
   # array, so node 1 already has it; the on-chain id then propagates to
   # the rest via the periodic `discoverContextGraphsFromChain` sweep.
@@ -1283,7 +1286,7 @@ cmd_clean() {
 
 # Bring up an additional node against an already-running devnet. The node's
 # config + wallets are generated and the daemon is started, but on-chain
-# wiring (createConviction, updateAsk, hostingNodes registration) is left to
+# wiring (createConviction, updateAsk, sharding-table membership) is left to
 # the caller — the v10-stress-devnet experiment does this from the test
 # itself so it can assert on every step.
 #

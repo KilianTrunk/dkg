@@ -221,13 +221,15 @@ export async function createContextGraph(
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         id, name, description,
-        // Codex PR #608 R1/R2 #5/#8: registration is opt-in (`opts.register`),
-        // not hard-coded. The previous always-`register: true` broke the
-        // local-first CG contract: unfunded / offline / no-RPC users got a
-        // hard create failure instead of a usable local project (matches
-        // what the user actually complained about: "wait, it will register
-        // on chain immediately, meaning I need tokens when I create a CG?").
-        // The modal explicitly passes `register: true` when the user opts in.
+        // Codex PR #608 R1/R2 #5/#8 + OT-RFC-38 LU-6 contract:
+        // project creation is LOCAL-ONLY by default. SWM works immediately
+        // (cores opaquely buffer ciphertext for curated CGs in host-mode
+        // for the pre-registration TTL); on-chain registration is deferred
+        // until either (a) the user opts in via `opts.register: true`
+        // (UI checkbox below), or (b) the first VM publish triggers
+        // `/api/shared-memory/publish` auto-register. Avoids requiring
+        // the user to hold TRAC / pay gas just to start a project, while
+        // still letting funded users register up-front.
         ...(opts?.register ? { register: true } : {}),
         ...(opts?.allowedAgents ? { allowedAgents: opts.allowedAgents } : {}),
         ...(opts?.accessPolicy !== undefined ? { accessPolicy: opts.accessPolicy } : {}),

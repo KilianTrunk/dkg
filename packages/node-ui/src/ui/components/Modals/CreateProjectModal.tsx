@@ -99,8 +99,17 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
     const cgId = `${agentAddress}/${finalSlug}`;
 
     try {
-      const slowTimer = setTimeout(() => setProgress('On-chain registration in progress — this can take up to 30s…'), 5000);
-
+      // OT-RFC-38 LU-6: project creation is LOCAL-ONLY (no chain
+      // interaction, no gas). On-chain registration is deferred to
+      // the first VM publish, which is what the user actually opts
+      // into when they choose to durabilify. SWM works immediately
+      // — cores opaquely buffer curated ciphertext via host-mode
+      // for the pre-registration TTL until either the CG is
+      // explicitly registered or the user publishes for the first
+      // time. We therefore no longer poll for an "on-chain
+      // registration in progress" timer here or treat
+      // `registered: false` as an error.
+      //
       // SPEC_CG_MEMORY_MODEL dials:
       //   Sharing      → accessPolicy   (0 = open, 1 = invite-only)
       //   Contribution → publishPolicy  (0 = curators-only, 1 = open)

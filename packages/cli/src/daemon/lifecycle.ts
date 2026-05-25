@@ -2100,6 +2100,12 @@ export async function runDaemonInner(
     shuttingDown = true;
     log("Shutting down...");
     const cleanup = (async () => {
+      await removePid().catch((err: any) =>
+        log(`PID cleanup error: ${err?.message ?? String(err)}`),
+      );
+      await removeApiPort().catch((err: any) =>
+        log(`API port cleanup error: ${err?.message ?? String(err)}`),
+      );
       if (updateInterval) clearInterval(updateInterval);
       clearInterval(chainScanTimer);
       clearInterval(pingTimer);
@@ -2119,8 +2125,6 @@ export async function runDaemonInner(
       server.close();
       await agent.stop();
       dashDb.close();
-      await removePid();
-      await removeApiPort();
       log("Stopped.");
     })().catch((err: any) => {
       log(`Shutdown cleanup error: ${err?.message ?? String(err)}`);

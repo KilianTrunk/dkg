@@ -31,7 +31,8 @@ describe('isForcedShutdownExitCode', () => {
     { input: 99, expected: false, label: 'just below the offset range' },
     { input: 100, expected: true, label: 'forced clean exit (0 + 100)' },
     { input: 175, expected: true, label: 'forced restart (75 + 100)' },
-    { input: 199, expected: true, label: 'top of the offset range' },
+    { input: 101, expected: false, label: 'unrelated process exit in the offset range' },
+    { input: 199, expected: false, label: 'top of the offset range' },
     { input: 200, expected: false, label: 'just above the offset range' },
     { input: 255, expected: false, label: 'arbitrary high exit code' },
   ])('returns $expected for $label ($input)', ({ input, expected }) => {
@@ -47,7 +48,8 @@ describe('decodeForcedExitCode', () => {
     { input: 1, forced: false, original: 1, label: 'arbitrary crash unchanged' },
     { input: 100, forced: true, original: 0, label: 'forced clean exit -> original 0' },
     { input: 175, forced: true, original: 75, label: 'forced restart -> original 75' },
-    { input: 199, forced: true, original: 99, label: 'top of offset range -> 99' },
+    { input: 101, forced: false, original: 101, label: 'unrelated offset-range code unchanged' },
+    { input: 199, forced: false, original: 199, label: 'top of offset range unchanged' },
     { input: 200, forced: false, original: 200, label: 'above offset range, treated as crash' },
   ])('decodes $input as forced=$forced, originalExitCode=$original ($label)', ({ input, forced, original }) => {
     expect(decodeForcedExitCode(input)).toEqual({

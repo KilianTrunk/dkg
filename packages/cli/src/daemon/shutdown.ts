@@ -44,6 +44,10 @@ export const SHUTDOWN_HARD_TIMEOUT_MS = 15_000;
  *     the "shutdown deadlocked" signal.
  */
 export const SHUTDOWN_FORCED_OFFSET = 100;
+const FORCED_SHUTDOWN_EXIT_CODES = new Set([
+  SHUTDOWN_FORCED_OFFSET,
+  SHUTDOWN_FORCED_OFFSET + 75,
+]);
 
 /**
  * Returns true if `exitCode` is one our shutdown handler emitted because the
@@ -51,7 +55,7 @@ export const SHUTDOWN_FORCED_OFFSET = 100;
  */
 export function isForcedShutdownExitCode(exitCode: number | null): boolean {
   if (exitCode === null) return false;
-  return exitCode >= SHUTDOWN_FORCED_OFFSET && exitCode < SHUTDOWN_FORCED_OFFSET * 2;
+  return FORCED_SHUTDOWN_EXIT_CODES.has(exitCode);
 }
 
 /**

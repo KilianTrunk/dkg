@@ -246,6 +246,52 @@ describe('applyPlan — refuses to mutate when blockers present', () => {
     await expect(applyPlan(planWithBlockers, () => {}, io)).rejects.toThrow(/blocker\(s\) present/);
     expect(renames).toBe(0);
   });
+
+  it('validates malformed config JSON before renaming source-tree markers', async () => {
+    const plan: MigrationPlan = {
+      actions: [
+        { kind: 'rename', from: '/repo/package.json', to: '/repo/package.json.bak', loadBearing: true, reason: 'r' },
+        { kind: 'config-write', configPath: '/state/config.json', key: 'autoUpdate.source', value: 'npm', reason: 'r' },
+      ],
+      warnings: [],
+      blockers: [],
+      alreadyMigrated: false,
+    };
+    let renames = 0;
+    const io: ApplyPlanIo = {
+      rename: async () => {
+        renames += 1;
+      },
+      readFile: async () => '{bad json',
+      writeFile: async () => {},
+      mkdir: async () => {},
+    };
+    await expect(applyPlan(plan, () => {}, io)).rejects.toThrow();
+    expect(renames).toBe(0);
+  });
+
+  it('validates scalar autoUpdate before renaming source-tree markers', async () => {
+    const plan: MigrationPlan = {
+      actions: [
+        { kind: 'rename', from: '/repo/package.json', to: '/repo/package.json.bak', loadBearing: true, reason: 'r' },
+        { kind: 'config-write', configPath: '/state/config.json', key: 'autoUpdate.source', value: 'npm', reason: 'r' },
+      ],
+      warnings: [],
+      blockers: [],
+      alreadyMigrated: false,
+    };
+    let renames = 0;
+    const io: ApplyPlanIo = {
+      rename: async () => {
+        renames += 1;
+      },
+      readFile: async () => JSON.stringify({ autoUpdate: 'git' }),
+      writeFile: async () => {},
+      mkdir: async () => {},
+    };
+    await expect(applyPlan(plan, () => {}, io)).rejects.toThrow(/autoUpdate must be an object/);
+    expect(renames).toBe(0);
+  });
 });
 
 describe('applyPlan — happy path on a real fixture', () => {

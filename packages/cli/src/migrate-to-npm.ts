@@ -287,6 +287,11 @@ export async function applyPlan(
     );
   }
   for (const action of plan.actions) {
+    if (action.kind === 'config-write') {
+      await validateConfigKeyWrite(action.configPath, action.key, io);
+    }
+  }
+  for (const action of plan.actions) {
     if (action.kind === 'rename') {
       log(`renaming ${action.from} → ${action.to}`);
       await io.rename(action.from, action.to);
@@ -322,6 +327,31 @@ export const defaultApplyPlanIo: ApplyPlanIo = {
   mkdir: (path) => mkdir(path, { recursive: true }).then(() => undefined),
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseConfigObject(raw: string | null, configPath: string): Record<string, unknown> {
+  if (!raw) return {};
+  const parsed = JSON.parse(raw);
+  if (!isRecord(parsed)) {
+    throw new Error(`${configPath} must contain a JSON object`);
+  }
+  return parsed;
+}
+
+async function validateConfigKeyWrite(
+  configPath: string,
+  dottedKey: string,
+  io: ApplyPlanIo,
+): Promise<void> {
+  const segments = dottedKey.split('.');
+  const parsed = parseConfigObject(await io.readFile(configPath), configPath);
+  if (segments.length === 2 && parsed[segments[0]] !== undefined && !isRecord(parsed[segments[0]])) {
+    throw new Error(`${configPath} key ${segments[0]} must be an object before writing ${dottedKey}`);
+  }
+}
+
 /**
  * Read `configPath` (or treat as empty object if missing), set the
  * dotted key, write back with the same `JSON.stringify(_, null, 2) + "\n"`
@@ -343,11 +373,15 @@ async function writeConfigKey(
     throw new Error(`writeConfigKey only supports 1- or 2-segment keys; got ${dottedKey}`);
   }
   const existing = await io.readFile(configPath);
-  const parsed: Record<string, unknown> = existing ? JSON.parse(existing) : {};
+  const parsed = parseConfigObject(existing, configPath);
   if (segments.length === 1) {
     parsed[segments[0]] = value;
   } else {
-    const top = (parsed[segments[0]] ?? {}) as Record<string, unknown>;
+    const topValue = parsed[segments[0]] ?? {};
+    if (!isRecord(topValue)) {
+      throw new Error(`${configPath} key ${segments[0]} must be an object before writing ${dottedKey}`);
+    }
+    const top = topValue;
     top[segments[1]] = value;
     parsed[segments[0]] = top;
   }

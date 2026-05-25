@@ -3893,11 +3893,11 @@ program
   .option('--force', 'Bypass the daemon-alive safety check. Operator must SIGKILL the worker first; in-flight writes may be lost.', false)
   .action(async (opts: ActionOpts) => {
     const { buildMigrationPlan, applyPlan, renderPlan } = await import('./migrate-to-npm.js');
-    const repoRoot = repoDir();
-    if (!repoRoot) {
-      console.log('No git-checkout install detected at this location (repoDir() === null).');
-      console.log('Nothing to migrate — the auto-updater is already taking the npm path.');
-      return;
+    const detectedRepoRoot = repoDir();
+    const repoRoot = detectedRepoRoot ?? process.cwd();
+    if (!detectedRepoRoot) {
+      console.log('No active git-checkout marker detected at this location (repoDir() === null).');
+      console.log(`Continuing from ${repoRoot} so a partial migration can still repair config pins.`);
     }
     const dkgHomeNow = dkgDir();
     const dkgHomePostMigration = process.env.DKG_HOME ?? join(homedir(), '.dkg');
@@ -3923,6 +3923,7 @@ program
       daemonAlive,
       forceAliveBypass: Boolean(opts.force),
       currentAutoUpdateSource,
+      ...(detectedRepoRoot ? {} : { exists: () => false }),
     });
     process.stdout.write(renderPlan(plan));
     if (plan.alreadyMigrated) return;

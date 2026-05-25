@@ -41,6 +41,16 @@ export const daemonState: {
   };
   /** Memoised result of `isStandaloneInstall()` — null = not yet checked. */
   standaloneCache: boolean | null;
+  /**
+   * Best-known NAT reachability for this node, surfaced via `/api/status` →
+   * `relay.natStatus`. Default `'unknown'`; populated by the AutoNAT-driven
+   * boot self-probe (planned in a follow-up PR) which subscribes to libp2p's
+   * AddressManager confidence events. Lives on `daemonState` (rather than
+   * inside the route file) so the probe doesn't have to know about the
+   * route, and the route doesn't have to know about the probe — they
+   * rendezvous through this slot.
+   */
+  natStatus: 'public' | 'private' | 'unknown';
   /** CORS allowlist, set by `runDaemonInner`, read in `handleRequest`. */
   moduleCorsAllowed: CorsAllowlist;
   /** OpenClaw bridge health cache. Mutated from both `openclaw.ts`
@@ -57,6 +67,7 @@ export const daemonState: {
     latestVersion: '',
   },
   standaloneCache: null,
+  natStatus: 'unknown',
   moduleCorsAllowed: '*',
   openClawBridgeHealth: null,
 };

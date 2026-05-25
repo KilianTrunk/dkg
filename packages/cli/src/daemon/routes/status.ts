@@ -105,6 +105,7 @@ import {
   CLI_NPM_PACKAGE,
 } from '../../config.js';
 import { createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../../publisher-runner.js';
+import { buildRelayStatusBlock } from '../relay-status-block.js';
 import { fetchAllEntries, resolveRegistryConfig } from '../../integrations/registry-client.js';
 import type { IntegrationEntry, TrustTier } from '../../integrations/schema.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../../catchup-runner.js';
@@ -482,6 +483,22 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       config.blockExplorerUrl ?? deriveBlockExplorerUrl(chainConf?.chainId);
     const identityId = agent.publisher.getIdentityId();
     const localAgentIntegrations = listLocalAgentIntegrations(config);
+    // Relay capability + capacity snapshot. Shape built by `buildRelayStatusBlock`
+    // (../relay-status-block.ts) — same shape on edge and core (role-irrelevant
+    // fields null) so consumers parse one schema. Common alerts:
+    //   relay.isCore && reservationsHeld === reservationCapacity
+    //     → Core at saturation, grow the fleet
+    //   relay.isCore && relay.natStatus === 'private'
+    //     → Core boots but the network can't reach it
+    const isCore = (config.nodeRole ?? 'edge') === 'core';
+    const relayStats = isCore ? agent.node.getRelayStats() : null;
+    const relayBlock = buildRelayStatusBlock({
+      isCore,
+      relayStats,
+      natStatus: daemonState.natStatus,
+      listenAddresses: agent.multiaddrs,
+      announceAddresses: config.announceAddresses ?? [],
+    });
     return jsonResponse(res, 200, {
       name: config.name,
       version: nodeVersion,
@@ -500,6 +517,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       },
       relayConnected: circuitAddrs.length > 0,
       multiaddrs: agent.multiaddrs,
+      relay: relayBlock,
       blockExplorerUrl,
       identityId: String(identityId),
       hasIdentity: identityId > 0n,

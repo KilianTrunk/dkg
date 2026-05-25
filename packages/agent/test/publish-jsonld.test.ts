@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { DKGAgent } from '../src/index.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DKGAgent, type DKGAgentConfig } from '../src/index.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { TripleStoreAsyncLiftPublisher } from '@origintrail-official/dkg-publisher';
 import { buildAuthorAttestationTypedData } from '@origintrail-official/dkg-core';
@@ -21,9 +24,16 @@ afterAll(async () => {
 
 const agents: DKGAgent[] = [];
 const stores: OxigraphStore[] = [];
+const tempDataDirs: string[] = [];
 
-async function createAgent(name: string) {
-  const store = new OxigraphStore();
+async function createTempDataDir(prefix: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  tempDataDirs.push(dir);
+  return dir;
+}
+
+async function createAgent(name: string, overrides: Partial<DKGAgentConfig> = {}) {
+  const store = overrides.store instanceof OxigraphStore ? overrides.store : new OxigraphStore();
   const agent = await DKGAgent.create({
     name,
     listenPort: 0,
@@ -31,6 +41,7 @@ async function createAgent(name: string) {
     chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     store,
     nodeRole: 'core',
+    ...overrides,
   });
   agents.push(agent);
   stores.push(store);
@@ -44,6 +55,9 @@ afterEach(async () => {
   }
   agents.length = 0;
   stores.length = 0;
+  for (const dir of tempDataDirs.splice(0)) {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 describe('publishJsonLd', () => {
@@ -562,6 +576,44 @@ describe('publishJsonLd', () => {
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
     const job = await asyncPublisher.getStatus(captureID);
     expect(job?.request.seal).toBeDefined();
+  }, 30_000);
+
+  it('async publish builds the seal when public snapshots are externalized to disk', async () => {
+    const dataDir = await createTempDataDir('dkg-agent-public-snapshots-');
+    const { agent, store } = await createAgent('AsyncSealDiskSnapshotBot', { dataDir });
+    await agent.createContextGraph({ id: 'async-seal-disk-snapshot', name: 'AsyncSealDiskSnapshot', description: '' });
+    await agent.registerContextGraph('async-seal-disk-snapshot');
+    const root = 'http://example.org/AsyncSealDiskSnapshotEntity';
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-seal-disk-snapshot',
+      {
+        '@context': 'http://schema.org/',
+        '@id': root,
+        '@type': 'Thing',
+        'name': 'Private async with disk-backed public snapshot',
+      },
+      { localOnly: true },
+    );
+
+    const metadata = await store.query(
+      `SELECT ?snapshotRef ?snapshotGraph WHERE {
+        GRAPH <did:dkg:context-graph:async-seal-disk-snapshot/_shared_memory_meta> {
+          ?s <http://dkg.io/ontology/publicSnapshotRef> ?snapshotRef .
+          OPTIONAL { ?s <http://dkg.io/ontology/publicSnapshotGraph> ?snapshotGraph }
+        }
+      }`,
+    );
+    expect(metadata.type).toBe('bindings');
+    if (metadata.type === 'bindings') {
+      expect(metadata.bindings.some((row) => row['snapshotRef']?.includes('sha256:'))).toBe(true);
+      expect(metadata.bindings.every((row) => row['snapshotGraph'] === undefined)).toBe(true);
+    }
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.seal).toBeDefined();
+    expect(job?.request.seal?.merkleRoot).toMatch(/^0x[0-9a-f]{64}$/i);
   }, 30_000);
 
   it('async publish accepts preSignedAuthorAttestation and threads it byte-for-byte into LiftRequest.seal', async () => {

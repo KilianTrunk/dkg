@@ -6241,6 +6241,7 @@ export class DKGAgent {
       request,
       store: this.store,
       graphManager,
+      publicSnapshotStore: this.publicSnapshotStore,
     });
 
     // Rewrite raw root URIs (urn:uuid:…) → canonical (dkg:cg:ns:scope/…-hash).
@@ -15215,4 +15216,3 @@ export class DKGAgent {
   }
 
 }
-

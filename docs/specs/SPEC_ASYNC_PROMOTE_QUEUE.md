@@ -517,3 +517,90 @@ Implementation work is intentionally NOT part of this PR. Sign-off on
 the spec first; implementation follows in a subsequent PR sized to fit
 under [`packages/publisher/src/async-lift-publisher-impl.ts`](../../packages/publisher/src/async-lift-publisher-impl.ts) (~1000 lines) — likely
 a sibling `async-promote-queue-impl.ts` of similar size.
+
+## 10. Empirical motivation (rc.10 Graphify import)
+
+The numbers below come from importing a real codebase graph (Graphify
+output for this repository: 26,960 nodes / 63,003 edges, partitioned into
+17 sub-graph-scoped assertions) against an rc.10 sandbox daemon on a
+local SSD, single worker. Two importer variants were measured: a
+hand-rolled `fetch` client written from the `dkg-node` SKILL.md alone
+(~330 LOC, no library) and the same workload using the existing rc.10
+`scripts/lib/dkg-daemon.mjs` `DkgClient` library. Both ran the same
+write/promote pattern documented in ADR 0002.
+
+### 10.1 Cascading write degradation under SWM load
+
+The most visible signal that sync `/promote` competes with the same
+worker doing writes is how write latency itself degrades as SWM grows.
+Each row is a single `client.writeAssertion(...)` call:
+
+| Partition | Triples | Write ms | Promote ms | Notes |
+|---|---:|---:|---:|---|
+| `.codex` | 450 | 241 | 129 | first write; warm-up |
+| `.cursor` | 131 | **5** | 66 | steady state, small |
+| `bench` | 1,812 | **20** | 2,310 | still ~10 µs/triple |
+| `ccl_v0_1` | 3,232 | **41** | 3,562 | linear |
+| `devnet` | 4,095 | **597** | 10,707 | first slowdown signal |
+| `packages-adapter-hermes` | 12,991 | 127 | 8,555 | recovers briefly |
+| `packages-chain` | 12,762 | **230** | 39,395 | promote getting slow |
+| `packages-cli` | 72,079 | **178,801** | 290,150 | **3 min write alone** |
+| `packages-core` | 33,742 | **31,610** | 73,322 | 30 s for 33k triples |
+
+After ~100k SWM triples ingested cumulatively, write latency degrades
+roughly **200× from baseline** (5-7 ms/batch → 1.2 s/batch and worse)
+because the single worker thread is interleaving writes with the
+SWM-side gossip/lifecycle work from previous promotes. The async queue
+in this spec moves promote work to dedicated background workers, so
+foreground writes stay flat regardless of how much promote pressure is
+queued behind them — that's the §1 "lift one tier earlier" claim in
+concrete numbers.
+
+### 10.2 10 MB gossip cap failures under sync `/promote`
+
+Four of 17 partitions exceeded the 10 MB gossip-message cap when promoted
+with `entities: "all"` (the convenient default for resumable importers).
+Each failure costs an entire halve-and-retry cycle:
+
+| Partition | Triples | Assertion size | Wall-clock in retry |
+|---|---:|---:|---:|
+| `packages-adapter-openclaw` | 36,618 | 10,788 KB | ~2 min |
+| `packages-agent` | 41,724 | 11,993 KB | ~3.5 min |
+| `packages-cli` | 72,079 | 20,686 KB | ~5 min |
+| `docs` | 69,792 | 24,599 KB | ~4 min |
+
+Total wall-clock spent in adaptive halving across these four:
+**~15 minutes**. The daemon error message is
+
+```
+HTTP 500 "Promoted assertion too large for gossip
+(<size> KB, limit 10 MB). Promote fewer entities per call."
+```
+
+This is a sync-route problem the async queue solves trivially: a
+background worker can promote one root at a time without blocking the
+client; the importer just polls a job id. The 15 min retry cost
+collapses to "enqueue, get a job id back in <50 ms, poll until
+`succeeded`". The hand-rolled adaptive-halving logic the rc.10
+importer needs (256 KB body cap + 10 MB gossip cap, two separate
+discovery loops) ceases to be part of the importer's job.
+
+### 10.3 Production importer reliability
+
+The rc.10 importer crashed once with a generic `fetch failed` socket
+error during a multi-minute promote call. There is no retry
+classification in the sync path; the importer either implements one
+itself or loses progress. The §3.3 `failed_retrying` state and §4.4
+attempt commit marker move that responsibility into the daemon, where
+it has the lease information and persistence to do it correctly.
+
+### 10.4 Why "in front of" instead of "underneath"
+
+A counter-proposal during review was to make sync `/promote` itself
+internally async with a `batched` flag. The numbers above show why
+that's the wrong layer: the importer's pain is **wall-clock per
+partition**, not request shape. A 5-minute sync call that quietly
+chunks is still a 5-minute sync call from the importer's perspective —
+it can't pipeline the next partition's write, it can't show progress,
+and a transient TCP reset still kills the operation. The async queue
+addresses the actual cost, not the symptom.

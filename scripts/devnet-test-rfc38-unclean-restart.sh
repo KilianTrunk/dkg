@@ -63,7 +63,14 @@ act()  { echo ""; echo "[urr] === $1 ==="; }
 node_dir()   { echo "$DEVNET_DIR/node$1"; }
 node_token() { tail -1 "$(node_dir "$1")/auth.token" 2>/dev/null | tr -d '\r\n'; }
 node_port()  { echo $((API_PORT_BASE + $1 - 1)); }
-node_pidfile() { echo "$(node_dir "$1")/daemon.pid"; }
+# Codex PR #624 R2: `devnet.sh` writes its supervisor pid to
+# `devnet.pid` and the inner CLI/daemon worker writes `daemon.pid`.
+# Sending kill -9 only to the inner worker can race with the
+# supervisor respawning it, so this test may never exercise a real
+# unclean outage. Kill the supervisor pid (and the inner worker as
+# belt-and-braces in case they differ).
+node_supervisor_pidfile() { echo "$(node_dir "$1")/devnet.pid"; }
+node_inner_pidfile()      { echo "$(node_dir "$1")/daemon.pid"; }
 
 api_call() {
   local node="$1" method="$2" path="$3" data="${4:-}"
@@ -169,13 +176,32 @@ W=$(api_call "$CURATOR_NODE" POST /api/shared-memory/write "$PAYLOAD")
 log "✓ $WRITES_COUNT triples written"
 sleep 4
 
+# Codex PR #624 R1: /api/shared-memory/list isn't a daemon route.
+# Use /api/query SPARQL COUNT against the _shared_memory graph
+# suffix — same fix shipped for C1/C2 (#621/#622).
+sparql_count() {
+  printf '%s' "$1" | node -e '
+    let d=""; process.stdin.on("data",c=>d+=c);
+    process.stdin.on("end",()=>{
+      try {
+        const j = JSON.parse(d);
+        const b = (j && j.result && j.result.bindings && j.result.bindings[0]) || {};
+        const raw = b.n || b.cnt || b.count || "";
+        const m = String(raw).match(/^"?(-?\d+)"?/);
+        console.log(m ? m[1] : "");
+      } catch { console.log(""); }
+    });
+  '
+}
+
 count_triples() {
   local node="$1"
-  local cg_enc; cg_enc=$(printf %s "$CG_ID" | sed 's/\//%2F/g')
-  local listing; listing=$(api_call "$node" GET "/api/shared-memory/list?contextGraphId=${cg_enc}")
-  local count; count=$(parse_json "$listing" '.triples?.length' 2>/dev/null || echo "")
-  [ -n "$count" ] || count=$(parse_json "$listing" '.quads?.length' 2>/dev/null || echo "0")
-  echo "$count"
+  local q; q=$(api_call "$node" POST /api/query "$(cat <<EOF
+{ "contextGraphId": "$CG_ID", "graphSuffix": "_shared_memory",
+  "sparql": "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://schema.org/note> ?o }" }
+EOF
+)")
+  sparql_count "$q"
 }
 
 # ===========================================================================
@@ -192,15 +218,29 @@ log "M1 partial catchup count: $M1_PARTIAL (target: $WRITES_COUNT)"
 # ===========================================================================
 act "4. SIGKILL the core (unclean shutdown — no graceful close)"
 # ===========================================================================
-CORE_PIDFILE=$(node_pidfile "$CORE_NODE")
-[ -f "$CORE_PIDFILE" ] || fail "core pidfile $CORE_PIDFILE missing — devnet startup didn't write one?"
-CORE_PID=$(tr -d '[:space:]' < "$CORE_PIDFILE")
-log "kill -9 $CORE_PID"
-kill -9 "$CORE_PID" 2>/dev/null || warn "kill -9 returned non-zero (process may have exited)"
-if ! wait_for_port_closed "$CORE_NODE" 20; then
-  warn "core port still open after 20s — kill may have raced"
+CORE_SUPERVISOR_PIDFILE=$(node_supervisor_pidfile "$CORE_NODE")
+CORE_INNER_PIDFILE=$(node_inner_pidfile "$CORE_NODE")
+[ -f "$CORE_SUPERVISOR_PIDFILE" ] || fail "core supervisor pidfile $CORE_SUPERVISOR_PIDFILE missing — devnet startup didn't write one?"
+CORE_SUPERVISOR_PID=$(tr -d '[:space:]' < "$CORE_SUPERVISOR_PIDFILE")
+CORE_INNER_PID=""
+if [ -f "$CORE_INNER_PIDFILE" ]; then
+  CORE_INNER_PID=$(tr -d '[:space:]' < "$CORE_INNER_PIDFILE")
 fi
-log "✓ core forcibly stopped"
+log "kill -9 supervisor=$CORE_SUPERVISOR_PID inner=${CORE_INNER_PID:-<none>}"
+kill -9 "$CORE_SUPERVISOR_PID" 2>/dev/null || warn "kill -9 supervisor returned non-zero (process may have exited)"
+# Also kill the inner worker if it's distinct, so a stray supervisor
+# can't respawn it. Belt-and-braces — in current devnet.sh they're
+# the same PID, but Codex called this out for future-proofing.
+if [ -n "$CORE_INNER_PID" ] && [ "$CORE_INNER_PID" != "$CORE_SUPERVISOR_PID" ] && kill -0 "$CORE_INNER_PID" 2>/dev/null; then
+  kill -9 "$CORE_INNER_PID" 2>/dev/null || true
+fi
+# Codex PR #624 R2: hard-fail if the API never goes down. A respawn
+# or a kill that missed would otherwise let phase 6 pass against a
+# still-running core, defeating the unclean-restart contract.
+if ! wait_for_port_closed "$CORE_NODE" 30; then
+  fail "core port still open after 30s — kill did NOT take effect (supervisor respawn?). Can't validate unclean-restart recovery against a still-running daemon."
+fi
+log "✓ core forcibly stopped (port closed, supervisor + inner pid gone)"
 
 # ===========================================================================
 act "5. Restart the core (B2 orphan reconcile + B3 host-mode restore must fire)"
@@ -240,7 +280,21 @@ log "Stats: $STATS"
 ENABLED=$(parse_json "$STATS" '.enabled')
 [ "$ENABLED" = "true" ] || fail "core host-mode NOT enabled after restart — B3 persistence regression"
 
-BYTES_AFTER=$(parse_json "$STATS" ".perCg['$CG_ID'].bytes" 2>/dev/null || echo "")
+# Codex PR #624 R3: asserting only `enabled === true` is too weak
+# for the B3 guarantee — host mode can be globally enabled while
+# the restarted core has forgotten THIS specific contextGraphId.
+# Check that $CG_ID is still in subscribedCgIds OR perCg after the
+# unclean restart.
+SUBSCRIBED_FOUND=$(parse_json "$STATS" ".subscribedCgIds.includes('$CG_ID')" 2>/dev/null || echo "")
+PERCG_BYTES=$(parse_json "$STATS" ".perCg['$CG_ID'].bytes" 2>/dev/null || echo "")
+if [ "$SUBSCRIBED_FOUND" != "true" ] && [ -z "$PERCG_BYTES" ]; then
+  fail "B3 PERSISTENCE REGRESSION: core no longer subscribed to $CG_ID after restart. " \
+       "Host mode is enabled globally (good) but the per-CG host-only designation was NOT restored. " \
+       "Stats: $STATS"
+fi
+log "✓ core still subscribed to $CG_ID after restart (subscribedFound=$SUBSCRIBED_FOUND perCg.bytes=${PERCG_BYTES:-<none>})"
+
+BYTES_AFTER="${PERCG_BYTES:-0}"
 log "Core perCg[$CG_ID].bytes after restart: $BYTES_AFTER"
 
 log ""

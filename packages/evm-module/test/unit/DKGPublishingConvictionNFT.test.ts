@@ -9,6 +9,8 @@ import {
   DKGPublishingConvictionNFT,
   EpochStorage,
   Hub,
+  PublishingConviction,
+  PublishingConvictionStorage,
   StakingStorage,
   Token,
 } from '../../typechain';
@@ -17,6 +19,8 @@ type Fixture = {
   accounts: SignerWithAddress[];
   Hub: Hub;
   NFT: DKGPublishingConvictionNFT;
+  Logic: PublishingConviction;
+  Storage: PublishingConvictionStorage;
   Token: Token;
   StakingStorage: StakingStorage;
   ConvictionStakingStorage: ConvictionStakingStorage;
@@ -56,6 +60,8 @@ describe('@unit DKGPublishingConvictionNFT', function () {
   let accounts: SignerWithAddress[];
   let HubContract: Hub;
   let NFT: DKGPublishingConvictionNFT;
+  let LogicContract: PublishingConviction;
+  let StorageContract: PublishingConvictionStorage;
   let TokenContract: Token;
   let StakingStorageContract: StakingStorage;
   let ConvictionStakingStorageContract: ConvictionStakingStorage;
@@ -64,6 +70,9 @@ describe('@unit DKGPublishingConvictionNFT', function () {
 
   async function deployFixture(): Promise<Fixture> {
     await hre.deployments.fixture([
+      // V10 split: storage + logic + slim ERC-721 wrapper
+      'PublishingConvictionStorage',
+      'PublishingConviction',
       'DKGPublishingConvictionNFT',
       'Token',
       'StakingStorage',
@@ -74,6 +83,10 @@ describe('@unit DKGPublishingConvictionNFT', function () {
     ]);
     const Hub = await hre.ethers.getContract<Hub>('Hub');
     const NFT = await hre.ethers.getContract<DKGPublishingConvictionNFT>('DKGPublishingConvictionNFT');
+    const Logic = await hre.ethers.getContract<PublishingConviction>('PublishingConviction');
+    const Storage = await hre.ethers.getContract<PublishingConvictionStorage>(
+      'PublishingConvictionStorage',
+    );
     const Token = await hre.ethers.getContract<Token>('Token');
     const StakingStorageC = await hre.ethers.getContract<StakingStorage>('StakingStorage');
     const CSS = await hre.ethers.getContract<ConvictionStakingStorage>('ConvictionStakingStorage');
@@ -88,6 +101,8 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       accounts,
       Hub,
       NFT,
+      Logic,
+      Storage,
       Token,
       StakingStorage: StakingStorageC,
       ConvictionStakingStorage: CSS,
@@ -102,6 +117,8 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       accounts,
       Hub: HubContract,
       NFT,
+      Logic: LogicContract,
+      Storage: StorageContract,
       Token: TokenContract,
       StakingStorage: StakingStorageContract,
       ConvictionStakingStorage: ConvictionStakingStorageContract,
@@ -195,7 +212,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       const amount = hre.ethers.parseEther('500000');
       await TokenContract.approve(await NFT.getAddress(), amount);
       const currentEpoch = await ChronosContract.getCurrentEpoch();
-      await expect(NFT.createAccount(amount)).to.emit(NFT, 'AccountCreated');
+      await expect(NFT.createAccount(amount)).to.emit(LogicContract, 'AccountCreated');
       const info = await NFT.getAccountInfo(1);
       expect(info.createdAtEpoch).to.equal(currentEpoch);
       expect(info.expiresAtEpoch - info.createdAtEpoch).to.be.gte(BigInt(LOCK_DURATION));
@@ -341,7 +358,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
           kcStart1,
           LOCK_DURATION,
         ),
-      ).to.be.revertedWithCustomError(NFT, 'InsufficientAllowance');
+      ).to.be.revertedWithCustomError(LogicContract, 'InsufficientAllowance');
 
       // --- Phase 2: advance one billing window so allowance resets ---
       await time.increase(epochLength + 1n);
@@ -399,20 +416,20 @@ describe('@unit DKGPublishingConvictionNFT', function () {
     });
   });
 
-  describe('N23 regression: createAccount reverts if EpochStorage address not set at init', () => {
-    // Each of these negative-init tests needs a clean Hub with only a SUBSET
-    // of the NFT contract's dependencies registered, so that `initialize()`
-    // hits a specific `ZeroAddressDependency(...)` branch. The original
-    // implementation used `hre.deployments.fixture([...])` per-test, which
-    // invokes `hardhat_reset` under the hood and invalidates the
-    // hardhat-network-helpers snapshot manager that every other suite relies
-    // on — the tests passed in isolation but broke the rest of the suite
-    // when run together.
+  describe('initialize-time dependency resolution (post-split)', () => {
+    // Post-split, `DKGPublishingConvictionNFT.initialize()` resolves
+    //   PublishingConviction
+    //   PublishingConvictionStorage
+    //   Token
+    //   ConvictionStakingStorage
+    // in that order. EpochStorageV8 / Chronos / ParametersStorage are
+    // resolved by `PublishingConviction.initialize()` (the logic
+    // contract). The negative-init tests below pin the bubbled-up
+    // `ContractDoesNotExist(name)` for each missing branch.
     //
-    // Fix: never reset the network. Instead, deploy a DISPOSABLE `Hub` via
-    // the contract factory for each test and register only the dependencies
-    // under test. The shared fixture snapshots stay valid because we never
-    // touch `hre.deployments.fixture` or mutate the shared Hub.
+    // Like before, we use a disposable Hub per test (factory-deployed)
+    // so the shared `loadFixture` snapshot stays valid — we never call
+    // `hre.deployments.fixture` here.
     async function deployDisposableHub(): Promise<Hub> {
       const HubFactory = await hre.ethers.getContractFactory('Hub');
       const freshHub = (await HubFactory.deploy()) as unknown as Hub;
@@ -424,30 +441,70 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       const Factory = await hre.ethers.getContractFactory('DKGPublishingConvictionNFT');
       const nft = (await Factory.deploy(await freshHub.getAddress())) as unknown as DKGPublishingConvictionNFT;
       await nft.waitForDeployment();
-      // Register the NFT in the fresh Hub so `onlyHub` accepts the initialize call.
       await freshHub.setContractAddress('DKGPublishingConvictionNFT', await nft.getAddress());
       return nft;
     }
 
-    // NOTE: Hub.setContractAddress rejects address(0), and
-    // hub.getContractAddress reverts with `ContractDoesNotExist(name)` when a
-    // name is unregistered. That means `initialize` never actually sees a
-    // zero address via Hub — the lookup reverts first. These tests originally
-    // asserted a bare revert; we now pin `ContractDoesNotExist(name)` which
-    // is the TRUE runtime revert bubbling through Hub.forwardCall. If the
-    // Hub ever starts returning address(0) (regression), `ZeroAddressDependency`
-    // would fire instead; tests would still fail, surfacing the behavior change.
-    // v4.0.0 — DKGPublishingConvictionNFT.initialize() now resolves
-    // Token → ConvictionStakingStorage → EpochStorageV8 → Chronos in that
-    // order. The four "missing dependency" tests below pin the bubbled-up
-    // ContractDoesNotExist(name) for each missing branch in resolution order.
-    it('initialize reverts when ConvictionStakingStorage is address(0)', async () => {
+    async function deployUnregisteredLogic(freshHub: Hub): Promise<PublishingConviction> {
+      const Factory = await hre.ethers.getContractFactory('PublishingConviction');
+      const logic = (await Factory.deploy(await freshHub.getAddress())) as unknown as PublishingConviction;
+      await logic.waitForDeployment();
+      await freshHub.setContractAddress('PublishingConviction', await logic.getAddress());
+      return logic;
+    }
+
+    // ----- NFT.initialize() resolution order -----
+
+    it('NFT.initialize reverts when PublishingConviction is unregistered', async () => {
+      const freshHub = await deployDisposableHub();
+      const nft = await deployUnregisteredNFT(freshHub);
+      await expect(
+        freshHub.forwardCall(
+          await nft.getAddress(),
+          nft.interface.encodeFunctionData('initialize'),
+        ),
+      )
+        .to.be.revertedWithCustomError(freshHub, 'ContractDoesNotExist')
+        .withArgs('PublishingConviction');
+    });
+
+    it('NFT.initialize reverts when PublishingConvictionStorage is unregistered', async () => {
+      const freshHub = await deployDisposableHub();
+      const [, signer17] = await hre.ethers.getSigners();
+      await freshHub.setContractAddress('PublishingConviction', signer17.address);
+      const nft = await deployUnregisteredNFT(freshHub);
+      await expect(
+        freshHub.forwardCall(
+          await nft.getAddress(),
+          nft.interface.encodeFunctionData('initialize'),
+        ),
+      )
+        .to.be.revertedWithCustomError(freshHub, 'ContractDoesNotExist')
+        .withArgs('PublishingConvictionStorage');
+    });
+
+    it('NFT.initialize reverts when Token is unregistered', async () => {
+      const freshHub = await deployDisposableHub();
+      const [, signer17, signer18] = await hre.ethers.getSigners();
+      await freshHub.setContractAddress('PublishingConviction', signer17.address);
+      await freshHub.setContractAddress('PublishingConvictionStorage', signer18.address);
+      const nft = await deployUnregisteredNFT(freshHub);
+      await expect(
+        freshHub.forwardCall(
+          await nft.getAddress(),
+          nft.interface.encodeFunctionData('initialize'),
+        ),
+      )
+        .to.be.revertedWithCustomError(freshHub, 'ContractDoesNotExist')
+        .withArgs('Token');
+    });
+
+    it('NFT.initialize reverts when ConvictionStakingStorage is unregistered', async () => {
       const freshHub = await deployDisposableHub();
       const [, signer17, signer18, signer19] = await hre.ethers.getSigners();
-      await freshHub.setContractAddress('Token', signer17.address);
-      await freshHub.setContractAddress('EpochStorageV8', signer18.address);
-      await freshHub.setContractAddress('Chronos', signer19.address);
-
+      await freshHub.setContractAddress('PublishingConviction', signer17.address);
+      await freshHub.setContractAddress('PublishingConvictionStorage', signer18.address);
+      await freshHub.setContractAddress('Token', signer19.address);
       const nft = await deployUnregisteredNFT(freshHub);
       await expect(
         freshHub.forwardCall(
@@ -459,58 +516,70 @@ describe('@unit DKGPublishingConvictionNFT', function () {
         .withArgs('ConvictionStakingStorage');
     });
 
-    it('initialize reverts when EpochStorageV8 is address(0)', async () => {
-      const freshHub = await deployDisposableHub();
-      const [, signer17, signer18, signer19] = await hre.ethers.getSigners();
-      await freshHub.setContractAddress('Token', signer17.address);
-      await freshHub.setContractAddress('ConvictionStakingStorage', signer18.address);
-      await freshHub.setContractAddress('Chronos', signer19.address);
+    // ----- Logic.initialize() resolution order -----
+    // PublishingConviction.initialize() resolves
+    //   PublishingConvictionStorage → EpochStorageV8 → Chronos → ParametersStorage
+    // in that order; pin the same bubbled-up ContractDoesNotExist surface.
 
-      const nft = await deployUnregisteredNFT(freshHub);
+    it('Logic.initialize reverts when PublishingConvictionStorage is unregistered', async () => {
+      const freshHub = await deployDisposableHub();
+      const logic = await deployUnregisteredLogic(freshHub);
       await expect(
         freshHub.forwardCall(
-          await nft.getAddress(),
-          nft.interface.encodeFunctionData('initialize'),
+          await logic.getAddress(),
+          logic.interface.encodeFunctionData('initialize'),
+        ),
+      )
+        .to.be.revertedWithCustomError(freshHub, 'ContractDoesNotExist')
+        .withArgs('PublishingConvictionStorage');
+    });
+
+    it('Logic.initialize reverts when EpochStorageV8 is unregistered', async () => {
+      const freshHub = await deployDisposableHub();
+      const [, signer17] = await hre.ethers.getSigners();
+      await freshHub.setContractAddress('PublishingConvictionStorage', signer17.address);
+      const logic = await deployUnregisteredLogic(freshHub);
+      await expect(
+        freshHub.forwardCall(
+          await logic.getAddress(),
+          logic.interface.encodeFunctionData('initialize'),
         ),
       )
         .to.be.revertedWithCustomError(freshHub, 'ContractDoesNotExist')
         .withArgs('EpochStorageV8');
     });
 
-    it('initialize reverts when Chronos is address(0)', async () => {
+    it('Logic.initialize reverts when Chronos is unregistered', async () => {
       const freshHub = await deployDisposableHub();
-      const [, signer17, signer18, signer19] = await hre.ethers.getSigners();
-      await freshHub.setContractAddress('Token', signer17.address);
-      await freshHub.setContractAddress('ConvictionStakingStorage', signer18.address);
-      await freshHub.setContractAddress('EpochStorageV8', signer19.address);
-
-      const nft = await deployUnregisteredNFT(freshHub);
+      const [, signer17, signer18] = await hre.ethers.getSigners();
+      await freshHub.setContractAddress('PublishingConvictionStorage', signer17.address);
+      await freshHub.setContractAddress('EpochStorageV8', signer18.address);
+      const logic = await deployUnregisteredLogic(freshHub);
       await expect(
         freshHub.forwardCall(
-          await nft.getAddress(),
-          nft.interface.encodeFunctionData('initialize'),
+          await logic.getAddress(),
+          logic.interface.encodeFunctionData('initialize'),
         ),
       )
         .to.be.revertedWithCustomError(freshHub, 'ContractDoesNotExist')
         .withArgs('Chronos');
     });
 
-    it('initialize reverts when Token is address(0)', async () => {
+    it('Logic.initialize reverts when ParametersStorage is unregistered', async () => {
       const freshHub = await deployDisposableHub();
       const [, signer17, signer18, signer19] = await hre.ethers.getSigners();
-      await freshHub.setContractAddress('ConvictionStakingStorage', signer17.address);
+      await freshHub.setContractAddress('PublishingConvictionStorage', signer17.address);
       await freshHub.setContractAddress('EpochStorageV8', signer18.address);
       await freshHub.setContractAddress('Chronos', signer19.address);
-
-      const nft = await deployUnregisteredNFT(freshHub);
+      const logic = await deployUnregisteredLogic(freshHub);
       await expect(
         freshHub.forwardCall(
-          await nft.getAddress(),
-          nft.interface.encodeFunctionData('initialize'),
+          await logic.getAddress(),
+          logic.interface.encodeFunctionData('initialize'),
         ),
       )
         .to.be.revertedWithCustomError(freshHub, 'ContractDoesNotExist')
-        .withArgs('Token');
+        .withArgs('ParametersStorage');
     });
   });
 
@@ -612,8 +681,8 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       const top1 = hre.ethers.parseEther('1000');
       const top2 = hre.ethers.parseEther('2000');
       await TokenContract.approve(await NFT.getAddress(), top1 + top2);
-      await expect(NFT.topUp(1, top1)).to.emit(NFT, 'ToppedUp').withArgs(1, top1, top1);
-      await expect(NFT.topUp(1, top2)).to.emit(NFT, 'ToppedUp').withArgs(1, top2, top1 + top2);
+      await expect(NFT.topUp(1, top1)).to.emit(LogicContract, 'ToppedUp').withArgs(1, top1, top1);
+      await expect(NFT.topUp(1, top2)).to.emit(LogicContract, 'ToppedUp').withArgs(1, top2, top1 + top2);
     });
   });
 
@@ -755,7 +824,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
           kcStart,
           LOCK_DURATION,
         ),
-      ).to.be.revertedWithCustomError(NFT, 'InsufficientAllowance');
+      ).to.be.revertedWithCustomError(LogicContract, 'InsufficientAllowance');
     });
 
     it('reverts NoConvictionAccount for an unregistered agent', async () => {
@@ -763,7 +832,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       await expect(
         NFT.connect(Kav10Signer).coverPublishingCost(accounts[9].address, 1n, kcStart, 1n),
       )
-        .to.be.revertedWithCustomError(NFT, 'NoConvictionAccount')
+        .to.be.revertedWithCustomError(LogicContract, 'NoConvictionAccount')
         .withArgs(accounts[9].address);
     });
 
@@ -781,7 +850,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
           0n,
         ),
       )
-        .to.be.revertedWithCustomError(NFT, 'InvalidConvictionKcEpochs')
+        .to.be.revertedWithCustomError(LogicContract, 'InvalidConvictionKcEpochs')
         .withArgs(LOCK_DURATION, 0n);
 
       // kcEpochs == LOCK_DURATION + 1 → reject (above ceiling).
@@ -793,7 +862,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
           LOCK_DURATION + 1,
         ),
       )
-        .to.be.revertedWithCustomError(NFT, 'InvalidConvictionKcEpochs')
+        .to.be.revertedWithCustomError(LogicContract, 'InvalidConvictionKcEpochs')
         .withArgs(LOCK_DURATION, LOCK_DURATION + 1);
 
       // kcEpochs == LOCK_DURATION → accepted (boundary).
@@ -936,10 +1005,10 @@ describe('@unit DKGPublishingConvictionNFT', function () {
     it('emits AgentRegistered / AgentDeregistered', async () => {
       const agent = accounts[3].address;
       await expect(NFT.registerAgent(1, agent))
-        .to.emit(NFT, 'AgentRegistered')
+        .to.emit(LogicContract, 'AgentRegistered')
         .withArgs(1, agent);
       await expect(NFT.deregisterAgent(1, agent))
-        .to.emit(NFT, 'AgentDeregistered')
+        .to.emit(LogicContract, 'AgentDeregistered')
         .withArgs(1, agent);
     });
 
@@ -950,7 +1019,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       await TokenContract.approve(await NFT.getAddress(), amount2);
       await NFT.createAccount(amount2);
       await expect(NFT.registerAgent(2, agent)).to.be.revertedWithCustomError(
-        NFT,
+        StorageContract,
         'AgentAlreadyRegistered',
       );
     });
@@ -961,7 +1030,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       await NFT.registerAgent(1, accounts[4].address);
       await expect(
         NFT.registerAgent(1, accounts[5].address),
-      ).to.be.revertedWithCustomError(NFT, 'AgentCapReached');
+      ).to.be.revertedWithCustomError(LogicContract, 'AgentCapReached');
     });
 
     it('only owner can register agents', async () => {
@@ -1021,14 +1090,19 @@ describe('@unit DKGPublishingConvictionNFT', function () {
     /**
      * @notice Sum the TRAC accounted to the staker pool by a single tx.
      *
-     * We parse the NFT contract's emitted accounting events instead of
-     * relying on `EpochStorage.getEpochPool` deltas: the underlying
-     * cumulative storage is shared with V8 stake-related diffs from the
-     * deployment fixtures, and the public `getEpochPool` getter walks
-     * unfinalized diffs from `lastFinalizedEpoch + 1`, which mixes
-     * unrelated noise into per-test deltas. The NFT's own events are the
-     * exact, unambiguous trail of what THIS account flushed into the
-     * staker pool.
+     * We parse the V10 conviction events instead of relying on
+     * `EpochStorage.getEpochPool` deltas: the underlying cumulative
+     * storage is shared with V8 stake-related diffs from the deployment
+     * fixtures, and the public `getEpochPool` getter walks unfinalized
+     * diffs from `lastFinalizedEpoch + 1`, which mixes unrelated noise
+     * into per-test deltas. The conviction events are the exact,
+     * unambiguous trail of what THIS account flushed into the staker
+     * pool.
+     *
+     * Post-split: state-change events live on `PublishingConviction`
+     * (the logic contract). The NFT wrapper emits no accounting events.
+     * We scan the logic contract's address for `WindowSettled`,
+     * `CostCovered`, and `AccountFinalSwept`.
      *
      * Returns: passive-sink (`WindowSettled.remainderSwept`) + active-sink
      * (`CostCovered.drawnFromEpoch + drawnFromTopUp`) + post-expiry tail
@@ -1046,12 +1120,15 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       let passive = 0n;
       let active = 0n;
       let tail = 0n;
-      const nftAddr = (await NFT.getAddress()).toLowerCase();
+      const logicAddr = (await LogicContract.getAddress()).toLowerCase();
       for (const log of receipt!.logs) {
-        if (log.address.toLowerCase() !== nftAddr) continue;
-        let parsed: ReturnType<DKGPublishingConvictionNFT['interface']['parseLog']> = null;
+        if (log.address.toLowerCase() !== logicAddr) continue;
+        let parsed: ReturnType<PublishingConviction['interface']['parseLog']> = null;
         try {
-          parsed = NFT.interface.parseLog({ topics: [...log.topics], data: log.data });
+          parsed = LogicContract.interface.parseLog({
+            topics: [...log.topics],
+            data: log.data,
+          });
         } catch {
           continue;
         }

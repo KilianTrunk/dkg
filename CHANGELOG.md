@@ -4,6 +4,10 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Added — Core-stability hardening (PR-5: AutoNAT boot self-probe)
+
+- **AutoNAT-driven NAT-status watcher for core nodes** (`packages/cli/src/daemon/nat-status.ts`, `packages/cli/src/daemon/lifecycle.ts`, `packages/cli/test/nat-status.test.ts`): subscribes to libp2p's `self:peer:update` eventbus after `agent.start()` for `nodeRole=core` and updates a module-level NAT-status cache (`'public' | 'private' | 'unknown'`) that PR-4's `/api/status` `relay` block reads. The classifier (`classifyAddressesForNat`) is a pure function over multiaddr strings that treats DNS-form / public-IPv4 / public-IPv6 addresses as `'public'` and rejects RFC1918, CGNAT (100.64/10 — the Tailscale range that caused the beacon-01 silent miscategorization), loopback, link-local, IPv6 ULA, and circuit-relay-only as `'private'`. A 60s soft-timeout reclassifies once when no AutoNAT event has fired, so nodes behind a closed firewall surface a `'private'` status block instead of indefinite `'unknown'`. Observability-only here — PR-3 (#661) owns the refuse-to-boot gate via `core.allowDegradedRelay`; this PR's classifier and that PR's gate share the same address-set view, so when both merge they classify consistently without coupling at the file level (no shared `daemonState` slot writes, no merge conflict). The watcher returns a `stop()` handle that lifecycle's shutdown closure calls to avoid leaking listeners across supervisor respawns. 29 unit tests (`test/nat-status.test.ts`): table-driven classifier coverage (TEST-NET-3 documentation range, real-world public IPv4, RFC1918 192/10/172, CGNAT 100.64, link-local, IPv6 loopback/link-local/ULA/public, DNS form, circuit-relay-only, beacon-01 Tailscale repro) + transition-only callback semantics + soft-timeout firing exactly once + stop() listener removal + module-cache `getNatStatus()` accessor.
+
 ---
 
 ## [10.0.0-rc.10] - 2026-05-25

@@ -217,6 +217,27 @@ describe('acceptSwmSenderKeyPackage: stale-target throw type', () => {
     await expect(accept).rejects.toBeInstanceOf(Error);
     await expect(accept).rejects.not.toBeInstanceOf(StaleSenderKeyTargetError);
   });
+
+  it('does NOT throw StaleSenderKeyTargetError when the active key exists but local private material is missing', async () => {
+    const { internals, recipient, senderWallet } = await bootAgentForStaleTargetTest();
+    const activeKeyId = recipient.workspaceEncryptionKeys[0].encryptionKeyId;
+    delete recipient.workspaceEncryptionKeys[0].privateEncryptionKey;
+    delete recipient.privateEncryptionKey;
+    const pkg = await buildSignedPackage({
+      senderWallet,
+      recipientAgentAddress: recipient.agentAddress,
+      recipientKeyId: activeKeyId,
+    });
+
+    const accept = internals.acceptSwmSenderKeyPackage(pkg, FROM_PEER_ID, {
+      operationId: 'test-op',
+      operationName: 'share',
+    });
+    await expect(accept).rejects.toThrow(
+      `No local X25519 private key for DKG agent ${recipient.agentAddress} key ${activeKeyId}`,
+    );
+    await expect(accept).rejects.not.toBeInstanceOf(StaleSenderKeyTargetError);
+  });
 });
 
 describe('handleSwmSenderKeyPackage: log-level routing', () => {
@@ -290,5 +311,31 @@ describe('handleSwmSenderKeyPackage: log-level routing', () => {
     expect(rejectEntries).toHaveLength(1);
     expect(rejectEntries[0].level).toBe('warn');
     expect(rejectEntries[0].message).toContain('is not local to this node');
+  });
+
+  it('routes a missing local private key for a known active fingerprint to WARN', async () => {
+    const { internals, recipient, senderWallet } = await bootAgentForStaleTargetTest();
+    const activeKeyId = recipient.workspaceEncryptionKeys[0].encryptionKeyId;
+    delete recipient.workspaceEncryptionKeys[0].privateEncryptionKey;
+    delete recipient.privateEncryptionKey;
+    const pkg = await buildSignedPackage({
+      senderWallet,
+      recipientAgentAddress: recipient.agentAddress,
+      recipientKeyId: activeKeyId,
+    });
+    const bytes = encodeSwmSenderKeyPackage(pkg);
+
+    const sink = captureLoggerSink();
+    detachSink = sink.detach;
+    await internals.handleSwmSenderKeyPackage(bytes, FROM_PEER_ID);
+
+    const rejectEntries = sink.entries.filter((e) =>
+      e.message.startsWith('SWM sender-key setup receive rejected'),
+    );
+    expect(rejectEntries).toHaveLength(1);
+    expect(rejectEntries[0].level).toBe('warn');
+    expect(rejectEntries[0].message).toContain(
+      `reason=No local X25519 private key for DKG agent ${recipient.agentAddress} key ${activeKeyId}`,
+    );
   });
 });

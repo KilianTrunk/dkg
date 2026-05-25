@@ -5828,6 +5828,12 @@ export class DKGAgent {
       // localAgents map the active-only filter does so the diagnostic
       // matches the gate exactly.
       const record = this.localAgents.get(recipientAgentAddress);
+      const activeEntry = record?.workspaceEncryptionKeys.find(
+        (entry) => entry.encryptionKeyId === pkg.recipientKeyId && !entry.revokedAt,
+      );
+      if (activeEntry) {
+        throw new Error(`No local X25519 private key for DKG agent ${recipientAgentAddress} key ${pkg.recipientKeyId}`);
+      }
       const revokedEntry = record?.workspaceEncryptionKeys.find(
         (entry) => entry.encryptionKeyId === pkg.recipientKeyId && entry.revokedAt,
       );

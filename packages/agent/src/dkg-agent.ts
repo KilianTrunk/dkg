@@ -8945,10 +8945,21 @@ export class DKGAgent {
     }
     const defaults = SwmHostModeStore.defaultLimits();
     const { join } = await import('node:path');
+    const swmHostStartupCtx = createOperationContext('share');
     this.swmHostModeStore = new SwmHostModeStore({
       dataDir: join(this.config.dataDir, 'swm-host'),
       unregisteredLimits: hostModeCfg.unregistered ?? defaults.unregistered,
       registeredLimits: hostModeCfg.registered ?? defaults.registered,
+      // B2: surface the orphan-log reconcile report through the
+      // agent's log facade so operators can see exactly how many
+      // bytes were recovered after a crash.
+      onStartupReconcile: ({ orphanLogsRemoved, orphanBytesRemoved }) => {
+        this.log.warn(
+          swmHostStartupCtx,
+          `Host-mode startup reconcile reaped orphan logs: count=${orphanLogsRemoved} bytes=${orphanBytesRemoved} ` +
+          `(crashed appendFile→persistMeta windows produce these — they were unservable + unprunable until now)`,
+        );
+      },
     });
     await this.swmHostModeStore.init();
 

@@ -9,6 +9,7 @@ export default defineConfig({
       'test/query-min-trust-alias.test.ts',
       'test/swm/host-catchup-sign.test.ts',
       'test/swm/host-catchup-wire.test.ts',
+      'test/swm/host-mode-store.test.ts',
     ],
     testTimeout: 60_000,
     maxWorkers: 1,

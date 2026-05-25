@@ -1,8 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { SwmHostModeStore } from '../../src/swm/host-mode-store.js';
+
+function cgKey(contextGraphId: string): string {
+  return createHash('sha256').update(contextGraphId).digest('base64url');
+}
 
 describe('SwmHostModeStore', () => {
   let dir: string;
@@ -226,5 +231,196 @@ describe('SwmHostModeStore', () => {
     expect(stats.perCg['cg/meta-only']).toBeUndefined();
     expect(stats.perCg['cg/real-1']).toBeDefined();
     expect(stats.perCg['cg/real-2']).toBeDefined();
+  });
+
+  describe('B2: orphan .log reconcile on startup', () => {
+    const limits = { perCgByteCap: 1024 * 1024, ttlMs: 60_000 };
+
+    it('removes a .log file with no matching .meta on init', async () => {
+      // Simulate a crashed first-write: .log exists, .meta absent.
+      const orphanKey = cgKey('curator/crashed-cg');
+      const orphanLog = path.join(dir, `${orphanKey}.log`);
+      await writeFile(orphanLog, Buffer.from('orphan-bytes-pretending-to-be-frames'));
+      const before = await readdir(dir);
+      expect(before).toContain(`${orphanKey}.log`);
+
+      let reportSeen: { orphanLogsRemoved: number; orphanBytesRemoved: number } | null = null;
+      const store = new SwmHostModeStore({
+        dataDir: dir,
+        unregisteredLimits: limits,
+        registeredLimits: limits,
+        onStartupReconcile: (r) => { reportSeen = r; },
+      });
+      await store.init();
+
+      const after = await readdir(dir);
+      expect(after).not.toContain(`${orphanKey}.log`);
+      expect(reportSeen).toEqual({ orphanLogsRemoved: 1, orphanBytesRemoved: 36 });
+    });
+
+    it('preserves .meta without matching .log (markRegistered + never-written CG case)', async () => {
+      const store = new SwmHostModeStore({
+        dataDir: dir,
+        unregisteredLimits: limits,
+        registeredLimits: limits,
+      });
+      await store.init();
+      await store.markRegistered('curator/registered-but-empty');
+
+      const reincarnated = new SwmHostModeStore({
+        dataDir: dir,
+        unregisteredLimits: limits,
+        registeredLimits: limits,
+      });
+      const report = await reincarnated.reconcileOrphanLogsNow();
+      expect(report).toEqual({ orphanLogsRemoved: 0, orphanBytesRemoved: 0 });
+      expect(await reincarnated.isRegistered('curator/registered-but-empty')).toBe(true);
+    });
+
+    it('preserves .log files that have a matching .meta (normal case)', async () => {
+      const store = new SwmHostModeStore({
+        dataDir: dir,
+        unregisteredLimits: limits,
+        registeredLimits: limits,
+      });
+      await store.append('curator/healthy', new Uint8Array([0xa, 0xb]));
+
+      const reincarnated = new SwmHostModeStore({
+        dataDir: dir,
+        unregisteredLimits: limits,
+        registeredLimits: limits,
+      });
+      const report = await reincarnated.reconcileOrphanLogsNow();
+      expect(report.orphanLogsRemoved).toBe(0);
+      const entries = await reincarnated.iterate('curator/healthy', 0);
+      expect(entries).toHaveLength(1);
+    });
+
+    it('handles mixed dirs: removes orphan logs, leaves healthy pairs + lonely metas alone', async () => {
+      // Seed a healthy pair via the store, then plant an orphan log manually,
+      // then call init and verify only the orphan was removed.
+      const store = new SwmHostModeStore({
+        dataDir: dir,
+        unregisteredLimits: limits,
+        registeredLimits: limits,
+      });
+      await store.append('curator/healthy', new Uint8Array([0x42, 0x42]));
+      await store.markRegistered('curator/lonely-meta');
+
+      const orphanKey1 = cgKey('curator/orphan-1');
+      const orphanKey2 = cgKey('curator/orphan-2');
+      await writeFile(path.join(dir, `${orphanKey1}.log`), Buffer.from('garbage-1'));
+      await writeFile(path.join(dir, `${orphanKey2}.log`), Buffer.from('garbage-22'));
+
+      let reportSeen: { orphanLogsRemoved: number; orphanBytesRemoved: number } | null = null;
+      const reincarnated = new SwmHostModeStore({
+        dataDir: dir,
+        unregisteredLimits: limits,
+        registeredLimits: limits,
+        onStartupReconcile: (r) => { reportSeen = r; },
+      });
+      await reincarnated.init();
+      expect(reportSeen).toEqual({ orphanLogsRemoved: 2, orphanBytesRemoved: 9 + 10 });
+
+      const after = await readdir(dir);
+      expect(after).not.toContain(`${orphanKey1}.log`);
+      expect(after).not.toContain(`${orphanKey2}.log`);
+      // Healthy pair + lonely meta survive.
+      expect(after).toContain(`${cgKey('curator/healthy')}.log`);
+      expect(after).toContain(`${cgKey('curator/healthy')}.meta`);
+      expect(after).toContain(`${cgKey('curator/lonely-meta')}.meta`);
+    });
+
+    it('does not fire the reconcile callback when there are no orphans', async () => {
+      let callbackCount = 0;
+      const store = new SwmHostModeStore({
+        dataDir: dir,
+        unregisteredLimits: limits,
+        registeredLimits: limits,
+        onStartupReconcile: () => { callbackCount += 1; },
+      });
+      await store.init();
+      expect(callbackCount).toBe(0);
+    });
+
+    it('swallows callback errors so init never breaks on observability faults', async () => {
+      const orphanKey = cgKey('curator/will-be-reaped');
+      await writeFile(path.join(dir, `${orphanKey}.log`), Buffer.from('x'));
+      const store = new SwmHostModeStore({
+        dataDir: dir,
+        unregisteredLimits: limits,
+        registeredLimits: limits,
+        onStartupReconcile: () => { throw new Error('observability is wedged'); },
+      });
+      await expect(store.init()).resolves.toBeUndefined();
+    });
+
+    describe('B2 round-2: Codex feedback', () => {
+      it('reconcileOrphanLogsNow returns the init-time report on the first call (not {0,0} after init swept)', async () => {
+        // Codex PR #619 R2: prior behavior always returned {0,0} on
+        // the first invocation because init() had already run the
+        // reconcile sweep before reconcileOrphanLogsNow() got a
+        // chance, making the operator/helper API misleading.
+        const orphanKey = cgKey('curator/init-reaped');
+        await writeFile(path.join(dir, `${orphanKey}.log`), Buffer.from('garbage-bytes-12345'));
+        const store = new SwmHostModeStore({
+          dataDir: dir,
+          unregisteredLimits: limits,
+          registeredLimits: limits,
+        });
+        // No prior init() — the helper triggers it internally.
+        const report = await store.reconcileOrphanLogsNow();
+        expect(report.orphanLogsRemoved).toBe(1);
+        expect(report.orphanBytesRemoved).toBe(19);
+        // Second call goes through reconcileOrphanLogs again (no
+        // orphans left now).
+        const second = await store.reconcileOrphanLogsNow();
+        expect(second.orphanLogsRemoved).toBe(0);
+      });
+
+      it('reaps .log paired with a .meta that fails to parse as JSON (crashed mid-persist)', async () => {
+        // Codex PR #619 R2: a crash mid-`writeFile(metaPath, ...)`
+        // can leave a truncated/invalid .meta. `loadMeta()` and
+        // `listKnownCgs()` already treat that as unusable, so the
+        // matching .log is still unservable + unprunable. The
+        // reconcile pass must reap both.
+        const corruptKey = cgKey('curator/half-persisted');
+        await writeFile(path.join(dir, `${corruptKey}.meta`), Buffer.from('{"seqno":3,"reg'));
+        await writeFile(path.join(dir, `${corruptKey}.log`), Buffer.from('xxxxxxxxxx'));
+
+        let reportSeen: { orphanLogsRemoved: number; orphanBytesRemoved: number } | null = null;
+        const store = new SwmHostModeStore({
+          dataDir: dir,
+          unregisteredLimits: limits,
+          registeredLimits: limits,
+          onStartupReconcile: (r) => { reportSeen = r; },
+        });
+        await store.init();
+        expect(reportSeen).not.toBeNull();
+        expect(reportSeen!.orphanLogsRemoved).toBe(2);
+
+        const after = await readdir(dir);
+        expect(after).not.toContain(`${corruptKey}.log`);
+        expect(after).not.toContain(`${corruptKey}.meta`);
+      });
+
+      it('reaps .log paired with a .meta missing contextGraphId (parses as JSON but is unusable)', async () => {
+        const corruptKey = cgKey('curator/meta-missing-cgid');
+        await writeFile(
+          path.join(dir, `${corruptKey}.meta`),
+          Buffer.from('{"seqno":0,"registered":false}'),
+        );
+        await writeFile(path.join(dir, `${corruptKey}.log`), Buffer.from('zzzz'));
+        const store = new SwmHostModeStore({
+          dataDir: dir,
+          unregisteredLimits: limits,
+          registeredLimits: limits,
+        });
+        await store.init();
+        const after = await readdir(dir);
+        expect(after).not.toContain(`${corruptKey}.log`);
+        expect(after).not.toContain(`${corruptKey}.meta`);
+      });
+    });
   });
 });

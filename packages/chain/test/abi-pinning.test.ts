@@ -172,7 +172,27 @@ const PINNED_DIGESTS: Record<string, string> = {
   // resolves this contract and the publisher SDK probes it via
   // `getConvictionAgentAccountId` / `getConvictionAccountLockDurationEpochs`
   // (Codex round-3 finding on PR #470).
-  DKGPublishingConvictionNFT:   '2364949790c200cb7a8cce2f0e6502316fcb1d124e7eed23ffa24fa109565bb5',
+  //
+  // Updated PR #650 (storage / logic split): the wrapper is now a slim
+  // ERC-721 facade. PCA business events (AccountCreated, ToppedUp,
+  // CostCovered, WindowSettled, AccountFinalSwept, AgentRegistered,
+  // AgentDeregistered) and PCA business errors (NoConvictionAccount,
+  // AccountExpired, AgentAlreadyRegistered, AgentNotRegistered,
+  // AgentCapReached, InvalidConvictionKcEpochs,
+  // InvalidPublishingConvictionEpochs, InsufficientAllowance,
+  // AccountAlreadyFullySettled, BillingWindowMismatch) all moved to
+  // `PublishingConviction` (logic) — the wrapper digest collapses to
+  // the ERC-721 surface plus mint/burn forwarders. The post-split
+  // pins below capture all three surfaces; chain consumers MUST load
+  // both `DKGPublishingConvictionNFT` (for ERC-721 + forwarders) and
+  // `PublishingConviction` (for PCA event/error decoding) — see
+  // `getPcaLogicInterface` in `evm-adapter.ts` and the
+  // `ERROR_ABI_CONTRACTS` list update in the same file. This
+  // intentional break is documented as the v2.x → v3.0.0 wrapper
+  // bump in the wrapper NatSpec.
+  DKGPublishingConvictionNFT:   '80a2d5c1962624fc3f7b7e475daaf86a41542a1641d84783c8d4f969d4d86188',
+  PublishingConviction:         '957528bfd31ac6450b33afecb8e7e84aeffd4d4a694be80377b7b73fa21eb861',
+  PublishingConvictionStorage:  '42d2aae17b575a8e024b7c4503d4b44109ba6eb8a9c2e26bea36192c969a4508',
 };
 
 describe('ABI pin digest — detects silent contract surface drift [CH-5]', () => {

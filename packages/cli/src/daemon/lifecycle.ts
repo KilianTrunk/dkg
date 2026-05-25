@@ -955,23 +955,39 @@ export async function runDaemonInner(
     // because the publisher runtime owns the upstream async-lift queue
     // and we want async-lift recovery to settle before we start
     // hammering the same triple store with promote retries.
-    const promoteWorkerTimer = setTimeout(() => {
-      const supervisor = createPromoteWorkerSupervisor({
-        agent,
-        log: (msg) => log(`[promote-worker] ${msg}`),
-        emitMemoryGraphChanged,
-      });
-      supervisor
-        .start()
-        .then(() => {
-          promoteWorkerSupervisor = supervisor;
-          log("Async promote worker supervisor started");
-        })
-        .catch((err: any) => {
-          log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
+    //
+    // Unlike the publisher runtime, the promote worker is ON by
+    // default — opt OUT via `config.promoteQueue.enabled: false`. Sizing
+    // knobs (`workerConcurrency`, `pollIntervalMs`,
+    // `heartbeatIntervalMs`, `shutdownTimeoutMs`) all live on the same
+    // block; omitted values use the supervisor defaults (4 / 100ms /
+    // 60s / 30s respectively).
+    const promoteWorkerConfig = config.promoteQueue;
+    if (promoteWorkerConfig?.enabled !== false) {
+      const promoteWorkerTimer = setTimeout(() => {
+        const supervisor = createPromoteWorkerSupervisor({
+          agent,
+          workerConcurrency: promoteWorkerConfig?.workerConcurrency,
+          pollIntervalMs: promoteWorkerConfig?.pollIntervalMs,
+          heartbeatIntervalMs: promoteWorkerConfig?.heartbeatIntervalMs,
+          shutdownTimeoutMs: promoteWorkerConfig?.shutdownTimeoutMs,
+          log: (msg) => log(`[promote-worker] ${msg}`),
+          emitMemoryGraphChanged,
         });
-    }, 0);
-    if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
+        supervisor
+          .start()
+          .then(() => {
+            promoteWorkerSupervisor = supervisor;
+            log("Async promote worker supervisor started");
+          })
+          .catch((err: any) => {
+            log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
+          });
+      }, 0);
+      if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
+    } else {
+      log("Async promote worker disabled via config.promoteQueue.enabled=false");
+    }
   };
 
   log(`PeerId: ${agent.peerId}`);

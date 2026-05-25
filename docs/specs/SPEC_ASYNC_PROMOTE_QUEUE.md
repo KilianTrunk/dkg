@@ -132,7 +132,7 @@ Response: `200 OK`
 ```json
 {
   "jobId": "promote-job:01HXXXXXXXXXXXXXXXXX",
-  "state": "queued | running | succeeded | failed",
+  "state": "queued | running | failed_retrying | succeeded | failed",
   "contextGraphId": "<cg>",
   "assertionName": "<name>",
   "subGraphName": "<sg>",
@@ -195,13 +195,20 @@ hook for failed jobs whose retry budget was exhausted.
 ### 4.1 Job model (sketch)
 
 ```ts
+type PromoteJobState =
+  | 'queued'           // accepted, not yet claimed
+  | 'running'          // claim lease active (see §4.3)
+  | 'failed_retrying'  // last attempt failed retryably; will retry at nextRetryAt
+  | 'succeeded'        // terminal
+  | 'failed';          // terminal — retry budget exhausted / non-retryable
+
 interface PromoteJob {
   jobId: string;                       // ULID-shaped
   contextGraphId: string;
   assertionName: string;
   subGraphName: string;
   entities: string[];
-  state: 'queued' | 'running' | 'succeeded' | 'failed';
+  state: PromoteJobState;
   enqueuedAt: string;
   startedAt?: string;
   finishedAt?: string;
@@ -214,6 +221,13 @@ interface PromoteJob {
   lastError?: { code: string; message: string; retryable: boolean };
 }
 ```
+
+The `PromoteJobState` enum is the single source of truth — every API
+surface that lists states (status payload, list-endpoint filter, internal
+worker code) MUST reference it. Earlier drafts of this spec omitted
+`failed_retrying` from the TS enum even though §3.2 and the importer
+example both relied on it; implementers who took the enum literally would
+have made retryable failures unrepresentable in the public API.
 
 Persisted in a **dedicated control graph** (`urn:dkg:promote-queue:control-plane`),
 **not** in any project's `meta` sub-graph. This mirrors the existing
@@ -241,29 +255,69 @@ Rationale for the dedicated graph:
 A single `AsyncPromoteWorker` runs in-process inside the daemon (no
 separate worker thread — promote is not CPU-bound). It:
 
-1. Polls the control graph for jobs in `queued` state, ordered by
-   `enqueuedAt`.
-2. **Claims** a job (atomic compare-and-swap on `state: queued → running`,
-   writes `claimedBy`, `claimToken`, `claimLeaseExpiresAt = now + leaseTtlMs`;
-   see §4.3 for the lease model). Calls the existing
-   `assertion.promote(...)` logic internally (the SAME code path the
-   sync route uses — we share implementation, not just shape), and
-   writes `succeeded` or transitions to `failed_retrying`/`failed`
-   based on the result.
+1. **Polls the control graph for runnable jobs**, ordered by
+   `enqueuedAt`. A job is runnable when:
+   - `state = 'queued'`, OR
+   - `state = 'failed_retrying' AND nextRetryAt <= now()`.
+
+   Earlier drafts of this spec only polled `queued`; that left
+   `failed_retrying` jobs stuck forever because nothing flipped them
+   back to `queued`. Two implementation options are equivalent and
+   either is acceptable:
+   - (a) the scheduler picks up `failed_retrying` rows directly when
+     their `nextRetryAt` has expired, OR
+   - (b) a tiny tick task flips eligible `failed_retrying` rows back to
+     `queued` and the scheduler only sees `queued`.
+   Pick whichever fits the storage shape; the user-visible state
+   machine is the same.
+
+2. **Claims** a job (atomic compare-and-swap on
+   `state: queued|failed_retrying → running`, writes `claimedBy`,
+   `claimToken`, `claimLeaseExpiresAt = now + leaseTtlMs`; see §4.3 for
+   the lease model). Calls the existing `assertion.promote(...)` logic
+   internally (the SAME code path the sync route uses — we share
+   implementation, not just shape), and writes `succeeded` or
+   transitions to `failed_retrying`/`failed` based on the result.
+
 3. While the promote is running, the worker renews its lease every
    `leaseTtlMs / 2` (default 30s) so a long-running but healthy
    promote is not reclaimed (see §4.3).
+
 4. On retryable error, transitions to `failed_retrying`, sets
    `nextRetryAt = now + backoff(attempts)` (matches
    `AsyncLiftPublisher`'s exponential backoff policy), and clears the
-   claim so the job becomes eligible for re-pickup at `nextRetryAt`.
+   claim (`claimedBy = null`, `claimToken = null`,
+   `claimLeaseExpiresAt = null`) so the job becomes eligible for
+   re-pickup per step 1 at `nextRetryAt`.
+
 5. On `attempts >= maxAttempts` (default 5) or non-retryable error,
    transitions to terminal `failed`. Requires explicit `recover` to
    retry.
-6. Concurrency: at most N (default 4) running jobs per daemon, matching
-   the ADR 0002 "max concurrent assertions" guidance. The worker doesn't
-   intra-assertion parallelise (still 1 promote per assertion at a
-   time).
+
+6. **Concurrency caps**:
+   - At most N (default 4) running jobs per daemon, matching ADR 0002's
+     "max concurrent assertions" guidance.
+   - **At most 1 active job per `(contextGraphId, assertionName)` pair.**
+     This is the same guarantee the sync `/promote` route gives today,
+     and it's enforced in two places to be defence-in-depth:
+     - **At enqueue** (`POST /api/assertion/promote-async`): if a job
+       with the same `(cgId, name)` is already in `queued` / `running`
+       / `failed_retrying` state, return `409 Conflict` with the
+       existing `jobId` in the body, so the importer can resume polling
+       that one. (Alternative: silently coalesce to the existing job;
+       the spec leaves this to implementation, but MUST NOT enqueue a
+       second concurrent job.)
+     - **At claim** (the CAS in step 2): the runnable-job query MUST
+       exclude rows whose `(cgId, name)` already has a running sibling.
+       This catches the race where two enqueues arrive simultaneously
+       and the enqueue-time check sees nothing on either side; whoever
+       loses the CAS races stays `queued` and waits.
+
+   This avoids the "two workers, one assertion, concurrent promote"
+   foot-gun the earlier draft would have allowed — without it, a client
+   firing `promote-async` twice for the same assertion (e.g. after a
+   timeout-and-retry on the enqueue request itself) would have ended up
+   with two workers stepping on each other's quads.
 
 ### 4.3 Lease-based reclaim (no fixed timeouts)
 

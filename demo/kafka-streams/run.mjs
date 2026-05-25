@@ -124,7 +124,6 @@ export async function ensureContextGraph(auth, cgId, options = {}) {
   }
   if (
     res.parsed?.registered === false &&
-    res.parsed.registerErrorStatus !== undefined &&
     res.parsed.registerErrorStatus !== 409
   ) {
     throw new Error(`context-graph create: on-chain register leg failed: ${res.body.slice(0, 300)}`);

@@ -61,7 +61,6 @@ export async function readDkgConfig(dkgHome, { tolerateMalformed = false } = {})
       if (!tolerateMalformed) {
         throw new Error(`${path} cannot be read as ${label}: ${err?.message ?? err}`);
       }
-      return { config: undefined };
     }
   }
 

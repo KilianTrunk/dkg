@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { readDkgConfig } from '../lib/config-file.mjs';
 import { resolveDaemonAuth } from '../lib/daemon-auth.mjs';
 
 async function withHome(setup, fn) {
@@ -93,6 +94,16 @@ test('resolveDaemonAuth supports config.yaml and keeps config.json precedence', 
     const auth = await resolveDaemonAuth(dir, { useEnvPort: false });
     assert.equal(auth.token, undefined);
     assert.equal(auth.authEnabled, false);
+  });
+});
+
+test('readDkgConfig falls back to config.yaml when config.json is malformed and tolerated', async () => {
+  await withHome(async (dir) => {
+    await writeFile(join(dir, 'config.json'), '{not-json');
+    await writeFile(join(dir, 'config.yaml'), 'auth:\n  enabled: true\n  tokens:\n    - yaml-token\n');
+  }, async (dir) => {
+    const { config } = await readDkgConfig(dir, { tolerateMalformed: true });
+    assert.equal(config.auth.tokens[0], 'yaml-token');
   });
 });
 

@@ -9,6 +9,20 @@ const META_URI = 'did:dkg:context-graph:urn:cg:demo/_meta';
 const DATA_URI = 'did:dkg:context-graph:urn:cg:demo';
 const SUBGRAPH_META_URI = 'did:dkg:context-graph:urn:cg:demo/streams/_meta';
 const SUBGRAPH_DATA_URI = 'did:dkg:context-graph:urn:cg:demo/streams';
+const STATUS = 'http://dkg.io/ontology/status';
+const SUBGRAPH_NAME = 'http://dkg.io/ontology/subGraphName';
+
+function expectConfirmedRootMetaScope(q: string): void {
+  expect(q).toContain(`?ual <${STATUS}> "confirmed" .`);
+  expect(q).toContain(`FILTER NOT EXISTS { ?ual <${SUBGRAPH_NAME}> ?_subGraphName . }`);
+}
+
+function expectConfirmedSubgraphMetaScope(q: string): void {
+  expect(q).toContain(`?ual <${STATUS}> "confirmed" .`);
+  expect(q).toContain(`?ual <${SUBGRAPH_NAME}> "streams" .`);
+  expect(q).not.toContain('FILTER NOT EXISTS');
+}
+
 describe('discovery — buildListQuery', () => {
   it('emits the exact SPARQL string joining KA meta (rootEntity/partOf/publishedAt) with data triples, ordered DESC by ?receivedAt', () => {
     const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 30, offset: 0 });
@@ -19,6 +33,8 @@ describe('discovery — buildListQuery', () => {
       GRAPH <${META_URI}> {
         ?ka <http://dkg.io/ontology/rootEntity> ?root .
         ?ka <http://dkg.io/ontology/partOf> ?ual .
+        ?ual <http://dkg.io/ontology/status> "confirmed" .
+        FILTER NOT EXISTS { ?ual <http://dkg.io/ontology/subGraphName> ?_subGraphName . }
         ?ual <http://dkg.io/ontology/publishedAt> ?receivedAt .
       }
       GRAPH <${DATA_URI}> {
@@ -48,6 +64,19 @@ ORDER BY DESC(?receivedAt) ?ual ?root ?p ?o`,
     expect(q).toContain(`GRAPH <${SUBGRAPH_DATA_URI}>`);
     expect(q).not.toContain(`GRAPH <${SUBGRAPH_META_URI}>`);
   });
+  it('only lists confirmed root-graph registrations when no subGraphName is configured', () => {
+    const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 30, offset: 0 });
+    expectConfirmedRootMetaScope(q);
+  });
+  it('only lists confirmed registrations for the configured subGraphName', () => {
+    const q = buildListQuery({
+      contextGraphId: 'urn:cg:demo',
+      subGraphName: 'streams',
+      limit: 30,
+      offset: 0,
+    });
+    expectConfirmedSubgraphMetaScope(q);
+  });
   it('keeps the outer joined rows sorted newest-first after each stream expands into triples', () => {
     const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 30, offset: 0 });
     expect(q).toMatch(/^SELECT \?ual \?root \?receivedAt \?p \?o WHERE/);
@@ -67,6 +96,8 @@ describe('discovery — buildCountQuery', () => {
   GRAPH <${META_URI}> {
     ?ka <http://dkg.io/ontology/rootEntity> ?root .
     ?ka <http://dkg.io/ontology/partOf> ?ual .
+    ?ual <http://dkg.io/ontology/status> "confirmed" .
+    FILTER NOT EXISTS { ?ual <http://dkg.io/ontology/subGraphName> ?_subGraphName . }
   }
   GRAPH <${DATA_URI}> { ?root a <https://ontology.dkg.io/streams#KafkaStream> . }
 }`,
@@ -84,6 +115,17 @@ describe('discovery — buildCountQuery', () => {
     expect(q).toContain(`GRAPH <${SUBGRAPH_DATA_URI}>`);
     expect(q).not.toContain(`GRAPH <${SUBGRAPH_META_URI}>`);
   });
+  it('only counts confirmed root-graph registrations when no subGraphName is configured', () => {
+    const q = buildCountQuery({ contextGraphId: 'urn:cg:demo' });
+    expectConfirmedRootMetaScope(q);
+  });
+  it('only counts confirmed registrations for the configured subGraphName', () => {
+    const q = buildCountQuery({
+      contextGraphId: 'urn:cg:demo',
+      subGraphName: 'streams',
+    });
+    expectConfirmedSubgraphMetaScope(q);
+  });
 });
 describe('discovery — buildSingleByUalQuery', () => {
   it('emits the exact SPARQL string resolving <UAL> via KA partOf in the meta graph then fetching content from the data graph', () => {
@@ -93,6 +135,8 @@ describe('discovery — buildSingleByUalQuery', () => {
   GRAPH <${META_URI}> {
     ?ka <http://dkg.io/ontology/rootEntity> ?root .
     ?ka <http://dkg.io/ontology/partOf> <did:dkg:1/0xabc> .
+    <did:dkg:1/0xabc> <http://dkg.io/ontology/status> "confirmed" .
+    FILTER NOT EXISTS { <did:dkg:1/0xabc> <http://dkg.io/ontology/subGraphName> ?_subGraphName . }
   }
   GRAPH <${DATA_URI}> {
     ?root a <https://ontology.dkg.io/streams#KafkaStream> .
@@ -120,6 +164,23 @@ describe('discovery — buildSingleByUalQuery', () => {
     expect(q).toContain(`GRAPH <${META_URI}>`);
     expect(q).toContain(`GRAPH <${SUBGRAPH_DATA_URI}>`);
     expect(q).not.toContain(`GRAPH <${SUBGRAPH_META_URI}>`);
+  });
+  it('only resolves confirmed root-graph registrations when no subGraphName is configured', () => {
+    const q = buildSingleByUalQuery({ contextGraphId: 'urn:cg:demo', ual: 'did:dkg:1/0xabc' });
+    expect(q).toContain(`<did:dkg:1/0xabc> <${STATUS}> "confirmed" .`);
+    expect(q).toContain(
+      `FILTER NOT EXISTS { <did:dkg:1/0xabc> <${SUBGRAPH_NAME}> ?_subGraphName . }`,
+    );
+  });
+  it('only resolves confirmed registrations for the configured subGraphName', () => {
+    const q = buildSingleByUalQuery({
+      contextGraphId: 'urn:cg:demo',
+      subGraphName: 'streams',
+      ual: 'did:dkg:1/0xabc',
+    });
+    expect(q).toContain(`<did:dkg:1/0xabc> <${STATUS}> "confirmed" .`);
+    expect(q).toContain(`<did:dkg:1/0xabc> <${SUBGRAPH_NAME}> "streams" .`);
+    expect(q).not.toContain('FILTER NOT EXISTS');
   });
 });
 describe('discovery — bindingsToKa decodes real N-Quads literal binding values', () => {

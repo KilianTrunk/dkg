@@ -263,7 +263,7 @@ async function createContextGraph(d: Daemon, cgId: string): Promise<void> {
     throw new Error(`createContextGraph failed: ${res.status} ${await res.text()}`);
   }
   const body = await res.json().catch(() => null);
-  if (body?.registered === false && body.registerErrorStatus !== undefined && body.registerErrorStatus !== 409) {
+  if (body?.registered === false && body.registerErrorStatus !== 409) {
     throw new Error(`createContextGraph: register leg failed: ${JSON.stringify(body)}`);
   }
 }

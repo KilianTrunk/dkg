@@ -4,6 +4,8 @@ const DKG_ONT = 'http://dkg.io/ontology/';
 const ROOT_ENTITY = `${DKG_ONT}rootEntity`;
 const PART_OF = `${DKG_ONT}partOf`;
 const PUBLISHED_AT = `${DKG_ONT}publishedAt`;
+const STATUS = `${DKG_ONT}status`;
+const SUB_GRAPH_NAME = `${DKG_ONT}subGraphName`;
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const KAFKA_STREAM_TYPE = `${DKG_STREAMS}KafkaStream`;
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
@@ -47,6 +49,14 @@ function assertSafeSubGraphName(subGraphName: string): void {
   }
 }
 
+function registrationScopeClause(ualTerm: string, subGraphName: string | undefined, indent: string): string {
+  const scope = subGraphName === undefined
+    ? `FILTER NOT EXISTS { ${ualTerm} <${SUB_GRAPH_NAME}> ?_subGraphName . }`
+    : `${ualTerm} <${SUB_GRAPH_NAME}> "${subGraphName}" .`;
+  return `${indent}${ualTerm} <${STATUS}> "confirmed" .
+${indent}${scope}`;
+}
+
 export interface ListQueryParams {
   contextGraphId: string;
   subGraphName?: string;
@@ -76,6 +86,7 @@ export function buildListQuery({ contextGraphId, subGraphName, limit, offset }: 
       GRAPH <${meta}> {
         ?ka <${ROOT_ENTITY}> ?root .
         ?ka <${PART_OF}> ?ual .
+${registrationScopeClause('?ual', subGraphName, '        ')}
         ?ual <${PUBLISHED_AT}> ?receivedAt .
       }
       GRAPH <${data}> {
@@ -99,6 +110,7 @@ export function buildCountQuery({ contextGraphId, subGraphName }: CountQueryPara
   GRAPH <${meta}> {
     ?ka <${ROOT_ENTITY}> ?root .
     ?ka <${PART_OF}> ?ual .
+${registrationScopeClause('?ual', subGraphName, '    ')}
   }
   GRAPH <${data}> { ?root a <${KAFKA_STREAM_TYPE}> . }
 }`;
@@ -114,6 +126,7 @@ export function buildSingleByUalQuery({ contextGraphId, subGraphName, ual }: Sin
   GRAPH <${meta}> {
     ?ka <${ROOT_ENTITY}> ?root .
     ?ka <${PART_OF}> <${ual}> .
+${registrationScopeClause(`<${ual}>`, subGraphName, '    ')}
   }
   GRAPH <${data}> {
     ?root a <${KAFKA_STREAM_TYPE}> .

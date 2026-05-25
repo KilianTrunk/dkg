@@ -60,10 +60,19 @@ test('ensureContextGraph registers on-chain after duplicate local create', async
   assert.deepEqual(JSON.parse(calls[1].init.body), { id: 'demo-cg' });
 });
 
-test('ensureContextGraph accepts idempotent create responses with registered false', async () => {
+test('ensureContextGraph accepts idempotent duplicate register responses with registered false', async () => {
   await ensureContextGraph({ baseUrl: 'http://node1', token: 't' }, 'demo-cg', {
-    httpJson: async () => ({ status: 200, body: '{"registered":false}', parsed: { registered: false } }),
+    httpJson: async () => ({ status: 200, body: '{"registered":false,"registerErrorStatus":409}', parsed: { registered: false, registerErrorStatus: 409 } }),
   });
+});
+
+test('ensureContextGraph fails fast when register leg returns unclassified registered false', async () => {
+  await assert.rejects(
+    ensureContextGraph({ baseUrl: 'http://node1', token: 't' }, 'demo-cg', {
+      httpJson: async () => ({ status: 200, body: '{"registered":false}', parsed: { registered: false } }),
+    }),
+    /register leg failed/,
+  );
 });
 
 test('ensureContextGraph fails fast on non-idempotent register leg errors', async () => {

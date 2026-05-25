@@ -8923,6 +8923,14 @@ export class DKGAgent {
           // revocations even if curator state has changed since.
           try {
             this.wireSwmHostModeHandler(cgId);
+            // Codex PR #620 R2: also re-probe registration state.
+            // Without this, a host-only CG that was registered while
+            // the node was offline stays on the 1MiB / 6h pre-reg
+            // limits after restart and can prune valid ciphertext
+            // permanently — `GraphManager.listContextGraphs()` only
+            // sees local store graphs, so the periodic reconciler
+            // can't heal it later either.
+            await this.maybeMarkRegisteredForHostMode(cgId);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             this.log.warn(
@@ -9051,16 +9059,12 @@ export class DKGAgent {
     this.gossip.onMessage(swmTopic, handler);
     // B3: persist the host-mode designation so a restart re-engages
     // this handler before the chain-event poller catches up.
-    // Best-effort — never fail the wire on a persistence error.
-    if (this.swmHostModeStore) {
-      this.swmHostModeStore.markHostModeSubscribed(contextGraphId).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.log.debug(
-          createOperationContext('system'),
-          `Host-mode persistence (mark) failed for "${contextGraphId}": ${msg}`,
-        );
-      });
-    }
+    // Codex PR #620 R2: chain wire/unwire writes through a per-CG
+    // serialization queue so mark/unmark calls always land on disk
+    // in invocation order. Without this, back-to-back mark→unmark
+    // could write `true` after `false` and a restart would re-subscribe
+    // a torn-down CG. Still non-blocking at the wire level.
+    this.enqueueHostModePersistence(contextGraphId, true);
   }
 
   /**
@@ -9085,16 +9089,52 @@ export class DKGAgent {
     this.swmHostModeHandlers.delete(contextGraphId);
     this.swmHostModeSubscribed.delete(contextGraphId);
     // B3: clear the persisted host-mode designation so a restart
-    // does NOT re-engage. Best-effort.
-    if (this.swmHostModeStore) {
-      this.swmHostModeStore.markHostModeUnsubscribed(contextGraphId).catch((err: unknown) => {
+    // does NOT re-engage. Serialized via the per-CG persistence
+    // queue (see `enqueueHostModePersistence` for the ordering
+    // rationale).
+    this.enqueueHostModePersistence(contextGraphId, false);
+  }
+
+  /**
+   * Per-CG promise chain for host-mode mark/unmark writes. Codex
+   * PR #620 R2: prior fire-and-forget invocation made restart state
+   * nondeterministic — a stale mark() write could land AFTER a fresh
+   * unmark() and a subsequent restart would re-subscribe a CG that
+   * was already torn down.
+   *
+   * The chain serializes ALL writes for a given CG so they hit disk
+   * in invocation order. The wire/unwire callers stay synchronous;
+   * persistence is awaited only by the chain itself.
+   */
+  private readonly hostModePersistenceQueues = new Map<string, Promise<void>>();
+
+  private enqueueHostModePersistence(contextGraphId: string, subscribe: boolean): void {
+    if (!this.swmHostModeStore) return;
+    const store = this.swmHostModeStore;
+    const op = subscribe ? 'mark' : 'unmark';
+    const apply = async (): Promise<void> => {
+      try {
+        if (subscribe) {
+          await store.markHostModeSubscribed(contextGraphId);
+        } else {
+          await store.markHostModeUnsubscribed(contextGraphId);
+        }
+      } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.log.debug(
           createOperationContext('system'),
-          `Host-mode persistence (unmark) failed for "${contextGraphId}": ${msg}`,
+          `Host-mode persistence (${op}) failed for "${contextGraphId}": ${msg}`,
         );
-      });
-    }
+      }
+    };
+    const prev = this.hostModePersistenceQueues.get(contextGraphId) ?? Promise.resolve();
+    const next = prev.then(apply, apply);
+    this.hostModePersistenceQueues.set(contextGraphId, next);
+    void next.finally(() => {
+      if (this.hostModePersistenceQueues.get(contextGraphId) === next) {
+        this.hostModePersistenceQueues.delete(contextGraphId);
+      }
+    });
   }
 
   /**

@@ -1,0 +1,391 @@
+import { describe, it, expect } from 'vitest';
+import {
+  buildListQuery,
+  buildCountQuery,
+  buildSingleByUalQuery,
+  bindingsToKa,
+} from '../src/discovery.js';
+const META_URI = 'did:dkg:context-graph:urn:cg:demo/_meta';
+const DATA_URI = 'did:dkg:context-graph:urn:cg:demo';
+const SUBGRAPH_META_URI = 'did:dkg:context-graph:urn:cg:demo/streams/_meta';
+const SUBGRAPH_DATA_URI = 'did:dkg:context-graph:urn:cg:demo/streams';
+describe('discovery — buildListQuery', () => {
+  it('emits the exact SPARQL string joining KA meta (rootEntity/partOf/publishedAt) with data triples, ordered DESC by ?receivedAt', () => {
+    const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 30, offset: 0 });
+    expect(q).toBe(
+      `SELECT ?ual ?root ?receivedAt ?p ?o WHERE {
+  {
+    SELECT DISTINCT ?ual ?root ?receivedAt WHERE {
+      GRAPH <${META_URI}> {
+        ?ka <http://dkg.io/ontology/rootEntity> ?root .
+        ?ka <http://dkg.io/ontology/partOf> ?ual .
+        ?ual <http://dkg.io/ontology/publishedAt> ?receivedAt .
+      }
+      GRAPH <${DATA_URI}> {
+        ?root a <https://ontology.dkg.io/streams#KafkaStream> .
+      }
+    }
+    ORDER BY DESC(?receivedAt)
+    LIMIT 30 OFFSET 0
+  }
+  GRAPH <${DATA_URI}> { ?root ?p ?o . }
+}
+ORDER BY DESC(?receivedAt) ?ual ?root ?p ?o`,
+    );
+  });
+  it('substitutes custom limit and offset into the LIMIT/OFFSET line', () => {
+    const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 1000, offset: 250 });
+    expect(q).toContain('LIMIT 1000 OFFSET 250');
+  });
+  it('uses root meta and sub-graph data URIs when subGraphName is configured', () => {
+    const q = buildListQuery({
+      contextGraphId: 'urn:cg:demo',
+      subGraphName: 'streams',
+      limit: 30,
+      offset: 0,
+    });
+    expect(q).toContain(`GRAPH <${META_URI}>`);
+    expect(q).toContain(`GRAPH <${SUBGRAPH_DATA_URI}>`);
+    expect(q).not.toContain(`GRAPH <${SUBGRAPH_META_URI}>`);
+  });
+  it('keeps the outer joined rows sorted newest-first after each stream expands into triples', () => {
+    const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 30, offset: 0 });
+    expect(q).toMatch(/^SELECT \?ual \?root \?receivedAt \?p \?o WHERE/);
+    expect(q).toContain('ORDER BY DESC(?receivedAt) ?ual ?root ?p ?o');
+  });
+  it('rejects an unsafe contextGraphId to block SPARQL injection', () => {
+    expect(() =>
+      buildListQuery({ contextGraphId: 'urn:cg:demo> } DROP ALL {', limit: 30, offset: 0 }),
+    ).toThrow();
+  });
+});
+describe('discovery — buildCountQuery', () => {
+  it('emits the exact SPARQL string counting distinct UALs joined via KA partOf in the meta graph and KafkaStream type in the data graph', () => {
+    const q = buildCountQuery({ contextGraphId: 'urn:cg:demo' });
+    expect(q).toBe(
+      `SELECT (COUNT(DISTINCT ?ual) AS ?count) WHERE {
+  GRAPH <${META_URI}> {
+    ?ka <http://dkg.io/ontology/rootEntity> ?root .
+    ?ka <http://dkg.io/ontology/partOf> ?ual .
+  }
+  GRAPH <${DATA_URI}> { ?root a <https://ontology.dkg.io/streams#KafkaStream> . }
+}`,
+    );
+  });
+  it('rejects an unsafe contextGraphId to block SPARQL injection', () => {
+    expect(() => buildCountQuery({ contextGraphId: 'urn:cg:demo> } DROP ALL {' })).toThrow();
+  });
+  it('uses the root meta graph when counting streams for a configured subGraphName', () => {
+    const q = buildCountQuery({
+      contextGraphId: 'urn:cg:demo',
+      subGraphName: 'streams',
+    });
+    expect(q).toContain(`GRAPH <${META_URI}>`);
+    expect(q).toContain(`GRAPH <${SUBGRAPH_DATA_URI}>`);
+    expect(q).not.toContain(`GRAPH <${SUBGRAPH_META_URI}>`);
+  });
+});
+describe('discovery — buildSingleByUalQuery', () => {
+  it('emits the exact SPARQL string resolving <UAL> via KA partOf in the meta graph then fetching content from the data graph', () => {
+    const q = buildSingleByUalQuery({ contextGraphId: 'urn:cg:demo', ual: 'did:dkg:1/0xabc' });
+    expect(q).toBe(
+      `SELECT ?root ?p ?o WHERE {
+  GRAPH <${META_URI}> {
+    ?ka <http://dkg.io/ontology/rootEntity> ?root .
+    ?ka <http://dkg.io/ontology/partOf> <did:dkg:1/0xabc> .
+  }
+  GRAPH <${DATA_URI}> {
+    ?root a <https://ontology.dkg.io/streams#KafkaStream> .
+    ?root ?p ?o .
+  }
+}`,
+    );
+  });
+  it('rejects UAL strings containing illegal SPARQL delimiters', () => {
+    expect(() =>
+      buildSingleByUalQuery({ contextGraphId: 'urn:cg:demo', ual: 'did:dkg:1/0x> } DROP {' }),
+    ).toThrow();
+  });
+  it('rejects an unsafe contextGraphId to block SPARQL injection', () => {
+    expect(() =>
+      buildSingleByUalQuery({ contextGraphId: 'urn:cg:demo> } DROP ALL {', ual: 'did:dkg:1/0xabc' }),
+    ).toThrow();
+  });
+  it('uses root meta and sub-graph data URIs when resolving a UAL for a configured subGraphName', () => {
+    const q = buildSingleByUalQuery({
+      contextGraphId: 'urn:cg:demo',
+      subGraphName: 'streams',
+      ual: 'did:dkg:1/0xabc',
+    });
+    expect(q).toContain(`GRAPH <${META_URI}>`);
+    expect(q).toContain(`GRAPH <${SUBGRAPH_DATA_URI}>`);
+    expect(q).not.toContain(`GRAPH <${SUBGRAPH_META_URI}>`);
+  });
+});
+describe('discovery — bindingsToKa decodes real N-Quads literal binding values', () => {
+  // The Oxigraph adapter formats literal bindings as `"value"`, `"value"@lang`
+  // or `"value"^^<datatype>`. IRIs are returned as the bare lexical form.
+  it('strips quoting from plain string literals so JSON-LD scalars are not double-quoted', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/name', o: '"demo"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://ontology.dkg.io/streams#kafkaBootstrapUrl', o: '"kafka://broker:9092"' },
+    ]);
+    expect(ka).toEqual({
+      '@context': {
+        'dkg-streams': 'https://ontology.dkg.io/streams#',
+        schema: 'https://schema.org/',
+      },
+      '@id': 'did:dkg:1/0xabc',
+      '@type': 'dkg-streams:KafkaStream',
+      'schema:name': 'demo',
+      'dkg-streams:kafkaBootstrapUrl': 'kafka://broker:9092',
+    });
+  });
+  it('decodes datatyped numeric literals to JS numbers', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://ontology.dkg.io/streams#somePort', o: '"42"^^<http://www.w3.org/2001/XMLSchema#integer>' },
+    ]);
+    expect(ka!['dkg-streams:somePort']).toBe(42);
+  });
+  it('decodes extension XSD boolean and numeric literals to JS primitives', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://source.example/enabled', o: '"true"^^<http://www.w3.org/2001/XMLSchema#boolean>' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://source.example/threshold', o: '"0.75"^^<http://www.w3.org/2001/XMLSchema#decimal>' },
+    ]);
+    const prefix = Object.entries(ka!['@context']).find(([, iri]) => iri === 'https://source.example/')![0];
+    expect(ka![`${prefix}:enabled`]).toBe(true);
+    expect(ka![`${prefix}:threshold`]).toBe(0.75);
+  });
+  it('decodes language-tagged literals to their lexical value (drops the lang tag)', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/description', o: '"sample records"@en' },
+    ]);
+    expect(ka!['schema:description']).toBe('sample records');
+  });
+  it('unescapes N-Quads backslash sequences in string literals', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/name', o: '"a\\"b\\nc"' },
+    ]);
+    expect(ka!['schema:name']).toBe('a"b\nc');
+  });
+  it('unescapes full N-Quads literal escapes including unicode and control characters', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/name', o: '"caf\\u00E9 \\U0001F600\\b\\f"' },
+    ]);
+    expect(ka!['schema:name']).toBe('caf\u00e9 \u{1f600}\b\f');
+  });
+  it('uses ?ual (not ?root) as @id so the published UAL — not the RDF root subject — is returned to the caller', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:internal', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+    ]);
+    expect(ka!['@id']).toBe('did:dkg:1/0xabc');
+  });
+});
+describe('discovery — bindingsToKa basics', () => {
+  it('builds a JSON-LD KA from triple-form bindings with bare-IRI object values', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://ontology.dkg.io/streams#protocol', o: '"kafka"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/name', o: '"demo-stream"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/description', o: '"sample records"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://ontology.dkg.io/streams#kafkaBootstrapUrl', o: '"kafka://broker:9092"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://ontology.dkg.io/streams#kafkaTopicName', o: '"demo-topic"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://ontology.dkg.io/streams#dataFormat', o: '"JSON"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+    ]);
+    expect(ka).toEqual({
+      '@context': {
+        'dkg-streams': 'https://ontology.dkg.io/streams#',
+        schema: 'https://schema.org/',
+      },
+      '@id': 'did:dkg:1/0xabc',
+      '@type': 'dkg-streams:KafkaStream',
+      'dkg-streams:protocol': 'kafka',
+      'schema:name': 'demo-stream',
+      'schema:description': 'sample records',
+      'dkg-streams:kafkaBootstrapUrl': 'kafka://broker:9092',
+      'dkg-streams:kafkaTopicName': 'demo-topic',
+      'dkg-streams:dataFormat': 'JSON',
+    });
+  });
+  it('returns null when bindings is empty', () => {
+    expect(bindingsToKa([])).toBeNull();
+  });
+  it('accumulates repeated non-type predicates into arrays without changing scalar fields', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/keywords', o: '"alpha"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/keywords', o: '"beta"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/name', o: '"demo"' },
+    ]);
+    expect(ka!['@type']).toBe('dkg-streams:KafkaStream');
+    expect(ka!['schema:keywords']).toEqual(['alpha', 'beta']);
+    expect(ka!['schema:name']).toBe('demo');
+  });
+  it('compacts unknown predicates via a synthesised @context prefix (Bug 2)', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://vendor.example/externalRef', o: '"ref-7"' },
+    ]);
+    expect(ka).not.toBeNull();
+    const ctx = ka!['@context'] as Record<string, string>;
+    const prefix = Object.entries(ctx).find(([, iri]) => iri === 'https://vendor.example/')?.[0];
+    expect(prefix).toBeDefined();
+    expect(ka![`${prefix}:externalRef`]).toBe('ref-7');
+  });
+});
+// Bug 2: discovery must surface ALL stored rdf:type triples (not just the
+// baseline), and reconstruct @context dynamically from the prefixes the
+// bindings actually use — so write -> publish -> SPARQL -> read is a true
+// round-trip for extensions adding secondary types and prefixes.
+describe('discovery — Bug 2: bindingsToKa surfaces stored rdf:type triples', () => {
+  it('emits scalar @type when only the baseline KafkaStream type is bound', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/name', o: '"demo"' },
+    ]);
+    expect(ka!['@type']).toBe('dkg-streams:KafkaStream');
+  });
+  it('emits a multi-type array (baseline first, rest sorted) when extension types are bound', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://source.example/StreamingSource' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://vendor.example/TelemetryFeed' },
+    ]);
+    // Non-baseline types compact via synthesised prefixes; baseline stays
+    // first, the rest sort lexicographically on their compacted form.
+    const types = ka!['@type'] as string[];
+    expect(Array.isArray(types)).toBe(true);
+    expect(types[0]).toBe('dkg-streams:KafkaStream');
+    expect(types).toHaveLength(3);
+    const ctx = ka!['@context'] as Record<string, string>;
+    const reverse = (compact: string): string => {
+      const [prefix, local] = compact.split(':');
+      return `${ctx[prefix]}${local}`;
+    };
+    const expanded = types.slice(1).map(reverse).sort();
+    expect(expanded).toEqual([
+      'https://source.example/StreamingSource',
+      'https://vendor.example/TelemetryFeed',
+    ]);
+  });
+  it('returns scalar baseline @type even if duplicate rdf:type rows bind the same baseline IRI', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+    ]);
+    expect(ka!['@type']).toBe('dkg-streams:KafkaStream');
+  });
+});
+describe('discovery — Bug 2: bindingsToKa reconstructs @context from observed prefixes', () => {
+  it('omits unused baseline prefixes nothing — always keeps dkg-streams + schema', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+    ]);
+    expect(ka!['@context']).toEqual({
+      'dkg-streams': 'https://ontology.dkg.io/streams#',
+      schema: 'https://schema.org/',
+    });
+  });
+  it('adds a synthesised prefix when a non-baseline namespace appears in the bindings', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://vendor.example.com/ontology#externalRef', o: '"ref-alpha"' },
+    ]);
+    const ctx = ka!['@context'] as Record<string, string>;
+    expect(ctx['dkg-streams']).toBe('https://ontology.dkg.io/streams#');
+    expect(ctx.schema).toBe('https://schema.org/');
+    const synthesised = Object.entries(ctx).find(
+      ([, iri]) => iri === 'https://vendor.example.com/ontology#',
+    );
+    expect(synthesised).toBeDefined();
+    const [prefix] = synthesised!;
+    expect(ka![`${prefix}:externalRef`]).toBe('ref-alpha');
+  });
+  it('adds distinct prefixes for distinct non-baseline namespaces', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://vendor.example/externalRef', o: '"ref-alpha"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://source.example/group', o: '"g1"' },
+    ]);
+    const ctx = ka!['@context'] as Record<string, string>;
+    const vendorIris = Object.values(ctx).filter((iri) => iri === 'https://vendor.example/');
+    const sourceIris = Object.values(ctx).filter((iri) => iri === 'https://source.example/');
+    expect(vendorIris).toHaveLength(1);
+    expect(sourceIris).toHaveLength(1);
+  });
+});
+describe('discovery — Bug 2: synthesised prefix collisions + edge cases', () => {
+  it('disambiguates two namespaces whose first hostname label is identical', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://vendor.example/externalRef', o: '"ref-alpha"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://vendor.other.example/region', o: '"eu"' },
+    ]);
+    const ctx = ka!['@context'] as Record<string, string>;
+    const prefixes = Object.entries(ctx)
+      .filter(([p]) => p.startsWith('vendor'))
+      .map(([p]) => p);
+    expect(new Set(prefixes).size).toBe(prefixes.length);
+    expect(prefixes.length).toBe(2);
+  });
+  it('strips angle-bracket wrapping on rdf:type object IRIs when the engine surfaces them', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: '<https://ontology.dkg.io/streams#KafkaStream>' },
+    ]);
+    expect(ka!['@type']).toBe('dkg-streams:KafkaStream');
+  });
+  it('falls back to "ns" prefix for an opaque namespace with no derivable stem', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'urn:opaque:weird/key', o: '"v"' },
+    ]);
+    const ctx = ka!['@context'] as Record<string, string>;
+    const synthesised = Object.entries(ctx).find(([, iri]) => iri === 'urn:opaque:weird/');
+    expect(synthesised).toBeDefined();
+  });
+  it('keeps non-IRI predicates verbatim if they cannot be split into namespace + local', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'unsplittable', o: '"v"' },
+    ]);
+    expect(ka!['unsplittable']).toBe('v');
+  });
+});
+describe('discovery — Bug 2: round-trip through ka-builder + bindingsToKa with extension secondary type', () => {
+  it('preserves both baseline and extension @type entries across write and read', async () => {
+    const { buildKa, mergeAugmentFragment } = await import('../src/ka-builder.js');
+    const { coreSchema } = await import('../src/schema.js');
+    const base = buildKa(coreSchema.parse({
+      name: 'demo', kafkaBootstrapUrl: 'kafka://b:9092', kafkaTopicName: 'demo-topic',
+    }));
+    const ka = mergeAugmentFragment(
+      base,
+      { '@type': 'https://source.example/StreamingSource' },
+      new Set<string>(),
+    );
+    const writtenTypes = Array.isArray(ka['@type']) ? ka['@type'] : [ka['@type']];
+    // Simulate what publisher + Oxigraph would surface back as rdf:type bindings.
+    const bindings = writtenTypes.map((t) => ({
+      ual: 'did:dkg:1/0xabc',
+      root: 'urn:entity:demo',
+      p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type',
+      o: t.startsWith('dkg-streams:')
+        ? `https://ontology.dkg.io/streams#${t.slice('dkg-streams:'.length)}`
+        : t,
+    }));
+    const decoded = bindingsToKa(bindings);
+    const types = decoded!['@type'] as string[];
+    expect(Array.isArray(types)).toBe(true);
+    expect(types[0]).toBe('dkg-streams:KafkaStream');
+    expect(types).toHaveLength(2);
+    const ctx = decoded!['@context'] as Record<string, string>;
+    const [prefix, local] = types[1].split(':');
+    expect(`${ctx[prefix]}${local}`).toBe('https://source.example/StreamingSource');
+  });
+});

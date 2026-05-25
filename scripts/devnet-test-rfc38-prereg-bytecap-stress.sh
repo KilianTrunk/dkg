@@ -23,10 +23,12 @@
 #      MUST report `perCg[CG_ID].bytes` ≤ the unregistered byte cap
 #      (default 1 MiB). The total submitted is deliberately larger,
 #      so a working cap clamps the on-disk size to the limit.
-#   5. The core's daemon.log MUST contain a "Host-mode rejected
-#      pre-reg envelope" line attributable to the rate limiter
-#      (curator EOA in the message). At least one rejection proves
-#      the cap is wired in, not just the size clamp.
+#   5. The core's daemon.log is grepped for "Host-mode rejected
+#      pre-reg envelope" lines (observability only — the byte cap
+#      validated in phase 4 is the authoritative pass/fail
+#      enforcement signal; explicit rejections are
+#      complementary). Codex PR #623 R4 was right that the test
+#      shouldn't OVER-claim DiscoveryRateLimit coverage.
 #   6. The core process MUST still be alive (no crash under stress).
 #
 # Re-runnable: timestamp-suffixed CG id.
@@ -51,6 +53,15 @@ CORE_NODE=1
 # ~80 KiB each = ~1.3 MiB submitted; exceeds the 1 MiB default cap.
 WRITES_COUNT="${WRITES_COUNT:-16}"
 WRITE_PAYLOAD_BYTES="${WRITE_PAYLOAD_BYTES:-81920}"
+
+# Default configured cap for pre-registration CGs is exactly 1 MiB,
+# enforced after every append via `enforceLimitsAfterAppend`. After
+# the burst settles the core's perCg.bytes MUST be ≤ this cap.
+# Operators running with a custom config can override via
+# EXPECTED_CAP_BYTES. Allow a small overhead allowance for envelope
+# framing.
+EXPECTED_CAP_BYTES="${EXPECTED_CAP_BYTES:-1048576}"
+CAP_OVERHEAD_BYTES="${CAP_OVERHEAD_BYTES:-65536}"
 
 log()  { echo "[cap] $*"; }
 warn() { echo "[cap] WARN: $*" >&2; }
@@ -102,9 +113,13 @@ CREATE=$(api_call "$CURATOR_NODE" POST /api/context-graph/create "$(cat <<EOF
   "allowedAgents": ["$CURATOR_AGENT"] }
 EOF
 )")
-CREATED_ID=$(parse_json "$CREATE" '.id')
+# Codex PR #623 R1: /api/context-graph/create (without register) returns
+# `{ created, uri }`, not `{ id }`. Reading `.id` produced an empty
+# string and the next [-n] check aborted the script before the burst
+# ever ran. Read `.created` instead.
+CREATED_ID=$(parse_json "$CREATE" '.created')
 [ -n "$CREATED_ID" ] || fail "create failed: $CREATE"
-log "✓ pre-reg CG created locally id=$CREATED_ID"
+log "✓ pre-reg CG created locally created=$CREATED_ID"
 
 # ===========================================================================
 act "2. Core explicitly subscribes in host-mode (short-circuits beacon)"
@@ -133,6 +148,10 @@ log "Core log offset before burst: $LOG_OFFSET bytes"
 # ===========================================================================
 act "3. Burst: $WRITES_COUNT large writes from curator"
 # ===========================================================================
+# Codex PR #623 R2: `|| true` hid every write failure, so the loop
+# could complete even if no envelope was ever emitted (= false PASS).
+# Track successful writes and require >0 before the assertion runs.
+SUCCESSFUL_WRITES=0
 for i in $(seq 1 "$WRITES_COUNT"); do
   PAYLOAD=$(STAMP="$STAMP" CG_ID="$CG_ID" I="$i" BYTES="$WRITE_PAYLOAD_BYTES" node -e '
     const stamp = process.env.STAMP;
@@ -149,11 +168,15 @@ for i in $(seq 1 "$WRITES_COUNT"); do
     }];
     console.log(JSON.stringify({ contextGraphId: cgId, quads }));
   ')
-  RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/write "$PAYLOAD" || true)
+  RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/write "$PAYLOAD")
   N=$(parse_json "$RESP" '.triplesWritten' 2>/dev/null || echo "?")
   printf '[cap]   write %02d/%02d → triplesWritten=%s\n' "$i" "$WRITES_COUNT" "$N"
+  if [ "$N" = "1" ]; then
+    SUCCESSFUL_WRITES=$((SUCCESSFUL_WRITES + 1))
+  fi
 done
-log "✓ burst complete; waiting 3s for envelopes to settle on core"
+[ "$SUCCESSFUL_WRITES" -gt 0 ] || fail "no SWM writes succeeded — can't validate cap enforcement (precondition broken)"
+log "✓ burst complete: $SUCCESSFUL_WRITES / $WRITES_COUNT writes succeeded; waiting 3s for envelopes to settle on core"
 sleep 3
 
 # ===========================================================================
@@ -170,34 +193,42 @@ REGISTERED=$(parse_json "$STATS" ".perCg['$CG_ID'].registered" 2>/dev/null || ec
 log "Core perCg[$CG_ID]: bytes=$BYTES entries=$ENTRIES registered=$REGISTERED"
 
 if [ -z "$BYTES" ] || [ "$BYTES" = "0" ]; then
-  warn "core didn't store any ciphertext — possible that the gossip path or the explicit subscribe didn't engage. Check core logs."
+  fail "core didn't store any ciphertext — the gossip path or the explicit host-mode subscribe didn't engage. Burst submitted $((WRITES_COUNT * WRITE_PAYLOAD_BYTES)) bytes; core saw zero. Cap can't be validated against an empty store."
 fi
 
-# Default unregistered cap = 1 MiB = 1048576. We accept anything ≤ 2 MiB
-# as "cap enforced" because the cap is a soft hint, not a hard wall.
-CAP_CEILING=2097152
-if [ -n "$BYTES" ] && [ "$BYTES" != "" ]; then
-  if [ "$BYTES" -gt "$CAP_CEILING" ]; then
-    fail "byte cap NOT enforced: core stored $BYTES bytes for pre-reg CG (> ${CAP_CEILING}). The submitted total was $((WRITES_COUNT * WRITE_PAYLOAD_BYTES)) bytes — anything that's not clamped is a regression."
-  fi
-  log "✓ core's perCg.bytes ($BYTES) is within ceiling ($CAP_CEILING) → cap is enforcing"
+# Codex PR #623 R3: assert against the actual configured cap, not a
+# loose 2 MiB ceiling that would mask a doubled-cap regression.
+# `enforceLimitsAfterAppend` guarantees survivorBytes ≤ perCgByteCap
+# after every oversized append, so the steady-state expectation is
+# `bytes ≤ EXPECTED_CAP_BYTES + a small overhead allowance`. The
+# allowance covers the in-flight envelope between append and prune.
+CAP_CEILING=$((EXPECTED_CAP_BYTES + CAP_OVERHEAD_BYTES))
+if [ "$BYTES" -gt "$CAP_CEILING" ]; then
+  fail "byte cap NOT enforced: core stored $BYTES bytes for pre-reg CG " \
+       "(configured cap = $EXPECTED_CAP_BYTES, hard ceiling = $CAP_CEILING). " \
+       "Submitted total was $((WRITES_COUNT * WRITE_PAYLOAD_BYTES)) bytes — " \
+       "anything beyond the cap is a regression. Override EXPECTED_CAP_BYTES if your node uses a non-default config."
 fi
+log "✓ core's perCg.bytes ($BYTES) ≤ cap+slop ($CAP_CEILING) → cap is enforcing"
 
 # ===========================================================================
-act "5. Grep daemon.log for rejection lines"
+act "5. Inspect daemon.log for rejection lines (observability only)"
 # ===========================================================================
+# Codex PR #623 R4 acknowledged: the byte-cap clamp (validated in
+# phase 4) is the authoritative enforcement signal. Explicit
+# DiscoveryRateLimit rejection messages are observability — the
+# clamp passing without rejection lines is acceptable (the cap
+# absorbed the burst in time). The lines below help operators
+# tune limits but are NOT pass/fail criteria.
 if [ -f "$CORE_LOG" ]; then
   REJ_COUNT=$(tail -c +"$((LOG_OFFSET + 1))" "$CORE_LOG" 2>/dev/null | grep -c "Host-mode rejected pre-reg envelope" || true)
-  log "Rejection lines since burst: $REJ_COUNT"
-  if [ "$REJ_COUNT" = "0" ]; then
-    warn "no explicit rate-limit rejection logged — the byte cap alone may have absorbed the burst. " \
-         "If perCg.bytes is bounded the test still passes; this is just an FYI for operators tuning limits."
-  else
+  log "Rejection lines since burst: $REJ_COUNT (informational — byte cap is the authoritative control)"
+  if [ "$REJ_COUNT" != "0" ]; then
     SAMPLE=$(tail -c +"$((LOG_OFFSET + 1))" "$CORE_LOG" | grep "Host-mode rejected pre-reg envelope" | tail -1)
     log "  example: $SAMPLE"
   fi
 else
-  warn "core daemon.log missing — skip rejection grep"
+  log "core daemon.log missing — skipping observability grep"
 fi
 
 # ===========================================================================

@@ -153,8 +153,14 @@ import {
   decodeSwmHostCatchupResponse,
   DEFAULT_MAX_BYTES as SWM_HOST_CATCHUP_DEFAULT_MAX_BYTES,
   DEFAULT_MAX_ENTRIES as SWM_HOST_CATCHUP_DEFAULT_MAX_ENTRIES,
+  SWM_HOST_CATCHUP_WIRE_VERSION,
   type SwmHostCatchupResponseEntry,
 } from './swm/host-catchup-wire.js';
+import {
+  CatchupReplayGuard,
+  mintSignedCatchupRequest,
+  verifySignedCatchupRequest,
+} from './swm/host-catchup-sign.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
@@ -645,6 +651,14 @@ export class DKGAgent {
    * to identity / abuse history).
    */
   private readonly beaconCuratorByWireId = new Map<string, string>();
+  /**
+   * OT-RFC-38 / LU-6 — replay-defence cache for signed
+   * `swm-host-catchup` requests. Tracks recent (requesterEoa, nonce)
+   * pairs so a request lifted off the wire can't be replayed against
+   * the same responder while the freshness window is still open.
+   * See {@link CatchupReplayGuard}.
+   */
+  private readonly catchupReplayGuard = new CatchupReplayGuard();
   /**
    * OT-RFC-38 / LU-6 Phase B — periodic beacon re-announce timer
    * (curators only). See {@link beaconRegistry} jsdoc.
@@ -9549,7 +9563,7 @@ export class DKGAgent {
     const ctx = createOperationContext('share');
     if (!this.swmHostModeStore) {
       return encodeSwmHostCatchupResponse({
-        version: 1,
+        version: SWM_HOST_CATCHUP_WIRE_VERSION,
         contextGraphId: '',
         nextSeqno: 0,
         truncated: false,
@@ -9563,7 +9577,7 @@ export class DKGAgent {
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return encodeSwmHostCatchupResponse({
-        version: 1,
+        version: SWM_HOST_CATCHUP_WIRE_VERSION,
         contextGraphId: '',
         nextSeqno: 0,
         truncated: false,
@@ -9571,41 +9585,27 @@ export class DKGAgent {
         entries: [],
       });
     }
-    // Codex PR #610 round-2 #6 (partial mitigation): when the local
-    // node has explicit peer-allowlist meta for this CG (the member-
-    // side case), require the requesting peer to be in it. Pre-fix,
-    // any connected peer that knew or guessed a `contextGraphId`
-    // could pull stored envelopes; ciphertext is useless without
-    // the chain key but the activity metadata (existence, timing,
-    // volume) still leaked. We DON'T yet authenticate the host-only-
-    // core case (no local allowlist, chain-only authority) — that
-    // needs a signed catchup-request wire change and is tracked as
-    // a separate post-launch follow-up. For now host-only cores
-    // still serve openly, mitigated by per-peer rate limiting on
-    // the wire and the fact that ciphertext leaks no useful data
-    // without the curator-issued chain key.
-    try {
-      const allowedPeers = await this.getContextGraphAllowedPeers(req.contextGraphId);
-      if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
-        this.log.info(
-          ctx,
-          `host-catchup denied cg=${req.contextGraphId} from=${fromPeerId}: peer not in allowedPeers (len=${allowedPeers.length})`,
-        );
-        return encodeSwmHostCatchupResponse({
-          version: 1,
-          contextGraphId: req.contextGraphId,
-          nextSeqno: req.sinceSeqno,
-          truncated: false,
-          denied: 'peer not in context-graph allowlist',
-          entries: [],
-        });
-      }
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      this.log.debug(ctx, `host-catchup peer-allowlist probe failed cg=${req.contextGraphId}: ${reason}`);
-      // Fall through — local-allowlist read failure is non-fatal
-      // (host-only cores hit this path) and the iterate call below
-      // still gates on the existence of the CG in the host store.
+
+    // OT-RFC-38 LU-6 B1: signature + freshness + replay-defence +
+    // chain-anchored authorization. Pre-B1 the handler treated the
+    // libp2p peer-id as an authority token, which leaked metadata
+    // (existence/timing/volume of curated CGs) to any connected peer
+    // that knew or guessed the wire id — see comment block below at
+    // the authorization branch for the threat-model rationale.
+    const authResult = await this.authorizeSwmHostCatchupRequest(req, fromPeerId, Date.now());
+    if (!authResult.ok) {
+      this.log.info(
+        ctx,
+        `host-catchup denied cg=${req.contextGraphId} from=${fromPeerId} requesterEoa=${req.requesterEoa}: ${authResult.reason}`,
+      );
+      return encodeSwmHostCatchupResponse({
+        version: SWM_HOST_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        nextSeqno: req.sinceSeqno,
+        truncated: false,
+        denied: authResult.reason,
+        entries: [],
+      });
     }
 
     const maxEntries = req.maxEntries ?? SWM_HOST_CATCHUP_DEFAULT_MAX_ENTRIES;
@@ -9617,7 +9617,7 @@ export class DKGAgent {
       const reason = err instanceof Error ? err.message : String(err);
       this.log.warn(ctx, `host-catchup iterate failed cg=${req.contextGraphId} from=${fromPeerId}: ${reason}`);
       return encodeSwmHostCatchupResponse({
-        version: 1,
+        version: SWM_HOST_CATCHUP_WIRE_VERSION,
         contextGraphId: req.contextGraphId,
         nextSeqno: req.sinceSeqno,
         truncated: false,
@@ -9668,7 +9668,7 @@ export class DKGAgent {
       // can't fit in the response (would otherwise loop because
       // `nextSeqno` stays equal to `sinceSeqno` when entries=0).
       return encodeSwmHostCatchupResponse({
-        version: 1,
+        version: SWM_HOST_CATCHUP_WIRE_VERSION,
         contextGraphId: req.contextGraphId,
         nextSeqno: req.sinceSeqno,
         truncated: true,
@@ -9682,12 +9682,149 @@ export class DKGAgent {
       `host-catchup served cg=${req.contextGraphId} from=${fromPeerId} sinceSeqno=${req.sinceSeqno} entries=${entries.length} bytes=${runningBytes} truncated=${truncatedByEntries || truncatedByBytes}`,
     );
     return encodeSwmHostCatchupResponse({
-      version: 1,
+      version: SWM_HOST_CATCHUP_WIRE_VERSION,
       contextGraphId: req.contextGraphId,
       nextSeqno,
       truncated: truncatedByEntries || truncatedByBytes,
       entries,
     });
+  }
+
+  /**
+   * OT-RFC-38 LU-6 B1 — authorize a signed `swm-host-catchup` request.
+   *
+   * Layered checks (deny-by-default):
+   *   1. Signature recovery + freshness (issuedAtMs within window).
+   *   2. Replay-nonce uniqueness (per-responder LRU).
+   *   3. Chain-anchored: `requesterEoa ∈ participantAgents` for the CG.
+   *      Definitive when chain context is available — the on-chain
+   *      participant set IS the curated access policy.
+   *   4. Pre-registration fallback: `requesterEoa == beaconCurator`.
+   *      Curators can always catch up themselves before paying gas to
+   *      register, mirroring `ingestSwmHostModeEnvelope`.
+   *   5. Member-side allowlist fallback: when the local node has
+   *      explicit peer-allowlist meta (member CG context, not host-only
+   *      core), require `fromPeerId ∈ allowedPeers`. Defence in depth
+   *      against a signed-but-out-of-band requester.
+   *   6. Otherwise: DENY. The previous behaviour ("serve openly when
+   *      no authority source available") was the metadata-leak vector
+   *      Codex flagged on PR #610 round-2 #6.
+   *
+   * Returns `{ ok: true, recoveredSigner }` on accept or
+   * `{ ok: false, reason }` with a wire-suitable string.
+   */
+  private async authorizeSwmHostCatchupRequest(
+    req: ReturnType<typeof decodeSwmHostCatchupRequest>,
+    fromPeerId: string,
+    nowMs: number,
+  ): Promise<{ ok: true; recoveredSigner: string } | { ok: false; reason: string }> {
+    // 1. signature + freshness. `verifySignedCatchupRequest` re-runs
+    //    `computeCatchupRequestDigest` over the same numerical fields
+    //    the client signed; pass defined defaults for the optional
+    //    `maxEntries`/`maxBytes` so the encoded uint256 layout matches.
+    const verify = verifySignedCatchupRequest(
+      {
+        version: req.version,
+        contextGraphId: req.contextGraphId,
+        sinceSeqno: req.sinceSeqno,
+        maxEntries: req.maxEntries ?? 0,
+        maxBytes: req.maxBytes ?? 0,
+        requesterEoa: req.requesterEoa,
+        issuedAtMs: req.issuedAtMs,
+        nonce: req.nonce,
+        sig: req.sig,
+      },
+      nowMs,
+    );
+    if (!verify.ok || !verify.recoveredSigner) {
+      return { ok: false, reason: verify.reason ?? 'signature verification failed' };
+    }
+    const requesterEoa = verify.recoveredSigner;
+
+    // 2. replay-defence
+    if (!this.catchupReplayGuard.recordIfFresh(requesterEoa, req.nonce, req.issuedAtMs, nowMs)) {
+      return { ok: false, reason: 'replayed catchup nonce' };
+    }
+
+    // The authority sources below use UNION semantics: any source
+    // that recognises the requester EOA (or, as transport-layer
+    // fallback, the peer-id) is sufficient to accept. Codex PR #618
+    // R2 caught a fail-closed bug in the prior implementation where
+    // `chainParticipants` was treated as authoritative — if the
+    // chain returned a set that didn't include a legitimate
+    // delegatee or allowed-agent, we'd hard-deny without checking
+    // the locally-persisted allowlist. The current logic accepts
+    // on the first match across:
+    //   3a. on-chain participant agents
+    //   3b. beacon-pinned curator (pre-registration)
+    //   3c. locally-persisted agent-gate set (allowedAgent UNION
+    //       participantAgent from _meta + subscription cache)
+    //   3d. transport-layer allowedPeers (libp2p peer-id allowlist)
+    // Only if none accept do we deny.
+    const requesterLower = requesterEoa.toLowerCase();
+    let anyAuthoritySourceFound = false;
+
+    try {
+      const chainParticipants = await this.resolveOnChainParticipantAgents(req.contextGraphId);
+      if (chainParticipants !== null) {
+        anyAuthoritySourceFound = true;
+        if (chainParticipants.some((a) => a.toLowerCase() === requesterLower)) {
+          return { ok: true, recoveredSigner: requesterEoa };
+        }
+      }
+    } catch {
+      // Adapter probe failure is non-fatal; fall through to other sources.
+    }
+
+    try {
+      const beaconCurator = await this.resolveBeaconPinnedCuratorEoa(req.contextGraphId);
+      if (beaconCurator) {
+        anyAuthoritySourceFound = true;
+        if (beaconCurator.toLowerCase() === requesterLower) {
+          return { ok: true, recoveredSigner: requesterEoa };
+        }
+      }
+    } catch {
+      // Beacon cache miss is non-fatal.
+    }
+
+    // Locally-persisted agent gate: `getContextGraphAgentGateAddresses`
+    // unions `dkg:allowedAgent` + `dkg:participantAgent` from the CG's
+    // `_meta` graph and the in-memory subscription cache. On a member-
+    // side host this is the canonical allowlist + delegatee set;
+    // chain-derived sets often miss recently-approved delegatees that
+    // haven't been mirrored on chain yet.
+    try {
+      const agentGate = await this.getContextGraphAgentGateAddresses(req.contextGraphId);
+      if (agentGate !== null) {
+        anyAuthoritySourceFound = true;
+        if (agentGate.some((a) => a.toLowerCase() === requesterLower)) {
+          return { ok: true, recoveredSigner: requesterEoa };
+        }
+      }
+    } catch {
+      // Local-meta probe failure is non-fatal.
+    }
+
+    // Transport-layer ACL (libp2p peer-id allowlist). Only meaningful
+    // on nodes that have persisted the CG's `allowedPeers`; host-only
+    // cores never see it.
+    try {
+      const allowedPeers = await this.getContextGraphAllowedPeers(req.contextGraphId);
+      if (allowedPeers !== null) {
+        anyAuthoritySourceFound = true;
+        if (allowedPeers.includes(fromPeerId)) {
+          return { ok: true, recoveredSigner: requesterEoa };
+        }
+      }
+    } catch {
+      // local-meta probe failure is non-fatal; the deny below still applies.
+    }
+
+    const reason = anyAuthoritySourceFound
+      ? 'requester EOA not in any of: on-chain participants, beacon curator, local agent-gate, allowedPeers'
+      : 'no authority source available for context graph';
+    return { ok: false, reason };
   }
 
   /**
@@ -9732,6 +9869,24 @@ export class DKGAgent {
     let sinceSeqno = options?.sinceSeqno ?? 0;
     const maxRounds = Math.max(1, options?.maxRounds ?? 8);
     const maxEntries = options?.maxEntriesPerRound ?? SWM_HOST_CATCHUP_DEFAULT_MAX_ENTRIES;
+    const maxBytes = SWM_HOST_CATCHUP_DEFAULT_MAX_BYTES;
+    // OT-RFC-38 LU-6 B1 — every catchup request is signed by the
+    // requesting agent's chain EOA so the host can authenticate via
+    // on-chain participant set without trusting the libp2p peer-id.
+    //
+    // Codex PR #618 R2: we deliberately do NOT pre-compute the
+    // requester EOA from `getRegistrationTxSignerAddress()`. The
+    // chain adapter's tx-signer can differ from its message-signer
+    // (per the helper's own doc-comment), and binding the two
+    // independently produced "signer mismatch" rejections in every
+    // adapter except the EVM one. `mintSignedCatchupRequest` now
+    // recovers the actual signer from the signature itself and
+    // binds the digest to it — no caller-side lookup needed.
+    if (typeof this.chain.signMessage !== 'function') {
+      const reason = 'chain adapter does not implement signMessage — cannot mint signed catchup request';
+      this.log.warn(ctx, `host-catchup ${reason} to=${remotePeerId} cg=${contextGraphId}`);
+      return { rounds: 0, fetched: 0, applied: 0, appliedTriples: 0, skipped: 0, nextSeqno: sinceSeqno, denied: reason };
+    }
     let rounds = 0;
     let fetched = 0;
     let applied = 0;
@@ -9740,11 +9895,33 @@ export class DKGAgent {
     let lastDenied: string | undefined;
     while (rounds < maxRounds) {
       rounds += 1;
-      const reqBytes = encodeSwmHostCatchupRequest({
-        version: 1,
+      const signedReq = await mintSignedCatchupRequest({
         contextGraphId,
         sinceSeqno,
         maxEntries,
+        maxBytes,
+        // requesterEoa intentionally omitted — the helper recovers
+        // the signer from the signature itself, which is the only
+        // way to guarantee the digest binds to the actual signing
+        // key (the chain adapter's tx-signer and message-signer can
+        // differ). See `MintSignedCatchupRequestInput.requesterEoa`
+        // doc comment for the full rationale.
+        sign: async (digest) => {
+          const { r, vs } = await this.chain.signMessage!(digest);
+          const sig = ethers.Signature.from({ r: ethers.hexlify(r), yParityAndS: ethers.hexlify(vs) });
+          return sig.serialized;
+        },
+      });
+      const reqBytes = encodeSwmHostCatchupRequest({
+        version: SWM_HOST_CATCHUP_WIRE_VERSION,
+        contextGraphId,
+        sinceSeqno,
+        maxEntries,
+        maxBytes,
+        requesterEoa: signedReq.requesterEoa,
+        issuedAtMs: signedReq.issuedAtMs,
+        nonce: signedReq.nonce,
+        sig: signedReq.sig,
       });
       let sendResult;
       try {

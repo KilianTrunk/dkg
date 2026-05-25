@@ -590,6 +590,16 @@ every PR that touches `pnpm-lock.yaml`, any `package.json`, the
 deny-list JSON, or the scanner script itself, on every push to `main`,
 and on the same weekly cron as the other supply-chain scanners.
 
+**Top-level fields**:
+
+| Field                      | Type    | Required | Notes                                                          |
+|----------------------------|---------|----------|----------------------------------------------------------------|
+| `schema_version`           | number  | yes      | Bumped when the scanner gains a new top-level array. Scanner refuses to load a file with a higher version than it supports — closes the stale-local-checkout failure mode. |
+| `scanner_sanity_check`     | object  | yes      | Must contain `expected_packages_in_lockfile[]` with ≥1 anchor. |
+| `denied_package_names[]`   | array   | yes      | Per-entry shape below.                                         |
+| `denied_files[]`           | array   | yes      | Exact-path file denials. May be `[]`.                          |
+| `denied_filenames[]`       | array   | no (v2+) | Basename-recursive file denials. Optional for older schemas.   |
+
 **Entry shape — package names** (each one carries provenance so future
 reviewers can audit why it landed):
 

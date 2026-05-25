@@ -235,9 +235,11 @@ jobs:
     # workspace against a curated list of package names that public
     # security research has linked to active supply-chain attacks
     # (currently: the TrapDoor crypto stealer wave — Socket.dev, May 2026).
-    # Also fails if any path in `denied_files[]` exists on disk — used
-    # to block AI-instruction persistence files (`.cursorrules`) that
-    # we structurally do not use in this repo.
+    # Also fails if any path in `denied_files[]` exists at an exact
+    # repo-root-relative location, or if any file whose basename is in
+    # `denied_filenames[]` (e.g. `.cursorrules`) exists ANYWHERE in
+    # the workspace tree — the right scope for AI-injection
+    # persistence files that an attacker could plant at any depth.
     #
     # Why a name-based blocklist on top of the cooldown + advisory gate
     # in `dependabot-advisory.yml`:
@@ -273,11 +275,16 @@ jobs:
           # surface inside an otherwise hermetic step.
       - name: Run dependency deny-list scanner
         # Vanilla Node, no `pnpm install` step. The scanner reads
-        # `.github/dependency-deny-list.json` and asserts no entry
-        # matches pnpm-lock.yaml or any package.json file. Exit codes:
+        # `.github/dependency-deny-list.json` and asserts that no
+        # `denied_package_names[]` entry appears in pnpm-lock.yaml or
+        # any package.json, no `denied_files[]` path exists, and no
+        # file whose basename is in `denied_filenames[]` exists
+        # anywhere in the tree. Exit codes:
         #   0 = clean
         #   1 = at least one denied entry matched
-        #   2 = scanner broken (lockfile sanity check failed)
+        #   2 = scanner broken (deny-list file missing / malformed
+        #       / schema-mismatched, or none of the sanity-check
+        #       anchors found in the lockfile)
         run: node scripts/check-dependency-deny-list.mjs
 
   npm-audit:

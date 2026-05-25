@@ -6,33 +6,39 @@
  *
  *   1. No name in `denied_package_names[]` appears in `pnpm-lock.yaml`
  *      or in any `package.json` file under the workspace.
- *   2. No path in `denied_files[]` exists on disk.
+ *   2. No path in `denied_files[]` exists at the exact repo-root-
+ *      relative location given.
+ *   3. No file whose basename is in `denied_filenames[]` exists
+ *      anywhere in the workspace tree (recursive — used for AI-
+ *      injection persistence files like `.cursorrules` where the
+ *      attacker could plant the file at any depth).
  *
  * Exit codes:
  *
  *     0  clean (and the lockfile sanity check passed)
  *     1  one or more denied entries matched
- *     2  scanner broken (deny-list file missing / unparseable, OR the
- *        sanity-check package was NOT found in pnpm-lock.yaml so the
- *        scan path cannot be trusted to be exercising the lockfile)
+ *     2  scanner broken (deny-list file missing / unparseable / wrong
+ *        schema version, OR none of the configured sanity-check
+ *        anchors were found in pnpm-lock.yaml so the scan path
+ *        cannot be trusted to be exercising the lockfile)
  *
  * Design constraints:
  *
  *   - Vanilla Node only. No `npm install` step in the calling workflow.
- *     We use `node:fs`, `node:path`, `node:url`. Nothing else.
- *   - Hard sanity check: if a known-present dep is NOT found in the
- *     lockfile, we exit 2 so a future workflow refactor (e.g. someone
- *     renaming `pnpm-lock.yaml` or moving it) does not silently start
- *     reporting clean for unrelated reasons. The previous version of
- *     `supply-chain-scan.yml`'s pnpm-audit step shipped without this
- *     and got a false-confidence bug (now fixed); we apply the same
- *     lesson here from the outset.
- *   - Both pnpm-lock.yaml AND every package.json under packages/* are
- *     scanned. Lockfile catches transitives; package.json catches a
- *     direct-dep addition before the lockfile updates.
- *   - Outputs both a job-summary table (when run in GHA) and a plain
- *     terminal report (when run locally) so the same script works for
- *     pre-push checks and CI gates.
+ *     We use `node:fs`, `node:path`, `node:url`. Nothing else. The
+ *     scanner is bit-for-bit reproducible from the committed file.
+ *   - Hard sanity check: if NONE of the configured anchor packages are
+ *     found in the lockfile, exit 2. A future workflow refactor that
+ *     renames `pnpm-lock.yaml` or moves it cannot silently start
+ *     reporting clean for unrelated reasons. (Same lesson the
+ *     pnpm-audit step in this workflow learned the hard way — see
+ *     §H + §13 in SUPPLY_CHAIN_HARDENING.md.)
+ *   - Both pnpm-lock.yaml AND every package.json anywhere in the
+ *     workspace are scanned. Lockfile catches transitives; package.json
+ *     catches a direct-dep addition before the lockfile updates.
+ *   - Outputs a job-summary table when GITHUB_STEP_SUMMARY is set
+ *     (CI context) and a plain terminal report otherwise (local dev).
+ *     The same script works for pre-push checks and CI gates.
  *
  * Usage:
  *
@@ -51,6 +57,22 @@ const repoRoot = dirname(dirname(__filename));
 
 const DENY_LIST_PATH = '.github/dependency-deny-list.json';
 const LOCKFILE_PATH = 'pnpm-lock.yaml';
+
+/**
+ * Maximum deny-list schema version this scanner can handle. Bumping
+ * this is a deliberate scanner change that must land in the same PR
+ * as the JSON field additions it enables.
+ *
+ *   v1 — initial: denied_package_names, denied_files, scanner_sanity_check
+ *   v2 — adds denied_filenames[] (recursive basename match)
+ *
+ * The scanner accepts the JSON when `schema_version <= MAX_SUPPORTED_SCHEMA`
+ * AND fails with exit 2 if it sees a higher version, on the theory that a
+ * stale local checkout reading a newer file should fail loudly rather than
+ * silently ignore the new fields. The JSON file is required to declare a
+ * version (`schema_version` field); omitting it is a load-time error.
+ */
+const MAX_SUPPORTED_SCHEMA = 2;
 
 function fail(code, message) {
   console.error(`::error title=dependency-deny-list scanner::${message}`);
@@ -71,6 +93,15 @@ function loadDenyList() {
     parsed = JSON.parse(readFileSync(path, 'utf-8'));
   } catch (err) {
     fail(2, `${DENY_LIST_PATH} is not valid JSON: ${err.message}`);
+  }
+  // Schema version. Required since v1. Fail loudly on either an unknown
+  // higher version (stale local scanner reading a newer file) or a
+  // missing version (malformed file).
+  if (typeof parsed.schema_version !== 'number') {
+    fail(2, `${DENY_LIST_PATH} missing required field 'schema_version' (number).`);
+  }
+  if (parsed.schema_version > MAX_SUPPORTED_SCHEMA) {
+    fail(2, `${DENY_LIST_PATH} declares schema_version=${parsed.schema_version} but this scanner only supports up to ${MAX_SUPPORTED_SCHEMA}. Pull latest main and re-run.`);
   }
   if (!Array.isArray(parsed.denied_package_names)) {
     fail(2, `${DENY_LIST_PATH} missing or malformed denied_package_names[].`);
@@ -178,7 +209,9 @@ function loadDenyList() {
  *     adjacent to the name and the regex correctly refuses to match
  *     a substring of a longer-looking token. This is a narrow vector
  *     (requires committing the tarball to the repo) and is covered
- *     in defence-in-depth by §10 (TURBO scope) and §1-3 generally.
+ *     in defence-in-depth by §1 (SHA-pinned actions), §3 (no
+ *     postinstall execution without an allow-list), and CODEOWNERS
+ *     routing on `pnpm-lock.yaml` + `package.json`.
  */
 function buildNameMatcher(name) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -189,17 +222,25 @@ function buildNameMatcher(name) {
   // For scoped entries the `@` is part of the match itself, so the
   // standard boundary rule applies.
   const leftClass = isScoped ? 'a-zA-Z0-9._-' : 'a-zA-Z0-9._@-';
-  return new RegExp(`(^|[^${leftClass}])${escaped}(?![a-zA-Z0-9._-])`, 'm');
+  // Non-capturing left-boundary group (we never read the capture).
+  return new RegExp(`(?:^|[^${leftClass}])${escaped}(?![a-zA-Z0-9._-])`, 'm');
 }
 
-function scanFileForNames(filePath, deniedNames) {
+/**
+ * Compile a regex matcher for each deny-list entry exactly once,
+ * up front, so the inner per-file loop is just `matcher.test(content)`
+ * (no rebuild). Caller passes the resulting array to `scanFileWithMatchers`.
+ */
+function buildAllMatchers(entries) {
+  return entries.map((entry) => ({ entry, matcher: buildNameMatcher(entry.name) }));
+}
+
+function scanFileWithMatchers(filePath, matchers) {
   if (!existsSync(filePath)) return [];
   const content = readFileSync(filePath, 'utf-8');
   const hits = [];
-  for (const entry of deniedNames) {
-    if (buildNameMatcher(entry.name).test(content)) {
-      hits.push(entry);
-    }
+  for (const { entry, matcher } of matchers) {
+    if (matcher.test(content)) hits.push(entry);
   }
   return hits;
 }
@@ -295,21 +336,28 @@ function main() {
   const allHits = [];
 
   // Single tree walk: gathers package.json files and basename-deny hits
-  // in one pass. `denied_filenames[]` is optional (added in the second
-  // hardening pass); older deny-list files without it Just Work.
+  // in one pass. `denied_filenames[]` is optional (introduced in
+  // schema v2); older deny-list files without it Just Work.
   const deniedFilenames = denyList.denied_filenames ?? [];
   const deniedFilenameMap = new Map(deniedFilenames.map((d) => [d.filename, d]));
   const { pkgJsons: pkgJsonFiles, filenameHits } = walkWorkspace(repoRoot, new Set(deniedFilenameMap.keys()));
 
+  // Pre-compile a matcher for every denied package name, once. The
+  // per-file loop below then just runs `matcher.test(content)` against
+  // each file — no rebuild per iteration. With 34 entries × ~27 files
+  // this is microscopic either way, but explicit precompilation
+  // documents the intent and keeps the inner loop O(files × patterns).
+  const nameMatchers = buildAllMatchers(denyList.denied_package_names);
+
   // 1. Package-name deny-list scan against the lockfile.
-  const lockHits = scanFileForNames(join(repoRoot, LOCKFILE_PATH), denyList.denied_package_names);
+  const lockHits = scanFileWithMatchers(join(repoRoot, LOCKFILE_PATH), nameMatchers);
   for (const hit of lockHits) {
     allHits.push({ kind: 'package_name', file: LOCKFILE_PATH, ...hit });
   }
 
   // 2. Same scan against every package.json under the workspace.
   for (const pkgJson of pkgJsonFiles) {
-    const hits = scanFileForNames(pkgJson, denyList.denied_package_names);
+    const hits = scanFileWithMatchers(pkgJson, nameMatchers);
     for (const hit of hits) {
       allHits.push({ kind: 'package_name', file: relative(repoRoot, pkgJson), ...hit });
     }

@@ -68,6 +68,12 @@ const SETTINGS_ICON = (
   </svg>
 );
 
+const OBSERVABILITY_ICON = (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+  </svg>
+);
+
 export function Header() {
   const { theme, setTheme, leftCollapsed, toggleLeft, rightCollapsed, toggleRight } = useLayoutStore();
   const nodeStatus = useAgentsStore((s) => s.nodeStatus);
@@ -141,7 +147,7 @@ export function Header() {
       <div className="v10-header-agent-switcher" title={currentAgent ? `${currentAgent.agentDid}\n${currentAgent.agentAddress}` : undefined}>
         <span className="v10-header-agent-dot" />
         <span className="v10-header-agent-name">
-          {currentAgent?.name || nodeStatus?.name || 'Agent'}
+          {(currentAgent?.name && currentAgent.name !== '**' ? currentAgent.name : null) || nodeStatus?.name || 'Agent'}
         </span>
         {currentAgent?.agentAddress && (
           <span className="v10-header-agent-addr">
@@ -206,6 +212,14 @@ export function Header() {
             </div>
           )}
         </div>
+
+        <button
+          className="v10-header-icon-btn"
+          onClick={() => openTab({ id: 'operations', label: 'Observability', closable: true })}
+          title="Observability"
+        >
+          {OBSERVABILITY_ICON}
+        </button>
 
         <button
           className="v10-header-icon-btn"

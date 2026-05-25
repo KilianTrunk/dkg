@@ -60,6 +60,11 @@ import {
   performNpmUpdate,
   DAEMON_EXIT_CODE_RESTART,
 } from './daemon.js';
+import {
+  isLivenessProbeEnabled,
+  startLivenessWatcher,
+  LIVENESS_CONSECUTIVE_FAILURES_TO_KILL,
+} from './daemon/supervisor-liveness.js';
 import { migrateToBlueGreen } from './migration.js';
 import { ensureRollbackNodeUiBundle } from './rollback-node-ui.js';
 import { registerIntegrationCommands } from './integrations/commands.js';
@@ -175,6 +180,65 @@ function resolveDaemonEntryPoint(): string {
   return fileURLToPath(import.meta.url);
 }
 
+/**
+ * Wire up the supervisor-liveness watchdog for a spawned worker child.
+ *
+ * Returns a `stop()` function the supervisor must call when the child
+ * exits (cleanly or via SIGKILL). Returns a no-op if:
+ *   - The env gate is disabled (`DKG_SUPERVISOR_LIVENESS_PROBE=off`).
+ *   - The worker's api.port file doesn't appear within ~10s (e.g. headless
+ *     workers that don't bind an HTTP listener — benchmarks, tests).
+ *
+ * Wraps the apiPort-read in a polling loop because the worker writes the
+ * port file midway through boot, AFTER spawn returns. The first probe
+ * therefore has to wait for the file to exist.
+ */
+async function maybeStartSupervisorLivenessWatcher(
+  child: { kill(signal: 'SIGKILL'): boolean },
+): Promise<() => void> {
+  if (!isLivenessProbeEnabled(process.env.DKG_SUPERVISOR_LIVENESS_PROBE)) {
+    return () => {};
+  }
+
+  // Defer-start: wait up to 10s for the worker to write api.port. If it
+  // never appears, the worker is headless (no HTTP listener) and we skip
+  // the probe entirely rather than false-positive every tick.
+  let cancelled = false;
+  let watcher: { stop(): void } | null = null;
+  void (async () => {
+    const startedAt = Date.now();
+    while (!cancelled && Date.now() - startedAt < 10_000) {
+      const port = await readApiPort().catch(() => null);
+      if (port) {
+        if (cancelled) return;
+        watcher = startLivenessWatcher({
+          port,
+          onUnresponsive: () => {
+            console.warn(
+              `[supervisor] worker unresponsive after ${LIVENESS_CONSECUTIVE_FAILURES_TO_KILL} consecutive liveness probes; SIGKILL + respawn.`,
+            );
+            try {
+              child.kill('SIGKILL');
+            } catch {
+              /* child may already be exiting; ignore */
+            }
+          },
+          onFailure: (consecutive: number) => {
+            console.warn(`[supervisor] liveness probe failed (${consecutive} in a row).`);
+          },
+        });
+        return;
+      }
+      await sleep(500);
+    }
+  })();
+
+  return () => {
+    cancelled = true;
+    watcher?.stop();
+  };
+}
+
 async function runDaemonSupervisor(): Promise<void> {
   const maxCrashRestarts = 5;
   let crashRestartCount = 0;
@@ -189,9 +253,18 @@ async function runDaemonSupervisor(): Promise<void> {
       },
     );
 
+    // Positive-liveness watchdog. Catches the generic zombie shape (HTTP
+    // listener dead but process still alive) that the exit-watcher can't
+    // see. SIGKILL forces the child's exit, the existing respawn logic
+    // takes it from there. Gated by DKG_SUPERVISOR_LIVENESS_PROBE so
+    // tests + headless-worker scenarios can opt out. See
+    // packages/cli/src/daemon/supervisor-liveness.ts for the full rationale.
+    const stopWatcher = await maybeStartSupervisorLivenessWatcher(child);
+
     const exitCode = await new Promise<number | null>((resolve) => {
       child.once('exit', (code) => resolve(code));
     });
+    stopWatcher();
 
     if (exitCode === DAEMON_EXIT_CODE_RESTART) {
       crashRestartCount = 0;
@@ -232,10 +305,14 @@ async function runForegroundSupervisor(childEnv: NodeJS.ProcessEnv = process.env
       },
     );
 
+    // See note in runDaemonSupervisor — same defense-in-depth wiring.
+    const stopWatcher = await maybeStartSupervisorLivenessWatcher(currentChild);
+
     const exitCode = await new Promise<number | null>((resolve) => {
       currentChild!.once('exit', (code) => resolve(code));
       currentChild!.once('error', () => resolve(1));
     });
+    stopWatcher();
     currentChild = null;
 
     if (signalled) process.exit(exitCode ?? 0);

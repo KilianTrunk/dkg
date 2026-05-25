@@ -744,7 +744,17 @@ export class ProtocolRouter {
         const sendDurationMs = Date.now() - sendStartedAt;
 
         const readStartedAt = Date.now();
-        const response = await readAll(stream, this.maxReadBytes);
+        // PR-6: race the read against (per-attempt signal | node.stopSignal).
+        // attemptSignal already captures per-call timeout + caller-supplied
+        // signal; node.stopSignal fires when the daemon's shutdown closure
+        // calls DKGNode.stop(). Either firing unblocks a wedged read so
+        // the graceful shutdown path can drain in finite time.
+        const readResponse = await readAllWithSignal(
+          stream,
+          this.maxReadBytes,
+          composeAbortSignals(attemptSignal, this.node.stopSignal),
+        );
+        const response = readResponse;
         const readDurationMs = Date.now() - readStartedAt;
         const totalDurationMs = Date.now() - startedAt;
         if (totalDurationMs > 100) {
@@ -1166,6 +1176,97 @@ export async function raceMultiPath(args: {
   }
 
   return { response: winnerResponse, attemptedPaths: picked.length };
+}
+
+/**
+ * PR-6: AbortSignal-aware exported wrapper. Tests + future call sites
+ * use this signature; the internal `readAll` keeps the original
+ * (no-signal) shape for callers that don't have a signal handy yet.
+ *
+ * When `signal` is provided and fires while the for-await is parked
+ * waiting for the next chunk, this function aborts the underlying
+ * stream and throws an `AbortError`. Without this, a silent peer (e.g.
+ * a relay that died mid-transfer) wedges the read forever — which is
+ * the root cause of the beacon-01 shutdown deadlock that PR-1 (#655)
+ * papers over with a hard timeout.
+ *
+ * Implementation note: we can't pass `signal` to the for-await
+ * directly — JavaScript's async iteration protocol has no abort hook.
+ * Instead we race the for-await against an abort-listener promise that
+ * rejects on signal; on rejection, we call `stream.abort()` which
+ * causes the iterator to throw on its next `.next()` call, which
+ * propagates the abort error out of the for-await loop naturally.
+ */
+export async function readAllWithSignal(
+  stream: Stream | AsyncIterable<Uint8Array>,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  if (!signal) return readAll(stream, maxBytes);
+  if (signal.aborted) {
+    abortStream(stream, signal.reason);
+    throw asAbortError(signal.reason);
+  }
+  let abortListener: (() => void) | undefined;
+  const onAbortPromise = new Promise<never>((_resolve, reject) => {
+    abortListener = () => {
+      abortStream(stream, signal.reason);
+      reject(asAbortError(signal.reason));
+    };
+    signal.addEventListener('abort', abortListener, { once: true });
+  });
+  try {
+    return await Promise.race([readAll(stream, maxBytes), onAbortPromise]);
+  } finally {
+    if (abortListener) signal.removeEventListener('abort', abortListener);
+  }
+}
+
+/**
+ * Compose two `AbortSignal`s into a single derived signal that aborts
+ * when EITHER input aborts. Used by PR-6 to compose per-attempt
+ * deadlines with the node-wide stopSignal so callers don't have to
+ * pick which one wins.
+ *
+ * Uses Node's `AbortSignal.any` when available (Node 20.3+, current
+ * production target). Falls back to a manual composer for older Node
+ * — keeps tests / older sandboxes working.
+ */
+export function composeAbortSignals(
+  primary: AbortSignal | undefined,
+  secondary: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (!primary) return secondary;
+  if (!secondary) return primary;
+  const AnyImpl = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (AnyImpl) return AnyImpl([primary, secondary]);
+  const combined = new AbortController();
+  const forwardPrimary = () => combined.abort(primary.reason);
+  const forwardSecondary = () => combined.abort(secondary.reason);
+  if (primary.aborted) combined.abort(primary.reason);
+  else if (secondary.aborted) combined.abort(secondary.reason);
+  else {
+    primary.addEventListener('abort', forwardPrimary, { once: true });
+    secondary.addEventListener('abort', forwardSecondary, { once: true });
+  }
+  return combined.signal;
+}
+
+function abortStream(stream: Stream | AsyncIterable<Uint8Array>, reason: unknown): void {
+  if ('abort' in stream && typeof (stream as Stream).abort === 'function') {
+    try {
+      (stream as Stream).abort(reason instanceof Error ? reason : new Error(String(reason ?? 'aborted')));
+    } catch {
+      /* stream may already be torn down */
+    }
+  }
+}
+
+function asAbortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const err = new Error(typeof reason === 'string' ? reason : 'aborted');
+  (err as Error & { name: string }).name = 'AbortError';
+  return err;
 }
 
 async function readAll(

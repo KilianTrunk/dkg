@@ -4,6 +4,10 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Added — Core-stability hardening (PR-6: AbortSignal plumbing through DKGNode.stop())
+
+- **`DKGNode.stopSignal` + `composeAbortSignals` + `readAllWithSignal`** (`packages/core/src/node.ts`, `packages/core/src/protocol-router.ts`, `packages/core/test/protocol-router-abort.test.ts`): `DKGNode` now owns a per-start-cycle `AbortController`; `stop()` aborts it as its **first** action (before `libp2p.stop()`), so any in-flight stream read can bail out immediately rather than wedge on a silent peer / dead relay. `ProtocolRouter.send` now reads `this.node.stopSignal` and composes it with the per-attempt deadline signal via `composeAbortSignals` (`AbortSignal.any` when available, manual composer fallback) before passing it to a new `readAllWithSignal(stream, max, signal)` wrapper around the existing `readAll`. The wrapper races the for-await loop against the abort signal — when it fires, the underlying stream is `.abort()`-ed which makes the iterator throw on its next `.next()` call, propagating the abort error out of the for-await naturally. This is the graceful counterpart to PR-1's hard-timeout safety net (#655): PR-1 force-exits at 30s; PR-6 lets the routine shutdown path drain in milliseconds instead. Scope-limited: this PR plumbs the signal through the one known sync-read deadlock site (the `await readAll(stream, this.maxReadBytes)` at `protocol-router.ts:747` that was wedging beacon-01 in the rc.10 investigation); broader long-await sites can opt in by composing `node.stopSignal` the same way. 13 unit tests (`test/protocol-router-abort.test.ts`): pre-aborted signal, abort-during-read (the beacon-01 repro using a `hangingStream` helper), abort-after-completion, no-signal passthrough, stream.abort() side-effect, listener-cleanup on success + on abort, `composeAbortSignals` truth table (undefined ×2, lone signal, either-fires-composed-fires, pre-aborted inputs).
+
 ---
 
 ## [10.0.0-rc.10] - 2026-05-25

@@ -247,6 +247,7 @@ import {
 import {
   ContextGraphNotFoundError,
   InvalidContentError,
+  StaleSenderKeyTargetError,
   SyncAccessDeniedError,
   type PreSignedAuthorAttestation,
   type LocalSwmSenderKeySendState,
@@ -5739,12 +5740,30 @@ export class DKGAgent {
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       if (pkg) {
-        this.log.warn(
-          ctx,
+        // A sender-key setup may legitimately be fanned out across every
+        // cached snapshot of our agent's public encryption keys. Each
+        // bootstrap that targets a fingerprint we don't host as an
+        // active local key throws `StaleSenderKeyTargetError` and is
+        // not actionable for the operator — the matching bootstrap that
+        // hits our active key is logged at INFO via
+        // `SWM sender-key setup receive accepted`. Logging every stale
+        // attempt at WARN swamps `daemon.log` (5 WARNs per peer per
+        // session was routine on testnet edge nodes) without surfacing
+        // anything operators need to act on, so this branch is demoted
+        // to DEBUG. WARN is reserved for failure modes that DO require
+        // intervention: signature mismatch, agent-gate violation,
+        // recipient not local, and revoked-key targeting (the
+        // last of which throws a generic `Error` with the explicit
+        // `was revoked at` message above and therefore stays at WARN).
+        const message =
           `SWM sender-key setup receive rejected: senderAgent=${pkg.senderAgentAddress} recipientAgent=${pkg.recipientAgentAddress} ` +
           `fromPeer=${fromPeerId} contextGraph=${pkg.contextGraphId}${pkg.subGraphName ? `/${pkg.subGraphName}` : ''} ` +
-          `epoch=${pkg.epochId} membershipHash=${pkg.membershipHash} reason=${reason}`,
-        );
+          `epoch=${pkg.epochId} membershipHash=${pkg.membershipHash} reason=${reason}`;
+        if (err instanceof StaleSenderKeyTargetError) {
+          this.log.debug(ctx, message);
+        } else {
+          this.log.warn(ctx, message);
+        }
       }
       return encodeSwmSenderKeyPackageAck({
         version: SWM_SENDER_KEY_PACKAGE_VERSION,
@@ -5808,7 +5827,31 @@ export class DKGAgent {
       // revoke flow want to see the latter explicitly. Use the same
       // localAgents map the active-only filter does so the diagnostic
       // matches the gate exactly.
-      const record = this.localAgents.get(recipientAgentAddress);
+      //
+      // Codex round 2 on PR #654: a `Map.get(checksum)` here can miss
+      // a record that's stored under a differently-cased Map key than
+      // its own `record.agentAddress` field (legacy persisted state,
+      // older fixtures, or any path that lowercased on persist while
+      // keeping the EIP-55 form on the record itself). The miss falls
+      // through to `StaleSenderKeyTargetError`, which demotes a real
+      // revoked-or-known-key failure to DEBUG and silences operator
+      // visibility. Mirror the case-insensitive scan already used by
+      // `hasLocalAgent` (just above) and `getLocalWorkspaceRecipient
+      // PrivateKeys` so this branch sees the record whenever the
+      // existence-gate above did.
+      let record: AgentKeyRecord | undefined;
+      for (const candidate of this.localAgents.values()) {
+        if (candidate.agentAddress.toLowerCase() === recipientAgentAddress.toLowerCase()) {
+          record = candidate;
+          break;
+        }
+      }
+      const activeEntry = record?.workspaceEncryptionKeys.find(
+        (entry) => entry.encryptionKeyId === pkg.recipientKeyId && !entry.revokedAt,
+      );
+      if (activeEntry) {
+        throw new Error(`No local X25519 private key for DKG agent ${recipientAgentAddress} key ${pkg.recipientKeyId}`);
+      }
       const revokedEntry = record?.workspaceEncryptionKeys.find(
         (entry) => entry.encryptionKeyId === pkg.recipientKeyId && entry.revokedAt,
       );
@@ -5820,7 +5863,7 @@ export class DKGAgent {
           'against an active key.',
         );
       }
-      throw new Error(`No local X25519 private key for DKG agent ${recipientAgentAddress} key ${pkg.recipientKeyId}`);
+      throw new StaleSenderKeyTargetError(recipientAgentAddress, pkg.recipientKeyId);
     }
 
     const secret = await decryptSwmSenderKeyPackage({ package: pkg, recipientKey: localKey });

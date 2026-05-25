@@ -92,6 +92,7 @@ export {
 export {
   ContextGraphNotFoundError,
   InvalidContentError,
+  StaleSenderKeyTargetError,
   type DKGAgentConfig,
   type ContextGraphSub,
   type PublishOpts,

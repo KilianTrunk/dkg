@@ -99,11 +99,15 @@ which slice, and a sketch of how to reconcile already-emitted parallel URIs.
 
 4. **`<relPath>` is the path relative to the package root, not the repo
    root.** A monorepo file at `packages/storage/src/adapters/oxigraph.ts`
-   has `<pkgName>=dkg-storage` and `<relPath>=src/adapters/oxigraph.ts`. The
-   parent's scanner (which runs against external repos one repo at a time)
-   has no concept of "package root", so its `<relPath>` is the repo-root-
-   relative path — but its `<pkgName>=<owner>/<name>` is also repo-rooted,
-   so the produced URI is unambiguous.
+   has `<pkgName>=@origintrail-official/dkg-storage` (the scoped name
+   from that package's `package.json`) and
+   `<relPath>=src/adapters/oxigraph.ts`. The scope-prefixed handle is
+   what `Code.uri.package`/`Code.uri.file` emit today, so the example
+   here matches what the helper produces — no parallel namespace. The
+   parent's scanner (which runs against external repos one repo at a
+   time) has no concept of "package root", so its `<relPath>` is the
+   repo-root-relative path — but its `<pkgName>=<owner>/<name>` is also
+   repo-rooted, so the produced URI is unambiguous.
 
 5. **The `code:` ontology stays exactly as defined today** —
    `scripts/lib/ontology.mjs` is the canonical source of truth for class
@@ -124,22 +128,37 @@ written once per known-aliased URI:
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 
 <graphify:file:7f3a9c1e>
-    owl:sameAs <urn:dkg:code:file:dkg-storage/src/adapters/oxigraph.ts> .
+    owl:sameAs <urn:dkg:code:file:%40origintrail-official/dkg-storage/src/adapters/oxigraph.ts> .
 
 <graphify:file:b2d4e8f0>
-    owl:sameAs <urn:dkg:code:file:dkg-agent/src/dkg-agent.ts> .
+    owl:sameAs <urn:dkg:code:file:%40origintrail-official/dkg-agent/src/dkg-agent.ts> .
 ```
 
-In SPARQL, joins across the legacy and canonical URIs become trivial
-(the `PREFIX owl:` declaration is required by standard SPARQL parsers
-when using the `owl:` short form):
+The canonical URIs above match the shape `Code.uri.file()` already
+emits — note the `%40` (percent-encoded `@`) in the scoped package
+name, applied per `scripts/lib/ontology.mjs`. Using the unscoped
+`dkg-storage`/`dkg-agent` form here would re-introduce the parallel
+namespace this ADR is trying to eliminate.
+
+In SPARQL, joins across the legacy and canonical URIs become trivial.
+Two things to note:
+
+- The `PREFIX owl:` declaration is required by standard SPARQL parsers
+  when using the `owl:` short form (Codex flagged the earlier draft
+  for shipping the property path without it).
+- DKG sub-graph data is stored in named graphs (see [AGENTS.md §Query
+  gotchas](../../AGENTS.md)); a query against the default graph returns
+  zero rows. Wrap the pattern in `GRAPH ?g { ... }` so the example is
+  executable against the real `code` sub-graph.
 
 ```sparql
 PREFIX owl: <http://www.w3.org/2002/07/owl#>
 
 SELECT ?file ?path WHERE {
-  ?file owl:sameAs* ?canonical .
-  ?canonical <http://dkg.io/ontology/code/path> ?path .
+  GRAPH ?g {
+    ?file owl:sameAs* ?canonical .
+    ?canonical <http://dkg.io/ontology/code/path> ?path .
+  }
 }
 ```
 

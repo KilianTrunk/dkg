@@ -54,9 +54,15 @@ Concretely:
 
    ```
    POST /api/assertion/create   { name, subGraphName, contextGraphId }
-   POST /api/assertion/:name/write    { quads: [...] }     ── one or more times
-   POST /api/assertion/:name/promote  { entities: [...] }
+   POST /api/assertion/:name/write    { contextGraphId, subGraphName, quads: [...] }     ── one or more times
+   POST /api/assertion/:name/promote  { contextGraphId, subGraphName, entities: [...] }
    ```
+
+   `contextGraphId` (and the matching `subGraphName`) MUST be sent on every
+   write and promote, not only on create. The daemon validates them on each
+   call — importers that omit the field get HTTP 400 from the request
+   validator before any quads are processed. (The earlier draft of this
+   ADR showed only `quads`/`entities` in the body; that was wrong.)
 
    Each `write` body MUST stay under `MAX_BODY_BYTES`. Each `promote`
    `entities` array MUST stay under a comparable URI-count budget. Multiple

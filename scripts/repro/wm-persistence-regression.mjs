@@ -21,10 +21,18 @@
  * Lifecycle modes:
  *   - --spawn (default true):     spawn a daemon child via the configured
  *                                 start command, wait for /api/status, then
- *                                 use the daemon PID file for kill cycles.
+ *                                 use the daemon PID file (and the harness-
+ *                                 owned supervisor pgid) for kill cycles.
+ *                                 REFUSES to reuse a pre-existing daemon at
+ *                                 the configured port — if you want to keep
+ *                                 your daemon up, clean-stop it first or use
+ *                                 --no-spawn.
  *   - --no-spawn:                 assume the daemon is already running at
- *                                 DKG_API_PORT; use the PID file for hard
- *                                 kills, and /api/shutdown for clean stops.
+ *                                 DKG_API_PORT; use /api/shutdown for clean
+ *                                 restarts. Incompatible with
+ *                                 --restart-mode=kill and --matrix because
+ *                                 the harness does not own the supervisor's
+ *                                 process group and cannot SIGKILL it safely.
  *
  * Workload:
  *   - --num-assertions N (default 5)
@@ -800,14 +808,42 @@ async function main() {
   if (SPAWN_DAEMON) {
     const pid = await readDaemonPid();
     if (pid && isAlive(pid)) {
-      log(`daemon pid ${pid} already alive — skipping spawn`);
-    } else {
-      await spawnDaemon();
+      // A pre-existing daemon at our port was passing the
+      // ensureNoForeignDaemon() listener-pid cross-check (so it's
+      // "ours" in the HOME-ABS sense), but we did NOT spawn it
+      // ourselves and therefore do NOT know its supervisor pgid.
+      // If we then run --restart-mode=kill, killDaemonHard() would
+      // SIGKILL just the worker; if the daemon was started under
+      // `dkg start --foreground`, the supervisor would respawn a
+      // fresh worker and the matrix would silently measure the
+      // restart instead of the kill. Refuse rather than measure
+      // garbage.
+      throw new Error(
+        `daemon pid ${pid} is already running at port ${PORT} but was not spawned by this harness. ` +
+        `Running the kill cycle against a daemon whose supervisor we don't own would let a ` +
+        `\`dkg start --foreground\` supervisor respawn it mid-test and silently produce wrong results. ` +
+        `Either: (a) clean-stop it first via \`curl -X POST .../api/shutdown\` and re-run; ` +
+        `(b) re-run with --no-spawn --restart-mode=clean (kill mode is unsafe without a known pgid).`,
+      );
     }
+    await spawnDaemon();
   } else {
     const ok = await pingStatus(5_000);
     if (!ok) throw new Error(`--no-spawn but daemon at ${API_BASE} is not responding`);
-    log('using pre-existing daemon');
+    // In --no-spawn mode the harness does not own the supervisor, so it
+    // cannot kill the process group atomically. Reject kill mode + the
+    // matrix (which exercises kill cells) to avoid the supervisor-respawn
+    // confound. clean-mode (/api/shutdown) is fine: the daemon shuts down
+    // its own supervisor.
+    if (RESTART_MODE === 'kill' || RUN_MATRIX) {
+      throw new Error(
+        `--no-spawn is incompatible with restart-mode=kill / --matrix. ` +
+        `The harness needs the supervisor's pgid (set via the harness's own \`detached: true\` spawn) ` +
+        `to kill the whole process group; a daemon started outside this harness cannot be safely SIGKILLed. ` +
+        `Use --restart-mode=clean with --no-spawn, or drop --no-spawn for kill / --matrix runs.`,
+      );
+    }
+    log('using pre-existing daemon (clean-restart mode only)');
   }
 
   // Verify the auth token can be read; many endpoints require it.

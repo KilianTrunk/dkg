@@ -43,11 +43,12 @@
  * Restart matrix:
  *   - --restart-mode clean|kill   (default clean)
  *   - --pause-ms <ms>             (delay between stop and restart; default 0)
- *   - --wait-for-exit-ms <ms>     (hard timeout the harness gives the daemon to
- *                                 exit before failing the run; default 30000.
- *                                 Bump this for very large workloads where a
- *                                 clean shutdown's WM flush genuinely takes
- *                                 longer.)
+ *   - --wait-for-exit-ms <ms>     (timeout the harness gives the daemon to
+ *                                 exit before SIGKILL-falling-back; default
+ *                                 300000 = 5min. Small/medium runs settle in
+ *                                 seconds, but a 1M-quad WM flush can legitimately
+ *                                 take minutes; lower this on fast disks to
+ *                                 surface real hangs.)
  *   - --matrix                    run the full matrix
  *                                   (clean × kill) × (small/medium/large)
  *                                   × (pause=0 / pause=30000) and write a
@@ -101,7 +102,10 @@ const RESTART_MODE = args['restart-mode'] ?? 'clean';
 const NUM_ASSERTIONS = Number(args['num-assertions'] ?? 5);
 const QUADS_PER_ASSERTION = Number(args['quads-per-assertion'] ?? 1000);
 const PAUSE_MS = Number(args['pause-ms'] ?? 0);
-const WAIT_FOR_EXIT_MS = Number(args['wait-for-exit-ms'] ?? 30_000);
+// 300s default — small/medium runs settle in seconds, but a 1M-quad WM
+// flush during clean shutdown can legitimately spend several minutes.
+// Operators on faster disks may lower this to surface real hangs.
+const WAIT_FOR_EXIT_MS = Number(args['wait-for-exit-ms'] ?? 300_000);
 const QUAD_SHAPE = args['quad-shape'] ?? 'generic';
 const KEEP_CG = args['keep-cg'] === 'true';
 const RUN_MATRIX = args.matrix === 'true';
@@ -347,9 +351,21 @@ async function spawnDaemon() {
   expectedSupervisorPgid = spawnedChild.pid;
   const ok = await pingStatus(120_000);
   if (!ok) throw new Error('daemon did not become responsive at /api/status within 120s');
-  // Race window between pingStatus returning and the daemon writing
-  // daemon.pid; give it a beat then read + cross-check.
+  // Give the OS a tick to flush the spawned child's 'exit' event if it
+  // died early (e.g. "Daemon already running, PID NNNN" — the new daemon
+  // exits milliseconds after spawn but the event handler is async).
+  // Without this sleep, the next check races and the matrix would
+  // happily talk to a foreign/leftover daemon.
   await sleep(500);
+  if (spawnedChild === null) {
+    throw new Error(
+      'spawned daemon exited before /api/status came up — a leftover daemon at ' +
+      `port ${PORT} is serving the matrix's status probes. Run \`rm -rf ${HOME_ABS}\` ` +
+      'and confirm no stray dkg processes are running.',
+    );
+  }
+  // Then cross-check identity: daemon.pid must exist AND match the pid
+  // actually listening on PORT, otherwise we cannot safely SIGKILL later.
   const workerPid = await readDaemonPid();
   const listener = listenerPidOnPort(PORT);
   if (!workerPid) {
@@ -444,33 +460,67 @@ async function killDaemonHard() {
   expectedSupervisorPgid = null;
 }
 
-async function waitForDaemonExit({ timeoutMs = 30_000 } = {}) {
-  // Hard deadline: previously this warn()'d and returned on timeout, which
-  // let the next snapshot talk to a still-alive (or auto-restarted) daemon
-  // and silently record a false post-restart result. Now we throw so the
-  // run aborts; the operator can re-run with a longer timeout for large
-  // datasets if needed.
-  const deadline = Date.now() + timeoutMs;
+async function waitForDaemonExit({ timeoutMs } = {}) {
+  // The shutdown sequence in packages/cli/src/daemon/lifecycle.ts calls
+  // `server.close()` first (closes the HTTP port) and only then
+  // `await agent.stop()` (which flushes WM to disk via OxigraphStore.close()).
+  // For a 1M-quad WM the flush can take a few minutes on a laptop, so we
+  // must NOT give up just because /api/status stops responding — the PID
+  // is still alive and the daemon is busy doing the durable thing. The
+  // default is 5 min; callers (stopDaemonClean / killDaemonHard) pass in
+  // the operator-configurable WAIT_FOR_EXIT_MS.
+  //
+  // We can't rely on `process.kill(pid, 0)` alone for "is it gone yet"
+  // because Node's spawn() reaps the child for us; the more reliable signal
+  // is `spawnedChild` being nulled out by the 'exit' handler. And we
+  // cross-check against the listener-on-port so that even if the pid file
+  // disappeared the daemon is genuinely no longer serving traffic.
+  const effectiveTimeout = timeoutMs ?? 300_000;
+  const deadline = Date.now() + effectiveTimeout;
   while (Date.now() < deadline) {
     let alive = false;
     try { await fetch(`${API_BASE}/api/status`); alive = true; } catch { alive = false; }
     const pid = await readDaemonPid();
     const pidAlive = pid != null && isAlive(pid);
+    const childGone = spawnedChild === null;
     const listener = listenerPidOnPort(PORT);
-    if (!alive && !pidAlive && listener == null) {
-      // Belt-and-braces: HTTP, pid file, AND listener-on-port all agree
-      // the daemon is gone. Give the OS another tick to clean up
+    if (!alive && !pidAlive && childGone && listener == null) {
+      // HTTP, pid file, spawned-child handle, AND listener-on-port all
+      // agree the daemon is gone. Give the OS another tick to clean up
       // port-bind state.
       await sleep(250);
       return;
     }
     await sleep(250);
   }
-  throw new Error(
-    `daemon did not exit cleanly within ${timeoutMs}ms — refusing to snapshot. ` +
-    `For large workloads use --wait-for-exit-ms=<larger>; for small/medium runs ` +
-    `this timeout indicates a real shutdown hang.`,
+  // Timeout fallback: SIGKILL whatever's still hanging on so the next
+  // matrix cell does not measure an auto-restarted or still-flushing
+  // zombie. Codex flagged the previous warn-and-continue path as unsafe
+  // (the snapshot could record false post-restart results); the
+  // SIGKILL-then-confirm shape is the matrix-survivable equivalent.
+  warn(
+    `daemon did not exit cleanly within ${effectiveTimeout}ms — SIGKILLing it so the next ` +
+    'matrix cell starts clean. (Loss attributed to THIS cell may include ' +
+    'unflushed inserts; treat results with care.)',
   );
+  const pid = await readDaemonPid();
+  if (pid && isAlive(pid)) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* */ }
+  }
+  if (spawnedChild?.pid && isAlive(spawnedChild.pid)) {
+    try { process.kill(spawnedChild.pid, 'SIGKILL'); } catch { /* */ }
+  }
+  // Wait briefly for OS to release port + clean pid file.
+  await sleep(2_000);
+  // After-SIGKILL assertion: the port MUST be free or we have a real
+  // ownership problem and downstream measurements are invalid.
+  const finalListener = listenerPidOnPort(PORT);
+  if (finalListener != null) {
+    throw new Error(
+      `even after SIGKILL fallback, port ${PORT} is still owned by pid ${finalListener}. ` +
+      'Aborting the run rather than silently measuring a foreign daemon.',
+    );
+  }
 }
 
 // ─── workload ──────────────────────────────────────────────────────

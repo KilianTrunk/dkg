@@ -301,10 +301,21 @@ export class OxigraphStore implements TripleStore {
     await this.flushNow();
   }
 
+  /**
+   * Final flush + cleanup. Must drain any in-flight flush BEFORE running
+   * its own — otherwise `flushNow()` short-circuits on `this.flushing`
+   * and silently drops any inserts that landed between the in-flight
+   * dump and the close call. (That's the "lost the last few assertions"
+   * mode in docs/bugs/wm-persistence-regression.md after the atomic-write
+   * fix landed.)
+   */
   async close(): Promise<void> {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
+    }
+    while (this.flushing) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
     }
     await this.flushNow();
   }

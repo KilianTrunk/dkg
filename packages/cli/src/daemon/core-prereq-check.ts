@@ -66,9 +66,12 @@ export interface CorePrereqResult {
   nonRoutableAddresses: Array<{ addr: string; class: AddrClassification }>;
   /**
    * True iff `publicListenAddresses` is empty AND no `announceAddresses` entry
-   * has a public class. Operators with public DNS announce addresses (the
-   * VPS-with-static-IP case) are not degraded even if their listenAddresses
-   * are all wildcards / non-routable.
+   * can rescue the result. Operators with public DNS announce addresses (the
+   * VPS-with-static-IP case) are not degraded when they still have at least
+   * one bound listen address, even if that listen address is a wildcard /
+   * non-routable address. A node with zero bound listen addresses is always
+   * degraded: an announce address cannot make an unbound transport serve
+   * relay traffic.
    */
   looksDegraded: boolean;
   /**
@@ -99,7 +102,8 @@ export interface CheckCoreRelayPrereqsOpts {
   /**
    * Optional multiaddrs the daemon advertises to the network (the VPS /
    * cloud case where the public IP isn't bound to a local interface).
-   * A public announce address rescues an otherwise-degraded result.
+   * A public announce address rescues an otherwise-degraded result only when
+   * the node also has at least one bound listen address.
    */
   announceAddresses?: string[];
   /**
@@ -265,10 +269,11 @@ export function checkCoreRelayPrereqs(
   const announcePublic = announceAddresses.some(
     (a) => classifyMultiaddr(a, hostInterfaces) === 'public',
   );
+  const announceRescues = listenAddresses.length > 0 && announcePublic;
 
   const looksDegraded = nodeRole === 'core'
     && publicListenAddresses.length === 0
-    && !announcePublic;
+    && !announceRescues;
 
   const reasons: string[] = [];
   if (looksDegraded) {

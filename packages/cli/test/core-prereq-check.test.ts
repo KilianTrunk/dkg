@@ -223,6 +223,17 @@ describe('checkCoreRelayPrereqs — additional safety cases', () => {
     expect(result.reasons.some((r) => r === 'listenAddresses is empty')).toBe(true);
   });
 
+  it('empty listenAddresses is still degraded even when announceAddresses contains a public address', () => {
+    const result = checkCoreRelayPrereqs({
+      listenAddresses: [],
+      hostInterfaces: [PUBLIC_IPV4_IFACE],
+      announceAddresses: ['/ip4/203.0.113.5/tcp/4001'],
+      nodeRole: 'core',
+    });
+    expect(result.looksDegraded).toBe(true);
+    expect(result.reasons).toContain('listenAddresses is empty');
+  });
+
   it('mixed degraded classes summarise in a single reason line (cgnat + rfc1918 + loopback)', () => {
     // Operator value: the reason summary is grep-able. If a node has 5
     // non-routable addresses across 3 classes, we don't want 5 log lines;

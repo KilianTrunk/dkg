@@ -868,7 +868,8 @@ export async function runDaemonInner(
   //
   // Behaviour gated by `config.core.allowDegradedRelay`:
   //   - `true` (default): warn-only. No backcompat change for any existing op.
-  //   - `false`: refuse to boot via `shutdown(1)` — fail-loud opt-in.
+  //   - `false`: refuse to boot via a minimal post-agent-start cleanup path —
+  //     fail-loud opt-in.
   //
   // The check is deliberately scoped to a single post-start pass. A pre-start
   // pass (classifying the *configured* listenAddresses + host interfaces
@@ -905,7 +906,16 @@ export async function runDaemonInner(
               : `Refusing to boot. Set core.allowDegradedRelay: true to downgrade this to a warning.`),
         );
         if (!allowDegraded) {
-          await shutdown(1);
+          await agent.stop().catch((err: any) =>
+            log(`Core prereq fatal-stop error: ${err?.message ?? String(err)}`),
+          );
+          try {
+            dashDb.close();
+          } catch (err: any) {
+            log(`Core prereq fatal DB close error: ${err?.message ?? String(err)}`);
+          }
+          await removePid().catch(() => {});
+          process.exit(1);
           return;
         }
       } else {

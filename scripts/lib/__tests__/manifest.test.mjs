@@ -189,25 +189,33 @@ test('pendingPartitions filters out done', () => {
  * `bindingShape` lets us also exercise the SPARQL 1.1 results-JSON
  * cell shape that the SPARQL-HTTP adapter returns.
  */
-function makeMockClient({ bindingShape = 'flat', createAlreadyExists = false } = {}) {
+function makeMockClient({
+  bindingShape = 'flat',
+  createAlreadyExists = false,
+  promoteBodyLimitBytes = Infinity,
+} = {}) {
   /** @type {Set<string>} */
   const wm = new Set();
   /** @type {Set<string>} */
   const swm = new Set();
   /** @type {string[]} */
   const calls = [];
+  /** @type {Array<{method:string,path:string,body:unknown}>} */
+  const requests = [];
+  const state = { wm, swm, calls, requests, createAlreadyExists, promoteBodyLimitBytes };
 
   const tripleKey = (t) => `${t.subject}\u0001${t.predicate}\u0001${t.object}`;
 
   return {
     cgId: 'urn:test:cg',
-    _state: { wm, swm, calls },
+    _state: state,
     insertSwmTriples(triples) {
       for (const t of triples) swm.add(tripleKey(t));
     },
-    async request(method, path) {
+    async request(method, path, body) {
       calls.push(`${method} ${path}`);
-      if (createAlreadyExists && method === 'POST' && path === '/api/assertion/create') {
+      requests.push({ method, path, body });
+      if (state.createAlreadyExists && method === 'POST' && path === '/api/assertion/create') {
         const err = new Error('POST /api/assertion/create -> 409: {"error":"already exists"}');
         err.status = 409;
         err.body = { error: 'already exists' };
@@ -219,7 +227,14 @@ function makeMockClient({ bindingShape = 'flat', createAlreadyExists = false } =
       calls.push(`write:${triples.length}`);
       for (const t of triples) wm.add(tripleKey(t));
     },
-    async promote({ entities }) {
+    async promote(payload) {
+      const { entities } = payload;
+      const bodyBytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+      if (bodyBytes > state.promoteBodyLimitBytes) {
+        const err = new Error(`POST /api/assertion/promote -> 413: body too large (${bodyBytes})`);
+        err.status = 413;
+        throw err;
+      }
       calls.push(`promote:${entities.length}`);
       for (const key of [...wm]) {
         const subject = key.split('\u0001')[0];
@@ -373,6 +388,41 @@ test('createImportManifest reuses an existing manifest assertion idempotently', 
   assert.ok(client._state.calls.includes('POST /api/assertion/create'));
   assert.ok(client._state.calls.some((c) => c.startsWith('write:')));
   assert.ok(client._state.calls.some((c) => c.startsWith('promote:')));
+});
+
+test('createImportManifest preserves original startedAt when reusing an assertion', async () => {
+  const client = makeMockClient();
+  const importId = 'started-at-reuse';
+
+  await createImportManifest({
+    client,
+    importId,
+    partitions: ['src/foo.ts'],
+    subGraphName: 'meta',
+  });
+  const importIri = importUri(importId);
+  const startedAtTriplesBefore = [...client._state.swm].filter((k) => (
+    k.startsWith(`${importIri}\u0001${IMPORT_P.startedAt}\u0001`)
+  ));
+  assert.equal(startedAtTriplesBefore.length, 1);
+
+  client._state.createAlreadyExists = true;
+  await new Promise((r) => setTimeout(r, 2));
+  await createImportManifest({
+    client,
+    importId,
+    partitions: ['src/foo.ts'],
+    subGraphName: 'meta',
+  });
+
+  const startedAtTriplesAfter = [...client._state.swm].filter((k) => (
+    k.startsWith(`${importIri}\u0001${IMPORT_P.startedAt}\u0001`)
+  ));
+  assert.deepEqual(
+    startedAtTriplesAfter,
+    startedAtTriplesBefore,
+    'retry/reuse must not append a fresh imp:startedAt timestamp',
+  );
 });
 
 test('round-trip works with SPARQL 1.1 results-JSON cell bindings too', async () => {
@@ -530,6 +580,30 @@ test('loadImportManifest routes the query through SWM (regression for codex L391
   );
 });
 
+test('createImportManifest splits oversized promote payloads on daemon 413', async () => {
+  const client = makeMockClient({ promoteBodyLimitBytes: 1800 });
+  const partitions = Array.from(
+    { length: 24 },
+    (_, i) => `deep/path/${String(i).padStart(2, '0')}/${'x'.repeat(120)}`,
+  );
+
+  await createImportManifest({
+    client,
+    importId: 'large-promote',
+    partitions,
+    subGraphName: 'meta',
+  });
+
+  const promoteCalls = client._state.calls.filter((c) => c.startsWith('promote:'));
+  assert.ok(
+    promoteCalls.length > 1,
+    `expected multiple promote calls after 413 splitting, got ${promoteCalls.join(', ')}`,
+  );
+
+  const state = await loadImportManifest({ client, importId: 'large-promote', subGraphName: 'meta' });
+  assert.equal(state.partitions.length, partitions.length);
+});
+
 test('statusEventUri produces strictly increasing suffixes for same-ms calls (regression for codex L84)', () => {
   // Same-millisecond status updates land with identical `recordedAt`
   // values. Without a monotonic in-process counter in the IRI, two writes
@@ -608,10 +682,16 @@ test('createImportManifest uses sanitized default name for unsafe importIds', as
     partitions: ['only.ts'],
     subGraphName: 'meta',
   });
-  // The mock records all `request()` calls; the create call should have
-  // used the sanitized name embedded inside the path-encoded form is not
-  // available here, so we just verify it didn't throw and that a
-  // subsequent load (which constructs the same name) succeeds end-to-end.
+  const createRequests = client._state.requests.filter((r) => (
+    r.method === 'POST' && r.path === '/api/assertion/create'
+  ));
+  assert.equal(createRequests.length, 1);
+  assert.equal(
+    createRequests[0].body.name,
+    'import-manifest-corpus-2026-q1',
+    'createImportManifest must send the sanitized assertion name to the daemon',
+  );
+
   const state = await loadImportManifest({
     client,
     importId: 'corpus/2026-q1',

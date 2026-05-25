@@ -67,6 +67,8 @@ export const IMPORT_P = {
 
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const XSD_DATETIME = 'http://www.w3.org/2001/XMLSchema#dateTime';
+const PROMOTE_ROOT_COUNT_CAP = 1000;
+const PROMOTE_BODY_SOFT_LIMIT_BYTES = 220 * 1024;
 
 /** Stable URI for an Import. Slug is `encodeURIComponent`'d. */
 export function importUri(importId) {
@@ -153,6 +155,71 @@ function dt(iso) {
 
 function uri(s) {
   return `<${s}>`;
+}
+
+function isPayloadTooLarge(err) {
+  const status = err?.status ?? err?.statusCode ?? err?.response?.status;
+  if (status === 413) return true;
+  const msg = String(err?.message ?? err ?? '');
+  return /\b413\b|payload too large|request entity too large|body.*too large/i.test(msg);
+}
+
+function promotePayloadBytes({ contextGraphId, assertionName, subGraphName, entities }) {
+  return Buffer.byteLength(
+    JSON.stringify({ contextGraphId, assertionName, subGraphName, entities }),
+    'utf8',
+  );
+}
+
+async function promoteRoots(client, { contextGraphId, assertionName, subGraphName }, entities) {
+  let batch = [];
+  const flush = async () => {
+    if (batch.length === 0) return;
+    const roots = batch;
+    batch = [];
+    await promoteRootsBatch(client, { contextGraphId, assertionName, subGraphName }, roots);
+  };
+
+  for (const entity of entities) {
+    const next = [...batch, entity];
+    if (
+      batch.length > 0 &&
+      (next.length > PROMOTE_ROOT_COUNT_CAP ||
+        promotePayloadBytes({ contextGraphId, assertionName, subGraphName, entities: next }) >
+          PROMOTE_BODY_SOFT_LIMIT_BYTES)
+    ) {
+      await flush();
+    }
+    batch.push(entity);
+  }
+  await flush();
+}
+
+async function promoteRootsBatch(client, { contextGraphId, assertionName, subGraphName }, entities) {
+  try {
+    await client.promote({
+      contextGraphId,
+      assertionName,
+      subGraphName,
+      entities,
+    });
+  } catch (err) {
+    if (isPayloadTooLarge(err) && entities.length > 1) {
+      const mid = Math.ceil(entities.length / 2);
+      await promoteRootsBatch(
+        client,
+        { contextGraphId, assertionName, subGraphName },
+        entities.slice(0, mid),
+      );
+      await promoteRootsBatch(
+        client,
+        { contextGraphId, assertionName, subGraphName },
+        entities.slice(mid),
+      );
+      return;
+    }
+    throw err;
+  }
 }
 
 /**
@@ -285,6 +352,7 @@ export async function createImportManifest({
   }
   const cgId = client.cgId;
   const assertion = assertionName ?? defaultManifestAssertionName(importId);
+  let createdFresh = true;
   try {
     await client.request('POST', '/api/assertion/create', {
       contextGraphId: cgId,
@@ -300,8 +368,11 @@ export async function createImportManifest({
     if (!String(err?.message ?? '').includes('already exists')) {
       throw err;
     }
+    createdFresh = false;
   }
-  const triples = buildInitialManifestTriples(importId, partitions, new Date().toISOString());
+  const importIri = importUri(importId);
+  const triples = buildInitialManifestTriples(importId, partitions, new Date().toISOString())
+    .filter((t) => createdFresh || !(t.subject === importIri && t.predicate === IMPORT_P.startedAt));
   await client.writeAssertion({
     contextGraphId: cgId,
     assertionName: assertion,
@@ -311,20 +382,17 @@ export async function createImportManifest({
   // Promote the import root AND every partition URI. Promoting only the
   // root leaves partition subjects in WM, which means `loadImportManifest`
   // running against SWM on another node can't see `imp:key` /
-  // `imp:initialStatus` and resume can't recover. Chunk by `ROOT_CHUNK` so
-  // very-large imports stay within the daemon's body-size budget — see
-  // ADR 0002.
-  const ROOT_CHUNK = 1000;
-  const allRoots = [importUri(importId), ...partitions.map((k) => partitionUri(importId, k))];
-  for (let i = 0; i < allRoots.length; i += ROOT_CHUNK) {
-    await client.promote({
-      contextGraphId: cgId,
-      assertionName: assertion,
-      subGraphName,
-      entities: allRoots.slice(i, i + ROOT_CHUNK),
-    });
-  }
-  return { assertionName: assertion, importUri: importUri(importId) };
+  // `imp:initialStatus` and resume can't recover. Chunk by estimated JSON body
+  // size, and still split-and-retry if the daemon returns 413, because long
+  // percent-encoded partition keys can exceed the promote endpoint's 256 KB
+  // body cap well before a fixed root-count chunk reaches 1000 entries.
+  const allRoots = [importIri, ...partitions.map((k) => partitionUri(importId, k))];
+  await promoteRoots(client, {
+    contextGraphId: cgId,
+    assertionName: assertion,
+    subGraphName,
+  }, allRoots);
+  return { assertionName: assertion, importUri: importIri };
 }
 
 /**

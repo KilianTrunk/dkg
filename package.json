@@ -61,6 +61,7 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
+      "@cyfrin/aderyn",
       "better-sqlite3",
       "esbuild",
       "oxigraph",

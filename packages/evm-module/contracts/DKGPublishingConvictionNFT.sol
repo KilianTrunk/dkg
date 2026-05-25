@@ -268,14 +268,17 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
             fullySwept: false
         });
 
-        _mint(msg.sender, accountId);
-
         // Direct publisher -> CSS vault transfer. Contract never holds TRAC.
         // The TRAC sits in escrow against this account's billing windows and
         // is accounted to the staker pool lazily via active/passive sinks.
+        // Pulled BEFORE `_safeMint` so the receiver's `onERC721Received`
+        // callback observes a fully-funded account and cannot re-enter
+        // `coverPublishingCost` against an unfunded balance.
         if (!tokenContract.transferFrom(msg.sender, stakingStorageAddress, committedTRAC)) {
             revert TokenTransferFailed();
         }
+
+        _safeMint(msg.sender, accountId);
 
         emit AccountCreated(accountId, msg.sender, committedTRAC, discountBps, currentEpoch, expiresAtEpoch);
     }

@@ -152,7 +152,7 @@ function TransactionsContent() {
     api.fetchOperationsWithPhases({ limit: '100', from, names })
       .then((data: any) => {
         const filtered = (data?.operations ?? []).filter((op: any) =>
-          (op.phases ?? []).some((p: any) => p.phase === 'chain')
+          op.tx_hash || (op.phases ?? []).some((p: any) => p.phase === 'chain')
         );
         setOps(filtered);
       })

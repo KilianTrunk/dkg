@@ -1415,10 +1415,12 @@ export async function runDaemonInner(
         contextGraphId: data.contextGraphId,
         peerId: data.fromPeerId,
         details: {
+          batchId: data.batchId,
           ual: data.ual,
           rootEntities: Array.isArray(data.rootEntities) ? data.rootEntities.slice(0, 5) : undefined,
         },
       });
+      if (data.txHash) tracker.setTxHash(ctx, data.txHash);
       tracker.complete(ctx);
     } catch { /* never crash */ }
   });

@@ -54,6 +54,53 @@ describe('ProtocolRouter', () => {
     });
   });
 
+  describe('send() node stop abort propagation', () => {
+    const FAKE_PEER_ID = '12D3KooWBzj7Hg2cKCdsKL6QcjC5UbLztKTvzCZQHaT4P4ZyJEAA';
+
+    it('passes node.stopSignal through close/dial work and does not retry shutdown aborts', async () => {
+      const stopController = new AbortController();
+      let dialCalls = 0;
+      let closeSignal: AbortSignal | undefined;
+      const node = {
+        get stopSignal() {
+          return stopController.signal;
+        },
+        libp2p: {
+          getConnections: () => [],
+          dialProtocol: async () => {
+            dialCalls += 1;
+            return {
+              writeStatus: 'open' as const,
+              send: () => undefined,
+              close: async (opts?: { signal?: AbortSignal }) => {
+                closeSignal = opts?.signal;
+                stopController.abort(new Error('node stopping'));
+                throw new Error('The operation was aborted');
+              },
+              abort: () => undefined,
+              async *[Symbol.asyncIterator]() {
+                /* never reached */
+              },
+            };
+          },
+          handle: () => undefined,
+          unhandle: () => undefined,
+          peerStore: { get: async () => { throw new Error('NotFound'); } },
+        },
+      } as unknown as DKGNode;
+      const peerResolver = { resolve: async () => [] } as unknown as PeerResolver;
+      const router = new ProtocolRouter(node, { peerResolver });
+
+      await expect(
+        router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]), 5000),
+      ).rejects.toThrow(/aborted/);
+
+      expect(closeSignal).toBeDefined();
+      expect(closeSignal?.aborted).toBe(true);
+      expect(dialCalls).toBe(1);
+    });
+  });
+
   // Per-attempt resolver re-run was added in the MessageOutbox PR after
   // the two-laptop debug session that produced PR #517. Original shape
   // (PR #497) called `peerResolver.resolve()` once before the dial loop;

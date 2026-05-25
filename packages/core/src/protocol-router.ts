@@ -450,6 +450,8 @@ export class ProtocolRouter {
     // is exhausted.
     const overallStartedAt = Date.now();
     const overallDeadline = AbortSignal.timeout(timeoutMs);
+    const stopSignal = this.node.stopSignal;
+    const overallSignal = composeAbortSignals(overallDeadline, stopSignal) ?? overallDeadline;
 
     const overlay = this.pooledByLogical.get(protocolId);
     const memoizedVariant = this.peerWireVariantFor(peerIdStr, protocolId);
@@ -459,7 +461,7 @@ export class ProtocolRouter {
         const response = await overlay.pool.send(peerIdStr, data, {
           // Share the OVERALL deadline so a fall-through to one-shot
           // doesn't get a fresh budget. Codex PR #560 round 4.
-          signal: overallDeadline,
+          signal: overallSignal,
           // Thread the remaining wall-clock into the pool's own
           // request timer so it lines up with the shared deadline.
           timeoutMs: remainingForPool,
@@ -520,6 +522,7 @@ export class ProtocolRouter {
       // Reuse the overall budget rather than starting a fresh one
       // — see comment above. Codex PR #560 round 4.
       const multipathSignal = overallDeadline;
+      const multipathSignalWithStop = composeAbortSignals(multipathSignal, stopSignal) ?? multipathSignal;
       // Multi-path pre-attempt — race up to N live connections.
       // Returns the response on a winning path, or null if there
       // weren't enough live candidates (or all candidates failed).
@@ -532,7 +535,7 @@ export class ProtocolRouter {
         protocolId,
         data,
         parallelPaths,
-        signal: multipathSignal,
+        signal: multipathSignalWithStop,
         maxReadBytes: this.maxReadBytes,
       });
       if (multipathResult !== null) {
@@ -592,7 +595,8 @@ export class ProtocolRouter {
         lastErr = new Error('send timeout elapsed');
         throw lastErr;
       }
-      const attemptSignal = AbortSignal.timeout(remaining);
+      const attemptDeadline = AbortSignal.timeout(remaining);
+      const attemptSignal = composeAbortSignals(attemptDeadline, stopSignal) ?? attemptDeadline;
       // Track which connection (if any) the fast path picked this
       // attempt so the catch block can blacklist it on failure
       // without needing to inspect stream/connection internals from
@@ -744,16 +748,10 @@ export class ProtocolRouter {
         const sendDurationMs = Date.now() - sendStartedAt;
 
         const readStartedAt = Date.now();
-        // PR-6: race the read against (per-attempt signal | node.stopSignal).
-        // attemptSignal already captures per-call timeout + caller-supplied
-        // signal; node.stopSignal fires when the daemon's shutdown closure
-        // calls DKGNode.stop(). Either firing unblocks a wedged read so
-        // the graceful shutdown path can drain in finite time.
-        const readResponse = await readAllWithSignal(
-          stream,
-          this.maxReadBytes,
-          composeAbortSignals(attemptSignal, this.node.stopSignal),
-        );
+        // PR-6: attemptSignal composes the per-attempt deadline with
+        // node.stopSignal, so shutdown aborts the resolver, dial,
+        // stream close, and final read consistently.
+        const readResponse = await readAllWithSignal(stream, this.maxReadBytes, attemptSignal);
         const response = readResponse;
         const readDurationMs = Date.now() - readStartedAt;
         const totalDurationMs = Date.now() - startedAt;
@@ -776,6 +774,7 @@ export class ProtocolRouter {
         if (pickedConnection) {
           triedConnections.add(pickedConnection);
         }
+        if (stopSignal?.aborted || attemptDeadline.aborted || overallDeadline.aborted) throw err;
         if (!isRecoverableSendError(err) || attempt >= 2) throw err;
         const backoff = (attempt + 1) * 500;
         // Make the backoff abortable so the overall deadline is
@@ -791,11 +790,11 @@ export class ProtocolRouter {
             clearTimeout(t);
             reject(new Error(`send timeout: backoff aborted by overall deadline (${timeoutMs}ms)`));
           };
-          if (overallDeadline.aborted) {
+          if (overallSignal.aborted) {
             onAbort();
             return;
           }
-          overallDeadline.addEventListener('abort', onAbort, { once: true });
+          overallSignal.addEventListener('abort', onAbort, { once: true });
         });
       }
     }

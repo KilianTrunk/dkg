@@ -141,6 +141,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(claimed?.jobId).toBe(jobId);
     expect(claimed?.state).toBe('running');
     expect(claimed?.lease?.workerId).toBe('worker-1');
+    expect(claimed?.attempt.count).toBe(1);
 
     const fetched = await queue.getStatus(jobId);
     expect(fetched).toEqual(claimed);
@@ -243,6 +244,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const claimed = await queue.claimNext('worker-1');
     expect(claimed?.jobId).toBe(first);
     expect(claimed?.state).toBe('running');
+    expect(claimed?.attempt.count).toBe(1);
     expect(claimed?.lease).toBeDefined();
     expect(claimed?.lease?.workerId).toBe('worker-1');
     expect(claimed?.lease?.expiresAt).toBe(now + 60_000);
@@ -432,7 +434,28 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const reclaim = await queue.claimNext('worker-1');
     expect(reclaim?.jobId).toBe(jobId);
     expect(reclaim?.state).toBe('running');
-    expect(reclaim?.attempt.count).toBe(1);
+    expect(reclaim?.attempt.count).toBe(2);
+  });
+
+  it('21a. claimNext() increments attempt count before a retry can succeed', async () => {
+    const queue = createQueue({ backoff: () => 0 });
+    const jobId = await queue.enqueue(makeRequest());
+    const first = await queue.claimNext('worker-1');
+    await queue.fail(jobId, first!.lease!.claimToken, {
+      message: 'first attempt failed',
+      retryable: true,
+      classification: 'transient',
+      recordedAt: now,
+    });
+
+    const retry = await queue.claimNext('worker-1');
+    expect(retry?.attempt.count).toBe(2);
+    await queue.recordCommitMarker(jobId, retry!.lease!.claimToken, 'swmInserted');
+    await queue.succeed(jobId, retry!.lease!.claimToken, { promotedCount: 1, succeededAt: now });
+
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('succeeded');
+    expect(job?.attempt.count).toBe(2);
   });
 
   it('21b. claimNext() generates a fresh claim token when the same worker reclaims the same job in the same millisecond', async () => {

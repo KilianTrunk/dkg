@@ -206,11 +206,12 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
 
       const next = eligible.sort(comparePromoteJobs)[0]!;
       const claimToken = `${workerId}:${next.jobId}:${this.claimTokenGenerator()}`;
+      const attemptCount = next.attempt.count + 1;
       const claimed: PromoteJob = {
         ...next,
         state: 'running',
         updatedAt: now,
-        attempt: { ...next.attempt, nextRetryAt: undefined },
+        attempt: { ...next.attempt, count: attemptCount, nextRetryAt: undefined },
         lease: {
           workerId,
           acquiredAt: now,
@@ -291,9 +292,9 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       this.assertLeaseHeld(job, claimToken);
 
       const now = this.now();
-      const nextCount = job.attempt.count + 1;
+      const attemptCount = Math.max(1, job.attempt.count);
       const swmInserted = job.commitMarker?.swmInserted === true;
-      const canRetry = error.retryable && !swmInserted && nextCount < job.attempt.maxRetries;
+      const canRetry = error.retryable && !swmInserted && attemptCount < job.attempt.maxRetries;
 
       if (canRetry) {
         const failedRetrying: PromoteJob = {
@@ -302,9 +303,9 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
           updatedAt: now,
           lease: undefined,
           attempt: {
-            count: nextCount,
+            count: attemptCount,
             maxRetries: job.attempt.maxRetries,
-            nextRetryAt: now + this.backoff(nextCount),
+            nextRetryAt: now + this.backoff(attemptCount),
             lastError: error,
           },
         };
@@ -318,7 +319,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
         updatedAt: now,
         lease: undefined,
         attempt: {
-          count: nextCount,
+          count: attemptCount,
           maxRetries: job.attempt.maxRetries,
           lastError: error,
         },

@@ -69,6 +69,13 @@ jobs:
               - 'packages/evm-module/scripts/**'
               - 'packages/evm-module/hardhat.*'
               - 'packages/evm-module/package.json'
+              - 'packages/evm-module/slither.config.json'
+              - 'packages/evm-module/.solhint.json'
+              - 'packages/evm-module/.solhintignore'
+              - 'packages/evm-module/aderyn.toml'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
               - '.github/workflows/ci.yml'
 
   # ------------------------------------------------------------------
@@ -607,21 +614,75 @@ jobs:
         if: needs.changes.outputs.contracts == 'true'
         run: pnpm install --frozen-lockfile
 
-      - name: Cache Hardhat artifacts
+      - name: Cache Hardhat artifacts (NOT typechain)
         if: needs.changes.outputs.contracts == 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
+          # `packages/evm-module/typechain` is INTENTIONALLY omitted.
+          # Caching typechain bindings caused ghost failures in CI:
+          # `rm -rf typechain && npx hardhat typechain` would run
+          # against a restored `cache/` (so hardhat-typechain thought
+          # the artifacts hadn't changed since the last typechain
+          # generation, even though we'd just wiped the output) and
+          # silently produce no bindings — or worse, bindings that
+          # didn't match the actual artifact ABIs. Shard 2 tests
+          # (`KnowledgeAssetsV10-ciphertextCommitment` /
+          # `RandomSampling-curated`) hit `Error: no matching fragment`
+          # on `createContextGraph` despite local runs being green on
+          # the same commit. Always regenerating from scratch (~10s
+          # overhead per shard, see Generate TypeChain step below)
+          # makes the binding-vs-ABI invariant non-cacheable and kills
+          # the entire failure class.
           path: |
             packages/evm-module/artifacts
             packages/evm-module/cache
-            packages/evm-module/typechain
+          # NO restore-keys fallback. Previously a `hardhat-Linux-` fallback
+          # would grab a snapshot from a sibling branch with a different
+          # contract surface (e.g. integration's 8-arg `createContextGraph`
+          # vs PR #630's 9-arg). Hardhat then preserved the stale artifacts
+          # for unchanged-on-paper files, and `typechain` regenerated from
+          # those stale artifacts — yielding bindings with the wrong
+          # signature. Tests failed with `no matching fragment` even though
+          # the on-disk contract source matched the test call shape. A
+          # full cache miss + fresh compile (~90s for 97 contracts) is the
+          # right tradeoff over hours debugging cross-branch ghost failures.
           key: hardhat-${{ runner.os }}-${{ hashFiles('packages/evm-module/contracts/**/*.sol', 'packages/evm-module/hardhat.node.config.ts') }}
-          restore-keys: |
-            hardhat-${{ runner.os }}-
 
       - name: Compile contracts
         if: needs.changes.outputs.contracts == 'true'
         run: npx hardhat compile --config hardhat.node.config.ts
+        working-directory: packages/evm-module
+
+      - name: Generate TypeChain bindings (always fresh)
+        if: needs.changes.outputs.contracts == 'true'
+        # Typechain is never cached (see Cache Hardhat artifacts step),
+        # so the output dir is always empty here on a cache hit and
+        # we generate from scratch against the artifacts that were
+        # either restored from cache or freshly compiled above.
+        #
+        # `hardhat.node.config.ts` deliberately doesn't load
+        # `@typechain/hardhat` (the test runner uses it for faster
+        # boot). The default `hardhat.config.ts` does load it, which
+        # is why `npx hardhat typechain` here uses the default config.
+        # The `--show-stack-traces` flag is for debugging visibility
+        # if the silent-no-op recurrence ever happens again.
+        run: |
+          set -euo pipefail
+          rm -rf typechain
+          npx hardhat typechain --show-stack-traces
+          # Sanity check: bindings must include the `createContextGraph`
+          # function fragment from `ContextGraphs.sol`. If this grep
+          # fails, the typechain output is wrong and we want a loud
+          # failure here, not 20 lines down in mocha output.
+          if [ ! -f typechain/contracts/ContextGraphs.ts ]; then
+            echo "::error::typechain/contracts/ContextGraphs.ts missing after \`hardhat typechain\`"
+            exit 1
+          fi
+          if ! grep -q "createContextGraph: TypedContractMethod" typechain/contracts/ContextGraphs.ts; then
+            echo "::error::typechain ContextGraphs bindings missing createContextGraph method"
+            sed -n '1,40p' typechain/contracts/ContextGraphs.ts
+            exit 1
+          fi
         working-directory: packages/evm-module
 
       - name: "Hardhat tests (shard ${{ matrix.shard }}/4)"
@@ -691,3 +752,155 @@ jobs:
         working-directory: packages/evm-module
         env:
           NODE_OPTIONS: --max-old-space-size=8192
+
+  # ------------------------------------------------------------------
+  # Tornado static analysis lane — Slither + Aderyn + solhint, all
+  # SARIF-uploading to GitHub Code Scanning. INFORMATIONAL ONLY for
+  # the first phase: every step is `continue-on-error: true` so the
+  # job stays green regardless of findings, while the Security tab
+  # accumulates the baseline. A future PR will flip Slither to
+  # `fail-on: high` once we've triaged the existing finding set.
+  #
+  # Triggers:
+  #   * pull_request : runs only when the `changes` filter detects
+  #                    contract-touching paths (mirrors the existing
+  #                    Tornado: Solidity lane).
+  #   * push (main / v10-rc / …) : ALWAYS runs so the Security tab
+  #                    baseline refreshes after every merge. Without
+  #                    this, post-merge findings would never bubble
+  #                    up to Code Scanning even though they apply to
+  #                    the new tip — same dual-trigger reasoning as
+  #                    the solidity-coverage lane above.
+  #
+  # Why pnpm pre-compile + ignore-compile=true: the upstream
+  # crytic/slither-action defaults to running `npm install` inside
+  # the target directory. That breaks here because the evm-module
+  # package's deps include workspace-protocol entries that npm cannot
+  # resolve. We pre-compile via pnpm at workspace level, leaving
+  # `cache/solidity-files-cache.json` + `artifacts/` for Slither's
+  # crytic-compile to read directly, and pass `ignore-compile: true`
+  # to skip the action's own install/build.
+  #
+  # Aderyn ships as the @cyfrin/aderyn npm devDep (postinstall fetches
+  # the platform-specific binary; gated by `pnpm.onlyBuiltDependencies`
+  # at the repo root). solhint is also a npm devDep. Both are then
+  # pulled by the standard `pnpm install --frozen-lockfile` step,
+  # so no scanner-specific install dance is needed.
+  # ------------------------------------------------------------------
+  tornado-static-analysis:
+    name: "Tornado: static analysis (informational)"
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Always run on push (refreshes Code Scanning baseline). On PR,
+    # only run when contracts changed (paths-filter, see `changes`).
+    if: github.event_name != 'pull_request' || needs.changes.outputs.contracts == 'true'
+    permissions:
+      contents: read
+      # Required to upload SARIF to GitHub Code Scanning.
+      security-events: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache Hardhat artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          # Same shape as the Tornado: Solidity lane (no typechain —
+          # we don't need TS bindings for static analysis, and
+          # caching them caused the failures documented at line 614
+          # of this file).
+          path: |
+            packages/evm-module/artifacts
+            packages/evm-module/cache
+          key: hardhat-${{ runner.os }}-${{ hashFiles('packages/evm-module/contracts/**/*.sol', 'packages/evm-module/hardhat.node.config.ts') }}
+
+      - name: Compile contracts (Slither reads the artifacts)
+        run: npx hardhat compile --config hardhat.node.config.ts
+        working-directory: packages/evm-module
+
+      # ------- Slither -------
+      - name: Run Slither (SARIF)
+        uses: crytic/slither-action@b52cc1cbfee9ca3e8722dd5224299d16c9a6b80f # v0.4.2
+        continue-on-error: true
+        id: slither
+        with:
+          target: packages/evm-module
+          slither-config: packages/evm-module/slither.config.json
+          # Skip the action's npm-install + compile step — pnpm
+          # workspace deps can't resolve via npm. We compiled above.
+          ignore-compile: true
+          sarif: slither.sarif
+          # Keep the action green even on findings; the upload step
+          # below sends them to Code Scanning regardless.
+          fail-on: none
+          # If a smoke run reveals viaIR-related SlithIR translation
+          # issues, uncomment:
+          # slither-args: --skip-assembly
+
+      - name: Upload Slither SARIF to GitHub Code Scanning
+        # Skip the upload on forked PRs: GitHub downgrades
+        # `security-events: write` to read-only for fork PRs and the
+        # upload would 403. Mirrors the same fork guard used by the
+        # zizmor lane in supply-chain-scan.yml.
+        if: |
+          always()
+          && steps.slither.outputs.sarif != ''
+          && hashFiles('slither.sarif') != ''
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        continue-on-error: true
+        with:
+          sarif_file: ${{ steps.slither.outputs.sarif }}
+          category: slither
+
+      # ------- Aderyn -------
+      - name: Run Aderyn (SARIF)
+        # Aderyn auto-detects Hardhat from hardhat.config.ts and uses
+        # the artifacts produced by the compile step above. Output
+        # path is relative to working-directory.
+        continue-on-error: true
+        working-directory: packages/evm-module
+        run: pnpm exec aderyn . --output aderyn.sarif
+
+      - name: Upload Aderyn SARIF to GitHub Code Scanning
+        if: |
+          always()
+          && hashFiles('packages/evm-module/aderyn.sarif') != ''
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        continue-on-error: true
+        with:
+          sarif_file: packages/evm-module/aderyn.sarif
+          category: aderyn
+
+      # ------- solhint -------
+      - name: Run solhint (SARIF)
+        continue-on-error: true
+        working-directory: packages/evm-module
+        # `-f sarif` writes JSON to stdout. We redirect to a file so
+        # the upload step has a stable path.
+        run: pnpm exec solhint -f sarif 'contracts/**/*.sol' > solhint.sarif
+
+      - name: Upload solhint SARIF to GitHub Code Scanning
+        if: |
+          always()
+          && hashFiles('packages/evm-module/solhint.sarif') != ''
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        continue-on-error: true
+        with:
+          sarif_file: packages/evm-module/solhint.sarif
+          category: solhint

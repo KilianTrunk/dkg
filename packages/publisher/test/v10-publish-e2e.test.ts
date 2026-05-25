@@ -63,11 +63,7 @@ describe('V10 Publish E2E', () => {
 
     const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const cgResult = await adapter.createOnChainContextGraph({
-      participantIdentityIds: [
-        BigInt(ctx.coreProfileId),
-        ...ctx.receiverIds.map(id => BigInt(id)),
-      ],
-      requiredSignatures: 3,
+      accessPolicy: 1,
       publishPolicy: 0,
     });
     if (!cgResult.success || cgResult.contextGraphId === 0n) {

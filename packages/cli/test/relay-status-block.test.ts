@@ -23,8 +23,8 @@ describe('buildRelayStatusBlock — edge node shape', () => {
       isCore: false,
       relayStats: null,
       natStatus: 'unknown',
-      listenAddresses: ['/ip4/192.168.1.1/tcp/4001', '/p2p-circuit'],
-      announceAddresses: [],
+      advertisedAddresses: ['/ip4/192.168.1.1/tcp/4001', '/p2p-circuit'],
+      configuredAnnounceAddresses: [],
     });
     expect(block).toEqual({
       isCore: false,
@@ -34,21 +34,21 @@ describe('buildRelayStatusBlock — edge node shape', () => {
       bytesIn: null,
       bytesOut: null,
       natStatus: 'unknown',
-      listenAddresses: ['/ip4/192.168.1.1/tcp/4001', '/p2p-circuit'],
-      announcedAddresses: [],
+      advertisedAddresses: ['/ip4/192.168.1.1/tcp/4001', '/p2p-circuit'],
+      configuredAnnounceAddresses: [],
     });
   });
 
-  it('listenAddresses + announceAddresses are passed through unchanged for edge', () => {
+  it('advertisedAddresses + configuredAnnounceAddresses are passed through unchanged for edge', () => {
     const block = buildRelayStatusBlock({
       isCore: false,
       relayStats: null,
       natStatus: 'private',
-      listenAddresses: ['/ip4/10.0.0.5/tcp/4001'],
-      announceAddresses: ['/dns4/edge.example.com/tcp/4001'],
+      advertisedAddresses: ['/ip4/10.0.0.5/tcp/4001'],
+      configuredAnnounceAddresses: ['/dns4/edge.example.com/tcp/4001'],
     });
-    expect(block.listenAddresses).toEqual(['/ip4/10.0.0.5/tcp/4001']);
-    expect(block.announcedAddresses).toEqual(['/dns4/edge.example.com/tcp/4001']);
+    expect(block.advertisedAddresses).toEqual(['/ip4/10.0.0.5/tcp/4001']);
+    expect(block.configuredAnnounceAddresses).toEqual(['/dns4/edge.example.com/tcp/4001']);
   });
 });
 
@@ -58,8 +58,8 @@ describe('buildRelayStatusBlock — core node shape', () => {
       isCore: true,
       relayStats: FULL_STATS,
       natStatus: 'public',
-      listenAddresses: ['/ip4/203.0.113.5/tcp/4001'],
-      announceAddresses: [],
+      advertisedAddresses: ['/ip4/203.0.113.5/tcp/4001'],
+      configuredAnnounceAddresses: [],
     });
     expect(block).toEqual({
       isCore: true,
@@ -69,8 +69,8 @@ describe('buildRelayStatusBlock — core node shape', () => {
       bytesIn: '123456789',
       bytesOut: '987654321',
       natStatus: 'public',
-      listenAddresses: ['/ip4/203.0.113.5/tcp/4001'],
-      announcedAddresses: [],
+      advertisedAddresses: ['/ip4/203.0.113.5/tcp/4001'],
+      configuredAnnounceAddresses: [],
     });
   });
 
@@ -83,8 +83,8 @@ describe('buildRelayStatusBlock — core node shape', () => {
       isCore: true,
       relayStats: null,
       natStatus: 'unknown',
-      listenAddresses: [],
-      announceAddresses: [],
+      advertisedAddresses: [],
+      configuredAnnounceAddresses: [],
     });
     expect(block.isCore).toBe(true);
     expect(block.reservationsHeld).toBe(0);
@@ -104,8 +104,8 @@ describe('buildRelayStatusBlock — BigInt serialization', () => {
       isCore: true,
       relayStats: { ...FULL_STATS, bytesIn: big, bytesOut: big * 3n },
       natStatus: 'public',
-      listenAddresses: [],
-      announceAddresses: [],
+      advertisedAddresses: [],
+      configuredAnnounceAddresses: [],
     });
     expect(block.bytesIn).toBe(big.toString());
     expect(block.bytesOut).toBe((big * 3n).toString());
@@ -125,8 +125,8 @@ describe('buildRelayStatusBlock — BigInt serialization', () => {
       isCore: true,
       relayStats: { ...FULL_STATS, bytesIn: 5n, bytesOut: 0n },
       natStatus: 'public',
-      listenAddresses: [],
-      announceAddresses: [],
+      advertisedAddresses: [],
+      configuredAnnounceAddresses: [],
     });
     expect(block.bytesIn).toBe('5');
     expect(block.bytesOut).toBe('0');
@@ -143,8 +143,8 @@ describe('buildRelayStatusBlock — natStatus pass-through', () => {
         isCore: true,
         relayStats: FULL_STATS,
         natStatus,
-        listenAddresses: [],
-        announceAddresses: [],
+        advertisedAddresses: [],
+        configuredAnnounceAddresses: [],
       });
       expect(block.natStatus).toBe(natStatus);
     },
@@ -157,15 +157,15 @@ describe('buildRelayStatusBlock — schema uniformity across edge and core', () 
       isCore: false,
       relayStats: null,
       natStatus: 'unknown',
-      listenAddresses: [],
-      announceAddresses: [],
+      advertisedAddresses: [],
+      configuredAnnounceAddresses: [],
     });
     const core = buildRelayStatusBlock({
       isCore: true,
       relayStats: FULL_STATS,
       natStatus: 'public',
-      listenAddresses: ['/ip4/203.0.113.5/tcp/4001'],
-      announceAddresses: ['/dns4/relay.example.com/tcp/4001'],
+      advertisedAddresses: ['/ip4/203.0.113.5/tcp/4001'],
+      configuredAnnounceAddresses: ['/dns4/relay.example.com/tcp/4001'],
     });
     expect(Object.keys(edge).sort()).toEqual(Object.keys(core).sort());
   });

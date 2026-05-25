@@ -496,8 +496,8 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       isCore,
       relayStats,
       natStatus: daemonState.natStatus,
-      listenAddresses: agent.multiaddrs,
-      announceAddresses: config.announceAddresses ?? [],
+      advertisedAddresses: agent.multiaddrs,
+      configuredAnnounceAddresses: config.announceAddresses ?? [],
     });
     return jsonResponse(res, 200, {
       name: config.name,

@@ -38,16 +38,17 @@ export interface BuildRelayStatusBlockOpts {
    */
   natStatus: 'public' | 'private' | 'unknown';
   /**
-   * Actually-bound multiaddrs from `agent.multiaddrs` (which itself wraps
-   * `libp2p.getMultiaddrs()`). Post-start, wildcards expanded.
+   * Runtime-advertised multiaddrs from `libp2p.getMultiaddrs()`. This can
+   * include relay circuit and announced addresses, so it is intentionally not
+   * exposed as the bound listen socket set.
    */
-  listenAddresses: string[];
+  advertisedAddresses: string[];
   /**
    * Operator-configured `announceAddresses` (from DkgConfig). Multiaddrs the
    * daemon advertises to peers when its local interface IP isn't the
    * public-routable one (VPS / cloud / NAT64 cases).
    */
-  announceAddresses: string[];
+  configuredAnnounceAddresses: string[];
 }
 
 /**
@@ -81,12 +82,12 @@ export interface RelayStatusBlock {
   /** Counterpart to `bytesIn` for departing bytes. */
   bytesOut: string | null;
   natStatus: 'public' | 'private' | 'unknown';
-  listenAddresses: string[];
-  announcedAddresses: string[];
+  advertisedAddresses: string[];
+  configuredAnnounceAddresses: string[];
 }
 
 export function buildRelayStatusBlock(opts: BuildRelayStatusBlockOpts): RelayStatusBlock {
-  const { isCore, relayStats, natStatus, listenAddresses, announceAddresses } = opts;
+  const { isCore, relayStats, natStatus, advertisedAddresses, configuredAnnounceAddresses } = opts;
   return {
     isCore,
     reservationsHeld: relayStats?.reservationCount ?? 0,
@@ -95,7 +96,7 @@ export function buildRelayStatusBlock(opts: BuildRelayStatusBlockOpts): RelaySta
     bytesIn: relayStats ? relayStats.bytesIn.toString() : null,
     bytesOut: relayStats ? relayStats.bytesOut.toString() : null,
     natStatus,
-    listenAddresses,
-    announcedAddresses: announceAddresses,
+    advertisedAddresses,
+    configuredAnnounceAddresses,
   };
 }

@@ -184,8 +184,8 @@ import {
   carryForwardBundledMarkItDownBinary,
 } from './manifest.js';
 import {
-  SHUTDOWN_FORCED_OFFSET,
   SHUTDOWN_HARD_TIMEOUT_MS,
+  encodeForcedShutdownExitCode,
   raceShutdownWithTimeout,
 } from './shutdown.js';
 import {
@@ -2099,33 +2099,39 @@ export async function runDaemonInner(
     if (shuttingDown) return;
     shuttingDown = true;
     log("Shutting down...");
-    const cleanup = (async () => {
+    const cleanupStateFiles = async () => {
       await removePid().catch((err: any) =>
         log(`PID cleanup error: ${err?.message ?? String(err)}`),
       );
       await removeApiPort().catch((err: any) =>
         log(`API port cleanup error: ${err?.message ?? String(err)}`),
       );
-      if (updateInterval) clearInterval(updateInterval);
-      clearInterval(chainScanTimer);
-      clearInterval(pingTimer);
-      clearInterval(pruneTimer);
-      rateLimiter.destroy();
-      metricsCollector.stop();
-      await publisherRuntime
-        ?.stop()
-        .catch((err: any) =>
-          log(`Publisher runtime stop error: ${err?.message ?? String(err)}`),
-        );
-      await daemonState.catchupRunner
-        ?.close()
-        .catch((err: any) =>
-          log(`Catch-up runner stop error: ${err?.message ?? String(err)}`),
-        );
-      server.close();
-      await agent.stop();
-      dashDb.close();
-      log("Stopped.");
+    };
+    const cleanup = (async () => {
+      try {
+        if (updateInterval) clearInterval(updateInterval);
+        clearInterval(chainScanTimer);
+        clearInterval(pingTimer);
+        clearInterval(pruneTimer);
+        rateLimiter.destroy();
+        metricsCollector.stop();
+        await publisherRuntime
+          ?.stop()
+          .catch((err: any) =>
+            log(`Publisher runtime stop error: ${err?.message ?? String(err)}`),
+          );
+        await daemonState.catchupRunner
+          ?.close()
+          .catch((err: any) =>
+            log(`Catch-up runner stop error: ${err?.message ?? String(err)}`),
+          );
+        server.close();
+        await agent.stop();
+        dashDb.close();
+        log("Stopped.");
+      } finally {
+        await cleanupStateFiles();
+      }
     })().catch((err: any) => {
       log(`Shutdown cleanup error: ${err?.message ?? String(err)}`);
     });
@@ -2133,8 +2139,9 @@ export async function runDaemonInner(
       cleanup,
       SHUTDOWN_HARD_TIMEOUT_MS,
       log,
+      cleanupStateFiles,
     );
-    process.exit(forced ? exitCode + SHUTDOWN_FORCED_OFFSET : exitCode);
+    process.exit(forced ? encodeForcedShutdownExitCode(exitCode) : exitCode);
   }
 
   process.on("SIGINT", () => shutdown(0));

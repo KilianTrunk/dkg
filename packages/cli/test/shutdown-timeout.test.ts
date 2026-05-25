@@ -3,6 +3,7 @@ import {
   SHUTDOWN_FORCED_OFFSET,
   SHUTDOWN_HARD_TIMEOUT_MS,
   decodeForcedExitCode,
+  encodeForcedShutdownExitCode,
   isForcedShutdownExitCode,
   raceShutdownWithTimeout,
 } from '../src/daemon/shutdown.js';
@@ -59,6 +60,14 @@ describe('decodeForcedExitCode', () => {
   });
 });
 
+describe('encodeForcedShutdownExitCode', () => {
+  it('encodes only the shutdown sentinels the supervisor can decode exactly', () => {
+    expect(encodeForcedShutdownExitCode(0)).toBe(100);
+    expect(encodeForcedShutdownExitCode(75)).toBe(175);
+    expect(() => encodeForcedShutdownExitCode(1)).toThrow(/Unsupported forced shutdown exit code/);
+  });
+});
+
 describe('raceShutdownWithTimeout', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -83,11 +92,12 @@ describe('raceShutdownWithTimeout', () => {
 
   it('resolves with forced=true and logs once after the deadline when cleanup never settles', async () => {
     const log = vi.fn<(msg: string) => void>();
+    const onForcedTimeout = vi.fn<() => void>();
     // A promise that never settles models the observed beacon-01 deadlock —
     // `agent.stop()` awaiting an in-flight libp2p read that holds forever.
     const cleanup = new Promise<void>(() => {});
 
-    const racePromise = raceShutdownWithTimeout(cleanup, 15_000, log);
+    const racePromise = raceShutdownWithTimeout(cleanup, 15_000, log, onForcedTimeout);
 
     // Just under the deadline: still racing, no log yet.
     await vi.advanceTimersByTimeAsync(14_999);
@@ -99,6 +109,7 @@ describe('raceShutdownWithTimeout', () => {
     const result = await racePromise;
 
     expect(result).toEqual({ forced: true });
+    expect(onForcedTimeout).toHaveBeenCalledTimes(1);
     expect(log).toHaveBeenCalledTimes(1);
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining('[shutdown-timeout]'),
@@ -106,6 +117,25 @@ describe('raceShutdownWithTimeout', () => {
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining('15000ms'),
     );
+  });
+
+  it('logs forced-cleanup errors but still resolves forced=true', async () => {
+    const log = vi.fn<(msg: string) => void>();
+    const cleanup = new Promise<void>(() => {});
+    const racePromise = raceShutdownWithTimeout(
+      cleanup,
+      15_000,
+      log,
+      async () => {
+        throw new Error('state-file cleanup failed');
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    const result = await racePromise;
+
+    expect(result).toEqual({ forced: true });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('forced cleanup error'));
   });
 
   it('clears the timeout when cleanup settles first (no leaked timer)', async () => {

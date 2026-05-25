@@ -25,7 +25,8 @@
 export const SHUTDOWN_HARD_TIMEOUT_MS = 15_000;
 
 /**
- * Forced-shutdown exit codes are the original `exitCode + SHUTDOWN_FORCED_OFFSET`.
+ * Forced-shutdown exit codes are fixed sentinels derived from the shutdown
+ * callsites that exist today:
  *
  *   exitCode 0  -> 100  (operator wanted final exit; cleanup deadlocked)
  *   exitCode 75 -> 175  (operator wanted restart;    cleanup deadlocked, restart still respected)
@@ -44,10 +45,20 @@ export const SHUTDOWN_HARD_TIMEOUT_MS = 15_000;
  *     the "shutdown deadlocked" signal.
  */
 export const SHUTDOWN_FORCED_OFFSET = 100;
-const FORCED_SHUTDOWN_EXIT_CODES = new Set([
-  SHUTDOWN_FORCED_OFFSET,
-  SHUTDOWN_FORCED_OFFSET + 75,
+const FORCED_SHUTDOWN_EXIT_CODES = new Map<number, number>([
+  [SHUTDOWN_FORCED_OFFSET, 0],
+  [SHUTDOWN_FORCED_OFFSET + 75, 75],
 ]);
+
+export function encodeForcedShutdownExitCode(exitCode: number): number {
+  const forcedExitCode = exitCode + SHUTDOWN_FORCED_OFFSET;
+  if (!FORCED_SHUTDOWN_EXIT_CODES.has(forcedExitCode)) {
+    throw new Error(
+      `Unsupported forced shutdown exit code ${exitCode}; add an explicit sentinel before using this shutdown path.`,
+    );
+  }
+  return forcedExitCode;
+}
 
 /**
  * Returns true if `exitCode` is one our shutdown handler emitted because the
@@ -72,7 +83,7 @@ export function decodeForcedExitCode(exitCode: number | null): {
 } {
   if (exitCode === null) return { forced: false, originalExitCode: null };
   if (isForcedShutdownExitCode(exitCode)) {
-    return { forced: true, originalExitCode: exitCode - SHUTDOWN_FORCED_OFFSET };
+    return { forced: true, originalExitCode: FORCED_SHUTDOWN_EXIT_CODES.get(exitCode)! };
   }
   return { forced: false, originalExitCode: exitCode };
 }
@@ -91,6 +102,7 @@ export async function raceShutdownWithTimeout(
   cleanup: Promise<void>,
   hardTimeoutMs: number,
   log: (msg: string) => void,
+  onForcedTimeout?: () => void | Promise<void>,
 ): Promise<{ forced: boolean }> {
   let forced = false;
   let timer: NodeJS.Timeout | null = null;
@@ -101,7 +113,11 @@ export async function raceShutdownWithTimeout(
         `[shutdown-timeout] cleanup exceeded ${hardTimeoutMs}ms; forcing exit. ` +
           `Likely a sync-deadlock in agent.stop(); preserve the preceding 20 log lines for a bug report.`,
       );
-      resolve();
+      Promise.resolve(onForcedTimeout?.())
+        .catch((err: any) => {
+          log(`[shutdown-timeout] forced cleanup error: ${err?.message ?? String(err)}`);
+        })
+        .finally(resolve);
     }, hardTimeoutMs);
   });
   try {

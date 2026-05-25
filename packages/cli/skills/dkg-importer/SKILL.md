@@ -94,10 +94,21 @@ const client = new DkgClient({ token: process.env.DKG_TOKEN });
 await client.ensureProject({ id: 'my-corpus', name: 'My Corpus' });
 await client.ensureSubGraph(client.cgId, 'code');
 
+async function ensureAssertion(client, body) {
+  try {
+    await client.request('POST', '/api/assertion/create', body);
+  } catch (err) {
+    if (err.status === 400 && /already exists/i.test(JSON.stringify(err.body ?? err.message))) {
+      return;
+    }
+    throw err;
+  }
+}
+
 for (const partition of partitions) {                       // one source artefact
   const triples = generateTriples(partition);               // ≤ tens of thousands typical
   const assertionName = `import-${partition.slug}`;
-  await client.request('POST', '/api/assertion/create', {
+  await ensureAssertion(client, {
     contextGraphId: client.cgId,
     name: assertionName,
     subGraphName: 'code',
@@ -135,9 +146,15 @@ BASE = f'http://localhost:{PORT}/api'
 CHUNK = 5000
 ROOT_CHUNK = 1000
 
+def ensure_assertion(cg, name, sg):
+    res = requests.post(f'{BASE}/assertion/create',
+                        headers=H, json={'contextGraphId': cg, 'name': name, 'subGraphName': sg})
+    if res.status_code == 400 and 'already exists' in res.text.lower():
+        return
+    res.raise_for_status()
+
 def write_assertion(cg, name, sg, triples, entities):
-    requests.post(f'{BASE}/assertion/create',
-                  headers=H, json={'contextGraphId': cg, 'name': name, 'subGraphName': sg}).raise_for_status()
+    ensure_assertion(cg, name, sg)
     for i in range(0, len(triples), CHUNK):
         requests.post(f'{BASE}/assertion/{name}/write',
                       headers=H, json={'contextGraphId': cg, 'subGraphName': sg,
@@ -257,7 +274,7 @@ You exceeded the request-body cap with too many N-Quads. Halve and retry:
 try {
   await client.writeOne(slice);
 } catch (err) {
-  if (err.statusCode !== 413) throw err;
+  if (err.status !== 413) throw err;
   // Halve the chunk size for the next attempt; exponential backoff is fine.
   await client.writeOne(slice.slice(0, slice.length / 2));
   await client.writeOne(slice.slice(slice.length / 2));
@@ -285,7 +302,7 @@ async function promoteRoots(assertion, roots, batchSize = 1000) {
         contextGraphId: client.cgId, subGraphName, entities: batch,
       });
     } catch (err) {
-      if (err.statusCode !== 413) throw err;
+      if (err.status !== 413) throw err;
       // Smaller batch and retry the same range.
       i -= batchSize;
       batchSize = Math.max(50, Math.floor(batchSize / 2));
@@ -342,10 +359,11 @@ to confirm who the daemon thinks you are.
 ### Connection errors / 5xx
 
 Standard retry with exponential backoff. The daemon does not implement
-idempotency tokens, but `assertion/create` returns 200 for both first and
-duplicate calls — safe to retry. `assertion/write` is also safe to retry
-with the same payload (duplicate triples are deduped server-side). Retrying
-`assertion/promote` is safe too.
+idempotency tokens. `assertion/write` is safe to retry with the same payload
+(duplicate triples are deduped server-side), and retrying `assertion/promote`
+is safe too. Raw `POST /api/assertion/create` returns HTTP 400 when the
+assertion already exists; higher-level helpers can normalize that into
+idempotent success by treating an `already exists` response as reuse.
 
 ### Daemon restart mid-import
 
@@ -354,8 +372,9 @@ characterises the bug fixed in OriginTrail/dkg#636-639). On resume,
 `loadImportManifest` gives you the "where was I?" answer; if a particular
 assertion's WM state is partial, you can either:
 
-- **Retry the assertion** — `assertion/create` is idempotent and re-running
-  `assertion/write` re-asserts the same triples (no duplication).
+- **Retry the assertion** — treat `assertion/create` "already exists" as reuse
+  (or call a helper that does), then re-run `assertion/write` to re-assert the
+  same triples without duplication.
 - **Discard the partial assertion** with `POST /api/assertion/<name>/discard`
   and start over from your last `done` partition.
 

@@ -380,7 +380,6 @@ export function buildInitialManifestTriples(importId, partitions, startedAtIso) 
  * @param {string} opts.importId        Stable id for this import run (slug-safe)
  * @param {string[]} opts.partitions    Caller-defined partition keys
  * @param {string} opts.subGraphName    Sub-graph that owns the manifest (typically `"meta"`)
- * @param {string} [opts.assertionName] Override the manifest assertion name (default: `"import-manifest-<importId>"`)
  * @returns {Promise<{ assertionName: string, importUri: string }>}
  */
 export async function createImportManifest({
@@ -390,6 +389,11 @@ export async function createImportManifest({
   subGraphName,
   assertionName,
 }) {
+  if (assertionName !== undefined) {
+    throw new Error(
+      'createImportManifest no longer accepts `assertionName`: manifest assertion names are derived from importId so resume/status writes target the same assertion.',
+    );
+  }
   if (!client?.cgId) {
     throw new Error(
       'createImportManifest requires a DkgClient with `cgId` set (call client.ensureProject first).',
@@ -479,7 +483,6 @@ export async function createImportManifest({
  * @param {string} opts.partitionKey
  * @param {string} opts.status
  * @param {string} opts.subGraphName
- * @param {string} [opts.assertionName]
  * @returns {Promise<void>}
  */
 export async function markPartitionStatus({
@@ -490,6 +493,11 @@ export async function markPartitionStatus({
   subGraphName,
   assertionName,
 }) {
+  if (assertionName !== undefined) {
+    throw new Error(
+      'markPartitionStatus no longer accepts `assertionName`: manifest assertion names are derived from importId so resume/status writes target the same assertion.',
+    );
+  }
   if (!client?.cgId) {
     throw new Error('markPartitionStatus requires a DkgClient with `cgId` set.');
   }

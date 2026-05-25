@@ -733,8 +733,8 @@ test('defaultManifestAssertionName sanitizes IRI-unsafe importIds (regression fo
     'long importIds that only differ after the visible cutoff must not collide',
   );
 
-  // No valid characters -> throws with a descriptive error pointing at
-  // the explicit-assertionName workaround instead of a cryptic 400 later.
+  // No valid characters -> throws with a descriptive error instead of a
+  // cryptic 400 later.
   assert.throws(
     () => defaultManifestAssertionName('///'),
     /no characters valid for an assertion name/,
@@ -772,4 +772,30 @@ test('createImportManifest uses sanitized default name for unsafe importIds', as
   });
   assert.equal(state.partitions.length, 1);
   assert.equal(state.partitions[0].key, 'only.ts');
+});
+
+test('manifest helpers reject custom assertionName overrides', async () => {
+  const client = makeMockClient();
+  assert.rejects(
+    () => createImportManifest({
+      client,
+      importId: 'custom-name',
+      partitions: ['a'],
+      subGraphName: 'meta',
+      assertionName: 'custom-assertion',
+    }),
+    /no longer accepts `assertionName`/,
+  );
+
+  assert.rejects(
+    () => markPartitionStatus({
+      client,
+      importId: 'custom-name',
+      partitionKey: 'a',
+      status: 'done',
+      subGraphName: 'meta',
+      assertionName: 'custom-assertion',
+    }),
+    /no longer accepts `assertionName`/,
+  );
 });

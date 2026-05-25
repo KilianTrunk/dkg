@@ -193,6 +193,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       if (this.paused) return null;
 
       const now = this.now();
+      await this.reconcileExpiredRunning(now);
       const candidates = (await this.list()).filter((j) => {
         if (j.state === 'queued') return true;
         if (j.state === 'failed_retrying' && (j.attempt.nextRetryAt ?? 0) <= now) return true;
@@ -336,48 +337,51 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
   async recoverOnStartup(): Promise<PromoteRecoverySummary> {
     return this.withMutationLock(async () => {
       await this.ensureGraph();
-      const now = this.now();
-      const running = await this.list({ state: ['running'] });
+      return this.reconcileExpiredRunning(this.now());
+    });
+  }
 
-      let reclaimed = 0;
-      let abandoned = 0;
+  private async reconcileExpiredRunning(now: number): Promise<PromoteRecoverySummary> {
+    const running = await this.list({ state: ['running'] });
 
-      for (const job of running) {
-        const expiresAt = job.lease?.expiresAt ?? 0;
-        if (expiresAt > now) continue; // lease still valid; worker is fine
+    let reclaimed = 0;
+    let abandoned = 0;
 
-        const conflicting = await this.findActiveByUniquenessKey(uniquenessKey(job.request), job.jobId);
-        if (conflicting) {
-          await this.abandonStartupRecovery(
-            job,
-            now,
-            `recovery conflict: active promote job ${conflicting.jobId} already owns this assertion`,
-            `Startup recovery found active promote job ${conflicting.jobId} for the same assertion`,
-          );
-          abandoned += 1;
-          continue;
-        }
+    for (const job of running) {
+      const expiresAt = job.lease?.expiresAt ?? 0;
+      if (expiresAt > now) continue; // lease still valid; worker is fine
 
-        // The worker records `swmInserted` only after `assertionPromote()`
-        // returns. A crash with the marker still false may have happened before
-        // promote started, or after the internal SWM write but before the marker
-        // write. Without a stronger on-store reconciliation signal, rerun is
-        // unsafe.
+      const conflicting = await this.findActiveByUniquenessKey(uniquenessKey(job.request), job.jobId);
+      if (conflicting) {
         await this.abandonStartupRecovery(
           job,
           now,
-          job.commitMarker?.swmInserted
-            ? 'partial promote ambiguity: lease expired after SWM insert; needs operator inspection'
-            : 'partial promote ambiguity: lease expired before durable SWM marker; needs operator inspection',
-          job.commitMarker?.swmInserted
-            ? 'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip'
-            : 'Worker crashed during promote with no durable commit marker; recovery aborted because SWM state is ambiguous',
+          `recovery conflict: active promote job ${conflicting.jobId} already owns this assertion`,
+          `Startup recovery found active promote job ${conflicting.jobId} for the same assertion`,
         );
         abandoned += 1;
+        continue;
       }
 
-      return { reclaimed, abandoned };
-    });
+      // The worker records `swmInserted` only after `assertionPromote()`
+      // returns. A crash with the marker still false may have happened before
+      // promote started, or after the internal SWM write but before the marker
+      // write. Without a stronger on-store reconciliation signal, rerun is
+      // unsafe.
+      await this.abandonStartupRecovery(
+        job,
+        now,
+        job.commitMarker?.swmInserted
+          ? 'partial promote ambiguity: lease expired after SWM insert; needs operator inspection'
+          : 'partial promote ambiguity: lease expired before durable SWM marker; needs operator inspection',
+        job.commitMarker?.swmInserted
+          ? 'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip'
+          : 'Worker crashed during promote with no durable commit marker; recovery aborted because SWM state is ambiguous',
+      );
+      abandoned += 1;
+    }
+
+    return { reclaimed, abandoned };
   }
 
   async pause(): Promise<void> {

@@ -15,10 +15,13 @@
  */
 
 import type { Quad, QueryResult } from '@origintrail-official/dkg-storage';
-import type {
-  PromoteJob,
-  PromoteJobState,
-  PromoteRequest,
+import {
+  PROMOTE_JOB_STATES,
+  type PromoteCommitMarker,
+  type PromoteJob,
+  type PromoteJobState,
+  type PromoteLease,
+  type PromoteRequest,
 } from './async-promote-queue-types.js';
 
 export const DEFAULT_PROMOTE_CONTROL_GRAPH_URI = 'urn:dkg:promote-queue:control-plane';
@@ -139,6 +142,41 @@ export function serializeJob(job: PromoteJob, graphUri: string): Quad[] {
   return quads;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isPromoteRequest(value: unknown): value is PromoteRequest {
+  if (!isRecord(value)) return false;
+  if (typeof value['contextGraphId'] !== 'string' || value['contextGraphId'].length === 0) return false;
+  if (typeof value['assertionName'] !== 'string' || value['assertionName'].length === 0) return false;
+  if (value['subGraphName'] !== undefined && typeof value['subGraphName'] !== 'string') return false;
+  const entities = value['entities'];
+  if (entities === 'all') return true;
+  return Array.isArray(entities) && entities.every((e) => typeof e === 'string' && e.length > 0);
+}
+
+function isLease(value: unknown): value is PromoteLease {
+  return isRecord(value) &&
+    typeof value['workerId'] === 'string' &&
+    isFiniteNumber(value['acquiredAt']) &&
+    isFiniteNumber(value['expiresAt']) &&
+    isFiniteNumber(value['lastHeartbeatAt']) &&
+    typeof value['claimToken'] === 'string';
+}
+
+function isCommitMarker(value: unknown): value is PromoteCommitMarker {
+  return isRecord(value) &&
+    typeof value['swmInserted'] === 'boolean' &&
+    typeof value['wmCleaned'] === 'boolean' &&
+    typeof value['lifecycleStamped'] === 'boolean' &&
+    typeof value['gossiped'] === 'boolean';
+}
+
 /**
  * Parse a `payload` binding back into a full `PromoteJob`. Returns null
  * if the literal is malformed (corrupted payload) — the queue logs and
@@ -149,9 +187,25 @@ export function parseJobPayload(binding: string | undefined): PromoteJob | null 
   try {
     const payload = parseLiteral(binding);
     if (typeof payload !== 'string') return null;
-    const parsed = JSON.parse(payload) as PromoteJob;
-    if (!parsed.jobId || !parsed.state) return null;
-    return parsed;
+    const parsed = JSON.parse(payload);
+    if (!isRecord(parsed)) return null;
+    if (typeof parsed['jobId'] !== 'string' || parsed['jobId'].length === 0) return null;
+    if (!(PROMOTE_JOB_STATES as readonly string[]).includes(String(parsed['state']))) return null;
+    if (!isPromoteRequest(parsed['request'])) return null;
+    if (!isFiniteNumber(parsed['enqueuedAt']) || !isFiniteNumber(parsed['updatedAt'])) return null;
+    if (!isRecord(parsed['attempt'])) return null;
+    if (!isFiniteNumber(parsed['attempt']['count']) || !isFiniteNumber(parsed['attempt']['maxRetries'])) {
+      return null;
+    }
+    if (
+      parsed['attempt']['nextRetryAt'] !== undefined &&
+      !isFiniteNumber(parsed['attempt']['nextRetryAt'])
+    ) {
+      return null;
+    }
+    if (parsed['lease'] !== undefined && !isLease(parsed['lease'])) return null;
+    if (parsed['commitMarker'] !== undefined && !isCommitMarker(parsed['commitMarker'])) return null;
+    return parsed as unknown as PromoteJob;
   } catch {
     return null;
   }

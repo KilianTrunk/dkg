@@ -16,6 +16,9 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import {
   DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+  PROMOTE_PAYLOAD,
+  PROMOTE_STATE,
+  literal,
   serializeJob,
   uniquenessKey,
 } from '../src/async-promote-queue-utils.js';
@@ -451,6 +454,19 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     await expect(queue.heartbeat(jobId, firstToken)).rejects.toBeInstanceOf(PromoteJobLeaseError);
   });
 
+  it('21c. claimNext() reconciles expired running jobs before scanning candidates', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    await queue.claimNext('worker-1');
+    advance(60_000);
+
+    expect(await queue.claimNext('worker-2')).toBeNull();
+    expect((await queue.getStatus(jobId))?.state).toBe('failed');
+
+    const replacement = await queue.enqueue(makeRequest());
+    expect(replacement).toBe('job-2');
+  });
+
   it('22. claimNext() does NOT pick up failed_retrying before nextRetryAt', async () => {
     const queue = createQueue({ backoff: () => 60_000 });
     const jobId = await queue.enqueue(makeRequest());
@@ -763,5 +779,27 @@ describe('TripleStoreAsyncPromoteQueue', () => {
 
     const all = await queue.list();
     expect(all.length).toBe(3);
+  });
+
+  it('33. list() skips corrupted payload rows with missing nested fields', async () => {
+    const queue = createQueue();
+    await queue.enqueue(makeRequest({ assertionName: 'valid' }));
+    await store.insert([
+      {
+        subject: 'urn:dkg:promote-queue:job:corrupt',
+        predicate: PROMOTE_STATE,
+        object: literal('queued'),
+        graph: DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+      },
+      {
+        subject: 'urn:dkg:promote-queue:job:corrupt',
+        predicate: PROMOTE_PAYLOAD,
+        object: literal(JSON.stringify({ jobId: 'corrupt', state: 'queued' })),
+        graph: DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+      },
+    ]);
+
+    const jobs = await queue.list();
+    expect(jobs.map((j) => j.request.assertionName)).toEqual(['valid']);
   });
 });

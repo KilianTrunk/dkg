@@ -98,6 +98,35 @@ export interface StorageACKHandlerConfig {
    *     local access-policy record without a chain RPC.
    */
   isCgCurated?: (cgId: string, swmGraphId?: string) => Promise<boolean | null>;
+  /**
+   * Codex PR #608 R1 #2 — publish-finalization callback. Called immediately
+   * AFTER the handler has persisted the encrypted-payload staging graph
+   * and signed an ACK, with the `(stagingGraphUri, cgId, merkleRoot)`
+   * triple. The agent (which owns the chain-event subscriber) is expected
+   * to register the staging-graph URI against the (cgId, merkleRoot) key
+   * and drop it when the V10 publish finalizes (success or permanent
+   * failure).
+   *
+   * The handler ALSO arms a long-window safety-net timer (default 60 min)
+   * as a fallback for nodes without finalization hooks wired. The
+   * safety net is configurable via `encryptedStagingSafetyNetMs`; agents
+   * that wire a real finalization hook can set this to `Infinity` to
+   * disable the timer entirely.
+   *
+   * Optional: handlers without this hook continue to rely on the
+   * safety-net timer (current behaviour).
+   */
+  onEncryptedStagingPersisted?: (info: {
+    stagingGraphUri: string;
+    cgId: string;
+    merkleRoot: Uint8Array;
+  }) => void | Promise<void>;
+  /**
+   * Codex PR #608 R1 #2 — safety-net cleanup window for encrypted staging
+   * graphs (default 60 * 60 * 1000 = 60 min). Set to `Infinity` to disable
+   * timer-based cleanup entirely when a finalization hook is wired.
+   */
+  encryptedStagingSafetyNetMs?: number;
 }
 
 /**
@@ -265,31 +294,40 @@ export class StorageACKHandler {
         object: ciphertextLiteral,
         graph: stagingGraphUri,
       }]);
-      // Codex PR #608: the previous 10-minute timer ran from the moment
-      // we persisted ciphertext — well BEFORE the publish outcome was
-      // known. Under realistic chain latency (mainnet block confirmation
-      // can exceed 10 min during congestion; testnets can stall longer)
-      // the timer would unconditionally drop the ciphertext before the
-      // V10 publish landed, breaking the "persist-before-sign" contract
-      // and starving any LU-7 catch-up requests that arrived after the
-      // drop. We extend the reap window to 60 minutes as a conservative
-      // upper-bound on chain confirmation, knowing that:
-      //   (1) The LU-6 `SwmHostModeStore` is the DURABLE copy for
-      //       opaque ciphertext on participating cores — members catch
-      //       up from there once the CG is on-chain, so this staging
-      //       graph is just bridge storage between ACK-sign and the
-      //       first successful catch-up; 60 min comfortably covers a
-      //       slow chain plus one member-catchup round-trip.
-      //   (2) The 4MB-per-payload cap + per-CG quotas already bound
-      //       staging growth, so extending the timer doesn't open a
-      //       new resource exhaustion vector.
-      // TODO: replace the timer with a publish-finalization hook so
-      // cleanup runs exactly when the V10 tx is confirmed (or
-      // permanently failed). The 60-min reap is a safety net, not the
-      // primary cleanup path.
-      setTimeout(async () => {
-        try { await this.store.dropGraph(stagingGraphUri); } catch { /* ignore */ }
-      }, 60 * 60 * 1000);
+      // Codex PR #608 R1 #2: cleanup is now tied to publish-finalization
+      // bookkeeping. When the agent wires `onEncryptedStagingPersisted`
+      // it owns the cleanup — typically by listening to V10 chain events
+      // and calling `dropGraph(stagingGraphUri)` when the publish tx
+      // finalizes (success OR permanent failure). The safety-net timer
+      // below is a fallback for nodes without that hook wired.
+      //
+      // Without a hook, default safety net is 60 min — long enough to
+      // cover slow mainnet confirmation + at least one LU-7 catchup
+      // round-trip. With a hook, the agent can pass
+      // `encryptedStagingSafetyNetMs: Infinity` to disable the timer
+      // entirely.
+      if (this.config.onEncryptedStagingPersisted) {
+        try {
+          await this.config.onEncryptedStagingPersisted({
+            stagingGraphUri,
+            cgId,
+            merkleRoot,
+          });
+        } catch (err) {
+          // Best-effort: the hook is bookkeeping, not load-bearing.
+          // The safety net timer below still fires.
+          console.warn(
+            '[StorageACKHandler] onEncryptedStagingPersisted hook threw:',
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      }
+      const safetyNetMs = this.config.encryptedStagingSafetyNetMs ?? 60 * 60 * 1000;
+      if (Number.isFinite(safetyNetMs) && safetyNetMs > 0) {
+        setTimeout(async () => {
+          try { await this.store.dropGraph(stagingGraphUri); } catch { /* ignore */ }
+        }, safetyNetMs);
+      }
 
       // Cores can't enumerate KAs from ciphertext — use the publisher's
       // claimed counts for the V10 digest. Validate they're positive so

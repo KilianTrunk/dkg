@@ -211,7 +211,7 @@ export async function createContextGraph(
   id: string,
   name: string,
   description?: string,
-  opts?: { allowedAgents?: string[]; accessPolicy?: number; publishPolicy?: number },
+  opts?: { allowedAgents?: string[]; accessPolicy?: number; publishPolicy?: number; register?: boolean },
 ): Promise<{ created: string; uri: string; registered?: boolean; onChainId?: string; registerError?: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
@@ -221,12 +221,14 @@ export async function createContextGraph(
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         id, name, description,
-        // UI primary "Create project" always wants an on-chain CG —
-        // otherwise the user can't publish to Verified Memory (the
-        // publish path requires an on-chain CG id). The modal already
-        // tells the user "Registering context graph on the network…",
-        // so the combined create+register flow matches the UX promise.
-        register: true,
+        // Codex PR #608 R1/R2 #5/#8: registration is opt-in (`opts.register`),
+        // not hard-coded. The previous always-`register: true` broke the
+        // local-first CG contract: unfunded / offline / no-RPC users got a
+        // hard create failure instead of a usable local project (matches
+        // what the user actually complained about: "wait, it will register
+        // on chain immediately, meaning I need tokens when I create a CG?").
+        // The modal explicitly passes `register: true` when the user opts in.
+        ...(opts?.register ? { register: true } : {}),
         ...(opts?.allowedAgents ? { allowedAgents: opts.allowedAgents } : {}),
         ...(opts?.accessPolicy !== undefined ? { accessPolicy: opts.accessPolicy } : {}),
         ...(opts?.publishPolicy !== undefined ? { publishPolicy: opts.publishPolicy } : {}),

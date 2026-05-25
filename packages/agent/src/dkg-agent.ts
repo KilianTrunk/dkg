@@ -6486,9 +6486,16 @@ export class DKGAgent {
     // defeats the point. PublishOpts here doesn't carry an explicit
     // authorAgentAddress, so we let _resolveEncryptInlinePayload fall back
     // to `defaultAgentAddress ?? peerId`.
+    //
+    // Codex PR #608 R2 #12: thread the target on-chain CG id through so
+    // the AEAD key derives from the canonical id consumers will use to
+    // verify/decrypt the published KC. Falls back to the source id when
+    // there's no remap, which is the common case.
     const encryptInlinePayload = await this._resolveEncryptInlinePayload(
       contextGraphId,
       opts?.subGraphName,
+      undefined,
+      onChainId ?? undefined,
     );
 
     const result = await this.publisher.publish({
@@ -7356,6 +7363,7 @@ export class DKGAgent {
     contextGraphId: string,
     subGraphName?: string,
     authorAgentAddress?: string,
+    publishContextGraphId?: string,
   ): Promise<((plaintext: Uint8Array) => Promise<Uint8Array>) | undefined> {
     const ctx = createOperationContext('publish');
     let isCurated = false;
@@ -7371,34 +7379,88 @@ export class DKGAgent {
       ?? this.defaultAgentAddress
       ?? this.peerId;
     const stateKey = swmSenderStateKey(contextGraphId, subGraphName, senderAddress);
-    const state = this.swmSenderKeySendStates.get(stateKey);
+    let state = this.swmSenderKeySendStates.get(stateKey);
     if (!state) {
-      // Codex PR #608: fail closed. The pre-fix behaviour returned
-      // `undefined` here, which silently sent the publisher into its
-      // PLAINTEXT-inline fallback for a CURATED CG — the exact data
-      // leak this resolver is meant to prevent. Even when cores
-      // would (today) decline plaintext for curated CGs with
-      // NO_DATA_IN_SWM, the ack handler still RECEIVES the plaintext
-      // in the PublishIntent's `stagingQuads`, and any core upgraded
-      // to handle plaintext-inline (or any malicious core) would
-      // hold the cleartext payload of an invite-only graph. Throw
-      // so the caller surfaces an actionable error to the user
-      // instead of leaking.
-      throw new Error(
-        `LU-5: curated CG ${contextGraphId} (sender=${senderAddress}${subGraphName ? `/${subGraphName}` : ''}) ` +
-        `has no swm-sender-key send state — refusing to publish to Verified Memory because falling back ` +
-        `to the plaintext-inline path would expose curated CG payload to cores. ` +
-        `Establish the send state by writing at least one SWM share to this CG (this gossips a ` +
-        `sender-key bootstrap to current members) before retrying the publish.`,
+      // Codex PR #608 R2/R3: prior fail-closed behaviour threw here
+      // and required callers to manually `share()` first. That made
+      // the headline "edge curator creates + publishes" flow break
+      // on the very first publish for any freshly registered CG.
+      //
+      // Bootstrap the sender-key epoch inline using the SAME helper
+      // `share()` uses (`createAndDistributeSwmSenderKeyEpoch`). This
+      // gossips the bootstrap to all current recipients and persists
+      // the state, exactly as a prior SWM write would have. After
+      // this branch the closure below has a chainKey to encrypt with
+      // — no plaintext fallback, no manual workaround.
+      await this.loadSwmSenderKeyState();
+      const sender = this.getLocalSigningAgentForAddress(senderAddress);
+      if (!sender) {
+        throw new Error(
+          `LU-5: curated CG ${contextGraphId}: cannot bootstrap swm-sender-key — ` +
+          `no local custodial signing key for agent ${senderAddress}. ` +
+          `Refusing to publish curated CG payload via the plaintext-inline fallback.`,
+        );
+      }
+      const resolution = await resolveWorkspaceAgentRecipients(this.store, { contextGraphId });
+      if (!resolution.requiresEncryption) {
+        // Access policy lookup said curated, but the recipient resolver
+        // disagrees. Conservative: refuse rather than silently downgrade.
+        throw new Error(
+          `LU-5: curated CG ${contextGraphId}: access-policy says curated but recipient resolver ` +
+          `returned no agent recipients. Refusing to publish to avoid plaintext leak.`,
+        );
+      }
+      if (resolution.recipients.length === 0) {
+        throw new Error(
+          `LU-5: curated CG ${contextGraphId}: no DKG agent recipients available — ` +
+          `add at least one allowed agent before publishing.`,
+        );
+      }
+      const recipientSet = new Set(resolution.recipients.map((r) => r.agentAddress.toLowerCase()));
+      if (!recipientSet.has(ethers.getAddress(senderAddress).toLowerCase())) {
+        throw new Error(
+          `LU-5: curated CG ${contextGraphId}: sender ${senderAddress} is not in the recipient set — ` +
+          `add yourself to the allowedAgents before publishing.`,
+        );
+      }
+      const membershipHash = computeSwmSenderKeyMembershipHash({
+        contextGraphId,
+        subGraphName,
+        members: resolution.recipients.map((r) => ({
+          agentAddress: r.agentAddress,
+          recipientKeyId: r.recipientKeyId,
+        })),
+      });
+      this.log.info(
+        ctx,
+        `LU-5: bootstrapping swm-sender-key epoch for first-publish on curated CG ${contextGraphId} ` +
+        `(sender=${senderAddress}, recipients=${resolution.recipients.length})`,
       );
+      state = await this.createAndDistributeSwmSenderKeyEpoch({
+        contextGraphId,
+        subGraphName,
+        sender,
+        recipients: resolution.recipients,
+        membershipHash,
+        ctx,
+      });
+      this.swmSenderKeySendStates.set(stateKey, state);
+      await this.saveSwmSenderKeyState();
     }
 
     const chainKey = state.chainKey;
-    const cgId = contextGraphId;
+    // Codex PR #608 R2 #12: the AEAD key must be derived from the
+    // *target* on-chain CG id (the one the published KC is bound to
+    // on chain) — not the source SWM CG id. On remap publishes
+    // (where the source `contextGraphId` differs from the target
+    // `publishContextGraphId`/`onChainId`), consumers verifying the
+    // KC use the canonical on-chain id; if we derive with the
+    // source id here, every consumer's decrypt fails.
+    const aeadCgId = publishContextGraphId ?? contextGraphId;
     return async (plaintextNquads: Uint8Array): Promise<Uint8Array> => {
       return encryptV10PublishPayload({
         chainKey,
-        contextGraphId: cgId,
+        contextGraphId: aeadCgId,
         plaintext: plaintextNquads,
       });
     };
@@ -7710,10 +7772,16 @@ export class DKGAgent {
     // AEAD using the publisher's swm-sender-key chainKey so cores hold
     // opaque bytes, not plaintext. Public CGs leave this undefined and
     // continue with the existing plaintext-inline path.
+    //
+    // Codex PR #608 R2 #12: bind AEAD to the target on-chain CG id
+    // (`onChainId`) so consumers using the canonical chain id can
+    // decrypt — without this, remap publishes (source SWM cg != target
+    // chain cg) produced undecryptable payloads.
     const encryptInlinePayload = await this._resolveEncryptInlinePayload(
       contextGraphId,
       options?.subGraphName,
       options?.authorAgentAddress,
+      onChainId ?? undefined,
     );
     if (encryptInlinePayload) {
       this.log.info(ctx, `LU-5: curated CG ${contextGraphId} — wrapping inline ACK payload with chain-key AEAD`);

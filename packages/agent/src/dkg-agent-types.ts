@@ -148,6 +148,37 @@ export class SyncAccessDeniedError extends Error {
   }
 }
 
+/**
+ * Thrown by `acceptSwmSenderKeyPackage` when an inbound sender-key
+ * setup package is targeted at a `recipientKeyId` we don't host as an
+ * active local X25519 private key. This is the routine, benign outcome
+ * when a sender fans the bootstrap out across every cached snapshot of
+ * our agent's public encryption keys (e.g. registry observations from
+ * before a rotation): one bootstrap per stale fingerprint lands here,
+ * only the bootstrap that targets the currently active key passes.
+ *
+ * Distinct from a generic `Error` so the receive handler can route this
+ * outcome to DEBUG (silenced from `daemon.log`) while leaving genuine
+ * security/protocol failures (signature mismatch, gate violation,
+ * non-local recipient, revoked-key targeting) at WARN. See PR
+ * `chore/swm-sender-key-stale-noise` for the operator-noise context.
+ *
+ * The thrown message is preserved verbatim from the original WARN so
+ * any external log scrapers that grepped for the legacy string keep
+ * matching: `No local X25519 private key for DKG agent <addr> key <id>`.
+ */
+export class StaleSenderKeyTargetError extends Error {
+  readonly code = 'StaleSenderKeyTarget';
+  readonly recipientAgentAddress: string;
+  readonly recipientKeyId: string;
+  constructor(recipientAgentAddress: string, recipientKeyId: string) {
+    super(`No local X25519 private key for DKG agent ${recipientAgentAddress} key ${recipientKeyId}`);
+    this.name = 'StaleSenderKeyTargetError';
+    this.recipientAgentAddress = recipientAgentAddress;
+    this.recipientKeyId = recipientKeyId;
+  }
+}
+
 // ── Publish surface ─────────────────────────────────────────────────
 
 export interface CclPublishedResultEntry {

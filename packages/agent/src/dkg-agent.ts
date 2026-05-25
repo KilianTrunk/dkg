@@ -12421,10 +12421,37 @@ export class DKGAgent {
     // matching write side.
     const delegationUri = `did:dkg:agent-delegation:${contextGraphId}:${agentAddress.toLowerCase()}`;
     await this.store.deleteByPattern({ graph: cgMetaGraph, subject: delegationUri });
+    // Persist a LOCAL tombstone so the recipient resolver excludes this
+    // agent from future sender-key wraps even when peer-sync has
+    // replicated the original `dkg:allowedAgent` triple onto this store
+    // (happens whenever multiple peers pre-create the CG with the same
+    // initial allowlist — see C1 devnet harness). Without the tombstone
+    // the delete above is racy: a fresh sync round can re-insert the
+    // revoked agent before the curator's next write resolves recipients,
+    // and the next sender-key epoch ends up wrapped for them too — a
+    // silent post-revoke read by a kicked member.
+    await this.store.insert([{
+      graph: cgMetaGraph,
+      subject: contextGraphUri,
+      predicate: DKG_ONTOLOGY.DKG_REVOKED_AGENT,
+      object: `"${agentAddress}"`,
+    }]);
     this.deleteContextGraphMember(contextGraphId, 'agent', agentAddress);
     this.queueSharedMemoryGossipSubscription(contextGraphId);
+    // Drop any cached sender-key send state for this CG so the next
+    // write re-resolves recipients (now excluding the revoked agent
+    // via the tombstone) and mints a fresh epoch. Without this the
+    // curator would keep using the pre-revoke chain key + epoch, which
+    // was already distributed to the revoked agent.
+    const cgPrefix = `${contextGraphId}\0`;
+    for (const key of [...this.swmSenderKeySendStates.keys()]) {
+      if (key.startsWith(cgPrefix)) {
+        this.swmSenderKeySendStates.delete(key);
+      }
+    }
+    await this.saveSwmSenderKeyState();
 
-    this.log.info(ctx, `Removed agent ${agentAddress} from context graph "${contextGraphId}"`);
+    this.log.info(ctx, `Removed agent ${agentAddress} from context graph "${contextGraphId}" (tombstoned)`);
   }
 
   /**
@@ -12496,18 +12523,42 @@ export class DKGAgent {
   async getContextGraphAllowedAgents(contextGraphId: string): Promise<string[]> {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
+    // Subtract `dkg:revokedAgent` tombstones from the allowlist union
+    // so a curator who has called `removeAgentFromContextGraph` sees
+    // their authoritative view, not the union with peer-sync-replicated
+    // copies of the original allowlist. Without this, the /participants
+    // endpoint and every sync-auth check that consults this method would
+    // silently re-include a revoked agent the moment another node's
+    // local CG metadata gossiped back (see C1 devnet harness for the
+    // reproducer + `removeAgentFromContextGraph` for the write side).
     const result = await this.store.query(
-      `SELECT ?agent WHERE {
-        GRAPH <${cgMetaGraph}> {
-          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent
+      `SELECT ?agent ?revoked WHERE {
+        {
+          GRAPH <${cgMetaGraph}> {
+            <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent
+          }
+        } UNION {
+          GRAPH <${cgMetaGraph}> {
+            <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_REVOKED_AGENT}> ?revoked
+          }
         }
       }`,
     );
     if (result.type !== 'bindings') return [];
-    return result.bindings
-      .map((row) => (row as Record<string, string>)['agent'])
-      .filter((v): v is string => typeof v === 'string')
-      .map((v) => v.replace(/^"|"$/g, ''));
+    const allowed: string[] = [];
+    const revoked = new Set<string>();
+    for (const row of result.bindings) {
+      const a = (row as Record<string, string>)['agent'];
+      const r = (row as Record<string, string>)['revoked'];
+      if (typeof a === 'string') {
+        allowed.push(a.replace(/^"|"$/g, ''));
+      }
+      if (typeof r === 'string') {
+        revoked.add(r.replace(/^"|"$/g, '').toLowerCase());
+      }
+    }
+    if (revoked.size === 0) return allowed;
+    return allowed.filter((addr) => !revoked.has(addr.toLowerCase()));
   }
 
   // ---------------------------------------------------------------------------
@@ -16304,23 +16355,19 @@ export class DKGAgent {
   }
 
   private async getContextGraphOwner(contextGraphId: string): Promise<string | null> {
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     // Prefer the curator (wallet-scoped owner) so per-agent authorization
     // works on multi-agent nodes. Fall back to the creator (libp2p peer ID)
     // for legacy CGs created before the curator triple existed.
-    const curatorResult = await this.store.query(`
-      SELECT ?owner WHERE {
-        GRAPH <${cgMetaGraph}> {
-          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?owner .
-        }
-      }
-      LIMIT 1
-    `);
-    if (curatorResult.type === 'bindings' && curatorResult.bindings.length > 0) {
-      const owner = (curatorResult.bindings[0] as Record<string, string>)['owner'];
-      if (owner) return owner;
-    }
+    //
+    // Delegates to `getContextGraphCurator`, which already handles the
+    // "multiple `dkg:curator` triples on the same local store" hazard
+    // (peer sync replicates foreign curator triples) by preferring a
+    // LOCAL agent's DID before falling back to the first row. Without
+    // that preference, the LIMIT-1 lookup here would non-deterministically
+    // pick a foreign curator and lock the real local curator out of
+    // manage-participants / rename / policy operations.
+    const curatorOwner = await this.getContextGraphCurator(contextGraphId);
+    if (curatorOwner) return curatorOwner;
     const fromCreator = await this.getContextGraphCreator(contextGraphId);
     if (fromCreator) return fromCreator;
     // Final fallback: V10 wallet-scoped cgId convention (`0x.../<name>`)
@@ -16347,19 +16394,51 @@ export class DKGAgent {
   private async getContextGraphCurator(contextGraphId: string): Promise<string | null> {
     const cgMetaGraph = contextGraphMetaUri(contextGraphId);
     const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+    // Multi-curator scenario: peer-to-peer sync of CG `_meta` triples
+    // can replicate FOREIGN `dkg:curator` triples onto a node's local
+    // store. The original behaviour (`LIMIT 1`) made ownership lookup
+    // non-deterministic — any subscribing node could win the unordered
+    // query, locking the real curator out of their own CG-management
+    // operations (revoke, rename, policy edits). Comment at
+    // `ensureContextGraphLocal` (~13754) already documents this hazard
+    // for the bootstrap path; the same fix applies at lookup time so
+    // we're robust to any future re-introduction of foreign-curator
+    // syncing.
+    //
+    // Resolution: enumerate ALL curator triples and prefer one that
+    // matches a LOCAL agent (the node's own peer-id DID, any of its
+    // wallet-scoped agents, or the default-agent DID). Falls back to
+    // the first curator triple when no local match exists, preserving
+    // the legacy "subscriber sees foreign owner" semantics for
+    // membership/UI queries against CGs this node did not curate.
     const curatorResult = await this.store.query(`
       SELECT ?owner WHERE {
         GRAPH <${cgMetaGraph}> {
           <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?owner .
         }
       }
-      LIMIT 1
     `);
-    if (curatorResult.type === 'bindings' && curatorResult.bindings.length > 0) {
-      const owner = (curatorResult.bindings[0] as Record<string, string>)['owner'];
-      if (owner) return owner;
+    if (curatorResult.type !== 'bindings' || curatorResult.bindings.length === 0) {
+      return null;
     }
-    return null;
+    const owners: string[] = [];
+    for (const b of curatorResult.bindings) {
+      const o = (b as Record<string, string>)['owner'];
+      if (o) owners.push(o);
+    }
+    if (owners.length === 0) return null;
+    if (owners.length === 1) return owners[0];
+    const selfDid = `did:dkg:agent:${this.peerId}`;
+    const localAgentDids = new Set<string>();
+    localAgentDids.add(selfDid);
+    if (this.defaultAgentAddress) {
+      localAgentDids.add(`did:dkg:agent:${this.defaultAgentAddress}`);
+    }
+    for (const addr of this.localAgents.keys()) {
+      localAgentDids.add(`did:dkg:agent:${addr}`);
+    }
+    const localOwner = owners.find((o) => localAgentDids.has(o));
+    return localOwner ?? owners[0];
   }
 
   /**

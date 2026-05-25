@@ -257,6 +257,18 @@ export const DKG_ONTOLOGY = {
   DKG_CURATOR: `${DKG}curator`,
   DKG_ALLOWED_PEER: `${DKG}allowedPeer`,
   DKG_ALLOWED_AGENT: `${DKG}allowedAgent`,
+  // Local-only tombstone for an agent revoked from a curated CG.
+  // Subject = the CG URI; object = the revoked agent address literal
+  // (same shape as DKG_ALLOWED_AGENT). The recipient resolver subtracts
+  // this set from the union of allowed/participant agents so a curator
+  // can lock out a member even when peer sync has re-replicated the
+  // original `DKG_ALLOWED_AGENT` triple from another node's local copy
+  // of the CG metadata. Tombstone is intentionally NOT gossiped — the
+  // curator's local store is authoritative for sender-key membership
+  // on the curator's writes; remote nodes maintain their own tombstones
+  // independently (and learn about the revocation through the absence
+  // of future sender-key packages for the revoked agent).
+  DKG_REVOKED_AGENT: `${DKG}revokedAgent`,
   DKG_AGENT_ADDRESS: `${DKG}agentAddress`,
   DKG_AGENT_MODE: `${DKG}agentMode`,
   DKG_PUBLIC_ENCRYPTION_KEY: `${DKG}publicEncryptionKey`,

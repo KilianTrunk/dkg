@@ -78,29 +78,84 @@ function loadDenyList() {
   if (!Array.isArray(parsed.denied_files)) {
     fail(2, `${DENY_LIST_PATH} missing or malformed denied_files[].`);
   }
-  if (!parsed.scanner_sanity_check?.expected_package_in_lockfile) {
-    fail(2, `${DENY_LIST_PATH} missing scanner_sanity_check.expected_package_in_lockfile.`);
+  if (!Array.isArray(parsed.scanner_sanity_check?.expected_packages_in_lockfile)
+      || parsed.scanner_sanity_check.expected_packages_in_lockfile.length === 0) {
+    fail(2, `${DENY_LIST_PATH} missing scanner_sanity_check.expected_packages_in_lockfile[] (must contain at least one anchor).`);
+  }
+
+  // Detect duplicate entries — a duplicate name in the JSON would
+  // produce duplicate annotations on a hit and signal that the list
+  // is being maintained sloppily. Belt-and-braces against accidental
+  // copy-paste during a bulk add.
+  const seenNames = new Set();
+  const dupes = [];
+  for (const entry of parsed.denied_package_names) {
+    if (!entry?.name) {
+      fail(2, `${DENY_LIST_PATH}: denied_package_names[] entry missing .name field: ${JSON.stringify(entry)}`);
+    }
+    if (seenNames.has(entry.name)) dupes.push(entry.name);
+    seenNames.add(entry.name);
+  }
+  const seenPaths = new Set();
+  for (const entry of parsed.denied_files) {
+    if (!entry?.path) {
+      fail(2, `${DENY_LIST_PATH}: denied_files[] entry missing .path field: ${JSON.stringify(entry)}`);
+    }
+    if (seenPaths.has(entry.path)) dupes.push(entry.path);
+    seenPaths.add(entry.path);
+  }
+  if (dupes.length > 0) {
+    fail(2, `${DENY_LIST_PATH}: duplicate entries detected (${dupes.join(', ')}); deduplicate before committing.`);
   }
   return parsed;
 }
 
 /**
- * Build a regex that matches a package NAME (not a substring of a longer
- * name). Package names in pnpm-lock.yaml appear in several positions:
+ * Build a regex that matches a package NAME as a whole token (not a
+ * substring of a longer name). Package names appear in many positions
+ * across pnpm-lock.yaml and package.json. Examples that MUST match:
  *
- *   /pkg-name@x.y.z:           ← snapshots block, leading `/`
- *   pkg-name:                  ← importers / specifiers
- *   'pkg-name@x.y.z':          ← quoted keys
- *   "pkg-name@x.y.z":          ← double-quoted
+ *     pkg-name:                       ← pnpm v9 importer dep block
+ *     pkg-name@x.y.z:                 ← pnpm v9 snapshot key
+ *     /pkg-name@x.y.z:                ← pnpm v8 snapshot key (legacy)
+ *     pkg-name@x.y.z(peer@y.y.y):     ← pnpm v9 peer-suffixed snapshot
+ *     pkg-name@<x.y.z: y.y.y          ← overrides / patchedDependencies
+ *     '@scope/pkg@x.y.z':             ← scoped, quoted snapshot key
+ *     "pkg-name": "^x.y.z"            ← package.json dep
  *
- * The left and right edge characters must NOT be part of a valid npm
- * package name char ([a-z0-9-._/]) — that prevents matching e.g.
- * `defi-env-auditor` inside `super-defi-env-auditor-pro` if a future
- * legitimate package shares a substring.
+ * Strategy: a name-continuation character is any of [a-zA-Z0-9._-].
+ * That is the set of chars a valid npm name (outside the `@scope/`
+ * prefix marker) can be made of. The boundary then is the negation of
+ * that set — anything else (`@`, `/`, `:`, quote, space, `(`, `)`, `<`,
+ * end-of-line, …) is a valid boundary.
+ *
+ * Left side: start-of-string OR a non-continuation char.
+ * Right side: a NEGATIVE LOOKAHEAD for a continuation char so the regex
+ * does not consume the next character (and so the boundary itself can
+ * be any non-continuation char, including end-of-string).
+ *
+ * Properties:
+ *   - 'super-commander-pro' does NOT match 'commander' (the `-` adjacent
+ *     to `commander` fails the boundary check on both sides).
+ *   - 'commander-extras' does NOT match 'commander' (trailing `-`).
+ *   - '@types/commander' does NOT match 'commander' alone (the `/`
+ *     before `commander` is a valid boundary, but the intent is that
+ *     the deny-list entry for that scoped package would itself be
+ *     '@types/commander' — listing the unscoped 'commander' SHOULD NOT
+ *     match the scoped package's path component, which it does not).
+ *     The trailing context is fine; the rule is checked left+right.
+ *     If the lockfile contains '@types/commander': the char before
+ *     'commander' is `/` (not a continuation char) and the char after
+ *     is `'` (not a continuation char), so the regex WOULD match.
+ *     This is a known false-positive shape: if a future deny-list
+ *     entry is the unscoped name, callers should be aware that the
+ *     scanner cannot distinguish a scope-suffix from a top-level name.
+ *     None of the current 21 TrapDoor entries collide with anything
+ *     scoped in our tree (verified by the clean-run sanity check).
  */
 function buildNameMatcher(name) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(^|[^a-z0-9._/@-])${escaped}(@|/|"|'|:|\\s|$)`, 'm');
+  return new RegExp(`(^|[^a-zA-Z0-9._-])${escaped}(?![a-zA-Z0-9._-])`, 'm');
 }
 
 function scanFileForNames(filePath, deniedNames) {
@@ -141,15 +196,20 @@ function findPackageJsonFiles(dir) {
   return out;
 }
 
-function checkLockfileSanity(sanityName) {
+function checkLockfileSanity(sanityNames) {
   const path = join(repoRoot, LOCKFILE_PATH);
   if (!existsSync(path)) {
     fail(2, `${LOCKFILE_PATH} not found at repo root; the lockfile must exist for the deny-list scan to mean anything.`);
   }
   const content = readFileSync(path, 'utf-8');
-  if (!buildNameMatcher(sanityName).test(content)) {
-    fail(2, `Sanity check failed: expected '${sanityName}' to appear in ${LOCKFILE_PATH}, but the scanner did not find it. This means either the lockfile path/format has drifted or the matcher regex is broken. Refusing to report clean. Update scanner_sanity_check.expected_package_in_lockfile in ${DENY_LIST_PATH} if the chosen sanity package has been removed from deps.`);
+  // Multi-anchor: as long as AT LEAST ONE configured anchor is found
+  // in the lockfile, the matcher + scan path are working. A future
+  // dep removal of one anchor will not silently break the scanner.
+  const found = sanityNames.filter((n) => buildNameMatcher(n).test(content));
+  if (found.length === 0) {
+    fail(2, `Sanity check failed: none of the expected anchor packages (${sanityNames.join(', ')}) were found in ${LOCKFILE_PATH}. This means either the lockfile path/format has drifted or the matcher regex is broken. Refusing to report clean. Update scanner_sanity_check.expected_packages_in_lockfile in ${DENY_LIST_PATH} if every chosen anchor has been removed from deps.`);
   }
+  return found;
 }
 
 function emitSummary(lines) {
@@ -164,12 +224,12 @@ function emitSummary(lines) {
 
 function main() {
   const denyList = loadDenyList();
-  const sanity = denyList.scanner_sanity_check.expected_package_in_lockfile;
+  const sanityAnchors = denyList.scanner_sanity_check.expected_packages_in_lockfile;
 
   // Sanity check FIRST. If this fails we don't even attempt to report
   // clean — the scanner is broken and any "no hits" result is meaningless.
-  checkLockfileSanity(sanity);
-  info(`✓ Lockfile sanity check passed (found '${sanity}' in ${LOCKFILE_PATH}).`);
+  const found = checkLockfileSanity(sanityAnchors);
+  info(`✓ Lockfile sanity check passed (${found.length}/${sanityAnchors.length} anchor(s) found: ${found.join(', ')}).`);
 
   const allHits = [];
 
@@ -207,7 +267,7 @@ function main() {
       '',
       `**Scanned:** ${pkgJsonFiles.length} \`package.json\` files + \`${LOCKFILE_PATH}\` + ${denyList.denied_files.length} denied paths.`,
       `**Deny-list entries:** ${denyList.denied_package_names.length} package names, ${denyList.denied_files.length} file paths.`,
-      `**Lockfile sanity check:** found \`${sanity}\` ✓`,
+      `**Lockfile sanity check:** ${found.length}/${sanityAnchors.length} anchor(s) found (${found.join(', ')}) ✓`,
     ]);
     process.exit(0);
   }

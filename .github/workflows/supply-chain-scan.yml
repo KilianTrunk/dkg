@@ -41,6 +41,12 @@ on:
       - 'pnpm-lock.yaml'
       - '**/package.json'
       - '.npmrc'
+      # The deny-list scanner's inputs: changes to the JSON list or
+      # the scanner script itself MUST re-trigger this workflow, or a
+      # PR that adds a new deny-list entry would not be exercised
+      # until the next unrelated lockfile change.
+      - '.github/dependency-deny-list.json'
+      - 'scripts/check-dependency-deny-list.mjs'
   push:
     branches: [main, v10-rc]
     paths:
@@ -51,6 +57,8 @@ on:
       - 'pnpm-lock.yaml'
       - '**/package.json'
       - '.npmrc'
+      - '.github/dependency-deny-list.json'
+      - 'scripts/check-dependency-deny-list.mjs'
   schedule:
     # Mondays 06:30 Europe/Belgrade ≈ 04:30 UTC. Same window as Dependabot
     # so any week-over-week drift surfaces in a single review pass.

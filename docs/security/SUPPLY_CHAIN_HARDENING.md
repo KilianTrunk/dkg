@@ -606,18 +606,28 @@ audit why it landed):
 **Scanner design**, all in vanilla `node:fs` (no `npm install` step —
 the scanner deliberately doesn't pull anything from a registry):
 
-- Lockfile sanity check first. If a known-present package (configured
-  in `scanner_sanity_check.expected_package_in_lockfile`) cannot be
-  found in `pnpm-lock.yaml`, the scanner exits 2 (= scanner broken)
-  instead of 0 (= clean). This closes the silent-no-op failure mode
+- Lockfile sanity check first. The scanner reads a multi-anchor list
+  (`scanner_sanity_check.expected_packages_in_lockfile`) and requires
+  AT LEAST ONE of those known-present packages to be visible in
+  `pnpm-lock.yaml`. If none are found, the scanner exits 2 (= scanner
+  broken) instead of 0 (= clean). The multi-anchor list is a small
+  resilience hedge against a future dep cleanup that legitimately
+  removes one of the anchors — the scan stays meaningful as long as
+  at least one anchor remains. Closes the silent-no-op failure mode
   the pnpm-audit step previously had (now fixed) — a future workflow
   refactor cannot accidentally turn this into a green badge over an
   unscanned lockfile.
-- Package-name matching uses a word-boundary regex that requires the
-  name to appear at a valid pnpm-lock / package.json token boundary
-  (`@`, `/`, `:`, quote, whitespace). This prevents a future
-  legitimate package whose name *contains* a deny-listed substring
-  from being false-positive flagged.
+- Package-name matching uses a token-boundary regex that requires the
+  name to appear adjacent to non-name-continuation characters (i.e.
+  anything that is not `[a-zA-Z0-9._-]`). This handles every position
+  where pnpm-lock / package.json can carry a name — pnpm v9
+  (`commander@x.y.z:`), pnpm v8 (`/commander@x.y.z:`),
+  peer-suffixed snapshots, scoped names, importer dep refs,
+  overrides, patchedDependencies — and prevents a future legitimate
+  package whose name *contains* a deny-listed substring from being
+  false-positive flagged. Duplicate entries in the deny-list and
+  missing required fields are detected at load time and fail the
+  scanner with exit 2.
 - `denied_files[]` covers paths that should never appear in the repo
   (currently: `.cursorrules`, the legacy Cursor instruction file).
   Maintained as a separate list so the scanner reports the right kind

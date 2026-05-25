@@ -1590,7 +1590,7 @@ LIMIT 1000`;
 const CONTEXT_GRAPH_QUERY_SUBGRAPH = '__context_graph';
 const USER_QUERY_CATALOG_SLUG = 'ui-saved-queries';
 const USER_QUERY_CATALOG_NAME = 'Saved queries';
-const USER_QUERY_CATALOG_DESCRIPTION = 'Queries saved from the Query tab.';
+const USER_QUERY_CATALOG_DESCRIPTION = 'User-created SPARQL saved in this node profile for this Context Graph.';
 const PROFILE_NS = 'http://dkg.io/ontology/profile/';
 const SCHEMA_NS = 'http://schema.org/';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
@@ -1615,7 +1615,7 @@ function contextGraphQueryFilter(contextGraphId: string): string {
 
 function contextGraphBuiltInCatalog(contextGraphId: string): QueryCatalog {
   const catalogSlug = 'whole-context-graph';
-  const catalogName = 'Whole graph';
+  const catalogName = 'Context graph';
   const catalogRank = -100;
   const subGraph = CONTEXT_GRAPH_QUERY_SUBGRAPH;
   const withQueryDefaults = (query: {
@@ -1629,7 +1629,7 @@ function contextGraphBuiltInCatalog(contextGraphId: string): QueryCatalog {
     subGraph,
     catalogSlug,
     catalogName,
-    catalogDescription: 'Built-in queries for the full context graph.',
+    catalogDescription: 'Ready-made SPARQL included with the Node UI for common Context Graph checks.',
     catalogRank,
     resultColumn: '',
     ...query,
@@ -1639,13 +1639,13 @@ function contextGraphBuiltInCatalog(contextGraphId: string): QueryCatalog {
     slug: catalogSlug,
     subGraph,
     name: catalogName,
-    description: 'Built-in queries for the full context graph.',
+    description: 'Ready-made SPARQL included with the Node UI for common Context Graph checks.',
     rank: catalogRank,
     queries: [
       withQueryDefaults({
         slug: 'all-triples',
         name: 'All triples',
-        description: 'Show triples across every public graph in this context graph.',
+        description: 'Show triples across available non-private graphs in this context graph.',
         sparql: contextGraphQueryTemplate(contextGraphId),
         resultColumn: 'o',
         rank: 1,
@@ -1653,7 +1653,7 @@ function contextGraphBuiltInCatalog(contextGraphId: string): QueryCatalog {
       withQueryDefaults({
         slug: 'graphs',
         name: 'Graphs',
-        description: 'List public named graphs and triple counts.',
+        description: 'List available non-private named graphs and triple counts.',
         sparql: `SELECT ?g (COUNT(*) AS ?triples) WHERE {
   GRAPH ?g { ?s ?p ?o }
   ${contextGraphQueryFilter(contextGraphId)}
@@ -1769,6 +1769,39 @@ function appendSavedQueryCatalog(catalogs: QueryCatalog[], query: SavedCatalogQu
   ];
 }
 
+function mergeQueryCatalogs(catalogs: QueryCatalog[]): QueryCatalog[] {
+  const byCatalog = new Map<string, QueryCatalog>();
+
+  for (const catalog of catalogs) {
+    const catalogKey = `${catalog.subGraph}|${catalog.slug}`;
+    const existing = byCatalog.get(catalogKey);
+    if (!existing) {
+      byCatalog.set(catalogKey, {
+        ...catalog,
+        queries: [...catalog.queries],
+      });
+      continue;
+    }
+
+    const byQuery = new Map(existing.queries.map(query => [
+      `${query.subGraph}|${query.catalogSlug}|${query.slug}`,
+      query,
+    ]));
+    for (const query of catalog.queries) {
+      const queryKey = `${query.subGraph}|${query.catalogSlug}|${query.slug}`;
+      if (!byQuery.has(queryKey)) byQuery.set(queryKey, query);
+    }
+    existing.queries = Array.from(byQuery.values())
+      .sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name));
+  }
+
+  return Array.from(byCatalog.values()).sort((a, b) =>
+    a.subGraph.localeCompare(b.subGraph)
+    || a.rank - b.rank
+    || a.name.localeCompare(b.name),
+  );
+}
+
 function bindingValue(v: unknown): string {
   if (v == null) return '';
   if (typeof v === 'string') return v;
@@ -1780,6 +1813,47 @@ function shortenBindingValue(value: string): string {
   if (!value) return '—';
   if (value.length <= 140) return value;
   return `${value.slice(0, 110)}...${value.slice(-24)}`;
+}
+
+function isBuiltInQueryCatalog(catalog: QueryCatalog): boolean {
+  return catalog.subGraph === CONTEXT_GRAPH_QUERY_SUBGRAPH && catalog.slug === 'whole-context-graph';
+}
+
+function queryCatalogueScope(catalog: QueryCatalog): 'context' | 'subgraph' {
+  return catalog.subGraph === CONTEXT_GRAPH_QUERY_SUBGRAPH ? 'context' : 'subgraph';
+}
+
+function queryCatalogueGroupLabel(catalog: QueryCatalog, scope: 'context' | 'subgraph', subGraphLabel?: string): string {
+  if (isBuiltInQueryCatalog(catalog)) return 'Built-in presets';
+  if (catalog.subGraph === CONTEXT_GRAPH_QUERY_SUBGRAPH && catalog.slug === USER_QUERY_CATALOG_SLUG) {
+    return USER_QUERY_CATALOG_NAME;
+  }
+  if (scope === 'context') return catalog.name;
+  return `${subGraphLabel ?? catalog.subGraph}: ${catalog.name}`;
+}
+
+function queryCatalogueGroupDescription(catalog: QueryCatalog): string {
+  if (isBuiltInQueryCatalog(catalog)) {
+    return 'UI-provided SPARQL for common Context Graph checks.';
+  }
+  if (catalog.subGraph === CONTEXT_GRAPH_QUERY_SUBGRAPH && catalog.slug === USER_QUERY_CATALOG_SLUG) {
+    return USER_QUERY_CATALOG_DESCRIPTION;
+  }
+  return catalog.description ?? '';
+}
+
+function queryCatalogueGroupKind(catalog: QueryCatalog, scope: 'context' | 'subgraph'): string {
+  if (isBuiltInQueryCatalog(catalog)) return 'Preset';
+  return scope === 'context' ? 'Saved' : 'Subgraph';
+}
+
+function queryErrorMessage(error: string | null): ReactNode {
+  return (
+    <>
+      <span>Review the query or node response details, then try again.</span>
+      {error && <span className="v10-cg-query-error-detail">{error}</span>}
+    </>
+  );
 }
 
 export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: string }) {
@@ -1797,8 +1871,12 @@ export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: stri
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const builtInCatalog = useMemo(() => contextGraphBuiltInCatalog(contextGraphId), [contextGraphId]);
   const queryCatalogs = useMemo(
-    () => [builtInCatalog, ...localSavedCatalogs, ...(profile?.queryCatalogs ?? [])],
+    () => mergeQueryCatalogs([builtInCatalog, ...localSavedCatalogs, ...(profile?.queryCatalogs ?? [])]),
     [builtInCatalog, localSavedCatalogs, profile?.queryCatalogs],
+  );
+  const renderedQueryCatalogs = useMemo(
+    () => (profile?.loading || profile?.error ? mergeQueryCatalogs([builtInCatalog, ...localSavedCatalogs]) : queryCatalogs),
+    [builtInCatalog, localSavedCatalogs, profile?.error, profile?.loading, queryCatalogs],
   );
 
   useEffect(() => {
@@ -1824,6 +1902,11 @@ export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: stri
     [data],
   );
 
+  const hasSavedProfileQueries = useMemo(
+    () => queryCatalogs.some(catalog => !isBuiltInQueryCatalog(catalog) && catalog.queries.length > 0),
+    [queryCatalogs],
+  );
+
   const columns = useMemo(() => {
     const out: string[] = [];
     for (const row of rows) {
@@ -1838,6 +1921,8 @@ export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: stri
     const next = draftQuery.trim();
     if (!next) return;
     setActiveCatalogQueryKey(null);
+    setSaveMessage(null);
+    setSaveError(null);
     if (next === activeQuery) {
       refresh();
       return;
@@ -1848,6 +1933,8 @@ export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: stri
   const resetQuery = useCallback(() => {
     setDraftQuery(defaultQuery);
     setActiveCatalogQueryKey(null);
+    setSaveMessage(null);
+    setSaveError(null);
     if (activeQuery === defaultQuery) refresh();
     else setActiveQuery(defaultQuery);
   }, [activeQuery, defaultQuery, refresh]);
@@ -1857,6 +1944,8 @@ export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: stri
     if (!next) return;
     setActiveCatalogQueryKey(key);
     setDraftQuery(next);
+    setSaveMessage(null);
+    setSaveError(null);
     if (activeQuery === next) {
       refresh();
       return;
@@ -1902,7 +1991,7 @@ export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: stri
       setSaveName('');
       setSaveDescription('');
       setSaveOpen(false);
-      setSaveMessage('Saved to catalog.');
+      setSaveMessage('Saved to catalogue.');
     } catch (err: any) {
       setSaveError(err?.message ?? 'Failed to save query.');
     } finally {
@@ -1915,52 +2004,119 @@ export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: stri
       <div className="v10-mlv-header">
         <span className="v10-mlv-icon">⟐</span>
         <div>
-          <h2 className="v10-mlv-title">Context Graph Query</h2>
-          <p className="v10-mlv-desc">Run SPARQL against the full context graph, across sub-graphs and memory layers.</p>
+          <h2 className="v10-mlv-title">Query Catalogue</h2>
+          <p className="v10-mlv-desc">
+            Reusable SPARQL for this Context Graph. Use UI presets or save queries for people and local agents to reuse.
+          </p>
         </div>
       </div>
 
-      <div className="v10-cg-query-catalog">
-        <span className="v10-subgraph-savedqueries-label">Query catalog</span>
-        {queryCatalogs.map((catalog) => {
-          const isBuiltIn = catalog.subGraph === CONTEXT_GRAPH_QUERY_SUBGRAPH;
-          const binding = isBuiltIn ? undefined : profile?.forSubGraph(catalog.subGraph);
-          const color = binding?.color ?? '#38bdf8';
-          const label = isBuiltIn ? catalog.name : `${binding?.displayName ?? catalog.subGraph}: ${catalog.name}`;
-          return (
-            <React.Fragment key={`${catalog.subGraph}|${catalog.slug}`}>
-              <span
-                className="v10-subgraph-savedqueries-label"
-                title={catalog.description || label}
-                style={{ marginLeft: 8, opacity: 0.8 }}
-              >
-                {label}
-              </span>
-              {catalog.queries.map((q) => {
-                const key = `${q.subGraph}|${q.catalogSlug}|${q.slug}`;
-                const isActive = activeCatalogQueryKey === key && activeQuery === q.sparql;
-                return (
-                  <button
-                    key={key}
-                    type="button"
-                    className={`v10-subgraph-savedquery${isActive ? ' active' : ''}`}
-                    onClick={() => runCatalogQuery(key, q.sparql)}
-                    title={q.description || q.name}
-                    style={{ '--sg-color': color } as React.CSSProperties}
-                  >
-                    <span className="v10-subgraph-savedquery-glyph">{isActive ? '✓' : '◎'}</span>
-                    {q.name}
-                  </button>
-                );
-              })}
-            </React.Fragment>
-          );
-        })}
-      </div>
+      <section className="v10-cg-query-zone v10-cg-query-zone-catalog" aria-labelledby="query-catalogue-saved-title">
+        <div className="v10-cg-query-zone-header">
+          <div>
+            <span className="v10-cg-query-eyebrow">Query Library</span>
+            <h3 id="query-catalogue-saved-title">Choose a query</h3>
+            <p>Load a preset or saved query into the editor below.</p>
+          </div>
+        </div>
+
+        {profile?.loading && (
+          <EmptyState
+            compact
+            inline
+            tone="query"
+            icon="?"
+            title="Loading saved queries..."
+            description="Built-in presets are available while saved queries load from this node profile."
+          />
+        )}
+
+        {profile?.error && (
+          <EmptyState
+            compact
+            inline
+            tone="danger"
+            icon="!"
+            title="Saved query catalogue unavailable"
+            description={profile.error}
+          />
+        )}
+
+        {renderedQueryCatalogs.length > 0 && (
+          <div className="v10-cg-query-catalog-groups">
+            {renderedQueryCatalogs.map((catalog) => {
+              const scope = queryCatalogueScope(catalog);
+              const binding = scope === 'context' ? undefined : profile?.forSubGraph(catalog.subGraph);
+              const color = binding?.color ?? '#38bdf8';
+              const label = queryCatalogueGroupLabel(catalog, scope, binding?.displayName);
+              const description = queryCatalogueGroupDescription(catalog);
+              const kind = queryCatalogueGroupKind(catalog, scope);
+              return (
+                <div
+                  key={`${catalog.subGraph}|${catalog.slug}`}
+                  className="v10-cg-query-catalog-group"
+                  style={{ '--sg-color': color } as React.CSSProperties}
+                >
+                  <div className="v10-cg-query-catalog-group-header">
+                    <div>
+                      <div className="v10-cg-query-catalog-title-row">
+                        <span className="v10-cg-query-catalog-kind">{kind}</span>
+                        <h4>{label}</h4>
+                      </div>
+                      {description && <p>{description}</p>}
+                    </div>
+                  </div>
+                  <div className="v10-cg-query-list">
+                    {catalog.queries.map((q) => {
+                      const key = `${q.subGraph}|${q.catalogSlug}|${q.slug}`;
+                      const isActive = activeCatalogQueryKey === key && activeQuery === q.sparql;
+                      const chipLabel = q.description ? `${q.name}. ${q.description}` : q.name;
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          className={`v10-cg-query-chip${isActive ? ' active' : ''}`}
+                          title={chipLabel}
+                          aria-label={`Load query: ${chipLabel}`}
+                          onClick={() => runCatalogQuery(key, q.sparql)}
+                        >
+                          <span className="v10-cg-query-chip-title">{q.name}</span>
+                          {q.description && <span className="v10-cg-query-chip-desc">{q.description}</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {!profile?.loading && !profile?.error && queryCatalogs.length > 0 && !hasSavedProfileQueries && (
+          <EmptyState
+            compact
+            inline
+            tone="query"
+            icon="?"
+            title="No saved queries yet."
+            description="Use Save after editing SPARQL to keep a reusable query for this Context Graph."
+          />
+        )}
+      </section>
+
+      <section className="v10-cg-query-zone v10-cg-query-zone-editor" aria-labelledby="query-catalogue-editor-title">
+        <div className="v10-cg-query-zone-header">
+          <div>
+            <span className="v10-cg-query-eyebrow">Ad-hoc SPARQL</span>
+            <h3 id="query-catalogue-editor-title">Editor and results</h3>
+            <p>Run a one-off query against this Context Graph, or save it when it should become reusable.</p>
+          </div>
+        </div>
 
       <div className="v10-cg-query-editor">
         <textarea
           className="v10-cg-query-textarea"
+          aria-label="SPARQL editor"
           value={draftQuery}
           onChange={(e) => {
             setDraftQuery(e.target.value);
@@ -2021,8 +2177,8 @@ export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: stri
             compact
             tone="danger"
             icon="!"
-            title="Query failed"
-            description={error}
+            title="Query could not run."
+            description={queryErrorMessage(error)}
           />
         )}
 
@@ -2065,6 +2221,7 @@ export function ContextGraphQueryView({ contextGraphId }: { contextGraphId: stri
           </div>
         )}
       </div>
+      </section>
     </div>
   );
 }

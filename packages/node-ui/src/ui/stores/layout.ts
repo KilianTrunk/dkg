@@ -4,9 +4,7 @@ interface LayoutState {
   leftCollapsed: boolean;
   rightCollapsed: boolean;
   bottomCollapsed: boolean;
-  // Per-section open state inside the left sidebar. Persisted alongside
-  // `leftCollapsed` so section preferences survive reloads in lockstep
-  // with the sidebar collapse state itself.
+  bottomMaximised: boolean;
   leftSectionMyProjectsOpen: boolean;
   leftSectionIntegrationsOpen: boolean;
   theme: 'dark' | 'light';
@@ -17,6 +15,7 @@ interface LayoutState {
   toggleLeft: () => void;
   toggleRight: () => void;
   toggleBottom: () => void;
+  toggleBottomMaximised: () => void;
   toggleLeftSectionMyProjects: () => void;
   toggleLeftSectionIntegrations: () => void;
   setTheme: (t: 'dark' | 'light') => void;
@@ -38,6 +37,8 @@ interface PersistedLayout {
   bottomHeight?: number;
 }
 
+const BOTTOM_HEIGHT_DEFAULT = 260;
+
 const DEFAULTS = {
   leftCollapsed: false,
   rightCollapsed: false,
@@ -50,7 +51,7 @@ const DEFAULTS = {
   leftSectionIntegrationsOpen: false,
   leftWidth: 240,
   rightWidth: 360,
-  bottomHeight: 200,
+  bottomHeight: BOTTOM_HEIGHT_DEFAULT,
 };
 
 // Must match the live drag handlers in App.tsx (`useDragResize`); without
@@ -164,6 +165,7 @@ export const useLayoutStore = create<LayoutState>((set, get) => ({
   leftCollapsed: initial.leftCollapsed,
   rightCollapsed: initial.rightCollapsed,
   bottomCollapsed: initial.bottomCollapsed,
+  bottomMaximised: false,
   leftSectionMyProjectsOpen: initial.leftSectionMyProjectsOpen,
   leftSectionIntegrationsOpen: initial.leftSectionIntegrationsOpen,
   theme: (localStorage.getItem('dkg-theme') as 'dark' | 'light') || 'dark',
@@ -180,7 +182,11 @@ export const useLayoutStore = create<LayoutState>((set, get) => ({
     persist(snapshot(get()));
   },
   toggleBottom: () => {
-    set((s) => ({ bottomCollapsed: !s.bottomCollapsed }));
+    set((s) => ({ bottomCollapsed: !s.bottomCollapsed, bottomMaximised: false }));
+    persist(snapshot(get()));
+  },
+  toggleBottomMaximised: () => {
+    set((s) => ({ bottomMaximised: !s.bottomMaximised, bottomCollapsed: false }));
     persist(snapshot(get()));
   },
   toggleLeftSectionMyProjects: () => {
@@ -196,10 +202,6 @@ export const useLayoutStore = create<LayoutState>((set, get) => ({
     set({ theme: t });
   },
   setLeftWidth: (w) => {
-    // Clamp at the setter boundary so the store itself enforces the layout
-    // contract — any caller (not just the drag handler in App.tsx) pushes
-    // values within the supported bounds, and persisted state stays
-    // consistent with what loadPersisted accepts on reload.
     set({ leftWidth: clamp(w, LEFT_WIDTH_MIN, LEFT_WIDTH_MAX) });
     persist(snapshot(get()));
   },
@@ -208,13 +210,6 @@ export const useLayoutStore = create<LayoutState>((set, get) => ({
     persist(snapshot(get()));
   },
   setBottomHeight: (h) => {
-    // Lower bound is viewport-aware, not a hard 120: on a short
-    // viewport `maxBottomHeight()` can be < BOTTOM_HEIGHT_MIN, and a
-    // static floor here would snap every drag back up to 120 while
-    // render-time clamping pins it at the smaller viewport max — the
-    // handle then appears inert and the store holds a wrong value
-    // (Codex). On normal viewports maxBottomHeight() >= 120 so the
-    // effective floor is still 120.
     const lo = Math.min(BOTTOM_HEIGHT_MIN, maxBottomHeight());
     set({ bottomHeight: clamp(h, lo, BOTTOM_HEIGHT_MAX) });
     persist(snapshot(get()));

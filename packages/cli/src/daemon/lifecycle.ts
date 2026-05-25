@@ -1405,6 +1405,26 @@ export async function runDaemonInner(
     }
   });
 
+  // Track remote KA updates (gossipsub-received only — local updates are
+  // already tracked by the /api/update route with full phase/tx context)
+  agent.eventBus.on(DKGEvent.KA_UPDATED, (data: any) => {
+    try {
+      if (!data.fromPeerId) return;
+      const ctx = createOperationContext("ka-update");
+      tracker.start(ctx, {
+        contextGraphId: data.contextGraphId,
+        peerId: data.fromPeerId,
+        details: {
+          batchId: data.batchId,
+          ual: data.ual,
+          rootEntities: Array.isArray(data.rootEntities) ? data.rootEntities.slice(0, 5) : undefined,
+        },
+      });
+      if (data.txHash) tracker.setTxHash(ctx, data.txHash);
+      tracker.complete(ctx);
+    } catch { /* never crash */ }
+  });
+
   // SSE (Server-Sent Events) broadcast: real-time push to connected UI clients
   const sseClients = new Set<ServerResponse>();
   function sseBroadcast(event: string, payload: Record<string, unknown>) {

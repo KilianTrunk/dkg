@@ -311,6 +311,12 @@ async function runForegroundSupervisor(childEnv: NodeJS.ProcessEnv = process.env
   while (true) {
     if (signalled) process.exit(0);
 
+    await removeApiPort().catch((err: any) => {
+      supervisorWarn(
+        `[supervisor] could not clear stale api.port before foreground spawn: ${err?.message ?? String(err)}`,
+      );
+    });
+
     currentChild = spawn(
       process.execPath,
       [...process.execArgv, resolveDaemonEntryPoint(), 'daemon-foreground-worker'],

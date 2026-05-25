@@ -328,6 +328,7 @@ import {
 import { handleRequest } from './handle-request.js';
 import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
+import { createPromoteWorkerSupervisor, type PromoteWorkerSupervisor } from './worker/async-promote-worker.js';
 
 /**
  * Resolve the WM agentAddress the daemon hands to `ChatMemoryManager`.
@@ -745,6 +746,12 @@ export async function runDaemonInner(
   });
 
   let publisherRuntime: PublisherRuntime | null = null;
+  // Holds the running async-promote worker supervisor (PR #3 of the
+  // async-promote-queue series). Initialised in `startPostApiPublishing`
+  // after the API is up so a recoverOnStartup hiccup never blocks boot;
+  // torn down in `shutdown` before `agent.stop()` so the queue store is
+  // still open when we wait for in-flight promotes to drain.
+  let promoteWorkerSupervisor: PromoteWorkerSupervisor | null = null;
 
   const networkId = await computeNetworkId();
   const publisherControl = createPublisherControlFromStore(
@@ -940,6 +947,31 @@ export async function runDaemonInner(
         });
     }, 0);
     if (publisherTimer.unref) publisherTimer.unref();
+
+    // Async-promote queue worker (PR #3) — drains the queue introduced
+    // in PR #1 + #2. Until this supervisor is running, jobs sit in
+    // `queued` forever; an operator could still inspect/cancel them
+    // via the HTTP routes. We start AFTER `startPublisherRuntimeIfEnabled`
+    // because the publisher runtime owns the upstream async-lift queue
+    // and we want async-lift recovery to settle before we start
+    // hammering the same triple store with promote retries.
+    const promoteWorkerTimer = setTimeout(() => {
+      const supervisor = createPromoteWorkerSupervisor({
+        agent,
+        log: (msg) => log(`[promote-worker] ${msg}`),
+        emitMemoryGraphChanged,
+      });
+      supervisor
+        .start()
+        .then(() => {
+          promoteWorkerSupervisor = supervisor;
+          log("Async promote worker supervisor started");
+        })
+        .catch((err: any) => {
+          log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
+        });
+    }, 0);
+    if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
   };
 
   log(`PeerId: ${agent.peerId}`);
@@ -2100,6 +2132,16 @@ export async function runDaemonInner(
       ?.stop()
       .catch((err: any) =>
         log(`Publisher runtime stop error: ${err?.message ?? String(err)}`),
+      );
+    // Drain the async-promote worker before closing the agent — once
+    // `agent.stop()` runs the queue's underlying triple store goes
+    // away. We let in-flight promotes complete (or hit
+    // `shutdownTimeoutMs`); RFC §6.2 forbids marking `running →
+    // queued` here so the next boot's `recoverOnStartup()` decides.
+    await promoteWorkerSupervisor
+      ?.stop()
+      .catch((err: any) =>
+        log(`Promote worker stop error: ${err?.message ?? String(err)}`),
       );
     await daemonState.catchupRunner
       ?.close()

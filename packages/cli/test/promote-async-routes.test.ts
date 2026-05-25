@@ -173,7 +173,7 @@ describe('promote-async daemon routes', () => {
     expect(r.status).toBe(200);
     expect(r.body.jobId).toBe('job-1');
     expect(r.body.state).toBe('queued');
-    expect(r.body.enqueuedAt).toBeTypeOf('number');
+    expect(r.body.enqueuedAt).toBeUndefined();
   });
 
   it('POST /:name/promote-async returns 409 with existingJobId on duplicate enqueue', async () => {
@@ -312,6 +312,13 @@ describe('promote-async daemon routes', () => {
   it('GET /promote-async?limit=abc returns 400', async () => {
     await startRoutes(makeAgent());
     const r = await get('/api/assertion/promote-async?limit=abc');
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/positive integer/);
+  });
+
+  it('GET /promote-async?limit=10foo returns 400 instead of coercing', async () => {
+    await startRoutes(makeAgent());
+    const r = await get('/api/assertion/promote-async?limit=10foo');
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/positive integer/);
   });

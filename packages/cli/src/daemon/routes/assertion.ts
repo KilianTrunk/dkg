@@ -1469,11 +1469,9 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         assertionName,
         { entities: entities ?? "all", subGraphName },
       );
-      const job = await agent.assertion.getPromoteAsyncStatus(result.jobId);
       return jsonResponse(res, 200, {
         jobId: result.jobId,
-        state: job?.state ?? "queued",
-        enqueuedAt: job?.enqueuedAt,
+        state: "queued",
       });
     } catch (err: any) {
       if (err instanceof PromoteJobConflictError) {
@@ -1516,7 +1514,12 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const stateFilter = requestedStates as PromoteJobState[] | undefined;
     const contextGraphId = url.searchParams.get("contextGraphId") ?? undefined;
     const limitParam = url.searchParams.get("limit");
-    const limit = limitParam ? Number.parseInt(limitParam, 10) : undefined;
+    if (limitParam !== null && !/^[1-9]\d*$/.test(limitParam)) {
+      return jsonResponse(res, 400, {
+        error: "limit must be a positive integer ≤ 1000",
+      });
+    }
+    const limit = limitParam !== null ? Number.parseInt(limitParam, 10) : undefined;
     if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0 || limit > 1000)) {
       return jsonResponse(res, 400, {
         error: "limit must be a positive integer ≤ 1000",

@@ -1072,7 +1072,7 @@ program
   .requiredOption('--context-graph <id>', 'Context Graph ID')
   .requiredOption('--verified-graph <id>', 'Verified Graph ID')
   .option('--timeout <ms>', `Timeout in milliseconds (default/max: ${VERIFY_COLLECTION_TIMEOUT_MAX_MS})`)
-  .option('--required-signatures <n>', 'M-of-N quorum threshold (default: on-chain config, or 1 if adapter lacks getContextGraphConfig)')
+  .option('--required-signatures <n>', 'M-of-N quorum threshold (default: system parameter parametersStorage.minimumRequiredSignatures)')
   .action(async (batchId: string, opts: ActionOpts) => {
     try {
       const client = await ApiClient.connect();
@@ -1453,13 +1453,6 @@ contextGraphCmd
   )
   .option('--invite <peer...>', 'Invite peers by peer ID (deprecated — use --allowed-agent)')
   .option('--private', 'Create a private local-only context graph')
-  .option(
-    '--participant-identity-id <id>',
-    'Participant identity ID to include for private access control (repeatable)',
-    (value: string, previous: string[] = []) => [...previous, value],
-    [] as string[],
-  )
-  .option('--required-signatures <n>', 'Required signatures threshold for participant-based context graphs')
   .option('--subscribe', 'Also subscribe to the context graph after creation', true)
   .option('--save', 'Persist subscription to config')
   .action(async (id: string, opts: ActionOpts) => {
@@ -1472,7 +1465,6 @@ contextGraphCmd
         id = `${identity.agentAddress}/${id}`;
       }
 
-      const participantIdentityIds = (opts.participantIdentityId as string[] | undefined) ?? [];
       const allowedAgents = (opts.allowedAgent as string[] | undefined) ?? [];
       // pcaAccountId is intentionally NOT a flag on `create` —
       // `createContextGraph` no longer persists the id, so a
@@ -1486,8 +1478,6 @@ contextGraphCmd
         private: !!opts.private,
         accessPolicy,
         allowedAgents: allowedAgents.length > 0 ? allowedAgents : undefined,
-        participantIdentityIds,
-        requiredSignatures: opts.requiredSignatures != null ? Number(opts.requiredSignatures) : undefined,
       }, opts.invite as string[] | undefined);
       console.log(`Context graph created:`);
       console.log(`  ID:   ${result.created}`);
@@ -1498,12 +1488,6 @@ contextGraphCmd
       }
       if (opts.invite?.length) {
         console.log(`  Invited ${(opts.invite as string[]).length} peer(s) via allowlist (legacy).`);
-      }
-      if (opts.private && participantIdentityIds.length > 0) {
-        console.log(`  Participants: ${participantIdentityIds.join(', ')}`);
-      }
-      if (opts.requiredSignatures != null) {
-        console.log(`  Required signatures: ${opts.requiredSignatures}`);
       }
       console.log(`  Run 'dkg context-graph register ${id}' to register on-chain (unlocks Verified Memory).`);
 
@@ -1518,15 +1502,6 @@ contextGraphCmd
       }
     } catch (err) {
       const message = toErrorMessage(err);
-      if (message.includes('participantIdentityIds') && message.includes('requiredSignatures')) {
-        console.error('Context-graph contract mismatch — the daemon was built against an older ABI.');
-        console.error('Rebuild and restart the daemon, then retry:');
-        console.error('  pnpm --filter @origintrail-official/dkg build');
-        console.error('  node packages/cli/dist/cli.js start');
-        console.error('Or use an existing context graph from:');
-        console.error('  node packages/cli/dist/cli.js context-graph list');
-        process.exit(1);
-      }
       console.error(message);
       process.exit(1);
     }

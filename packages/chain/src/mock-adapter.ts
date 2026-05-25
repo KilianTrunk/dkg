@@ -626,9 +626,7 @@ export class MockChainAdapter implements ChainAdapter {
 
   private contextGraphs = new Map<bigint, {
     manager: string;
-    participantIdentityIds: bigint[];
     participantAgents: string[];
-    requiredSignatures: number;
     metadataBatchId: bigint;
     accessPolicy: number;
     publishPolicy: number;
@@ -636,23 +634,19 @@ export class MockChainAdapter implements ChainAdapter {
     publishAuthorityAccountId: bigint;
     active: boolean;
     batches: bigint[];
+    // OT-RFC-38 / LU-6 Phase B — curator-committed wire id.
+    // `null` indicates the curator opted out at create time.
+    nameHash?: string | null;
   }>();
   private nextContextGraphId = 1n;
 
   async createOnChainContextGraph(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult> {
-    if (params.requiredSignatures < 1) {
-      throw new Error('Mock: requiredSignatures must be >= 1');
+    if (params.accessPolicy === undefined || params.publishPolicy === undefined) {
+      throw new Error(
+        'Mock createOnChainContextGraph: `accessPolicy` and `publishPolicy` are required (SPEC_CG_MEMORY_MODEL).',
+      );
     }
-    if (params.requiredSignatures > params.participantIdentityIds.length) {
-      throw new Error(`Mock: requiredSignatures (${params.requiredSignatures}) exceeds participant count (${params.participantIdentityIds.length})`);
-    }
-    for (let i = 1; i < params.participantIdentityIds.length; i++) {
-      if (params.participantIdentityIds[i] <= params.participantIdentityIds[i - 1]) {
-        throw new Error('Mock: participantIdentityIds must be strictly increasing (sorted, unique)');
-      }
-    }
-    const publishPolicy = params.publishPolicy ?? 1;
-    const accessPolicy = params.accessPolicy ?? 0;
+    const { accessPolicy, publishPolicy } = params;
     if (accessPolicy !== 0 && accessPolicy !== 1) {
       throw new Error('Mock: invalid accessPolicy');
     }
@@ -705,12 +699,24 @@ export class MockChainAdapter implements ChainAdapter {
       seenParticipantAgents.add(key);
     }
 
+    // OT-RFC-38 / LU-6 Phase B — accept the curator's wire-id commitment
+    // verbatim. Validation is intentionally permissive: the contract
+    // accepts ANY non-zero 32-byte value, including ones that aren't
+    // derivable from a known cleartext (forward compatibility). Mock
+    // stores `null` for the opt-out path so the event surface matches
+    // the EVM adapter's `nameHashRaw === '0x' ? null : ...` shape.
+    let nameHash: string | null = null;
+    if (params.nameHash !== undefined && params.nameHash !== ethers.ZeroHash) {
+      if (!/^0x[0-9a-fA-F]{64}$/.test(params.nameHash)) {
+        throw new Error(`Mock: invalid nameHash ${params.nameHash}`);
+      }
+      nameHash = params.nameHash.toLowerCase();
+    }
+
     const contextGraphId = this.nextContextGraphId++;
     this.contextGraphs.set(contextGraphId, {
       manager: this.signerAddress,
-      participantIdentityIds: [...params.participantIdentityIds],
       participantAgents: participantAgents.map((agent) => ethers.getAddress(agent)),
-      requiredSignatures: params.requiredSignatures,
       metadataBatchId: params.metadataBatchId ?? 0n,
       accessPolicy,
       publishPolicy,
@@ -718,6 +724,7 @@ export class MockChainAdapter implements ChainAdapter {
       publishAuthorityAccountId,
       active: true,
       batches: [],
+      nameHash,
     });
 
     this.pushEvent('ContextGraphCreated', {
@@ -725,11 +732,10 @@ export class MockChainAdapter implements ChainAdapter {
       creator: this.signerAddress,
       owner: this.signerAddress,
       manager: this.signerAddress,
-      participantIdentityIds: params.participantIdentityIds.map((id) => id.toString()),
       participantAgents: participantAgents.map((agent) => ethers.getAddress(agent)),
-      requiredSignatures: params.requiredSignatures,
       accessPolicy,
       publishPolicy,
+      nameHash,
     });
 
     return {
@@ -775,6 +781,14 @@ export class MockChainAdapter implements ChainAdapter {
 
   async getMinimumRequiredSignatures(): Promise<number> {
     return this.minimumRequiredSignatures;
+  }
+
+  // Codex PR #595 round-4: mock environments don't model the sharding
+  // table, so any registered (non-zero) identity counts as a member.
+  // Tests that need to exercise non-membership rejection should
+  // override this with a vi.spyOn / monkey-patch.
+  async isShardingTableMember(identityId: bigint): Promise<boolean> {
+    return identityId > 0n;
   }
 
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
@@ -887,8 +901,8 @@ export class MockChainAdapter implements ChainAdapter {
       }
     }
 
-    if (params.signerSignatures.length < cg.requiredSignatures) {
-      throw new Error(`Not enough signatures: need ${cg.requiredSignatures}, got ${params.signerSignatures.length}`);
+    if (params.signerSignatures.length < this.minimumRequiredSignatures) {
+      throw new Error(`Not enough signatures: need ${this.minimumRequiredSignatures}, got ${params.signerSignatures.length}`);
     }
 
     cg.batches.push(params.batchId);
@@ -907,9 +921,9 @@ export class MockChainAdapter implements ChainAdapter {
       throw new Error(`Context graph ${params.contextGraphId} not found or inactive`);
     }
 
-    if (params.participantSignatures.length < cg.requiredSignatures) {
+    if (params.participantSignatures.length < this.minimumRequiredSignatures) {
       throw new Error(
-        `Not enough participant signatures: need ${cg.requiredSignatures}, got ${params.participantSignatures.length}`,
+        `Not enough participant signatures: need ${this.minimumRequiredSignatures}, got ${params.participantSignatures.length}`,
       );
     }
 
@@ -975,9 +989,45 @@ export class MockChainAdapter implements ChainAdapter {
     return this.contextGraphs.get(contextGraphId);
   }
 
-  async getContextGraphParticipants(contextGraphId: bigint): Promise<bigint[] | null> {
+  /**
+   * OT-RFC-38 / LU-5: chain-backed access-policy oracle parity for the
+   * mock chain. Returns the same uint8 enum the EVM adapter does
+   * (`0`=public, `1`=curated). Unknown ids yield `0` to match the
+   * Solidity default-zero mapping.
+   */
+  async getContextGraphAccessPolicy(contextGraphId: bigint): Promise<number> {
     const cg = this.contextGraphs.get(contextGraphId);
-    return cg ? [...cg.participantIdentityIds] : null;
+    if (!cg) return 0;
+    const ap = (cg as { accessPolicy?: number }).accessPolicy;
+    return typeof ap === 'number' ? ap : 0;
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B: chain-backed participant-agent allowlist
+   * parity for the mock. Mirrors {@link getContextGraphAccessPolicy}
+   * shape. Returns an empty array when the CG is unknown or has no
+   * `participantAgents` field set on the mock state — matching the
+   * Solidity getter's behavior on unregistered ids.
+   */
+  async getContextGraphParticipantAgents(contextGraphId: bigint): Promise<string[]> {
+    const cg = this.contextGraphs.get(contextGraphId);
+    if (!cg) return [];
+    const agents = (cg as { participantAgents?: string[] }).participantAgents;
+    if (!Array.isArray(agents)) return [];
+    return agents.map((a) => ethers.getAddress(a));
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — mock mirror of
+   * `ContextGraphStorage.getNameHash(uint256)`. Returns `null` for
+   * unregistered ids OR for ids the curator opted out of committing
+   * to a name hash (matches the EVM adapter's `'0x' → null` mapping
+   * on the event surface for symmetry).
+   */
+  async getContextGraphNameHash(contextGraphId: bigint): Promise<string | null> {
+    const cg = this.contextGraphs.get(contextGraphId);
+    if (!cg) return null;
+    return cg.nameHash ?? null;
   }
 
   // --- V10 Publish (KnowledgeAssetsV10 → KnowledgeCollectionStorage) ---

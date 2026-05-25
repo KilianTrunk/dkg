@@ -707,8 +707,7 @@ describe('Tentative data and chain event confirmation', () => {
     // `packages/chain/src/archive/`.
     const ownerIdentityId = BigInt(getSharedContext().coreProfileId);
     const cgResult = await chain.createOnChainContextGraph({
-      participantIdentityIds: [ownerIdentityId],
-      requiredSignatures: 1,
+      accessPolicy: 1,
       publishPolicy: 0,
     });
     expect(cgResult.success).toBe(true);

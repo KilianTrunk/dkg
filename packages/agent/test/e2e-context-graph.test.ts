@@ -80,8 +80,8 @@ describe('E2E: context graph publish + finalization (shared chain)', () => {
 
   it('creates a context graph on the shared chain', async () => {
     const result = await nodeA.registerContextGraphOnChain({
-      participantIdentityIds: [1n, 2n],
-      requiredSignatures: 1,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
 
     contextGraphId = result.contextGraphId;

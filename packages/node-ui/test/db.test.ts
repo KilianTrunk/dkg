@@ -86,7 +86,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(13);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(14);
 
     const cols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -120,6 +120,58 @@ describe('DashboardDB — metric snapshots', () => {
     const preExisting = db.getSnapshotHistory(recentTs, recentTs);
     expect(preExisting).toHaveLength(1);
     expect(preExisting[0].relay_capacity).toBeNull();
+  });
+
+  it('migrates pre-V14 paranet_count / paranet_id columns to contextGraph_*', () => {
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    const raw = new Database(dbPath);
+    // Simulate a V13 DB that still has the old column names
+    const snapshotCols = (raw.prepare('PRAGMA table_info(metric_snapshots)').all() as { name: string }[])
+      .map(c => c.name);
+    if (snapshotCols.includes('contextGraph_count')) {
+      raw.exec('ALTER TABLE metric_snapshots RENAME COLUMN contextGraph_count TO paranet_count');
+    }
+    const opsCols = (raw.prepare('PRAGMA table_info(operations)').all() as { name: string }[])
+      .map(c => c.name);
+    if (opsCols.includes('contextGraph_id')) {
+      raw.exec('ALTER TABLE operations RENAME COLUMN contextGraph_id TO paranet_id');
+    }
+    raw.pragma('user_version = 13');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.db.pragma('user_version', { simple: true })).toBe(14);
+
+    const newSnapshotCols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as { name: string }[])
+      .map(c => c.name);
+    expect(newSnapshotCols).toContain('contextGraph_count');
+    expect(newSnapshotCols).not.toContain('paranet_count');
+
+    const newOpsCols = (db.db.prepare('PRAGMA table_info(operations)').all() as { name: string }[])
+      .map(c => c.name);
+    expect(newOpsCols).toContain('contextGraph_id');
+    expect(newOpsCols).not.toContain('paranet_id');
+
+    // Verify inserts work with the new column names
+    expect(() => db.insertSnapshot({
+      ts: Date.now(), cpu_percent: 50, mem_used_bytes: null, mem_total_bytes: null,
+      disk_used_bytes: null, disk_total_bytes: null, heap_used_bytes: null,
+      uptime_seconds: null, peer_count: 2, direct_peers: 1, relayed_peers: 1,
+      mesh_peers: null, contextGraph_count: 3, total_triples: null,
+      total_kcs: null, total_kas: null, store_bytes: null, confirmed_kcs: null,
+      tentative_kcs: null, rpc_latency_ms: null, rpc_healthy: null,
+      relay_capacity: null, relay_reservation_count: null, relay_active_circuits: null,
+      relay_bytes_in: null, relay_bytes_out: null,
+    })).not.toThrow();
+
+    expect(() => db.insertOperation({
+      operation_id: 'test-v14-migration',
+      operation_name: 'query',
+      started_at: Date.now(),
+      contextGraph_id: 'did:dkg:context-graph:test',
+    })).not.toThrow();
   });
 });
 
@@ -827,7 +879,7 @@ describe('DashboardDB — V11→V13 chat schema migration chain', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(13);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(14);
 
     const cols = (db.db.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>)
       .map((c) => c.name);

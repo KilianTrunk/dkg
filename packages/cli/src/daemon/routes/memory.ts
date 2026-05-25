@@ -610,12 +610,20 @@ WHERE {
     // request body for slow or congested networks.
     const DEFAULT_PER_PEER_SWM_BUDGET_MS = 110_000;
     const DEFAULT_PER_PEER_DURABLE_BUDGET_MS = 110_000;
-    const PER_PEER_SWM_BUDGET_MS = (typeof parsed.perPeerBudgetMs === 'number' && parsed.perPeerBudgetMs > 0)
-      ? Math.min(parsed.perPeerBudgetMs, 300_000)
-      : DEFAULT_PER_PEER_SWM_BUDGET_MS;
-    const PER_PEER_DURABLE_BUDGET_MS = (typeof parsed.perPeerDurableBudgetMs === 'number' && parsed.perPeerDurableBudgetMs > 0)
-      ? Math.min(parsed.perPeerDurableBudgetMs, 300_000)
-      : DEFAULT_PER_PEER_DURABLE_BUDGET_MS;
+    // Explicit integer-floor + range-check pattern: lets CodeQL's taint
+    // analysis prove the timer duration is bounded to [1_000, 300_000]ms
+    // even when the input arrives via untrusted JSON. Math.min alone reads
+    // as "user-controlled" to the resource-exhaustion rule.
+    const MIN_BUDGET_MS = 1_000;
+    const MAX_BUDGET_MS = 300_000;
+    const boundedBudget = (raw: unknown, fallback: number): number => {
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) return fallback;
+      const n = Math.floor(raw);
+      if (n < MIN_BUDGET_MS || n > MAX_BUDGET_MS) return fallback;
+      return n;
+    };
+    const PER_PEER_SWM_BUDGET_MS = boundedBudget(parsed.perPeerBudgetMs, DEFAULT_PER_PEER_SWM_BUDGET_MS);
+    const PER_PEER_DURABLE_BUDGET_MS = boundedBudget(parsed.perPeerDurableBudgetMs, DEFAULT_PER_PEER_DURABLE_BUDGET_MS);
 
     const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
       new Promise<T>((resolve, reject) => {

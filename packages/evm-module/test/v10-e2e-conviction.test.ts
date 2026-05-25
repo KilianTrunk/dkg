@@ -290,6 +290,7 @@ describe('V10 E2E Conviction System', function () {
         1,                 // publishPolicy = open (any non-zero publisher auth'd)
         ethers.ZeroAddress,
         0,                 // publishAuthorityAccountId
+        ethers.ZeroHash,   // nameHash (LU-6 Phase B)
       );
       const cgId = await CGS.getLatestContextGraphId();
       expect(cgId).to.equal(1n);
@@ -476,8 +477,7 @@ describe('V10 E2E Conviction System', function () {
       expect(
         await KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId),
       ).to.equal(creator.address);
-    });,
-        ethers.ZeroHash,
-  ));
+    });
+  });
 
 });

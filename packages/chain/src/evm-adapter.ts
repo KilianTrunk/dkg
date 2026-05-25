@@ -1,4 +1,8 @@
 import { ethers, JsonRpcProvider, Wallet, Contract, Interface } from 'ethers';
+import {
+  createFilterErrorSilencer,
+  type FilterErrorSilencer,
+} from './filter-error-silencer.js';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
@@ -284,6 +288,7 @@ export class EVMChainAdapter implements ChainAdapter {
   readonly chainId: string;
 
   private readonly provider: JsonRpcProvider;
+  private readonly filterErrorSilencer: FilterErrorSilencer;
   /** Primary signer — used for identity/profile/staking operations. */
   private readonly signer: Wallet;
   /** All operational signers (includes primary). Used round-robin for publish TXs. */
@@ -359,6 +364,25 @@ export class EVMChainAdapter implements ChainAdapter {
 
   constructor(config: EVMAdapterConfig) {
     this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
+    // PR-8: install the filter-not-found silencer. Without this, RPC
+    // nodes that GC filters faster than ethers' polling cadence
+    // (observed: 134 MB of daemon.log spam in 24h on beacon-01) spam
+    // the operator's logs with per-tick "filter not found" errors.
+    // The silencer dedupe-logs once per DEDUP_WINDOW_MS, lets every
+    // other provider error propagate normally. The Hub TTL-refresh
+    // fallback in startHubRotationListener already keeps contract
+    // addresses fresh while filters are silently failing — this PR is
+    // log-spam suppression, not filter recreation. (See module
+    // docblock for the rationale on the deliberate scope limit.)
+    this.filterErrorSilencer = createFilterErrorSilencer();
+    this.provider.on('error', (err: unknown) => {
+      if (this.filterErrorSilencer.handle(err)) return;
+      // Non-filter provider errors fall through to the default warn
+      // path so they remain visible. Operators grepping their logs
+      // for chain-provider issues still see everything they used to
+      // EXCEPT the filter-spam class.
+      console.warn(`[chain] provider error: ${err instanceof Error ? err.message : String(err)}`);
+    });
     this.signer = new Wallet(config.privateKey, this.provider);
     this.signerPool = [this.signer];
     for (const key of config.additionalKeys ?? []) {

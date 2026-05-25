@@ -1,0 +1,194 @@
+/**
+ * Unit tests for PR-8: the filter-not-found log-spam silencer.
+ *
+ * Two surfaces:
+ *   - `isFilterNotFoundError` — pure classifier; table-driven.
+ *   - `createFilterErrorSilencer` — stateful dedup; injectable clock
+ *     and log target make the time-based suppression deterministic.
+ */
+
+import { describe, it, expect, vi } from 'vitest';
+import {
+  isFilterNotFoundError,
+  createFilterErrorSilencer,
+  DEFAULT_DEDUP_WINDOW_MS,
+} from '../src/filter-error-silencer.js';
+
+describe('isFilterNotFoundError', () => {
+  it('matches plain ethers error messages containing "filter not found"', () => {
+    expect(isFilterNotFoundError(new Error('filter not found'))).toBe(true);
+    expect(isFilterNotFoundError(new Error('Filter Not Found'))).toBe(true);
+    expect(isFilterNotFoundError(new Error('JSON-RPC response: -32602 filter not found'))).toBe(true);
+    expect(
+      isFilterNotFoundError(
+        new Error(
+          'could not coalesce error eth_getFilterChanges("0x4e58f53e...") filter not found',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('matches ethers-wrapped errors with structured RPC code on err.info', () => {
+    const wrapped = Object.assign(new Error('could not coalesce error'), {
+      info: { error: { code: -32602, message: 'filter not found' } },
+    });
+    expect(isFilterNotFoundError(wrapped)).toBe(true);
+  });
+
+  it('matches when err.code is set directly to -32602 with a filter message', () => {
+    const err = Object.assign(new Error('rpc failure'), {
+      code: -32602,
+      info: { error: { code: -32602, message: 'filter expired' } },
+    });
+    expect(isFilterNotFoundError(err)).toBe(true);
+  });
+
+  it('does NOT match other -32602 messages (invalid params, etc.)', () => {
+    const err = Object.assign(new Error('rpc failure'), {
+      info: { error: { code: -32602, message: 'invalid params: from must be hex' } },
+    });
+    expect(isFilterNotFoundError(err)).toBe(false);
+  });
+
+  it('does NOT match unrelated provider errors', () => {
+    expect(isFilterNotFoundError(new Error('ECONNRESET'))).toBe(false);
+    expect(isFilterNotFoundError(new Error('rate limited'))).toBe(false);
+    expect(isFilterNotFoundError(new Error('execution reverted: foo'))).toBe(false);
+    expect(isFilterNotFoundError(undefined)).toBe(false);
+    expect(isFilterNotFoundError(null)).toBe(false);
+  });
+
+  it('handles non-Error inputs gracefully', () => {
+    expect(isFilterNotFoundError('filter not found')).toBe(true);
+    expect(isFilterNotFoundError({ message: 'no match here' })).toBe(false);
+  });
+});
+
+describe('createFilterErrorSilencer', () => {
+  it('returns false (does NOT handle) for non-filter errors', () => {
+    const log = vi.fn();
+    const silencer = createFilterErrorSilencer({ log });
+    expect(silencer.handle(new Error('ECONNRESET'))).toBe(false);
+    expect(log).not.toHaveBeenCalled();
+    expect(silencer.stats().filterErrorsTotal).toBe(0);
+  });
+
+  it('emits the first filter error immediately', () => {
+    const log = vi.fn();
+    const silencer = createFilterErrorSilencer({ log, now: () => 1_000 });
+    expect(silencer.handle(new Error('filter not found'))).toBe(true);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toContain('RPC filter expired');
+    expect(silencer.stats().filterErrorsTotal).toBe(1);
+    expect(silencer.stats().filterErrorsSuppressedInWindow).toBe(0);
+  });
+
+  it('suppresses subsequent errors within the dedup window', () => {
+    const log = vi.fn();
+    let clock = 1_000;
+    const silencer = createFilterErrorSilencer({
+      log,
+      dedupWindowMs: 60_000,
+      now: () => clock,
+    });
+    silencer.handle(new Error('filter not found'));
+    expect(log).toHaveBeenCalledTimes(1);
+    clock = 30_000;
+    silencer.handle(new Error('filter not found'));
+    silencer.handle(new Error('filter not found'));
+    silencer.handle(new Error('filter not found'));
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(silencer.stats().filterErrorsTotal).toBe(4);
+    expect(silencer.stats().filterErrorsSuppressedInWindow).toBe(3);
+  });
+
+  it('re-emits after the dedup window elapses with the suppressed count', () => {
+    const log = vi.fn();
+    let clock = 1_000;
+    const silencer = createFilterErrorSilencer({
+      log,
+      dedupWindowMs: 60_000,
+      now: () => clock,
+    });
+    silencer.handle(new Error('filter not found'));
+    expect(log).toHaveBeenCalledTimes(1);
+    clock = 30_000;
+    silencer.handle(new Error('filter not found'));
+    silencer.handle(new Error('filter not found'));
+    clock = 70_000;
+    silencer.handle(new Error('filter not found'));
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(log.mock.calls[1][0]).toContain('2 similar errors suppressed');
+    expect(silencer.stats().filterErrorsTotal).toBe(4);
+    expect(silencer.stats().filterErrorsSuppressedInWindow).toBe(0);
+  });
+
+  it('omits the suppressed-suffix when no errors were suppressed since the last emit', () => {
+    const log = vi.fn();
+    let clock = 1_000;
+    const silencer = createFilterErrorSilencer({
+      log,
+      dedupWindowMs: 1_000,
+      now: () => clock,
+    });
+    silencer.handle(new Error('filter not found'));
+    clock = 5_000;
+    silencer.handle(new Error('filter not found'));
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(log.mock.calls[0][0]).not.toContain('similar errors suppressed');
+    expect(log.mock.calls[1][0]).not.toContain('similar errors suppressed');
+  });
+
+  it('uses the default 5-minute window when not overridden', () => {
+    const log = vi.fn();
+    let clock = 1_000;
+    const silencer = createFilterErrorSilencer({ log, now: () => clock });
+    silencer.handle(new Error('filter not found'));
+    expect(log).toHaveBeenCalledTimes(1);
+    clock = 1_000 + DEFAULT_DEDUP_WINDOW_MS - 1;
+    silencer.handle(new Error('filter not found'));
+    expect(log).toHaveBeenCalledTimes(1);
+    clock = 1_000 + DEFAULT_DEDUP_WINDOW_MS;
+    silencer.handle(new Error('filter not found'));
+    expect(log).toHaveBeenCalledTimes(2);
+  });
+
+  it('resetForTest clears all internal state', () => {
+    const log = vi.fn();
+    const silencer = createFilterErrorSilencer({ log, now: () => 1_000 });
+    silencer.handle(new Error('filter not found'));
+    silencer.handle(new Error('filter not found'));
+    expect(silencer.stats().filterErrorsTotal).toBe(2);
+    silencer.resetForTest();
+    expect(silencer.stats()).toEqual({
+      filterErrorsTotal: 0,
+      filterErrorsSuppressedInWindow: 0,
+      lastEmitAt: null,
+    });
+  });
+
+  it('non-filter errors don\'t bump the counter or affect the dedup window', () => {
+    const log = vi.fn();
+    let clock = 1_000;
+    const silencer = createFilterErrorSilencer({
+      log,
+      dedupWindowMs: 60_000,
+      now: () => clock,
+    });
+    silencer.handle(new Error('filter not found'));
+    silencer.handle(new Error('ECONNRESET'));
+    silencer.handle(new Error('rate limited'));
+    expect(silencer.stats().filterErrorsTotal).toBe(1);
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('production wiring shape (sanity)', () => {
+  it('createFilterErrorSilencer with no args returns a working silencer using console.warn', () => {
+    const silencer = createFilterErrorSilencer();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    silencer.handle(new Error('filter not found'));
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
+  });
+});

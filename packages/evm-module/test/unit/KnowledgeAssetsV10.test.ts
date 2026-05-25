@@ -257,7 +257,8 @@ describe('@unit KnowledgeAssetsV10', () => {
       0, // accessPolicy = public/discoverable
       1, // publishPolicy = open
       ethers.ZeroAddress,
-      0, // publishAuthorityAccountId
+      0, // publishAuthorityAccountId,
+      ethers.ZeroHash,
     );
     return CGStorageContract.getLatestContextGraphId();
   }
@@ -277,6 +278,7 @@ describe('@unit KnowledgeAssetsV10', () => {
       0, // publishPolicy = curated
       authority,
       accountId,
+      ethers.ZeroHash,
     );
     return CGStorageContract.getLatestContextGraphId();
   }
@@ -1041,6 +1043,9 @@ describe('@unit KnowledgeAssetsV10', () => {
           tokenAmount,
           isImmutable: false,
           merkleLeafCount: 1,
+          // RFC-39 Phase A.5: open CG path, no ciphertext commitment.
+          ciphertextChunksRoot: ethers.ZeroHash,
+          ciphertextChunkCount: 0,
           publisherNodeIdentityId: publisherIdentityId,
           authorAddress: creator.address,
           authorR: authorSig.authorR,
@@ -2047,6 +2052,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           0, // publishPolicy = curated
           nftOwner.address,
           pcaAccountId,
+          ethers.ZeroHash,
         );
         const cgId = await CGStorageContract.getLatestContextGraphId();
 

@@ -1205,6 +1205,12 @@ export class EVMChainAdapter implements ChainAdapter {
           for (const log of logs) {
             const parsed = cgStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
             if (parsed) {
+              // OT-RFC-38 / LU-6 Phase B — `nameHash` is the curator-committed
+              // wire id used to derive the SWM gossip topic. Zero indicates
+              // the curator opted out at create time (rare); cores fall back
+              // to the discovery-beacon path in that case.
+              const nameHashRaw = parsed.args.nameHash?.toString() ?? '0x';
+              const nameHash = nameHashRaw === '0x' ? null : nameHashRaw.toLowerCase();
               yield {
                 type: 'ContextGraphCreated',
                 blockNumber: log.blockNumber,
@@ -1214,6 +1220,7 @@ export class EVMChainAdapter implements ChainAdapter {
                   owner: parsed.args.owner?.toString() ?? '',
                   accessPolicy: Number(parsed.args.accessPolicy ?? 0),
                   publishPolicy: Number(parsed.args.publishPolicy ?? 0),
+                  nameHash,
                   txHash: log.transactionHash,
                 },
               };
@@ -1385,6 +1392,11 @@ export class EVMChainAdapter implements ChainAdapter {
       params.publishPolicy,
       params.publishAuthority ?? ethers.ZeroAddress,
       params.publishAuthorityAccountId ?? 0n,
+      // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
+      // `bytes32(0)` opts out; the agent supplies a non-zero hash
+      // (typically `keccak256(bytes(cleartextId))`) to enable cores'
+      // chain-event-driven host-mode auto-subscribe path.
+      params.nameHash ?? ethers.ZeroHash,
     );
     const receipt = await tx.wait();
 
@@ -1700,6 +1712,14 @@ export class EVMChainAdapter implements ChainAdapter {
       tokenAmount: params.tokenAmount,
       isImmutable: params.isImmutable,
       merkleLeafCount: params.merkleLeafCount,
+      // RFC-39 Phase A.5 — ciphertext-commitment pair. Defaults to
+      // `bytes32(0)` / 0 (legacy/transitional, picker skips this KC in
+      // the curated draw). Callers that have an LU-11 commitment set
+      // both via `ciphertextChunksRoot` + `ciphertextChunkCount`.
+      ciphertextChunksRoot: params.ciphertextChunksRoot
+        ? ethers.hexlify(params.ciphertextChunksRoot)
+        : ethers.ZeroHash,
+      ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
       publisherNodeIdentityId: params.publisherNodeIdentityId,
       authorAddress: params.author.address,
       authorR: ethers.hexlify(params.author.signature.r),
@@ -2049,6 +2069,14 @@ export class EVMChainAdapter implements ChainAdapter {
       newMerkleLeafCount: params.newMerkleLeafCount,
       mintKnowledgeAssetsAmount: params.mintAmount ?? 0,
       knowledgeAssetsToBurn: burnIds,
+      // Codex PR #630 R1 #2 — RFC-39 Phase A.5 commitment refresh.
+      // Defaults to `bytes32(0)` / 0 (metadata-only update or
+      // public-CG path; KC's existing commitment stays in place).
+      // Callers refreshing curated ciphertext set BOTH non-zero.
+      newCiphertextChunksRoot: params.newCiphertextChunksRoot
+        ? ethers.hexlify(params.newCiphertextChunksRoot)
+        : ethers.ZeroHash,
+      newCiphertextChunkCount: params.newCiphertextChunkCount ?? 0,
       publisherNodeIdentityId: identityId,
       identityIds: ackSigs.map(s => s.identityId),
       r: ackSigs.map(s => ethers.hexlify(s.r)),
@@ -2948,5 +2976,62 @@ export class EVMChainAdapter implements ChainAdapter {
     const cgs = this.requireContextGraphStorage();
     const cgId: bigint = await cgs.kcToContextGraph(kcId);
     return BigInt(cgId);
+  }
+
+  /**
+   * OT-RFC-38 / LU-5: chain-backed access-policy oracle for cores.
+   * `ContextGraphStorage.getAccessPolicy` returns the uint8 enum
+   * (`0`=public, `1`=curated). Unregistered ids return `0` (Solidity
+   * default-zero mapping); callers should treat that as "public /
+   * unknown" — for the encrypted-payload guard, `0` MUST NOT be
+   * interpreted as a positive curation signal.
+   */
+  async getContextGraphAccessPolicy(contextGraphId: bigint): Promise<number> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
+    return Number(raw);
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent
+   * allowlist read. Mirrors {@link getContextGraphAccessPolicy}
+   * (single eth_call, used as the authoritative oracle when the
+   * local store has no answer).
+   *
+   * `ContextGraphStorage.getParticipantAgents` returns the address
+   * array as registered at create time. Empty array for unregistered
+   * ids or CGs that genuinely have no agents (the Solidity getter
+   * just returns the stored mapping; absent ids return zero-length).
+   * Addresses are returned in EIP-55 checksum form to keep callers
+   * consistent with the local-store accessor.
+   */
+  async getContextGraphParticipantAgents(contextGraphId: bigint): Promise<string[]> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const raw: string[] = await cgs.getParticipantAgents(contextGraphId);
+    return raw.map((addr: string) => ethers.getAddress(addr));
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — read the curator-committed wire id
+   * from `ContextGraphStorage.getNameHash(uint256)`. Returns `null`
+   * for unregistered ids OR for the opt-out path (curator passed
+   * `bytes32(0)` at create time); callers fall back to the discovery
+   * beacon in that case.
+   */
+  async getContextGraphNameHash(contextGraphId: bigint): Promise<string | null> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    try {
+      const raw: string = await cgs.getNameHash(contextGraphId);
+      if (!raw || raw === ethers.ZeroHash) return null;
+      return raw.toLowerCase();
+    } catch (err) {
+      // Fail-closed: an RPC hiccup shouldn't leak as a positive id.
+      // Caller treats `null` as "no chain-anchored hash" and falls
+      // back to the beacon path or rejects.
+      return null;
+    }
   }
 }

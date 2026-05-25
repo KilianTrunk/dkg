@@ -121,8 +121,20 @@ const PINNED_DIGESTS: Record<string, string> = {
   // The transient `PCAEpochsMismatch` error introduced earlier in this
   // PR was removed (it became unreachable). Update path uses `<=` for
   // `remainingEpochs` since update legitimately passes a delta.
-  KnowledgeAssetsV10:           '785311d19ce39743522bf1db501f41276fb22d715a2cc94cc67d96f8a22e519e',
-  KnowledgeCollectionStorage:   'e165cbddc6569602d1d5c05c15909fd0a9ff851f974357cf80297041b2a83fd2',
+  //
+  // Updated PR #630 (RFC-39 Phase A.5): `KnowledgeAssetsV10.publish` /
+  // `update` now thread a per-KC ciphertext commitment pair
+  // (`(bytes32 ciphertextChunksRoot, uint64 ciphertextChunkCount)`)
+  // through `V10PublishParams` / `V10UpdateParams`. The picker in
+  // `RandomSampling` (curated draw, step 2) reads these via
+  // `KnowledgeCollectionStorage.getLatestCiphertextChunksRoot` /
+  // `…ChunkCount` to filter pre-LU-11 curated KCs out of the curated
+  // lottery. The KCS hash drift here reflects the new storage getters
+  // + the `CiphertextChunksCommitmentSet` event surface that
+  // `KnowledgeAssetsV10._executeUpdateCore` emits when a non-zero pair
+  // rotates the commitment.
+  KnowledgeAssetsV10:           '6f186793993c18c40a212d2e2a663689b520cf96f351e86492a23a75416c417c',
+  KnowledgeCollectionStorage:   '8c0e6e3b19f072b15f6c54852ff0a58ffc0dffddb9676d221de78b8019d32bdd',
   // V8 `KnowledgeCollection` ABI was moved to `abi/archive/` in
   // `archive-non-v10-contracts`; the pin entry is intentionally dropped.
   // Updated for SPEC_CG_MEMORY_MODEL: per-CG hosting committees and
@@ -133,8 +145,15 @@ const PINNED_DIGESTS: Record<string, string> = {
   // `getContextGraphRequiredSignatures`, `HostingNodesSet`, `QuorumUpdated`,
   // and the `hostingNodes`+`requiredSignatures` fields on `createContextGraph`
   // / `ContextGraphCreated` / `getContextGraph` are all gone.
-  ContextGraphs:                'f29a059eac0edcfb06a77ef303a3929c450dc52ddfe7b7c1593047f92e59937c',
-  ContextGraphStorage:          'dc861b05580022225f36d6e593a9c23097b87fb43e4975936a54d34d9c3ffe31',
+  // Updated OT-RFC-38 / LU-6 Phase B: `bytes32 nameHash` added as the 8th
+  // arg to `createContextGraph` (+ matching `bytes32 indexed nameHash` in
+  // `ContextGraphCreated` event between `owner` and `participantAgents`),
+  // plus a new `getNameHash(uint256)` accessor. Curator-committed wire
+  // identifier so hosting cores can derive the SWM gossip topic directly
+  // from chain events — no off-chain discovery channel required for
+  // registered CGs.
+  ContextGraphs:                '052f2afe4dd7b95e1230c5ddaedd05db014e63d3ef9ca195f2f0f79433821bde',
+  ContextGraphStorage:          '295160a2bb171dae51fb791d2a8642b22196ede95f3308366589edaea40d22cb',
   // Identity / staking — consulted on every publish.
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
   Identity:                     '29d09dd97de53de69d5bf2282d2f3008044ab43fb86c812fc4912552c9288946',
@@ -217,7 +236,13 @@ describe('ABI content sanity — required event/error surfaces are present [CH-5
     expect(types).toEqual(['uint256', 'address', 'uint256', 'uint256']);
   });
 
-  it('ContextGraphStorage declares ContextGraphCreated with the post-SPEC_CG_MEMORY_MODEL shape (no per-CG hosting committee)', () => {
+  it('ContextGraphStorage declares ContextGraphCreated with the post-LU-6-Phase-B shape (nameHash inserted as 3rd field)', () => {
+    // OT-RFC-38 / LU-6 Phase B adds `bytes32 indexed nameHash` between
+    // `owner` and `participantAgents`. The field is INSERTED rather
+    // than appended so cores reading the event can pull it off the
+    // indexed topics array (topic[3] in the new layout) instead of
+    // ABI-decoding the data tail — keeps the chain-event-driven host-
+    // mode auto-subscribe path O(1) per event.
     const abi = JSON.parse(
       readFileSync(join(ABI_DIR, 'ContextGraphStorage.json'), 'utf8'),
     ) as AbiEntry[];
@@ -227,6 +252,7 @@ describe('ABI content sanity — required event/error surfaces are present [CH-5
     expect(types).toEqual([
       'uint256',   // contextGraphId
       'address',   // owner
+      'bytes32',   // nameHash (LU-6 Phase B)
       'address[]', // participantAgents
       'uint256',   // metadataBatchId
       'uint8',     // accessPolicy
@@ -234,6 +260,9 @@ describe('ABI content sanity — required event/error surfaces are present [CH-5
       'address',   // publishAuthority
       'uint256',   // publishAuthorityAccountId
     ]);
+    // Indexed: contextGraphId, owner, nameHash.
+    const indexed = (ev!.inputs ?? []).map((i) => Boolean(i.indexed));
+    expect(indexed.slice(0, 3)).toEqual([true, true, true]);
   });
 
   it('KnowledgeCollectionStorage declares KnowledgeCollectionUpdated (V10 update event)', () => {

@@ -21,7 +21,7 @@ import yaml from 'js-yaml';
 import {
   loadConfig, saveConfig, configExists, configPath,
   readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir,
-  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveChainConfig,
+  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
@@ -3972,7 +3972,7 @@ program
     // operator with `source: "npm"` configured goes through the npm install
     // path even if .git is still present in the working tree. See
     // `AutoUpdateConfig.source` (config.ts) for the rationale.
-    const standalone = resolveStandaloneInstall(au.source ?? config.autoUpdate?.source);
+    const standalone = resolveStandaloneInstall(au.source ?? resolveAutoUpdateSource(config, net));
     const allowPre = opts.allowPrerelease === true ? true : (au.allowPrerelease ?? true);
 
     if (standalone) {

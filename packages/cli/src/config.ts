@@ -663,6 +663,13 @@ export function resolveAutoUpdateConfig(
   };
 }
 
+export function resolveAutoUpdateSource(
+  config: Pick<DkgConfig, 'autoUpdate'> | null | undefined,
+  network: Pick<NetworkConfig, 'autoUpdate'> | null | undefined,
+): AutoUpdateConfig['source'] {
+  return config?.autoUpdate?.source ?? network?.autoUpdate?.source;
+}
+
 /**
  * Field-level merge of the effective chain configuration.
  *

@@ -100,6 +100,7 @@ import {
   gitCommandEnv,
   gitCommandArgs,
   isStandaloneInstall,
+  resolveAutoUpdateSource,
   slotEntryPoint,
   CLI_NPM_PACKAGE,
 } from '../config.js';
@@ -1057,10 +1058,10 @@ export async function runDaemonInner(
   const au = resolveAutoUpdateConfig(config, network);
   // Honour `autoUpdate.source` override (config.ts) — explicit "npm" / "git"
   // wins over the filesystem probe (`isStandaloneInstall()`); "auto" or omitted
-  // falls through to today's behaviour. Fall back to the raw config when `au`
-  // is null (auto-update disabled) so the override still seeds the cache for
-  // anyone else who reads `daemonState.standaloneCache` later in the boot.
-  const standalone = resolveStandaloneInstall(au?.source ?? config.autoUpdate?.source);
+  // falls through to today's behaviour. Resolve source even when `au` is null
+  // (auto-update disabled) so local/network install-mode policy still seeds the
+  // cache for anyone else who reads `daemonState.standaloneCache` later in boot.
+  const standalone = resolveStandaloneInstall(au?.source ?? resolveAutoUpdateSource(config, network));
   const hasGitConfig = !!au;
 
   if (standalone || hasGitConfig) {

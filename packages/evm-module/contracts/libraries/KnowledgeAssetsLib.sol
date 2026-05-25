@@ -41,20 +41,24 @@ library KnowledgeAssetsLib {
     /**
      * @dev Core context graph metadata.
      *
-     * The two participant lists (hosting nodes — uint72 identity IDs — and
-     * participant agents — addresses) live in their own mappings inside
-     * ContextGraphStorage rather than as struct fields, because Solidity's
-     * memory↔storage copy semantics make struct-level dynamic arrays
-     * awkward to mutate.
+     * The participant-agent allow-list (address list) lives in its own
+     * mapping inside ContextGraphStorage rather than as a struct field,
+     * because Solidity's memory↔storage copy semantics make struct-level
+     * dynamic arrays awkward to mutate.
      *
      * `publishAuthority` stores the curator address for EOA / Safe curator
      * types AND the account-owner address for PCA. The curator type is
      * disambiguated by the `_publishAuthorityAccountId` mapping — non-zero
      * means PCA.
      *
+     * Per-CG hosting committees (`hostingNodes`) and per-CG quorum
+     * (`requiredSignatures`) were removed in SPEC_CG_MEMORY_MODEL: every
+     * CG is hosted by the sharding table at publish time, and the ACK
+     * quorum is the system parameter `parametersStorage.minimumRequiredSignatures()`.
+     *
      * Storage layout (tight-packed, 2 slots):
-     *   slot 0: publishAuthority (20) | createdAt (5) | requiredSignatures (1)
-     *           | publishPolicy (1) | active (1) | accessPolicy (1) = 29 bytes
+     *   slot 0: publishAuthority (20) | createdAt (5) | publishPolicy (1)
+     *           | active (1) | accessPolicy (1) = 28 bytes
      *   slot 1: metadataBatchId (32) — full 256 bits for forward-compat
      *
      * `createdAt` is uint40 seconds-since-epoch: max value ~1.1e12 seconds ≈
@@ -64,7 +68,6 @@ library KnowledgeAssetsLib {
         // Slot 0 (28 bytes of 32 used)
         address publishAuthority;  // Curator address (EOA, Safe multisig, or PCA owner)
         uint40 createdAt;          // Seconds since epoch; good until year ~36,835
-        uint8 requiredSignatures;
         uint8 publishPolicy;       // 0 = curated (default), 1 = open
         bool active;
         uint8 accessPolicy;        // 0 = public/discoverable, 1 = private/curated

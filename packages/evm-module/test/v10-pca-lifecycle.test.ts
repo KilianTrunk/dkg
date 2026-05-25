@@ -277,9 +277,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     expect(await NFT.agentToAccountId(creator.address)).to.equal(accountId);
 
     await CGFacade.connect(creator).createContextGraph(
-      [10n, 20n, 30n],
       [],
-      2,
       0,
       0,
       1,

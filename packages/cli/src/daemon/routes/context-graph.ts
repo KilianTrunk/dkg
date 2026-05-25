@@ -423,81 +423,30 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
   } = ctx;
 
 
-  // POST /api/context-graph/create — on-chain context graph creation (V10)
-  // When the body has `participantIdentityIds` but no local create metadata (`id`/`name`),
-  // treat it as the on-chain multisig creation flow. Otherwise, handle it as the
-  // free/local context-graph create flow below.
+  // POST /api/context-graph/create — context graph definition create.
+  // SPEC_CG_MEMORY_MODEL / Codex PR #595 round-4: per-CG hosting
+  // committees and per-CG quorum overrides were removed end-to-end.
+  // The on-chain contract no longer accepts those args, so silently
+  // stripping `participantIdentityIds` / `requiredSignatures` from the
+  // request body would let callers believe they created an M-of-N /
+  // roster-constrained CG when those constraints were actually
+  // discarded. We reject any body that still carries either field with
+  // a structured 400 + machine-readable `code`, forcing callers to
+  // migrate. The on-chain semantics those fields requested no longer
+  // exist; there is no faithful translation.
   if (req.method === "POST" && path === "/api/context-graph/create") {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = JSON.parse(body);
-    const isLocalCreate = typeof parsed.id === 'string' && typeof parsed.name === 'string';
-    if (Array.isArray(parsed.participantIdentityIds) && !isLocalCreate) {
-      const { participantIdentityIds } = parsed;
-      const isPrivateLocalOnly = parsed.private === true;
-      const requiredSignatures = typeof parsed.requiredSignatures === 'number'
-        ? parsed.requiredSignatures
-        : (isPrivateLocalOnly ? 1 : undefined);
-      if (typeof requiredSignatures !== 'number') {
-        return jsonResponse(res, 400, { error: 'Missing requiredSignatures (number)' });
-      }
-      if (!Number.isInteger(requiredSignatures) || requiredSignatures < 1) {
-        return jsonResponse(res, 400, {
-          error: "requiredSignatures must be a positive integer (>= 1)",
-        });
-      }
-      if (requiredSignatures > participantIdentityIds.length) {
-        return jsonResponse(res, 400, {
-          error: `requiredSignatures (${requiredSignatures}) cannot exceed participantIdentityIds count (${participantIdentityIds.length})`,
-        });
-      }
-      for (let i = 0; i < participantIdentityIds.length; i++) {
-        const id = participantIdentityIds[i];
-        if (typeof id === "number") {
-          if (
-            !Number.isInteger(id) ||
-            id <= 0 ||
-            id > Number.MAX_SAFE_INTEGER
-          ) {
-            return jsonResponse(res, 400, {
-              error: `participantIdentityIds[${i}] must be a positive safe integer`,
-            });
-          }
-        } else if (typeof id === "string") {
-          if (!/^\d+$/.test(id) || id === "0") {
-            return jsonResponse(res, 400, {
-              error: `participantIdentityIds[${i}] must be a positive decimal integer string`,
-            });
-          }
-        } else {
-          return jsonResponse(res, 400, {
-            error: `participantIdentityIds[${i}] must be a number or string`,
-          });
-        }
-      }
-      try {
-        const mappedIds = participantIdentityIds.map((id: number | string) =>
-          BigInt(id),
-        );
-        const uniqueIds: bigint[] = Array.from(new Set(mappedIds));
-        const sortedUniqueIds = uniqueIds.sort((a, b) =>
-          a < b ? -1 : a > b ? 1 : 0,
-        );
-        if (requiredSignatures > sortedUniqueIds.length) {
-          return jsonResponse(res, 400, {
-            error: `requiredSignatures (${requiredSignatures}) exceeds unique participant count (${sortedUniqueIds.length}) after deduplication`,
-          });
-        }
-        const result = await agent.registerContextGraphOnChain({
-          participantIdentityIds: sortedUniqueIds,
-          requiredSignatures,
-        });
-        return jsonResponse(res, 200, {
-          contextGraphId: String(result.contextGraphId),
-          success: true,
-        });
-      } catch (err: any) {
-        return jsonResponse(res, 500, { error: err.message });
-      }
+    if (parsed.participantIdentityIds !== undefined || parsed.requiredSignatures !== undefined) {
+      return jsonResponse(res, 400, {
+        error:
+          '`participantIdentityIds` and `requiredSignatures` were removed in SPEC_CG_MEMORY_MODEL. Per-CG hosting committees and per-CG quorum overrides no longer exist on-chain — every CG uses the system-wide ACK quorum (parametersStorage.minimumRequiredSignatures()) and the network sharding table for hosting. Remove these fields from the request body and use `{ id, name, accessPolicy?, publishPolicy?, allowedAgents? }` instead.',
+        code: 'DEPRECATED_CONTEXT_GRAPH_FIELDS',
+        deprecatedFields: [
+          ...(parsed.participantIdentityIds !== undefined ? ['participantIdentityIds'] : []),
+          ...(parsed.requiredSignatures !== undefined ? ['requiredSignatures'] : []),
+        ],
+      });
     }
     // Body has `id` + `name` → context-graph-style context graph definition create (handled below)
     const { id, name, description, allowedAgents, allowedPeers, participantAgents, publishPolicy, accessPolicy, register } = parsed;
@@ -582,10 +531,6 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         accessPolicy: inferredAccessPolicy,
         callerAgentAddress: requestAgentAddress,
         ...(parsed.private === true ? { private: true } : {}),
-        ...(Array.isArray(parsed.participantIdentityIds)
-          ? { participantIdentityIds: parsed.participantIdentityIds.map((v: string | number) => BigInt(v)) }
-          : {}),
-        ...(typeof parsed.requiredSignatures === 'number' ? { requiredSignatures: parsed.requiredSignatures } : {}),
       });
     } catch (err: any) {
       const msg = err?.message ?? "";

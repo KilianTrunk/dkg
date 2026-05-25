@@ -724,6 +724,55 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     // message — callers should see something human-readable.
     expect(body.error).not.toMatch(/^0x[0-9a-fA-F]+$/);
   });
+
+  // SPEC_CG_MEMORY_MODEL / Codex PR #595 round-4: per-CG hosting
+  // committees and per-CG quorum overrides were removed end-to-end.
+  // The on-chain contract no longer accepts those args, so silently
+  // stripping them from the request body would let callers believe
+  // they created a roster-constrained / M-of-N CG when those
+  // constraints were actually discarded. We reject any body that
+  // carries either field, regardless of whether `id`/`name` are also
+  // present — there is no faithful translation.
+  for (const fields of [
+    { participantIdentityIds: ['1', '2'], requiredSignatures: 1 },
+    { participantIdentityIds: ['1', '2'] },
+    { requiredSignatures: 1 },
+  ] as const) {
+    const presentKeys = Object.keys(fields).sort().join('+');
+    it(`rejects POST /api/context-graph/create with deprecated fields (${presentKeys}) — even alongside valid id/name`, async () => {
+      const d = daemon!;
+      const cgId = 'depr-reject-' + Math.random().toString(36).slice(2, 8);
+      const res = await fetch(urlFor(d, '/api/context-graph/create'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+        body: JSON.stringify({ id: cgId, name: cgId, ...fields }),
+      });
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as {
+        error?: string;
+        code?: string;
+        deprecatedFields?: string[];
+      };
+      expect(body.code).toBe('DEPRECATED_CONTEXT_GRAPH_FIELDS');
+      expect(body.error ?? '').toMatch(/SPEC_CG_MEMORY_MODEL/);
+      expect(body.deprecatedFields).toEqual(Object.keys(fields).sort());
+    });
+  }
+
+  it('rejects POST /api/context-graph/create with deprecated fields (no id/name) — naming the missing fields explicitly', async () => {
+    const d = daemon!;
+    const res = await fetch(urlFor(d, '/api/context-graph/create'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({
+        participantIdentityIds: ['1', '2'],
+        requiredSignatures: 1,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: string; code?: string };
+    expect(body.code).toBe('DEPRECATED_CONTEXT_GRAPH_FIELDS');
+  });
 });
 
 describe('DKG-419 — lazy context graph metadata from SWM writes', () => {

@@ -125,8 +125,16 @@ const PINNED_DIGESTS: Record<string, string> = {
   KnowledgeCollectionStorage:   'e165cbddc6569602d1d5c05c15909fd0a9ff851f974357cf80297041b2a83fd2',
   // V8 `KnowledgeCollection` ABI was moved to `abi/archive/` in
   // `archive-non-v10-contracts`; the pin entry is intentionally dropped.
-  ContextGraphs:                'ee69f0d50b54df966b8bfb3bf457fe6d2865393f51f8770b4185fafd324b9462',
-  ContextGraphStorage:          '4e0ef683d10ead0f167ee08d7d980df4d37a24dcabf2dad3970cf9d7b6d4813b',
+  // Updated for SPEC_CG_MEMORY_MODEL: per-CG hosting committees and
+  // per-CG `requiredSignatures` were removed. Every CG is hosted by the
+  // sharding table at publish time and the ACK quorum is the system
+  // parameter `parametersStorage.minimumRequiredSignatures()`.
+  // `setHostingNodes`, `updateQuorum`, `getHostingNodes`, `isHostingNode`,
+  // `getContextGraphRequiredSignatures`, `HostingNodesSet`, `QuorumUpdated`,
+  // and the `hostingNodes`+`requiredSignatures` fields on `createContextGraph`
+  // / `ContextGraphCreated` / `getContextGraph` are all gone.
+  ContextGraphs:                'f29a059eac0edcfb06a77ef303a3929c450dc52ddfe7b7c1593047f92e59937c',
+  ContextGraphStorage:          'dc861b05580022225f36d6e593a9c23097b87fb43e4975936a54d34d9c3ffe31',
   // Identity / staking — consulted on every publish.
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
   Identity:                     '29d09dd97de53de69d5bf2282d2f3008044ab43fb86c812fc4912552c9288946',
@@ -209,7 +217,7 @@ describe('ABI content sanity — required event/error surfaces are present [CH-5
     expect(types).toEqual(['uint256', 'address', 'uint256', 'uint256']);
   });
 
-  it('ContextGraphStorage declares ContextGraphCreated with the full participant struct', () => {
+  it('ContextGraphStorage declares ContextGraphCreated with the post-SPEC_CG_MEMORY_MODEL shape (no per-CG hosting committee)', () => {
     const abi = JSON.parse(
       readFileSync(join(ABI_DIR, 'ContextGraphStorage.json'), 'utf8'),
     ) as AbiEntry[];
@@ -219,9 +227,7 @@ describe('ABI content sanity — required event/error surfaces are present [CH-5
     expect(types).toEqual([
       'uint256',   // contextGraphId
       'address',   // owner
-      'uint72[]',  // hostingNodes
       'address[]', // participantAgents
-      'uint8',     // requiredSignatures
       'uint256',   // metadataBatchId
       'uint8',     // accessPolicy
       'uint8',     // publishPolicy

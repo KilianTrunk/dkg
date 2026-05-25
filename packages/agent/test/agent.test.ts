@@ -79,7 +79,6 @@ class CapturingContextGraphChainAdapter extends MockChainAdapter {
   async createOnChainContextGraph(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult> {
     this.createOnChainContextGraphCalls.push({
       ...params,
-      participantIdentityIds: [...params.participantIdentityIds],
       participantAgents: params.participantAgents ? [...params.participantAgents] : undefined,
     });
     return super.createOnChainContextGraph(params);
@@ -4109,7 +4108,10 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         onChainId: '1',
       });
       (agent as any).isPrivateContextGraph = async () => true;
-      (chain as any).getContextGraphParticipants = async () => [1n];
+      // LU-2: per-CG `chain.getContextGraphParticipants` is removed; stub
+      // the agent-side resolver directly so the replay test exercises
+      // the seenRequestIds path without depending on the dead surface.
+      (agent as any).getPrivateContextGraphParticipants = async () => ['1'];
       (chain as any).verifySyncIdentity = async () => true;
       (chain as any).verifyACKIdentity = async () => true;
 
@@ -4309,7 +4311,6 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         subscribed: false,
         synced: true,
         onChainId: '1',
-        participantIdentityIds: [1n],
       });
       (agent as any).isPrivateContextGraph = async () => true;
       (agent as any).getPrivateContextGraphParticipants = async () => [
@@ -4370,7 +4371,6 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         subscribed: false,
         synced: true,
         onChainId: '1',
-        participantIdentityIds: [108n],
       });
       (agent as any).isPrivateContextGraph = async () => true;
       (agent as any).getPrivateContextGraphParticipants = async () => ['108', wallet.address];

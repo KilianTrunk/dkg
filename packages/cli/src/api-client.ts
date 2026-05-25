@@ -1006,8 +1006,6 @@ export class ApiClient {
     accessPolicy?: number;
     allowedAgents?: string[];
     participantAgents?: string[];
-    participantIdentityIds?: Array<string | number | bigint>;
-    requiredSignatures?: number;
     /**
      * Atomic combined-flow flag. When `true`, the daemon registers the
      * CG on-chain in the same call after the local create step
@@ -1055,10 +1053,6 @@ export class ApiClient {
       ...(options?.allowedAgents?.length ? { allowedAgents: options.allowedAgents } : {}),
       ...(options?.participantAgents?.length ? { participantAgents: options.participantAgents } : {}),
       ...(options?.private ? { private: true } : {}),
-      ...(options?.participantIdentityIds?.length
-        ? { participantIdentityIds: options.participantIdentityIds.map((id) => id.toString()) }
-        : {}),
-      ...(options?.requiredSignatures != null ? { requiredSignatures: options.requiredSignatures } : {}),
       ...(options?.register === true ? { register: true } : {}),
       ...(options?.publishPolicy != null ? { publishPolicy: options.publishPolicy } : {}),
       ...(options?.pcaAccountId != null ? { pcaAccountId: options.pcaAccountId.toString() } : {}),

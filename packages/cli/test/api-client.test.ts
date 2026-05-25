@@ -162,12 +162,13 @@ describe('ApiClient', () => {
       expect(body.contextGraphId).toBe('my-contextGraph');
     });
 
-    it('createContextGraph() includes private and participant identity options when provided', async () => {
+    // LU-2 (SPEC_CG_MEMORY_MODEL): the legacy participantIdentityIds /
+    // requiredSignatures body surface is removed. The HTTP-client now
+    // forwards only `private` (plus accessPolicy / allowedAgents / etc.).
+    it('createContextGraph() forwards private flag', async () => {
       globalThis.fetch = mockFetchOk({ created: 'GuardianTest', uri: 'did:dkg:context-graph:GuardianTest' });
       await client.createContextGraph('GuardianTest', 'Guardian Test', 'private graph', {
         private: true,
-        participantIdentityIds: [11n, '12', 13],
-        requiredSignatures: 1,
       });
 
       const [url, opts] = (globalThis.fetch as any)._calls[0];
@@ -178,8 +179,6 @@ describe('ApiClient', () => {
         name: 'Guardian Test',
         description: 'private graph',
         private: true,
-        participantIdentityIds: ['11', '12', '13'],
-        requiredSignatures: 1,
       });
     });
 

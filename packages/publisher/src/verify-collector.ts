@@ -10,9 +10,27 @@ import { ethers } from 'ethers';
 
 export interface VerifyCollectorDeps {
   sendP2P: (peerId: string, protocol: string, data: Uint8Array) => Promise<Uint8Array>;
-  getParticipantPeers: (contextGraphId: string) => string[];
+  /**
+   * Returns peer IDs eligible to ACK a verify proposal for the given CG.
+   * The collector forwards proposal payloads (with `contextGraphId`,
+   * `verifiedMemoryId`, `batchId`, root entities) to every returned
+   * peer, so this set MUST be filtered to peers that legitimately can
+   * see the CG — leaking proposals to unrelated peers is a privacy
+   * regression (Codex PR #595 round-5). Async return is allowed so
+   * callers can consult an enumerator that probes pubsub / allowlist.
+   */
+  getParticipantPeers: (contextGraphId: string) => string[] | Promise<string[]>;
   verifyIdentity?: (recoveredAddress: string, claimedIdentityId: bigint) => Promise<boolean>;
   log?: (msg: string) => void;
+  /**
+   * LU-2 (SPEC_CG_MEMORY_MODEL): per-CG quorum is gone — every CG uses
+   * the system parameter `parametersStorage.minimumRequiredSignatures()`.
+   * When `collect()` is called without an explicit `requiredSignatures`,
+   * the collector consults this accessor to obtain the system default.
+   * Optional: callers that always pass an explicit override (e.g. the
+   * legacy verify HTTP route with `?requiredSignatures=N`) can omit it.
+   */
+  getMinimumRequiredSignatures?: () => Promise<number>;
 }
 
 export interface CollectedApproval {
@@ -75,15 +93,64 @@ export class VerifyCollector {
     merkleRoot: Uint8Array;
     entities: string[];
     proposerSignature: { r: Uint8Array; vs: Uint8Array };
-    requiredSignatures: number;
+    /**
+     * LU-2: optional — when omitted we fall back to the system parameter
+     * via `deps.getMinimumRequiredSignatures()`. Explicit overrides are
+     * still honoured (e.g. `/api/verify` with a `requiredSignatures`
+     * advisory).
+     */
+    requiredSignatures?: number;
+    /**
+     * Codex PR #595 round-5: whether the proposer's own self-signature
+     * counts toward `requiredSignatures`. Defaults to `true` for the
+     * legacy assumption that proposers are always eligible. Pass
+     * `false` from the agent when the proposer isn't sharding-table-
+     * eligible (e.g. edge node with identityId=0) so the collector
+     * demands the FULL quorum from remote peers instead of
+     * `requiredSignatures - 1`.
+     */
+    proposerCountsTowardQuorum?: boolean;
     timeoutMs: number;
     allowPartial?: boolean;
   }): Promise<VerifyCollectionResult> {
     const {
       contextGraphId, contextGraphIdOnChain, verifiedMemoryId,
       batchId, merkleRoot, entities, proposerSignature,
-      requiredSignatures, timeoutMs, allowPartial = false,
+      timeoutMs, allowPartial = false,
+      proposerCountsTowardQuorum = true,
     } = params;
+    // FAIL-CLOSED (Codex PR #595 round-4): a caller that omits an
+    // explicit `requiredSignatures` MUST get the system-parameter
+    // quorum. Defaulting to 1 on lookup failure would let the
+    // proposer self-approve and pass quorum, and `chain.verify()`
+    // doesn't re-check signatures on-chain, so this local count is
+    // the only enforcement gate. If we can't determine the system
+    // minimum (no probe wired, RPC fails, garbage value), refuse to
+    // proceed.
+    let requiredSignatures = params.requiredSignatures ?? 0;
+    if (requiredSignatures <= 0) {
+      if (!this.deps.getMinimumRequiredSignatures) {
+        throw new Error(
+          'VerifyCollector: requiredSignatures was omitted and no `getMinimumRequiredSignatures` probe was wired. ' +
+          'Pass `params.requiredSignatures` explicitly or supply a probe at construction.',
+        );
+      }
+      let sysMin: number;
+      try {
+        sysMin = await this.deps.getMinimumRequiredSignatures();
+      } catch (err: any) {
+        throw new Error(
+          `VerifyCollector: getMinimumRequiredSignatures() failed (${err?.message ?? err}). ` +
+          `Pass params.requiredSignatures explicitly or fix the probe.`,
+        );
+      }
+      if (!Number.isInteger(sysMin) || sysMin < 1) {
+        throw new Error(
+          `VerifyCollector: getMinimumRequiredSignatures() returned invalid value ${sysMin} (must be a positive integer).`,
+        );
+      }
+      requiredSignatures = sysMin;
+    }
     const boundedTimeoutMs = Math.min(
       assertVerifyCollectionTimeoutMs(timeoutMs),
       VERIFY_COLLECTION_TIMEOUT_MAX_MS,
@@ -110,11 +177,17 @@ export class VerifyCollector {
     };
     const proposalBytes = encodeVerifyProposal(proposal);
 
-    // The proposer already signed before calling collect(), so we need
-    // (requiredSignatures - 1) additional remote approvals.
-    const remoteRequired = Math.max(0, requiredSignatures - 1);
+    // If the proposer's own signature counts toward quorum (the legacy
+    // assumption — proposer is a sharding-table member), we need
+    // `requiredSignatures - 1` remote approvals. When the caller flags
+    // the proposer as ineligible (edge node / non-member), every ACK
+    // must come from a remote peer so we need the FULL quorum.
+    const remoteRequired = Math.max(
+      0,
+      requiredSignatures - (proposerCountsTowardQuorum ? 1 : 0),
+    );
 
-    const peers = this.deps.getParticipantPeers(contextGraphId);
+    const peers = await this.deps.getParticipantPeers(contextGraphId);
     if (remoteRequired > 0 && peers.length === 0) {
       if (allowPartial) {
         return {

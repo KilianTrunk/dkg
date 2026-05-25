@@ -1212,7 +1212,6 @@ export class EVMChainAdapter implements ChainAdapter {
                   contextGraphId: parsed.args.contextGraphId?.toString() ?? '',
                   creator: parsed.args.owner?.toString() ?? '',
                   owner: parsed.args.owner?.toString() ?? '',
-                  requiredSignatures: Number(parsed.args.requiredSignatures ?? 0),
                   accessPolicy: Number(parsed.args.accessPolicy ?? 0),
                   publishPolicy: Number(parsed.args.publishPolicy ?? 0),
                   txHash: log.transactionHash,
@@ -1275,8 +1274,8 @@ export class EVMChainAdapter implements ChainAdapter {
   //
   // Thin transitional affordance — reserves a bytes32 name-hash with an
   // optional cleartext metadata reveal. Governance for the context graph
-  // itself (hosting nodes, publish policy, participants, quorum) lives in
-  // `ContextGraphs` / `ContextGraphStorage` — see createOnChainContextGraph.
+  // itself (publish policy, participant agents) lives in `ContextGraphs` /
+  // `ContextGraphStorage` — see createOnChainContextGraph.
   // =====================================================================
 
   async createContextGraph(params: CreateContextGraphParams): Promise<TxResult> {
@@ -1373,14 +1372,17 @@ export class EVMChainAdapter implements ChainAdapter {
       throw new Error('ContextGraphs contract not deployed. Deploy ContextGraphs and ContextGraphStorage first.');
     }
 
-    const hostingNodes = params.participantIdentityIds.map((id) => id);
+    if (params.accessPolicy === undefined || params.publishPolicy === undefined) {
+      throw new Error(
+        'createOnChainContextGraph: `accessPolicy` and `publishPolicy` are required (SPEC_CG_MEMORY_MODEL). ' +
+        'Pass both explicitly — e.g. { accessPolicy: 1, publishPolicy: 0 } for invite-only + curators-only.',
+      );
+    }
     const tx = await this.contracts.contextGraphs.createContextGraph(
-      hostingNodes,
       params.participantAgents ?? [],
-      params.requiredSignatures,
       params.metadataBatchId ?? 0n,
-      params.accessPolicy ?? 0,
-      params.publishPolicy ?? 1,
+      params.accessPolicy,
+      params.publishPolicy,
       params.publishAuthority ?? ethers.ZeroAddress,
       params.publishAuthorityAccountId ?? 0n,
     );
@@ -1415,20 +1417,6 @@ export class EVMChainAdapter implements ChainAdapter {
       success: receipt.status === 1,
       contextGraphId,
     };
-  }
-
-  async getContextGraphParticipants(contextGraphId: bigint): Promise<bigint[] | null> {
-    await this.init();
-    if (!this.contracts.contextGraphStorage) {
-      return null;
-    }
-
-    try {
-      const hostingNodes: bigint[] = await this.contracts.contextGraphStorage.getHostingNodes(contextGraphId);
-      return hostingNodes.map((id) => BigInt(id));
-    } catch {
-      return null;
-    }
   }
 
   async verify(params: VerifyParams): Promise<TxResult> {
@@ -2329,8 +2317,31 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async getMinimumRequiredSignatures(): Promise<number> {
     await this.init();
-    if (!this.contracts.parametersStorage) return 3;
+    // FAIL-CLOSED (Codex PR #595 round-5): the agent + publisher
+    // verify paths trust whatever this method returns. A silent
+    // fallback to a hardcoded `3` (or any other value) when
+    // ParametersStorage isn't resolvable would let verify use the
+    // wrong quorum without anyone noticing. Refuse to guess.
+    if (!this.contracts.parametersStorage) {
+      throw new Error(
+        'getMinimumRequiredSignatures: ParametersStorage contract is not resolvable. ' +
+        'Verify cannot enforce ACK quorum without a real chain read — fix the adapter wiring or pass an explicit override.',
+      );
+    }
     return Number(await this.contracts.parametersStorage.minimumRequiredSignatures());
+  }
+
+  async isShardingTableMember(identityId: bigint): Promise<boolean> {
+    if (identityId <= 0n) return false;
+    await this.init();
+    const storage = await this.resolveContract('ShardingTableStorage');
+    if (!storage) {
+      throw new Error(
+        'isShardingTableMember: ShardingTableStorage contract is not resolvable. ' +
+        'Verify path cannot enforce sharding-table eligibility without it.',
+      );
+    }
+    return Boolean(await storage.nodeExists(identityId));
   }
 
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {

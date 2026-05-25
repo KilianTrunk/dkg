@@ -154,15 +154,26 @@ export interface ContextGraphOnChain {
 
 // ----- On-Chain Context Graph types (ContextGraphs contract) -----
 
+/**
+ * Per SPEC_CG_MEMORY_MODEL: every CG is hosted by the network's sharding
+ * table at publish time and the ACK quorum is the system parameter
+ * `parametersStorage.minimumRequiredSignatures()`. CGs do not declare
+ * per-CG hosting committees or per-CG quorum.
+ *
+ * `accessPolicy` and `publishPolicy` are REQUIRED (Codex PR #595
+ * round-5): the previous all-optional shape let `{}` silently create a
+ * public + open-contribution CG, which is a privilege widening relative
+ * to the safe defaults the MCP/UI surfaces use. Callers must state both
+ * dials explicitly so migrations from the pre-LU2 signature can't
+ * accidentally leak data.
+ */
 export interface CreateOnChainContextGraphParams {
-  participantIdentityIds: bigint[];
-  participantAgents?: string[];
-  requiredSignatures: number;
-  metadataBatchId?: bigint;
   /** 0 = public/discoverable, 1 = private/curated. */
-  accessPolicy?: number;
+  accessPolicy: number;
   /** 0 = curated publishing, 1 = open publishing. */
-  publishPolicy?: number;
+  publishPolicy: number;
+  participantAgents?: string[];
+  metadataBatchId?: bigint;
   publishAuthority?: string;
   publishAuthorityAccountId?: bigint;
 }
@@ -701,7 +712,6 @@ export interface ChainAdapter {
 
   // On-Chain Context Graphs (ContextGraphs contract)
   createOnChainContextGraph?(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult>;
-  getContextGraphParticipants?(contextGraphId: bigint): Promise<bigint[] | null>;
   verify?(params: VerifyParams): Promise<TxResult>;
   publishToContextGraph?(params: PublishToContextGraphParams): Promise<OnChainPublishResult>;
 
@@ -721,6 +731,20 @@ export interface ChainAdapter {
 
   /** Read minimumRequiredSignatures from ParametersStorage. Used by ACKCollector. */
   getMinimumRequiredSignatures?(): Promise<number>;
+
+  /**
+   * Sharding-table membership check (Codex PR #595 round-4 follow-up).
+   *
+   * SPEC_CG_MEMORY_MODEL §4.3 promises that only sharding-table members
+   * can ACK a VM publish. The agent's verify path calls this on every
+   * resolved signer identityId and DROPS any approval whose signer is
+   * not in the sharding table. Adapters that can't probe membership
+   * (test mocks, legacy in-tree fakes) return `true` for any non-zero
+   * identityId — those environments aren't security-sensitive.
+   *
+   * Implementation maps to `ShardingTableStorage.nodeExists(uint72)`.
+   */
+  isShardingTableMember?(identityId: bigint): Promise<boolean>;
 
   /** Verify that a recovered signer address is a registered operational key for the given identity. */
   verifyACKIdentity?(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean>;

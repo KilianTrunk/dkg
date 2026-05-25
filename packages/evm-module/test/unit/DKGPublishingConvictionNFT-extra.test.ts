@@ -103,6 +103,23 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
     return await NFT.totalSupply();
   }
 
+  async function deployReplacementLogic(): Promise<PublishingConviction> {
+    const LogicFactory = await hre.ethers.getContractFactory('PublishingConviction');
+    const replacement = (await LogicFactory.deploy(
+      await HubContract.getAddress(),
+    )) as unknown as PublishingConviction;
+    await replacement.waitForDeployment();
+
+    await HubContract.setAndReinitializeContracts(
+      [{ name: 'PublishingConviction', addr: await replacement.getAddress() }],
+      [],
+      [await replacement.getAddress()],
+      [],
+    );
+
+    return replacement;
+  }
+
   async function advanceToEpoch(targetEpoch: bigint) {
     while ((await ChronosContract.getCurrentEpoch()) < targetEpoch) {
       await time.increase((await ChronosContract.timeUntilNextEpoch()) + 1n);
@@ -119,6 +136,31 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       await time.increase(targetTimestamp - now);
     }
   }
+
+  describe('logic Hub re-registration', () => {
+    it('forwards writes to the current Hub-registered logic without wrapper reinitialization', async () => {
+      const committed = hre.ethers.parseEther('50000');
+      const acctId = await createAccount(accounts[0], committed);
+
+      const oldLogicAddress = await LogicContract.getAddress();
+      const replacement = await deployReplacementLogic();
+      const replacementAddress = await replacement.getAddress();
+
+      expect(replacementAddress).to.not.equal(oldLogicAddress);
+      expect(await NFT.publishingConviction()).to.equal(replacementAddress);
+      expect(await HubContract['isContract(address)'](oldLogicAddress)).to.equal(false);
+      expect(await HubContract['isContract(address)'](replacementAddress)).to.equal(true);
+
+      const topUpAmount = hre.ethers.parseEther('1000');
+      await TokenContract.connect(accounts[0]).approve(await NFT.getAddress(), topUpAmount);
+
+      await expect(NFT.connect(accounts[0]).topUp(acctId, topUpAmount))
+        .to.emit(replacement, 'ToppedUp')
+        .withArgs(acctId, topUpAmount, topUpAmount);
+
+      expect(await NFT.topUpBalance(acctId)).to.equal(topUpAmount);
+    });
+  });
 
   // ======================================================================
   // E-6 — topUp after expiry must revert with AccountExpired.

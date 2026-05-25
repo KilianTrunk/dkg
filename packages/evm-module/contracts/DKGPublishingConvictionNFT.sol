@@ -28,15 +28,15 @@ import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/
  *   - All business logic (account creation, lazy passive-sink
  *     settlement, post-expiry final sweep, active-sink epoch
  *     distribution, agent management, transfer-hook agent clear)
- *     lives on `PublishingConviction`. Both backing contracts can be
- *     upgraded independently of this wrapper.
+ *     lives on `PublishingConviction`. The logic address is resolved
+ *     lazily from Hub so it can be re-registered without touching this
+ *     wrapper.
  *
  * Wrapper-level state (intentional):
  *   - `_nextAccountId`: monotonic mint counter, tightly coupled to
  *     ERC-721 mint ordering. Mirrors `DKGStakingConvictionNFT.nextTokenId`.
- *   - Hub-resolved contract refs (logic, storage, token, vault) are
- *     loaded once at `initialize()`; they are metadata, not application
- *     state.
+ *   - Hub-resolved contract refs (storage, token, vault) are loaded
+ *     once at `initialize()`; they are metadata, not application state.
  *
  * TRAC custody:
  *   - The wrapper NEVER holds TRAC. `createAccount` / `topUp` move TRAC
@@ -74,11 +74,10 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     //                  Hub-wired dependencies
     // ============================================================
 
-    /// @notice V10 stateless logic contract. Receives every NFT-driven
-    ///         write forward (createAccount / topUp /
-    ///         coverPublishingCost / settle / register / deregister /
-    ///         onTransfer).
-    PublishingConviction public publishingConviction;
+    /// @dev Reserved slot from the first v3 split draft where the logic
+    ///      reference was cached. The public `publishingConviction()`
+    ///      getter below now resolves Hub lazily.
+    PublishingConviction private __reservedPublishingConviction;
 
     /// @notice V10 application-state store. Read directly for the
     ///         selector-stable public view forwarders below.
@@ -124,10 +123,6 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     ) HubDependent(hubAddress) ERC721("DKG Publishing Conviction", "DKGPC") {}
 
     function initialize() public onlyHub {
-        address logic = hub.getContractAddress("PublishingConviction");
-        if (logic == address(0)) revert ZeroAddressDependency("PublishingConviction");
-        publishingConviction = PublishingConviction(logic);
-
         address store = hub.getContractAddress("PublishingConvictionStorage");
         if (store == address(0)) revert ZeroAddressDependency("PublishingConvictionStorage");
         publishingConvictionStorage = PublishingConvictionStorage(store);
@@ -149,6 +144,14 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
 
     function version() external pure virtual returns (string memory) {
         return _VERSION;
+    }
+
+    /// @notice Current Hub-registered publishing-conviction logic.
+    /// @dev    Kept as a selector-stable getter, but intentionally does a
+    ///         lazy Hub lookup so logic-only upgrades do not require
+    ///         reinitializing this wrapper.
+    function publishingConviction() public view returns (PublishingConviction) {
+        return _publishingConviction();
     }
 
     // ========================================================================
@@ -182,7 +185,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
 
         _mint(msg.sender, accountId);
 
-        publishingConviction.createAccount(msg.sender, accountId, committedTRAC);
+        _publishingConviction().createAccount(msg.sender, accountId, committedTRAC);
 
         if (!tokenContract.transferFrom(msg.sender, stakingStorageAddress, committedTRAC)) {
             revert TokenTransferFailed();
@@ -203,7 +206,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     function topUp(uint256 accountId, uint96 amount) external {
         _requireOwner(accountId);
 
-        publishingConviction.topUp(msg.sender, accountId, amount);
+        _publishingConviction().topUp(msg.sender, accountId, amount);
 
         if (!tokenContract.transferFrom(msg.sender, stakingStorageAddress, amount)) {
             revert TokenTransferFailed();
@@ -234,14 +237,14 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         address kav10 = hub.getContractAddress("KnowledgeAssetsV10");
         if (msg.sender != kav10) revert OnlyKnowledgeAssetsV10(msg.sender);
 
-        return publishingConviction.coverPublishingCost(publishingAgent, baseCost, kcStartEpoch, kcEpochs);
+        return _publishingConviction().coverPublishingCost(publishingAgent, baseCost, kcStartEpoch, kcEpochs);
     }
 
     /// @notice Permissionless lazy-settlement entry point.
     /// @dev    Pure forwarder — the logic contract handles existence
     ///         and `fullySwept` short-circuit checks.
     function settle(uint256 accountId) external {
-        publishingConviction.settle(accountId);
+        _publishingConviction().settle(accountId);
     }
 
     // ========================================================================
@@ -250,12 +253,12 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
 
     function registerAgent(uint256 accountId, address agent) external {
         _requireOwner(accountId);
-        publishingConviction.registerAgent(msg.sender, accountId, agent);
+        _publishingConviction().registerAgent(msg.sender, accountId, agent);
     }
 
     function deregisterAgent(uint256 accountId, address agent) external {
         _requireOwner(accountId);
-        publishingConviction.deregisterAgent(msg.sender, accountId, agent);
+        _publishingConviction().deregisterAgent(msg.sender, accountId, agent);
     }
 
     // ========================================================================
@@ -404,12 +407,12 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     /// @notice Remaining base + topUp allowance for `accountId` in
     ///         chain `epoch`. Forwards to the logic contract's view.
     function getRemainingAllowance(uint256 accountId, uint40 epoch) external view returns (uint96) {
-        return publishingConviction.getRemainingAllowance(accountId, epoch);
+        return _publishingConviction().getRemainingAllowance(accountId, epoch);
     }
 
     /// @notice Current billing-window index for `accountId`.
     function getCurrentBillingWindow(uint256 accountId) external view returns (uint40) {
-        return publishingConviction.getCurrentBillingWindow(accountId);
+        return _publishingConviction().getCurrentBillingWindow(accountId);
     }
 
     /// @notice Chain-epoch range for billing window `w`.
@@ -418,7 +421,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         view
         returns (uint40 startEp, uint40 endEp)
     {
-        return publishingConviction.getWindowChainEpochRange(accountId, w);
+        return _publishingConviction().getWindowChainEpochRange(accountId, w);
     }
 
     // ========================================================================
@@ -452,7 +455,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         address from = super._update(to, tokenId, auth);
 
         if (from != address(0) && to != address(0) && from != to) {
-            publishingConviction.onTransfer(tokenId, from, to);
+            _publishingConviction().onTransfer(tokenId, from, to);
         }
 
         return from;
@@ -461,6 +464,12 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     // ========================================================================
     //                  Internal
     // ========================================================================
+
+    function _publishingConviction() internal view returns (PublishingConviction) {
+        address logic = hub.getContractAddress("PublishingConviction");
+        if (logic == address(0)) revert ZeroAddressDependency("PublishingConviction");
+        return PublishingConviction(logic);
+    }
 
     function _requireOwner(uint256 accountId) internal view {
         if (_ownerOf(accountId) == address(0)) {

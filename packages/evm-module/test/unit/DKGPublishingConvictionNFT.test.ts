@@ -418,14 +418,15 @@ describe('@unit DKGPublishingConvictionNFT', function () {
 
   describe('initialize-time dependency resolution (post-split)', () => {
     // Post-split, `DKGPublishingConvictionNFT.initialize()` resolves
-    //   PublishingConviction
     //   PublishingConvictionStorage
     //   Token
     //   ConvictionStakingStorage
-    // in that order. EpochStorageV8 / Chronos / ParametersStorage are
-    // resolved by `PublishingConviction.initialize()` (the logic
-    // contract). The negative-init tests below pin the bubbled-up
-    // `ContractDoesNotExist(name)` for each missing branch.
+    // in that order. `PublishingConviction` is resolved lazily by the
+    // wrapper forwarders/getter, so logic-only Hub re-registration does
+    // not require wrapper reinitialization. EpochStorageV8 / Chronos /
+    // ParametersStorage are resolved by `PublishingConviction.initialize()`
+    // (the logic contract). The negative-init tests below pin the
+    // bubbled-up `ContractDoesNotExist(name)` for each missing branch.
     //
     // Like before, we use a disposable Hub per test (factory-deployed)
     // so the shared `loadFixture` snapshot stays valid — we never call
@@ -455,15 +456,21 @@ describe('@unit DKGPublishingConvictionNFT', function () {
 
     // ----- NFT.initialize() resolution order -----
 
-    it('NFT.initialize reverts when PublishingConviction is unregistered', async () => {
+    it('NFT.initialize does not require PublishingConviction to be registered', async () => {
       const freshHub = await deployDisposableHub();
+      const [, signer17, signer18, signer19] = await hre.ethers.getSigners();
+      await freshHub.setContractAddress('PublishingConvictionStorage', signer17.address);
+      await freshHub.setContractAddress('Token', signer18.address);
+      await freshHub.setContractAddress('ConvictionStakingStorage', signer19.address);
       const nft = await deployUnregisteredNFT(freshHub);
       await expect(
         freshHub.forwardCall(
           await nft.getAddress(),
           nft.interface.encodeFunctionData('initialize'),
         ),
-      )
+      ).to.not.be.reverted;
+
+      await expect(nft.publishingConviction())
         .to.be.revertedWithCustomError(freshHub, 'ContractDoesNotExist')
         .withArgs('PublishingConviction');
     });

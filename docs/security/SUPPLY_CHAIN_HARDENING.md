@@ -587,8 +587,9 @@ The deny-list lives at `.github/dependency-deny-list.json` and is
 scanned by `scripts/check-dependency-deny-list.mjs` from the
 `dependency-deny-list` job in `supply-chain-scan.yml`. The job runs on
 every PR that touches `pnpm-lock.yaml`, any `package.json`, the
-deny-list JSON, or the scanner script itself, on every push to `main`,
-and on the same weekly cron as the other supply-chain scanners.
+deny-list JSON, the scanner script itself, or any currently configured
+recursive filename IoC (`.cursorrules`), on every push to `main`, and
+on the same weekly cron as the other supply-chain scanners.
 
 **Top-level fields**:
 
@@ -637,8 +638,8 @@ right shape for AI-injection persistence files (`.cursorrules`,
 and reports a hit at any depth, not only at the repo root. Dot-prefixed
 directories like `.git`, `.idea`, `.vscode` are skipped during the
 walk to keep it fast and avoid editor-config false positives; the
-dot-prefixed `.github` directory is opted back in via an explicit
-allow-list.
+dot-prefixed `.github` directory and this repo's committed `.cursor`
+rules tree are opted back in via an explicit allow-list.
 
 **Scanner design**, all in vanilla `node:fs` (no `npm install` step —
 the scanner deliberately doesn't pull anything from a registry):

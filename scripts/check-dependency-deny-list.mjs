@@ -253,18 +253,18 @@ function scanFileWithMatchers(filePath, matchers) {
  * Single traversal so the recursive filename check costs nothing
  * beyond what the existing package.json walk already does.
  *
- * NB: dot-prefixed directories are skipped EXCEPT `.github` (we want
- * to scan that one) — so a `.cursorrules` planted inside `.husky/`,
- * `.idea/`, etc. would NOT be caught. That's intentional for the
- * current scope: IDE/editor configs are user-local and not normally
- * committed; if a future review wants to extend coverage to specific
- * dot-dirs, add them to the EXTRA_SCAN_DOT_DIRS set.
+ * NB: dot-prefixed directories are skipped EXCEPT `.github` and the
+ * committed `.cursor` rules tree — so a `.cursorrules` planted inside
+ * `.husky/`, `.idea/`, etc. would NOT be caught. That's intentional for
+ * the current scope: most IDE/editor configs are user-local and not
+ * normally committed; if a future review wants to extend coverage to
+ * specific dot-dirs, add them to the EXTRA_SCAN_DOT_DIRS set.
  */
 function walkWorkspace(dir, deniedFilenameSet) {
   const pkgJsons = [];
   const filenameHits = [];
   const SKIP = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '.publish-artifacts']);
-  const EXTRA_SCAN_DOT_DIRS = new Set(['.github']);
+  const EXTRA_SCAN_DOT_DIRS = new Set(['.github', '.cursor']);
 
   function walk(d) {
     let entries;
@@ -282,7 +282,7 @@ function walkWorkspace(dir, deniedFilenameSet) {
         // hold package.json files we care about, and pulling in
         // editor configs would slow the walk and risk false positives.
         // EXTRA_SCAN_DOT_DIRS allows opting specific ones back in
-        // (e.g. `.github`).
+        // (e.g. `.github` and this repo's committed `.cursor` rules).
         if (e.name.startsWith('.') && !EXTRA_SCAN_DOT_DIRS.has(e.name)) continue;
         walk(full);
       } else if (e.isFile()) {

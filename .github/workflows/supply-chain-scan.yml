@@ -47,6 +47,11 @@ on:
       # until the next unrelated lockfile change.
       - '.github/dependency-deny-list.json'
       - 'scripts/check-dependency-deny-list.mjs'
+      # Recursive filename deny-list entries that are themselves IoCs.
+      # Keep this in sync with denied_filenames[] so an IoC-only PR
+      # cannot avoid the scanner by touching no package metadata.
+      - '.cursorrules'
+      - '**/.cursorrules'
   push:
     branches: [main, v10-rc]
     paths:
@@ -59,6 +64,8 @@ on:
       - '.npmrc'
       - '.github/dependency-deny-list.json'
       - 'scripts/check-dependency-deny-list.mjs'
+      - '.cursorrules'
+      - '**/.cursorrules'
   schedule:
     # Mondays 06:30 Europe/Belgrade ≈ 04:30 UTC. Same window as Dependabot
     # so any week-over-week drift surfaces in a single review pass.

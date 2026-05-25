@@ -13,7 +13,17 @@ import {ShardingTableLib} from "./libraries/ShardingTableLib.sol";
 
 contract ShardingTable is INamed, IVersioned, ContractStatus, IInitializable {
     string private constant _NAME = "ShardingTable";
-    string private constant _VERSION = "1.0.1";
+    // v2.0.0 — ABI-breaking: dropped the V8→V9 `migrationPeriodEnd` field
+    // and its constructor parameter, plus the matching public getter.
+    // Original purpose: gate the `migrateOldShardingTable` Neuroweb-only
+    // function set during the old ShardingTable migration window. That
+    // function was removed during the V9→V10 consolidation, leaving the
+    // field as dead state on a Logic contract — a violation of the
+    // Storage/Logic separation pattern. The Neuroweb-only branch in
+    // `019_deploy_sharding_table.ts` that referenced `migrateOldShardingTable`
+    // is removed in the same PR (the function it called no longer exists,
+    // so the branch was already unreachable on V10 deploys).
+    string private constant _VERSION = "2.0.0";
 
     ProfileStorage public profileStorage;
     ShardingTableStorage public shardingTableStorage;
@@ -22,12 +32,6 @@ contract ShardingTable is INamed, IVersioned, ContractStatus, IInitializable {
     ///         post-migration so its `getNodeStake` is not a faithful read.
     ConvictionStakingStorage public convictionStakingStorage;
 
-    // v1.0.1 — Dropped the `migrationPeriodEnd` field and its constructor
-    // parameter. It was a V8→V9 carry-over: it was set in the constructor and
-    // intended to gate a `migrateOldShardingTable` Neuroweb-only function
-    // that has since been removed during the V9→V10 consolidation. With the
-    // gated function gone, the field was unused, unread, and pure dead state
-    // on a Logic contract — violating the Storage/Logic separation pattern.
     // solhint-disable-next-line no-empty-blocks
     constructor(address hubAddress) ContractStatus(hubAddress) {}
 

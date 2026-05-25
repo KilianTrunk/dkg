@@ -446,7 +446,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.lease).toBeUndefined();
   });
 
-  it('26. recoverOnStartup() requeues running jobs whose lease expired AND swmInserted=false', async () => {
+  it('26. recoverOnStartup() abandons expired running jobs even when swmInserted=false', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const jobId = await queue.enqueue(makeRequest());
     await queue.claimNext('worker-1');
@@ -455,13 +455,13 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     advance(60_000);
     const summary = await queue.recoverOnStartup();
 
-    expect(summary.reclaimed).toBe(1);
-    expect(summary.abandoned).toBe(0);
+    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(1);
     const job = await queue.getStatus(jobId);
-    expect(job?.state).toBe('queued');
+    expect(job?.state).toBe('failed');
     expect(job?.lease).toBeUndefined();
-    // Attempt counter preserved — this is a recovery, not a normal retry.
     expect(job?.attempt.count).toBe(0);
+    expect(job?.reason).toMatch(/partial promote ambiguity/i);
   });
 
   it('27. recoverOnStartup() leaves `running` jobs alone when the lease is still valid', async () => {
@@ -487,15 +487,16 @@ describe('TripleStoreAsyncPromoteQueue', () => {
       ids.push(id);
       const claimed = await queue.claimNext(`worker-${i}`);
       if (i < 2) {
-        // Half have swmInserted marker → abandoned on recovery.
+        // Half have swmInserted marker; all expired running jobs are now
+        // abandoned because a false marker is not proof that SWM was untouched.
         await queue.recordCommitMarker(id, claimed!.lease!.claimToken, 'swmInserted');
       }
     }
 
     advance(60_000);
     const summary = await queue.recoverOnStartup();
-    expect(summary.abandoned).toBe(2);
-    expect(summary.reclaimed).toBe(2);
+    expect(summary.abandoned).toBe(4);
+    expect(summary.reclaimed).toBe(0);
   });
 
   // ---------------------------------------------------------------------------

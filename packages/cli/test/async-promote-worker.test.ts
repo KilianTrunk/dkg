@@ -465,7 +465,7 @@ describe('createPromoteWorkerSupervisor', () => {
 
   it('runs recoverOnStartup() during start()', async () => {
     // Build a queue with a stale `running` job (lease expired, swmInserted=false)
-    // and verify start() reclaims it.
+    // and verify start() parks it for operator recovery.
     let nowFn = 0;
     const recoverableQueue = new TripleStoreAsyncPromoteQueue(store, {
       now: () => nowFn,
@@ -486,9 +486,31 @@ describe('createPromoteWorkerSupervisor', () => {
       workerIdPrefix: 'test',
     });
     await sup.start();
-    expect((await recoverableQueue.getStats()).queued).toBe(1);
+    expect((await recoverableQueue.getStats()).failed).toBe(1);
     expect((await recoverableQueue.getStats()).running).toBe(0);
-    expect(logs.some((m) => m.includes('reclaimed=1'))).toBe(true);
+    expect(logs.some((m) => m.includes('abandoned=1'))).toBe(true);
     await sup.stop();
+  });
+
+  it('refuses to start polling when recoverOnStartup() fails', async () => {
+    const sup = createPromoteWorkerSupervisor({
+      agent: {
+        promoteQueue: {
+          recoverOnStartup: async () => {
+            throw new Error('store offline');
+          },
+          claimNext: async () => {
+            throw new Error('must not poll after failed recovery');
+          },
+        },
+        assertion: { promote: async () => ({ promotedCount: 1 }) },
+      } as any,
+      workerConcurrency: 1,
+      pollIntervalMs: 1,
+      log: (m) => logs.push(m),
+      workerIdPrefix: 'test',
+    });
+    await expect(sup.start()).rejects.toThrow(/recoverOnStartup failed: store offline/);
+    expect(sup.getCounters().attempted).toBe(0);
   });
 });

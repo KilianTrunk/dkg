@@ -381,7 +381,9 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
           log(`recoverOnStartup: reclaimed=${summary.reclaimed} abandoned=${summary.abandoned}`);
         }
       } catch (err: unknown) {
-        log(`recoverOnStartup failed: ${err instanceof Error ? err.message : String(err)}`);
+        started = false;
+        shuttingDown = true;
+        throw new Error(`recoverOnStartup failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       for (const slot of slots) {
         slot.timer = setInterval(() => {

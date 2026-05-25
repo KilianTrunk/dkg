@@ -332,44 +332,30 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       const expiresAt = job.lease?.expiresAt ?? 0;
       if (expiresAt > now) continue; // lease still valid; worker is fine
 
-      if (job.commitMarker?.swmInserted) {
-        // RFC §4.4: partial-promote ambiguity. SWM already has the data;
-        // re-running would double-gossip and could leave WM in an
-        // inconsistent state. Park for operator inspection.
-        const abandonedJob: PromoteJob = {
-          ...job,
-          state: 'failed',
-          updatedAt: now,
-          reason: 'partial promote ambiguity: lease expired after SWM insert; needs operator inspection',
-          lease: undefined,
-          attempt: {
-            count: job.attempt.count,
-            maxRetries: job.attempt.maxRetries,
-            lastError: {
-              message: 'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip',
-              retryable: false,
-              classification: 'fatal',
-              recordedAt: now,
-            },
-          },
-        };
-        await this.writeJob(abandonedJob);
-        abandoned += 1;
-        continue;
-      }
-
-      // Safe to rerun: nothing landed in SWM yet, so a fresh attempt is idempotent.
-      const requeued: PromoteJob = {
+      // RFC §4.4 partial-promote ambiguity. The worker can only persist
+      // commitMarker.swmInserted after assertionPromote() returns, so a crash
+      // between the internal SWM write and marker write leaves a false marker
+      // even though SWM may already contain the assertion. Without a stronger
+      // store-side proof, expired running jobs are not safe to re-run.
+      const abandonedJob: PromoteJob = {
         ...job,
-        state: 'queued',
+        state: 'failed',
         updatedAt: now,
+        reason: 'partial promote ambiguity: lease expired while job was running; needs operator inspection',
         lease: undefined,
-        // Preserve attempt count — this is a recovery, not a normal retry.
-        // The job will be picked up immediately by the next claimNext().
-        commitMarker: undefined,
+        attempt: {
+          count: job.attempt.count,
+          maxRetries: job.attempt.maxRetries,
+          lastError: {
+            message: 'Worker lease expired during promote; recovery aborted to prevent duplicate SWM/gossip',
+            retryable: false,
+            classification: 'fatal',
+            recordedAt: now,
+          },
+        },
       };
-      await this.writeJob(requeued);
-      reclaimed += 1;
+      await this.writeJob(abandonedJob);
+      abandoned += 1;
     }
 
     return { reclaimed, abandoned };

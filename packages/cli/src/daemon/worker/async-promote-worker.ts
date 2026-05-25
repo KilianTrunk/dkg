@@ -248,11 +248,9 @@ export async function runPromoteJob(
 
     // Plan §7 recommendation (b): single OUTER commit-marker after
     // `assertionPromote` returns. We can't observe the internal phases
-    // (SWM insert / WM clean / lifecycle stamp / gossip) so we treat
-    // the successful return as "all four phases completed".
-    for (const step of ['swmInserted', 'wmCleaned', 'lifecycleStamped', 'gossiped'] as const) {
-      await queue.recordCommitMarker(job.jobId, claimToken, step);
-    }
+    // (WM clean / lifecycle stamp / gossip), so only stamp the recovery
+    // gate the queue actually consumes.
+    await queue.recordCommitMarker(job.jobId, claimToken, 'swmInserted');
     await queue.succeed(job.jobId, claimToken, {
       promotedCount: result.promotedCount,
       succeededAt: now(),
@@ -283,6 +281,7 @@ export async function runPromoteJob(
 interface WorkerSlot {
   workerId: string;
   inFlight: Promise<void> | null;
+  tickInFlight: Promise<boolean> | null;
   timer: ReturnType<typeof setInterval> | null;
 }
 
@@ -297,6 +296,7 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
   const slots: WorkerSlot[] = Array.from({ length: concurrency }, (_, i) => ({
     workerId: `${workerIdPrefix}-slot-${i}`,
     inFlight: null,
+    tickInFlight: null,
     timer: null,
   }));
   let shuttingDown = false;
@@ -360,13 +360,39 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
     return true;
   }
 
+  function scheduleTick(slot: WorkerSlot): Promise<boolean> {
+    if (slot.tickInFlight) return slot.tickInFlight;
+    const run = tickSlot(slot).finally(() => {
+      if (slot.tickInFlight === run) {
+        slot.tickInFlight = null;
+      }
+    });
+    slot.tickInFlight = run;
+    return run;
+  }
+
   async function tickAllOnce(): Promise<number> {
     let picked = 0;
     for (const slot of slots) {
-      const claimed = await tickSlot(slot);
+      const claimed = await scheduleTick(slot);
       if (claimed) picked += 1;
     }
     return picked;
+  }
+
+  function activeShutdownSlotCount(): number {
+    return slots.filter((s) => s.tickInFlight || s.inFlight).length;
+  }
+
+  async function drainForShutdown(): Promise<number> {
+    const pendingTicks = slots.map((s) => s.tickInFlight).filter((p): p is Promise<boolean> => p !== null);
+    if (pendingTicks.length > 0) {
+      await Promise.allSettled(pendingTicks);
+    }
+    const inFlight = slots.map((s) => s.inFlight).filter((p): p is Promise<void> => p !== null);
+    if (inFlight.length === 0) return 0;
+    await Promise.all(inFlight);
+    return inFlight.length;
   }
 
   return {
@@ -388,7 +414,7 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
       for (const slot of slots) {
         slot.timer = setInterval(() => {
           if (shuttingDown) return;
-          void tickSlot(slot);
+          void scheduleTick(slot);
         }, pollIntervalMs);
         if (slot.timer.unref) slot.timer.unref();
       }
@@ -402,8 +428,8 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
           slot.timer = null;
         }
       }
-      const inFlight = slots.map((s) => s.inFlight).filter((p): p is Promise<void> => p !== null);
-      if (inFlight.length === 0) {
+      const activeAtStop = activeShutdownSlotCount();
+      if (activeAtStop === 0) {
         started = false;
         return;
       }
@@ -411,12 +437,13 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
         const t = setTimeout(() => resolve('timeout'), shutdownTimeoutMs);
         if (t.unref) t.unref();
       });
-      const drained = Promise.all(inFlight).then(() => 'drained' as const);
+      const drained = drainForShutdown().then((count) => ({ kind: 'drained' as const, count }));
       const result = await Promise.race([timeout, drained]);
       if (result === 'timeout') {
-        counters.interruptedAtShutdown += inFlight.length;
+        const active = activeShutdownSlotCount() || activeAtStop;
+        counters.interruptedAtShutdown += active;
         log(
-          `Shutdown timeout (${shutdownTimeoutMs}ms) reached; ${inFlight.length} in-flight promote(s) abandoned to next-boot recovery`,
+          `Shutdown timeout (${shutdownTimeoutMs}ms) reached; ${active} in-flight promote(s) abandoned to next-boot recovery`,
         );
       }
       started = false;

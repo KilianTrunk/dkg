@@ -6,7 +6,7 @@
  *   - `runPromoteJob(...)` — per-job lifecycle including commit-marker
  *     bookkeeping and outcome reporting (8 tests).
  *   - `createPromoteWorkerSupervisor(...)` — multi-slot polling +
- *     shutdown drain (5 tests).
+ *     shutdown drain (6 tests).
  *
  * Backed by a real `TripleStoreAsyncPromoteQueue` against an in-memory
  * `OxigraphStore`. The `agent.assertion.promote` call is a stub
@@ -26,6 +26,20 @@ import {
   createPromoteWorkerSupervisor,
   runPromoteJob,
 } from '../src/daemon/worker/async-promote-worker.js';
+
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value?: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value?: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 describe('classifyPromoteError', () => {
   // RFC §10 / plan §10.3 — the three patterns surfaced by the rc.10 Graphify import
@@ -129,7 +143,7 @@ describe('runPromoteJob', () => {
     return claimed;
   }
 
-  it('on success, records all 4 commit markers and transitions to succeeded', async () => {
+  it('on success, records the recovery commit marker and transitions to succeeded', async () => {
     const job = await enqueueAndClaim();
     const result = await runPromoteJob({
       job,
@@ -146,9 +160,9 @@ describe('runPromoteJob', () => {
     expect(final?.state).toBe('succeeded');
     expect(final?.commitMarker).toEqual({
       swmInserted: true,
-      wmCleaned: true,
-      lifecycleStamped: true,
-      gossiped: true,
+      wmCleaned: false,
+      lifecycleStamped: false,
+      gossiped: false,
     });
     expect(final?.result?.promotedCount).toBe(42);
   });
@@ -461,6 +475,55 @@ describe('createPromoteWorkerSupervisor', () => {
     // wait on it forever.
     releaseSlow!();
     await slowPromote;
+  });
+
+  it('stop() waits for a poll callback that has claimed work but not published inFlight yet', async () => {
+    await queue.enqueue(makeRequest('interval-claim-race'));
+    const claimStarted = deferred();
+    const releaseClaim = deferred();
+    const promoteStarted = deferred();
+    const releasePromote = deferred<{ promotedCount: number }>();
+    const wrappedQueue = Object.create(queue) as AsyncPromoteQueue;
+    wrappedQueue.claimNext = async (workerId: string) => {
+      claimStarted.resolve();
+      await releaseClaim.promise;
+      return queue.claimNext(workerId);
+    };
+    const sup = createPromoteWorkerSupervisor({
+      agent: {
+        promoteQueue: wrappedQueue,
+        assertion: {
+          async promote() {
+            promoteStarted.resolve();
+            return releasePromote.promise;
+          },
+        },
+      } as any,
+      workerConcurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 0,
+      shutdownTimeoutMs: 500,
+      log: (m) => logs.push(m),
+      workerIdPrefix: 'test',
+    });
+    await sup.start();
+    await claimStarted.promise;
+
+    let stopResolved = false;
+    const stopPromise = sup.stop().then(() => {
+      stopResolved = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(stopResolved).toBe(false);
+
+    releaseClaim.resolve();
+    await promoteStarted.promise;
+    releasePromote.resolve({ promotedCount: 1 });
+    await stopPromise;
+
+    expect(stopResolved).toBe(true);
+    expect(logs.some((m) => m.includes('Shutdown timeout'))).toBe(false);
+    expect((await queue.getStats()).succeeded).toBe(1);
   });
 
   it('runs recoverOnStartup() during start()', async () => {

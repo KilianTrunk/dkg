@@ -1,0 +1,3694 @@
+{
+  "schemaVersion": 1,
+  "startedAt": "2026-05-25T07:45:15.674Z",
+  "home": "/Users/aleatoric/dev/dkg-graphify/.dkg-repro",
+  "port": 54293,
+  "spawnedDaemon": true,
+  "runs": [
+    {
+      "tag": "small-clean-pause0",
+      "ok": true,
+      "spec": {
+        "tag": "small-clean-pause0",
+        "numAssertions": 5,
+        "quadsPerAssertion": 1000,
+        "quadShape": "generic",
+        "restartMode": "clean",
+        "pauseMs": 0
+      },
+      "cgId": "repro-wm-persistence-mpkvx7xz",
+      "subGraph": "repro",
+      "expectedTriples": 5000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 5000,
+          "tripleCount": 5000
+        },
+        "viaSparql": {
+          "triples": 5000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/_meta",
+              "triples": 92
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 1000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 1000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": {
+          "entityCount": 5000,
+          "tripleCount": 5000
+        },
+        "viaSparql": {
+          "triples": 5000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/_meta",
+              "triples": 92
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 1000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvx7xz/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 1000
+          }
+        ]
+      },
+      "lostTriples": 0,
+      "failed": false,
+      "timings": {
+        "writeMs": 50,
+        "stopMs": 504,
+        "restartMs": 6283,
+        "totalMs": 8742
+      }
+    },
+    {
+      "tag": "medium-clean-pause0",
+      "ok": true,
+      "spec": {
+        "tag": "medium-clean-pause0",
+        "numAssertions": 25,
+        "quadsPerAssertion": 5000,
+        "quadShape": "generic",
+        "restartMode": "clean",
+        "pauseMs": 0
+      },
+      "cgId": "repro-wm-persistence-mpkvxeot",
+      "subGraph": "repro",
+      "expectedTriples": 125000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 125000,
+          "tripleCount": 125000
+        },
+        "viaSparql": {
+          "triples": 125000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/_meta",
+              "triples": 432
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 5000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 5000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": {
+          "entityCount": 125000,
+          "tripleCount": 125000
+        },
+        "viaSparql": {
+          "triples": 125000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/_meta",
+              "triples": 432
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 5000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxeot/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 5000
+          }
+        ]
+      },
+      "lostTriples": 0,
+      "failed": false,
+      "timings": {
+        "writeMs": 899,
+        "stopMs": 505,
+        "restartMs": 6785,
+        "totalMs": 10322
+      }
+    },
+    {
+      "tag": "large-clean-pause0",
+      "ok": true,
+      "spec": {
+        "tag": "large-clean-pause0",
+        "numAssertions": 50,
+        "quadsPerAssertion": 20000,
+        "quadShape": "generic",
+        "restartMode": "clean",
+        "pauseMs": 0
+      },
+      "cgId": "repro-wm-persistence-mpkvxmnj",
+      "subGraph": "repro",
+      "expectedTriples": 1000000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 1000000,
+          "tripleCount": 1000000
+        },
+        "viaSparql": {
+          "triples": 1000000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0049",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0036",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0046",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0041",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0044",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/_meta",
+              "triples": 857
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0047",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0034",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0029",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0032",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0038",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0025",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0026",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0043",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0037",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0028",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0033",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0040",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0031",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0039",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0048",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0027",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0045",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0035",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0030",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0042",
+              "triples": 20000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0049",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0036",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0046",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0041",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0044",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0047",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0034",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0029",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0032",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0038",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0025",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0026",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0043",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0037",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0028",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0033",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0040",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0031",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0039",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0048",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0027",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0045",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0035",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0030",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkvxmnj/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0042",
+            "triples": 20000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": null,
+        "viaSparql": {
+          "triples": 0,
+          "allGraphs": []
+        },
+        "perAssertion": []
+      },
+      "lostTriples": 1000000,
+      "failed": true,
+      "timings": {
+        "writeMs": 153723,
+        "stopMs": 508,
+        "restartMs": 6279,
+        "totalMs": 219017
+      }
+    },
+    {
+      "tag": "small-clean-pause30000",
+      "ok": true,
+      "spec": {
+        "tag": "small-clean-pause30000",
+        "numAssertions": 5,
+        "quadsPerAssertion": 1000,
+        "quadShape": "generic",
+        "restartMode": "clean",
+        "pauseMs": 30000
+      },
+      "cgId": "repro-wm-persistence-mpkw2bnc",
+      "subGraph": "repro",
+      "expectedTriples": 5000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 5000,
+          "tripleCount": 5000
+        },
+        "viaSparql": {
+          "triples": 5000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/_meta",
+              "triples": 92
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 1000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 1000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": {
+          "entityCount": 5000,
+          "tripleCount": 5000
+        },
+        "viaSparql": {
+          "triples": 5000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/_meta",
+              "triples": 92
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 1000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw2bnc/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 1000
+          }
+        ]
+      },
+      "lostTriples": 0,
+      "failed": false,
+      "timings": {
+        "writeMs": 37,
+        "stopMs": 504,
+        "restartMs": 6803,
+        "totalMs": 39190
+      }
+    },
+    {
+      "tag": "medium-clean-pause30000",
+      "ok": true,
+      "spec": {
+        "tag": "medium-clean-pause30000",
+        "numAssertions": 25,
+        "quadsPerAssertion": 5000,
+        "quadShape": "generic",
+        "restartMode": "clean",
+        "pauseMs": 30000
+      },
+      "cgId": "repro-wm-persistence-mpkw35vy",
+      "subGraph": "repro",
+      "expectedTriples": 125000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 125000,
+          "tripleCount": 125000
+        },
+        "viaSparql": {
+          "triples": 125000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/_meta",
+              "triples": 432
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 5000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 5000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": {
+          "entityCount": 110000,
+          "tripleCount": 110000
+        },
+        "viaSparql": {
+          "triples": 110000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/_meta",
+              "triples": 398
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 5000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw35vy/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 5000
+          }
+        ]
+      },
+      "lostTriples": 15000,
+      "failed": true,
+      "timings": {
+        "writeMs": 1063,
+        "stopMs": 503,
+        "restartMs": 6790,
+        "totalMs": 40694
+      }
+    },
+    {
+      "tag": "large-clean-pause30000",
+      "ok": true,
+      "spec": {
+        "tag": "large-clean-pause30000",
+        "numAssertions": 50,
+        "quadsPerAssertion": 20000,
+        "quadShape": "generic",
+        "restartMode": "clean",
+        "pauseMs": 30000
+      },
+      "cgId": "repro-wm-persistence-mpkw41ac",
+      "subGraph": "repro",
+      "expectedTriples": 1000000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 1000000,
+          "tripleCount": 1000000
+        },
+        "viaSparql": {
+          "triples": 1000000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0040",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0044",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0037",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0025",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0029",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0032",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0030",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0038",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0048",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0034",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0047",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0043",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0026",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0031",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0046",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/_meta",
+              "triples": 857
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0027",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0036",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0041",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0042",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0035",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0039",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0045",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0028",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0033",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0049",
+              "triples": 20000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0040",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0044",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0037",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0025",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0029",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0032",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0030",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0038",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0048",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0034",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0047",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0043",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0026",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0031",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0046",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0027",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0036",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0041",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0042",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0035",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0039",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0045",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0028",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0033",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw41ac/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0049",
+            "triples": 20000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": null,
+        "viaSparql": {
+          "triples": 0,
+          "allGraphs": []
+        },
+        "perAssertion": []
+      },
+      "lostTriples": 1000000,
+      "failed": true,
+      "timings": {
+        "writeMs": 133908,
+        "stopMs": 517,
+        "restartMs": 6569,
+        "totalMs": 179577
+      }
+    },
+    {
+      "tag": "small-kill-pause0",
+      "ok": true,
+      "spec": {
+        "tag": "small-kill-pause0",
+        "numAssertions": 5,
+        "quadsPerAssertion": 1000,
+        "quadShape": "generic",
+        "restartMode": "kill",
+        "pauseMs": 0
+      },
+      "cgId": "repro-wm-persistence-mpkw7vul",
+      "subGraph": "repro",
+      "expectedTriples": 5000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 5000,
+          "tripleCount": 5000
+        },
+        "viaSparql": {
+          "triples": 5000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/_meta",
+              "triples": 92
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 1000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 1000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": {
+          "entityCount": 5000,
+          "tripleCount": 5000
+        },
+        "viaSparql": {
+          "triples": 5000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/_meta",
+              "triples": 92
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw7vul/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 1000
+          }
+        ]
+      },
+      "lostTriples": 0,
+      "failed": false,
+      "timings": {
+        "writeMs": 41,
+        "stopMs": 264,
+        "restartMs": 6292,
+        "totalMs": 8467
+      }
+    },
+    {
+      "tag": "medium-kill-pause0",
+      "ok": true,
+      "spec": {
+        "tag": "medium-kill-pause0",
+        "numAssertions": 25,
+        "quadsPerAssertion": 5000,
+        "quadShape": "generic",
+        "restartMode": "kill",
+        "pauseMs": 0
+      },
+      "cgId": "repro-wm-persistence-mpkw82ds",
+      "subGraph": "repro",
+      "expectedTriples": 125000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 125000,
+          "tripleCount": 125000
+        },
+        "viaSparql": {
+          "triples": 125000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/_meta",
+              "triples": 432
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 5000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 5000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": {
+          "entityCount": 115000,
+          "tripleCount": 115000
+        },
+        "viaSparql": {
+          "triples": 115000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/_meta",
+              "triples": 398
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 5000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw82ds/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 5000
+          }
+        ]
+      },
+      "lostTriples": 10000,
+      "failed": true,
+      "timings": {
+        "writeMs": 1291,
+        "stopMs": 273,
+        "restartMs": 6537,
+        "totalMs": 11140
+      }
+    },
+    {
+      "tag": "large-kill-pause0",
+      "ok": true,
+      "spec": {
+        "tag": "large-kill-pause0",
+        "numAssertions": 50,
+        "quadsPerAssertion": 20000,
+        "quadShape": "generic",
+        "restartMode": "kill",
+        "pauseMs": 0
+      },
+      "cgId": "repro-wm-persistence-mpkw8az8",
+      "subGraph": "repro",
+      "expectedTriples": 1000000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 1000000,
+          "tripleCount": 1000000
+        },
+        "viaSparql": {
+          "triples": 1000000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0027",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0040",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0025",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0026",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0044",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0038",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0028",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0033",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0032",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0034",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0042",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0049",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0031",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0043",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0048",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0030",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0041",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0039",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0036",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/_meta",
+              "triples": 857
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0035",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0045",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0037",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0047",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0029",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0046",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 20000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 20000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0027",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0040",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0025",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0026",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0044",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0038",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0028",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0033",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0032",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0034",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0042",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0049",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0031",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0043",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0048",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0030",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0041",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0039",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0036",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0035",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0045",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0037",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0047",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0029",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0046",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 20000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkw8az8/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 20000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": null,
+        "viaSparql": {
+          "triples": 0,
+          "allGraphs": []
+        },
+        "perAssertion": []
+      },
+      "lostTriples": 1000000,
+      "failed": true,
+      "timings": {
+        "writeMs": 382477,
+        "stopMs": 564,
+        "restartMs": 6533,
+        "totalMs": 393205
+      }
+    },
+    {
+      "tag": "small-kill-pause30000",
+      "ok": true,
+      "spec": {
+        "tag": "small-kill-pause30000",
+        "numAssertions": 5,
+        "quadsPerAssertion": 1000,
+        "quadShape": "generic",
+        "restartMode": "kill",
+        "pauseMs": 30000
+      },
+      "cgId": "repro-wm-persistence-mpkwgqdl",
+      "subGraph": "repro",
+      "expectedTriples": 5000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 5000,
+          "tripleCount": 5000
+        },
+        "viaSparql": {
+          "triples": 5000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/_meta",
+              "triples": 92
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 1000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 1000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": {
+          "entityCount": 5000,
+          "tripleCount": 5000
+        },
+        "viaSparql": {
+          "triples": 5000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/_meta",
+              "triples": 92
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 1000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 1000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 1000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwgqdl/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 1000
+          }
+        ]
+      },
+      "lostTriples": 0,
+      "failed": false,
+      "timings": {
+        "writeMs": 41,
+        "stopMs": 261,
+        "restartMs": 6817,
+        "totalMs": 38980
+      }
+    },
+    {
+      "tag": "medium-kill-pause30000",
+      "ok": true,
+      "spec": {
+        "tag": "medium-kill-pause30000",
+        "numAssertions": 25,
+        "quadsPerAssertion": 5000,
+        "quadShape": "generic",
+        "restartMode": "kill",
+        "pauseMs": 30000
+      },
+      "cgId": "repro-wm-persistence-mpkwhkgd",
+      "subGraph": "repro",
+      "expectedTriples": 125000,
+      "preStop": {
+        "viaList": {
+          "entityCount": 125000,
+          "tripleCount": 125000
+        },
+        "viaSparql": {
+          "triples": 125000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/_meta",
+              "triples": 432
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 5000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 5000
+          }
+        ]
+      },
+      "postStart": {
+        "viaList": {
+          "entityCount": 125000,
+          "tripleCount": 125000
+        },
+        "viaSparql": {
+          "triples": 125000,
+          "allGraphs": [
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/_meta",
+              "triples": 432
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+              "triples": 5000
+            },
+            {
+              "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+              "triples": 5000
+            }
+          ]
+        },
+        "perAssertion": [
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0002",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0011",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0018",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0005",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0016",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0015",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0017",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0021",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0012",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0009",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0014",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0003",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0008",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0023",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0024",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0001",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0004",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0006",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0000",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0010",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0013",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0022",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0007",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0019",
+            "triples": 5000
+          },
+          {
+            "g": "did:dkg:context-graph:repro-wm-persistence-mpkwhkgd/repro/assertion/0x14E6e9b02a9c90e78ffb0ed7Ac84591C5C0fc103/repro-0020",
+            "triples": 5000
+          }
+        ]
+      },
+      "lostTriples": 0,
+      "failed": false,
+      "timings": {
+        "writeMs": 1106,
+        "stopMs": 270,
+        "restartMs": 7292,
+        "totalMs": 52336
+      }
+    },
+    {
+      "tag": "large-kill-pause30000",
+      "ok": false,
+      "error": "POST /api/context-graph/create -> 500: {\"error\":\"missing revert data (action=\\\"call\\\", data=null, reason=null, transaction={ \\\"data\\\": \\\"0x867a468000000000000000000000000014e6e9b02a9c90e78ffb0ed7ac84591c5c0fc103\\\", \\\"from\\\": \\\"0x14E6e9b02a"
+    }
+  ]
+}

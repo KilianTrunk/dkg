@@ -1,0 +1,702 @@
+#!/usr/bin/env node
+/**
+ * WM persistence regression repro
+ * ===============================
+ *
+ * Reproduces the symptom called out in PR #602 / issue #596: WM (working-memory)
+ * assertions written via /api/assertion/<name>/{create,write} sometimes do NOT
+ * survive a daemon stop → start cycle. The script writes a parameterised pile
+ * of triples into a throwaway context graph, snapshots the sub-graph counts,
+ * cycles the daemon (clean SIGTERM via /api/shutdown OR hard SIGKILL on the
+ * daemon PID), and diffs the counts to see what was lost.
+ *
+ * Strict isolation contract (see REPRO.md):
+ *   - Runs against DKG_HOME / DKG_API_PORT only. Hard-refuses to talk to the
+ *     default 9200 port so the kill cycle can never nuke the other agent's
+ *     daemon on ~/.dkg-dev:9200.
+ *   - Defaults to DKG_HOME=<repo-root>/.dkg-repro and DKG_API_PORT=54293 if
+ *     neither env var nor CLI flag is set. Both defaults are still validated
+ *     against the 9200 ban.
+ *
+ * Lifecycle modes:
+ *   - --spawn (default true):     spawn a daemon child via the configured
+ *                                 start command, wait for /api/status, then
+ *                                 use the daemon PID file for kill cycles.
+ *   - --no-spawn:                 assume the daemon is already running at
+ *                                 DKG_API_PORT; use the PID file for hard
+ *                                 kills, and /api/shutdown for clean stops.
+ *
+ * Workload:
+ *   - --num-assertions N (default 5)
+ *   - --quads-per-assertion M (default 1000)
+ *   - --quad-shape <code|generic> (default generic; "code" matches the shape
+ *     used by .dkg/scripts/scan-code.mjs and PR #602's importer)
+ *
+ * Restart matrix:
+ *   - --restart-mode clean|kill   (default clean)
+ *   - --pause-ms <ms>             (delay between stop and restart; default 0)
+ *   - --matrix                    run the full matrix
+ *                                   (clean × kill) × (small/medium/large)
+ *                                   × (pause=0 / pause=30000) and write a
+ *                                 combined JSON report. Overrides the
+ *                                 single-run knobs.
+ *
+ * Output:
+ *   - --report <path>             write a JSON report (default:
+ *                                 ./.dkg-repro-reports/<ts>.json under the
+ *                                 worktree, never inside DKG_HOME).
+ *   - --keep-cg                   keep the throwaway context graph (default).
+ *                                 The V10 daemon has no context-graph delete
+ *                                 endpoint; each run picks a fresh CG id, and
+ *                                 the operator wipes state via `rm -rf
+ *                                 $DKG_HOME/store.nq ...` (see REPRO.md).
+ *
+ * Usage examples:
+ *   node scripts/repro/wm-persistence-regression.mjs           # single small run
+ *   node scripts/repro/wm-persistence-regression.mjs --no-spawn # use existing daemon
+ *   node scripts/repro/wm-persistence-regression.mjs --matrix   # full matrix
+ *   node scripts/repro/wm-persistence-regression.mjs --num-assertions=50 --quads-per-assertion=10000 --restart-mode=kill
+ */
+
+import { spawn } from 'node:child_process';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(__dirname, '..', '..');
+
+// ─── arg parsing ───────────────────────────────────────────────────
+
+function parseArgs(argv = process.argv.slice(2)) {
+  const out = {};
+  for (const a of argv) {
+    const m = a.match(/^--([^=]+)(?:=(.*))?$/);
+    if (!m) continue;
+    out[m[1]] = m[2] === undefined ? 'true' : m[2];
+  }
+  return out;
+}
+
+const args = parseArgs();
+const HOME_DIR = args.home ?? process.env.DKG_HOME ?? join(REPO_ROOT, '.dkg-repro');
+const PORT = Number(args.port ?? process.env.DKG_API_PORT ?? 54293);
+const SPAWN_DAEMON = args.spawn !== 'false' && args['no-spawn'] !== 'true';
+const RESTART_MODE = args['restart-mode'] ?? 'clean';
+const NUM_ASSERTIONS = Number(args['num-assertions'] ?? 5);
+const QUADS_PER_ASSERTION = Number(args['quads-per-assertion'] ?? 1000);
+const PAUSE_MS = Number(args['pause-ms'] ?? 0);
+const QUAD_SHAPE = args['quad-shape'] ?? 'generic';
+const KEEP_CG = args['keep-cg'] === 'true';
+const RUN_MATRIX = args.matrix === 'true';
+const CG_ID_OVERRIDE = args['cg-id'] ?? null;
+const SUBGRAPH = args.subgraph ?? 'repro';
+// Default to the globally-installed `dkg` binary on PATH (npm-global install
+// or symlink from the monorepo CLI). Override with --start-cmd if you've
+// built the workspace and want to use the source tree's CLI directly.
+const START_CMD = args['start-cmd'] ?? 'dkg start --foreground';
+const REPORT_PATH = args.report ?? join(REPO_ROOT, '.dkg-repro-reports', `${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+
+// ─── safety ────────────────────────────────────────────────────────
+
+if (PORT === 9200) {
+  console.error(
+    `\n[FATAL] DKG_API_PORT=${PORT} matches the default port used by the other agent's daemon ` +
+    `(~/.dkg-dev). This script does kill -9 cycles and must never run against that daemon. ` +
+    `Set DKG_API_PORT (or pass --port) to something else — REPRO.md proposes 54293.\n`,
+  );
+  process.exit(2);
+}
+if (!Number.isFinite(PORT) || PORT < 1024 || PORT > 65535) {
+  console.error(`[FATAL] invalid port ${PORT}. Must be in [1024, 65535].`);
+  process.exit(2);
+}
+if (!HOME_DIR || HOME_DIR === '~/.dkg' || HOME_DIR === '~/.dkg-dev') {
+  console.error(`[FATAL] refusing to use HOME=${HOME_DIR} — please point DKG_HOME at the dedicated repro dir (REPRO.md).`);
+  process.exit(2);
+}
+const HOME_ABS = resolve(HOME_DIR);
+
+// ─── daemon helpers ────────────────────────────────────────────────
+
+const API_BASE = `http://127.0.0.1:${PORT}`;
+
+function log(...m) { console.log('[repro]', ...m); }
+function warn(...m) { console.warn('[repro][warn]', ...m); }
+function err(...m) { console.error('[repro][err]', ...m); }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function readAuthToken() {
+  const tokenPath = join(HOME_ABS, 'auth.token');
+  if (!existsSync(tokenPath)) return null;
+  try {
+    const raw = await readFile(tokenPath, 'utf-8');
+    for (const line of raw.split('\n')) {
+      const t = line.trim();
+      if (t.length > 0 && !t.startsWith('#')) return t;
+    }
+  } catch { /* unreadable */ }
+  return null;
+}
+
+async function readDaemonPid() {
+  const p = join(HOME_ABS, 'daemon.pid');
+  if (!existsSync(p)) return null;
+  try {
+    const raw = await readFile(p, 'utf-8');
+    const n = Number(raw.trim());
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch { return null; }
+}
+
+function isAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+async function apiFetch(method, path, body) {
+  const token = await readAuthToken();
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let parsed;
+  try { parsed = text ? JSON.parse(text) : {}; } catch { parsed = { raw: text }; }
+  if (!res.ok) {
+    const e = new Error(`${method} ${path} -> ${res.status}: ${text.slice(0, 200)}`);
+    e.status = res.status;
+    e.body = parsed;
+    throw e;
+  }
+  return parsed;
+}
+
+async function pingStatus(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(`${API_BASE}/api/status`, { method: 'GET' });
+      // /api/status requires auth — a 401 is just as good a "daemon is up" signal as a 200.
+      if (r.ok || r.status === 401) return true;
+    } catch { /* not yet */ }
+    await sleep(250);
+  }
+  return false;
+}
+
+async function ensureNoForeignDaemon() {
+  // Reject if a daemon is responding at our port but the PID does NOT match
+  // the file in HOME_ABS — that means someone else is squatting our port and
+  // we must NOT kill it.
+  let healthy;
+  try {
+    const r = await fetch(`${API_BASE}/api/status`);
+    healthy = r.ok || r.status === 401;
+  } catch { healthy = false; }
+  if (!healthy) return; // nothing listening — safe.
+
+  const pid = await readDaemonPid();
+  if (pid && isAlive(pid)) return; // our daemon — fine.
+
+  // The daemon at our port has no matching pid file under HOME_ABS. Refuse.
+  throw new Error(
+    `Port ${PORT} is occupied but ${join(HOME_ABS, 'daemon.pid')} does not point at a live process. ` +
+    `Refusing to proceed: this is exactly the scenario the isolation contract forbids — ` +
+    `the script would otherwise kill a daemon it doesn't own. Free port ${PORT} or set a different one.`,
+  );
+}
+
+let spawnedChild = null;
+
+async function spawnDaemon() {
+  log(`spawning daemon: ${START_CMD} (HOME=${HOME_ABS}, PORT=${PORT})`);
+  const env = {
+    ...process.env,
+    DKG_HOME: HOME_ABS,
+    DKG_API_PORT: String(PORT),
+  };
+  const [cmd, ...rest] = START_CMD.split(/\s+/);
+  spawnedChild = spawn(cmd, rest, {
+    cwd: REPO_ROOT,
+    env,
+    stdio: ['ignore', 'inherit', 'inherit'],
+    detached: false,
+  });
+  spawnedChild.on('exit', (code, signal) => {
+    log(`daemon child exited (code=${code}, signal=${signal})`);
+    spawnedChild = null;
+  });
+  const ok = await pingStatus(120_000);
+  if (!ok) throw new Error('daemon did not become responsive at /api/status within 120s');
+  log('daemon is up.');
+}
+
+async function stopDaemonClean() {
+  log('clean-stopping daemon via /api/shutdown ...');
+  try {
+    await apiFetch('POST', '/api/shutdown', {});
+  } catch (e) {
+    // The daemon kills itself ~100ms after responding 200 OK; the response
+    // sometimes fails to read on a fast machine. Treat connection errors as success.
+    warn(`shutdown returned ${e.message}; relying on PID death`);
+  }
+  await waitForDaemonExit();
+}
+
+async function killDaemonHard() {
+  const pid = await readDaemonPid();
+  if (!pid) {
+    warn('no daemon.pid found — nothing to kill');
+    return;
+  }
+  if (!isAlive(pid)) {
+    warn(`pid ${pid} is not alive`);
+    return;
+  }
+  log(`SIGKILL daemon pid=${pid}`);
+  try { process.kill(pid, 'SIGKILL'); } catch (e) {
+    warn(`kill -9 ${pid} failed: ${e.message}`);
+  }
+  // Also kill our spawned child shell, in case start-cmd was a wrapper.
+  if (spawnedChild && spawnedChild.pid && isAlive(spawnedChild.pid)) {
+    try { process.kill(spawnedChild.pid, 'SIGKILL'); } catch { /* */ }
+  }
+  await waitForDaemonExit();
+}
+
+async function waitForDaemonExit() {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    let alive = false;
+    try { await fetch(`${API_BASE}/api/status`); alive = true; } catch { alive = false; }
+    const pid = await readDaemonPid();
+    const pidAlive = pid != null && isAlive(pid);
+    if (!alive && !pidAlive) {
+      // Give the OS another tick to clean up port-bind state.
+      await sleep(250);
+      return;
+    }
+    await sleep(250);
+  }
+  warn('daemon did not exit cleanly within 30s — proceeding anyway');
+}
+
+// ─── workload ──────────────────────────────────────────────────────
+
+function genQuads(assertionIdx, count, shape) {
+  const out = new Array(count);
+  if (shape === 'code') {
+    // Mimic .dkg/scripts/scan-code.mjs: a "file" node + a handful of
+    // edges + a "package" container. Each quad is one triple in the
+    // /write payload (subGraphName is supplied at the request level).
+    const owner = 'repro';
+    const name = 'wm-persistence';
+    for (let i = 0; i < count; i++) {
+      const fileUri = `urn:dkg:code:file:${owner}/${name}/a${assertionIdx}/f${i}.ts`;
+      // Cycle 5 different predicates so the quad set isn't all one shape.
+      switch (i % 5) {
+        case 0:
+          out[i] = {
+            subject: fileUri,
+            predicate: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type',
+            object: 'http://dkg.io/ontology/code/File',
+          };
+          break;
+        case 1:
+          out[i] = {
+            subject: fileUri,
+            predicate: 'http://www.w3.org/2000/01/rdf-schema#label',
+            object: `"f${i}.ts"`,
+          };
+          break;
+        case 2:
+          out[i] = {
+            subject: fileUri,
+            predicate: 'http://dkg.io/ontology/code/lineCount',
+            object: `"${(i * 13) % 999}"^^<http://www.w3.org/2001/XMLSchema#integer>`,
+          };
+          break;
+        case 3:
+          out[i] = {
+            subject: fileUri,
+            predicate: 'http://dkg.io/ontology/code/inPackage',
+            object: `urn:dkg:code:package:${owner}/${name}/pkg-${(i >> 4) % 32}`,
+          };
+          break;
+        case 4:
+          out[i] = {
+            subject: fileUri,
+            predicate: 'http://purl.org/dc/terms/modified',
+            object: `"2025-01-01T00:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>`,
+          };
+          break;
+      }
+    }
+  } else {
+    // Generic: one assertion -> count distinct subjects with a label + a payload.
+    for (let i = 0; i < count; i++) {
+      const subject = `urn:dkg:repro:wm:${assertionIdx}:${i}`;
+      out[i] = {
+        subject,
+        predicate: 'http://www.w3.org/2000/01/rdf-schema#label',
+        object: `"a${assertionIdx}-q${i}"`,
+      };
+    }
+  }
+  return out;
+}
+
+async function ensureContextGraph(cgId) {
+  try {
+    await apiFetch('POST', '/api/context-graph/create', {
+      id: cgId,
+      name: cgId,
+      description: 'Throwaway repro CG for wm-persistence-regression',
+    });
+    log(`created CG ${cgId}`);
+  } catch (e) {
+    if (String(e.message).includes('already exists') || (e.body?.error && String(e.body.error).includes('already exists'))) {
+      log(`CG ${cgId} already exists, reusing`);
+    } else {
+      throw e;
+    }
+  }
+}
+
+async function ensureSubGraph(cgId, name) {
+  try {
+    await apiFetch('POST', '/api/sub-graph/create', { contextGraphId: cgId, subGraphName: name });
+  } catch (e) {
+    if (!String(e.message).includes('already exists')) throw e;
+  }
+}
+
+async function deleteCg(cgId) {
+  // V10 daemon does not expose a context-graph/delete route; each repro run
+  // gets a unique id so leftover CGs don't interfere across runs. Cleanup is
+  // a manual operator step on the throwaway DKG_HOME (just `rm -rf` it).
+  log(`skipping CG delete for ${cgId} (no daemon endpoint); rm -rf ${HOME_ABS} between matrix runs if needed`);
+}
+
+async function writeAssertionBatch(cgId, name, quads, subGraph) {
+  // Create + write in two calls (mirrors the protocol importers use).
+  // Some shapes prefer the one-shot /create with quads; we use the explicit
+  // two-call shape since that's what PR #602's failing path used.
+  await apiFetch('POST', '/api/assertion/create', {
+    contextGraphId: cgId,
+    name,
+    subGraphName: subGraph,
+  });
+  // Chunk writes to keep individual requests under the JSON body limit.
+  const CHUNK = 5000;
+  for (let i = 0; i < quads.length; i += CHUNK) {
+    const batch = quads.slice(i, i + CHUNK);
+    await apiFetch('POST', `/api/assertion/${encodeURIComponent(name)}/write`, {
+      contextGraphId: cgId,
+      quads: batch,
+      subGraphName: subGraph,
+    });
+  }
+}
+
+async function snapshotCounts(cgId, subGraph) {
+  // Two probes:
+  //   (a) /api/sub-graph/list — same shape the UI uses, gives sub-graph-level totals.
+  //   (b) raw COUNT(*) SPARQL over every named graph that belongs to <cgId>/<subGraph>/...
+  let viaList = null;
+  try {
+    const list = await apiFetch('GET', `/api/sub-graph/list?contextGraphId=${encodeURIComponent(cgId)}`);
+    const entry = (list?.subGraphs ?? []).find((sg) => sg.name === subGraph);
+    viaList = entry ? { entityCount: entry.entityCount, tripleCount: entry.tripleCount } : null;
+  } catch (e) {
+    warn(`sub-graph/list probe failed: ${e.message}`);
+  }
+
+  // The /api/query endpoint already scopes the query to <cgId>. Sum every
+  // graph in the response so we don't depend on the on-disk URI shape (which
+  // is `did:dkg:context-graph:<cg>/<subgraph>/...` for bare-id CGs but
+  // `did:dkg:context-graph:<wallet>/<cg>/<subgraph>/...` for wallet-scoped
+  // ones). Bucket per-graph entries so the per-assertion view still works.
+  //
+  // Pass `view: 'working-memory'` explicitly: the daemon's default routing
+  // when no view is supplied is "everything visible to the caller", which on
+  // a fresh node can include only finalized/promoted graphs and miss WM
+  // assertions for an auth-disabled / node-level caller — exactly the case
+  // we're trying to measure here.
+  let viaSparql = null;
+  let perAssertion = null;
+  try {
+    const sparql = `
+      SELECT ?g (COUNT(*) AS ?triples) WHERE {
+        GRAPH ?g { ?s ?p ?o }
+      } GROUP BY ?g
+    `;
+    // No `view` passed: the daemon defaults to its "everything visible to the
+    // caller" view, which on a single-node auth-disabled daemon includes WM.
+    // /api/sub-graph/list uses the same shape and we know that one finds the
+    // WM graphs.
+    const response = await apiFetch('POST', '/api/query', {
+      sparql,
+      contextGraphId: cgId,
+    });
+    // /api/query wraps the SPARQL result in { result, phases } — the
+    // bindings live at response.result.bindings, not response.bindings.
+    const result = response?.result ?? response;
+    // /api/query intentionally returns every named graph the caller can see,
+    // regardless of `contextGraphId`. We filter to graphs that belong to
+    // THIS cgId so prior repro runs in the same DKG_HOME don't inflate the
+    // count. Wallet-scoped CGs surface as
+    //   did:dkg:context-graph:<wallet>/<cgId>/...
+    // and bare ids as
+    //   did:dkg:context-graph:<cgId>/...
+    // — `:cgId/` matches the bare form, `/cgId/` matches the wallet form.
+    const wantsCg = (g) =>
+      g && (g.includes(`:${cgId}/`) || g.includes(`/${cgId}/`));
+    const subGraphSegment = `/${subGraph}/`;
+    let total = 0;
+    const assertions = [];
+    const allGraphs = [];
+    for (const row of result?.bindings ?? []) {
+      const g = typeof row.g === 'string' ? row.g : row.g?.value;
+      const tv = row.triples;
+      const ts = typeof tv === 'string' ? tv : tv?.value ?? '';
+      const m = String(ts).match(/^"?(\d+)/);
+      const triples = m ? Number(m[1]) : 0;
+      if (wantsCg(g)) {
+        allGraphs.push({ g, triples });
+        if (g.includes(subGraphSegment)) {
+          total += triples;
+          if (g.includes('/assertion/')) {
+            assertions.push({ g, triples });
+          }
+        }
+      }
+    }
+    viaSparql = { triples: total, allGraphs };
+    perAssertion = assertions;
+  } catch (e) {
+    warn(`SPARQL count probe failed: ${e.message}`);
+  }
+
+  return { viaList, viaSparql, perAssertion };
+}
+
+// ─── single run ────────────────────────────────────────────────────
+
+async function ensureWalletScope() {
+  // listContextGraphs is wallet-scoped, but /api/context-graph/create accepts
+  // either a bare id or a wallet-scoped one. We use a bare slug for the throwaway
+  // CG since the repro doesn't need wallet semantics; the daemon happily reads
+  // and writes under that id. (See scripts/lib/dkg-daemon.mjs for the "phantom"
+  // discussion — we're intentionally hitting the phantom path here because it's
+  // the same write path PR #602's importer used.)
+  return null;
+}
+
+async function runOnce(spec) {
+  const startTs = Date.now();
+  const cgId = CG_ID_OVERRIDE ?? `repro-wm-persistence-${startTs.toString(36)}`;
+  log(`run: cg=${cgId} N=${spec.numAssertions} M=${spec.quadsPerAssertion} restart=${spec.restartMode} pause=${spec.pauseMs}ms shape=${spec.quadShape}`);
+
+  await ensureWalletScope();
+  await ensureContextGraph(cgId);
+  await ensureSubGraph(cgId, SUBGRAPH);
+
+  const writeStart = Date.now();
+  const assertionNames = [];
+  for (let i = 0; i < spec.numAssertions; i++) {
+    const name = `repro-${i.toString().padStart(4, '0')}`;
+    assertionNames.push(name);
+    const quads = genQuads(i, spec.quadsPerAssertion, spec.quadShape);
+    await writeAssertionBatch(cgId, name, quads, SUBGRAPH);
+    if ((i + 1) % 10 === 0 || i === spec.numAssertions - 1) {
+      log(`  wrote ${i + 1}/${spec.numAssertions} assertions`);
+    }
+  }
+  const writeMs = Date.now() - writeStart;
+
+  // Force the storage worker to flush its outstanding work before we measure.
+  await sleep(500);
+
+  const preStop = await snapshotCounts(cgId, SUBGRAPH);
+  log(`pre-stop: triples=${preStop.viaSparql?.triples ?? '?'} (list: entities=${preStop.viaList?.entityCount ?? '?'}, triples=${preStop.viaList?.tripleCount ?? '?'}, assertions=${preStop.perAssertion?.length ?? '?'})`);
+
+  // Restart cycle ---------------------------------------------------
+  const stopStart = Date.now();
+  if (spec.restartMode === 'clean') {
+    await stopDaemonClean();
+  } else if (spec.restartMode === 'kill') {
+    await killDaemonHard();
+  } else {
+    throw new Error(`unknown restart-mode: ${spec.restartMode}`);
+  }
+  const stopMs = Date.now() - stopStart;
+
+  if (spec.pauseMs > 0) {
+    log(`pause ${spec.pauseMs}ms before restart`);
+    await sleep(spec.pauseMs);
+  }
+
+  const restartStart = Date.now();
+  if (SPAWN_DAEMON) {
+    await spawnDaemon();
+  } else {
+    warn('--no-spawn: waiting for operator to restart the daemon ...');
+    const ok = await pingStatus(300_000);
+    if (!ok) throw new Error('daemon did not come back within 300s (--no-spawn)');
+  }
+  const restartMs = Date.now() - restartStart;
+
+  // Give the index time to re-open and any post-load fsync to settle.
+  await sleep(1000);
+
+  const postStart = await snapshotCounts(cgId, SUBGRAPH);
+  log(`post-restart: triples=${postStart.viaSparql?.triples ?? '?'} (list: entities=${postStart.viaList?.entityCount ?? '?'}, triples=${postStart.viaList?.tripleCount ?? '?'}, assertions=${postStart.perAssertion?.length ?? '?'})`);
+
+  const expected = spec.numAssertions * spec.quadsPerAssertion;
+  const observedPre = preStop.viaSparql?.triples ?? null;
+  const observedPost = postStart.viaSparql?.triples ?? null;
+  const lostTriples = observedPre != null && observedPost != null ? observedPre - observedPost : null;
+  const failed = observedPre != null && observedPost != null && observedPost < observedPre;
+
+  if (!KEEP_CG) {
+    await deleteCg(cgId);
+  }
+
+  return {
+    spec,
+    cgId,
+    subGraph: SUBGRAPH,
+    expectedTriples: expected,
+    preStop,
+    postStart,
+    lostTriples,
+    failed,
+    timings: { writeMs, stopMs, restartMs, totalMs: Date.now() - startTs },
+  };
+}
+
+// ─── matrix ────────────────────────────────────────────────────────
+
+function matrixSpecs() {
+  const sizes = [
+    { numAssertions: 5, quadsPerAssertion: 1000, tag: 'small' },           // 5k
+    { numAssertions: 25, quadsPerAssertion: 5000, tag: 'medium' },         // 125k
+    { numAssertions: 50, quadsPerAssertion: 20000, tag: 'large' },         // 1M (heavy)
+  ];
+  const restartModes = ['clean', 'kill'];
+  const pauses = [0, 30_000];
+  const out = [];
+  for (const m of restartModes) {
+    for (const p of pauses) {
+      for (const s of sizes) {
+        out.push({
+          tag: `${s.tag}-${m}-pause${p}`,
+          numAssertions: s.numAssertions,
+          quadsPerAssertion: s.quadsPerAssertion,
+          quadShape: QUAD_SHAPE,
+          restartMode: m,
+          pauseMs: p,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// ─── main ──────────────────────────────────────────────────────────
+
+async function main() {
+  log(`HOME=${HOME_ABS}`);
+  log(`PORT=${PORT}`);
+  log(`SPAWN_DAEMON=${SPAWN_DAEMON}`);
+
+  await ensureNoForeignDaemon();
+
+  if (SPAWN_DAEMON) {
+    const pid = await readDaemonPid();
+    if (pid && isAlive(pid)) {
+      log(`daemon pid ${pid} already alive — skipping spawn`);
+    } else {
+      await spawnDaemon();
+    }
+  } else {
+    const ok = await pingStatus(5_000);
+    if (!ok) throw new Error(`--no-spawn but daemon at ${API_BASE} is not responding`);
+    log('using pre-existing daemon');
+  }
+
+  // Verify the auth token can be read; many endpoints require it.
+  const token = await readAuthToken();
+  if (!token) {
+    warn(`no auth.token found under ${HOME_ABS}. If auth is enabled on this daemon, write operations will 401.`);
+  }
+
+  const runs = [];
+
+  if (RUN_MATRIX) {
+    const specs = matrixSpecs();
+    log(`running matrix: ${specs.length} runs`);
+    for (const spec of specs) {
+      try {
+        const r = await runOnce(spec);
+        runs.push({ tag: spec.tag, ok: true, ...r });
+        log(`  matrix run ${spec.tag}: ${r.failed ? 'FAILED' : 'ok'} (lost=${r.lostTriples})`);
+      } catch (e) {
+        warn(`matrix run ${spec.tag} threw: ${e.message}`);
+        runs.push({ tag: spec.tag, ok: false, error: e.message });
+      }
+    }
+  } else {
+    const spec = {
+      tag: 'single',
+      numAssertions: NUM_ASSERTIONS,
+      quadsPerAssertion: QUADS_PER_ASSERTION,
+      quadShape: QUAD_SHAPE,
+      restartMode: RESTART_MODE,
+      pauseMs: PAUSE_MS,
+    };
+    const r = await runOnce(spec);
+    runs.push({ tag: 'single', ok: true, ...r });
+  }
+
+  const report = {
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    home: HOME_ABS,
+    port: PORT,
+    spawnedDaemon: SPAWN_DAEMON,
+    runs,
+  };
+
+  await mkdir(dirname(REPORT_PATH), { recursive: true });
+  await writeFile(REPORT_PATH, JSON.stringify(report, null, 2));
+  log(`report written to ${REPORT_PATH}`);
+
+  const failures = runs.filter((r) => r.failed || !r.ok);
+  if (failures.length > 0) {
+    log(`SUMMARY: ${failures.length}/${runs.length} run(s) reproduced the regression`);
+    process.exitCode = 1;
+  } else {
+    log(`SUMMARY: 0/${runs.length} runs reproduced the regression`);
+  }
+
+  // Clean up child if we own it.
+  if (spawnedChild && spawnedChild.pid && isAlive(spawnedChild.pid)) {
+    log('terminating spawned daemon child ...');
+    try { process.kill(spawnedChild.pid, 'SIGTERM'); } catch { /* */ }
+  }
+}
+
+main().catch((e) => {
+  err(e.stack ?? e.message);
+  if (spawnedChild && spawnedChild.pid && isAlive(spawnedChild.pid)) {
+    try { process.kill(spawnedChild.pid, 'SIGTERM'); } catch { /* */ }
+  }
+  process.exit(1);
+});

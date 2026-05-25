@@ -41,30 +41,54 @@ which slice, and a sketch of how to reconcile already-emitted parallel URIs.
    urn:dkg:code:module:<moduleName>
    ```
 
-   - `<pkgName>` and `<relPath>` MUST be `encodeURIComponent`'d per path
-     segment. A `relPath` of `src/a b.ts` becomes `src/a%20b.ts`. This
-     matches the helper's behaviour today and matches the
-     `must-be-percent-encoded` rule called out in the parent workspace's
-     `AGENTS.md` (§ "Query gotchas #4").
+   - **Encoding** — there are two producers in play and they encode
+     differently for historical reasons. New code MUST keep doing what
+     the existing producer in its slice does, **not** invent a third
+     convention:
+     - `scripts/lib/ontology.mjs` (`Code.uri.file`) — the monorepo
+       helper — runs `encodeURIComponent` on `<pkgName>` and on
+       `<relPath>` **as whole strings**. A `relPath` of `src/a b.ts`
+       becomes `src%2Fa%20b.ts` and the literal URI is
+       `urn:dkg:code:file:@origintrail-official%2Fdkg-storage/src%2Fa%20b.ts`.
+       This is what every monorepo importer (`import-code-graph.mjs`,
+       `seed-dkg-code-project.mjs`, `import-github.mjs`, `import-tasks.mjs`,
+       `import-decisions.mjs`) emits today.
+     - The parent workspace's `.dkg/scripts/scan-code.mjs` — which scans
+       arbitrary external GitHub repos — percent-encodes **each path
+       segment** and joins them with literal `/`. The parent workspace's
+       `AGENTS.md` (§ "Query gotchas #4") documents this. That convention
+       stays as well; both producers have months of WM/SWM/VM data behind
+       them.
+     - These two encodings cannot collide because the producers own
+       disjoint `<pkgName>` slices (see §2): the monorepo helper passes
+       the package.json `name` field (e.g. `@origintrail-official/dkg-storage`);
+       the parent scanner passes `<owner>/<name>` (e.g.
+       `OriginTrail/dkg`). No `<pkgName>` is valid in both spaces.
+     - If a future change unifies the encoding, that's a separate ADR
+       with a real migration plan; do not flip it in passing.
    - `<pkgName>` is **the source's natural package handle in the producer's
      scope**, not always a public npm name:
-     - For DKG monorepo packages: the workspace package name without scope
-       — e.g. `dkg-storage`, `dkg-agent`, `dkg-cli`.
+     - For DKG monorepo packages: the scoped package.json `name` field —
+       e.g. `@origintrail-official/dkg-storage`,
+       `@origintrail-official/dkg-agent`,
+       `@origintrail-official/dkg-cli`. This matches what the existing
+       monorepo importers pass; using a hand-rolled unscoped form would
+       create a parallel `dkg-storage` namespace and fragment the graph.
      - For external GitHub repos scanned by the parent workspace's
-       `scan-code.mjs`: `<owner>/<name>` (slash kept as-is — that's the only
-       case `<pkgName>` contains a literal slash). The parent scanner has
-       been emitting this pattern for months; it stays.
-     - For loose source trees with no package metadata: a slug derived from
-       the directory name.
+       `scan-code.mjs`: `<owner>/<name>` (slash kept as-is — that's the
+       only case `<pkgName>` contains a literal slash). The parent
+       scanner has been emitting this pattern for months; it stays.
+     - For loose source trees with no package metadata: a slug derived
+       from the directory name.
 
 2. **One producer owns one slice.** Each tool MUST stay inside its declared
    scope so the URIs don't collide:
 
-   | Producer | Owns | Reads from |
-   |---|---|---|
-   | `scripts/lib/ontology.mjs` consumers in this worktree | DKG monorepo `urn:dkg:code:*` triples (`<pkgName>` is the workspace name) | Other producers via SPARQL — joins are by URI |
-   | Parent workspace's `scan-code.mjs` | External-repo `urn:dkg:code:*` triples (`<pkgName>` is `<owner>/<name>`) | Other producers via SPARQL — joins are by URI |
-   | Future Graphify-style importers | A producer-specific sub-graph; URIs MUST follow the canonical shape above (no `graphify:*` namespace) | Other producers via SPARQL — joins are by URI |
+   | Producer | Owns | `<pkgName>` shape | Reads from |
+   |---|---|---|---|
+   | `scripts/lib/ontology.mjs` consumers in this worktree | DKG monorepo `urn:dkg:code:*` triples | scoped package.json name (`@origintrail-official/dkg-storage`) | Other producers via SPARQL — joins are by URI |
+   | Parent workspace's `scan-code.mjs` | External-repo `urn:dkg:code:*` triples | `<owner>/<name>` (slash kept literal) | Other producers via SPARQL — joins are by URI |
+   | Future Graphify-style importers | A producer-specific sub-graph; URIs MUST follow the canonical shape above (no `graphify:*` namespace) | Whatever fits the producer's scope; pick one and stick to it | Other producers via SPARQL — joins are by URI |
 
 3. **The `graphify:*` URI namespace is deprecated.** Importers that
    currently emit `graphify:file:<hash>` MUST switch to
@@ -106,9 +130,13 @@ written once per known-aliased URI:
     owl:sameAs <urn:dkg:code:file:dkg-agent/src/dkg-agent.ts> .
 ```
 
-In SPARQL, joins across the legacy and canonical URIs become trivial:
+In SPARQL, joins across the legacy and canonical URIs become trivial
+(the `PREFIX owl:` declaration is required by standard SPARQL parsers
+when using the `owl:` short form):
 
 ```sparql
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
 SELECT ?file ?path WHERE {
   ?file owl:sameAs* ?canonical .
   ?canonical <http://dkg.io/ontology/code/path> ?path .
@@ -134,8 +162,8 @@ a single ROOT_CHUNK = 1000 URIs).
   any graphs that have already been promoted with the legacy URIs.
 - The parent workspace's `.dkg/scripts/scan-code.mjs` — scheduled for a
   documentation pass that points at this ADR. No URI-shape change is
-  required; the existing `<owner>/<name>/<relPath>` shape is already
-  canonical within its scope (external-repo scanning).
+  required; the existing `<owner>/<name>/<per-segment-encoded-relPath>`
+  shape is already canonical within its scope (external-repo scanning).
 - Any new code-graph importer — MUST import class/property IRIs from
   `scripts/lib/ontology.mjs` and MUST follow the URI shape above.
 

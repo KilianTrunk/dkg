@@ -787,6 +787,10 @@ export class DkgClient {
     id: string;
     name: string;
     description?: string;
+    /** 0 = public/discoverable, 1 = private/curated. Forwarded to the daemon verbatim. */
+    accessPolicy?: number;
+    /** 0 = curated publishing, 1 = open publishing. Forwarded to the daemon verbatim. */
+    publishPolicy?: number;
   }): Promise<{ created: string; uri: string; alreadyExists: boolean }> {
     try {
       const response = await this.request<{ created: string; uri: string }>(
@@ -796,6 +800,8 @@ export class DkgClient {
           id: args.id,
           name: args.name,
           description: args.description,
+          ...(args.accessPolicy !== undefined ? { accessPolicy: args.accessPolicy } : {}),
+          ...(args.publishPolicy !== undefined ? { publishPolicy: args.publishPolicy } : {}),
         },
       );
       return { ...response, alreadyExists: false };

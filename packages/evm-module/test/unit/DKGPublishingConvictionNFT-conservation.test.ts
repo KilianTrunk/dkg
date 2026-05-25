@@ -21,6 +21,7 @@ import {
   DKGPublishingConvictionNFT,
   EpochStorage,
   Hub,
+  PublishingConviction,
   StakingStorage,
   Token,
 } from '../../typechain';
@@ -29,6 +30,7 @@ type Fixture = {
   accounts: SignerWithAddress[];
   Hub: Hub;
   NFT: DKGPublishingConvictionNFT;
+  Logic: PublishingConviction;
   Token: Token;
   StakingStorage: StakingStorage;
   ConvictionStakingStorage: ConvictionStakingStorage;
@@ -61,12 +63,16 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
   let accounts: SignerWithAddress[];
   let HubContract: Hub;
   let NFT: DKGPublishingConvictionNFT;
+  let LogicContract: PublishingConviction;
   let TokenContract: Token;
   let CSS: ConvictionStakingStorage;
   let ChronosContract: Chronos;
 
   async function deployFixture(): Promise<Fixture> {
     await hre.deployments.fixture([
+      // V10 split — pull storage + logic + wrapper trio.
+      'PublishingConvictionStorage',
+      'PublishingConviction',
       'DKGPublishingConvictionNFT',
       'Token',
       'StakingStorage',
@@ -76,6 +82,7 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
     ]);
     const Hub = await hre.ethers.getContract<Hub>('Hub');
     const NFT = await hre.ethers.getContract<DKGPublishingConvictionNFT>('DKGPublishingConvictionNFT');
+    const Logic = await hre.ethers.getContract<PublishingConviction>('PublishingConviction');
     const Token = await hre.ethers.getContract<Token>('Token');
     const SS = await hre.ethers.getContract<StakingStorage>('StakingStorage');
     const CSS = await hre.ethers.getContract<ConvictionStakingStorage>('ConvictionStakingStorage');
@@ -88,6 +95,7 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
       accounts,
       Hub,
       NFT,
+      Logic,
       Token,
       StakingStorage: SS,
       ConvictionStakingStorage: CSS,
@@ -102,6 +110,7 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
       accounts,
       Hub: HubContract,
       NFT,
+      Logic: LogicContract,
       Token: TokenContract,
       ConvictionStakingStorage: CSS,
       Chronos: ChronosContract,
@@ -123,15 +132,19 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
     tx: Awaited<ReturnType<typeof NFT.settle>>,
   ): Promise<Distribution> {
     const receipt = await tx.wait();
-    const nftAddr = (await NFT.getAddress()).toLowerCase();
+    // Post-split: state-change events fire on `PublishingConviction`.
+    const logicAddr = (await LogicContract.getAddress()).toLowerCase();
     let passive = 0n;
     let active = 0n;
     let tail = 0n;
     for (const log of receipt!.logs) {
-      if (log.address.toLowerCase() !== nftAddr) continue;
-      let parsed: ReturnType<DKGPublishingConvictionNFT['interface']['parseLog']> = null;
+      if (log.address.toLowerCase() !== logicAddr) continue;
+      let parsed: ReturnType<PublishingConviction['interface']['parseLog']> = null;
       try {
-        parsed = NFT.interface.parseLog({ topics: [...log.topics], data: log.data });
+        parsed = LogicContract.interface.parseLog({
+          topics: [...log.topics],
+          data: log.data,
+        });
       } catch {
         continue;
       }

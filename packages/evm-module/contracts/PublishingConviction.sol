@@ -1,0 +1,806 @@
+// SPDX-License-Identifier: Apache-2.0
+
+pragma solidity ^0.8.20;
+
+import {INamed} from "./interfaces/INamed.sol";
+import {IVersioned} from "./interfaces/IVersioned.sol";
+import {IInitializable} from "./interfaces/IInitializable.sol";
+import {ContractStatus} from "./abstract/ContractStatus.sol";
+import {Chronos} from "./storage/Chronos.sol";
+import {EpochStorage} from "./storage/EpochStorage.sol";
+import {ParametersStorage} from "./storage/ParametersStorage.sol";
+import {PublishingConvictionStorage} from "./storage/PublishingConvictionStorage.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/**
+ * @title PublishingConviction
+ * @notice Stateless V10 logic contract for publisher conviction accounts.
+ *
+ * V10 split-contract architecture (mirrors the staking-side
+ * `StakingV10` / `ConvictionStakingStorage` / `DKGStakingConvictionNFT`
+ * trio):
+ *   - `PublishingConvictionStorage` (PCS) holds every byte of state:
+ *     `Account` records, `windowSpent[id][w]`, `topUpBalance[id]`,
+ *     agent registrations, and the governance cap.
+ *   - This contract holds NO application state — only Hub-resolved
+ *     contract references and metadata constants. Every business rule
+ *     (account creation, lazy passive-sink settlement, post-expiry
+ *     final sweep, active-sink epoch distribution, agent register /
+ *     deregister, transfer-hook agent clear) lives here. The contract
+ *     can be redeployed and re-registered on Hub without touching any
+ *     account state.
+ *   - `DKGPublishingConvictionNFT` (the NFT wrapper) keeps only the
+ *     ERC-721 surface, the `_nextAccountId` mint counter, and the
+ *     publisher-facing TRAC `transferFrom` paths. Every state read /
+ *     write goes through PCS.
+ *
+ * Lazy-settlement model (preserved 1:1 from the legacy stateful NFT):
+ *   - Each account lifetime is divided into `lockDurationEpochs` billing
+ *     windows of length `Chronos.epochLength()`, anchored at
+ *     `Account.createdAtTimestamp`. Per-window base budget is
+ *     `B = committedTRAC / lockDurationEpochs`.
+ *   - Two sinks drain `B` per window:
+ *       1. ACTIVE: `coverPublishingCost` distributes its
+ *          `discountedCost` across the published KC's epoch range via
+ *          `EpochStorage.addTokensToEpochRange`. The base portion drawn
+ *          increments `windowSpent[id][w]`, capped at `B`.
+ *       2. PASSIVE: at the end of window `w`, the unspent remainder
+ *          `B - windowSpent[w]` is swept to the staker reward pool for
+ *          the chain epochs that window overlaps. Settlement is lazy:
+ *          triggered by the next `coverPublishingCost`, `topUp`,
+ *          ERC-721 transfer (via `onTransfer`), or an explicit public
+ *          `settle(accountId)` call.
+ *   - `topUpBalance[accountId]` is a separate prepaid usage buffer
+ *     beyond the base budget. It is drawn only when the current
+ *     window's base allowance is exhausted. Any leftover at account
+ *     expiry is swept to the staker pool (final chain epoch) via the
+ *     same `settle()` path.
+ *   - Invariant: over a full account lifetime, the total TRAC accounted
+ *     to the staker pool equals `committedTRAC + sum(topUps)`. Any
+ *     `committedTRAC % lockDurationEpochs` dust is swept on the final
+ *     settle alongside the topUp tail.
+ *
+ * Caller gates:
+ *   - Mutating entry points driven by user actions are
+ *     `onlyConvictionNFT` — only the Hub-registered
+ *     `DKGPublishingConvictionNFT` can invoke them. The wrapper passes
+ *     `msg.sender` (the publisher / owner / KAV10 publishing-agent
+ *     resolver) explicitly so this contract never trusts `tx.origin`.
+ *   - `coverPublishingCost` additionally enforces N28: KAV10 calls the
+ *     NFT, the NFT forwards here with the publishing agent's address,
+ *     and we resolve the paying account via PCS's `agentToAccountId`.
+ *     A trusted caller cannot pass a victim's accountId.
+ *   - `settle(accountId)` is intentionally permissionless — any account
+ *     (including a staker pool watcher) can flush pending sweeps. The
+ *     account's `fullySwept` flag short-circuits redundant work.
+ */
+contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializable {
+    string private constant _NAME = "PublishingConviction";
+    // Version history:
+    //   1.0.0 — initial split-out from `DKGPublishingConvictionNFT` v2.0.0.
+    //           Identical lazy-settlement semantics; no economic behavior
+    //           changes. State now lives on `PublishingConvictionStorage`,
+    //           accessed via `onlyContracts`-gated mutators. Caller gates
+    //           tightened via `onlyConvictionNFT` for NFT-driven write
+    //           paths so KAV10 cannot bypass the wrapper.
+    string private constant _VERSION = "1.0.0";
+
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    /// @notice EpochStorage shard ID for the staker reward pool. Mirrors
+    ///         the constant on `KnowledgeAssetsV10` and the legacy
+    ///         stateful NFT so reward-distribution semantics are identical.
+    uint256 public constant STAKER_SHARD_ID = 1;
+
+    // ============================================================
+    //                  Hub-wired dependencies
+    // ============================================================
+
+    /// @notice Application-state store for every conviction account.
+    ///         Resolved once at `initialize()` from Hub; can be
+    ///         replaced by Hub re-registration in a future upgrade
+    ///         without touching this contract's own (empty) state.
+    PublishingConvictionStorage public publishingConvictionStorage;
+
+    /// @notice EpochStorage is the cross-V10 active/passive sink: every
+    ///         TRAC distribution to the staker reward pool flows through
+    ///         `addTokensToEpochRange(STAKER_SHARD_ID, ...)`.
+    EpochStorage public epochStorage;
+
+    /// @notice Chronos drives both the chain-epoch cursor (`getCurrentEpoch`,
+    ///         `epochAtTimestamp`, `timestampForEpoch`) and the billing-
+    ///         window length (`epochLength`). Billing windows align in
+    ///         duration to chain epochs but are anchored at the account's
+    ///         creation timestamp, not at chain-epoch boundaries.
+    Chronos public chronos;
+
+    /// @notice ParametersStorage exposes the protocol-wide
+    ///         `publishingConvictionEpochs` setting that fixes
+    ///         `Account.lockDurationEpochs` at creation time.
+    ParametersStorage public parametersStorage;
+
+    // ============================================================
+    //                          Events
+    // ============================================================
+    //
+    // The wrapper-layer NFT does NOT duplicate these events; off-chain
+    // indexers watching the conviction product subscribe to the logic
+    // contract for state-change events. The NFT-layer emits only ERC-721
+    // Transfer / Approval / etc.
+
+    event AccountCreated(
+        uint256 indexed accountId,
+        address indexed owner,
+        uint96 committedTRAC,
+        uint16 discountBps,
+        uint40 createdAtEpoch,
+        uint40 expiresAtEpoch
+    );
+    event ToppedUp(uint256 indexed accountId, uint96 amount, uint96 newTopUpBalance);
+    event CostCovered(
+        uint256 indexed accountId,
+        uint40 indexed epoch,
+        uint96 baseCost,
+        uint96 discountedCost,
+        uint96 drawnFromEpoch,
+        uint96 drawnFromTopUp
+    );
+    event AgentRegistered(uint256 indexed accountId, address indexed agent);
+    event AgentDeregistered(uint256 indexed accountId, address indexed agent);
+    /// @notice Emitted for each elapsed billing window that gets swept to
+    ///         the staker pool via the passive sink during lazy settlement.
+    event WindowSettled(
+        uint256 indexed accountId,
+        uint40 indexed windowIndex,
+        uint40 startChainEpoch,
+        uint40 endChainEpoch,
+        uint96 remainderSwept
+    );
+    /// @notice Emitted once per account, when the post-expiry final sweep
+    ///         finishes (base remainder + topUp buffer + dust all accounted).
+    event AccountFinalSwept(
+        uint256 indexed accountId,
+        uint96 topUpSwept,
+        uint96 dustSwept
+    );
+
+    // ============================================================
+    //                          Errors
+    // ============================================================
+
+    error ZeroAddressDependency(string name);
+    error OnlyConvictionNFT(address caller);
+    error NoConvictionAccount(address publishingAgent);
+    error InsufficientAllowance(uint256 accountId, uint40 epoch, uint96 required, uint96 available);
+    error AccountExpired(uint256 accountId, uint40 expiresAtEpoch);
+    error InvalidAmount();
+    error ZeroAgentAddress();
+    error AgentCapReached(uint256 accountId, uint256 cap);
+    error InvalidPublishingConvictionEpochs(uint256 configuredEpochs);
+    /// @notice `kcEpochs` was 0 or exceeded the account's `lockDurationEpochs`.
+    error InvalidConvictionKcEpochs(uint256 lockDurationEpochs, uint256 kcEpochs);
+    error UnknownAccount(uint256 accountId);
+
+    // solhint-disable-next-line no-empty-blocks
+    constructor(address hubAddress) ContractStatus(hubAddress) {}
+
+    /// @dev Wires every Hub-registered dependency. Reverts on any
+    ///      missing slot so a half-initialized deploy is impossible
+    ///      (mirrors the legacy stateful NFT's defensive checks).
+    function initialize() external onlyHub {
+        address pcs = hub.getContractAddress("PublishingConvictionStorage");
+        if (pcs == address(0)) revert ZeroAddressDependency("PublishingConvictionStorage");
+        publishingConvictionStorage = PublishingConvictionStorage(pcs);
+
+        address es = hub.getContractAddress("EpochStorageV8");
+        if (es == address(0)) revert ZeroAddressDependency("EpochStorageV8");
+        epochStorage = EpochStorage(es);
+
+        address ch = hub.getContractAddress("Chronos");
+        if (ch == address(0)) revert ZeroAddressDependency("Chronos");
+        chronos = Chronos(ch);
+
+        address params = hub.getContractAddress("ParametersStorage");
+        if (params == address(0)) revert ZeroAddressDependency("ParametersStorage");
+        parametersStorage = ParametersStorage(params);
+    }
+
+    function name() external pure virtual override returns (string memory) {
+        return _NAME;
+    }
+
+    function version() external pure virtual override returns (string memory) {
+        return _VERSION;
+    }
+
+    // ============================================================
+    //                       Caller gate
+    // ============================================================
+
+    /// @dev Lazy Hub lookup so the NFT wrapper address can be re-registered
+    ///      without re-initializing this contract. Mirrors
+    ///      `StakingV10.onlyConvictionNFT`.
+    modifier onlyConvictionNFT() {
+        if (msg.sender != hub.getContractAddress("DKGPublishingConvictionNFT")) {
+            revert OnlyConvictionNFT(msg.sender);
+        }
+        _;
+    }
+
+    // ============================================================
+    //                  Account lifecycle
+    // ============================================================
+
+    /**
+     * @notice Persist the `Account` record for a freshly-minted NFT.
+     *
+     * @dev Called by `DKGPublishingConvictionNFT.createAccount` AFTER it
+     *      has allocated `accountId` from its own monotonic mint counter
+     *      and minted the ERC-721 to `publisher`. The wrapper handles the
+     *      TRAC `transferFrom(publisher → ConvictionStakingStorage)`
+     *      itself; this function only writes accounting state.
+     *
+     *      Mint-then-write ordering matters for the transfer hook on the
+     *      NFT wrapper: by the time the transfer hook runs (mint case
+     *      `from == address(0)`), the storage record has been populated.
+     *      The hook short-circuits on mint/burn so this ordering is fine.
+     *
+     *      `lockDurationEpochs` is fixed by the protocol-wide
+     *      `parametersStorage.publishingConvictionEpochs()` setting at
+     *      creation. The discount tier is set once from the 6-tier
+     *      ladder applied to `committedTRAC`; subsequent top-ups do NOT
+     *      change the tier or extend the expiry.
+     */
+    function createAccount(
+        address publisher,
+        uint256 accountId,
+        uint96 committedTRAC
+    ) external onlyConvictionNFT {
+        if (committedTRAC == 0) revert InvalidAmount();
+
+        uint40 currentEpoch = uint40(chronos.getCurrentEpoch());
+        uint40 createdAtTimestamp = uint40(block.timestamp);
+
+        uint256 configuredEpochs = parametersStorage.publishingConvictionEpochs();
+        if (configuredEpochs == 0 || configuredEpochs > type(uint16).max) {
+            revert InvalidPublishingConvictionEpochs(configuredEpochs);
+        }
+        uint16 lockDurationEpochs = uint16(configuredEpochs);
+
+        uint256 epochLength = chronos.epochLength();
+        uint40 expiresAtTimestamp = uint40(
+            uint256(createdAtTimestamp) + (uint256(lockDurationEpochs) * epochLength)
+        );
+        uint40 expiresAtEpoch = uint40(
+            chronos.epochAtTimestamp(uint256(expiresAtTimestamp) - 1)
+        ) + 1;
+        uint16 discountBps = uint16(getDiscountBps(committedTRAC));
+
+        publishingConvictionStorage.createAccount(
+            accountId,
+            PublishingConvictionStorage.Account({
+                committedTRAC: committedTRAC,
+                createdAtEpoch: currentEpoch,
+                expiresAtEpoch: expiresAtEpoch,
+                createdAtTimestamp: createdAtTimestamp,
+                expiresAtTimestamp: expiresAtTimestamp,
+                lockDurationEpochs: lockDurationEpochs,
+                discountBps: discountBps,
+                lastSettledWindow: 0,
+                fullySwept: false
+            })
+        );
+
+        emit AccountCreated(accountId, publisher, committedTRAC, discountBps, currentEpoch, expiresAtEpoch);
+    }
+
+    /**
+     * @notice Settle elapsed windows then bump the persistent top-up
+     *         buffer. NFT wrapper owns ownership validation; this
+     *         function only enforces "amount > 0" and "not expired".
+     *
+     * @dev TRAC `transferFrom(owner → CSS vault)` happens on the NFT
+     *      wrapper, not here. We only update accounting state.
+     */
+    function topUp(
+        address /* owner */,
+        uint256 accountId,
+        uint96 amount
+    ) external onlyConvictionNFT {
+        if (amount == 0) revert InvalidAmount();
+
+        PublishingConvictionStorage.Account memory acct =
+            publishingConvictionStorage.getAccount(accountId);
+
+        if (block.timestamp >= uint256(acct.expiresAtTimestamp)) {
+            revert AccountExpired(accountId, acct.expiresAtEpoch);
+        }
+
+        _settleElapsed(acct, accountId);
+
+        publishingConvictionStorage.increaseTopUpBalance(accountId, amount);
+
+        emit ToppedUp(accountId, amount, publishingConvictionStorage.topUpBalance(accountId));
+    }
+
+    // ============================================================
+    //              Publishing-cost coverage (active sink)
+    // ============================================================
+
+    /**
+     * @notice Charge a publishing agent's conviction allowance for
+     *         `baseCost` and fund the published KC's epoch range from
+     *         the escrowed TRAC sitting in the CSS vault.
+     *
+     * @dev Authorization (N28-fixed):
+     *        - `onlyConvictionNFT`: this function may only be invoked by
+     *          the NFT wrapper. KAV10 calls the NFT, the NFT validates
+     *          KAV10 as the outer caller, and the NFT forwards here.
+     *        - The publishing agent's accountId is resolved from PCS's
+     *          `agentToAccountId` map; KAV10 cannot pass a victim's
+     *          accountId.
+     *
+     *      Behavior — preserved 1:1 from the legacy stateful NFT:
+     *        1. Reject if the publish's KC lifetime (`kcEpochs`) exceeds
+     *           the account's `lockDurationEpochs`.
+     *        2. Lazily settle elapsed billing windows (passive sink).
+     *        3. Compute `discountedCost = baseCost * (1 - discountBps/1e4)`.
+     *        4. Spend order against the current window: base allowance
+     *           first, then `topUpBalance` overflow.
+     *        5. Distribute the discounted cost across the KC's epoch
+     *           range via `EpochStorage.addTokensToEpochRange` —
+     *           prorating the partial first and last chain epoch.
+     *
+     *      Does NOT physically move TRAC; the escrowed amount is already
+     *      in the CSS vault from `createAccount` / `topUp`. Returns the
+     *      discounted amount for KAV10's internal accounting.
+     */
+    function coverPublishingCost(
+        address publishingAgent,
+        uint96 baseCost,
+        uint40 kcStartEpoch,
+        uint40 kcEpochs
+    ) external onlyConvictionNFT returns (uint96 discountedCost) {
+        uint256 accountId = publishingConvictionStorage.agentToAccountId(publishingAgent);
+        if (accountId == 0) revert NoConvictionAccount(publishingAgent);
+
+        PublishingConvictionStorage.Account memory acct =
+            publishingConvictionStorage.getAccount(accountId);
+
+        if (block.timestamp >= uint256(acct.expiresAtTimestamp)) {
+            revert AccountExpired(accountId, acct.expiresAtEpoch);
+        }
+        if (kcEpochs == 0 || kcEpochs > uint40(acct.lockDurationEpochs)) {
+            revert InvalidConvictionKcEpochs(uint256(acct.lockDurationEpochs), uint256(kcEpochs));
+        }
+
+        // Re-read after settle: `_settleElapsed` may have advanced
+        // `lastSettledWindow` on storage. We don't actually depend on the
+        // updated cursor below (`currentBillingWindow` is independent of
+        // it), but keeping the in-memory snapshot consistent with storage
+        // avoids surprises if future logic adds a dependency.
+        _settleElapsed(acct, accountId);
+
+        uint40 currentEpoch = uint40(chronos.getCurrentEpoch());
+        uint40 currentBillingWindow = _currentBillingWindow(acct);
+
+        discountedCost = uint96(
+            (uint256(baseCost) * (BPS_DENOMINATOR - uint256(acct.discountBps))) / BPS_DENOMINATOR
+        );
+
+        uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
+        uint96 spent = publishingConvictionStorage.windowSpent(accountId, currentBillingWindow);
+        uint96 epochRemaining = spent < baseAllowance ? baseAllowance - spent : 0;
+
+        uint96 drawnFromEpoch;
+        uint96 drawnFromTopUp;
+
+        if (discountedCost <= epochRemaining) {
+            drawnFromEpoch = discountedCost;
+        } else {
+            drawnFromEpoch = epochRemaining;
+            uint96 shortfall = discountedCost - epochRemaining;
+            uint96 buffer = publishingConvictionStorage.topUpBalance(accountId);
+            if (shortfall > buffer) {
+                revert InsufficientAllowance(
+                    accountId,
+                    currentEpoch,
+                    discountedCost,
+                    epochRemaining + buffer
+                );
+            }
+            drawnFromTopUp = shortfall;
+            publishingConvictionStorage.decreaseTopUpBalance(accountId, shortfall);
+        }
+
+        if (drawnFromEpoch > 0) {
+            publishingConvictionStorage.increaseWindowSpent(accountId, currentBillingWindow, drawnFromEpoch);
+        }
+
+        // Active sink: fund the KC's epoch range with the discounted
+        // cost. MUST mirror `KnowledgeAssetsV10._distributeTokens`
+        // semantics so conviction-funded and direct-spend reward curves
+        // are identical (modulo the conviction discount).
+        uint96 distributed = drawnFromEpoch + drawnFromTopUp;
+        if (distributed > 0) {
+            _distributeProrated(distributed, kcStartEpoch, uint256(kcEpochs));
+        }
+
+        emit CostCovered(accountId, currentEpoch, baseCost, discountedCost, drawnFromEpoch, drawnFromTopUp);
+    }
+
+    /// @dev Mirrors `KnowledgeAssetsV10._distributeTokens` exactly so
+    ///      conviction-funded reward curves match direct-spend curves.
+    ///      Splits `amount` across `storageUnits + 1` chain epochs
+    ///      starting at `firstEpoch`: the partial first epoch gets a
+    ///      time-weighted slice, the middle full epochs each get the
+    ///      base, and the partial tail epoch absorbs the remainder
+    ///      (including any rounding dust).
+    function _distributeProrated(
+        uint96 amount,
+        uint40 firstEpoch,
+        uint256 storageUnits
+    ) internal {
+        uint256 epochLengthSec = chronos.epochLength();
+        uint256 timeRemainingInCurrentEpoch = chronos.timeUntilNextEpoch();
+        uint96 baseTokensPerFullEpoch = uint96(uint256(amount) / storageUnits);
+        uint96 currentEpochAllocation = uint96(
+            (uint256(baseTokensPerFullEpoch) * timeRemainingInCurrentEpoch) / epochLengthSec
+        );
+        uint96 finalEpochAllocation = baseTokensPerFullEpoch - currentEpochAllocation;
+        uint256 numberOfFullEpochs = storageUnits - 1;
+        uint96 totalTokensForFullEpochs = uint96(uint256(baseTokensPerFullEpoch) * numberOfFullEpochs);
+
+        uint96 totalAllocated = currentEpochAllocation + totalTokensForFullEpochs + finalEpochAllocation;
+        if (totalAllocated < amount) {
+            finalEpochAllocation += (amount - totalAllocated);
+        }
+
+        if (currentEpochAllocation > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                firstEpoch,
+                firstEpoch,
+                currentEpochAllocation
+            );
+        }
+
+        if (numberOfFullEpochs > 0 && totalTokensForFullEpochs > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                firstEpoch + 1,
+                firstEpoch + uint40(numberOfFullEpochs),
+                totalTokensForFullEpochs
+            );
+        }
+
+        if (finalEpochAllocation > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                firstEpoch + uint40(storageUnits),
+                firstEpoch + uint40(storageUnits),
+                finalEpochAllocation
+            );
+        }
+    }
+
+    // ============================================================
+    //          Lazy settlement (passive sink + final tail)
+    // ============================================================
+
+    /**
+     * @notice Public lazy-settlement entry point. Permissionless: anyone
+     *         (account owner, staker pool watcher, automation bot) can
+     *         flush pending sweeps. Idempotent — subsequent calls after
+     *         the post-expiry final sweep are no-ops.
+     *
+     * @dev Flow:
+     *        - Pre-expiry: sweeps every elapsed billing window's unspent
+     *          base remainder (`B - windowSpent[w]`) into the staker
+     *          pool, prorated across the chain epochs the window
+     *          overlaps.
+     *        - Post-expiry: in addition to the above, finalises the
+     *          last window, sweeps any leftover `topUpBalance`, and
+     *          sweeps `committedTRAC % lockDurationEpochs` dust to the
+     *          final chain epoch. Sets `fullySwept = true`.
+     *
+     *      No `onlyConvictionNFT` gate — public on purpose. Accounts
+     *      that have never been created revert via PCS's
+     *      `getAccount(...)` underflow path. `fullySwept` accounts
+     *      short-circuit before any work.
+     */
+    function settle(uint256 accountId) external {
+        if (!publishingConvictionStorage.accountExists(accountId)) {
+            revert UnknownAccount(accountId);
+        }
+        PublishingConvictionStorage.Account memory acct =
+            publishingConvictionStorage.getAccount(accountId);
+        if (acct.fullySwept) return;
+
+        _settleElapsed(acct, accountId);
+
+        if (block.timestamp >= uint256(acct.expiresAtTimestamp)) {
+            _finalSweep(acct, accountId);
+        }
+    }
+
+    /// @notice Trigger lazy-settlement from the NFT wrapper's transfer
+    ///         hook AND clear every agent registration so the new owner
+    ///         starts with a clean slate. Restricted to the NFT.
+    /// @dev    `from`/`to` arguments are not used internally — the
+    ///         wrapper passes them so a future audit-friendly extension
+    ///         (e.g. emitting a wrapper-layer transfer-settle event with
+    ///         both endpoints) does not require an interface change.
+    function onTransfer(
+        uint256 accountId,
+        address /* from */,
+        address /* to */
+    ) external onlyConvictionNFT {
+        PublishingConvictionStorage.Account memory acct =
+            publishingConvictionStorage.getAccount(accountId);
+        if (acct.lockDurationEpochs != 0 && !acct.fullySwept) {
+            _settleElapsed(acct, accountId);
+            if (block.timestamp >= uint256(acct.expiresAtTimestamp)) {
+                _finalSweep(acct, accountId);
+            }
+        }
+        publishingConvictionStorage.clearAgents(accountId);
+    }
+
+    /// @notice Internal helper: sweep all CLOSED windows up to the
+    ///         current window into the staker pool. Idempotent and
+    ///         gas-bounded by `lockDurationEpochs - lastSettledWindow`.
+    /// @dev    Mutates `acct.lastSettledWindow` in memory so callers
+    ///         (e.g. `topUp`, `coverPublishingCost`) see a consistent
+    ///         snapshot after the call. The single SSTORE to PCS at
+    ///         the end keeps gas costs predictable.
+    function _settleElapsed(
+        PublishingConvictionStorage.Account memory acct,
+        uint256 accountId
+    ) internal {
+        uint40 currentWindow = _currentBillingWindow(acct);
+        uint40 maxWindow = uint40(acct.lockDurationEpochs);
+        uint40 stopAt = currentWindow < maxWindow ? currentWindow : maxWindow;
+
+        if (uint40(acct.lastSettledWindow) >= stopAt) return;
+
+        uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
+
+        for (uint40 w = uint40(acct.lastSettledWindow); w < stopAt; w++) {
+            uint96 spent = publishingConvictionStorage.windowSpent(accountId, w);
+            uint96 remainder = spent < baseAllowance ? baseAllowance - spent : 0;
+            (uint40 startEp, uint40 endEp) = _windowChainEpochRange(acct, w);
+            if (remainder > 0) {
+                _sweepWindowProrated(acct, w, startEp, endEp, remainder);
+            }
+            emit WindowSettled(accountId, w, startEp, endEp, remainder);
+        }
+
+        acct.lastSettledWindow = uint16(stopAt);
+        publishingConvictionStorage.setLastSettledWindow(accountId, uint16(stopAt));
+    }
+
+    /// @dev Distribute `amount` across the chain-epoch range
+    ///      `[startEp, endEp]` that billing window `w` of `acct`
+    ///      overlaps, proportional to wall-clock seconds shared with
+    ///      each chain epoch. A billing window is exactly
+    ///      `epochLength()` long, so it overlaps AT MOST two chain
+    ///      epochs (single chain epoch or one straddle).
+    function _sweepWindowProrated(
+        PublishingConvictionStorage.Account memory acct,
+        uint40 w,
+        uint40 startEp,
+        uint40 endEp,
+        uint96 amount
+    ) internal {
+        if (startEp == endEp) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                uint256(startEp),
+                uint256(endEp),
+                amount
+            );
+            return;
+        }
+        uint256 epochLengthSec = chronos.epochLength();
+        uint256 winStartTs = uint256(acct.createdAtTimestamp) + uint256(w) * epochLengthSec;
+        uint256 boundaryTs = chronos.timestampForEpoch(uint256(endEp));
+        uint256 startOverlap = boundaryTs - winStartTs;
+        uint96 startAllocation = uint96((uint256(amount) * startOverlap) / epochLengthSec);
+        uint96 endAllocation = amount - startAllocation;
+        if (startAllocation > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                uint256(startEp),
+                uint256(startEp),
+                startAllocation
+            );
+        }
+        if (endAllocation > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                uint256(endEp),
+                uint256(endEp),
+                endAllocation
+            );
+        }
+    }
+
+    /// @notice Post-expiry final sweep. Assumes
+    ///         `block.timestamp >= acct.expiresAtTimestamp`. Settles
+    ///         any windows `_settleElapsed` left for the final one,
+    ///         then sweeps `topUpBalance` and dust to the final chain
+    ///         epoch. Marks `fullySwept = true`.
+    function _finalSweep(
+        PublishingConvictionStorage.Account memory acct,
+        uint256 accountId
+    ) internal {
+        if (acct.fullySwept) return;
+
+        uint40 maxWindow = uint40(acct.lockDurationEpochs);
+        uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
+
+        for (uint40 w = uint40(acct.lastSettledWindow); w < maxWindow; w++) {
+            uint96 spent = publishingConvictionStorage.windowSpent(accountId, w);
+            uint96 remainder = spent < baseAllowance ? baseAllowance - spent : 0;
+            (uint40 startEp, uint40 endEp) = _windowChainEpochRange(acct, w);
+            if (remainder > 0) {
+                _sweepWindowProrated(acct, w, startEp, endEp, remainder);
+            }
+            emit WindowSettled(accountId, w, startEp, endEp, remainder);
+        }
+        acct.lastSettledWindow = uint16(maxWindow);
+        publishingConvictionStorage.setLastSettledWindow(accountId, uint16(maxWindow));
+
+        uint40 finalChainEpoch = uint40(
+            chronos.epochAtTimestamp(uint256(acct.expiresAtTimestamp) - 1)
+        );
+        uint96 dust = acct.committedTRAC - baseAllowance * uint96(acct.lockDurationEpochs);
+        uint96 leftoverTopUp = publishingConvictionStorage.topUpBalance(accountId);
+        uint96 tailSweep = dust + leftoverTopUp;
+        if (tailSweep > 0) {
+            epochStorage.addTokensToEpochRange(
+                STAKER_SHARD_ID,
+                uint256(finalChainEpoch),
+                uint256(finalChainEpoch),
+                tailSweep
+            );
+        }
+        if (leftoverTopUp > 0) {
+            publishingConvictionStorage.clearTopUpBalance(accountId);
+        }
+
+        publishingConvictionStorage.setFullySwept(accountId, true);
+        emit AccountFinalSwept(accountId, leftoverTopUp, dust);
+    }
+
+    // ============================================================
+    //                  Window-index helpers (views)
+    // ============================================================
+
+    /// @dev Internal: current billing-window index for `acct`. Anchored
+    ///      at `acct.createdAtTimestamp`; window length matches
+    ///      `Chronos.epochLength()`.
+    function _currentBillingWindow(
+        PublishingConvictionStorage.Account memory acct
+    ) internal view returns (uint40) {
+        if (block.timestamp <= uint256(acct.createdAtTimestamp)) return 0;
+        return uint40(
+            (block.timestamp - uint256(acct.createdAtTimestamp)) / chronos.epochLength()
+        );
+    }
+
+    /// @notice Public view: current billing-window index, capped at
+    ///         `lockDurationEpochs` (i.e. "no more active windows").
+    function getCurrentBillingWindow(uint256 accountId) external view returns (uint40) {
+        PublishingConvictionStorage.Account memory acct =
+            publishingConvictionStorage.getAccount(accountId);
+        uint40 maxWindow = uint40(acct.lockDurationEpochs);
+        uint40 current = _currentBillingWindow(acct);
+        return current < maxWindow ? current : maxWindow;
+    }
+
+    /// @dev Internal: chain-epoch range overlapping billing window `w`.
+    function _windowChainEpochRange(
+        PublishingConvictionStorage.Account memory acct,
+        uint40 w
+    ) internal view returns (uint40 startEp, uint40 endEp) {
+        uint256 epLen = chronos.epochLength();
+        uint256 winStartTs = uint256(acct.createdAtTimestamp) + uint256(w) * epLen;
+        uint256 winEndTs = winStartTs + epLen - 1;
+        startEp = uint40(chronos.epochAtTimestamp(winStartTs));
+        endEp = uint40(chronos.epochAtTimestamp(winEndTs));
+    }
+
+    /// @notice Public view: chain-epoch range that billing-window `w`
+    ///         of `accountId` overlaps. Useful for off-chain reporting.
+    function getWindowChainEpochRange(uint256 accountId, uint40 w)
+        external
+        view
+        returns (uint40 startEp, uint40 endEp)
+    {
+        PublishingConvictionStorage.Account memory acct =
+            publishingConvictionStorage.getAccount(accountId);
+        return _windowChainEpochRange(acct, w);
+    }
+
+    /// @notice Remaining allowance (base + topUp) for `accountId` in
+    ///         a given chain `epoch`. Returns 0 outside the account's
+    ///         active lifetime.
+    function getRemainingAllowance(uint256 accountId, uint40 epoch) external view returns (uint96) {
+        PublishingConvictionStorage.Account memory acct =
+            publishingConvictionStorage.getAccount(accountId);
+        if (epoch < acct.createdAtEpoch || epoch >= acct.expiresAtEpoch) {
+            return 0;
+        }
+        uint256 epochStartTimestamp = chronos.timestampForEpoch(epoch);
+        uint40 billingWindow;
+        if (epochStartTimestamp <= uint256(acct.createdAtTimestamp)) {
+            billingWindow = 0;
+        } else {
+            billingWindow = uint40(
+                (epochStartTimestamp - uint256(acct.createdAtTimestamp)) / chronos.epochLength()
+            );
+        }
+        uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
+        uint96 spent = publishingConvictionStorage.windowSpent(accountId, billingWindow);
+        uint96 epochRemaining = spent < baseAllowance ? baseAllowance - spent : 0;
+        return epochRemaining + publishingConvictionStorage.topUpBalance(accountId);
+    }
+
+    // ============================================================
+    //                  Agent management
+    // ============================================================
+
+    /// @notice Append `agent` to `accountId`. Cap, zero-address, and
+    ///         already-registered checks are enforced here; PCS
+    ///         performs the atomic write.
+    /// @dev    Owner-validation lives on the NFT wrapper, which calls
+    ///         this function with `owner` for symmetry with future
+    ///         audit-friendly extensions. The argument is intentionally
+    ///         unused here to avoid double-validating ownership across
+    ///         contracts.
+    function registerAgent(
+        address /* owner */,
+        uint256 accountId,
+        address agent
+    ) external onlyConvictionNFT {
+        if (agent == address(0)) revert ZeroAgentAddress();
+
+        uint256 cap = publishingConvictionStorage.maxAgentsPerAccount();
+        if (publishingConvictionStorage.agentCount(accountId) >= cap) {
+            revert AgentCapReached(accountId, cap);
+        }
+
+        publishingConvictionStorage.addAgent(accountId, agent);
+        emit AgentRegistered(accountId, agent);
+    }
+
+    /// @notice Remove `agent` from `accountId`. PCS reverts if not
+    ///         registered.
+    function deregisterAgent(
+        address /* owner */,
+        uint256 accountId,
+        address agent
+    ) external onlyConvictionNFT {
+        publishingConvictionStorage.removeAgent(accountId, agent);
+        emit AgentDeregistered(accountId, agent);
+    }
+
+    // ============================================================
+    //                  Discount tier ladder
+    // ============================================================
+
+    /// @notice Discrete 6-tier discount ladder. Tiers are evaluated
+    ///         highest-first so the largest commit that qualifies is
+    ///         selected. Pure — duplicated on the NFT wrapper for
+    ///         caller-side cheap reads.
+    function getDiscountBps(uint96 committedTRAC) public pure returns (uint256) {
+        if (committedTRAC >= 1_000_000 ether) return 7500; // 75%
+        if (committedTRAC >= 500_000 ether)   return 5000; // 50%
+        if (committedTRAC >= 250_000 ether)   return 4000; // 40%
+        if (committedTRAC >= 100_000 ether)   return 3000; // 30%
+        if (committedTRAC >= 50_000 ether)    return 2000; // 20%
+        if (committedTRAC >= 25_000 ether)    return 1000; // 10%
+        return 0;
+    }
+}

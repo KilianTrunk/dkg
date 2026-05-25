@@ -446,8 +446,8 @@ describe('Context Graph Enshrinement with Signatures', () => {
     });
 
     const cgResult = await chain.createOnChainContextGraph({
-      participantIdentityIds: [1n, 2n],
-      requiredSignatures: 1,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
     CONTEXT_GRAPH = String(cgResult.contextGraphId);
     await seedContextGraphRegistration(store, CONTEXT_GRAPH);
@@ -530,8 +530,8 @@ describe('PublishToContextGraph chain adapter method', () => {
     });
 
     const { contextGraphId } = await chain.createOnChainContextGraph({
-      participantIdentityIds: [BigInt(getSharedContext().coreProfileId)],
-      requiredSignatures: 1,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
 
     const result = await publisher.publish({
@@ -587,8 +587,8 @@ describe('Regression: sorted and deduplicated participant signatures', () => {
       ctx: { provider: _provider, kav10Address: _kav10Address },
     });
     const cgResult = await chain.createOnChainContextGraph({
-      participantIdentityIds: [1n, 3n, 5n],
-      requiredSignatures: 1,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
     CONTEXT_GRAPH = String(cgResult.contextGraphId);
     await seedContextGraphRegistration(store, CONTEXT_GRAPH);

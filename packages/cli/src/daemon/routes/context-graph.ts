@@ -423,81 +423,30 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
   } = ctx;
 
 
-  // POST /api/context-graph/create — on-chain context graph creation (V10)
-  // When the body has `participantIdentityIds` but no local create metadata (`id`/`name`),
-  // treat it as the on-chain multisig creation flow. Otherwise, handle it as the
-  // free/local context-graph create flow below.
+  // POST /api/context-graph/create — context graph definition create.
+  // SPEC_CG_MEMORY_MODEL / Codex PR #595 round-4: per-CG hosting
+  // committees and per-CG quorum overrides were removed end-to-end.
+  // The on-chain contract no longer accepts those args, so silently
+  // stripping `participantIdentityIds` / `requiredSignatures` from the
+  // request body would let callers believe they created an M-of-N /
+  // roster-constrained CG when those constraints were actually
+  // discarded. We reject any body that still carries either field with
+  // a structured 400 + machine-readable `code`, forcing callers to
+  // migrate. The on-chain semantics those fields requested no longer
+  // exist; there is no faithful translation.
   if (req.method === "POST" && path === "/api/context-graph/create") {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = JSON.parse(body);
-    const isLocalCreate = typeof parsed.id === 'string' && typeof parsed.name === 'string';
-    if (Array.isArray(parsed.participantIdentityIds) && !isLocalCreate) {
-      const { participantIdentityIds } = parsed;
-      const isPrivateLocalOnly = parsed.private === true;
-      const requiredSignatures = typeof parsed.requiredSignatures === 'number'
-        ? parsed.requiredSignatures
-        : (isPrivateLocalOnly ? 1 : undefined);
-      if (typeof requiredSignatures !== 'number') {
-        return jsonResponse(res, 400, { error: 'Missing requiredSignatures (number)' });
-      }
-      if (!Number.isInteger(requiredSignatures) || requiredSignatures < 1) {
-        return jsonResponse(res, 400, {
-          error: "requiredSignatures must be a positive integer (>= 1)",
-        });
-      }
-      if (requiredSignatures > participantIdentityIds.length) {
-        return jsonResponse(res, 400, {
-          error: `requiredSignatures (${requiredSignatures}) cannot exceed participantIdentityIds count (${participantIdentityIds.length})`,
-        });
-      }
-      for (let i = 0; i < participantIdentityIds.length; i++) {
-        const id = participantIdentityIds[i];
-        if (typeof id === "number") {
-          if (
-            !Number.isInteger(id) ||
-            id <= 0 ||
-            id > Number.MAX_SAFE_INTEGER
-          ) {
-            return jsonResponse(res, 400, {
-              error: `participantIdentityIds[${i}] must be a positive safe integer`,
-            });
-          }
-        } else if (typeof id === "string") {
-          if (!/^\d+$/.test(id) || id === "0") {
-            return jsonResponse(res, 400, {
-              error: `participantIdentityIds[${i}] must be a positive decimal integer string`,
-            });
-          }
-        } else {
-          return jsonResponse(res, 400, {
-            error: `participantIdentityIds[${i}] must be a number or string`,
-          });
-        }
-      }
-      try {
-        const mappedIds = participantIdentityIds.map((id: number | string) =>
-          BigInt(id),
-        );
-        const uniqueIds: bigint[] = Array.from(new Set(mappedIds));
-        const sortedUniqueIds = uniqueIds.sort((a, b) =>
-          a < b ? -1 : a > b ? 1 : 0,
-        );
-        if (requiredSignatures > sortedUniqueIds.length) {
-          return jsonResponse(res, 400, {
-            error: `requiredSignatures (${requiredSignatures}) exceeds unique participant count (${sortedUniqueIds.length}) after deduplication`,
-          });
-        }
-        const result = await agent.registerContextGraphOnChain({
-          participantIdentityIds: sortedUniqueIds,
-          requiredSignatures,
-        });
-        return jsonResponse(res, 200, {
-          contextGraphId: String(result.contextGraphId),
-          success: true,
-        });
-      } catch (err: any) {
-        return jsonResponse(res, 500, { error: err.message });
-      }
+    if (parsed.participantIdentityIds !== undefined || parsed.requiredSignatures !== undefined) {
+      return jsonResponse(res, 400, {
+        error:
+          '`participantIdentityIds` and `requiredSignatures` were removed in SPEC_CG_MEMORY_MODEL. Per-CG hosting committees and per-CG quorum overrides no longer exist on-chain — every CG uses the system-wide ACK quorum (parametersStorage.minimumRequiredSignatures()) and the network sharding table for hosting. Remove these fields from the request body and use `{ id, name, accessPolicy?, publishPolicy?, allowedAgents? }` instead.',
+        code: 'DEPRECATED_CONTEXT_GRAPH_FIELDS',
+        deprecatedFields: [
+          ...(parsed.participantIdentityIds !== undefined ? ['participantIdentityIds'] : []),
+          ...(parsed.requiredSignatures !== undefined ? ['requiredSignatures'] : []),
+        ],
+      });
     }
     // Body has `id` + `name` → context-graph-style context graph definition create (handled below)
     const { id, name, description, allowedAgents, allowedPeers, participantAgents, publishPolicy, accessPolicy, register } = parsed;
@@ -530,21 +479,18 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     if (parsedPcaAccountId.value !== undefined && publishPolicy === 1) {
       return jsonResponse(res, 400, { error: 'pcaAccountId is only valid with curated publish policy (publishPolicy=0)' });
     }
-    // pcaAccountId on a create-only request is a silent foot-gun:
-    // `createContextGraph()` no longer persists it (Codex PR #502
-    // round-3), so a later `/register` call without re-supplying the
-    // id would register as plain EOA-curated. Reject the
-    // create-without-register combo so callers either bundle the
-    // combined flow (`register: true`) or move the id to the
-    // dedicated `/register` call. Codex PR #502 round-5.
-    if (parsedPcaAccountId.value !== undefined && parsed.register !== true) {
-      return jsonResponse(res, 400, {
-        error:
-          'pcaAccountId on POST /api/context-graph/create requires `register: true` in the same call. '
-          + 'For two-step flows, pass pcaAccountId on POST /api/context-graph/register instead — '
-          + 'create-only requests do not persist the PCA id locally.',
-      });
-    }
+    // OT-RFC-38 / LU-6 Phase B (Codex PR #610 fd5b31f1 fix):
+    // pcaAccountId on a create-only request used to be a silent foot-
+    // gun because `createContextGraph()` didn't persist it, so a later
+    // auto-register on first VM publish would silently fall back to
+    // raw EOA-curated. The same was true for `publishPolicy` — the UI
+    // exposes a curated-vs-open radio at create time, but the choice
+    // was lost when registration deferred. Both knobs are now
+    // persisted at create time via `DKG_PUBLISH_POLICY` /
+    // `DKG_PUBLISH_AUTHORITY_ACCOUNT_ID` triples and re-read by
+    // `memory.ts`'s deferred-register call. Codex PR #502 round-5's
+    // safety rationale is preserved end-to-end without forcing
+    // callers into the combined-flow constraint.
     // Effective accessPolicy for both the create and the (optional)
     // register-during-create leg below. Priority:
     //   1. `private: true` is a curated signal that overrides any
@@ -567,11 +513,12 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
           ? 1
           : undefined;
     try {
-      // NOTE: parsedPcaAccountId.value is intentionally NOT forwarded
-      // to `agent.createContextGraph` — the agent now rejects that
-      // param at the boundary (Codex PR #502 round-6). The daemon
-      // route uses parsedPcaAccountId.value below in the (optional)
-      // register leg only.
+      // OT-RFC-38 / LU-6 Phase B (Codex PR #610 fd5b31f1 fix):
+      // forward both register-time knobs to createContextGraph so the
+      // user's create-time choice survives the deferred-registration
+      // path. Re-supplying them on `/register` still wins (caller
+      // arg > stored), so the two-step flow keeps its override
+      // semantics; the one-step flow keeps its single-call UX.
       await agent.createContextGraph({
         id,
         name,
@@ -580,12 +527,10 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         allowedPeers: Array.isArray(allowedPeers) ? allowedPeers : undefined,
         participantAgents: Array.isArray(participantAgents) ? participantAgents : undefined,
         accessPolicy: inferredAccessPolicy,
+        publishPolicy: typeof publishPolicy === 'number' ? publishPolicy : undefined,
+        publishAuthorityAccountId: parsedPcaAccountId.value,
         callerAgentAddress: requestAgentAddress,
         ...(parsed.private === true ? { private: true } : {}),
-        ...(Array.isArray(parsed.participantIdentityIds)
-          ? { participantIdentityIds: parsed.participantIdentityIds.map((v: string | number) => BigInt(v)) }
-          : {}),
-        ...(typeof parsed.requiredSignatures === 'number' ? { requiredSignatures: parsed.requiredSignatures } : {}),
       });
     } catch (err: any) {
       const msg = err?.message ?? "";
@@ -656,7 +601,7 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
-    const { id, accessPolicy, publishPolicy } = parsed;
+    const { id, accessPolicy, publishPolicy, strictEoaCuratorMatch } = parsed;
     if (!id) return jsonResponse(res, 400, { error: 'Missing "id"' });
     if (typeof id !== 'string') return jsonResponse(res, 400, { error: '"id" must be a string' });
     if (!isValidContextGraphId(id)) return jsonResponse(res, 400, { error: 'Invalid context graph id' });
@@ -666,22 +611,30 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     if (publishPolicy !== undefined && (publishPolicy !== 0 && publishPolicy !== 1)) {
       return jsonResponse(res, 400, { error: '"publishPolicy" must be 0 (curated) or 1 (open)' });
     }
+    if (strictEoaCuratorMatch !== undefined && typeof strictEoaCuratorMatch !== 'boolean') {
+      return jsonResponse(res, 400, { error: '"strictEoaCuratorMatch" must be a boolean' });
+    }
     const parsedPcaAccountId = parseOptionalPcaAccountId(parsed);
     if (parsedPcaAccountId.error) {
       return jsonResponse(res, 400, { error: parsedPcaAccountId.error });
     }
-    // Early-reject obvious mismatch: explicit open publishPolicy with a PCA
-    // account id makes no sense. The agent enforces the canonical check too,
-    // but this gives callers a 400 at the API boundary instead of a 500.
     if (parsedPcaAccountId.value !== undefined && publishPolicy === 1) {
       return jsonResponse(res, 400, { error: 'pcaAccountId is only valid for curated context graphs (publishPolicy=0)' });
     }
     try {
+      // OT-RFC-38 / LU-6 Phase B (Codex PR #610 fd5b31f1 round-2):
+      // expose `strictEoaCuratorMatch` opt-in on the public registration
+      // API. Default behaviour is the relaxed "auto-promote chain signer
+      // as on-chain owner" path (single-tenant edge nodes — the mainnet
+      // launch deployment shape — see `registerContextGraph` jsdoc),
+      // but multi-tenant operators can pass `strictEoaCuratorMatch:true`
+      // to require an exact wallet match before registration proceeds.
       const result = await agent.registerContextGraph(id, {
         accessPolicy,
         publishPolicy,
         callerAgentAddress: requestAgentAddress,
         publishAuthorityAccountId: parsedPcaAccountId.value,
+        ...(strictEoaCuratorMatch === true ? { strictEoaCuratorMatch: true } : {}),
       });
       return jsonResponse(res, 200, {
         registered: id,

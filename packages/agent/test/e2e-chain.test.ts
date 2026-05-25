@@ -113,8 +113,8 @@ describe('E2E: DKGAgent with real blockchain', () => {
       makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.EXTRA1),
     );
     const cgResult = await chainAdapter.createOnChainContextGraph({
-      participantIdentityIds: [BigInt(agentAIdentityId)],
-      requiredSignatures: 1,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
     CONTEXT_GRAPH_ID = String(cgResult.contextGraphId);
 
@@ -226,8 +226,8 @@ describe('E2E: DKGAgent with real blockchain', () => {
       makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.EXTRA1),
     );
     const cgResult = await chainAdapter.createOnChainContextGraph({
-      participantIdentityIds: [BigInt(agentAIdentityId)],
-      requiredSignatures: 1,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
     const secondCG = String(cgResult.contextGraphId);
 
@@ -322,8 +322,8 @@ describe('E2E: DKGAgent with real blockchain', () => {
       makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.EXTRA1),
     );
     const cgResult = await chainAdapter.createOnChainContextGraph({
-      participantIdentityIds: [BigInt(agentAIdentityId)],
-      requiredSignatures: 1,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
     const gossipCG = String(cgResult.contextGraphId);
 

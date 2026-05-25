@@ -199,6 +199,7 @@ export async function handleNodeUIRequest(
 
   if (req.method === 'GET' && path === '/api/operations') {
     const name = url.searchParams.get('name') ?? undefined;
+    const names = url.searchParams.get('names')?.split(',').filter(Boolean) ?? undefined;
     const status = url.searchParams.get('status') ?? undefined;
     const operationId = url.searchParams.get('operationId') ?? undefined;
     const from = url.searchParams.get('from') ? parseInt(url.searchParams.get('from')!, 10) : undefined;
@@ -207,10 +208,10 @@ export async function handleNodeUIRequest(
     const offset = parseInt(url.searchParams.get('offset') ?? '0', 10);
     const includePhases = url.searchParams.get('phases') === '1';
     if (includePhases) {
-      const result = db.getOperationsWithPhases({ name, status, operationId, from, to, limit, offset });
+      const result = db.getOperationsWithPhases({ name, names, status, operationId, from, to, limit, offset });
       return json(res, 200, result);
     }
-    const result = db.getOperations({ name, status, operationId, from, to, limit, offset });
+    const result = db.getOperations({ name, names, status, operationId, from, to, limit, offset });
     return json(res, 200, result);
   }
 

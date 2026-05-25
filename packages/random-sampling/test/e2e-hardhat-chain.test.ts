@@ -114,19 +114,16 @@ describe('Random Sampling E2E (Hardhat)', () => {
     }
     await setMinimumRequiredSignatures(provider, ctx.hubAddress, HARDHAT_KEYS.DEPLOYER, 3);
 
-    // 2. Create an on-chain context graph with all four nodes as
-    //    participants. requiredSignatures=3 matches the receiver count.
+    // 2. Create an on-chain context graph. The system-wide ACK quorum
+    //    is set to 3 above (matches the receiver count). LU-2: per-CG
+    //    hosting committees and quorum overrides are gone.
     const publisherAdapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     kav10Address = await publisherAdapter.getKnowledgeAssetsV10Address();
     // publishPolicy: 1 (open) — required for the CG to be eligible
     // for random sampling. publishPolicy: 0 means "curated" and
     // RandomSampling._isCGEligible() filters those out at draw time.
     const cgResult = await publisherAdapter.createOnChainContextGraph({
-      participantIdentityIds: [
-        BigInt(ctx.coreProfileId),
-        ...ctx.receiverIds.map((id) => BigInt(id)),
-      ],
-      requiredSignatures: 3,
+      accessPolicy: 0,
       publishPolicy: 1,
     });
     if (!cgResult.success || cgResult.contextGraphId === 0n) {

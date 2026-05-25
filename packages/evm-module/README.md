@@ -61,6 +61,50 @@ cd packages/evm-module && npx hardhat compile && cd -
 git add packages/evm-module/abi/
 ```
 
+## Static analysis
+
+Three layered scanners run as informational checks in CI (`tornado-static-analysis` job in `.github/workflows/ci.yml`) and are wired up as local pnpm scripts. Findings surface in the GitHub **Security → Code scanning** tab; the CI lane is currently non-blocking so we can build a triage baseline before deciding what to ratchet.
+
+| Tool | Purpose | Install |
+|---|---|---|
+| **Slither** | Mature Solidity static analyzer (Trail of Bits). Detects reentrancy, uninitialized storage, dangerous delegatecall, etc. | `pip install slither-analyzer` (Python). Requires `solc` 0.8.20 — install via [`solc-select`](https://github.com/crytic/solc-select) or rely on hardhat's bundled compiler. |
+| **Aderyn** | Cyfrin's Rust-based analyzer, complementary detector set. | Already a devDep (`@cyfrin/aderyn`). `pnpm install` fetches the platform binary. |
+| **solhint** | Solidity linter — style + a lightweight security ruleset. | Already a devDep (`solhint`). |
+
+### Running locally
+
+All scripts run from this package directory.
+
+```bash
+cd packages/evm-module
+
+pnpm compile                  # populate cache/ + artifacts/ for Slither
+
+pnpm slither                  # full Slither run (uses slither.config.json)
+pnpm slither:reentrancy       # reentrancy-focused detector subset
+pnpm slither:storage-layout   # printer: storage layout for upgrade-safety review
+pnpm slither:sarif            # writes slither.sarif (what CI uploads)
+
+pnpm aderyn                   # full Aderyn run, writes report.md
+pnpm aderyn:sarif             # writes report.sarif (what CI uploads)
+
+pnpm lint:sol                 # solhint (defaults stylish format)
+pnpm lint:sol:fix             # solhint --fix
+```
+
+### Configuration files
+
+- [`slither.config.json`](./slither.config.json) — pins solc 0.8.20 and excludes vendored deps (`contracts/.deps/`), archived contracts (`contracts/archive/`), mocks, and the standalone `tokens/` ERC1155Delta variants. **Do not** add `compile_force_framework: "hardhat"` — there's a known crytic-compile bug ([crytic/crytic-compile#570](https://github.com/crytic/crytic-compile/issues/570)) that breaks framework-forcing in projects with vendored deps.
+- [`aderyn.toml`](./aderyn.toml) — same exclude paths.
+- [`.solhint.json`](./.solhint.json) — `solhint:recommended` with `compiler-version: ^0.8.20` and a few overrides matching the V8 fork's tuning (allow inline assembly, don't warn on `block.timestamp`, etc.).
+- [`.solhintignore`](./.solhintignore) — same exclude paths plus `Identity.sol` (excluded for the same viaIR-stack-depth reason it's excluded from `solidity-coverage` instrumentation in [`.solcover.js`](./.solcover.js)).
+
+### Troubleshooting
+
+- **`pnpm slither` errors on SlithIR translation under viaIR.** Hardhat's [own docs](https://v2.hardhat.org/hardhat-runner/docs/reference/solidity-support) caveat that viaIR integration "is less reliable" — Slither relies on Hardhat's compile output, so edge cases can leak through. Workaround: run with `pnpm slither -- --skip-assembly` (skips assembly-block analysis, which is where most viaIR stack-trace mismatches live). If that helps, switch the CI lane's `crytic/slither-action` step to pass `slither-args: --skip-assembly` and document which contract triggered it.
+- **`pnpm aderyn` complains it can't find sources.** Aderyn auto-detects the project layout from `hardhat.config.ts`. If it can't, add `--src contracts/` explicitly. The hardhat config we ship works out of the box for Aderyn 0.6.x.
+- **Adding new vendored deps under `contracts/.deps/` (or new mocks)** — update the same regex in `slither.config.json` (`filter_paths`), `.solhintignore`, and `aderyn.toml`. Slither's `filter_paths` is a regex, so escape `.` as `\\.`.
+
 ## Internal Dependencies
 
 None — standalone Solidity/Hardhat project. Consumed by `@origintrail-official/dkg-chain`.

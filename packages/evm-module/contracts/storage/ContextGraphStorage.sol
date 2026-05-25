@@ -12,19 +12,19 @@ import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/
 /**
  * @title ContextGraphStorage
  * @notice ERC-721 registry for Context Graphs. Each CG is an NFT — the token holder
- *         has management authority (publish policy, participants, quorum).
+ *         has management authority (publish policy, participants).
  *
  * Inherits Guardian for Hub-based access control and ERC721Enumerable for
  * transferable governance tokens. The logic facade (ContextGraphs.sol) remains
  * stateless and replaceable; all state lives here.
  *
- * V10 Phase 7 redesign:
- *   - Hosting nodes (uint72 identityIds) and participant agents (addresses)
- *     are tracked as two SEPARATE lists. Decision #21 — nodes and agents are
- *     different principals; the old conflated `participantIdentityIds` field
- *     is gone.
- *   - Quorum (`requiredSignatures`) is bound to hosting nodes only — ACK
- *     signatures attest storage and come from hosting nodes.
+ * Design notes:
+ *   - Per-CG hosting committees and per-CG quorum were removed in
+ *     SPEC_CG_MEMORY_MODEL. Every CG is hosted by the network's sharding
+ *     table at publish time, and the ACK quorum is the system parameter
+ *     `parametersStorage.minimumRequiredSignatures()`. The CG records only
+ *     the participant-agent allow-list (addresses used for curated / PCA
+ *     flows).
  *   - 3 curator types are supported via (publishAuthority, publishAuthorityAccountId):
  *       EOA      -> publishAuthority = wallet, accountId = 0
  *       Safe     -> publishAuthority = multisig contract, accountId = 0
@@ -44,15 +44,11 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     string private constant _VERSION = "1.0.0";
 
     // -----------------------------------------------------------------------
-    // Bounds on participant lists — anti-griefing caps.
-    //
-    // MAX_HOSTING_NODES bounds the O(n^2) creation-time sorted-dedup walk
-    // (`_validateHostingNodes`) to ~4k storage-reads worst case.
+    // Bounds on participant list — anti-griefing cap.
     //
     // MAX_PARTICIPANT_AGENTS bounds both the O(n^2) creation-time dedup and
     // the O(n) shift-left in `removeParticipantAgent` to ~1.3M gas worst case.
     // -----------------------------------------------------------------------
-    uint256 public constant MAX_HOSTING_NODES = 64;
     uint256 public constant MAX_PARTICIPANT_AGENTS = 256;
 
     // -----------------------------------------------------------------------
@@ -61,13 +57,9 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
 
     uint256 private _contextGraphCounter;
 
-    // Core context graph metadata (no participant lists; those live in their
-    // own mappings to avoid struct↔dynamic-array mutability constraints).
+    // Core context graph metadata (no participant list; that lives in its
+    // own mapping to avoid struct↔dynamic-array mutability constraints).
     mapping(uint256 contextGraphId => KnowledgeAssetsLib.ContextGraph) private _contextGraphs;
-
-    // Hosting nodes: identity IDs of nodes that store this CG's data.
-    // Sorted ascending, no zeros, no duplicates.
-    mapping(uint256 contextGraphId => uint72[]) private _hostingNodes;
 
     // Participant agents: EOA addresses authorised to publish into a curated
     // CG (used as an allow-list for Safe / PCA-agent flows). Insertion order
@@ -77,6 +69,20 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     // Non-zero when curator type is PCA: the DKGPublishingConvictionNFT
     // account ID whose registered agents are authorised to publish.
     mapping(uint256 contextGraphId => uint256) private _publishAuthorityAccountId;
+
+    // OT-RFC-38 / LU-6 Phase B — opt-in stable identifier the curator
+    // commits to at create time. Set to `keccak256(bytes(cleartextId))`
+    // by the agent layer so the wire form of SWM gossip (topic,
+    // envelope `contextGraphId`, signing payload, host-mode store key)
+    // is chain-derivable and privacy-preserving (cleartext never leaves
+    // the local node). Hosting cores that hear `ContextGraphCreated`
+    // read this and auto-subscribe to `dkg/context-graph/{nameHash}/
+    // shared-memory` in host mode — no off-chain discovery channel
+    // required for registered CGs. Zero indicates a CG that didn't
+    // commit to a name hash (curator chose not to opt in, or it pre-
+    // dates this surface); host-mode auto-subscribe is then governed
+    // by the discovery beacon path instead.
+    mapping(uint256 contextGraphId => bytes32) private _contextGraphNameHash;
 
     // KC -> CG reverse lookup (Phase 10 random sampling).
     // Public for convenience; zero means "not registered".
@@ -92,9 +98,8 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     event ContextGraphCreated(
         uint256 indexed contextGraphId,
         address indexed owner,
-        uint72[] hostingNodes,
+        bytes32 indexed nameHash,
         address[] participantAgents,
-        uint8 requiredSignatures,
         uint256 metadataBatchId,
         uint8 accessPolicy,
         uint8 publishPolicy,
@@ -119,11 +124,6 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         uint256 newAuthorityAccountId
     );
 
-    event HostingNodesSet(
-        uint256 indexed contextGraphId,
-        uint72[] nodes
-    );
-
     event AgentParticipantAdded(
         uint256 indexed contextGraphId,
         address indexed agent
@@ -132,11 +132,6 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     event AgentParticipantRemoved(
         uint256 indexed contextGraphId,
         address indexed agent
-    );
-
-    event QuorumUpdated(
-        uint256 indexed contextGraphId,
-        uint8 requiredSignatures
     );
 
     event KCRegisteredToContextGraph(
@@ -163,16 +158,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     /**
      * @notice Create a new context graph and mint its governance NFT.
      * @param owner_                       Recipient of the ERC-721 (token holder == manager).
-     * @param hostingNodes                 Sorted ascending, no zeros, no duplicates.
-     *                                     MAY be empty for edge-owned CGs that intend
-     *                                     to fan out to hosts via sharding-table membership
-     *                                     at publish time.
      * @param participantAgents            EOA allow-list (no zeros, no duplicates).
-     * @param requiredSignatures           ACK quorum. Must be in (0, hostingNodes.length]
-     *                                     when `hostingNodes` is non-empty. Must be 0
-     *                                     when `hostingNodes` is empty (edge-owned CG
-     *                                     pattern); the publish path then falls back to
-     *                                     `parametersStorage.minimumRequiredSignatures()`.
      * @param metadataBatchId              Batch ID describing the CG metadata (0 if none).
      * @param accessPolicy                 0 = public/discoverable, 1 = private/curated.
      * @param publishPolicy                0 = curated, 1 = open.
@@ -180,40 +166,37 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
      *                                     (and forced to address(0)) when open.
      * @param publishAuthorityAccountId    Non-zero for PCA curator type. Requires curated.
      *                                     Forced to 0 when open.
+     * @param nameHash                     OT-RFC-38 / LU-6 Phase B — opt-in stable wire
+     *                                     identifier the curator commits to (intended to
+     *                                     be `keccak256(bytes(cleartextId))`, but the
+     *                                     contract is agnostic to the derivation; ANY
+     *                                     unique non-zero `bytes32` works). Hosting
+     *                                     cores in the sharding table use this to
+     *                                     auto-subscribe to the SWM gossip topic on
+     *                                     receipt of the `ContextGraphCreated` event.
+     *                                     Pass `bytes32(0)` to opt out — host-mode
+     *                                     auto-discovery for the CG then relies on the
+     *                                     gossip-beacon path (Option β).
+     *
+     * @dev Hosts and ACK quorum are network-level concerns: the sharding table
+     *      supplies hosts at publish time and `parametersStorage.minimumRequiredSignatures()`
+     *      sets the quorum. CGs do not declare a per-CG hosting committee.
      */
     function createContextGraph(
         address owner_,
-        uint72[] calldata hostingNodes,
         address[] calldata participantAgents,
-        uint8 requiredSignatures,
         uint256 metadataBatchId,
         uint8 accessPolicy,
         uint8 publishPolicy,
         address publishAuthority,
-        uint256 publishAuthorityAccountId
+        uint256 publishAuthorityAccountId,
+        bytes32 nameHash
     ) external onlyContracts returns (uint256 contextGraphId) {
         if (owner_ == address(0)) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("zero address owner");
         }
-        if (hostingNodes.length > MAX_HOSTING_NODES) {
-            revert KnowledgeAssetsLib.InvalidContextGraphConfig("hosting nodes cap");
-        }
         if (participantAgents.length > MAX_PARTICIPANT_AGENTS) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("agents cap");
-        }
-        if (hostingNodes.length == 0) {
-            // Edge-owned CG pattern: no host list, no per-CG quorum override. The
-            // publish path will use `parametersStorage.minimumRequiredSignatures()`
-            // and gate ACK signers on sharding-table membership instead.
-            if (requiredSignatures != 0) {
-                revert KnowledgeAssetsLib.InvalidContextGraphConfig(
-                    "empty hosts requires zero requiredSignatures"
-                );
-            }
-        } else {
-            if (requiredSignatures == 0 || requiredSignatures > hostingNodes.length) {
-                revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid M/N threshold");
-            }
         }
         if (accessPolicy > 1) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid accessPolicy");
@@ -221,7 +204,6 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         if (publishPolicy > 1) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid publishPolicy");
         }
-        _validateHostingNodes(hostingNodes);
 
         // Curator config is policy-dependent.
         address normalizedAuthority;
@@ -250,19 +232,12 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         _mint(owner_, contextGraphId);
 
         KnowledgeAssetsLib.ContextGraph storage cg = _contextGraphs[contextGraphId];
-        cg.requiredSignatures = requiredSignatures;
         cg.metadataBatchId = metadataBatchId;
         cg.active = true;
         cg.createdAt = uint40(block.timestamp);
         cg.accessPolicy = accessPolicy;
         cg.publishPolicy = publishPolicy;
         cg.publishAuthority = normalizedAuthority;
-
-        // Copy split lists into their own mappings.
-        uint72[] storage storedNodes = _hostingNodes[contextGraphId];
-        for (uint256 i; i < hostingNodes.length; i++) {
-            storedNodes.push(hostingNodes[i]);
-        }
 
         address[] storage storedAgents = _participantAgents[contextGraphId];
         for (uint256 i; i < participantAgents.length; i++) {
@@ -283,32 +258,21 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
             _publishAuthorityAccountId[contextGraphId] = normalizedAccountId;
         }
 
+        if (nameHash != bytes32(0)) {
+            _contextGraphNameHash[contextGraphId] = nameHash;
+        }
+
         emit ContextGraphCreated(
             contextGraphId,
             owner_,
-            hostingNodes,
+            nameHash,
             participantAgents,
-            requiredSignatures,
             metadataBatchId,
             accessPolicy,
             publishPolicy,
             normalizedAuthority,
             normalizedAccountId
         );
-    }
-
-    function _validateHostingNodes(uint72[] calldata hostingNodes) internal pure {
-        uint72 prev = 0;
-        for (uint256 i; i < hostingNodes.length; i++) {
-            uint72 current = hostingNodes[i];
-            if (current == 0) {
-                revert KnowledgeAssetsLib.InvalidContextGraphConfig("zero hosting node id");
-            }
-            if (current <= prev) {
-                revert KnowledgeAssetsLib.InvalidContextGraphConfig("hosting nodes unsorted or duplicate");
-            }
-            prev = current;
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -467,41 +431,6 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     }
 
     // -----------------------------------------------------------------------
-    // Hosting node governance — full-replace
-    // -----------------------------------------------------------------------
-
-    /**
-     * @notice Replace the hosting node list entirely. New list is validated
-     *         (sorted, no zeros, no duplicates) and the existing quorum must
-     *         still fit in the new size.
-     */
-    function setHostingNodes(
-        uint256 contextGraphId,
-        uint72[] calldata nodes
-    ) external onlyContracts {
-        _requireExists(contextGraphId);
-        if (nodes.length == 0) {
-            revert KnowledgeAssetsLib.InvalidContextGraphConfig("empty hosting nodes");
-        }
-        if (nodes.length > MAX_HOSTING_NODES) {
-            revert KnowledgeAssetsLib.InvalidContextGraphConfig("hosting nodes cap");
-        }
-        if (_contextGraphs[contextGraphId].requiredSignatures > nodes.length) {
-            revert KnowledgeAssetsLib.InvalidContextGraphConfig("setHostingNodes would break quorum");
-        }
-        _validateHostingNodes(nodes);
-
-        // Full replace.
-        delete _hostingNodes[contextGraphId];
-        uint72[] storage stored = _hostingNodes[contextGraphId];
-        for (uint256 i; i < nodes.length; i++) {
-            stored.push(nodes[i]);
-        }
-
-        emit HostingNodesSet(contextGraphId, nodes);
-    }
-
-    // -----------------------------------------------------------------------
     // Participant agent governance
     // -----------------------------------------------------------------------
 
@@ -554,23 +483,6 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     }
 
     // -----------------------------------------------------------------------
-    // Quorum
-    // -----------------------------------------------------------------------
-
-    function updateQuorum(
-        uint256 contextGraphId,
-        uint8 requiredSignatures
-    ) external onlyContracts {
-        _requireExists(contextGraphId);
-        uint256 hostCount = _hostingNodes[contextGraphId].length;
-        if (requiredSignatures == 0 || requiredSignatures > hostCount) {
-            revert KnowledgeAssetsLib.InvalidContextGraphConfig("invalid M/N threshold");
-        }
-        _contextGraphs[contextGraphId].requiredSignatures = requiredSignatures;
-        emit QuorumUpdated(contextGraphId, requiredSignatures);
-    }
-
-    // -----------------------------------------------------------------------
     // Read APIs
     // -----------------------------------------------------------------------
 
@@ -578,9 +490,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         uint256 contextGraphId
     ) external view returns (
         address owner_,
-        uint72[] memory hostingNodes,
         address[] memory participantAgents,
-        uint8 requiredSignatures,
         uint256 metadataBatchId,
         bool active,
         uint256 createdAt,
@@ -593,9 +503,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         KnowledgeAssetsLib.ContextGraph storage cg = _contextGraphs[contextGraphId];
         return (
             ownerOf(contextGraphId),
-            _hostingNodes[contextGraphId],
             _participantAgents[contextGraphId],
-            cg.requiredSignatures,
             cg.metadataBatchId,
             cg.active,
             cg.createdAt,
@@ -606,33 +514,10 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         );
     }
 
-    function getContextGraphRequiredSignatures(
-        uint256 contextGraphId
-    ) external view returns (uint8) {
-        return _contextGraphs[contextGraphId].requiredSignatures;
-    }
-
-    function getHostingNodes(
-        uint256 contextGraphId
-    ) external view returns (uint72[] memory) {
-        return _hostingNodes[contextGraphId];
-    }
-
     function getParticipantAgents(
         uint256 contextGraphId
     ) external view returns (address[] memory) {
         return _participantAgents[contextGraphId];
-    }
-
-    function isHostingNode(
-        uint256 contextGraphId,
-        uint72 identityId
-    ) external view returns (bool) {
-        uint72[] storage nodes = _hostingNodes[contextGraphId];
-        for (uint256 i; i < nodes.length; i++) {
-            if (nodes[i] == identityId) return true;
-        }
-        return false;
     }
 
     function isParticipantAgent(
@@ -678,12 +563,38 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     }
 
     /**
-     * @notice Convenience helper: true iff the CG is curated (publishPolicy == 0).
+     * @notice OT-RFC-38 / LU-6 Phase B — committed name hash for the CG.
+     *         Returns `bytes32(0)` when the curator opted out at create
+     *         time (rare; expected only for CGs that pre-date the
+     *         Phase B surface or want to rely on the discovery-beacon
+     *         path exclusively).
+     */
+    function getNameHash(
+        uint256 contextGraphId
+    ) external view returns (bytes32) {
+        return _contextGraphNameHash[contextGraphId];
+    }
+
+    /**
+     * @notice True iff the CG carries curated (encrypted) payloads — i.e.,
+     *         the ACCESS policy is curated, regardless of publish policy.
+     *
+     * Originally this checked `publishPolicy == 0`, but that conflated two
+     * orthogonal axes: "who can read" (access) vs. "who can publish".
+     * The ciphertext-commitment branch on the KAv10 publish path needs
+     * to know whether the payload is ENCRYPTED, which is an access-policy
+     * question. The "curated access + open publish" combo (anyone in the
+     * allowlist may publish, but readers must still decrypt) is a valid
+     * configuration and must accept ciphertext commitments.
+     *
+     * Used by `RandomSampling._pickWeightedChallenge` step 2 to decide
+     * whether the per-KC ciphertext-commitment filter applies (RFC-39
+     * Phase A.5). Both call sites converge on this access-policy check.
      */
     function getIsCurated(
         uint256 contextGraphId
     ) external view returns (bool) {
-        return _contextGraphs[contextGraphId].publishPolicy == 0;
+        return _contextGraphs[contextGraphId].accessPolicy != 0;
     }
 
     function getLatestContextGraphId() external view returns (uint256) {

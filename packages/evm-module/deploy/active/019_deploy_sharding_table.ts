@@ -16,12 +16,8 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
       hre.helpers.contractDeployments.contracts['ShardingTable'];
   }
 
-  const block = await hre.ethers.provider.getBlock('latest');
-  const blockTimeNow = block!.timestamp;
-
   const newShardingTable = await hre.helpers.deploy({
     newContractName: 'ShardingTable',
-    additionalArgs: [isMigration ? blockTimeNow + 86400 : blockTimeNow],
   });
 
   if (isMigration && hre.network.name.startsWith('neuroweb')) {

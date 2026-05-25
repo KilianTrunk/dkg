@@ -13,7 +13,7 @@ import {ShardingTableLib} from "./libraries/ShardingTableLib.sol";
 
 contract ShardingTable is INamed, IVersioned, ContractStatus, IInitializable {
     string private constant _NAME = "ShardingTable";
-    string private constant _VERSION = "1.0.0";
+    string private constant _VERSION = "1.0.1";
 
     ProfileStorage public profileStorage;
     ShardingTableStorage public shardingTableStorage;
@@ -22,12 +22,14 @@ contract ShardingTable is INamed, IVersioned, ContractStatus, IInitializable {
     ///         post-migration so its `getNodeStake` is not a faithful read.
     ConvictionStakingStorage public convictionStakingStorage;
 
-    uint256 public migrationPeriodEnd;
-
+    // v1.0.1 — Dropped the `migrationPeriodEnd` field and its constructor
+    // parameter. It was a V8→V9 carry-over: it was set in the constructor and
+    // intended to gate a `migrateOldShardingTable` Neuroweb-only function
+    // that has since been removed during the V9→V10 consolidation. With the
+    // gated function gone, the field was unused, unread, and pure dead state
+    // on a Logic contract — violating the Storage/Logic separation pattern.
     // solhint-disable-next-line no-empty-blocks
-    constructor(address hubAddress, uint256 migrationPeriodEnd_) ContractStatus(hubAddress) {
-        migrationPeriodEnd = migrationPeriodEnd_;
-    }
+    constructor(address hubAddress) ContractStatus(hubAddress) {}
 
     function initialize() public onlyHub {
         profileStorage = ProfileStorage(hub.getContractAddress("ProfileStorage"));

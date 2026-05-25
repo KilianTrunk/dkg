@@ -63,8 +63,10 @@ The 12-cell matrix run (`--matrix` flag of the repro script) writes a fresh
 context graph per cell against the same single shared `store.nq` and
 restarts the daemon between cells, mirroring the load pattern of a typical
 day's importer churn. Results are written to
-`.dkg-repro-reports/matrix-<ts>.json`; the run that drove this report lives
-at `.dkg-repro-reports/matrix-20260525-092823.json`.
+`.dkg-repro-reports/matrix-<ts>.json`. The matrix snapshot that drove this
+report (`matrix-20260525-092823.json`) is not committed — it's a 545-line
+forensic dump and the actionable result is the table below. Re-run
+`node scripts/repro/wm-persistence-regression.mjs --matrix` to regenerate.
 
 | Triples written | Restart        | Pause | Pre-stop | Post-restart | Lost      | Mode                                         |
 |-----------------|----------------|-------|----------|--------------|-----------|----------------------------------------------|

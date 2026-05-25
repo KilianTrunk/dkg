@@ -221,6 +221,56 @@ describe('createSwmAckQuorum: track idempotency / edge cases', () => {
     q.onAck('op-nan', 'p9');
     expect(q.stats().completed).toBe(1);
   });
+
+  it('falls back to default threshold for +Infinity (locks !Number.isFinite over Number.isNaN)', () => {
+    // Defends against a regression that swapped clamp01's
+    // `!Number.isFinite(n)` for `Number.isNaN(n)`. Both
+    // correctly handle NaN, but `Number.isNaN(Infinity)` is
+    // false → would reach `n > 1 → return 1` and silently
+    // change default-threshold behaviour to "wait for 100%".
+    // This test pins the DEFAULT (0.9) path: 8/10 = 80%
+    // does NOT complete; 9/10 = 90% does. Under the broken
+    // regression both would route through threshold=1.0
+    // and the 9/10 case would also fail to complete.
+    const q = makeQuorum();
+    q.track({
+      shareOperationId: 'op-pos-inf',
+      cgId: 'cg',
+      expectedMembers: ['p1','p2','p3','p4','p5','p6','p7','p8','p9','p10'],
+      payload: PAYLOAD,
+      enumerationSource: 'topic-subscribers',
+      quorumThreshold: Number.POSITIVE_INFINITY,
+    });
+    for (let i = 1; i <= 8; i++) q.onAck('op-pos-inf', `p${i}`);
+    expect(q.stats().completed).toBe(0);
+    q.onAck('op-pos-inf', 'p9');
+    expect(q.stats().completed).toBe(1);
+  });
+
+  it('falls back to default threshold for -Infinity (negative non-finite path)', () => {
+    // Mirror of the +Infinity test — `-Infinity` also hits
+    // `!Number.isFinite` and returns DEFAULT (NOT 0). A
+    // regression that handled negatives via `n < 0 → return
+    // 0` BEFORE the finite check would silently change this
+    // to threshold=0 (everything completes immediately on
+    // track), which the `expect(completed).toBe(0)` after
+    // track but before any ack would catch.
+    const q = makeQuorum();
+    q.track({
+      shareOperationId: 'op-neg-inf',
+      cgId: 'cg',
+      expectedMembers: ['p1','p2','p3','p4','p5','p6','p7','p8','p9','p10'],
+      payload: PAYLOAD,
+      enumerationSource: 'topic-subscribers',
+      quorumThreshold: Number.NEGATIVE_INFINITY,
+    });
+    // Default 0.9: 0/10 = 0 < 0.9, NOT completed. Under the
+    // pre-finite-check-clamp regression, -Inf would have
+    // routed to 0 and completed=1 here.
+    expect(q.stats().completed).toBe(0);
+    for (let i = 1; i <= 9; i++) q.onAck('op-neg-inf', `p${i}`);
+    expect(q.stats().completed).toBe(1);
+  });
 });
 
 describe('createSwmAckQuorum: onAck filtering / dedup', () => {

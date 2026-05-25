@@ -7,7 +7,7 @@ import { spawn, execSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { writeFile, unlink } from 'node:fs/promises';
+import { appendFile, writeFile, unlink } from 'node:fs/promises';
 import { ethers } from 'ethers';
 import {
   dkgAuthTokenPath,
@@ -20,7 +20,7 @@ import {
 import yaml from 'js-yaml';
 import {
   loadConfig, saveConfig, configExists, configPath,
-  readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir,
+  readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir, removeApiPort,
   loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveChainConfig,
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall,
@@ -73,6 +73,16 @@ import { registerIntegrationCommands } from './integrations/commands.js';
 type ActionOpts = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 const VERIFY_COLLECTION_TIMEOUT_MIN_MS = 1_000;
 const VERIFY_COLLECTION_TIMEOUT_MAX_MS = 30 * 60 * 1000;
+
+async function appendSupervisorLog(message: string): Promise<void> {
+  await ensureDkgDir();
+  await appendFile(logPath(), `${new Date().toISOString()} ${message}\n`, 'utf-8');
+}
+
+function supervisorWarn(message: string): void {
+  console.warn(message);
+  void appendSupervisorLog(message).catch(() => {});
+}
 
 const STARTUP_BANNER = `
 \x1b[36m██████╗ ██╗  ██╗ ██████╗     ██╗   ██╗ ██╗ ██████╗
@@ -214,7 +224,7 @@ async function maybeStartSupervisorLivenessWatcher(
         watcher = startLivenessWatcher({
           port,
           onUnresponsive: () => {
-            console.warn(
+            supervisorWarn(
               `[supervisor] worker unresponsive after ${LIVENESS_CONSECUTIVE_FAILURES_TO_KILL} consecutive liveness probes; SIGKILL + respawn.`,
             );
             try {
@@ -224,7 +234,7 @@ async function maybeStartSupervisorLivenessWatcher(
             }
           },
           onFailure: (consecutive: number) => {
-            console.warn(`[supervisor] liveness probe failed (${consecutive} in a row).`);
+            supervisorWarn(`[supervisor] liveness probe failed (${consecutive} in a row).`);
           },
         });
         return;
@@ -244,6 +254,11 @@ async function runDaemonSupervisor(): Promise<void> {
   let crashRestartCount = 0;
 
   while (true) {
+    await removeApiPort().catch((err: any) => {
+      supervisorWarn(
+        `[supervisor] could not clear stale api.port before spawn: ${err?.message ?? String(err)}`,
+      );
+    });
     const child = spawn(
       process.execPath,
       [...process.execArgv, resolveDaemonEntryPoint(), 'daemon-worker'],

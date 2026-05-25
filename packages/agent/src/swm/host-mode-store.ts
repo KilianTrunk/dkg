@@ -134,6 +134,7 @@ export class SwmHostModeStore {
   private readonly metaCache = new Map<string, CgMetaState>();
   private readonly inflightWrites = new Map<string, Promise<void>>();
   private initialized = false;
+  private lastStartupReconcileReport: SwmHostModeStartupReconcileReport | undefined;
 
   constructor(options: SwmHostModeStoreOptions) {
     this.dataDir = options.dataDir;
@@ -151,6 +152,7 @@ export class SwmHostModeStore {
     if (this.initialized) return;
     await fs.mkdir(this.dataDir, { recursive: true });
     const report = await this.reconcileOrphanLogs();
+    this.lastStartupReconcileReport = report;
     this.initialized = true;
     if (this.onStartupReconcile && (report.orphanLogsRemoved > 0 || report.orphanBytesRemoved > 0)) {
       try {
@@ -162,12 +164,22 @@ export class SwmHostModeStore {
   }
 
   /**
-   * Test-only / operator helper: re-run the orphan-log sweep without
-   * re-initialising. Returns the totals for the current pass.
+   * Test-only / operator helper: get the orphan-log reconcile report
+   * the store actually applied. Codex PR #619 R2: on a first call
+   * before `init()` has captured anything, we lazily run init() and
+   * return the report it produced — NOT a second sweep, which would
+   * always come back empty after init's first pass already cleaned
+   * up.
    */
   async reconcileOrphanLogsNow(): Promise<SwmHostModeStartupReconcileReport> {
+    const wasInitialized = this.initialized;
     await this.init();
-    return this.reconcileOrphanLogs();
+    if (!wasInitialized && this.lastStartupReconcileReport) {
+      return this.lastStartupReconcileReport;
+    }
+    const report = await this.reconcileOrphanLogs();
+    this.lastStartupReconcileReport = report;
+    return report;
   }
 
   /**
@@ -194,12 +206,35 @@ export class SwmHostModeStore {
     } catch {
       return { orphanLogsRemoved: 0, orphanBytesRemoved: 0 };
     }
-    const metaKeys = new Set<string>();
+    // Codex PR #619 R2: only count a .meta as "healthy pairing
+    // candidate" if it parses as valid JSON with a contextGraphId.
+    // A crash mid-`writeFile(metaPath, ...)` can leave a truncated
+    // file; `loadMeta()` / `listKnownCgs()` already treat that as
+    // unusable, so the paired .log is still unservable + unprunable
+    // and must be reaped here too.
+    const validMetaKeys = new Set<string>();
+    const corruptMetaNames: string[] = [];
     const logFiles: { key: string; name: string }[] = [];
     for (const e of entries) {
       if (!e.isFile()) continue;
       if (e.name.endsWith('.meta')) {
-        metaKeys.add(e.name.slice(0, -'.meta'.length));
+        const metaPath = path.join(this.dataDir, e.name);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(await fs.readFile(metaPath, 'utf-8'));
+        } catch {
+          corruptMetaNames.push(e.name);
+          continue;
+        }
+        if (
+          parsed && typeof parsed === 'object'
+          && typeof (parsed as { contextGraphId?: unknown }).contextGraphId === 'string'
+          && (parsed as { contextGraphId: string }).contextGraphId.length > 0
+        ) {
+          validMetaKeys.add(e.name.slice(0, -'.meta'.length));
+        } else {
+          corruptMetaNames.push(e.name);
+        }
       } else if (e.name.endsWith('.log')) {
         logFiles.push({ key: e.name.slice(0, -'.log'.length), name: e.name });
       }
@@ -207,7 +242,7 @@ export class SwmHostModeStore {
     let orphanLogsRemoved = 0;
     let orphanBytesRemoved = 0;
     for (const { key, name } of logFiles) {
-      if (metaKeys.has(key)) continue;
+      if (validMetaKeys.has(key)) continue;
       const fullPath = path.join(this.dataDir, name);
       try {
         const stat = await fs.stat(fullPath);
@@ -216,6 +251,20 @@ export class SwmHostModeStore {
         orphanLogsRemoved += 1;
       } catch {
         // best-effort; another process may have removed the file
+      }
+    }
+    // Also reap corrupt .meta files themselves so subsequent inits
+    // don't keep tripping over them. Their footprint is tiny (counted
+    // in orphanBytesRemoved for observability).
+    for (const name of corruptMetaNames) {
+      const fullPath = path.join(this.dataDir, name);
+      try {
+        const stat = await fs.stat(fullPath);
+        orphanBytesRemoved += stat.size;
+        await fs.rm(fullPath, { force: true });
+        orphanLogsRemoved += 1;
+      } catch {
+        // best-effort
       }
     }
     return { orphanLogsRemoved, orphanBytesRemoved };

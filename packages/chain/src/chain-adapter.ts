@@ -296,6 +296,21 @@ export interface V10PublishParams {
   author: V10AuthorAttestation;
   ackSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
   /**
+   * RFC-39 Phase A.5 — OPTIONAL Merkle root over `[keccak256(ct_i)]` in
+   * `swmMessageIndex` order for this batch's ciphertext chunks. Required
+   * by the contract to be `bytes32(0)` for public CGs; for curated CGs
+   * either zero (legacy/transitional — picker skips this KC in the
+   * curated draw) OR paired with a non-zero `ciphertextChunkCount`.
+   * Defaults to `bytes32(0)` when omitted.
+   */
+  ciphertextChunksRoot?: Uint8Array;
+  /**
+   * RFC-39 Phase A.5 — OPTIONAL number of ciphertext chunks in this
+   * batch (== curated leaf count for random sampling). Same zero-or-paired
+   * constraints as `ciphertextChunksRoot`. Defaults to `0` when omitted.
+   */
+  ciphertextChunkCount?: number;
+  /**
    * Write-ahead hook invoked by the adapter *immediately before the
    * concrete publish tx is broadcast* — i.e. after `approve()` and any
    * allowance top-up, after gas estimation / populate / signing have
@@ -347,6 +362,20 @@ export interface V10UpdateKCParams {
   updateOperationId?: string;
   publisherNodeIdentityId?: bigint;
   ackSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
+  /**
+   * RFC-39 Phase A.5 — OPTIONAL refreshed Merkle root over the new
+   * batch's ciphertext chunks. Same zero-or-paired contract as
+   * {@link V10PublishParams.ciphertextChunksRoot}: zero on metadata-only
+   * updates and public CGs; both non-zero on curated commitment
+   * rotation. Defaults to `bytes32(0)`.
+   */
+  newCiphertextChunksRoot?: Uint8Array;
+  /**
+   * RFC-39 Phase A.5 — OPTIONAL refreshed ciphertext chunk count for the
+   * new batch. Defaults to `0`. Paired with
+   * {@link newCiphertextChunksRoot}.
+   */
+  newCiphertextChunkCount?: number;
   /**
    * Write-ahead hook fired just before the concrete update tx is
    * broadcast, carrying the signed tx hash. See

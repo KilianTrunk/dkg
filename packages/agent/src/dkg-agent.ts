@@ -5827,7 +5827,25 @@ export class DKGAgent {
       // revoke flow want to see the latter explicitly. Use the same
       // localAgents map the active-only filter does so the diagnostic
       // matches the gate exactly.
-      const record = this.localAgents.get(recipientAgentAddress);
+      //
+      // Codex round 2 on PR #654: a `Map.get(checksum)` here can miss
+      // a record that's stored under a differently-cased Map key than
+      // its own `record.agentAddress` field (legacy persisted state,
+      // older fixtures, or any path that lowercased on persist while
+      // keeping the EIP-55 form on the record itself). The miss falls
+      // through to `StaleSenderKeyTargetError`, which demotes a real
+      // revoked-or-known-key failure to DEBUG and silences operator
+      // visibility. Mirror the case-insensitive scan already used by
+      // `hasLocalAgent` (just above) and `getLocalWorkspaceRecipient
+      // PrivateKeys` so this branch sees the record whenever the
+      // existence-gate above did.
+      let record: AgentKeyRecord | undefined;
+      for (const candidate of this.localAgents.values()) {
+        if (candidate.agentAddress.toLowerCase() === recipientAgentAddress.toLowerCase()) {
+          record = candidate;
+          break;
+        }
+      }
       const activeEntry = record?.workspaceEncryptionKeys.find(
         (entry) => entry.encryptionKeyId === pkg.recipientKeyId && !entry.revokedAt,
       );

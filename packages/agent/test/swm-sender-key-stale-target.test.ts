@@ -238,6 +238,37 @@ describe('acceptSwmSenderKeyPackage: stale-target throw type', () => {
     );
     await expect(accept).rejects.not.toBeInstanceOf(StaleSenderKeyTargetError);
   });
+
+  it('does NOT misclassify a revoked-key target as stale when localAgents is keyed under a different case', async () => {
+    // Codex round 2 regression on PR #654: `hasLocalAgent` does a
+    // case-insensitive scan over `localAgents.values()`, but the
+    // inner record lookup in the `!localKey` diagnostic branch was
+    // doing exact-string `Map.get(checksum)`. If the keystore is
+    // keyed under a different case than the record's own
+    // `agentAddress` field (legacy persisted state, older fixtures,
+    // any path that lowercases on save while keeping EIP-55 on the
+    // record itself), `record` becomes `undefined`, the
+    // active/revoked discriminators silently fail, and the bootstrap
+    // falls through to `StaleSenderKeyTargetError` — demoting a real
+    // revoked-key targeting to DEBUG. Pin the case-insensitive scan.
+    const { internals, recipient, senderWallet } = await bootAgentForStaleTargetTest();
+    const activeKeyId = recipient.workspaceEncryptionKeys[0].encryptionKeyId;
+    recipient.workspaceEncryptionKeys[0].revokedAt = new Date().toISOString();
+    internals.localAgents.delete(recipient.agentAddress);
+    internals.localAgents.set(recipient.agentAddress.toLowerCase(), recipient);
+
+    const pkg = await buildSignedPackage({
+      senderWallet,
+      recipientAgentAddress: recipient.agentAddress,
+      recipientKeyId: activeKeyId,
+    });
+    const accept = internals.acceptSwmSenderKeyPackage(pkg, FROM_PEER_ID, {
+      operationId: 'test-op',
+      operationName: 'share',
+    });
+    await expect(accept).rejects.toThrow(/was revoked at/);
+    await expect(accept).rejects.not.toBeInstanceOf(StaleSenderKeyTargetError);
+  });
 });
 
 describe('handleSwmSenderKeyPackage: log-level routing', () => {
@@ -337,5 +368,35 @@ describe('handleSwmSenderKeyPackage: log-level routing', () => {
     expect(rejectEntries[0].message).toContain(
       `reason=No local X25519 private key for DKG agent ${recipient.agentAddress} key ${activeKeyId}`,
     );
+  });
+
+  it('routes a revoked-key target to WARN even when localAgents is keyed under a different case', async () => {
+    // Operator-facing pin for Codex round 2: same case-mismatch as
+    // the accept-path regression above, but verified end-to-end
+    // through `handleSwmSenderKeyPackage` so a future refactor that
+    // re-introduces the exact-key Map.get() trips both halves.
+    const { internals, recipient, senderWallet } = await bootAgentForStaleTargetTest();
+    const activeKeyId = recipient.workspaceEncryptionKeys[0].encryptionKeyId;
+    recipient.workspaceEncryptionKeys[0].revokedAt = new Date().toISOString();
+    internals.localAgents.delete(recipient.agentAddress);
+    internals.localAgents.set(recipient.agentAddress.toLowerCase(), recipient);
+
+    const pkg = await buildSignedPackage({
+      senderWallet,
+      recipientAgentAddress: recipient.agentAddress,
+      recipientKeyId: activeKeyId,
+    });
+    const bytes = encodeSwmSenderKeyPackage(pkg);
+
+    const sink = captureLoggerSink();
+    detachSink = sink.detach;
+    await internals.handleSwmSenderKeyPackage(bytes, FROM_PEER_ID);
+
+    const rejectEntries = sink.entries.filter((e) =>
+      e.message.startsWith('SWM sender-key setup receive rejected'),
+    );
+    expect(rejectEntries).toHaveLength(1);
+    expect(rejectEntries[0].level).toBe('warn');
+    expect(rejectEntries[0].message).toContain('was revoked at');
   });
 });

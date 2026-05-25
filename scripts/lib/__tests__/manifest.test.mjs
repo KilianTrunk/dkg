@@ -429,6 +429,62 @@ test('createImportManifest preserves original startedAt when reusing an assertio
   );
 });
 
+test('createImportManifest rejects reuse with a different partition set', async () => {
+  const client = makeMockClient();
+  const importId = 'partition-set-reuse';
+
+  await createImportManifest({
+    client,
+    importId,
+    partitions: ['src/a.ts', 'src/b.ts'],
+    subGraphName: 'meta',
+  });
+
+  client._state.createAlreadyExists = true;
+  await assert.rejects(
+    () => createImportManifest({
+      client,
+      importId,
+      partitions: ['src/a.ts', 'src/c.ts'],
+      subGraphName: 'meta',
+    }),
+    /different partition set/,
+  );
+
+  const state = await loadImportManifest({ client, importId, subGraphName: 'meta' });
+  assert.deepEqual(
+    state.partitions.map((p) => p.key).sort(),
+    ['src/a.ts', 'src/b.ts'],
+    'failed reuse must not union new partitions into the existing manifest',
+  );
+});
+
+test('markPartitionStatus rejects undeclared partition keys', async () => {
+  const client = makeMockClient();
+  const importId = 'declared-partitions-only';
+
+  await createImportManifest({
+    client,
+    importId,
+    partitions: ['src/a.ts'],
+    subGraphName: 'meta',
+  });
+
+  await assert.rejects(
+    () => markPartitionStatus({
+      client,
+      importId,
+      partitionKey: 'src/typo.ts',
+      status: 'done',
+      subGraphName: 'meta',
+    }),
+    /not declared in manifest/,
+  );
+
+  const state = await loadImportManifest({ client, importId, subGraphName: 'meta' });
+  assert.deepEqual(state.partitions.map((p) => [p.key, p.status]), [['src/a.ts', 'pending']]);
+});
+
 test('round-trip works with SPARQL 1.1 results-JSON cell bindings too', async () => {
   // Same flow, but the mock returns `{value, type}` cells instead of
   // flat strings (mimics the SPARQL-HTTP adapter). loadImportManifest()

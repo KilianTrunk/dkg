@@ -325,6 +325,20 @@ function bareUri(v) {
   return typeof v === 'string' ? v : String(v ?? '');
 }
 
+function sameStringSet(a, b) {
+  if (a.length !== b.length) return false;
+  const seen = new Set(a);
+  if (seen.size !== a.length) return false;
+  for (const value of b) {
+    if (!seen.has(value)) return false;
+  }
+  return new Set(b).size === b.length;
+}
+
+function isMissingManifestError(err) {
+  return /No import manifest rows found/.test(String(err?.message ?? err ?? ''));
+}
+
 /**
  * Build the initial set of triples for a fresh Import manifest.
  *
@@ -407,6 +421,24 @@ export async function createImportManifest({
     }
     createdFresh = false;
   }
+  if (!createdFresh) {
+    try {
+      const existing = await loadImportManifest({ client, importId, subGraphName });
+      const existingKeys = existing.partitions.map((p) => p.key);
+      if (!sameStringSet(existingKeys, partitions)) {
+        throw new Error(
+          `createImportManifest: manifest '${importId}' already exists with a different partition set. ` +
+          `Refusing to merge old and new partitions; pass a new importId for a new import run.`,
+        );
+      }
+    } catch (err) {
+      // If the assertion exists but no manifest rows are visible yet, this is
+      // the partial-create retry path the idempotent branch is meant to heal:
+      // continue with the additive write/promote below. Any visible manifest
+      // with a different partition set is a real caller error and must fail.
+      if (!isMissingManifestError(err)) throw err;
+    }
+  }
   const importIri = importUri(importId);
   const triples = buildInitialManifestTriples(importId, partitions, new Date().toISOString())
     .filter((t) => createdFresh || !(t.subject === importIri && t.predicate === IMPORT_P.startedAt));
@@ -467,6 +499,13 @@ export async function markPartitionStatus({
 
   const cgId = client.cgId;
   const assertion = assertionName ?? defaultManifestAssertionName(importId);
+  const manifest = await loadImportManifest({ client, importId, subGraphName });
+  if (!manifest.partitions.some((p) => p.key === partitionKey)) {
+    throw new Error(
+      `markPartitionStatus: partition '${partitionKey}' is not declared in manifest '${importId}'. ` +
+      `Call createImportManifest with the complete partition set before recording status events.`,
+    );
+  }
   const partIri = partitionUri(importId, partitionKey);
   const evIri = statusEventUri(importId, partitionKey);
   const nowIso = new Date().toISOString();

@@ -114,6 +114,22 @@ interface CgMetaState {
   seqno: number;
   registered: boolean;
   contextGraphId: string;
+  /**
+   * OT-RFC-38 LU-6 B3 — true when the agent has actively engaged
+   * host-mode for this CG (subscribed to its SWM gossip topic in
+   * opaque-ciphertext mode). Persisted so a restart can re-engage
+   * the gossip handler before the chain-event poller catches up
+   * (chain events outside the lookback window would otherwise be
+   * silently lost, stranding hosted CGs without an apply path).
+   *
+   * Distinct from `registered` (which tracks on-chain registration
+   * for limits + rate-limit purposes). A CG can be host-mode
+   * subscribed but unregistered (pre-registration auto-host via
+   * beacon) and vice-versa (registered but the curator revoked
+   * this core via off-protocol means — the next reconcile loop
+   * will clear `hostModeSubscribed`).
+   */
+  hostModeSubscribed?: boolean;
 }
 
 /**
@@ -352,6 +368,50 @@ export class SwmHostModeStore {
     return out;
   }
 
+  /**
+   * OT-RFC-38 LU-6 B3 — record that the agent has engaged host-mode
+   * for this CG (subscribed to its SWM gossip topic in opaque-store
+   * mode). Persisted so a restart can re-engage the gossip handler
+   * before the chain-event poller catches up. Idempotent.
+   */
+  async markHostModeSubscribed(contextGraphId: string): Promise<void> {
+    await this.init();
+    const meta = await this.loadMeta(contextGraphId);
+    if (meta.hostModeSubscribed === true) return;
+    meta.hostModeSubscribed = true;
+    await this.persistMeta(contextGraphId, meta);
+  }
+
+  /**
+   * Inverse of {@link markHostModeSubscribed}. Called when the agent
+   * unwires the host-mode handler (promoted to member, curator
+   * revoked, operator explicitly disabled host-mode for this CG).
+   * Persisted so a restart does NOT re-engage.
+   */
+  async markHostModeUnsubscribed(contextGraphId: string): Promise<void> {
+    await this.init();
+    const meta = await this.loadMeta(contextGraphId);
+    if (meta.hostModeSubscribed !== true) return;
+    meta.hostModeSubscribed = false;
+    await this.persistMeta(contextGraphId, meta);
+  }
+
+  /**
+   * Returns the cleartext / wire ids of every CG marked
+   * `hostModeSubscribed: true` in its `.meta`. Used by the agent at
+   * startup to re-engage gossip handlers without waiting for the
+   * chain-event poller to re-derive them.
+   */
+  async listHostModeSubscribedCgs(): Promise<string[]> {
+    await this.init();
+    const out: string[] = [];
+    for (const { contextGraphId } of await this.listKnownCgs()) {
+      const meta = await this.loadMeta(contextGraphId).catch(() => null);
+      if (meta?.hostModeSubscribed === true) out.push(contextGraphId);
+    }
+    return out;
+  }
+
   /** Mark a CG as on-chain registered. Switches it to the larger limits. */
   async markRegistered(contextGraphId: string): Promise<void> {
     await this.init();
@@ -549,6 +609,7 @@ export class SwmHostModeStore {
       seqno: Math.max(parsed?.seqno ?? 0, logSeqno),
       registered: parsed?.registered ?? false,
       contextGraphId,
+      ...(parsed?.hostModeSubscribed === true ? { hostModeSubscribed: true } : {}),
     };
     // If the log says more than the meta does, persist the
     // reconciled cursor so subsequent cold loads don't have to

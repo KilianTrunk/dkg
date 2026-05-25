@@ -46,6 +46,8 @@
  *   const pending = state.filter((p) => p.status !== 'done');
  */
 
+import { createHash } from 'node:crypto';
+
 export const IMPORT_NS = 'https://ontology.dkg.io/import#';
 
 export const IMPORT_T = {
@@ -88,8 +90,11 @@ export function importUri(importId) {
  * This helper:
  *   - replaces any character outside `[A-Za-z0-9._-]` with `-`
  *   - collapses runs of `-` and trims leading/trailing dashes
- *   - prefixes with `import-manifest-` and truncates so the total length
- *     stays under the daemon's 256-char limit
+ *   - prefixes with `import-manifest-`
+ *   - appends a stable hash whenever sanitization or truncation changes
+ *     the caller's raw id, so `a/b` and `a b` cannot collide
+ *   - truncates the human-readable slug segment so the total length stays
+ *     under the daemon's 256-char limit
  *   - throws a descriptive error if the `importId` reduces to an empty slug
  *     (e.g. `importId = "///"`), so callers don't get a cryptic 400 later
  *
@@ -101,19 +106,32 @@ export function defaultManifestAssertionName(importId) {
   }
   const prefix = 'import-manifest-';
   const maxSlugLen = 256 - prefix.length;
-  const slug = importId
+  const rawSlug = importId
     .replace(/[^A-Za-z0-9._-]+/g, '-')
     .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, maxSlugLen);
-  if (slug.length === 0) {
+    .replace(/^-|-$/g, '');
+  if (rawSlug.length === 0) {
     throw new Error(
       `defaultManifestAssertionName: importId '${importId}' contains no characters ` +
       `valid for an assertion name (must include at least one of [A-Za-z0-9._-]). ` +
       `Pass an explicit \`assertionName\` to createImportManifest, or pick a simpler importId.`,
     );
   }
-  return `${prefix}${slug}`;
+  const needsHash = rawSlug !== importId || rawSlug.length > maxSlugLen;
+  if (!needsHash) return `${prefix}${rawSlug}`;
+
+  const hash = createHash('sha256').update(importId).digest('hex').slice(0, 12);
+  const maxSlugWithHash = maxSlugLen - hash.length - 1;
+  const slug = rawSlug
+    .slice(0, maxSlugWithHash)
+    .replace(/-+$/g, '');
+  if (slug.length === 0) {
+    throw new Error(
+      `defaultManifestAssertionName: importId '${importId}' sanitizes to an empty assertion-name slug. ` +
+      `Pass an explicit \`assertionName\` to createImportManifest, or pick a simpler importId.`,
+    );
+  }
+  return `${prefix}${slug}-${hash}`;
 }
 
 /** Stable URI for a Partition within an Import. */
@@ -141,11 +159,21 @@ export function statusEventUri(importId, key) {
 }
 
 function lit(value) {
-  const s = String(value)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r');
+  const s = String(value).replace(/["\\\t\b\n\r\f]|[\u0000-\u001F\u007F]/g, (ch) => {
+    switch (ch) {
+      case '"': return '\\"';
+      case '\\': return '\\\\';
+      case '\t': return '\\t';
+      case '\b': return '\\b';
+      case '\n': return '\\n';
+      case '\r': return '\\r';
+      case '\f': return '\\f';
+      default: {
+        const code = ch.codePointAt(0) ?? 0;
+        return `\\u${code.toString(16).toUpperCase().padStart(4, '0')}`;
+      }
+    }
+  });
   return `"${s}"`;
 }
 
@@ -261,13 +289,22 @@ function unquote(v) {
       // pass as the start of a new escape sequence. This regex matches each
       // escape exactly once and dispatches via a replacer, so no byte is
       // unescaped twice.
-      return m[1].replace(/\\(["\\nr])/g, (_, ch) => {
-        switch (ch) {
+      return m[1].replace(/\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|["'\\tbnrf])/g, (_, esc) => {
+        switch (esc) {
           case '"': return '"';
+          case "'": return "'";
           case '\\': return '\\';
+          case 't': return '\t';
+          case 'b': return '\b';
           case 'n': return '\n';
           case 'r': return '\r';
-          default: return ch;
+          case 'f': return '\f';
+          default: {
+            if (esc.startsWith('u') || esc.startsWith('U')) {
+              return String.fromCodePoint(Number.parseInt(esc.slice(1), 16));
+            }
+            return esc;
+          }
         }
       });
     }

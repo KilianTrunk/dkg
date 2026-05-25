@@ -106,7 +106,7 @@ test('statusEventUri nests under partitionUri and is unique', () => {
   assert.notEqual(a, b, 'two events on the same partition should differ');
 });
 
-test('round-trip preserves literal escape sequences without double-unescape (regression for CodeQL L138)', async () => {
+test('round-trip preserves N-Triples literal escapes without double-unescape (regression for CodeQL L138)', async () => {
   // The previous unquote() used four chained `.replace()` passes; the
   // `\\` -> `\` pass running after `\"` -> `"` could re-interpret a `\`
   // left behind by an earlier pass as the start of a new escape sequence.
@@ -132,6 +132,10 @@ test('round-trip preserves literal escape sequences without double-unescape (reg
     'crlf\\r\\nstuff',        // backslash + "r", backslash + "n"
     'quote\\"inside',         // backslash + quote
     'mixed \\\\ and \\n',     // escaped backslash + escaped \n
+    'tab\tinside',            // tab must be escaped as \t, not emitted raw
+    'backspace\binside',      // valid N-Triples \b escape
+    'formfeed\finside',       // valid N-Triples \f escape
+    'nul\u0000inside',        // remaining controls use \uXXXX
     'plain done',             // baseline, no escapes
   ];
 
@@ -139,13 +143,13 @@ test('round-trip preserves literal escape sequences without double-unescape (reg
     await markPartitionStatus({
       client, importId, partitionKey: 'p1', status, subGraphName: 'meta',
     });
-    // Tiny delay so each event's recordedAt is strictly increasing.
-    await new Promise((r) => setTimeout(r, 2));
+    const state = await loadImportManifest({ client, importId, subGraphName: 'meta' });
+    assert.equal(
+      state.partitions[0].status,
+      status,
+      'latest status string must round-trip byte-for-byte through lit/unquote',
+    );
   }
-
-  const state = await loadImportManifest({ client, importId, subGraphName: 'meta' });
-  assert.equal(state.partitions[0].status, samples[samples.length - 1],
-    'last status string must round-trip byte-for-byte through lit/unquote');
 });
 
 test('pendingPartitions filters out done', () => {
@@ -635,30 +639,43 @@ test('defaultManifestAssertionName sanitizes IRI-unsafe importIds (regression fo
   // `/`, whitespace, and `<>"{}|^\`\\`. `importUri`/`partitionUri` accept
   // those characters via percent-encoding, so a caller can construct
   // valid URIs from an importId that the default assertion-name path
-  // can't actually `create`. The sanitizer maps unsafe runs to `-`, and
-  // refuses outright if no valid characters remain.
+  // can't actually `create`. The sanitizer maps unsafe runs to `-`,
+  // appends a stable hash when the raw id changed, and refuses outright
+  // if no valid characters remain.
   assert.equal(defaultManifestAssertionName('plain-id'), 'import-manifest-plain-id');
-  assert.equal(defaultManifestAssertionName('with/slash'), 'import-manifest-with-slash');
-  assert.equal(defaultManifestAssertionName('  trim me  '), 'import-manifest-trim-me');
-  assert.equal(
+  assert.match(defaultManifestAssertionName('with/slash'), /^import-manifest-with-slash-[0-9a-f]{12}$/);
+  assert.match(defaultManifestAssertionName('  trim me  '), /^import-manifest-trim-me-[0-9a-f]{12}$/);
+  assert.match(
     defaultManifestAssertionName('with"quote<bracket>'),
-    'import-manifest-with-quote-bracket',
+    /^import-manifest-with-quote-bracket-[0-9a-f]{12}$/,
   );
-  assert.equal(
+  assert.match(
     defaultManifestAssertionName('mixed/slash and space'),
-    'import-manifest-mixed-slash-and-space',
+    /^import-manifest-mixed-slash-and-space-[0-9a-f]{12}$/,
   );
-  assert.equal(
+  assert.match(
     defaultManifestAssertionName('--leading-and-trailing--'),
-    'import-manifest-leading-and-trailing',
+    /^import-manifest-leading-and-trailing-[0-9a-f]{12}$/,
+  );
+  assert.notEqual(
+    defaultManifestAssertionName('a/b'),
+    defaultManifestAssertionName('a b'),
+    'different unsafe importIds that sanitize to the same slug must not collide',
   );
 
   // Length cap: prefix is 16 chars, daemon limit is 256, so slug must be
-  // truncated to <=240 chars and the total result must stay <=256.
+  // truncated enough to leave room for the stable hash, and the total
+  // result must stay <=256.
   const longId = 'a'.repeat(500);
   const longResult = defaultManifestAssertionName(longId);
   assert.ok(longResult.length <= 256, `result should fit under 256 chars, got ${longResult.length}`);
   assert.ok(longResult.startsWith('import-manifest-'));
+  assert.match(longResult, /-[0-9a-f]{12}$/);
+  assert.notEqual(
+    defaultManifestAssertionName(`${'a'.repeat(500)}x`),
+    defaultManifestAssertionName(`${'a'.repeat(500)}y`),
+    'long importIds that only differ after the visible cutoff must not collide',
+  );
 
   // No valid characters -> throws with a descriptive error pointing at
   // the explicit-assertionName workaround instead of a cryptic 400 later.
@@ -688,7 +705,7 @@ test('createImportManifest uses sanitized default name for unsafe importIds', as
   assert.equal(createRequests.length, 1);
   assert.equal(
     createRequests[0].body.name,
-    'import-manifest-corpus-2026-q1',
+    defaultManifestAssertionName('corpus/2026-q1'),
     'createImportManifest must send the sanitized assertion name to the daemon',
   );
 

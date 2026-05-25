@@ -409,7 +409,7 @@ loop.
 | Method | Route | Purpose |
 |---|---|---|
 | `POST` | `/api/assertion/<name>/promote-async` | Enqueue. Body: `{ contextGraphId, entities?: [...] \| "all", subGraphName? }`. Returns `202 { jobId, state: "queued", enqueuedAt }`. Returns `409 { existingJobId }` if there is already an active job for the same `(contextGraphId, subGraphName, name)`. |
-| `GET`  | `/api/assertion/promote-async` | List jobs. Query: `state=queued\|running\|failed_retrying\|succeeded\|failed` (repeatable), `contextGraphId=...`, `limit=N`. Returns `{ jobs: [...] }`. |
+| `GET`  | `/api/assertion/promote-async` | List jobs. Query: `state=queued,running,failed_retrying,succeeded,failed` (comma-separated), `contextGraphId=...`, `limit=N`. Returns `{ jobs: [...] }`. |
 | `GET`  | `/api/assertion/promote-async/<jobId>` | Read one job: `state`, `attempt.count`, `commitMarker`, `result`, `attempt.lastError` with `classification: transient\|cap_exceeded\|fatal`. |
 | `DELETE` | `/api/assertion/promote-async/<jobId>` | Cancel a `queued` / `failed_retrying` job. `409` if the job is `running` (let the lease expire). |
 | `POST` | `/api/assertion/promote-async/<jobId>/recover` | Re-queue a `failed` job after fixing whatever was wrong (subdivide an over-large entity set, restart an upstream, etc.). |
@@ -488,7 +488,7 @@ A running import can be inspected without interrupting it:
 ```bash
 # Everything still queued for this context graph
 curl -H "Authorization: Bearer $DKG_TOKEN" \
-  "http://localhost:9200/api/assertion/promote-async?contextGraphId=$CG_ID&state=queued&state=running"
+  "http://localhost:9200/api/assertion/promote-async?contextGraphId=$CG_ID&state=queued,running"
 
 # Anything that failed and is waiting on operator action
 curl -H "Authorization: Bearer $DKG_TOKEN" \

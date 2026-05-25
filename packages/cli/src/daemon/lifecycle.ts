@@ -880,114 +880,110 @@ export async function runDaemonInner(
     if (profileTimer.unref) profileTimer.unref();
 
     const publisherTimer = setTimeout(() => {
-      void startPublisherRuntimeIfEnabled({
-        dataDir: dkgDir(),
-        config,
-        store: agent.store,
-        keypair: agent.wallet.keypair,
-        chainBase: publisherChainBase,
-        ackTransportFactory: () => ({
-          publisherPeerId: agent.peerId,
-          gossipPublish: async (topic: string, data: Uint8Array) => {
-            await agent.gossip.publish(topic, data);
-          },
-          // Route storage-ack + verify-proposal outbound sends through
-          // the Messenger rather than directly through ProtocolRouter
-          // (rc.9 PR-2 wiring). Today this is semantically identical
-          // to the prior `agent.router.send` path — `/dkg/10.0.0/*`
-          // protocols travel `Messenger.sendToPeer` (legacy pass-
-          // through) → `ProtocolRouter.send`. The wiring matters at
-          // Milestone C PR-11 when `/storage-ack` + `/verify-proposal`
-          // migrate to `/dkg/10.0.1/*` and start using
-          // `messenger.sendReliable`, picking up the substrate's
-          // durable outbox + sender-side idempotency without
-          // touching this factory again.
-          //
-          // HIGH RISK gate (rc.9 plan): Milestone C migration of
-          // these protocols MUST include an explicit publishing-flow
-          // integration test covering ACK quorum collection + the
-          // ackTransportFactory hot path before the prefix bump
-          // lands.
-          // rc.9 PR-11: /storage-ack + /verify-proposal migrated to
-          // /dkg/10.0.1/* and now route through messenger.sendReliable
-          // (envelope wrap + sender-side idempotency + durable
-          // outbox). queued surfaces as a thrown transport error so
-          // ACKCollector's MAX_RETRIES loop + per-peer skip semantics
-          // kick in unchanged.
-          sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
-            const sendResult = await agent.messenger.sendReliable(peerId, protocol, data);
-            if (!sendResult.delivered) {
-              throw new Error(`substrate queued (transport): ${sendResult.error}`);
-            }
-            return sendResult.response;
-          },
-          getConnectedCorePeers: () => {
-            const allPeers = agent.node.libp2p
-              .getPeers()
-              .map((p) => p.toString())
-              .filter((id) => id !== agent.peerId);
-            const knownCorePeerIds = (agent as any).knownCorePeerIds as
-              | Set<string>
-              | undefined;
-            if (knownCorePeerIds && knownCorePeerIds.size > 0) {
-              const filtered = allPeers.filter((id) => knownCorePeerIds.has(id));
-              if (filtered.length > 0) return filtered;
-            }
-            return allPeers;
-          },
-          log,
-        }),
-        log,
-      })
-        .then((runtime) => {
+      void (async () => {
+        try {
+          const runtime = await startPublisherRuntimeIfEnabled({
+            dataDir: dkgDir(),
+            config,
+            store: agent.store,
+            keypair: agent.wallet.keypair,
+            chainBase: publisherChainBase,
+            ackTransportFactory: () => ({
+              publisherPeerId: agent.peerId,
+              gossipPublish: async (topic: string, data: Uint8Array) => {
+                await agent.gossip.publish(topic, data);
+              },
+              // Route storage-ack + verify-proposal outbound sends through
+              // the Messenger rather than directly through ProtocolRouter
+              // (rc.9 PR-2 wiring). Today this is semantically identical
+              // to the prior `agent.router.send` path — `/dkg/10.0.0/*`
+              // protocols travel `Messenger.sendToPeer` (legacy pass-
+              // through) → `ProtocolRouter.send`. The wiring matters at
+              // Milestone C PR-11 when `/storage-ack` + `/verify-proposal`
+              // migrate to `/dkg/10.0.1/*` and start using
+              // `messenger.sendReliable`, picking up the substrate's
+              // durable outbox + sender-side idempotency without
+              // touching this factory again.
+              //
+              // HIGH RISK gate (rc.9 plan): Milestone C migration of
+              // these protocols MUST include an explicit publishing-flow
+              // integration test covering ACK quorum collection + the
+              // ackTransportFactory hot path before the prefix bump
+              // lands.
+              // rc.9 PR-11: /storage-ack + /verify-proposal migrated to
+              // /dkg/10.0.1/* and now route through messenger.sendReliable
+              // (envelope wrap + sender-side idempotency + durable
+              // outbox). queued surfaces as a thrown transport error so
+              // ACKCollector's MAX_RETRIES loop + per-peer skip semantics
+              // kick in unchanged.
+              sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
+                const sendResult = await agent.messenger.sendReliable(peerId, protocol, data);
+                if (!sendResult.delivered) {
+                  throw new Error(`substrate queued (transport): ${sendResult.error}`);
+                }
+                return sendResult.response;
+              },
+              getConnectedCorePeers: () => {
+                const allPeers = agent.node.libp2p
+                  .getPeers()
+                  .map((p) => p.toString())
+                  .filter((id) => id !== agent.peerId);
+                const knownCorePeerIds = (agent as any).knownCorePeerIds as
+                  | Set<string>
+                  | undefined;
+                if (knownCorePeerIds && knownCorePeerIds.size > 0) {
+                  const filtered = allPeers.filter((id) => knownCorePeerIds.has(id));
+                  if (filtered.length > 0) return filtered;
+                }
+                return allPeers;
+              },
+              log,
+            }),
+            log,
+          });
           publisherRuntime = runtime;
-        })
-        .catch((err: any) => {
+        } catch (err: any) {
           log(`Async publisher startup failed: ${err?.message ?? String(err)}`);
-        });
-    }, 0);
-    if (publisherTimer.unref) publisherTimer.unref();
+        }
 
-    // Async-promote queue worker (PR #3) — drains the queue introduced
-    // in PR #1 + #2. Until this supervisor is running, jobs sit in
-    // `queued` forever; an operator could still inspect/cancel them
-    // via the HTTP routes. We start AFTER `startPublisherRuntimeIfEnabled`
-    // because the publisher runtime owns the upstream async-lift queue
-    // and we want async-lift recovery to settle before we start
-    // hammering the same triple store with promote retries.
-    //
-    // Unlike the publisher runtime, the promote worker is ON by
-    // default — opt OUT via `config.promoteQueue.enabled: false`. Sizing
-    // knobs (`workerConcurrency`, `pollIntervalMs`,
-    // `heartbeatIntervalMs`, `shutdownTimeoutMs`) all live on the same
-    // block; omitted values use the supervisor defaults (4 / 100ms /
-    // 60s / 30s respectively).
-    const promoteWorkerConfig = config.promoteQueue;
-    if (promoteWorkerConfig?.enabled !== false) {
-      const promoteWorkerTimer = setTimeout(() => {
-        const supervisor = createPromoteWorkerSupervisor({
-          agent,
-          workerConcurrency: promoteWorkerConfig?.workerConcurrency,
-          pollIntervalMs: promoteWorkerConfig?.pollIntervalMs,
-          heartbeatIntervalMs: promoteWorkerConfig?.heartbeatIntervalMs,
-          shutdownTimeoutMs: promoteWorkerConfig?.shutdownTimeoutMs,
-          log: (msg) => log(`[promote-worker] ${msg}`),
-          emitMemoryGraphChanged,
-        });
-        supervisor
-          .start()
-          .then(() => {
+        // Async-promote queue worker (PR #3) — drains the queue introduced
+        // in PR #1 + #2. Until this supervisor is running, jobs sit in
+        // `queued` forever; an operator could still inspect/cancel them
+        // via the HTTP routes. We start only after publisher startup has
+        // settled because the publisher runtime owns the upstream async-lift
+        // queue and may be recovering the same triple store.
+        //
+        // Unlike the publisher runtime, the promote worker is ON by
+        // default — opt OUT via `config.promoteQueue.enabled: false`. Sizing
+        // knobs (`workerConcurrency`, `pollIntervalMs`,
+        // `heartbeatIntervalMs`, `shutdownTimeoutMs`) all live on the same
+        // block; omitted values use the supervisor defaults.
+        const promoteWorkerConfig = config.promoteQueue;
+        daemonState.promoteWorkerEnabled = promoteWorkerConfig?.enabled !== false;
+        if (daemonState.promoteWorkerEnabled) {
+          try {
+            const supervisor = createPromoteWorkerSupervisor({
+              agent,
+              workerConcurrency: promoteWorkerConfig?.workerConcurrency,
+              pollIntervalMs: promoteWorkerConfig?.pollIntervalMs,
+              heartbeatIntervalMs: promoteWorkerConfig?.heartbeatIntervalMs,
+              shutdownTimeoutMs: promoteWorkerConfig?.shutdownTimeoutMs,
+              log: (msg) => log(`[promote-worker] ${msg}`),
+              emitMemoryGraphChanged,
+            });
+            await supervisor.start();
             promoteWorkerSupervisor = supervisor;
             log("Async promote worker supervisor started");
-          })
-          .catch((err: any) => {
+          } catch (err: any) {
+            daemonState.promoteWorkerEnabled = false;
             log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
-          });
-      }, 0);
-      if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
-    } else {
-      log("Async promote worker disabled via config.promoteQueue.enabled=false");
-    }
+          }
+        } else {
+          log("Async promote worker disabled via config.promoteQueue.enabled=false");
+        }
+      })();
+    }, 0);
+    if (publisherTimer.unref) publisherTimer.unref();
   };
 
   log(`PeerId: ${agent.peerId}`);

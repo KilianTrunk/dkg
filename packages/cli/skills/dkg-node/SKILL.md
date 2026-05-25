@@ -624,7 +624,7 @@ The worker runs in-daemon and is **on by default**. Disable per node with `confi
 | Method | Route | Purpose |
 |---|---|---|
 | `POST` | `/api/assertion/{name}/promote-async` | Enqueue a promote. Body: `{ contextGraphId, entities?: [...] \| "all", subGraphName? }`. Returns `202 { jobId, state: "queued", enqueuedAt }`. Returns `409 { existingJobId }` if there is already an active job for the same `(contextGraphId, subGraphName, name)`. |
-| `GET`  | `/api/assertion/promote-async` | List jobs. Query: `state=queued\|running\|failed_retrying\|succeeded\|failed` (repeatable), `contextGraphId=...`, `limit=N`. Returns `{ jobs: [...] }`. |
+| `GET`  | `/api/assertion/promote-async` | List jobs. Query: `state=queued,running,failed_retrying,succeeded,failed` (comma-separated), `contextGraphId=...`, `limit=N`. Returns `{ jobs: [...] }`. |
 | `GET`  | `/api/assertion/promote-async/{jobId}` | Read one job (`state`, `attempt.count`, `commitMarker`, `result`, `attempt.lastError` with `classification: transient\|cap_exceeded\|fatal`). |
 | `DELETE` | `/api/assertion/promote-async/{jobId}` | Cancel a `queued` / `failed_retrying` job. `409` if the job is `running` (let the lease expire). |
 | `POST` | `/api/assertion/promote-async/{jobId}/recover` | Re-queue a `failed` job after the operator has fixed whatever was wrong (subdivided an over-large entity set, restarted an upstream, etc.). |

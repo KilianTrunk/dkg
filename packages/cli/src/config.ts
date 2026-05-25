@@ -370,7 +370,7 @@ export interface DkgConfig {
     workerConcurrency?: number;
     /** Default 100ms. Polling interval per slot. */
     pollIntervalMs?: number;
-    /** Default 60_000ms (1 min). Heartbeat cadence; must be shorter than the queue's 5-min lease. */
+    /** Default 60_000ms (1 min). Must be >0 and shorter than the queue's 5-min lease when enabled. */
     heartbeatIntervalMs?: number;
     /** Default 30_000ms. Max time `stop()` waits for in-flight promotes to drain on shutdown. */
     shutdownTimeoutMs?: number;

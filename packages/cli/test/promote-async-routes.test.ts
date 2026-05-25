@@ -27,6 +27,7 @@ import {
   type PromoteListFilter,
 } from '@origintrail-official/dkg-publisher';
 import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { daemonState } from '../src/daemon/state.js';
 
 describe('promote-async daemon routes', () => {
   let server: Server | undefined;
@@ -44,6 +45,7 @@ describe('promote-async daemon routes', () => {
       idGenerator: () => `job-${++idCounter}`,
       backoff: () => 60_000,
     });
+    daemonState.promoteWorkerEnabled = true;
   });
 
   afterEach(async () => {
@@ -192,6 +194,18 @@ describe('promote-async daemon routes', () => {
     expect(second.status).toBe(409);
     expect(second.body.existingJobId).toBe(first.body.jobId);
     expect(second.body.error).toMatch(/already active/i);
+  });
+
+  it('POST /:name/promote-async returns 503 when the worker is disabled', async () => {
+    daemonState.promoteWorkerEnabled = false;
+    await startRoutes(makeAgent());
+    const r = await post('/api/assertion/my-assertion/promote-async', {
+      contextGraphId: 'graphify',
+      entities: 'all',
+    });
+    expect(r.status).toBe(503);
+    expect(r.body.error).toMatch(/worker is disabled/);
+    expect(await queue.getStats()).toMatchObject({ queued: 0 });
   });
 
   it('POST /:name/promote-async returns 400 on missing contextGraphId', async () => {

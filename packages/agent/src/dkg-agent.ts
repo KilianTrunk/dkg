@@ -7763,34 +7763,11 @@ export class DKGAgent {
       if (numericId <= 0n) return false;
       const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
       if (typeof getAccessPolicy !== 'function') {
-        // Codex PR #637 follow-up: `getContextGraphAccessPolicy` is
-        // an OPTIONAL `ChainAdapter` method, and the prior
-        // `return null` here turned a missing implementation into
-        // UNKNOWN — which the throw at the bottom of
-        // `_resolveEncryptInlinePayload` converted into a hard
-        // "publish access-policy is unknown" failure. That broke
-        // every external / custom adapter that supports V10 publish
-        // but hasn't adopted the access-policy getter yet
-        // (the regression Codex flagged on PRs #637 + #645).
-        //
-        // Local meta already had its shot above (`isPrivateContextGraph`
-        // would have returned `true` for a curated CG the local node
-        // created or joined with policy metadata). If we got here,
-        // either:
-        //   (a) the local node never had local meta for this CG —
-        //       we have no way to know it's curated, so we fall
-        //       through to PUBLIC, restoring v9-era behaviour for
-        //       adapters that pre-date the getter; OR
-        //   (b) the local meta returned `false` (= public). Same
-        //       answer.
-        //
-        // The fail-closed semantic is preserved for the SEPARATE
-        // case "method is implemented but threw" — see the catch
-        // below — because that's an actual policy-lookup failure
-        // (RPC down, contract reverted, etc.) and refusing to choose
-        // plaintext vs encrypted without a verified policy is the
-        // right call there.
-        return false;
+        // Numeric ids are chain-owned policy surfaces. If the adapter
+        // cannot expose chain truth, choosing plaintext would risk a
+        // curated-target leak, so keep the UNKNOWN path and let the
+        // caller fail closed below.
+        return null;
       }
       try {
         const policy = await getAccessPolicy.call(this.chain, numericId);

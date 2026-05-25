@@ -92,6 +92,24 @@ parse_json() {
   "
 }
 
+catchup_peer_error() {
+  printf '%s' "$1" | node -e '
+    let d = "";
+    process.stdin.on("data", c => { d += c; });
+    process.stdin.on("end", () => {
+      try {
+        const j = JSON.parse(d);
+        const results = Array.isArray(j.results) ? j.results : [];
+        const hit = results.find((r) => r && (r.swmError || r.durableError || r.error));
+        const value = hit ? (hit.swmError || hit.durableError || hit.error || "") : "";
+        console.log(value && typeof value === "object" ? JSON.stringify(value) : (value || ""));
+      } catch {
+        process.exit(1);
+      }
+    });
+  '
+}
+
 wait_for_port_open() {
   local node="$1" max="${2:-30}"
   local port; port=$(node_port "$node")
@@ -315,7 +333,7 @@ assert_catchup_clean() {
     fail "$label catchup top-level error: $err — host-catchup path is NOT recovering after unclean restart. Response: $resp"
   fi
   # `results[].swmError` / `.durableError` — first non-empty fail.
-  local swm_err; swm_err=$(parse_json "$resp" '(.results && .results.length) ? (.results.find(r => r && r.swmError) || {}).swmError : ""' 2>/dev/null || echo "")
+  local swm_err; swm_err=$(catchup_peer_error "$resp" 2>/dev/null || echo "")
   if [ -n "$swm_err" ] && [ "$swm_err" != "null" ]; then
     fail "$label catchup per-peer swmError: $swm_err — restarted core is rejecting requests. Response: $resp"
   fi

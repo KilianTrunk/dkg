@@ -229,7 +229,7 @@ export class SwmHostModeStore {
     try {
       entries = await fs.readdir(this.dataDir, { withFileTypes: true });
     } catch {
-      return { orphanLogsRemoved: 0, orphanBytesRemoved: 0, corruptMetasRemoved: 0 };
+      return { orphanLogsRemoved: 0, orphanBytesRemoved: 0 };
     }
     // Codex PR #619 R2: only count a .meta as "healthy pairing
     // candidate" if it parses as valid JSON with a contextGraphId.
@@ -306,11 +306,16 @@ export class SwmHostModeStore {
         // best-effort
       }
     }
-    return {
-      orphanLogsRemoved,
+    const report: SwmHostModeStartupReconcileReport = {
+      // Backwards-compatible aggregate: older callers treat these as
+      // "files/bytes reaped by startup reconcile", including corrupt
+      // .meta files. Keep that contract and expose the split counter
+      // only as an optional drill-down.
+      orphanLogsRemoved: orphanLogsRemoved + corruptMetasRemoved,
       orphanBytesRemoved: orphanBytesRemoved + corruptMetaBytesRemoved,
-      corruptMetasRemoved,
     };
+    if (corruptMetasRemoved > 0) report.corruptMetasRemoved = corruptMetasRemoved;
+    return report;
   }
 
   /**

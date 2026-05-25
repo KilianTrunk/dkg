@@ -50,11 +50,33 @@ import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/
  *
  * Public surface stability (selector-compatible with v2.x):
  *   - The legacy `accounts(uint256)` auto-getter is preserved as an
- *     explicit forwarder over `PublishingConvictionStorage.getAccount`.
+ *     explicit forwarder over the storage contract's auto-generated
+ *     `accounts` mapping getter — INCLUDING the legacy zero-tuple
+ *     return for an unknown `accountId` (it does NOT revert; use
+ *     `getAccount` for the fail-closed variant). See the function
+ *     NatSpec on `accounts(uint256)` below.
  *   - `agentToAccountId(address)`, `topUpBalance(uint256)`,
  *     `windowSpent(uint256, uint40)`, `maxAgentsPerAccount()` are kept
  *     on the wrapper as forwarders so `IDKGPublishingConvictionNFT`,
  *     `KnowledgeAssetsV10`, and `ContextGraphs` need no changes.
+ *
+ * Deliberate breaks in the v2.x → v3.0.0 wrapper bump:
+ *   - PCA state-change events (`AccountCreated`, `ToppedUp`,
+ *     `CostCovered`, `WindowSettled`, `AccountFinalSwept`,
+ *     `AgentRegistered`, `AgentDeregistered`) are emitted by
+ *     `PublishingConviction` (the logic contract), NOT by this
+ *     wrapper. Off-chain consumers that subscribe to PCA state
+ *     changes MUST listen to the `PublishingConviction` address
+ *     (resolved from Hub at `getContractAddress("PublishingConviction")`),
+ *     not this contract's address. This is the architectural
+ *     invariant of the V10 split: the logic contract owns business
+ *     semantics, including events. The 3.0.0 major version bump is
+ *     the deliberate signal of this break — do NOT add wrapper-side
+ *     re-emission to "preserve compatibility"; the canonical
+ *     listening address is the logic contract.
+ *   - The wrapper still emits ERC-721 events (`Transfer`,
+ *     `Approval`, `ApprovalForAll`) from its own address, exactly
+ *     as a normal NFT does — those are NOT moved.
  */
 contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitializable, ERC721Enumerable {
     string private constant _NAME = "DKGPublishingConvictionNFT";
@@ -286,7 +308,24 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     // working unchanged. Each forwarder is a pure read against PCS.
 
     /// @notice Conviction-account record by id. Selector-compatible
-    ///         with the legacy `accounts` public mapping.
+    ///         with the legacy v2.x `accounts` public mapping AND
+    ///         behavior-compatible with it: returns the all-zero
+    ///         tuple for an unknown / unminted `accountId` instead
+    ///         of reverting. Indexers and existence-probe callers
+    ///         that read the legacy mapping continue to work
+    ///         unchanged. Use `getAccount(accountId)` (forwarded
+    ///         from `PublishingConvictionStorage`) for the
+    ///         fail-closed variant that reverts `UnknownAccount`.
+    ///
+    ///         Implemented by forwarding to the storage contract's
+    ///         auto-generated `accounts(accountId)` mapping getter,
+    ///         not `getAccount(accountId)`, precisely so the unknown-
+    ///         id branch keeps the legacy zero-tuple semantic. Codex
+    ///         round 3 review on PR #650 flagged the prior
+    ///         `getAccount(...)` forwarder as an observable behavior
+    ///         break vs the legacy public mapping; this regression
+    ///         is locked in by `accounts(unknown id) returns zero
+    ///         tuple` in `DKGPublishingConvictionNFT.test.ts`.
     function accounts(uint256 accountId) external view returns (
         uint96 committedTRAC,
         uint40 createdAtEpoch,
@@ -298,19 +337,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         uint16 lastSettledWindow,
         bool fullySwept
     ) {
-        PublishingConvictionStorage.Account memory a =
-            publishingConvictionStorage.getAccount(accountId);
-        return (
-            a.committedTRAC,
-            a.createdAtEpoch,
-            a.expiresAtEpoch,
-            a.createdAtTimestamp,
-            a.expiresAtTimestamp,
-            a.lockDurationEpochs,
-            a.discountBps,
-            a.lastSettledWindow,
-            a.fullySwept
-        );
+        return publishingConvictionStorage.accounts(accountId);
     }
 
     /// @notice Per-billing-window TRAC drawn against the base

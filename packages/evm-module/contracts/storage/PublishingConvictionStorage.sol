@@ -20,8 +20,24 @@ import {HubDependent} from "../abstract/HubDependent.sol";
  *     struct keyed by `accountId`, per-billing-window TRAC accounting
  *     (`windowSpent`), the persistent top-up buffer (`topUpBalance`), the
  *     agent registration tables, and the governance-tunable
- *     `maxAgentsPerAccount` cap. State migrates here from the legacy
- *     stateful `DKGPublishingConvictionNFT` v2.x.
+ *     `maxAgentsPerAccount` cap.
+ *
+ *     This is a fresh-state contract: it ships EMPTY at deploy time
+ *     and there is NO automated migration path that copies state out
+ *     of the legacy combined `DKGPublishingConvictionNFT` v2.x. PCA
+ *     accounts opened against the v2.x contract are NOT readable here
+ *     after the upgrade. This is intentional and matches how the V10
+ *     line has handled prior storage-split redeploys
+ *     (`ProfileStorage`, `ParametersStorage`): network operators bump
+ *     `chainResetMarker` in the network config so daemons auto-wipe
+ *     their derived chain state on next start, the on-chain Hub
+ *     re-points consumers (`KnowledgeAssetsV10`, `ContextGraphs`) at
+ *     this contract, and the publisher fleet re-creates conviction
+ *     accounts under the new wrapper. PR #650 ships the
+ *     `chainResetMarker` bump alongside this storage contract; do
+ *     NOT deploy the new PCA stack against a network without the
+ *     accompanying marker bump. See `network/testnet.json` and the
+ *     PR body's "Migration / fresh-state reset" section.
  *   - `PublishingConviction` (the new logic contract) holds zero
  *     application state — only Hub-resolved contract references and
  *     metadata. It reads/writes here via `onlyContracts`-gated mutators

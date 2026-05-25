@@ -1334,4 +1334,165 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       expect(await NFT.maxAgentsPerAccount()).to.equal(100n);
     });
   });
+
+  // PR #650 / Codex round-3 review: regressions that pin the post-split
+  // public surface invariants of the V10 publisher-conviction wrapper.
+  // Both items here were behavior-compat issues raised in the review of
+  // the storage / logic / wrapper split — keep them explicit so any
+  // future refactor that re-introduces them fails loudly.
+  describe('PR #650 regressions: post-split wrapper invariants', () => {
+    it("accounts(unknownId) returns the legacy zero tuple — does NOT revert (v2.x ABI compat)", async () => {
+      // The legacy v2.x `accounts` public mapping returned the all-zero
+      // Account record for an unknown id. After the split, the wrapper's
+      // `accounts(uint256)` is an explicit forwarder; an early Codex
+      // review caught it routing through `getAccount(...)` instead, which
+      // reverts `UnknownAccount`. That is an observable behavior break
+      // for indexers and existence probes that read the legacy mapping.
+      //
+      // The wrapper now forwards to the storage contract's auto-generated
+      // `accounts(uint256)` mapping getter so the unknown-id branch keeps
+      // its zero-tuple semantic. This test pins that contract.
+      const unknownId = 99999n;
+      const tup = await NFT.accounts(unknownId);
+      // `Account` struct field order, projected through the auto-getter:
+      //   committedTRAC, createdAtEpoch, expiresAtEpoch,
+      //   createdAtTimestamp, expiresAtTimestamp, lockDurationEpochs,
+      //   discountBps, lastSettledWindow, fullySwept
+      expect(tup[0]).to.equal(0n); // committedTRAC
+      expect(tup[1]).to.equal(0n); // createdAtEpoch
+      expect(tup[2]).to.equal(0n); // expiresAtEpoch
+      expect(tup[3]).to.equal(0n); // createdAtTimestamp
+      expect(tup[4]).to.equal(0n); // expiresAtTimestamp
+      expect(tup[5]).to.equal(0n); // lockDurationEpochs
+      expect(tup[6]).to.equal(0n); // discountBps
+      expect(tup[7]).to.equal(0n); // lastSettledWindow
+      expect(tup[8]).to.equal(false); // fullySwept
+    });
+
+    it("getAccount(unknownId) DOES revert UnknownAccount — fail-closed variant is still available", async () => {
+      // Symmetric pin: callers that intentionally want fail-closed
+      // semantics (e.g. internal helpers that should not silently
+      // operate on a zero account) still have `getAccount` to call.
+      const unknownId = 99999n;
+      await expect(StorageContract.getAccount(unknownId))
+        .to.be.revertedWithCustomError(StorageContract, 'UnknownAccount')
+        .withArgs(unknownId);
+    });
+
+    it("accounts(knownId) returns the same tuple as getAccount(knownId) for an existing account", async () => {
+      // Sanity check that the auto-getter forwarder is wire-compatible
+      // with `getAccount` for the ordinary in-range case — only the
+      // unknown-id branch differs.
+      const amount = hre.ethers.parseEther('100000');
+      await TokenContract.approve(await NFT.getAddress(), amount);
+      await NFT.createAccount(amount);
+
+      const tup = await NFT.accounts(1);
+      const struct = await StorageContract.getAccount(1);
+
+      expect(tup[0]).to.equal(struct.committedTRAC);
+      expect(tup[1]).to.equal(struct.createdAtEpoch);
+      expect(tup[2]).to.equal(struct.expiresAtEpoch);
+      expect(tup[3]).to.equal(struct.createdAtTimestamp);
+      expect(tup[4]).to.equal(struct.expiresAtTimestamp);
+      expect(tup[5]).to.equal(struct.lockDurationEpochs);
+      expect(tup[6]).to.equal(struct.discountBps);
+      expect(tup[7]).to.equal(struct.lastSettledWindow);
+      expect(tup[8]).to.equal(struct.fullySwept);
+    });
+
+    it('PCA state-change events fire from PublishingConviction (logic), NOT from the NFT wrapper', async () => {
+      // Deliberate v2.x → v3.0.0 break for PR #650. The combined v2.x
+      // `DKGPublishingConvictionNFT` emitted PCA business events
+      // (AccountCreated, ToppedUp, CostCovered, AccountFinalSwept,
+      // AgentRegistered/Deregistered, WindowSettled) from the wrapper
+      // address. Post-split, those events live on the logic contract
+      // — the wrapper's ABI does not declare them. Off-chain consumers
+      // MUST listen on `PublishingConviction` (resolved via Hub).
+      //
+      // This test pins the architectural invariant: every PCA event
+      // log raised during a `createAccount` + `topUp` flow is emitted
+      // by the logic contract, never by the wrapper. ERC-721 events
+      // (Transfer/Approval) are still emitted by the wrapper — those
+      // are not part of the PCA state-change set and are not moved.
+      const amount = hre.ethers.parseEther('60000');
+      await TokenContract.approve(await NFT.getAddress(), amount * 2n);
+
+      const logicAddr = (LogicContract.target as string).toLowerCase();
+      const wrapperAddr = (NFT.target as string).toLowerCase();
+      const logicAbi = LogicContract.interface;
+      const pcaEventNames = [
+        'AccountCreated',
+        'ToppedUp',
+        'CostCovered',
+        'WindowSettled',
+        'AccountFinalSwept',
+        'AgentRegistered',
+        'AgentDeregistered',
+      ];
+
+      // Helper that walks a tx receipt and asserts every parseable PCA
+      // event log was emitted by the logic contract — and never by the
+      // wrapper. ERC-721 events from the wrapper and ERC-20 Transfer
+      // events from the token won't parse against the logic ABI and
+      // are correctly skipped.
+      const assertPcaEventsFromLogic = (
+        receipt: { logs: ReadonlyArray<{ address: string; topics: ReadonlyArray<string>; data: string }> },
+        expectedEventNames: ReadonlyArray<string>,
+      ) => {
+        const seen = new Set<string>();
+        for (const log of receipt.logs) {
+          try {
+            const parsed = logicAbi.parseLog({
+              topics: [...log.topics],
+              data: log.data,
+            });
+            if (parsed && pcaEventNames.includes(parsed.name)) {
+              expect(
+                log.address.toLowerCase(),
+                `${parsed.name} must be emitted by the logic contract, not the wrapper`,
+              ).to.equal(logicAddr);
+              expect(
+                log.address.toLowerCase(),
+                `${parsed.name} must NOT be emitted by the NFT wrapper`,
+              ).to.not.equal(wrapperAddr);
+              seen.add(parsed.name);
+            }
+          } catch {
+            // Not a logic-contract event — skip.
+          }
+        }
+        for (const expected of expectedEventNames) {
+          expect(
+            seen.has(expected),
+            `expected ${expected} to fire from the logic contract`,
+          ).to.equal(true);
+        }
+      };
+
+      // 1) createAccount → AccountCreated must come from logic.
+      const createTx = await NFT.createAccount(amount);
+      const createReceipt = await createTx.wait();
+      assertPcaEventsFromLogic(createReceipt!, ['AccountCreated']);
+
+      // 2) topUp → ToppedUp must come from logic.
+      const topUpTx = await NFT.topUp(1, amount);
+      const topUpReceipt = await topUpTx.wait();
+      assertPcaEventsFromLogic(topUpReceipt!, ['ToppedUp']);
+
+      // 3) Architectural negative pin: the wrapper's ABI MUST NOT
+      //    declare PCA events. If anyone re-introduces a re-emission
+      //    shim on the wrapper to "preserve compatibility", this
+      //    assertion fails at the type-system level.
+      const wrapperEventNames = NFT.interface.fragments
+        .filter((f) => f.type === 'event')
+        .map((f) => (f as { name: string }).name);
+      for (const name of pcaEventNames) {
+        expect(
+          wrapperEventNames,
+          `wrapper ABI must not declare PCA event ${name} (architectural invariant)`,
+        ).to.not.include(name);
+      }
+    });
+  });
 });

@@ -902,7 +902,7 @@ export async function runDaemonInner(
               .join(', ')}. ` +
             (allowDegraded
               ? `Set core.allowDegradedRelay: false in ~/.dkg/config.json to refuse-to-boot on this state. ` +
-                `See docs/operator/CORE_RELAY_PREREQS.md for the full rationale.`
+                `See docs/specs/SPEC_RELAY_DISCOVERY.md for the full rationale.`
               : `Refusing to boot. Set core.allowDegradedRelay: true to downgrade this to a warning.`),
         );
         if (!allowDegraded) {

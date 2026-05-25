@@ -188,6 +188,7 @@ function classifyIPv6(ipRaw: string): AddrClassification {
  */
 function bestClassAmongInterfaces(
   ifs: ReadonlyArray<NetworkInterfaceInfo>,
+  family: 'IPv4' | 'IPv6',
 ): AddrClassification {
   let best: AddrClassification = 'wildcardNoPublicInterface';
   const RANK: Record<AddrClassification, number> = {
@@ -204,6 +205,7 @@ function bestClassAmongInterfaces(
   };
   for (const i of ifs) {
     if (i.internal) continue;
+    if (i.family !== family) continue;
     const klass = i.family === 'IPv6' ? classifyIPv6(i.address) : classifyIPv4(i.address);
     if (RANK[klass] > RANK[best]) best = klass;
   }
@@ -232,12 +234,12 @@ export function classifyMultiaddr(
   }
 
   if (proto === 'ip4') {
-    if (value === '0.0.0.0') return bestClassAmongInterfaces(hostInterfaces);
+    if (value === '0.0.0.0') return bestClassAmongInterfaces(hostInterfaces, 'IPv4');
     return classifyIPv4(value);
   }
 
   if (proto === 'ip6') {
-    if (value === '::') return bestClassAmongInterfaces(hostInterfaces);
+    if (value === '::') return bestClassAmongInterfaces(hostInterfaces, 'IPv6');
     return classifyIPv6(value);
   }
 
@@ -269,7 +271,13 @@ export function checkCoreRelayPrereqs(
   const announcePublic = announceAddresses.some(
     (a) => classifyMultiaddr(a, hostInterfaces) === 'public',
   );
-  const announceRescues = listenAddresses.length > 0 && announcePublic;
+  const announceCanServe = classified.some(
+    (c) => c.class === 'dns'
+      || c.class === 'rfc1918'
+      || c.class === 'cgnat'
+      || c.class === 'ulaIpv6',
+  );
+  const announceRescues = announceCanServe && announcePublic;
 
   const looksDegraded = nodeRole === 'core'
     && publicListenAddresses.length === 0

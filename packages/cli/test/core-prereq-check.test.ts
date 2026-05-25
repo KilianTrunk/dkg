@@ -20,6 +20,15 @@ const PUBLIC_IPV4_IFACE: NetworkInterfaceInfo = {
   cidr: '203.0.113.5/24',
 };
 
+const PUBLIC_IPV6_IFACE: NetworkInterfaceInfo = {
+  address: '2001:db8::5',
+  netmask: 'ffff:ffff:ffff:ffff::',
+  family: 'IPv6',
+  mac: '00:00:00:00:00:00',
+  internal: false,
+  cidr: '2001:db8::5/64',
+};
+
 const RFC1918_IFACE: NetworkInterfaceInfo = {
   address: '192.168.1.42',
   netmask: '255.255.255.0',
@@ -111,8 +120,13 @@ describe('classifyMultiaddr — wildcards delegate to host interfaces', () => {
   });
 
   it("IPv6 :: wildcard delegates to host interfaces the same way IPv4 0.0.0.0 does", () => {
-    expect(classifyMultiaddr('/ip6/::/tcp/4001', [PUBLIC_IPV4_IFACE])).toBe('public');
+    expect(classifyMultiaddr('/ip6/::/tcp/4001', [PUBLIC_IPV6_IFACE])).toBe('public');
     expect(classifyMultiaddr('/ip6/::/tcp/4001', [])).toBe('wildcardNoPublicInterface');
+  });
+
+  it("IPv4 and IPv6 wildcards only consider interfaces from the matching family", () => {
+    expect(classifyMultiaddr('/ip4/0.0.0.0/tcp/4001', [PUBLIC_IPV6_IFACE])).toBe('wildcardNoPublicInterface');
+    expect(classifyMultiaddr('/ip6/::/tcp/4001', [PUBLIC_IPV4_IFACE])).toBe('wildcardNoPublicInterface');
   });
 });
 
@@ -232,6 +246,17 @@ describe('checkCoreRelayPrereqs — additional safety cases', () => {
     });
     expect(result.looksDegraded).toBe(true);
     expect(result.reasons).toContain('listenAddresses is empty');
+  });
+
+  it('loopback listenAddresses stay degraded even when announceAddresses contains a public address', () => {
+    const result = checkCoreRelayPrereqs({
+      listenAddresses: ['/ip4/127.0.0.1/tcp/4001'],
+      hostInterfaces: [LOOPBACK_IFACE],
+      announceAddresses: ['/ip4/203.0.113.5/tcp/4001'],
+      nodeRole: 'core',
+    });
+    expect(result.looksDegraded).toBe(true);
+    expect(result.nonRoutableAddresses[0].class).toBe('loopback');
   });
 
   it('mixed degraded classes summarise in a single reason line (cgnat + rfc1918 + loopback)', () => {

@@ -845,24 +845,30 @@ describe('@unit RandomSampling', () => {
 
     /**
      * Create a Context Graph via the storage directly and return its id.
-     * Policy: 0 = curated (private for Phase 10), 1 = open.
+     * Policy arg: 0 = curated (private for Phase 10 / RFC-39), 1 = open.
+     *
+     * Codex PR #630 R1 #1325 (cherry-picked from C2): `getIsCurated()` was
+     * re-anchored from `publishPolicy == 0` to `accessPolicy != 0`. The
+     * Phase 10 picker (step 2 of `_pickWeightedChallenge`) calls
+     * `getIsCurated()` to decide whether to apply the per-KC ciphertext-
+     * commitment filter. So the arg this helper takes — semantically
+     * "should this CG be treated as curated?" — now drives `accessPolicy`
+     * and we keep `publishPolicy` open in both branches (the picker
+     * doesn't read `publishPolicy`; an open publish policy keeps the
+     * fixture simple and avoids needing an authority signature).
      */
-    async function createCG(publishPolicy: number): Promise<bigint> {
+    async function createCG(curatedPolicy: number): Promise<bigint> {
       const owner = accounts[1].address;
-      const authority =
-        publishPolicy === CURATED_POLICY
-          ? accounts[2].address
-          : ethers.ZeroAddress;
+      const accessPolicy = curatedPolicy === CURATED_POLICY ? 1 : 0;
       const tx = await ContextGraphStorage.connect(opSigner).createContextGraph(
         owner,
-        [10n, 20n, 30n], // hosting nodes (sorted, non-zero, distinct)
         [], // no participant agents
-        2, // requiredSignatures
         0, // metadataBatchId
-        0, // accessPolicy = public/discoverable
-        publishPolicy,
-        authority,
+        accessPolicy,
+        1, // publishPolicy = open (picker doesn't read this; keeps fixture simple)
+        ethers.ZeroAddress, // publishAuthority — unused with open publish policy
         0, // publishAuthorityAccountId
+        ethers.ZeroHash, // nameHash (integration branch post-PR #595)
       );
       await tx.wait();
       return ContextGraphStorage.getLatestContextGraphId();
@@ -974,10 +980,21 @@ describe('@unit RandomSampling', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Test 2 — Edge: no eligible value at all (no CGs or every CG is curated)
-    // => revert with NoEligibleContextGraph.
+    // Test 2 — Edge: only-curated-CG-holds-value scenario.
+    //
+    // RFC-39 Phase B (deferred): the curated-CG eligibility branch in
+    // `_isCGEligible` is currently a hard skip until the off-chain prover
+    // learns to fetch `getCiphertextChunkCount` + `getCiphertextChunksRoot`
+    // and build proofs against ciphertext chunks. With curated CGs filtered
+    // at the CG-level, the only-curated scenario falls through to
+    // `adjustedTotal == 0` on the first attempt and reverts
+    // `NoEligibleContextGraph` (the pre-RFC-39 behaviour). When the prover
+    // ciphertext path lands and the eligibility filter is removed, this
+    // test should be flipped back to expect `NoEligibleKnowledgeCollection`
+    // — see the corresponding `describe.skip` in
+    // `RandomSampling-curated.test.ts`.
     // -----------------------------------------------------------------------
-    it('reverts NoEligibleContextGraph when only curated CGs hold value', async () => {
+    it('reverts NoEligibleContextGraph when only curated CGs hold value (Phase B picker skip)', async () => {
       const curatedCgId = await createCG(CURATED_POLICY);
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
       await createKC(curatedCgId, endEpoch);
@@ -993,10 +1010,26 @@ describe('@unit RandomSampling', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Test 3 — Private CG coexists with a public CG: private must be excluded
-    // and the public CG must win 100% of draws.
+    // Test 3 — Mixed-curation scenario: curated CG (no commitment) coexists
+    // with a public CG.
+    //
+    // RFC-39 Phase A.5 behaviour: curated CGs participate in the CG-level
+    // lottery; the per-KC ciphertext-commitment gate is what keeps legacy
+    // (pre-LU-11) curated KCs out of the curated draw.
+    //
+    // Codex PR #630 R1 #3 added a bounded outer CG-retry to
+    // `_pickWeightedChallenge` so a single high-value legacy curated CG
+    // can't DoS the entire sampling tick. With this retry, the picker
+    // self-heals when it lands on a curated CG whose KCs are all
+    // uncommitted: it marks that CG exhausted, re-draws against the
+    // remaining eligible CGs, and falls through to the public CG. So
+    // even though the curated CG carries 10× the weight, all 25 draws
+    // succeed and EVERY successful draw must land on the public CG/KC
+    // (a success on the curated branch would mean the per-KC commitment
+    // filter is leaking and `setCiphertextChunksCommitment` is no longer
+    // a prerequisite for inclusion in the curated lottery).
     // -----------------------------------------------------------------------
-    it('excludes curated CGs and always picks the public CG', async () => {
+    it('skips curated KCs without ciphertext commitment; CG-retry fallback routes every draw to the public CG', async () => {
       const curatedCg = await createCG(CURATED_POLICY);
       const openCg = await createCG(OPEN_POLICY);
 
@@ -1004,9 +1037,11 @@ describe('@unit RandomSampling', () => {
       await createKC(curatedCg, endEpoch);
       const openKc = await createKC(openCg, endEpoch);
 
-      // Private CG holds 10x the value of the public CG. Weighting would
-      // prefer the private one by naive ratio, so this test asserts the
-      // read-time exclusion filter.
+      // Curated CG holds 10x the value of the public CG. Pre-R1 the picker
+      // would have reverted on every curated-weighted draw; post-R1 the
+      // outer CG-retry exhausts the curated CG and falls back to the
+      // public one. The per-KC commitment filter is still what guarantees
+      // the curated KC never gets picked (only public KCs survive step 2).
       await seedCGValue(curatedCg, 10_000n);
       await seedCGValue(openCg, 1_000n);
 
@@ -1016,6 +1051,9 @@ describe('@unit RandomSampling', () => {
           testSeed(i),
           currentEpoch,
         );
+        // Every successful draw MUST be the public CG / public KC. A
+        // success on the curated branch would mean the per-KC commitment
+        // filter is leaking.
         expect(preview.cgId).to.equal(openCg);
         expect(preview.kcId).to.equal(openKc);
       }

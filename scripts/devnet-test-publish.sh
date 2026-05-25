@@ -7,30 +7,29 @@
 #                                 identities registered, stake + ask set).
 #
 # What this does:
-#   1. Reads ContextGraphs / ContextGraphStorage / IdentityStorage /
-#      KnowledgeCollectionStorage addresses from
-#      packages/evm-module/deployments/localhost_contracts.json.
-#   2. Discovers hosting-node identity ids by reading each devnet node's
-#      .devnet/nodeN/wallets.json, deriving the operational wallet[0]
-#      address, and querying IdentityStorage.getIdentityId(opAddress).
-#      Pre-PR #366 the operational + admin keys were the same Hardhat
-#      signer, so iterating provider.listAccounts() worked. Post-PR #366
-#      identities are registered against random operational wallets only,
-#      so Hardhat signers no longer resolve to any identity.
-#   3. Creates a fresh open-policy V10 context graph on-chain via
-#      ContextGraphs.createContextGraph(hostingNodes, [], 1, 0, 0, 1, ZeroAddress, 0).
-#      Uses staticCall to preview the returned numeric cgId, then sends the
-#      real tx. Falls back to parsing ContextGraphStorage.ContextGraphCreated
-#      from the receipt if preview fails.
-#   4. Writes a single N-Quad into a tmp file under the new CG URI.
-#   5. Invokes the CLI `dkg publish <cgId> --file <tmp>` via DKG_HOME=.devnet/node1.
-#   6. Tails .devnet/node1/daemon.log for a line matching
+#   1. Reads ContextGraphs / ContextGraphStorage / KnowledgeCollectionStorage
+#      addresses from packages/evm-module/deployments/localhost_contracts.json.
+#   2. Creates a fresh open-policy V10 context graph on-chain via
+#      ContextGraphs.createContextGraph([], 0, 0, 1, ZeroAddress, 0)
+#      — participantAgents=[] (open), metadataBatchId=0, accessPolicy=0
+#      (public), publishPolicy=1 (open), no publish authority. Per
+#      SPEC_CG_MEMORY_MODEL, the contract no longer accepts hostingNodes
+#      or per-CG requiredSignatures: hosting comes from the sharding table
+#      at publish time and the ACK quorum is the system parameter
+#      parametersStorage.minimumRequiredSignatures().
+#      Uses staticCall to preview the returned numeric cgId, then sends
+#      the real tx. Falls back to parsing
+#      ContextGraphStorage.ContextGraphCreated from the receipt if preview
+#      fails.
+#   3. Writes a single N-Quad into a tmp file under the new CG URI.
+#   4. Invokes the CLI `dkg publish <cgId> --file <tmp>` via DKG_HOME=.devnet/node1.
+#   5. Tails .devnet/node1/daemon.log for a line matching
 #      "On-chain confirmed: UAL=... batchId=N tx=0x..." (format from
 #      dkg-publisher.ts:1252). Extracts batchId + tx.
-#   7. Verifies the KC is readable back via
+#   6. Verifies the KC is readable back via
 #      KnowledgeCollectionStorage.getKnowledgeCollectionMetadata(batchId) —
 #      merkleRoots array non-empty and byteSize > 0.
-#   8. Exits 0 on success with "Published KC id=N tx=0x..."; non-zero otherwise.
+#   7. Exits 0 on success with "Published KC id=N tx=0x..."; non-zero otherwise.
 #
 # Scope:
 #   publishDirect only. Conviction-path `publish` and `update`/`updateDirect`
@@ -45,9 +44,6 @@ NODE_NUM="${DEVNET_TEST_NODE:-1}"
 API_PORT_BASE=9201
 API_PORT=$((API_PORT_BASE + NODE_NUM - 1))
 CONFIRM_TIMEOUT="${CONFIRM_TIMEOUT:-60}"
-# Match scripts/devnet.sh's default node count when probing for hosting-node
-# identities. Override if you start devnet with a different size.
-HOSTING_NODE_COUNT="${HOSTING_NODE_COUNT:-6}"
 
 CONTRACTS_JSON="$REPO_ROOT/packages/evm-module/deployments/localhost_contracts.json"
 EVM_ABI_DIR="$REPO_ROOT/packages/evm-module/abi"
@@ -87,148 +83,54 @@ done
 
 log "Preconditions OK (hardhat pid=$HARDHAT_PID, node $NODE_NUM pid=$NODE_PID, api :$API_PORT)"
 
-# --- 2. Create V10 context graph ---------------------------------------------
+# --- 2. Create + register V10 context graph via the daemon -------------------
+#
+# Previous revision called `ContextGraphs.createContextGraph(...)` directly
+# from a hardhat signer. That mints an on-chain CG owned by a wallet the
+# daemon does not control, so the subsequent `dkg context-graph register
+# <id>` call (run against that numeric id) creates a SECOND on-chain CG
+# under the daemon's wallet rather than binding the existing one. The
+# publish then targets the orphan and fails with "not registered on-chain".
+#
+# The publish flow expects the daemon to OWN the CG it publishes to (the
+# author signature on the finalized assertion has to chain back to the
+# on-chain CG curator/creator). So we just use the daemon's own CLI:
+#   1. `context-graph create <slug>` creates a local CG name.
+#   2. `context-graph register <slug>` mints the on-chain CG under the
+#      daemon's EOA and binds the local name to the numeric id.
+# The RDF data graph URI is `did:dkg:context-graph:<slug>` (the publisher
+# resolves the slug → on-chain id internally before computing leaves).
+#
+# Slug is timestamped so reruns within the same devnet session don't
+# collide with prior CGs.
 
-log "Creating fresh V10 context graph via ContextGraphs.createContextGraph..."
+CG_SLUG="v10-publish-smoke-$(date +%s)"
+log "Creating local CG '$CG_SLUG' via daemon CLI..."
+# `context-graph create` auto-namespaces bare slugs to
+# `{agentAddress}/{slug}` (see cli.ts → contextGraphCmd.command('create')).
+# Capture the post-namespacing id from the "ID:" line so register and
+# publish use the fully-qualified form the daemon registry actually
+# stores.
+CREATE_OUT=$(DKG_HOME="$NODE_DIR" node "$CLI_JS" context-graph create "$CG_SLUG" \
+  --name "V10 publishDirect smoke" \
+  --description "Auto-created by scripts/devnet-test-publish.sh") \
+  || fail "context-graph create failed"
+CG_FQ_ID=$(printf '%s\n' "$CREATE_OUT" | sed -nE 's/^[[:space:]]*ID:[[:space:]]+(.+)$/\1/p' | head -n1)
+[ -n "$CG_FQ_ID" ] || fail "could not parse CG id from create output:\n$CREATE_OUT"
+log "Local CG id = $CG_FQ_ID"
 
-CG_ID=$(
-  cd "$REPO_ROOT/packages/evm-module" && \
-  RPC_URL="http://127.0.0.1:${HARDHAT_PORT}" \
-  CONTRACTS_JSON="$CONTRACTS_JSON" \
-  ABI_DIR="$EVM_ABI_DIR" \
-  DEVNET_DIR="$DEVNET_DIR" \
-  HOSTING_NODE_COUNT="$HOSTING_NODE_COUNT" \
-  node -e '
-const { ethers } = require("ethers");
-const fs = require("fs");
-const path = require("path");
-
-(async () => {
-  const rpc = process.env.RPC_URL;
-  const contractsPath = process.env.CONTRACTS_JSON;
-  const abiDir = process.env.ABI_DIR;
-
-  const provider = new ethers.JsonRpcProvider(rpc);
-  const deployer = await provider.getSigner(0);
-
-  const contracts = JSON.parse(fs.readFileSync(contractsPath, "utf8")).contracts;
-  const cgAddr        = contracts.ContextGraphs?.evmAddress;
-  const cgStorageAddr = contracts.ContextGraphStorage?.evmAddress;
-  const identityAddr  = contracts.IdentityStorage?.evmAddress;
-  if (!cgAddr)        throw new Error("ContextGraphs not deployed");
-  if (!cgStorageAddr) throw new Error("ContextGraphStorage not deployed");
-  if (!identityAddr)  throw new Error("IdentityStorage not deployed");
-
-  const loadAbi = (name) => JSON.parse(fs.readFileSync(path.join(abiDir, name + ".json"), "utf8"));
-  const identityAbi  = loadAbi("IdentityStorage");
-  const cgAbi        = loadAbi("ContextGraphs");
-  const cgStorageAbi = loadAbi("ContextGraphStorage");
-
-  // Discover hosting-node identity ids by reading each devnet nodes
-  // wallets.json file and querying IdentityStorage against the operational
-  // wallet[0] address. PR #366 separated admin and operational keys: the
-  // identity is registered against the operational key, not the Hardhat
-  // signer that funded the node. NOTE: avoid an apostrophe in this comment;
-  // the entire JS body lives inside bashs `node -e ...` single-quoted arg,
-  // so any apostrophe here would close the bash quoting prematurely.
-  const identity = new ethers.Contract(identityAddr, identityAbi, provider);
-  const devnetDir = process.env.DEVNET_DIR;
-  const hostingCount = Number(process.env.HOSTING_NODE_COUNT || "6");
-  if (!devnetDir) throw new Error("DEVNET_DIR not set");
-  // Distinguish FILE-level failures (missing/malformed wallets.json —
-  // unexpected post-bootstrap, treat as fatal) from NO-IDENTITY (edge
-  // nodes have valid wallets.json but no on-chain identity by design,
-  // so this is silently expected). Without this split, a corrupt
-  // wallets.json on one core node would silently shrink the roster
-  // and let the smoke test pass against fewer hosting nodes than
-  // intended. Codex follow-up to PR #368.
-  const ids = [];
-  const failures = [];
-  for (let i = 1; i <= hostingCount; i++) {
-    const walletsPath = path.join(devnetDir, "node" + i, "wallets.json");
-    if (!fs.existsSync(walletsPath)) {
-      failures.push("node " + i + ": missing " + walletsPath);
-      continue;
-    }
-    let opAddr;
-    try {
-      const w = JSON.parse(fs.readFileSync(walletsPath, "utf8"));
-      const op0 = Array.isArray(w.wallets) ? w.wallets[0] : null;
-      if (!op0 || !op0.privateKey) {
-        failures.push("node " + i + ": wallets.json has no wallets[0].privateKey");
-        continue;
-      }
-      opAddr = new ethers.Wallet(op0.privateKey).address;
-    } catch (e) {
-      failures.push("node " + i + ": failed to parse wallets.json: " + (e?.message || e));
-      continue;
-    }
-    const id = await identity.getIdentityId(opAddr);
-    if (id > 0n) ids.push(id);
-    // No identity → edge node, by design (dkg-agent.ts skips
-    // ensureProfile for effectiveRole==='edge'). Silent skip is
-    // intentional here.
-  }
-  if (failures.length > 0) {
-    throw new Error("hosting-node discovery failures (refusing partial roster):\n  " + failures.join("\n  "));
-  }
-  if (ids.length === 0) {
-    throw new Error("no hosting-node identities found — devnet identity registration may still be pending");
-  }
-  ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  console.error("hosting-node identity ids: [" + ids.map(String).join(", ") + "]");
-
-  const cg        = new ethers.Contract(cgAddr, cgAbi, deployer);
-  const cgStorage = new ethers.Contract(cgStorageAddr, cgStorageAbi, provider);
-
-  // Open policy, requiredSignatures=1, no metadata, no curator, no authority.
-  const args = [
-    ids,                    // uint72[] hostingNodes
-    [],                     // address[] participantAgents (open — no curator list)
-    1,                      // uint8 requiredSignatures  (contract needs > 0)
-    0,                      // uint256 metadataBatchId  (none)
-    0,                      // uint8 accessPolicy       (0 = public/discoverable)
-    1,                      // uint8 publishPolicy      (1 = open)
-    ethers.ZeroAddress,     // address publishAuthority  (open rejects non-zero)
-    0,                      // uint256 publishAuthorityAccountId (open rejects non-zero)
-  ];
-
-  // Preview cgId via staticCall, fall back to event parsing if needed.
-  let previewId = null;
-  try {
-    previewId = await cg.createContextGraph.staticCall(...args);
-    console.error("staticCall preview: cgId=" + previewId);
-  } catch (e) {
-    console.error("staticCall preview failed: " + (e?.shortMessage || e?.message || e));
-  }
-
-  const tx = await cg.createContextGraph(...args);
-  const receipt = await tx.wait();
-
-  let cgId = previewId;
-  if (cgId == null) {
-    const topic = cgStorage.interface.getEvent("ContextGraphCreated").topicHash;
-    for (const lg of receipt.logs) {
-      if (lg.address.toLowerCase() !== cgStorageAddr.toLowerCase()) continue;
-      if (lg.topics[0] !== topic) continue;
-      const parsed = cgStorage.interface.parseLog(lg);
-      cgId = parsed.args.contextGraphId;
-      break;
-    }
-    if (cgId == null) throw new Error("ContextGraphCreated event not found on receipt");
-  }
-
-  console.error("createContextGraph tx=" + receipt.hash + " cgId=" + cgId);
-  console.log(cgId.toString());
-})().catch(e => {
-  console.error("[create-cg] " + (e?.shortMessage || e?.message || String(e)));
-  process.exit(1);
-});
-'
-) || fail "context graph creation failed"
-
-[ -n "$CG_ID" ] || fail "empty CG_ID captured"
-log "Created V10 context graph id=$CG_ID"
+log "Registering '$CG_FQ_ID' on-chain via daemon CLI..."
+REG_OUT=$(DKG_HOME="$NODE_DIR" node "$CLI_JS" context-graph register "$CG_FQ_ID") \
+  || fail "context-graph register failed (CG=$CG_FQ_ID)"
+CG_ONCHAIN_ID=$(printf '%s\n' "$REG_OUT" | sed -nE 's/.*On-chain:[[:space:]]+([0-9]+).*/\1/p' | head -n1)
+[ -n "$CG_ONCHAIN_ID" ] || fail "could not parse on-chain id from register output:\n$REG_OUT"
+# The slug is what `dkg publish` and the data-graph URI both consume;
+# CG_ONCHAIN_ID is only used in the post-publish KCS verification at
+# step 6 (kcsAddr.getKnowledgeCollectionMetadata takes a numeric KC id,
+# but the publish receipt gives us batchId directly so CG_ONCHAIN_ID is
+# only kept for logging / debug context).
+CG_ID="$CG_FQ_ID"
+log "CG ready: id=$CG_ID on-chain=$CG_ONCHAIN_ID"
 
 # --- 3. Build RDF fixture -----------------------------------------------------
 
@@ -243,7 +145,6 @@ log "Wrote RDF fixture to $TMP_RDF (subject=$SUBJECT)"
 
 # --- 4. CLI publish -----------------------------------------------------------
 
-# Remember where the daemon log currently ends so we can scan only new lines.
 if [ -s "$DAEMON_LOG" ]; then
   BASELINE_LINES=$(wc -l < "$DAEMON_LOG" | tr -d ' ')
 else

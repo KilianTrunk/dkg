@@ -16,8 +16,8 @@ import {
  * Unit tests for the ContextGraphs facade — Phase 7 Task 3 rewrite.
  *
  * Scope:
- *   - createContextGraph (new 7-arg signature: hosting nodes + participant agents
- *     + PCA accountId, with msg.sender defaulting on curated policy)
+ *   - createContextGraph (new signature: participant agents + PCA accountId,
+ *     with msg.sender defaulting on curated policy)
  *   - isAuthorizedPublisher 3-curator-type model (EOA / Safe / PCA) including
  *     the N17 regression: the function must check the `publisher` parameter,
  *     not a recovered node signer
@@ -90,7 +90,6 @@ describe('@unit ContextGraphs (facade)', () => {
   // -------------------------------------------------------------------------
   // Reusable helpers
   // -------------------------------------------------------------------------
-  const hosts = (): bigint[] => [10n, 20n, 30n];
   const noAgents = (): string[] => [];
 
   /**
@@ -102,14 +101,13 @@ describe('@unit ContextGraphs (facade)', () => {
     accountId: bigint = 0n,
   ): Promise<bigint> {
     await Facade.connect(caller).createContextGraph(
-      hosts(),
       noAgents(),
-      2,            // requiredSignatures
       0,            // metadataBatchId
       0,            // accessPolicy = public/discoverable
       0,            // publishPolicy = curated
       authority,
       accountId,
+      ethers.ZeroHash,
     );
     return Storage.getLatestContextGraphId();
   }
@@ -119,14 +117,13 @@ describe('@unit ContextGraphs (facade)', () => {
    */
   async function createOpenCG(caller: SignerWithAddress): Promise<bigint> {
     await Facade.connect(caller).createContextGraph(
-      hosts(),
       noAgents(),
-      2,
       0,
       0,                            // accessPolicy = public/discoverable
       1,                            // publishPolicy = open
       ethers.ZeroAddress,
       0,
+      ethers.ZeroHash,
     );
     return Storage.getLatestContextGraphId();
   }
@@ -155,18 +152,19 @@ describe('@unit ContextGraphs (facade)', () => {
       const caller = accounts[0];
 
       // Pin the full event payload so a regression that swaps arg order
-      // (e.g. owner vs authority) or silently mutates the hosting-node list
-      // fails immediately. Args per ContextGraphStorage.ContextGraphCreated:
-      // (contextGraphId, owner, hostingNodes, participantAgents,
-      //  requiredSignatures, metadataBatchId, accessPolicy, publishPolicy,
-      //  publishAuthority, publishAuthorityAccountId).
+      // (e.g. owner vs authority) or silently mutates the participant agent
+      // list fails immediately. Args per ContextGraphStorage.ContextGraphCreated:
+      // (contextGraphId, owner, nameHash, participantAgents, metadataBatchId,
+      //  accessPolicy, publishPolicy, publishAuthority,
+      //  publishAuthorityAccountId).
       await expect(
         Facade.connect(caller).createContextGraph(
-          hosts(), noAgents(), 2, 0, 0, 0, authority, 0,
+          noAgents(), 0, 0, 0, authority, 0,
+          ethers.ZeroHash,
         ),
       )
         .to.emit(Storage, 'ContextGraphCreated')
-        .withArgs(1n, caller.address, hosts(), noAgents(), 2, 0, 0, 0, authority, 0);
+        .withArgs(1n, caller.address, ethers.ZeroHash, noAgents(), 0, 0, 0, authority, 0);
 
       expect(await Storage.ownerOf(1)).to.equal(caller.address);
       expect(await Storage.balanceOf(caller.address)).to.equal(1);
@@ -176,7 +174,7 @@ describe('@unit ContextGraphs (facade)', () => {
       const authority = accounts[5].address;
       const cgId = await Facade
         .connect(accounts[0])
-        .createContextGraph.staticCall(hosts(), noAgents(), 2, 0, 0, 0, authority, 0);
+        .createContextGraph.staticCall(noAgents(), 0, 0, 0, authority, 0, ethers.ZeroHash);
       expect(cgId).to.equal(1);
     });
 
@@ -188,7 +186,8 @@ describe('@unit ContextGraphs (facade)', () => {
       const authority = accounts[0].address;
       const agents = [accounts[3].address, accounts[4].address];
       await Facade.connect(accounts[0]).createContextGraph(
-        hosts(), agents, 2, 42, 0, 0, authority, pcaAccountId,
+        agents, 42, 0, 0, authority, pcaAccountId,
+        ethers.ZeroHash,
       );
 
       // pcaAccountId is 1 (first NFT mint) and the PCA CG takes token id 1
@@ -197,9 +196,7 @@ describe('@unit ContextGraphs (facade)', () => {
       const cgId = 1n;
       const cg = await Storage.getContextGraph(cgId);
       expect(cg.owner_).to.equal(accounts[0].address);
-      expect(cg.hostingNodes).to.deep.equal(hosts());
       expect(cg.participantAgents).to.deep.equal(agents);
-      expect(cg.requiredSignatures).to.equal(2);
       expect(cg.metadataBatchId).to.equal(42);
       expect(cg.active).to.be.true;
       expect(cg.accessPolicy).to.equal(0);
@@ -210,7 +207,8 @@ describe('@unit ContextGraphs (facade)', () => {
 
     it('defaults authority to msg.sender when curated + zero authority passed', async () => {
       await Facade.connect(accounts[0]).createContextGraph(
-        hosts(), noAgents(), 2, 0, 0, 0, ethers.ZeroAddress, 0,
+        noAgents(), 0, 0, 0, ethers.ZeroAddress, 0,
+        ethers.ZeroHash,
       );
       const policy = await Storage.getPublishPolicy(1);
       expect(policy.publishPolicy).to.equal(0);
@@ -221,7 +219,8 @@ describe('@unit ContextGraphs (facade)', () => {
       // Open + zero authority + zero accountId is valid. The defaulting
       // branch is curated-only.
       await Facade.connect(accounts[0]).createContextGraph(
-        hosts(), noAgents(), 2, 0, 0, 1, ethers.ZeroAddress, 0,
+        noAgents(), 0, 0, 1, ethers.ZeroAddress, 0,
+        ethers.ZeroHash,
       );
       const policy = await Storage.getPublishPolicy(1);
       expect(policy.publishPolicy).to.equal(1);
@@ -230,74 +229,24 @@ describe('@unit ContextGraphs (facade)', () => {
 
     it('assigns incrementing contextGraphIds across calls', async () => {
       await Facade.connect(accounts[0]).createContextGraph(
-        hosts(), noAgents(), 2, 0, 0, 1, ethers.ZeroAddress, 0,
+        noAgents(), 0, 0, 1, ethers.ZeroAddress, 0,
+        ethers.ZeroHash,
       );
       await Facade.connect(accounts[1]).createContextGraph(
-        hosts(), noAgents(), 2, 0, 0, 1, ethers.ZeroAddress, 0,
+        noAgents(), 0, 0, 1, ethers.ZeroAddress, 0,
+        ethers.ZeroHash,
       );
       expect(await Storage.getLatestContextGraphId()).to.equal(2);
       expect(await Storage.ownerOf(1)).to.equal(accounts[0].address);
       expect(await Storage.ownerOf(2)).to.equal(accounts[1].address);
     });
 
-    // --- Validation (storage-level reverts bubble through the facade) ---
-    it('reverts on empty hosting nodes with requiredSignatures > 0 (RFC-001 edge-CG: must be zero)', async () => {
-      await expect(
-        Facade.connect(accounts[0]).createContextGraph(
-          [], noAgents(), 1, 0, 0, 1, ethers.ZeroAddress, 0,
-        ),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('facade accepts empty hosts when requiredSignatures == 0', async () => {
-      // 8-arg signature: hostingNodes, participantAgents, requiredSignatures,
-      // metadataBatchId, accessPolicy, publishPolicy, publishAuthority,
-      // publishAuthorityAccountId.
-      await expect(
-        Facade.connect(accounts[0]).createContextGraph(
-          [], noAgents(), 0, 0, 0, 1, ethers.ZeroAddress, 0,
-        ),
-      ).to.not.be.reverted;
-    });
-
-    it('reverts on zero hosting node id', async () => {
-      await expect(
-        Facade.connect(accounts[0]).createContextGraph(
-          [0n, 10n], noAgents(), 1, 0, 0, 1, ethers.ZeroAddress, 0,
-        ),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('reverts on unsorted hosting nodes', async () => {
-      await expect(
-        Facade.connect(accounts[0]).createContextGraph(
-          [30n, 10n, 20n], noAgents(), 1, 0, 0, 1, ethers.ZeroAddress, 0,
-        ),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('reverts on duplicate hosting nodes', async () => {
-      await expect(
-        Facade.connect(accounts[0]).createContextGraph(
-          [10n, 10n, 20n], noAgents(), 1, 0, 0, 1, ethers.ZeroAddress, 0,
-        ),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('reverts when hosting nodes exceed MAX_HOSTING_NODES', async () => {
-      const nodes = Array.from({ length: 65 }, (_, i) => BigInt(i + 1));
-      await expect(
-        Facade.connect(accounts[0]).createContextGraph(
-          nodes, noAgents(), 1, 0, 0, 1, ethers.ZeroAddress, 0,
-        ),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
     it('accepts empty participantAgents (ALLOWED by design)', async () => {
       // Empty allow-list is explicitly supported: ContextGraphStorage does
       // not enforce a non-empty participantAgents list.
       await Facade.connect(accounts[0]).createContextGraph(
-        hosts(), [], 2, 0, 0, 0, accounts[5].address, 0,
+        [], 0, 0, 0, accounts[5].address, 0,
+        ethers.ZeroHash,
       );
       expect(await Storage.getParticipantAgents(1)).to.deep.equal([]);
     });
@@ -305,9 +254,9 @@ describe('@unit ContextGraphs (facade)', () => {
     it('reverts on duplicate participant agent', async () => {
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(),
           [accounts[3].address, accounts[3].address],
-          1, 0, 0, 1, ethers.ZeroAddress, 0,
+          0, 0, 1, ethers.ZeroAddress, 0,
+          ethers.ZeroHash,
         ),
       ).to.be.revertedWithCustomError(Storage, 'AgentParticipantAlreadyExists');
     });
@@ -315,9 +264,9 @@ describe('@unit ContextGraphs (facade)', () => {
     it('reverts on zero participant agent address', async () => {
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(),
           [accounts[3].address, ethers.ZeroAddress],
-          1, 0, 0, 1, ethers.ZeroAddress, 0,
+          0, 0, 1, ethers.ZeroAddress, 0,
+          ethers.ZeroHash,
         ),
       ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
     });
@@ -328,23 +277,8 @@ describe('@unit ContextGraphs (facade)', () => {
       );
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          [10n], agents, 1, 0, 0, 1, ethers.ZeroAddress, 0,
-        ),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('reverts when requiredSignatures > hostingNodes.length', async () => {
-      await expect(
-        Facade.connect(accounts[0]).createContextGraph(
-          [10n, 20n], noAgents(), 3, 0, 0, 1, ethers.ZeroAddress, 0,
-        ),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('reverts when requiredSignatures == 0', async () => {
-      await expect(
-        Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 0, 0, 0, 1, ethers.ZeroAddress, 0,
+          agents, 0, 0, 1, ethers.ZeroAddress, 0,
+          ethers.ZeroHash,
         ),
       ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
     });
@@ -352,7 +286,8 @@ describe('@unit ContextGraphs (facade)', () => {
     it('reverts on invalid publishPolicy (>1)', async () => {
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 2, 0, 0, 2, accounts[5].address, 0,
+          noAgents(), 0, 0, 2, accounts[5].address, 0,
+          ethers.ZeroHash,
         ),
       ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
     });
@@ -360,7 +295,8 @@ describe('@unit ContextGraphs (facade)', () => {
     it('reverts on invalid accessPolicy (>1)', async () => {
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 2, 0, 2, 1, ethers.ZeroAddress, 0,
+          noAgents(), 0, 2, 1, ethers.ZeroAddress, 0,
+          ethers.ZeroHash,
         ),
       ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
     });
@@ -371,7 +307,8 @@ describe('@unit ContextGraphs (facade)', () => {
       // vector). Set up a real PCA account with accounts[0] as the owner.
       const pcaAccountId = await createPCAAccount(accounts[0], '60000');
       await Facade.connect(accounts[0]).createContextGraph(
-        hosts(), noAgents(), 2, 0, 0, 0, accounts[0].address, pcaAccountId,
+        noAgents(), 0, 0, 0, accounts[0].address, pcaAccountId,
+        ethers.ZeroHash,
       );
       const cgId = 1n;
       const policy = await Storage.getPublishPolicy(cgId);
@@ -381,7 +318,8 @@ describe('@unit ContextGraphs (facade)', () => {
 
     it('curated + accountId == 0 (EOA/Safe) with non-zero authority is valid', async () => {
       await Facade.connect(accounts[0]).createContextGraph(
-        hosts(), noAgents(), 2, 0, 0, 0, accounts[5].address, 0,
+        noAgents(), 0, 0, 0, accounts[5].address, 0,
+        ethers.ZeroHash,
       );
       expect(await Storage.getPublishAuthorityAccountId(1)).to.equal(0);
     });
@@ -390,7 +328,8 @@ describe('@unit ContextGraphs (facade)', () => {
     it('reverts on open policy with non-zero publishAuthority', async () => {
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 2, 0, 0, 1, accounts[5].address, 0,
+          noAgents(), 0, 0, 1, accounts[5].address, 0,
+          ethers.ZeroHash,
         ),
       ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
     });
@@ -398,7 +337,8 @@ describe('@unit ContextGraphs (facade)', () => {
     it('reverts on open policy with non-zero publishAuthorityAccountId', async () => {
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 2, 0, 0, 1, ethers.ZeroAddress, 99,
+          noAgents(), 0, 0, 1, ethers.ZeroAddress, 99,
+          ethers.ZeroHash,
         ),
       ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
     });
@@ -421,16 +361,16 @@ describe('@unit ContextGraphs (facade)', () => {
       // the call but writes wrong curator metadata fails immediately.
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 2, 0, 0, 0, accounts[0].address, pcaAccountId,
+          noAgents(), 0, 0, 0, accounts[0].address, pcaAccountId,
+          ethers.ZeroHash,
         ),
       )
         .to.emit(Storage, 'ContextGraphCreated')
         .withArgs(
           1n,
           accounts[0].address,
-          hosts(),
+          ethers.ZeroHash,
           noAgents(),
-          2,
           0,
           0,
           0,
@@ -446,7 +386,8 @@ describe('@unit ContextGraphs (facade)', () => {
       const pcaAccountId = await createPCAAccount(accounts[0], '60000');
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 2, 0, 0, 0, accounts[5].address, pcaAccountId,
+          noAgents(), 0, 0, 0, accounts[5].address, pcaAccountId,
+          ethers.ZeroHash,
         ),
       )
         .to.be.revertedWithCustomError(Facade, 'PCAAuthorityMismatch')
@@ -459,7 +400,8 @@ describe('@unit ContextGraphs (facade)', () => {
       // as PCAAccountDoesNotExist.
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 2, 0, 0, 0, accounts[0].address, 999,
+          noAgents(), 0, 0, 0, accounts[0].address, 999,
+          ethers.ZeroHash,
         ),
       )
         .to.be.revertedWithCustomError(Facade, 'PCAAccountDoesNotExist')
@@ -473,16 +415,16 @@ describe('@unit ContextGraphs (facade)', () => {
       // path (non-zero accountId) or drops the EOA authority fails.
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 2, 0, 0, 0, accounts[5].address, 0,
+          noAgents(), 0, 0, 0, accounts[5].address, 0,
+          ethers.ZeroHash,
         ),
       )
         .to.emit(Storage, 'ContextGraphCreated')
         .withArgs(
           1n,
           accounts[0].address,
-          hosts(),
+          ethers.ZeroHash,
           noAgents(),
-          2,
           0,
           0,
           0,
@@ -496,16 +438,16 @@ describe('@unit ContextGraphs (facade)', () => {
       // regression that conflates open/curated writes is caught.
       await expect(
         Facade.connect(accounts[0]).createContextGraph(
-          hosts(), noAgents(), 2, 0, 0, 1, ethers.ZeroAddress, 0,
+          noAgents(), 0, 0, 1, ethers.ZeroAddress, 0,
+          ethers.ZeroHash,
         ),
       )
         .to.emit(Storage, 'ContextGraphCreated')
         .withArgs(
           1n,
           accounts[0].address,
-          hosts(),
+          ethers.ZeroHash,
           noAgents(),
-          2,
           0,
           0,
           1,
@@ -1092,7 +1034,8 @@ describe('@unit ContextGraphs (facade)', () => {
       // so mint one for accounts[0] and use its accountId here.
       const pcaAccountId = await createPCAAccount(accounts[0], '60000');
       await Facade.connect(accounts[0]).createContextGraph(
-        hosts(), noAgents(), 2, 0, 0, 0, accounts[0].address, pcaAccountId,
+        noAgents(), 0, 0, 0, accounts[0].address, pcaAccountId,
+        ethers.ZeroHash,
       );
       const newCgId = await Storage.getLatestContextGraphId();
 
@@ -1121,56 +1064,6 @@ describe('@unit ContextGraphs (facade)', () => {
         1,
       );
       expect((await Storage.getPublishPolicy(1)).publishAuthority).to.equal(accounts[5].address);
-    });
-  });
-
-  // =========================================================================
-  // Governance: setHostingNodes
-  // =========================================================================
-  describe('setHostingNodes', () => {
-    beforeEach(async () => {
-      await createOpenCG(accounts[0]);
-    });
-
-    it('owner can replace hosting nodes', async () => {
-      const newNodes = [5n, 15n, 25n, 35n];
-      await expect(
-        Facade.connect(accounts[0]).setHostingNodes(1, newNodes),
-      ).to.emit(Storage, 'HostingNodesSet').withArgs(1, newNodes);
-      expect(await Storage.getHostingNodes(1)).to.deep.equal(newNodes);
-    });
-
-    it('reverts for non-owner (NotContextGraphOwner)', async () => {
-      await expect(
-        Facade.connect(accounts[5]).setHostingNodes(1, [99n]),
-      ).to.be.revertedWithCustomError(Facade, 'NotContextGraphOwner');
-    });
-
-    it('reverts on unsorted nodes', async () => {
-      await expect(
-        Facade.connect(accounts[0]).setHostingNodes(1, [30n, 10n, 20n]),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('reverts on zero node id', async () => {
-      await expect(
-        Facade.connect(accounts[0]).setHostingNodes(1, [0n, 10n]),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('reverts when new list exceeds MAX_HOSTING_NODES', async () => {
-      const nodes = Array.from({ length: 65 }, (_, i) => BigInt(i + 1));
-      await expect(
-        Facade.connect(accounts[0]).setHostingNodes(1, nodes),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('reverts when new size would break quorum (requiredSignatures=2)', async () => {
-      // CG was created with requiredSignatures = 2, so shrinking to 1 node
-      // is invalid.
-      await expect(
-        Facade.connect(accounts[0]).setHostingNodes(1, [42n]),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
     });
   });
 
@@ -1255,48 +1148,6 @@ describe('@unit ContextGraphs (facade)', () => {
       await Facade.connect(accounts[0]).addParticipantAgent(1, agent3);
       await Facade.connect(accounts[0]).removeParticipantAgent(1, agent2);
       expect(await Storage.getParticipantAgents(1)).to.deep.equal([agent1, agent3]);
-    });
-  });
-
-  // =========================================================================
-  // Governance: updateQuorum
-  // =========================================================================
-  describe('updateQuorum', () => {
-    beforeEach(async () => {
-      // Create CG with 3 hosting nodes, requiredSignatures = 2.
-      await Facade.connect(accounts[0]).createContextGraph(
-        hosts(), noAgents(), 2, 0, 0, 1, ethers.ZeroAddress, 0,
-      );
-    });
-
-    it('owner can raise quorum within hosting nodes count', async () => {
-      await expect(
-        Facade.connect(accounts[0]).updateQuorum(1, 3),
-      ).to.emit(Storage, 'QuorumUpdated').withArgs(1, 3);
-      expect(await Storage.getContextGraphRequiredSignatures(1)).to.equal(3);
-    });
-
-    it('owner can lower quorum', async () => {
-      await Facade.connect(accounts[0]).updateQuorum(1, 1);
-      expect(await Storage.getContextGraphRequiredSignatures(1)).to.equal(1);
-    });
-
-    it('non-owner cannot update quorum', async () => {
-      await expect(
-        Facade.connect(accounts[5]).updateQuorum(1, 1),
-      ).to.be.revertedWithCustomError(Facade, 'NotContextGraphOwner');
-    });
-
-    it('reverts when quorum > hostingNodes.length', async () => {
-      await expect(
-        Facade.connect(accounts[0]).updateQuorum(1, 4),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
-    });
-
-    it('reverts when quorum == 0', async () => {
-      await expect(
-        Facade.connect(accounts[0]).updateQuorum(1, 0),
-      ).to.be.revertedWithCustomError(Storage, 'InvalidContextGraphConfig');
     });
   });
 

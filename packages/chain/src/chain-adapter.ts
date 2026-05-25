@@ -154,17 +154,46 @@ export interface ContextGraphOnChain {
 
 // ----- On-Chain Context Graph types (ContextGraphs contract) -----
 
+/**
+ * Per SPEC_CG_MEMORY_MODEL: every CG is hosted by the network's sharding
+ * table at publish time and the ACK quorum is the system parameter
+ * `parametersStorage.minimumRequiredSignatures()`. CGs do not declare
+ * per-CG hosting committees or per-CG quorum.
+ *
+ * `accessPolicy` and `publishPolicy` are REQUIRED (Codex PR #595
+ * round-5): the previous all-optional shape let `{}` silently create a
+ * public + open-contribution CG, which is a privilege widening relative
+ * to the safe defaults the MCP/UI surfaces use. Callers must state both
+ * dials explicitly so migrations from the pre-LU2 signature can't
+ * accidentally leak data.
+ */
 export interface CreateOnChainContextGraphParams {
-  participantIdentityIds: bigint[];
-  participantAgents?: string[];
-  requiredSignatures: number;
-  metadataBatchId?: bigint;
   /** 0 = public/discoverable, 1 = private/curated. */
-  accessPolicy?: number;
+  accessPolicy: number;
   /** 0 = curated publishing, 1 = open publishing. */
-  publishPolicy?: number;
+  publishPolicy: number;
+  participantAgents?: string[];
+  metadataBatchId?: bigint;
   publishAuthority?: string;
   publishAuthorityAccountId?: bigint;
+  /**
+   * OT-RFC-38 / LU-6 Phase B — opt-in stable wire identifier the
+   * curator commits to at create time. Intended to be
+   * `keccak256(bytes(cleartextId))` so the SWM gossip topic, envelope
+   * `contextGraphId`, signing payload, and host-mode store key are all
+   * chain-derivable AND privacy-preserving (cleartext never leaves
+   * the curator's local node). Hosting cores in the sharding table
+   * use this to auto-subscribe to the SWM topic on receipt of the
+   * `ContextGraphCreated` event — no off-chain discovery channel is
+   * required for registered CGs.
+   *
+   * Omit (or pass `'0x' + '0'.repeat(64)`) to opt out — host-mode
+   * discovery for that CG then relies on the gossip-beacon path
+   * (Option β) exclusively. We recommend always passing a non-zero
+   * hash; the opt-out branch exists only to keep the contract
+   * surface forward-compatible.
+   */
+  nameHash?: string;
 }
 
 export interface CreateOnChainContextGraphResult extends Omit<TxResult, 'contextGraphId'> {
@@ -285,6 +314,21 @@ export interface V10PublishParams {
   author: V10AuthorAttestation;
   ackSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
   /**
+   * RFC-39 Phase A.5 — OPTIONAL Merkle root over `[keccak256(ct_i)]` in
+   * `swmMessageIndex` order for this batch's ciphertext chunks. Required
+   * by the contract to be `bytes32(0)` for public CGs; for curated CGs
+   * either zero (legacy/transitional — picker skips this KC in the
+   * curated draw) OR paired with a non-zero `ciphertextChunkCount`.
+   * Defaults to `bytes32(0)` when omitted.
+   */
+  ciphertextChunksRoot?: Uint8Array;
+  /**
+   * RFC-39 Phase A.5 — OPTIONAL number of ciphertext chunks in this
+   * batch (== curated leaf count for random sampling). Same zero-or-paired
+   * constraints as `ciphertextChunksRoot`. Defaults to `0` when omitted.
+   */
+  ciphertextChunkCount?: number;
+  /**
    * Write-ahead hook invoked by the adapter *immediately before the
    * concrete publish tx is broadcast* — i.e. after `approve()` and any
    * allowance top-up, after gas estimation / populate / signing have
@@ -336,6 +380,20 @@ export interface V10UpdateKCParams {
   updateOperationId?: string;
   publisherNodeIdentityId?: bigint;
   ackSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
+  /**
+   * RFC-39 Phase A.5 — OPTIONAL refreshed Merkle root over the new
+   * batch's ciphertext chunks. Same zero-or-paired contract as
+   * {@link V10PublishParams.ciphertextChunksRoot}: zero on metadata-only
+   * updates and public CGs; both non-zero on curated commitment
+   * rotation. Defaults to `bytes32(0)`.
+   */
+  newCiphertextChunksRoot?: Uint8Array;
+  /**
+   * RFC-39 Phase A.5 — OPTIONAL refreshed ciphertext chunk count for the
+   * new batch. Defaults to `0`. Paired with
+   * {@link newCiphertextChunksRoot}.
+   */
+  newCiphertextChunkCount?: number;
   /**
    * Write-ahead hook fired just before the concrete update tx is
    * broadcast, carrying the signed tx hash. See
@@ -701,7 +759,6 @@ export interface ChainAdapter {
 
   // On-Chain Context Graphs (ContextGraphs contract)
   createOnChainContextGraph?(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult>;
-  getContextGraphParticipants?(contextGraphId: bigint): Promise<bigint[] | null>;
   verify?(params: VerifyParams): Promise<TxResult>;
   publishToContextGraph?(params: PublishToContextGraphParams): Promise<OnChainPublishResult>;
 
@@ -721,6 +778,20 @@ export interface ChainAdapter {
 
   /** Read minimumRequiredSignatures from ParametersStorage. Used by ACKCollector. */
   getMinimumRequiredSignatures?(): Promise<number>;
+
+  /**
+   * Sharding-table membership check (Codex PR #595 round-4 follow-up).
+   *
+   * SPEC_CG_MEMORY_MODEL §4.3 promises that only sharding-table members
+   * can ACK a VM publish. The agent's verify path calls this on every
+   * resolved signer identityId and DROPS any approval whose signer is
+   * not in the sharding table. Adapters that can't probe membership
+   * (test mocks, legacy in-tree fakes) return `true` for any non-zero
+   * identityId — those environments aren't security-sensitive.
+   *
+   * Implementation maps to `ShardingTableStorage.nodeExists(uint72)`.
+   */
+  isShardingTableMember?(identityId: bigint): Promise<boolean>;
 
   /** Verify that a recovered signer address is a registered operational key for the given identity. */
   verifyACKIdentity?(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean>;
@@ -948,6 +1019,67 @@ export interface ChainAdapter {
    * skip the period rather than blindly querying CG `_meta:0`.
    */
   getKCContextGraphId?(kcId: bigint): Promise<bigint>;
+
+  /**
+   * On-chain access policy for `contextGraphId`. Read from
+   * `ContextGraphStorage.getAccessPolicy(uint256)`. Returns the
+   * Solidity enum value: `0` = public/discoverable, `1` = private/curated.
+   *
+   * OT-RFC-38 / LU-5 use case: when a core node receives a
+   * `PublishIntent` with `isEncryptedPayload=true` it MUST independently
+   * verify the CG is curated before honoring the opaque-ACK path
+   * (otherwise a malicious publisher could bypass merkle verification
+   * on a public CG). The local triple store oracle isn't authoritative
+   * for a CG the core didn't create — the publisher's meta-graph
+   * gossip is race-y with the publish itself — so cores fall back to
+   * the chain, which is the source of truth.
+   *
+   * Returns `0` for unregistered IDs (matches Solidity default-zero
+   * mapping; callers can treat as "public/unknown"). Optional so
+   * non-V10 / no-chain adapters can stub the surface.
+   *
+   * Cheap (single eth_call) and called only on the encrypted-payload
+   * path, but cores SHOULD cache the result per (chainId, cgId) to
+   * avoid one RPC per publish.
+   */
+  getContextGraphAccessPolicy?(contextGraphId: bigint): Promise<number>;
+
+  /**
+   * On-chain participant agent allowlist for `contextGraphId`. Read
+   * from `ContextGraphStorage.getParticipantAgents(uint256)`.
+   *
+   * OT-RFC-38 / LU-6 Phase B use case: a core node that hosts a
+   * curated CG without being a member of it (sharding-table-driven
+   * host-mode hosting) needs to authenticate incoming gossip envelopes
+   * against the curator's agent allowlist. The local triple-store
+   * oracle (`DKG_ALLOWED_AGENT` ∪ `DKG_PARTICIPANT_AGENT` in the CG
+   * meta graph) only works for CGs the local node CREATED or JOINED
+   * (i.e. is a member of); hosting cores have no such meta. Falling
+   * back to the chain is the authoritative path.
+   *
+   * Returns an empty array when the CG has no participant agents
+   * registered (unregistered ID, or non-agent-gated CG). Optional so
+   * non-V10 / no-chain adapters can stub the surface.
+   *
+   * Cheap (single eth_call). Hosting cores SHOULD cache the result
+   * per (chainId, cgId); the allowlist is mutable on chain but
+   * changes slowly, so a 5-minute TTL is a reasonable default.
+   */
+  getContextGraphParticipantAgents?(contextGraphId: bigint): Promise<string[]>;
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — chain-backed `getNameHash(uint256)`
+   * accessor. Returns the curator-committed wire id for `contextGraphId`,
+   * or `null` when (a) the id is unregistered, or (b) the curator
+   * opted out at create time. Used by hosting cores to derive the SWM
+   * gossip topic for CGs they didn't create or join, without an off-
+   * chain discovery channel.
+   *
+   * Adapters are free to cache the result indefinitely: the on-chain
+   * value is write-once at create time (no setter exists), so stale
+   * entries can't occur.
+   */
+  getContextGraphNameHash?(contextGraphId: bigint): Promise<string | null>;
 }
 
 // ----- Backward-compat deprecated aliases -----

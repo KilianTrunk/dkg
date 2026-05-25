@@ -44,6 +44,11 @@
   },
   {
     "inputs": [],
+    "name": "IncompleteCiphertextCommitment",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "InvalidAuthorSignature",
     "type": "error"
   },
@@ -161,6 +166,17 @@
       }
     ],
     "name": "NoRemainingLifetimeForDelta",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      }
+    ],
+    "name": "PublicCGCannotHaveCiphertextCommitment",
     "type": "error"
   },
   {
@@ -563,6 +579,16 @@
             "type": "uint32"
           },
           {
+            "internalType": "bytes32",
+            "name": "ciphertextChunksRoot",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint32",
+            "name": "ciphertextChunkCount",
+            "type": "uint32"
+          },
+          {
             "internalType": "uint72",
             "name": "publisherNodeIdentityId",
             "type": "uint72"
@@ -747,6 +773,16 @@
             "internalType": "bytes32[]",
             "name": "vs",
             "type": "bytes32[]"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "newCiphertextChunksRoot",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint32",
+            "name": "newCiphertextChunkCount",
+            "type": "uint32"
           }
         ],
         "internalType": "struct KnowledgeAssetsV10.UpdateParams",

@@ -135,19 +135,9 @@
   {
     "inputs": [
       {
-        "internalType": "uint72[]",
-        "name": "hostingNodes",
-        "type": "uint72[]"
-      },
-      {
         "internalType": "address[]",
         "name": "participantAgents",
         "type": "address[]"
-      },
-      {
-        "internalType": "uint8",
-        "name": "requiredSignatures",
-        "type": "uint8"
       },
       {
         "internalType": "uint256",
@@ -173,6 +163,11 @@
         "internalType": "uint256",
         "name": "publishAuthorityAccountId",
         "type": "uint256"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "nameHash",
+        "type": "bytes32"
       }
     ],
     "name": "createContextGraph",
@@ -282,24 +277,6 @@
   {
     "inputs": [
       {
-        "internalType": "uint256",
-        "name": "contextGraphId",
-        "type": "uint256"
-      },
-      {
-        "internalType": "uint72[]",
-        "name": "nodes",
-        "type": "uint72[]"
-      }
-    ],
-    "name": "setHostingNodes",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {
         "internalType": "bool",
         "name": "_status",
         "type": "bool"
@@ -370,24 +347,6 @@
       }
     ],
     "name": "updatePublishPolicy",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {
-        "internalType": "uint256",
-        "name": "contextGraphId",
-        "type": "uint256"
-      },
-      {
-        "internalType": "uint8",
-        "name": "requiredSignatures",
-        "type": "uint8"
-      }
-    ],
-    "name": "updateQuorum",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

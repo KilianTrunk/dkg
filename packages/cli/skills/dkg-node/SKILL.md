@@ -438,7 +438,7 @@ Implications:
 ### Core CG routes
 
 - `POST /api/context-graph/create` — create a context graph.
-  Body: `{ id, name, description?, accessPolicy? (0=open, 1=private), allowedAgents?: [...], allowedPeers?: [...], private?, register?, participantIdentityIds?, requiredSignatures? }`.
+  Body: `{ id, name, description?, accessPolicy? (0=open, 1=private), allowedAgents?: [...], allowedPeers?: [...], participantAgents?: [...], private?, register?, publishPolicy?, pcaAccountId? }`.
 
   Whether the CG stays local depends on the node's chain adapter configuration — there are four distinct regimes:
 
@@ -448,7 +448,14 @@ Implications:
   - **Real chain adapter WITHOUT on-chain identity**: no auto-register on create; CG stays local until `/api/context-graph/register` or `register: true` promotes it.
   - **Curated CG** (default for the `dkg_context_graph_create` tool): the tool sends `accessPolicy: 1` automatically. The creator is auto-included in `DKG_ALLOWED_AGENT` so they can immediately read/write. Add collaborators with `dkg_participant_add` (or pass `allowed_agents: ["0x..."]` at creation to do it atomically).
   - **Public CG**: pass `public: true` on the tool (or `accessPolicy: 0` / omit on the raw HTTP route). Anyone can subscribe and read SWM gossip.
-  - **Multi-sig CG**: pass `participantIdentityIds: [...]` + `requiredSignatures: M`. Use `register: true` so the participant set and threshold are anchored on-chain. `requiredSignatures` is optional when `private: true`.
+
+  > **No more multi-sig hosting committees.** Per `SPEC_CG_MEMORY_MODEL`,
+  > on-chain CGs are edge-owned by default: hosts are picked from the
+  > network sharding table at publish time and the ACK quorum is the
+  > system parameter `parametersStorage.minimumRequiredSignatures()`. The
+  > legacy `participantIdentityIds` / `requiredSignatures` body fields
+  > are accepted for backwards compatibility but silently dropped with a
+  > deprecation warning.
 
   > **Direct HTTP vs tool.** When you call the `dkg_context_graph_create`
   > tool, it defaults to curated/private (sends `accessPolicy: 1`). When

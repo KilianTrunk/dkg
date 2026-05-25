@@ -538,11 +538,15 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     expect(body.error).toMatch(/pcaAccountId|PCA account id/i);
   });
 
-  // Codex PR #502 round-5: pcaAccountId on a create-only request used
-  // to be silently accepted (and silently dropped because
-  // createContextGraph no longer persists it). The daemon now rejects
-  // the create-without-register combo at the API boundary.
-  it('rejects pcaAccountId on POST /api/context-graph/create when register is not true', async () => {
+  // OT-RFC-38 LU-6 Phase B (Codex PR #610): pcaAccountId on a create-only
+  // request used to be rejected at the API boundary (PR #502 round-5) because
+  // createContextGraph silently dropped it. PR #610 made createContextGraph
+  // persist `publishPolicy` / `publishAuthorityAccountId` via the
+  // DKG_PUBLISH_* triples so the deferred-register path on first VM publish
+  // re-loads the user's create-time choices. The create-only call is now
+  // accepted; the safety invariant is preserved by the persist+replay
+  // round-trip instead of the create-without-register reject.
+  it('accepts pcaAccountId on POST /api/context-graph/create and persists it for deferred register', async () => {
     const d = daemon!;
     const cgId = 'pca-create-only-' + Math.random().toString(36).slice(2, 8);
     const create = await fetch(urlFor(d, '/api/context-graph/create'), {
@@ -550,10 +554,10 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
       headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
       body: JSON.stringify({ id: cgId, name: cgId, pcaAccountId: '1' }),
     });
-    expect(create.status).toBe(400);
-    const body = (await create.json()) as { error?: string };
-    expect(body.error ?? '').toMatch(/register: true|register=true|register/i);
-    expect(body.error ?? '').toMatch(/pcaAccountId/);
+    expect(create.status).toBe(200);
+    const body = (await create.json()) as { created?: string; registered?: boolean };
+    expect(body.created).toBe(cgId);
+    expect(body.registered).toBeUndefined();
   });
 
   // Codex review #502 round-3: pcaAccountId is a register-time knob —
@@ -723,6 +727,55 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     // No raw revert hex / Hardhat internal frames in the surfaced
     // message — callers should see something human-readable.
     expect(body.error).not.toMatch(/^0x[0-9a-fA-F]+$/);
+  });
+
+  // SPEC_CG_MEMORY_MODEL / Codex PR #595 round-4: per-CG hosting
+  // committees and per-CG quorum overrides were removed end-to-end.
+  // The on-chain contract no longer accepts those args, so silently
+  // stripping them from the request body would let callers believe
+  // they created a roster-constrained / M-of-N CG when those
+  // constraints were actually discarded. We reject any body that
+  // carries either field, regardless of whether `id`/`name` are also
+  // present — there is no faithful translation.
+  for (const fields of [
+    { participantIdentityIds: ['1', '2'], requiredSignatures: 1 },
+    { participantIdentityIds: ['1', '2'] },
+    { requiredSignatures: 1 },
+  ] as const) {
+    const presentKeys = Object.keys(fields).sort().join('+');
+    it(`rejects POST /api/context-graph/create with deprecated fields (${presentKeys}) — even alongside valid id/name`, async () => {
+      const d = daemon!;
+      const cgId = 'depr-reject-' + Math.random().toString(36).slice(2, 8);
+      const res = await fetch(urlFor(d, '/api/context-graph/create'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+        body: JSON.stringify({ id: cgId, name: cgId, ...fields }),
+      });
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as {
+        error?: string;
+        code?: string;
+        deprecatedFields?: string[];
+      };
+      expect(body.code).toBe('DEPRECATED_CONTEXT_GRAPH_FIELDS');
+      expect(body.error ?? '').toMatch(/SPEC_CG_MEMORY_MODEL/);
+      expect(body.deprecatedFields).toEqual(Object.keys(fields).sort());
+    });
+  }
+
+  it('rejects POST /api/context-graph/create with deprecated fields (no id/name) — naming the missing fields explicitly', async () => {
+    const d = daemon!;
+    const res = await fetch(urlFor(d, '/api/context-graph/create'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({
+        participantIdentityIds: ['1', '2'],
+        requiredSignatures: 1,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: string; code?: string };
+    expect(body.code).toBe('DEPRECATED_CONTEXT_GRAPH_FIELDS');
   });
 });
 

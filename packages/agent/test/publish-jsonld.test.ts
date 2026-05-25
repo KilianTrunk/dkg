@@ -1,8 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { DKGAgent } from '../src/index.js';
-import { OxigraphStore } from '@origintrail-official/dkg-storage';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DKGAgent, type DKGAgentConfig } from '../src/index.js';
+import { OxigraphStore, SharedMemoryLiteralBlobStore, type TripleStore } from '@origintrail-official/dkg-storage';
 import { TripleStoreAsyncLiftPublisher } from '@origintrail-official/dkg-publisher';
-import { buildAuthorAttestationTypedData } from '@origintrail-official/dkg-core';
+import { DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, buildAuthorAttestationTypedData, contextGraphDataGraphUri } from '@origintrail-official/dkg-core';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
@@ -20,17 +23,25 @@ afterAll(async () => {
 });
 
 const agents: DKGAgent[] = [];
-const stores: OxigraphStore[] = [];
+const stores: TripleStore[] = [];
+const tempDataDirs: string[] = [];
 
-async function createAgent(name: string) {
-  const store = new OxigraphStore();
+async function createTempDataDir(prefix: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  tempDataDirs.push(dir);
+  return dir;
+}
+
+async function createAgent(name: string, overrides: Partial<DKGAgentConfig> = {}) {
+  const store = overrides.store ?? new OxigraphStore();
   const agent = await DKGAgent.create({
     name,
     listenPort: 0,
     skills: [],
     chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
-    store,
     nodeRole: 'core',
+    ...overrides,
+    store,
   });
   agents.push(agent);
   stores.push(store);
@@ -44,9 +55,36 @@ afterEach(async () => {
   }
   agents.length = 0;
   stores.length = 0;
+  for (const dir of tempDataDirs.splice(0)) {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 describe('publishJsonLd', () => {
+  it('uses the override store for agent writes and helper bookkeeping', async () => {
+    const overrideStore = new SharedMemoryLiteralBlobStore(new OxigraphStore(), {
+      blobDir: await createTempDataDir('dkg-agent-override-store-blobs-'),
+      thresholdBytes: 65_536,
+    });
+
+    const { agent, store } = await createAgent('OverrideStoreBot', { store: overrideStore });
+
+    expect(store).toBe(overrideStore);
+    await agent.createContextGraph({ id: 'override-store-observable', name: 'OverrideStoreObservable', description: '' });
+
+    const result = await store.query(`
+      ASK {
+        GRAPH <${contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY)}> {
+          <${contextGraphDataGraphUri('override-store-observable')}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}>
+        }
+      }
+    `);
+    expect(result.type).toBe('boolean');
+    if (result.type === 'boolean') {
+      expect(result.value).toBe(true);
+    }
+  }, 30_000);
+
   it('bare JSON-LD doc defaults to private quads (with synthetic public anchor)', async () => {
     const { agent, store } = await createAgent('BarePrivateBot');
     await agent.createContextGraph({ id: 'bare-priv', name: 'BP', description: '' });
@@ -562,6 +600,44 @@ describe('publishJsonLd', () => {
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
     const job = await asyncPublisher.getStatus(captureID);
     expect(job?.request.seal).toBeDefined();
+  }, 30_000);
+
+  it('async publish builds the seal when public snapshots are externalized to disk', async () => {
+    const dataDir = await createTempDataDir('dkg-agent-public-snapshots-');
+    const { agent, store } = await createAgent('AsyncSealDiskSnapshotBot', { dataDir });
+    await agent.createContextGraph({ id: 'async-seal-disk-snapshot', name: 'AsyncSealDiskSnapshot', description: '' });
+    await agent.registerContextGraph('async-seal-disk-snapshot');
+    const root = 'http://example.org/AsyncSealDiskSnapshotEntity';
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-seal-disk-snapshot',
+      {
+        '@context': 'http://schema.org/',
+        '@id': root,
+        '@type': 'Thing',
+        'name': 'Private async with disk-backed public snapshot',
+      },
+      { localOnly: true },
+    );
+
+    const metadata = await store.query(
+      `SELECT ?snapshotRef ?snapshotGraph WHERE {
+        GRAPH <did:dkg:context-graph:async-seal-disk-snapshot/_shared_memory_meta> {
+          ?s <http://dkg.io/ontology/publicSnapshotRef> ?snapshotRef .
+          OPTIONAL { ?s <http://dkg.io/ontology/publicSnapshotGraph> ?snapshotGraph }
+        }
+      }`,
+    );
+    expect(metadata.type).toBe('bindings');
+    if (metadata.type === 'bindings') {
+      expect(metadata.bindings.some((row) => row['snapshotRef']?.includes('sha256:'))).toBe(true);
+      expect(metadata.bindings.every((row) => row['snapshotGraph'] === undefined)).toBe(true);
+    }
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job?.request.seal).toBeDefined();
+    expect(job?.request.seal?.merkleRoot).toMatch(/^0x[0-9a-f]{64}$/i);
   }, 30_000);
 
   it('async publish accepts preSignedAuthorAttestation and threads it byte-for-byte into LiftRequest.seal', async () => {

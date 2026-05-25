@@ -252,14 +252,13 @@ describe('@unit KnowledgeAssetsV10', () => {
    */
   async function createOpenCG(creator: SignerWithAddress): Promise<bigint> {
     await Facade.connect(creator).createContextGraph(
-      [10n, 20n, 30n], // hosting nodes (not validated against identity storage)
       [], // participant agents
-      2, // requiredSignatures
       0, // metadataBatchId
       0, // accessPolicy = public/discoverable
       1, // publishPolicy = open
       ethers.ZeroAddress,
-      0, // publishAuthorityAccountId
+      0, // publishAuthorityAccountId,
+      ethers.ZeroHash,
     );
     return CGStorageContract.getLatestContextGraphId();
   }
@@ -273,14 +272,13 @@ describe('@unit KnowledgeAssetsV10', () => {
     accountId: bigint = 0n,
   ): Promise<bigint> {
     await Facade.connect(creator).createContextGraph(
-      [10n, 20n, 30n],
       [],
-      2,
       0,
       0, // accessPolicy = public/discoverable
       0, // publishPolicy = curated
       authority,
       accountId,
+      ethers.ZeroHash,
     );
     return CGStorageContract.getLatestContextGraphId();
   }
@@ -1045,6 +1043,9 @@ describe('@unit KnowledgeAssetsV10', () => {
           tokenAmount,
           isImmutable: false,
           merkleLeafCount: 1,
+          // RFC-39 Phase A.5: open CG path, no ciphertext commitment.
+          ciphertextChunksRoot: ethers.ZeroHash,
+          ciphertextChunkCount: 0,
           publisherNodeIdentityId: publisherIdentityId,
           authorAddress: creator.address,
           authorR: authorSig.authorR,
@@ -2045,14 +2046,13 @@ describe('@unit KnowledgeAssetsV10', () => {
         // owner. Using accounts[0] as CG creator keeps TRAC on the deployer
         // (which is fine because the agent is the real publishing principal).
         await Facade.connect(accounts[0]).createContextGraph(
-          [10n, 20n, 30n],
           [],
-          2,
           0,
           0, // accessPolicy = public/discoverable
           0, // publishPolicy = curated
           nftOwner.address,
           pcaAccountId,
+          ethers.ZeroHash,
         );
         const cgId = await CGStorageContract.getLatestContextGraphId();
 

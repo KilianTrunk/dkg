@@ -188,6 +188,41 @@ partitions, and continues from there.
   for their own importers without forcing every client to re-read status.
   Hard enforcement stays in HTTP code; `/api/status` is a hint.
 
+## Empirical motivation
+
+Quoted from an rc.10 import of this repository's Graphify output
+(26,960 nodes / 63,003 edges across 17 partitions), running on a
+sandbox daemon (port 9201, single worker, local SSD):
+
+- A hand-rolled importer written from `dkg-node/SKILL.md` alone needed
+  **~330 LOC** to land the graph: arg parsing, token resolution, wallet-
+  scoped CG id construction, partitioning, write batching, 413-driven
+  adaptive halving on `/promote`, 500-driven `entities: "all"` →
+  per-root batching on the 10 MB gossip cap, and a hand-rolled JSON
+  resume state file. Roughly half of that is cap-discovery ceremony.
+- The same workload using rc.10's existing `scripts/lib/dkg-daemon.mjs`
+  `DkgClient` cuts the importer to ~half the LOC because token, project
+  ensure, sub-graph ensure, and write batching are already handled.
+  Importer authors still hand-roll adaptive halving and the resume
+  manifest — those are the gaps PRs #642 and #643 close.
+- **Four of 17 partitions hit the 10 MB gossip cap** with
+  `entities: "all"` (24,599 KB, 11,993 KB, 10,788 KB, 20,686 KB). Each
+  failure required halve-and-retry. Total wall-clock spent in retry
+  cycles: **~15 minutes** on top of the legitimate write/promote work.
+  A documented contract (this ADR) plus a pinned `ROOT_CHUNK ≤ 1000`
+  default in the importer SKILL would have avoided all of it.
+- Write latency degrades roughly **200× from baseline** once cumulative
+  SWM grows past ~100k triples (5-7 ms/batch → 1.2 s/batch and worse),
+  because sync `/promote` shares a worker with write ingestion. That
+  cost is what motivates PR #643's async queue, not this ADR — but the
+  chunking discipline here is the prerequisite: without an agreed-upon
+  contract you can't move promote work to a background worker without
+  changing the importer's request shape.
+
+The full per-partition breakdown lives in the rc.10 test artifacts;
+this section keeps the headlines so the contract's "why these numbers"
+question has a concrete answer for reviewers.
+
 ## References
 
 - HTTP 413 semantics — [RFC 9110 §15.5.14](https://www.rfc-editor.org/rfc/rfc9110#name-413-content-too-large)

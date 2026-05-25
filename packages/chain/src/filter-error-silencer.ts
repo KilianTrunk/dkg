@@ -52,7 +52,7 @@
  * Returns true if `err` looks like an ethers-surfaced
  * `eth_getFilterChanges` failure from a GC'd filter.
  *
- * Defensive: matches on EITHER the RPC error code (-32602) OR the
+ * Defensive: matches on EITHER the RPC error code (-32602 / -32000) OR the
  * canonical string ("filter not found"). Some RPC nodes return -32000
  * with the same string; some return -32602 with a generic "invalid
  * params". Combining both predicates catches both shapes.
@@ -66,10 +66,46 @@ export function isFilterNotFoundError(err: unknown): boolean {
   const candidate = err as { code?: unknown; info?: { error?: { code?: unknown; message?: unknown } } };
   const rpcCode = typeof candidate.code === 'number' ? candidate.code : candidate.info?.error?.code;
   const rpcMessage = candidate.info?.error?.message;
-  if (rpcCode === -32602 && typeof rpcMessage === 'string') {
+  if ((rpcCode === -32602 || rpcCode === -32000) && typeof rpcMessage === 'string') {
     if (rpcMessage.toLowerCase().includes('filter')) return true;
   }
   return false;
+}
+
+/**
+ * Format non-filter provider errors without dropping the nested JSON-RPC
+ * payload ethers often stores on `err.info.error`.
+ */
+export function formatProviderError(err: unknown): string {
+  if (err instanceof Error) {
+    const parts = [err.stack || err.message];
+    const record = err as Error & {
+      code?: unknown;
+      info?: unknown;
+      error?: unknown;
+      data?: unknown;
+    };
+    for (const [label, value] of [
+      ['code', record.code],
+      ['info', record.info],
+      ['error', record.error],
+      ['data', record.data],
+    ] as const) {
+      if (value !== undefined) {
+        parts.push(`${label}=${safeJson(value)}`);
+      }
+    }
+    return parts.join(' ');
+  }
+  return typeof err === 'string' ? err : safeJson(err);
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 /** Default dedup window — 5 min. Operators see ~12 lines/hour during a sustained outage instead of ~thousands. */

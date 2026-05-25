@@ -10,6 +10,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   isFilterNotFoundError,
+  formatProviderError,
   createFilterErrorSilencer,
   DEFAULT_DEDUP_WINDOW_MS,
 } from '../src/filter-error-silencer.js';
@@ -43,11 +44,27 @@ describe('isFilterNotFoundError', () => {
     expect(isFilterNotFoundError(err)).toBe(true);
   });
 
+  it('matches -32000 provider filter-expiration payloads', () => {
+    const nested = Object.assign(new Error('could not coalesce error'), {
+      info: { error: { code: -32000, message: 'filter expired' } },
+    });
+    const direct = Object.assign(new Error('rpc failure'), {
+      code: -32000,
+      info: { error: { code: -32000, message: 'filter not found' } },
+    });
+    expect(isFilterNotFoundError(nested)).toBe(true);
+    expect(isFilterNotFoundError(direct)).toBe(true);
+  });
+
   it('does NOT match other -32602 messages (invalid params, etc.)', () => {
     const err = Object.assign(new Error('rpc failure'), {
       info: { error: { code: -32602, message: 'invalid params: from must be hex' } },
     });
     expect(isFilterNotFoundError(err)).toBe(false);
+    const serverErr = Object.assign(new Error('rpc failure'), {
+      info: { error: { code: -32000, message: 'rate limited' } },
+    });
+    expect(isFilterNotFoundError(serverErr)).toBe(false);
   });
 
   it('does NOT match unrelated provider errors', () => {
@@ -61,6 +78,21 @@ describe('isFilterNotFoundError', () => {
   it('handles non-Error inputs gracefully', () => {
     expect(isFilterNotFoundError('filter not found')).toBe(true);
     expect(isFilterNotFoundError({ message: 'no match here' })).toBe(false);
+  });
+});
+
+describe('formatProviderError', () => {
+  it('includes stack/message plus nested ethers JSON-RPC fields', () => {
+    const err = Object.assign(new Error('could not coalesce error'), {
+      code: 'UNKNOWN_ERROR',
+      info: { error: { code: -32000, message: 'rate limited' } },
+      data: { request: { method: 'eth_getFilterChanges' } },
+    });
+    const formatted = formatProviderError(err);
+    expect(formatted).toContain('could not coalesce error');
+    expect(formatted).toContain('UNKNOWN_ERROR');
+    expect(formatted).toContain('"code":-32000');
+    expect(formatted).toContain('eth_getFilterChanges');
   });
 });
 

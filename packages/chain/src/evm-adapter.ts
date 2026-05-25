@@ -1,6 +1,7 @@
 import { ethers, JsonRpcProvider, Wallet, Contract, Interface } from 'ethers';
 import {
   createFilterErrorSilencer,
+  formatProviderError,
   type FilterErrorSilencer,
 } from './filter-error-silencer.js';
 import { createRequire } from 'node:module';
@@ -381,7 +382,7 @@ export class EVMChainAdapter implements ChainAdapter {
       // path so they remain visible. Operators grepping their logs
       // for chain-provider issues still see everything they used to
       // EXCEPT the filter-spam class.
-      console.warn(`[chain] provider error: ${err instanceof Error ? err.message : String(err)}`);
+      console.warn(`[chain] provider error: ${formatProviderError(err)}`);
     });
     this.signer = new Wallet(config.privateKey, this.provider);
     this.signerPool = [this.signer];

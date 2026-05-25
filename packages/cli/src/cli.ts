@@ -59,6 +59,7 @@ import {
   checkForNpmVersionUpdate,
   performNpmUpdate,
   DAEMON_EXIT_CODE_RESTART,
+  resolveStandaloneInstall,
 } from './daemon.js';
 import { migrateToBlueGreen } from './migration.js';
 import { ensureRollbackNodeUiBundle } from './rollback-node-ui.js';
@@ -3989,9 +3990,14 @@ program
         branch: proj.defaultBranch,
         allowPrerelease: true,
         checkIntervalMinutes: 30,
+        source: undefined as 'auto' | 'npm' | 'git' | undefined,
       };
     })();
-    const standalone = isStandaloneInstall();
+    // Honour `autoUpdate.source` override so `dkg update` from a beacon-01
+    // operator with `source: "npm"` configured goes through the npm install
+    // path even if .git is still present in the working tree. See
+    // `AutoUpdateConfig.source` (config.ts) for the rationale.
+    const standalone = resolveStandaloneInstall(au.source ?? config.autoUpdate?.source);
     const allowPre = opts.allowPrerelease === true ? true : (au.allowPrerelease ?? true);
 
     if (standalone) {

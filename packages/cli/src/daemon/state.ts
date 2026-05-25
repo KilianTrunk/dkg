@@ -62,6 +62,41 @@ export const daemonState: {
 };
 
 /**
+ * Resolve whether this daemon should be treated as a standalone (npm-global)
+ * install, honouring the operator's `autoUpdate.source` override if present.
+ *
+ *   - `source === 'npm'` → return `true` regardless of `.git` presence.
+ *   - `source === 'git'` → return `false` regardless of `.git` presence.
+ *   - `source === 'auto'` or omitted → fall through to the filesystem probe
+ *     (`isStandaloneInstall()`, i.e. `repoDir() === null`).
+ *
+ * The first call seeds `daemonState.standaloneCache` so every subsequent caller
+ * (`resolveAutoUpdateEnabled`, the auto-update setup in `lifecycle.ts`, the
+ * `dkg update` CLI subcommand, the status route) reads the same answer for the
+ * lifetime of the worker process — no inconsistency where one caller thinks
+ * "git" and another thinks "npm".
+ *
+ * Call this in preference to `isStandaloneInstall()` directly. The latter
+ * stays exported (and is the underlying probe) but doesn't honour the override.
+ */
+export function resolveStandaloneInstall(
+  source?: 'auto' | 'npm' | 'git',
+): boolean {
+  if (source === 'npm') {
+    daemonState.standaloneCache = true;
+    return true;
+  }
+  if (source === 'git') {
+    daemonState.standaloneCache = false;
+    return false;
+  }
+  if (daemonState.standaloneCache === null) {
+    daemonState.standaloneCache = isStandaloneInstall();
+  }
+  return daemonState.standaloneCache;
+}
+
+/**
  * Is auto-update enabled for this daemon?
  *
  * Standalone installs (npm-global / pnpm dlx) default to `enabled`
@@ -73,8 +108,8 @@ export const daemonState: {
  * `handle-request.ts` itself (which would create an import cycle).
  */
 export function resolveAutoUpdateEnabled(config: DkgConfig): boolean {
-  if (daemonState.standaloneCache === null) daemonState.standaloneCache = isStandaloneInstall();
-  return daemonState.standaloneCache
+  const standalone = resolveStandaloneInstall(config.autoUpdate?.source);
+  return standalone
     ? config.autoUpdate?.enabled !== false
     : (config.autoUpdate?.enabled ?? false);
 }

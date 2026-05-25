@@ -53,6 +53,36 @@ export interface AutoUpdateConfig {
   checkIntervalMinutes?: number;
   /** Optional per-step build timeout overrides for the git-based update path. */
   buildTimeoutMs?: AutoUpdateBuildTimeouts;
+  /**
+   * Override how the daemon resolves "am I a standalone (npm-global) install
+   * or a git checkout?" — the question that decides whether auto-update goes
+   * through `performNpmUpdate` (npm install into a blue/green slot) or
+   * `performUpdate` (git pull + build from source).
+   *
+   *   `'auto'` (default): probe the filesystem (`repoDir() === null`).
+   *     Preserves today's behaviour. Operators who set up the daemon via
+   *     `npm install -g` get the npm path; operators who cloned the
+   *     monorepo for development get the git path.
+   *
+   *   `'npm'`: force the npm path regardless of `.git` presence. The fix for
+   *     Core nodes that were originally cloned but should now track npm
+   *     releases — beacon-01 is the canonical case (its `~/dkg-v9/.git`
+   *     directory caused the auto-update path to build from `main`'s HEAD
+   *     during the v10.0.0-rc.10 rollout, which then hit the shutdown
+   *     deadlock that left the worker a zombie). Next polling cycle wipes
+   *     the inactive slot, runs `npm install @origintrail-official/dkg@<version>`,
+   *     and swaps — no filesystem prep required.
+   *
+   *   `'git'`: force the git path regardless of `.git` presence. Opt-in for
+   *     dev nodes that want to keep tracking a branch even after running
+   *     from a globally-installed CLI.
+   *
+   * Implementation: read once at boot via `resolveStandaloneInstall(source)`
+   * in `daemon/state.ts`, which writes the result into the shared
+   * `daemonState.standaloneCache` memo so every later caller (status route,
+   * `dkg update` CLI subcommand, …) sees the same answer.
+   */
+  source?: 'auto' | 'npm' | 'git';
 }
 
 /**
@@ -85,6 +115,14 @@ export interface NetworkConfig {
     sshCommand?: string;
     checkIntervalMinutes: number;
     buildTimeoutMs?: AutoUpdateBuildTimeouts;
+    /**
+     * Network-level default for `AutoUpdateConfig.source` — see the
+     * matching doc comment on that field. Lets `network/<env>.json` set the
+     * recommended source policy (e.g. testnet defaulting to `'npm'` so new
+     * Core operators don't have to know about the override). Local config
+     * still wins per field.
+     */
+    source?: 'auto' | 'npm' | 'git';
   };
   chain?: {
     type: 'evm';
@@ -596,6 +634,7 @@ export function resolveAutoUpdateConfig(
   const sshKeyPath = cfg?.sshKeyPath ?? net?.sshKeyPath;
   const sshCommand = cfg?.sshCommand ?? net?.sshCommand;
   const checkIntervalMinutes = cfg?.checkIntervalMinutes ?? net?.checkIntervalMinutes ?? 30;
+  const source = cfg?.source ?? net?.source;
 
   // Merge build timeouts per-key so operators can override one step (e.g.
   // `contracts` on slow ARM hosts) without re-specifying the rest.
@@ -620,6 +659,7 @@ export function resolveAutoUpdateConfig(
     ...(sshCommand ? { sshCommand } : {}),
     checkIntervalMinutes,
     ...(buildTimeoutMs ? { buildTimeoutMs } : {}),
+    ...(source ? { source } : {}),
   };
 }
 

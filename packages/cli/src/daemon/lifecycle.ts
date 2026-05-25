@@ -145,6 +145,7 @@ import { DkgClient } from '@origintrail-official/dkg-mcp/client';
 // the project's tsconfig (`noUnusedLocals` is off).
 import {
   daemonState,
+  resolveStandaloneInstall,
   type CorsAllowlist,
 } from './state.js';
 import {
@@ -1054,7 +1055,12 @@ export async function runDaemonInner(
   // omits the field (the common case after `dkg init` with default answers).
   let updateInterval: ReturnType<typeof setInterval> | null = null;
   const au = resolveAutoUpdateConfig(config, network);
-  const standalone = isStandaloneInstall();
+  // Honour `autoUpdate.source` override (config.ts) — explicit "npm" / "git"
+  // wins over the filesystem probe (`isStandaloneInstall()`); "auto" or omitted
+  // falls through to today's behaviour. Fall back to the raw config when `au`
+  // is null (auto-update disabled) so the override still seeds the cache for
+  // anyone else who reads `daemonState.standaloneCache` later in the boot.
+  const standalone = resolveStandaloneInstall(au?.source ?? config.autoUpdate?.source);
   const hasGitConfig = !!au;
 
   if (standalone || hasGitConfig) {

@@ -22,6 +22,7 @@ import {
   DKGPublishingConvictionNFT,
   EpochStorage,
   Hub,
+  PublishingConviction,
   StakingStorage,
   Token,
 } from '../../typechain';
@@ -30,6 +31,7 @@ type Fixture = {
   accounts: SignerWithAddress[];
   Hub: Hub;
   NFT: DKGPublishingConvictionNFT;
+  Logic: PublishingConviction;
   Token: Token;
   StakingStorage: StakingStorage;
   EpochStorage: EpochStorage;
@@ -42,11 +44,15 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
   let accounts: SignerWithAddress[];
   let HubContract: Hub;
   let NFT: DKGPublishingConvictionNFT;
+  let LogicContract: PublishingConviction;
   let TokenContract: Token;
   let ChronosContract: Chronos;
 
   async function deployFixture(): Promise<Fixture> {
     await hre.deployments.fixture([
+      // V10 split — pull the storage + logic + wrapper trio.
+      'PublishingConvictionStorage',
+      'PublishingConviction',
       'DKGPublishingConvictionNFT',
       'Token',
       'StakingStorage',
@@ -55,6 +61,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
     ]);
     const Hub = await hre.ethers.getContract<Hub>('Hub');
     const NFT = await hre.ethers.getContract<DKGPublishingConvictionNFT>('DKGPublishingConvictionNFT');
+    const Logic = await hre.ethers.getContract<PublishingConviction>('PublishingConviction');
     const Token = await hre.ethers.getContract<Token>('Token');
     const StakingStorageC = await hre.ethers.getContract<StakingStorage>('StakingStorage');
     const EpochStorageC = await hre.ethers.getContract<EpochStorage>('EpochStorageV8');
@@ -65,6 +72,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       accounts: signers,
       Hub,
       NFT,
+      Logic,
       Token,
       StakingStorage: StakingStorageC,
       EpochStorage: EpochStorageC,
@@ -78,6 +86,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       accounts,
       Hub: HubContract,
       NFT,
+      Logic: LogicContract,
       Token: TokenContract,
       Chronos: ChronosContract,
     } = await loadFixture(deployFixture));
@@ -92,6 +101,23 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
     await TokenContract.connect(signer).approve(await NFT.getAddress(), committed);
     await NFT.connect(signer).createAccount(committed);
     return await NFT.totalSupply();
+  }
+
+  async function deployReplacementLogic(): Promise<PublishingConviction> {
+    const LogicFactory = await hre.ethers.getContractFactory('PublishingConviction');
+    const replacement = (await LogicFactory.deploy(
+      await HubContract.getAddress(),
+    )) as unknown as PublishingConviction;
+    await replacement.waitForDeployment();
+
+    await HubContract.setAndReinitializeContracts(
+      [{ name: 'PublishingConviction', addr: await replacement.getAddress() }],
+      [],
+      [await replacement.getAddress()],
+      [],
+    );
+
+    return replacement;
   }
 
   async function advanceToEpoch(targetEpoch: bigint) {
@@ -110,6 +136,31 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       await time.increase(targetTimestamp - now);
     }
   }
+
+  describe('logic Hub re-registration', () => {
+    it('forwards writes to the current Hub-registered logic without wrapper reinitialization', async () => {
+      const committed = hre.ethers.parseEther('50000');
+      const acctId = await createAccount(accounts[0], committed);
+
+      const oldLogicAddress = await LogicContract.getAddress();
+      const replacement = await deployReplacementLogic();
+      const replacementAddress = await replacement.getAddress();
+
+      expect(replacementAddress).to.not.equal(oldLogicAddress);
+      expect(await NFT.publishingConviction()).to.equal(replacementAddress);
+      expect(await HubContract['isContract(address)'](oldLogicAddress)).to.equal(false);
+      expect(await HubContract['isContract(address)'](replacementAddress)).to.equal(true);
+
+      const topUpAmount = hre.ethers.parseEther('1000');
+      await TokenContract.connect(accounts[0]).approve(await NFT.getAddress(), topUpAmount);
+
+      await expect(NFT.connect(accounts[0]).topUp(acctId, topUpAmount))
+        .to.emit(replacement, 'ToppedUp')
+        .withArgs(acctId, topUpAmount, topUpAmount);
+
+      expect(await NFT.topUpBalance(acctId)).to.equal(topUpAmount);
+    });
+  });
 
   // ======================================================================
   // E-6 — topUp after expiry must revert with AccountExpired.
@@ -131,7 +182,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       await TokenContract.connect(accounts[0]).approve(await NFT.getAddress(), topUpAmount);
 
       await expect(NFT.connect(accounts[0]).topUp(acctId, topUpAmount))
-        .to.be.revertedWithCustomError(NFT, 'AccountExpired')
+        .to.be.revertedWithCustomError(LogicContract, 'AccountExpired')
         .withArgs(acctId, expiresAt);
     });
 
@@ -148,7 +199,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       await TokenContract.connect(accounts[0]).approve(await NFT.getAddress(), topUpAmount);
 
       await expect(NFT.connect(accounts[0]).topUp(acctId, topUpAmount))
-        .to.be.revertedWithCustomError(NFT, 'AccountExpired')
+        .to.be.revertedWithCustomError(LogicContract, 'AccountExpired')
         .withArgs(acctId, expiresAt);
     });
 
@@ -169,7 +220,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       // wrong reason (e.g. allowance/balance check) — but still leaves
       // state unchanged — doesn't silently pass this "no-mutation" test.
       await expect(NFT.connect(accounts[0]).topUp(acctId, topUpAmount))
-        .to.be.revertedWithCustomError(NFT, 'AccountExpired')
+        .to.be.revertedWithCustomError(LogicContract, 'AccountExpired')
         .withArgs(acctId, expiresAt);
 
       expect(await NFT.topUpBalance(acctId)).to.equal(bufferBefore);
@@ -190,7 +241,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       await TokenContract.connect(accounts[0]).approve(await NFT.getAddress(), topUpAmount);
 
       await expect(NFT.connect(accounts[0]).topUp(acctId, topUpAmount))
-        .to.emit(NFT, 'ToppedUp')
+        .to.emit(LogicContract, 'ToppedUp')
         .withArgs(acctId, topUpAmount, topUpAmount);
       expect(await NFT.topUpBalance(acctId)).to.equal(topUpAmount);
     });
@@ -242,7 +293,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
           BigInt(LOCK_DURATION),
         ),
       )
-        .to.be.revertedWithCustomError(NFT, 'AccountExpired')
+        .to.be.revertedWithCustomError(LogicContract, 'AccountExpired')
         .withArgs(acctId, expiresAt);
     });
 
@@ -264,7 +315,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
           BigInt(LOCK_DURATION),
         ),
       )
-        .to.be.revertedWithCustomError(NFT, 'AccountExpired')
+        .to.be.revertedWithCustomError(LogicContract, 'AccountExpired')
         .withArgs(acctId, expiresAt);
     });
 
@@ -288,7 +339,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
           BigInt(LOCK_DURATION),
         ),
       )
-        .to.be.revertedWithCustomError(NFT, 'AccountExpired')
+        .to.be.revertedWithCustomError(LogicContract, 'AccountExpired')
         .withArgs(acctId, expiresAt);
 
       expect(await NFT.topUpBalance(acctId)).to.equal(bufferBefore);
@@ -321,7 +372,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
           BigInt(LOCK_DURATION),
         ),
       )
-        .to.emit(NFT, 'CostCovered')
+        .to.emit(LogicContract, 'CostCovered')
         .withArgs(
           acctId,
           currentEpoch,
@@ -363,7 +414,7 @@ describe('@unit DKGPublishingConvictionNFT — extra audit coverage (E-6)', func
       const finalEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
         NFT.connect(kav10).coverPublishingCost(agent.address, 1n, finalEpoch, 1n),
-      ).to.be.revertedWithCustomError(NFT, 'AccountExpired');
+      ).to.be.revertedWithCustomError(LogicContract, 'AccountExpired');
     });
   });
 });

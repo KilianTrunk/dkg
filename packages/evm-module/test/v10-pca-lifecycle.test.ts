@@ -21,6 +21,7 @@ import {
   KnowledgeAssetsV10,
   KnowledgeCollectionStorage,
   Profile,
+  PublishingConviction,
   StakingV10,
   Token,
 } from '../typechain';
@@ -52,6 +53,7 @@ type Fixture = {
   ContextGraphs: ContextGraphs;
   ContextGraphStorage: ContextGraphStorage;
   NFT: DKGPublishingConvictionNFT;
+  PublishingConviction: PublishingConviction;
 };
 
 async function deployFixture(): Promise<Fixture> {
@@ -103,6 +105,10 @@ async function deployFixture(): Promise<Fixture> {
     NFT: await hre.ethers.getContract<DKGPublishingConvictionNFT>(
       'DKGPublishingConvictionNFT',
     ),
+    PublishingConviction:
+      await hre.ethers.getContract<PublishingConviction>(
+        'PublishingConviction',
+      ),
   };
 }
 
@@ -120,6 +126,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   let CGFacade: ContextGraphs;
   let CGS: ContextGraphStorage;
   let NFT: DKGPublishingConvictionNFT;
+  let LogicContract: PublishingConviction;
 
   beforeEach(async () => {
     hre.helpers.resetDeploymentsJson();
@@ -137,6 +144,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       ContextGraphs: CGFacade,
       ContextGraphStorage: CGS,
       NFT,
+      PublishingConviction: LogicContract,
     } = await loadFixture(deployFixture));
   });
 
@@ -180,7 +188,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     await Token.mint(creator.address, top);
     await Token.connect(creator).approve(await NFT.getAddress(), top);
     await expect(NFT.connect(creator).topUp(accountId, top))
-      .to.emit(NFT, 'ToppedUp')
+      .to.emit(LogicContract, 'ToppedUp')
       .withArgs(accountId, top, top);
     info = await NFT.getAccountInfo(accountId);
     expect(info.topUpBuffer).to.equal(top);
@@ -194,7 +202,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
 
     // ---- registerAgent ----
     await expect(NFT.connect(creator).registerAgent(accountId, agent.address))
-      .to.emit(NFT, 'AgentRegistered')
+      .to.emit(LogicContract, 'AgentRegistered')
       .withArgs(accountId, agent.address);
     expect(await NFT.isAgent(accountId, agent.address)).to.equal(true);
     expect(await NFT.agentToAccountId(agent.address)).to.equal(accountId);
@@ -205,7 +213,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
 
     // ---- deregisterAgent ----
     await expect(NFT.connect(creator).deregisterAgent(accountId, agent.address))
-      .to.emit(NFT, 'AgentDeregistered')
+      .to.emit(LogicContract, 'AgentDeregistered')
       .withArgs(accountId, agent.address);
     expect(await NFT.isAgent(accountId, agent.address)).to.equal(false);
     expect(await NFT.agentToAccountId(agent.address)).to.equal(0n);
@@ -224,7 +232,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     const lockDurationEpochs = acct[5];
     await time.increase(Number(epochLength) * (Number(lockDurationEpochs) + 1));
     await expect(NFT.connect(stranger).settle(accountId)).to.emit(
-      NFT,
+      LogicContract,
       'AccountFinalSwept',
     );
     expect((await NFT.getAccountInfo(accountId)).fullySwept).to.equal(true);

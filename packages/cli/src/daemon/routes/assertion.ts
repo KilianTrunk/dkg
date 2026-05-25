@@ -58,7 +58,7 @@ const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, escapeDkgRdfLiteral, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, assertionLifecycleUri } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
+import { findReservedSubjectPrefix, isSkolemizedUri, PROMOTE_JOB_STATES, PromoteJobConflictError, type PromoteJobState, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import { validatePreSignedAuthorAttestation } from './memory.js';
 import {
   DashboardDB,
@@ -1400,6 +1400,177 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         err.message?.includes("Unsafe")
       ) {
         return jsonResponse(res, 400, { error: err.message });
+      }
+      throw err;
+    }
+  }
+
+  // ── Async-promote queue (RFC: docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md) ──
+  //
+  // Five routes that mirror the sync /promote contract but enqueue work
+  // for an in-process worker (PR #3) instead of running it inline. All
+  // routes share the SMALL_BODY_BYTES cap from sync /promote — see
+  // RFC §3.1.
+  //
+  // The list/status/cancel/recover routes are unambiguous because the
+  // jobId lives in the path; the enqueue route uses `/promote-async`
+  // as the trailing segment so it doesn't conflict with assertion
+  // names containing the word "promote".
+
+  // POST /api/assertion/:name/promote-async  { contextGraphId, entities?, subGraphName? }
+  if (
+    req.method === "POST" &&
+    path.startsWith("/api/assertion/") &&
+    path.endsWith("/promote-async")
+  ) {
+    const assertionName = safeDecodeURIComponent(
+      path.slice("/api/assertion/".length, -"/promote-async".length),
+      res,
+    );
+    if (assertionName === null) return;
+    const nameVal = validateAssertionName(assertionName);
+    if (!nameVal.valid)
+      return jsonResponse(res, 400, {
+        error: `Invalid assertion name: ${nameVal.reason}`,
+      });
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    const { contextGraphId, entities, subGraphName } = parsed;
+    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    if (!validateEntities(entities, res)) return;
+    if (!validateOptionalSubGraphName(subGraphName, res)) return;
+    try {
+      const result = await agent.assertion.promoteAsync(
+        contextGraphId,
+        assertionName,
+        { entities: entities ?? "all", subGraphName },
+      );
+      const job = await agent.assertion.getPromoteAsyncStatus(result.jobId);
+      return jsonResponse(res, 202, {
+        jobId: result.jobId,
+        state: job?.state ?? "queued",
+        enqueuedAt: job?.enqueuedAt,
+      });
+    } catch (err: any) {
+      if (err instanceof PromoteJobConflictError) {
+        return jsonResponse(res, 409, {
+          error: err.message,
+          existingJobId: err.existingJobId,
+        });
+      }
+      if (
+        err.message?.includes("required") ||
+        err.message?.includes("Invalid") ||
+        err.message?.includes("must be")
+      ) {
+        return jsonResponse(res, 400, { error: err.message });
+      }
+      throw err;
+    }
+  }
+
+  // GET /api/assertion/promote-async  ?contextGraphId=<cg>&state=queued,running,...&limit=<n>
+  // List jobs filtered by contextGraphId / state. Must come BEFORE the
+  // `/:jobId` route below because Node URL routing here is by `startsWith`
+  // + `endsWith` rather than a real router; an exact-prefix GET to the
+  // collection URL would otherwise be claimed by the per-job handler.
+  if (
+    req.method === "GET" &&
+    path === "/api/assertion/promote-async"
+  ) {
+    const stateParam = url.searchParams.get("state");
+    const stateFilter: PromoteJobState[] | undefined = stateParam
+      ? stateParam.split(",").map((s) => s.trim()).filter((s): s is PromoteJobState =>
+          (PROMOTE_JOB_STATES as readonly string[]).includes(s),
+        )
+      : undefined;
+    if (stateParam && (!stateFilter || stateFilter.length === 0)) {
+      return jsonResponse(res, 400, {
+        error: `Invalid state filter: ${stateParam}. Allowed: ${PROMOTE_JOB_STATES.join(",")}`,
+      });
+    }
+    const contextGraphId = url.searchParams.get("contextGraphId") ?? undefined;
+    const limitParam = url.searchParams.get("limit");
+    const limit = limitParam ? Number.parseInt(limitParam, 10) : undefined;
+    if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0 || limit > 1000)) {
+      return jsonResponse(res, 400, {
+        error: "limit must be a positive integer ≤ 1000",
+      });
+    }
+    const jobs = await agent.assertion.listPromoteAsyncJobs({
+      state: stateFilter,
+      contextGraphId,
+      limit,
+    });
+    return jsonResponse(res, 200, { jobs });
+  }
+
+  // GET /api/assertion/promote-async/:jobId
+  if (
+    req.method === "GET" &&
+    path.startsWith("/api/assertion/promote-async/") &&
+    !path.endsWith("/recover")
+  ) {
+    const jobId = safeDecodeURIComponent(
+      path.slice("/api/assertion/promote-async/".length),
+      res,
+    );
+    if (jobId === null) return;
+    const job = await agent.assertion.getPromoteAsyncStatus(jobId);
+    if (!job) {
+      return jsonResponse(res, 404, { error: `Promote job not found: ${jobId}` });
+    }
+    return jsonResponse(res, 200, job);
+  }
+
+  // DELETE /api/assertion/promote-async/:jobId   — cancel a queued/failed_retrying job
+  if (
+    req.method === "DELETE" &&
+    path.startsWith("/api/assertion/promote-async/")
+  ) {
+    const jobId = safeDecodeURIComponent(
+      path.slice("/api/assertion/promote-async/".length),
+      res,
+    );
+    if (jobId === null) return;
+    try {
+      await agent.assertion.cancelPromoteAsync(jobId);
+      const job = await agent.assertion.getPromoteAsyncStatus(jobId);
+      return jsonResponse(res, 200, { jobId, state: job?.state ?? "failed" });
+    } catch (err: any) {
+      if (err.message?.includes("not found")) {
+        return jsonResponse(res, 404, { error: err.message });
+      }
+      // "Cannot cancel job in state 'running'" etc.
+      if (err.message?.includes("Cannot cancel")) {
+        return jsonResponse(res, 409, { error: err.message });
+      }
+      throw err;
+    }
+  }
+
+  // POST /api/assertion/promote-async/:jobId/recover   — requeue a terminal-failed job
+  if (
+    req.method === "POST" &&
+    path.startsWith("/api/assertion/promote-async/") &&
+    path.endsWith("/recover")
+  ) {
+    const jobId = safeDecodeURIComponent(
+      path.slice("/api/assertion/promote-async/".length, -"/recover".length),
+      res,
+    );
+    if (jobId === null) return;
+    try {
+      await agent.assertion.recoverPromoteAsync(jobId);
+      const job = await agent.assertion.getPromoteAsyncStatus(jobId);
+      return jsonResponse(res, 200, { jobId, state: job?.state ?? "queued" });
+    } catch (err: any) {
+      if (err.message?.includes("not found")) {
+        return jsonResponse(res, 404, { error: err.message });
+      }
+      if (err.message?.includes("Cannot recover")) {
+        return jsonResponse(res, 409, { error: err.message });
       }
       throw err;
     }

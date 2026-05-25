@@ -163,14 +163,14 @@ describe('promote-async daemon routes', () => {
   // POST /api/assertion/:name/promote-async
   // ---------------------------------------------------------------------------
 
-  it('POST /:name/promote-async returns 202 with jobId on success', async () => {
+  it('POST /:name/promote-async returns 200 with jobId on success', async () => {
     await startRoutes(makeAgent());
     const r = await post('/api/assertion/my-assertion/promote-async', {
       contextGraphId: 'graphify',
       subGraphName: 'code',
       entities: 'all',
     });
-    expect(r.status).toBe(202);
+    expect(r.status).toBe(200);
     expect(r.body.jobId).toBe('job-1');
     expect(r.body.state).toBe('queued');
     expect(r.body.enqueuedAt).toBeTypeOf('number');
@@ -183,7 +183,7 @@ describe('promote-async daemon routes', () => {
       subGraphName: 'sub',
       entities: 'all',
     });
-    expect(first.status).toBe(202);
+    expect(first.status).toBe(200);
     const second = await post('/api/assertion/dup/promote-async', {
       contextGraphId: 'cg',
       subGraphName: 'sub',
@@ -216,7 +216,7 @@ describe('promote-async daemon routes', () => {
       contextGraphId: 'cg',
       entities: ['urn:dkg:entity:a', 'urn:dkg:entity:b'],
     });
-    expect(r.status).toBe(202);
+    expect(r.status).toBe(200);
     const job = await queue.getStatus(r.body.jobId);
     expect(job?.request.entities).toEqual(['urn:dkg:entity:a', 'urn:dkg:entity:b']);
   });
@@ -244,6 +244,13 @@ describe('promote-async daemon routes', () => {
     const r = await get('/api/assertion/promote-async/non-existent');
     expect(r.status).toBe(404);
     expect(r.body.error).toMatch(/not found/i);
+  });
+
+  it('GET /promote-async/:jobId rejects unsafe path values before queue lookup', async () => {
+    await startRoutes(makeAgent());
+    const r = await get('/api/assertion/promote-async/job%3Ebad');
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/Invalid promote jobId/);
   });
 
   // ---------------------------------------------------------------------------
@@ -295,6 +302,13 @@ describe('promote-async daemon routes', () => {
     expect(r.body.error).toMatch(/Invalid state filter/);
   });
 
+  it('GET /promote-async?state=queued,garbage rejects the whole filter', async () => {
+    await startRoutes(makeAgent());
+    const r = await get('/api/assertion/promote-async?state=queued,garbage');
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/Invalid state filter/);
+  });
+
   it('GET /promote-async?limit=abc returns 400', async () => {
     await startRoutes(makeAgent());
     const r = await get('/api/assertion/promote-async?limit=abc');
@@ -331,6 +345,13 @@ describe('promote-async daemon routes', () => {
     expect(r.status).toBe(404);
   });
 
+  it('DELETE /promote-async/:jobId rejects unsafe path values before queue lookup', async () => {
+    await startRoutes(makeAgent());
+    const r = await del('/api/assertion/promote-async/job%20bad');
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/Invalid promote jobId/);
+  });
+
   // ---------------------------------------------------------------------------
   // POST /api/assertion/promote-async/:jobId/recover
   // ---------------------------------------------------------------------------
@@ -358,6 +379,13 @@ describe('promote-async daemon routes', () => {
     await startRoutes(makeAgent());
     const r = await post('/api/assertion/promote-async/non-existent/recover', {});
     expect(r.status).toBe(404);
+  });
+
+  it('POST /promote-async/:jobId/recover rejects unsafe path values before queue lookup', async () => {
+    await startRoutes(makeAgent());
+    const r = await post('/api/assertion/promote-async/job%3Ebad/recover', {});
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/Invalid promote jobId/);
   });
 
   // ---------------------------------------------------------------------------

@@ -407,6 +407,29 @@ function validateContentHash(hash: string): boolean {
   return /^(?:sha256:|keccak256:)?[0-9a-f]{64}$/i.test(hash);
 }
 
+function validatePromoteJobId(jobId: string): { valid: true } | { valid: false; reason: string } {
+  if (!jobId) return { valid: false, reason: "jobId is required" };
+  if (jobId.length > 256) return { valid: false, reason: "jobId is too long" };
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(jobId)) {
+    return {
+      valid: false,
+      reason: "jobId may only contain letters, numbers, '.', '_', ':', and '-'",
+    };
+  }
+  return { valid: true };
+}
+
+function decodePromoteJobId(encoded: string, res: ServerResponse): string | null {
+  const jobId = safeDecodeURIComponent(encoded, res);
+  if (jobId === null) return null;
+  const validation = validatePromoteJobId(jobId);
+  if (!validation.valid) {
+    jsonResponse(res, 400, { error: `Invalid promote jobId: ${validation.reason}` });
+    return null;
+  }
+  return jobId;
+}
+
 function parseImportedAssertionUri(
   assertionUri: string,
   contextGraphId: string,
@@ -1447,7 +1470,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         { entities: entities ?? "all", subGraphName },
       );
       const job = await agent.assertion.getPromoteAsyncStatus(result.jobId);
-      return jsonResponse(res, 202, {
+      return jsonResponse(res, 200, {
         jobId: result.jobId,
         state: job?.state ?? "queued",
         enqueuedAt: job?.enqueuedAt,
@@ -1480,16 +1503,17 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     path === "/api/assertion/promote-async"
   ) {
     const stateParam = url.searchParams.get("state");
-    const stateFilter: PromoteJobState[] | undefined = stateParam
-      ? stateParam.split(",").map((s) => s.trim()).filter((s): s is PromoteJobState =>
-          (PROMOTE_JOB_STATES as readonly string[]).includes(s),
-        )
-      : undefined;
-    if (stateParam && (!stateFilter || stateFilter.length === 0)) {
+    const requestedStates = stateParam ? stateParam.split(",").map((s) => s.trim()) : undefined;
+    if (
+      requestedStates &&
+      (requestedStates.length === 0 ||
+        requestedStates.some((s) => !(PROMOTE_JOB_STATES as readonly string[]).includes(s)))
+    ) {
       return jsonResponse(res, 400, {
         error: `Invalid state filter: ${stateParam}. Allowed: ${PROMOTE_JOB_STATES.join(",")}`,
       });
     }
+    const stateFilter = requestedStates as PromoteJobState[] | undefined;
     const contextGraphId = url.searchParams.get("contextGraphId") ?? undefined;
     const limitParam = url.searchParams.get("limit");
     const limit = limitParam ? Number.parseInt(limitParam, 10) : undefined;
@@ -1512,10 +1536,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     path.startsWith("/api/assertion/promote-async/") &&
     !path.endsWith("/recover")
   ) {
-    const jobId = safeDecodeURIComponent(
-      path.slice("/api/assertion/promote-async/".length),
-      res,
-    );
+    const jobId = decodePromoteJobId(path.slice("/api/assertion/promote-async/".length), res);
     if (jobId === null) return;
     const job = await agent.assertion.getPromoteAsyncStatus(jobId);
     if (!job) {
@@ -1529,10 +1550,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     req.method === "DELETE" &&
     path.startsWith("/api/assertion/promote-async/")
   ) {
-    const jobId = safeDecodeURIComponent(
-      path.slice("/api/assertion/promote-async/".length),
-      res,
-    );
+    const jobId = decodePromoteJobId(path.slice("/api/assertion/promote-async/".length), res);
     if (jobId === null) return;
     try {
       await agent.assertion.cancelPromoteAsync(jobId);
@@ -1556,7 +1574,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     path.startsWith("/api/assertion/promote-async/") &&
     path.endsWith("/recover")
   ) {
-    const jobId = safeDecodeURIComponent(
+    const jobId = decodePromoteJobId(
       path.slice("/api/assertion/promote-async/".length, -"/recover".length),
       res,
     );

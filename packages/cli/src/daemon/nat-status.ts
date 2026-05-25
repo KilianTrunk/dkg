@@ -1,3 +1,5 @@
+import { isIP } from 'node:net';
+
 /**
  * NAT-status tracking + AutoNAT boot self-probe for core nodes.
  *
@@ -133,11 +135,17 @@ export function classifyAddressesForNat(addrs: ReadonlyArray<string>): NatStatus
  * treated as public for `looksDegraded` purposes).
  */
 function isPublicMultiaddr(addr: string): boolean {
-  const dnsMatch = addr.match(/^\/(?:dns4|dns6|dnsaddr)\//);
-  if (dnsMatch) return true;
+  const dnsMatch = addr.match(/^\/(?:dns|dns4|dns6|dnsaddr)\/([^/]+)/);
+  if (dnsMatch) {
+    const host = dnsMatch[1].toLowerCase();
+    if (host === 'localhost' || host.endsWith('.localhost')) return false;
+    return true;
+  }
   const ip4Match = addr.match(/^\/ip4\/(\d+)\.(\d+)\.(\d+)\.(\d+)\//);
   if (ip4Match) {
-    const [, a, b, c, _d] = ip4Match;
+    const [, a, b, c, d] = ip4Match;
+    const ip4 = `${a}.${b}.${c}.${d}`;
+    if (isIP(ip4) !== 4) return false;
     const A = parseInt(a, 10);
     const B = parseInt(b, 10);
     const C = parseInt(c, 10);
@@ -158,10 +166,14 @@ function isPublicMultiaddr(addr: string): boolean {
   const ip6Match = addr.match(/^\/ip6\/([0-9a-fA-F:]+)\//);
   if (ip6Match) {
     const ip6 = ip6Match[1].toLowerCase();
+    if (isIP(ip6) !== 6) return false;
+    const firstHextet = parseInt(ip6.split(':')[0] || '0', 16);
     if (ip6 === '::1') return false;
-    if (ip6.startsWith('fe80:') || ip6.startsWith('fe80::')) return false;
-    if (ip6.startsWith('fc') || ip6.startsWith('fd')) return false;
+    if ((firstHextet & 0xffc0) === 0xfe80) return false;
+    if ((firstHextet & 0xfe00) === 0xfc00) return false;
+    if ((firstHextet & 0xff00) === 0xff00) return false;
     if (ip6 === '::' || ip6.startsWith('::')) return false;
+    if (ip6.startsWith('2001:db8:') || ip6.startsWith('2001:0db8:')) return false;
     return true;
   }
   return false;

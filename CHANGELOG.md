@@ -4,6 +4,10 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Added — Node release visible on the libp2p wire
+
+- **`DKGNodeConfig.nodeVersion` → libp2p `nodeInfo.userAgent`** (`packages/core/src/types.ts`, `packages/core/src/node.ts`, `packages/agent/src/dkg-agent-types.ts`, `packages/agent/src/dkg-agent.ts`, `packages/cli/src/daemon/lifecycle.ts`, `packages/agent/test/dkg-agent-diagnostics.test.ts`): the daemon now sets `nodeInfo.userAgent` at `createLibp2p()` time to `dkg/<semver>` (read from the running CLI's `package.json`). libp2p's identify protocol ships that string in its `agentVersion` PB field, and every remote peer stores it under `Peer.metadata.AgentVersion`. Closes the version-on-the-wire gap that surfaced during the v10.0.0-rc.10 rollout: before this change `/api/peer-info` could tell operators *which* protocols a peer spoke but not *which DKG release* they were running, leaving "did the network pick up the upgrade?" answerable only by SSHing into each Core node. `getPeerDiagnostics()` now surfaces the decoded string as `peerStore.nodeVersion` (kept distinct from libp2p's `AgentVersion` wire name because in the DKG context "agent" already means `DKGAgent`). Pre-rc.11 peers fall through to libp2p's `js-libp2p/<version>` default — itself a useful "peer hasn't adopted the version-advertisement convention yet" signal. `peerStore.protocolVersion` (libp2p's `ProtocolVersion`, default `ipfs/0.1.0`) is exposed alongside under its libp2p name since it's truly libp2p's protocol version, unrelated to DKG. Lets a single Core node answer "what's every peer's DKG version?" by iterating `/api/agents` → `/api/peer-info?peerId=…` and reading `peerStore.nodeVersion`.
+
 ---
 
 ## [10.0.0-rc.10] - 2026-05-25

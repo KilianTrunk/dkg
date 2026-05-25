@@ -962,6 +962,7 @@ export class DKGAgent {
       nodeRole,
       relayServerCapacity: config.relayServerCapacity,
       relayReservationCount: config.relayReservationCount,
+      nodeVersion: config.nodeVersion,
     };
 
     const node = new DKGNode(nodeConfig);
@@ -17066,10 +17067,37 @@ export class DKGAgent {
     try {
       const peer = await libp2p.peerStore.get(pid);
       const multiaddrs = (peer.addresses ?? []).map((a) => a.multiaddr.toString());
+      // libp2p's identify (`/ipfs/id/1.0.0`) populates Peer.metadata
+      // with utf8-encoded `AgentVersion` / `ProtocolVersion` after the
+      // first successful exchange. Surface both so operators can answer
+      // "which DKG release is this peer running?" from the wire —
+      // without this, /api/peer-info shows protocol counts but no
+      // release info at all. The libp2p wire name is `AgentVersion`;
+      // we expose it as `nodeVersion` because "agent" collides with
+      // `DKGAgent` in the DKG context (the rename only happens at this
+      // read boundary — libp2p's PB field stays `AgentVersion`).
+      // Defensive: `metadata` can be Map (libp2p >=2.x), plain object
+      // on some serialised paths, or undefined before identify completes.
+      const readMeta = (key: string): string | null => {
+        const m: unknown = (peer as { metadata?: unknown }).metadata;
+        let raw: unknown;
+        if (m instanceof Map) raw = m.get(key);
+        else if (m && typeof m === 'object') raw = (m as Record<string, unknown>)[key];
+        if (raw == null) return null;
+        try {
+          if (raw instanceof Uint8Array) return new TextDecoder().decode(raw);
+          if (typeof raw === 'string') return raw;
+          return null;
+        } catch {
+          return null;
+        }
+      };
       peerStoreSnapshot = {
         knownMultiaddrCount: multiaddrs.length,
         multiaddrs,
         protocols: [...(peer.protocols ?? [])],
+        nodeVersion: readMeta('AgentVersion'),
+        protocolVersion: readMeta('ProtocolVersion'),
       };
     } catch {
       // peerStore.get throws on cold-cache miss; that IS the diagnostic

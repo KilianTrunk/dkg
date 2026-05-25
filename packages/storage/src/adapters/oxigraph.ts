@@ -91,7 +91,17 @@ export class OxigraphStore implements TripleStore {
     if (!this.persistPath || this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      this.flushNow();
+      // Background flush has no caller to receive errors; log them.
+      // Explicit `flush()`/`close()` callers DO `await` flushNow() and
+      // get the original throw, which is what we want for shutdown
+      // durability — see flushNow()'s docstring.
+      this.flushNow().catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[OxigraphStore] background flush failed for ${this.persistPath}: ${(err as Error).message}. ` +
+            `Next flush will retry; explicit flush() / close() will surface the error.`,
+        );
+      });
     }, 50);
   }
 
@@ -110,6 +120,14 @@ export class OxigraphStore implements TripleStore {
    * rewritten, then hydrateSync would fail-then-swallow on next start).
    * This is the proximate fix for the catastrophic data-loss mode
    * documented in docs/bugs/wm-persistence-regression.md.
+   *
+   * Error model: this method THROWS on any write/fsync/rename failure
+   * (ENOSPC, EACCES, EROFS, EXDEV, …). The background debounced flush
+   * (via `scheduleFlush`) catches and logs — there's no caller to
+   * propagate to. Explicit `flush()` and `close()` `await` this method
+   * directly, so their callers (e.g. `DKGAgent.stop()`) receive the
+   * error and can fail the shutdown loudly instead of reporting
+   * success while data was lost on disk.
    */
   private async flushNow(): Promise<void> {
     if (!this.persistPath || this.flushing) return;
@@ -135,7 +153,9 @@ export class OxigraphStore implements TripleStore {
       // 4: fsync the directory so the rename itself survives a power loss.
       // Best-effort: some filesystems / Node versions don't expose dir-fd
       // sync; swallow ENOENT/EPERM since the rename itself already
-      // succeeded and the cache will eventually flush.
+      // succeeded and the cache will eventually flush. The rename itself
+      // landed bytes on disk; only the directory entry's durability
+      // depends on this step.
       try {
         const dirFh = await open(dir, 'r');
         try {
@@ -144,16 +164,20 @@ export class OxigraphStore implements TripleStore {
           await dirFh.close();
         }
       } catch {
-        // Best-effort dir fsync.
+        // Best-effort dir fsync — see comment above.
       }
     } catch (err) {
+      // Log here so we see the failure regardless of the caller — but
+      // re-throw so explicit callers fail loudly. (Background callers
+      // catch + log themselves in scheduleFlush.)
       // eslint-disable-next-line no-console
       console.error(
         `[OxigraphStore] flushNow failed for ${this.persistPath}: ${(err as Error).message}. ` +
           `Tmp file (${tmpPath}) may need cleanup.`,
       );
-      // Persistence is best-effort by design; surface the failure but don't
-      // crash the running daemon — the next flush will retry.
+      throw err instanceof Error
+        ? err
+        : new Error(`OxigraphStore flush failed: ${String(err)}`);
     } finally {
       this.flushing = false;
     }
@@ -288,6 +312,11 @@ export class OxigraphStore implements TripleStore {
    * Cancels any pending debounced flush (we'll cover its work) and waits
    * out any in-flight flushNow() before dumping the current snapshot, so
    * triples inserted while the previous flush was running aren't dropped.
+   *
+   * THROWS if the underlying write/fsync/rename fails (ENOSPC, EACCES,
+   * EROFS, EXDEV, …). Callers that need a durable insert must treat the
+   * rejection as a hard error — previous behaviour swallowed these and
+   * returned success even when the data never landed.
    */
   async flush(): Promise<void> {
     if (!this.persistPath) return;
@@ -308,6 +337,12 @@ export class OxigraphStore implements TripleStore {
    * dump and the close call. (That's the "lost the last few assertions"
    * mode in docs/bugs/wm-persistence-regression.md after the atomic-write
    * fix landed.)
+   *
+   * THROWS if the final flush fails — see `flush()` for the same error
+   * contract. The agent's `stop()` path catches this and logs but does
+   * not crash the shutdown, but at least the failure is now observable;
+   * previously a silent ENOSPC / EROFS during shutdown would lose data
+   * and the daemon would report a clean exit.
    */
   async close(): Promise<void> {
     if (this.flushTimer) {
